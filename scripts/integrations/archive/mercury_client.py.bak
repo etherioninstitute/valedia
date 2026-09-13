@@ -1,0 +1,63 @@
+"""Mercury Banking API Client — Abundance Agent
+Read balances, list transactions, initiate transfers.
+Operator: Burton Chatelain Jr. (GOATWORTHY Post, LLC)
+"""
+import os, json, requests
+from datetime import datetime, timedelta
+
+MERCURY_API_KEY = os.environ.get("MERCURY_API_KEY", "")
+MERCURY_BASE = "https://api.mercury.com/api/v1"
+
+# Force IPv4 — Mercury IP whitelist only has our IPv4
+import socket
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(*args, **kwargs):
+    responses = _orig_getaddrinfo(*args, **kwargs)
+    return [r for r in responses if r[0] == socket.AF_INET] or responses
+socket.getaddrinfo = _ipv4_getaddrinfo
+
+def _headers():
+    return {"Authorization": f"Bearer {MERCURY_API_KEY}", "Content-Type": "application/json"}
+
+def get_accounts():
+    """List all Mercury accounts (personal checking only — savings is off-limits)."""
+    r = requests.get(f"{MERCURY_BASE}/accounts", headers=_headers())
+    r.raise_for_status()
+    return r.json().get("accounts", [])
+
+def get_balance(account_id):
+    """Get current balance for a specific account."""
+    r = requests.get(f"{MERCURY_BASE}/account/{account_id}", headers=_headers())
+    r.raise_for_status()
+    data = r.json()
+    return {"balance": data.get("currentBalance"), "available": data.get("availableBalance"), "name": data.get("name")}
+
+def get_transactions(account_id, days=7):
+    """Get recent transactions."""
+    start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    r = requests.get(f"{MERCURY_BASE}/account/{account_id}/transactions", headers=_headers(), params={"start": start})
+    r.raise_for_status()
+    return r.json().get("transactions", [])
+
+def daily_summary():
+    """Generate daily fund summary for Signal reporting."""
+    accounts = get_accounts()
+    summary_lines = ["💰 Mercury Fund Summary"]
+    total = 0
+    for acct in accounts:
+        bal = get_balance(acct["id"])
+        total += bal["available"] or 0
+        summary_lines.append(f"  ▸ {bal[name]}: ${bal[available]:,.2f}")
+    summary_lines.append(f"  ▸ Total Available: ${total:,.2f}")
+    # 70/30 rule
+    tradeable = total * 0.30
+    locked = total * 0.70
+    summary_lines.append(f"  ▸ Tradeable (30%): ${tradeable:,.2f}")
+    summary_lines.append(f"  ▸ Locked (70%): ${locked:,.2f}")
+    return "\n".join(summary_lines)
+
+if __name__ == "__main__":
+    if not MERCURY_API_KEY:
+        print("Set MERCURY_API_KEY environment variable")
+    else:
+        print(daily_summary())

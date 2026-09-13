@@ -1,0 +1,25 @@
+{
+  "ts": "2026-03-26T03:01:22.156374+00:00",
+  "series": {
+    "KXHIGHNY": {
+      "code": "NY",
+      "type": "high",
+      "title": "Will the **high temp in NYC** be >72\u00b0 on Mar 26, 2026?"
+    },
+    "KXHIGHCHI": {
+      "code": "CHI",
+      "type": "high",
+      "title": "Will the high temp in Chicago be >84\u00b0 on Mar 26, 2026?"
+    },
+    "KXHIGHDEN": {
+      "code": "DEN",
+      "type": "high",
+      "title": "Will the **high temp in Denver** be >84\u00b0 on Mar 26, 2026?"
+    },
+    "KXHIGHAUS": {
+      "code": "AUS",
+      "type": "high",
+      "title": "Will the **high temp in Austin** be >95\u00b0 on Mar 26, 2026?"
+    }
+  }
+}

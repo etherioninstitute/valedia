@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-09-13 08:00 UTC",
+  "results": [
+    {
+      "ticker": "XRP-USD",
+      "accuracy": 0.5556,
+      "samples": 131,
+      "buy_probability": 0.0076,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "SOL-USD",
+      "accuracy": 0.6296,
+      "samples": 131,
+      "buy_probability": 0.0008,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "ETH-USD",
+      "accuracy": 0.5926,
+      "samples": 131,
+      "buy_probability": 0.726,
+      "signal": "BUY"
+    },
+    {
+      "ticker": "BTC-USD",
+      "accuracy": 0.4815,
+      "samples": 131,
+      "buy_probability": 0.0119,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "ADA-USD",
+      "accuracy": 0.5556,
+      "samples": 131,
+      "buy_probability": 0.0002,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "DOT-USD",
+      "accuracy": 0.5185,
+      "samples": 131,
+      "buy_probability": 0.0001,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "AVAX-USD",
+      "accuracy": 0.7037,
+      "samples": 131,
+      "buy_probability": 0.0017,
+      "signal": "AVOID"
+    },
+    {
+      "ticker": "LINK-USD",
+      "accuracy": 0.4815,
+      "samples": 131,
+      "buy_probability": 0.0,
+      "signal": "AVOID"
+    }
+  ]
+}

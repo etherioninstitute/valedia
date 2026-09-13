@@ -1,0 +1,589 @@
+{
+  "audits": [
+    {
+      "ts": "2026-03-17T18:50:52.307994+00:00",
+      "reflection": {
+        "period_days": 7,
+        "total_trades": 22,
+        "wins": 0,
+        "losses": 0,
+        "pending": 22,
+        "hit_rate": 0.0,
+        "signal_accuracy": {},
+        "day_of_week": {},
+        "asset_performance": {}
+      },
+      "findings_count": 1,
+      "problems": 1,
+      "strengths": 0,
+      "adjustments": 0,
+      "lessons_written": 0
+    },
+    {
+      "ts": "2026-03-17T18:52:06.014004+00:00",
+      "reflection": {
+        "period_days": 7,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-18T06:00:05.668482+00:00",
+      "reflection": {
+        "period_days": 7,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-19T06:00:01.981043+00:00",
+      "reflection": {
+        "period_days": 7,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-20T06:00:07.542087+00:00",
+      "reflection": {
+        "period_days": 7,
+        "total_trades": 12,
+        "wins": 12,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "BTC-USD": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.20329999999999998
+          },
+          "ETH-USD": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.5281
+          },
+          "SOL-USD": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.17470000000000002
+          }
+        }
+      },
+      "findings_count": 3,
+      "problems": 0,
+      "strengths": 3,
+      "adjustments": 0,
+      "lessons_written": 3
+    },
+    {
+      "ts": "2026-03-21T06:00:02.166761+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-22T06:00:03.099741+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-23T06:00:02.836081+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-24T06:00:05.609315+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-25T06:00:05.627340+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-26T06:00:04.479617+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-27T06:00:04.625862+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-28T06:00:04.763762+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    },
+    {
+      "ts": "2026-03-29T06:00:04.604912+00:00",
+      "reflection": {
+        "period_days": 30,
+        "total_trades": 22,
+        "wins": 22,
+        "losses": 0,
+        "pending": 0,
+        "hit_rate": 100.0,
+        "signal_accuracy": {},
+        "day_of_week": {
+          "Thursday": 100.0,
+          "Friday": 100.0,
+          "Sunday": 100.0
+        },
+        "asset_performance": {
+          "XLE": {
+            "wins": 4,
+            "total": 4,
+            "pnl": 0.13019999999999998
+          },
+          "BTC-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.3668
+          },
+          "ETH-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.9163
+          },
+          "SOL-USD": {
+            "wins": 6,
+            "total": 6,
+            "pnl": 0.2935
+          }
+        }
+      },
+      "findings_count": 4,
+      "problems": 0,
+      "strengths": 4,
+      "adjustments": 0,
+      "lessons_written": 4
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "regime": "CALM",
+  "risk_level": "NORMAL",
+  "fear_greed": 61,
+  "signals": {
+    "SPY_TREND": "CALM",
+    "VIX_REGIME": "FLAT"
+  },
+  "source": "intel_refresh (lightweight)",
+  "ts": "2026-09-13T11:00:01.097847+00:00"
+}

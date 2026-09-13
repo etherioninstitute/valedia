@@ -1,0 +1,120 @@
+"""Sentiment Scanner - Abundance Agent
+Aggregates social/news sentiment from free sources.
+Uses Finnhub social sentiment + news API (free tier).
+Upgradeable to X Premium API when profits justify $8/month.
+"""
+import os, requests, json
+from datetime import datetime, timezone, timedelta
+
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+def get_social_sentiment(symbol):
+    """Get Reddit/Twitter sentiment from Finnhub."""
+    r = requests.get(f"{FINNHUB_BASE}/stock/social-sentiment",
+                     params={"symbol": symbol, "token": FINNHUB_KEY})
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+def get_news_sentiment(symbol):
+    """Get news sentiment score from Finnhub."""
+    r = requests.get(f"{FINNHUB_BASE}/news-sentiment",
+                     params={"symbol": symbol, "token": FINNHUB_KEY})
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+def get_market_news(category="general"):
+    """Get latest market news headlines."""
+    r = requests.get(f"{FINNHUB_BASE}/news",
+                     params={"category": category, "token": FINNHUB_KEY})
+    if r.status_code == 200:
+        return r.json()[:20]
+    return []
+
+def get_crypto_news():
+    """Get crypto-specific news."""
+    return get_market_news("crypto")
+
+def analyze_headlines(news):
+    """Simple keyword-based sentiment scoring."""
+    bullish_words = ["surge", "rally", "bull", "gain", "jump", "soar", "high",
+                     "breakout", "upgrade", "buy", "growth", "profit", "record"]
+    bearish_words = ["crash", "drop", "bear", "fall", "plunge", "dump", "low",
+                     "selloff", "downgrade", "sell", "loss", "fear", "risk"]
+    
+    bull_count = 0
+    bear_count = 0
+    for article in news:
+        headline = article.get("headline", "").lower()
+        for w in bullish_words:
+            if w in headline:
+                bull_count += 1
+        for w in bearish_words:
+            if w in headline:
+                bear_count += 1
+    
+    total = bull_count + bear_count
+    if total == 0:
+        return "NEUTRAL", 0.5
+    
+    bull_ratio = bull_count / total
+    if bull_ratio > 0.6:
+        return "BULLISH", bull_ratio
+    elif bull_ratio < 0.4:
+        return "BEARISH", bull_ratio
+    else:
+        return "NEUTRAL", bull_ratio
+
+def sentiment_report():
+    """Generate comprehensive sentiment report."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"Sentiment Scan ({ts})", ""]
+    
+    # General market news
+    lines.append("Market News Sentiment:")
+    news = get_market_news()
+    if news:
+        sentiment, ratio = analyze_headlines(news)
+        lines.append(f"  Overall: {sentiment} ({ratio:.0%} bull ratio)")
+        lines.append(f"  Headlines analyzed: {len(news)}")
+        for n in news[:5]:
+            lines.append(f"  > {n.get('headline', '?')[:65]}")
+    
+    # Crypto news
+    lines.append("")
+    lines.append("Crypto News Sentiment:")
+    crypto_news = get_crypto_news()
+    if crypto_news:
+        c_sent, c_ratio = analyze_headlines(crypto_news)
+        lines.append(f"  Overall: {c_sent} ({c_ratio:.0%} bull ratio)")
+        for n in crypto_news[:3]:
+            lines.append(f"  > {n.get('headline', '?')[:65]}")
+    
+    # Social sentiment for key assets
+    lines.append("")
+    lines.append("Social Sentiment (Finnhub):")
+    for symbol in ["AAPL", "TSLA", "NVDA", "COIN"]:
+        try:
+            data = get_social_sentiment(symbol)
+            if data:
+                reddit = data.get("reddit", [])
+                twitter = data.get("twitter", [])
+                r_mentions = sum(d.get("mention", 0) for d in reddit[-7:]) if reddit else 0
+                t_mentions = sum(d.get("mention", 0) for d in twitter[-7:]) if twitter else 0
+                r_score = sum(d.get("score", 0) for d in reddit[-7:]) / max(len(reddit[-7:]), 1) if reddit else 0
+                lines.append(f"  {symbol}: Reddit({r_mentions} mentions, score:{r_score:.2f}) Twitter({t_mentions} mentions)")
+        except:
+            pass
+    
+    lines.append("")
+    lines.append("Source: Finnhub free tier (upgrade to X Premium for real-time)")
+    
+    return "\n".join(lines)
+
+if __name__ == "__main__":
+    if not FINNHUB_KEY:
+        print("Set FINNHUB_API_KEY env var")
+    else:
+        print(sentiment_report())

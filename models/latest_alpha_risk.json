@@ -1,0 +1,109 @@
+{
+  "timestamp": "2026-03-09 06:27 UTC",
+  "signals": {
+    "BTC": {
+      "signal": "FLAT",
+      "z_score": -0.024,
+      "decay_coeff": 2.4123,
+      "decay_rate": 0.7857,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0129,
+      "signal_strength": 0.0878,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "UP",
+      "regime": "NOISE"
+    },
+    "ETH": {
+      "signal": "FLAT",
+      "z_score": -0.011,
+      "decay_coeff": 2.134,
+      "decay_rate": 0.8078,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0079,
+      "signal_strength": 0.0714,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "UP",
+      "regime": "NOISE"
+    },
+    "SOL": {
+      "signal": "FLAT",
+      "z_score": -0.01,
+      "decay_coeff": 2.1597,
+      "decay_rate": 0.8058,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0081,
+      "signal_strength": 0.0787,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "UP",
+      "regime": "NOISE"
+    },
+    "XRP": {
+      "signal": "FLAT",
+      "z_score": -0.014,
+      "decay_coeff": 2.3972,
+      "decay_rate": 0.7868,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0115,
+      "signal_strength": 0.0481,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "DOWN",
+      "regime": "NOISE"
+    },
+    "AVAX": {
+      "signal": "FLAT",
+      "z_score": -0.008,
+      "decay_coeff": 2.1181,
+      "decay_rate": 0.8091,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0069,
+      "signal_strength": 0.1755,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "UP",
+      "regime": "MIXED"
+    },
+    "LINK": {
+      "signal": "FLAT",
+      "z_score": -0.005,
+      "decay_coeff": 2.2393,
+      "decay_rate": 0.7994,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0045,
+      "signal_strength": 0.0579,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "UP",
+      "regime": "NOISE"
+    },
+    "SPY": {
+      "signal": "FLAT",
+      "z_score": 0.001,
+      "decay_coeff": 2.2487,
+      "decay_rate": 0.7986,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": 0.0001,
+      "signal_strength": 0.1014,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "DOWN",
+      "regime": "MIXED"
+    },
+    "QQQ": {
+      "signal": "FLAT",
+      "z_score": -0.006,
+      "decay_coeff": 2.3304,
+      "decay_rate": 0.7921,
+      "half_life_bars": 0.3,
+      "expected_reversion_pct": -0.0013,
+      "signal_strength": 0.0898,
+      "multi_scale_confirms": 0,
+      "confidence": 50,
+      "trend_dir": "DOWN",
+      "regime": "NOISE"
+    }
+  }
+}

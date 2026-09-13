@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-09-13T11:03:50.469Z",
+  "projectRoot": "/Users/burtonchatelain/.openclaw/workspace",
+  "structure": {
+    "hasPackageJson": false,
+    "hasTsConfig": false,
+    "hasClaudeConfig": true,
+    "hasClaudeFlow": true
+  },
+  "scannedAt": 1789297430469
+}

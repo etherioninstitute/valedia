@@ -1,0 +1,121 @@
+{
+  "ts": "2026-09-13 07:30 UTC",
+  "assets": {
+    "LSK": {
+      "ticker": "LSK-USD",
+      "class": "unknown",
+      "platform": "alpaca",
+      "buzz_score": 125,
+      "price": 0.7593058347702026,
+      "reasons": [
+        "breakout@0.7593",
+        "vol/mcap=172%",
+        "CG_trending#1"
+      ],
+      "breakout": true,
+      "cg_id": "lisk",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "VTHO": {
+      "ticker": "VTHO-USD",
+      "class": "unknown",
+      "platform": "alpaca",
+      "buzz_score": 80,
+      "price": 0.0008745900122448802,
+      "reasons": [
+        "breakout@0.0009",
+        "vol/mcap=225%"
+      ],
+      "breakout": true,
+      "cg_id": "vethor-token",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "ILV": {
+      "ticker": "ILV-USD",
+      "class": "unknown",
+      "platform": "alpaca",
+      "buzz_score": 50,
+      "price": 3.793100118637085,
+      "reasons": [
+        "CG_trending#15",
+        "breakout@3.7931"
+      ],
+      "breakout": true,
+      "cg_id": "illuvium",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "\u725b\u6765": {
+      "ticker": "\u725b\u6765-USD",
+      "class": "crypto",
+      "platform": "coinbase",
+      "buzz_score": 50,
+      "price": 0.142732,
+      "reasons": [
+        "vol/mcap=61%"
+      ],
+      "breakout": false,
+      "cg_id": "niu-lai",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "EMBER": {
+      "ticker": "EMBER-USD",
+      "class": "crypto",
+      "platform": "coinbase",
+      "buzz_score": 42,
+      "price": 0,
+      "reasons": [
+        "CG_trending#2"
+      ],
+      "breakout": false,
+      "cg_id": "embercurve",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "LAPTOP": {
+      "ticker": "LAPTOP-USD",
+      "class": "crypto",
+      "platform": "coinbase",
+      "buzz_score": 39,
+      "price": 0,
+      "reasons": [
+        "CG_trending#3"
+      ],
+      "breakout": false,
+      "cg_id": "hunter-biden-s-laptop-3",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    },
+    "STONK": {
+      "ticker": "STONK-USD",
+      "class": "crypto",
+      "platform": "coinbase",
+      "buzz_score": 36,
+      "price": 0,
+      "reasons": [
+        "CG_trending#4"
+      ],
+      "breakout": false,
+      "cg_id": "stonk-3",
+      "discovered": "2026-09-13 07:30 UTC",
+      "max_trade_pct": 0.02,
+      "kelly_mult": 0.5,
+      "sell_threshold": 50
+    }
+  }
+}

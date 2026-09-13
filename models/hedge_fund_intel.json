@@ -1,0 +1,86 @@
+{
+  "ts": "2026-09-13 09:30 UTC",
+  "short_squeeze": [
+    {
+      "ticker": "MARA",
+      "short_pct": 32.6,
+      "price": 11.98,
+      "avg_vol": 47180808,
+      "float": 378268135
+    },
+    {
+      "ticker": "UPST",
+      "short_pct": 30.5,
+      "price": 25.59,
+      "avg_vol": 4302677,
+      "float": 83798210
+    },
+    {
+      "ticker": "BYND",
+      "short_pct": 27.5,
+      "price": 10.21,
+      "avg_vol": 1304845,
+      "float": 16660937
+    }
+  ],
+  "sentiment_divergence": [
+    {
+      "ticker": "PYPL",
+      "pe": 9.3,
+      "roe": 24.5,
+      "change52w": -20.0,
+      "price": 53.72
+    },
+    {
+      "ticker": "NKE",
+      "pe": 16.1,
+      "roe": 22.1,
+      "change52w": -49.6,
+      "price": 36.8
+    },
+    {
+      "ticker": "BABA",
+      "pe": 11.8,
+      "roe": 6.4,
+      "change52w": -30.8,
+      "price": 109.3
+    }
+  ],
+  "dividend_danger": [
+    {
+      "ticker": "MO",
+      "yield": 645.0,
+      "payout": 89.3,
+      "debt_eq": "?",
+      "danger": 1
+    },
+    {
+      "ticker": "PM",
+      "yield": 310.0,
+      "payout": 80.7,
+      "debt_eq": "?",
+      "danger": 1
+    },
+    {
+      "ticker": "LYB",
+      "yield": 433.0,
+      "payout": 1146.8,
+      "debt_eq": 133.0,
+      "danger": 1
+    },
+    {
+      "ticker": "DOW",
+      "yield": 482.0,
+      "payout": 700.0,
+      "debt_eq": 112.0,
+      "danger": 1
+    },
+    {
+      "ticker": "OHI",
+      "yield": 579.0,
+      "payout": 95.4,
+      "debt_eq": 71.0,
+      "danger": 1
+    }
+  ]
+}

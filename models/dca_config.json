@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "amount_per_cycle": 5.0,
+  "max_assets": 3,
+  "crypto_tickers": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "ADA-USD",
+    "AVAX-USD"
+  ],
+  "equity_tickers": [
+    "SPY",
+    "QQQ",
+    "GLD",
+    "XLE"
+  ],
+  "min_score": 50
+}

@@ -1,0 +1,32 @@
+# Secrets and local env
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Ruflo / Claude Flow runtime
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Local DBs / heavy binaries (restore from backup if needed)
+ruvector.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Optional local overrides
+.claude/settings.local.json

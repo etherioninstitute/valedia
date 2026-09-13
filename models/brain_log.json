@@ -1,0 +1,9 @@
+{
+  "trades": [],
+  "stats": {
+    "total": 0,
+    "wins": 0,
+    "hit_rate": 50,
+    "recent_20": 50
+  }
+}

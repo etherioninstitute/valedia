@@ -1,0 +1,335 @@
+{
+  "teams": {
+    "nba_DEN": {
+      "ts": "2026-05-01T01:00:04.980286+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_MIN": {
+      "ts": "2026-04-12T13:00:13.040937+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_OKC": {
+      "ts": "2026-05-19T01:00:18.432393+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_COL": {
+      "ts": "2026-05-23T01:00:13.767403+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_VGK": {
+      "ts": "2026-06-07T03:00:29.730595+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "mlb_PHI": {
+      "ts": "2026-03-30T15:00:14.707142+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "mlb_TOR": {
+      "ts": "2026-03-30T15:00:15.223466+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "mlb_LAD": {
+      "ts": "2026-03-30T15:00:15.554118+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "ncaamb_OKL": {
+      "ts": "2026-03-30T15:00:16.411000+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "ncaamb_AUB": {
+      "ts": "2026-03-30T15:00:16.668597+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_MIL": {
+      "ts": "2026-04-10T23:00:18.002026+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_SAS": {
+      "ts": "2026-06-14T01:00:03.822378+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_PHX": {
+      "ts": "2026-04-10T03:00:12.605840+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_BOS": {
+      "ts": "2026-04-29T01:00:08.152181+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_NSH": {
+      "ts": "2026-04-11T05:00:25.544010+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "mlb_NYM": {
+      "ts": "2026-04-05T06:28:22.491405+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_CHI": {
+      "ts": "2026-04-09T21:00:32.252442+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_BKN": {
+      "ts": "2026-04-08T01:00:22.527543+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_DAL": {
+      "ts": "2026-04-21T03:00:08.361649+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_PHI": {
+      "ts": "2026-04-05T21:00:06.193738+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_ORL": {
+      "ts": "2026-05-02T01:00:05.285454+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_CLE": {
+      "ts": "2026-05-14T03:00:05.686876+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_OTT": {
+      "ts": "2026-04-16T01:00:24.217740+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_NOP": {
+      "ts": "2026-04-07T23:00:13.876101+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_LAC": {
+      "ts": "2026-04-16T03:00:32.075110+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_MIN": {
+      "ts": "2026-05-14T01:00:10.286209+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_WPG": {
+      "ts": "2026-04-07T01:00:15.852898+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_BUF": {
+      "ts": "2026-05-04T03:00:06.803745+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_LA": {
+      "ts": "2026-04-11T05:00:20.422913+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_ANA": {
+      "ts": "2026-05-08T15:00:05.834487+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_CAR": {
+      "ts": "2026-06-10T01:00:19.775806+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_MTL": {
+      "ts": "2026-05-22T01:00:33.446608+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_EDM": {
+      "ts": "2026-04-27T03:00:05.194510+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_HOU": {
+      "ts": "2026-04-27T03:00:04.576468+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_GSW": {
+      "ts": "2026-04-11T01:00:10.735134+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_CHA": {
+      "ts": "2026-04-14T23:00:06.038332+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_ATL": {
+      "ts": "2026-04-24T01:00:08.422075+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_NYK": {
+      "ts": "2026-05-20T01:03:25.082476+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_PIT": {
+      "ts": "2026-04-28T01:00:08.721028+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_TB": {
+      "ts": "2026-04-17T21:00:51.760570+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_NJ": {
+      "ts": "2026-04-08T23:00:20.279294+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_STL": {
+      "ts": "2026-04-08T23:00:21.345628+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_NYI": {
+      "ts": "2026-04-09T19:00:26.172366+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_CBJ": {
+      "ts": "2026-04-10T01:00:24.787099+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_DET": {
+      "ts": "2026-05-14T01:00:08.438410+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_POR": {
+      "ts": "2026-04-26T21:00:08.988372+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_DAL": {
+      "ts": "2026-04-12T21:00:13.727879+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_FLA": {
+      "ts": "2026-04-12T01:00:13.776597+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_SJ": {
+      "ts": "2026-04-16T01:00:24.930522+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_MIA": {
+      "ts": "2026-04-12T21:00:15.513695+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_WSH": {
+      "ts": "2026-04-12T21:00:19.254607+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_DET": {
+      "ts": "2026-04-13T05:00:07.512155+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nhl_UTA": {
+      "ts": "2026-04-15T03:00:05.128258+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_LAL": {
+      "ts": "2026-05-02T03:00:03.228448+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    },
+    "nba_PHI": {
+      "ts": "2026-05-03T05:00:06.328885+00:00",
+      "risk": "OK",
+      "injuries": [],
+      "out_count": 0
+    }
+  },
+  "updated": "2026-06-14T01:00:03.822418+00:00"
+}

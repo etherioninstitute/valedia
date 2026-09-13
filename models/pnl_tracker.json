@@ -1,0 +1,346 @@
+{
+  "trades": [
+    {
+      "ticker": "KXNBAGAME-26MAR23HOUCHI-HOU",
+      "strategy": "SPORTS",
+      "side": "yes",
+      "cost": 0.77,
+      "profit": -0.77,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXNBAGAME-26MAR23SASMIA-SAS",
+      "strategy": "SPORTS",
+      "side": "yes",
+      "cost": 0.66,
+      "profit": 0.34,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXNHLGAME-26MAR23OTTNYR-OTT",
+      "strategy": "SPORTS",
+      "side": "yes",
+      "cost": 0.64,
+      "profit": 0.36,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXWTI-26MAR23-T100.99",
+      "strategy": "OIL_BRACKET",
+      "side": "yes",
+      "cost": 3.12,
+      "profit": -3.12,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXWTI-26MAR23-T99.99",
+      "strategy": "OIL_BRACKET",
+      "side": "yes",
+      "cost": 4.9,
+      "profit": -4.9,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXWTI-26MAR23-T98.99",
+      "strategy": "OIL_BRACKET",
+      "side": "yes",
+      "cost": 4.88,
+      "profit": -4.88,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXWTI-26MAR23-T97.99",
+      "strategy": "OIL_BRACKET",
+      "side": "yes",
+      "cost": 7.0,
+      "profit": -7.0,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2317-B1990",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "no",
+      "cost": 2.34,
+      "profit": 15.66,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXETH-26MAR2317-B2110",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "no",
+      "cost": 8.52,
+      "profit": 49.48,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXETH-26MAR2317-B2070",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "no",
+      "cost": 2.24,
+      "profit": 7.76,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2060",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "no",
+      "cost": 1.47,
+      "profit": 4.53,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXHIGHAUS-26MAR23-T86",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 0.45,
+      "profit": -0.45,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHDEN-26MAR23-T77",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 5.42,
+      "profit": -5.42,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHCHI-26MAR23-T47",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 5.54,
+      "profit": -5.54,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2040",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "no",
+      "cost": 0.68,
+      "profit": -0.68,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B1940",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 1.4,
+      "profit": -1.4,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B1960",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 1.8,
+      "profit": -1.8,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2000",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 2.4,
+      "profit": -2.4,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2120",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 3.0,
+      "profit": -3.0,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2140",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 3.8,
+      "profit": -3.8,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B1900",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 4.75,
+      "profit": -4.75,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B1920",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 5.89,
+      "profit": -5.89,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2160",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 7.41,
+      "profit": -7.41,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2180",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 7.98,
+      "profit": -7.98,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2305-B2100",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 7.92,
+      "profit": -7.92,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHAUS-26MAR23-T93",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 1.85,
+      "profit": -1.85,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHMIA-26MAR23-B79.5",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 2.61,
+      "profit": -2.61,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXETH-26MAR2317-B2030",
+      "strategy": "CRYPTO_BRACKET",
+      "side": "yes",
+      "cost": 1.4,
+      "profit": -1.4,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHMIA-26MAR23-T79",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 4.54,
+      "profit": -4.54,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXNHLGAME-26MAR22LAUTA-LA",
+      "strategy": "SPORTS",
+      "side": "no",
+      "cost": 0.62,
+      "profit": 0.38,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXNHLGAME-26MAR22LAUTA-UTA",
+      "strategy": "SPORTS",
+      "side": "yes",
+      "cost": 0.62,
+      "profit": 0.38,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXHIGHMIA-26MAR22-B81.5",
+      "strategy": "WEATHER_ARB",
+      "side": "no",
+      "cost": 0.5,
+      "profit": -0.5,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHCHI-26MAR22-T58",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 0.5,
+      "profit": -0.5,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHNY-26MAR22-T62",
+      "strategy": "WEATHER_ARB",
+      "side": "yes",
+      "cost": 0.5,
+      "profit": -0.5,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHCHI-26MAR22-T65",
+      "strategy": "WEATHER_ARB",
+      "side": "no",
+      "cost": 0.5,
+      "profit": -0.5,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXHIGHNY-26MAR22-B62.5",
+      "strategy": "WEATHER_ARB",
+      "side": "no",
+      "cost": 0.5,
+      "profit": -0.5,
+      "status": "LOST"
+    },
+    {
+      "ticker": "KXNBAGAME-26MAR22WASNYK-NYK",
+      "strategy": "SPORTS",
+      "side": "yes",
+      "cost": 4.75,
+      "profit": 0.25,
+      "status": "WON"
+    },
+    {
+      "ticker": "KXNBAGAME-26MAR22WASNYK-WAS",
+      "strategy": "SPORTS",
+      "side": "no",
+      "cost": 4.75,
+      "profit": 0.25,
+      "status": "WON"
+    }
+  ],
+  "summary": {
+    "last_updated": "2026-09-13T06:00:09.035531+00:00",
+    "total_trades": 38,
+    "wins": 10,
+    "losses": 28,
+    "win_rate": 26.3,
+    "total_won": 79.39,
+    "total_lost": 92.01,
+    "net_pnl": -12.62,
+    "current_balance": 5.0,
+    "current_deployed": 113.0,
+    "strategies": {
+      "SPORTS": {
+        "wins": 6,
+        "losses": 1,
+        "profit": 1.96,
+        "cost": 0.77
+      },
+      "OIL_BRACKET": {
+        "wins": 0,
+        "losses": 4,
+        "profit": 0,
+        "cost": 19.9
+      },
+      "CRYPTO_BRACKET": {
+        "wins": 4,
+        "losses": 12,
+        "profit": 77.43,
+        "cost": 48.43
+      },
+      "WEATHER_ARB": {
+        "wins": 0,
+        "losses": 11,
+        "profit": 0,
+        "cost": 22.91
+      }
+    }
+  }
+}

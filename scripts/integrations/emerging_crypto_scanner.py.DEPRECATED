@@ -1,0 +1,63 @@
+"""Emerging Crypto Scanner — Valedia ASI
+Scans for new/trending crypto before they pump.
+(c) GOATWORTHY Post LLC.
+"""
+import requests, json
+from datetime import datetime, timezone
+
+def scan_trending():
+    """CoinGecko trending coins — free API, no key needed."""
+    lines = [f"[EMERGING] {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"]
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=15)
+        if r.ok:
+            coins = r.json().get("coins", [])
+            lines.append(f"  Trending coins ({len(coins)}):")
+            for c in coins[:10]:
+                item = c.get("item", {})
+                name = item.get("name", "?")
+                symbol = item.get("symbol", "?")
+                rank = item.get("market_cap_rank", "?")
+                price_btc = item.get("price_btc", 0)
+                lines.append(f"    {symbol:8s} {name:20s} MCap Rank: {rank} pBTC: {price_btc:.10f}")
+    except Exception as e:
+        lines.append(f"  CoinGecko error: {e}")
+    # Top gainers (24h)
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=10&page=1", timeout=15)
+        if r.ok:
+            lines.append(f"  Top 24h gainers:")
+            for c in r.json()[:10]:
+                chg = c.get("price_change_percentage_24h", 0) or 0
+                vol = c.get("total_volume", 0) or 0
+                mcap = c.get("market_cap", 0) or 0
+                lines.append(f"    {c['symbol'].upper():8s} +{chg:.1f}% vol=${vol/1e6:.1f}M mcap=${mcap/1e9:.2f}B")
+    except Exception as e:
+        lines.append(f"  Gainers error: {e}")
+    # New listings from CoinGecko
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/list?include_platform=false", timeout=15)
+        if r.ok:
+            all_coins = r.json()
+            lines.append(f"  Total coins tracked: {len(all_coins)}")
+    except: pass
+    return "\n".join(lines)
+
+def scan_volume_spikes():
+    """Find coins with abnormal volume (>3x average)."""
+    lines = ["  Volume spikes:"]
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1", timeout=15)
+        if r.ok:
+            for c in r.json():
+                mcap = c.get("market_cap", 0) or 0
+                vol = c.get("total_volume", 0) or 0
+                if mcap > 0 and vol / mcap > 0.3:  # volume > 30% of mcap = unusual
+                    lines.append(f"    {c['symbol'].upper():8s} vol/mcap={vol/mcap:.1%} vol=${vol/1e6:.0f}M")
+    except: pass
+    if len(lines) == 1: lines.append("    None detected")
+    return "\n".join(lines)
+
+if __name__ == "__main__":
+    print(scan_trending())
+    print(scan_volume_spikes())

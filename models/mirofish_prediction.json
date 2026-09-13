@@ -1,0 +1,14 @@
+{
+  "ts": "2026-09-13T02:46:22.018327+00:00",
+  "status": "complete",
+  "steps": [
+    "ontology: 10 entity types",
+    "graph built",
+    "agents prepared",
+    "simulation completed",
+    "report generated"
+  ],
+  "project_id": "proj_7a058d03781b",
+  "simulation_id": "sim_523e0193d43e",
+  "report_summary": "{'completed_at': '2026-09-12T19:46:19.240200', 'created_at': '2026-09-12T19:08:11.902496', 'error': None, 'graph_id': '6e3752ae-104a-4ff8-b48d-4e7f06746dec', 'markdown_content': '# Future Prediction Report: Crypto and Equity Market Dynamics Over the Next 5 Trading Days\\n\\n> The simulation reveals that over the next five trading days, crypto markets will be driven by retail FOMO narratives and political-crypto entanglements, with market makers and quant funds amplifying volatility while institutional traders position defensively amid emerging regulatory signals.\\n\\n---\\n\\n## Retail FOMO Narratives Drive Altcoin Momentum\\n\\nThe simulation reveals that over the next five trading days, retail investors will become the primary engine of altcoin momentum, with social media narratives acting as the ignition switch. The data shows a clear pattern of specific tokens being elevated from background noise into focal points of collective buying enthusiasm, each carrying the unmistakable fingerprint of FOMO-driven participation rather than fundamental analysis.\\n\\n**The Roster of FOMO Altcoins**\\n\\nThe simulation identifies a distinct cluster of assets that retail investors are actively discussing as signals of momentum and emerging narratives. These are not random picks\u2014they represent the coins where social energy is concentrating most intensely:\\n\\n> \"Uniswap is trending, often a signal of retail FOMO or an emerging narrative.\"\\n\\n> \"Solana is often a signal of retail FOMO or an emerging narrative.\"\\n\\n> \"Pudgy Penguins is often a signal of retail FOMO or an emerging narrative.\"\\n\\n> \"Illuvium is often a signal of retail FOMO or an emerging narrative.\"\\n\\n> \"Hunter Biden\\'s Laptop is often a signal of retail FOMO or an emerging narrative.\"\\n\\nThe inclusion of **Hunter Biden\\'s Laptop** as an altcoin is particularly telling\u2014it signals that retail momentum in this simulation is driven by meme-culture politics and viral spectacle rather than technological utility. The token\\'s ver"
+}

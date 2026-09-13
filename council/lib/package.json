@@ -1,0 +1,61 @@
+{
+  "name": "@ai-fund/lib",
+  "version": "0.1.0",
+  "description": "Shared libraries for ai-fund: indicators, math, backtesting, signals, regime detection",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "exports": {
+    "./indicators": "./indicators.ts",
+    "./math": "./math.ts",
+    "./format": "./format.ts",
+    "./datastore": "./datastore.ts",
+    "./backtester": "./backtester.ts",
+    "./regime-detector": "./regime-detector.ts",
+    "./signal-generator": "./signal-generator.ts",
+    "./connector-interface": "./connector-interface.ts",
+    "./confluence-detector": "./confluence-detector.ts",
+    "./connector-registry": "./connector-registry.ts",
+    "./valuation": "./valuation.ts",
+    "./volume-profile": "./volume-profile.ts",
+    "./execution-analytics": "./execution-analytics.ts",
+    "./execution-planner": "./execution-planner.ts",
+    "./grid-trading": "./grid-trading.ts",
+    "./options": "./options.ts",
+    "./monte-carlo": "./monte-carlo.ts",
+    "./portfolio-analytics": "./portfolio-analytics.ts",
+    "./sentiment": "./sentiment.ts",
+    "./portfolio-optimizer": "./portfolio-optimizer.ts",
+    "./factor-model": "./factor-model.ts",
+    "./funding": "./funding.ts",
+    "./order-flow": "./order-flow.ts",
+    "./liquidation": "./liquidation.ts",
+    "./microstructure": "./microstructure.ts",
+    "./stat-arb": "./stat-arb.ts",
+    "./time-series": "./time-series.ts",
+    "./venue-analytics": "./venue-analytics.ts",
+    "./analytics-store": "./analytics-store.ts",
+    "./ingest/exchange": "./ingest/exchange.ts",
+    "./ingest/yahoo": "./ingest/yahoo.ts",
+    "./test-fixtures": "./test-fixtures/index.ts",
+    "./test-fixtures/market-data": "./test-fixtures/market-data.ts",
+    "./test-fixtures/mock-mcp-server": "./test-fixtures/mock-mcp-server.ts",
+    "./test-fixtures/mock-exchange": "./test-fixtures/mock-exchange.ts",
+    "./test-fixtures/mock-fetch": "./test-fixtures/mock-fetch.ts",
+    "./test-fixtures/http-replay": "./test-fixtures/http-replay.ts"
+  },
+  "files": [
+    "*.ts",
+    "ingest/*.ts",
+    "test-fixtures/*.ts"
+  ],
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

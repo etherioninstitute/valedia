@@ -1,0 +1,23 @@
+{
+  "ts": "2026-04-07 19:00 UTC",
+  "capital": {
+    "kalshi": 0,
+    "coinbase_usd": 5.198218234716266,
+    "coinbase_usdc": 100.0,
+    "alpaca": 8.56,
+    "total": 113.75821823471627,
+    "deployed": 19.740000000000002,
+    "deployable": 59.890752764301375
+  },
+  "n_opps": 62,
+  "n_allocs": 20,
+  "total_deployed": 58.75,
+  "total_ev": 117.77,
+  "by_platform": {
+    "kalshi": {
+      "n": 20,
+      "alloc": 58.75,
+      "ev": 117.77
+    }
+  }
+}

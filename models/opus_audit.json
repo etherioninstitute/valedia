@@ -1,0 +1,43 @@
+{
+  "ts": "2026-09-13T06:00:39.842756+00:00",
+  "model": "qwen3:8b (local)",
+  "audit": "**1. ROOT CAUSE ANALYSIS**  \n- **WEATHER_ARB & OIL_BRACKET** are the primary culprits: 11+ losses with $0 profit, costing $22.91 + $19.90 = **$42.81** in capital. These strategies are unprofitable and drag down P&L.  \n- **CRYPTO_BRACKET** has 12 losses vs. 4 wins, but $77.43 profit (92% of total gains). High loss frequency undermines profitability.  \n- **SPORTS** has 6 wins vs. 1 loss, but $1.96 profit (25% of total gains). Low volume and high cost ($0.77) limit impact.  \n\n**2. STRATEGY CHANGES**  \n- **Kill**: WEATHER_ARB ($22.91 lost), OIL_BRACKET ($19.90 lost).  \n- **Keep**: CRYPTO_BRACKET (profitable despite losses) and SPORTS (positive skew).  \n- **Add**: Short-term crypto shorts (e.g., BTC/ETH) or high-probability sports bets (e.g., NBA/MLB games with >50% implied odds).  \n\n**3. CAPITAL ALLOCATION**  \n- **$300-500**: Allocate **$200 to crypto shorts** (e.g., short BTC/ETH on Coinbase) and **$100 to sports bets** (e.g., NBA games with >50% implied odds).  \n- **$0 to WEATHER_ARB/OIL_BRACKET**.  \n\n**4. SPECIFIC TRADES**  \n- **Crypto Shorts**:  \n  - **BTC/ETH**: Short BTC/ETH on Coinbase if Fear & Greed (FG) index drops below 10 (extreme fear). Use $200 to short 10% of position.  \n  - **Leverage**: Use 2x leverage (if available) to amplify returns.  \n- **Sports Bets**:  \n  - **NBA/MLB**: Bet on underdogs with >50% implied odds (e.g., 20%+ edge). Use $100 to place 5-7 bets with 10% stake each.  \n  - **Focus**: Games with low volatility (e.g., 2nd half of 4th quarter) to reduce risk.  \n\n**Key**: Prioritize **low-cost, high-probability trades**. Avoid WEATHER_ARB/OIL_BRACKET. Use FG index as a signal for crypto shorts.",
+  "summary": {
+    "last_updated": "2026-09-13T06:00:09.035531+00:00",
+    "total_trades": 38,
+    "wins": 10,
+    "losses": 28,
+    "win_rate": 26.3,
+    "total_won": 79.39,
+    "total_lost": 92.01,
+    "net_pnl": -12.62,
+    "current_balance": 5.0,
+    "current_deployed": 113.0,
+    "strategies": {
+      "SPORTS": {
+        "wins": 6,
+        "losses": 1,
+        "profit": 1.96,
+        "cost": 0.77
+      },
+      "OIL_BRACKET": {
+        "wins": 0,
+        "losses": 4,
+        "profit": 0,
+        "cost": 19.9
+      },
+      "CRYPTO_BRACKET": {
+        "wins": 4,
+        "losses": 12,
+        "profit": 77.43,
+        "cost": 48.43
+      },
+      "WEATHER_ARB": {
+        "wins": 0,
+        "losses": 11,
+        "profit": 0,
+        "cost": 22.91
+      }
+    }
+  }
+}

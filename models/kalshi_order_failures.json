@@ -1,0 +1,14 @@
+{
+  "KXCPI-26OCT-T0.0": {
+    "count": 3,
+    "last_error": "400 Client Error"
+  },
+  "KXGDP-26JUL30-T1.0": {
+    "count": 3,
+    "last_error": "400 Client Error: Bad Request for url: https://api.elections.kalshi.com/trade-ap"
+  },
+  "KXCPI-26SEP-T0.1": {
+    "count": 1,
+    "last_error": "400 Client Error: Bad Request for url: https://api.elections.kalshi.com/trade-ap"
+  }
+}

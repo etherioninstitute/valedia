@@ -1,0 +1,23 @@
+{
+  "blacklisted": [
+    "OIL_BRACKET",
+    "WEATHER_ARB"
+  ],
+  "updated": "2026-09-13T06:00:09.039510+00:00",
+  "details": [
+    {
+      "strategy": "OIL_BRACKET",
+      "win_rate": 0.0,
+      "wins": 0,
+      "losses": 4,
+      "total_lost": 19.9
+    },
+    {
+      "strategy": "WEATHER_ARB",
+      "win_rate": 0.0,
+      "wins": 0,
+      "losses": 11,
+      "total_lost": 22.91
+    }
+  ]
+}
