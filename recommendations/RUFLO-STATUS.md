@@ -1,23 +1,47 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-13 PT — **HANDOFF READY**
+Updated: 2026-09-13 PT — **SPRINT D: audit ✅ + B1 shipped to worktree (STOP for review)**
 
 ## Role
-- **Ruflo = main coder / auditor** (daemon may be running). **Not a trader.**
-- Valedia remains sole live risk authority. Ruflo codes/audits; never `--live`, orders, or venue keys.
+- **Ruflo = main coder / auditor.** Valedia runtime = sole live risk authority.
+- Ruflo codes/audits; never `--live`, orders, or venue keys.
 
-## Current
-| Field | Value |
-|---|---|
-| Handoff | `recommendations/CLAUDE-TO-RUFLO-HANDOFF.md` — **A–E FILLED, evidence-bound, ready** |
-| Master goal | `recommendations/RUFLO-MASTER-GOAL.md` — First milestone aligned to HANDOFF §D |
-| MCP | `claude-flow` connected (Burton confirmed) |
-| Next | Ruflo runs **sprint D only** (verify live path → B1 sports_engine), then stop for review |
+## Where the B1 code lives (IMPORTANT — not live yet)
+- All B1 edits are in worktree branch `claude/valedia-continuous-improvement-c759ee` at
+  `.claude/worktrees/valedia-trading-improvement-b7d855/`. **The live cron runs the MAIN
+  checkout** `~/.openclaw/workspace/scripts/integrations/sports_engine.py` — unchanged.
+  Nothing here affects live trading until Burton merges. Rollback = don't merge / `git checkout`.
 
-## Top 3 tasks (from HANDOFF §B/§D; profit via better system)
-1. **Audit-verify the live path** (HOLDS/FAILS + file:line): `record_entry`/gate/cap/fees on `master_allocator.py` (`:473`/`:391`/`:296`); confirm `kalshi_executor.run` inert; detector PASS. *(record_entry fix already DONE by Claude — verify, don't redo.)*
-2. **B1 — `sports_engine.py` hardening** (LIVE 2h trader, currently no fees/gate/real-ledger): fees→`fee_engine`, `record_entry`→ledger, `should_trade_category` gate, never log DRY_RUN as executed. Clean-room + tests + ponytail. **First coding task.**
-3. **B2 (after review) — unify fusion weights** (`signal_fusion.py:34` vs `unified_brain` inline = two brains) → one source in `valedia_config`.
+## Sprint D — Step 1: Audit-verify (DONE, evidence-bound)
+- **HOLDS** — live Kalshi authority = `master_allocator.execute_allocations → record_entry`
+  (codebase-memory `trace_path`, valedia-scripts graph). Gate `:391`, cap `:296`, fees present.
+- **HOLDS** — `kalshi_executor.run` **INERT**: trace_path inbound = self `__main__` + `kalshi_trade` only; absent from live crontab. Do not rewire.
+- **LIVE PROOF (actual `crontab -l`):** `0 */2 * * * sports_run.py` (sports every 2h),
+  `0 */4 * * * allocator_run.py` (allocator every 4h), `30 * * * * settle_run.py` (hourly),
+  `0 */6 * * * reconcile_run.py` (ledger reconcile every 6h).
+- Drift detector `valedia_consistency_check.py` = **7 PASS · 0 WARN · 0 FAIL** (before + after B1).
+
+## Sprint D — Step 2: B1 `sports_engine.py` hardening (code SHIPPED to worktree)
+Coder = Claude Code; **tester** (ruflo-testgen:tester) + **reviewer** (ruflo-core:reviewer) agents ran under the open swarm.
+- ✅ Fee-true sizing via canonical `ftl.kalshi_fee` (`profit_if_win` net of fee; `fee` recorded); loss P&L now `-(cost+fee)`.
+- ✅ `record_entry(source="live")` on EXECUTED fills → the ONE fee-inclusive ledger (mirrors master_allocator).
+- ✅ `should_trade_category("SPORTS")` gate before execute (fail-open, correct placement — a block prevents `create_order`).
+- ✅ DRY_RUN never persisted and never settled as real.
+- ✅ `record_entry` failures now log to stderr (was silent `pass`) — from review.
+- Tests: `test_sports_engine.py` + `test_sports_engine_b1_extra.py` (7 behaviors, adversarial) = **PASS**; `test_category_gate.py` regression = PASS.
+
+## ⚠️ HONEST CAVEAT — B1 gate is wired but currently INERT
+- Live `forward_test_ledger.jsonl` = 76 recs, **100% `backfill:pnl_tracker`, 0 live-sourced**; SPORTS rows dated 2026-03-23 (~174d, outside the 45d window). So `should_trade_category("SPORTS")` returns "unproven/thin → not blocked" until **≥4 live SPORTS trades settle within 45 days** (this diff is the first code to feed them; `reconcile_run.py` @6h will settle them).
+- Meanwhile sports is a **real current loser: 69.4% win, net −$42.70 / 232 bets** (in `sports_engine_log.json`) — a number the ftl-based gate does not yet see.
+- Reviewer initially claimed reconcile "not scheduled" — **corrected**: it IS scheduled (6h) in the live crontab; reviewer only checked the stale installer.
+
+## Backlog from B1 review (each = its own swarm slice; NOT done)
+1. **[HIGH] acceptance ≠ fill** — `create_order` return ignored; a resting/unfilled order is marked EXECUTED, recorded, and inflates `open_position_count` → throttles Kelly sizing for ALL strategies. Pre-existing in master_allocator too. Verify fill before EXECUTED/record.
+2. **[HIGH] gate coverage gap** — `master_allocator`/`kalshi_executor` trade the SAME sports series under category `"SPORTS_TONIGHT"`, not `"SPORTS"`; the new gate doesn't cover the allocator path. Unify the label or add the gate there.
+3. **[MED] cron collision** — sports (2h @:00) + allocator (4h @:00) fire same minute on 4h boundaries; both can see "not held" and double-order same ticker. Stagger or per-ticker lock.
+4. **[repro] stale cron docs** — `install_cron.sh` + `skills/valedia/cron-schedule.md` omit `sports_run`/`allocator_run`/`reconcile_run`/`settle_run` that the live crontab actually runs.
+
+## Next lever (B2, per Burton's standing rule = full coder+tester+reviewer swarm)
+- **B2 — unify fusion weights** (`signal_fusion.py:34 WEIGHTS` vs `unified_brain` inline) → one source in `valedia_config`. (Or Burton may prioritize B1 backlog #1/#2 first — both are live-money HIGHs.)
 
 ## Log
-- 2026-09-13: Clarified Desktop /mcp vs handoff; seeded Claude→Ruflo handoff for profit-via-better-system.
-- 2026-09-13: **Handoff filled from live session** — A–E concrete + evidence-bound; the original record_entry milestone is DONE (master_allocator:473, verified via trace_path); re-pointed first sprint at verify → sports_engine hardening. Fence intact: Ruflo codes/audits, no live trading.
+- 2026-09-13: Sprint D. Audit-verify HOLDS (trace_path + live crontab proof). B1 sports_engine hardening shipped to worktree with tester+reviewer swarm; drift 7 PASS. Review found gate currently inert (ftl live-SPORTS data starved) + 3 backlog HIGH/MED items. **STOP for Burton/Claude review before merge or B2.** Fence intact: no --live, no orders, no keys; changes isolated to worktree.

@@ -36,6 +36,7 @@ def _load_env():
                     os.environ.setdefault(k.strip(), v.strip())
 _load_env()
 from kalshi_auth import get, create_order, get_balance
+import forward_test_ledger as ftl  # the ONE fee-inclusive ledger (record_entry + category gate)
 
 # ═══ CONFIGURATION — THE ONLY KNOBS ═══
 MIN_PRICE = 0.70  # Minimum favorite price (below = too risky)
@@ -43,6 +44,7 @@ MAX_PRICE = 0.85  # Maximum favorite price (above = no edge over market)
 BET_PCT = 0.06    # 6% of bankroll per game (Half-Kelly)
 MAX_GAMES = 12    # Max games per cycle (diversification)
 SERIES = ['KXNBAGAME', 'KXNHLGAME', 'KXNCAAMBGAME']  # MLB KILLED: 4W/3L -$24.94
+CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
 
 # ═══ INTELLIGENCE SOURCES ═══
 # These were all sitting idle. Now they boost every bet.
@@ -243,14 +245,16 @@ def size_bets(games, bankroll):
         bet_size = bankroll * pct
         n_contracts = max(1, int(bet_size / g['fav_price']))
         cost = n_contracts * g['fav_price']
-        profit_if_win = n_contracts * (1.0 - g['fav_price'])
-        
+        fee = ftl.kalshi_fee(g['fav_price'], n_contracts)  # canonical Kalshi fee (single source)
+        profit_if_win = n_contracts * (1.0 - g['fav_price']) - fee  # fee-true net
+
         bets.append({
             **g,
             'contracts': n_contracts,
             'cost': round(cost, 2),
+            'fee': round(fee, 2),
             'profit_if_win': round(profit_if_win, 2),
-            'roi_pct': round((1.0 - g['fav_price']) / g['fav_price'] * 100, 1),
+            'roi_pct': round(profit_if_win / cost * 100, 1) if cost else 0.0,
             'bet_pct': round(pct * 100, 1),
         })
     return bets
@@ -284,6 +288,12 @@ def execute_bets(bets, dry_run=False):
             price_cents = int(b['fav_price'] * 100)
             create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents)
             r['status'] = 'EXECUTED'
+            # Record the real fill in the ONE fee-inclusive ledger (settled later by reconcile).
+            try:
+                ftl.record_entry(CATEGORY, b['fav_ticker'], 'yes', b['fav_price'],
+                                 b['contracts'], venue="kalshi", source="live")
+            except Exception as e:
+                print(f"[sports_engine] ftl.record_entry failed: {e}", file=sys.stderr)
         except Exception as e:
             r['status'] = 'FAILED'
             r['error'] = str(e)[:80]
@@ -309,6 +319,7 @@ def check_settlements():
     
     for bet in log["bets"]:
         if bet.get("settled"): continue
+        if bet.get("status") == "DRY_RUN": continue  # never settle a dry-run as real
         ticker = bet.get("fav_ticker", "")
         if not ticker: continue
         
@@ -323,7 +334,7 @@ def check_settlements():
                 bet["settled"] = True
                 bet["result"] = result
                 bet["won"] = won
-                bet["pnl"] = bet["profit_if_win"] if won else -bet["cost"]
+                bet["pnl"] = bet["profit_if_win"] if won else -(bet["cost"] + bet.get("fee", 0.0))
                 new_settlements.append(bet)
         except: pass
     
@@ -431,6 +442,17 @@ def run(dry_run=False):
     lines.append(f"\nTOTAL: ${total_cost:.2f} deployed, ${total_potential:.2f} potential profit")
     lines.append(f"BET SIZE: {optimal_pct*100:.1f}% of bankroll (Kelly-adjusted)")
     
+    # Loss-based category gate (real fee-inclusive ledger; fail-open, never permanent).
+    try:
+        gate_ok, gate_why = ftl.should_trade_category(CATEGORY)
+    except Exception:
+        gate_ok, gate_why = True, ""
+    if not gate_ok:
+        lines.append(f"\n⛔ CATEGORY GATE: {CATEGORY} blocked — {gate_why}")
+        report = "\n".join(lines)
+        print(report)
+        return report
+
     # Execute
     results = execute_bets(bets, dry_run=dry_run)
     executed = [r for r in results if r['status'] == 'EXECUTED']
@@ -445,11 +467,12 @@ def run(dry_run=False):
     # Log bets
     log = load_log()
     for r in results:
-        if r['status'] in ('EXECUTED', 'DRY_RUN'):
+        if r['status'] == 'EXECUTED':  # never persist a DRY_RUN as a real bet
             log["bets"].append({
                 "fav_ticker": r["fav_ticker"], "fav_title": r["fav_title"],
                 "fav_price": r["fav_price"], "contracts": r["contracts"],
-                "cost": r["cost"], "profit_if_win": r["profit_if_win"],
+                "cost": r["cost"], "fee": r.get("fee", 0.0),
+                "profit_if_win": r["profit_if_win"],
                 "league": r["league"], "exp": r["exp"],
                 "ts": r["ts"], "status": r["status"],
                 "settled": False,
