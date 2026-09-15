@@ -112,3 +112,51 @@ def dynamic_per_trade_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor
 #                         | weather_arb.py = 0.02 | quant_engine.py = 0.007 | unified_brain.py = 0.005
 #                         | forward_test_ledger.py = nonlinear published formula.
 # Signal-fusion weights:  signal_fusion.WEIGHTS  vs  unified_brain.py inline scheme (two brains).
+
+# ── Nautilus sidecar seam (Phase 0) — exclusive writer lock ──────────────
+# Default deny. Coding agents never flip these. Valedia runtime is the only
+# process allowed to enable NT dispatch / live fills. Dual-write is -EV.
+class ExclusiveWriterError(ValueError):
+    """Raised when a claimant is not the exclusive live writer for a venue."""
+
+
+NAUTILUS_ENABLED = False  # sidecar dispatch off until Valedia runtime enables
+NAUTILUS_LIVE = False     # live ledger source via NT sink; default deny
+
+VENUE_WRITER = {
+    "kalshi": "valedia",
+    "coinbase": "valedia",
+    "alpaca": "valedia",
+    "kraken": "none",
+    "polymarket": "none",
+    "hyperliquid": "none",
+}
+
+
+def venue_writer(venue):
+    """Exclusive live writer for a venue: valedia | nautilus | none."""
+    return VENUE_WRITER.get(str(venue or "").strip().lower(), "none")
+
+
+def assert_exclusive_writer(venue, claimant):
+    """Lock hook: claimant may be the live writer only if it owns the venue."""
+    owner = venue_writer(venue)
+    want = str(claimant or "").strip().lower()
+    if owner != want:
+        raise ExclusiveWriterError(
+            f"venue {venue!r} writer is {owner!r}, not {want!r}"
+        )
+    return owner
+
+
+def nautilus_may_dispatch(venue):
+    return bool(NAUTILUS_ENABLED) and venue_writer(venue) == "nautilus"
+
+
+def nautilus_live_fills_allowed(venue=None):
+    """Default deny. source=live requires explicit Valedia NT flags + writer lock."""
+    if not NAUTILUS_ENABLED or not NAUTILUS_LIVE:
+        return False
+    if venue is not None and venue_writer(venue) != "nautilus":
+        return False
+    return True

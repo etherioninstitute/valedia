@@ -34,6 +34,12 @@ def kalshi_fee(price, contracts):
     return math.ceil(raw * 100.0) / 100.0
 
 
+def _is_non_real_source(source):
+    """Paper/sandbox rows never count as edge. 'sandbox' also matches nautilus_sandbox."""
+    s = str(source or "").lower()
+    return "paper" in s or "sandbox" in s
+
+
 def _append(rec):
     rec.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
     with open(LEDGER, "a") as f:
@@ -69,7 +75,7 @@ def open_position_count():
     try:
         done = _settled_ids()
         return sum(1 for e in _read() if e.get("type") == "entry" and e["id"] not in done
-                   and "paper" not in str(e.get("source", "")).lower())
+                   and not _is_non_real_source(e.get("source", "")))
     except Exception:
         return 0
 
@@ -221,10 +227,19 @@ def real_track_record():
     """Aggregate REAL (non-paper) settled edge — the single source both the Kelly cap
     (valedia_config._track_record_mult) and the confidence multiplier (unified_brain
     .get_confidence_multiplier) read, so sizing breathes on real fee-inclusive outcomes
-    instead of paper marks. Paper trades (source contains 'paper') are excluded.
+    instead of paper marks. Paper/sandbox trades (source contains 'paper' or
+    'sandbox', including nautilus_sandbox) are excluded.
     Returns {"n", "wins", "hit_rate", "recent_20", "net"}; empty -> neutral 50/50."""
-    setts = [r for r in _read() if r.get("type") == "settlement"
-             and "paper" not in str(r.get("source", "")).lower()]
+    recs = _read()
+    entries = {r["id"]: r for r in recs if r.get("type") == "entry"}
+    setts = []
+    for r in recs:
+        if r.get("type") != "settlement":
+            continue
+        src = r.get("source") or entries.get(r.get("entry_id"), {}).get("source", "")
+        if _is_non_real_source(src):
+            continue
+        setts.append(r)
     n = len(setts)
     if not n:
         return {"n": 0, "wins": 0, "hit_rate": 50.0, "recent_20": 50.0, "net": 0.0}
@@ -250,7 +265,7 @@ def _overrides():
 def category_stats(lookback_days=None):
     """Per-category REAL settled stats within a recency window. Counts ONLY type=='settlement'
     records with a real result — never failed/errored/pending trades (those have no settlement)
-    — and excludes paper. Recency is by the TRADE's time (entry ts), so stale real losses age
+    — and excludes paper/sandbox. Recency is by the TRADE's time (entry ts), so stale real losses age
     out of the window and a block can never be permanent. Returns {cat:{"n","wins","net"}}."""
     from datetime import datetime, timezone, timedelta
     try:
@@ -260,12 +275,16 @@ def category_stats(lookback_days=None):
         days = lookback_days or 45
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     recs = _read()
-    entry_ts = {r["id"]: r.get("ts", "") for r in recs if r.get("type") == "entry"}
+    entries = {r["id"]: r for r in recs if r.get("type") == "entry"}
     out = {}
     for r in recs:
-        if r.get("type") != "settlement" or "paper" in str(r.get("source", "")).lower():
+        if r.get("type") != "settlement":
             continue
-        when = entry_ts.get(r.get("entry_id", ""), "") or r.get("logged_at", "")
+        entry = entries.get(r.get("entry_id"), {})
+        src = r.get("source") or entry.get("source", "")
+        if _is_non_real_source(src):
+            continue
+        when = entry.get("ts", "") or r.get("logged_at", "")
         if when and when < cutoff:
             continue  # aged out — self-healing, never permanent
         d = out.setdefault(r.get("strategy", "?"), {"n": 0, "wins": 0, "net": 0.0})
