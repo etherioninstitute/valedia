@@ -509,6 +509,38 @@ def get_coinbase():
         return None
 
 
+def _spot_source(plat, alpaca_live=False):
+    if plat == "coinbase":
+        return "live"
+    return "live" if alpaca_live else "paper"
+
+
+def ledger_spot_buy(plat, ticker, resp, alpaca_live=False):
+    """Book a Coinbase/Alpaca buy: fee-true live fill, or UNRECONCILED. Never silent."""
+    if not _ftl:
+        return None
+    try:
+        strategy = "CRYPTO_MOMENTUM" if plat == "coinbase" else "EQUITY_MOMENTUM"
+        return _ftl.book_spot_fill(
+            strategy, ticker, "buy", plat, resp or {},
+            intended_source=_spot_source(plat, alpaca_live))
+    except Exception:
+        return None
+
+
+def ledger_spot_sell(plat, ticker, resp, alpaca_live=False, fallback_price=None, fee=None):
+    """Settle a Coinbase/Alpaca sell. Incomplete fill cannot book live P&L."""
+    if not _ftl:
+        return None
+    try:
+        return _ftl.settle_spot_fill(
+            ticker, plat, resp or {},
+            intended_source=_spot_source(plat, alpaca_live),
+            fallback_price=fallback_price, fee=fee)
+    except Exception:
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # MASTER ORCHESTRATOR — run_brain()
 # ══════════════════════════════════════════════════════════════════════
@@ -770,32 +802,33 @@ def run_brain():
                     not has_pos and actionable):
 
                 executed = False
+                buy_resp = None
                 if plat == "coinbase" and cb and cb_cash >= position:
                     try:
-                        cb_buy(ticker, position)
-                        spent_cb += position; executed = True
+                        buy_resp = cb_buy(ticker, position)
+                        if _ftl and not _ftl.spot_ack_ok("coinbase", buy_resp):
+                            lines.append(f"  {name:6s} BUY FAILED: {buy_resp}")
+                        else:
+                            spent_cb += position; executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} BUY FAILED: {e}")
 
                 elif plat == "alpaca" and alpaca:
                     try:
-                        alp_buy(ticker, notional=position)
-                        spent_alp += position; executed = True
+                        buy_resp = alp_buy(ticker, notional=position)
+                        if _ftl and not _ftl.spot_ack_ok("alpaca", buy_resp):
+                            lines.append(f"  {name:6s} BUY FAILED: {buy_resp}")
+                        else:
+                            spent_alp += position; executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} BUY FAILED: {e}")
 
                 if executed:
                     log_trade(ticker, "BUY", fused, cur_price, position,
                               booster_str, plat)
-                    # Real fill -> fee-inclusive ledger (coinbase=live money, alpaca=paper).
-                    if _ftl and cur_price > 0:
-                        try:
-                            _ftl.record_entry(
-                                "CRYPTO_MOMENTUM" if plat == "coinbase" else "EQUITY_MOMENTUM",
-                                ticker, "buy", cur_price, position / cur_price, venue=plat,
-                                source="live" if plat == "coinbase" else "paper")
-                        except Exception:
-                            pass
+                    # Fill details → fee-true live row; POST-only → UNRECONCILED (never silent).
+                    alp_live = bool(alpaca[4]) if alpaca else False
+                    ledger_spot_buy(plat, ticker, buy_resp, alpaca_live=alp_live)
                     if MEMORY_AVAILABLE:
                         try:
                             capture_trade(ticker, "BUY", fused, cur_price, position)
@@ -811,34 +844,40 @@ def run_brain():
             # SELL signal (exit existing position)
             elif fused < sell_thresh and has_pos:
                 executed = False
+                sell_resp = None
+                bal = 0.0
                 if plat == "coinbase" and cb:
                     try:
                         base = ticker.replace("-USD","")
                         bal  = float(cb_bal.get(base, {}).get("balance", 0))
                         if bal > 0.0001:
-                            cb_sell(ticker, bal); executed = True
+                            sell_resp = cb_sell(ticker, bal)
+                            if _ftl and not _ftl.spot_ack_ok("coinbase", sell_resp):
+                                lines.append(f"  {name:6s} SELL FAILED: {sell_resp}")
+                            else:
+                                executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} SELL FAILED: {e}")
                 elif plat == "alpaca" and alpaca:
                     try:
-                        alp_sell(ticker); executed = True
+                        sell_resp = alp_sell(ticker)
+                        if _ftl and not _ftl.spot_ack_ok("alpaca", sell_resp):
+                            lines.append(f"  {name:6s} SELL FAILED: {sell_resp}")
+                        else:
+                            executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} SELL FAILED: {e}")
 
                 if executed:
                     log_trade(ticker, "SELL", fused, cur_price, 0,
                               booster_str, plat)
-                    # Settle the round-trip in the fee-inclusive ledger.
-                    if _ftl and cur_price > 0:
-                        try:
-                            if plat == "coinbase":
-                                notional = float(bal) * cur_price
-                                fee = 2 * FEES.get("coinbase", 0.0) * notional  # ponytail: 2-leg taker approx
-                                _ftl.settle_open(ticker, "coinbase", cur_price, fee=fee, source="live")
-                            else:
-                                _ftl.settle_open(ticker, "alpaca", cur_price, source="paper")
-                        except Exception:
-                            pass
+                    alp_live = bool(alpaca[4]) if alpaca else False
+                    sell_fee = None
+                    if plat == "coinbase" and bal and cur_price:
+                        sell_fee = FEES.get("coinbase", 0.0) * float(bal) * cur_price
+                    ledger_spot_sell(plat, ticker, sell_resp, alpaca_live=alp_live,
+                                     fallback_price=cur_price if cur_price > 0 else None,
+                                     fee=sell_fee)
                     actions.append(f"SELL {ticker}")
                     lines.append(
                         f"  >> SELL {name:6s} fused={fused:.0f} "
@@ -894,10 +933,21 @@ def run_brain():
         for s in scalper.get_scalp_candidates(wp):
             if s["signal"] == "SCALP_LONG" and cash >= 2 and alpaca:
                 amt = min(cash * 0.03, 2)
-                _, alp_buy_fn, _, _, _ = alpaca
-                alp_buy_fn(s["ticker"], notional=amt)
-                actions.append(f"SCALP BUY ${amt:.2f} {s['ticker']}")
-                lines.append(f"  >> SCALP BUY ${amt:.2f} {s['ticker']} z={s['z']}")
+                _, alp_buy_fn, _, _, alp_live = alpaca
+                scalp_resp = alp_buy_fn(s["ticker"], notional=amt)
+                if _ftl and not _ftl.spot_ack_ok("alpaca", scalp_resp):
+                    lines.append(f"  SCALP BUY FAILED {s['ticker']}: {scalp_resp}")
+                else:
+                    if _ftl:
+                        try:
+                            _ftl.book_spot_fill(
+                                "EQUITY_SCALP", s["ticker"], "buy", "alpaca",
+                                scalp_resp or {},
+                                intended_source="live" if alp_live else "paper")
+                        except Exception:
+                            pass
+                    actions.append(f"SCALP BUY ${amt:.2f} {s['ticker']}")
+                    lines.append(f"  >> SCALP BUY ${amt:.2f} {s['ticker']} z={s['z']}")
     except Exception as e:
         lines.append(f"  Scalp: {str(e)[:50]}")
 

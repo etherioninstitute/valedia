@@ -54,30 +54,154 @@ def _read():
     return [json.loads(l) for l in open(LEDGER) if l.strip()]
 
 
+def _spot_fee(venue, price, contracts):
+    """Coinbase/Alpaca entry fee from fee_engine STATIC_FEES (no network). Kalshi uses kalshi_fee."""
+    notional = abs(float(price or 0) * float(contracts or 0))
+    if notional <= 0:
+        return 0.0
+    v = str(venue or "").lower()
+    try:
+        from fee_engine import STATIC_FEES
+        if "coinbase" in v:
+            f = STATIC_FEES["coinbase"]
+            return round(notional * (float(f.get("taker", 0.006)) + float(f.get("spread", 0))), 6)
+        if "alpaca" in v:
+            return float(STATIC_FEES["alpaca"].get("commission_stocks", 0) or 0)
+    except Exception:
+        if "coinbase" in v:
+            return round(notional * 0.006, 6)
+    return 0.0
+
+
+def _first_float(blob, keys, allow_zero=False):
+    for k in keys:
+        if blob.get(k) in (None, "", "?"):
+            continue
+        try:
+            val = float(blob[k])
+        except (TypeError, ValueError):
+            continue
+        if val > 0 or (allow_zero and val >= 0):
+            return val
+    return None
+
+
+def extract_spot_fill(venue, raw):
+    """Parse a Coinbase/Alpaca order body into fill fields. Quote/notional is NOT a fill."""
+    raw = raw if isinstance(raw, dict) else {}
+    sr = raw.get("success_response")
+    blob = {**raw, **sr} if isinstance(sr, dict) else dict(raw)
+    qty = _first_float(blob, ("filled_size", "filled_qty", "filled_contracts"))
+    price = _first_float(blob, ("average_filled_price", "filled_avg_price", "avg_fill_price"))
+    fee = _first_float(blob, ("total_fees", "commission", "filled_fees"), allow_zero=True)
+    if (qty is None or price is None) and (
+            blob.get("fill_status") == "FILLED" or blob.get("filled") is True):
+        if qty is None:
+            qty = _first_float(blob, ("qty", "contracts"))
+        if price is None:
+            price = _first_float(blob, ("price", "entry_price"))
+    return {
+        "complete": bool(price and price > 0 and qty and qty > 0),
+        "price": price or 0.0, "qty": qty or 0.0, "fee": fee,
+        "order_id": blob.get("order_id") or blob.get("id"),
+    }
+
+
+def spot_ack_ok(venue, resp):
+    """True if the venue accepted the order. False = do not mark EXECUTED."""
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("success") is False or resp.get("error"):
+        return False
+    st = str(resp.get("status") or "").lower()
+    if st in ("rejected", "canceled", "cancelled", "expired"):
+        return False
+    v = str(venue or "").lower()
+    if "alpaca" in v and not (resp.get("id") or resp.get("order_id")):
+        if resp.get("message") or resp.get("code"):
+            return False
+    return True
+
+
+def book_spot_fill(strategy, ticker, side, venue, raw, intended_source="live", ts=None,
+                   predicted_direction=None, predicted_prob=None):
+    """Fee-true record_entry when fill qty+price exist; else UNRECONCILED (never silent live).
+
+    paper/sandbox/unreconciled intended_source is never upgraded to live.
+    """
+    fill = extract_spot_fill(venue, raw)
+    src_in = str(intended_source or "live")
+    if not fill["complete"]:
+        return record_unreconciled(
+            strategy, ticker, side, fill["price"], fill["qty"], venue,
+            predicted_direction=predicted_direction, predicted_prob=predicted_prob,
+            ts=ts, order_id=fill.get("order_id"),
+        )
+    fee = fill["fee"] if fill["fee"] is not None else _spot_fee(venue, fill["price"], fill["qty"])
+    source = src_in if _is_non_real_source(src_in) else "live"
+    return record_entry(
+        strategy, ticker, side, fill["price"], fill["qty"], venue=venue,
+        predicted_direction=predicted_direction, predicted_prob=predicted_prob,
+        source=source, ts=ts, fill_status="FILLED", entry_fee=fee,
+        order_id=fill.get("order_id"),
+    )
+
+
+def settle_spot_fill(ticker, venue, raw, intended_source="live", fallback_price=None, fee=None):
+    """Settle a spot round-trip. Incomplete fill cannot book live P&L (unreconciled or no-op)."""
+    fill = extract_spot_fill(venue, raw)
+    if fill["complete"]:
+        price = fill["price"]
+        if fee is None:
+            fee = fill["fee"] if fill["fee"] is not None else _spot_fee(venue, fill["price"], fill["qty"])
+        src = intended_source
+    else:
+        if fallback_price is None or float(fallback_price) <= 0:
+            return None
+        price = float(fallback_price)
+        fee = 0.0
+        src = "unreconciled"
+    if _is_non_real_source(intended_source):
+        src = intended_source
+    return settle_open(ticker, venue, price, fee=fee, source=src)
+
+
 # ── record an entry (called by executors at order time) ─────────────────────
 def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
                  predicted_direction=None, predicted_prob=None, source="live", ts=None,
-                 fill_status=None):
+                 fill_status=None, entry_fee=None, order_id=None):
     eid = "ft_" + uuid.uuid4().hex[:12]
+    v = str(venue or "")
+    if entry_fee is None:
+        if v.startswith("kalshi"):
+            fee = kalshi_fee(price, contracts)
+        else:
+            fee = _spot_fee(v, price, contracts)
+    else:
+        fee = float(entry_fee)
     rec = {"type": "entry", "id": eid, "ts": ts or datetime.now(timezone.utc).isoformat(),
            "strategy": strategy, "venue": venue, "ticker": ticker, "side": side,
            "entry_price": round(float(price), 4), "contracts": float(contracts),
-           "entry_fee": kalshi_fee(price, contracts) if venue.startswith("kalshi") else 0.0,
+           "entry_fee": fee,
            "predicted_direction": predicted_direction, "predicted_prob": predicted_prob,
            "source": source}
     if fill_status:
         rec["fill_status"] = fill_status
+    if order_id:
+        rec["order_id"] = order_id
     _append(rec)
     return eid
 
 
 def record_unreconciled(strategy, ticker, side, price, contracts, venue,
-                        predicted_direction=None, predicted_prob=None, ts=None):
+                        predicted_direction=None, predicted_prob=None, ts=None,
+                        order_id=None):
     """Coinbase/Alpaca POST with no venue fill yet. Excluded from Kelly/real_track_record."""
     return record_entry(
         strategy, ticker, side, price, contracts, venue=venue,
         predicted_direction=predicted_direction, predicted_prob=predicted_prob,
         source="unreconciled", ts=ts, fill_status="UNRECONCILED",
+        entry_fee=0.0, order_id=order_id,
     )
 
 
@@ -227,6 +351,8 @@ def settle_open(ticker, venue, exit_price, fee=0.0, source="live"):
     if not opens:
         return None
     e = opens[-1]
+    if _is_non_real_source(e.get("source")):
+        source = e["source"]  # never let a live settlement launder paper/sandbox/unreconciled
     c = float(e.get("contracts", 0) or 0)
     realized = round((float(exit_price) - float(e["entry_price"])) * c
                      - float(e.get("entry_fee", 0) or 0) - float(fee or 0), 4)
@@ -244,7 +370,8 @@ def real_track_record():
     (valedia_config._track_record_mult) and the confidence multiplier (unified_brain
     .get_confidence_multiplier) read, so sizing breathes on real fee-inclusive outcomes
     instead of paper marks. Paper/sandbox/unreconciled trades (source contains
-    'paper', 'sandbox' including nautilus_sandbox, or 'unreconciled') are excluded.
+    'paper', 'sandbox' including nautilus_sandbox, or 'unreconciled') are excluded
+    if the settlement OR its entry is non-real (no live-source laundering).
     Returns {"n", "wins", "hit_rate", "recent_20", "net"}; empty -> neutral 50/50."""
     recs = _read()
     entries = {r["id"]: r for r in recs if r.get("type") == "entry"}
@@ -252,8 +379,8 @@ def real_track_record():
     for r in recs:
         if r.get("type") != "settlement":
             continue
-        src = r.get("source") or entries.get(r.get("entry_id"), {}).get("source", "")
-        if _is_non_real_source(src):
+        entry = entries.get(r.get("entry_id"), {})
+        if _is_non_real_source(r.get("source")) or _is_non_real_source(entry.get("source")):
             continue
         setts.append(r)
     n = len(setts)
@@ -297,8 +424,7 @@ def category_stats(lookback_days=None):
         if r.get("type") != "settlement":
             continue
         entry = entries.get(r.get("entry_id"), {})
-        src = r.get("source") or entry.get("source", "")
-        if _is_non_real_source(src):
+        if _is_non_real_source(r.get("source")) or _is_non_real_source(entry.get("source")):
             continue
         when = entry.get("ts", "") or r.get("logged_at", "")
         if when and when < cutoff:

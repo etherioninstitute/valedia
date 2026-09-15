@@ -488,13 +488,14 @@ def execute_allocations(allocations, dry_run=False):
                 try:
                     from coinbase_trader import place_market_order
                     ticker = a["ticker"].replace("-USD", "")
-                    place_market_order(ticker, a["side"], a["allocation"])
+                    cb_resp = place_market_order(ticker, a["side"], a["allocation"])
                     r["status"] = "EXECUTED"
                     if _ftl:
                         try:
-                            _ftl.record_unreconciled(
+                            _ftl.book_spot_fill(
                                 a.get("type", "CRYPTO"), a["ticker"], a["side"],
-                                float(a.get("price") or 0), 0.0, venue="coinbase")
+                                "coinbase", cb_resp if isinstance(cb_resp, dict) else {},
+                                intended_source="live")
                         except Exception:
                             pass
                 except Exception as e:
@@ -505,13 +506,14 @@ def execute_allocations(allocations, dry_run=False):
                 # Stock trades via Alpaca (existing Valedia writer)
                 try:
                     from alpaca_executor import place_order
-                    place_order(a["ticker"], a["side"], notional=a["allocation"])
+                    alp_resp = place_order(a["ticker"], a["side"], notional=a["allocation"])
                     r["status"] = "EXECUTED"
                     if _ftl:
                         try:
-                            _ftl.record_unreconciled(
+                            _ftl.book_spot_fill(
                                 a.get("type", "EQUITY"), a["ticker"], a["side"],
-                                float(a.get("price") or 0), 0.0, venue="alpaca")
+                                "alpaca", alp_resp if isinstance(alp_resp, dict) else {},
+                                intended_source="live")
                         except Exception:
                             pass
                 except Exception as e:

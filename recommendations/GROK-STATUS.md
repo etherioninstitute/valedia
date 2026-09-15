@@ -1,34 +1,22 @@
 # Grok Build status
 
-**Updated:** 2026-09-15 01:18 PT
+**Updated:** 2026-09-15 01:35 PT
 
-**Mode:** RuFlo MCP required (`:8810` filtered). Unfiltered claude-flow disabled.
+**Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** Slice 2 SHIPPED — Coinbase shadow Intents (writer stays `valedia`)
+**Current:** SHIPPED — Slice 3: Coinbase/Alpaca ledger truth
 
-**Last done:** Slice 2 — allocator Coinbase emits never-dispatchable shadow Intents + POST-body diff; UNRECONCILED ledger hook; tests PASS. Slice 1 remains `e385c59`.
+**Last done:** Slice 3 on `valedia-v2-grok-build`
 
-**Goal:** Maximum profit under gates. Shadow-compare allocator Coinbase path vs Intent shape — **do not dispatch**, do not cut over writer, do not install NT.
+- Real Coinbase/Alpaca fills → `book_spot_fill` → fee-true `record_entry` (`entry_fee` from fee_engine STATIC_FEES; size/venue/source from the fill).
+- POST-ack without filled qty+price → `UNRECONCILED` (never silent live). Quote/notional is not a fill.
+- `real_track_record` / category stats exclude if **entry or settlement** is paper/sandbox/unreconciled (no live-source laundering).
+- Alpaca `IS_LIVE` books `source=live`, not paper. Paper/sandbox still cannot lift Kelly.
+- Dead allocator `place_market_order` / `place_order` still absent (no new live writer). `VENUE_WRITER` unchanged (not nautilus).
+- Tests: `test_spot_fill_ledger.py` PASS (no network). Slice 1–2 tests still PASS.
 
-**Shipped (Slice 2):**
-- `nautilus_shadow_coinbase.py` — `emit_allocator_shadow()` from allocator Coinbase branch; `dispatch=False`; `live_flag=False`; `ledger_source=shadow`; JSONL `shadow=true`
-- Even if `NAUTILUS_ENABLED` + `VENUE_WRITER[coinbase]=nautilus`, shadow enqueue is `status=held`, `dispatchable=false`
-- `compare_intent_to_post()` vs `coinbase_order_body.build_market_order_body` (same POST `coinbase_trader` would send)
-- `master_allocator` Coinbase branch: shadow first, existing Valedia writer unchanged
-- `record_unreconciled()` for Coinbase/Alpaca **after EXECUTED** — excluded from Kelly / `real_track_record`
-- Tests: `test_nautilus_intent.py` PASS; `test_nautilus_shadow_coinbase.py` PASS
-- Fence held: no `--live`, no venue POST from this slice, no NT wheel, `VENUE_WRITER[coinbase]=valedia`
+**Goal:** Maximum profit — real fills feed Kelly; no fake sandbox lift.
 
-**Findings (pre-cutover mismatches — do not “fix” by adding a live `place_market_order`):**
-- Allocator calls `place_market_order` — **not on** `coinbase_trader` (`market_buy` / `market_sell` only). Coinbase allocator branch is currently dead (ImportError), not a second live writer.
-- Allocator strips `-USD` (`BTC-USD` → `BTC`); trader POST needs `product_id=BTC-USD`
-- Allocator always passes USD `allocation`; sells need `base_size` (qty), not quote notional
-- Working Coinbase writer today is `unified_brain` (`market_buy` / `market_sell`), not the allocator
+**Fence:** No --live, no new orders, no key changes. VENUE_WRITER not cut over.
 
-**Next (still no NT install, no writer cutover):**
-- Shadow the **working** Coinbase path (`unified_brain` buy/sell) the same way — that is the live writer to compare before Phase 2
-- Do **not** add `place_market_order` / do **not** unstick allocator POSTs from this lane
-- Do **not** flip `VENUE_WRITER[coinbase]`
-- Parallel Valedia P&L (not NT): sports B1 ledger-truth remains higher immediate compounding than NT Phase 1 sandbox
-
-**Blockers:** none
+**Next:** GET-reconcile UNRECONCILED Coinbase/Alpaca `order_id`s into fee-true fills (Valedia runtime I/O; coding slice can stub). Then rebalancer Intents. Still no NT live writer.

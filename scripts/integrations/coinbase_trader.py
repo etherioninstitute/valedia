@@ -52,15 +52,28 @@ def get_price(pair="BTC-USD"):
     r = _request("GET", f"/api/v3/brokerage/products/{pair}")
     return float(r.json()["price"]) if r.ok else 0
 
+def _fill_fields(d):
+    """Pass through venue fill fields if the POST body has them. Quote size is not a fill."""
+    sr = d.get("success_response") if isinstance(d.get("success_response"), dict) else {}
+    out = {}
+    for k in ("filled_size", "average_filled_price", "total_fees", "completion_percentage"):
+        if k in sr:
+            out[k] = sr[k]
+        elif k in d:
+            out[k] = d[k]
+    return out
+
 def market_buy(pair, usd_amount):
-    """Market buy $usd_amount worth of crypto. Returns order result."""
+    """Market buy $usd_amount worth of crypto. Returns order result (fill fields if present)."""
     body = build_market_order_body(pair, "BUY", usd_amount=usd_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
         d = r.json()
         success = d.get("success", False)
         oid = d.get("success_response", {}).get("order_id", "?")
-        return {"success": success, "order_id": oid, "pair": pair, "usd": usd_amount}
+        rec = {"success": success, "order_id": oid, "pair": pair, "usd": usd_amount}
+        rec.update(_fill_fields(d))
+        return rec
     return {"success": False, "error": r.text[:300]}
 
 def market_sell(pair, crypto_amount):
@@ -71,7 +84,9 @@ def market_sell(pair, crypto_amount):
         d = r.json()
         success = d.get("success", False)
         oid = d.get("success_response", {}).get("order_id", "?")
-        return {"success": success, "order_id": oid, "pair": pair, "qty": crypto_amount}
+        rec = {"success": success, "order_id": oid, "pair": pair, "qty": crypto_amount}
+        rec.update(_fill_fields(d))
+        return rec
     return {"success": False, "error": r.text[:300]}
 
 def get_orders(status="OPEN"):
