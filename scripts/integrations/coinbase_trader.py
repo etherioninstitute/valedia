@@ -4,6 +4,7 @@ Executes market buys/sells on Coinbase using v3 brokerage API.
 """
 import json, jwt, time, secrets, requests, os
 import platform
+from coinbase_order_body import build_market_order_body
 
 # Route through VPS SOCKS proxy on Mac (IP-locked API)
 _USE_PROXY = platform.system() == "Darwin"
@@ -53,12 +54,7 @@ def get_price(pair="BTC-USD"):
 
 def market_buy(pair, usd_amount):
     """Market buy $usd_amount worth of crypto. Returns order result."""
-    body = {
-        "client_order_id": secrets.token_hex(16),
-        "product_id": pair,
-        "side": "BUY",
-        "order_configuration": {"market_market_ioc": {"quote_size": f"{usd_amount:.2f}"}}
-    }
+    body = build_market_order_body(pair, "BUY", usd_amount=usd_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
         d = r.json()
@@ -69,12 +65,7 @@ def market_buy(pair, usd_amount):
 
 def market_sell(pair, crypto_amount):
     """Market sell crypto_amount of base currency."""
-    body = {
-        "client_order_id": secrets.token_hex(16),
-        "product_id": pair,
-        "side": "SELL",
-        "order_configuration": {"market_market_ioc": {"base_size": f"{crypto_amount}"}}
-    }
+    body = build_market_order_body(pair, "SELL", crypto_amount=crypto_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
         d = r.json()

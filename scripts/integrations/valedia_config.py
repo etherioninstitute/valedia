@@ -122,6 +122,7 @@ class ExclusiveWriterError(ValueError):
 
 NAUTILUS_ENABLED = False  # sidecar dispatch off until Valedia runtime enables
 NAUTILUS_LIVE = False     # live ledger source via NT sink; default deny
+NAUTILUS_SHADOW_COINBASE = True  # allocator Coinbase branch emits never-dispatchable Intents
 
 VENUE_WRITER = {
     "kalshi": "valedia",

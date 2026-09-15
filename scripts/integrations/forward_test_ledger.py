@@ -35,9 +35,11 @@ def kalshi_fee(price, contracts):
 
 
 def _is_non_real_source(source):
-    """Paper/sandbox rows never count as edge. 'sandbox' also matches nautilus_sandbox."""
+    """Paper/sandbox/unreconciled rows never count as edge. 'sandbox' also
+    matches nautilus_sandbox. UNRECONCILED Coinbase/Alpaca POSTs are visible
+    in the ledger but must not lift Kelly until a real fill is booked."""
     s = str(source or "").lower()
-    return "paper" in s or "sandbox" in s
+    return "paper" in s or "sandbox" in s or "unreconciled" in s
 
 
 def _append(rec):
@@ -54,15 +56,29 @@ def _read():
 
 # ── record an entry (called by executors at order time) ─────────────────────
 def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
-                 predicted_direction=None, predicted_prob=None, source="live", ts=None):
+                 predicted_direction=None, predicted_prob=None, source="live", ts=None,
+                 fill_status=None):
     eid = "ft_" + uuid.uuid4().hex[:12]
-    _append({"type": "entry", "id": eid, "ts": ts or datetime.now(timezone.utc).isoformat(),
-             "strategy": strategy, "venue": venue, "ticker": ticker, "side": side,
-             "entry_price": round(float(price), 4), "contracts": float(contracts),
-             "entry_fee": kalshi_fee(price, contracts) if venue.startswith("kalshi") else 0.0,
-             "predicted_direction": predicted_direction, "predicted_prob": predicted_prob,
-             "source": source})
+    rec = {"type": "entry", "id": eid, "ts": ts or datetime.now(timezone.utc).isoformat(),
+           "strategy": strategy, "venue": venue, "ticker": ticker, "side": side,
+           "entry_price": round(float(price), 4), "contracts": float(contracts),
+           "entry_fee": kalshi_fee(price, contracts) if venue.startswith("kalshi") else 0.0,
+           "predicted_direction": predicted_direction, "predicted_prob": predicted_prob,
+           "source": source}
+    if fill_status:
+        rec["fill_status"] = fill_status
+    _append(rec)
     return eid
+
+
+def record_unreconciled(strategy, ticker, side, price, contracts, venue,
+                        predicted_direction=None, predicted_prob=None, ts=None):
+    """Coinbase/Alpaca POST with no venue fill yet. Excluded from Kelly/real_track_record."""
+    return record_entry(
+        strategy, ticker, side, price, contracts, venue=venue,
+        predicted_direction=predicted_direction, predicted_prob=predicted_prob,
+        source="unreconciled", ts=ts, fill_status="UNRECONCILED",
+    )
 
 
 def _settled_ids():
@@ -227,8 +243,8 @@ def real_track_record():
     """Aggregate REAL (non-paper) settled edge — the single source both the Kelly cap
     (valedia_config._track_record_mult) and the confidence multiplier (unified_brain
     .get_confidence_multiplier) read, so sizing breathes on real fee-inclusive outcomes
-    instead of paper marks. Paper/sandbox trades (source contains 'paper' or
-    'sandbox', including nautilus_sandbox) are excluded.
+    instead of paper marks. Paper/sandbox/unreconciled trades (source contains
+    'paper', 'sandbox' including nautilus_sandbox, or 'unreconciled') are excluded.
     Returns {"n", "wins", "hit_rate", "recent_20", "net"}; empty -> neutral 50/50."""
     recs = _read()
     entries = {r["id"]: r for r in recs if r.get("type") == "entry"}

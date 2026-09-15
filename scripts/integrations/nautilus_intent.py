@@ -210,18 +210,30 @@ def validate_intent(intent: Intent, dispatch: bool = False) -> IntentDecision:
     return IntentDecision(True, True, "dispatchable", "ok")
 
 
-def enqueue_intent(intent: Intent, dispatch: bool = False, queue_path: Optional[str] = None) -> dict:
+def enqueue_intent(intent: Intent, dispatch: bool = False, queue_path: Optional[str] = None,
+                   extra: Optional[dict] = None) -> dict:
     """Append-only JSONL. Ungated/disabled Intents may be logged as held/refused
-    but dispatchable is always False unless validate_intent says otherwise."""
+    but dispatchable is always False unless validate_intent says otherwise.
+    extra may add fields (shadow, compare) but cannot set dispatchable/status."""
     if not isinstance(intent, Intent):
         intent = intent_from_dict(intent)
+    extra = dict(extra or {})
+    if extra.get("shadow"):
+        dispatch = False  # shadow Intents are never a sidecar-send request
     decision = validate_intent(intent, dispatch=dispatch)
     rec = intent_to_dict(intent)
     rec["status"] = decision.status
-    rec["dispatchable"] = bool(decision.dispatchable and dispatch)
     rec["validate_reason"] = decision.reason
     rec["enqueued_at"] = datetime.now(timezone.utc).isoformat()
+    locked = {"dispatchable", "status", "dispatch_requested", "validate_reason"}
+    for k, v in extra.items():
+        if k not in locked:
+            rec[k] = v
     rec["dispatch_requested"] = bool(dispatch)
+    rec["dispatchable"] = bool(decision.dispatchable and dispatch)
+    if extra.get("shadow") and rec["status"] == "dispatchable":
+        rec["status"] = "held"
+        rec["validate_reason"] = "shadow — never dispatchable"
     path = queue_path or DEFAULT_QUEUE
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a") as f:

@@ -476,22 +476,44 @@ def execute_allocations(allocations, dry_run=False):
                             pass
             
             elif a["platform"] == "coinbase":
-                # Crypto trades via Coinbase
+                # Shadow Intent (Slice 2): never dispatchable; writer stays valedia.
+                try:
+                    from nautilus_shadow_coinbase import emit_allocator_shadow
+                    sh = emit_allocator_shadow(a)
+                    r["shadow_intent"] = sh.get("intent_id")
+                    r["shadow_dispatchable"] = bool(sh.get("dispatchable"))
+                except Exception as e:
+                    r["shadow_error"] = str(e)[:80]
+                # Crypto trades via Coinbase (existing Valedia writer — do not cut over)
                 try:
                     from coinbase_trader import place_market_order
                     ticker = a["ticker"].replace("-USD", "")
                     place_market_order(ticker, a["side"], a["allocation"])
                     r["status"] = "EXECUTED"
+                    if _ftl:
+                        try:
+                            _ftl.record_unreconciled(
+                                a.get("type", "CRYPTO"), a["ticker"], a["side"],
+                                float(a.get("price") or 0), 0.0, venue="coinbase")
+                        except Exception:
+                            pass
                 except Exception as e:
                     r["status"] = "FAILED"
                     r["error"] = str(e)[:80]
             
             elif a["platform"] == "alpaca":
-                # Stock trades via Alpaca
+                # Stock trades via Alpaca (existing Valedia writer)
                 try:
                     from alpaca_executor import place_order
                     place_order(a["ticker"], a["side"], notional=a["allocation"])
                     r["status"] = "EXECUTED"
+                    if _ftl:
+                        try:
+                            _ftl.record_unreconciled(
+                                a.get("type", "EQUITY"), a["ticker"], a["side"],
+                                float(a.get("price") or 0), 0.0, venue="alpaca")
+                        except Exception:
+                            pass
                 except Exception as e:
                     r["status"] = "FAILED"
                     r["error"] = str(e)[:80]
