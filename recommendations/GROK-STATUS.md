@@ -1,25 +1,26 @@
 # Grok Build status
 
-**Updated:** 2026-09-15 20:25 PT
+**Updated:** 2026-09-15 20:45 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 4: UNRECONCILED GET-reconcile + unified_brain Coinbase shadow
+**Current:** SHIPPED — Slice 5: reconcile_run injected getter + rebalancer shadow Intents
 
-**Last done:** Slice 4 on `valedia-v2-grok-build`
+**Last done:** Slice 5 on `valedia-v2-grok-build`
 
-- A) `spot_reconcile.py`: UNRECONCILED rows with `order_id` upgrade from a fill payload or mocked GET body to fee-true `record_entry` (buy) / `settle` (sell). Missing data stays UNRECONCILED. Never invents fills. No live HTTP (injected getter only). Paper/sandbox `intended_source` still cannot lift Kelly.
-- B) `unified_brain` Coinbase buy/sell emits never-dispatchable shadow Intents **before** `market_buy`/`market_sell`. Canonical POST matches `coinbase_trader` (buy `quote_size`, sell `base_size`). Writer stays `valedia`. `VENUE_WRITER` not cut over.
-- Tests: `test_spot_reconcile.py` + `test_nautilus_shadow_coinbase.py` PASS (no network). Slice 1–3 still PASS.
+- A) `reconcile_run.py`: cron walks UNRECONCILED ledger rows via `spot_reconcile` with an **injected** getter. Shipped default is `mock_spot_order_getter` (returns None, no HTTP). Hook: `set_spot_order_getter(fn)` for Valedia runtime to supply a real GET later. Tests pass `kalshi=False` so this lane never opens a venue socket. Paper/sandbox/unreconciled still cannot lift Kelly.
+- B) `rebalancer.py` proposed trades emit never-dispatchable shadow Intents (Slice 1 schema) via `emit_rebalancer_shadow`. Buy `quote_size` / sell `base_size` POST compare matches `coinbase_trader`. `market_buy`/`market_sell` are not imported and not called. Writer stays `valedia`. `VENUE_WRITER` not cut over.
+- Tests: `test_reconcile_run.py` + `test_rebalancer_shadow.py` PASS (no network). Slice 1–4 still PASS.
 
 **Shipped:**
 - Slice 1 `e385c59` Intent seam
 - Slice 2 `f9cc19e` allocator Coinbase shadow
 - Slice 3 `f115029` fee-true spot fills / UNRECONCILED
 - Slice 4 `f360513` GET-reconcile + brain shadow
+- Slice 5 (this commit) reconcile_run wiring + rebalancer Intents
 
-**Goal:** Max profit — UNRECONCILED Coinbase/Alpaca rows can become fee-true fills; real writer is shadowed before any cutover.
+**Goal:** Max profit — UNRECONCILED stubs can be upgraded when Valedia injects a real GET; rebalancer drift is Intent-shaped before any auto-exec.
 
-**Fence:** No --live, no orders, no key changes, no NT writer cutover, no `nautilus_trader`.
+**Fence:** No --live, no orders, no key changes, no NT writer cutover, no `nautilus_trader`. Default reconcile getter never HTTP.
 
-**Next:** Wire `reconcile_run` to call GET-reconcile with a Valedia-runtime getter (this lane still does not GET live). Then rebalancer Intents. Still no `VENUE_WRITER=nautilus`.
+**Next:** Valedia-runtime GET injection (not this lane). Still no `VENUE_WRITER=nautilus`. No auto-exec rebalancer.

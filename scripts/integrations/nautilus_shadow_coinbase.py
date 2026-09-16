@@ -348,3 +348,99 @@ def emit_brain_shadow(side, ticker, usd_amount=None, crypto_amount=None,
         f"side={side_l} dispatchable=false canonical_ok={compare.get('ok')}"
     )
     return rec
+
+
+def intent_from_rebalance(trade: dict, gates: Optional[dict] = None,
+                          strategy: str = "REBALANCER"):
+    """Map a rebalancer proposed trade → Slice-1 Intent.
+
+    Buy: notional = USD (trader quote_size). Sell: qty = base (trader base_size).
+    Never invents a missing size. Never dispatchable.
+    """
+    t = trade or {}
+    side_l = str(t.get("side") or "").strip().lower()
+    instrument = coinbase_product_id(t.get("ticker") or "")
+    g = shadow_gates(gates, note="rebalancer_proposed_not_executed")
+    if side_l == "buy":
+        notional = float(t.get("notional"))
+        return make_intent(
+            strategy=strategy, venue="coinbase", instrument=instrument, side="buy",
+            order_type="market", tif="IOC", notional=notional, qty=None,
+            max_notional=notional, max_qty=notional, gates=g, ledger_source="shadow",
+        )
+    qty = float(t.get("qty"))
+    notional = t.get("notional")
+    max_n = float(notional) if notional not in (None, "") else max(qty, 0.01)
+    if max_n <= 0:
+        max_n = max(qty, 0.01)
+    return make_intent(
+        strategy=strategy, venue="coinbase", instrument=instrument, side="sell",
+        order_type="market", tif="IOC", qty=qty, notional=None,
+        max_qty=qty, max_notional=max_n, gates=g, ledger_source="shadow",
+    )
+
+
+def emit_rebalancer_shadow(trade: dict, queue_path: Optional[str] = None,
+                           gates: Optional[dict] = None,
+                           strategy: str = "REBALANCER") -> dict:
+    """Shadow a rebalancer proposed trade. Never dispatchable. Never a venue POST.
+
+    Writer stays valedia. Rebalancer still does not auto-execute.
+    """
+    if not getattr(vc, "NAUTILUS_SHADOW_COINBASE", True):
+        return {"shadow": False, "skipped": True, "dispatchable": False,
+                "writer": "rebalancer"}
+    t = trade or {}
+    side_l = str(t.get("side") or "").strip().lower()
+    if side_l == "buy":
+        try:
+            if t.get("notional") is None or float(t.get("notional")) <= 0:
+                return {"shadow": False, "skipped": True, "reason": "no_notional",
+                        "dispatchable": False, "writer": "rebalancer"}
+        except (TypeError, ValueError):
+            return {"shadow": False, "skipped": True, "reason": "no_notional",
+                    "dispatchable": False, "writer": "rebalancer"}
+    elif side_l == "sell":
+        try:
+            if t.get("qty") is None or float(t.get("qty")) <= 0:
+                return {"shadow": False, "skipped": True, "reason": "no_qty",
+                        "dispatchable": False, "writer": "rebalancer"}
+        except (TypeError, ValueError):
+            return {"shadow": False, "skipped": True, "reason": "no_qty",
+                    "dispatchable": False, "writer": "rebalancer"}
+    else:
+        return {"shadow": False, "skipped": True, "reason": "bad_side",
+                "dispatchable": False, "writer": "rebalancer"}
+    intent = intent_from_rebalance(t, gates=gates, strategy=strategy)
+    try:
+        canonical = post_body_from_intent(intent)
+        compare = compare_intent_to_post(intent, canonical)
+    except Exception as e:
+        canonical = None
+        compare = {
+            "ok": False, "error": str(e)[:160],
+            "mismatches": [{"field": "post_body", "intent": intent.side, "post": str(e)[:80]}],
+        }
+    extra = {
+        "shadow": True,
+        "writer": "rebalancer",
+        "venue_writer": vc.venue_writer("coinbase"),
+        "compare": compare,
+        "canonical_post": canonical,
+        "rebalancer_executes": False,
+        "proposed_trade": {
+            "side": side_l, "ticker": t.get("ticker"),
+            "qty": t.get("qty"), "notional": t.get("notional"),
+        },
+    }
+    rec = enqueue_intent(intent, dispatch=False, queue_path=queue_path, extra=extra)
+    rec["dispatchable"] = False
+    rec["dispatch_requested"] = False
+    rec["shadow"] = True
+    rec["writer"] = "rebalancer"
+    rec["rebalancer_executes"] = False
+    print(
+        f"[shadow-rebalancer] intent={rec.get('intent_id','')} "
+        f"side={side_l} dispatchable=false canonical_ok={compare.get('ok')}"
+    )
+    return rec
