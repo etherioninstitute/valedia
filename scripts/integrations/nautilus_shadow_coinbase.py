@@ -179,7 +179,7 @@ def _ere_level() -> str:
     return "UNKNOWN"
 
 
-def shadow_gates(over: Optional[dict] = None) -> dict:
+def shadow_gates(over: Optional[dict] = None, note: Optional[str] = None) -> dict:
     """Shadow never sets live_flag. Allocator Coinbase does not re-check fee/category;
     we snapshot ERE level and fail-closed on HALT/DANGER via ere_ok()."""
     g = {
@@ -189,7 +189,7 @@ def shadow_gates(over: Optional[dict] = None) -> dict:
         "blacklist_ok": True,
         "exec_dry_run": bool(getattr(vc, "EXEC_DRY_RUN", False)),
         "live_flag": False,
-        "gate_note": "allocator_coinbase_does_not_recheck_fee_category",
+        "gate_note": note or "allocator_coinbase_does_not_recheck_fee_category",
     }
     if over:
         g.update(over)
@@ -266,5 +266,85 @@ def emit_allocator_shadow(allocation: dict, queue_path: Optional[str] = None,
         f"[shadow-coinbase] intent={rec.get('intent_id','')} status={rec.get('status')} "
         f"dispatchable=false canonical_ok={compare.get('ok')} "
         f"allocator_mismatches={len(alloc_compare.get('mismatches') or [])}"
+    )
+    return rec
+
+
+def intent_from_brain(side, ticker, usd_amount=None, crypto_amount=None,
+                      gates: Optional[dict] = None, strategy: str = "UNIFIED_BRAIN"):
+    """Map unified_brain Coinbase buy/sell → Slice-1 Intent.
+
+    Buy: notional = usd_amount (trader quote_size). Sell: qty = crypto_amount
+    (trader base_size). Never invents a missing size.
+    """
+    side_l = str(side or "").strip().lower()
+    instrument = coinbase_product_id(ticker)
+    g = shadow_gates(gates, note="unified_brain_coinbase_shadow")
+    if side_l == "buy":
+        notional = float(usd_amount)
+        return make_intent(
+            strategy=strategy, venue="coinbase", instrument=instrument, side="buy",
+            order_type="market", tif="IOC", notional=notional, qty=None,
+            max_notional=notional, max_qty=notional, gates=g, ledger_source="shadow",
+        )
+    qty = float(crypto_amount)
+    return make_intent(
+        strategy=strategy, venue="coinbase", instrument=instrument, side="sell",
+        order_type="market", tif="IOC", qty=qty, notional=None,
+        max_qty=qty, max_notional=max(qty, 0.01), gates=g, ledger_source="shadow",
+    )
+
+
+def emit_brain_shadow(side, ticker, usd_amount=None, crypto_amount=None,
+                      queue_path: Optional[str] = None, gates: Optional[dict] = None,
+                      strategy: str = "UNIFIED_BRAIN") -> dict:
+    """Shadow the REAL Coinbase writer (unified_brain buy/sell). Never dispatchable."""
+    if not getattr(vc, "NAUTILUS_SHADOW_COINBASE", True):
+        return {"shadow": False, "skipped": True, "dispatchable": False, "writer": "unified_brain"}
+    side_l = str(side or "").strip().lower()
+    if side_l == "buy":
+        try:
+            if usd_amount is None or float(usd_amount) <= 0:
+                return {"shadow": False, "skipped": True, "reason": "no_notional",
+                        "dispatchable": False}
+        except (TypeError, ValueError):
+            return {"shadow": False, "skipped": True, "reason": "no_notional",
+                    "dispatchable": False}
+    elif side_l == "sell":
+        try:
+            if crypto_amount is None or float(crypto_amount) <= 0:
+                return {"shadow": False, "skipped": True, "reason": "no_qty",
+                        "dispatchable": False}
+        except (TypeError, ValueError):
+            return {"shadow": False, "skipped": True, "reason": "no_qty",
+                    "dispatchable": False}
+    else:
+        return {"shadow": False, "skipped": True, "reason": "bad_side", "dispatchable": False}
+    intent = intent_from_brain(
+        side_l, ticker, usd_amount=usd_amount, crypto_amount=crypto_amount,
+        gates=gates, strategy=strategy)
+    try:
+        canonical = post_body_from_intent(intent)
+        compare = compare_intent_to_post(intent, canonical)
+    except Exception as e:
+        canonical = None
+        compare = {
+            "ok": False, "error": str(e)[:160],
+            "mismatches": [{"field": "post_body", "intent": intent.side, "post": str(e)[:80]}],
+        }
+    extra = {
+        "shadow": True,
+        "writer": "unified_brain",
+        "compare": compare,
+        "canonical_post": canonical,
+    }
+    rec = enqueue_intent(intent, dispatch=False, queue_path=queue_path, extra=extra)
+    rec["dispatchable"] = False
+    rec["dispatch_requested"] = False
+    rec["shadow"] = True
+    rec["writer"] = "unified_brain"
+    print(
+        f"[shadow-brain-coinbase] intent={rec.get('intent_id','')} "
+        f"side={side_l} dispatchable=false canonical_ok={compare.get('ok')}"
     )
     return rec

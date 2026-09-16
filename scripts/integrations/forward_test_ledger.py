@@ -135,7 +135,7 @@ def book_spot_fill(strategy, ticker, side, venue, raw, intended_source="live", t
         return record_unreconciled(
             strategy, ticker, side, fill["price"], fill["qty"], venue,
             predicted_direction=predicted_direction, predicted_prob=predicted_prob,
-            ts=ts, order_id=fill.get("order_id"),
+            ts=ts, order_id=fill.get("order_id"), intended_source=src_in,
         )
     fee = fill["fee"] if fill["fee"] is not None else _spot_fee(venue, fill["price"], fill["qty"])
     source = src_in if _is_non_real_source(src_in) else "live"
@@ -169,7 +169,7 @@ def settle_spot_fill(ticker, venue, raw, intended_source="live", fallback_price=
 # ── record an entry (called by executors at order time) ─────────────────────
 def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
                  predicted_direction=None, predicted_prob=None, source="live", ts=None,
-                 fill_status=None, entry_fee=None, order_id=None):
+                 fill_status=None, entry_fee=None, order_id=None, intended_source=None):
     eid = "ft_" + uuid.uuid4().hex[:12]
     v = str(venue or "")
     if entry_fee is None:
@@ -189,19 +189,21 @@ def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
         rec["fill_status"] = fill_status
     if order_id:
         rec["order_id"] = order_id
+    if intended_source:
+        rec["intended_source"] = intended_source
     _append(rec)
     return eid
 
 
 def record_unreconciled(strategy, ticker, side, price, contracts, venue,
                         predicted_direction=None, predicted_prob=None, ts=None,
-                        order_id=None):
+                        order_id=None, intended_source=None):
     """Coinbase/Alpaca POST with no venue fill yet. Excluded from Kelly/real_track_record."""
     return record_entry(
         strategy, ticker, side, price, contracts, venue=venue,
         predicted_direction=predicted_direction, predicted_prob=predicted_prob,
         source="unreconciled", ts=ts, fill_status="UNRECONCILED",
-        entry_fee=0.0, order_id=order_id,
+        entry_fee=0.0, order_id=order_id, intended_source=intended_source,
     )
 
 

@@ -261,6 +261,106 @@ def run():
         assert sh.coinbase_product_id("btc-usd") == "BTC-USD"
         assert sh.coinbase_product_id("ETH-USD") == "ETH-USD"
 
+        # 13. unified_brain buy shadow: never dispatchable; POST matches trader quote_size.
+        qpath = _queue()
+        try:
+            rec = sh.emit_brain_shadow("buy", "ETH-USD", usd_amount=25.0,
+                                       queue_path=qpath, gates=_gates())
+            assert rec["shadow"] is True, rec
+            assert rec["dispatchable"] is False, rec
+            assert rec["dispatch_requested"] is False, rec
+            assert rec["status"] != "dispatchable", rec
+            assert rec["writer"] == "unified_brain"
+            assert rec["venue"] == "coinbase"
+            assert rec["instrument"] == "ETH-USD"
+            assert rec["side"] == "buy"
+            assert rec["ledger_source"] != "live"
+            assert rec["gates"]["live_flag"] is False
+            assert rec.get("notional") == 25.0
+            assert rec.get("compare", {}).get("ok") is True, rec.get("compare")
+            post = rec.get("canonical_post") or sh.post_body_from_intent(
+                sh.intent_from_brain("buy", "ETH-USD", usd_amount=25.0, gates=_gates()))
+            assert post["product_id"] == "ETH-USD"
+            assert post["side"] == "BUY"
+            assert post["order_configuration"]["market_market_ioc"]["quote_size"] == "25.00"
+            same = cob.build_market_order_body(
+                "ETH-USD", "buy", usd_amount=25.0, client_order_id=rec["client_order_id"])
+            assert same == post
+            with open(qpath) as f:
+                line = f.read().strip()
+            assert '"shadow": true' in line.lower().replace("True", "true")
+            assert '"dispatchable": true' not in line.lower().replace("True", "true")
+        finally:
+            os.remove(qpath)
+
+        # 14. unified_brain sell shadow: POST matches trader base_size (unlike allocator).
+        sell_intent = sh.intent_from_brain("sell", "BTC-USD", crypto_amount=0.001, gates=_gates())
+        sell_post = sh.post_body_from_intent(sell_intent)
+        sell_cmp = sh.compare_intent_to_post(sell_intent, sell_post)
+        assert sell_cmp["ok"] is True, sell_cmp
+        assert sell_post["side"] == "SELL"
+        assert sell_post["order_configuration"]["market_market_ioc"]["base_size"] == "0.001"
+        same_sell = cob.build_market_order_body(
+            "BTC-USD", "sell", crypto_amount=0.001,
+            client_order_id=sell_intent.client_order_id)
+        assert same_sell == sell_post
+        qpath = _queue()
+        try:
+            rec = sh.emit_brain_shadow("sell", "BTC-USD", crypto_amount=0.001,
+                                       queue_path=qpath, gates=_gates())
+            assert rec["dispatchable"] is False
+            assert rec["shadow"] is True
+            assert rec["writer"] == "unified_brain"
+            assert rec.get("compare", {}).get("ok") is True, rec.get("compare")
+        finally:
+            os.remove(qpath)
+
+        # 15. Missing size is skipped (never invented). Bad side skipped.
+        assert sh.emit_brain_shadow("buy", "ETH-USD", usd_amount=0).get("skipped") is True
+        assert sh.emit_brain_shadow("sell", "ETH-USD").get("skipped") is True
+        assert sh.emit_brain_shadow("hold", "ETH-USD", usd_amount=1).get("skipped") is True
+
+        # 16. NT flags + writer=nautilus still cannot dispatch a brain shadow.
+        vc.NAUTILUS_ENABLED = True
+        vc.NAUTILUS_LIVE = True
+        vc.VENUE_WRITER["coinbase"] = "nautilus"
+        qpath = _queue()
+        try:
+            rec = sh.emit_brain_shadow("buy", "SOL-USD", usd_amount=5.0, queue_path=qpath)
+            assert rec["dispatchable"] is False, rec
+            assert rec["shadow"] is True
+            assert rec["status"] != "dispatchable"
+            assert rec["gates"]["live_flag"] is False
+        finally:
+            os.remove(qpath)
+            _restore()
+        assert vc.VENUE_WRITER["coinbase"] == "valedia"
+        assert vc.NAUTILUS_ENABLED is False
+        assert vc.nautilus_may_dispatch("coinbase") is False
+
+        # 17. REAL writer stays valedia; brain emits shadow BEFORE market_buy/market_sell.
+        brain_src = open(os.path.join(os.path.dirname(__file__), "unified_brain.py")).read()
+        trader_src = open(os.path.join(os.path.dirname(__file__), "coinbase_trader.py")).read()
+        cfg_src = open(os.path.join(os.path.dirname(__file__), "valedia_config.py")).read()
+        assert "def _shadow_coinbase_write" in brain_src
+        assert "emit_brain_shadow" in brain_src
+        buy_shadow_at = brain_src.find('_shadow_coinbase_write("buy"')
+        buy_write_at = brain_src.find("cb_buy(ticker, position)")
+        sell_shadow_at = brain_src.find('_shadow_coinbase_write("sell"')
+        sell_write_at = brain_src.find("cb_sell(ticker, bal)")
+        assert buy_shadow_at != -1 and buy_write_at != -1 and buy_shadow_at < buy_write_at
+        assert sell_shadow_at != -1 and sell_write_at != -1 and sell_shadow_at < sell_write_at
+        assert 'VENUE_WRITER' in cfg_src and '"coinbase": "valedia"' in cfg_src
+        assert "def place_market_order" not in trader_src
+        assert "def market_buy" in trader_src and "def market_sell" in trader_src
+
+        # 18. Skip switch still covers brain shadow.
+        vc.NAUTILUS_SHADOW_COINBASE = False
+        skipped = sh.emit_brain_shadow("buy", "ETH-USD", usd_amount=10.0)
+        assert skipped.get("skipped") is True
+        assert skipped["dispatchable"] is False
+        _restore()
+
     finally:
         _restore()
 

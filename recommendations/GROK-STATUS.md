@@ -1,22 +1,25 @@
 # Grok Build status
 
-**Updated:** 2026-09-15 01:35 PT
+**Updated:** 2026-09-15 20:25 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 3: Coinbase/Alpaca ledger truth
+**Current:** SHIPPED — Slice 4: UNRECONCILED GET-reconcile + unified_brain Coinbase shadow
 
-**Last done:** Slice 3 on `valedia-v2-grok-build`
+**Last done:** Slice 4 on `valedia-v2-grok-build`
 
-- Real Coinbase/Alpaca fills → `book_spot_fill` → fee-true `record_entry` (`entry_fee` from fee_engine STATIC_FEES; size/venue/source from the fill).
-- POST-ack without filled qty+price → `UNRECONCILED` (never silent live). Quote/notional is not a fill.
-- `real_track_record` / category stats exclude if **entry or settlement** is paper/sandbox/unreconciled (no live-source laundering).
-- Alpaca `IS_LIVE` books `source=live`, not paper. Paper/sandbox still cannot lift Kelly.
-- Dead allocator `place_market_order` / `place_order` still absent (no new live writer). `VENUE_WRITER` unchanged (not nautilus).
-- Tests: `test_spot_fill_ledger.py` PASS (no network). Slice 1–2 tests still PASS.
+- A) `spot_reconcile.py`: UNRECONCILED rows with `order_id` upgrade from a fill payload or mocked GET body to fee-true `record_entry` (buy) / `settle` (sell). Missing data stays UNRECONCILED. Never invents fills. No live HTTP (injected getter only). Paper/sandbox `intended_source` still cannot lift Kelly.
+- B) `unified_brain` Coinbase buy/sell emits never-dispatchable shadow Intents **before** `market_buy`/`market_sell`. Canonical POST matches `coinbase_trader` (buy `quote_size`, sell `base_size`). Writer stays `valedia`. `VENUE_WRITER` not cut over.
+- Tests: `test_spot_reconcile.py` + `test_nautilus_shadow_coinbase.py` PASS (no network). Slice 1–3 still PASS.
 
-**Goal:** Maximum profit — real fills feed Kelly; no fake sandbox lift.
+**Shipped:**
+- Slice 1 `e385c59` Intent seam
+- Slice 2 `f9cc19e` allocator Coinbase shadow
+- Slice 3 `f115029` fee-true spot fills / UNRECONCILED
+- Slice 4 `cb74393` GET-reconcile + brain shadow
 
-**Fence:** No --live, no new orders, no key changes. VENUE_WRITER not cut over.
+**Goal:** Max profit — UNRECONCILED Coinbase/Alpaca rows can become fee-true fills; real writer is shadowed before any cutover.
 
-**Next:** GET-reconcile UNRECONCILED Coinbase/Alpaca `order_id`s into fee-true fills (Valedia runtime I/O; coding slice can stub). Then rebalancer Intents. Still no NT live writer.
+**Fence:** No --live, no orders, no key changes, no NT writer cutover, no `nautilus_trader`.
+
+**Next:** Wire `reconcile_run` to call GET-reconcile with a Valedia-runtime getter (this lane still does not GET live). Then rebalancer Intents. Still no `VENUE_WRITER=nautilus`.

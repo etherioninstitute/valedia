@@ -515,6 +515,15 @@ def _spot_source(plat, alpaca_live=False):
     return "live" if alpaca_live else "paper"
 
 
+def _shadow_coinbase_write(side, ticker, usd_amount=None, crypto_amount=None):
+    """Slice 4B: never-dispatchable Intent before the Valedia Coinbase writer. Best-effort."""
+    try:
+        from nautilus_shadow_coinbase import emit_brain_shadow
+        emit_brain_shadow(side, ticker, usd_amount=usd_amount, crypto_amount=crypto_amount)
+    except Exception:
+        pass
+
+
 def ledger_spot_buy(plat, ticker, resp, alpaca_live=False):
     """Book a Coinbase/Alpaca buy: fee-true live fill, or UNRECONCILED. Never silent."""
     if not _ftl:
@@ -805,6 +814,7 @@ def run_brain():
                 buy_resp = None
                 if plat == "coinbase" and cb and cb_cash >= position:
                     try:
+                        _shadow_coinbase_write("buy", ticker, usd_amount=position)
                         buy_resp = cb_buy(ticker, position)
                         if _ftl and not _ftl.spot_ack_ok("coinbase", buy_resp):
                             lines.append(f"  {name:6s} BUY FAILED: {buy_resp}")
@@ -851,6 +861,7 @@ def run_brain():
                         base = ticker.replace("-USD","")
                         bal  = float(cb_bal.get(base, {}).get("balance", 0))
                         if bal > 0.0001:
+                            _shadow_coinbase_write("sell", ticker, crypto_amount=bal)
                             sell_resp = cb_sell(ticker, bal)
                             if _ftl and not _ftl.spot_ack_ok("coinbase", sell_resp):
                                 lines.append(f"  {name:6s} SELL FAILED: {sell_resp}")
