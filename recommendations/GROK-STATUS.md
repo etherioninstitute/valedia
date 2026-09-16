@@ -16,7 +16,7 @@
 - Slice 1 `e385c59` Intent seam
 - Slice 2 `f9cc19e` allocator Coinbase shadow
 - Slice 3 `f115029` fee-true spot fills / UNRECONCILED
-- Slice 4 `cb74393` GET-reconcile + brain shadow
+- Slice 4 `f360513` GET-reconcile + brain shadow
 
 **Goal:** Max profit — UNRECONCILED Coinbase/Alpaca rows can become fee-true fills; real writer is shadowed before any cutover.
 
