@@ -17,7 +17,7 @@
 - Slice 2 `f9cc19e` allocator Coinbase shadow
 - Slice 3 `f115029` fee-true spot fills / UNRECONCILED
 - Slice 4 `f360513` GET-reconcile + brain shadow
-- Slice 5 (this commit) reconcile_run wiring + rebalancer Intents
+- Slice 5 `c3086df` reconcile_run wiring + rebalancer Intents
 
 **Goal:** Max profit — UNRECONCILED stubs can be upgraded when Valedia injects a real GET; rebalancer drift is Intent-shaped before any auto-exec.
 
