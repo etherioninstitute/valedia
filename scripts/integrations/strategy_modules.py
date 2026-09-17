@@ -235,8 +235,11 @@ class EmergingCryptoScanner:
 # ══════════════════════════════════════════════════════════════════════
 class MicroScalper:
     """Ultra-short-term mean-reversion on stocks.
-    Only viable on Alpaca (0% fees). Uses 5-min momentum reversal.
-    NOT high-frequency — runs 3x/day at brain checkpoints."""
+
+    Slice 8: LIVE_PATH is False. Report-only. unified_brain must not alp_buy.
+    Daily-bar z-score is not a scalp; equity live-off until OOS filter.
+    """
+    LIVE_PATH = False
     
     def __init__(self, max_hold_bars=10, entry_z=1.8):
         self.max_hold_bars = max_hold_bars

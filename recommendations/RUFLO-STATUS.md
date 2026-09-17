@@ -1,4 +1,15 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 8 SHIPPED** (one fusion + one fee table; scalper/weather dead; REBALANCER_AUTOEXEC=False)
+
+## Slice 8 (Grok Build executor, `valedia-v2-grok-build`)
+- Canonical live fusion: `valedia_config.FUSION_WEIGHTS` (kernel-first) → `unified_brain.stage_fusion`. `signal_fusion.LIVE_PATH=False` (report scanner only).
+- Canonical fees: `fee_engine.STATIC_FEES`. Brain `FEES` dict deleted. `stage_fee_gate` uses `roundtrip_cost(..., use_static=True)` so Coinbase spread is not silently dropped. `stage_kelly` delegates to `KellySizer`.
+- MicroScalper live buys dead (`scalper_place_buy` never calls `alp_buy`). Allocator hard-skips `WEATHER_ARB`/`OIL_BRACKET` even if blacklist file missing. `weather_arb.execute_weather_trades` never `create_order`; dry forced.
+- `REBALANCER_AUTOEXEC=False`. Shadow/propose only. Flag+NT still cannot dispatch. This lane did not set True.
+- Tests: `test_slice8.py` + prior slices PASS. Drift detector 10 PASS · 0 WARN · 0 FAIL. No network, no --live, no NT cutover.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 7 SHIPPED** (spot GET OFF + per-strategy cap + cron stagger)
 
 ## Slice 7 (Grok Build executor, `valedia-v2-grok-build`)

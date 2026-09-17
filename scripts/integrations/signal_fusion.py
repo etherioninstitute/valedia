@@ -1,21 +1,14 @@
 """Composite Signal Fusion Engine — Valedia ASI
-Merges ALL data sources into a single conviction score per asset.
-Only trades when composite score > threshold.
 
-Signal Weights:
-  ML Model (40%) — GradientBoosting prediction confidence
-  Technical (30%) — RSI, MACD, Bollinger Band position
-  Sentiment (15%) — News bull/bear ratio
-  Volume (10%) — Volume vs 20-day average
-  Whale Activity (5%) — On-chain whale movements (when available)
+NON-LIVE scanner. Do not use for execution.
 
-Output: 0-100 conviction score per asset
-  > 80: STRONG BUY (high conviction)
-  > 70: BUY (standard conviction)
-  > 50: HOLD (insufficient edge)
-  < 40: AVOID (bearish signals)
-  < 25: SHORT CANDIDATE (if perps available)
+Canonical LIVE fusion is valedia_config.FUSION_WEIGHTS consumed by
+unified_brain.stage_fusion (kernel-first). This module writes a report JSON
+only. Allocator Coinbase execute is a dead writer (no place_market_order).
+
+Scanner weights below are for the report scan, not the live edge.
 """
+LIVE_PATH = False
 import os, sys, json, pickle, requests
 import numpy as np
 import pandas as pd
@@ -31,6 +24,7 @@ WATCHLIST = {
     "AVAX": "AVAX-USD", "LINK": "LINK-USD"
 }
 
+# Report-scanner weights only. LIVE fusion = valedia_config.FUSION_WEIGHTS.
 WEIGHTS = {
     "ml": 0.40,
     "technical": 0.30,

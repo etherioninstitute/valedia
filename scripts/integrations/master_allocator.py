@@ -108,6 +108,9 @@ def gather_all_opportunities():
         kalshi_opps = scan_all_markets()
         for o in kalshi_opps:
             if o["side"] in ("pending_intel", "both"): continue
+            # Slice 8: hard-skip killed strategies even if blacklist file is missing
+            if _cfg and _cfg.is_killed_strategy(o.get("strategy", "")):
+                continue
             # BLACKLIST CHECK: skip strategies proven to lose money
             if _blacklist_check and is_strategy_blacklisted(o.get("strategy", "")):
                 continue
@@ -129,29 +132,9 @@ def gather_all_opportunities():
     except Exception as e:
         print(f"  Kalshi scan error: {e}")
     
-    # ── SOURCE 2: Weather arbitrage (NOAA vs Kalshi) ──
-    try:
-        if _blacklist_check and is_strategy_blacklisted("WEATHER_ARB"):
-            raise Exception("WEATHER_ARB blacklisted")
-        from weather_arb import find_edges
-        wx_edges = find_edges()
-        for e in wx_edges:
-            hours = 24  # Weather resolves daily
-            ev = e["profit_per"] / (e["price"] + 0.01)
-            opps.append({
-                "platform": "kalshi_weather", "type": "WEATHER_ARB",
-                "ticker": e["ticker"], "title": e["title"][:50],
-                "side": e["side"], "price": e["price"],
-                "ev_per_dollar": round(ev, 4),
-                "ev_per_day": round(ev, 4),  # Resolves in ~1 day
-                "hours_to_resolve": hours,
-                "edge_pct": e["edge_pct"],
-                "max_loss_pct": 100,
-                "confidence": min(0.95, e["noaa_prob"]),
-                "raw": e,
-            })
-    except Exception as e:
-        print(f"  Weather scan error: {e}")
+    # ── SOURCE 2: Weather — permanently killed (Slice 8). Never find_edges.
+    # WEATHER_ARB 0W/11L. Hard-skip even if strategy_blacklist.json is missing.
+    opps.extend(gather_weather_opportunities())
     
     # ── SOURCE 3: Crypto (Coinbase — from unified brain signals) ──
     try:
@@ -280,6 +263,11 @@ def rank_opportunities(opps):
 # STEP 4: ALLOCATE capital to top opportunities
 # ═══════════════════════════════════════════════════════════════
 
+def gather_weather_opportunities():
+    """Permanently empty. WEATHER_ARB killed. Does not call find_edges."""
+    return []
+
+
 def allocate(opps, capital):
     """Distribute available capital across top opportunities.
     Uses Kelly-inspired sizing: higher EV = larger allocation."""
@@ -295,9 +283,11 @@ def allocate(opps, capital):
     
     for o in opps:
         if remaining < 0.50: break
+        cat = o.get("type") or o.get("strategy")
+        if _cfg and _cfg.is_killed_strategy(cat):
+            continue
         if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
 
-        cat = o.get("type") or o.get("strategy")
         try:
             _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15
         except Exception:

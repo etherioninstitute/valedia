@@ -8,9 +8,10 @@ get_balances/get_price stay injectable so tests never hit Coinbase. Cron default
 still reads balances/prices via coinbase_trader (existing, read-only for this path).
 (c) GOATWORTHY Post LLC.
 """
+import os
 import sys
 from datetime import datetime, timezone
-sys.path.insert(0, "/Users/burtonchatelain/.openclaw/workspace/scripts/integrations")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TARGET_ALLOC = {
     "BTC-USD": 0.35,
@@ -87,12 +88,56 @@ def emit_rebalance_shadows(trades, queue_path=None, gates=None):
     return out
 
 
-def run_rebalance(get_balances_fn=None, get_price_fn=None, queue_path=None,
-                  emit_shadows=True, gates=None):
-    """Compute drift, emit shadow Intents, print actions. Never auto-executes.
+def rebalancer_may_exec(gates=None):
+    """AUTOEXEC is necessary but not sufficient.
 
+    Requires: REBALANCER_AUTOEXEC, writer=valedia, live_flag=True, not NT,
+    not ERE HALT/DANGER. Default cron passes no live_flag → False.
+    """
+    import valedia_config as vc
+    if not vc.rebalancer_autoexec_enabled():
+        return False
+    if vc.venue_writer("coinbase") != "valedia":
+        return False
+    if vc.NAUTILUS_ENABLED or vc.NAUTILUS_LIVE or vc.nautilus_may_dispatch("coinbase"):
+        return False
+    g = gates or {}
+    if g.get("live_flag") is not True:
+        return False
+    if str(g.get("ere_level") or "NORMAL").upper() in ("HALT", "DANGER"):
+        return False
+    if g.get("fee_ok") is False or g.get("category_ok") is False:
+        return False
+    return True
+
+
+def exec_rebalance_trades(trades, market_buy_fn=None, market_sell_fn=None, gates=None):
+    """POST only if rebalancer_may_exec. Never NT. Never invent fills.
+
+    Injected fns only — tests pass mocks. Cron default does not POST.
+    """
+    if not rebalancer_may_exec(gates):
+        return []
+    out = []
+    for t in trades or []:
+        side = str(t.get("side") or "").strip().lower()
+        if side == "buy" and market_buy_fn and t.get("notional"):
+            market_buy_fn(t["ticker"], t["notional"])
+            out.append({"side": "buy", "ticker": t["ticker"], "posted": True})
+        elif side == "sell" and market_sell_fn and t.get("qty"):
+            market_sell_fn(t["ticker"], t["qty"])
+            out.append({"side": "sell", "ticker": t["ticker"], "posted": True})
+    return out
+
+
+def run_rebalance(get_balances_fn=None, get_price_fn=None, queue_path=None,
+                  emit_shadows=True, gates=None, autoexec=None,
+                  market_buy_fn=None, market_sell_fn=None):
+    """Compute drift, emit shadow Intents, print actions.
+
+    Default: REBALANCER_AUTOEXEC=False → shadow only, no market_buy/sell.
+    AUTOEXEC=True still cannot NT-dispatch and still needs live_flag.
     Default getters are coinbase_trader reads (existing cron). Tests inject mocks.
-    market_buy / market_sell are not imported and not called.
     """
     if get_balances_fn is None or get_price_fn is None:
         from coinbase_trader import get_balances, get_price
@@ -132,7 +177,15 @@ def run_rebalance(get_balances_fn=None, get_price_fn=None, queue_path=None,
                 f"    shadow intent={rec.get('intent_id','')} "
                 f"status={rec.get('status')} dispatchable=false"
             )
-        lines.append("  (Execute manually or enable auto-rebalance)")
+        posted = exec_rebalance_trades(
+            trades, market_buy_fn=market_buy_fn,
+            market_sell_fn=market_sell_fn, gates=gates)
+        if posted:
+            lines.append(f"  AUTOEXEC posted {len(posted)} via valedia writer")
+        elif rebalancer_may_exec(gates):
+            lines.append("  AUTOEXEC on but no writer fns — shadow only")
+        else:
+            lines.append("  (shadow only; REBALANCER_AUTOEXEC=False or gates blocked)")
     else:
         lines.append("  Portfolio within tolerance")
     return "\n".join(lines)

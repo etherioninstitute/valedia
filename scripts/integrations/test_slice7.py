@@ -281,7 +281,7 @@ def test_per_strategy_cap():
         # Allocator: per-opp cap. Loser type cannot ride a winner's cap.
         def _alloc_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor=None,
                        category=None):
-            if category == "WEATHER_ARB":
+            if category == "MACRO":
                 return 0.01
             if category in ("SPORTS", "SPORTS_TONIGHT"):
                 return 0.04
@@ -290,7 +290,7 @@ def test_per_strategy_cap():
         assert ma._cfg is not None
         ma._cfg.dynamic_per_trade_cap = _alloc_cap
         allocs, _why = ma.allocate(
-            [_opp("WEATHER_ARB", "W1"), _opp("SPORTS", "S1")],
+            [_opp("MACRO", "W1"), _opp("SPORTS", "S1")],
             {"deployable": 100.0},
         )
         by = {a["ticker"]: a["allocation"] for a in allocs}

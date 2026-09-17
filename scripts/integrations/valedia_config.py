@@ -22,6 +22,26 @@ MIROFISH_WEIGHT     = 0.10     # MiroFish fusion weight (<=10% cap). Consumers: 
 CRYPTO_FEE_PCT      = 0.001    # crypto taker-fee assumption for backtests/sizing.
 CRYPTO_SLIPPAGE_PCT = 0.0005   # crypto slippage assumption.
 
+# Canonical LIVE fusion (kernel-first). Consumed by unified_brain.stage_fusion.
+# signal_fusion.WEIGHTS is a NON-LIVE scanner (LIVE_PATH=False) — not an exec brain.
+# Remainder (1 - kernel - mirofish - ml - intel) is a 50-neutral fill so weights sum to 1.
+FUSION_WEIGHTS = {
+    "kernel_equity": 0.35,
+    "kernel_crypto": 0.30,
+    "mirofish": MIROFISH_WEIGHT,
+    "ml": 0.18,
+    "intel_equity": 0.10,
+    "intel_crypto": 0.15,
+}
+
+# Permanently killed strategies (0W/11L weather, 0W/4L oil). Hard-skip in gather/allocate
+# even if strategy_blacklist.json is missing. Do not live-buy.
+KILLED_STRATEGIES = frozenset({"WEATHER_ARB", "OIL_BRACKET"})
+
+# MicroScalper / weather live buys. This lane never sets True.
+SCALPER_LIVE = False
+WEATHER_LIVE = False
+
 # Position sizing — half-Kelly + DYNAMIC per-trade cap + absolute fuses (backtested 2026-09-12).
 # The per-trade ceiling BREATHES with regime/track-record/risk instead of a flat number; the
 # fuses are circuit-breakers (rarely bind), not operating caps. Consumers: kelly_sizing, quant_engine, sports_engine.
@@ -53,6 +73,11 @@ CATEGORY_BLOCK_NET     = 0.0    # block only if fee-inclusive net is an actual l
 # Enabling live GET is a Valedia go, not a coding-agent go.
 SPOT_RECONCILE_HTTP = False
 
+# Rebalancer auto-exec. Default OFF. Shadow/propose only until Burton flips:
+#   export REBALANCER_AUTOEXEC=1
+# AND passes live_flag gates. This lane never sets True. NT never writes.
+REBALANCER_AUTOEXEC = False
+
 # Cron stagger (Slice 7): sports every 2h at :00, allocator every 4h at :20.
 # Same-minute collision was a double-bet race on 4h boundaries.
 SPORTS_CRON_MINUTE = 0
@@ -66,16 +91,60 @@ EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master
 import os as _os, json as _json   # for auto-sourcing live track-record / risk state
 _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
 
+def _env_flag(name, default):
+    env = _os.environ.get(name)
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    return bool(default)
+
+
 def spot_reconcile_http_enabled():
     """True only if Burton/Valedia flipped the spot GET HTTP flag.
 
     Env SPOT_RECONCILE_HTTP=1/true/yes/on wins over the constant. Anything
     else (unset, empty, 0, false) is OFF. Default constant is False.
     """
-    env = _os.environ.get("SPOT_RECONCILE_HTTP")
-    if env is not None and str(env).strip() != "":
-        return str(env).strip().lower() in ("1", "true", "yes", "on")
-    return bool(SPOT_RECONCILE_HTTP)
+    return _env_flag("SPOT_RECONCILE_HTTP", SPOT_RECONCILE_HTTP)
+
+
+def rebalancer_autoexec_enabled():
+    """True only if Burton flipped REBALANCER_AUTOEXEC. Default False.
+
+    Necessary but not sufficient: rebalancer still needs live_flag gates and
+    venue_writer==valedia. NT cannot dispatch. This lane never sets True.
+    """
+    return _env_flag("REBALANCER_AUTOEXEC", REBALANCER_AUTOEXEC)
+
+
+def scalper_live_enabled():
+    """MicroScalper live buys. Hard-off. Env cannot enable — dead path."""
+    return False
+
+
+def weather_live_enabled():
+    """WEATHER_ARB live orders. Hard-off. Env cannot enable — dead path."""
+    return False
+
+
+def is_killed_strategy(name):
+    return str(name or "").strip().upper() in KILLED_STRATEGIES
+
+
+def fusion_weights_for(asset_class="equity"):
+    """Resolved kernel-first weights for one asset class. Sum + remainder = 1."""
+    crypto = str(asset_class or "").strip().lower() == "crypto"
+    kernel = FUSION_WEIGHTS["kernel_crypto"] if crypto else FUSION_WEIGHTS["kernel_equity"]
+    intel = FUSION_WEIGHTS["intel_crypto"] if crypto else FUSION_WEIGHTS["intel_equity"]
+    mf = FUSION_WEIGHTS["mirofish"]
+    ml = FUSION_WEIGHTS["ml"]
+    remainder = 1.0 - kernel - mf - ml - intel
+    return {
+        "kernel": kernel,
+        "mirofish": mf,
+        "ml": ml,
+        "intel": intel,
+        "remainder": remainder,
+    }
 
 
 def _track_record_mult():
@@ -182,10 +251,11 @@ def dynamic_per_trade_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor
 #
 # Kelly safety fraction:  kelly_sizing.py = 0.5 (half) | quant_engine.py = 0.25 (quarter)
 #                         | sports_engine.py = 0.5 | master_allocator.py = ad-hoc.
-# Kalshi fee:             fee_engine.py = canonical table (bypassed!) | kalshi_executor.py = 0.02 flat
-#                         | weather_arb.py = 0.02 | quant_engine.py = 0.007 | unified_brain.py = 0.005
-#                         | forward_test_ledger.py = nonlinear published formula.
-# Signal-fusion weights:  signal_fusion.WEIGHTS  vs  unified_brain.py inline scheme (two brains).
+# Kalshi fee:             fee_engine.STATIC_FEES is canonical (brain fee gate uses it).
+#                         kalshi_executor 0.02 flat / quant_engine 0.007 still diverge — do not
+#                         unify without a fee-true backtest. weather_arb live path is dead.
+# Signal-fusion weights:  unified (Slice 8). Live = FUSION_WEIGHTS → unified_brain.stage_fusion.
+#                         signal_fusion.WEIGHTS is NON-LIVE (LIVE_PATH=False).
 
 # ── Nautilus sidecar seam (Phase 0) — exclusive writer lock ──────────────
 # Default deny. Coding agents never flip these. Valedia runtime is the only

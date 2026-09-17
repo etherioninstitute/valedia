@@ -20,6 +20,8 @@ def _restore():
     vc.NAUTILUS_LIVE = False
     vc.NAUTILUS_SHADOW_COINBASE = True
     vc.VENUE_WRITER["coinbase"] = "valedia"
+    vc.REBALANCER_AUTOEXEC = False
+    os.environ.pop("REBALANCER_AUTOEXEC", None)
 
 
 def _queue():
@@ -59,7 +61,9 @@ def run():
     assert "market_buy(" not in src
     assert "market_sell(" not in src
     assert "emit_rebalance_shadows" in src
-    assert "Execute manually or enable auto-rebalance" in src
+    assert "REBALANCER_AUTOEXEC" in open(os.path.join(HERE, "valedia_config.py")).read()
+    assert "rebalancer_may_exec" in src
+    assert "exec_rebalance_trades" in src
     assert "import nautilus_trader" not in src
     assert vc.venue_writer("coinbase") == "valedia"
     assert vc.NAUTILUS_ENABLED is False
@@ -189,7 +193,7 @@ def run():
                 get_balances_fn=_bal, get_price_fn=_px,
                 queue_path=qpath, gates=_gates())
             assert "Rebalance needed" in report
-            assert "Execute manually" in report
+            assert "REBALANCER_AUTOEXEC=False" in report or "shadow only" in report
             assert "dispatchable=false" in report
             assert buys_calls == [] and sells_calls == []
             with open(qpath) as f:
