@@ -20,7 +20,7 @@
 - Slice 3 `f115029` fee-true spot fills / UNRECONCILED
 - Slice 4 `f360513` GET-reconcile + brain shadow
 - Slice 5 `c3086df` reconcile_run wiring + rebalancer Intents
-- Slice 6 (this) Kalshi fill-true + sports cap + one SPORTS category + backfill exclude
+- Slice 6 `659d4b7` Kalshi fill-true + sports cap + one SPORTS category + backfill exclude
 
 **Goal:** Max fee-true realized P&L. Kalshi taker no longer Thorp-throttles the book on unfilled acks or inflates Kelly; sports cannot 10% a retracted WR.
 
