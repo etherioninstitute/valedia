@@ -6,7 +6,7 @@
 
 **Current:** SHIPPED — Slice 9 / P1.4 (`valedia-v2-grok-build`)
 
-**Shipped:** Slices 1–9 (`e385c59` … Slice 8 `02987c3` + Slice 9 this commit)
+**Shipped:** Slices 1–9 (`e385c59` … Slice 8 `02987c3` + Slice 9 `a0f3572`)
 
 ## Slice 9 / P1.4 (learning pause, not a grave)
 

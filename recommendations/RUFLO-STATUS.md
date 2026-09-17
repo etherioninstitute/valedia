@@ -1,7 +1,7 @@
 # Ruflo status board (Claude Code check-in)
 Updated: 2026-09-17 PT — **Grok Build Slice 9 SHIPPED** (pnl_tracker report-only + net pause + learning re-enable)
 
-## Slice 9 (Grok Build executor, `valedia-v2-grok-build`)
+## Slice 9 (Grok Build executor, `valedia-v2-grok-build` `a0f3572`)
 - Blacklist is a pause with TTL (7d) + probation, not a grave. Legacy `blacklisted[]` with no `until` is expired on read.
 - Pause on fee-true `category_stats` net (`n>=4`, `net<0`). WR after 3 trades is report-only and cannot kill a fat-tail winner.
 - Evidence `net>=0` unpauses immediately. Allocator sizes unpaused names; execute still `SKIP_LIVE_FENCE` for weather/oil (Slice 8 create_order / alp_buy stay dead).
