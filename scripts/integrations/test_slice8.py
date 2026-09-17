@@ -146,11 +146,53 @@ def test_scalper_weather_dead():
     }
     oil = dict(dummy, type="OIL_BRACKET", ticker="OIL1")
     sports = dict(dummy, type="SPORTS", ticker="SP1")
-    allocs, _why = ma.allocate([dummy, oil, sports], {"deployable": 100.0})
-    tickers = {a["ticker"] for a in allocs}
-    assert "WX1" not in tickers
-    assert "OIL1" not in tickers
-    assert "SP1" in tickers
+    # Slice 9: unpaused weather/oil may be sized (evaluation). Live fence is execute.
+    orig_pause = ma._is_strategy_paused
+    ma._is_strategy_paused = lambda n: False
+    try:
+        allocs, _why = ma.allocate([dummy, oil, sports], {"deployable": 100.0})
+        tickers = {a["ticker"] for a in allocs}
+        assert "WX1" in tickers and "OIL1" in tickers and "SP1" in tickers, tickers
+        called = []
+        import types
+        import kalshi_auth
+        orig_co = kalshi_auth.create_order
+        orig_pos = kalshi_auth.get_positions
+        orig_plan, orig_mom = ma.build_execution_plan, ma.MakerOrderManager
+        orig_bl = ma._is_kalshi_blacklisted
+        orig_intel = sys.modules.get("intel_layer")
+        fake = types.ModuleType("intel_layer")
+
+        class _I:
+            def get_kalshi_conviction(self, *a, **k):
+                return {"recommended_side": "yes", "confidence": 0.2, "conviction_yes": 50}
+
+        fake.get_intel = lambda: _I()
+        sys.modules["intel_layer"] = fake
+        kalshi_auth.create_order = lambda *a, **k: called.append(a) or {"order": {"status": "resting"}}
+        kalshi_auth.get_positions = lambda: {"market_positions": []}
+        ma.build_execution_plan = None
+        ma.MakerOrderManager = None
+        ma._is_kalshi_blacklisted = lambda t: False
+        try:
+            fenced = [a for a in allocs if a["ticker"] in ("WX1", "OIL1")]
+            out = ma.execute_allocations(fenced, dry_run=False)
+            by = {r["ticker"]: r["status"] for r in out}
+            assert by["WX1"] == "SKIP_LIVE_FENCE", by
+            assert by["OIL1"] == "SKIP_LIVE_FENCE", by
+            assert called == [], called  # fenced names never reach create_order
+        finally:
+            kalshi_auth.create_order = orig_co
+            kalshi_auth.get_positions = orig_pos
+            ma.build_execution_plan = orig_plan
+            ma.MakerOrderManager = orig_mom
+            ma._is_kalshi_blacklisted = orig_bl
+            if orig_intel is not None:
+                sys.modules["intel_layer"] = orig_intel
+            else:
+                sys.modules.pop("intel_layer", None)
+    finally:
+        ma._is_strategy_paused = orig_pause
 
 
 def test_rebalancer_autoexec_false():

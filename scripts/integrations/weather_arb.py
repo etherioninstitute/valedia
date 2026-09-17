@@ -213,9 +213,10 @@ def find_edges():
 # ═══ EXECUTION ═══
 
 def execute_weather_trades(edges, dry_run=True, max_trades=5):
-    """WEATHER_ARB permanently killed (0W/11L). Never places orders.
+    """WEATHER_ARB live exec fenced (Slice 8). Never places orders.
 
-    dry_run is forced True. create_order is not called. No Kalshi HTTP.
+    Learning pause/TTL (Slice 9) may re-enable evaluation/sizing elsewhere.
+    This function still never calls create_order. dry_run is forced True.
     """
     dry_run = True
     results = []

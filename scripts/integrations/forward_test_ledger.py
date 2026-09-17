@@ -557,13 +557,24 @@ def category_stats(lookback_days=None):
     return out
 
 
+def _learning_pause_until(category, now=None):
+    """Learning pause expiry (pnl_tracker). Fail-open: errors → not paused.
+    Pause is TTL-bounded; it is never a permanent kill."""
+    try:
+        import pnl_tracker as _pt
+        return _pt.paused_until(category, now=now)
+    except Exception:
+        return None
+
+
 def should_trade_category(category, lookback_days=None):
     """(allowed, reason) for a strategy/category. FAIL-OPEN: any uncertainty or error -> allow.
-    Blocked ONLY by (a) a manual 'parked' entry, or (b) a VERIFIED recent record — at least
+    Blocked by (a) a manual 'parked' entry, (b) an unexpired learning pause
+    ('paused until …', never 'dead forever'), or (c) a VERIFIED recent record — at least
     CATEGORY_MIN_TRADES real settled trades in-window AND a negative fee-inclusive net (real
     money lost). Gates on NET, not win-rate, so a fat-tailed low-win winner isn't killed.
     Errors, failed/pending trades, paper, and thin/old samples NEVER block; a 'retest' override
-    force-allows; recent losses age out -> nothing is permanent."""
+    force-allows; pause TTL and recent losses age out -> nothing is permanent."""
     cat = canonical_category(category)
     try:
         ov = _overrides()
@@ -580,6 +591,13 @@ def should_trade_category(category, lookback_days=None):
     except Exception:
         pass  # override read failed -> never block on our own error
     try:
+        until = _learning_pause_until(cat)
+        if until is not None:
+            iso = until.isoformat()
+            return (False, f"paused until {iso} (learning TTL; not permanent)")
+    except Exception:
+        pass  # pause read failed -> never block on our own error
+    try:
         import valedia_config as _c
         min_n, block_net = _c.CATEGORY_MIN_TRADES, _c.CATEGORY_BLOCK_NET
     except Exception:
@@ -589,7 +607,7 @@ def should_trade_category(category, lookback_days=None):
         if not s or s["n"] < min_n:
             return (True, f"unproven/thin ({0 if not s else s['n']} recent settled) — not blocked")
         if s["net"] < block_net:
-            return (False, f"VERIFIED recent loss {s['wins']}/{s['n']} win, net ${s['net']:.2f} — retest to re-enable")
+            return (False, f"VERIFIED recent loss {s['wins']}/{s['n']} win, net ${s['net']:.2f} — pause/retest ages out")
         return (True, f"ok {s['wins']}/{s['n']} win, net ${s['net']:+.2f}")
     except Exception as e:
         return (True, f"gate error -> allow (fail-open): {str(e)[:40]}")

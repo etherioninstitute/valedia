@@ -8,7 +8,7 @@ Without this, Valedia reports "100% win rate" while losing money.
 (c) GOATWORTHY Post LLC. All rights reserved.
 """
 import os, sys, json, time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.expanduser("~/.openclaw/workspace/models")
@@ -142,43 +142,289 @@ def track_kalshi_pnl():
     return pnl["summary"], new_settlements
 
 def get_strategy_kill_list():
-    """Returns strategies that should be disabled based on actual P&L.
-    Rule: If a strategy has 3+ losses and <25% win rate, KILL IT."""
+    """REPORT-ONLY. Win-rate is not a live fuse (Slice 9 / P1.4).
+
+    Fat-tailed winners (low WR, fee-true net>0) must not be killed — that fight
+    the category gate. Returned for the daily report / wr_report field only.
+    """
     pnl = load_pnl()
     kills = []
     for strat, data in pnl["summary"].get("strategies", {}).items():
         total = data["wins"] + data["losses"]
         if total >= 3:
             wr = data["wins"] / total * 100
+            net = data.get("profit", 0) - data.get("cost", 0)
             if wr < 25:
                 kills.append({"strategy": strat, "win_rate": round(wr, 1),
                               "wins": data["wins"], "losses": data["losses"],
-                              "total_lost": data["cost"]})
+                              "total_lost": data.get("cost", 0),
+                              "net": round(net, 2),
+                              "fuse": "report_only"})
     return kills
 
 STRATEGY_BLACKLIST_PATH = os.path.join(MODELS, "strategy_blacklist.json")
 
-def update_strategy_blacklist():
-    """Auto-disable strategies that are proven losers."""
-    kills = get_strategy_kill_list()
-    blacklist = []
-    for k in kills:
-        blacklist.append(k["strategy"])
-        print(f"  ❌ KILLING strategy '{k['strategy']}': {k['wins']}W/{k['losses']}L ({k['win_rate']}% win rate, ${k['total_lost']:.2f} lost)")
-    
-    with open(STRATEGY_BLACKLIST_PATH, "w") as f:
-        json.dump({"blacklisted": blacklist, "updated": datetime.now(timezone.utc).isoformat(),
-                    "details": kills}, f, indent=2)
-    return blacklist
+
+# ── Slice 9 learning pause ──────────────────────────────────────────────
+# Blacklist file is a PAUSE with TTL, not a life sentence.
+# Pause on fee-true NET (category_stats when available), never raw WR after 3 trades.
+# TTL expiry → probation (eligible for evaluation/sizing again).
+# Evidence: category_stats n>=min and net>=0 → unpause immediately.
+# Legacy blacklisted[] with no `until` is expired (a grave is invalid).
+# Live-exec fences (weather create_order / scalper alp_buy) stay in valedia_config.
+
+
+def _as_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(str(s).replace("Z", "+00:00")))
+    except Exception:
+        return None
+
+
+def _canon(name):
+    n = str(name or "").strip()
+    try:
+        import forward_test_ledger as _ftl
+        return _ftl.canonical_category(n)
+    except Exception:
+        return n
+
+
+def _pause_ttl_days():
+    try:
+        import valedia_config as _c
+        return int(_c.PAUSE_TTL_DAYS)
+    except Exception:
+        return 7
+
+
+def _pause_min_n_block_net():
+    try:
+        import valedia_config as _c
+        return int(_c.CATEGORY_MIN_TRADES), float(_c.CATEGORY_BLOCK_NET)
+    except Exception:
+        return 4, 0.0
+
+
+def _fee_true_stats():
+    try:
+        import forward_test_ledger as _ftl
+        return _ftl.category_stats() or {}
+    except Exception:
+        return {}
+
+
+def _read_raw_registry(path=None):
+    p = path or STRATEGY_BLACKLIST_PATH
+    if os.path.exists(p):
+        try:
+            return json.load(open(p))
+        except Exception:
+            return {}
+    return {}
+
+
+def _pnl_net_stats():
+    """Fee-blind fallback from pnl_tracker.json (profit-cost). NET, not WR."""
+    out = {}
+    for strat, data in (load_pnl().get("summary") or {}).get("strategies", {}).items():
+        n = int(data.get("wins", 0) or 0) + int(data.get("losses", 0) or 0)
+        net = float(data.get("profit", 0) or 0) - float(data.get("cost", 0) or 0)
+        out[_canon(strat)] = {
+            "n": n, "wins": int(data.get("wins", 0) or 0),
+            "net": round(net, 2), "source": "pnl_tracker",
+        }
+    return out
+
+
+def _merged_stats(stats=None):
+    """Prefer fee-true category_stats; fill gaps from pnl_tracker net (never WR)."""
+    fee = dict(stats) if stats is not None else _fee_true_stats()
+    merged = {}
+    for k, v in fee.items():
+        merged[_canon(k)] = {
+            "n": int(v.get("n") or 0), "wins": int(v.get("wins") or 0),
+            "net": float(v.get("net") or 0), "source": "category_stats",
+        }
+    for k, v in _pnl_net_stats().items():
+        if k not in merged:
+            merged[k] = v
+    return merged
+
+
+def load_pause_registry(path=None, now=None):
+    """In-memory pause view. Expired / legacy-no-until are NOT paused."""
+    now = _as_utc(now or datetime.now(timezone.utc))
+    raw = _read_raw_registry(path)
+    live = []
+    for p in raw.get("paused") or []:
+        until = _parse_iso(p.get("until"))
+        if until is None:
+            continue  # no until = not a life sentence
+        if now < until:
+            live.append(dict(p))
+    probation = []
+    for x in raw.get("probation") or []:
+        until = _parse_iso(x.get("until"))
+        if until is not None and now < until:
+            probation.append(dict(x))
+    return {
+        "paused": live,
+        "probation": probation,
+        "history": list(raw.get("history") or []),
+        "updated": raw.get("updated"),
+        "wr_report": list(raw.get("wr_report") or raw.get("details") or []),
+        "blacklisted": [p.get("strategy") for p in live],
+    }
+
+
+def paused_until(strategy_name, now=None, path=None):
+    """Datetime (UTC) when pause lifts, or None if not currently paused."""
+    cat = _canon(strategy_name)
+    for p in load_pause_registry(path=path, now=now).get("paused") or []:
+        if _canon(p.get("strategy")) == cat:
+            return _parse_iso(p.get("until"))
+    return None
+
+
+def is_strategy_paused(strategy_name, now=None, path=None):
+    """True only while a learning pause is unexpired. Fail-open on errors."""
+    try:
+        return paused_until(strategy_name, now=now, path=path) is not None
+    except Exception:
+        return False
+
 
 def is_strategy_blacklisted(strategy_name):
-    """Check if a strategy has been auto-disabled."""
-    if os.path.exists(STRATEGY_BLACKLIST_PATH):
-        try:
-            bl = json.load(open(STRATEGY_BLACKLIST_PATH))
-            return strategy_name in bl.get("blacklisted", [])
-        except: pass
-    return False
+    """Back-compat reader. Delegates to is_strategy_paused (TTL-aware)."""
+    return is_strategy_paused(strategy_name)
+
+
+def update_strategy_blacklist(now=None, stats=None, path=None):
+    """Write pause registry from fee-true NET. Report-only WR is stored, not fused.
+
+    Pause if n >= CATEGORY_MIN_TRADES and net < CATEGORY_BLOCK_NET.
+    Do not extend existing until (cron must not turn TTL into a grave).
+    TTL expiry → history + probation (eligible again; will not re-pause until
+    probation ends). Evidence net>=0 unpauses immediately (no probation).
+    Legacy blacklisted[] with no until → released to probation, not re-paused.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    ttl = _pause_ttl_days()
+    min_n, block_net = _pause_min_n_block_net()
+    dest = path or STRATEGY_BLACKLIST_PATH
+    raw = _read_raw_registry(dest)
+    merged = _merged_stats(stats)
+    wr_report = get_strategy_kill_list()
+
+    history = list(raw.get("history") or [])
+    paused_in = list(raw.get("paused") or [])
+    probation_in = list(raw.get("probation") or [])
+
+    # Legacy graves (blacklisted names, no until) → probation, not paused.
+    paused_names_in = {_canon(p.get("strategy")) for p in paused_in}
+    for name in raw.get("blacklisted") or []:
+        c = _canon(name)
+        if c and c not in paused_names_in:
+            history.append({
+                "strategy": name, "ended_at": now.isoformat(),
+                "end_reason": "legacy_released",
+                "reason": "legacy blacklist had no until — not a life sentence",
+            })
+            probation_in.append({
+                "strategy": name,
+                "until": (now + timedelta(days=ttl)).isoformat(),
+                "reason": "legacy grave released to probation (evaluation eligible)",
+            })
+
+    still_paused = []
+    probation = []
+    seen_prob = set()
+
+    def _add_probation(name, reason):
+        c = _canon(name)
+        if c in seen_prob:
+            return
+        seen_prob.add(c)
+        probation.append({
+            "strategy": name,
+            "until": (now + timedelta(days=ttl)).isoformat(),
+            "reason": reason,
+        })
+
+    for x in probation_in:
+        until = _parse_iso(x.get("until"))
+        if until is not None and now < until:
+            c = _canon(x.get("strategy"))
+            if c not in seen_prob:
+                seen_prob.add(c)
+                probation.append(dict(x))
+
+    for p in paused_in:
+        name = p.get("strategy")
+        c = _canon(name)
+        until = _parse_iso(p.get("until"))
+        st = merged.get(c)
+        if st and st["n"] >= min_n and st["net"] >= block_net:
+            history.append({
+                "strategy": name, "ended_at": now.isoformat(),
+                "end_reason": "evidence_net_recovered",
+                "net": st["net"], "n": st["n"],
+            })
+            continue
+        if until is None or now >= until:
+            history.append({
+                "strategy": name, "ended_at": now.isoformat(),
+                "end_reason": "ttl",
+                "until": p.get("until"),
+            })
+            _add_probation(name, "ttl expired — eligible for evaluation/sizing")
+            continue
+        still_paused.append(dict(p))
+
+    paused_now = {_canon(p.get("strategy")) for p in still_paused}
+
+    for name, st in merged.items():
+        c = _canon(name)
+        if c in paused_now or c in seen_prob:
+            continue
+        if st["n"] >= min_n and st["net"] < block_net:
+            still_paused.append({
+                "strategy": name,
+                "until": (now + timedelta(days=ttl)).isoformat(),
+                "paused_at": now.isoformat(),
+                "reason": f"fee-true net ${st['net']:+.2f} over {st['n']} trades",
+                "net": st["net"], "n": st["n"], "wins": st.get("wins", 0),
+                "source": st.get("source", "category_stats"),
+            })
+            paused_now.add(c)
+            print(f"  ⏸ PAUSE '{name}' until {(now + timedelta(days=ttl)).date()} "
+                  f"net=${st['net']:+.2f} n={st['n']} ({st.get('source')})")
+
+    live_names = [p.get("strategy") for p in still_paused]
+    out = {
+        "paused": still_paused,
+        "probation": probation,
+        "history": history[-50:],
+        "blacklisted": live_names,  # currently paused only; expired omitted
+        "updated": now.isoformat(),
+        "wr_report": wr_report,  # informational — not a fuse
+        "rule": ("pause on fee-true net (n>=min, net<0); TTL "
+                 f"{ttl}d + probation; evidence net>=0 unpauses; never WR"),
+    }
+    with open(dest, "w") as f:
+        json.dump(out, f, indent=2)
+    return live_names
 
 def opus_audit():
     """Use LOCAL deepseek-r1:70b via Ollama to analyze P&L.
@@ -285,10 +531,17 @@ def run():
         net = d.get("profit", 0) - d.get("cost", 0)
         lines.append(f"  {s:18} {d['wins']}W/{d['losses']}L ({wr:.0f}%) net:${net:+.2f}")
     
-    # Auto-kill losing strategies
-    blacklist = update_strategy_blacklist()
-    if blacklist:
-        lines.append(f"\n⛔ AUTO-DISABLED: {', '.join(blacklist)}")
+    # Learning pause (net-based, TTL). WR flags are report-only — not a Kelly fuse.
+    paused = update_strategy_blacklist()
+    if paused:
+        lines.append(f"\n⏸ PAUSED (until TTL/evidence, not permanent): {', '.join(paused)}")
+        for p in load_pause_registry().get("paused") or []:
+            until = str(p.get("until") or "")[:10]
+            lines.append(f"    {p.get('strategy')} until {until} {p.get('reason', '')}")
+    wr_flags = get_strategy_kill_list()
+    if wr_flags:
+        names = ", ".join(k["strategy"] for k in wr_flags)
+        lines.append(f"\n(report-only WR flags, not a fuse): {names}")
     
     # Run Opus audit weekly (or on first run)
     audit_path = os.path.join(MODELS, "opus_audit.json")

@@ -89,18 +89,22 @@ def get_total_capital():
 # STEP 2: Gather ALL opportunities across ALL platforms
 # ═══════════════════════════════════════════════════════════════
 
+def _is_strategy_paused(name):
+    """Learning pause (TTL). Fail-open: errors / expired → not paused.
+    Live-exec fence is separate (is_killed_strategy) and is applied at execute."""
+    try:
+        from pnl_tracker import is_strategy_paused
+        return bool(is_strategy_paused(name))
+    except Exception:
+        return False
+
+
 def gather_all_opportunities():
     """Collect every opportunity from every source into one unified list.
     Each opportunity gets: expected_value_per_dollar, hours_to_resolve, platform.
-    RESPECTS STRATEGY BLACKLIST — dead strategies never trade."""
+    Skips currently-paused strategies (TTL). Unpaused names re-enter evaluation
+    even if Slice 8 live-exec fenced — sizing/gating yes, live POST no."""
     opps = []
-    
-    # Check strategy blacklist
-    try:
-        from pnl_tracker import is_strategy_blacklisted
-        _blacklist_check = True
-    except:
-        _blacklist_check = False
     
     # ── SOURCE 1: Kalshi prediction markets ──
     try:
@@ -108,11 +112,8 @@ def gather_all_opportunities():
         kalshi_opps = scan_all_markets()
         for o in kalshi_opps:
             if o["side"] in ("pending_intel", "both"): continue
-            # Slice 8: hard-skip killed strategies even if blacklist file is missing
-            if _cfg and _cfg.is_killed_strategy(o.get("strategy", "")):
-                continue
-            # BLACKLIST CHECK: skip strategies proven to lose money
-            if _blacklist_check and is_strategy_blacklisted(o.get("strategy", "")):
+            # Learning pause: skip while unexpired. Not a grave.
+            if _is_strategy_paused(o.get("strategy", "")):
                 continue
             hours = max(1, o.get("hours_to_exp", 720))
             ev = o["edge"] / (o["price"] + 0.01)  # Return per dollar
@@ -132,8 +133,9 @@ def gather_all_opportunities():
     except Exception as e:
         print(f"  Kalshi scan error: {e}")
     
-    # ── SOURCE 2: Weather — permanently killed (Slice 8). Never find_edges.
-    # WEATHER_ARB 0W/11L. Hard-skip even if strategy_blacklist.json is missing.
+    # ── SOURCE 2: Weather scan stays HTTP-off (Slice 8). No find_edges.
+    # Evaluation of WEATHER_ARB happens if injected/scanned opps pass pause.
+    # Live create_order stays fenced at execute.
     opps.extend(gather_weather_opportunities())
     
     # ── SOURCE 3: Crypto (Coinbase — from unified brain signals) ──
@@ -264,7 +266,11 @@ def rank_opportunities(opps):
 # ═══════════════════════════════════════════════════════════════
 
 def gather_weather_opportunities():
-    """Permanently empty. WEATHER_ARB killed. Does not call find_edges."""
+    """No NOAA/Kalshi HTTP. Weather live exec stays fenced; this is not a scan.
+
+    Evaluation/sizing of WEATHER_ARB is allowed when the learning pause has
+    expired and opps are injected or appear from other gather sources.
+    """
     return []
 
 
@@ -284,7 +290,9 @@ def allocate(opps, capital):
     for o in opps:
         if remaining < 0.50: break
         cat = o.get("type") or o.get("strategy")
-        if _cfg and _cfg.is_killed_strategy(cat):
+        # Pause = skip sizing. Unpaused (incl. weather/oil) may be sized/gated.
+        # Live-exec fence is applied at execute, not here.
+        if _is_strategy_paused(cat):
             continue
         if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
 
@@ -367,6 +375,21 @@ def execute_allocations(allocations, dry_run=False):
         
         if dry_run:
             r["status"] = "DRY_RUN"
+            results.append(r)
+            continue
+
+        cat = a.get("type") or a.get("strategy")
+        if _is_strategy_paused(cat):
+            r["status"] = "SKIP_PAUSED"
+            r["error"] = "learning pause (until TTL/evidence); not permanent"
+            results.append(r)
+            continue
+
+        # Slice 8 live-exec fence: weather/oil may be sized when unpaused, but
+        # this lane never places their orders. Unpause ≠ create_order / alp_buy.
+        if _cfg and _cfg.live_exec_fenced(cat):
+            r["status"] = "SKIP_LIVE_FENCE"
+            r["error"] = "live exec fenced (Slice 8); evaluation/sizing only"
             results.append(r)
             continue
         

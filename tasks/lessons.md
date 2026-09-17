@@ -80,3 +80,5 @@ artifact, never real. Do NOT increase position sizes on the basis of those entri
 Real realized record is NEGATIVE (pnl_tracker net -$12.62; sports executed-only -$62.66).
 Standing rule going forward: no accuracy claim or sizing change is admissible until the
 fee-inclusive, fill-reconciled forward-test ledger (forward_test_ledger.py) shows it.
+
+[2026-09-17] | Plan said do not auto-unblacklist weather/oil | Burton override: a blacklist is a pause, not a grave. Re-enable evaluation/sizing when TTL expires or fee-true net recovers. Do not re-arm Slice 8 live writers (weather create_order / scalper alp_buy). Pause on net, never WR after 3 trades.

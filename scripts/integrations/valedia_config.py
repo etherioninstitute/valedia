@@ -34,9 +34,13 @@ FUSION_WEIGHTS = {
     "intel_crypto": 0.15,
 }
 
-# Permanently killed strategies (0W/11L weather, 0W/4L oil). Hard-skip in gather/allocate
-# even if strategy_blacklist.json is missing. Do not live-buy.
-KILLED_STRATEGIES = frozenset({"WEATHER_ARB", "OIL_BRACKET"})
+# Live-exec fence (Slice 8). These names must not place orders from this lane
+# (weather create_order / oil via allocator Kalshi POST / scalper alp_buy).
+# This is NOT a learning grave: pause/TTL in pnl_tracker can re-enable
+# evaluation + sizing + category gating. Unpause ≠ live-buy.
+# Alias KILLED_STRATEGIES kept for Slice 8 tests.
+LIVE_EXEC_FENCED = frozenset({"WEATHER_ARB", "OIL_BRACKET"})
+KILLED_STRATEGIES = LIVE_EXEC_FENCED
 
 # MicroScalper / weather live buys. This lane never sets True.
 SCALPER_LIVE = False
@@ -65,6 +69,12 @@ KELLY_UNPROVEN_MULT     = 0.5
 CATEGORY_MIN_TRADES    = 4      # min REAL settled trades in-window before a block is even possible
 CATEGORY_LOOKBACK_DAYS = 45     # recency window; stale real losses age out -> automatic retest
 CATEGORY_BLOCK_NET     = 0.0    # block only if fee-inclusive net is an actual loss (< $0.00)
+
+# Learning pause (Slice 9 / P1.4). strategy_blacklist.json is a pause, not a life sentence.
+# Rule: pause on fee-true NET (category_stats when available), never raw WR after 3 trades.
+# TTL expiry → probation (eligible for evaluation/sizing). Evidence net>=0 unpauses immediately.
+# Category gate still blocks execute on verified 45d net loss. Live-exec fence still holds.
+PAUSE_TTL_DAYS = 7
 
 # Spot GET-reconcile HTTP. Default OFF. Slice 7 ships Coinbase/Alpaca GET helpers;
 # the default cron path stays mock/no HTTP. Burton/Valedia later uses ONE flip:
@@ -127,7 +137,17 @@ def weather_live_enabled():
 
 
 def is_killed_strategy(name):
-    return str(name or "").strip().upper() in KILLED_STRATEGIES
+    """Live-exec fence. True means do not place orders. Not a learning grave."""
+    return live_exec_fenced(name)
+
+
+def live_exec_fenced(name):
+    """True if this strategy must not place live orders (Slice 8 fence).
+
+    Independent of learning pause. Unpause / TTL expiry re-enters evaluation
+    and Kelly/category gating only. This lane never lifts the fence.
+    """
+    return str(name or "").strip().upper() in LIVE_EXEC_FENCED
 
 
 def fusion_weights_for(asset_class="equity"):
