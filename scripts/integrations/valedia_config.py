@@ -290,6 +290,14 @@ NAUTILUS_SHADOW_COINBASE = True  # allocator + brain + rebalancer Coinbase: neve
 # Slice 10: MiroFish/news/scanner/hot_list/arb → gated Intents. Always shadow.
 # This lane never sets dispatchable. Writer stays valedia. No --live.
 INTEL_SHADOW_INTENTS = True
+# Slice 11: HL shorts + Polymarket arb shadow Intents. Never-dispatchable.
+# This lane never sets dispatchable. No --live. No writer flip.
+NAUTILUS_SHADOW_VENUES = True
+
+# SUBSUME NT cutover preference (later, Valedia-gated). Not a writer flip.
+# Coinbase first → Hyperliquid shorts/futures → Polymarket arb → Kalshi last.
+# Kraken stays read-only. Mercury never. Alpaca stays Valedia until an adapter.
+VENUE_NT_CUTOVER_ORDER = ("coinbase", "hyperliquid", "polymarket", "kalshi")
 
 VENUE_WRITER = {
     "kalshi": "valedia",

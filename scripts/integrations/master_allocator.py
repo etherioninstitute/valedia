@@ -571,6 +571,15 @@ def run(dry_run=False, max_allocs=15):
         lines.append(f"INTEL SHADOW: {n_intel} gated Intents (never-dispatchable)")
     except Exception as e:
         lines.append(f"INTEL SHADOW: skip ({str(e)[:60]})")
+
+    # Slice 11: HL shorts + Polymarket arb shadow. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST. Writer stays valedia/none.
+    try:
+        from nautilus_shadow_venues import emit_venue_expansion_shadows
+        n_v = len(emit_venue_expansion_shadows() or [])
+        lines.append(f"VENUE SHADOW: {n_v} HL/PM Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"VENUE SHADOW: skip ({str(e)[:60]})")
     
     # Capital
     capital = get_total_capital()
