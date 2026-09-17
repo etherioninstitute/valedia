@@ -21,7 +21,7 @@
 - Slice 4 `f360513` GET-reconcile + brain shadow
 - Slice 5 `c3086df` reconcile_run wiring + rebalancer Intents
 - Slice 6 `659d4b7` Kalshi fill-true + sports cap + one SPORTS category + backfill exclude
-- Slice 7 (this commit) spot GET off + per-strategy cap + cron stagger
+- Slice 7 `7e7f8ef` spot GET off + per-strategy cap + cron stagger
 
 **Goal:** Max fee-true realized P&L. Crypto/equity *can* enter the ledger when Burton flips GET; winners are not starved by graves; sports and allocator cannot double-bet the same minute.
 
