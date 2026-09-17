@@ -58,12 +58,15 @@ def _category_keys(name):
 
 
 def _is_non_real_source(source):
-    """Paper/sandbox/unreconciled/backfill rows never count as edge. 'sandbox'
-    also matches nautilus_sandbox. UNRECONCILED POST-acks are visible in the
-    ledger but must not lift Kelly until a real fill is booked. `backfill:`
-    (e.g. backfill:pnl_tracker) is unverified-fee history — same family."""
+    """Paper/sandbox/unreconciled/backfill/shadow rows never count as edge.
+    'sandbox' also matches nautilus_sandbox. UNRECONCILED POST-acks are visible
+    in the ledger but must not lift Kelly until a real fill is booked.
+    `backfill:` (e.g. backfill:pnl_tracker) is unverified-fee history.
+    `shadow` / `intel_shadow` are Slice 1/10 never-dispatchable Intents — same
+    family. None of these may lift _track_record_mult or category_stats."""
     s = str(source or "").lower()
-    return "paper" in s or "sandbox" in s or "unreconciled" in s or "backfill" in s
+    return ("paper" in s or "sandbox" in s or "unreconciled" in s
+            or "backfill" in s or "shadow" in s)
 
 
 def _append(rec):

@@ -562,6 +562,15 @@ def run(dry_run=False, max_allocs=15):
     """Full allocation cycle: gather → rank → allocate → execute → report."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"🧠 MASTER ALLOCATOR ({ts}) {'[DRY]' if dry_run else '[LIVE]'}", ""]
+
+    # Slice 10: MiroFish/intel → gated Intents. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST.
+    try:
+        from intel_opportunity_gatherer import emit_shadow_intents
+        n_intel = len(emit_shadow_intents() or [])
+        lines.append(f"INTEL SHADOW: {n_intel} gated Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"INTEL SHADOW: skip ({str(e)[:60]})")
     
     # Capital
     capital = get_total_capital()

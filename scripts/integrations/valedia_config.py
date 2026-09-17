@@ -287,6 +287,9 @@ class ExclusiveWriterError(ValueError):
 NAUTILUS_ENABLED = False  # sidecar dispatch off until Valedia runtime enables
 NAUTILUS_LIVE = False     # live ledger source via NT sink; default deny
 NAUTILUS_SHADOW_COINBASE = True  # allocator + brain + rebalancer Coinbase: never-dispatchable Intents
+# Slice 10: MiroFish/news/scanner/hot_list/arb → gated Intents. Always shadow.
+# This lane never sets dispatchable. Writer stays valedia. No --live.
+INTEL_SHADOW_INTENTS = True
 
 VENUE_WRITER = {
     "kalshi": "valedia",
