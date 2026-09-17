@@ -209,10 +209,14 @@ def size_bets(games, bankroll, per_trade_cap=None):
     """Size each bet through dynamic_per_trade_cap (same throttle as allocator).
 
     Edge ranks and can skip (< -10); it does not unlock 10% off a retracted WR.
-    Ceiling = min(live cap, fund 4%/trade). Unproven cap is already ~4%.
+    Ceiling = min(SPORTS category cap, fund 4%/trade). A hot other-category
+    book cannot lift sports. Unproven cap is already ~4%.
     """
     try:
-        cap = float(per_trade_cap) if per_trade_cap is not None else float(dynamic_per_trade_cap())
+        if per_trade_cap is not None:
+            cap = float(per_trade_cap)
+        else:
+            cap = float(dynamic_per_trade_cap(category=CATEGORY))
     except Exception:
         cap = FUND_PER_TRADE_MAX
     cap = max(0.0, min(cap, FUND_PER_TRADE_MAX))
@@ -361,7 +365,7 @@ def get_optimal_bet_pct():
     dynamic_per_trade_cap directly; this stays in lockstep for the report line.
     """
     try:
-        return min(float(dynamic_per_trade_cap()), FUND_PER_TRADE_MAX)
+        return min(float(dynamic_per_trade_cap(category=CATEGORY)), FUND_PER_TRADE_MAX)
     except Exception:
         return FUND_PER_TRADE_MAX
 

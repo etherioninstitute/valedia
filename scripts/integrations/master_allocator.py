@@ -289,18 +289,20 @@ def allocate(opps, capital):
     
     allocations = []
     remaining = deployable
-    # Per-trade ceiling from the single source — breathes with the REAL track record / regime /
-    # Etherion risk (falls back to 15% if unavailable). Currently throttled small by the real
-    # (losing) ledger, which is correct: size to proven edge.
-    try:
-        _cap = _cfg.dynamic_per_trade_cap() if _cfg else 0.15
-    except Exception:
-        _cap = 0.15
-    max_per_opp = deployable * _cap
+    # Per-strategy ceiling from category_stats (fee-true). A hot fake/other
+    # category cannot lift this opp; paper/sandbox/unreconciled/backfill cannot
+    # lift. Falls back to 15% only if config is unavailable.
     
     for o in opps:
         if remaining < 0.50: break
         if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
+
+        cat = o.get("type") or o.get("strategy")
+        try:
+            _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15
+        except Exception:
+            _cap = 0.15
+        max_per_opp = deployable * _cap
         
         # Kelly-inspired: bet proportional to edge × confidence
         kelly_frac = o["ev_per_dollar"] * o["confidence"]

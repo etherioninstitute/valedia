@@ -1,18 +1,18 @@
 # Grok Build status
 
-**Updated:** 2026-09-16 23:40 PT
+**Updated:** 2026-09-17 14:40 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 6: Kalshi fill-before-EXECUTED + sports `dynamic_per_trade_cap` + SPORTS_TONIGHT→SPORTS + backfill exclude
+**Current:** SHIPPED — Slice 7: spot GET helpers OFF + per-strategy cap + stagger allocator vs sports crons
 
-**Last done:** Slice 6 on `valedia-v2-grok-build`
+**Last done:** Slice 7 on `valedia-v2-grok-build`
 
-- A) Kalshi taker fill-true: `sports_engine.execute_bets`, `master_allocator` Kalshi taker, and `kalshi_executor.execute_trade` no longer stamp `EXECUTED` + `record_entry(source=live)` on a bare POST-ack. `extract_kalshi_fill` / `book_kalshi_fill` record live only when fill count > 0 (order.fill_count, executed+remaining=0, or get_fills rows for that order_id). Else `UNRECONCILED` with `order_id`. Maker path still records on get_fills.
-- B) Sports sizing: `size_bets` uses `min(edge fraction, dynamic_per_trade_cap, 4% fund max)`. Retracted 86%/100% WR is not a sizing input (`LEAGUE_BONUS` gone; `get_optimal_bet_pct` no longer defaults to 86% or 10%).
-- C) One sports bucket: `kalshi_executor` strategy `"SPORTS_TONIGHT"` → `"SPORTS"`. `CATEGORY_ALIASES` folds leftover `SPORTS_TONIGHT` into `SPORTS` for `category_stats` / `should_trade_category` / park+retest. Two crons cannot split Kelly or dodge the sports gate.
-- D) `source` containing `backfill` (e.g. `backfill:pnl_tracker`) is `_is_non_real_source` — cannot lift `real_track_record` / Thorp opens / the 20-trade proven gate.
-- Tests: `test_kalshi_fill_ledger.py` + sports B1 + category-gate + Slice 1–5 tests PASS (no network). Mocked ack-without-fill does not increment Kelly/open; fill payload does.
+- A) Spot GET helpers: `coinbase_trader.get_order` + `alpaca_executor.get_order` + `spot_order_get.{coinbase_order_get,alpaca_order_get,live_spot_order_getter}`. Default cron still `mock_spot_order_getter` (no HTTP). `valedia_config.SPOT_RECONCILE_HTTP = False`. Flag-off helpers return None even if called. Tests inject `_request`/`_get` only.
+- B) **Single flip (Burton/Valedia later, not this lane):** `export SPOT_RECONCILE_HTTP=1` (or `valedia_config.SPOT_RECONCILE_HTTP = True`). Then `reconcile_run.get_spot_order_getter()` returns `live_spot_order_getter` (read-only GET). Do not enable from this lane.
+- C) Per-strategy cap: `category_track_record_mult` from fee-true `category_stats` (thin → 0.5, loser → 0.3, winner toward 1.0 within fuse). Wired into `dynamic_per_trade_cap(category=...)`, `sports_engine.size_bets` (SPORTS), `master_allocator.allocate` (per `type`), `KellySizer.size_position`. Paper/sandbox/unreconciled/backfill cannot lift. A hot other category cannot lift this one.
+- D) Cron stagger: sports `0 */2` (:00 every 2h), allocator `20 */4` (:20 every 4h) in `install_cron.sh` + `cron-schedule.md`. Offset = 20 min (`SPORTS_CRON_MINUTE=0`, `ALLOCATOR_CRON_MINUTE=20`). Worktree config only — live crontab is unchanged until Burton installs/merges.
+- Tests: `test_slice7.py` + Slice 3–6 suite PASS (no network). `SPOT_RECONCILE_HTTP` False ⇒ no HTTP.
 
 **Shipped:**
 - Slice 1 `e385c59` Intent seam
@@ -21,9 +21,10 @@
 - Slice 4 `f360513` GET-reconcile + brain shadow
 - Slice 5 `c3086df` reconcile_run wiring + rebalancer Intents
 - Slice 6 `659d4b7` Kalshi fill-true + sports cap + one SPORTS category + backfill exclude
+- Slice 7 (this commit) spot GET off + per-strategy cap + cron stagger
 
-**Goal:** Max fee-true realized P&L. Kalshi taker no longer Thorp-throttles the book on unfilled acks or inflates Kelly; sports cannot 10% a retracted WR.
+**Goal:** Max fee-true realized P&L. Crypto/equity *can* enter the ledger when Burton flips GET; winners are not starved by graves; sports and allocator cannot double-bet the same minute.
 
-**Fence:** No --live, no orders, no key changes, no NT writer cutover, no `nautilus_trader`. Tests mocked only.
+**Fence:** No --live, no orders, no key changes, no NT writer cutover, no `nautilus_trader`, **GET HTTP remains off**. Tests mocked only.
 
-**Next:** Slice 7 — spot GET helpers shipped off (`SPOT_RECONCILE_HTTP=False`) + per-strategy cap from `category_stats` + stagger `allocator_run` vs `sports_run`. Cron minute change can ship there. Do not enable GET HTTP from this lane.
+**Next:** Slice 8 — one fusion + one fee table; scalper/weather dead; `REBALANCER_AUTOEXEC=False`. Do not enable GET HTTP. Do not flip `VENUE_WRITER`.

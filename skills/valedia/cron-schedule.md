@@ -1,7 +1,7 @@
 ---
 description: >
   Complete cron schedule for Valedia. 24 jobs on Mac Studio. All times UTC.
-  Updated March 30, 2026.
+  Updated 2026-09-17 (Slice 7: sports :00 / allocator :20 stagger).
 ---
 
 # cron-schedule (24 jobs)
@@ -12,8 +12,9 @@ description: >
 |----------|-----|-----|--------|---------|
 | */30 * * * * | Every 30min | LATENCY ARB | arb_run.py | BTC/ETH spot vs Kalshi strikes (dry-run) |
 | 30 * * * * | Every hour | SETTLEMENT | settle_run.py | Check bet results, Signal profit alerts |
-| 0 */2 * * * | Every 2h | SPORTS ENGINE | sports_run.py | Scan+bet 70-85c favorites (live) |
-| 0 */4 * * * | Every 4h | MASTER ALLOCATOR | allocator_run.py | Cross-strategy capital allocation |
+| 0 */2 * * * | Every 2h at :00 | SPORTS ENGINE | sports_run.py | Scan+bet 70-85c favorites (live) |
+| 20 */4 * * * | Every 4h at :20 | MASTER ALLOCATOR | allocator_run.py | Cross-strategy capital allocation (staggered vs sports — Slice 7, no double-bet race) |
+| 0 */6 * * * | Every 6h | LEDGER RECONCILE | reconcile_run.py | Kalshi settle + spot UNRECONCILED walk (GET HTTP off by default) |
 | 0 */6 * * * | Every 6h | QUANT ENGINE | quant_run.py | LMSR+EV+Kelly quant scan |
 | 30 */6 * * * | Every 6h | MARKET SCANNER | scanner_run.py | 600+ Kalshi markets edge scoring |
 | 0 */6 * * * | Every 6h | WHALE MONITOR | whale_copier.py | Whale wallet monitoring |

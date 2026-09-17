@@ -8,7 +8,7 @@ ENV_CMD="export PATH=\$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:\$P
 SCRIPTS="/Users/burtonchatelain/.openclaw/workspace/scripts/integrations"
 
 # Clear existing Valedia crons
-crontab -l 2>/dev/null | grep -v "VALEDIA\|cron_runner_mac\|unified_brain\|hedge_fund\|fund_pipeline\|ml_kernel\|emerging\|insider\|whale\|rebalancer\|dca_module\|sentiment\|alpha_intel\|asi_scan" > /tmp/clean_cron
+crontab -l 2>/dev/null | grep -v "VALEDIA\|cron_runner_mac\|unified_brain\|hedge_fund\|fund_pipeline\|ml_kernel\|emerging\|insider\|whale\|rebalancer\|dca_module\|sentiment\|alpha_intel\|asi_scan\|sports_run\|allocator_run\|settle_run\|reconcile_run" > /tmp/clean_cron
 
 # Add all Valedia jobs (times in PT since Mac is PT)
 cat >> /tmp/clean_cron << 'CRON'
@@ -39,6 +39,15 @@ PATH=/usr/local/bin:/opt/homebrew/bin:/Users/burtonchatelain/.npm-global/bin:/us
 
 # Whale monitor (every 4 hours)
 0 */4 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh whale_copier.py "WHALE MONITOR" 2>&1
+
+# Kalshi live writers — STAGGERED (Slice 7). Sports :00 every 2h; allocator :20
+# every 4h. Same-minute collision was a double-bet race on 4h boundaries.
+0 */2 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh sports_run.py "SPORTS ENGINE" 2>&1
+20 */4 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh allocator_run.py "MASTER ALLOCATOR" 2>&1
+
+# Ledger (live crontab already ran these; installer was stale)
+30 * * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh settle_run.py "SETTLEMENT" 2>&1
+0 */6 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh reconcile_run.py "LEDGER RECONCILE" 2>&1
 
 # Weekly
 0 17 * * 0 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh dca_module.py "DCA" 2>&1

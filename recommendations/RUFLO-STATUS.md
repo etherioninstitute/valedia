@@ -1,4 +1,14 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 7 SHIPPED** (spot GET OFF + per-strategy cap + cron stagger)
+
+## Slice 7 (Grok Build executor, `valedia-v2-grok-build`)
+- Spot GET helpers exist (`spot_order_get.py`, Coinbase/Alpaca `get_order`) behind `SPOT_RECONCILE_HTTP=False`. Default cron = mock/no HTTP. Burton flip later: `export SPOT_RECONCILE_HTTP=1`.
+- Per-strategy cap from `category_stats` via `category_track_record_mult` → allocator + sports + KellySizer. Paper/unreconciled/backfill cannot lift.
+- Worktree crons staggered: sports `:00` / 2h, allocator `:20` / 4h. **Live crontab not rewritten by this slice** (still collides until merge/install).
+- Fence intact: no --live, no orders, no NT, no GET HTTP on.
+
+---
+
 Updated: 2026-09-13 PT — **SPRINT D: audit ✅ + B1 shipped to worktree (STOP for review)**
 
 ## Role

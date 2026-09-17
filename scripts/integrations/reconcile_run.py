@@ -8,6 +8,14 @@ Slice 5: also walks UNRECONCILED Coinbase/Alpaca rows via spot_reconcile
 with an **injected** getter. Default getter is a mock (returns None, no HTTP).
 Valedia runtime supplies a real GET later via set_spot_order_getter().
 
+Slice 7: real Coinbase/Alpaca GET helpers live in spot_order_get.py, gated by
+valedia_config.SPOT_RECONCILE_HTTP (default False). Default/cron path stays mock.
+
+Burton/Valedia single flip later (NOT this lane):
+    export SPOT_RECONCILE_HTTP=1
+  # or valedia_config.SPOT_RECONCILE_HTTP = True
+Then get_spot_order_getter() returns live_spot_order_getter (read-only GET).
+
 Never live venue HTTP on the default/test path. No nautilus_trader. No --live.
 Idempotent (already-settled entries are skipped); safe to run often.
 (c) GOATWORTHY Post LLC.
@@ -38,8 +46,22 @@ def set_spot_order_getter(fn):
 
 
 def get_spot_order_getter():
-    """Active getter. Default is mock_spot_order_getter (no HTTP)."""
-    return _spot_order_getter if _spot_order_getter is not None else mock_spot_order_getter
+    """Active getter. Default is mock_spot_order_getter (no HTTP).
+
+    If Valedia injected a callable, that wins. Else, only when
+    SPOT_RECONCILE_HTTP is on, return live_spot_order_getter. Flag-off
+    (shipped default) never imports or calls the HTTP helpers.
+    """
+    if _spot_order_getter is not None:
+        return _spot_order_getter
+    try:
+        import valedia_config as vc
+        if vc.spot_reconcile_http_enabled():
+            from spot_order_get import live_spot_order_getter
+            return live_spot_order_getter
+    except Exception:
+        pass
+    return mock_spot_order_getter
 
 
 def reconcile_unreconciled_run(getter=None, rows=None):

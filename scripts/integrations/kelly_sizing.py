@@ -200,8 +200,10 @@ class KellySizer:
         if n_conc > 1:
             adjusted_frac /= math.sqrt(n_conc)
 
-        # Dynamic per-trade ceiling — breathes with regime/track-record/risk; fused at KELLY_FUSE
-        adjusted_frac = min(adjusted_frac, dynamic_per_trade_cap(regime, track_record_mult, risk_factor))
+        # Dynamic per-trade ceiling — breathes with regime/track-record/risk; fused at KELLY_FUSE.
+        # category uses fee-true category_stats so a hot grave cannot lift this strategy.
+        adjusted_frac = min(adjusted_frac, dynamic_per_trade_cap(
+            regime, track_record_mult, risk_factor, category=category))
         
         # Check daily risk budget
         remaining_daily = self.max_daily_risk - self.daily_risked

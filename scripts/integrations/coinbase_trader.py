@@ -89,6 +89,24 @@ def market_sell(pair, crypto_amount):
         return rec
     return {"success": False, "error": r.text[:300]}
 
+def get_order(order_id):
+    """Read-only GET of one order by id. Not a fill until qty+price parse complete.
+
+    Path: /api/v3/brokerage/orders/historical/{order_id}. Fail-closed → None.
+    Slice 7: called from spot_order_get only when SPOT_RECONCILE_HTTP is on.
+    """
+    if not order_id:
+        return None
+    try:
+        r = _request("GET", f"/api/v3/brokerage/orders/historical/{order_id}")
+        if not r.ok:
+            return None
+        body = r.json()
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
 def get_orders(status="OPEN"):
     r = _request("GET", f"/api/v3/brokerage/orders/historical?order_status={status}&limit=10")
     if not r.ok: return []

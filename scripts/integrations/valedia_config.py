@@ -46,6 +46,18 @@ CATEGORY_MIN_TRADES    = 4      # min REAL settled trades in-window before a blo
 CATEGORY_LOOKBACK_DAYS = 45     # recency window; stale real losses age out -> automatic retest
 CATEGORY_BLOCK_NET     = 0.0    # block only if fee-inclusive net is an actual loss (< $0.00)
 
+# Spot GET-reconcile HTTP. Default OFF. Slice 7 ships Coinbase/Alpaca GET helpers;
+# the default cron path stays mock/no HTTP. Burton/Valedia later uses ONE flip:
+#   export SPOT_RECONCILE_HTTP=1
+# or set SPOT_RECONCILE_HTTP = True below. This lane never sets True.
+# Enabling live GET is a Valedia go, not a coding-agent go.
+SPOT_RECONCILE_HTTP = False
+
+# Cron stagger (Slice 7): sports every 2h at :00, allocator every 4h at :20.
+# Same-minute collision was a double-bet race on 4h boundaries.
+SPORTS_CRON_MINUTE = 0
+ALLOCATOR_CRON_MINUTE = 20
+
 # Execution policy (execution_policy.py maker-order layer). DRY-RUN by default: Valedia decides
 # maker/taker/no_trade autonomously, but placing REAL resting maker orders stays off until proven
 # on paper (earn it). Flip to False to let her place/manage live maker orders under her risk stack.
@@ -53,6 +65,18 @@ EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master
 
 import os as _os, json as _json   # for auto-sourcing live track-record / risk state
 _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
+
+def spot_reconcile_http_enabled():
+    """True only if Burton/Valedia flipped the spot GET HTTP flag.
+
+    Env SPOT_RECONCILE_HTTP=1/true/yes/on wins over the constant. Anything
+    else (unset, empty, 0, false) is OFF. Default constant is False.
+    """
+    env = _os.environ.get("SPOT_RECONCILE_HTTP")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    return bool(SPOT_RECONCILE_HTTP)
+
 
 def _track_record_mult():
     """Track-record scalar from the REAL fee-inclusive settlement ledger (forward_test_ledger,
@@ -88,16 +112,66 @@ def _risk_factor():
     except Exception:
         return 1.0
 
-def dynamic_per_trade_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor=None):
+def category_track_record_mult(category):
+    """Per-strategy Kelly scalar from fee-true category_stats (not the global mix).
+
+    Thin (< KELLY_MIN_PROVEN_TRADES real settled in-window) → KELLY_UNPROVEN_MULT (0.5).
+    Loser (net < 0 or hit-rate ≤ 40) → 0.3.
+    Winner earns toward 1.0 (never above 1.0; KELLY_FUSE still binds the cap).
+    Paper/sandbox/unreconciled/backfill never appear in category_stats, so they
+    cannot lift a category. A hot fake/other category cannot lift this one.
+    Alias labels (SPORTS_TONIGHT) fold into the canonical bucket.
+    Any error → unproven 0.5.
+    """
+    if not category:
+        return KELLY_UNPROVEN_MULT
+    try:
+        import sys as _sys
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+        import forward_test_ledger as _ftl
+        cat = _ftl.canonical_category(category)
+        s = _ftl.category_stats().get(cat)
+        if not s or int(s.get("n") or 0) < KELLY_MIN_PROVEN_TRADES:
+            return KELLY_UNPROVEN_MULT
+        n = int(s["n"])
+        wins = int(s.get("wins") or 0)
+        net = float(s.get("net") or 0)
+        hit = (wins / n) * 100.0 if n else 0.0
+        if net < 0 or hit <= 40:
+            return 0.3
+        if hit >= 65 and net > 0:
+            return 1.0
+        if hit >= 60:
+            return 0.9
+        if hit >= 55:
+            return 0.8
+        if hit >= 50:
+            return 0.7
+        return KELLY_UNPROVEN_MULT
+    except Exception:
+        return KELLY_UNPROVEN_MULT
+
+
+def dynamic_per_trade_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor=None,
+                          category=None):
     """Per-trade position ceiling that BREATHES with regime + live track-record + live Etherion risk:
         cap = KELLY_BASE_CAP * regime_factor * track_record * risk, fused at KELLY_FUSE.
     track_record_mult / risk_factor default to None -> AUTO-SOURCED from the canonical state files
     (brain_log.json recent hit-rate; latest_etherion_risk.json risk_level). Pass values to override.
+    category: when set (and track_record_mult is None) uses category_track_record_mult so a
+    hot grave/fake book cannot lift a different strategy. Paper/unreconciled/backfill cannot lift.
     - regime: favorable regime raises the ceiling so the regime-boosted Kelly fraction isn't clipped.
     Returns a capital fraction in [0, KELLY_FUSE]."""
     rf = KELLY_REGIME_CAP_FACTOR.get(regime, 1.0)
-    tr   = _track_record_mult() if track_record_mult is None else float(track_record_mult)
-    risk = _risk_factor()       if risk_factor is None       else float(risk_factor)
+    if track_record_mult is not None:
+        tr = float(track_record_mult)
+    elif category:
+        tr = category_track_record_mult(category)
+    else:
+        tr = _track_record_mult()
+    risk = _risk_factor() if risk_factor is None else float(risk_factor)
     cap = KELLY_BASE_CAP * rf * max(0.0, tr) * max(0.0, risk)
     return max(0.0, min(cap, KELLY_FUSE))
 

@@ -40,6 +40,7 @@ def _cb_get(oid="oid-run", size="0.01", px="2000", fee="0.22"):
 
 
 def run():
+    os.environ.pop("SPOT_RECONCILE_HTTP", None)
     src = open(os.path.join(HERE, "reconcile_run.py")).read()
     assert "import requests" not in src
     assert "import coinbase_trader" not in src
@@ -52,6 +53,9 @@ def run():
     assert "ftl.reconcile()" in src
     assert vc.VENUE_WRITER["coinbase"] == "valedia"
     assert vc.NAUTILUS_ENABLED is False
+    assert vc.SPOT_RECONCILE_HTTP is False
+    assert vc.spot_reconcile_http_enabled() is False
+    assert "SPOT_RECONCILE_HTTP" in src
 
     rr.set_spot_order_getter(None)
     assert rr.get_spot_order_getter() is rr.mock_spot_order_getter
