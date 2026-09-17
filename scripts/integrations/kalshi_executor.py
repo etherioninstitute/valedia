@@ -207,7 +207,7 @@ def _score_market(m, series):
         if ya >= 0.60 and ya <= 0.85:
             roi_pct = (1.0 - ya) / ya * 100
             score = 50 + roi_pct * 0.5
-            strategy = "SPORTS_TONIGHT"
+            strategy = "SPORTS"
             side = "yes"
             price = ya
             edge = 1.0 - ya - kalshi_fee_per_contract(ya)
@@ -216,7 +216,7 @@ def _score_market(m, series):
             no_cost = na if na > 0 else (1.0 - ya)
             roi_pct = (1.0 - no_cost) / no_cost * 100
             score = 50 + roi_pct * 0.5
-            strategy = "SPORTS_TONIGHT"
+            strategy = "SPORTS"
             side = "no"
             price = no_cost
             edge = 1.0 - no_cost - kalshi_fee_per_contract(no_cost)
@@ -332,7 +332,7 @@ def _size_contracts(opp, state, cost_per):
     if max_spend < 0.10:
         return 0
     n = int(max_spend / cost_per)
-    cap = 100 if opp.get("strategy") in ("CONVICTION_YES", "CONVICTION_NO", "SPORTS_TONIGHT") else 50
+    cap = 100 if opp.get("strategy") in ("CONVICTION_YES", "CONVICTION_NO", "SPORTS", "SPORTS_TONIGHT") else 50
     n = max(1, min(n, cap))
     fee = n * kalshi_fee_per_contract(cost_per)
     if n * cost_per + fee > state["balance"]:
@@ -375,8 +375,16 @@ def execute_trade(opp, state, dry_run=False):
             count=n_contracts, price_cents=price_cents,
             order_type="limit"
         )
-        result["status"] = "EXECUTED"
         result["order"] = order
+        fill = {}
+        if _ftl:
+            try:
+                fill = _ftl.extract_kalshi_fill(order)
+            except Exception:
+                fill = {}
+        result["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+        if fill.get("order_id"):
+            result["order_id"] = fill["order_id"]
     except Exception as e:
         result["status"] = "FAILED"
         result["error"] = str(e)[:200]
@@ -592,17 +600,21 @@ def run(dry_run=False, max_trades=5, min_score=40):
 
         result = execute_trade(opp, state, dry_run=dry_run)
         _log_trade(result)
-        # Record the real fill in the fee-inclusive ledger (settled later by reconcile()).
-        # Defensive: ledger bookkeeping must never block or fail a trade.
-        if _ftl and result.get("status") == "EXECUTED":
+        # Fill-true ledger: POST-ack without fill count is UNRECONCILED, never live.
+        if _ftl and result.get("status") in ("EXECUTED", "UNRECONCILED"):
             try:
-                _ftl.record_entry(result["strategy"], result["ticker"], result["side"],
-                                  result["price_cents"] / 100.0, result["contracts"],
-                                  venue="kalshi", source="live")
+                _ftl.book_kalshi_fill(
+                    _ftl.canonical_category(result["strategy"]),
+                    result["ticker"], result["side"], result.get("order") or {},
+                    intended_source="live",
+                    fallback_price=result["price_cents"] / 100.0,
+                    fallback_contracts=result["contracts"])
             except Exception:
                 pass
         
-        status_icon = "✅" if result["status"] == "EXECUTED" else "🔶" if result["status"] == "DRY_RUN" else "❌"
+        status_icon = ("✅" if result["status"] == "EXECUTED"
+                       else "⏳" if result["status"] == "UNRECONCILED"
+                       else "🔶" if result["status"] == "DRY_RUN" else "❌")
         lines.append(
             f"  {status_icon} {result['strategy']:15} {result['side']:3} "
             f"x{result['contracts']} @{result['price_cents']}¢ "
@@ -612,7 +624,7 @@ def run(dry_run=False, max_trades=5, min_score=40):
         if result.get("error"):
             lines.append(f"    ERROR: {result['error']}")
         
-        if result["status"] == "EXECUTED":
+        if result["status"] in ("EXECUTED", "UNRECONCILED"):
             trades_placed += 1
             state["max_deployable"] -= result["total_cost"]
             state["balance"] -= result["total_cost"]

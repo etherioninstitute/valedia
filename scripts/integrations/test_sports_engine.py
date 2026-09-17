@@ -31,21 +31,33 @@ def run():
     assert abs(b['profit_if_win'] - round(gross - fee, 2)) < 1e-9, b['profit_if_win']
     assert b['profit_if_win'] < gross, "profit must be net of fee"
 
-    # 2. EXECUTED fills record to the ONE ledger under SPORTS; DRY_RUN records nothing / no order.
-    calls = {'orders': 0, 'records': []}
-    se.create_order = lambda *a, **k: calls.__setitem__('orders', calls['orders'] + 1)
+    # 2. Bare POST-ack is UNRECONCILED (not live). Fill payload is EXECUTED + live.
+    #    DRY_RUN records nothing / no order. book_kalshi_fill is stubbed (no disk).
+    calls = {'orders': 0, 'books': []}
+    se.create_order = lambda *a, **k: (calls.__setitem__('orders', calls['orders'] + 1) or
+                                       {"order": {"order_id": "ack-only", "status": "resting"}})
     kalshi_auth.get_positions = lambda: {'market_positions': []}
-    se.ftl.record_entry = lambda *a, **k: calls['records'].append((a, k))
+    orig_book = se.ftl.book_kalshi_fill
+    se.ftl.book_kalshi_fill = lambda *a, **k: calls['books'].append((a, k)) or "ft_stub"
 
     res = se.execute_bets([_bet()], dry_run=False)
-    assert res[0]['status'] == 'EXECUTED', res[0]
-    assert calls['orders'] == 1 and len(calls['records']) == 1, calls
-    assert calls['records'][0][0][0] == se.CATEGORY, "must record under SPORTS category"
+    assert res[0]['status'] == 'UNRECONCILED', res[0]
+    assert calls['orders'] == 1 and len(calls['books']) == 1, calls
+    assert calls['books'][0][0][0] == se.CATEGORY, "must book under SPORTS category"
 
-    calls['orders'] = 0; calls['records'] = []
+    calls['orders'] = 0; calls['books'] = []
+    se.create_order = lambda *a, **k: (calls.__setitem__('orders', calls['orders'] + 1) or
+                                       {"order": {"order_id": "f1", "status": "executed",
+                                                  "fill_count": 5, "yes_price": 80}})
+    res = se.execute_bets([_bet()], dry_run=False)
+    assert res[0]['status'] == 'EXECUTED', res[0]
+    assert calls['orders'] == 1 and len(calls['books']) == 1, calls
+
+    calls['orders'] = 0; calls['books'] = []
     res = se.execute_bets([_bet()], dry_run=True)
     assert res[0]['status'] == 'DRY_RUN', res[0]
-    assert calls['orders'] == 0 and len(calls['records']) == 0, "DRY_RUN must not order or record"
+    assert calls['orders'] == 0 and len(calls['books']) == 0, "DRY_RUN must not order or record"
+    se.ftl.book_kalshi_fill = orig_book
 
     # 3. Settlement skips DRY_RUN entirely; loss P&L is fee-inclusive.
     log = {'bets': [

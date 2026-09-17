@@ -45,6 +45,18 @@ def run():
           {"parked": ["OIL_BRACKET"], "retest": ["OIL_BRACKET"]})
     assert ftl.should_trade_category("OIL_BRACKET")[0] is True  # retest wins
 
+    # 7. SPORTS_TONIGHT and SPORTS are one bucket: a SPORTS loss blocks both labels;
+    #    parking SPORTS parks SPORTS_TONIGHT (and the reverse).
+    _with({"SPORTS": {"n": 4, "wins": 0, "net": -12.0}})
+    ok, why = ftl.should_trade_category("SPORTS_TONIGHT")
+    assert ok is False, why
+    ok, why = ftl.should_trade_category("SPORTS")
+    assert ok is False, why
+    _with({}, {"parked": ["SPORTS"]})
+    assert ftl.should_trade_category("SPORTS_TONIGHT")[0] is False
+    _with({}, {"parked": ["SPORTS_TONIGHT"], "retest": ["SPORTS"]})
+    assert ftl.should_trade_category("SPORTS_TONIGHT")[0] is True  # retest on canonical wins
+
     print("category-gate safety checks: PASS")
 
 

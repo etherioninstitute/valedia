@@ -1,25 +1,21 @@
-"""Valedia Sports Engine v1.0 — The One Bulletproof Strategy
-═══════════════════════════════════════════════════════════════════════════
-PROVEN: 86% win rate on 70-85¢ favorites (6W/1L real money)
-RULE: Only bet favorites priced 70-85¢. Nothing else. Ever.
-EDGE: Market says 77% chance. We win 86%. That 9% gap = profit.
+"""Valedia Sports Engine v1.0 — 70-85¢ favorites only.
 
-This is Valedia's money printer. One strategy. Fully tested. Fully autonomous.
-Everything else was distraction.
+Sizing is the same unproven throttle the allocator uses (dynamic_per_trade_cap,
+~4%/trade while the fee-true ledger is thin). The old 86%/100% WR was retracted
+(W vs WIN bug + no-horizon resolver) — it is not a sizing input.
 
 Architecture:
   1. SCAN — Find all sports games resolving in next 24h
-  2. FILTER — Only 70-85¢ favorites (the proven edge)
-  3. SIZE — 6% of bankroll per game (Half-Kelly for 86% edge)
-  4. EXECUTE — Place limit orders at the ask
-  5. TRACK — Log every bet with outcome for learning
-  6. LEARN — Nightly: compute real win rate, adjust sizing
+  2. FILTER — Only 70-85¢ favorites
+  3. SIZE — min(edge table, dynamic_per_trade_cap); never 10% while unproven
+  4. EXECUTE — Limit at the ask; EXECUTED+live only on real fill data
+  5. TRACK — fee-inclusive ledger (UNRECONCILED until fill-true)
 
 (c) GOATWORTHY Post LLC. All rights reserved.
 """
 import os, sys, json, time
 from datetime import datetime, timezone, timedelta
-from valedia_config import KELLY_SAFETY_FRACTION  # shared source of truth
+from valedia_config import dynamic_per_trade_cap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.expanduser("~/.openclaw/workspace/models")
@@ -41,7 +37,7 @@ import forward_test_ledger as ftl  # the ONE fee-inclusive ledger (record_entry 
 # ═══ CONFIGURATION — THE ONLY KNOBS ═══
 MIN_PRICE = 0.70  # Minimum favorite price (below = too risky)
 MAX_PRICE = 0.85  # Maximum favorite price (above = no edge over market)
-BET_PCT = 0.06    # 6% of bankroll per game (Half-Kelly)
+FUND_PER_TRADE_MAX = 0.04  # fund-rules.md 4%/trade; unproven cap already ~4%
 MAX_GAMES = 12    # Max games per cycle (diversification)
 SERIES = ['KXNBAGAME', 'KXNHLGAME', 'KXNCAAMBGAME']  # MLB KILLED: 4W/3L -$24.94
 CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
@@ -185,8 +181,7 @@ def scan_games():
     for g in games:
         league = g.get('league', '')
         
-        # League track record: NBA/NCAAMB proven 100%, NHL decent, others neutral
-        # This IS our edge — we know which leagues we win in
+        # League rank only (not a sizing input). Retracted 86%/100% WR is not used.
         league_edge = {'NBA': 10, 'NCAAMB': 10, 'NHL': 0}.get(league, -5)
         if league_edge != 0:
             g['edge_score'] += league_edge
@@ -210,38 +205,32 @@ def scan_games():
 
 # ═══ STEP 2: SIZE — Calculate bet sizes ═══
 
-def size_bets(games, bankroll):
-    """Size each bet using edge_score + league WR history.
-    Base: 6% of bankroll. Boosted up to 10% for high-edge + proven leagues.
-    Reduced to 4% for marginal games. Skipped if edge_score < -10."""
-    # League performance bonuses (from real settled data)
-    LEAGUE_BONUS = {
-        'NBA': 15,      # 8W/0L = 100% WR → always high conviction
-        'NCAAMB': 15,   # 3W/0L = 100% WR → always high conviction
-        'NHL': 0,       # 4W/2L = 67% WR → neutral
-    }
+def size_bets(games, bankroll, per_trade_cap=None):
+    """Size each bet through dynamic_per_trade_cap (same throttle as allocator).
+
+    Edge ranks and can skip (< -10); it does not unlock 10% off a retracted WR.
+    Ceiling = min(live cap, fund 4%/trade). Unproven cap is already ~4%.
+    """
+    try:
+        cap = float(per_trade_cap) if per_trade_cap is not None else float(dynamic_per_trade_cap())
+    except Exception:
+        cap = FUND_PER_TRADE_MAX
+    cap = max(0.0, min(cap, FUND_PER_TRADE_MAX))
     bets = []
     for g in games[:MAX_GAMES]:
         edge = g.get('edge_score', 0)
-        league = g.get('league', '')
-        edge += LEAGUE_BONUS.get(league, 0)  # Boost proven leagues
-        
-        # Skip games with negative combined intelligence
         if edge < -10:
             continue
-        
-        # Variable sizing based on edge score
+        # Conviction as a fraction of the live cap — never a 10% WR printer.
         if edge >= 25:
-            pct = 0.10  # Elite conviction (NBA/NCAAMB + good signals) — 10%
-        elif edge >= 20:
-            pct = 0.09  # High conviction — 9% of bankroll
+            frac = 1.00
         elif edge >= 10:
-            pct = 0.07  # Good edge — 7%
+            frac = 0.75
         elif edge >= 0:
-            pct = 0.06  # Standard — 6%
+            frac = 0.60
         else:
-            pct = 0.04  # Marginal — 4%
-        
+            frac = 0.50
+        pct = min(frac * cap, cap)
         bet_size = bankroll * pct
         n_contracts = max(1, int(bet_size / g['fav_price']))
         cost = n_contracts * g['fav_price']
@@ -286,14 +275,20 @@ def execute_bets(bets, dry_run=False):
         
         try:
             price_cents = int(b['fav_price'] * 100)
-            create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents)
-            r['status'] = 'EXECUTED'
-            # Record the real fill in the ONE fee-inclusive ledger (settled later by reconcile).
+            resp = create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents)
+            fill = ftl.extract_kalshi_fill(resp)
+            r['order_id'] = fill.get('order_id')
+            r['status'] = 'EXECUTED' if fill['complete'] else 'UNRECONCILED'
             try:
-                ftl.record_entry(CATEGORY, b['fav_ticker'], 'yes', b['fav_price'],
-                                 b['contracts'], venue="kalshi", source="live")
+                ftl.book_kalshi_fill(
+                    CATEGORY, b['fav_ticker'], 'yes', resp,
+                    intended_source="live",
+                    fallback_price=b['fav_price'],
+                    fallback_contracts=b['contracts'])
             except Exception as e:
-                print(f"[sports_engine] ftl.record_entry failed: {e}", file=sys.stderr)
+                print(f"[sports_engine] ftl.book_kalshi_fill failed: {e}", file=sys.stderr)
+                if r['status'] == 'EXECUTED':
+                    r['status'] = 'UNRECONCILED'  # never silent-live if bookkeeping failed
         except Exception as e:
             r['status'] = 'FAILED'
             r['error'] = str(e)[:80]
@@ -360,25 +355,15 @@ def check_settlements():
 # ═══ STEP 5: LEARN — Adjust based on real results ═══
 
 def get_optimal_bet_pct():
-    """Compute optimal bet size from actual win rate using Kelly Criterion.
-    f* = (bp - q) / b where b=odds, p=win rate, q=loss rate"""
-    log = load_log()
-    stats = log.get("stats", {})
-    n = stats.get("total_bets", 0)
-    
-    if n < 5:
-        return BET_PCT  # Not enough data, use default 6%
-    
-    p = stats.get("win_rate", 86) / 100
-    avg_price = 0.77  # Average price in our range
-    b = (1 - avg_price) / avg_price  # Average odds
-    q = 1 - p
-    
-    kelly = (b * p - q) / b
-    half_kelly = kelly * KELLY_SAFETY_FRACTION  # half-Kelly (shared: valedia_config)
-    
-    # Clamp between 2% and 10%
-    return max(0.02, min(0.10, half_kelly))
+    """Display/report size = live throttle. Not the retracted sports-log WR.
+
+    sports_engine_log is not the admissible ledger (SDA HOLDS). Size_bets uses
+    dynamic_per_trade_cap directly; this stays in lockstep for the report line.
+    """
+    try:
+        return min(float(dynamic_per_trade_cap()), FUND_PER_TRADE_MAX)
+    except Exception:
+        return FUND_PER_TRADE_MAX
 
 # ═══ MAIN: Full cycle ═══
 
@@ -411,7 +396,7 @@ def run(dry_run=False):
     
     # Show intelligence context
     fg = get_fear_greed()
-    lines.append(f"INTEL: Fear/Greed={fg} | Edge: league_bonus + spread + price + injuries + F&G")
+    lines.append(f"INTEL: Fear/Greed={fg} | Edge: spread + price + injuries + F&G (WR not a size input)")
     
     # Adaptive sizing from real results
     optimal_pct = get_optimal_bet_pct()
@@ -440,7 +425,7 @@ def run(dry_run=False):
                      f"| {b['fav_title'][:30]}")
     
     lines.append(f"\nTOTAL: ${total_cost:.2f} deployed, ${total_potential:.2f} potential profit")
-    lines.append(f"BET SIZE: {optimal_pct*100:.1f}% of bankroll (Kelly-adjusted)")
+    lines.append(f"BET SIZE: {optimal_pct*100:.1f}% of bankroll (dynamic cap, fund 4% max)")
     
     # Loss-based category gate (real fee-inclusive ledger; fail-open, never permanent).
     try:
@@ -460,7 +445,10 @@ def run(dry_run=False):
     
     lines.append(f"\nEXECUTED: {len(executed)} | SKIPPED: {len(skipped)}")
     for r in results:
-        icon = "✅" if r['status'] == 'EXECUTED' else "🔶" if r['status'] == 'DRY_RUN' else "⏭" if 'SKIP' in r['status'] else "❌"
+        icon = ("✅" if r['status'] == 'EXECUTED'
+                     else "⏳" if r['status'] == 'UNRECONCILED'
+                     else "🔶" if r['status'] == 'DRY_RUN'
+                     else "⏭" if 'SKIP' in r['status'] else "❌")
         lines.append(f"  {icon} {r['status']:12} {r['fav_title'][:30]} ${r['cost']:.2f}")
         if r.get('error'): lines.append(f"    ERR: {r['error']}")
     

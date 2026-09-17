@@ -464,16 +464,24 @@ def execute_allocations(allocations, dry_run=False):
                     _clear_kalshi_failure(a["ticker"])
                 else:
                     resp = create_order(a["ticker"], a["side"], n, price_cents)
-                    r["status"] = "EXECUTED"
                     r["contracts"] = n
                     _clear_kalshi_failure(a["ticker"])
-                    # Record the real fill in the fee-inclusive ledger (settled later by reconcile).
+                    # Fill-true only. Bare POST-ack is UNRECONCILED — never a live open.
+                    fill = {}
                     if _ftl:
                         try:
-                            _ftl.record_entry(a.get("type", "KALSHI"), a["ticker"], a["side"],
-                                              price_cents / 100.0, n, venue="kalshi", source="live")
+                            fill = _ftl.extract_kalshi_fill(resp)
+                            _ftl.book_kalshi_fill(
+                                _ftl.canonical_category(a.get("type", "KALSHI")),
+                                a["ticker"], a["side"], resp,
+                                intended_source="live",
+                                fallback_price=price_cents / 100.0,
+                                fallback_contracts=n)
                         except Exception:
-                            pass
+                            fill = {}
+                    r["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+                    if fill.get("order_id"):
+                        r["order_id"] = fill["order_id"]
             
             elif a["platform"] == "coinbase":
                 # Shadow Intent (Slice 2): never dispatchable; writer stays valedia.
