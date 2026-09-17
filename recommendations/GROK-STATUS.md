@@ -6,7 +6,7 @@
 
 **Current:** SHIPPED — Slice 8: one fusion + one fee table; scalper/weather dead; REBALANCER_AUTOEXEC=False
 
-**Shipped:** Slices 1–8 (`e385c59` … this commit)
+**Shipped:** Slices 1–8 (`e385c59` … `02987c3`)
 
 **Fence:** No GET HTTP enable. No VENUE_WRITER flip. No --live orders. No NT cutover. REBALANCER_AUTOEXEC=False. SCALPER_LIVE/WEATHER_LIVE hard-off.
 
