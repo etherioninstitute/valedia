@@ -17,10 +17,14 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (NT-1 enrichment JSON; Slice 22/23 versioning). Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.24.0"
+# Runtime identity (NT-2 signal/ledger neural_enriched tag; Slice 22/23 versioning).
+# Not a substitute for MANUSCRIPT_VERSION.
+VALEDIA_VERSION = "0.25.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
+# MIROFISH_* caps. AUTO_RAISE stays False until Burton master flip
+# (VALEDIA_SELF_ADJUST). Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
+# NT-2 tags neural_enriched only — no weight math in this slice.
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
 MIROFISH_UNPROVEN_CAP = 0.10   # Slice 13: never exceed while accuracy unproven
 MIROFISH_PROVEN_CAP   = 0.15   # 10–15% ceiling even if proven

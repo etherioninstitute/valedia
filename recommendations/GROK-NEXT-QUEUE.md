@@ -1,16 +1,20 @@
-# Arc G — neural-trader → MiroFish (Burton GO 2026-09-18)
-
-Charter: `VALEDIA-NEURAL-TRADER-FENCED.md` + local models section.
+# Grok Build queue (Burton — seamless adapt)
 
 ## DONE this session
-- **NT-0** `6f594d1` — pin `tools/neural-trader@2.8.11` `--ignore-scripts`; research allowlist; live/broker unreachable. `NT-0-SMOKE.md`.
-- **NT-1** — `mirofish_neural_enrichment.json` writer; tests mocked; `VALEDIA_VERSION` 0.24.0.
-- Optional: `valedia_models.sh mirofish-sync|mirofish-report [--write]`.
+- **NT-2** — enrichment wired into seed + extractor; ledger `neural_enriched`; tests mocked; `VALEDIA_VERSION` 0.25.0. `MIROFISH_AUTO_RAISE` still False; caps 0.10/0.15; no weight math.
 
 ## STOP
-Do not start **NT-3** OpenTerminal UI this session.
+Do not start **NT-3** OpenTerminal or dynamic-band/`VALEDIA_SELF_ADJUST` this session. Next named slice after Burton approval: dynamic band + master flip.
 
-## Later (Burton go)
-- **NT-2** — wire enrichments into MiroFish seed/extractor; accuracy ledger tags `neural_enriched`.
-- **NT-3** — OpenTerminal Valedia+MiroFish read-only panel.
-- **NT-4** — optional RuFlo `trading-*` memory namespaces (still no live).
+## Later (Burton go — after this STOP)
+### H1 — Deep analyze (seamless architecture)
+Per `VALEDIA-REPO-ADAPTATION.md` + `GROK-BUILD-LOOP.md`:
+- Dossiers in `recommendations/ADAPT-DOSSIERS/` for: ai-fund, OpenTerminal, hypergrok-trading-desk, nautilus_trader, kalshi-agent (personal-use OK), lf-game-theory, fortress
+- One **seamless integration map**: how each feeds MiroFish / brain / UI / shadow without duplicate Kelly/FTL
+- Output: `recommendations/VALEDIA-SEAMLESS-ARCHITECTURE.md`
+
+### H1b — Ponytail audit of H1 docs? skip — docs only
+### Then H2 coding — ai-fund personas → MiroFish lenses
+**After H2 codes: mandatory Ponytail audit** of the new modules.
+
+Live venue fences still held unless Burton flips.

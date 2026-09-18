@@ -134,6 +134,103 @@ def build_enrichment(mirofish_signal, regime_by_symbol=None, signal_by_symbol=No
     }
 
 
+def slim_neural(entry):
+    """Regime/signal context only. unknown+HOLD+no quality → None (not enriched)."""
+    if not isinstance(entry, dict):
+        return None
+    regime = entry.get("regime") if isinstance(entry.get("regime"), dict) else {}
+    sig = entry.get("signal") if isinstance(entry.get("signal"), dict) else {}
+    label = str(regime.get("label") or "").strip()
+    direction = str(sig.get("direction") or "").strip()
+    quality = sig.get("quality")
+    known_regime = label.lower() not in ("", "unknown")
+    known_sig = quality is not None or direction.upper() not in ("", "HOLD")
+    if not known_regime and not known_sig:
+        return None
+    return {
+        "regime": {"label": label or "unknown", "confidence": _f(regime.get("confidence"))},
+        "signal": {
+            "direction": direction or "HOLD",
+            "quality": None if quality is None else _f(quality),
+        },
+        "present": True,
+    }
+
+
+def load_enrichment(path=None):
+    """NT-1 JSON. Missing/empty → {}. Never raises for I/O/parse."""
+    try:
+        if path:
+            d = _load(path)
+            return d if isinstance(d, dict) else {}
+        d = _load(_OUT)
+        if isinstance(d, dict) and d.get("symbols"):
+            return d
+        live = os.path.expanduser(
+            "~/.openclaw/workspace/models/mirofish_neural_enrichment.json"
+        )
+        d = _load(live)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def attach_to_signal(signal_doc, enrichment=None):
+    """Stamp per-symbol neural context. Does not change score/direction/bias/weight."""
+    doc = dict(signal_doc or {})
+    sigs = dict(doc.get("signals") or {})
+    enr = enrichment if enrichment is not None else load_enrichment()
+    symbols = (enr or {}).get("symbols") if isinstance(enr, dict) else {}
+    if not isinstance(symbols, dict):
+        symbols = {}
+    any_hit = False
+    out = {}
+    for k, v in sigs.items():
+        blob = dict(v) if isinstance(v, dict) else {"direction": v}
+        slim = slim_neural(symbols.get(canon_symbol(k)) or symbols.get(k) or {})
+        if slim:
+            blob["neural"] = slim
+            any_hit = True
+        out[k] = blob
+    doc["signals"] = out
+    doc["neural_enriched"] = any_hit
+    return doc
+
+
+def seed_section(enrichment=None):
+    """Markdown for MiroFish seed. Empty string if nothing to attach."""
+    enr = enrichment if enrichment is not None else load_enrichment()
+    symbols = (enr or {}).get("symbols") if isinstance(enr, dict) else {}
+    if not isinstance(symbols, dict):
+        return ""
+    lines = []
+    for sym, entry in sorted(symbols.items()):
+        slim = slim_neural(entry)
+        if not slim:
+            continue
+        r, s = slim["regime"], slim["signal"]
+        q = s.get("quality")
+        qpart = f" quality {q}" if q is not None else ""
+        lines.append(
+            f"- **{sym}**: regime {r.get('label')} ({r.get('confidence')}); "
+            f"neural signal {s.get('direction')}{qpart}."
+        )
+    if not lines:
+        return ""
+    return (
+        "## Neural-trader context (advisory, not an order)\n"
+        "Research regime/signal prior for the swarm. Not a live order "
+        "and not a fusion-weight change.\n" + "\n".join(lines)
+    )
+
+
+def apply_seed_text(text, enrichment=None):
+    extra = seed_section(enrichment)
+    if not extra:
+        return text
+    return (text or "").rstrip() + "\n\n" + extra + "\n"
+
+
 def write_enrichment(obj, path=None):
     path = path or _OUT
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

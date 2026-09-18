@@ -178,6 +178,12 @@ def record(signal_doc=None):
         if _norm_dir(direction) is None:
             continue
         score = blob.get("score")
+        neural = False
+        if isinstance(blob, dict):
+            nblob = blob.get("neural")
+            neural = bool(isinstance(nblob, dict) and nblob.get("present"))
+            if blob.get("neural_enriched") is True:
+                neural = True
         _append({
             "type": "prediction",
             "pred_id": f"{pid}_{asset}",
@@ -188,6 +194,7 @@ def record(signal_doc=None):
             "score": score,
             "horizon_days": HORIZON_DAYS,
             "score_after": due,
+            "neural_enriched": bool(neural),
         })
         n += 1
     print(f"recorded {n} MiroFish predictions from real sim (source='{src}')")
@@ -294,6 +301,7 @@ def score(now=None, ftl_rows=None):
             "ftl_entry_id": entry.get("id"),
             "source": "forward_test_ledger",
             "scored_at": now.isoformat() if hasattr(now, "isoformat") else str(now),
+            "neural_enriched": bool(p.get("neural_enriched")),
         })
         n += 1
     print(f"scored {n} predictions")
@@ -327,9 +335,12 @@ def accuracy_stats(rows=None):
             net += float(r.get("realized_pnl_net") or 0)
         except (TypeError, ValueError):
             pass
+    n_enr = sum(1 for r in results if r.get("neural_enriched"))
     return {
         "n_predictions": len(preds),
         "n_scored": n,
+        "n_scored_enriched": n_enr,
+        "n_scored_plain": n - n_enr,
         "hits": hits,
         "directional_accuracy": None if acc is None else round(acc, 4),
         "fee_true_net": round(net, 4),

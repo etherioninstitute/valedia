@@ -1,22 +1,27 @@
 # Grok Build status
 
+**NORTH STAR:** world's smartest, highest-profiting auto-trader (seamless; self-adjust when flipped; gates until Burton widens).
 **Updated:** 2026-09-18 PT
 
 **Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
 
-**Current:** STOP — Arc G NT-0 + NT-1 shipped. NT-3 OpenTerminal UI not this session.
+**Current:** SHIPPED — Arc G **NT-2**. `VALEDIA_VERSION` **0.25.0**. Tag `valedia-v0.25.0` (this commit).
 
-**Shipped:** Slices 1–23 + S24 live messaging; model switcher; **NT-0** pin; **NT-1** MiroFish neural enrichment JSON.
+**What shipped**
+- NT-1 JSON (`mirofish_neural_enrichment.json`) attached onto MiroFish seed (advisory markdown) and extractor (`mirofish_signal.json` per-symbol `neural` + top-level `neural_enriched`). Scores/bias/weight unchanged.
+- Accuracy ledger tags `neural_enriched` true/false on predictions and **fee-true** results. Stats expose `n_scored_enriched` / `n_scored_plain` only — **no weight math change**.
+- Tests: `test_nt2.py` PASS (mocked). Related: test_nt1, test_slice13, test_slice18, test_slice23, test_event_signs PASS.
 
-| Slice | Tip | Version | Tag |
-|-------|-----|---------|-----|
-| NT-0 | `6f594d1` | 0.23.0 (no bump) | — |
-| NT-1 | `bf798eb` | **0.24.0** | `valedia-v0.24.0` |
+**Fence (unchanged this slice)**
+- `MIROFISH_AUTO_RAISE` = **False**
+- Caps still **0.10** unproven / **0.15** proven
+- No `VALEDIA_SELF_ADJUST` implementation (comment only in `valedia_config`)
+- No trader live / broker / writers / SPOT_RECONCILE / NAUTILUS_LIVE / Intents
 
-**Fence:** No trader live, no broker writers, no VENUE_WRITER / REBALANCER_AUTOEXEC / SPOT_RECONCILE_HTTP / NAUTILUS_LIVE flips. CLI-first neural-trader; no opus/sonnet agents. MiroFish weight 0.10 / `MIROFISH_AUTO_RAISE=False`. Filtered MCP 57 tools, 0 neural/live/broker.
+**Next:** STOP for Burton. Dynamic band + master flip (`VALEDIA_SELF_ADJUST`) = next named slice **after approval**. Do not start NT-3 OpenTerminal this stop.
 
-**NT-0:** `tools/neural-trader` pin `2.8.11` `--ignore-scripts`. Allowlist research verbs only. Smoke: `recommendations/NT-0-SMOKE.md`. `test_nt0.py` PASS.
+**Shipped prior:** NT-0 `6f594d1`, NT-1 `bf798eb` / v0.24.0
 
-**NT-1:** `mirofish_neural_enrich.py` → `models/mirofish_neural_enrichment.json` (regime + signal quality). No fusion weight change. `test_nt1.py` PASS. Tests mocked, no network orders.
+---
 
-**Next:** STOP for Burton. NT-2 = wire enrichments into MiroFish seed/extractor + accuracy `neural_enriched` tag.
+**Standing (not this slice):** After Burton go — H1 dossiers / H2 ai-fund→MiroFish per addendum. Live writers still gated.

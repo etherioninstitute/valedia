@@ -189,7 +189,13 @@ def build_seed():
         "5 trading days. Focus on BTC, ETH, SOL, SPY, QQQ, and NVDA direction; key support/resistance; "
         "sentiment shifts; and catalysts that could trigger a regime change.",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    try:
+        import mirofish_neural_enrich as mne
+        text = mne.apply_seed_text(text)
+    except Exception:
+        pass
+    return text
 
 
 def generate_seed():

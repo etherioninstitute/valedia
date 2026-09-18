@@ -1,5 +1,11 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Arc G NT-0 + NT-1 SHIPPED.** Version `0.24.0` tag `valedia-v0.24.0`. **STOP for Burton.** NT-3 OpenTerminal not this session.
+Updated: 2026-09-18 PT — **Arc G NT-2 SHIPPED.** Version `0.25.0` tag `valedia-v0.25.0`. **STOP for Burton.** Dynamic band + master flip = later named slice after approval. NT-3 OpenTerminal not this stop.
+
+## NT-2 (Grok Build executor, `valedia-v2-grok-build`)
+- Seed + extractor carry NT-1 neural context when present (`neural` / `neural_enriched`). Scores/bias/weight unchanged.
+- Accuracy ledger tags `neural_enriched` on predictions and fee-true results. `n_scored_enriched` / `n_scored_plain` in stats only.
+- `MIROFISH_AUTO_RAISE=False`. Caps 0.10 / 0.15. No `VALEDIA_SELF_ADJUST` implementation (comment pointer only).
+- Tests: `test_nt2.py` PASS. Fence held. No `--live` / VENUE_WRITER / NAUTILUS_LIVE / SPOT_RECONCILE_HTTP / REBALANCER_AUTOEXEC.
 
 ## NT-0 / NT-1 (Grok Build executor, `valedia-v2-grok-build`)
 - NT-0 `6f594d1`: local `neural-trader@2.8.11` `--ignore-scripts`; research allowlist only; live/broker unwired (cron/config/MCP). `test_nt0.py` PASS.

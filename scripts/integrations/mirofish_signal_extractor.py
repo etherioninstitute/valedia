@@ -305,7 +305,7 @@ def extract_events(markdown_content, report_summary=""):
     return events, round(max(0.0, min(100.0, macro_bias)), 1)
 
 
-def process_mirofish_report(report_json):
+def process_mirofish_report(report_json, enrichment=None, out_path=None):
     """Main entry: takes MiroFish report JSON → returns brain-ready signal.
     
     Output format (saved to mirofish_signal.json):
@@ -363,12 +363,27 @@ def process_mirofish_report(report_json):
         "overall_bias": round(overall, 1),
         "source": "mirofish_swarm"
     }
-    
-    # Save for brain consumption
-    out_path = os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
-    with open(out_path, "w") as f:
+
+    dest = out_path or os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
+    # NT-2: stamp neural context when present. Does not change scores/bias/weight.
+    try:
+        import mirofish_neural_enrich as mne
+        if enrichment is not None:
+            enr = enrichment
+        else:
+            sibling = os.path.join(os.path.dirname(os.path.abspath(dest)),
+                                   "mirofish_neural_enrichment.json")
+            enr = mne.load_enrichment(sibling)
+            if not (isinstance(enr, dict) and enr.get("symbols")):
+                enr = mne.load_enrichment()
+        result = mne.attach_to_signal(result, enr)
+    except Exception:
+        result["neural_enriched"] = False
+
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    with open(dest, "w") as f:
         json.dump(result, f, indent=2)
-    
+
     return result
 
 if __name__ == "__main__":
