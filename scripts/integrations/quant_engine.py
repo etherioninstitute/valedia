@@ -7,7 +7,7 @@ Implements the LunarResearcher/hedge fund framework:
   5. Cross-platform arbitrage (Kalshi vs Polymarket)
 
 PLATFORMS:
-  - Kalshi: ACTIVE (CFTC-regulated, USD, live trading)
+  - Kalshi: SCAN-ONLY from this module (writers are executor/allocator/sports)
   - Polymarket: BUILT BUT DISABLED (waiting for non-sports access)
 
 The math: C(q) = b * ln(sum(e^(qi/b)))
@@ -104,7 +104,7 @@ def expected_value(true_prob, market_price, fees_pct=0.007):
 def kelly_size(true_prob, market_price, bankroll, fraction=KELLY_SAFETY_FRACTION):
     """Kelly criterion position sizing. Quarter-Kelly by default (conservative).
     full Kelly: f* = (p*b - q) / b where b = payout ratio, q = 1-p
-    fraction: 0.25 = quarter-Kelly (what pros actually use)
+    fraction: KELLY_SAFETY_FRACTION (half-Kelly). This scanner does not place orders.
     
     Returns: (bet_amount, contracts, kelly_fraction)"""
     if market_price <= 0 or market_price >= 1 or true_prob <= 0:
@@ -365,9 +365,9 @@ def run(bankroll=300, top_n=10):
     """Run the full quant scan and display results."""
     results, ts = scan_for_edges(bankroll)
     
-    print(f"QUANT ENGINE ({ts})")
-    print(f"Bankroll: {bankroll:.2f} | Min edge: 3c | Kelly: quarter")
-    print(f"Kalshi: ACTIVE | Polymarket: DISABLED")
+    print(f"QUANT ENGINE ({ts}) [SCAN-ONLY]")
+    print(f"Bankroll: {bankroll:.2f} | Min edge: 3c | Kelly: half (display, no orders)")
+    print(f"Kalshi: SCAN | Polymarket: DISABLED")
     print(f"Found {len(results)} opportunities\n")
     
     for i, r in enumerate(results[:top_n], 1):

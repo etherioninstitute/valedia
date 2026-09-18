@@ -294,6 +294,15 @@ def load_arb_log():
 def save_arb_log(log_data):
     with open(ARB_LOG, 'w') as f: json.dump(log_data, f, indent=2)
 
+def ack_status(order):
+    """POST-ack is UNRECONCILED until Kalshi fill count > 0. Dry-run stays DRY_RUN."""
+    try:
+        import forward_test_ledger as _ftl
+        fill = _ftl.extract_kalshi_fill(order if isinstance(order, dict) else {})
+        return "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+    except Exception:
+        return "UNRECONCILED"
+
 def execute_arb(contract, dry_run=True):
     """Execute the latency arb trade on Kalshi.
     
@@ -357,9 +366,9 @@ def execute_arb(contract, dry_run=True):
                 "yes_price": price_cents if side == 'yes' else None,
                 "no_price": price_cents if side == 'no' else None,
             })
-            result["status"] = "EXECUTED"
+            result["status"] = ack_status(order)
             result["order_id"] = order.get("order", {}).get("order_id", "?")
-            log.info(f"EXECUTED: {side.upper()} {n_contracts}x {contract['ticker']} "
+            log.info(f"{result['status']}: {side.upper()} {n_contracts}x {contract['ticker']} "
                      f"@{price_cents}c edge:{contract['edge_cents']}c")
         except Exception as e:
             result["status"] = "FAILED"

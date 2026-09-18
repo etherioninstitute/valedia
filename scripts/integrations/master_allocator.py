@@ -512,13 +512,13 @@ def execute_allocations(allocations, dry_run=False):
                     from coinbase_trader import place_market_order
                     ticker = a["ticker"].replace("-USD", "")
                     cb_resp = place_market_order(ticker, a["side"], a["allocation"])
-                    r["status"] = "EXECUTED"
+                    raw = cb_resp if isinstance(cb_resp, dict) else {}
+                    r["status"] = spot_fill_status("coinbase", raw)
                     if _ftl:
                         try:
                             _ftl.book_spot_fill(
                                 a.get("type", "CRYPTO"), a["ticker"], a["side"],
-                                "coinbase", cb_resp if isinstance(cb_resp, dict) else {},
-                                intended_source="live")
+                                "coinbase", raw, intended_source="live")
                         except Exception:
                             pass
                 except Exception as e:
@@ -530,13 +530,13 @@ def execute_allocations(allocations, dry_run=False):
                 try:
                     from alpaca_executor import place_order
                     alp_resp = place_order(a["ticker"], a["side"], notional=a["allocation"])
-                    r["status"] = "EXECUTED"
+                    raw = alp_resp if isinstance(alp_resp, dict) else {}
+                    r["status"] = spot_fill_status("alpaca", raw)
                     if _ftl:
                         try:
                             _ftl.book_spot_fill(
                                 a.get("type", "EQUITY"), a["ticker"], a["side"],
-                                "alpaca", alp_resp if isinstance(alp_resp, dict) else {},
-                                intended_source="live")
+                                "alpaca", raw, intended_source="live")
                         except Exception:
                             pass
                 except Exception as e:
@@ -554,6 +554,21 @@ def execute_allocations(allocations, dry_run=False):
         results.append(r)
     return results
 
+def spot_fill_status(venue, raw, ftl_mod=None):
+    """EXECUTED only when extract_spot_fill.complete. POST-ack → UNRECONCILED.
+
+    Missing writer (place_market_order / place_order) stays FAILED at the caller.
+    """
+    mod = ftl_mod if ftl_mod is not None else _ftl
+    if not mod:
+        return "UNRECONCILED"
+    try:
+        fill = mod.extract_spot_fill(venue, raw if isinstance(raw, dict) else {})
+    except Exception:
+        return "UNRECONCILED"
+    return "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+
+
 # ═══════════════════════════════════════════════════════════════
 # MAIN: Full cycle
 # ═══════════════════════════════════════════════════════════════
@@ -561,7 +576,14 @@ def execute_allocations(allocations, dry_run=False):
 def run(dry_run=False, max_allocs=15):
     """Full allocation cycle: gather → rank → allocate → execute → report."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"🧠 MASTER ALLOCATOR ({ts}) {'[DRY]' if dry_run else '[LIVE]'}", ""]
+    try:
+        stamp = _cfg.version_stamp() if _cfg else ""
+    except Exception:
+        stamp = ""
+    banner = f"🧠 MASTER ALLOCATOR ({ts}) {'[DRY]' if dry_run else '[LIVE]'}"
+    if stamp:
+        banner = f"{banner} {stamp}"
+    lines = [banner, ""]
 
     # Slice 10: MiroFish/intel → gated Intents. Never mixed into live allocations.
     # Fail-open. Never-dispatchable. No venue POST.
@@ -633,8 +655,16 @@ def run(dry_run=False, max_allocs=15):
     results = execute_allocations(allocations[:max_allocs], dry_run=dry_run)
     lines.append(f"\nEXECUTION:")
     for r in results:
-        icon = "✅" if r["status"]=="EXECUTED" else "🔶" if r["status"]=="DRY_RUN" else "❌"
-        lines.append(f"  {icon} {r['platform']:15} ${r['allocation']:.2f} → EV ${r['expected_profit']:.2f} | {r['ticker'][:30]}")
+        st = r.get("status") or "?"
+        icon = ("✅" if st == "EXECUTED"
+                else "⏳" if st == "UNRECONCILED"
+                else "🔶" if st == "DRY_RUN"
+                else "⏭" if str(st).startswith("SKIP")
+                else "❌")
+        lines.append(
+            f"  {icon} {st:16} {r['platform']:15} ${r['allocation']:.2f} "
+            f"→ EV ${r['expected_profit']:.2f} | {r['ticker'][:30]}"
+        )
         if r.get("error"): lines.append(f"    ERR: {r['error']}")
     
     # Save state

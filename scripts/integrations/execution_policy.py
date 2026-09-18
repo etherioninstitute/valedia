@@ -3,8 +3,8 @@ trade (signal fusion) and HOW MUCH (kelly_sizing). Adapted from kalshi-agent's e
 
 SINGLE-SOURCE: fee drag uses fee_engine.kalshi_fee_per_contract (real nonlinear fee), NOT the
 flat 0.07 the source used. Book microstructure from market_state.MARKET_STATE. Live maker orders
-route through kalshi_auth and are gated by valedia_config.EXEC_DRY_RUN (default True — proven on
-paper before real resting orders). MakerOrderManager NEVER places a resting order it can't cancel.
+route through kalshi_auth and are gated by valedia_config.EXEC_DRY_RUN (False as of 2026-09-12 —
+live maker orders enabled; flip True to paper-gate). MakerOrderManager NEVER places a resting order it can't cancel.
 (c) GOATWORTHY Post LLC.
 """
 import os, sys, time, logging

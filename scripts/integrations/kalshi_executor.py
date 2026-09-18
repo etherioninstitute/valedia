@@ -414,7 +414,7 @@ def opportunity_report():
     """Generate a comprehensive profit opportunity report across all platforms.
     This is what gets sent to Signal when opportunities are hot."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"💰 VALEDIA PROFIT SCAN ({ts})", ""]
+    lines = [f"💰 VALEDIA OPPORTUNITY SCAN ({ts}) [not fills / not realized P&L]", ""]
     
     # 1. Kalshi state
     state = get_state()
@@ -693,10 +693,12 @@ def audit():
         by_strat[s]["profit"] += t.get("potential_profit", 0)
     
     lines = ["Kalshi Trade Audit", f"Total trades: {total}", f"Total deployed: ${total_cost:.2f}",
-             f"Expected profit: ${total_profit:.2f}", f"Avg ROI: {total_profit/(total_cost+0.01)*100:.0f}%", ""]
+             f"Expected (not realized): ${total_profit:.2f}",
+             f"Avg modeled ROI: {total_profit/(total_cost+0.01)*100:.0f}%", ""]
     for s, d in by_strat.items():
         roi = d["profit"] / (d["cost"] + 0.01) * 100
-        lines.append(f"  {s}: {d['n']} trades, ${d['cost']:.2f} deployed, ${d['profit']:.2f} profit ({roi:.0f}% ROI)")
+        lines.append(f"  {s}: {d['n']} trades, ${d['cost']:.2f} deployed, "
+                     f"${d['profit']:.2f} expected (not realized) ({roi:.0f}% ROI)")
     
     return "\n".join(lines)
 

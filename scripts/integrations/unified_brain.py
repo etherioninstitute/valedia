@@ -24,6 +24,7 @@ import numpy as np
 from datetime import datetime, timezone
 from valedia_config import (  # shared source of truth (drift-guarded)
     MIROFISH_WEIGHT, KELLY_MIN_PROVEN_TRADES, FUSION_WEIGHTS, fusion_weights_for,
+    version_stamp,
 )
 try:
     import forward_test_ledger as _ftl  # the REAL fee-inclusive track record (single source for sizing)
@@ -348,12 +349,15 @@ def stage_kernel(prices, asset_class="equity"):
 # ══════════════════════════════════════════════════════════════════════
 
 def stage_ere_safety(prices):
-    _safe = {"safe": True, "multiplier": 1.0, "status": "OK",
+    # Fail-open for sizing (safe/mult unchanged). Status must not say OK/safe-gated
+    # when the v2 API is missing cumulative_extremes and this path no-ops.
+    _safe = {"safe": True, "multiplier": 1.0, "status": "FAIL_CLOSED",
              "phi_ratio": 0, "cascade_stable": True, "snr": 0.5}
     try:
         from Etherion_Risk_Engine import SignalDecomposer, VarianceCascadeEngine, DrawdownGuard
         ret = np.diff(np.log(np.clip(prices, 1e-10, None)))
-        if len(ret) < 30: return _safe
+        if len(ret) < 30:
+            return {**_safe, "status": "INSUFFICIENT_DATA"}
         cascade  = VarianceCascadeEngine()
         matrix   = ret.reshape(-1, 1)
         ladder   = cascade.energy_ladder_check(matrix)
@@ -526,7 +530,7 @@ def get_alpaca():
     """Returns (account_fn, buy_fn, sell_fn, position_fn, IS_LIVE) or None."""
     try:
         import alpaca_executor as ae
-        return ae.get_account, ae.market_buy, ae.market_sell, ae.get_position, ae.IS_LIVE
+        return ae.get_account, ae.market_buy, ae.market_sell, ae.get_position, ae.alpaca_is_live()
     except Exception:
         return None
 
@@ -601,8 +605,15 @@ def run_brain():
         4: " [Fri — standard, watch end-of-week bias]",
     }.get(dow, "")
 
+    try:
+        stamp = version_stamp()
+    except Exception:
+        stamp = ""
+    head = f"[BRAIN] Unified Brain v3.1 — {ts}"
+    if stamp:
+        head = f"{head} {stamp}"
     lines = [
-        f"[BRAIN] Unified Brain v3.1 — {ts}",
+        head,
         f"Host: {SYS['hostname']} ({'Mac' if SYS['is_mac'] else 'Linux/VPS'})"
         f" | Day: {DOW_NAMES[dow]}{dow_note}",
         ""
@@ -887,9 +898,9 @@ def run_brain():
                             pass
                     actions.append(f"BUY ${position:.2f} {ticker}")
                     lines.append(
-                        f"  >> BUY  ${position:.2f} {name:6s} "
+                        f"  >> BUY ACK ${position:.2f} {name:6s} "
                         f"fused={fused:.0f} boosters=[{booster_str}] "
-                        f"dom={q['dom']} votes={q['votes']}"
+                        f"dom={q['dom']} votes={q['votes']} (POST-ack, not fill-confirmed)"
                     )
 
             # SELL signal (exit existing position)
@@ -935,8 +946,8 @@ def run_brain():
                                      fee=sell_fee)
                     actions.append(f"SELL {ticker}")
                     lines.append(
-                        f"  >> SELL {name:6s} fused={fused:.0f} "
-                        f"boosters=[{booster_str}]"
+                        f"  >> SELL ACK {name:6s} fused={fused:.0f} "
+                        f"boosters=[{booster_str}] (POST-ack, not fill-confirmed)"
                     )
 
             # HOLD existing position
@@ -999,7 +1010,7 @@ def run_brain():
     lines.append("")
     if actions:
         lines.append(
-            f"EXECUTED: {len(actions)} trades "
+            f"ACKED: {len(actions)} orders (POST-ack, not fill-confirmed) "
             f"(Alpaca ${spent_alp:.2f}, Coinbase ${spent_cb:.2f})"
         )
         for a in actions: lines.append(f"  {a}")

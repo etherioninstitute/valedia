@@ -15,7 +15,7 @@ Architecture:
 """
 import os, sys, json, time
 from datetime import datetime, timezone, timedelta
-from valedia_config import dynamic_per_trade_cap
+from valedia_config import dynamic_per_trade_cap, version_stamp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.expanduser("~/.openclaw/workspace/models")
@@ -374,7 +374,14 @@ def get_optimal_bet_pct():
 def run(dry_run=False):
     """Full sports engine cycle: scan → filter → size → execute → track."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"🏀 SPORTS ENGINE v1.0 ({ts}) {'[DRY]' if dry_run else '[LIVE]'}", ""]
+    try:
+        stamp = version_stamp()
+    except Exception:
+        stamp = ""
+    banner = f"🏀 SPORTS ENGINE v1.0 ({ts}) {'[DRY]' if dry_run else '[LIVE]'}"
+    if stamp:
+        banner = f"{banner} {stamp}"
+    lines = [banner, ""]
     
     # Check settlements first
     new_settles, stats = check_settlements()
