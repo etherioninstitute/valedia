@@ -1,19 +1,20 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 19:46 PT
+**Updated:** 2026-09-17 22:45 PT
 
-**Mode:** RuFlo MCP required (`:8810` filtered).
+**Mode:** RuFlo MCP (`:8810` filtered) + Ponytail plugin. Hard fence held.
 
-**Current:** SHIPPED — Slice 14: Burton-gated spot GET (`SPOT_RECONCILE_HTTP` default False)
+**Current:** DONE — Arc F Slice 15 (fenced merge/deploy live)
 
-**Shipped:** Slices 1–14 (tip `5996181`)
-
-**Next:** STOP for Burton. Do not flip `SPOT_RECONCILE_HTTP` / `REBALANCER_AUTOEXEC` / `VENUE_WRITER` / `--live`. No NT.
+**Shipped:** Slices 1–15 (v2 tip pending this commit; live tag `fenced-deploy-s15`)
 
 **Done this slice:**
-- Valedia-runtime getter wiring complete: `reconcile_run.get_spot_order_getter()` → `spot_order_get.live_spot_order_getter` iff `spot_reconcile_http_enabled()`. Flag-off cron stays `mock_spot_order_getter` (no HTTP, even if a test transport is installed).
-- Single flip (this lane never True): `export SPOT_RECONCILE_HTTP=1` **or** `valedia_config.SPOT_RECONCILE_HTTP = True`. Env wins. No extra `set_spot_order_getter` call.
-- Tests inject mocked transport via `set_spot_http_transport` only. Any module inject blocks fall-through to live `get_order`. Default tests never hit network.
-- Tests: `test_slice14.py` PASS (+ slices 7–13, `test_reconcile_run.py`). Drift check 10 PASS. No network.
+- Diff live `~/.openclaw/workspace` vs v2. Content-only sync of Slices 1–14 integrations + tests.
+- `recommendations/VALEDIA-DEPLOY-FENCED.md` (file list, cron checklist, rollback, smoke).
+- Backup `~/.openclaw/backups/live-scripts-pre-s15-20260917_224401.tar.gz`. Live tag `pre-arc-f-s15`.
+- Secrets/.env untouched. Crontab **not** rewritten. `SPOT_RECONCILE_HTTP` still False.
+- Live smoke: flags OK + slice 7–14 / kalshi-fill / spot-reconcile PASS.
 
-**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT, no keys. `SPOT_RECONCILE_HTTP` default False.
+**Next:** Slice 16 — real shadow parity harness ops (report-only)
+
+**Fence:** No --live, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP default False.

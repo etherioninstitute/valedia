@@ -80,7 +80,8 @@ def _opp(typ, ticker, ev=0.50, conf=0.90):
 
 
 def test_spot_get_helpers():
-    assert "workspace-v2" in rr.__file__, rr.__file__
+    assert os.path.basename(rr.__file__) == "reconcile_run.py", rr.__file__
+    assert "scripts/integrations" in rr.__file__.replace("\\", "/")
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.spot_reconcile_http_enabled() is False

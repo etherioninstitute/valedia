@@ -1,4 +1,14 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 15 SHIPPED** (fenced merge/deploy into live)
+
+## Slice 15 (Grok Build executor, `valedia-v2-grok-build`)
+- Live `~/.openclaw/workspace` received Slices 1–14 fenced code (content-diff rsync, no `--delete`).
+- Backup `~/.openclaw/backups/live-scripts-pre-s15-20260917_224401.tar.gz`. Tags: live `pre-arc-f-s15` / `fenced-deploy-s15`.
+- `.env` / models / crontab installer **not** touched. Flags still off. Smoke PASS.
+- Doc: `recommendations/VALEDIA-DEPLOY-FENCED.md`.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 14 SHIPPED** (Burton-gated spot GET, default OFF)
 
 ## Slice 14 (Grok Build executor, `valedia-v2-grok-build` `5996181`)
