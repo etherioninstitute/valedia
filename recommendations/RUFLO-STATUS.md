@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Arc G NT-2 SHIPPED.** Version `0.25.0` tag `valedia-v0.25.0`. **STOP for Burton.** Dynamic band + master flip = later named slice after approval. NT-3 OpenTerminal not this stop.
+Updated: 2026-09-18 PT — **Arc G NT-2 SHIPPED.** Version `0.25.0` tip `71a39f9` tag `valedia-v0.25.0`. **STOP for Burton.** Dynamic band + master flip = later named slice after approval. NT-3 OpenTerminal not this stop.
 
 ## NT-2 (Grok Build executor, `valedia-v2-grok-build`)
 - Seed + extractor carry NT-1 neural context when present (`neural` / `neural_enriched`). Scores/bias/weight unchanged.

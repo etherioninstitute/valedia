@@ -5,7 +5,7 @@
 
 **Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
 
-**Current:** SHIPPED — Arc G **NT-2**. `VALEDIA_VERSION` **0.25.0**. Tag `valedia-v0.25.0` (this commit).
+**Current:** SHIPPED — Arc G **NT-2**. `VALEDIA_VERSION` **0.25.0**. Tip `71a39f9`. Tag `valedia-v0.25.0`.
 
 **What shipped**
 - NT-1 JSON (`mirofish_neural_enrichment.json`) attached onto MiroFish seed (advisory markdown) and extractor (`mirofish_signal.json` per-symbol `neural` + top-level `neural_enriched`). Scores/bias/weight unchanged.
