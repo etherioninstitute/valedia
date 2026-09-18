@@ -1,20 +1,18 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 22:45 PT
+**Updated:** 2026-09-18 09:29 PT
 
-**Mode:** RuFlo MCP (`:8810` filtered) + Ponytail plugin. Hard fence held.
+**Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
 
-**Current:** DONE — Arc F Slice 15 (fenced merge/deploy live)
+**Current:** DONE — S24 fenced live deploy (messaging + crontab stagger). **STOP for Burton.**
 
-**Shipped:** Slices 1–15 (v2 tip pending this commit; live tag `fenced-deploy-s15`)
+**Build tip:** `59d9bbc` / Slice 23 `0a94a5b` — `VALEDIA_VERSION` 0.23.0 / tag `valedia-v0.23.0`
 
-**Done this slice:**
-- Diff live `~/.openclaw/workspace` vs v2. Content-only sync of Slices 1–14 integrations + tests.
-- `recommendations/VALEDIA-DEPLOY-FENCED.md` (file list, cron checklist, rollback, smoke).
-- Backup `~/.openclaw/backups/live-scripts-pre-s15-20260917_224401.tar.gz`. Live tag `pre-arc-f-s15`.
-- Secrets/.env untouched. Crontab **not** rewritten. `SPOT_RECONCILE_HTTP` still False.
-- Live smoke: flags OK + slice 7–14 / kalshi-fill / spot-reconcile PASS.
+**Live tip:** `093bba8` — tags `fenced-deploy-s24-messaging`, `valedia-v0.23.0-live`
+**Live crontab:** allocator `20 */4` (was `0 */4`); sports still `0 */2`. Backup: `recommendations/crontab.pre-s24-*.txt`
 
-**Next:** Slice 16 — real shadow parity harness ops (report-only)
+**Shipped:** Slices 1–23 + S24 live messaging apply
 
-**Fence:** No --live, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP default False.
+**Fence:** No --live flips, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP False. No `install_cron.sh`.
+
+**Next:** STOP. Optional later: ERE `cumulative_extremes` bind, Ponytail cleanup Top 10 where Grok AGREEd.
