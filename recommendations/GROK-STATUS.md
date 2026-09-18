@@ -8,7 +8,7 @@
 
 **Shipped:** Slices 1–20. Audit: `recommendations/PONYTAIL-AUDIT-VALEDIA.md` (mirrored to live `recommendations/` for relay).
 
-**Tip:** this commit on `valedia-v2-grok-build` (Slice 20). Parent: `51719ff` Slice 19.
+**Tip:** `9f4559f` on `valedia-v2-grok-build` (Slice 20). Parent: `51719ff` Slice 19.
 
 **Next:** STOP for Burton. Optional later cleanup slices are ranked in the audit (ERE live names, installer 404s, one Kelly/fee/ledger) — not started.
 
