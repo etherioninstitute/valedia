@@ -8,13 +8,14 @@ Slice 5: also walks UNRECONCILED Coinbase/Alpaca rows via spot_reconcile
 with an **injected** getter. Default getter is a mock (returns None, no HTTP).
 Valedia runtime supplies a real GET later via set_spot_order_getter().
 
-Slice 7: real Coinbase/Alpaca GET helpers live in spot_order_get.py, gated by
+Slice 7/14: Coinbase/Alpaca GET helpers live in spot_order_get.py, gated by
 valedia_config.SPOT_RECONCILE_HTTP (default False). Default/cron path stays mock.
 
-Burton/Valedia single flip later (NOT this lane):
+Single Burton/Valedia flip later (NOT this lane — no extra set_spot_order_getter):
     export SPOT_RECONCILE_HTTP=1
   # or valedia_config.SPOT_RECONCILE_HTTP = True
 Then get_spot_order_getter() returns live_spot_order_getter (read-only GET).
+Tests inject mocked transport via spot_order_get.set_spot_http_transport.
 
 Never live venue HTTP on the default/test path. No nautilus_trader. No --live.
 Idempotent (already-settled entries are skipped); safe to run often.
@@ -26,10 +27,11 @@ import forward_test_ledger as ftl
 import spot_reconcile as sr
 
 # ── injected getter hook ──────────────────────────────────────────────────
-# Default/tests: mock (no HTTP). Valedia runtime:
-#   import reconcile_run as rr
-#   rr.set_spot_order_getter(real_get)   # real_get(order_id, venue) -> dict|None
-# This lane never installs a live GET.
+# Default/tests: mock (no HTTP).
+# Valedia runtime (Slice 14): ONE flip SPOT_RECONCILE_HTTP → live_spot_order_getter.
+# Optional override (tests / custom):
+#   rr.set_spot_order_getter(fn)   # fn(order_id, venue) -> dict|None
+# This lane never installs a live GET and never sets the flag True.
 
 _spot_order_getter = None  # None → mock_spot_order_getter
 
@@ -48,9 +50,10 @@ def set_spot_order_getter(fn):
 def get_spot_order_getter():
     """Active getter. Default is mock_spot_order_getter (no HTTP).
 
-    If Valedia injected a callable, that wins. Else, only when
-    SPOT_RECONCILE_HTTP is on, return live_spot_order_getter. Flag-off
-    (shipped default) never imports or calls the HTTP helpers.
+    If a callable was injected via set_spot_order_getter, that wins.
+    Else, only when SPOT_RECONCILE_HTTP is on, return live_spot_order_getter
+    (Valedia-runtime path; tests mock transport, never live HTTP).
+    Flag-off (shipped default) never imports or calls the HTTP helpers.
     """
     if _spot_order_getter is not None:
         return _spot_order_getter

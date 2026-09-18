@@ -6,6 +6,7 @@ explicit fill payload or a mocked GET-order body, book a fee-true record_entry
 
 Never invents fills. Missing/partial/empty data stays UNRECONCILED.
 Never live HTTP — pass fill_payload, get_response, or an injected getter.
+Cron getter is mock unless SPOT_RECONCILE_HTTP is on (Slice 14).
 Paper/sandbox intended_source is never upgraded to live.
 
 No nautilus_trader. No --live. No keys.

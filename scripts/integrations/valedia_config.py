@@ -81,10 +81,13 @@ CATEGORY_BLOCK_NET     = 0.0    # block only if fee-inclusive net is an actual l
 # Category gate still blocks execute on verified 45d net loss. Live-exec fence still holds.
 PAUSE_TTL_DAYS = 7
 
-# Spot GET-reconcile HTTP. Default OFF. Slice 7 ships Coinbase/Alpaca GET helpers;
-# the default cron path stays mock/no HTTP. Burton/Valedia later uses ONE flip:
+# Spot GET-reconcile HTTP. DEFAULT OFF (Slice 7 helpers; Slice 14 runtime wiring).
+# Single Burton/Valedia flip (this lane never sets True):
 #   export SPOT_RECONCILE_HTTP=1
-# or set SPOT_RECONCILE_HTTP = True below. This lane never sets True.
+# or set SPOT_RECONCILE_HTTP = True below.
+# Then reconcile_run.get_spot_order_getter() → spot_order_get.live_spot_order_getter
+# (read-only Coinbase/Alpaca GET). No extra set_spot_order_getter call.
+# Tests inject mocked transport; they never live-GET.
 # Enabling live GET is a Valedia go, not a coding-agent go.
 SPOT_RECONCILE_HTTP = False
 
@@ -116,8 +119,9 @@ def _env_flag(name, default):
 def spot_reconcile_http_enabled():
     """True only if Burton/Valedia flipped the spot GET HTTP flag.
 
-    Env SPOT_RECONCILE_HTTP=1/true/yes/on wins over the constant. Anything
-    else (unset, empty, 0, false) is OFF. Default constant is False.
+    Single flip: env SPOT_RECONCILE_HTTP=1/true/yes/on OR this module's
+    SPOT_RECONCILE_HTTP = True. Env wins over the constant. Anything else
+    (unset, empty, 0, false) is OFF. Default constant is False.
     """
     return _env_flag("SPOT_RECONCILE_HTTP", SPOT_RECONCILE_HTTP)
 

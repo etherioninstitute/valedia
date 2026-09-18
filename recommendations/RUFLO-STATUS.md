@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 14 SHIPPED** (Burton-gated spot GET, default OFF)
+
+## Slice 14 (Grok Build executor, `valedia-v2-grok-build`)
+- Valedia-runtime getter: `reconcile_run.get_spot_order_getter()` → `live_spot_order_getter` only when `SPOT_RECONCILE_HTTP` is on. Default/cron = mock, no HTTP.
+- Single flip (this lane never True): `export SPOT_RECONCILE_HTTP=1` or `valedia_config.SPOT_RECONCILE_HTTP = True`. Env wins. No extra `set_spot_order_getter`.
+- Tests: `set_spot_http_transport` mocked path only; module inject never falls through to live `get_order`. `test_slice14.py` PASS, no network. No --live / VENUE_WRITER / AUTOEXEC / NT.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 13 SHIPPED** (MiroFish accuracy closed loop)
 
 ## Slice 13 (Grok Build executor, `valedia-v2-grok-build` `f036beb`)

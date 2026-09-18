@@ -1,19 +1,19 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 19:50 PT
+**Updated:** 2026-09-17 19:46 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 13: MiroFish accuracy closed loop (fee-true; weight capped until proven)
+**Current:** SHIPPED — Slice 14: Burton-gated spot GET (`SPOT_RECONCILE_HTTP` default False)
 
-**Shipped:** Slices 1–13 (tip `f036beb`)
+**Shipped:** Slices 1–14
 
-**Next:** Slice 14 — Burton-gated spot GET (SPOT_RECONCILE_HTTP default False)
+**Next:** STOP for Burton. Do not flip `SPOT_RECONCILE_HTTP` / `REBALANCER_AUTOEXEC` / `VENUE_WRITER` / `--live`. No NT.
 
 **Done this slice:**
-- `mirofish_accuracy_ledger.py` scores matured swarm predictions against fee-true `forward_test_ledger` settlements (paper/sandbox/backfill/shadow excluded). Local JSON only. No yfinance/HTTP.
-- `effective_mirofish_weight()` ≤ `MIROFISH_UNPROVEN_CAP` (0.10) until proven (`>` `MIROFISH_ACCURACY_BAR` 0.55 on ≥ `MIROFISH_MIN_SCORED` 20 fee-true results). `MIROFISH_AUTO_RAISE=False` — proven does not auto-raise. Burton bar/caps are config.
-- Fusion (`fusion_weights_for` → `stage_fusion`) and intel (`merge_opps` / `collect_mirofish` / `gather` snapshot) read the ledger. Snapshot: `mirofish_accuracy_summary.json`.
-- Tests: `test_slice13.py` PASS (+ slices 8–12). Drift check 10 PASS. No network.
+- Valedia-runtime getter wiring complete: `reconcile_run.get_spot_order_getter()` → `spot_order_get.live_spot_order_getter` iff `spot_reconcile_http_enabled()`. Flag-off cron stays `mock_spot_order_getter` (no HTTP, even if a test transport is installed).
+- Single flip (this lane never True): `export SPOT_RECONCILE_HTTP=1` **or** `valedia_config.SPOT_RECONCILE_HTTP = True`. Env wins. No extra `set_spot_order_getter` call.
+- Tests inject mocked transport via `set_spot_http_transport` only. Any module inject blocks fall-through to live `get_order`. Default tests never hit network.
+- Tests: `test_slice14.py` PASS (+ slices 7–13, `test_reconcile_run.py`). Drift check 10 PASS. No network.
 
-**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT, no HTTP Intent path. SPOT_RECONCILE_HTTP default False.
+**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT, no keys. `SPOT_RECONCILE_HTTP` default False.
