@@ -1,7 +1,7 @@
 # Ruflo status board (Claude Code check-in)
 Updated: 2026-09-17 PT — **Grok Build Slice 13 SHIPPED** (MiroFish accuracy closed loop)
 
-## Slice 13 (Grok Build executor, `valedia-v2-grok-build`)
+## Slice 13 (Grok Build executor, `valedia-v2-grok-build` `f036beb`)
 - Fee-true outcomes from `forward_test_ledger` settlements → `mirofish_accuracy_ledger.jsonl`. Paper/sandbox/backfill/shadow never count. No yfinance/HTTP.
 - Weight stays ≤ `MIROFISH_UNPROVEN_CAP` (0.10) until proven (`>` 55% directional on ≥20 fee-true results). `MIROFISH_AUTO_RAISE=False` — no auto-raise past cap. Proven cap 15% only if Burton flips AUTO_RAISE.
 - `fusion_weights_for` / intel gather+blend read `effective_mirofish_weight()` + `mirofish_accuracy_summary.json`.

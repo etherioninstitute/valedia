@@ -6,7 +6,7 @@
 
 **Current:** SHIPPED — Slice 13: MiroFish accuracy closed loop (fee-true; weight capped until proven)
 
-**Shipped:** Slices 1–13
+**Shipped:** Slices 1–13 (tip `f036beb`)
 
 **Next:** Slice 14 — Burton-gated spot GET (SPOT_RECONCILE_HTTP default False)
 

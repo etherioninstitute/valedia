@@ -5,7 +5,7 @@ Run in order. HARD FENCE throughout: no --live orders, no VENUE_WRITER flip, no 
 ## Slice 12 — Shadow parity harness — SHIPPED
 7d (or mockable window) compare.ok report for brain Coinbase shadow + HL/Poly/intel shadows. No flag flips. Tests mocked. Harness: `nautilus_shadow_parity.py`. Fail-closed on side/instrument/size/venue/signed/hook/leverage/dispatchable. Allocator Coinbase ignored as cutover evidence. `cutover_ready` does not flip flags.
 
-## Slice 13 — MiroFish accuracy closed loop (local) — SHIPPED
+## Slice 13 — MiroFish accuracy closed loop (local) — SHIPPED (`f036beb`)
 Fee-true FTL settlements → `mirofish_accuracy_ledger` → `effective_mirofish_weight()` capped at 10% until proven (>55% on ≥20 fee-true, or Burton bar). `MIROFISH_AUTO_RAISE=False`. Fusion/intel read ledger. Tests mocked. Local JSON only.
 
 ## Slice 14 — Burton-gated spot GET
