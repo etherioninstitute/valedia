@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 12 SHIPPED** (shadow parity harness, 7d compare.ok)
+
+## Slice 12 (Grok Build executor, `valedia-v2-grok-build`)
+- `nautilus_shadow_parity.py`: mockable `7d` window. Compares shadow Intents vs Valedia POST bodies for brain Coinbase + HL short + Polymarket arb + intel Coinbase. Records `compare.ok` / diffs. Allocator Coinbase is not cutover evidence.
+- Fail-closed on side / instrument / size / venue / signed / live hook / leverage / dispatchable / live_flag / writer=nautilus. `cutover_ready` needs 7 calendar days of matching brain rows and does **not** flip flags.
+- Tests: `test_slice12.py` PASS, no network. No --live / VENUE_WRITER / AUTOEXEC / GET HTTP / NT.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 9 SHIPPED** (pnl_tracker report-only + net pause + learning re-enable)
 
 ## Slice 9 (Grok Build executor, `valedia-v2-grok-build` `a0f3572`)

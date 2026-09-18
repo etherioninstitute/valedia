@@ -293,6 +293,7 @@ INTEL_SHADOW_INTENTS = True
 # Slice 11: HL shorts + Polymarket arb shadow Intents. Never-dispatchable.
 # This lane never sets dispatchable. No --live. No writer flip.
 NAUTILUS_SHADOW_VENUES = True
+# Slice 12: nautilus_shadow_parity.py — 7d compare.ok report. No flag flips.
 
 # SUBSUME NT cutover preference (later, Valedia-gated). Not a writer flip.
 # Coinbase first → Hyperliquid shorts/futures → Polymarket arb → Kalshi last.

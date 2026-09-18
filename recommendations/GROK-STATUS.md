@@ -1,22 +1,21 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 15:40 PT
+**Updated:** 2026-09-17 19:22 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 11: HL shorts + Polymarket arb shadow Intents (`valedia-v2-grok-build`)
+**Current:** SHIPPED — Slice 12: shadow parity harness (brain Coinbase + HL/Poly/intel compare.ok)
 
-**Shipped:** Slices 1–11 (Slice 10 `b5600e0` + Slice 11 `17bf2c1`)
+**Shipped:** Slices 1–12
 
-## Slice 11 (venue expansion shadow)
+**Next:** Slice 13 — MiroFish accuracy closed loop (local JSON; weight still capped)
 
-1. **Hyperliquid shorts** `hyperliquid_order_body.py` + `nautilus_shadow_venues.emit_hl_short_shadow`. Never-dispatchable Slice-1 Intents (`shadow` + `live_flag=False` + `ledger_source=shadow`). Side=sell opens a short; flatten is buy + `reduce_only`. Leverage pinned at 0.
-2. **POST/shape diff** vs intended `POST /exchange` action (Ioc limit — HL has no native market). `LIVE_CLIENT_HOOK=None`; `send_via_live_hook` always `{sent: False}`. Archived `hyperliquid_client.py` stays Info-only. No SDK, no keys, no un-archive.
-3. **Polymarket arb** `polymarket_order_body.py` + `emit_polymarket_arb_shadow`. Same never-dispatchable pattern. Diff vs unsigned CLOB `POST /order` (FOK OrderArgs). Scan-only client / `PolymarketAdapter.ENABLED` untouched. Kalshi-only arb rows stay Slice 10.
-4. **Writer lock:** `VENUE_WRITER` unchanged (`coinbase/kalshi/alpaca=valedia`, `hyperliquid/polymarket/kraken=none`). `VENUE_NT_CUTOVER_ORDER = (coinbase, hyperliquid, polymarket, kalshi)` aligns SUBSUME. NT flags flipped in tests still cannot dispatch. Allocator fail-open emit is **not** mixed into live gather.
+## Slice 12 (shadow parity harness)
 
-**Tests:** `test_slice11.py` + `test_slice10.py` + `test_slice9.py` + `test_slice8.py` + `test_nautilus_intent.py` + `test_nautilus_shadow_coinbase.py` + `test_rebalancer_shadow.py` + `test_category_gate.py` PASS. No network.
+1. **`nautilus_shadow_parity.py`** — mockable `7d` window (`--window 7d --now ISO`). Compares shadow Intents vs the POST Valedia would/did emit: unified_brain Coinbase, HL short, Polymarket arb, intel Coinbase. Records `compare.ok` / diffs. No HTTP.
+2. **Fail-closed** on cutover-dangerous mismatches: side, instrument, size, venue, signed, live hook, leverage, dispatchable, live_flag, writer=nautilus, stale `compare.ok`, corrupt JSONL. Allocator Coinbase is **ignored** as cutover evidence (still fence-scanned). Intel Alpaca/Kalshi are advisory (not NT cutover surfaces).
+3. **`cutover_ready.coinbase`** requires 7 UTC calendar days of matching brain rows **and** no dangerous diffs. Report-only — this lane does not flip `VENUE_WRITER`, `--live`, `SPOT_RECONCILE_HTTP`, `REBALANCER_AUTOEXEC`, or NT flags.
 
-**Next:** STOP for Burton. Do not flip `VENUE_WRITER` / `--live` / `SPOT_RECONCILE_HTTP` / `REBALANCER_AUTOEXEC`. NT venv / Phase 1 sandbox only if Burton says go.
+**Tests:** `test_slice12.py` PASS (fixtures, no network). Slice 11 still PASS.
 
-**Fence:** No --live orders, no SPOT_RECONCILE_HTTP=True, no VENUE_WRITER flip, no NT install. REBALANCER_AUTOEXEC stays False. Shadow/gated Intents only.
+**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT. SPOT_RECONCILE_HTTP default False.
