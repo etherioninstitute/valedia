@@ -6,7 +6,7 @@
 
 **Current:** SHIPPED — Slice 12: shadow parity harness (brain Coinbase + HL/Poly/intel compare.ok)
 
-**Shipped:** Slices 1–12
+**Shipped:** Slices 1–12 (Slice 12 `d57f7ed`)
 
 **Next:** Slice 13 — MiroFish accuracy closed loop (local JSON; weight still capped)
 
