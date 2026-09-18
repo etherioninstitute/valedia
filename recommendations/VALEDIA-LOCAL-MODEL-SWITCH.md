@@ -19,8 +19,8 @@ Trading flags (`SPOT_RECONCILE_HTTP`, writers, etc.) are **out of scope** for th
 scripts/valedia_models.sh list          # LMS + MiroFish tags
 scripts/valedia_models.sh show          # current Hermes default + MiroFish models
 scripts/valedia_models.sh hermes <id>   # set Hermes model.default (backup first)
-scripts/valedia_models.sh mirofish-sync <tag>    # print export line / optional write
-scripts/valedia_models.sh mirofish-report <tag>  # print export line / optional write
+scripts/valedia_models.sh mirofish-sync <tag> [--write]    # print export; --write backups then sets LLM_MODEL_NAME
+scripts/valedia_models.sh mirofish-report <tag> [--write]  # print export; --write backups then sets MIROFISH_REPORT_MODEL
 ```
 
 Presets (names only — resolve to real LMS/Ollama ids at runtime):
@@ -37,7 +37,7 @@ Presets (names only — resolve to real LMS/Ollama ids at runtime):
 2. Refuse unknown ids not returned by `list`.
 3. Never change `EXEC_DRY_RUN`, writers, or API keys.
 4. RuVocal: document “load this in LMS” if API can’t hot-swap; don’t fight LMS UI.
-5. Grok Build may harden presets + RuVocal path in a later slice; v1 = Hermes + show MiroFish.
+5. Grok Build may harden presets + RuVocal path in a later slice; v1 = Hermes + MiroFish show; NT-1 leftover = `mirofish-sync` / `mirofish-report` (`--write` backups `$MIROFISH_ENV`, default `~/mirofish-offline/.env`).
 
 ## Success
 

@@ -2,9 +2,11 @@
 # Valedia local model switcher — list/show/set Hermes; show MiroFish.
 # Fence: never touches trading flags or venue keys.
 set -euo pipefail
+SELF="$0"
 LMS="${VALEDIA_LMS_URL:-http://127.0.0.1:1234}"
 MF_OLLAMA="${VALEDIA_MIROFISH_OLLAMA:-http://127.0.0.1:11435}"
 HERMES_CFG="${HERMES_CONFIG:-$HOME/.hermes/config.yaml}"
+MIROFISH_ENV="${MIROFISH_ENV:-$HOME/mirofish-offline/.env}"
 
 usage() {
   cat <<'U'
@@ -13,6 +15,8 @@ Usage:
   valedia_models.sh show
   valedia_models.sh hermes <lms-model-id>
   valedia_models.sh preset chat|reason|turbo   # Hermes only in v1
+  valedia_models.sh mirofish-sync <tag> [--write]
+  valedia_models.sh mirofish-report <tag> [--write]
 U
   exit 2
 }
@@ -77,7 +81,7 @@ cmd_hermes() {
   [[ -n "$id" ]] || usage
   [[ -f "$HERMES_CFG" ]] || { echo "no $HERMES_CFG"; exit 1; }
   if ! lms_list | grep -Fxq "$id"; then
-    echo "Refuse: '$id' not in LMS /v1/models. Run: $0 list"
+    echo "Refuse: '$id' not in LMS /v1/models. Run: $SELF list"
     exit 1
   fi
   local ts bak
@@ -115,7 +119,7 @@ cmd_preset() {
       local turbo
       turbo=$(lms_list | grep -i 'turbo' | head -1 || true)
       if [[ -z "$turbo" ]]; then
-        echo "No turbo id loaded in LMS. Load one, then: $0 list"
+        echo "No turbo id loaded in LMS. Load one, then: $SELF list"
         exit 1
       fi
       cmd_hermes "$turbo"
@@ -124,10 +128,50 @@ cmd_preset() {
   esac
 }
 
+cmd_mf_set() {
+  local key="$1" tag="${2:-}" write="${3:-}"
+  [[ -n "$tag" ]] || usage
+  case "$key" in
+    LLM_MODEL_NAME|MIROFISH_REPORT_MODEL) ;;
+    *) echo "Refuse: unknown MiroFish key $key"; exit 1 ;;
+  esac
+  if ! mf_list | grep -Fxq "$tag"; then
+    echo "Refuse: '$tag' not in MiroFish Ollama tags. Run: $SELF list"
+    exit 1
+  fi
+  echo "export ${key}=${tag}"
+  if [[ "$write" != "--write" ]]; then
+    echo "(dry) pass --write to persist to $MIROFISH_ENV"
+    return 0
+  fi
+  [[ -f "$MIROFISH_ENV" ]] || { echo "no $MIROFISH_ENV"; exit 1; }
+  local ts bak
+  ts=$(date +%Y%m%d-%H%M%S)
+  bak="${MIROFISH_ENV}.bak-modelswitch-${ts}"
+  cp "$MIROFISH_ENV" "$bak"
+  python3 - <<PY
+from pathlib import Path
+p = Path("$MIROFISH_ENV")
+key, tag = "$key", "$tag"
+t = p.read_text()
+import re
+new, n = re.subn(rf"^{re.escape(key)}=.*$", f"{key}={tag}", t, count=1, flags=re.M)
+if n == 0:
+    if t and not t.endswith("\n"):
+        t += "\n"
+    new = t + f"{key}={tag}\n"
+p.write_text(new)
+print(f"{key} -> {tag}")
+print("backup:", "$bak")
+PY
+}
+
 case "${1:-}" in
   list) cmd_list ;;
   show) cmd_show ;;
   hermes) shift; cmd_hermes "$@" ;;
   preset) shift; cmd_preset "$@" ;;
+  mirofish-sync) shift; cmd_mf_set LLM_MODEL_NAME "$@" ;;
+  mirofish-report) shift; cmd_mf_set MIROFISH_REPORT_MODEL "$@" ;;
   *) usage ;;
 esac

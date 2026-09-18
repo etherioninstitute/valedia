@@ -17,8 +17,8 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (Slice 22/23). Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.23.0"
+# Runtime identity (NT-1 enrichment JSON; Slice 22/23 versioning). Not a substitute for MANUSCRIPT_VERSION.
+VALEDIA_VERSION = "0.24.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().

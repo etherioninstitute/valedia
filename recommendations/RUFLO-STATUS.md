@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **Arc G NT-0 + NT-1 SHIPPED.** Version `0.24.0` tag `valedia-v0.24.0`. **STOP for Burton.** NT-3 OpenTerminal not this session.
+
+## NT-0 / NT-1 (Grok Build executor, `valedia-v2-grok-build`)
+- NT-0 `6f594d1`: local `neural-trader@2.8.11` `--ignore-scripts`; research allowlist only; live/broker unwired (cron/config/MCP). `test_nt0.py` PASS.
+- NT-1: `mirofish_neural_enrich.py` → MiroFish-adjacent JSON; no fusion weight / AUTO_RAISE / Intents. `test_nt1.py` PASS.
+- Fence held. No `--live` venue, no VENUE_WRITER / NAUTILUS_LIVE / SPOT_RECONCILE_HTTP / REBALANCER_AUTOEXEC flips.
+
+---
+
 Updated: 2026-09-18 PT — **Grok Build Slices 22+23 SHIPPED.** Version `0.23.0` tag `valedia-v0.23.0`. **STOP for Burton.**
 
 ## Slice 22 (Grok Build executor, `valedia-v2-grok-build`)

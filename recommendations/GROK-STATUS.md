@@ -4,17 +4,19 @@
 
 **Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
 
-**Version:** 0.23.0  
-**Tag:** `valedia-v0.23.0` (Build, annotated)  
-**Tip:** `e82c4bf` (`valedia-v2-grok-build`)  
-**Slice 22:** `5447d94` · **Slice 23 code:** `0a94a5b`
+**Current:** STOP — Arc G NT-0 + NT-1 shipped. NT-3 OpenTerminal UI not this session.
 
-**Current:** Slices 22 + 23 SHIPPED. **Next = STOP for Burton.**
+**Shipped:** Slices 1–23 + S24 live messaging; model switcher; **NT-0** pin; **NT-1** MiroFish neural enrichment JSON.
 
-**Slice 23:** `VALEDIA_VERSION` in `valedia_config.py`. `scripts/valedia_version.sh` prints version+sha+branch+dirty. Status/Signal headers stamp `version_stamp()`. Annotated tag on Build tip. Live tag only after fenced deploy (do not apply this slice).
+| Slice | Tip | Version | Tag |
+|-------|-----|---------|-----|
+| NT-0 | `6f594d1` | 0.23.0 (no bump) | — |
+| NT-1 | see `valedia-v0.24.0` | **0.24.0** | `valedia-v0.24.0` |
 
-**Slice 22:** FTL `Profit:` from fee-true ledger (sports JSON view-only; UNRECONCILED cannot be realized P&L). Allocator Coinbase/Alpaca `UNRECONCILED` unless `extract_spot_fill.complete`; missing `place_market_order` stays FAILED. Alpaca banner = env `ALPACA_PAPER`. latency_arb POST-ack → UNRECONCILED; `arb_run` dry-run. Crontab stagger **patch only** — not installed. ERE still `FAIL_CLOSED`. Tests: `test_slice22.py` + `test_slice23.py` PASS.
+**Fence:** No trader live, no broker writers, no VENUE_WRITER / REBALANCER_AUTOEXEC / SPOT_RECONCILE_HTTP / NAUTILUS_LIVE flips. CLI-first neural-trader; no opus/sonnet agents. MiroFish weight 0.10 / `MIROFISH_AUTO_RAISE=False`. Filtered MCP 57 tools, 0 neural/live/broker.
 
-**Propose (do not apply):** fenced rsync of v2 scripts → live `~/.openclaw/workspace` (messaging only). No crontab rewrite unless Burton pastes `CRONTAB-STAGGER-S22.patch`. No `install_cron.sh`. No flag flips. No live tag until that deploy.
+**NT-0:** `tools/neural-trader` pin `2.8.11` `--ignore-scripts`. Allowlist research verbs only. Smoke: `recommendations/NT-0-SMOKE.md`. `test_nt0.py` PASS.
 
-**Fence:** No --live, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP default False. Do **not** run `install_cron.sh`.
+**NT-1:** `mirofish_neural_enrich.py` → `models/mirofish_neural_enrichment.json` (regime + signal quality). No fusion weight change. `test_nt1.py` PASS. Tests mocked, no network orders.
+
+**Next:** STOP for Burton. NT-2 = wire enrichments into MiroFish seed/extractor + accuracy `neural_enriched` tag.

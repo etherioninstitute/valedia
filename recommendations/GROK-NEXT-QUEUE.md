@@ -1,15 +1,16 @@
-# Grok Build next queue (post Slice 23)
+# Arc G — neural-trader → MiroFish (Burton GO 2026-09-18)
 
-## Standing (Burton 2026-09-18)
-Use **git + Valedia versions** on every ship. See `VALEDIA-VERSIONING.md`.
-Status messages must be truthful and version-stamped.
+Charter: `VALEDIA-NEURAL-TRADER-FENCED.md` + local models section.
 
-## Shipped
-- Slice 22 — FTL Profit Signal + fill-vs-ack labels (`5447d94`)
-- Slice 23 — versioning bootstrap (`VALEDIA_VERSION=0.23.0`, tag `valedia-v0.23.0`)
+## DONE this session
+- **NT-0** `6f594d1` — pin `tools/neural-trader@2.8.11` `--ignore-scripts`; research allowlist; live/broker unreachable. `NT-0-SMOKE.md`.
+- **NT-1** — `mirofish_neural_enrichment.json` writer; tests mocked; `VALEDIA_VERSION` 0.24.0.
+- Optional: `valedia_models.sh mirofish-sync|mirofish-report [--write]`.
 
-## STOP for Burton
-Fenced live deploy of S22 messaging is a separate go. Do not run `install_cron.sh`. Live tag only after fenced deploy.
+## STOP
+Do not start **NT-3** OpenTerminal UI this session.
 
-### Then (from Ponytail Top 10, after Grok agree/disagree)
-Cleanup slices only where Grok AGREEd — ERE bind (`cumulative_extremes`), cron 404s, one Kelly/fee/ledger — still fenced.
+## Later (Burton go)
+- **NT-2** — wire enrichments into MiroFish seed/extractor; accuracy ledger tags `neural_enriched`.
+- **NT-3** — OpenTerminal Valedia+MiroFish read-only panel.
+- **NT-4** — optional RuFlo `trading-*` memory namespaces (still no live).
