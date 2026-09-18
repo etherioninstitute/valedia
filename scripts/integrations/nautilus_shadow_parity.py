@@ -25,6 +25,7 @@ from nautilus_shadow_venues import (
 WINDOW_DEFAULT = "7d"
 EVIDENCE = frozenset({"brain_coinbase", "hl_short", "polymarket_arb", "intel_coinbase"})
 CUTOVER_DAYS = 7
+DEFAULT_REPORT = os.path.join(os.path.dirname(DEFAULT_QUEUE), "shadow_parity_report.json")
 
 # Field names from venue compare_* that would send the wrong order at cutover.
 _DANGEROUS_FIELD = {
@@ -470,11 +471,11 @@ def report(*, queue_path=None, rows=None, window="7d", now=None, out_path=None):
 
 def main(argv=None):
     import argparse
-    p = argparse.ArgumentParser(description="Slice 12 shadow parity report (no HTTP)")
+    p = argparse.ArgumentParser(description="Slice 12/16 shadow parity report (no HTTP)")
     p.add_argument("--queue", default=None, help="intent JSONL (default models queue)")
     p.add_argument("--window", default=WINDOW_DEFAULT)
     p.add_argument("--now", default=None, help="ISO timestamp (fixtures)")
-    p.add_argument("--out", default=None, help="write JSON report")
+    p.add_argument("--out", default=DEFAULT_REPORT, help="write JSON report")
     args = p.parse_args(argv)
     rep = report(queue_path=args.queue, window=args.window, now=args.now, out_path=args.out)
     print(json.dumps({

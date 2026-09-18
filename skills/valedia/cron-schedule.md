@@ -15,6 +15,7 @@ description: >
 | 0 */2 * * * | Every 2h at :00 | SPORTS ENGINE | sports_run.py | Scan+bet 70-85c favorites (live) |
 | 20 */4 * * * | Every 4h at :20 | MASTER ALLOCATOR | allocator_run.py | Cross-strategy capital allocation (staggered vs sports — Slice 7, no double-bet race) |
 | 0 */6 * * * | Every 6h | LEDGER RECONCILE | reconcile_run.py | Kalshi settle + spot UNRECONCILED walk (GET HTTP off; Burton flip: `export SPOT_RECONCILE_HTTP=1` or `SPOT_RECONCILE_HTTP = True`) |
+| 45 6 * * * | 6:45 AM | SHADOW PARITY | parity_run.py | Report-only Intent vs POST compare (7d). Writes `models/shadow_parity_report.json`. Never POSTs / never flips flags. **Not in live crontab until Burton pastes the line.** |
 | 0 */6 * * * | Every 6h | QUANT ENGINE | quant_run.py | LMSR+EV+Kelly quant scan |
 | 30 */6 * * * | Every 6h | MARKET SCANNER | scanner_run.py | 600+ Kalshi markets edge scoring |
 | 0 */6 * * * | Every 6h | WHALE MONITOR | whale_copier.py | Whale wallet monitoring |
@@ -48,6 +49,28 @@ description: >
 | 0 7 * * * | 7:00 AM | MORNING BRIEF | kalshi_alert.py | Daily briefing |
 | 0 15 * * * | 3:00 PM | EOD PORTFOLIO | portfolio_monitor.py | End of day status |
 | 0 23 * * * | 11:00 PM | P&L TRACKER | pnl_run.py | Settlement + Ollama AI audit |
+
+## Shadow parity report (Slice 16)
+
+File: `~/.openclaw/workspace/models/shadow_parity_report.json`  
+CLI: `python3 scripts/integrations/nautilus_shadow_parity.py --window 7d`  
+Cron wrapper: `parity_run.py` (always exit 0; report-only).
+
+| Field | Meaning |
+|-------|---------|
+| `ok` | No dangerous mismatches in the window |
+| `diffs` | Per-row advisory / stored compare mismatches |
+| `dangerous` | Fail-closed: side, instrument, size, venue, signed, hook, leverage, dispatchable, live_flag, writer |
+| `buckets.*.compare_ok` | Rows that match Valedia POST bodies |
+| `ignored.allocator_coinbase` | Allocator Coinbase is not cutover evidence |
+| `cutover_ready` | 7d matching evidence. **Does not enable NT / writer / GET HTTP / AUTOEXEC** |
+| `flags` | Must stay `NAUTILUS_LIVE=false`, writers `valedia` or `none` |
+
+Manual cron (do not run `install_cron.sh` on live):
+
+```
+45 6 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh parity_run.py "SHADOW PARITY" 2>&1
+```
 
 ## Signal output
 

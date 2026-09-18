@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 16 SHIPPED** (shadow parity ops, report-only)
+
+## Slice 16 (Grok Build executor, `valedia-v2-grok-build`)
+- `parity_run.py` + `nautilus_shadow_parity.py --out` default `models/shadow_parity_report.json`. Window `7d` / `SHADOW_PARITY_WINDOW`.
+- Report-only: `ok` / `diffs` / `dangerous` / `cutover_ready`. Cron wrapper always exits 0. Live crontab not rewritten.
+- Tests: `test_slice16.py` PASS, no network. No --live / VENUE_WRITER / AUTOEXEC / GET HTTP / NT.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 15 SHIPPED** (fenced merge/deploy into live)
 
 ## Slice 15 (Grok Build executor, `valedia-v2-grok-build`)

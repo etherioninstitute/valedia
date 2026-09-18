@@ -49,6 +49,9 @@ PATH=/usr/local/bin:/opt/homebrew/bin:/Users/burtonchatelain/.npm-global/bin:/us
 30 * * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh settle_run.py "SETTLEMENT" 2>&1
 0 */6 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh reconcile_run.py "LEDGER RECONCILE" 2>&1
 
+# Shadow parity report-only (Slice 16). No POST. No flag flips. Do not run this installer on live.
+45 6 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh parity_run.py "SHADOW PARITY" 2>&1
+
 # Weekly
 0 17 * * 0 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh dca_module.py "DCA" 2>&1
 0 12 * * 5 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh rebalancer.py "REBALANCE" 2>&1
