@@ -30,3 +30,7 @@ venv/
 
 # Optional local overrides
 .claude/settings.local.json
+
+# NT-0 local pin. Install: cd tools/neural-trader && npm install --ignore-scripts --no-audit --no-fund
+tools/neural-trader/node_modules/
+

@@ -1,0 +1,10 @@
+{
+  "pin": "neural-trader@^2.8.11",
+  "min_version": "2.8.11",
+  "install": "npm install --ignore-scripts --no-audit --no-fund",
+  "path": "tools/neural-trader",
+  "cli": "npx --no-install neural-trader",
+  "allow": ["backtest", "signal", "regime", "risk", "portfolio", "train", "explain"],
+  "deny": ["live", "--live", "broker", "--broker", "mcp", "cloud", "--swarm"],
+  "agents": "never — CLI-first; plugin agents (opus/sonnet) are not Valedia LMS"
+}

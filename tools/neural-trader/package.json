@@ -1,0 +1,8 @@
+{
+  "name": "valedia-neural-trader-pin",
+  "private": true,
+  "description": "Local pin of neural-trader for MiroFish research CLI only. Not an OMS. Install: npm install --ignore-scripts --no-audit --no-fund",
+  "dependencies": {
+    "neural-trader": "^2.8.11"
+  }
+}
