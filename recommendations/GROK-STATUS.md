@@ -6,7 +6,7 @@
 
 **Current:** SHIPPED — Slice 14: Burton-gated spot GET (`SPOT_RECONCILE_HTTP` default False)
 
-**Shipped:** Slices 1–14
+**Shipped:** Slices 1–14 (tip `5996181`)
 
 **Next:** STOP for Burton. Do not flip `SPOT_RECONCILE_HTTP` / `REBALANCER_AUTOEXEC` / `VENUE_WRITER` / `--live`. No NT.
 

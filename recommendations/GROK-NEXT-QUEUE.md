@@ -8,7 +8,7 @@ Run in order. HARD FENCE throughout: no --live orders, no VENUE_WRITER flip, no 
 ## Slice 13 — MiroFish accuracy closed loop (local) — SHIPPED (`f036beb`)
 Fee-true FTL settlements → `mirofish_accuracy_ledger` → `effective_mirofish_weight()` capped at 10% until proven (>55% on ≥20 fee-true, or Burton bar). `MIROFISH_AUTO_RAISE=False`. Fusion/intel read ledger. Tests mocked. Local JSON only.
 
-## Slice 14 — Burton-gated spot GET — SHIPPED
+## Slice 14 — Burton-gated spot GET — SHIPPED (`5996181`)
 Valedia-runtime getter behind `SPOT_RECONCILE_HTTP` default False. Single flip: `export SPOT_RECONCILE_HTTP=1` or `SPOT_RECONCILE_HTTP = True`. Flag-off = mock/no HTTP. Flag-on tests inject mocked transport only (`set_spot_http_transport`). Still no --live / VENUE_WRITER / REBALANCER_AUTOEXEC.
 
 ## STOP
