@@ -1,6 +1,7 @@
 """P&L Tracker — Cron Wrapper (11pm)
-Tracks Kalshi settlements, auto-kills losing strategies, runs local AI audit,
-then sends Burton a simple, accurate P&L + invested message via Signal.
+Tracks Kalshi settlements, writes learning pauses (TTL/evidence, not graves),
+runs local AI audit, then sends Burton a simple, accurate P&L + invested
+message via Signal. WR flags are report-only and do not feed Kelly.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

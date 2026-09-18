@@ -12,7 +12,8 @@ Run anytime, or nightly:  python3 ~/.openclaw/workspace/scripts/valedia_consiste
 """
 import os, re, sys, glob, json, time
 
-INT = os.path.expanduser("~/.openclaw/workspace/scripts/integrations")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+INT = os.path.join(_HERE, "integrations")
 MODELS = os.path.expanduser("~/.openclaw/workspace/models")
 def live_pys():
     return [f for f in glob.glob(f"{INT}/*.py") if "/archive/" not in f]
@@ -115,6 +116,50 @@ for b in ("kelly_sizing.py", "quant_engine.py"):
     if os.path.exists(p) and "dynamic_per_trade_cap" not in open(p, encoding="utf-8", errors="ignore").read():
         kbad.append(b + ":no-dynamic-cap")
 r(F, "Kelly drift (hardcoded fraction or flat cap)", f"{kbad}") if kbad else r(P, "half-Kelly via KELLY_SAFETY_FRACTION + dynamic_per_trade_cap")
+
+# 8. Live fusion is valedia_config.FUSION_WEIGHTS; signal_fusion is non-live.
+print("\n[8] Fusion single-source (valedia_config.FUSION_WEIGHTS)")
+ub = open(f"{INT}/unified_brain.py", encoding="utf-8", errors="ignore").read()
+sf = open(f"{INT}/signal_fusion.py", encoding="utf-8", errors="ignore").read() if os.path.exists(f"{INT}/signal_fusion.py") else ""
+vc_txt = open(f"{INT}/valedia_config.py", encoding="utf-8", errors="ignore").read()
+fusion_ok = "FUSION_WEIGHTS" in vc_txt and "fusion_weights_for" in ub
+live_off = bool(re.search(r"LIVE_PATH\s*=\s*False", sf))
+inline = bool(re.search(r"kernel_weight\s*=\s*0\.3[05]", ub))
+if fusion_ok and live_off and not inline:
+    r(P, "live fusion = FUSION_WEIGHTS; signal_fusion LIVE_PATH=False")
+else:
+    r(F, "fusion drift (second live brain or missing FUSION_WEIGHTS)",
+      f"fusion_ok={fusion_ok} live_off={live_off} inline={inline}")
+
+# 9. No second fee table on the brain.
+print("\n[9] Fee table single-source (fee_engine.STATIC_FEES)")
+fees_dict = bool(re.search(r"^FEES\s*=", ub, re.M))
+gate_ok = "roundtrip_cost" in ub and "use_static=True" in ub
+if fees_dict or not gate_ok:
+    r(F, "unified_brain.FEES still present or fee gate not using fee_engine",
+      f"FEES_dict={fees_dict} gate_ok={gate_ok}")
+else:
+    r(P, "brain fee gate uses fee_engine.STATIC_FEES (use_static)")
+
+# 10. Rebalancer auto-exec default False; scalper/weather live off.
+print("\n[10] Rebalancer AUTOEXEC=False; scalper/weather live off")
+bad10 = []
+if not re.search(r"^REBALANCER_AUTOEXEC\s*=\s*False\b", vc_txt, re.M):
+    bad10.append("REBALANCER_AUTOEXEC")
+if not re.search(r"^SCALPER_LIVE\s*=\s*False\b", vc_txt, re.M):
+    bad10.append("SCALPER_LIVE")
+if not re.search(r"^WEATHER_LIVE\s*=\s*False\b", vc_txt, re.M):
+    bad10.append("WEATHER_LIVE")
+if "alp_buy_fn" in ub.split("# ── Scalper", 1)[-1].split("# ── Summary", 1)[0]:
+    bad10.append("scalper-alp_buy")
+wx = open(f"{INT}/weather_arb.py", encoding="utf-8", errors="ignore").read()
+wx_exec = wx.split("def execute_weather_trades", 1)[-1].split("def run", 1)[0]
+if "create_order(" in wx_exec:
+    bad10.append("weather-create_order")
+if bad10:
+    r(F, "live-adjacent kills incomplete", f"{bad10}")
+else:
+    r(P, "AUTOEXEC=False; scalper/weather cannot place live buys")
 
 print(f"\n=== {counts[P]} PASS · {counts[W]} WARN · {counts[F]} FAIL ===")
 sys.exit(1 if counts[F] else 0)

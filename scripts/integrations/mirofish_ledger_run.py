@@ -13,11 +13,11 @@ import mirofish_accuracy_ledger as m
 
 if __name__ == "__main__":
     try:
-        m.score()      # score matured predictions vs realized moves
+        m.score()      # score matured predictions vs fee-true FTL settlements
     except Exception as e:
         print(f"[mirofish_ledger] score failed: {e}")
     try:
         m.record()     # log today's real-sim predictions (no-op on lightweight signals)
     except Exception as e:
         print(f"[mirofish_ledger] record failed: {e}")
-    m.summary()
+    m.summary()        # writes mirofish_accuracy_summary.json for intel/fusion

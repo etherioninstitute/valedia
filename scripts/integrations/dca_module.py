@@ -77,6 +77,12 @@ def run_dca():
                     r = cb_buy(asset["ticker"], per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f}) -> {r.get('success','?')}")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
+                    try:
+                        import forward_test_ledger as _ftl
+                        _ftl.book_spot_fill("DCA", asset["ticker"], "buy", "coinbase",
+                                            r or {}, intended_source="live")
+                    except Exception:
+                        pass
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient CB cash (${cash:.2f})")
             else:
@@ -86,6 +92,14 @@ def run_dca():
                     r = alp_buy(asset["ticker"], notional=per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f})")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
+                    try:
+                        import forward_test_ledger as _ftl
+                        import alpaca_executor as _ae
+                        src = "live" if getattr(_ae, "IS_LIVE", False) else "paper"
+                        _ftl.book_spot_fill("DCA", asset["ticker"], "buy", "alpaca",
+                                            r or {}, intended_source=src)
+                    except Exception:
+                        pass
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient Alpaca cash (${cash:.2f})")
         except Exception as e:

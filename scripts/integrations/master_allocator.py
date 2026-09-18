@@ -89,18 +89,22 @@ def get_total_capital():
 # STEP 2: Gather ALL opportunities across ALL platforms
 # ═══════════════════════════════════════════════════════════════
 
+def _is_strategy_paused(name):
+    """Learning pause (TTL). Fail-open: errors / expired → not paused.
+    Live-exec fence is separate (is_killed_strategy) and is applied at execute."""
+    try:
+        from pnl_tracker import is_strategy_paused
+        return bool(is_strategy_paused(name))
+    except Exception:
+        return False
+
+
 def gather_all_opportunities():
     """Collect every opportunity from every source into one unified list.
     Each opportunity gets: expected_value_per_dollar, hours_to_resolve, platform.
-    RESPECTS STRATEGY BLACKLIST — dead strategies never trade."""
+    Skips currently-paused strategies (TTL). Unpaused names re-enter evaluation
+    even if Slice 8 live-exec fenced — sizing/gating yes, live POST no."""
     opps = []
-    
-    # Check strategy blacklist
-    try:
-        from pnl_tracker import is_strategy_blacklisted
-        _blacklist_check = True
-    except:
-        _blacklist_check = False
     
     # ── SOURCE 1: Kalshi prediction markets ──
     try:
@@ -108,8 +112,8 @@ def gather_all_opportunities():
         kalshi_opps = scan_all_markets()
         for o in kalshi_opps:
             if o["side"] in ("pending_intel", "both"): continue
-            # BLACKLIST CHECK: skip strategies proven to lose money
-            if _blacklist_check and is_strategy_blacklisted(o.get("strategy", "")):
+            # Learning pause: skip while unexpired. Not a grave.
+            if _is_strategy_paused(o.get("strategy", "")):
                 continue
             hours = max(1, o.get("hours_to_exp", 720))
             ev = o["edge"] / (o["price"] + 0.01)  # Return per dollar
@@ -129,29 +133,10 @@ def gather_all_opportunities():
     except Exception as e:
         print(f"  Kalshi scan error: {e}")
     
-    # ── SOURCE 2: Weather arbitrage (NOAA vs Kalshi) ──
-    try:
-        if _blacklist_check and is_strategy_blacklisted("WEATHER_ARB"):
-            raise Exception("WEATHER_ARB blacklisted")
-        from weather_arb import find_edges
-        wx_edges = find_edges()
-        for e in wx_edges:
-            hours = 24  # Weather resolves daily
-            ev = e["profit_per"] / (e["price"] + 0.01)
-            opps.append({
-                "platform": "kalshi_weather", "type": "WEATHER_ARB",
-                "ticker": e["ticker"], "title": e["title"][:50],
-                "side": e["side"], "price": e["price"],
-                "ev_per_dollar": round(ev, 4),
-                "ev_per_day": round(ev, 4),  # Resolves in ~1 day
-                "hours_to_resolve": hours,
-                "edge_pct": e["edge_pct"],
-                "max_loss_pct": 100,
-                "confidence": min(0.95, e["noaa_prob"]),
-                "raw": e,
-            })
-    except Exception as e:
-        print(f"  Weather scan error: {e}")
+    # ── SOURCE 2: Weather scan stays HTTP-off (Slice 8). No find_edges.
+    # Evaluation of WEATHER_ARB happens if injected/scanned opps pass pause.
+    # Live create_order stays fenced at execute.
+    opps.extend(gather_weather_opportunities())
     
     # ── SOURCE 3: Crypto (Coinbase — from unified brain signals) ──
     try:
@@ -280,6 +265,15 @@ def rank_opportunities(opps):
 # STEP 4: ALLOCATE capital to top opportunities
 # ═══════════════════════════════════════════════════════════════
 
+def gather_weather_opportunities():
+    """No NOAA/Kalshi HTTP. Weather live exec stays fenced; this is not a scan.
+
+    Evaluation/sizing of WEATHER_ARB is allowed when the learning pause has
+    expired and opps are injected or appear from other gather sources.
+    """
+    return []
+
+
 def allocate(opps, capital):
     """Distribute available capital across top opportunities.
     Uses Kelly-inspired sizing: higher EV = larger allocation."""
@@ -289,18 +283,24 @@ def allocate(opps, capital):
     
     allocations = []
     remaining = deployable
-    # Per-trade ceiling from the single source — breathes with the REAL track record / regime /
-    # Etherion risk (falls back to 15% if unavailable). Currently throttled small by the real
-    # (losing) ledger, which is correct: size to proven edge.
-    try:
-        _cap = _cfg.dynamic_per_trade_cap() if _cfg else 0.15
-    except Exception:
-        _cap = 0.15
-    max_per_opp = deployable * _cap
+    # Per-strategy ceiling from category_stats (fee-true). A hot fake/other
+    # category cannot lift this opp; paper/sandbox/unreconciled/backfill cannot
+    # lift. Falls back to 15% only if config is unavailable.
     
     for o in opps:
         if remaining < 0.50: break
+        cat = o.get("type") or o.get("strategy")
+        # Pause = skip sizing. Unpaused (incl. weather/oil) may be sized/gated.
+        # Live-exec fence is applied at execute, not here.
+        if _is_strategy_paused(cat):
+            continue
         if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
+
+        try:
+            _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15
+        except Exception:
+            _cap = 0.15
+        max_per_opp = deployable * _cap
         
         # Kelly-inspired: bet proportional to edge × confidence
         kelly_frac = o["ev_per_dollar"] * o["confidence"]
@@ -375,6 +375,21 @@ def execute_allocations(allocations, dry_run=False):
         
         if dry_run:
             r["status"] = "DRY_RUN"
+            results.append(r)
+            continue
+
+        cat = a.get("type") or a.get("strategy")
+        if _is_strategy_paused(cat):
+            r["status"] = "SKIP_PAUSED"
+            r["error"] = "learning pause (until TTL/evidence); not permanent"
+            results.append(r)
+            continue
+
+        # Slice 8 live-exec fence: weather/oil may be sized when unpaused, but
+        # this lane never places their orders. Unpause ≠ create_order / alp_buy.
+        if _cfg and _cfg.live_exec_fenced(cat):
+            r["status"] = "SKIP_LIVE_FENCE"
+            r["error"] = "live exec fenced (Slice 8); evaluation/sizing only"
             results.append(r)
             continue
         
@@ -464,34 +479,66 @@ def execute_allocations(allocations, dry_run=False):
                     _clear_kalshi_failure(a["ticker"])
                 else:
                     resp = create_order(a["ticker"], a["side"], n, price_cents)
-                    r["status"] = "EXECUTED"
                     r["contracts"] = n
                     _clear_kalshi_failure(a["ticker"])
-                    # Record the real fill in the fee-inclusive ledger (settled later by reconcile).
+                    # Fill-true only. Bare POST-ack is UNRECONCILED — never a live open.
+                    fill = {}
                     if _ftl:
                         try:
-                            _ftl.record_entry(a.get("type", "KALSHI"), a["ticker"], a["side"],
-                                              price_cents / 100.0, n, venue="kalshi", source="live")
+                            fill = _ftl.extract_kalshi_fill(resp)
+                            _ftl.book_kalshi_fill(
+                                _ftl.canonical_category(a.get("type", "KALSHI")),
+                                a["ticker"], a["side"], resp,
+                                intended_source="live",
+                                fallback_price=price_cents / 100.0,
+                                fallback_contracts=n)
                         except Exception:
-                            pass
+                            fill = {}
+                    r["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+                    if fill.get("order_id"):
+                        r["order_id"] = fill["order_id"]
             
             elif a["platform"] == "coinbase":
-                # Crypto trades via Coinbase
+                # Shadow Intent (Slice 2): never dispatchable; writer stays valedia.
+                try:
+                    from nautilus_shadow_coinbase import emit_allocator_shadow
+                    sh = emit_allocator_shadow(a)
+                    r["shadow_intent"] = sh.get("intent_id")
+                    r["shadow_dispatchable"] = bool(sh.get("dispatchable"))
+                except Exception as e:
+                    r["shadow_error"] = str(e)[:80]
+                # Crypto trades via Coinbase (existing Valedia writer — do not cut over)
                 try:
                     from coinbase_trader import place_market_order
                     ticker = a["ticker"].replace("-USD", "")
-                    place_market_order(ticker, a["side"], a["allocation"])
+                    cb_resp = place_market_order(ticker, a["side"], a["allocation"])
                     r["status"] = "EXECUTED"
+                    if _ftl:
+                        try:
+                            _ftl.book_spot_fill(
+                                a.get("type", "CRYPTO"), a["ticker"], a["side"],
+                                "coinbase", cb_resp if isinstance(cb_resp, dict) else {},
+                                intended_source="live")
+                        except Exception:
+                            pass
                 except Exception as e:
                     r["status"] = "FAILED"
                     r["error"] = str(e)[:80]
             
             elif a["platform"] == "alpaca":
-                # Stock trades via Alpaca
+                # Stock trades via Alpaca (existing Valedia writer)
                 try:
                     from alpaca_executor import place_order
-                    place_order(a["ticker"], a["side"], notional=a["allocation"])
+                    alp_resp = place_order(a["ticker"], a["side"], notional=a["allocation"])
                     r["status"] = "EXECUTED"
+                    if _ftl:
+                        try:
+                            _ftl.book_spot_fill(
+                                a.get("type", "EQUITY"), a["ticker"], a["side"],
+                                "alpaca", alp_resp if isinstance(alp_resp, dict) else {},
+                                intended_source="live")
+                        except Exception:
+                            pass
                 except Exception as e:
                     r["status"] = "FAILED"
                     r["error"] = str(e)[:80]
@@ -515,6 +562,24 @@ def run(dry_run=False, max_allocs=15):
     """Full allocation cycle: gather → rank → allocate → execute → report."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"🧠 MASTER ALLOCATOR ({ts}) {'[DRY]' if dry_run else '[LIVE]'}", ""]
+
+    # Slice 10: MiroFish/intel → gated Intents. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST.
+    try:
+        from intel_opportunity_gatherer import emit_shadow_intents
+        n_intel = len(emit_shadow_intents() or [])
+        lines.append(f"INTEL SHADOW: {n_intel} gated Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"INTEL SHADOW: skip ({str(e)[:60]})")
+
+    # Slice 11: HL shorts + Polymarket arb shadow. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST. Writer stays valedia/none.
+    try:
+        from nautilus_shadow_venues import emit_venue_expansion_shadows
+        n_v = len(emit_venue_expansion_shadows() or [])
+        lines.append(f"VENUE SHADOW: {n_v} HL/PM Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"VENUE SHADOW: skip ({str(e)[:60]})")
     
     # Capital
     capital = get_total_capital()

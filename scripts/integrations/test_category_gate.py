@@ -11,6 +11,9 @@ def _with(stats, overrides=None):
 
 
 def run():
+    # Isolate learning pause so this file tests the net gate, not the live blacklist.
+    ftl._learning_pause_until = lambda *a, **k: None
+
     # 1. Real net loss over a real sample -> BLOCK.
     _with({"OIL_BRACKET": {"n": 4, "wins": 0, "net": -19.90}})
     ok, why = ftl.should_trade_category("OIL_BRACKET")
@@ -44,6 +47,30 @@ def run():
     _with({"OIL_BRACKET": {"n": 4, "wins": 0, "net": -19.90}},
           {"parked": ["OIL_BRACKET"], "retest": ["OIL_BRACKET"]})
     assert ftl.should_trade_category("OIL_BRACKET")[0] is True  # retest wins
+
+    # 7. SPORTS_TONIGHT and SPORTS are one bucket: a SPORTS loss blocks both labels;
+    #    parking SPORTS parks SPORTS_TONIGHT (and the reverse).
+    _with({"SPORTS": {"n": 4, "wins": 0, "net": -12.0}})
+    ok, why = ftl.should_trade_category("SPORTS_TONIGHT")
+    assert ok is False, why
+    ok, why = ftl.should_trade_category("SPORTS")
+    assert ok is False, why
+    _with({}, {"parked": ["SPORTS"]})
+    assert ftl.should_trade_category("SPORTS_TONIGHT")[0] is False
+    _with({}, {"parked": ["SPORTS_TONIGHT"], "retest": ["SPORTS"]})
+    assert ftl.should_trade_category("SPORTS_TONIGHT")[0] is True  # retest on canonical wins
+
+    # 8. Learning pause is "paused until …", not a permanent kill; retest still wins.
+    from datetime import datetime, timezone, timedelta
+    until = datetime.now(timezone.utc) + timedelta(days=3)
+    ftl._learning_pause_until = lambda cat, now=None: until if cat == "OIL_BRACKET" else None
+    _with({"OIL_BRACKET": {"n": 4, "wins": 4, "net": 10.0}})
+    ok, why = ftl.should_trade_category("OIL_BRACKET")
+    assert ok is False and "paused until" in why and "not permanent" in why, why
+    _with({"OIL_BRACKET": {"n": 4, "wins": 4, "net": 10.0}}, {"retest": ["OIL_BRACKET"]})
+    assert ftl.should_trade_category("OIL_BRACKET")[0] is True
+    ftl._learning_pause_until = lambda *a, **k: None  # expired / missing → not paused
+    assert ftl.should_trade_category("OIL_BRACKET")[0] is True
 
     print("category-gate safety checks: PASS")
 

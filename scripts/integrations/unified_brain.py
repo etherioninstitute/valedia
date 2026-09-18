@@ -22,7 +22,9 @@ FILTER v3 (empirically derived from 2025 backtests):
 import os, sys, json, traceback, platform
 import numpy as np
 from datetime import datetime, timezone
-from valedia_config import MIROFISH_WEIGHT, KELLY_MIN_PROVEN_TRADES  # shared source of truth (drift-guarded)
+from valedia_config import (  # shared source of truth (drift-guarded)
+    MIROFISH_WEIGHT, KELLY_MIN_PROVEN_TRADES, FUSION_WEIGHTS, fusion_weights_for,
+)
 try:
     import forward_test_ledger as _ftl  # the REAL fee-inclusive track record (single source for sizing)
 except Exception:
@@ -381,16 +383,14 @@ def stage_fusion(kernel_sig, ere_safety, intel,
                  ml_score=50, mirofish_score=50, asset_class="equity"):
     k_score     = float(kernel_sig.get("score", 50))
     intel_boost = intel.get("fg_signal", 0)
-    # Crypto gets stronger intel boost
-    intel_weight = 0.15 if asset_class == "crypto" else 0.10
-    kernel_weight = 0.35 if asset_class == "equity" else 0.30
+    w = fusion_weights_for(asset_class)
 
     fused = (
-        k_score        * kernel_weight +
-        mirofish_score * MIROFISH_WEIGHT +
-        ml_score       * 0.18 +
-        (50 + intel_boost) * intel_weight +
-        50             * (1.0 - kernel_weight - 0.10 - 0.18 - intel_weight)
+        k_score        * w["kernel"] +
+        mirofish_score * w["mirofish"] +
+        ml_score       * w["ml"] +
+        (50 + intel_boost) * w["intel"] +
+        50             * w["remainder"]
     )
     deviation = (fused - 50) * ere_safety["multiplier"]
     return round(float(np.clip(50 + deviation, 5, 95)), 1)
@@ -400,29 +400,59 @@ def stage_fusion(kernel_sig, ere_safety, intel,
 # STAGE 5: KELLY SIZING
 # ══════════════════════════════════════════════════════════════════════
 
-def stage_kelly(fused_score, equity, max_pct=0.04, pos_multiplier=1.0):
-    if fused_score <= 55: return 0.0
-    edge     = (fused_score - 50) / 50.0
-    position = min(edge * 0.5 * equity, equity * max_pct) * pos_multiplier
-    return round(max(float(position), 0.0), 2)
+def stage_kelly(fused_score, equity, max_pct=0.04, pos_multiplier=1.0,
+                expected_return_pct=None, regime="SIDEWAYS", category=None,
+                track_record_mult=None, risk_factor=None, concurrent_bets=None):
+    """Delegate to KellySizer. One sizer. Fail-closed on error."""
+    if fused_score <= 55 or equity <= 0:
+        return 0.0
+    try:
+        from kelly_sizing import KellySizer
+        exp_ret = expected_return_pct
+        if exp_ret is None:
+            exp_ret = abs(float(fused_score) - 50.0) * 0.12
+        sizer = KellySizer(total_capital=float(equity))
+        rec = sizer.size_position(
+            composite_score=float(fused_score),
+            expected_return_pct=float(exp_ret),
+            regime=regime,
+            category=category,
+            track_record_mult=track_record_mult,
+            risk_factor=risk_factor,
+            concurrent_bets=concurrent_bets,
+        )
+        usd = float(rec.get("position_usd") or 0)
+        usd = min(usd, float(equity) * float(max_pct)) * float(pos_multiplier)
+        return round(max(usd, 0.0), 2)
+    except Exception:
+        return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
-# STAGE 6: FEE GATE
+# STAGE 6: FEE GATE — fee_engine.STATIC_FEES only (no second table)
 # ══════════════════════════════════════════════════════════════════════
-
-FEES = {"alpaca": 0.0, "coinbase": 0.006, "kraken": 0.0016,
-        "kalshi": 0.02, "polymarket": 0.0}
 
 def stage_fee_gate(position_size, expected_return_pct, platform="alpaca"):
     if position_size <= 0:
         return {"pass": False, "reason": "zero position"}
-    fee_rate  = FEES.get(platform, 0.005)
-    rt_fee    = position_size * fee_rate * 2
-    exp_pnl   = position_size * expected_return_pct / 100.0
+    from fee_engine import roundtrip_cost
+    rt = roundtrip_cost(platform, position_size, use_static=True)
+    rt_fee = float(rt["total_roundtrip"])
+    exp_pnl = position_size * expected_return_pct / 100.0
     if exp_pnl <= rt_fee:
         return {"pass": False, "reason": f"fees ${rt_fee:.4f} >= profit ${exp_pnl:.4f}"}
     return {"pass": True, "net_profit": round(exp_pnl - rt_fee, 4)}
+
+
+def scalper_place_buy(ticker, notional, alp_buy_fn=None, **_):
+    """Slice 8: MicroScalper never places live buys. Report-only. alp_buy_fn unused."""
+    return {
+        "bought": False,
+        "ticker": ticker,
+        "notional": notional,
+        "reason": "SCALPER_LIVE=False",
+        "status": "DISABLED",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -509,6 +539,47 @@ def get_coinbase():
         return None
 
 
+def _spot_source(plat, alpaca_live=False):
+    if plat == "coinbase":
+        return "live"
+    return "live" if alpaca_live else "paper"
+
+
+def _shadow_coinbase_write(side, ticker, usd_amount=None, crypto_amount=None):
+    """Slice 4B: never-dispatchable Intent before the Valedia Coinbase writer. Best-effort."""
+    try:
+        from nautilus_shadow_coinbase import emit_brain_shadow
+        emit_brain_shadow(side, ticker, usd_amount=usd_amount, crypto_amount=crypto_amount)
+    except Exception:
+        pass
+
+
+def ledger_spot_buy(plat, ticker, resp, alpaca_live=False):
+    """Book a Coinbase/Alpaca buy: fee-true live fill, or UNRECONCILED. Never silent."""
+    if not _ftl:
+        return None
+    try:
+        strategy = "CRYPTO_MOMENTUM" if plat == "coinbase" else "EQUITY_MOMENTUM"
+        return _ftl.book_spot_fill(
+            strategy, ticker, "buy", plat, resp or {},
+            intended_source=_spot_source(plat, alpaca_live))
+    except Exception:
+        return None
+
+
+def ledger_spot_sell(plat, ticker, resp, alpaca_live=False, fallback_price=None, fee=None):
+    """Settle a Coinbase/Alpaca sell. Incomplete fill cannot book live P&L."""
+    if not _ftl:
+        return None
+    try:
+        return _ftl.settle_spot_fill(
+            ticker, plat, resp or {},
+            intended_source=_spot_source(plat, alpaca_live),
+            fallback_price=fallback_price, fee=fee)
+    except Exception:
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # MASTER ORCHESTRATOR — run_brain()
 # ══════════════════════════════════════════════════════════════════════
@@ -559,7 +630,17 @@ def run_brain():
         with open(mfp) as f: mf = json.load(f)
         if mf.get("status") == "active":
             mirofish_signals = mf.get("signals", {})
-            lines.append(f"MIROFISH: bias={mf.get('overall_bias',50):.0f} ({len(mirofish_signals)} assets)")
+            acc_note = ""
+            try:
+                import mirofish_accuracy_ledger as _mal
+                st = _mal.read_summary(SYS["models_dir"])
+                acc_note = (f" acc={st.get('directional_accuracy')} "
+                            f"n={st.get('n_scored')} proven={st.get('proven')} "
+                            f"w={st.get('weight')}")
+            except Exception:
+                acc_note = ""
+            lines.append(f"MIROFISH: bias={mf.get('overall_bias',50):.0f} "
+                         f"({len(mirofish_signals)} assets){acc_note}")
     except Exception as e:
         lines.append(f"MIROFISH: signal unavailable — {str(e)[:50]}")
 
@@ -732,15 +813,16 @@ def run_brain():
 
             # Tighter sizing for discovered assets
             disc_mult = kelly_mult_disc if is_discovered else 1.0
+            exp_ret   = abs(fused - 50) * (0.3 if asset_cls == "crypto" else 0.12)
             position = min(
                 stage_kelly(fused, base_equity,
                             max_pct=max_trade_pct,
-                            pos_multiplier=q["pos_multiplier"] * conf_mult * disc_mult),
+                            pos_multiplier=q["pos_multiplier"] * conf_mult * disc_mult,
+                            expected_return_pct=exp_ret),
                 budget_left
             )
 
-            # Stage 7: Fee gate
-            exp_ret   = abs(fused - 50) * (0.3 if asset_cls == "crypto" else 0.12)
+            # Stage 7: Fee gate (fee_engine.STATIC_FEES, round-trip incl. Coinbase spread)
             fee_check = stage_fee_gate(position, exp_ret, plat)
 
             # ── Get current position ─────────────────────────────────
@@ -770,32 +852,34 @@ def run_brain():
                     not has_pos and actionable):
 
                 executed = False
+                buy_resp = None
                 if plat == "coinbase" and cb and cb_cash >= position:
                     try:
-                        cb_buy(ticker, position)
-                        spent_cb += position; executed = True
+                        _shadow_coinbase_write("buy", ticker, usd_amount=position)
+                        buy_resp = cb_buy(ticker, position)
+                        if _ftl and not _ftl.spot_ack_ok("coinbase", buy_resp):
+                            lines.append(f"  {name:6s} BUY FAILED: {buy_resp}")
+                        else:
+                            spent_cb += position; executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} BUY FAILED: {e}")
 
                 elif plat == "alpaca" and alpaca:
                     try:
-                        alp_buy(ticker, notional=position)
-                        spent_alp += position; executed = True
+                        buy_resp = alp_buy(ticker, notional=position)
+                        if _ftl and not _ftl.spot_ack_ok("alpaca", buy_resp):
+                            lines.append(f"  {name:6s} BUY FAILED: {buy_resp}")
+                        else:
+                            spent_alp += position; executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} BUY FAILED: {e}")
 
                 if executed:
                     log_trade(ticker, "BUY", fused, cur_price, position,
                               booster_str, plat)
-                    # Real fill -> fee-inclusive ledger (coinbase=live money, alpaca=paper).
-                    if _ftl and cur_price > 0:
-                        try:
-                            _ftl.record_entry(
-                                "CRYPTO_MOMENTUM" if plat == "coinbase" else "EQUITY_MOMENTUM",
-                                ticker, "buy", cur_price, position / cur_price, venue=plat,
-                                source="live" if plat == "coinbase" else "paper")
-                        except Exception:
-                            pass
+                    # Fill details → fee-true live row; POST-only → UNRECONCILED (never silent).
+                    alp_live = bool(alpaca[4]) if alpaca else False
+                    ledger_spot_buy(plat, ticker, buy_resp, alpaca_live=alp_live)
                     if MEMORY_AVAILABLE:
                         try:
                             capture_trade(ticker, "BUY", fused, cur_price, position)
@@ -811,34 +895,44 @@ def run_brain():
             # SELL signal (exit existing position)
             elif fused < sell_thresh and has_pos:
                 executed = False
+                sell_resp = None
+                bal = 0.0
                 if plat == "coinbase" and cb:
                     try:
                         base = ticker.replace("-USD","")
                         bal  = float(cb_bal.get(base, {}).get("balance", 0))
                         if bal > 0.0001:
-                            cb_sell(ticker, bal); executed = True
+                            _shadow_coinbase_write("sell", ticker, crypto_amount=bal)
+                            sell_resp = cb_sell(ticker, bal)
+                            if _ftl and not _ftl.spot_ack_ok("coinbase", sell_resp):
+                                lines.append(f"  {name:6s} SELL FAILED: {sell_resp}")
+                            else:
+                                executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} SELL FAILED: {e}")
                 elif plat == "alpaca" and alpaca:
                     try:
-                        alp_sell(ticker); executed = True
+                        sell_resp = alp_sell(ticker)
+                        if _ftl and not _ftl.spot_ack_ok("alpaca", sell_resp):
+                            lines.append(f"  {name:6s} SELL FAILED: {sell_resp}")
+                        else:
+                            executed = True
                     except Exception as e:
                         lines.append(f"  {name:6s} SELL FAILED: {e}")
 
                 if executed:
                     log_trade(ticker, "SELL", fused, cur_price, 0,
                               booster_str, plat)
-                    # Settle the round-trip in the fee-inclusive ledger.
-                    if _ftl and cur_price > 0:
-                        try:
-                            if plat == "coinbase":
-                                notional = float(bal) * cur_price
-                                fee = 2 * FEES.get("coinbase", 0.0) * notional  # ponytail: 2-leg taker approx
-                                _ftl.settle_open(ticker, "coinbase", cur_price, fee=fee, source="live")
-                            else:
-                                _ftl.settle_open(ticker, "alpaca", cur_price, source="paper")
-                        except Exception:
-                            pass
+                    alp_live = bool(alpaca[4]) if alpaca else False
+                    sell_fee = None
+                    if plat == "coinbase" and bal and cur_price:
+                        from fee_engine import calculate_trade_cost
+                        sell_fee = calculate_trade_cost(
+                            "coinbase", "sell", float(bal) * cur_price,
+                            use_static=True)["total_cost"]
+                    ledger_spot_sell(plat, ticker, sell_resp, alpaca_live=alp_live,
+                                     fallback_price=cur_price if cur_price > 0 else None,
+                                     fee=sell_fee)
                     actions.append(f"SELL {ticker}")
                     lines.append(
                         f"  >> SELL {name:6s} fused={fused:.0f} "
@@ -883,7 +977,7 @@ def run_brain():
     except Exception as e:
         lines.append(f"  DCA: {str(e)[:50]}")
 
-    # ── Scalper ──────────────────────────────────────────────────────
+    # ── Scalper (report-only; never alp_buy / never book live) ────────
     try:
         from strategy_modules import MicroScalper
         scalper = MicroScalper()
@@ -892,12 +986,12 @@ def run_brain():
             try: wp[t] = yf.Ticker(t).history(period="1mo")["Close"].values
             except: pass
         for s in scalper.get_scalp_candidates(wp):
-            if s["signal"] == "SCALP_LONG" and cash >= 2 and alpaca:
-                amt = min(cash * 0.03, 2)
-                _, alp_buy_fn, _, _, _ = alpaca
-                alp_buy_fn(s["ticker"], notional=amt)
-                actions.append(f"SCALP BUY ${amt:.2f} {s['ticker']}")
-                lines.append(f"  >> SCALP BUY ${amt:.2f} {s['ticker']} z={s['z']}")
+            # Slice 8: live scalper buys are dead. alp_buy is not called.
+            rec = scalper_place_buy(s.get("ticker"), 0)
+            lines.append(
+                f"  SCALP {s.get('signal')} {s.get('ticker')} z={s.get('z')} "
+                f"({rec['reason']})"
+            )
     except Exception as e:
         lines.append(f"  Scalp: {str(e)[:50]}")
 

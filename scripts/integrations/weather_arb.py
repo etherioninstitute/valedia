@@ -23,7 +23,7 @@ def _load_env():
                     k, v = line.split('=', 1)
                     os.environ.setdefault(k.strip(), v.strip())
 _load_env()
-from kalshi_auth import get, create_order, get_balance
+from kalshi_auth import get, get_balance  # create_order removed — weather live killed
 
 MIN_EDGE_PCT = 12
 MAX_PER_TRADE = 10
@@ -212,38 +212,36 @@ def find_edges():
 
 # ═══ EXECUTION ═══
 
-def execute_weather_trades(edges, dry_run=False, max_trades=5):
-    """Execute top weather arb trades."""
-    bal = get_balance()
-    balance = bal.get("balance",0) / 100
+def execute_weather_trades(edges, dry_run=True, max_trades=5):
+    """WEATHER_ARB live exec fenced (Slice 8). Never places orders.
+
+    Learning pause/TTL (Slice 9) may re-enable evaluation/sizing elsewhere.
+    This function still never calls create_order. dry_run is forced True.
+    """
+    dry_run = True
     results = []
-    for edge in edges[:max_trades]:
-        cost_per = edge["price"]
+    for edge in (edges or [])[:max_trades]:
+        cost_per = float(edge.get("price") or 0) or 1.0
         n = min(int(MAX_PER_TRADE / cost_per), 50)
-        if n < 1: continue
+        if n < 1:
+            continue
         total_cost = n * cost_per
-        if total_cost > balance * 0.10:
-            n = max(1, int(balance * 0.10 / cost_per))
-            total_cost = n * cost_per
-        profit = n * edge["profit_per"]
-        price_cents = max(1, min(99, int(cost_per * 100)))
-        r = {"ticker":edge["ticker"],"city":edge["city"],"side":edge["side"],
-             "contracts":n,"cost":round(total_cost,2),"profit":round(profit,2),
-             "edge":edge["edge_pct"],"noaa_fc":edge["forecast_high"],"bracket":edge["bracket"]}
-        if dry_run:
-            r["status"] = "DRY_RUN"
-        else:
-            try:
-                create_order(edge["ticker"], edge["side"], n, price_cents)
-                r["status"] = "EXECUTED"; balance -= total_cost
-            except Exception as e:
-                r["status"] = "FAILED"; r["error"] = str(e)[:100]
+        profit = n * float(edge.get("profit_per") or 0)
+        r = {"ticker": edge.get("ticker"), "city": edge.get("city"),
+             "side": edge.get("side"), "contracts": n,
+             "cost": round(total_cost, 2), "profit": round(profit, 2),
+             "edge": edge.get("edge_pct"),
+             "noaa_fc": edge.get("forecast_high"),
+             "bracket": edge.get("bracket"),
+             "status": "DRY_RUN",
+             "reason": "WEATHER_ARB_KILLED"}
         results.append(r)
     return results
 
 # ═══ MAIN ═══
 
-def run(dry_run=False, max_trades=5):
+def run(dry_run=True, max_trades=5):
+    dry_run = True  # Slice 8: live weather is dead
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"🌡️ WEATHER ARB v2 ({ts}) {'[DRY]' if dry_run else '[LIVE]'}", ""]
     edges = find_edges()
@@ -288,4 +286,4 @@ if __name__ == "__main__":
     elif args.mode == "dry-run":
         run(dry_run=True, max_trades=args.max_trades)
     elif args.mode == "execute":
-        run(dry_run=False, max_trades=args.max_trades)
+        run(dry_run=True, max_trades=args.max_trades)  # live disabled

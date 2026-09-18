@@ -36,6 +36,24 @@ def get_position(symbol):
     r.raise_for_status()
     return r.json()
 
+def get_order(order_id):
+    """Read-only GET of one order by id. Not a fill until qty+price parse complete.
+
+    Path: GET /v2/orders/{order_id}. Fail-closed → None.
+    Slice 7: called from spot_order_get only when SPOT_RECONCILE_HTTP is on.
+    """
+    if not order_id:
+        return None
+    import requests
+    try:
+        r = requests.get(f"{_base()}/v2/orders/{order_id}", headers=_headers(), timeout=10)
+        if not r.ok:
+            return None
+        body = r.json()
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
 def market_buy(symbol, notional=None, qty=None):
     """Buy stock by dollar amount (fractional) or quantity."""
     import requests

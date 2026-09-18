@@ -37,6 +37,7 @@ STATIC_FEES = {
         "source": "static", "updated": "2026-03-13"
     },
     "alpaca": {
+        "maker": 0, "taker": 0,
         "commission_stocks": 0, "commission_etfs": 0,
         "commission_options": 0.65,
         "deposit": 0, "withdraw": 0,
@@ -126,11 +127,13 @@ def kalshi_fee_per_contract(price):
     return 0.07 * p * (1 - p)
 
 
-def calculate_trade_cost(platform, side, amount_usd, is_maker=False, price=None):
+def calculate_trade_cost(platform, side, amount_usd, is_maker=False, price=None,
+                         use_static=False):
     """Calculate total fees for a trade. For Kalshi, pass price (0<P<1) to use the REAL
     published nonlinear fee ceil(0.07*contracts*P*(1-P)); without price it falls back to a
-    flat per-contract approximation (callers should pass price)."""
-    fees = get_fees(platform)
+    flat per-contract approximation (callers should pass price).
+    use_static=True reads STATIC_FEES only (no cache, no HTTP). Brain fee gate uses this."""
+    fees = dict(STATIC_FEES.get(platform, {})) if use_static else get_fees(platform)
     rate = fees.get("maker" if is_maker else "taker", 0.003)
     trading_fee = amount_usd * rate
 
@@ -157,9 +160,11 @@ def calculate_trade_cost(platform, side, amount_usd, is_maker=False, price=None)
         "cost_pct": round((trading_fee + extra) / amount_usd * 100, 4) if amount_usd > 0 else 0
     }
 
-def is_trade_profitable(platform, amount_usd, expected_return_pct, is_maker=False, price=None):
+def is_trade_profitable(platform, amount_usd, expected_return_pct, is_maker=False, price=None,
+                        use_static=False):
     """Gate: Is this trade profitable after all fees?"""
-    cost = calculate_trade_cost(platform, "buy", amount_usd, is_maker, price=price)
+    cost = calculate_trade_cost(platform, "buy", amount_usd, is_maker, price=price,
+                                use_static=use_static)
     gross_profit = amount_usd * (expected_return_pct / 100)
     net_profit = gross_profit - cost["total_cost"]
 
@@ -174,11 +179,11 @@ def is_trade_profitable(platform, amount_usd, expected_return_pct, is_maker=Fals
         "verdict": "EXECUTE" if net_profit > 0 else "REJECT (fees eat profit)"
     }
 
-def roundtrip_cost(platform, amount_usd, is_maker=False):
+def roundtrip_cost(platform, amount_usd, is_maker=False, use_static=False):
     """Full round-trip cost: buy + sell + deposit + withdraw."""
-    fees = get_fees(platform)
-    buy_cost = calculate_trade_cost(platform, "buy", amount_usd, is_maker)
-    sell_cost = calculate_trade_cost(platform, "sell", amount_usd, is_maker)
+    fees = dict(STATIC_FEES.get(platform, {})) if use_static else get_fees(platform)
+    buy_cost = calculate_trade_cost(platform, "buy", amount_usd, is_maker, use_static=use_static)
+    sell_cost = calculate_trade_cost(platform, "sell", amount_usd, is_maker, use_static=use_static)
     deposit_fee = fees.get("deposit_ach", fees.get("deposit", 0))
     withdraw_fee = fees.get("withdraw_ach", fees.get("withdraw_flat", 0))
 

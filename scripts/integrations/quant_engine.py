@@ -20,7 +20,9 @@ The math: C(q) = b * ln(sum(e^(qi/b)))
 """
 import os, sys, json, math
 from datetime import datetime, timezone
-from valedia_config import MIROFISH_WEIGHT, KELLY_SAFETY_FRACTION, dynamic_per_trade_cap  # shared source of truth (drift-guarded)
+from valedia_config import (  # shared source of truth (drift-guarded)
+    MIROFISH_WEIGHT, effective_mirofish_weight, KELLY_SAFETY_FRACTION, dynamic_per_trade_cap,
+)
 from fee_engine import kalshi_fee_per_contract  # canonical real Kalshi fee (single source)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -291,7 +293,7 @@ def scan_for_edges(bankroll=300, min_edge_cents=3):
     intel_sources = []
     try:
         mf = json.load(open(os.path.join(MODELS, "mirofish_signal.json")))
-        intel_sources.append(("MiroFish", mf.get("overall_bias", 50) / 100, MIROFISH_WEIGHT))  # <=10% cap; shared source of truth (drift-guarded)
+        intel_sources.append(("MiroFish", mf.get("overall_bias", 50) / 100, effective_mirofish_weight()))  # capped until proven; valedia_config
     except: pass
     try:
         ere = json.load(open(os.path.join(MODELS, "latest_etherion_risk.json")))

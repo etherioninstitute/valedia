@@ -4,6 +4,7 @@ Executes market buys/sells on Coinbase using v3 brokerage API.
 """
 import json, jwt, time, secrets, requests, os
 import platform
+from coinbase_order_body import build_market_order_body
 
 # Route through VPS SOCKS proxy on Mac (IP-locked API)
 _USE_PROXY = platform.system() == "Darwin"
@@ -51,37 +52,60 @@ def get_price(pair="BTC-USD"):
     r = _request("GET", f"/api/v3/brokerage/products/{pair}")
     return float(r.json()["price"]) if r.ok else 0
 
+def _fill_fields(d):
+    """Pass through venue fill fields if the POST body has them. Quote size is not a fill."""
+    sr = d.get("success_response") if isinstance(d.get("success_response"), dict) else {}
+    out = {}
+    for k in ("filled_size", "average_filled_price", "total_fees", "completion_percentage"):
+        if k in sr:
+            out[k] = sr[k]
+        elif k in d:
+            out[k] = d[k]
+    return out
+
 def market_buy(pair, usd_amount):
-    """Market buy $usd_amount worth of crypto. Returns order result."""
-    body = {
-        "client_order_id": secrets.token_hex(16),
-        "product_id": pair,
-        "side": "BUY",
-        "order_configuration": {"market_market_ioc": {"quote_size": f"{usd_amount:.2f}"}}
-    }
+    """Market buy $usd_amount worth of crypto. Returns order result (fill fields if present)."""
+    body = build_market_order_body(pair, "BUY", usd_amount=usd_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
         d = r.json()
         success = d.get("success", False)
         oid = d.get("success_response", {}).get("order_id", "?")
-        return {"success": success, "order_id": oid, "pair": pair, "usd": usd_amount}
+        rec = {"success": success, "order_id": oid, "pair": pair, "usd": usd_amount}
+        rec.update(_fill_fields(d))
+        return rec
     return {"success": False, "error": r.text[:300]}
 
 def market_sell(pair, crypto_amount):
     """Market sell crypto_amount of base currency."""
-    body = {
-        "client_order_id": secrets.token_hex(16),
-        "product_id": pair,
-        "side": "SELL",
-        "order_configuration": {"market_market_ioc": {"base_size": f"{crypto_amount}"}}
-    }
+    body = build_market_order_body(pair, "SELL", crypto_amount=crypto_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
         d = r.json()
         success = d.get("success", False)
         oid = d.get("success_response", {}).get("order_id", "?")
-        return {"success": success, "order_id": oid, "pair": pair, "qty": crypto_amount}
+        rec = {"success": success, "order_id": oid, "pair": pair, "qty": crypto_amount}
+        rec.update(_fill_fields(d))
+        return rec
     return {"success": False, "error": r.text[:300]}
+
+def get_order(order_id):
+    """Read-only GET of one order by id. Not a fill until qty+price parse complete.
+
+    Path: /api/v3/brokerage/orders/historical/{order_id}. Fail-closed → None.
+    Slice 7: called from spot_order_get only when SPOT_RECONCILE_HTTP is on.
+    """
+    if not order_id:
+        return None
+    try:
+        r = _request("GET", f"/api/v3/brokerage/orders/historical/{order_id}")
+        if not r.ok:
+            return None
+        body = r.json()
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
 
 def get_orders(status="OPEN"):
     r = _request("GET", f"/api/v3/brokerage/orders/historical?order_status={status}&limit=10")
