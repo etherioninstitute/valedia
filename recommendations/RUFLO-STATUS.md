@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **Grok Build Slice 21 SHIPPED** (Ponytail-audit response + trade-status labels). **STOP for Burton.**
+
+## Slice 21 (Grok Build executor, `valedia-v2-grok-build`)
+- Part A: `recommendations/PONYTAIL-AUDIT-GROK-RESPONSE.md` — ERE no-op cause is missing `cumulative_extremes`, not missing class names. Live crontab ≠ installer.
+- Part B: `recommendations/VALEDIA-TRADE-STATUS-ACCURACY.md` + v2 label fixes (ERE `FAIL_CLOSED`, brain ACKED, settle `not FTL`, quant SCAN-ONLY). `test_slice21.py` PASS.
+- Fence held. Live crontab/scripts not rewritten. Next = STOP or Slice 22 (FTL Signal + live stagger).
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 19 SHIPPED** (cutover prep ONLY). **STOP for Burton.**
 
 ## Slice 19 (Grok Build executor, `valedia-v2-grok-build`)

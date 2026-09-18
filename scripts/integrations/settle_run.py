@@ -30,7 +30,7 @@ def settle_sports():
             result = m.get('result', '')
             if result in ('yes', 'no'):
                 won = (result == 'yes')
-                pnl = bet['profit_if_win'] if won else -bet['cost']
+                pnl = bet['profit_if_win'] if won else -(bet['cost'] + bet.get('fee', 0.0))
                 bet['settled'] = True
                 bet['result'] = result
                 bet['won'] = won
@@ -55,6 +55,15 @@ def settle_sports():
 
     return new_settlements, log.get('stats', {})
 
+def format_settled_signal(new_pnl, w, l, total_net, total_record):
+    """Keep Profit: prefix (signal-protocol.md). Body must not claim FTL realized P&L."""
+    return (f"Profit: {new_pnl:+.2f} ({w}W/{l}L settled) sports-log not FTL\n"
+            f"Total: {total_net:+.2f} ({total_record})")
+
+def format_arb_signal(arb):
+    return (f"Profit: {arb['net_pnl']:+.2f} ({arb['wins']}W/{arb['losses']}L) "
+            f"arb-log not FTL")
+
 def run():
     new_sports, stats = settle_sports()
 
@@ -67,7 +76,7 @@ def run():
         total_record = f"{stats.get('wins',0)}W/{stats.get('losses',0)}L"
 
         from signal_send import send
-        send(f"Profit: {new_pnl:+.2f} ({w}W/{l}L settled)\nTotal: {total_net:+.2f} ({total_record})")
+        send(format_settled_signal(new_pnl, w, l, total_net, total_record))
 
     # Also check arb settlements
     try:
@@ -75,7 +84,7 @@ def run():
         arb = check_arb_settlements()
         if arb and arb.get('settled', 0) > 0:
             from signal_send import send
-            send(f"Arb profit: {arb['net_pnl']:+.2f} ({arb['wins']}W/{arb['losses']}L)")
+            send(format_arb_signal(arb))
     except:
         pass
 

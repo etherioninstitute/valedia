@@ -633,8 +633,16 @@ def run(dry_run=False, max_allocs=15):
     results = execute_allocations(allocations[:max_allocs], dry_run=dry_run)
     lines.append(f"\nEXECUTION:")
     for r in results:
-        icon = "✅" if r["status"]=="EXECUTED" else "🔶" if r["status"]=="DRY_RUN" else "❌"
-        lines.append(f"  {icon} {r['platform']:15} ${r['allocation']:.2f} → EV ${r['expected_profit']:.2f} | {r['ticker'][:30]}")
+        st = r.get("status") or "?"
+        icon = ("✅" if st == "EXECUTED"
+                else "⏳" if st == "UNRECONCILED"
+                else "🔶" if st == "DRY_RUN"
+                else "⏭" if str(st).startswith("SKIP")
+                else "❌")
+        lines.append(
+            f"  {icon} {st:16} {r['platform']:15} ${r['allocation']:.2f} "
+            f"→ EV ${r['expected_profit']:.2f} | {r['ticker'][:30]}"
+        )
         if r.get("error"): lines.append(f"    ERR: {r['error']}")
     
     # Save state

@@ -495,7 +495,7 @@ def simple_pnl_message(summary):
     lines = [
         f"💰 Valedia P&L — {d}",
         f"Invested: ${inv:,.2f} deployed · ${cash:,.2f} cash",
-        f"{icon} Realized P&L: ${net:+,.2f}  (Kalshi, net of fees)",
+        f"{icon} Kalshi broker P&L: ${net:+,.2f}  (pnl_tracker.json, not FTL)",
     ]
     if w + l > 0:
         lines.append(f"Settled record: {w}W / {l}L ({s.get('win_rate', 0):.0f}% win)")
