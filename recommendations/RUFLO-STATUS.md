@@ -1,4 +1,12 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 19 SHIPPED** (cutover prep ONLY). **STOP for Burton.**
+
+## Slice 19 (Grok Build executor, `valedia-v2-grok-build`)
+- Checklist: `recommendations/VALEDIA-LIVE-CUTOVER-PREP.md`. No NT install, no NAUTILUS_LIVE, no VENUE_WRITER, no HL/PM live.
+- Next: STOP for Burton.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 18 SHIPPED** (MiroFish weight rec, cap ≤10–15%)
 
 ## Slice 18 (Grok Build executor, `valedia-v2-grok-build`)

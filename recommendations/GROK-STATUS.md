@@ -1,20 +1,17 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 22:55 PT
+**Updated:** 2026-09-17 22:58 PT
 
 **Mode:** RuFlo MCP (`:8810` filtered) + Ponytail plugin. Hard fence held.
 
-**Current:** DONE — Arc F Slice 18 (MiroFish weight recommendation, local JSON)
+**Current:** DONE — Arc F Slice 19 (NT/HL/Polymarket live-cutover prep). **STOP for Burton.**
 
-**Shipped:** Slices 1–18
+**Shipped:** Slices 1–19 (Arc F complete)
 
 **Done this slice:**
-- `recommend_weight()` writes `models/mirofish_weight_recommendation.json`.
-- Unproven rec **10%**; proven rec **≤15%**. Runtime stays `effective_weight()` (no auto-raise).
-- `applied=False` — this lane never writes `MIROFISH_WEIGHT` / `MIROFISH_AUTO_RAISE`.
-- Learning: pause TTL / probation; `permanent_blacklist=false`. Unpause ≠ weather/oil live-buy.
-- Local JSON only. No HTTP Intent. `test_slice18.py` PASS.
+- `recommendations/VALEDIA-LIVE-CUTOVER-PREP.md` — shadow→live gaps, Burton go/no-go order.
+- **Did not** enable `NAUTILUS_LIVE` / `VENUE_WRITER` / HL or Polymarket live / NT install.
 
-**Next:** Slice 19 — NT/HL/Polymarket live-cutover prep checklist ONLY
+**Next:** STOP for Burton (no trading flag flips from this lane)
 
 **Fence:** No --live, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP default False.
