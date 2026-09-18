@@ -18,7 +18,12 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
-MIROFISH_WEIGHT     = 0.10     # MiroFish fusion weight (<=10% cap). Consumers: unified_brain, quant_engine.
+MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
+MIROFISH_UNPROVEN_CAP = 0.10   # Slice 13: never exceed while accuracy unproven
+MIROFISH_PROVEN_CAP   = 0.15   # 10–15% ceiling even if proven
+MIROFISH_ACCURACY_BAR = 0.55   # Burton-configurable directional bar (strict >)
+MIROFISH_MIN_SCORED   = 20     # fee-true scored sample before proven
+MIROFISH_AUTO_RAISE   = False  # this lane never auto-raises past the unproven cap
 CRYPTO_FEE_PCT      = 0.001    # crypto taker-fee assumption for backtests/sizing.
 CRYPTO_SLIPPAGE_PCT = 0.0005   # crypto slippage assumption.
 
@@ -150,12 +155,25 @@ def live_exec_fenced(name):
     return str(name or "").strip().upper() in LIVE_EXEC_FENCED
 
 
+def effective_mirofish_weight():
+    """Runtime MiroFish fusion weight from the fee-true accuracy ledger.
+
+    Unproven → ≤ MIROFISH_UNPROVEN_CAP. Proven does not auto-raise
+    (MIROFISH_AUTO_RAISE=False). Any error fails closed to the unproven cap.
+    """
+    try:
+        import mirofish_accuracy_ledger as _mal
+        return float(_mal.effective_weight())
+    except Exception:
+        return min(float(MIROFISH_WEIGHT), float(MIROFISH_UNPROVEN_CAP))
+
+
 def fusion_weights_for(asset_class="equity"):
     """Resolved kernel-first weights for one asset class. Sum + remainder = 1."""
     crypto = str(asset_class or "").strip().lower() == "crypto"
     kernel = FUSION_WEIGHTS["kernel_crypto"] if crypto else FUSION_WEIGHTS["kernel_equity"]
     intel = FUSION_WEIGHTS["intel_crypto"] if crypto else FUSION_WEIGHTS["intel_equity"]
-    mf = FUSION_WEIGHTS["mirofish"]
+    mf = effective_mirofish_weight()
     ml = FUSION_WEIGHTS["ml"]
     remainder = 1.0 - kernel - mf - ml - intel
     return {

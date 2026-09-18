@@ -630,7 +630,17 @@ def run_brain():
         with open(mfp) as f: mf = json.load(f)
         if mf.get("status") == "active":
             mirofish_signals = mf.get("signals", {})
-            lines.append(f"MIROFISH: bias={mf.get('overall_bias',50):.0f} ({len(mirofish_signals)} assets)")
+            acc_note = ""
+            try:
+                import mirofish_accuracy_ledger as _mal
+                st = _mal.read_summary(SYS["models_dir"])
+                acc_note = (f" acc={st.get('directional_accuracy')} "
+                            f"n={st.get('n_scored')} proven={st.get('proven')} "
+                            f"w={st.get('weight')}")
+            except Exception:
+                acc_note = ""
+            lines.append(f"MIROFISH: bias={mf.get('overall_bias',50):.0f} "
+                         f"({len(mirofish_signals)} assets){acc_note}")
     except Exception as e:
         lines.append(f"MIROFISH: signal unavailable — {str(e)[:50]}")
 

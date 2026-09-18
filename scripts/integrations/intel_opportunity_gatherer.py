@@ -1,10 +1,7 @@
-"""Slice 10 — MiroFish + in-tree intel → opportunities → gated Intents.
+"""Slice 10 — MiroFish + in-tree intel → gated never-dispatchable Intents.
 
-Reads local JSON only (injectable models_dir). No HTTP. No keys. No live orders.
-Does not write the forward-test ledger. Intents are shadow + exec_dry_run + live_flag=False.
-ledger_source is paper (cannot lift Kelly). Writer stays valedia.
-Arb candidates are extra-shadow only.
-
+Local JSON only. No HTTP/keys/orders. ledger_source=paper. Writer=valedia.
+Slice 13: MiroFish blend uses effective (capped) weight from the fee-true ledger.
 (c) GOATWORTHY Post LLC.
 """
 from __future__ import annotations
@@ -12,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 import valedia_config as vc
 from nautilus_intent import enqueue_intent, make_intent
@@ -142,11 +138,27 @@ def _opp(kind, strategy, venue, instrument, side, score, edge_pct, feed, raw,
     }
 
 
-def collect_mirofish(doc, listed=LISTED_CRYPTO):
+def _mf_weight():
+    try:
+        return float(vc.effective_mirofish_weight())
+    except Exception:
+        return float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+
+
+def _mf_accuracy(models_dir=None):
+    try:
+        import mirofish_accuracy_ledger as mal
+        return mal.read_summary(models_dir)
+    except Exception:
+        return {}
+
+
+def collect_mirofish(doc, listed=LISTED_CRYPTO, accuracy=None):
     """MiroFish swarm JSON → listed crypto / equity / new-listing candidates."""
     out = []
     signals = (doc or {}).get("signals") or {}
-    mf_w = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+    mf_w = _mf_weight()
+    acc = accuracy if isinstance(accuracy, dict) else {}
     for raw_tk, sig in signals.items():
         if not isinstance(sig, dict):
             continue
@@ -166,11 +178,12 @@ def collect_mirofish(doc, listed=LISTED_CRYPTO):
             if side != "buy":
                 # Alpaca shadow is long-only here (no short Intent from intel).
                 continue
-        # MiroFish is ≤10% of fusion; standalone score is still the swarm number,
-        # tagged so a later blender can cap it.
         out.append(_opp(kind, strategy, venue, tk, side, score,
                         _edge_pct_from_score(score), "mirofish",
-                        {**sig, "mirofish_weight": mf_w}))
+                        {**sig, "mirofish_weight": mf_w,
+                         "mirofish_proven": bool(acc.get("proven")),
+                         "mirofish_accuracy": acc.get("directional_accuracy"),
+                         "mirofish_n_scored": acc.get("n_scored")}))
     return out
 
 
@@ -327,8 +340,8 @@ def _blend_key(o):
 
 
 def merge_opps(opps):
-    """Dedupe. MiroFish may only contribute MIROFISH_WEIGHT when fusion is present."""
-    mf_w = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+    """Dedupe. MiroFish blend uses effective (capped) weight when fusion is present."""
+    mf_w = _mf_weight()
     buckets = {}
     for o in opps:
         buckets.setdefault(_blend_key(o), []).append(o)
@@ -440,7 +453,8 @@ def gather(models_dir=_MODELS, listed=None):
     listed = listed if listed is not None else LISTED_CRYPTO
     md = models_dir
     opps = []
-    opps.extend(collect_mirofish(_load(os.path.join(md, "mirofish_signal.json")), listed))
+    opps.extend(collect_mirofish(_load(os.path.join(md, "mirofish_signal.json")),
+                                 listed, accuracy=_mf_accuracy(md)))
     opps.extend(collect_fusion(_load(os.path.join(md, "latest_fusion.json")), listed))
     opps.extend(collect_hot_list(_load(os.path.join(md, "hot_list.json")), listed))
     opps.extend(collect_hedge(_load(os.path.join(md, "hedge_fund_intel.json"))))

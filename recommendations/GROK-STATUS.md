@@ -1,21 +1,19 @@
 # Grok Build status
 
-**Updated:** 2026-09-17 19:22 PT
+**Updated:** 2026-09-17 19:50 PT
 
 **Mode:** RuFlo MCP required (`:8810` filtered).
 
-**Current:** SHIPPED — Slice 12: shadow parity harness (brain Coinbase + HL/Poly/intel compare.ok)
+**Current:** SHIPPED — Slice 13: MiroFish accuracy closed loop (fee-true; weight capped until proven)
 
-**Shipped:** Slices 1–12 (Slice 12 `d57f7ed`)
+**Shipped:** Slices 1–13
 
-**Next:** Slice 13 — MiroFish accuracy closed loop (local JSON; weight still capped)
+**Next:** Slice 14 — Burton-gated spot GET (SPOT_RECONCILE_HTTP default False)
 
-## Slice 12 (shadow parity harness)
+**Done this slice:**
+- `mirofish_accuracy_ledger.py` scores matured swarm predictions against fee-true `forward_test_ledger` settlements (paper/sandbox/backfill/shadow excluded). Local JSON only. No yfinance/HTTP.
+- `effective_mirofish_weight()` ≤ `MIROFISH_UNPROVEN_CAP` (0.10) until proven (`>` `MIROFISH_ACCURACY_BAR` 0.55 on ≥ `MIROFISH_MIN_SCORED` 20 fee-true results). `MIROFISH_AUTO_RAISE=False` — proven does not auto-raise. Burton bar/caps are config.
+- Fusion (`fusion_weights_for` → `stage_fusion`) and intel (`merge_opps` / `collect_mirofish` / `gather` snapshot) read the ledger. Snapshot: `mirofish_accuracy_summary.json`.
+- Tests: `test_slice13.py` PASS (+ slices 8–12). Drift check 10 PASS. No network.
 
-1. **`nautilus_shadow_parity.py`** — mockable `7d` window (`--window 7d --now ISO`). Compares shadow Intents vs the POST Valedia would/did emit: unified_brain Coinbase, HL short, Polymarket arb, intel Coinbase. Records `compare.ok` / diffs. No HTTP.
-2. **Fail-closed** on cutover-dangerous mismatches: side, instrument, size, venue, signed, live hook, leverage, dispatchable, live_flag, writer=nautilus, stale `compare.ok`, corrupt JSONL. Allocator Coinbase is **ignored** as cutover evidence (still fence-scanned). Intel Alpaca/Kalshi are advisory (not NT cutover surfaces).
-3. **`cutover_ready.coinbase`** requires 7 UTC calendar days of matching brain rows **and** no dangerous diffs. Report-only — this lane does not flip `VENUE_WRITER`, `--live`, `SPOT_RECONCILE_HTTP`, `REBALANCER_AUTOEXEC`, or NT flags.
-
-**Tests:** `test_slice12.py` PASS (fixtures, no network). Slice 11 still PASS.
-
-**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT. SPOT_RECONCILE_HTTP default False.
+**Fence:** No --live, no VENUE_WRITER flip, no REBALANCER_AUTOEXEC, no NT, no HTTP Intent path. SPOT_RECONCILE_HTTP default False.

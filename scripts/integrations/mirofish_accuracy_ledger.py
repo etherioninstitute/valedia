@@ -1,122 +1,400 @@
-"""mirofish_accuracy_ledger.py — append-only accuracy ledger for MiroFish predictions.
+"""MiroFish accuracy ledger — fee-true closed loop (Slice 13).
 
-Path A item 5. Records each REAL MiroFish signal's per-asset predicted direction,
-then later scores it against the realized move and reports a running hit rate.
-MiroFish fusion weight stays 10% until this ledger shows directional accuracy
->55% over 2-4 weeks (per skills/trading/intelligence/mirofish.md). This ledger is
-the ONLY thing that may justify raising that weight.
+Append-only JSONL. Predictions from local mirofish_signal.json; outcomes from
+fee-inclusive forward_test_ledger settlements. Paper/sandbox/backfill/shadow
+never count. No HTTP. yfinance is dead unless MIROFISH_PRICE_HTTP=1 (this
+lane never sets that).
 
-  record()  — append predictions from a NON-lightweight mirofish_signal.json
-  score()   — fill outcomes for predictions past their horizon; append results
-  summary() — running hit rate per asset + overall, with sample size
+Weight: effective_weight() ≤ MIROFISH_UNPROVEN_CAP until proven
+(directional accuracy > MIROFISH_ACCURACY_BAR on ≥ MIROFISH_MIN_SCORED
+fee-true results, or Burton-configured bar). Does not auto-raise
+(MIROFISH_AUTO_RAISE=False). Fusion/intel read this module.
 
-Append-only JSONL. (c) GOATWORTHY Post LLC.
+  record()  — directional predictions from a NON-lightweight signal
+  score()   — match matured preds to fee-true FTL settlements
+  summary() — hit rate + proven flag + effective weight
+
+(c) GOATWORTHY Post LLC.
 """
-import os, sys, json, argparse
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
 from datetime import datetime, timezone, timedelta
 
-MODELS = os.path.expanduser("~/.openclaw/workspace/models")
-SIGNAL = os.path.join(MODELS, "mirofish_signal.json")
-LEDGER = os.path.join(MODELS, "mirofish_accuracy_ledger.jsonl")
+import valedia_config as vc
+
+_MODELS = os.path.expanduser("~/.openclaw/workspace/models")
+_LEDGER = None
+_SIGNAL = None
+_FTL = None
+_SUMMARY = None
 HORIZON_DAYS = 5
+
+# Back-compat names (healthcheck / docs).
+MODELS = _MODELS
+LEDGER = os.path.join(_MODELS, "mirofish_accuracy_ledger.jsonl")
+SIGNAL = os.path.join(_MODELS, "mirofish_signal.json")
+
+
+def set_paths(models_dir=None, ledger_path=None, signal_path=None,
+              ftl_path=None, summary_path=None):
+    """Injectable paths for tests. None leaves that slot unchanged."""
+    global _MODELS, _LEDGER, _SIGNAL, _FTL, _SUMMARY, MODELS, LEDGER, SIGNAL
+    if models_dir is not None:
+        _MODELS = models_dir
+        MODELS = models_dir
+        _LEDGER = _SIGNAL = _FTL = _SUMMARY = None
+    if ledger_path is not None:
+        _LEDGER = ledger_path
+    if signal_path is not None:
+        _SIGNAL = signal_path
+    if ftl_path is not None:
+        _FTL = ftl_path
+    if summary_path is not None:
+        _SUMMARY = summary_path
+    p = paths()
+    LEDGER = p["ledger"]
+    SIGNAL = p["signal"]
+
+
+def paths():
+    models = _MODELS
+    return {
+        "models": models,
+        "ledger": _LEDGER or os.path.join(models, "mirofish_accuracy_ledger.jsonl"),
+        "signal": _SIGNAL or os.path.join(models, "mirofish_signal.json"),
+        "ftl": _FTL or os.path.join(models, "forward_test_ledger.jsonl"),
+        "summary": _SUMMARY or os.path.join(models, "mirofish_accuracy_summary.json"),
+    }
 
 
 def _append(rec):
-    with open(LEDGER, "a") as f:
+    path = paths()["ledger"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
         f.write(json.dumps(rec) + "\n")
 
 
+def _read_jsonl(path):
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
 def _read():
-    return [json.loads(l) for l in open(LEDGER)] if os.path.exists(LEDGER) else []
+    return _read_jsonl(paths()["ledger"])
 
 
-def record():
-    """Append predictions from the current signal file IF it is a real sim (not lightweight)."""
-    if not os.path.exists(SIGNAL):
-        print("no signal file"); return 1
-    d = json.load(open(SIGNAL))
+def _parse_ts(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    s = s.replace(" UTC", "").replace("Z", "+00:00")
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T")
+        if "+" not in s:
+            s += "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _norm_dir(raw):
+    s = str(raw or "").strip().upper()
+    if not s:
+        return None
+    if s.startswith(("UP", "BUY", "LONG", "YES", "BULL")):
+        return "UP"
+    if s.startswith(("DOWN", "SELL", "SHORT", "NO", "BEAR")):
+        return "DOWN"
+    return None
+
+
+def _assets_match(pred_asset, ticker):
+    a = str(pred_asset or "").strip().upper().replace(" ", "")
+    b = str(ticker or "").strip().upper().replace(" ", "")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a + "-USD" == b or b + "-USD" == a:
+        return True
+    return a.replace("-", "") == b.replace("-", "")
+
+
+def _non_real(source):
+    try:
+        import forward_test_ledger as ftl
+        return bool(ftl._is_non_real_source(source))
+    except Exception:
+        s = str(source or "").lower()
+        return ("paper" in s or "sandbox" in s or "unreconciled" in s
+                or "backfill" in s or "shadow" in s)
+
+
+def record(signal_doc=None):
+    """Append directional predictions from a REAL swarm signal. No HTTP."""
+    if signal_doc is None:
+        sig_path = paths()["signal"]
+        if not os.path.exists(sig_path):
+            print("no signal file")
+            return 1
+        try:
+            signal_doc = json.load(open(sig_path))
+        except Exception:
+            print("signal unreadable")
+            return 1
+    d = signal_doc or {}
     src = str(d.get("source", ""))
     if "lightweight" in src.lower():
-        print(f"signal source is '{src}' — lightweight, NOT recording (only real sims count)"); return 2
-    ts = d.get("ts", datetime.now(timezone.utc).isoformat())
-    signals = d.get("signals", {})
-    pid = "mf_" + ts.replace(":", "").replace("-", "")[:15]
+        print(f"signal source is '{src}' — lightweight, NOT recording")
+        return 2
+    ts = d.get("ts") or datetime.now(timezone.utc).isoformat()
+    signals = d.get("signals") or {}
+    pid = "mf_" + str(ts).replace(":", "").replace("-", "")[:15]
     n = 0
+    due_dt = _parse_ts(ts)
+    due = ((due_dt or datetime.now(timezone.utc))
+           + timedelta(days=HORIZON_DAYS)).isoformat()
     for asset, s in signals.items():
-        direction = s.get("direction") if isinstance(s, dict) else s
-        score = s.get("score") if isinstance(s, dict) else None
-        _append({"type": "prediction", "pred_id": f"{pid}_{asset}", "ts": ts, "source": src,
-                 "asset": asset, "predicted_direction": direction, "score": score,
-                 "horizon_days": HORIZON_DAYS,
-                 "score_after": (datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                                 + timedelta(days=HORIZON_DAYS)).isoformat()})
+        blob = s if isinstance(s, dict) else {"direction": s}
+        direction = blob.get("direction") or blob.get("predicted_direction")
+        if _norm_dir(direction) is None:
+            continue
+        score = blob.get("score")
+        _append({
+            "type": "prediction",
+            "pred_id": f"{pid}_{asset}",
+            "ts": ts,
+            "source": src,
+            "asset": asset,
+            "predicted_direction": direction,
+            "score": score,
+            "horizon_days": HORIZON_DAYS,
+            "score_after": due,
+        })
         n += 1
     print(f"recorded {n} MiroFish predictions from real sim (source='{src}')")
     return 0
 
 
-def _price(asset):
-    """Latest price for an asset ticker (yfinance; CoinGecko fallback for -USD)."""
+def _ftl_pairs(rows=None):
+    recs = rows if rows is not None else _read_jsonl(paths()["ftl"])
+    entries = {r["id"]: r for r in recs if r.get("type") == "entry" and r.get("id")}
+    pairs = []
+    for s in recs:
+        if s.get("type") != "settlement":
+            continue
+        e = entries.get(s.get("entry_id"), {})
+        if _non_real(s.get("source")) or _non_real(e.get("source")):
+            continue
+        pairs.append((e, s))
+    return pairs
+
+
+def _event_ts(entry, sett):
+    return (_parse_ts(sett.get("ts"))
+            or _parse_ts(sett.get("logged_at"))
+            or _parse_ts(entry.get("ts"))
+            or _parse_ts(entry.get("logged_at")))
+
+
+def _fee_true_outcome(entry, sett):
     try:
-        import yfinance as yf, io, contextlib
-        with contextlib.redirect_stderr(io.StringIO()):
-            h = yf.Ticker(asset).history(period="7d")
-        if not h.empty:
-            return float(h["Close"].iloc[-1])
-    except Exception:
+        net = float(sett.get("realized_pnl_net"))
+    except (TypeError, ValueError):
+        return None, None, None
+    fee = sett.get("fee")
+    if fee is None:
+        fee = entry.get("entry_fee")
+    if net == 0:
+        return None, net, fee
+    side = str(entry.get("side") or "").strip().lower()
+    if side in ("sell", "short", "no"):
+        realized = "DOWN" if net > 0 else "UP"
+    else:
+        realized = "UP" if net > 0 else "DOWN"
+    return realized, net, fee
+
+
+def _best_ftl_match(pred, pairs, pts, due):
+    asset = pred.get("asset")
+    best = None
+    best_ts = None
+    for entry, sett in pairs:
+        ticker = entry.get("ticker") or sett.get("ticker")
+        if not _assets_match(asset, ticker):
+            continue
+        ets = _event_ts(entry, sett)
+        if ets is None:
+            continue
+        if pts is not None and ets < pts:
+            continue
+        if due is not None and ets > due:
+            continue
+        if best_ts is None or ets < best_ts:
+            best = (entry, sett)
+            best_ts = ets
+    return best
+
+
+def score(now=None, ftl_rows=None):
+    """Score matured predictions vs fee-true FTL settlements. No HTTP."""
+    if os.environ.get("MIROFISH_PRICE_HTTP") == "1":
+        # Explicit opt-in only. Default path never fetches prices.
         pass
-    return None
-
-
-def score():
-    """For predictions past their horizon and not yet scored, fetch realized move + hit."""
     recs = _read()
-    scored = {r["pred_id"] for r in recs if r.get("type") == "result"}
-    preds = [r for r in recs if r.get("type") == "prediction" and r["pred_id"] not in scored]
-    now = datetime.now(timezone.utc)
+    scored = {r["pred_id"] for r in recs if r.get("type") == "result" and r.get("pred_id")}
+    preds = [r for r in recs if r.get("type") == "prediction" and r.get("pred_id") not in scored]
+    now = now or datetime.now(timezone.utc)
+    pairs = _ftl_pairs(ftl_rows)
     n = 0
     for p in preds:
-        try:
-            due = datetime.fromisoformat(p["score_after"].replace("Z", "+00:00"))
-        except Exception:
+        due = _parse_ts(p.get("score_after"))
+        pts = _parse_ts(p.get("ts"))
+        if due is not None and now < due:
             continue
-        if now < due:
-            continue  # horizon not reached
-        entry = p.get("entry_price") or _price(p["asset"])
-        cur = _price(p["asset"])
-        if entry is None or cur is None:
+        pred_dir = _norm_dir(p.get("predicted_direction"))
+        if pred_dir is None:
             continue
-        realized = "UP" if cur > entry else "DOWN"
-        pred = str(p.get("predicted_direction", "")).upper()
-        hit = (pred.startswith("UP") and realized == "UP") or (pred.startswith("DOWN") and realized == "DOWN")
-        _append({"type": "result", "pred_id": p["pred_id"], "asset": p["asset"],
-                 "predicted_direction": p.get("predicted_direction"), "realized": realized,
-                 "hit": bool(hit), "scored_at": now.isoformat()})
+        match = _best_ftl_match(p, pairs, pts, due)
+        if match is None:
+            continue
+        entry, sett = match
+        realized, net, fee = _fee_true_outcome(entry, sett)
+        if realized is None:
+            continue
+        hit = realized == pred_dir
+        _append({
+            "type": "result",
+            "pred_id": p["pred_id"],
+            "asset": p.get("asset"),
+            "predicted_direction": p.get("predicted_direction"),
+            "realized": realized,
+            "hit": bool(hit),
+            "fee_true": True,
+            "realized_pnl_net": net,
+            "fee": fee,
+            "ftl_entry_id": entry.get("id"),
+            "source": "forward_test_ledger",
+            "scored_at": now.isoformat() if hasattr(now, "isoformat") else str(now),
+        })
         n += 1
     print(f"scored {n} predictions")
     return 0
 
 
-def summary():
-    recs = _read()
-    results = [r for r in recs if r.get("type") == "result"]
+def _weight_from(proven):
+    configured = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+    unproven_cap = float(getattr(vc, "MIROFISH_UNPROVEN_CAP", 0.10))
+    proven_cap = float(getattr(vc, "MIROFISH_PROVEN_CAP", 0.15))
+    auto_raise = bool(getattr(vc, "MIROFISH_AUTO_RAISE", False))
+    cap = proven_cap if (proven and auto_raise) else unproven_cap
+    return min(configured, cap)
+
+
+def accuracy_stats(rows=None):
+    recs = rows if rows is not None else _read()
     preds = [r for r in recs if r.get("type") == "prediction"]
-    if not results:
-        print(f"MiroFish accuracy ledger: {len(preds)} predictions recorded, 0 scored yet.")
-        print("Weight stays 10% until >55% directional accuracy over 2-4 weeks.")
-        return 0
-    from collections import defaultdict
-    per = defaultdict(lambda: [0, 0])
+    results = [r for r in recs if r.get("type") == "result" and r.get("fee_true")]
+    legacy = [r for r in recs if r.get("type") == "result" and not r.get("fee_true")]
+    hits = sum(1 for r in results if r.get("hit"))
+    n = len(results)
+    acc = (hits / n) if n else None
+    bar = float(getattr(vc, "MIROFISH_ACCURACY_BAR", 0.55))
+    min_n = int(getattr(vc, "MIROFISH_MIN_SCORED", 20))
+    proven = bool(n >= min_n and acc is not None and acc > bar)
+    w = _weight_from(proven)
+    net = 0.0
     for r in results:
-        per[r["asset"]][0] += 1; per[r["asset"]][1] += 1 if r["hit"] else 0
-    tot_n = sum(v[0] for v in per.values()); tot_h = sum(v[1] for v in per.values())
-    print(f"{'asset':10}{'n':>5}{'hits':>6}{'hit%':>8}")
-    for a, (nn, hh) in sorted(per.items()):
-        print(f"{a:10}{nn:>5}{hh:>6}{100.0*hh/nn:>8.1f}")
-    rate = 100.0 * tot_h / tot_n
-    print(f"{'OVERALL':10}{tot_n:>5}{tot_h:>6}{rate:>8.1f}")
-    print(f"\nGate: raise MiroFish fusion weight above 10% ONLY if overall >55% "
-          f"over 2-4 weeks. Currently {rate:.1f}% on {tot_n} (n {'>=' if tot_n>=20 else '<'} 20).")
+        try:
+            net += float(r.get("realized_pnl_net") or 0)
+        except (TypeError, ValueError):
+            pass
+    return {
+        "n_predictions": len(preds),
+        "n_scored": n,
+        "hits": hits,
+        "directional_accuracy": None if acc is None else round(acc, 4),
+        "fee_true_net": round(net, 4),
+        "legacy_n": len(legacy),
+        "proven": proven,
+        "bar": bar,
+        "min_scored": min_n,
+        "weight": w,
+        "auto_raise": bool(getattr(vc, "MIROFISH_AUTO_RAISE", False)),
+        "source": "forward_test_ledger",
+    }
+
+
+def is_proven(stats=None):
+    st = stats if stats is not None else accuracy_stats()
+    return bool(st.get("proven"))
+
+
+def effective_weight(stats=None):
+    """Runtime MiroFish fusion weight. Never auto-raises past the unproven cap."""
+    proven = is_proven(stats) if stats is not None else is_proven()
+    return _weight_from(proven)
+
+
+def write_summary_snapshot(stats=None):
+    st = stats if stats is not None else accuracy_stats()
+    path = paths()["summary"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(st, f, indent=2)
+    return st
+
+
+def read_summary(models_dir=None):
+    """Intel/fusion read path: snapshot JSON if present, else that dir's ledger.
+
+    A caller-supplied models_dir never falls through to the live home ledger.
+    """
+    if models_dir:
+        snap = os.path.join(models_dir, "mirofish_accuracy_summary.json")
+        if os.path.exists(snap):
+            try:
+                d = json.load(open(snap))
+                if isinstance(d, dict) and "proven" in d:
+                    return d
+            except Exception:
+                pass
+        led = os.path.join(models_dir, "mirofish_accuracy_ledger.jsonl")
+        return accuracy_stats(_read_jsonl(led) if os.path.exists(led) else [])
+    return accuracy_stats()
+
+
+def summary():
+    st = write_summary_snapshot()
+    n_pred, n, hits = st["n_predictions"], st["n_scored"], st["hits"]
+    if n == 0:
+        print(f"MiroFish accuracy ledger: {n_pred} predictions recorded, 0 fee-true scored.")
+        print(f"Weight stays {st['weight']:.0%} until >{st['bar']:.0%} directional "
+              f"on ≥{st['min_scored']} fee-true results.")
+        return 0
+    rate = 100.0 * hits / n
+    print(f"OVERALL n={n} hits={hits} hit%={rate:.1f} fee_true_net={st['fee_true_net']:+.2f}")
+    print(f"proven={st['proven']} weight={st['weight']:.0%} auto_raise={st['auto_raise']}")
+    print("Gate: raise fusion weight above the unproven cap ONLY if proven AND "
+          "Burton sets MIROFISH_AUTO_RAISE. This lane does not auto-raise.")
     return 0
 
 
