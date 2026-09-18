@@ -71,14 +71,14 @@ Still true / still live:
 
 ## Slice 22 plan (messaging/label unless a bug blocks truth)
 
-Still no fence lifts.
+Still no fence lifts. **Shipped in v2** (`test_slice22.py`). Live crontab/scripts not rewritten this slice.
 
-1. **FTL settlement Signal.** `settle_run` reads fee-true FTL rows for the `Profit:` body. Sports JSON = view. Test: UNRECONCILED row cannot appear as realized P&L.
-2. **Allocator spot status.** Coinbase/Alpaca: `UNRECONCILED` unless `extract_spot_fill.complete` (mirror Kalshi). Missing `place_market_order` stays FAILED (do not add the writer).
-3. **Live crontab (Burton).** Allocator `:20` stagger. Do not execute `install_cron.sh`. Optional: morning brief to log-only (protocol: only Invested/Profit).
-4. **Alpaca one flag.** `IS_LIVE` vs `ALPACA_PAPER` — pick env, one banner. No key edits.
-5. **`latency_arb` POST-ack** → `UNRECONCILED` if execute ever used; cron stays dry-run.
-6. **ERE bind** is Part A Top 1 (not messaging). Status `FAIL_CLOSED` stays until `cumulative_extremes` exists.
+1. **FTL settlement Signal.** **Done.** `settle_run` `Profit:` body from fee-true FTL (`fee_true_settlements` / `ftl_profit_signal`). Sports JSON = print view only. UNRECONCILED/paper/backfill/shadow cannot appear as P&L.
+2. **Allocator spot status.** **Done.** Coinbase/Alpaca: `spot_fill_status` → `UNRECONCILED` unless `extract_spot_fill.complete`. Missing `place_market_order` stays FAILED (writer not added). Alpaca `place_order` still missing → FAILED.
+3. **Live crontab (Burton).** **Documented only:** `recommendations/CRONTAB-STAGGER-S22.patch` (allocator `:20`). Do not execute `install_cron.sh`. Optional morning brief log-only noted in the patch.
+4. **Alpaca one flag.** **Done.** `alpaca_is_live()` from env `ALPACA_PAPER` (unset → live, executor default). Brain + portfolio_monitor + `_base()` share it. No key edits.
+5. **`latency_arb` POST-ack** → **Done.** `ack_status` → `UNRECONCILED` without fill. `arb_run.py` stays `dry-run`.
+6. **ERE bind** — **deferred.** Porting `cumulative_extremes` is small but would silently change fail-open sizing (`multiplier` 1.0 → live ERE cuts). Status stays `FAIL_CLOSED`. Later slice, not messaging.
 
 ---
 

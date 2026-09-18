@@ -11,7 +11,12 @@ sys.path.insert(0, "/Users/burtonchatelain/.openclaw/workspace/scripts/integrati
 def check_alpaca():
     key = os.environ.get("ALPACA_API_KEY", "")
     secret = os.environ.get("ALPACA_SECRET_KEY", "")
-    paper = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+    try:
+        from alpaca_executor import alpaca_is_live
+        paper = not alpaca_is_live()
+    except Exception:
+        env = os.environ.get("ALPACA_PAPER")
+        paper = False if env is None or str(env).strip() == "" else str(env).strip().lower() in ("1", "true", "yes", "on")
     base = "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
     if not key:
         return "Alpaca: No API key configured"

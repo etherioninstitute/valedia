@@ -1,5 +1,9 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Grok Build Slice 21 SHIPPED** (Ponytail-audit response + trade-status labels). **STOP for Burton.**
+Updated: 2026-09-18 PT — **Grok Build Slice 22 SHIPPED** (FTL Profit Signal + fill-vs-ack). Versioning = Slice 23.
+
+## Slice 22 (Grok Build executor, `valedia-v2-grok-build`)
+- FTL `Profit:` body; sports JSON view-only; UNRECONCILED excluded. Allocator spot UNRECONCILED unless fill complete. Alpaca `ALPACA_PAPER` one flag. latency_arb execute → UNRECONCILED. Crontab patch documented, not installed. ERE still FAIL_CLOSED.
+- Tests: `test_slice22.py` PASS. Fence held. No `install_cron.sh`.
 
 ## Slice 21 (Grok Build executor, `valedia-v2-grok-build`)
 - Part A: `recommendations/PONYTAIL-AUDIT-GROK-RESPONSE.md` — ERE no-op cause is missing `cumulative_extremes`, not missing class names. Live crontab ≠ installer.

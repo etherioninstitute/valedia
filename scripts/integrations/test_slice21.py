@@ -82,7 +82,7 @@ def test_unreconciled_cannot_say_realized_pnl():
     msg = sr.format_settled_signal(-1.25, 0, 1, -12.5, "0W/4L")
     assert msg.startswith("Profit:"), msg
     assert "realized" not in msg.lower(), msg
-    assert "not FTL" in msg, msg
+    assert "FTL fee-true" in msg, msg
     arb = sr.format_arb_signal({"net_pnl": 2.0, "wins": 1, "losses": 0})
     assert arb.startswith("Profit:"), arb
     assert "realized" not in arb.lower()

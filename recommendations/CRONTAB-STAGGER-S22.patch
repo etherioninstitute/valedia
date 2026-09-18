@@ -1,0 +1,30 @@
+# CRONTAB-STAGGER-S22.patch
+# Document only. Do NOT run install_cron.sh. Do not apply without Burton.
+# Captured from live `crontab -l` on 2026-09-18. Worktree installer already
+# has allocator :20; live crontab still collides with sports at :00.
+#
+# Apply (Burton, after review):
+#   crontab -l > /tmp/crontab.pre-s22
+#   # change the allocator minute 0 → 20 (exact lines below)
+#   crontab /tmp/crontab.s22
+#   crontab -l | grep allocator_run   # expect 20 */4
+#
+# Do not paste install_cron.sh over live — that grep -v would drop arb/quant/
+# pnl/alert/scanner/universe jobs.
+
+--- live crontab (allocator + sports collision)
++++ live crontab (allocator :20 stagger)
+
+  0 */2 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh sports_run.py "SPORTS ENGINE" 2>&1
+- 0 */4 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh allocator_run.py "MASTER ALLOCATOR" 2>&1
++ 20 */4 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh allocator_run.py "MASTER ALLOCATOR" 2>&1
+
+# Optional morning brief → log-only (signal-protocol.md: Invested:/Profit: only).
+# Live 07:00 kalshi_alert.py still Signals modeled EV when "hot". v2 report is
+# already labeled OPPORTUNITY SCAN. To stop Signal (not install):
+#
+# - 0 7 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh kalshi_alert.py "MORNING BRIEF" 2>&1
+# + # 0 7 * * * ... kalshi_alert.py "MORNING BRIEF"   # log-only; run by hand if wanted
+#
+# latency_arb cron stays dry-run (no change):
+#   */30 * * * * ... arb_run.py "LATENCY ARB"

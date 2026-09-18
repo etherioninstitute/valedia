@@ -17,6 +17,9 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
+# Runtime identity (Slice 22/23). Not a substitute for MANUSCRIPT_VERSION.
+VALEDIA_VERSION = "0.22.0"
+
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
 MIROFISH_UNPROVEN_CAP = 0.10   # Slice 13: never exceed while accuracy unproven
@@ -114,6 +117,36 @@ def _env_flag(name, default):
     if env is not None and str(env).strip() != "":
         return str(env).strip().lower() in ("1", "true", "yes", "on")
     return bool(default)
+
+
+_ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
+_STAMP_CACHE = None
+
+
+def version_identity():
+    """Build identity: version, short sha, branch, dirty. Fail-closed to unknowns."""
+    def _git(*args):
+        import subprocess
+        try:
+            return subprocess.check_output(
+                ["git", "-C", _ROOT, *args],
+                stderr=subprocess.DEVNULL, timeout=2,
+            ).decode().strip()
+        except Exception:
+            return ""
+    sha = _git("rev-parse", "--short", "HEAD") or "unknown"
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+    dirty = bool(_git("status", "--porcelain"))
+    return {"version": VALEDIA_VERSION, "sha": sha, "branch": branch, "dirty": dirty}
+
+
+def version_stamp():
+    """Short 'vX.Y.Z sha' (dirty → trailing *) for Signal/status headers."""
+    global _STAMP_CACHE
+    if _STAMP_CACHE is None:
+        i = version_identity()
+        _STAMP_CACHE = f"v{i['version']} {i['sha']}" + ("*" if i["dirty"] else "")
+    return _STAMP_CACHE
 
 
 def spot_reconcile_http_enabled():

@@ -9,6 +9,13 @@ TARGET = "uuid:47bd6dd5-2c96-4514-9541-acd8ed013612"
 def send(msg):
     """Send a message via Signal through VPS relay."""
     try:
+        from valedia_config import version_stamp
+        st = version_stamp()
+        if st and st not in str(msg):
+            msg = str(msg).rstrip() + "\n" + st
+    except Exception:
+        pass
+    try:
         # Replace $ with USD to survive bash escaping through SSH
         safe = msg.replace('$', 'USD ').replace("'", "'\\''")
         subprocess.run([

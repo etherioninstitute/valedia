@@ -8,13 +8,24 @@ from datetime import datetime, timezone
 
 ALPACA_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "")
-IS_LIVE = True  # LIVE account confirmed
+
+def alpaca_is_live():
+    """Single env flag: ALPACA_PAPER. Unset → live (executor default). No key edits."""
+    env = os.environ.get("ALPACA_PAPER")
+    if env is None or str(env).strip() == "":
+        return True
+    return str(env).strip().lower() not in ("1", "true", "yes", "on")
+
+def __getattr__(name):
+    if name == "IS_LIVE":
+        return alpaca_is_live()
+    raise AttributeError(name)
 
 def _headers():
     return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
 def _base():
-    return "https://api.alpaca.markets" if IS_LIVE else "https://paper-api.alpaca.markets"
+    return "https://api.alpaca.markets" if alpaca_is_live() else "https://paper-api.alpaca.markets"
 
 def get_account():
     import requests
@@ -89,7 +100,7 @@ def close_all():
 def portfolio_summary():
     acct = get_account()
     positions = get_positions()
-    lines = [f"Alpaca {'LIVE' if IS_LIVE else 'PAPER'}"]
+    lines = [f"Alpaca {'LIVE' if alpaca_is_live() else 'PAPER'}"]
     lines.append(f"  Equity: ${float(acct['equity']):,.2f}")
     lines.append(f"  Cash: ${float(acct['cash']):,.2f}")
     lines.append(f"  Buying Power: ${float(acct['buying_power']):,.2f}")

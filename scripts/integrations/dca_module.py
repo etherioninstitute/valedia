@@ -95,7 +95,8 @@ def run_dca():
                     try:
                         import forward_test_ledger as _ftl
                         import alpaca_executor as _ae
-                        src = "live" if getattr(_ae, "IS_LIVE", False) else "paper"
+                        live = _ae.alpaca_is_live() if hasattr(_ae, "alpaca_is_live") else getattr(_ae, "IS_LIVE", False)
+                        src = "live" if live else "paper"
                         _ftl.book_spot_fill("DCA", asset["ticker"], "buy", "alpaca",
                                             r or {}, intended_source=src)
                     except Exception:

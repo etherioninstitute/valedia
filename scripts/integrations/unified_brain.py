@@ -24,6 +24,7 @@ import numpy as np
 from datetime import datetime, timezone
 from valedia_config import (  # shared source of truth (drift-guarded)
     MIROFISH_WEIGHT, KELLY_MIN_PROVEN_TRADES, FUSION_WEIGHTS, fusion_weights_for,
+    version_stamp,
 )
 try:
     import forward_test_ledger as _ftl  # the REAL fee-inclusive track record (single source for sizing)
@@ -529,7 +530,7 @@ def get_alpaca():
     """Returns (account_fn, buy_fn, sell_fn, position_fn, IS_LIVE) or None."""
     try:
         import alpaca_executor as ae
-        return ae.get_account, ae.market_buy, ae.market_sell, ae.get_position, ae.IS_LIVE
+        return ae.get_account, ae.market_buy, ae.market_sell, ae.get_position, ae.alpaca_is_live()
     except Exception:
         return None
 
@@ -604,8 +605,15 @@ def run_brain():
         4: " [Fri — standard, watch end-of-week bias]",
     }.get(dow, "")
 
+    try:
+        stamp = version_stamp()
+    except Exception:
+        stamp = ""
+    head = f"[BRAIN] Unified Brain v3.1 — {ts}"
+    if stamp:
+        head = f"{head} {stamp}"
     lines = [
-        f"[BRAIN] Unified Brain v3.1 — {ts}",
+        head,
         f"Host: {SYS['hostname']} ({'Mac' if SYS['is_mac'] else 'Linux/VPS'})"
         f" | Day: {DOW_NAMES[dow]}{dow_note}",
         ""
