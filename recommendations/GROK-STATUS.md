@@ -6,7 +6,8 @@
 
 **Version:** 0.23.0  
 **Tag:** `valedia-v0.23.0` (Build, annotated)  
-**Tip:** `0a94a5b` (`valedia-v2-grok-build`; tag `valedia-v0.23.0` on Build tip)
+**Tip:** `e82c4bf` (`valedia-v2-grok-build`)  
+**Slice 22:** `5447d94` · **Slice 23 code:** `0a94a5b`
 
 **Current:** Slices 22 + 23 SHIPPED. **Next = STOP for Burton.**
 
