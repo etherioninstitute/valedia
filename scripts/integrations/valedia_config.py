@@ -18,7 +18,7 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
 # Runtime identity (Slice 22/23). Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.22.0"
+VALEDIA_VERSION = "0.23.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
@@ -147,6 +147,12 @@ def version_stamp():
         i = version_identity()
         _STAMP_CACHE = f"v{i['version']} {i['sha']}" + ("*" if i["dirty"] else "")
     return _STAMP_CACHE
+
+
+def version_line():
+    """Match scripts/valedia_version.sh: vX.Y.Z sha branch clean|dirty."""
+    i = version_identity()
+    return f"v{i['version']} {i['sha']} {i['branch']} {'dirty' if i['dirty'] else 'clean'}"
 
 
 def spot_reconcile_http_enabled():

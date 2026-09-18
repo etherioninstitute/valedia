@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Grok Build Slice 22 SHIPPED** (FTL Profit Signal + fill-vs-ack). Versioning = Slice 23.
+Updated: 2026-09-18 PT — **Grok Build Slices 22+23 SHIPPED.** Version `0.23.0` tag `valedia-v0.23.0`. **STOP for Burton.**
 
 ## Slice 22 (Grok Build executor, `valedia-v2-grok-build`)
 - FTL `Profit:` body; sports JSON view-only; UNRECONCILED excluded. Allocator spot UNRECONCILED unless fill complete. Alpaca `ALPACA_PAPER` one flag. latency_arb execute → UNRECONCILED. Crontab patch documented, not installed. ERE still FAIL_CLOSED.
