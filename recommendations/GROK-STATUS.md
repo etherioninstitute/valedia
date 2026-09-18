@@ -11,7 +11,7 @@
 | Slice | Tip | Version | Tag |
 |-------|-----|---------|-----|
 | NT-0 | `6f594d1` | 0.23.0 (no bump) | — |
-| NT-1 | see `valedia-v0.24.0` | **0.24.0** | `valedia-v0.24.0` |
+| NT-1 | `bf798eb` | **0.24.0** | `valedia-v0.24.0` |
 
 **Fence:** No trader live, no broker writers, no VENUE_WRITER / REBALANCER_AUTOEXEC / SPOT_RECONCILE_HTTP / NAUTILUS_LIVE flips. CLI-first neural-trader; no opus/sonnet agents. MiroFish weight 0.10 / `MIROFISH_AUTO_RAISE=False`. Filtered MCP 57 tools, 0 neural/live/broker.
 
