@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 18 SHIPPED** (MiroFish weight rec, cap ≤10–15%)
+
+## Slice 18 (Grok Build executor, `valedia-v2-grok-build`)
+- `recommend_weight()` → local `mirofish_weight_recommendation.json`. Proven rec ≤15%, unproven 10%. Does not apply. AUTO_RAISE stays False.
+- Learning re-enable: pause/probation, no permanent blacklist. Wired into `mirofish_ledger_run.py`.
+- Tests: `test_slice18.py` PASS, no network. No HTTP Intent / --live / GET HTTP / NT.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 17 SHIPPED** (SPOT_RECONCILE_HTTP checklist; still False)
 
 ## Slice 17 (Grok Build executor, `valedia-v2-grok-build`)

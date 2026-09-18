@@ -21,3 +21,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[mirofish_ledger] record failed: {e}")
     m.summary()        # writes mirofish_accuracy_summary.json for intel/fusion
+    try:
+        m.recommend_weight()  # local JSON rec; never writes MIROFISH_WEIGHT
+    except Exception as e:
+        print(f"[mirofish_ledger] recommend failed: {e}")

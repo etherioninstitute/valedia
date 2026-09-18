@@ -363,6 +363,75 @@ def write_summary_snapshot(stats=None):
     return st
 
 
+HARD_CEILING = 0.15  # Burton cap until a later go; this lane never writes MIROFISH_WEIGHT
+
+
+def _learning_note(now=None, pause_path=None):
+    """Pause/TTL is not a grave. Fail-open if the registry is unreadable."""
+    note = {
+        "permanent_blacklist": False,
+        "live_exec_fenced": sorted(getattr(vc, "LIVE_EXEC_FENCED", ())),
+        "note": "TTL/probation re-enables evaluation+sizing. Unpause != live-buy for weather/oil.",
+    }
+    try:
+        import pnl_tracker as pt
+        note["pause_ttl_days"] = int(pt._pause_ttl_days())
+        reg = pt.load_pause_registry(path=pause_path, now=now)
+        note["paused"] = [p.get("strategy") for p in (reg.get("paused") or [])]
+        note["probation"] = [p.get("strategy") for p in (reg.get("probation") or [])]
+    except Exception as e:
+        note["pause_error"] = str(e)[:80]
+    return note
+
+
+def recommend_weight(stats=None, out_path=None, now=None, pause_path=None):
+    """Local JSON recommendation. Never assigns MIROFISH_WEIGHT / AUTO_RAISE.
+
+    Unproven → ≤10% (UNPROVEN_CAP). Proven → recommend ≤15% (PROVEN_CAP,
+    hard ceiling). Runtime weight stays effective_weight() until Burton
+    flips AUTO_RAISE or the constant. No HTTP. No Intent path.
+    """
+    st = stats if stats is not None else accuracy_stats()
+    proven = bool(st.get("proven"))
+    unproven_cap = min(float(getattr(vc, "MIROFISH_UNPROVEN_CAP", 0.10)), 0.10)
+    proven_cap = min(float(getattr(vc, "MIROFISH_PROVEN_CAP", 0.15)), HARD_CEILING)
+    recommended = min(proven_cap if proven else unproven_cap, HARD_CEILING)
+    runtime = float(effective_weight(st))
+    configured = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+    rec = {
+        "recommended_weight": recommended,
+        "runtime_weight": runtime,
+        "configured_weight": configured,
+        "cap": proven_cap if proven else unproven_cap,
+        "hard_ceiling": HARD_CEILING,
+        "proven": proven,
+        "n_scored": st.get("n_scored"),
+        "directional_accuracy": st.get("directional_accuracy"),
+        "bar": st.get("bar"),
+        "min_scored": st.get("min_scored"),
+        "auto_raise": bool(getattr(vc, "MIROFISH_AUTO_RAISE", False)),
+        "applied": False,
+        "action": ("burton_may_set_MIROFISH_WEIGHT_or_AUTO_RAISE"
+                   if proven else "keep_unproven_cap"),
+        "reason": (
+            f"proven fee-true acc={st.get('directional_accuracy')} n={st.get('n_scored')}; "
+            f"runtime stays {runtime} until Burton raises"
+            if proven else
+            f"unproven n={st.get('n_scored')} acc={st.get('directional_accuracy')}; "
+            f"cap {unproven_cap}"
+        ),
+        "learning": _learning_note(now=now, pause_path=pause_path),
+        "source": "mirofish_accuracy_ledger",
+    }
+    path = out_path or os.path.join(paths()["models"], "mirofish_weight_recommendation.json")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(rec, f, indent=2)
+        f.write("\n")
+    rec["path"] = path
+    return rec
+
+
 def read_summary(models_dir=None):
     """Intel/fusion read path: snapshot JSON if present, else that dir's ledger.
 
@@ -398,10 +467,19 @@ def summary():
     return 0
 
 
+def recommend():
+    rec = recommend_weight()
+    print(f"recommend={rec['recommended_weight']:.0%} runtime={rec['runtime_weight']:.0%} "
+          f"proven={rec['proven']} applied={rec['applied']} action={rec['action']}")
+    print(f"wrote {rec['path']}")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(prog="mirofish_accuracy_ledger")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("record", "score", "summary"):
+    for c in ("record", "score", "summary", "recommend"):
         sub.add_parser(c)
     a = ap.parse_args()
-    sys.exit({"record": record, "score": score, "summary": summary}[a.cmd]())
+    sys.exit({"record": record, "score": score, "summary": summary,
+              "recommend": recommend}[a.cmd]())
