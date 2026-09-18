@@ -1,4 +1,11 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-17 PT — **Grok Build Slice 17 SHIPPED** (SPOT_RECONCILE_HTTP checklist; still False)
+
+## Slice 17 (Grok Build executor, `valedia-v2-grok-build`)
+- Checklist only: `recommendations/SPOT-RECONCILE-HTTP-FLIP.md`. Flag remains False. `.env` not written. No GET HTTP from this lane.
+
+---
+
 Updated: 2026-09-17 PT — **Grok Build Slice 16 SHIPPED** (shadow parity ops, report-only)
 
 ## Slice 16 (Grok Build executor, `valedia-v2-grok-build`)
