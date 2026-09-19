@@ -17,9 +17,9 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.28.0 = H3 Kalshi fill-true GET poll; 0.27.0 adversarial fights).
+# Runtime identity (0.29.0 = H4 OpenTerminal GET panel; 0.28.0 H3 fill-true).
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.28.0"
+VALEDIA_VERSION = "0.29.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. AUTO_RAISE stays False until Burton master flip

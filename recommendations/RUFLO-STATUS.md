@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **H3+H4 SHIPPED.** H3 `0.28.0` tag `valedia-v0.28.0` tip `57bddba` (Kalshi fill-true GET poll). H4 `0.29.0` OpenTerminal GET panel (this commit). CBM-SMOKE PASS. **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
+
+## H3 / H4 (Grok Build executor, `valedia-v2-grok-build`)
+- H3: `resolve_kalshi_fill` — POST-ack is not a fill; GET `/portfolio/fills` may upgrade when `order_id` matches. sports / allocator / executor aligned. `test_h3.py` PASS. Ponytail: `PONYTAIL-AUDIT-H3.md`.
+- H4: `valedia_cockpit.py` GET `/status` (POST 405). Reads FTL + shadow queue + MiroFish/neural/persona JSON. No OMS. `test_h4.py` PASS. Ponytail: `PONYTAIL-AUDIT-H4.md`.
+- Fence held. No `--live` / VENUE_WRITER / NAUTILUS_LIVE / SPOT_RECONCILE_HTTP / REBALANCER_AUTOEXEC / MIROFISH_AUTO_RAISE.
+
+---
+
 Updated: 2026-09-18 PT — **Paper fights SHIPPED.** Version `0.27.0` tip `448410f` tag `valedia-v0.27.0`. H2 personas remain `0.26.0` (`ba71ab6`). **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
 
 ## Paper fights (Grok Build executor, `valedia-v2-grok-build`)
