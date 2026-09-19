@@ -296,6 +296,26 @@ def extract_kalshi_fill(raw, fills_payload=None):
     }
 
 
+def resolve_kalshi_fill(raw, get_fills_fn=None):
+    """POST-ack first; GET fills only if ack is incomplete and order_id is known.
+
+    Attributed rewrite of kalshi-agent MarketMaker.check_fills (remaining_count
+    / get_order). Their API has no get_order; Valedia polls kalshi_auth.get_fills.
+    POST success is never a fill. No order_id → do not poll (would steal others).
+    """
+    fill = extract_kalshi_fill(raw)
+    payload = None
+    if fill["complete"] or get_fills_fn is None or not fill.get("order_id"):
+        return fill, payload
+    try:
+        payload = get_fills_fn()
+    except Exception:
+        payload = None
+    if payload:
+        fill = extract_kalshi_fill(raw, payload)
+    return fill, payload
+
+
 def book_kalshi_fill(strategy, ticker, side, raw, intended_source="live",
                      fallback_price=None, fallback_contracts=None, ts=None,
                      fills_payload=None, predicted_direction=None, predicted_prob=None):

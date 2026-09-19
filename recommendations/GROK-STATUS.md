@@ -6,14 +6,14 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** SHIPPED — adversarial paper fights `VALEDIA_VERSION` **0.27.0** tip `448410f` tag `valedia-v0.27.0` (H2 personas stay `0.26.0` / `ba71ab6`). Module `scripts/integrations/adversarial_paper_fight.py` + thin `adversarial_run.py` (not crontab-installed). JSON `models/adversarial_round_*.json`. Lenses: H2 Buffett, momentum/kernel, MiroFish-enriched, risk veto. Heuristics/stdlib. No orders. No LN.
+**Current:** CBM-SMOKE PASS. H3 shipping 0.28.0 (Kalshi fill-true GET poll). H4 next in this session.
 
-**Tests:** `python3 test_adversarial_paper_fight.py` PASS (mocked). `test_nt1` / `test_nt2` / `test_slice23` PASS.
+**Tests:** `test_h3.py` PASS. `test_kalshi_fill_ledger.py` PASS. `test_slice23` / `test_h2` / `test_nt1` / `test_nt2` / `test_adversarial_paper_fight` / `test_sports_engine_b1_extra` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-ADV-FIGHT.md` (safe cuts applied; runner kept because charter named it).
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-H3.md`
 
-**H1:** dossiers in `recommendations/ADAPT-DOSSIERS/` + `VALEDIA-SEAMLESS-ARCHITECTURE.md`. Arena dossier = leave LN, steal fight pattern → this module.
+**H3:** `resolve_kalshi_fill` polls `get_fills` only when POST-ack is incomplete and `order_id` is known. sports / allocator / executor book via `fills_payload`. POST-ack is never FILLED.
 
-**Fence:** No live writers, no AUTO_RAISE flip, no LN/Arena funding, no crontab install.
+**Fence:** No `--live`, no venue orders, no API-key edits, no `MIROFISH_AUTO_RAISE`, no crontab.
 
-**Next:** STOP for Burton. Do not start NT-3 / dynamic-band / Arena funding.
+**Next:** H4 OpenTerminal GET panel, then STOP for Burton.

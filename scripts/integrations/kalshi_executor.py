@@ -34,7 +34,7 @@ def _load_env():
                     os.environ.setdefault(k.strip(), v.strip())
 _load_env()
 
-from kalshi_auth import get, post, get_balance, get_positions, create_order
+from kalshi_auth import get, post, get_balance, get_positions, create_order, get_fills
 try:
     import forward_test_ledger as _ftl  # real fee-inclusive ledger — record every real fill
 except Exception:
@@ -377,11 +377,13 @@ def execute_trade(opp, state, dry_run=False):
         )
         result["order"] = order
         fill = {}
+        payload = None
         if _ftl:
             try:
-                fill = _ftl.extract_kalshi_fill(order)
+                fill, payload = _ftl.resolve_kalshi_fill(order, get_fills)
             except Exception:
                 fill = {}
+        result["fills_payload"] = payload
         result["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
         if fill.get("order_id"):
             result["order_id"] = fill["order_id"]
@@ -608,7 +610,8 @@ def run(dry_run=False, max_trades=5, min_score=40):
                     result["ticker"], result["side"], result.get("order") or {},
                     intended_source="live",
                     fallback_price=result["price_cents"] / 100.0,
-                    fallback_contracts=result["contracts"])
+                    fallback_contracts=result["contracts"],
+                    fills_payload=result.get("fills_payload"))
             except Exception:
                 pass
         

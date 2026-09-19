@@ -112,9 +112,9 @@ def test_cli_still_denies_live():
 
 
 def test_version_contract():
-    assert vc.VALEDIA_VERSION == "0.27.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.28.0", vc.VALEDIA_VERSION
     stamp = vc.version_stamp()
-    assert stamp.startswith("v0.27.0 ")
+    assert stamp.startswith("v0.28.0 ")
 
 
 if __name__ == "__main__":

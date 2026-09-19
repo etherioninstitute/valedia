@@ -442,7 +442,7 @@ def execute_allocations(allocations, dry_run=False):
         
         try:
             if a["platform"] in ("kalshi", "kalshi_weather"):
-                from kalshi_auth import create_order, get_positions
+                from kalshi_auth import create_order, get_positions, get_fills
                 # FAIL-SAFE: Check we don't already hold this ticker
                 existing = get_positions().get("market_positions", [])
                 already_held = any(
@@ -482,16 +482,18 @@ def execute_allocations(allocations, dry_run=False):
                     r["contracts"] = n
                     _clear_kalshi_failure(a["ticker"])
                     # Fill-true only. Bare POST-ack is UNRECONCILED — never a live open.
+                    # Incomplete ack → GET /portfolio/fills (same habit as maker check_and_manage).
                     fill = {}
                     if _ftl:
                         try:
-                            fill = _ftl.extract_kalshi_fill(resp)
+                            fill, payload = _ftl.resolve_kalshi_fill(resp, get_fills)
                             _ftl.book_kalshi_fill(
                                 _ftl.canonical_category(a.get("type", "KALSHI")),
                                 a["ticker"], a["side"], resp,
                                 intended_source="live",
                                 fallback_price=price_cents / 100.0,
-                                fallback_contracts=n)
+                                fallback_contracts=n,
+                                fills_payload=payload)
                         except Exception:
                             fill = {}
                     r["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"

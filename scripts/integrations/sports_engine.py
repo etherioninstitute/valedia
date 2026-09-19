@@ -256,7 +256,7 @@ def size_bets(games, bankroll, per_trade_cap=None):
 
 def execute_bets(bets, dry_run=False):
     """Place limit orders for each bet. Skip if already holding."""
-    from kalshi_auth import get_positions
+    from kalshi_auth import get_positions, get_fills
     
     # Get existing positions to avoid duplicates
     pos = get_positions()
@@ -280,7 +280,7 @@ def execute_bets(bets, dry_run=False):
         try:
             price_cents = int(b['fav_price'] * 100)
             resp = create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents)
-            fill = ftl.extract_kalshi_fill(resp)
+            fill, payload = ftl.resolve_kalshi_fill(resp, get_fills)
             r['order_id'] = fill.get('order_id')
             r['status'] = 'EXECUTED' if fill['complete'] else 'UNRECONCILED'
             try:
@@ -288,7 +288,8 @@ def execute_bets(bets, dry_run=False):
                     CATEGORY, b['fav_ticker'], 'yes', resp,
                     intended_source="live",
                     fallback_price=b['fav_price'],
-                    fallback_contracts=b['contracts'])
+                    fallback_contracts=b['contracts'],
+                    fills_payload=payload)
             except Exception as e:
                 print(f"[sports_engine] ftl.book_kalshi_fill failed: {e}", file=sys.stderr)
                 if r['status'] == 'EXECUTED':

@@ -146,7 +146,9 @@ def run():
         # 6. execute_bets: ack-without-fill does not increment Kelly/open; fill does.
         orig_pos = kalshi_auth.get_positions
         orig_co = se.create_order
+        orig_gf = kalshi_auth.get_fills
         kalshi_auth.get_positions = lambda: {"market_positions": []}
+        kalshi_auth.get_fills = lambda: {"fills": []}
         try:
             n0, o0 = ftl.real_track_record()["n"], ftl.open_position_count()
             se.create_order = lambda *a, **k: _ack("se-ack")
@@ -166,6 +168,7 @@ def run():
         finally:
             se.create_order = orig_co
             kalshi_auth.get_positions = orig_pos
+            kalshi_auth.get_fills = orig_gf
 
         # 7. allocator Kalshi taker: same fill-true rule (mocked intel/auth, no HTTP).
         orig_plan, orig_mom = ma.build_execution_plan, ma.MakerOrderManager
@@ -185,7 +188,9 @@ def run():
         ma._is_kalshi_blacklisted = lambda t: False
         ma._clear_kalshi_failure = lambda t: None
         orig_ka_co, orig_ka_pos = kalshi_auth.create_order, kalshi_auth.get_positions
+        orig_ka_gf = kalshi_auth.get_fills
         kalshi_auth.get_positions = lambda: {"market_positions": []}
+        kalshi_auth.get_fills = lambda: {"fills": []}
         alloc = {
             "platform": "kalshi", "type": "SPORTS_TONIGHT", "ticker": "ALLOC-ACK",
             "title": "t", "side": "yes", "price": 0.80, "allocation": 4.0,
@@ -213,6 +218,7 @@ def run():
             ma._clear_kalshi_failure = orig_clr
             kalshi_auth.create_order = orig_ka_co
             kalshi_auth.get_positions = orig_ka_pos
+            kalshi_auth.get_fills = orig_ka_gf
             if orig_intel is not None:
                 sys.modules["intel_layer"] = orig_intel
             else:
@@ -238,7 +244,7 @@ def run():
     ma_src = open(os.path.join(HERE, "master_allocator.py")).read()
     ke_src = open(os.path.join(HERE, "kalshi_executor.py")).read()
     ftl_src = open(os.path.join(HERE, "forward_test_ledger.py")).read()
-    assert "book_kalshi_fill" in se_src and "extract_kalshi_fill" in se_src
+    assert "book_kalshi_fill" in se_src and "resolve_kalshi_fill" in se_src
     assert "book_kalshi_fill" in ma_src
     assert "book_kalshi_fill" in ke_src
     assert "ftl.record_entry" not in se_src
