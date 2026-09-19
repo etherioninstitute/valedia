@@ -1,4 +1,14 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **H6 SHIPPED.** Version `0.31.0` tag `valedia-v0.31.0`. Prior H5+DYNAMIC-BAND `0.30.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H7. `VALEDIA_SELF_ADJUST` stays False.
+
+## H6 (Grok Build executor, `valedia-v2-grok-build`)
+- Shadow OMS event model: `nautilus_shadow_events.py` (OrderStatus + CommandFailure rewrite, no `nautilus_trader`). submitted ≠ fill. Ambiguous ≠ denied.
+- Fill sink: inferred fills cannot be `source=live`; trade_id/fee on FTL. One Kelly / one FTL.
+- Parity: report-only event timeline + fail-closed side/size/venue/leverage/dispatchable. `test_h6.py` PASS. Ponytail: `PONYTAIL-AUDIT-H6.md`.
+- Fence held. Do not start H7 / Arena funding / NT live.
+
+---
+
 Updated: 2026-09-18 PT — **H5 + DYNAMIC-BAND SHIPPED.** Version `0.30.0` tag `valedia-v0.30.0` tip `a7801d3`. Prior H4 `0.29.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab. `VALEDIA_SELF_ADJUST` stays False.
 
 ## H5 / DYNAMIC-BAND (Grok Build executor, `valedia-v2-grok-build`)

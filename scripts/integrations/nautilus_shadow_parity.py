@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import valedia_config as vc
 from nautilus_intent import DEFAULT_QUEUE, intent_from_dict
 from nautilus_shadow_coinbase import compare_intent_to_post, post_body_from_intent
+from nautilus_shadow_events import inspect_record
 from nautilus_shadow_venues import (
     compare_intent_to_hl_post,
     compare_intent_to_pm_post,
@@ -319,6 +320,8 @@ def compare_row(rec: dict) -> dict:
     bucket = classify(rec)
     evidence = bucket in EVIDENCE
     dangerous = fence_diffs(rec)
+    evd, timeline = inspect_record(rec)
+    dangerous.extend(evd)
     advisory = []
     mismatches = []
     rebuilt_ok = None
@@ -368,6 +371,8 @@ def compare_row(rec: dict) -> dict:
         "mismatches": mismatches,
         "dangerous": dangerous,
         "advisory": advisory,
+        "event_state": timeline.get("state"),
+        "event_timeline": timeline,
     }
 
 
@@ -396,9 +401,11 @@ def report(*, queue_path=None, rows=None, window="7d", now=None, out_path=None):
     buckets = {}
     diffs, dangerous, ignored = [], [], {}
     ok_dates = {}
+    timelines = []
     for rec in in_win:
         cr = compare_row(rec)
         b = cr["bucket"]
+        timelines.append(cr.get("event_timeline"))
         buckets.setdefault(b, _empty_bucket())
         buckets[b]["n"] += 1
         if cr["compare_ok"]:
@@ -441,7 +448,6 @@ def report(*, queue_path=None, rows=None, window="7d", now=None, out_path=None):
             ok and b["n"] > 0 and b["compare_ok"] == b["n"]
             and b.get("days_ok", 0) >= CUTOVER_DAYS
         )
-    # Intel coinbase is evidence for POST-diff, not a writer cutover surface.
     result = {
         "ok": ok,
         "window": str(window) if not isinstance(window, timedelta) else f"{window.days}d",
@@ -455,9 +461,10 @@ def report(*, queue_path=None, rows=None, window="7d", now=None, out_path=None):
         "buckets": buckets,
         "diffs": diffs,
         "dangerous": dangerous,
+        "event_timelines": timelines,
         "cutover_ready": ready,
         "flags": after,
-        "note": "Allocator Coinbase is not cutover evidence. No live flags flipped.",
+        "note": "Allocator Coinbase is not cutover evidence. No live flags flipped. Event timeline is shadow practice: submitted≠fill; Ambiguous≠denied.",
     }
     if out_path:
         parent = os.path.dirname(out_path)

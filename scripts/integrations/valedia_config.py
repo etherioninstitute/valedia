@@ -17,9 +17,9 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.30.0 = H5 desk labels + HL public /info + DYNAMIC-BAND knobs).
+# Runtime identity (0.31.0 = H6 Nautilus shadow event model / parity deepen).
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.30.0"
+VALEDIA_VERSION = "0.31.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -379,6 +379,7 @@ INTEL_SHADOW_INTENTS = True
 # This lane never sets dispatchable. No --live. No writer flip.
 NAUTILUS_SHADOW_VENUES = True
 # Slice 12: nautilus_shadow_parity.py — 7d compare.ok report. No flag flips.
+# H6: nautilus_shadow_events.py — shadow OMS states + CommandFailure. NAUTILUS_LIVE stays False.
 
 # SUBSUME NT cutover preference (later, Valedia-gated). Not a writer flip.
 # Coinbase first → Hyperliquid shorts/futures → Polymarket arb → Kalshi last.

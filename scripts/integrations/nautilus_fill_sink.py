@@ -13,7 +13,9 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 import valedia_config as vc
-from nautilus_intent import Intent, ere_ok, intent_from_dict, round_size_down, validate_intent
+from nautilus_intent import (
+    Intent, ere_ok, intent_from_dict, intent_to_dict, round_size_down, validate_intent,
+)
 
 
 class FillRefused(ValueError):
@@ -73,6 +75,9 @@ def apply_fill(intent, fill: dict, recorder: Optional[Callable[..., Any]] = None
         raise FillRefused(f"ungated intent: {decision.reason}", code="ungated")
 
     source = resolve_ledger_source(intent, fill)
+    inferred = bool(fill.get("inferred"))
+    if inferred and source == "live":
+        raise FillRefused("inferred fill cannot be source=live", code="inferred_live")
     if source == "live" and not live_source_allowed(intent):
         raise FillRefused(
             "source=live refused (Valedia NT live flags default deny)",
@@ -103,13 +108,45 @@ def apply_fill(intent, fill: dict, recorder: Optional[Callable[..., Any]] = None
     if rec is None:
         import forward_test_ledger as ftl
         rec = ftl.record_entry
+    kw = {"venue": intent.venue, "source": source}
+    if fill.get("fee") is not None and fill.get("fee") != "":
+        kw["entry_fee"] = float(fill["fee"])
+    tid = fill.get("trade_id") or fill.get("order_id")
+    if tid:
+        kw["order_id"] = tid
     eid = rec(
         intent.strategy,
         intent.instrument,
         intent.side,
         price,
         qty,
-        venue=intent.venue,
-        source=source,
+        **kw,
     )
-    return {"recorded": True, "id": eid, "source": source, "qty": qty, "price": price}
+    return {"recorded": True, "id": eid, "source": source, "qty": qty, "price": price,
+            "trade_id": tid or None, "inferred": inferred}
+
+
+def apply_fill_event(intent, event: dict, recorder: Optional[Callable[..., Any]] = None,
+                     lot_size: float = 0.0) -> dict:
+    """Book a fill event only after accepted/partially_filled. submitted ≠ fill."""
+    from nautilus_shadow_events import EventRefused, apply, make_order
+    intent = _as_intent(intent)
+    event = dict(event or {})
+    order = make_order(intent_to_dict(intent))
+    try:
+        order = apply(order, event)
+    except EventRefused as e:
+        raise FillRefused(e.reason, code=e.code)
+    if str(event.get("type") or "").lower() != "fill":
+        return {"recorded": False, "id": None, "source": None, "state": order["state"],
+                "qty": order["filled_qty"]}
+    fill = {
+        "price": event["price"], "qty": event["qty"],
+        "source": event.get("source") or "paper",
+        "inferred": event.get("inferred"),
+        "trade_id": event.get("trade_id"),
+        "fee": event.get("fee"),
+    }
+    out = apply_fill(intent, fill, recorder=recorder, lot_size=lot_size)
+    out["state"] = order["state"]
+    return out
