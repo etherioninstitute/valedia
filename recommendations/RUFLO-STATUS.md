@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **H7 SHIPPED.** Version `0.32.0`. Prior H6 `0.31.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H8. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False.
+
+## H7 (Grok Build executor, `valedia-v2-grok-build`)
+- `arena_stress.py` wraps `adversarial_paper_fight.py` (not rebuilt). Arena primes + fee-true FTL score. JSON `models/arena_stress_*.json`.
+- Risk veto records disagreement; `intents=[]`. `ARENA_MODE=paper`. LN/faucet refused. Not crontab-installed.
+- `test_h7.py` PASS. Ponytail: `PONYTAIL-AUDIT-H7.md`. Fence held. Do not start H8 / Arena funding / NT live.
+
+---
+
 Updated: 2026-09-18 PT — **H6 SHIPPED.** Version `0.31.0` tag `valedia-v0.31.0` tip `22a6cff`. Prior H5+DYNAMIC-BAND `0.30.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H7. `VALEDIA_SELF_ADJUST` stays False.
 
 ## H6 (Grok Build executor, `valedia-v2-grok-build`)

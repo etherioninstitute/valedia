@@ -94,7 +94,7 @@ Burton VALEDIA_SELF_ADJUST=1
 | **hypergrok** | H5 desk *passes* + public `/info` snapshot | `/exchange`, stop-% sizer, 7 Grok Bots |
 | **nautilus_trader** | H6 shadow **event** model (Ambiguous ≠ denied) | LiveNode, LGPL in-process, Kalshi-via-Betfair |
 | **kalshi-agent** | H3 fill-true / scan / Brier-from-FTL | UNLICENSED tree, flat $0.07 Kelly, Electron `--live` |
-| **lf-game-theory** | fight pattern → `adversarial_paper_fight.py` (PAPER JSON, FTL later) | Lightning faucet, Arena sats, fusion weight |
+| **lf-game-theory** | fight pattern → `adversarial_paper_fight.py` + H7 `arena_stress.py` (PAPER, fee-true FTL score) | Lightning faucet, Arena sats, fusion weight |
 | **fortress** | H8 fail-gated allowlisted fetch | WAF-beating default scraper, venue UIs |
 | **neural-trader** | **Done NT-0…2** — enrich JSON only | `trader live`, second portfolio |
 
@@ -107,6 +107,7 @@ public APIs / RSS ──► seed ──► MiroFish ──► signal JSON
 neural-trader CLI ──► enrichment JSON ──► attach (scores unchanged)
 persona checklists ──► lens JSON ──► attach (scores unchanged)
 adversarial_paper_fight ──► models/adversarial_round_*.json (PAPER; no orders)
+arena_stress ──► models/arena_stress_*.json (primes + fee-true FTL score; no orders)
 gatherer ──► shadow Intents ──► queue (dispatchable=False)
 FTL settlements ──► MiroFish accuracy ──► capped weight
 KellySizer ◄── FTL real track only
@@ -128,7 +129,7 @@ OpenTerminal GET ──► all of the above (display)
 | Neural enrich cron | yes if NT-2+ shipped | — |
 | Persona lenses | yes as intel | new fusion key |
 | Spot GET / writers / NT live / AUTOEXEC | **no** | each flag separately |
-| Arena funded sats / fortress engine | **no** | H7/H8 Burton go |
+| Arena funded sats / fortress engine | **no** | funded Arena / H8 Burton go |
 
 Dormant ≠ dead. Forgotten `False` after Burton asked for smart mode is the failure this architecture forbids — **inside intel/weight only**.
 
@@ -144,7 +145,7 @@ Dormant ≠ dead. Forgotten `False` after Burton asked for smart mode is the fai
 | **H4** | OpenTerminal Valedia GET panel |
 | **H5** | desk passes + HL public info file |
 | **H6** | shadow OrderEvent + Ambiguous |
-| **H7** | Arena LN **left**; fight pattern **shipped** (`adversarial_paper_fight.py`) |
+| **H7** | Arena LN **left**; `arena_stress.py` wrap + fee-true FTL score **shipped** (`0.32.0`) |
 | **H8** | fortress fallback flag, default off |
 
 STOP between slices. Ponytail audit after every coding slice.

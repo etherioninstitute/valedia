@@ -119,8 +119,8 @@ def test_hygiene_and_version():
         assert "--live" not in src or name == "nautilus_fill_sink.py"
     src_ev = open(os.path.join(HERE, "nautilus_shadow_events.py")).read()
     assert "LiveNode" in src_ev
-    assert vc.VALEDIA_VERSION == "0.31.0", vc.VALEDIA_VERSION
-    assert vc.version_stamp().startswith("v0.31.0 ")
+    assert vc.VALEDIA_VERSION == "0.32.0", vc.VALEDIA_VERSION
+    assert vc.version_stamp().startswith("v0.32.0 ")
     assert "last_qty" in ev.ORDER_FILLED_MAP
     _assert_fence()
 

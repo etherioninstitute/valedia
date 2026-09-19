@@ -17,7 +17,7 @@ Multi-agent **paper/shadow** competition inside Valedia:
 
 ## Slice deliverable (Grok Build)
 
-**SHIPPED 2026-09-18 — `VALEDIA_VERSION` 0.27.0** (H2 personas remain 0.26.0). Crontab not installed. Arena not funded.
+**SHIPPED 2026-09-18 — `VALEDIA_VERSION` 0.27.0** (H2 personas remain 0.26.0). **H7 wrap 0.32.0:** `arena_stress.py` scores rounds vs fee-true FTL + Arena primes. Crontab not installed. Arena not funded.
 
 1. `scripts/integrations/adversarial_paper_fight.py` + thin `adversarial_run.py` (cron-optional, **not** installed).
 2. Round input: `mirofish_signal.json` (+ neural enrichment if present) and/or `--opps`.

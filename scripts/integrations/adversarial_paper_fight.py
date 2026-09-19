@@ -2,7 +2,7 @@
 """Multi-lens PAPER/SHADOW fight on MiroFish / opportunity inputs.
 
 Lenses: buffett_value, momentum_kernel, mirofish_enriched, risk_veto.
-Writes models/adversarial_round_*.json. Scores vs fee-true FTL later.
+Writes models/adversarial_round_*.json. H7 `arena_stress.py` scores vs fee-true FTL.
 
 No venue orders. No LN/Arena sats. No fusion-weight change.
 """
@@ -23,7 +23,7 @@ _ERE = None
 
 BUY, SELL, HOLD = 55.0, 45.0, 50.0
 _f = mne._f
-# ponytail: FTL winner/loser scoring later; this slice records votes only
+# ponytail: FTL winner/loser scoring is arena_stress.score_round (H7 wrap)
 # ponytail: Buffett = persona_lenses.buffett (H2); no second checklist
 
 

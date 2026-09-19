@@ -5,7 +5,7 @@
 **License:** README claims **MIT**; **no `LICENSE` file**, `package.json` has no `license` field. Attribute on rewrite.  
 **Slice:** H7 — offline strategy stress. **No funded sats unless Burton.**  
 **Burton 2026-09-18:** Lightning / Arena sats are **out of profit scope**. Leave LN. Steal the **fight pattern only**.  
-**Shipped (no LN):** `scripts/integrations/adversarial_paper_fight.py` — Buffett / momentum / MiroFish / risk-veto paper fight, JSON under `models/adversarial_round_*.json`, scored later vs fee-true FTL. Do not fund Arena. Do not `npm run arena:*`.  
+**Shipped (no LN):** `scripts/integrations/adversarial_paper_fight.py` — Buffett / momentum / MiroFish / risk-veto paper fight, JSON under `models/adversarial_round_*.json`. **H7 wrap:** `arena_stress.py` — Arena primes + fee-true FTL score, JSON `models/arena_stress_*.json`. `ARENA_MODE=paper`. Do not fund Arena. Do not `npm run arena:*`.  
 **Prior docs:** `SEBAI-ARENA-*.md`, `BURTON-PILOT-RUN.md`, `BURTON-ARENA-SECURITY-AUDIT-GROK.md`. Clone already has `experiments/arena-valedia-micro-pilot.yaml` (4×5×100 sats) — **leave unfunded**.
 
 ---
@@ -95,7 +95,9 @@ Valedia brain  ←  no arena weight, no LN
 MiroFish / opps
         └── adversarial_paper_fight.py  (PAPER/SHADOW)
               → models/adversarial_round_*.json
-              → later: fee-true FTL winner/loser
+              → arena_stress.py (H7 wrap)
+                    → models/arena_stress_*.json
+                    → fee-true FTL winner/loser
               → never dispatchable, never faucet
 ```
 
@@ -103,4 +105,4 @@ MiroFish / opps
 
 ## H7-ready
 
-**Done this session:** in-Valedia paper fight (no `lf-game-theory` process). Remaining H7 (optional, Burton go): fixture stress of primes; still `ARENA_MODE=paper`; refuse Lightning unless a **named Burton flag**. Do not start `npm run arena:*`. Do not fund.
+**SHIPPED 2026-09-18 (`0.32.0`):** `arena_stress.py` wraps the paper fight. Fixture primes (strategic/competitive/cooperative/neutral). Fee-true FTL winner/loser. `ARENA_MODE=paper`. LN keys / `BURTON_ARENA_LN` recorded, still `funded=False` — this harness does not fund. Do not start `npm run arena:*`. Do not fund.
