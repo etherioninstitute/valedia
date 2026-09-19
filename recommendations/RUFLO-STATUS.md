@@ -1,5 +1,16 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **MIROFISH-SMOKE SHIPPED.** Version `0.37.0` tag `valedia-v0.37.0` tip `5b49cc1`. Prior TREASURY-1 `0.36.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+Updated: 2026-09-19 PT — **FULL-SMOKE SHIPPED**. Version `0.38.0`. CLI `valedia_full_smoke.py` + `VALEDIA-FULL-SMOKE.md` **PASS** (wall 3.763s). Ponytail: `PONYTAIL-AUDIT-FULL-SMOKE.md`. **STOP — parent launches KILL-SWITCH.** Do not auto-start `VALEDIA_TRADING_HALT`. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+
+## FULL-SMOKE (Grok Build executor, `valedia-v2-grok-build`)
+- Minutes-scale whole-brain smoke. One CLI wraps fence stamps, treasury_status, mirofish_smoke fixture (+ live-lite), Kalshi balance GET, Poly US whoami_retail/preview (create blocked), shadow queue + adversarial import, cockpit `panel()`, pnl_tracker broker≠FTL.
+- Live run: all 8 PASS; cockpit GET SKIP (`:8765` down). `test_valedia_full_smoke.py` PASS offline. No cron. No live flips.
+- **Next = KILL-SWITCH (parent launches). Do not auto-start here.**
+
+## PONYTAIL-FULL (Grok Build executor, `valedia-v2-grok-build`)
+- Report-only full audit after MIROFISH-SMOKE. `recommendations/PONYTAIL-AUDIT-VALEDIA-FULL.md`.
+- Slice 20 ~−10200 still unpaid (archive 5613, ERE FAIL_CLOSED missing `cumulative_extremes`, DEPRECATED installer 404s). Post-S20 ~3775 mostly do-not-cut.
+- No tiny cuts, no version bump, no live flags. Tests: mirofish_smoke / treasury / poly_us / h3 / slice23 PASS.
+- **Next = VALEDIA-FULL-SMOKE (parent launches). Do not auto-start here.**
 
 ## MIROFISH-SMOKE (Grok Build executor, `valedia-v2-grok-build`)
 - Minutes-scale wiring gate. `mirofish_smoke.py`: fixture always (synthetic seed→extractor→neural tag→mocked fee-true ledger→gatherer). Live-lite one Ollama/LMS ping ≤90s; SKIP if down.

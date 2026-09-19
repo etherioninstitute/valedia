@@ -2,22 +2,18 @@
 
 **NORTH STAR:** world's smartest, highest-profiting DYNAMIC auto-trader.
 
-**Updated:** 2026-09-18 PT
+**Updated:** 2026-09-19 PT
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** MIROFISH-SMOKE SHIPPED. Prior: TREASURY-1 0.36.0.
+**Current:** FULL-SMOKE SHIPPED. Next=KILL-SWITCH (do not auto-start this session — STOP for parent chain).
 
-**Version:** `0.37.0` tag `valedia-v0.37.0` tip `5b49cc1`. Prior: TREASURY-1 `0.36.0` `93f9b66`.
+**Version:** `0.38.0` (harness code shipped). Tag `valedia-v0.38.0` after commit. Prior tag `valedia-v0.37.0` tip `5b49cc1`; PONYTAIL-FULL was `ee6da91`.
 
-**Tests:** `test_mirofish_smoke.py` PASS offline. Harness `mirofish_smoke.py` PASS (fixture 6ms, live-lite 7.4s on `:11435` `qwen3-8b-mf:latest`, wall 7.44s). `test_nt2.py` / `test_slice23.py` PASS. No production ledger writes. No live flips.
+**Tests:** `test_valedia_full_smoke.py` PASS offline. Live CLI **PASS** wall **3.763s** / 600s — all 8 sections PASS (cockpit GET SKIP, panel PASS). Version-bumped: slice23 / h3 / h4 / treasury / mirofish_smoke / poly_us / h2 / h5–h8 / nt1 / nt2 / poly_e / adversarial PASS. No production ledger writes. No live flips.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-MIROFISH-SMOKE.md`
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-FULL-SMOKE.md` (thin). Reused existing smokes; no second fence/client/cron.
 
-**MIROFISH-SMOKE:** Minutes-scale wiring gate. Fixture: synthetic seed JSON → extractor → `neural_enriched` → ledger `record`+mocked fee-true `score` → intel `gather`. Live-lite: one Ollama generate, 90s cap, SKIP if down (this run: PASS). Overnight swarm still the corpus job. Caps 0.10/0.15. `MIROFISH_AUTO_RAISE` False. Report: `recommendations/MIROFISH-SMOKE.md`.
+**Fence:** No live orders, no ACH/wire/card, no wallet/venue transfer, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False. `LIVE_CLIENT_HOOK` None. `POLYMARKET_US_LIVE` False. `REBALANCER_AUTOEXEC` False. `VALEDIA_TREASURY_AUTO` False. Kill-switch (`VALEDIA_TRADING_HALT`) **not authored this slice**.
 
-**TREASURY-1:** Burton guide `VALEDIA-TREASURY-FUNDING.md`. `treasury_status.py` reads cash where helpers exist (Kalshi cents, Poly US balances, Coinbase USD, Alpaca cash/buying_power); HL/Kraken DOCUMENT. Floors: Poly 25, Kalshi stub 25, Coinbase 20, Alpaca 10. Emits `models/treasury_status.json`. Below floor → WARN strings only. `VALEDIA_TREASURY_AUTO=False`; `attempt_auto_topup` raises even if env=1. `TREASURY_ALERT_WEBHOOK` unused. Rebalancer stays shadow (`REBALANCER_AUTOEXEC=False`). First human fund still required.
-
-**Fence:** No `--live`, no ACH/wire/card, no wallet/venue transfer, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False. `LIVE_CLIENT_HOOK` None. `POLYMARKET_US_LIVE` False. `REBALANCER_AUTOEXEC` False. `VALEDIA_TREASURY_AUTO` False.
-
-**Next:** STOP (do not flip live). Queue after Burton go: PONYTAIL-FULL → FULL-SMOKE → KILL-SWITCH → staged ON. See GROK-NEXT-QUEUE.md.
+**Next:** KILL-SWITCH (`VALEDIA_TRADING_HALT`) — parent launches. Then OPENTERMINAL-VALEDIA → staged ON.
