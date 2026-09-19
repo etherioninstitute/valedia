@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Arc H1+H2 SHIPPED.** Version `0.26.0` (tag `valedia-v0.26.0` on Build). **STOP for Burton.** H3 Kalshi fill-true / H4 OpenTerminal next named go. Dynamic band + master flip still later. No AUTO_RAISE / writers / LN.
+Updated: 2026-09-18 PT — **Arc H1+H2 SHIPPED.** Version `0.26.0` tip `ba71ab6` tag `valedia-v0.26.0` on Build. **STOP for Burton.** H3 Kalshi fill-true / H4 OpenTerminal next named go. Dynamic band + master flip still later. No AUTO_RAISE / writers / LN.
 
 ## H1 / H2 (Grok Build executor, `valedia-v2-grok-build`)
 - Dossiers: `recommendations/ADAPT-DOSSIERS/` (ai-fund, OpenTerminal, hypergrok, nautilus, kalshi-agent, lf-game-theory, fortress).
