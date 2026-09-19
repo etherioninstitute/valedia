@@ -74,6 +74,11 @@ def test_resolve_poll_rules():
     fill, payload = ftl.resolve_kalshi_fill(complete, lambda: polled.append(1) or _fills("f1"))
     assert fill["complete"] is True and polled == [] and payload is None
 
+    # V2 resting ack (fill_count string 0) is not a fill; GET fills may upgrade.
+    v2_rest = {"order_id": "v2r", "fill_count": "0.00", "remaining_count": "5.00", "ts_ms": 1}
+    fill, payload = ftl.resolve_kalshi_fill(v2_rest, lambda: _fills("v2r", 3, 77))
+    assert fill["complete"] is True and fill["qty"] == 3, fill
+
 
 def test_sports_poll_upgrades_ack():
     orig, path = _ledger()
@@ -177,10 +182,10 @@ def test_hygiene_and_version():
     assert "fills_payload=result.get(\"fills_payload\")" in ke_src
     assert "MIROFISH_AUTO_RAISE" not in se_src
     assert "--live" not in ftl_src
-    assert vc.VALEDIA_VERSION == "0.42.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.43.0", vc.VALEDIA_VERSION
     assert vc.MIROFISH_AUTO_RAISE is False
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.42.0 ")
+    assert vc.version_stamp().startswith("v0.43.0 ")
 
 
 if __name__ == "__main__":

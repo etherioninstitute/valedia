@@ -9,6 +9,7 @@
 6. **Staged ON** — Kalshi-only already live (Burton 2026-09-19); Poly still dry.
 7. **POLY-LEARN** — done `0.41.0` (`POLY-LEARN.md`, `PROFIT-PATHS-INVENTORY.md`; no POLYMARKET_US_LIVE flip).
 7b. **SCAN-ACCURACY** — done `0.42.0` (honest Signal scan, oil ticker-family fence, Kalshi per-venue deployable).
+7c. **KALSHI-ORDERS-V2** — done `0.43.0` (Create/Cancel Order V2; yes/no → bid/ask). Next = Burton re-run live allocator.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)
@@ -31,4 +32,4 @@
 - Live OpenTerminal market terminal may already be at localhost:3000 (API :4010); Valedia widgets are the Build deliverable.
 - Signal P&L remains truthful broker tracker; UI must not pretend FTL when n=0.
 
-7b. **SCAN-ACCURACY** — done `0.42.0`. Next = Burton.
+7c. **KALSHI-ORDERS-V2** — done `0.43.0`. Next = Burton re-run live allocator.

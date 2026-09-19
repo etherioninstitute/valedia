@@ -1,4 +1,4 @@
-# Profit-path inventory (2026-09-19 / 0.42.0)
+# Profit-path inventory (2026-09-19 / 0.43.0)
 
 Honest matrix of ways Valedia can (or cannot) make money. Status is the **Build tree** (`workspace-v2`) unless noted. Live runtime (`~/.openclaw/workspace`) is the sole live-risk authority; Kalshi-only stage is documented in `STAGED-ON-KALSHI.md`.
 
@@ -10,7 +10,7 @@ This lane does **not** unfence weather/oil, does **not** invent live shorts, doe
 
 | Path | Module(s) | Status | Venue | Why fenced / why not live | Next unlock (Burton) |
 |------|-----------|--------|-------|---------------------------|----------------------|
-| Kalshi sports | `sports_engine.py`, `kalshi_executor.py` (`SPORTS`), `master_allocator` | **LIVE** | Kalshi | Writer `valedia`. Fill-true GET. Halt may stay off. | Kalshi deployable is per-venue (0.42.0); CB/Alpaca writer none must not zero it. |
+| Kalshi sports | `sports_engine.py`, `kalshi_executor.py` (`SPORTS`), `master_allocator` | **LIVE** | Kalshi | Writer `valedia`. Create/Cancel Order V2 (`0.43.0`). Fill-true GET. Halt may stay off. | Kalshi deployable is per-venue (0.42.0); CB/Alpaca writer none must not zero it. |
 | CRYPTO_BRACKET | `intel_opportunity_gatherer` (shadow tag); Kalshi `SERIES_CRYPTO` `KXBTC`/`KXETH` via executor as CONVICTION_* | **LIVE** (Kalshi scan) / **SHADOW** (intel JSON) | Kalshi | FTL category exists; allocator executes Kalshi types, not the intel-shadow name. | Keep Kalshi-only. Do not route intel shadows to POST. |
 | WEATHER_ARB | `weather_arb.py`, `master_allocator.gather_weather_opportunities` → `[]`, `LIVE_EXEC_FENCED` | **FENCED** | Kalshi | Slice 8: `execute_weather_trades` forces DRY, never `create_order`. `WEATHER_LIVE` False. | Evaluation/sizing if pause TTL expires. **Do not** live unfence. |
 | OIL_BRACKET | `LIVE_EXEC_FENCED` + `LIVE_EXEC_FENCED_SERIES` (`KXWTI`/`KXOIL`/`WTI`) | **FENCED** (FIXED 0.42.0) | Kalshi | Name **or** ticker family blocks live exec (`SKIP_LIVE_FENCE`) even if scanner tags `NO_HARVEST`. Report may still list as FENCED. | Stay fenced. **Do not** live unfence. |

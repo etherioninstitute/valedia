@@ -3,7 +3,7 @@
 **Burton go:** Kalshi-only ON while OpenTerminal-Valedia UI builds.
 
 ## Live now
-- Kalshi writer: `valedia` (allocator + sports already `[LIVE]`)
+- Kalshi writer: `valedia` (allocator + sports already `[LIVE]`). Create/sell/cancel = Order V2 (`0.43.0`; no V1 POST `/portfolio/orders`).
 - Kill-switch: `VALEDIA_TRADING_HALT` wired on live; **halt OFF**
 - Coinbase / Alpaca writers: `none` + allocator `SKIP_WRITER` (Kalshi-only)
 - Polymarket / HL / Kraken: still `none`

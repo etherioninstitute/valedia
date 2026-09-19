@@ -199,13 +199,13 @@ def _alpaca_body(intent) -> dict:
 def _kalshi_body(intent) -> dict:
     """Unsigned shape note. Does not invent contract count from notional."""
     return {
-        "path": "POST /portfolio/orders",
+        "path": "POST /portfolio/events/orders",
         "signed": False,
         "live_client_hook": None,
         "ticker": intent.instrument,
         "action": intent.side,
         "notional": intent.notional,
-        "note": "intel Intent is notional/IOC; Valedia create_order wants count+yes/no",
+        "note": "intel Intent is notional/IOC; Valedia create_order maps yes/no to V2 bid/ask",
     }
 
 

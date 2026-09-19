@@ -61,7 +61,7 @@ def test_hygiene_and_default_off():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.trading_halted() is False
     assert vc.require_not_halted("probe") is False
-    assert vc.VALEDIA_VERSION == "0.42.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.43.0", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.MIROFISH_AUTO_RAISE is False
@@ -108,7 +108,7 @@ def test_env_halt_blocks_and_unhalt_restores():
         pass
     _disarm_env()
     out = ka.create_order("TICK", "yes", 1, 10)
-    assert posted and posted[0][0] == "/portfolio/orders"
+    assert posted and posted[0][0] == "/portfolio/events/orders"
     assert out["order"]["order_id"] == "should-not"
     ka.post = orig_post
 
@@ -221,7 +221,7 @@ def test_file_arm_env_off_wins_and_self_heal_report_only():
     assert ev["ping"]["send"] is False
     assert vc.panel_looks_sick(None) is True
     assert vc.panel_looks_sick({"error": "boom"}) is True
-    assert vc.panel_looks_sick({"valedia_version": "0.42.0"}) is False
+    assert vc.panel_looks_sick({"valedia_version": "0.43.0"}) is False
     armed = vc.record_halt_event("repeated writer exceptions", source="observe",
                                  arm=True)
     assert armed["halted"] is True

@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kalshi_auth import get, post
+from kalshi_auth import get, create_order
 
 # ═══ CONFIGURATION ═══
 KALSHI_SERIES = {
@@ -356,18 +356,10 @@ def execute_arb(contract, dry_run=True):
                  f"${cost:.2f}→+${potential_profit:.2f}")
     else:
         try:
-            from kalshi_auth import post as kalshi_post
-            order = kalshi_post("/portfolio/orders", {
-                "ticker": contract['ticker'],
-                "action": "buy",
-                "side": side,
-                "type": "limit",
-                "count": n_contracts,
-                "yes_price": price_cents if side == 'yes' else None,
-                "no_price": price_cents if side == 'no' else None,
-            })
+            order = create_order(contract['ticker'], side, n_contracts, price_cents)
             result["status"] = ack_status(order)
-            result["order_id"] = order.get("order", {}).get("order_id", "?")
+            nested = order.get("order") if isinstance(order.get("order"), dict) else {}
+            result["order_id"] = nested.get("order_id") or order.get("order_id") or "?"
             log.info(f"{result['status']}: {side.upper()} {n_contracts}x {contract['ticker']} "
                      f"@{price_cents}c edge:{contract['edge_cents']}c")
         except Exception as e:
