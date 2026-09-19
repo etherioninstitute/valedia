@@ -8,7 +8,7 @@
 
 **Current:** TREASURY-1 SHIPPED. Report-only multi-venue funding. No money moved.
 
-**Version:** `0.36.0` tag `valedia-v0.36.0` (Build). Prior: POLY-US-2 `0.35.0`.
+**Version:** `0.36.0` tag `valedia-v0.36.0` tip `93f9b66`. Prior: POLY-US-2 `0.35.0`.
 
 **Tests:** `test_treasury.py` PASS (mocked balances; auto path refused). `test_slice23.py` / `test_rebalancer_shadow.py` / `test_poly_us.py` / `test_h2.py`–`test_h8.py` / `test_poly_e.py` / `test_nt1.py` / `test_nt2.py` / `test_adversarial_paper_fight.py` PASS. No network.
 

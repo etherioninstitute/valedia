@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **TREASURY-1 SHIPPED.** Version `0.36.0` tag `valedia-v0.36.0`. Prior POLY-US-2 `0.35.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+Updated: 2026-09-18 PT — **TREASURY-1 SHIPPED.** Version `0.36.0` tag `valedia-v0.36.0` tip `93f9b66`. Prior POLY-US-2 `0.35.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
 
 ## TREASURY-1 (Grok Build executor, `valedia-v2-grok-build`)
 - Report-only cash vs floors. Guide: `VALEDIA-TREASURY-FUNDING.md`. Script: `treasury_status.py` → `models/treasury_status.json`. Never ACH/wire/withdraw.
