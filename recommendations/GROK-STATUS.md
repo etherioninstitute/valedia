@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H7 SHIPPED. Arena offline paper stress harness (wrap of `adversarial_paper_fight`). VALEDIA_VERSION `0.32.0`. Prior: H6 `0.31.0`.
+**Current:** H7 SHIPPED. Arena offline paper stress harness (wrap of `adversarial_paper_fight`). VALEDIA_VERSION `0.32.0` tag `valedia-v0.32.0` tip `d0a29ab`. Prior: H6 `0.31.0`.
 
 **Tests:** `test_h7.py` PASS. `test_adversarial_paper_fight.py` PASS. `test_h6.py` PASS. `test_slice12.py` / `test_nautilus_intent.py` / `test_h2` / `test_h3` / `test_h4` / `test_h5` / `test_nt1` / `test_nt2` / `test_slice23` / `test_dynamic_band` PASS.
 
