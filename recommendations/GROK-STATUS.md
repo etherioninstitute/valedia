@@ -8,7 +8,7 @@
 
 **Current:** OPENTERMINAL-VALEDIA SHIPPED. Next=staged ON (STOP for Burton — do not auto-flip live).
 
-**Version:** `0.40.0` tag `valedia-v0.40.0` (this commit). Prior: `0.39.0` `4b7b6d3`.
+**Version:** `0.40.0` tag `valedia-v0.40.0` tip `3327adc`. Prior: `0.39.0` `4b7b6d3`.
 
 **Tests:** `test_openterminal_valedia.py` + `test_h4.py` (version-bumped: slice23 / h3 / treasury / mirofish_smoke / poly_us / h2 / h5–h8 / nt1 / nt2 / poly_e / adversarial / valedia_full_smoke / kill_switch). No production ledger writes. No live flips.
 

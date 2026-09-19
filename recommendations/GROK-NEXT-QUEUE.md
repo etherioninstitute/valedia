@@ -5,7 +5,7 @@
 2. **PONYTAIL-FULL** — done (report-only, `PONYTAIL-AUDIT-VALEDIA-FULL.md`, version stays 0.37.0)
 3. **VALEDIA-FULL-SMOKE** — done `0.38.0` (`VALEDIA-FULL-SMOKE.md` PASS, wall 3.763s)
 4. **KILL-SWITCH** — done `0.39.0` / `4b7b6d3` (`KILL-SWITCH.md`, `VALEDIA_TRADING_HALT`)
-5. **OPENTERMINAL-VALEDIA (Grok Build only)** — done `0.40.0` (`OPENTERMINAL-VALEDIA.md`, read-only glance :8765)
+5. **OPENTERMINAL-VALEDIA (Grok Build only)** — done `0.40.0` / `3327adc` (`OPENTERMINAL-VALEDIA.md`, read-only glance :8765)
 6. **Staged ON** — Burton go after seeing results. STOP — do not auto-flip live.
 
 ## OPENTERMINAL-VALEDIA (done 0.40.0)
