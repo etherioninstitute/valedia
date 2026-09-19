@@ -8,7 +8,7 @@
 
 **Current:** STOP — POLY-US-2 SHIPPED (retail whoami + preview dry-run). Prior: POLY-US 0.34.0.
 
-**Version:** `0.35.0` tag `valedia-v0.35.0` (tip after code commit). Prior: POLY-US `0.34.0`.
+**Version:** `0.35.0` tag `valedia-v0.35.0` tip `d4811d4`. Prior: POLY-US `0.34.0`.
 
 **Tests:** `test_poly_us.py` PASS (mocked + live-http preview). `poly_us_smoke.py` PASS (create blocked). `test_poly_e.py` / `test_h8.py` / `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice23.py` PASS.
 
