@@ -18,7 +18,7 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
 # Runtime identity (Slice 22/23). Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.23.0"
+VALEDIA_VERSION = "0.43.0"  # overlay KALSHI-ORDERS-V2; writers stay Kalshi-only
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
@@ -49,6 +49,8 @@ FUSION_WEIGHTS = {
 # Alias KILLED_STRATEGIES kept for Slice 8 tests.
 LIVE_EXEC_FENCED = frozenset({"WEATHER_ARB", "OIL_BRACKET"})
 KILLED_STRATEGIES = LIVE_EXEC_FENCED
+# Scanner may tag KXWTI/KXOIL as NO_HARVEST/CONVICTION_*; name-only fence misses those.
+LIVE_EXEC_FENCED_SERIES = frozenset({"KXWTI", "KXOIL"})
 
 # MicroScalper / weather live buys. This lane never sets True.
 SCALPER_LIVE = False
@@ -184,18 +186,37 @@ def weather_live_enabled():
     return False
 
 
-def is_killed_strategy(name):
+def ticker_family_fenced(ticker):
+    """True if ticker/series is an oil bracket (KXWTI / KXOIL / WTI). Not an unfence."""
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    series = t.split("-", 1)[0]
+    for prefix in LIVE_EXEC_FENCED_SERIES:
+        if series == prefix or series.startswith(prefix):
+            return True
+    return series == "WTI" or series.startswith("WTI")
+
+
+def is_killed_strategy(name, ticker=None):
     """Live-exec fence. True means do not place orders. Not a learning grave."""
-    return live_exec_fenced(name)
+    return live_exec_fenced(name, ticker=ticker)
 
 
-def live_exec_fenced(name):
-    """True if this strategy must not place live orders (Slice 8 fence).
+def live_exec_fenced(name, ticker=None):
+    """True if this strategy or ticker family must not place live orders.
 
     Independent of learning pause. Unpause / TTL expiry re-enters evaluation
     and Kelly/category gating only. This lane never lifts the fence.
+    Name fence: WEATHER_ARB / OIL_BRACKET. Series fence: KXWTI / KXOIL / WTI
+    even when the scanner labeled the pick NO_HARVEST.
     """
-    return str(name or "").strip().upper() in LIVE_EXEC_FENCED
+    n = str(name or "").strip().upper()
+    if n in LIVE_EXEC_FENCED:
+        return True
+    if ticker_family_fenced(ticker):
+        return True
+    return ticker_family_fenced(n)
 
 
 def effective_mirofish_weight():
@@ -361,10 +382,339 @@ NAUTILUS_SHADOW_VENUES = True
 # Kraken stays read-only. Mercury never. Alpaca stays Valedia until an adapter.
 VENUE_NT_CUTOVER_ORDER = ("coinbase", "hyperliquid", "polymarket", "kalshi")
 
+# Docs: recommendations/KILL-SWITCH.md. Gate: require_not_halted().
+VALEDIA_TRADING_HALT = False
+TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
+TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
+TREASURY_FLOOR_COINBASE = 20.0
+TREASURY_FLOOR_ALPACA = 10.0
+TREASURY_FLOORS = {
+    "polymarket_us": TREASURY_FLOOR_POLYMARKET_US,
+    "kalshi": TREASURY_FLOOR_KALSHI,
+    "coinbase": TREASURY_FLOOR_COINBASE,
+    "alpaca": TREASURY_FLOOR_ALPACA,
+    "hyperliquid": None,  # writer none; document only
+    "kraken": None,
+}
+TREASURY_ALERT_WEBHOOK = ""  # unused stub; treasury_status never POSTs it
+
+# Cron stagger (Slice 7): sports every 2h at :00, allocator every 4h at :20.
+# Same-minute collision was a double-bet race on 4h boundaries.
+SPORTS_CRON_MINUTE = 0
+ALLOCATOR_CRON_MINUTE = 20
+
+# Execution policy (execution_policy.py maker-order layer). DRY-RUN by default: Valedia decides
+# maker/taker/no_trade autonomously, but placing REAL resting maker orders stays off until proven
+# on paper (earn it). Flip to False to let her place/manage live maker orders under her risk stack.
+EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master_allocator, the live authority)
+
+import os as _os, json as _json   # for auto-sourcing live track-record / risk state
+_MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
+
+def _env_flag(name, default):
+    env = _os.environ.get(name)
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    return bool(default)
+
+
+_ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
+_STAMP_CACHE = None
+
+
+def version_identity():
+    """Build identity: version, short sha, branch, dirty. Fail-closed to unknowns."""
+    def _git(*args):
+        import subprocess
+        try:
+            return subprocess.check_output(
+                ["git", "-C", _ROOT, *args],
+                stderr=subprocess.DEVNULL, timeout=2,
+            ).decode().strip()
+        except Exception:
+            return ""
+    sha = _git("rev-parse", "--short", "HEAD") or "unknown"
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+    dirty = bool(_git("status", "--porcelain"))
+    return {"version": VALEDIA_VERSION, "sha": sha, "branch": branch, "dirty": dirty}
+
+
+def version_stamp():
+    """Short 'vX.Y.Z sha' (dirty → trailing *) for Signal/status headers."""
+    global _STAMP_CACHE
+    if _STAMP_CACHE is None:
+        i = version_identity()
+        _STAMP_CACHE = f"v{i['version']} {i['sha']}" + ("*" if i["dirty"] else "")
+    return _STAMP_CACHE
+
+
+def version_line():
+    """Match scripts/valedia_version.sh: vX.Y.Z sha branch clean|dirty."""
+    i = version_identity()
+    return f"v{i['version']} {i['sha']} {i['branch']} {'dirty' if i['dirty'] else 'clean'}"
+
+
+def spot_reconcile_http_enabled():
+    """True only if Burton/Valedia flipped the spot GET HTTP flag.
+
+    Single flip: env SPOT_RECONCILE_HTTP=1/true/yes/on OR this module's
+    SPOT_RECONCILE_HTTP = True. Env wins over the constant. Anything else
+    (unset, empty, 0, false) is OFF. Default constant is False.
+    """
+    return _env_flag("SPOT_RECONCILE_HTTP", SPOT_RECONCILE_HTTP)
+
+
+def fortress_intel_fallback_enabled():
+    """True only if Burton flipped FORTRESS_INTEL_FALLBACK. Default False.
+
+    Does not start CDP, Docker, or Colima. Engine stays PARKED/fail-closed
+    until a later Linux sidecar. Env FORTRESS_INTEL_FALLBACK=1 wins.
+    This lane never sets the constant True.
+    """
+    return _env_flag("FORTRESS_INTEL_FALLBACK", FORTRESS_INTEL_FALLBACK)
+
+
+def self_adjust_enabled():
+    """True only if Burton flipped VALEDIA_SELF_ADJUST. Default False.
+
+    Wakes MiroFish AUTO_RAISE *inside the band* and documents that pause
+    re-open / neural enrich may run. Does not open VENUE_WRITER, SPOT GET,
+    NAUTILUS_LIVE, or AUTOEXEC. Env VALEDIA_SELF_ADJUST=1 wins over the constant.
+    This lane never sets the constant True.
+    """
+    return _env_flag("VALEDIA_SELF_ADJUST", VALEDIA_SELF_ADJUST)
+
+
+def rebalancer_autoexec_enabled():
+    """True only if Burton flipped REBALANCER_AUTOEXEC. Default False.
+
+    Necessary but not sufficient: rebalancer still needs live_flag gates and
+    venue_writer==valedia. NT cannot dispatch. This lane never sets True.
+    """
+    return _env_flag("REBALANCER_AUTOEXEC", REBALANCER_AUTOEXEC)
+
+
+def treasury_auto_enabled():
+    """True only if Burton flipped VALEDIA_TREASURY_AUTO. Default False.
+
+    Necessary but not sufficient: treasury_status still refuses to move
+    money. This lane never sets True. Env VALEDIA_TREASURY_AUTO=1 wins.
+    """
+    return _env_flag("VALEDIA_TREASURY_AUTO", VALEDIA_TREASURY_AUTO)
+
+
+class HaltedError(RuntimeError):
+    """New venue orders refused while VALEDIA_TRADING_HALT is on."""
+
+
+def halt_state_path():
+    """JSON arm/disarm file. Env VALEDIA_TRADING_HALT_FILE overrides."""
+    env = _os.environ.get("VALEDIA_TRADING_HALT_FILE")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return _os.path.join(_ROOT, "models", "valedia_trading_halt.json")
+
+
+def halt_ping_path():
+    """Status file for Valedia exit-ping / Signal. Never sent from here."""
+    env = _os.environ.get("VALEDIA_TRADING_HALT_PING")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return _os.path.join(_ROOT, "recommendations", "KILL-SWITCH-STATUS.md")
+
+
+def _halt_file_state():
+    path = halt_state_path()
+    try:
+        with open(path) as f:
+            doc = _json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {"halted": True, "reason": "halt file unreadable (fail-closed)",
+                "corrupt": True}
+    if not isinstance(doc, dict):
+        return {"halted": True, "reason": "halt file not an object (fail-closed)",
+                "corrupt": True}
+    return doc
+
+
+def trading_halted():
+    """True if new venue orders must refuse.
+
+    Env set (including 0/false/off) always wins — manual OFF works even if
+    the halt file still says armed. Env unset → halt file → config default.
+    """
+    env = _os.environ.get("VALEDIA_TRADING_HALT")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    doc = _halt_file_state()
+    if doc is not None:
+        return bool(doc.get("halted"))
+    return bool(VALEDIA_TRADING_HALT)
+
+
+def halt_reason():
+    """Human reason for the current halt (empty if not halted)."""
+    if not trading_halted():
+        return ""
+    env = _os.environ.get("VALEDIA_TRADING_HALT")
+    if env is not None and str(env).strip() != "":
+        return "VALEDIA_TRADING_HALT env"
+    doc = _halt_file_state() or {}
+    why = str(doc.get("reason") or "").strip()
+    if why:
+        return why
+    if VALEDIA_TRADING_HALT:
+        return "VALEDIA_TRADING_HALT config"
+    return "VALEDIA_TRADING_HALT"
+
+
+def require_not_halted(action="create_order"):
+    """Central write gate. Raise HaltedError if halted. Reads stay allowed."""
+    if trading_halted():
+        why = halt_reason() or "VALEDIA_TRADING_HALT"
+        raise HaltedError(f"{action} refused ({why})")
+    return False
+
+
+def write_halt_state(halted, reason="", source="manual"):
+    """Arm/disarm the halt file. No Signal send. No auto-spend."""
+    from datetime import datetime, timezone
+    halted = bool(halted)
+    doc = {
+        "halted": halted,
+        "reason": str(reason or ("VALEDIA_TRADING_HALT on" if halted else "cleared")),
+        "source": str(source or "manual"),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "valedia_version": VALEDIA_VERSION,
+        "ping": {
+            "send": False,
+            "channel": "signal",
+            "audience": "valedia-exit-ping",
+            "text": (
+                f"VALEDIA_TRADING_HALT halted={str(halted).lower()} "
+                f"reason={reason or '-'} (not sent; Valedia/Grok Bot to deliver)"
+            ),
+        },
+    }
+    path = halt_state_path()
+    _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        _json.dump(doc, f, indent=2)
+        f.write("\n")
+    _write_halt_ping(doc)
+    return doc
+
+
+def _write_halt_ping(doc):
+    path = halt_ping_path()
+    _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+    ping = doc.get("ping") or {}
+    lines = [
+        "# KILL-SWITCH status (not sent)",
+        "",
+        f"- halted: `{doc.get('halted')}`",
+        f"- reason: {doc.get('reason') or '-'}",
+        f"- source: {doc.get('source') or '-'}",
+        f"- ts: {doc.get('ts') or '-'}",
+        f"- version: {doc.get('valedia_version') or VALEDIA_VERSION}",
+        f"- ping.send: `{ping.get('send', False)}` (Valedia/Grok Bot delivers)",
+        f"- ping.text: {ping.get('text') or '-'}",
+        "",
+    ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def record_halt_event(reason, source="observe", arm=False):
+    """Report-only chain-failure hook. arm=False does not set halt this slice.
+
+    Writes models JSON + ping status. Never sends Signal. Never spends.
+    """
+    doc = _halt_file_state() or {}
+    if doc.get("corrupt"):
+        doc = {}
+    halted = True if arm else bool(doc.get("halted"))
+    return write_halt_state(halted, reason=reason, source=source)
+
+
+def panel_looks_sick(panel):
+    """Obvious cockpit/panel failure. Uncertain → True (fail-closed)."""
+    if not isinstance(panel, dict):
+        return True
+    if panel.get("error") or panel.get("ok") is False:
+        return True
+    if not panel.get("valedia_version"):
+        return True
+    return False
+
+
+def note_writer_exception(exc, source="writer", arm=False):
+    """Report a writer exception. Default report-only (arm=False)."""
+    return record_halt_event(f"writer exception: {exc}", source=source, arm=arm)
+
+
+def treasury_floors():
+    """Copy of TREASURY_FLOORS (None = no floor / document-only venue)."""
+    return dict(TREASURY_FLOORS)
+
+
+def treasury_alert_webhook():
+    """Unused stub. treasury_status never POSTs this URL."""
+    env = _os.environ.get("TREASURY_ALERT_WEBHOOK")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return str(TREASURY_ALERT_WEBHOOK or "")
+
+
+def scalper_live_enabled():
+    """MicroScalper live buys. Hard-off. Env cannot enable — dead path."""
+    return False
+
+
+def weather_live_enabled():
+    """WEATHER_ARB live orders. Hard-off. Env cannot enable — dead path."""
+    return False
+
+
+def ticker_family_fenced(ticker):
+    """True if ticker/series is an oil bracket (KXWTI / KXOIL / WTI). Not an unfence."""
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    series = t.split("-", 1)[0]
+    for prefix in LIVE_EXEC_FENCED_SERIES:
+        if series == prefix or series.startswith(prefix):
+            return True
+    return series == "WTI" or series.startswith("WTI")
+
+
+def is_killed_strategy(name, ticker=None):
+    """Live-exec fence. True means do not place orders. Not a learning grave."""
+    return live_exec_fenced(name, ticker=ticker)
+
+
+def live_exec_fenced(name, ticker=None):
+    """True if this strategy or ticker family must not place live orders.
+
+    Independent of learning pause. Unpause / TTL expiry re-enters evaluation
+    and Kelly/category gating only. This lane never lifts the fence.
+    Name fence: WEATHER_ARB / OIL_BRACKET. Series fence: KXWTI / KXOIL / WTI
+    even when the scanner labeled the pick NO_HARVEST.
+    """
+    n = str(name or "").strip().upper()
+    if n in LIVE_EXEC_FENCED:
+        return True
+    if ticker_family_fenced(ticker):
+        return True
+    return ticker_family_fenced(n)
+
 VENUE_WRITER = {
-    "kalshi": "valedia",
-    "coinbase": "valedia",
-    "alpaca": "valedia",
+    "kalshi": "valedia",  # STAGED-ON Kalshi-only 2026-09-19
+    "coinbase": "none",   # fenced for Kalshi-only stage
+    "alpaca": "none",     # fenced for Kalshi-only stage
     "kraken": "none",
     "polymarket": "none",
     "hyperliquid": "none",

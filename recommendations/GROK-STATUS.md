@@ -1,18 +1,21 @@
 # Grok Build status
 
-**Updated:** 2026-09-18 09:29 PT
+**NORTH STAR:** world's smartest, highest-profiting DYNAMIC auto-trader.
 
-**Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
+**Updated:** 2026-09-19 PT
 
-**Current:** DONE — S24 fenced live deploy (messaging + crontab stagger). **STOP for Burton.**
+**Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Build tip:** `59d9bbc` / Slice 23 `0a94a5b` — `VALEDIA_VERSION` 0.23.0 / tag `valedia-v0.23.0`
+**Current:** KALSHI-ORDERS-V2 SHIPPED. Next=Burton re-run live allocator.
 
-**Live tip:** `093bba8` — tags `fenced-deploy-s24-messaging`, `valedia-v0.23.0-live`
-**Live crontab:** allocator `20 */4` (was `0 */4`); sports still `0 */2`. Backup: `recommendations/crontab.pre-s24-*.txt`
+**Version:** `0.43.0` tag `valedia-v0.43.0` tip `db21c91`. Prior: `0.42.0` `02298ad`.
 
-**Shipped:** Slices 1–23 + S24 live messaging apply
+**Tests:** `test_kalshi_orders_v2.py` PASS (yes→bid, no→ask at 1-price, sell maps, cancel V2, V2 ack fill_count 0 ≠ fill). Also h3, kill-switch, scan_accuracy, slice8/9/23, execution_policy, poly_learn.
 
-**Fence:** No --live flips, no VENUE_WRITER, no REBALANCER_AUTOEXEC, no NT live, SPOT_RECONCILE_HTTP False. No `install_cron.sh`.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-KALSHI-ORDERS-V2.md` (thin). No new client; mapped onto existing create/sell.
 
-**Next:** STOP. Optional later: ERE `cumulative_extremes` bind, Ponytail cleanup Top 10 where Grok AGREEd.
+**Tool use:** RuFlo `hooks_route`/`hooks_pre-task`/`hooks_pre-edit` (architect/coder/tester). CBM `list_projects` + `search_graph` `create_order`/`sell_position` + `trace_path` inbound + `get_code_snippet` + `check_index_coverage`. Ponytail after code (no batch/amend, no client_order_id).
+
+**Fence:** No live orders in Build. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore (live `valedia_config` not wholesale-copied). No weather/oil unfence. MiroFish ears on. FENCED.
+
+**Next:** Burton re-run live allocator. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.

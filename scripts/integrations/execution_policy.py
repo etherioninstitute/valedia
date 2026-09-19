@@ -137,12 +137,17 @@ class MakerOrderManager:
         return K
 
     def _place(self, ticker, side, contracts, price_cents):
+        _cfg.require_not_halted("execution_policy._place")
         a = self._api()
         return a.place_order(ticker, side, contracts, price_cents) if self.api is not None \
             else a.create_order(ticker, side, contracts, price_cents)
 
-    def _cancel(self, order_id):
-        return self._api().cancel_order(order_id)
+    def _cancel(self, order_id, ticker=None):
+        fn = self._api().cancel_order
+        try:
+            return fn(order_id, ticker=ticker)
+        except TypeError:
+            return fn(order_id)
 
     def place_maker_order(self, ticker, side, contracts, price_cents, strategy="", max_age_s=None):
         if getattr(_cfg, "EXEC_DRY_RUN", True):
@@ -150,7 +155,8 @@ class MakerOrderManager:
             return None
         try:
             res = self._place(ticker, side, contracts, price_cents) or {}
-            order_id = (res.get("order", {}) or {}).get("order_id", "")
+            nested = res.get("order") if isinstance(res.get("order"), dict) else {}
+            order_id = nested.get("order_id") or res.get("order_id") or ""
             if order_id:
                 self._orders[order_id] = {"ticker": ticker, "side": side, "price": price_cents,
                                           "contracts": contracts, "strategy": strategy,
@@ -200,7 +206,7 @@ class MakerOrderManager:
                 continue
             if time.time() - info["placed_at"] > info["max_age_s"]:
                 try:
-                    self._cancel(oid)
+                    self._cancel(oid, info.get("ticker"))
                     log.info(f"  MAKER CANCEL (stale): {info['ticker']} @{info['price']}c")
                 except Exception as e:
                     log.debug(f"  cancel failed {oid}: {e}")
@@ -224,7 +230,7 @@ class MakerOrderManager:
             return True
         elif cur > best_bid + 5:                                   # book moved down -> edge likely gone
             try:
-                self._cancel(oid)
+                self._cancel(oid, info.get("ticker"))
                 log.info(f"  MAKER CANCEL (book moved): {info['ticker']} our={cur}c best_bid={best_bid}c")
             except Exception:
                 pass
@@ -234,7 +240,7 @@ class MakerOrderManager:
 
     def _replace_order(self, oid, info, new_price):
         try:
-            self._cancel(oid)
+            self._cancel(oid, info.get("ticker"))
             self._orders.pop(oid, None)
             if self.place_maker_order(info["ticker"], info["side"], info["contracts"], new_price,
                                       strategy=info.get("strategy", ""), max_age_s=info["max_age_s"]):
@@ -247,7 +253,7 @@ class MakerOrderManager:
             if ticker and info["ticker"] != ticker:
                 continue
             try:
-                self._cancel(oid)
+                self._cancel(oid, info.get("ticker"))
             except Exception:
                 pass
             self._orders.pop(oid, None)
@@ -280,7 +286,7 @@ if __name__ == "__main__":
     class _Stub:
         def __init__(s): s.cancelled = []; s._fills = []
         def place_order(s, t, side, n, p): return {"order": {"order_id": f"oid_{t}_{p}"}}
-        def cancel_order(s, oid): s.cancelled.append(oid); return {}
+        def cancel_order(s, oid, ticker=None): s.cancelled.append(oid); return {}
         def get_fills(s): return {"fills": s._fills}
 
     # Capture ledger writes instead of touching the real ledger.
