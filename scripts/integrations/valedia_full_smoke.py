@@ -91,6 +91,7 @@ def check_fence():
         "polymarket_us_live": poly_live,
         "treasury_auto": bool(vc.treasury_auto_enabled()),
         "rebalancer_autoexec": bool(vc.rebalancer_autoexec_enabled()),
+        "trading_halt": bool(vc.trading_halted()),
     }
     if not ok:
         bits = []
@@ -321,7 +322,7 @@ def run_smoke(offline=False, live_mirofish=True, poly_client=None,
         "fence": "No POLYMARKET_US_LIVE / VENUE_WRITER / REBALANCER_AUTOEXEC / "
                  "NAUTILUS_LIVE / VALEDIA_SELF_ADJUST / MIROFISH_AUTO_RAISE / "
                  "VALEDIA_TREASURY_AUTO / live orders / ACH.",
-        "next": "KILL-SWITCH (VALEDIA_TRADING_HALT) — do not auto-start",
+        "next": "OPENTERMINAL-VALEDIA — do not auto-start",
     }
     return report
 
@@ -356,10 +357,10 @@ def render_md(report):
         "",
         "- live orders / Kalshi writes / Poly create (blocked)",
         "- ACH / wire / card / treasury auto top-up",
-        "- kill-switch (`VALEDIA_TRADING_HALT`) — next queue, not this slice",
+        "- kill-switch: `valedia_config.require_not_halted` (see `KILL-SWITCH.md`)",
         "- OpenTerminal Valedia UI",
         "",
-        "**Next = KILL-SWITCH.** Do not auto-start. Do not flip live.",
+        "**Next = OPENTERMINAL-VALEDIA.** Do not auto-start. Do not flip live.",
         "",
     ]
     return "\n".join(lines)

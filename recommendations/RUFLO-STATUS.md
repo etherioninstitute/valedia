@@ -1,5 +1,10 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-19 PT — **FULL-SMOKE SHIPPED**. Version `0.38.0` tag `valedia-v0.38.0` tip `cdbec1b`. CLI `valedia_full_smoke.py` + `VALEDIA-FULL-SMOKE.md` **PASS** (wall 3.763s). Ponytail: `PONYTAIL-AUDIT-FULL-SMOKE.md`. **STOP — parent launches KILL-SWITCH.** Do not auto-start `VALEDIA_TRADING_HALT`. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+Updated: 2026-09-19 PT — **KILL-SWITCH SHIPPED**. Version `0.39.0` tag `valedia-v0.39.0`. Gate `valedia_config.require_not_halted` / `HaltedError`. Ponytail: `PONYTAIL-AUDIT-KILL-SWITCH.md`. **STOP — parent launches OPENTERMINAL-VALEDIA.** Do not auto-start OpenTerminal. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+
+## KILL-SWITCH (Grok Build executor, `valedia-v2-grok-build`)
+- Master halt: env/file `VALEDIA_TRADING_HALT`. Writers (Kalshi create/sell, Poly US create/cancel, Coinbase/Alpaca market buy/sell) + allocator/rebalancer/maker `_place` refuse with `HaltedError`. GET/preview/dry-run stay allowed.
+- Manual OFF: `unset` / `=0` / `valedia_trading_halt.py off`. Self-heal report-only (`send: false` ping file). `test_kill_switch.py` PASS.
+- **Next = OPENTERMINAL-VALEDIA (parent launches). Do not auto-start here. Do not flip staged ON.**
 
 ## FULL-SMOKE (Grok Build executor, `valedia-v2-grok-build`)
 - Minutes-scale whole-brain smoke. One CLI wraps fence stamps, treasury_status, mirofish_smoke fixture (+ live-lite), Kalshi balance GET, Poly US whoami_retail/preview (create blocked), shadow queue + adversarial import, cockpit `panel()`, pnl_tracker broker≠FTL.

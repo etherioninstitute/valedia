@@ -65,6 +65,8 @@ def _fill_fields(d):
 
 def market_buy(pair, usd_amount):
     """Market buy $usd_amount worth of crypto. Returns order result (fill fields if present)."""
+    import valedia_config as vc
+    vc.require_not_halted("coinbase.market_buy")
     body = build_market_order_body(pair, "BUY", usd_amount=usd_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:
@@ -78,6 +80,8 @@ def market_buy(pair, usd_amount):
 
 def market_sell(pair, crypto_amount):
     """Market sell crypto_amount of base currency."""
+    import valedia_config as vc
+    vc.require_not_halted("coinbase.market_sell")
     body = build_market_order_body(pair, "SELL", crypto_amount=crypto_amount)
     r = _request("POST", "/api/v3/brokerage/orders", body)
     if r.ok:

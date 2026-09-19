@@ -99,6 +99,8 @@ def rebalancer_may_exec(gates=None):
     not ERE HALT/DANGER. Default cron passes no live_flag → False.
     """
     import valedia_config as vc
+    if vc.trading_halted():
+        return False
     if not vc.rebalancer_autoexec_enabled():
         return False
     if vc.venue_writer("coinbase") != "valedia":

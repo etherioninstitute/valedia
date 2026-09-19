@@ -64,6 +64,8 @@ def get_markets(limit=200, status="open"):
 # Write endpoints (use with caution)
 def create_order(ticker, side, count, price_cents, order_type="limit"):
     """Place an order. side='yes' or 'no'. price in cents (1-99)."""
+    import valedia_config as vc
+    vc.require_not_halted("kalshi.create_order")
     body = {
         "ticker": ticker,
         "action": "buy",
@@ -84,6 +86,8 @@ def cancel_order(order_id):
 
 def sell_position(ticker, side, count, price_cents, order_type="limit"):
     """Sell an existing position. side='yes' or 'no'. price in cents (1-99)."""
+    import valedia_config as vc
+    vc.require_not_halted("kalshi.sell_position")
     body = {
         "ticker": ticker,
         "action": "sell",

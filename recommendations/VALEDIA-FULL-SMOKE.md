@@ -66,8 +66,8 @@ python3 scripts/integrations/valedia_full_smoke.py --offline
 
 - live orders / Kalshi writes / Poly create (blocked)
 - ACH / wire / card / treasury auto top-up
-- kill-switch (`VALEDIA_TRADING_HALT`) — next queue, not this slice
+- kill-switch (`VALEDIA_TRADING_HALT`) — shipped 0.39.0, see `KILL-SWITCH.md` (default off)
 - OpenTerminal Valedia UI
 - cockpit HTTP server (`valedia_cockpit.py --listen`)
 
-**Next = KILL-SWITCH.** Do not auto-start. Do not flip live.
+**Next = OPENTERMINAL-VALEDIA.** Do not auto-start. Do not flip live.

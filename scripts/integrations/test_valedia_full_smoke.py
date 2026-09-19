@@ -45,6 +45,9 @@ def _restore():
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     os.environ.pop("VALEDIA_FULL_SMOKE_OFFLINE", None)
     os.environ.pop("MIROFISH_SMOKE_LIVE", None)
+    os.environ.pop("VALEDIA_TRADING_HALT", None)
+    os.environ.pop("VALEDIA_TRADING_HALT_FILE", None)
+    vc.VALEDIA_TRADING_HALT = False
     cockpit.set_paths(models_dir=cockpit.MODELS, ledger=None, intent_queue=None)
     vc._STAMP_CACHE = None
     tpu._restore()
@@ -204,9 +207,9 @@ def test_poly_write_stays_blocked():
 
 def test_version_and_docs():
     _restore()
-    assert vc.VALEDIA_VERSION == "0.38.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.39.0", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.38.0 ")
+    assert vc.version_stamp().startswith("v0.39.0 ")
     rec = open(os.path.join(ROOT, "recommendations", "VALEDIA-FULL-SMOKE.md")).read()
     assert "fence" in rec.lower()
     assert "KILL-SWITCH" in rec

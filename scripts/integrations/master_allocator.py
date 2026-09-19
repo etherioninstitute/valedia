@@ -378,6 +378,15 @@ def execute_allocations(allocations, dry_run=False):
             results.append(r)
             continue
 
+        if _cfg is not None:
+            try:
+                _cfg.require_not_halted("execute_allocations")
+            except _cfg.HaltedError as e:
+                r["status"] = "HALTED"
+                r["error"] = str(e)
+                results.append(r)
+                continue
+
         cat = a.get("type") or a.get("strategy")
         if _is_strategy_paused(cat):
             r["status"] = "SKIP_PAUSED"

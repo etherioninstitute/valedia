@@ -67,6 +67,8 @@ def get_order(order_id):
 
 def market_buy(symbol, notional=None, qty=None):
     """Buy stock by dollar amount (fractional) or quantity."""
+    import valedia_config as vc
+    vc.require_not_halted("alpaca.market_buy")
     import requests
     order = {"symbol": symbol, "side": "buy", "type": "market", "time_in_force": "day"}
     if notional:
@@ -80,6 +82,8 @@ def market_buy(symbol, notional=None, qty=None):
 
 def market_sell(symbol, qty=None, pct=100):
     """Sell stock. qty=None sells all. pct=50 sells half."""
+    import valedia_config as vc
+    vc.require_not_halted("alpaca.market_sell")
     import requests
     if qty is None:
         pos = get_position(symbol)

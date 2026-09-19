@@ -327,6 +327,7 @@ class PolymarketUSClient:
                 "note": "preview != create; ack != fill"}
 
     def _require_live(self, method):
+        vc.require_not_halted(f"polymarket_us.{method}")
         if not self.live:
             raise LiveWriteBlocked(
                 f"{method} refused (POLYMARKET_US_LIVE off)")

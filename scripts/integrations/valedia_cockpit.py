@@ -149,6 +149,8 @@ def panel(now=None):
         "get_only": True,
         "no_orders": True,
         "auto_raise": bool(vc.MIROFISH_AUTO_RAISE),
+        "trading_halt": bool(vc.trading_halted()),
+        "trading_halt_reason": vc.halt_reason() if vc.trading_halted() else "",
     }
 
 

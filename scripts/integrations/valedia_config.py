@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.38.0 = VALEDIA-FULL-SMOKE minutes-scale whole-brain gate).
-# Prior 0.37.0 = MIROFISH-SMOKE. Prior 0.36.0 = TREASURY-1. Prior 0.35.0 = POLY-US-2.
+# Runtime identity (0.39.0 = KILL-SWITCH VALEDIA_TRADING_HALT).
+# Prior 0.38.0 = VALEDIA-FULL-SMOKE. Prior 0.37.0 = MIROFISH-SMOKE.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.38.0"
+VALEDIA_VERSION = "0.39.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -120,6 +120,10 @@ REBALANCER_AUTOEXEC = False
 # Optional later auto top-up from one treasury bank. This lane never sets True.
 # First human fund is still required even if the flag is later flipped.
 VALEDIA_TREASURY_AUTO = False
+# Master kill-switch. Default unset/False = normal. Env=1 or halt file arms.
+# Manual OFF: env=0/false/off/unset+file cleared. This lane never sets True.
+# Docs: recommendations/KILL-SWITCH.md. Gate: require_not_halted().
+VALEDIA_TRADING_HALT = False
 TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
 TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
 TREASURY_FLOOR_COINBASE = 20.0
@@ -237,6 +241,159 @@ def treasury_auto_enabled():
     money. This lane never sets True. Env VALEDIA_TREASURY_AUTO=1 wins.
     """
     return _env_flag("VALEDIA_TREASURY_AUTO", VALEDIA_TREASURY_AUTO)
+
+
+class HaltedError(RuntimeError):
+    """New venue orders refused while VALEDIA_TRADING_HALT is on."""
+
+
+def halt_state_path():
+    """JSON arm/disarm file. Env VALEDIA_TRADING_HALT_FILE overrides."""
+    env = _os.environ.get("VALEDIA_TRADING_HALT_FILE")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return _os.path.join(_ROOT, "models", "valedia_trading_halt.json")
+
+
+def halt_ping_path():
+    """Status file for Valedia exit-ping / Signal. Never sent from here."""
+    env = _os.environ.get("VALEDIA_TRADING_HALT_PING")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return _os.path.join(_ROOT, "recommendations", "KILL-SWITCH-STATUS.md")
+
+
+def _halt_file_state():
+    path = halt_state_path()
+    try:
+        with open(path) as f:
+            doc = _json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {"halted": True, "reason": "halt file unreadable (fail-closed)",
+                "corrupt": True}
+    if not isinstance(doc, dict):
+        return {"halted": True, "reason": "halt file not an object (fail-closed)",
+                "corrupt": True}
+    return doc
+
+
+def trading_halted():
+    """True if new venue orders must refuse.
+
+    Env set (including 0/false/off) always wins — manual OFF works even if
+    the halt file still says armed. Env unset → halt file → config default.
+    """
+    env = _os.environ.get("VALEDIA_TRADING_HALT")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    doc = _halt_file_state()
+    if doc is not None:
+        return bool(doc.get("halted"))
+    return bool(VALEDIA_TRADING_HALT)
+
+
+def halt_reason():
+    """Human reason for the current halt (empty if not halted)."""
+    if not trading_halted():
+        return ""
+    env = _os.environ.get("VALEDIA_TRADING_HALT")
+    if env is not None and str(env).strip() != "":
+        return "VALEDIA_TRADING_HALT env"
+    doc = _halt_file_state() or {}
+    why = str(doc.get("reason") or "").strip()
+    if why:
+        return why
+    if VALEDIA_TRADING_HALT:
+        return "VALEDIA_TRADING_HALT config"
+    return "VALEDIA_TRADING_HALT"
+
+
+def require_not_halted(action="create_order"):
+    """Central write gate. Raise HaltedError if halted. Reads stay allowed."""
+    if trading_halted():
+        why = halt_reason() or "VALEDIA_TRADING_HALT"
+        raise HaltedError(f"{action} refused ({why})")
+    return False
+
+
+def write_halt_state(halted, reason="", source="manual"):
+    """Arm/disarm the halt file. No Signal send. No auto-spend."""
+    from datetime import datetime, timezone
+    halted = bool(halted)
+    doc = {
+        "halted": halted,
+        "reason": str(reason or ("VALEDIA_TRADING_HALT on" if halted else "cleared")),
+        "source": str(source or "manual"),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "valedia_version": VALEDIA_VERSION,
+        "ping": {
+            "send": False,
+            "channel": "signal",
+            "audience": "valedia-exit-ping",
+            "text": (
+                f"VALEDIA_TRADING_HALT halted={str(halted).lower()} "
+                f"reason={reason or '-'} (not sent; Valedia/Grok Bot to deliver)"
+            ),
+        },
+    }
+    path = halt_state_path()
+    _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        _json.dump(doc, f, indent=2)
+        f.write("\n")
+    _write_halt_ping(doc)
+    return doc
+
+
+def _write_halt_ping(doc):
+    path = halt_ping_path()
+    _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+    ping = doc.get("ping") or {}
+    lines = [
+        "# KILL-SWITCH status (not sent)",
+        "",
+        f"- halted: `{doc.get('halted')}`",
+        f"- reason: {doc.get('reason') or '-'}",
+        f"- source: {doc.get('source') or '-'}",
+        f"- ts: {doc.get('ts') or '-'}",
+        f"- version: {doc.get('valedia_version') or VALEDIA_VERSION}",
+        f"- ping.send: `{ping.get('send', False)}` (Valedia/Grok Bot delivers)",
+        f"- ping.text: {ping.get('text') or '-'}",
+        "",
+    ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def record_halt_event(reason, source="observe", arm=False):
+    """Report-only chain-failure hook. arm=False does not set halt this slice.
+
+    Writes models JSON + ping status. Never sends Signal. Never spends.
+    """
+    doc = _halt_file_state() or {}
+    if doc.get("corrupt"):
+        doc = {}
+    halted = True if arm else bool(doc.get("halted"))
+    return write_halt_state(halted, reason=reason, source=source)
+
+
+def panel_looks_sick(panel):
+    """Obvious cockpit/panel failure. Uncertain → True (fail-closed)."""
+    if not isinstance(panel, dict):
+        return True
+    if panel.get("error") or panel.get("ok") is False:
+        return True
+    if not panel.get("valedia_version"):
+        return True
+    return False
+
+
+def note_writer_exception(exc, source="writer", arm=False):
+    """Report a writer exception. Default report-only (arm=False)."""
+    return record_halt_event(f"writer exception: {exc}", source=source, arm=arm)
 
 
 def treasury_floors():

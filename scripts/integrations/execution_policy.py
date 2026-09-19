@@ -137,6 +137,7 @@ class MakerOrderManager:
         return K
 
     def _place(self, ticker, side, contracts, price_cents):
+        _cfg.require_not_halted("execution_policy._place")
         a = self._api()
         return a.place_order(ticker, side, contracts, price_cents) if self.api is not None \
             else a.create_order(ticker, side, contracts, price_cents)
