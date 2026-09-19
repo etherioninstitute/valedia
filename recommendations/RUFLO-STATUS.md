@@ -1,5 +1,10 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **H8 + POLY-E SHIPPED.** Version `0.33.0` tag `valedia-v0.33.0` tip `ef609ef`. Prior H7 `0.32.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+Updated: 2026-09-18 PT — **POLY-US SHIPPED.** Version `0.34.0`. Prior H8+POLY-E `0.33.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+
+## POLY-US (Grok Build executor, `valedia-v2-grok-build`)
+- US DCM client `polymarket_us_client.py` (not Int'l CLOB). Env `POLYMARKET_KEY_ID`/`POLYMARKET_SECRET_KEY`. create/cancel gated. Nav tag helpers. Fill-true GET-by-id. `test_poly_us.py` PASS. Ponytail: `PONYTAIL-AUDIT-POLY-US.md`.
+- Cutover: `POLYMARKET-US-CUTOVER.md` — **do not flip** `VENUE_WRITER["polymarket"]` / `LIVE_CLIENT_HOOK` / `POLYMARKET_US_LIVE`.
+- Fence held. Do not enable live Polymarket / NT live / Arena funding.
 
 ## H8 + POLY-E (Grok Build executor, `valedia-v2-grok-build`)
 - H8: `intel_fetch_fallback.py` failure-gated `{ok,empty,blocked,waf}` after 403/429/empty/WAF. Engine PARKED. `test_h8.py` PASS. Ponytail: `PONYTAIL-AUDIT-H8.md`.

@@ -6,16 +6,16 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H8 + POLY-E SHIPPED. Version `0.33.0` tag `valedia-v0.33.0` tip `ef609ef`. Prior: H7 0.32.0.
+**Current:** POLY-US SHIPPED. Fence held. Next=STOP. Do not enable live Poly.
 
-**Tests:** `test_h8.py` PASS. `test_poly_e.py` PASS. `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice11.py` / `test_slice12.py` / `test_slice10.py` / `test_slice23.py` PASS.
+**Version:** `0.34.0` (tag `valedia-v0.34.0` after commit). Prior: H8+POLY-E `0.33.0`.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-H8.md` + `recommendations/PONYTAIL-AUDIT-POLY-E.md`
+**Tests:** `test_poly_us.py` PASS (mocked). `test_poly_e.py` PASS. `test_h8.py` / `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice23.py` PASS.
 
-**H8:** `intel_fetch_fallback.py` — classify `{ok,empty,blocked,waf}`; `FORTRESS_INTEL_FALLBACK` default False; engine PARKED (no Colima/Docker/CDP); venue hosts refused; token-capped headlines → `models/intel_fetch_fallback.json`. Seed `_get` observe hook. No second Kelly.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-POLY-US.md`
 
-**POLY-E:** `polymarket_entertainment.py` — nav buckets Sports/Politics/Crypto/Weather/Tech/Culture/Econ (Culture = Oscars). Gatherer tags + category aliases. Shadow Intents via existing CLOB stub; `LIVE_CLIENT_HOOK=None`; writer `none`. POST-ack ≠ filled (`resolve_polymarket_fill` by order/trade id). Cutover: `POLYMARKET-ENTERTAINMENT-CUTOVER.md` — **do not flip**.
+**POLY-US:** `polymarket_us_client.py` — US DCM (`api.polymarket.us` + `gateway.polymarket.us`), env `POLYMARKET_KEY_ID`/`POLYMARKET_SECRET_KEY`. create/cancel gated `POLYMARKET_US_LIVE` default False. Nav Sports/Politics/Crypto/Weather/Tech/Culture/Econ via US tags. Fill-true: preview ≠ create; create ack ≠ fill. Matrix: `POLYMARKET-US-API-MATRIX.md`. Cutover: `POLYMARKET-US-CUTOVER.md` — **do not flip**. Int'l Gamma/CLOB (`polymarket_client.py`) unchanged. No `polymarket-us` SDK install.
 
-**Fence:** No `--live`, no venue orders, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False.
+**Fence:** No `--live`, no venue orders, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False. `LIVE_CLIENT_HOOK` None. `POLYMARKET_US_LIVE` False.
 
-**Next:** STOP.
+**Next:** STOP. Do not enable live Polymarket.

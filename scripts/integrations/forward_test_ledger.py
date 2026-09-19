@@ -308,21 +308,38 @@ def extract_kalshi_fill(raw, fills_payload=None):
     }
 
 
-def extract_polymarket_fill(raw, trades_payload=None):
-    """Parse a Polymarket CLOB ack / trades blob. POST-ack is NEVER a fill.
+def _poly_px(value):
+    if isinstance(value, dict):
+        value = value.get("value")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    Complete only when GET trades match this order_id or trade_id with size>0.
-    No id → do not steal other trades. Mirrors resolve_kalshi_fill (H3).
+
+def extract_polymarket_fill(raw, trades_payload=None):
+    """Parse a Polymarket CLOB or US DCM ack / trades blob.
+
+    POST-ack is NEVER a fill (preview != create; create ack != fill).
+    Complete only when GET trades/order match this order_id or trade_id
+    with size>0. No id → do not steal other trades. Mirrors H3 Kalshi.
     """
     raw = raw if isinstance(raw, dict) else {}
     nested = raw.get("order") if isinstance(raw.get("order"), dict) else {}
     blob = {**raw, **nested}
+    kind = str(blob.get("kind") or "").lower()
     order_id = blob.get("orderID") or blob.get("order_id") or blob.get("id")
-    trade_id = blob.get("tradeID") or blob.get("trade_id")
-    status = str(blob.get("status") or "").lower()
+    trade_id = (blob.get("tradeID") or blob.get("trade_id")
+                or blob.get("tradeId"))
+    status = str(blob.get("status") or blob.get("state") or "").lower()
+    if kind in ("preview", "order_preview"):
+        return {"complete": False, "qty": 0.0, "price": 0.0,
+                "order_id": order_id, "trade_id": trade_id, "status": "preview"}
     trades = None
     if isinstance(trades_payload, dict):
-        trades = trades_payload.get("trades") or trades_payload.get("data")
+        trades = (trades_payload.get("trades") or trades_payload.get("data")
+                  or trades_payload.get("executions")
+                  or trades_payload.get("activities"))
     elif isinstance(trades_payload, list):
         trades = trades_payload
     qty = 0.0
@@ -333,10 +350,12 @@ def extract_polymarket_fill(raw, trades_payload=None):
         for t in trades:
             if not isinstance(t, dict):
                 continue
-            tid = t.get("id") or t.get("trade_id") or t.get("tradeID")
-            ids = {str(t.get(k) or "") for k in (
-                "order_id", "orderID", "taker_order_id", "maker_order_id",
-                "takerOrderId", "makerOrderId")}
+            nested_o = t.get("order") if isinstance(t.get("order"), dict) else {}
+            tid = (t.get("id") or t.get("trade_id") or t.get("tradeID")
+                   or t.get("tradeId"))
+            ids = {str(t.get(k) or nested_o.get(k) or "") for k in (
+                "order_id", "orderID", "orderId", "taker_order_id",
+                "maker_order_id", "takerOrderId", "makerOrderId")}
             if trade_id and tid and str(tid) == str(trade_id):
                 matched.append(t)
                 continue
@@ -346,17 +365,31 @@ def extract_polymarket_fill(raw, trades_payload=None):
         for t in matched:
             try:
                 total += float(t.get("size") or t.get("matchedAmount")
-                               or t.get("takingAmount") or 0)
+                               or t.get("takingAmount") or t.get("lastShares")
+                               or t.get("cumQuantity") or 0)
             except (TypeError, ValueError):
                 pass
         if total > 0:
             qty = total
             last = matched[-1]
+            price = _poly_px(last.get("price") or last.get("lastPx")
+                             or last.get("avgPx"))
+            matched_id = (last.get("id") or last.get("trade_id")
+                          or last.get("tradeId") or trade_id)
+    if (qty <= 0 and isinstance(trades_payload, dict) and order_id):
+        snap = trades_payload.get("order")
+        if not isinstance(snap, dict):
+            snap = trades_payload
+        if str(snap.get("id") or "") == str(order_id):
+            st = str(snap.get("state") or snap.get("status") or "").upper()
             try:
-                price = float(last.get("price") or 0)
+                cq = float(snap.get("cumQuantity") or 0)
             except (TypeError, ValueError):
-                price = 0.0
-            matched_id = last.get("id") or last.get("trade_id") or trade_id
+                cq = 0.0
+            if cq > 0 and "FILL" in st:
+                qty = cq
+                price = _poly_px(snap.get("avgPx") or snap.get("price"))
+                status = st.lower()
     return {
         "complete": qty > 0,
         "qty": qty,
