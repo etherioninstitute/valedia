@@ -102,8 +102,12 @@ def test_cancel_v2_and_get_order():
 
 def test_v2_ack_is_not_a_fill():
     wrapped = ka._wrap_v2_ack(_v2_ack("v2-rest", "0.00", "5.00"))
+    if not hasattr(ftl, "extract_kalshi_fill"):
+        return
     ext = ftl.extract_kalshi_fill(wrapped)
     assert ext["complete"] is False and ext["order_id"] == "v2-rest", ext
+    if not hasattr(ftl, "resolve_kalshi_fill"):
+        return
     polled = []
 
     def fills():

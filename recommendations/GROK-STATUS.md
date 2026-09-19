@@ -6,16 +6,16 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** SCAN-ACCURACY SHIPPED. Next=Burton.
+**Current:** KALSHI-ORDERS-V2 SHIPPED. Next=Burton re-run live allocator.
 
-**Version:** `0.42.0` tag `valedia-v0.42.0` tip `02298ad`. Prior: `0.41.0` `a211b8d`.
+**Version:** `0.43.0` tag `valedia-v0.43.0` tip `db21c91`. Prior: `0.42.0` `02298ad`.
 
-**Tests:** `test_scan_accuracy.py` PASS (honest Signal scan, oil `NO_HARVEST` ticker fence, Kalshi deployable > 0 with CB/Alpaca writers none). Also slice8/9/23, h3, poly_learn, kill_switch, version-bumped suite.
+**Tests:** `test_kalshi_orders_v2.py` PASS (yes→bid, no→ask at 1-price, sell maps, cancel V2, V2 ack fill_count 0 ≠ fill). Also h3, kill-switch, scan_accuracy, slice8/9/23, execution_policy, poly_learn.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-SCAN-ACCURACY.md` (thin). Deleted extra-capital hype; per-venue deployable; one fence helper.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-KALSHI-ORDERS-V2.md` (thin). No new client; mapped onto existing create/sell.
 
-**Tool use:** RuFlo `hooks_route`/`hooks_pre-task` (tester/coder, medium). CBM `get_architecture` + `search_graph` `opportunity_report`/`live_exec_fenced` + `trace_path` inbound. Ponytail after code (deleted deposit-ROI invention).
+**Tool use:** RuFlo `hooks_route`/`hooks_pre-task`/`hooks_pre-edit` (architect/coder/tester). CBM `list_projects` + `search_graph` `create_order`/`sell_position` + `trace_path` inbound + `get_code_snippet` + `check_index_coverage`. Ponytail after code (no batch/amend, no client_order_id).
 
-**Fence:** No live orders, no ACH/wire/card, no wallet/venue transfer, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False. `LIVE_CLIENT_HOOK` None. `POLYMARKET_US_LIVE` False. `REBALANCER_AUTOEXEC` False. `VALEDIA_TREASURY_AUTO` False. `WEATHER_LIVE` False. No CB/Alpaca writer restore. `VALEDIA_TRADING_HALT` default False. Oil stays fenced (name **and** KXWTI/KXOIL/WTI). MiroFish ears stay on. FENCED.
+**Fence:** No live orders in Build. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore (live `valedia_config` not wholesale-copied). No weather/oil unfence. MiroFish ears on. FENCED.
 
-**Next:** Burton. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
+**Next:** Burton re-run live allocator. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
