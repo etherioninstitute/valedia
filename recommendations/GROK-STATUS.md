@@ -8,7 +8,7 @@
 
 **Current:** MIROFISH-BIONIC SHIPPED. Next=Burton (Neo4j `:7687` was down during healthcheck; 27B sync timeout risk vs 8B still open).
 
-**Version:** `0.44.0` (tag `valedia-v0.44.0` after commit). Prior: `0.43.0` `db21c91`.
+**Version:** `0.44.0` tag `valedia-v0.44.0` tip `39dfe68`. Prior: `0.43.0` `db21c91`.
 
 **Tests:** `test_mirofish_bionic.py` PASS (openai/ollama URL detect + 768-d parse). `test_mirofish_smoke.py` PASS. `test_slice23.py` PASS. `test_kill_switch.py` PASS.
 
