@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **H5 + DYNAMIC-BAND SHIPPED.** Version `0.30.0` tag `valedia-v0.30.0`. Prior H4 `0.29.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab. `VALEDIA_SELF_ADJUST` stays False.
+Updated: 2026-09-18 PT — **H5 + DYNAMIC-BAND SHIPPED.** Version `0.30.0` tag `valedia-v0.30.0` tip `a7801d3`. Prior H4 `0.29.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab. `VALEDIA_SELF_ADJUST` stays False.
 
 ## H5 / DYNAMIC-BAND (Grok Build executor, `valedia-v2-grok-build`)
 - H5: `desk_roles.py` labels on shadow Intents; `hl_public_info.py` public `/info` snapshot; gatherer `source_feed=hl_public`. No Exchange. `test_h5.py` PASS. Ponytail: `PONYTAIL-AUDIT-H5.md`.

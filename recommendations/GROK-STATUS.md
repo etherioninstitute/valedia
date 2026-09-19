@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H5 + DYNAMIC-BAND SHIPPED. VALEDIA_VERSION `0.30.0`. Next = STOP for Burton.
+**Current:** H5 + DYNAMIC-BAND SHIPPED. VALEDIA_VERSION `0.30.0` tag `valedia-v0.30.0` tip `a7801d3`. Next = STOP for Burton.
 
 **Tests:** `test_h5.py` PASS. `test_dynamic_band.py` PASS. `test_slice10` / `test_slice11` / `test_slice13` / `test_slice18` / `test_h2` / `test_h3` / `test_h4` / `test_nt1` / `test_nt2` / `test_slice23` / `test_adversarial_paper_fight` PASS.
 
