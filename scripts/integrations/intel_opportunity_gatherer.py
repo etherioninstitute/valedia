@@ -311,6 +311,12 @@ def collect_hl_public(doc):
     return opportunities(doc, notional=SHADOW_NOTIONAL)
 
 
+def collect_pm_entertainment(doc):
+    """models/polymarket_entertainment.json — Oscars/awards/culture. Shadow."""
+    from polymarket_entertainment import opportunities
+    return opportunities(doc, notional=SHADOW_NOTIONAL)
+
+
 def collect_arb(doc):
     """latency_arb_log.json — *candidates* only. Always extra-shadow later."""
     out = []
@@ -468,6 +474,8 @@ def gather(models_dir=_MODELS, listed=None):
     opps.extend(collect_scanner(_load(os.path.join(md, "scanner_results.json"))))
     opps.extend(collect_arb(_load(os.path.join(md, "latency_arb_log.json"))))
     opps.extend(collect_hl_public(_load(os.path.join(md, "hl_public_info.json"))))
+    opps.extend(collect_pm_entertainment(
+        _load(os.path.join(md, "polymarket_entertainment.json"))))
     return merge_opps(opps)
 
 
@@ -490,6 +498,8 @@ def emit_shadow_intents(models_dir=_MODELS, queue_path=None, opps=None,
             "source_feed": o["source_feed"],
             "intel_edge_pct": o["edge_pct"],
         }
+        if o.get("tags"):
+            extra["opportunity_tags"] = list(o["tags"])
         extra.update(label_shadow(gates, venue=o["venue"]))
         if o["kind"] == "arb":
             extra["arb_candidate"] = True

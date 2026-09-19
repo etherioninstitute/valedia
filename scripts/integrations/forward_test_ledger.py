@@ -36,7 +36,19 @@ def kalshi_fee(price, contracts):
 
 # Sports labels that must share one category-gate / Kelly bucket (allocator
 # used SPORTS_TONIGHT while sports_engine used SPORTS — two crons, split gate).
-CATEGORY_ALIASES = {"SPORTS_TONIGHT": "SPORTS"}
+CATEGORY_ALIASES = {
+    "SPORTS_TONIGHT": "SPORTS",
+    "POLYMARKET_SPORTS": "SPORTS",
+    "POLYMARKET_ENTERTAINMENT": "ENTERTAINMENT",
+    "POLYMARKET_CULTURE": "ENTERTAINMENT",
+    "OSCARS": "ENTERTAINMENT",
+    "CULTURE": "ENTERTAINMENT",
+    "POLYMARKET_POLITICS": "POLITICS",
+    "POLYMARKET_CRYPTO": "CRYPTO",
+    "POLYMARKET_WEATHER": "WEATHER",
+    "POLYMARKET_TECH": "TECH",
+    "POLYMARKET_ECON": "ECON",
+}
 
 
 def canonical_category(category):
@@ -294,6 +306,110 @@ def extract_kalshi_fill(raw, fills_payload=None):
         "order_id": order_id,
         "status": status,
     }
+
+
+def extract_polymarket_fill(raw, trades_payload=None):
+    """Parse a Polymarket CLOB ack / trades blob. POST-ack is NEVER a fill.
+
+    Complete only when GET trades match this order_id or trade_id with size>0.
+    No id → do not steal other trades. Mirrors resolve_kalshi_fill (H3).
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    nested = raw.get("order") if isinstance(raw.get("order"), dict) else {}
+    blob = {**raw, **nested}
+    order_id = blob.get("orderID") or blob.get("order_id") or blob.get("id")
+    trade_id = blob.get("tradeID") or blob.get("trade_id")
+    status = str(blob.get("status") or "").lower()
+    trades = None
+    if isinstance(trades_payload, dict):
+        trades = trades_payload.get("trades") or trades_payload.get("data")
+    elif isinstance(trades_payload, list):
+        trades = trades_payload
+    qty = 0.0
+    price = 0.0
+    matched_id = None
+    if isinstance(trades, list) and trades and (order_id or trade_id):
+        matched = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("id") or t.get("trade_id") or t.get("tradeID")
+            ids = {str(t.get(k) or "") for k in (
+                "order_id", "orderID", "taker_order_id", "maker_order_id",
+                "takerOrderId", "makerOrderId")}
+            if trade_id and tid and str(tid) == str(trade_id):
+                matched.append(t)
+                continue
+            if order_id and str(order_id) in ids:
+                matched.append(t)
+        total = 0.0
+        for t in matched:
+            try:
+                total += float(t.get("size") or t.get("matchedAmount")
+                               or t.get("takingAmount") or 0)
+            except (TypeError, ValueError):
+                pass
+        if total > 0:
+            qty = total
+            last = matched[-1]
+            try:
+                price = float(last.get("price") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            matched_id = last.get("id") or last.get("trade_id") or trade_id
+    return {
+        "complete": qty > 0,
+        "qty": qty,
+        "price": price,
+        "order_id": order_id,
+        "trade_id": matched_id or trade_id,
+        "status": status,
+    }
+
+
+def resolve_polymarket_fill(raw, get_trades_fn=None):
+    """POST-ack first; GET trades only if order_id/trade_id is known.
+
+    POST success is never a fill. No id → do not poll (would steal others).
+    """
+    fill = extract_polymarket_fill(raw)
+    if get_trades_fn is None:
+        return fill, None
+    if not fill.get("order_id") and not fill.get("trade_id"):
+        return fill, None
+    try:
+        payload = get_trades_fn()
+    except Exception:
+        payload = None
+    if payload:
+        fill = extract_polymarket_fill(raw, payload)
+    return fill, payload
+
+
+def book_polymarket_fill(strategy, ticker, side, raw, intended_source="live",
+                         fallback_price=None, fallback_size=None, ts=None,
+                         trades_payload=None, predicted_direction=None,
+                         predicted_prob=None):
+    """Fee-true record_entry when GET trades size > 0; else UNRECONCILED."""
+    fill = extract_polymarket_fill(raw, trades_payload)
+    src_in = str(intended_source or "live")
+    price = fill["price"] if fill["price"] > 0 else float(fallback_price or 0)
+    qty = fill["qty"] if fill["complete"] else float(fallback_size or fill["qty"] or 0)
+    strat = canonical_category(strategy)
+    oid = fill.get("order_id") or fill.get("trade_id")
+    if not fill["complete"]:
+        return record_unreconciled(
+            strat, ticker, side, price, qty, "polymarket",
+            predicted_direction=predicted_direction, predicted_prob=predicted_prob,
+            ts=ts, order_id=oid, intended_source=src_in,
+        )
+    source = src_in if _is_non_real_source(src_in) else "live"
+    return record_entry(
+        strat, ticker, side, price, fill["qty"], venue="polymarket",
+        predicted_direction=predicted_direction, predicted_prob=predicted_prob,
+        source=source, ts=ts, fill_status="FILLED",
+        entry_fee=0.0, order_id=oid,
+    )
 
 
 def resolve_kalshi_fill(raw, get_fills_fn=None):

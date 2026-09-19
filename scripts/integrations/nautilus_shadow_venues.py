@@ -357,29 +357,43 @@ def emit_polymarket_arb_shadow(candidate: dict, queue_path: Optional[str] = None
         canonical = None
         compare = {"ok": False, "error": str(e)[:160], "mismatches": [
             {"field": "post_body", "intent": intent.side, "post": str(e)[:80]}]}
+    kind = str(c.get("kind") or "polymarket_arb")
     extra = {
         "shadow": True,
         "writer": "none",
         "venue_writer": vc.venue_writer("polymarket"),
         "compare": compare,
         "canonical_post": canonical,
-        "arb_candidate": True,
+        "arb_candidate": kind == "polymarket_arb",
         "kalshi_ticker": c.get("kalshi_ticker") or c.get("ticker"),
         "live_client_hook": PM_HOOK,
         "pm_send": pm_send_via_live_hook(canonical),
-        "kind": "polymarket_arb",
+        "kind": kind,
     }
+    if c.get("tags"):
+        extra["opportunity_tags"] = list(c["tags"])
+    extra.update(label_shadow(intent.gates, venue="polymarket"))
     rec = enqueue_intent(intent, dispatch=False, queue_path=queue_path, extra=extra)
     rec["dispatchable"] = False
     rec["dispatch_requested"] = False
     rec["shadow"] = True
-    rec["kind"] = "polymarket_arb"
-    rec["arb_candidate"] = True
+    rec["kind"] = kind
+    rec["arb_candidate"] = kind == "polymarket_arb"
     print(
-        f"[shadow-pm-arb] intent={rec.get('intent_id','')} "
+        f"[shadow-pm-{kind}] intent={rec.get('intent_id','')} "
         f"dispatchable=false canonical_ok={compare.get('ok')} hook={PM_HOOK}"
     )
     return rec
+
+
+def emit_polymarket_entertainment_shadow(candidate: dict, queue_path: Optional[str] = None,
+                                         gates: Optional[dict] = None) -> dict:
+    """Oscars/awards/culture CLOB shadow. Never dispatchable. Same body stub."""
+    c = dict(candidate or {})
+    c.setdefault("strategy", "POLYMARKET_ENTERTAINMENT")
+    c["kind"] = "polymarket_entertainment"
+    c.setdefault("tags", ["entertainment"])
+    return emit_polymarket_arb_shadow(c, queue_path=queue_path, gates=gates)
 
 
 def polymarket_candidates_from_arb_log(doc) -> list:
@@ -412,7 +426,7 @@ def polymarket_candidates_from_arb_log(doc) -> list:
 
 def emit_venue_expansion_shadows(hl_candidates=None, pm_candidates=None,
                                  models_dir=None, queue_path=None,
-                                 gates=None):
+                                 gates=None, pm_ent_candidates=None):
     """Batch emit. Default: local JSON only (no HTTP). Returns list of recs."""
     if not getattr(vc, "NAUTILUS_SHADOW_VENUES", True):
         return []
@@ -425,9 +439,25 @@ def emit_venue_expansion_shadows(hl_candidates=None, pm_candidates=None,
     if pm_candidates is None:
         pm_candidates = polymarket_candidates_from_arb_log(
             _load_json(os.path.join(md, "latency_arb_log.json")))
+    if pm_ent_candidates is None:
+        try:
+            import polymarket_entertainment as pe
+            pm_ent_candidates = pe.candidates_from_doc(
+                _load_json(os.path.join(md, "polymarket_entertainment.json")))
+        except Exception:
+            pm_ent_candidates = []
     recs = []
     for c in hl_candidates or []:
         recs.append(emit_hl_short_shadow(c, queue_path=queue_path, gates=gates))
     for c in pm_candidates or []:
         recs.append(emit_polymarket_arb_shadow(c, queue_path=queue_path, gates=gates))
+    for c in pm_ent_candidates or []:
+        kind = str((c or {}).get("kind") or "")
+        cat = str((c or {}).get("category") or "")
+        if kind == "polymarket_entertainment" or cat in ("ENTERTAINMENT", "CULTURE"):
+            recs.append(emit_polymarket_entertainment_shadow(
+                c, queue_path=queue_path, gates=gates))
+        else:
+            recs.append(emit_polymarket_arb_shadow(
+                c, queue_path=queue_path, gates=gates))
     return recs

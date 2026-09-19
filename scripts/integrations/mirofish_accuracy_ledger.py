@@ -184,6 +184,11 @@ def record(signal_doc=None):
             neural = bool(isinstance(nblob, dict) and nblob.get("present"))
             if blob.get("neural_enriched") is True:
                 neural = True
+        tags = []
+        if isinstance(blob, dict):
+            raw_tags = blob.get("tags") or blob.get("opportunity_tags") or []
+            if isinstance(raw_tags, (list, tuple)):
+                tags = [str(t) for t in raw_tags]
         _append({
             "type": "prediction",
             "pred_id": f"{pid}_{asset}",
@@ -195,6 +200,7 @@ def record(signal_doc=None):
             "horizon_days": HORIZON_DAYS,
             "score_after": due,
             "neural_enriched": bool(neural),
+            "opportunity_tags": tags,
         })
         n += 1
     print(f"recorded {n} MiroFish predictions from real sim (source='{src}')")
@@ -302,6 +308,7 @@ def score(now=None, ftl_rows=None):
             "source": "forward_test_ledger",
             "scored_at": now.isoformat() if hasattr(now, "isoformat") else str(now),
             "neural_enriched": bool(p.get("neural_enriched")),
+            "opportunity_tags": list(p.get("opportunity_tags") or []),
         })
         n += 1
     print(f"scored {n} predictions")

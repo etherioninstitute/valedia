@@ -6,14 +6,16 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H7 SHIPPED. Arena offline paper stress harness (wrap of `adversarial_paper_fight`). VALEDIA_VERSION `0.32.0` tag `valedia-v0.32.0` tip `d0a29ab`. Prior: H6 `0.31.0`.
+**Current:** H8 + POLY-E SHIPPED. Version `0.33.0` tag `valedia-v0.33.0`. Prior: H7 0.32.0.
 
-**Tests:** `test_h7.py` PASS. `test_adversarial_paper_fight.py` PASS. `test_h6.py` PASS. `test_slice12.py` / `test_nautilus_intent.py` / `test_h2` / `test_h3` / `test_h4` / `test_h5` / `test_nt1` / `test_nt2` / `test_slice23` / `test_dynamic_band` PASS.
+**Tests:** `test_h8.py` PASS. `test_poly_e.py` PASS. `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice11.py` / `test_slice12.py` / `test_slice10.py` / `test_slice23.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-H7.md`
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-H8.md` + `recommendations/PONYTAIL-AUDIT-POLY-E.md`
 
-**H7:** `arena_stress.py` — personas/primes fight, scored on fee-true FTL. Risk veto records disagreement; never orders. `ARENA_MODE=paper`. LN/faucet refused (`funded=False` even if keys present). No crontab. No `FUSION_WEIGHTS["arena"]`.
+**H8:** `intel_fetch_fallback.py` — classify `{ok,empty,blocked,waf}`; `FORTRESS_INTEL_FALLBACK` default False; engine PARKED (no Colima/Docker/CDP); venue hosts refused; token-capped headlines → `models/intel_fetch_fallback.json`. Seed `_get` observe hook. No second Kelly.
 
-**Fence:** No `--live`, no venue orders, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN/Arena funding, no crontab for ADV/H7. `NAUTILUS_ENABLED` unchanged (False). `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False.
+**POLY-E:** `polymarket_entertainment.py` — nav buckets Sports/Politics/Crypto/Weather/Tech/Culture/Econ (Culture = Oscars). Gatherer tags + category aliases. Shadow Intents via existing CLOB stub; `LIVE_CLIENT_HOOK=None`; writer `none`. POST-ack ≠ filled (`resolve_polymarket_fill` by order/trade id). Cutover: `POLYMARKET-ENTERTAINMENT-CUTOVER.md` — **do not flip**.
 
-**Next:** STOP for Burton (H8 fortress optional next — do not auto-start).
+**Fence:** No `--live`, no venue orders, no API-key edits, no `VENUE_WRITER` flips, no `SPOT_RECONCILE_HTTP`, no `NAUTILUS_LIVE`, no LN, no crontab. `MIROFISH_AUTO_RAISE` False. `VALEDIA_SELF_ADJUST` False. `FORTRESS_INTEL_FALLBACK` False.
+
+**Next:** STOP.

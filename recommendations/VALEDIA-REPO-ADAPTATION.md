@@ -46,7 +46,7 @@ Out of scope for trading adapt: `youtube-automation-agent`, `CLI-Anything` unles
 | **H5** | hypergrok desk role pattern (research/risk/review) as optional RuFlo/Valedia swarm, no HL live |
 | **H6** | Nautilus deepen shadow parity / event model (still no NAUTILUS_LIVE) |
 | **H7** | Arena as offline strategy stress harness (no funded sats unless Burton) |
-| **H8** | fortress sidecar doc + optional hook behind intel fetch failures |
+| **H8** | fortress sidecar doc + optional hook behind intel fetch failures — **SHIPPED 0.33.0** (flag off, engine parked) |
 
 STOP between major slices for Burton. NT-2 completes Arc G wiring first; then H1.
 

@@ -17,9 +17,9 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.32.0 = H7 Arena offline paper stress / FTL score).
+# Runtime identity (0.33.0 = H8 fortress intel fallback + POLY-E entertainment path).
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.32.0"
+VALEDIA_VERSION = "0.33.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -105,6 +105,11 @@ PAUSE_TTL_DAYS = 7
 # Enabling live GET is a Valedia go, not a coding-agent go.
 SPOT_RECONCILE_HTTP = False
 
+# H8 fortress intel fallback. DEFAULT OFF. Failure-gated after 403/429/empty/WAF
+# only. Engine is PARKED on this Mac (no Colima/Docker/CDP). This lane never
+# sets True. Env FORTRESS_INTEL_FALLBACK=1 is a Burton/Valedia flip.
+FORTRESS_INTEL_FALLBACK = False
+
 # Rebalancer auto-exec. Default OFF. Shadow/propose only until Burton flips:
 #   export REBALANCER_AUTOEXEC=1
 # AND passes live_flag gates. This lane never sets True. NT never writes.
@@ -174,6 +179,16 @@ def spot_reconcile_http_enabled():
     (unset, empty, 0, false) is OFF. Default constant is False.
     """
     return _env_flag("SPOT_RECONCILE_HTTP", SPOT_RECONCILE_HTTP)
+
+
+def fortress_intel_fallback_enabled():
+    """True only if Burton flipped FORTRESS_INTEL_FALLBACK. Default False.
+
+    Does not start CDP, Docker, or Colima. Engine stays PARKED/fail-closed
+    until a later Linux sidecar. Env FORTRESS_INTEL_FALLBACK=1 wins.
+    This lane never sets the constant True.
+    """
+    return _env_flag("FORTRESS_INTEL_FALLBACK", FORTRESS_INTEL_FALLBACK)
 
 
 def self_adjust_enabled():

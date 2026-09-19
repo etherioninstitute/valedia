@@ -30,7 +30,18 @@ EQUITIES = [
 
 def _get(url, **kw):
     kw.setdefault("timeout", 15); kw.setdefault("headers", UA)
-    return requests.get(url, **kw)
+    r = requests.get(url, **kw)
+    try:
+        import intel_fetch_fallback as iff
+        body = ""
+        try:
+            body = r.text[:4000]
+        except Exception:
+            body = ""
+        iff.observe(url, r.status_code, body, dict(r.headers))
+    except Exception:
+        pass
+    return r
 
 
 def crypto_section():
@@ -203,6 +214,11 @@ def build_seed():
             with open(sig_path) as f:
                 sig = json.load(f) or {}
         text = pl.apply_seed_text(text, signal_doc=sig)
+    except Exception:
+        pass
+    try:
+        import polymarket_entertainment as pe
+        text = pe.apply_seed_text(text)
     except Exception:
         pass
     return text

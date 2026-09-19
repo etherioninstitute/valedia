@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **H8 + POLY-E SHIPPED.** Version `0.33.0` tag `valedia-v0.33.0`. Prior H7 `0.32.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+
+## H8 + POLY-E (Grok Build executor, `valedia-v2-grok-build`)
+- H8: `intel_fetch_fallback.py` failure-gated `{ok,empty,blocked,waf}` after 403/429/empty/WAF. Engine PARKED. `test_h8.py` PASS. Ponytail: `PONYTAIL-AUDIT-H8.md`.
+- POLY-E: Oscars/Culture + Sports/Politics/Crypto/Weather/Tech/Econ path. Shadow only. Fill-true GET-by-id. Cutover doc does not flip. `test_poly_e.py` PASS. Ponytail: `PONYTAIL-AUDIT-POLY-E.md`.
+- Fence held. Do not enable live Polymarket / NT live / Arena funding.
+
+---
+
 Updated: 2026-09-18 PT — **H7 SHIPPED.** Version `0.32.0` tag `valedia-v0.32.0` tip `d0a29ab`. Prior H6 `0.31.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H8. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False.
 
 ## H7 (Grok Build executor, `valedia-v2-grok-build`)
