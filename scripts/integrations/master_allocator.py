@@ -50,17 +50,40 @@ MIN_EV_PER_DOLLAR = 0.03      # Minimum 3% expected return to deploy
 # STEP 1: Gather capital from ALL platforms
 # ═══════════════════════════════════════════════════════════════
 
+def venue_deployable(cash, deployed, pct=MAX_TOTAL_DEPLOY_PCT):
+    """Per-venue fuse: (cash + positions) * pct - positions. Never mix other venues."""
+    cash = max(0.0, float(cash or 0))
+    deployed = max(0.0, float(deployed or 0))
+    return max(0.0, (cash + deployed) * float(pct) - deployed)
+
+
+def _writer_is_valedia(venue):
+    if _cfg is None:
+        return True
+    try:
+        return _cfg.venue_writer(venue) == "valedia"
+    except Exception:
+        return True
+
+
 def get_total_capital():
-    """Get available capital across all platforms."""
-    capital = {"kalshi": 0, "coinbase_usd": 0, "coinbase_usdc": 0,
-               "alpaca": 0, "total": 0, "deployed": 0}
+    """Get available capital across platforms.
+
+    Deployable is per-venue. Kalshi-only (CB/Alpaca writer none) uses Kalshi
+    cash+positions fuse so Alpaca equity cannot zero Kalshi deployable.
+    """
+    capital = {"kalshi": 0.0, "kalshi_deployed": 0.0,
+               "coinbase_usd": 0.0, "coinbase_usdc": 0.0,
+               "alpaca": 0.0, "alpaca_equity": 0.0, "alpaca_deployed": 0.0,
+               "total": 0.0, "deployed": 0.0, "kalshi_deployable": 0.0,
+               "deployable": 0.0}
     
     # Kalshi
     try:
         from kalshi_auth import get_balance
         bal = get_balance()
         capital["kalshi"] = bal.get("balance", 0) / 100
-        capital["deployed"] += bal.get("portfolio_value", 0) / 100
+        capital["kalshi_deployed"] = bal.get("portfolio_value", 0) / 100
     except: pass
     
     # Coinbase
@@ -76,13 +99,31 @@ def get_total_capital():
         from alpaca_executor import get_account
         acct = get_account()
         capital["alpaca"] = float(acct.get("cash", 0))
-        capital["deployed"] += float(acct.get("equity", 0)) - float(acct.get("cash", 0))
+        capital["alpaca_equity"] = float(acct.get("equity", 0))
+        capital["alpaca_deployed"] = max(
+            0.0, capital["alpaca_equity"] - capital["alpaca"])
     except: pass
-    
-    capital["total"] = (capital["kalshi"] + capital["coinbase_usd"] +
-                        capital["coinbase_usdc"] + capital["alpaca"])
-    capital["deployable"] = capital["total"] * MAX_TOTAL_DEPLOY_PCT - capital["deployed"]
-    capital["deployable"] = max(0, capital["deployable"])
+
+    capital["kalshi_deployable"] = venue_deployable(
+        capital["kalshi"], capital["kalshi_deployed"])
+    cb_cash = capital["coinbase_usd"] + capital["coinbase_usdc"]
+    cb_deployable = venue_deployable(cb_cash, 0.0)
+    alp_deployable = venue_deployable(capital["alpaca"], capital["alpaca_deployed"])
+
+    deployable = 0.0
+    deployed = 0.0
+    if _writer_is_valedia("kalshi"):
+        deployable += capital["kalshi_deployable"]
+        deployed += capital["kalshi_deployed"]
+    if _writer_is_valedia("coinbase"):
+        deployable += cb_deployable
+    if _writer_is_valedia("alpaca"):
+        deployable += alp_deployable
+        deployed += capital["alpaca_deployed"]
+
+    capital["total"] = (capital["kalshi"] + cb_cash + capital["alpaca"])
+    capital["deployed"] = deployed
+    capital["deployable"] = max(0.0, deployable)
     return capital
 
 # ═══════════════════════════════════════════════════════════════
@@ -418,7 +459,8 @@ def execute_allocations(allocations, dry_run=False):
 
         # Slice 8 live-exec fence: weather/oil may be sized when unpaused, but
         # this lane never places their orders. Unpause ≠ create_order / alp_buy.
-        if _cfg and _cfg.live_exec_fenced(cat):
+        # Oil also fenced by ticker family (KXWTI/KXOIL/WTI) when tagged NO_HARVEST.
+        if _cfg and _cfg.live_exec_fenced(cat, ticker=a.get("ticker")):
             r["status"] = "SKIP_LIVE_FENCE"
             r["error"] = "live exec fenced (Slice 8); evaluation/sizing only"
             results.append(r)
@@ -532,6 +574,11 @@ def execute_allocations(allocations, dry_run=False):
                         r["order_id"] = fill["order_id"]
             
             elif a["platform"] == "coinbase":
+                if _cfg and _cfg.venue_writer("coinbase") != "valedia":
+                    r["status"] = "SKIP_WRITER"
+                    r["error"] = "coinbase writer not valedia (Kalshi-only stage)"
+                    results.append(r)
+                    continue
                 # Shadow Intent (Slice 2): never dispatchable; writer stays valedia.
                 try:
                     from nautilus_shadow_coinbase import emit_allocator_shadow
@@ -559,6 +606,11 @@ def execute_allocations(allocations, dry_run=False):
                     r["error"] = str(e)[:80]
             
             elif a["platform"] == "alpaca":
+                if _cfg and _cfg.venue_writer("alpaca") != "valedia":
+                    r["status"] = "SKIP_WRITER"
+                    r["error"] = "alpaca writer not valedia (Kalshi-only stage)"
+                    results.append(r)
+                    continue
                 # Stock trades via Alpaca (existing Valedia writer)
                 try:
                     from alpaca_executor import place_order

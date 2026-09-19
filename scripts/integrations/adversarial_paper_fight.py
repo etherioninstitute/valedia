@@ -171,7 +171,9 @@ def lens_mirofish_enriched(opp):
 
 def lens_risk_veto(opp, others, ctx):
     reasons = []
-    fenced = vc.live_exec_fenced(opp.get("strategy") or (opp.get("raw") or {}).get("strategy"))
+    fenced = vc.live_exec_fenced(
+        opp.get("strategy") or (opp.get("raw") or {}).get("strategy"),
+        ticker=opp.get("ticker") or (opp.get("raw") or {}).get("ticker"))
     if fenced:
         reasons.append("live-exec fenced strategy")
     ere = ctx.get("ere") if isinstance(ctx.get("ere"), dict) else {}

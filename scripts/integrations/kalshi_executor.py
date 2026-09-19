@@ -368,6 +368,11 @@ def execute_trade(opp, state, dry_run=False):
     if dry_run:
         result["status"] = "DRY_RUN"
         return result
+
+    if _cfg is not None and _cfg.live_exec_fenced(opp.get("strategy"), ticker=opp.get("ticker")):
+        result["status"] = "SKIP_LIVE_FENCE"
+        result["error"] = "live exec fenced (strategy or oil ticker family)"
+        return result
     
     try:
         order = create_order(
@@ -412,18 +417,36 @@ def _log_trade(result):
 # OPPORTUNITY REPORT — cross-platform profit potential
 # ═══════════════════════════════════════════════════════════════
 
-def opportunity_report():
+def constrained_scan_profit(sims, cash, deployable):
+    """Fee-true sim profit for picks that fit remaining cash. Picks compete; not additive."""
+    remaining = min(max(0.0, float(cash or 0)), max(0.0, float(deployable or 0)))
+    profit = 0.0
+    for sim in sims:
+        cost = float(sim.get("total_cost") or 0)
+        pot = float(sim.get("potential_profit") or 0)
+        if cost <= 0:
+            continue
+        if cost <= remaining + 1e-9:
+            profit += pot
+            remaining -= cost
+    return profit
+
+
+def opportunity_report(state=None, opps=None):
     """Generate a comprehensive profit opportunity report across all platforms.
-    This is what gets sent to Signal when opportunities are hot."""
+    This is what gets sent to Signal when opportunities are hot.
+    Scan numbers are fee-true Kalshi sims, not fills / not realized P&L."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"💰 VALEDIA OPPORTUNITY SCAN ({ts}) [not fills / not realized P&L]", ""]
     
     # 1. Kalshi state
-    state = get_state()
+    if state is None:
+        state = get_state()
     lines.append(f"KALSHI: ${state['balance']:.2f} cash | ${state['portfolio_value']:.2f} deployed | {state['n_positions']} positions")
     
     # 2. Scan all opportunities
-    opps = scan_all_markets()
+    if opps is None:
+        opps = scan_all_markets()
     if not opps:
         lines.append("  No opportunities found this scan.")
         return "\n".join(lines)
@@ -435,8 +458,8 @@ def opportunity_report():
         if s not in by_strat: by_strat[s] = []
         by_strat[s].append(o)
     
-    total_potential = 0
     total_deployable = state["max_deployable"]
+    fitted_sims = []
     
     # 4. Show top opportunities per strategy
     for strat in ["ARBITRAGE","EXPIRY_SCALP","NO_HARVEST","SPORTS_FAVORITE","MACRO_EDGE"]:
@@ -445,27 +468,33 @@ def opportunity_report():
         lines.append(f"\n{strat} ({len(group)} opportunities):")
         for o in group[:5]:
             sim = execute_trade(o, state, dry_run=True)
+            fitted_sims.append(sim)
             pot = sim.get("potential_profit", 0)
             roi = sim.get("roi_pct", 0)
-            total_potential += pot
             exp_label = f"{o['hours_to_exp']:.0f}h" if o['hours_to_exp'] < 720 else f"{o['hours_to_exp']/720:.0f}mo"
+            fenced = False
+            if _cfg is not None:
+                try:
+                    fenced = _cfg.live_exec_fenced(o.get("strategy"), ticker=o.get("ticker"))
+                except Exception:
+                    fenced = False
+            tag = " [FENCED/SKIP_LIVE_FENCE]" if fenced else ""
             lines.append(
                 f"  ${sim.get('total_cost',0):.2f}→${pot:.2f} "
-                f"({roi:+.0f}% ROI) exp:{exp_label} | {o['title'][:50]}"
+                f"({roi:+.0f}% ROI) exp:{exp_label} | {o['title'][:50]}{tag}"
             )
             lines.append(f"    {o['rationale']}")
     
-    # 5. Summary: what you COULD make
-    lines.append(f"\n═══ PROFIT POTENTIAL ═══")
+    # 5. Summary: cash-constrained fee-true sim (picks compete — do not sum as portfolio)
+    fit_profit = constrained_scan_profit(fitted_sims, state.get("balance"), total_deployable)
+    lines.append(f"\n═══ PROFIT POTENTIAL (fee-true Kalshi sim, not broker fills) ═══")
     lines.append(f"  With current ${state['balance']:.2f}: deploy up to ${total_deployable:.2f}")
-    lines.append(f"  Estimated profit from top picks: ${total_potential:.2f}")
-    if total_potential > 0 and state['balance'] > 0:
-        lines.append(f"  ROI on deployed capital: {total_potential/min(total_deployable,state['balance'])*100:.0f}%")
+    lines.append(f"  Estimated profit from top picks that fit cash (not additive): ${fit_profit:.2f}")
     
-    # 6. (Removed — deposit recommendations consolidated in section 8 below)
-    
-    # 7. Cross-platform context (Coinbase, Alpaca)
-    lines.append(f"\nCROSS-PLATFORM:")
+    # 6. Deposit illustrations deleted — averaging edge/price invented 100%+ ROI.
+
+    # 7. Cross-platform context (Coinbase, Alpaca) — broker cash/equity, not P&L
+    lines.append(f"\nCROSS-PLATFORM (broker cash/equity, not P&L):")
     total_capital = state["balance"] + state["portfolio_value"]
     try:
         from coinbase_trader import get_balances
@@ -487,18 +516,7 @@ def opportunity_report():
     except Exception as e:
         lines.append(f"  Alpaca: error ({str(e)[:40]})")
     
-    lines.append(f"\n  TOTAL CAPITAL ACROSS ALL PLATFORMS: ${total_capital:.2f}")
-    
-    # 8. The deposit recommendation Burton wants
-    lines.append(f"\n═══ WHAT EXTRA CAPITAL COULD DO ═══")
-    # Calculate expected return rate from current best opportunities
-    if opps:
-        best_edges = [o["edge"] / (o["price"] + 0.01) for o in opps[:20] if o["edge"] > 0 and o["price"] > 0]
-        avg_roi = sum(best_edges) / (len(best_edges) + 1) * 100
-        for extra in [50, 100, 200, 500, 1000]:
-            extra_profit = extra * MAX_DEPLOYED_PCT * (avg_roi / 100)
-            if extra_profit > 1:
-                lines.append(f"  💰 Deposit ${extra} → ~${extra_profit:.2f} expected profit ({avg_roi:.0f}% avg ROI on top picks)")
+    lines.append(f"\n  TOTAL CAPITAL ACROSS ALL PLATFORMS (broker): ${total_capital:.2f}")
     
     return "\n".join(lines)
 
@@ -563,6 +581,11 @@ def run(dry_run=False, max_trades=5, min_score=40):
         if state["max_deployable"] < 0.10:
             lines.append("  Max deployment reached, stopping.")
             break
+
+        if not dry_run and _cfg is not None and _cfg.live_exec_fenced(
+                opp.get("strategy"), ticker=opp.get("ticker")):
+            lines.append(f"  ⊘ SKIP_LIVE_FENCE {opp.get('ticker','?')} [{opp.get('strategy','?')}]")
+            continue
 
         # Advisory execution plan (fee-drag/book-quality/urgency). ADVISORY-ONLY: it only VETOES
         # a poor-execution entry (no_trade) and annotates maker/taker — sizing/entry stays with

@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.41.0 = POLY-LEARN paper classroom + profit-path inventory).
-# Prior 0.40.0 = OPENTERMINAL-VALEDIA. Prior 0.39.0 = KILL-SWITCH.
+# Runtime identity (0.42.0 = SCAN-ACCURACY: honest Signal scan, oil ticker fence, Kalshi deployable).
+# Prior 0.41.0 = POLY-LEARN. Prior 0.40.0 = OPENTERMINAL-VALEDIA. Prior 0.39.0 = KILL-SWITCH.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.41.0"
+VALEDIA_VERSION = "0.42.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -61,6 +61,8 @@ FUSION_WEIGHTS = {
 # Alias KILLED_STRATEGIES kept for Slice 8 tests.
 LIVE_EXEC_FENCED = frozenset({"WEATHER_ARB", "OIL_BRACKET"})
 KILLED_STRATEGIES = LIVE_EXEC_FENCED
+# Scanner may tag KXWTI/KXOIL as NO_HARVEST/CONVICTION_*; name-only fence misses those.
+LIVE_EXEC_FENCED_SERIES = frozenset({"KXWTI", "KXOIL"})
 
 # MicroScalper / weather live buys. This lane never sets True.
 SCALPER_LIVE = False
@@ -419,18 +421,37 @@ def weather_live_enabled():
     return False
 
 
-def is_killed_strategy(name):
+def ticker_family_fenced(ticker):
+    """True if ticker/series is an oil bracket (KXWTI / KXOIL / WTI). Not an unfence."""
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    series = t.split("-", 1)[0]
+    for prefix in LIVE_EXEC_FENCED_SERIES:
+        if series == prefix or series.startswith(prefix):
+            return True
+    return series == "WTI" or series.startswith("WTI")
+
+
+def is_killed_strategy(name, ticker=None):
     """Live-exec fence. True means do not place orders. Not a learning grave."""
-    return live_exec_fenced(name)
+    return live_exec_fenced(name, ticker=ticker)
 
 
-def live_exec_fenced(name):
-    """True if this strategy must not place live orders (Slice 8 fence).
+def live_exec_fenced(name, ticker=None):
+    """True if this strategy or ticker family must not place live orders.
 
     Independent of learning pause. Unpause / TTL expiry re-enters evaluation
     and Kelly/category gating only. This lane never lifts the fence.
+    Name fence: WEATHER_ARB / OIL_BRACKET. Series fence: KXWTI / KXOIL / WTI
+    even when the scanner labeled the pick NO_HARVEST.
     """
-    return str(name or "").strip().upper() in LIVE_EXEC_FENCED
+    n = str(name or "").strip().upper()
+    if n in LIVE_EXEC_FENCED:
+        return True
+    if ticker_family_fenced(ticker):
+        return True
+    return ticker_family_fenced(n)
 
 
 def effective_mirofish_weight():

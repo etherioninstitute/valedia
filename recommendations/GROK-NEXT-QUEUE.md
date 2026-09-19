@@ -8,7 +8,14 @@
 5. **OPENTERMINAL-VALEDIA (Grok Build only)** — done `0.40.0` / `3327adc` (`OPENTERMINAL-VALEDIA.md`, read-only glance :8765)
 6. **Staged ON** — Kalshi-only already live (Burton 2026-09-19); Poly still dry.
 7. **POLY-LEARN** — done `0.41.0` (`POLY-LEARN.md`, `PROFIT-PATHS-INVENTORY.md`; no POLYMARKET_US_LIVE flip).
+7b. **SCAN-ACCURACY** — done `0.42.0` (honest Signal scan, oil ticker-family fence, Kalshi per-venue deployable).
 8. Wider venue ON — Burton go only.
+
+## SCAN-ACCURACY (done 0.42.0)
+- Signal `opportunity_report`: no invented 100%+ ROI; extra-capital block deleted; fee-true sim, picks compete.
+- Oil live fence by ticker family (`KXWTI`/`KXOIL`/`WTI`) even when strategy is `NO_HARVEST`.
+- Kalshi deployable per-venue; CB/Alpaca writer `none` cannot zero Kalshi cash.
+- Next = Burton. Do not unfence weather/oil. Do not restore writers.
 
 ## POLY-LEARN (done 0.41.0)
 - Paper classroom: market-by-slug + BBO/book, `poly_learn.py` → `models/poly_us_proposals.json` **DRY/SHADOW**. Allocator execute never `create_order`.
@@ -23,3 +30,5 @@
 ## Notes
 - Live OpenTerminal market terminal may already be at localhost:3000 (API :4010); Valedia widgets are the Build deliverable.
 - Signal P&L remains truthful broker tracker; UI must not pretend FTL when n=0.
+
+7b. **SCAN-ACCURACY** — done `0.42.0`. Next = Burton.
