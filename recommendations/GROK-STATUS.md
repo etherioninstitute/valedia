@@ -8,7 +8,7 @@
 
 **Current:** MIROFISH-SMOKE SHIPPED. Prior: TREASURY-1 0.36.0.
 
-**Version:** `0.37.0` tag `valedia-v0.37.0` (this commit). Prior: TREASURY-1 `0.36.0` `93f9b66`.
+**Version:** `0.37.0` tag `valedia-v0.37.0` tip `5b49cc1`. Prior: TREASURY-1 `0.36.0` `93f9b66`.
 
 **Tests:** `test_mirofish_smoke.py` PASS offline. Harness `mirofish_smoke.py` PASS (fixture 6ms, live-lite 7.4s on `:11435` `qwen3-8b-mf:latest`, wall 7.44s). `test_nt2.py` / `test_slice23.py` PASS. No production ledger writes. No live flips.
 

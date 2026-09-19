@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **MIROFISH-SMOKE SHIPPED.** Version `0.37.0` tag `valedia-v0.37.0`. Prior TREASURY-1 `0.36.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
+Updated: 2026-09-18 PT — **MIROFISH-SMOKE SHIPPED.** Version `0.37.0` tag `valedia-v0.37.0` tip `5b49cc1`. Prior TREASURY-1 `0.36.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False.
 
 ## MIROFISH-SMOKE (Grok Build executor, `valedia-v2-grok-build`)
 - Minutes-scale wiring gate. `mirofish_smoke.py`: fixture always (synthetic seed→extractor→neural tag→mocked fee-true ledger→gatherer). Live-lite one Ollama/LMS ping ≤90s; SKIP if down.
