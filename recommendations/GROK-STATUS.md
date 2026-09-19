@@ -8,7 +8,7 @@
 
 **Current:** KILL-SWITCH SHIPPED. Next=OPENTERMINAL-VALEDIA (do not auto-start this session — STOP for parent chain).
 
-**Version:** `0.39.0` tag `valedia-v0.39.0` tip (this commit). Prior: `0.38.0` `cdbec1b`.
+**Version:** `0.39.0` tag `valedia-v0.39.0` tip `4b7b6d3`. Prior: `0.38.0` `cdbec1b`.
 
 **Tests:** `test_kill_switch.py` PASS offline. Version-bumped: slice23 / h3 / h4 / treasury / mirofish_smoke / poly_us / h2 / h5–h8 / nt1 / nt2 / poly_e / adversarial / valedia_full_smoke. No production ledger writes. No live flips.
 
