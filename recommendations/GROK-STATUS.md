@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** CBM-SMOKE PASS. H3 tagged `valedia-v0.28.0` (`57bddba`). H4 shipping 0.29.0 (OpenTerminal GET panel).
+**Current:** CBM-SMOKE PASS. H3 `0.28.0` tag `valedia-v0.28.0` tip `57bddba`. H4 `0.29.0` tag `valedia-v0.29.0` tip `16acf13`.
 
 **Tests:** `test_h3.py` PASS. `test_h4.py` PASS. `test_kalshi_fill_ledger` / `test_slice23` / `test_h2` / `test_nt1` / `test_nt2` / `test_adversarial_paper_fight` PASS.
 

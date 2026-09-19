@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **H3+H4 SHIPPED.** H3 `0.28.0` tag `valedia-v0.28.0` tip `57bddba` (Kalshi fill-true GET poll). H4 `0.29.0` OpenTerminal GET panel (this commit). CBM-SMOKE PASS. **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
+Updated: 2026-09-18 PT — **H3+H4 SHIPPED.** H3 `0.28.0` tag `valedia-v0.28.0` tip `57bddba`. H4 `0.29.0` tag `valedia-v0.29.0` tip `16acf13`. CBM-SMOKE PASS. **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
 
 ## H3 / H4 (Grok Build executor, `valedia-v2-grok-build`)
 - H3: `resolve_kalshi_fill` — POST-ack is not a fill; GET `/portfolio/fills` may upgrade when `order_id` matches. sports / allocator / executor aligned. `test_h3.py` PASS. Ponytail: `PONYTAIL-AUDIT-H3.md`.
