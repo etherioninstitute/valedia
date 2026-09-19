@@ -8,7 +8,7 @@
 
 **Current:** SCAN-ACCURACY SHIPPED. Next=Burton.
 
-**Version:** `0.42.0` tag `valedia-v0.42.0`. Prior: `0.41.0` `a211b8d`.
+**Version:** `0.42.0` tag `valedia-v0.42.0` tip `02298ad`. Prior: `0.41.0` `a211b8d`.
 
 **Tests:** `test_scan_accuracy.py` PASS (honest Signal scan, oil `NO_HARVEST` ticker fence, Kalshi deployable > 0 with CB/Alpaca writers none). Also slice8/9/23, h3, poly_learn, kill_switch, version-bumped suite.
 
