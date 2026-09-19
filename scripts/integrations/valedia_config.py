@@ -17,9 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.34.0 = POLY-US API matrix). Prior 0.33.0 = H8+POLY-E.
+# Runtime identity (0.35.0 = POLY-US-2 retail whoami + preview dry-run).
+# Prior 0.34.0 = POLY-US API matrix. Prior 0.33.0 = H8+POLY-E.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.34.0"
+VALEDIA_VERSION = "0.35.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md

@@ -12,7 +12,8 @@ Fill-true (H3 / POLY-E habit): **preview ≠ create**; **create ack ≠ fill**. 
 | API | Method / path | Auth | Needed for max-profit | Valedia status | Fill-true notes |
 |-----|---------------|------|----------------------|----------------|-----------------|
 | Auth (Key ID + Secret, Ed25519 headers) | `X-PM-Access-Key` / `Timestamp` / `Signature` | yes | yes (orders + portfolio) | **tested-mock** | Keys from env only. Missing keys → mock HTTP. |
-| Whoami | `GET /v1/whoami` | yes | identity check | **stub** (wired; retail vs institutional host may 404) | Not a fill. |
+| Whoami (institutional) | `GET /v1/whoami` on `api.prod.polymarketexchange.com` | bearer JWT | no (not this lane) | **out of scope** | Institutional FIX/gRPC host. **404 on `api.polymarket.us`.** Do not call from retail client. |
+| Whoami (retail) | identity = `GET /v1/account/balances` (`whoami()` / `whoami_retail()`) | Ed25519 | yes (auth check) | **tested-mock** | Returns `{ok, source:"balances", balances:[redacted], positions_n?}`. Not a fill. |
 | Account balances | `GET /v1/account/balances` | yes | yes (buying power / fee gate) | **tested-mock** | Read-only. Optional live smoke if keys present. |
 | Markets list | `GET /v1/markets` | public | yes (universe) | **tested-mock** | Gateway only. Not CLOB Gamma. |
 | Market by slug/id, BBO, book, settlement, price history | `GET /v1/markets/...` | public | yes (price/size) | **missing** (list only this slice) | Add when sizing US live. |
@@ -22,7 +23,7 @@ Fill-true (H3 / POLY-E habit): **preview ≠ create**; **create ack ≠ fill**. 
 | Sports (leagues/events) | `GET /v1/sports` + sports-by-slug | public | sports max-profit | **stub** (`list_sports`) | Nav uses tag `sports`. |
 | Tags + events-for-tag | `GET /v1/tags`, `GET /v2/tags/{slug}/events` | public | **yes** (category nav) | **tested-mock** | Sports/Politics/Crypto/Weather/Tech/Culture/Econ. |
 | Series | `GET /v1/series` | public | later | **missing** | |
-| Order preview | `POST /v1/order/preview` | yes | **yes** (dry-run before live) | **tested-mock** | **Not a create. Not a fill.** |
+| Order preview | `POST /v1/order/preview` body `{request: order}` | yes | **yes** (dry-run before live) | **tested-mock** | **Not a create. Not a fill.** Unwrapped body 400s (`Request is required`). |
 | Create order | `POST /v1/orders` | yes | live path only | **tested-mock, LIVE-gated** | Ack `{id}` ≠ fill. `POLYMARKET_US_LIVE` default False. |
 | Get order | `GET /v1/order/{orderId}` | yes | **yes** (reconcile) | **tested-mock** | FILLED/`cumQuantity`/`tradeId` on GET only. |
 | Open orders | `GET /v1/orders/open` | yes | yes (open risk) | **tested-mock** | |
@@ -35,6 +36,8 @@ Fill-true (H3 / POLY-E habit): **preview ≠ create**; **create ack ≠ fill**. 
 | Markets WebSocket | `wss://api.polymarket.us/v1/ws/markets` | public/auth | book | **missing** | |
 | Combos / RFQ / incentives / institutional FIX/gRPC | various | mixed | not this lane | **missing** | Out of scope. |
 
-**Max-profit path (US, still fenced):** public tag-nav + markets → preview → (Burton live later) create → GET order/trade id → fee-true FTL. Writer flip is **not** this slice.
+**Retail vs institutional:** `api.polymarket.us` + Ed25519 Key ID/Secret. `GET /v1/whoami` and `POST /v1/trading/orders/preview` belong to `api.prod.polymarketexchange.com` (bearer JWT). Retail preview is `POST /v1/order/preview`. Retail identity is balances.
+
+**Max-profit path (US, still fenced):** public tag-nav + markets → preview → (Burton live later) create → GET order/trade id → fee-true FTL. Writer flip is **not** this slice. Preview dry-run: `scripts/integrations/poly_us_smoke.py` (`POLYMARKET_US_HTTP=1`, `POLYMARKET_US_LIVE=0`).
 
 **Do not confuse with Int'l:** CLOB `POST /order` + Gamma `/markets` in `polymarket_client.py` / `polymarket_order_body.py`. US uses `marketSlug` + `ORDER_INTENT_*`, not CLOB `tokenID`.

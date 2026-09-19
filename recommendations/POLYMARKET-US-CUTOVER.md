@@ -39,7 +39,7 @@ Int'l CLOB ≠ US DCM. Do not point this client at `clob.polymarket.com`.
    Never commit. Never paste into this worktree.
 3. Fund the US account (debit / ACH / wire per docs). Funding is not a trade.
 4. Read-only smoke: balances + markets (`POLYMARKET_US_HTTP=1`, `POLYMARKET_US_LIVE` unset).
-5. Dry-run **preview** only (`POST /v1/order/preview`). Confirm preview ≠ create.
+5. Dry-run **preview** only (`POST /v1/order/preview`). Confirm preview ≠ create. Harness: `python3 scripts/integrations/poly_us_smoke.py` (`POLYMARKET_US_HTTP=1`, `POLYMARKET_US_LIVE` stays 0).
 6. Prove GET-by-id upgrades `UNRECONCILED` → `FILLED` on a paper/sandbox or a single tiny fill **after** Burton explicitly sets `POLYMARKET_US_LIVE=1` on runtime — not in this coding lane.
 7. **Do not flip** `VENUE_WRITER["polymarket"]`. One writer. Leverage stays 0. No second Kelly.
 
@@ -49,4 +49,4 @@ Int'l CLOB ≠ US DCM. Do not point this client at `clob.polymarket.com`.
 python3 -c "import valedia_config as vc, polymarket_order_body as p, polymarket_us_client as u; print(vc.VALEDIA_VERSION, vc.VENUE_WRITER['polymarket'], vc.NAUTILUS_LIVE, p.LIVE_CLIENT_HOOK, u.live_enabled())"
 ```
 
-Expect: `0.34.0 none False None False`
+Expect: `0.35.0 none False None False`

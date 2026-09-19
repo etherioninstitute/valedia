@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""POLY-US — Polymarket US DCM client. Mocked. No live orders.
+"""POLY-US-2 — Polymarket US DCM client. Mocked. No live orders.
 
-No network unless keys present (optional read-only smoke).
+No network unless keys present (optional live-http skip if no keys).
 No VENUE_WRITER flip, no LIVE_CLIENT_HOOK, no create in tests.
 Run: python3 test_poly_us.py
 """
@@ -13,6 +13,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
 import forward_test_ledger as ftl
+import poly_us_smoke as smoke
 import polymarket_order_body as pmob
 import polymarket_us_client as pmu
 import valedia_config as vc
@@ -61,7 +62,10 @@ class MockXport:
             return {"order": {"id": path.rsplit("/", 1)[-1],
                               "state": "ORDER_STATE_NEW", "cumQuantity": 0}}
         if path == "/v1/order/preview":
-            return {"order": {"marketSlug": (body or {}).get("marketSlug")}}
+            inner = body or {}
+            if isinstance(inner.get("request"), dict):
+                inner = inner["request"]
+            return {"order": {"marketSlug": inner.get("marketSlug")}}
         if path == "/v1/orders":
             return {"id": "ord-us-1"}
         if path.endswith("/cancel"):
@@ -99,6 +103,7 @@ def test_hygiene_and_fence():
     assert "clob.polymarket.com" in clob
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "polymarket_us_client" not in cron
+    assert "poly_us_smoke" not in cron
     cut = open(os.path.join(ROOT, "recommendations",
                             "POLYMARKET-US-CUTOVER.md")).read()
     assert "do not flip" in cut.lower()
@@ -108,7 +113,16 @@ def test_hygiene_and_fence():
                                "POLYMARKET-US-API-MATRIX.md")).read()
     assert "preview" in matrix.lower()
     assert "websocket" in matrix.lower()
-    assert vc.VALEDIA_VERSION == "0.34.0", vc.VALEDIA_VERSION
+    assert "whoami_retail" in matrix.lower() or "retail identity" in matrix.lower()
+    assert "api.prod.polymarketexchange.com" in matrix
+    assert vc.VALEDIA_VERSION == "0.35.0", vc.VALEDIA_VERSION
+    assert 'self._request("GET", "/v1/whoami"' not in src
+    assert "def whoami_retail" in src
+    smoke_src = open(os.path.join(HERE, "poly_us_smoke.py")).read()
+    assert "POLYMARKET_US_LIVE\"] = \"0\"" in smoke_src
+    assert "create_order" in smoke_src
+    assert "LiveWriteBlocked" in smoke_src
+    assert "POLYMARKET_US_LIVE\"] = \"1\"" not in smoke_src
 
 
 def test_public_reads_and_nav():
@@ -148,10 +162,18 @@ def test_auth_reads_and_write_gate():
     _restore()
     x = MockXport()
     c = _client(x, live=False)
-    assert c.whoami()["user"] == "mock"
+    ident = c.whoami()
+    assert ident["ok"] is True
+    assert ident["source"] == "balances"
+    assert ident["balances"][0]["currency"] == "USD"
+    assert "pendingWithdrawals" not in ident["balances"][0]
+    assert ident.get("positions_n") == 0
     assert c.balances()["balances"][0]["currency"] == "USD"
     assert c.positions()["positions"] == {}
     assert c.get_open_orders()["orders"] == []
+    paths = [call["path"] for call in x.calls]
+    assert "/v1/whoami" not in paths
+    assert "/v1/account/balances" in paths
     auth_urls = [call["url"] for call in x.calls]
     assert any(u.startswith("https://api.polymarket.us/v1/account/balances")
                for u in auth_urls)
@@ -164,6 +186,9 @@ def test_auth_reads_and_write_gate():
     })
     assert prev["kind"] == "preview"
     assert prev["filled"] is False
+    posted_prev = [call for call in x.calls if call["path"] == "/v1/order/preview"]
+    assert posted_prev and "request" in (posted_prev[-1]["body"] or {})
+    assert posted_prev[-1]["body"]["request"]["marketSlug"] == "btc-100k"
     try:
         c.create_order({"marketSlug": "btc-100k"})
         raise AssertionError("create must be gated")
@@ -188,6 +213,36 @@ def test_auth_reads_and_write_gate():
     posted = [call for call in x.calls if call["path"] == "/v1/orders"]
     assert posted and posted[-1]["method"] == "POST"
     assert posted[-1]["url"].startswith("https://api.polymarket.us")
+
+
+def test_whoami_retail_error_is_not_institutional():
+    _restore()
+    x = MockXport()
+    x.replies["GET /v1/account/balances"] = {"status": 404, "error": "nope"}
+    c = _client(x, live=False)
+    ident = c.whoami_retail(include_positions=False)
+    assert ident["ok"] is False
+    assert ident["source"] == "balances"
+    assert ident.get("status") == 404
+    assert [call["path"] for call in x.calls] == ["/v1/account/balances"]
+
+
+def test_mocked_preview_smoke_never_creates():
+    _restore()
+    x = MockXport()
+    c = _client(x, live=False)
+    out = smoke.run_smoke(client=c)
+    assert out["ok"] is True
+    assert out["live"] is False
+    assert out["create_blocked"] is True
+    assert out["whoami"]["source"] == "balances"
+    assert out["preview"]["kind"] == "preview"
+    assert out["preview"]["quantity"] == 1
+    paths = [call["path"] for call in x.calls]
+    assert "/v1/whoami" not in paths
+    assert "/v1/order/preview" in paths
+    assert "/v1/orders" not in paths
+    assert pmu.live_enabled() is False
 
 
 def test_http_off_without_transport():
@@ -243,32 +298,33 @@ def test_fill_true_preview_and_ack_not_filled():
 
 
 def test_optional_readonly_smoke():
-    """Keys present → balances/markets only. Never create. Network fail ≠ fail."""
+    """Keys present → whoami/balances + preview. Never create. Skip if no keys."""
     _restore()
-    kid = os.environ.get("POLYMARKET_KEY_ID")
-    sec = os.environ.get("POLYMARKET_SECRET_KEY")
-    if not (str(kid or "").strip() and str(sec or "").strip()):
+    pmu.load_openclaw_env()
+    os.environ["POLYMARKET_US_LIVE"] = "0"
+    probe = pmu.PolymarketUSClient(live=False, http=False, transport=None)
+    if not probe.has_keys():
         return
-    c = pmu.PolymarketUSClient(live=False, http=True, transport=None)
     try:
-        c.create_order({"marketSlug": "must-not-send"})
-        raise AssertionError("smoke must not create")
-    except pmu.LiveWriteBlocked:
-        pass
-    try:
-        bals = c.balances()
-        mkts = c.list_markets(limit=1)
-        assert isinstance(bals, dict)
-        assert isinstance(mkts, dict)
-    except Exception as e:
-        print("optional read-only smoke skipped:", type(e).__name__)
+        out = smoke.run_smoke()
+    except (OSError, TimeoutError) as e:
+        print("optional live-http smoke skipped:", type(e).__name__)
+        return
+    assert out["ok"] is True
+    assert out["create_blocked"] is True
+    assert out["live"] is False
+    assert out["whoami"]["source"] == "balances"
+    assert out["preview"]["kind"] == "preview"
+    assert out["preview"]["filled"] is False
 
 
 if __name__ == "__main__":
     test_hygiene_and_fence()
     test_public_reads_and_nav()
     test_auth_reads_and_write_gate()
+    test_whoami_retail_error_is_not_institutional()
+    test_mocked_preview_smoke_never_creates()
     test_http_off_without_transport()
     test_fill_true_preview_and_ack_not_filled()
     test_optional_readonly_smoke()
-    print("POLY-US US DCM client: PASS")
+    print("POLY-US-2 retail whoami + preview dry-run: PASS")

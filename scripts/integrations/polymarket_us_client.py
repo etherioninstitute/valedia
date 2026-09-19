@@ -7,6 +7,7 @@ Int'l CLOB/Gamma stays in polymarket_client.py. This module talks only to:
 Auth env: POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY.
 Writes (create/cancel) require POLYMARKET_US_LIVE=1. Default False.
 Real urllib requires POLYMARKET_US_HTTP=1 or an injected transport.
+Retail identity is balances (whoami_retail), not GET /v1/whoami.
 Tests inject transport. No py-clob-client. No polymarket-us SDK.
 (c) GOATWORTHY Post LLC.
 """
@@ -44,6 +45,11 @@ NAV_ORDER = ("SPORTS", "POLITICS", "CRYPTO", "WEATHER", "TECH",
              "CULTURE", "ENTERTAINMENT", "ECON")
 
 WRITE_METHODS = frozenset({"create_order", "cancel_order"})
+# GET /v1/whoami is institutional (api.prod.polymarketexchange.com bearer JWT).
+# Retail Ed25519 host api.polymarket.us 404s that path. Identity = balances.
+WHOAMI_RETAIL_SOURCE = "balances"
+_BAL_KEEP = ("currency", "buyingPower", "currentBalance",
+             "assetAvailable", "openOrders")
 
 
 def _flag(name, default=False):
@@ -59,6 +65,50 @@ def live_enabled():
 
 def http_enabled():
     return _flag("POLYMARKET_US_HTTP", False)
+
+
+def load_openclaw_env():
+    """setdefault from ~/.openclaw/.env. Does not override existing env."""
+    path = os.path.expanduser("~/.openclaw/.env")
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("'").strip('"'))
+    return True
+
+
+def _http_ok(doc):
+    if not isinstance(doc, dict):
+        return False
+    st = doc.get("status")
+    if isinstance(st, int) and st >= 400:
+        return False
+    return "error" not in doc or "balances" in doc or "positions" in doc
+
+
+def _redact_balances(doc):
+    bals = doc.get("balances") if isinstance(doc, dict) else None
+    if not isinstance(bals, list):
+        return []
+    out = []
+    for row in bals:
+        if isinstance(row, dict):
+            out.append({k: row[k] for k in _BAL_KEEP if k in row})
+    return out
+
+
+def _positions_n(doc):
+    raw = doc.get("positions") if isinstance(doc, dict) else None
+    if isinstance(raw, list):
+        return len(raw)
+    if isinstance(raw, dict):
+        return len(raw)
+    return 0
 
 
 def nav_category(name):
@@ -171,7 +221,37 @@ class PolymarketUSClient:
             return parsed
 
     def whoami(self):
-        return self._request("GET", "/v1/whoami", auth=True)
+        """Retail identity via balances. Does not call GET /v1/whoami."""
+        return self.whoami_retail()
+
+    def whoami_retail(self, include_positions=True):
+        """Identity on api.polymarket.us = GET /v1/account/balances.
+
+        GET /v1/whoami is institutional (api.prod.polymarketexchange.com,
+        bearer JWT) and 404s on the retail Ed25519 host.
+        """
+        bals = self.balances()
+        ok = _http_ok(bals)
+        out = {
+            "ok": ok,
+            "source": WHOAMI_RETAIL_SOURCE,
+            "host": "api.polymarket.us",
+            "balances": _redact_balances(bals) if ok else [],
+            "note": ("retail identity via GET /v1/account/balances; "
+                     "GET /v1/whoami is institutional bearer JWT, not retail"),
+        }
+        if not ok and isinstance(bals, dict):
+            st = bals.get("status")
+            if st is not None:
+                out["status"] = st
+        if include_positions and ok:
+            try:
+                pos = self.positions(limit=5)
+                if _http_ok(pos):
+                    out["positions_n"] = _positions_n(pos)
+            except Exception:
+                pass
+        return out
 
     def balances(self):
         return self._request("GET", "/v1/account/balances", auth=True)
@@ -233,8 +313,15 @@ class PolymarketUSClient:
         return self._request("GET", f"/v1/order/{oid}", auth=True)
 
     def preview_order(self, body):
-        """Dry-run. Not a create. Never a fill."""
-        resp = self._request("POST", "/v1/order/preview", body=body, auth=True)
+        """Dry-run. Not a create. Never a fill.
+
+        Retail OpenAPI wants `{request: <order>}`. Unwrapped body 400s
+        ("Request is required") on api.polymarket.us.
+        """
+        payload = body
+        if isinstance(body, dict) and "request" not in body:
+            payload = {"request": body}
+        resp = self._request("POST", "/v1/order/preview", body=payload, auth=True)
         wrap = resp if isinstance(resp, dict) else {"raw": resp}
         return {**wrap, "kind": "preview", "filled": False,
                 "note": "preview != create; ack != fill"}
