@@ -33,6 +33,10 @@ When Burton enables it (env or config, explicit yes):
 
 When master flip is **off**: current seatbelts (auto-raise off, 10/15 caps) stay.
 
+## Implemented (0.30.0 — DYNAMIC-BAND)
+
+Knobs live in `valedia_config`: `VALEDIA_SELF_ADJUST=False` (env `VALEDIA_SELF_ADJUST=1` wins). Seatbelted path unchanged (AUTO_RAISE False, 10/15 caps). Flip on: `_band_weight` from fee-true ledger — unproven 0.10, proven raise to 0.25, n≥min and below bar decay to 0.05, enrich bonus 0.02 inside band, hard ceiling 0.30. **Do not True the constant in live config.** Pause TTL re-open and neural enrich may run under the flip; writers / SPOT GET / NAUTILUS_LIVE stay separate fences.
+
 ## NT-2 scope (this Build session)
 
 **Do:** wire enrichment into MiroFish seed/extractor; accuracy ledger `neural_enriched` tag; tests; no weight math change yet.  

@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 import valedia_config as vc
+from desk_roles import label_shadow
 from nautilus_intent import enqueue_intent, make_intent
 
 _MODELS = os.path.expanduser("~/.openclaw/workspace/models")
@@ -304,6 +305,12 @@ def collect_scanner(doc):
     return out
 
 
+def collect_hl_public(doc):
+    """models/hl_public_info.json — public /info only. Never a fill."""
+    from hl_public_info import opportunities
+    return opportunities(doc, notional=SHADOW_NOTIONAL)
+
+
 def collect_arb(doc):
     """latency_arb_log.json — *candidates* only. Always extra-shadow later."""
     out = []
@@ -460,6 +467,7 @@ def gather(models_dir=_MODELS, listed=None):
     opps.extend(collect_hedge(_load(os.path.join(md, "hedge_fund_intel.json"))))
     opps.extend(collect_scanner(_load(os.path.join(md, "scanner_results.json"))))
     opps.extend(collect_arb(_load(os.path.join(md, "latency_arb_log.json"))))
+    opps.extend(collect_hl_public(_load(os.path.join(md, "hl_public_info.json"))))
     return merge_opps(opps)
 
 
@@ -482,6 +490,7 @@ def emit_shadow_intents(models_dir=_MODELS, queue_path=None, opps=None,
             "source_feed": o["source_feed"],
             "intel_edge_pct": o["edge_pct"],
         }
+        extra.update(label_shadow(gates, venue=o["venue"]))
         if o["kind"] == "arb":
             extra["arb_candidate"] = True
         rec = enqueue_intent(

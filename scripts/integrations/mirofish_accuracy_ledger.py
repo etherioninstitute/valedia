@@ -309,12 +309,45 @@ def score(now=None, ftl_rows=None):
 
 
 def _weight_from(proven):
+    """Seatbelted 10/15 path. Used when VALEDIA_SELF_ADJUST is off."""
     configured = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
     unproven_cap = float(getattr(vc, "MIROFISH_UNPROVEN_CAP", 0.10))
     proven_cap = float(getattr(vc, "MIROFISH_PROVEN_CAP", 0.15))
     auto_raise = bool(getattr(vc, "MIROFISH_AUTO_RAISE", False))
     cap = proven_cap if (proven and auto_raise) else unproven_cap
     return min(configured, cap)
+
+
+def _band_weight(st):
+    """SELF_ADJUST on: raise/decay inside band. Never opens writers."""
+    configured = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
+    unproven = float(getattr(vc, "MIROFISH_UNPROVEN_CAP", 0.10))
+    floor = float(getattr(vc, "MIROFISH_BAND_FLOOR", 0.05))
+    top = float(getattr(vc, "MIROFISH_BAND_TOP", 0.25))
+    ceiling = float(getattr(vc, "MIROFISH_HARD_CEILING", 0.30))
+    bonus = float(getattr(vc, "MIROFISH_ENRICH_BONUS", 0.02))
+    bar = float(st.get("bar") or getattr(vc, "MIROFISH_ACCURACY_BAR", 0.55))
+    min_n = int(st.get("min_scored") or getattr(vc, "MIROFISH_MIN_SCORED", 20))
+    n = int(st.get("n_scored") or 0)
+    acc = st.get("directional_accuracy")
+    if n < min_n or acc is None:
+        return min(configured, unproven)
+    w = top if acc > bar else floor
+    enr_n = int(st.get("n_scored_enriched") or 0)
+    plain_n = int(st.get("n_scored_plain") or 0)
+    enr_acc = st.get("enriched_accuracy")
+    plain_acc = st.get("plain_accuracy")
+    if (enr_n >= 5 and plain_n >= 5
+            and enr_acc is not None and plain_acc is not None
+            and enr_acc > plain_acc):
+        w = w + bonus
+    return max(floor, min(w, top, ceiling))
+
+
+def _runtime_weight(st):
+    if getattr(vc, "self_adjust_enabled", lambda: False)():
+        return _band_weight(st)
+    return _weight_from(bool(st.get("proven")))
 
 
 def accuracy_stats(rows=None):
@@ -328,30 +361,38 @@ def accuracy_stats(rows=None):
     bar = float(getattr(vc, "MIROFISH_ACCURACY_BAR", 0.55))
     min_n = int(getattr(vc, "MIROFISH_MIN_SCORED", 20))
     proven = bool(n >= min_n and acc is not None and acc > bar)
-    w = _weight_from(proven)
     net = 0.0
     for r in results:
         try:
             net += float(r.get("realized_pnl_net") or 0)
         except (TypeError, ValueError):
             pass
-    n_enr = sum(1 for r in results if r.get("neural_enriched"))
-    return {
+    enr = [r for r in results if r.get("neural_enriched")]
+    plain = [r for r in results if not r.get("neural_enriched")]
+    def _dir_acc(group):
+        if not group:
+            return None
+        return round(sum(1 for r in group if r.get("hit")) / len(group), 4)
+    st = {
         "n_predictions": len(preds),
         "n_scored": n,
-        "n_scored_enriched": n_enr,
-        "n_scored_plain": n - n_enr,
+        "n_scored_enriched": len(enr),
+        "n_scored_plain": len(plain),
         "hits": hits,
         "directional_accuracy": None if acc is None else round(acc, 4),
+        "enriched_accuracy": _dir_acc(enr),
+        "plain_accuracy": _dir_acc(plain),
         "fee_true_net": round(net, 4),
         "legacy_n": len(legacy),
         "proven": proven,
         "bar": bar,
         "min_scored": min_n,
-        "weight": w,
         "auto_raise": bool(getattr(vc, "MIROFISH_AUTO_RAISE", False)),
+        "self_adjust": bool(getattr(vc, "self_adjust_enabled", lambda: False)()),
         "source": "forward_test_ledger",
     }
+    st["weight"] = _runtime_weight(st)
+    return st
 
 
 def is_proven(stats=None):
@@ -360,9 +401,9 @@ def is_proven(stats=None):
 
 
 def effective_weight(stats=None):
-    """Runtime MiroFish fusion weight. Never auto-raises past the unproven cap."""
-    proven = is_proven(stats) if stats is not None else is_proven()
-    return _weight_from(proven)
+    """Runtime MiroFish fusion weight. Seatbelt 10/15 unless SELF_ADJUST band."""
+    st = stats if stats is not None else accuracy_stats()
+    return _runtime_weight(st)
 
 
 def write_summary_snapshot(stats=None):
@@ -404,9 +445,16 @@ def recommend_weight(stats=None, out_path=None, now=None, pause_path=None):
     """
     st = stats if stats is not None else accuracy_stats()
     proven = bool(st.get("proven"))
+    flipped = bool(getattr(vc, "self_adjust_enabled", lambda: False)())
     unproven_cap = min(float(getattr(vc, "MIROFISH_UNPROVEN_CAP", 0.10)), 0.10)
-    proven_cap = min(float(getattr(vc, "MIROFISH_PROVEN_CAP", 0.15)), HARD_CEILING)
-    recommended = min(proven_cap if proven else unproven_cap, HARD_CEILING)
+    if flipped:
+        ceiling = float(getattr(vc, "MIROFISH_HARD_CEILING", 0.30))
+        proven_cap = min(float(getattr(vc, "MIROFISH_BAND_TOP", 0.25)), ceiling)
+        recommended = float(effective_weight(st))
+    else:
+        ceiling = HARD_CEILING
+        proven_cap = min(float(getattr(vc, "MIROFISH_PROVEN_CAP", 0.15)), HARD_CEILING)
+        recommended = min(proven_cap if proven else unproven_cap, HARD_CEILING)
     runtime = float(effective_weight(st))
     configured = float(getattr(vc, "MIROFISH_WEIGHT", 0.10))
     rec = {
@@ -414,13 +462,14 @@ def recommend_weight(stats=None, out_path=None, now=None, pause_path=None):
         "runtime_weight": runtime,
         "configured_weight": configured,
         "cap": proven_cap if proven else unproven_cap,
-        "hard_ceiling": HARD_CEILING,
+        "hard_ceiling": ceiling,
         "proven": proven,
         "n_scored": st.get("n_scored"),
         "directional_accuracy": st.get("directional_accuracy"),
         "bar": st.get("bar"),
         "min_scored": st.get("min_scored"),
         "auto_raise": bool(getattr(vc, "MIROFISH_AUTO_RAISE", False)),
+        "self_adjust": flipped,
         "applied": False,
         "action": ("burton_may_set_MIROFISH_WEIGHT_or_AUTO_RAISE"
                    if proven else "keep_unproven_cap"),

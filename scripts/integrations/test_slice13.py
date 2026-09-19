@@ -39,9 +39,15 @@ def _restore():
     vc.MIROFISH_ACCURACY_BAR = 0.55
     vc.MIROFISH_MIN_SCORED = 20
     vc.MIROFISH_AUTO_RAISE = False
+    vc.VALEDIA_SELF_ADJUST = False
+    vc.MIROFISH_BAND_FLOOR = 0.05
+    vc.MIROFISH_BAND_TOP = 0.25
+    vc.MIROFISH_HARD_CEILING = 0.30
+    vc.MIROFISH_ENRICH_BONUS = 0.02
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     os.environ.pop("REBALANCER_AUTOEXEC", None)
     os.environ.pop("MIROFISH_PRICE_HTTP", None)
+    os.environ.pop("VALEDIA_SELF_ADJUST", None)
     mal.set_paths(models_dir=HOME_MODELS)
 
 

@@ -17,20 +17,27 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.29.0 = H4 OpenTerminal GET panel; 0.28.0 H3 fill-true).
+# Runtime identity (0.30.0 = H5 desk labels + HL public /info + DYNAMIC-BAND knobs).
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.29.0"
+VALEDIA_VERSION = "0.30.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
-# MIROFISH_* caps. AUTO_RAISE stays False until Burton master flip
-# (VALEDIA_SELF_ADJUST). Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
-# NT-2 tags neural_enriched only — no weight math in this slice.
+# MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
+# Master flip VALEDIA_SELF_ADJUST (False here; env=1). Do NOT True this in live config.
+# Dormant ≠ dead: pause TTL re-open + neural enrich may run under the flip.
+# SELF_ADJUST does not open venue writers / SPOT GET / NAUTILUS_LIVE.
+VALEDIA_SELF_ADJUST   = False  # Burton master flip only
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
-MIROFISH_UNPROVEN_CAP = 0.10   # Slice 13: never exceed while accuracy unproven
-MIROFISH_PROVEN_CAP   = 0.15   # 10–15% ceiling even if proven
+MIROFISH_UNPROVEN_CAP = 0.10   # never exceed while accuracy unproven
+MIROFISH_PROVEN_CAP   = 0.15   # seatbelted 10–15% when SELF_ADJUST is False
 MIROFISH_ACCURACY_BAR = 0.55   # Burton-configurable directional bar (strict >)
 MIROFISH_MIN_SCORED   = 20     # fee-true scored sample before proven
-MIROFISH_AUTO_RAISE   = False  # this lane never auto-raises past the unproven cap
+MIROFISH_AUTO_RAISE   = False  # stays False unless SELF_ADJUST allows in-band raise
+# Band used only when self_adjust_enabled(). Hard ceiling until Burton raises.
+MIROFISH_BAND_FLOOR   = 0.05
+MIROFISH_BAND_TOP     = 0.25
+MIROFISH_HARD_CEILING = 0.30
+MIROFISH_ENRICH_BONUS = 0.02   # enriched-vs-plain, inside band only
 CRYPTO_FEE_PCT      = 0.001    # crypto taker-fee assumption for backtests/sizing.
 CRYPTO_SLIPPAGE_PCT = 0.0005   # crypto slippage assumption.
 
@@ -169,6 +176,17 @@ def spot_reconcile_http_enabled():
     return _env_flag("SPOT_RECONCILE_HTTP", SPOT_RECONCILE_HTTP)
 
 
+def self_adjust_enabled():
+    """True only if Burton flipped VALEDIA_SELF_ADJUST. Default False.
+
+    Wakes MiroFish AUTO_RAISE *inside the band* and documents that pause
+    re-open / neural enrich may run. Does not open VENUE_WRITER, SPOT GET,
+    NAUTILUS_LIVE, or AUTOEXEC. Env VALEDIA_SELF_ADJUST=1 wins over the constant.
+    This lane never sets the constant True.
+    """
+    return _env_flag("VALEDIA_SELF_ADJUST", VALEDIA_SELF_ADJUST)
+
+
 def rebalancer_autoexec_enabled():
     """True only if Burton flipped REBALANCER_AUTOEXEC. Default False.
 
@@ -205,8 +223,10 @@ def live_exec_fenced(name):
 def effective_mirofish_weight():
     """Runtime MiroFish fusion weight from the fee-true accuracy ledger.
 
-    Unproven → ≤ MIROFISH_UNPROVEN_CAP. Proven does not auto-raise
-    (MIROFISH_AUTO_RAISE=False). Any error fails closed to the unproven cap.
+    SELF_ADJUST off: unproven ≤ 0.10; proven auto-raise only if MIROFISH_AUTO_RAISE
+    (default False → stays 0.10; True → proven cap 0.15).
+    SELF_ADJUST on: AUTO_RAISE inside band (floor 0.05 / top 0.25 / ceiling 0.30).
+    Any error fails closed to the unproven cap. Never opens venue writers.
     """
     try:
         import mirofish_accuracy_ledger as _mal

@@ -20,6 +20,7 @@ from hyperliquid_order_body import (
     hl_coin,
     send_via_live_hook as hl_send_via_live_hook,
 )
+from desk_roles import label_shadow
 from nautilus_intent import enqueue_intent, make_intent
 from polymarket_order_body import (
     LIVE_CLIENT_HOOK as PM_HOOK,
@@ -199,6 +200,7 @@ def emit_hl_short_shadow(candidate: dict, queue_path: Optional[str] = None,
         "hl_send": hl_send_via_live_hook(canonical),
         "kind": "hl_short",
     }
+    extra.update(label_shadow(intent.gates, venue="hyperliquid"))
     rec = enqueue_intent(intent, dispatch=False, queue_path=queue_path, extra=extra)
     rec["dispatchable"] = False
     rec["dispatch_requested"] = False
