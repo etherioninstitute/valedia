@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H6 SHIPPED. Nautilus shadow event model + fail-closed parity. VALEDIA_VERSION `0.31.0` tag `valedia-v0.31.0`. Prior: H5+DYNAMIC-BAND `0.30.0`.
+**Current:** H6 SHIPPED. Nautilus shadow event model + fail-closed parity. VALEDIA_VERSION `0.31.0` tag `valedia-v0.31.0` tip `22a6cff`. Prior: H5+DYNAMIC-BAND `0.30.0`.
 
 **Tests:** `test_h6.py` PASS. `test_slice12.py` PASS. `test_nautilus_intent.py` PASS. `test_h2` / `test_h3` / `test_h4` / `test_h5` / `test_nt1` / `test_nt2` / `test_slice23` / `test_adversarial_paper_fight` / `test_dynamic_band` PASS.
 

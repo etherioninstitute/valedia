@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **H6 SHIPPED.** Version `0.31.0` tag `valedia-v0.31.0`. Prior H5+DYNAMIC-BAND `0.30.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H7. `VALEDIA_SELF_ADJUST` stays False.
+Updated: 2026-09-18 PT — **H6 SHIPPED.** Version `0.31.0` tag `valedia-v0.31.0` tip `22a6cff`. Prior H5+DYNAMIC-BAND `0.30.0`. **STOP for Burton.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / H7. `VALEDIA_SELF_ADJUST` stays False.
 
 ## H6 (Grok Build executor, `valedia-v2-grok-build`)
 - Shadow OMS event model: `nautilus_shadow_events.py` (OrderStatus + CommandFailure rewrite, no `nautilus_trader`). submitted ≠ fill. Ambiguous ≠ denied.
