@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** H8 + POLY-E SHIPPED. Version `0.33.0` tag `valedia-v0.33.0`. Prior: H7 0.32.0.
+**Current:** H8 + POLY-E SHIPPED. Version `0.33.0` tag `valedia-v0.33.0` tip `ef609ef`. Prior: H7 0.32.0.
 
 **Tests:** `test_h8.py` PASS. `test_poly_e.py` PASS. `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice11.py` / `test_slice12.py` / `test_slice10.py` / `test_slice23.py` PASS.
 
