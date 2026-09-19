@@ -8,7 +8,7 @@
 
 **Current:** POLY-US SHIPPED. Fence held. Next=STOP. Do not enable live Poly.
 
-**Version:** `0.34.0` (tag `valedia-v0.34.0` after commit). Prior: H8+POLY-E `0.33.0`.
+**Version:** `0.34.0` tag `valedia-v0.34.0` tip `e118ff5`. Prior: H8+POLY-E `0.33.0`.
 
 **Tests:** `test_poly_us.py` PASS (mocked). `test_poly_e.py` PASS. `test_h8.py` / `test_h7.py` / `test_h5.py` / `test_h3.py` / `test_slice23.py` PASS.
 
