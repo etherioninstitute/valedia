@@ -380,6 +380,18 @@ def process_mirofish_report(report_json, enrichment=None, out_path=None):
     except Exception:
         result["neural_enriched"] = False
 
+    # H2: persona lenses. Does not change scores/bias/weight/Kelly.
+    try:
+        import persona_lenses as pl
+        pack = pl.score_document(result)
+        result = pl.attach_to_signal(result, pack)
+        if pack.get("symbols"):
+            sibling = os.path.join(os.path.dirname(os.path.abspath(dest)),
+                                   "persona_lens_scores.json")
+            pl.write_scores(pack, sibling)
+    except Exception:
+        result["persona_lenses"] = False
+
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     with open(dest, "w") as f:
         json.dump(result, f, indent=2)

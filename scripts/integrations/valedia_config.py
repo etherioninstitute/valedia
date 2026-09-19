@@ -19,7 +19,7 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
 
 # Runtime identity (NT-2 signal/ledger neural_enriched tag; Slice 22/23 versioning).
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.25.0"
+VALEDIA_VERSION = "0.26.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. AUTO_RAISE stays False until Burton master flip

@@ -1,4 +1,14 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **Arc H1+H2 SHIPPED.** Version `0.26.0` (tag `valedia-v0.26.0` on Build). **STOP for Burton.** H3 Kalshi fill-true / H4 OpenTerminal next named go. Dynamic band + master flip still later. No AUTO_RAISE / writers / LN.
+
+## H1 / H2 (Grok Build executor, `valedia-v2-grok-build`)
+- Dossiers: `recommendations/ADAPT-DOSSIERS/` (ai-fund, OpenTerminal, hypergrok, nautilus, kalshi-agent, lf-game-theory, fortress).
+- One-brain map: `recommendations/VALEDIA-SEAMLESS-ARCHITECTURE.md`.
+- H2: `persona_lenses.py` Buffett/Lynch/Hayes → MiroFish seed/extractor attach. Scores/bias/Kelly/weight unchanged. `test_h2.py` PASS. Ponytail: `PONYTAIL-AUDIT-H2.md`.
+- Fence held. No `--live` / VENUE_WRITER / NAUTILUS_LIVE / SPOT_RECONCILE_HTTP / REBALANCER_AUTOEXEC / MIROFISH_AUTO_RAISE.
+
+---
+
 Updated: 2026-09-18 PT — **Arc G NT-2 SHIPPED.** Version `0.25.0` tip `71a39f9` tag `valedia-v0.25.0`. **STOP for Burton.** Dynamic band + master flip = later named slice after approval. NT-3 OpenTerminal not this stop.
 
 ## NT-2 (Grok Build executor, `valedia-v2-grok-build`)

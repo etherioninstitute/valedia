@@ -1,27 +1,17 @@
 # Grok Build status
 
-**NORTH STAR:** world's smartest, highest-profiting auto-trader (seamless; self-adjust when flipped; gates until Burton widens).
+**NORTH STAR:** world's smartest, highest-profiting auto-trader (seamless; dynamic; gates until Burton widens).
+
 **Updated:** 2026-09-18 PT
 
 **Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
 
-**Current:** SHIPPED — Arc G **NT-2**. `VALEDIA_VERSION` **0.25.0**. Tip `71a39f9`. Tag `valedia-v0.25.0`.
+**Current:** SHIPPED — Arc **H1** dossiers + `VALEDIA-SEAMLESS-ARCHITECTURE.md`; **H2** Buffett/Lynch/Hayes lenses (`persona_lenses.py`) wired like NT-2. `VALEDIA_VERSION` **0.26.0**. `test_h2.py` PASS.
 
-**What shipped**
-- NT-1 JSON (`mirofish_neural_enrichment.json`) attached onto MiroFish seed (advisory markdown) and extractor (`mirofish_signal.json` per-symbol `neural` + top-level `neural_enriched`). Scores/bias/weight unchanged.
-- Accuracy ledger tags `neural_enriched` true/false on predictions and **fee-true** results. Stats expose `n_scored_enriched` / `n_scored_plain` only — **no weight math change**.
-- Tests: `test_nt2.py` PASS (mocked). Related: test_nt1, test_slice13, test_slice18, test_slice23, test_event_signs PASS.
+**Shipped:** NT-0…NT-2; H1; H2 (advisory attach only — no weight math)
 
-**Fence (unchanged this slice)**
-- `MIROFISH_AUTO_RAISE` = **False**
-- Caps still **0.10** unproven / **0.15** proven
-- No `VALEDIA_SELF_ADJUST` implementation (comment only in `valedia_config`)
-- No trader live / broker / writers / SPOT_RECONCILE / NAUTILUS_LIVE / Intents
+**Fence:** No live writers / `MIROFISH_AUTO_RAISE=False` / caps 0.10–0.15 / `NAUTILUS_LIVE=False` / `SPOT_RECONCILE_HTTP=False` / no LN/Arena funding
 
-**Next:** STOP for Burton. Dynamic band + master flip (`VALEDIA_SELF_ADJUST`) = next named slice **after approval**. Do not start NT-3 OpenTerminal this stop.
+**Loop:** analyze → code → Ponytail audit (`recommendations/PONYTAIL-AUDIT-H2.md`).
 
-**Shipped prior:** NT-0 `6f594d1`, NT-1 `bf798eb` / v0.24.0
-
----
-
-**Standing (not this slice):** After Burton go — H1 dossiers / H2 ai-fund→MiroFish per addendum. Live writers still gated.
+**Next:** STOP for Burton. Then H3 kalshi-agent fill-true rewrite, or H4 OpenTerminal panel. Arena/paper fights stay **H7** (`ADAPT-DOSSIERS/lf-game-theory.md`) — paper/shadow only, no Lightning.

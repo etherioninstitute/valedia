@@ -195,6 +195,16 @@ def build_seed():
         text = mne.apply_seed_text(text)
     except Exception:
         pass
+    try:
+        import persona_lenses as pl
+        sig_path = os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
+        sig = {}
+        if os.path.isfile(sig_path):
+            with open(sig_path) as f:
+                sig = json.load(f) or {}
+        text = pl.apply_seed_text(text, signal_doc=sig)
+    except Exception:
+        pass
     return text
 
 
