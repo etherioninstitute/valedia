@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Valedia</title>
+  <style>
+    :root {
+      --bg: #f2f2f7;
+      --surface: #ffffff;
+      --grouped: #ffffff;
+      --label: rgba(0,0,0,0.85);
+      --secondary: rgba(60,60,67,0.6);
+      --tertiary: rgba(60,60,67,0.3);
+      --sep: rgba(60,60,67,0.12);
+      --accent: #007aff;
+      --ok: #248a3d;
+      --warn: #c93400;
+      --halt: #d70015;
+      --live: #d70015;
+      --dry: #9a6700;
+      --fenced: #6e6e73;
+      --banner: #fff4e5;
+      --banner-ink: #7a4b00;
+      --radius: 12px;
+      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+      color-scheme: light dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1c1c1e;
+        --surface: #2c2c2e;
+        --grouped: #2c2c2e;
+        --label: rgba(255,255,255,0.92);
+        --secondary: rgba(235,235,245,0.6);
+        --tertiary: rgba(235,235,245,0.3);
+        --sep: rgba(235,235,245,0.12);
+        --ok: #30d158;
+        --warn: #ff9f0a;
+        --halt: #ff453a;
+        --live: #ff453a;
+        --dry: #ffd60a;
+        --fenced: #8e8e93;
+        --banner: #3a2a12;
+        --banner-ink: #ffd60a;
+        --shadow: 0 1px 2px rgba(0,0,0,0.4);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font: 15px/1.47 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--label);
+      padding: 28px 24px 48px;
+    }
+    main { max-width: 920px; margin: 0 auto; }
+    header {
+      display: flex; flex-wrap: wrap; align-items: flex-end;
+      justify-content: space-between; gap: 12px 20px; margin-bottom: 16px;
+    }
+    h1 { font-size: 28px; font-weight: 650; letter-spacing: -0.03em; margin: 0; }
+    .sub { color: var(--secondary); font-size: 13px; margin-top: 4px; }
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+      text-transform: uppercase; padding: 5px 10px; border-radius: 999px;
+      background: var(--surface); color: var(--secondary);
+      border: 1px solid var(--sep);
+    }
+    .pill.FENCED { color: var(--fenced); }
+    .pill.DRY { color: var(--dry); }
+    .pill.LIVE { color: var(--live); }
+    .pill.halt { color: var(--halt); }
+    .pill.ok { color: var(--ok); }
+    button.refresh {
+      appearance: none; border: 1px solid var(--sep); background: var(--surface);
+      color: var(--accent); font: inherit; font-weight: 600; font-size: 15px;
+      min-height: 44px; min-width: 44px; padding: 8px 16px; border-radius: 10px;
+      cursor: pointer;
+    }
+    button.refresh:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+    button.refresh:disabled { opacity: 0.5; cursor: default; }
+    .spin {
+      width: 14px; height: 14px; border: 2px solid var(--sep);
+      border-top-color: var(--accent); border-radius: 50%;
+      display: none;
+    }
+    .spin.on { display: inline-block; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .spin.on { animation: none; opacity: 0.7; }
+    }
+    .banner {
+      display: none; background: var(--banner); color: var(--banner-ink);
+      border-radius: var(--radius); padding: 12px 16px; margin: 0 0 16px;
+      font-size: 14px;
+    }
+    .banner.on { display: block; }
+    .grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+    section.card {
+      background: var(--grouped); border-radius: var(--radius);
+      box-shadow: var(--shadow); padding: 16px 18px 14px;
+      min-height: 132px;
+    }
+    section.card.wide { grid-column: 1 / -1; }
+    h2 {
+      margin: 0 0 10px; font-size: 12px; font-weight: 650;
+      letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary);
+    }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; }
+    .row + .row { border-top: 1px solid var(--sep); }
+    .k { color: var(--secondary); }
+    .v { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; }
+    .num { font-size: 28px; font-weight: 650; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+    .muted { color: var(--secondary); font-size: 13px; margin: 4px 0 0; }
+    .callout {
+      margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+      color: var(--label); font-size: 13px;
+    }
+    .pos { color: var(--ok); }
+    .neg { color: var(--warn); }
+    footer {
+      margin-top: 20px; color: var(--secondary); font-size: 12px;
+      display: flex; flex-wrap: wrap; gap: 8px 16px;
+    }
+    .err { color: var(--halt); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Valedia</h1>
+        <p class="sub" id="ident">Read-only glance · polling /status</p>
+      </div>
+      <div class="toolbar">
+        <span class="pill" id="mode">—</span>
+        <span class="pill ok" id="haltpill">Halt off</span>
+        <span class="spin" id="spin" aria-hidden="true"></span>
+        <button type="button" class="refresh" id="refresh">Refresh</button>
+      </div>
+    </header>
+    <div class="banner" id="banner" role="status"></div>
+    <div class="grid">
+      <section class="card wide" aria-labelledby="pnl-h">
+        <h2 id="pnl-h">P&amp;L</h2>
+        <div class="grid">
+          <div>
+            <div class="muted" id="broker-label">Broker (pnl_tracker) ≠ FTL</div>
+            <div class="num" id="broker-net">—</div>
+            <p class="muted" id="broker-rec"></p>
+          </div>
+          <div>
+            <div class="muted" id="ftl-label">Fee-true FTL</div>
+            <div class="num" id="ftl-net">—</div>
+            <p class="muted" id="ftl-rec"></p>
+          </div>
+        </div>
+        <div class="callout" id="ftl-empty" hidden>Fee-true ledger n=0. Broker numbers are not FTL.</div>
+      </section>
+      <section class="card" aria-labelledby="cash-h">
+        <h2 id="cash-h">Cash</h2>
+        <div class="row"><span class="k">Cash</span><span class="v" id="cash">—</span></div>
+        <div class="row"><span class="k">Deployed</span><span class="v" id="deployed">—</span></div>
+        <p class="muted" id="cash-src"></p>
+      </section>
+      <section class="card" aria-labelledby="venue-h">
+        <h2 id="venue-h">Venues</h2>
+        <div class="row"><span class="k">Kalshi</span><span class="v" id="kalshi">—</span></div>
+        <div class="row"><span class="k">Polymarket US</span><span class="v" id="poly">—</span></div>
+        <p class="muted" id="venue-src"></p>
+      </section>
+      <section class="card" aria-labelledby="mf-h">
+        <h2 id="mf-h">MiroFish</h2>
+        <div class="row"><span class="k">Weight</span><span class="v" id="mf-w">—</span></div>
+        <div class="row"><span class="k">Bias</span><span class="v" id="mf-b">—</span></div>
+        <div class="row"><span class="k">Signal ts</span><span class="v" id="mf-ts">—</span></div>
+        <p class="muted" id="mf-ears">Data streams gathering — halt does not stop ears.</p>
+      </section>
+      <section class="card" aria-labelledby="sh-h">
+        <h2 id="sh-h">Shadow</h2>
+        <div class="row"><span class="k">Intents</span><span class="v" id="sh-n">—</span></div>
+        <div class="row"><span class="k">Dispatchable</span><span class="v" id="sh-d">—</span></div>
+        <p class="muted">Read-only counts. This panel never dispatches.</p>
+      </section>
+    </div>
+    <footer>
+      <span id="updated">Waiting for /status</span>
+      <span>GET only · no orders from this panel</span>
+      <span id="stamp"></span>
+    </footer>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const money = (n) => {
+      if (n == null || n === "" || Number.isNaN(Number(n))) return "unread";
+      return Number(n).toLocaleString(undefined, { style: "currency", currency: "USD" });
+    };
+    const signed = (n) => {
+      if (n == null || Number.isNaN(Number(n))) return "—";
+      const v = Number(n);
+      return (v >= 0 ? "+" : "−") + money(Math.abs(v));
+    };
+    const cls = (el, n) => {
+      el.classList.remove("pos", "neg");
+      if (n == null || Number.isNaN(Number(n))) return;
+      el.classList.add(Number(n) >= 0 ? "pos" : "neg");
+    };
+    function render(p) {
+      $("ident").textContent = "v" + (p.valedia_version || "?")
+        + (p.sha ? " · " + p.sha : "")
+        + (p.dirty ? " dirty" : "");
+      $("stamp").textContent = p.stamp || "";
+      const mode = p.mode || "—";
+      $("mode").textContent = mode;
+      $("mode").className = "pill " + mode;
+      const halted = !!p.trading_halt;
+      $("haltpill").textContent = halted ? "Halt on" : "Halt off";
+      $("haltpill").className = "pill " + (halted ? "halt" : "ok");
+      const banner = $("banner");
+      if (halted) {
+        banner.className = "banner on";
+        banner.textContent = "New orders halted"
+          + (p.trading_halt_reason ? " — " + p.trading_halt_reason : "")
+          + ". MiroFish and data streams keep gathering.";
+      } else {
+        banner.className = "banner";
+        banner.textContent = "";
+      }
+      const br = p.broker || {};
+      $("broker-label").textContent = br.label || "Broker (pnl_tracker.json) ≠ FTL";
+      $("broker-net").textContent = signed(br.net);
+      cls($("broker-net"), br.net);
+      const rec = [];
+      if (br.wins != null || br.losses != null) rec.push((br.wins || 0) + "W / " + (br.losses || 0) + "L");
+      rec.push("broker, not FTL");
+      $("broker-rec").textContent = rec.join(" · ");
+      const ftl = p.ftl || {};
+      $("ftl-label").textContent = ftl.label || "Fee-true FTL";
+      $("ftl-net").textContent = ftl.n ? signed(ftl.net) : "n=0";
+      cls($("ftl-net"), ftl.n ? ftl.net : null);
+      $("ftl-rec").textContent = ftl.n
+        ? ("n=" + ftl.n + " · unreconciled " + (ftl.unreconciled || 0))
+        : "empty ledger";
+      $("ftl-empty").hidden = !(ftl.empty || ftl.n === 0);
+      $("cash").textContent = money(p.cash);
+      $("deployed").textContent = money(p.deployed);
+      $("cash-src").textContent = p.cash_source || "";
+      const v = p.venues || {};
+      const k = v.kalshi || {};
+      const py = v.polymarket_us || {};
+      $("kalshi").textContent = k.cash == null ? (k.status || "unread") : money(k.cash);
+      $("poly").textContent = py.cash == null ? (py.status || "unread") : money(py.cash);
+      $("venue-src").textContent = v.source || "treasury_status.json (no live GET)";
+      const mf = p.mirofish || {};
+      $("mf-w").textContent = mf.weight == null ? "—" : Number(mf.weight).toFixed(2);
+      $("mf-b").textContent = mf.bias == null ? "—" : Number(mf.bias).toFixed(1);
+      $("mf-ts").textContent = mf.ts ? String(mf.ts).replace("T", " ").slice(0, 19) : "—";
+      $("mf-ears").textContent = "Ears gathering — halt blocks new orders only.";
+      const sh = p.shadow || {};
+      $("sh-n").textContent = sh.intents == null ? "—" : String(sh.intents);
+      $("sh-d").textContent = sh.dispatchable == null ? "—" : String(sh.dispatchable);
+      $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+    }
+    async function poll() {
+      $("spin").classList.add("on");
+      $("refresh").disabled = true;
+      try {
+        const r = await fetch("/status", { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        render(await r.json());
+      } catch (e) {
+        $("updated").innerHTML = '<span class="err">Cockpit unreachable — start valedia_cockpit.py --listen</span>';
+      } finally {
+        $("spin").classList.remove("on");
+        $("refresh").disabled = false;
+      }
+    }
+    $("refresh").addEventListener("click", poll);
+    poll();
+    setInterval(poll, 5000);
+  </script>
+</body>
+</html>

@@ -70,4 +70,4 @@ python3 scripts/integrations/valedia_full_smoke.py --offline
 - OpenTerminal Valedia UI
 - cockpit HTTP server (`valedia_cockpit.py --listen`)
 
-**Next = OPENTERMINAL-VALEDIA.** Do not auto-start. Do not flip live.
+**Next = staged ON** (OpenTerminal glance shipped 0.40.0). Do not auto-flip live.

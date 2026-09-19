@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.39.0 = KILL-SWITCH VALEDIA_TRADING_HALT).
-# Prior 0.38.0 = VALEDIA-FULL-SMOKE. Prior 0.37.0 = MIROFISH-SMOKE.
+# Runtime identity (0.40.0 = OPENTERMINAL-VALEDIA read-only glance).
+# Prior 0.39.0 = KILL-SWITCH. Prior 0.38.0 = VALEDIA-FULL-SMOKE.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.39.0"
+VALEDIA_VERSION = "0.40.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md

@@ -61,7 +61,7 @@ def test_hygiene_and_default_off():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.trading_halted() is False
     assert vc.require_not_halted("probe") is False
-    assert vc.VALEDIA_VERSION == "0.39.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.40.0", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.MIROFISH_AUTO_RAISE is False
@@ -221,7 +221,7 @@ def test_file_arm_env_off_wins_and_self_heal_report_only():
     assert ev["ping"]["send"] is False
     assert vc.panel_looks_sick(None) is True
     assert vc.panel_looks_sick({"error": "boom"}) is True
-    assert vc.panel_looks_sick({"valedia_version": "0.39.0"}) is False
+    assert vc.panel_looks_sick({"valedia_version": "0.40.0"}) is False
     armed = vc.record_halt_event("repeated writer exceptions", source="observe",
                                  arm=True)
     assert armed["halted"] is True

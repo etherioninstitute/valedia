@@ -55,3 +55,5 @@ GET/balances/positions/fills/orders, Poly `preview_order`, cockpit GET, treasury
 ```bash
 python3 scripts/integrations/test_kill_switch.py
 ```
+
+**Ears always on (Burton 2026-09-19):** MiroFish (signal/swarm/ledger/neural enrich), persona lenses, fortress intel reads, NT research tags, and any other *data* streams must keep gathering whether `VALEDIA_TRADING_HALT` is on or off. Halt blocks **new orders only** — never intel collection. The OpenTerminal glance (`OPENTERMINAL-VALEDIA.md`) shows `trading_halt` but `ears.gathering` stays true — never imply ears are off.

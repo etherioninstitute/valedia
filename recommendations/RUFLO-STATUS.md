@@ -1,10 +1,15 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-19 PT — **KILL-SWITCH SHIPPED**. Version `0.39.0` tag `valedia-v0.39.0` tip `4b7b6d3`. Gate `valedia_config.require_not_halted` / `HaltedError`. Ponytail: `PONYTAIL-AUDIT-KILL-SWITCH.md`. **STOP — parent launches OPENTERMINAL-VALEDIA.** Do not auto-start OpenTerminal. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+Updated: 2026-09-19 PT — **OPENTERMINAL-VALEDIA SHIPPED**. Version `0.40.0` tag `valedia-v0.40.0`. Read-only glance `valedia_cockpit.py --listen` → `http://127.0.0.1:8765/`. Ponytail: `PONYTAIL-AUDIT-OPENTERMINAL-VALEDIA.md`. **Next = staged ON (STOP for Burton — do not auto-flip live).** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+
+## OPENTERMINAL-VALEDIA (Grok Build executor, `valedia-v2-grok-build`)
+- HIG HTML glance on existing GET server :8765 (not OT :3000 / API :4010 / LiteLLM :4000). JSON `/status` + FTL vs broker labels; halt shown; ears always gathering.
+- No send/buy/create_order buttons. No OpenTerminal Next fork. No cron. `test_openterminal_valedia.py` PASS.
+- **Next = staged ON. STOP. Do not auto-flip live.**
 
 ## KILL-SWITCH (Grok Build executor, `valedia-v2-grok-build`)
 - Master halt: env/file `VALEDIA_TRADING_HALT`. Writers (Kalshi create/sell, Poly US create/cancel, Coinbase/Alpaca market buy/sell) + allocator/rebalancer/maker `_place` refuse with `HaltedError`. GET/preview/dry-run stay allowed.
 - Manual OFF: `unset` / `=0` / `valedia_trading_halt.py off`. Self-heal report-only (`send: false` ping file). `test_kill_switch.py` PASS.
-- **Next = OPENTERMINAL-VALEDIA (parent launches). Do not auto-start here. Do not flip staged ON.**
+- Shipped 0.39.0. OpenTerminal glance is 0.40.0. **Next = staged ON (Burton). Do not auto-flip live.**
 
 ## FULL-SMOKE (Grok Build executor, `valedia-v2-grok-build`)
 - Minutes-scale whole-brain smoke. One CLI wraps fence stamps, treasury_status, mirofish_smoke fixture (+ live-lite), Kalshi balance GET, Poly US whoami_retail/preview (create blocked), shadow queue + adversarial import, cockpit `panel()`, pnl_tracker broker≠FTL.

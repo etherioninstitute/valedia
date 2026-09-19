@@ -322,7 +322,7 @@ def run_smoke(offline=False, live_mirofish=True, poly_client=None,
         "fence": "No POLYMARKET_US_LIVE / VENUE_WRITER / REBALANCER_AUTOEXEC / "
                  "NAUTILUS_LIVE / VALEDIA_SELF_ADJUST / MIROFISH_AUTO_RAISE / "
                  "VALEDIA_TREASURY_AUTO / live orders / ACH.",
-        "next": "OPENTERMINAL-VALEDIA — do not auto-start",
+        "next": "staged ON — STOP for Burton; do not auto-flip live",
     }
     return report
 
@@ -358,9 +358,9 @@ def render_md(report):
         "- live orders / Kalshi writes / Poly create (blocked)",
         "- ACH / wire / card / treasury auto top-up",
         "- kill-switch: `valedia_config.require_not_halted` (see `KILL-SWITCH.md`)",
-        "- OpenTerminal Valedia UI",
+        "- live OpenTerminal market UI (:3000) — Valedia glance is :8765 (opt-in --listen)",
         "",
-        "**Next = OPENTERMINAL-VALEDIA.** Do not auto-start. Do not flip live.",
+        "**Next = staged ON.** STOP for Burton. Do not auto-flip live.",
         "",
     ]
     return "\n".join(lines)

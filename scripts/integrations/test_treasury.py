@@ -59,7 +59,7 @@ def test_hygiene_and_fence():
     assert vc.TREASURY_FLOORS["hyperliquid"] is None
     assert vc.TREASURY_ALERT_WEBHOOK == ""
     assert vc.treasury_alert_webhook() == ""
-    assert vc.VALEDIA_VERSION == "0.39.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.40.0", vc.VALEDIA_VERSION
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.NAUTILUS_LIVE is False
@@ -157,7 +157,7 @@ def test_emit_json():
         }, live_read=False)
         assert os.path.isfile(path)
         saved = json.load(open(path))
-        assert saved["valedia_version"] == "0.39.0"
+        assert saved["valedia_version"] == "0.40.0"
         assert saved["moves_money"] is False
         by = {v["venue"]: v for v in saved["venues"]}
         assert by["polymarket_us"]["status"] == "WARN"
