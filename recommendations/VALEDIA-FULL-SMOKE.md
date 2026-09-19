@@ -2,7 +2,7 @@
 
 **Updated:** 2026-09-19 PT
 **Harness:** `python3 scripts/integrations/valedia_full_smoke.py`
-**Version:** `0.38.0` stamp `v0.38.0 ee6da91*` (dirty until this slice commits)
+**Version:** `0.38.0` tag `valedia-v0.38.0` tip `cdbec1b`
 **JSON:** `models/valedia_full_smoke_report.json`
 **Verdict:** **PASS**
 **Wall:** **3.763s** / 600s
