@@ -188,6 +188,9 @@ def gather_all_opportunities():
                     })
     except: pass
     
+    # ── SOURCE 5b: POLY-LEARN classroom is NOT mixed into live gather.
+    # Paper proposals live in poly_learn.run() (DRY/SHADOW, never create_order).
+
     # ── SOURCE 5: Kalshi Market Scanner (600+ market heuristic scoring) ──
     try:
         scanner_path = os.path.join(MODELS_DIR, "scanner_results.json")
@@ -272,6 +275,17 @@ def gather_weather_opportunities():
     expired and opps are injected or appear from other gather sources.
     """
     return []
+
+
+def gather_poly_us_opportunities(client=None, models_dir=None, limit=8):
+    """POLY-LEARN paper classroom. Dry/shadow only. Never create_order."""
+    try:
+        import poly_learn
+        c = client
+        return poly_learn.gather(c, limit=limit, models_dir=models_dir) if c else []
+    except Exception as e:
+        print(f"  Poly US learn skip: {e}")
+        return []
 
 
 def allocate(opps, capital):
@@ -371,7 +385,15 @@ def execute_allocations(allocations, dry_run=False):
     for a in allocations:
         r = {"ticker": a["ticker"], "platform": a["platform"],
              "type": a["type"], "allocation": a["allocation"],
-             "expected_profit": a["expected_profit"]}
+             "expected_profit": a.get("expected_profit", 0)}
+
+        plat = str(a.get("platform") or "").lower()
+        if plat in ("polymarket_us", "poly_us", "polymarket") or a.get("mode") == "DRY/SHADOW":
+            r["status"] = "DRY/SHADOW"
+            r["create_order"] = False
+            r["error"] = "POLY-LEARN classroom; never create_order"
+            results.append(r)
+            continue
         
         if dry_run:
             r["status"] = "DRY_RUN"
@@ -613,6 +635,15 @@ def run(dry_run=False, max_allocs=15):
         lines.append(f"VENUE SHADOW: {n_v} HL/PM Intents (never-dispatchable)")
     except Exception as e:
         lines.append(f"VENUE SHADOW: skip ({str(e)[:60]})")
+
+    # POLY-LEARN: paper classroom. Never mixed into live execute. Never create_order.
+    try:
+        import poly_learn
+        poly_doc = poly_learn.run(models_dir=MODELS_DIR)
+        n_poly = int((poly_doc or {}).get("n") or 0)
+        lines.append(f"POLY-LEARN DRY/SHADOW: {n_poly} proposals (never create_order)")
+    except Exception as e:
+        lines.append(f"POLY-LEARN: skip ({str(e)[:60]})")
     
     # Capital
     capital = get_total_capital()

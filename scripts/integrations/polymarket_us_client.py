@@ -111,6 +111,49 @@ def _positions_n(doc):
     return 0
 
 
+def _quote_seg(value, name="id"):
+    s = urllib.parse.quote(str(value or "").strip(), safe="")
+    if not s:
+        raise ValueError(name + " required")
+    return s
+
+
+def _amount_value(obj):
+    if isinstance(obj, dict):
+        if "value" in obj:
+            try:
+                return float(obj["value"])
+            except (TypeError, ValueError):
+                return None
+        return _amount_value(obj.get("px"))
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        return None
+
+
+def sizing_from_bbo(doc):
+    """Best bid/ask for paper sizing. Not a fill."""
+    raw = doc if isinstance(doc, dict) else {}
+    md = raw.get("marketData") if isinstance(raw.get("marketData"), dict) else raw
+    bid = _amount_value(md.get("bestBid"))
+    ask = _amount_value(md.get("bestAsk"))
+    if bid is None:
+        bids = md.get("bids") or []
+        if bids and isinstance(bids[0], dict):
+            bid = _amount_value(bids[0].get("px") or bids[0])
+    if ask is None:
+        offers = md.get("offers") or md.get("asks") or []
+        if offers and isinstance(offers[0], dict):
+            ask = _amount_value(offers[0].get("px") or offers[0])
+    mid = spread = None
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2.0
+        spread = ask - bid
+    return {"bid": bid, "ask": ask, "mid": mid, "spread": spread,
+            "ok": bid is not None and ask is not None and ask > 0}
+
+
 def nav_category(name):
     n = str(name or "").strip().upper().replace(" ", "_")
     if n in ("CULTURE", "OSCARS", "AWARDS"):
@@ -301,6 +344,27 @@ class PolymarketUSClient:
         for name in NAV_ORDER:
             out[name] = self.list_nav_markets(name, limit=limit)
         return out
+
+    def get_market(self, slug):
+        """GET /v1/market/slug/{slug} — public, for paper sizing."""
+        return self._request(
+            "GET", "/v1/market/slug/" + _quote_seg(slug, "slug"), auth=False)
+
+    def get_market_by_id(self, market_id):
+        return self._request(
+            "GET", "/v1/market/id/" + _quote_seg(market_id, "id"), auth=False)
+
+    def get_bbo(self, slug):
+        """GET /v1/markets/{slug}/bbo — public top of book."""
+        return self._request(
+            "GET", "/v1/markets/" + _quote_seg(slug, "slug") + "/bbo",
+            auth=False)
+
+    def get_book(self, slug):
+        """GET /v1/markets/{slug}/book — public L2. Prefer BBO for sizing."""
+        return self._request(
+            "GET", "/v1/markets/" + _quote_seg(slug, "slug") + "/book",
+            auth=False)
 
     def get_open_orders(self, market_slug=None):
         q = {"marketSlug": market_slug} if market_slug else None

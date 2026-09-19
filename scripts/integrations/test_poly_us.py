@@ -49,7 +49,26 @@ class MockXport:
                                 "markets": [{"slug": slug + "-mkt"}]}]}
         if path == "/v1/markets":
             return {"markets": [{"slug": "btc-100k",
-                                 "tags": [{"slug": "crypto"}]}]}
+                                 "tags": [{"slug": "crypto"}],
+                                 "question": "Bitcoin above 100k?"}]}
+        if path.startswith("/v1/market/slug/"):
+            slug = path.rsplit("/", 1)[-1]
+            return {"slug": slug, "question": slug.replace("-", " "),
+                    "active": True, "tags": [{"slug": "crypto"}]}
+        if path.startswith("/v1/market/id/"):
+            return {"id": path.rsplit("/", 1)[-1], "slug": "btc-100k"}
+        if path.startswith("/v1/markets/") and path.endswith("/bbo"):
+            slug = path.split("/")[3]
+            return {"marketData": {
+                "marketSlug": slug,
+                "bestBid": {"value": "0.54", "currency": "USD"},
+                "bestAsk": {"value": "0.56", "currency": "USD"}}}
+        if path.startswith("/v1/markets/") and path.endswith("/book"):
+            slug = path.split("/")[3]
+            return {"marketData": {
+                "marketSlug": slug,
+                "bids": [{"px": {"value": "0.54", "currency": "USD"}, "qty": "10"}],
+                "offers": [{"px": {"value": "0.56", "currency": "USD"}, "qty": "12"}]}}
         if path == "/v1/events":
             return {"events": [{"slug": "ev-1"}]}
         if path == "/v1/account/balances":
@@ -117,7 +136,7 @@ def test_hygiene_and_fence():
     assert "websocket" in matrix.lower()
     assert "whoami_retail" in matrix.lower() or "retail identity" in matrix.lower()
     assert "api.prod.polymarketexchange.com" in matrix
-    assert vc.VALEDIA_VERSION == "0.40.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.41.0", vc.VALEDIA_VERSION
     assert 'self._request("GET", "/v1/whoami"' not in src
     assert "def whoami_retail" in src
     smoke_src = open(os.path.join(HERE, "poly_us_smoke.py")).read()

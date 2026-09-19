@@ -16,7 +16,10 @@ Fill-true (H3 / POLY-E habit): **preview ≠ create**; **create ack ≠ fill**. 
 | Whoami (retail) | identity = `GET /v1/account/balances` (`whoami()` / `whoami_retail()`) | Ed25519 | yes (auth check) | **tested-mock** | Returns `{ok, source:"balances", balances:[redacted], positions_n?}`. Not a fill. |
 | Account balances | `GET /v1/account/balances` | yes | yes (buying power / fee gate) | **tested-mock** | Read-only. Optional live smoke if keys present. |
 | Markets list | `GET /v1/markets` | public | yes (universe) | **tested-mock** | Gateway only. Not CLOB Gamma. |
-| Market by slug/id, BBO, book, settlement, price history | `GET /v1/markets/...` | public | yes (price/size) | **missing** (list only this slice) | Add when sizing US live. |
+| Market by slug/id | `GET /v1/market/slug/{slug}`, `GET /v1/market/id/{id}` | public | yes (universe → one market) | **tested-mock** | POLY-LEARN sizing. Gateway only. |
+| BBO | `GET /v1/markets/{slug}/bbo` | public | yes (price/size) | **tested-mock** | `sizing_from_bbo`. Not a fill. |
+| Book | `GET /v1/markets/{slug}/book` | public | yes (depth) | **tested-mock** | Prefer BBO for paper size. |
+| Settlement, price history | `GET /v1/markets/{slug}/settlement`, `GET /v1/price-history` | public | later | **missing** | YAGNI until live writer. |
 | Events list | `GET /v1/events` | public | yes | **tested-mock** | `tagSlug` supported. |
 | Event by slug/id | `GET /v1/events/...` | public | later | **missing** | |
 | Search | `GET /v1/search` | public | discovery | **stub** (method present) | |
