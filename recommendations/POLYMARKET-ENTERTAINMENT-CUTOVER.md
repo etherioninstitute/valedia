@@ -41,4 +41,4 @@ POST `/order` ack is **not** a fill (`status=matched` included). Reconcile with 
 python3 -c "import valedia_config as vc, polymarket_order_body as p; print(vc.VALEDIA_VERSION, vc.VENUE_WRITER['polymarket'], vc.NAUTILUS_LIVE, p.LIVE_CLIENT_HOOK, vc.MIROFISH_AUTO_RAISE)"
 ```
 
-Expect: `0.35.0 none False None False`
+Expect: `0.36.0 none False None False`

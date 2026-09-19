@@ -4,6 +4,10 @@ Maintains target allocation across assets.
 Slice 5: proposed trades emit never-dispatchable shadow Intents (Slice 1 schema).
 Does not auto-execute. Does not call market_buy/market_sell. Writer stays valedia.
 
+TREASURY-1: cash floors live in valedia_config.TREASURY_FLOORS. This module stays
+shadow-only (REBALANCER_AUTOEXEC=False). treasury_status never calls
+exec_rebalance_trades. Cross-venue funding is human, not rebalancer.
+
 get_balances/get_price stay injectable so tests never hit Coinbase. Cron default
 still reads balances/prices via coinbase_trader (existing, read-only for this path).
 (c) GOATWORTHY Post LLC.

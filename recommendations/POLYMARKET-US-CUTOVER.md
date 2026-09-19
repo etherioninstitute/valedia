@@ -49,4 +49,4 @@ Int'l CLOB ≠ US DCM. Do not point this client at `clob.polymarket.com`.
 python3 -c "import valedia_config as vc, polymarket_order_body as p, polymarket_us_client as u; print(vc.VALEDIA_VERSION, vc.VENUE_WRITER['polymarket'], vc.NAUTILUS_LIVE, p.LIVE_CLIENT_HOOK, u.live_enabled())"
 ```
 
-Expect: `0.35.0 none False None False`
+Expect: `0.36.0 none False None False`

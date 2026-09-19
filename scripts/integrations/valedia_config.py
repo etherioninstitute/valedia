@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.35.0 = POLY-US-2 retail whoami + preview dry-run).
-# Prior 0.34.0 = POLY-US API matrix. Prior 0.33.0 = H8+POLY-E.
+# Runtime identity (0.36.0 = TREASURY-1 report-only multi-venue funding).
+# Prior 0.35.0 = POLY-US-2 retail whoami. Prior 0.34.0 = POLY-US API matrix.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.35.0"
+VALEDIA_VERSION = "0.36.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -116,6 +116,24 @@ FORTRESS_INTEL_FALLBACK = False
 # AND passes live_flag gates. This lane never sets True. NT never writes.
 REBALANCER_AUTOEXEC = False
 
+# TREASURY-1 — report-only cash floors. Never ACH/wire/card, never withdraw.
+# Optional later auto top-up from one treasury bank. This lane never sets True.
+# First human fund is still required even if the flag is later flipped.
+VALEDIA_TREASURY_AUTO = False
+TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
+TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
+TREASURY_FLOOR_COINBASE = 20.0
+TREASURY_FLOOR_ALPACA = 10.0
+TREASURY_FLOORS = {
+    "polymarket_us": TREASURY_FLOOR_POLYMARKET_US,
+    "kalshi": TREASURY_FLOOR_KALSHI,
+    "coinbase": TREASURY_FLOOR_COINBASE,
+    "alpaca": TREASURY_FLOOR_ALPACA,
+    "hyperliquid": None,  # writer none; document only
+    "kraken": None,
+}
+TREASURY_ALERT_WEBHOOK = ""  # unused stub; treasury_status never POSTs it
+
 # Cron stagger (Slice 7): sports every 2h at :00, allocator every 4h at :20.
 # Same-minute collision was a double-bet race on 4h boundaries.
 SPORTS_CRON_MINUTE = 0
@@ -210,6 +228,28 @@ def rebalancer_autoexec_enabled():
     venue_writer==valedia. NT cannot dispatch. This lane never sets True.
     """
     return _env_flag("REBALANCER_AUTOEXEC", REBALANCER_AUTOEXEC)
+
+
+def treasury_auto_enabled():
+    """True only if Burton flipped VALEDIA_TREASURY_AUTO. Default False.
+
+    Necessary but not sufficient: treasury_status still refuses to move
+    money. This lane never sets True. Env VALEDIA_TREASURY_AUTO=1 wins.
+    """
+    return _env_flag("VALEDIA_TREASURY_AUTO", VALEDIA_TREASURY_AUTO)
+
+
+def treasury_floors():
+    """Copy of TREASURY_FLOORS (None = no floor / document-only venue)."""
+    return dict(TREASURY_FLOORS)
+
+
+def treasury_alert_webhook():
+    """Unused stub. treasury_status never POSTs this URL."""
+    env = _os.environ.get("TREASURY_ALERT_WEBHOOK")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    return str(TREASURY_ALERT_WEBHOOK or "")
 
 
 def scalper_live_enabled():
