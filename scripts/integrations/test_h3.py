@@ -182,10 +182,10 @@ def test_hygiene_and_version():
     assert "fills_payload=result.get(\"fills_payload\")" in ke_src
     assert "MIROFISH_AUTO_RAISE" not in se_src
     assert "--live" not in ftl_src
-    assert vc.VALEDIA_VERSION == "0.43.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.44.0", vc.VALEDIA_VERSION
     assert vc.MIROFISH_AUTO_RAISE is False
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.43.0 ")
+    assert vc.version_stamp().startswith("v0.44.0 ")
 
 
 if __name__ == "__main__":

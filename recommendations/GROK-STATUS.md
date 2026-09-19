@@ -6,16 +6,16 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** KALSHI-ORDERS-V2 SHIPPED. Next=Burton re-run live allocator.
+**Current:** MIROFISH-BIONIC SHIPPED. Next=Burton (Neo4j `:7687` was down during healthcheck; 27B sync timeout risk vs 8B still open).
 
-**Version:** `0.43.0` tag `valedia-v0.43.0` tip `db21c91`. Prior: `0.42.0` `02298ad`.
+**Version:** `0.44.0` (tag `valedia-v0.44.0` after commit). Prior: `0.43.0` `db21c91`.
 
-**Tests:** `test_kalshi_orders_v2.py` PASS (yes→bid, no→ask at 1-price, sell maps, cancel V2, V2 ack fill_count 0 ≠ fill). Also h3, kill-switch, scan_accuracy, slice8/9/23, execution_policy, poly_learn.
+**Tests:** `test_mirofish_bionic.py` PASS (openai/ollama URL detect + 768-d parse). `test_mirofish_smoke.py` PASS. `test_slice23.py` PASS. `test_kill_switch.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-KALSHI-ORDERS-V2.md` (thin). No new client; mapped onto existing create/sell.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-MIROFISH-BIONIC.md` (thin). No new client; OpenAI embed is URL+parse on existing `requests`.
 
-**Tool use:** RuFlo `hooks_route`/`hooks_pre-task`/`hooks_pre-edit` (architect/coder/tester). CBM `list_projects` + `search_graph` `create_order`/`sell_position` + `trace_path` inbound + `get_code_snippet` + `check_index_coverage`. Ponytail after code (no batch/amend, no client_order_id).
+**Tool use:** RuFlo `hooks_route` / `hooks_pre-task` / `memory_search` (grok-build, 0.42). CBM `list_projects` + `search_graph` embedding_service / `_request_embeddings` inbound + `get_code_snippet` + `check_index_coverage`. Ponytail after code (no dual-load manager, no llm_client rewrite).
 
-**Fence:** No live orders in Build. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore (live `valedia_config` not wholesale-copied). No weather/oil unfence. MiroFish ears on. FENCED.
+**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore (live `valedia_config` not wholesale-copied). No weather/oil unfence. Did **not** stop `com.burton.ollama-mirofish`. Did **not** delete models. MiroFish ears on. FENCED.
 
-**Next:** Burton re-run live allocator. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
+**Next:** Burton. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil. Optional: bring Neo4j `:7687` up; if ontology timeouts on 27B, `mirofish-inference ollama --write`.

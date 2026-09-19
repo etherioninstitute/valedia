@@ -10,6 +10,7 @@
 7. **POLY-LEARN** — done `0.41.0` (`POLY-LEARN.md`, `PROFIT-PATHS-INVENTORY.md`; no POLYMARKET_US_LIVE flip).
 7b. **SCAN-ACCURACY** — done `0.42.0` (honest Signal scan, oil ticker-family fence, Kalshi per-venue deployable).
 7c. **KALSHI-ORDERS-V2** — done `0.43.0` (Create/Cancel Order V2; yes/no → bid/ask). Next = Burton re-run live allocator.
+7d. **MIROFISH-BIONIC** — done `0.44.0` (Bionic `:1234` primary, Ollama `:11435` fallback). See `MIROFISH-BIONIC.md`.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)
@@ -33,3 +34,4 @@
 - Signal P&L remains truthful broker tracker; UI must not pretend FTL when n=0.
 
 7c. **KALSHI-ORDERS-V2** — done `0.43.0`. Next = Burton re-run live allocator.
+7d. **MIROFISH-BIONIC** — done `0.44.0` (Bionic `:1234` primary, Ollama `:11435` fallback; OpenAI embeddings). See `MIROFISH-BIONIC.md` Results.

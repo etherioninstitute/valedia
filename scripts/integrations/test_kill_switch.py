@@ -61,7 +61,7 @@ def test_hygiene_and_default_off():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.trading_halted() is False
     assert vc.require_not_halted("probe") is False
-    assert vc.VALEDIA_VERSION == "0.43.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.44.0", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.MIROFISH_AUTO_RAISE is False

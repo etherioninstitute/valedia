@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.43.0 = KALSHI-ORDERS-V2: Create/Cancel Order V2, YES-leg bid/ask).
-# Prior 0.42.0 = SCAN-ACCURACY. Prior 0.41.0 = POLY-LEARN. Prior 0.40.0 = OPENTERMINAL-VALEDIA.
+# Runtime identity (0.44.0 = MIROFISH-BIONIC: Bionic :1234 primary, Ollama :11435 fallback).
+# Prior 0.43.0 = KALSHI-ORDERS-V2. Prior 0.42.0 = SCAN-ACCURACY. Prior 0.41.0 = POLY-LEARN.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.43.0"
+VALEDIA_VERSION = "0.44.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
