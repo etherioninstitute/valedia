@@ -1,5 +1,10 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-19 PT — **OPENTERMINAL-VALEDIA SHIPPED**. Version `0.40.0` tag `valedia-v0.40.0` tip `3327adc`. Read-only glance `valedia_cockpit.py --listen` → `http://127.0.0.1:8765/`. Ponytail: `PONYTAIL-AUDIT-OPENTERMINAL-VALEDIA.md`. **Next = staged ON (STOP for Burton — do not auto-flip live).** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+Updated: 2026-09-19 PT — **POLY-LEARN SHIPPED**. Version `0.41.0` tag `valedia-v0.41.0` tip `a211b8d`. Paper classroom `poly_learn.py` → `models/poly_us_proposals.json` DRY/SHADOW. Inventory `PROFIT-PATHS-INVENTORY.md`. Ponytail: `PONYTAIL-AUDIT-POLY-LEARN.md`. **GROK-STATUS: POLY-LEARN SHIPPED; Next=Burton (Kalshi stays ON; Poly live still STOP).** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+
+## POLY-LEARN (Grok Build executor, `valedia-v2-grok-build`)
+- US DCM market-by-slug + BBO/book helpers. `poly_learn` proposals labeled DRY/SHADOW. Allocator execute never `create_order`. Preview still works. Cheap MiroFish/persona tags from cache.
+- `test_poly_learn.py` PASS. `POLYMARKET_US_LIVE` False. Writer polymarket `none`.
+- **Next = Burton. Kalshi stays ON. Poly live still STOP.**
 
 ## OPENTERMINAL-VALEDIA (Grok Build executor, `valedia-v2-grok-build`)
 - HIG HTML glance on existing GET server :8765 (not OT :3000 / API :4010 / LiteLLM :4000). JSON `/status` + FTL vs broker labels; halt shown; ears always gathering.
