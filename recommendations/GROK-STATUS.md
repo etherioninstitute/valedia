@@ -6,7 +6,7 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** SHIPPED — adversarial paper fights `VALEDIA_VERSION` **0.27.0** (H2 personas stay `0.26.0`). Module `scripts/integrations/adversarial_paper_fight.py` + thin `adversarial_run.py` (not crontab-installed). JSON `models/adversarial_round_*.json`. Lenses: H2 Buffett, momentum/kernel, MiroFish-enriched, risk veto. Heuristics/stdlib. No orders. No LN.
+**Current:** SHIPPED — adversarial paper fights `VALEDIA_VERSION` **0.27.0** tip `448410f` tag `valedia-v0.27.0` (H2 personas stay `0.26.0` / `ba71ab6`). Module `scripts/integrations/adversarial_paper_fight.py` + thin `adversarial_run.py` (not crontab-installed). JSON `models/adversarial_round_*.json`. Lenses: H2 Buffett, momentum/kernel, MiroFish-enriched, risk veto. Heuristics/stdlib. No orders. No LN.
 
 **Tests:** `python3 test_adversarial_paper_fight.py` PASS (mocked). `test_nt1` / `test_nt2` / `test_slice23` PASS.
 

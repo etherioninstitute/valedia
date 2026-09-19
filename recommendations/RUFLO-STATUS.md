@@ -1,5 +1,5 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-18 PT — **Paper fights SHIPPED.** Version `0.27.0`. H2 personas remain `0.26.0` (`ba71ab6`). **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
+Updated: 2026-09-18 PT — **Paper fights SHIPPED.** Version `0.27.0` tip `448410f` tag `valedia-v0.27.0`. H2 personas remain `0.26.0` (`ba71ab6`). **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
 
 ## Paper fights (Grok Build executor, `valedia-v2-grok-build`)
 - `adversarial_paper_fight.py` reuses H2 Buffett; momentum/kernel; MiroFish-enriched; risk veto. `adversarial_run.py` not crontab-installed.
