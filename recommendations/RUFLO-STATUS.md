@@ -1,4 +1,13 @@
 # Ruflo status board (Claude Code check-in)
+Updated: 2026-09-18 PT — **Paper fights SHIPPED.** Version `0.27.0`. H2 personas remain `0.26.0` (`ba71ab6`). **STOP for Burton.** No AUTO_RAISE / writers / LN / crontab.
+
+## Paper fights (Grok Build executor, `valedia-v2-grok-build`)
+- `adversarial_paper_fight.py` reuses H2 Buffett; momentum/kernel; MiroFish-enriched; risk veto. `adversarial_run.py` not crontab-installed.
+- JSON `models/adversarial_round_*.json`. Tests: `test_adversarial_paper_fight.py` PASS. Ponytail: `PONYTAIL-AUDIT-ADV-FIGHT.md`.
+- Arena LN left. Fight pattern only. Fence held.
+
+---
+
 Updated: 2026-09-18 PT — **Arc H1+H2 SHIPPED.** Version `0.26.0` tip `ba71ab6` tag `valedia-v0.26.0` on Build. **STOP for Burton.** H3 Kalshi fill-true / H4 OpenTerminal next named go. Dynamic band + master flip still later. No AUTO_RAISE / writers / LN.
 
 ## H1 / H2 (Grok Build executor, `valedia-v2-grok-build`)

@@ -194,9 +194,9 @@ def test_weight_math_unchanged_with_enriched_proven():
 
 
 def test_version_contract():
-    assert vc.VALEDIA_VERSION == "0.26.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.27.0", vc.VALEDIA_VERSION
     stamp = vc.version_stamp()
-    assert stamp.startswith("v0.26.0 ")
+    assert stamp.startswith("v0.27.0 ")
     src = open(os.path.join(HERE, "valedia_config.py")).read()
     assert "VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md" in src
     assert "VALEDIA_SELF_ADJUST" in src

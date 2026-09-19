@@ -1,17 +1,19 @@
 # Grok Build status
 
-**NORTH STAR:** world's smartest, highest-profiting auto-trader (seamless; dynamic; gates until Burton widens).
+**NORTH STAR:** world's smartest, highest-profiting DYNAMIC auto-trader.
 
 **Updated:** 2026-09-18 PT
 
-**Mode:** RuFlo MCP (`:8810` filtered) + Ponytail. Hard fence held.
+**Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** SHIPPED — Arc **H1** dossiers + `VALEDIA-SEAMLESS-ARCHITECTURE.md`; **H2** Buffett/Lynch/Hayes lenses (`persona_lenses.py`) wired like NT-2. `VALEDIA_VERSION` **0.26.0**. Tip `ba71ab6` tag `valedia-v0.26.0`. `test_h2.py` PASS.
+**Current:** SHIPPED — adversarial paper fights `VALEDIA_VERSION` **0.27.0** (H2 personas stay `0.26.0`). Module `scripts/integrations/adversarial_paper_fight.py` + thin `adversarial_run.py` (not crontab-installed). JSON `models/adversarial_round_*.json`. Lenses: H2 Buffett, momentum/kernel, MiroFish-enriched, risk veto. Heuristics/stdlib. No orders. No LN.
 
-**Shipped:** NT-0…NT-2; H1; H2 (advisory attach only — no weight math)
+**Tests:** `python3 test_adversarial_paper_fight.py` PASS (mocked). `test_nt1` / `test_nt2` / `test_slice23` PASS.
 
-**Fence:** No live writers / `MIROFISH_AUTO_RAISE=False` / caps 0.10–0.15 / `NAUTILUS_LIVE=False` / `SPOT_RECONCILE_HTTP=False` / no LN/Arena funding
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-ADV-FIGHT.md` (safe cuts applied; runner kept because charter named it).
 
-**Loop:** analyze → code → Ponytail audit (`recommendations/PONYTAIL-AUDIT-H2.md`).
+**H1:** dossiers in `recommendations/ADAPT-DOSSIERS/` + `VALEDIA-SEAMLESS-ARCHITECTURE.md`. Arena dossier = leave LN, steal fight pattern → this module.
 
-**Next:** STOP for Burton. Then H3 kalshi-agent fill-true rewrite, or H4 OpenTerminal panel. Arena/paper fights stay **H7** (`ADAPT-DOSSIERS/lf-game-theory.md`) — paper/shadow only, no Lightning.
+**Fence:** No live writers, no AUTO_RAISE flip, no LN/Arena funding, no crontab install.
+
+**Next:** STOP for Burton. Do not start NT-3 / dynamic-band / Arena funding.

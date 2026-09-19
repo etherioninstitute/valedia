@@ -4,7 +4,9 @@
 **Upstream:** Paul Ferguson / Lightning Faucet (`pfergi42/lf-game-theory`)  
 **License:** README claims **MIT**; **no `LICENSE` file**, `package.json` has no `license` field. Attribute on rewrite.  
 **Slice:** H7 — offline strategy stress. **No funded sats unless Burton.**  
-**Prior docs:** `SEBAI-ARENA-*.md`, `BURTON-PILOT-RUN.md`, `BURTON-ARENA-SECURITY-AUDIT-GROK.md`. Clone already has `experiments/arena-valedia-micro-pilot.yaml` (4×5×100 sats).
+**Burton 2026-09-18:** Lightning / Arena sats are **out of profit scope**. Leave LN. Steal the **fight pattern only**.  
+**Shipped (no LN):** `scripts/integrations/adversarial_paper_fight.py` — Buffett / momentum / MiroFish / risk-veto paper fight, JSON under `models/adversarial_round_*.json`, scored later vs fee-true FTL. Do not fund Arena. Do not `npm run arena:*`.  
+**Prior docs:** `SEBAI-ARENA-*.md`, `BURTON-PILOT-RUN.md`, `BURTON-ARENA-SECURITY-AUDIT-GROK.md`. Clone already has `experiments/arena-valedia-micro-pilot.yaml` (4×5×100 sats) — **leave unfunded**.
 
 ---
 
@@ -35,13 +37,13 @@ Valedia overlay in-tree: `npm run arena:valedia-micro`. Grok Build does **not** 
 
 ## STEAL
 
-1. **Four primes as strategy opponents** — strategic / competitive / cooperative / neutral. Use as *policies that attack Valedia strategies*, not extra traders.  
-2. **Allowlisted action grammar + rate limits** — models emit text; **code** moves balances (same spirit as Intent gates).  
-3. **Paper-sats closed loop** (missing upstream) — integer ledger, no HTTP. **This is the only H7 default.**  
-4. **Classic 5-game battery** — cheap unit tests of persona/strategy prompts (H2 Buffett vs extractive peer).  
-5. **Gini / exploitation / deception metrics** — robustness tags, not size.  
-6. **Append-only run log** — FTL-shaped JSONL.  
-7. **YAML micro matrix** — ≤4 agents, ≤10 rounds, local models.  
+1. **Adversarial multi-agent fight (SHIPPED, no LN)** — personas/strategies score the same opportunity set, disagreement recorded, risk can veto, later fee-true FTL scoring. Valedia module: `scripts/integrations/adversarial_paper_fight.py` (+ thin `adversarial_run.py`, **not** crontab-installed). This is the Arena energy without sats.  
+2. **Four primes as strategy opponents** — strategic / competitive / cooperative / neutral. Optional later lenses; not extra traders.  
+3. **Allowlisted action grammar + rate limits** — models emit text; **code** moves balances (same spirit as Intent gates).  
+4. **Paper closed loop** — integer/JSON ledger, no HTTP. **Default. No faucet.**  
+5. **Classic 5-game battery** — cheap unit tests of persona prompts (later).  
+6. **Gini / exploitation / deception metrics** — robustness tags, not size. Do not add `FUSION_WEIGHTS["arena"]`.  
+7. **Append-only run log** — FTL-shaped JSONL later; fight JSON is the first log.  
 8. **Research hygiene** — one-run README results are not fusion alpha.
 
 ---
@@ -86,18 +88,19 @@ Valedia overlay in-tree: `npm run arena:valedia-micro`. Grok Build does **not** 
 
 ## Seamless hook
 
-Arena is a **lab leaf**, not a trunk:
+Arena LN is **left**. Fight pattern is a **lab leaf** on the one brain:
 
 ```
-Valedia brain  ←  no arena weight
-MiroFish       ←  optional robustness tags on seed
-        └── arena_stress.py (paper default, local LLM or fixtures)
-              → models/arena_stress.json
-              → never dispatchable
+Valedia brain  ←  no arena weight, no LN
+MiroFish / opps
+        └── adversarial_paper_fight.py  (PAPER/SHADOW)
+              → models/adversarial_round_*.json
+              → later: fee-true FTL winner/loser
+              → never dispatchable, never faucet
 ```
 
 ---
 
 ## H7-ready
 
-`scripts/integrations/arena_stress.py`: `ARENA_MODE=paper` default; refuse Lightning unless a **named Burton flag**. Fixture test: cooperative policy loses to strategic. Zero network in CI. Do not start `npm run arena:*`.
+**Done this session:** in-Valedia paper fight (no `lf-game-theory` process). Remaining H7 (optional, Burton go): fixture stress of primes; still `ARENA_MODE=paper`; refuse Lightning unless a **named Burton flag**. Do not start `npm run arena:*`. Do not fund.

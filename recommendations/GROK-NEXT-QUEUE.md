@@ -1,19 +1,17 @@
 # Grok Build queue (Burton — seamless adapt)
 
 ## DONE this session
-- **NT-2** — enrichment wired into seed + extractor; ledger `neural_enriched`; tests mocked; `VALEDIA_VERSION` 0.25.0. `MIROFISH_AUTO_RAISE` still False; caps 0.10/0.15; no weight math.
-- **H1** — `recommendations/ADAPT-DOSSIERS/` + `VALEDIA-SEAMLESS-ARCHITECTURE.md`.
-- **H2** — Buffett/Lynch/Hayes `persona_lenses.py` attach; v0.26.0; `PONYTAIL-AUDIT-H2.md`. No weight/Kelly/orders.
+- **Adversarial paper fights (0.27.0)** — `adversarial_paper_fight.py` + `adversarial_run.py` (not crontab). Reuses H2 Buffett; momentum/MiroFish/risk-veto. JSON under `models/`. Tests mocked PASS. Ponytail audit written. Arena LN left; fight pattern pointed at this module.
+- **H1** — `ADAPT-DOSSIERS/` + `VALEDIA-SEAMLESS-ARCHITECTURE.md` (wired).
 
 ## STOP
-Do not start **H3** Kalshi fill-true, **H4/NT-3** OpenTerminal, dynamic-band/`VALEDIA_SELF_ADJUST`, or funded Arena/LN this session.
+Do not start **NT-3** OpenTerminal or dynamic-band/`VALEDIA_SELF_ADJUST` this session. Do not install crontab. Do not fund Arena.
 
 ## Later (Burton go)
-- **H3** kalshi-agent ideas → Valedia fill-true / scan (personal-use rewrite)
-- **H4** OpenTerminal Valedia GET panel
-- **H5** hypergrok desk passes + HL public `/info`
-- **H6** Nautilus shadow event model (`Ambiguous` ≠ denied)
-- **H7** Arena paper stress (no Lightning)
-- **H8** fortress intel fallback, flag default off
+- H2 leftovers: Lynch / Hayes lenses on the same fight module
+- H3 Kalshi fill-true
+- FTL winner/loser scoring of paper-fight JSON
+- H4 OpenTerminal GET panel
+- H5–H8 as charter
 
 Live venue fences still held unless Burton flips.

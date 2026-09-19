@@ -103,9 +103,12 @@ When Burton flips `VALEDIA_SELF_ADJUST`, lenses can start contributing to *which
 
 ## H2-ready
 
-**Ship:** Buffett (value) + Lynch (GARP) + Hayes (crypto macro). Skip Thorp (Kelly already ours). Simons *scoring* (p/z, net-of-cost, alpha-decay) is optional later — **not** his `0.5 × Kelly`. Structured-output rule from `docs/security-model.md`: lenses **propose JSON, never execute**. HL connector in this tree stores a wallet key even with orders disabled — do not `npm i` connectors.
+**Shipped H2 (0.26.0):** `persona_lenses.py` Buffett/Lynch/Hayes attach on MiroFish (no DCF invention).  
+**Shipped paper fight (0.27.0):** `adversarial_paper_fight.py` reuses H2 Buffett vs momentum/MiroFish/risk-veto. No keys, no LLM.
 
-**Adapter:** one Python module, deterministic, stdlib. Schema per symbol:
+**Still later:** Lynch (GARP) + Hayes (crypto macro) as extra lenses. Skip Thorp (Kelly already ours). Simons *scoring* is optional — **not** his `0.5 × Kelly`. Lenses **propose JSON, never execute**. Do not `npm i` connectors.
+
+**Adapter:** `scripts/integrations/adversarial_paper_fight.py`, deterministic, stdlib. Schema per symbol:
 
 ```json
 {

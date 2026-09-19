@@ -1,7 +1,7 @@
 # Valedia seamless one-brain architecture
 
 **Date:** 2026-09-18  
-**Status:** H1 design (post NT-2 `71a39f9` / `valedia-v0.25.0`)  
+**Status:** H1 dossiers + map; H2 personas `0.26.0`; paper fights `0.27.0` (no LN)  
 **NORTH STAR:** world-smartest, highest-profiting **dynamic** auto-trader. One brain. Self-adjust when Burton flips smart mode. Live risk gated until he widens fences.
 
 Hard fence (this doc does not lift): no venue `--live` writers, wallet/spend, `VENUE_WRITER` flips, `REBALANCER_AUTOEXEC`, `SPOT_RECONCILE_HTTP`, `NAUTILUS_LIVE`. `MIROFISH_AUTO_RAISE=False` (band design exists; do not implement the flip this slice).
@@ -38,7 +38,8 @@ Everything we steal from disk becomes **intel, shadow, UI, or OMS-event practice
 │  MiroFish swarm (:11435) │                 │  Nautilus sidecar (H6)    │
 │  seed ← neural (NT-2)    │                 │  IntentConsumer only      │
 │       ← personas (H2)    │                 │  NAUTILUS_LIVE=False      │
-│       ← arena tags (H7)  │                 │  event timeline in SHADOW │
+│  paper fight (0.27.0)    │                 │  event timeline in SHADOW │
+│       ← risk veto        │                 │                           │
 │  extractor → signal JSON │                 └───────────────────────────┘
 │  accuracy ledger (capped)│
 └──────────▲───────────────┘
@@ -93,7 +94,7 @@ Burton VALEDIA_SELF_ADJUST=1
 | **hypergrok** | H5 desk *passes* + public `/info` snapshot | `/exchange`, stop-% sizer, 7 Grok Bots |
 | **nautilus_trader** | H6 shadow **event** model (Ambiguous ≠ denied) | LiveNode, LGPL in-process, Kalshi-via-Betfair |
 | **kalshi-agent** | H3 fill-true / scan / Brier-from-FTL | UNLICENSED tree, flat $0.07 Kelly, Electron `--live` |
-| **lf-game-theory** | H7 paper-sats stress / primes | Lightning faucet, fusion weight |
+| **lf-game-theory** | fight pattern → `adversarial_paper_fight.py` (PAPER JSON, FTL later) | Lightning faucet, Arena sats, fusion weight |
 | **fortress** | H8 fail-gated allowlisted fetch | WAF-beating default scraper, venue UIs |
 | **neural-trader** | **Done NT-0…2** — enrich JSON only | `trader live`, second portfolio |
 
@@ -105,6 +106,7 @@ Burton VALEDIA_SELF_ADJUST=1
 public APIs / RSS ──► seed ──► MiroFish ──► signal JSON
 neural-trader CLI ──► enrichment JSON ──► attach (scores unchanged)
 persona checklists ──► lens JSON ──► attach (scores unchanged)
+adversarial_paper_fight ──► models/adversarial_round_*.json (PAPER; no orders)
 gatherer ──► shadow Intents ──► queue (dispatchable=False)
 FTL settlements ──► MiroFish accuracy ──► capped weight
 KellySizer ◄── FTL real track only
@@ -136,13 +138,13 @@ Dormant ≠ dead. Forgotten `False` after Burton asked for smart mode is the fai
 
 | Slice | One-brain job |
 |-------|----------------|
-| **H1** | this file + dossiers |
-| **H2** | Buffett/Lynch/Hayes lenses → MiroFish attach |
+| **H1** | this file + dossiers (**done**) |
+| **H2** | Buffett/Lynch/Hayes attach **0.26.0**; paper fight reuses Buffett **0.27.0** |
 | **H3** | Kalshi fill-true + scan hygiene into existing writer |
 | **H4** | OpenTerminal Valedia GET panel |
 | **H5** | desk passes + HL public info file |
 | **H6** | shadow OrderEvent + Ambiguous |
-| **H7** | paper Arena stress JSON |
+| **H7** | Arena LN **left**; fight pattern **shipped** (`adversarial_paper_fight.py`) |
 | **H8** | fortress fallback flag, default off |
 
 STOP between slices. Ponytail audit after every coding slice.
