@@ -63,6 +63,29 @@ def get_orders():
 def get_markets(limit=200, status="open"):
     return get(f"/markets?limit={limit}&status={status}")
 
+
+def get_series(series_ticker):
+    """GET /series/{ticker} — current fee_type + fee_multiplier (read)."""
+    return get(f"/series/{quote(str(series_ticker), safe='')}")
+
+
+def get_series_fee_changes(series_ticker=None, show_historical=True):
+    """GET /series/fee_changes?series_ticker=&show_historical= (read)."""
+    q = [f"show_historical={'true' if show_historical else 'false'}"]
+    if series_ticker:
+        q.insert(0, f"series_ticker={quote(str(series_ticker), safe='')}")
+    return get("/series/fee_changes?" + "&".join(q))
+
+
+def get_event_fee_changes(event_ticker=None, limit=100, cursor=None):
+    """GET /events/fee_changes — event override on parent series (read)."""
+    q = [f"limit={int(limit)}"]
+    if event_ticker:
+        q.append(f"event_ticker={quote(str(event_ticker), safe='')}")
+    if cursor:
+        q.append(f"cursor={quote(str(cursor), safe='')}")
+    return get("/events/fee_changes?" + "&".join(q))
+
 # Write endpoints — Create/Cancel Order V2 (legacy POST /portfolio/orders 410s)
 CREATE_ORDER_V2 = "/portfolio/events/orders"
 

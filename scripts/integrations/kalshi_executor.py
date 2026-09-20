@@ -307,7 +307,7 @@ def _score_market(m, series):
                 rationale += f" [Intel FLIPPED to NO]"
         except: pass
     
-    return {
+    out = {
         "ticker": ticker, "title": title[:60], "series": series,
         "strategy": strategy, "score": round(score, 1),
         "side": side, "price": round(price, 4), "edge": round(edge, 4),
@@ -316,6 +316,15 @@ def _score_market(m, series):
         "last_price": lp, "hours_to_exp": round(hours_to_exp, 1),
         "rationale": rationale, "is_sport": is_sport,
     }
+    try:
+        import kalshi_fee_map as _kfm
+        ok, info = _kfm.allow(ticker, series=series)
+        out["fee_map"] = info
+        if not ok:
+            return None
+    except Exception:
+        pass
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -326,6 +335,13 @@ def _size_contracts(opp, state, cost_per):
     """Shared contract sizing (used by taker execute_trade AND maker placement, so both size
     the same way). Budget + strategy caps + balance-aware. Returns int contracts, or 0 if
     unaffordable/bad price."""
+    try:
+        import kalshi_fee_map as _kfm
+        ok, _ = _kfm.allow(opp.get("ticker"), series=opp.get("series"))
+        if not ok:
+            return 0
+    except Exception:
+        pass
     if cost_per <= 0 or cost_per >= 1.0:
         return 0
     max_spend = min(state["max_per_trade"], state["max_deployable"])

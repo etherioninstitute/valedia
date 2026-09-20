@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.44.0 = MIROFISH-BIONIC: Bionic :1234 primary, Ollama :11435 fallback).
-# Prior 0.43.0 = KALSHI-ORDERS-V2. Prior 0.42.0 = SCAN-ACCURACY. Prior 0.41.0 = POLY-LEARN.
+# Runtime identity (0.45.0 = KALSHI-FEE-MAP: series maker/taker map + consult gate).
+# Prior 0.44.0 = MIROFISH-BIONIC. Prior 0.43.0 = KALSHI-ORDERS-V2.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.44.0"
+VALEDIA_VERSION = "0.45.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -126,6 +126,11 @@ VALEDIA_TREASURY_AUTO = False
 # Manual OFF: env=0/false/off/unset+file cleared. This lane never sets True.
 # Docs: recommendations/KILL-SWITCH.md. Gate: require_not_halted().
 VALEDIA_TRADING_HALT = False
+
+# KALSHI-FEE-MAP blocking gate. Default OFF (annotate only). Env=1 drops
+# unknown + taker_taxed (multiplier > 1) at select/size. Consult always
+# fail-closed on unknown fields. This lane never sets True.
+KALSHI_FEE_MAP_GATE = False
 TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
 TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
 TREASURY_FLOOR_COINBASE = 20.0
@@ -243,6 +248,15 @@ def treasury_auto_enabled():
     money. This lane never sets True. Env VALEDIA_TREASURY_AUTO=1 wins.
     """
     return _env_flag("VALEDIA_TREASURY_AUTO", VALEDIA_TREASURY_AUTO)
+
+
+def kalshi_fee_map_gate_enabled():
+    """True only if Burton flipped KALSHI_FEE_MAP_GATE. Default False.
+
+    Off: consult annotates, never drops. On: drop unknown + taker_taxed.
+    This lane never sets True.
+    """
+    return _env_flag("KALSHI_FEE_MAP_GATE", KALSHI_FEE_MAP_GATE)
 
 
 class HaltedError(RuntimeError):

@@ -350,6 +350,16 @@ def allocate(opps, capital):
         if _is_strategy_paused(cat):
             continue
         if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
+        if o.get("platform") in ("kalshi", "kalshi_scanner"):
+            try:
+                import kalshi_fee_map as _kfm
+                raw = o.get("raw") if isinstance(o.get("raw"), dict) else {}
+                ok, info = _kfm.allow(o.get("ticker"), series=raw.get("series"))
+                o["fee_map"] = info
+                if not ok:
+                    continue
+            except Exception:
+                pass
 
         try:
             _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15

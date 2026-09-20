@@ -11,6 +11,7 @@
 7b. **SCAN-ACCURACY** — done `0.42.0` (honest Signal scan, oil ticker-family fence, Kalshi per-venue deployable).
 7c. **KALSHI-ORDERS-V2** — done `0.43.0` (Create/Cancel Order V2; yes/no → bid/ask). Next = Burton re-run live allocator.
 7d. **MIROFISH-BIONIC** — done `0.44.0` (Bionic `:1234` primary, Ollama `:11435` fallback). See `MIROFISH-BIONIC.md`.
+7e. **KALSHI-FEE-MAP** — done `0.45.0` (series maker/taker map, `fee(P,C,M)`, consult gate default off). See `KALSHI-FEE-MAP.md`.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)

@@ -6,16 +6,16 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** MIROFISH-BIONIC SHIPPED. Next=Burton (Neo4j `:7687` was down during healthcheck; 27B sync timeout risk vs 8B still open).
+**Current:** KALSHI-FEE-MAP SHIPPED. Next=Burton (flip `KALSHI_FEE_MAP_GATE=1` only after a GET refresh populates sports multipliers).
 
-**Version:** `0.44.0` tag `valedia-v0.44.0` tip `39dfe68`. Prior: `0.43.0` `db21c91`.
+**Version:** `0.45.0` tag `valedia-v0.45.0` (stamp after commit). Prior: `0.44.0` `39dfe68`.
 
-**Tests:** `test_mirofish_bionic.py` PASS (openai/ollama URL detect + 768-d parse). `test_mirofish_smoke.py` PASS. `test_slice23.py` PASS. `test_kill_switch.py` PASS.
+**Tests:** `test_kalshi_fee_map.py` PASS (PDF Jul 7 2026 table + maker formula + mocked V2 GETs + gate off/on). `test_kalshi_orders_v2.py` PASS. `test_slice23.py` PASS. `test_sports_engine.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-MIROFISH-BIONIC.md` (thin). No new client; OpenAI embed is URL+parse on existing `requests`.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-KALSHI-FEE-MAP.md`. No new client; gate default off.
 
-**Tool use:** RuFlo `hooks_route` / `hooks_pre-task` / `memory_search` (grok-build, 0.42). CBM `list_projects` + `search_graph` embedding_service / `_request_embeddings` inbound + `get_code_snippet` + `check_index_coverage`. Ponytail after code (no dual-load manager, no llm_client rewrite).
+**Tool use:** RuFlo `hooks_route` (grok-build, 0.7) / `hooks_pre-task` / `memory_search` (kalshi-orders-v2). CBM `list_projects` + `get_architecture` scripts/integrations + `search_graph` fee/kalshi/allocator + `get_code_snippet` + `trace_path` `kalshi_auth.get` inbound + `check_index_coverage`. Ponytail after code (no PDF scrape of garbled pages, no FTL rewrite, no gate default on).
 
-**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore (live `valedia_config` not wholesale-copied). No weather/oil unfence. Did **not** stop `com.burton.ollama-mirofish`. Did **not** delete models. MiroFish ears on. FENCED.
+**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. FENCED.
 
-**Next:** Burton. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil. Optional: bring Neo4j `:7687` up; if ontology timeouts on 27B, `mirofish-inference ollama --write`.
+**Next:** Burton. Do not auto-flip `KALSHI_FEE_MAP_GATE`. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
