@@ -136,7 +136,7 @@ def test_hygiene_and_fence():
     assert "websocket" in matrix.lower()
     assert "whoami_retail" in matrix.lower() or "retail identity" in matrix.lower()
     assert "api.prod.polymarketexchange.com" in matrix
-    assert vc.VALEDIA_VERSION == "0.45.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.46.0", vc.VALEDIA_VERSION
     assert 'self._request("GET", "/v1/whoami"' not in src
     assert "def whoami_retail" in src
     smoke_src = open(os.path.join(HERE, "poly_us_smoke.py")).read()

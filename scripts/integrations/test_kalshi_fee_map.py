@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""KALSHI-FEE-MAP — formula vs PDF Jul 7 2026, map join, gate. No network.
+"""KALSHI-FEE-MAP — formula vs PDF Jul 7 2026, map join, gate, refresh. No network.
 
 Run: python3 test_kalshi_fee_map.py
 """
+import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -163,7 +165,7 @@ def test_allocator_and_score_consult():
 
 
 def test_hygiene():
-    assert vc.VALEDIA_VERSION == "0.45.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.46.0", vc.VALEDIA_VERSION
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
@@ -171,6 +173,77 @@ def test_hygiene():
     src = open(os.path.join(HERE, "kalshi_fee_map.py")).read()
     assert "create_order" not in src
     assert "VALEDIA_TRADING_HALT" not in src
+    assert "KALSHI_FEE_MAP_GATE=True" not in open(os.path.join(HERE, "valedia_config.py")).read()
+    cfg = open(os.path.join(HERE, "valedia_config.py")).read()
+    assert "KALSHI_FEE_MAP_GATE = False" in cfg
+
+
+def test_refresh_dry_persists_counts():
+    kfm.reset_map()
+    td = tempfile.mkdtemp()
+    out = os.path.join(td, "kalshi-fee-map.json")
+    hits = []
+    res = kfm.run_refresh(
+        dry=True, out_path=out,
+        series_tickers=["KXBTCY", "KXNBAGAME", "KXNOPE"],
+        get_series_fee_changes=lambda *a, **k: hits.append("fc") or {},
+        get_series=lambda *a, **k: hits.append("gs") or {},
+    )
+    assert hits == []  # dry ignores getters
+    assert res["mode"] == "dry"
+    c = res["counts"]
+    assert c["maker_viable"] == 1  # KXBTCY
+    assert c["taker_taxed"] == 0
+    assert c["unknown"] == 2  # KXNBAGAME + KXNOPE
+    assert c["sports_unknown"] == 4  # none of the 4 sports in PDF
+    doc = json.load(open(out))
+    assert doc["as_of"]
+    assert doc["mode"] == "dry"
+    assert doc["kalshi_fee_map_gate_constant"] is False
+    assert "KXBTCY" in doc["series"]
+    assert vc.KALSHI_FEE_MAP_GATE is False
+
+
+def test_refresh_get_mocked_fills_sports():
+    kfm.reset_map()
+    td = tempfile.mkdtemp()
+    out = os.path.join(td, "kalshi-fee-map.json")
+    gets = []
+
+    def fc(_ticker=None, _hist=True):
+        gets.append("fc")
+        return {"series_fee_change_arr": [{
+            "series_ticker": "KXTAX", "fee_type": "quadratic",
+            "fee_multiplier": 5, "scheduled_ts": "2026-07-07T00:00:00Z",
+        }]}
+
+    def gs(ticker):
+        gets.append(ticker)
+        return {"series": {"ticker": ticker, "fee_type": "quadratic", "fee_multiplier": 1}}
+
+    res = kfm.run_refresh(
+        dry=False, out_path=out, series_tickers=["KXNBAGAME", "KXTAX", "KXBTCY"],
+        get_series_fee_changes=fc, get_series=gs,
+    )
+    assert res["mode"] == "get"
+    assert "fc" in gets and "KXNBAGAME" in gets
+    assert "KXTAX" not in gets  # already in fee_changes overlay
+    c = res["counts"]
+    assert c["unknown"] == 0
+    assert c["taker_taxed"] == 1  # KXTAX M=5
+    assert c["maker_viable"] == 3  # all three quadratic maker 0 (incl. taxed KXTAX)
+    doc = json.load(open(out))
+    assert doc["series"]["KXNBAGAME"]["source"] == "api"
+    assert doc["series"]["KXNBAGAME"]["maker_viable"] is True
+    assert doc["kalshi_fee_map_gate_constant"] is False
+
+
+def test_target_series_includes_sports_and_executor():
+    ts = kfm.target_series()
+    for s in kfm.SPORTS_SERIES:
+        assert s in ts
+    assert "KXCPI" in ts and "KXBTC" in ts
+    assert "KXGREENLAND" in ts  # continuation line of SERIES_POLITICS
 
 
 if __name__ == "__main__":
@@ -184,4 +257,7 @@ if __name__ == "__main__":
     test_gate_on_drops_unknown_and_taxed()
     test_allocator_and_score_consult()
     test_hygiene()
+    test_refresh_dry_persists_counts()
+    test_refresh_get_mocked_fills_sports()
+    test_target_series_includes_sports_and_executor()
     print("KALSHI-FEE-MAP: PASS")

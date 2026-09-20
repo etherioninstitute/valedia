@@ -7,8 +7,15 @@ P is executable (ask+half-spread/slip for a buy, bid−slip for a sell).
 Never last trade alone.
 
 GET-only. No orders. Blocking gate default OFF (annotate only).
+
+CLI (never flips KALSHI_FEE_MAP_GATE):
+  python3 kalshi_fee_map.py --dry
+  python3 kalshi_fee_map.py --get
 """
+import json
 import math
+import os
+import sys
 from datetime import datetime, timezone
 
 PDF_AS_OF = "2026-07-07"
@@ -34,7 +41,12 @@ PDF_NONSTANDARD = {
     "KXEMMYCSERIES": (1.0, 1.0, "Emmys Comedy Series"),
 }
 
+# Sports-relevant (executor SERIES_SPORTS + sports_engine.SERIES). MLB listed
+# for fee lookup even though sports_engine killed it on net.
+SPORTS_SERIES = ("KXNBAGAME", "KXNCAAMBGAME", "KXNHLGAME", "KXMLBGAME")
+
 _MAP = None
+refresh_last_errors = []
 
 
 def round_up_cent(x):
@@ -201,16 +213,42 @@ def reset_map():
     _MAP = None
 
 
-def refresh(get_series_fee_changes=None, get_event_fee_changes=None):
-    """GET overlay. Inject getters in tests. No orders."""
+def refresh(get_series_fee_changes=None, get_event_fee_changes=None,
+            get_series=None, series_tickers=None):
+    """GET overlay. Inject getters in tests. No orders.
+
+    Bulk fee_changes first; GET /series/{ticker} fills targets still unknown
+    (sports PDF pages are garbled — this is how multipliers get populated).
+    """
     fc = {}
     ev = {}
     if get_series_fee_changes:
         fc = get_series_fee_changes(None, True) or {}
     if get_event_fee_changes:
         ev = get_event_fee_changes() or {}
-    global _MAP
+    tickers = list(series_tickers) if series_tickers is not None else target_series()
+    extra, errors = [], []
+    if get_series:
+        preview = build_map(fc, ev)
+        for s in tickers:
+            row = preview.get(s) or {}
+            if row.get("source") in ("api", "event"):
+                continue
+            try:
+                payload = get_series(s)
+            except Exception as e:
+                errors.append({"series": s, "error": type(e).__name__})
+                continue
+            ch = series_payload_to_change(s, payload)
+            if ch:
+                extra.append(ch)
+        if extra:
+            arr = list(_fee_change_arr(fc))
+            arr.extend(extra)
+            fc = {"series_fee_change_arr": arr}
+    global _MAP, refresh_last_errors
     _MAP = build_map(fc, ev)
+    refresh_last_errors = errors
     return _MAP
 
 
@@ -240,3 +278,208 @@ def allow(ticker, series=None, fmap=None):
     if info.get("taker_taxed"):
         return False, info
     return True, info
+
+
+def _fee_change_arr(payload):
+    payload = payload or {}
+    arr = payload.get("series_fee_change_arr") or payload.get("fee_changes") or []
+    return arr if isinstance(arr, list) else []
+
+
+def series_payload_to_change(ticker, payload):
+    """Normalize GET /series/{ticker} into a fee_changes row."""
+    doc = payload if isinstance(payload, dict) else {}
+    s = doc.get("series") if isinstance(doc.get("series"), dict) else doc
+    if not isinstance(s, dict) or not s:
+        return None
+    ft = s.get("fee_type")
+    fm = s.get("fee_multiplier")
+    if ft is None and fm is None:
+        return None
+    ts = s.get("fee_change_ts") or s.get("scheduled_ts") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "series_ticker": str(s.get("ticker") or ticker or "").upper(),
+        "fee_type": ft or "quadratic",
+        "fee_multiplier": 1 if fm is None else fm,
+        "scheduled_ts": ts,
+    }
+
+
+def target_series():
+    """PDF keys + executor ALL_SERIES + sports. Parse source, skip executor import."""
+    seen = []
+
+    def add(xs):
+        for x in xs or []:
+            s = str(x).upper().strip()
+            if s and s not in seen:
+                seen.append(s)
+
+    add(PDF_NONSTANDARD)
+    add(SPORTS_SERIES)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kalshi_executor.py")
+    try:
+        text = open(path).read()
+    except OSError:
+        text = ""
+    # Quoted tickers in SERIES_* lists (continuation lines included). Parse
+    # source text so this module never imports the executor writer.
+    in_list = False
+    for line in text.splitlines():
+        if "SERIES_" in line or "ALL_SERIES" in line:
+            in_list = True
+        if not in_list:
+            continue
+        for tok in line.replace(",", " ").replace("[", " ").replace("]", " ").replace("'", " ").replace('"', " ").split():
+            if tok.startswith("KX") and tok.isalnum():
+                add([tok])
+        if "]" in line:
+            in_list = False
+    return seen
+
+
+def classify(fmap, series_list=None):
+    """Counts over targets. maker_viable and taker_taxed can overlap (M_maker=0, M_taker>1)."""
+    series_list = list(series_list) if series_list is not None else target_series()
+    fmap = fmap or {}
+    maker_viable, taker_taxed, unknown, ok = [], [], [], []
+    for s in series_list:
+        row = fmap.get(s) or unknown_row(s)
+        if row.get("status") != "ok":
+            unknown.append(s)
+            continue
+        ok.append(s)
+        if row.get("maker_viable"):
+            maker_viable.append(s)
+        if row.get("taker_taxed"):
+            taker_taxed.append(s)
+    sports = list(SPORTS_SERIES)
+    sports_unknown = [s for s in sports if (fmap.get(s) or unknown_row(s)).get("status") != "ok"]
+    sports_viable = [s for s in sports if (fmap.get(s) or {}).get("maker_viable")]
+    sports_taxed = [s for s in sports if (fmap.get(s) or {}).get("taker_taxed")]
+    return {
+        "n_series": len(series_list),
+        "ok": len(ok),
+        "maker_viable": len(maker_viable),
+        "taker_taxed": len(taker_taxed),
+        "unknown": len(unknown),
+        "maker_viable_series": maker_viable,
+        "taker_taxed_series": taker_taxed,
+        "unknown_series": unknown,
+        "sports_n": len(sports),
+        "sports_maker_viable": len(sports_viable),
+        "sports_taker_taxed": len(sports_taxed),
+        "sports_unknown": len(sports_unknown),
+        "sports_unknown_series": sports_unknown,
+    }
+
+
+def default_artifact_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(here, "..", "..", "recommendations", "kalshi-fee-map.json"))
+
+
+def save_artifact(fmap, counts, mode, path=None, as_of=None, errors=None):
+    path = path or default_artifact_path()
+    as_of = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        import valedia_config as vc
+        ver = vc.VALEDIA_VERSION
+        gate_const = bool(vc.KALSHI_FEE_MAP_GATE)
+        gate_env = vc.kalshi_fee_map_gate_enabled()
+    except Exception:
+        ver, gate_const, gate_env = "unknown", False, False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    summary = {k: counts[k] for k in (
+        "n_series", "ok", "maker_viable", "taker_taxed", "unknown",
+        "sports_n", "sports_maker_viable", "sports_taker_taxed", "sports_unknown",
+    ) if k in counts}
+    doc = {
+        "as_of": as_of,
+        "valedia_version": ver,
+        "mode": mode,
+        "kalshi_fee_map_gate_constant": gate_const,
+        "kalshi_fee_map_gate_enabled": gate_env,
+        "counts": summary,
+        "sports_unknown_series": counts.get("sports_unknown_series") or [],
+        "errors": errors or [],
+        "series": fmap or {},
+    }
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def _load_env():
+    env_path = os.path.expanduser("~/.openclaw/.env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+def run_refresh(dry=True, get_series_fee_changes=None, get_event_fee_changes=None,
+                get_series=None, out_path=None, series_tickers=None):
+    """Dry = PDF only, no network. --get uses V2 GET wrappers. Never sets the gate."""
+    if dry:
+        fmap = refresh(series_tickers=series_tickers)
+        mode = "dry"
+        errors = []
+    else:
+        if get_series_fee_changes is None or get_series is None:
+            _load_env()
+            import kalshi_auth as ka
+            if get_series_fee_changes is None:
+                get_series_fee_changes = ka.get_series_fee_changes
+            if get_series is None:
+                get_series = ka.get_series
+        fmap = refresh(
+            get_series_fee_changes=get_series_fee_changes,
+            get_event_fee_changes=get_event_fee_changes,
+            get_series=get_series,
+            series_tickers=series_tickers,
+        )
+        mode = "get"
+        errors = list(refresh_last_errors)
+    tickers = series_tickers if series_tickers is not None else target_series()
+    counts = classify(fmap, tickers)
+    path = save_artifact(fmap, counts, mode, out_path, errors=errors)
+    return {"path": path, "counts": counts, "mode": mode, "errors": errors, "n_map": len(fmap)}
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    dry = "--get" not in argv
+    out = None
+    if "--out" in argv:
+        i = argv.index("--out")
+        out = argv[i + 1] if i + 1 < len(argv) else None
+    res = run_refresh(dry=dry, out_path=out)
+    c = res["counts"]
+    print(json.dumps({
+        "ok": True,
+        "mode": res["mode"],
+        "path": res["path"],
+        "as_of_file": res["path"],
+        "maker_viable": c["maker_viable"],
+        "taker_taxed": c["taker_taxed"],
+        "unknown": c["unknown"],
+        "n_series": c["n_series"],
+        "sports_unknown": c["sports_unknown"],
+        "gate_constant": False,
+        "errors": res["errors"],
+    }, indent=2))
+    print(
+        f"maker_viable={c['maker_viable']} taker_taxed={c['taker_taxed']} "
+        f"unknown={c['unknown']} sports_unknown={c['sports_unknown']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

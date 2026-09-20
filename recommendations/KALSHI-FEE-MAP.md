@@ -2,7 +2,7 @@
 
 Series fee map for Valedia's Kalshi path. Allocator/strategies can gate **maker-viable** vs **taker-taxed**. GET-only. No live flip, no orders, no wallet/key changes, no `VALEDIA_TRADING_HALT` bypass.
 
-**Version:** `0.45.0`
+**Version:** `0.46.0` (refresh CLI + artifact; gate still False)
 
 ## Discovery (CBM)
 
@@ -64,6 +64,17 @@ Hooked (no new live strategies):
 - `sports_engine.size_bets` (size; `series` stored on the game)
 
 Gate off: annotate, never drop. Gate on: fail-closed unknown + extra-taxed.
+
+## Refresh (AUTONOMY-1)
+
+```bash
+python3 scripts/integrations/kalshi_fee_map.py --dry
+python3 scripts/integrations/kalshi_fee_map.py --get   # GET only; writes recommendations/kalshi-fee-map.json
+```
+
+`--dry` = PDF join, no network. `--get` = bulk `fee_changes` then `GET /series/{ticker}` for remaining targets (Valedia `SERIES_*` + sports). Never sets the gate.
+
+Flip steps: `recommendations/KALSHI-FEE-MAP-GATE-CHECKLIST.md`.
 
 ## Out of scope (held)
 
