@@ -8,7 +8,7 @@
 
 **Current:** KALSHI-FEE-MAP SHIPPED. Next=Burton (flip `KALSHI_FEE_MAP_GATE=1` only after a GET refresh populates sports multipliers).
 
-**Version:** `0.45.0` tag `valedia-v0.45.0` (stamp after commit). Prior: `0.44.0` `39dfe68`.
+**Version:** `0.45.0` tag `valedia-v0.45.0` tip `05f23d8`. Prior: `0.44.0` `39dfe68`.
 
 **Tests:** `test_kalshi_fee_map.py` PASS (PDF Jul 7 2026 table + maker formula + mocked V2 GETs + gate off/on). `test_kalshi_orders_v2.py` PASS. `test_slice23.py` PASS. `test_sports_engine.py` PASS.
 
