@@ -76,6 +76,8 @@ python3 scripts/integrations/kalshi_fee_map.py --get   # GET only; writes recomm
 
 Flip steps: `recommendations/KALSHI-FEE-MAP-GATE-CHECKLIST.md`.
 
+PROFIT-1 (`0.48.0`) sits on this map: `kalshi_profit.py` EV / maker-first / fill ledger. See `PROFIT-1-EV-PREFLIGHT.md`. Does **not** flip this gate.
+
 ## Out of scope (held)
 
 Poly live, oil unfence, sports geo bypass, ACH, writer changes, halt bypass.

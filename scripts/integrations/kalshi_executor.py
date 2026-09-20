@@ -324,6 +324,13 @@ def _score_market(m, series):
             return None
     except Exception:
         pass
+    try:
+        import kalshi_profit as _kp
+        proceed, out = _kp.annotate(out)
+        if not proceed:
+            return None
+    except Exception:
+        pass
     return out
 
 
@@ -353,6 +360,13 @@ def _size_contracts(opp, state, cost_per):
     fee = n * kalshi_fee_per_contract(cost_per)
     if n * cost_per + fee > state["balance"]:
         n = max(1, int((state["balance"] - fee) / cost_per))
+    try:
+        import kalshi_profit as _kp
+        proceed, _ = _kp.annotate(opp, contracts=n)
+        if not proceed:
+            return 0
+    except Exception:
+        pass
     return n
 
 
@@ -638,6 +652,34 @@ def run(dry_run=False, max_trades=5, min_score=40):
                                  f"— taking as taker (gated)")
             except Exception:
                 pass  # advisory must never break execution
+
+        try:
+            import kalshi_profit as _kp
+            proceed, opp = _kp.annotate(opp)
+            if not proceed:
+                ev = (opp.get("ev_preflight") or {})
+                lines.append(f"  ⊘ skip {opp.get('ticker','?')} EV preflight net={ev.get('net')}")
+                continue
+            mf = opp.get("maker_first") or {}
+            if _kp.maker_first_on() and mf.get("prefer") == "maker":
+                live_maker = (maker_mgr is not None and not dry_run
+                              and not getattr(_cfg, "EXEC_DRY_RUN", True))
+                if live_maker:
+                    contracts = _size_contracts(opp, state, (opp.get("price") or 0) or 0.01)
+                    if contracts > 0:
+                        oid = maker_mgr.place_maker_order(
+                            opp["ticker"], opp.get("side", "yes"),
+                            contracts, int(round(float(opp.get("price") or 0) * 100)),
+                            strategy=opp.get("strategy", ""))
+                        lines.append(f"  ◇ MAKER-FIRST {opp.get('ticker','?')} {contracts}x "
+                                     f"(id={str(oid)[:12]})")
+                        trades_placed += 1
+                        continue
+                if _kp.should_skip_taker(mf):
+                    lines.append(f"  ⊘ skip taker {opp.get('ticker','?')} (maker-first, hurdle)")
+                    continue
+        except Exception:
+            pass
 
         result = execute_trade(opp, state, dry_run=dry_run)
         _log_trade(result)

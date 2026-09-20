@@ -33,6 +33,7 @@ This lane does **not** unfence weather/oil, does **not** invent live shorts, doe
 | Nautilus live / NT | `valedia_config.NAUTILUS_*`, `neural_trader_fence.py` | **FENCED** | sidecar | `NAUTILUS_LIVE` False. NT research pin only. | Stay fenced. |
 | Kill switch | `VALEDIA_TRADING_HALT` | **LIVE-gate** (default off) | all writers | Halt may stay off. GET/preview/dry allowed. Ears gather. | Manual `on` if needed. |
 | Crypto paper desk | `crypto_paper.py`, `crypto_paper_run.py` | **SHADOW** (paper sim) | none | Fixture or public klines; simulated mid±slip fills; would-have fee-true PnL. No wallets, no `create_order`. | Burton go later for real wallets. Do not restore CB/Alpaca writers. |
+| Kalshi EV preflight / maker-first / fill ledger | `kalshi_profit.py` | **SHADOW** (annotate) | Kalshi | `KALSHI_EV_PREFLIGHT_GATE` / `KALSHI_MAKER_FIRST` / `KALSHI_FILL_LEDGER_DEMOTE` default False. Annotate suggest/rest/size. Persist `data/kalshi-fill-quality.json`. | Burton flag flip. Do not auto-flip `KALSHI_FEE_MAP_GATE`. |
 
 ## Not wired to allocator gather / execute
 

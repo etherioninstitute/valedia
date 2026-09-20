@@ -52,7 +52,7 @@ def test_healthcheck_helpers():
 
 
 def test_hygiene_and_version():
-    assert vc.VALEDIA_VERSION == "0.47.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.48.0", vc.VALEDIA_VERSION
     assert vc.MIROFISH_AUTO_RAISE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
     sh = open(os.path.join(ROOT, "scripts", "valedia_models.sh")).read()

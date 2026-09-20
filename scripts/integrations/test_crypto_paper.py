@@ -40,7 +40,7 @@ def test_hygiene_and_fence():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.VALEDIA_TREASURY_AUTO is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VALEDIA_VERSION == "0.47.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.48.0", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "crypto_paper" not in cron
     doc = open(os.path.join(ROOT, "recommendations", "CRYPTO-PAPER-DESK.md")).read()

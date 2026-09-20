@@ -137,7 +137,7 @@ def test_hygiene_no_legacy_write_path():
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VALEDIA_VERSION == "0.47.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.48.0", vc.VALEDIA_VERSION
 
 
 if __name__ == "__main__":

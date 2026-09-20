@@ -13,7 +13,8 @@
 7d. **MIROFISH-BIONIC** — done `0.44.0` (Bionic `:1234` primary, Ollama `:11435` fallback). See `MIROFISH-BIONIC.md`.
 7e. **KALSHI-FEE-MAP** — done `0.45.0` (series maker/taker map, `fee(P,C,M)`, consult gate default off). See `KALSHI-FEE-MAP.md`.
 7f. **AUTONOMY-1 FEE-MAP-REFRESH** — done `0.46.0` (GET refresh + artifact + gate checklist; gate still False). See `KALSHI-FEE-MAP-GATE-CHECKLIST.md`. Next = Burton flip **or** AUTONOMY-2 MIROFISH-JEV-SHADOW.
-7g. **CRYPTO-PAPER-1** — done `0.47.0` (paper/shadow crypto simulation ledger; fixture + optional public klines; no wallets/orders). See `CRYPTO-PAPER-DESK.md`. Next = Burton (AUTONOMY-2 still available).
+7g. **CRYPTO-PAPER-1** — done `0.47.0` (paper/shadow crypto simulation ledger; fixture + optional public klines; no wallets/orders). See `CRYPTO-PAPER-DESK.md`.
+7h. **PROFIT-1 EV-PREFLIGHT + MAKER-FIRST + FILL-LEDGER** — done `0.48.0`. See `PROFIT-1-EV-PREFLIGHT.md`. Gates default OFF. Next = Burton (CONTROLS-READOUT / AUTONOMY-2 Jev optional / GATE flip still his).
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)

@@ -360,6 +360,13 @@ def allocate(opps, capital):
                     continue
             except Exception:
                 pass
+            try:
+                import kalshi_profit as _kp
+                proceed, o = _kp.annotate(o)
+                if not proceed:
+                    continue
+            except Exception:
+                pass
 
         try:
             _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15
@@ -387,6 +394,9 @@ def allocate(opps, capital):
             "confidence": o["confidence"],
             "expected_profit": round(alloc * o["ev_per_dollar"], 2),
             "raw": o.get("raw"),
+            "ev_preflight": o.get("ev_preflight"),
+            "maker_first": o.get("maker_first"),
+            "fill_quality": o.get("fill_quality"),
         })
         remaining -= alloc
         
@@ -555,6 +565,25 @@ def execute_allocations(allocations, dry_run=False):
                             action, price_cents = "maker", ep.price_cents
                     except Exception:
                         pass
+                try:
+                    import kalshi_profit as _kp
+                    proceed, a = _kp.annotate(a, contracts=n)
+                    r["ev_preflight"] = a.get("ev_preflight")
+                    r["maker_first"] = a.get("maker_first")
+                    if not proceed:
+                        r["status"] = "SKIP_EV_PREFLIGHT"
+                        results.append(r)
+                        continue
+                    mf = a.get("maker_first") or {}
+                    if _kp.maker_first_on() and mf.get("prefer") == "maker":
+                        if _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
+                            action = "maker"
+                        elif _kp.should_skip_taker(mf):
+                            r["status"] = "SKIP_MAKER_FIRST"
+                            results.append(r)
+                            continue
+                except Exception:
+                    pass
                 if action == "maker" and _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
                     oid = _maker_mgr.place_maker_order(a["ticker"], a["side"], n, price_cents,
                                                        strategy=a.get("type", ""))

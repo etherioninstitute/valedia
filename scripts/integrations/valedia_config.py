@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.47.0 = CRYPTO-PAPER-1 paper/shadow crypto simulation ledger).
-# Prior 0.46.0 = AUTONOMY-1 fee-map GET refresh. Prior 0.45.0 = KALSHI-FEE-MAP.
+# Runtime identity (0.48.0 = PROFIT-1 EV preflight + maker-first + fill ledger).
+# Prior 0.47.0 = CRYPTO-PAPER-1. Prior 0.46.0 = AUTONOMY-1 fee-map GET refresh.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.47.0"
+VALEDIA_VERSION = "0.48.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -131,6 +131,14 @@ VALEDIA_TRADING_HALT = False
 # unknown + taker_taxed (multiplier > 1) at select/size. Consult always
 # fail-closed on unknown fields. This lane never sets True.
 KALSHI_FEE_MAP_GATE = False
+# PROFIT-1. All default OFF (annotate/shadow). This lane never sets True.
+# Env=1: skip suggest/rest/size when fee-true net EV <= 0.
+KALSHI_EV_PREFLIGHT_GATE = False
+# Env=1: rest on maker_viable; skip taker unless EV >= maker_net + hurdle.
+# Off = soft annotate only (existing taker fallthrough).
+KALSHI_MAKER_FIRST = False
+# Env=1: hard-skip series/strategy with adverse mid-drift score. Off = persist only.
+KALSHI_FILL_LEDGER_DEMOTE = False
 TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
 TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
 TREASURY_FLOOR_COINBASE = 20.0
@@ -257,6 +265,33 @@ def kalshi_fee_map_gate_enabled():
     This lane never sets True.
     """
     return _env_flag("KALSHI_FEE_MAP_GATE", KALSHI_FEE_MAP_GATE)
+
+
+def kalshi_ev_preflight_gate_enabled():
+    """True only if Burton flipped KALSHI_EV_PREFLIGHT_GATE. Default False.
+
+    Off: annotate net EV. On: skip suggest/rest/size when net <= 0.
+    This lane never sets True.
+    """
+    return _env_flag("KALSHI_EV_PREFLIGHT_GATE", KALSHI_EV_PREFLIGHT_GATE)
+
+
+def kalshi_maker_first_enabled():
+    """True only if Burton flipped KALSHI_MAKER_FIRST. Default False.
+
+    Off: annotate preferred role. On: skip taker unless hurdle clears.
+    This lane never sets True.
+    """
+    return _env_flag("KALSHI_MAKER_FIRST", KALSHI_MAKER_FIRST)
+
+
+def kalshi_fill_ledger_demote_enabled():
+    """True only if Burton flipped KALSHI_FILL_LEDGER_DEMOTE. Default False.
+
+    Off: persist mid-drift scores. On: skip high-score series/strategy.
+    This lane never sets True.
+    """
+    return _env_flag("KALSHI_FILL_LEDGER_DEMOTE", KALSHI_FILL_LEDGER_DEMOTE)
 
 
 class HaltedError(RuntimeError):

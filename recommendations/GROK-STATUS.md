@@ -6,21 +6,19 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** CRYPTO-PAPER-1 SHIPPED. Paper/shadow crypto simulation ledger (fixture + optional public klines). Would-have fee-true PnL. No wallets, no exchange orders. Next=Burton (AUTONOMY-2 MIROFISH-JEV-SHADOW still available). Do not auto-flip `KALSHI_FEE_MAP_GATE` or `POLYMARKET_US_LIVE`.
+**Current:** PROFIT-1 SHIPPED. Fee-true EV preflight + maker-first router + fill-quality ledger. Shadow/annotate always. New gates default OFF. `KALSHI_FEE_MAP_GATE` not flipped. Next=Burton (CONTROLS-READOUT / AUTONOMY-2 Jev optional / GATE flip still his).
 
-**Version:** `0.47.0` tag `valedia-v0.47.0` tip `6f3f0c4`. Prior: `0.46.0` `3014b72`.
+**Version:** `0.48.0` (tag after commit). Prior: `0.47.0` `6f3f0c4`.
 
-**Tests:** `test_crypto_paper.py` PASS (hygiene + fee/MTM + SMA fixture + injected public klines + CLI dry). `test_slice23.py` PASS. `test_kalshi_fee_map.py` PASS. `test_kill_switch.py` PASS. `test_poly_learn.py` PASS. `test_scan_accuracy.py` PASS. `test_valedia_full_smoke.py` PASS.
+**Tests:** `test_kalshi_profit.py` PASS (EV math, annotate-only default, EV gate skip, maker preference, fill ledger + demote flag off). `test_kalshi_fee_map.py` PASS. `test_kalshi_orders_v2.py` PASS. `test_kill_switch.py` PASS. `test_crypto_paper.py` PASS. `test_slice7/8/9.py` PASS. `test_h3.py` PASS. `test_slice23.py` PASS. `test_scan_accuracy.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-CRYPTO-PAPER.md`. No CCXT, no OMS class, no crontab, no allocator execute, no new live flags.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-PROFIT-1.md`. Reused `kalshi_fee_map.fee`. One helper module. No CLI/cron/live GET. Flags default False.
 
-**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` (keyword, coder) / `memory_search` (paper shadow ledger). CBM `list_projects` + `search_graph` paper/poly_learn/fill + `get_architecture` scripts/integrations + `check_index_coverage` after write. Ponytail after code (no wallets, no create_order, no gate flips).
+**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` (keyword, grok-build) / `memory_search` (fee-map). CBM `list_projects` + `get_architecture` scripts + `search_graph` fee/executor/allocator + `trace_path` consult inbound + `check_index_coverage` after write. Ponytail after code.
 
-**Paper proof:** `data/crypto-paper/equity.json` source=fixture pair=BTC-USDT starting=10000 ending=10114.432169 would_have_pnl=+114.432169 n_fills=2 fees_paid=2.116549. Synthetic SMA-cross tape — **not** a live track record.
+**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. `KALSHI_EV_PREFLIGHT_GATE` / `KALSHI_MAKER_FIRST` / `KALSHI_FILL_LEDGER_DEMOTE` stay False. No wallet keys/signing. FENCED.
 
-**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. No wallet keys/signing. FENCED.
-
-**Next:** Burton. AUTONOMY-2 MIROFISH-JEV-SHADOW still available. Do not auto-flip `KALSHI_FEE_MAP_GATE`. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil. Do not restore crypto writers from this paper desk.
+**Next:** Burton. CONTROLS-READOUT / AUTONOMY-2 MIROFISH-JEV-SHADOW still available. Do not auto-flip `KALSHI_FEE_MAP_GATE`. Do not auto-flip new PROFIT-1 gates. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
 
 
 ---
