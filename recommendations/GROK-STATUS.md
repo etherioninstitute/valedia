@@ -8,7 +8,7 @@
 
 **Current:** PROFIT-1 SHIPPED. Fee-true EV preflight + maker-first router + fill-quality ledger. Shadow/annotate always. New gates default OFF. `KALSHI_FEE_MAP_GATE` not flipped. Next=Burton (CONTROLS-READOUT / AUTONOMY-2 Jev optional / GATE flip still his).
 
-**Version:** `0.48.0` (tag after commit). Prior: `0.47.0` `6f3f0c4`.
+**Version:** `0.48.0` tag `valedia-v0.48.0` tip `4e8ad94`. Prior: `0.47.0` `6f3f0c4`.
 
 **Tests:** `test_kalshi_profit.py` PASS (EV math, annotate-only default, EV gate skip, maker preference, fill ledger + demote flag off). `test_kalshi_fee_map.py` PASS. `test_kalshi_orders_v2.py` PASS. `test_kill_switch.py` PASS. `test_crypto_paper.py` PASS. `test_slice7/8/9.py` PASS. `test_h3.py` PASS. `test_slice23.py` PASS. `test_scan_accuracy.py` PASS.
 
