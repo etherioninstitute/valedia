@@ -72,9 +72,9 @@ def test_hygiene():
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.MIROFISH_AUTO_RAISE is False
     assert hpi.http_enabled() is False
-    assert vc.VALEDIA_VERSION == "0.46.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.47.0", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.46.0 ")
+    assert vc.version_stamp().startswith("v0.47.0 ")
 
 
 def test_desk_stages_and_ticket():
@@ -120,7 +120,7 @@ def test_hl_snapshot_injected_no_http():
     assert "/exchange" not in json.dumps(snap).lower() or "No /exchange" in snap["safety"]
     assert Decimal(snap["book"]["spread_bps"]) > 0
     assert "5" in snap["book"]["depth"]
-    assert snap["valedia_version"] == "0.46.0"
+    assert snap["valedia_version"] == "0.47.0"
     md = tempfile.mkdtemp(prefix="h5_hl_")
     path = hpi.write_snapshot(snap, models_dir=md)
     assert os.path.basename(path) == "hl_public_info.json"

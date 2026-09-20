@@ -207,9 +207,9 @@ def test_poly_write_stays_blocked():
 
 def test_version_and_docs():
     _restore()
-    assert vc.VALEDIA_VERSION == "0.46.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.47.0", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.46.0 ")
+    assert vc.version_stamp().startswith("v0.47.0 ")
     rec = open(os.path.join(ROOT, "recommendations", "VALEDIA-FULL-SMOKE.md")).read()
     assert "fence" in rec.lower()
     assert "KILL-SWITCH" in rec

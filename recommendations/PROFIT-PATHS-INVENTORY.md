@@ -32,6 +32,7 @@ This lane does **not** unfence weather/oil, does **not** invent live shorts, doe
 | Treasury auto | `treasury_status.py` | **FENCED** | bank/venues | `VALEDIA_TREASURY_AUTO` False; auto refused even if env=1. Report-only. | Human fund. No ACH from here. |
 | Nautilus live / NT | `valedia_config.NAUTILUS_*`, `neural_trader_fence.py` | **FENCED** | sidecar | `NAUTILUS_LIVE` False. NT research pin only. | Stay fenced. |
 | Kill switch | `VALEDIA_TRADING_HALT` | **LIVE-gate** (default off) | all writers | Halt may stay off. GET/preview/dry allowed. Ears gather. | Manual `on` if needed. |
+| Crypto paper desk | `crypto_paper.py`, `crypto_paper_run.py` | **SHADOW** (paper sim) | none | Fixture or public klines; simulated mid±slip fills; would-have fee-true PnL. No wallets, no `create_order`. | Burton go later for real wallets. Do not restore CB/Alpaca writers. |
 
 ## Not wired to allocator gather / execute
 

@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.46.0 = AUTONOMY-1 fee-map GET refresh + gate checklist).
-# Prior 0.45.0 = KALSHI-FEE-MAP. Prior 0.44.0 = MIROFISH-BIONIC.
+# Runtime identity (0.47.0 = CRYPTO-PAPER-1 paper/shadow crypto simulation ledger).
+# Prior 0.46.0 = AUTONOMY-1 fee-map GET refresh. Prior 0.45.0 = KALSHI-FEE-MAP.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.46.0"
+VALEDIA_VERSION = "0.47.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
