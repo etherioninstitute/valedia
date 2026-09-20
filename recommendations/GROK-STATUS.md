@@ -8,7 +8,7 @@
 
 **Current:** CRYPTO-PAPER-1 SHIPPED. Paper/shadow crypto simulation ledger (fixture + optional public klines). Would-have fee-true PnL. No wallets, no exchange orders. Next=Burton (AUTONOMY-2 MIROFISH-JEV-SHADOW still available). Do not auto-flip `KALSHI_FEE_MAP_GATE` or `POLYMARKET_US_LIVE`.
 
-**Version:** `0.47.0` tag `valedia-v0.47.0` (tip at status commit). Prior: `0.46.0` `3014b72`.
+**Version:** `0.47.0` tag `valedia-v0.47.0` tip `6f3f0c4`. Prior: `0.46.0` `3014b72`.
 
 **Tests:** `test_crypto_paper.py` PASS (hygiene + fee/MTM + SMA fixture + injected public klines + CLI dry). `test_slice23.py` PASS. `test_kalshi_fee_map.py` PASS. `test_kill_switch.py` PASS. `test_poly_learn.py` PASS. `test_scan_accuracy.py` PASS. `test_valedia_full_smoke.py` PASS.
 
