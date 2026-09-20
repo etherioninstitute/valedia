@@ -8,7 +8,7 @@
 
 **Current:** AUTONOMY-1 FEE-MAP-REFRESH SHIPPED. GET refresh populated sports multipliers. `KALSHI_FEE_MAP_GATE` still False. Next=Burton gate flip (checklist) **or** AUTONOMY-2 MIROFISH-JEV-SHADOW.
 
-**Version:** `0.46.0` (tag `valedia-v0.46.0` on commit). Prior: `0.45.0` `05f23d8`.
+**Version:** `0.46.0` tag `valedia-v0.46.0` tip `3014b72`. Prior: `0.45.0` `05f23d8`.
 
 **Tests:** `test_kalshi_fee_map.py` PASS (dry persist + mocked GET sports fill + PDF table + gate off/on). `test_slice23.py` PASS. `test_kalshi_orders_v2.py` PASS. `test_kill_switch.py` PASS. `test_scan_accuracy.py` PASS.
 
