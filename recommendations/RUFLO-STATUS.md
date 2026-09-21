@@ -1,5 +1,15 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-20 PT — **AUTONOMY-2 MIROFISH-JEV-SHADOW SHIPPED**. Version `0.50.0` tag `valedia-v0.50.0` tip `e460e05`. `jev_shadow.py` fail-open; `VALEDIA_JEV` default False (zero TypeSafe calls when off). One MiroFish hook. Not on Kalshi live path. Ponytail: `PONYTAIL-AUDIT-AUTONOMY-2.md`. Docs: `AUTONOMY-2-JEV-SHADOW.md`. **GROK-STATUS: AUTONOMY-2 SHIPPED.** Prior CONTROLS-READOUT `0.49.0`. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore / Jev enable in git. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False. `KALSHI_FEE_MAP_GATE` stays False. `VALEDIA_JEV` stays False.
+Updated: 2026-09-20 PT — **POLY-LOOP-UNIVERSE SHIPPED**. Version `0.52.0`. Universe filter + US/Gamma field map + cache FV + `skip_reasons` histogram. `POLYMARKET_US_LIVE` False; writer polymarket `none`. Ponytail: `PONYTAIL-AUDIT-POLY-LOOP-UNIVERSE.md`. Docs: `POLY-LOOP.md`. **GROK-STATUS: POLY-LOOP-UNIVERSE SHIPPED.** Prior POLY-LOOP `0.51.0` folded into this commit. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore / Jev enable in git. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False. `KALSHI_FEE_MAP_GATE` stays False. `VALEDIA_JEV` stays False.
+
+## POLY-LOOP-UNIVERSE (Grok Build executor, `valedia-v2-grok-build`)
+- Pull `active=true&closed=false&archived=false` (no `endDateMin` — it breaks `closed`). Over-fetch, drop expired / present-zero-liq. Unwrap `{market:…}`. US/Gamma aliases for end/liq/resolution. FV from market/tags or MiroFish/persona cache; named resolution source required; skip `no_fv` otherwise. `skip_reasons` on `last_run.json`.
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## POLY-LOOP (Grok Build executor, `valedia-v2-grok-build`)
+- Paper desk on POLY-LEARN. Folded into 0.52.0 commit. 8pt edge, 3% flatten, half-Kelly 6% cap, max 5 open, 40% DD stop + post-mortem (no category flip).
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
 
 ## POLY-LEARN (Grok Build executor, `valedia-v2-grok-build`)
 - US DCM market-by-slug + BBO/book helpers. `poly_learn` proposals labeled DRY/SHADOW. Allocator execute never `create_order`. Preview still works. Cheap MiroFish/persona tags from cache.

@@ -23,7 +23,7 @@ Cockpit stays GET-only. No order buttons. No live flips from the panel or CLI.
 
 ## Included (at least)
 
-Halt, Kalshi fee-map / EV preflight / maker-first / fill-ledger demote, `VALEDIA_JEV` (default **False**), `VALEDIA_SELF_ADJUST`, `MIROFISH_AUTO_RAISE`, `POLYMARKET_US_LIVE`, `VENUE_WRITER.*` per venue, oil/`NO_HARVEST` fence (`LIVE_EXEC_FENCED` + series `KXWTI`/`KXOIL`), `WEATHER_LIVE`/`SCALPER_LIVE` hard-off, `NAUTILUS_LIVE`/`NAUTILUS_ENABLED`, crypto `PAPER/SHADOW`, version/sha. Also existing: SPOT GET, fortress, rebalancer autoexec, treasury auto, `EXEC_DRY_RUN`.
+Halt, Kalshi fee-map / EV preflight / maker-first / fill-ledger demote, `VALEDIA_JEV` (default **False**), `VALEDIA_SELF_ADJUST`, `MIROFISH_AUTO_RAISE`, `POLYMARKET_US_LIVE`, POLY-LOOP (`POLY_LOOP_EDGE_PTS` / `MAX_OPEN` / `DD_STOP` / `DD_STOP_ARMED`, read-only), `VENUE_WRITER.*` per venue, oil/`NO_HARVEST` fence (`LIVE_EXEC_FENCED` + series `KXWTI`/`KXOIL`), `WEATHER_LIVE`/`SCALPER_LIVE` hard-off, `NAUTILUS_LIVE`/`NAUTILUS_ENABLED`, crypto `PAPER/SHADOW`, version/sha. Also existing: SPOT GET, fortress, rebalancer autoexec, treasury auto, `EXEC_DRY_RUN`.
 
 ## Fence (unchanged)
 

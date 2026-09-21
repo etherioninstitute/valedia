@@ -195,6 +195,11 @@ def run(client=None, models_dir=None, limit=8, paper_usd=None):
         "error": err,
         "note": "paper classroom; preview ok; create blocked",
     }
+    try:
+        import poly_loop
+        doc["poly_loop"] = poly_loop.status_line()
+    except Exception as e:
+        doc["poly_loop"] = f"skip ({str(e)[:60]})"
     path = write_proposals(doc, models_dir=md)
     doc["path"] = path
     return doc

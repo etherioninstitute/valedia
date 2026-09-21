@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.50.0 = AUTONOMY-2 Jev shadow). Prior 0.49.0 = CONTROLS-READOUT.
-# Prior 0.48.0 = PROFIT-1. Prior 0.47.0 = CRYPTO-PAPER-1.
+# Runtime identity (0.52.0 = POLY-LOOP-UNIVERSE). Prior 0.51.0 = POLY-LOOP.
+# Prior 0.50.0 = AUTONOMY-2 Jev shadow. Prior 0.49.0 = CONTROLS-READOUT.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.50.0"
+VALEDIA_VERSION = "0.52.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -71,6 +71,11 @@ SCALPER_LIVE = False
 WEATHER_LIVE = False
 # US DCM writes. Env POLYMARKET_US_LIVE=1 is a Burton/Valedia flip.
 POLYMARKET_US_LIVE = False  # this lane never sets True
+# POLY-LOOP paper desk (read-only snapshot). Execution still POLYMARKET_US_LIVE.
+POLY_LOOP_EDGE_PTS = 8.0          # |FV-mid| percentage points to flag
+POLY_LOOP_MAX_OPEN = 5            # max open paper positions
+POLY_LOOP_DD_STOP = 0.40          # peak drawdown halt; no auto category flip
+POLY_LOOP_DD_STOP_ARMED = True    # stop proposing when DD hits stop
 
 # Position sizing — half-Kelly + DYNAMIC per-trade cap + absolute fuses (backtested 2026-09-12).
 # The per-trade ceiling BREATHES with regime/track-record/risk instead of a flat number; the
@@ -780,6 +785,14 @@ def controls_snapshot():
          "stays False unless SELF_ADJUST allows"),
         ("POLYMARKET_US_LIVE", polymarket_us_live_enabled(),
          _src("POLYMARKET_US_LIVE"), "poly", "US DCM create/cancel"),
+        ("POLY_LOOP_EDGE_PTS", POLY_LOOP_EDGE_PTS, "const", "poly",
+         "|FV-mid| pts to flag; POLY-LOOP paper desk"),
+        ("POLY_LOOP_MAX_OPEN", POLY_LOOP_MAX_OPEN, "const", "poly",
+         "max open paper positions"),
+        ("POLY_LOOP_DD_STOP", POLY_LOOP_DD_STOP, "const", "poly",
+         "peak drawdown halt; no auto category flip"),
+        ("POLY_LOOP_DD_STOP_ARMED", bool(POLY_LOOP_DD_STOP_ARMED), "const",
+         "poly", "read-only; stop proposing when DD hits stop"),
         ("NAUTILUS_LIVE", bool(NAUTILUS_LIVE), "const", "nautilus",
          "live fills via NT sink"),
         ("NAUTILUS_ENABLED", bool(NAUTILUS_ENABLED), "const", "nautilus",

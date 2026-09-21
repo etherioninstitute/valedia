@@ -735,6 +735,13 @@ def run(dry_run=False, max_allocs=15):
         lines.append(f"POLY-LEARN DRY/SHADOW: {n_poly} proposals (never create_order)")
     except Exception as e:
         lines.append(f"POLY-LEARN: skip ({str(e)[:60]})")
+
+    # POLY-LOOP: status only. Never mixed into live execute. Never create.
+    try:
+        import poly_loop
+        lines.append("POLY-LOOP: " + poly_loop.status_line())
+    except Exception as e:
+        lines.append(f"POLY-LOOP: skip ({str(e)[:60]})")
     
     # Capital
     capital = get_total_capital()

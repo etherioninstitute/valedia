@@ -16,7 +16,9 @@
 7g. **CRYPTO-PAPER-1** — done `0.47.0` (paper/shadow crypto simulation ledger; fixture + optional public klines; no wallets/orders). See `CRYPTO-PAPER-DESK.md`.
 7h. **PROFIT-1 EV-PREFLIGHT + MAKER-FIRST + FILL-LEDGER** — done `0.48.0`. See `PROFIT-1-EV-PREFLIGHT.md`. Gates default OFF.
 7i. **CONTROLS-READOUT** — done `0.49.0`. See `CONTROLS-READOUT.md`. Snapshot + cockpit `/status.controls` + HTML + CLI. No live flips.
-7j. **AUTONOMY-2 MIROFISH-JEV-SHADOW** — done `0.50.0`. See `AUTONOMY-2-JEV-SHADOW.md`. `VALEDIA_JEV` stays False. Next = `KALSHI_FEE_MAP_GATE` runtime flip.
+7j. **AUTONOMY-2 MIROFISH-JEV-SHADOW** — done `0.50.0`. See `AUTONOMY-2-JEV-SHADOW.md`. `VALEDIA_JEV` stays False.
+7k. **POLY-LOOP** — done `0.51.0` (folded into 0.52.0 commit). See `POLY-LOOP.md`. Desk loop on POLY-LEARN; `POLYMARKET_US_LIVE` stays False.
+7l. **POLY-LOOP-UNIVERSE** — done `0.52.0`. Universe filter + field map + cache FV + skip_reasons. Next = Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)
