@@ -8,7 +8,7 @@
 
 **Current:** CONTROLS-READOUT SHIPPED. `valedia_config.controls_snapshot()` is the SoT for every gate on/off. Wired into cockpit `GET /status` key `controls` + HTML Controls card + CLI `valedia_controls.py`. `VALEDIA_JEV` default False. No live flips. Next=Burton (AUTONOMY-2 Jev shadow, then fee-map runtime flip).
 
-**Version:** `0.49.0`. Prior: `0.48.0` tag `valedia-v0.48.0` tip `4e8ad94`.
+**Version:** `0.49.0` tag `valedia-v0.49.0` tip `d8cd1bb`. Prior: `0.48.0` `4e8ad94`.
 
 **Tests:** `test_controls_readout.py` PASS (shape, defaults off, env source, halt file, panel/HTML, CLI, committed False). `test_openterminal_valedia.py` PASS. `test_h4.py` PASS. `test_kill_switch.py` PASS. `test_kalshi_profit.py` PASS.
 
