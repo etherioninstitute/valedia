@@ -8,7 +8,7 @@
 
 **Current:** AUTONOMY-2 MIROFISH-JEV-SHADOW SHIPPED. `jev_shadow.py` pass-through when `VALEDIA_JEV=False` (zero TypeSafe calls). When on: POST systemone CIO questions; stamp only; fail-open. One hook: `process_mirofish_report`. Not wired into Kalshi execute. Constant stays False. Next=Burton (`KALSHI_FEE_MAP_GATE` runtime flip per checklist).
 
-**Version:** `0.50.0` tag pending. Prior: `0.49.0` `d8cd1bb`.
+**Version:** `0.50.0` tag `valedia-v0.50.0` tip `e460e05`. Prior: `0.49.0` `d8cd1bb`.
 
 **Tests:** `test_jev_shadow.py` PASS (off no network, on mocked HTTP, fail-open, extractor hook, hygiene). `test_controls_readout.py` PASS. `test_h2.py` / `test_nt2.py` PASS.
 
