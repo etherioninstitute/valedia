@@ -6,19 +6,19 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** PROFIT-1 SHIPPED. Fee-true EV preflight + maker-first router + fill-quality ledger. Shadow/annotate always. New gates default OFF. `KALSHI_FEE_MAP_GATE` not flipped. Next=Burton (CONTROLS-READOUT / AUTONOMY-2 Jev optional / GATE flip still his).
+**Current:** CONTROLS-READOUT SHIPPED. `valedia_config.controls_snapshot()` is the SoT for every gate on/off. Wired into cockpit `GET /status` key `controls` + HTML Controls card + CLI `valedia_controls.py`. `VALEDIA_JEV` default False. No live flips. Next=Burton (AUTONOMY-2 Jev shadow, then fee-map runtime flip).
 
-**Version:** `0.48.0` tag `valedia-v0.48.0` tip `4e8ad94`. Prior: `0.47.0` `6f3f0c4`.
+**Version:** `0.49.0`. Prior: `0.48.0` tag `valedia-v0.48.0` tip `4e8ad94`.
 
-**Tests:** `test_kalshi_profit.py` PASS (EV math, annotate-only default, EV gate skip, maker preference, fill ledger + demote flag off). `test_kalshi_fee_map.py` PASS. `test_kalshi_orders_v2.py` PASS. `test_kill_switch.py` PASS. `test_crypto_paper.py` PASS. `test_slice7/8/9.py` PASS. `test_h3.py` PASS. `test_slice23.py` PASS. `test_scan_accuracy.py` PASS.
+**Tests:** `test_controls_readout.py` PASS (shape, defaults off, env source, halt file, panel/HTML, CLI, committed False). `test_openterminal_valedia.py` PASS. `test_h4.py` PASS. `test_kill_switch.py` PASS. `test_kalshi_profit.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-PROFIT-1.md`. Reused `kalshi_fee_map.fee`. One helper module. No CLI/cron/live GET. Flags default False.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-CONTROLS-READOUT.md`. Reused existing flag helpers. One snapshot function. CLI is a print. No flip API.
 
-**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` (keyword, grok-build) / `memory_search` (fee-map). CBM `list_projects` + `get_architecture` scripts + `search_graph` fee/executor/allocator + `trace_path` consult inbound + `check_index_coverage` after write. Ponytail after code.
+**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` (keyword, grok-build) / `memory_search`. CBM `list_projects` + `get_architecture` scripts/integrations + `search_graph` valedia_config/cockpit + `get_code_snippet` panel + `check_index_coverage`. Ponytail after code.
 
-**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. `KALSHI_EV_PREFLIGHT_GATE` / `KALSHI_MAKER_FIRST` / `KALSHI_FILL_LEDGER_DEMOTE` stay False. No wallet keys/signing. FENCED.
+**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No Jev enable. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. PROFIT-1 gates stay False. No wallet keys/signing. FENCED.
 
-**Next:** Burton. CONTROLS-READOUT / AUTONOMY-2 MIROFISH-JEV-SHADOW still available. Do not auto-flip `KALSHI_FEE_MAP_GATE`. Do not auto-flip new PROFIT-1 gates. Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
+**Next:** Burton. AUTONOMY-2 MIROFISH-JEV-SHADOW then `KALSHI_FEE_MAP_GATE` runtime flip (env/LaunchAgent; do not commit True). Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
 
 
 ---

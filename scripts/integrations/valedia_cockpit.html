@@ -125,6 +125,11 @@
     }
     .pos { color: var(--ok); }
     .neg { color: var(--warn); }
+    .v.on { color: var(--ok); }
+    .v.off { color: var(--halt); }
+    #controls { columns: 2; column-gap: 24px; }
+    #controls .row { break-inside: avoid; }
+    @media (max-width: 720px) { #controls { columns: 1; } }
     footer {
       margin-top: 20px; color: var(--secondary); font-size: 12px;
       display: flex; flex-wrap: wrap; gap: 8px 16px;
@@ -148,6 +153,11 @@
     </header>
     <div class="banner" id="banner" role="status"></div>
     <div class="grid">
+      <section class="card wide" aria-labelledby="ctl-h">
+        <h2 id="ctl-h">Controls</h2>
+        <div id="controls"></div>
+        <p class="muted">Read-only. This panel never flips a gate.</p>
+      </section>
       <section class="card wide" aria-labelledby="pnl-h">
         <h2 id="pnl-h">P&amp;L</h2>
         <div class="grid">
@@ -266,6 +276,27 @@
       const sh = p.shadow || {};
       $("sh-n").textContent = sh.intents == null ? "—" : String(sh.intents);
       $("sh-d").textContent = sh.dispatchable == null ? "—" : String(sh.dispatchable);
+      const box = $("controls");
+      const items = (p.controls && p.controls.items) || [];
+      box.replaceChildren();
+      items.forEach((it) => {
+        const row = document.createElement("div");
+        row.className = "row";
+        const k = document.createElement("span");
+        k.className = "k";
+        k.textContent = it.name;
+        if (it.notes) k.title = it.notes;
+        const v = document.createElement("span");
+        const bool = typeof it.value === "boolean";
+        const raw = bool ? (it.value ? "ON" : "OFF") : String(it.value);
+        v.textContent = raw;
+        const low = raw.toLowerCase();
+        v.className = "v" + (bool ? (it.value ? " on" : " off")
+          : (low === "none" || low === "off" ? " off"
+            : (low === "valedia" || low === "on" ? " on" : "")));
+        row.append(k, v);
+        box.append(row);
+      });
       $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
     }
     async function poll() {

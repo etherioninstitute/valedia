@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.48.0 = PROFIT-1 EV preflight + maker-first + fill ledger).
+# Runtime identity (0.49.0 = CONTROLS-READOUT). Prior 0.48.0 = PROFIT-1.
 # Prior 0.47.0 = CRYPTO-PAPER-1. Prior 0.46.0 = AUTONOMY-1 fee-map GET refresh.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.48.0"
+VALEDIA_VERSION = "0.49.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -28,6 +28,7 @@ VALEDIA_VERSION = "0.48.0"
 # Dormant ≠ dead: pause TTL re-open + neural enrich may run under the flip.
 # SELF_ADJUST does not open venue writers / SPOT GET / NAUTILUS_LIVE.
 VALEDIA_SELF_ADJUST   = False  # Burton master flip only
+VALEDIA_JEV           = False  # AUTONOMY-2 typed gates. Off = Valedia works fully. This lane never sets True.
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
 MIROFISH_UNPROVEN_CAP = 0.10   # never exceed while accuracy unproven
 MIROFISH_PROVEN_CAP   = 0.15   # seatbelted 10–15% when SELF_ADJUST is False
@@ -41,6 +42,7 @@ MIROFISH_HARD_CEILING = 0.30
 MIROFISH_ENRICH_BONUS = 0.02   # enriched-vs-plain, inside band only
 CRYPTO_FEE_PCT      = 0.001    # crypto taker-fee assumption for backtests/sizing.
 CRYPTO_SLIPPAGE_PCT = 0.0005   # crypto slippage assumption.
+CRYPTO_PAPER_MODE   = "PAPER/SHADOW"  # would-have ledger; never live/wallets.
 
 # Canonical LIVE fusion (kernel-first). Consumed by unified_brain.stage_fusion.
 # signal_fusion.WEIGHTS is a NON-LIVE scanner (LIVE_PATH=False) — not an exec brain.
@@ -67,6 +69,8 @@ LIVE_EXEC_FENCED_SERIES = frozenset({"KXWTI", "KXOIL"})
 # MicroScalper / weather live buys. This lane never sets True.
 SCALPER_LIVE = False
 WEATHER_LIVE = False
+# US DCM writes. Env POLYMARKET_US_LIVE=1 is a Burton/Valedia flip.
+POLYMARKET_US_LIVE = False  # this lane never sets True
 
 # Position sizing — half-Kelly + DYNAMIC per-trade cap + absolute fuses (backtested 2026-09-12).
 # The per-trade ceiling BREATHES with regime/track-record/risk instead of a flat number; the
@@ -173,6 +177,13 @@ def _env_flag(name, default):
     return bool(default)
 
 
+def _src(name):
+    env = _os.environ.get(name)
+    if env is not None and str(env).strip() != "":
+        return "env"
+    return "const"
+
+
 _ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
 _STAMP_CACHE = None
 
@@ -238,6 +249,23 @@ def self_adjust_enabled():
     This lane never sets the constant True.
     """
     return _env_flag("VALEDIA_SELF_ADJUST", VALEDIA_SELF_ADJUST)
+
+
+def jev_enabled():
+    """True only if Burton flipped VALEDIA_JEV. Default False.
+
+    Off: Valedia works fully (fail-open). On: typed gates only (AUTONOMY-2).
+    Does not place orders. This lane never sets True.
+    """
+    return _env_flag("VALEDIA_JEV", VALEDIA_JEV)
+
+
+def polymarket_us_live_enabled():
+    """True only if Burton flipped POLYMARKET_US_LIVE. Default False.
+
+    This lane never sets True. Env POLYMARKET_US_LIVE=1 wins.
+    """
+    return _env_flag("POLYMARKET_US_LIVE", POLYMARKET_US_LIVE)
 
 
 def rebalancer_autoexec_enabled():
@@ -706,3 +734,89 @@ def nautilus_live_fills_allowed(venue=None):
     if venue is not None and venue_writer(venue) != "nautilus":
         return False
     return True
+
+
+def controls_snapshot():
+    """Read-only dict of every Valedia control. Never flips a gate.
+
+    Returns {version, sha, branch, dirty, items:[{name, value, source, category, notes}]}.
+    source is env | const | file (halt file only).
+    """
+    ident = version_identity()
+    halt_env = _os.environ.get("VALEDIA_TRADING_HALT")
+    if halt_env is not None and str(halt_env).strip() != "":
+        halt_src = "env"
+    elif _halt_file_state() is not None:
+        halt_src = "file"
+    else:
+        halt_src = "const"
+    rows = [
+        ("VALEDIA_VERSION", ident["version"], "const", "identity",
+         "runtime identity"),
+        ("GIT_SHA", ident["sha"] + ("*" if ident["dirty"] else ""), "const",
+         "identity", ident["branch"]),
+        ("VALEDIA_TRADING_HALT", trading_halted(), halt_src, "halt",
+         halt_reason() or "new orders refuse when on"),
+        ("KALSHI_FEE_MAP_GATE", kalshi_fee_map_gate_enabled(),
+         _src("KALSHI_FEE_MAP_GATE"), "kalshi",
+         "off=annotate; on=drop unknown+taker_taxed"),
+        ("KALSHI_EV_PREFLIGHT_GATE", kalshi_ev_preflight_gate_enabled(),
+         _src("KALSHI_EV_PREFLIGHT_GATE"), "kalshi",
+         "off=annotate; on=skip net EV<=0"),
+        ("KALSHI_MAKER_FIRST", kalshi_maker_first_enabled(),
+         _src("KALSHI_MAKER_FIRST"), "kalshi",
+         "off=annotate; on=skip taker unless hurdle"),
+        ("KALSHI_FILL_LEDGER_DEMOTE", kalshi_fill_ledger_demote_enabled(),
+         _src("KALSHI_FILL_LEDGER_DEMOTE"), "kalshi",
+         "off=persist; on=skip adverse series"),
+        ("VALEDIA_JEV", jev_enabled(), _src("VALEDIA_JEV"), "autonomy",
+         "off=Valedia works fully; on=typed gates only"),
+        ("VALEDIA_SELF_ADJUST", self_adjust_enabled(),
+         _src("VALEDIA_SELF_ADJUST"), "autonomy",
+         "wakes MiroFish AUTO_RAISE in-band only"),
+        ("MIROFISH_AUTO_RAISE", bool(MIROFISH_AUTO_RAISE), "const", "autonomy",
+         "stays False unless SELF_ADJUST allows"),
+        ("POLYMARKET_US_LIVE", polymarket_us_live_enabled(),
+         _src("POLYMARKET_US_LIVE"), "poly", "US DCM create/cancel"),
+        ("NAUTILUS_LIVE", bool(NAUTILUS_LIVE), "const", "nautilus",
+         "live fills via NT sink"),
+        ("NAUTILUS_ENABLED", bool(NAUTILUS_ENABLED), "const", "nautilus",
+         "sidecar dispatch"),
+        ("SCALPER_LIVE", scalper_live_enabled(), "const", "fence",
+         "hard-off; env cannot enable"),
+        ("WEATHER_LIVE", weather_live_enabled(), "const", "fence",
+         "hard-off; env cannot enable"),
+        ("LIVE_EXEC_FENCED", ",".join(sorted(LIVE_EXEC_FENCED)), "const",
+         "fence", "not a learning grave; unpause != live-buy"),
+        ("LIVE_EXEC_FENCED_SERIES", ",".join(sorted(LIVE_EXEC_FENCED_SERIES)),
+         "const", "fence", "oil ticker family even as NO_HARVEST"),
+        ("CRYPTO_PAPER_MODE", CRYPTO_PAPER_MODE, "const", "crypto",
+         "would-have fee-true PnL; no wallets/orders"),
+        ("SPOT_RECONCILE_HTTP", spot_reconcile_http_enabled(),
+         _src("SPOT_RECONCILE_HTTP"), "spot", "read-only GET reconcile"),
+        ("FORTRESS_INTEL_FALLBACK", fortress_intel_fallback_enabled(),
+         _src("FORTRESS_INTEL_FALLBACK"), "intel", "PARKED until Burton flip"),
+        ("REBALANCER_AUTOEXEC", rebalancer_autoexec_enabled(),
+         _src("REBALANCER_AUTOEXEC"), "rebalance", "shadow/propose until flip"),
+        ("VALEDIA_TREASURY_AUTO", treasury_auto_enabled(),
+         _src("VALEDIA_TREASURY_AUTO"), "treasury",
+         "never ACH/wire even if on"),
+        ("EXEC_DRY_RUN", bool(EXEC_DRY_RUN), "const", "exec",
+         "False=maker live path exists; halt/writer still bind"),
+    ]
+    for venue in sorted(VENUE_WRITER):
+        rows.append((
+            f"VENUE_WRITER.{venue}", VENUE_WRITER[venue], "const", "writer",
+            "valedia|nautilus|none",
+        ))
+    items = [
+        {"name": n, "value": v, "source": s, "category": c, "notes": notes}
+        for n, v, s, c, notes in rows
+    ]
+    return {
+        "version": ident["version"],
+        "sha": ident["sha"],
+        "branch": ident["branch"],
+        "dirty": bool(ident["dirty"]),
+        "items": items,
+    }

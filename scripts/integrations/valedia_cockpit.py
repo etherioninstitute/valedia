@@ -249,6 +249,7 @@ def panel(now=None):
         "auto_raise": bool(vc.MIROFISH_AUTO_RAISE),
         "trading_halt": halted,
         "trading_halt_reason": vc.halt_reason() if halted else "",
+        "controls": vc.controls_snapshot(),
     }
 
 

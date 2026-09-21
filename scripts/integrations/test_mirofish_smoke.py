@@ -163,9 +163,9 @@ def test_exit_nonzero_only_on_fixture_fail():
 
 def test_version_and_docs():
     _restore()
-    assert vc.VALEDIA_VERSION == "0.48.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.49.0", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.48.0 ")
+    assert vc.version_stamp().startswith("v0.49.0 ")
     rec = open(os.path.join(ROOT, "recommendations", "MIROFISH-SMOKE.md")).read()
     assert "fixture" in rec.lower()
     assert "overnight" in rec.lower()
