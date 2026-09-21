@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.52.0 = POLY-LOOP-UNIVERSE). Prior 0.51.0 = POLY-LOOP.
-# Prior 0.50.0 = AUTONOMY-2 Jev shadow. Prior 0.49.0 = CONTROLS-READOUT.
+# Runtime identity (0.53.0 = POLY-LOOP-RESOLUTION). Prior 0.52.0 = POLY-LOOP-UNIVERSE.
+# Prior 0.51.0 = POLY-LOOP. Prior 0.50.0 = AUTONOMY-2 Jev shadow.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.52.0"
+VALEDIA_VERSION = "0.53.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md

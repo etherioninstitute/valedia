@@ -6,8 +6,10 @@ This module never calls create/cancel. Proposals are DRY/SHADOW or BLOCKED.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import polymarket_us_client as pmu
@@ -70,32 +72,137 @@ def _named(v):
     return None
 
 
-def resolution_source(market):
+# Explicit source fields (short name or URL). Long criteria text is not a name.
+_NAMED_KEYS = (
+    "resolutionSource", "resolution_source", "resolvedBy", "resolved_by",
+    "resolver", "oracle", "resolutionURL", "resolution_url",
+)
+# US list/get_market + event: rules live in description (docs.polymarket.us).
+_TEXT_KEYS = (
+    "rules", "resolutionCriteria", "resolution_criteria", "description",
+    "resolutionDescription", "rulesText", "rules_text", "resolutionRules",
+    "settlementDescription", "rulesDisclaimer",
+)
+# ponytail: known-label scan, not an NLP resolver. Add a row if live text
+# names a source we miss. Unknown prose → rules_text hash, not a vibe FV.
+_OFFICIAL = (
+    ("national weather service", "NWS"),
+    ("associated press", "AP"),
+    ("federal reserve", "Fed"),
+    ("bureau of labor statistics", "BLS"),
+    ("new york times", "NYT"),
+    ("wall street journal", "WSJ"),
+    ("white house", "White House"),
+    ("supreme court", "SCOTUS"),
+    ("sportradar", "Sportradar"),
+    ("reuters", "Reuters"),
+    ("bloomberg", "Bloomberg"),
+    ("noaa", "NOAA"), ("nws", "NWS"), ("fomc", "FOMC"), ("bls", "BLS"),
+    ("bea", "BEA"), ("cdc", "CDC"), ("eia", "EIA"), ("fed", "Fed"),
+    ("ap", "AP"), ("nyt", "NYT"), ("wsj", "WSJ"), ("bbc", "BBC"),
+    ("nfl", "NFL"), ("nba", "NBA"), ("mlb", "MLB"), ("nhl", "NHL"),
+    ("ncaa", "NCAA"), ("fifa", "FIFA"), ("cme", "CME"),
+)
+_LAB = {k: v for k, v in _OFFICIAL}
+_OFFICIAL_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k, _ in _OFFICIAL) + r")\b", re.I)
+_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
+
+
+def _res_blobs(market):
     m = market if isinstance(market, dict) else {}
-    blobs = [m]
+    out = [m]
     for nest in ("metadata", "event", "market"):
-        inner = m.get(nest) if isinstance(m.get(nest), dict) else None
-        if inner:
-            blobs.append(inner)
-    keys = ("resolutionSource", "resolution_source", "resolvedBy",
-            "resolved_by", "resolution", "resolver", "oracle",
-            "resolutionURL", "resolution_url", "resolutionCriteria")
-    for blob in blobs:
-        for k in keys:
-            s = _named(blob.get(k))
+        inner = m.get(nest)
+        if isinstance(inner, dict):
+            out.append(inner)
+    evs = m.get("events")
+    if isinstance(evs, list):
+        out.extend(e for e in evs[:4] if isinstance(e, dict))
+    return out
+
+
+def _short_named(v):
+    s = _named(v)
+    if not s:
+        return None
+    if s.lower().startswith("http"):
+        return s.split()[0]
+    if len(s) > 80 or s.count(" ") > 8:
+        return None
+    return s
+
+
+def _plain(s):
+    t = re.sub(r"<[^>]+>", " ", s)
+    return " ".join(t.split())
+
+
+def _text_chunks(market):
+    chunks = []
+    for blob in _res_blobs(market):
+        for k in _TEXT_KEYS:
+            v = blob.get(k)
+            if isinstance(v, str) and v.strip():
+                chunks.append(v.strip())
+            elif isinstance(v, dict):
+                s = v.get("text") or v.get("body") or v.get("html")
+                if isinstance(s, str) and s.strip():
+                    chunks.append(s.strip())
+        res = blob.get("resolution")
+        if isinstance(res, str) and (
+                len(res.strip()) > 80 or res.count(" ") > 8):
+            chunks.append(res.strip())
+    return chunks
+
+
+def _label_from_text(text):
+    m = _OFFICIAL_RE.search(text)
+    if m:
+        return _LAB.get(m.group(0).lower())
+    u = _URL_RE.search(text)
+    if not u:
+        return None
+    host = u.group(0).split("://", 1)[-1].split("/")[0].split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+def _rules_token(text):
+    compact = _plain(text)
+    h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"rules_text:{h}:{compact[:80]}"
+
+
+def resolution_source(market):
+    """Named source, extracted label, or rules_text hash. None if no text.
+
+    Fail closed only when there is zero rules/description/resolution text.
+    Question/title/slug alone is vibes — not a source.
+    """
+    m = market if isinstance(market, dict) else {}
+    for blob in _res_blobs(m):
+        for k in _NAMED_KEYS:
+            s = _short_named(blob.get(k))
             if s:
                 return s
+        s = _short_named(blob.get("resolution"))
+        if s:
+            return s
     for t in m.get("tags") or []:
         if not isinstance(t, dict):
             continue
         league = t.get("league") if isinstance(t.get("league"), dict) else {}
-        s = _named(league.get("resolution")) or _named(t.get("resolution"))
+        s = (_short_named(league.get("resolution"))
+             or _short_named(t.get("resolution")))
         if s:
             return s
-    disc = m.get("rulesDisclaimer")
-    if isinstance(disc, str) and disc.strip().startswith("http"):
-        return disc.strip().split()[0]
-    return None
+    chunks = _text_chunks(m)
+    if not chunks:
+        return None
+    text = "\n".join(chunks)
+    return _label_from_text(text) or _rules_token(text)
 
 
 _LIQ_KEYS = ("liquidity", "liquidityNum", "liquidityClob", "liquidityUsd",

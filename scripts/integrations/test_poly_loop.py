@@ -3,6 +3,7 @@
 
 Run: python3 test_poly_loop.py
 """
+import hashlib
 import json
 import os
 import sys
@@ -80,7 +81,7 @@ def test_hygiene_and_fence():
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VALEDIA_VERSION == "0.52.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.53.0", vc.VALEDIA_VERSION
     assert vc.POLY_LOOP_EDGE_PTS == 8.0
     assert vc.POLY_LOOP_MAX_OPEN == 5
     assert vc.POLY_LOOP_DD_STOP == 0.40
@@ -309,6 +310,97 @@ def test_fv_from_cache_when_fairvalue_missing():
     ) == "no_resolution"
 
 
+def test_us_resolution_from_description_and_rules():
+    """US list/get_market often omit resolutionSource; rules live in description."""
+    _restore()
+    us_list = {
+        "id": "wx-1", "slug": "la-rain", "question": "Will it rain in LA?",
+        "description": (
+            "This market will resolve based on the National Weather Service "
+            "daily climate report."),
+        "active": True, "closed": False, "endDate": _end(24),
+        "liquidity": 9000, "fairValue": 0.70,
+    }
+    assert poly_loop.resolution_source(us_list) == "NWS"
+    assert poly_loop.skip_reason(
+        us_list, book=_book(), bbo=_book(), now=NOW) is None
+
+    wrapped = {"status": 200, "market": {
+        "slug": "ap-wrap", "question": "Did X happen?",
+        "description": "Resolves to Yes if the Associated Press reports X.",
+        "endDate": _end(24), "active": True, "fairValue": 0.70,
+        "liquidity": 9000,
+    }}
+    inner = poly_loop._unwrap_market(wrapped)
+    assert poly_loop.resolution_source(inner) == "AP"
+    assert poly_loop.resolution_source(wrapped) == "AP"
+
+    event_rules = {
+        "slug": "fed-cut", "question": "Fed cut?",
+        "event": {"rules": "Resolution uses the Federal Reserve FOMC statement."},
+        "endDate": _end(24), "active": True, "liquidity": 9000,
+    }
+    assert poly_loop.resolution_source(event_rules) == "Fed"
+
+    market_rules = {
+        "slug": "nested-mkt", "question": "Will they win?",
+        "market": {"rules": "Official box score from MLB.com decides the winner."},
+        "endDate": _end(24), "active": True,
+    }
+    assert poly_loop.resolution_source(market_rules) == "MLB"
+
+    prose = (
+        "This market resolves Yes if the thing happens by the end date, "
+        "using the listed criteria only.")
+    prose_mkt = {
+        "slug": "prose-mkt", "question": "Will the thing happen?",
+        "description": prose, "endDate": _end(24), "active": True,
+    }
+    src = poly_loop.resolution_source(prose_mkt)
+    h = hashlib.sha256(prose.encode("utf-8")).hexdigest()[:12]
+    snip = " ".join(prose.split())[:80]
+    assert src == f"rules_text:{h}:{snip}"
+
+    url_only = {
+        "slug": "url-src", "question": "Did it happen?",
+        "description": "Resolves using https://www.weather.gov/climate data.",
+        "endDate": _end(24), "active": True,
+    }
+    assert poly_loop.resolution_source(url_only) == "weather.gov"
+
+    vibes = {
+        "slug": "vibes", "question": "Will it rain?",
+        "endDate": _end(24), "active": True, "liquidity": 9000,
+    }
+    assert poly_loop.resolution_source(vibes) is None
+    assert poly_loop.skip_reason(
+        vibes, book=_book(), bbo=_book(), now=NOW) == "no_resolution"
+    empty = dict(vibes)
+    empty["description"] = "   \n\t  "
+    assert poly_loop.resolution_source(empty) is None
+
+    no_fv = dict(us_list)
+    no_fv.pop("fairValue")
+    assert poly_loop.skip_reason(
+        no_fv, book=_book(), bbo=_book(), now=NOW) == "no_fv"
+    thin = dict(us_list)
+    thin["fairValue"] = 0.55
+    assert poly_loop.skip_reason(
+        thin, book=_book(), bbo=_book(), now=NOW) == "edge_lt_8"
+
+    both = dict(us_list)
+    both["resolutionSource"] = "https://official.example"
+    assert poly_loop.resolution_source(both) == "https://official.example"
+    assert poly_loop.resolution_source({"resolvedBy": "Reuters"}) == "Reuters"
+
+    rec = poly_loop.evaluate_one(
+        us_list, book=_book(), bbo=_book(), now=NOW, bankroll=100)
+    assert rec is not None
+    assert rec["status"] == poly_loop.STATUS_DRY
+    assert rec["create_order"] is False
+    assert "NWS" in rec["reason"]
+
+
 def test_allocator_status_only_and_no_create():
     _restore()
     alloc = open(os.path.join(HERE, "master_allocator.py")).read()
@@ -333,5 +425,6 @@ if __name__ == "__main__":
     test_expired_filtered_and_aliases()
     test_skip_reason_histogram()
     test_fv_from_cache_when_fairvalue_missing()
+    test_us_resolution_from_description_and_rules()
     test_allocator_status_only_and_no_create()
     print("POLY-LOOP paper desk: PASS")

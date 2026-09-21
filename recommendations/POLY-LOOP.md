@@ -1,4 +1,4 @@
-# POLY-LOOP — Polymarket US paper desk (0.52.0)
+# POLY-LOOP — Polymarket US paper desk (0.53.0)
 
 **Name is POLY-LOOP** (not POLY-GROK-LOOP).
 
@@ -25,14 +25,27 @@ Allocator / POLY-LEARN print a **status line only** (`poly_loop.status_line`). N
 
 `GET /v1/markets` with `active=true`, `closed=false`, `archived=false` (do **not** send `endDateMin` — gateway then ignores `closed` and returns stale NFL). Over-fetch (~5×) then drop closed/archived/expired (`hours_left < 2`) and **present** `liquidity < $5k` before the batch fills. Missing liq ≠ 0 (US list often omits it). If the extra query 400s, retry `active=true` only. `last_run.json` `skip_reasons` + `pull.dropped` show why (expired / low_liq / no_resolution / no_fv / edge_lt_8 / slip / …). Unwrap `get_market` `{market: {...}}`.
 
-US + Gamma aliases: `endDate`/`endDateIso`/`event.endDate`; `liquidity`/`liquidityNum` as number or `{value}`; `resolutionSource` / `metadata` / `tags[].league.resolution` / `resolvedBy`. Fail closed if hours or named source still missing.
+US + Gamma aliases: `endDate`/`endDateIso`/`event.endDate`; `liquidity`/`liquidityNum` as number or `{value}`; `resolutionSource` / `metadata` / `tags[].league.resolution` / `resolvedBy`. Hours still fail closed if missing.
 
-HTTP smoke (2026-09-21, `POLYMARKET_US_HTTP=1` LIVE=0): `closed=false` returns live 2026 MLB; `skip_reasons` was `no_resolution`×8 (US payload has empty tags / no resolutionSource). Not expired-NFL domination. Filter held. Still no create.
+## Resolution (0.53.0)
+
+US `GET /v1/markets` + `GET /v1/market/slug/{slug}` **do not** document `resolutionSource` / `fairValue` (see Markets API overview). Rules live in `description` (and `event.rules` / `market.rules` / `resolutionCriteria` when present).
+
+`resolution_source()`:
+
+1. Explicit short name or URL: `resolutionSource` / `resolution_source` / `resolvedBy` / `resolver` / `oracle` / `resolutionURL` / nested `event`/`market`/`metadata` / `tags[].league.resolution`.
+2. Else scan rules text for a named official source (NWS, AP, Fed, BLS, Reuters, MLB, …) or a URL host.
+3. Else if any rules/description/resolution **text** exists → `rules_text:<12-hex>:<snippet>` (audit token; not invented).
+4. Fail closed (`None` → skip `no_resolution`) only when that text is **zero**. Question/title/slug is vibes, not a source.
+
+FV path unchanged: `fairValue` / cache `p_yes`. Resolution helper must return something before FV arms. Honest skips: `no_resolution` vs `no_fv` vs `edge_lt_8`.
+
+HTTP smoke (2026-09-21, `POLYMARKET_US_HTTP=1` LIVE=0, keys present, no create): list+get_market both carry `description` (~500 chars) and **omit** `resolutionSource` / `resolvedBy` / `rules` / `fairValue` / nested `event`. GET slug adds no extra resolution fields vs list. 0.53.0 `resolution_source` on 8 rows: 4 named (e.g. MLB from description) + 4 `rules_text`. Full loop `skip_reasons` **`no_fv`×20** (was `no_resolution`×20 on 0.52.0). Remaining gap is numeric FV (no `fairValue`, cache miss) — not missing rules text. `live=0` `create_order=0`.
 
 ## Loop
 
 1. Active Poly US markets (existing client). Skip resolve-under-2h and liquidity &lt; $5k. Pull-time filter so stale NFL / zero-liq rows cannot occupy the whole batch.
-2. Fair value: **named resolution source required**. Numeric FV from market/tags `fairValue`/`fv`/`p_yes`, else slug lookup in existing `mirofish_neural_enrichment.json` / `persona_lens_scores.json` caches (`poly_learn.cheap_tags` still tags only). **No** vibes, **no** new Ollama/TypeSafe, **no** `modeled_prob` price-series (crypto, not poly). Skip `no_fv` if none of those exist.
+2. Fair value: **resolution helper must return something** (explicit name, extracted official label, or `rules_text` hash — see Resolution 0.53.0). Numeric FV from market/tags `fairValue`/`fv`/`p_yes`, else slug lookup in existing `mirofish_neural_enrichment.json` / `persona_lens_scores.json` caches (`poly_learn.cheap_tags` still tags only). **No** vibes, **no** new Ollama/TypeSafe, **no** `modeled_prob` price-series (crypto, not poly). Skip `no_fv` if none of those exist.
 3. Flag only if `|FV − mid| ≥ 8` percentage points (`POLY_LOOP_EDGE_PTS`).
 4. Book/BBO flatten: full size at ≤ 3% slippage or skip (`BLOCKED`).
 5. Half-Kelly (`quant_engine.kelly_size` / `KELLY_SAFETY_FRACTION`); hard cap **6%** bankroll; max **5** open paper positions.
