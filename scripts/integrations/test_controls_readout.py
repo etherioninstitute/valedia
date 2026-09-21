@@ -93,8 +93,8 @@ def _restore(name, prev):
 def test_defaults_and_shape():
     snap = vc.controls_snapshot()
     assert set(snap) >= {"version", "sha", "branch", "dirty", "items"}
-    assert snap["version"] == "0.49.0"
-    assert vc.VALEDIA_VERSION == "0.49.0"
+    assert snap["version"] == "0.50.0"
+    assert vc.VALEDIA_VERSION == "0.50.0"
     assert vc.VALEDIA_JEV is False
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.jev_enabled() is False
@@ -115,7 +115,7 @@ def test_defaults_and_shape():
     assert "OIL_BRACKET" in got["LIVE_EXEC_FENCED"]["value"]
     assert "KXWTI" in got["LIVE_EXEC_FENCED_SERIES"]["value"]
     assert got["CRYPTO_PAPER_MODE"]["value"] == "PAPER/SHADOW"
-    assert got["VALEDIA_VERSION"]["value"] == "0.49.0"
+    assert got["VALEDIA_VERSION"]["value"] == "0.50.0"
 
 
 def test_env_source_does_not_stick():
@@ -169,7 +169,7 @@ def test_halt_file_source():
 def test_panel_and_html():
     p = cockpit.panel()
     assert "controls" in p
-    assert p["controls"]["version"] == "0.49.0"
+    assert p["controls"]["version"] == "0.50.0"
     names = {r["name"] for r in p["controls"]["items"]}
     for n in REQUIRED:
         assert n in names, n

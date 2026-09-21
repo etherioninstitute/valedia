@@ -392,6 +392,14 @@ def process_mirofish_report(report_json, enrichment=None, out_path=None):
     except Exception:
         result["persona_lenses"] = False
 
+    # AUTONOMY-2: Jev shadow. Off = zero TypeSafe calls. On = annotate; fail-open.
+    # Does not change scores/bias/weight/Kelly. Never blocks live Kalshi.
+    try:
+        import jev_shadow as jev
+        result = jev.attach_to_signal(result)
+    except Exception:
+        pass
+
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     with open(dest, "w") as f:
         json.dump(result, f, indent=2)

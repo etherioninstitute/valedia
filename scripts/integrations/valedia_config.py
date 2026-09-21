@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.49.0 = CONTROLS-READOUT). Prior 0.48.0 = PROFIT-1.
-# Prior 0.47.0 = CRYPTO-PAPER-1. Prior 0.46.0 = AUTONOMY-1 fee-map GET refresh.
+# Runtime identity (0.50.0 = AUTONOMY-2 Jev shadow). Prior 0.49.0 = CONTROLS-READOUT.
+# Prior 0.48.0 = PROFIT-1. Prior 0.47.0 = CRYPTO-PAPER-1.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.49.0"
+VALEDIA_VERSION = "0.50.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -254,8 +254,10 @@ def self_adjust_enabled():
 def jev_enabled():
     """True only if Burton flipped VALEDIA_JEV. Default False.
 
-    Off: Valedia works fully (fail-open). On: typed gates only (AUTONOMY-2).
-    Does not place orders. This lane never sets True.
+    Off: Valedia works fully; zero TypeSafe calls (fail-open).
+    On: MiroFish jev_shadow annotate/veto/resize in shadow only.
+    Timeouts do not block live Kalshi. Does not place orders.
+    This lane never sets True.
     """
     return _env_flag("VALEDIA_JEV", VALEDIA_JEV)
 
@@ -770,7 +772,7 @@ def controls_snapshot():
          _src("KALSHI_FILL_LEDGER_DEMOTE"), "kalshi",
          "off=persist; on=skip adverse series"),
         ("VALEDIA_JEV", jev_enabled(), _src("VALEDIA_JEV"), "autonomy",
-         "off=Valedia works fully; on=typed gates only"),
+         "off=no TypeSafe; on=MiroFish jev_shadow annotate; fail-open"),
         ("VALEDIA_SELF_ADJUST", self_adjust_enabled(),
          _src("VALEDIA_SELF_ADJUST"), "autonomy",
          "wakes MiroFish AUTO_RAISE in-band only"),

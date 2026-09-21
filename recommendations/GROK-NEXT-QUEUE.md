@@ -15,7 +15,8 @@
 7f. **AUTONOMY-1 FEE-MAP-REFRESH** — done `0.46.0` (GET refresh + artifact + gate checklist; gate still False). See `KALSHI-FEE-MAP-GATE-CHECKLIST.md`. Next = Burton flip **or** AUTONOMY-2 MIROFISH-JEV-SHADOW.
 7g. **CRYPTO-PAPER-1** — done `0.47.0` (paper/shadow crypto simulation ledger; fixture + optional public klines; no wallets/orders). See `CRYPTO-PAPER-DESK.md`.
 7h. **PROFIT-1 EV-PREFLIGHT + MAKER-FIRST + FILL-LEDGER** — done `0.48.0`. See `PROFIT-1-EV-PREFLIGHT.md`. Gates default OFF.
-7i. **CONTROLS-READOUT** — done `0.49.0`. See `CONTROLS-READOUT.md`. Snapshot + cockpit `/status.controls` + HTML + CLI. No live flips. Next = AUTONOMY-2 then fee-map runtime flip.
+7i. **CONTROLS-READOUT** — done `0.49.0`. See `CONTROLS-READOUT.md`. Snapshot + cockpit `/status.controls` + HTML + CLI. No live flips.
+7j. **AUTONOMY-2 MIROFISH-JEV-SHADOW** — done `0.50.0`. See `AUTONOMY-2-JEV-SHADOW.md`. `VALEDIA_JEV` stays False. Next = `KALSHI_FEE_MAP_GATE` runtime flip.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)

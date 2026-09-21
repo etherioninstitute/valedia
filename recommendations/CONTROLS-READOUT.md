@@ -40,4 +40,4 @@ python3 scripts/integrations/test_kill_switch.py
 
 ## Next
 
-Parent launches **AUTONOMY-2 MIROFISH-JEV-SHADOW** (`VALEDIA_JEV` stays False in git). Then fee-map **runtime** flip (env / LaunchAgent only; do not commit True).
+**AUTONOMY-2** shipped `0.50.0` (`VALEDIA_JEV` still False in git). Then fee-map **runtime** flip (env / LaunchAgent only; do not commit True).

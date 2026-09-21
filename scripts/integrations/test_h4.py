@@ -57,7 +57,7 @@ def test_panel_get_only():
         assert body["no_orders"] is True
         assert body["auto_raise"] is False
         assert body["trading_halt"] is False
-        assert body["valedia_version"] == "0.49.0"
+        assert body["valedia_version"] == "0.50.0"
         assert body["ftl"]["profit_is_fee_true"] is True
         assert body["ftl"]["unreconciled"] >= 1
         assert body["shadow"]["intents"] == 2
@@ -109,9 +109,9 @@ def test_hygiene_and_version():
     assert "--live" not in src.replace("--listen", "")
     assert "import requests" not in src
     assert "do_POST" in src
-    assert vc.VALEDIA_VERSION == "0.49.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.50.0", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.49.0 ")
+    assert vc.version_stamp().startswith("v0.50.0 ")
     assert src.count("serve_forever") == 1  # optional loopback only, not cron
 
 

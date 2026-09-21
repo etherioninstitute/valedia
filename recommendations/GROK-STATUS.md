@@ -6,19 +6,19 @@
 
 **Mode:** RuFlo + Ponytail. Hard fence held.
 
-**Current:** CONTROLS-READOUT SHIPPED. `valedia_config.controls_snapshot()` is the SoT for every gate on/off. Wired into cockpit `GET /status` key `controls` + HTML Controls card + CLI `valedia_controls.py`. `VALEDIA_JEV` default False. No live flips. Next=Burton (AUTONOMY-2 Jev shadow, then fee-map runtime flip).
+**Current:** AUTONOMY-2 MIROFISH-JEV-SHADOW SHIPPED. `jev_shadow.py` pass-through when `VALEDIA_JEV=False` (zero TypeSafe calls). When on: POST systemone CIO questions; stamp only; fail-open. One hook: `process_mirofish_report`. Not wired into Kalshi execute. Constant stays False. Next=Burton (`KALSHI_FEE_MAP_GATE` runtime flip per checklist).
 
-**Version:** `0.49.0` tag `valedia-v0.49.0` tip `d8cd1bb`. Prior: `0.48.0` `4e8ad94`.
+**Version:** `0.50.0` tag pending. Prior: `0.49.0` `d8cd1bb`.
 
-**Tests:** `test_controls_readout.py` PASS (shape, defaults off, env source, halt file, panel/HTML, CLI, committed False). `test_openterminal_valedia.py` PASS. `test_h4.py` PASS. `test_kill_switch.py` PASS. `test_kalshi_profit.py` PASS.
+**Tests:** `test_jev_shadow.py` PASS (off no network, on mocked HTTP, fail-open, extractor hook, hygiene). `test_controls_readout.py` PASS. `test_h2.py` / `test_nt2.py` PASS.
 
-**Ponytail:** `recommendations/PONYTAIL-AUDIT-CONTROLS-READOUT.md`. Reused existing flag helpers. One snapshot function. CLI is a print. No flip API.
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-AUTONOMY-2.md`. urllib not SDK. One call site. No live arm.
 
-**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` (keyword, grok-build) / `memory_search`. CBM `list_projects` + `get_architecture` scripts/integrations + `search_graph` valedia_config/cockpit + `get_code_snippet` panel + `check_index_coverage`. Ponytail after code.
+**Tool use:** RuFlo `hooks_pre-task` / `hooks_route` / `hooks_pre-edit` / `memory_search`. CBM `list_projects` + `search_graph` + `search_code` + `get_code_snippet` process_mirofish_report / kalshi_profit.annotate. TypeSafe live API docs. Ponytail after code.
 
-**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No Jev enable. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. PROFIT-1 gates stay False. No wallet keys/signing. FENCED.
+**Fence:** No live orders. No ACH/wire/card. No `POLYMARKET_US_LIVE`. No Jev enable in git. No CB/Alpaca writer restore. No weather/oil unfence. No `VALEDIA_TRADING_HALT` bypass. `KALSHI_FEE_MAP_GATE` stays False. PROFIT-1 gates stay False. No wallet keys/signing. FENCED.
 
-**Next:** Burton. AUTONOMY-2 MIROFISH-JEV-SHADOW then `KALSHI_FEE_MAP_GATE` runtime flip (env/LaunchAgent; do not commit True). Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil.
+**Next:** Burton. `KALSHI_FEE_MAP_GATE` runtime flip (env/LaunchAgent; do not commit True). Do not auto-flip `POLYMARKET_US_LIVE`. Do not unfence weather/oil. Do not default `VALEDIA_JEV` True.
 
 
 ---
