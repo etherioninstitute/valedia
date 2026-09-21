@@ -8,7 +8,7 @@
 
 **Current:** POLY-LOOP-UNIVERSE SHIPPED (with POLY-LOOP 0.51.0 in the same commit). Active pull `closed=false` + client-side drop of expired/zero-liq. US/Gamma field aliases for end/liq/resolution. FV from existing MiroFish/persona caches when `fairValue` missing; still requires a named resolution source; fail closed otherwise. `last_run.json` `skip_reasons` histogram. `POLYMARKET_US_LIVE` git False. Writer polymarket `none`. No crontab. Next=Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 
-**Version:** `0.52.0`. Prior: `0.51.0` POLY-LOOP (uncommitted, folded here) / `0.50.0` AUTONOMY-2.
+**Version:** `0.52.0` tip `bda27e2` tag `valedia-v0.52.0`. Prior: `0.51.0` POLY-LOOP (folded into this commit) / `0.50.0` AUTONOMY-2.
 
 **Tests:** `test_poly_loop.py` (expired filter, skip_reason histogram, FV-from-cache, edge/Kelly/DD, live blocked).
 
