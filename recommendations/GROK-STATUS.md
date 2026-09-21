@@ -8,7 +8,7 @@
 
 **Current:** POLY-LOOP-RESOLUTION SHIPPED. `resolution_source()` maps US/event fields: explicit `resolutionSource`/`resolvedBy`, else official label from `description`/`rules`/`resolutionCriteria`/`event.rules` (NWS, AP, Fed, …) or URL host, else `rules_text:<hash>:<snippet>` when text exists. Fail closed only on zero rules/description text (question-only is vibes). FV path unchanged (caches/`fairValue`); skip_reasons stay honest (`no_resolution` vs `no_fv` vs `edge_lt_8`). `POLYMARKET_US_LIVE` git False. Writer polymarket `none`. No crontab. Next=Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 
-**Version:** `0.53.0` tip pending tag `valedia-v0.53.0`. Prior: `0.52.0` POLY-LOOP-UNIVERSE / `0.51.0` POLY-LOOP (folded) / `0.50.0` AUTONOMY-2.
+**Version:** `0.53.0` tip `a00c49a` tag `valedia-v0.53.0`. Prior: `0.52.0` POLY-LOOP-UNIVERSE / `0.51.0` POLY-LOOP (folded) / `0.50.0` AUTONOMY-2.
 
 **Tests:** `test_poly_loop.py` (US list/get_market fixtures, NWS/AP/Fed/MLB extract, rules_text hash, vibes fail-closed, no_fv vs edge_lt_8, prior universe/edge/Kelly/DD).
 
