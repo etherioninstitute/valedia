@@ -8,7 +8,7 @@
 
 **Current:** FOMO-RADAR-DOSSIER SHIPPED. Dossier + offline enrich stub for CRYPTO-PAPER / MiroFish. Tags: `wallet_conviction`, `provenance_ok`, `burst`, `exit`. Annotate only — radar score does not size. Fixture `data/crypto-paper/fomo_radar_fixture.json`. No FOMOAPI. No browser/extension. No chain RPC. Not wired into `crypto_paper.run`, Kalshi execute, or Poly `create_order`. `POLYMARKET_US_LIVE` git False. Writer polymarket `none`. No crontab. Next=Burton. Do not auto-flip Poly live.
 
-**Version:** `0.55.0` (tip+tag on status commit). Prior: `0.54.0` POLY-LOOP-FV / `0.53.0` POLY-LOOP-RESOLUTION / `0.52.0` POLY-LOOP-UNIVERSE.
+**Version:** `0.55.0` tip `8e4c86b` tag `valedia-v0.55.0`. Prior: `0.54.0` POLY-LOOP-FV / `0.53.0` POLY-LOOP-RESOLUTION / `0.52.0` POLY-LOOP-UNIVERSE.
 
 **Tests:** `test_fomo_radar.py` (fixture conviction, seeded quarantine, burst span, exit floor, paper/signal stamps leave qty and score). PASS.
 
