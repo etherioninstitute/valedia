@@ -77,3 +77,19 @@ Set `MIROFISH_INFERENCE=ollama` (or restore bak `.env`) → previous `:11435` UR
 **Tests:** `test_mirofish_bionic.py` PASS. `test_mirofish_smoke.py` PASS. `test_slice23.py` PASS. `test_kill_switch.py` PASS.
 
 **Ponytail:** `recommendations/PONYTAIL-AUDIT-MIROFISH-BIONIC.md`.
+
+## Results (2026-09-22 — ontology E2E)
+
+**Inference:** stayed `MIROFISH_INFERENCE=bionic`. Did not set ollama.
+
+**json_object:** `LLMClient.normalize_response_format` drops `json_object` on Bionic. `chat_json` PASS 129s vs `qwen3.8-27b-obliterated-k`. Ontology generate no longer 400s.
+
+**Neo4j:** Colima started (stale `in_use_by` removed). Container `mirofish-neo4j` neo4j **5.18.1**, auth matches `.env`, bolt open. Rec asked 5.15; 5.18.1 was the existing compose volume.
+
+**Ontology:** `proj_c29e60ca7611` PASS (10 types / 6 edges, 656s) after Bionic `max_tokens=1500` + timeout 900 + `max_retries=0`. First 4096-token attempt timed out at 20min.
+
+**Swarm wall:** graph_completed 141s, **0 NER nodes** on 245-char seed. Prepare stalled. Signal file still `intel_refresh (lightweight)` — not overwritten.
+
+**Healthcheck:** 20 PASS · 2 WARN · 0 FAIL. Bionic required path green; Ollama fallback present (not used).
+
+**Ponytail:** `recommendations/PONYTAIL-AUDIT-MIROFISH-E2E.md`.

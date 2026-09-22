@@ -1,0 +1,212 @@
+{
+  "ok": true,
+  "verdict": "PASS",
+  "valedia_version": "0.57.0",
+  "stamp": "v0.57.0 4708fd5*",
+  "ts": "2026-09-22T09:09:14.094762+00:00",
+  "wall_s": 41.004,
+  "wall_budget_s": 600,
+  "within_budget": true,
+  "offline": false,
+  "sections": [
+    {
+      "name": "fence",
+      "status": "PASS",
+      "reason": "v0.57.0 writers held, POLYMARKET_US_LIVE on",
+      "critical": true,
+      "extra": {
+        "valedia_version": "0.57.0",
+        "stamp": "v0.57.0 4708fd5*",
+        "venue_writer": {
+          "kalshi": "valedia",
+          "coinbase": "valedia",
+          "alpaca": "valedia",
+          "kraken": "none",
+          "polymarket": "none",
+          "hyperliquid": "none"
+        },
+        "writer_drift": {},
+        "env_live": [],
+        "config_live": [],
+        "polymarket_us_live": true,
+        "kalshi_ev_preflight_gate": true,
+        "kalshi_maker_first": true,
+        "treasury_auto": false,
+        "rebalancer_autoexec": false,
+        "trading_halt": false
+      }
+    },
+    {
+      "name": "treasury",
+      "status": "PASS",
+      "reason": "report-only; auto refused; no ACH",
+      "critical": true,
+      "extra": {
+        "moves_money": false,
+        "auto": {
+          "flag": false,
+          "executed": false,
+          "refused": true,
+          "reason": "this slice never moves money; first human fund still required"
+        },
+        "venues": [
+          {
+            "venue": "kalshi",
+            "status": "OK",
+            "cash": 66.76,
+            "writer": "valedia"
+          },
+          {
+            "venue": "polymarket_us",
+            "status": "OK",
+            "cash": 75.552,
+            "writer": "none"
+          },
+          {
+            "venue": "coinbase",
+            "status": "WARN",
+            "cash": 0.15240463670028,
+            "writer": "valedia"
+          },
+          {
+            "venue": "alpaca",
+            "status": "WARN",
+            "cash": 0.31,
+            "writer": "valedia"
+          },
+          {
+            "venue": "hyperliquid",
+            "status": "DOCUMENT",
+            "cash": null,
+            "writer": "none"
+          },
+          {
+            "venue": "kraken",
+            "status": "DOCUMENT",
+            "cash": null,
+            "writer": "none"
+          }
+        ],
+        "polymarket_us_live": false
+      }
+    },
+    {
+      "name": "mirofish",
+      "status": "PASS",
+      "reason": "fixture PASS; live-lite PASS; bionic=PASS; backend=PASS; neo4j=PASS",
+      "critical": true,
+      "extra": {
+        "fixture_ok": true,
+        "live_lite": "PASS",
+        "live_reason": null,
+        "live_endpoint": "http://127.0.0.1:1234",
+        "health": {
+          "bionic": "PASS",
+          "backend": "PASS",
+          "neo4j": "PASS",
+          "inference": "bionic",
+          "llm_base": "http://127.0.0.1:1234/v1"
+        },
+        "wall_s": 35.938,
+        "verdict": "PASS"
+      }
+    },
+    {
+      "name": "kalshi",
+      "status": "PASS",
+      "reason": "GET /portfolio/balance + fee-map consult",
+      "critical": false,
+      "extra": {
+        "cash_usd": 66.76,
+        "keys": [
+          "balance"
+        ],
+        "ev_preflight": true,
+        "maker_first": true,
+        "fee_map_consult": "ok",
+        "fee_map_series": "KXBTCY"
+      }
+    },
+    {
+      "name": "poly_us",
+      "status": "PASS",
+      "reason": "whoami_retail/balances + preview; LIVE on; create skipped",
+      "critical": false,
+      "extra": {
+        "whoami_source": "balances",
+        "preview": {
+          "kind": "preview",
+          "filled": false,
+          "marketSlug": "aec-nfl-lac-ten-2025-11-02",
+          "quantity": 1,
+          "price": "0.01"
+        },
+        "create_blocked": false,
+        "create_skipped": true,
+        "live": true
+      }
+    },
+    {
+      "name": "shadow_adversarial",
+      "status": "PASS",
+      "reason": "queue intents=337 dispatchable=0; adversarial paper import ok",
+      "critical": true,
+      "extra": {
+        "intents": 337,
+        "dispatchable": 0,
+        "queue": "/Users/burtonchatelain/.openclaw/workspace/models/nautilus_intent_queue.jsonl",
+        "adversarial_n": 0,
+        "adversarial_mode": "PAPER/SHADOW",
+        "no_orders": true
+      }
+    },
+    {
+      "name": "cockpit",
+      "status": "PASS",
+      "reason": "panel() LIVE; GET PASS",
+      "critical": true,
+      "extra": {
+        "mode": "LIVE",
+        "get_only": true,
+        "no_orders": true,
+        "shadow": {
+          "intents": 337,
+          "dispatchable": 0
+        },
+        "http": {
+          "status": "PASS",
+          "http": 200,
+          "mode": "LIVE"
+        }
+      }
+    },
+    {
+      "name": "pnl",
+      "status": "PASS",
+      "reason": "broker summary present; label broker\u2260FTL; FTL n=1",
+      "critical": true,
+      "extra": {
+        "label": "broker (pnl_tracker.json) \u2260 FTL",
+        "broker_wins": 10,
+        "broker_losses": 28,
+        "broker_net": -12.62,
+        "ftl_n": 1,
+        "ftl_net": 0.37,
+        "message": "\ud83d\udcb0 Valedia P&L \u2014 Sep 22\nInvested: $80.55 deployed \u00b7 $70.53 cash\n\ud83d\udd34 Kalshi broker P&L: $-12.62  (pnl_tracker.json, not FTL)\nSettled record: 10W / 28L (26% win)"
+      }
+    }
+  ],
+  "by_name": {
+    "fence": "PASS",
+    "treasury": "PASS",
+    "mirofish": "PASS",
+    "kalshi": "PASS",
+    "poly_us": "PASS",
+    "shadow_adversarial": "PASS",
+    "cockpit": "PASS",
+    "pnl": "PASS"
+  },
+  "critical_fail": [],
+  "fence": "POLYMARKET_US_LIVE reported honestly (env-only, never committed). No VENUE_WRITER / REBALANCER_AUTOEXEC / NAUTILUS_LIVE / VALEDIA_SELF_ADJUST / MIROFISH_AUTO_RAISE / VALEDIA_TREASURY_AUTO / mass create_order / ACH / oil-weather unfence.",
+  "next": "STOP for Burton. Do not auto-start another slice."
+}

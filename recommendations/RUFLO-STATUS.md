@@ -1,5 +1,25 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-21 PT — **OPENTERMINAL-ACCURACY SHIPPED**. Version `0.56.0` tip `a987248` tag `valedia-v0.56.0`. Honest `:8765` GET glance (live Kalshi GET or STALE age, all controls, Poly last_run, mode from halt/writers). No order path. No OT-VALEDIA-FORK. Ponytail: `PONYTAIL-AUDIT-OPENTERMINAL-ACCURACY.md`. **GROK-STATUS: OPENTERMINAL-ACCURACY SHIPPED.** Prior `0.55.0` FOMO-RADAR-DOSSIER. No `--live` / writer edits / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore / Jev enable in git. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False. `KALSHI_FEE_MAP_GATE` stays False in git. `VALEDIA_JEV` stays False in git.
+Updated: 2026-09-22 PT — **VALEDIA-TRADING-SMOKE SHIPPED**. Version stays `0.57.0`. MiroFish Bionic ontology PASS (no json_object 400). `valedia_full_smoke` PASS 41s with `POLYMARKET_US_LIVE` reported on (env-only). Writer polymarket `none`. Screens `ot-valedia-desk` / `valedia-glance` left running. Ponytail: `PONYTAIL-AUDIT-VALEDIA-TRADING-SMOKE.md` + `PONYTAIL-AUDIT-MIROFISH-E2E.md`. **GROK-STATUS: VALEDIA-TRADING-SMOKE SHIPPED.** Next = Burton. No oil/weather unfence. No mass create_order. No `MIROFISH_INFERENCE=ollama`.
+
+## VALEDIA-TRADING-SMOKE (Grok Build executor)
+- Ontology `proj_c29e60ca7611` PASS on Bionic. Neo4j bolt up (Colima + neo4j 5.18.1).
+- Harness no longer false-fails LIVE=1 / EV gates.
+- **Next = Burton. Do not auto-start another slice.**
+
+
+## OT-VALEDIA-POLISH (Grok Build executor)
+- Fork commit `f33c6e6` (not pushed). UI only. Same GET `/api/valedia/status` → `127.0.0.1:8765/status`.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE. Do not auto-start another slice.**
+
+## OT-VALEDIA-FORK-2 (Grok Build executor)
+- Fork commit `2f8b412` (not pushed). Same GET `/api/valedia/status` → `127.0.0.1:8765/status`.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE. Do not auto-start FORK-3.**
+
+## INFORMED-BEFORE-CREATE (Grok Build executor, `valedia-v2-grok-build`)
+- `informed_before_create.py` on `kalshi_auth.create_order` / `sell_position` and `PolymarketUSClient.create_order`.
+- Controls: `INFORMED_BEFORE_CREATE` const True, `POLY_TAG_PRIOR_CREATE` const False.
+- `test_informed_before_create.py` PASS. Callers without evidence fail closed.
+- **Next was Burton. Fork later shipped as FORK-1 then FORK-2. Poly live still STOP.**
 
 ## OPENTERMINAL-ACCURACY (Grok Build executor, `valedia-v2-grok-build`)
 - `valedia_cockpit.py --listen` on `127.0.0.1:8765`. GET `/` and `/status` only.

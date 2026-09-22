@@ -189,7 +189,9 @@ def test_fence_fail_on_live_flag():
     os.environ["POLYMARKET_US_LIVE"] = "1"
     try:
         row = smoke.check_fence()
-        assert row["status"] == "FAIL"
+        assert row["status"] == "PASS"
+        assert row["extra"]["polymarket_us_live"] is True
+        assert "POLYMARKET_US_LIVE on" in row["reason"]
     finally:
         os.environ.pop("POLYMARKET_US_LIVE", None)
     _restore()

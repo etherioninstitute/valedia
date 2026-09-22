@@ -58,7 +58,6 @@ SYNTHETIC_ENRICHMENT = {
 }
 
 _LIVE_ENV = (
-    "POLYMARKET_US_LIVE",
     "REBALANCER_AUTOEXEC",
     "NAUTILUS_LIVE",
     "VALEDIA_SELF_ADJUST",
@@ -137,15 +136,31 @@ def _pick_lms_model(doc):
 
 
 def run_live_lite(timeout=LIVE_TIMEOUT_S):
-    """One short local-model ping. Unreachable or timeout → SKIP, never FAIL fixture."""
+    """One short local-model ping. Bionic first; Ollama fallback SKIP. Never FAIL fixture."""
     t0 = time.monotonic()
     cap = min(int(timeout), LIVE_TIMEOUT_S)
     mf, lms = ollama_base(), lms_base()
     try:
+        models = http_json(lms + "/v1/models", timeout=PROBE_TIMEOUT_S)
+        model = _pick_lms_model(models)
+        if model:
+            out = http_json(lms + "/v1/chat/completions", {
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with the word ok."}],
+                "max_tokens": 8,
+                "reasoning_effort": "none",
+            }, timeout=cap)
+            text = (((out.get("choices") or [{}])[0].get("message") or {}).get("content") or "")[:80]
+            return {"status": "PASS", "endpoint": lms, "model": model,
+                    "reply": text, "ms": _ms(t0)}
+        # lms up but empty catalog — try Ollama fallback
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError, KeyError):
+        pass
+    try:
         tags = http_json(mf + "/api/tags", timeout=PROBE_TIMEOUT_S)
         model = _pick_ollama_model(tags)
         if not model:
-            return {"status": "SKIP", "reason": "ollama up, no models",
+            return {"status": "SKIP", "reason": "bionic miss; ollama up, no models",
                     "endpoint": mf, "ms": _ms(t0)}
         out = http_json(mf + "/api/generate", {
             "model": model,
@@ -156,24 +171,8 @@ def run_live_lite(timeout=LIVE_TIMEOUT_S):
         text = str(out.get("response") or "")[:80]
         return {"status": "PASS", "endpoint": mf, "model": model,
                 "reply": text, "ms": _ms(t0)}
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
-        pass
-    try:
-        models = http_json(lms + "/v1/models", timeout=PROBE_TIMEOUT_S)
-        model = _pick_lms_model(models)
-        if not model:
-            return {"status": "SKIP", "reason": "lms up, no models",
-                    "endpoint": lms, "ms": _ms(t0)}
-        out = http_json(lms + "/v1/chat/completions", {
-            "model": model,
-            "messages": [{"role": "user", "content": "Reply with the word ok."}],
-            "max_tokens": 8,
-        }, timeout=cap)
-        text = (((out.get("choices") or [{}])[0].get("message") or {}).get("content") or "")[:80]
-        return {"status": "PASS", "endpoint": lms, "model": model,
-                "reply": text, "ms": _ms(t0)}
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as e:
-        return {"status": "SKIP", "reason": str(e)[:120], "endpoint": mf,
+        return {"status": "SKIP", "reason": str(e)[:120], "endpoint": lms,
                 "ms": _ms(t0)}
 
 

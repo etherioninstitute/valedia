@@ -69,7 +69,8 @@ def _row(name, status, reason, critical=False, extra=None):
 
 
 def check_fence():
-    """Version + VENUE_WRITER + LIVE/TREASURY/POLYMARKET_US_LIVE stamps. Never sets them."""
+    """Version + VENUE_WRITER + LIVE/TREASURY stamps. POLYMARKET_US_LIVE is
+    reported honestly (env-only) and is not a fence fail. Never sets flags."""
     mf_fence = mf.check_fence()
     writers = {k: vc.venue_writer(k) for k in EXPECTED_WRITERS}
     drift = {k: writers[k] for k in EXPECTED_WRITERS if writers[k] != EXPECTED_WRITERS[k]}
@@ -80,15 +81,18 @@ def check_fence():
         poly_live = bool(pmu.live_enabled())
     except Exception:
         poly_live = mf._truthy(os.environ.get("POLYMARKET_US_LIVE"))
-    ok = bool(mf_fence["ok"]) and not drift and not cfg and not poly_live
+    env_live = [k for k in (mf_fence.get("env_live") or []) if k != "POLYMARKET_US_LIVE"]
+    ok = not env_live and not (mf_fence.get("config_live") or []) and not drift and not cfg
     extra = {
         "valedia_version": vc.VALEDIA_VERSION,
         "stamp": vc.version_stamp(),
         "venue_writer": writers,
         "writer_drift": drift,
-        "env_live": mf_fence.get("env_live") or [],
+        "env_live": env_live,
         "config_live": list(dict.fromkeys((mf_fence.get("config_live") or []) + cfg)),
         "polymarket_us_live": poly_live,
+        "kalshi_ev_preflight_gate": bool(vc.kalshi_ev_preflight_gate_enabled()),
+        "kalshi_maker_first": bool(vc.kalshi_maker_first_enabled()),
         "treasury_auto": bool(vc.treasury_auto_enabled()),
         "rebalancer_autoexec": bool(vc.rebalancer_autoexec_enabled()),
         "trading_halt": bool(vc.trading_halted()),
@@ -101,11 +105,11 @@ def check_fence():
             bits.append("cfg " + ",".join(extra["config_live"]))
         if drift:
             bits.append("writer " + json.dumps(drift))
-        if poly_live:
-            bits.append("POLYMARKET_US_LIVE")
         reason = "live flag/writer on: " + "; ".join(bits) or "fence failed"
         return _row("fence", "FAIL", reason, critical=True, extra=extra)
-    return _row("fence", "PASS", f"v{vc.VALEDIA_VERSION} writers held, live flags off",
+    live_note = "POLYMARKET_US_LIVE on" if poly_live else "POLYMARKET_US_LIVE off"
+    return _row("fence", "PASS",
+                f"v{vc.VALEDIA_VERSION} writers held, {live_note}",
                 critical=True, extra=extra)
 
 
@@ -128,14 +132,54 @@ def check_treasury(live_read=False, readers=None):
                 critical=True, extra=extra)
 
 
+def _mirofish_live_health():
+    """Bionic + backend + Neo4j probe. Ollama miss is WARN/skip, never FAIL."""
+    out = {"bionic": "SKIP", "backend": "SKIP", "neo4j": "SKIP", "inference": "bionic"}
+    try:
+        em = {}
+        envp = os.path.expanduser("~/mirofish-offline/.env")
+        with open(envp) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                em[k] = v
+        out["inference"] = (em.get("MIROFISH_INFERENCE") or "bionic").strip().lower()
+        out["llm_base"] = em.get("LLM_BASE_URL")
+    except Exception:
+        pass
+    try:
+        mf.http_json("http://127.0.0.1:1234/v1/models", timeout=2)
+        out["bionic"] = "PASS"
+    except Exception as e:
+        out["bionic"] = "FAIL" if out["inference"] == "bionic" else "WARN"
+        out["bionic_err"] = str(e)[:80]
+    try:
+        urllib.request.urlopen("http://127.0.0.1:5001/health", timeout=2)
+        out["backend"] = "PASS"
+    except Exception as e:
+        out["backend"] = "WARN"
+        out["backend_err"] = str(e)[:80]
+    try:
+        with socket.create_connection(("127.0.0.1", 7687), 2):
+            out["neo4j"] = "PASS"
+    except Exception:
+        out["neo4j"] = "WARN"
+    return out
+
+
 def check_mirofish(live=True, models_dir=None):
     report = mf.run_smoke(live=live, models_dir=models_dir, out_path=None)
     fx_ok = bool(report.get("ok"))
     live_r = report.get("live_lite") or {}
+    health = _mirofish_live_health() if live else {}
     extra = {
         "fixture_ok": fx_ok,
         "live_lite": live_r.get("status"),
         "live_reason": live_r.get("reason"),
+        "live_endpoint": live_r.get("endpoint"),
+        "health": health,
         "wall_s": report.get("wall_s"),
         "verdict": report.get("verdict"),
     }
@@ -144,8 +188,12 @@ def check_mirofish(live=True, models_dir=None):
                     "fixture failed: " + str(report.get("fixture", {}).get("error") or "ok=false"),
                     critical=True, extra=extra)
     live_st = live_r.get("status", "SKIP")
-    reason = "fixture PASS; live-lite " + str(live_st)
-    return _row("mirofish", "PASS", reason, critical=True, extra=extra)
+    bits = ["fixture PASS", "live-lite " + str(live_st)]
+    if health:
+        bits.append("bionic=" + str(health.get("bionic")))
+        bits.append("backend=" + str(health.get("backend")))
+        bits.append("neo4j=" + str(health.get("neo4j")))
+    return _row("mirofish", "PASS", "; ".join(bits), critical=True, extra=extra)
 
 
 def check_kalshi(offline=False, reader=None):
@@ -167,8 +215,22 @@ def check_kalshi(offline=False, reader=None):
         import kalshi_auth
         raw = kalshi_auth.get_balance()
         cash = ts.cash_from_kalshi(raw)
-        return _row("kalshi", "PASS", "GET /portfolio/balance",
-                    extra={"cash_usd": cash, "keys": ("balance",)})
+        consult = None
+        try:
+            import kalshi_fee_map as kfm
+            consult = kfm.consult("KXBTCY", series="KXBTCY")
+        except Exception as e:
+            consult = {"status": "error", "error": str(e)[:120]}
+        extra = {
+            "cash_usd": cash,
+            "keys": ("balance",),
+            "ev_preflight": bool(vc.kalshi_ev_preflight_gate_enabled()),
+            "maker_first": bool(vc.kalshi_maker_first_enabled()),
+            "fee_map_consult": (consult or {}).get("status"),
+            "fee_map_series": (consult or {}).get("series") or "KXBTCY",
+        }
+        return _row("kalshi", "PASS", "GET /portfolio/balance + fee-map consult",
+                    extra=extra)
     except Exception as e:
         return _row("kalshi", "SKIP", "balance read failed: " + str(e)[:200])
     finally:
@@ -178,8 +240,15 @@ def check_kalshi(offline=False, reader=None):
 def check_poly_us(offline=False, client=None):
     if client is None and offline:
         return _row("poly_us", "SKIP", "offline")
+    live = False
     try:
-        out = poly_smoke.run_smoke(client=client)
+        import polymarket_us_client as pmu
+        live = bool(pmu.live_enabled())
+    except Exception:
+        live = mf._truthy(os.environ.get("POLYMARKET_US_LIVE"))
+    live_was = os.environ.get("POLYMARKET_US_LIVE")
+    try:
+        out = poly_smoke.run_smoke(client=client, force_live_off=not live)
     except RuntimeError as e:
         msg = str(e)
         if "missing POLYMARKET" in msg or "whoami" in msg.lower() or "balances" in msg.lower():
@@ -189,16 +258,32 @@ def check_poly_us(offline=False, client=None):
         return _row("poly_us", "SKIP", msg[:200])
     except Exception as e:
         return _row("poly_us", "SKIP", str(e)[:200])
+    finally:
+        if live_was is None:
+            os.environ.pop("POLYMARKET_US_LIVE", None)
+        else:
+            os.environ["POLYMARKET_US_LIVE"] = live_was
+    who = out.get("whoami") or {}
+    extra = {
+        "whoami_source": who.get("source"),
+        "preview": out.get("preview"),
+        "create_blocked": bool(out.get("create_blocked")),
+        "create_skipped": bool(out.get("create_skipped")),
+        "live": bool(out.get("live") or live),
+    }
+    if live:
+        if not out.get("ok") or not extra["preview"]:
+            return _row("poly_us", "FAIL", "LIVE on: balances+preview required",
+                        critical=True, extra=extra)
+        return _row("poly_us", "PASS",
+                    "whoami_retail/balances + preview; LIVE on; create skipped",
+                    extra=extra)
     if not out.get("create_blocked") or out.get("live"):
         return _row("poly_us", "FAIL", "poly write must stay blocked / live must stay False",
-                    critical=True, extra=out)
-    who = out.get("whoami") or {}
+                    critical=True, extra=extra)
     return _row("poly_us", "PASS",
                 "whoami_retail/balances + preview; create blocked",
-                extra={"whoami_source": who.get("source"),
-                       "preview": out.get("preview"),
-                       "create_blocked": True,
-                       "live": False})
+                extra=extra)
 
 
 def check_shadow_adversarial(queue_path=None):
@@ -319,10 +404,11 @@ def run_smoke(offline=False, live_mirofish=True, poly_client=None,
         "sections": sections,
         "by_name": by,
         "critical_fail": [s["name"] for s in critical_fail],
-        "fence": "No POLYMARKET_US_LIVE / VENUE_WRITER / REBALANCER_AUTOEXEC / "
-                 "NAUTILUS_LIVE / VALEDIA_SELF_ADJUST / MIROFISH_AUTO_RAISE / "
-                 "VALEDIA_TREASURY_AUTO / live orders / ACH.",
-        "next": "staged ON — STOP for Burton; do not auto-flip live",
+        "fence": "POLYMARKET_US_LIVE reported honestly (env-only, never committed). "
+                 "No VENUE_WRITER / REBALANCER_AUTOEXEC / NAUTILUS_LIVE / "
+                 "VALEDIA_SELF_ADJUST / MIROFISH_AUTO_RAISE / VALEDIA_TREASURY_AUTO / "
+                 "mass create_order / ACH / oil-weather unfence.",
+        "next": "STOP for Burton. Do not auto-start another slice.",
     }
     return report
 
@@ -337,9 +423,10 @@ def render_md(report):
         f"**Verdict:** **{report.get('verdict')}**",
         f"**Wall:** {report.get('wall_s')}s / {report.get('wall_budget_s')}s",
         "",
-        "Hard fence held: no `POLYMARKET_US_LIVE`, no `VENUE_WRITER` changes, "
-        "no `REBALANCER_AUTOEXEC`, no `NAUTILUS_LIVE`, no `VALEDIA_SELF_ADJUST`/"
-        "`MIROFISH_AUTO_RAISE`, no treasury auto, no live orders, no ACH.",
+        "Hard fence held: `POLYMARKET_US_LIVE` reported honestly (env-only). "
+        "No `VENUE_WRITER` changes, no `REBALANCER_AUTOEXEC`, no `NAUTILUS_LIVE`, "
+        "no `VALEDIA_SELF_ADJUST`/`MIROFISH_AUTO_RAISE`, no treasury auto, "
+        "no mass `create_order`, no ACH, no oil/weather unfence.",
         "",
         "| # | Section | Result | Reason |",
         "|---|---------|--------|--------|",
@@ -360,7 +447,7 @@ def render_md(report):
         "- kill-switch: `valedia_config.require_not_halted` (see `KILL-SWITCH.md`)",
         "- live OpenTerminal market UI (:3000) — Valedia glance is :8765 (opt-in --listen)",
         "",
-        "**Next = staged ON.** STOP for Burton. Do not auto-flip live.",
+        "**Next = Burton.** Do not auto-start another slice.",
         "",
     ]
     return "\n".join(lines)

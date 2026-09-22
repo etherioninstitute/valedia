@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""POLY-US-2 preview dry-run. LIVE=0. Never create/cancel.
+"""POLY-US-2 preview dry-run. Default LIVE off for standalone.
 
-Loads ~/.openclaw/.env. Forces POLYMARKET_US_HTTP=1, POLYMARKET_US_LIVE=0.
-Asserts has_keys, whoami/balances, preview on one active market (qty=1 tiny
-limit), create_order raises LiveWriteBlocked.
+Loads ~/.openclaw/.env. Forces POLYMARKET_US_HTTP=1. Default force_live_off
+keeps create_order LiveWriteBlocked. Full smoke may pass force_live_off=False
+when POLYMARKET_US_LIVE is already on: preview only, never create.
 Run: python3 poly_us_smoke.py
 """
 from __future__ import annotations
@@ -32,12 +32,14 @@ def _first_slug(doc):
     return None
 
 
-def run_smoke(client=None):
+def run_smoke(client=None, force_live_off=True):
     pmu.load_openclaw_env()
     os.environ["POLYMARKET_US_HTTP"] = "1"
-    os.environ["POLYMARKET_US_LIVE"] = "0"
-    c = client or pmu.PolymarketUSClient(live=False, http=True, transport=None)
-    if c.live:
+    if force_live_off:
+        os.environ["POLYMARKET_US_LIVE"] = "0"
+    live = False if force_live_off else bool(pmu.live_enabled())
+    c = client or pmu.PolymarketUSClient(live=live, http=True, transport=None)
+    if force_live_off and c.live:
         raise RuntimeError("fence: POLYMARKET_US_LIVE must stay False")
     if not c.has_keys():
         raise RuntimeError("missing POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY")
@@ -64,18 +66,25 @@ def run_smoke(client=None):
         raise RuntimeError("preview must be dry-run, not a fill")
     if isinstance(prev.get("status"), int) and prev["status"] >= 400:
         raise RuntimeError("preview HTTP " + str(prev["status"]))
-    try:
-        c.create_order({"marketSlug": slug, "quantity": 1})
-        raise RuntimeError("create_order must raise LiveWriteBlocked")
-    except pmu.LiveWriteBlocked:
-        pass
+    create_blocked = False
+    create_skipped = False
+    if c.live:
+        # LIVE on: create may succeed. Default smoke never places.
+        create_skipped = True
+    else:
+        try:
+            c.create_order({"marketSlug": slug, "quantity": 1})
+            raise RuntimeError("create_order must raise LiveWriteBlocked")
+        except pmu.LiveWriteBlocked:
+            create_blocked = True
     return {
         "ok": True,
         "whoami": {k: ident[k] for k in ident if k != "note"},
         "preview": {"kind": prev.get("kind"), "filled": prev.get("filled"),
                     "marketSlug": slug, "quantity": 1, "price": "0.01"},
-        "create_blocked": True,
-        "live": False,
+        "create_blocked": create_blocked,
+        "create_skipped": create_skipped,
+        "live": bool(c.live),
     }
 
 
