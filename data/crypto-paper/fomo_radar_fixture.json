@@ -1,0 +1,45 @@
+{
+  "source": "fomo_radar_offline",
+  "upstream": "cvxv666/fomo-robinhood-radar@0bfee25",
+  "note": "Synthetic offline sample. Not a live tape. Not a track record.",
+  "tokens": [
+    {
+      "symbol": "BTC",
+      "pair": "BTC-USDT",
+      "judgement_rank": 1,
+      "holders": [
+        {"score": 80, "kind": "trade"},
+        {"score": 80, "kind": "trade"},
+        {"score": 80, "kind": "trade"}
+      ],
+      "burst": {"conviction": 4.48, "wallets": 4, "window_min": 30, "span_s": 400},
+      "exit": {"state": "open", "exit_pct": 0.0, "sellers": 0}
+    },
+    {
+      "symbol": "ETH",
+      "pair": "ETH-USDT",
+      "judgement_rank": 9,
+      "holders": [
+        {"score": 80, "kind": "dust"},
+        {"score": 80, "kind": "direct"},
+        {"score": 80, "kind": "seed"},
+        {"score": 85, "kind": "dust"},
+        {"score": 90, "kind": "trade"}
+      ],
+      "burst": {"conviction": 6.0, "wallets": 5, "window_min": 2, "span_s": 90},
+      "exit": {"state": "closed", "exit_pct": 1.0, "sellers": 4}
+    },
+    {
+      "symbol": "SOL",
+      "pair": "SOL-USDT",
+      "judgement_rank": 4,
+      "holders": [
+        {"score": 80, "kind": "trade"},
+        {"score": 80, "kind": "trade"},
+        {"score": 40, "kind": "trade"}
+      ],
+      "burst": null,
+      "exit": {"state": "closed", "exit_pct": 0.98, "sellers": 2}
+    }
+  ]
+}

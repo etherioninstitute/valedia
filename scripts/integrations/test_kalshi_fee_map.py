@@ -165,7 +165,7 @@ def test_allocator_and_score_consult():
 
 
 def test_hygiene():
-    assert vc.VALEDIA_VERSION == "0.54.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.55.0", vc.VALEDIA_VERSION
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
