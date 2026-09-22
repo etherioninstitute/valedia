@@ -81,7 +81,7 @@ def test_hygiene_and_fence():
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
     assert vc.POLY_LOOP_EDGE_PTS == 8.0
     assert vc.POLY_LOOP_MAX_OPEN == 5
     assert vc.POLY_LOOP_DD_STOP == 0.40
@@ -400,6 +400,7 @@ def test_fv_sources():
     assert rec["fv_source"] == "tag_prior"
     assert rec["edge_pts"] >= 8
     assert rec["create_order"] is False
+    assert rec["create_eligible"] is False
     assert "fv=tag_prior" in rec["reason"]
 
     # OTHER + rules_text + no cache → no_fv.

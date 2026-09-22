@@ -171,7 +171,7 @@ def test_allocator_skip_when_ev_gate_on():
 
 
 def test_hygiene_and_call_sites():
-    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.KALSHI_EV_PREFLIGHT_GATE is False
     assert vc.KALSHI_MAKER_FIRST is False

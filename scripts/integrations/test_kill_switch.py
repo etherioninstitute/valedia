@@ -22,6 +22,9 @@ import rebalancer
 import test_poly_us as tpu
 import valedia_config as vc
 import valedia_full_smoke as smoke
+import informed_before_create as ibc
+from test_informed_before_create import good_kalshi, good_poly, pin_kelly, unpin_kelly
+import kalshi_fee_map as kfm
 
 
 def _restore():
@@ -61,7 +64,7 @@ def test_hygiene_and_default_off():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.trading_halted() is False
     assert vc.require_not_halted("probe") is False
-    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.MIROFISH_AUTO_RAISE is False
@@ -107,7 +110,19 @@ def test_env_halt_blocks_and_unhalt_restores():
     except vc.HaltedError:
         pass
     _disarm_env()
-    out = ka.create_order("TICK", "yes", 1, 10)
+    try:
+        ka.create_order("TICK", "yes", 1, 10)
+        raise AssertionError("uninformed create must stay refused after unhalt")
+    except ibc.InformedCreateRefused:
+        pass
+    assert posted == []
+    qe, old = pin_kelly()
+    fmap = {"TICK": kfm._row("TICK", 0.0, 0.0, "halt")}
+    try:
+        out = ka.create_order(
+            "TICK", "yes", 1, 10, informed=good_kalshi(series="TICK", fmap=fmap))
+    finally:
+        unpin_kelly(qe, old)
     assert posted and posted[0][0] == "/portfolio/events/orders"
     assert out["order"]["order_id"] == "should-not"
     ka.post = orig_post
@@ -146,7 +161,16 @@ def test_halt_allows_get_and_preview():
     except vc.HaltedError:
         pass
     _disarm_env()
-    live.create_order({"marketSlug": "btc-100k"})
+    try:
+        live.create_order({"marketSlug": "btc-100k"})
+        raise AssertionError("uninformed poly create must stay refused after unhalt")
+    except ibc.InformedCreateRefused:
+        pass
+    qe, old = pin_kelly()
+    try:
+        live.create_order(good_poly())
+    finally:
+        unpin_kelly(qe, old)
     posted = [call for call in x.calls if call["path"] == "/v1/orders"]
     assert posted and posted[-1]["method"] == "POST"
     ka.get = orig_get

@@ -22,6 +22,8 @@
 7m. **POLY-LOOP-RESOLUTION** — done `0.53.0`. Map US `description`/`rules`/`resolvedBy` to a source label or `rules_text` hash; fail closed only on zero text.
 7n. **POLY-LOOP-FV** — done `0.54.0`. Real FV ladder (override/market/fuzzy cache/modeled EMA/tag_prior). Fail closed `no_fv`. Next = Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 7o. **OPENTERMINAL-ACCURACY** — done `0.56.0`. Honest `:8765` glance. Do not start OT-VALEDIA-FORK until Burton says so.
+7p. **INFORMED-BEFORE-CREATE** — in flight. Fail-closed research/FV/EV before create; no POLYMARKET_US_LIVE. Then OT-VALEDIA-FORK-1.
+7q. **OT-VALEDIA-FORK-1** — queued after 7p (boot fork :3001/:8766; Controls/Trades/Venues → /status).
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)

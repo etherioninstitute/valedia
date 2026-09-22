@@ -398,6 +398,8 @@ class PolymarketUSClient:
 
     def create_order(self, body):
         self._require_live("create_order")
+        import informed_before_create as ibc
+        ibc.require_poly(body)
         resp = self._request("POST", "/v1/orders", body=body, auth=True)
         wrap = resp if isinstance(resp, dict) else {"raw": resp}
         oid = wrap.get("id") or (wrap.get("order") or {}).get("id")

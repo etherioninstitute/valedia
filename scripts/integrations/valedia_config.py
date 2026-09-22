@@ -17,10 +17,10 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.56.0 = OPENTERMINAL-ACCURACY). Prior 0.55.0 = FOMO-RADAR-DOSSIER.
-# Prior 0.54.0 = POLY-LOOP-FV. Prior 0.53.0 = POLY-LOOP-RESOLUTION.
+# Runtime identity (0.57.0 = INFORMED-BEFORE-CREATE). Prior 0.56.0 = OPENTERMINAL-ACCURACY.
+# Prior 0.55.0 = FOMO-RADAR-DOSSIER. Prior 0.54.0 = POLY-LOOP-FV.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.56.0"
+VALEDIA_VERSION = "0.57.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -76,6 +76,10 @@ POLY_LOOP_EDGE_PTS = 8.0          # |FV-mid| percentage points to flag
 POLY_LOOP_MAX_OPEN = 5            # max open paper positions
 POLY_LOOP_DD_STOP = 0.40          # peak drawdown halt; no auto category flip
 POLY_LOOP_DD_STOP_ARMED = True    # stop proposing when DD hits stop
+# Create-path quality bar. Hard on. Env cannot disable. Halt off is not enough.
+INFORMED_BEFORE_CREATE = True
+# tag_prior-alone is never a Poly create. Env cannot enable. LIVE stays off.
+POLY_TAG_PRIOR_CREATE = False
 
 # Position sizing — half-Kelly + DYNAMIC per-trade cap + absolute fuses (backtested 2026-09-12).
 # The per-trade ceiling BREATHES with regime/track-record/risk instead of a flat number; the
@@ -776,6 +780,14 @@ def controls_snapshot():
         ("KALSHI_FILL_LEDGER_DEMOTE", kalshi_fill_ledger_demote_enabled(),
          _src("KALSHI_FILL_LEDGER_DEMOTE"), "kalshi",
          "off=persist; on=skip adverse series"),
+        ("INFORMED_BEFORE_CREATE", True, "const", "kalshi",
+         "fail-closed before create. Env cannot disable. Fee-map series, "
+         "fee-true EV (maker prefer, higher taker hurdle), FV model or "
+         "rules_clock or researched plus confidence, depth, Kelly/FTL size. "
+         "Halt off is necessary, not sufficient."),
+        ("POLY_TAG_PRIOR_CREATE", False, "const", "poly",
+         "tag_prior-alone is never create-eligible. Env cannot enable. "
+         "US writes stay blocked while POLYMARKET_US_LIVE is off."),
         ("VALEDIA_JEV", jev_enabled(), _src("VALEDIA_JEV"), "autonomy",
          "off=no TypeSafe; on=MiroFish jev_shadow annotate; fail-open"),
         ("VALEDIA_SELF_ADJUST", self_adjust_enabled(),

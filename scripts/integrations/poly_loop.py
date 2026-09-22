@@ -742,6 +742,23 @@ def _mid_from(doc):
     return sized.get("mid"), sized
 
 
+def _loop_fee(market):
+    """Known fee probability, or None. Missing is not zero."""
+    m = market if isinstance(market, dict) else {}
+    for k in ("fee_prob", "takerFee", "fee"):
+        if k in m and m.get(k) is not None:
+            try:
+                return float(m.get(k))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _create_eligible(rec):
+    import informed_before_create as ibc
+    return bool(ibc.create_eligible(rec))
+
+
 def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
                  n_open=0, now=None, models_dir=None, out_dir=None):
     """Skip (None), BLOCKED row, or DRY/SHADOW row. Never places."""
@@ -767,7 +784,10 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         mid=round(float(mid), 4), edge_pts=round(edge_pts(fv, mid), 2),
         size=round(float(bet), 2), exit_condition=exit_c, reason="",
         status=STATUS_BLOCKED, side=side, tags=tags, fv_source=fv_src,
-        spread=sized.get("spread"), create_order=False,
+        spread=sized.get("spread"), create_order=False, create_eligible=False,
+        fee_prob=_loop_fee(m), fv_confidence=fv_src in (
+            "override", "market", "cache", "modeled"),
+        mirofish_score=m.get("mirofish_score"),
     )
     if vc.trading_halted():
         base["reason"] = "halt"
@@ -783,11 +803,13 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         base["reason"] = why
         return base
     base["status"] = STATUS_DRY
+    base["slip"] = None if slip is None else round(slip, 4)
+    base["create_order"] = False
+    base["create_eligible"] = _create_eligible(base)
     base["reason"] = (
         f"edge {base['edge_pts']}pts fv={fv_src} src={resolution_source(m)!r} "
-        f"nav={(tags or {}).get('nav')} slip={None if slip is None else round(slip, 4)}"
+        f"nav={(tags or {}).get('nav')} slip={base['slip']}"
     )
-    base["slip"] = None if slip is None else round(slip, 4)
     return base
 
 

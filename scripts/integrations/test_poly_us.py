@@ -136,7 +136,7 @@ def test_hygiene_and_fence():
     assert "websocket" in matrix.lower()
     assert "whoami_retail" in matrix.lower() or "retail identity" in matrix.lower()
     assert "api.prod.polymarketexchange.com" in matrix
-    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
     assert 'self._request("GET", "/v1/whoami"' not in src
     assert "def whoami_retail" in src
     smoke_src = open(os.path.join(HERE, "poly_us_smoke.py")).read()
@@ -222,12 +222,22 @@ def test_auth_reads_and_write_gate():
         pass
     assert not any(call["path"] == "/v1/orders" for call in x.calls)
     live = _client(x, live=True)
-    ack = live.create_order({
-        "marketSlug": "btc-100k",
-        "intent": "ORDER_INTENT_BUY_LONG",
-        "type": "ORDER_TYPE_LIMIT",
-        "quantity": 1,
-    })
+    try:
+        live.create_order({
+            "marketSlug": "btc-100k",
+            "intent": "ORDER_INTENT_BUY_LONG",
+            "type": "ORDER_TYPE_LIMIT",
+            "quantity": 1,
+        })
+        raise AssertionError("uninformed create must refuse even if live=True")
+    except Exception as e:
+        assert type(e).__name__ == "InformedCreateRefused"
+    from test_informed_before_create import good_poly, pin_kelly, unpin_kelly
+    qe, old = pin_kelly()
+    try:
+        ack = live.create_order(good_poly())
+    finally:
+        unpin_kelly(qe, old)
     assert ack["kind"] == "create_ack"
     assert ack["id"] == "ord-us-1"
     assert ack["filled"] is False

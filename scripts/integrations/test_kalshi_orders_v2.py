@@ -11,8 +11,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import kalshi_auth as ka
+import kalshi_fee_map as kfm
 import forward_test_ledger as ftl
 import valedia_config as vc
+from test_informed_before_create import good_kalshi, pin_kelly, unpin_kelly
+
+
+def _informed():
+    fmap = {"TICK": kfm._row("TICK", 0.0, 0.0, "wire")}
+    return good_kalshi(series="TICK", fmap=fmap)
 
 
 def _v2_ack(oid="oid-1", fill="0.00", remain="5.00"):
@@ -42,8 +49,10 @@ def test_create_buy_yes_and_no():
     posted = []
     orig = ka.post
     ka.post = lambda ep, body=None: posted.append((ep, dict(body or {}))) or _v2_ack()
+    qe, old = pin_kelly()
+    info = _informed()
     try:
-        out = ka.create_order("TICK-Y", "yes", 5, 56)
+        out = ka.create_order("TICK-Y", "yes", 5, 56, informed=info)
         assert posted[-1][0] == "/portfolio/events/orders"
         body = posted[-1][1]
         assert body["ticker"] == "TICK-Y"
@@ -56,31 +65,35 @@ def test_create_buy_yes_and_no():
         assert out["order_id"] == "oid-1"
         assert out["order"]["order_id"] == "oid-1"
 
-        ka.create_order("TICK-N", "no", 2, 40)
+        ka.create_order("TICK-N", "no", 2, 40, informed=info)
         body = posted[-1][1]
         assert body["side"] == "ask"
         assert body["price"] == "0.6000"
         assert body["count"] == "2.00"
     finally:
         ka.post = orig
+        unpin_kelly(qe, old)
 
 
 def test_sell_maps_and_reduce_only():
     posted = []
     orig = ka.post
     ka.post = lambda ep, body=None: posted.append((ep, dict(body or {}))) or _v2_ack("s1")
+    qe, old = pin_kelly()
+    info = _informed()
     try:
-        ka.sell_position("TICK", "yes", 3, 40)
+        ka.sell_position("TICK", "yes", 3, 40, informed=info)
         body = posted[-1][1]
         assert posted[-1][0] == "/portfolio/events/orders"
         assert body["side"] == "ask" and body["price"] == "0.4000"
         assert body["reduce_only"] is True
-        ka.sell_position("TICK", "no", 3, 40)
+        ka.sell_position("TICK", "no", 3, 40, informed=info)
         body = posted[-1][1]
         assert body["side"] == "bid" and body["price"] == "0.6000"
         assert body["reduce_only"] is True
     finally:
         ka.post = orig
+        unpin_kelly(qe, old)
 
 
 def test_cancel_v2_and_get_order():
@@ -137,7 +150,7 @@ def test_hygiene_no_legacy_write_path():
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
 
 
 if __name__ == "__main__":
