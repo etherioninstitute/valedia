@@ -81,7 +81,7 @@ def test_hygiene_and_fence():
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VALEDIA_VERSION == "0.55.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
     assert vc.POLY_LOOP_EDGE_PTS == 8.0
     assert vc.POLY_LOOP_MAX_OPEN == 5
     assert vc.POLY_LOOP_DD_STOP == 0.40

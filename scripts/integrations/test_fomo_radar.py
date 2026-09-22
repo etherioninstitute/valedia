@@ -28,7 +28,7 @@ def _banned(src):
 def test_hygiene_and_fence():
     src = open(os.path.join(HERE, "fomo_radar_enrich.py")).read()
     _banned(src)
-    assert vc.VALEDIA_VERSION == "0.55.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.56.0", vc.VALEDIA_VERSION
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.VALEDIA_TREASURY_AUTO is False

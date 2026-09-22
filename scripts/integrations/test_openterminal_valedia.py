@@ -11,6 +11,7 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +63,18 @@ def test_panel_broker_vs_ftl():
     _use(d, ledger, q)
     try:
         p = cockpit.panel()
-        assert p["mode"] == "FENCED"
+        assert p["trading_halt"] is False
+        assert p["mode"] == "LIVE"
+        assert p["mode_why"] == "writer"
+        assert p["mode"] == cockpit.cockpit_mode()
+        assert p["identity"].startswith("v" + vc.VALEDIA_VERSION)
+        assert p["branch"]
+        assert "sha" in p and "dirty" in p
+        assert [c["name"] for c in p["connections"]] == [
+            "litellm", "bionic", "ruflo", "kalshi"]
+        assert all(c["status"] == "SKIP" for c in p["connections"])
+        assert "n" in p["poly_loop"] and "skip_reasons" in p["poly_loop"]
+        assert "live" in p["poly_loop"]
         assert p["get_only"] is True
         assert p["no_orders"] is True
         assert p["broker"]["label"].startswith("broker")
@@ -83,7 +95,7 @@ def test_panel_broker_vs_ftl():
         assert p["ears"]["gathering"] is True
         assert p["trading_halt"] is False
         assert p["shadow"]["dispatchable"] == 0
-        assert p["valedia_version"] == "0.55.0"
+        assert p["valedia_version"] == vc.VALEDIA_VERSION
     finally:
         _restore()
 
@@ -155,7 +167,7 @@ def test_html_hygiene_file():
     assert "refresh" in html
     assert "--live" not in src.replace("--listen", "")
     assert "import requests" not in src
-    assert vc.VALEDIA_VERSION == "0.55.0"
+    assert vc.VALEDIA_VERSION == "0.56.0"
     assert cockpit.DEFAULT_PORT == 8765
     assert cockpit.DEFAULT_HOST == "127.0.0.1"
     assert cockpit.DEFAULT_PORT != 3000
@@ -163,7 +175,14 @@ def test_html_hygiene_file():
     assert cockpit.DEFAULT_PORT != 4000
 
 
-def test_mode_dry():
+def test_mode_truth():
+    class _Live:
+        NAUTILUS_LIVE = True
+        SCALPER_LIVE = False
+        WEATHER_LIVE = False
+        REBALANCER_AUTOEXEC = False
+    assert cockpit.cockpit_mode(_Live) == "LIVE"
+
     class _Dry:
         NAUTILUS_LIVE = False
         SCALPER_LIVE = False
@@ -171,7 +190,119 @@ def test_mode_dry():
         REBALANCER_AUTOEXEC = False
         EXEC_DRY_RUN = True
     assert cockpit.cockpit_mode(_Dry) == "DRY"
-    assert cockpit.cockpit_mode() == "FENCED"
+
+    class _Shadow:
+        NAUTILUS_LIVE = False
+        SCALPER_LIVE = False
+        WEATHER_LIVE = False
+        REBALANCER_AUTOEXEC = False
+        EXEC_DRY_RUN = False
+        NAUTILUS_SHADOW_COINBASE = True
+    assert cockpit.cockpit_mode(_Shadow) == "SHADOW"
+
+    class _Fenced:
+        NAUTILUS_LIVE = False
+        SCALPER_LIVE = False
+        WEATHER_LIVE = False
+        REBALANCER_AUTOEXEC = False
+        EXEC_DRY_RUN = False
+    assert cockpit.cockpit_mode(_Fenced) == "FENCED"
+
+    class _Halt:
+        NAUTILUS_LIVE = True
+
+        def trading_halted(self):
+            return True
+
+        def controls_snapshot(self):
+            return {"items": [{"category": "writer", "value": "valedia"}]}
+
+    assert cockpit.cockpit_mode(_Halt) == "FENCED"
+    assert cockpit.cockpit_mode() == "LIVE"
+    assert cockpit._mode_why() == "writer"
+
+
+def test_treasury_stale_and_fresh_and_injected():
+    d, ledger, q = _tmp()
+    _use(d, ledger, q)
+    now = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+    try:
+        old = cockpit.panel(now=now)
+        assert old["venues"]["kalshi"]["freshness"] == "STALE"
+        assert old["venues"]["kalshi"]["status"] == "STALE"
+        assert old["venues"]["kalshi"]["cash"] == 5.0
+        assert old["venues"]["kalshi"]["age_s"] > cockpit.STALE_S
+        assert old["venues"]["polymarket_us"]["cash"] == 30.55
+        assert "STALE" in old["venues"]["source"] and "age=" in old["venues"]["source"]
+        with open(os.path.join(d, "treasury_status.json"), "w") as f:
+            json.dump({"ts": now.isoformat(), "venues": [
+                {"venue": "kalshi", "cash": 5.0, "status": "WARN"},
+                {"venue": "polymarket_us", "cash": 30.55, "status": "OK"},
+            ]}, f)
+        fresh = cockpit.panel(now=now)
+        assert fresh["venues"]["kalshi"]["freshness"] == "CACHED"
+        assert fresh["venues"]["kalshi"]["status"] == "WARN"
+        assert fresh["venues"]["kalshi"]["age_s"] == 0
+        cockpit.set_paths(readers={
+            "kalshi": {"kind": "kalshi", "raw": {"balance": 5000}},
+            "polymarket_us": {"kind": "polymarket_us", "raw": {
+                "buyingPower": "12.5", "currency": "USD"}},
+        })
+        live = cockpit.panel(now=now)
+        assert live["venues"]["kalshi"]["freshness"] == "LIVE"
+        assert live["venues"]["kalshi"]["cash"] == 50.0
+        assert live["venues"]["polymarket_us"]["freshness"] == "LIVE"
+        assert live["venues"]["polymarket_us"]["cash"] == 12.5
+        assert "live GET" in live["venues"]["source"]
+    finally:
+        _restore()
+
+
+def test_poly_loop_and_ping_and_controls():
+    d, ledger, q = _tmp()
+    path = os.path.join(d, "last_run.json")
+    with open(path, "w") as f:
+        json.dump({
+            "n": 3, "live": False, "status": "DRY/SHADOW",
+            "skip_reasons": {"no_fv": 2, "edge_lt_8": 1},
+            "ts": "2026-09-21T00:00:00+00:00",
+        }, f)
+    _use(d, ledger, q)
+    cockpit.set_paths(poly_loop=path, ping=lambda host, port: host == "127.0.0.1" and port == 4000)
+    try:
+        p = cockpit.panel()
+        assert p["poly_loop"]["present"] is True
+        assert p["poly_loop"]["n"] == 3
+        assert p["poly_loop"]["live"] is False
+        assert p["poly_loop"]["skip_reasons"]["no_fv"] == 2
+        rows = {c["name"]: c["status"] for c in p["connections"]}
+        assert rows == {"litellm": "OK", "bionic": "FAIL", "ruflo": "FAIL", "kalshi": "FAIL"}
+        items = vc.controls_snapshot()["items"]
+        html = cockpit.render_controls_html(items)
+        page = cockpit.ui_html()
+        src = open(os.path.join(HERE, "valedia_cockpit.html"), encoding="utf-8").read()
+        assert "it.source" in src and "forEach" in src and ".filter(" not in src
+        assert 'id="conns"' in src and 'id="pl-n"' in src
+        assert "does not restart" in src
+        for it in items:
+            needle = f'data-control="{it["name"]}"'
+            assert needle in html, it["name"]
+            assert needle in page, it["name"]
+            assert f'data-source="{it["source"]}"' in html
+            if isinstance(it["value"], bool):
+                i = html.index(needle)
+                chunk = html[i:i + 500]
+                assert ("ON" if it["value"] else "OFF") in chunk
+                assert f'badge {it["source"]}' in chunk
+        for n in ("VALEDIA_JEV", "POLY_LOOP_EDGE_PTS", "POLY_LOOP_MAX_OPEN",
+                  "POLY_LOOP_DD_STOP", "POLY_LOOP_DD_STOP_ARMED", "KALSHI_FEE_MAP_GATE"):
+            assert f'data-control="{n}"' in html
+        short = [it for it in items if it["name"] != "VALEDIA_JEV"]
+        missing = [it["name"] for it in items
+                   if f'data-control="{it["name"]}"' not in cockpit.render_controls_html(short)]
+        assert missing == ["VALEDIA_JEV"]
+    finally:
+        _restore()
 
 
 def test_http_smoke():
@@ -210,6 +341,8 @@ if __name__ == "__main__":
     test_unread_treasury()
     test_handle_ui_and_json()
     test_html_hygiene_file()
-    test_mode_dry()
+    test_mode_truth()
+    test_treasury_stale_and_fresh_and_injected()
+    test_poly_loop_and_ping_and_controls()
     test_http_smoke()
     print("OPENTERMINAL-VALEDIA: PASS")

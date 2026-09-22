@@ -54,12 +54,12 @@ python3 scripts/integrations/valedia_cockpit.py --listen --host 100.125.9.30 --p
 
 ## Panel fields
 
-- **mode** — exactly one of `LIVE` / `DRY` / `FENCED` (LIVE only if NAUTILUS_LIVE / SCALPER_LIVE / WEATHER_LIVE / REBALANCER_AUTOEXEC)
+- **mode** — exactly one of `LIVE` / `DRY` / `SHADOW` / `FENCED` from halt, live flags, and writers (halt wins). `mode_why` says which.
 - **trading_halt** — `VALEDIA_TRADING_HALT`; banner says **new orders** halted
 - **ears.gathering** — always `true`. Halt does not stop MiroFish / data streams (`KILL-SWITCH.md`)
 - **broker** — `pnl_tracker.json` (label *broker ≠ FTL*); cash + deployed
 - **ftl** — fee-true ledger; if `n=0` the UI says so plainly (do not treat broker net as FTL)
-- **venues** — Kalshi / Poly US from **cached** `treasury_status.json` (no live GET from the cockpit). If that file is missing, Kalshi cash falls back to `pnl_tracker.json` (`status=BROKER`); Poly stays UNREAD until a treasury cache exists.
+- **venues** — Kalshi live GET when `KALSHI_API_KEY_ID` is set. Poly live GET only when `POLYMARKET_US_HTTP` is already on. Otherwise `treasury_status.json` is `CACHED` or `STALE` with age. Missing file: Kalshi falls back to `pnl_tracker.json` (`status=BROKER`); Poly stays UNREAD.
 - **mirofish** — weight, `overall_bias`, signal `ts`
 - **shadow** — intent counts; dispatchable stays 0 in this lane
 

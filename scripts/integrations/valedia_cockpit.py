@@ -1,7 +1,15 @@
-"""Valedia read-only cockpit — OpenTerminal glance (H4 + OPENTERMINAL-VALEDIA).
+"""Valedia read-only cockpit — OpenTerminal glance (H4 + OPENTERMINAL-ACCURACY).
 
-Polls existing JSON + FTL + pnl_tracker. GET /status JSON. GET / HTML.
-Non-GET → 405. No OMS, no venue send.
+GET /status JSON. GET / HTML. Non-GET → 405. No OMS, no venue send.
+
+Restart (not cron, not from this page):
+  python3 scripts/integrations/valedia_cockpit.py --listen
+  http://127.0.0.1:8765/
+
+Treasury: live Kalshi GET only when KALSHI_API_KEY_ID is set (existing read
+gate; there is no separate Kalshi HTTP flag). Poly GET only when
+POLYMARKET_US_HTTP is already on. Otherwise the cache is CACHED or STALE
+with age. Never ACH, never a wallet move.
 
 Attributed: status-GET panel idea from OpenTerminal (MIT).
 Not a fork of their Next app; no AiWidget, no portfolio buy.
@@ -10,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import valedia_config as vc
@@ -19,8 +29,19 @@ MODELS = os.path.expanduser("~/.openclaw/workspace/models")
 _MODELS = MODELS
 _LEDGER = None
 _QUEUE = None
+_POLY_LOOP = None
+_READERS = None
+_PING = None
+_LIVE = False
+_UNSET = object()
+_VENUE_MEMO = {"at": 0.0, "rows": None}
+_CONN_MEMO = {"at": 0.0, "rows": None}
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _UI = os.path.join(_HERE, "valedia_cockpit.html")
+STALE_S = 15 * 60
+# ponytail: 60s memo. Drop it if the glance must be sub-minute.
+_MEMO_S = 60
 
 JSON_PATHS = frozenset({"/status", "/api/valedia/status"})
 UI_PATHS = frozenset({"/", "/ui", "/index.html"})
@@ -29,29 +50,111 @@ DEFAULT_PORT = 8765
 EARS_NOTE = "Halt blocks new orders only. MiroFish and data streams keep gathering."
 
 
-def set_paths(models_dir=None, ledger=None, intent_queue=None):
-    global _MODELS, _LEDGER, _QUEUE
+def set_paths(models_dir=None, ledger=None, intent_queue=None,
+              poly_loop=_UNSET, readers=_UNSET, ping=_UNSET):
+    global _MODELS, _LEDGER, _QUEUE, _POLY_LOOP, _READERS, _PING
     if models_dir is not None:
         _MODELS = models_dir
     if ledger is not None:
         _LEDGER = ledger
     if intent_queue is not None:
         _QUEUE = intent_queue
+    if poly_loop is not _UNSET:
+        _POLY_LOOP = poly_loop
+    if readers is not _UNSET:
+        _READERS = readers
+    if ping is not _UNSET:
+        _PING = ping
+    restoring = (models_dir == MODELS and ledger is None and intent_queue is None
+                 and poly_loop is _UNSET and readers is _UNSET and ping is _UNSET)
+    if restoring:
+        _POLY_LOOP = None
+        _READERS = None
+        _PING = None
+        _VENUE_MEMO["rows"] = None
+        _CONN_MEMO["rows"] = None
 
 
-def cockpit_mode(cfg=None):
-    """Exactly one of LIVE / DRY / SHADOW / FENCED. This lane defaults FENCED."""
-    cfg = cfg or vc
-    if any((
-        getattr(cfg, "NAUTILUS_LIVE", False),
-        getattr(cfg, "SCALPER_LIVE", False),
-        getattr(cfg, "WEATHER_LIVE", False),
-        getattr(cfg, "REBALANCER_AUTOEXEC", False),
+def _halted(cfg):
+    fn = getattr(cfg, "trading_halted", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return True
+    if cfg is vc:
+        return bool(vc.trading_halted())
+    return bool(getattr(cfg, "VALEDIA_TRADING_HALT", False))
+
+
+def _live_flag(cfg):
+    if cfg is vc:
+        return any((
+            vc.NAUTILUS_LIVE,
+            vc.SCALPER_LIVE,
+            vc.WEATHER_LIVE,
+            vc.rebalancer_autoexec_enabled(),
+            vc.polymarket_us_live_enabled(),
+        ))
+    return any(bool(getattr(cfg, n, False)) for n in (
+        "NAUTILUS_LIVE", "SCALPER_LIVE", "WEATHER_LIVE",
+        "REBALANCER_AUTOEXEC", "POLYMARKET_US_LIVE",
+    ))
+
+
+def _writer_live(cfg, items=None):
+    if items is None:
+        fn = getattr(cfg, "controls_snapshot", None)
+        if not callable(fn):
+            return False
+        try:
+            items = (fn() or {}).get("items") or []
+        except Exception:
+            return False
+    for it in items or []:
+        if it.get("category") == "writer" and str(it.get("value") or "").lower() in (
+            "valedia", "nautilus",
+        ):
+            return True
+    return False
+
+
+def _shadow(cfg):
+    if any(bool(getattr(cfg, n, False)) for n in (
+        "NAUTILUS_SHADOW_COINBASE", "NAUTILUS_SHADOW_VENUES", "INTEL_SHADOW_INTENTS",
     )):
+        return True
+    return "SHADOW" in str(getattr(cfg, "CRYPTO_PAPER_MODE", "") or "")
+
+
+def cockpit_mode(cfg=None, items=None):
+    """One of LIVE / DRY / SHADOW / FENCED from halt, live flags, and writers."""
+    cfg = cfg or vc
+    if _halted(cfg):
+        return "FENCED"
+    if _live_flag(cfg) or _writer_live(cfg, items):
         return "LIVE"
     if getattr(cfg, "EXEC_DRY_RUN", False):
         return "DRY"
+    if _shadow(cfg):
+        return "SHADOW"
     return "FENCED"
+
+
+def _mode_why(cfg=None, items=None):
+    cfg = cfg or vc
+    mode = cockpit_mode(cfg, items)
+    if mode == "FENCED" and _halted(cfg):
+        return "halt"
+    if mode == "LIVE" and _live_flag(cfg):
+        return "live flag"
+    if mode == "LIVE":
+        return "writer"
+    if mode == "DRY":
+        return "EXEC_DRY_RUN"
+    if mode == "SHADOW":
+        return "shadow desks"
+    return "no live writer"
 
 
 def _load_json(path):
@@ -117,22 +220,138 @@ def _venue_row(venues, name):
     }
 
 
-def _venues_block(models):
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t
+
+
+def _age_s(ts, now):
+    t = _parse_ts(ts)
+    if t is None or now is None:
+        return None
+    return max(0, int((now - t).total_seconds()))
+
+
+def _http_on(name):
+    env = os.environ.get(name)
+    if env is None or str(env).strip() == "":
+        return False
+    return str(env).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rows_from_readers(readers):
+    import treasury_status as ts
+    out = {}
+    for name, payload in (readers or {}).items():
+        if name in ("kalshi", "polymarket_us"):
+            out[name] = ts._parse_injected(name, payload)
+    return out
+
+
+def _live_rows():
+    """Kalshi/Poly GET or an injected reader. None = do not try."""
+    if _READERS is not None:
+        return _rows_from_readers(_READERS)
+    if not _LIVE:
+        return None
+    now_m = time.monotonic()
+    if _VENUE_MEMO["rows"] is not None and now_m - _VENUE_MEMO["at"] < _MEMO_S:
+        return _VENUE_MEMO["rows"]
+    import socket
+    import treasury_status as ts
+    rows = {}
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(4)
+    try:
+        # ponytail: Kalshi has no HTTP flag; the key is the existing read gate.
+        if os.environ.get("KALSHI_API_KEY_ID", "").strip():
+            rows["kalshi"] = ts._parse_injected("kalshi", ts._live_reader("kalshi"))
+        if _http_on("POLYMARKET_US_HTTP"):
+            rows["polymarket_us"] = ts._parse_injected(
+                "polymarket_us", ts._live_reader("polymarket_us"))
+    except Exception as e:
+        rows["_error"] = str(e)[:160]
+    finally:
+        socket.setdefaulttimeout(prev)
+    _VENUE_MEMO["at"] = now_m
+    _VENUE_MEMO["rows"] = rows
+    return rows
+
+
+def _mark_cached(row, ts, now, missing):
+    row = dict(row)
+    age = None if missing else _age_s(ts, now)
+    row["age_s"] = age
+    if missing:
+        row["freshness"] = "STALE"
+        row["status"] = row.get("status") or "UNREAD"
+        return row
+    stale = age is None or age > STALE_S
+    row["freshness"] = "STALE" if stale else "CACHED"
+    if stale and row.get("cash") is not None:
+        row["cached_status"] = row.get("status")
+        row["status"] = "STALE"
+    return row
+
+
+def _venues_block(models, now=None):
+    now = now or datetime.now(timezone.utc)
     tre = _load_json(os.path.join(models, "treasury_status.json"))
-    if not isinstance(tre, dict):
-        return {
-            "source": "treasury_status.json missing (unread; no live GET)",
-            "ts": None,
-            "kalshi": {"cash": None, "status": "UNREAD", "note": "file missing"},
-            "polymarket_us": {"cash": None, "status": "UNREAD", "note": "file missing"},
-        }
-    venues = tre.get("venues") or []
-    return {
-        "source": "treasury_status.json (cached; cockpit does not live GET)",
-        "ts": tre.get("ts"),
-        "kalshi": _venue_row(venues, "kalshi"),
-        "polymarket_us": _venue_row(venues, "polymarket_us"),
+    missing = not isinstance(tre, dict)
+    venues = [] if missing else (tre.get("venues") or [])
+    ts = None if missing else tre.get("ts")
+    block = {
+        "ts": ts,
+        "age_s": None if missing else _age_s(ts, now),
+        "kalshi": _mark_cached(_venue_row(venues, "kalshi"), ts, now, missing),
+        "polymarket_us": _mark_cached(
+            _venue_row(venues, "polymarket_us"), ts, now, missing),
     }
+    if missing:
+        block["kalshi"]["note"] = "file missing"
+        block["polymarket_us"]["note"] = "file missing"
+        block["polymarket_us"]["status"] = "UNREAD"
+        block["kalshi"]["status"] = "UNREAD"
+    live = _live_rows() or {}
+    for name in ("kalshi", "polymarket_us"):
+        got = live.get(name)
+        if isinstance(got, dict) and got.get("cash") is not None:
+            got = dict(got)
+            got["freshness"] = "LIVE"
+            got["age_s"] = 0
+            block[name] = got
+            continue
+        if isinstance(got, dict) and (got.get("error") or got.get("note")):
+            why = got.get("error") or got.get("note")
+            block[name]["note"] = (
+                str(block[name].get("note") or "") + " live GET failed: " + str(why)[:120]
+            ).strip()
+            block[name]["freshness"] = "STALE"
+            if block[name].get("cash") is not None:
+                block[name]["cached_status"] = block[name].get("cached_status") or block[name].get("status")
+                block[name]["status"] = "STALE"
+    bits = []
+    if any(block[n].get("freshness") == "LIVE" for n in ("kalshi", "polymarket_us")):
+        bits.append("live GET")
+    if missing:
+        bits.append("treasury_status.json missing")
+    else:
+        age = block.get("age_s")
+        stale = any(block[n].get("freshness") == "STALE" for n in ("kalshi", "polymarket_us"))
+        label = "STALE" if stale else "cached"
+        bits.append("treasury_status.json " + label + (
+            " age=unknown" if age is None else f" age={age}s"))
+    if not _http_on("POLYMARKET_US_HTTP") and block["polymarket_us"].get("freshness") != "LIVE":
+        bits.append("POLYMARKET_US_HTTP off")
+    block["source"] = "; ".join(bits)
+    return block
 
 
 def _ftl_block():
@@ -178,8 +397,102 @@ def _ftl_block():
     return block
 
 
+def _poly_loop_block():
+    path = _POLY_LOOP or os.path.join(_ROOT, "data", "poly-loop", "last_run.json")
+    doc = _load_json(path)
+    empty = {
+        "present": False, "n": None, "skip_reasons": {}, "live": None,
+        "status": None, "ts": None, "path": "data/poly-loop/last_run.json",
+    }
+    if not isinstance(doc, dict):
+        return empty
+    reasons = doc.get("skip_reasons")
+    n = doc.get("n")
+    return {
+        "present": True,
+        "n": None if n is None else int(n),
+        "skip_reasons": reasons if isinstance(reasons, dict) else {},
+        "live": bool(doc.get("live")),
+        "status": doc.get("status"),
+        "ts": doc.get("ts"),
+        "path": "data/poly-loop/last_run.json",
+    }
+
+
+def _tcp(host, port):
+    import socket
+    s = socket.socket()
+    s.settimeout(0.4)
+    try:
+        s.connect((host, int(port)))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+_CONN = (
+    ("litellm", "127.0.0.1", 4000),
+    ("bionic", "127.0.0.1", 1234),
+    ("ruflo", "127.0.0.1", 8810),
+    ("kalshi", "api.elections.kalshi.com", 443),
+)
+
+
+def _connections():
+    """Alert-only pings. No restart, no heal."""
+    if _PING is None and not _LIVE:
+        return [{"name": n, "ok": None, "status": "SKIP"} for n, _h, _p in _CONN]
+    now_m = time.monotonic()
+    if _PING is None and _CONN_MEMO["rows"] is not None and now_m - _CONN_MEMO["at"] < 30:
+        return _CONN_MEMO["rows"]
+    fn = _PING or _tcp
+    rows = []
+    for name, host, port in _CONN:
+        try:
+            ok = bool(fn(host, port))
+        except Exception:
+            ok = False
+        rows.append({"name": name, "ok": ok, "status": "OK" if ok else "FAIL"})
+    if _PING is None:
+        _CONN_MEMO["at"] = now_m
+        _CONN_MEMO["rows"] = rows
+    return rows
+
+
+def render_controls_html(items):
+    """Every snapshot row. Bool → ON/OFF. Source badge is const | env | file."""
+    parts = []
+    for it in items or []:
+        name = escape(str(it.get("name") or ""), quote=True)
+        src = escape(str(it.get("source") or ""), quote=True)
+        notes = escape(str(it.get("notes") or ""), quote=True)
+        val = it.get("value")
+        if isinstance(val, bool):
+            shown, klass = ("ON", "on") if val else ("OFF", "off")
+        else:
+            shown = escape(str(val))
+            low = str(val).lower()
+            klass = "off" if low in ("none", "off", "false") else (
+                "on" if low in ("valedia", "on", "true") else "")
+        parts.append(
+            f'<div class="row" data-control="{name}" data-source="{src}">'
+            f'<span class="k" title="{notes}">{name}</span>'
+            f'<span class="v {klass}">{shown}<span class="badge {src}">{src}</span></span>'
+            f'</div>'
+        )
+    return "".join(parts)
+
+
 def panel(now=None):
-    ident = vc.version_identity()
+    controls = vc.controls_snapshot()
+    ident = {
+        "version": controls.get("version"),
+        "sha": controls.get("sha"),
+        "branch": controls.get("branch"),
+        "dirty": bool(controls.get("dirty")),
+    }
     now = now or datetime.now(timezone.utc)
     models = _MODELS
     queue = _QUEUE or os.path.join(models, "nautilus_intent_queue.jsonl")
@@ -188,12 +501,14 @@ def panel(now=None):
     sig = _load_json(os.path.join(models, "mirofish_signal.json")) or {}
     ftl_block = _ftl_block()
     broker = _broker_block(models)
-    venues = _venues_block(models)
+    venues = _venues_block(models, now)
     if venues.get("kalshi", {}).get("cash") is None and broker.get("cash") is not None:
         venues["kalshi"] = {
             "cash": broker["cash"],
             "status": "BROKER",
-            "note": "pnl_tracker.json current_balance (not treasury GET)",
+            "freshness": "BROKER",
+            "age_s": None,
+            "note": "pnl_tracker.json current_balance (not a treasury GET)",
         }
 
     miro = {
@@ -219,19 +534,25 @@ def panel(now=None):
         pass
 
     halted = bool(vc.trading_halted())
+    items = controls.get("items") or []
     return {
         "ts": now.isoformat(),
         "valedia_version": ident["version"],
         "stamp": vc.version_stamp(),
         "sha": ident["sha"],
+        "branch": ident["branch"],
         "dirty": bool(ident["dirty"]),
-        "mode": cockpit_mode(),
+        "identity": vc.version_line(),
+        "mode": cockpit_mode(items=items),
+        "mode_why": _mode_why(items=items),
         "ftl": ftl_block,
         "broker": broker,
         "cash": broker.get("cash"),
         "deployed": broker.get("deployed"),
         "cash_source": "pnl_tracker.json summary (Kalshi broker; not FTL)",
         "venues": venues,
+        "poly_loop": _poly_loop_block(),
+        "connections": _connections(),
         "shadow": _shadow_counts(queue),
         "mirofish": miro,
         "neural": {
@@ -249,17 +570,26 @@ def panel(now=None):
         "auto_raise": bool(vc.MIROFISH_AUTO_RAISE),
         "trading_halt": halted,
         "trading_halt_reason": vc.halt_reason() if halted else "",
-        "controls": vc.controls_snapshot(),
+        "controls": controls,
     }
 
 
 def ui_html():
     try:
         with open(_UI, encoding="utf-8") as f:
-            return f.read()
+            raw = f.read()
     except OSError:
         return ("<!doctype html><title>Valedia</title>"
                 "<p>UI file missing. GET /status still works.</p>")
+    try:
+        rows = render_controls_html(vc.controls_snapshot().get("items") or [])
+    except Exception:
+        rows = ""
+    return raw.replace(
+        '<div id="controls"></div>',
+        '<div id="controls">' + rows + '</div>',
+        1,
+    )
 
 
 def handle(method, path):
@@ -304,7 +634,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT):
-    """GET server. Not started by cron. Default loopback :8765."""
+    """GET server. Not started by cron. Default loopback :8765.
+
+    Restart: python3 scripts/integrations/valedia_cockpit.py --listen
+    """
+    global _LIVE
+    _LIVE = True
     httpd = HTTPServer((host, int(port)), _Handler)
     httpd.serve_forever()
 
@@ -325,4 +660,5 @@ if __name__ == "__main__":
         port = int(_argv_opt(argv, "--port", str(DEFAULT_PORT)))
         serve(host, port)
     else:
+        _LIVE = True
         print(json.dumps(panel(), indent=2))

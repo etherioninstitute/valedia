@@ -72,8 +72,17 @@
     .pill.FENCED { color: var(--fenced); }
     .pill.DRY { color: var(--dry); }
     .pill.LIVE { color: var(--live); }
+    .pill.SHADOW { color: var(--accent); }
     .pill.halt { color: var(--halt); }
     .pill.ok { color: var(--ok); }
+    .strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; align-items: center; }
+    .badge {
+      display: inline-block; margin-left: 6px; padding: 1px 6px;
+      border-radius: 999px; border: 1px solid var(--sep);
+      font-size: 10px; font-weight: 650; letter-spacing: 0.04em;
+      text-transform: uppercase; color: var(--secondary); vertical-align: 1px;
+    }
+    .badge.env { color: var(--accent); }
     button.refresh {
       appearance: none; border: 1px solid var(--sep); background: var(--surface);
       color: var(--accent); font: inherit; font-weight: 600; font-size: 15px;
@@ -152,11 +161,20 @@
       </div>
     </header>
     <div class="banner" id="banner" role="status"></div>
+    <div class="strip" id="conns" aria-label="Connection pings"></div>
+    <p class="muted" id="conn-note">Ping only. This panel does not restart services.</p>
     <div class="grid">
       <section class="card wide" aria-labelledby="ctl-h">
         <h2 id="ctl-h">Controls</h2>
         <div id="controls"></div>
-        <p class="muted">Read-only. This panel never flips a gate.</p>
+        <p class="muted">Read-only. ON/OFF plus source (env, const, or file). This panel never flips a gate.</p>
+      </section>
+      <section class="card wide" aria-labelledby="pl-h">
+        <h2 id="pl-h">POLY-LOOP</h2>
+        <div class="row"><span class="k">Proposals</span><span class="v" id="pl-n">—</span></div>
+        <div class="row"><span class="k">Live flag</span><span class="v" id="pl-live">—</span></div>
+        <div class="row"><span class="k">Status</span><span class="v" id="pl-st">—</span></div>
+        <p class="muted" id="pl-skip"></p>
       </section>
       <section class="card wide" aria-labelledby="pnl-h">
         <h2 id="pnl-h">P&amp;L</h2>
@@ -223,12 +241,13 @@
       el.classList.add(Number(n) >= 0 ? "pos" : "neg");
     };
     function render(p) {
-      $("ident").textContent = "v" + (p.valedia_version || "?")
+      $("ident").textContent = p.identity || ("v" + (p.valedia_version || "?")
         + (p.sha ? " · " + p.sha : "")
-        + (p.dirty ? " dirty" : "");
+        + (p.branch ? " · " + p.branch : "")
+        + (p.dirty ? " dirty" : " clean"));
       $("stamp").textContent = p.stamp || "";
       const mode = p.mode || "—";
-      $("mode").textContent = mode;
+      $("mode").textContent = mode + (p.mode_why ? " · " + p.mode_why : "");
       $("mode").className = "pill " + mode;
       const halted = !!p.trading_halt;
       $("haltpill").textContent = halted ? "Halt on" : "Halt off";
@@ -265,9 +284,34 @@
       const v = p.venues || {};
       const k = v.kalshi || {};
       const py = v.polymarket_us || {};
-      $("kalshi").textContent = k.cash == null ? (k.status || "unread") : money(k.cash);
-      $("poly").textContent = py.cash == null ? (py.status || "unread") : money(py.cash);
-      $("venue-src").textContent = v.source || "treasury_status.json (no live GET)";
+      $("venue-src").textContent = v.source || "treasury unread";
+      const tag = (row) => {
+        const cash = row.cash == null ? (row.status || "unread") : money(row.cash);
+        if (!row.freshness || row.freshness === "LIVE") return cash;
+        const age = row.age_s == null ? "" : (" " + row.age_s + "s");
+        return cash + " " + row.freshness + age;
+      };
+      $("kalshi").textContent = tag(k);
+      $("poly").textContent = tag(py);
+      const pl = p.poly_loop || {};
+      $("pl-n").textContent = pl.present ? String(pl.n) : "unread";
+      $("pl-live").textContent = pl.live == null ? "—" : (pl.live ? "ON" : "OFF");
+      $("pl-live").className = "v" + (pl.live ? " on" : " off");
+      $("pl-st").textContent = pl.status || "—";
+      const reasons = pl.skip_reasons || {};
+      const bits = Object.keys(reasons).map((key) => key + "×" + reasons[key]);
+      $("pl-skip").textContent = pl.present
+        ? ((bits.join(" ") || "no skips") + (pl.ts ? " · " + String(pl.ts).replace("T", " ").slice(0, 19) : ""))
+        : "no last_run.json";
+      const strip = $("conns");
+      strip.replaceChildren();
+      (p.connections || []).forEach((c) => {
+        const s = document.createElement("span");
+        const st = c.status || "SKIP";
+        s.className = "pill " + (st === "OK" ? "ok" : (st === "FAIL" ? "halt" : ""));
+        s.textContent = c.name + " " + st;
+        strip.append(s);
+      });
       const mf = p.mirofish || {};
       $("mf-w").textContent = mf.weight == null ? "—" : Number(mf.weight).toFixed(2);
       $("mf-b").textContent = mf.bias == null ? "—" : Number(mf.bias).toFixed(1);
@@ -282,6 +326,8 @@
       items.forEach((it) => {
         const row = document.createElement("div");
         row.className = "row";
+        row.setAttribute("data-control", it.name);
+        row.setAttribute("data-source", it.source || "");
         const k = document.createElement("span");
         k.className = "k";
         k.textContent = it.name;
@@ -289,11 +335,15 @@
         const v = document.createElement("span");
         const bool = typeof it.value === "boolean";
         const raw = bool ? (it.value ? "ON" : "OFF") : String(it.value);
-        v.textContent = raw;
         const low = raw.toLowerCase();
         v.className = "v" + (bool ? (it.value ? " on" : " off")
-          : (low === "none" || low === "off" ? " off"
-            : (low === "valedia" || low === "on" ? " on" : "")));
+          : (low === "none" || low === "off" || low === "false" ? " off"
+            : (low === "valedia" || low === "on" || low === "true" ? " on" : "")));
+        v.textContent = raw;
+        const b = document.createElement("span");
+        b.className = "badge " + (it.source || "");
+        b.textContent = it.source || "";
+        v.append(b);
         row.append(k, v);
         box.append(row);
       });
