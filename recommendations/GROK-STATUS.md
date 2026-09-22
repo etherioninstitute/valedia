@@ -8,7 +8,7 @@
 
 **Current:** POLY-LOOP-FV SHIPPED. Resolution gate kept. Numeric FV ladder: `fv_overrides.json` → market `fairValue`/`fv`/`p_yes`/`modeled_prob` → fuzzy MiroFish/persona cache (slug/id/event) → `modeled_prob.ema_fair` on a ≥20-point YES series → mid-anchored `tag_prior` (`0.5*mid+0.5*0.5`) when classified or NWS/MLB/Fed label. Ledger reason `fv=cache|modeled|tag_prior|market|override`. Fail closed `no_fv`. HTTP smoke: 5 `tag_prior` proposals; `skip_reasons` `slip`×7 `max_open`×5 `no_fv`×2 `edge_lt_8`×1 (not all-20 no_fv). `POLYMARKET_US_LIVE` git False. Writer polymarket `none`. No crontab. Next=Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 
-**Version:** `0.54.0` (tip+tag on status commit). Prior: `0.53.0` POLY-LOOP-RESOLUTION / `0.52.0` POLY-LOOP-UNIVERSE / `0.51.0` POLY-LOOP (folded).
+**Version:** `0.54.0` tip `7dce534` tag `valedia-v0.54.0`. Prior: `0.53.0` POLY-LOOP-RESOLUTION / `0.52.0` POLY-LOOP-UNIVERSE / `0.51.0` POLY-LOOP (folded).
 
 **Tests:** `test_poly_loop.py` (market fields, fuzzy cache, override blotter, modeled EMA, tag_prior vs no_fv vs edge_lt_8, resolution gate, prior universe/edge/Kelly/DD). PASS.
 
