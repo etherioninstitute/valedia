@@ -83,7 +83,7 @@ def test_panel_broker_vs_ftl():
         assert p["ears"]["gathering"] is True
         assert p["trading_halt"] is False
         assert p["shadow"]["dispatchable"] == 0
-        assert p["valedia_version"] == "0.53.0"
+        assert p["valedia_version"] == "0.54.0"
     finally:
         _restore()
 
@@ -155,7 +155,7 @@ def test_html_hygiene_file():
     assert "refresh" in html
     assert "--live" not in src.replace("--listen", "")
     assert "import requests" not in src
-    assert vc.VALEDIA_VERSION == "0.53.0"
+    assert vc.VALEDIA_VERSION == "0.54.0"
     assert cockpit.DEFAULT_PORT == 8765
     assert cockpit.DEFAULT_HOST == "127.0.0.1"
     assert cockpit.DEFAULT_PORT != 3000

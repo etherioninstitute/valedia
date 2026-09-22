@@ -1,8 +1,13 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-20 PT — **POLY-LOOP-RESOLUTION SHIPPED**. Version `0.53.0` tip `a00c49a` tag `valedia-v0.53.0`. US `description`/`rules`/`resolvedBy` → named label or `rules_text` hash; fail closed only on zero text. FV unchanged. `POLYMARKET_US_LIVE` False; writer polymarket `none`. Ponytail: `PONYTAIL-AUDIT-POLY-LOOP-RESOLUTION.md`. Docs: `POLY-LOOP.md`. **GROK-STATUS: POLY-LOOP-RESOLUTION SHIPPED.** Prior `0.52.0` POLY-LOOP-UNIVERSE. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore / Jev enable in git. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False. `KALSHI_FEE_MAP_GATE` stays False. `VALEDIA_JEV` stays False.
+Updated: 2026-09-21 PT — **POLY-LOOP-FV SHIPPED**. Version `0.54.0` (tip+tag on status commit). FV ladder: override → market fields → fuzzy MiroFish/persona cache → `modeled_prob.ema_fair` → mid-anchored `tag_prior`. Fail closed `no_fv`. HTTP smoke: 5 tag_prior proposals, residual `no_fv`×2 / `edge_lt_8`×1 (not all-20 no_fv). `POLYMARKET_US_LIVE` False; writer polymarket `none`. Ponytail: `PONYTAIL-AUDIT-POLY-LOOP-FV.md`. Docs: `POLY-LOOP.md`. **GROK-STATUS: POLY-LOOP-FV SHIPPED.** Prior `0.53.0` POLY-LOOP-RESOLUTION. No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore / Jev enable in git. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False. `KALSHI_FEE_MAP_GATE` stays False. `VALEDIA_JEV` stays False.
+
+## POLY-LOOP-FV (Grok Build executor, `valedia-v2-grok-build`)
+- Resolution gate kept. Numeric FV from blotter / `fairValue|fv|p_yes|modeled_prob` / fuzzy cache / EMA series / 50/50 mid-anchored tag_prior (classified or NWS/MLB/Fed label). Ledger `fv=cache|modeled|tag_prior|market|override`.
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
 
 ## POLY-LOOP-RESOLUTION (Grok Build executor, `valedia-v2-grok-build`)
-- Explicit `resolutionSource`/`resolvedBy` first. Else extract NWS/AP/Fed/… or URL host from `description`/`rules`/`event.rules`. Else `rules_text:<hash>:<snippet>` if text exists. Zero text → `no_resolution`. FV still cache/`fairValue` only.
+- Explicit `resolutionSource`/`resolvedBy` first. Else extract NWS/AP/Fed/… or URL host from `description`/`rules`/`event.rules`. Else `rules_text:<hash>:<snippet>` if text exists. Zero text → `no_resolution`.
 - `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
 - **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
 

@@ -81,7 +81,7 @@ def test_hygiene_and_fence():
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VALEDIA_VERSION == "0.53.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.54.0", vc.VALEDIA_VERSION
     assert vc.POLY_LOOP_EDGE_PTS == 8.0
     assert vc.POLY_LOOP_MAX_OPEN == 5
     assert vc.POLY_LOOP_DD_STOP == 0.40
@@ -301,13 +301,126 @@ def test_fv_from_cache_when_fairvalue_missing():
         m, book=_book(), bbo=_book(), now=NOW, models_dir=d, bankroll=100)
     assert rec is not None
     assert rec["fv"] == 0.72
+    assert rec["fv_source"] == "cache"
     assert rec["create_order"] is False
+    assert "fv=cache" in rec["reason"]
     bare = dict(m)
     bare.pop("resolutionSource")
     assert poly_loop.estimate_fv(bare, models_dir=d) is None
     assert poly_loop.skip_reason(
         bare, book=_book(), bbo=_book(), now=NOW, models_dir=d
     ) == "no_resolution"
+
+
+def test_fv_sources():
+    """Market fields, fuzzy cache, override, modeled EMA, tag_prior. Fail closed."""
+    _restore()
+    book50 = _book(mid=0.50)
+    book70 = _book(mid=0.70)
+
+    p_yes = _mkt(slug="field-yes")
+    p_yes.pop("fairValue")
+    p_yes["p_yes"] = 0.81
+    assert poly_loop.estimate_fv(p_yes) == 0.81
+    assert poly_loop.estimate_fv_src(p_yes)[1] == "market"
+
+    modeled_field = _mkt(slug="field-modeled")
+    modeled_field.pop("fairValue")
+    modeled_field["modeled_prob"] = 0.64
+    assert poly_loop.estimate_fv(modeled_field) == 0.64
+
+    # Fuzzy: underscore vs hyphen; event slug; unique contains.
+    m = _mkt(slug="edge-mkt")
+    m.pop("fairValue")
+    d = tempfile.mkdtemp(prefix="poly_fv_fz_")
+    with open(os.path.join(d, "mirofish_neural_enrichment.json"), "w") as f:
+        json.dump({"markets": {"Edge_Mkt": {"p_yes": 0.73}}}, f)
+    assert poly_loop.estimate_fv(m, models_dir=d) == 0.73
+    ev = _mkt(slug="child-row")
+    ev.pop("fairValue")
+    ev["event"] = {"slug": "parent-event-slug"}
+    d2 = tempfile.mkdtemp(prefix="poly_fv_ev_")
+    with open(os.path.join(d2, "persona_lens_scores.json"), "w") as f:
+        json.dump({"events": {"parent-event-slug": {"fv": 0.69}}}, f)
+    assert poly_loop.estimate_fv(ev, models_dir=d2) == 0.69
+    contain = _mkt(slug="la-rain-in-2026")
+    contain.pop("fairValue")
+    d3 = tempfile.mkdtemp(prefix="poly_fv_ct_")
+    with open(os.path.join(d3, "mirofish_neural_enrichment.json"), "w") as f:
+        json.dump({"symbols": {
+            "will-la-rain-in-2026": {"p_yes": 0.61}}}, f)
+    assert poly_loop.estimate_fv(contain, models_dir=d3) == 0.61
+    # Top-level p_yes is not a per-market FV.
+    d4 = tempfile.mkdtemp(prefix="poly_fv_top_")
+    with open(os.path.join(d4, "mirofish_neural_enrichment.json"), "w") as f:
+        json.dump({"p_yes": 0.99, "regime": {"label": "x"}}, f)
+    assert poly_loop.estimate_fv(m, models_dir=d4) is None
+
+    # Override blotter beats cache miss.
+    od = tempfile.mkdtemp(prefix="poly_fv_ov_")
+    with open(os.path.join(od, "fv_overrides.json"), "w") as f:
+        json.dump({"schema": "poly-loop-fv-overrides/v1",
+                   "overrides": {"edge-mkt": 0.77}}, f)
+    fv, kind = poly_loop.estimate_fv_src(m, out_dir=od)
+    assert fv == 0.77 and kind == "override"
+    rec = poly_loop.evaluate_one(
+        m, book=book50, bbo=book50, now=NOW, out_dir=od, bankroll=100)
+    assert rec["fv_source"] == "override"
+    assert "fv=override" in rec["reason"]
+
+    # modeled_prob.ema_fair on a YES series (not P(up)).
+    series = _mkt(slug="series-mkt")
+    series.pop("fairValue")
+    series["priceHistory"] = [0.72] * 24
+    fv, kind = poly_loop.estimate_fv_src(series)
+    assert kind == "modeled"
+    assert abs(fv - 0.72) < 1e-9
+    rec = poly_loop.evaluate_one(
+        series, book=book50, bbo=book50, now=NOW, bankroll=100)
+    assert rec["fv_source"] == "modeled"
+    assert "fv=modeled" in rec["reason"]
+
+    # tag_prior: NWS label from description, mid-anchored. Wide mid → propose.
+    wx = {
+        "id": "wx-2", "slug": "la-rain", "question": "Will it rain in LA?",
+        "description": (
+            "This market will resolve based on the National Weather Service "
+            "daily climate report."),
+        "active": True, "closed": False, "endDate": _end(24),
+        "liquidity": 9000,
+    }
+    fv, kind = poly_loop.estimate_fv_src(wx, mid=0.70)
+    assert kind == "tag_prior"
+    assert abs(fv - (0.5 * 0.70 + 0.5 * 0.50)) < 1e-9
+    assert poly_loop.skip_reason(
+        wx, book=book50, bbo=book50, now=NOW) == "edge_lt_8"
+    rec = poly_loop.evaluate_one(
+        wx, book=book70, bbo=book70, now=NOW, bankroll=100)
+    assert rec is not None
+    assert rec["fv_source"] == "tag_prior"
+    assert rec["edge_pts"] >= 8
+    assert rec["create_order"] is False
+    assert "fv=tag_prior" in rec["reason"]
+
+    # OTHER + rules_text + no cache → no_fv.
+    other = {
+        "slug": "obscure-thing", "question": "Will the thing happen?",
+        "description": (
+            "This market resolves Yes if the thing happens by the end date, "
+            "using the listed criteria only."),
+        "active": True, "endDate": _end(24), "liquidity": 9000,
+    }
+    assert poly_loop.resolution_source(other)
+    assert poly_loop.estimate_fv(other, mid=0.70) is None
+    assert poly_loop.skip_reason(
+        other, book=book70, bbo=book70, now=NOW) == "no_fv"
+
+    # Resolution gate still blocks tag_prior / cache.
+    wx_bare = dict(wx)
+    wx_bare.pop("description")
+    assert poly_loop.estimate_fv(wx_bare, mid=0.70) is None
+    assert poly_loop.skip_reason(
+        wx_bare, book=book70, bbo=book70, now=NOW) == "no_resolution"
 
 
 def test_us_resolution_from_description_and_rules():
@@ -381,8 +494,9 @@ def test_us_resolution_from_description_and_rules():
 
     no_fv = dict(us_list)
     no_fv.pop("fairValue")
+    # NWS → WEATHER tag_prior; mid 0.50 → FV 0.50 → edge_lt_8, not no_fv.
     assert poly_loop.skip_reason(
-        no_fv, book=_book(), bbo=_book(), now=NOW) == "no_fv"
+        no_fv, book=_book(), bbo=_book(), now=NOW) == "edge_lt_8"
     thin = dict(us_list)
     thin["fairValue"] = 0.55
     assert poly_loop.skip_reason(
@@ -399,6 +513,7 @@ def test_us_resolution_from_description_and_rules():
     assert rec["status"] == poly_loop.STATUS_DRY
     assert rec["create_order"] is False
     assert "NWS" in rec["reason"]
+    assert "fv=market" in rec["reason"]
 
 
 def test_allocator_status_only_and_no_create():
@@ -425,6 +540,7 @@ if __name__ == "__main__":
     test_expired_filtered_and_aliases()
     test_skip_reason_histogram()
     test_fv_from_cache_when_fairvalue_missing()
+    test_fv_sources()
     test_us_resolution_from_description_and_rules()
     test_allocator_status_only_and_no_create()
     print("POLY-LOOP paper desk: PASS")

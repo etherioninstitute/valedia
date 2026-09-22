@@ -1,0 +1,5 @@
+{
+  "schema": "poly-loop-fv-overrides/v1",
+  "note": "Desk/manual P(yes) in [0,1]. Keys: slug, id, eventSlug, conditionId (exact then normalized; unique contains if both keys >=8 chars). Scalar 0.62 or {\"fv\": 0.62, \"note\": \"desk\"}. Empty overrides = no blotter hits. Resolution gate still required. Not live orders.",
+  "overrides": {}
+}

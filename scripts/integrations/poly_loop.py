@@ -29,10 +29,32 @@ BANKROLL_CAP = 0.06
 DEFAULT_BANKROLL = 100.0
 SUBSCRIPTION_USD = 20.0
 CRON_FLAG = "INSTALL_CRON"
+FV_OVERRIDE_NAME = "fv_overrides.json"
+# Mid-anchored favorite-longshot shrink: FV = (1-w)*mid + w*0.5.
+# |FV-mid| = w*|mid-0.5|; w=0.5 → 8pt edge at mid 0.34/0.66.
+TAG_PRIOR_W = 0.50
+TAG_PRIOR_MU = 0.50
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 DEFAULT_DIR = os.path.join(_ROOT, "data", "poly-loop")
+_MODELS = os.path.join(_ROOT, "models")
+_FV_KEYS = ("fairValue", "fair_value", "fv", "p_yes", "modeled_prob")
+_ID_KEYS = ("slug", "marketSlug", "ticker", "id", "conditionId",
+            "eventSlug", "eventId", "event_id")
+_CACHE_SKIP = frozenset({
+    "regime", "ts", "version", "source", "fusion_touched", "auto_raise",
+    "symbols", "markets", "events", "by_slug", "overrides", "schema",
+    "note", "command",
+})
+# Official resolution label → nav bucket when classify returns OTHER.
+_SRC_NAV = {
+    "NWS": "WEATHER", "NOAA": "WEATHER",
+    "MLB": "SPORTS", "NFL": "SPORTS", "NBA": "SPORTS", "NHL": "SPORTS",
+    "NCAA": "SPORTS", "FIFA": "SPORTS",
+    "Fed": "ECON", "FOMC": "ECON", "BLS": "ECON", "BEA": "ECON", "EIA": "ECON",
+    "CDC": "WEATHER",
+}
 
 
 def _now():
@@ -288,37 +310,196 @@ def _dead(market):
     return any(s in state for s in ("CLOSED", "EXPIRED", "TERMINATED", "ARCHIVED"))
 
 
-def _cache_fv(market, tags=None, models_dir=None):
-    """Numeric FV from market/tags/MiroFish+persona caches. No Ollama."""
-    m = market if isinstance(market, dict) else {}
-    blobs = [m]
-    if isinstance(tags, dict):
-        blobs.append(tags)
-    slug = str(m.get("slug") or m.get("marketSlug") or m.get("ticker") or "")
-    if models_dir:
-        for name in ("mirofish_neural_enrichment.json", "persona_lens_scores.json"):
-            doc = _load_json(os.path.join(models_dir, name))
-            if not doc:
-                continue
-            blobs.append(doc)
-            for bag in (doc.get("symbols"), doc.get("markets")):
-                if slug and isinstance(bag, dict) and isinstance(bag.get(slug), dict):
-                    blobs.append(bag[slug])
-    for blob in blobs:
-        if not isinstance(blob, dict):
-            continue
-        for k in ("fairValue", "fair_value", "fv", "p_yes", "modeled_prob"):
-            v = _f(blob.get(k))
-            if v is not None:
-                return _clip01(v)
+def _fv_num(blob):
+    if not isinstance(blob, dict):
+        return None
+    for k in _FV_KEYS:
+        v = _f(blob.get(k))
+        if v is not None:
+            return _clip01(v)
     return None
 
 
-def estimate_fv(market, tags=None, mid=None, models_dir=None):
-    """Require a named resolution source. Fail closed if no numeric FV."""
-    if not resolution_source(market):
+def _market_ids(market):
+    m = market if isinstance(market, dict) else {}
+    blobs = [m]
+    for nest in ("event", "market"):
+        if isinstance(m.get(nest), dict):
+            blobs.append(m[nest])
+    out, seen = [], set()
+    for blob in blobs:
+        for k in _ID_KEYS:
+            v = blob.get(k)
+            if v in (None, ""):
+                continue
+            s = str(v)
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+def _norm_key(s):
+    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+
+
+def _fuzzy_fv(bag, ids):
+    """Exact, normalized, then unique contains (len>=8). Scalar values ok."""
+    if not isinstance(bag, dict) or not ids:
         return None
-    return _cache_fv(market, tags=tags, models_dir=models_dir)
+    want = [_norm_key(i) for i in ids]
+    want_set = {w for w in want if w}
+    index = {_norm_key(k): v for k, v in bag.items()}
+    for raw, nk in zip(ids, want):
+        hit = bag.get(raw)
+        if hit is None:
+            hit = index.get(nk)
+        v = _fv_num(hit) if isinstance(hit, dict) else _f(hit)
+        if v is not None:
+            return _clip01(v)
+    hits = []
+    for nk, hit in index.items():
+        if not nk or len(nk) < 8:
+            continue
+        if any(nk == w or (len(w) >= 8 and (nk in w or w in nk))
+               for w in want_set):
+            v = _fv_num(hit) if isinstance(hit, dict) else _f(hit)
+            if v is not None:
+                hits.append(round(v, 6))
+    if len(set(hits)) == 1:
+        return hits[0]
+    return None
+
+
+def _walk_cache(doc, ids):
+    if not isinstance(doc, dict):
+        return None
+    for key in ("symbols", "markets", "events", "by_slug", "overrides"):
+        bag = doc.get(key)
+        if isinstance(bag, dict):
+            v = _fuzzy_fv(bag, ids)
+            if v is not None:
+                return v
+        elif isinstance(bag, list):
+            want = {_norm_key(i) for i in ids}
+            for row in bag:
+                if not isinstance(row, dict):
+                    continue
+                row_ids = {_norm_key(x) for x in _market_ids(row)}
+                if not (row_ids & want):
+                    continue
+                v = _fv_num(row)
+                if v is not None:
+                    return v
+    slim = {k: v for k, v in doc.items() if k not in _CACHE_SKIP}
+    return _fuzzy_fv(slim, ids)
+
+
+def load_fv_overrides(out_dir=None):
+    p = os.path.join(_dir(out_dir), FV_OVERRIDE_NAME)
+    doc = _load_json(p)
+    return doc if isinstance(doc, dict) else {}
+
+
+def _override_fv(market, out_dir=None):
+    doc = load_fv_overrides(out_dir)
+    bag = doc.get("overrides") if isinstance(doc.get("overrides"), dict) else doc
+    return _fuzzy_fv(bag, _market_ids(market)) if isinstance(bag, dict) else None
+
+
+def _price_series(market):
+    m = market if isinstance(market, dict) else {}
+    for k in ("priceHistory", "price_history", "midHistory", "mids"):
+        raw = m.get(k)
+        if not isinstance(raw, list):
+            continue
+        out = []
+        for x in raw:
+            v = _f(x)
+            if v is None and isinstance(x, dict):
+                v = _f(x.get("p") or x.get("price") or x.get("mid")
+                       or x.get("yes"))
+            if v is not None:
+                out.append(v)
+        if len(out) >= 20:
+            return out
+    return []
+
+
+def _modeled_fv(market):
+    """EMA fair of a YES series via modeled_prob.ema_fair. Not P(up)."""
+    prices = _price_series(market)
+    if len(prices) < 20:
+        return None
+    try:
+        from modeled_prob import ema_fair
+        v = ema_fair(prices)
+    except Exception:
+        return None
+    return _clip01(v) if v is not None else None
+
+
+def _nav(market, tags=None):
+    if isinstance(tags, dict):
+        cat = tags.get("nav")
+        if cat and cat != "OTHER":
+            return cat
+    try:
+        import polymarket_entertainment as pe
+        cat = pe.classify_market(market).get("category")
+        if cat and cat != "OTHER":
+            return cat
+    except Exception:
+        pass
+    src = resolution_source(market) or ""
+    if src.startswith("rules_text:"):
+        return None
+    return _SRC_NAV.get(src)
+
+
+def _tag_prior(market, tags, mid):
+    if mid is None:
+        return None
+    if not _nav(market, tags):
+        return None
+    return _clip01(
+        (1.0 - TAG_PRIOR_W) * float(mid) + TAG_PRIOR_W * TAG_PRIOR_MU)
+
+
+def estimate_fv_src(market, tags=None, mid=None, models_dir=None, out_dir=None):
+    """(fv, source) with source in override|market|cache|modeled|tag_prior."""
+    if not resolution_source(market):
+        return None, None
+    m = market if isinstance(market, dict) else {}
+    v = _override_fv(m, out_dir=out_dir)
+    if v is not None:
+        return v, "override"
+    v = _fv_num(m)
+    if v is None and isinstance(tags, dict):
+        v = _fv_num(tags)
+    if v is not None:
+        return v, "market"
+    ids = _market_ids(m)
+    if models_dir:
+        for name in ("mirofish_neural_enrichment.json",
+                     "persona_lens_scores.json"):
+            v = _walk_cache(_load_json(os.path.join(models_dir, name)), ids)
+            if v is not None:
+                return v, "cache"
+    v = _modeled_fv(m)
+    if v is not None:
+        return v, "modeled"
+    v = _tag_prior(m, tags, mid)
+    if v is not None:
+        return v, "tag_prior"
+    return None, None
+
+
+def estimate_fv(market, tags=None, mid=None, models_dir=None, out_dir=None):
+    """Require a resolution source. Fail closed if no numeric FV."""
+    fv, _src = estimate_fv_src(
+        market, tags=tags, mid=mid, models_dir=models_dir, out_dir=out_dir)
+    return fv
 
 
 def universe_skip(market, now=None):
@@ -335,7 +516,7 @@ def universe_skip(market, now=None):
 
 
 def skip_reason(market, *, book=None, bbo=None, tags=None, now=None,
-                models_dir=None):
+                models_dir=None, out_dir=None):
     """Named skip or None if sizing may proceed. No vibes FV."""
     why = universe_skip(market, now=now)
     if why:
@@ -343,12 +524,13 @@ def skip_reason(market, *, book=None, bbo=None, tags=None, now=None,
     if not resolution_source(market):
         return "no_resolution"
     tags = tags if tags is not None else cheap_tags(market, models_dir=models_dir)
-    fv = estimate_fv(market, tags=tags, models_dir=models_dir)
-    if fv is None:
-        return "no_fv"
     mid, _ = _mid_from(bbo or book or {})
     if mid is None and book is not None:
         mid, _ = _mid_from(book)
+    fv, _src = estimate_fv_src(
+        market, tags=tags, mid=mid, models_dir=models_dir, out_dir=out_dir)
+    if fv is None:
+        return "no_fv"
     if mid is None:
         return "no_mid"
     if not passes_edge(fv, mid):
@@ -561,7 +743,7 @@ def _mid_from(doc):
 
 
 def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
-                 n_open=0, now=None, models_dir=None):
+                 n_open=0, now=None, models_dir=None, out_dir=None):
     """Skip (None), BLOCKED row, or DRY/SHADOW row. Never places."""
     m = market if isinstance(market, dict) else {}
     slug = m.get("slug") or m.get("marketSlug") or m.get("ticker")
@@ -571,9 +753,10 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         mid, sized = _mid_from(book)
     tags = tags if tags is not None else cheap_tags(m, models_dir=models_dir)
     if skip_reason(m, book=book, bbo=bbo, tags=tags, now=now,
-                   models_dir=models_dir):
+                   models_dir=models_dir, out_dir=out_dir):
         return None
-    fv = estimate_fv(m, tags=tags, mid=mid, models_dir=models_dir)
+    fv, fv_src = estimate_fv_src(
+        m, tags=tags, mid=mid, models_dir=models_dir, out_dir=out_dir)
     if fv is None or mid is None:
         return None
     bet, _n, _f, side = kelly_capped(fv, mid, bankroll)
@@ -583,7 +766,7 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         ts=_now(), market_id=m.get("id") or slug, slug=slug, fv=round(fv, 4),
         mid=round(float(mid), 4), edge_pts=round(edge_pts(fv, mid), 2),
         size=round(float(bet), 2), exit_condition=exit_c, reason="",
-        status=STATUS_BLOCKED, side=side, tags=tags,
+        status=STATUS_BLOCKED, side=side, tags=tags, fv_source=fv_src,
         spread=sized.get("spread"), create_order=False,
     )
     if vc.trading_halted():
@@ -601,7 +784,7 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         return base
     base["status"] = STATUS_DRY
     base["reason"] = (
-        f"edge {base['edge_pts']}pts src={resolution_source(m)!r} "
+        f"edge {base['edge_pts']}pts fv={fv_src} src={resolution_source(m)!r} "
         f"nav={(tags or {}).get('nav')} slip={None if slip is None else round(slip, 4)}"
     )
     base["slip"] = None if slip is None else round(slip, 4)
@@ -741,11 +924,12 @@ def run(client=None, markets=None, books=None, bbos=None, out_dir=None,
         book, bbo = _book_for(client, slug, books, bbos)
         rec = evaluate_one(
             m, book=book, bbo=bbo, bankroll=eq, n_open=len(open_pos),
-            now=now, models_dir=models_dir,
+            now=now, models_dir=models_dir, out_dir=d,
         )
         if rec is None:
             why = skip_reason(
                 m, book=book, bbo=bbo, now=now, models_dir=models_dir,
+                out_dir=d,
             ) or "other"
             skip_reasons[why] = skip_reasons.get(why, 0) + 1
             skipped += 1
@@ -791,4 +975,4 @@ def run(client=None, markets=None, books=None, bbos=None, out_dir=None,
 
 
 if __name__ == "__main__":
-    print(json.dumps(run(), indent=2, default=str))
+    print(json.dumps(run(models_dir=_MODELS), indent=2, default=str))

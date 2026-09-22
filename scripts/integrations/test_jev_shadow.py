@@ -80,7 +80,7 @@ def _boom(*_a, **_k):
 def test_hygiene_and_defaults():
     assert vc.VALEDIA_JEV is False
     assert vc.jev_enabled() is False
-    assert vc.VALEDIA_VERSION == "0.53.0"
+    assert vc.VALEDIA_VERSION == "0.54.0"
     src = open(os.path.join(HERE, "jev_shadow.py")).read()
     assert "VALEDIA_JEV = True" not in src
     assert "create_order" not in src

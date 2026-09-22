@@ -1,4 +1,4 @@
-# POLY-LOOP — Polymarket US paper desk (0.53.0)
+# POLY-LOOP — Polymarket US paper desk (0.54.0)
 
 **Name is POLY-LOOP** (not POLY-GROK-LOOP).
 
@@ -38,14 +38,44 @@ US `GET /v1/markets` + `GET /v1/market/slug/{slug}` **do not** document `resolut
 3. Else if any rules/description/resolution **text** exists → `rules_text:<12-hex>:<snippet>` (audit token; not invented).
 4. Fail closed (`None` → skip `no_resolution`) only when that text is **zero**. Question/title/slug is vibes, not a source.
 
-FV path unchanged: `fairValue` / cache `p_yes`. Resolution helper must return something before FV arms. Honest skips: `no_resolution` vs `no_fv` vs `edge_lt_8`.
+Resolution helper must return something before FV arms. Honest skips: `no_resolution` vs `no_fv` vs `edge_lt_8`.
 
-HTTP smoke (2026-09-21, `POLYMARKET_US_HTTP=1` LIVE=0, keys present, no create): list+get_market both carry `description` (~500 chars) and **omit** `resolutionSource` / `resolvedBy` / `rules` / `fairValue` / nested `event`. GET slug adds no extra resolution fields vs list. 0.53.0 `resolution_source` on 8 rows: 4 named (e.g. MLB from description) + 4 `rules_text`. Full loop `skip_reasons` **`no_fv`×20** (was `no_resolution`×20 on 0.52.0). Remaining gap is numeric FV (no `fairValue`, cache miss) — not missing rules text. `live=0` `create_order=0`.
+HTTP smoke (2026-09-21, `POLYMARKET_US_HTTP=1` LIVE=0, keys present, no create): list+get_market both carry `description` (~500 chars) and **omit** `resolutionSource` / `resolvedBy` / `rules` / `fairValue` / nested `event`. GET slug adds no extra resolution fields vs list. 0.53.0 `resolution_source` on 8 rows: 4 named (e.g. MLB from description) + 4 `rules_text`. Full loop `skip_reasons` **`no_fv`×20** (was `no_resolution`×20 on 0.52.0). Remaining gap was numeric FV (no `fairValue`, exact-slug cache miss). `live=0` `create_order=0`.
+
+## Fair value (0.54.0)
+
+Gate: `resolution_source()` must return a value. Then first hit wins:
+
+| source | when | ledger `fv=` |
+|--------|------|----------------|
+| blotter | `data/poly-loop/fv_overrides.json` `overrides` keyed by slug/id/event | `override` |
+| market | `fairValue` / `fair_value` / `fv` / `p_yes` / `modeled_prob` on the row or tags | `market` |
+| cache | MiroFish/persona JSON, fuzzy slug/id/event (exact → normalized `_`/`-` → unique contains, keys ≥8 chars) | `cache` |
+| modeled | `priceHistory` / `midHistory` length ≥20 → `modeled_prob.ema_fair` (YES EMA, **not** P(up)) | `modeled` |
+| tag_prior | `cheap_tags` / `classify_market` nav ≠ OTHER, **or** official label NWS/MLB/Fed/… mapped to a nav bucket. FV = `0.5*mid + 0.5*0.5` (favorite-longshot shrink). Needs mid. | `tag_prior` |
+
+Fail closed (`no_fv`) if none apply. `rules_text` + unclassified + empty caches + no series + empty blotter = `no_fv`. Top-level cache `p_yes` is **not** applied to every market.
+
+`tag_prior` is a documented 50/50 mid vs uninformed 0.5, **not** a per-question invention. `|FV−mid| = 0.5·|mid−0.5|` so 8pt flags need mid ≤0.34 or ≥0.66. Tighter mids skip `edge_lt_8`.
+
+### `fv_overrides.json` schema
+
+```
+{
+  "schema": "poly-loop-fv-overrides/v1",
+  "note": "Desk/manual P(yes) in [0,1]. Not live orders.",
+  "overrides": { "some-slug": 0.62 }
+}
+```
+
+Value may be a float or `{"fv": 0.62, "note": "desk"}`. Seed file ships with `"overrides": {}`.
+
+HTTP smoke (2026-09-21, `POLYMARKET_US_HTTP=1` LIVE=0, 20-row pull, empty blotter, no MiroFish per-slug keys): **n=5** DRY/SHADOW proposals, all `fv=tag_prior` (MLB longshots, mids 0.05–0.25, edges 12–23pt). `skip_reasons`: `slip`×7, `max_open`×5 (paper cap filled), `no_fv`×2, `edge_lt_8`×1. Residual `no_fv` is unclassified `rules_text` without series/cache — not all 20. `live=0` `create_order=0`.
 
 ## Loop
 
 1. Active Poly US markets (existing client). Skip resolve-under-2h and liquidity &lt; $5k. Pull-time filter so stale NFL / zero-liq rows cannot occupy the whole batch.
-2. Fair value: **resolution helper must return something** (explicit name, extracted official label, or `rules_text` hash — see Resolution 0.53.0). Numeric FV from market/tags `fairValue`/`fv`/`p_yes`, else slug lookup in existing `mirofish_neural_enrichment.json` / `persona_lens_scores.json` caches (`poly_learn.cheap_tags` still tags only). **No** vibes, **no** new Ollama/TypeSafe, **no** `modeled_prob` price-series (crypto, not poly). Skip `no_fv` if none of those exist.
+2. Fair value: **resolution helper must return something** (explicit name, extracted official label, or `rules_text` hash — see Resolution 0.53.0). Numeric FV from the 0.54.0 ladder (override → market fields → fuzzy cache → modeled EMA → tag_prior). Ledger reason includes `fv=cache|modeled|tag_prior|market|override`. **No** vibes, **no** new Ollama/TypeSafe. Skip `no_fv` if none apply.
 3. Flag only if `|FV − mid| ≥ 8` percentage points (`POLY_LOOP_EDGE_PTS`).
 4. Book/BBO flatten: full size at ≤ 3% slippage or skip (`BLOCKED`).
 5. Half-Kelly (`quant_engine.kelly_size` / `KELLY_SAFETY_FRACTION`); hard cap **6%** bankroll; max **5** open paper positions.

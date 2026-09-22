@@ -135,6 +135,23 @@ def modeled_prob_up(prices, fair_window=20, horizon=1):
     return 0.5 + (p_up - 0.5) * trust
 
 
+def ema_fair(prices, window=20):
+    """Last EMA of a YES/price series (same EMA as modeled_prob_up).
+
+    A modeled contract fair, not P(next move up). None if the series is
+    shorter than `window`.
+    """
+    p = np.asarray(prices, dtype=float)
+    p = p[np.isfinite(p)]
+    if len(p) < window:
+        return None
+    alpha = 2.0 / (window + 1.0)
+    fair = float(p[0])
+    for x in p[1:]:
+        fair = alpha * float(x) + (1.0 - alpha) * fair
+    return float(max(0.0, min(1.0, fair)))
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Calibration + honest scoring
 # ────────────────────────────────────────────────────────────────────────────

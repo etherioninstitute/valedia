@@ -19,7 +19,8 @@
 7j. **AUTONOMY-2 MIROFISH-JEV-SHADOW** — done `0.50.0`. See `AUTONOMY-2-JEV-SHADOW.md`. `VALEDIA_JEV` stays False.
 7k. **POLY-LOOP** — done `0.51.0` (folded into 0.52.0 commit). See `POLY-LOOP.md`. Desk loop on POLY-LEARN; `POLYMARKET_US_LIVE` stays False.
 7l. **POLY-LOOP-UNIVERSE** — done `0.52.0`. Universe filter + field map + cache FV + skip_reasons.
-7m. **POLY-LOOP-RESOLUTION** — done `0.53.0`. Map US `description`/`rules`/`resolvedBy` to a source label or `rules_text` hash; fail closed only on zero text. Next = Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
+7m. **POLY-LOOP-RESOLUTION** — done `0.53.0`. Map US `description`/`rules`/`resolvedBy` to a source label or `rules_text` hash; fail closed only on zero text.
+7n. **POLY-LOOP-FV** — done `0.54.0`. Real FV ladder (override/market/fuzzy cache/modeled EMA/tag_prior). Fail closed `no_fv`. Next = Burton (`KALSHI_FEE_MAP_GATE` runtime flip). Do not auto-flip Poly live.
 8. Wider venue ON — Burton go only.
 
 ## SCAN-ACCURACY (done 0.42.0)
