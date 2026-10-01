@@ -1,18 +1,12 @@
 """signal_verify.py — nothing reaches Burton on Signal unless every figure checks out.
 
-Every money figure in a Signal message must name its source and be recomputed
-independently from that source before send:
-  * broker  — Kalshi /portfolio/positions (Invested = open-position cost), re-read
-  * ledger  — forward_test_ledger.jsonl (Realized P&L, fee-incl.), re-read
-  * model   — labelled "Modeled EV — not profit", recomputed from its parts
-Checks: figure == independent recompute (half-cent), totals == sum of parts,
-counts match, sources fresh, and no 2-decimal figure in the text that no claim
-backs (catches hardcoded / guessed numbers). Any failure -> the figures are NOT
-sent; Burton gets one short "Report withheld (<kind>): <reason>" instead and the
-full discrepancy goes to data/signal/verify_log.jsonl (gitignored). Same message
-within its window is not re-sent (data/signal/sent_log.jsonl). Never raises.
-No orders, no keys, no gates touched — reporting only.
-(c) GOATWORTHY Post LLC
+Each money figure names its source and is recomputed independently before send:
+broker (Kalshi positions, re-read), ledger (forward_test_ledger realized, fee-incl.,
+re-read) or a labelled model. Checks: figure == recompute, totals == sum of parts,
+counts match, freshness, and no money figure the claims don't back (shared money
+detector below). Failure -> one "Report withheld (<kind>): <reason>" with no
+numbers; full discrepancy -> data/signal/verify_log.jsonl. Dedupe via sent_log.jsonl.
+Never raises. Reporting only: no orders, keys or gates. (c) GOATWORTHY Post LLC
 """
 import hashlib
 import json
@@ -28,6 +22,104 @@ MAX_LEN = 1400
 # 2-decimal money-like figures; skips version stamps (v0.74.1) and dotted ids.
 FIG_RE = re.compile(r"(?<![\w.])[+-]?\d[\d,]*\.\d{2}(?![.\d])")
 LOG_HINT = "see data/signal/verify_log.jsonl"
+LEDGER_STALE_OPEN_S = 36 * 3600   # no new ledger row for 36h while positions are open
+LEDGER_STALE_ANY_S = 7 * 86400    # no new ledger row for 7 days, positions or not
+
+# ── shared money detector: Signal text, LLM answers, legacy relays, ops alerts ──
+# Money line = money keyword, currency/% marker or signed decimal; every number on it
+# (any decimals, commas, k/m/b, sign) is a money figure. Dates/times/versions/IPs are
+# not. scripts/cron_runner.sh mirrors MONEY_WORDS in shell (keep in sync).
+MONEY_WORDS = ("profit", "profits", "p&l", "p/l", "pnl", "gain", "gains", "gained", "loss",
+               "losses", "lost", "net", "balance", "balances", "invested", "investment",
+               "equity", "realized", "unrealized", "payout", "payouts", "return", "returns",
+               "cash", "deployed", "made", "earned", "earnings", "earn", "value", "worth",
+               "usd", "usdc", "dollar", "dollars", "buck", "bucks", "cent", "cents", "ev")
+_WORD_RE = re.compile(r"(?<![a-z0-9_])(?:" + "|".join(re.escape(w) for w in MONEY_WORDS)
+                      + r")(?![a-z0-9_])", re.I)
+_MARK_RE = re.compile(r"[$€£¢%]|(?<![\w.])[+\-−]\s?\d[\d,]*\.\d")
+_NOISE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?"
+                       r"|(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)|v?\d+(?:\.\d+){2,}")
+NUM_RE = re.compile(r"(?<![\w.])[+\-−]?\s?[$€£]?\s?(\d[\d,]*(?:\.\d+)?|\.\d+)"
+                    r"(?:\s?(k|mm|m|bn|b)(?![a-z]))?(?![a-z\d])", re.I)
+_MULT = {"k": 1e3, "m": 1e6, "mm": 1e6, "b": 1e9, "bn": 1e9}
+VERIFIED_TAGS = ("[VERIFIED-BROKER]", "[VERIFIED-REALIZED]")
+_MODEL_WORDS = re.compile(r"model|expect|potential|if-win|payout|estimat|project|forecast", re.I)
+
+
+def _denoise(line):  # length-preserving, so token positions match the original line
+    return _NOISE_RE.sub(lambda m: " " * len(m.group(0)), str(line or ""))
+
+
+def _tokens(line, pos=False):
+    out = []
+    for m in NUM_RE.finditer(_denoise(line)):
+        v = _f(m.group(1).replace(",", "")) * _MULT.get((m.group(2) or "").lower(), 1.0)
+        out.append((m.group(0).strip(), abs(v), m.start(1)) if pos else (m.group(0).strip(), abs(v)))
+    return out
+
+
+def is_money_line(line):
+    clean = _denoise(line)
+    return bool(_WORD_RE.search(clean) or _MARK_RE.search(clean))
+
+
+def money_tokens(text):
+    """[(raw, abs value)] for every numeric token on a money line."""
+    return [t for line in str(text or "").splitlines() if is_money_line(line)
+            for t in _tokens(line)]
+
+
+def has_money(text):
+    return bool(money_tokens(text))
+
+
+def verified_figures(context, kind=None):
+    """$-figures on [VERIFIED-BROKER]/[VERIFIED-REALIZED] context lines only (kind:
+    "broker"|"realized" filters). Modeled/expected/payout lines never qualify."""
+    vals = []
+    for line in str(context or "").splitlines():
+        s = line.strip()
+        if s.startswith(VERIFIED_TAGS) and not _MODEL_WORDS.search(s) and (
+                kind is None or s.startswith(f"[VERIFIED-{kind.upper()}]")):
+            vals += [v for raw, v in _tokens(s) if "$" in raw]
+    return vals
+
+
+_KIND_W = {"none": r"unrealized|expect\w*|potential|model\w*|payout|if-win|estimat\w*|project\w*"
+                   r"|forecast\w*|ev",  # nothing verified may back these
+           "realized": r"profit\w*|p&l|p/l|pnl|gain\w*|loss\w*|lost|realized|net|made|earn\w*"
+                       r"|returns?",
+           "broker": r"cash|balances?|invested|investment|deployed|equity|value|worth"}
+_KIND_RE = {k: re.compile(r"(?<![a-z0-9_])(?:" + v + r")(?![a-z0-9_])", re.I)
+            for k, v in _KIND_W.items()}
+
+
+def ai_unverified(text, context):
+    """Money tokens in free (LLM) text that do not EXACTLY equal a verified context
+    figure of the kind named by the NEAREST money word on that line: profit/P&L ->
+    realized; cash/balance/invested -> broker; unrealized/expected/payout/EV ->
+    nothing; no kind word (bare $) -> either. Modeled figures never qualify."""
+    allow = {"realized": verified_figures(context, "realized"), "none": [],
+             "broker": verified_figures(context, "broker")}
+    bad = []
+    for line in str(text or "").splitlines():
+        if not is_money_line(line):
+            continue
+        clean = _denoise(line)
+        words = [(m.start(), k) for k, rx in _KIND_RE.items() for m in rx.finditer(clean)]
+        modeled_line = any(k == "none" for _, k in words)  # whole line: nothing verified
+        for raw, v, p in _tokens(line, pos=True):
+            if modeled_line:
+                ok = []
+            elif words:
+                d = min(abs(w - p) for w, _ in words)
+                kinds = {k for w, k in words if abs(w - p) == d}
+                ok = [] if "none" in kinds else sum((allow[k] for k in kinds), [])
+            else:
+                ok = allow["realized"] + allow["broker"]
+            if not any(abs(v - a) <= 1e-9 for a in ok):
+                bad.append(raw)
+    return bad
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -112,9 +204,24 @@ def broker_snapshot(get_positions=None, now=None):
         from kalshi_auth import get_positions  # network; never used in tests
     raw = get_positions() or {}
     rows = [p for p in (raw.get("market_positions") or []) if abs(_qty(p)) > 0]
+    vts = next((raw.get(k) for k in ("ts", "timestamp", "server_time", "as_of", "updated_time")
+                if raw.get(k)), None)  # the venue's own clock, when it sends one
     return {"invested": sum(_exposure(p) for p in rows), "n": len(rows),
             "tickers": sorted(p.get("ticker", "") for p in rows),
-            "ts": (now or utcnow()).isoformat()}
+            "ts": (now or utcnow()).isoformat(), "venue_ts": vts}
+
+
+def broker_fresh(snap, max_age_s=900):
+    """Freshness from the venue's own timestamp. None -> footer says time unknown."""
+    if snap.get("venue_ts") and parse_ts(snap["venue_ts"]):
+        return [fresh("broker", snap["venue_ts"], max_age_s)], f"broker {hhmm(snap['venue_ts'])}"
+    return [], f"broker time unknown (read {hhmm(snap['ts'])})"
+
+
+def ledger_latest(recs):
+    stamps = [parse_ts(r.get("logged_at") or r.get("ts")) for r in recs]
+    stamps = [t for t in stamps if t]
+    return max(stamps).astimezone(timezone.utc).isoformat() if stamps else None
 
 
 def read_ledger():
@@ -185,14 +292,14 @@ def fresh(name, ts, max_age_s, policy="withhold"):
 
 
 def unsourced_figures(text, claims, allowed=()):
+    """Money tokens (any line with a money keyword/marker) + any 2-decimal figure that
+    no claim backs (half-cent: display rounding) and no allowed figure EQUALS."""
     known = [abs(_f(c["reported"])) for c in claims if c.get("reported") is not None]
-    known += [abs(_f(a)) for a in allowed]
-    out = []
-    for m in FIG_RE.findall(text or ""):
-        v = abs(_f(m.replace(",", "")))
-        if not any(abs(v - k) <= CENT for k in known):
-            out.append(m)
-    return out
+    exact = [abs(_f(a)) for a in allowed]
+    toks = money_tokens(text) + [(m, abs(_f(m.replace(",", ""))))
+                                 for m in FIG_RE.findall(_NOISE_RE.sub(" ", text or ""))]
+    return [raw for raw, v in toks if not any(abs(v - k) <= CENT for k in known)
+            and not any(abs(v - a) <= 1e-9 for a in exact)]
 
 
 def evaluate(body, claims=(), freshness=(), now=None, allowed=()):
@@ -313,43 +420,10 @@ def withhold(kind, code, detail="", send_fn=None, now=None, dedupe_window_s=3600
 
 
 # ── senders' verified builders ──────────────────────────────────────────────
-def pnl_report(get_positions=None, ledger=None, send_fn=None, now=None):
-    """11pm P&L: Invested (broker) + Profit (ledger realized, fee-incl.)."""
-    kind, now = "11pm P&L", now or utcnow()
-    ledger = ledger or read_ledger
-    try:
-        recs, snap = ledger(), broker_snapshot(get_positions, now)
-        recs2, snap2 = ledger(), broker_snapshot(get_positions, now)  # independent re-reads
-    except Exception as e:
-        return withhold(kind, "source read failed", e, send_fn, now)
-    real, real2 = ledger_realized(recs), ledger_realized(recs2)
-    day, cut = now.astimezone().date(), now - timedelta(hours=24)  # cron is 11pm local
-    last = lambda rows: [s for s in rows  # noqa: E731 — settled in the last 24h
-                         if (parse_ts(s.get("logged_at") or s.get("ts")) or cut) > cut]
-    today, today2 = last(real["settlements"]), last(real2["settlements"])
-    t_pnl = sum(_f(s.get("realized_pnl_net")) for s in today)
-    body = (f"💰 Valedia P&L — {day:%b} {day.day}\n"
-            f"Invested: {snap['invested']:,.2f} (Kalshi open-position cost, broker)\n"
-            f"Profit: {real['total']:+,.2f} Realized (ledger, fee-incl.) "
-            f"{real['wins']}W/{real['losses']}L · last 24h {t_pnl:+,.2f}")
-    claims = [
-        claim("Invested", snap["invested"], snap2["invested"], "broker re-read"),
-        claim("open positions", snap["n"], snap2["n"], "broker re-read", tol=0),
-        claim("Profit", real["total"], real2["total"], "ledger re-read"),
-        sum_claim("Profit total", real["total"], real2["parts"]),
-        claim("Profit last 24h", t_pnl, sum(_f(s.get("realized_pnl_net")) for s in today2),
-              "ledger re-read"),
-        claim("wins", real["wins"], real2["wins"], "ledger re-read", tol=0),
-        claim("losses", real["losses"], real2["losses"], "ledger re-read", tol=0),
-    ]
-    notes, open_n = [], ledger_open_kalshi(recs2)
-    if open_n != snap2["n"]:
-        notes.append(f"ledger has {open_n} open Kalshi entries vs broker {snap2['n']} positions"
-                     " (not reconciled)")
-    return deliver(kind, body, claims, [fresh("broker", snap["ts"], 900)],
-                   footer=[f"ledger {real['rows']} settled rows", f"broker {hhmm(snap['ts'])}"],
-                   notes=notes, send_fn=send_fn, dedupe_key=f"pnl:{day}",
-                   dedupe_window_s=20 * 3600, now=now)
+def pnl_report(*a, **k):
+    """11pm P&L (Invested broker + Profit ledger). Lives in pnl_run.py."""
+    from pnl_run import pnl_report as _pnl
+    return _pnl(*a, **k)
 
 
 def invested_ping(executed, ledger=None, send_fn=None, now=None):
@@ -401,26 +475,19 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
                    dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
 
 
-# ── ops alerts (no figures): text-only, money numbers stripped ──────────────
-MONEY_RE = re.compile(r"[+-]?\$\s*\d[\d,]*(?:\.\d+)?|(?<![\w.])[+-]?\d[\d,]*\.\d{2}(?![.\d])")
-
-
+# ── ops alerts (no figures): text-only, money lines removed ─────────────────
 def strip_money(text):
-    """Replace anything that looks like a money figure with '[figure withheld]'.
-    Returns (clean_text, n_stripped). Ops alerts carry no verified money numbers."""
-    clean, n = MONEY_RE.subn("[figure withheld]", str(text or ""))
-    return clean, n
+    """Every line the shared detector flags -> '[figure withheld]'. (clean, n_lines)."""
+    lines = str(text or "").splitlines()
+    out = ["[figure withheld]" if is_money_line(l) and _tokens(l) else l for l in lines]
+    return "\n".join(out), sum(1 for a, b in zip(lines, out) if a != b)
 
 
 def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0):
-    """Ops/health alert (watchdog etc.): text only, money figures stripped + labelled,
-    logged to verify_log. Never raises. dedupe_window_s=0 -> every alert is sent."""
-    try:
-        clean, n = strip_money(body)
-        notes = [f"{n} money figure(s) removed; ops alerts carry no verified money numbers"] if n else []
-        return deliver(kind, clean, notes=notes, footer=["ops alert, no money figures"],
-                       send_fn=send_fn, now=now, dedupe_key=dedupe_key or clean,
-                       dedupe_window_s=dedupe_window_s, info={"stripped": n})
-    except Exception as e:
-        print(f"[signal_verify] {kind}: ops_alert error {type(e).__name__}: {e}", file=sys.stderr)
-        return {"kind": kind, "status": "error", "sent": False, "text": ""}
+    """Ops/health alert (watchdog etc.): text only, money lines removed, logged to
+    verify_log. Never raises (deliver never raises). dedupe_window_s=0 -> always sent."""
+    clean, n = strip_money(body)
+    notes = [f"{n} money line(s) removed; ops alerts carry no money figures"] if n else []
+    return deliver(kind, clean, notes=notes, footer=["ops alert, no money figures"],
+                   send_fn=send_fn, now=now, dedupe_key=dedupe_key or clean,
+                   dedupe_window_s=dedupe_window_s, info={"stripped": n})

@@ -41,6 +41,7 @@ NOPE = os.path.join(TMP, "missing.json")
 # tokens with the synthetic markers removed, standing in for the real radar feed.
 _FEED_DOC = {k: v for k, v in json.load(open(fre.DEFAULT_FIXTURE)).items() if k == "tokens"}
 _FEED_DOC["source"] = "fomo_radar_feed_test"
+_FEED_DOC["as_of"] = datetime.now(timezone.utc).isoformat()  # undated feeds are stale
 FIXTURE = os.path.join(TMP, "fomo_radar.json")
 with open(FIXTURE, "w") as _f:
     json.dump(_FEED_DOC, _f)
@@ -104,6 +105,17 @@ def test_fomo_absent_and_non_crypto():
     doc["as_of"] = (now - timedelta(hours=2)).isoformat()
     fresh = _write("fresh_fomo.json", doc)
     assert _facts("BTC", fomo=fresh, now=now)["facts"]["fomo_present"] is True
+    # an UNDATED feed cannot prove freshness -> ignored as stale
+    undated = _write("undated_fomo.json", {k: v for k, v in doc.items() if k != "as_of"})
+    r = _facts("BTC", fomo=undated, now=now)
+    assert not r["facts"]["fomo_present"] and r["sources"]["fomo"]["reason"] == "undated_stale", r
+    # prediction-market callers pass asset_class -> FOMO never looked up
+    r = _facts("BTC", fomo=fresh, now=now, asset_class="prediction")
+    assert not r["facts"]["fomo_present"] and r["sources"]["fomo"]["reason"] == "not_crypto", r
+    nw_src = open(os.path.join(HERE, "nimble_wiring.py")).read()
+    sp_src = open(os.path.join(HERE, "nimble_wiring_spot.py")).read()
+    assert "asset_class=_ASSET" in nw_src
+    assert sp_src.count("asset_class=cls)") == 2, "both spot informed_facts calls pass the class"
     # facts are booleans (Nimble state carries booleans only); fomo never joins conflict/risk
     f = _facts("SOL")["facts"]
     assert all(isinstance(v, bool) for v in f.values()), f

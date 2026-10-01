@@ -187,7 +187,7 @@ def gate(asset_class, symbol, row=None, *, source, side="buy", venue=None, label
         facts = code_facts if code_facts is not None else (
             nd.crypto_facts(row) if cls == "crypto" else nd.stock_facts(row))
         sym = norm_symbol(symbol, cls)
-        informed = inf.informed_facts(sym, side, news=news) if on else {}
+        informed = inf.informed_facts(sym, side, news=news, asset_class=cls) if on else {}
         if on:
             warm_once()
         return nd.decide_candidate(
@@ -329,7 +329,7 @@ def scan_rows(ranked, limits, *, post=None, get=None, clock=time.monotonic):
                 items.append({
                     "candidate": {"symbol": sym, "venue": "movers_scan"}, "side": "buy",
                     "code_facts": movers_facts(r, limits), "label": r.get("label"),
-                    "informed": inf.informed_facts(sym, "buy", news=news)})
+                    "informed": inf.informed_facts(sym, "buy", news=news, asset_class=cls)})
             out = nd.decide_many(
                 cls, items, source="movers_scan",
                 cap_s=max(0.0, cap - (clock() - t0)),

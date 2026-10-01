@@ -164,7 +164,7 @@ def gate(opp, informed=None, *, source, side=None, poly=False, label=None, news=
         facts = nd.prediction_facts(merged, poly=poly)
         import informed_facts as inf
         inf_facts = inf.informed_facts(_symbol(opp), side, direction=direction_for(opp, side),
-                                       news=news)
+                                       news=news, asset_class=_ASSET)
         code_label = label if label is not None else {"status": "admitted_by_code", "source": source}
         econ = economics if economics is not None else economics_for(opp, side)
         return nd.decide_candidate(_ASSET, cand, side=side, code_facts=facts, informed=inf_facts,

@@ -21,10 +21,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Run script and capture output
 OUTPUT=$(python3 "$SCRIPT" 2>&1)
 
-# Money guard: $ amounts, "USD 12", or any 2-decimal figure (version stamps and
-# dotted ids like v0.74.1 / 100.125.9.30 are not matched).
-MONEY_RE='(\$ *[0-9])|(USD *[0-9])|((^|[^0-9.])[+-]?[0-9][0-9,]*\.[0-9]{2}([^0-9.]|$))'
-if printf '%s\n' "$OUTPUT" | grep -Eq "$MONEY_RE"; then
+# Money guard (same rule as signal_verify's shared detector; MONEY_WORDS kept in
+# sync): ANY line that has a money keyword, a currency/percent marker or a signed
+# decimal AND any digit withholds the WHOLE message. Plus any 2-decimal figure
+# anywhere (version stamps / dotted ids like v0.74.1, 100.125.9.30 not matched).
+MONEY_WORDS='profit|profits|p&l|p/l|pnl|gain|gains|gained|loss|losses|lost|net|balance|balances|invested|investment|equity|realized|unrealized|payout|payouts|return|returns|cash|deployed|made|earned|earnings|earn|value|worth|usd|usdc|dollar|dollars|buck|bucks|cent|cents|ev'
+MONEY_LINE_RE="(^|[^[:alnum:]_])($MONEY_WORDS)([^[:alnum:]_]|\$)|\\\$|€|£|¢|%|(^|[^[:alnum:]_.])(\\+|-|−) ?[0-9][0-9,]*\\.[0-9]"
+MONEY_RE='((^|[^0-9.])[+-]?[0-9][0-9,]*\.[0-9]{2}([^0-9.]|$))'
+money_output() {
+    printf '%s\n' "$1" | grep -Ei -- "$MONEY_LINE_RE" | grep -q '[0-9]' && return 0
+    printf '%s\n' "$1" | grep -Eq -- "$MONEY_RE"
+}
+if money_output "$OUTPUT"; then
     echo "$OUTPUT"   # raw output stays in the cron log only
     SIGDIR="${VALEDIA_SIGNAL_DIR:-$HERE/../data/signal}"
     mkdir -p "$SIGDIR" 2>/dev/null

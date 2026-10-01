@@ -88,7 +88,8 @@ def test_pnl_report_figures_match_sources():
     # +2.50 - 1.25; unreconciled 9.99 and paper 5.00 excluded
     assert "Profit: +1.25 Realized (ledger, fee-incl.) 1W/1L · last 24h +2.50" in t, t
     assert "9.99" not in t and "5.00" not in t
-    assert "✓ verified: ledger 2 settled rows, broker 23:00 UTC" in t, t
+    assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 21:00 UTC, "
+            "broker time unknown (read 23:00 UTC)") in t, t
     assert "⚠" not in t  # ledger open (e5) == broker open (KXA)
     rec = _log(d)[-1]
     assert rec["status"] == "verified" and rec["sent"] is True
@@ -258,10 +259,12 @@ def test_alert_modeled_never_profit():
 
 def test_bridge_ai_answer_gated():
     _fresh_dir()
-    ctx = "ACCOUNT (broker): cash=$12.50 market value=$3.20 total=$15.70\nPAUSED: none"
+    ctx = ("[VERIFIED-BROKER] Kalshi cash $12.50; invested (open-position cost) $3.20; "
+           "1 open positions\n[INFO] PAUSED: none")
     send = Sender()
     ok = cb.gate_answer("q", "You have $12.50 cash.", ctx, send=True, send_fn=send, now=NOW)
-    assert ok["status"] == "verified" and "figures match broker/ledger context" in send.msgs[0]
+    assert ok["status"] == "verified", ok
+    assert "money figures match VERIFIED broker/ledger context" in send.msgs[0]
     bad = cb.gate_answer("q2", "Expected profit next week: $40.00", ctx, send=True,
                          send_fn=send, now=NOW)
     assert bad["status"] == "withheld" and "40.00" not in send.msgs[-1]
