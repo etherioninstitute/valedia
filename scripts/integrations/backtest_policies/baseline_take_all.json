@@ -1,0 +1,8 @@
+{
+  "name": "baseline_take_all",
+  "description": "Status quo reference: take every settled ledger trade at 1x.",
+  "min_edge": null,
+  "categories_allow": null,
+  "categories_block": [],
+  "size_mult": {}
+}
