@@ -1,6 +1,7 @@
 """Poly↔Kalshi paper/shadow arb. Allowlist fills; heuristic matches are review-only.
 
-Ornith must PASS (CE-1 shape) after the Kalshi taker fee. No venue order.
+Ornith must PASS (CE-1 shape) after the Kalshi taker fee. No venue order here; the gated
+live promotion is arb_live.py (VALEDIA_ARB_LIVE default OFF → paper only, unchanged).
 
   python3 vaughan_arb_paper.py          # fixture book, no network
   python3 vaughan_arb_paper.py --read   # GET via polymarket_client + kalshi_auth.get_markets
@@ -426,6 +427,10 @@ def run_scan(poly, kalshi, *, path=None, post_fn=None, equity=1000.0, env=None,
     rows = []
     for cand in sorted(cands, key=lambda c: c.get("edge_pct") or 0, reverse=True):
         row = decide(cand, state, limits=limits, env=env, post_fn=post_fn, timeout=timeout)
+        import arb_live  # gated live promotion (VALEDIA_ARB_LIVE default OFF → None, paper only)
+        live = arb_live.maybe_promote(cand, env=env)
+        if live is not None:
+            row["arb_live"] = live
         append_decision(row, path)
         rows.append(row)
         if row.get("filled"):

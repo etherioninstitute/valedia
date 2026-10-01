@@ -170,6 +170,8 @@ def scanner_alloc(ticker="ALLOC-SCAN", with_fv=True):
          "title": "macro", "side": "yes", "price": 0.80, "allocation": 4.0,
          "expected_profit": 0.5, "hours_to_resolve": 6, "raw": {"edge_score": 80}}
     a.update(_admitted_sports_opp())
+    # taker on a free-maker (maker_viable) series is now SKIP_TAKER_HURDLE: taker-priced series
+    a["fmap"] = {"ALLOC": __import__("kalshi_fee_map")._row("ALLOC", 1.0, 1.0, "sports")}
     if not with_fv:
         for k in FV_KEYS:
             a.pop(k, None)
