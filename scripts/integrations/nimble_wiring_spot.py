@@ -184,22 +184,22 @@ def gate(asset_class, symbol, row=None, *, source, side="buy", venue=None, label
 DCA_FEE_MAX_RT_PCT = 2.5
 
 
-def dca_row(venue, amount, *, score=None, prices=None, has_pos=None):
+def dca_row(venue, amount, *, score=None, prices=None):
     """Row for gate() built only from what a DCA decision actually knows. Unknown stays absent.
 
     score  -> fused: nd._spot_facts turns it into fused_strong with nd.FUSED_STRONG (same
               code threshold as unified_brain); None when the caller has no kernel score.
     prices -> q.p5 = p[-1]/p[-6]-1 (same formula as unified_brain.compute_signal_quality)
               -> trend_up_5d; absent when fewer than 7 closes.
-    has_pos-> already_held (a bool from balances / positions); None -> unknown.
+    already_held is deliberately NEVER set: DCA re-buys held names by design, and the spot
+    question lists "already held" as a skip red flag, so a True here would veto every
+    routine DCA buy. It stays None (unknown). The brain BUY path still passes has_pos.
     amount -> fee_ok from fee_engine static round trip vs DCA_FEE_MAX_RT_PCT.
     filter_passed, momentum_dominant, regime_risk_off are not known to DCA: left None.
     """
     row = {}
     if isinstance(score, (int, float)) and not isinstance(score, bool):
         row["fused"] = float(score)
-    if isinstance(has_pos, bool):
-        row["has_pos"] = has_pos
     try:
         import fee_engine
         rt = fee_engine.roundtrip_cost(venue, float(amount), use_static=True)

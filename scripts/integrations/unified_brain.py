@@ -999,12 +999,9 @@ def run_brain():
         )
         if cb and dca.should_buy() and cb_cash >= 5:
             _, cb_buy_fn, _, _ = cb
-            # Facts DCA actually knows: fee (static round trip) and held balance. No kernel
-            # score / price history here, so fused_strong / trend_up_5d stay unknown.
-            _rows = {pair: nws.dca_row(
-                "coinbase", dca.weekly_budget * w,
-                has_pos=float(cb_bal.get(pair.replace("-USD", ""), {}).get("balance", 0)) > 0.0001)
-                for pair, w in dca.assets.items()}
+            # Facts DCA actually knows: fee only (static round trip). No kernel score or price
+            # history here, and already_held is never sent for DCA (re-buying held names is the point).
+            _rows = {pair: nws.dca_row("coinbase", dca.weekly_budget * w) for pair, w in dca.assets.items()}
             for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca", rows=_rows),
                                   lambda: cb_cash, venue="coinbase"):
                 lines.append(f"  {da}"); actions += [da] if da.startswith("DCA: bought") else []

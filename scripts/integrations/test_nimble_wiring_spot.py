@@ -300,14 +300,15 @@ def test_dca_and_movers_facts_mapping():
     run_dca()
     by = {c["state"]["symbol"]: c["state"]["facts"] for c in post.calls}
     f = by["BTC-USD"]
-    assert (f["fused_strong"], f["fee_ok"], f["already_held"], f["trend_up_5d"]) == (True, True, False, True)
+    assert (f["fused_strong"], f["fee_ok"], f["trend_up_5d"]) == (True, True, True)
+    assert f["already_held"] is None  # DCA re-buys held names: never sent as a red flag
     assert f["filter_passed"] is None and f["momentum_dominant"] is None and f["regime_risk_off"] is None
-    assert by["SPY"]["fee_ok"] is True and by["SPY"]["already_held"] is None  # no alpaca position fn: unknown
+    assert by["SPY"]["fee_ok"] is True and by["SPY"]["already_held"] is None
     # unified_brain DCA: no kernel score or price history there -> fused_strong / trend None
     post = setup("shadow", post=Nim("skip"))
     run_brain({}, dca_due=True)
     f = post.calls[0]["state"]["facts"]
-    assert f["fee_ok"] is True and f["already_held"] is False
+    assert f["fee_ok"] is True and f["already_held"] is None
     assert f["fused_strong"] is None and f["trend_up_5d"] is None
     # dca_row units: score band uses the nd threshold; fee ceiling; short history
     assert nd._spot_facts(nws.dca_row("coinbase", 5, score=nd.FUSED_STRONG))["fused_strong"] is True
@@ -322,6 +323,12 @@ def test_dca_and_movers_facts_mapping():
     finally:
         nws.DCA_FEE_MAX_RT_PCT = real
     assert nd._spot_facts(nws.dca_row("coinbase", 5))["already_held"] is None
+    try:
+        nws.dca_row("coinbase", 5, has_pos=True)
+        raise AssertionError("dca_row must not accept has_pos")
+    except TypeError:
+        pass
+    # the brain BUY path still sends already_held (see test_unified_brain_buy_points)
     # movers: s1.facts names mapped to the spot names the question describes
     row = {"chg_24h": 20.0, "edge": 0.4, "quote_volume_usd": 5e9}
     m = nws.movers_facts(row, ak.LIMITS)
