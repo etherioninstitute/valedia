@@ -35,3 +35,4 @@ venv/
 tools/neural-trader/node_modules/
 
 data/systemone/*.jsonl
+data/calibration/

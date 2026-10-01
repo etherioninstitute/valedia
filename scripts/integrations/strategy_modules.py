@@ -37,34 +37,66 @@ class DCAEngine:
         last = datetime.fromisoformat(self.state["last_buy"])
         return (datetime.now(timezone.utc) - last).days >= 7
     
-    def execute(self, buy_func, balance_func):
-        """Execute DCA buys. Returns list of actions."""
+    @staticmethod
+    def _acked(result):
+        """True only when the venue accepted the order (success True, or an order id)."""
+        if not isinstance(result, dict) or result.get("error") or result.get("success") is False:
+            return False
+        return result.get("success") is True or bool(result.get("order_id") or result.get("id"))
+
+    @staticmethod
+    def _writer_ok(venue):
+        """Live spot buys need valedia_config.venue_writer(venue) == "valedia" (fail-closed)."""
+        try:
+            import nimble_wiring_spot as nws
+            return nws.venue_buy_allowed(venue)
+        except Exception:
+            return False
+
+    def execute(self, buy_func, balance_func, venue="coinbase"):
+        """Execute DCA buys. Returns list of actions.
+
+        last_buy advances only when at least one buy was ACKed by the venue. If every
+        asset was vetoed (SKIP_NIMBLE), venue-blocked or rejected, state is untouched
+        and the next scheduled run retries instead of waiting 7 days.
+        """
         if not self.should_buy():
             days_left = 7 - (datetime.now(timezone.utc) - datetime.fromisoformat(self.state["last_buy"])).days
             return [f"DCA: next buy in {days_left} days"]
-        
+
+        if not self._writer_ok(venue):
+            return [f"DCA: SKIP_VENUE_WRITER {venue} writer!=valedia"]
+
         available = balance_func()
         budget = min(self.weekly_budget, available * 0.5)
         if budget < 2:
             return ["DCA: insufficient funds"]
-        
+
         actions = []
+        acked = 0
         for pair, weight in self.assets.items():
             amount = round(budget * weight, 2)
             if amount < 1:
                 continue
             try:
                 result = buy_func(pair, amount)
-                actions.append(f"DCA: bought ${amount:.2f} {pair} -> {result.get('success', '?')}")
-                self.state["buys"].append({"ts": datetime.now(timezone.utc).isoformat(),
-                                           "pair": pair, "amount": amount})
+                if self._acked(result):
+                    acked += 1
+                    actions.append(f"DCA: bought ${amount:.2f} {pair} -> {result.get('success', '?')}")
+                    self.state["buys"].append({"ts": datetime.now(timezone.utc).isoformat(),
+                                               "pair": pair, "amount": amount})
+                else:
+                    actions.append(f"DCA: {pair} buy not acked -> {result}")
             except Exception as e:
                 actions.append(f"DCA: {pair} error: {e}")
-        
-        self.state["last_buy"] = datetime.now(timezone.utc).isoformat()
-        self.state["total_invested"] = sum(b["amount"] for b in self.state["buys"])
-        self.state["buys"] = self.state["buys"][-200:]
-        self._save()
+
+        if acked:
+            self.state["last_buy"] = datetime.now(timezone.utc).isoformat()
+            self.state["total_invested"] = sum(b["amount"] for b in self.state["buys"])
+            self.state["buys"] = self.state["buys"][-200:]
+            self._save()
+        else:
+            actions.append("DCA: no buy acked, last_buy unchanged, retry next run")
         return actions
 
 

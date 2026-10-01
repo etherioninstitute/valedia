@@ -148,6 +148,8 @@ def _write_decision(dec, *, path, pair, bar_ts, maker, taker, slip, snap, cash):
         dec, pair=pair, maker=maker, taker=taker, slip=slip,
         bar_ts=bar_ts, snap=snap, cash=cash,
     )
+    if dec.get("nimble") is not None:
+        row["nimble"] = dec["nimble"]  # verdict beside the Ornith reason in the paper decision row
     cp.append_decision(row, path)
     dec["decision_path"] = path
     return dec

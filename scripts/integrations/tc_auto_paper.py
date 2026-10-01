@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+import nimble_wiring_spot as nws
 import valedia_config as vc
 from crypto_paper import CLIP_FRAC, fee_usd, fill_px
 from fee_engine import STATIC_FEES
@@ -353,6 +354,16 @@ def decide(body: Any, book: dict, env: Optional[dict] = None) -> Tuple[int, dict
         spend = px * qty + fee
         if float(book["cash"]) + 1e-8 < spend:
             return _refuse(422, "insufficient_cash", journal=True)
+        # Last step before the paper fill: Nimble 2 verdict (shadow stamps; veto may skip the entry).
+        nv = nws.gate(kind, ticker, {"fee_check": {"pass": True}, "has_pos": ticker in book["positions"]},
+                      source="tc_auto_paper", venue=VENUE, label=strategy)
+        nws.stamp(base, nv)
+        if nws.blocked(nv):
+            base["band"], base["reason"] = "review_only", nws.SKIP
+            row = _fence(base)
+            book.setdefault("_journal", []).append(row)
+            return 200, {"ok": True, "create_order": False, "live": False, "filled": False,
+                         "decision": public_fields(row)}
         book["cash"] = float(book["cash"]) - spend
         book["fees_paid"] = float(book.get("fees_paid") or 0) + fee
         pos = book["positions"].get(ticker) or {"qty": 0.0, "cost_cash": 0.0}

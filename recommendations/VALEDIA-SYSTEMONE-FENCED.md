@@ -53,3 +53,7 @@ Keep Jev optional. Nimble stamps. It does not size and it does not send.
 - **Log:** one `decisions.jsonl` line per call, `source = nimble_decide:<source>`, `label = {code, mode, min_conf, informed_sources}`, so a review can compare the model with the code.
 - **Wired** (`nimble_wiring.gate`, last gate after the code admits): the prediction points are wired: `master_allocator.execute_allocations` (live Kalshi), `sports_evidence` (live sports; MiroFish team/series facts as the underlying), `weather_live.admit` (live weather), `poly_loop` (paper) and `vaughan_arb_paper` (paper). Mode default **shadow**; unset `VALEDIA_SYSTEMONE` on crons: zero behavior change.
 - Informed facts also carry offline FOMO-radar facts for crypto (`fomo_present`, `fomo_wallet_conviction_high`, `fomo_exit_signal`, `fomo_provenance_ok`). Annotate only; they never size.
+
+### Confidence semantics
+
+Nimble's `confidence` is 1 - normalized entropy of `probabilities`, not P(chosen action). Verified on Burton's Mac: buy 0.4765 / skip 0.5235 gives choice skip with confidence 0.00159. `nimble_decide` verdicts now also carry `p_action` (probability of the chosen action) and `p_buy`, read from `probabilities` (None when absent). The veto rule is unchanged: it still compares `confidence` to `VALEDIA_NIMBLE_MIN_CONF`; `p_buy` is recorded only.
