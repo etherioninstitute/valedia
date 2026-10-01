@@ -13,8 +13,8 @@ from .config import Config, ConfigError, load_config
 from .dashboard import Dashboard, PlainSink
 from .decision import Engine, load_engine, run_engine, validate_decision
 from .decision_engine import sanitize
-from .decision_log import DecisionLog, review_main
-from .executor import Executor, PaperExecutor
+from .decision_log import DecisionLog, read_records, review_main
+from .executor import DuplicatePoolError, Executor, PaperExecutor
 from .gates import evaluate_gates, first_failure
 from .state import QuoteUsd, build_state, split_roles
 from .stats import LatencyStats
@@ -25,10 +25,17 @@ class Bot:
     def __init__(self, cfg: Config, reader: ChainReader, executor: Executor, engine: Engine,
                  sink, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  decision_log: Optional[DecisionLog] = None,
-                 perf: Callable[[], float] = time.perf_counter):
+                 perf: Callable[[], float] = time.perf_counter, redecide: bool = False):
         self.cfg, self.reader, self.executor = cfg, reader, executor
         self.engine, self.sink, self._clock, self._perf = engine, sink, clock, perf
         self.log = decision_log
+        self.redecide = redecide
+        # Pools already decided (in an earlier run) are not decided again after a restart
+        # inside the lookback window, so the log keeps one line per decision. Records that
+        # ended in an engine error do not count: those are retried.
+        self.seen_pools = set() if (redecide or decision_log is None) else {
+            r["pool"] for r in read_records(decision_log.path)
+            if r.get("pool") and not (r.get("decision") or {}).get("error")}
         self.stats = LatencyStats(cfg.decision_latency_budget_ms)
         self.quote_usd = QuoteUsd(reader, cfg.quote_tokens)
         self.watcher = PoolWatcher(reader, cfg.lookback_blocks, cfg.max_block_range,
@@ -83,14 +90,21 @@ class Bot:
             self.stats.warm, self.stats.last_error = not decision["error"], decision["error"]
         final, gates = evaluate_gates(decision, state, self.cfg)
         position = None
+        has_pos = getattr(self.executor, "has_position", lambda pool: False)
+        if final == "buy" and has_pos(ev.pool):
+            final = "skip"
+            gates.append({"gate": "duplicate_pool", "value": ev.pool,
+                          "threshold": "no open position", "passed": False})
         if final == "buy":
             try:
                 position = self.executor.buy(ev.pool, state["token_address"],
                                              self.cfg.paper_size, entry)
             except Exception as e:  # noqa: BLE001 - executor failure must not kill the loop
                 final = "skip"
-                gates.append({"gate": "executor", "value": f"{type(e).__name__}: {e}",
+                gate = "duplicate_pool" if isinstance(e, DuplicatePoolError) else "executor"
+                gates.append({"gate": gate, "value": f"{type(e).__name__}: {e}",
                               "threshold": "no error", "passed": False})
+        self.seen_pools.add(ev.pool)
         self._log(ts, ev, state, decision, latency, within, gates, final, position)
         self.sink.decision({
             "pool": ev.pool, "action": decision["action"], "confidence": decision["confidence"],
@@ -134,6 +148,9 @@ class Bot:
         self.sink.status(f"head={self.watcher.last_head} scanned_to={self.watcher.last_block} "
                          f"new_pools={len(events)}")
         for ev in events:
+            if ev.pool in self.seen_pools:
+                self.sink.action(f"already decided, skipping pool {ev.pool} (use --redecide)")
+                continue
             try:
                 outcomes.append(self.process_event(ev))
             except Exception as e:  # noqa: BLE001 - one bad pool must not stop the loop
@@ -147,7 +164,8 @@ class Bot:
             sleep(self.cfg.poll_interval_seconds)
 
 
-def build_bot(cfg: Config, sink, transport=None, nimble_transport=None) -> Bot:
+def build_bot(cfg: Config, sink, transport=None, nimble_transport=None,
+              redecide: bool = False) -> Bot:
     reader = ChainReader(RpcClient(cfg.rpc_url, transport=transport), cfg.factory_address,
                          cfg.chain_id)
     engine = load_engine(cfg.decision_engine, cfg, nimble_transport)
@@ -155,7 +173,7 @@ def build_bot(cfg: Config, sink, transport=None, nimble_transport=None) -> Bot:
     if problem:
         raise ValueError(problem)
     return Bot(cfg, reader, PaperExecutor(cfg.positions_file), engine, sink,
-               decision_log=DecisionLog(cfg.decisions_log))
+               decision_log=DecisionLog(cfg.decisions_log), redecide=redecide)
 
 
 def _review(argv: List[str]) -> int:
@@ -175,23 +193,23 @@ def main(argv: Optional[List[str]] = None, transport=None, nimble_transport=None
         "Subcommand: 'review' reads the decision log."))
     ap.add_argument("--headless", action="store_true", help="plain lines instead of the TUI")
     ap.add_argument("--once", action="store_true", help="run a single poll iteration and exit")
+    ap.add_argument("--redecide", action="store_true",
+                    help="decide again on pools already in the decision log")
     ap.add_argument("--env-file", default=".env", help="path to .env (default: ./.env)")
     args = ap.parse_args(argv)
     try:
         cfg = load_config(env_file=args.env_file)
         sink = PlainSink() if args.headless else Dashboard()
-        bot = build_bot(cfg, sink, transport, nimble_transport)
+        bot = build_bot(cfg, sink, transport, nimble_transport, args.redecide)
         bot.reader.verify_chain()
     except (ConfigError, ValueError, ChainMismatchError, RpcError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     try:
         if isinstance(sink, Dashboard):
-            with sink:
+            with sink:  # Live prints its final frame on exit, so --once renders exactly once
                 bot.start()
                 bot.run_once() if args.once else bot.run_forever()
-            if args.once:
-                sink.console.print(sink.render())
         else:
             bot.start()
             bot.run_once() if args.once else bot.run_forever()

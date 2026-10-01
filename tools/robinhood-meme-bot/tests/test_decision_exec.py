@@ -95,7 +95,7 @@ def test_config_defaults_and_validation():
     assert cfg.chain_id == 4663 and cfg.rpc_url.endswith("chain.robinhood.com")
     assert cfg.factory_address == "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
     assert (cfg.min_liquidity_usd, cfg.min_confidence, cfg.max_risk_score) == (20000.0, 0.70, 4)
-    assert (cfg.decision_timeout_s, cfg.decision_latency_budget_ms) == (2.0, 500.0)
+    assert (cfg.decision_timeout_s, cfg.warmup_timeout_s) == (10.0, 120.0)
     assert cfg.nimble_url == "http://127.0.0.1:11434/v1/systemone" and cfg.nimble_model == "nimble2"
     assert cfg.nimble_allow_remote is False and cfg.decisions_log == "decisions.jsonl"
     a, b = "0x" + "ab" * 20, "0x" + "cd" * 20
@@ -114,12 +114,42 @@ def test_config_rejects_bad_values():
                          "FACTORY_ADDRESS": "0x12", "RPC_URL": "ftp://x",
                          "MAX_BLOCK_RANGE": "0", "DECISION_ENGINE": "nocolon",
                          "MAX_RISK_SCORE": "11", "MIN_LIQUIDITY_USD": "-1",
-                         "DECISION_TIMEOUT_S": "0", "NIMBLE_ALLOW_REMOTE": "maybe",
+                         "DECISION_TIMEOUT_S": "0", "WARMUP_TIMEOUT_S": "-5", "NIMBLE_ALLOW_REMOTE": "maybe",
                          "QUOTE_TOKENS": "0x12:USDC:stable", "NIMBLE_URL": "x"})
     msg = str(ei.value)
     for key in ("MIN_CONFIDENCE", "POLL_INTERVAL_SECONDS", "FACTORY_ADDRESS", "RPC_URL",
                 "MAX_BLOCK_RANGE", "DECISION_ENGINE", "MAX_RISK_SCORE", "MIN_LIQUIDITY_USD",
-                "DECISION_TIMEOUT_S", "NIMBLE_ALLOW_REMOTE", "QUOTE_TOKENS", "NIMBLE_URL"):
+                "DECISION_TIMEOUT_S", "WARMUP_TIMEOUT_S", "NIMBLE_ALLOW_REMOTE", "QUOTE_TOKENS", "NIMBLE_URL"):
         assert key in msg
     with pytest.raises(ConfigError):
         load_config(env={"QUOTE_TOKENS": f"{'0x' + 'ab' * 20}:USDC:pool"})  # pool needs address
+
+
+def test_paper_executor_restart_continues_ids_and_refuses_duplicate_pool(tmp_path):
+    from rh_meme_bot.executor import DuplicatePoolError
+    path = str(tmp_path / "pos.jsonl")
+    ex = PaperExecutor(path)
+    ex.buy("0xp1", "0xt1", 10.0, Decimal(1))
+    ex.buy("0xp2", "0xt2", 10.0, Decimal(2))
+    with open(path, "a") as fh:
+        fh.write("garbage line\n")
+    ex2 = PaperExecutor(path)  # simulated restart
+    assert [p.id for p in ex2.positions] == [1, 2]
+    assert ex2.has_position("0xp1") and not ex2.has_position("0xp3")
+    with pytest.raises(DuplicatePoolError):
+        ex2.buy("0xp1", "0xt1", 10.0, Decimal(1))
+    assert ex2.buy("0xp3", "0xt3", 10.0, Decimal(3)).id == 3
+    ids = [json.loads(x)["id"] for x in (tmp_path / "pos.jsonl").read_text().splitlines()
+           if x.startswith("{")]
+    assert ids == [1, 2, 3]
+
+
+def test_plugin_extra_keys_preserved_under_raw_and_invalid_output_kept():
+    dec, _ = validate_decision({"action": "buy", "confidence": 0.9, "why": "vibes",
+                                "scores": [1, 2]})
+    assert dec["raw"] == {"extra": {"why": "vibes", "scores": [1, 2]}}
+    dec, _ = validate_decision({"action": "buy", "confidence": 0.9, "raw": {"r": 1}, "x": 1})
+    assert dec["raw"] == {"raw": {"r": 1}, "extra": {"x": 1}}
+    dec, problem = validate_decision({"action": "moon", "confidence": 3, "note": "n"})
+    assert problem and "moon" in dec["raw"]["invalid_output"] and dec["action"] == "skip"
+    assert validate_decision({"action": "skip", "confidence": 0})[0]["raw"] is None

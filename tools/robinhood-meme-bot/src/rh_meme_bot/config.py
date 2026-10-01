@@ -42,7 +42,8 @@ class Config:
     nimble_model: str = "nimble2"
     nimble_keep_alive: str = "30m"
     nimble_allow_remote: bool = False
-    decision_timeout_s: float = 2.0
+    decision_timeout_s: float = 10.0  # hard cap per decision; exceeding it = skip
+    warmup_timeout_s: float = 120.0  # cold load of the 9B model
     decision_latency_budget_ms: float = 500.0
 
 
@@ -132,8 +133,10 @@ def parse_config(env: Mapping[str, str]) -> Config:
         nimble_model=(env.get("NIMBLE_MODEL") or "").strip() or "nimble2",
         nimble_keep_alive=(env.get("NIMBLE_KEEP_ALIVE") or "").strip() or "30m",
         nimble_allow_remote=_bool(env, "NIMBLE_ALLOW_REMOTE", errors),
-        decision_timeout_s=_parse(env, "DECISION_TIMEOUT_S", float, 2.0, errors,
+        decision_timeout_s=_parse(env, "DECISION_TIMEOUT_S", float, 10.0, errors,
                                   lo=0, lo_excl=True),
+        warmup_timeout_s=_parse(env, "WARMUP_TIMEOUT_S", float, 120.0, errors,
+                                lo=0, lo_excl=True),
         decision_latency_budget_ms=_parse(env, "DECISION_LATENCY_BUDGET_MS", float, 500.0,
                                           errors, lo=0, lo_excl=True),
     )
