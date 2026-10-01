@@ -235,20 +235,37 @@ def _read_raw_registry(path=None):
 
 
 def _pnl_net_stats():
-    """Fee-blind fallback from pnl_tracker.json (profit-cost). NET, not WR."""
+    """Fee-BLIND net from pnl_tracker.json (profit-cost). REPORT-ONLY.
+
+    Never feeds pause/unpause or should_trade_category: pnl_tracker.json has no
+    verified fees, so it cannot prove a category loses (or wins) real money.
+    """
     out = {}
     for strat, data in (load_pnl().get("summary") or {}).get("strategies", {}).items():
         n = int(data.get("wins", 0) or 0) + int(data.get("losses", 0) or 0)
         net = float(data.get("profit", 0) or 0) - float(data.get("cost", 0) or 0)
         out[_canon(strat)] = {
             "n": n, "wins": int(data.get("wins", 0) or 0),
-            "net": round(net, 2), "source": "pnl_tracker",
+            "net": round(net, 2), "source": "fee_blind", "report_only": True,
         }
     return out
 
 
+def _fee_blind_report():
+    """Labeled fee-blind figures for the registry/report. Fail-soft: [] on error."""
+    try:
+        return [dict(v, strategy=k) for k, v in sorted(_pnl_net_stats().items())]
+    except Exception:
+        return []
+
+
 def _merged_stats(stats=None):
-    """Prefer fee-true category_stats; fill gaps from pnl_tracker net (never WR)."""
+    """Fee-true category_stats ONLY — the sole input to pause/unpause.
+
+    Fee-blind net is never merged in (no gap-fill): a category with no fee-true
+    stats is "unproven" -> not paused (fail-open, like
+    forward_test_ledger.should_trade_category). Name kept for back-compat.
+    """
     fee = dict(stats) if stats is not None else _fee_true_stats()
     merged = {}
     for k, v in fee.items():
@@ -256,9 +273,6 @@ def _merged_stats(stats=None):
             "n": int(v.get("n") or 0), "wins": int(v.get("wins") or 0),
             "net": float(v.get("net") or 0), "source": "category_stats",
         }
-    for k, v in _pnl_net_stats().items():
-        if k not in merged:
-            merged[k] = v
     return merged
 
 
@@ -284,6 +298,7 @@ def load_pause_registry(path=None, now=None):
         "history": list(raw.get("history") or []),
         "updated": raw.get("updated"),
         "wr_report": list(raw.get("wr_report") or raw.get("details") or []),
+        "fee_blind_report": list(raw.get("fee_blind_report") or []),
         "blacklisted": [p.get("strategy") for p in live],
     }
 
@@ -312,6 +327,10 @@ def is_strategy_blacklisted(strategy_name):
 
 def update_strategy_blacklist(now=None, stats=None, path=None):
     """Write pause registry from fee-true NET. Report-only WR is stored, not fused.
+
+    ONLY fee-true category_stats may pause/unpause. Fee-blind pnl_tracker net is
+    stored as `fee_blind_report` (report_only) and never gates; no fee-true
+    stats (or a loader error) = unproven = not paused.
 
     Pause if n >= CATEGORY_MIN_TRADES and net < CATEGORY_BLOCK_NET.
     Do not extend existing until (cron must not turn TTL into a grave).
@@ -419,6 +438,7 @@ def update_strategy_blacklist(now=None, stats=None, path=None):
         "blacklisted": live_names,  # currently paused only; expired omitted
         "updated": now.isoformat(),
         "wr_report": wr_report,  # informational — not a fuse
+        "fee_blind_report": _fee_blind_report(),  # report_only — never gates
         "rule": ("pause on fee-true net (n>=min, net<0); TTL "
                  f"{ttl}d + probation; evidence net>=0 unpauses; never WR"),
     }
