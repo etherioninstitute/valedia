@@ -158,8 +158,12 @@ def test_decide_parses_and_fail_open():
 
 
 def test_model_pin_nimble2_only():
-    for tag in ("nimble2", "NIMBLE2", "nimble2:latest", "nimble2:q4_k_m", "nimble:9b-v2",
-                "nimble:v2", "nimble:2", "nimble:2b", "hf.co/bespokelabs/Bespoke-Nimble-9B-v2",
+    for tag in ("nimble2", "NIMBLE2", "nimble2:latest", "nimble2:q4_k_m", "nimble2:fp16",
+                "nimble:9b-v2", "nimble:v2", "nimble:2", "nimble:2-q4_k_m", "nimble:v2-q8_0",
+                "nimble:9b-v2-fp16", "NIMBLE:9B-V2-Q4_K_M",
+                "Bespoke-Nimble-9B-v2", "bespoke-nimble-9b-v2", "bespoke-nimble-9b-v2:latest",
+                "bespokelabs/Bespoke-Nimble-9B-v2",
+                "hf.co/bespokelabs/Bespoke-Nimble-9B-v2",
                 "hf.co/bespokelabs/Bespoke-Nimble-9B-v2:Q4_K_M",
                 "HF.CO/BESPOKELABS/BESPOKE-NIMBLE-9B-V2:latest"):
         assert sc.is_nimble2(tag), tag
@@ -176,9 +180,15 @@ def test_model_pin_nimble2_only():
             os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     # v1, Tev, look-alikes, and empty are refused and never posted.
     for tag in ("nimble", "nimble:9b", "nimble:latest", "NIMBLE:9B", "nimble:1", "nimble3",
-                "nimble2x", "tev1:4b", "tev1:0.8b", "nimble2:0.8b", "nimble:v2-0.8b",
-                "hf.co/bespokelabs/Bespoke-Nimble-9B", "hf.co/other/Bespoke-Nimble-9B-v2",
-                "qwen3:8b", ""):
+                "nimble2x", "nimble:2b", "nimble:2b-v1", "nimble:20b", "nimble:2x",
+                "nimble:2-", "nimble:2-notaquant", "nimble:v2-v1", "nimble:9b-v2-0.8b",
+                "nimble2:v1", "nimble2:q4-v1", "nimble:v1", "nimble:9b-v1", "nimble:1-q4_k_m",
+                "tev1:4b", "tev1:0.8b", "nimble2:0.8b", "nimble:v2-0.8b", "tev-nimble2",
+                "bespoke-nimble-9b", "bespoke-nimble-9b-v1", "bespoke-nimble-9b-v2-gguf",
+                "bespoke-nimble-9b-v2:v1", "hf.co/bespokelabs/Bespoke-Nimble-9B",
+                "hf.co/other/Bespoke-Nimble-9B-v2", "someone/Bespoke-Nimble-9B-v2",
+                "hf.co/bespokelabs/Bespoke-Nimble-9B-v2-GGUF", "evil.com/bespokelabs/bespoke-nimble-9b-v2",
+                "nimble2:", "qwen3:8b", ""):
         assert not sc.is_nimble2(tag), tag
         os.environ["VALEDIA_SYSTEMONE_MODEL"] = tag
         try:
