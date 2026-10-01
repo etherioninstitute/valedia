@@ -228,7 +228,18 @@ def admit_bet(b, r, build):
     """Evidence → price check → allocator chain → fee-true edge, for one bet.
 
     (preflight, price_cents) on admit; (None, price_cents|None) with r marked SKIP_*.
+    Fail-closed like the allocator's EV-preflight except: any exception escaping the
+    pre-create sequence (clock, informed, …) → SKIP_PRECREATE_ERROR, no order, the
+    cron loop continues.
     """
+    try:
+        return _admit(b, r, build)
+    except Exception as e:
+        _skip(r, 'SKIP_PRECREATE_ERROR', [f"{type(e).__name__}: {str(e)[:80]}"])
+        return None, None
+
+
+def _admit(b, r, build):
     try:
         opp, evidence = build(b)
     except Exception as e:
