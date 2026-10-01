@@ -67,36 +67,19 @@ class DCAEngine:
             print(f"[DCAEngine] ledger booking failed for {pair}: {e}", file=sys.stderr)
             return None
 
-    # Ambiguous POST: marker saved BEFORE each buy, cleared on a definitive answer; a leftover is
-    # resolved via read-only recent_buy_orders: found → booked; none → retry; unknown → skip.
-    NOT_PLACED = ("NimbleSkip", "VenueWriterSkip", "HaltedError")  # raised before any POST
-
+    # Ambiguous POST guard (dca_pending): marker saved BEFORE each buy, cleared only on a
+    # definitive answer (ack / explicit rejection / pre-POST refusal). 5xx, timeouts and
+    # unclear bodies keep it; the next due run checks the venue's recent orders first.
     def _record_buy(self, pair, amount, result, venue, book):
         self.state["buys"].append({"ts": datetime.now(timezone.utc).isoformat(),
                                    "pair": pair, "amount": amount})
         self._book(book, venue, pair, result)
 
-    def _resolve_pending(self, venue, lookup, book):
-        pend, found, skip, acts = self.state.get("pending") or {}, 0, set(), []
-        mod = {"coinbase": "coinbase_trader", "alpaca": "alpaca_executor"}.get(venue)
-        fn = lookup or (mod and (lambda pr, t: __import__(mod).recent_buy_orders(pr, t)))
-        for pair, p in list(pend.items()):
-            since = datetime.fromisoformat(p["ts"]) - timedelta(seconds=120)  # clock skew
-            try:
-                orders = fn(pair, since.strftime("%Y-%m-%dT%H:%M:%SZ")) if fn else None
-            except Exception:
-                orders = None
-            if orders is None:
-                skip.add(pair); acts.append(f"DCA: {pair} previous attempt unresolved (venue lookup failed); not re-buying")
-            elif pend.pop(pair) and orders:
-                self._record_buy(pair, p["amount"], dict(orders[0], success=True, pair=pair), venue, book)
-                found += 1; acts.append(f"DCA: {pair} previous attempt found ({orders[0].get('order_id')}) -> booked, not re-bought")
-        if found and self.should_buy():  # an ack (same rule as below) advances the week
-            self.state["last_buy"] = datetime.now(timezone.utc).isoformat()
-            self.state["total_invested"] = sum(b["amount"] for b in self.state["buys"])
-        if acts:
-            self._save()
-        return skip, acts
+    def _advance(self):
+        self.state["last_buy"] = datetime.now(timezone.utc).isoformat()
+        self.state["total_invested"] = sum(b["amount"] for b in self.state["buys"])
+        self.state["buys"] = self.state["buys"][-200:]
+        self._save()
 
     def execute(self, buy_func, balance_func, venue="coinbase", book=None, lookup=None):
         """Execute DCA buys. Returns list of actions.
@@ -107,24 +90,27 @@ class DCAEngine:
         Every acked buy is booked once in the fee-true ledger (book(pair, result), or
         spot_ledger.book_buy as DCA_CRYPTO/DCA_EQUITY when book is None).
         """
-        unresolved, pend_acts = self._resolve_pending(venue, lookup, book)
+        import dca_pending as dp
         if not self.should_buy():
             days_left = 7 - (datetime.now(timezone.utc) - datetime.fromisoformat(self.state["last_buy"])).days
-            return [f"DCA: next buy in {days_left} days"] + pend_acts
+            return [f"DCA: next buy in {days_left} days"]
 
         if not self._writer_ok(venue):
             return [f"DCA: SKIP_VENUE_WRITER {venue} writer!=valedia"]
 
+        skip, found, pend_acts = dp.resolve(self, venue, lookup, book)
         available = balance_func()
         budget = min(self.weekly_budget, available * 0.5)
         if budget < 2:
-            return ["DCA: insufficient funds"]
+            if found:
+                self._advance()
+            return ["DCA: insufficient funds"] + pend_acts
 
-        actions, acked = list(pend_acts), 0
+        actions, acked = list(pend_acts), found
         pending = self.state.setdefault("pending", {})
         for pair, weight in self.assets.items():
             amount = round(budget * weight, 2)
-            if amount < 1 or pair in unresolved:
+            if amount < 1 or pair in skip:
                 continue
             pending[pair] = {"ts": datetime.now(timezone.utc).isoformat(), "amount": amount}
             try:
@@ -135,25 +121,22 @@ class DCAEngine:
                 continue
             try:
                 result = buy_func(pair, amount)
-                pending.pop(pair, None)  # a response is definitive (acked or refused)
-                if self._acked(result):
-                    acked += 1
-                    actions.append(f"DCA: bought ${amount:.2f} {pair} -> {result.get('success', '?')}")
-                    self._record_buy(pair, amount, result, venue, book)
-                else:
-                    actions.append(f"DCA: {pair} buy not acked -> {result}")
+                how = dp.outcome(result, acked=self._acked(result))
             except Exception as e:
-                if type(e).__name__ in self.NOT_PLACED:
-                    pending.pop(pair, None)
-                    actions.append(f"DCA: {pair} error: {e}")
-                else:  # ambiguous (timeout/transport): keep marker, venue lookup before any retry
-                    actions.append(f"DCA: {pair} ambiguous error, checking venue before retry: {e}")
+                result, how = e, dp.outcome(exc=e)
+            if how != "ambiguous":
+                pending.pop(pair, None)
+            if how == "acked":
+                acked += 1
+                actions.append(f"DCA: bought ${amount:.2f} {pair} -> {result.get('success', '?')}")
+                self._record_buy(pair, amount, result, venue, book)
+            elif how == "refused":
+                actions.append(f"DCA: {pair} buy not acked -> {result}")
+            else:  # may have executed: keep the marker, venue lookup before any retry
+                actions.append(f"DCA: {pair} ambiguous ({str(result)[:120]}), checking venue before retry")
 
         if acked:
-            self.state["last_buy"] = datetime.now(timezone.utc).isoformat()
-            self.state["total_invested"] = sum(b["amount"] for b in self.state["buys"])
-            self.state["buys"] = self.state["buys"][-200:]
-            self._save()
+            self._advance()
         else:
             actions.append("DCA: no buy acked, last_buy unchanged, retry next run")
             try:

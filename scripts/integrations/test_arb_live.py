@@ -28,9 +28,13 @@ TMP = tempfile.mkdtemp(prefix="arb_live_")
 REPORT = os.path.join(TMP, "backtest_arb.json")
 
 
-def _report(verdict="PASS", category="ARB", age_s=0, generated=True, name="ARB_candidate"):
+def _report(verdict="PASS", category="ARB", age_s=0, generated=True, name="ARB_candidate",
+            base=None, cand=None, policies=None):
     doc = {"tool": "backtest_gate", "verdict": verdict, "category": category,
-           "candidate": {"name": name}}
+           "baseline": base or {"name": "ARB_baseline", "n_taken": 40, "net": 1.0},
+           "candidate": cand or {"name": name, "n_taken": 35, "net": 3.0}}
+    if policies is not None:
+        doc["policies"] = policies
     if generated:
         doc["generated_at"] = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
     with open(REPORT, "w") as f:
@@ -199,6 +203,50 @@ def test_leg2_failure_cancels_leg1_and_hedges():
                        hedge_fn=lambda t, s, n: hedged.append((t, s, n)) or {"ok": True})
     assert row["status"] == "LEG2_FAILED_LEG1_HEDGED" and "poly refused" in row["error"], row
     assert k.cancels == ["k1"] and hedged == [(row["kalshi_ticker"], "no", row["k_qty"])]
+
+
+def test_backtest_self_comparison_refused():
+    for kw in (dict(base={"name": "same", "net": 1.0}, cand={"name": "same", "net": 2.0}),
+               dict(base={"name": "b", "n_taken": 40, "net": 1.0},
+                    cand={"name": "c", "n_taken": 40, "net": 1.0}),
+               dict(policies={"baseline": {"name": "b", "min_edge": 0.02},
+                              "candidate": {"name": "c", "min_edge": 0.02}})):
+        _report(**kw)
+        row, k, _p, _ = _go()
+        assert row["reason"] == "backtest_self_compare" and not k.orders, (kw, row)
+    _report(policies={"baseline": {"name": "b", "min_edge": 0.02},
+                      "candidate": {"name": "c", "min_edge": 0.03}})
+    row, _k, _p, _ = _go()
+    assert row["status"] == "BOTH_FILLED", row
+
+
+def test_leg1_fill_unknown_counts_exposure_and_alerts():
+    _report()
+
+    class NoFields(FakeKalshi):
+        def create_order(self, ticker, side, n, price_cents, order_type="limit", informed=None):
+            self.orders.append((ticker, side, n, price_cents, order_type))
+            return {"order": {"order_id": "k1", "status": "resting"}}  # IOC ack, no fill fields
+
+        def get_fills(self):
+            raise OSError("fills endpoint down")
+    row, k, p, _ = _go(k=NoFields())
+    assert row["status"] == "LEG1_UNKNOWN" and row["filled"] is True and row["alert"] is True, row
+    assert row["exposure_unknown"] and row["possible_contracts"] == k.orders[0][2]
+    assert k.cancels == ["k1"] and not p.orders, "cancel attempted, no leg 2"
+    assert json.loads(open(LAST["log"]).readlines()[-1])["status"] == "LEG1_UNKNOWN"
+
+
+def test_poly_fill_unknown_always_alerts_even_when_hedged():
+    _report()
+    hedged = []
+    row, k, p, _ = _go(p=FakePoly(read_fails=True),
+                       hedge_fn=lambda t, s, n: hedged.append(n) or {"ok": True})
+    assert row["status"] == "LEG2_FAILED_LEG1_HEDGED" and hedged == [row["k_qty"]], row
+    assert row["poly_fill_unknown"] is True and row["alert"] is True, row
+    row, k, p, _ = _go(p=FakePoly(fills=False), hedge_fn=lambda t, s, n: {"ok": True})
+    assert row["status"] == "LEG2_FAILED_LEG1_HEDGED" and row["poly_fill_unknown"] is False
+    assert row["alert"] is False, "a CONFIRMED zero Poly fill that is fully hedged needs no alert"
 
 
 def test_leg1_unfilled_places_nothing_else():

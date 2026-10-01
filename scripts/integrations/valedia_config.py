@@ -682,7 +682,7 @@ def _risk_factor():
     """Live risk scalar from latest_etherion_risk.json risk_level: NORMAL 1.0 .. HALT 0.0.
     Defensive — any error returns 1.0 (neutral)."""
     try:
-        lvl = str(_json.load(open(_os.path.join(_MODELS, "latest_etherion_risk.json"))).get("risk_level", "NORMAL")).upper()
+        lvl = str(_json.load(open(_os.path.join(_MODELS, "latest_etherion_risk.json"))).get("risk_level", "NORMAL")).strip().upper()
         return {"NORMAL": 1.0, "CAUTION": 0.6, "ELEVATED": 0.5, "WARNING": 0.25, "HALT": 0.0, "DANGER": 0.0}.get(lvl, 1.0)
     except Exception:
         return 1.0

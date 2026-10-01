@@ -109,7 +109,12 @@ def market_buy(symbol, notional=None, qty=None):
     else:
         return {"error": "Need notional or qty"}
     r = requests.post(f"{_base()}/v2/orders", headers=_headers(), json=order, timeout=10)
-    return r.json()
+    if r.status_code >= 500 or r.status_code == 408:  # order may exist → ambiguous, look it up
+        return {"error": r.text[:300], "http_status": r.status_code, "ambiguous": True}
+    body = r.json()
+    if not r.ok and isinstance(body, dict):  # 4xx with a body: explicit Alpaca rejection
+        body.update(http_status=r.status_code, rejected=True)
+    return body
 
 def market_sell(symbol, qty=None, pct=100):
     """Sell stock. qty=None sells all. pct=50 sells half."""
