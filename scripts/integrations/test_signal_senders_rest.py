@@ -140,22 +140,45 @@ def test_executor_alert_broker_failure_withholds_never_crashes():
 def test_watchdog_text_only_no_money():
     d = _fresh_dir()
     send = Sender()
-    r = watchdog.alert("WATCHDOG ALERT\nCron log is 130 min stale (>2h)\nPnL $24.94 and +3.10",
-                       send_fn=send)
+    r = watchdog.alert("WATCHDOG ALERT\nPnL $24.94 and +3.10", send_fn=send,
+                       code_lines=["Cron log is 130 min stale (>2h)"])
     assert r["sent"] is True and len(send.msgs) == 1
     t = send.msgs[0]
-    assert "24.94" not in t and "3.10" not in t and "$" not in t, t
-    assert "[figure withheld]" in t and "130 min stale" in t, t
+    assert "24.94" not in t and "3.10" not in t, t
+    assert "PnL $[n] and +[n]" in t and "Cron log is 130 min stale (>2h)" in t, t
     assert "ops alert, no money figures" in t
     assert _log(d)[-1]["kind"] == "watchdog"
+    # numbers in free text never survive, even if they look like an age
+    t2 = sv.ops_alert("watchdog", "Cron log is 130 min stale", send_fn=send)["text"]
+    assert "130" not in t2 and "[n] min stale" in t2, t2
     # figure-free alert is untouched and still sent every time (no dedupe)
     for _ in range(2):
         sv.ops_alert("watchdog", "WATCHDOG ALERT\nCron log does not exist", send_fn=send)
-    assert len(send.msgs) == 3
+    assert len(send.msgs) == 4
     # transport failure and relay trap never raise
     assert sv.ops_alert("watchdog", "x", send_fn=lambda m: 1 / 0)["sent"] is False
     watchdog.alert("WATCHDOG ALERT\nx $5.00")  # default _ssh_send -> booby-trapped subprocess
-    assert sv.strip_money("v0.74.1 ip 100.125.9.30 up 12 min")[1] == 0
+    # check(): the stale-age line is code-built (int minutes), file names are scrubbed
+    import time as _t
+    tmp = tempfile.mkdtemp(prefix="wd_")
+    log, scripts = os.path.join(tmp, "cron.log"), os.path.join(tmp, "scripts")
+    os.makedirs(scripts)
+    open(log, "w").write("x")
+    os.utime(log, (_t.time() - 3 * 3600, _t.time() - 3 * 3600))
+    bad = os.path.join(scripts, "profit_12.sh")
+    open(bad, "w").write("#!/bin/sh\n")
+    os.chmod(bad, 0o644)
+    saved = (watchdog.LOG, watchdog.RUNNER, watchdog.os.path.expanduser)
+    real_exp = os.path.expanduser
+    watchdog.LOG, watchdog.RUNNER = log, os.path.join(tmp, "missing.sh")
+    watchdog.os.path.expanduser = lambda p: scripts if p.endswith("/workspace/scripts") else real_exp(p)
+    send = Sender()
+    try:
+        watchdog.check(send_fn=send)
+    finally:
+        watchdog.LOG, watchdog.RUNNER, watchdog.os.path.expanduser = saved
+    t = send.msgs[0]
+    assert "Cron log is 180 min stale (>2h)" in t and "Fixed: profit_[n].sh was not executable" in t, t
 
 
 def _run_sh(script, args, bins, env_extra=None):
@@ -170,6 +193,7 @@ def _run_sh(script, args, bins, env_extra=None):
         os.chmod(p, 0o755)
     env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
                VALEDIA_SIGNAL_DIR=os.path.join(d, "sig"), OPENCLAW_ENV=os.path.join(d, "none"),
+               CRON_LOG=os.path.join(d, "cron.log"),
                **(env_extra or {}))
     r = subprocess.run(["bash", os.path.join(SCRIPTS, script)] + args, env=env,
                        capture_output=True, text=True, timeout=30)
@@ -180,24 +204,28 @@ def _run_sh(script, args, bins, env_extra=None):
 _OPENCLAW = 'printf "%s\\n" "$*" >> @CALLS@\n'
 
 
-def test_cron_runner_refuses_money_figures():
+def test_cron_runner_sends_only_fixed_lines():
     d0 = tempfile.mkdtemp(prefix="sigsh_s_")
     money = os.path.join(d0, "money.py")
     ops = os.path.join(d0, "ops.py")
+    fail = os.path.join(d0, "fail.py")
     open(money, "w").write('print("Profit today: $24.94 (+3.10) on 5 bets")\n')
     open(ops, "w").write('print("scan ok v0.74.1 host 100.125.9.30 12 markets")\n')
+    open(fail, "w").write('import sys\nprint("lost twelve dollars"); sys.exit(1)\n')
     r, sent, d = _run_sh("cron_runner.sh", [money, "PNL"], {"openclaw": _OPENCLAW})
     assert r.returncode == 0, r.stderr
-    assert "Report withheld (legacy cron_runner)" in sent, sent
-    assert "24.94" not in sent and "3.10" not in sent and "$" not in sent, sent
-    rec = json.loads(open(os.path.join(d, "sig", "verify_log.jsonl")).read().splitlines()[-1])
-    assert rec["status"] == "withheld" and rec["sent"] is False
+    assert sent.strip().endswith("--message Valedia job PNL finished OK"), sent
+    assert "24.94" in open(os.path.join(d, "cron.log")).read()  # raw output: log only
     r, sent, d = _run_sh("cron_runner.sh", [ops, "SCAN"], {"openclaw": _OPENCLAW})
-    assert "scan ok v0.74.1 host 100.125.9.30 12 markets" in sent, sent  # figure-free relays
-    assert "withheld" not in sent
+    assert "scan ok" not in sent and "Valedia job SCAN finished OK" in sent, sent
+    r, sent, d = _run_sh("cron_runner.sh", [fail, "P&L $12 run-7"], {"openclaw": _OPENCLAW})
+    assert sent.strip().endswith("--message Valedia job PL  run- FAILED (see cron log)"), sent
+    assert not any(c.isdigit() for c in sent.split("--message", 1)[1]), sent
 
 
-_NIMROD_GATED = "AI answer (Claude, not a ledger report):\nYou have $12.50 cash.\n✓ verified: figures match broker/ledger context, 23:00 UTC"
+_NIMROD_GATED = ("AI answer (Claude; any numbers it wrote are shown as [n]):\nYou have [n] cash.\n\n"
+                 "Facts (code-generated; broker read twice, ledger read twice):\nCash (broker): $12.50\n"
+                 "✓ figures from broker/ledger only")
 
 
 def test_claude_router_relays_only_gated_text():
@@ -211,7 +239,8 @@ def test_claude_router_relays_only_gated_text():
     # structurally gated bridge output (header sha + exit 0) is relayed
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
                          {"ssh": ssh(gated("verified", _NIMROD_GATED)), "openclaw": _OPENCLAW})
-    assert "✓ verified" in sent and "12.50" in sent and "VALEDIA-GATE" not in sent, sent
+    assert "✓ figures from broker/ledger only" in sent and "12.50" in sent, sent
+    assert "VALEDIA-GATE" not in sent
     assert "VALEDIA-GATE" not in r.stdout and "12.50" in r.stdout
     # a single withheld notice (exit 3) is relayed
     wh = "Report withheld (AI answer): figure(s) with no named source. Unverified figures not sent; see data/signal/verify_log.jsonl."
@@ -258,6 +287,6 @@ if __name__ == "__main__":
     test_executor_alert_verified_modeled_fenced_excluded()
     test_executor_alert_broker_failure_withholds_never_crashes()
     test_watchdog_text_only_no_money()
-    test_cron_runner_refuses_money_figures()
+    test_cron_runner_sends_only_fixed_lines()
     test_claude_router_relays_only_gated_text()
     print("signal_senders_rest: PASS")

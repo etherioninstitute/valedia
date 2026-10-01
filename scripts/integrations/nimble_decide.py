@@ -448,7 +448,7 @@ def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None,
             return _no_call(mode, False, "engine_disabled")
         if informed is None:
             sym = build_state(cls, candidate, side, {}, {})["symbol"]
-            informed = inf.informed_facts(sym, side)
+            informed = inf.informed_facts(sym, side, asset_class=cls)
         inf_facts = informed.get("facts") if isinstance(informed, dict) else None
         state = build_state(cls, candidate, side, code_facts, inf_facts)
         warm(post=post, get=get)

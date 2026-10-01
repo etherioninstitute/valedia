@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,8 +43,6 @@ _NOISE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)
 NUM_RE = re.compile(r"(?<![\w.])[+\-−]?\s?[$€£]?\s?(\d[\d,]*(?:\.\d+)?|\.\d+)"
                     r"(?:\s?(k|mm|m|bn|b)(?![a-z]))?(?![a-z\d])", re.I)
 _MULT = {"k": 1e3, "m": 1e6, "mm": 1e6, "b": 1e9, "bn": 1e9}
-VERIFIED_TAGS = ("[VERIFIED-BROKER]", "[VERIFIED-REALIZED]")
-_MODEL_WORDS = re.compile(r"model|expect|potential|if-win|payout|estimat|project|forecast", re.I)
 
 
 def _denoise(line):  # length-preserving, so token positions match the original line
@@ -73,53 +72,50 @@ def has_money(text):
     return bool(money_tokens(text))
 
 
-def verified_figures(context, kind=None):
-    """$-figures on [VERIFIED-BROKER]/[VERIFIED-REALIZED] context lines only (kind:
-    "broker"|"realized" filters). Modeled/expected/payout lines never qualify."""
-    vals = []
-    for line in str(context or "").splitlines():
-        s = line.strip()
-        if s.startswith(VERIFIED_TAGS) and not _MODEL_WORDS.search(s) and (
-                kind is None or s.startswith(f"[VERIFIED-{kind.upper()}]")):
-            vals += [v for raw, v in _tokens(s) if "$" in raw]
-    return vals
+# ── number scrubber (free text: LLM answers, ops alerts) ──────────────────────
+# By construction, not by blacklist: after NFKC + dropping format/zero-width chars,
+# EVERY numeric character (any Unicode digit, superscript, fraction, CJK/roman
+# numeral) and every number word becomes "[n]". Figures then come only from code.
+_NUM_WORDS = ("zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen"
+              "|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty"
+              "|fourty|fifty|sixty|seventy|eighty|ninety|hundreds?|thousands?|millions?"
+              "|billions?|trillions?|grand|half|halves|dozens?|quarter|quarters|k|bn|mm")
+_WORDNUM_RE = re.compile(r"(?<![^\W\d_])(?:" + _NUM_WORDS + r")(?![^\W\d_])", re.I)
+_ROMAN_RE = re.compile(r"(?<![^\W\d_])(?=[MDCLXVI]{2,}(?![^\W\d_]))M{0,3}(?:CM|CD|D?C{0,3})"
+                       r"(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})(?![^\W\d_])")
+_RUN_RE = re.compile(r"0(?:[.,'’_\u00a0\u202f ]?0)*(?:[eE][+-]?0+)?(?:(?:k|mm|m|bn|b)(?![^\W\d_]))?")
 
 
-_KIND_W = {"none": r"unrealized|expect\w*|potential|model\w*|payout|if-win|estimat\w*|project\w*"
-                   r"|forecast\w*|ev",  # nothing verified may back these
-           "realized": r"profit\w*|p&l|p/l|pnl|gain\w*|loss\w*|lost|realized|net|made|earn\w*"
-                       r"|returns?",
-           "broker": r"cash|balances?|invested|investment|deployed|equity|value|worth"}
-_KIND_RE = {k: re.compile(r"(?<![a-z0-9_])(?:" + v + r")(?![a-z0-9_])", re.I)
-            for k, v in _KIND_W.items()}
+def _is_num(c):
+    return unicodedata.numeric(c, None) is not None
 
 
-def ai_unverified(text, context):
-    """Money tokens in free (LLM) text that do not EXACTLY equal a verified context
-    figure of the kind named by the NEAREST money word on that line: profit/P&L ->
-    realized; cash/balance/invested -> broker; unrealized/expected/payout/EV ->
-    nothing; no kind word (bare $) -> either. Modeled figures never qualify."""
-    allow = {"realized": verified_figures(context, "realized"), "none": [],
-             "broker": verified_figures(context, "broker")}
-    bad = []
-    for line in str(text or "").splitlines():
-        if not is_money_line(line):
-            continue
-        clean = _denoise(line)
-        words = [(m.start(), k) for k, rx in _KIND_RE.items() for m in rx.finditer(clean)]
-        modeled_line = any(k == "none" for _, k in words)  # whole line: nothing verified
-        for raw, v, p in _tokens(line, pos=True):
-            if modeled_line:
-                ok = []
-            elif words:
-                d = min(abs(w - p) for w, _ in words)
-                kinds = {k for w, k in words if abs(w - p) == d}
-                ok = [] if "none" in kinds else sum((allow[k] for k in kinds), [])
-            else:
-                ok = allow["realized"] + allow["broker"]
-            if not any(abs(v - a) <= 1e-9 for a in ok):
-                bad.append(raw)
-    return bad
+# Latin look-alikes (Cyrillic/Greek) folded before number-word matching.
+_CONFUSABLE = str.maketrans("аеорсухіјѕкмтнвАЕОРСУХІЈЅКМТНВοαειкνтυΟΑΕΙΚΝΤΥΒΗΜΡΧΖ",
+                            "aeopcyxijskmtHBAEOPCYXIJSKMTHBoaeikvtuOAEIKNTYBHMPXZ")
+
+
+def scrub_numbers(text):
+    """(clean, n): every numeral / number word -> "[n]". clean has no numeric char."""
+    t = "".join("0" if _is_num(c) else c for c in str(text or ""))  # Ⅻ, ½, 十 before NFKC
+    t = unicodedata.normalize("NFKC", t)
+    t = t.replace("\u2028", "\n").replace("\u2029", "\n")
+    t = "".join(c for c in t if unicodedata.category(c) != "Cf").translate(_CONFUSABLE)
+    marked = "".join("0" if _is_num(c) else c for c in t)
+    out, n, last = [], 0, 0
+    for m in _RUN_RE.finditer(marked):  # numeric runs incl. separators/exponent/k-m-b
+        out.append(t[last:m.start()] + "[n]")
+        last, n = m.end(), n + 1
+    t = "".join(out) + t[last:]
+    t, k = _WORDNUM_RE.subn("[n]", t)
+    t, r = _ROMAN_RE.subn("[n]", t)
+    k += r
+    t = "".join("[n]" if _is_num(c) else c for c in t)  # belt and braces
+    return t, n + k
+
+
+def has_numerals(text):
+    return any(_is_num(c) for c in unicodedata.normalize("NFKC", str(text or "")))
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -353,7 +349,7 @@ def _dedupe_hit(key, window_s, now):
 
 def deliver(kind, body, claims=(), freshness=(), footer=(), notes=(), send_fn=None,
             dedupe_key=None, dedupe_window_s=3600, now=None, allowed=(), info=None,
-            problems=(), transport=True):
+            problems=(), transport=True, verified_line=None):
     """Verify, then send the verified body OR a single withheld notice. Never raises.
     transport=False: verify + log only (caller prints/relays res["text"])."""
     now = now or utcnow()
@@ -372,7 +368,7 @@ def deliver(kind, body, claims=(), freshness=(), footer=(), notes=(), send_fn=No
         else:
             head = [f"⚠ STALE: {s['name']} data is {s['age']} old" for s in ev["stale"]]
             tail = [f"⚠ {n}" for n in notes]
-            ver = "✓ verified: " + ", ".join(footer) if footer else "✓ verified"
+            ver = verified_line or ("✓ verified: " + ", ".join(footer) if footer else "✓ verified")
             text = "\n".join(head + [body.strip()[:MAX_LEN]] + tail + [ver])
             status = "verified"
             key_src = f"{kind}|verified|{dedupe_key or body}"
@@ -475,19 +471,20 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
                    dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
 
 
-# ── ops alerts (no figures): text-only, money lines removed ─────────────────
+# ── ops alerts (no figures): free text scrubbed, code-built lines kept ─────
 def strip_money(text):
-    """Every line the shared detector flags -> '[figure withheld]'. (clean, n_lines)."""
-    lines = str(text or "").splitlines()
-    out = ["[figure withheld]" if is_money_line(l) and _tokens(l) else l for l in lines]
-    return "\n".join(out), sum(1 for a, b in zip(lines, out) if a != b)
+    """Back-compat name: (clean, n) from scrub_numbers — no numeral survives."""
+    return scrub_numbers(text)
 
 
-def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0):
-    """Ops/health alert (watchdog etc.): text only, money lines removed, logged to
-    verify_log. Never raises (deliver never raises). dedupe_window_s=0 -> always sent."""
-    clean, n = strip_money(body)
-    notes = [f"{n} money line(s) removed; ops alerts carry no money figures"] if n else []
-    return deliver(kind, clean, notes=notes, footer=["ops alert, no money figures"],
-                   send_fn=send_fn, now=now, dedupe_key=dedupe_key or clean,
-                   dedupe_window_s=dedupe_window_s, info={"stripped": n})
+def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0,
+              code_lines=()):
+    """Ops/health alert (watchdog etc.). `body` is free text: every numeral / number
+    word -> [n]. `code_lines` are built by the caller's code from ints it computed
+    (e.g. an age in minutes) and are kept verbatim. Never raises."""
+    clean, n = scrub_numbers(body)
+    text = "\n".join([clean] + [str(l) for l in code_lines])
+    notes = ["numbers in free text replaced by [n]; ops alerts carry no money"] if n else []
+    return deliver(kind, text, notes=notes, footer=["ops alert, no money figures"],
+                   send_fn=send_fn, now=now, dedupe_key=dedupe_key or text,
+                   dedupe_window_s=dedupe_window_s, info={"scrubbed": n})

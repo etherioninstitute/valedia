@@ -1,13 +1,15 @@
 #!/bin/bash
 # Abundance Agent — Master Cron Runner (VPS LEGACY)
-# Sources env, runs the specified script, sends result via Signal.
+# Sources env, runs the specified script, logs its output, pings Signal.
 #
-# LEGACY / UNVERIFIED PATH: this runner relays RAW script output, which cannot be
-# checked against broker/ledger. It therefore REFUSES to send money figures:
-# if the output contains any ($N, N.NN) it sends only a withheld notice (no
-# figures) and logs to data/signal/verify_log.jsonl. Money reports go through
-# signal_verify (pnl_run.py, settle_run.py, kalshi_alert.py, sports_engine.py).
-# Figure-free ops text is still relayed as before.
+# LEGACY PATH — NEVER FORWARDS SCRIPT OUTPUT TO SIGNAL. Raw output cannot be
+# verified against broker/ledger, so it stays in the cron log only
+# (stdout + ${CRON_LOG:-/root/.openclaw/logs/valedia-cron.log}). Signal gets ONE
+# fixed, code-built line with no figures:
+#   "Valedia job <LABEL> finished OK"   or   "Valedia job <LABEL> FAILED (see cron log)"
+# <LABEL> is reduced to letters, spaces, '_' and '-' (no digits, no symbols).
+# Money reports go through signal_verify (pnl_run.py, settle_run.py,
+# kalshi_alert.py, sports_engine.py) — never through this runner.
 
 set -a
 [ -f "${OPENCLAW_ENV:-/root/.openclaw/.env}" ] && source "${OPENCLAW_ENV:-/root/.openclaw/.env}"
@@ -16,36 +18,22 @@ set +a
 SCRIPT="$1"
 LABEL="$2"
 TARGET="uuid:47bd6dd5-2c96-4514-9541-acd8ed013612"
-HERE="$(cd "$(dirname "$0")" && pwd)"
+LOG="${CRON_LOG:-/root/.openclaw/logs/valedia-cron.log}"
 
-# Run script and capture output
+# Run script and capture output (log only)
 OUTPUT=$(python3 "$SCRIPT" 2>&1)
+RC=$?
+echo "$OUTPUT"
+{ mkdir -p "$(dirname "$LOG")" && printf '[%s] %s rc=%s\n%s\n---\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$LABEL" "$RC" "$OUTPUT" >> "$LOG"; } 2>/dev/null || true
 
-# Money guard (same rule as signal_verify's shared detector; MONEY_WORDS kept in
-# sync): ANY line that has a money keyword, a currency/percent marker or a signed
-# decimal AND any digit withholds the WHOLE message. Plus any 2-decimal figure
-# anywhere (version stamps / dotted ids like v0.74.1, 100.125.9.30 not matched).
-MONEY_WORDS='profit|profits|p&l|p/l|pnl|gain|gains|gained|loss|losses|lost|net|balance|balances|invested|investment|equity|realized|unrealized|payout|payouts|return|returns|cash|deployed|made|earned|earnings|earn|value|worth|usd|usdc|dollar|dollars|buck|bucks|cent|cents|ev'
-MONEY_LINE_RE="(^|[^[:alnum:]_])($MONEY_WORDS)([^[:alnum:]_]|\$)|\\\$|€|£|¢|%|(^|[^[:alnum:]_.])(\\+|-|−) ?[0-9][0-9,]*\\.[0-9]"
-MONEY_RE='((^|[^0-9.])[+-]?[0-9][0-9,]*\.[0-9]{2}([^0-9.]|$))'
-money_output() {
-    printf '%s\n' "$1" | grep -Ei -- "$MONEY_LINE_RE" | grep -q '[0-9]' && return 0
-    printf '%s\n' "$1" | grep -Eq -- "$MONEY_RE"
-}
-if money_output "$OUTPUT"; then
-    echo "$OUTPUT"   # raw output stays in the cron log only
-    SIGDIR="${VALEDIA_SIGNAL_DIR:-$HERE/../data/signal}"
-    mkdir -p "$SIGDIR" 2>/dev/null
-    LABEL="$LABEL" SCRIPT="$SCRIPT" python3 -c '
-import json, os, sys, datetime
-rec = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-       "kind": "cron_runner legacy", "status": "withheld", "sent": False,
-       "problems": [{"code": "legacy cron_runner.sh output carries money figures (unverifiable)",
-                     "detail": os.environ.get("SCRIPT", "")}],
-       "label": os.environ.get("LABEL", "")}
-sys.stdout.write(json.dumps(rec) + "\n")' >> "$SIGDIR/verify_log.jsonl" 2>/dev/null || true
-    OUTPUT="Report withheld (legacy cron_runner): script output carries money figures this path cannot verify. Unverified figures not sent; see data/signal/verify_log.jsonl."
+SAFE_LABEL=$(printf '%s' "$LABEL" | LC_ALL=C tr -cd 'A-Za-z _-' | head -c 40)
+[ -z "$SAFE_LABEL" ] && SAFE_LABEL="job"
+if [ "$RC" -eq 0 ]; then
+    MSG="Valedia job $SAFE_LABEL finished OK"
+else
+    MSG="Valedia job $SAFE_LABEL FAILED (see cron log)"
 fi
 
-# Send to Signal
-openclaw message send --channel signal --target "$TARGET" --message "[$LABEL] $OUTPUT" 2>&1 | tail -1
+# Send to Signal (fixed line only)
+openclaw message send --channel signal --target "$TARGET" --message "$MSG" 2>&1 | tail -1

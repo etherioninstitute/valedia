@@ -259,17 +259,19 @@ def test_alert_modeled_never_profit():
 
 def test_bridge_ai_answer_gated():
     _fresh_dir()
-    ctx = ("[VERIFIED-BROKER] Kalshi cash $12.50; invested (open-position cost) $3.20; "
-           "1 open positions\n[INFO] PAUSED: none")
+    facts = {"broker": {"cash": (12.5, 12.5), "invested": (3.2, 3.2), "n": (1, 1)},
+             "ledger": None, "why": {"ledger": "ledger STALE (no recent rows)"}}
     send = Sender()
-    ok = cb.gate_answer("q", "You have $12.50 cash.", ctx, send=True, send_fn=send, now=NOW)
+    ok = cb.gate_answer("q", "You have $12.50 cash.", facts, send=True, send_fn=send, now=NOW)
     assert ok["status"] == "verified", ok
-    assert "money figures match VERIFIED broker/ledger context" in send.msgs[0]
-    bad = cb.gate_answer("q2", "Expected profit next week: $40.00", ctx, send=True,
+    t = send.msgs[0]
+    assert "You have $[n] cash." in t and "Cash (broker): $12.50" in t, t
+    assert "Realized P&L omitted — ledger STALE" in t and t.endswith("✓ figures from broker/ledger only")
+    exp = cb.gate_answer("q2", "Expected profit next week: $40.00", facts, send=True,
                          send_fn=send, now=NOW)
-    assert bad["status"] == "withheld" and "40.00" not in send.msgs[-1]
-    local = cb.gate_answer("q3", "MLB lost $24.94", ctx, send=False, now=NOW)
-    assert local["status"] == "withheld" and local["sent"] is False and len(send.msgs) == 2
+    assert exp["status"] == "verified" and "40.00" not in send.msgs[-1], send.msgs[-1]
+    local = cb.gate_answer("q3", "MLB lost $24.94", facts, send=False, now=NOW)
+    assert local["sent"] is False and "24.94" not in local["text"] and len(send.msgs) == 2
 
 
 def test_btc_day_date_guard():
