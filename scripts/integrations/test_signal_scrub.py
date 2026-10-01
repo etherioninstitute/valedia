@@ -197,9 +197,9 @@ def _facts():
             "ledger": {"total": (-5.0, -5.0), "wins": (2, 2), "losses": (3, 3)}, "why": {}}
 
 
-FACT_LINES = ["Facts (code-generated; each source read twice):", "Cash (broker): $250.00",
-              "Open-position cost (broker): $40.00", "Open positions (broker): 3",
-              "Realized P&L (ledger, fee-incl.): −$5.00 (2W/3L)"]
+FACT_LINES = ["Facts (code-generated; each source read twice):", "Cash (Kalshi, broker): $250.00",
+              "Open-position cost (Kalshi, broker): $40.00", "Open positions (Kalshi, broker): 3",
+              "Realized P&L (ledger, all venues, fee-incl.): −$5.00 (2W/3L)"]
 
 
 class Sender(rest.Sender):
@@ -224,7 +224,7 @@ def test_signal_body_is_facts_plus_fixed_line_only():
     send = Sender()
     cb.gate_answer("bad", "You made $124 profit", bad, send=True, send_fn=send, now=NOW)
     assert "124" not in send.msgs[0] and "profit" not in send.msgs[0].lower(), send.msgs
-    assert "Cash (broker): omitted — unavailable" in send.msgs[0]
+    assert "Cash (Kalshi, broker): omitted — unavailable" in send.msgs[0]
 
 
 def test_bridge_stdout_router_mode_keeps_model_text_off_relay():
@@ -299,7 +299,7 @@ def test_router_question_injection_and_apostrophes():
     ssh2 = "cat <<'EOF'\n" + cb.gate_header("verified", big) + "\n" + big + "\nEOF\nexit 0\n"
     r, sent, _ = rest._run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
                               {"ssh": ssh2, "openclaw": rest._OPENCLAW})
-    assert "Realized P&L (ledger, fee-incl.): −USD 5.00 (2W/3L)" in sent and "é" * 900 in sent, sent
+    assert "Realized P&L (ledger, all venues, fee-incl.): −USD 5.00 (2W/3L)" in sent and "é" * 900 in sent, sent
 
 
 def test_cron_runner_only_fixed_lines_for_every_string():

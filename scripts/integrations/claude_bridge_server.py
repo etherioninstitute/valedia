@@ -9,6 +9,11 @@ Listens on port 7878 (Tailscale only — not exposed to internet).
 POST /ask
   {"question": "...", "model": "sonnet|opus", "with_data": true}
 
+LOCAL ONLY — NOT FOR SIGNAL. "response" is free model text and cannot be verified;
+it must never be relayed to Signal. For Signal use "signal_safe_text": the gated
+facts-only message (claude_bridge.gate_answer: code-built broker/ledger facts + the
+fixed "AI answer not sent to Signal" line), or claude_router.sh / --router.
+
 (c) GOATWORTHY Post LLC
 """
 import http.server, json, subprocess, os, sys, threading
@@ -51,8 +56,8 @@ class ClaudeBridgeHandler(http.server.BaseHTTPRequestHandler):
         # Add system context
         full_prompt = (
             "You are Valedia, an autonomous trading intelligence. "
-            "Answer concisely with numbers first. Be direct and quantitative. "
-            "Keep response under 1200 chars for Signal delivery.\n\n"
+            "Answer concisely. Be direct. This answer is shown LOCALLY only — "
+            "it is not sent to Signal (Signal gets verified broker/ledger facts only).\n\n"
             + full_prompt
         )
 
@@ -71,7 +76,15 @@ class ClaudeBridgeHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             response_text = f"Error: {str(e)}"
         
-        resp = json.dumps({"response": response_text, "model": model, "ts": datetime.now(timezone.utc).isoformat()})
+        try:  # the only Signal-safe text: code-built facts + fixed line, never model wording
+            import claude_bridge as cb
+            gated = cb.gate_answer(question, response_text, cb.verified_facts(), send=False)
+            signal_safe = gated["text"] if gated["status"] in ("verified", "withheld") else None
+        except Exception:
+            signal_safe = None
+        resp = json.dumps({"response": response_text, "local_only": True, "not_for_signal": True,
+                           "signal_safe_text": signal_safe, "model": model,
+                           "ts": datetime.now(timezone.utc).isoformat()})
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()

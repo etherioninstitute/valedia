@@ -19,7 +19,7 @@ def _fenced(ke, o):
         return bool(ke._cfg is not None and ke._cfg.live_exec_fenced(o.get("strategy"),
                                                                      ticker=o.get("ticker")))
     except Exception:
-        return False
+        return True  # fence unreadable -> fail closed: the pick is excluded
 
 
 def _req(x, what):

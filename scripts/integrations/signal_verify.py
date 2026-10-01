@@ -19,20 +19,18 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CENT = 0.005 + 1e-9
-MAX_LEN = 1400
+MAX_LEN = 1400  # chars of body kept in a verified message
 # 2-decimal money-like figures; skips version stamps (v0.74.1) and dotted ids.
 FIG_RE = re.compile(r"(?<![\w.])[+-]?\d[\d,]*\.\d{2}(?![.\d])")
-LOG_HINT = "see data/signal/verify_log.jsonl"
 LEDGER_STALE_OPEN_S = 36 * 3600   # no new ledger row for 36h while positions are open
 LEDGER_STALE_ANY_S = 7 * 86400    # no new ledger row for 7 days, positions or not
 
 # ── money detector for code-built pings: any number on a line with a money word,
 # currency/% marker or signed decimal must be backed by a claim. Dates/times/versions/IPs skipped.
-MONEY_WORDS = ("profit", "profits", "p&l", "p/l", "pnl", "gain", "gains", "gained", "loss",
-               "losses", "lost", "net", "balance", "balances", "invested", "investment",
-               "equity", "realized", "unrealized", "payout", "payouts", "return", "returns",
-               "cash", "deployed", "made", "earned", "earnings", "earn", "value", "worth",
-               "usd", "usdc", "dollar", "dollars", "buck", "bucks", "cent", "cents", "ev")
+MONEY_WORDS = tuple("profit profits p&l p/l pnl gain gains gained loss losses lost net balance balances "
+                    "invested investment equity realized unrealized payout payouts return returns cash "
+                    "deployed made earned earnings earn value worth usd usdc dollar dollars buck bucks "
+                    "cent cents ev".split())
 _WORD_RE = re.compile(r"(?<![a-z0-9_])(?:" + "|".join(re.escape(w) for w in MONEY_WORDS)
                       + r")(?![a-z0-9_])", re.I)
 _MARK_RE = re.compile(r"[$€£¢%]|(?<![\w.])[+\-−]\s?\d[\d,]*\.\d")
@@ -64,10 +62,8 @@ def money_tokens(text):
             for t in _tokens(line)]
 
 
-# ── number scrubber (free text: LLM answers, ops alerts) ──────────────────────
-# By construction, not by blacklist: after NFKC + dropping format/zero-width chars,
-# EVERY numeric character (any Unicode digit, superscript, fraction, CJK/roman
-# numeral) and every number word becomes "[n]". Figures then come only from code.
+# ── number scrubber (ops alert free text): after NFKC + dropping format chars, every
+# numeric char (any script, superscript, fraction, CJK/roman) and number word -> "[n]".
 _NUM_WORDS = ("zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen"
               "|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty"
               "|fourty|fifty|sixty|seventy|eighty|ninety|hundreds?|thousands?|millions?"
@@ -96,13 +92,8 @@ def scrub_numbers(text):
     t = "".join(out) + t[last:]
     t, k = _WORDNUM_RE.subn("[n]", t)
     t, r = _ROMAN_RE.subn("[n]", t)
-    k += r
     t = "".join("[n]" if _is_num(c) else c for c in t)  # belt and braces
-    return t, n + k
-
-
-def has_numerals(text):
-    return any(_is_num(c) for c in unicodedata.normalize("NFKC", str(text or "")))
+    return t, n + k + r
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -136,9 +127,8 @@ def hhmm(ts):
 
 def _append(name, rec):
     try:
-        d = signal_dir()
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, name), "a") as f:
+        os.makedirs(signal_dir(), exist_ok=True)
+        with open(os.path.join(signal_dir(), name), "a") as f:
             f.write(json.dumps(rec, default=str) + "\n")
     except Exception as e:
         print(f"[signal_verify] could not write {name}: {e}", file=sys.stderr)
@@ -177,9 +167,8 @@ def num(x):
 
 def won_flag(v):
     """Explicit win flag: True/False, or the strings "true"/"false". Else None (bad)."""
-    if isinstance(v, bool) or not isinstance(v, str):
-        return v if isinstance(v, bool) else None
-    return {"true": True, "false": False}.get(v.strip().lower())
+    s = {"true": True, "false": False}.get(v.strip().lower()) if isinstance(v, str) else v
+    return s if isinstance(s, bool) else None
 
 
 def money(v, signed=False):
@@ -190,6 +179,12 @@ def money(v, signed=False):
     if d == 0:
         return body
     return ("−" if v < 0 else ("+" if signed else "")) + body
+
+
+def dsum(values):
+    """Exact decimal sum of ledger/broker floats (Decimal(str(x))), then one float for
+    money(): no binary drift before the single half-away rounding."""
+    return float(sum((Decimal(str(v)) for v in values), Decimal("0")))
 
 
 # ── independent source readers ──────────────────────────────────────────────
@@ -224,13 +219,20 @@ def broker_snapshot(get_positions=None, now=None):
         raise ValueError("positions payload missing market_positions")
     if raw.get("incomplete") or raw.get("cursor"):  # more pages exist -> counts incomplete
         raise ValueError("positions incomplete (pagination)")
+    keyed = {}
+    for p in raw["market_positions"]:  # duplicates (paging): identical collapse, conflicting -> invalid
+        k = (p.get("ticker"), p.get("side")) if isinstance(p, dict) else None
+        if k in keyed and keyed[k] != p:
+            raise ValueError("positions incomplete (conflicting duplicate rows)")
+        keyed[k] = p
+    raw = dict(raw, market_positions=list(keyed.values()))
     rows = [p for p in raw["market_positions"] if abs(_qty(p)) > 0]
     if any(_qty(p) == 0 and (num(p.get("market_exposure_dollars")) or num(p.get("market_exposure")))
            for p in raw["market_positions"]):
         raise ValueError("position size zero with exposure (inconsistent)")
     vts = next((raw.get(k) for k in ("ts", "timestamp", "server_time", "as_of", "updated_time")
                 if raw.get(k) not in (None, "")), None)  # the venue's own clock, if sent
-    return {"invested": sum(_exposure(p) for p in rows), "n": len(rows),
+    return {"invested": dsum(_exposure(p) for p in rows), "n": len(rows),
             "tickers": sorted(p.get("ticker", "") for p in rows),
             "ts": (now or utcnow()).isoformat(), "venue_ts": vts}
 
@@ -296,7 +298,7 @@ def ledger_realized(recs):
         rows.append(s)
     parts = [num(s.get("realized_pnl_net")) for s in rows]
     wins = sum(1 for s in rows if won_flag(s.get("won")))
-    return {"rows": len(rows), "settlements": rows, "parts": parts, "total": sum(parts),
+    return {"rows": len(rows), "settlements": rows, "parts": parts, "total": dsum(parts),
             "wins": wins, "losses": len(rows) - wins, "bad": bad}
 
 
@@ -316,15 +318,15 @@ def ledger_order_cost(recs, order_ids):
         if e.get("type") == "entry" and e.get("order_id") in want and not _non_real(
                 e.get("source")) and not _unrec(e):
             by_id.setdefault(e.get("order_id"), e)
-    rows, cost, bad = list(by_id.values()), 0.0, 0
+    rows, cost, bad = list(by_id.values()), Decimal("0"), 0
     for e in rows:
         p, c, f = num(e.get("entry_price")), num(e.get("contracts")), num(e.get("entry_fee"))
         if p is None or c is None or f is None or not (0 < p <= 1) or c <= 0 or f < 0:
             bad += 1
         else:
-            cost += p * c + f
+            cost += Decimal(str(p)) * Decimal(str(c)) + Decimal(str(f))
     stamps = [t for t in (parse_ts(e.get("logged_at") or e.get("ts")) for e in rows) if t]
-    return {"n": len(rows), "cost": cost, "order_ids": sorted(by_id), "bad": bad,
+    return {"n": len(rows), "cost": float(cost), "order_ids": sorted(by_id), "bad": bad,
             "oldest_ts": min(stamps).isoformat() if stamps else None}
 
 
@@ -335,7 +337,7 @@ def claim(name, reported, recomputed, source, tol=CENT):
 
 
 def sum_claim(name, total, parts, source="sum of parts"):
-    return claim(name, total, sum(parts), source)
+    return claim(name, total, dsum(parts), source)
 
 
 def fresh(name, ts, max_age_s, policy="withhold"):
@@ -384,7 +386,7 @@ def evaluate(body, claims=(), freshness=(), now=None, allowed=()):
 
 
 def withheld_text(kind, reason):
-    return f"Report withheld ({kind}): {reason}. Unverified figures not sent; {LOG_HINT}."
+    return f"Report withheld ({kind}): {reason}. Unverified figures not sent; see data/signal/verify_log.jsonl."
 
 
 def _default_send(msg):

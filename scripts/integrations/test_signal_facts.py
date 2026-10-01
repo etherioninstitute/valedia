@@ -46,13 +46,13 @@ def lines(**kw):
     kw.setdefault("get", lambda e: {"balance": 10000})
     kw.setdefault("get_positions", lambda: POS)
     kw.setdefault("ledger", L())
-    return cb.facts_block(cb.verified_facts(now=NOW, **kw))[0][1:]
+    return cb.facts_block(cb.verified_facts(now=NOW, **kw))[0][1:5]  # figure lines
 
 
 def test_facts_attack_cases():
     ok = lines()
-    assert ok == ["Cash (broker): $100.00", "Open-position cost (broker): $3.00",
-                  "Open positions (broker): 1", "Realized P&L (ledger, fee-incl.): −$12.34 (0W/1L)"], ok
+    assert ok == ["Cash (Kalshi, broker): $100.00", "Open-position cost (Kalshi, broker): $3.00",
+                  "Open positions (Kalshi, broker): 1", "Realized P&L (ledger, all venues, fee-incl.): −$12.34 (0W/1L)"], ok
     for name, kw in [("missing", {"get": lambda e: {}}), ("None", {"get": lambda e: {"balance": None}}),
                      ("renamed", {"get": lambda e: {"balance_dollars": "1234.56"}}),
                      ("garbage", {"get": lambda e: {"balance": "n/a"}}),
@@ -61,10 +61,10 @@ def test_facts_attack_cases():
                      ("bool", {"get": lambda e: {"balance": True}}),
                      ("not dict", {"get": lambda e: "oops"})]:
         got = lines(**kw)
-        assert got[0] == "Cash (broker): omitted — unavailable", (name, got)
+        assert got[0] == "Cash (Kalshi, broker): omitted — unavailable", (name, got)
         assert "$0.00" not in "\n".join(got) and got[1:] == ok[1:], (name, got)
     got = lines(get=seq([{"balance": 100}, {"balance": 200}]))
-    assert got[0] == "Cash (broker): omitted — re-read disagreed", got
+    assert got[0] == "Cash (Kalshi, broker): omitted — re-read disagreed", got
     for name, pos, why in [("empty", {}, "unavailable"), ("error", {"error": "rate limited"}, "unavailable"),
                            ("cursor", dict(POS, cursor="abc"), "incomplete"),
                            ("incomplete", dict(POS, incomplete=True), "incomplete"),
@@ -74,12 +74,12 @@ def test_facts_attack_cases():
                            ("garbage size", {"market_positions": [{"ticker": "T", "position": "x",
                                                                    "market_exposure": 300}]}, "unavailable")]:
         got = lines(get_positions=lambda pos=pos: pos)
-        assert got[1:3] == [f"Open-position cost (broker): omitted — {why}",
-                            f"Open positions (broker): omitted — {why}"], (name, got)
+        assert got[1:3] == [f"Open-position cost (Kalshi, broker): omitted — {why}",
+                            f"Open positions (Kalshi, broker): omitted — {why}"], (name, got)
     got = lines(get_positions=seq([POS, {"market_positions": []}]))
-    assert got[1] == "Open-position cost (broker): omitted — re-read disagreed", got
+    assert got[1] == "Open-position cost (Kalshi, broker): omitted — re-read disagreed", got
     got = lines(get_positions=lambda: dict(POS, ts=(NOW - timedelta(hours=2)).isoformat()))
-    assert got[1] == "Open-position cost (broker): omitted — STALE", got
+    assert got[1] == "Open-position cost (Kalshi, broker): omitted — STALE", got
     for name, kw, why in [
             ("stale 40h open", {"ledger": L(40)}, "STALE (no recent live rows)"),
             ("broker down, assume open", {"ledger": L(40), "get_positions": lambda: 1 / 0},
@@ -95,10 +95,10 @@ def test_facts_attack_cases():
             ("nan pnl", {"ledger": L(pnl=float("nan"))}, "unavailable (unparseable rows)"),
             ("string pnl", {"ledger": L(pnl="abc")}, "unavailable (unparseable rows)")]:
         got = lines(**kw)
-        assert got[3] == f"Realized P&L (ledger, fee-incl.): omitted — {why}", (name, got)
-    assert lines(ledger=L(pnl=-0.004))[3] == "Realized P&L (ledger, fee-incl.): $0.00 (0W/1L)"
-    assert lines(ledger=L(pnl=0.004))[3] == "Realized P&L (ledger, fee-incl.): $0.00 (1W/0L)"
-    assert lines(get=lambda e: {"balance": -500})[0] == "Cash (broker): −$5.00"
+        assert got[3] == f"Realized P&L (ledger, all venues, fee-incl.): omitted — {why}", (name, got)
+    assert lines(ledger=L(pnl=-0.004))[3] == "Realized P&L (ledger, all venues, fee-incl.): $0.00 (0W/1L)"
+    assert lines(ledger=L(pnl=0.004))[3] == "Realized P&L (ledger, all venues, fee-incl.): $0.00 (1W/0L)"
+    assert lines(get=lambda e: {"balance": -500})[0] == "Cash (Kalshi, broker): −$5.00"
 
 
 def test_money_formatting():
@@ -128,12 +128,12 @@ def test_pnl_ping_loss_and_settlement_time():
     t = sent[0]
     assert r["status"] == "verified", r
     assert "Invested: $40.00 (Kalshi open-position cost, broker)" in t, t
-    assert "Profit: −$10.34 (net loss) Realized (ledger, fee-incl.) 1W/1L · settled last 24h −$12.34" in t, t
+    assert "Profit (all-time realized, ledger): −$10.34 (net loss) fee-incl., all venues · 1W/1L · settled last 24h −$12.34" in t, t
     rest._fresh_dir()
     sent.clear()
     pnl_run.pnl_report(get_positions=pos, ledger=L(1, pnl=-0.004), send_fn=lambda m: sent.append(m) or True,
                        now=NOW)
-    assert "Profit: $0.00 Realized" in sent[0] and "-$0.00" not in sent[0] and "net loss" not in sent[0]
+    assert "Profit (all-time realized, ledger): $0.00 fee-incl." in sent[0] and "-$0.00" not in sent[0] and "net loss" not in sent[0]
     rest._fresh_dir()
     sent.clear()
     r = pnl_run.pnl_report(get_positions=pos, ledger=L(1, pnl=float("nan")),
@@ -167,7 +167,8 @@ def test_get_positions_paginates_read_only():
     out = kalshi_auth.get_positions(_get=fake_get)
     assert [p["ticker"] for p in out["market_positions"]] == ["A", "B", "C"] and len(calls) == 3
     assert out["cursor"] == "" and not out.get("incomplete") and out["event_positions"] == [{"e": 1}]
-    loop = lambda ep: {"market_positions": [{"ticker": "X"}], "cursor": "again"}  # noqa: E731
+    n = iter(range(100))
+    loop = lambda ep: {"market_positions": [{"ticker": f"X{next(n)}"}], "cursor": "again"}  # noqa: E731
     out = kalshi_auth.get_positions(_get=loop, max_pages=3)
     assert out["incomplete"] is True and len(out["market_positions"]) == 3
     try:
