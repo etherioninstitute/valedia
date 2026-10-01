@@ -228,22 +228,24 @@ def test_systemone_default_off_and_fail_open():
         assert by["USO"]["would_have"]["sized"] is False
         assert by["KXHIGHNY"]["label"] == "watch"
         assert all(r["would_have"]["create_order"] is False for r in blown["ranked"])
-        states = {s["symbol"]: s for s in seen}
-        assert states["PUMP"]["class"] == "crypto"
-        assert states["SPY"]["class"] == "equity"
-        assert states["KXHIGHNY"]["class"] == "weather_watch"
-        assert states["USO"]["class"] == "oil_blocked"
-        assert states["NOISE"]["informed"]["news"] is True
-        assert states["SPY"]["informed"]["news"] is False
+        states = {s["symbol"]: s for s in seen if s.get("symbol") != "warmup"}
+        # Nimble 2 decides stock/crypto rows only. Weather and oil stay code-labelled watch.
+        assert states["PUMP-USD"]["asset_class"] == "crypto"
+        assert states["SPY"]["asset_class"] == "stock"
+        assert "KXHIGHNY" not in states and "USO" not in states
+        assert states["NOISE-USD"]["informed"]["news_present"] is True
+        assert "systemone_shadow" not in by["KXHIGHNY"] and "nimble" not in by["USO"]
+        assert by["PUMP"]["nimble"]["allow"] is True and by["PUMP"]["nimble"]["enforced"] is False
+        assert by["PUMP"]["nimble"]["error"] == "ConnectionRefusedError"
 
         def ok(url, payload, timeout):
             assert payload["model"] == "nimble:latest"
             return {
                 "model": "nimble2",
                 "answers": {
-                    "admit_paper": {"noul": 0.99},
-                    "edge_quality": {"score": 3},
-                    "venue_class": {"choice": "crypto"},
+                    "action": {"choice": "buy", "confidence": 0.9,
+                               "probabilities": {"buy": 0.9, "hold": 0.05, "skip": 0.05}},
+                    "risk": {"choice": "3"},
                 },
             }
 
@@ -255,7 +257,10 @@ def test_systemone_default_off_and_fail_open():
         assert by["USO"]["label"] == "watch"
         assert by["USO"]["would_have"]["sized"] is False
         assert by["PUMP"]["systemone_shadow"]["backend"] == "systemone_http"
-        assert by["PUMP"]["systemone_shadow"]["answers"]["admit_paper"] == 0.99
+        assert by["PUMP"]["systemone_shadow"]["answers"]["nimble_action"] == "buy"
+        assert by["PUMP"]["nimble"]["action"] == "buy" and by["PUMP"]["nimble"]["risk"] == 3
+        assert by["PUMP"]["label"] == "would_buy"           # the verdict never relabels
+        assert "systemone_shadow" not in by["USO"] and "nimble" not in by["KXHIGHNY"]
         assert by["PUMP"]["systemone_shadow"]["enforcement"] == "none"
         assert by["PUMP"]["would_have"]["create_order"] is False
         assert RETIRED not in json.dumps(stamped, default=str).lower()
@@ -279,30 +284,32 @@ def test_scan_logs_every_decision_with_code_label_and_facts():
         def post(url, payload, timeout):
             seen.append(payload)
             return {"model": "nimble2", "answers": {
-                "admit_paper": {"noul": 0.7}, "edge_quality": {"score": 2},
-                "venue_class": {"choice": "crypto", "confidence": 0.8}}}
+                "action": {"choice": "hold", "confidence": 0.7,
+                           "probabilities": {"buy": 0.2, "hold": 0.7, "skip": 0.1}},
+                "risk": {"choice": "5"}}}
 
         doc = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d,
                        systemone_post=post)
         n = len(doc["ranked"])
         lines = [json.loads(x) for x in open(SLOG).read().splitlines()]
-        assert len(lines) == n + 1                      # warmup + one per row, yes and no
-        assert lines[0]["source"] == "warmup" and seen[0]["state"]["symbol"] == "warmup"
         rows = {r["symbol"]: r for r in doc["ranked"]}
-        by = {ln["state"]["symbol"]: ln for ln in lines[1:]}
-        assert set(by) == set(rows)
+        spot = {k for k, r in rows.items() if r["class"] in ("crypto", "equity", "etf")}
+        assert spot and len(spot) < n                   # weather / oil rows get no call
+        assert len(lines) == len(spot) + 1              # warmup + one per stock/crypto row
+        assert lines[0]["source"] == "warmup" and seen[0]["state"]["symbol"] == "warmup"
+        by = {ln["state"]["symbol"].replace("-USD", ""): ln for ln in lines[1:]}
+        assert set(by) == spot
         for sym, ln in by.items():
-            assert ln["source"] == "movers_scan"
-            assert ln["label"] == rows[sym]["label"]    # code's label beside the model's answer
-            assert ln["answers"]["admit_paper"] == 0.7 and ln["error"] is None
+            assert ln["source"] == "nimble_decide:movers_scan"
+            assert ln["label"]["code"] == rows[sym]["label"]   # code's label beside the answer
+            assert ln["answers"]["action"] == "hold" and ln["error"] is None
         # Facts come from the scan's own constants, computed in code.
         f = by["PUMP"]["state"]["facts"]
         assert f["has_print"] is True and f["edge_positive"] is True
         assert f["clears_size_bar"] is True and f["is_oil"] is False
-        assert by["USO"]["state"]["facts"]["is_oil"] is True
+        assert "USO" not in by and "KXHIGHNY" not in by
         assert by["DUST"]["state"]["facts"]["edge_positive"] is False
         assert by["NOISE"]["state"]["facts"]["clears_size_bar"] is False
-        assert by["KXHIGHNY"]["state"]["facts"]["is_weather"] is True
         assert ak.LIMITS == {"print_bar_pct": ak.PRINT_BAR_PCT,
                              "min_quote_usd": ak.BINANCE_MIN_QUOTE_USD}
         # The model's answer never changes label, size, or rank.
@@ -311,7 +318,7 @@ def test_scan_logs_every_decision_with_code_label_and_facts():
         assert [r["would_have"]["sized"] for r in doc["ranked"]] == \
             [r["would_have"]["sized"] for r in off["ranked"]]
         blk = doc["systemone"]
-        assert blk["budget_ms"] == 500.0 and "latency_ms_p95" in blk and blk["n_ok"] == n
+        assert blk["budget_ms"] == 500.0 and "latency_ms_p95" in blk and blk["n_ok"] == len(spot)
     finally:
         os.environ.pop("VALEDIA_SYSTEMONE", None)
 

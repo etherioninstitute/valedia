@@ -6,6 +6,8 @@ Splits available cash across top-scoring assets.
 import os, sys, json
 from datetime import datetime, timezone
 sys.path.insert(0, "/Users/burtonchatelain/.openclaw/workspace/scripts/integrations")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimble_wiring_spot as nws  # Nimble 2 entry veto (shadow default)
 
 DCA_CONFIG = "/Users/burtonchatelain/.openclaw/workspace/models/dca_config.json"
 DCA_LOG = "/Users/burtonchatelain/.openclaw/workspace/models/dca_log.json"
@@ -74,6 +76,11 @@ def run_dca():
                 bal = get_balances()
                 cash = bal.get("USD",{}).get("balance",0)
                 if cash >= per_asset:
+                    nv = nws.gate("crypto", asset["ticker"], {"fused": asset["score"]},
+                                  source="dca_module", venue="coinbase", label="dca")
+                    lines.extend(nws.note(asset["ticker"], nv))
+                    if nws.blocked(nv):
+                        continue
                     r = cb_buy(asset["ticker"], per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f}) -> {r.get('success','?')}")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
@@ -89,6 +96,11 @@ def run_dca():
                 acct = get_account()
                 cash = float(acct.get("cash",0))
                 if cash >= per_asset:
+                    nv = nws.gate("equity", asset["ticker"], {"fused": asset["score"]},
+                                  source="dca_module", venue="alpaca", label="dca")
+                    lines.extend(nws.note(asset["ticker"], nv))
+                    if nws.blocked(nv):
+                        continue
                     r = alp_buy(asset["ticker"], notional=per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f})")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})

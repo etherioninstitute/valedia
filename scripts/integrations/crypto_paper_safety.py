@@ -19,6 +19,7 @@ import urllib.request
 
 import crypto_paper as cp
 import crypto_paper_indicators as ind
+import nimble_wiring_spot as nws
 import valedia_config as vc
 
 MODEL = "ornith-1.5-k-m"
@@ -443,6 +444,15 @@ def run_safety(*, fixture_path=None, rules_path=None, pair="BTC-USDT", cash=1000
     proposal = proposal_for(snap, pair, cash) if bias == "long" else None
     dec = judge(rules, snap, proposal, post_fn=post_fn, url=ornith_url, timeout=timeout)
     dec["symbol"] = pair
+    if dec["pass"] and proposal:
+        # Nimble 2 beside Ornith (Ornith stays the safety gate). Shadow stamps only;
+        # veto may additionally remove the paper entry. Never adds, sizes or exits.
+        nv = nws.gate("crypto", pair, {"passes_filter": True, "has_pos": False},
+                      source="crypto_paper_safety", venue="paper", label="pass")
+        nws.stamp(dec, nv)
+        if nws.blocked(nv):
+            dec.update(reason=nws.SKIP, failed_conditions=list(dec["failed_conditions"]) + [nws.SKIP])
+            dec["pass"] = dec["allPass"] = False
     fill = None
     if dec["pass"] and proposal and bars:
         maker = float(vc.CRYPTO_FEE_PCT if maker is None else maker)
