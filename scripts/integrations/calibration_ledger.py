@@ -53,10 +53,9 @@ earns exactly its base; no skill or worse earns 0. Never raises.
 Plugging in (later, Burton approves; backtest first):
   - valedia_config.effective_mirofish_weight() (valedia_config.py:629): wrap the
     mirofish_accuracy_ledger result as min(current, earned_weight("mirofish", ...)).
-  - Nimble per-point trust: nimble_decide.decide_candidate (nimble_decide.py:293) /
-    nimble_wiring.gate (nimble_wiring.py:87) could gate veto mode on
-    earned_weight("nimble_decide:<pt>") > 0. (Note: the veto threshold min_conf,
-    nimble_decide.py:115, compares `confidence`, which is entropy sharpness, not P(buy).)
+  - Nimble per-point trust: nimble_decide.decide_candidate / nimble_wiring.gate could gate
+    veto mode on earned_weight("nimble_decide:<pt>") > 0. The veto already reads
+    calibrate("nimble_decide:<pt>", p_buy) (calibration_map.py; confidence = sharpness floor).
 
 CLI: python3 calibration_ledger.py [--source X] [--since ISO] [--json]
 Writes data/calibration/summary.json (gitignored) unless --no-write.
@@ -370,6 +369,12 @@ def _metrics(items):
     return st
 
 
+def _all_items(dec_rows, ftl_rows, mf_rows, now):
+    pairs = [(e, s) for e, s in mfl._ftl_pairs(ftl_rows) if e]
+    items = _dedupe(_nimble_items(dec_rows, pairs))
+    return items + _mirofish_items(mf_rows, ftl_rows, now) + _fv_items(ftl_rows)
+
+
 def _match_filter(src, flt):
     return flt is None or src == flt or src.startswith(str(flt) + ":")
 
@@ -386,10 +391,7 @@ def score(source_filter=None, since=None, *, decisions_path=None, ftl_path=None,
     mf_rows = _rows(mirofish_path or d["mirofish"])
     now = _ts(now) or datetime.now(timezone.utc)
     since_dt = _ts(since) if since is not None else None
-    pairs = [(e, s) for e, s in mfl._ftl_pairs(ftl_rows) if e]
-    items = _dedupe(_nimble_items(dec_rows, pairs))
-    items += _mirofish_items(mf_rows, ftl_rows, now)
-    items += _fv_items(ftl_rows)
+    items = _all_items(dec_rows, ftl_rows, mf_rows, now)
     groups = {}
     for it in items:
         if not _match_filter(it["source"], source_filter):
@@ -421,6 +423,13 @@ def earned_weight(source, base, cap, *, min_n=MIN_N, shrink=SHRINK, bss_ref=BSS_
         return max(0.0, min(b * bss / float(bss_ref), c))
     except Exception:
         return fallback
+
+
+# ---------------------------------------------------------------- calibrate (Nimble veto input)
+# calibrate(source, p) lives in calibration_map.py (identity under MIN_N, then Laplace-smoothed
+# PAV isotonic map over this module's _all_items); re-exported here for existing callers.
+from calibration_map import (  # noqa: E402,F401
+    _FITS, _reset_cache, calibrate, calibrate_ex, isotonic_fit)
 
 
 # ---------------------------------------------------------------- CLI

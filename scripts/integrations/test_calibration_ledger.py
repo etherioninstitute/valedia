@@ -241,6 +241,65 @@ def test_filters_and_cli():
     assert list(json.loads(buf.getvalue())["sources"]) == ["fv:nymex"]
 
 
+def _synthetic(n, seed):
+    """Overconfident source: it says p, the true P(y=1) is 0.3 + 0.4 * p (squashed to the middle)."""
+    import random
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        p = rng.random()
+        true = 0.3 + 0.4 * p  # the source says p, reality is much closer to 0.5
+        out.append((round(p, 4), 1 if rng.random() < true else 0))
+    return out
+
+
+def test_calibrate_identity_under_min_n():
+    pairs = _synthetic(cl.MIN_N - 1, 1)
+    r = cl.calibrate_ex("nimble_decide:x", 0.8, pairs=pairs)
+    assert r == {"p_cal": 0.8, "calibration": "identity", "n": cl.MIN_N - 1}, r
+    assert cl.calibrate("nimble_decide:x", None, pairs=pairs) is None
+    assert cl.calibrate("nimble_decide:x", 1.7, pairs=pairs) == 1.0  # clamped
+    assert cl.calibrate("nimble_decide:x", "junk") is None
+    # cached per process from the files; with no record → identity, never raises
+    cl._reset_cache(items=[])
+    assert cl.calibrate_ex("nimble_decide:y", 0.7) == {"p_cal": 0.7, "calibration": "identity", "n": 0}
+    cl._reset_cache(items=[{"source": "s", "p": "bad", "y": 1}] * 40)  # malformed → identity
+    assert cl.calibrate_ex("s", 0.7)["calibration"] == "identity"
+    cl._reset_cache()
+
+
+def test_calibrate_isotonic_monotone_and_improves_brier():
+    train, test = _synthetic(2000, 7), _synthetic(2000, 8)
+    knots = cl.isotonic_fit(train)
+    xs = [k[0] for k in knots]
+    vs = [k[1] for k in knots]
+    assert all(a < b for a, b in zip(xs, xs[1:])) and all(a <= b for a, b in zip(vs, vs[1:]))
+    assert all(0.0 < v < 1.0 for v in vs)
+    grid = [i / 100 for i in range(101)]
+    cal = [cl.calibrate("src", g, pairs=train) for g in grid]
+    assert all(a <= b for a, b in zip(cal, cal[1:])), "monotone"
+    assert all(0.0 <= c <= 1.0 for c in cal)
+    assert cl.calibrate_ex("src", 0.9, pairs=train)["calibration"] == "isotonic"
+    assert cl.calibrate("src", 0.9, pairs=train) < 0.8  # overconfident 0.9 pulled toward 0.66
+    brier = lambda f: sum((f(p) - y) ** 2 for p, y in test) / len(test)  # noqa: E731
+    raw = brier(lambda p: p)
+    fit = brier(lambda p: cl.calibrate("src", p, pairs=train))
+    assert fit < raw - 0.01, (raw, fit)
+    # deterministic; the process cache fits once from the preloaded items
+    assert cl.isotonic_fit(train) == knots
+    cl._reset_cache(items=[{"source": "src", "p": p, "y": y} for p, y in train])
+    a = cl.calibrate_ex("src", 0.9)
+    assert a["calibration"] == "isotonic" and a["n"] == 2000
+    assert a["p_cal"] == cl.calibrate("src", 0.9, pairs=train)
+    assert ("src", cl.MIN_N) in cl._FITS
+    assert cl.calibrate_ex("other", 0.9)["calibration"] == "identity"
+    cl._reset_cache()
+    # pooling: a violating pair is merged, ties start in one block
+    assert cl.isotonic_fit([(0.2, 1), (0.8, 0)]) == [(0.5, 0.5)]
+    assert cl.isotonic_fit([(0.5, 1), (0.5, 0)]) == [(0.5, 0.5)]
+    assert cl.isotonic_fit([]) == []
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
