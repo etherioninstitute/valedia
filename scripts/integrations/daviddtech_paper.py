@@ -16,6 +16,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+import nimble_wiring_spot as nws
+
 MODE = "PAPER/SHADOW"
 SOURCE = "daviddtech_paper"
 VENUE = "daviddtech-paper"
@@ -247,6 +249,13 @@ def to_decision(body: dict, *, halt: bool = False, env: Optional[dict] = None) -
     row["filled"] = False
     row["paperTrading"] = True
     row["counts_toward_kelly"] = False
+    if side == "buy" and band == "allowlist":
+        # Entry only (exits are never asked). Shadow stamps; veto downgrades the entry to review_only.
+        nv = nws.gate(None, n.get("ticker"), {}, source="daviddtech_paper", venue=VENUE,
+                      label=n.get("action"))
+        nws.stamp(row, nv)
+        if nws.blocked(nv):
+            row["band"], row["reason"] = "review_only", nws.SKIP
     if live_flag(env):
         # still refuse live; note attempt
         row["reason"] = (row.get("reason") or "") + "|davidd_live_ignored"

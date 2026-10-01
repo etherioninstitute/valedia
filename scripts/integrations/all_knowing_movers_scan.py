@@ -29,6 +29,7 @@ if HERE not in sys.path:
 
 import crypto_paper as cp
 import jev_shadow
+import nimble_wiring_spot as nws
 import ornith_seasoning
 import systemone_hotpath_client as s1
 import valedia_config as vc
@@ -168,16 +169,15 @@ def rank_movers(rows, *, bankroll=BANKROLL, maker=None, taker=None, slip=None,
             "harvest": "NO_HARVEST" if oil_fenced(sym, cls) else None,
         }
         row["label"] = fee_true_label(row)
-        if s1.enabled():
-            row["systemone_shadow"] = s1.decide(
-                s1.compact_state(row, informed, LIMITS), post=systemone_post,
-                label=row["label"])
         if row["label"] == "would_buy":
             row["would_have"] = _would_have(
                 row["price"], notional, maker, taker, slip, impact)
         else:
             row["would_have"] = _blank_size()
         ranked.append(row)
+    # Nimble 2 per stock/crypto row (weather/oil stay code-labelled watch). Shadow
+    # semantics in every mode: stamps row["nimble"], never touches label/size/rank.
+    nws.scan_rows(ranked, LIMITS, post=systemone_post)
     ranked.sort(
         key=lambda r: (
             r["impact_usd"] is not None,
@@ -608,10 +608,10 @@ def _proof_lines(doc):
         sh = r.get("systemone_shadow") or {}
         ans = sh.get("answers") or {}
         lines.append(
-            "proof %s %s class=%s label=%s sized=%s admit=%s edge_q=%s venue=%s latency_ms=%s create_order=false"
+            "proof %s %s class=%s label=%s sized=%s nimble=%s conf=%s risk=%s latency_ms=%s create_order=false"
             % (key, r.get("symbol"), r.get("class"), r.get("label"),
                "Y" if (r.get("would_have") or {}).get("sized") else "n",
-               ans.get("admit_paper"), ans.get("edge_quality"), ans.get("venue_class"),
+               ans.get("nimble_action"), ans.get("nimble_confidence"), ans.get("nimble_risk"),
                sh.get("latency_ms")))
     return "\n".join(lines)
 

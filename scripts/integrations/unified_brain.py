@@ -32,6 +32,7 @@ except Exception:
     _ftl = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimble_wiring_spot as nws  # Nimble 2 entry veto (shadow default; SELL never asked)
 
 # Memory system (graceful — works even if Memori unavailable)
 try:
@@ -868,6 +869,12 @@ def run_brain():
                     fee_check["pass"] and ere["safe"] and
                     not has_pos and actionable):
 
+                _nv = nws.gate(asset_cls, ticker, {"fused": fused, "q": q, "fee_check": fee_check,
+                               "has_pos": has_pos, "ere": ere}, source="unified_brain", venue=plat, label="buy") \
+                    if (plat == "coinbase" and cb and cb_cash >= position) or (plat == "alpaca" and alpaca) else None
+                lines.extend(nws.note(name, _nv))
+                if nws.blocked(_nv):
+                    continue
                 executed = False
                 buy_resp = None
                 if plat == "coinbase" and cb and cb_cash >= position:
@@ -987,8 +994,8 @@ def run_brain():
         )
         if cb and dca.should_buy() and cb_cash >= 5:
             _, cb_buy_fn, _, _ = cb
-            for da in dca.execute(cb_buy_fn, lambda: cb_cash):
-                lines.append(f"  {da}"); actions.append(da)
+            for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca"), lambda: cb_cash):
+                lines.append(f"  {da}"); actions += [] if nws.SKIP in da else [da]
         elif dca.should_buy():
             lines.append("  DCA: ready — insufficient USD or Coinbase offline")
     except Exception as e:
