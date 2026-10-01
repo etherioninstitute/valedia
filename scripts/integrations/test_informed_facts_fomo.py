@@ -37,8 +37,13 @@ import test_sports_evidence as tse  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="inffomo_")
 NOPE = os.path.join(TMP, "missing.json")
-FIXTURE = os.path.join(TMP, "fomo_fixture.json")
-shutil.copy(fre.DEFAULT_FIXTURE, FIXTURE)
+# The repo fixture marks itself synthetic, so production ignores it. FEED is the same
+# tokens with the synthetic markers removed, standing in for the real radar feed.
+_FEED_DOC = {k: v for k, v in json.load(open(fre.DEFAULT_FIXTURE)).items() if k == "tokens"}
+_FEED_DOC["source"] = "fomo_radar_feed_test"
+FIXTURE = os.path.join(TMP, "fomo_radar.json")
+with open(FIXTURE, "w") as _f:
+    json.dump(_FEED_DOC, _f)
 FOMO = ("fomo_present", "fomo_wallet_conviction_high", "fomo_exit_signal", "fomo_provenance_ok")
 MF = ("mirofish_fresh", "mirofish_has_symbol", "mirofish_agrees", "mirofish_conflicts")
 
@@ -106,8 +111,28 @@ def test_fomo_absent_and_non_crypto():
     print("ok fomo absent / non-crypto / stale")
 
 
-def test_fomo_default_path_is_the_existing_file():
-    assert inf.FOMO_PATHS == (fre.DEFAULT_FIXTURE,)
+def test_fomo_default_paths_never_a_fixture():
+    assert inf.FOMO_PATHS == (inf.FOMO_FEED_PATH,), inf.FOMO_PATHS
+    for p in inf.FOMO_PATHS:
+        assert os.path.abspath(p) != os.path.abspath(fre.DEFAULT_FIXTURE), p
+        assert not any(w in os.path.basename(p).lower() for w in ("fixture", "sample", "synthetic")), p
+    # the real repo fixture (note "Synthetic offline sample") yields all-False when pointed at
+    r = _facts("BTC", fomo=fre.DEFAULT_FIXTURE)
+    assert all(r["facts"][k] is False for k in FOMO), r["facts"]
+    assert r["sources"]["fomo"]["note"] == "synthetic_ignored", r["sources"]["fomo"]
+    # any self-marked synthetic / fixture / sample file is ignored, whatever its name
+    for mark in ({"note": "Synthetic offline sample"}, {"source": "test fixture"},
+                 {"description": "SAMPLE data"}, {"synthetic": True}, {"fixture": True}):
+        p = _write("marked/fomo_radar.json", dict(_FEED_DOC, **mark))
+        r = _facts("BTC", fomo=p)
+        assert all(r["facts"][k] is False for k in FOMO), (mark, r["facts"])
+        assert r["sources"]["fomo"]["note"] == "synthetic_ignored", mark
+    # default production run (feed absent today): all False, never reads the fixture
+    r = inf.informed_facts("BTC-USD", "buy", mirofish_paths=[NOPE], ere_paths=[NOPE],
+                           prediction_log_paths=[NOPE])
+    if not os.path.exists(inf.FOMO_FEED_PATH):
+        assert all(r["facts"][k] is False for k in FOMO), r["facts"]
+    assert r["sources"]["fomo"].get("path") != fre.DEFAULT_FIXTURE
     src = open(os.path.join(HERE, "informed_facts.py")).read()
     for bad in ("import requests", "urllib", "http://", "https://", "create_order"):
         assert bad not in src, bad
@@ -212,7 +237,7 @@ if __name__ == "__main__":
     try:
         test_fomo_from_fixture()
         test_fomo_absent_and_non_crypto()
-        test_fomo_default_path_is_the_existing_file()
+        test_fomo_default_paths_never_a_fixture()
         test_sports_evidence_mirofish()
         test_sports_nimble_verdict_carries_mirofish()
         test_dead_helper_removed()

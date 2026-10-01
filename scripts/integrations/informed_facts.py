@@ -13,8 +13,10 @@ Sources (all offline; this module NEVER makes a network call):
   shape {SYM: {score, reasons, price}}) passed by the caller, plus the cached
   intel_sentiment prediction_log.json (per-ticker latest direction < 24h).
 - ERE: models/latest_etherion_risk.json, fresh < 24h by `timestamp` / `ts`.
-- FOMO radar (crypto only): fomo_radar_enrich.enrich over its existing data file
-  (data/crypto-paper/fomo_radar_fixture.json) when present. Exact symbol/pair
+- FOMO radar (crypto only): fomo_radar_enrich.enrich over the real radar feed
+  file data/crypto-paper/fomo_radar.json (written by the real radar feed; absent
+  today). Never the fixture. A file whose metadata marks it synthetic / fixture /
+  sample is ignored (sources.fomo.note = "synthetic_ignored"). Exact symbol/pair
   match only. Annotate only: never sizes money. A dated file older than 24h is
   ignored; missing → every fomo_* fact False.
 - intel_layer is skipped: IntelLayer() fetches Fear/Greed over the network.
@@ -39,7 +41,14 @@ MIROFISH_PATHS = (os.path.join(_ROOT, "models", "mirofish_signal.json"),
 ERE_PATHS = (os.path.join(_ROOT, "models", "latest_etherion_risk.json"),
              os.path.join(_HOME_MODELS, "latest_etherion_risk.json"))
 PREDICTION_LOG_PATHS = (os.path.join(_HOME_MODELS, "prediction_log.json"),)
-FOMO_PATHS = (fre.DEFAULT_FIXTURE,)
+# Written by the real radar feed; absent today. Production never reads the
+# synthetic fixture (fomo_radar_enrich.DEFAULT_FIXTURE); tests pass paths explicitly.
+FOMO_FEED_PATH = os.path.join(_ROOT, "data", "crypto-paper", "fomo_radar.json")
+FOMO_PATHS = (FOMO_FEED_PATH,)
+_SYNTHETIC_WORDS = ("synthetic", "fixture", "sample")
+_SYNTHETIC_FLAGS = ("synthetic", "fixture", "sample", "is_fixture", "is_synthetic", "is_sample")
+_META_KEYS = ("note", "notes", "source", "kind", "type", "description", "provenance", "origin",
+              "tape", "mode")
 # Wallet conviction = sum((score/100)^2) over trusted real-trade wallets
 # (fomo_radar_enrich.conviction). 1.5 ~ three trusted wallets at >= 71.
 FOMO_CONVICTION_HIGH = 1.5
@@ -249,6 +258,19 @@ def _fomo_tag(enr, symbol):
     return None, None
 
 
+def fomo_is_synthetic(doc):
+    """True when the file's own metadata marks it synthetic / fixture / sample."""
+    if not isinstance(doc, dict):
+        return False
+    if any(doc.get(k) is True for k in _SYNTHETIC_FLAGS):
+        return True
+    for k in _META_KEYS:
+        v = doc.get(k)
+        if isinstance(v, str) and any(w in v.lower() for w in _SYNTHETIC_WORDS):
+            return True
+    return False
+
+
 def fomo_facts(symbol, d, *, paths=None, asset_class=None, now=None):
     """Offline FOMO radar tags for one crypto symbol. Direction-free facts.
 
@@ -269,8 +291,9 @@ def fomo_facts(symbol, d, *, paths=None, asset_class=None, now=None):
         except (OSError, ValueError):
             continue
         ts = doc.get("as_of") or doc.get("ts") or doc.get("timestamp") if isinstance(doc, dict) else None
-        src = {"used": True, "path": p, "dated": ts is not None, "annotate_only": True,
-               "note": doc.get("note") if isinstance(doc, dict) else None}
+        if fomo_is_synthetic(doc):
+            return facts, {"used": False, "path": p, "note": "synthetic_ignored"}
+        src = {"used": True, "path": p, "dated": ts is not None, "annotate_only": True}
         if ts is not None:
             age = _age_s(ts, now)
             src["age_s"] = age

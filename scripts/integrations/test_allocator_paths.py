@@ -350,6 +350,19 @@ def test_spot_on_writer_halt_side_refuse():
     print("ok spot on: writer/halt/side refuse")
 
 
+def test_report_icons():
+    """Run report: PAPER_* gets the neutral paper icon, never ❌ (source of ma.run)."""
+    import inspect
+    src = inspect.getsource(ma.run)
+    i = src.index('icon = (')
+    expr = src[i + len("icon = "): src.index('else "❌")', i) + len('else "❌")')]
+    icon = lambda st: eval(expr, {}, {"st": st})  # noqa: E731  the exact report expression
+    assert icon("PAPER_EXECUTED") == "📝" and icon("PAPER_UNRECONCILED") == "📝"
+    assert icon("EXECUTED") == "✅" and icon("UNRECONCILED") == "⏳" and icon("DRY_RUN") == "🔶"
+    assert icon("SKIP_ALLOCATOR_SPOT_DISABLED") == "⏭" and icon("FAILED") == "❌"
+    print("ok report icons")
+
+
 def test_source_hygiene():
     src = open(os.path.join(HERE, "master_allocator.py")).read()
     assert "place_market_order" not in src and "import place_order" not in src
@@ -371,5 +384,6 @@ if __name__ == "__main__":
     test_spot_on_coinbase_real_writer_fill_truth()
     test_spot_on_alpaca_paper_semantics()
     test_spot_on_writer_halt_side_refuse()
+    test_report_icons()
     test_source_hygiene()
     print("allocator paths: PASS")

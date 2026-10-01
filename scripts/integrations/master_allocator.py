@@ -808,6 +808,7 @@ def run(dry_run=False, max_allocs=15):
         icon = ("✅" if st == "EXECUTED"
                 else "⏳" if st == "UNRECONCILED"
                 else "🔶" if st == "DRY_RUN"
+                else "📝" if str(st).startswith("PAPER_")  # Alpaca paper account: non-live
                 else "⏭" if str(st).startswith("SKIP")
                 else "❌")
         lines.append(
