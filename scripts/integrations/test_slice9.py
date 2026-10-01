@@ -274,8 +274,10 @@ def test_slice8_live_exec_still_dead():
     assert "from weather_arb import find_edges" not in src_ma
 
 
-def test_pnl_fallback_uses_net_not_wr():
-    """When ledger stats are empty, pnl_tracker net (not WR) can pause."""
+def test_pnl_fallback_is_report_only_not_gate():
+    """Fee-blind pnl_tracker net is report-only: with ledger (fee-true) stats empty it
+    must NOT pause. Replaces test_pnl_fallback_uses_net_not_wr, which asserted the
+    fee-blind LOSER net paused -- the gap-fill behavior this change removes."""
     bl, pnl = _tmp(), _tmp()
     orig = (pt.STRATEGY_BLACKLIST_PATH, pt.PNL_PATH)
     pt.STRATEGY_BLACKLIST_PATH, pt.PNL_PATH = bl, pnl
@@ -285,8 +287,10 @@ def test_pnl_fallback_uses_net_not_wr():
     })
     try:
         paused = pt.update_strategy_blacklist(now=NOW, stats={}, path=bl)
-        assert "LOSER" in paused
-        assert "FAT_TAIL" not in paused  # net +40 despite WR ~17%
+        assert paused == [], paused
+        rep = {r["strategy"]: r for r in json.load(open(bl))["fee_blind_report"]}
+        assert rep["LOSER"]["net"] == -12.0 and rep["LOSER"]["report_only"] is True
+        assert rep["FAT_TAIL"]["net"] == 40.0  # net +40 despite WR ~17%
     finally:
         pt.STRATEGY_BLACKLIST_PATH, pt.PNL_PATH = orig
         os.remove(bl); os.remove(pnl)
@@ -301,7 +305,7 @@ def run():
     test_allocator_pause_vs_fence()
     test_category_gate_pause_until()
     test_slice8_live_exec_still_dead()
-    test_pnl_fallback_uses_net_not_wr()
+    test_pnl_fallback_is_report_only_not_gate()
     print("slice9 checks: PASS")
 
 
