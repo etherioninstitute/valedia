@@ -57,6 +57,24 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
 7. **`portfolio_monitor.py` (3pm)** — wire the Signal send or confirm it's intentionally log-only.
 8. **Backtest-first harness** — any edge/threshold change must produce a fee-inclusive backtest (Monte-Carlo / forward) before it ships. Codify as a required step.
 
+   **Backtest-first rule** (tool: `scripts/integrations/backtest_gate.py`, offline + read-only, tests `test_backtest_gate.py`).
+   Any change to an edge threshold, category allow/pause set, or per-category size weight ships only with a gate report:
+   ```bash
+   cd scripts/integrations
+   python3 backtest_gate.py --baseline backtest_policies/baseline_take_all.json \
+       --candidate my_change.json [--ledger ../../models/forward_test_ledger.jsonl] [--live-only] [--seed 7]
+   ```
+   - Policy JSON: `{"name", "min_edge": float|null, "categories_allow": [..]|null, "categories_block": [..], "size_mult": {"CAT": x}}` (unknown keys rejected).
+   - Replays the REAL settlement ledger (never `brain_log.json`) under both policies. P&L is fee-true: recorded fee if the ledger has one,
+     else `forward_test_ledger.kalshi_fee` = ceil(0.07·C·P·(1−P)) to the cent per order (0.07·cost upper bound when price is unknown). Never flat.
+   - Unsettled, paper/sandbox/shadow/unreconciled and malformed rows are excluded and counted; backfill vs live reported separately (`--live-only` drops backfill).
+   - Paired bootstrap Monte-Carlo (seeded, N=2000) on the same resamples for baseline and candidate.
+   - **PASS bar** (all must hold; thresholds CLI-overridable): candidate `n_taken >= 30`; candidate fee-true net `>=` baseline;
+     `P(candidate − baseline < 0) <= 0.35`; candidate tail (p95) max drawdown `<=` 1.2 × baseline's.
+     Thin sample → `INSUFFICIENT_DATA`, never PASS. Exit 0 PASS / 1 FAIL / 2 INSUFFICIENT_DATA / 3 input error.
+   - Attach the JSON report + one-line summary to the change. Caveat: a policy tuned on this same ledger is in-sample;
+     PASS on backfill-only rows is weak evidence — prefer `--live-only` once live settlements reach the min sample.
+
 ## C. Audit checklist Ruflo runs (HOLDS/FAILS, auditor mode = verify only, no "improvements")
 - [ ] Live cron → `master_allocator` → `record_entry` writes to `forward_test_ledger.jsonl` (file:line + trace, not `/audit` alone)
 - [ ] `kalshi_executor.run` confirmed inert (no live caller); no live logic depends on it

@@ -1,0 +1,8 @@
+{
+  "name": "candidate_pause_losers",
+  "description": "EXAMPLE only (not a recommendation): pause OIL_BRACKET + WEATHER_ARB, 0.5x SPORTS.",
+  "min_edge": null,
+  "categories_allow": null,
+  "categories_block": ["OIL_BRACKET", "WEATHER_ARB"],
+  "size_mult": {"SPORTS": 0.5}
+}
