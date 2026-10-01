@@ -53,7 +53,92 @@ def _book_dca(venue, ticker, resp):
         print(f"[dca_module] ledger booking failed for {ticker}: {e}", file=sys.stderr)
         return None
 
-def run_dca():
+# Ambiguous buys (5xx / 408 / timeout / unclear body — dca_pending.outcome): the venue MAY
+# have taken the order, so it is never booked as "not filled". An UNRECONCILED ledger stub
+# (no order id, intended notional, reason ambiguous_5xx) is written instead. Before the next
+# buy of that ticker its open stubs are resolved against the venue's read-only
+# recent_buy_orders: found (and not already booked) → booked as the fill, stub closed, no
+# re-buy; none → stub closed, buy proceeds; lookup failed → ticker skipped this run.
+AMBIGUOUS_REASON = "ambiguous_5xx"
+
+
+def _stub_ambiguous(venue, ticker, amount, why):
+    import uuid
+    import forward_test_ledger as ftl
+    import spot_ledger as sl
+    rec = {"type": "entry", "id": "ft_" + uuid.uuid4().hex[:12],
+           "ts": datetime.now(timezone.utc).isoformat(), "strategy": sl.DCA[venue],
+           "venue": venue, "ticker": ticker, "side": "buy", "entry_price": 0.0,
+           "contracts": 0.0, "entry_fee": 0.0, "predicted_direction": None,
+           "predicted_prob": None, "source": "unreconciled", "fill_status": "UNRECONCILED",
+           "intended_source": sl.venue_source(venue), "intended_notional": round(float(amount), 2),
+           "reason": AMBIGUOUS_REASON, "error": str(why)[:160]}
+    ftl._append(rec)
+    return rec["id"]
+
+
+def _resolve_stubs(venue, ticker, lookup=None):
+    """("clear"|"found"|"unknown", lines). Only "clear" lets this run buy the ticker."""
+    import dca_pending as dp
+    try:
+        import forward_test_ledger as ftl
+        rows, done = ftl._read(), ftl._settled_ids()
+    except Exception as e:  # ledger unreadable: no known stub (logged, not silent)
+        print(f"[dca_module] ambiguous-stub read failed: {e}", file=sys.stderr)
+        return "clear", []
+    stubs = sorted((r for r in rows if r.get("type") == "entry"
+                    and r.get("reason") == AMBIGUOUS_REASON and r.get("venue") == venue
+                    and r.get("ticker") == ticker and r.get("id") not in done),
+                   key=lambda r: str(r.get("ts")))
+    if not stubs:
+        return "clear", []
+    since = datetime.fromisoformat(stubs[0]["ts"]) - dp.timedelta(seconds=dp.SKEW_S)
+    fn = dp._lookup(venue, lookup)
+    try:
+        orders = fn(ticker, since.strftime("%Y-%m-%dT%H:%M:%SZ")) if fn else None
+    except Exception:
+        orders = None
+    if orders is None:
+        return "unknown", [f"  {ticker}: earlier ambiguous buy unresolved (venue lookup failed); not re-buying"]
+    import spot_ledger as sl
+    import spot_reconcile as sr
+    orders, found, lines = dp.unbooked(orders, rows), 0, []
+    for st in stubs:
+        if orders:
+            o = dict(orders.pop(0), success=True)
+            res = sl.book_buy(sl.DCA[venue], venue, ticker, o, intended_source=sl.venue_source(venue))
+            sr._close_stub(st, (res or {}).get("id"))
+            found += 1
+            lines.append(f"  {ticker}: earlier ambiguous buy found ({o.get('order_id')}) -> booked, not re-bought")
+        else:
+            sr._close_stub(st)
+            lines.append(f"  {ticker}: earlier ambiguous buy not at venue -> stub closed")
+    return ("found" if found else "clear"), lines
+
+
+def _buy_or_stub(venue, ticker, amount, buy):
+    """Place one buy; book an ack/refusal as before, stub an ambiguous outcome. Returns resp."""
+    import dca_pending as dp
+    try:
+        r = buy()
+    except Exception as e:
+        if dp.outcome(exc=e) == "ambiguous":
+            _stub_ambiguous(venue, ticker, amount, e)
+            return {"success": False, "error": str(e)[:120], "ambiguous": True}
+        raise
+    try:
+        import forward_test_ledger as ftl
+        acked = bool(ftl.spot_ack_ok(venue, r))
+    except Exception:
+        acked = False
+    if dp.outcome(r, acked=acked) == "ambiguous":
+        _stub_ambiguous(venue, ticker, amount, (r or {}).get("error") if isinstance(r, dict) else r)
+    else:
+        _book_dca(venue, ticker, r)
+    return r if isinstance(r, dict) else {"success": False, "error": str(r)[:120]}
+
+
+def run_dca(lookup=None):
     import yfinance as yf
     from kernel_predictor_v16e import KernelPredictor
     from coinbase_trader import get_balances, market_buy as cb_buy
@@ -94,6 +179,10 @@ def run_dca():
                 if not nws.venue_buy_allowed("coinbase"):
                     lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER coinbase writer!=valedia")
                     continue
+                state, notes = _resolve_stubs("coinbase", asset["ticker"], lookup)
+                lines.extend(notes)
+                if state != "clear":
+                    continue
                 if cash >= per_asset:
                     row = nws.dca_row("coinbase", per_asset, score=asset["score"], prices=asset.get("prices"))
                     nv = nws.gate("crypto", asset["ticker"], row,
@@ -101,15 +190,19 @@ def run_dca():
                     lines.extend(nws.note(asset["ticker"], nv))
                     if nws.blocked(nv):
                         continue
-                    r = cb_buy(asset["ticker"], per_asset)
+                    r = _buy_or_stub("coinbase", asset["ticker"], per_asset,
+                                     lambda: cb_buy(asset["ticker"], per_asset))
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f}) -> {r.get('success','?')}")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
-                    _book_dca("coinbase", asset["ticker"], r)
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient CB cash (${cash:.2f})")
             else:
                 if not nws.venue_buy_allowed("alpaca"):
                     lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER alpaca writer!=valedia")
+                    continue
+                state, notes = _resolve_stubs("alpaca", asset["ticker"], lookup)
+                lines.extend(notes)
+                if state != "clear":
                     continue
                 acct = get_account()
                 cash = float(acct.get("cash",0))
@@ -120,10 +213,10 @@ def run_dca():
                     lines.extend(nws.note(asset["ticker"], nv))
                     if nws.blocked(nv):
                         continue
-                    r = alp_buy(asset["ticker"], notional=per_asset)
+                    _buy_or_stub("alpaca", asset["ticker"], per_asset,
+                                 lambda: alp_buy(asset["ticker"], notional=per_asset))
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f})")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
-                    _book_dca("alpaca", asset["ticker"], r)
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient Alpaca cash (${cash:.2f})")
         except Exception as e:

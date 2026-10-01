@@ -353,7 +353,7 @@ def test_dca_engine_default_book_and_failure():
 
 
 # ── dca_module.run_dca ──────────────────────────────────────────────────────
-def run_dca(cb_resp, alp_resp, alpaca_live):
+def run_dca(cb_resp, alp_resp, alpaca_live, lookup=None):
     calls = {"cb_buy": [], "alp_buy": []}
     tmp = tempfile.mkdtemp(prefix="spotdca_")
     cfg = os.path.join(tmp, "cfg.json")
@@ -378,7 +378,7 @@ def run_dca(cb_resp, alp_resp, alpaca_live):
     sys.modules.update(mods)
     dca_module.DCA_CONFIG, dca_module.DCA_LOG = cfg, os.path.join(tmp, "log.json")
     try:
-        out = dca_module.run_dca()
+        out = dca_module.run_dca(lookup=lookup)
     finally:
         dca_module.DCA_CONFIG, dca_module.DCA_LOG = saved_paths
         for k, v in saved.items():
@@ -404,7 +404,10 @@ def test_dca_module_books():
         assert len(rows) == 1 and rows[0]["strategy"] == "DCA_CRYPTO"
         assert rows[0]["fill_status"] == "UNRECONCILED" and rows[0]["order_id"] == "c2"
     with ledger():  # rejected order: no fill, no row
-        run_dca({"success": False, "error": "nope"}, {"message": "forbidden", "code": 403}, True)
+        # (coinbase_trader now always tags a non-2xx with http_status; a bare unclear body is
+        # ambiguous and leaves an UNRECONCILED stub — see test_dca_pending)
+        run_dca({"success": False, "error": "nope", "http_status": 400},
+                {"message": "forbidden", "code": 403}, True)
         assert ftl._read() == []
 
 

@@ -11,7 +11,9 @@ wrapper), timeouts, connection errors, unparseable or bare `success: False` bodi
 A leftover marker is resolved on the next DUE run via the venue's read-only recent_buy_orders:
 found → booked (counts as an ack only if the attempt belongs to the current window), never
 re-bought; venue says none → cleared and retried; lookup failed → pair skipped this run.
-No network of its own; the lookup is the venue module's read-only helper (or an injected fake).
+Orders already booked in the ledger (by id) are never matched. Also used by
+dca_module.run_dca (ledger stubs instead of a state file). No network of its own; the lookup
+is the venue module's read-only helper (or an injected fake).
 """
 from datetime import datetime, timedelta
 
@@ -41,6 +43,18 @@ def outcome(result=None, exc=None, acked=False):
     return "refused" if any(w in low for w in REJECT_WORDS) else "ambiguous"
 
 
+def unbooked(orders, rows=None):
+    """Drop venue orders whose id is already booked in the ledger (another run/writer's fill)."""
+    try:
+        if rows is None:
+            import forward_test_ledger as ftl
+            rows = ftl._read()
+        ids = {str(r.get("order_id")) for r in rows if r.get("order_id")}
+    except Exception:
+        ids = set()
+    return [o for o in orders or [] if not o.get("order_id") or str(o.get("order_id")) not in ids]
+
+
 def _lookup(venue, lookup):
     if lookup is not None:
         return lookup
@@ -65,6 +79,7 @@ def resolve(engine, venue, lookup=None, book=None):
             acts.append(f"DCA: {pair} previous attempt unresolved (venue lookup failed); not re-buying")
             continue
         pend.pop(pair)
+        orders = unbooked(orders)
         if not orders:
             continue
         o = dict(orders[0], success=True, pair=pair)

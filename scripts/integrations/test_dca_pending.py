@@ -184,6 +184,68 @@ def test_venue_wrappers_classify_5xx_as_ambiguous():
         requests.post = orig_post
 
 
+def test_dca_module_ambiguous_stub_then_resolve():
+    """dca_module.run_dca: a 5xx buy leaves an UNRECONCILED stub (no order id); the next run
+    looks the ticker up before buying: found → booked + stub closed, no re-buy; none → stub
+    closed + bought; lookup failed → skipped. Crypto leg only (SPY uses Alpaca paper here)."""
+    import forward_test_ledger as ftl
+    import test_spot_ledger_booking as tsb
+    bad = {"success": False, "error": "<html>502</html>", "http_status": 502, "ambiguous": True}
+    paper = {"id": "a", "status": "accepted"}
+
+    def stubs():
+        done = ftl._settled_ids()
+        return [r for r in ftl._read() if r.get("reason") == "ambiguous_5xx"
+                and r["id"] not in done]
+    with tsb.ledger():
+        out, calls = tsb.run_dca(bad, paper, False, lookup=lambda t, s: [])
+        st = stubs()
+        assert calls["cb_buy"] == ["BTC-USD"] and len(st) == 1, (calls, ftl._read())
+        assert st[0]["fill_status"] == "UNRECONCILED" and "order_id" not in st[0]
+        assert st[0]["intended_notional"] == 5.0 and st[0]["venue"] == "coinbase"
+        # lookup fails → BTC skipped (stub stays), no second POST
+        out, calls = tsb.run_dca(tsb.cb_fill(0.0001, 50000, oid="x"), paper, False,
+                                 lookup=lambda t, s: None)
+        assert calls["cb_buy"] == [] and len(stubs()) == 1 and "unresolved" in out, out
+        # found at the venue → booked as the fill, stub closed, NOT re-bought
+        landed = [{"order_id": "landed-1", "filled_size": "0.0001",
+                   "average_filled_price": "50000", "total_fees": "0.03"}]
+        out, calls = tsb.run_dca(tsb.cb_fill(0.0001, 50000, oid="y"), paper, False,
+                                 lookup=lambda t, s: landed)
+        assert calls["cb_buy"] == [] and stubs() == [], (calls, out)
+        filled = [r for r in ftl._read() if r.get("order_id") == "landed-1"]
+        assert filled and filled[0]["fill_status"] == "FILLED" and filled[0]["entry_fee"] == 0.03
+        # the booked order id is never matched again; a fresh 5xx then "venue says none" → buy
+        tsb.run_dca(bad, paper, False, lookup=lambda t, s: [])
+        assert len(stubs()) == 1
+        out, calls = tsb.run_dca(tsb.cb_fill(0.0001, 50000, oid="z"), paper, False,
+                                 lookup=lambda t, s: landed)  # only the already-booked id
+        assert calls["cb_buy"] == ["BTC-USD"] and stubs() == [], (calls, out)
+        assert [r for r in ftl._read() if r.get("order_id") == "z"]
+
+
+def test_dca_module_timeout_exception_is_stubbed():
+    import dca_module
+    import forward_test_ledger as ftl
+    import test_spot_ledger_booking as tsb
+
+    def timeout():
+        raise TimeoutError("read timed out")
+
+    def halted():
+        raise type("HaltedError", (RuntimeError,), {})("halt")
+    with tsb.ledger():
+        r = dca_module._buy_or_stub("coinbase", "BTC-USD", 5.0, timeout)
+        rows = [x for x in ftl._read() if x.get("reason") == "ambiguous_5xx"]
+        assert r["ambiguous"] is True and len(rows) == 1 and "timed out" in rows[0]["error"], rows
+        try:  # a pre-POST refusal is definitive: re-raised, no stub
+            dca_module._buy_or_stub("coinbase", "ETH-USD", 5.0, halted)
+            raise AssertionError("must re-raise")
+        except RuntimeError as e:
+            assert str(e) == "halt"
+        assert len([x for x in ftl._read() if x.get("reason") == "ambiguous_5xx"]) == 1
+
+
 class _R:
     def __init__(self, ok, body):
         self.ok, self._b = ok, body
