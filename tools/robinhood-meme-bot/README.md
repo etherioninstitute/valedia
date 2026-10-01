@@ -12,8 +12,7 @@ other code in this repo.
 - No transactions are ever signed or sent. There is no wallet, signer, or private-key handling
   anywhere in the code, and no key variables in the configuration.
 - RPC methods used are read-only: `eth_chainId`, `eth_blockNumber`, `eth_getLogs`,
-  `eth_getCode`, `eth_call`. The only other request is a loopback `GET /api/tags` to Ollama
-  (Nimble digest pin).
+  `eth_getCode`, `eth_call`. The only other request is a loopback `GET /api/tags` (digest pin).
 - `LiveSwapExecutor.swap()` raises `NotImplementedError` by design.
 - The model is called only on loopback (`127.0.0.1`) unless you set `NIMBLE_ALLOW_REMOTE=1`.
 - The risk answer and every score are heuristics. **Not financial advice.** New memecoin pools
@@ -40,10 +39,10 @@ labels "1".."10"). It never computes anything, and no threshold (20000, 0.70, 4)
 question text. `gates.py` then applies the numbers. If the model is down, slow, refused, or
 returns anything malformed, the result is `skip` (fail-closed for buying).
 
-At pool creation there is no momentum or buy-pressure data, so the questions only concern facts
-in the state. Risk is a 10-way `choice` rather than Ollama's `score` type because the score
-index scale is ambiguous (0- vs 1-based) and an off-by-one would silently move the risk gate.
-`risk_score = int(choice)`; `risk_expected = sum(k * p_k)` is recorded for information only.
+At pool creation there is no momentum data, so the questions only concern facts in the state.
+Risk is a 10-way `choice`, not Ollama's `score` type (its index base is ambiguous and an
+off-by-one would silently move the risk gate). `risk_score = int(choice)`;
+`risk_expected = sum(k * p_k)` is recorded for information only.
 
 ### Nimble 2 setup and pin
 
@@ -56,17 +55,16 @@ Default tag `nimble:latest`: Burton's Nimble 2 (Bespoke-Nimble-9B-v2, 8192 ctx),
 - `nimble:latest` and bare `nimble` pass **only** while `GET {nimble base}/api/tags` lists the
   model with a digest starting with `NIMBLE2_DIGEST` (default `24e550a16a70`; override with
   `NIMBLE_DIGEST`, an optional `sha256:` prefix is accepted). Checked in `warmup()` and cached
-  per process: a pass for `DIGEST_OK_TTL_S` = 300 s (`NIMBLE_DIGEST_TTL_S`; junk, <= 0, inf
-  or nan mean 300), then re-verified, so a later re-pull with another digest is caught; a
-  failure for `DIGEST_RETRY_S` = 30 s, then retried. Unverified (Ollama down, model not
-  listed, no digest) or mismatched = refused: every decision is a fail-closed skip with error
-  `digest_unverified: ...` / `digest_mismatch: ...`, logged, and nothing is POSTed.
+  per process: a pass for 300 s (`NIMBLE_DIGEST_TTL_S`; junk, <= 0, inf or nan mean 300), then
+  re-verified so a re-pull with another digest is caught; a failure for 30 s, then retried.
+  Unverified (Ollama down, model not listed, no digest) or mismatched = refused: every decision
+  is a fail-closed skip with error `digest_unverified: ...` / `digest_mismatch: ...`, logged,
+  and nothing is POSTed.
 - Explicit v1 tags (`nimble:9b`, `nimble:v1`, ...) and Tev tags are always refused.
 
-This copies Valedia's rule (source of truth: `scripts/integrations/systemone_pin.py`; same
-constant names and refusal reasons). This project stays standalone, so it is not imported.
-The model's own calibrated temperature is not overridden. At startup `warmup()` makes one tiny
-call so the model is resident (`keep_alive`, default 30m).
+This copies Valedia's rule (source of truth: `scripts/integrations/systemone_pin.py`); the
+project stays standalone, so it is not imported. The model's own temperature is not
+overridden. At startup `warmup()` makes one tiny call so the model is resident (`keep_alive`).
 
 ### Latency: timeout vs budget vs warmup
 
@@ -77,13 +75,12 @@ call so the model is resident (`keep_alive`, default 30m).
 | `DECISION_LATENCY_BUDGET_MS` | 500 | **observable target only**; never blocks or skips anything |
 
 The cap is not a preemptive kill: the HTTP timeout bounds each socket read and the engine
-compares total elapsed time to the cap when the call returns. Plugin engines get the same
-after-the-fact check, but a plugin that hangs forever is not interrupted. The under-0.5 s goal
-depends on hardware and a warm model; it could not be measured from the build sandbox (warm
-3-4 s was seen on a laptop with an earlier Nimble and 3 questions), so a slower-than-budget
-decision still trades if it answers within the cap. Each decision records `latency_ms` and
-`within_budget`; the status line shows model, warm/cold, last latency, p50/p95 and the
-**budget hit-rate**. A low hit-rate with p50 of a few seconds means decisions work but are slow
+compares total elapsed time to the cap when the call returns (plugin engines get the same
+check, but a plugin that hangs forever is not interrupted). The under-0.5 s goal depends on
+hardware and a warm model and was not measured here (3-4 s warm on a laptop with an earlier
+Nimble), so a slower-than-budget decision still trades if it answers within the cap. Each
+decision records `latency_ms` and `within_budget`; the status line shows model, warm/cold,
+last latency, p50/p95 and the **budget hit-rate**. A low hit-rate with p50 of a few seconds means decisions work but are slow
 (smaller quant or more memory are the levers, not a higher timeout); decisions over
 `DECISION_TIMEOUT_S` show up as skips with a `timeout` error.
 
@@ -123,6 +120,9 @@ NIMBLE_ALLOW_REMOTE=0
 DECISION_TIMEOUT_S=10.0
 WARMUP_TIMEOUT_S=120
 DECISION_LATENCY_BUDGET_MS=500
+ENGINE_RETRY_BLOCKS=10
+ENGINE_BREAKER_ERRORS=3
+ENGINE_COOLDOWN_S=30
 ```
 
 ### Quote tokens (built in per chain; QUOTE_TOKENS overrides/extends)
@@ -137,19 +137,19 @@ Burton, corroborated by docs.robinhood.com/chain/protocol-contracts and sqd.dev)
 | 4663 / 46630 | native ETH (v4 currency `0x0`) | - | same price as WETH |
 | 46630 testnet | WETH | `0x7943e237c7F95DA44E0301572D358911207852Fa` | unknown (no USDG on testnet) |
 
-There is **no canonical USDC** on Robinhood Chain: a token named "USDC" at any other address is
-not a stable. WETH's USD price is discovered **at runtime**, never from a hardcoded pool: V3
+There is **no canonical USDC** on Robinhood Chain: a token named "USDC" elsewhere is not a
+stable. WETH's USD price is discovered **at runtime**, never from a hardcoded pool: V3
 factory `getPool(WETH, USDG, fee)` over fee tiers 100/500/3000/10000, using the pool holding the
 most USDG (`balanceOf`). With no V3 pool, a hookless V4 WETH/USDG or ETH/USDG pool found via
 StateView is the fallback. No pool = WETH USD unknown = `liquidity_usd` empty = skip.
 `quote_usd(token, chain_profile, reader)` in `quotes.py` is the reusable function.
-`QUOTE_TOKENS` (comma-separated) overrides or extends the profile: `0xADDR:SYMBOL:stable` is
-1.0 USD; `0xADDR:SYMBOL:pool:0xPOOL` is valued from that V3 pool's slot0 (other side a stable).
+`QUOTE_TOKENS` (comma-separated) extends the profile: `0xADDR:SYMBOL:stable` is 1.0 USD;
+`0xADDR:SYMBOL:pool:0xPOOL` is valued from that V3 pool's slot0 (other side a stable).
 
 ## Uniswap v3 and v4: both are watched
 
-Launches happen on both, so the bot watches both: dropping v3 would blind it, and v4 pools add
-hooks and dynamic fees, which get their own hard gates. One unified pool record carries
+Launches happen on both, so the bot watches both; v4 pools add hooks and dynamic fees, which
+get their own hard gates. One unified pool record carries
 `version` ("v3"/"v4"), the pool address (v3) or bytes32 pool id (v4), `hooks`, `fee` and
 `tick_spacing`. The v4 id is recomputed as `keccak256(abi.encode(PoolKey))` and must equal the
 event id, otherwise the log is skipped.
@@ -162,18 +162,15 @@ event id, otherwise the log is skipped.
 
 Because StateView has one source, both v4 addresses are configurable (`V4_POOL_MANAGER`,
 `V4_STATE_VIEW`) and **verified at startup**: both must have bytecode, `StateView.poolManager()`
-must equal the PoolManager, and a `StateView.getSlot0` call must succeed. On failure the v4
-watcher is disabled with a warning in the action log and on the status line
-(`v4 DISABLED: ...`); v3 keeps running. A transient RPC error leaves v4 unverified (not polled)
-and the check is retried every poll. Chain 46630 has no built-in v4 addresses (v4 off there).
+must equal the PoolManager, and `StateView.getSlot0` must succeed. On failure the v4 watcher is
+disabled with a warning (`v4 DISABLED: ...`) and v3 keeps running; a transient RPC error leaves
+v4 unverified and retried every poll. Chain 46630 has no built-in v4 addresses (v4 off).
 
-v4 specifics: currency `0x0` is native ETH (token facts are read only for the meme side; no
-ERC-20 call is made on address 0). Price comes from `StateView.getSlot0(poolId)` with the same
-Decimal math as v3. v4 has no per-pool contract, so `balanceOf(pool)` is meaningless: real
-reserves are rebuilt from the pool's `ModifyLiquidity` events (net `liquidityDelta` per
-(tickLower, tickUpper), then `getAmountsForLiquidity` with an exact TickMath port at the current
-sqrtPrice). The in-range sum must equal `StateView.getLiquidity(poolId)`; otherwise (logs
-incomplete) liquidity is unknown and the pool is skipped.
+v4 specifics: currency `0x0` is native ETH (no ERC-20 call on address 0). Price comes from
+`StateView.getSlot0(poolId)` with the same Decimal math as v3. v4 has no per-pool contract, so
+real reserves are rebuilt from the pool's `ModifyLiquidity` events (net `liquidityDelta` per
+tick range, then `getAmountsForLiquidity` with an exact TickMath port). The in-range sum must
+equal `StateView.getLiquidity(poolId)`; otherwise liquidity is unknown and the pool is skipped.
 
 ### Re-check window
 
@@ -183,8 +180,21 @@ of this test because the model is asked again) is re-evaluated every poll until
 `creation block + RECHECK_BLOCKS` (default 300; `0` = off). Facts are rebuilt each poll; only
 when they change is Nimble called again and a decision-log line written (`"recheck": n`). An
 engine error (Nimble down, timeout, digest refusal) is not a verdict: the pool stays watched
-and is re-asked next poll until the window ends. A buy ends the watch, and the
+and is re-asked (after the backoff below) until the window ends. A buy ends the watch, and the
 `duplicate_pool` rule still prevents any re-buy.
+
+### Engine failure backoff
+
+A failing or hanging Nimble would otherwise be re-asked for every watched pool each poll, up to
+`DECISION_TIMEOUT_S` per call. Two guards (`recheck.py`, `backoff.py`; `0` turns each off):
+
+- **Per-pool:** after an engine error the pool is not re-asked for `ENGINE_RETRY_BLOCKS`
+  chain blocks (default 10). New pools are still asked once at detection.
+- **Circuit breaker:** after `ENGINE_BREAKER_ERRORS` consecutive engine errors (default 3) all
+  engine calls pause for `ENGINE_COOLDOWN_S` seconds (default 30). Each affected pool gets one
+  decision-log line, a skip with error `engine_cooldown`, and no call is made. Afterwards the
+  next call is a probe: one more error reopens it, a success resets it. Settings are validated
+  at startup; an `engine_cooldown` pool that passed the fact gates stays in the re-check window.
 
 ## Hard gates
 
@@ -231,15 +241,14 @@ bold green `BUY ★`), and an action log. Paper positions append to `POSITIONS_F
 
 `DECISIONS_LOG` (default `decisions.jsonl`, gitignored) gets one JSON line per decision, every
 outcome: one at detection, plus one per re-check whose facts changed (or whose earlier answer
-was an engine error). Each line has timestamp, pool, `version`, `recheck`, `pool_record`, full
-state, the model's full raw response, parsed decision, latency, `within_budget`, the gate list
-(value / threshold / passed), `final_action`, and `position_id`.
+was an engine error, or an `engine_cooldown` skip). Each line has timestamp, pool, `version`,
+`recheck`, `pool_record`, full state, the model's raw response, parsed decision, latency,
+`within_budget`, the gate list (value / threshold / passed), `final_action`, `position_id`.
 
 ```bash
 python -m rh_meme_bot review --last 20                # most recent 20
 python -m rh_meme_bot review --action skip            # what the model said no to
-python -m rh_meme_bot review --action buy --json      # full records
-python -m rh_meme_bot review --final skip             # filter by the post-gate outcome
+python -m rh_meme_bot review --action buy --json      # full records (--final = post-gate)
 ```
 
 ## Restarts and duplicates
@@ -247,17 +256,15 @@ python -m rh_meme_bot review --final skip             # filter by the post-gate 
 `PaperExecutor` reloads `POSITIONS_FILE` at start, continues position ids from the max, and
 refuses a second position for the same pool (logged as a `duplicate_pool` skip). Addresses and
 v4 pool ids are compared lowercase. The dedupe fails closed: a corrupt or torn line containing a
-pool address or id still counts as a known pool, extra fields from a future schema are ignored,
-and new lines always start on a fresh line. Corrupt decision-log records are skipped with a
-warning at startup, and startup errors exit 2 with a one-line message. Pools already in the
-decision log are not decided again after a restart inside `LOOKBACK_BLOCKS`; pass `--redecide`
-to decide them again. Pools whose earlier decision ended in an engine error are retried.
+pool address or id still counts as a known pool. Corrupt decision-log records are skipped with
+a warning, and startup errors exit 2 with a one-line message. Pools already in the decision
+log are not decided again after a restart inside `LOOKBACK_BLOCKS` (`--redecide` overrides);
+pools whose earlier decision ended in an engine error are retried.
 
 ## Plug in a different decision model
 
-`DECISION_ENGINE=` (empty) uses Nimble 2. `DECISION_ENGINE=stub` (or
-`rh_meme_bot.decision:decide`) selects the inert stub that always skips.
-`DECISION_ENGINE=mypkg.model:decide` loads your own callable:
+`DECISION_ENGINE=` (empty) uses Nimble 2; `stub` (or `rh_meme_bot.decision:decide`) selects the
+inert stub that always skips; `mypkg.model:decide` loads your own callable:
 
 ```python
 def decide(state: dict) -> dict:
@@ -266,34 +273,28 @@ def decide(state: dict) -> dict:
 
 `risk_score` is optional but required for a buy to pass the risk gate. Output is validated:
 unknown action, bad confidence, wrong type, or an exception becomes a logged skip. Extra keys
-are preserved in the decision log under `raw.extra`; an unparseable Nimble response body is
-logged as `raw` text (truncated to 4 KB).
+are kept in the decision log under `raw.extra`; an unparseable Nimble body is logged as `raw`.
 `state` keys: `version, token_address, symbol, decimals, total_supply, owner_renounced,
 owner_status, contract_has_code, pool_address (v3), pool_id (v4), fee_tier (None for a dynamic
 fee), has_hooks, dynamic_fee, quote_symbol, price_in_quote, price_usd, liquidity_usd,
 quote_reserve_usd, meme_reserve_usd, tvl_usd, flag_*` (v4 also `v4_liquidity_consistent`).
-Hooks and dynamic fee reach the model only as booleans; the hooks address is in the log's
-`pool_record`. Unreadable facts are `None`.
+Hooks and dynamic fee reach the model only as booleans (the hooks address is in the log's
+`pool_record`). Unreadable facts are `None`.
 
 ## Tests
 
 `python3 -m pytest -q` (needs `pytest`) runs fully offline: fake RPC and fake Nimble
-transports, no network. The `PoolCreated`, v4 `Initialize` and `ModifyLiquidity` topics, all selectors (incl. `getPool`
-0x1698ee82, `getSlot0(bytes32)`, `getLiquidity(bytes32)`, `poolManager()`) and v4 pool ids are
-checked against an independent pure-Python keccak-256 (`tests/keccak.py`). TickMath is checked
-against known vectors (tick 0 = 2^96, MIN/MAX ticks) and an 80-digit Decimal reference.
+transports, no network. Event topics, all selectors and v4 pool ids are checked against an
+independent pure-Python keccak-256 (`tests/keccak.py`); TickMath against known vectors and an
+80-digit Decimal reference. Backoff tests use a fake chain head and a fake monotonic clock.
 
 ## Limitations
 
-- Not exercised against the live Robinhood RPC or a real Nimble 2 here (no access from the
-  build sandbox). First live check: `python -m rh_meme_bot --headless --once`. The digest pin
-  and actual latency are unverified against a real Ollama.
+- Not run against the live Robinhood RPC or a real Nimble 2. First live check:
+  `python -m rh_meme_bot --headless --once`.
 - `liquidity_usd` relies on token balances (v3) or ModifyLiquidity history (v4) and the quote
   mapping; fee-on-transfer or rebasing tokens can make balances misleading.
-- Positions are only appended, never marked to market or closed.
-- Uniswap **v2** launches are not watched (future item).
-- The re-check list is in memory only; a restart forgets it.
-- The V4 StateView address has a single source. It is verified on-chain at startup, but no
-  address here was checked against the live chain from the build sandbox.
-- Reorgs are not handled; polling starts at head minus `LOOKBACK_BLOCKS` and the last block is
-  not persisted across restarts.
+- Positions are only appended, never marked to market or closed. Uniswap **v2** is not watched.
+- The re-check list and the breaker state are in memory only; a restart forgets them.
+- The V4 StateView address has one source (verified on-chain at startup). Reorgs are not
+  handled; polling starts at head minus `LOOKBACK_BLOCKS` (not persisted).
