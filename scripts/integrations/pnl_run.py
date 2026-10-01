@@ -13,7 +13,6 @@ signal_verify.LEDGER_STALE_OPEN_S (36h) with positions open, or LEDGER_STALE_ANY
 WR flags are report-only and do not feed Kelly.
 """
 import sys, os
-from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import signal_verify as sv
 
@@ -22,42 +21,44 @@ ALL_TIME = "Realized P&L (all-time, ledger, all venues, fee-incl.)"
 
 
 def settled_at(s):
-    """Settlement time: the row's own settlement field, else when it was booked.
-    Missing / non-string / garbage -> None (the 24h figure is then omitted)."""
-    raw = s.get("settled_at") or s.get("settlement_ts") or s.get("ts") or s.get("logged_at")
-    return sv.parse_ts(raw) if isinstance(raw, str) else None
+    """Settlement time (ledger_view.settled_time): the row's own settlement field, else
+    when it was booked. Missing / non-string / garbage -> None (24h figure omitted)."""
+    import ledger_view as lv
+    return lv.settled_time(s)
 
 
 def pnl_report(get_positions=None, ledger=None, send_fn=None, now=None):
     """11pm P&L: Invested (broker) + Profit (ledger realized, fee-incl.). Never sends
-    nothing: any unexpected error -> one withheld notice."""
-    now = now or sv.utcnow()
+    nothing: any unexpected error -> one withheld notice. now=None -> taken AFTER the
+    ledger is read (a row booked during the read is never "future")."""
     try:
         return _pnl_report(get_positions, ledger, send_fn, now)
     except Exception as e:
-        return sv.withhold("11pm P&L", "report failed", f"{type(e).__name__}: {e}", send_fn, now)
+        return sv.withhold("11pm P&L", "report failed", f"{type(e).__name__}: {e}", send_fn,
+                           now or sv.utcnow())
 
 
 def _pnl_report(get_positions, ledger, send_fn, now):
+    import ledger_view as lv
     kind = "11pm P&L"
     ledger = ledger or sv.read_ledger
     try:
         recs, snap = ledger(), sv.broker_snapshot(get_positions, now)
         recs2, snap2 = ledger(), sv.broker_snapshot(get_positions, now)  # independent re-reads
     except Exception as e:
-        return sv.withhold(kind, "source read failed", e, send_fn, now)
-    real, real2 = sv.ledger_realized(recs), sv.ledger_realized(recs2)
-    day, cut = now.astimezone().date(), now - timedelta(hours=24)  # cron is 11pm local
+        return sv.withhold(kind, "source read failed", e, send_fn, now or sv.utcnow())
+    now = now or sv.utcnow()  # after the reads
+    real, real2 = sv.ledger_realized(recs, now), sv.ledger_realized(recs2, now)  # shared selection
+    day = now.astimezone().date()  # cron is 11pm local
     claim = sv.claim
     claims = [claim("Open-position cost", snap["invested"], snap2["invested"], "broker re-read"),
               claim("open positions", snap["n"], snap2["n"], "broker re-read", tol=0)]
     lines = [f"💰 Valedia P&L — {day.isoformat()}",
              f"Open-position cost (Kalshi, broker): {sv.money(snap['invested'])}"]
-    bad = max(real["bad"], real2["bad"])
-    if bad:  # garbage / NaN / orphan / conflicting duplicate rows: never summed, never 0.00
-        what = "conflicting duplicate settlement" if real["conflict"] else "unparseable"
-        lines += [f"{ALL_TIME}: omitted — {bad} ledger row(s) {what}",
-                  "Settled last 24h (ledger): omitted — ledger rows unparseable"]
+    reason = real["reason"] or real2["reason"]
+    if reason:  # garbage / NaN / orphan / future / conflicting rows: never summed, never 0.00
+        lines += [f"{ALL_TIME}: omitted — {reason}", f"Settled last 24h (ledger): omitted — {reason}"]
+        bad = max(real["bad"], real2["bad"])
         claims.append(claim("bad rows", bad, bad, "ledger re-read", tol=0))
     else:
         prof = sv.money(real["total"], signed=True)
@@ -67,14 +68,11 @@ def _pnl_report(get_positions, ledger, send_fn, now):
                    sv.sum_claim("Realized total", real["total"], real2["parts"]),
                    claim("wins", real["wins"], real2["wins"], "ledger re-read", tol=0),
                    claim("losses", real["losses"], real2["losses"], "ledger re-read", tol=0)]
-        untimed = sum(1 for s in real["settlements"] if settled_at(s) is None)
+        (t1, untimed), (t2, _) = (lv.last_24h(r["settlements"], now) for r in (real, real2))
         if untimed:  # never a verified 0.00 for rows we cannot place in time
             lines.append(f"Settled last 24h (ledger): omitted — {untimed} row(s) lack times")
             claims.append(claim("untimed rows", untimed, untimed, "ledger re-read", tol=0))
         else:
-            last = lambda rows: [s for s in rows if cut < settled_at(s) <= now]  # noqa: E731
-            t1, t2 = (sv.dsum(sv.num(s.get("realized_pnl_net")) for s in last(r["settlements"]))
-                      for r in (real, real2))
             lines.append(f"Settled last 24h (ledger): {sv.money(t1, signed=True)}")
             claims.append(claim("last 24h", t1, t2, "ledger re-read"))
     body = "\n".join(lines)

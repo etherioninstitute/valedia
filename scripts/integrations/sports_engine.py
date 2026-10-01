@@ -345,9 +345,31 @@ def execute_bets(bets, dry_run=False, bankroll=None, fv_fn=None, fmap=None):
 # ═══ STEP 4: TRACK — Log everything ═══
 
 def load_log():
-    if os.path.exists(SPORTS_LOG):
-        try: return json.load(open(SPORTS_LOG))
-        except: pass
+    """Missing -> fresh log. Corrupt JSON / wrong shape -> the file is MOVED aside to
+    sports_engine_log.corrupt-<ts>.json (history never overwritten), one figure-free
+    Signal alert, then a fresh log. Unreadable (I/O) -> raises (caller must not save)."""
+    if not os.path.exists(SPORTS_LOG):
+        return {"bets": [], "stats": {}}
+    with open(SPORTS_LOG, "rb") as f:
+        raw = f.read()
+    try:
+        log = json.loads(raw.decode("utf-8"))
+        if isinstance(log, dict) and isinstance(log.get("bets", []), list):
+            log.setdefault("bets", [])
+            return log
+    except (ValueError, UnicodeDecodeError):
+        pass
+    aside = SPORTS_LOG[:-len(".json")] + datetime.now(timezone.utc).strftime(
+        ".corrupt-%Y%m%dT%H%M%S%fZ.json")
+    os.replace(SPORTS_LOG, aside)  # raises if it cannot be kept -> caller does not save
+    print(f"[sports_engine] corrupt sports log moved to {aside}; starting fresh", file=sys.stderr)
+    try:
+        import signal_verify as _sv
+        _sv.deliver("Sports log", "Sports log corrupt — moved aside (history kept), started "
+                    "fresh; sports figures come from the ledger only", info={"moved_to": aside},
+                    dedupe_key="sports-log-corrupt:" + aside, dedupe_window_s=86400)
+    except Exception as e:
+        print(f"[sports_engine] corrupt-log alert failed: {e}", file=sys.stderr)
     return {"bets": [], "stats": {}}
 
 def save_log(log):

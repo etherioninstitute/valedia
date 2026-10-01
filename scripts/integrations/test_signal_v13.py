@@ -191,7 +191,7 @@ def test_decimal_sums():
         from decimal import Decimal, ROUND_HALF_UP
         exact = sum(Decimal(str(x)) for x in found).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         assert sv.money(sv.dsum(found)) == f"${exact}", found
-    real = sv.ledger_realized([ent("a"), st("a", 0.1, True, t(1)), ent("b"), st("b", 0.2, True, t(1))])
+    real = sv.ledger_realized([ent("a"), st("a", 0.1, True, t(1)), ent("b"), st("b", 0.2, True, t(1))], NOW)
     assert real["total"] == 0.3
 
 

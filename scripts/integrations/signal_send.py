@@ -4,8 +4,8 @@ Money reports must go through signal_verify.deliver(), which checks every
 figure against broker/ledger before calling send().
 send() is TRI-STATE and never raises:
   True  = relay exited 0 (delivered)
-  False = confirmed failure (relay exited non-zero / ssh missing) -> safe to retry
-  None  = unknown (timeout or unexpected error): it may or may not have arrived
+  False = confirmed failure (relay exited non-zero other than 255 / ssh missing) -> retry
+  None  = unknown (ssh exit 255, timeout or unexpected error): may or may not have arrived
 VALEDIA_SIGNAL_DRY=1 prints instead of sending (tests / dry runs).
 (c) GOATWORTHY Post LLC
 """
@@ -36,6 +36,10 @@ def send(msg):
             'ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no', 'openclaw',
             f"openclaw message send --channel signal --target '{TARGET}' --message '{safe}'"
         ], capture_output=True, timeout=20)
+        if r.returncode == 255:  # ssh's own error: the link may drop after the remote ran
+            print(f"[signal_send] ssh exit 255, delivery unknown: "
+                  f"{(r.stderr or b'')[:200]!r}", file=sys.stderr)
+            return None
         if r.returncode != 0:
             print(f"[signal_send] relay exit {r.returncode}: "
                   f"{(r.stderr or b'')[:200]!r}", file=sys.stderr)
