@@ -69,8 +69,13 @@ Three separate knobs:
 | Setting | Default | Role |
 |---|---|---|
 | `WARMUP_TIMEOUT_S` | 120 | startup warmup call only; the first call cold-loads the 9B model |
-| `DECISION_TIMEOUT_S` | 10 | **hard cap** per decision; exceeding it (even if the server answers late) is a skip, fail-closed |
+| `DECISION_TIMEOUT_S` | 10 | per-decision cap, **checked on return**: an answer that took longer is discarded and the pool is skipped, fail-closed |
 | `DECISION_LATENCY_BUDGET_MS` | 500 | **observable target only**; never blocks or skips anything |
+
+The cap is not a preemptive kill. For Nimble, the HTTP timeout bounds each socket read and the
+engine then compares total elapsed time to the cap when the call returns. The bot applies the
+same after-the-fact check to plugin engines (over the cap = skip), but a plugin that hangs
+forever is not interrupted unless it implements its own timeout.
 
 The under-0.5 s goal depends on your hardware and on the model being warm; it could not be
 measured from the build sandbox, and warm latencies of 3-4 s were seen on a laptop with an
@@ -185,7 +190,11 @@ python -m rh_meme_bot review --final skip             # filter by the post-gate 
 
 `PaperExecutor` reloads `POSITIONS_FILE` at start, continues position ids from the max, and
 refuses a second position for the same pool (a `duplicate_pool` gate failure is logged as a
-skip). Pools already in the decision log are not decided again after a restart inside
+skip). Addresses are compared lowercase. The dedupe fails closed: a corrupt or torn line in the
+positions file that contains a pool address still counts as a known pool, extra fields from a
+future schema are ignored, and new lines always start on a fresh line. Corrupt decision-log
+records are skipped with a warning at startup instead of crashing, and startup errors exit 2
+with a one-line message. Pools already in the decision log are not decided again after a restart inside
 `LOOKBACK_BLOCKS` (so the log keeps one line per decision); pass `--redecide` to decide them
 again. Pools whose earlier decision ended in an engine error (e.g. Ollama was down) are
 retried automatically.

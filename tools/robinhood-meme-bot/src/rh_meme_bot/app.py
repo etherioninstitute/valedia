@@ -33,13 +33,26 @@ class Bot:
         # Pools already decided (in an earlier run) are not decided again after a restart
         # inside the lookback window, so the log keeps one line per decision. Records that
         # ended in an engine error do not count: those are retried.
-        self.seen_pools = set() if (redecide or decision_log is None) else {
-            r["pool"] for r in read_records(decision_log.path)
-            if r.get("pool") and not (r.get("decision") or {}).get("error")}
+        self.seen_pools = set() if (redecide or decision_log is None) \
+            else self._load_seen(decision_log.path)
         self.stats = LatencyStats(cfg.decision_latency_budget_ms)
         self.quote_usd = QuoteUsd(reader, cfg.quote_tokens)
         self.watcher = PoolWatcher(reader, cfg.lookback_blocks, cfg.max_block_range,
                                    on_error=lambda m: sink.action(f"RPC error: {m}"))
+
+    def _load_seen(self, path: str) -> set:
+        """Pools with a completed (non-error) decision. Corrupt records are skipped, not fatal."""
+        seen, bad = set(), 0
+        for r in read_records(path):
+            dec, pool = r.get("decision"), r.get("pool")
+            if not isinstance(pool, str) or not pool or not isinstance(dec, dict):
+                bad += 1
+                continue
+            if not dec.get("error"):
+                seen.add(pool.lower())
+        if bad:
+            self.sink.action(f"WARNING: skipped {bad} unreadable record(s) in {path}")
+        return seen
 
     @property
     def model_name(self) -> str:
@@ -85,6 +98,10 @@ class Bot:
             wall = (self._perf() - t0) * 1000.0
             if problem:
                 decision["error"] = decision["error"] or problem
+            cap_ms = self.cfg.decision_timeout_s * 1000.0
+            if wall > cap_ms and not decision["error"]:  # same post-hoc cap for plugin engines
+                decision.update(action="skip", confidence=0.0, risk_score=None,
+                                error=f"timeout: engine took {wall:.0f}ms > cap {cap_ms:.0f}ms")
             latency = decision["latency_ms"] if decision["latency_ms"] is not None else wall
             within = self.stats.record(latency)
             self.stats.warm, self.stats.last_error = not decision["error"], decision["error"]
@@ -104,7 +121,7 @@ class Bot:
                 gate = "duplicate_pool" if isinstance(e, DuplicatePoolError) else "executor"
                 gates.append({"gate": gate, "value": f"{type(e).__name__}: {e}",
                               "threshold": "no error", "passed": False})
-        self.seen_pools.add(ev.pool)
+        self.seen_pools.add(ev.pool.lower())
         self._log(ts, ev, state, decision, latency, within, gates, final, position)
         self.sink.decision({
             "pool": ev.pool, "action": decision["action"], "confidence": decision["confidence"],
@@ -148,7 +165,7 @@ class Bot:
         self.sink.status(f"head={self.watcher.last_head} scanned_to={self.watcher.last_block} "
                          f"new_pools={len(events)}")
         for ev in events:
-            if ev.pool in self.seen_pools:
+            if ev.pool.lower() in self.seen_pools:
                 self.sink.action(f"already decided, skipping pool {ev.pool} (use --redecide)")
                 continue
             try:
@@ -204,6 +221,9 @@ def main(argv: Optional[List[str]] = None, transport=None, nimble_transport=None
         bot.reader.verify_chain()
     except (ConfigError, ValueError, ChainMismatchError, RpcError) as e:
         print(f"error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 - e.g. unreadable positions file: clear message, not a traceback
+        print(f"error: startup failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     try:
         if isinstance(sink, Dashboard):

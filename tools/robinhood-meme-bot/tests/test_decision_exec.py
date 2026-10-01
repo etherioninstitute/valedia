@@ -153,3 +153,67 @@ def test_plugin_extra_keys_preserved_under_raw_and_invalid_output_kept():
     dec, problem = validate_decision({"action": "moon", "confidence": 3, "note": "n"})
     assert problem and "moon" in dec["raw"]["invalid_output"] and dec["action"] == "skip"
     assert validate_decision({"action": "skip", "confidence": 0})[0]["raw"] is None
+
+
+# ---- final hardening round ------------------------------------------------------------
+POOL_A = "0x" + "ab" * 20
+POOL_B = "0x" + "cd" * 20
+
+
+def _row(i, pool, **extra):
+    row = {"entry_price": "1", "id": i, "pool": pool, "simulated": True, "size": 100.0,
+           "timestamp": "2026-01-01T00:00:00+00:00", "token": "0x" + "11" * 20, **extra}
+    return json.dumps(row, sort_keys=True)
+
+
+def test_torn_last_line_is_fail_closed_and_next_write_starts_fresh(tmp_path):
+    from rh_meme_bot.executor import DuplicatePoolError
+    p = tmp_path / "pos.jsonl"
+    torn = _row(7, POOL_B)[:-25]  # cut mid-line, no trailing newline
+    p.write_text(_row(1, POOL_A) + "\n" + torn)
+    ex = PaperExecutor(str(p))
+    assert ex.has_position(POOL_A) and ex.has_position(POOL_B)  # torn line still blocks POOL_B
+    with pytest.raises(DuplicatePoolError):
+        ex.buy(POOL_B, "0x" + "22" * 20, 1.0, Decimal(1))
+    assert ex._next_id == 8  # ids continue past the torn line's id too
+    new = ex.buy("0x" + "ef" * 20, "0x" + "33" * 20, 1.0, Decimal(2))
+    lines = p.read_text().split("\n")
+    assert lines[-1] == "" and json.loads(lines[-2])["id"] == 8 and new.id == 8
+    assert lines[1] == torn  # torn line left intact on its own line, not merged with ours
+
+
+def test_complete_line_without_trailing_newline_gets_separator(tmp_path):
+    p = tmp_path / "pos.jsonl"
+    p.write_text(_row(1, POOL_A))  # no newline at EOF
+    ex = PaperExecutor(str(p))
+    ex.buy(POOL_B, "0x" + "22" * 20, 1.0, Decimal(1))
+    rows = [json.loads(x) for x in p.read_text().splitlines()]
+    assert [r["id"] for r in rows] == [1, 2]
+
+
+def test_schema_drift_extra_field_and_garbage_lines(tmp_path):
+    p = tmp_path / "pos.jsonl"
+    garbage_with_pool = f"CORRUPT <<{POOL_B.upper().replace('0X', '0x')}>> id junk"
+    p.write_text("\n".join([_row(3, POOL_A, new_field="v2", nested={"a": 1}),
+                            "total garbage without any address",
+                            garbage_with_pool, "[1, 2]", ""]) + "\n")
+    ex = PaperExecutor(str(p))
+    assert [x.id for x in ex.positions] == [3] and ex._next_id == 4
+    assert ex.has_position(POOL_A)  # extra fields tolerated
+    assert ex.has_position(POOL_B)  # unparsable line containing a pool address: known
+    assert not ex.has_position("0x" + "99" * 20)
+
+
+def test_address_case_is_normalised(tmp_path):
+    from rh_meme_bot.executor import DuplicatePoolError
+    p = tmp_path / "pos.jsonl"
+    mixed = "0x" + "Ab" * 20
+    p.write_text(_row(1, mixed) + "\n")
+    ex = PaperExecutor(str(p))
+    assert ex.has_position(mixed.lower()) and ex.has_position(mixed.upper().replace("0X", "0x"))
+    assert ex.positions[0].pool == mixed.lower()
+    with pytest.raises(DuplicatePoolError):
+        ex.buy(mixed.upper().replace("0X", "0x"), "0x" + "22" * 20, 1.0, Decimal(1))
+    ex.buy("0x" + "Cd" * 20, "0x" + "22" * 20, 1.0, Decimal(1))
+    assert ex.has_position("0x" + "cd" * 20)
+    assert json.loads(p.read_text().splitlines()[-1])["pool"] == "0x" + "cd" * 20
