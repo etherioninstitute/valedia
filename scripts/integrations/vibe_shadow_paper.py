@@ -15,6 +15,7 @@ import math
 import os
 from datetime import datetime, timezone
 
+import nimble_wiring_spot as nws
 import valedia_config as vc
 
 MODE = "PAPER/SHADOW"
@@ -166,7 +167,12 @@ def decide(trade, state, limits=None, env=None):
         return _row(trade, "daily_notional", 0)
     if size < float(limits["min_size_usd"]):
         return _row(trade, "size_too_small", 0)
-    return _row(trade, "shadow_log", size)
+    # Last step before the shadow entry: Nimble 2 verdict (shadow stamps; veto may skip it).
+    nv = nws.gate(None, trade.get("symbol"), {"fee_check": {"pass": True}, "q": {"p5": prior}},
+                  source="vibe_shadow_paper", venue="vibe-paper", label="shadow_log")
+    if nws.blocked(nv):
+        return nws.stamp(_row(trade, nws.SKIP, 0), nv)
+    return nws.stamp(_row(trade, "shadow_log", size), nv)
 
 
 def read_decisions(path=None):

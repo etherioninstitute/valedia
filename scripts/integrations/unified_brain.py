@@ -32,6 +32,7 @@ except Exception:
     _ftl = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimble_wiring_spot as nws  # Nimble 2 entry veto (shadow default; SELL never asked)
 
 # Memory system (graceful — works even if Memori unavailable)
 try:
@@ -868,6 +869,17 @@ def run_brain():
                     fee_check["pass"] and ere["safe"] and
                     not has_pos and actionable):
 
+                # Live spot BUY needs the venue writer to be valedia. Exits below are
+                # deliberately not writer-gated (a lock must never strand a position).
+                if plat in ("coinbase", "alpaca") and not nws.venue_buy_allowed(plat):
+                    lines.append(nws.writer_skip_line(name, plat))
+                    continue
+                _nv = nws.gate(asset_cls, ticker, {"fused": fused, "q": q, "fee_check": fee_check,
+                               "has_pos": has_pos, "ere": ere}, source="unified_brain", venue=plat, label="buy") \
+                    if (plat == "coinbase" and cb and cb_cash >= position) or (plat == "alpaca" and alpaca) else None
+                lines.extend(nws.note(name, _nv))
+                if nws.blocked(_nv):
+                    continue
                 executed = False
                 buy_resp = None
                 if plat == "coinbase" and cb and cb_cash >= position:
@@ -987,8 +999,12 @@ def run_brain():
         )
         if cb and dca.should_buy() and cb_cash >= 5:
             _, cb_buy_fn, _, _ = cb
-            for da in dca.execute(cb_buy_fn, lambda: cb_cash):
-                lines.append(f"  {da}"); actions.append(da)
+            # Facts DCA actually knows: fee only (static round trip). No kernel score or price
+            # history here, and already_held is never sent for DCA (re-buying held names is the point).
+            _rows = {pair: nws.dca_row("coinbase", dca.weekly_budget * w) for pair, w in dca.assets.items()}
+            for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca", rows=_rows),
+                                  lambda: cb_cash, venue="coinbase"):
+                lines.append(f"  {da}"); actions += [da] if da.startswith("DCA: bought") else []
         elif dca.should_buy():
             lines.append("  DCA: ready — insufficient USD or Coinbase offline")
     except Exception as e:

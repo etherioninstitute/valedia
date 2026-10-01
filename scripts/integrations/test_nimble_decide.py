@@ -114,7 +114,7 @@ def test_off_no_call():
     v = _decide(_post(choice="skip", calls=calls))
     assert v["allow"] is True and v["mode"] == "off" and not calls and not _lines()
     assert set(v) == {"action", "confidence", "risk", "mode", "allow", "reason",
-                      "latency_ms", "within_budget", "error"}
+                      "latency_ms", "within_budget", "error", "p_action", "p_buy"}
 
 
 def test_shadow_never_blocks():
@@ -288,6 +288,44 @@ def test_fact_builders():
     assert all(v is None for v in nd.prediction_facts({}).values())
 
 
+def test_confidence_is_not_p_chosen():
+    """Verified on Burton's Mac: confidence = 1 - normalized entropy, NOT P(chosen)."""
+    def post(url, payload, timeout):
+        return {"model": payload["model"], "answers": {
+            "action": {"choice": "skip", "confidence": 0.00159,
+                       "probabilities": {"buy": 0.4765, "skip": 0.5235}},
+            "risk": {"choice": "5"}}}
+    _reset(mode="shadow")
+    v = _decide(post)
+    assert v["action"] == "skip" and v["confidence"] == 0.00159
+    assert v["p_action"] == 0.5235 and v["p_buy"] == 0.4765
+    for k in ("action", "confidence", "risk", "mode", "allow", "reason", "latency_ms",
+              "within_budget", "error"):  # existing keys kept
+        assert k in v
+    # veto still uses confidence (not p_buy / p_action): skip is vetoed, a "buy" at the
+    # same near-coin-flip confidence is low_confidence even though p_buy is recorded
+    _reset(mode="veto")
+    v = _decide(post)
+    assert v["allow"] is False and v["reason"] == "veto_model_skip" and v["p_buy"] == 0.4765
+
+    def post_buy(url, payload, timeout):
+        return {"model": payload["model"], "answers": {
+            "action": {"choice": "buy", "confidence": 0.00159,
+                       "probabilities": {"buy": 0.5235, "skip": 0.4765}}, "risk": {"choice": "5"}}}
+    v = _decide(post_buy)
+    assert v["allow"] is False and v["reason"] == "veto_low_confidence"
+    assert v["p_action"] == 0.5235 == v["p_buy"]
+    # no probabilities: no invented odds
+    def bare(url, payload, timeout):
+        return {"model": payload["model"], "answers": {"action": {"choice": "buy", "confidence": 0.9}}}
+    v = _decide(bare)
+    assert v["p_action"] is None and v["p_buy"] is None and v["allow"] is True
+    # engine off / exit: keys present, None
+    _reset(mode="veto", enabled=False)
+    v = _decide(post)
+    assert v["p_action"] is None and v["p_buy"] is None
+
+
 if __name__ == "__main__":
     test_questions_have_no_digits()
     test_modes_resolution()
@@ -301,4 +339,5 @@ if __name__ == "__main__":
     test_informed_none_is_computed_offline()
     test_decide_many_cap()
     test_fact_builders()
+    test_confidence_is_not_p_chosen()
     print("test_nimble_decide: OK")

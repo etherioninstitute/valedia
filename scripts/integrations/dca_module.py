@@ -6,6 +6,8 @@ Splits available cash across top-scoring assets.
 import os, sys, json
 from datetime import datetime, timezone
 sys.path.insert(0, "/Users/burtonchatelain/.openclaw/workspace/scripts/integrations")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimble_wiring_spot as nws  # Nimble 2 entry veto (shadow default)
 
 DCA_CONFIG = "/Users/burtonchatelain/.openclaw/workspace/models/dca_config.json"
 DCA_LOG = "/Users/burtonchatelain/.openclaw/workspace/models/dca_log.json"
@@ -35,6 +37,10 @@ def log_dca(entry):
     log = log[-200:]
     with open(DCA_LOG, "w") as f: json.dump(log, f, indent=2, default=str)
 
+# Exits: none here. run_dca only BUYs, and a writer lock must never block a sell.
+# No last-run state: every scheduled run re-evaluates, so a vetoed / blocked run
+# already retries on the next run (unlike strategy_modules.DCAEngine's weekly last_buy).
+
 def run_dca():
     import yfinance as yf
     from kernel_predictor_v16e import KernelPredictor
@@ -52,7 +58,7 @@ def run_dca():
             if len(p)<80: continue
             sig = KernelPredictor("crypto").predict(p)
             if sig["score"] >= cfg["min_score"]:
-                scored.append({"ticker":tk,"score":sig["score"],"type":"crypto"})
+                scored.append({"ticker":tk,"score":sig["score"],"type":"crypto","prices":p})
         except: pass
     for tk in cfg["equity_tickers"]:
         try:
@@ -60,7 +66,7 @@ def run_dca():
             if len(p)<80: continue
             sig = KernelPredictor("equity").predict(p)
             if sig["score"] >= cfg["min_score"]:
-                scored.append({"ticker":tk,"score":sig["score"],"type":"equity"})
+                scored.append({"ticker":tk,"score":sig["score"],"type":"equity","prices":p})
         except: pass
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:cfg["max_assets"]]
@@ -73,7 +79,16 @@ def run_dca():
             if asset["type"] == "crypto":
                 bal = get_balances()
                 cash = bal.get("USD",{}).get("balance",0)
+                if not nws.venue_buy_allowed("coinbase"):
+                    lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER coinbase writer!=valedia")
+                    continue
                 if cash >= per_asset:
+                    row = nws.dca_row("coinbase", per_asset, score=asset["score"], prices=asset.get("prices"))
+                    nv = nws.gate("crypto", asset["ticker"], row,
+                                  source="dca_module", venue="coinbase", label="dca")
+                    lines.extend(nws.note(asset["ticker"], nv))
+                    if nws.blocked(nv):
+                        continue
                     r = cb_buy(asset["ticker"], per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f}) -> {r.get('success','?')}")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
@@ -86,9 +101,18 @@ def run_dca():
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient CB cash (${cash:.2f})")
             else:
+                if not nws.venue_buy_allowed("alpaca"):
+                    lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER alpaca writer!=valedia")
+                    continue
                 acct = get_account()
                 cash = float(acct.get("cash",0))
                 if cash >= per_asset:
+                    row = nws.dca_row("alpaca", per_asset, score=asset["score"], prices=asset.get("prices"))
+                    nv = nws.gate("equity", asset["ticker"], row,
+                                  source="dca_module", venue="alpaca", label="dca")
+                    lines.extend(nws.note(asset["ticker"], nv))
+                    if nws.blocked(nv):
+                        continue
                     r = alp_buy(asset["ticker"], notional=per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f})")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
