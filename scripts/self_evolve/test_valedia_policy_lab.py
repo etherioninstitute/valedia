@@ -6,7 +6,9 @@ Covers: init layout/git/pins, holdout outside the tree, lab suite PASS for a bet
 candidate / FAIL for worse / not-PASS for INSUFFICIENT, IMMUTABLE edits detected and
 refused at PATCH, --live refused, builtin evolve round end-to-end (STATIC_REJECT),
 full self-evolve ACCEPT of an injected better candidate + REJECT of a worse one,
-export proposal + re-adjudication + tamper refusal + out-path guard."""
+export proposal + re-adjudication + tamper refusal + out-path guard; grid proposer:
+ACCEPTs blocking the losing category over 2 rounds + export, no-op on a flat lab,
+deterministic, never opens holdout/pins (open() audit), 200-candidate cap."""
 import json
 import os
 import re
@@ -33,12 +35,19 @@ WORSE = dict(BASE, name="block_good", categories_block=["GOOD"])
 THIN = dict(BASE, name="rare_only", categories_allow=["RARE"])
 
 
-def _ledger(path, n=150):
-    """GOOD wins 7/10, BAD always loses, a few RARE; recorded (net) fees, live source."""
+def _ledger(path, n=150, kind="bad"):
+    """kind=bad: GOOD wins 7/10, BAD always loses, a few RARE. kind=flat: two categories,
+    both win 7/10 (nothing to improve). kind=wide: 25 categories (search-cap test).
+    Recorded (net) fees, live source."""
     rows = []
     for i in range(n):
-        cat = "RARE" if i % 37 == 5 else ("BAD" if i % 3 == 0 else "GOOD")
-        won = cat != "BAD" and i % 10 not in (1, 4, 7)
+        if kind == "flat":
+            cat, won = ("A" if i % 2 else "B"), i % 10 not in (1, 4, 7)
+        elif kind == "wide":
+            cat, won = "C%02d" % (i % 25), (i * 7) % 10 not in (1, 4, 7)
+        else:
+            cat = "RARE" if i % 37 == 5 else ("BAD" if i % 3 == 0 else "GOOD")
+            won = cat != "BAD" and i % 10 not in (1, 4, 7)
         eid, ts = "e%03d" % i, "2026-01-%02dT%02d:00:00Z" % (1 + i // 24, i % 24)
         fee = kalshi_fee(0.5, 10)
         rows.append({"type": "entry", "id": eid, "ts": ts, "strategy": cat, "venue": "kalshi",
@@ -60,9 +69,9 @@ def _baseline_file():
     return p
 
 
-def _init(name, n=150):
+def _init(name, n=150, kind="bad"):
     lab = os.path.join(TMP, name)
-    r = subprocess.run(CLI + ["init", "--lab", lab, "--ledger", _ledger(lab + ".jsonl", n),
+    r = subprocess.run(CLI + ["init", "--lab", lab, "--ledger", _ledger(lab + ".jsonl", n, kind),
                               "--baseline", _baseline_file(), "--n-boot", "400"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -196,7 +205,7 @@ def check_live_refused(lab):
 
 
 def check_evolve_builtin(lab):
-    r = subprocess.run(CLI + ["evolve", "--lab", lab, "--max-rounds", "1"],
+    r = subprocess.run(CLI + ["evolve", "--lab", lab, "--max-rounds", "1", "--proposer", "none"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     s = json.loads(r.stdout)
@@ -256,6 +265,69 @@ def check_accept_and_export(lab):
     assert r.returncode == 1 and "IMMUTABLE" in r.stderr, r.stderr
 
 
+def _evolve(lab, rounds):
+    r = subprocess.run(CLI + ["evolve", "--lab", lab, "--max-rounds", str(rounds)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def check_grid_evolve(lab, twin):
+    s = _evolve(lab, 2)                                              # default proposer = grid
+    assert s["accepted_versions"] == ["v1"] and s["snapshot_integrity"]["v1"] == "intact", s
+    assert s["grid_searches"][0]["chosen"]["move"] == "block BAD", s["grid_searches"]
+    assert s["grid_searches"][1]["parent"] == "v1"
+    snap = os.path.join(V._snapshot(lab, s["run_id"], "v1"), "policy", "candidate.json")
+    v1 = open(snap).read()
+    assert json.loads(v1)["categories_block"] == ["BAD"]
+    out = os.path.join(TMP, "grid_proposal.json")
+    r = subprocess.run(CLI + ["export", "--lab", lab, "--run-id", s["run_id"], "--out", out],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "IN-SAMPLE" in r.stderr, r.stderr
+    p = json.load(open(out))
+    assert p["candidate_policy"]["categories_block"] == ["BAD"]
+    assert p["search"]["candidates_searched_total"] == sum(
+        g["searched"] for g in s["grid_searches"]) > 0
+    assert "out-of-sample" in p["multiple_comparisons_warning"]
+    s2 = _evolve(twin, 1)                                            # determinism across runs
+    snap2 = os.path.join(V._snapshot(twin, s2["run_id"], "v1"), "policy", "candidate.json")
+    assert open(snap2).read() == v1, "grid proposer not deterministic across runs"
+
+
+def check_grid_noop(lab):
+    s = _evolve(lab, 2)
+    assert s["accepted_versions"] == [], s
+    assert all(g["chosen"] is None for g in s["grid_searches"]) and len(s["grid_searches"]) == 2
+    assert [x["phase"] for x in s["static_rejects"]] == ["PROPOSE", "PROPOSE"], s
+
+
+def check_grid_unit(lab, wide):
+    import builtins
+    import time
+    import grid_proposer as GP
+    real_open, opened = builtins.open, []
+
+    def audit(path, *a, **k):
+        opened.append(os.path.realpath(str(path)))
+        return real_open(path, *a, **k)
+    builtins.open = audit
+    try:
+        r1, r2 = GP.propose(lab), GP.propose(lab)
+    finally:
+        builtins.open = real_open
+    assert r1 == r2 and r1["proposals"], "same inputs must give the same proposal"
+    priv, lab_r = os.path.realpath(adj.private_dir(lab)), os.path.realpath(lab)
+    allowed = {os.path.join(lab_r, p) for p in ("policy/baseline.json", "policy/candidate.json",
+                                                 "data/visible.jsonl")}
+    assert opened and set(opened) <= allowed, sorted(set(opened) - allowed)
+    assert not any(o.startswith(priv) or "holdout" in o or "pins" in o for o in opened)
+    t0 = time.time()
+    rw = GP.propose(wide)["search"]
+    assert rw["space_size"] > GP.MAX_CANDIDATES and rw["searched"] == GP.MAX_CANDIDATES
+    assert rw["truncated"] and len(rw["gate_evals"]) <= GP.MAX_GATE_EVALS
+    assert time.time() - t0 < 60, "grid search exceeded its runtime bound"
+
+
 def run():
     before = _repo_state()
     lab = _init("lab_a")
@@ -265,6 +337,9 @@ def run():
     check_live_refused(_init("lab_live"))
     check_evolve_builtin(_init("lab_evolve"))
     check_accept_and_export(_init("lab_accept"))
+    check_grid_unit(_init("lab_unit"), _init("lab_wide", n=300, kind="wide"))
+    check_grid_evolve(_init("lab_grid"), _init("lab_grid_twin"))
+    check_grid_noop(_init("lab_flat", kind="flat"))
     assert _repo_state() == before, "Valedia tree or ledger changed during the test"
     shutil.rmtree(TMP, ignore_errors=True)
     print("test_valedia_policy_lab: all checks passed")

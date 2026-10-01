@@ -87,7 +87,8 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
    - Accept = visible slice PASS + strict fee-true gain + time-held-out last 30% not FAIL; INSUFFICIENT_DATA never passes. `export` re-checks with the real gate.
    - Output is a PROPOSAL file only — nothing writes live config, crontab, models/ or allocator settings; a human applies it (or not).
    - self-evolve's own `--live` means "real LLM agents" (not trading): the wrapper refuses it; `--llm-agents` opts in (costs tokens, needs node + cc/claude + codex).
-   - Default builtin mode has no policy proposer, so rounds end STATIC_REJECT at PROPOSE until a JSON-policy proposer is plugged in.
+   - Default `--proposer grid` (`grid_proposer.py`): offline, deterministic hill-climb (≤200 moves: block 1/2 categories, size_mult 0.5/0.75, min_edge grid) scored on the VISIBLE slice only; holdout is never read.
+   - Grid search is in-sample: export records `candidates_searched_total` and warns that only the holdout verdict is out-of-sample. `--proposer none` = old no-op rounds.
    - On today's 38-trade backfill ledger the visible slice is INSUFFICIENT_DATA (< 30), so nothing can be accepted yet — by design.
 
 ## C. Audit checklist Ruflo runs (HOLDS/FAILS, auditor mode = verify only, no "improvements")

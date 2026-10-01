@@ -175,7 +175,7 @@ def _git(lab, *args):
 
 
 def materialize(lab, ledger=DEFAULT_LEDGER, baseline=DEFAULT_BASELINE, holdout_frac=0.3,
-                n_folds=12, holdout_min_n=10, n_boot=GATE_DEFAULTS["n_boot"]):
+                n_folds=12, holdout_min_n=30, n_boot=GATE_DEFAULTS["n_boot"]):
     """Create + git-commit the lab. Returns the pins dict. Caller validates `lab`."""
     lab = os.path.abspath(lab)
     with open(baseline) as f:
