@@ -138,7 +138,9 @@ def run_allocator():
     try:
         alloc = {"platform": "kalshi", "type": "SPORTS", "ticker": "ALLOC-NW", "title": "t",
                  "side": "yes", "price": 0.80, "allocation": 4.0, "expected_profit": 0.5,
-                 "hours_to_resolve": 6, "raw": {}, **h3._admitted_sports_opp()}
+                 "hours_to_resolve": 6, "raw": {}, **h3._admitted_sports_opp(),
+                 # taker on a free-maker series is now SKIP_TAKER_HURDLE: use a taker-priced one
+                 "fmap": {"ALLOC": __import__("kalshi_fee_map")._row("ALLOC", 1.0, 1.0, "sports")}}
         out = ma.execute_allocations([alloc], dry_run=False)
         return out[0], len(orders)
     finally:

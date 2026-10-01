@@ -183,6 +183,27 @@ def route(ticker, series=None, edge=0.0, bid=0.0, ask=0.0, C=1, slip=0.0,
     }
 
 
+def taker_clears_floor(route_d, P):
+    """Any order placed AS TAKER: taker_ev.net >= hurdle + dome_extra(P), and on a
+    maker_viable series also >= maker_ev.net + hurdle. Same rule informed_before_create
+    applies to role=taker (no new threshold). Unknown EV → False."""
+    r = route_d or {}
+    try:
+        t_net = float((r.get("taker_ev") or {}).get("net"))
+    except (TypeError, ValueError):
+        return False
+    hurdle = float(r.get("hurdle", taker_hurdle()))
+    if t_net < hurdle + dome_extra(P):
+        return False
+    if r.get("maker_viable"):
+        try:
+            m_net = float((r.get("maker_ev") or {}).get("net"))
+        except (TypeError, ValueError):
+            return True
+        return t_net >= m_net + hurdle
+    return True
+
+
 def should_skip_taker(route_d=None):
     if not maker_first_on():
         return False

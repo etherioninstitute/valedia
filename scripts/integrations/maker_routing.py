@@ -16,9 +16,15 @@ Rule (decide):
   taker  when taker EV clears ITS higher hurdle: taker_ev.net >= TAKER_HURDLE + dome_extra(P)
          (on a maker_viable series also taker_ev.net >= maker_ev.net + hurdle), and maker was
          not chosen (not viable / no resting price / closes too soon / manager not live).
-  none   neither clears. VALEDIA_MAKER_FIRST_ENFORCE OFF (default) → legacy action, unchanged
-         behaviour, annotated "legacy". ON → SKIP_NO_ROUTE, and taker rows carry role=taker
-         into create_preflight (strict mode only REMOVES orders, never adds).
+  none   neither clears. VALEDIA_MAKER_FIRST_ENFORCE OFF (default) → legacy action, annotated
+         "legacy". ON → SKIP_NO_ROUTE (removes orders, never adds).
+
+Taker floor (UNCONDITIONAL): whatever the route, an order placed as taker (action taker, or a
+"maker" priced at/through the ask) must pass kalshi_profit.taker_clears_floor — the same rule
+create_preflight applies to role=taker — else SKIP_TAKER_HURDLE. The chosen role is passed to
+create_preflight (a["role"]) and ev_preflight is the chosen role's EV, so both judge the same
+order. Exception: a fee-paying maker (not maker_viable) keeps create_preflight's stricter taker
+floor, because judging it at the maker floor could add orders.
 
 Time threshold: MAKER_MIN_SECONDS_TO_CLOSE = 2h, measured to the session close that
 session_clocks reads (market close_time / closeTime = when the venue stops accepting
@@ -122,15 +128,11 @@ def decide(rt, *, legacy_maker=False, maker_px=None, taker_px=None, secs=None, l
     import kalshi_profit as kp
     rt = rt or {}
     m_net, t_net = _net(rt.get("maker_ev")), _net(rt.get("taker_ev"))
-    hurdle = float(rt.get("hurdle", kp.taker_hurdle()))
     viable = bool(rt.get("maker_viable"))
     out = {"maker_ev": m_net, "taker_ev": t_net}
     m_extra = kp.dome_extra((maker_px or 0) / 100.0) if maker_px else 0.0
-    t_extra = kp.dome_extra((taker_px or 0) / 100.0) if taker_px else 0.0
     maker_clears = m_net is not None and m_net > m_extra
-    taker_clears = t_net is not None and t_net >= hurdle + t_extra
-    if taker_clears and viable:
-        taker_clears = m_net is None or t_net >= m_net + hurdle
+    taker_clears = kp.taker_clears_floor(rt, (taker_px or 0) / 100.0)
     too_soon = secs is not None and secs < MAKER_MIN_SECONDS_TO_CLOSE
     blockers = []
     if not (viable or legacy_maker):
@@ -201,13 +203,10 @@ def route_allocation(a, n, price_cents, mgr=None, cfg=None, plan_fn=None, now=No
                       maker_ev=d["maker_ev"], taker_ev=d["taker_ev"])
     if d["route"] == "maker":
         out.update(action="maker", price_cents=mpx)
-    elif d["route"] == "taker":
-        if enforce_on():
-            a["role"] = "taker"  # strict: create_preflight judges the order actually placed
-    elif enforce_on():
+    elif d["route"] == "none" and enforce_on():
         out.update(status="SKIP_NO_ROUTE", error=d["why"])
         return False, a, out
-    else:  # legacy: the pre-maker_routing decision (dollar-bid fix only), annotated
+    elif d["route"] == "none":  # legacy: the pre-maker_routing decision (dollar-bid fix only)
         out["row"]["route"] = "legacy"
         if legacy_maker:
             out.update(action="maker", price_cents=plan.price_cents)
@@ -217,8 +216,28 @@ def route_allocation(a, n, price_cents, mgr=None, cfg=None, plan_fn=None, now=No
             elif kp.should_skip_taker(mf):
                 out["status"] = "SKIP_MAKER_FIRST"
                 return False, a, out
-        return True, a, out
-    if d["route"] == "taker" and kp.maker_first_on() and mf.get("prefer") == "maker" \
+    # Judge the order ACTUALLY placed. A "maker" at/through the ask fills as a taker.
+    role = "taker" if out["action"] == "taker" or (ask_c and out["price_cents"] >= ask_c) else "maker"
+    out["row"]["role"] = role
+    if role == "taker":
+        # Unconditional (not behind ENFORCE): only removes orders. Same rule create_preflight
+        # applies to role=taker; existing TAKER_HURDLE + dome_extra, no new threshold.
+        if not kp.taker_clears_floor(mf, out["price_cents"] / 100.0):
+            out.update(status="SKIP_TAKER_HURDLE",
+                       error="taker_ev %s < hurdle+dome%s" % (
+                           d["taker_ev"], " (or < maker_ev+hurdle)" if mf.get("maker_viable") else ""))
+            return False, a, out
+        a["role"] = "taker"
+        ev = mf.get("taker_ev")
+    else:
+        if mf.get("prefer") == "maker":
+            a["role"] = "maker"
+        # else (fee-paying maker on a wide spread): leave role unset so create_preflight keeps
+        # the stricter taker floor; judging it at the maker floor could ADD orders.
+        ev = mf.get("maker_ev")
+    if isinstance(ev, dict):
+        a["ev_preflight"] = out["row"]["ev_preflight"] = ev
+    if role == "taker" and kp.maker_first_on() and mf.get("prefer") == "maker" \
             and kp.should_skip_taker(mf):
         out["status"] = "SKIP_MAKER_FIRST"
         return False, a, out

@@ -230,6 +230,9 @@ def run():
             "title": "t", "side": "yes", "price": 0.80, "allocation": 4.0,
             "expected_profit": 0.5, "hours_to_resolve": 6, "raw": {},
             **_admitted_sports_opp(),
+            # taker fill-truth needs a taker-priced series: a taker on a free-maker
+            # (maker_viable) series is now SKIP_TAKER_HURDLE (maker_routing).
+            "fmap": {"ALLOC": __import__("kalshi_fee_map")._row("ALLOC", 1.0, 1.0, "sports")},
         }
         try:
             n0, o0 = ftl.real_track_record()["n"], ftl.open_position_count()

@@ -166,16 +166,47 @@ def test_allocator_maker_chosen_when_viable_and_better():
 
 
 def test_allocator_too_soon_and_enforce():
-    # closes in 1h: maker unsafe; taker does not clear on a viable series → legacy (flag OFF)
+    # closes in 1h: maker unusable. On a maker_viable series the taker (0.075) clears the
+    # maker floor but not maker_ev+hurdle → SKIP_TAKER_HURDLE, unconditionally (concern 3).
     r, orders, mgr = _run(_alloc(hours=1))
     assert r["route"] == "legacy" and "closes_in_" in r["route_why"], r
-    assert r["status"] == "EXECUTED" and len(orders) == 1 and mgr.placed == [], (r, orders)
+    assert r["status"] == "SKIP_TAKER_HURDLE" and r["role"] == "taker", r
+    assert orders == [] and mgr.placed == [], (r, orders)
     os.environ["VALEDIA_MAKER_FIRST_ENFORCE"] = "1"
     try:
         r, orders, mgr = _run(_alloc(hours=1))
         assert r["status"] == "SKIP_NO_ROUTE" and orders == [] and mgr.placed == [], (r, orders)
     finally:
         os.environ.pop("VALEDIA_MAKER_FIRST_ENFORCE", None)
+
+
+def _thin(edge):
+    """Fee-paying maker series at 30c with a 1c spread: maker cannot rest (bid+1 == ask)."""
+    a = _alloc(series="THN", maker_m=1.0, taker_m=1.0)
+    a.update(price=0.30, edge=edge, bid=0.29, ask=0.30,
+             raw={"yes_bid": 0.29, "yes_ask": 0.30, "no_bid": 0.70, "no_ask": 0.71})
+    return a
+
+
+def test_taker_floor_between_maker_floor_and_taker_hurdle():
+    # edge 0.04: taker net 0.04-0.015-0.01=0.015 < hurdle 0.02 (dome 0 at 30c); maker net
+    # 0.036 > maker floor 0 → would have passed a maker-floor check, must be skipped.
+    r, orders, mgr = _run(_thin(0.04))
+    assert r["status"] == "SKIP_TAKER_HURDLE" and orders == [] and mgr.placed == [], (r, orders)
+    assert 0 < r["taker_ev"] < kp.TAKER_HURDLE < r["maker_ev"], r
+    # edge 0.06: taker net 0.035 >= 0.02 → taker placed, judged as taker by create_preflight
+    r, orders, mgr = _run(_thin(0.06))
+    assert r["status"] == "EXECUTED" and len(orders) == 1 and mgr.placed == [], (r, orders)
+    assert r["route"] == "taker" and r["role"] == "taker" and orders[0][0][3] == 30, r
+    assert r["ev_preflight"]["role"] == "taker", r["ev_preflight"]
+
+
+def test_taker_floor_rule_unit():
+    rt = _rt(False, 0.03, 0.019)
+    assert kp.taker_clears_floor(rt, 0.30) is False and kp.taker_clears_floor(_rt(False, 0.03, 0.02), 0.30)
+    assert kp.taker_clears_floor(_rt(False, 0.10, 0.03), 0.50) is False  # dome: needs 0.04 at 50c
+    assert kp.taker_clears_floor(_rt(True, 0.10, 0.11), 0.30) is False   # viable: beat maker+hurdle
+    assert kp.taker_clears_floor(_rt(True, 0.10, 0.13), 0.30) is True
 
 
 def test_allocator_taker_when_maker_not_viable():
