@@ -29,6 +29,13 @@ import dynamic_universe as du
 import valedia_config as vc
 import weather_shadow as ws
 
+# Local Ollama is faked: the floating default tag nimble:latest carries Burton's
+# digest (24e550a16a70...), so it passes the digest pin. No real /api/tags call.
+ak.s1._get = lambda url, timeout: (
+    {"models": [{"name": "nimble:latest", "digest": "24e550a16a70" + "9" * 52}]}
+    if url.endswith("/api/tags") else {"version": "0.35.0"})
+ak.s1._reset_digest()
+
 
 def _doc():
     return ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d)
@@ -193,7 +200,7 @@ def test_systemone_default_off_and_fail_open():
     off = _doc()
     assert off["systemone"]["backend"] == "stub"
     assert off["systemone"]["enabled"] is False
-    assert off["systemone"]["model"] == "nimble2"
+    assert off["systemone"]["model"] == "nimble:latest"
     assert off["fences"]["systemone"] == "stub"
     assert "systemone_shadow" not in off["ranked"][0]
     # The retired decider leaves no key, row field, fence, env read, or print line.
@@ -207,7 +214,7 @@ def test_systemone_default_off_and_fail_open():
         def down(url, payload, timeout):
             seen.append(payload["state"])
             assert payload["state"]["create_order"] is False
-            assert payload["model"] == "nimble2"
+            assert payload["model"] == "nimble:latest"
             raise ConnectionRefusedError("down")
 
         blown = ak.build(
@@ -232,7 +239,7 @@ def test_systemone_default_off_and_fail_open():
         assert states["SPY"]["informed"]["news"] is False
 
         def ok(url, payload, timeout):
-            assert payload["model"] == "nimble2"
+            assert payload["model"] == "nimble:latest"
             return {
                 "model": "nimble2",
                 "answers": {

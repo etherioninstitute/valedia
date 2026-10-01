@@ -797,7 +797,7 @@ VENUE_WRITER = {
     "coinbase": "valedia",
     "alpaca": "valedia",
     "kraken": "none",
-    "polymarket": "valedia",  # Burton 2026-09-23 max-env widget; working tree only, not committed
+    "polymarket": "valedia",  # TODO(Burton): "valedia" was committed in snapshot a49cece although the old comment said working-tree only. Burton acknowledged 2026-10-01 and kept it. test_h8, test_session_clocks, test_controls_readout still assert "none"; revisit when Burton decides (flip back or update those asserts).
     "hyperliquid": "none",
 }
 
@@ -875,12 +875,9 @@ def controls_snapshot():
          "(n>=5, score>=0.03) even when this is off. Empty or missing file "
          "does not refuse and is not a zero score."),
         ("INFORMED_BEFORE_CREATE", True, "const", "kalshi",
-         "fail-closed before create. Env cannot disable. Refreshed fee-map "
-         "series, fee-true EV (maker prefer, higher taker hurdle, extra floor "
-         "near the 50c fee dome), FV model or rules_clock or researched plus "
-         "confidence, book, depth, Kelly/FTL size, ledger evidence, "
-         "session_clock and resolve_clock on sports, 15m, and Poly US. "
-         "Halt off is necessary, not sufficient."),
+         "fail-closed before create. Env cannot disable. Needs fee-true EV, FV, "
+         "book, depth, size, ledger and clock checks. Halt off is necessary, "
+         "not sufficient."),
         ("POLY_TAG_PRIOR_CREATE", False, "const", "poly",
          "tag_prior-alone is never create-eligible. Env cannot enable. "
          "US writes stay blocked while POLYMARKET_US_LIVE is off."),
@@ -985,7 +982,7 @@ def controls_snapshot():
         ("VIBE_SHADOW_LIVE", _vb_live, "const", "vibe",
          "hard-off. Env cannot enable HKUDS broker connectors."),
         ("VIBE_BROKER_WRITE", False, "const", "vibe",
-         "place_order and create_order raise vibe_broker_write"),
+         "hard-off. Every HKUDS broker write path raises vibe_broker_write."),
         ("VIBE_SHADOW_TICK_AGE_S", _vb_tick.get("last_tick_age_s"), "file", "vibe",
          "seconds since last paper shadow decision; none if the log is empty"),
         ("VIBE_SHADOW_LAST_DECISION", _vb_tick.get("last_decision") or "none", "file",

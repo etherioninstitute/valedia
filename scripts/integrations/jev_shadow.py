@@ -9,7 +9,10 @@ Gates live in code, not in the model call: no number or comparison is asked of
 the model. tiny_state/weather_state add code-computed `facts` and the questions
 refer to those facts. Every decision, both backends, is logged (systemone_log).
 VALEDIA_JEV_BACKEND=nimble2 (opt-in) sends the same questions to loopback
-Ollama /v1/systemone on the Nimble 2 pin; default stays the TypeSafe cloud.
+Ollama /v1/systemone on the Nimble 2 pin (nimble:latest, digest-pinned to
+24e550a16a70 in systemone_hotpath_client; a mismatch or unverified digest
+fails open, reason digest_mismatch / digest_unverified); default stays the
+TypeSafe cloud.
 """
 import json
 import logging
