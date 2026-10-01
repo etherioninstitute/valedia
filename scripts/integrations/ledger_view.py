@@ -22,6 +22,7 @@ Selection (`select(recs, now)`):
     not missing / None / ""):
         booked        = logged_at, else ts                      (since-last-report, freshness)
         settled_time  = settled_at, settlement_ts, ts, logged_at (the 24h window)
+    a settlement with no booked time (neither logged_at nor ts) is flagged unparseable.
   * bad rows are counted as distinct ledger LINES: two identical garbage lines are 2, a
     conflicting pair is 2 (every settlement line of that entry), never collapsed by content.
 `now` should be taken AFTER the ledger was read (callers pass now=None for that).
@@ -145,7 +146,7 @@ def select(recs, now):
             bad[line_key("row:" + _row_hash(r))] = "future-dated"
             continue
         p, w = sv.num(r.get("realized_pnl_net")), sv.won_flag(r.get("won"))
-        if p is None or w is None or not tf or any(t is None for t in tf.values()):
+        if p is None or w is None or booked(r) is None or any(t is None for t in tf.values()):
             bad[line_key("row:" + _row_hash(r))] = "unparseable"
             continue
         if eid in dropped:

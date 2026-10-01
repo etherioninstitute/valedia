@@ -73,6 +73,22 @@ def test_every_time_field_validated_one_precedence():
     assert lv.booked(dict(r, logged_at="")) == mins(-30)  # "" is absent
 
 
+
+def test_no_booked_time_is_flagged_everywhere():
+    # only settled_at / settlement_ts present (no logged_at, no ts): flagged, never counted or crashing
+    for extra in (dict(settled_at=mins(-30).isoformat()), dict(settlement_ts=mins(-30).isoformat())):
+        row = {k: v for k, v in st("b", -9.0, False, mins(-30), **extra).items() if k != "logged_at"}
+        rows = BASE + [ent("b", mins(-300)), row]
+        v = lv.select(rows, mins(0))
+        assert list(v["valid"]) == ["a"] and list(v["bad"].values()) == ["unparseable"], v
+        _, t = _pnl(rows)
+        assert "9.00" not in t and "6.00" not in t, t
+        assert _facts(rows) == [f"{AT}omitted — 1 ledger row(s) unparseable {SCAN}"]
+        with Settle() as s:
+            s.write(rows)
+            out = [_nostale(m) for m in go(s, mins(0))]
+        assert out and all("9.00" not in m and "settlement check failed" not in m for m in out), out
+
 # ── F2 ───────────────────────────────────────────────────────────────────────
 def test_torn_fragment_never_marks_ids_sent():
     for tag, tail in [("quote_only", '"a"\n"'), ("prefix_b", '"a"\n"b')]:
