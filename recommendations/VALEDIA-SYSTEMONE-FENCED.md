@@ -5,7 +5,7 @@
 **HTTP:** `127.0.0.1:11434` only. `POST /v1/systemone`.  
 **Model pin:** Nimble 2 (`Bespoke-Nimble-9B-v2`, 8,192 ctx). Hugging Face id `bespokelabs/Bespoke-Nimble-9B-v2`. Default Ollama tag `nimble2`, override with `VALEDIA_SYSTEMONE_MODEL`.  
 **Confirm the tag:** the Ollama tag is not verified from the sandbox. Run `ollama list` on Burton's Mac and set `VALEDIA_SYSTEMONE_MODEL` if the installed name differs.  
-**Accepted tags (case-insensitive):** `nimble2`, `nimble2:*`, `nimble:9b-v2`, `nimble:v2`, `nimble:2*`, `hf.co/bespokelabs/Bespoke-Nimble-9B-v2[:*]`. Nimble v1 (`nimble`, `nimble:9b`, `nimble:latest`) is refused and not posted.  
+**Accepted tags (full match, case-insensitive):** `nimble2`, `nimble2:<tag>`, `nimble:2`, `nimble:v2`, `nimble:9b-v2` (each optionally `-<quant>`, e.g. `-q4_k_m`, `-q8_0`, `-fp16`), and the release name `bespoke-nimble-9b-v2[:<tag>]`, bare or under `bespokelabs/` or `hf.co/bespokelabs/`. Refused and never posted: Nimble v1 (`nimble`, `nimble:9b`, `nimble:latest`), anything containing `v1`, `tev` or `0.8`, loose forms like `nimble:2b` / `nimble:20b`, and any other namespace or host (no provenance).  
 **Receipt:** `recommendations/NIMBLE-SYSTEMONE-REPLACE-LAYA-2026-09-30.md`  
 **Replaced:** Laya (retired 2026-09-30). `VALEDIA-LAYA-FENCED.md` is retired.
 

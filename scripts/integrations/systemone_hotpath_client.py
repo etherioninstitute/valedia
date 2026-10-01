@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 import urllib.request
 
@@ -23,10 +24,18 @@ PORT = 11434
 # confirm it on Burton's Mac with `ollama list` and set VALEDIA_SYSTEMONE_MODEL
 # if it differs from this default.
 MODEL_DEFAULT = "nimble2"
-HF_ID = "hf.co/bespokelabs/bespoke-nimble-9b-v2"
-# Nimble 2 only. v1 tags (nimble, nimble:9b, nimble:latest) are not here.
-_V2_EXACT = frozenset({"nimble2", "nimble:9b-v2", "nimble:v2", HF_ID})
-_V2_PREFIX = ("nimble2:", "nimble:2", HF_ID + ":")
+# Nimble 2 only. Full-match, case-insensitive, explicit forms. v1 tags
+# (nimble, nimble:9b, nimble:latest) match nothing here.
+_TAG = r"[a-z0-9][a-z0-9._-]*"
+_QUANT = r"(?:q\d[a-z0-9_]*|iq\d[a-z0-9_]*|fp16|fp32|bf16|f16|f32|int4|int8)"
+_V2_RE = re.compile(
+    r"nimble2(?::" + _TAG + r")?"                        # nimble2, nimble2:<tag>
+    r"|nimble:(?:2|v2|9b-v2)(?:-" + _QUANT + r")?"       # nimble:2, :v2, :9b-v2 [+ quant]
+    # Release name, bare or under the vendor namespace only. Other namespaces
+    # and hosts have no provenance here, so they are refused.
+    r"|(?:(?:hf\.co/)?bespokelabs/)?bespoke-nimble-9b-v2(?::" + _TAG + r")?"
+)
+_V2_BANNED = ("v1", "tev", "0.8")
 DECIDE_URL = "http://127.0.0.1:11434/v1/systemone"
 VERSION_URL = "http://127.0.0.1:11434/api/version"
 TAGS_URL = "http://127.0.0.1:11434/api/tags"
@@ -91,9 +100,9 @@ def enabled():
 def is_nimble2(name):
     """True for a Nimble 2 tag only (case-insensitive). Never v1, never Tev."""
     low = str(name or "").strip().lower()
-    if not low or "0.8" in low or low.startswith("tev"):
+    if not low or any(bad in low for bad in _V2_BANNED):
         return False
-    return low in _V2_EXACT or low.startswith(_V2_PREFIX)
+    return _V2_RE.fullmatch(low) is not None
 
 
 def model_pin():
