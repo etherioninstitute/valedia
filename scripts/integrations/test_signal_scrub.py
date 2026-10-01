@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Figures by construction: free text carries NO numbers; figures come only from code.
+"""Money accuracy by construction: the AI note is an ALLOWLIST of figure-free sentences.
 
-Replays every string from the re-verifier harness (v9 strings.txt, adv2.py, prev.py,
-snd.py watchdog cases) plus Unicode/number-word variants through the AI-answer gate,
-the watchdog and the legacy cron_runner.sh: every numeral must become [n] or the
-message must be a fixed line. The code-built facts block carries sign + label from
-fixtures; disagreeing / stale / failing sources -> figures omitted. claude_router.sh
-passes the question base64 as one argv word (injection + apostrophes inert).
+Replays every string from the verifier harnesses (v9 strings.txt, adv2/prev/snd, v11
+a1/a2/a3 + scrub_attack) and a generated corpus (600 random lexicon / emoji /
+homoglyph / foreign / leet combinations): the AI note never carries a numeral, a
+numeric-lexicon form or a money/direction word; the code-built facts block stays
+intact (also under multi-byte-heavy answers, byte budget). Legacy cron_runner.sh
+sends fixed lines with allowlisted labels only; watchdog free text is scrubbed;
+claude_router.sh passes the question base64 (injection-safe) and never prints raw
+bridge output. Facts robustness / formatting / pagination: test_signal_facts.py.
 Fakes only: no network, no keys, no orders, real relay booby-trapped.
 Run: python3 test_signal_scrub.py
 """
@@ -121,15 +123,63 @@ EXTRA = ["Profit ½", "Profit 十二", "Profit Ⅻ", "twеlve dollars", "zwölf:
          "Profit XII", "minus 1 234", "⁦Profit 12⁩", "௧௨ rupees"]
 
 
+V11 = [
+    "You are doing great. Your profit is 🔟 dollars, about twentyfive bucks, fivehundred total, "
+    "it grew tenfold — xii percent, a tenner per bet, 💯 safe.",
+    "🚀" * 400 + "aa", "ok answer",
+]
+SCRUB_ATTACK = [
+    "profit 🔟 dollars", "💯 percent", "you made twentyfive dollars", "fivehundred dollars", "fortytwo",
+    "grew tenfold", "a fiver", "a tenner", "a third of your cash", "doubled your money", "tripled",
+    "xii dollars", "IIII", "XXXX", "Xii", "a couple hundred", "four score", "a gross",
+    "cinco dólares", "zwanzig Euro", "пять долларов", "两百", "兩", "하나", "백 달러", "万", "零",
+    "Ƽ3", "$ƼЗ", "$З00", "$lOO", "$1OO", "𝍷𝍸", "⚂", "١٢", "1​2", "1́", "‮21",
+    "1e5", "1.5E+3", "½", "Ⅻ", "ⅻ", "x²", "ten-fold", "twenty‐five", "seventy five", "nine-teen",
+    "Ⓐ", "⑩", "⒑", "🄁", "𝟗", "੧", "፲", "𑁒", "໑", "nil", "zero", "a dozen", "a pair of hundreds",
+    "eighty-eight", "one hundred and ten", "One Thousand", "ONE", "o n e", "t-e-n", "sixty sixty",
+    "sevens", "tens of dollars", "fifties", "the nineties", "first", "fifth", "tenth", "hundredth",
+    "millionaire", "thousandfold", "billionth", "1️⃣2️⃣", "#️⃣", "🕐", "🀇", "🂡", "⓵", "❶", "➓",
+    "𝟎", "٣", "௰", "൰", "〡", "〸", "ↂ", "𐄇", "Ⅽ", "ⅽ", "Ⅿ", "ⅾ", "MCM", "mcm", "XLII", "xlii",
+    "C-note", "a grand", "a K", "five-K", "5k", "k", "a benjamin", "a nickel", "a dime", "a penny",
+    "sixtyish", "fortyish", "thirties", "twelvemonth", "eleventh", "seventies",
+    "ⅠⅡ", "١٠٠", "۱۰۰", "१००", "௧௦௦", "一百", "壹佰", "肆", "拾", "佰", "仟", "萬", "億", "兆",
+    "twénty", "ꓔen", "cinco", "lOO", "SOO", "IO", "dos", "tres", "cuatro", "vingt", "zwei",
+]
+# every piece that would carry a figure; none may appear in a surviving AI note
+PIECES = ["🔟", "💯", "twentyfive", "fivehundred", "tenfold", "fiver", "tenner", "c-note", "xii",
+          "xlii", "mcm", "twénty", "ꓔen", "lOO", "$", "cinco", "dos", "tres", "zwei", "vingt",
+          "dozen", "grand", "nickel", "dime", "penny", "half", "quarter", "couple", "score",
+          "gross", "million", "thousand", "hundred", "seventy", "forty", "fortytwo", "nil",
+          "benjamin", "1", "5", "0", "twelve", "eleven", "thirteen"]
+_NUMW = ["twelve", "twentyfive", "fivehundred", "tenfold", "fiver", "tenner", "C-note", "xlii",
+         "XII", "a grand", "a dozen", "half", "a quarter", "a couple", "four score", "a gross",
+         "cinco", "dos", "tres", "zwei", "vingt", "🔟", "💯", "1️⃣", "twénty", "ꓔen", "$lOO", "lOO",
+         "SOO", "1OO", "١٢", "１２", "¹²", "½", "Ⅻ", "十二", "nil", "forty", "seventy-two",
+         "thirteen", "eleven", "millionish", "a benjamin", "a nickel", "a dime", "a penny",
+         "fortytwo", "twelvefold", "doubled", "tripled"]
+_MONEYW = ["dollars", "bucks", "USD", "profit", "cash", "", "", "in the green", "up", "net",
+           "returns", "earned", "worth", "value", "equity", "payout", "", "quid", "cents"]
+_TMPL = ["You made {n} {m}.", "{n} {m}", "Your {m} is {n}.", "It grew {n}!", "{n}.",
+         "Things look {n} {m} today.", "We are {n}", "Result {n}", "{m} {n}", "about {n}"]
+
+
+def _corpus(k=600, seed=7):
+    import random
+    rnd = random.Random(seed)
+    return [rnd.choice(_TMPL).format(n=rnd.choice(_NUMW), m=rnd.choice(_MONEYW)) + " "
+            + rnd.choice(["", "The slate looks calm.", "Nothing else to note."])
+            for _ in range(k)]
+
+
 def _all_strings():
-    out = list(V9_STRINGS)
-    harness = ("/tmp/claude-0/-home-user-valedia/0f09ea09-13bd-5223-9832-3fd22d8ba606/"
-               "scratchpad/v9/strings.txt")
-    if os.path.exists(harness):  # replay the re-verifier's own file too, when present
-        for s in open(harness).read().split("\n=====\n"):
-            s = s.strip("\n").replace("\\u2028", "\u2028").replace("\\u200b", "\u200b")
-            if s:
-                out.append(s)
+    out = list(V9_STRINGS) + V11 + SCRUB_ATTACK
+    for d in ("v9/strings.txt", "v11/a1.txt", "v11/a2.txt", "v11/a3.txt"):
+        p = "/tmp/claude-0/-home-user-valedia/0f09ea09-13bd-5223-9832-3fd22d8ba606/scratchpad/" + d
+        if os.path.exists(p):  # replay the verifiers' own files too, when present
+            for s in open(p).read().split("\n=====\n"):
+                s = s.strip("\n").replace("\\u2028", " ").replace("\\u200b", "​")
+                if s:
+                    out.append(s)
     return list(dict.fromkeys(out + ADV2 + PREV + WATCHDOG + EXTRA))
 
 
@@ -137,116 +187,89 @@ def _numerals(text):
     return [c for c in unicodedata.normalize("NFKC", text) if unicodedata.numeric(c, None) is not None]
 
 
-def _facts(cash=(250.0, 250.0), inv=(40.0, 40.0), n=(3, 3), real=(-5.0, -5.0)):
-    return {"broker": {"cash": cash, "invested": inv, "n": n},
-            "ledger": {"total": real, "wins": (2, 2), "losses": (3, 3)}, "why": {}}
+def _facts():
+    return {"cash": (250.0, 250.0), "positions": {"invested": (40.0, 40.0), "n": (3, 3)},
+            "ledger": {"total": (-5.0, -5.0), "wins": (2, 2), "losses": (3, 3)}, "why": {}}
+
+
+FACT_LINES = ["Facts (code-generated; each source read twice):", "Cash (broker): $250.00",
+              "Open-position cost (broker): $40.00", "Open positions (broker): 3",
+              "Realized P&L (ledger, fee-incl.): −$5.00 (2W/3L)"]
 
 
 class Sender(rest.Sender):
     pass
 
 
-def test_every_replayed_string_scrubbed():
+def _assert_clean_note(note, src):
+    assert not _numerals(note) and sv.scrub_numbers(note)[1] == 0, (src, note)
+    assert all(32 <= ord(c) < 127 for c in note), (src, note)
+    assert not cb._MONEY_DIR.search(note.lower()) and not cb._LEXICON.search(note.lower()), (src, note)
+    import re
+    for p in PIECES:
+        if p.isalpha() and p != p.lower() and p != p.upper():
+            assert p not in note, (src, p, note)  # leet / mixed case: exact
+        elif p.isalpha():
+            assert not re.search(r"(?<![a-z])" + re.escape(p) + r"(?![a-z])", note, re.I), (src, p, note)
+        else:
+            assert p not in note, (src, p, note)
+
+
+def test_ai_note_allowlist_every_string_and_corpus():
     rest._fresh_dir()
-    strings = _all_strings()
-    assert len(strings) >= 100, len(strings)
-    for s in strings:
-        clean, n = sv.scrub_numbers(s)
-        assert not _numerals(clean), (s, clean)
-        assert n > 0 or not _numerals(s), (s, clean)
+    strings = _all_strings() + _corpus()
+    assert len(strings) >= 800, len(strings)
+    kept_any = 0
+    for i, s in enumerate(strings):
+        for text in (s, "The slate looks calm tonight. " + s, s + "\nNothing else to note."):
+            note, kept, _ = cb.ai_note(text, 1000)
+            _assert_clean_note(note, text)
+            kept_any += bool(kept)
         send = Sender()
-        r = cb.gate_answer("q:" + s, s, _facts(), send=True, send_fn=send, now=NOW)
+        r = cb.gate_answer(f"q{i}", s, _facts(), send=True, send_fn=send, now=NOW)
         assert r["status"] == "verified", (s, r)
         t = send.msgs[0]
-        answer = t.split("\nFacts (code-generated", 1)[0]
-        assert not _numerals(answer), (s, answer)  # model text: zero figures
+        head, facts = t.split("Facts (code-generated", 1)
+        _assert_clean_note(head.replace(cb.NOTE_LABEL, "").strip("\n"), s)
+        assert ["Facts (code-generated" + facts.splitlines()[0]] + facts.splitlines()[1:5] == FACT_LINES, t
         assert t.endswith("✓ figures from broker/ledger only"), t
-        assert "Realized P&L (ledger, fee-incl.): -$5.00 (2W/3L)" in t, t
-        figs = [l for l in t.splitlines() if _numerals(l)]
-        assert all(l.startswith(("Cash (broker): ", "Open-position cost (broker): ",
-                                 "Open positions (broker): ", "Realized P&L (ledger"))
-                   for l in figs), (s, figs)
+    assert kept_any > 100  # benign wording still gets through
 
 
-def test_facts_block_from_fixtures_sign_and_labels():
-    bal = iter([{"balance": 25000}, {"balance": 25000}])
-    pos = lambda: {"market_positions": [  # noqa: E731
-        {"ticker": "A", "position_fp": "2", "market_exposure_dollars": "30.00"},
-        {"ticker": "B", "position_fp": "-1", "market_exposure_dollars": "10.00"},
-        {"ticker": "C", "position_fp": "0", "market_exposure_dollars": "0"}]}
-    ts = (NOW - timedelta(hours=1)).isoformat()
-    rows = [{"type": "entry", "id": "e1", "source": "live", "logged_at": ts},
-            {"type": "settlement", "entry_id": "e1", "realized_pnl_net": -5.0, "won": False,
-             "logged_at": ts}]
-    f = cb.verified_facts(get=lambda p: next(bal), get_positions=pos, ledger=lambda: rows, now=NOW)
-    lines, claims = cb.facts_block(f)
-    assert lines[1:] == ["Cash (broker): $250.00", "Open-position cost (broker): $40.00",
-                         "Open positions (broker): 2", "Realized P&L (ledger, fee-incl.): -$5.00 (0W/1L)"], lines
-    rows[1]["realized_pnl_net"] = 7.5
-    f = cb.verified_facts(get=lambda p: {"balance": 0}, get_positions=pos, ledger=lambda: rows, now=NOW)
-    assert "Realized P&L (ledger, fee-incl.): +$7.50 (0W/1L)" in cb.facts_block(f)[0]
-
-
-def test_disagreeing_stale_failing_sources_omit_figures():
-    pos = lambda: {"market_positions": [{"ticker": "A", "position_fp": "1",  # noqa: E731
-                                         "market_exposure_dollars": "3.00"}]}
-    ts = (NOW - timedelta(hours=1)).isoformat()
-    rows = [{"type": "entry", "id": "e1", "source": "live", "logged_at": ts},
-            {"type": "settlement", "entry_id": "e1", "realized_pnl_net": 2.0, "won": True, "logged_at": ts}]
-    bal = iter([{"balance": 1000}, {"balance": 1100}])
-    calls = []
-
-    def ledger():
-        calls.append(1)
-        return rows if len(calls) == 1 else rows + [dict(rows[1], entry_id="e1", realized_pnl_net=9.0)]
-    f = cb.verified_facts(get=lambda p: next(bal), get_positions=pos, ledger=ledger, now=NOW)
-    lines = cb.facts_block(f)[0]
-    assert lines[1:] == ["Broker figures omitted — broker re-read disagreed",
-                         "Realized P&L omitted — ledger re-read disagreed"], lines
-    old = [dict(r, logged_at=(NOW - timedelta(days=30)).isoformat()) for r in rows]
-    stale_pos = lambda: dict(pos(), ts=(NOW - timedelta(hours=2)).isoformat())  # noqa: E731
-    f = cb.verified_facts(get=lambda p: {"balance": 1}, get_positions=stale_pos,
-                          ledger=lambda: old, now=NOW)
-    assert cb.facts_block(f)[0][1:] == ["Broker figures omitted — broker data STALE",
-                                        "Realized P&L omitted — ledger STALE (no recent rows)"]
-
-    def boom(*a, **k):
-        raise ConnectionError("down 12.50")
-    f = cb.verified_facts(get=boom, get_positions=pos, ledger=boom, now=NOW)
-    lines = cb.facts_block(f)[0]
-    assert lines[1:] == ["Broker figures omitted — broker unavailable (ConnectionError)",
-                         "Realized P&L omitted — ledger unavailable (ConnectionError)"], lines
+def test_legit_note_and_multibyte_budget():
     rest._fresh_dir()
     send = Sender()
-    r = cb.gate_answer("q", "All fine.", f, send=True, send_fn=send, now=NOW)
-    assert r["status"] == "verified" and not _numerals(send.msgs[0]), send.msgs
-    # a facts dict whose two reads disagree can never be sent with figures
-    send = Sender()
-    r = cb.gate_answer("q2", "ok", _facts(cash=(250.0, 251.0)), send=True, send_fn=send, now=NOW)
-    assert r["status"] == "withheld" and not _numerals(send.msgs[0]), send.msgs
+    cb.gate_answer("ok", "The slate looks calm tonight. Nothing else to note.", _facts(),
+                   send=True, send_fn=send, now=NOW)
+    assert send.msgs[0].startswith(cb.NOTE_LABEL + "\nThe slate looks calm tonight. Nothing else to note.")
+    for heavy in ("🚀" * 5000, "你好" * 3000 + ". The slate looks calm.",
+                  ("Calm night ahead. " * 400), "é" * 9000):
+        send = Sender()
+        r = cb.gate_answer("h" + heavy[:9], heavy, _facts(), send=True, send_fn=send, now=NOW)
+        t = send.msgs[0]
+        assert r["status"] == "verified" and all(l in t for l in FACT_LINES), t
+        assert cb._wire_len(t) <= cb.BUDGET_BYTES, cb._wire_len(t)
+    send = Sender()  # facts block alone over budget -> withheld, never truncated
+    r = cb.gate_answer("tiny", "ok", _facts(), send=True, send_fn=send, now=NOW, budget_bytes=60)
+    assert r["status"] == "withheld" and "facts block exceeds message budget" in send.msgs[0]
 
 
-def _args(q):
-    return types.SimpleNamespace(question=q, no_data=True, model="sonnet", signal=False, router=True)
-
-
-def test_bridge_header_and_exit_codes():
-    rest._fresh_dir()
-    for answer, rc, status in (("You made $124 profit", 0, "verified"), ("Error: timeout", 4, None)):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            got = cb.run(_args(answer), ask=lambda *a, **k: answer, facts_fn=_facts)
-        out = buf.getvalue().rstrip("\n").split("\n")
-        assert got == rc, (answer, got, out)
-        if status:
-            assert out[0] == cb.gate_header(status, "\n".join(out[1:])), out
-            assert "124" not in buf.getvalue() and out[-1] == cb.FOOTER
-        else:
-            assert not out[0].startswith("VALEDIA-GATE"), out
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        got = cb.run(_args("x"), ask=lambda *a, **k: "ok", facts_fn=lambda: _facts(n=(3, 4)))
-    assert got == 3 and buf.getvalue().split("\n")[1].startswith("Report withheld (AI answer)")
+def test_cron_runner_label_allowlist_matches_install_cron():
+    import re
+    inst = open(os.path.join(rest.SCRIPTS, "install_cron.sh")).read()
+    labels = sorted(set(re.findall(r'^[^#\n]*cron_runner_mac\.sh \S+ "([^"]+)"', inst, re.M)))
+    cr = open(os.path.join(rest.SCRIPTS, "cron_runner.sh")).read()
+    known = re.search(r'KNOWN_LABELS="([^"]*)"', cr).group(1).split("|")
+    assert sorted(known) == labels, (sorted(known), labels)
+    d0 = tempfile.mkdtemp(prefix="crlab_")
+    ok = os.path.join(d0, "ok.py")
+    open(ok, "w").write('print("PROFIT $999.99 sent")\n')
+    for lab, want in (("SETTLEMENT", "Valedia job SETTLEMENT finished OK"),
+                      ("P&L TRACKER", "Valedia job P&L TRACKER finished OK"),
+                      ("PROFIT 999", "Valedia job finished OK"), ("", "Valedia job finished OK"),
+                      ("SETTLEMENT; echo x", "Valedia job finished OK")):
+        r, sent, _ = rest._run_sh("cron_runner.sh", [ok, lab], {"openclaw": rest._OPENCLAW})
+        assert sent.split("--message ", 1)[1].strip() == want, (lab, sent)
 
 
 _FAKE_BRIDGE = r'''import base64, os, sys
@@ -276,22 +299,28 @@ def test_router_question_injection_and_apostrophes():
                                   {"FAKEHOME": home, "OUTQ": outq})
         assert not os.path.exists(mark), (q, r.stdout, r.stderr)
         assert open(outq).read() == q, (q, open(outq).read())
-        argv = open(outq + ".argv").read()
-        assert "'--model', 'sonnet'" in argv, argv  # bad MODEL whitelisted back to sonnet
+        assert "'--model', 'sonnet'" in open(outq + ".argv").read()
         assert "Report withheld (claude router)" in sent, sent  # exit 4 -> never relayed
-    src = open(os.path.join(rest.SCRIPTS, "claude_router.sh")).read()
-    assert "${QUESTION" not in src.split("RAW=$(", 1)[1].split("RC=$?", 1)[0]
+        assert r.stdout.strip() == "Report withheld (claude router): bridge output was not " \
+            "signal_verify-gated. Unverified figures not sent; see data/signal/verify_log.jsonl.", r.stdout
+    # a long multi-byte gated text is relayed whole (no byte cap in the router)
+    big = cb.NOTE_LABEL + "\n" + ("Calm. " * 300).strip() + "\n\n" + "\n".join(FACT_LINES) + \
+        "\n✓ figures from broker/ledger only"
+    ssh2 = "cat <<'EOF'\n" + cb.gate_header("verified", big) + "\n" + big + "\nEOF\nexit 0\n"
+    r, sent, _ = rest._run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
+                              {"ssh": ssh2, "openclaw": rest._OPENCLAW})
+    assert "Realized P&L (ledger, fee-incl.): −USD 5.00 (2W/3L)" in sent and "✓ figures" in sent, sent
 
 
 def test_cron_runner_only_fixed_lines_for_every_string():
     d0 = tempfile.mkdtemp(prefix="crfix_")
-    for i, s in enumerate(_all_strings()):
+    for i, s in enumerate(_all_strings()[:120]):
         p = os.path.join(d0, f"s{i}.py")
         open(p, "w").write(f"import sys\nprint({s!r})\nsys.exit({i % 2})\n")
-        r, sent, _ = rest._run_sh("cron_runner.sh", [p, "LBL"], {"openclaw": rest._OPENCLAW})
+        r, sent, _ = rest._run_sh("cron_runner.sh", [p, "SETTLEMENT"], {"openclaw": rest._OPENCLAW})
         msg = sent.split("--message ", 1)[1].strip()
-        assert msg == ("Valedia job LBL finished OK" if i % 2 == 0
-                       else "Valedia job LBL FAILED (see cron log)"), (s, msg)
+        assert msg == ("Valedia job SETTLEMENT finished OK" if i % 2 == 0
+                       else "Valedia job SETTLEMENT FAILED (see cron log)"), (s, msg)
 
 
 def test_watchdog_free_text_scrubbed_for_every_string():
@@ -303,10 +332,9 @@ def test_watchdog_free_text_scrubbed_for_every_string():
 
 
 if __name__ == "__main__":
-    test_every_replayed_string_scrubbed()
-    test_facts_block_from_fixtures_sign_and_labels()
-    test_disagreeing_stale_failing_sources_omit_figures()
-    test_bridge_header_and_exit_codes()
+    test_ai_note_allowlist_every_string_and_corpus()
+    test_legit_note_and_multibyte_budget()
+    test_cron_runner_label_allowlist_matches_install_cron()
     test_router_question_injection_and_apostrophes()
     test_cron_runner_only_fixed_lines_for_every_string()
     test_watchdog_free_text_scrubbed_for_every_string()

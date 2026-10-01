@@ -51,8 +51,35 @@ def delete(endpoint):
 def get_balance():
     return get("/portfolio/balance")
 
-def get_positions():
-    return get("/portfolio/positions")
+POSITIONS_PAGE_LIMIT = 1000
+POSITIONS_MAX_PAGES = 20
+
+
+def get_positions(_get=None, max_pages=POSITIONS_MAX_PAGES):
+    """All portfolio positions (read-only GETs), following Kalshi's `cursor`.
+    Merges market_positions / event_positions across pages. If the page cap is hit
+    the result keeps the last cursor and sets incomplete=True, so callers can omit
+    counts/cost instead of reporting a partial figure."""
+    _get = _get or get
+    out, cursor = None, ""
+    for _ in range(max_pages):
+        q = f"?limit={POSITIONS_PAGE_LIMIT}" + (f"&cursor={cursor}" if cursor else "")
+        page = _get("/portfolio/positions" + q)
+        if not isinstance(page, dict) or not isinstance(page.get("market_positions"), list):
+            return page  # error / unexpected payload: hand back as-is, callers omit
+        if out is None:
+            out = dict(page)
+            out["market_positions"] = list(page.get("market_positions") or [])
+            out["event_positions"] = list(page.get("event_positions") or [])
+        else:
+            out["market_positions"] += list(page.get("market_positions") or [])
+            out["event_positions"] += list(page.get("event_positions") or [])
+        cursor = page.get("cursor") or ""
+        out["cursor"] = cursor
+        if not cursor:
+            return out
+    out["incomplete"] = True
+    return out
 
 def get_fills():
     return get("/portfolio/fills")

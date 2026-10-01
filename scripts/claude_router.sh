@@ -17,8 +17,10 @@
 #   - exit 0 with status "verified" and last line "✓ figures from broker/ledger
 #     only", OR exit 3 with status "withheld" and a single "Report withheld (" line;
 #   - the sha256 in the header equals the sha256 of the text that follows.
-# Anything else (old bridge, raw AI text, errors, spoofed markers) is replaced by
-# a figure-free withheld notice. Bridge stderr is dropped.
+# Anything else (old bridge, raw AI text, errors, spoofed markers, missing/invalid
+# header) is replaced by a figure-free withheld notice — on stdout AND on Signal;
+# raw bridge output is never printed. No byte cap here: the bridge enforces its
+# byte budget on the exact wire form ($ -> "USD "). Bridge stderr is dropped.
 
 QUESTION="${1:-What is my portfolio status?}"
 MODEL="${2:-sonnet}"
@@ -43,35 +45,34 @@ if [ "$TAG" = "VALEDIA-GATE" ]; then
 else
     BODY="$RAW"
 fi
-[ -z "$BODY" ] && BODY="Claude bridge failed — NIMROD may be unreachable or Claude Code timed out."
-
-echo "$BODY"
 
 _sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
     else shasum -a 256 | cut -d' ' -f1; fi
 }
 
+# Structural gate (also decides what stdout shows: never raw bridge output)
+GATED=0
+if [ "$TAG" = "VALEDIA-GATE" ] && [ -z "$EXTRA" ] && [ -n "$DIGEST" ] && [ -n "$BODY" ] \
+   && [ "$(printf '%s' "$BODY" | _sha256)" = "$DIGEST" ]; then
+    NLINES=$(printf '%s\n' "$BODY" | wc -l | tr -d ' ')
+    LAST=$(printf '%s\n' "$BODY" | tail -n 1)
+    if [ "$RC" -eq 0 ] && [ "$STATUS" = "verified" ]; then
+        case "$LAST" in "✓ figures from broker/ledger only") GATED=1 ;; esac
+    elif [ "$RC" -eq 3 ] && [ "$STATUS" = "withheld" ] && [ "$NLINES" -eq 1 ]; then
+        case "$BODY" in "Report withheld ("*) GATED=1 ;; esac
+    fi
+fi
+WITHHELD="Report withheld (claude router): bridge output was not signal_verify-gated. Unverified figures not sent; see data/signal/verify_log.jsonl."
+if [ "$GATED" = "1" ]; then OUT="$BODY"; else OUT="$WITHHELD"; fi
+printf '%s\n' "$OUT"   # stdout: gated text or the withheld notice ONLY
+
 # Optionally send via Signal (only structurally-verified bridge output)
 if [ "$SIGNAL" = "--signal" ]; then
-    GATED=0
-    if [ "$TAG" = "VALEDIA-GATE" ] && [ -z "$EXTRA" ] && [ -n "$DIGEST" ] \
-       && [ "$(printf '%s' "$BODY" | _sha256)" = "$DIGEST" ]; then
-        NLINES=$(printf '%s\n' "$BODY" | wc -l | tr -d ' ')
-        LAST=$(printf '%s\n' "$BODY" | tail -n 1)
-        if [ "$RC" -eq 0 ] && [ "$STATUS" = "verified" ]; then
-            case "$LAST" in "✓ figures from broker/ledger only") GATED=1 ;; esac
-        elif [ "$RC" -eq 3 ] && [ "$STATUS" = "withheld" ] && [ "$NLINES" -eq 1 ]; then
-            case "$BODY" in "Report withheld ("*) GATED=1 ;; esac
-        fi
-    fi
-    if [ "$GATED" = "1" ]; then
-        OUT="$BODY"
-    else
-        OUT="Report withheld (claude router): bridge output was not signal_verify-gated. Unverified figures not sent; see data/signal/verify_log.jsonl."
-    fi
     # --message is a single argv word (no shell re-parse): apostrophes need no escaping.
-    SAFE=$(printf '%s\n' "$OUT" | head -c 1800 | sed 's/\$/USD /g')
+    # No byte cap here: the bridge enforces BUDGET_BYTES on this exact wire form
+    # ($ -> "USD "), with the facts block never truncated.
+    SAFE=$(printf '%s\n' "$OUT" | sed 's/\$/USD /g')
     openclaw message send --channel signal \
         --target "uuid:47bd6dd5-2c96-4514-9541-acd8ed013612" \
         --message "$SAFE" 2>/dev/null

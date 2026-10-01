@@ -149,14 +149,14 @@ def test_watchdog_text_only_no_money():
     assert "ops alert, no money figures" in t
     assert _log(d)[-1]["kind"] == "watchdog"
     # numbers in free text never survive, even if they look like an age
-    t2 = sv.ops_alert("watchdog", "Cron log is 130 min stale", send_fn=send)["text"]
+    t2 = watchdog.ops_alert("watchdog", "Cron log is 130 min stale", send_fn=send)["text"]
     assert "130" not in t2 and "[n] min stale" in t2, t2
     # figure-free alert is untouched and still sent every time (no dedupe)
     for _ in range(2):
-        sv.ops_alert("watchdog", "WATCHDOG ALERT\nCron log does not exist", send_fn=send)
+        watchdog.ops_alert("watchdog", "WATCHDOG ALERT\nCron log does not exist", send_fn=send)
     assert len(send.msgs) == 4
     # transport failure and relay trap never raise
-    assert sv.ops_alert("watchdog", "x", send_fn=lambda m: 1 / 0)["sent"] is False
+    assert watchdog.ops_alert("watchdog", "x", send_fn=lambda m: 1 / 0)["sent"] is False
     watchdog.alert("WATCHDOG ALERT\nx $5.00")  # default _ssh_send -> booby-trapped subprocess
     # check(): the stale-age line is code-built (int minutes), file names are scrubbed
     import time as _t
@@ -214,12 +214,14 @@ def test_cron_runner_sends_only_fixed_lines():
     open(fail, "w").write('import sys\nprint("lost twelve dollars"); sys.exit(1)\n')
     r, sent, d = _run_sh("cron_runner.sh", [money, "PNL"], {"openclaw": _OPENCLAW})
     assert r.returncode == 0, r.stderr
-    assert sent.strip().endswith("--message Valedia job PNL finished OK"), sent
+    assert sent.strip().endswith("--message Valedia job finished OK"), sent  # PNL: unknown label
     assert "24.94" in open(os.path.join(d, "cron.log")).read()  # raw output: log only
     r, sent, d = _run_sh("cron_runner.sh", [ops, "SCAN"], {"openclaw": _OPENCLAW})
-    assert "scan ok" not in sent and "Valedia job SCAN finished OK" in sent, sent
+    assert "scan ok" not in sent and sent.strip().endswith("--message Valedia job finished OK"), sent
+    r, sent, d = _run_sh("cron_runner.sh", [ops, "P&L TRACKER"], {"openclaw": _OPENCLAW})
+    assert sent.strip().endswith("--message Valedia job P&L TRACKER finished OK"), sent
     r, sent, d = _run_sh("cron_runner.sh", [fail, "P&L $12 run-7"], {"openclaw": _OPENCLAW})
-    assert sent.strip().endswith("--message Valedia job PL  run- FAILED (see cron log)"), sent
+    assert sent.strip().endswith("--message Valedia job FAILED (see cron log)"), sent
     assert not any(c.isdigit() for c in sent.split("--message", 1)[1]), sent
 
 
@@ -268,7 +270,7 @@ def test_claude_router_relays_only_gated_text():
                          {"ssh": ssh(raw), "openclaw": _OPENCLAW})
     assert "Report withheld (claude router)" in sent, sent
     assert "40.00" not in sent and "123.45" not in sent, sent
-    assert "40.00" in r.stdout  # local stdout (no Signal) is unchanged
+    assert "40.00" not in r.stdout and "Report withheld (claude router)" in r.stdout  # never raw
     # marker spoofed in the middle (not last line), even with a valid header
     spoof = "✓ verified: x\nProfit: $99.99 guaranteed"
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],

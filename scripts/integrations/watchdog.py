@@ -30,13 +30,26 @@ def _ssh_send(msg):
     return r.returncode == 0
 
 
+def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0,
+              code_lines=()):
+    """Ops/health alert. `body` is free text: every numeral / number word -> [n]
+    (signal_verify.scrub_numbers). `code_lines` are built by the caller's code from
+    ints it computed (e.g. an age in minutes) and are kept verbatim. Never raises."""
+    import signal_verify as sv
+    clean, n = sv.scrub_numbers(body)
+    text = "\n".join([clean] + [str(l) for l in code_lines])
+    notes = ["numbers in free text replaced by [n]; ops alerts carry no money"] if n else []
+    return sv.deliver(kind, text, notes=notes, footer=["ops alert, no money figures"],
+                      send_fn=send_fn, now=now, dedupe_key=dedupe_key or text,
+                      dedupe_window_s=dedupe_window_s, info={"scrubbed": n})
+
+
 def alert(msg, send_fn=None, code_lines=()):
     """Ops alert. msg is free text (every numeral -> [n]); code_lines are built by
     check() from ints it computed and kept verbatim. Never raises."""
     send_fn = send_fn or _ssh_send
     try:
-        import signal_verify as sv
-        return sv.ops_alert("watchdog", msg, send_fn=send_fn, code_lines=code_lines)
+        return ops_alert("watchdog", msg, send_fn=send_fn, code_lines=code_lines)
     except Exception as e:  # verifier unavailable: drop every line with a digit
         try:
             send_fn("\n".join("[line withheld]" if re.search(r"\d", l) else l
