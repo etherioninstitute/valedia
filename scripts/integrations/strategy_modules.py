@@ -53,12 +53,28 @@ class DCAEngine:
         except Exception:
             return False
 
-    def execute(self, buy_func, balance_func, venue="coinbase"):
+    @staticmethod
+    def _book(book, venue, pair, result):
+        """Ledger booking for one acked buy. Bookkeeping only: a failure is logged to
+        stderr and never blocks, retries or changes the order flow."""
+        try:
+            if book is not None:
+                return book(pair, result)
+            import spot_ledger as sl  # -> forward_test_ledger.book_spot_fill
+            return sl.book_buy(sl.DCA.get(venue, "DCA"), venue, pair, result,
+                               intended_source=sl.venue_source(venue))
+        except Exception as e:
+            print(f"[DCAEngine] ledger booking failed for {pair}: {e}", file=sys.stderr)
+            return None
+
+    def execute(self, buy_func, balance_func, venue="coinbase", book=None):
         """Execute DCA buys. Returns list of actions.
 
         last_buy advances only when at least one buy was ACKed by the venue. If every
         asset was vetoed (SKIP_NIMBLE), venue-blocked or rejected, state is untouched
         and the next scheduled run retries instead of waiting 7 days.
+        Every acked buy is booked once in the fee-true ledger (book(pair, result), or
+        spot_ledger.book_buy as DCA_CRYPTO/DCA_EQUITY when book is None).
         """
         if not self.should_buy():
             days_left = 7 - (datetime.now(timezone.utc) - datetime.fromisoformat(self.state["last_buy"])).days
@@ -85,6 +101,7 @@ class DCAEngine:
                     actions.append(f"DCA: bought ${amount:.2f} {pair} -> {result.get('success', '?')}")
                     self.state["buys"].append({"ts": datetime.now(timezone.utc).isoformat(),
                                                "pair": pair, "amount": amount})
+                    self._book(book, venue, pair, result)
                 else:
                     actions.append(f"DCA: {pair} buy not acked -> {result}")
             except Exception as e:

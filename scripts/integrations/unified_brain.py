@@ -559,30 +559,34 @@ def _shadow_coinbase_write(side, ticker, usd_amount=None, crypto_amount=None):
         pass
 
 
-def ledger_spot_buy(plat, ticker, resp, alpaca_live=False):
-    """Book a Coinbase/Alpaca buy: fee-true live fill, or UNRECONCILED. Never silent."""
-    if not _ftl:
-        return None
+def ledger_spot_buy(plat, ticker, resp, alpaca_live=False, strategy=None):
+    """Book a live Coinbase/Alpaca buy (spot_ledger -> _ftl.book_spot_fill): fee-true
+    EXECUTED row on a confirmed fill, else UNRECONCILED. Paper writes nothing.
+    Returns the ledger status string; never raises, never touches the order."""
     try:
-        strategy = "CRYPTO_MOMENTUM" if plat == "coinbase" else "EQUITY_MOMENTUM"
-        return _ftl.book_spot_fill(
-            strategy, ticker, "buy", plat, resp or {},
-            intended_source=_spot_source(plat, alpaca_live))
-    except Exception:
-        return None
+        import spot_ledger as sl
+        return sl.book_buy(strategy or sl.BRAIN.get(plat, "BRAIN_SPOT"), plat, ticker, resp,
+                           intended_source=_spot_source(plat, alpaca_live))["status"]
+    except Exception as e:
+        print(f"[unified_brain] ledger_spot_buy failed: {e}", file=sys.stderr)
+        return "UNRECONCILED"
 
 
-def ledger_spot_sell(plat, ticker, resp, alpaca_live=False, fallback_price=None, fee=None):
-    """Settle a Coinbase/Alpaca sell. Incomplete fill cannot book live P&L."""
-    if not _ftl:
-        return None
+def ledger_spot_sell(plat, ticker, resp, alpaca_live=False, strategy=None):
+    """Settle a live Coinbase/Alpaca sell: confirmed fill -> fee-true FIFO settlement of the
+    open lots; POST-ack only -> UNRECONCILED sell row (spot_reconcile settles it later).
+    Returns the ledger status string; never raises, never touches the order."""
     try:
-        return _ftl.settle_spot_fill(
-            ticker, plat, resp or {},
-            intended_source=_spot_source(plat, alpaca_live),
-            fallback_price=fallback_price, fee=fee)
-    except Exception:
-        return None
+        import spot_ledger as sl
+        return sl.book_sell(strategy or sl.BRAIN.get(plat, "BRAIN_SPOT"), plat, ticker, resp,
+                            intended_source=_spot_source(plat, alpaca_live))["status"]
+    except Exception as e:
+        print(f"[unified_brain] ledger_spot_sell failed: {e}", file=sys.stderr)
+        return "UNRECONCILED"
+
+
+def _ledger_note(status):
+    return f" ledger={status}" if status else ""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -908,7 +912,7 @@ def run_brain():
                               booster_str, plat)
                     # Fill details → fee-true live row; POST-only → UNRECONCILED (never silent).
                     alp_live = bool(alpaca[4]) if alpaca else False
-                    ledger_spot_buy(plat, ticker, buy_resp, alpaca_live=alp_live)
+                    led = ledger_spot_buy(plat, ticker, buy_resp, alpaca_live=alp_live)
                     if MEMORY_AVAILABLE:
                         try:
                             capture_trade(ticker, "BUY", fused, cur_price, position)
@@ -919,6 +923,7 @@ def run_brain():
                         f"  >> BUY ACK ${position:.2f} {name:6s} "
                         f"fused={fused:.0f} boosters=[{booster_str}] "
                         f"dom={q['dom']} votes={q['votes']} (POST-ack, not fill-confirmed)"
+                        f"{_ledger_note(led)}"
                     )
 
             # SELL signal (exit existing position)
@@ -953,19 +958,13 @@ def run_brain():
                     log_trade(ticker, "SELL", fused, cur_price, 0,
                               booster_str, plat)
                     alp_live = bool(alpaca[4]) if alpaca else False
-                    sell_fee = None
-                    if plat == "coinbase" and bal and cur_price:
-                        from fee_engine import calculate_trade_cost
-                        sell_fee = calculate_trade_cost(
-                            "coinbase", "sell", float(bal) * cur_price,
-                            use_static=True)["total_cost"]
-                    ledger_spot_sell(plat, ticker, sell_resp, alpaca_live=alp_live,
-                                     fallback_price=cur_price if cur_price > 0 else None,
-                                     fee=sell_fee)
+                    # Fee: broker body, else fee_engine static (fee_status=modeled) in spot_ledger.
+                    led = ledger_spot_sell(plat, ticker, sell_resp, alpaca_live=alp_live)
                     actions.append(f"SELL {ticker}")
                     lines.append(
                         f"  >> SELL ACK {name:6s} fused={fused:.0f} "
                         f"boosters=[{booster_str}] (POST-ack, not fill-confirmed)"
+                        f"{_ledger_note(led)}"
                     )
 
             # HOLD existing position
@@ -1002,8 +1001,11 @@ def run_brain():
             # Facts DCA actually knows: fee only (static round trip). No kernel score or price
             # history here, and already_held is never sent for DCA (re-buying held names is the point).
             _rows = {pair: nws.dca_row("coinbase", dca.weekly_budget * w) for pair, w in dca.assets.items()}
+            # Each acked DCA buy is booked as DCA_CRYPTO (bookkeeping only, never blocks).
+            _dca_book = lambda pair, resp: ledger_spot_buy("coinbase", pair, resp,
+                                                           strategy="DCA_CRYPTO")
             for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca", rows=_rows),
-                                  lambda: cb_cash, venue="coinbase"):
+                                  lambda: cb_cash, venue="coinbase", book=_dca_book):
                 lines.append(f"  {da}"); actions += [da] if da.startswith("DCA: bought") else []
         elif dca.should_buy():
             lines.append("  DCA: ready — insufficient USD or Coinbase offline")
