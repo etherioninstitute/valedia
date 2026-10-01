@@ -14,17 +14,19 @@ Policy JSON (unknown keys are rejected so a typo can't silently pass the gate):
 Categories are canonicalised with forward_test_ledger.canonical_category.
 
 Fees: a settlement's realized_pnl_net is taken as net when the ledger recorded the
-fee (reconcile()/settle_open() semantics). Otherwise (backfill:pnl_tracker rows,
-fee_status=unverified_source) realized P&L is treated as GROSS and the nonlinear
-Kalshi fee is subtracted as Kalshi charges it: forward_test_ledger.kalshi_fee =
-ceil(0.07*C*P*(1-P)) to the next cent per order — never a flat fee. When
-price/contracts are unknown the fee is the upper bound 0.07*cost (P->0),
-i.e. conservative.
+fee — a recorded 0.0 (maker fill) is respected (reconcile()/settle_open() semantics).
+Otherwise (fee absent, backfill rows, fee_status=unverified_source) realized P&L is
+treated as GROSS and the nonlinear Kalshi fee is subtracted as Kalshi charges it:
+forward_test_ledger.kalshi_fee = ceil(0.07*C*P*(1-P)) to the next cent per order —
+never a flat fee. When price/contracts are unknown the fee is the upper bound
+0.07*cost (P->0), i.e. conservative. Under a size_mult m the Kalshi fee is
+recomputed per order as kalshi_fee(P, C*m), not scaled; only the bound scales.
 
 CLI:
   python3 backtest_gate.py --baseline a.json --candidate b.json \
       [--ledger PATH] [--live-only] [--seed 7] [--n-boot 2000] [--min-n 30] \
       [--max-p-worse 0.35] [--max-dd-worse 0.20]
+--min-n below HARD_MIN_N (30) is clamped up to 30 with a report warning.
 JSON report -> stdout, one-line summary -> stderr.
 Exit: 0 PASS, 1 FAIL, 2 INSUFFICIENT_DATA, 3 usage/input error.
 (c) GOATWORTHY Post LLC.
@@ -38,7 +40,8 @@ from forward_test_ledger import canonical_category, _is_non_real_source, kalshi_
 
 DEFAULT_LEDGER = os.path.join(os.path.dirname(os.path.dirname(HERE)),
                               "models", "forward_test_ledger.jsonl")
-DEFAULTS = {"min_n": 30, "max_p_worse": 0.35, "max_dd_worse": 0.20,
+HARD_MIN_N = 30  # floor: --min-n may raise it, never lower it (thin sample is never PASS)
+DEFAULTS = {"min_n": HARD_MIN_N, "max_p_worse": 0.35, "max_dd_worse": 0.20,
             "n_boot": 2000, "seed": 7}
 POLICY_KEYS = {"name", "min_edge", "categories_allow", "categories_block", "size_mult",
                "description"}
@@ -152,35 +155,77 @@ def _edge(entry, sett):
     return None
 
 
-def fee_true_net(entry, sett):
-    """(net, fee, fee_basis) for one settlement, or None if it cannot be priced."""
+def fee_model(entry, sett):
+    """Fee-true model of one settlement, or None if it cannot be priced:
+    {net, fee, basis, gross, price, qty, kind}. `kind` says how the fee scales with a
+    policy's size_mult m: "kalshi" -> recompute kalshi_fee(price, qty*m) (ceil per order),
+    "zero" -> a recorded 0.0 fee (maker fill) stays 0, "linear" -> fee*m (spot % fees,
+    the 0.07*cost bound, or a recorded fee with unknown price/qty).
+    A recorded fee (including 0.0) is respected; fees are modeled ONLY when absent or the
+    row is unverified (fee_status=unverified_source or a backfill source)."""
     realized = _num(sett.get("realized_pnl_net"))
     if realized is None:
         return None
     venue = str(entry.get("venue") or sett.get("venue") or "kalshi").lower()
-    unverified = sett.get("fee_status") == "unverified_source"
-    rec_fee = _num(sett.get("fee"))
-    if rec_fee is not None and not unverified:
-        return realized, rec_fee, "recorded"          # reconcile(): already net
-    ent_fee = _num(entry.get("entry_fee"))
-    if not venue.startswith("kalshi") and not unverified:
-        return realized, ent_fee or 0.0, "recorded_spot"  # settle_open(): net of fees
-    if ent_fee and ent_fee > 0 and not unverified:
-        return realized, ent_fee, "recorded_entry"
-    # Fee not verified -> realized treated as GROSS; subtract the nonlinear Kalshi fee.
+    kalshi = venue.startswith("kalshi")
+    unverified = (sett.get("fee_status") == "unverified_source"
+                  or "backfill" in str(sett.get("source")).lower()
+                  or "backfill" in str(entry.get("source")).lower())
     price = _num(entry.get("entry_price"))
     qty = _num(sett.get("filled_contracts")) or _num(entry.get("contracts"))
+    if not (price and 0 < price < 1 and qty and qty > 0):
+        price = qty = None
+
+    def out(fee, basis, kind):
+        if kind == "kalshi" and price is None:
+            kind = "linear"
+        if kind != "zero" and fee == 0:
+            kind = "zero"
+        return {"net": realized - (fee if basis.startswith("modeled") else 0.0),
+                "fee": fee, "basis": basis, "kind": kind, "price": price, "qty": qty,
+                "gross": realized + (0.0 if basis.startswith("modeled") else fee)}
+
+    if not unverified:
+        rec_fee = _num(sett.get("fee"))
+        ent_fee = _num(entry.get("entry_fee"))
+        if rec_fee is not None:                       # reconcile(): realized already net
+            return out(rec_fee, "recorded", "kalshi" if kalshi else "linear")
+        if not kalshi:                                # settle_open(): net of entry_fee
+            return out(ent_fee or 0.0, "recorded_spot", "linear")
+        if ent_fee is not None:                       # recorded entry fee, 0.0 = maker
+            return out(ent_fee, "recorded_entry", "kalshi")
+    # Fee absent or unverified -> realized treated as GROSS; subtract the Kalshi fee.
     cost = _num(sett.get("cost"))
-    if price and 0 < price < 1 and qty and qty > 0:
-        fee, basis = kalshi_fee(price, qty), "modeled"   # per-order ceil to the cent
-    elif cost and cost > 0 and sett.get("won") is True and realized > 0:
+    if price is not None:
+        return out(kalshi_fee(price, qty), "modeled", "kalshi")
+    if cost and cost > 0 and sett.get("won") is True and realized > 0:
         qty = cost + realized                         # $1 payout per contract
-        fee, basis = kalshi_fee(cost / qty, qty), "modeled_inferred"
-    elif cost and cost > 0:
-        fee, basis = 0.07 * cost, "modeled_bound"     # 0.07*C*P*(1-P) <= 0.07*cost
+        price = cost / qty
+        return out(kalshi_fee(price, qty), "modeled_inferred", "kalshi")
+    if cost and cost > 0:
+        return out(0.07 * cost, "modeled_bound", "linear")  # 0.07*C*P*(1-P) <= 0.07*cost
+    return None
+
+
+def fee_true_net(entry, sett):
+    """(net, fee, fee_basis) for one settlement at 1x, or None if it cannot be priced."""
+    m = fee_model(entry, sett)
+    return None if m is None else (m["net"], m["fee"], m["basis"])
+
+
+def scaled(trade, m):
+    """(net, fee) of a trade at size multiplier m. Kalshi fees are ceil-per-order, so a
+    scaled position recomputes kalshi_fee(price, qty*m) instead of scaling the fee."""
+    if m == 1.0:
+        return trade["net"], trade["fee"]
+    kind = trade["fee_kind"]
+    if kind == "kalshi":
+        fee = kalshi_fee(trade["price"], trade["qty"] * m)
+    elif kind == "zero":
+        fee = 0.0
     else:
-        return None
-    return realized - fee, fee, basis
+        fee = trade["fee"] * m
+    return trade["gross"] * m - fee, fee
 
 
 def build_trades(records, live_only=False):
@@ -222,18 +267,19 @@ def build_trades(records, live_only=False):
         if live_only and src != "live":
             stats["backfill_excluded"] += 1
             continue
-        priced = fee_true_net(entry, s)
-        if priced is None:
+        fm = fee_model(entry, s)
+        if fm is None:
             stats["malformed_skipped"] += 1
             continue
-        net, fee, basis = priced
-        stats["fee_basis:" + basis] += 1
+        stats["fee_basis:" + fm["basis"]] += 1
         stats["source:" + src] += 1
         trades.append({"id": eid, "ts": str(entry.get("ts") or s.get("logged_at") or ""),
                        "_ord": order.get(eid, i),
                        "category": canonical_category(s.get("strategy") or entry.get("strategy") or "?"),
-                       "edge": _edge(entry, s), "net": net, "fee": fee,
-                       "fee_basis": basis, "source": src, "won": s.get("won") is True})
+                       "edge": _edge(entry, s), "net": fm["net"], "fee": fm["fee"],
+                       "gross": fm["gross"], "price": fm["price"], "qty": fm["qty"],
+                       "fee_kind": fm["kind"], "fee_basis": fm["basis"],
+                       "source": src, "won": s.get("won") is True})
     stats["unsettled_excluded"] = len((set(entries) | pending) - seen)
     trades.sort(key=lambda t: (t["ts"], t["_ord"]))
     for t in trades:
@@ -269,14 +315,15 @@ def replay(trades, policy):
     fees = net = 0.0
     for t in trades:
         m = decide(policy, t)
-        c = m * t["net"]
-        contribs.append(c)
         if m <= 0:
+            contribs.append(0.0)
             continue
+        c, fee = scaled(t, m)
+        contribs.append(c)
         n += 1
         wins += 1 if t["won"] else 0
         net += c
-        fees += m * t["fee"]
+        fees += fee
         for bucket, key in ((by_src, t["source"]), (by_cat, t["category"])):
             b = bucket.setdefault(key, {"n": 0, "net": 0.0})
             b["n"] += 1
@@ -322,7 +369,12 @@ def monte_carlo(base_c, cand_c, n_boot, seed):
 def evaluate(trades, baseline, candidate, min_n=DEFAULTS["min_n"],
              max_p_worse=DEFAULTS["max_p_worse"], max_dd_worse=DEFAULTS["max_dd_worse"],
              n_boot=DEFAULTS["n_boot"], seed=DEFAULTS["seed"]):
-    """Pure gate: trades + two normalised policies -> report dict with verdict."""
+    """Pure gate: trades + two normalised policies -> report dict with verdict.
+    min_n below HARD_MIN_N is clamped up to HARD_MIN_N (with a warning), never honoured."""
+    warnings, requested = [], min_n
+    if min_n < HARD_MIN_N:
+        min_n = HARD_MIN_N
+        warnings.append(f"min_n={requested} below hard floor; clamped to {HARD_MIN_N}")
     base_r, base_c = replay(trades, baseline)
     cand_r, cand_c = replay(trades, candidate)
     mc = monte_carlo(base_c, cand_c, n_boot, seed)
@@ -339,8 +391,9 @@ def evaluate(trades, baseline, candidate, min_n=DEFAULTS["min_n"],
         if cdd > bdd * (1.0 + max_dd_worse) + 1e-9:
             reasons.append(f"candidate tail max-DD ${cdd:.2f} > baseline ${bdd:.2f} x{1 + max_dd_worse:.2f}")
         verdict = FAIL if reasons else PASS
-    return {"verdict": verdict, "reasons": reasons,
-            "thresholds": {"min_n": min_n, "max_p_worse": max_p_worse,
+    return {"verdict": verdict, "reasons": reasons, "warnings": warnings,
+            "thresholds": {"min_n": min_n, "min_n_requested": requested,
+                           "max_p_worse": max_p_worse,
                            "max_dd_worse": max_dd_worse, "n_boot": n_boot, "seed": seed},
             "baseline": base_r, "candidate": cand_r, "monte_carlo": mc}
 
@@ -357,6 +410,8 @@ def summary_line(report):
             f"backfill={ls.get('source:backfill', 0)})")
     if report["reasons"]:
         line += " | " + "; ".join(report["reasons"])
+    if report.get("warnings"):
+        line += " | WARN " + "; ".join(report["warnings"])
     return line
 
 

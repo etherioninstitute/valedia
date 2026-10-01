@@ -71,7 +71,7 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
    - Paired bootstrap Monte-Carlo (seeded, N=2000) on the same resamples for baseline and candidate.
    - **PASS bar** (all must hold; thresholds CLI-overridable): candidate `n_taken >= 30`; candidate fee-true net `>=` baseline;
      `P(candidate − baseline < 0) <= 0.35`; candidate tail (p95) max drawdown `<=` 1.2 × baseline's.
-     Thin sample → `INSUFFICIENT_DATA`, never PASS. Exit 0 PASS / 1 FAIL / 2 INSUFFICIENT_DATA / 3 input error.
+     Thin sample → `INSUFFICIENT_DATA`, never PASS (`--min-n` can raise the 30 floor, never lower it). Exit 0 PASS / 1 FAIL / 2 INSUFFICIENT_DATA / 3 input error.
    - Attach the JSON report + one-line summary to the change. Caveat: a policy tuned on this same ledger is in-sample;
      PASS on backfill-only rows is weak evidence — prefer `--live-only` once live settlements reach the min sample.
 
