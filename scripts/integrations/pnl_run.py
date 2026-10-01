@@ -46,12 +46,12 @@ def _pnl_report(get_positions, ledger, send_fn, now):
     day, cut = now.astimezone().date(), now - timedelta(hours=24)  # cron is 11pm local
     last = lambda rows: [s for s in rows if cut < (settled_at(s) or cut) <= now]  # noqa: E731
     today, today2 = last(real["settlements"]), last(real2["settlements"])
-    t_pnl = sum(sv.num(s.get("realized_pnl_net")) for s in today)
+    t_pnl = sv.dsum(sv.num(s.get("realized_pnl_net")) for s in today)
     prof = sv.money(real["total"], signed=True)
     body = (f"💰 Valedia P&L — {day.isoformat()}\n"
             f"Invested: {sv.money(snap['invested'])} (Kalshi open-position cost, broker)\n"
-            f"Profit: {prof}{' (net loss)' if prof.startswith('−') else ''} Realized "
-            f"(ledger, fee-incl.) {real['wins']}W/{real['losses']}L · settled last 24h "
+            f"Profit (all-time realized, ledger): {prof}{' (net loss)' if prof.startswith('−') else ''}"
+            f" fee-incl., all venues · {real['wins']}W/{real['losses']}L · settled last 24h "
             f"{sv.money(t_pnl, signed=True)}")
     claim = sv.claim
     claims = [
@@ -59,7 +59,7 @@ def _pnl_report(get_positions, ledger, send_fn, now):
         claim("open positions", snap["n"], snap2["n"], "broker re-read", tol=0),
         claim("Profit", real["total"], real2["total"], "ledger re-read"),
         sv.sum_claim("Profit total", real["total"], real2["parts"]),
-        claim("Profit last 24h", t_pnl, sum(sv.num(s.get("realized_pnl_net")) for s in today2),
+        claim("Profit last 24h", t_pnl, sv.dsum(sv.num(s.get("realized_pnl_net")) for s in today2),
               "ledger re-read"),
         claim("wins", real["wins"], real2["wins"], "ledger re-read", tol=0),
         claim("losses", real["losses"], real2["losses"], "ledger re-read", tol=0),

@@ -534,6 +534,18 @@ def run(dry_run=False):
             lines.append("SIGNAL: " + signal_verify.invested_ping(executed)["status"])
         except Exception as e:
             print(f"[sports_engine] Invested ping failed: {e}", file=sys.stderr)
+    # Orders that ended UNRECONCILED / FAILED after create_order: figure-free notice.
+    unconf = [r for r in results if r['status'] in ('UNRECONCILED', 'FAILED')]
+    if unconf and not dry_run:
+        try:
+            import signal_verify as _sv
+            ids = sorted(str(r.get('order_id') or f"{r.get('fav_ticker')}@{r.get('ts')}") for r in unconf)
+            lines.append("SIGNAL unconfirmed: " + _sv.deliver(
+                "Kalshi sports", f"Kalshi sports: {len(unconf)} order(s) unconfirmed — figures "
+                "withheld until reconciled", [_sv.claim("orders", len(unconf), len(ids), "engine", tol=0)],
+                dedupe_key="unconfirmed:" + ",".join(ids), dedupe_window_s=7 * 86400)["status"])
+        except Exception as e:
+            print(f"[sports_engine] unconfirmed notice failed: {e}", file=sys.stderr)
     
     report = "\n".join(lines)
     print(report)

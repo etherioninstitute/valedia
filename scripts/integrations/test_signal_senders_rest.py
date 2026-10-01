@@ -226,7 +226,7 @@ def test_cron_runner_sends_only_fixed_lines():
 
 
 _NIMROD_GATED = ("AI answer (Claude; any numbers it wrote are shown as [n]):\nYou have [n] cash.\n\n"
-                 "Facts (code-generated; broker read twice, ledger read twice):\nCash (broker): $12.50\n"
+                 "Facts (code-generated; broker read twice, ledger read twice):\nCash (Kalshi, broker): $12.50\n"
                  "✓ figures from broker/ledger only")
 
 

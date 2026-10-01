@@ -102,6 +102,8 @@ def verified_facts(get=None, get_positions=None, ledger=None, now=None):
         else:
             f["ledger"] = {"total": (r1["total"], r2["total"]), "wins": (r1["wins"], r2["wins"]),
                            "losses": (r1["losses"], r2["losses"])}
+        if f["positions"]:  # open Kalshi entries in the ledger vs broker open positions
+            f["open_mismatch"] = (sv.ledger_open_kalshi(recs2), f["positions"]["n"][0])
     except Exception as e:
         f["why"]["ledger"] = f"unavailable ({type(e).__name__})"
     return f
@@ -114,28 +116,34 @@ def facts_block(f):
     why = f.get("why") or {}
     if f.get("cash"):
         c = f["cash"]
-        lines.append(f"Cash (broker): {sv.money(c[0])}")
+        lines.append(f"Cash (Kalshi, broker): {sv.money(c[0])}")
         claims.append(sv.claim("Cash", c[0], c[1], "broker re-read"))
     else:
-        lines.append(f"Cash (broker): omitted — {why.get('cash', 'unavailable')}")
+        lines.append(f"Cash (Kalshi, broker): omitted — {why.get('cash', 'unavailable')}")
     if f.get("positions"):
         p = f["positions"]
-        lines += [f"Open-position cost (broker): {sv.money(p['invested'][0])}",
-                  f"Open positions (broker): {p['n'][0]}"]
+        lines += [f"Open-position cost (Kalshi, broker): {sv.money(p['invested'][0])}",
+                  f"Open positions (Kalshi, broker): {p['n'][0]}"]
         claims += [sv.claim("Open-position cost", p["invested"][0], p["invested"][1], "broker re-read"),
                    sv.claim("Open positions", p["n"][0], p["n"][1], "broker re-read", tol=0)]
     else:
         w = why.get("positions", "unavailable")
-        lines += [f"Open-position cost (broker): omitted — {w}", f"Open positions (broker): omitted — {w}"]
+        lines += [f"Open-position cost (Kalshi, broker): omitted — {w}",
+                  f"Open positions (Kalshi, broker): omitted — {w}"]
     if f.get("ledger"):
         l = f["ledger"]
         t = l["total"][0]
-        lines.append(f"Realized P&L (ledger, fee-incl.): {sv.money(t, signed=True)} "
+        lines.append(f"Realized P&L (ledger, all venues, fee-incl.): {sv.money(t, signed=True)} "
                      f"({l['wins'][0]}W/{l['losses'][0]}L)")
         claims += [sv.claim("Realized P&L", t, l["total"][1], "ledger re-read"),
                    sv.claim("wins", l["wins"][0], l["wins"][1], "ledger re-read", tol=0)]
     else:
-        lines.append(f"Realized P&L (ledger, fee-incl.): omitted — {why.get('ledger', 'unavailable')}")
+        lines.append(f"Realized P&L (ledger, all venues, fee-incl.): omitted — "
+                     f"{why.get('ledger', 'unavailable')}")
+    mm = f.get("open_mismatch")
+    if mm and mm[0] != mm[1]:
+        lines.append(f"⚠ ledger/broker open-position mismatch ({mm[0]} vs {mm[1]}) — not reconciled")
+        claims.append(sv.claim("ledger open entries", mm[0], mm[0], "ledger re-read", tol=0))
     return lines, claims
 
 

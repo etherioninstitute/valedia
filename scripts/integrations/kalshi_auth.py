@@ -77,8 +77,21 @@ def get_positions(_get=None, max_pages=POSITIONS_MAX_PAGES):
         cursor = page.get("cursor") or ""
         out["cursor"] = cursor
         if not cursor:
-            return out
+            return _dedupe_positions(out)
     out["incomplete"] = True
+    return _dedupe_positions(out)
+
+
+def _dedupe_positions(out):
+    """Pages can repeat rows. Identical duplicates (same ticker+side) collapse; a
+    conflicting duplicate means the merged view is unreliable -> incomplete=True."""
+    keyed = {}
+    for p in out.get("market_positions") or []:
+        k = (p.get("ticker"), p.get("side")) if isinstance(p, dict) else repr(p)
+        if k in keyed and keyed[k] != p:
+            out["incomplete"] = True
+        keyed.setdefault(k, p)
+    out["market_positions"] = list(keyed.values())
     return out
 
 def get_fills():

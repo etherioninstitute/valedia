@@ -3,7 +3,7 @@ Checks pending bets for settlement. Sends Signal ONLY when profit/loss realized.
 (c) GOATWORTHY Post LLC
 """
 import sys, os, json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.expanduser("~/.openclaw/workspace/models")
@@ -92,11 +92,12 @@ def _pl(v):
 
 
 def format_settled_signal(new_pnl, w, l, total_net, total_record):
-    """Keep Profit: prefix (signal-protocol.md). Body is fee-true FTL only."""
+    """Profit ping body (signal-protocol.md). Fee-true FTL figures only."""
     st = _stamp()
     tail = f"\n{st}" if st else ""
-    return (f"Profit: {_pl(new_pnl)} ({w}W/{l}L settled) Realized (ledger, fee-incl.)\n"
-            f"Total: {_pl(total_net)} ({total_record}) Realized (ledger, fee-incl.){tail}")
+    return (f"Profit (settled since last report): {_pl(new_pnl)} ({w}W/{l}L) "
+            f"Realized (ledger, fee-incl.)\n"
+            f"Total (all-time realized, ledger): {_pl(total_net)} ({total_record}) fee-incl.{tail}")
 
 
 def format_arb_signal(arb):
@@ -107,77 +108,108 @@ def format_arb_signal(arb):
             f"({arb['wins']}W/{arb['losses']}L cumulative)")
 
 
+def read_ledger_safe(path=None):
+    """(rows, problems): parse the ledger line by line, never raising. Truncated JSON
+    or a non-object row is a PROBLEM (the caller withholds and says so), never skipped
+    silently."""
+    import forward_test_ledger as ftl
+    path = path or ftl.LEDGER
+    if not os.path.exists(path):
+        return [], []
+    try:
+        lines = open(path).read().splitlines()
+    except Exception as e:
+        return [], [f"ledger unreadable ({type(e).__name__})"]
+    rows, problems = [], set()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            problems.add("ledger has a truncated / invalid JSON line")
+            continue
+        if not isinstance(r, dict):
+            problems.add("ledger has a non-object row")
+            continue
+        rows.append(r)
+    return rows, sorted(problems)
+
+
+def ftl_profit_parts(recs=None, since=None, minutes=50, now=None, exclude=()):
+    """Figures behind the Profit ping (fee-true FTL rows newer than `since`, else the
+    last `minutes`; neither -> all), minus settlements already reported (`exclude`:
+    entry ids from the sent-set). None if nothing new and nothing wrong.
+    bad: missing/None/NaN/inf/garbage P&L, non-boolean win flag, unparseable row time,
+    or a live orphan settlement. future: any live row dated > 5 min ahead."""
+    import forward_test_ledger as ftl
+    import signal_verify as sv
+    now = now or sv.utcnow()
+    recs = recs if recs is not None else read_ledger_safe()[0]
+    entries = {r["id"]: r for r in recs if r.get("type") == "entry" and r.get("id")}
+    setts = [r for r in recs if r.get("type") == "settlement"]
+    all_true = fee_true_settlements(setts, entries)
+    when = lambda s: sv.parse_ts(s.get("logged_at") or s.get("ts")) if isinstance(  # noqa: E731
+        s.get("logged_at") or s.get("ts"), str) else None
+    ok = lambda s: (sv.num(s.get("realized_pnl_net")) is not None  # noqa: E731
+                    and sv.won_flag(s.get("won")) is not None and when(s) is not None)
+    orphans = {s.get("entry_id") for s in setts if s.get("entry_id") not in entries
+               and not ftl._is_non_real_source(s.get("source"))}
+    bad = sum(1 for s in all_true if not ok(s)) + len(orphans)
+    future = sv.ledger_latest(recs, now)[1]
+    all_true = [s for s in all_true if ok(s)]
+    since = sv.parse_ts(since) if isinstance(since, str) else since
+    if since is None and minutes:
+        since = now - timedelta(minutes=minutes)
+    exclude = set(exclude or ())
+    new = [s for s in all_true if (since is None or when(s) > since)
+           and str(s.get("entry_id")) not in exclude]
+    new = [s for s in new if when(s) <= now + timedelta(minutes=5)]
+    if not new and not bad and not future:
+        return None
+    w = sum(1 for s in new if sv.won_flag(s.get("won")))
+    tw = sum(1 for s in all_true if sv.won_flag(s.get("won")))
+    newest = max([when(s) for s in new], default=since or now)
+    return {"new": new, "new_pnl": sv.dsum(sv.num(s.get("realized_pnl_net")) for s in new),
+            "w": w, "l": len(new) - w, "bad": bad, "future": future,
+            "total_net": sv.dsum(sv.num(s.get("realized_pnl_net")) for s in all_true),
+            "tw": tw, "tl": len(all_true) - tw,
+            "cursor": min(newest, now).isoformat()}  # never past now
+
+
 def ftl_profit_signal(recs=None, since=None, minutes=50):
-    """Profit: body from fee-true FTL rows. None if nothing admissible (incl. UNRECONCILED)."""
+    """Profit body from fee-true FTL rows. None if nothing admissible (incl. UNRECONCILED)."""
     p = ftl_profit_parts(recs, since, minutes)
-    if not p:
+    if not p or not p["new"]:
         return None
     return format_settled_signal(p["new_pnl"], p["w"], p["l"], p["total_net"],
                                  f"{p['tw']}W/{p['tl']}L")
 
 
-def ftl_profit_parts(recs=None, since=None, minutes=50):
-    """Figures behind the Profit: ping (fee-true FTL rows). None if nothing new."""
-    import forward_test_ledger as ftl
-    import signal_verify as sv
-    recs = recs if recs is not None else ftl._read()
-    entries = {r["id"]: r for r in recs if r.get("type") == "entry" and r.get("id")}
-    setts = [r for r in recs if r.get("type") == "settlement"]
-    all_true = fee_true_settlements(setts, entries)
-    # bad: missing/None/NaN/inf/garbage P&L, non-boolean win flag, or a live orphan
-    ok = lambda s: sv.num(s.get("realized_pnl_net")) is not None and sv.won_flag(s.get("won")) is not None  # noqa: E731
-    orphans = {s.get("entry_id") for s in setts if s.get("entry_id") not in entries
-               and not ftl._is_non_real_source(s.get("source"))}
-    bad = sum(1 for s in all_true if not ok(s)) + len(orphans)
-    all_true = [s for s in all_true if ok(s)]
-    new = all_true
-    if since:
-        new = [s for s in new if (s.get("logged_at") or s.get("ts") or "") > since]
-    elif minutes:
-        from datetime import timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-        kept = []
-        for s in new:
-            raw = s.get("logged_at") or s.get("ts") or ""
-            try:
-                ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts >= cutoff:
-                kept.append(s)
-        new = kept
-    if not new and not bad:
-        return None
-    w = sum(1 for s in new if sv.won_flag(s.get("won")))
-    tw = sum(1 for s in all_true if sv.won_flag(s.get("won")))
-    return {"new": new, "new_pnl": sum(sv.num(s.get("realized_pnl_net")) for s in new),
-            "w": w, "l": len(new) - w, "bad": bad,
-            "total_net": sum(sv.num(s.get("realized_pnl_net")) for s in all_true),
-            "tw": tw, "tl": len(all_true) - tw,
-            "cursor": max([(s.get("logged_at") or s.get("ts") or "") for s in new] or [since or ""])}
+WITHHELD_KEY = "profit-withheld"  # one notice per cause per 7 days, whatever rows are pending
 
 
 def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
-    """Verified 'Profit:' ping: every figure recomputed from an independent ledger
-    re-read (signal_verify.ledger_realized). Any unparseable / orphan row -> withheld."""
+    """Verified Profit ping: every figure recomputed from an independent ledger re-read
+    (signal_verify.ledger_realized). Bad / orphan / future-dated rows -> withheld."""
     import signal_verify as sv
     kind, now = "Profit", now or sv.utcnow()
     try:
         real = sv.ledger_realized((ledger or sv.read_ledger)())
     except Exception as e:
-        return sv.withhold(kind, "ledger read failed", e, send_fn, now)
+        return sv.withhold(kind, "ledger read failed", e, send_fn, now, dedupe_window_s=7 * 86400)
+    probs = ([{"code": "ledger settlement rows unparseable", "detail": [parts.get("bad"), real["bad"]]}]
+             if parts.get("bad") or real["bad"] else [])
+    if parts.get("future"):
+        probs.append({"code": "ledger has future-dated rows", "detail": "future"})
+    if probs:
+        return sv.deliver(kind, "", problems=probs, send_fn=send_fn, now=now,
+                          dedupe_key=WITHHELD_KEY, dedupe_window_s=7 * 86400)
     new_ids = {s.get("entry_id") for s in parts["new"]}
-    key = "profit:" + ",".join(sorted(str(i) for i in new_ids))
-    if parts.get("bad") or real["bad"]:
-        return sv.deliver(kind, "", problems=[{"code": "ledger settlement rows unparseable",
-                                               "detail": [parts.get("bad"), real["bad"]]}],
-                          send_fn=send_fn, now=now, dedupe_key=key, dedupe_window_s=7 * 86400)
     new2 = [s for s in real["settlements"] if s.get("entry_id") in new_ids]
     claim = sv.claim
     claims = [
-        claim("Profit", parts["new_pnl"], sum(sv.num(s.get("realized_pnl_net")) for s in new2),
+        claim("Profit", parts["new_pnl"], sv.dsum(sv.num(s.get("realized_pnl_net")) for s in new2),
               "ledger re-read"),
         claim("settled count", len(parts["new"]), len(new2), "ledger re-read", tol=0),
         claim("wins", parts["w"], sum(1 for s in new2 if sv.won_flag(s.get("won"))),
@@ -190,10 +222,52 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
     oldest = min((t for t in stamps if sv.parse_ts(t)), key=sv.parse_ts, default=None)
     return sv.deliver(kind, body, claims, [sv.fresh("settlement", oldest, 6 * 3600, policy="label")],
                       footer=[f"ledger {real['rows']} settled rows", sv.hhmm(now)],
-                      send_fn=send_fn, now=now, dedupe_window_s=7 * 86400, dedupe_key=key)
+                      send_fn=send_fn, now=now, dedupe_window_s=7 * 86400,
+                      dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
 
 
-def run(send_fn=None):
+SENT_IDS_MAX = 5000  # bounded: the newest reported settlement ids are kept
+
+
+def _sent_ids_path():
+    import signal_verify as sv
+    return os.path.join(sv.signal_dir(), "profit_sent_ids.jsonl")  # gitignored (*.jsonl)
+
+
+def load_sent_ids():
+    """Entry ids of settlements already reported in a Profit ping (the source of truth;
+    the cursor is only an optimization). Unreadable lines are ignored."""
+    try:
+        with open(_sent_ids_path()) as f:
+            return {json.loads(l) for l in f if l.strip()}
+    except Exception:
+        return set()
+
+
+def add_sent_ids(ids):
+    try:
+        path = _sent_ids_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        old = open(path).read().splitlines() if os.path.exists(path) else []
+        new = [json.dumps(str(i)) for i in sorted(ids, key=str)]
+        keep = [l for l in old if l.strip() and l not in set(new)] + new
+        with open(path, "w") as f:
+            f.write("".join(l + "\n" for l in keep[-SENT_IDS_MAX:]))
+    except Exception as e:
+        print(f"[settle_run] sent-set write failed: {e}")
+
+
+def _write_cursor(path, iso):
+    try:
+        with open(path, "w") as f:
+            f.write(iso)
+    except Exception as e:
+        print(f"[settle_run] cursor write failed: {e}")
+
+
+def run(send_fn=None, now=None):
+    import signal_verify as sv
+    now = now or sv.utcnow()
     try:
         new_sports, stats = settle_sports()
         if new_sports:
@@ -201,28 +275,43 @@ def run(send_fn=None):
     except Exception as e:
         print(f"[settle_run] sports-log settle failed (Signal uses FTL only): {e}")
 
+    # Cursor: an ISO time, never in the future; first run starts 50 min back and is
+    # persisted, so rows held back by a withheld report are still sent once valid.
+    # It is only an optimization: the persisted sent-set (profit_sent_ids.jsonl) is
+    # what guarantees no settlement is reported twice, even after a window reset.
     cursor_path = os.path.join(MODELS, "settle_ftl_signal_cursor.txt")
-    since = None
     try:
-        since = open(cursor_path).read().strip() or None
+        since = sv.parse_ts(open(cursor_path).read().strip())
     except Exception:
         since = None
+    if since is None or since > now:  # missing, garbage or impossible (future) cursor:
+        since = now - timedelta(minutes=50)  # restart the window rather than skip rows
+        _write_cursor(cursor_path, since.isoformat())
     try:
-        parts = ftl_profit_parts(since=since, minutes=None if since else 50)
-        if parts:
-            body = format_settled_signal(parts["new_pnl"], parts["w"], parts["l"],
-                                         parts["total_net"], f"{parts['tw']}W/{parts['tl']}L")
-            res = profit_ping(parts, body, send_fn=send_fn)
-            print(f"[settle_run] Signal {res['status']} sent={res['sent']}")
-            # Advance only past rows Burton actually got (or already got) — never skip one.
-            if res["status"] == "dedupe" or (res["status"] == "verified" and res["sent"]):
-                try:
-                    with open(cursor_path, "w") as f:
-                        f.write(parts["cursor"])
-                except Exception:
-                    pass
+        recs, problems = read_ledger_safe()
+        if problems:  # never silent: one withheld notice per cause per 7 days
+            res = sv.deliver("Profit", "", problems=[{"code": p, "detail": p} for p in problems],
+                             send_fn=send_fn, now=now, dedupe_key=WITHHELD_KEY,
+                             dedupe_window_s=7 * 86400)
+            print(f"[settle_run] ledger file problems {problems}: Signal {res['status']}")
+        else:
+            parts = ftl_profit_parts(recs, since=since, now=now, exclude=load_sent_ids())
+            if parts:
+                body = format_settled_signal(parts["new_pnl"], parts["w"], parts["l"],
+                                             parts["total_net"], f"{parts['tw']}W/{parts['tl']}L")
+                res = profit_ping(parts, body, ledger=lambda: read_ledger_safe()[0],
+                                  send_fn=send_fn, now=now)
+                print(f"[settle_run] Signal {res['status']} sent={res['sent']}")
+                # Advance only over rows Burton actually got (or already got, verified).
+                delivered = (res["status"] == "verified" and res["sent"]) or (
+                    res["status"] == "dedupe" and not res.get("problems"))
+                if delivered and parts["new"]:  # sent-set first: never report a row twice
+                    add_sent_ids(str(s.get("entry_id")) for s in parts["new"])
+                    _write_cursor(cursor_path, parts["cursor"])
     except Exception as e:
-        print(f"[settle_run] FTL Profit ping failed: {e}")
+        res = sv.withhold("Profit", "settlement check failed", f"{type(e).__name__}: {e}",
+                          send_fn, now, dedupe_window_s=7 * 86400)
+        print(f"[settle_run] FTL Profit ping failed: {e} (Signal {res['status']})")
 
     # Arb settlements: arb-log is not FTL -> local log only, never a Profit ping.
     try:
@@ -232,6 +321,7 @@ def run(send_fn=None):
             print(format_arb_signal(arb))
     except Exception:
         pass
+
 
 if __name__ == "__main__":
     run()

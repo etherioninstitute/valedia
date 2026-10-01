@@ -87,7 +87,7 @@ def test_pnl_report_figures_match_sources():
     t = send.msgs[0]
     assert "Invested: $3.20 (Kalshi open-position cost, broker)" in t, t
     # +2.50 - 1.25; unreconciled 9.99 and paper 5.00 excluded
-    assert "Profit: +$1.25 Realized (ledger, fee-incl.) 1W/1L · settled last 24h +$2.50" in t, t
+    assert "Profit (all-time realized, ledger): +$1.25 fee-incl., all venues · 1W/1L · settled last 24h +$2.50" in t, t
     assert "9.99" not in t and "5.00" not in t
     assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 20:00 UTC, "
             "broker time unknown (read 23:00 UTC)") in t, t
@@ -179,31 +179,33 @@ def test_settle_run_profit_verified_and_cursor():
     d = _fresh_dir()
     models = tempfile.mkdtemp(prefix="models_")
     recs = _ledger()
-    orig = (ftl._read, sr.settle_sports, sr.MODELS, sys.modules.get("latency_arb"))
+    orig = (ftl.LEDGER, sr.settle_sports, sr.MODELS, sys.modules.get("latency_arb"))
     fake_arb = types.ModuleType("latency_arb")
     fake_arb.check_arb_settlements = lambda: {"settled": 3, "net_pnl": 7.77, "wins": 2, "losses": 1}
     try:
-        ftl._read = lambda: recs
+        ftl.LEDGER = os.path.join(models, "ledger.jsonl")
+        with open(ftl.LEDGER, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in recs))
         sr.settle_sports = lambda: (_ for _ in ()).throw(RuntimeError("no sports log"))
         sr.MODELS = models
         sys.modules["latency_arb"] = fake_arb
         with open(os.path.join(models, "settle_ftl_signal_cursor.txt"), "w") as f:
             f.write("2026-09-01T00:00:00+00:00")
         send = Sender()
-        sr.run(send_fn=send)  # never crashes on sports-log failure
+        sr.run(send_fn=send, now=NOW)  # never crashes on sports-log failure
         assert len(send.msgs) == 1, send.msgs  # arb-log is never sent
         t = send.msgs[0]
-        assert "\nProfit: +$1.25 (1W/1L settled) Realized (ledger, fee-incl.)" in t, t
+        assert "\nProfit (settled since last report): +$1.25 (1W/1L) Realized (ledger, fee-incl.)" in t, t
         assert t.startswith("⚠ STALE: settlement data is"), t  # 09-30 row is > 6h old
         assert "7.77" not in t and "9.99" not in t
         assert "✓ verified: ledger 2 settled rows" in t, t
         cur = open(os.path.join(models, "settle_ftl_signal_cursor.txt")).read()
         assert cur == "2026-10-01T20:00:00+00:00", cur  # max logged_at sent, not now()
         send2 = Sender()
-        sr.run(send_fn=send2)
+        sr.run(send_fn=send2, now=NOW)
         assert send2.msgs == [], send2.msgs  # nothing new past the cursor
     finally:
-        ftl._read, sr.settle_sports, sr.MODELS = orig[0], orig[1], orig[2]
+        ftl.LEDGER, sr.settle_sports, sr.MODELS = orig[0], orig[1], orig[2]
         if orig[3] is None:
             sys.modules.pop("latency_arb", None)
         else:
@@ -269,7 +271,7 @@ def test_bridge_ai_answer_gated():
     t = send.msgs[0]
     path = os.path.join(d, "ai_answers", "20261001T230000000000Z.txt")
     assert t == "\n".join(cb.facts_block(facts)[0] + [cb.AI_LINE + path, cb.FOOTER]), t
-    assert "slate" not in t and "Cash (broker): $12.50" in t
+    assert "slate" not in t and "Cash (Kalshi, broker): $12.50" in t
     assert "The slate looks calm tonight." in open(path).read()  # full answer saved locally
     local = cb.gate_answer("q3", "MLB lost $24.94", facts, send=False, now=NOW)
     assert local["sent"] is False and "24.94" not in local["text"] and len(send.msgs) == 1
