@@ -9,6 +9,7 @@ from typing import Mapping, Optional
 from dotenv import dotenv_values
 
 from .decision_engine import DEFAULT_NIMBLE_MODEL, DEFAULT_NIMBLE_URL, NIMBLE2_DIGEST
+from .nimble_pin import digest_ok_ttl, strip_digest
 from .profiles import profile_for
 
 DEFAULT_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
@@ -51,6 +52,7 @@ class Config:
     nimble_url: str = DEFAULT_NIMBLE_URL
     nimble_model: str = DEFAULT_NIMBLE_MODEL
     nimble_digest: str = NIMBLE2_DIGEST  # digest prefix required for nimble / nimble:latest
+    nimble_digest_ttl_s: float = 300.0  # a passed digest check is re-verified after this
     nimble_keep_alive: str = "30m"
     nimble_allow_remote: bool = False
     decision_timeout_s: float = 10.0  # hard cap per decision; exceeding it = skip
@@ -147,7 +149,7 @@ def parse_config(env: Mapping[str, str]) -> Config:
         errors.append(f"NIMBLE_URL={nurl!r}: must start with http:// or https://")
     chain_id = _parse(env, "CHAIN_ID", int, 4663, errors, lo=1)
     prof = profile_for(chain_id)
-    digest = (env.get("NIMBLE_DIGEST") or "").strip() or NIMBLE2_DIGEST
+    digest = strip_digest(env.get("NIMBLE_DIGEST")) or NIMBLE2_DIGEST  # 'sha256:' optional
     if not _DIGEST_RE.match(digest):
         errors.append(f"NIMBLE_DIGEST={digest!r}: expected 12-64 hex chars")
     cfg = Config(
@@ -175,6 +177,7 @@ def parse_config(env: Mapping[str, str]) -> Config:
         nimble_url=nurl,
         nimble_model=(env.get("NIMBLE_MODEL") or "").strip() or DEFAULT_NIMBLE_MODEL,
         nimble_digest=digest.lower(),
+        nimble_digest_ttl_s=digest_ok_ttl(env.get("NIMBLE_DIGEST_TTL_S") or ""),  # junk: 300
         nimble_keep_alive=(env.get("NIMBLE_KEEP_ALIVE") or "").strip() or "30m",
         nimble_allow_remote=_bool(env, "NIMBLE_ALLOW_REMOTE", errors),
         decision_timeout_s=_parse(env, "DECISION_TIMEOUT_S", float, 10.0, errors,

@@ -3,7 +3,8 @@
 A pool whose only failing FACT gate at detection is liquidity_usd is re-evaluated every poll
 until ``creation block + RECHECK_BLOCKS``. Facts are rebuilt each poll; only when they CHANGE
 is the model asked again and a decision-log line written. A buy ends the watch, and the
-existing duplicate_pool rule still prevents any re-buy. RECHECK_BLOCKS=0 turns this off.
+existing duplicate_pool rule still prevents any re-buy. An engine error keeps the pool
+watched (re-asked next poll) until the window ends. RECHECK_BLOCKS=0 turns this off.
 The watch list is in memory only: a restart forgets it (pools already decided are not
 re-decided after a restart unless --redecide).
 """
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from .chain import PoolCreatedEvent
-from .gates import only_liquidity_fails
+from .gates import FACT_GATES, only_liquidity_fails
 from .nimble_questions import sanitize
 
 
@@ -36,14 +37,20 @@ class RecheckBook:
         self.pending: Dict[str, Pending] = {}
 
     def consider(self, ev: PoolCreatedEvent, state: dict, gates: List[dict],
-                 final: str, checks: int = 0) -> bool:
-        """Start / keep / stop watching ``ev`` after an evaluation. Returns True if watched."""
+                 final: str, checks: int = 0, engine_error: bool = False) -> bool:
+        """Start / keep / stop watching ``ev`` after an evaluation. Returns True if watched.
+
+        An engine error (Nimble down, timeout, digest refusal) is not a verdict: if the facts
+        pass, or only liquidity fails, the pool stays watched and is re-asked next poll even
+        when the facts do not change (empty fingerprint)."""
         key = ev.pool.lower()
-        if self.blocks <= 0 or final == "buy" or not only_liquidity_fails(gates):
+        facts_ok = not any(not g["passed"] for g in gates if g["gate"] in FACT_GATES)
+        keep = only_liquidity_fails(gates) or (engine_error and facts_ok)
+        if self.blocks <= 0 or final == "buy" or not keep:
             self.pending.pop(key, None)
             return False
-        self.pending[key] = Pending(ev, ev.block_number + self.blocks, fingerprint(state),
-                                    checks)
+        self.pending[key] = Pending(ev, ev.block_number + self.blocks,
+                                    "" if engine_error else fingerprint(state), checks)
         return True
 
     def expire(self, head: int) -> List[Pending]:

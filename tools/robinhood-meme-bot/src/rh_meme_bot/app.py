@@ -174,7 +174,8 @@ class Bot:
                               "threshold": "no error", "passed": False})
         self.seen_pools.add(ev.pool.lower())
         self._log(ts, ev, state, decision, latency, within, gates, final, position, recheck)
-        watched = not build_err and self.rechecks.consider(ev, state, gates, final, recheck)
+        watched = not build_err and self.rechecks.consider(
+            ev, state, gates, final, recheck, engine_error=bool(decision["error"]))
         self.sink.decision({
             "pool": ev.pool, "action": decision["action"], "confidence": decision["confidence"],
             "risk_score": decision["risk_score"], "latency_ms": latency, "within_budget": within,

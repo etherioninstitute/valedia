@@ -59,13 +59,69 @@ def test_digest_unverified_refuses(tags):
     assert out["error"].startswith("digest_unverified")
 
 
-def test_unverified_is_retried_and_recovers():
+@pytest.fixture
+def clock(monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(nimble_pin, "_now", lambda: t[0])
+    return t
+
+
+def test_failures_held_for_retry_window_then_retried(clock):
     fake = FakeNimble()
     fake.tags = ConnectionError("starting up")
     eng, _ = engine(fake)
     assert eng.warmup()["error"].startswith("digest_unverified")
     fake.tags = nimble_tags()
+    clock[0] += nimble_pin.DIGEST_RETRY_S - 1  # inside the 30 s window: cached failure
+    assert eng.decide(STATE)["error"].startswith("digest_unverified")
+    assert len(fake.tag_requests) == 1 and fake.requests == []
+    clock[0] += 2  # window over: re-verified, recovers
     assert eng.decide(STATE)["error"] is None and len(fake.tag_requests) == 2
+    # a mismatch is retried after the window too (e.g. after `ollama pull` of the right one)
+    nimble_pin.clear_cache()
+    fake.tags = nimble_tags(digest="deadbeef0000" + "00" * 26)
+    assert eng.decide(STATE)["error"].startswith("digest_mismatch")
+    fake.tags = nimble_tags()
+    assert eng.decide(STATE)["error"].startswith("digest_mismatch")  # held
+    clock[0] += nimble_pin.DIGEST_RETRY_S
+    assert eng.decide(STATE)["error"] is None
+
+
+def test_ok_expires_after_ttl_and_repull_is_caught(clock, caplog):
+    fake = FakeNimble()
+    eng, _ = engine(fake)
+    assert eng.decide(STATE)["error"] is None and len(fake.requests) == 1
+    fake.tags = nimble_tags(digest="badc0ffee000" + "11" * 26)  # someone re-pulled nimble
+    clock[0] += nimble_pin.DIGEST_OK_TTL_S - 1
+    assert eng.decide(STATE)["error"] is None and len(fake.tag_requests) == 1  # still trusted
+    clock[0] += 2  # past the 300 s TTL: re-verified
+    out = eng.decide(STATE)
+    assert out["action"] == "skip" and out["error"].startswith("digest_mismatch")
+    assert len(fake.requests) == 2 and len(fake.tag_requests) == 2  # no POST after mismatch
+    assert any("digest_mismatch" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("raw,want", [("", 300.0), ("junk", 300.0), ("0", 300.0),
+                                      ("-5", 300.0), ("inf", 300.0), ("nan", 300.0),
+                                      ("60", 60.0), ("1.5", 1.5)])
+def test_digest_ttl_env_parsing(raw, want):
+    assert nimble_pin.digest_ok_ttl(raw) == want
+    assert load_config(env={"NIMBLE_DIGEST_TTL_S": raw}).nimble_digest_ttl_s == want
+
+
+def test_config_ttl_reaches_engine(clock):
+    fake = FakeNimble()
+    eng = engine_from_config(load_config(env={"NIMBLE_DIGEST_TTL_S": "10"}), fake)
+    assert eng.digest_ttl_s == 10.0 and eng.decide(STATE)["error"] is None
+    clock[0] += 11
+    eng.decide(STATE)
+    assert len(fake.tag_requests) == 2
+
+
+def test_nimble_digest_accepts_sha256_prefix():
+    cfg = load_config(env={"NIMBLE_DIGEST": "sha256:24E550A16A70"})
+    assert cfg.nimble_digest == "24e550a16a70"
+    assert engine_from_config(cfg, FakeNimble()).decide(STATE)["error"] is None
 
 
 def test_explicit_v2_names_skip_digest_and_v1_tags_refused():

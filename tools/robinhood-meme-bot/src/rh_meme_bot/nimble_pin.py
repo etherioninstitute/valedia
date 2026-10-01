@@ -1,9 +1,9 @@
 """Nimble 2 pin rule: explicit v2 names, or the bare/latest tag pinned by Ollama digest.
 
-Copied from Valedia; source of truth: scripts/integrations/systemone_hotpath_client.py
-(is_nimble2 and the NIMBLE2_DIGEST rule; this project must stay standalone, so it is
-duplicated here, not imported). Semantics match that file: same constant name
-NIMBLE2_DIGEST, same refusal reasons ``digest_unverified`` / ``digest_mismatch``.
+Copied from Valedia; source of truth: scripts/integrations/systemone_pin.py (is_nimble2 and
+the NIMBLE2_DIGEST rule; this project must stay standalone, so it is duplicated here, not
+imported). Semantics match that file: same constant names NIMBLE2_DIGEST, DIGEST_OK_TTL_S,
+DIGEST_RETRY_S, same refusal reasons ``digest_unverified`` / ``digest_mismatch``.
 
 Burton's Nimble 2 is ``nimble:latest`` (ollama list ID 24e550a16a70). A bare ``nimble`` or
 ``nimble:latest`` tag says nothing about the version on its own, so it is accepted ONLY when
@@ -13,7 +13,9 @@ tags (nimble:9b, nimble:v1, ...) and Tev are always refused.
 """
 from __future__ import annotations
 
+import os
 import re
+import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -85,19 +87,48 @@ def check_tags(body: Any, model: str, prefix: str) -> Tuple[bool, Optional[str]]
     return False, f"digest_unverified: {want} not listed in /api/tags"
 
 
-# Per-process cache: (tags url, model, prefix) -> (verified, reason). Only definitive
-# answers are cached (verified, or a listed model with the wrong digest); a transport failure
-# or a missing model is retried on the next call.
-_CACHE: Dict[Tuple[str, str, str], Tuple[bool, Optional[str]]] = {}
+# Per-process cache: (tags url, model, prefix) -> (verified, reason, monotonic ts). Same
+# timing as Valedia: a pass is trusted for DIGEST_OK_TTL_S (then re-verified, so a later
+# re-pull with another digest is caught); a failure (mismatch or unverified) is held for
+# DIGEST_RETRY_S so decisions do not hammer /api/tags, then retried.
+DIGEST_OK_TTL_S = 300.0
+DIGEST_TTL_ENV = "NIMBLE_DIGEST_TTL_S"
+DIGEST_RETRY_S = 30.0
+_CACHE: Dict[Tuple[str, str, str], Tuple[bool, Optional[str], float]] = {}
+_now = time.monotonic  # patched in tests
 
 
-def cached(key: Tuple[str, str, str]) -> Optional[Tuple[bool, Optional[str]]]:
-    return _CACHE.get(key)
+def digest_ok_ttl(raw: Any = None) -> float:
+    """Seconds a passed check stays valid (env NIMBLE_DIGEST_TTL_S). Junk, <= 0, inf or
+    nan -> DIGEST_OK_TTL_S."""
+    raw = os.environ.get(DIGEST_TTL_ENV) if raw is None else raw
+    try:
+        v = float(raw if raw not in (None, "") else DIGEST_OK_TTL_S)
+    except (TypeError, ValueError):
+        return DIGEST_OK_TTL_S
+    return v if v > 0 and v == v and v != float("inf") else DIGEST_OK_TTL_S
+
+
+def strip_digest(raw: Any) -> str:
+    """Lowercase digest prefix with an optional 'sha256:' removed (like Valedia)."""
+    low = str(raw or "").strip().lower()
+    return low[7:] if low.startswith("sha256:") else low
+
+
+def cached(key: Tuple[str, str, str],
+           ok_ttl: float = DIGEST_OK_TTL_S) -> Optional[Tuple[bool, Optional[str]]]:
+    """Cached (verified, reason) still inside its window, else None (re-verify)."""
+    hit = _CACHE.get(key)
+    if hit is None:
+        return None
+    age = _now() - hit[2]
+    if age < (ok_ttl if hit[0] else DIGEST_RETRY_S):
+        return hit[0], hit[1]
+    return None
 
 
 def remember(key: Tuple[str, str, str], result: Tuple[bool, Optional[str]]) -> None:
-    if result[0] or (result[1] or "").startswith("digest_mismatch"):
-        _CACHE[key] = result
+    _CACHE[key] = (result[0], result[1], _now())
 
 
 def clear_cache() -> None:
