@@ -30,15 +30,20 @@ How it maps onto self-evolve (reflect -> propose -> evaluate -> judge -> accept)
 Usage (offline; default self-evolve mode is builtin/serial: no LLM, no network):
   python3 scripts/self_evolve/valedia_policy_lab.py init   --lab ~/.valedia-policy-lab
         [--ledger models/forward_test_ledger.jsonl] [--baseline POLICY.json]
-        [--holdout-frac 0.3] [--n-folds 12] [--holdout-min-n 10] [--n-boot 2000]
-  python3 scripts/self_evolve/valedia_policy_lab.py evolve --lab DIR [--max-rounds 3]
+        [--holdout-frac 0.3] [--n-folds 12] [--holdout-min-n 30] [--n-boot 2000]
+  python3 scripts/self_evolve/valedia_policy_lab.py evolve --lab DIR [--max-rounds 3] \
+        [--proposer grid|none]
   python3 scripts/self_evolve/valedia_policy_lab.py status --lab DIR [--run-id ID]
   python3 scripts/self_evolve/valedia_policy_lab.py export --lab DIR --run-id ID \
         --out recommendations/policy_proposal.json [--vid v1] [--force]
 
-Builtin mode has no policy proposer of its own (self-evolve's builtin proposer only
-replays a `fix_content` it is handed), so a builtin round ends STATIC_REJECT at
-PROPOSE: the harness, profile (tier A) and gates run; nothing changes.
+Proposer: self-evolve's builtin proposer only replays a `fix_content` it is handed, so
+`--proposer grid` (default) routes builtin PROPOSE to grid_proposer.py: a bounded
+(<=200 moves), deterministic, offline hill-climb over categories_block / size_mult /
+min_edge scored on the VISIBLE slice with the lab's own gate. It searches in-sample,
+so the time-held-out slice is the only out-of-sample check; export records how many
+candidates were searched and warns. `--proposer none` keeps the old no-op rounds.
+The gate's hard floor clamps any min_n below 30 (holdout included) up to 30.
 
 `--live` NAMING CLASH: self-evolve's `--live` means "real LLM agents", unrelated to
 Valedia trading `--live`. This wrapper refuses --live outright and never passes it.
@@ -152,6 +157,15 @@ def _lineage(lab, run_id):
         return json.load(f)
 
 
+def grid_log(lab, run_id):
+    """Grid-proposer searches recorded by sie_shim for this run ([] if none)."""
+    p = os.path.join(run_dir(lab, run_id), "valedia_grid_proposals.jsonl")
+    if not os.path.isfile(p):
+        return []
+    with open(p) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def _snapshot(lab, run_id, vid):
     return os.path.join(run_dir(lab, run_id), "archive", "versions", vid, "snapshot")
 
@@ -187,7 +201,8 @@ def cmd_evolve(a):
         return _err("self-evolve init failed: %s" % (r.stderr or r.stdout)[-800:], 1)
     rid = meta["run_id"]
     mode = (["--proposer", "llm", "--reflect-mode", "parallel"] if a.llm_agents
-            else ["--proposer", "builtin", "--reflect-mode", "serial", "--single"])
+            else ["--proposer", "builtin", "--reflect-mode", "serial", "--single",
+                  "--valedia-proposer", a.proposer])
     if a.llm_agents:
         sys.stderr.write("valedia_policy_lab: --llm-agents: self-evolve will call external LLM "
                          "CLIs (costs tokens). Its llm proposer edits .py sources only; here those "
@@ -195,13 +210,18 @@ def cmd_evolve(a):
     r = sie(["run", "--target", lab, "--run-id", rid, "--base-ref", "HEAD",
              "--max-rounds", str(a.max_rounds), "--mode", "auto"] + mode)
     out = {"harness_exit": r.returncode, "harness_summary": _last_json(r.stdout),
-           "mode": "llm-agents" if a.llm_agents else "builtin/serial (no LLM, no network)"}
+           "mode": "llm-agents" if a.llm_agents else
+                   "builtin/serial, proposer=%s (no LLM, no network)" % a.proposer}
     out.update(summarize_run(lab, rid, pins))
+    out["grid_searches"] = [{k: s.get(k) for k in ("parent", "searched", "truncated",
+                                                     "improving", "chosen", "reason")}
+                            for s in grid_log(lab, rid)]
     if r.returncode != 0:
         out["harness_stderr_tail"] = (r.stderr or "")[-1500:]
     if not out["accepted_versions"]:
-        out["note"] = ("no candidate accepted. Builtin mode has no policy proposer; plug one in "
-                       "(LLM or offline search) that writes policy/candidate.json.")
+        out["note"] = ("no candidate accepted" + (
+            "; --proposer none never proposes" if a.proposer == "none" and not a.llm_agents
+            else "; see grid_searches / static_rejects for why"))
     print(json.dumps(out, indent=2))
     return 0 if r.returncode == 0 else 1
 
@@ -267,6 +287,13 @@ def cmd_export(a):
         cand = json.load(f)
     with open(base_p) as f:
         base = json.load(f)
+    searches = grid_log(lab, a.run_id)
+    n_searched = sum(int(s.get("searched") or 0) for s in searches)
+    warning = ("IN-SAMPLE WARNING: visible-slice results (gate, folds, full snapshot) are "
+               "in-sample%s; only the holdout verdict (%s) is out-of-sample."
+               % (" — the grid proposer searched %d candidates on visible data" % n_searched
+                  if searches else "", verdict["holdout"]["verdict"]))
+    sys.stderr.write("valedia_policy_lab: %s\n" % warning)
     proposal = {
         "kind": "valedia_policy_proposal",
         "status": "PROPOSAL ONLY - not applied. Nothing in this tool writes live config.",
@@ -284,6 +311,9 @@ def cmd_export(a):
         "gate_reports": {"visible": verdict["visible"], "holdout": verdict["holdout"],
                          "full_snapshot_in_sample": full},
         "folds": verdict["folds"], "lab_config": cfg,
+        "multiple_comparisons_warning": warning,
+        "search": {"proposer": "grid" if searches else "external/none",
+                   "candidates_searched_total": n_searched, "rounds": searches},
         "integrity": {"snapshot": "intact", "base_commit": pins["base_commit"],
                       "source_ledger_sha256": pins["source_ledger_sha256"]},
     }
@@ -307,11 +337,13 @@ def main(argv=None):
     p.add_argument("--baseline", default=None, help="baseline policy JSON")
     p.add_argument("--holdout-frac", type=float, default=0.3)
     p.add_argument("--n-folds", type=int, default=12)
-    p.add_argument("--holdout-min-n", type=int, default=10)
+    p.add_argument("--holdout-min-n", type=int, default=30)
     p.add_argument("--n-boot", type=int, default=2000)
     p = sub.add_parser("evolve", help="run self-evolve against the lab (builtin by default)")
     p.add_argument("--lab", required=True)
     p.add_argument("--max-rounds", type=int, default=3)
+    p.add_argument("--proposer", choices=("grid", "none"), default="grid",
+                   help="builtin-mode proposer: grid (offline search, default) or none (no-op)")
     p.add_argument("--run-id", default=None)
     p.add_argument("--llm-agents", action="store_true",
                    help="opt in to LLM agents (costs tokens; needs node + cc/claude + codex)")
