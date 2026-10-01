@@ -1,4 +1,7 @@
-"""Output sinks: a rich live dashboard (3 panels) and a plain-line printer for headless runs."""
+"""Output sinks: a rich live dashboard (3 panels) and a plain-line printer for headless runs.
+
+Sink interface: status(text), engine(snapshot), launch(row), decision(row), action(text).
+"""
 from __future__ import annotations
 
 from collections import deque
@@ -9,18 +12,36 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
+
+from .stats import format_status
 
 
 def short(addr: Optional[str]) -> str:
     return "-" if not addr else (addr if len(addr) <= 12 else f"{addr[:6]}..{addr[-4:]}")
 
 
-def fmt_price(p: Optional[float]) -> str:
-    return "-" if p is None else f"{p:.6g}"
+def fmt_num(v: Optional[float]) -> str:
+    return "-" if v is None else f"{v:.6g}"
+
+
+def fmt_usd(v: Optional[float]) -> str:
+    return "-" if v is None else f"${v:,.0f}"
+
+
+def flags(r: dict) -> str:
+    """Compact owner/code flags: R=renounced, O=owned, N=no owner(), code yes/no."""
+    owner = {"renounced": "R", "no_owner_fn": "N"}.get(r.get("owner_status"), "O")
+    return f"owner:{owner} code:{'Y' if r.get('code') else 'N'}"
 
 
 def now_hms() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def _lat(r: dict) -> str:
+    ms = r.get("latency_ms")
+    return "-" if ms is None else f"{ms:.0f}ms{'' if r.get('within_budget') else '!'}"
 
 
 class PlainSink:
@@ -32,22 +53,26 @@ class PlainSink:
     def status(self, text: str) -> None:
         self._w(f"[status] {text}")
 
+    def engine(self, snap: dict) -> None:
+        self._w(f"[engine] {format_status(snap)}")
+
     def launch(self, r: dict) -> None:
-        self._w(f"[launch] {r['time']} pool={r['pool']} token0={r['token0']} token1={r['token1']} "
-                f"sym={r['symbol'] or '-'} fee={r['fee']} price={fmt_price(r['price'])} "
-                f"liq={r['liquidity']} risk={r['risk']:.2f}")
+        self._w(f"[launch] {r['time']} pool={r['pool']} sym={r['symbol'] or '-'} fee={r['fee']} "
+                f"price={fmt_num(r['price'])} liq={fmt_usd(r['liquidity_usd'])} {flags(r)}")
 
     def decision(self, r: dict) -> None:
-        gated = f" ({r['reason']})" if r.get("reason") else ""
-        self._w(f"[decision] pool={r['pool']} engine={r['action']}@{r['confidence']:.2f} "
-                f"final={r['final_action']}{gated}")
+        why = f" first_fail={r['first_fail']}" if r.get("first_fail") else ""
+        err = f" error={r['error']}" if r.get("error") else ""
+        star = " BUY *" if r["final_action"] == "buy" else ""
+        self._w(f"[decision] pool={r['pool']} model={r['action']}@{r['confidence']:.2f} "
+                f"risk={r['risk_score']} {_lat(r)} final={r['final_action']}{star}{why}{err}")
 
     def action(self, text: str) -> None:
         self._w(f"[action] {text}")
 
 
 class Dashboard:
-    """Rich Live layout: launches | decisions | action log."""
+    """Rich Live layout: launches | decisions | action log, plus an engine status line."""
 
     def __init__(self, console: Optional[Console] = None, rows: int = 12):
         self.console = console or Console()
@@ -55,11 +80,16 @@ class Dashboard:
         self.decisions: Deque[dict] = deque(maxlen=rows)
         self.actions: Deque[str] = deque(maxlen=rows * 2)
         self._status = "starting..."
+        self._engine = "engine: starting"
         self._live = None
 
     # --- sink interface ---
     def status(self, text: str) -> None:
         self._status = text
+        self._refresh()
+
+    def engine(self, snap: dict) -> None:
+        self._engine = format_status(snap)
         self._refresh()
 
     def launch(self, r: dict) -> None:
@@ -77,25 +107,27 @@ class Dashboard:
     # --- rendering ---
     def render(self) -> Layout:
         t = Table(expand=True, show_edge=False)
-        for col in ("time", "pool", "tokens", "fee", "price", "liquidity", "risk"):
+        for col in ("time", "pool", "token", "fee", "price", "liquidity", "flags"):
             t.add_column(col, overflow="fold")
         for r in self.launches:
-            t.add_row(r["time"], short(r["pool"]),
-                      r["symbol"] or f"{short(r['token0'])}/{short(r['token1'])}",
-                      str(r["fee"]), fmt_price(r["price"]), str(r["liquidity"]),
-                      f"{r['risk']:.2f}")
+            t.add_row(r["time"], short(r["pool"]), r["symbol"] or short(r.get("token")),
+                      str(r["fee"]), fmt_num(r["price"]), fmt_usd(r["liquidity_usd"]), flags(r))
         d = Table(expand=True, show_edge=False)
-        for col in ("pool", "engine", "conf", "final", "reason"):
+        for col in ("pool", "model", "conf", "risk", "latency", "final", "first failing gate"):
             d.add_column(col, overflow="fold")
         for r in self.decisions:
-            style = "green" if r["final_action"] == "buy" else "dim"
+            buy = r["final_action"] == "buy"
+            final = "[bold green]BUY ★[/]" if buy else f"[dim]{r['final_action']}[/]"
+            style = "bold green" if buy else None
             d.add_row(short(r["pool"]), r["action"], f"{r['confidence']:.2f}",
-                      f"[{style}]{r['final_action']}[/{style}]", r.get("reason") or "")
+                      str(r["risk_score"]), _lat(r), final,
+                      r.get("first_fail") or r.get("error") or "", style=style)
         layout = Layout()
-        layout.split_column(Layout(name="top", ratio=2), Layout(name="log", ratio=1, minimum_size=5))
-        layout["top"].split_row(
-            Layout(Panel(t, title="New pool launches")),
-            Layout(Panel(d, title="Decisions")))
+        layout.split_column(Layout(Text(self._engine, style="cyan"), name="engine", size=1),
+                            Layout(name="top", ratio=2),
+                            Layout(name="log", ratio=1, minimum_size=5))
+        layout["top"].split_row(Layout(Panel(t, title="New pool launches")),
+                                Layout(Panel(d, title="Decisions")))
         body = "\n".join(self.actions) or "(no actions yet)"
         layout["log"].update(Panel(body, title=f"Action log  |  {self._status}  |  PAPER ONLY"))
         return layout

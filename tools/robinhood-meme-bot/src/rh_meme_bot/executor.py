@@ -9,7 +9,7 @@ import os
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Context, Decimal
 from typing import Callable, List, Optional, Protocol
 
 
@@ -29,6 +29,9 @@ class Position:
 
 class Executor(Protocol):
     def buy(self, pool: str, token: str, amount: float, price: Decimal) -> Position: ...
+
+
+_ROUND = Context(prec=12)  # 12 significant digits: readable, far finer than slot0 accuracy
 
 
 def _utc_iso() -> str:
@@ -51,7 +54,7 @@ class PaperExecutor:
             raise ValueError("price must be positive")
         with self._lock:
             pos = Position(id=len(self.positions) + 1, timestamp=self._clock(), pool=pool,
-                           token=token, size=amount, entry_price=format(price, "f"),
+                           token=token, size=amount, entry_price=format(_ROUND.create_decimal(price).normalize(), "f"),
                            simulated=True)
             if self.path:
                 parent = os.path.dirname(os.path.abspath(self.path))

@@ -150,6 +150,15 @@ class ChainReader:
             return "no_owner_fn"
         return "renounced" if owner == abi.ZERO_ADDRESS else f"owned:{owner}"
 
+    def decimals(self, token: str) -> Optional[int]:
+        res = self._call(token, abi.SEL_DECIMALS)
+        return abi.decode_uint(res) if res else None
+
+    def balance_of(self, token: str, holder: str) -> Optional[int]:
+        """Raw ERC-20 balance of ``holder`` (None if the call reverts or is empty)."""
+        res = self._call(token, abi.encode_balance_of(holder))
+        return abi.decode_uint(res) if res else None
+
     # --- Uniswap V3 pool ---------------------------------------------
     def pool_tokens(self, pool: str) -> Tuple[Optional[str], Optional[str]]:
         t0, t1 = self._call(pool, abi.SEL_TOKEN0), self._call(pool, abi.SEL_TOKEN1)

@@ -1,8 +1,10 @@
-"""Pluggable decision engine and the post-decision config gates.
+"""Decision-engine interface, the inert stub, plugin loading, and output validation.
 
-Contract: ``decide(state: dict) -> {"action": "buy"|"hold"|"skip", "confidence": float}``.
-The built-in stub is deliberately inert (always skip). Wire a real model with
-``DECISION_ENGINE=package.module:function``.
+Contract: ``decide(state: dict) -> {"action": "buy"|"hold"|"skip", "confidence": float, ...}``
+Optional extra keys (risk_score 1-10, risk_expected, latency_ms, model, raw, error) are kept.
+Default engine is Nimble 2 (decision_engine.py). ``DECISION_ENGINE=stub`` selects the stub
+below; ``DECISION_ENGINE=package.module:function`` loads an external callable.
+Numeric limits are NOT applied here; gates.py enforces them after the engine answers.
 """
 from __future__ import annotations
 
@@ -19,9 +21,16 @@ def decide(state: dict) -> dict:
     return {"action": "skip", "confidence": 0.0}
 
 
+def _finite(v) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return float(v)
+
+
 def validate_decision(out: object) -> Tuple[dict, Optional[str]]:
     """Coerce arbitrary engine output into a valid decision. Returns (decision, problem)."""
-    safe = {"action": "skip", "confidence": 0.0}
+    safe = {"action": "skip", "confidence": 0.0, "risk_score": None, "risk_expected": None,
+            "latency_ms": None, "model": None, "raw": None, "error": None}
     if not isinstance(out, dict):
         return safe, f"engine returned {type(out).__name__}, expected dict"
     action, conf = out.get("action"), out.get("confidence")
@@ -31,12 +40,27 @@ def validate_decision(out: object) -> Tuple[dict, Optional[str]]:
         return safe, f"invalid confidence {conf!r}"
     if not math.isfinite(conf) or not 0.0 <= conf <= 1.0:
         return safe, f"confidence {conf!r} outside [0,1]"
-    return {"action": action, "confidence": float(conf)}, None
+    risk = out.get("risk_score")
+    risk = risk if isinstance(risk, int) and not isinstance(risk, bool) and 1 <= risk <= 10 \
+        else None
+    err = out.get("error")
+    dec = {"action": action, "confidence": float(conf), "risk_score": risk,
+           "risk_expected": _finite(out.get("risk_expected")),
+           "latency_ms": _finite(out.get("latency_ms")),
+           "model": out.get("model") if isinstance(out.get("model"), str) else None,
+           "raw": out.get("raw"), "error": str(err) if err else None}
+    if dec["error"]:  # an engine that reports an error can never buy
+        dec["action"], dec["confidence"] = "skip", 0.0
+    return dec, None
 
 
-def load_engine(spec: str = "") -> Engine:
-    """Resolve 'module:function' to a callable; empty spec returns the stub."""
+def load_engine(spec: str = "", cfg=None, transport=None) -> Engine:
+    """'' -> Nimble 2 engine; 'stub' -> the inert stub; 'module:function' -> external."""
     if not spec:
+        from .config import Config
+        from .decision_engine import engine_from_config
+        return engine_from_config(cfg or Config(), transport)
+    if spec == "stub":
         return decide
     module_name, _, func_name = spec.partition(":")
     try:
@@ -53,23 +77,5 @@ def run_engine(engine: Engine, state: dict) -> Tuple[dict, Optional[str]]:
     try:
         return validate_decision(engine(dict(state)))
     except Exception as e:  # noqa: BLE001 - external model code must not crash the loop
-        return {"action": "skip", "confidence": 0.0}, f"engine error: {type(e).__name__}: {e}"
-
-
-def apply_gates(decision: dict, state: dict, *, min_confidence: float,
-                max_risk_score: float, min_liquidity: int) -> Tuple[str, Optional[str]]:
-    """Return (final_action, reason). Only a 'buy' can be downgraded, to 'skip'."""
-    if decision["action"] != "buy":
-        return decision["action"], None
-    reasons = []
-    if decision["confidence"] < min_confidence:
-        reasons.append(f"confidence {decision['confidence']:.2f} < {min_confidence:.2f}")
-    risk = state.get("risk_score")
-    if risk is None or risk > max_risk_score:
-        reasons.append(f"risk {risk} > {max_risk_score:.2f}")
-    liq = state.get("liquidity")
-    if liq is None or liq < min_liquidity:
-        reasons.append(f"liquidity {liq} < {min_liquidity}")
-    if reasons:
-        return "skip", "gated: " + "; ".join(reasons)
-    return "buy", None
+        dec, _ = validate_decision(None)
+        return dec, f"engine error: {type(e).__name__}: {e}"

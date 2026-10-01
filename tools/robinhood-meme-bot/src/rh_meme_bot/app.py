@@ -1,116 +1,128 @@
-"""Application wiring: watch pools -> gather facts -> decide -> gate -> paper execute."""
+"""Wiring: new pool -> state -> decide -> hard gates -> paper buy -> log EVERY decision."""
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Callable, List, Optional
 
-from .chain import (ChainMismatchError, ChainReader, PoolCreatedEvent, PoolWatcher,
-                    price_from_sqrt)
+from .chain import ChainMismatchError, ChainReader, PoolCreatedEvent, PoolWatcher
 from .config import Config, ConfigError, load_config
 from .dashboard import Dashboard, PlainSink
-from .decision import Engine, apply_gates, load_engine, run_engine
+from .decision import Engine, load_engine, run_engine, validate_decision
+from .decision_engine import sanitize
+from .decision_log import DecisionLog, review_main
 from .executor import Executor, PaperExecutor
-from .risk import compute_risk
+from .gates import evaluate_gates, first_failure
+from .state import QuoteUsd, build_state, split_roles
+from .stats import LatencyStats
 from .rpc import RpcClient, RpcError
-
-
-def _float(d: Optional[Decimal]) -> Optional[float]:
-    if d is None:
-        return None
-    try:
-        f = float(d)
-    except (OverflowError, ValueError):
-        return None
-    return f if f == f and abs(f) != float("inf") else None
 
 
 class Bot:
     def __init__(self, cfg: Config, reader: ChainReader, executor: Executor, engine: Engine,
-                 sink, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 sink, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 decision_log: Optional[DecisionLog] = None,
+                 perf: Callable[[], float] = time.perf_counter):
         self.cfg, self.reader, self.executor = cfg, reader, executor
-        self.engine, self.sink, self._clock = engine, sink, clock
+        self.engine, self.sink, self._clock, self._perf = engine, sink, clock, perf
+        self.log = decision_log
+        self.stats = LatencyStats(cfg.decision_latency_budget_ms)
+        self.quote_usd = QuoteUsd(reader, cfg.quote_tokens)
         self.watcher = PoolWatcher(reader, cfg.lookback_blocks, cfg.max_block_range,
                                    on_error=lambda m: sink.action(f"RPC error: {m}"))
 
-    # --- fact gathering -------------------------------------------------
-    def build_state(self, ev: PoolCreatedEvent) -> tuple:
-        """Return (state, entry_price Decimal|None). Partial facts on RPC trouble."""
-        quotes = set(self.cfg.quote_tokens)
-        t0_is_quote = ev.token0 in quotes and ev.token1 not in quotes
-        target = ev.token1 if t0_is_quote else ev.token0
-        quote = ev.token0 if t0_is_quote else ev.token1
-        info = self.reader.token_info(target)
-        qinfo = self.reader.token_info(quote)
-        pool, liq = ev.pool, None
-        slot0 = price = None
-        try:
-            liq = self.reader.pool_liquidity(pool)
-            slot0 = self.reader.pool_slot0(pool)
-        except RpcError as e:
-            self.sink.action(f"pool read failed {pool}: {e}")
-        d_t, d_q = info.decimals, qinfo.decimals
-        if slot0 and d_t is not None and d_q is not None:
-            d0, d1 = (d_q, d_t) if t0_is_quote else (d_t, d_q)
-            price = price_from_sqrt(slot0.sqrt_price_x96, d0, d1)
-        # entry price = quote units per 1 target token
-        entry = None if price is None else (price[0] if not t0_is_quote else price[1])
-        state = {
-            "pool": pool, "token0": ev.token0, "token1": ev.token1, "fee": ev.fee,
-            "tick_spacing": ev.tick_spacing, "block_number": ev.block_number,
-            "tx_hash": ev.tx_hash, "detected_at": self._clock().isoformat(timespec="seconds"),
-            "target_token": target, "quote_token": quote, "target_is_token0": not t0_is_quote,
-            "symbol": info.symbol, "decimals": info.decimals, "total_supply": info.total_supply,
-            "has_bytecode": info.has_bytecode, "owner_status": info.owner_status,
-            "liquidity": liq, "tick": slot0.tick if slot0 else None,
-            "price_token1_per_token0": _float(price[0]) if price else None,
-            "price_token0_per_token1": _float(price[1]) if price else None,
-            "target_price_in_quote": _float(entry),
-        }
-        risk = compute_risk(state, self.cfg.min_liquidity)
-        state["risk_score"], state["risk_reasons"] = risk.score, risk.reasons
-        return state, entry
+    @property
+    def model_name(self) -> str:
+        return getattr(self.engine, "model", None) or getattr(self.engine, "__name__", "plugin")
 
-    # --- one pool -------------------------------------------------------
+    def _emit_engine(self) -> None:
+        self.sink.engine(self.stats.snapshot(self.model_name))
+
+    def start(self) -> None:
+        """Warm the model once (resident via keep_alive) and report its latency."""
+        warm = getattr(self.engine, "warmup", None)
+        if warm is not None:
+            res = warm()
+            self.stats.warmup_ms, self.stats.warm = res.get("latency_ms"), not res.get("error")
+            self.stats.last_error = res.get("error")
+            self.sink.action(f"warmup {res.get('latency_ms')}ms "
+                             + ("ok" if self.stats.warm else f"FAILED: {res.get('error')}"))
+        self._emit_engine()
+
+    # --- one pool ---------------------------------------------------------
     def process_event(self, ev: PoolCreatedEvent) -> dict:
-        state, entry = self.build_state(ev)
-        self.sink.launch({
-            "time": self._clock().strftime("%H:%M:%S"), "pool": ev.pool, "token0": ev.token0,
-            "token1": ev.token1, "symbol": state["symbol"], "fee": ev.fee,
-            "price": state["price_token1_per_token0"], "liquidity": state["liquidity"],
-            "risk": state["risk_score"]})
-        decision, problem = run_engine(self.engine, state)
-        final, reason = apply_gates(
-            decision, state, min_confidence=self.cfg.min_confidence,
-            max_risk_score=self.cfg.max_risk_score, min_liquidity=self.cfg.min_liquidity)
-        if problem:
-            reason = problem
+        ts = self._clock().isoformat(timespec="seconds")
+        meme, _ = split_roles(ev, self.cfg.quote_tokens)
+        entry, build_err = None, None
+        try:
+            state, entry = build_state(self.reader, self.cfg, ev, self.quote_usd)
+        except Exception as e:  # noqa: BLE001 - unreadable pool is logged as a skip
+            state = {"token_address": meme, "pool_address": ev.pool, "symbol": None,
+                     "fee_tier": ev.fee, "liquidity_usd": None}
+            build_err = f"state_error: {type(e).__name__}: {e}"
+        self.sink.launch({"time": self._clock().strftime("%H:%M:%S"), "pool": ev.pool,
+                          "token": meme, "symbol": state.get("symbol"), "fee": ev.fee,
+                          "price": state.get("price_in_quote"),
+                          "liquidity_usd": state.get("liquidity_usd"),
+                          "owner_status": state.get("owner_status"),
+                          "code": state.get("contract_has_code")})
+        if build_err:
+            decision, _ = validate_decision(None)
+            decision["error"], latency, within = build_err, None, False
+        else:
+            t0 = self._perf()
+            decision, problem = run_engine(self.engine, state)
+            wall = (self._perf() - t0) * 1000.0
+            if problem:
+                decision["error"] = decision["error"] or problem
+            latency = decision["latency_ms"] if decision["latency_ms"] is not None else wall
+            within = self.stats.record(latency)
+            self.stats.warm, self.stats.last_error = not decision["error"], decision["error"]
+        final, gates = evaluate_gates(decision, state, self.cfg)
         position = None
         if final == "buy":
-            if entry is None or entry <= 0:
-                final, reason = "skip", "gated: no usable entry price"
-            else:
-                try:
-                    position = self.executor.buy(ev.pool, state["target_token"],
-                                                 self.cfg.paper_size, entry)
-                except Exception as e:  # noqa: BLE001 - executor failure must not kill the loop
-                    final, reason = "skip", f"executor error: {type(e).__name__}: {e}"
-        self.sink.decision({"pool": ev.pool, "action": decision["action"],
-                            "confidence": decision["confidence"], "final_action": final,
-                            "reason": reason})
+            try:
+                position = self.executor.buy(ev.pool, state["token_address"],
+                                             self.cfg.paper_size, entry)
+            except Exception as e:  # noqa: BLE001 - executor failure must not kill the loop
+                final = "skip"
+                gates.append({"gate": "executor", "value": f"{type(e).__name__}: {e}",
+                              "threshold": "no error", "passed": False})
+        self._log(ts, ev, state, decision, latency, within, gates, final, position)
+        self.sink.decision({
+            "pool": ev.pool, "action": decision["action"], "confidence": decision["confidence"],
+            "risk_score": decision["risk_score"], "latency_ms": latency, "within_budget": within,
+            "final_action": final, "first_fail": first_failure(gates),
+            "error": decision["error"]})
         if position:
-            self.sink.action(f"PAPER BUY #{position.id} {state['symbol'] or position.token} "
+            self.sink.action(f"PAPER BUY #{position.id} {state.get('symbol') or position.token} "
                              f"size={position.size} @ {position.entry_price} "
                              f"(simulated, pool {ev.pool})")
         else:
-            self.sink.action(f"{final.upper()} pool {ev.pool}" + (f" - {reason}" if reason else ""))
-        return {"state": state, "decision": decision, "final_action": final,
-                "reason": reason, "position": position}
+            self.sink.action(f"{final.upper()} pool {ev.pool} - {first_failure(gates)}")
+        self._emit_engine()
+        return {"state": state, "decision": decision, "final_action": final, "gates": gates,
+                "position": position, "latency_ms": latency, "within_budget": within}
 
-    # --- loop -----------------------------------------------------------
+    def _log(self, ts, ev, state, decision, latency, within, gates, final, position) -> None:
+        if self.log is None:
+            return
+        rec = {"ts": ts, "pool": ev.pool, "block_number": ev.block_number,
+               "tx_hash": ev.tx_hash, "state": state, "raw": decision["raw"],
+               "decision": {k: decision[k] for k in
+                            ("action", "confidence", "risk_score", "risk_expected",
+                             "model", "error")},
+               "latency_ms": latency, "within_budget": within, "gates": gates,
+               "final_action": final, "position_id": position.id if position else None}
+        try:
+            self.log.append(sanitize(rec))
+        except Exception as e:  # noqa: BLE001 - disk trouble must be visible, not fatal
+            self.sink.action(f"DECISION LOG WRITE FAILED: {type(e).__name__}: {e}")
+
+    # --- loop ---------------------------------------------------------------
     def run_once(self) -> List[dict]:
         """One poll iteration. RPC failures are reported, never raised."""
         outcomes: List[dict] = []
@@ -135,16 +147,32 @@ class Bot:
             sleep(self.cfg.poll_interval_seconds)
 
 
-def build_bot(cfg: Config, sink, transport=None) -> Bot:
+def build_bot(cfg: Config, sink, transport=None, nimble_transport=None) -> Bot:
     reader = ChainReader(RpcClient(cfg.rpc_url, transport=transport), cfg.factory_address,
                          cfg.chain_id)
-    return Bot(cfg, reader, PaperExecutor(cfg.positions_file), load_engine(cfg.decision_engine),
-               sink)
+    engine = load_engine(cfg.decision_engine, cfg, nimble_transport)
+    problem = getattr(engine, "config_problem", lambda: None)()
+    if problem:
+        raise ValueError(problem)
+    return Bot(cfg, reader, PaperExecutor(cfg.positions_file), engine, sink,
+               decision_log=DecisionLog(cfg.decisions_log))
 
 
-def main(argv: Optional[List[str]] = None, transport=None) -> int:
+def _review(argv: List[str]) -> int:
+    try:
+        path = load_config().decisions_log
+    except ConfigError:
+        path = os.environ.get("DECISIONS_LOG", "decisions.jsonl")
+    return review_main(argv, path)
+
+
+def main(argv: Optional[List[str]] = None, transport=None, nimble_transport=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "review":
+        return _review(argv[1:])
     ap = argparse.ArgumentParser(prog="rh-meme-bot", description=(
-        "Robinhood Chain memecoin monitor. PAPER TRADING ONLY: no keys, no real swaps."))
+        "Robinhood Chain memecoin monitor. PAPER TRADING ONLY: no keys, no real swaps. "
+        "Subcommand: 'review' reads the decision log."))
     ap.add_argument("--headless", action="store_true", help="plain lines instead of the TUI")
     ap.add_argument("--once", action="store_true", help="run a single poll iteration and exit")
     ap.add_argument("--env-file", default=".env", help="path to .env (default: ./.env)")
@@ -152,7 +180,7 @@ def main(argv: Optional[List[str]] = None, transport=None) -> int:
     try:
         cfg = load_config(env_file=args.env_file)
         sink = PlainSink() if args.headless else Dashboard()
-        bot = build_bot(cfg, sink, transport)
+        bot = build_bot(cfg, sink, transport, nimble_transport)
         bot.reader.verify_chain()
     except (ConfigError, ValueError, ChainMismatchError, RpcError) as e:
         print(f"error: {e}", file=sys.stderr)
@@ -160,13 +188,13 @@ def main(argv: Optional[List[str]] = None, transport=None) -> int:
     try:
         if isinstance(sink, Dashboard):
             with sink:
+                bot.start()
                 bot.run_once() if args.once else bot.run_forever()
             if args.once:
                 sink.console.print(sink.render())
-        elif args.once:
-            bot.run_once()
         else:
-            bot.run_forever()
+            bot.start()
+            bot.run_once() if args.once else bot.run_forever()
     except KeyboardInterrupt:
         print("stopped", file=sys.stderr)
     return 0
