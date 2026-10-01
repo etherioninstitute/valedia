@@ -41,6 +41,18 @@ def log_dca(entry):
 # No last-run state: every scheduled run re-evaluates, so a vetoed / blocked run
 # already retries on the next run (unlike strategy_modules.DCAEngine's weekly last_buy).
 
+def _book_dca(venue, ticker, resp):
+    """Book one DCA buy (spot_ledger -> forward_test_ledger.book_spot_fill) as DCA_CRYPTO /
+    DCA_EQUITY: fee-true EXECUTED row on a confirmed fill, UNRECONCILED on a POST-ack,
+    nothing for a rejected order or Alpaca paper. Bookkeeping only: never raises."""
+    try:
+        import spot_ledger as sl
+        return sl.book_buy(sl.DCA[venue], venue, ticker, resp,
+                           intended_source=sl.venue_source(venue))["status"]
+    except Exception as e:
+        print(f"[dca_module] ledger booking failed for {ticker}: {e}", file=sys.stderr)
+        return None
+
 def run_dca():
     import yfinance as yf
     from kernel_predictor_v16e import KernelPredictor
@@ -92,12 +104,7 @@ def run_dca():
                     r = cb_buy(asset["ticker"], per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f}) -> {r.get('success','?')}")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
-                    try:
-                        import forward_test_ledger as _ftl
-                        _ftl.book_spot_fill("DCA", asset["ticker"], "buy", "coinbase",
-                                            r or {}, intended_source="live")
-                    except Exception:
-                        pass
+                    _book_dca("coinbase", asset["ticker"], r)
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient CB cash (${cash:.2f})")
             else:
@@ -116,15 +123,7 @@ def run_dca():
                     r = alp_buy(asset["ticker"], notional=per_asset)
                     lines.append(f"  DCA BUY ${per_asset:.2f} {asset['ticker']} (score={asset['score']:.0f})")
                     log_dca({"ts":ts,"ticker":asset["ticker"],"amount":per_asset,"score":asset["score"]})
-                    try:
-                        import forward_test_ledger as _ftl
-                        import alpaca_executor as _ae
-                        live = _ae.alpaca_is_live() if hasattr(_ae, "alpaca_is_live") else getattr(_ae, "IS_LIVE", False)
-                        src = "live" if live else "paper"
-                        _ftl.book_spot_fill("DCA", asset["ticker"], "buy", "alpaca",
-                                            r or {}, intended_source=src)
-                    except Exception:
-                        pass
+                    _book_dca("alpaca", asset["ticker"], r)
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient Alpaca cash (${cash:.2f})")
         except Exception as e:

@@ -78,7 +78,7 @@ def sandbox(create=None, pre=None, before=None):
 
 def admit_pre(opp, count, price_cents, order_type="limit", action="buy", post=None):
     info = ibc.informed_from_opp(opp)
-    return {"ok": True, "reasons": [], "informed": info, "jev": None}
+    return {"ok": True, "reasons": [], "informed": info}
 
 
 def state_of(d):
@@ -223,7 +223,7 @@ def test_each_stage_failure_is_a_skip_not_an_order():
         r = la.execute_arb(contract(), dry_run=False)
         assert r["status"] == "SKIP_SESSION" and r["reasons"] == ["closed"] and orders == []
     # informed refuses
-    refuse = lambda *a, **k: {"ok": False, "reasons": ["fv_source", "depth"], "informed": {}, "jev": None}
+    refuse = lambda *a, **k: {"ok": False, "reasons": ["fv_source", "depth"], "informed": {}}
     with sandbox(pre=refuse, before=lambda opp, now=None: None) as (orders, d):
         r = la.execute_arb(contract(), dry_run=False)
         assert r["status"] == "SKIP_INFORMED" and r["error"] == "fv_source,depth" and orders == []

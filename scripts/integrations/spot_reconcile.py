@@ -2,7 +2,9 @@
 
 Given a ledger entry marked UNRECONCILED with a venue order_id, and either an
 explicit fill payload or a mocked GET-order body, book a fee-true record_entry
-(buy) or settle (sell) when qty+price exist.
+(buy) or settle (sell) when qty+price exist. A sell FIFO-closes every open lot
+opened at/before it for the filled quantity (spot_ledger.close_sell); a partly
+sold lot re-opens its remainder; reruns never close a lot twice.
 
 Never invents fills. Missing/partial/empty data stays UNRECONCILED.
 Never live HTTP — pass fill_payload, get_response, or an injected getter.
@@ -17,6 +19,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 import forward_test_ledger as ftl
+import spot_ledger as sl  # close_sell: the one FIFO sell-settlement implementation
 
 # Documented venue GET paths (not fetched by this module).
 COINBASE_ORDER_GET = "/api/v3/brokerage/orders/historical/{order_id}"
@@ -117,6 +120,11 @@ def reconcile_unreconciled_entry(entry, fill_payload=None, get_response=None,
     if existing:
         return {"upgraded": False, "reason": "already_filled", "id": entry.get("id"),
                 "existing_id": existing}
+    if str(entry.get("side") or "").lower() == "sell" and (
+            entry.get("id") in ftl._settled_ids() or sl.sell_already_settled(oid, rows)):
+        _close_stub(entry)  # no-op if already closed; never closes another lot
+        return {"upgraded": False, "reason": "already_settled", "id": entry.get("id"),
+                "order_id": oid}
 
     payload, gresp = fill_payload, get_response
     if payload is None and gresp is None and getter is not None:
@@ -143,26 +151,21 @@ def reconcile_unreconciled_entry(entry, fill_payload=None, get_response=None,
         blob = {**blob, "order_id": oid}
 
     if side == "sell":
+        # FIFO over every open lot opened at/before this sell, for the FILLED quantity
+        # (spot_ledger.close_sell - the one implementation book_sell also uses). Settle
+        # first, then close the stub: a rerun finds the order's settlements and stops.
+        res = sl.close_sell(entry.get("ticker"), venue, fill,
+                            exit_strategy=entry.get("strategy"), order_id=oid,
+                            source=source, before_ts=entry.get("ts"))
         _close_stub(entry)
-        fee = fill["fee"] if fill["fee"] is not None else ftl._spot_fee(
-            venue, fill["price"], fill["qty"])
-        realized = ftl.settle_open(
-            entry.get("ticker"), venue, fill["price"], fee=fee, source=source)
-        if realized is not None:
-            return {"upgraded": True, "action": "settle", "id": entry.get("id"),
-                    "order_id": oid, "source": source, "realized": realized}
-        eid = ftl.book_spot_fill(
-            entry.get("strategy") or "SPOT", entry.get("ticker"), side, venue, blob,
-            intended_source=source,
-            predicted_direction=entry.get("predicted_direction"),
-            predicted_prob=entry.get("predicted_prob"))
-        return {"upgraded": True, "action": "record_entry", "id": eid,
-                "order_id": oid, "source": source, "note": "no_open_to_settle",
-                "from_id": entry.get("id")}
+        return {"upgraded": True, "action": "settle", "id": entry.get("id"),
+                "order_id": oid, "source": source, "realized": res["realized"],
+                "closed": [x["entry_id"] for x in res["settlements"]],
+                "excess": res.get("excess", 0.0), "excess_id": res.get("excess_id")}
 
     eid = ftl.book_spot_fill(
         entry.get("strategy") or "SPOT", entry.get("ticker"), side, venue, blob,
-        intended_source=source,
+        intended_source=source, ts=entry.get("ts"),  # lot keeps its order time (FIFO)
         predicted_direction=entry.get("predicted_direction"),
         predicted_prob=entry.get("predicted_prob"))
     new_rows = [r for r in ftl._read() if r.get("id") == eid]

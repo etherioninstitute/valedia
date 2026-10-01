@@ -91,18 +91,24 @@ def test_oil_and_weather_stay_watch():
     assert w["impact_usd"] is None
 
 
-def test_jev_does_not_reorder_and_fail_open():
-    doc = _doc()
-    assert doc["jev"]["fail_open"] is True
-    assert doc["jev"]["reason"] == "VALEDIA_JEV_off"
-    assert doc["jev"]["changes_rank"] is False
+def test_nimble_note_does_not_reorder_and_fail_open():
+    os.environ.pop("VALEDIA_SYSTEMONE", None)
+    doc = ak.build(fixture_path=ak.DEFAULT_FIXTURE)  # default note path, engine off: no call
+    note = doc["nimble_note"]
+    assert note["fail_open"] is True and note["reason"] == "VALEDIA_SYSTEMONE_off"
+    assert note["changes_rank"] is False and note["seasoning_only"] is True
+    # The note carries code-computed scan facts even with the engine off.
+    assert note["facts"]["has_rows"] is True and note["facts"]["any_sized"] is True
+    assert note["facts"]["top_fenced"] is True  # USO (oil) ranks first and stays unsized
+    assert doc["fences"]["nimble_note"] == "seasoning_only" and "jev" not in doc
     symbols = [r["symbol"] for r in doc["ranked"]]
 
-    def _boom(_doc):
-        raise TimeoutError("jev down")
+    def _boom(_ranked):
+        raise TimeoutError("nimble down")
 
     blown = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=_boom)
-    assert blown["jev"]["fail_open"] is True
+    assert blown["nimble_note"]["fail_open"] is True
+    assert blown["nimble_note"]["error"] == "TimeoutError"
     assert [r["symbol"] for r in blown["ranked"]] == symbols
 
 
@@ -391,7 +397,7 @@ if __name__ == "__main__":
     test_models_dir_v2()
     test_fee_true_rank_and_size_gate()
     test_oil_and_weather_stay_watch()
-    test_jev_does_not_reorder_and_fail_open()
+    test_nimble_note_does_not_reorder_and_fail_open()
     test_fences_and_hygiene()
     test_write_and_cli_fixture()
     test_tape_prefers_coingecko_then_binance()

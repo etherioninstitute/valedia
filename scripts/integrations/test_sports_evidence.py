@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ["OPENCLAW_SKIP_ENV"] = "1"
+os.environ["VALEDIA_SIGNAL_DIR"] = tempfile.mkdtemp(prefix="sig_ev_")  # signal_verify logs
 
 import sports_engine as se
 import kalshi_auth

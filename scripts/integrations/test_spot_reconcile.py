@@ -224,5 +224,94 @@ def run():
     print("spot-reconcile checks: PASS")
 
 
+def _fill(oid, size, px, fee):
+    return {"order_id": oid, "filled_size": str(size), "average_filled_price": str(px),
+            "total_fees": str(fee)}
+
+
+def _setts(order_id=None):
+    return [r for r in ftl._read() if r.get("type") == "settlement" and r.get("result") == "exit"
+            and (order_id is None or r.get("order_id") == order_id)]
+
+
+def _close(a, b):
+    return abs(a - b) < 1e-6
+
+
+def run_fifo():
+    """Sell reconcile closes lots FIFO for the filled qty (spot_ledger.close_sell)."""
+    orig, path = _ledger()
+    try:
+        # A. Three lots, sell 2.5: oldest first, third lot partial, remainder stays open.
+        lots = [ftl.book_spot_fill("DCA_CRYPTO", "BTC-USD", "buy", "coinbase",
+                                   _fill(f"b{i}", 1, px, 0.1), ts=f"2026-09-0{i + 1}T00:00:00+00:00")
+                for i, px in enumerate((10, 12, 14))]
+        sid = ftl.record_unreconciled("BRAIN_CRYPTO", "BTC-USD", "sell", 0, 0, "coinbase",
+                                      ts="2026-09-04T00:00:00+00:00", order_id="s-fifo",
+                                      intended_source="live")
+        stub = [r for r in ftl._read() if r.get("id") == sid][0]
+        res = sr.reconcile_unreconciled_entry(stub, fill_payload=_fill("s-fifo", 2.5, 20, 0.25))
+        assert res["upgraded"] is True and res["action"] == "settle", res
+        assert res["closed"] == lots, res  # oldest first
+        by = {s["entry_id"]: s for s in _setts("s-fifo")}
+        assert _close(by[lots[0]]["realized_pnl_net"], 10 - 0.1 - 0.1)
+        assert _close(by[lots[1]]["realized_pnl_net"], 8 - 0.1 - 0.1)
+        third = by[lots[2]]
+        assert third["filled_contracts"] == 0.5
+        assert _close(third["realized_pnl_net"], 3 - 0.05 - 0.05)
+        assert _close(res["realized"], 9.8 + 7.8 + 2.9) and res["excess"] == 0.0
+        rem = [r for r in ftl._read() if r.get("id") == third["remainder_id"]][0]
+        assert rem["contracts"] == 0.5 and rem["entry_price"] == 14 and _close(rem["entry_fee"], 0.05)
+        assert rem["ts"] == "2026-09-03T00:00:00+00:00" and rem["source"] == "live"
+        assert ftl.open_position_count() == 1
+        tr = ftl.real_track_record()
+        assert tr["n"] == 3 and _close(tr["net"], 20.5), tr
+
+        # Idempotent: rerunning the same stub, the batch, or a duplicate stub for the same
+        # sell order (crash between settle and stub-close) never closes another lot.
+        n = len(ftl._read())
+        again = sr.reconcile_unreconciled_entry(stub, fill_payload=_fill("s-fifo", 2.5, 20, 0.25))
+        assert again["upgraded"] is False and again["reason"] == "already_settled", again
+        assert sr.reconcile_unreconciled(fill_payloads={"s-fifo": _fill("s-fifo", 2.5, 20, 0.25)}
+                                         )["upgraded"] == 0
+        assert len(ftl._read()) == n
+        dup = ftl.record_unreconciled("BRAIN_CRYPTO", "BTC-USD", "sell", 0, 0, "coinbase",
+                                      order_id="s-fifo", intended_source="live")
+        dup_row = [r for r in ftl._read() if r.get("id") == dup][0]
+        d = sr.reconcile_unreconciled_entry(dup_row, fill_payload=_fill("s-fifo", 2.5, 20, 0.25))
+        assert d["reason"] == "already_settled" and len(_setts("s-fifo")) == 3
+        assert ftl.open_position_count() == 1 and ftl.real_track_record()["n"] == 3
+
+        # B. Mixed: EXECUTED lot + UNRECONCILED buy stub reconciled in the same run; a lot
+        # bought AFTER the sell is never closed by it.
+        a = ftl.book_spot_fill("BRAIN_CRYPTO", "ETH-USD", "buy", "coinbase",
+                               _fill("e-a", 1, 100, 1.0), ts="2026-09-01T00:00:00+00:00")
+        ftl.book_spot_fill("BRAIN_CRYPTO", "ETH-USD", "buy", "coinbase",
+                           {"success": True, "order_id": "e-b"}, ts="2026-09-02T00:00:00+00:00")
+        ftl.record_unreconciled("BRAIN_CRYPTO", "ETH-USD", "sell", 0, 0, "coinbase",
+                                ts="2026-09-03T00:00:00+00:00", order_id="e-s",
+                                intended_source="live")
+        c = ftl.book_spot_fill("BRAIN_CRYPTO", "ETH-USD", "buy", "coinbase",
+                               _fill("e-c", 1, 130, 1.3), ts="2026-09-05T00:00:00+00:00")
+        out = sr.reconcile_unreconciled(fill_payloads={
+            "e-b": _fill("e-b", 1, 110, 1.1), "e-s": _fill("e-s", 2, 120, 2.4)})
+        assert out["upgraded"] == 2, out
+        sell = [r for r in out["results"] if r.get("action") == "settle"][0]
+        b_up = [r for r in out["results"] if r.get("action") == "record_entry"][0]["id"]
+        assert sell["closed"] == [a, b_up] and c not in sell["closed"], sell
+        by = {s["entry_id"]: s for s in _setts("e-s")}
+        assert _close(by[a]["realized_pnl_net"], 20 - 1.0 - 1.2)
+        assert _close(by[b_up]["realized_pnl_net"], 10 - 1.1 - 1.2)
+        assert by[a]["fee_status"] == "venue" and by[b_up]["source"] == "live"
+        assert [r for r in ftl._read() if r.get("id") == b_up][0]["ts"] == "2026-09-02T00:00:00+00:00"
+        open_ids = {r["id"] for r in ftl._read() if r.get("type") == "entry"} - {
+            r.get("entry_id") for r in ftl._read() if r.get("type") == "settlement"}
+        assert c in open_ids
+    finally:
+        _restore(orig, path)
+    print("spot-reconcile FIFO checks: PASS")
+
+
 if __name__ == "__main__":
     run()
+    run_fifo()

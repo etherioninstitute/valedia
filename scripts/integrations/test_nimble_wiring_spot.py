@@ -289,7 +289,12 @@ def run_dca():
         "alpaca_executor": types.SimpleNamespace(
             get_account=lambda: {"cash": 100.0}, alpaca_is_live=lambda: False,
             market_buy=lambda t, notional=0: calls["alp_buy"].append(t) or {"id": "a"}),
-        "forward_test_ledger": types.SimpleNamespace(book_spot_fill=lambda *a, **k: None),
+        # fake ledger: every function spot_ledger.book_buy calls, all inert (no writes)
+        "forward_test_ledger": types.SimpleNamespace(
+            book_spot_fill=lambda *a, **k: None, spot_ack_ok=lambda *a, **k: True,
+            record_unreconciled=lambda *a, **k: None,
+            extract_spot_fill=lambda *a, **k: {"complete": False, "price": 0.0, "qty": 0.0,
+                                               "fee": None, "order_id": None}),
     }
     saved = {k: sys.modules.get(k) for k in mods}
     saved_paths = (dca_module.DCA_CONFIG, dca_module.DCA_LOG)

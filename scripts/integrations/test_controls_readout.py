@@ -27,7 +27,7 @@ REQUIRED = (
     "KALSHI_FILL_LEDGER_DEMOTE",
     "INFORMED_BEFORE_CREATE",
     "POLY_TAG_PRIOR_CREATE",
-    "VALEDIA_JEV",
+    "VALEDIA_SYSTEMONE",
     "VALEDIA_SELF_ADJUST",
     "MIROFISH_AUTO_RAISE",
     "POLYMARKET_US_LIVE",
@@ -69,7 +69,7 @@ OFF_BOOL = (
     "KALSHI_MAKER_FIRST",
     "KALSHI_FILL_LEDGER_DEMOTE",
     "POLY_TAG_PRIOR_CREATE",
-    "VALEDIA_JEV",
+    "VALEDIA_SYSTEMONE",
     "VALEDIA_SELF_ADJUST",
     "MIROFISH_AUTO_RAISE",
     "POLYMARKET_US_LIVE",
@@ -86,7 +86,7 @@ OFF_BOOL = (
 )
 
 ENV_FLAGS = (
-    "VALEDIA_JEV",
+    "VALEDIA_SYSTEMONE",
     "KALSHI_FEE_MAP_GATE",
     "KALSHI_EV_PREFLIGHT_GATE",
     "KALSHI_MAKER_FIRST",
@@ -122,9 +122,9 @@ def test_defaults_and_shape():
     assert set(snap) >= {"version", "sha", "branch", "dirty", "items"}
     assert snap["version"] == "0.74.1"
     assert vc.VALEDIA_VERSION == "0.74.1"
-    assert vc.VALEDIA_JEV is False
+    assert not hasattr(vc, "VALEDIA_" + "JEV")  # Jev retired: Nimble 2 is the only model
     assert vc.POLYMARKET_US_LIVE is False
-    assert vc.jev_enabled() is False
+    assert vc.systemone_enabled() is False
     names = [r["name"] for r in snap["items"]]
     assert names == list(dict.fromkeys(names))
     got = _by_name(snap)
@@ -181,7 +181,7 @@ def test_env_source_does_not_stick():
     for n in ENV_FLAGS:
         assert got[n]["value"] is False, n
         assert got[n]["source"] == "const", n
-    assert vc.VALEDIA_JEV is False
+    assert vc.systemone_enabled() is False
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.KALSHI_FEE_MAP_GATE is False
 
@@ -247,7 +247,7 @@ def test_cli_table():
         sys.stdout = old
     out = buf.getvalue()
     assert rc == 0
-    assert "VALEDIA_JEV" in out
+    assert "VALEDIA_SYSTEMONE" in out
     assert "POLYMARKET_US_LIVE" in out
     assert "VENUE_WRITER.kalshi" in out
     assert "OFF" in out
@@ -260,7 +260,6 @@ def test_cli_table():
 def test_committed_defaults_stay_false():
     src = open(os.path.join(HERE, "valedia_config.py")).read()
     for stmt in (
-        "VALEDIA_JEV           = False",
         "POLYMARKET_US_LIVE = False",
         "KALSHI_FEE_MAP_GATE = False",
         "KALSHI_EV_PREFLIGHT_GATE = False",
@@ -271,7 +270,7 @@ def test_committed_defaults_stay_false():
         "VALEDIA_SELF_ADJUST   = False",
     ):
         assert stmt in src, stmt
-    assert "VALEDIA_JEV           = True" not in src
+    assert ("VALEDIA_" + "JEV") not in src
     assert "POLYMARKET_US_LIVE = True" not in src
 
 

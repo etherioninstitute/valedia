@@ -515,7 +515,7 @@ def informed_from_opp(opp):
 
 
 def _speed_path(info, ticker):
-    """Arb and 15m stay off the Jev hook. INFORMED still applies at create."""
+    """Arb and 15m stay off the CONVICTION annotation. INFORMED still applies at create."""
     info = info or {}
     strat = str(info.get("strategy") or "").upper()
     if "ARB" in strat:
@@ -525,29 +525,29 @@ def _speed_path(info, ticker):
     return head in _SPEED_SERIES or ser in _SPEED_SERIES
 
 
-def jev_beside(info, ticker, post=None):
-    """Shadow stamp. Fail-open. None when off, or on arb / GOLD-15m. Never a veto."""
-    if not is_conviction((info or {}).get("strategy")) or _speed_path(info, ticker):
+def conviction_note(opp, info, *, caller, post=None, get=None):
+    """Nimble 2 annotation for an admitted CONVICTION create. Annotate only, never a veto.
+
+    None when VALEDIA_SYSTEMONE is off, on arb / 15m, or for any other strategy.
+    Only for call sites without nimble_wiring.gate (that verdict is the note there).
+    Facts: prediction_facts on the opp + this `info`, informed_facts for the underlying.
+    """
+    opp = opp if isinstance(opp, dict) else {}
+    if not is_conviction((info or {}).get("strategy")) or _speed_path(info, opp.get("ticker")):
         return None
     try:
-        import jev_shadow as jev
-        if not jev.jev_on():
-            return None
-        doc = dict(info or {})
-        doc["ticker"] = ticker
-        stamped = jev.annotate(doc, post=post)
-        j = stamped.get("jev") if isinstance(stamped, dict) else None
-        if not isinstance(j, dict):
-            return {"enabled": True, "fail_open": True, "error": "no_stamp"}
-        return j
+        import nimble_annotate as na
+        return na.conviction_note(opp, info, caller=caller, post=post, get=get)
     except Exception as e:
-        return {"enabled": True, "fail_open": True, "error": type(e).__name__}
+        return {"annotate_only": True, "oms": False, "kind": "conviction", "fail_open": True,
+                "error": type(e).__name__}
 
 
-def create_preflight(opp, count, price_cents, order_type="limit", action="buy", post=None):
-    """INFORMED fail-closed, then Jev beside it on CONVICTION only.
+def create_preflight(opp, count, price_cents, order_type="limit", action="buy"):
+    """INFORMED fail-closed. Pure gate: no model call here.
 
-    A refuse returns jev=None so a shadow annotate cannot override the gate.
+    The Nimble 2 verdict on an admitted create comes from nimble_wiring.gate at the
+    caller (last gate) or, at an unwired site, from conviction_note (annotate only).
     """
     opp = opp if isinstance(opp, dict) else {}
     ticker = opp.get("ticker")
@@ -555,6 +555,5 @@ def create_preflight(opp, count, price_cents, order_type="limit", action="buy", 
     reasons = kalshi_reasons(
         ticker, opp.get("side"), count, price_cents, order_type, info, action=action)
     if reasons:
-        return {"ok": False, "reasons": list(reasons), "informed": info, "jev": None}
-    stamp = jev_beside(info, ticker, post=post)
-    return {"ok": True, "reasons": [], "informed": info, "jev": stamp}
+        return {"ok": False, "reasons": list(reasons), "informed": info}
+    return {"ok": True, "reasons": [], "informed": info}

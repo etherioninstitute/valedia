@@ -184,6 +184,7 @@ def book_spot_fill(strategy, ticker, side, venue, raw, intended_source="live", t
         predicted_direction=predicted_direction, predicted_prob=predicted_prob,
         source=source, ts=ts, fill_status="FILLED", entry_fee=fee,
         order_id=fill.get("order_id"),
+        fee_status="venue" if fill["fee"] is not None else "modeled",
     )
 
 
@@ -209,7 +210,9 @@ def settle_spot_fill(ticker, venue, raw, intended_source="live", fallback_price=
 # ── record an entry (called by executors at order time) ─────────────────────
 def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
                  predicted_direction=None, predicted_prob=None, source="live", ts=None,
-                 fill_status=None, entry_fee=None, order_id=None, intended_source=None):
+                 fill_status=None, entry_fee=None, order_id=None, intended_source=None,
+                 fee_status=None):
+    """fee_status (optional): "venue" = fee from the broker response, "modeled" = fee_engine."""
     eid = "ft_" + uuid.uuid4().hex[:12]
     v = str(venue or "")
     if entry_fee is None:
@@ -231,6 +234,8 @@ def record_entry(strategy, ticker, side, price, contracts, venue="kalshi",
         rec["order_id"] = order_id
     if intended_source:
         rec["intended_source"] = intended_source
+    if fee_status:
+        rec["fee_status"] = fee_status
     _append(rec)
     return eid
 

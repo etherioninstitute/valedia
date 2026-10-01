@@ -297,13 +297,13 @@ def test_poly_loop_and_ping_and_controls():
                 chunk = html[i:i + 500]
                 assert ("ON" if it["value"] else "OFF") in chunk
                 assert f'badge {it["source"]}' in chunk
-        for n in ("VALEDIA_JEV", "POLY_LOOP_EDGE_PTS", "POLY_LOOP_MAX_OPEN",
+        for n in ("VALEDIA_SYSTEMONE", "POLY_LOOP_EDGE_PTS", "POLY_LOOP_MAX_OPEN",
                   "POLY_LOOP_DD_STOP", "POLY_LOOP_DD_STOP_ARMED", "KALSHI_FEE_MAP_GATE"):
             assert f'data-control="{n}"' in html
-        short = [it for it in items if it["name"] != "VALEDIA_JEV"]
+        short = [it for it in items if it["name"] != "VALEDIA_SYSTEMONE"]
         missing = [it["name"] for it in items
                    if f'data-control="{it["name"]}"' not in cockpit.render_controls_html(short)]
-        assert missing == ["VALEDIA_JEV"]
+        assert missing == ["VALEDIA_SYSTEMONE"]
     finally:
         _restore()
 

@@ -52,8 +52,7 @@ def test_unreconciled_ftl_cannot_be_realized_pnl():
     body = sr.ftl_profit_signal(
         recs=[{"type": "entry", **entries["ft_live"]}, live], minutes=None)
     assert body is not None and body.startswith("Profit:"), body
-    assert "FTL fee-true" in body
-    assert "realized" not in body.lower()
+    assert "Realized (ledger, fee-incl.)" in body  # fee-true FTL rows only
     assert "9.99" not in body
     assert "-1.25" in body
     assert "UNRECONCILED" not in body

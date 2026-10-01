@@ -87,19 +87,29 @@ def format_settled_signal(new_pnl, w, l, total_net, total_record):
     """Keep Profit: prefix (signal-protocol.md). Body is fee-true FTL only."""
     st = _stamp()
     tail = f"\n{st}" if st else ""
-    return (f"Profit: {new_pnl:+.2f} ({w}W/{l}L settled) FTL fee-true\n"
-            f"Total: {total_net:+.2f} ({total_record}){tail}")
+    return (f"Profit: {new_pnl:+.2f} ({w}W/{l}L settled) Realized (ledger, fee-incl.)\n"
+            f"Total: {total_net:+.2f} ({total_record}) Realized (ledger, fee-incl.){tail}")
 
 
 def format_arb_signal(arb):
-    st = _stamp()
-    tail = f" {st}" if st else ""
-    return (f"Profit: {arb['net_pnl']:+.2f} ({arb['wins']}W/{arb['losses']}L) "
-            f"arb-log not FTL{tail}")
+    """LOG ONLY. latency_arb's arb-log is not the fee-true ledger (no fee on
+    losses, potential_profit on wins) and its 'settled' count is cumulative, so
+    it is never sent to Signal as Profit."""
+    return (f"arb-log (not FTL, not sent): net {arb['net_pnl']:+.2f} "
+            f"({arb['wins']}W/{arb['losses']}L cumulative)")
 
 
 def ftl_profit_signal(recs=None, since=None, minutes=50):
     """Profit: body from fee-true FTL rows. None if nothing admissible (incl. UNRECONCILED)."""
+    p = ftl_profit_parts(recs, since, minutes)
+    if not p:
+        return None
+    return format_settled_signal(p["new_pnl"], p["w"], p["l"], p["total_net"],
+                                 f"{p['tw']}W/{p['tl']}L")
+
+
+def ftl_profit_parts(recs=None, since=None, minutes=50):
+    """Figures behind the Profit: ping (fee-true FTL rows). None if nothing new."""
     import forward_test_ledger as ftl
     recs = recs if recs is not None else ftl._read()
     entries = {r["id"]: r for r in recs if r.get("type") == "entry" and r.get("id")}
@@ -109,7 +119,7 @@ def ftl_profit_signal(recs=None, since=None, minutes=50):
     if since:
         new = [s for s in new if (s.get("logged_at") or s.get("ts") or "") > since]
     elif minutes:
-        from datetime import datetime, timezone, timedelta
+        from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         kept = []
         for s in new:
@@ -125,19 +135,22 @@ def ftl_profit_signal(recs=None, since=None, minutes=50):
         new = kept
     if not new:
         return None
-    new_pnl = sum(float(s.get("realized_pnl_net") or 0) for s in new)
     w = sum(1 for s in new if s.get("won"))
-    l = len(new) - w
-    total_net = sum(float(s.get("realized_pnl_net") or 0) for s in all_true)
     tw = sum(1 for s in all_true if s.get("won"))
-    tl = len(all_true) - tw
-    return format_settled_signal(new_pnl, w, l, total_net, f"{tw}W/{tl}L")
+    return {"new": new, "new_pnl": sum(float(s.get("realized_pnl_net") or 0) for s in new),
+            "w": w, "l": len(new) - w,
+            "total_net": sum(float(s.get("realized_pnl_net") or 0) for s in all_true),
+            "tw": tw, "tl": len(all_true) - tw,
+            "cursor": max((s.get("logged_at") or s.get("ts") or "") for s in new)}
 
 
-def run():
-    new_sports, stats = settle_sports()
-    if new_sports:
-        print(f"sports-log view: {len(new_sports)} settled (not FTL, not Signal)")
+def run(send_fn=None):
+    try:
+        new_sports, stats = settle_sports()
+        if new_sports:
+            print(f"sports-log view: {len(new_sports)} settled (not FTL, not Signal)")
+    except Exception as e:
+        print(f"[settle_run] sports-log settle failed (Signal uses FTL only): {e}")
 
     cursor_path = os.path.join(MODELS, "settle_ftl_signal_cursor.txt")
     since = None
@@ -145,24 +158,31 @@ def run():
         since = open(cursor_path).read().strip() or None
     except Exception:
         since = None
-    body = ftl_profit_signal(since=since, minutes=None if since else 50)
-    if body:
-        from signal_send import send
-        send(body)
-        try:
-            with open(cursor_path, "w") as f:
-                f.write(datetime.now(timezone.utc).isoformat())
-        except Exception:
-            pass
+    try:
+        parts = ftl_profit_parts(since=since, minutes=None if since else 50)
+        if parts:
+            import signal_verify
+            body = format_settled_signal(parts["new_pnl"], parts["w"], parts["l"],
+                                         parts["total_net"], f"{parts['tw']}W/{parts['tl']}L")
+            res = signal_verify.profit_ping(parts, body, send_fn=send_fn)
+            print(f"[settle_run] Signal {res['status']} sent={res['sent']}")
+            # Advance only past rows Burton actually got (or already got) — never skip one.
+            if res["status"] == "dedupe" or (res["status"] == "verified" and res["sent"]):
+                try:
+                    with open(cursor_path, "w") as f:
+                        f.write(parts["cursor"])
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[settle_run] FTL Profit ping failed: {e}")
 
-    # Also check arb settlements
+    # Arb settlements: arb-log is not FTL -> local log only, never a Profit ping.
     try:
         from latency_arb import check_arb_settlements
         arb = check_arb_settlements()
         if arb and arb.get('settled', 0) > 0:
-            from signal_send import send
-            send(format_arb_signal(arb))
-    except:
+            print(format_arb_signal(arb))
+    except Exception:
         pass
 
 if __name__ == "__main__":

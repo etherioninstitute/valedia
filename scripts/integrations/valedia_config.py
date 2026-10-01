@@ -18,10 +18,10 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
 # Runtime identity (0.74.1 = Kalshi dollars quote helper for weather morning-go).
-# Prior 0.74.0 = weather Jev morning + live preflight.
+# Prior 0.74.0 = weather morning + live preflight (Jev retired; Nimble 2 notes).
 # Prior 0.73.0 = weather scrape lookup, shadow only; live exec stays fenced.
 # Prior 0.72.0 = oil/weather RESEARCH/SHADOW desks.
-# Prior 0.70.0 = Kalshi CONVICTION INFORMED-before-create + Jev shadow.
+# Prior 0.70.0 = Kalshi CONVICTION INFORMED-before-create (Jev retired; Nimble 2 notes).
 # Prior 0.68.0 = BB-Terminal INTEL display on OpenTerminal-Valedia.
 # Prior 0.67.0 = eToro research + CopyTrader paper/shadow.
 # Prior 0.66.0 = Vaughan Poly↔Kalshi paper/shadow arb.
@@ -42,7 +42,6 @@ VALEDIA_VERSION = "0.74.1"
 # Dormant ≠ dead: pause TTL re-open + neural enrich may run under the flip.
 # SELF_ADJUST does not open venue writers / SPOT GET / NAUTILUS_LIVE.
 VALEDIA_SELF_ADJUST   = False  # Burton master flip only
-VALEDIA_JEV           = False  # AUTONOMY-2 typed gates. Off = Valedia works fully. This lane never sets True.
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
 MIROFISH_UNPROVEN_CAP = 0.10   # never exceed while accuracy unproven
 MIROFISH_PROVEN_CAP   = 0.15   # seatbelted 10–15% when SELF_ADJUST is False
@@ -197,9 +196,9 @@ _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
 # Durable wire for Burton flips that live in ~/.openclaw/.env (same file
 # cron_runner_mac.sh sources). LaunchAgents do not inherit that file; any
 # process that imports this module picks flags up via setdefault so a bare
-# `python3 .../all_knowing_movers_scan.py` sees VALEDIA_JEV without a manual
+# `python3 .../all_knowing_movers_scan.py` sees VALEDIA_SYSTEMONE without a manual
 # export. Process env always wins. Opt out: OPENCLAW_SKIP_ENV=1 (unit tests).
-# Override path: OPENCLAW_ENV_FILE. This lane never sets VALEDIA_JEV True in git.
+# Override path: OPENCLAW_ENV_FILE. This lane never sets a flip True in git.
 _OPENCLAW_ENV_LOADED = False
 _OPENCLAW_ENV_DEFAULT = _os.path.expanduser("~/.openclaw/.env")
 
@@ -323,16 +322,12 @@ def self_adjust_enabled():
     return _env_flag("VALEDIA_SELF_ADJUST", VALEDIA_SELF_ADJUST)
 
 
-def jev_enabled():
-    """True only if Burton flipped VALEDIA_JEV. Default False.
+def systemone_enabled():
+    """Same switch as systemone_hotpath_client.enabled(): env VALEDIA_SYSTEMONE == "1".
 
-    Off: Valedia works fully; zero TypeSafe calls (fail-open).
-    On: CONVICTION annotate/shadow beside INFORMED, plus MiroFish jev_shadow.
-    Timeouts do not block live Kalshi. Does not place orders. Not arb or GOLD-15m.
-    Flip via env VALEDIA_JEV=1 or ~/.openclaw/.env (ensure_openclaw_env).
-    This lane never sets True in git.
+    Nimble 2 (loopback, digest-pinned) is the only decision model. Off: zero calls.
     """
-    return _env_flag("VALEDIA_JEV", VALEDIA_JEV)
+    return _os.environ.get("VALEDIA_SYSTEMONE") == "1"
 
 
 def polymarket_us_live_enabled():
@@ -881,9 +876,10 @@ def controls_snapshot():
         ("POLY_TAG_PRIOR_CREATE", False, "const", "poly",
          "tag_prior-alone is never create-eligible. Env cannot enable. "
          "US writes stay blocked while POLYMARKET_US_LIVE is off."),
-        ("VALEDIA_JEV", jev_enabled(), _src("VALEDIA_JEV"), "autonomy",
-         "off=no TypeSafe; on=CONVICTION annotate/shadow beside INFORMED "
-         "and MiroFish jev_shadow; fail-open; not OMS"),
+        ("VALEDIA_SYSTEMONE", systemone_enabled(), _src("VALEDIA_SYSTEMONE"), "autonomy",
+         "Nimble 2 is the only decision model (Jev retired). off=zero model calls; "
+         "on=loopback Nimble 2 decide + notes on CONVICTION, weather, MiroFish, movers; "
+         "notes never gate or size; fail-open; not OMS"),
         ("VALEDIA_SELF_ADJUST", self_adjust_enabled(),
          _src("VALEDIA_SELF_ADJUST"), "autonomy",
          "wakes MiroFish AUTO_RAISE in-band only"),
