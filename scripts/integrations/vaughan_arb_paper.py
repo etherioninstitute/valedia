@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 import crypto_paper_safety as cps
 import kalshi_fee_map as kfm
+import nimble_wiring as _nw
 import valedia_config as vc
 
 MODE = "PAPER/SHADOW"
@@ -366,7 +367,13 @@ def decide(cand, state, limits=None, env=None, post_fn=None, timeout=20):
     if why:
         return _row(cand, why, "none", False, quote)
     reason, model = ask_ornith(_conds(quote, limits), post_fn=post_fn, timeout=timeout)
-    return _row(cand, reason, model, reason == "pass", quote)
+    nv = _nw.vaughan_gate(cand, quote) if reason == "pass" else None  # Nimble 2: last gate
+    row = _row(cand, reason, model, reason == "pass" and (nv is None or nv["allow"]), quote)
+    if nv is not None:
+        row["nimble"] = nv
+        if not nv["allow"]:  # veto: not filled (shadow never lands here); ornith stays "pass"
+            row["reason"], row["pass"] = "SKIP_NIMBLE", False
+    return row
 
 def read_decisions(path=None):
     path = path or DECISION_LOG

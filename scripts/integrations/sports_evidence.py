@@ -258,6 +258,12 @@ def _admit(b, r, build):
     if eft is None or eft <= 0:
         _skip(r, 'SKIP_EVIDENCE', ["edge_fee_true_nonpositive"])
         return None, price_cents
+    import nimble_wiring as _nw  # Nimble 2: last gate, entry removal only (shadow = log only)
+    r['nimble'] = nv = _nw.gate(
+        opp, pre["informed"], source="sports_evidence", extra={"fee_true_edge": eft, "clock_ok": True})
+    if not nv["allow"]:
+        _skip(r, 'SKIP_NIMBLE', [_nw.why(nv)])
+        return None, price_cents
     return pre, price_cents
 
 
