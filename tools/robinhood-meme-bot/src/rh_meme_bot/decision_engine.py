@@ -25,7 +25,7 @@ DEFAULT_NIMBLE_URL = "http://127.0.0.1:11434/v1/systemone"
 DEFAULT_NIMBLE_MODEL = "nimble:latest"  # Burton's Nimble 2; accepted only by digest pin
 
 # Pin rule (is_nimble2 + NIMBLE2_DIGEST) lives in nimble_pin.py. Source of truth:
-# Valedia's scripts/integrations/systemone_hotpath_client.py (copied, not imported).
+# Valedia's scripts/integrations/systemone_pin.py (copied, not imported).
 
 
 class NimbleError(Exception):
@@ -78,12 +78,14 @@ class NimbleEngine:
                  transport: Optional[Callable[[str, dict, float], dict]] = None,
                  clock: Callable[[], float] = time.perf_counter, warmup_timeout_s: float = 120.0,
                  digest: str = NIMBLE2_DIGEST,
-                 tags_transport: Optional[Callable[[str, float], Any]] = None):
+                 tags_transport: Optional[Callable[[str, float], Any]] = None,
+                 digest_ttl_s: Optional[float] = None):
         self.url, self.model, self.timeout_s = url, model, timeout_s
         self.warmup_timeout_s = warmup_timeout_s
         self.keep_alive, self.allow_remote = keep_alive, allow_remote
         self._transport, self._clock = transport, clock
         self.digest = digest
+        self.digest_ttl_s = nimble_pin.digest_ok_ttl(digest_ttl_s)
         # GET /api/tags: explicit, else the POST transport's .get (fakes), else HTTP. A custom
         # POST transport without .get gets no network GET: the digest stays unverified.
         if tags_transport is None and transport is not None:
@@ -96,7 +98,8 @@ class NimbleEngine:
                     clock=time.perf_counter) -> "NimbleEngine":
         return cls(cfg.nimble_url, cfg.nimble_model, cfg.decision_timeout_s,
                    cfg.nimble_keep_alive, cfg.nimble_allow_remote, transport, clock,
-                   cfg.warmup_timeout_s, cfg.nimble_digest)
+                   cfg.warmup_timeout_s, cfg.nimble_digest,
+                   digest_ttl_s=cfg.nimble_digest_ttl_s)
 
     @property
     def pin_ok(self) -> bool:
@@ -108,8 +111,9 @@ class NimbleEngine:
         """
         if not needs_digest(self.model):
             return None
-        key = (nimble_pin.tags_url(self.url), normalize_tag(self.model), self.digest.lower())
-        hit = nimble_pin.cached(key)
+        key = (nimble_pin.tags_url(self.url), normalize_tag(self.model),
+               nimble_pin.strip_digest(self.digest))
+        hit = nimble_pin.cached(key, self.digest_ttl_s)
         if hit is None:
             if self._tags is None and self._tags_default:
                 self._tags = _http_get()
@@ -118,7 +122,7 @@ class NimbleEngine:
             else:
                 try:
                     body = self._tags(key[0], min(self.timeout_s, 10.0))
-                    hit = nimble_pin.check_tags(body, self.model, self.digest)
+                    hit = nimble_pin.check_tags(body, self.model, key[2])
                 except Exception as e:  # noqa: BLE001 - down / bad json: unverified, retried
                     hit = (False, f"digest_unverified: {type(e).__name__}: {e}")
             nimble_pin.remember(key, hit)
@@ -236,7 +240,8 @@ def ask_nimble(state: Any, questions: dict, model: Optional[str] = None) -> dict
     if model and model != eng.model:
         eng = NimbleEngine(eng.url, model, eng.timeout_s, eng.keep_alive, eng.allow_remote,
                            eng._transport, warmup_timeout_s=eng.warmup_timeout_s,
-                           digest=eng.digest, tags_transport=eng._tags)
+                           digest=eng.digest, tags_transport=eng._tags,
+                           digest_ttl_s=eng.digest_ttl_s)
     return eng.ask(state, questions)
 
 

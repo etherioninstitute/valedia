@@ -175,3 +175,44 @@ def test_dashboard_shows_version_column_hooks_flag_and_watcher_health(tmp_path):
     text = dash.console.export_text()
     assert "ver" in text and " v3 " in text and " v4 " in text
     assert "hooks:N" in text and "watchers: v3 ok | v4 ok" in text and "BUY ★" in text
+
+
+def test_recheck_engine_error_keeps_watch_and_retries(tmp_path):
+    rpc = FakeRpc(head=1000)
+    install_v4(rpc)
+    install_weth_usdg(rpc, FACTORY)
+    pid, liq, sqrt, tick = v4_meme_pool(rpc, 995, with_liquidity=False)
+    bot, _ = make(tmp_path, rpc)
+    assert bot.run_once()[0]["final_action"] == "skip"
+    rpc.logs.append(modify_log(pid, FULL_LO, FULL_HI, liq, 1002))  # liquidity arrives...
+    set_v4_pool(rpc, pid, sqrt, tick, liq)
+    rpc.head = 1003
+    bot.nimble.fail = ConnectionError("ollama restarting")  # ...but the model call fails
+    out = bot.run_once()
+    assert out[0]["final_action"] == "skip" and "ConnectionError" in out[0]["decision"]["error"]
+    assert pid in bot.rechecks.pending  # not dropped: an engine error is not a verdict
+    bot.nimble.fail = None
+    rpc.head = 1004  # facts unchanged, model back: re-asked anyway
+    out = bot.run_once()
+    assert out[0]["final_action"] == "buy" and out[0]["recheck"] == 2
+    recs = [r for r in read_records(str(tmp_path / "d.jsonl")) if r["pool"] == pid]
+    assert [(r["final_action"], r["recheck"]) for r in recs] == [
+        ("skip", 0), ("skip", 1), ("buy", 2)]
+    assert bot.rechecks.pending == {}
+    rpc.head = 1006
+    assert bot.run_once() == []
+
+
+def test_engine_error_watch_ends_with_window(tmp_path):
+    rpc = FakeRpc(head=1000)
+    install_v4(rpc)
+    install_weth_usdg(rpc, FACTORY)
+    pid, *_ = v4_meme_pool(rpc, 995)  # liquid pool, but Nimble is down at detection
+    bot, _ = make(tmp_path, rpc, RECHECK_BLOCKS="8")
+    bot.nimble.fail = ConnectionError("down")
+    assert bot.run_once()[0]["decision"]["error"]
+    assert pid in bot.rechecks.pending
+    rpc.head = 1002  # window ends at 995 + 8 = 1003
+    assert bot.run_once()[0]["recheck"] == 1  # retried although facts did not change
+    rpc.head = 1004
+    assert bot.run_once() == [] and bot.rechecks.pending == {}  # window over
