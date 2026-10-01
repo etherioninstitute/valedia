@@ -27,11 +27,22 @@ One selection, so the senders never disagree: live + reconciled settlements only
 paper / sandbox / backfill / shadow / UNRECONCILED, on the settlement or its entry);
 canonical entry id = `str(entry_id)`; the FIRST valid settlement per entry counts
 (identical duplicates ignored, a differing one = conflict). Flagged rows (unparseable
-line / non-object row, live orphan, missing / NaN / garbage P&L or win flag, missing /
-garbage booking time, conflicting duplicate, and future-dated rows — any of logged_at /
-ts / settled_at / settlement_ts more than 5 min ahead) are excluded, and EVERY sender
-omits the all-time total with the same text: `N ledger row(s) unparseable / future-dated /
-conflicting duplicate settlement`. `now` is taken after the ledger read.
+line / non-object row, live orphan, missing / NaN / garbage P&L or win flag, no usable
+time, conflicting duplicate, and future-dated rows) are excluded, and EVERY sender omits
+the all-time total with the same text: `N ledger row(s) unparseable / future-dated /
+conflicting duplicate settlement (ledger scan)`. `now` is taken after the ledger read.
+- EVERY present time field (logged_at, ts, settled_at, settlement_ts) is validated: more
+  than 5 min ahead of `now` = future-dated, present but not a parseable timestamp =
+  unparseable. So a row is either flagged (omitted from the all-time AND the 24h figure,
+  in every sender) or counted in both — e.g. logged_at = now−60m with ts = now+2h is
+  flagged everywhere, never "all-time yes / 24h no".
+- One precedence (first PRESENT field wins; missing / null / "" = absent):
+  `booked` = logged_at, else ts (since-last-report, freshness);
+  `settled_time` = settled_at, settlement_ts, ts, logged_at (the 24h window).
+- N counts distinct ledger LINES: two identical garbage lines = 2, a conflicting pair = 2
+  (every settlement line of that entry). It is a ledger scan count, labelled
+  `(ledger scan)` and never claimed `verified` (no self-compared claims; the bad-row
+  and paused notices end `ledger scan count — no money figure to verify`, not `✓ verified`).
 
 ### Profit — settle_run.py (hourly :30)
 ```
@@ -41,14 +52,16 @@ Realized P&L (all-time, ledger, all venues, fee-incl.): +$6.06 (7W/1L)
 - Id-based: reports exactly the valid settlements not yet in the sent record
   (data/signal/profit_sent_ids.jsonl + backup models/settle_profit_sent_ids.jsonl, one
   JSON id per line), under an exclusive lock. Never reports a settlement twice.
-- Rollout / bootstrap (no sent record yet): if the old cursor
-  models/settle_ftl_signal_cursor.txt is present, settlements booked at or before it
-  count as sent and everything after it is reported. No (or garbage / future) cursor:
-  every existing id becomes the baseline only after one figure-free notice
+- Rollout / bootstrap: whenever the legacy cursor models/settle_ftl_signal_cursor.txt
+  exists and the sent record lacks its `{"seeded_from_cursor": ...}` marker line, the ids
+  booked (logged_at) at or before the cursor are UNION-seeded as sent — once — and the
+  marker is written (so a v13 + sent-set deployment never re-reports what the cursor-only
+  code already sent). Everything after the cursor is reported. No marker and no cursor:
+  the marker is written alone. First run with no (or garbage / future) cursor: every
+  existing id becomes the baseline only after one figure-free notice
   `Profit reporting (re)initialized — earlier settlements are included in the 11pm all-time total`
-  (history is never marked silently; a failed notice marks nothing and retries). The
-  cursor file is rewritten after each confirmed report, so if both records are ever
-  lost or emptied the bootstrap reseeds from it.
+  (history is never marked silently; a failed notice marks nothing and retries). If both
+  records are ever lost or emptied, the marker is lost with them and the cursor reseeds.
 - Ledger missing / unreadable: `Profit report paused — ledger unreadable`, no baseline
   recorded (bootstrap deferred until the ledger is readable).
 - Bad rows never block valid ones; the all-time line becomes
@@ -60,14 +73,21 @@ Realized P&L (all-time, ledger, all venues, fee-incl.): +$6.06 (7W/1L)
   unknown (relay timeout, ssh exit 255, exception, or a crash after send) leaves it, so
   the next run re-sends once with `(re-sent: previous delivery unconfirmed) N of these
   settlement(s)`. After two unknown deliveries of the same ids: one figure-free
-  `Profit report delivery unconfirmed twice — see the 11pm report`, then marked sent.
+  `Profit report delivery unconfirmed twice — see the 11pm report`; the ids are marked
+  sent ONLY once that notice is confirmed delivered. If it fails (confirmed) it is
+  retried on the next run; if its outcome is unknown it is retried at most once per UTC
+  day; each attempt is in verify_log and the log, never silent, and the figures stay
+  withheld meanwhile.
 - Record write fails after a confirmed delivery: no "withheld" notice; logged, the ids
   kept as pending_sent in settle_state.json and recording retried next run.
 - Record robustness: appends first terminate an unterminated last line; bad / duplicate
-  lines rewritten away; one unreadable copy is tolerated while the other is readable; a
-  last line cut mid-write in both copies is recovered as sent (logged).
+  lines rewritten away; one unreadable copy is tolerated while the other is readable. A
+  last line cut mid-write is a torn fragment and is DISCARDED (logged): only exact,
+  complete ids count as sent. An id in the write-ahead (unconfirmed) record is re-sent
+  labelled `(re-sent: previous delivery unconfirmed)`; an id in neither record is
+  reported normally. No prefix / mtime guessing, so a fragment `"b` never hides `bb`.
 - Sent record unreadable (both copies): `Profit report paused — sent-record unreadable ·
-  N settlement(s) waiting`. Paused notices (ledger unreadable, sent-record unreadable /
+  N settlement(s) waiting (ledger scan)`. Paused notices (ledger unreadable, sent-record unreadable /
   unwritable, no lock available, settle lock held too long) go out at most once per day.
 - Lock: flock on data/signal/settle.lock (held → exit quietly). flock unsupported
   (ENOLCK) or the lock path unusable → O_EXCL pid file settle.lock.pid (stale after 20
@@ -83,10 +103,11 @@ Realized P&L (all-time, ledger, all venues, fee-incl.): −$10.34 (net loss) · 
 Settled last 24h (ledger): −$12.34
 ```
 - Uses the shared selection. Flagged rows → both lines `omitted — <reason>`. 24h window:
-  `now − 24h < settled_at ≤ now + 5 min` (settled_at / settlement_ts / ts / logged_at);
-  a present-but-garbage settlement time → `omitted — N row(s) lack times`.
+  `now − 24h < settled_time ≤ now + 5 min` (settled_time precedence above; every time
+  field was already validated, so a row is never counted in one figure and flagged in the
+  other). Footer counts read `N settled rows (ledger scan)`.
   `⚠ STALE: ledger …` header when the ledger is stale, future-dated or undated;
-  `⚠ ledger has N open Kalshi entries vs broker M positions (not reconciled)`.
+  `⚠ ledger has N open Kalshi entries (ledger scan) vs broker M positions (not reconciled)`.
 
 ### Sports fills — sports_engine.py (every 2h, real executions only)
 ```

@@ -13,8 +13,17 @@ Selection (`select(recs, now)`):
   * flagged (excluded, and every sender omits the all-time total with the same
     `omit_reason` text): unparseable line / non-object row, live orphan, missing /
     NaN / garbage P&L or win flag, missing / non-string / garbage booking time
-    (logged_at, else ts), and FUTURE rows — any of logged_at / ts / settled_at /
-    settlement_ts more than TOL beyond `now`.
+    (logged_at, else ts), and FUTURE rows — any PRESENT time field (logged_at / ts /
+    settled_at / settlement_ts) more than TOL beyond `now`, or present but not a parseable
+    timestamp. EVERY present time field is validated, so the two derived times below can
+    never disagree about a row: a row is either flagged (omitted from the all-time AND the
+    24h figure) or counted in both.
+  * ONE documented precedence for the derived times (first PRESENT field wins; "present" =
+    not missing / None / ""):
+        booked        = logged_at, else ts                      (since-last-report, freshness)
+        settled_time  = settled_at, settlement_ts, ts, logged_at (the 24h window)
+  * bad rows are counted as distinct ledger LINES: two identical garbage lines are 2, a
+    conflicting pair is 2 (every settlement line of that entry), never collapsed by content.
 `now` should be taken AFTER the ledger was read (callers pass now=None for that).
 """
 import hashlib
@@ -57,21 +66,37 @@ def bad_line_row(line):
     return r if isinstance(r, dict) else {"type": "_bad_line", "key": "line:" + _h(line)}
 
 
+TIME_KEYS = ("logged_at", "ts", "settled_at", "settlement_ts")
+
+
 def _ts(v):
     return sv.parse_ts(v) if isinstance(v, str) else None
 
 
+def _first(s, keys):
+    """Parsed first PRESENT field of `keys` (missing / None / "" are absent); a present
+    value that is not a parseable timestamp -> None."""
+    for k in keys:
+        if s.get(k) not in (None, ""):
+            return _ts(s.get(k))
+    return None
+
+
+def time_fields(s):
+    """{key: datetime | None} for every PRESENT time field (None = present but garbage)."""
+    return {k: _ts(s.get(k)) for k in TIME_KEYS if s.get(k) not in (None, "")}
+
+
 def booked(s):
-    """When the settlement was booked (logged_at, else ts); None if missing / garbage."""
-    raw = s.get("logged_at") or s.get("ts")
-    return _ts(raw)
+    """When the settlement was booked: logged_at, else ts; None if missing / garbage."""
+    return _first(s, ("logged_at", "ts"))
 
 
 def settled_time(s):
-    """Settlement time for the 24h window: settled_at / settlement_ts / ts / logged_at
-    (first present). Present-but-garbage -> None (the 24h figure is then omitted)."""
-    raw = s.get("settled_at") or s.get("settlement_ts") or s.get("ts") or s.get("logged_at")
-    return _ts(raw)
+    """Settlement time for the 24h window: settled_at, settlement_ts, ts, logged_at (first
+    present). None if missing / garbage (select() flags such rows, so for selected rows
+    this is always a real time)."""
+    return _first(s, ("settled_at", "settlement_ts", "ts", "logged_at"))
 
 
 def _live(r):
@@ -84,45 +109,54 @@ def canon(eid):
     return str(eid)
 
 
-def _row_key(r):
-    return "row:" + _h(json.dumps(r, sort_keys=True, default=str))
+def _row_hash(r):
+    return _h(json.dumps(r, sort_keys=True, default=str))
 
 
 def select(recs, now):
-    """{"valid": {eid: settlement}, "bad": {key: kind}} — see module docstring."""
+    """{"valid": {eid: settlement}, "bad": {line_key: kind}} — see module docstring.
+    line_key = "<content hash>#<n>": the n-th identical line, so every ledger line counts."""
     entries = {}
     for r in recs:
         if r.get("type") == "entry" and canon(r.get("id")) is not None:
             entries.setdefault(canon(r.get("id")), r)
-    valid, bad, dropped = {}, {}, set()
+    valid, bad, dropped, lines, seen = {}, {}, set(), {}, {}
+
+    def line_key(h):  # the n-th identical line; hashed only for rows that end up flagged
+        seen[h] = seen.get(h, -1) + 1
+        return f"{h}#{seen[h]}"
+
     limit = now + TOL
     for r in recs:
         if r.get("type") == "_bad_line":
-            bad[r.get("key") or "line:?"] = "unparseable"
+            bad[line_key(r.get("key") or "line:?")] = "unparseable"
             continue
         if r.get("type") != "settlement" or not _live(r):
             continue
-        eid, key = canon(r.get("entry_id")), _row_key(r)
+        eid = canon(r.get("entry_id"))
         e = entries.get(eid) if eid is not None else None
         if e is None:
-            bad[key] = "unparseable"  # live orphan
+            bad[line_key("row:" + _row_hash(r))] = "unparseable"  # live orphan
             continue
         if not _live(e):
             continue
-        times = [booked(r)] + [_ts(r.get(k)) for k in ("settled_at", "settlement_ts")]
-        if any(t is not None and t > limit for t in times):
-            bad[key] = "future-dated"
+        tf = time_fields(r)
+        if any(t is not None and t > limit for t in tf.values()):
+            bad[line_key("row:" + _row_hash(r))] = "future-dated"
             continue
         p, w = sv.num(r.get("realized_pnl_net")), sv.won_flag(r.get("won"))
-        if p is None or w is None or times[0] is None:
-            bad[key] = "unparseable"
+        if p is None or w is None or not tf or any(t is None for t in tf.values()):
+            bad[line_key("row:" + _row_hash(r))] = "unparseable"
             continue
         if eid in dropped:
+            bad[line_key("row:" + _row_hash(r))] = KINDS[2]
             continue
+        lines.setdefault(eid, []).append(r)
         if eid in valid:
             f = valid[eid]
             if (sv.num(f.get("realized_pnl_net")), sv.won_flag(f.get("won"))) != (p, w):
-                bad["conflict:" + eid] = "conflicting duplicate settlement"
+                for x in lines[eid]:  # every settlement line of the entry is affected
+                    bad[line_key("row:" + _row_hash(x))] = KINDS[2]
                 del valid[eid]
                 dropped.add(eid)
             continue
@@ -136,7 +170,7 @@ def omit_reason(v):
     if not bad:
         return None
     kinds = [k for k in KINDS if k in set(bad.values())]
-    return f"{len(bad)} ledger row(s) " + " / ".join(kinds)
+    return f"{len(bad)} ledger row(s) " + " / ".join(kinds) + " (ledger scan)"
 
 
 def pnl(rows):

@@ -121,7 +121,7 @@ def test_facts_labels_and_open_mismatch():
     assert lines[1:] == ["Cash (Kalshi, broker): $250.00", "Open-position cost (Kalshi, broker): $7.50",
                          "Open positions (Kalshi, broker): 3",
                          "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (0W/1L)",
-                         "⚠ ledger/broker open-position mismatch (1 vs 3) — not reconciled"], lines
+                         "⚠ ledger/broker open-position mismatch (ledger scan 1 vs broker 3) — not reconciled"], lines
     rows.append(ent("open2", h=1))
     rows.append(ent("open3", h=1))
     f = cb.verified_facts(get=lambda e: {"balance": 25000}, get_positions=pos, ledger=lambda: rows, now=NOW)
@@ -131,7 +131,7 @@ def test_facts_labels_and_open_mismatch():
     cb.gate_answer("q", "x", cb.verified_facts(get=lambda e: {"balance": 25000}, get_positions=pos,
                                                ledger=lambda: rows[:3], now=NOW),
                    send=True, send_fn=lambda m: send.append(m) or True, now=NOW)
-    assert "⚠ ledger/broker open-position mismatch (1 vs 3) — not reconciled" in send[0], send
+    assert "⚠ ledger/broker open-position mismatch (ledger scan 1 vs broker 3) — not reconciled" in send[0], send
 
 
 def test_sports_unconfirmed_notice():

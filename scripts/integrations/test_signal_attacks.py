@@ -82,7 +82,7 @@ def test_facts_attack():
     assert r(led(["-3.5"], won=[False])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$3.50 (0W/1L)"
     assert r(led([1.005, 2.675])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): +$3.68 (2W/0L)"
     assert r(led([-5.0], won=["false"])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (0W/1L)"
-    unp = "Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — 1 ledger row(s) unparseable"
+    unp = "Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — 1 ledger row(s) unparseable (ledger scan)"
     for rows in (led([float("nan")]), led([None]), led([1e30]), led([5.0], won=[None]),
                  led([5.0], won=["yes"]), led([5.0], won=[1]),
                  led([5.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",
@@ -129,13 +129,13 @@ def _ping(recs):
 def test_settle_attack():
     sent = _ping(led([2.5, -1.0], won=[True, False]))
     assert sent == [f"{P}+$1.50 (1W/1L)\n{AT}+$1.50 (1W/1L)"], sent
-    warn = "⚠ 1 ledger row(s) unparseable — all-time total omitted"
+    warn = "⚠ 1 ledger row(s) unparseable (ledger scan) — all-time total omitted"
     for name, recs in [("missing", led([2.0, 3.0], missing=(0,))), ("None", led([None, 3.0]))]:
         assert _ping(recs) == [f"{P}+$3.00 (1W/0L)\n{warn}"], name  # bad row never blocks a valid one
     for name, recs in [("nan", led([float("nan")])), ("nan str", led(["NaN"])), ("inf", led([float("inf")])),
                        ("garbage", led(["abc"])), ("huge", led([1e30])), ("won None", led([1.0], won=[None])),
                        ("won str", led([1.0], won=["maybe"]))]:
-        assert _ping(recs) == ["⚠ 1 ledger row(s) unparseable — their figures withheld until fixed"], name
+        assert _ping(recs) == ["⚠ 1 ledger row(s) unparseable (ledger scan) — their figures withheld until fixed"], name
     orphan = led([1.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",
                                 "logged_at": t(0.1), "realized_pnl_net": 9.0, "won": True}])
     assert _ping(orphan) == [f"{P}+$1.00 (1W/0L)\n{warn}"]
@@ -162,7 +162,7 @@ def test_pnl_run_attack():
     sent = []
     r = pnl_run.pnl_report(get_positions=POS, ledger=lambda: led([1.0], missing=(0,)),
                            send_fn=lambda m: sent.append(m) or True, now=NOW)
-    assert r["status"] == "verified" and "fee-incl.): omitted — 1 ledger row(s) unparseable" in sent[0], sent
+    assert r["status"] == "verified" and "fee-incl.): omitted — 1 ledger row(s) unparseable (ledger scan)" in sent[0], sent
     for name, gp, recs in (("huge exposure", lambda: {"market_positions": [{"ticker": "A", "position": 1,
                                                                             "market_exposure": 1e18}]}, led([1.0])),
                            ("garbage venue ts", lambda: dict(POS(), ts="garbage"), led([1.0])),

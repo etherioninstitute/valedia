@@ -250,8 +250,10 @@ def ledger_latest(recs, now=None):
     live = [r for r in recs if r.get("type") in ("entry", "settlement")
             and not _non_real(r.get("source")) and not _unrec(r)
             and (r.get("type") == "entry" or not _non_real(ent.get(r.get("entry_id"), {}).get("source")))]
+    import ledger_view as lv
     stamps = [t for t in (parse_ts(r.get("logged_at") or r.get("ts")) for r in live) if t]
-    future = any((t - now).total_seconds() > 300 for t in stamps)
+    future = any((t - now).total_seconds() > 300 for r in live  # ANY present time field
+                 for t in lv.time_fields(r).values() if t)
     ok = [t for t in stamps if (t - now).total_seconds() <= 300]
     return (max(ok).astimezone(timezone.utc).isoformat() if ok else None), future
 

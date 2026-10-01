@@ -5,7 +5,6 @@ settle_run.MODELS (read at call time so tests / harnesses can repoint it).
 import json
 import os
 import sys
-from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,7 +23,9 @@ SENT_FILE = "profit_sent_ids.jsonl"
 UNCONF_FILE = "profit_unconfirmed_ids.jsonl"
 STATE_FILE = "settle_state.json"               # last bad-row set already notified
 NOTICE_FILE = "settle_notice_days.json"        # once-per-day paused notices
-CURSOR_FILE = "settle_ftl_signal_cursor.txt"   # old deployed cursor (bootstrap seed only)
+CURSOR_FILE = "settle_ftl_signal_cursor.txt"   # old deployed cursor (seed only, once)
+SEED_MARKER = "seeded_from_cursor"             # JSON-object line in the sent record: cursor
+#                                                reconciliation done (never seed twice)
 SENT_IDS_MAX = 5000
 LOCK_STALE_S = 20 * 60
 
@@ -43,14 +44,15 @@ def _paths():
 
 
 def _read_ids(path):
-    """(Counter ids, bad_lines, tail_fragment). Missing -> empty. Directory / parent not
-    a directory / unreadable -> SentRecordError."""
+    """(Counter ids, bad_lines, tail_fragment, seed_marker). Missing -> empty. Directory /
+    parent not a directory / unreadable -> SentRecordError. seed_marker: the value of the
+    {"seeded_from_cursor": ...} line (None when absent; the line is not a bad line)."""
     from collections import Counter
     parent = os.path.dirname(path)
     if os.path.lexists(parent) and not os.path.isdir(parent):
         raise SentRecordError(f"{parent} is not a directory")
     if not os.path.lexists(path):
-        return Counter(), 0, None
+        return Counter(), 0, None, None
     if not os.path.isfile(path):
         raise SentRecordError(f"{path} is not a file")
     try:
@@ -58,7 +60,7 @@ def _read_ids(path):
             parts = f.read().split(b"\n")
     except OSError as e:
         raise SentRecordError(str(e))
-    ids, bad, frag = Counter(), 0, None
+    ids, bad, frag, mark = Counter(), 0, None, None
     for i, line in enumerate(parts):
         if not line.strip():
             continue
@@ -68,28 +70,32 @@ def _read_ids(path):
             v = None
         if isinstance(v, str) and v:
             ids[v] += 1
+        elif isinstance(v, dict) and SEED_MARKER in v:
+            mark = v[SEED_MARKER] if v[SEED_MARKER] is not None else "none"
         else:
             bad += 1
             if i == len(parts) - 1:  # last line without "\n": cut mid-write
                 frag = line.decode("utf-8", "replace")
-    return ids, bad, frag
+    return ids, bad, frag, mark
 
 
 def _load_pair(name):
     """Max-per-id union of primary + backup. One unreadable copy is tolerated only when
     the other exists and is readable; otherwise SentRecordError (fail closed)."""
     from collections import Counter
-    out = {"ids": Counter(), "bad": 0, "frags": [], "ok": [], "errs": [], "seen": [], "mtime": 0}
+    out = {"ids": Counter(), "bad": 0, "frags": [], "ok": [], "errs": [], "seen": [],
+           "marks": [], "marker": None}
     for path in _pair(name):
         try:
-            ids, bad, frag = _read_ids(path)
+            ids, bad, frag, mark = _read_ids(path)
         except SentRecordError as e:
             out["errs"].append(str(e))
             continue
         out["ok"].append(path)
         if os.path.lexists(path):
             out["seen"].append(ids)
-            out["mtime"] = max(out["mtime"], os.path.getmtime(path))
+            out["marks"].append(mark)
+            out["marker"] = out["marker"] or mark
         out["bad"] += bad
         out["frags"] += [frag] if frag else []
         for k, n in ids.items():
@@ -99,7 +105,7 @@ def _load_pair(name):
     if out["errs"]:
         print(f"[settle_run] {name}: using the readable copy ({'; '.join(out['errs'])})")
     out["differ"] = len(out["seen"]) == 1 and len(out["ok"]) == 2 or any(
-        c != out["seen"][0] for c in out["seen"])
+        c != out["seen"][0] for c in out["seen"]) or any(m != out["marks"][0] for m in out["marks"])
     return out
 
 
@@ -148,36 +154,48 @@ def record_sent(ids):
     return _write_pair(SENT_FILE, [json.dumps(str(i)) for i in sorted(ids)])
 
 
-def load_sent(keep=(), recover=None):
-    """(ids, first_run). Bad / duplicate lines are rewritten away. A last line cut
-    mid-write (a batch appended after a CONFIRMED delivery) is recovered: every valid
-    settlement booked by the time of that append was either already recorded or in that
-    batch, so unsent ids booked before the record's mtime whose JSON starts with the
-    fragment count as sent (never re-reported) and are logged. Unreadable ->
-    SentRecordError."""
-    import ledger_view as lv
+def seed_line(cursor):
+    """The marker line: this record has been reconciled with the legacy cursor."""
+    return json.dumps({SEED_MARKER: cursor.isoformat() if cursor else None}, separators=(",", ":"))
+
+
+def record_seed(ids, cursor):
+    """Append the cursor-seeded ids + the marker (one append per copy). Copies written."""
+    return _write_pair(SENT_FILE, [json.dumps(str(i)) for i in sorted(ids)] + [seed_line(cursor)])
+
+
+def load_sent_full(keep=()):
+    """{"ids", "first", "marker"}. Bad / duplicate lines are rewritten away (the seed
+    marker is kept). A last line cut mid-write is a torn fragment: it is DISCARDED, never
+    guessed at — only exact complete ids count as sent. An id that was in the write-ahead
+    (unconfirmed) record is re-sent, labelled; an id in neither record is reported normally.
+    Unreadable -> SentRecordError."""
     d = _load_pair(SENT_FILE)
     ids, first = set(d["ids"]), not d["seen"] and not d["errs"]
-    rec = set()
-    limit = datetime.fromtimestamp(d["mtime"], timezone.utc) + lv.TOL if d["mtime"] else None
-    for frag in d["frags"]:
-        if frag.startswith('"') and limit:
-            rec |= {k for k, s in (recover or {}).items() if k not in ids
-                    and json.dumps(k).startswith(frag) and lv.booked(s) <= limit}
-    if rec:
-        print(f"[settle_run] truncated sent-record line: {sorted(rec)} treated as sent")
-        ids |= rec
+    if d["frags"]:
+        print(f"[settle_run] truncated sent-record line discarded ({len(d['frags'])} fragment(s)); "
+              "only complete ids count as sent")
     dup = any(n > 1 for n in d["ids"].values())
-    if not first and (d["bad"] or d["differ"] or dup or rec or len(ids) > SENT_IDS_MAX):
+    if not first and (d["bad"] or d["differ"] or dup or len(ids) > SENT_IDS_MAX):
         keep, others = set(keep), sorted(ids - set(keep))
         room = max(0, SENT_IDS_MAX - len(ids & keep))  # ids still in the ledger never dropped
         ids = set(sorted(ids & keep) + (others[len(others) - room:] if room else []))
+        lines = [json.dumps(i) for i in sorted(ids)]
+        if d["marker"]:
+            lines.append(json.dumps({SEED_MARKER: None if d["marker"] == "none" else d["marker"]},
+                                    separators=(",", ":")))
         for path in d["ok"]:
             try:
-                _rewrite(path, [json.dumps(i) for i in sorted(ids)])
+                _rewrite(path, lines)
             except OSError as e:
                 print(f"[settle_run] could not repair {path}: {e}")
-    return ids, first
+    return {"ids": ids, "first": first, "marker": d["marker"]}
+
+
+def load_sent(keep=()):
+    """(ids, first_run) — see load_sent_full."""
+    r = load_sent_full(keep)
+    return r["ids"], r["first"]
 
 
 def load_sent_ids():

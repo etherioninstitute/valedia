@@ -95,6 +95,7 @@ def _pl(v):
 ALL_TIME = "Realized P&L (all-time, ledger, all venues, fee-incl.)"
 REINIT = "Profit reporting (re)initialized — earlier settlements are included in the 11pm all-time total"
 TWICE = "Profit report delivery unconfirmed twice — see the 11pm report"
+SCAN_LINE = "ledger scan count — no money figure to verify"  # instead of "✓ verified"
 
 
 def format_settled_signal(new_pnl, w, l, total_net=None, total_record=None, bad=0, resent=0,
@@ -154,7 +155,7 @@ def ftl_profit_signal(recs=None, since=None, minutes=50):
 # Persistent records + lock live in settle_record.py (kept under 500 lines each).
 from settle_record import (SENT_FILE, UNCONF_FILE, STATE_FILE, NOTICE_FILE, SENT_IDS_MAX,  # noqa: E402,F401
                            LOCK_STALE_S, SentRecordError, _paths, _load_pair, _write_pair,
-                           record_sent, load_sent, load_sent_ids, set_unconfirmed, _json_pair,
+                           record_sent, record_seed, load_sent, load_sent_full, load_sent_ids, set_unconfirmed, _json_pair,
                            _save_json_pair, _cursor, _write_cursor, _lock_info, _acquire)
 
 
@@ -167,9 +168,11 @@ def _paused(send_fn, now, what, waiting=None, why=""):
         print(f"[settle_run] paused ({what}); notice already sent today")
         return {"status": "dedupe", "sent": False, "text": ""}
     text = f"Profit report paused — {what}" + (
-        f" · {waiting} settlement(s) waiting" if waiting is not None else "")
-    claims = [sv.claim("waiting", waiting, waiting, "ledger", tol=0)] if waiting is not None else []
-    res = sv.deliver("Profit", text, claims, send_fn=send_fn, now=now, dedupe_window_s=0,
+        f" · {waiting} settlement(s) waiting (ledger scan)" if waiting is not None else "")
+    # the count is a ledger scan, not an independently re-read figure: labelled, never "verified"
+    res = sv.deliver("Profit", text, (), send_fn=send_fn, now=now, dedupe_window_s=0,
+                     allowed=[waiting] if waiting is not None else (),
+                     verified_line=SCAN_LINE if waiting is not None else None,
                      info={"why": str(why)[:300]})
     if res.get("delivery") in ("ok", "unknown"):
         days = {k: v for k, v in days.items() if k.split("|")[-1] >= (now - timedelta(days=7)).date().isoformat()}
@@ -178,25 +181,60 @@ def _paused(send_fn, now, what, waiting=None, why=""):
 
 
 def _bootstrap(valid, send_fn, now):
-    """No sent record at all. Old cursor present -> settlements booked at or before it
-    count as sent, the rest are reported now (returns None). No cursor -> record every
-    existing id as baseline ONLY after one figure-free notice went out (returns res)."""
+    """First run, NO legacy cursor: record every existing id as baseline ONLY after one
+    figure-free notice went out (returns res; nothing recorded otherwise -> retried).
+    No settlements at all -> record the empty baseline (+ marker), returns None."""
     import signal_verify as sv
     import ledger_view as lv
-    cur = _cursor(now)
-    if cur is not None:
-        base = {k for k, s in valid.items() if lv.booked(s) <= cur}
-        if not record_sent(base):
-            raise SentRecordError("baseline not recorded")
-        print(f"[settle_run] bootstrap from old cursor {cur.isoformat()}: {len(base)} already reported")
-        return None
     if not valid:
-        record_sent([])
+        if not record_seed([], None):
+            raise SentRecordError("baseline not recorded")
         return None
     res = sv.deliver("Profit", REINIT, send_fn=send_fn, now=now, dedupe_window_s=0,
                      info={"baseline_ids": len(valid)})
-    if res.get("delivery") in ("ok", "unknown") and record_sent(valid):
+    if res.get("delivery") in ("ok", "unknown") and record_seed(valid, None):
         _write_cursor(max([now] + [lv.booked(s) for s in valid.values()]))
+    return res
+
+
+def _seed_from_cursor(valid, sent, now):
+    """Legacy cursor file present and the sent-record lacks its seeded_from_cursor marker:
+    UNION-seed ids booked at or before the cursor (the old code already reported them),
+    once, then write the marker. No cursor -> the marker alone (nothing to reconcile).
+    Returns the ids now known sent."""
+    import ledger_view as lv
+    cur = _cursor(now)
+    base = {k for k, s in valid.items() if lv.booked(s) <= cur} if cur else set()
+    if not record_seed(base - set(sent), cur):
+        raise SentRecordError("baseline not recorded")
+    if base - set(sent):
+        print(f"[settle_run] seeded from old cursor {cur.isoformat()}: "
+              f"{len(base - set(sent))} already reported")
+    return set(sent) | base
+
+
+def _twice_notice(send_fn, now, twice, unc):
+    """The "unconfirmed twice" notice. The ids are marked sent ONLY after it is confirmed
+    delivered. A confirmed failure leaves them unrecorded (figures stay withheld) and the
+    notice is retried on the next run; an unknown outcome (maybe delivered) is retried at
+    most once per UTC day, so a duplicate is bounded. Never silent: every attempt is in
+    verify_log + stderr and a skipped retry is logged."""
+    import signal_verify as sv
+    tag = f"twice|{now.date().isoformat()}"
+    days = _json_pair(NOTICE_FILE)
+    if tag in days:
+        print(f"[settle_run] {len(twice)} settlement(s) still unconfirmed-twice: notice outcome "
+              "unknown today; retry tomorrow")
+        return None
+    res = sv.deliver("Profit", TWICE, send_fn=send_fn, now=now, dedupe_window_s=0,
+                     info={"ids": twice})
+    if res.get("delivery") == "ok" and res["status"] == "verified":
+        return res
+    if res.get("delivery") == "unknown" or res.get("sent"):  # may have reached Burton
+        days = {k: v for k, v in days.items() if k.split("|")[-1] >= (now - timedelta(days=7)).date().isoformat()}
+        _save_json_pair(NOTICE_FILE, dict(days, **{tag: now.isoformat()}))
+    print(f"[settle_run] 'unconfirmed twice' notice not confirmed ({res.get('delivery')}); "
+          f"{len(twice)} id(s) stay unrecorded and are retried")
     return res
 
 
@@ -210,12 +248,15 @@ def _cycle(send_fn, now_in):
     v = lv.select(recs, now)
     valid, bad, reason = v["valid"], v["bad"], lv.omit_reason(v)
     try:
-        sent, first = load_sent(keep=valid, recover=valid)
-        if first or (not sent and _cursor(now) is not None):  # never recorded, or wiped empty
+        d = load_sent_full(keep=valid)
+        sent, first = d["ids"], d["first"]
+        if first and _cursor(now) is None:  # never recorded, no old cursor: one re-init notice
             res = _bootstrap(valid, send_fn, now)
             if res is not None:
                 return res
             sent = load_sent(keep=valid)[0]
+        elif d["marker"] is None:  # record never reconciled with the legacy cursor (once)
+            sent = _seed_from_cursor(valid, sent, now)
         unc_d = _load_pair(UNCONF_FILE)
         st = _json_pair(STATE_FILE)
     except SentRecordError as e:
@@ -236,18 +277,16 @@ def _cycle(send_fn, now_in):
     res = None
     twice = [k for k in todo if unc[k] >= 2]
     if twice:  # two unknown deliveries: stop re-sending figures, point to the 11pm report
-        res = sv.deliver("Profit", TWICE, send_fn=send_fn, now=now, dedupe_window_s=0,
-                         info={"ids": twice})
-        if record_sent(twice):
+        res = _twice_notice(send_fn, now, twice, unc)
+        if res and res.get("delivery") == "ok" and res["status"] == "verified" and record_sent(twice):
             unc = type(unc)({k: n for k, n in unc.items() if k not in twice})
             set_unconfirmed(unc)
         todo = [k for k in todo if k not in twice]
     bad_key = lv._h(",".join(sorted(bad))) if bad else ""
     if not todo:
         if bad and st.get("bad_notified") != bad_key:
-            r = sv.deliver("Profit", f"⚠ {reason} — their figures withheld until fixed",
-                           [sv.claim("rows", len(bad), len(bad), "ledger", tol=0)],
-                           send_fn=send_fn, now=now, dedupe_key="bad:" + bad_key,
+            r = sv.deliver("Profit", f"⚠ {reason} — their figures withheld until fixed", (),
+                           allowed=[len(bad)], verified_line=SCAN_LINE, send_fn=send_fn, now=now, dedupe_key="bad:" + bad_key,
                            dedupe_window_s=30 * 86400, info={"bad": sorted(bad)})
             if r.get("delivery") in ("ok", "unknown") or r["status"] == "dedupe":
                 _save_json_pair(STATE_FILE, dict(st, bad_notified=bad_key))
@@ -279,7 +318,7 @@ def _report(send_fn, now, valid, bad, reason, todo, unc, st, bad_key):
     oldest = min(lv.booked(s) for s in rows)
     res = sv.deliver("Profit", body, claims,
                      [sv.fresh("settlement", oldest.isoformat(), 6 * 3600, policy="label")],
-                     footer=[f"ledger {len(valid)} settled rows", sv.hhmm(now)], send_fn=send_fn,
+                     footer=[f"{len(valid)} settled rows (ledger scan)", sv.hhmm(now)], send_fn=send_fn,
                      now=now, dedupe_window_s=0, info={"ids": todo, "bad": sorted(bad)})
     d = res.get("delivery") if res["status"] == "verified" else None
     if d == "ok":
