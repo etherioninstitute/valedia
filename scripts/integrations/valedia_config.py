@@ -875,12 +875,9 @@ def controls_snapshot():
          "(n>=5, score>=0.03) even when this is off. Empty or missing file "
          "does not refuse and is not a zero score."),
         ("INFORMED_BEFORE_CREATE", True, "const", "kalshi",
-         "fail-closed before create. Env cannot disable. Refreshed fee-map "
-         "series, fee-true EV (maker prefer, higher taker hurdle, extra floor "
-         "near the 50c fee dome), FV model or rules_clock or researched plus "
-         "confidence, book, depth, Kelly/FTL size, ledger evidence, "
-         "session_clock and resolve_clock on sports, 15m, and Poly US. "
-         "Halt off is necessary, not sufficient."),
+         "fail-closed before create. Env cannot disable. Needs fee-true EV, FV, "
+         "book, depth, size, ledger and clock checks. Halt off is necessary, "
+         "not sufficient."),
         ("POLY_TAG_PRIOR_CREATE", False, "const", "poly",
          "tag_prior-alone is never create-eligible. Env cannot enable. "
          "US writes stay blocked while POLYMARKET_US_LIVE is off."),
