@@ -201,17 +201,38 @@ _NIMROD_GATED = "AI answer (Claude, not a ledger report):\nYou have $12.50 cash.
 
 
 def test_claude_router_relays_only_gated_text():
-    def ssh(text):
-        return "cat <<'EOF'\n" + text + "\nEOF\n"
-    # gated bridge output is relayed (with $ -> USD by the shell escape)
+    import claude_bridge as cb
+
+    def ssh(text, rc=0):
+        return "cat <<'EOF'\n" + text + "\nEOF\nexit %d\n" % rc
+
+    def gated(status, text):
+        return cb.gate_header(status, text) + "\n" + text
+    # structurally gated bridge output (header sha + exit 0) is relayed
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
-                         {"ssh": ssh(_NIMROD_GATED), "openclaw": _OPENCLAW})
-    assert "✓ verified" in sent and "12.50" in sent, sent
-    # a single withheld notice is relayed
+                         {"ssh": ssh(gated("verified", _NIMROD_GATED)), "openclaw": _OPENCLAW})
+    assert "✓ verified" in sent and "12.50" in sent and "VALEDIA-GATE" not in sent, sent
+    assert "VALEDIA-GATE" not in r.stdout and "12.50" in r.stdout
+    # a single withheld notice (exit 3) is relayed
     wh = "Report withheld (AI answer): figure(s) with no named source. Unverified figures not sent; see data/signal/verify_log.jsonl."
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
-                         {"ssh": ssh(wh), "openclaw": _OPENCLAW})
+                         {"ssh": ssh(gated("withheld", wh), 3), "openclaw": _OPENCLAW})
     assert "Report withheld (AI answer)" in sent
+    # text markers alone are NOT trusted: correct-looking footer without header
+    r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
+                         {"ssh": ssh(_NIMROD_GATED), "openclaw": _OPENCLAW})
+    assert "claude router" in sent and "12.50" not in sent, sent
+    # header present but body tampered (sha mismatch)
+    tampered = cb.gate_header("verified", _NIMROD_GATED) + "\n" + _NIMROD_GATED.replace("12.50", "99.50")
+    r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
+                         {"ssh": ssh(tampered), "openclaw": _OPENCLAW})
+    assert "99.50" not in sent and "claude router" in sent, sent
+    # header says verified but exit code is not 0 / status-code mismatch
+    for rc, st in ((3, "verified"), (0, "withheld"), (4, "verified")):
+        body = _NIMROD_GATED if st == "verified" else wh
+        r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
+                             {"ssh": ssh(gated(st, body), rc), "openclaw": _OPENCLAW})
+        assert "claude router" in sent, (rc, st, sent)
     # ungated raw AI text (old bridge copy / injected) is NOT relayed
     raw = "Expected profit next week: $40.00, you will make 123.45"
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
@@ -219,10 +240,10 @@ def test_claude_router_relays_only_gated_text():
     assert "Report withheld (claude router)" in sent, sent
     assert "40.00" not in sent and "123.45" not in sent, sent
     assert "40.00" in r.stdout  # local stdout (no Signal) is unchanged
-    # marker spoofed in the middle (not last line) is not gated
+    # marker spoofed in the middle (not last line), even with a valid header
     spoof = "✓ verified: x\nProfit: $99.99 guaranteed"
     r, sent, _ = _run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
-                         {"ssh": ssh(spoof), "openclaw": _OPENCLAW})
+                         {"ssh": ssh(gated("verified", spoof)), "openclaw": _OPENCLAW})
     assert "99.99" not in sent and "claude router" in sent, sent
     # no --signal: nothing sent at all
     r, sent, _ = _run_sh("claude_router.sh", ["q"], {"ssh": ssh(raw), "openclaw": _OPENCLAW})

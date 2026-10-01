@@ -43,8 +43,16 @@ def modeled_picks(ke, state, opps):
 
 
 def brief(ke=None, get_positions=None, send_fn=None, now=None, state=None, opps=None):
+    """Never raises: any error (scan, sim, broker, verifier) -> one withheld notice."""
     import signal_verify as sv
     kind, now = "7am brief", now or sv.utcnow()
+    try:
+        return _brief(sv, kind, ke, get_positions, send_fn, now, state, opps)
+    except Exception as e:
+        return sv.withhold(kind, "brief failed", f"{type(e).__name__}: {e}", send_fn, now)
+
+
+def _brief(sv, kind, ke, get_positions, send_fn, now, state, opps):
     if ke is None:
         import kalshi_executor as ke
     try:
@@ -67,9 +75,11 @@ def brief(ke=None, get_positions=None, send_fn=None, now=None, state=None, opps=
               sv.claim("Modeled if-all-win", upside,
                        sum(p["contracts"] * p["edge"] for p in picks), "contracts x edge", tol=0.01),
               sv.claim("picks fit cash", 0.0, max(0.0, sum(p["cost"] for p in picks) - fit),
-                       "cash limit")]
-    return sv.deliver(kind, body, claims, [sv.fresh("broker", snap["ts"], 900)],
-                      footer=[f"broker {sv.hhmm(snap['ts'])}", f"model {len(picks)} picks"],
+                       "cash limit"),
+              sv.claim("picks", len(picks), len(picks), "model", tol=0)]
+    bfresh, bfoot = sv.broker_fresh(snap)
+    return sv.deliver(kind, body, claims, bfresh,
+                      footer=[bfoot, f"model {len(picks)} picks"],
                       send_fn=send_fn, now=now, dedupe_key=f"brief:{now.date()}",
                       dedupe_window_s=20 * 3600, info={"picks": picks})
 

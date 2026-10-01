@@ -3,7 +3,8 @@ Checks if cron_runner_mac.sh is executable and cron log is fresh.
 Alerts Burton via Signal if something is wrong.
 Runs via a SEPARATE crontab entry (not through cron_runner_mac.sh).
 Ops alerts carry no money figures: the text goes through signal_verify.ops_alert,
-which strips/labels any money-like number and logs to data/signal/verify_log.jsonl.
+which replaces every line the shared money detector flags (money keyword /
+currency / % / signed decimal + any number) and logs to data/signal/verify_log.jsonl.
 (c) GOATWORTHY Post LLC
 """
 import os, re, subprocess, sys, time
@@ -14,7 +15,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 RUNNER = os.path.expanduser("~/.openclaw/workspace/scripts/cron_runner_mac.sh")
 LOG = os.path.expanduser("~/.openclaw/logs/valedia-cron.log")
 TARGET = "uuid:47bd6dd5-2c96-4514-9541-acd8ed013612"
-_MONEY = r"[+-]?\$\s*\d[\d,]*(?:\.\d+)?|(?<![\w.])[+-]?\d[\d,]*\.\d{2}(?![.\d])"
 
 
 def _ssh_send(msg):
@@ -33,9 +33,10 @@ def alert(msg, send_fn=None):
     try:
         import signal_verify as sv
         return sv.ops_alert("watchdog", msg, send_fn=send_fn)
-    except Exception as e:  # verifier unavailable: still figure-free
+    except Exception as e:  # verifier unavailable: drop every line with a digit
         try:
-            send_fn(re.sub(_MONEY, "[figure withheld]", msg))
+            send_fn("\n".join("[line withheld]" if re.search(r"\d", l) else l
+                              for l in str(msg).splitlines()))
         except Exception:
             pass
         print(f"[watchdog] verifier unavailable ({type(e).__name__}); sent figure-free text")

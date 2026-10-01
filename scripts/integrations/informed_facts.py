@@ -17,8 +17,9 @@ Sources (all offline; this module NEVER makes a network call):
   file data/crypto-paper/fomo_radar.json (written by the real radar feed; absent
   today). Never the fixture. A file whose metadata marks it synthetic / fixture /
   sample is ignored (sources.fomo.note = "synthetic_ignored"). Exact symbol/pair
-  match only. Annotate only: never sizes money. A dated file older than 24h is
-  ignored; missing → every fomo_* fact False.
+  match only. Annotate only: never sizes money. Only a file dated <= 24h is used
+  (undated or older -> ignored as stale); missing → every fomo_* fact False.
+  Callers pass asset_class (prediction/stock -> not looked up).
 - intel_layer is skipped: IntelLayer() fetches Fear/Greed over the network.
 
 Direction: "up" for buy/long, "down" for sell/short. A prediction side
@@ -294,11 +295,12 @@ def fomo_facts(symbol, d, *, paths=None, asset_class=None, now=None):
         if fomo_is_synthetic(doc):
             return facts, {"used": False, "path": p, "note": "synthetic_ignored"}
         src = {"used": True, "path": p, "dated": ts is not None, "annotate_only": True}
-        if ts is not None:
-            age = _age_s(ts, now)
-            src["age_s"] = age
-            if age is None or age >= MAX_AGE_S:
-                return facts, dict(src, used=False, reason="stale")
+        if ts is None:  # an undated feed cannot prove it is fresh -> stale, ignored
+            return facts, dict(src, used=False, reason="undated_stale")
+        age = _age_s(ts, now)
+        src["age_s"] = age
+        if age is None or age >= MAX_AGE_S:
+            return facts, dict(src, used=False, reason="stale")
         key, tag = _fomo_tag(fre.enrich(doc), symbol)
         src["symbol_found"] = tag is not None
         if tag is None:
