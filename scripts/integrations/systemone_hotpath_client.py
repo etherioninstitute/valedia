@@ -119,21 +119,15 @@ def verify_digest(get=None, timeout=3.0, force=False):
 
 
 
-def load_informed():
-    """Local MiroFish file if it is already on disk. No model call."""
-    for path in _INFORMED_PATHS:
-        try:
-            with open(path) as f:
-                doc = json.load(f)
-        except Exception:
-            continue
-        if not isinstance(doc, dict):
-            continue
-        sigs = doc.get("signals")
-        return {
-            "present": True,
-            "signals": sigs if isinstance(sigs, dict) else {},
-        }
+def load_informed(paths=None, now=None):
+    """MiroFish only via mirofish_intel_archive.load_for_fv: fresh (<24h), source
+    mirofish_swarm, not near-neutral, not an archive. Stale or lightweight → absent."""
+    import mirofish_intel_archive as mia
+    for path in paths or _INFORMED_PATHS:
+        doc = mia.load_for_fv(path, now)
+        if doc:
+            sigs = doc.get("signals")
+            return {"present": True, "signals": sigs if isinstance(sigs, dict) else {}}
     return {"present": False, "signals": {}}
 
 
