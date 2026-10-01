@@ -18,7 +18,6 @@ os.environ.pop("VALEDIA_ORNITH_SEASON", None)
 os.environ.pop("VALEDIA_SYSTEMONE", None)
 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
 SLOG = os.path.join(tempfile.mkdtemp(prefix="akslog_"), "decisions.jsonl")
-os.environ["VALEDIA_SYSTEMONE_LOG"] = SLOG
 # Retired shadow decider name, spelled indirectly so grep over scripts/ stays clean.
 RETIRED = "".join(["l", "a", "y", "a"])
 
@@ -29,12 +28,11 @@ import dynamic_universe as du
 import valedia_config as vc
 import weather_shadow as ws
 
-# Local Ollama is faked: the floating default tag nimble:latest carries Burton's
-# digest (24e550a16a70...), so it passes the digest pin. No real /api/tags call.
-ak.s1._get = lambda url, timeout: (
-    {"models": [{"name": "nimble:latest", "digest": "24e550a16a70" + "9" * 52}]}
-    if url.endswith("/api/tags") else {"version": "0.35.0"})
-ak.s1._reset_digest()
+# Local Ollama is faked, scoped per test (fixture / script main): nimble:latest carries
+# Burton's digest (24e550a16a70...), so it passes the pin. No real /api/tags call.
+from systemone_test_fakes import Scoped
+_S = Scoped(ak.s1, SLOG)
+_scoped_fakes = _S.fixture()
 
 
 def _doc():
@@ -382,6 +380,7 @@ def test_live_fallback(tmp=None):
 
 
 if __name__ == "__main__":
+    _S.setup()
     test_models_dir_v2()
     test_fee_true_rank_and_size_gate()
     test_oil_and_weather_stay_watch()
@@ -393,4 +392,5 @@ if __name__ == "__main__":
     test_scan_logs_every_decision_with_code_label_and_facts()
     test_ornith_season_does_not_reorder()
     test_live_fallback()
+    _S.teardown()
     print("PASS test_all_knowing_movers_scan")

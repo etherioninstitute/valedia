@@ -21,6 +21,10 @@ TAGS_URL = "http://127.0.0.1:11434/api/tags"
 NIMBLE2_DIGEST = "24e550a16a70"
 DIGEST_ENV = "VALEDIA_SYSTEMONE_DIGEST"
 DIGEST_RETRY_S = 30.0  # a failed digest check is not retried inside this window
+# A passed check expires too, so a later re-pull with another digest is caught.
+# Env override (seconds, > 0): VALEDIA_SYSTEMONE_DIGEST_TTL_S.
+DIGEST_OK_TTL_S = 300.0
+DIGEST_TTL_ENV = "VALEDIA_SYSTEMONE_DIGEST_TTL_S"
 # Explicit Nimble 2 names only. Full-match, case-insensitive. The floating
 # tags (nimble, nimble:latest) are NOT here: they pass only via the digest pin.
 # v1 tags (nimble:9b, nimble:1, ...) match nothing and stay refused.
@@ -95,6 +99,19 @@ def _digest_from_tags(tags_body):
     return "ok" if any(d.startswith(prefix) for d in digs) else "digest_mismatch"
 
 
+def digest_ok_ttl():
+    """Seconds a passed digest check stays valid. Bad or non-positive env: the default."""
+    try:
+        v = float(os.environ.get(DIGEST_TTL_ENV, DIGEST_OK_TTL_S))
+    except (TypeError, ValueError):
+        return DIGEST_OK_TTL_S
+    return v if v > 0 and v == v and v != float("inf") else DIGEST_OK_TTL_S
+
+
+def _fresh_ok():
+    return _DIGEST["status"] == "ok" and time.monotonic() - _DIGEST["ts"] < digest_ok_ttl()
+
+
 def _digest_set(raw, status):
     _DIGEST.update(key=_digest_key(raw), status=status, ts=time.monotonic())
     return status
@@ -107,13 +124,18 @@ def _reset_digest():
 def digest_status(raw=None):
     """Cached status for the configured floating tag: ok / digest_mismatch / digest_unverified.
 
-    None for an explicit v2 tag (no digest needed). Reads the cache only.
+    None for an explicit v2 tag (no digest needed). Reads the cache only. A passed
+    check older than digest_ok_ttl() reads as digest_unverified until re-verified.
     """
     raw = _raw_model() if raw is None else raw
     key = _digest_key(raw)
     if key is None:
         return None
-    return _DIGEST["status"] if _DIGEST["key"] == key and _DIGEST["status"] else "digest_unverified"
+    if _DIGEST["key"] != key or not _DIGEST["status"]:
+        return "digest_unverified"
+    if _DIGEST["status"] == "ok" and not _fresh_ok():
+        return "digest_unverified"
+    return _DIGEST["status"]
 
 def model_pin():
     """Pin to POST, or "" (the caller must not POST). Never touches the network.
@@ -141,9 +163,9 @@ def pin_refusal():
 
 
 def verify_digest(get, timeout=3.0, force=False):
-    """Verify the floating tag's digest via GET /api/tags. Cached for this process.
+    """Verify the floating tag's digest via GET /api/tags. Cached per process.
 
-    ok is cached until the process restarts; a failure is cached for
+    ok is cached for digest_ok_ttl() (then re-verified); a failure is cached for
     DIGEST_RETRY_S so a scan does not hammer /api/tags. Never raises.
     None for an explicit v2 tag. `get(url, timeout)` is the caller's transport.
     """
@@ -152,7 +174,8 @@ def verify_digest(get, timeout=3.0, force=False):
     if key is None:
         return None
     if not force and _DIGEST["key"] == key and _DIGEST["status"]:
-        if _DIGEST["status"] == "ok" or time.monotonic() - _DIGEST["ts"] < DIGEST_RETRY_S:
+        if _fresh_ok() or (_DIGEST["status"] != "ok"
+                           and time.monotonic() - _DIGEST["ts"] < DIGEST_RETRY_S):
             return _DIGEST["status"]
     try:
         body = get(TAGS_URL, timeout)
