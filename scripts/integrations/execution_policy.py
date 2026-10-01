@@ -18,7 +18,8 @@ import valedia_config as _cfg
 
 log = logging.getLogger("valedia.execution")
 RECONCILE_WINDOW_S = 3600   # keep a cancelled order tracked this long to catch a fill that raced the cancel
-MAX_CANCEL_ATTEMPTS = 5     # then stop retrying the cancel (still reconciled for fills)
+MAX_CANCEL_ATTEMPTS = 5     # then flag cancel_failed + ALERT; tracked until a GET confirms gone
+GONE_STATUSES = frozenset({"canceled", "cancelled", "executed", "filled", "expired"})
 
 
 @dataclass
@@ -128,7 +129,7 @@ class MakerOrderManager:
         try:
             import json
             with open(self._state_file, "w") as f:
-                json.dump(self._orders, f, indent=2)
+                json.dump(self._orders, f, indent=2, default=str)
         except Exception:
             pass
 
@@ -167,7 +168,8 @@ class MakerOrderManager:
                 self._orders[order_id] = {"ticker": ticker, "side": side, "price": price_cents,
                                           "contracts": contracts, "strategy": strategy,
                                           "placed_at": time.time(), "filled_recorded": 0,
-                                          "max_age_s": max_age_s or self._max_age_seconds}
+                                          "max_age_s": max_age_s or self._max_age_seconds,
+                                          "informed": informed}  # reprice re-runs create_preflight
                 self._save()
                 log.info(f"  MAKER PLACED: {side} {contracts}x {ticker} @{price_cents}c (id={order_id[:12]})")
             return order_id
@@ -218,18 +220,32 @@ class MakerOrderManager:
 
     def _cancel_tracked(self, oid, info, why):
         """Cancel and KEEP tracking (cancelled_at) so a fill that raced the cancel is still
-        recorded next cycle. A failed cancel stays live and retries (never orphaned)."""
+        recorded next cycle. A failed cancel stays live (still resting for SKIP_MAKER_RESTING)
+        and retries; after MAX_CANCEL_ATTEMPTS it is flagged cancel_failed + ALERT and stays
+        tracked until a GET confirms the order is gone (never dropped on a guess)."""
         try:
             self._cancel(oid, info.get("ticker"))
         except Exception as e:
             info["cancel_attempts"] = int(info.get("cancel_attempts", 0) or 0) + 1
             log.debug(f"  cancel failed {oid}: {e}")
-            if info["cancel_attempts"] < MAX_CANCEL_ATTEMPTS:
-                return False
-            why = "cancel_failed"
+            if info["cancel_attempts"] >= MAX_CANCEL_ATTEMPTS and not info.get("cancel_failed"):
+                info["cancel_failed"] = True
+                log.error(f"  ALERT MAKER CANCEL FAILED x{info['cancel_attempts']}: "
+                          f"{info['ticker']} id={oid} still resting until a GET confirms gone")
+            return False
+        info.pop("cancel_failed", None)
         info["cancelled_at"], info["cancel_reason"] = time.time(), why
         log.info(f"  MAKER CANCEL ({why}): {info['ticker']} @{info['price']}c")
         return True
+
+    def _order_gone(self, oid):
+        """GET confirms the venue no longer rests this order. Any doubt → False (still resting)."""
+        try:
+            g = self._api().get_order(oid) or {}
+        except Exception:
+            return False
+        o = g.get("order") if isinstance(g.get("order"), dict) else g
+        return str(o.get("status") or "").lower() in GONE_STATUSES
 
     def check_and_manage(self):
         """Record ACTUAL fills, cancel stale, reprice on book moves. Call each cron cycle
@@ -246,6 +262,13 @@ class MakerOrderManager:
             if info.get("cancelled_at"):                     # reconcile late fills, then drop
                 if fills is not None and now - info["cancelled_at"] > RECONCILE_WINDOW_S:
                     self._orders.pop(oid, None); changed = True
+                continue
+            if info.get("cancel_failed"):                    # GET-confirm gone, else retry
+                if self._order_gone(oid):
+                    info["cancelled_at"], info["cancel_reason"] = now, "cancel_failed_gone"
+                else:
+                    self._cancel_tracked(oid, info, "cancel_retry")
+                changed = True
                 continue
             if now - info["placed_at"] > info["max_age_s"]:
                 self._cancel_tracked(oid, info, "stale"); changed = True
@@ -282,8 +305,16 @@ class MakerOrderManager:
             remaining = int(float(info.get("contracts") or 0) - float(info.get("filled_recorded", 0) or 0))
             if remaining < 1:
                 return
+            # Re-run the informed gate at the NEW price; refused (or no informed) → cancel only.
+            import informed_before_create as ibc
+            opp = dict(info.get("informed") or {}, ticker=info["ticker"], side=info["side"])
+            pre = ibc.create_preflight(opp, remaining, new_price)
+            if not pre["ok"]:
+                log.info(f"  MAKER REPRICE REFUSED ({','.join(pre['reasons'][:4])}): cancel only")
+                return
             if self.place_maker_order(info["ticker"], info["side"], remaining, new_price,
-                                      strategy=info.get("strategy", ""), max_age_s=info["max_age_s"]):
+                                      strategy=info.get("strategy", ""), max_age_s=info["max_age_s"],
+                                      informed=pre["informed"]):
                 log.info(f"  MAKER REPRICED: {info['ticker']} {info['price']}c -> {new_price}c x{remaining}")
         except Exception as e:
             log.debug(f"  maker replace failed: {e}")

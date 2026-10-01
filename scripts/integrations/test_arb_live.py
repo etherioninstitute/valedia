@@ -28,11 +28,13 @@ TMP = tempfile.mkdtemp(prefix="arb_live_")
 REPORT = os.path.join(TMP, "backtest_arb.json")
 
 
-def _report(verdict="PASS", name="ARB_candidate", age_s=0):
+def _report(verdict="PASS", category="ARB", age_s=0, generated=True, name="ARB_candidate"):
+    doc = {"tool": "backtest_gate", "verdict": verdict, "category": category,
+           "candidate": {"name": name}}
+    if generated:
+        doc["generated_at"] = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
     with open(REPORT, "w") as f:
-        json.dump({"tool": "backtest_gate", "verdict": verdict, "candidate": {"name": name}}, f)
-    t = time.time() - age_s
-    os.utime(REPORT, (t, t))
+        json.dump(doc, f)
 
 
 def _env(**kw):
@@ -77,8 +79,9 @@ class FakeKalshi:
 
 
 class FakePoly:
-    def __init__(self, fills=True, raise_create=False):
+    def __init__(self, fills=True, raise_create=False, partial=None, read_fails=False):
         self.orders, self.cancels, self.fills, self.raise_create = [], [], fills, raise_create
+        self.partial, self.read_fails = partial, read_fails
 
     def create_order(self, body):
         if self.raise_create:
@@ -87,6 +90,11 @@ class FakePoly:
         return {"id": "p1", "kind": "create_ack", "filled": False}
 
     def get_order(self, oid):
+        if self.read_fails:
+            raise OSError("poly GET down")
+        if self.partial is not None:
+            return {"order": {"id": oid, "state": "ORDER_STATE_PARTIALLY_FILLED",
+                              "cumQuantity": self.partial, "avgPx": "0.30"}}
         q = self.orders[-1]["quantity"] if self.fills else 0
         st = "ORDER_STATE_FILLED" if self.fills else "ORDER_STATE_OPEN"
         return {"order": {"id": oid, "state": st, "cumQuantity": q, "avgPx": "0.30"}}
@@ -107,16 +115,29 @@ class Clock:
         self.t += s
 
 
-def _go(cand=None, env=None, k=None, p=None, **kw):
-    k, p, clk = k or FakeKalshi(), p or FakePoly(), Clock()
+LAST = {}
+
+
+def _go(cand=None, env=None, k=None, p=None, clk=None, **kw):
+    k, p, clk = k or FakeKalshi(), p or FakePoly(), clk or Clock()
+    kw.setdefault("ornith_post", tva._pass)
     orig = ftl.LEDGER
-    ftl.LEDGER = os.path.join(TMP, "ledger-%d.jsonl" % time.time_ns())
+    ftl.LEDGER = LAST["ledger"] = os.path.join(TMP, "ledger-%d.jsonl" % time.time_ns())
+    env = env if env is not None else _env()
+    LAST["log"] = env.get("VALEDIA_ARB_LIVE_LOG")
     try:
-        row = al.promote(cand or _cand(), env=env if env is not None else _env(), kalshi=k,
+        row = al.promote(cand or _cand(), env=env, kalshi=k,
                          poly=p, clock=clk, sleep=clk.sleep, **kw)
     finally:
         ftl.LEDGER = orig
     return row, k, p, clk
+
+
+def _ledger_rows():
+    try:
+        return [json.loads(x) for x in open(LAST["ledger"]) if x.strip()]
+    except OSError:
+        return []
 
 
 def test_flag_off_paper_only_zero_orders():
@@ -137,7 +158,10 @@ def test_missing_or_bad_backtest_refused():
     assert row["status"] == "REFUSED" and row["reason"] == "backtest_missing", row
     assert not k.orders and not p.orders
     for kw, why in ((dict(verdict="FAIL"), "backtest_not_pass"),
-                    (dict(name="SPORTS_only"), "backtest_not_arb"),
+                    (dict(category=None), "backtest_not_arb"),          # name "ARB_candidate" ≠ category
+                    (dict(category="ARB_SPORTS"), "backtest_not_arb"),  # substring is not a match
+                    (dict(category="arb"), "backtest_not_arb"),
+                    (dict(generated=False), "backtest_stale"),          # no generated_at → stale
                     (dict(age_s=8 * 86400), "backtest_stale")):
         _report(**kw)
         row, k, p, _ = _go()
@@ -220,6 +244,71 @@ def test_preflights_refuse_before_any_leg():
     c["poly_informed"] = {}
     row, k, p, _ = _go(cand=c)
     assert row["reason"].startswith("poly_preflight:") and not k.orders and not p.orders, row
+
+
+def test_backtest_freshness_ignores_mtime_and_category_configurable():
+    _report(age_s=8 * 86400)
+    os.utime(REPORT, None)  # fresh mtime must not rescue a stale generated_at
+    row, k, _p, _ = _go()
+    assert row["reason"] == "backtest_stale" and not k.orders, row
+    _report(category="PREDICTION_PAIR")
+    row, _k, _p, _ = _go(env=_env(VALEDIA_ARB_CATEGORY="PREDICTION_PAIR"))
+    assert row["status"] == "BOTH_FILLED", row
+
+
+def test_ornith_pass_required():
+    _report()
+    row, k, p, _ = _go(ornith_post=tva._refuse)
+    assert row["reason"] == "ornith:ornith_refuse" and not k.orders and not p.orders, row
+    row, k, p, _ = _go(ornith_post=tva._down)
+    assert row["reason"] == "ornith:ornith_down" and not k.orders, row
+    # a paper row with Ornith PASS for this exact pair is reused (Ornith not asked again)
+    paper = {"ticker": "%s|%s" % (_cand()["poly_slug"], _cand()["kalshi_ticker"]), "ornith": "pass"}
+    row, k, _p, _ = _go(ornith_post=tva._bomb, paper_row=paper)
+    assert row["status"] == "BOTH_FILLED", row
+    other = dict(paper, ticker="x|y")
+    row, k, _p, _ = _go(ornith_post=tva._refuse, paper_row=other)
+    assert row["reason"] == "ornith:ornith_refuse" and not k.orders, row
+
+
+def test_partial_poly_fill_booked_and_unmatched_alerted():
+    _report()
+    row, k, p, _ = _go(p=FakePoly(partial=5))
+    assert row["status"] == "LEG2_FAILED_LEG1_UNHEDGED" and row["p_qty"] == 5, row
+    assert row["unmatched"] == row["k_qty"] - 5 and row["alert"] is True
+    poly_rows = [r for r in _ledger_rows() if r.get("venue", "").startswith("poly")]
+    assert len(poly_rows) == 1 and float(poly_rows[0]["contracts"]) == 5.0, poly_rows
+    logged = [json.loads(x) for x in open(LAST["log"])]
+    assert logged[-1]["status"] == row["status"] and logged[-1]["filled"] is True
+
+
+def test_poly_unreadable_booked_unreconciled_with_order_id():
+    _report()
+    row, k, p, _ = _go(p=FakePoly(read_fails=True))
+    assert row["status"] == "LEG2_FAILED_LEG1_UNHEDGED" and p.cancels == ["p1"], row
+    poly_rows = [r for r in _ledger_rows() if r.get("venue", "").startswith("poly")]
+    assert len(poly_rows) == 1 and poly_rows[0].get("order_id") == "p1", poly_rows
+    assert poly_rows[0].get("fill_status") != "FILLED", poly_rows
+
+
+def test_exceptions_after_leg1_unwind_and_log():
+    _report()
+
+    class BoomClock(Clock):
+        def __call__(self):
+            raise RuntimeError("clock exploded")
+    row, k, p, _ = _go(clk=BoomClock())
+    assert row["status"] == "POST_LEG1_ERROR_LEG1_UNHEDGED" and row["alert"] is True, row
+    assert k.cancels == ["k1"] and "clock exploded" in row["error"] and row["filled"] is True
+    assert json.loads(open(LAST["log"]).readlines()[-1])["status"] == row["status"]
+
+    class BoomKalshi(FakeKalshi):
+        def create_order(self, *a, **k):
+            self.orders.append(a)
+            raise TimeoutError("POST timed out")
+    row, k, p, _ = _go(k=BoomKalshi())
+    assert row["status"] == "LEG1_ERROR" and row["exposure_unknown"] and row["filled"], row
+    assert not p.orders and json.loads(open(LAST["log"]).readlines()[-1])["status"] == "LEG1_ERROR"
 
 
 if __name__ == "__main__":

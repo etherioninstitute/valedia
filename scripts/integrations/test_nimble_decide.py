@@ -158,8 +158,11 @@ def test_veto_semantics():
     _reset(mode="veto")
     v = _decide(_post("buy", None))
     assert v["confidence"] == 0.9 and v["risk"] == 3
+    # VALEDIA_NIMBLE_P_FLOOR may only RAISE the 0.60 floor: 0.4 is ignored, 0.7 binds
     _reset(mode="veto", VALEDIA_NIMBLE_P_FLOOR="0.4")
-    assert _decide(_post("buy", 0.5))["allow"] is True
+    assert nd.p_floor() == 0.60 and _decide(_post("buy", 0.5))["allow"] is False
+    _reset(mode="veto", VALEDIA_NIMBLE_P_FLOOR="0.7")
+    assert nd.p_floor() == 0.7 and _decide(_post("buy", 0.65))["allow"] is False
     _reset(mode="veto", enabled=False)
     v = _decide(_post())
     assert v["allow"] is False and v["error"] == "engine_disabled"

@@ -29,7 +29,7 @@ Veto rule (entries only): allow iff action == "buy" and confidence >= min_sharpn
   margin         VALEDIA_NIMBLE_BASE_MARGIN (0.02) * phi_multiplier;
   phi_multiplier 0.5 + 2.5 * (1 - rf), rf = valedia_config._risk_factor(), the SAME Etherion
                  risk_level scalar dynamic_per_trade_cap uses: NORMAL 0.5 .. CAUTION 1.5 .. HALT
-                 3.0; missing / no risk_level / stale (VALEDIA_NIMBLE_PHI_MAX_AGE_H, 24) → 1.0.
+                 3.0; missing/no/unknown risk_level/stale (PHI_MAX_AGE_H 24) → 1.0. P_FLOOR only raises.
 break_even_p from the caller's `economics` (code only, NEVER in the model state), else None:
   prediction    price of the side bought: `yes_price` (else `price`) for a yes buy, `no_price`
                 ONLY for a no buy (> 1 = cents) + fee_per_contract + half_spread + slip.
@@ -58,6 +58,7 @@ MODES = ("off", "shadow", "veto")
 DEFAULT_MODE = "shadow"
 MIN_SHARPNESS_DEFAULT = 0.05
 P_FLOOR_DEFAULT = 0.60
+KNOWN_RISK_LEVELS = frozenset({"NORMAL", "CAUTION", "ELEVATED", "WARNING", "HALT", "DANGER"})
 BASE_MARGIN_DEFAULT = 0.02
 PHI_MULT_LO, PHI_MULT_HI = 0.5, 3.0
 PHI_MAX_AGE_H_DEFAULT = 24.0
@@ -153,8 +154,8 @@ def min_sharpness():
 min_conf = min_sharpness  # deprecated name
 
 
-def p_floor():
-    return _env_float("VALEDIA_NIMBLE_P_FLOOR", P_FLOOR_DEFAULT, 0.0, 1.0)
+def p_floor():  # env may only RAISE the floor: below 0.60 (or junk) → 0.60
+    return _env_float("VALEDIA_NIMBLE_P_FLOOR", P_FLOOR_DEFAULT, P_FLOOR_DEFAULT, 1.0)
 
 
 def base_margin():
@@ -289,8 +290,8 @@ def phi_multiplier(now=None):
         with open(path) as f:
             doc = json.load(f)
         lvl = str(doc.get("risk_level") or "").strip().upper() if isinstance(doc, dict) else ""
-        if not lvl:
-            return 1.0, "etherion_no_risk_level"
+        if lvl not in KNOWN_RISK_LEVELS:  # unknown is neutral 1.0, not _risk_factor's NORMAL (0.5x)
+            return 1.0, "etherion_unknown_level" if lvl else "etherion_no_risk_level"
         try:
             t = datetime.fromisoformat(str(doc.get("ts"))).timestamp()
         except (TypeError, ValueError):

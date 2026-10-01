@@ -578,7 +578,7 @@ def execute_allocations(allocations, dry_run=False):
                     results.append(r)
                     continue
                 import informed_before_create as _ibc
-                pre = _ibc.create_preflight(a, n, price_cents)
+                pre = _mr.preflight(_ibc, a, n, price_cents, rd["quoted_cents"])  # create_preflight (+ quote for maker)
                 if not pre["ok"]:
                     r["status"] = "SKIP_INFORMED"
                     r["error"] = ",".join(pre["reasons"])

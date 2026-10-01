@@ -8,9 +8,10 @@ become venue orders, and every gate below must hold BEFORE either leg is placed
   2 trading halt off                           (valedia_config.trading_halted)
   3 venue_writer("kalshi") == venue_writer("polymarket") == "valedia"
   4 POLYMARKET_US_LIVE on for the Poly leg     (valedia_config.polymarket_us_live_enabled)
-  5 backtest-first proof: a backtest_gate.py JSON report, verdict PASS, category ARB,
-    no older than VALEDIA_ARB_BACKTEST_MAX_AGE_H (168) at VALEDIA_ARB_BACKTEST_REPORT
-    (default data/arb-live/backtest_arb.json). Missing / stale / FAIL → refuse.
+  5 backtest-first proof: a backtest_gate.py JSON report (`--category ARB`), verdict PASS,
+    category EXACTLY ARB (or VALEDIA_ARB_CATEGORY), generated_at no older than
+    VALEDIA_ARB_BACKTEST_MAX_AGE_H (168) at VALEDIA_ARB_BACKTEST_REPORT (default
+    data/arb-live/backtest_arb.json). Missing / no generated_at / stale / FAIL → refuse.
   6 allowlisted pair only (exact vaughan_arb_paper.PAIRS slug+ticker; never heuristic)
   7 Kalshi ticker family not fenced
   8 fee-true edge + paper risk limits (vaughan fee_true/_risk: min edge, daily exposure/loss)
@@ -18,6 +19,7 @@ become venue orders, and every gate below must hold BEFORE either leg is placed
  10 Kalshi leg: informed_before_create.create_preflight (full informed, IOC=taker role)
     + nimble_wiring.gate (prediction asset class)
  11 Poly leg: informed_before_create.poly_reasons (the US create bar)
+ 12 the paper desk's Ornith PASS (vaughan ask_ornith, CE-1 fail-closed) for this pair/quote
 
 Both-legs-or-none (documented, paper-simulated in test_arb_live.py):
   leg 1 Kalshi IOC buy at the quoted price → fill read (POST-ack is never a fill).
@@ -28,7 +30,10 @@ Both-legs-or-none (documented, paper-simulated in test_arb_live.py):
         leg-1 contracts with hedge_fn → LEG2_FAILED_LEG1_HEDGED; with no hedge_fn (the
         default — no automatic Kalshi unwind is wired) → LEG2_FAILED_LEG1_UNHEDGED and an
         alert line in the live log (bounded by the size cap; close manually).
-Fills are booked fee-true via forward_test_ledger (Kalshi taker fee, Poly fill).
+  Any exception after leg 1 → POST_LEG1_ERROR_*: same cancel/hedge path, alert, logged.
+  Leg-1 POST exception → LEG1_ERROR (exposure unknown: counted + alert, no leg 2).
+Fills are booked fee-true via forward_test_ledger (Kalshi taker fee; Poly from the venue
+payload incl. partials; no payload but an order id → UNRECONCILED).
 No flag is flipped here. No keys are read here (the venue clients own that).
 """
 import json
@@ -44,6 +49,7 @@ DEFAULT_LEG_TIMEOUT_S = 10.0
 DEFAULT_BACKTEST_MAX_AGE_H = 168.0
 POLL_S = 0.5
 STRATEGY = "ARB"
+ARB_CATEGORY = "ARB"  # exact backtest_gate --category; VALEDIA_ARB_CATEGORY overrides
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 DEFAULT_REPORT = os.path.join(_ROOT, "data", "arb-live", "backtest_arb.json")
 DEFAULT_LOG = os.path.join(_ROOT, "data", "arb-live", "legs.jsonl")
@@ -76,8 +82,10 @@ def poly_live(env=None):
     return bool(vc.POLYMARKET_US_LIVE) or _on(env, "POLYMARKET_US_LIVE")
 
 
-def backtest_proof(path=None, now=None, max_age_h=None):
-    """(ok, reason). A PASS report from backtest_gate.py for category ARB, recent enough."""
+def backtest_proof(path=None, now=None, max_age_h=None, category=None):
+    """(ok, reason). backtest_gate.py report: verdict PASS, category EXACTLY `category`
+    (default ARB; backtest_gate --category ARB records it), fresh by its own generated_at.
+    Missing / unparseable generated_at → stale. File mtime is never used."""
     path = path or DEFAULT_REPORT
     if not os.path.isfile(path):
         return False, "backtest_missing"
@@ -90,13 +98,16 @@ def backtest_proof(path=None, now=None, max_age_h=None):
         return False, "backtest_not_gate_report"
     if doc.get("verdict") != "PASS":
         return False, "backtest_not_pass"
-    cand = doc.get("candidate") if isinstance(doc.get("candidate"), dict) else {}
-    cats = [str(doc.get("category") or ""), str(cand.get("name") or "")]
-    cats += [str(k) for k in (cand.get("by_category") or {})]
-    if not any("ARB" in c.upper() for c in cats):
+    if str(doc.get("category") or "") != str(category or ARB_CATEGORY):
         return False, "backtest_not_arb"
-    age = (now or time.time()) - os.path.getmtime(path)
-    if age > float(max_age_h or DEFAULT_BACKTEST_MAX_AGE_H) * 3600.0:
+    try:
+        gen = datetime.fromisoformat(str(doc.get("generated_at")).replace("Z", "+00:00"))
+        if gen.tzinfo is None:
+            gen = gen.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False, "backtest_stale"
+    age = (now or time.time()) - gen.timestamp()
+    if age < -300 or age > float(max_age_h or DEFAULT_BACKTEST_MAX_AGE_H) * 3600.0:
         return False, "backtest_stale"
     return True, "backtest_pass"
 
@@ -162,7 +173,7 @@ def poly_body(cand, quote, n):
     return body
 
 
-def gates(cand, env=None, now=None):
+def gates(cand, env=None, now=None, paper_row=None, ornith_post=None):
     """Every pre-order gate. (ok, reason, ctx). Nothing is placed here."""
     import vaughan_arb_paper as va
     if not enabled(env):
@@ -176,7 +187,8 @@ def gates(cand, env=None, now=None):
         return False, "poly_live_off", {}
     ok, why = backtest_proof(_env(env).get("VALEDIA_ARB_BACKTEST_REPORT") or None, now=now,
                              max_age_h=_num(env, "VALEDIA_ARB_BACKTEST_MAX_AGE_H",
-                                            DEFAULT_BACKTEST_MAX_AGE_H))
+                                            DEFAULT_BACKTEST_MAX_AGE_H),
+                             category=_env(env).get("VALEDIA_ARB_CATEGORY") or ARB_CATEGORY)
     if not ok:
         return False, why, {}
     if not allowlisted(cand):
@@ -192,6 +204,12 @@ def gates(cand, env=None, now=None):
     why = va._risk(quote, state, limits)
     if why:
         return False, why, {}
+    # The paper desk's Ornith PASS (CE-1 fail-closed) on this quote: reuse the paper row's
+    # verdict for this exact pair, else ask Ornith with the paper desk's own conditions.
+    if not _paper_pass(cand, paper_row):
+        verdict, _model = va.ask_ornith(va._conds(quote, limits), post_fn=ornith_post)
+        if verdict != "pass":
+            return False, "ornith:" + verdict, {}
     quote = dict(quote, kal_side=cand.get("kal_side"), poly_side=cand.get("poly_side"))
     n = int(float(quote["contracts"]))
     if n < 1:
@@ -215,78 +233,127 @@ def gates(cand, env=None, now=None):
                           "log": log_path, "size": size}
 
 
+def _paper_pass(cand, row):
+    r = row if isinstance(row, dict) else {}
+    want = "%s|%s" % (cand.get("poly_slug") or "", cand.get("kalshi_ticker") or "")
+    return r.get("ornith") == "pass" and r.get("ticker") == want
+
+
 def _wait_poly(client, ack, need, timeout, clock, sleep, fills_fn):
+    """(fill, payload) — payload is the last venue read (None if every read failed)."""
     import forward_test_ledger as ftl
     oid = ack.get("id")
     get = fills_fn or (lambda: client.get_order(oid))
     deadline = clock() + timeout
-    fill = {"qty": 0.0, "complete": False}
+    fill, last = {"qty": 0.0, "complete": False}, None
     while True:
-        fill, _ = ftl.resolve_polymarket_fill(ack, get)
+        fill, payload = ftl.resolve_polymarket_fill(ack, get)
+        last = payload if payload is not None else last
         if fill.get("complete") and float(fill.get("qty") or 0) >= need:
-            return fill
+            return fill, last
         if clock() >= deadline:
-            return fill
+            return fill, last
         sleep(POLL_S)
+
+
+def _book_poly(ftl, cand, body, ack, qty, payload):
+    """Venue payload → fee-true booking of what filled (partial included). No payload but an
+    order id → UNRECONCILED row with that id. Confirmed zero fill → nothing to book."""
+    if not ack.get("id") or (payload is not None and qty <= 0):
+        return None
+    return _safe(ftl.book_polymarket_fill, STRATEGY, cand.get("poly_slug"), body.get("intent"),
+                 ack, intended_source="live", fallback_price=float(cand.get("raw_poly")),
+                 fallback_size=qty if payload is not None else body.get("quantity"),
+                 trades_payload=payload)
 
 
 def execute(cand, ctx, kalshi=None, poly=None, hedge_fn=None, env=None,
             clock=time.monotonic, sleep=time.sleep, poly_fills_fn=None):
-    """Both-legs-or-none. Only called after gates() passed."""
-    import forward_test_ledger as ftl
+    """Both-legs-or-none. Only called after gates() passed. Never raises after leg 1."""
     if kalshi is None:
         import kalshi_auth as kalshi
     if poly is None:
         import polymarket_us_client as pmu
         poly = pmu.PolymarketUSClient()
-    n, quote, tk = ctx["n"], ctx["quote"], cand.get("kalshi_ticker")
-    kside = ctx["kopp"]["side"]
-    timeout = _num(env, "VALEDIA_ARB_LEG_TIMEOUT_S", DEFAULT_LEG_TIMEOUT_S)
-    base = {"n": n, "size_usd": ctx["size"], "edge_pct": quote.get("edge_pct"),
+    n, tk = ctx["n"], cand.get("kalshi_ticker")
+    base = {"n": n, "size_usd": ctx["size"], "edge_pct": ctx["quote"].get("edge_pct"),
             "nimble": ctx.get("nimble")}
-    k_ack = kalshi.create_order(tk, kside, n, ctx["kcents"], order_type="ioc",
-                                informed=ctx["informed"])
+    try:
+        k_ack = kalshi.create_order(tk, ctx["kopp"]["side"], n, ctx["kcents"], order_type="ioc",
+                                    informed=ctx["informed"])
+    except Exception as e:  # ambiguous POST: exposure unknown → counted, alerted, no leg 2
+        return _row(cand, "LEG1_ERROR", orders=1, filled=True, alert=True,
+                    exposure_unknown=True, error=str(e)[:120], **base)
+    st = {"orders": 1, "k_oid": None, "k_qty": None, "p_ack": {}, "p_qty": 0, "err": ""}
+    try:
+        return _after_leg1(cand, ctx, kalshi, poly, env, clock, sleep, poly_fills_fn,
+                           k_ack or {}, st, base, hedge_fn)
+    except Exception as e:  # anything unexpected after leg 1: cancel both, alert, count exposure
+        st["err"] = (st["err"] + " | " if st["err"] else "") + "%s: %s" % (
+            type(e).__name__, str(e)[:100])
+        return _unwind(cand, ctx, kalshi, poly, hedge_fn, st, base, "POST_LEG1_ERROR")
+
+
+def _after_leg1(cand, ctx, kalshi, poly, env, clock, sleep, poly_fills_fn, k_ack, st, base,
+                hedge_fn):
+    import forward_test_ledger as ftl
+    tk, kside = cand.get("kalshi_ticker"), ctx["kopp"]["side"]
+    nested = k_ack.get("order") if isinstance(k_ack.get("order"), dict) else {}
+    st["k_oid"] = nested.get("order_id") or k_ack.get("order_id")
     kfill, kpay = ftl.resolve_kalshi_fill(k_ack, kalshi.get_fills)
-    k_oid = kfill.get("order_id")
-    k_qty = int(float(kfill.get("qty") or 0)) if kfill.get("complete") else 0
-    orders = 1
+    st["k_oid"] = kfill.get("order_id") or st["k_oid"]
+    st["k_qty"] = k_qty = int(float(kfill.get("qty") or 0)) if kfill.get("complete") else 0
     if k_qty < 1:
-        if k_oid:
-            _safe(kalshi.cancel_order, k_oid, tk)
-        return _row(cand, "NONE_LEG1_UNFILLED", orders=orders, **base)
+        if st["k_oid"]:
+            _safe(kalshi.cancel_order, st["k_oid"], tk)
+        return _row(cand, "NONE_LEG1_UNFILLED", orders=1, **base)
     _safe(ftl.book_kalshi_fill, STRATEGY, tk, kside, k_ack, intended_source="live",
           fallback_price=ctx["kcents"] / 100.0, fallback_contracts=k_qty, fills_payload=kpay)
     body = dict(ctx["body"], quantity=k_qty)
-    p_ack, p_qty, err = {}, 0, ""
-    deadline = clock() + timeout
+    deadline = clock() + _num(env, "VALEDIA_ARB_LEG_TIMEOUT_S", DEFAULT_LEG_TIMEOUT_S)
+    p_pay = None
     try:
-        p_ack = poly.create_order(body) or {}
-        orders += 1
-        pfill = _wait_poly(poly, p_ack, k_qty, max(0.0, deadline - clock()), clock, sleep,
-                           poly_fills_fn)
-        p_qty = int(float(pfill.get("qty") or 0)) if pfill.get("complete") else 0
+        st["p_ack"] = poly.create_order(body) or {}
+        st["orders"] += 1
+        pfill, p_pay = _wait_poly(poly, st["p_ack"], k_qty, max(0.0, deadline - clock()), clock,
+                                  sleep, poly_fills_fn)
+        st["p_qty"] = int(float(pfill.get("qty") or 0)) if pfill.get("complete") else 0
     except Exception as e:
-        err = str(e)[:120]
-    if p_qty >= k_qty:
-        _safe(ftl.book_polymarket_fill, STRATEGY, cand.get("poly_slug"), body["intent"], p_ack,
-              intended_source="live", fallback_price=float(cand.get("raw_poly")),
-              fallback_size=p_qty)
-        return _row(cand, "BOTH_FILLED", orders=orders, filled=True, both_filled=True, k_qty=k_qty,
-                    p_qty=p_qty, **base)
-    if p_ack.get("id"):
-        _safe(poly.cancel_order, p_ack.get("id"))
-    if k_oid:
-        _safe(kalshi.cancel_order, k_oid, tk)
-    unmatched = k_qty - p_qty
-    # filled=True: leg-1 exposure exists, so it counts toward the daily exposure limit.
-    kw = dict(orders=orders, filled=True, both_filled=False, k_qty=k_qty, p_qty=p_qty,
-              unmatched=unmatched, error=err,
-              leg1_cancelled=bool(k_oid), leg2_cancelled=bool(p_ack.get("id")), **base)
-    if hedge_fn is not None:
-        h = _safe(hedge_fn, tk, kside, unmatched)
-        return _row(cand, "LEG2_FAILED_LEG1_HEDGED" if h is not None else
-                    "LEG2_FAILED_LEG1_UNHEDGED", hedge=h, alert=h is None, **kw)
-    return _row(cand, "LEG2_FAILED_LEG1_UNHEDGED", alert=True, **kw)
+        st["err"] = str(e)[:120]
+    if st["p_qty"] >= k_qty:
+        _book_poly(ftl, cand, body, st["p_ack"], st["p_qty"], p_pay)
+        return _row(cand, "BOTH_FILLED", orders=st["orders"], filled=True, both_filled=True,
+                    k_qty=k_qty, p_qty=st["p_qty"], **base)
+    if st["p_ack"].get("id"):
+        _safe(poly.cancel_order, st["p_ack"]["id"])
+        get = poly_fills_fn or (lambda: poly.get_order(st["p_ack"]["id"]))
+        fill, pay = ftl.resolve_polymarket_fill(st["p_ack"], get)  # final read after the cancel
+        if pay is not None:
+            p_pay = pay
+            st["p_qty"] = int(float(fill.get("qty") or 0)) if fill.get("complete") else 0
+    _book_poly(ftl, cand, body, st["p_ack"], st["p_qty"], p_pay)
+    return _unwind(cand, ctx, kalshi, poly, hedge_fn, st, base, "LEG2_FAILED", cancel_poly=False)
+
+
+def _unwind(cand, ctx, kalshi, poly, hedge_fn, st, base, prefix, cancel_poly=True):
+    """Cancel leg 2 + leg-1 remainder, hedge unmatched leg-1 contracts, alert if unhedged."""
+    tk = cand.get("kalshi_ticker")
+    p_id = (st.get("p_ack") or {}).get("id")
+    if cancel_poly and p_id:
+        _safe(poly.cancel_order, p_id)
+    if st.get("k_oid"):
+        _safe(kalshi.cancel_order, st["k_oid"], tk)
+    k_qty = st.get("k_qty")
+    unmatched = None if k_qty is None else max(0, k_qty - int(st.get("p_qty") or 0))
+    # filled=True: leg-1 exposure exists (or is unknown), so it counts toward daily exposure.
+    kw = dict(orders=st["orders"], filled=True, both_filled=False, k_qty=k_qty,
+              p_qty=st.get("p_qty"), unmatched=unmatched, error=st.get("err", ""),
+              leg1_cancelled=bool(st.get("k_oid")), leg2_cancelled=bool(p_id), **base)
+    if unmatched == 0:
+        return _row(cand, prefix + "_LEG1_MATCHED", alert=True, **kw)
+    h = _safe(hedge_fn, tk, ctx["kopp"]["side"], unmatched) if (hedge_fn and unmatched) else None
+    return _row(cand, prefix + ("_LEG1_HEDGED" if h is not None else "_LEG1_UNHEDGED"),
+                hedge=h, alert=h is None, **kw)
 
 
 def _safe(fn, *a, **k):
@@ -296,10 +363,11 @@ def _safe(fn, *a, **k):
         return None
 
 
-def promote(cand, env=None, now=None, **exec_kw):
-    """Gate, then (only if every gate passes) execute both legs. Always returns a row."""
+def promote(cand, env=None, now=None, paper_row=None, ornith_post=None, **exec_kw):
+    """Gate, then (only if every gate passes) execute both legs. Always returns a row; every
+    executed row (incl. errors after leg 1) is appended to the live log, so exposure counts."""
     try:
-        ok, why, ctx = gates(cand, env=env, now=now)
+        ok, why, ctx = gates(cand, env=env, now=now, paper_row=paper_row, ornith_post=ornith_post)
     except Exception as e:
         ok, why, ctx = False, "gate_error:" + type(e).__name__, {}
     if not ok:
@@ -307,9 +375,13 @@ def promote(cand, env=None, now=None, **exec_kw):
         if ctx.get("nimble"):
             row["nimble"] = ctx["nimble"]
         return row
-    row = execute(cand, ctx, env=env, **exec_kw)
+    try:
+        row = execute(cand, ctx, env=env, **exec_kw)
+    except Exception as e:  # defensive: execute itself does not raise after leg 1
+        row = _row(cand, "EXECUTE_ERROR", filled=True, alert=True, exposure_unknown=True,
+                   error="%s: %s" % (type(e).__name__, str(e)[:100]), size_usd=ctx.get("size"))
     row["reason"] = "pass"
-    _append(ctx["log"], row)
+    _safe(_append, ctx["log"], row)
     return row
 
 
