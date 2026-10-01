@@ -7,18 +7,14 @@ Usage:
     python3 claude_bridge.py "What is my expected profit next week?"
     python3 claude_bridge.py --question-b64 <base64> --router   (claude_router.sh)
 
-MONEY ACCURACY BY CONSTRUCTION (allowlist, not blacklist):
-  * Figures come ONLY from a code-built facts block: each figure read twice from
-    its source (broker balance, broker positions, fee-incl. ledger), kept only if
-    both reads parse, agree and are fresh; else "omitted — <reason>" (never $0.00).
-    Signs/rounding via signal_verify.money (no "-$0.00"; negatives "−$5.00").
-  * The model's text becomes an optional "AI note (wording only — no figures, see
-    facts below)": only WHOLE sentences that are plain ASCII letters/punctuation,
-    with no numeric-lexicon root, roman/leet token or money/direction word survive
-    (ai_note). Nothing survives -> no note. Over-blocking is intended.
-  * The facts block is computed first and never truncated; the note gets the rest
-    of BUDGET_BYTES (UTF-8 bytes — the unit claude_router.sh relays). If the facts
-    block alone exceeds the budget the answer is withheld.
+MODEL TEXT NEVER REACHES SIGNAL. Free model wording cannot be verified, so the
+Signal message is ONLY the code-built facts block (each figure read twice from its
+source — broker balance, broker positions, fee-incl. ledger — kept only if both reads
+parse, agree and are fresh, else "omitted — <reason>", never $0.00; formatting via
+signal_verify.money) plus one fixed line:
+  "AI answer not sent to Signal (model wording cannot be verified) — full text saved: <path>"
+The full answer is saved to data/signal/ai_answers/<ts>.txt (gitignored) and printed
+locally (stdout without --router; stderr with --router, which the router drops).
 --router prints "VALEDIA-GATE <status> <sha256>" first; exit 0 verified, 3 withheld,
 4 other. claude_router.sh relays only on a matching header + exit code.
 
@@ -28,10 +24,8 @@ import argparse
 import base64
 import json
 import os
-import re
 import subprocess
 import sys
-import unicodedata
 from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,8 +33,7 @@ CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
 MODELS_DIR = os.path.expanduser("~/.openclaw/workspace/models")
 SCRIPTS_DIR = os.path.expanduser("~/.openclaw/workspace/scripts/integrations")
 FOOTER = "✓ figures from broker/ledger only"
-NOTE_LABEL = "AI note (wording only — no figures, see facts below):"
-BUDGET_BYTES = 1400  # whole relayed text incl. footer, UTF-8 bytes (router sends as-is)
+AI_LINE = "AI answer not sent to Signal (model wording cannot be verified) — full text saved: "
 EXIT = {"verified": 0, "withheld": 3}  # anything else (error/dedupe) -> 4: router won't relay
 
 
@@ -82,7 +75,7 @@ def verified_facts(get=None, get_positions=None, ledger=None, now=None):
         fr, _ = sv.broker_fresh(s1)
         if abs(s1["invested"] - s2["invested"]) > sv.CENT or s1["n"] != s2["n"]:
             f["why"]["positions"] = "re-read disagreed"
-        elif any((now - sv.parse_ts(x["ts"])).total_seconds() > x["max_age_s"] for x in fr):
+        elif fr and (lambda ev: ev["problems"] or ev["stale"])(sv.evaluate("", (), fr, now)):
             f["why"]["positions"] = "STALE"
         else:
             f["positions"] = {"invested": (s1["invested"], s2["invested"]), "n": (s1["n"], s2["n"])}
@@ -146,63 +139,6 @@ def facts_block(f):
     return lines, claims
 
 
-# ── AI note: ALLOWLIST of figure-free sentences ────────────────────────────────
-# A sentence survives only if, after NFKC, it is (a) ASCII letters/space/basic
-# punctuation only (no digit, symbol or non-ASCII char), (b) has no numeric-lexicon
-# root (joined, suffixed, ordinal, multiplicative, slang forms), (c) no roman-numeral
-# or leet token, (d) no money/direction word. Over-blocking is intended.
-_SAFE_CHARS = re.compile(r"[A-Za-z .,;:!?'\"()/-]*")
-_LEXICON = re.compile(
-    r"zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thir|fif|teen|twent"
-    r"|ty\b|forty|hundred|thousand|million|billion|trillion|dozen|score|half|halv|quarter|third"
-    r"|double|doubl|tripl|quadr|quint|fold|couple|pair|grand|fiver|tenner|c-note|nickel|dime"
-    r"|penny|pennies|cent|buck|quid|\bk\b|\bm\b|\bbn\b|\bmm\b|nil\b|nought|naught|gross|lakh"
-    r"|crore|single|first|second|benjamin|percent|\bpct\b|\bbps\b|illion"
-    # common es/pt/fr/de/it number roots (ASCII spellings; accented ones are non-ASCII)
-    r"|\buno\b|\buna\b|\bdos\b|\btres\b|cuatro|cinco|\bseis\b|siete|\bocho\b|nueve|\bdiez\b"
-    r"|veinte|cien|\bmil\b|\bdeux\b|trois|quatre|\bcinq\b|\bsept\b|\bhuit\b|\bneuf\b|\bdix\b"
-    r"|vingt|mille|\beins\b|zwei|\bdrei\b|\bvier\b|\bfunf\b|sechs|sieben|\bacht\b|\bneun\b"
-    r"|\bzehn\b|zwanzig|hundert|tausend|\bdue\b|\btre\b|quattro|\bsei\b|sette|\botto\b|\bnove\b"
-    r"|dieci|venti|cento|\bmila\b|\bdez\b|\bvinte\b|\bcem\b")
-_MONEY_DIR = re.compile(
-    r"\b(?:profit|loss|lost|los[ei]ng|gain|earn|made|make|making|up\b|down|return|pnl|p&l|p/l"
-    r"|balanc|cash|invest|equit|payout|worth|valu|money|dollar|usd|pric|cost|fee|win|won\b"
-    r"|green|red\b|rich|broke|great|bank|fund|capital|pay|paid|spen[dt]|stake|exposure|revenue"
-    r"|income|interest|roi\b|yield|odds|bet\b|bets\b|wager|account|portfolio|total|sum\b|amount|net\b)")
-_ROMAN_TOKEN = re.compile(r"\b[ivxlcdm]{2,}\b", re.I)
-
-
-def _leet(tok):
-    return bool(re.search(r"[a-z][A-Z]", tok)) or (
-        len(tok) > 1 and tok.isupper() and set(tok) <= set("OISZBGLT"))
-
-
-def _sentence_ok(s):
-    low = s.lower()
-    return bool(s.strip()) and _SAFE_CHARS.fullmatch(s) is not None \
-        and not _LEXICON.search(low) and not _MONEY_DIR.search(low) \
-        and not _ROMAN_TOKEN.search(s) and not any(_leet(t) for t in re.findall(r"[A-Za-z]+", s))
-
-
-def ai_note(text, budget_bytes):
-    """(note, kept, dropped): whole figure-free sentences within budget_bytes (UTF-8).
-    Belt and braces: any numeral / number word left -> drop the whole note."""
-    import signal_verify as sv
-    t = unicodedata.normalize("NFKC", str(text or ""))
-    sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+|[\r\n  \x85]+", t) if x.strip()]
-    kept, used = [], 0
-    for x in sents:
-        need = len(x.encode()) + (1 if kept else 0)
-        if not _sentence_ok(x) or used + need > budget_bytes:
-            continue
-        kept.append(x)
-        used += need
-    note = " ".join(kept)
-    if note and (sv.scrub_numbers(note)[1] or sv.has_numerals(note)):
-        return "", 0, len(sents)
-    return note, len(kept), len(sents) - len(kept)
-
-
 def get_portfolio_context(facts=None, models_dir=None, **kw):
     """Context for the model (it may read numbers; its own text never carries any)."""
     facts = facts if facts is not None else verified_facts(**kw)
@@ -225,9 +161,8 @@ def get_portfolio_context(facts=None, models_dir=None, **kw):
     except Exception as e:
         parts.append(f"[INFO] PAUSED: registry unavailable ({type(e).__name__})")
     parts.append(f"[INFO] TIMESTAMP: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    parts.append("[RULE] Write plain English with NO numbers, amounts or money words. "
-                 "The system appends the verified figures itself; sentences with numbers "
-                 "or money words are dropped.")
+    parts.append("[RULE] Your answer is shown to Burton locally only; Signal gets the "
+                 "verified facts above, never your wording.")
     return "\n".join(parts)
 
 
@@ -256,30 +191,33 @@ def ask_claude(question, with_data=False, model="sonnet", context=None):
 
 
 # ── gate ─────────────────────────────────────────────────────────────────────
-def gate_answer(question, response, facts, send=False, send_fn=None, now=None,
-                budget_bytes=BUDGET_BYTES):
-    """Facts block first (never truncated), then an allowlisted AI note in the bytes
-    left. Facts alone over budget -> withheld. Never raises."""
+def save_answer(question, response, now=None):
+    """Full model answer -> data/signal/ai_answers/<ts>.txt (local only). Path or None."""
+    import signal_verify as sv
+    now = now or sv.utcnow()
+    try:
+        d = os.path.join(sv.signal_dir(), "ai_answers")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, now.strftime("%Y%m%dT%H%M%S%fZ") + ".txt")
+        with open(path, "w") as f:
+            f.write(f"Q: {question}\n\n{response}\n")
+        return path
+    except Exception:
+        return None
+
+
+def gate_answer(question, response, facts, send=False, send_fn=None, now=None):
+    """Signal text = code-built facts block + one fixed line (+ footer). No model text.
+    The facts' figures are verified (two reads agree) by signal_verify.deliver."""
     import hashlib
     import signal_verify as sv
     lines, claims = facts_block(facts or {"why": {}})
-    facts_txt = "\n".join(lines)
-    fixed = _wire_len(facts_txt + "\n" + FOOTER)
-    problems = []
-    if fixed > budget_bytes:
-        problems.append({"code": "facts block exceeds message budget", "detail": fixed})
-    room = budget_bytes - fixed - _wire_len(NOTE_LABEL + "\n\n")
-    note, kept, dropped = ai_note(response, max(0, room))
-    body = f"{NOTE_LABEL}\n{note}\n\n{facts_txt}" if note else facts_txt
+    path = save_answer(question, response, now)
+    body = "\n".join(lines + [AI_LINE + (path or "(save failed, see bridge stdout)")])
     key = hashlib.sha1(f"{question}|{response}".encode()).hexdigest()
     return sv.deliver("AI answer", body, claims, send_fn=send_fn, now=now, dedupe_key=key,
-                      dedupe_window_s=600, transport=send, problems=problems,
-                      verified_line=FOOTER, info={"note_kept": kept, "note_dropped": dropped})
-
-
-def _wire_len(s):
-    """UTF-8 bytes as relayed (claude_router.sh rewrites "$" as "USD ")."""
-    return len(s.replace("$", "USD ").encode())
+                      dedupe_window_s=600, transport=send, verified_line=FOOTER,
+                      info={"answer_path": path})
 
 
 def gate_header(status, text):
@@ -306,7 +244,11 @@ def run(args, ask=None, facts_fn=None):
     status = res["status"] if res["status"] in EXIT else "error"
     if getattr(args, "router", False):
         print(gate_header(status, text))
-    print(text)
+        print(text)
+        print(f"[model answer, local only]\n{response}", file=sys.stderr)
+    else:
+        print(text)
+        print(f"\n[model answer, local only — not sent to Signal]\n{response}")
     return EXIT.get(status, 4)
 
 

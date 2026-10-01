@@ -22,23 +22,39 @@ def _fenced(ke, o):
         return False
 
 
+def _req(x, what):
+    """Strict number (signal_verify.num) or ValueError: missing / None / NaN / inf /
+    garbage / renamed inputs make the brief withheld, never a 0.00 figure."""
+    import signal_verify as sv
+    v = sv.num(x)
+    if v is None:
+        raise ValueError(f"{what} missing or unparseable")
+    return v
+
+
+def _fit(state):
+    return min(max(0.0, _req(state.get("balance"), "balance")),
+               max(0.0, _req(state.get("max_deployable"), "max_deployable")))
+
+
 def modeled_picks(ke, state, opps):
     """Same pick order as opportunity_report; unfenced dry-run sims that fit cash."""
-    remaining = min(max(0.0, float(state.get("balance") or 0)),
-                    max(0.0, float(state.get("max_deployable") or 0)))
+    remaining = _fit(state)
     picks = []
     for strat in STRATS:
         for o in [x for x in opps if x.get("strategy") == strat][:5]:
             if _fenced(ke, o):
                 continue
             sim = ke.execute_trade(o, state, dry_run=True)
-            cost = float(sim.get("total_cost") or 0)
-            if sim.get("status") != "DRY_RUN" or cost <= 0 or cost > remaining + 1e-9:
+            if sim.get("status") != "DRY_RUN":
+                continue
+            cost = _req(sim.get("total_cost"), "sim cost")
+            if cost <= 0 or cost > remaining + 1e-9:
                 continue
             remaining -= cost
-            picks.append({"ticker": o["ticker"], "contracts": sim["contracts"],
-                          "edge": float(o["edge"]), "cost": cost,
-                          "upside": float(sim.get("potential_profit") or 0)})
+            picks.append({"ticker": o["ticker"], "contracts": _req(sim.get("contracts"), "contracts"),
+                          "edge": _req(o.get("edge"), "edge"), "cost": cost,
+                          "upside": _req(sim.get("potential_profit"), "sim upside")})
     return picks
 
 
@@ -67,10 +83,10 @@ def _brief(sv, kind, ke, get_positions, send_fn, now, state, opps):
         print("[kalshi_alert] no positive modeled upside — nothing sent")
         return {"status": "not_hot", "sent": False, "text": ""}
     body = (f"Valedia 7am brief — Kalshi\n"
-            f"Invested: {snap['invested']:,.2f} (Kalshi open-position cost, broker)\n"
-            f"Modeled if-all-win: {upside:+,.2f} ({len(picks)} picks that fit cash, fee-incl. sim)"
+            f"Invested: {sv.money(snap['invested'])} (Kalshi open-position cost, broker)\n"
+            f"Modeled if-all-win: {sv.money(upside, signed=True)} ({len(picks)} picks that fit cash, fee-incl. sim)"
             f" — not profit, not EV, not fills")
-    fit = min(max(0.0, float(state.get("balance") or 0)), max(0.0, float(state.get("max_deployable") or 0)))
+    fit = _fit(state)
     claims = [sv.claim("Invested", snap["invested"], snap2["invested"], "broker re-read"),
               sv.claim("Modeled if-all-win", upside,
                        sum(p["contracts"] * p["edge"] for p in picks), "contracts x edge", tol=0.01),

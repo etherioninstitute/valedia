@@ -23,8 +23,17 @@ def settled_at(s):
 
 
 def pnl_report(get_positions=None, ledger=None, send_fn=None, now=None):
-    """11pm P&L: Invested (broker) + Profit (ledger realized, fee-incl.)."""
-    kind, now = "11pm P&L", now or sv.utcnow()
+    """11pm P&L: Invested (broker) + Profit (ledger realized, fee-incl.). Never sends
+    nothing: any unexpected error -> one withheld notice."""
+    now = now or sv.utcnow()
+    try:
+        return _pnl_report(get_positions, ledger, send_fn, now)
+    except Exception as e:
+        return sv.withhold("11pm P&L", "report failed", f"{type(e).__name__}: {e}", send_fn, now)
+
+
+def _pnl_report(get_positions, ledger, send_fn, now):
+    kind = "11pm P&L"
     ledger = ledger or sv.read_ledger
     try:
         recs, snap = ledger(), sv.broker_snapshot(get_positions, now)

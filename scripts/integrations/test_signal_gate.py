@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_signal_senders_rest as rest  # installs the relay booby-traps + temp signal dir
 import signal_verify as sv
+import pnl_run
 import kalshi_alert as ka
 
 NOW = datetime(2026, 10, 1, 23, 0, tzinfo=timezone.utc)
@@ -32,10 +33,10 @@ class Sender(rest.Sender):
 
 def test_detector_flags_every_adversarial_string():
     for s in ADVERSARIAL:
-        assert sv.has_money(s), s
+        assert bool(sv.money_tokens(s)), s
     for s in ("scan ok v0.74.1 host 100.125.9.30 12 markets", "Cron log is 130 min stale (>2h)",
               "You have 3 open bets", "Report at 23:00 UTC on 2026-10-01", "Cash App ready"):
-        assert not sv.has_money(s), s
+        assert not bool(sv.money_tokens(s)), s
 
 
 def rest_positions(exp):
@@ -72,35 +73,35 @@ def test_pnl_staleness_broker_and_ledger():
     pos = lambda vts: (lambda: {"ts": vts, "market_positions": [  # noqa: E731
         {"ticker": "KXA", "position_fp": "1", "market_exposure_dollars": "2.00"}]})
     send = Sender()  # venue timestamp fresh -> footer uses it, no STALE
-    r = sv.pnl_report(get_positions=pos((NOW - timedelta(minutes=2)).isoformat()),
+    r = pnl_run.pnl_report(get_positions=pos((NOW - timedelta(minutes=2)).isoformat()),
                       ledger=lambda: _ledger_rows(timedelta(hours=3)), send_fn=send, now=NOW)
     assert r["status"] == "verified" and "broker 22:58 UTC" in send.msgs[0], send.msgs
     assert "STALE" not in send.msgs[0]
     rest._fresh_dir()
     send = Sender()  # venue timestamp old -> withheld
-    r = sv.pnl_report(get_positions=pos((NOW - timedelta(hours=2)).isoformat()),
+    r = pnl_run.pnl_report(get_positions=pos((NOW - timedelta(hours=2)).isoformat()),
                       ledger=lambda: _ledger_rows(timedelta(hours=3)), send_fn=send, now=NOW)
     assert r["status"] == "withheld" and "broker data STALE" in send.msgs[0], send.msgs
     rest._fresh_dir()
     send = Sender()  # 30-day-old ledger -> never plain verified
-    r = sv.pnl_report(get_positions=pos(None), ledger=lambda: _ledger_rows(timedelta(days=30)),
+    r = pnl_run.pnl_report(get_positions=pos(None), ledger=lambda: _ledger_rows(timedelta(days=30)),
                       send_fn=send, now=NOW)
     assert send.msgs[0].startswith("⚠ STALE: ledger data is 30d"), send.msgs
     assert "broker time unknown" in send.msgs[0]
     rest._fresh_dir()
     send = Sender()  # 2 days quiet with an open position -> STALE (36h rule)
-    sv.pnl_report(get_positions=pos(None), ledger=lambda: _ledger_rows(timedelta(days=2)),
+    pnl_run.pnl_report(get_positions=pos(None), ledger=lambda: _ledger_rows(timedelta(days=2)),
                   send_fn=send, now=NOW)
     assert send.msgs[0].startswith("⚠ STALE: ledger data is 2d"), send.msgs
     rest._fresh_dir()
     send = Sender()  # 2 days quiet, NO open positions -> fine (7d rule)
-    sv.pnl_report(get_positions=lambda: {"market_positions": []},
+    pnl_run.pnl_report(get_positions=lambda: {"market_positions": []},
                   ledger=lambda: _ledger_rows(timedelta(days=2)), send_fn=send, now=NOW)
     assert "STALE" not in send.msgs[0], send.msgs
     rest._fresh_dir()
     send = Sender()  # ledger without any timestamp -> STALE + "ledger time unknown"
     rows = [{k: v for k, v in r.items() if k != "logged_at"} for r in _ledger_rows(timedelta(0))]
-    sv.pnl_report(get_positions=pos(None), ledger=lambda: rows, send_fn=send, now=NOW)
+    pnl_run.pnl_report(get_positions=pos(None), ledger=lambda: rows, send_fn=send, now=NOW)
     assert send.msgs[0].startswith("⚠ STALE: ledger") and "ledger time unknown" in send.msgs[0]
 
 

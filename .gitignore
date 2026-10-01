@@ -37,3 +37,4 @@ tools/neural-trader/node_modules/
 data/systemone/*.jsonl
 data/calibration/
 data/signal/*.jsonl
+data/signal/ai_answers/

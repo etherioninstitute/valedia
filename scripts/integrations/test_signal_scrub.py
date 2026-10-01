@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Money accuracy by construction: the AI note is an ALLOWLIST of figure-free sentences.
+"""Model text never reaches Signal: the AI-answer message is the code-built facts block
+plus one fixed line (and the gate footer), whatever the model wrote.
 
-Replays every string from the verifier harnesses (v9 strings.txt, adv2/prev/snd, v11
-a1/a2/a3 + scrub_attack) and a generated corpus (600 random lexicon / emoji /
-homoglyph / foreign / leet combinations): the AI note never carries a numeral, a
-numeric-lexicon form or a money/direction word; the code-built facts block stays
-intact (also under multi-byte-heavy answers, byte budget). Legacy cron_runner.sh
-sends fixed lines with allowlisted labels only; watchdog free text is scrubbed;
-claude_router.sh passes the question base64 (injection-safe) and never prints raw
-bridge output. Facts robustness / formatting / pagination: test_signal_facts.py.
+Replays every string from the verifier harnesses (v9, v11, v12 a1-a4 + note_attack
+cases, scrub_attack) and a generated corpus (600 lexicon / emoji / homoglyph /
+foreign / slang combinations): the Signal body equals facts lines + fixed line +
+footer exactly; the full answer is saved locally. Legacy cron_runner.sh sends fixed
+lines with allowlisted labels only; watchdog free text is scrubbed; claude_router.sh
+passes the question base64 (injection-safe) and never prints raw bridge output.
 Fakes only: no network, no keys, no orders, real relay booby-trapped.
 Run: python3 test_signal_scrub.py
 """
@@ -145,22 +144,27 @@ SCRUB_ATTACK = [
     "ⅠⅡ", "١٠٠", "۱۰۰", "१००", "௧௦௦", "一百", "壹佰", "肆", "拾", "佰", "仟", "萬", "億", "兆",
     "twénty", "ꓔen", "cinco", "lOO", "SOO", "IO", "dos", "tres", "cuatro", "vingt", "zwei",
 ]
-# every piece that would carry a figure; none may appear in a surviving AI note
-PIECES = ["🔟", "💯", "twentyfive", "fivehundred", "tenfold", "fiver", "tenner", "c-note", "xii",
-          "xlii", "mcm", "twénty", "ꓔen", "lOO", "$", "cinco", "dos", "tres", "zwei", "vingt",
-          "dozen", "grand", "nickel", "dime", "penny", "half", "quarter", "couple", "score",
-          "gross", "million", "thousand", "hundred", "seventy", "forty", "fortytwo", "nil",
-          "benjamin", "1", "5", "0", "twelve", "eleven", "thirteen"]
+NOTE_ATTACK = [
+    "You are ahead.", "Your holdings grew.", "The account grew.", "A nice haul today.", "You broke even.",
+    "You are in the black.", "You are in the red.", "You made a small fortune.", "A handful of trades hit.",
+    "Several trades settled in your favor.", "Dozens of trades settled.", "You will lose.",
+    "Your holdings rose twice over.", "Your holdings rose by a googol.", "Your holdings rose by a G.",
+    "Your holdings rose by F I V E.", "Your holdings rose by f-i-f-t-y.", "Ganaste cincuenta dolares.",
+    "Du hast dreissig Euro gewonnen.", "Vous avez gagne quarante euros.", "Hai guadagnato cinquanta euro.",
+    "Je hebt twintig euro verdiend.", "Kazandin elli lira.", "Ni lipata elfu moja.",
+    "Anda untung lima puluh ribu rupiah.", "Ichi man en moketa.", "Your holdings rose by a monkey.",
+    "Your holdings rose by a pony.", "A bundle came in today.", "You doubled up.", "You quadrupled.",
+    "Burton, you crushed it today and came out well ahead.", "Everything looks great.",
+    "You are ahead today. Your holdings grew. Ganaste cincuenta dolares. Your holdings rose by f-i-f-t-y.",
+    "Your holdings look healthy and you are ahead of where you were. " * 40, "x" * 5000,
+    "Burton, you came out well ahead this week and your holdings grew nicely. Every trade went "
+    "your way, so you are in the black.",
+]
 _NUMW = ["twelve", "twentyfive", "fivehundred", "tenfold", "fiver", "tenner", "C-note", "xlii",
-         "XII", "a grand", "a dozen", "half", "a quarter", "a couple", "four score", "a gross",
-         "cinco", "dos", "tres", "zwei", "vingt", "🔟", "💯", "1️⃣", "twénty", "ꓔen", "$lOO", "lOO",
-         "SOO", "1OO", "١٢", "１２", "¹²", "½", "Ⅻ", "十二", "nil", "forty", "seventy-two",
-         "thirteen", "eleven", "millionish", "a benjamin", "a nickel", "a dime", "a penny",
-         "fortytwo", "twelvefold", "doubled", "tripled"]
-_MONEYW = ["dollars", "bucks", "USD", "profit", "cash", "", "", "in the green", "up", "net",
-           "returns", "earned", "worth", "value", "equity", "payout", "", "quid", "cents"]
-_TMPL = ["You made {n} {m}.", "{n} {m}", "Your {m} is {n}.", "It grew {n}!", "{n}.",
-         "Things look {n} {m} today.", "We are {n}", "Result {n}", "{m} {n}", "about {n}"]
+         "a grand", "a dozen", "half", "cinco", "zwei", "🔟", "💯", "twénty", "ꓔen", "$lOO", "١٢",
+         "１２", "½", "Ⅻ", "十二", "a monkey", "a pony", "a googol", "ahead", "in the black"]
+_MONEYW = ["dollars", "bucks", "USD", "profit", "cash", "", "in the green", "up", "net", "euros"]
+_TMPL = ["You made {n} {m}.", "{n} {m}", "Your {m} is {n}.", "It grew {n}!", "{n}.", "about {n}"]
 
 
 def _corpus(k=600, seed=7):
@@ -172,11 +176,12 @@ def _corpus(k=600, seed=7):
 
 
 def _all_strings():
-    out = list(V9_STRINGS) + V11 + SCRUB_ATTACK
-    for d in ("v9/strings.txt", "v11/a1.txt", "v11/a2.txt", "v11/a3.txt"):
-        p = "/tmp/claude-0/-home-user-valedia/0f09ea09-13bd-5223-9832-3fd22d8ba606/scratchpad/" + d
-        if os.path.exists(p):  # replay the verifiers' own files too, when present
-            for s in open(p).read().split("\n=====\n"):
+    out = list(V9_STRINGS) + V11 + SCRUB_ATTACK + NOTE_ATTACK
+    base = "/tmp/claude-0/-home-user-valedia/0f09ea09-13bd-5223-9832-3fd22d8ba606/scratchpad/"
+    for d in ("v9/strings.txt", "v11/a1.txt", "v11/a2.txt", "v11/a3.txt",
+              "v12/a1.txt", "v12/a2.txt", "v12/a3.txt", "v12/a4.txt"):
+        if os.path.exists(base + d):  # replay the verifiers' own files too, when present
+            for s in open(base + d).read().split("\n=====\n"):
                 s = s.strip("\n").replace("\\u2028", " ").replace("\\u200b", "​")
                 if s:
                     out.append(s)
@@ -201,57 +206,43 @@ class Sender(rest.Sender):
     pass
 
 
-def _assert_clean_note(note, src):
-    assert not _numerals(note) and sv.scrub_numbers(note)[1] == 0, (src, note)
-    assert all(32 <= ord(c) < 127 for c in note), (src, note)
-    assert not cb._MONEY_DIR.search(note.lower()) and not cb._LEXICON.search(note.lower()), (src, note)
-    import re
-    for p in PIECES:
-        if p.isalpha() and p != p.lower() and p != p.upper():
-            assert p not in note, (src, p, note)  # leet / mixed case: exact
-        elif p.isalpha():
-            assert not re.search(r"(?<![a-z])" + re.escape(p) + r"(?![a-z])", note, re.I), (src, p, note)
-        else:
-            assert p not in note, (src, p, note)
-
-
-def test_ai_note_allowlist_every_string_and_corpus():
-    rest._fresh_dir()
+def test_signal_body_is_facts_plus_fixed_line_only():
+    d = rest._fresh_dir()
     strings = _all_strings() + _corpus()
     assert len(strings) >= 800, len(strings)
-    kept_any = 0
     for i, s in enumerate(strings):
-        for text in (s, "The slate looks calm tonight. " + s, s + "\nNothing else to note."):
-            note, kept, _ = cb.ai_note(text, 1000)
-            _assert_clean_note(note, text)
-            kept_any += bool(kept)
         send = Sender()
-        r = cb.gate_answer(f"q{i}", s, _facts(), send=True, send_fn=send, now=NOW)
+        now = NOW + timedelta(seconds=i)
+        r = cb.gate_answer(f"q{i}", s, _facts(), send=True, send_fn=send, now=now)
         assert r["status"] == "verified", (s, r)
-        t = send.msgs[0]
-        head, facts = t.split("Facts (code-generated", 1)
-        _assert_clean_note(head.replace(cb.NOTE_LABEL, "").strip("\n"), s)
-        assert ["Facts (code-generated" + facts.splitlines()[0]] + facts.splitlines()[1:5] == FACT_LINES, t
-        assert t.endswith("✓ figures from broker/ledger only"), t
-    assert kept_any > 100  # benign wording still gets through
-
-
-def test_legit_note_and_multibyte_budget():
-    rest._fresh_dir()
+        path = os.path.join(d, "ai_answers", now.strftime("%Y%m%dT%H%M%S%fZ") + ".txt")
+        want = FACT_LINES + [cb.AI_LINE + path, cb.FOOTER]
+        assert send.msgs[0].split("\n") == want, (s, send.msgs[0])
+        assert open(path).read() == f"Q: q{i}\n\n{s}\n"  # full answer kept locally only
+    # sources failing -> still facts-only (figures omitted), never model text
+    bad = {"why": {"cash": "unavailable", "positions": "STALE", "ledger": "re-read disagreed"}}
     send = Sender()
-    cb.gate_answer("ok", "The slate looks calm tonight. Nothing else to note.", _facts(),
-                   send=True, send_fn=send, now=NOW)
-    assert send.msgs[0].startswith(cb.NOTE_LABEL + "\nThe slate looks calm tonight. Nothing else to note.")
-    for heavy in ("🚀" * 5000, "你好" * 3000 + ". The slate looks calm.",
-                  ("Calm night ahead. " * 400), "é" * 9000):
-        send = Sender()
-        r = cb.gate_answer("h" + heavy[:9], heavy, _facts(), send=True, send_fn=send, now=NOW)
-        t = send.msgs[0]
-        assert r["status"] == "verified" and all(l in t for l in FACT_LINES), t
-        assert cb._wire_len(t) <= cb.BUDGET_BYTES, cb._wire_len(t)
-    send = Sender()  # facts block alone over budget -> withheld, never truncated
-    r = cb.gate_answer("tiny", "ok", _facts(), send=True, send_fn=send, now=NOW, budget_bytes=60)
-    assert r["status"] == "withheld" and "facts block exceeds message budget" in send.msgs[0]
+    cb.gate_answer("bad", "You made $124 profit", bad, send=True, send_fn=send, now=NOW)
+    assert "124" not in send.msgs[0] and "profit" not in send.msgs[0].lower(), send.msgs
+    assert "Cash (broker): omitted — unavailable" in send.msgs[0]
+
+
+def test_bridge_stdout_router_mode_keeps_model_text_off_relay():
+    import contextlib
+    import io
+    rest._fresh_dir()
+    args = types.SimpleNamespace(question="q", no_data=True, model="sonnet", signal=False, router=True)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cb.run(args, ask=lambda *a, **k: "You made twelve dollars profit", facts_fn=_facts)
+    lines = out.getvalue().rstrip("\n").split("\n")
+    assert rc == 0 and lines[0] == cb.gate_header("verified", "\n".join(lines[1:])), lines
+    assert "twelve" not in out.getvalue() and "twelve" in err.getvalue()
+    args.router = False
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cb.run(args, ask=lambda *a, **k: "Local wording.", facts_fn=_facts)
+    assert "[model answer, local only — not sent to Signal]\nLocal wording." in out.getvalue()
 
 
 def test_cron_runner_label_allowlist_matches_install_cron():
@@ -304,12 +295,11 @@ def test_router_question_injection_and_apostrophes():
         assert r.stdout.strip() == "Report withheld (claude router): bridge output was not " \
             "signal_verify-gated. Unverified figures not sent; see data/signal/verify_log.jsonl.", r.stdout
     # a long multi-byte gated text is relayed whole (no byte cap in the router)
-    big = cb.NOTE_LABEL + "\n" + ("Calm. " * 300).strip() + "\n\n" + "\n".join(FACT_LINES) + \
-        "\n✓ figures from broker/ledger only"
+    big = "\n".join(FACT_LINES + [cb.AI_LINE + "/x/" + "é" * 900 + ".txt", cb.FOOTER])
     ssh2 = "cat <<'EOF'\n" + cb.gate_header("verified", big) + "\n" + big + "\nEOF\nexit 0\n"
     r, sent, _ = rest._run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
                               {"ssh": ssh2, "openclaw": rest._OPENCLAW})
-    assert "Realized P&L (ledger, fee-incl.): −USD 5.00 (2W/3L)" in sent and "✓ figures" in sent, sent
+    assert "Realized P&L (ledger, fee-incl.): −USD 5.00 (2W/3L)" in sent and "é" * 900 in sent, sent
 
 
 def test_cron_runner_only_fixed_lines_for_every_string():
@@ -332,8 +322,8 @@ def test_watchdog_free_text_scrubbed_for_every_string():
 
 
 if __name__ == "__main__":
-    test_ai_note_allowlist_every_string_and_corpus()
-    test_legit_note_and_multibyte_budget()
+    test_signal_body_is_facts_plus_fixed_line_only()
+    test_bridge_stdout_router_mode_keeps_model_text_off_relay()
     test_cron_runner_label_allowlist_matches_install_cron()
     test_router_question_injection_and_apostrophes()
     test_cron_runner_only_fixed_lines_for_every_string()
