@@ -48,16 +48,8 @@ CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
 # ═══ INTELLIGENCE SOURCES ═══
 # These were all sitting idle. Now they boost every bet.
 
-def get_mirofish_bias():
-    """Swarm mood only when the live file is fresh and not near-neutral."""
-    try:
-        import mirofish_intel_archive as _mia
-        mf = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json"))
-        if not mf:
-            return 50
-        return mf.get("overall_bias", 50)
-    except Exception:
-        return 50
+# MiroFish: sports_evidence.mirofish_evidence (informed_facts, load_for_fv freshness)
+# puts team/series facts on the evidence record and the Nimble verdict. Facts only.
 
 def get_ere_regime():
     """Read ERE v2.0 regime — are markets calm or turbulent?"""
