@@ -7,86 +7,25 @@ Fail-closed: any problem (down, timeout, refused pin, malformed answers) yields 
 from __future__ import annotations
 
 import json
-import math
-import re
+import logging
 import time
-from decimal import Decimal
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 from urllib.parse import urlparse
 
-from .config import DEFAULT_NIMBLE_URL, Config
+from . import nimble_pin
+from .nimble_questions import (ACTIONS, QUESTIONS, RAW_LIMIT, RISK_LABELS,  # noqa: F401
+                               _num, _risk_expected, raw_snippet, sanitize)
+from .nimble_pin import NIMBLE2_DIGEST, is_nimble2, needs_digest, normalize_tag  # noqa: F401
 
-# --- Nimble 2 pin rule ----------------------------------------------------------------
-# Copied from Valedia; source of truth: scripts/integrations/systemone_hotpath_client.is_nimble2
-# (this project must stay standalone, so it is duplicated here, not imported).
-_TAG = r"[a-z0-9][a-z0-9._-]*"
-_QUANT = r"(?:q\d[a-z0-9_]*|iq\d[a-z0-9_]*|fp16|fp32|bf16|f16|f32|int4|int8)"
-_V2_RE = re.compile(
-    r"nimble2(?::" + _TAG + r")?"
-    r"|nimble:(?:2|v2|9b-v2)(?:-" + _QUANT + r")?"
-    r"|(?:(?:hf\.co/)?bespokelabs/)?bespoke-nimble-9b-v2(?::" + _TAG + r")?"
-)
-_V2_BANNED = ("v1", "tev", "0.8")
+if TYPE_CHECKING:  # config imports this module; avoid the cycle at runtime
+    from .config import Config
 
+log = logging.getLogger(__name__)
+DEFAULT_NIMBLE_URL = "http://127.0.0.1:11434/v1/systemone"
+DEFAULT_NIMBLE_MODEL = "nimble:latest"  # Burton's Nimble 2; accepted only by digest pin
 
-def is_nimble2(name) -> bool:
-    """True for a Nimble 2 tag only (case-insensitive). Never v1, never Tev."""
-    low = str(name or "").strip().lower()
-    if not low or any(bad in low for bad in _V2_BANNED):
-        return False
-    return _V2_RE.fullmatch(low) is not None
-
-
-# --- Questions -------------------------------------------------------------------------
-ACTIONS = ("buy", "hold", "skip")
-RISK_LABELS = [str(i) for i in range(1, 11)]
-
-# At pool creation there is NO momentum or buy-pressure data, so the criteria only talk about
-# facts the state really contains; asking about momentum would invite guessing. No threshold
-# or number appears in any question text: the code gates enforce every number afterwards.
-# Risk is a 10-way "choice" instead of Ollama's "score" type: the score index scale is
-# ambiguous (0- vs 1-based) and an off-by-one would silently move the risk gate. With choice
-# labels "1".."10", int(choice) is unambiguous and the probabilities give a distribution.
-QUESTIONS = {
-    "action": {
-        "type": "choice",
-        "instructions": ("A new token pool was just created. Using only the facts in the state, "
-                         "should a small paper position be opened right now?"),
-        "criteria": {
-            "buy": ("Facts look like a legitimate launch: real contract code, ownership "
-                    "renounced, meaningful two-sided liquidity, plausible supply and price"),
-            "hold": "Facts are mixed, incomplete, or too early to judge",
-            "skip": ("Red flags: no contract code, active owner, one-sided or tiny liquidity, "
-                     "absurd supply or price"),
-        },
-    },
-    "risk_score": {
-        "type": "choice",
-        "instructions": ("Rate the rug-pull and scam risk of this launch from 1 (safe) to 10 "
-                         "(extreme), using only the facts in the state."),
-        "criteria": {
-            "1": "no red flags at all", "2": "negligible concerns", "3": "minor concerns",
-            "4": "some concerns but plausible", "5": "mixed picture", "6": "several red flags",
-            "7": "serious red flags", "8": "many serious red flags",
-            "9": "almost certainly a scam", "10": "near-certain rug pull",
-        },
-    },
-}
-
-
-RAW_LIMIT = 4096
-
-
-def raw_snippet(obj: Any, limit: int = RAW_LIMIT) -> str:
-    """Text form of an unparseable body / odd output, truncated for the decision log."""
-    if isinstance(obj, bytes):
-        obj = obj.decode("utf-8", errors="replace")
-    if not isinstance(obj, str):
-        try:
-            obj = json.dumps(obj, default=str)
-        except (TypeError, ValueError):
-            obj = repr(obj)
-    return obj if len(obj) <= limit else obj[:limit] + f"...[truncated {len(obj) - limit} chars]"
+# Pin rule (is_nimble2 + NIMBLE2_DIGEST) lives in nimble_pin.py. Source of truth:
+# Valedia's scripts/integrations/systemone_hotpath_client.py (copied, not imported).
 
 
 class NimbleError(Exception):
@@ -95,19 +34,18 @@ class NimbleError(Exception):
         self.raw = raw  # whatever the server returned, if anything
 
 
-def sanitize(obj: Any) -> Any:
-    """JSON-safe copy: NaN/inf -> None, Decimal -> float, tuples -> lists, keys -> str."""
-    if isinstance(obj, bool) or obj is None or isinstance(obj, (int, str)):
-        return obj
-    if isinstance(obj, Decimal):
-        obj = float(obj)
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
-    if isinstance(obj, dict):
-        return {str(k): sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [sanitize(v) for v in obj]
-    return str(obj)
+def _http_get() -> Callable[[str, float], Any]:
+    import requests
+
+    session = requests.Session()
+
+    def get(url: str, timeout: float) -> Any:
+        resp = session.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            raise NimbleError(f"http {resp.status_code}")
+        return resp.json()
+
+    return get
 
 
 def _http_transport() -> Callable[[str, dict, float], dict]:
@@ -134,34 +72,63 @@ def _fail(reason: str, ms: float, model: str, raw: Any = None) -> dict:
             "latency_ms": round(ms, 2), "model": model, "raw": raw, "error": reason}
 
 
-def _num(v: Any) -> Optional[float]:
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-        return None
-    return float(v)
-
-
 class NimbleEngine:
-    def __init__(self, url: str = DEFAULT_NIMBLE_URL, model: str = "nimble2",
+    def __init__(self, url: str = DEFAULT_NIMBLE_URL, model: str = DEFAULT_NIMBLE_MODEL,
                  timeout_s: float = 10.0, keep_alive: str = "30m", allow_remote: bool = False,
                  transport: Optional[Callable[[str, dict, float], dict]] = None,
-                 clock: Callable[[], float] = time.perf_counter, warmup_timeout_s: float = 120.0):
+                 clock: Callable[[], float] = time.perf_counter, warmup_timeout_s: float = 120.0,
+                 digest: str = NIMBLE2_DIGEST,
+                 tags_transport: Optional[Callable[[str, float], Any]] = None):
         self.url, self.model, self.timeout_s = url, model, timeout_s
         self.warmup_timeout_s = warmup_timeout_s
         self.keep_alive, self.allow_remote = keep_alive, allow_remote
         self._transport, self._clock = transport, clock
+        self.digest = digest
+        # GET /api/tags: explicit, else the POST transport's .get (fakes), else HTTP. A custom
+        # POST transport without .get gets no network GET: the digest stays unverified.
+        if tags_transport is None and transport is not None:
+            tags_transport = getattr(transport, "get", None)
+        self._tags = tags_transport if (tags_transport or transport) else None
+        self._tags_default = tags_transport is None and transport is None
 
     @classmethod
-    def from_config(cls, cfg: Config, transport=None, clock=time.perf_counter) -> "NimbleEngine":
+    def from_config(cls, cfg: "Config", transport=None,
+                    clock=time.perf_counter) -> "NimbleEngine":
         return cls(cfg.nimble_url, cfg.nimble_model, cfg.decision_timeout_s,
                    cfg.nimble_keep_alive, cfg.nimble_allow_remote, transport, clock,
-                   cfg.warmup_timeout_s)
+                   cfg.warmup_timeout_s, cfg.nimble_digest)
 
     @property
     def pin_ok(self) -> bool:
-        return is_nimble2(self.model)
+        return nimble_pin.pin_form_ok(self.model)
+
+    def verify_digest(self) -> Optional[str]:
+        """For nimble / nimble:latest: check /api/tags once per process. None = verified
+        (or not needed); otherwise a 'digest_unverified: ...' / 'digest_mismatch: ...' reason.
+        """
+        if not needs_digest(self.model):
+            return None
+        key = (nimble_pin.tags_url(self.url), normalize_tag(self.model), self.digest.lower())
+        hit = nimble_pin.cached(key)
+        if hit is None:
+            if self._tags is None and self._tags_default:
+                self._tags = _http_get()
+            if self._tags is None:
+                hit = (False, "digest_unverified: no /api/tags transport")
+            else:
+                try:
+                    body = self._tags(key[0], min(self.timeout_s, 10.0))
+                    hit = nimble_pin.check_tags(body, self.model, self.digest)
+                except Exception as e:  # noqa: BLE001 - down / bad json: unverified, retried
+                    hit = (False, f"digest_unverified: {type(e).__name__}: {e}")
+            nimble_pin.remember(key, hit)
+            if hit[1]:
+                log.warning("Nimble pin refused: %s", hit[1])
+        return hit[1]
 
     def config_problem(self) -> Optional[str]:
-        """Why this engine would refuse every request (pin or non-loopback URL), if so."""
+        """Why this engine would refuse every request (pin or non-loopback URL), if so.
+        No network: the digest check for nimble / nimble:latest happens in warmup()/ask()."""
         if not self.pin_ok:
             return f"NIMBLE_MODEL {self.model!r} is not a Nimble 2 tag; refusing to POST"
         host = urlparse(self.url).hostname or ""
@@ -178,6 +145,9 @@ class NimbleEngine:
         problem = self.config_problem()
         if problem:
             raise NimbleError(f"refused: {problem}")
+        problem = self.verify_digest()
+        if problem:
+            raise NimbleError(problem)
         timeout = self.timeout_s if timeout is None else timeout
         payload = {"model": self.model, "state": sanitize(state), "questions": questions,
                    "keep_alive": self.keep_alive}
@@ -218,12 +188,19 @@ class NimbleEngine:
         """One tiny decide so the model is resident (keep_alive keeps it loaded).
 
         Uses its own, much longer timeout: the first call loads the 9B model into memory.
+        For nimble / nimble:latest the digest is verified first (cached per process).
         """
+        t0 = self._clock()
+        problem = self.config_problem() or self.verify_digest()
+        if problem:
+            return _fail(problem, (self._clock() - t0) * 1000.0, self.model)
         return self.decide({"warmup": True}, timeout=self.warmup_timeout_s)
 
     def _parse(self, body: dict) -> dict:
         resp_model = body.get("model")
-        if resp_model is not None and not is_nimble2(resp_model):
+        same_pinned = (needs_digest(self.model) and isinstance(resp_model, str)
+                       and normalize_tag(resp_model) == normalize_tag(self.model))
+        if resp_model is not None and not is_nimble2(resp_model) and not same_pinned:
             raise NimbleError(f"refused: response model {resp_model!r} is not Nimble 2")
         answers = body.get("answers")
         if not isinstance(answers, dict):
@@ -242,20 +219,6 @@ class NimbleEngine:
                 "latency_ms": 0.0, "model": self.model, "raw": body, "error": None}
 
 
-def _risk_expected(probs: Any) -> Optional[float]:
-    """sum(k * p_k) over the risk labels (renormalised); None if unusable."""
-    if not isinstance(probs, dict) or not probs:
-        return None
-    total = acc = 0.0
-    for label, p in probs.items():
-        pv = _num(p)
-        if label not in RISK_LABELS or pv is None or pv < 0:
-            return None
-        total += pv
-        acc += int(label) * pv
-    return round(acc / total, 4) if total > 0 else None
-
-
 _DEFAULT: Optional[NimbleEngine] = None
 
 
@@ -272,7 +235,8 @@ def ask_nimble(state: Any, questions: dict, model: Optional[str] = None) -> dict
     eng = _default_engine()
     if model and model != eng.model:
         eng = NimbleEngine(eng.url, model, eng.timeout_s, eng.keep_alive, eng.allow_remote,
-                           eng._transport, warmup_timeout_s=eng.warmup_timeout_s)
+                           eng._transport, warmup_timeout_s=eng.warmup_timeout_s,
+                           digest=eng.digest, tags_transport=eng._tags)
     return eng.ask(state, questions)
 
 
@@ -281,5 +245,5 @@ def decide(state: dict) -> dict:
     return _default_engine().decide(state)
 
 
-def engine_from_config(cfg: Config, transport=None, clock=time.perf_counter) -> NimbleEngine:
+def engine_from_config(cfg: "Config", transport=None, clock=time.perf_counter) -> NimbleEngine:
     return NimbleEngine.from_config(cfg, transport, clock)

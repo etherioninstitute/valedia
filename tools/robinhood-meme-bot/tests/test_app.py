@@ -70,7 +70,7 @@ def test_every_pool_logged_with_raw_response(tmp_path):
     assert good["raw"]["answers"]["action"]["choice"] == "buy"
     assert good["decision"]["action"] == "buy" and good["decision"]["risk_score"] == 2
     assert good["state"]["token_address"] == MEME and good["within_budget"] is True
-    assert good["latency_ms"] == pytest.approx(120.0) and len(good["gates"]) == 7
+    assert good["latency_ms"] == pytest.approx(120.0) and len(good["gates"]) == 9
     bad = next(r for r in recs if r["pool"] == RUG_POOL)
     assert bad["final_action"] == "skip" and bad["position_id"] is None and bad["raw"]
 
@@ -104,7 +104,8 @@ def test_warmup_reports_latency_and_engine_status(tmp_path):
     assert bot.stats.snapshot("m")["warm"] is False  # cold until warmed
     bot.start()
     assert any("warmup 230.0ms ok" in ln for ln in lines)
-    assert any(ln.startswith("[engine]") and "warm" in ln and "nimble2" in ln for ln in lines)
+    assert any(ln.startswith("[engine]") and "warm" in ln and "nimble:latest" in ln
+               for ln in lines)
     assert len(bot.nimble.requests) == 1 and bot.stats.warm
     assert bot.stats.samples == []  # warmup latency is not counted in decision stats
     bot.nimble.fail = TimeoutError("slow")
@@ -182,7 +183,7 @@ def test_main_headless_once_and_failures(tmp_path, capsys):
                 nimble_transport=FakeNimble()) == 2
     assert "chain id 1" in capsys.readouterr().err
     (tmp_path / "x").mkdir()
-    env2 = _envfile(tmp_path / "x", "NIMBLE_MODEL=nimble\n")
+    env2 = _envfile(tmp_path / "x", "NIMBLE_MODEL=nimble:9b\n")
     assert main(["--headless", "--once", "--env-file", env2], transport=standard_scenario(),
                 nimble_transport=FakeNimble()) == 2
     assert "not a Nimble 2 tag" in capsys.readouterr().err

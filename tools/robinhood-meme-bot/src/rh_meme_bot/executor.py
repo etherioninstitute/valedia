@@ -29,7 +29,8 @@ class Position:
 
 
 _FIELDS = tuple(f.name for f in fields(Position))
-_ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
+# v4 pool ids are bytes32: match those first so a torn v4 line still blocks its pool
+_ADDR = re.compile(r"0x[0-9a-fA-F]{64}|0x[0-9a-fA-F]{40}")
 _ID = re.compile(r'"id"\s*:\s*(\d+)')
 _ROUND = Context(prec=12)  # 12 significant digits: readable, far finer than slot0 accuracy
 

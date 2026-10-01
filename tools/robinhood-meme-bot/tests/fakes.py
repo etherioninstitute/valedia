@@ -50,6 +50,20 @@ def pool_created_log(token0, token1, fee, tick_spacing, pool, block, idx=0) -> d
     }
 
 
+def _log_matches(lg: dict, flt: dict) -> bool:
+    """Address/topic filter like a node. Logs without an address (deliberately malformed
+    fixtures) match any filter so decoders still see them."""
+    if "address" not in lg:
+        return True
+    if flt.get("address") and lg["address"].lower() != flt["address"].lower():
+        return False
+    topics = lg.get("topics") or []
+    for i, t in enumerate(flt.get("topics") or []):
+        if t is not None and (i >= len(topics) or topics[i].lower() != t.lower()):
+            return False
+    return True
+
+
 class FakeRpc:
     """Callable transport: ``rpc(payload) -> response``. Records every request."""
 
@@ -82,7 +96,8 @@ class FakeRpc:
         elif m == "eth_getLogs":
             lo, hi = int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16)
             self.log_ranges.append((lo, hi))
-            res = [lg for lg in self.logs if lo <= int(lg["blockNumber"], 16) <= hi]
+            res = [lg for lg in self.logs if lo <= int(lg["blockNumber"], 16) <= hi
+                   and _log_matches(lg, p[0])]
         elif m == "eth_call":
             v = self.calls.get((p[0]["to"].lower(), p[0]["data"]), "revert")
             if v == "revert":
@@ -137,6 +152,16 @@ class FakeClock:
         self.t += ms / 1000.0
 
 
+NIMBLE_DIGEST_FULL = "24e550a16a70" + "ab" * 26  # what `ollama list` shows as 24e550a16a70
+
+
+def nimble_tags(name="nimble:latest", digest=NIMBLE_DIGEST_FULL) -> dict:
+    """Shape of Ollama GET /api/tags."""
+    return {"models": [{"name": name, "model": name, "digest": digest, "size": 1,
+                        "details": {"family": "qwen"}},
+                       {"name": "jev:latest", "model": "jev:latest", "digest": "ff" * 32}]}
+
+
 def nimble_body(action="buy", conf=0.9, risk="2", model="nimble2") -> dict:
     rest = {"buy": 0.05, "hold": 0.05, "skip": 0.05}
     rest[action] = conf
@@ -152,7 +177,8 @@ def nimble_body(action="buy", conf=0.9, risk="2", model="nimble2") -> dict:
 def default_nimble_response(payload: dict) -> dict:
     st = payload["state"]
     good = st.get("owner_renounced") is True and st.get("contract_has_code") is True
-    return nimble_body("buy", 0.91, "2") if good else nimble_body("skip", 0.8, "9")
+    model = payload.get("model", "nimble2")
+    return nimble_body("buy", 0.91, "2", model) if good else nimble_body("skip", 0.8, "9", model)
 
 
 class FakeNimble:
@@ -163,6 +189,15 @@ class FakeNimble:
         self.clock, self.step_ms = clock, step_ms
         self.respond = respond or default_nimble_response
         self.fail: Exception = None
+        self.tags = nimble_tags()  # GET /api/tags body (dict) or an Exception to raise
+        self.tag_requests: list = []
+
+    def get(self, url, timeout):
+        """Fake GET {nimble base}/api/tags (digest pin check)."""
+        self.tag_requests.append((url, timeout))
+        if isinstance(self.tags, Exception):
+            raise self.tags
+        return self.tags
 
     def __call__(self, url, payload, timeout):
         self.requests.append((url, payload, timeout))
