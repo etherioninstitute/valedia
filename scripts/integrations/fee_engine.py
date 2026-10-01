@@ -144,7 +144,7 @@ def calculate_trade_cost(platform, side, amount_usd, is_maker=False, price=None,
         if price and 0 < float(price) < 1:
             p = float(price)
             contracts = amount_usd / p
-            trading_fee = math.ceil(0.07 * contracts * p * (1 - p) * 100) / 100
+            trading_fee = math.ceil(round(0.07 * contracts * p * (1 - p) * 100, 6)) / 100
         else:
             trading_fee = int(amount_usd / 1.0) * fees.get("taker_per_contract", 0.02)
     elif platform == "defi_uniswap":

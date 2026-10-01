@@ -31,7 +31,8 @@ def kalshi_fee(price, contracts):
     """Kalshi trading fee, per side: ceil(0.07 * C * P * (1-P)) to the next cent."""
     p = max(0.0, min(1.0, float(price)))
     raw = 0.07 * float(contracts) * p * (1.0 - p)
-    return math.ceil(raw * 100.0) / 100.0
+    # round(.., 6) strips float noise (1.7500000000000002) so exact-cent fees aren't bumped a cent
+    return math.ceil(round(raw * 100.0, 6)) / 100.0
 
 
 # Sports labels that must share one category-gate / Kelly bucket (allocator

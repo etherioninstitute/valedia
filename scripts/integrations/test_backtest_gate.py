@@ -93,7 +93,7 @@ def run():
     net, fee, basis = G.fee_true_net(e, s)
     raw = 0.07 * 100 * 0.10 * 0.90
     assert basis == "modeled" and fee == kalshi_fee(0.10, 100), fee
-    assert raw <= fee < raw + 0.01 + 1e-9 and abs(fee * 100 - round(fee * 100)) < 1e-9, fee
+    assert raw - 1e-9 <= fee < raw + 0.01 + 1e-9 and abs(fee * 100 - round(fee * 100)) < 1e-9, fee
     assert abs(fee - 0.02 * 100) > 1.0, "flat fee used"
     assert abs(net - (90.0 - fee)) < 1e-6, net
     # per-order rounding: raw fee 0.0105 (P=0.5, C=0.6) is charged 0.02, not 0.0105
