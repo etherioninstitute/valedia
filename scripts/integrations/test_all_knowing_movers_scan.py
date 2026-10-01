@@ -6,6 +6,7 @@ Run: python3 test_all_knowing_movers_scan.py
 import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -16,6 +17,8 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 os.environ.pop("VALEDIA_ORNITH_SEASON", None)
 os.environ.pop("VALEDIA_SYSTEMONE", None)
 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+SLOG = os.path.join(tempfile.mkdtemp(prefix="akslog_"), "decisions.jsonl")
+os.environ["VALEDIA_SYSTEMONE_LOG"] = SLOG
 # Retired shadow decider name, spelled indirectly so grep over scripts/ stays clean.
 RETIRED = "".join(["l", "a", "y", "a"])
 
@@ -261,6 +264,53 @@ def test_systemone_default_off_and_fail_open():
         os.environ.pop("VALEDIA_SYSTEMONE", None)
 
 
+def test_scan_logs_every_decision_with_code_label_and_facts():
+    if os.path.exists(SLOG):
+        os.remove(SLOG)
+    os.environ["VALEDIA_SYSTEMONE"] = "1"
+    try:
+        seen = []
+
+        def post(url, payload, timeout):
+            seen.append(payload)
+            return {"model": "nimble2", "answers": {
+                "admit_paper": {"noul": 0.7}, "edge_quality": {"score": 2},
+                "venue_class": {"choice": "crypto", "confidence": 0.8}}}
+
+        doc = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d,
+                       systemone_post=post)
+        n = len(doc["ranked"])
+        lines = [json.loads(x) for x in open(SLOG).read().splitlines()]
+        assert len(lines) == n + 1                      # warmup + one per row, yes and no
+        assert lines[0]["source"] == "warmup" and seen[0]["state"]["symbol"] == "warmup"
+        rows = {r["symbol"]: r for r in doc["ranked"]}
+        by = {ln["state"]["symbol"]: ln for ln in lines[1:]}
+        assert set(by) == set(rows)
+        for sym, ln in by.items():
+            assert ln["source"] == "movers_scan"
+            assert ln["label"] == rows[sym]["label"]    # code's label beside the model's answer
+            assert ln["answers"]["admit_paper"] == 0.7 and ln["error"] is None
+        # Facts come from the scan's own constants, computed in code.
+        f = by["PUMP"]["state"]["facts"]
+        assert f["has_print"] is True and f["edge_positive"] is True
+        assert f["clears_size_bar"] is True and f["is_oil"] is False
+        assert by["USO"]["state"]["facts"]["is_oil"] is True
+        assert by["DUST"]["state"]["facts"]["edge_positive"] is False
+        assert by["NOISE"]["state"]["facts"]["clears_size_bar"] is False
+        assert by["KXHIGHNY"]["state"]["facts"]["is_weather"] is True
+        assert ak.LIMITS == {"print_bar_pct": ak.PRINT_BAR_PCT,
+                             "min_quote_usd": ak.BINANCE_MIN_QUOTE_USD}
+        # The model's answer never changes label, size, or rank.
+        off = _doc()
+        assert [r["label"] for r in doc["ranked"]] == [r["label"] for r in off["ranked"]]
+        assert [r["would_have"]["sized"] for r in doc["ranked"]] == \
+            [r["would_have"]["sized"] for r in off["ranked"]]
+        blk = doc["systemone"]
+        assert blk["budget_ms"] == 500.0 and "latency_ms_p95" in blk and blk["n_ok"] == n
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE", None)
+
+
 def test_ornith_season_does_not_reorder():
     doc = _doc()
     symbols = [r["symbol"] for r in doc["ranked"]]
@@ -333,6 +383,7 @@ if __name__ == "__main__":
     test_write_and_cli_fixture()
     test_tape_prefers_coingecko_then_binance()
     test_systemone_default_off_and_fail_open()
+    test_scan_logs_every_decision_with_code_label_and_facts()
     test_ornith_season_does_not_reorder()
     test_live_fallback()
     print("PASS test_all_knowing_movers_scan")
