@@ -7,9 +7,10 @@ writers (unified_brain BUY/SELL, strategy_modules.DCAEngine, dca_module.run_dca)
                  broker body carries fill qty+price (fee from the body, else fee_engine
                  static fee with fee_status="modeled"); POST-ack only -> UNRECONCILED
                  entry with the venue order_id (spot_reconcile cron upgrades it later).
-  book_sell() -> complete fill: FIFO-close the open live lots for ticker+venue with
-                 fee-true settlements (realized = (exit-entry)*qty - entry fee - exit fee);
-                 POST-ack only -> UNRECONCILED sell entry with order_id (cron settles).
+  book_sell() -> complete fill: close_sell() FIFO-closes the open live lots for
+                 ticker+venue with fee-true settlements (realized = (exit-entry)*qty -
+                 entry fee - exit fee); POST-ack only -> UNRECONCILED sell entry with
+                 order_id, which spot_reconcile settles later through the same close_sell().
 
 Returned status is "EXECUTED" only when extract_spot_fill(...).complete; otherwise
 "UNRECONCILED". Paper/shadow/sandbox sources write nothing ("SKIPPED_NON_LIVE").
@@ -18,6 +19,7 @@ Any bookkeeping error is printed to stderr and falls back to an UNRECONCILED row
 (c) GOATWORTHY Post LLC.
 """
 import sys
+from datetime import datetime, timezone
 
 BRAIN = {"coinbase": "BRAIN_CRYPTO", "alpaca": "BRAIN_EQUITY"}
 DCA = {"coinbase": "DCA_CRYPTO", "alpaca": "DCA_EQUITY"}
@@ -103,33 +105,58 @@ def book_buy(strategy, venue, ticker, resp, intended_source="live"):
         return _stub(ftl, strategy, ticker, "buy", venue, raw, f"book_buy {strategy} {ticker}", e)
 
 
-def _open_lots(ftl, ticker, venue):
+def _ts(v):
+    """Entry/stub ts -> aware datetime (None if missing/unparseable)."""
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _open_lots(ftl, ticker, venue, source="live", before_ts=None):
     recs = ftl._read()
     done = {r.get("entry_id") for r in recs if r.get("type") == "settlement"}
+    cutoff = _ts(before_ts) if before_ts else None
     lots = []
     for e in recs:
         if e.get("type") != "entry" or e.get("id") in done:
             continue
         if e.get("ticker") != ticker or e.get("venue") != venue:
             continue
-        if str(e.get("side") or "buy").lower() != "buy" or e.get("source") != "live":
-            continue  # paper/sandbox/unreconciled lots are never closed by a live sell
-        if float(e.get("contracts") or 0) > 0 and float(e.get("entry_price") or 0) > 0:
-            lots.append(e)
-    return sorted(lots, key=lambda e: str(e.get("ts") or ""))  # FIFO (stable)
+        if str(e.get("side") or "buy").lower() != "buy" or e.get("source") != source:
+            continue  # a live sell never closes paper/sandbox/unreconciled lots (and vice versa)
+        if not (float(e.get("contracts") or 0) > 0 and float(e.get("entry_price") or 0) > 0):
+            continue
+        when = _ts(e.get("ts"))
+        if cutoff and when and when > cutoff:
+            continue  # bought after this sell was placed: not part of what it sold
+        lots.append(e)
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(lots, key=lambda e: _ts(e.get("ts")) or floor)  # FIFO (stable)
+
+
+def sell_already_settled(order_id, rows=None):
+    """True when a sell order id already produced exit settlements (idempotency guard)."""
+    if not order_id:
+        return False
+    rows = rows if rows is not None else _ftl()._read()
+    return any(r.get("type") == "settlement" and r.get("result") == "exit"
+               and str(r.get("order_id")) == str(order_id) for r in rows)
 
 
 def settle_lots(ticker, venue, exit_price, qty, exit_fee, fee_status="modeled",
-                exit_strategy=None, order_id=None):
-    """FIFO-close open live lots with fee-true settlements. Returns (settlements, excess).
+                exit_strategy=None, order_id=None, source="live", before_ts=None):
+    """FIFO-close open lots (of `source`) with fee-true settlements -> (settlements, excess).
 
     A lot only partly covered is settled for the sold part; the rest re-opens as a new
     FILLED entry (same ts/price, pro-rata entry fee) referenced by remainder_id.
+    before_ts: only lots opened at/before the sell (the cron passes the sell stub's ts).
     """
     ftl = _ftl()
     exit_price, qty, exit_fee = float(exit_price), float(qty), float(exit_fee or 0)
     remaining, out = qty, []
-    for e in _open_lots(ftl, ticker, venue):
+    for e in _open_lots(ftl, ticker, venue, source=source, before_ts=before_ts):
         if remaining <= EPS:
             break
         c = float(e["contracts"])
@@ -145,14 +172,14 @@ def settle_lots(ticker, venue, exit_price, qty, exit_fee, fee_status="modeled",
             rem_id = ftl.record_entry(
                 e.get("strategy", "?"), ticker, e.get("side", "buy"), entry_px, round(c - take, 10),
                 venue=venue, predicted_direction=e.get("predicted_direction"),
-                predicted_prob=e.get("predicted_prob"), source="live", ts=e.get("ts"),
+                predicted_prob=e.get("predicted_prob"), source=source, ts=e.get("ts"),
                 fill_status="FILLED", entry_fee=round(float(e.get("entry_fee") or 0) - entry_fee, 6),
                 order_id=e.get("order_id"), fee_status=e.get("fee_status"))
         both_venue = fee_status == "venue" and e.get("fee_status") == "venue"
         rec = {"type": "settlement", "entry_id": e["id"], "ticker": ticker,
                "strategy": e.get("strategy", "?"), "result": "exit",
                "filled_contracts": take, "fill_note": "roundtrip_exit",
-               "realized_pnl_net": net, "won": net > 0, "hit": None, "source": "live",
+               "realized_pnl_net": net, "won": net > 0, "hit": None, "source": source,
                "exit_price": exit_price, "gross": gross,
                "fee": round(entry_fee + exit_share, 6), "entry_fee": entry_fee,
                "exit_fee": exit_share, "fee_status": "venue" if both_venue else "modeled",
@@ -163,6 +190,33 @@ def settle_lots(ticker, venue, exit_price, qty, exit_fee, fee_status="modeled",
         out.append(rec)
         remaining -= take
     return out, (remaining if remaining > EPS else 0.0)
+
+
+def close_sell(ticker, venue, fill, exit_strategy=None, order_id=None, source="live",
+               before_ts=None):
+    """Book a COMPLETE sell fill (extract_spot_fill dict): FIFO settle_lots + excess row.
+
+    The one sell implementation, shared by book_sell (ack time) and spot_reconcile (cron).
+    Fee: broker fee when present ("venue"), else fee_engine static fee ("modeled").
+    Excess (sold more than the ledger holds) -> UNRECONCILED sell row WITHOUT order_id,
+    so the cron can never settle a later, unrelated lot with this exit.
+    """
+    ftl = _ftl()
+    price, qty = float(fill["price"]), float(fill["qty"])
+    if fill.get("fee") is not None:
+        fee, fee_status = float(fill["fee"]), "venue"
+    else:
+        fee, fee_status = ftl._spot_fee(venue, price, qty), "modeled"
+    setts, excess = settle_lots(ticker, venue, price, qty, fee, fee_status,
+                                exit_strategy=exit_strategy, order_id=order_id,
+                                source=source, before_ts=before_ts)
+    out = {"status": "EXECUTED", "id": None, "settlements": setts,
+           "realized": round(sum(s["realized_pnl_net"] for s in setts), 4)}
+    if excess > 0:
+        out["excess_id"] = ftl.record_unreconciled(
+            exit_strategy, ticker, "sell", price, excess, venue, intended_source=source)
+        out["excess"] = excess
+    return out
 
 
 def book_sell(exit_strategy, venue, ticker, resp, intended_source="live"):
@@ -184,22 +238,7 @@ def book_sell(exit_strategy, venue, ticker, resp, intended_source="live"):
                                           fill["qty"], venue, order_id=oid,
                                           intended_source="live")
             return {"status": "UNRECONCILED", "id": eid, "settlements": []}
-        if fill["fee"] is not None:
-            fee, fee_status = float(fill["fee"]), "venue"
-        else:
-            fee, fee_status = ftl._spot_fee(venue, fill["price"], fill["qty"]), "modeled"
-        setts, excess = settle_lots(ticker, venue, fill["price"], fill["qty"], fee,
-                                    fee_status, exit_strategy=exit_strategy, order_id=oid)
-        out = {"status": "EXECUTED", "id": None, "settlements": setts,
-               "realized": round(sum(s["realized_pnl_net"] for s in setts), 4)}
-        if excess > 0:
-            # Sold more than the ledger holds (pre-ledger lots, or a buy still UNRECONCILED).
-            # No order_id: the cron must not settle a later, unrelated lot with this exit.
-            out["excess_id"] = ftl.record_unreconciled(
-                exit_strategy, ticker, "sell", fill["price"], excess, venue,
-                intended_source="live")
-            out["excess"] = excess
-        return out
+        return close_sell(ticker, venue, fill, exit_strategy=exit_strategy, order_id=oid)
     except Exception as e:
         return _stub(ftl, exit_strategy, ticker, "sell", venue, raw,
                      f"book_sell {exit_strategy} {ticker}", e)
