@@ -37,6 +37,25 @@ def log_dca(entry):
     log = log[-200:]
     with open(DCA_LOG, "w") as f: json.dump(log, f, indent=2, default=str)
 
+def _cb_has_pos(bal, ticker):
+    """True/False from the Coinbase balances already fetched, else None (unknown)."""
+    try:
+        return float(bal.get(ticker.replace("-USD", ""), {}).get("balance", 0)) > 0.0001
+    except Exception:
+        return None
+
+def _alp_has_pos(ticker):
+    """True/False from Alpaca positions when available, else None (unknown, never guessed)."""
+    try:
+        import alpaca_executor as ae
+        return ae.get_position(ticker) is not None
+    except Exception:
+        return None
+
+# Exits: none here. run_dca only BUYs, and a writer lock must never block a sell.
+# No last-run state: every scheduled run re-evaluates, so a vetoed / blocked run
+# already retries on the next run (unlike strategy_modules.DCAEngine's weekly last_buy).
+
 def run_dca():
     import yfinance as yf
     from kernel_predictor_v16e import KernelPredictor
@@ -54,7 +73,7 @@ def run_dca():
             if len(p)<80: continue
             sig = KernelPredictor("crypto").predict(p)
             if sig["score"] >= cfg["min_score"]:
-                scored.append({"ticker":tk,"score":sig["score"],"type":"crypto"})
+                scored.append({"ticker":tk,"score":sig["score"],"type":"crypto","prices":p})
         except: pass
     for tk in cfg["equity_tickers"]:
         try:
@@ -62,7 +81,7 @@ def run_dca():
             if len(p)<80: continue
             sig = KernelPredictor("equity").predict(p)
             if sig["score"] >= cfg["min_score"]:
-                scored.append({"ticker":tk,"score":sig["score"],"type":"equity"})
+                scored.append({"ticker":tk,"score":sig["score"],"type":"equity","prices":p})
         except: pass
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:cfg["max_assets"]]
@@ -75,8 +94,13 @@ def run_dca():
             if asset["type"] == "crypto":
                 bal = get_balances()
                 cash = bal.get("USD",{}).get("balance",0)
+                if not nws.venue_buy_allowed("coinbase"):
+                    lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER coinbase writer!=valedia")
+                    continue
                 if cash >= per_asset:
-                    nv = nws.gate("crypto", asset["ticker"], {"fused": asset["score"]},
+                    row = nws.dca_row("coinbase", per_asset, score=asset["score"], prices=asset.get("prices"),
+                                      has_pos=_cb_has_pos(bal, asset["ticker"]))
+                    nv = nws.gate("crypto", asset["ticker"], row,
                                   source="dca_module", venue="coinbase", label="dca")
                     lines.extend(nws.note(asset["ticker"], nv))
                     if nws.blocked(nv):
@@ -93,10 +117,15 @@ def run_dca():
                 else:
                     lines.append(f"  {asset['ticker']}: insufficient CB cash (${cash:.2f})")
             else:
+                if not nws.venue_buy_allowed("alpaca"):
+                    lines.append(f"  {asset['ticker']}: SKIP_VENUE_WRITER alpaca writer!=valedia")
+                    continue
                 acct = get_account()
                 cash = float(acct.get("cash",0))
                 if cash >= per_asset:
-                    nv = nws.gate("equity", asset["ticker"], {"fused": asset["score"]},
+                    row = nws.dca_row("alpaca", per_asset, score=asset["score"], prices=asset.get("prices"),
+                                      has_pos=_alp_has_pos(asset["ticker"]))
+                    nv = nws.gate("equity", asset["ticker"], row,
                                   source="dca_module", venue="alpaca", label="dca")
                     lines.extend(nws.note(asset["ticker"], nv))
                     if nws.blocked(nv):

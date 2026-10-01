@@ -20,6 +20,14 @@ Exits (side sell/exit/close, or candidate action sell / exit True) are never
 blocked and never sent: allow True in every mode. Veto can only remove an
 order; it never adds one, sizes, flips a side, or changes a price.
 
+Confidence semantics (verified on Burton's Mac): Nimble's `confidence` is
+1 - normalized entropy of `probabilities`. It is NOT P(chosen action). Example:
+buy 0.4765 / skip 0.5235 gives choice skip with confidence 0.00159 (a near coin
+flip is "unconfident" even though skip won). Veto still uses `confidence` against
+VALEDIA_NIMBLE_MIN_CONF, unchanged. Every verdict also records `p_action`
+(probability of the chosen action) and `p_buy` (probability of buy), read from
+`probabilities` (None when absent), so a review can see the actual odds.
+
 This module never places an order and never fetches market data.
 """
 from __future__ import annotations
@@ -245,9 +253,14 @@ def _parse(body):
         conf = probs.get(action)
     if conf is not None and not 0.0 <= conf <= 1.0:
         conf = None
+    # confidence is 1 - normalized entropy, not P(chosen): record the real odds beside it.
+    lower = {str(k).strip().lower(): v for k, v in (probs or {}).items()}
+    p_action = lower.get(action) if action else None
+    p_buy = lower.get("buy")
     rk = ans.get("risk") if isinstance(ans.get("risk"), dict) else {}
     rc = str(rk.get("choice") or "").strip()
     return {"action": action, "confidence": conf, "action_probabilities": probs,
+            "p_action": p_action, "p_buy": p_buy,
             "risk": int(rc) if rc in RISK_LABELS else None,
             "risk_probabilities": s1._probs(rk.get("probabilities"))}
 
@@ -260,10 +273,11 @@ def is_exit(candidate, side):
 
 
 def _verdict(mode, allow, reason, *, action=None, confidence=None, risk=None,
-             latency_ms=None, within_budget=False, error=None):
+             latency_ms=None, within_budget=False, error=None, p_action=None, p_buy=None):
     return {"action": action, "confidence": confidence, "risk": risk, "mode": mode,
             "allow": bool(allow), "reason": reason, "latency_ms": latency_ms,
-            "within_budget": bool(within_budget), "error": error}
+            "within_budget": bool(within_budget), "error": error,
+            "p_action": p_action, "p_buy": p_buy}
 
 
 def _no_call(mode, exit_, reason):
@@ -292,7 +306,8 @@ def build_state(asset_class, candidate, side, code_facts, informed_facts_):
 
 def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None, source,
                      label=None, post=None, get=None):
-    """Verdict {action, confidence, risk, mode, allow, reason, latency_ms, within_budget, error}.
+    """Verdict {action, confidence, risk, mode, allow, reason, latency_ms, within_budget, error,
+    p_action, p_buy}. confidence = 1 - normalized entropy (NOT P(chosen)); see module docstring.
 
     informed: informed_facts.informed_facts(...) output; None → computed here from
     local files (no network); {} → no informed facts. Never raises.
@@ -324,7 +339,7 @@ def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None,
     ans = res.get("answers") or {}
     err = res.get("error") or (None if ans.get("action") else "bad_action")
     out = dict(action=ans.get("action"), confidence=ans.get("confidence"), risk=ans.get("risk"),
-               latency_ms=res.get("latency_ms"), within_budget=res.get("within_budget"), error=err)
+               p_action=ans.get("p_action"), p_buy=ans.get("p_buy"), latency_ms=res.get("latency_ms"), within_budget=res.get("within_budget"), error=err)
     if mode == "shadow":
         return _verdict(mode, True, "shadow_error" if err else "shadow_logged", **out)
     if err:

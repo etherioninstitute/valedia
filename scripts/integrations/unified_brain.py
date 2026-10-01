@@ -869,6 +869,11 @@ def run_brain():
                     fee_check["pass"] and ere["safe"] and
                     not has_pos and actionable):
 
+                # Live spot BUY needs the venue writer to be valedia. Exits below are
+                # deliberately not writer-gated (a lock must never strand a position).
+                if plat in ("coinbase", "alpaca") and not nws.venue_buy_allowed(plat):
+                    lines.append(nws.writer_skip_line(name, plat))
+                    continue
                 _nv = nws.gate(asset_cls, ticker, {"fused": fused, "q": q, "fee_check": fee_check,
                                "has_pos": has_pos, "ere": ere}, source="unified_brain", venue=plat, label="buy") \
                     if (plat == "coinbase" and cb and cb_cash >= position) or (plat == "alpaca" and alpaca) else None
@@ -994,8 +999,15 @@ def run_brain():
         )
         if cb and dca.should_buy() and cb_cash >= 5:
             _, cb_buy_fn, _, _ = cb
-            for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca"), lambda: cb_cash):
-                lines.append(f"  {da}"); actions += [] if nws.SKIP in da else [da]
+            # Facts DCA actually knows: fee (static round trip) and held balance. No kernel
+            # score / price history here, so fused_strong / trend_up_5d stay unknown.
+            _rows = {pair: nws.dca_row(
+                "coinbase", dca.weekly_budget * w,
+                has_pos=float(cb_bal.get(pair.replace("-USD", ""), {}).get("balance", 0)) > 0.0001)
+                for pair, w in dca.assets.items()}
+            for da in dca.execute(nws.wrap_buy(cb_buy_fn, source="unified_brain_dca", rows=_rows),
+                                  lambda: cb_cash, venue="coinbase"):
+                lines.append(f"  {da}"); actions += [da] if da.startswith("DCA: bought") else []
         elif dca.should_buy():
             lines.append("  DCA: ready — insufficient USD or Coinbase offline")
     except Exception as e:

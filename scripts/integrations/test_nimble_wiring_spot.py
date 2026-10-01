@@ -294,6 +294,49 @@ def test_dca_module():
     setup("veto", post=Nim(exc=OSError("down")))
     assert run_dca()[1] == {"cb_buy": [], "alp_buy": []}
 
+def test_dca_and_movers_facts_mapping():
+    # DCA: facts come from what DCA knows; the rest stay None (never invented)
+    post = setup("shadow", post=Nim("skip"))
+    run_dca()
+    by = {c["state"]["symbol"]: c["state"]["facts"] for c in post.calls}
+    f = by["BTC-USD"]
+    assert (f["fused_strong"], f["fee_ok"], f["already_held"], f["trend_up_5d"]) == (True, True, False, True)
+    assert f["filter_passed"] is None and f["momentum_dominant"] is None and f["regime_risk_off"] is None
+    assert by["SPY"]["fee_ok"] is True and by["SPY"]["already_held"] is None  # no alpaca position fn: unknown
+    # unified_brain DCA: no kernel score or price history there -> fused_strong / trend None
+    post = setup("shadow", post=Nim("skip"))
+    run_brain({}, dca_due=True)
+    f = post.calls[0]["state"]["facts"]
+    assert f["fee_ok"] is True and f["already_held"] is False
+    assert f["fused_strong"] is None and f["trend_up_5d"] is None
+    # dca_row units: score band uses the nd threshold; fee ceiling; short history
+    assert nd._spot_facts(nws.dca_row("coinbase", 5, score=nd.FUSED_STRONG))["fused_strong"] is True
+    assert nd._spot_facts(nws.dca_row("coinbase", 5, score=nd.FUSED_STRONG - 1))["fused_strong"] is False
+    assert nws.dca_row("coinbase", 5, prices=[1, 2, 3]).get("q") is None
+    assert nd._spot_facts(nws.dca_row("coinbase", 5, prices=[5, 4, 3, 3, 3, 3, 3]))["trend_up_5d"] is False
+    real = nws.DCA_FEE_MAX_RT_PCT
+    nws.DCA_FEE_MAX_RT_PCT = 1.0
+    try:
+        assert nd._spot_facts(nws.dca_row("coinbase", 5))["fee_ok"] is False  # static 2.2% > 1.0
+        assert nd._spot_facts(nws.dca_row("alpaca", 5))["fee_ok"] is True
+    finally:
+        nws.DCA_FEE_MAX_RT_PCT = real
+    assert nd._spot_facts(nws.dca_row("coinbase", 5))["already_held"] is None
+    # movers: s1.facts names mapped to the spot names the question describes
+    row = {"chg_24h": 20.0, "edge": 0.4, "quote_volume_usd": 5e9}
+    m = nws.movers_facts(row, ak.LIMITS)
+    assert m["fee_ok"] is True and m["filter_passed"] is True and m["edge_positive"] is True
+    m = nws.movers_facts({"chg_24h": 0.1, "edge": -0.2}, ak.LIMITS)
+    assert m["fee_ok"] is False and m["filter_passed"] is False
+    m = nws.movers_facts({"edge": 0.1}, ak.LIMITS)  # no print: bar comparison unknown stays None
+    assert m["filter_passed"] is None and m["fee_ok"] is True
+    for k in ("fused_strong", "already_held", "trend_up_5d", "momentum_dominant", "regime_risk_off"):
+        assert k not in m  # absent, never defaulted
+    post = setup("shadow", post=Nim("skip"))
+    doc = _scan()
+    f = post.calls[0]["state"]["facts"]
+    assert "fee_ok" in f and "filter_passed" in f and f["has_print"] is True
+
 def _echo(payload):
     text = payload["messages"][0]["content"]
     blob = json.loads(text[text.rfind("\n") + 1:])
