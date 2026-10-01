@@ -52,3 +52,7 @@ Keep Jev optional. Nimble stamps. It does not size and it does not send.
 - **Speed:** warmup once per process; per-call timeout `VALEDIA_NIMBLE_TIMEOUT_S` (default 10 s); the target stays 500 ms. `decide_many` stops calling after `VALEDIA_NIMBLE_MANY_CAP_S` (default 30 s); the remaining items get the mode default (shadow allows, veto blocks entries).
 - **Log:** one `decisions.jsonl` line per call, `source = nimble_decide:<source>`, `label = {code, mode, min_conf, informed_sources}`, so a review can compare the model with the code.
 - Default shadow, unset `VALEDIA_SYSTEMONE` on crons: zero behavior change. The wiring into the decision points is a separate step.
+
+### Confidence semantics
+
+Nimble's `confidence` is 1 - normalized entropy of `probabilities`, not P(chosen action). Verified on Burton's Mac: buy 0.4765 / skip 0.5235 gives choice skip with confidence 0.00159. `nimble_decide` verdicts now also carry `p_action` (probability of the chosen action) and `p_buy`, read from `probabilities` (None when absent). The veto rule is unchanged: it still compares `confidence` to `VALEDIA_NIMBLE_MIN_CONF`; `p_buy` is recorded only.
