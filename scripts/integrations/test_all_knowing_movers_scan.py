@@ -16,7 +16,8 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 os.environ.pop("VALEDIA_ORNITH_SEASON", None)
 os.environ.pop("VALEDIA_SYSTEMONE", None)
 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
-os.environ.pop("VALEDIA_LAYA", None)
+# Retired shadow decider name, spelled indirectly so grep over scripts/ stays clean.
+RETIRED = "".join(["l", "a", "y", "a"])
 
 import all_knowing_movers_scan as ak
 import crypto_paper as cp
@@ -46,13 +47,13 @@ def test_fee_true_rank_and_size_gate():
     pump = by["PUMP"]
     assert abs(pump["edge"] - (0.164 - rt)) < 1e-9
     assert abs(pump["impact_usd"] - pump["edge"] * notional) < 1e-6
-    assert pump["laya"] == "would_buy"
+    assert pump["label"] == "would_buy"
     assert pump["would_have"]["sized"] is True
     assert pump["would_have"]["create_order"] is False
     assert pump["would_have"]["qty"] > 0
-    assert by["QNT"]["laya"] == "would_buy"
+    assert by["QNT"]["label"] == "would_buy"
     # High buzz, small move: watched, not sized, ranks under the 16% names.
-    assert by["NOISE"]["laya"] == "watch"
+    assert by["NOISE"]["label"] == "watch"
     assert by["NOISE"]["would_have"]["sized"] is False
     assert by["NOISE"]["buzz"] > by["PUMP"]["buzz"]
     # 22% oil prints the largest impact and stays unsized. First size is PUMP.
@@ -61,9 +62,9 @@ def test_fee_true_rank_and_size_gate():
     assert [r["symbol"] for r in sized] == ["PUMP", "QNT"]
     assert doc["ranked"].index(pump) < doc["ranked"].index(by["NOISE"])
     assert by["DUST"]["edge"] < 0
-    assert by["DUST"]["laya"] == "would_pass"
+    assert by["DUST"]["label"] == "would_pass"
     assert by["SPY"]["class"] == "etf"
-    assert by["SPY"]["laya"] == "watch"
+    assert by["SPY"]["label"] == "watch"
 
 
 def test_oil_and_weather_stay_watch():
@@ -72,12 +73,12 @@ def test_oil_and_weather_stay_watch():
     uso = by["USO"]
     assert uso["oil_fenced"] is True
     assert uso["harvest"] == "NO_HARVEST"
-    assert uso["laya"] == "watch"
+    assert uso["label"] == "watch"
     assert uso["would_have"]["sized"] is False
     assert uso["chg_24h"] >= ak.PRINT_BAR_PCT
     w = by["KXHIGHNY"]
     assert w["class"] == "weather"
-    assert w["laya"] == "watch"
+    assert w["label"] == "watch"
     assert w["would_have"]["sized"] is False
     assert w["impact_usd"] is None
 
@@ -100,7 +101,7 @@ def test_jev_does_not_reorder_and_fail_open():
 def test_fences_and_hygiene():
     src = open(os.path.join(HERE, "all_knowing_movers_scan.py")).read()
     for banned in (
-        "laya-coreml", "create_order(", "place_order", "alpaca_executor",
+        RETIRED, "8766", "create_order(", "place_order", "alpaca_executor",
         "coinbase_trader", "kraken_client", "kalshi_executor", "--live",
         "MIROFISH_AUTO_RAISE = True", "import subprocess",
     ):
@@ -133,7 +134,7 @@ def test_write_and_cli_fixture(tmp=None):
         assert paper["paper_only"] is True
         assert paper["create_order"] is False
         assert paper["crypto_paper_allowlist"] == ["BTC-USDT", "ETH-USDT"]
-        assert all(n["laya"] != "would_pass" for n in paper["names"])
+        assert all(n["label"] != "would_pass" for n in paper["names"])
         assert any(n["symbol"] == "USO" and n["sized"] is False for n in paper["names"])
         rc = ak.main(["--fixture", ak.DEFAULT_FIXTURE, "--out", out, "--watch", watch])
         assert rc == 0
@@ -181,28 +182,21 @@ def test_tape_prefers_coingecko_then_binance():
     assert by["PUMP"]["quote_volume_usd"] == 100.0
     ranked = {r["symbol"]: r for r in ak.rank_movers(rows)}
     assert ranked["PUMP"]["quote_volume_usd"] == 100.0
-    assert ranked["AAA"]["laya"] == "would_buy"
+    assert ranked["AAA"]["label"] == "would_buy"
 
 
-def test_systemone_default_off_laya_retired_and_fail_open():
+def test_systemone_default_off_and_fail_open():
     assert os.environ.get("VALEDIA_SYSTEMONE") != "1"
     off = _doc()
-    assert off["laya"]["backend"] == "retired"
-    assert off["laya"]["enabled"] is False
-    assert off["fences"]["laya"] == "retired"
     assert off["systemone"]["backend"] == "stub"
     assert off["systemone"]["enabled"] is False
+    assert off["systemone"]["model"] == "nimble2"
     assert off["fences"]["systemone"] == "stub"
-    assert "laya_shadow" not in off["ranked"][0]
     assert "systemone_shadow" not in off["ranked"][0]
-    os.environ["VALEDIA_LAYA"] = "1"
-    try:
-        ignored = _doc()
-        assert ignored["laya"]["backend"] == "retired"
-        assert "laya_shadow" not in ignored["ranked"][0]
-        assert ignored["systemone"]["enabled"] is False
-    finally:
-        os.environ.pop("VALEDIA_LAYA", None)
+    # The retired decider leaves no key, row field, fence, env read, or print line.
+    assert RETIRED not in json.dumps(off, default=str).lower()
+    assert RETIRED not in ak.format_table(off).lower()
+    assert "label" in off["ranked"][0] and "decide" not in off["ranked"][0]
     os.environ["VALEDIA_SYSTEMONE"] = "1"
     try:
         seen = []
@@ -210,7 +204,7 @@ def test_systemone_default_off_laya_retired_and_fail_open():
         def down(url, payload, timeout):
             seen.append(payload["state"])
             assert payload["state"]["create_order"] is False
-            assert payload["model"] == "nimble"
+            assert payload["model"] == "nimble2"
             raise ConnectionRefusedError("down")
 
         blown = ak.build(
@@ -218,16 +212,14 @@ def test_systemone_default_off_laya_retired_and_fail_open():
         assert blown["systemone"]["backend"] == "stub"
         assert blown["systemone"]["fail_open"] is True
         assert blown["fences"]["systemone"] == "stub"
-        assert blown["laya"]["backend"] == "retired"
         assert [r["symbol"] for r in blown["ranked"]] == [r["symbol"] for r in off["ranked"]]
         by = {r["symbol"]: r for r in blown["ranked"]}
-        assert by["PUMP"]["laya"] == "would_buy"
+        assert by["PUMP"]["label"] == "would_buy"
         assert by["PUMP"]["would_have"]["create_order"] is False
         assert by["USO"]["harvest"] == "NO_HARVEST"
         assert by["USO"]["would_have"]["sized"] is False
-        assert by["KXHIGHNY"]["laya"] == "watch"
+        assert by["KXHIGHNY"]["label"] == "watch"
         assert all(r["would_have"]["create_order"] is False for r in blown["ranked"])
-        assert "laya_shadow" not in by["PUMP"]
         states = {s["symbol"]: s for s in seen}
         assert states["PUMP"]["class"] == "crypto"
         assert states["SPY"]["class"] == "equity"
@@ -237,9 +229,9 @@ def test_systemone_default_off_laya_retired_and_fail_open():
         assert states["SPY"]["informed"]["news"] is False
 
         def ok(url, payload, timeout):
-            assert payload["model"] == "nimble"
+            assert payload["model"] == "nimble2"
             return {
-                "model": "nimble",
+                "model": "nimble2",
                 "answers": {
                     "admit_paper": {"noul": 0.99},
                     "edge_quality": {"score": 3},
@@ -251,20 +243,20 @@ def test_systemone_default_off_laya_retired_and_fail_open():
             fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d, systemone_post=ok)
         assert stamped["systemone"]["backend"] == "systemone_http"
         assert stamped["fences"]["create_order"] is False
-        assert stamped["fences"]["laya"] == "retired"
         by = {r["symbol"]: r for r in stamped["ranked"]}
-        assert by["USO"]["laya"] == "watch"
+        assert by["USO"]["label"] == "watch"
         assert by["USO"]["would_have"]["sized"] is False
         assert by["PUMP"]["systemone_shadow"]["backend"] == "systemone_http"
         assert by["PUMP"]["systemone_shadow"]["answers"]["admit_paper"] == 0.99
         assert by["PUMP"]["systemone_shadow"]["enforcement"] == "none"
         assert by["PUMP"]["would_have"]["create_order"] is False
-        assert "laya_shadow" not in by["PUMP"]
+        assert RETIRED not in json.dumps(stamped, default=str).lower()
         proof = ak._proof_lines(stamped)
         assert "proof crypto PUMP" in proof
         assert "proof equity SPY" in proof
         assert "proof prediction KXHIGHNY" in proof
         assert "create_order=false" in proof
+        assert "label=would_buy" in proof
     finally:
         os.environ.pop("VALEDIA_SYSTEMONE", None)
 
@@ -340,7 +332,7 @@ if __name__ == "__main__":
     test_fences_and_hygiene()
     test_write_and_cli_fixture()
     test_tape_prefers_coingecko_then_binance()
-    test_systemone_default_off_laya_retired_and_fail_open()
+    test_systemone_default_off_and_fail_open()
     test_ornith_season_does_not_reorder()
     test_live_fallback()
     print("PASS test_all_knowing_movers_scan")

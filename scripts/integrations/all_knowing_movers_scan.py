@@ -10,8 +10,7 @@ summary, Finnhub headlines, crypto_paper fee/clip, and jev_shadow.annotate
 and never reorders. CoinGecko 429 falls through to the public Binance 24h tape.
 Fee-true code still labels and sizes. Nimble System One is off unless
 VALEDIA_SYSTEMONE=1, then a loopback /v1/systemone decide is attached and a
-down server falls open to the same label. VALEDIA_LAYA is ignored.
-No ALLOWLIST change.
+down server falls open to the same label. No ALLOWLIST change.
 """
 from __future__ import annotations
 
@@ -82,11 +81,11 @@ def fee_true_edge(chg_pct, taker, slip):
     return (float(chg_pct) / 100.0) - rt
 
 
-def laya_shadow_decide(row):
+def fee_true_label(row):
     """Fee-true paper label. watch / would_buy / would_pass. Never create_order.
 
-    Not OMS. Not Kelly. The field name is the historical code label.
-    Nimble System One does not change it.
+    Not OMS. Not Kelly. Stored as row["label"]. Nimble System One does not
+    change it.
     """
     if weather_name(row.get("symbol"), row.get("class")) or row.get("oil_fenced"):
         return "watch"
@@ -168,11 +167,11 @@ def rank_movers(rows, *, bankroll=BANKROLL, maker=None, taker=None, slip=None,
             "oil_fenced": oil_fenced(sym, cls),
             "harvest": "NO_HARVEST" if oil_fenced(sym, cls) else None,
         }
-        row["laya"] = laya_shadow_decide(row)
+        row["label"] = fee_true_label(row)
         if s1.enabled():
             row["systemone_shadow"] = s1.decide(
                 s1.compact_state(row, informed), post=systemone_post)
-        if row["laya"] == "would_buy":
+        if row["label"] == "would_buy":
             row["would_have"] = _would_have(
                 row["price"], notional, maker, taker, slip, impact)
         else:
@@ -435,7 +434,7 @@ def presence(ranked, notes, sym):
                 "chg_24h": r["chg_24h"],
                 "edge": r["edge"],
                 "impact_usd": r["impact_usd"],
-                "laya": r["laya"],
+                "label": r["label"],
                 "sized": bool((r.get("would_have") or {}).get("sized")),
                 "note": (notes or {}).get(sym),
             }
@@ -453,23 +452,10 @@ def fences():
         "allowlist_widened": False,
         "oil": "NO_HARVEST",
         "weather": "WATCH",
-        "laya": "retired",
         "systemone": "stub",
         "jev": "seasoning_only",
         "ornith": "seasoning_only",
         "counts_toward_kelly": False,
-    }
-
-
-def _laya_retired():
-    return {
-        "enabled": False,
-        "backend": "retired",
-        "fail_open": False,
-        "mode": "retired",
-        "enforcement": "none",
-        "create_order": False,
-        "note": "VALEDIA_LAYA removed 2026-09-30. Local decide is Nimble /v1/systemone.",
     }
 
 
@@ -505,7 +491,6 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
     _ = order_before
     shadow = s1.summary(ranked, informed)
     held = fences()
-    held["laya"] = "retired"
     held["systemone"] = shadow["backend"] if shadow["enabled"] else "stub"
     doc = {
         "ts": _now(),
@@ -517,7 +502,6 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
         "print_bar_pct": PRINT_BAR_PCT,
         "fee_table": cp.FEE_TABLE,
         "fences": held,
-        "laya": _laya_retired(),
         "systemone": shadow,
         "jev": jev,
         "ornith": ornith,
@@ -532,12 +516,12 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
 def paper_watch_doc(doc):
     names = []
     for r in doc["ranked"]:
-        if r["laya"] == "would_pass":
+        if r["label"] == "would_pass":
             continue
         names.append({
             "symbol": r["symbol"],
             "class": r["class"],
-            "laya": r["laya"],
+            "label": r["label"],
             "chg_24h": r["chg_24h"],
             "impact_usd": r["impact_usd"],
             "sized": bool((r.get("would_have") or {}).get("sized")),
@@ -570,7 +554,7 @@ def format_table(doc, n=12):
         "origin=%s bankroll=%.2f clip=%.0f%% bar=%.0f%% safety=%s"
         % (doc["origin"], doc["bankroll_usd"], doc["clip_frac"] * 100,
            doc["print_bar_pct"], doc["fences"]["crypto_paper_safety"]),
-        f"{'symbol':10} {'class':8} {'chg%':>8} {'edge':>9} {'impact$':>10} {'laya':12} sized",
+        f"{'symbol':10} {'class':8} {'chg%':>8} {'edge':>9} {'impact$':>10} {'label':12} sized",
     ]
     for r in doc["ranked"][:n]:
         chg = "—" if r["chg_24h"] is None else "%+8.2f" % r["chg_24h"]
@@ -578,21 +562,18 @@ def format_table(doc, n=12):
         impact = "—" if r["impact_usd"] is None else "%10.4f" % r["impact_usd"]
         sized = "Y" if (r.get("would_have") or {}).get("sized") else "n"
         lines.append(
-            f"{r['symbol']:10} {r['class']:8} {chg:>8} {edge:>9} {impact:>10} {r['laya']:12} {sized}")
+            f"{r['symbol']:10} {r['class']:8} {chg:>8} {edge:>9} {impact:>10} {r['label']:12} {sized}")
     for sym, info in (doc.get("probe") or {}).items():
         if info.get("present"):
-            lines.append("probe %s present chg=%s laya=%s sized=%s" % (
-                sym, info.get("chg_24h"), info.get("laya"), info.get("sized")))
+            lines.append("probe %s present chg=%s label=%s sized=%s" % (
+                sym, info.get("chg_24h"), info.get("label"), info.get("sized")))
         else:
             lines.append("probe %s ABSENT reason=%s" % (sym, info.get("reason")))
-    lay = doc.get("laya") or {}
     shadow = doc.get("systemone") or {}
     lines.append(
         "systemone.backend=%s model=%s fail_open=%s enforcement=%s create_order=false"
         % (shadow.get("backend"), shadow.get("model"), shadow.get("fail_open"),
            shadow.get("enforcement")))
-    lines.append(
-        "laya.backend=%s retired=true create_order=false" % lay.get("backend"))
     orn = doc.get("ornith") or {}
     lines.append(
         "ornith enabled=%s fail_open=%s reason=%s changes_rank=false"
@@ -624,7 +605,7 @@ def _proof_lines(doc):
         ans = sh.get("answers") or {}
         lines.append(
             "proof %s %s class=%s label=%s sized=%s admit=%s edge_q=%s venue=%s latency_ms=%s create_order=false"
-            % (key, r.get("symbol"), r.get("class"), r.get("laya"),
+            % (key, r.get("symbol"), r.get("class"), r.get("label"),
                "Y" if (r.get("would_have") or {}).get("sized") else "n",
                ans.get("admit_paper"), ans.get("edge_quality"), ans.get("venue_class"),
                sh.get("latency_ms")))
@@ -638,8 +619,10 @@ def main(argv=None):
     p.add_argument("--watch", default=PAPER_WATCH)
     p.add_argument("--bankroll", type=float, default=BANKROLL)
     args = p.parse_args(argv)
+    health = None
     if s1.enabled():
         h = s1.health()
+        health = h
         print(
             "systemone.health ok=%s version=%s model_present=%s model=%s mode=%s enforcement=%s"
             % (h.get("ok"), h.get("version"), h.get("model_present"),
@@ -648,6 +631,8 @@ def main(argv=None):
         fixture_path=args.fixture or None,
         bankroll=args.bankroll,
     )
+    if health is not None:
+        doc["systemone"]["health"] = health
     out, watch = write_doc(doc, args.out, args.watch)
     print(format_table(doc))
     print("wrote %s" % out)
