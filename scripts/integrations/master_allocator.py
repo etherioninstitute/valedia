@@ -605,8 +605,7 @@ def execute_allocations(allocations, dry_run=False):
                     r["contracts"] = n
                     results.append(r)
                     continue
-                if pre.get("jev") is not None:
-                    r["jev"] = pre["jev"]
+                # The Nimble 2 verdict below is this create's only model note (no second call).
                 r["nimble"] = nv = _nw.gate(
                     a, pre["informed"], source="master_allocator", extra={"clock_ok": True})
                 if not nv["allow"]:  # Nimble 2 veto: last gate, entry removal only

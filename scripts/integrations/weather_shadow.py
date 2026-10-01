@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 LEDGER_PATH = os.path.join(ROOT, "models", "weather_shadow_ledger.json")
 CACHE_PATH = os.path.join(ROOT, "models", "weather_city_cache.json")
-# Live create rows. Shadow morning alerts. Jev never writes these alone.
+# Live create rows. Shadow morning alerts. A Nimble 2 note never writes these alone.
 LIVE_LEDGER_PATH = os.path.join(ROOT, "models", "weather_live_ledger.jsonl")
 ALERT_MD = os.path.join(ROOT, "recommendations", "WEATHER-MORNING-ALERT.md")
 ALERT_EV = 0.0
@@ -406,17 +406,18 @@ def score(candidate, fmap=None, bankroll=100.0, now=None):
     }
     row = wl.attach(row, looked)
     row["ftl_shaped"] = desk.ftl_shaped(row, "WEATHER_ARB")
-    return _jev_weather(row)
+    return _nimble_weather(row)
 
 
-def _jev_weather(row):
-    """Jev shadow on the scored bundle. Fail-open. Never a create."""
+def _nimble_weather(row):
+    """Nimble 2 note on the scored bundle (VALEDIA_SYSTEMONE=1). Fail-open. Never a create."""
     try:
-        import jev_shadow as jev
-        stamped = jev.annotate_weather(row)
+        import nimble_annotate as na
+        stamped = na.annotate_weather(row, caller="weather_shadow")
     except Exception:
         stamped = dict(row)
-        stamped["jev"] = {"enabled": True, "fail_open": True, "oms": False, "error": "annotate_weather"}
+        stamped["nimble_note"] = {"annotate_only": True, "fail_open": True, "oms": False,
+                                  "error": "annotate_weather"}
     stamped["create_order"] = False
     stamped["dispatchable"] = 0
     return stamped
@@ -552,14 +553,14 @@ def append_live_ledger(row, path=None):
         "reasons", "reason", "create_order",
     )}
     slim["ledger"] = "weather_live_ledger"
-    slim["jev_oms"] = False
+    slim["nimble_oms"] = False
     with open(path, "a") as f:
         f.write(json.dumps(slim, default=str) + "\n")
     return path
 
 
 def morning_scan(markets, fmap=None, bankroll=100.0, alert_path=None, ledger_path=None):
-    """Score each daily weather bundle, Jev-stamp, shadow-ledger, alert on edge.
+    """Score each daily weather bundle, Nimble-note, shadow-ledger, alert on edge.
 
     ledger_path False skips the shadow file. Never sets create_order.
     """

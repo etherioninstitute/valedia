@@ -26,7 +26,7 @@ Local typed shadow on the paper movers scan. Same three judgments as pack `valed
 ## Fence
 
 - Enable for one process with `VALEDIA_SYSTEMONE=1`. Leave it unset on crons so a scan does not cold-load 9 GB beside resident Ornith.
-- Jev (`VALEDIA_JEV`) stays the optional cloud seasoning. This client does not call it.
+- Jev (TypeSafe cloud) is retired and deleted from code (2026-10-01): no cloud URL, no key, no `VALEDIA_JEV`. Nimble 2 is the only decision model.
 - No `--live`. No venue flips. No wallet or keys in the state. Oil `NO_HARVEST`. Weather watch. ALLOWLIST unchanged.
 - Health is `GET /api/version` and `GET /api/tags` only. `model_present` is true only when the configured Nimble 2 tag is listed (for `nimble:latest`, also with the pinned digest: otherwise `error` is `digest_mismatch` / `digest_unverified`); otherwise the scan fails open to the same fee-true label. Do not stack a decide in front of a scan.
 - The scan row label is `label` (fee-true, code-owned). The scan JSON carries a `systemone` block (backend, model, health) and no per-backend retired block.
@@ -34,13 +34,13 @@ Local typed shadow on the paper movers scan. Same three judgments as pack `valed
 
 ## Gates live in code (principle)
 
-Nimble 2 is weak at arithmetic and counting. It gets one narrow question per call; every hard number and comparison is enforced by deterministic code around it. `facts()` (and Jev's `tiny_state` / `weather_state`) compute booleans such as `edge_positive`, `clears_size_bar`, `thin_tape`, `is_oil`, `fv_vs_book` from the scan's own constants (`LIMITS`). The questions refer to those facts in words and contain no digits (asserted in tests). The model's answer never sets a label, size, rank, or order.
+Nimble 2 is weak at arithmetic and counting. It gets one narrow question per call; every hard number and comparison is enforced by deterministic code around it. `facts()` (and `nimble_annotate`'s report / weather / conviction / scan facts) compute booleans such as `edge_positive`, `clears_size_bar`, `thin_tape`, `is_oil`, `fv_vs_book` from the scan's own constants (`LIMITS`). The questions refer to those facts in words and contain no digits (asserted in tests). The model's answer never sets a label, size, rank, or order.
 
-- **Decision log:** every call, yes and no, appends one JSON line to `data/systemone/decisions.jsonl` (git-ignored; `VALEDIA_SYSTEMONE_LOG` overrides): ts, source, model, full state, raw response or error, parsed answers (confidence, probabilities), latency, `within_budget`, and the code's own `label`. Covers the movers scan, warmup, and Jev shadow on both backends. No keys or headers.
+- **Decision log:** every call, yes and no, appends one JSON line to `data/systemone/decisions.jsonl` (git-ignored; `VALEDIA_SYSTEMONE_LOG` overrides): ts, source, model, full state, raw response or error, parsed answers (confidence, probabilities), latency, `within_budget`, and the code's own `label`. Covers the movers scan, warmup, `nimble_decide` and `nimble_annotate:<kind>:<caller>` notes. No keys or headers.
 - **Latency:** warm target under 500 ms (`VALEDIA_SYSTEMONE_BUDGET_MS`). `warmup()` runs once at the start of an enabled scan; the 120 s timeout stays for cold loads. `summary()` reports warm p50/p95, `cold_n`, `within_budget_n`.
-- **Jev backend:** `VALEDIA_JEV_BACKEND=nimble2` (opt-in, with `VALEDIA_JEV=1`) sends the Jev questions to loopback `/v1/systemone` on the Nimble 2 pin with the short Jev timeout. Default stays the TypeSafe cloud. Fail-open; annotations never change score, direction, bias, weight, or Kelly.
+- **Notes (`nimble_annotate`, replaces Jev):** with `VALEDIA_SYSTEMONE=1`, Kalshi CONVICTION at the unwired `kalshi_executor` (`conviction_note`: prediction_facts on the INFORMED dict + informed_facts), weather_shadow rows (agree / status_honesty), MiroFish signal docs (report_usable / stand_down / we_are_the_exit) and the movers scan get a `nimble_note` built from code facts. Annotate only: never gates, sizes, or changes score, direction, bias, weight, or Kelly. Sites with `nimble_wiring.gate` use that verdict, no second call.
 
-Keep Jev optional. Nimble stamps. It does not size and it does not send.
+Nimble stamps. It does not size and it does not send.
 
 ## Quick decisions for every asset class (`nimble_decide`)
 
