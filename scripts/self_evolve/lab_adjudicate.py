@@ -12,8 +12,10 @@ The `gate` argument is a backtest_gate module (dependency injection), so this fi
 never imports Valedia code and never touches the network, keys or live config.
 
 Rule: ACCEPT iff visible verdict == PASS and candidate fee-true net strictly beats
-baseline on visible and holdout verdict != FAIL. INSUFFICIENT_DATA on visible is
-never a pass. Fold results (disjoint chronological slices of visible) are
+baseline on visible and the holdout verdict is PASS, or not FAIL with candidate
+n_taken >= 30 on holdout. INSUFFICIENT_DATA never passes: a thin holdout BLOCKS
+acceptance unless the lab was initialised with allow_thin_holdout (pinned in
+lab_config.json; then holdout only has to be not FAIL — in-sample risk). Fold results (disjoint chronological slices of visible) are
 evidence for self-evolve's e-process; they only count when the rule above holds.
 (c) GOATWORTHY Post LLC.
 """
@@ -25,6 +27,8 @@ EVOLVABLE = "policy/candidate.json"
 PRIVATE_SUBDIR = "valedia-policy-lab"        # lives in <lab>/.git/, outside every worktree
 IGNORED_DIRS = {".git", ".sie", "__pycache__", ".pytest_cache"}
 EPS = 1e-9
+HOLDOUT_MIN_TAKEN = 30                       # = backtest_gate HARD_MIN_N
+HOLDOUT_FRAC_RANGE = (0.2, 0.5)              # out-of-sample slice must be real
 
 
 def sha256_file(path):
@@ -100,8 +104,9 @@ def split_ledger(lines, holdout_frac):
     Rows are grouped per trade (entry + its settlements) so a trade never straddles
     the split; groups are ordered like backtest_gate.build_trades (entry ts, else
     settlement logged_at, then ledger order) and the LAST holdout_frac go to holdout."""
-    if not 0.0 <= holdout_frac < 1.0:
-        raise ValueError("holdout_frac must be in [0, 1)")
+    lo, hi = HOLDOUT_FRAC_RANGE
+    if not lo <= holdout_frac <= hi:
+        raise ValueError("holdout_frac must be in [%s, %s]" % (lo, hi))
     groups, order = {}, []
     for i, ln in enumerate(lines):
         try:
@@ -164,6 +169,11 @@ def adjudicate(gate, cfg, baseline, candidate, visible_path, holdout_path):
                        % (vis["candidate"]["net"], vis["baseline"]["net"]))
     if hold["verdict"] == "FAIL":
         reasons.append("holdout verdict FAIL: %s" % hold["summary"])
+    elif (hold["verdict"] != "PASS" and hold["candidate"]["n_taken"] < HOLDOUT_MIN_TAKEN
+          and not cfg.get("allow_thin_holdout", False)):
+        reasons.append("holdout too thin to check out-of-sample (%s, candidate n_taken=%d < %d); "
+                       "re-init with --allow-thin-holdout to accept in-sample risk"
+                       % (hold["verdict"], hold["candidate"]["n_taken"], HOLDOUT_MIN_TAKEN))
     folds = fold_results(gate, visible_path, baseline, candidate, cfg["n_folds"],
                          live_only=bool(g.get("live_only", False)))
     return {"accepted": not reasons, "reasons": reasons, "visible": vis, "holdout": hold,

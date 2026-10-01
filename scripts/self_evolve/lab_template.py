@@ -54,7 +54,8 @@ edits are refused at the PATCH gate and fail the integrity test.
 
 Grader = `pytest` (self-evolve A-tier). Guards must stay green; a candidate is
 accepted only when backtest_gate says PASS on the visible ledger slice with a strict
-fee-true improvement and the holdout slice is not FAIL. Fold tests turn from XFAIL
+fee-true improvement and the held-out last slice PASSes too (a holdout too thin
+to judge blocks acceptance unless lab_config.allow_thin_holdout). Fold tests turn from XFAIL
 to PASSED only for such a candidate. Output is a PROPOSAL; nothing is auto-promoted.
 """
 
@@ -175,7 +176,8 @@ def _git(lab, *args):
 
 
 def materialize(lab, ledger=DEFAULT_LEDGER, baseline=DEFAULT_BASELINE, holdout_frac=0.3,
-                n_folds=12, holdout_min_n=30, n_boot=GATE_DEFAULTS["n_boot"]):
+                n_folds=12, holdout_min_n=30, n_boot=GATE_DEFAULTS["n_boot"],
+                allow_thin_holdout=False):
     """Create + git-commit the lab. Returns the pins dict. Caller validates `lab`."""
     lab = os.path.abspath(lab)
     with open(baseline) as f:
@@ -207,6 +209,7 @@ def materialize(lab, ledger=DEFAULT_LEDGER, baseline=DEFAULT_BASELINE, holdout_f
     cfg = {"gate": dict(GATE_DEFAULTS, n_boot=int(n_boot), live_only=False),
            "holdout_min_n": int(holdout_min_n), "n_folds": int(n_folds),
            "holdout_frac": float(holdout_frac),
+           "allow_thin_holdout": bool(allow_thin_holdout),
            "split": {"visible_rows": len(vis), "holdout_rows": len(hold)},
            "source_ledger_sha256": adj.sha256_file(ledger),
            "visible_sha256": vis_sha, "holdout_sha256": hold_sha}

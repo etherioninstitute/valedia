@@ -84,7 +84,7 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
    python3 scripts/self_evolve/valedia_policy_lab.py export --lab ~/.valedia-policy-lab --run-id ID --out recommendations/policy_proposal.json
    ```
    - Only `policy/candidate.json` is evolvable; grader, gate copy, baseline, ledger snapshot are IMMUTABLE (sha256 pins in `<lab>/.git/`, PATCH-gate shim refuses other writes).
-   - Accept = visible slice PASS + strict fee-true gain + time-held-out last 30% not FAIL; INSUFFICIENT_DATA never passes. `export` re-checks with the real gate.
+   - Accept = visible slice PASS + strict fee-true gain + time-held-out last 20–50% (default 30%) PASS (or not FAIL with ≥30 candidate trades); INSUFFICIENT_DATA never passes, a thin holdout blocks unless the lab was init'd with `--allow-thin-holdout` (in-sample risk, pinned + reported). `export` re-checks with the real gate.
    - Output is a PROPOSAL file only — nothing writes live config, crontab, models/ or allocator settings; a human applies it (or not).
    - self-evolve's own `--live` means "real LLM agents" (not trading): the wrapper refuses it; `--llm-agents` opts in (costs tokens, needs node + cc/claude + codex).
    - Default `--proposer grid` (`grid_proposer.py`): offline, deterministic hill-climb (≤200 moves: block 1/2 categories, size_mult 0.5/0.75, min_edge grid) scored on the VISIBLE slice only; holdout is never read.

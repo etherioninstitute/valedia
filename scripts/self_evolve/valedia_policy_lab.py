@@ -18,7 +18,9 @@ How it maps onto self-evolve (reflect -> propose -> evaluate -> judge -> accept)
     backtest gate on a frozen ledger snapshot. Guards stay green (pass->fail = hard
     REJECT). Adjudication tests are XFAIL at baseline and PASS only when the gate says
     PASS on the visible slice with a strict fee-true improvement AND the time-held-out
-    last 30% is not FAIL (INSUFFICIENT_DATA on visible is never a pass). One test per
+    last 20-50% (default 30%) PASSes or is not FAIL with >= 30 candidate trades.
+    INSUFFICIENT_DATA never passes: a thin holdout blocks acceptance unless the lab was
+    initialised with --allow-thin-holdout (in-sample risk; pinned and reported). One test per
     disjoint chronological fold supplies the >=9 red->green flips self-evolve's
     e-process needs at alpha=0.05; folds only flip for an accepted candidate.
   * judge/accept = self-evolve's deterministic acceptor; `export` then re-adjudicates
@@ -30,7 +32,8 @@ How it maps onto self-evolve (reflect -> propose -> evaluate -> judge -> accept)
 Usage (offline; default self-evolve mode is builtin/serial: no LLM, no network):
   python3 scripts/self_evolve/valedia_policy_lab.py init   --lab ~/.valedia-policy-lab
         [--ledger models/forward_test_ledger.jsonl] [--baseline POLICY.json]
-        [--holdout-frac 0.3] [--n-folds 12] [--holdout-min-n 30] [--n-boot 2000]
+        [--holdout-frac 0.3 (0.2..0.5)] [--n-folds 12] [--holdout-min-n 30] [--n-boot 2000]
+        [--allow-thin-holdout]
   python3 scripts/self_evolve/valedia_policy_lab.py evolve --lab DIR [--max-rounds 3] \
         [--proposer grid|none]
   python3 scripts/self_evolve/valedia_policy_lab.py status --lab DIR [--run-id ID]
@@ -70,6 +73,7 @@ for _p in (HERE, INTEGRATIONS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import lab_adjudicate as adj  # noqa: E402
+from sie_shim import refused_flags, valid_id  # noqa: E402
 
 LIVE_REFUSAL = ("refusing --live: in self-evolve, --live means 'call real LLM agents' (external "
                 "cc/claude + codex CLIs, costs tokens) — it has nothing to do with Valedia trading "
@@ -101,6 +105,18 @@ def _lab_arg(lab):
     return lab
 
 
+def _id_arg(lab, value, what="--run-id"):
+    """A user-supplied run id / vid: plain segment, and its run dir stays inside the lab."""
+    if value is None:
+        return None
+    if not valid_id(value):
+        raise ValueError("%s %r must match ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ without '..'"
+                         % (what, value))
+    if not _inside(os.path.join(lab, ".sie", "runs", value), os.path.join(lab, ".sie", "runs")):
+        raise ValueError("%s %r resolves outside the lab" % (what, value))
+    return value
+
+
 def check_lab(lab):
     """(pins, violations) for the lab checkout. Raises if it is not a policy lab."""
     pins = adj.load_pins(lab)
@@ -109,7 +125,7 @@ def check_lab(lab):
 
 def sie(args, timeout=1800):
     """Run self-evolve's CLI through the IMMUTABLE shim. Never passes --live."""
-    if any(a.split("=", 1)[0] == "--live" for a in args):
+    if refused_flags(args):
         raise RuntimeError(LIVE_REFUSAL)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     return subprocess.run([sys.executable, SHIM, *args], cwd=SIE_ROOT, env=env,
@@ -178,7 +194,8 @@ def cmd_init(a):
         return _err("--lab %s exists and is not empty; refusing to overwrite" % lab)
     pins = materialize(lab, ledger=a.ledger or DEFAULT_LEDGER,
                        baseline=a.baseline or DEFAULT_BASELINE, holdout_frac=a.holdout_frac,
-                       n_folds=a.n_folds, holdout_min_n=a.holdout_min_n, n_boot=a.n_boot)
+                       n_folds=a.n_folds, holdout_min_n=a.holdout_min_n, n_boot=a.n_boot,
+                       allow_thin_holdout=a.allow_thin_holdout)
     with open(os.path.join(lab, "judge", "lab_config.json")) as f:
         cfg = json.load(f)
     print(json.dumps({"lab": lab, "base_commit": pins["base_commit"], "split": cfg["split"],
@@ -230,7 +247,7 @@ def cmd_status(a):
     lab = _lab_arg(a.lab)
     pins, bad = check_lab(lab)
     runs_root = os.path.join(lab, ".sie", "runs")
-    rids = [a.run_id] if a.run_id else sorted(os.listdir(runs_root)) if os.path.isdir(runs_root) else []
+    rids = [a.run_id] if a.run_id else sorted(d for d in os.listdir(runs_root) if valid_id(d)) if os.path.isdir(runs_root) else []
     runs = []
     for rid in rids:
         r = sie(["status", "--target", lab, "--run-id", rid], timeout=120)
@@ -293,6 +310,10 @@ def cmd_export(a):
                "in-sample%s; only the holdout verdict (%s) is out-of-sample."
                % (" — the grid proposer searched %d candidates on visible data" % n_searched
                   if searches else "", verdict["holdout"]["verdict"]))
+    if cfg.get("allow_thin_holdout"):
+        warning += (" THIN HOLDOUT ALLOWED: this lab accepts a holdout that is merely not FAIL "
+                    "(holdout candidate n_taken=%d) — treat the result as in-sample."
+                    % verdict["holdout"]["candidate"]["n_taken"])
     sys.stderr.write("valedia_policy_lab: %s\n" % warning)
     proposal = {
         "kind": "valedia_policy_proposal",
@@ -303,7 +324,9 @@ def cmd_export(a):
         "lab": lab, "run_id": a.run_id, "vid": entry["vid"], "lineage_entry": entry,
         "candidate_policy": cand, "baseline_policy": base,
         "adjudication": {"accepted": True, "rule": "visible PASS + strict fee-true improvement "
-                         "+ holdout not FAIL (re-run with Valedia backtest_gate.py)",
+                         "+ holdout PASS (or not FAIL with >= 30 candidate trades; "
+                         "re-run with Valedia backtest_gate.py)",
+                         "allow_thin_holdout": bool(cfg.get("allow_thin_holdout", False)),
                          "visible_verdict": verdict["visible"]["verdict"],
                          "holdout_verdict": verdict["holdout"]["verdict"],
                          "folds_improved": sum(f["improved"] for f in verdict["folds"]),
@@ -339,6 +362,9 @@ def main(argv=None):
     p.add_argument("--n-folds", type=int, default=12)
     p.add_argument("--holdout-min-n", type=int, default=30)
     p.add_argument("--n-boot", type=int, default=2000)
+    p.add_argument("--allow-thin-holdout", action="store_true",
+                   help="accept with a holdout too thin to judge (only 'not FAIL' required): "
+                        "IN-SAMPLE RISK, pinned in lab_config and recorded in exports")
     p = sub.add_parser("evolve", help="run self-evolve against the lab (builtin by default)")
     p.add_argument("--lab", required=True)
     p.add_argument("--max-rounds", type=int, default=3)
@@ -357,14 +383,20 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--vid", default=None)
     p.add_argument("--force", action="store_true")
-    if any(x.split("=", 1)[0] == "--live" for x in argv):
+    if refused_flags(argv):                          # --live/--self and abbreviations
         return _err(LIVE_REFUSAL, 2)
     a = ap.parse_args(argv)
-    if a.cmd == "init" and (a.n_folds < 8 or not 0 <= a.holdout_frac < 1 or a.n_boot < 1):
+    lo, hi = adj.HOLDOUT_FRAC_RANGE
+    if a.cmd == "init" and (a.n_folds < 8 or not lo <= a.holdout_frac <= hi or a.n_boot < 1):
         # 1 adjudication test + n_folds fold tests must reach the 9 red->green flips the
         # A-tier e-process needs at alpha=0.05, else nothing could ever be accepted.
-        return _err("--n-folds must be >= 8, --n-boot >= 1, --holdout-frac in [0,1)")
+        return _err("--n-folds must be >= 8, --n-boot >= 1, --holdout-frac in [%s, %s]"
+                    % (lo, hi))
     try:
+        if getattr(a, "run_id", None) is not None:
+            _id_arg(_lab_arg(a.lab), a.run_id)
+        if getattr(a, "vid", None) is not None:
+            _id_arg(_lab_arg(a.lab), a.vid, "--vid")
         return {"init": cmd_init, "evolve": cmd_evolve, "status": cmd_status,
                 "export": cmd_export}[a.cmd](a)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
