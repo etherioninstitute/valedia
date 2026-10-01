@@ -1,0 +1,9 @@
+# KILL-SWITCH status (not sent)
+
+- halted: `False`
+- reason: manual off
+- source: cli
+- ts: 2026-09-19T07:26:15.762059+00:00
+- version: 0.23.0
+- ping.send: `False` (Valedia/Grok Bot delivers)
+- ping.text: VALEDIA_TRADING_HALT halted=false reason=manual off (not sent; Valedia/Grok Bot to deliver)

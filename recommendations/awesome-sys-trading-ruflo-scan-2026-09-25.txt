@@ -1,0 +1,15 @@
+
+Security Scan
+──────────────────────────────────────────────────
+... Scanning /Users/burtonchatelain/MemPalace/sources/repos/github/awesome-systematic-trading...                                    Scan complete
+
+No security issues found!
+
++-------------------------------------- Scan Summary --------------------------------------+
+| Target: /Users/burtonchatelain/MemPalace/sources/repos/github/awesome-systematic-trading |
+| Depth: standard                                                                          |
+| Type: all                                                                                |
+|                                                                                          |
+| Critical: 0  High: 0  Medium: 0  Low: 0                                                  |
+| Total Issues: 0                                                                          |
++------------------------------------------------------------------------------------------+

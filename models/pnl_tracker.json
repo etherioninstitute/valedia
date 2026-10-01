@@ -306,7 +306,7 @@
     }
   ],
   "summary": {
-    "last_updated": "2026-09-13T06:00:09.035531+00:00",
+    "last_updated": "2026-10-01T06:01:31.016477+00:00",
     "total_trades": 38,
     "wins": 10,
     "losses": 28,
@@ -314,8 +314,8 @@
     "total_won": 79.39,
     "total_lost": 92.01,
     "net_pnl": -12.62,
-    "current_balance": 5.0,
-    "current_deployed": 113.0,
+    "current_balance": 60.6,
+    "current_deployed": 1.68,
     "strategies": {
       "SPORTS": {
         "wins": 6,

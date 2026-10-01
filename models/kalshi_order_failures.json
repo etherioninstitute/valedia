@@ -10,5 +10,153 @@
   "KXCPI-26SEP-T0.1": {
     "count": 1,
     "last_error": "400 Client Error: Bad Request for url: https://api.elections.kalshi.com/trade-ap"
+  },
+  "KXMLBGAME-26SEP192010NYYAZ-NYY": {
+    "count": 2,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP20NYINJ-NJ": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2017-B81625": {
+    "count": 2,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP192110SFLAD-SF": {
+    "count": 2,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201310PHINYM-PHI": {
+    "count": 2,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2017-B2580": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201340CHCCIN-CHC": {
+    "count": 1,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201340ATHCLE-CLE": {
+    "count": 1,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201610SFLAD-SF": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2017-B81875": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201510SEACOL-SEA": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP20SJANA-ANA": {
+    "count": 1,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP20UTACOL-COL": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201920MILBAL-MIL": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2017-B79875": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP20NSHTB-TB": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXMLBGAME-26SEP201610SFLAD-LAD": {
+    "count": 1,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP20CARFLA-FLA": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2117-B81125": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2117-B2570": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2117-B2610": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP21MINCHI-MIN": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2117-B81375": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNEXTSPEAKER-31-JJOR": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXUSAKIM-29": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2108-B84850": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP21MINCHI-CHI": {
+    "count": 3,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2112-B86150": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2116-B86250": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXNHLGAME-26SEP21COLWPG-WPG": {
+    "count": 2,
+    "last_error": "403 Client Error: Forbidden for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2217-B2830": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2217-B86625": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2217-B2790": {
+    "count": 2,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2217-B86125": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2217-B86375": {
+    "count": 1,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXBTC-26SEP2317-B86625": {
+    "count": 2,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
+  },
+  "KXETH-26SEP2317-B2800": {
+    "count": 2,
+    "last_error": "404 Client Error: Not Found for url: https://api.elections.kalshi.com/trade-api/"
   }
 }

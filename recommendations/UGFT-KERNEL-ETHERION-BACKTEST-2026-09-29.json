@@ -1,0 +1,869 @@
+{
+  "name": "UGFT-KERNEL-ETHERION-BACKTEST",
+  "label": "PAPER/fee-true/not-live",
+  "generated_at": "2026-09-29 21:43:28 PDT",
+  "jev": "AUTONOMY-2 jev_shadow is MiroFish annotate-only. Not a bar bulk backtester. Jev did not run these bars.",
+  "alpha": "kernel_predictor_v16e.KernelPredictor",
+  "gates": [
+    "QEIDrawdownGuard",
+    "VarianceCascade",
+    "ExecutionErrorEstimator"
+  ],
+  "gate_policy": {
+    "qei": "Finite HALT_ALL flattens; REDUCE_50% multiplies size by 0.5. phi_0 from the prior 120 asset log-returns via adaptive_threshold. check_guard runs on the last 60 asset log-returns, not on strategy pnl. A non-finite ratio is qei_nonfinite and is not a halt.",
+    "variance_cascade": "VarianceCascadeEngine.compute_sobolev_ladder. Gronwall_ratio >= 2 multiplies size by 0.5. energy_ladder_check is not called: kotecky_preiss_criterion IndexErrors on a single column because np.corrcoef returns a scalar. KP is cross-asset and is not a signal here.",
+    "execution_error": "estimate_slippage rebalance_freq=1. slippage_pct >= 8.0 flattens; >= 5.0 multiplies by 0.5. Booked cost stays CE-3.",
+    "sign": "Gates never increase |size| and never flip sign."
+  },
+  "fees": {
+    "CRYPTO_FEE_PCT": 0.001,
+    "CRYPTO_SLIPPAGE_PCT": 0.0005,
+    "one_way": 0.0015,
+    "not": "kernel backtest default fee 0.0008",
+    "turn_min": 0.05
+  },
+  "not": [
+    "orders",
+    "--live",
+    "venue sends",
+    "create_order",
+    "Kelly",
+    "Etherion-as-alpha",
+    "SuperTrend-only TV",
+    "Jev bar replay"
+  ],
+  "assets": [
+    {
+      "ticker": "ETH-USD",
+      "asset_class": "crypto",
+      "fee_book": "CE-3 CRYPTO_FEE_PCT+CRYPTO_SLIPPAGE_PCT on |delta weight|",
+      "start": "2020-01-01",
+      "end": "2026-09-30",
+      "closes": 2464,
+      "ugft": {
+        "ret_pct": 87.13003333414775,
+        "bh_pct": 1911.6743162400378,
+        "alpha_pct": -1824.54428290589,
+        "sharpe": 0.4559778583249407,
+        "maxdd_pct": 23.070791633152282,
+        "hit_pct": 51.388888888888886,
+        "trades": 489,
+        "fees_paid": 0.15904246604123887,
+        "fees_paid_pct_of_start": 15.904246604123887,
+        "bars": 2383
+      },
+      "ugft_gates": {
+        "kernel_halt": 0,
+        "qei_cut": 251,
+        "qei_halt": 513,
+        "qei_nonfinite": 0,
+        "cascade_cut": 574,
+        "eee_cut": 286,
+        "eee_halt": 69,
+        "bars_halt": 582,
+        "bars_cut": 727
+      },
+      "ugft_years": [
+        {
+          "ret_pct": 10.925225836724728,
+          "bh_pct": 455.4965892564536,
+          "alpha_pct": -444.57136341972887,
+          "sharpe": 0.6135852304987282,
+          "maxdd_pct": 10.009336190262431,
+          "hit_pct": 54.37499999999999,
+          "trades": 54,
+          "fees_paid": 0.01248609547302059,
+          "fees_paid_pct_of_start": 1.248609547302059,
+          "bars": 285,
+          "year": "2020",
+          "gates": {
+            "qei_cut": 1,
+            "qei_halt": 54,
+            "qei_nonfinite": 0,
+            "cascade_cut": 85,
+            "eee_cut": 1,
+            "eee_halt": 69
+          }
+        },
+        {
+          "ret_pct": 11.955414618528714,
+          "bh_pct": 399.13469953394934,
+          "alpha_pct": -387.1792849154206,
+          "sharpe": 0.3779696963159701,
+          "maxdd_pct": 16.255102556628103,
+          "hit_pct": 51.973684210526315,
+          "trades": 103,
+          "fees_paid": 0.033068515492662584,
+          "fees_paid_pct_of_start": 3.3068515492662582,
+          "bars": 365,
+          "year": "2021",
+          "gates": {
+            "qei_cut": 19,
+            "qei_halt": 61,
+            "qei_nonfinite": 0,
+            "cascade_cut": 84,
+            "eee_cut": 184,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.0018931492716367515,
+          "bh_pct": -67.50229248563252,
+          "alpha_pct": 67.50039933636089,
+          "sharpe": -0.00010013658877216647,
+          "maxdd_pct": 23.070791633152282,
+          "hit_pct": 51.68539325842697,
+          "trades": 58,
+          "fees_paid": 0.01687387920575946,
+          "fees_paid_pct_of_start": 1.6873879205759459,
+          "bars": 365,
+          "year": "2022",
+          "gates": {
+            "qei_cut": 53,
+            "qei_halt": 99,
+            "qei_nonfinite": 0,
+            "cascade_cut": 80,
+            "eee_cut": 89,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 7.944811758739867,
+          "bh_pct": 90.63552955696427,
+          "alpha_pct": -82.6907177982244,
+          "sharpe": 0.48109009290415977,
+          "maxdd_pct": 12.4644001852663,
+          "hit_pct": 46.913580246913575,
+          "trades": 75,
+          "fees_paid": 0.02178793164837173,
+          "fees_paid_pct_of_start": 2.178793164837173,
+          "bars": 365,
+          "year": "2023",
+          "gates": {
+            "qei_cut": 57,
+            "qei_halt": 40,
+            "qei_nonfinite": 0,
+            "cascade_cut": 66,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 2.795347806112858,
+          "bh_pct": 46.06942006693273,
+          "alpha_pct": -43.27407226081987,
+          "sharpe": 0.16338524101692575,
+          "maxdd_pct": 19.012294073801698,
+          "hit_pct": 52.46478873239436,
+          "trades": 74,
+          "fees_paid": 0.02306277227883497,
+          "fees_paid_pct_of_start": 2.306277227883497,
+          "bars": 366,
+          "year": "2024",
+          "gates": {
+            "qei_cut": 34,
+            "qei_halt": 82,
+            "qei_nonfinite": 0,
+            "cascade_cut": 113,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 21.358008136401896,
+          "bh_pct": -10.967461657649602,
+          "alpha_pct": 32.3254697940515,
+          "sharpe": 0.8088181805897829,
+          "maxdd_pct": 10.549780151420016,
+          "hit_pct": 51.369863013698634,
+          "trades": 79,
+          "fees_paid": 0.0331366122112489,
+          "fees_paid_pct_of_start": 3.31366122112489,
+          "bars": 365,
+          "year": "2025",
+          "gates": {
+            "qei_cut": 52,
+            "qei_halt": 73,
+            "qei_nonfinite": 0,
+            "cascade_cut": 61,
+            "eee_cut": 12,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 11.900652592313365,
+          "bh_pct": -9.947892641364021,
+          "alpha_pct": 21.848545233677385,
+          "sharpe": 1.0093684899053115,
+          "maxdd_pct": 5.416222938527572,
+          "hit_pct": 53.84615384615385,
+          "trades": 46,
+          "fees_paid": 0.01862665973134049,
+          "fees_paid_pct_of_start": 1.862665973134049,
+          "bars": 272,
+          "year": "2026",
+          "gates": {
+            "qei_cut": 35,
+            "qei_halt": 104,
+            "qei_nonfinite": 0,
+            "cascade_cut": 85,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        }
+      ],
+      "kernel_only_same_fees": {
+        "ret_pct": 114.76920215843074,
+        "bh_pct": 1911.6743162400378,
+        "alpha_pct": -1796.905114081607,
+        "sharpe": 0.34604699659864535,
+        "maxdd_pct": 32.5669989768557,
+        "hit_pct": 50.902981940361194,
+        "trades": 517,
+        "fees_paid": 0.24900235082465028,
+        "fees_paid_pct_of_start": 24.900235082465027,
+        "bars": 2383
+      },
+      "kernel_only_gates": {
+        "kernel_halt": 0
+      },
+      "kernel_parity_same_fees": {
+        "ok": true,
+        "ref_fee": 0.0015,
+        "ref_ret_pct": 114.76920215843035,
+        "ref_bh_pct": 1911.6743162400378,
+        "ref_alpha_pct": -1796.9051140816075,
+        "ref_sharpe": 0.34604699659864435,
+        "ref_hit_pct": 50.902981940361194,
+        "ref_trades": 517,
+        "ret_abs_diff": 3.979039320256561e-13,
+        "trades_match": true,
+        "note": "Same CE-3 one-way cost passed into kernel backtest(). Kernel default 8 bps was not used."
+      }
+    },
+    {
+      "ticker": "BTC-USD",
+      "asset_class": "crypto",
+      "fee_book": "CE-3 CRYPTO_FEE_PCT+CRYPTO_SLIPPAGE_PCT on |delta weight|",
+      "start": "2020-01-01",
+      "end": "2026-09-30",
+      "closes": 2464,
+      "ugft": {
+        "ret_pct": 5.423001639121794,
+        "bh_pct": 1246.322701416024,
+        "alpha_pct": -1240.8996997769023,
+        "sharpe": 0.05132519278696796,
+        "maxdd_pct": 35.48051606634113,
+        "hit_pct": 50.28306742151313,
+        "trades": 437,
+        "fees_paid": 0.12159813821526783,
+        "fees_paid_pct_of_start": 12.159813821526782,
+        "bars": 2383
+      },
+      "ugft_gates": {
+        "kernel_halt": 0,
+        "qei_cut": 311,
+        "qei_halt": 437,
+        "qei_nonfinite": 0,
+        "cascade_cut": 569,
+        "eee_cut": 100,
+        "eee_halt": 0,
+        "bars_halt": 437,
+        "bars_cut": 682
+      },
+      "ugft_years": [
+        {
+          "ret_pct": 26.534771438545434,
+          "bh_pct": 368.89909983535193,
+          "alpha_pct": -342.3643283968065,
+          "sharpe": 2.0096728657137515,
+          "maxdd_pct": 3.374311018657064,
+          "hit_pct": 58.333333333333336,
+          "trades": 59,
+          "fees_paid": 0.013226404576633915,
+          "fees_paid_pct_of_start": 1.3226404576633914,
+          "bars": 285,
+          "year": "2020",
+          "gates": {
+            "qei_cut": 4,
+            "qei_halt": 42,
+            "qei_nonfinite": 0,
+            "cascade_cut": 91,
+            "eee_cut": 68,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -7.784540498601644,
+          "bh_pct": 59.66792379843302,
+          "alpha_pct": -67.45246429703467,
+          "sharpe": -0.2919369428022396,
+          "maxdd_pct": 33.03629038941504,
+          "hit_pct": 48.92086330935252,
+          "trades": 83,
+          "fees_paid": 0.026942789074977335,
+          "fees_paid_pct_of_start": 2.6942789074977336,
+          "bars": 365,
+          "year": "2021",
+          "gates": {
+            "qei_cut": 46,
+            "qei_halt": 87,
+            "qei_nonfinite": 0,
+            "cascade_cut": 60,
+            "eee_cut": 32,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -5.660708552438165,
+          "bh_pct": -64.26524216644383,
+          "alpha_pct": 58.60453361400566,
+          "sharpe": -0.4640217477372641,
+          "maxdd_pct": 10.96926372111593,
+          "hit_pct": 54.0650406504065,
+          "trades": 46,
+          "fees_paid": 0.011226997101792303,
+          "fees_paid_pct_of_start": 1.1226997101792302,
+          "bars": 365,
+          "year": "2022",
+          "gates": {
+            "qei_cut": 49,
+            "qei_halt": 120,
+            "qei_nonfinite": 0,
+            "cascade_cut": 78,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 8.112428572983,
+          "bh_pct": 155.4174194122553,
+          "alpha_pct": -147.3049908392723,
+          "sharpe": 0.5623215472553814,
+          "maxdd_pct": 16.117446360960898,
+          "hit_pct": 49.48453608247423,
+          "trades": 83,
+          "fees_paid": 0.026834844911187452,
+          "fees_paid_pct_of_start": 2.683484491118745,
+          "bars": 365,
+          "year": "2023",
+          "gates": {
+            "qei_cut": 14,
+            "qei_halt": 73,
+            "qei_nonfinite": 0,
+            "cascade_cut": 110,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -4.6903738660903365,
+          "bh_pct": 121.05474659257101,
+          "alpha_pct": -125.74512045866135,
+          "sharpe": -0.41074507540939487,
+          "maxdd_pct": 15.530921128488288,
+          "hit_pct": 48.59550561797753,
+          "trades": 71,
+          "fees_paid": 0.019083564183526122,
+          "fees_paid_pct_of_start": 1.9083564183526123,
+          "bars": 366,
+          "year": "2024",
+          "gates": {
+            "qei_cut": 89,
+            "qei_halt": 10,
+            "qei_nonfinite": 0,
+            "cascade_cut": 88,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -6.537943258601386,
+          "bh_pct": -6.336749968935374,
+          "alpha_pct": -0.20119328966601202,
+          "sharpe": -0.7952942683218905,
+          "maxdd_pct": 10.213517032694822,
+          "hit_pct": 44.5859872611465,
+          "trades": 54,
+          "fees_paid": 0.013320646972877302,
+          "fees_paid_pct_of_start": 1.3320646972877301,
+          "bars": 365,
+          "year": "2025",
+          "gates": {
+            "qei_cut": 68,
+            "qei_halt": 51,
+            "qei_nonfinite": 0,
+            "cascade_cut": 66,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.5553497529120377,
+          "bh_pct": -4.842797110648656,
+          "alpha_pct": 4.2874473577366174,
+          "sharpe": -0.06073211545845237,
+          "maxdd_pct": 9.808944760262847,
+          "hit_pct": 50.917431192660544,
+          "trades": 41,
+          "fees_paid": 0.010962891394273335,
+          "fees_paid_pct_of_start": 1.0962891394273335,
+          "bars": 272,
+          "year": "2026",
+          "gates": {
+            "qei_cut": 41,
+            "qei_halt": 54,
+            "qei_nonfinite": 0,
+            "cascade_cut": 76,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        }
+      ],
+      "kernel_only_same_fees": {
+        "ret_pct": 71.65035795119898,
+        "bh_pct": 1246.322701416024,
+        "alpha_pct": -1174.6723434648252,
+        "sharpe": 0.3766270090611145,
+        "maxdd_pct": 25.540530495267866,
+        "hit_pct": 50.54621848739495,
+        "trades": 453,
+        "fees_paid": 0.209873416730951,
+        "fees_paid_pct_of_start": 20.9873416730951,
+        "bars": 2383
+      },
+      "kernel_only_gates": {
+        "kernel_halt": 0
+      },
+      "kernel_parity_same_fees": {
+        "ok": true,
+        "ref_fee": 0.0015,
+        "ref_ret_pct": 71.65035795119942,
+        "ref_bh_pct": 1246.322701416024,
+        "ref_alpha_pct": -1174.6723434648247,
+        "ref_sharpe": 0.3766270090611161,
+        "ref_hit_pct": 50.54621848739495,
+        "ref_trades": 453,
+        "ret_abs_diff": 4.405364961712621e-13,
+        "trades_match": true,
+        "note": "Same CE-3 one-way cost passed into kernel backtest(). Kernel default 8 bps was not used."
+      }
+    },
+    {
+      "ticker": "SPY",
+      "asset_class": "equity",
+      "fee_book": "CE-3 CRYPTO_FEE_PCT+CRYPTO_SLIPPAGE_PCT on |delta weight|",
+      "start": "2020-01-02",
+      "end": "2026-09-29",
+      "closes": 1694,
+      "ugft": {
+        "ret_pct": -3.5560993429817667,
+        "bh_pct": 192.42609210894778,
+        "alpha_pct": -195.98219145192954,
+        "sharpe": -0.10662398155610213,
+        "maxdd_pct": 13.077834718815337,
+        "hit_pct": 53.091872791519435,
+        "trades": 479,
+        "fees_paid": 0.13974982940796005,
+        "fees_paid_pct_of_start": 13.974982940796005,
+        "bars": 1613
+      },
+      "ugft_gates": {
+        "kernel_halt": 0,
+        "qei_cut": 118,
+        "qei_halt": 154,
+        "qei_nonfinite": 0,
+        "cascade_cut": 185,
+        "eee_cut": 0,
+        "eee_halt": 0,
+        "bars_halt": 154,
+        "bars_cut": 243
+      },
+      "ugft_years": [
+        {
+          "ret_pct": 5.166267673331104,
+          "bh_pct": 32.515198006748335,
+          "alpha_pct": -27.34893033341723,
+          "sharpe": 0.6303178454406894,
+          "maxdd_pct": 8.120770705270127,
+          "hit_pct": 59.23566878980891,
+          "trades": 83,
+          "fees_paid": 0.025008966271029776,
+          "fees_paid_pct_of_start": 2.5008966271029776,
+          "bars": 172,
+          "year": "2020",
+          "gates": {
+            "qei_cut": 0,
+            "qei_halt": 0,
+            "qei_nonfinite": 0,
+            "cascade_cut": 16,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 0.02782651740469433,
+          "bh_pct": 28.728762372808635,
+          "alpha_pct": -28.70093585540394,
+          "sharpe": 0.006579705095189736,
+          "maxdd_pct": 3.968138211087642,
+          "hit_pct": 55.96330275229357,
+          "trades": 97,
+          "fees_paid": 0.02988125377278893,
+          "fees_paid_pct_of_start": 2.988125377278893,
+          "bars": 252,
+          "year": "2021",
+          "gates": {
+            "qei_cut": 29,
+            "qei_halt": 21,
+            "qei_nonfinite": 0,
+            "cascade_cut": 45,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -5.309893402376331,
+          "bh_pct": -18.175374511131448,
+          "alpha_pct": 12.865481108755116,
+          "sharpe": -1.4319413201674518,
+          "maxdd_pct": 6.2652295464655765,
+          "hit_pct": 36.19047619047619,
+          "trades": 46,
+          "fees_paid": 0.009580557701623206,
+          "fees_paid_pct_of_start": 0.9580557701623206,
+          "bars": 251,
+          "year": "2022",
+          "gates": {
+            "qei_cut": 19,
+            "qei_halt": 12,
+            "qei_nonfinite": 0,
+            "cascade_cut": 22,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 0.7169801637919582,
+          "bh_pct": 26.17579252359967,
+          "alpha_pct": -25.458812359807713,
+          "sharpe": 0.20263527232148001,
+          "maxdd_pct": 3.0634335767516725,
+          "hit_pct": 56.024096385542165,
+          "trades": 75,
+          "fees_paid": 0.018821729632755285,
+          "fees_paid_pct_of_start": 1.8821729632755284,
+          "bars": 250,
+          "year": "2023",
+          "gates": {
+            "qei_cut": 18,
+            "qei_halt": 10,
+            "qei_nonfinite": 0,
+            "cascade_cut": 2,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -3.4483827260718525,
+          "bh_pct": 24.88647122661336,
+          "alpha_pct": -28.33485395268521,
+          "sharpe": -0.8686488846390884,
+          "maxdd_pct": 4.880269727631329,
+          "hit_pct": 56.00000000000001,
+          "trades": 73,
+          "fees_paid": 0.022325084022456608,
+          "fees_paid_pct_of_start": 2.232508402245661,
+          "bars": 252,
+          "year": "2024",
+          "gates": {
+            "qei_cut": 24,
+            "qei_halt": 50,
+            "qei_nonfinite": 0,
+            "cascade_cut": 37,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.16254932578232406,
+          "bh_pct": 17.719063776702647,
+          "alpha_pct": -17.88161310248497,
+          "sharpe": -0.06038924433719692,
+          "maxdd_pct": 2.068791850121991,
+          "hit_pct": 53.191489361702125,
+          "trades": 59,
+          "fees_paid": 0.017321122893322483,
+          "fees_paid_pct_of_start": 1.7321122893322483,
+          "bars": 250,
+          "year": "2025",
+          "gates": {
+            "qei_cut": 14,
+            "qei_halt": 57,
+            "qei_nonfinite": 0,
+            "cascade_cut": 33,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.271993729486264,
+          "bh_pct": 12.941246192941946,
+          "alpha_pct": -13.21323992242821,
+          "sharpe": -0.07542247183393577,
+          "maxdd_pct": 4.109166164241729,
+          "hit_pct": 48.23529411764706,
+          "trades": 46,
+          "fees_paid": 0.016811115113983678,
+          "fees_paid_pct_of_start": 1.681111511398368,
+          "bars": 186,
+          "year": "2026",
+          "gates": {
+            "qei_cut": 14,
+            "qei_halt": 4,
+            "qei_nonfinite": 0,
+            "cascade_cut": 30,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        }
+      ],
+      "kernel_only_same_fees": {
+        "ret_pct": -0.47174707089120416,
+        "bh_pct": 192.42609210894778,
+        "alpha_pct": -192.897839179839,
+        "sharpe": -0.012195912698419865,
+        "maxdd_pct": 14.11005207954021,
+        "hit_pct": 54.19906687402799,
+        "trades": 491,
+        "fees_paid": 0.15395254203641437,
+        "fees_paid_pct_of_start": 15.395254203641437,
+        "bars": 1613
+      },
+      "kernel_only_gates": {
+        "kernel_halt": 0
+      },
+      "kernel_parity_same_fees": {
+        "ok": true,
+        "ref_fee": 0.0015,
+        "ref_ret_pct": -0.47174707089115975,
+        "ref_bh_pct": 192.42609210894778,
+        "ref_alpha_pct": -192.89783917983894,
+        "ref_sharpe": -0.012195912698418758,
+        "ref_hit_pct": 54.19906687402799,
+        "ref_trades": 491,
+        "ret_abs_diff": 4.440892098500626e-14,
+        "trades_match": true,
+        "note": "Same CE-3 one-way cost passed into kernel backtest(). Kernel default 8 bps was not used."
+      }
+    },
+    {
+      "ticker": "AAPL",
+      "asset_class": "equity",
+      "fee_book": "CE-3 CRYPTO_FEE_PCT+CRYPTO_SLIPPAGE_PCT on |delta weight|",
+      "start": "2020-01-02",
+      "end": "2026-09-29",
+      "closes": 1694,
+      "ugft": {
+        "ret_pct": 26.74886575065201,
+        "bh_pct": 390.2351884933623,
+        "alpha_pct": -363.4863227427103,
+        "sharpe": 0.5168775410689768,
+        "maxdd_pct": 16.198668830996723,
+        "hit_pct": 54.266538830297215,
+        "trades": 348,
+        "fees_paid": 0.0935029339149272,
+        "fees_paid_pct_of_start": 9.35029339149272,
+        "bars": 1613
+      },
+      "ugft_gates": {
+        "kernel_halt": 1,
+        "qei_cut": 171,
+        "qei_halt": 134,
+        "qei_nonfinite": 0,
+        "cascade_cut": 223,
+        "eee_cut": 0,
+        "eee_halt": 0,
+        "bars_halt": 134,
+        "bars_cut": 270
+      },
+      "ugft_years": [
+        {
+          "ret_pct": 14.575814639258255,
+          "bh_pct": 91.71372476572952,
+          "alpha_pct": -77.13791012647127,
+          "sharpe": 1.2254311915898528,
+          "maxdd_pct": 14.430837536189461,
+          "hit_pct": 57.41935483870968,
+          "trades": 76,
+          "fees_paid": 0.023669940726502952,
+          "fees_paid_pct_of_start": 2.366994072650295,
+          "bars": 172,
+          "year": "2020",
+          "gates": {
+            "qei_cut": 7,
+            "qei_halt": 0,
+            "qei_nonfinite": 0,
+            "cascade_cut": 36,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.04528969191195387,
+          "bh_pct": 34.64820624737774,
+          "alpha_pct": -34.6934959392897,
+          "sharpe": -0.007967665278698034,
+          "maxdd_pct": 5.428035059784383,
+          "hit_pct": 54.18994413407822,
+          "trades": 58,
+          "fees_paid": 0.01414860341364611,
+          "fees_paid_pct_of_start": 1.414860341364611,
+          "bars": 252,
+          "year": "2021",
+          "gates": {
+            "qei_cut": 28,
+            "qei_halt": 16,
+            "qei_nonfinite": 0,
+            "cascade_cut": 19,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -5.467491559776505,
+          "bh_pct": -26.40420026704947,
+          "alpha_pct": 20.936708707272967,
+          "sharpe": -1.6941858618209864,
+          "maxdd_pct": 5.664968111363568,
+          "hit_pct": 43.02325581395349,
+          "trades": 20,
+          "fees_paid": 0.00343325701062337,
+          "fees_paid_pct_of_start": 0.343325701062337,
+          "bars": 251,
+          "year": "2022",
+          "gates": {
+            "qei_cut": 17,
+            "qei_halt": 17,
+            "qei_nonfinite": 0,
+            "cascade_cut": 17,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 6.4593613704613695,
+          "bh_pct": 49.00806781827636,
+          "alpha_pct": -42.54870644781499,
+          "sharpe": 1.370127574542116,
+          "maxdd_pct": 2.9729290837872973,
+          "hit_pct": 53.2258064516129,
+          "trades": 64,
+          "fees_paid": 0.013891544202923548,
+          "fees_paid_pct_of_start": 1.389154420292355,
+          "bars": 250,
+          "year": "2023",
+          "gates": {
+            "qei_cut": 28,
+            "qei_halt": 25,
+            "qei_nonfinite": 0,
+            "cascade_cut": 21,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 5.092973316513683,
+          "bh_pct": 30.70524087353508,
+          "alpha_pct": -25.612267557021397,
+          "sharpe": 0.8784271397799781,
+          "maxdd_pct": 3.9231403341141413,
+          "hit_pct": 63.030303030303024,
+          "trades": 48,
+          "fees_paid": 0.01607874177154062,
+          "fees_paid_pct_of_start": 1.6078741771540621,
+          "bars": 252,
+          "year": "2024",
+          "gates": {
+            "qei_cut": 22,
+            "qei_halt": 2,
+            "qei_nonfinite": 0,
+            "cascade_cut": 14,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": -0.20674480834341757,
+          "bh_pct": 9.052613334426617,
+          "alpha_pct": -9.259358142770035,
+          "sharpe": -0.04131886385069729,
+          "maxdd_pct": 4.519272118082712,
+          "hit_pct": 51.65562913907284,
+          "trades": 43,
+          "fees_paid": 0.011878509922465542,
+          "fees_paid_pct_of_start": 1.187850992246554,
+          "bars": 250,
+          "year": "2025",
+          "gates": {
+            "qei_cut": 15,
+            "qei_halt": 25,
+            "qei_nonfinite": 0,
+            "cascade_cut": 55,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        },
+        {
+          "ret_pct": 4.859541793463307,
+          "bh_pct": 21.495113869389073,
+          "alpha_pct": -16.635572075925765,
+          "sharpe": 1.1042858989046929,
+          "maxdd_pct": 3.1658257125490743,
+          "hit_pct": 51.2396694214876,
+          "trades": 39,
+          "fees_paid": 0.010402336867225026,
+          "fees_paid_pct_of_start": 1.0402336867225026,
+          "bars": 186,
+          "year": "2026",
+          "gates": {
+            "qei_cut": 54,
+            "qei_halt": 49,
+            "qei_nonfinite": 0,
+            "cascade_cut": 61,
+            "eee_cut": 0,
+            "eee_halt": 0
+          }
+        }
+      ],
+      "kernel_only_same_fees": {
+        "ret_pct": 31.19169750675088,
+        "bh_pct": 390.2351884933623,
+        "alpha_pct": -359.0434909866114,
+        "sharpe": 0.5079145704952939,
+        "maxdd_pct": 17.204849533108927,
+        "hit_pct": 53.91156462585034,
+        "trades": 312,
+        "fees_paid": 0.094356993527977,
+        "fees_paid_pct_of_start": 9.4356993527977,
+        "bars": 1613
+      },
+      "kernel_only_gates": {
+        "kernel_halt": 1
+      },
+      "kernel_parity_same_fees": {
+        "ok": true,
+        "ref_fee": 0.0015,
+        "ref_ret_pct": 31.19169750675099,
+        "ref_bh_pct": 390.2351884933623,
+        "ref_alpha_pct": -359.0434909866113,
+        "ref_sharpe": 0.5079145704952954,
+        "ref_hit_pct": 53.91156462585034,
+        "ref_trades": 312,
+        "ret_abs_diff": 1.1013412404281553e-13,
+        "trades_match": true,
+        "note": "Same CE-3 one-way cost passed into kernel backtest(). Kernel default 8 bps was not used."
+      }
+    }
+  ]
+}

@@ -1,60 +1,60 @@
 {
-  "timestamp": "2026-09-13 08:00 UTC",
+  "timestamp": "2026-10-01 08:00 UTC",
   "results": [
     {
       "ticker": "XRP-USD",
-      "accuracy": 0.5556,
-      "samples": 131,
-      "buy_probability": 0.0076,
+      "accuracy": 0.6538,
+      "samples": 130,
+      "buy_probability": 0.0041,
       "signal": "AVOID"
     },
     {
       "ticker": "SOL-USD",
-      "accuracy": 0.6296,
-      "samples": 131,
-      "buy_probability": 0.0008,
+      "accuracy": 0.5385,
+      "samples": 130,
+      "buy_probability": 0.001,
       "signal": "AVOID"
     },
     {
       "ticker": "ETH-USD",
-      "accuracy": 0.5926,
-      "samples": 131,
-      "buy_probability": 0.726,
-      "signal": "BUY"
+      "accuracy": 0.6538,
+      "samples": 130,
+      "buy_probability": 0.3652,
+      "signal": "AVOID"
     },
     {
       "ticker": "BTC-USD",
-      "accuracy": 0.4815,
-      "samples": 131,
-      "buy_probability": 0.0119,
+      "accuracy": 0.5769,
+      "samples": 130,
+      "buy_probability": 0.0115,
       "signal": "AVOID"
     },
     {
       "ticker": "ADA-USD",
-      "accuracy": 0.5556,
-      "samples": 131,
-      "buy_probability": 0.0002,
+      "accuracy": 0.5385,
+      "samples": 130,
+      "buy_probability": 0.0006,
       "signal": "AVOID"
     },
     {
       "ticker": "DOT-USD",
-      "accuracy": 0.5185,
-      "samples": 131,
-      "buy_probability": 0.0001,
-      "signal": "AVOID"
+      "accuracy": 0.5385,
+      "samples": 130,
+      "buy_probability": 1.0,
+      "signal": "BUY"
     },
     {
       "ticker": "AVAX-USD",
-      "accuracy": 0.7037,
-      "samples": 131,
-      "buy_probability": 0.0017,
-      "signal": "AVOID"
+      "accuracy": 0.2692,
+      "samples": 130,
+      "buy_probability": 0.9995,
+      "signal": "BUY"
     },
     {
       "ticker": "LINK-USD",
-      "accuracy": 0.4815,
-      "samples": 131,
-      "buy_probability": 0.0,
+      "accuracy": 0.5,
+      "samples": 130,
+      "buy_probability": 0.001,
       "signal": "AVOID"
     }
   ]

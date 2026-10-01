@@ -1,67 +1,28 @@
 {
-  "ts": "2026-09-13T04:25:46.858693+00:00",
-  "status": "active",
+  "overall_bias": 45.1,
   "signals": {
     "BTC-USD": {
-      "score": 42.5,
-      "direction": "SELL",
-      "confidence": 0.36,
-      "mentions": 3,
-      "raw_sentiment": -0.3
+      "direction": "HOLD",
+      "score": 50
+    },
+    "ETH-USD": {
+      "direction": "HOLD",
+      "score": 50
     },
     "SOL-USD": {
-      "score": 50.0,
-      "direction": "HOLD",
-      "confidence": 0.1,
-      "mentions": 4,
-      "raw_sentiment": 0.0
+      "direction": "SELL",
+      "score": 41.4
     },
-    "XRP-USD": {
-      "score": 57.1,
-      "direction": "BUY",
-      "confidence": 0.229,
-      "mentions": 2,
-      "raw_sentiment": 0.286
+    "AVAX-USD": {
+      "direction": "SELL",
+      "score": 41.5
     },
-    "ADA-USD": {
-      "score": 50.0,
-      "direction": "HOLD",
-      "confidence": 0.1,
-      "mentions": 1,
-      "raw_sentiment": 0.0
+    "LINK-USD": {
+      "direction": "SELL",
+      "score": 42.6
     }
   },
-  "consensus": {
-    "bullish": 0,
-    "bearish": 0,
-    "neutral": 5,
-    "agents": {
-      "institutional": "NEUTRAL",
-      "retail": "NEUTRAL",
-      "quant": "NEUTRAL",
-      "market maker": "NEUTRAL",
-      "defi": "NEUTRAL"
-    },
-    "bull_ratio": 0.0
-  },
-  "price_targets": {},
-  "events": [
-    {
-      "type": "regulation",
-      "matched": "regulatory",
-      "sentiment": 1.0,
-      "direction": "RISK_ON",
-      "snippet": "t-run anticipated regulatory tailwinds.  **A Regulatory Optimism Thread Through Stablecoin Narratives**  The political-crypto entanglement extends beyond UK politics into the stablecoin arena, where regulatory clarity is treated as an open "
-    },
-    {
-      "type": "geopolitics",
-      "matched": "war",
-      "sentiment": -1.0,
-      "direction": "RISK_OFF",
-      "snippet": "erely political gossip; it signals a potential shift in the regulatory climate, suggesting that crypto wealth is accumulating direct political influence and that future policy could tilt favorably toward the industry. This expectation becom"
-    }
-  ],
-  "macro_bias": 50.0,
-  "overall_bias": 49.1,
-  "source": "mirofish_swarm"
+  "fear_greed": 74,
+  "source": "intel_refresh (lightweight)",
+  "ts": "2026-10-01T10:21:30.383594+00:00"
 }

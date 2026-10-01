@@ -1,0 +1,14 @@
+{
+  "n_predictions": 9,
+  "n_scored": 0,
+  "hits": 0,
+  "directional_accuracy": null,
+  "fee_true_net": 0.0,
+  "legacy_n": 0,
+  "proven": false,
+  "bar": 0.55,
+  "min_scored": 20,
+  "weight": 0.1,
+  "auto_raise": false,
+  "source": "forward_test_ledger"
+}

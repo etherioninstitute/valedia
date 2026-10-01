@@ -62,7 +62,8 @@ def extract_signals_from_report(markdown_content, report_summary=""):
         # Find all occurrences and get surrounding context (200 chars each side)
         score = 0
         mentions = 0
-        for match in re.finditer(re.escape(keyword), text):
+        # Token boundary: "ada" must not match inside "adapting", "adapted", or "intraday".
+        for match in re.finditer(r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])", text):
             start = max(0, match.start() - 200)
             end = min(len(text), match.end() + 200)
             context = text[start:end]
@@ -363,7 +364,9 @@ def process_mirofish_report(report_json):
         "overall_bias": round(overall, 1),
         "source": "mirofish_swarm"
     }
-    
+    if isinstance(report_json, dict) and report_json.get("report_id"):
+        result["report_id"] = report_json["report_id"]
+
     # Save for brain consumption
     out_path = os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
     with open(out_path, "w") as f:

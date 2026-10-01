@@ -1,5 +1,116 @@
 # Ruflo status board (Claude Code check-in)
-Updated: 2026-09-19 PT — **KALSHI-ORDERS-V2 SHIPPED**. Version `0.43.0` tag `valedia-v0.43.0` tip `db21c91`. Create/sell/cancel → POST/DELETE `/portfolio/events/orders` (V1 410). YES-leg bid/ask mapping. Fill-true GET fills. Ponytail: `PONYTAIL-AUDIT-KALSHI-ORDERS-V2.md`. **GROK-STATUS: KALSHI-ORDERS-V2 SHIPPED; Next=Burton re-run live allocator.** No `--live` / writers / SPOT GET / NAUTILUS_LIVE / LN / crontab / live Polymarket / funding / weather-oil unfence / CB-Alpaca restore. `VALEDIA_TREASURY_AUTO` stays False. `REBALANCER_AUTOEXEC` stays False. `POLYMARKET_US_LIVE` stays False. `VALEDIA_SELF_ADJUST` stays False. `MIROFISH_AUTO_RAISE` stays False. `FORTRESS_INTEL_FALLBACK` stays False. `VALEDIA_TRADING_HALT` default False.
+Updated: 2026-09-28 — **MIROFISH REPORT PICKER FIX DONE** (`GROK_EXIT:0`). `mirofish_runner.py` newest-completed-by-mtime; token boundary on tickers. Regen `report_fe11a230040a`, ADA absent, smoke PASS. No sim, no orders. **GROK-STATUS: MIROFISH REPORT PICKER FIX.**
+
+Updated: 2026-09-28 — **PAPERCLIP FOLLOW-UP APPLY DONE** (`GROK_EXIT:0`). UUID `c6778eec` is VAL-10, not live VAL-3. VAL-10 restored to Scout, review=Auditor approve=Decider, `/execution` no longer `recovery_needed`. VAL-12 `in_progress` on CTO run `0a7036a0`, review=Auditor approve=`user:local-board`, watchdog=Auditor. VAL-11 CTO run `dbc1f464`. VAL-4 policy filled. VAL-1/3 left on live reconnecting checkouts. Watchdog opened VAL-13 (Auditor live, policy still empty). No money four-pack, no `OKX_LIVE`, no grok-valedia. Dual-home `GROK-STATUS.md`. **GROK-STATUS: PAPERCLIP FOLLOW-UP DONE.** Next = Burton. Let the live runs finish.
+
+
+Updated: 2026-09-27 — **OKX-PORTFOLIO-MONITOR DONE** (`GROK_EXIT:0`). `check_okx` in `scripts/integrations/portfolio_monitor.py` calls `OKXClient().portfolio_summary()` and `main()` appends it after Kraken. Dual-home workspace-v2 and workspace. Fail-soft. Proof from workspace-v2 exit 0 (`2026-09-28 05:29 UTC`). SOCKS exit `85.239.234.32`. Trading USD eq=60 avail=60 nonzero, funding empty, open orders 0. `key_hits` 0. `OKX_LIVE` unset. No order, no TradingView, no Davidd unlock. RuFlo `:8810` `hooks_route` grok-build 0.70, `hooks_pre-task` single agent, `hooks_pre-edit`. Ponytail: reused `portfolio_summary`. **GROK-STATUS: OKX-PORTFOLIO-MONITOR DONE.** Next = Burton. Do not flip `OKX_LIVE`.
+
+Updated: 2026-09-27 — **DAVIDDTECH-PHASE1D DONE** (`GROK_EXIT:0`). Sister paper Pine `DAVIDDTECH-PINE-TRENDHOO-45M-PAPER.pine` (3336 chars, `Trendhoo_45M`, `portfolio_risk` 0.3) and `DAVIDDTECH-PINE-TOPG-5M-PAPER.pine` (4658 chars, `TopG_5M_Scalp`, `portfolio_risk` 0.2), dual-home. `pine_check` 0/0 each. Editor restored to the Waddah stub (4697 chars). Not on the chart. Alerts 0. No webhook. Tests 17 pass / 1 skip. `DAVIDD_LIVE=0`. No CCXT, no wallet, no tunnel. Hermes left on 8787; desk docs say operator default `DAVIDDTECH_WEBHOOK_PORT=8788`. RuFlo `:8810` `hooks_route` security-architect 0.85, `hooks_pre-task` single agent, `memory_search`, `hooks_pre-edit`. CBM index 2026-09-23 (daviddtech files not tracked; source read). Ponytail: `PONYTAIL-AUDIT-DAVIDDTECH-PHASE1.md` Phase 1d. **GROK-STATUS: DAVIDDTECH-PHASE1D DONE.** Next = Burton. Do not Add to chart, Save, Publish, or arm a webhook unless asked. Tunnel locked.
+
+Updated: 2026-09-27 — **DAVIDDTECH-PHASE1C DONE** (`GROK_EXIT:0`). EMA stand-in replaced with a paper-shaped Boilerplate subset in `DAVIDDTECH-PINE-PAPER-STUB.pine` (dual-home). `Waddah_1H_Anchor`, subaccount `paper`, passphrase sentinel only. `pine_set_source` 4697 chars, read-back match. `pine_check` 0 errors, 0 warnings. Not on the chart. Alerts 0. No webhook. Tests 16 pass / 1 skip. `DAVIDD_LIVE=0`. No CCXT, no wallet, no tunnel. RuFlo `:8810` `hooks_route` grok-build 0.85, `hooks_pre-task`, `memory_search`, `hooks_pre-edit`. CBM index 2026-09-23 (daviddtech files not tracked; source read). Ponytail: `PONYTAIL-AUDIT-DAVIDDTECH-PHASE1.md` Phase 1c. **GROK-STATUS: DAVIDDTECH-PHASE1C DONE.** Next = Burton. Do not Add to chart, Save, Publish, or arm a webhook unless asked. Tunnel locked.
+
+Updated: 2026-09-27 — **DAVIDDTECH-PHASE1 DONE** (`GROK_EXIT:0`, build tree `0.74.1` uncommitted). Paper webhook smoked on `127.0.0.1:8788` because `8787` is Hermes WebUI. jsonl `create_order=false`, no passphrase field. Pine stub `DAVIDDTECH-PINE-PAPER-STUB.pine` dual-homed (`Waddah_1H_Anchor`, paper). `pine_check` compiled; inject skipped (Monaco did not open); no webhook alert. Tests 16 pass / 1 skip. `DAVIDD_LIVE=0`. No CCXT, no wallet, no tunnel. RuFlo `:8810` `hooks_route` security-architect, `memory_search`, `hooks_pre-task`, `hooks_post-task`, `memory_store`. CBM index 2026-09-23 (daviddtech files not tracked; source read). Ponytail: `PONYTAIL-AUDIT-DAVIDDTECH-PHASE1.md`. **GROK-STATUS: DAVIDDTECH-PHASE1 DONE.** Next = Burton paste stub when Pine editor is open. Do not arm a webhook. Tunnel locked.
+
+Updated: 2026-09-27 — **DAVIDDTECH-SUBSUME-1 DONE** (`GROK_EXIT:0`, build tree `0.74.1` uncommitted). Paper/shadow TradingView webhook on `127.0.0.1`. Passphrase omitted from jsonl. `create_order` always false. Halt still logs. Default python3 has no FastAPI; stdlib listen. Tests 15 pass / 1 skip. `DAVIDD_LIVE=0`. No CCXT, no `--live`, no wallet, no public bind. Cloudflare OUT. RuFlo `:8810` `hooks_route` tester, `memory_search`, `hooks_pre-task`. CBM index 2026-09-23 (source read). Ponytail: `PONYTAIL-AUDIT-DAVIDDTECH-SUBSUME-1.md`. **GROK-STATUS: DAVIDDTECH-SUBSUME-1 DONE.** Next = Phase 1 Pine checklist (operator). Tunnel locked until Burton unlocks.
+
+Updated: 2026-09-25 — **WEATHER-INFORMED-ADMIT-BRIDGE-1 DONE** (`GROK_EXIT:0`, build tree `0.74.1` uncommitted, live cron version unchanged). `weather_live.nws_informed` remaps NWS final/observation onto INFORMED for one admit. Stub KXHIGHDEN-26SEP25-T72: before `fv_source,fv_confidence,edge_missing,depth,size` → after `reasons=[]` `create_order=True`. No Kalshi POST. `ALLOWED_FV` / lottery / late unchanged. Oil fenced. `WEATHER_LIVE` not flipped. RuFlo `:8810` `hooks_route` coder, `memory_search` patterns, `hooks_pre-task`. CBM project `Users-burtonchatelain-.openclaw-workspace-v2` (index 2026-09-23, source read for the admit path). Ponytail: `PONYTAIL-AUDIT-WEATHER-INFORMED-ADMIT-BRIDGE-1.md`. Screens `ot-valedia-desk` / `valedia-glance` left running. **GROK-STATUS: WEATHER-INFORMED-ADMIT-BRIDGE-1 DONE.** Next = Burton. Stop. Do not unfence oil. Do not mass create_order.
+
+Updated: 2026-09-24 18:16 PT — **WEATHER-KALSHI-DOLLARS-1 DONE** (`GROK_EXIT:0`, build tree `0.74.1` uncommitted, live cron stays `0.44.0`). `kalshi_quote.py` dollars-first. Live morning-go `--dry-decide`: n_price=360 n_price_null=0 n_fee_true_ev=75 n_alert=2 admitted=0 create_order=false. `WEATHER_LIVE` left 1. Lottery/late/INFORMED unchanged. Oil fenced. Screens `ot-valedia-desk` (783) / `valedia-glance` (17171) left running. `valedia-grok` (15022) not recycled. Ponytail: `PONYTAIL-AUDIT-WEATHER-KALSHI-DOLLARS-1.md`. **GROK-STATUS: WEATHER-KALSHI-DOLLARS-1 DONE.** Next = Burton. Stop. Do not unfence oil. Do not mass create_order.
+
+Updated: 2026-09-23 19:34 PT — **WEATHER-JEV-MORNING-1 DONE** (`GROK_EXIT:0`, build tree `0.74.0` uncommitted, live cron stays `0.44.0`). Preflight PASS. `WEATHER_LIVE` env not set. `weather_live_enabled()` false. TWC daily settle for KXHIGH/KXLOW when rules name Weather Company. Stations MFL/MIA and VEF/LAS. 38 city series on the fee artifact, quadratic multiplier 1. Create refuses SKIP_LOTTERY and SKIP_LATE_COLLAPSE. Jev shadow only. Screens `ot-valedia-desk` (783) / `valedia-glance` (17171) left running. `valedia-grok` (74464) not recycled. Oil fenced. Ponytail: `PONYTAIL-AUDIT-WEATHER-JEV-MORNING-1.md`. **GROK-STATUS: WEATHER-JEV-MORNING-1 DONE.** Next = Burton. Stop. Do not unfence oil. Do not mass create_order.
+
+Updated: 2026-09-23 19:07 PT — **WEATHER-SCRAPE-APIS-1 DONE** (`GROK_EXIT:0`, build tree `0.73.0` uncommitted, live cron stays `0.44.0`). NWS CLI lookup + research tags. NYC max 67 F. Smoke fv 0.04779 size 0. `dispatchable=0`. `create_order` false. `WEATHER_LIVE` false. RuFlo `:8810` coder route, swarm terminated, 0 agents. CBM indexed this tree and returned `weather_shadow.score` / `fence_gate`. Screens `ot-valedia-desk` (783) / `valedia-glance` (17171) left running. `valedia-grok` (54578) not recycled. Fence held. Ponytail: `PONYTAIL-AUDIT-WEATHER-SCRAPE-APIS-1.md`. **GROK-STATUS: WEATHER-SCRAPE-APIS-1 DONE.** Next = Burton. Stop. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-23 18:34 PT — **OIL-WEATHER-SMART-1 DONE** (`GROK_EXIT:0`, build tree `0.72.0` uncommitted, live cron stays `0.44.0`). Oil shadow ledger + weather NWS observe-day gate. `dispatchable=0`. `create_order` false. Hint `apply=false`. RuFlo `:8810` coder route, swarm terminated, 0 agents. CBM indexed this tree and returned `weather_shadow.score` / `fence_gate`. Screens `ot-valedia-desk` (783) / `valedia-glance` (17171) / `valedia-grok` (35929) left running. Fence held. Ponytail: `PONYTAIL-AUDIT-OIL-WEATHER-SMART-1.md`. **GROK-STATUS: OIL-WEATHER-SMART-1 DONE.** Next = Burton. Stop. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-23 18:01 PT — **VIBE-TRADING-SUBSUME-1 DONE** (`GROK_EXIT:0`, build tree `0.71.0` uncommitted, live cron stays `0.44.0`). HKUDS Vibe-Trading scrubbed at `a65427a3` and not imported. `vibe_shadow_paper.py` fixture: BTC shadow_log $25, ETH fee_true, SOL review_only, DOGE missing_feature. `create_order` false. Broker/codegen/shell stubs raise. Alpha Zoo is an inventory of 462 modules. `vibe-trading-ai` not installed. Screens `ot-valedia-desk` (783) / `valedia-glance` (17171) / `valedia-grok` (15032) left running. Fence held. Ponytail: `PONYTAIL-AUDIT-VIBE-TRADING-SUBSUME-1.md`. Security: `VIBE-TRADING-SECURITY-2026-09-23.md`. **GROK-STATUS: VIBE-TRADING-SUBSUME-1 DONE.** Next = Burton. Stop. No oil/weather unfence. No mass create_order. No HKUDS broker wiring.
+
+Updated: 2026-09-23 16:05 PT — **KALSHI-INFORMED-LIVE DONE** (`GROK_EXIT:0`, build tree `0.70.0` uncommitted, live cron stays `0.44.0`). Six resting CONVICTION lottery orders canceled. Live `kalshi_auth.create_order` calls `informed_before_create`. Jev annotates CONVICTION only after that gate, fail-open. Screens `ot-valedia-desk` / `valedia-glance` / `valedia-grok` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-KALSHI-INFORMED-LIVE.md`. **GROK-STATUS: KALSHI-INFORMED-LIVE DONE.** Next = Burton. Stop. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-23 — **ARB-OPENSSL-HARDEN DONE** (`GROK_EXIT:0`, Valedia `0.69.0` working tree, not tagged). LATENCY ARB dry-run: SSLContext+Session once on main thread; cron_runner 139/134 no retry. Live cron tree got the three files; live version stays `0.44.0`. Screens `ot-valedia-desk` / `valedia-glance` / `valedia-grok` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-ARB-OPENSSL-HARDEN.md`. **GROK-STATUS: ARB-OPENSSL-HARDEN DONE.** Next = Burton. Stop. No live unlock. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-23 — **VAUGHAN-SUBSUME-2 + RUFLO-PONYTAIL-AUDIT DONE** (`GROK_EXIT:0`, Valedia `0.68.0` working tree, not tagged). OT INTEL is display-only on `:3001` (`/api/valedia/intel` GET, POST 405). FOMO `burst`/`exit`/`seeded` and CE `PAPER/SHADOW+ORNITH`. Cached eToro and Vaughan rows stay `create_order` false / `start_copy` false. RuFlo `:8810` up; swarm terminated, 0 agents. Screens `ot-valedia-desk` / `valedia-glance` / `valedia-grok` left running. Fence held. Rollup: `PONYTAIL-AUDIT-ROLLUP-2026-09-23.md`. **GROK-STATUS: both DONE.** Next = Burton. Stop. No live unlock. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 — **ETORO-SUBSUME-1 DONE** (`GROK_EXIT:0`, Valedia `0.67.0` working tree, not tagged). Public API client + CopyTrader/Smart Portfolio paper desk. Fixture would-copy `crypto-smart` and `steady-pi` at $25. Live GET would-copy `Smudliczek` and `JeppeKirkBonde` at $25. `create_order` false. `start_copy` false. Write stubs do not send. Screens `ot-valedia-desk` / `valedia-glance` / `valedia-grok` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-ETORO-SUBSUME-1.md`. **GROK-STATUS: ETORO-SUBSUME-1 DONE.** Next = Burton. Stop. No live unlock. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 — **VAUGHAN-SUBSUME-1 DONE** (`GROK_EXIT:0`, Valedia `0.66.0` working tree, not tagged). Poly↔Kalshi paper scanner `vaughan_arb_paper.py`. Allowlist + Ornith fail-closed + Kalshi taker fee. Heuristic `review_only`. Echo would-have pnl 10.091786 on $25, fee 0.61, `create_order` false. Live Ornith fixture reply `malformed` (no fill). Parent `POLYMARKET_US_LIVE` left at 1. Screens `ot-valedia-desk` / `valedia-glance` / `valedia-grok` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-VAUGHAN-SUBSUME-1.md`. **GROK-STATUS: VAUGHAN-SUBSUME-1 DONE.** Next = Burton. Stop. No Slice 2. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 — **MIROFISH-INTEL-ARCHIVE DONE** (`GROK_EXIT:0`, Valedia `0.65.0` working tree, not tagged). PASS archives `data/mirofish/YYYY-MM-DD.json` then atomic-replaces live `mirofish_signal.json`. FAIL writes `mirofish_freshness.json` only. `load_for_fv` requires fresh swarm and `|bias-50| > 5`. Live bias 51.5 is not fuel and was not rewritten. Screens `ot-valedia-desk` / `valedia-glance` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-MIROFISH-INTEL-ARCHIVE.md`. **GROK-STATUS: MIROFISH-INTEL-ARCHIVE DONE.** Next = Burton. Stop. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 — **CE-3 DONE** (`GROK_EXIT:0`, Valedia `0.64.0` working tree, not tagged). Paper tick writes `data/crypto-paper/decisions.jsonl` (`CRYPTO_FEE_PCT`, source `crypto_paper`). Live FTL not written. Kelly ignores the source. Lock + 400-row tail. Controls show tick age and last Ornith reason. Dead-port `ornith_down`, would-have fee 1.0005, no fill. Screens `ot-valedia-desk` / `valedia-glance` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-CE-3-FEE-TRUE-PAPER-CRON.md`. **GROK-STATUS: CE-3 DONE.** Next = MIROFISH-INTEL-ARCHIVE. This session did not launch it. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 ~19:40 PT — **CE-1 DONE** (`GROK_EXIT:0`, Valedia `0.62.0` working tree, not tagged). Crypto paper rules + Ornith fail-closed gate. Live alias `ornith-1.5-k-m` PASS → one paper fill, would-have PnL -$1.5005. `CRYPTO_PAPER_SAFETY=PAPER/SHADOW+ORNITH`. Screens `ot-valedia-desk` / `valedia-glance` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-CE-1-CLAUDE-EXECUTE-RULES-ORNITH.md`. **GROK-STATUS: CE-1 DONE.** Next = Burton. Stop. No auto CE-2. No oil/weather unfence. No mass create_order.
+
+Updated: 2026-09-22 ~19:10 PT — **ORNITH-BIONIC-Q4-CUTOVER DONE** (`GROK_EXIT:0`). LiteLLM Ornith aliases backend `ornith-1.5-35b-a3b@q4_k_m` on Mac-Studio-M2 via LM Link. MiroFish report model matches. Q5 file kept on disk. Screens `ot-valedia-desk` / `valedia-glance` left running. Fence held. Ponytail: `PONYTAIL-AUDIT-ORNITH-BIONIC-Q4-CUTOVER.md`. **GROK-STATUS: cutover DONE.** Next = CE-1. This session did not launch it. No oil/weather unfence. No mass create_order.
+
+Updated earlier 2026-09-22 PT — **PHASE-3 weather RESEARCH/SHADOW DONE**. Version `0.60.0` (working tree, tip `10b24aa`, not tagged). Shadow scorer + `models/weather_shadow_ledger.json`. `dispatchable=0`. Weather mode `RESEARCH/SHADOW`, still `LIVE_EXEC_FENCED`. Oil stays fenced. City weather tickers take `live_fence`. `POLYMARKET_US_LIVE` stays False in git. Writer polymarket `none`. Screens `ot-valedia-desk` / `valedia-glance` left running. Ponytail: `PONYTAIL-AUDIT-PHASE-3-WEATHER-RESEARCH-SHADOW.md`. **GROK-STATUS: PHASE-3 DONE.** Next = Burton. Stop the chain. No oil/weather unfence. No mass create_order.
+
+## PHASE-3 weather RESEARCH/SHADOW (Grok Build executor)
+- `weather_shadow.py` + `models/weather_shadow_ledger.json`. `dispatchable=0`.
+- Clocks parse observe-day / Last Trading Time. Missing TZ stays missing.
+- Tests PASS. No live create. Screens not signaled.
+- **Next = Burton. Stop. Do not unfence weather or oil.**
+
+## PHASE-2 session_clock + resolve_clock + fence_gate (Grok Build executor)
+- `session_clocks.py` consulted by `informed_before_create` and `master_allocator.before_create`.
+- Tests PASS. No live create. No screen restart.
+- **Next = Phase 3. Parent launches weather RESEARCH/shadow. This session does not.**
+
+## PHASE-1 Kalshi create quality (Grok Build executor)
+- `informed_before_create.py` + `kalshi_profit.ledger_view` / `dome_extra` + `kalshi_fee_map.artifact_status`.
+- Tests PASS. No live create.
+- **Next = Phase 2. Parent launches it. This session does not.**
+
+## VALEDIA-TRADING-SMOKE (Grok Build executor)
+- Ontology `proj_c29e60ca7611` PASS on Bionic. Neo4j bolt up (Colima + neo4j 5.18.1).
+- Harness no longer false-fails LIVE=1 / EV gates.
+- **Next = Burton. Do not auto-start another slice.**
+
+
+## OT-VALEDIA-POLISH (Grok Build executor)
+- Fork commit `f33c6e6` (not pushed). UI only. Same GET `/api/valedia/status` → `127.0.0.1:8765/status`.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE. Do not auto-start another slice.**
+
+## OT-VALEDIA-FORK-2 (Grok Build executor)
+- Fork commit `2f8b412` (not pushed). Same GET `/api/valedia/status` → `127.0.0.1:8765/status`.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE. Do not auto-start FORK-3.**
+
+## INFORMED-BEFORE-CREATE (Grok Build executor, `valedia-v2-grok-build`)
+- `informed_before_create.py` on `kalshi_auth.create_order` / `sell_position` and `PolymarketUSClient.create_order`.
+- Controls: `INFORMED_BEFORE_CREATE` const True, `POLY_TAG_PRIOR_CREATE` const False.
+- `test_informed_before_create.py` PASS. Callers without evidence fail closed.
+- **Next was Burton. Fork later shipped as FORK-1 then FORK-2. Poly live still STOP.**
+
+## OPENTERMINAL-ACCURACY (Grok Build executor, `valedia-v2-grok-build`)
+- `valedia_cockpit.py --listen` on `127.0.0.1:8765`. GET `/` and `/status` only.
+- Kalshi balance GET when the key is set. Poly balance GET only if `POLYMARKET_US_HTTP` is already on. Cache older than 15 min is `STALE` with age.
+- **Next = Burton. Do not start OT-VALEDIA-FORK. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## FOMO-RADAR-DOSSIER (Grok Build executor, `valedia-v2-grok-build`)
+- Dossier + `fomo_radar_enrich.py`. Fixture tags only. `stamp_paper` / `stamp_signal` do not change qty or score. `test_fomo_radar.py`.
+- `POLYMARKET_US_LIVE` stays False. No `VENUE_WRITER` edit. No cron. No wallets.
+- **Next = Burton. Do not size from radar conviction. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## POLY-LOOP-FV (Grok Build executor, `valedia-v2-grok-build`)
+- Resolution gate kept. Numeric FV from blotter / `fairValue|fv|p_yes|modeled_prob` / fuzzy cache / EMA series / 50/50 mid-anchored tag_prior (classified or NWS/MLB/Fed label). Ledger `fv=cache|modeled|tag_prior|market|override`.
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## POLY-LOOP-RESOLUTION (Grok Build executor, `valedia-v2-grok-build`)
+- Explicit `resolutionSource`/`resolvedBy` first. Else extract NWS/AP/Fed/… or URL host from `description`/`rules`/`event.rules`. Else `rules_text:<hash>:<snippet>` if text exists. Zero text → `no_resolution`.
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## POLY-LOOP-UNIVERSE (Grok Build executor, `valedia-v2-grok-build`)
+- Pull `active=true&closed=false&archived=false` (no `endDateMin` — it breaks `closed`). Over-fetch, drop expired / present-zero-liq. Unwrap `{market:…}`. US/Gamma aliases for end/liq/resolution. FV from market/tags or MiroFish/persona cache; named resolution source required; skip `no_fv` otherwise. `skip_reasons` on `last_run.json`.
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
+
+## POLY-LOOP (Grok Build executor, `valedia-v2-grok-build`)
+- Paper desk on POLY-LEARN. Folded into 0.52.0 commit. 8pt edge, 3% flatten, half-Kelly 6% cap, max 5 open, 40% DD stop + post-mortem (no category flip).
+- `test_poly_loop.py`. LIVE stays False. Writer `none`. No crontab.
+- **Next = Burton. Do not auto-flip POLYMARKET_US_LIVE.**
 
 ## POLY-LEARN (Grok Build executor, `valedia-v2-grok-build`)
 - US DCM market-by-slug + BBO/book helpers. `poly_learn` proposals labeled DRY/SHADOW. Allocator execute never `create_order`. Preview still works. Cheap MiroFish/persona tags from cache.

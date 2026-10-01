@@ -1,23 +1,77 @@
 {
+  "paused": [
+    {
+      "strategy": "OIL_BRACKET",
+      "until": "2026-10-02T06:00:16.957338+00:00",
+      "paused_at": "2026-09-25T06:00:16.957338+00:00",
+      "reason": "fee-true net $-19.90 over 4 trades",
+      "net": -19.9,
+      "n": 4,
+      "wins": 0,
+      "source": "pnl_tracker"
+    },
+    {
+      "strategy": "WEATHER_ARB",
+      "until": "2026-10-02T06:00:16.957338+00:00",
+      "paused_at": "2026-09-25T06:00:16.957338+00:00",
+      "reason": "fee-true net $-22.91 over 11 trades",
+      "net": -22.91,
+      "n": 11,
+      "wins": 0,
+      "source": "pnl_tracker"
+    }
+  ],
+  "probation": [
+    {
+      "strategy": "SPORTS",
+      "until": "2026-10-08T06:01:31.045619+00:00",
+      "reason": "ttl expired \u2014 eligible for evaluation/sizing"
+    }
+  ],
+  "history": [
+    {
+      "strategy": "OIL_BRACKET",
+      "ended_at": "2026-09-18T06:00:06.326353+00:00",
+      "end_reason": "legacy_released",
+      "reason": "legacy blacklist had no until \u2014 not a life sentence"
+    },
+    {
+      "strategy": "WEATHER_ARB",
+      "ended_at": "2026-09-18T06:00:06.326353+00:00",
+      "end_reason": "legacy_released",
+      "reason": "legacy blacklist had no until \u2014 not a life sentence"
+    },
+    {
+      "strategy": "SPORTS",
+      "ended_at": "2026-10-01T06:01:31.045619+00:00",
+      "end_reason": "ttl",
+      "until": "2026-10-01T06:00:12.299187+00:00"
+    }
+  ],
   "blacklisted": [
     "OIL_BRACKET",
     "WEATHER_ARB"
   ],
-  "updated": "2026-09-13T06:00:09.039510+00:00",
-  "details": [
+  "updated": "2026-10-01T06:01:31.045619+00:00",
+  "wr_report": [
     {
       "strategy": "OIL_BRACKET",
       "win_rate": 0.0,
       "wins": 0,
       "losses": 4,
-      "total_lost": 19.9
+      "total_lost": 19.9,
+      "net": -19.9,
+      "fuse": "report_only"
     },
     {
       "strategy": "WEATHER_ARB",
       "win_rate": 0.0,
       "wins": 0,
       "losses": 11,
-      "total_lost": 22.91
+      "total_lost": 22.91,
+      "net": -22.91,
+      "fuse": "report_only"
     }
-  ]
+  ],
+  "rule": "pause on fee-true net (n>=min, net<0); TTL 7d + probation; evidence net>=0 unpauses; never WR"
 }

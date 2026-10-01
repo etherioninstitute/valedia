@@ -3,6 +3,9 @@
 ## Goal (one sentence)
 _Maximize Valedia’s long-run profit by hardening the coding harness — live-path correctness, fee-true ledger, category gates, and Claude-checkable progress — without Ruflo placing any live trades._
 
+## Ownership
+**RuFlo is the primary coder.** Claude Code is optional Burton review only. Goal UI `/agents` is not the executor. Prior wiring is not sacred — improve or replace with proof.
+
 ## North star
 **Maximum profit through a better Valedia system** (reliability, edge measurement, gates, execution quality). Ruflo ships code, tests, audits, and docs. **Valedia runtime stays sole live risk authority.** Ruflo does **not** run `--live`, place venue orders, or change trading API keys.
 
@@ -29,12 +32,15 @@ Live Valedia root: `~/.openclaw/workspace` (this tree). Read first: `recommendat
 - Copying proprietary `kalshi-agent` modules into Valedia
 - Acting as Valedia’s live risk brain
 
+## Continuous mode (2026-09-13)
+RuFlo keeps coding day/night. Status + profit-lever notes go to Burton. Goal UI `/agents` is not the executor.
+
 ## First milestone (do this first — mirrors HANDOFF section D)
 > Note: the original "trace/fix `record_entry`" milestone is **DONE** (Claude wired it into the true live path — `master_allocator.py:473`, gate `:391`, cap `:296`; verified via codebase-memory `trace_path`). Ruflo's first job is to independently VERIFY it, then take the first coding task.
 1. **Audit-verify (HOLDS/FAILS, file:line + live-path proof)** the live path: `record_entry` / `should_trade_category` / `dynamic_per_trade_cap` / `fee_engine` on `master_allocator`; confirm `kalshi_executor.run` is inert; drift detector `valedia_consistency_check.py` PASS.
 2. **First coding task — B1: `sports_engine.py` hardening** (clean-room + tests + ponytail + live-path proof): fees→`fee_engine`, `record_entry`→real ledger, `should_trade_category` gate, and never log a DRY_RUN bet as executed. No `--live`, no orders, no key changes.
 3. Update `RUFLO-STATUS.md` with evidence (file:line, test output, detector result).
-4. Stop and wait for Burton/Claude review before B2+ (fusion-weight unify, per-strategy sizing, ledger completeness…).
+4. Continue into B2+ under continuous coding mode; Burton reviews via Claude Code whenever — do not block on Goal UI Approve. Still no live trading.
 
 ## Handoff
 Claude Code: refine this goal if needed, then tell Ruflo (via MCP `claude-flow` / guidance tools) to execute **First milestone** only.

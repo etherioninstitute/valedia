@@ -38,3 +38,13 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 ---
 
 Add whatever helps you do your job. This is your cheat sheet.
+
+## Agent inventory (always check)
+
+Canonical list of repos, MCPs, CLIs, and model lanes so you don’t ask Burton what he already has:
+
+→ `~/MemPalace/sources/shared-brain/AGENT-INVENTORY.md`
+
+Also mirrored: `recommendations/AGENT-INVENTORY.md`
+
+**Prefer:** codebase-memory-mcp for structural code Qs; Repomix for whole-repo packs; RuFlo MCP `:8810` (filtered) for orchestration.

@@ -1,522 +1,5 @@
 [
   {
-    "ts": "2026-07-25 07:30 UTC",
-    "found": 12,
-    "top5": [
-      "ZAMA",
-      "AKE",
-      "DEXE",
-      "BANK",
-      "EUL"
-    ]
-  },
-  {
-    "ts": "2026-07-25 13:30 UTC",
-    "found": 13,
-    "top5": [
-      "AKE",
-      "DEXE",
-      "BANK",
-      "EUL",
-      "AERO"
-    ]
-  },
-  {
-    "ts": "2026-07-25 19:30 UTC",
-    "found": 14,
-    "top5": [
-      "ZAMA",
-      "DEXE",
-      "BANK",
-      "SHIB",
-      "EUL"
-    ]
-  },
-  {
-    "ts": "2026-07-26 01:30 UTC",
-    "found": 15,
-    "top5": [
-      "EUL",
-      "DEXE",
-      "BANK",
-      "ZAMA",
-      "FDUSD"
-    ]
-  },
-  {
-    "ts": "2026-07-26 07:30 UTC",
-    "found": 16,
-    "top5": [
-      "EUL",
-      "SHIB",
-      "DEXE",
-      "FDUSD",
-      "ORDI"
-    ]
-  },
-  {
-    "ts": "2026-07-26 13:30 UTC",
-    "found": 16,
-    "top5": [
-      "SHIB",
-      "KAITO",
-      "DEXE",
-      "BANK",
-      "EUL"
-    ]
-  },
-  {
-    "ts": "2026-07-26 19:30 UTC",
-    "found": 14,
-    "top5": [
-      "KAITO",
-      "BANK",
-      "DEXE",
-      "EUL",
-      "SHIB"
-    ]
-  },
-  {
-    "ts": "2026-07-27 01:30 UTC",
-    "found": 18,
-    "top5": [
-      "EUL",
-      "SHIB",
-      "PEPE",
-      "KAITO",
-      "ONDO"
-    ]
-  },
-  {
-    "ts": "2026-07-27 07:30 UTC",
-    "found": 13,
-    "top5": [
-      "BANK",
-      "DEXE",
-      "GEOD",
-      "AKE",
-      "ONDO"
-    ]
-  },
-  {
-    "ts": "2026-07-27 13:30 UTC",
-    "found": 7,
-    "top5": [
-      "GEOD",
-      "ONDO",
-      "ZAMA",
-      "CSPR",
-      "STORJ"
-    ]
-  },
-  {
-    "ts": "2026-07-27 19:30 UTC",
-    "found": 15,
-    "top5": [
-      "ZAMA",
-      "BANK",
-      "ETH",
-      "ZIG",
-      "AKE"
-    ]
-  },
-  {
-    "ts": "2026-07-28 01:30 UTC",
-    "found": 15,
-    "top5": [
-      "ZAMA",
-      "AKE",
-      "ETH",
-      "FDUSD",
-      "COTI"
-    ]
-  },
-  {
-    "ts": "2026-07-28 07:30 UTC",
-    "found": 13,
-    "top5": [
-      "COTI",
-      "FDUSD",
-      "ETH",
-      "BANK",
-      "ZAMA"
-    ]
-  },
-  {
-    "ts": "2026-07-28 13:30 UTC",
-    "found": 14,
-    "top5": [
-      "DEXE",
-      "ZAMA",
-      "FDUSD",
-      "COTI",
-      "VVV"
-    ]
-  },
-  {
-    "ts": "2026-07-28 19:30 UTC",
-    "found": 13,
-    "top5": [
-      "ZAMA",
-      "FDUSD",
-      "COTI",
-      "ONDO",
-      "FET"
-    ]
-  },
-  {
-    "ts": "2026-07-29 01:30 UTC",
-    "found": 5,
-    "top5": [
-      "PRL",
-      "CASHCAT",
-      "XPL",
-      "CSPR",
-      "PUMP"
-    ]
-  },
-  {
-    "ts": "2026-07-29 07:30 UTC",
-    "found": 13,
-    "top5": [
-      "BANK",
-      "COTI",
-      "ZAMA",
-      "AERO",
-      "DEXE"
-    ]
-  },
-  {
-    "ts": "2026-07-29 13:30 UTC",
-    "found": 5,
-    "top5": [
-      "ZAMA",
-      "COTI",
-      "CSPR",
-      "PENGU",
-      "UNI"
-    ]
-  },
-  {
-    "ts": "2026-07-29 19:30 UTC",
-    "found": 11,
-    "top5": [
-      "KAITO",
-      "BANK",
-      "MUB",
-      "SUI",
-      "ZAMA"
-    ]
-  },
-  {
-    "ts": "2026-07-30 01:30 UTC",
-    "found": 12,
-    "top5": [
-      "COTI",
-      "MUB",
-      "SUI",
-      "USDG",
-      "ZAMA"
-    ]
-  },
-  {
-    "ts": "2026-07-30 07:30 UTC",
-    "found": 14,
-    "top5": [
-      "COTI",
-      "BANK",
-      "MUB",
-      "KAITO",
-      "ONDO"
-    ]
-  },
-  {
-    "ts": "2026-07-30 13:30 UTC",
-    "found": 18,
-    "top5": [
-      "USDON",
-      "MUB",
-      "AKE",
-      "PI",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-07-30 19:30 UTC",
-    "found": 12,
-    "top5": [
-      "CAP",
-      "MUB",
-      "RE",
-      "VET",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-07-31 01:30 UTC",
-    "found": 14,
-    "top5": [
-      "MUB",
-      "PENGU",
-      "PI",
-      "ETH",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-07-31 07:30 UTC",
-    "found": 5,
-    "top5": [
-      "MOONDOGECOIN",
-      "PENGU",
-      "ONDO",
-      "GRVT",
-      "UNI"
-    ]
-  },
-  {
-    "ts": "2026-07-31 13:30 UTC",
-    "found": 11,
-    "top5": [
-      "MMT",
-      "PENGU",
-      "MUB",
-      "GRAM",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-07-31 19:30 UTC",
-    "found": 11,
-    "top5": [
-      "MUB",
-      "PENGU",
-      "PI",
-      "SNDKB",
-      "SPCXB"
-    ]
-  },
-  {
-    "ts": "2026-08-01 01:30 UTC",
-    "found": 8,
-    "top5": [
-      "SNDKB",
-      "SPCXB",
-      "ENA",
-      "FDUSD",
-      "MUB"
-    ]
-  },
-  {
-    "ts": "2026-08-01 07:30 UTC",
-    "found": 10,
-    "top5": [
-      "GIGGLE",
-      "BNB",
-      "SNDKB",
-      "SPCXB",
-      "ORDI"
-    ]
-  },
-  {
-    "ts": "2026-08-01 13:30 UTC",
-    "found": 11,
-    "top5": [
-      "PI",
-      "GEOD",
-      "SHIB",
-      "SPCXB",
-      "ORDI"
-    ]
-  },
-  {
-    "ts": "2026-08-01 19:30 UTC",
-    "found": 9,
-    "top5": [
-      "AKE",
-      "PI",
-      "SLX",
-      "SPCXB",
-      "BABY"
-    ]
-  },
-  {
-    "ts": "2026-08-02 01:30 UTC",
-    "found": 8,
-    "top5": [
-      "AKE",
-      "PI",
-      "SPCXB",
-      "BABY",
-      "GRVT"
-    ]
-  },
-  {
-    "ts": "2026-08-02 07:30 UTC",
-    "found": 5,
-    "top5": [
-      "PI",
-      "SPCXB",
-      "ONDO",
-      "PENGU",
-      "CATE"
-    ]
-  },
-  {
-    "ts": "2026-08-02 13:30 UTC",
-    "found": 6,
-    "top5": [
-      "PI",
-      "FET",
-      "ADA",
-      "ENA",
-      "CATE"
-    ]
-  },
-  {
-    "ts": "2026-08-02 19:30 UTC",
-    "found": 7,
-    "top5": [
-      "BLESS",
-      "BNB",
-      "XMR",
-      "BTC",
-      "PENGU"
-    ]
-  },
-  {
-    "ts": "2026-08-03 01:30 UTC",
-    "found": 6,
-    "top5": [
-      "NEAR",
-      "PONS",
-      "JUPUSD",
-      "PENGU",
-      "CATE"
-    ]
-  },
-  {
-    "ts": "2026-08-03 07:30 UTC",
-    "found": 7,
-    "top5": [
-      "BLESS",
-      "ENA",
-      "PRL",
-      "USDC",
-      "PENGU"
-    ]
-  },
-  {
-    "ts": "2026-08-03 13:30 UTC",
-    "found": 8,
-    "top5": [
-      "PI",
-      "ADA",
-      "ALLO",
-      "SNDKB",
-      "BLESS"
-    ]
-  },
-  {
-    "ts": "2026-08-03 19:30 UTC",
-    "found": 5,
-    "top5": [
-      "ADA",
-      "CASHCAT",
-      "ATOM",
-      "HYPE",
-      "PUMP"
-    ]
-  },
-  {
-    "ts": "2026-08-04 01:30 UTC",
-    "found": 8,
-    "top5": [
-      "ADA",
-      "GRAM",
-      "SNDKB",
-      "ALLO",
-      "PENGU"
-    ]
-  },
-  {
-    "ts": "2026-08-04 07:30 UTC",
-    "found": 5,
-    "top5": [
-      "GRAM",
-      "CASHCAT",
-      "PENGU",
-      "BTC",
-      "TAO"
-    ]
-  },
-  {
-    "ts": "2026-08-04 13:30 UTC",
-    "found": 8,
-    "top5": [
-      "ERG",
-      "CASHCAT",
-      "CYS",
-      "SHIB",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-08-04 19:30 UTC",
-    "found": 8,
-    "top5": [
-      "ERG",
-      "SNDKB",
-      "SPCXB",
-      "SKYAI",
-      "MUB"
-    ]
-  },
-  {
-    "ts": "2026-08-05 01:30 UTC",
-    "found": 9,
-    "top5": [
-      "SKYAI",
-      "CASHCAT",
-      "ENA",
-      "SPCXB",
-      "SNDKB"
-    ]
-  },
-  {
-    "ts": "2026-08-05 07:30 UTC",
-    "found": 12,
-    "top5": [
-      "PI",
-      "GRAM",
-      "NEAR",
-      "SPCXB",
-      "CYS"
-    ]
-  },
-  {
-    "ts": "2026-08-05 13:30 UTC",
-    "found": 13,
-    "top5": [
-      "CYS",
-      "SKYAI",
-      "BIO",
-      "FET",
-      "SPCXB"
-    ]
-  },
-  {
-    "ts": "2026-08-05 19:30 UTC",
-    "found": 14,
-    "top5": [
-      "SKYAI",
-      "BIO",
-      "CASHCAT",
-      "HEI",
-      "BLESS"
-    ]
-  },
-  {
     "ts": "2026-08-06 01:30 UTC",
     "found": 6,
     "top5": [
@@ -2196,6 +1679,522 @@
       "ILV",
       "\u725b\u6765",
       "EMBER"
+    ]
+  },
+  {
+    "ts": "2026-09-13 13:30 UTC",
+    "found": 9,
+    "top5": [
+      "LSK",
+      "VTHO",
+      "POLYX",
+      "CVC",
+      "ETH"
+    ]
+  },
+  {
+    "ts": "2026-09-13 19:30 UTC",
+    "found": 12,
+    "top5": [
+      "LSK",
+      "FIL",
+      "VTHO",
+      "POLYX",
+      "STONK"
+    ]
+  },
+  {
+    "ts": "2026-09-14 01:30 UTC",
+    "found": 12,
+    "top5": [
+      "LSK",
+      "FIL",
+      "VTHO",
+      "PRL",
+      "STONK"
+    ]
+  },
+  {
+    "ts": "2026-09-14 07:30 UTC",
+    "found": 12,
+    "top5": [
+      "LSK",
+      "FIL",
+      "POLYX",
+      "ETH",
+      "VET"
+    ]
+  },
+  {
+    "ts": "2026-09-14 13:30 UTC",
+    "found": 5,
+    "top5": [
+      "LSK",
+      "ARB",
+      "LAPTOP",
+      "EMBER",
+      "DOT"
+    ]
+  },
+  {
+    "ts": "2026-09-14 19:30 UTC",
+    "found": 15,
+    "top5": [
+      "LSK",
+      "PONS",
+      "T",
+      "STONK",
+      "XRP"
+    ]
+  },
+  {
+    "ts": "2026-09-15 01:30 UTC",
+    "found": 14,
+    "top5": [
+      "LSK",
+      "PONS",
+      "STONK",
+      "PENGU",
+      "FIL"
+    ]
+  },
+  {
+    "ts": "2026-09-15 07:30 UTC",
+    "found": 4,
+    "top5": [
+      "POWER",
+      "PONS",
+      "ZEC",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-15 13:30 UTC",
+    "found": 6,
+    "top5": [
+      "AKE",
+      "ARB",
+      "PONS",
+      "BTC",
+      "XRP"
+    ]
+  },
+  {
+    "ts": "2026-09-15 19:30 UTC",
+    "found": 7,
+    "top5": [
+      "AKE",
+      "ARB",
+      "TRUMP",
+      "FIRO",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-16 07:30 UTC",
+    "found": 14,
+    "top5": [
+      "ARB",
+      "FDUSD",
+      "DRV",
+      "PONS",
+      "PENGU"
+    ]
+  },
+  {
+    "ts": "2026-09-16 13:30 UTC",
+    "found": 17,
+    "top5": [
+      "LSK",
+      "ARB",
+      "FDUSD",
+      "TRUMP",
+      "PENGU"
+    ]
+  },
+  {
+    "ts": "2026-09-16 19:30 UTC",
+    "found": 18,
+    "top5": [
+      "LSK",
+      "ARB",
+      "ZEC",
+      "TRUMP",
+      "ARGUS"
+    ]
+  },
+  {
+    "ts": "2026-09-17 01:30 UTC",
+    "found": 16,
+    "top5": [
+      "DRV",
+      "ZEC",
+      "TRUMP",
+      "SPCXB",
+      "ARGUS"
+    ]
+  },
+  {
+    "ts": "2026-09-17 07:30 UTC",
+    "found": 18,
+    "top5": [
+      "ZEC",
+      "DRV",
+      "NEAR",
+      "ARB",
+      "PENGU"
+    ]
+  },
+  {
+    "ts": "2026-09-17 13:30 UTC",
+    "found": 8,
+    "top5": [
+      "NEAR",
+      "ZEC",
+      "GENIUS",
+      "JPYC",
+      "ARGUS"
+    ]
+  },
+  {
+    "ts": "2026-09-17 19:30 UTC",
+    "found": 6,
+    "top5": [
+      "NEAR",
+      "ZEC",
+      "UNI",
+      "ARGUS",
+      "FIRO"
+    ]
+  },
+  {
+    "ts": "2026-09-18 01:30 UTC",
+    "found": 7,
+    "top5": [
+      "NEAR",
+      "UNI",
+      "ZEC",
+      "PRL",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-18 07:30 UTC",
+    "found": 18,
+    "top5": [
+      "NEAR",
+      "UNI",
+      "COTI",
+      "ARB",
+      "ZEC"
+    ]
+  },
+  {
+    "ts": "2026-09-18 13:30 UTC",
+    "found": 24,
+    "top5": [
+      "NEAR",
+      "UNI",
+      "ARB",
+      "GEOD",
+      "FIRO"
+    ]
+  },
+  {
+    "ts": "2026-09-18 19:30 UTC",
+    "found": 10,
+    "top5": [
+      "FIRO",
+      "SOL",
+      "NEAR",
+      "ZEC",
+      "ARB"
+    ]
+  },
+  {
+    "ts": "2026-09-19 01:30 UTC",
+    "found": 8,
+    "top5": [
+      "FIRO",
+      "DRV",
+      "ZEC",
+      "XMR",
+      "PRL"
+    ]
+  },
+  {
+    "ts": "2026-09-19 07:30 UTC",
+    "found": 10,
+    "top5": [
+      "FIRO",
+      "AKE",
+      "ZEC",
+      "SOL",
+      "DRV"
+    ]
+  },
+  {
+    "ts": "2026-09-19 13:30 UTC",
+    "found": 30,
+    "top5": [
+      "DRV",
+      "ZAMA",
+      "ENA",
+      "AVAX",
+      "NEAR"
+    ]
+  },
+  {
+    "ts": "2026-09-19 19:30 UTC",
+    "found": 11,
+    "top5": [
+      "ZAMA",
+      "FIRO",
+      "ONDO",
+      "AKE",
+      "FIL"
+    ]
+  },
+  {
+    "ts": "2026-09-20 01:30 UTC",
+    "found": 10,
+    "top5": [
+      "FIRO",
+      "AVAX",
+      "ENA",
+      "ZAMA",
+      "INJ"
+    ]
+  },
+  {
+    "ts": "2026-09-20 07:30 UTC",
+    "found": 24,
+    "top5": [
+      "AVAX",
+      "ZAMA",
+      "ONE",
+      "G",
+      "ZIL"
+    ]
+  },
+  {
+    "ts": "2026-09-20 13:30 UTC",
+    "found": 8,
+    "top5": [
+      "AVAX",
+      "ZAMA",
+      "NEAR",
+      "DRV",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-20 19:30 UTC",
+    "found": 9,
+    "top5": [
+      "AKE",
+      "NEAR",
+      "ENA",
+      "ZAMA",
+      "AVAX"
+    ]
+  },
+  {
+    "ts": "2026-09-21 01:30 UTC",
+    "found": 7,
+    "top5": [
+      "AVAX",
+      "NEAR",
+      "FIRO",
+      "ZANO",
+      "SEI"
+    ]
+  },
+  {
+    "ts": "2026-09-21 07:30 UTC",
+    "found": 22,
+    "top5": [
+      "NEAR",
+      "AVAX",
+      "SUI",
+      "ZAMA",
+      "SEI"
+    ]
+  },
+  {
+    "ts": "2026-09-21 13:30 UTC",
+    "found": 11,
+    "top5": [
+      "NEAR",
+      "SUI",
+      "BTC",
+      "ZAMA",
+      "SOL"
+    ]
+  },
+  {
+    "ts": "2026-09-21 19:30 UTC",
+    "found": 12,
+    "top5": [
+      "SUI",
+      "FIRO",
+      "BTC",
+      "SOL",
+      "ETH"
+    ]
+  },
+  {
+    "ts": "2026-09-22 01:30 UTC",
+    "found": 7,
+    "top5": [
+      "RHEA",
+      "TRUMP",
+      "PENGU",
+      "BTC",
+      "AS"
+    ]
+  },
+  {
+    "ts": "2026-09-22 07:30 UTC",
+    "found": 7,
+    "top5": [
+      "BTC",
+      "NEAR",
+      "PRL",
+      "FIRO",
+      "TAO"
+    ]
+  },
+  {
+    "ts": "2026-09-22 13:30 UTC",
+    "found": 8,
+    "top5": [
+      "FIRO",
+      "BCH",
+      "RHEA",
+      "NEAR",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-22 19:30 UTC",
+    "found": 8,
+    "top5": [
+      "NEAR",
+      "PRL",
+      "SOL",
+      "BTC",
+      "BCH"
+    ]
+  },
+  {
+    "ts": "2026-09-23 01:30 UTC",
+    "found": 23,
+    "top5": [
+      "UNI",
+      "PENGU",
+      "MUBARAK",
+      "WIF",
+      "ZEC"
+    ]
+  },
+  {
+    "ts": "2026-09-23 07:30 UTC",
+    "found": 25,
+    "top5": [
+      "UNI",
+      "PENGU",
+      "ZAMA",
+      "MUBARAK",
+      "WIF"
+    ]
+  },
+  {
+    "ts": "2026-09-23 13:30 UTC",
+    "found": 25,
+    "top5": [
+      "NEAR",
+      "PENGU",
+      "MET",
+      "UNI",
+      "BTC"
+    ]
+  },
+  {
+    "ts": "2026-09-23 19:30 UTC",
+    "found": 22,
+    "top5": [
+      "RAY",
+      "NIL",
+      "NEAR",
+      "ARB",
+      "FDUSD"
+    ]
+  },
+  {
+    "ts": "2026-09-24 01:30 UTC",
+    "found": 21,
+    "top5": [
+      "NIL",
+      "RAY",
+      "PENGU",
+      "FDUSD",
+      "NEAR"
+    ]
+  },
+  {
+    "ts": "2026-09-24 07:30 UTC",
+    "found": 18,
+    "top5": [
+      "NIL",
+      "NEAR",
+      "PENGU",
+      "FDUSD",
+      "PEPE"
+    ]
+  },
+  {
+    "ts": "2026-09-24 13:30 UTC",
+    "found": 19,
+    "top5": [
+      "RAY",
+      "NEAR",
+      "ONDO",
+      "FDUSD",
+      "PEAQ"
+    ]
+  },
+  {
+    "ts": "2026-09-24 19:30 UTC",
+    "found": 16,
+    "top5": [
+      "LTC",
+      "ONDO",
+      "PENGU",
+      "PEAQ",
+      "NEAR"
+    ]
+  },
+  {
+    "ts": "2026-09-25 01:30 UTC",
+    "found": 17,
+    "top5": [
+      "ONDO",
+      "PENGU",
+      "LTC",
+      "PEAQ",
+      "ENA"
+    ]
+  },
+  {
+    "ts": "2026-09-25 07:34 UTC",
+    "found": 7,
+    "top5": [
+      "ONDO",
+      "VIRTUAL",
+      "PEAQ",
+      "EDGE",
+      "BP"
     ]
   }
 ]

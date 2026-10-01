@@ -224,3 +224,7 @@ After any correction from Burton, write to `tasks/lessons.md` immediately:
 ```
 
 Never make the same mistake twice.
+
+## Grok Build executor
+
+Burton: **Grok Build is the executor** for Valedia coding/merges. Architect/audit stay with Valedia chat. See `recommendations/GROK-BUILD-LANE.md`.

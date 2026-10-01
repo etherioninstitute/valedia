@@ -1,0 +1,93 @@
+//@version=5
+// PAPER. Boilerplate-shaped gates (inverse flip, MDD, session, RiskMTip, kill).
+// Engine: Waddah_1H_Anchor. Not Trendhoo_45M. Not TopG_5M_Scalp. No webhook.
+// Passphrase is a sentinel. Replace it in the TradingView alert dialog only.
+strategy("DAVIDDTECH Waddah_1H_Anchor paper", overlay=true, pyramiding=0, process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// ponytail: public WAE + QQE + McGinley with the PDF numbers. Not DaviddTech source.
+// ponytail: trail / tp1 / tp2 / breakeven alerts omitted. JSON stays entry|exit. Add when a paper trail is requested.
+// ponytail: WAE sensitivity 150 is the public constant. McGinley length is not in the PDF (input 14).
+
+invFlip = input.bool(false, "Inverse flip")
+kill = input.bool(false, "Kill switch")
+maxPercDd = input.float(15.0, "maxPercDdTip", minval=0.1, step=0.1)
+useSession = input.bool(false, "Session filter")
+sess = input.session("0800-1600", "Session")
+riskMTip = input.float(1.5, "RiskMTip", minval=0.1, step=0.1)
+atpStopMult = input.float(3.0, "atp_stop_mult", minval=0.1, step=0.1)
+hullLen = input.int(21, "atp_hull_length", minval=1)
+fastLen = input.int(20, "Fast EMA", minval=1)
+slowLen = input.int(40, "Slow EMA", minval=1)
+dzLen = input.int(100, "Deadzone TR length", minval=1)
+dzMult = input.float(3.7, "atp_exp_deadzone_mult", minval=0.1, step=0.1)
+adxLen = input.int(14, "ADX length", minval=1)
+adxTh = input.float(25.0, "ADX threshold", minval=0, step=1)
+mgLen = input.int(14, "McGinley length", minval=1)
+waeSens = input.int(150, "WAE sensitivity", minval=1)
+
+ALERT_ENTRY = '{"passphrase":"PASTE_PASSPHRASE_IN_TV_ALERT","timestamp":"{{timenow}}","strategy_id":"Waddah_1H_Anchor","ticker":"{{ticker}}","action":"entry","subaccount":"paper","entry_price":{{close}},"volume":{{strategy.order.contracts}},"portfolio_risk":0.5}'
+
+f_alert(action) =>
+    str.replace(ALERT_ENTRY, '"action":"entry"', '"action":"' + action + '"')
+
+basis = ta.hma(close, hullLen)
+macd = ta.ema(basis, fastLen) - ta.ema(basis, slowLen)
+hist = (macd - macd[1]) * waeSens
+deadzone = ta.rma(ta.tr(true), dzLen) * dzMult
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+rsi = ta.rsi(close, 14)
+rsiMa = ta.ema(rsi, 5)
+atrRsi = math.abs(nz(rsiMa) - nz(rsiMa[1]))
+maAtr = ta.ema(atrRsi, 27)
+dar = ta.ema(maAtr, 27) * 4.236
+var float longband = na
+var float shortband = na
+var int qqeTrend = 0
+float newLong = rsiMa - dar
+float newShort = rsiMa + dar
+longband := nz(rsiMa[1]) > nz(longband[1]) and rsiMa > nz(longband[1]) ? math.max(nz(longband[1]), newLong) : newLong
+shortband := nz(rsiMa[1]) < nz(shortband[1]) and rsiMa < nz(shortband[1]) ? math.min(nz(shortband[1]), newShort) : newShort
+bool qqeUp = ta.crossover(rsiMa, shortband[1])
+bool qqeDn = ta.crossunder(rsiMa, longband[1])
+qqeTrend := qqeUp ? 1 : qqeDn ? -1 : qqeTrend
+
+var float mg = na
+float prevMg = mg[1]
+if na(prevMg) or prevMg == 0.0 or close <= 0
+    mg := basis
+else
+    mg := prevMg + (close - prevMg) / (mgLen * math.pow(close / prevMg, 4))
+
+rawLong = qqeTrend == 1 and close > mg and hist > deadzone and adx > adxTh and diPlus > diMinus
+rawShort = qqeTrend == -1 and close < mg and -hist > deadzone and adx > adxTh and diMinus > diPlus
+wantLong = invFlip ? rawShort : rawLong
+wantShort = invFlip ? rawLong : rawShort
+
+var float peakEq = na
+peakEq := math.max(nz(peakEq, strategy.initial_capital), strategy.equity)
+ddPct = peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100.0 : 0.0
+inSess = not useSession or not na(time(timeframe.period, sess))
+allow = not kill and ddPct < maxPercDd and inSess and not na(mg) and not na(adx) and not na(deadzone)
+
+float stopDist = ta.atr(22) * atpStopMult
+float qty = stopDist > 0 ? (strategy.equity * riskMTip / 100.0) / stopDist : 1.0
+float swingLow = ta.lowest(low, 5)[1]
+float swingHigh = ta.highest(high, 5)[1]
+
+if allow and wantLong and not wantShort and strategy.position_size == 0
+    strategy.entry("L", strategy.long, qty=qty, alert_message=f_alert("entry"))
+if allow and wantShort and not wantLong and strategy.position_size == 0
+    strategy.entry("S", strategy.short, qty=qty, alert_message=f_alert("entry"))
+
+if strategy.position_size > 0 and wantShort
+    strategy.close("L", alert_message=f_alert("exit"))
+if strategy.position_size < 0 and wantLong
+    strategy.close("S", alert_message=f_alert("exit"))
+
+if strategy.position_size > 0
+    strategy.exit("XL", from_entry="L", stop=math.min(strategy.position_avg_price - stopDist, swingLow), alert_message=f_alert("exit"))
+if strategy.position_size < 0
+    strategy.exit("XS", from_entry="S", stop=math.max(strategy.position_avg_price + stopDist, swingHigh), alert_message=f_alert("exit"))
+
+plot(mg, "McGinley", color=color.orange)

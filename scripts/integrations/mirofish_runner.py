@@ -98,7 +98,10 @@ def run_simulation(seed_path):
     results = {"status": "starting", "steps": []}
     
     # Step 1: Upload seed + generate ontology
-    print("[MiroFish] Step 1: Uploading seed and generating ontology...")
+    _t0 = time.time()
+    def _stage(label):
+        print(f"[MiroFish] {label} +{time.time()-_t0:.0f}s", flush=True)
+    _stage("Step 1: Uploading seed and generating ontology")
     with open(seed_path, "rb") as f:
         r = requests.post(f"{MIROFISH_URL}/graph/ontology/generate", 
             files={"files": (os.path.basename(seed_path), f, "text/markdown")},
@@ -120,9 +123,10 @@ def run_simulation(seed_path):
     results["project_id"] = project_id
     results["steps"].append(f"ontology: {len(data['data'].get('ontology',{}).get('entity_types',[]))} entity types")
     print(f"  Project: {project_id}")
+    _stage("ontology done")
     
     # Step 2: Build knowledge graph
-    print("[MiroFish] Step 2: Building knowledge graph...")
+    _stage("Step 2: Building knowledge graph")
     r = requests.post(f"{MIROFISH_URL}/graph/build", 
         json={"project_id": project_id}, timeout=600)
     
@@ -135,19 +139,25 @@ def run_simulation(seed_path):
     
     # Wait for graph build to complete
     task_id = build_data.get("data",{}).get("task_id","")
+    graph_ok = False
     for _ in range(600):  # max 50 min wait (rich seed measured ~28min on 2026-09-10; margin so an unattended 02:00 cron never hits the wall)
         time.sleep(5)
         status_r = requests.get(f"{MIROFISH_URL}/graph/project/{project_id}", timeout=30)
         if status_r.ok:
             proj = status_r.json().get("data",{})
             if proj.get("status") in ["graph_completed", "completed"]:
+                graph_ok = True
+                print(f"  graph {proj.get('status')} node_count={proj.get('node_count', proj.get('entity_count', '?'))}", flush=True)
                 break
             if proj.get("status") == "failed":
                 results["status"] = f"graph build failed: {proj.get('error','?')}"
                 return results
-    
+    if not graph_ok:
+        results["status"] = "graph build timed out before graph_completed"
+        return results
+    _stage("graph done")
     # Step 3: Create simulation
-    print("[MiroFish] Step 3: Creating simulation...")
+    _stage("Step 3: Creating simulation")
     r = requests.post(f"{MIROFISH_URL}/simulation/create",
         json={"project_id": project_id}, timeout=60)
     
@@ -159,7 +169,7 @@ def run_simulation(seed_path):
     results["simulation_id"] = sim_id
     
     # Step 4: Prepare (generate agent profiles)
-    print("[MiroFish] Step 4: Preparing agents...")
+    _stage("Step 4: Preparing agents")
     r = requests.post(f"{MIROFISH_URL}/simulation/prepare",
         json={"simulation_id": sim_id}, timeout=600)
     
@@ -182,6 +192,7 @@ def run_simulation(seed_path):
         results["status"] = "agents not ready after 90min (prepare timeout) — did not start sim"
         return results
     results["steps"].append("agents prepared")
+    _stage("agents prepared")
 
     # Step 5: Start simulation
     # NOTE (2026-09-10): enable_graph_memory_update is the intended rounds->report bridge (writes
@@ -190,7 +201,7 @@ def run_simulation(seed_path):
     # ~100 posts each trigger an NER call that starves the report's own LLM calls -> 600s timeouts.
     # Left OFF until the sim->report sequencing is fixed (drain graph-memory before the report, or a
     # lighter/faster embed-only path). Report still runs on the accurate seed graph + personas.
-    print("[MiroFish] Step 5: Running simulation (this may take 5-15 min)...")
+    _stage("Step 5: Running simulation")
     r = requests.post(f"{MIROFISH_URL}/simulation/start",
         json={"simulation_id": sim_id, "max_rounds": 8}, timeout=60)
     
@@ -215,9 +226,10 @@ def run_simulation(seed_path):
                 print(f"  ... round {d.get('current_round', '?')}")
     
     results["steps"].append("simulation completed")
+    _stage("simulation completed")
     
     # Step 6: Generate report (MiroFish-Offline: async generate -> poll status -> fetch content)
-    print("[MiroFish] Step 6: Generating prediction report...")
+    _stage("Step 6: Generating prediction report")
     r = requests.post(f"{MIROFISH_URL}/report/generate",
         json={"simulation_id": sim_id}, timeout=60)
     if not r.ok:
@@ -251,6 +263,7 @@ def run_simulation(seed_path):
         results["report"] = fr.json().get("data", {})
         results["steps"].append("report generated")
         results["status"] = "complete"
+        _stage("report done")
     else:
         results["status"] = f"report fetch failed: {fr.text[:200]}"
 
@@ -270,7 +283,133 @@ def save_prediction(results):
         }, f, indent=2)
     return pred_path
 
+
+def _completed_report_mtime(path):
+    """Directory mtime when a completed marker exists and full_report.md is non-empty."""
+    if not os.path.isdir(path):
+        return None
+    md = os.path.join(path, "full_report.md")
+    try:
+        if os.path.getsize(md) <= 0:
+            return None
+    except OSError:
+        return None
+    done = False
+    for marker in ("progress.json", "meta.json"):
+        try:
+            with open(os.path.join(path, marker)) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and str(doc.get("status", "")).lower() == "completed":
+            done = True
+            break
+    if not done:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def pick_newest_completed_report(report_dir):
+    # Newest completed report by directory mtime; skip incomplete/placeholder (empty full_report.md or no completed marker). Not os.listdir order.
+    best = None
+    if not report_dir or not os.path.isdir(report_dir):
+        return None
+    for name in os.listdir(report_dir):
+        if name.startswith("."):
+            continue
+        path = os.path.join(report_dir, name)
+        mtime = _completed_report_mtime(path)
+        if mtime is None:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, name, path)
+    return {"mtime": best[0], "id": best[1], "path": best[2]} if best else None
+
+
+def _assert_pick_newest_not_lexical():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        older = os.path.join(td, "report_aaa")
+        newer = os.path.join(td, "report_zzz")
+        placeholder = os.path.join(td, "report_000")
+        for p in (older, newer, placeholder):
+            os.makedirs(p)
+        open(os.path.join(older, "full_report.md"), "w").write("bitcoin " * 20)
+        open(os.path.join(newer, "full_report.md"), "w").write("ethereum " * 20)
+        open(os.path.join(placeholder, "full_report.md"), "w").write("")
+        for p, status in ((older, "completed"), (newer, "completed"), (placeholder, "generating")):
+            json.dump({"status": status}, open(os.path.join(p, "progress.json"), "w"))
+        os.utime(older, (1_700_000_000, 1_700_000_000))
+        os.utime(newer, (1_800_000_000, 1_800_000_000))
+        os.utime(placeholder, (1_900_000_000, 1_900_000_000))
+        picked = pick_newest_completed_report(td)
+        assert picked and picked["id"] == "report_zzz", picked
+
+
+def apply_disk_report(report_data, report_dir=None):
+    report_dir = report_dir or os.path.expanduser("~/mirofish-offline/backend/uploads/reports")
+    picked = pick_newest_completed_report(report_dir)
+    if not picked:
+        return None
+    with open(os.path.join(picked["path"], "full_report.md")) as rf:
+        report_data["markdown_content"] = rf.read()
+    outline_path = os.path.join(picked["path"], "outline.json")
+    if os.path.exists(outline_path):
+        with open(outline_path) as of:
+            report_data["outline"] = json.load(of)
+    meta_path = os.path.join(picked["path"], "meta.json")
+    report_data["report_id"] = picked["id"]
+    if os.path.exists(meta_path):
+        try:
+            meta = json.load(open(meta_path))
+        except (OSError, ValueError):
+            meta = {}
+        if isinstance(meta, dict):
+            if meta.get("report_id"):
+                report_data["report_id"] = meta["report_id"]
+            if meta.get("simulation_id"):
+                report_data.setdefault("simulation_id", meta["simulation_id"])
+    return picked
+
+
+def extract_newest_report():
+    """Rewrite mirofish_signal.json from the newest completed report. Does not start a sim."""
+    _assert_pick_newest_not_lexical()
+    from mirofish_signal_extractor import extract_signals_from_report, process_mirofish_report
+    import re
+    import shutil
+    bogus = extract_signals_from_report(
+        "Quant funds are adapting their risk. Intraday prices adapted to flows.")
+    report_data = {}
+    picked = apply_disk_report(report_data)
+    text = (report_data.get("markdown_content") or "").lower()
+    real_ada = re.search(r"(?<![a-z0-9])(?:ada|cardano)(?![a-z0-9])", text)
+    pre = extract_signals_from_report(text) if picked else {}
+    if (not picked) or ("ADA-USD" in bogus) or ("ADA-USD" in pre and not real_ada):
+        why = "no-report" if not picked else "ada"
+        print("SMOKE FAIL", why, (picked or {}).get("id"))
+        return 1
+    sig = process_mirofish_report(report_data)
+    ada = "ADA-USD" in (sig.get("signals") or {})
+    if ada and not real_ada:
+        print("SMOKE FAIL spurious ADA after write", picked["id"])
+        return 1
+    dest = os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
+    mirror = os.path.expanduser("~/.openclaw/workspace-v2/models/mirofish_signal.json")
+    if os.path.isfile(mirror) and os.path.abspath(mirror) != os.path.abspath(dest):
+        shutil.copy2(dest, mirror)
+    mt = datetime.fromtimestamp(picked["mtime"]).astimezone().isoformat(timespec="seconds")
+    tickers = ",".join(sorted(sig.get("signals") or {})) or "-"
+    print(f"SMOKE PASS report={picked['id']} mtime={mt} tickers={tickers} ada={'present' if ada else 'absent'} path={dest}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--extract-only" in sys.argv:
+        sys.exit(extract_newest_report())
     print("=" * 60)
     print("  MIROFISH AUTONOMOUS RUNNER — Valedia ASI")
     print("=" * 60)
@@ -339,17 +478,9 @@ if __name__ == "__main__":
             # if present. Missing dir must NOT abort extraction — report_data already carries
             # markdown_content from the API. (Reports live in the backend's uploads/reports, not SEED_DIR.)
             report_dir = os.path.expanduser("~/mirofish-offline/backend/uploads/reports")
-            if os.path.isdir(report_dir):
-                for d in os.listdir(report_dir):
-                    report_md_path = os.path.join(report_dir, d, "full_report.md")
-                    if os.path.exists(report_md_path):
-                        with open(report_md_path) as rf:
-                            report_data["markdown_content"] = rf.read()
-                        outline_path = os.path.join(report_dir, d, "outline.json")
-                        if os.path.exists(outline_path):
-                            with open(outline_path) as of:
-                                report_data["outline"] = json.load(of)
-                        break
+            picked = apply_disk_report(report_data, report_dir)
+            if picked:
+                print(f"  Report pick: {picked['id']} mtime={picked['mtime']}")
 
             sig = process_mirofish_report(report_data)
             print(f"  Signals extracted: {len(sig.get('signals',{}))} assets, bias={sig.get('overall_bias',50)}")

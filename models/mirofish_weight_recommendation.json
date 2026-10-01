@@ -1,0 +1,32 @@
+{
+  "recommended_weight": 0.1,
+  "runtime_weight": 0.1,
+  "configured_weight": 0.1,
+  "cap": 0.1,
+  "hard_ceiling": 0.15,
+  "proven": false,
+  "n_scored": 0,
+  "directional_accuracy": null,
+  "bar": 0.55,
+  "min_scored": 20,
+  "auto_raise": false,
+  "applied": false,
+  "action": "keep_unproven_cap",
+  "reason": "unproven n=0 acc=None; cap 0.1",
+  "learning": {
+    "permanent_blacklist": false,
+    "live_exec_fenced": [
+      "OIL_BRACKET",
+      "WEATHER_ARB"
+    ],
+    "note": "TTL/probation re-enables evaluation+sizing. Unpause != live-buy for weather/oil.",
+    "pause_ttl_days": 7,
+    "paused": [
+      "SPORTS",
+      "OIL_BRACKET",
+      "WEATHER_ARB"
+    ],
+    "probation": []
+  },
+  "source": "mirofish_accuracy_ledger"
+}

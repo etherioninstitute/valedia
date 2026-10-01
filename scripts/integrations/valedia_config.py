@@ -18,7 +18,7 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
 # Runtime identity (Slice 22/23). Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.43.0"  # overlay KALSHI-ORDERS-V2; writers stay Kalshi-only
+VALEDIA_VERSION = "0.44.0"  # live cron tree. INFORMED promote 2026-09-23; build tree is 0.70.0
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 MIROFISH_WEIGHT       = 0.10   # configured fusion weight. Runtime: effective_mirofish_weight().
@@ -181,9 +181,30 @@ def scalper_live_enabled():
     return False
 
 
+_WEATHER_PREFLIGHT_DEPTH = 0
+
+
 def weather_live_enabled():
-    """WEATHER_ARB live orders. Hard-off. Env cannot enable — dead path."""
-    return False
+    """WEATHER_ARB orders. The constant stays False.
+
+    Env WEATHER_LIVE=1 is honored only when weather_live_preflight is PASS.
+    Unset env stays off. Oil is not this switch. Valedia morning go decides
+    WEATHER_LIVE (PASS→1, else→0); Grok Bot does not flip it.
+    """
+    global _WEATHER_PREFLIGHT_DEPTH
+    if _WEATHER_PREFLIGHT_DEPTH:
+        return False
+    if not _env_flag("WEATHER_LIVE", False):
+        return False
+    _WEATHER_PREFLIGHT_DEPTH += 1
+    try:
+        import weather_live_preflight as wlp
+        body = wlp.run()
+    except Exception:
+        return False
+    finally:
+        _WEATHER_PREFLIGHT_DEPTH -= 1
+    return body.get("status") == "PASS" and body.get("weather_live_flip_allowed") is True
 
 
 def ticker_family_fenced(ticker):
@@ -384,6 +405,9 @@ VENUE_NT_CUTOVER_ORDER = ("coinbase", "hyperliquid", "polymarket", "kalshi")
 
 # Docs: recommendations/KILL-SWITCH.md. Gate: require_not_halted().
 VALEDIA_TRADING_HALT = False
+# KALSHI-FEE-MAP blocking gate. Default OFF (annotate only). Env=1 drops
+# unknown + taker_taxed at select/size. This lane never sets True.
+KALSHI_FEE_MAP_GATE = False
 TREASURY_FLOOR_POLYMARKET_US = 25.0  # known ~$30.55; WARN below 25
 TREASURY_FLOOR_KALSHI = 25.0          # stub until Burton sets
 TREASURY_FLOOR_COINBASE = 20.0
@@ -408,6 +432,10 @@ ALLOCATOR_CRON_MINUTE = 20
 # on paper (earn it). Flip to False to let her place/manage live maker orders under her risk stack.
 EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master_allocator, the live authority)
 
+# INFORMED-BEFORE-CREATE is enforced in informed_before_create.require_kalshi. Env cannot disable it.
+INFORMED_BEFORE_CREATE = True
+VALEDIA_JEV = False  # VALEDIA_JEV=1 annotates CONVICTION shadow only. Not OMS. Git default stays False.
+
 import os as _os, json as _json   # for auto-sourcing live track-record / risk state
 _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
 
@@ -416,6 +444,15 @@ def _env_flag(name, default):
     if env is not None and str(env).strip() != "":
         return str(env).strip().lower() in ("1", "true", "yes", "on")
     return bool(default)
+
+
+def jev_enabled():
+    """True only when VALEDIA_JEV is flipped. Default False.
+
+    On: CONVICTION annotate/shadow beside INFORMED. Fail-open. Not OMS.
+    Off: zero TypeSafe calls. Not on arb or GOLD-15m.
+    """
+    return _env_flag("VALEDIA_JEV", VALEDIA_JEV)
 
 
 _ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", ".."))
@@ -501,6 +538,15 @@ def treasury_auto_enabled():
     money. This lane never sets True. Env VALEDIA_TREASURY_AUTO=1 wins.
     """
     return _env_flag("VALEDIA_TREASURY_AUTO", VALEDIA_TREASURY_AUTO)
+
+
+def kalshi_fee_map_gate_enabled():
+    """True only if Burton flipped KALSHI_FEE_MAP_GATE. Default False.
+
+    Off: consult annotates, never drops. On: drop unknown + taker_taxed.
+    This lane never sets True.
+    """
+    return _env_flag("KALSHI_FEE_MAP_GATE", KALSHI_FEE_MAP_GATE)
 
 
 class HaltedError(RuntimeError):
@@ -674,9 +720,30 @@ def scalper_live_enabled():
     return False
 
 
+_WEATHER_PREFLIGHT_DEPTH = 0
+
+
 def weather_live_enabled():
-    """WEATHER_ARB live orders. Hard-off. Env cannot enable — dead path."""
-    return False
+    """WEATHER_ARB orders. The constant stays False.
+
+    Env WEATHER_LIVE=1 is honored only when weather_live_preflight is PASS.
+    Unset env stays off. Oil is not this switch. Valedia morning go decides
+    WEATHER_LIVE (PASS→1, else→0); Grok Bot does not flip it.
+    """
+    global _WEATHER_PREFLIGHT_DEPTH
+    if _WEATHER_PREFLIGHT_DEPTH:
+        return False
+    if not _env_flag("WEATHER_LIVE", False):
+        return False
+    _WEATHER_PREFLIGHT_DEPTH += 1
+    try:
+        import weather_live_preflight as wlp
+        body = wlp.run()
+    except Exception:
+        return False
+    finally:
+        _WEATHER_PREFLIGHT_DEPTH -= 1
+    return body.get("status") == "PASS" and body.get("weather_live_flip_allowed") is True
 
 
 def ticker_family_fenced(ticker):

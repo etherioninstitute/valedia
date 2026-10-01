@@ -1,5 +1,7 @@
 # Valedia × ruflo-neural-trader (fenced) — Burton 2026-09-18
 
+**NORTH STAR (Burton):** Valedia = world-class auto-trader — smartest + highest-profiting under gates. Every slice serves that. Seamless one-brain. Self-adjust when flipped on. Live risk gated until Burton widens fences.
+
 **North star:** maximum profit under gates. Valedia runtime = sole live risk.  
 **This charter:** `ruflo-neural-trader` / `neural-trader` exists **only to strengthen MiroFish** (better features, regimes, backtested context, scored signals) so Valedia’s fusion + accuracy loop gets smarter. It is **not** a second trader.
 
@@ -100,6 +102,10 @@ Valedia’s local stack stays authoritative:
 Neural math (Rust/NAPI) runs on-box; enrichment is JSON into MiroFish. MiroFish keeps using `:11435`. OpenTerminal optional Claude assistant = **off**.
 
 Easy lane switching: see `VALEDIA-LOCAL-MODEL-SWITCH.md` + `scripts/valedia_models.sh`.
+
+## Dynamic MiroFish weight (Option B)
+
+See `VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md`. NT-2 wires tags only. Auto-raise / wider caps wait for Burton master flip (`VALEDIA_SELF_ADJUST`). **Dormant gates wake when flipped — they do not stay off forever by neglect.**
 
 ## References
 

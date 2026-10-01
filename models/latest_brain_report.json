@@ -1,14 +1,14 @@
 {
-  "ts": "2026-09-11 19:45 UTC",
+  "ts": "2026-10-01 13:37 UTC",
   "actions": [],
   "intel": {
-    "ts": "2026-09-11T19:45:18.138393+00:00",
-    "fear_greed": 56,
+    "ts": "2026-10-01T13:37:10.944071+00:00",
+    "fear_greed": 74,
     "fg_label": "Greed",
-    "fg_signal": 0
+    "fg_signal": -8
   },
-  "equity": 30.21,
-  "conf_mult": 0.3,
+  "equity": 29.55,
+  "conf_mult": 1.0,
   "version": "v3.1",
   "host": "burtons-mac-studio-m1"
 }

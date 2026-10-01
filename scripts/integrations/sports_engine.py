@@ -225,6 +225,14 @@ def size_bets(games, bankroll, per_trade_cap=None):
         edge = g.get('edge_score', 0)
         if edge < -10:
             continue
+        try:
+            import kalshi_fee_map as _kfm
+            ok, info = _kfm.allow(g.get("fav_ticker"), series=g.get("series"))
+            g["fee_map"] = info
+            if not ok:
+                continue
+        except Exception:
+            pass
         # Conviction as a fraction of the live cap — never a 10% WR printer.
         if edge >= 25:
             frac = 1.00

@@ -137,26 +137,38 @@ def get_order(order_id):
     return get(f"/portfolio/orders/{order_id}")
 
 
-def create_order(ticker, side, count, price_cents, order_type="limit"):
-    """Place a buy. side='yes' or 'no'. price in cents (1-99). Caller API stable."""
+def create_order(ticker, side, count, price_cents, order_type="limit", informed=None):
+    """Place a buy. side='yes' or 'no'. price in cents (1-99).
+
+    Halt is necessary, not sufficient. informed-before-create must pass.
+    """
     import valedia_config as vc
+    import informed_before_create as ibc
     vc.require_not_halted("kalshi.create_order")
+    ibc.require_kalshi(
+        ticker, side, count, price_cents, order_type, informed, action="buy")
     body = create_order_v2_body(ticker, side, count, price_cents, order_type, "buy")
     return _wrap_v2_ack(post(CREATE_ORDER_V2, body))
 
 
 def cancel_order(order_id, ticker=None):
-    """Cancel via DELETE /portfolio/events/orders/{id}. ticker enables auto-route."""
+    """Cancel via DELETE /portfolio/events/orders/{id}.
+
+    Do not put query params on the signed path — Kalshi returns
+    INCORRECT_API_KEY_SIGNATURE when market_ticker is appended.
+    ticker is accepted for call-site compat and ignored.
+    """
     path = f"/portfolio/events/orders/{order_id}"
-    if ticker:
-        path += f"?market_ticker={quote(str(ticker), safe='')}"
     return delete(path)
 
 
-def sell_position(ticker, side, count, price_cents, order_type="limit"):
+def sell_position(ticker, side, count, price_cents, order_type="limit", informed=None):
     """Sell an existing position. side='yes' or 'no'. price in cents (1-99)."""
     import valedia_config as vc
+    import informed_before_create as ibc
     vc.require_not_halted("kalshi.sell_position")
+    ibc.require_kalshi(
+        ticker, side, count, price_cents, order_type, informed, action="sell")
     body = create_order_v2_body(ticker, side, count, price_cents, order_type, "sell")
     body["reduce_only"] = True
     return _wrap_v2_ack(post(CREATE_ORDER_V2, body))

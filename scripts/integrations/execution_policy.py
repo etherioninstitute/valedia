@@ -136,11 +136,15 @@ class MakerOrderManager:
         import kalshi_auth as K
         return K
 
-    def _place(self, ticker, side, contracts, price_cents):
+    def _place(self, ticker, side, contracts, price_cents, informed=None):
         _cfg.require_not_halted("execution_policy._place")
         a = self._api()
-        return a.place_order(ticker, side, contracts, price_cents) if self.api is not None \
-            else a.create_order(ticker, side, contracts, price_cents)
+        if self.api is not None:
+            try:
+                return a.place_order(ticker, side, contracts, price_cents, informed=informed)
+            except TypeError:
+                return a.place_order(ticker, side, contracts, price_cents)
+        return a.create_order(ticker, side, contracts, price_cents, informed=informed)
 
     def _cancel(self, order_id, ticker=None):
         fn = self._api().cancel_order
@@ -149,12 +153,12 @@ class MakerOrderManager:
         except TypeError:
             return fn(order_id)
 
-    def place_maker_order(self, ticker, side, contracts, price_cents, strategy="", max_age_s=None):
+    def place_maker_order(self, ticker, side, contracts, price_cents, strategy="", max_age_s=None, informed=None):
         if getattr(_cfg, "EXEC_DRY_RUN", True):
             log.info(f"  MAKER DRY-RUN: {side} {contracts}x {ticker} @{price_cents}c")
             return None
         try:
-            res = self._place(ticker, side, contracts, price_cents) or {}
+            res = self._place(ticker, side, contracts, price_cents, informed=informed) or {}
             nested = res.get("order") if isinstance(res.get("order"), dict) else {}
             order_id = nested.get("order_id") or res.get("order_id") or ""
             if order_id:

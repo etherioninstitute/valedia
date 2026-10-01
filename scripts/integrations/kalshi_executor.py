@@ -307,7 +307,7 @@ def _score_market(m, series):
                 rationale += f" [Intel FLIPPED to NO]"
         except: pass
     
-    return {
+    out = {
         "ticker": ticker, "title": title[:60], "series": series,
         "strategy": strategy, "score": round(score, 1),
         "side": side, "price": round(price, 4), "edge": round(edge, 4),
@@ -316,6 +316,15 @@ def _score_market(m, series):
         "last_price": lp, "hours_to_exp": round(hours_to_exp, 1),
         "rationale": rationale, "is_sport": is_sport,
     }
+    try:
+        import kalshi_fee_map as _kfm
+        ok, info = _kfm.allow(ticker, series=series)
+        out["fee_map"] = info
+        if not ok:
+            return None
+    except Exception:
+        pass
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -326,6 +335,13 @@ def _size_contracts(opp, state, cost_per):
     """Shared contract sizing (used by taker execute_trade AND maker placement, so both size
     the same way). Budget + strategy caps + balance-aware. Returns int contracts, or 0 if
     unaffordable/bad price."""
+    try:
+        import kalshi_fee_map as _kfm
+        ok, _ = _kfm.allow(opp.get("ticker"), series=opp.get("series"))
+        if not ok:
+            return 0
+    except Exception:
+        pass
     if cost_per <= 0 or cost_per >= 1.0:
         return 0
     max_spend = min(state["max_per_trade"], state["max_deployable"])
@@ -368,12 +384,26 @@ def execute_trade(opp, state, dry_run=False):
     if dry_run:
         result["status"] = "DRY_RUN"
         return result
-    
+
+    if _cfg is not None and _cfg.live_exec_fenced(opp.get("strategy"), ticker=opp.get("ticker")):
+        result["status"] = "SKIP_LIVE_FENCE"
+        result["error"] = "live exec fenced (strategy or oil ticker family)"
+        return result
+
+    import informed_before_create as ibc
+    pre = ibc.create_preflight(opp, n_contracts, price_cents)
+    if not pre["ok"]:
+        result["status"] = "SKIP_INFORMED"
+        result["error"] = ",".join(pre["reasons"])
+        return result
+    if pre.get("jev") is not None:
+        result["jev"] = pre["jev"]
+
     try:
         order = create_order(
             ticker=opp["ticker"], side=opp["side"],
             count=n_contracts, price_cents=price_cents,
-            order_type="limit"
+            order_type="limit", informed=pre["informed"],
         )
         result["order"] = order
         fill = {}
@@ -385,6 +415,9 @@ def execute_trade(opp, state, dry_run=False):
         result["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
         if fill.get("order_id"):
             result["order_id"] = fill["order_id"]
+    except ibc.InformedCreateRefused as e:
+        result["status"] = "SKIP_INFORMED"
+        result["error"] = ",".join(e.reasons)
     except Exception as e:
         result["status"] = "FAILED"
         result["error"] = str(e)[:200]
@@ -410,18 +443,36 @@ def _log_trade(result):
 # OPPORTUNITY REPORT — cross-platform profit potential
 # ═══════════════════════════════════════════════════════════════
 
-def opportunity_report():
+def constrained_scan_profit(sims, cash, deployable):
+    """Fee-true sim profit for picks that fit remaining cash. Picks compete; not additive."""
+    remaining = min(max(0.0, float(cash or 0)), max(0.0, float(deployable or 0)))
+    profit = 0.0
+    for sim in sims:
+        cost = float(sim.get("total_cost") or 0)
+        pot = float(sim.get("potential_profit") or 0)
+        if cost <= 0:
+            continue
+        if cost <= remaining + 1e-9:
+            profit += pot
+            remaining -= cost
+    return profit
+
+
+def opportunity_report(state=None, opps=None):
     """Generate a comprehensive profit opportunity report across all platforms.
-    This is what gets sent to Signal when opportunities are hot."""
+    This is what gets sent to Signal when opportunities are hot.
+    Scan numbers are fee-true Kalshi sims, not fills / not realized P&L."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"💰 VALEDIA OPPORTUNITY SCAN ({ts}) [not fills / not realized P&L]", ""]
     
     # 1. Kalshi state
-    state = get_state()
+    if state is None:
+        state = get_state()
     lines.append(f"KALSHI: ${state['balance']:.2f} cash | ${state['portfolio_value']:.2f} deployed | {state['n_positions']} positions")
     
     # 2. Scan all opportunities
-    opps = scan_all_markets()
+    if opps is None:
+        opps = scan_all_markets()
     if not opps:
         lines.append("  No opportunities found this scan.")
         return "\n".join(lines)
@@ -433,8 +484,8 @@ def opportunity_report():
         if s not in by_strat: by_strat[s] = []
         by_strat[s].append(o)
     
-    total_potential = 0
     total_deployable = state["max_deployable"]
+    fitted_sims = []
     
     # 4. Show top opportunities per strategy
     for strat in ["ARBITRAGE","EXPIRY_SCALP","NO_HARVEST","SPORTS_FAVORITE","MACRO_EDGE"]:
@@ -443,27 +494,33 @@ def opportunity_report():
         lines.append(f"\n{strat} ({len(group)} opportunities):")
         for o in group[:5]:
             sim = execute_trade(o, state, dry_run=True)
+            fitted_sims.append(sim)
             pot = sim.get("potential_profit", 0)
             roi = sim.get("roi_pct", 0)
-            total_potential += pot
             exp_label = f"{o['hours_to_exp']:.0f}h" if o['hours_to_exp'] < 720 else f"{o['hours_to_exp']/720:.0f}mo"
+            fenced = False
+            if _cfg is not None:
+                try:
+                    fenced = _cfg.live_exec_fenced(o.get("strategy"), ticker=o.get("ticker"))
+                except Exception:
+                    fenced = False
+            tag = " [FENCED/SKIP_LIVE_FENCE]" if fenced else ""
             lines.append(
                 f"  ${sim.get('total_cost',0):.2f}→${pot:.2f} "
-                f"({roi:+.0f}% ROI) exp:{exp_label} | {o['title'][:50]}"
+                f"({roi:+.0f}% ROI) exp:{exp_label} | {o['title'][:50]}{tag}"
             )
             lines.append(f"    {o['rationale']}")
     
-    # 5. Summary: what you COULD make
-    lines.append(f"\n═══ PROFIT POTENTIAL ═══")
+    # 5. Summary: cash-constrained fee-true sim (picks compete — do not sum as portfolio)
+    fit_profit = constrained_scan_profit(fitted_sims, state.get("balance"), total_deployable)
+    lines.append(f"\n═══ PROFIT POTENTIAL (fee-true Kalshi sim, not broker fills) ═══")
     lines.append(f"  With current ${state['balance']:.2f}: deploy up to ${total_deployable:.2f}")
-    lines.append(f"  Estimated profit from top picks: ${total_potential:.2f}")
-    if total_potential > 0 and state['balance'] > 0:
-        lines.append(f"  ROI on deployed capital: {total_potential/min(total_deployable,state['balance'])*100:.0f}%")
+    lines.append(f"  Estimated profit from top picks that fit cash (not additive): ${fit_profit:.2f}")
     
-    # 6. (Removed — deposit recommendations consolidated in section 8 below)
-    
-    # 7. Cross-platform context (Coinbase, Alpaca)
-    lines.append(f"\nCROSS-PLATFORM:")
+    # 6. Deposit illustrations deleted — averaging edge/price invented 100%+ ROI.
+
+    # 7. Cross-platform context (Coinbase, Alpaca) — broker cash/equity, not P&L
+    lines.append(f"\nCROSS-PLATFORM (broker cash/equity, not P&L):")
     total_capital = state["balance"] + state["portfolio_value"]
     try:
         from coinbase_trader import get_balances
@@ -485,18 +542,7 @@ def opportunity_report():
     except Exception as e:
         lines.append(f"  Alpaca: error ({str(e)[:40]})")
     
-    lines.append(f"\n  TOTAL CAPITAL ACROSS ALL PLATFORMS: ${total_capital:.2f}")
-    
-    # 8. The deposit recommendation Burton wants
-    lines.append(f"\n═══ WHAT EXTRA CAPITAL COULD DO ═══")
-    # Calculate expected return rate from current best opportunities
-    if opps:
-        best_edges = [o["edge"] / (o["price"] + 0.01) for o in opps[:20] if o["edge"] > 0 and o["price"] > 0]
-        avg_roi = sum(best_edges) / (len(best_edges) + 1) * 100
-        for extra in [50, 100, 200, 500, 1000]:
-            extra_profit = extra * MAX_DEPLOYED_PCT * (avg_roi / 100)
-            if extra_profit > 1:
-                lines.append(f"  💰 Deposit ${extra} → ~${extra_profit:.2f} expected profit ({avg_roi:.0f}% avg ROI on top picks)")
+    lines.append(f"\n  TOTAL CAPITAL ACROSS ALL PLATFORMS (broker): ${total_capital:.2f}")
     
     return "\n".join(lines)
 
@@ -562,6 +608,11 @@ def run(dry_run=False, max_trades=5, min_score=40):
             lines.append("  Max deployment reached, stopping.")
             break
 
+        if not dry_run and _cfg is not None and _cfg.live_exec_fenced(
+                opp.get("strategy"), ticker=opp.get("ticker")):
+            lines.append(f"  ⊘ SKIP_LIVE_FENCE {opp.get('ticker','?')} [{opp.get('strategy','?')}]")
+            continue
+
         # Advisory execution plan (fee-drag/book-quality/urgency). ADVISORY-ONLY: it only VETOES
         # a poor-execution entry (no_trade) and annotates maker/taker — sizing/entry stays with
         # execute_trade. Live maker orders are a separate step (EXEC_DRY_RUN). Fail-open.
@@ -586,9 +637,21 @@ def run(dry_run=False, max_trades=5, min_score=40):
                     if live_maker:
                         contracts = _size_contracts(opp, state, plan.price_cents / 100.0)
                         if contracts > 0:
-                            oid = maker_mgr.place_maker_order(opp["ticker"], opp.get("side", "yes"),
-                                                              contracts, plan.price_cents,
-                                                              strategy=opp.get("strategy", ""))
+                            import informed_before_create as ibc
+                            pre = ibc.create_preflight(opp, contracts, plan.price_cents)
+                            if not pre["ok"]:
+                                lines.append(
+                                    f"  ⊘ SKIP_INFORMED {opp.get('ticker','?')} "
+                                    f"[{opp.get('strategy','?')}] {','.join(pre['reasons'])}")
+                                continue
+                            oid = maker_mgr.place_maker_order(
+                                opp["ticker"], opp.get("side", "yes"),
+                                contracts, plan.price_cents,
+                                strategy=opp.get("strategy", ""),
+                                informed=pre["informed"])
+                            if not oid:
+                                lines.append(f"  ⊘ maker refused {opp.get('ticker','?')}")
+                                continue
                             lines.append(f"  ◇ MAKER {opp.get('ticker','?')} {contracts}x @{plan.price_cents}c "
                                          f"(id={str(oid)[:12]}) — {plan.reason}")
                             trades_placed += 1

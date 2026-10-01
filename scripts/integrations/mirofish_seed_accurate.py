@@ -35,10 +35,21 @@ def _get(url, **kw):
 
 def crypto_section():
     out = ["## Cryptocurrency Market (live, CoinGecko)"]
-    r = _get("https://api.coingecko.com/api/v3/coins/markets", params={
-        "vs_currency": "usd", "ids": ",".join(CRYPTO_IDS),
-        "order": "market_cap_desc", "price_change_percentage": "24h,7d"})
-    for c in r.json():
+    rows = None
+    r = None
+    for _try in range(2):
+        r = _get("https://api.coingecko.com/api/v3/coins/markets", params={
+            "vs_currency": "usd", "ids": ",".join(CRYPTO_IDS),
+            "order": "market_cap_desc", "price_change_percentage": "24h,7d"})
+        rows = r.json()
+        if isinstance(rows, list):
+            break
+        time.sleep(2)
+    if not isinstance(rows, list):
+        raise RuntimeError(f"coingecko markets HTTP {getattr(r, 'status_code', '?')} not a list")
+    for c in rows:
+        if not isinstance(c, dict):
+            continue
         name, sym = c.get("name", "?"), (c.get("symbol", "?") or "").upper()
         px = c.get("current_price", 0) or 0
         d1 = c.get("price_change_percentage_24h", 0) or 0

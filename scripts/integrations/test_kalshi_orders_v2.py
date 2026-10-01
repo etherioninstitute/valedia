@@ -42,6 +42,9 @@ def test_create_buy_yes_and_no():
     posted = []
     orig = ka.post
     ka.post = lambda ep, body=None: posted.append((ep, dict(body or {}))) or _v2_ack()
+    import informed_before_create as ibc
+    orig_req = ibc.require_kalshi
+    ibc.require_kalshi = lambda *a, **k: True
     try:
         out = ka.create_order("TICK-Y", "yes", 5, 56)
         assert posted[-1][0] == "/portfolio/events/orders"
@@ -63,12 +66,16 @@ def test_create_buy_yes_and_no():
         assert body["count"] == "2.00"
     finally:
         ka.post = orig
+        ibc.require_kalshi = orig_req
 
 
 def test_sell_maps_and_reduce_only():
     posted = []
     orig = ka.post
     ka.post = lambda ep, body=None: posted.append((ep, dict(body or {}))) or _v2_ack("s1")
+    import informed_before_create as ibc
+    orig_req = ibc.require_kalshi
+    ibc.require_kalshi = lambda *a, **k: True
     try:
         ka.sell_position("TICK", "yes", 3, 40)
         body = posted[-1][1]
@@ -81,6 +88,7 @@ def test_sell_maps_and_reduce_only():
         assert body["reduce_only"] is True
     finally:
         ka.post = orig
+        ibc.require_kalshi = orig_req
 
 
 def test_cancel_v2_and_get_order():
@@ -137,7 +145,7 @@ def test_hygiene_no_legacy_write_path():
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VALEDIA_VERSION == "0.43.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.44.0", vc.VALEDIA_VERSION
 
 
 if __name__ == "__main__":

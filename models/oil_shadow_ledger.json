@@ -1,0 +1,233 @@
+{
+  "desk": "oil",
+  "mode": "RESEARCH/SHADOW",
+  "dispatchable": 0,
+  "live_exec": false,
+  "live_writer": false,
+  "fence": "LIVE_EXEC_FENCED",
+  "create_order": false,
+  "valedia_version": "0.74.0",
+  "note": "Universe is KXWTI/KXOIL already on the fee-map. No Kalshi GET, no CME scrape, no order placement. FV requires an official print plus rules_cite. book=fixture is a worked example, not a live print.",
+  "n_universe": 2,
+  "universe": [
+    {
+      "ticker": "KXOIL",
+      "mode": "RESEARCH/SHADOW",
+      "dispatchable": 0,
+      "live_exec": false,
+      "writer": null,
+      "create_order": false,
+      "fence": "LIVE_EXEC_FENCED",
+      "tag": "no_fv",
+      "fv_source": null,
+      "rules_cite": null,
+      "fv": null,
+      "model_fv": null,
+      "print_usd": null,
+      "side": "yes",
+      "price": null,
+      "fee": null,
+      "fee_role": null,
+      "fee_status": null,
+      "fee_true_ev": null,
+      "would_have_size": 0,
+      "would_have_pnl": null,
+      "settlement": null,
+      "enter_window": {
+        "open_at": null,
+        "close_at": null,
+        "active": false,
+        "reason": "LIVE_EXEC_FENCED"
+      },
+      "resolve": {
+        "known": false,
+        "kind": "unknown",
+        "reason": "fenced_unparsed",
+        "resolve_at": null
+      },
+      "book": "absent",
+      "ftl_shaped": {
+        "type": "would_have",
+        "strategy": "OIL_BRACKET",
+        "ticker": "KXOIL",
+        "source": "shadow",
+        "fill_status": "PAPER",
+        "contracts": 0,
+        "price": null,
+        "fee": null,
+        "realized_pnl_net": null,
+        "reconcile": false,
+        "live_fill": false
+      }
+    },
+    {
+      "ticker": "KXWTI",
+      "mode": "RESEARCH/SHADOW",
+      "dispatchable": 0,
+      "live_exec": false,
+      "writer": null,
+      "create_order": false,
+      "fence": "LIVE_EXEC_FENCED",
+      "tag": "no_fv",
+      "fv_source": null,
+      "rules_cite": null,
+      "fv": null,
+      "model_fv": null,
+      "print_usd": null,
+      "side": "yes",
+      "price": null,
+      "fee": null,
+      "fee_role": null,
+      "fee_status": null,
+      "fee_true_ev": null,
+      "would_have_size": 0,
+      "would_have_pnl": null,
+      "settlement": null,
+      "enter_window": {
+        "open_at": null,
+        "close_at": null,
+        "active": false,
+        "reason": "LIVE_EXEC_FENCED"
+      },
+      "resolve": {
+        "known": false,
+        "kind": "unknown",
+        "reason": "fenced_unparsed",
+        "resolve_at": null
+      },
+      "book": "absent",
+      "ftl_shaped": {
+        "type": "would_have",
+        "strategy": "OIL_BRACKET",
+        "ticker": "KXWTI",
+        "source": "shadow",
+        "fill_status": "PAPER",
+        "contracts": 0,
+        "price": null,
+        "fee": null,
+        "realized_pnl_net": null,
+        "reconcile": false,
+        "live_fill": false
+      }
+    }
+  ],
+  "n_scored": 1,
+  "scored": [
+    {
+      "ticker": "KXWTI-26SEP23-T72",
+      "mode": "RESEARCH/SHADOW",
+      "dispatchable": 0,
+      "live_exec": false,
+      "writer": null,
+      "create_order": false,
+      "fence": "LIVE_EXEC_FENCED",
+      "tag": "official",
+      "fv_source": "nymex",
+      "rules_cite": "nymex_cl",
+      "fv": 0.99,
+      "model_fv": 0.99,
+      "print_usd": 80.0,
+      "side": "yes",
+      "price": 0.4,
+      "fee": 0.0,
+      "fee_role": "maker",
+      "fee_status": "ok",
+      "fee_true_ev": 11.8,
+      "would_have_size": 20,
+      "would_have_pnl": 12.0,
+      "settlement": "yes",
+      "enter_window": {
+        "open_at": null,
+        "close_at": null,
+        "active": false,
+        "reason": "LIVE_EXEC_FENCED"
+      },
+      "resolve": {
+        "known": false,
+        "kind": "unknown",
+        "reason": "fenced_unparsed",
+        "resolve_at": null
+      },
+      "book": "fixture",
+      "ftl_shaped": {
+        "type": "would_have",
+        "strategy": "OIL_BRACKET",
+        "ticker": "KXWTI-26SEP23-T72",
+        "source": "shadow",
+        "fill_status": "PAPER",
+        "contracts": 20,
+        "price": 0.4,
+        "fee": 0.0,
+        "realized_pnl_net": 12.0,
+        "reconcile": false,
+        "live_fill": false
+      }
+    }
+  ],
+  "history": [
+    {
+      "ticker": "KXWTI-26SEP23-T72",
+      "mode": "RESEARCH/SHADOW",
+      "dispatchable": 0,
+      "live_exec": false,
+      "writer": null,
+      "create_order": false,
+      "fence": "LIVE_EXEC_FENCED",
+      "tag": "official",
+      "fv_source": "nymex",
+      "rules_cite": "nymex_cl",
+      "fv": 0.99,
+      "model_fv": 0.99,
+      "print_usd": 80.0,
+      "side": "yes",
+      "price": 0.4,
+      "fee": 0.0,
+      "fee_role": "maker",
+      "fee_status": "ok",
+      "fee_true_ev": 11.8,
+      "would_have_size": 20,
+      "would_have_pnl": 12.0,
+      "settlement": "yes",
+      "enter_window": {
+        "open_at": null,
+        "close_at": null,
+        "active": false,
+        "reason": "LIVE_EXEC_FENCED"
+      },
+      "resolve": {
+        "known": false,
+        "kind": "unknown",
+        "reason": "fenced_unparsed",
+        "resolve_at": null
+      },
+      "book": "fixture",
+      "ftl_shaped": {
+        "type": "would_have",
+        "strategy": "OIL_BRACKET",
+        "ticker": "KXWTI-26SEP23-T72",
+        "source": "shadow",
+        "fill_status": "PAPER",
+        "contracts": 20,
+        "price": 0.4,
+        "fee": 0.0,
+        "realized_pnl_net": 12.0,
+        "reconcile": false,
+        "live_fill": false
+      }
+    }
+  ],
+  "accuracy": {
+    "n": 1,
+    "hits": 1,
+    "hit_rate": 1.0,
+    "mean_pnl": 12.0,
+    "admissible_for_kelly": false,
+    "admissible_for_category_stats": false
+  },
+  "threshold_hint": {
+    "suggest_min_abs_edge": null,
+    "apply": false,
+    "reason": "shadow_not_admissible"
+  },
+  "appended_at": "2026-09-24T04:31:58.031404+00:00"
+}

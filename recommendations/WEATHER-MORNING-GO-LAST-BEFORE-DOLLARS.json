@@ -1,0 +1,30 @@
+{
+  "WEATHER_LIVE_decider": "valedia",
+  "WEATHER_LIVE_env": "1",
+  "admitted": 0,
+  "diagnosis": [
+    "No fee-true official alerts. INFORMED will not create without settlement FV + edge.",
+    "198 books wrong_date \u2014 live CLI report date \u2260 market observe-date (morning CLI is usually yesterday\u2019s final; today\u2019s high is not final yet).",
+    "87 official FV rows existed but none cleared fee-true alert (edge/lottery/late filters).",
+    "Timing note: free NWS CLI settlement FV for calendar day D usually posts the next morning as the YESTERDAY block. Same-day open books at 7:04 AM PT often cannot be INFORMED-final yet; evening CLI-final rescan is the free-stack edge window."
+  ],
+  "diagnosis_path": "/Users/burtonchatelain/.openclaw/workspace/recommendations/WEATHER-MORNING-DIAGNOSIS.md",
+  "dry": false,
+  "flip_allowed": true,
+  "grok_bot_routine": "paused",
+  "n_alert": 0,
+  "n_markets": 360,
+  "n_series": 38,
+  "owner": "valedia-runtime",
+  "preflight": "PASS",
+  "settle_policy": "nws_free_only",
+  "skipped_non_nws": 0,
+  "tags": {
+    "near_neutral": 3,
+    "official": 87,
+    "station_unconfigured": 72,
+    "wrong_date": 198
+  },
+  "ts": "2026-09-24T22:24:06.304760+00:00",
+  "weather_live_enabled": true
+}

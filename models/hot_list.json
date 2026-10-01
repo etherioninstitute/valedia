@@ -1,92 +1,77 @@
 {
-  "ts": "2026-09-13 07:30 UTC",
+  "ts": "2026-09-25 07:34 UTC",
   "assets": {
-    "LSK": {
-      "ticker": "LSK-USD",
+    "ONDO": {
+      "ticker": "ONDO-USD",
       "class": "unknown",
       "platform": "alpaca",
-      "buzz_score": 125,
-      "price": 0.7593058347702026,
+      "buzz_score": 95,
+      "price": 0.5544099807739258,
       "reasons": [
-        "breakout@0.7593",
-        "vol/mcap=172%",
-        "CG_trending#1"
+        "breakout@0.5544",
+        "CG_trending#1",
+        "Finnhub:crypto"
       ],
       "breakout": true,
-      "cg_id": "lisk",
-      "discovered": "2026-09-13 07:30 UTC",
+      "cg_id": "ondo-finance",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
     },
-    "VTHO": {
-      "ticker": "VTHO-USD",
+    "VIRTUAL": {
+      "ticker": "VIRTUAL-USD",
       "class": "unknown",
       "platform": "alpaca",
-      "buzz_score": 80,
-      "price": 0.0008745900122448802,
+      "buzz_score": 60,
+      "price": 0.773865282535553,
       "reasons": [
-        "breakout@0.0009",
-        "vol/mcap=225%"
+        "CG_trending#10",
+        "breakout@0.7739"
       ],
       "breakout": true,
-      "cg_id": "vethor-token",
-      "discovered": "2026-09-13 07:30 UTC",
+      "cg_id": "virtual-protocol",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
     },
-    "ILV": {
-      "ticker": "ILV-USD",
+    "PEAQ": {
+      "ticker": "PEAQ-USD",
       "class": "unknown",
       "platform": "alpaca",
       "buzz_score": 50,
-      "price": 3.793100118637085,
+      "price": 0.042545538395643234,
       "reasons": [
-        "CG_trending#15",
-        "breakout@3.7931"
+        "CG_trending#9",
+        "breakout@0.0425"
       ],
       "breakout": true,
-      "cg_id": "illuvium",
-      "discovered": "2026-09-13 07:30 UTC",
+      "cg_id": "peaq-2",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
     },
-    "\u725b\u6765": {
-      "ticker": "\u725b\u6765-USD",
-      "class": "crypto",
-      "platform": "coinbase",
+    "EDGE": {
+      "ticker": "EDGE",
+      "class": "unknown",
+      "platform": "alpaca",
       "buzz_score": 50,
-      "price": 0.142732,
+      "price": 52.060001373291016,
       "reasons": [
-        "vol/mcap=61%"
+        "breakout@52.0600",
+        "CG_trending#12"
       ],
-      "breakout": false,
-      "cg_id": "niu-lai",
-      "discovered": "2026-09-13 07:30 UTC",
+      "breakout": true,
+      "cg_id": "definitive",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
     },
-    "EMBER": {
-      "ticker": "EMBER-USD",
-      "class": "crypto",
-      "platform": "coinbase",
-      "buzz_score": 42,
-      "price": 0,
-      "reasons": [
-        "CG_trending#2"
-      ],
-      "breakout": false,
-      "cg_id": "embercurve",
-      "discovered": "2026-09-13 07:30 UTC",
-      "max_trade_pct": 0.02,
-      "kelly_mult": 0.5,
-      "sell_threshold": 50
-    },
-    "LAPTOP": {
-      "ticker": "LAPTOP-USD",
+    "QNT": {
+      "ticker": "QNT-USD",
       "class": "crypto",
       "platform": "coinbase",
       "buzz_score": 39,
@@ -95,14 +80,14 @@
         "CG_trending#3"
       ],
       "breakout": false,
-      "cg_id": "hunter-biden-s-laptop-3",
-      "discovered": "2026-09-13 07:30 UTC",
+      "cg_id": "quant-network",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
     },
-    "STONK": {
-      "ticker": "STONK-USD",
+    "XPL": {
+      "ticker": "XPL-USD",
       "class": "crypto",
       "platform": "coinbase",
       "buzz_score": 36,
@@ -111,8 +96,8 @@
         "CG_trending#4"
       ],
       "breakout": false,
-      "cg_id": "stonk-3",
-      "discovered": "2026-09-13 07:30 UTC",
+      "cg_id": "plasma",
+      "discovered": "2026-09-25 07:34 UTC",
       "max_trade_pct": 0.02,
       "kelly_mult": 0.5,
       "sell_threshold": 50
