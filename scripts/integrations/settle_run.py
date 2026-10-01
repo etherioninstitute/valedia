@@ -136,9 +136,10 @@ def read_ledger_safe(path=None):
     return rows, sorted(problems)
 
 
-def ftl_profit_parts(recs=None, since=None, minutes=50, now=None):
+def ftl_profit_parts(recs=None, since=None, minutes=50, now=None, exclude=()):
     """Figures behind the Profit ping (fee-true FTL rows newer than `since`, else the
-    last `minutes`; neither -> all). None if nothing new and nothing wrong.
+    last `minutes`; neither -> all), minus settlements already reported (`exclude`:
+    entry ids from the sent-set). None if nothing new and nothing wrong.
     bad: missing/None/NaN/inf/garbage P&L, non-boolean win flag, unparseable row time,
     or a live orphan settlement. future: any live row dated > 5 min ahead."""
     import forward_test_ledger as ftl
@@ -160,7 +161,9 @@ def ftl_profit_parts(recs=None, since=None, minutes=50, now=None):
     since = sv.parse_ts(since) if isinstance(since, str) else since
     if since is None and minutes:
         since = now - timedelta(minutes=minutes)
-    new = [s for s in all_true if since is None or when(s) > since]
+    exclude = set(exclude or ())
+    new = [s for s in all_true if (since is None or when(s) > since)
+           and str(s.get("entry_id")) not in exclude]
     new = [s for s in new if when(s) <= now + timedelta(minutes=5)]
     if not new and not bad and not future:
         return None
@@ -223,6 +226,37 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
                       dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
 
 
+SENT_IDS_MAX = 5000  # bounded: the newest reported settlement ids are kept
+
+
+def _sent_ids_path():
+    import signal_verify as sv
+    return os.path.join(sv.signal_dir(), "profit_sent_ids.jsonl")  # gitignored (*.jsonl)
+
+
+def load_sent_ids():
+    """Entry ids of settlements already reported in a Profit ping (the source of truth;
+    the cursor is only an optimization). Unreadable lines are ignored."""
+    try:
+        with open(_sent_ids_path()) as f:
+            return {json.loads(l) for l in f if l.strip()}
+    except Exception:
+        return set()
+
+
+def add_sent_ids(ids):
+    try:
+        path = _sent_ids_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        old = open(path).read().splitlines() if os.path.exists(path) else []
+        new = [json.dumps(str(i)) for i in sorted(ids, key=str)]
+        keep = [l for l in old if l.strip() and l not in set(new)] + new
+        with open(path, "w") as f:
+            f.write("".join(l + "\n" for l in keep[-SENT_IDS_MAX:]))
+    except Exception as e:
+        print(f"[settle_run] sent-set write failed: {e}")
+
+
 def _write_cursor(path, iso):
     try:
         with open(path, "w") as f:
@@ -243,6 +277,8 @@ def run(send_fn=None, now=None):
 
     # Cursor: an ISO time, never in the future; first run starts 50 min back and is
     # persisted, so rows held back by a withheld report are still sent once valid.
+    # It is only an optimization: the persisted sent-set (profit_sent_ids.jsonl) is
+    # what guarantees no settlement is reported twice, even after a window reset.
     cursor_path = os.path.join(MODELS, "settle_ftl_signal_cursor.txt")
     try:
         since = sv.parse_ts(open(cursor_path).read().strip())
@@ -259,7 +295,7 @@ def run(send_fn=None, now=None):
                              dedupe_window_s=7 * 86400)
             print(f"[settle_run] ledger file problems {problems}: Signal {res['status']}")
         else:
-            parts = ftl_profit_parts(recs, since=since, now=now)
+            parts = ftl_profit_parts(recs, since=since, now=now, exclude=load_sent_ids())
             if parts:
                 body = format_settled_signal(parts["new_pnl"], parts["w"], parts["l"],
                                              parts["total_net"], f"{parts['tw']}W/{parts['tl']}L")
@@ -269,7 +305,8 @@ def run(send_fn=None, now=None):
                 # Advance only over rows Burton actually got (or already got, verified).
                 delivered = (res["status"] == "verified" and res["sent"]) or (
                     res["status"] == "dedupe" and not res.get("problems"))
-                if delivered and parts["new"]:
+                if delivered and parts["new"]:  # sent-set first: never report a row twice
+                    add_sent_ids(str(s.get("entry_id")) for s in parts["new"])
                     _write_cursor(cursor_path, parts["cursor"])
     except Exception as e:
         res = sv.withhold("Profit", "settlement check failed", f"{type(e).__name__}: {e}",

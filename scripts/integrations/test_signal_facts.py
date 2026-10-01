@@ -198,7 +198,9 @@ def test_bridge_header_and_exit_codes():
         assert got == rc, (answer, got, out)
         if rc == 0:
             assert out[0] == cb.gate_header("verified", "\n".join(out[1:])), out
-            assert "124" not in buf.getvalue() and out[-1] == cb.FOOTER
+            shown = [l for l in out if not l.startswith(cb.AI_LINE)]  # saved-file path has digits
+            assert "124" not in "\n".join(shown) and "profit" not in "\n".join(shown).lower()
+            assert out[-1] == cb.FOOTER and out[-2].startswith(cb.AI_LINE)
         else:
             assert not out[0].startswith("VALEDIA-GATE"), out
     buf = io.StringIO()

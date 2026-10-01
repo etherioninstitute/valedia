@@ -223,7 +223,8 @@ def test_signal_body_is_facts_plus_fixed_line_only():
     bad = {"why": {"cash": "unavailable", "positions": "STALE", "ledger": "re-read disagreed"}}
     send = Sender()
     cb.gate_answer("bad", "You made $124 profit", bad, send=True, send_fn=send, now=NOW)
-    assert "124" not in send.msgs[0] and "profit" not in send.msgs[0].lower(), send.msgs
+    shown = "\n".join(l for l in send.msgs[0].split("\n") if not l.startswith(cb.AI_LINE))
+    assert "124" not in shown and "profit" not in shown.lower(), send.msgs  # path line excluded
     assert "Cash (Kalshi, broker): omitted — unavailable" in send.msgs[0]
 
 

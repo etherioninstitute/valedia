@@ -117,9 +117,39 @@ def test_settle_future_row_blocks_then_pending_rows_sent():
             f.write((NOW + timedelta(days=30)).isoformat())  # impossible cursor: window restarts
         s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("c"), st("c", -9.0, False, t(0)),
                  ent("d"), st("d", 2.0, True, (NOW + timedelta(minutes=1)).isoformat())])
-        sent = s.run(now=NOW + timedelta(minutes=2))  # d is not skipped
-        assert _profit(sent)[0].startswith("Profit (settled since last report): −$4.00 (net loss) (2W/1L)"), sent
+        sent = s.run(now=NOW + timedelta(minutes=2))  # d is not skipped; a, c never re-reported
+        assert _profit(sent)[0].startswith("Profit (settled since last report): +$2.00 (1W/0L)"), sent
         assert s.cursor() <= NOW + timedelta(minutes=2)
+
+
+def test_settle_sent_set_no_double_report_after_cursor_reset():
+    with Settle() as s:
+        rows = [ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), st("b", -1.0, False, t(0.1))]
+        s.write(rows)
+        first = _profit(s.run())
+        assert first and first[0].startswith("Profit (settled since last report): +$2.00 (1W/1L)"), first
+        cur = os.path.join(s.dir, "settle_ftl_signal_cursor.txt")
+        for reset in (None, "garbage", (NOW - timedelta(days=30)).isoformat(),
+                      (NOW + timedelta(days=9)).isoformat()):
+            if reset is None:
+                os.remove(cur)
+            else:
+                open(cur, "w").write(reset)
+            assert s.run() == [], reset  # same settlements never reported twice
+        ids = sr.load_sent_ids()
+        assert {"a", "b"} <= ids
+        s.write(rows + [ent("c"), st("c", 4.0, True, t(0))])
+        os.remove(cur)
+        again = _profit(s.run())
+        assert again and again[0].startswith("Profit (settled since last report): +$4.00 (1W/0L)"), again
+        assert "Total (all-time realized, ledger): +$6.00 (2W/1L)" in again[0], again
+        saved = sr.SENT_IDS_MAX
+        try:  # bounded: only the newest ids are kept
+            sr.SENT_IDS_MAX = 2
+            sr.add_sent_ids(["x1", "x2", "x3"])
+            assert sr.load_sent_ids() == {"x2", "x3"}
+        finally:
+            sr.SENT_IDS_MAX = saved
 
 
 def test_settle_numeric_time_and_orphan_never_skip_valid_rows():
@@ -279,6 +309,7 @@ if __name__ == "__main__":
     test_settle_corrupt_and_nonobject_then_fixed()
     test_settle_future_row_blocks_then_pending_rows_sent()
     test_settle_numeric_time_and_orphan_never_skip_valid_rows()
+    test_settle_sent_set_no_double_report_after_cursor_reset()
     test_positions_dedupe()
     test_facts_labels_and_open_mismatch()
     test_sports_unconfirmed_notice()
