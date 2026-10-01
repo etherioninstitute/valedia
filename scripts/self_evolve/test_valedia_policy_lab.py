@@ -45,9 +45,9 @@ def _ledger(path, n=150, kind="bad"):
             cat, won = ("A" if i % 2 else "B"), i % 10 not in (1, 4, 7)
         elif kind == "wide":
             cat, won = "C%02d" % (i % 25), (i * 7) % 10 not in (1, 4, 7)
-        else:
+        else:                                    # bad / flip (BAD wins in the last 30%)
             cat = "RARE" if i % 37 == 5 else ("BAD" if i % 3 == 0 else "GOOD")
-            won = cat != "BAD" and i % 10 not in (1, 4, 7)
+            won = (cat != "BAD" or (kind == "flip" and i >= 0.7 * n)) and i % 10 not in (1, 4, 7)
         eid, ts = "e%03d" % i, "2026-01-%02dT%02d:00:00Z" % (1 + i // 24, i % 24)
         fee = kalshi_fee(0.5, 10)
         rows.append({"type": "entry", "id": eid, "ts": ts, "strategy": cat, "venue": "kalshi",
@@ -69,10 +69,10 @@ def _baseline_file():
     return p
 
 
-def _init(name, n=150, kind="bad"):
+def _init(name, n=150, kind="bad", extra=()):
     lab = os.path.join(TMP, name)
     r = subprocess.run(CLI + ["init", "--lab", lab, "--ledger", _ledger(lab + ".jsonl", n, kind),
-                              "--baseline", _baseline_file(), "--n-boot", "400"],
+                              "--baseline", _baseline_file(), "--n-boot", "400", *extra],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return lab
@@ -328,6 +328,91 @@ def check_grid_unit(lab, wide):
     assert time.time() - t0 < 60, "grid search exceeded its runtime bound"
 
 
+def _adjudicate(lab, pol):
+    import backtest_gate as G
+    _set_candidate(lab, pol)
+    with open(os.path.join(lab, "judge", "lab_config.json")) as f:
+        cfg = json.load(f)
+    try:
+        return adj.adjudicate(G, cfg, os.path.join(lab, "policy", "baseline.json"),
+                              os.path.join(lab, "policy", "candidate.json"),
+                              os.path.join(lab, "data", "visible.jsonl"),
+                              os.path.join(adj.private_dir(lab), "holdout.jsonl"))
+    finally:
+        _git(lab, "checkout", "--", ".")
+
+
+def check_abbrev_and_ids(lab):
+    for tok in ("--l", "--li", "--liv", "--live", "--live=1", "--s", "--se", "--sel", "--self",
+                "--sel=x"):
+        assert sie_shim.refused_flags(["run", tok]) == [tok], tok
+    for tok in ("--single", "--lab", "--llm-agents", "--target", "--run-id", "--", "-l"):
+        assert sie_shim.refused_flags([tok]) == [], tok
+    for argv in (["run", "--target", lab, "--run-id", "x", "--liv"],
+                 ["run", "--target", lab, "--run-id", "x", "--sel"]):
+        assert sie_shim.main(argv) == 2, argv
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--run-id", default=None)
+    for argv in (["--live"], ["--run-id", "../x"], ["--run-id", "a/b"]):  # post-parse guard
+        try:
+            with sie_shim._ParsedGuard():
+                ap.parse_args(argv)
+            assert False, argv
+        except SystemExit as e:
+            assert e.code == 2, argv
+    assert ap.parse_args(["--live"]).live is True                     # guard was removed
+    esc = os.path.join(TMP, "escaped_rid")
+    r = subprocess.run([sys.executable, sie_shim.__file__, "init", "--target", lab,
+                        "--run", "../../../escaped_rid"], cwd=sie_shim.SIE_ROOT,
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "invalid --run-id" in r.stderr, r.stderr
+    for argv in (["evolve", "--lab", lab, "--run-id", "../../../escaped_rid"],
+                 ["evolve", "--lab", lab, "--run-id", "a..b"],
+                 ["status", "--lab", lab, "--run-id", "/abs"],
+                 ["export", "--lab", lab, "--run-id", "ok", "--vid", "../v1",
+                  "--out", os.path.join(TMP, "x.json")],
+                 ["evolve", "--lab", lab, "--run-id", ".hidden"]):
+        r = subprocess.run(CLI + argv, capture_output=True, text=True)
+        assert r.returncode == 3 and "must match" in r.stderr, (argv, r.stderr)
+    r = subprocess.run(CLI + ["evolve", "--lab", lab, "--liv"], capture_output=True, text=True)
+    assert r.returncode == 2 and "LLM" in r.stderr
+    assert not os.path.exists(esc) and not os.path.exists(os.path.join(lab, ".sie")), "escaped"
+
+
+def check_holdout_rules():
+    for frac in ("0", "0.1", "0.19", "0.6", "1"):
+        lab = os.path.join(TMP, "frac_" + frac)
+        r = subprocess.run(CLI + ["init", "--lab", lab, "--ledger", _ledger(lab + ".jsonl"),
+                                  "--holdout-frac", frac], capture_output=True, text=True)
+        assert r.returncode == 3 and "holdout-frac" in r.stderr and not os.path.exists(lab), frac
+    thin = _init("lab_thin", extra=("--holdout-frac", "0.2"))       # holdout: 30 trades
+    v = _adjudicate(thin, BETTER)
+    assert v["visible"]["verdict"] == "PASS" and v["holdout"]["verdict"] == "INSUFFICIENT_DATA"
+    assert not v["accepted"] and "too thin" in " ".join(v["reasons"]), v["reasons"]
+    code, out = _pytest_with(thin, BETTER)
+    assert out["test_gate_adjudication"] == "XFAIL", out             # lab suite agrees
+    ok = _init("lab_thin_ok", extra=("--holdout-frac", "0.2", "--allow-thin-holdout"))
+    assert json.load(open(os.path.join(ok, "judge", "lab_config.json")))["allow_thin_holdout"]
+    assert "judge/lab_config.json" in adj.load_pins(ok)["files"]       # pinned / IMMUTABLE
+    assert _adjudicate(ok, BETTER)["accepted"]
+    flip = _init("lab_flip", kind="flip")
+    flip_ok = _init("lab_flip_ok", kind="flip", extra=("--allow-thin-holdout",))
+    for lab in (flip, flip_ok):
+        v = _adjudicate(lab, BETTER)
+        assert v["visible"]["verdict"] == "PASS" and v["holdout"]["verdict"] == "FAIL", v["reasons"]
+        assert not v["accepted"]
+
+
+def _pytest_with(lab, pol):
+    _set_candidate(lab, pol)
+    try:
+        return _pytest(lab)
+    finally:
+        _git(lab, "checkout", "--", ".")
+
+
 def run():
     before = _repo_state()
     lab = _init("lab_a")
@@ -340,6 +425,8 @@ def run():
     check_grid_unit(_init("lab_unit"), _init("lab_wide", n=300, kind="wide"))
     check_grid_evolve(_init("lab_grid"), _init("lab_grid_twin"))
     check_grid_noop(_init("lab_flat", kind="flat"))
+    check_abbrev_and_ids(_init("lab_ids"))
+    check_holdout_rules()
     assert _repo_state() == before, "Valedia tree or ledger changed during the test"
     shutil.rmtree(TMP, ignore_errors=True)
     print("test_valedia_policy_lab: all checks passed")

@@ -17,14 +17,18 @@ snapshot, else the base commit): upstream never commits accepted edits, so a lat
 REJECT (`git checkout -- .`) or PAUSE would otherwise leave the sandbox off-lineage.
 Each search is appended to <run_dir>/valedia_grid_proposals.jsonl for `export`.
 
-Also refuses `--live` (self-evolve's real-LLM switch) and `--self`. Usage (cwd must be
+Also refuses `--live` (self-evolve's real-LLM switch) and `--self`, including argparse
+abbreviations (`--liv`, `--sel=1`), re-checks the parsed namespace (live/self_mode must
+be False) and requires run ids / vids to be plain path segments. Usage (cwd must be
 vendors/self-evolve, as `python -m tools.sie.cli` would need):
   python3 scripts/self_evolve/sie_shim.py run --target LAB --run-id ID \
       [--valedia-proposer grid|none] ...
 (c) GOATWORTHY Post LLC.
 """
+import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +39,48 @@ SIE_ROOT = os.path.join(REPO, "vendors", "self-evolve")
 EVOLVABLE = ("policy/candidate.json",)
 REFUSED_FLAGS = ("--live", "--self")
 GRID_LOG = "valedia_grid_proposals.jsonl"
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def refused_flags(argv):
+    """Tokens naming --live/--self, INCLUDING argparse abbreviations (--l, --liv, --sel=1):
+    self-evolve's argparse expands any unambiguous prefix, so exact matching is not enough."""
+    bad = []
+    for a in argv:
+        name = str(a).split("=", 1)[0]
+        if len(name) >= 3 and name.startswith("--") and any(f.startswith(name)
+                                                             for f in REFUSED_FLAGS):
+            bad.append(a)
+    return bad
+
+
+def valid_id(s):
+    """Run ids / vids become path segments: ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$, no '..'."""
+    return isinstance(s, str) and bool(ID_RE.match(s)) and ".." not in s
+
+
+class _ParsedGuard:
+    """Belt and braces: after self-evolve's own argparse runs, refuse live/self_mode=True
+    and any run id / vid that is not a plain path segment (covers abbreviations too)."""
+
+    def __enter__(self):
+        self.orig = orig = argparse.ArgumentParser.parse_args
+
+        def parse_args(parser, *a, **k):
+            ns = orig(parser, *a, **k)
+            if getattr(ns, "live", False) or getattr(ns, "self_mode", False):
+                parser.exit(2, "sie_shim: parsed live/self_mode=True; refusing\n")
+            for key in ("run_id", "vid"):
+                v = getattr(ns, key, None)
+                if v is not None and not valid_id(v):
+                    parser.exit(2, "sie_shim: invalid --%s %r\n" % (key.replace("_", "-"), v))
+            return ns
+        argparse.ArgumentParser.parse_args = parse_args
+        return self
+
+    def __exit__(self, *exc):
+        argparse.ArgumentParser.parse_args = self.orig
+        return False
 
 
 def normalize_rel(file_rel):
@@ -132,7 +178,7 @@ def install_grid():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    bad = [a for a in argv if a.split("=", 1)[0] in REFUSED_FLAGS]
+    bad = refused_flags(argv)
     if bad:
         sys.stderr.write("sie_shim: refusing %s (self-evolve --live calls external LLM CLIs; "
                          "--self evolves self-evolve itself). Use valedia_policy_lab.py "
@@ -151,7 +197,8 @@ def main(argv=None):
     else:
         install()
     from tools.sie.cli import main as sie_main
-    return sie_main(argv)
+    with _ParsedGuard():
+        return sie_main(argv)
 
 
 if __name__ == "__main__":
