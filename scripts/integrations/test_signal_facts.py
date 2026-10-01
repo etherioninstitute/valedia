@@ -93,8 +93,8 @@ def test_facts_attack_cases():
              "STALE (no recent live rows)"),
             ("fresh only via note row", {"ledger": L(720, extra=[{"type": "note", "logged_at": NOW.isoformat()}])},
              "STALE (no recent live rows)"),
-            ("nan pnl", {"ledger": L(pnl=float("nan"))}, "unavailable (unparseable rows)"),
-            ("string pnl", {"ledger": L(pnl="abc")}, "unavailable (unparseable rows)")]:
+            ("nan pnl", {"ledger": L(pnl=float("nan"))}, "1 ledger row(s) unparseable"),
+            ("string pnl", {"ledger": L(pnl="abc")}, "1 ledger row(s) unparseable")]:
         got = lines(**kw)
         assert got[3] == f"Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — {why}", (name, got)
     assert lines(ledger=L(pnl=-0.004))[3] == "Realized P&L (all-time, ledger, all venues, fee-incl.): $0.00 (0W/1L)"

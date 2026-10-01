@@ -34,6 +34,8 @@ P = "Profit (settled since last report): "
 AT = "Realized P&L (all-time, ledger, all venues, fee-incl.): "
 WARN1 = "⚠ 1 ledger row(s) unparseable — all-time total omitted"
 NOTICE1 = "⚠ 1 ledger row(s) unparseable — their figures withheld until fixed"
+WARN_FUT = "⚠ 1 ledger row(s) future-dated — all-time total omitted"
+WARN_CONF = "⚠ 1 ledger row(s) conflicting duplicate settlement — all-time total omitted"
 
 
 def ent(i, t, **k):
@@ -48,7 +50,7 @@ def st(i, p, won, t, **k):
 
 
 class Settle:
-    def __init__(self, fresh_record=False):
+    def __init__(self, fresh_record=True):  # post-rollout: an existing (empty) sent record
         self.fresh_record = fresh_record
 
     def __enter__(self):
@@ -119,10 +121,10 @@ def test_bad_rows_never_block_valid_ones():
     with Settle() as s:  # future-dated row
         fut = st("b", 1.0, True, mins(400 * 1440))
         s.write([ent("a", mins(-300)), st("a", 3.0, True, mins(-12)), ent("b", mins(-300)), fut])
-        assert s.run(mins(0)) == [f"{P}+$3.00 (1W/0L)\n{WARN1}"]
+        assert s.run(mins(0)) == [f"{P}+$3.00 (1W/0L)\n{WARN_FUT}"]
         assert s.run(mins(60)) == []
         s.append([ent("c", mins(-300)), st("c", -9.0, False, mins(100))])
-        assert s.run(mins(120)) == [f"{P}−$9.00 (net loss) (0W/1L)\n{WARN1}"]
+        assert s.run(mins(120)) == [f"{P}−$9.00 (net loss) (0W/1L)\n{WARN_FUT}"]
         s.write([ent("a", mins(-300)), st("a", 3.0, True, mins(-12)), ent("b", mins(-300)),
                  st("b", 1.0, True, mins(130)), ent("c", mins(-300)), st("c", -9.0, False, mins(100))])
         assert s.run(mins(180)) == [f"{P}+$1.00 (1W/0L)\n{AT}−$5.00 (net loss) (2W/1L)"]
@@ -142,7 +144,7 @@ def test_bad_rows_never_block_valid_ones():
     with Settle() as s:  # conflicting duplicate settlement for one entry
         s.write([ent("a", mins(-300)), st("a", 3.0, True, mins(-12)), st("a", -50.0, False, mins(-5)),
                  ent("b", mins(-300)), st("b", 2.0, True, mins(-4))])
-        assert s.run(mins(0)) == [f"{P}+$2.00 (1W/0L)\n{WARN1}"]
+        assert s.run(mins(0)) == [f"{P}+$2.00 (1W/0L)\n{WARN_CONF}"]
 
 
 def test_sent_record_robustness():
@@ -168,8 +170,8 @@ def test_sent_record_robustness():
                 os.makedirs(s.sent_path)
             s.append([ent("b", mins(-300)), st("b", -1.0, False, mins(-5))])
             r2, r3 = s.run(mins(20)), s.run(mins(80))
-            if mode == "dir":  # fail closed: nothing re-reported, one figure-free notice
-                assert r2 == ["Profit report paused — sent-record unreadable"] and r3 == [], (mode, r2, r3)
+            if mode == "dir":  # primary unusable -> the readable backup copy carries the record
+                assert r2 == [f"{P}−$1.00 (net loss) (0W/1L)\n{AT}+$2.00 (1W/1L)"] and r3 == [], (mode, r2, r3)
                 continue
             assert r2 == [f"{P}−$1.00 (net loss) (0W/1L)\n{AT}+$2.00 (1W/1L)"], (mode, r2)
             assert r3 == [], (mode, r3)
@@ -247,14 +249,17 @@ def _pnl(rows):
 
 def test_pnl_24h_and_conflicts():
     base = [ent("a", mins(-3000)), st("a", 3.0, True, mins(-2000))]
-    for name, extra in [("garbage", st("b", -9.0, False, "yesterday-ish")),
-                        ("numeric", st("b", -9.0, False, mins(-10).timestamp())),
-                        ("missing", st("b", -9.0, False, None)),
-                        ("settled_at garbage", st("b", -9.0, False, mins(-10), settled_at="bad"))]:
+    for name, extra in [("garbage", st("b", -9.0, False, "yesterday-ish")),  # shared selection:
+                        ("numeric", st("b", -9.0, False, mins(-10).timestamp())),  # no booking time
+                        ("missing", st("b", -9.0, False, None))]:  # -> flagged like settle_run does
         r, t = _pnl(base + [ent("b", mins(-300)), extra])
         assert r["status"] == "verified", (name, r)
-        assert "Settled last 24h (ledger): omitted — 1 row(s) lack times" in t, (name, t)
-        assert f"{AT}−$6.00 (net loss) · 1W/1L" in t and "$0.00" not in t, (name, t)
+        assert f"{AT}omitted — 1 ledger row(s) unparseable" in t, (name, t)
+        assert "Settled last 24h (ledger): omitted — 1 ledger row(s) unparseable" in t, (name, t)
+        assert "$0.00" not in t and "6.00" not in t and "9.00" not in t, (name, t)
+    r, t = _pnl(base + [ent("b", mins(-300)), st("b", -9.0, False, mins(-10), settled_at="bad")])
+    assert "Settled last 24h (ledger): omitted — 1 row(s) lack times" in t, t
+    assert f"{AT}−$6.00 (net loss) · 1W/1L" in t and "$0.00" not in t, t
     r, t = _pnl(base + [ent("b", mins(-3000)), st("b", -9.0, False, mins(-10), ts=mins(-1800).isoformat())])
     assert "Settled last 24h (ledger): $0.00" in t, t  # settled 30h ago (ts), booked now
     r, t = _pnl(base + [ent("b", mins(-300)), st("b", -9.0, False, mins(-10))])
@@ -264,7 +269,7 @@ def test_pnl_24h_and_conflicts():
     assert "Open-position cost (Kalshi, broker): $2.50" in t and "-50" not in t and "50.00" not in t
     f = cb.verified_facts(get=lambda p: {"balance": 12345}, get_positions=POS,
                           ledger=lambda: base + [st("a", -50.0, False, mins(-5))], now=mins(0))
-    assert cb.facts_block(f)[0][4] == f"{AT}omitted — unavailable (conflicting duplicate settlements)"
+    assert cb.facts_block(f)[0][4] == f"{AT}omitted — 1 ledger row(s) conflicting duplicate settlement"
 
 
 def test_sports_pings_survive_log_failures():

@@ -82,7 +82,7 @@ def test_facts_attack():
     assert r(led(["-3.5"], won=[False])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$3.50 (0W/1L)"
     assert r(led([1.005, 2.675])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): +$3.68 (2W/0L)"
     assert r(led([-5.0], won=["false"])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (0W/1L)"
-    unp = "Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — unavailable (unparseable rows)"
+    unp = "Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — 1 ledger row(s) unparseable"
     for rows in (led([float("nan")]), led([None]), led([1e30]), led([5.0], won=[None]),
                  led([5.0], won=["yes"]), led([5.0], won=[1]),
                  led([5.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",

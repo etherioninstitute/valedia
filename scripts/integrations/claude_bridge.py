@@ -57,7 +57,7 @@ def verified_facts(get=None, get_positions=None, ledger=None, now=None):
     """Each figure is read twice from its source and kept only if both reads parse,
     agree and are fresh; otherwise it is OMITTED with a reason (never shown as 0)."""
     import signal_verify as sv
-    now = now or sv.utcnow()
+    now_in, now = now, now or sv.utcnow()
     f = {"cash": None, "positions": None, "ledger": None, "why": {}}
     try:
         get = get or _broker_get()
@@ -86,13 +86,14 @@ def verified_facts(get=None, get_positions=None, ledger=None, now=None):
     try:
         rd = ledger or sv.read_ledger
         recs1, recs2 = rd(), rd()
-        r1, r2 = sv.ledger_realized(recs1), sv.ledger_realized(recs2)
-        lts, future = sv.ledger_latest(recs2, now)
+        # ONE shared selection (ledger_view) -> same rows / same omission text as 11pm + Profit
+        lnow = now_in or sv.utcnow()  # taken after the ledger reads
+        r1, r2 = sv.ledger_realized(recs1, lnow), sv.ledger_realized(recs2, lnow)
+        lts, future = sv.ledger_latest(recs2, lnow)
         open_pos = f["positions"]["n"][0] if f["positions"] else 1  # unknown -> assume open
         limit = sv.LEDGER_STALE_OPEN_S if open_pos else sv.LEDGER_STALE_ANY_S
-        if r1["bad"] or r2["bad"]:
-            f["why"]["ledger"] = ("unavailable (conflicting duplicate settlements)" if r1["conflict"]
-                                  else "unavailable (unparseable rows)")
+        if r1["reason"] or r2["reason"]:
+            f["why"]["ledger"] = r1["reason"] or r2["reason"]
         elif abs(r1["total"] - r2["total"]) > sv.CENT or r1["rows"] != r2["rows"] \
                 or r1["wins"] != r2["wins"]:
             f["why"]["ledger"] = "re-read disagreed"

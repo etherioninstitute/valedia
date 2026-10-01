@@ -293,7 +293,9 @@ def test_transport_returns_status_never_raises():
         signal_send.subprocess = FakeRelay
         assert signal_send.send("Invested: $1.00") is True
         assert "USD 1.00" in calls[-1][-1]
-        FakeRelay.rc = 255
+        FakeRelay.rc = 255  # ssh's own error: the remote may have run -> unknown
+        assert signal_send.send("x") is None
+        FakeRelay.rc = 1  # relay itself exited non-zero -> confirmed failure
         assert signal_send.send("x") is False
     finally:
         signal_send.subprocess = prev

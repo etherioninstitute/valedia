@@ -259,17 +259,15 @@ def ledger_latest(recs, now=None):
 def read_ledger():
     """Ledger rows; an invalid / non-object line -> {"type": "_bad_line"} (counted bad)."""
     import forward_test_ledger as ftl
+    import ledger_view as lv
     if not os.path.exists(ftl.LEDGER):
         return []
-    return [_row(l) for l in open(ftl.LEDGER, errors="replace") if l.strip()]
+    return [lv.bad_line_row(l) for l in open(ftl.LEDGER, errors="replace") if l.strip()]
 
 
-def _row(line):
-    try:
-        r = json.loads(line)
-    except ValueError:
-        r = None
-    return r if isinstance(r, dict) else {"type": "_bad_line"}
+def _row(line):  # one ledger line -> row (bad line -> {"type": "_bad_line", ...})
+    import ledger_view as lv
+    return lv.bad_line_row(line)
 
 
 def _non_real(source):
@@ -281,36 +279,17 @@ def _unrec(rec):
     return str(rec.get("fill_status") or "").upper() == "UNRECONCILED"
 
 
-def ledger_realized(recs):
-    """Admissible (real, reconciled) settlements, one per entry. bad = unparseable lines,
-    missing/garbage P&L or win flag, live orphans, and CONFLICTING duplicate settlements
-    for one entry (identical duplicates collapse). conflict counted separately too."""
-    entries = {r.get("id"): r for r in recs if r.get("type") == "entry" and r.get("id")}
-    first, bad, conflict = {}, sum(1 for r in recs if r.get("type") == "_bad_line"), 0
-    key = lambda r: (num(r.get("realized_pnl_net")), won_flag(r.get("won")))  # noqa: E731
-    for s in recs:
-        if s.get("type") == "settlement":
-            k = s.get("entry_id")
-            conflict += k in first and key(first[k]) != key(s)
-            first.setdefault(k, s)
-    rows = []
-    for k, s in first.items():
-        e = entries.get(k)
-        if e is None or _non_real(s.get("source")) or _non_real(e.get("source")) or _unrec(e) or _unrec(s):
-            bad += e is None and not _non_real(s.get("source"))
-        elif None in key(s):
-            bad += 1
-        else:
-            rows.append(s)
-    parts = [num(s.get("realized_pnl_net")) for s in rows]
-    wins = sum(1 for s in rows if won_flag(s.get("won")))
-    return {"rows": len(rows), "settlements": rows, "parts": parts, "total": dsum(parts),
-            "wins": wins, "losses": len(rows) - wins, "bad": bad + conflict, "conflict": conflict}
+def ledger_realized(recs, now=None):
+    """Admissible settlements via the ONE shared selection (ledger_view.select): live,
+    reconciled, first valid settlement per canonical entry id; bad / future / conflicting
+    rows counted in "bad" with the shared "reason" text."""
+    import ledger_view as lv
+    return lv.realized(recs, now or utcnow())
 
 
 def ledger_open_kalshi(recs):
-    done = {r.get("entry_id") for r in recs if r.get("type") == "settlement"}
-    return sum(1 for e in recs if e.get("type") == "entry" and e.get("id") not in done
+    done = {str(r.get("entry_id")) for r in recs if r.get("type") == "settlement"}
+    return sum(1 for e in recs if e.get("type") == "entry" and str(e.get("id")) not in done
                and str(e.get("venue") or "").startswith("kalshi")
                and not _non_real(e.get("source")) and not _unrec(e))
 
