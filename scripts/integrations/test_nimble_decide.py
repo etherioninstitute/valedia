@@ -240,7 +240,7 @@ def test_informed_none_is_computed_offline():
     _reset()
     seen = []
     saved = nd.inf.informed_facts
-    nd.inf.informed_facts = lambda sym, side: seen.append((sym, side)) or {
+    nd.inf.informed_facts = lambda sym, side, **k: seen.append((sym, side, k)) or {
         "facts": {"news_present": True}, "sources": {"news": {}}}
     try:
         calls = []
@@ -248,7 +248,7 @@ def test_informed_none_is_computed_offline():
                             source="t", post=_post(calls=calls), get=_get())
     finally:
         nd.inf.informed_facts = saved
-    assert seen == [("BTC-USD", "buy")]
+    assert seen == [("BTC-USD", "buy", {"asset_class": "crypto"})]
     assert calls[0]["payload"]["state"]["informed"] == {"news_present": True}
 
 

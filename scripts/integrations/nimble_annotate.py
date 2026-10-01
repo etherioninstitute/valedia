@@ -312,7 +312,7 @@ def conviction_note(opp, informed, *, caller, side=None, post=None, get=None):
         cand = {"ticker": o.get("ticker") or sym, "venue": o.get("platform") or "kalshi",
                 "side": side}
         facts = conviction_facts(o, informed)
-        inf_doc = inf.informed_facts(sym, side, direction=nw.direction_for(o, side))
+        inf_doc = inf.informed_facts(sym, side, direction=nw.direction_for(o, side), asset_class="prediction")
         state = nd.build_state("prediction", cand, side, facts, inf_doc.get("facts"))
         state["annotate_only"] = True
         label = {"code": "informed_pass", "strategy": _dict(informed).get("strategy"),

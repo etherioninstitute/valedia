@@ -2,9 +2,12 @@
 Checks if cron_runner_mac.sh is executable and cron log is fresh.
 Alerts Burton via Signal if something is wrong.
 Runs via a SEPARATE crontab entry (not through cron_runner_mac.sh).
-Ops alerts carry no money figures: the text goes through signal_verify.ops_alert,
-which replaces every line the shared money detector flags (money keyword /
-currency / % / signed decimal + any number) and logs to data/signal/verify_log.jsonl.
+Ops alerts carry no money figures. Fields:
+  CODE-PRODUCED (kept verbatim): the fixed problem sentences below and the cron-log
+    age, an int minute count this file computes from the log mtime.
+  DYNAMIC (scrubbed): everything else, incl. script file names and any text passed
+    to alert(): signal_verify.scrub_numbers turns every numeral / number word into
+    "[n]". Logged to data/signal/verify_log.jsonl.
 (c) GOATWORTHY Post LLC
 """
 import os, re, subprocess, sys, time
@@ -27,12 +30,13 @@ def _ssh_send(msg):
     return r.returncode == 0
 
 
-def alert(msg, send_fn=None):
-    """Ops alert, text only, money figures stripped. Never raises."""
+def alert(msg, send_fn=None, code_lines=()):
+    """Ops alert. msg is free text (every numeral -> [n]); code_lines are built by
+    check() from ints it computed and kept verbatim. Never raises."""
     send_fn = send_fn or _ssh_send
     try:
         import signal_verify as sv
-        return sv.ops_alert("watchdog", msg, send_fn=send_fn)
+        return sv.ops_alert("watchdog", msg, send_fn=send_fn, code_lines=code_lines)
     except Exception as e:  # verifier unavailable: drop every line with a digit
         try:
             send_fn("\n".join("[line withheld]" if re.search(r"\d", l) else l
@@ -43,7 +47,7 @@ def alert(msg, send_fn=None):
 
 
 def check(send_fn=None):
-    problems = []
+    problems, code_lines = [], []
 
     # 1. Is cron_runner_mac.sh executable?
     if os.path.exists(RUNNER) and not os.access(RUNNER, os.X_OK):
@@ -58,7 +62,7 @@ def check(send_fn=None):
     if os.path.exists(LOG):
         age_min = (time.time() - os.path.getmtime(LOG)) / 60
         if age_min > 120:  # 2 hours stale = something is wrong
-            problems.append(f"Cron log is {age_min:.0f} min stale (>2h)")
+            code_lines.append(f"Cron log is {int(age_min)} min stale (>2h)")  # code int
     else:
         problems.append("Cron log does not exist")
 
@@ -76,13 +80,13 @@ def check(send_fn=None):
                 os.chmod(fp, 0o755)
                 problems.append(f"Fixed: {f} was not executable")
 
-    if problems:
+    if problems or code_lines:
         msg = "WATCHDOG ALERT\n" + "\n".join(problems)
-        alert(msg, send_fn)
-        print(msg)
+        alert(msg, send_fn, code_lines=code_lines)
+        print(msg + ("\n" + "\n".join(code_lines) if code_lines else ""))
     else:
         pass  # Silent when healthy
-    return problems
+    return problems + code_lines
 
 
 if __name__ == "__main__":

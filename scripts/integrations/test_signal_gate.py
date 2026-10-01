@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Shared money detector + structural gates (repair round).
-
-Adversarial money text must be withheld everywhere (LLM answers, legacy
-cron_runner.sh, watchdog); real VERIFIED broker/realized figures still pass;
-a modeled context figure never allows a match; the router relays only
-structurally verified bridge output; the 7am brief never crashes; broker and
-ledger staleness are labelled. Fakes only: no network, no keys, no orders.
+"""Money detector (Signal pings), 7am brief never crashes, broker/ledger staleness.
+Free-text scrubbing / AI answers / router / cron_runner / watchdog: test_signal_scrub.py.
+Fakes only: no network, no keys, no orders.
 Run: python3 test_signal_gate.py
 """
 import json
@@ -19,9 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_signal_senders_rest as rest  # installs the relay booby-traps + temp signal dir
 import signal_verify as sv
-import claude_bridge as cb
 import kalshi_alert as ka
-import watchdog
 
 NOW = datetime(2026, 10, 1, 23, 0, tzinfo=timezone.utc)
 ADVERSARIAL = [
@@ -32,13 +26,6 @@ ADVERSARIAL = [
     "Profit $12.499", "Profit: +12.5 (that is your cash)",
     "Unrealized P&L $1.25", "Expected profit $1.25", "EV $3.20", "Your cash is $1.25",
 ]
-CTX = ("[VERIFIED-BROKER] Kalshi cash $12.50; invested (open-position cost) $3.20; 1 open positions\n"
-       "[VERIFIED-REALIZED] Realized P&L (ledger, fee-incl.): +$1.25 (1W/1L, 2 settlements)\n"
-       "[MODELED — never quote as profit] If-win payout: $123.45\n"
-       "[VERIFIED-BROKER] if-win payout $77.70\n"  # mis-tagged modeled line: still never allowed
-       "[UNVERIFIED sports log] Cost: $40.00\n[INFO] PAUSED: none")
-
-
 class Sender(rest.Sender):
     pass
 
@@ -49,89 +36,11 @@ def test_detector_flags_every_adversarial_string():
     for s in ("scan ok v0.74.1 host 100.125.9.30 12 markets", "Cron log is 130 min stale (>2h)",
               "You have 3 open bets", "Report at 23:00 UTC on 2026-10-01", "Cash App ready"):
         assert not sv.has_money(s), s
-    assert sv.verified_figures(CTX) == [12.5, 3.2, 1.25], sv.verified_figures(CTX)
-
-
-def test_llm_adversarial_withheld_real_figures_pass():
-    rest._fresh_dir()
-    for s in ADVERSARIAL + ["The if-win payout is $123.45", "Payout $77.70 expected",
-                            "Sports cost $40.00 so far", "You made $12.5k"]:
-        send = Sender()
-        r = cb.gate_answer("q:" + s, s, CTX, send=True, send_fn=send, now=NOW)
-        assert r["status"] == "withheld", (s, r["text"])
-        assert len(send.msgs) == 1 and send.msgs[0].startswith("Report withheld (AI answer)")
-        for raw, _v in sv.money_tokens(s):
-            assert raw.lstrip("+-−$€") not in send.msgs[0], (s, send.msgs[0])
-    for s in ("Realized P&L is +$1.25 and you have $12.50 cash.",
-              "Invested (open-position cost): $3.20", "You have 3 open bets.",
-              "Cash $12.5 — realized $1.250", "cash: 12.5"):
-        send = Sender()
-        r = cb.gate_answer("ok:" + s, s, CTX, send=True, send_fn=send, now=NOW)
-        assert r["status"] == "verified", (s, r)
-        assert send.msgs[0].splitlines()[-1].startswith("✓ verified")
-
-
-def _args(**k):
-    return types.SimpleNamespace(question=k.get("q", "q"), no_data=False, model="sonnet",
-                                 signal=False, router=k.get("router", True))
-
-
-def test_bridge_exit_codes_and_header(capsys=None):
-    import io
-    import contextlib
-    rest._fresh_dir()
-    for answer, rc, status in (("You have $12.50 cash.", 0, "verified"),
-                               ("You made $124 profit", 3, "withheld"),
-                               ("Error: timeout", 4, None)):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            got = cb.run(_args(q=answer), ask=lambda *a, **k: answer, context_fn=lambda: CTX)
-        out = buf.getvalue().rstrip("\n").split("\n")
-        assert got == rc, (answer, got)
-        if status:
-            text = "\n".join(out[1:])
-            assert out[0] == cb.gate_header(status, text), out
-        else:
-            assert not out[0].startswith("VALEDIA-GATE"), out
-
-
-def test_bridge_context_tags_only_agreeing_reads():
-    bal = iter([{"balance": 1250}, {"balance": 1250}])
-    ctx = cb.get_portfolio_context(get=lambda p: next(bal), get_positions=rest_positions(3.20),
-                                   ledger=lambda: [], models_dir=tempfile.mkdtemp())
-    assert "[VERIFIED-BROKER] Kalshi cash $12.50; invested (open-position cost) $3.20" in ctx, ctx
-    assert "[VERIFIED-REALIZED] Realized P&L (ledger, fee-incl.): +$0.00" in ctx, ctx
-    bal = iter([{"balance": 1250}, {"balance": 1300}])
-    ctx = cb.get_portfolio_context(get=lambda p: next(bal), get_positions=rest_positions(3.20),
-                                   ledger=lambda: [], models_dir=tempfile.mkdtemp())
-    assert "[VERIFIED-BROKER]" not in ctx and "12.50" not in ctx and "13.00" not in ctx, ctx
-    assert sv.verified_figures(ctx) == [0.0]
 
 
 def rest_positions(exp):
     return lambda: {"market_positions": [{"ticker": "KXA", "position_fp": "1",
                                           "market_exposure_dollars": str(exp)}]}
-
-
-def test_cron_runner_withholds_every_adversarial_line():
-    d0 = tempfile.mkdtemp(prefix="sigsh_adv_")
-    for i, s in enumerate(ADVERSARIAL):
-        p = os.path.join(d0, f"s{i}.py")
-        open(p, "w").write(f"print({('scan done' + chr(10) + s)!r})\n")
-        r, sent, _ = rest._run_sh("cron_runner.sh", [p, "LBL"], {"openclaw": rest._OPENCLAW})
-        assert "Report withheld (legacy cron_runner)" in sent, (s, sent)
-        assert "scan done" not in sent, (s, sent)  # the WHOLE message is withheld
-
-
-def test_watchdog_strips_every_adversarial_line():
-    rest._fresh_dir()
-    for s in ADVERSARIAL:
-        send = Sender()
-        watchdog.alert("WATCHDOG ALERT\nCron log does not exist\n" + s, send_fn=send)
-        t = send.msgs[0]
-        assert "Cron log does not exist" in t and "[figure withheld]" in t, (s, t)
-        for raw, _v in sv.money_tokens(s):
-            assert raw.lstrip("+-−$€") not in t, (s, t)
 
 
 def test_brief_never_crashes():
@@ -197,11 +106,6 @@ def test_pnl_staleness_broker_and_ledger():
 
 if __name__ == "__main__":
     test_detector_flags_every_adversarial_string()
-    test_llm_adversarial_withheld_real_figures_pass()
-    test_bridge_exit_codes_and_header()
-    test_bridge_context_tags_only_agreeing_reads()
-    test_cron_runner_withholds_every_adversarial_line()
-    test_watchdog_strips_every_adversarial_line()
     test_brief_never_crashes()
     test_pnl_staleness_broker_and_ledger()
     print("signal_gate: PASS")
