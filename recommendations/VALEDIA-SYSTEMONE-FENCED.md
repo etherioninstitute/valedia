@@ -59,9 +59,9 @@ Nimble stamps. It does not size and it does not send.
 Nimble's `confidence` is 1 - normalized entropy of `probabilities` (sharpness), not P(chosen action). Verified on Burton's Mac: buy 0.4765 / skip 0.5235 gives skip with confidence 0.00159. Verdicts carry `p_action` and `p_buy` (from `probabilities`, None when absent).
 
 Veto rule (entries only; exits never blocked; shadow computes and stamps it but never blocks):
-allow iff action == buy AND confidence >= `VALEDIA_NIMBLE_MIN_SHARPNESS` (0.05, a not-a-coin-flip floor; `VALEDIA_NIMBLE_MIN_CONF` is a deprecated alias) AND `p_cal` >= `required_p`.
-- `p_cal` = `calibration_ledger.calibrate("nimble_decide:<point>", p_buy)`: identity under 30 scorable decisions, then Laplace-smoothed isotonic (PAV) fit (`calibration` = identity | isotonic).
+allow iff action == buy AND confidence >= `VALEDIA_NIMBLE_MIN_SHARPNESS` (0.05, a not-a-coin-flip floor; the old `VALEDIA_NIMBLE_MIN_CONF` is ignored, with a one-line deprecation note) AND `p_cal` >= `required_p`.
+- `p_cal` = `calibration_ledger.calibrate("nimble_decide:<point>", p_buy)`: identity under 30 scorable decisions, then Laplace-smoothed isotonic (PAV) fit in `calibration_map.py` (`calibration` = identity | isotonic).
 - `required_p` = max(`VALEDIA_NIMBLE_P_FLOOR` 0.60, `break_even_p` + margin); floor alone when break-even is unknown.
-- `break_even_p` (code only, never in the model state): prediction = bought side's price (NO price for a no buy) + fee per contract (+ half spread / slip); spot = 0.5 + round-trip fee % / 200 (approximation for a symmetric outcome; understates for real moves).
+- `break_even_p` (code only, never in the model state): prediction = bought side's price (a no buy needs an explicit NO price — no `no_ask`/marked NO price → None, floor applies) + fee per contract (+ half spread / slip); spot = 0.5 + round-trip fee % / 200 (approximation for a symmetric outcome; understates for real moves).
 - margin = `VALEDIA_NIMBLE_BASE_MARGIN` 0.02 x phi_multiplier = 0.5 + 2.5 x (1 - `valedia_config._risk_factor()`), the Etherion scalar the dynamic Kelly cap uses (NORMAL 0.5 .. HALT 3.0; missing/stale → 1.0).
 Reasons: `veto_not_sharp`, `veto_no_p_buy`, `veto_p_below_required`, `veto_model_<hold|skip>`; allow = `veto_model_buy`.

@@ -301,14 +301,22 @@ def test_economics_for():
     opp = {"platform": "kalshi", "side": "yes", "price": 0.8, "yes_ask": 81,
            "ev_preflight": {"fee_per": 0.012, "half_spread": 0.01, "slip": 0.002}}
     e = nw.economics_for(opp, "yes")
-    assert e["price"] == 0.81 and e["fee_per_contract"] == 0.012 and e["half_spread"] is None
+    assert e["yes_price"] == 0.81 and e["fee_per_contract"] == 0.012 and e["half_spread"] is None
     assert abs(nd.break_even_p("prediction", e) - 0.824) < 1e-9, e
     e = nw.economics_for({"platform": "kalshi", "price": 0.3, "raw": {"no_ask": 0.31}}, "no")
-    assert e["side"] == "no" and e["price"] == 0.31  # NO buy uses the NO price
+    assert e["side"] == "no" and e["no_price"] == 0.31  # NO buy uses the NO price
     assert abs(e["fee_per_contract"] - 0.07 * 0.31 * 0.69) < 1e-12, e
     e = nw.economics_for({"platform": "kalshi", "price": 0.4,
                           "ev_preflight": {"fee_per": 0.01, "half_spread": 0.02}}, "yes")
     assert e["half_spread"] == 0.02 and abs(nd.break_even_p("prediction", e) - 0.43) < 1e-9
+    # scanner-shaped opp: price = yes_ask / 100 on side no, no no_ask -> no break-even
+    scan = {"platform": "kalshi_scanner", "side": "no", "price": 64 / 100,
+            "raw": {"yes_ask": 64, "mid": 40}}
+    assert nw.economics_for(scan, "no") is None
+    assert nd.break_even_p("prediction", nw.economics_for(scan, "no"), "no") is None
+    e = nw.economics_for(dict(scan, price=0.37, price_side="no"), "no")  # explicitly NO
+    assert e["no_price"] == 0.37 and abs(nd.break_even_p("prediction", e) - 0.37 - 0.07 * 0.37 * 0.63) < 1e-9
+    assert nw.economics_for(dict(scan, no_price=0.36), "no")["no_price"] == 0.36
     assert nw.economics_for({"price": 0.4}, None) is None  # no yes/no side: floor applies
     assert nw.economics_for({"platform": "kalshi"}, "yes") is None
     print("ok economics_for")

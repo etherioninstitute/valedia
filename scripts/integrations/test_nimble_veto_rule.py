@@ -108,7 +108,9 @@ def test_break_even_math():
     assert abs(be("prediction", {"side": "no", "yes_price": 0.40, "no_price": 0.62,
                                  "fee_per_contract": 0.0165}) - 0.6365) < 1e-9
     assert be("prediction", {"yes_price": 0.40}, side="no") is None  # NO price unknown
-    assert abs(be("prediction", {"price": 0.3}, side="no") - 0.3) < 1e-9  # side from the caller
+    assert be("prediction", {"price": 0.3}, side="no") is None  # unmarked price: never for NO
+    assert abs(be("prediction", {"no_price": 0.3}, side="no") - 0.3) < 1e-9  # side from caller
+    assert abs(be("prediction", {"price": 0.3}, side="yes") - 0.3) < 1e-9
     assert be("prediction", {"price": 0.3}) is None and be("prediction", None, "yes") is None
     assert be("prediction", {"side": "yes", "price": 0}) is None
     # spot: 0.5 + roundtrip_fee_pct / 100 / 2 (documented approximation); explicit value wins
@@ -244,19 +246,23 @@ def test_shadow_never_blocks():
     assert nd.mode_for("prediction") == "shadow"  # default stays shadow
 
 
-def test_deprecated_min_conf_alias():
+def test_deprecated_min_conf_ignored():
+    """An old VALEDIA_NIMBLE_MIN_CONF=0.6 must not become a sharpness floor that blocks all."""
     nd._MIN_CONF_NOTED = False
-    _reset(VALEDIA_NIMBLE_MIN_CONF="0.4")
+    _reset(VALEDIA_NIMBLE_MIN_CONF="0.6")
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        assert nd.min_sharpness() == 0.4 and nd.min_conf() == 0.4
-        assert nd.min_sharpness() == 0.4
+        assert nd.min_sharpness() == 0.05 and nd.min_conf() == 0.05
+        assert nd.min_sharpness() == 0.05
         v = _decide(_post("buy", 0.3, 0.95))
     lines = [x for x in err.getvalue().splitlines() if x.strip()]
-    assert len(lines) == 1 and "deprecated" in lines[0], lines  # one-line note, once
-    assert v["allow"] is False and v["reason"] == "veto_not_sharp"
-    _reset(VALEDIA_NIMBLE_MIN_CONF="0.4", VALEDIA_NIMBLE_MIN_SHARPNESS="0.2")
-    assert nd.min_sharpness() == 0.2  # the new name wins
+    assert len(lines) == 1, lines  # one-line note, once
+    assert "deprecated and ignored" in lines[0] and "VALEDIA_NIMBLE_MIN_SHARPNESS" in lines[0]
+    assert v["allow"] is True and v["reason"] == "veto_model_buy", v  # 0.3 >= 0.05
+    _reset(VALEDIA_NIMBLE_MIN_CONF="0.6", VALEDIA_NIMBLE_MIN_SHARPNESS="0.4")
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert nd.min_sharpness() == 0.4  # only the new name sets the floor
+        assert _decide(_post("buy", 0.3, 0.95))["reason"] == "veto_not_sharp"
     _reset()
     assert nd.min_sharpness() == 0.05
 

@@ -93,9 +93,11 @@ def _price(v):
 def economics_for(opp, side):
     """Break-even inputs for nimble_decide (code only, never sent to the model), or None.
 
-    price: the bought side's ask (yes_ask / no_ask on the opp or its raw) when present,
-    else opp `price` (allocator convention: the bought side's price, as kalshi_profit._book
-    reads it). fee_per_contract: ev_preflight fee_per (venue fee map), else
+    price: the bought side's ask (yes_ask / no_ask on the opp or its raw) when present.
+    Else, for a YES buy, opp `price`; for a NO buy, an explicit NO price only: opp `no_price`,
+    or `price` when the opp marks it `price_side == "no"` (scanner opps carry price =
+    yes_ask / 100 even on side no, so an unmarked price is never used for NO).
+    fee_per_contract: ev_preflight fee_per (venue fee map), else
     fee_engine.kalshi_fee_per_contract(price) on Kalshi, else a Poly `fee_prob`.
     half_spread (only when price is not already the ask) and slip from ev_preflight.
     No yes/no side or no price → None (the probability floor applies). Never raises.
@@ -112,7 +114,11 @@ def _economics(opp, side):
         return None
     raw = opp.get("raw") if isinstance(opp.get("raw"), dict) else {}
     ask = _price(opp.get(side + "_ask", raw.get(side + "_ask")))
-    price = ask if ask is not None and ask > 0 else _price(opp.get("price"))
+    if side == "yes" or str(opp.get("price_side") or "").strip().lower() == "no":
+        fallback = opp.get("price")
+    else:
+        fallback = opp.get("no_price")
+    price = ask if ask is not None and ask > 0 else _price(fallback)
     if price is None or not 0.0 < price < 1.0:
         return None
     ev = opp.get("ev_preflight") if isinstance(opp.get("ev_preflight"), dict) else {}
@@ -122,7 +128,7 @@ def _economics(opp, side):
         fee = fee_engine.kalshi_fee_per_contract(price)
     if fee is None:
         fee = opp.get("fee_prob")
-    return {"side": side, "price": price, "fee_per_contract": fee, "slip": ev.get("slip"),
+    return {"side": side, side + "_price": price, "fee_per_contract": fee, "slip": ev.get("slip"),
             "half_spread": None if ask is not None and ask > 0 else ev.get("half_spread")}
 
 

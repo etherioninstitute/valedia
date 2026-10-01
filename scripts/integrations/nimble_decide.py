@@ -22,7 +22,7 @@ Confidence semantics (verified on Burton's Mac): `confidence` = 1 - normalized e
 `probabilities` (sharpness), NOT P(chosen): buy .4765 / skip .5235 → confidence .00159.
 Veto rule (entries only): allow iff action == "buy" and confidence >= min_sharpness (only a
 "not a coin flip" floor) and p_cal >= required_p, where
-  min_sharpness  VALEDIA_NIMBLE_MIN_SHARPNESS (0.05); VALEDIA_NIMBLE_MIN_CONF = deprecated alias;
+  min_sharpness  VALEDIA_NIMBLE_MIN_SHARPNESS (0.05); old VALEDIA_NIMBLE_MIN_CONF is ignored;
   p_cal          calibration_ledger.calibrate("nimble_decide:<source>", p_buy): identity under
                  30 scorable decisions, then isotonic (`calibration` records which);
   required_p     max(VALEDIA_NIMBLE_P_FLOOR (0.60), break_even_p + margin), floor if unknown;
@@ -31,8 +31,8 @@ Veto rule (entries only): allow iff action == "buy" and confidence >= min_sharpn
                  risk_level scalar dynamic_per_trade_cap uses: NORMAL 0.5 .. CAUTION 1.5 .. HALT
                  3.0; missing / no risk_level / stale (VALEDIA_NIMBLE_PHI_MAX_AGE_H, 24) → 1.0.
 break_even_p from the caller's `economics` (code only, NEVER in the model state), else None:
-  prediction    price of the side bought (`<side>_price` else `price`; YES for a yes buy, NO
-                for a no buy; > 1 = cents) + fee_per_contract + half_spread + slip (known ones).
+  prediction    price of the side bought: `yes_price` (else `price`) for a yes buy, `no_price`
+                ONLY for a no buy (> 1 = cents) + fee_per_contract + half_spread + slip.
   stock/crypto  0.5 + roundtrip_fee_pct / 100 / 2 (percent, fee_engine.roundtrip_cost).
                 APPROXIMATION for a symmetric +-m outcome, exact break-even 0.5 + fee / (2 m):
                 this is m = 100% and UNDERSTATES it for real moves. `expected_move_pct` gives
@@ -141,16 +141,13 @@ def _env_float(key, default, lo, hi):
 
 
 def min_sharpness():
-    """VALEDIA_NIMBLE_MIN_SHARPNESS, else deprecated VALEDIA_NIMBLE_MIN_CONF, else 0.05."""
+    """VALEDIA_NIMBLE_MIN_SHARPNESS (0.05). Old VALEDIA_NIMBLE_MIN_CONF is IGNORED (one note)."""
     global _MIN_CONF_NOTED
-    key = "VALEDIA_NIMBLE_MIN_SHARPNESS"
-    if not os.environ.get(key, "").strip() and os.environ.get("VALEDIA_NIMBLE_MIN_CONF", "").strip():
-        key = "VALEDIA_NIMBLE_MIN_CONF"
-        if not _MIN_CONF_NOTED:
-            _MIN_CONF_NOTED = True
-            print("nimble_decide: VALEDIA_NIMBLE_MIN_CONF is deprecated; read as the sharpness "
-                  "floor VALEDIA_NIMBLE_MIN_SHARPNESS", file=sys.stderr)
-    return _env_float(key, MIN_SHARPNESS_DEFAULT, 0.0, 1.0)
+    if os.environ.get("VALEDIA_NIMBLE_MIN_CONF", "").strip() and not _MIN_CONF_NOTED:
+        _MIN_CONF_NOTED = True
+        print("nimble_decide: VALEDIA_NIMBLE_MIN_CONF is deprecated and ignored; use "
+              "VALEDIA_NIMBLE_MIN_SHARPNESS (sharpness floor, default 0.05)", file=sys.stderr)
+    return _env_float("VALEDIA_NIMBLE_MIN_SHARPNESS", MIN_SHARPNESS_DEFAULT, 0.0, 1.0)
 
 
 min_conf = min_sharpness  # deprecated name
@@ -317,7 +314,8 @@ def break_even_p(asset_class, economics, side=None):
         if asset_class == "prediction":
             sd = str(e.get("side") or side or "").strip().lower()
             price = _num(e.get(sd + "_price")) if sd in ("yes", "no") else None
-            price = _num(e.get("price")) if price is None else price
+            if price is None and sd == "yes":  # a NO buy needs no_price: never a YES price
+                price = _num(e.get("price"))
             price = price / 100.0 if price is not None and price > 1.0 else price  # cents
             if sd not in ("yes", "no") or price is None or not 0.0 < price < 1.0:
                 return None
