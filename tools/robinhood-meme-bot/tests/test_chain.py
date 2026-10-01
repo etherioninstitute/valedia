@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from fakes import (FACTORY, MEME, OWNER, POOL, QUOTE, FakeRpc, add_pool, add_token,
-                   bytes32_string, pool_created_log, standard_scenario)
+                   bytes32_string, pool_created_log, sqrt_for, standard_scenario)
 from keccak import keccak256
 from rh_meme_bot import abi
 from rh_meme_bot.chain import (ChainMismatchError, ChainReader, PoolWatcher,
@@ -93,10 +93,10 @@ def test_pool_reads_via_rpc():
     rpc = standard_scenario()
     r = reader(rpc)
     s0 = r.pool_slot0(POOL)
-    assert s0.sqrt_price_x96 == 2 * 2 ** 96 and s0.tick == 13863
+    assert s0.sqrt_price_x96 == sqrt_for(0.0005, 18, 6) and s0.tick == -76000
     assert r.pool_liquidity(POOL) == 5_000_000
     assert r.pool_tokens(POOL) == (MEME, QUOTE)
-    assert r.pool_price(POOL, 18, 18)[0] == Decimal(4)
+    assert float(r.pool_price(POOL, 18, 6)[0]) == pytest.approx(0.0005, rel=1e-9)
     assert r.pool_slot0("0x" + "00" * 20) is None  # reverts
 
 
@@ -157,3 +157,17 @@ def test_rpc_retry_with_backoff_then_success_and_exhaustion():
         RpcClient("http://fake", transport=rpc2, retries=3, sleep=lambda s: None).call(
             "eth_call", [{"to": MEME, "data": abi.SEL_OWNER}, "latest"])
     assert ei.value.retryable is False and len(rpc2.requests) == 1
+
+
+def test_balance_of_and_decimals():
+    rpc = standard_scenario()
+    r = reader(rpc)
+    assert r.balance_of(QUOTE, POOL) == 30_000 * 10 ** 6
+    assert r.balance_of(MEME, POOL) == 40_000_000 * 10 ** 18
+    assert r.balance_of(QUOTE, "0x" + "00" * 20) is None  # reverts -> None
+    assert r.decimals(QUOTE) == 6
+    # calldata is selector 0x70a08231 + left-padded holder
+    sent = [q["params"][0]["data"] for q in rpc.requests if q["method"] == "eth_call"]
+    assert abi.encode_balance_of(POOL) in sent
+    assert abi.encode_balance_of(POOL).startswith("0x70a08231" + "0" * 24)
+    assert "0x" + keccak256(b"balanceOf(address)").hex()[:8] == abi.SEL_BALANCE_OF

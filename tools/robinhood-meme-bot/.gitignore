@@ -6,3 +6,4 @@ __pycache__/
 .pytest_cache/
 positions*.jsonl
 *.jsonl
+decisions*.jsonl

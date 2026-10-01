@@ -15,6 +15,7 @@ SEL_SLOT0 = "0x3850c7bd"
 SEL_LIQUIDITY = "0x1a686502"
 SEL_TOKEN0 = "0x0dfe1681"
 SEL_TOKEN1 = "0xd21220a7"
+SEL_BALANCE_OF = "0x70a08231"
 
 
 def strip0x(h: str) -> str:
@@ -44,6 +45,11 @@ def decode_int(data: str, bits: int, index: int = 0) -> Optional[int]:
 def decode_address(data: str, index: int = 0) -> Optional[str]:
     w = words(data)
     return "0x" + w[index][-40:].lower() if len(w) > index else None
+
+
+def encode_balance_of(holder: str) -> str:
+    """Calldata for balanceOf(holder)."""
+    return SEL_BALANCE_OF + strip0x(holder).lower().rjust(64, "0")
 
 
 def topic_to_address(topic: str) -> str:
