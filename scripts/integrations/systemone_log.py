@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Append-only decision log + latency budget for the System One shadow paths.
 
-Every shadow decision (movers scan and Jev shadow, any backend) is one JSON
+Every shadow decision (movers scan and Nimble 2 notes, any backend) is one JSON
 line, yes and no alike, so a review can read what the model said no to as
 well as yes to. Default data/systemone/decisions.jsonl; VALEDIA_SYSTEMONE_LOG
 overrides. No keys, no headers. Never raises into the caller.

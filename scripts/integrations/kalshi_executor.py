@@ -511,7 +511,6 @@ def opportunity_report(state=None, opps=None):
         lines.append(f"\n{strat} ({len(group)} opportunities):")
         for o in group[:5]:
             sim = execute_trade(o, state, dry_run=True)
-            fitted_sims.append(sim)
             pot = sim.get("potential_profit", 0)
             roi = sim.get("roi_pct", 0)
             exp_label = f"{o['hours_to_exp']:.0f}h" if o['hours_to_exp'] < 720 else f"{o['hours_to_exp']/720:.0f}mo"
@@ -522,6 +521,8 @@ def opportunity_report(state=None, opps=None):
                 except Exception:
                     fenced = False
             tag = " [FENCED/SKIP_LIVE_FENCE]" if fenced else ""
+            if not fenced:  # fenced picks never trade live: not in the modeled total
+                fitted_sims.append(sim)
             lines.append(
                 f"  ${sim.get('total_cost',0):.2f}→${pot:.2f} "
                 f"({roi:+.0f}% ROI) exp:{exp_label} | {o['title'][:50]}{tag}"
@@ -530,9 +531,10 @@ def opportunity_report(state=None, opps=None):
     
     # 5. Summary: cash-constrained fee-true sim (picks compete — do not sum as portfolio)
     fit_profit = constrained_scan_profit(fitted_sims, state.get("balance"), total_deployable)
-    lines.append(f"\n═══ PROFIT POTENTIAL (fee-true Kalshi sim, not broker fills) ═══")
+    lines.append(f"\n═══ MODELED UPSIDE (fee-true Kalshi sim, not broker fills) ═══")
     lines.append(f"  With current ${state['balance']:.2f}: deploy up to ${total_deployable:.2f}")
-    lines.append(f"  Estimated profit from top picks that fit cash (not additive): ${fit_profit:.2f}")
+    lines.append(f"  Modeled if-all-win, unfenced top picks that fit cash: ${fit_profit:.2f} "
+                 f"(not profit, not EV, not fills; fenced picks excluded; not additive)")
     
     # 6. Deposit illustrations deleted — averaging edge/price invented 100%+ ROI.
 
@@ -765,23 +767,26 @@ def run(dry_run=False, max_trades=5, min_score=40):
 
 
 def send_opportunity_alert():
-    """Generate opportunity report and send via Signal if opportunities are hot."""
-    report = opportunity_report()
-    
-    # Send via Signal if there are good opportunities
-    hot = "PROFIT POTENTIAL" in report and "$0.00" not in report.split("PROFIT POTENTIAL")[1][:50]
-    if hot:
-        try:
-            from subprocess import run as sp_run
-            msg = report[:1500]  # Signal length limit
-            sp_run([
-                "openclaw", "message", "send",
-                "--channel", "signal",
-                "--target", "uuid:47bd6dd5-2c96-4514-9541-acd8ed013612",
-                "--message", msg
-            ], capture_output=True, timeout=30)
-        except: pass
-    
+    """Print the opportunity report (cron log only) and send the VERIFIED 7am brief.
+    The Signal text comes from kalshi_alert.brief via signal_verify: Invested =
+    broker open-position cost (re-read), "Modeled if-all-win" labelled not profit,
+    fenced picks excluded; any mismatch -> withheld notice. Never raises."""
+    state = opps = None
+    try:
+        state, opps = get_state(), scan_all_markets()
+    except Exception as e:  # brief() re-reads on None and withholds on failure
+        print(f"[kalshi_executor] scan failed: {type(e).__name__}: {e}"[:300])
+    try:
+        report = opportunity_report(state=state, opps=opps)
+    except Exception as e:
+        report = f"opportunity report failed: {type(e).__name__}: {e}"[:300]
+        print(report)
+    try:
+        import kalshi_alert
+        res = kalshi_alert.brief(ke=sys.modules[__name__], state=state, opps=opps)
+        print(f"[kalshi_executor] Signal {res['status']} sent={res['sent']}")
+    except Exception as e:  # never crash the cron; report was already printed
+        print(f"[kalshi_executor] verified alert failed: {type(e).__name__}: {e}"[:300])
     return report
 
 

@@ -7,8 +7,8 @@ Alpha is kernel_predictor_v16e only. QEIDrawdownGuard, VarianceCascade
 (EnergyLadderCascade), and ExecutionErrorEstimator may only cut or zero
 that size. Etherion is not an alpha. Mean-reversion is not consulted.
 
-AUTONOMY-2 jev_shadow is MiroFish annotate-only. It is not a bar bulk
-backtester. This process does not call Jev.
+Nimble 2 (the only model; the retired AUTONOMY-2 shadow it replaced) is
+annotate-only. It is not a bar bulk backtester. This process does not call it.
 
 Fee book is CE-3 (valedia_config CRYPTO_FEE_PCT + CRYPTO_SLIPPAGE_PCT)
 charged on turnover. Not the kernel helper's 8 bps default.
@@ -323,7 +323,7 @@ def render_md(doc):
         "",
         "**PAPER / fee-true / not-live.** No orders. No `--live`. No venue sends. No Kelly.",
         "",
-        "AUTONOMY-2 `jev_shadow` is MiroFish annotate-only. It is not a bar bulk backtester. Jev did not run these bars. Numbers below are a Python causal replay of `kernel_predictor_v16e` with Etherion risk gates.",
+        "Nimble 2 is annotate-only (it replaced the retired AUTONOMY-2 shadow). It is not a bar bulk backtester. Nimble 2 did not run these bars. Numbers below are a Python causal replay of `kernel_predictor_v16e` with Etherion risk gates.",
         "",
         "This is not the TradingView SuperTrend test. SuperTrend Pine stays `//@version=6` (no bump): Desktop `tv-pine-profiler-2026-09-29/GROK-SuperTrend-Strategy-paper.pine`, `recommendations/SUPERTREND-STRATEGY-PAPER.pine`, and the accel-ornith twin.",
         "",
@@ -394,7 +394,7 @@ def render_md(doc):
         "",
         "## Fences",
         "",
-        "No orders. No `--live`. No venue sends. No `create_order`. No Kelly. Etherion did not supply a direction. Jev did not run bars.",
+        "No orders. No `--live`. No venue sends. No `create_order`. No Kelly. Etherion did not supply a direction. Nimble 2 did not run bars.",
         "",
         f"Label: {doc['label']}",
         "",
@@ -426,7 +426,7 @@ def main(argv):
         "name": "UGFT-KERNEL-ETHERION-BACKTEST",
         "label": "PAPER/fee-true/not-live",
         "generated_at": now,
-        "jev": "AUTONOMY-2 jev_shadow is MiroFish annotate-only. Not a bar bulk backtester. Jev did not run these bars.",
+        "nimble2": "Nimble 2 is annotate-only (replaced the retired AUTONOMY-2 shadow). Not a bar bulk backtester. Nimble 2 did not run these bars.",
         "alpha": "kernel_predictor_v16e.KernelPredictor",
         "gates": [
             "QEIDrawdownGuard",
@@ -454,7 +454,7 @@ def main(argv):
             "Kelly",
             "Etherion-as-alpha",
             "SuperTrend-only TV",
-            "Jev bar replay",
+            "Nimble 2 bar replay",
         ],
         "assets": assets,
     }

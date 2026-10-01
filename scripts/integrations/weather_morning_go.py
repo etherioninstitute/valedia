@@ -10,7 +10,7 @@ Flow:
   4) morning_scan with live FV lookup (refuse create on no_fv)
   5) If live enabled + preflight PASS, weather_live.admit may send on
      NWS-settled official alerts only (TWC API path stays shadow without key;
-     oil always fenced; Jev shadow-only)
+     oil always fenced; Nimble 2 annotate-only)
   6) Always write WEATHER-MORNING-DIAGNOSIS.md explaining admits=0 or blockers
 
 Best-of-free settle: NWS CLI / climate (CLIxxx in rules). Research tags never alone-pass create.
