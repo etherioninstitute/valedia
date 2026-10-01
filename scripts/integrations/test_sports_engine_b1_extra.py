@@ -86,7 +86,7 @@ def test_run_gate_blocks_execution():
         _patch(se, 'scan_games', lambda: [_game()], patches)
         _patch(se.ftl, 'should_trade_category',
                lambda cat: (False, "VERIFIED recent loss"), patches)
-        _patch(se, 'execute_bets', lambda bets, dry_run: execute_calls.append(1) or [], patches)
+        _patch(se, 'execute_bets', lambda bets, dry_run, **k: execute_calls.append(1) or [], patches)
         _patch(se, 'load_log', lambda: {"bets": [], "stats": {}}, patches)
         _patch(se, 'save_log', lambda l: None, patches)
 
@@ -110,7 +110,7 @@ def test_run_gate_fail_open_on_exception():
         def _raise(cat):
             raise RuntimeError("ledger unavailable")
         _patch(se.ftl, 'should_trade_category', _raise, patches)
-        _patch(se, 'execute_bets', lambda bets, dry_run: execute_calls.append(1) or [], patches)
+        _patch(se, 'execute_bets', lambda bets, dry_run, **k: execute_calls.append(1) or [], patches)
         _patch(se, 'load_log', lambda: {"bets": [], "stats": {}}, patches)
         _patch(se, 'save_log', lambda l: None, patches)
 
@@ -139,7 +139,7 @@ def test_run_persists_only_executed_with_fee():
         _patch(se, 'scan_games', lambda: [_game()], patches)
         _patch(se.ftl, 'should_trade_category', lambda cat: (True, "ok"), patches)
         results = [_result('EXECUTED', 'T1'), _result('DRY_RUN', 'T2'), _result('SKIP_HELD', 'T3')]
-        _patch(se, 'execute_bets', lambda bets, dry_run: results, patches)
+        _patch(se, 'execute_bets', lambda bets, dry_run, **k: results, patches)
         _patch(se, 'load_log', lambda: {"bets": [], "stats": {}}, patches)
         _patch(se, 'save_log', lambda l: saved.setdefault('log', l), patches)
 
