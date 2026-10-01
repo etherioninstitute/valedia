@@ -170,7 +170,8 @@ def run():
     assert set(rep["baseline"]["by_source"]) == {"live", "backfill"}
     code, out, _ = _run_main(["--baseline", pa, "--candidate", pa, "--ledger", mixed,
                               "--live-only", "--min-n", "2", "--n-boot", "50"])
-    assert json.loads(out)["ledger_stats"]["eligible"] == 2 and code in (0, 1)
+    r = json.loads(out)
+    assert r["ledger_stats"]["eligible"] == 2 and code == 2 and r["warnings"], (code, r)
 
     # 9. Malformed rows skipped, not crashing.
     rows = (_pair("m1", "X", True, 0) + [
@@ -198,7 +199,7 @@ def run():
     trades, _ = G.build_trades(G.load_ledger(_book(rows, "edge.jsonl"))[0])
     pol = G.load_policy(dict(TAKE_ALL, name="e", min_edge=0.05, size_mult={"X": 2}))
     rep, _ = G.replay(trades, pol)
-    assert rep["n_taken"] == 1 and abs(rep["net"] - 2 * (5.0 - kalshi_fee(0.5, 10))) < 1e-6, rep
+    assert rep["n_taken"] == 1 and abs(rep["net"] - (2 * 5.0 - kalshi_fee(0.5, 20))) < 1e-6, rep
     code, _, err = _run_main(["--baseline", pa, "--candidate", "/nonexistent.json",
                               "--ledger", thin])
     assert code == 3 and "input error" in err
@@ -207,6 +208,58 @@ def run():
     before = hashlib.sha256(open(gb, "rb").read()).hexdigest()
     G.run_gate(gb, pa, pc, n_boot=20)
     assert hashlib.sha256(open(gb, "rb").read()).hexdigest() == before
+
+    # 12. Hard floor: --min-n can raise the sample bar but never lower it below 30.
+    rows, i = [], 0
+    for k in range(23):  # candidate (no BAD) takes 23 winners-heavy rows: PASS-worthy if thin were OK
+        rows += _pair(f"g{k}", "GOOD", k % 4 != 0, i); i += 1
+        rows += _pair(f"b{k}", "BAD", k % 4 == 0, i); i += 1
+    thin23 = _book(rows, "thin23.jsonl")
+    code, out, err = _run_main(["--baseline", pa, "--candidate", pc, "--ledger", thin23,
+                                "--min-n", "1", "--n-boot", "200"])
+    r = json.loads(out)
+    assert code == 2 and r["verdict"] == "INSUFFICIENT_DATA", (code, r["reasons"])
+    assert r["thresholds"]["min_n"] == G.HARD_MIN_N == 30 and r["thresholds"]["min_n_requested"] == 1
+    assert r["warnings"] and "WARN" in err
+    assert G.evaluate([], G.load_policy(TAKE_ALL), G.load_policy(TAKE_ALL), min_n=0)["verdict"] \
+        == "INSUFFICIENT_DATA"                                   # pure API clamps too
+    code, out, _ = _run_main(["--baseline", pa, "--candidate", pc, "--ledger", gb,
+                              "--min-n", "50", "--n-boot", "100"])   # raising is honoured
+    assert code == 2 and json.loads(out)["thresholds"]["min_n"] == 50
+
+    # 13. size_mult recomputes the per-order ceil fee instead of scaling it.
+    rows = _pair("s1", "X", True, 0, price=0.5, qty=1) + _pair("s2", "Y", True, 1, price=0.5, qty=10)
+    t1, t2 = G.build_trades(G.load_ledger(_book(rows, "scale.jsonl"))[0])[0]
+    assert t1["fee"] == 0.02 and t1["fee_kind"] == "kalshi"
+    n_half, f_half = G.scaled(t1, 0.5)                           # C=0.5: raw 0.00875 -> 0.01
+    assert abs(f_half - 0.01) < 1e-12 and abs(n_half - (0.25 - 0.01)) < 1e-9, (n_half, f_half)
+    n_q, f_q = G.scaled(t1, 0.25)                                # raw 0.004375 -> 0.01, not 0.005
+    assert abs(f_q - 0.01) < 1e-12 and abs(n_q - (0.125 - 0.01)) < 1e-9, (n_q, f_q)
+    n_2, f_2 = G.scaled(t2, 2.0)                                 # C=20: 0.35, not 2*0.18
+    assert abs(f_2 - 0.35) < 1e-12 and abs(n_2 - (10.0 - 0.35)) < 1e-9, (n_2, f_2)
+    rep, _ = G.replay([t1, t2], G.load_policy(dict(TAKE_ALL, size_mult={"X": 0.25, "Y": 2})))
+    assert abs(rep["net"] - (n_q + n_2)) < 1e-6 and abs(rep["fees"] - 0.36) < 1e-6, rep
+    bound = {"type": "settlement", "entry_id": "bb", "realized_pnl_net": -0.77, "cost": 0.77,
+             "won": False, "fee": None, "fee_status": "unverified_source", "result": "no"}
+    fm = G.fee_model({}, bound)
+    tb = {"net": fm["net"], "fee": fm["fee"], "gross": fm["gross"], "fee_kind": fm["kind"],
+          "price": fm["price"], "qty": fm["qty"]}
+    nb, fb = G.scaled(tb, 0.5)                                   # bound path scales linearly
+    assert tb["fee_kind"] == "linear" and abs(fb - 0.5 * 0.07 * 0.77) < 1e-12, fb
+    assert abs(nb - 0.5 * (-0.77 - 0.07 * 0.77)) < 1e-9, nb
+
+    # 14. A recorded 0.0 fee (maker fill) is respected, not replaced by a modeled taker fee.
+    em = dict(_entry("mk", "X", 0.5, 10, "2026-09-01T00:00:00Z"), entry_fee=0.0)
+    sm = {"type": "settlement", "entry_id": "mk", "strategy": "X", "result": "exit",
+          "realized_pnl_net": 8.25, "won": True, "source": "live"}   # no exit fee key
+    net, fee, basis = G.fee_true_net(em, sm)
+    assert (net, fee, basis) == (8.25, 0.0, "recorded_entry"), (net, fee, basis)
+    tm = G.build_trades([em, sm])[0][0]
+    assert tm["fee_kind"] == "zero" and G.scaled(tm, 2.0) == (16.5, 0.0)
+    net, fee, basis = G.fee_true_net(em, dict(sm, fee=0.0, result="yes"))
+    assert (net, fee, basis) == (8.25, 0.0, "recorded")
+    net, fee, basis = G.fee_true_net(em, dict(sm, fee_status="unverified_source"))
+    assert basis == "modeled" and abs(net - (8.25 - kalshi_fee(0.5, 10))) < 1e-9  # flagged -> modeled
 
     print("test_backtest_gate: all checks passed")
 
