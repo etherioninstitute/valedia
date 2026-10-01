@@ -197,9 +197,9 @@ def run():
             + _pair("e2", "X", True, 1, price=0.5, prob=0.52)   # edge +0.02
             + _pair("e3", "X", True, 2, price=0.5))             # no prob -> unknown
     trades, _ = G.build_trades(G.load_ledger(_book(rows, "edge.jsonl"))[0])
-    pol = G.load_policy(dict(TAKE_ALL, name="e", min_edge=0.05, size_mult={"X": 2}))
+    pol = G.load_policy(dict(TAKE_ALL, name="e", min_edge=0.05, size_mult={"X": 0.5}))
     rep, _ = G.replay(trades, pol)
-    assert rep["n_taken"] == 1 and abs(rep["net"] - (2 * 5.0 - kalshi_fee(0.5, 20))) < 1e-6, rep
+    assert rep["n_taken"] == 1 and abs(rep["net"] - (0.5 * 5.0 - kalshi_fee(0.5, 5))) < 1e-6, rep
     code, _, err = _run_main(["--baseline", pa, "--candidate", "/nonexistent.json",
                               "--ledger", thin])
     assert code == 3 and "input error" in err
@@ -235,10 +235,10 @@ def run():
     assert abs(f_half - 0.01) < 1e-12 and abs(n_half - (0.25 - 0.01)) < 1e-9, (n_half, f_half)
     n_q, f_q = G.scaled(t1, 0.25)                                # raw 0.004375 -> 0.01, not 0.005
     assert abs(f_q - 0.01) < 1e-12 and abs(n_q - (0.125 - 0.01)) < 1e-9, (n_q, f_q)
-    n_2, f_2 = G.scaled(t2, 2.0)                                 # C=20: 0.35, not 2*0.18
-    assert abs(f_2 - 0.35) < 1e-12 and abs(n_2 - (10.0 - 0.35)) < 1e-9, (n_2, f_2)
-    rep, _ = G.replay([t1, t2], G.load_policy(dict(TAKE_ALL, size_mult={"X": 0.25, "Y": 2})))
-    assert abs(rep["net"] - (n_q + n_2)) < 1e-6 and abs(rep["fees"] - 0.36) < 1e-6, rep
+    n_3, f_3 = G.scaled(t2, 0.75)                                # C=7.5: 0.14, not 0.75*0.18
+    assert abs(f_3 - 0.14) < 1e-12 and abs(n_3 - (3.75 - 0.14)) < 1e-9, (n_3, f_3)
+    rep, _ = G.replay([t1, t2], G.load_policy(dict(TAKE_ALL, size_mult={"X": 0.25, "Y": 0.75})))
+    assert abs(rep["net"] - (n_q + n_3)) < 1e-6 and abs(rep["fees"] - 0.15) < 1e-6, rep
     bound = {"type": "settlement", "entry_id": "bb", "realized_pnl_net": -0.77, "cost": 0.77,
              "won": False, "fee": None, "fee_status": "unverified_source", "result": "no"}
     fm = G.fee_model({}, bound)
@@ -255,11 +255,46 @@ def run():
     net, fee, basis = G.fee_true_net(em, sm)
     assert (net, fee, basis) == (8.25, 0.0, "recorded_entry"), (net, fee, basis)
     tm = G.build_trades([em, sm])[0][0]
-    assert tm["fee_kind"] == "zero" and G.scaled(tm, 2.0) == (16.5, 0.0)
+    assert tm["fee_kind"] == "zero" and G.scaled(tm, 0.5) == (4.125, 0.0)
     net, fee, basis = G.fee_true_net(em, dict(sm, fee=0.0, result="yes"))
     assert (net, fee, basis) == (8.25, 0.0, "recorded")
     net, fee, basis = G.fee_true_net(em, dict(sm, fee_status="unverified_source"))
     assert basis == "modeled" and abs(net - (8.25 - kalshi_fee(0.5, 10))) < 1e-9  # flagged -> modeled
+
+    # 15. size_mult bounded to [0.25, 1.0]: shrink only; near-zero/zero/upsize rejected.
+    assert (G.SIZE_MULT_MIN, G.SIZE_MULT_MAX) == (0.25, 1.0)
+    for bad_m in (1e-9, 0, 0.0, -1, 2.0, 1.01, 0.2499, float("nan"), "0.5", True):
+        try:
+            G.load_policy(dict(TAKE_ALL, size_mult={"X": bad_m}))
+            raise AssertionError("size_mult accepted: " + repr(bad_m))
+        except ValueError as ex:
+            assert "categories_block" in str(ex), ex                 # points at the right tool
+    for ok_m in (0.25, 0.5, 0.75, 1.0, 1):
+        assert G.load_policy(dict(TAKE_ALL, size_mult={"X": ok_m}))["size_mult"]["X"] == ok_m
+    # Verifier repro: baseline allow A (10 trades) vs candidate taking B at a ~0 multiplier
+    # used to score n_taken=60 and PASS. Now rejected (exit 3); the legal floor can't PASS.
+    rows, i = [], 0
+    for k in range(10):
+        rows += _pair(f"a{k}", "A", True, i); i += 1
+    for k in range(50):
+        rows += _pair(f"bb{k}", "B", k % 3 == 0, i); i += 1
+    repro = _book(rows, "repro.jsonl")
+    p_allow = _policy_file(dict(TAKE_ALL, name="allow_a", categories_allow=["A"]), "allow_a.json")
+    p_tiny = _policy_file(dict(TAKE_ALL, name="tiny_b", size_mult={"B": 1e-9}), "tiny_b.json")
+    code, out, err = _run_main(["--baseline", p_allow, "--candidate", p_tiny, "--ledger", repro,
+                                "--n-boot", "200"])
+    assert code == 3 and out == "" and "categories_block" in err, (code, err)
+    try:  # API bypass attempt: an unvalidated dict handed straight to evaluate()
+        G.evaluate(G.build_trades(G.load_ledger(repro)[0])[0], G.load_policy(TAKE_ALL),
+                   dict(G.load_policy(TAKE_ALL), size_mult={"B": 1e-9}))
+        raise AssertionError("evaluate accepted an unvalidated tiny size_mult")
+    except ValueError:
+        pass
+    p_min = _policy_file(dict(TAKE_ALL, name="min_b", size_mult={"B": 0.25}), "min_b.json")
+    code, out, _ = _run_main(["--baseline", p_allow, "--candidate", p_min, "--ledger", repro,
+                              "--n-boot", "200"])
+    r = json.loads(out)
+    assert code != 0 and r["verdict"] != "PASS" and r["candidate"]["n_taken"] == 60, (code, r)
 
     print("test_backtest_gate: all checks passed")
 

@@ -10,7 +10,10 @@ no network, no orders, no keys.
 
 Policy JSON (unknown keys are rejected so a typo can't silently pass the gate):
   {"name": str, "min_edge": float|null, "categories_allow": [..]|null,
-   "categories_block": [..], "size_mult": {"CAT": float}}
+   "categories_block": [..], "size_mult": {"CAT": float in [0.25, 1.0]}}
+size_mult may only SHRINK exposure (SIZE_MULT_MIN..SIZE_MULT_MAX); to drop a category use
+categories_block. Upsizing above 1x belongs to Kelly / the dynamic cap, not this gate —
+and a near-zero multiplier would let a policy count trades it barely takes toward min_n.
 Categories are canonicalised with forward_test_ledger.canonical_category.
 
 Fees: a settlement's realized_pnl_net is taken as net when the ledger recorded the
@@ -41,6 +44,7 @@ from forward_test_ledger import canonical_category, _is_non_real_source, kalshi_
 DEFAULT_LEDGER = os.path.join(os.path.dirname(os.path.dirname(HERE)),
                               "models", "forward_test_ledger.jsonl")
 HARD_MIN_N = 30  # floor: --min-n may raise it, never lower it (thin sample is never PASS)
+SIZE_MULT_MIN, SIZE_MULT_MAX = 0.25, 1.0  # policies may shrink a category, never upsize/zero it
 DEFAULTS = {"min_n": HARD_MIN_N, "max_p_worse": 0.35, "max_dd_worse": 0.20,
             "n_boot": 2000, "seed": 7}
 POLICY_KEYS = {"name", "min_edge", "categories_allow", "categories_block", "size_mult",
@@ -89,9 +93,11 @@ def load_policy(obj):
         raise ValueError("policy.size_mult must be an object")
     mult = {}
     for k, v in size.items():
-        m = _num(v)
-        if m is None or m < 0:
-            raise ValueError(f"policy.size_mult[{k!r}] must be a finite number >= 0")
+        m = _num(v) if isinstance(v, (int, float)) else None  # JSON number only
+        if m is None or not SIZE_MULT_MIN <= m <= SIZE_MULT_MAX:
+            raise ValueError(
+                f"policy.size_mult[{k!r}]={v!r} must be in [{SIZE_MULT_MIN}, {SIZE_MULT_MAX}]; "
+                "to remove a category use categories_block (sizing above 1x is Kelly's job)")
         mult[canonical_category(k)] = m
     return {"name": name,
             "min_edge": None if min_edge is None else float(min_edge),
@@ -370,7 +376,9 @@ def evaluate(trades, baseline, candidate, min_n=DEFAULTS["min_n"],
              max_p_worse=DEFAULTS["max_p_worse"], max_dd_worse=DEFAULTS["max_dd_worse"],
              n_boot=DEFAULTS["n_boot"], seed=DEFAULTS["seed"]):
     """Pure gate: trades + two normalised policies -> report dict with verdict.
-    min_n below HARD_MIN_N is clamped up to HARD_MIN_N (with a warning), never honoured."""
+    min_n below HARD_MIN_N is clamped up to HARD_MIN_N (with a warning), never honoured.
+    Policies are re-validated (load_policy is idempotent) so the API can't skip bounds."""
+    baseline, candidate = load_policy(baseline), load_policy(candidate)
     warnings, requested = [], min_n
     if min_n < HARD_MIN_N:
         min_n = HARD_MIN_N
