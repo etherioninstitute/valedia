@@ -48,16 +48,8 @@ CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
 # ═══ INTELLIGENCE SOURCES ═══
 # These were all sitting idle. Now they boost every bet.
 
-def get_mirofish_bias():
-    """Swarm mood only when the live file is fresh and not near-neutral."""
-    try:
-        import mirofish_intel_archive as _mia
-        mf = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json"))
-        if not mf:
-            return 50
-        return mf.get("overall_bias", 50)
-    except Exception:
-        return 50
+# MiroFish: sports_evidence.mirofish_evidence (informed_facts, load_for_fv freshness)
+# puts team/series facts on the evidence record and the Nimble verdict. Facts only.
 
 def get_ere_regime():
     """Read ERE v2.0 regime — are markets calm or turbulent?"""
@@ -486,7 +478,7 @@ def run(dry_run=False):
                      f"edge:{b.get('edge_score',0):+d} [{reasons}] "
                      f"| {b['fav_title'][:30]}")
     
-    lines.append(f"\nTOTAL: ${total_cost:.2f} deployed, ${total_potential:.2f} potential profit")
+    lines.append(f"\nTOTAL: ${total_cost:.2f} sized, ${total_potential:.2f} if-win payout (modeled, not profit)")
     lines.append(f"BET SIZE: {optimal_pct*100:.1f}% of bankroll (dynamic cap, fund 4% max)")
     
     # Loss-based category gate (real fee-inclusive ledger; fail-open, never permanent).
@@ -535,11 +527,13 @@ def run(dry_run=False):
         log["skips"] = log["skips"][-SKIP_LOG_MAX:]
     save_log(log)
     
-    # Signal: money invested (only for real executions)
+    # Signal Invested (real executions only): ledger fills+fees, verified; mismatch -> withheld.
     if executed and not dry_run:
-        total_cost = sum(r['cost'] for r in executed)
-        from signal_send import send
-        send(f"Invested: {total_cost:.2f} on {len(executed)} games")
+        try:
+            import signal_verify
+            lines.append("SIGNAL: " + signal_verify.invested_ping(executed)["status"])
+        except Exception as e:
+            print(f"[sports_engine] Invested ping failed: {e}", file=sys.stderr)
     
     report = "\n".join(lines)
     print(report)

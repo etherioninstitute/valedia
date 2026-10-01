@@ -58,6 +58,10 @@ class Config:
     decision_timeout_s: float = 10.0  # hard cap per decision; exceeding it = skip
     warmup_timeout_s: float = 120.0  # cold load of the 9B model
     decision_latency_budget_ms: float = 500.0
+    # Nimble failure containment (backoff.py / recheck.py); 0 turns each part off
+    engine_retry_blocks: int = 10  # after an engine error, blocks to wait before re-asking that pool
+    engine_breaker_errors: int = 3  # consecutive engine errors that open the circuit breaker
+    engine_cooldown_s: float = 30.0  # breaker open time: no engine calls, pools logged engine_cooldown
 
 
 def _parse(env: Mapping[str, str], key: str, cast, default, errors: list,
@@ -186,6 +190,9 @@ def parse_config(env: Mapping[str, str]) -> Config:
                                 lo=0, lo_excl=True),
         decision_latency_budget_ms=_parse(env, "DECISION_LATENCY_BUDGET_MS", float, 500.0,
                                           errors, lo=0, lo_excl=True),
+        engine_retry_blocks=_parse(env, "ENGINE_RETRY_BLOCKS", int, 10, errors, lo=0),
+        engine_breaker_errors=_parse(env, "ENGINE_BREAKER_ERRORS", int, 3, errors, lo=0),
+        engine_cooldown_s=_parse(env, "ENGINE_COOLDOWN_S", float, 30.0, errors, lo=0),
     )
     eng = cfg.decision_engine
     if eng and eng != "stub" and not re.match(r"^[\w.]+:\w+$", eng):

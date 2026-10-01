@@ -1,7 +1,8 @@
-"""Portfolio Monitor — Checks ALL platforms and reports via Signal.
-Runs on cron. Reports balance, positions, and opportunities across
-every connected platform: Mercury, Alpaca, Kraken, OKX, Coinbase,
-Kalshi, Polymarket.
+"""Portfolio Monitor — 3pm EOD broker snapshot. LOG ONLY: prints to the cron log
+(cron_runner_mac.sh never sends to Signal); not a Signal sender.
+Reports broker balances/positions for Mercury, Alpaca, Kraken, OKX. Every figure is
+a live broker read stamped with its read time; position P&L is UNREALIZED; missing
+fields print "n/a" (never a guessed number).
 """
 import os, sys, json, urllib.request
 from datetime import datetime, timezone
@@ -25,10 +26,10 @@ def check_alpaca():
         req.add_header("APCA-API-KEY-ID", key)
         req.add_header("APCA-API-SECRET-KEY", secret)
         data = json.loads(urllib.request.urlopen(req, timeout=10).read())
-        equity = data.get("equity", "?")
-        cash = data.get("cash", "?")
-        bp = data.get("buying_power", "?")
-        status = data.get("status", "?")
+        equity = data.get("equity", "n/a")
+        cash = data.get("cash", "n/a")
+        bp = data.get("buying_power", "n/a")
+        status = data.get("status", "n/a")
         req2 = urllib.request.Request(f"{base}/v2/positions")
         req2.add_header("APCA-API-KEY-ID", key)
         req2.add_header("APCA-API-SECRET-KEY", secret)
@@ -36,11 +37,13 @@ def check_alpaca():
         pos_str = f"{len(positions)} positions"
         if positions:
             pos_str += ": " + ", ".join(
-                f"{p['symbol']} {p['qty']}@${p.get('current_price','?')} (P&L:${p.get('unrealized_pl','?')})"
+                f"{p['symbol']} {p['qty']}@${p.get('current_price','n/a')} "
+                f"(unrealized P&L:${p.get('unrealized_pl','n/a')})"
                 for p in positions[:5]
             )
         mode = "PAPER" if paper else "LIVE"
-        return f"Alpaca ({mode}): ${equity} equity | ${cash} cash | ${bp} buying power | {pos_str} | Status: {status}"
+        return (f"Alpaca ({mode}, broker): ${equity} equity | ${cash} cash | ${bp} buying power | "
+                f"{pos_str} | Status: {status}")
     except Exception as e:
         return f"Alpaca: [API ERROR] {e}"
 
@@ -73,13 +76,13 @@ def check_okx():
 
 def main():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"PORTFOLIO STATUS ({now})", ""]
+    lines = [f"PORTFOLIO STATUS ({now}) [broker reads, log only — not sent to Signal]", ""]
     lines.append(check_mercury())
     lines.append(check_alpaca())
     lines.append(check_kraken())
     lines.append(check_okx())
     lines.append("")
-    lines.append("All platforms checked. Will report again at next scheduled scan.")
+    lines.append("All platforms checked (errors shown inline). Next run: next scheduled scan.")
     return "\n".join(lines)
 
 if __name__ == "__main__":

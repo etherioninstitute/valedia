@@ -21,6 +21,7 @@ import os, sys, json, time, traceback
 from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nimble_wiring as _nw  # Nimble 2 prediction wiring (lazy heavy imports; never raises)
+import allocator_paths as _ap  # scanner / spot execute routing (both flags default OFF)
 # Single sources (this is the LIVE authority — it MUST use them, not its own copies).
 try:
     import forward_test_ledger as _ftl                      # real fee-inclusive ledger
@@ -449,6 +450,7 @@ def execute_allocations(allocations, dry_run=False):
         r = {"ticker": a["ticker"], "platform": a["platform"],
              "type": a["type"], "allocation": a["allocation"],
              "expected_profit": a.get("expected_profit", 0)}
+        kpath = _ap.kalshi_path(a["platform"])  # kalshi_scanner only if VALEDIA_SCANNER_EXECUTE
 
         plat = str(a.get("platform") or "").lower()
         if plat in ("polymarket_us", "poly_us", "polymarket") or a.get("mode") == "DRY/SHADOW":
@@ -489,14 +491,14 @@ def execute_allocations(allocations, dry_run=False):
             continue
         
         # ── FAIL-SAFE: Skip blacklisted tickers (failed 3+ times) ──
-        if a["platform"] in ("kalshi", "kalshi_weather") and _is_kalshi_blacklisted(a["ticker"]):
+        if kpath and _is_kalshi_blacklisted(a["ticker"]):
             r["status"] = "SKIP_BLACKLISTED"
             r["error"] = "Failed 3+ times previously"
             results.append(r)
             continue
 
         # ── Loss-based category gate (real fee-inclusive ledger; fail-open, never permanent) ──
-        if _ftl and a["platform"] in ("kalshi", "kalshi_weather"):
+        if _ftl and kpath:
             try:
                 ok, why = _ftl.should_trade_category(a.get("type", ""))
             except Exception:
@@ -507,7 +509,7 @@ def execute_allocations(allocations, dry_run=False):
         
         # ── FAIL-SAFE: Intel vetting gate ──
         # If we can't verify the trade through the intelligence layer, SKIP it
-        if a["platform"] in ("kalshi", "kalshi_weather"):
+        if kpath:
             try:
                 from intel_layer import get_intel
                 intel = get_intel()
@@ -536,7 +538,7 @@ def execute_allocations(allocations, dry_run=False):
                 continue
         
         try:
-            if a["platform"] in ("kalshi", "kalshi_weather"):
+            if kpath:
                 from kalshi_auth import create_order, get_positions, get_fills
                 # FAIL-SAFE: Check we don't already hold this ticker
                 existing = get_positions().get("market_positions", [])
@@ -661,23 +663,9 @@ def execute_allocations(allocations, dry_run=False):
                     r["shadow_dispatchable"] = bool(sh.get("dispatchable"))
                 except Exception as e:
                     r["shadow_error"] = str(e)[:80]
-                # Crypto trades via Coinbase (existing Valedia writer — do not cut over)
-                try:
-                    from coinbase_trader import place_market_order
-                    ticker = a["ticker"].replace("-USD", "")
-                    cb_resp = place_market_order(ticker, a["side"], a["allocation"])
-                    raw = cb_resp if isinstance(cb_resp, dict) else {}
-                    r["status"] = spot_fill_status("coinbase", raw)
-                    if _ftl:
-                        try:
-                            _ftl.book_spot_fill(
-                                a.get("type", "CRYPTO"), a["ticker"], a["side"],
-                                "coinbase", raw, intended_source="live")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    r["status"] = "FAILED"
-                    r["error"] = str(e)[:80]
+                # Crypto buy via the real Valedia writer (coinbase_trader.market_buy), fill-true.
+                _ap.spot_execute(a, "coinbase", r, cfg=_cfg, fill_status=spot_fill_status,
+                                 book=_ftl.book_spot_fill if _ftl else None)
             
             elif a["platform"] == "alpaca":
                 if _cfg and _cfg.venue_writer("alpaca") != "valedia":
@@ -685,30 +673,16 @@ def execute_allocations(allocations, dry_run=False):
                     r["error"] = "alpaca writer not valedia (Kalshi-only stage)"
                     results.append(r)
                     continue
-                # Stock trades via Alpaca (existing Valedia writer)
-                try:
-                    from alpaca_executor import place_order
-                    alp_resp = place_order(a["ticker"], a["side"], notional=a["allocation"])
-                    raw = alp_resp if isinstance(alp_resp, dict) else {}
-                    r["status"] = spot_fill_status("alpaca", raw)
-                    if _ftl:
-                        try:
-                            _ftl.book_spot_fill(
-                                a.get("type", "EQUITY"), a["ticker"], a["side"],
-                                "alpaca", raw, intended_source="live")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    r["status"] = "FAILED"
-                    r["error"] = str(e)[:80]
-            else:
-                r["status"] = "SKIP"
-                r["error"] = f"Unknown platform: {a['platform']}"
+                # Stock buy via alpaca_executor.market_buy (ALPACA_PAPER honored), fill-true.
+                _ap.spot_execute(a, "alpaca", r, cfg=_cfg, fill_status=spot_fill_status,
+                                 book=_ftl.book_spot_fill if _ftl else None)
+            else:  # kalshi_scanner with VALEDIA_SCANNER_EXECUTE off, or unknown
+                r["status"], r["error"] = _ap.skip_unrouted(a["platform"])
         except Exception as e:
             r["status"] = "FAILED"
             r["error"] = str(e)[:80]
             # SELF-HEAL: Track Kalshi failures for auto-blacklisting
-            if a["platform"] in ("kalshi", "kalshi_weather"):
+            if kpath:
                 _record_kalshi_failure(a["ticker"], str(e))
         results.append(r)
     return results
@@ -716,7 +690,7 @@ def execute_allocations(allocations, dry_run=False):
 def spot_fill_status(venue, raw, ftl_mod=None):
     """EXECUTED only when extract_spot_fill.complete. POST-ack → UNRECONCILED.
 
-    Missing writer (place_market_order / place_order) stays FAILED at the caller.
+    A venue rejection or writer exception stays FAILED at the caller.
     """
     mod = ftl_mod if ftl_mod is not None else _ftl
     if not mod:
@@ -834,6 +808,7 @@ def run(dry_run=False, max_allocs=15):
         icon = ("✅" if st == "EXECUTED"
                 else "⏳" if st == "UNRECONCILED"
                 else "🔶" if st == "DRY_RUN"
+                else "📝" if str(st).startswith("PAPER_")  # Alpaca paper account: non-live
                 else "⏭" if str(st).startswith("SKIP")
                 else "❌")
         lines.append(

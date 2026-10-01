@@ -503,8 +503,8 @@ Respond in under 500 words."""
         return f"Local audit failed: {e}"
 
 def simple_pnl_message(summary):
-    """The daily P&L message Burton gets: simple + informative + 100% real (broker-sourced).
-    Shows what's invested (deployed) and realized settled P&L — no modeled/EV numbers."""
+    """LOG-ONLY (not Signal; Signal uses signal_verify.pnl_report). net_pnl is a
+    heuristic broker-derived figure (no fees; profit guessed from exposure), not FTL."""
     s = summary or {}
     net = s.get("net_pnl", 0.0)
     inv = s.get("current_deployed", 0.0)
@@ -513,9 +513,9 @@ def simple_pnl_message(summary):
     d = datetime.now(timezone.utc).astimezone().strftime("%b %-d")
     icon = "🟢" if net >= 0 else "🔴"
     lines = [
-        f"💰 Valedia P&L — {d}",
-        f"Invested: ${inv:,.2f} deployed · ${cash:,.2f} cash",
-        f"{icon} Kalshi broker P&L: ${net:+,.2f}  (pnl_tracker.json, not FTL)",
+        f"💰 Valedia P&L (log only) — {d}",
+        f"Broker market value: ${inv:,.2f} · ${cash:,.2f} cash",
+        f"{icon} Kalshi broker-derived P&L (heuristic, no fees): ${net:+,.2f}  (pnl_tracker.json, not FTL)",
     ]
     if w + l > 0:
         lines.append(f"Settled record: {w}W / {l}L ({s.get('win_rate', 0):.0f}% win)")
@@ -533,7 +533,7 @@ def run():
     summary, new = track_kalshi_pnl()
     
     lines.append(f"Win Rate: {summary['win_rate']}% ({summary['wins']}W / {summary['losses']}L)")
-    lines.append(f"Net P&L: ${summary['net_pnl']:+.2f}")
+    lines.append(f"Net P&L (broker-derived heuristic, not fee-true/FTL): ${summary['net_pnl']:+.2f}")
     lines.append(f"Total Won: ${summary['total_won']:.2f} | Lost: ${summary['total_lost']:.2f}")
     lines.append(f"Balance: ${summary['current_balance']:.2f} cash + ${summary['current_deployed']:.2f} deployed")
     
