@@ -90,6 +90,7 @@ def recent_buy_orders(symbol, since_iso, get=None):
                 continue
             out.append({"order_id": o.get("id"), "client_order_id": o.get("client_order_id"),
                         "status": st, "filled_qty": o.get("filled_qty"),
+                        "created_time": o.get("submitted_at") or o.get("created_at"),
                         "filled_avg_price": o.get("filled_avg_price"),
                         "notional": o.get("notional")})
         return out
