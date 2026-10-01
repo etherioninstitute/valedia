@@ -399,3 +399,28 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
                    footer=[f"ledger {real['rows']} settled rows", hhmm(now)],
                    send_fn=send_fn, now=now, dedupe_window_s=7 * 86400,
                    dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
+
+
+# ── ops alerts (no figures): text-only, money numbers stripped ──────────────
+MONEY_RE = re.compile(r"[+-]?\$\s*\d[\d,]*(?:\.\d+)?|(?<![\w.])[+-]?\d[\d,]*\.\d{2}(?![.\d])")
+
+
+def strip_money(text):
+    """Replace anything that looks like a money figure with '[figure withheld]'.
+    Returns (clean_text, n_stripped). Ops alerts carry no verified money numbers."""
+    clean, n = MONEY_RE.subn("[figure withheld]", str(text or ""))
+    return clean, n
+
+
+def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0):
+    """Ops/health alert (watchdog etc.): text only, money figures stripped + labelled,
+    logged to verify_log. Never raises. dedupe_window_s=0 -> every alert is sent."""
+    try:
+        clean, n = strip_money(body)
+        notes = [f"{n} money figure(s) removed; ops alerts carry no verified money numbers"] if n else []
+        return deliver(kind, clean, notes=notes, footer=["ops alert, no money figures"],
+                       send_fn=send_fn, now=now, dedupe_key=dedupe_key or clean,
+                       dedupe_window_s=dedupe_window_s, info={"stripped": n})
+    except Exception as e:
+        print(f"[signal_verify] {kind}: ops_alert error {type(e).__name__}: {e}", file=sys.stderr)
+        return {"kind": kind, "status": "error", "sent": False, "text": ""}

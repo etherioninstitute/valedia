@@ -1,6 +1,6 @@
 """Narrow weather create. Dead unless weather_live_enabled().
 
-Oil tickers never pass. Jev is not read. The allocator still returns
+Oil tickers never pass. No model output is read (Nimble 2 notes are annotate-only). The allocator still returns
 SKIP_LIVE_FENCE from session_clocks. This function is the only weather send.
 
 NWS CLI final/observation alerts are mapped onto INFORMED keys here.
@@ -151,7 +151,6 @@ def admit(order, post=None):
     _order, raw = _parts(order)
     bridged = nws_informed(order)
     info = ibc.informed_from_opp(bridged if bridged else raw)
-    info.pop("jev", None)
     side = order.get("side") or info.get("side") or "yes"
     if bridged:
         count = bridged["count"]
