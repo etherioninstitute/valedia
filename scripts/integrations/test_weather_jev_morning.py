@@ -33,13 +33,51 @@ def _read(name):
     return open(os.path.join(FIX, name)).read()
 
 
+class _twc_env:
+    """Pin the env that weather_lookup.resolve_source reads for TWC + CLIxxx rules.
+
+    free=True : default free stack, no TWC key -> NWS CLI report settles.
+    free=False: free-settle off and a placeholder key (never sent anywhere; the
+                resolver only checks it is non-empty) -> Weather Company route.
+    """
+    _KEYS = ("WEATHER_SETTLE_FREE", "WEATHER_COM_API_KEY")
+
+    def __init__(self, free):
+        self.free = free
+
+    def __enter__(self):
+        self._saved = {k: os.environ.get(k) for k in self._KEYS}
+        os.environ.pop("WEATHER_SETTLE_FREE", None)
+        os.environ.pop("WEATHER_COM_API_KEY", None)
+        if not self.free:
+            os.environ["WEATHER_SETTLE_FREE"] = "0"
+            os.environ["WEATHER_COM_API_KEY"] = "test-placeholder-not-a-key"
+
+    def __exit__(self, *exc):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
 def test_twc_daily_and_nws_still_nws():
-    fam, met, why = wl.resolve_source(
-        "kalshi", "KXHIGHMIA-26SEP24", "settles on The Weather Company CLIMIA daily high")
-    assert fam == "weather_com" and met == "maximum" and why is None
-    fam, met, why = wl.resolve_source(
-        "kalshi", "KXLOWTLV-26SEP24", "The Weather Channel CLILAS daily low")
-    assert fam == "weather_com" and met == "minimum" and why is None
+    # Free stack (weather_lookup.resolve_source): rules that name TWC *and* a CLIxxx
+    # climate product settle on the NWS CLI report by default (WEATHER_SETTLE_FREE=1).
+    # The Weather Company route is taken only when free-settle is off and a key exists.
+    twc_rules = [
+        ("KXHIGHMIA-26SEP24", "settles on The Weather Company CLIMIA daily high", "maximum"),
+        ("KXLOWTLV-26SEP24", "The Weather Channel CLILAS daily low", "minimum"),
+    ]
+    with _twc_env(free=True):
+        for tkr, rules, want in twc_rules:
+            fam, met, why = wl.resolve_source("kalshi", tkr, rules)
+            assert fam == "nws_cli" and met == want and why is None, (tkr, fam, met, why)
+    with _twc_env(free=False):
+        for tkr, rules, want in twc_rules:
+            fam, met, why = wl.resolve_source("kalshi", tkr, rules)
+            assert fam == "weather_com" and met == want and why is None, (tkr, fam, met, why)
     fam, met, why = wl.resolve_source(
         "kalshi", "KXHIGHNY-26SEP24", "weather.com / Weather Company observation")
     assert fam == "weather_com" and met == "maximum" and why is None
@@ -71,13 +109,14 @@ def test_daily_observation_and_cross_check():
     forecast = weather_com.parse(_json_daily(), DAY)
     assert forecast["settlement_fv"] is None
     assert forecast["research_tag"]["forecast_or_observation"] == "forecast"
-    got = wl.lookup(
-        "kalshi", "KXHIGHNY-26SEP23-T72", observe_date=DAY, rules=TWC_RULES,
-        fixtures={
-            "wx_json": payload,
-            "cli_html": _read("nws_cli_nyc_2026-09-23.html"),
-            "raw_fixture_ref": "nws_cli_nyc_2026-09-23.html",
-        })
+    with _twc_env(free=False):  # TWC-settled path; NWS CLI stays the cross-check
+        got = wl.lookup(
+            "kalshi", "KXHIGHNY-26SEP23-T72", observe_date=DAY, rules=TWC_RULES,
+            fixtures={
+                "wx_json": payload,
+                "cli_html": _read("nws_cli_nyc_2026-09-23.html"),
+                "raw_fixture_ref": "nws_cli_nyc_2026-09-23.html",
+            })
     assert got["settlement_fv"]["source"] == "weather_com"
     assert got["settlement_fv"]["value"] == 88
     assert got["informed_pass"] is False and got["create_order"] is False
@@ -97,7 +136,9 @@ def test_stations_tz_and_ltt_will_be():
     assert mia["wfo"] == "MFL" and mia["issuedby"] == "MIA" and mia["cli_product"] == "CLIMIA"
     assert las["wfo"] == "VEF" and las["issuedby"] == "LAS"
     assert tlv["issuedby"] == "LAS" and tlv["cli_product"] == "CLILAS"
-    assert nws_cli.station_for(city="CHI") is None
+    # CHI is a mapped station now (Midway, LOT/MDW); unmapped cities still None.
+    assert nws_cli.station_for(city="CHI")["issuedby"] == "MDW"
+    assert nws_cli.station_for(city="ORD") is None
     assert ws.CITY_TZ["LAS"] == "America/Los_Angeles"
     assert ws.CITY_TZ["TLV"] == "America/Los_Angeles"
     assert ws.CITY_TZ["MIA"] == "America/New_York"
@@ -146,7 +187,12 @@ def test_lottery_and_late_on_create_only():
 def test_jev_cannot_pass_and_morning_alert(tmp):
     assert jev.annotate_weather({"ticker": "KXHIGHNY", "create_order": False, "fv": 0.2})["fv"] == 0.2
     prev = os.environ.get("VALEDIA_JEV")
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
     os.environ["VALEDIA_JEV"] = "1"
+    # annotate_weather fails closed (no_key) before calling `post` when no TypeSafe
+    # key is set. Use the placeholder convention of test_jev_shadow.py; `post` is
+    # stubbed below so nothing leaves the process, and the real env is restored.
+    os.environ["TYPESAFE_API_KEY"] = "test-key"
     try:
         def boom(*_a, **_k):
             raise TimeoutError("slow")
@@ -175,6 +221,10 @@ def test_jev_cannot_pass_and_morning_alert(tmp):
             os.environ.pop("VALEDIA_JEV", None)
         else:
             os.environ["VALEDIA_JEV"] = prev
+        if prev_key is None:
+            os.environ.pop("TYPESAFE_API_KEY", None)
+        else:
+            os.environ["TYPESAFE_API_KEY"] = prev_key
     fmap = {"KXHIGHNY": {
         "series_ticker": "KXHIGHNY", "status": "ok",
         "maker_multiplier": 0.0, "taker_multiplier": 1.0, "maker_viable": True,

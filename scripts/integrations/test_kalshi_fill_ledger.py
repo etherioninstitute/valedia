@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import types
+from datetime import datetime, timedelta, timezone
 
 import forward_test_ledger as ftl
 import sports_engine as se
@@ -32,6 +33,35 @@ def _restore(orig, path):
         os.remove(path)
     except OSError:
         pass
+
+
+def _admitted_sports_opp():
+    """Fields that let a Kalshi sports allocation clear the create-time gates.
+
+    master_allocator.execute_allocations now runs two gates before create_order:
+    session_clocks.before_create (needs status + open/close schedule and a known
+    resolve) and informed_before_create.create_preflight (needs attestation,
+    fee-map row, fair value, edge, spread, depth, bankroll). These tests guard
+    fill-truth (EXECUTED only on a confirmed fill), so the opp must be admitted
+    for real and reach the POST. Session times are relative to now.
+    """
+    import kalshi_fee_map as kfm
+    now = datetime.now(timezone.utc)
+    return {
+        "market": {
+            "status": "active",
+            "open_time": (now - timedelta(hours=1)).isoformat(),
+            "close_time": (now + timedelta(hours=8)).isoformat(),
+            "expected_expiration_time": (now + timedelta(hours=5)).isoformat(),
+            "can_close_early": True,
+            "early_close_condition": "game end",
+        },
+        "sports_attestation": True,
+        "fmap": {"ALLOC": kfm._row("ALLOC", 0.0, 0.0, "sports")},
+        "fv": 0.90, "fv_source": "model", "fv_confidence": True,
+        "edge": 0.10, "slip": 0.0, "bid": 0.79, "ask": 0.80,
+        "depth": 20, "bankroll": 10000,
+    }
 
 
 def _ack(oid="ack-1"):
@@ -195,6 +225,7 @@ def run():
             "platform": "kalshi", "type": "SPORTS_TONIGHT", "ticker": "ALLOC-ACK",
             "title": "t", "side": "yes", "price": 0.80, "allocation": 4.0,
             "expected_profit": 0.5, "hours_to_resolve": 6, "raw": {},
+            **_admitted_sports_opp(),
         }
         try:
             n0, o0 = ftl.real_track_record()["n"], ftl.open_position_count()
@@ -255,7 +286,11 @@ def run():
     assert 'strategy = "SPORTS_TONIGHT"' not in ke_src
     assert 'strategy = "SPORTS"' in ke_src
     assert 'or "backfill" in s' in ftl_src
-    assert 'CATEGORY_ALIASES = {"SPORTS_TONIGHT": "SPORTS"}' in ftl_src
+    # CATEGORY_ALIASES grew past one line (Polymarket buckets); the SPORTS_TONIGHT
+    # -> SPORTS fold is what this slice guards.
+    assert '"SPORTS_TONIGHT": "SPORTS"' in ftl_src
+    assert ftl.CATEGORY_ALIASES["SPORTS_TONIGHT"] == "SPORTS"
+    assert ftl.canonical_category("SPORTS_TONIGHT") == "SPORTS"
     trader_src = open(os.path.join(HERE, "coinbase_trader.py")).read()
     assert "def place_market_order" not in trader_src
     print("kalshi-fill-ledger Slice 6 checks: PASS")

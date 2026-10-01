@@ -258,12 +258,13 @@ def test_cli_tick_dead_ornith():
     log = os.path.join(d, "tick-check-log.json")
     out = os.path.join(d, "equity.json")
     decisions = os.path.join(d, "decisions.jsonl")
-    rc = cpr.main([
-        "--tick", "--no-qwen", "--fixture", BARS, "--rules", RULES,
-        "--safety-log", log, "--out", out, "--decision-log", decisions,
-        "--ornith-url", "http://127.0.0.1:9/v1/chat/completions",
-        "--ornith-timeout", "2",
-    ])
+    with _stub_litellm_key():
+        rc = cpr.main([
+            "--tick", "--no-qwen", "--fixture", BARS, "--rules", RULES,
+            "--safety-log", log, "--out", out, "--decision-log", decisions,
+            "--ornith-url", "http://127.0.0.1:9/v1/chat/completions",
+            "--ornith-timeout", "2",
+        ])
     assert rc == 0
     row = json.load(open(log))["trades"][-1]
     assert row["tick"] is True and row["reason"] == "ornith_down" and row["pass"] is False
@@ -282,16 +283,32 @@ def test_cli_tick_dead_ornith():
     assert logged[0]["side"] == "buy"
 
 
+class _stub_litellm_key:
+    """_http_post now fails closed (ornith_auth) before the wire when no LiteLLM
+    key is configured. The dead-endpoint CLI tests guard the *connection refused*
+    -> ornith_down path, so they need a key to get that far. Placeholder only: it
+    is sent to 127.0.0.1:9 (nothing listens) and never read from disk or env."""
+
+    def __enter__(self):
+        self._orig = safety._litellm_key
+        safety._litellm_key = lambda: "test-placeholder-not-a-key"
+
+    def __exit__(self, *exc):
+        safety._litellm_key = self._orig
+        return False
+
+
 def test_cli_dead_ornith():
     d = tempfile.mkdtemp(prefix="ce1_cli_")
     log = os.path.join(d, "safety-check-log.json")
     out = os.path.join(d, "equity.json")
-    rc = cpr.main([
-        "--safety", "--fixture", BARS, "--rules", RULES,
-        "--safety-log", log, "--out", out,
-        "--ornith-url", "http://127.0.0.1:9/v1/chat/completions",
-        "--ornith-timeout", "2",
-    ])
+    with _stub_litellm_key():
+        rc = cpr.main([
+            "--safety", "--fixture", BARS, "--rules", RULES,
+            "--safety-log", log, "--out", out,
+            "--ornith-url", "http://127.0.0.1:9/v1/chat/completions",
+            "--ornith-timeout", "2",
+        ])
     assert rc == 0
     row = json.load(open(log))["trades"][-1]
     assert row["reason"] == "ornith_down" and row["pass"] is False
