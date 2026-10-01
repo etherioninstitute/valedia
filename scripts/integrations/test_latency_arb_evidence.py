@@ -18,8 +18,14 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ["OPENCLAW_SKIP_ENV"] = "1"
+for _k in list(os.environ):
+    if _k.startswith("VALEDIA_NIMBLE") or _k.startswith("VALEDIA_SYSTEMONE"):
+        os.environ.pop(_k)
+os.environ["VALEDIA_SYSTEMONE_LOG"] = os.path.join(tempfile.mkdtemp(prefix="arbnim_"), "d.jsonl")
 
 import latency_arb as la
+import latency_arb_evidence as lae
+import nimble_wiring as nw
 import kalshi_auth
 import kalshi_profit as kp
 import session_clocks as sc
@@ -236,11 +242,56 @@ def test_each_stage_failure_is_a_skip_not_an_order():
         assert la.execute_arb(bad, dry_run=False)["status"] == "SKIP_EVIDENCE" and orders == []
 
 
+def test_nimble_shadow_stamps_and_allows():
+    with sandbox(pre=admit_pre, before=lambda opp, now=None: None) as (orders, d):
+        r = la.execute_arb(contract(), dry_run=False)
+        assert r["status"] == "EXECUTED" and len(orders) == 1
+        nv = r["nimble"]
+        assert nv["mode"] == "shadow" and nv["allow"] is True, nv  # stamp only, never blocks
+
+
+def test_nimble_veto_skips_and_is_last_gate_only_for_admitted():
+    calls = []
+    orig = nw.gate
+
+    def veto(opp, informed=None, **kw):
+        calls.append((opp, informed, kw))
+        return {"allow": False, "mode": "veto", "reason": "veto_model_skip"}
+
+    nw.gate = veto
+    try:
+        with sandbox(pre=admit_pre, before=lambda opp, now=None: None) as (orders, d):
+            r = la.execute_arb(contract(), dry_run=False)
+            assert r["status"] == "SKIP_NIMBLE" and r["error"] == "nimble:veto_model_skip"
+            assert orders == [] and r["nimble"]["allow"] is False
+            assert len(calls) == 1 and calls[0][2]["source"] == "latency_arb"
+            assert calls[0][1]["fv_source"] == "distance_heuristic"  # informed dict from preflight
+            st = state_of(d)
+            assert st is None or st.get("daily_trades", 0) == 0
+        # never asked for a candidate the code gates refused (real gates refuse this one)
+        calls.clear()
+        with sandbox() as (orders, d):
+            assert la.execute_arb(contract(), dry_run=False)["status"].startswith("SKIP_")
+            assert calls == [] and orders == []
+        # nor in dry-run
+        with sandbox() as (orders, d):
+            assert la.execute_arb(contract(), dry_run=True)["status"] == "DRY_RUN"
+            assert calls == []
+    finally:
+        nw.gate = orig
+
+
 def test_hygiene():
     src = open(os.path.join(HERE, "latency_arb.py")).read()
+    ev = open(os.path.join(HERE, "latency_arb_evidence.py")).read()
+    assert len(src.splitlines()) <= 620
     assert "informed=pre[\"informed\"]" in src
-    assert "ibc.ALLOWED_FV" not in src and "ALLOWED_FV" not in src.split("def build_arb_evidence")[1][:200]
-    assert 'fv_source": "model"' not in src and "fv_source='model'" not in src
+    assert la.build_arb_evidence is lae.build_arb_evidence and la.arb_pre_create is lae.arb_pre_create
+    assert "ALLOWED_FV" not in ev.split("def build_arb_evidence")[1].split("def arb_pre_create")[0]
+    assert 'fv_source": "model"' not in ev and "fv_source='model'" not in ev
+    # the Nimble gate is the last step in the chain, after create_preflight
+    chain = ev.split("def arb_pre_create")[1]
+    assert chain.index("create_preflight") < chain.index("nimble_wiring")
     arb_run = open(os.path.join(HERE, "arb_run.py")).read()
     assert "dry-run" in arb_run and "execute" not in arb_run.replace("Switch to --mode execute", "")
 
