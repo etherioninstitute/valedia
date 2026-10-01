@@ -2,10 +2,11 @@
 """Nimble 9B System One shadow client. Loopback Ollama only. Fail-open.
 
 VALEDIA_SYSTEMONE=1 turns the movers scan onto POST /v1/systemone.
-Default off. Model pin is nimble (nimble:9b / nimble:latest). Tev1,
-including Tev1-0.8B, is refused. Code still owns the fee-true label
-and the would-have size. This module never places an order.
-A down server returns a stub and the scan continues.
+Default off. Model pin is Nimble 2 (Bespoke-Nimble-9B-v2, 8192 ctx).
+Nimble v1 tags and Tev1, including Tev1-0.8B, are refused and never
+posted. Code still owns the fee-true label and the would-have size.
+This module never places an order. A down server returns a stub and
+the scan continues.
 """
 from __future__ import annotations
 
@@ -17,8 +18,15 @@ import urllib.request
 
 HOST = "127.0.0.1"
 PORT = 11434
-MODEL_DEFAULT = "nimble"
-ALLOWED_MODELS = frozenset({"nimble", "nimble:9b", "nimble:latest"})
+# Nimble 2 = Hugging Face bespokelabs/Bespoke-Nimble-9B-v2 (release
+# Bespoke-Nimble-9B-v2, 8192 ctx). The exact Ollama tag is NOT verified here:
+# confirm it on Burton's Mac with `ollama list` and set VALEDIA_SYSTEMONE_MODEL
+# if it differs from this default.
+MODEL_DEFAULT = "nimble2"
+HF_ID = "hf.co/bespokelabs/bespoke-nimble-9b-v2"
+# Nimble 2 only. v1 tags (nimble, nimble:9b, nimble:latest) are not here.
+_V2_EXACT = frozenset({"nimble2", "nimble:9b-v2", "nimble:v2", HF_ID})
+_V2_PREFIX = ("nimble2:", "nimble:2", HF_ID + ":")
 DECIDE_URL = "http://127.0.0.1:11434/v1/systemone"
 VERSION_URL = "http://127.0.0.1:11434/api/version"
 TAGS_URL = "http://127.0.0.1:11434/api/tags"
@@ -80,14 +88,18 @@ def enabled():
     return os.environ.get("VALEDIA_SYSTEMONE") == "1"
 
 
+def is_nimble2(name):
+    """True for a Nimble 2 tag only (case-insensitive). Never v1, never Tev."""
+    low = str(name or "").strip().lower()
+    if not low or "0.8" in low or low.startswith("tev"):
+        return False
+    return low in _V2_EXACT or low.startswith(_V2_PREFIX)
+
+
 def model_pin():
-    """Nimble only. Empty string means the caller must not POST."""
-    raw = os.environ.get("VALEDIA_SYSTEMONE_MODEL", MODEL_DEFAULT).strip().lower()
-    if not raw or "0.8" in raw or raw.startswith("tev"):
-        return ""
-    if raw not in ALLOWED_MODELS:
-        return ""
-    return raw
+    """Nimble 2 only. Empty string means the caller must not POST."""
+    raw = os.environ.get("VALEDIA_SYSTEMONE_MODEL", MODEL_DEFAULT).strip()
+    return raw if is_nimble2(raw) else ""
 
 
 def load_informed():
@@ -133,7 +145,7 @@ def _flags(row, informed):
             if "finnhub" in text or "news" in text:
                 news = True
                 break
-    label = row.get("laya")
+    label = row.get("label")
     watch = label == "watch" or _venue(row) in ("weather_watch", "oil_blocked")
     return {
         "mirofish": sym in sigs,
@@ -231,12 +243,7 @@ def _get(url, timeout):
 
 
 def _response_model_ok(body, pin):
-    got = str((body or {}).get("model") or pin).strip().lower()
-    if "0.8" in got or got.startswith("tev"):
-        return False
-    if got in ALLOWED_MODELS or got.startswith("nimble"):
-        return True
-    return False
+    return is_nimble2((body or {}).get("model") or pin)
 
 
 def decide(state, post=None, timeout=None):
@@ -305,7 +312,7 @@ def health(get=None, timeout=3.0):
             "error": type(e).__name__,
             "version": None,
             "model_present": False,
-            "model": MODEL_DEFAULT,
+            "model": model_pin() or None,
             "mode": "shadow",
             "enforcement": "none",
         }
@@ -315,14 +322,17 @@ def health(get=None, timeout=3.0):
         for row in tags_body.get("models") or []:
             if isinstance(row, dict) and row.get("name"):
                 names.append(str(row["name"]))
-    present = any(n == "nimble" or n.startswith("nimble:") for n in names)
+    pin = model_pin().lower()
+    # Ollama lists an untagged pull as <name>:latest.
+    want = {pin, pin + ":latest"} if pin and ":" not in pin.rsplit("/", 1)[-1] else {pin}
+    present = bool(pin) and any(n.lower() in want for n in names)
     ready = _version_ok(version) and present
     return {
         "ok": ready,
         "error": None if ready else ("version" if not _version_ok(version) else "model_missing"),
         "version": version,
         "model_present": present,
-        "model": MODEL_DEFAULT,
+        "model": model_pin() or None,
         "mode": "shadow",
         "enforcement": "none",
     }
@@ -338,7 +348,7 @@ def summary(ranked, informed=None):
             "mode": "shadow",
             "enforcement": "none",
             "create_order": False,
-            "model": MODEL_DEFAULT,
+            "model": model_pin() or None,
             "judge": "dont_trade",
             "informed_mirofish": False,
         }
