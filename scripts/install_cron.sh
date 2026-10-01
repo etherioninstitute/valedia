@@ -75,6 +75,10 @@ PATH=/usr/local/bin:/opt/homebrew/bin:/Users/burtonchatelain/.npm-global/bin:/us
 # --- Weekly ---
 0 17 * * 0 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh dca_module.py "DCA" 2>&1
 0 12 * * 5 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh rebalancer.py "REBALANCE" 2>&1
+# Self-evolve weekly: policy-lab proposals only (offline, no LLM/network; writes recommendations/proposals/ + labs
+# under ~/.openclaw/state/policy_lab; never live config, crontab, models/ or orders). Sun 4:50 AM PT; :50 dodges
+# every other job (allocator is 04:20). Runner cds to scripts/integrations, hence the relative path.
+50 4 * * 0 /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh ../self_evolve/weekly_run.py "SELF-EVOLVE WEEKLY" 2>&1
 CRON
 
 crontab /tmp/clean_cron && echo "Cron jobs installed" && crontab -l | grep -c "cron_runner_mac" && echo "total Valedia jobs"

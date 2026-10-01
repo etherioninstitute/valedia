@@ -1,11 +1,11 @@
 ---
 description: >
-  Complete cron schedule for Valedia. 27 jobs on Mac Studio. Cron fields are the
+  Complete cron schedule for Valedia. 28 jobs on Mac Studio. Cron fields are the
   Mac's LOCAL clock (America/Los_Angeles, PT); UTC shown in parentheses (PDT, UTC-7).
   Source of truth is scripts/install_cron.sh; scripts/test_cron_schedule.py enforces this doc matches it.
 ---
 
-# cron-schedule (27 jobs)
+# cron-schedule (28 jobs)
 
 **Timezone.** The Mac clock is PT. Every `Schedule` column below is the literal crontab
 field (Mac-local PT). The parenthesised UTC is for PDT (UTC-7, Mar-Nov); during PST (UTC-8)
@@ -68,6 +68,7 @@ unless the Script column is a `.sh` (those are invoked directly).
 |----------|---------------|-----|--------|---------|
 | `0 17 * * 0` | Sun 5:00 PM PT (00:00 UTC +1d) | DCA | dca_module.py | Weekly DCA module |
 | `0 12 * * 5` | Fri 12:00 PM PT (19:00 UTC) | REBALANCE | rebalancer.py | Weekly rebalance |
+| `50 4 * * 0` | Sun 4:50 AM PT (11:50 UTC) | SELF-EVOLVE WEEKLY | ../self_evolve/weekly_run.py | Policy-lab proposals per category (offline, no LLM/network). Writes `recommendations/proposals/SELF-EVOLVE-<date>.md/.json` + labs in `~/.openclaw/state/policy_lab/<date>/`. PROPOSALS ONLY: never live config, crontab, models/ or orders; Burton approves. Exit 0 even when nothing qualifies |
 
 ## Removed (deprecated, not installed)
 
