@@ -79,19 +79,20 @@ def test_shadow_cannot_say_filled():
 
 
 def test_unreconciled_cannot_say_realized_pnl():
+    # Only fee_true_settlements (UNRECONCILED excluded) reach this formatter, and
+    # signal_verify re-reads the ledger before send -> "Realized (ledger, fee-incl.)".
     msg = sr.format_settled_signal(-1.25, 0, 1, -12.5, "0W/4L")
     assert msg.startswith("Profit:"), msg
-    assert "realized" not in msg.lower(), msg
-    assert "FTL fee-true" in msg, msg
+    assert "Realized (ledger, fee-incl.)" in msg, msg
     arb = sr.format_arb_signal({"net_pnl": 2.0, "wins": 1, "losses": 0})
-    assert arb.startswith("Profit:"), arb
+    assert not arb.startswith("Profit:"), arb  # arb-log is never a Profit ping
     assert "realized" not in arb.lower()
-    assert "not FTL" in arb
+    assert "not FTL" in arb and "not sent" in arb
     pnl = pt.simple_pnl_message({"net_pnl": 1.0, "current_deployed": 2.0,
                                  "current_balance": 3.0, "wins": 1, "losses": 0,
                                  "win_rate": 100})
     assert "Realized P&L" not in pnl, pnl
-    assert "not FTL" in pnl, pnl
+    assert "not FTL" in pnl and "log only" in pnl, pnl
 
 
 def test_brain_acked_not_executed_fill():

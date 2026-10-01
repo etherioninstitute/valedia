@@ -9,7 +9,9 @@ check_settlements, and size_bets regression edges (edge==-10 boundary, MAX_GAMES
 No network — every I/O boundary (create_order, get_positions, get, get_balance,
 signal_send.send, ftl.record_entry/should_trade_category) is monkeypatched.
 """
-import sys, types
+import os, sys, tempfile, types
+# signal_verify logs (verify/sent/dedupe) go to a throwaway dir, never data/signal.
+os.environ["VALEDIA_SIGNAL_DIR"] = tempfile.mkdtemp(prefix="sig_b1_")
 import sports_engine as se
 import forward_test_ledger as ftl
 import kalshi_auth
