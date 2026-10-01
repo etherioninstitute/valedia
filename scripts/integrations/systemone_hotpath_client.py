@@ -4,7 +4,10 @@
 VALEDIA_SYSTEMONE=1 turns the movers scan onto POST /v1/systemone.
 Default off. Model pin is Nimble 2 (Bespoke-Nimble-9B-v2, 8192 ctx).
 Nimble v1 tags and Tev1, including Tev1-0.8B, are refused and never
-posted. Code still owns the fee-true label and the would-have size.
+posted. Burton's Nimble 2 is the Ollama tag `nimble:latest` (digest
+24e550a16a70, confirmed 2026-10-01). A floating `latest` tag can change on
+the next pull, so `nimble:latest` and bare `nimble` are accepted ONLY while
+/api/tags shows a digest starting with NIMBLE2_DIGEST (digest pin). Code still owns the fee-true label and the would-have size.
 This module never places an order. A down server returns a stub and
 the scan continues.
 
@@ -27,12 +30,19 @@ from systemone_log import budget_ms, finite_tree, log_decision, log_path  # noqa
 HOST = "127.0.0.1"
 PORT = 11434
 # Nimble 2 = Hugging Face bespokelabs/Bespoke-Nimble-9B-v2 (release
-# Bespoke-Nimble-9B-v2, 8192 ctx). The exact Ollama tag is NOT verified here:
-# confirm it on Burton's Mac with `ollama list` and set VALEDIA_SYSTEMONE_MODEL
-# if it differs from this default.
-MODEL_DEFAULT = "nimble2"
-# Nimble 2 only. Full-match, case-insensitive, explicit forms. v1 tags
-# (nimble, nimble:9b, nimble:latest) match nothing here.
+# Bespoke-Nimble-9B-v2, 8192 ctx). On Burton's Mac it is the Ollama tag
+# `nimble:latest`, digest 24e550a16a70 (`ollama list`: 9.5 GB; Burton
+# confirmed 2026-10-01). Override the tag with VALEDIA_SYSTEMONE_MODEL.
+MODEL_DEFAULT = "nimble:latest"
+# Digest pin for the floating tag. `ollama list` shows the first 12 hex chars
+# of the sha256 that /api/tags returns in models[].digest. Env override for a
+# deliberate re-pin: VALEDIA_SYSTEMONE_DIGEST (hex prefix, at least 12 chars).
+NIMBLE2_DIGEST = "24e550a16a70"
+DIGEST_ENV = "VALEDIA_SYSTEMONE_DIGEST"
+DIGEST_RETRY_S = 30.0  # a failed digest check is not retried inside this window
+# Explicit Nimble 2 names only. Full-match, case-insensitive. The floating
+# tags (nimble, nimble:latest) are NOT here: they pass only via the digest pin.
+# v1 tags (nimble:9b, nimble:1, ...) match nothing and stay refused.
 _TAG = r"[a-z0-9][a-z0-9._-]*"
 _QUANT = r"(?:q\d[a-z0-9_]*|iq\d[a-z0-9_]*|fp16|fp32|bf16|f16|f32|int4|int8)"
 _V2_RE = re.compile(
@@ -42,6 +52,7 @@ _V2_RE = re.compile(
     # and hosts have no provenance here, so they are refused.
     r"|(?:(?:hf\.co/)?bespokelabs/)?bespoke-nimble-9b-v2(?::" + _TAG + r")?"
 )
+_FLOATING = ("nimble", "nimble:latest")  # Ollama resolves bare `nimble` to :latest
 _V2_BANNED = ("v1", "tev", "0.8")
 DECIDE_URL = "http://127.0.0.1:11434/v1/systemone"
 VERSION_URL = "http://127.0.0.1:11434/api/version"
@@ -50,6 +61,9 @@ ALLOWED_URLS = frozenset({DECIDE_URL, VERSION_URL, TAGS_URL})
 TIMEOUT_S = 120.0  # ponytail: cold 9B load; warm calls are far under this
 KEEP_ALIVE = "10m"
 _WARM = False  # a successful call this process: the model is resident
+# Digest verification of a floating tag, cached per process:
+# {"key": (tag, prefix), "status": "ok"|"digest_mismatch"|"digest_unverified", "ts": t}
+_DIGEST = {"key": None, "status": None, "ts": 0.0}
 
 # Same three judgments as packs/valedia-paper-v1. Stamp only. No numbers and
 # no comparisons live here: the state carries code-computed `facts` booleans
@@ -116,17 +130,125 @@ def enabled():
 
 
 def is_nimble2(name):
-    """True for a Nimble 2 tag only (case-insensitive). Never v1, never Tev."""
+    """True for an EXPLICIT Nimble 2 tag only (case-insensitive). Never v1, never Tev.
+
+    Stateless. The floating `nimble:latest` / `nimble` are False here: they
+    pass only through the digest pin (is_floating_nimble + verify_digest).
+    """
     low = str(name or "").strip().lower()
     if not low or any(bad in low for bad in _V2_BANNED):
         return False
     return _V2_RE.fullmatch(low) is not None
 
 
+def is_floating_nimble(name):
+    """True for `nimble:latest` or bare `nimble` (the digest-pinned candidates)."""
+    return str(name or "").strip().lower() in _FLOATING
+
+
+def digest_prefix():
+    """Pinned digest hex prefix (env VALEDIA_SYSTEMONE_DIGEST). "" if unusable."""
+    raw = os.environ.get(DIGEST_ENV, NIMBLE2_DIGEST).strip().lower()
+    if raw.startswith("sha256:"):
+        raw = raw[7:]
+    return raw if re.fullmatch(r"[0-9a-f]{12,64}", raw) else ""
+
+
+def _raw_model():
+    return os.environ.get("VALEDIA_SYSTEMONE_MODEL", MODEL_DEFAULT).strip()
+
+
+def configured_model():
+    """The configured tag if it could be Nimble 2 (explicit v2 or floating). Else ""."""
+    raw = _raw_model()
+    return raw if is_nimble2(raw) or is_floating_nimble(raw) else ""
+
+
+def _digest_key(raw):
+    return ("nimble:latest", digest_prefix()) if is_floating_nimble(raw) else None
+
+
+def _digest_from_tags(tags_body):
+    """Compare the local digest of nimble:latest with the pin. Pure."""
+    prefix = digest_prefix()
+    if not prefix or not isinstance(tags_body, dict):
+        return "digest_unverified"
+    rows = [r for r in (tags_body.get("models") or []) if isinstance(r, dict)
+            and "nimble:latest" in (str(r.get("name") or "").strip().lower(),
+                                    str(r.get("model") or "").strip().lower())]
+    digs = [str(r.get("digest") or "").strip().lower() for r in rows]
+    digs = [d[7:] if d.startswith("sha256:") else d for d in digs]
+    digs = [d for d in digs if d]
+    if not digs:
+        return "digest_unverified"
+    return "ok" if any(d.startswith(prefix) for d in digs) else "digest_mismatch"
+
+
+def _digest_set(raw, status):
+    _DIGEST.update(key=_digest_key(raw), status=status, ts=time.monotonic())
+    return status
+
+
+def _reset_digest():
+    _DIGEST.update(key=None, status=None, ts=0.0)
+
+
+def digest_status(raw=None):
+    """Cached status for the configured floating tag: ok / digest_mismatch / digest_unverified.
+
+    None for an explicit v2 tag (no digest needed). Reads the cache only.
+    """
+    raw = _raw_model() if raw is None else raw
+    key = _digest_key(raw)
+    if key is None:
+        return None
+    return _DIGEST["status"] if _DIGEST["key"] == key and _DIGEST["status"] else "digest_unverified"
+
+
+def verify_digest(get=None, timeout=3.0, force=False):
+    """Verify the floating tag's digest via GET /api/tags. Cached for this process.
+
+    ok is cached until the process restarts; a failure is cached for
+    DIGEST_RETRY_S so a scan does not hammer /api/tags. Never raises.
+    None for an explicit v2 tag.
+    """
+    raw = _raw_model()
+    key = _digest_key(raw)
+    if key is None:
+        return None
+    if not force and _DIGEST["key"] == key and _DIGEST["status"]:
+        if _DIGEST["status"] == "ok" or time.monotonic() - _DIGEST["ts"] < DIGEST_RETRY_S:
+            return _DIGEST["status"]
+    try:
+        body = (get or _get)(TAGS_URL, timeout)
+    except Exception:
+        return _digest_set(raw, "digest_unverified")
+    return _digest_set(raw, _digest_from_tags(body))
+
+
 def model_pin():
-    """Nimble 2 only. Empty string means the caller must not POST."""
-    raw = os.environ.get("VALEDIA_SYSTEMONE_MODEL", MODEL_DEFAULT).strip()
-    return raw if is_nimble2(raw) else ""
+    """Pin to POST, or "" (the caller must not POST). Never touches the network.
+
+    Explicit Nimble 2 passes as before. `nimble:latest` / `nimble` pass only if
+    this process already verified the digest (verify_digest / health / ask).
+    """
+    raw = _raw_model()
+    if is_nimble2(raw):
+        return raw
+    if is_floating_nimble(raw) and digest_status(raw) == "ok":
+        return raw
+    return ""
+
+
+def pin_refusal():
+    """Why model_pin() is empty: model_refused, digest_unverified, digest_mismatch."""
+    raw = _raw_model()
+    if is_nimble2(raw):
+        return None
+    if is_floating_nimble(raw):
+        status = digest_status(raw)
+        return None if status == "ok" else status
+    return "model_refused"
 
 
 def load_informed():
@@ -313,10 +435,15 @@ def _get(url, timeout):
 
 
 def _response_model_ok(body, pin):
-    return is_nimble2((body or {}).get("model") or pin)
+    got = (body or {}).get("model") or pin
+    if is_nimble2(got):
+        return True
+    # A floating answer name is fine only when the pin itself is the
+    # digest-verified floating tag; a v1 name never is.
+    return is_floating_nimble(got) and is_floating_nimble(pin) and model_pin() == pin
 
 
-def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=None):
+def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=None, get=None):
     """One loopback shadow call. Always logged. Never raises.
 
     Returns {pin, body, error, answers, cold, latency_ms, within_budget}.
@@ -324,12 +451,13 @@ def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=
     """
     global _WARM
     state = finite_tree(state)
+    verify_digest(get)  # no-op for an explicit v2 tag; cached once verified; never raises
     pin = model_pin()
     res = {"pin": pin or None, "body": None, "error": None, "answers": None, "cold": not _WARM}
     t0 = time.perf_counter()
     try:
         if not pin:
-            res["error"] = "model_refused"
+            res["error"] = pin_refusal() or "model_refused"
         else:
             body = (post or _post)(
                 DECIDE_URL,
@@ -356,21 +484,21 @@ def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=
     return res
 
 
-def warmup(post=None, timeout=None):
+def warmup(post=None, timeout=None, get=None):
     """One tiny call so the model is resident (keep_alive). Once per scan."""
     if not enabled():
         return None
     return ask({"symbol": "warmup", "create_order": False}, WARM_QUESTIONS,
-               source="warmup", post=post, timeout=timeout)
+               source="warmup", post=post, timeout=timeout, get=get)
 
 
-def decide(state, post=None, timeout=None, label=None, source="movers_scan"):
+def decide(state, post=None, timeout=None, label=None, source="movers_scan", get=None):
     """POST one shadow decide. Timeout, bad model, or a bad body → stub.
 
     label is the code's own fee-true label, logged beside the model's answer.
     """
     res = ask(state, QUESTIONS, source=source, label=label, post=post,
-              timeout=timeout, parse=_answers)
+              timeout=timeout, parse=_answers, get=get)
     ms = res["latency_ms"]
     if res["error"]:
         out = _stub(res["error"])
@@ -397,8 +525,13 @@ def decide(state, post=None, timeout=None, label=None, source="movers_scan"):
 
 
 def health(get=None, timeout=3.0):
-    """Version + tags only. Does not send a decide."""
+    """Version + tags only. Does not send a decide.
+
+    For the floating `nimble:latest` it also checks the digest pin against
+    /api/tags and caches the verdict for this process (digest field).
+    """
     fn = get or _get
+    raw = _raw_model()
     try:
         ver_body = fn(VERSION_URL, timeout)
         tags_body = fn(TAGS_URL, timeout)
@@ -408,7 +541,8 @@ def health(get=None, timeout=3.0):
             "error": type(e).__name__,
             "version": None,
             "model_present": False,
-            "model": model_pin() or None,
+            "model": configured_model() or None,
+            "digest": digest_status(raw),
             "mode": "shadow",
             "enforcement": "none",
         }
@@ -418,17 +552,32 @@ def health(get=None, timeout=3.0):
         for row in tags_body.get("models") or []:
             if isinstance(row, dict) and row.get("name"):
                 names.append(str(row["name"]))
-    pin = model_pin().lower()
+    pin = configured_model().lower()
     # Ollama lists an untagged pull as <name>:latest.
     want = {pin, pin + ":latest"} if pin and ":" not in pin.rsplit("/", 1)[-1] else {pin}
     present = bool(pin) and any(n.lower() in want for n in names)
-    ready = _version_ok(version) and present
+    digest = None
+    if present and is_floating_nimble(raw):
+        digest = _digest_set(raw, _digest_from_tags(tags_body))
+    elif is_floating_nimble(raw):
+        digest = digest_status(raw)
+    digest_ok = digest in (None, "ok")
+    ready = _version_ok(version) and present and digest_ok
+    if ready:
+        err = None
+    elif not _version_ok(version):
+        err = "version"
+    elif not present:
+        err = "model_missing"
+    else:
+        err = digest
     return {
         "ok": ready,
-        "error": None if ready else ("version" if not _version_ok(version) else "model_missing"),
+        "error": err,
         "version": version,
         "model_present": present,
-        "model": model_pin() or None,
+        "model": configured_model() or None,
+        "digest": digest,
         "mode": "shadow",
         "enforcement": "none",
     }
@@ -444,7 +593,7 @@ def summary(ranked, informed=None):
             "mode": "shadow",
             "enforcement": "none",
             "create_order": False,
-            "model": model_pin() or None,
+            "model": configured_model() or None,
             "judge": "dont_trade",
             "budget_ms": budget_ms(),
             "informed_mirofish": False,
@@ -465,7 +614,8 @@ def summary(ranked, informed=None):
         "mode": "shadow",
         "enforcement": "none",
         "create_order": False,
-        "model": model_pin() or None,
+        "model": configured_model() or None,
+        "digest": digest_status(),
         "judge": "dont_trade",
         "n_ok": len(ok),
         "n": len(rows),

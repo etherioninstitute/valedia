@@ -797,7 +797,7 @@ VENUE_WRITER = {
     "coinbase": "valedia",
     "alpaca": "valedia",
     "kraken": "none",
-    "polymarket": "valedia",  # Burton 2026-09-23 max-env widget; working tree only, not committed
+    "polymarket": "valedia",  # TODO(Burton): "valedia" was committed in snapshot a49cece although the old comment said working-tree only. Burton acknowledged 2026-10-01 and kept it. test_h8, test_session_clocks, test_controls_readout still assert "none"; revisit when Burton decides (flip back or update those asserts).
     "hyperliquid": "none",
 }
 
@@ -985,7 +985,7 @@ def controls_snapshot():
         ("VIBE_SHADOW_LIVE", _vb_live, "const", "vibe",
          "hard-off. Env cannot enable HKUDS broker connectors."),
         ("VIBE_BROKER_WRITE", False, "const", "vibe",
-         "place_order and create_order raise vibe_broker_write"),
+         "hard-off. Every HKUDS broker write path raises vibe_broker_write."),
         ("VIBE_SHADOW_TICK_AGE_S", _vb_tick.get("last_tick_age_s"), "file", "vibe",
          "seconds since last paper shadow decision; none if the log is empty"),
         ("VIBE_SHADOW_LAST_DECISION", _vb_tick.get("last_decision") or "none", "file",

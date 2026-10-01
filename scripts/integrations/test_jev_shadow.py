@@ -24,6 +24,22 @@ from mirofish_signal_extractor import process_mirofish_report
 import valedia_config as vc
 
 
+# Local Ollama is faked: Burton's `nimble:latest` digest (24e550a16a70...) matches the
+# pin, so the floating default tag passes. No real /api/tags call in unit tests.
+import systemone_hotpath_client as _s1_fake
+_DIGEST_FULL = "24e550a16a70" + "9" * 52
+
+
+def _use_digest(digest=_DIGEST_FULL):
+    _s1_fake._get = lambda url, timeout: (
+        {"models": [{"name": "nimble:latest", "digest": digest}]} if url.endswith("/api/tags")
+        else {"version": "0.35.0"})
+    _s1_fake._reset_digest()
+
+
+_use_digest()
+
+
 SIG = {
     "ts": "2026-09-20T00:00:00+00:00",
     "status": "active",
@@ -375,7 +391,7 @@ def test_nimble2_backend_routing_and_fail_open():
         url, payload, timeout = seen[0]
         import systemone_hotpath_client as s1
         assert url == s1.DECIDE_URL and url.startswith("http://127.0.0.1:11434/")
-        assert payload["model"] == "nimble2" and payload["keep_alive"] == s1.KEEP_ALIVE
+        assert payload["model"] == "nimble:latest" and payload["keep_alive"] == s1.KEEP_ALIVE
         assert set(payload["questions"]) == set(jev.QUESTIONS)
         assert payload["state"]["facts"]["directions_conflict"] is True
         assert timeout == jev._timeout()             # live-adjacent path keeps the short timeout
@@ -403,12 +419,12 @@ def test_nimble2_backend_routing_and_fail_open():
         for bad, err in ((lambda *a: (_ for _ in ()).throw(TimeoutError("t")), "TimeoutError"),
                          (lambda *a: ["junk"], "bad_response"),
                          (lambda *a: {"model": "nimble2"}, "no_answers"),
-                         (lambda *a: dict(LOCAL_OK, model="nimble"), "model_refused")):
+                         (lambda *a: dict(LOCAL_OK, model="nimble:9b"), "model_refused")):
             o = jev.annotate(SIG, post=_boom, local_post=bad)
             assert o["jev"]["fail_open"] is True and o["jev"]["error"] == err, err
             assert o["overall_bias"] == 58.5 and o["signals"]["ETH-USD"]["direction"] == "SELL"
         # Pin refusal: v1 and Tev pins are never posted.
-        for pin in ("nimble", "nimble:9b", "nimble:latest", "tev1:4b", "tev1:0.8b"):
+        for pin in ("nimble:9b", "nimble:1", "tev1:4b", "tev1:0.8b"):
             os.environ["VALEDIA_SYSTEMONE_MODEL"] = pin
             try:
                 n = len(seen)
@@ -417,6 +433,15 @@ def test_nimble2_backend_routing_and_fail_open():
                 assert o["jev"]["fail_open"] is True and o["jev"]["error"] == "model_refused", pin
             finally:
                 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+        # Floating default tag with a wrong local digest: refused, never posted, reason kept.
+        _use_digest("deadbeef0000" + "1" * 52)
+        try:
+            n = len(seen)
+            o = jev.annotate(SIG, local_post=local)
+            assert len(seen) == n
+            assert o["jev"]["fail_open"] is True and o["jev"]["error"] == "digest_mismatch"
+        finally:
+            _use_digest()
         # v2 pin override is honored.
         os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:9b-v2"
         try:

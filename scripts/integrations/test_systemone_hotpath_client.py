@@ -16,6 +16,7 @@ sys.path.insert(0, HERE)
 os.environ["OPENCLAW_SKIP_ENV"] = "1"
 os.environ.pop("VALEDIA_SYSTEMONE", None)
 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+os.environ.pop("VALEDIA_SYSTEMONE_DIGEST", None)
 os.environ.pop("SYSTEMONE_LIVE_PROBE", None)
 os.environ.pop("VALEDIA_SYSTEMONE_BUDGET_MS", None)
 LOG = os.path.join(tempfile.mkdtemp(prefix="s1log_"), "nested", "decisions.jsonl")
@@ -24,6 +25,47 @@ os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 RETIRED = "".join(["l", "a", "y", "a"])
 
 import systemone_hotpath_client as sc
+
+# Burton's `ollama list`: nimble:latest ID 24e550a16a70 (the 12-char prefix of the
+# full sha256 that /api/tags returns). Never a real network call in these tests.
+PIN = "24e550a16a70"
+FULL = PIN + "9" * 52
+OTHER = "deadbeef0000" + "1" * 52
+
+
+def _tags_body(*rows):
+    out = []
+    for r in rows:
+        name, dig = (r, FULL) if isinstance(r, str) else r
+        row = {"name": name, "model": name}
+        if dig is not None:
+            row["digest"] = dig
+        out.append(row)
+    return {"models": out}
+
+
+def _fake_get(*rows, version="0.35.0", seen=None):
+    def fake(url, timeout):
+        if seen is not None:
+            seen.append(url)
+        if url.endswith("/api/version"):
+            return {"version": version}
+        if url.endswith("/api/tags"):
+            return _tags_body(*rows)
+        raise AssertionError(url)
+    return fake
+
+
+_REAL_GET = sc._get
+
+
+def _use_tags(*rows):
+    """Fake /api/tags for ask()/decide() (module transport) and drop the digest cache."""
+    sc._get = _fake_get(*rows)
+    sc._reset_digest()
+
+
+_use_tags("nimble:latest")  # default: Burton's Mac, digest matches the pin
 
 
 def _row():
@@ -44,8 +86,11 @@ def test_loopback_and_pin():
     assert sc.HOST == "127.0.0.1"
     assert sc.PORT == 11434
     assert sc.DECIDE_URL == "http://127.0.0.1:11434/v1/systemone"
-    assert sc.model_pin() == "nimble2"
-    assert sc.MODEL_DEFAULT == "nimble2"
+    assert sc.MODEL_DEFAULT == "nimble:latest" and sc.NIMBLE2_DIGEST == PIN
+    _use_tags("nimble:latest")
+    assert sc.model_pin() == ""                  # floating tag: nothing verified yet
+    assert sc.verify_digest() == "ok"
+    assert sc.model_pin() == "nimble:latest"
     src = open(os.path.join(HERE, "systemone_hotpath_client.py")).read()
     assert "8766" not in src
     assert RETIRED not in src.lower()
@@ -124,7 +169,7 @@ def test_decide_parses_and_fail_open():
 
     out = sc.decide(sc.compact_state(_row()), post=ok)
     assert seen["url"] == sc.DECIDE_URL
-    assert seen["payload"]["model"] == "nimble2"
+    assert seen["payload"]["model"] == "nimble:latest"
     assert seen["payload"]["questions"]["admit_paper"]["type"] == "noul"
     assert seen["payload"]["state"]["create_order"] is False
     assert out["backend"] == "systemone_http"
@@ -156,7 +201,7 @@ def test_decide_parses_and_fail_open():
     assert bad["create_order"] is False
 
     def v1(url, payload, timeout):
-        return {"model": "nimble", "answers": {"admit_paper": {"noul": 0.9}}}
+        return {"model": "nimble:9b", "answers": {"admit_paper": {"noul": 0.9}}}
 
     old = sc.decide({"symbol": "SPY"}, post=v1)
     assert old["backend"] == "stub"
@@ -185,7 +230,7 @@ def test_model_pin_nimble2_only():
         finally:
             os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     # v1, Tev, look-alikes, and empty are refused and never posted.
-    for tag in ("nimble", "nimble:9b", "nimble:latest", "NIMBLE:9B", "nimble:1", "nimble3",
+    for tag in ("nimble:9b", "NIMBLE:9B", "nimble:1", "nimble3",
                 "nimble2x", "nimble:2b", "nimble:2b-v1", "nimble:20b", "nimble:2x",
                 "nimble:2-", "nimble:2-notaquant", "nimble:v2-v1", "nimble:9b-v2-0.8b",
                 "nimble2:v1", "nimble2:q4-v1", "nimble:v1", "nimble:9b-v1", "nimble:1-q4_k_m",
@@ -207,18 +252,29 @@ def test_model_pin_nimble2_only():
         finally:
             os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     # A server answering with a v1 model name is refused even when the pin is v2.
-    os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
-    for got in ("nimble", "nimble:9b", "nimble:latest"):
-        bad = sc.decide(
+    # An explicit v2 pin never accepts a floating answer name either.
+    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble2"
+    try:
+        for got in ("nimble", "nimble:9b", "nimble:latest"):
+            bad = sc.decide(
+                {"symbol": "SPY"},
+                post=lambda url, payload, timeout, got=got: {
+                    "model": got, "answers": {"admit_paper": {"noul": 0.9}}})
+            assert bad["backend"] == "stub" and bad["error"] == "model_refused", got
+        ok = sc.decide(
             {"symbol": "SPY"},
-            post=lambda url, payload, timeout, got=got: {
-                "model": got, "answers": {"admit_paper": {"noul": 0.9}}})
-        assert bad["backend"] == "stub" and bad["error"] == "model_refused", got
-    ok = sc.decide(
+            post=lambda url, payload, timeout: {
+                "model": "nimble2:latest", "answers": {"admit_paper": {"noul": 0.9}}})
+        assert ok["backend"] == "systemone_http"
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+    # Default (digest-verified floating pin): a v1 answer name is still refused.
+    _use_tags("nimble:latest")
+    bad = sc.decide(
         {"symbol": "SPY"},
         post=lambda url, payload, timeout: {
-            "model": "nimble2:latest", "answers": {"admit_paper": {"noul": 0.9}}})
-    assert ok["backend"] == "systemone_http"
+            "model": "nimble:9b", "answers": {"admit_paper": {"noul": 0.9}}})
+    assert bad["backend"] == "stub" and bad["error"] == "model_refused"
 
 
 def test_summary_off_and_on():
@@ -227,7 +283,7 @@ def test_summary_off_and_on():
     off = sc.summary([{"systemone_shadow": {"backend": "systemone_http"}}])
     assert off["enabled"] is False
     assert off["backend"] == "stub"
-    assert off["model"] == "nimble2"
+    assert off["model"] == "nimble:latest"
     os.environ["VALEDIA_SYSTEMONE"] = "1"
     try:
         ranked = [{
@@ -250,35 +306,49 @@ def test_summary_off_and_on():
 
 
 def _fake_tags(*names):
-    def fake(url, timeout):
-        if url.endswith("/api/version"):
-            return {"version": "0.35.0"}
-        if url.endswith("/api/tags"):
-            return {"models": [{"name": n} for n in names]}
-        raise AssertionError(url)
-
-    return fake
+    return _fake_get(*names)
 
 
 def test_health_shape():
-    h = sc.health(get=_fake_tags("nimble2:latest"))
-    assert h["ok"] is True
+    sc._reset_digest()
+    h = sc.health(get=_fake_tags("nimble:latest"))
+    assert h["ok"] is True and h["digest"] == "ok"
     assert h["version"] == "0.35.0"
     assert h["model_present"] is True
-    assert h["model"] == "nimble2"
+    assert h["model"] == "nimble:latest"
     assert h["enforcement"] == "none"
-    # Nimble v1 on disk is not Nimble 2: fail-open with model_missing.
-    for v1 in ("nimble:latest", "nimble:9b", "nimble", "nimble2x:latest", "nimble2:q4"):
-        h = sc.health(get=_fake_tags(v1, "qwen3:8b"))
-        assert h["model_present"] is False, v1
-        assert h["ok"] is False and h["error"] == "model_missing", v1
-        assert h["model"] == "nimble2"
+    assert sc.model_pin() == "nimble:latest"      # health verified the digest this process
+    # Missing tag, v1 look-alikes, and near-misses are not present: model_missing.
+    for other in ("nimble:9b", "nimble2x:latest", "nimble2:q4", "nimble2:latest"):
+        sc._reset_digest()
+        h = sc.health(get=_fake_tags(other, "qwen3:8b"))
+        assert h["model_present"] is False, other
+        assert h["ok"] is False and h["error"] == "model_missing", other
+        assert h["model"] == "nimble:latest"
+        assert sc.model_pin() == ""
+    # Right tag, wrong digest: not ok, digest_mismatch, and the pin stays closed.
+    sc._reset_digest()
+    h = sc.health(get=_fake_tags(("nimble:latest", OTHER)))
+    assert h["model_present"] is True and h["ok"] is False
+    assert h["error"] == "digest_mismatch" and h["digest"] == "digest_mismatch"
+    assert sc.model_pin() == "" and sc.pin_refusal() == "digest_mismatch"
+    # No digest field at all: unverified.
+    sc._reset_digest()
+    h = sc.health(get=_fake_tags(("nimble:latest", None)))
+    assert h["ok"] is False and h["error"] == "digest_unverified"
     # Health looks for the configured tag, not any name starting with nimble.
     os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:9b-v2"
     try:
         assert sc.health(get=_fake_tags("nimble2:latest"))["model_present"] is False
         h = sc.health(get=_fake_tags("nimble:9b-v2"))
         assert h["model_present"] is True and h["model"] == "nimble:9b-v2"
+        assert h["ok"] is True and h["digest"] is None       # explicit v2: no digest needed
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble2"
+    try:
+        h = sc.health(get=_fake_tags("nimble2:latest"))
+        assert h["ok"] is True and h["model"] == "nimble2"
     finally:
         os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     hf = "hf.co/bespokelabs/Bespoke-Nimble-9B-v2"
@@ -289,19 +359,151 @@ def test_health_shape():
     finally:
         os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     # A refused pin means nothing is present, whatever is on disk.
-    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble"
+    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:9b"
     try:
-        h = sc.health(get=_fake_tags("nimble:latest", "nimble2:latest"))
+        h = sc.health(get=_fake_tags("nimble:9b", "nimble:latest", "nimble2:latest"))
         assert h["model_present"] is False and h["ok"] is False and h["model"] is None
     finally:
         os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
     down = sc.health(get=lambda url, timeout: (_ for _ in ()).throw(TimeoutError("x")))
     assert down["ok"] is False and down["model_present"] is False
     assert sc._version_ok("0.33.3") is False
+    _use_tags("nimble:latest")
     if os.environ.get("SYSTEMONE_LIVE_PROBE") == "1":
-        live = sc.health()
+        live = sc.health(get=_REAL_GET)
         assert live.get("ok") is True
         assert live.get("model_present") is True
+
+
+def _never_post(*a):
+    raise AssertionError("decide was POSTed")
+
+
+def test_digest_pin():
+    # Match: Burton's tag + full sha256 starting with the pinned 12-char prefix.
+    _use_tags(("nimble:latest", FULL))
+    seen = []
+    out = sc.decide({"symbol": "SPY"}, post=lambda url, payload, timeout: seen.append(payload["model"]) or {
+        "model": "nimble:latest", "answers": {"admit_paper": {"noul": 0.5}}})
+    assert seen == ["nimble:latest"] and out["backend"] == "systemone_http"
+    assert sc.digest_status() == "ok"
+    # sha256: prefix and models[].name vs models[].model are both honoured.
+    sc._get = _fake_get(("nimble:latest", "sha256:" + FULL.upper()))
+    sc._reset_digest()
+    assert sc.verify_digest() == "ok"
+    sc._get = lambda url, timeout: {"models": [{"model": "nimble:latest", "digest": FULL}]}
+    sc._reset_digest()
+    assert sc.verify_digest() == "ok"
+    # Bare `nimble` resolves to nimble:latest and is gated the same way.
+    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble"
+    try:
+        _use_tags(("nimble:latest", FULL))
+        seen = []
+        out = sc.decide({"symbol": "SPY"}, post=lambda url, payload, timeout: seen.append(payload["model"]) or {
+            "model": "nimble:latest", "answers": {"admit_paper": {"noul": 0.5}}})
+        assert seen == ["nimble"] and out["backend"] == "systemone_http"
+        _use_tags(("nimble:latest", OTHER))
+        out = sc.decide({"symbol": "SPY"}, post=_never_post)
+        assert out["backend"] == "stub" and out["error"] == "digest_mismatch"
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+    # Mismatch: refused, decide is never POSTed, reason is logged.
+    _reset_log()
+    _use_tags(("nimble:latest", OTHER))
+    out = sc.decide({"symbol": "SPY"}, post=_never_post, label="watch")
+    assert out["backend"] == "stub" and out["fail_open"] is True
+    assert out["error"] == "digest_mismatch" and out["create_order"] is False
+    assert out["model"] is None
+    assert _lines()[-1]["error"] == "digest_mismatch" and _lines()[-1]["backend"] == "stub"
+    # Missing /api/tags (down, 404, junk, no row, no digest): refused as digest_unverified.
+    def tags_down(url, timeout):
+        raise ConnectionRefusedError("down")
+    for getter in (tags_down,
+                   lambda url, timeout: "junk",
+                   lambda url, timeout: {"models": []},
+                   lambda url, timeout: {"models": [{"name": "qwen3:8b", "digest": FULL}]},
+                   lambda url, timeout: {"models": [{"name": "nimble:latest"}]},
+                   lambda url, timeout: {"models": [{"name": "nimble:9b", "digest": FULL}]}):
+        sc._get = getter
+        sc._reset_digest()
+        out = sc.decide({"symbol": "SPY"}, post=_never_post)
+        assert out["backend"] == "stub" and out["error"] == "digest_unverified"
+    # A refusal is cached for DIGEST_RETRY_S, so a scan does not hammer /api/tags.
+    calls = []
+    sc._get = lambda url, timeout: calls.append(url) or {"models": []}
+    sc._reset_digest()
+    sc.decide({"symbol": "A"}, post=_never_post)
+    sc.decide({"symbol": "B"}, post=_never_post)
+    assert len(calls) == 1
+    # ...and once verified, ok is cached for the process: no more GETs, no flip on a later bad tags.
+    _use_tags(("nimble:latest", FULL))
+    calls = []
+    good = sc._get
+    sc._get = lambda url, timeout: calls.append(url) or good(url, timeout)
+    sc.verify_digest()
+    sc.verify_digest()
+    assert len(calls) == 1 and sc.model_pin() == "nimble:latest"
+    # Restart (cache gone): re-verified against whatever is on disk now.
+    sc._reset_digest()
+    assert sc.model_pin() == ""
+    sc._get = _fake_get(("nimble:latest", OTHER))
+    assert sc.verify_digest() == "digest_mismatch" and sc.model_pin() == ""
+    # Warmup is a decide-shaped call: it refuses on a mismatch too, never POSTs.
+    os.environ["VALEDIA_SYSTEMONE"] = "1"
+    try:
+        sc._reset_digest()
+        res = sc.warmup(post=_never_post)
+        assert res["error"] == "digest_mismatch"
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE", None)
+    # Explicit v1 floating look-alikes stay refused whatever the digest says.
+    for tag in ("nimble:9b", "nimble:1", "nimble:latest-v1", "nimble:LATEST2"):
+        os.environ["VALEDIA_SYSTEMONE_MODEL"] = tag
+        try:
+            _use_tags((tag, FULL), "nimble:latest")
+            out = sc.decide({"symbol": "SPY"}, post=_never_post)
+            assert out["backend"] == "stub" and out["error"] == "model_refused", tag
+        finally:
+            os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+    # Explicit v2 names are unaffected: no /api/tags needed, wrong digests irrelevant.
+    sc._get = _fake_get(("nimble:latest", OTHER))
+    sc._reset_digest()
+    for tag in ("nimble2", "nimble:9b-v2", "Bespoke-Nimble-9B-v2"):
+        os.environ["VALEDIA_SYSTEMONE_MODEL"] = tag
+        try:
+            assert sc.model_pin() == tag and sc.digest_status() is None
+            sc._get = tags_down
+            out = sc.decide({"symbol": "SPY"}, post=lambda url, payload, timeout, tag=tag: {
+                "model": tag, "answers": {"admit_paper": {"noul": 0.5}}})
+            assert out["backend"] == "systemone_http", tag
+        finally:
+            os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
+    # Env override of the pin: VALEDIA_SYSTEMONE_DIGEST.
+    other_prefix = OTHER[:12]
+    _use_tags(("nimble:latest", OTHER))
+    assert sc.verify_digest() == "digest_mismatch"
+    os.environ["VALEDIA_SYSTEMONE_DIGEST"] = other_prefix
+    try:
+        assert sc.digest_prefix() == other_prefix
+        assert sc.digest_status() == "digest_unverified"   # key changed: cache does not carry over
+        assert sc.verify_digest() == "ok" and sc.model_pin() == "nimble:latest"
+        os.environ["VALEDIA_SYSTEMONE_DIGEST"] = "sha256:" + other_prefix.upper()
+        assert sc.digest_prefix() == other_prefix
+        # Unusable overrides never match anything (too short / not hex / empty).
+        for bad in ("", "abc", "zzzzzzzzzzzz", "24e550a1"):
+            os.environ["VALEDIA_SYSTEMONE_DIGEST"] = bad
+            _use_tags(("nimble:latest", FULL))
+            assert sc.digest_prefix() == "" and sc.verify_digest() == "digest_unverified", bad
+    finally:
+        os.environ.pop("VALEDIA_SYSTEMONE_DIGEST", None)
+    # With the default pin back, the old digest is the one that matches again.
+    _use_tags(("nimble:latest", FULL))
+    assert sc.verify_digest() == "ok"
+    # Floating names are not Nimble 2 by name alone.
+    assert not sc.is_nimble2("nimble:latest") and not sc.is_nimble2("nimble")
+    assert sc.is_floating_nimble("NIMBLE:Latest") and sc.is_floating_nimble("nimble")
+    assert not sc.is_floating_nimble("nimble:9b") and not sc.is_floating_nimble("nimble2:latest")
+    _use_tags("nimble:latest")
 
 
 def _lines():
@@ -395,8 +597,8 @@ def test_decision_log_every_call():
     sc.decide(state, post=_ok_post(), label="would_buy")                      # success
     sc.decide(state, post=lambda *a: (_ for _ in ()).throw(TimeoutError("t")), label="watch")  # timeout
     sc.decide(state, post=lambda *a: {"model": "nimble2"}, label="watch")      # no answers
-    sc.decide(state, post=_ok_post("nimble"), label="watch")                   # v1 response refused
-    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble"
+    sc.decide(state, post=_ok_post("nimble:9b"), label="watch")                # v1 response refused
+    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:9b"
     try:
         sc.decide(state, post=lambda *a: (_ for _ in ()).throw(AssertionError("posted")),
                   label="would_pass")                                          # refused pin
@@ -415,7 +617,7 @@ def test_decision_log_every_call():
         assert ln["source"] == "movers_scan" and ln["create_order"] is False
         assert ln["state"]["symbol"] == "PUMP"
     assert ok["error"] is None and ok["backend"] == "systemone_http"
-    assert ok["label"] == "would_buy" and ok["model"] == "nimble2"
+    assert ok["label"] == "would_buy" and ok["model"] == "nimble:latest"
     assert ok["response"]["answers"]["admit_paper"]["noul"] == 0.81   # full raw response
     assert ok["answers"]["admit_paper"] == 0.81 and ok["answers"]["venue_confidence"] == 0.9
     assert ok["cold"] is True and ok["state"]["facts"]["is_oil"] is False
@@ -423,7 +625,7 @@ def test_decision_log_every_call():
     assert timeout["response"] is None and timeout["within_budget"] is False
     assert timeout["label"] == "watch"
     assert noans["error"] == "no_answers" and noans["response"] == {"model": "nimble2"}
-    assert v1["error"] == "model_refused" and v1["response"]["model"] == "nimble"
+    assert v1["error"] == "model_refused" and v1["response"]["model"] == "nimble:9b"
     assert refused["error"] == "model_refused" and refused["model"] is None
     assert refused["label"] == "would_pass" and refused["response"] is None
     assert nan["state"]["chg_pct"] is None and nan["error"] is None
@@ -527,4 +729,5 @@ if __name__ == "__main__":
     test_model_pin_nimble2_only()
     test_summary_off_and_on()
     test_health_shape()
+    test_digest_pin()
     print("PASS test_systemone_hotpath_client")
