@@ -410,8 +410,9 @@ def execute_trade(opp, state, dry_run=False):
         result["status"] = "SKIP_INFORMED"
         result["error"] = ",".join(pre["reasons"])
         return result
-    if pre.get("jev") is not None:
-        result["jev"] = pre["jev"]
+    note = ibc.conviction_note(opp, pre["informed"], caller="kalshi_executor")
+    if note is not None:  # annotate only: never gates, sizes, or reprices this create
+        result["conviction_note"] = note
 
     try:
         order = create_order(

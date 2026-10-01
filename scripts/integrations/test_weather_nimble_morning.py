@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""WEATHER-JEV-MORNING-1. Fixtures only. No network. No orders.
+"""WEATHER morning (was WEATHER-JEV-MORNING-1; Jev retired, Nimble 2 notes). Fixtures only.
+No network. No orders.
 
-Run: python3 test_weather_jev_morning.py
+Run: python3 test_weather_nimble_morning.py
 """
 import json
 import os
@@ -17,7 +18,8 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 FIX = os.path.join(HERE, "fixtures", "weather")
 
 import informed_before_create as ibc
-import jev_shadow as jev
+import nimble_annotate as na
+import nimble_decide as nd
 import valedia_config as vc
 import weather_live
 import weather_lookup as wl
@@ -184,47 +186,65 @@ def test_lottery_and_late_on_create_only():
     assert "SKIP_LOTTERY" not in other and "SKIP_LATE_COLLAPSE" not in other
 
 
-def test_jev_cannot_pass_and_morning_alert(tmp):
-    assert jev.annotate_weather({"ticker": "KXHIGHNY", "create_order": False, "fv": 0.2})["fv"] == 0.2
-    prev = os.environ.get("VALEDIA_JEV")
-    prev_key = os.environ.get("TYPESAFE_API_KEY")
-    os.environ["VALEDIA_JEV"] = "1"
-    # annotate_weather fails closed (no_key) before calling `post` when no TypeSafe
-    # key is set. Use the placeholder convention of test_jev_shadow.py; `post` is
-    # stubbed below so nothing leaves the process, and the real env is restored.
-    os.environ["TYPESAFE_API_KEY"] = "test-key"
-    try:
-        def boom(*_a, **_k):
-            raise TimeoutError("slow")
+class _Nimble:
+    """VALEDIA_SYSTEMONE=1 with a fake loopback Nimble 2. `post` is the engine fake."""
 
-        failed = jev.annotate_weather(
-            {"ticker": "KXHIGHNY", "create_order": False, "fv": 0.2, "informed_pass": False},
-            post=boom)
-        assert failed["jev"]["fail_open"] is True and failed["jev"]["oms"] is False
-        assert failed["create_order"] is False and failed["fv"] == 0.2
+    def __init__(self, post):
+        self.post = post
 
-        def ok_post(*_a, **_k):
-            return {"model": "jev-test", "answers": {
-                "agree": {"choice": "agree", "confidence": 0.4},
-                "confidence": {"noul": 0.4},
-                "status_honesty": {"choice": "honest"},
-            }}
+    def __enter__(self):
+        import systemone_hotpath_client as s1
+        from systemone_test_fakes import FULL
+        self.s1, self._saved = s1, (s1._post, s1._get)
+        s1._post = self.post
+        s1._get = lambda url, timeout: (
+            {"models": [{"name": "nimble:latest", "digest": FULL}]}
+            if url.endswith("/api/tags") else {"version": "0.35.0"})
+        s1._reset_digest()
+        nd._WARMED = True
+        self._prev = (os.environ.get("VALEDIA_SYSTEMONE"), os.environ.get("VALEDIA_SYSTEMONE_LOG"))
+        os.environ["VALEDIA_SYSTEMONE"] = "1"
+        os.environ["VALEDIA_SYSTEMONE_LOG"] = os.path.join(tempfile.mkdtemp(prefix="wx_nim_"), "d.jsonl")
+        return self
 
-        agreed = jev.annotate_weather(
-            {"ticker": "KXHIGHNY", "create_order": False, "informed_pass": False, "fv": 0.62},
-            post=ok_post)
-        assert agreed["jev"]["agree"] == "agree" and agreed["jev"]["oms"] is False
-        assert agreed["create_order"] is False and agreed["informed_pass"] is False
-        assert agreed["fv"] == 0.62
-    finally:
-        if prev is None:
-            os.environ.pop("VALEDIA_JEV", None)
-        else:
-            os.environ["VALEDIA_JEV"] = prev
-        if prev_key is None:
-            os.environ.pop("TYPESAFE_API_KEY", None)
-        else:
-            os.environ["TYPESAFE_API_KEY"] = prev_key
+    def __exit__(self, *exc):
+        self.s1._post, self.s1._get = self._saved
+        self.s1._reset_digest()
+        for k, v in zip(("VALEDIA_SYSTEMONE", "VALEDIA_SYSTEMONE_LOG"), self._prev):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
+def test_nimble_note_cannot_pass_and_morning_alert(tmp):
+    os.environ.pop("VALEDIA_SYSTEMONE", None)
+    assert na.annotate_weather({"ticker": "KXHIGHNY", "create_order": False, "fv": 0.2})["fv"] == 0.2
+
+    def boom(*_a, **_k):
+        raise TimeoutError("slow")
+
+    with _Nimble(boom):
+        failed = na.annotate_weather(
+            {"ticker": "KXHIGHNY", "create_order": False, "fv": 0.2, "informed_pass": False})
+    assert failed["nimble_note"]["fail_open"] is True and failed["nimble_note"]["oms"] is False
+    assert failed["create_order"] is False and failed["fv"] == 0.2
+
+    def ok_post(_url, payload, _timeout):
+        return {"model": payload["model"], "answers": {
+            "agree": {"choice": "agree", "confidence": 0.4},
+            "confidence": {"noul": 0.4},
+            "status_honesty": {"choice": "honest"},
+        }}
+
+    with _Nimble(ok_post):
+        agreed = na.annotate_weather(
+            {"ticker": "KXHIGHNY", "create_order": False, "informed_pass": False, "fv": 0.62})
+    assert agreed["nimble_note"]["agree"] == "agree" and agreed["nimble_note"]["oms"] is False
+    assert agreed["nimble_note"]["facts"]["fv_present"] is True
+    assert agreed["create_order"] is False and agreed["informed_pass"] is False
+    assert agreed["fv"] == 0.62
     fmap = {"KXHIGHNY": {
         "series_ticker": "KXHIGHNY", "status": "ok",
         "maker_multiplier": 0.0, "taker_multiplier": 1.0, "maker_viable": True,
@@ -285,13 +305,13 @@ def main():
     test_daily_observation_and_cross_check()
     test_stations_tz_and_ltt_will_be()
     test_lottery_and_late_on_create_only()
-    tmp = tempfile.mkdtemp(prefix="weather-jev-")
+    tmp = tempfile.mkdtemp(prefix="weather-nimble-")
     try:
-        test_jev_cannot_pass_and_morning_alert(tmp)
+        test_nimble_note_cannot_pass_and_morning_alert(tmp)
     finally:
         pass
     test_live_stays_off_and_oil_fenced()
-    print("WEATHER-JEV-MORNING: PASS")
+    print("WEATHER-MORNING (Nimble notes): PASS")
 
 
 if __name__ == "__main__":

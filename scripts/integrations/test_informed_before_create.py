@@ -5,6 +5,7 @@ Run: python3 test_informed_before_create.py
 """
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -438,67 +439,79 @@ def _roi_conviction():
     }
 
 
-def test_conviction_refuses_without_fv_and_skips_jev():
+class _Nimble:
+    """VALEDIA_SYSTEMONE=1 with a fake loopback Nimble 2 (no network). raise_ = engine down."""
+
+    def __init__(self, raise_=None):
+        self.raise_, self.posts = raise_, []
+
+    def _post(self, url, payload, timeout):
+        self.posts.append(payload)
+        if self.raise_:
+            raise self.raise_
+        return {"model": payload["model"], "answers": {"action": {
+            "choice": "skip", "confidence": 0.9,
+            "probabilities": {"buy": 0.05, "hold": 0.05, "skip": 0.9}}}}
+
+    def __enter__(self):
+        import nimble_decide as nd
+        import systemone_hotpath_client as s1
+        from systemone_test_fakes import FULL
+        self.s1, self._saved = s1, (s1._post, s1._get)
+        s1._post = self._post
+        s1._get = lambda url, timeout: (
+            {"models": [{"name": "nimble:latest", "digest": FULL}]}
+            if url.endswith("/api/tags") else {"version": "0.35.0"})
+        s1._reset_digest()
+        nd._WARMED = True
+        self._env = (_env("VALEDIA_SYSTEMONE", "1"), _env(
+            "VALEDIA_SYSTEMONE_LOG", os.path.join(tempfile.mkdtemp(prefix="ibc_nim_"), "d.jsonl")))
+        return self
+
+    def __exit__(self, *exc):
+        self.s1._post, self.s1._get = self._saved
+        self.s1._reset_digest()
+        _restore_env("VALEDIA_SYSTEMONE", self._env[0])
+        _restore_env("VALEDIA_SYSTEMONE_LOG", self._env[1])
+        return False
+
+
+def test_conviction_refuses_without_fv_and_no_model_call():
     _quiet()
-    calls = []
-    prev = _env("VALEDIA_JEV", "1")
-    prev_k = _env("TYPESAFE_API_KEY", "test-key")
-
-    def boom(*_a, **_k):
-        calls.append(1)
-        raise AssertionError("jev must not run on INFORMED refuse")
-
-    try:
-        pre = ibc.create_preflight(_roi_conviction(), 1, 17, post=boom)
+    with _Nimble() as n:
+        pre = ibc.create_preflight(_roi_conviction(), 1, 17)
         assert pre["ok"] is False
-        assert pre["jev"] is None
+        assert set(pre) == {"ok", "reasons", "informed"}
         assert "fv_missing" in pre["reasons"] or "fv_source" in pre["reasons"]
-        assert calls == []
+        assert n.posts == []
         assert "tag_prior" not in pre["informed"].get("fv_source", "")
-    finally:
-        _restore_env("VALEDIA_JEV", prev)
-        _restore_env("TYPESAFE_API_KEY", prev_k)
 
 
-def test_conviction_allows_with_fv_and_jev_fail_open():
+def test_conviction_allows_with_fv_and_note_fail_open():
     _quiet()
     qe, old = pin_kelly()
-    prev = _env("VALEDIA_JEV", "1")
-    prev_k = _env("TYPESAFE_API_KEY", "test-key")
     opp = good_kalshi(strategy="CONVICTION_YES", ticker="KXBTCY-1", side="yes", price=0.50)
     try:
-        off = _env("VALEDIA_JEV", None)
-        try:
-            pre = ibc.create_preflight(opp, 1, 50, post=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("off")))
-            assert pre["ok"] is True
-            assert pre["jev"] is None
+        prev = _env("VALEDIA_SYSTEMONE", None)
+        try:  # off: pure gate, no note
+            pre = ibc.create_preflight(opp, 1, 50)
+            assert pre["ok"] is True and set(pre) == {"ok", "reasons", "informed"}
+            assert ibc.conviction_note(opp, pre["informed"], caller="t") is None
         finally:
-            _restore_env("VALEDIA_JEV", off)
-
-        def boom(*_a, **_k):
-            raise TimeoutError("slow")
-
-        pre = ibc.create_preflight(opp, 1, 50, post=boom)
-        assert pre["ok"] is True
-        assert pre["jev"]["fail_open"] is True
-        assert pre["jev"]["enabled"] is True
-
-        def stand(*_a, **_k):
-            return {"model": "jev-1.13.0", "answers": {
-                "action": {"choice": "stand_down", "confidence": 0.9},
-                "stand_down": {"noul": 0.99},
-                "report_usable": {"noul": 0.2},
-                "we_are_the_exit": {"noul": 0.1},
-            }}
-
-        pre = ibc.create_preflight(opp, 1, 50, post=stand)
-        assert pre["ok"] is True
-        assert pre["jev"]["action"] == "stand_down"
-        assert pre["jev"]["fail_open"] is False
+            _restore_env("VALEDIA_SYSTEMONE", prev)
+        with _Nimble() as n:
+            pre = ibc.create_preflight(opp, 1, 50)
+            assert pre["ok"] is True and n.posts == []  # the gate itself never calls a model
+            note = ibc.conviction_note(opp, pre["informed"], caller="t")
+        assert len(n.posts) == 1 and note["action"] == "skip" and note["fail_open"] is False
+        facts = n.posts[0]["state"]["facts"]
+        assert facts["edge_positive"] is True and facts["fv_source_allowed"] is True
+        assert facts["informed_gate_passed"] is True and "allow" not in note
+        with _Nimble(raise_=TimeoutError("slow")):
+            note = ibc.conviction_note(opp, pre["informed"], caller="t")
+        assert note["fail_open"] is True and note["error"] == "TimeoutError"
     finally:
         unpin_kelly(qe, old)
-        _restore_env("VALEDIA_JEV", prev)
-        _restore_env("TYPESAFE_API_KEY", prev_k)
 
 
 def test_executor_conviction_create_path():
@@ -511,33 +524,29 @@ def test_executor_conviction_create_path():
     ex.get_fills = lambda: {"fills": []}
     state = {"max_per_trade": 10, "max_deployable": 10, "balance": 100}
     qe, old = pin_kelly()
-    prev = _env("VALEDIA_JEV", "1")
-    prev_k = _env("TYPESAFE_API_KEY", "test-key")
-    import jev_shadow as jev
-    real_post = jev.http_post
-    jev.http_post = lambda *_a, **_k: (_ for _ in ()).throw(TimeoutError("slow"))
     try:
-        refused = ex.execute_trade(_roi_conviction(), state, dry_run=False)
-        assert refused["status"] == "SKIP_INFORMED"
-        assert posted == []
-        opp = good_kalshi(strategy="CONVICTION_YES", ticker="KXBTCY-1", side="yes", price=0.50)
-        allowed = ex.execute_trade(opp, state, dry_run=False)
+        with _Nimble() as n:  # the engine says skip: a note only, the create still runs
+            refused = ex.execute_trade(_roi_conviction(), state, dry_run=False)
+            assert refused["status"] == "SKIP_INFORMED"
+            assert posted == [] and n.posts == []
+            opp = good_kalshi(strategy="CONVICTION_YES", ticker="KXBTCY-1", side="yes", price=0.50)
+            allowed = ex.execute_trade(opp, state, dry_run=False)
         assert allowed["status"] in ("EXECUTED", "UNRECONCILED")
         assert posted and posted[-1]["informed"]["fv_source"] == "model"
-        assert allowed["jev"]["fail_open"] is True
+        assert allowed["contracts"] == 1 and len(n.posts) == 1
+        note = allowed["conviction_note"]
+        assert note["annotate_only"] is True and note["action"] == "skip"
+        assert note["facts"]["edge_positive"] is True
         exe = open(os.path.join(HERE, "kalshi_executor.py")).read()
         alloc = open(os.path.join(HERE, "master_allocator.py")).read()
         arb = open(os.path.join(HERE, "latency_arb.py")).read()
         assert "informed_before_create" in exe and "create_preflight" in exe
         assert "create_preflight" in alloc
-        assert "jev_shadow" not in exe
-        assert "jev_shadow" not in arb  # arb is speed-path (strategy LATENCY_ARB): no Jev; it now runs create_preflight (see test_latency_arb_evidence)
+        assert "jev" not in exe.lower() and "jev" not in alloc.lower()
+        assert "conviction_note" not in arb  # arb is speed-path (LATENCY_ARB): no note
     finally:
         ex.create_order, ex._size_contracts = orig_c, orig_s
-        jev.http_post = real_post
         unpin_kelly(qe, old)
-        _restore_env("VALEDIA_JEV", prev)
-        _restore_env("TYPESAFE_API_KEY", prev_k)
 
 
 if __name__ == "__main__":
@@ -548,7 +557,7 @@ if __name__ == "__main__":
     test_ev_floor_uses_preflight()
     test_poly_stays_blocked_and_informed()
     test_poly_loop_tag_prior_not_eligible()
-    test_conviction_refuses_without_fv_and_skips_jev()
-    test_conviction_allows_with_fv_and_jev_fail_open()
+    test_conviction_refuses_without_fv_and_no_model_call()
+    test_conviction_allows_with_fv_and_note_fail_open()
     test_executor_conviction_create_path()
     print("INFORMED-BEFORE-CREATE: PASS")

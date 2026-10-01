@@ -5,8 +5,8 @@ Watch crypto + stocks/ETFs + weather. Size only names that printed like
 PUMP/QNT (~16% day) after a roundtrip of crypto taker+slip. Never orders.
 
 Reuses the dynamic_universe CoinGecko gainer query, market_data Yahoo
-summary, Finnhub headlines, crypto_paper fee/clip, and jev_shadow.annotate
-(fail-open). Ornith 1.5 9B seasoning stays off unless VALEDIA_ORNITH_SEASON=1
+summary, Finnhub headlines, crypto_paper fee/clip, and nimble_annotate.season_scan
+(Nimble 2 note, fail-open). Ornith 1.5 9B seasoning stays off unless VALEDIA_ORNITH_SEASON=1
 and never reorders. CoinGecko 429 falls through to the public Binance 24h tape.
 Fee-true code still labels and sizes. Nimble System One is off unless
 VALEDIA_SYSTEMONE=1, then a loopback /v1/systemone decide is attached and a
@@ -28,7 +28,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import crypto_paper as cp
-import jev_shadow
+import nimble_annotate
 import nimble_wiring_spot as nws
 import ornith_seasoning
 import systemone_hotpath_client as s1
@@ -394,39 +394,18 @@ def _weather_row():
     }
 
 
-def season_jev(ranked, annotate=None):
-    """Stamp Jev on a copy. Ranking is already fixed. Fail-open."""
-    doc = {
-        "source": "all_knowing_movers",
-        "overall_bias": "WATCH",
-        "signals": {},
-        "events": [],
-    }
-    for r in ranked[:8]:
-        doc["signals"][r["symbol"]] = {
-            "direction": "WATCH",
-            "chg_24h": r.get("chg_24h"),
-        }
-    fn = annotate or jev_shadow.annotate
+def season_nimble(ranked, annotate=None, informed=None):
+    """Nimble 2 note on the fixed ranking (scan facts from code). Fail-open. Never reorders."""
+    fn = annotate or (lambda r: nimble_annotate.season_scan(
+        r, print_bar=PRINT_BAR_PCT, informed=informed))
     try:
-        stamped = fn(doc)
+        note = fn(ranked)
     except Exception as e:
-        stamped = dict(doc)
-        stamped["jev"] = {"enabled": True, "fail_open": True, "error": type(e).__name__}
-    if not isinstance(stamped, dict):
-        stamped = dict(doc)
-    if "jev" not in stamped:
-        stamped = dict(stamped)
-        stamped["jev"] = {
-            "enabled": False,
-            "fail_open": True,
-            "reason": "VALEDIA_JEV_off",
-            "seasoning_only": True,
-        }
-    jev = dict(stamped["jev"])
-    jev["seasoning_only"] = True
-    jev["changes_rank"] = False
-    return jev
+        note = {"annotate_only": True, "fail_open": True, "error": type(e).__name__}
+    note = dict(note) if isinstance(note, dict) else {"fail_open": True, "error": "no_note"}
+    note["seasoning_only"] = True
+    note["changes_rank"] = False
+    return note
 
 
 def presence(ranked, notes, sym):
@@ -456,7 +435,7 @@ def fences():
         "oil": "NO_HARVEST",
         "weather": "WATCH",
         "systemone": "stub",
-        "jev": "seasoning_only",
+        "nimble_note": "seasoning_only",
         "ornith": "seasoning_only",
         "counts_toward_kelly": False,
     }
@@ -489,7 +468,7 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
     ranked = rank_movers(
         use, bankroll=bankroll, systemone_post=systemone_post, informed=informed)
     ranked_order = [r["symbol"] for r in ranked]
-    jev = season_jev(ranked, annotate=annotate)
+    note = season_nimble(ranked, annotate=annotate, informed=informed)
     ornith = ornith_seasoning.stamp(ranked, season=season)
     assert [r["symbol"] for r in ranked] == ranked_order
     _ = order_before
@@ -507,7 +486,7 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
         "fee_table": cp.FEE_TABLE,
         "fences": held,
         "systemone": shadow,
-        "jev": jev,
+        "nimble_note": note,
         "ornith": ornith,
         "probe": {s: presence(ranked, notes, s) for s in PROBE},
         "notes": notes,

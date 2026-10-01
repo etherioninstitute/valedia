@@ -395,11 +395,11 @@ def process_mirofish_report(report_json, enrichment=None, out_path=None):
     except Exception:
         result["persona_lenses"] = False
 
-    # AUTONOMY-2: Jev shadow. Off = zero TypeSafe calls. On = annotate; fail-open.
-    # Does not change scores/bias/weight/Kelly. Never blocks live Kalshi.
+    # Nimble 2 note (VALEDIA_SYSTEMONE=1, loopback only; off = zero calls). Facts are
+    # computed in code from this doc. Does not change scores/bias/weight/Kelly.
     try:
-        import jev_shadow as jev
-        result = jev.attach_to_signal(result)
+        import nimble_annotate as na
+        result = na.annotate_report(result, caller="mirofish_signal_extractor")
     except Exception:
         pass
 

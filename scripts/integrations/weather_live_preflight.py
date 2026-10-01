@@ -2,7 +2,7 @@
 (Valedia weather_morning_go decides LIVE from weather_live_flip_allowed).
 
 Returns PASS only if every gate below is green. Otherwise FAIL with blockers.
-Oil / OIL_LIVE is never touched. Jev is never a create gate.
+Oil / OIL_LIVE is never touched. A Nimble 2 weather note is never a create gate.
 
 Usage:
   python3 weather_live_preflight.py
@@ -180,34 +180,31 @@ def check_lottery_late_in_create_path():
     )
 
 
-def check_jev_shadow_only():
-    import valedia_config as vc
-    import jev_shadow as js
+def check_nimble_annotate_only():
+    """Nimble 2 weather notes are annotate-only: never a create gate for weather.
 
-    env_on = js.jev_on()
-    # Must not appear as OMS / create gate
-    create_refs = []
-    for name in ("weather_arb.py", "informed_before_create.py", "kalshi_auth.py"):
+    Static: the live weather create path does not import nimble_annotate, and the
+    annotate module carries no create call. The weather live veto, when one
+    is configured, lives in nimble_wiring (mode), not in the note.
+    """
+    import systemone_hotpath_client as s1
+
+    leaks = []
+    for name in ("weather_live.py", "weather_arb.py", "kalshi_auth.py"):
         path = os.path.join(HERE, name)
-        if not os.path.isfile(path):
-            continue
-        text = open(path, encoding="utf-8", errors="ignore").read()
-        if "jev" in text.lower() and ("create_order" in text or "informed_pass" in text):
-            # crude: fail if jev appears to gate create
-            if "jev" in text and "alone" not in text:
-                pass
-        if "jev_shadow" in text and "informed_pass" in text:
-            # check they aren't AND-ed as create requirement poorly — soft
-            create_refs.append(name)
-    # Weather wire optional for PASS of this check; role check = fail-open + not OMS
-    ok = True
-    # Code default False is fine; env may be 1
+        if os.path.isfile(path):
+            text = open(path, encoding="utf-8", errors="ignore").read()
+            if "nimble_annotate" in text:
+                leaks.append(name)
+    path = os.path.join(HERE, "nimble_annotate.py")
+    note_src = open(path, encoding="utf-8", errors="ignore").read() if os.path.isfile(path) else ""
+    creates = "create_order(" in note_src
+    ok = bool(note_src) and not leaks and not creates
     detail = (
-        f"jev_on={env_on} code_default={vc.VALEDIA_JEV} "
-        f"jev_enabled={vc.jev_enabled()} fail_open_module=yes"
+        f"systemone_enabled={s1.enabled()} annotate_module={bool(note_src)} "
+        f"create_path_imports={leaks or ['none']} note_creates={creates}"
     )
-    # Ensure weather_live does not require jev
-    return _check("jev_shadow_fail_open", ok, detail)
+    return _check("nimble_annotate_only", ok, detail, blocker="nimble_note_in_create_path")
 
 
 def check_live_ledger_alert_hooks():
@@ -273,7 +270,7 @@ CHECKS = [
     check_stations_and_tz,
     check_fee_map_city_series,
     check_lottery_late_in_create_path,
-    check_jev_shadow_only,
+    check_nimble_annotate_only,
     check_live_ledger_alert_hooks,
     check_fence_tonight,
     check_risk_caps_exist,
@@ -296,7 +293,7 @@ def run():
         "stations_tz",
         "fee_map_kxhigh_kxlow",
         "lottery_late_create_path",
-        "jev_shadow_fail_open",
+        "nimble_annotate_only",
         "live_ledger_and_alert",
         "risk_caps_kelly",
     }
@@ -314,7 +311,7 @@ def run():
         "checks": results,
         "note": (
             "Valedia flips WEATHER_LIVE only when status==PASS (else off). Oil stays fenced. "
-            "Jev is shadow-only fail-open and never alone-passes create."
+            "Nimble 2 weather notes are annotate-only and never pass create."
         ),
     }
 
