@@ -408,6 +408,41 @@ def test_session_clock_and_ev_preflight_run():
         kp.annotate, sc.before_create, ibc.create_preflight = o_ann, o_bc, o_cp
 
 
+def test_precreate_exceptions_fail_closed_and_loop_continues():
+    """A raise from EV preflight, the session clock, or informed preflight → that bet
+    is a SKIP (no order, no crash) and the next bet in the same cycle still runs."""
+    o_ann, o_bc, o_cp = kp.annotate, sc.before_create, ibc.create_preflight
+    bad = FAV + "BAD"
+
+    def raiser(orig):
+        def f(opp, *a, **k):
+            if opp.get("ticker") == bad:
+                raise RuntimeError("boom " + "x" * 200)
+            return orig(opp, *a, **k)
+        return f
+    expected = {"annotate": "SKIP_EV_PREFLIGHT", "before_create": "SKIP_PRECREATE_ERROR",
+                "create_preflight": "SKIP_PRECREATE_ERROR"}
+    try:
+        for mod, name in ((kp, "annotate"), (sc, "before_create"), (ibc, "create_preflight")):
+            orig = getattr(mod, name)
+            setattr(mod, name, raiser(orig))
+            try:
+                with admitted_sports_env() as env, Venue() as v:
+                    res = se.execute_bets([sports_bet(ticker=bad), sports_bet()],
+                                          dry_run=False, **_kw(env))
+            finally:
+                setattr(mod, name, orig)
+            r_bad, r_ok = res
+            assert r_bad["status"] == expected[name], (name, r_bad["status"], r_bad.get("reasons"))
+            assert "boom" in r_bad["error"] and len(r_bad["error"]) <= 160, (name, r_bad["error"])
+            if name != "annotate":
+                assert r_bad["reasons"][0].startswith("RuntimeError: boom"), r_bad["reasons"]
+            assert r_ok["status"] == "EXECUTED", (name, r_ok["status"], r_ok.get("reasons"))
+            assert [a[0] for a, _k in v.orders] == [FAV], (name, v.orders)  # no order for bad
+    finally:
+        kp.annotate, sc.before_create, ibc.create_preflight = o_ann, o_bc, o_cp
+
+
 if __name__ == "__main__":
     test_admitted_reaches_create_order_with_informed()
     test_each_missing_evidence_skips()
@@ -417,4 +452,5 @@ if __name__ == "__main__":
     test_fill_truth_and_ledger_unchanged()
     test_run_logs_evidence_and_skips()
     test_session_clock_and_ev_preflight_run()
+    test_precreate_exceptions_fail_closed_and_loop_continues()
     print("sports evidence wiring: PASS")
