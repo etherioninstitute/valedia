@@ -17,27 +17,19 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 os.environ.pop("VALEDIA_JEV_BACKEND", None)
 os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)
 LOG = os.path.join(tempfile.mkdtemp(prefix="jevlog_"), "decisions.jsonl")
-os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 
 import jev_shadow as jev
 from mirofish_signal_extractor import process_mirofish_report
 import valedia_config as vc
 
 
-# Local Ollama is faked: Burton's `nimble:latest` digest (24e550a16a70...) matches the
-# pin, so the floating default tag passes. No real /api/tags call in unit tests.
+# Local Ollama is faked, scoped per test (fixture / script main): Burton's nimble:latest
+# digest (24e550a16a70...) matches the pin. No real /api/tags call in unit tests.
 import systemone_hotpath_client as _s1_fake
-_DIGEST_FULL = "24e550a16a70" + "9" * 52
-
-
-def _use_digest(digest=_DIGEST_FULL):
-    _s1_fake._get = lambda url, timeout: (
-        {"models": [{"name": "nimble:latest", "digest": digest}]} if url.endswith("/api/tags")
-        else {"version": "0.35.0"})
-    _s1_fake._reset_digest()
-
-
-_use_digest()
+from systemone_test_fakes import FULL as _DIGEST_FULL, Scoped
+_S = Scoped(_s1_fake, LOG)
+_use_digest = _S.use
+_scoped_fakes = _S.fixture()
 
 
 SIG = {
@@ -486,6 +478,7 @@ def test_nimble2_backend_via_attach_to_signal():
 
 
 if __name__ == "__main__":
+    _S.setup()
     test_questions_have_no_numbers_and_facts_are_code_computed()
     test_default_backend_unchanged_and_logged()
     test_nimble2_backend_routing_and_fail_open()
@@ -497,4 +490,5 @@ if __name__ == "__main__":
     test_on_missing_key_fail_open_no_post()
     test_extractor_off_passthrough()
     test_extractor_on_mocked()
+    _S.teardown()
     print("AUTONOMY-2 JEV-SHADOW: PASS")
