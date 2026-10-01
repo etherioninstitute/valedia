@@ -31,4 +31,12 @@ Local typed shadow on the paper movers scan. Same three judgments as pack `valed
 - The scan row label is `label` (fee-true, code-owned). The scan JSON carries a `systemone` block (backend, model, health) and no per-backend retired block.
 - Non-finite prints are null. Ollama rejects JSON `NaN`.
 
+## Gates live in code (principle)
+
+Nimble 2 is weak at arithmetic and counting. It gets one narrow question per call; every hard number and comparison is enforced by deterministic code around it. `facts()` (and Jev's `tiny_state` / `weather_state`) compute booleans such as `edge_positive`, `clears_size_bar`, `thin_tape`, `is_oil`, `fv_vs_book` from the scan's own constants (`LIMITS`). The questions refer to those facts in words and contain no digits (asserted in tests). The model's answer never sets a label, size, rank, or order.
+
+- **Decision log:** every call, yes and no, appends one JSON line to `data/systemone/decisions.jsonl` (git-ignored; `VALEDIA_SYSTEMONE_LOG` overrides): ts, source, model, full state, raw response or error, parsed answers (confidence, probabilities), latency, `within_budget`, and the code's own `label`. Covers the movers scan, warmup, and Jev shadow on both backends. No keys or headers.
+- **Latency:** warm target under 500 ms (`VALEDIA_SYSTEMONE_BUDGET_MS`). `warmup()` runs once at the start of an enabled scan; the 120 s timeout stays for cold loads. `summary()` reports warm p50/p95, `cold_n`, `within_budget_n`.
+- **Jev backend:** `VALEDIA_JEV_BACKEND=nimble2` (opt-in, with `VALEDIA_JEV=1`) sends the Jev questions to loopback `/v1/systemone` on the Nimble 2 pin with the short Jev timeout. Default stays the TypeSafe cloud. Fail-open; annotations never change score, direction, bias, weight, or Kelly.
+
 Keep Jev optional. Nimble stamps. It does not size and it does not send.

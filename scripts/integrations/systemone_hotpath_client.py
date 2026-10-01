@@ -7,6 +7,11 @@ Nimble v1 tags and Tev1, including Tev1-0.8B, are refused and never
 posted. Code still owns the fee-true label and the would-have size.
 This module never places an order. A down server returns a stub and
 the scan continues.
+
+Gates live in code, not in the model call. Nimble 2 is weak at arithmetic
+and counting, so every threshold and comparison is computed in code
+(facts()) and the questions only refer to those facts, with no numbers.
+Every call is logged, yes and no alike, to an append-only decisions.jsonl.
 """
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ import os
 import re
 import time
 import urllib.request
+
+from systemone_log import budget_ms, finite_tree, log_decision, log_path  # noqa: F401
 
 HOST = "127.0.0.1"
 PORT = 11434
@@ -42,32 +49,36 @@ TAGS_URL = "http://127.0.0.1:11434/api/tags"
 ALLOWED_URLS = frozenset({DECIDE_URL, VERSION_URL, TAGS_URL})
 TIMEOUT_S = 120.0  # ponytail: cold 9B load; warm calls are far under this
 KEEP_ALIVE = "10m"
+_WARM = False  # a successful call this process: the model is resident
 
-# Same three judgments as packs/valedia-paper-v1. Stamp only.
+# Same three judgments as packs/valedia-paper-v1. Stamp only. No numbers and
+# no comparisons live here: the state carries code-computed `facts` booleans
+# and the criteria refer to them qualitatively.
 QUESTIONS = {
     "admit_paper": {
         "type": "noul",
         "instructions": (
-            "Paper shadow only. Given the symbol, venue class, fee-true edge, "
-            "impact, and informed flags, is this name admissible as a paper note? "
-            "Oil and weather stay blocked. Do not place an order."
+            "Paper shadow only. Read the code-computed `facts` in the state. "
+            "Is this name admissible as a paper note? Do not compute or compare "
+            "anything. Oil and weather stay blocked. Do not place an order."
         ),
         "criteria": {
-            "false": "Do not admit. No print, negative fee-true edge, oil, weather, or too thin.",
-            "true": "Admissible as a paper shadow note. Still not a live order.",
+            "false": "Do not admit. The facts show no print, no positive edge, oil, weather, or a thin tape.",
+            "true": "Admissible as a paper shadow note: a print, a positive edge, and no oil, weather, or thin-tape flag. Still not a live order.",
         },
     },
     "edge_quality": {
         "type": "score",
         "instructions": (
-            "How strong is the fee-true edge as a paper shadow note after "
-            "roundtrip cost? This score does not size and does not send."
+            "How strong is the fee-true edge as a paper shadow note, judged "
+            "from the code-computed `facts` only? This score does not size "
+            "and does not send."
         ),
         "criteria": [
-            "none — no print, or fee-true edge is negative",
-            "thin — positive edge but under a 16 percent day",
-            "printable — day move clears the paper size bar and edge stays positive",
-            "stretched — huge print or thin tape; watch, do not treat as size",
+            "none: the facts show no print, or no positive edge",
+            "thin: the edge is positive but the paper size bar is not cleared",
+            "printable: the paper size bar is cleared and the edge stays positive",
+            "stretched: the tape is thin; watch, do not treat as size",
         ],
     },
     "venue_class": {
@@ -83,6 +94,13 @@ QUESTIONS = {
             "weather_watch": "Weather contract. Watch only.",
             "oil_blocked": "Oil or oil-linked. No harvest.",
         },
+    },
+}
+WARM_QUESTIONS = {
+    "ping": {
+        "type": "noul",
+        "instructions": "Warmup ping so the model is resident. Is this a ping?",
+        "criteria": {"true": "This is a ping.", "false": "This is not a ping."},
     },
 }
 
@@ -172,7 +190,34 @@ def _finite(value):
     return value
 
 
-def compact_state(row, informed=None):
+def _num(v):
+    """Finite real number or None. Bools and strings are not numbers."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return v
+
+
+def facts(row, limits=None):
+    """Code-computed booleans. Every threshold and comparison lives here.
+
+    limits: {"print_bar_pct", "min_quote_usd"} from the scan's own constants.
+    A fact is None when its input is unknown. The model never compares.
+    """
+    lim = limits or {}
+    chg, edge = _num(row.get("chg_24h")), _num(row.get("edge"))
+    bar, minq, vol = _num(lim.get("print_bar_pct")), _num(lim.get("min_quote_usd")), _num(row.get("quote_volume_usd"))
+    venue = _venue(row)
+    return {
+        "has_print": chg is not None,
+        "edge_positive": edge is not None and edge > 0,
+        "clears_size_bar": None if bar is None or chg is None else chg >= bar,
+        "thin_tape": None if minq is None or vol is None else vol < minq,
+        "is_oil": venue == "oil_blocked",
+        "is_weather": venue == "weather_watch",
+    }
+
+
+def compact_state(row, informed=None, limits=None):
     """Small non-secret state. No keys, no headlines, no order."""
     return {
         "symbol": row.get("symbol"),
@@ -180,6 +225,7 @@ def compact_state(row, informed=None):
         "chg_pct": _finite(row.get("chg_24h")),
         "fee_true_edge": _finite(row.get("edge")),
         "impact_usd": _finite(row.get("impact_usd")),
+        "facts": facts(row, limits),
         "informed": _flags(row, informed),
         "create_order": False,
     }
@@ -198,7 +244,19 @@ def _stub(reason):
         "answers": {},
         "latency_ms": None,
         "client_ms": None,
+        "within_budget": False,
     }
+
+
+def _prob(d):
+    """noul probability. Accepts the `noul` or `probability` key."""
+    d = d if isinstance(d, dict) else {}
+    v = _num(d.get("noul"))
+    return v if v is not None else _num(d.get("probability"))
+
+
+def _probs(d):
+    return {str(k): _num(v) for k, v in d.items()} if isinstance(d, dict) else None
 
 
 def _answers(body):
@@ -207,9 +265,12 @@ def _answers(body):
     edge = ans.get("edge_quality") or {}
     venue = ans.get("venue_class") or {}
     return {
-        "admit_paper": admit.get("noul"),
+        "admit_paper": _prob(admit),
         "edge_quality": edge.get("score"),
+        "edge_quality_confidence": _num(edge.get("confidence")),
         "venue_class": venue.get("choice"),
+        "venue_confidence": _num(venue.get("confidence")),
+        "venue_probabilities": _probs(venue.get("probabilities")),
     }
 
 
@@ -255,44 +316,68 @@ def _response_model_ok(body, pin):
     return is_nimble2((body or {}).get("model") or pin)
 
 
-def decide(state, post=None, timeout=None):
-    """POST one shadow decide. Timeout, bad model, or a bad body → stub."""
+def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=None):
+    """One loopback shadow call. Always logged. Never raises.
+
+    Returns {pin, body, error, answers, cold, latency_ms, within_budget}.
+    error is None only when a model answer came back from an allowed pin.
+    """
+    global _WARM
+    state = finite_tree(state)
     pin = model_pin()
+    res = {"pin": pin or None, "body": None, "error": None, "answers": None, "cold": not _WARM}
     t0 = time.perf_counter()
-    if not pin:
-        out = _stub("model_refused")
-        out["client_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
-        return out
-    fn = post or _post
     try:
-        body = fn(
-            DECIDE_URL,
-            {
-                "model": pin,
-                "state": state,
-                "questions": QUESTIONS,
-                "keep_alive": KEEP_ALIVE,
-            },
-            timeout or TIMEOUT_S,
-        )
+        if not pin:
+            res["error"] = "model_refused"
+        else:
+            body = (post or _post)(
+                DECIDE_URL,
+                {"model": pin, "state": state, "questions": questions, "keep_alive": KEEP_ALIVE},
+                timeout or TIMEOUT_S,
+            )
+            res["body"] = body
+            if not isinstance(body, dict):
+                res["error"] = "bad_response"
+            elif not _response_model_ok(body, pin):
+                res["error"] = "model_refused"
+            elif "answers" not in body:
+                res["error"] = "no_answers"
+            elif parse:
+                res["answers"] = parse(body)
     except Exception as e:
-        out = _stub(type(e).__name__)
-        out["client_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        res["error"] = type(e).__name__
+    res["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+    res["within_budget"] = res["error"] is None and res["latency_ms"] <= budget_ms()
+    if res["error"] is None:
+        _WARM = True
+    log_decision(source, "stub" if res["error"] else "systemone_http", res["pin"], state,
+                 res["body"], res["error"], res["answers"], res["latency_ms"], label, res["cold"])
+    return res
+
+
+def warmup(post=None, timeout=None):
+    """One tiny call so the model is resident (keep_alive). Once per scan."""
+    if not enabled():
+        return None
+    return ask({"symbol": "warmup", "create_order": False}, WARM_QUESTIONS,
+               source="warmup", post=post, timeout=timeout)
+
+
+def decide(state, post=None, timeout=None, label=None, source="movers_scan"):
+    """POST one shadow decide. Timeout, bad model, or a bad body → stub.
+
+    label is the code's own fee-true label, logged beside the model's answer.
+    """
+    res = ask(state, QUESTIONS, source=source, label=label, post=post,
+              timeout=timeout, parse=_answers)
+    ms = res["latency_ms"]
+    if res["error"]:
+        out = _stub(res["error"])
+        out["client_ms"] = ms
+        out["cold"] = res["cold"]
         return out
-    client_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-    if not isinstance(body, dict):
-        out = _stub("bad_response")
-        out["client_ms"] = client_ms
-        return out
-    if not _response_model_ok(body, pin):
-        out = _stub("model_refused")
-        out["client_ms"] = client_ms
-        return out
-    if "answers" not in body:
-        out = _stub("no_answers")
-        out["client_ms"] = client_ms
-        return out
-    usage = body.get("usage")
+    usage = res["body"].get("usage")
     return {
         "backend": "systemone_http",
         "fail_open": False,
@@ -300,11 +385,13 @@ def decide(state, post=None, timeout=None):
         "mode": "shadow",
         "enforcement": "none",
         "create_order": False,
-        "model": pin,
+        "model": res["pin"],
         "judge": "dont_trade",
-        "answers": _answers(body),
-        "latency_ms": client_ms,
-        "client_ms": client_ms,
+        "answers": res["answers"],
+        "latency_ms": ms,
+        "client_ms": ms,
+        "cold": res["cold"],
+        "within_budget": res["within_budget"],
         "usage": usage if isinstance(usage, dict) else None,
     }
 
@@ -359,11 +446,18 @@ def summary(ranked, informed=None):
             "create_order": False,
             "model": model_pin() or None,
             "judge": "dont_trade",
+            "budget_ms": budget_ms(),
             "informed_mirofish": False,
         }
     rows = [r.get("systemone_shadow") or {} for r in ranked or []]
     ok = [r for r in rows if r.get("backend") == "systemone_http" and not r.get("fail_open")]
     lats = [r.get("latency_ms") for r in ok if isinstance(r.get("latency_ms"), (int, float))]
+    warm = sorted(r["latency_ms"] for r in ok
+                  if not r.get("cold") and isinstance(r.get("latency_ms"), (int, float)))
+
+    def pct(q):  # nearest rank over warm calls only; cold loads are counted apart
+        return warm[min(len(warm) - 1, max(0, math.ceil(q * len(warm)) - 1))] if warm else None
+
     return {
         "enabled": True,
         "backend": "systemone_http" if ok else "stub",
@@ -377,5 +471,10 @@ def summary(ranked, informed=None):
         "n": len(rows),
         "latency_ms_min": min(lats) if lats else None,
         "latency_ms_max": max(lats) if lats else None,
+        "latency_ms_p50": pct(0.50),
+        "latency_ms_p95": pct(0.95),
+        "budget_ms": budget_ms(),
+        "within_budget_n": sum(1 for r in ok if r.get("within_budget")),
+        "cold_n": sum(1 for r in ok if r.get("cold")),
         "informed_mirofish": bool((informed or {}).get("present")),
     }

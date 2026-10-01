@@ -170,7 +170,8 @@ def rank_movers(rows, *, bankroll=BANKROLL, maker=None, taker=None, slip=None,
         row["label"] = fee_true_label(row)
         if s1.enabled():
             row["systemone_shadow"] = s1.decide(
-                s1.compact_state(row, informed), post=systemone_post)
+                s1.compact_state(row, informed, LIMITS), post=systemone_post,
+                label=row["label"])
         if row["label"] == "would_buy":
             row["would_have"] = _would_have(
                 row["price"], notional, maker, taker, slip, impact)
@@ -228,6 +229,8 @@ BINANCE_24H_URLS = (
 )
 BINANCE_MIN_QUOTE_USD = 250_000.0
 _STABLE = frozenset({"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USD", "USDP", "EUR"})
+# Thresholds behind the model's `facts`. Code compares; the model never does.
+LIMITS = {"print_bar_pct": PRINT_BAR_PCT, "min_quote_usd": BINANCE_MIN_QUOTE_USD}
 
 
 def rows_from_cg_markets(payload):
@@ -482,6 +485,7 @@ def build(*, rows=None, fixture_path=None, fetch=None, annotate=None, bankroll=B
     order_before = [r.get("symbol") for r in use]
     if s1.enabled() and informed is None:
         informed = s1.load_informed()
+    s1.warmup(post=systemone_post)  # no-op unless VALEDIA_SYSTEMONE=1
     ranked = rank_movers(
         use, bankroll=bankroll, systemone_post=systemone_post, informed=informed)
     ranked_order = [r["symbol"] for r in ranked]

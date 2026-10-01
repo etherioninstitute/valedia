@@ -4,10 +4,17 @@ VALEDIA_JEV default False → pass-through, zero TypeSafe calls.
 When on: POST /v1/systemone with a tiny JSON state + CIO questions.
 Timeouts/errors/missing key: log + continue. Never blocks live Kalshi.
 Does not change score/direction/bias/weight/Kelly. Research helper, not OMS.
+
+Gates live in code, not in the model call: no number or comparison is asked of
+the model. tiny_state/weather_state add code-computed `facts` and the questions
+refer to those facts. Every decision, both backends, is logged (systemone_log).
+VALEDIA_JEV_BACKEND=nimble2 (opt-in) sends the same questions to loopback
+Ollama /v1/systemone on the Nimble 2 pin; default stays the TypeSafe cloud.
 """
 import json
 import logging
 import os
+import time
 import urllib.request
 
 log = logging.getLogger("jev_shadow")
@@ -15,13 +22,15 @@ log = logging.getLogger("jev_shadow")
 SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-1.13.0"
 TIMEOUT_S = 3.0
+BACKEND_LOCAL = "nimble2"
 
 QUESTIONS = {
     "action": {
         "type": "choice",
         "instructions": (
-            "Which shadow CIO action fits `overall_bias`, `directions`, and "
-            "`events`? Code owns sizing and live orders. Seasoning only."
+            "Using the code-computed `facts`, which shadow CIO action fits "
+            "this report? Do not count or compare. Code owns sizing and live "
+            "orders. Seasoning only."
         ),
         "criteria": {
             "annotate": "Stamp the report; no shadow veto or resize.",
@@ -33,8 +42,8 @@ QUESTIONS = {
     "stand_down": {
         "type": "noul",
         "instructions": (
-            "Should the desk stand down on this report in shadow "
-            "(sit out, not a live halt)?"
+            "Using the code-computed `facts`, should the desk stand down on "
+            "this report in shadow (sit out, not a live halt)?"
         ),
         "criteria": {
             "true": "Report is not actionable; sit out this cycle.",
@@ -43,7 +52,10 @@ QUESTIONS = {
     },
     "report_usable": {
         "type": "noul",
-        "instructions": "Is this compressed MiroFish report usable as shadow seasoning?",
+        "instructions": (
+            "Using the code-computed `facts`, is this compressed MiroFish "
+            "report usable as shadow seasoning?"
+        ),
         "criteria": {
             "true": "Enough structure to judge.",
             "false": "Too thin or contradictory to use.",
@@ -52,8 +64,8 @@ QUESTIONS = {
     "we_are_the_exit": {
         "type": "noul",
         "instructions": (
-            "Does this setup look like we are the exit "
-            "(chasing, late, providing the other side's liquidity)?"
+            "Using the code-computed `facts`, does this setup look like we "
+            "are the exit (chasing, late, providing the other side's liquidity)?"
         ),
         "criteria": {
             "true": "We would be the exit / late chase.",
@@ -137,7 +149,17 @@ def tiny_state(doc):
         else:
             events.append(str(e)[:40])
     cons = doc.get("consensus") if isinstance(doc.get("consensus"), dict) else {}
+    bull, bear = _real(cons.get("bullish")), _real(cons.get("bearish"))
+    facts = {
+        "has_signals": n_signals > 0,
+        "has_events": bool(events),
+        "directions_conflict": len(dirs) > 1,
+        "consensus_side": (
+            None if bull is None or bear is None
+            else "bull" if bull > bear else "bear" if bear > bull else "split"),
+    }
     return {
+        "facts": facts,
         "overall_bias": doc.get("overall_bias"),
         "macro_bias": doc.get("macro_bias"),
         "n_signals": n_signals,
@@ -148,12 +170,18 @@ def tiny_state(doc):
     }
 
 
+def _real(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def _noul(ans, key):
     v = (ans or {}).get(key) or {}
-    try:
-        return float(v.get("noul"))
-    except (TypeError, ValueError):
-        return None
+    for k in ("noul", "probability"):
+        try:
+            return float(v.get(k))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def parse_answers(body):
@@ -165,6 +193,7 @@ def parse_answers(body):
         "model": (body or {}).get("model") or _model(),
         "action": action.get("choice"),
         "action_confidence": action.get("confidence"),
+        "action_probabilities": action.get("probabilities"),
         "stand_down": _noul(ans, "stand_down"),
         "report_usable": _noul(ans, "report_usable"),
         "we_are_the_exit": _noul(ans, "we_are_the_exit"),
@@ -183,32 +212,67 @@ def http_post(url, payload, headers, timeout):
         return json.load(resp)
 
 
-def annotate(doc, post=None):
+def backend():
+    """typesafe (default, cloud) or nimble2 (opt-in, loopback Ollama)."""
+    raw = str(os.environ.get("VALEDIA_JEV_BACKEND") or "").strip().lower()
+    return BACKEND_LOCAL if raw == BACKEND_LOCAL else "typesafe"
+
+
+def _log(caller, backend_name, model, state, body, err, parsed, ms, label):
+    try:
+        import systemone_log as slog
+        slog.log_decision("jev_shadow:" + caller, backend_name, model, state, body,
+                          err, parsed, ms, label)
+    except Exception:
+        pass
+
+
+def _run(caller, state, questions, parse, post, local_post, label=None):
+    """One shadow call on the chosen backend. Logged. Returns a stamp dict."""
+    if backend() == BACKEND_LOCAL:
+        try:
+            import systemone_hotpath_client as s1
+            res = s1.ask(state, questions, source="jev_shadow:" + caller, label=label,
+                         post=local_post, timeout=_timeout(), parse=parse)
+        except Exception as e:
+            return _fail(type(e).__name__)
+        if res["error"]:
+            return _fail(res["error"])
+        out = dict(res["answers"])
+        out["backend"] = BACKEND_LOCAL
+        out["model"] = res["body"].get("model") or res["pin"]
+        return out
+    t0 = time.perf_counter()
+    body = out = err = None
+    key = api_key()
+    if not key:
+        err = "no_key"
+    else:
+        try:
+            body = (post or http_post)(
+                SYSTEMONE_URL,
+                {"state": state, "model": _model(), "questions": questions},
+                {"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                _timeout(),
+            )
+            if not isinstance(body, dict) or "answers" not in body:
+                err = "bad_response"
+            else:
+                out = parse(body)
+                out["backend"] = "typesafe"
+        except Exception as e:
+            err = type(e).__name__
+    ms = None if err == "no_key" else round((time.perf_counter() - t0) * 1000.0, 2)
+    _log(caller, "typesafe_cloud", _model(), state, body, err, out, ms, label)
+    return _fail(err) if err else out
+
+
+def annotate(doc, post=None, local_post=None):
     """Pass-through if Jev off. Shadow-stamp `jev` if on. Fail-open. Never skips live."""
     if not jev_on():
         return doc
     doc = dict(doc or {})
-    key = api_key()
-    if not key:
-        doc["jev"] = _fail("no_key")
-        return doc
-    fn = post or http_post
-    try:
-        body = fn(
-            SYSTEMONE_URL,
-            {"state": tiny_state(doc), "model": _model(), "questions": QUESTIONS},
-            {
-                "Authorization": "Bearer " + key,
-                "Content-Type": "application/json",
-            },
-            _timeout(),
-        )
-        if not isinstance(body, dict) or "answers" not in body:
-            doc["jev"] = _fail("bad_response")
-            return doc
-        doc["jev"] = parse_answers(body)
-    except Exception as e:
-        doc["jev"] = _fail(type(e).__name__)
+    doc["jev"] = _run("annotate", tiny_state(doc), QUESTIONS, parse_answers, post, local_post)
     return doc
 
 
@@ -216,7 +280,8 @@ WEATHER_QUESTIONS = {
     "agree": {
         "type": "choice",
         "instructions": (
-            "Given settle value, research tags, and the book price, do they agree? "
+            "Using the code-computed `facts`, plus the settle source and research "
+            "tags, do they agree with the book? Do not compare numbers. "
             "Shadow only. Do not send."
         ),
         "criteria": {
@@ -256,7 +321,16 @@ def weather_state(bundle):
     for t in (b.get("research_tags") or [])[:6]:
         if isinstance(t, dict):
             tags.append(t.get("source"))
+    fv, px, ev = _real(b.get("fv")), _real(b.get("price")), _real(b.get("fee_true_ev"))
+    facts = {
+        "settle_present": sf.get("value") is not None,
+        "fv_vs_book": (
+            None if fv is None or px is None
+            else "above" if fv > px else "below" if fv < px else "equal"),
+        "fee_true_ev_positive": None if ev is None else ev > 0,
+    }
     return {
+        "facts": facts,
         "ticker": b.get("ticker"),
         "settle_source": sf.get("source"),
         "settle_value": sf.get("value"),
@@ -281,12 +355,13 @@ def parse_weather_answers(body):
         "model": (body or {}).get("model") or _model(),
         "agree": agree.get("choice"),
         "confidence": agree.get("confidence"),
+        "agree_probabilities": agree.get("probabilities"),
         "confidence_noul": _noul(ans, "confidence"),
         "status_honesty": honest.get("choice"),
     }
 
 
-def annotate_weather(bundle, post=None):
+def annotate_weather(bundle, post=None, local_post=None):
     """Shadow stamp on a weather row. Off = identity. Fail-open.
 
     Adds `jev` only. Does not resize, veto, or send. Agree is not a pass.
@@ -294,27 +369,9 @@ def annotate_weather(bundle, post=None):
     if not jev_on():
         return bundle
     bundle = dict(bundle or {})
-    key = api_key()
-    if not key:
-        bundle["jev"] = _fail("no_key")
-    else:
-        fn = post or http_post
-        try:
-            body = fn(
-                SYSTEMONE_URL,
-                {"state": weather_state(bundle), "model": _model(), "questions": WEATHER_QUESTIONS},
-                {
-                    "Authorization": "Bearer " + key,
-                    "Content-Type": "application/json",
-                },
-                _timeout(),
-            )
-            if not isinstance(body, dict) or "answers" not in body:
-                bundle["jev"] = _fail("bad_response")
-            else:
-                bundle["jev"] = parse_weather_answers(body)
-        except Exception as e:
-            bundle["jev"] = _fail(type(e).__name__)
+    bundle["jev"] = _run(
+        "annotate_weather", weather_state(bundle), WEATHER_QUESTIONS,
+        parse_weather_answers, post, local_post, label=bundle.get("tag"))
     bundle["jev"]["oms"] = False
     return bundle
 
