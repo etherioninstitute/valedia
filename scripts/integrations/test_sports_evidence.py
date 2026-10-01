@@ -267,9 +267,10 @@ def test_attestation_never_synthesized():
         opp, ev = se.build_sports_opp(sports_bet(), **{k: env[k] for k in ("bankroll", "fv_fn", "fmap")})
     assert "sports_attestation" not in opp and ev["sports_attestation"] is None
     assert "sports_attestation" not in ibc.informed_from_opp(opp)
-    src = open(os.path.join(HERE, "sports_engine.py")).read()
-    assert not re.search(r"sports_attestation['\"]?\s*[\]:=]+\s*True", src), "attestation literal True"
-    assert not re.search(r"sports_geo['\"]?\s*[\]:=]+\s*['\"]pass", src)
+    for name in ("sports_engine.py", "sports_evidence.py"):
+        src = open(os.path.join(HERE, name)).read()
+        assert not re.search(r"sports_attestation['\"]?\s*[\]:=]+\s*True", src), f"attestation literal True in {name}"
+        assert not re.search(r"sports_geo['\"]?\s*[\]:=]+\s*['\"]pass", src), name
 
 
 # ── (4) dry_run never calls create_order (nor the book GET) ──
