@@ -19,6 +19,10 @@ Rule (decide):
   none   neither clears. VALEDIA_MAKER_FIRST_ENFORCE OFF (default) → legacy action, annotated
          "legacy". ON → SKIP_NO_ROUTE (removes orders, never adds).
 
+Maker floor at the quote (default): a maker priced below the quote must also pass
+create_preflight at the quoted price (preflight()), so routing never admits an order the
+baseline refused. VALEDIA_MAKER_FIRST_ENFORCE on → judged only at the maker's own price.
+
 Taker floor (UNCONDITIONAL): whatever the route, an order placed as taker (action taker, or a
 "maker" priced at/through the ask) must pass kalshi_profit.taker_clears_floor — the same rule
 create_preflight applies to role=taker — else SKIP_TAKER_HURDLE. The chosen role is passed to
@@ -175,7 +179,7 @@ def route_allocation(a, n, price_cents, mgr=None, cfg=None, plan_fn=None, now=No
 
     Fail-closed is the caller's job (any exception here → SKIP_EV_PREFLIGHT there)."""
     import kalshi_profit as kp
-    out = {"action": "taker", "price_cents": price_cents, "row": {}}
+    out = {"action": "taker", "price_cents": price_cents, "quoted_cents": price_cents, "row": {}}
     if mgr is not None and any(i.get("ticker") == a.get("ticker")
                                for i in (getattr(mgr, "active_orders", {}) or {}).values()):
         out.update(status="SKIP_MAKER_RESTING", error="resting maker order already on ticker")
@@ -242,3 +246,21 @@ def route_allocation(a, n, price_cents, mgr=None, cfg=None, plan_fn=None, now=No
         out["status"] = "SKIP_MAKER_FIRST"
         return False, a, out
     return True, a, out
+
+
+def preflight(ibc, a, n, price_cents, quoted_cents):
+    """create_preflight for the order actually placed.
+
+    Default: an order priced below the quote (a maker) must ALSO pass create_preflight at the
+    quoted price, so the admitted set can only shrink vs the pre-maker-routing baseline (the
+    floor's dome_extra(P) and the Kelly cap both loosen at a lower P).
+    VALEDIA_MAKER_FIRST_ENFORCE on: judged at the real execution price only (fairer floor).
+    """
+    pre = ibc.create_preflight(a, n, price_cents)
+    if not pre["ok"] or int(price_cents) == int(quoted_cents) or enforce_on():
+        return pre
+    q = ibc.create_preflight(a, n, quoted_cents)
+    if q["ok"]:
+        return pre
+    return {"ok": False, "reasons": ["quoted_" + r for r in q["reasons"]],
+            "informed": pre["informed"]}

@@ -428,7 +428,7 @@ def run_scan(poly, kalshi, *, path=None, post_fn=None, equity=1000.0, env=None,
     for cand in sorted(cands, key=lambda c: c.get("edge_pct") or 0, reverse=True):
         row = decide(cand, state, limits=limits, env=env, post_fn=post_fn, timeout=timeout)
         import arb_live  # gated live promotion (VALEDIA_ARB_LIVE default OFF → None, paper only)
-        live = arb_live.maybe_promote(cand, env=env)
+        live = arb_live.maybe_promote(cand, env=env, paper_row=row, ornith_post=post_fn)
         if live is not None:
             row["arb_live"] = live
         append_decision(row, path)

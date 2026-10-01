@@ -243,6 +243,13 @@ class Stub:
             raise OSError("fills down")
         return {"fills": list(self._fills)}
 
+    status = None
+
+    def get_order(self, oid):
+        if self.status is None:
+            raise OSError("GET down")
+        return {"order": {"order_id": oid, "status": self.status}}
+
 
 def _mgr(stub, **kw):
     sf = tempfile.mktemp(suffix=".json")
@@ -305,27 +312,126 @@ def test_stale_maker_cancelled_and_late_fill_reconciled():
         o3 = m3.place_maker_order("KXM-3", "yes", 1, 30)
         m3.check_and_manage()
         assert o3 in m3.active_orders and m3._orders[o3]["cancel_attempts"] == 1
+        # after MAX_CANCEL_ATTEMPTS: flagged cancel_failed + alert, STILL resting (never dropped)
+        for _ in range(ep.MAX_CANCEL_ATTEMPTS + 2):
+            m3.check_and_manage()
+        assert m3._orders[o3].get("cancel_failed") is True and o3 in m3.active_orders
+        fl.status = "resting"  # GET says still live → keep tracking + retry the cancel
+        m3.check_and_manage()
+        assert o3 in m3.active_orders
+        fl.status = "canceled"  # GET confirms gone → reconcile-only (no longer resting)
+        m3.check_and_manage()
+        assert o3 not in m3.active_orders and m3._orders[o3]["cancel_reason"] == "cancel_failed_gone"
         for p in (sf, sf3):
             os.path.exists(p) and os.remove(p)
     finally:
         ftl.record_entry = orig
 
 
-def test_reprice_reposts_only_remainder():
+class InformedStub(Stub):
+    def __init__(self):
+        super().__init__()
+        self.informed = []
+
+    def place_order(self, t, side, n, p, informed=None):
+        self.informed.append(informed)
+        return super().place_order(t, side, n, p)
+
+
+def test_reprice_reposts_only_remainder_through_preflight():
+    import informed_before_create as ibc
     rec, orig = _capture()
     try:
-        stub = Stub()
-        m, sf = _mgr(stub)
-        oid = m.place_maker_order("KXM-4", "yes", 7, 40)
-        stub._fills = [{"order_id": oid, "count": 3}]
+        inf = ibc.informed_from_opp(dict(h3._admitted_sports_opp("KXM"), bid=0.45, ask=0.50))
         book = ep.MARKET_STATE.update_book("KXM-4", {"orderbook": {
             "yes": [{"price": 45, "size": 5}], "no": [{"price": 50, "size": 5}]}})
-        assert m._check_reprice(oid, m._orders[oid], book) is True
+        stub = InformedStub()
+        m, sf = _mgr(stub)
+        oid = m.place_maker_order("KXM-4", "yes", 7, 40, informed=inf)
+        m2 = ep.MakerOrderManager(api=stub, state_file=sf)  # informed survives the JSON state
+        assert m2._orders[oid]["informed"]["fv"] == inf["fv"]
+        stub._fills = [{"order_id": oid, "count": 3}]
+        assert m2._check_reprice(oid, m2._orders[oid], book) is True
         assert stub.cancelled == [oid] and stub.placed[-1] == ("KXM-4", "yes", 4, 46), stub.placed
+        assert stub.informed[-1] and stub.informed[-1]["fv"] == inf["fv"], "re-post carries informed"
         assert [x[0][4] for x in rec] == [3.0]
-        os.path.exists(sf) and os.remove(sf)
+        # no informed (or preflight refuses at the new price) → cancel only, nothing re-posted
+        stub2 = InformedStub()
+        m3, sf3 = _mgr(stub2)
+        o3 = m3.place_maker_order("KXM-4", "yes", 7, 40)
+        assert m3._check_reprice(o3, m3._orders[o3], book) is True
+        assert stub2.cancelled == [o3] and len(stub2.placed) == 1, stub2.placed
+        for p in (sf, sf3):
+            os.path.exists(p) and os.remove(p)
     finally:
         ftl.record_entry = orig
+
+
+# ------------------------------------------------------------------ differential vs baseline
+def _baseline_admits(alloc):
+    """The pre-maker-routing allocator decision on the same inputs (default flags): annotate
+    (gates off → proceed), session clock, then create_preflight at the QUOTED price with the
+    route's own role. Nimble is disabled (VALEDIA_SYSTEMONE unset) → allow."""
+    import copy
+    import informed_before_create as ibc
+    import session_clocks as sc
+    a = copy.deepcopy(alloc)
+    n = max(1, int(a["allocation"] / a["price"]))
+    quoted = max(1, min(99, int(a["price"] * 100)))
+    ok, a = kp.annotate(a, contracts=n)
+    if not ok or sc.before_create(a):
+        return False
+    return ibc.create_preflight(a, n, quoted)["ok"]
+
+
+def _grid():
+    for p in (0.30, 0.50, 0.55, 0.80):
+        for spread in (1, 2, 4, 7):
+            for edge in (0.0, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.06, 0.10):
+                for mm, tm in ((FREE, FREE), (FREE, 1.0), (1.0, 1.0)):
+                    for hours in (1, 8):
+                        a = _alloc(series="DIF", hours=hours, maker_m=mm, taker_m=tm)
+                        bid = round(p - spread / 100.0, 2)
+                        a.update(price=p, edge=edge, bid=bid, ask=p,
+                                 raw={"yes_bid": bid, "yes_ask": p,
+                                      "no_bid": round(1 - p, 2), "no_ask": round(1 - bid, 2)})
+                        yield (p, spread, edge, mm, tm, hours), a
+
+
+def test_differential_default_admits_subset_of_baseline():
+    """Identical fake inputs over a grid: HEAD (default config) admits ⊆ baseline admits."""
+    import copy
+    head_n = base_n = 0
+    leaks, n = [], 0
+    for key, a in _grid():
+        n += 1
+        base = _baseline_admits(a)
+        r, orders, mgr = _run(copy.deepcopy(a))
+        head = r["status"] in ("MAKER_PLACED", "EXECUTED", "UNRECONCILED")
+        assert head == bool(orders or mgr.placed), (key, r)
+        head_n += head
+        base_n += base
+        if head and not base:
+            leaks.append((key, r["status"], r.get("route"), r.get("route_why")))
+    assert not leaks, leaks[:5]
+    # the verifier's case: 50c / bid 48 / edge 0.02 on a free-maker series → refused
+    a = dict(_alloc(series="DIF"), price=0.50, edge=0.02, bid=0.48, ask=0.50,
+             raw={"yes_bid": 0.48, "yes_ask": 0.50, "no_bid": 0.50, "no_ask": 0.52})
+    r, orders, mgr = _run(a)
+    assert r["status"] not in ("MAKER_PLACED", "EXECUTED") and not orders and not mgr.placed, r
+    print("  differential: %d scenarios, head admits %d, baseline admits %d, leaks 0"
+          % (n, head_n, base_n))
+
+
+def test_enforce_judges_maker_at_its_own_price():
+    a = dict(_alloc(series="DIF"), price=0.50, edge=0.02, bid=0.48, ask=0.50,
+             raw={"yes_bid": 0.48, "yes_ask": 0.50, "no_bid": 0.50, "no_ask": 0.52})
+    os.environ["VALEDIA_MAKER_FIRST_ENFORCE"] = "1"
+    try:
+        r, orders, mgr = _run(a)
+    finally:
+        os.environ.pop("VALEDIA_MAKER_FIRST_ENFORCE", None)
+    assert r["status"] == "MAKER_PLACED" and mgr.placed == [("DIF-1", "yes", 10, 49)], r
 
 
 if __name__ == "__main__":

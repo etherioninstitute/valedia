@@ -111,6 +111,35 @@ def get_order(order_id):
         return None
 
 
+def recent_buy_orders(pair, since_iso, request=None):
+    """Read-only: BUY orders for `pair` created at/after since_iso (RFC3339) that may have
+    executed (FAILED, and zero-fill CANCELLED/EXPIRED, dropped). [] = venue says none.
+    None on ANY error = unknown (callers must never treat it as "none").
+    Used by strategy_modules.DCAEngine before retrying an ambiguous buy. `request` is a test seam.
+    """
+    from urllib.parse import urlencode
+    try:
+        q = urlencode({"product_ids": pair, "order_side": "BUY", "start_date": since_iso,
+                       "limit": 50})
+        r = (request or _request)("GET", f"/api/v3/brokerage/orders/historical/batch?{q}")
+        if not r.ok:
+            return None
+        out = []
+        for o in r.json().get("orders", []) or []:
+            st = str(o.get("status") or "").upper()
+            filled = float(o.get("filled_size") or 0)
+            if o.get("product_id") not in (None, pair) or str(o.get("side") or "BUY").upper() != "BUY":
+                continue
+            if st == "FAILED" or (st in ("CANCELLED", "EXPIRED") and filled <= 0):
+                continue
+            out.append({k: o.get(k) for k in ("order_id", "client_order_id", "status",
+                                              "created_time", "filled_size",
+                                              "average_filled_price", "total_fees")})
+        return out
+    except Exception:
+        return None
+
+
 def get_orders(status="OPEN"):
     r = _request("GET", f"/api/v3/brokerage/orders/historical?order_status={status}&limit=10")
     if not r.ok: return []

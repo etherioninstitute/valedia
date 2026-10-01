@@ -65,6 +65,37 @@ def get_order(order_id):
     except Exception:
         return None
 
+def recent_buy_orders(symbol, since_iso, get=None):
+    """Read-only: buy orders for `symbol` submitted after since_iso that may have executed
+    (rejected, and zero-fill canceled/expired, dropped). [] = venue says none.
+    None on ANY error = unknown (callers must never treat it as "none").
+    Used by strategy_modules.DCAEngine before retrying an ambiguous buy. `get` is a test seam.
+    """
+    try:
+        if get is None:
+            import requests
+            get = requests.get
+        r = get(f"{_base()}/v2/orders", headers=_headers(), timeout=10,
+                params={"status": "all", "after": since_iso, "symbols": symbol,
+                        "side": "buy", "limit": 50})
+        if not r.ok:
+            return None
+        out = []
+        for o in r.json() or []:
+            st = str(o.get("status") or "").lower()
+            filled = float(o.get("filled_qty") or 0)
+            if o.get("symbol") not in (None, symbol) or str(o.get("side") or "buy").lower() != "buy":
+                continue
+            if st == "rejected" or (st in ("canceled", "expired") and filled <= 0):
+                continue
+            out.append({"order_id": o.get("id"), "client_order_id": o.get("client_order_id"),
+                        "status": st, "filled_qty": o.get("filled_qty"),
+                        "filled_avg_price": o.get("filled_avg_price"),
+                        "notional": o.get("notional")})
+        return out
+    except Exception:
+        return None
+
 def market_buy(symbol, notional=None, qty=None):
     """Buy stock by dollar amount (fractional) or quantity."""
     import valedia_config as vc

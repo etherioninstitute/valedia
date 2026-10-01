@@ -27,7 +27,7 @@ recomputed per order as kalshi_fee(P, C*m), not scaled; only the bound scales.
 
 CLI:
   python3 backtest_gate.py --baseline a.json --candidate b.json \
-      [--ledger PATH] [--live-only] [--seed 7] [--n-boot 2000] [--min-n 30] \
+      [--ledger PATH] [--live-only] [--category ARB] [--seed 7] [--n-boot 2000] [--min-n 30] \
       [--max-p-worse 0.35] [--max-dd-worse 0.20]
 --min-n below HARD_MIN_N (30) is clamped up to 30 with a report warning.
 JSON report -> stdout, one-line summary -> stderr.
@@ -35,6 +35,7 @@ Exit: 0 PASS, 1 FAIL, 2 INSUFFICIENT_DATA, 3 usage/input error.
 (c) GOATWORTHY Post LLC.
 """
 import os, sys, json, math, random, argparse
+from datetime import datetime, timezone
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -423,14 +424,19 @@ def summary_line(report):
     return line
 
 
-def run_gate(ledger_path, baseline, candidate, live_only=False, **kw):
-    """Load ledger + policies, evaluate, attach ledger stats. Pure w.r.t. the ledger (read-only)."""
+def run_gate(ledger_path, baseline, candidate, live_only=False, category=None, **kw):
+    """Load ledger + policies, evaluate, attach ledger stats. Pure w.r.t. the ledger (read-only).
+    category: replay ONLY that canonical category's trades; the report records it (exact)."""
     recs, bad = load_ledger(ledger_path)
     trades, stats = build_trades(recs, live_only=live_only)
+    if category:
+        category = canonical_category(category)
+        trades = [t for t in trades if t["category"] == category]
     stats["records"] = len(recs) + bad
     stats["malformed_skipped"] = stats.get("malformed_skipped", 0) + bad
     report = evaluate(trades, load_policy(baseline), load_policy(candidate), **kw)
-    report.update({"tool": "backtest_gate", "ledger": os.path.abspath(ledger_path),
+    report.update({"tool": "backtest_gate", "category": category or None,
+                   "ledger": os.path.abspath(ledger_path),
                    "live_only": bool(live_only), "ledger_stats": stats,
                    "fee_fn": "forward_test_ledger.kalshi_fee (ceil(0.07*C*P*(1-P)) per order)"})
     report["summary"] = summary_line(report)
@@ -450,6 +456,7 @@ def main(argv=None):
     ap.add_argument("--candidate", required=True, help="candidate policy JSON")
     ap.add_argument("--ledger", default=DEFAULT_LEDGER)
     ap.add_argument("--live-only", action="store_true", help="exclude backfill rows")
+    ap.add_argument("--category", default=None, help="replay only this category (e.g. ARB)")
     ap.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     ap.add_argument("--n-boot", type=int, default=DEFAULTS["n_boot"])
     ap.add_argument("--min-n", type=int, default=DEFAULTS["min_n"])
@@ -460,11 +467,13 @@ def main(argv=None):
         ap.error("--n-boot and --min-n must be >= 1")
     try:
         report = run_gate(a.ledger, a.baseline, a.candidate, live_only=a.live_only,
+                          category=a.category,
                           min_n=a.min_n, max_p_worse=a.max_p_worse,
                           max_dd_worse=a.max_dd_worse, n_boot=a.n_boot, seed=a.seed)
     except (OSError, ValueError) as e:
         sys.stderr.write(f"backtest_gate: input error: {e}\n")
         return 3
+    report["generated_at"] = datetime.now(timezone.utc).isoformat()  # freshness (arb_live)
     print(json.dumps(report, indent=2, sort_keys=True))
     sys.stderr.write(report["summary"] + "\n")
     return EXIT_CODES[report["verdict"]]
