@@ -66,7 +66,7 @@ def facts(get=None, gp=None, ledger=None):
 def test_facts_attack():
     base = facts()
     assert base == ["Cash (Kalshi, broker): $100.00", "Open-position cost (Kalshi, broker): $2.50",
-                    "Open positions (Kalshi, broker): 1", "Realized P&L (ledger, all venues, fee-incl.): +$1.00 (1W/0L)"], base
+                    "Open positions (Kalshi, broker): 1", "Realized P&L (all-time, ledger, all venues, fee-incl.): +$1.00 (1W/0L)"], base
     omitted = "Cash (Kalshi, broker): omitted — unavailable"
     for bal in ({"balance": 1e40}, {"balance": 1e20}, {"balance_cents": 100}, {"balance": True},
                 {"balance": [1]}, {"balance": "١٢٣"}, {"balance": "NaN"}, {"balance": "1e400"}):
@@ -76,13 +76,13 @@ def test_facts_attack():
         assert facts(get=lambda e, b=bal: {"balance": b})[0] == f"Cash (Kalshi, broker): {want}", bal
     assert facts(get=seq({"balance": 100}, {"balance": 100.4}))[0] == "Cash (Kalshi, broker): $1.00"
     r = lambda rows: facts(ledger=lambda: rows)[3]  # noqa: E731
-    assert r(led([-0.005])) == "Realized P&L (ledger, all venues, fee-incl.): −$0.01 (0W/1L)"
-    assert r(led([0.005])) == "Realized P&L (ledger, all venues, fee-incl.): +$0.01 (1W/0L)"
+    assert r(led([-0.005])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$0.01 (0W/1L)"
+    assert r(led([0.005])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): +$0.01 (1W/0L)"
     assert r(led([-0.0049])) == r(led([-0.0])).replace("0W/1L", "0W/1L") and "-$0.00" not in r(led([-0.0049]))
-    assert r(led(["-3.5"], won=[False])) == "Realized P&L (ledger, all venues, fee-incl.): −$3.50 (0W/1L)"
-    assert r(led([1.005, 2.675])) == "Realized P&L (ledger, all venues, fee-incl.): +$3.68 (2W/0L)"
-    assert r(led([-5.0], won=["false"])) == "Realized P&L (ledger, all venues, fee-incl.): −$5.00 (0W/1L)"
-    unp = "Realized P&L (ledger, all venues, fee-incl.): omitted — unavailable (unparseable rows)"
+    assert r(led(["-3.5"], won=[False])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$3.50 (0W/1L)"
+    assert r(led([1.005, 2.675])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): +$3.68 (2W/0L)"
+    assert r(led([-5.0], won=["false"])) == "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (0W/1L)"
+    unp = "Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — unavailable (unparseable rows)"
     for rows in (led([float("nan")]), led([None]), led([1e30]), led([5.0], won=[None]),
                  led([5.0], won=["yes"]), led([5.0], won=[1]),
                  led([5.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",
@@ -90,7 +90,7 @@ def test_facts_attack():
         assert r(rows) == unp, rows
     dup = led([5.0], extra=[{"type": "settlement", "entry_id": "e0", "source": "live", "logged_at": t(1),
                              "realized_pnl_net": 5.0, "won": True}])
-    assert r(dup) == "Realized P&L (ledger, all venues, fee-incl.): +$5.00 (1W/0L)", r(dup)  # counted once
+    assert r(dup) == "Realized P&L (all-time, ledger, all venues, fee-incl.): +$5.00 (1W/0L)", r(dup)  # counted once
     fut = led([5.0], extra=[{"type": "entry", "id": "f", "source": "live",
                              "logged_at": (NOW + timedelta(days=1)).isoformat()}])
     assert r(fut).endswith("STALE (future-dated rows, suspect)")
@@ -114,55 +114,56 @@ def test_facts_attack():
     assert p({"market_positions": [], "ts": t(0.01)}) == "Open-position cost (Kalshi, broker): $0.00"
 
 
+P = "Profit (settled since last report): "
+AT = "Realized P&L (all-time, ledger, all venues, fee-incl.): "
+
+
 def _ping(recs):
-    shutil.rmtree(os.environ["VALEDIA_SIGNAL_DIR"], ignore_errors=True)
-    sent = []
-    parts = sr.ftl_profit_parts(recs=recs, minutes=50 * 60 * 24, now=NOW)
-    body = sr.format_settled_signal(parts["new_pnl"], parts["w"], parts["l"], parts["total_net"],
-                                    f"{parts['tw']}W/{parts['tl']}L")
-    res = sr.profit_ping(parts, body, ledger=lambda: recs, send_fn=lambda m: sent.append(m) or True, now=NOW)
-    return res, sent
+    """Full settle_run.run() on these rows (fresh, existing-but-empty sent-record)."""
+    from test_signal_v14 import Settle
+    with Settle(fresh_record=True) as st_:
+        st_.write([r for r in recs])
+        return st_.run(NOW)
 
 
 def test_settle_attack():
-    rest._fresh_dir()
-    res, sent = _ping(led([2.5, -1.0], won=[True, False]))
-    assert res["status"] == "verified" and sent[0].startswith(
-        "Profit (settled since last report): +$1.50 (1W/1L) Realized (ledger, fee-incl.)\nTotal (all-time realized, ledger): +$1.50 (1W/1L)"), sent
-    for name, recs in [("missing", led([2.0, 3.0], missing=(0,))), ("None", led([None, 3.0])),
-                       ("nan", led([float("nan")])), ("nan str", led(["NaN"])), ("inf", led([float("inf")])),
+    sent = _ping(led([2.5, -1.0], won=[True, False]))
+    assert sent == [f"{P}+$1.50 (1W/1L)\n{AT}+$1.50 (1W/1L)"], sent
+    warn = "⚠ 1 ledger row(s) unparseable — all-time total omitted"
+    for name, recs in [("missing", led([2.0, 3.0], missing=(0,))), ("None", led([None, 3.0]))]:
+        assert _ping(recs) == [f"{P}+$3.00 (1W/0L)\n{warn}"], name  # bad row never blocks a valid one
+    for name, recs in [("nan", led([float("nan")])), ("nan str", led(["NaN"])), ("inf", led([float("inf")])),
                        ("garbage", led(["abc"])), ("huge", led([1e30])), ("won None", led([1.0], won=[None])),
-                       ("won str", led([1.0], won=["maybe"])),
-                       ("orphan", led([1.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",
-                                                     "logged_at": t(0.1), "realized_pnl_net": 9.0, "won": True}]))]:
-        res, sent = _ping(recs)
-        assert res["status"] == "withheld", (name, res)
-        assert sent == ["Report withheld (Profit): ledger settlement rows unparseable. Unverified figures "
-                        "not sent; see data/signal/verify_log.jsonl."], (name, sent)
-    for pnl, won, want in ((-0.004, False, "Profit (settled since last report): $0.00 (0W/1L)"),
-                           (0.125, True, "Profit (settled since last report): +$0.13 (1W/0L)"),
-                           (-0.125, False, "Profit (settled since last report): −$0.13 (net loss) (0W/1L)"),
-                           (-7.5, False, "Profit (settled since last report): −$7.50 (net loss) (0W/1L)")):
-        res, sent = _ping(led([pnl], won=[won]))
-        assert res["status"] == "verified" and sent[0].startswith(want), (pnl, sent)
+                       ("won str", led([1.0], won=["maybe"]))]:
+        assert _ping(recs) == ["⚠ 1 ledger row(s) unparseable — their figures withheld until fixed"], name
+    orphan = led([1.0], extra=[{"type": "settlement", "entry_id": "zz", "source": "live",
+                                "logged_at": t(0.1), "realized_pnl_net": 9.0, "won": True}])
+    assert _ping(orphan) == [f"{P}+$1.00 (1W/0L)\n{warn}"]
+    for pnl, won, want in ((-0.004, False, f"{P}$0.00 (0W/1L)"), (0.125, True, f"{P}+$0.13 (1W/0L)"),
+                           (-0.125, False, f"{P}−$0.13 (net loss) (0W/1L)"),
+                           (-7.5, False, f"{P}−$7.50 (net loss) (0W/1L)")):
+        sent = _ping(led([pnl], won=[won]))
+        assert sent and sent[0].startswith(want), (pnl, sent)
     dup = led([5.0], extra=[{"type": "settlement", "entry_id": "e0", "source": "live", "logged_at": t(0.05),
                              "realized_pnl_net": 5.0, "won": True}])
-    res, sent = _ping(dup)
-    assert sent[0].startswith("Profit (settled since last report): +$5.00 (1W/0L)"), sent
-    assert sv.profit_ping is not None  # back-compat delegator
+    assert _ping(dup) == [f"{P}+$5.00 (1W/0L)\n{AT}+$5.00 (1W/0L)"]  # identical duplicate counted once
 
 
 def test_pnl_run_attack():
-    for recs, want in ((led([-0.004], won=[False]), "Profit (all-time realized, ledger): $0.00 fee-incl."),
-                       (led([0.125]), "Profit (all-time realized, ledger): +$0.13 fee-incl."),
-                       (led([-7.5], won=[False]), "Profit (all-time realized, ledger): −$7.50 (net loss) fee-incl.")):
+    for recs, want in ((led([-0.004], won=[False]), "Realized P&L (all-time, ledger, all venues, fee-incl.): $0.00 · 0W/1L"),
+                       (led([0.125]), "Realized P&L (all-time, ledger, all venues, fee-incl.): +$0.13 · 1W/0L"),
+                       (led([-7.5], won=[False]), "Realized P&L (all-time, ledger, all venues, fee-incl.): −$7.50 (net loss) · 0W/1L")):
         rest._fresh_dir()
         sent = []
         r = pnl_run.pnl_report(get_positions=POS, ledger=lambda: recs, send_fn=lambda m: sent.append(m) or True,
                                now=NOW)
         assert r["status"] == "verified" and want in sent[0], (want, sent)
-    for name, gp, recs in (("missing pnl", POS, led([1.0], missing=(0,))),
-                           ("huge exposure", lambda: {"market_positions": [{"ticker": "A", "position": 1,
+    rest._fresh_dir()
+    sent = []
+    r = pnl_run.pnl_report(get_positions=POS, ledger=lambda: led([1.0], missing=(0,)),
+                           send_fn=lambda m: sent.append(m) or True, now=NOW)
+    assert r["status"] == "verified" and "fee-incl.): omitted — 1 ledger row(s) unparseable" in sent[0], sent
+    for name, gp, recs in (("huge exposure", lambda: {"market_positions": [{"ticker": "A", "position": 1,
                                                                             "market_exposure": 1e18}]}, led([1.0])),
                            ("garbage venue ts", lambda: dict(POS(), ts="garbage"), led([1.0])),
                            ("future venue ts", lambda: dict(POS(), ts=(NOW + timedelta(days=2)).isoformat()),
@@ -188,7 +189,7 @@ def test_invested_attack():
         r = sv.invested_ping(executed, ledger=lambda: entries, send_fn=lambda m: sent.append(m) or True, now=NOW)
         return r, sent
     r, sent = go([e("o1"), e("o2")])
-    assert r["status"] == "verified" and sent[0].startswith("Invested: $8.14 on 2 games"), sent
+    assert r["status"] == "verified" and sent[0].startswith("Sports fills cost incl. fees (ledger): $8.14 on 2 games"), sent
     for name, rows in [("renamed", [e("o1", entry_price=None, price=0.4), e("o2", entry_price=None, price=0.4)]),
                        ("nan", [e("o1", entry_price=float("nan")), e("o2")]),
                        ("garbage", [e("o1", entry_price="abc"), e("o2")]),
@@ -200,7 +201,7 @@ def test_invested_attack():
         r, sent = go(rows)
         assert r["status"] == "withheld" and len(sent) == 1 and "$" not in sent[0], (name, sent)
     r, sent = go([e("o1"), e("o1", entry_price=0.9), e("o2")])  # duplicate rows never double-count
-    assert sent[0].startswith("Invested: $8.14 on 2 games"), sent
+    assert sent[0].startswith("Sports fills cost incl. fees (ledger): $8.14 on 2 games"), sent
 
 
 def test_kalshi_alert_classes():
@@ -215,7 +216,7 @@ def test_kalshi_alert_classes():
     sent = []
     r = ka.brief(ke=ke(), get_positions=POS, send_fn=lambda m: sent.append(m) or True, now=NOW,
                  state=st, opps=opp)
-    assert r["status"] == "verified" and "Invested: $2.50" in sent[0] and "Modeled if-all-win: +$1.50" in sent[0]
+    assert r["status"] == "verified" and "Open-position cost (Kalshi, broker): $2.50" in sent[0] and "Modeled if-all-win: +$1.50" in sent[0]
     for name, kw in [("nan cost", {"k": ke({"status": "DRY_RUN", "contracts": 10, "total_cost": float("nan"),
                                             "potential_profit": 1.5})}),
                      ("garbage upside", {"k": ke({"status": "DRY_RUN", "contracts": 10, "total_cost": 8.0,

@@ -101,7 +101,7 @@ def test_executor_alert_verified_modeled_fenced_excluded():
     assert "$2.10" in report and "$6.10" not in report, report
     assert len(send.msgs) == 1, send.msgs
     t = send.msgs[0]
-    assert "Invested: $3.20" in t and "Modeled if-all-win: +$2.10" in t and "not profit" in t, t
+    assert "Open-position cost (Kalshi, broker): $3.20" in t and "Modeled if-all-win: +$2.10" in t and "not profit" in t, t
     assert "4.00" not in t and "estimated profit" not in t.lower()
     assert "✓ verified" in t
     assert _log(d)[-1]["kind"] == "7am brief" and _log(d)[-1]["status"] == "verified"

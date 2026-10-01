@@ -506,9 +506,13 @@ def run(dry_run=False):
         lines.append(f"  {icon} {r['status']:12} {r['fav_title'][:30]} ${r['cost']:.2f}")
         if r.get('error'): lines.append(f"    ERR: {r['error']}")
     
-    # Log bets
-    log = load_log()
-    for r in results:
+    # Log bets — a log read/write failure never blocks the Signal pings below
+    try:
+        log = load_log()
+    except Exception as e:
+        print(f"[sports_engine] sports log unreadable, not saved: {e}", file=sys.stderr)
+        log = None  # never overwrite an unreadable log with a partial one
+    for r in (results if log is not None else []):
         if r['status'] == 'EXECUTED':  # never persist a DRY_RUN as a real bet
             log["bets"].append({
                 "fav_ticker": r["fav_ticker"], "fav_title": r["fav_title"],
@@ -523,10 +527,14 @@ def run(dry_run=False):
             })
         elif str(r['status']).startswith('SKIP_'):  # refusals are recorded, never settled
             _sev.record_skip(log, r)
-    if "skips" in log:
+    if log is not None and "skips" in log:
         log["skips"] = log["skips"][-SKIP_LOG_MAX:]
-    save_log(log)
-    
+    try:
+        if log is not None:
+            save_log(log)
+    except Exception as e:
+        print(f"[sports_engine] sports log not saved: {e}", file=sys.stderr)
+
     # Signal Invested (real executions only): ledger fills+fees, verified; mismatch -> withheld.
     if executed and not dry_run:
         try:

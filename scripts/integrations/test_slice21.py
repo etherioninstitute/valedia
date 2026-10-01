@@ -83,7 +83,7 @@ def test_unreconciled_cannot_say_realized_pnl():
     # signal_verify re-reads the ledger before send -> "Realized (ledger, fee-incl.)".
     msg = sr.format_settled_signal(-1.25, 0, 1, -12.5, "0W/4L")
     assert msg.startswith("Profit (settled since last report):"), msg
-    assert "Realized (ledger, fee-incl.)" in msg, msg
+    assert "Realized P&L (all-time, ledger, all venues, fee-incl.)" in msg, msg
     arb = sr.format_arb_signal({"net_pnl": 2.0, "wins": 1, "losses": 0})
     assert not arb.startswith("Profit:"), arb  # arb-log is never a Profit ping
     assert "realized" not in arb.lower()

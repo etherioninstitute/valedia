@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""v13 replay: settle_run end-to-end (corrupt / non-object / future / numeric-time /
-orphan rows -> one withheld notice, cursor never skips or passes now, pending rows sent
-once valid), positions de-duplication, sports unconfirmed-order notice, facts labels
+"""v13 replay (settle_run scenarios now in test_signal_v14.py): positions de-duplication, sports unconfirmed-order notice, facts labels
 and ledger/broker mismatch line, kalshi_alert fence fail-closed, Decimal sums, bridge
 docs/server "local only". Fakes only: no network, no keys, no orders.
 Run: python3 test_signal_v13.py
@@ -79,104 +77,6 @@ def _profit(sent):
     return [m for m in sent if m.startswith("Profit (settled since last report)")]
 
 
-def test_settle_corrupt_and_nonobject_then_fixed():
-    for extra, rows_extra, cause in (
-            (['{"type": "settlement", "entry_id": "b", "realized_pnl'], [], "truncated / invalid JSON line"),
-            ([], [[1, 2]], "non-object row")):
-        with Settle() as s:
-            good = [ent("a"), st("a", 3.0, True, t(0.1))]
-            s.write(good + rows_extra, extra)
-            first = s.run()
-            assert first == [WH + f"ledger has a {cause}. Unverified figures not sent; see "
-                             "data/signal/verify_log.jsonl."], first
-            assert s.run() == []  # rate-limited: one notice per cause per 7 days
-            assert s.cursor() <= NOW - timedelta(minutes=49)  # never advanced past held rows
-            s.write(good)  # fixed
-            sent = s.run()
-            assert _profit(sent) and _profit(sent)[0].startswith(
-                "Profit (settled since last report): +$3.00 (1W/0L)"), sent
-
-
-def test_settle_future_row_blocks_then_pending_rows_sent():
-    with Settle() as s:
-        fut = st("b", 1.0, True, (NOW + timedelta(days=400)).isoformat())
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), fut])
-        r1 = s.run()
-        assert r1 == [WH + "ledger has future-dated rows. Unverified figures not sent; see "
-                      "data/signal/verify_log.jsonl."], r1
-        assert s.run() == []
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), fut, ent("c"), st("c", -9.0, False, t(0))])
-        assert s.run() == []  # still withheld (deduped notice) while the future row exists
-        assert s.cursor() <= NOW
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("c"), st("c", -9.0, False, t(0))])  # fixed
-        sent = s.run()
-        assert _profit(sent)[0].startswith(
-            "Profit (settled since last report): −$6.00 (net loss) (1W/1L)"), sent  # −9 sent once valid
-        assert s.cursor() <= NOW and s.run() == []
-        with open(os.path.join(s.dir, "settle_ftl_signal_cursor.txt"), "w") as f:
-            f.write((NOW + timedelta(days=30)).isoformat())  # impossible cursor: window restarts
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("c"), st("c", -9.0, False, t(0)),
-                 ent("d"), st("d", 2.0, True, (NOW + timedelta(minutes=1)).isoformat())])
-        sent = s.run(now=NOW + timedelta(minutes=2))  # d is not skipped; a, c never re-reported
-        assert _profit(sent)[0].startswith("Profit (settled since last report): +$2.00 (1W/0L)"), sent
-        assert s.cursor() <= NOW + timedelta(minutes=2)
-
-
-def test_settle_sent_set_no_double_report_after_cursor_reset():
-    with Settle() as s:
-        rows = [ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), st("b", -1.0, False, t(0.1))]
-        s.write(rows)
-        first = _profit(s.run())
-        assert first and first[0].startswith("Profit (settled since last report): +$2.00 (1W/1L)"), first
-        cur = os.path.join(s.dir, "settle_ftl_signal_cursor.txt")
-        for reset in (None, "garbage", (NOW - timedelta(days=30)).isoformat(),
-                      (NOW + timedelta(days=9)).isoformat()):
-            if reset is None:
-                os.remove(cur)
-            else:
-                open(cur, "w").write(reset)
-            assert s.run() == [], reset  # same settlements never reported twice
-        ids = sr.load_sent_ids()
-        assert {"a", "b"} <= ids
-        s.write(rows + [ent("c"), st("c", 4.0, True, t(0))])
-        os.remove(cur)
-        again = _profit(s.run())
-        assert again and again[0].startswith("Profit (settled since last report): +$4.00 (1W/0L)"), again
-        assert "Total (all-time realized, ledger): +$6.00 (2W/1L)" in again[0], again
-        saved = sr.SENT_IDS_MAX
-        try:  # bounded: only the newest ids are kept
-            sr.SENT_IDS_MAX = 2
-            sr.add_sent_ids(["x1", "x2", "x3"])
-            assert sr.load_sent_ids() == {"x2", "x3"}
-        finally:
-            sr.SENT_IDS_MAX = saved
-
-
-def test_settle_numeric_time_and_orphan_never_skip_valid_rows():
-    with Settle() as s:
-        s.write([ent("a"), st("a", 3.0, True, t(0.2))])
-        assert _profit(s.run())
-        bad_b = st("b", -4.0, False, 1790000000)
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), bad_b])
-        r = s.run()
-        assert r == [WH + "ledger settlement rows unparseable. Unverified figures not sent; see "
-                     "data/signal/verify_log.jsonl."], r
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), bad_b, ent("c"), st("c", 2.0, True, t(0))])
-        assert s.run() == []
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), ent("b"), st("b", -4.0, False, t(0.05)),
-                 ent("c"), st("c", 2.0, True, t(0))])  # b's time fixed
-        sent = s.run()
-        assert _profit(sent)[0].startswith(
-            "Profit (settled since last report): −$2.00 (net loss) (1W/1L)"), sent  # b and c, once
-    with Settle() as s:
-        orphan = {"type": "settlement", "entry_id": "zz", "source": "live", "logged_at": t(0.1),
-                  "realized_pnl_net": 1, "won": True}
-        s.write([ent("a"), st("a", 3.0, True, t(0.2)), orphan])
-        assert s.run()[0].startswith(WH) and s.run() == []
-        s.write([ent("a"), st("a", 3.0, True, t(0.2))])  # orphan removed -> pending row sent
-        assert _profit(s.run())[0].startswith("Profit (settled since last report): +$3.00")
-
-
 POS1 = {"ticker": "A", "side": "yes", "position": 1, "market_exposure": 250}
 
 
@@ -220,7 +120,7 @@ def test_facts_labels_and_open_mismatch():
     lines = cb.facts_block(f)[0]
     assert lines[1:] == ["Cash (Kalshi, broker): $250.00", "Open-position cost (Kalshi, broker): $7.50",
                          "Open positions (Kalshi, broker): 3",
-                         "Realized P&L (ledger, all venues, fee-incl.): −$5.00 (0W/1L)",
+                         "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (0W/1L)",
                          "⚠ ledger/broker open-position mismatch (1 vs 3) — not reconciled"], lines
     rows.append(ent("open2", h=1))
     rows.append(ent("open3", h=1))
@@ -306,10 +206,6 @@ def test_bridge_docs_and_server_local_only():
 
 
 if __name__ == "__main__":
-    test_settle_corrupt_and_nonobject_then_fixed()
-    test_settle_future_row_blocks_then_pending_rows_sent()
-    test_settle_numeric_time_and_orphan_never_skip_valid_rows()
-    test_settle_sent_set_no_double_report_after_cursor_reset()
     test_positions_dedupe()
     test_facts_labels_and_open_mismatch()
     test_sports_unconfirmed_notice()

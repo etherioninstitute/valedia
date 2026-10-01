@@ -21,7 +21,7 @@ Element X + Hermex + Hermes Mac already hit the **same** Hermes Valedia (shared 
 Until then: Signal chat = OpenClaw's Valedia (same persona/rules via its SOUL.md), NOT the same Hermes session.
 
 ## Money pings (unchanged, always)
-Outbound-only, exactly TWO formats from `signal-protocol.md`: `Invested: …` and `Profit: …`. Sent via `scripts/.../signal_send.py` (VPS relay: `ssh openclaw → openclaw message send`) and cron `openclaw message send`. Everything else → `~/.openclaw/logs/valedia-cron.log`. No status spam. These stay even after Hermes takes the chat door (outbound from any linked device is fine).
+Outbound-only, exact formats in `signal-protocol.md`: Profit (settled since last report) + all-time realized (settle_run), 11pm P&L (pnl_run), Sports fills cost (sports_engine), 7am brief (kalshi_alert), facts-only AI answers (claude_router), figure-free ops/legacy lines, and `Report withheld …` when a figure cannot be verified. Every figure is code-built and verified by `signal_verify` before `signal_send.py` (VPS relay: `ssh openclaw → openclaw message send`). Everything else → `~/.openclaw/logs/valedia-cron.log`. No status spam. These stay even after Hermes takes the chat door (outbound from any linked device is fine). OpenClaw's own chat replies are model-written and NOT verified (TODO in claude-bridge.md).
 
 ## Freeze / kill switches
 - **Money:** freeze the Mercury agent card in the Mercury app (agent can't reverse). Transfers ≥$100/tx or ≥$200/day already require Burton's yes.

@@ -199,7 +199,7 @@ def _facts():
 
 FACT_LINES = ["Facts (code-generated; each source read twice):", "Cash (Kalshi, broker): $250.00",
               "Open-position cost (Kalshi, broker): $40.00", "Open positions (Kalshi, broker): 3",
-              "Realized P&L (ledger, all venues, fee-incl.): −$5.00 (2W/3L)"]
+              "Realized P&L (all-time, ledger, all venues, fee-incl.): −$5.00 (2W/3L)"]
 
 
 class Sender(rest.Sender):
@@ -300,7 +300,7 @@ def test_router_question_injection_and_apostrophes():
     ssh2 = "cat <<'EOF'\n" + cb.gate_header("verified", big) + "\n" + big + "\nEOF\nexit 0\n"
     r, sent, _ = rest._run_sh("claude_router.sh", ["q", "sonnet", "--signal"],
                               {"ssh": ssh2, "openclaw": rest._OPENCLAW})
-    assert "Realized P&L (ledger, all venues, fee-incl.): −USD 5.00 (2W/3L)" in sent and "é" * 900 in sent, sent
+    assert "Realized P&L (all-time, ledger, all venues, fee-incl.): −USD 5.00 (2W/3L)" in sent and "é" * 900 in sent, sent
 
 
 def test_cron_runner_only_fixed_lines_for_every_string():

@@ -109,6 +109,10 @@ Manual cron (do not run `install_cron.sh` on live):
 
 Cron runner (cron_runner_mac.sh) NEVER sends to Signal directly.
 should_send() always returns 1 (suppress all).
-Only sports_engine.py and settle_run.py send via signal_send.py:
-- Invested: when bets placed
-- Profit: when bets settle
+Scripts send only through signal_verify (exact formats: signal-protocol.md):
+- settle_run.py (hourly :30): `Profit (settled since last report): …` + `Realized P&L (all-time, ledger, all venues, fee-incl.): …` (id-based, never twice)
+- pnl_run.py (23:00): `Open-position cost (Kalshi, broker)`, all-time realized, `Settled last 24h (ledger)`
+- sports_engine.py (every 2h, real fills only): `Sports fills cost incl. fees (ledger): …`; unconfirmed orders → figure-free notice
+- kalshi_alert.py (07:00, only with positive upside): `Open-position cost (Kalshi, broker)` + `Modeled if-all-win … — not profit`
+- watchdog / legacy cron_runner.sh: figure-free text only
+- Anything unverifiable → one figure-free `Report withheld (<kind>): …`

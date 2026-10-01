@@ -2,7 +2,10 @@
 Sends messages to Burton via VPS relay. Escapes dollar signs.
 Money reports must go through signal_verify.deliver(), which checks every
 figure against broker/ledger before calling send().
-send() returns True only when the relay exits 0; it never raises.
+send() is TRI-STATE and never raises:
+  True  = relay exited 0 (delivered)
+  False = confirmed failure (relay exited non-zero / ssh missing) -> safe to retry
+  None  = unknown (timeout or unexpected error): it may or may not have arrived
 VALEDIA_SIGNAL_DRY=1 prints instead of sending (tests / dry runs).
 (c) GOATWORTHY Post LLC
 """
@@ -14,7 +17,7 @@ TARGET = "uuid:47bd6dd5-2c96-4514-9541-acd8ed013612"
 
 
 def send(msg):
-    """Send a message via Signal through VPS relay. True = relay accepted it."""
+    """Send via the VPS relay. True delivered / False confirmed failure / None unknown."""
     msg = str(msg)
     try:
         from valedia_config import version_stamp
@@ -38,6 +41,9 @@ def send(msg):
                   f"{(r.stderr or b'')[:200]!r}", file=sys.stderr)
             return False
         return True
-    except Exception as e:
-        print(f"[signal_send] relay failed: {type(e).__name__}: {e}", file=sys.stderr)
+    except FileNotFoundError as e:  # no ssh binary: nothing left this host
+        print(f"[signal_send] relay unavailable: {e}", file=sys.stderr)
         return False
+    except Exception as e:  # timeout / unexpected: delivery state unknown
+        print(f"[signal_send] relay outcome unknown: {type(e).__name__}: {e}", file=sys.stderr)
+        return None

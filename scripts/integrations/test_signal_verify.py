@@ -10,7 +10,7 @@ import os
 import sys
 import tempfile
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -85,9 +85,9 @@ def test_pnl_report_figures_match_sources():
     res = pnl_run.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "verified" and len(send.msgs) == 1, res
     t = send.msgs[0]
-    assert "Invested: $3.20 (Kalshi open-position cost, broker)" in t, t
+    assert "Open-position cost (Kalshi, broker): $3.20" in t, t
     # +2.50 - 1.25; unreconciled 9.99 and paper 5.00 excluded
-    assert "Profit (all-time realized, ledger): +$1.25 fee-incl., all venues · 1W/1L · settled last 24h +$2.50" in t, t
+    assert "Realized P&L (all-time, ledger, all venues, fee-incl.): +$1.25 · 1W/1L\nSettled last 24h (ledger): +$2.50" in t, t
     assert "9.99" not in t and "5.00" not in t
     assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 20:00 UTC, "
             "broker time unknown (read 23:00 UTC)") in t, t
@@ -103,7 +103,7 @@ def test_broker_mismatch_withholds_and_logs():
     res = pnl_run.pnl_report(get_positions=lambda: next(reads), ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "withheld", res
     t = send.msgs[0]
-    assert t.startswith("Report withheld (11pm P&L): Invested does not match broker re-read"), t
+    assert t.startswith("Report withheld (11pm P&L): Open-position cost does not match broker re-read"), t
     assert "3.20" not in t and "4.10" not in t and "1.25" not in t  # no unverified numbers
     rec = _log(d)[-1]
     assert rec["status"] == "withheld" and "4.1" in json.dumps(rec["problems"])
@@ -121,7 +121,7 @@ def test_ledger_mismatch_withholds():
                          "won": True, "logged_at": "2026-10-01T22:59:00+00:00"})
         return recs
     res = pnl_run.pnl_report(get_positions=_broker(), ledger=ledger, send_fn=send, now=NOW)
-    assert res["status"] == "withheld" and "Profit" in send.msgs[0], send.msgs
+    assert res["status"] == "withheld" and "Realized does not match" in send.msgs[0], send.msgs
 
 
 def test_source_failure_withholds_never_crashes():
@@ -175,42 +175,27 @@ def test_dedupe_same_message_once():
     assert a["status"] == "verified" and b["status"] == "dedupe" and len(send.msgs) == 1
 
 
-def test_settle_run_profit_verified_and_cursor():
-    d = _fresh_dir()
-    models = tempfile.mkdtemp(prefix="models_")
-    recs = _ledger()
-    orig = (ftl.LEDGER, sr.settle_sports, sr.MODELS, sys.modules.get("latency_arb"))
-    fake_arb = types.ModuleType("latency_arb")
-    fake_arb.check_arb_settlements = lambda: {"settled": 3, "net_pnl": 7.77, "wins": 2, "losses": 1}
-    try:
-        ftl.LEDGER = os.path.join(models, "ledger.jsonl")
-        with open(ftl.LEDGER, "w") as f:
-            f.write("".join(json.dumps(r) + "\n" for r in recs))
-        sr.settle_sports = lambda: (_ for _ in ()).throw(RuntimeError("no sports log"))
-        sr.MODELS = models
+def test_settle_run_profit_id_based():
+    from test_signal_v14 import Settle
+    with Settle(fresh_record=True) as st_:
+        st_.write(_ledger())
+        fake_arb = types.ModuleType("latency_arb")
+        fake_arb.check_arb_settlements = lambda: {"settled": 3, "net_pnl": 7.77, "wins": 2, "losses": 1}
         sys.modules["latency_arb"] = fake_arb
-        with open(os.path.join(models, "settle_ftl_signal_cursor.txt"), "w") as f:
-            f.write("2026-09-01T00:00:00+00:00")
+        sr.settle_sports = lambda: (_ for _ in ()).throw(RuntimeError("no sports log"))
         send = Sender()
         sr.run(send_fn=send, now=NOW)  # never crashes on sports-log failure
         assert len(send.msgs) == 1, send.msgs  # arb-log is never sent
         t = send.msgs[0]
-        assert "\nProfit (settled since last report): +$1.25 (1W/1L) Realized (ledger, fee-incl.)" in t, t
         assert t.startswith("⚠ STALE: settlement data is"), t  # 09-30 row is > 6h old
-        assert "7.77" not in t and "9.99" not in t
+        assert "\nProfit (settled since last report): +$1.25 (1W/1L)\n" in t, t
+        assert "Realized P&L (all-time, ledger, all venues, fee-incl.): +$1.25 (1W/1L)" in t, t
+        assert "7.77" not in t and "9.99" not in t and "5.00" not in t
         assert "✓ verified: ledger 2 settled rows" in t, t
-        cur = open(os.path.join(models, "settle_ftl_signal_cursor.txt")).read()
-        assert cur == "2026-10-01T20:00:00+00:00", cur  # max logged_at sent, not now()
         send2 = Sender()
-        sr.run(send_fn=send2, now=NOW)
-        assert send2.msgs == [], send2.msgs  # nothing new past the cursor
-    finally:
-        ftl.LEDGER, sr.settle_sports, sr.MODELS = orig[0], orig[1], orig[2]
-        if orig[3] is None:
-            sys.modules.pop("latency_arb", None)
-        else:
-            sys.modules["latency_arb"] = orig[3]
-    assert any(r["kind"] == "Profit" for r in _log(d))
+        sr.run(send_fn=send2, now=NOW + timedelta(hours=1))
+        assert send2.msgs == [], send2.msgs  # nothing reported twice
+        assert {"e1", "e2"} <= sr.load_sent_ids()
 
 
 def test_sports_invested_from_ledger_fills():
@@ -225,7 +210,7 @@ def test_sports_invested_from_ledger_fills():
     send = Sender()
     r = sv.invested_ping(ex, ledger=lambda: recs, send_fn=send, now=NOW)
     assert r["status"] == "verified", r
-    assert send.msgs[0].startswith("Invested: $7.05 on 2 games (Kalshi fills + fees, ledger)")
+    assert send.msgs[0].startswith("Sports fills cost incl. fees (ledger): $7.05 on 2 games")
     send = Sender()
     r = sv.invested_ping(ex + [{"order_id": "o3", "cost": 1.0}], ledger=lambda: recs,
                          send_fn=send, now=NOW)
@@ -249,7 +234,7 @@ def test_alert_modeled_never_profit():
                  state={"balance": 20.0, "max_deployable": 15.0}, opps=opps)
     assert r["status"] == "verified", r
     t = send.msgs[0]
-    assert "Invested: $3.20" in t and "Modeled if-all-win: +$2.10 (2 picks that fit cash" in t, t
+    assert "Open-position cost (Kalshi, broker): $3.20" in t and "Modeled if-all-win: +$2.10 (2 picks that fit cash" in t, t
     for line in t.lower().splitlines():
         assert not line.startswith("profit") and "estimated profit" not in line
         if "profit" in line:
@@ -323,7 +308,7 @@ if __name__ == "__main__":
     test_stale_label_and_withhold()
     test_unsourced_and_arithmetic()
     test_dedupe_same_message_once()
-    test_settle_run_profit_verified_and_cursor()
+    test_settle_run_profit_id_based()
     test_sports_invested_from_ledger_fills()
     test_alert_modeled_never_profit()
     test_bridge_ai_answer_gated()

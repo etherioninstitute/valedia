@@ -154,8 +154,7 @@ NUM_MAX = 1e15  # anything this large is not a real account figure -> invalid
 
 
 def num(x):
-    """Strict number: finite float from int/float or an ASCII numeric string; None for
-    None, bool, garbage, non-ASCII digits, NaN, inf, |x| >= 1e15. Never 0.00 by default."""
+    """Finite float from int/float/ASCII numeric str; else None (bool, NaN, inf, >=1e15)."""
     if x is None or isinstance(x, bool) or (isinstance(x, str) and not _NUM_STR.fullmatch(x)):
         return None
     try:
@@ -172,8 +171,7 @@ def won_flag(v):
 
 
 def money(v, signed=False):
-    """Round half away from zero to cents FIRST, then sign by the rounded value:
-    no "-$0.00"; negatives as "−$5.00" (U+2212); signed positives "+$5.00"."""
+    """Half-away cents, sign by the rounded value: no "-$0.00"; "−$5.00"; "+$5.00"."""
     d = Decimal(str(abs(v))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     body = f"${d:,.2f}"
     if d == 0:
@@ -182,8 +180,7 @@ def money(v, signed=False):
 
 
 def dsum(values):
-    """Exact decimal sum of ledger/broker floats (Decimal(str(x))), then one float for
-    money(): no binary drift before the single half-away rounding."""
+    """Exact Decimal(str(x)) sum -> one float for money(): no binary drift."""
     return float(sum((Decimal(str(v)) for v in values), Decimal("0")))
 
 
@@ -238,8 +235,7 @@ def broker_snapshot(get_positions=None, now=None):
 
 
 def broker_fresh(snap, max_age_s=900):
-    """Freshness from the venue's own timestamp. Absent -> footer says time unknown.
-    Present but garbage -> "no timestamp" problem; future -> problem (both: not fresh)."""
+    """Venue timestamp: absent -> "time unknown"; garbage / future -> not fresh."""
     v = snap.get("venue_ts")
     if v is None or v == "":
         return [], f"broker time unknown (read {hhmm(snap['ts'])})"
@@ -248,9 +244,7 @@ def broker_fresh(snap, max_age_s=900):
 
 
 def ledger_latest(recs, now=None):
-    """(newest live entry/settlement time, future_flag). Paper/sandbox/backfill/
-    shadow/unreconciled and other row types do not count. A row dated > 5 min in
-    the future makes the ledger suspect (future_flag True -> treat as STALE)."""
+    """(newest LIVE entry/settlement time, future_flag: any live row > 5 min ahead)."""
     now = now or utcnow()
     ent = {r.get("id"): r for r in recs if r.get("type") == "entry"}
     live = [r for r in recs if r.get("type") in ("entry", "settlement")
@@ -263,8 +257,19 @@ def ledger_latest(recs, now=None):
 
 
 def read_ledger():
+    """Ledger rows; an invalid / non-object line -> {"type": "_bad_line"} (counted bad)."""
     import forward_test_ledger as ftl
-    return ftl._read()
+    if not os.path.exists(ftl.LEDGER):
+        return []
+    return [_row(l) for l in open(ftl.LEDGER, errors="replace") if l.strip()]
+
+
+def _row(line):
+    try:
+        r = json.loads(line)
+    except ValueError:
+        r = None
+    return r if isinstance(r, dict) else {"type": "_bad_line"}
 
 
 def _non_real(source):
@@ -277,29 +282,30 @@ def _unrec(rec):
 
 
 def ledger_realized(recs):
-    """Admissible (real, reconciled) settlements — independent of settle_run's filter.
-    One settlement per entry (first wins, like the writers' _settled_ids). bad = rows
-    with missing/garbage P&L or win flag, or orphan settlements (no entry)."""
+    """Admissible (real, reconciled) settlements, one per entry. bad = unparseable lines,
+    missing/garbage P&L or win flag, live orphans, and CONFLICTING duplicate settlements
+    for one entry (identical duplicates collapse). conflict counted separately too."""
     entries = {r.get("id"): r for r in recs if r.get("type") == "entry" and r.get("id")}
-    rows, seen, bad = [], set(), 0
+    first, bad, conflict = {}, sum(1 for r in recs if r.get("type") == "_bad_line"), 0
+    key = lambda r: (num(r.get("realized_pnl_net")), won_flag(r.get("won")))  # noqa: E731
     for s in recs:
-        if s.get("type") != "settlement" or s.get("entry_id") in seen:
-            continue
-        seen.add(s.get("entry_id"))
-        e = entries.get(s.get("entry_id"))
-        if e is None:
-            bad += 0 if _non_real(s.get("source")) else 1
-            continue
-        if _non_real(s.get("source")) or _non_real(e.get("source")) or _unrec(e) or _unrec(s):
-            continue
-        if num(s.get("realized_pnl_net")) is None or won_flag(s.get("won")) is None:
+        if s.get("type") == "settlement":
+            k = s.get("entry_id")
+            conflict += k in first and key(first[k]) != key(s)
+            first.setdefault(k, s)
+    rows = []
+    for k, s in first.items():
+        e = entries.get(k)
+        if e is None or _non_real(s.get("source")) or _non_real(e.get("source")) or _unrec(e) or _unrec(s):
+            bad += e is None and not _non_real(s.get("source"))
+        elif None in key(s):
             bad += 1
-            continue
-        rows.append(s)
+        else:
+            rows.append(s)
     parts = [num(s.get("realized_pnl_net")) for s in rows]
     wins = sum(1 for s in rows if won_flag(s.get("won")))
     return {"rows": len(rows), "settlements": rows, "parts": parts, "total": dsum(parts),
-            "wins": wins, "losses": len(rows) - wins, "bad": bad}
+            "wins": wins, "losses": len(rows) - wins, "bad": bad + conflict, "conflict": conflict}
 
 
 def ledger_open_kalshi(recs):
@@ -310,9 +316,8 @@ def ledger_open_kalshi(recs):
 
 
 def ledger_order_cost(recs, order_ids):
-    """Fee-incl. cost of real FILLED ledger entries for these Kalshi order ids. One row
-    per DISTINCT order id (duplicates never double-count). bad = rows whose price
-    (0 < p <= 1), contracts (> 0) or fee (>= 0) is missing / garbage / out of range."""
+    """Fee-incl. cost per DISTINCT filled order id; bad = price not in (0,1], contracts
+    <= 0, fee < 0, or any of them missing / garbage."""
     want, by_id = {o for o in order_ids if o}, {}
     for e in recs:
         if e.get("type") == "entry" and e.get("order_id") in want and not _non_real(
@@ -345,8 +350,7 @@ def fresh(name, ts, max_age_s, policy="withhold"):
 
 
 def unsourced_figures(text, claims, allowed=()):
-    """Money tokens (any line with a money keyword/marker) + any 2-decimal figure that
-    no claim backs (half-cent: display rounding) and no allowed figure EQUALS."""
+    """Money tokens + 2-decimal figures no claim (half-cent) or allowed figure backs."""
     known = [abs(_f(c["reported"])) for c in claims if c.get("reported") is not None]
     exact = [abs(_f(a)) for a in allowed]
     toks = money_tokens(text) + [(m, abs(_f(m.replace(",", ""))))
@@ -407,8 +411,8 @@ def _dedupe_hit(key, window_s, now):
 def deliver(kind, body, claims=(), freshness=(), footer=(), notes=(), send_fn=None,
             dedupe_key=None, dedupe_window_s=3600, now=None, allowed=(), info=None,
             problems=(), transport=True, verified_line=None):
-    """Verify, then send the verified body OR a single withheld notice. Never raises.
-    transport=False: verify + log only (caller prints/relays res["text"])."""
+    """Verify, then send the body OR one withheld notice. Never raises. transport=False:
+    verify + log only. res["delivery"]: ok / failed (confirmed) / unknown."""
     now = now or utcnow()
     res = {"kind": kind, "status": "error", "text": "", "sent": False, "problems": []}
     try:
@@ -431,14 +435,14 @@ def deliver(kind, body, claims=(), freshness=(), footer=(), notes=(), send_fn=No
             key_src = f"{kind}|verified|{dedupe_key or body}"
         key = hashlib.sha1(key_src.encode()).hexdigest()[:16]
         res.update(status=status, text=text, problems=problems, stale=ev["stale"], key=key)
-        if transport and _dedupe_hit(key, dedupe_window_s, now):
+        if transport and dedupe_window_s > 0 and _dedupe_hit(key, dedupe_window_s, now):
             res["status"] = "dedupe"
         elif transport:
             try:
                 ok = (send_fn or _default_send)(text)
-                res["sent"] = ok is not False
+                res["sent"], res["delivery"] = ok is not False, {True: "ok", False: "failed"}.get(ok, "unknown")
             except Exception as e:
-                res["sent"] = False
+                res["sent"], res["delivery"] = False, "unknown"
                 res["transport_error"] = f"{type(e).__name__}: {e}"[:200]
             if res["sent"]:
                 _append("sent_log.jsonl", {"ts": now.isoformat(), "kind": kind,
@@ -483,7 +487,7 @@ def invested_ping(executed, ledger=None, send_fn=None, now=None):
     if got["bad"] or got2["bad"]:
         return withhold(kind, "ledger fill rows unparseable", got, send_fn, now)
     intent = sum(_f(r.get("cost")) + _f(r.get("fee")) for r in executed)
-    body = f"Invested: {money(got['cost'])} on {got['n']} games (Kalshi fills + fees, ledger)"
+    body = f"Sports fills cost incl. fees (ledger): {money(got['cost'])} on {got['n']} games"
     claims = [claim("games", len(executed), got2["n"], "ledger fills", tol=0),
               claim("Invested", got["cost"], got2["cost"], "ledger re-read")]
     return deliver(kind, body, claims,
@@ -493,7 +497,3 @@ def invested_ping(executed, ledger=None, send_fn=None, now=None):
                    dedupe_window_s=7 * 86400, now=now,
                    info={"order_intent_cost_incl_fee": round(intent, 4),
                          "ledger_cost": round(got["cost"], 4)})
-
-
-def profit_ping(*a, **k):  # implementation lives in settle_run.py
-    return __import__("settle_run").profit_ping(*a, **k)
