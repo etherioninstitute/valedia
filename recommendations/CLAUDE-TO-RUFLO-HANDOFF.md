@@ -66,7 +66,7 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
    ```
    - Policy JSON: `{"name", "min_edge": float|null, "categories_allow": [..]|null, "categories_block": [..], "size_mult": {"CAT": x}}` (unknown keys rejected).
    - Replays the REAL settlement ledger (never `brain_log.json`) under both policies. P&L is fee-true: recorded fee if the ledger has one,
-     else nonlinear `fee_engine.kalshi_fee_per_contract` (0.07·P·(1−P)/contract; 0.07·cost upper bound when price is unknown). Never flat.
+     else `forward_test_ledger.kalshi_fee` = ceil(0.07·C·P·(1−P)) to the cent per order (0.07·cost upper bound when price is unknown). Never flat.
    - Unsettled, paper/sandbox/shadow/unreconciled and malformed rows are excluded and counted; backfill vs live reported separately (`--live-only` drops backfill).
    - Paired bootstrap Monte-Carlo (seeded, N=2000) on the same resamples for baseline and candidate.
    - **PASS bar** (all must hold; thresholds CLI-overridable): candidate `n_taken >= 30`; candidate fee-true net `>=` baseline;

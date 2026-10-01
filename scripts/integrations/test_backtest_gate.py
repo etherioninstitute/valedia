@@ -2,13 +2,13 @@
 """Checks for the backtest-first gate. Run: python3 test_backtest_gate.py
 Synthetic ledgers in a tempdir only — no network, never touches the real ledger.
 Covers: fee inclusion (gross-positive/fee-negative nets negative), nonlinear Kalshi
-fee (not flat), thin sample -> INSUFFICIENT_DATA, better -> PASS, worse -> FAIL,
+fee (not flat) ceil'd to the cent per order, thin sample -> INSUFFICIENT_DATA, better -> PASS, worse -> FAIL,
 seed determinism, unsettled excluded, --live-only, malformed rows skipped."""
 import os, sys, io, json, hashlib, tempfile, contextlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_gate as G
-from fee_engine import kalshi_fee_per_contract
+from forward_test_ledger import kalshi_fee
 
 TMP = tempfile.mkdtemp(prefix="backtest_gate_test_")
 TAKE_ALL = {"name": "all", "min_edge": None, "categories_allow": None,
@@ -18,14 +18,14 @@ TAKE_ALL = {"name": "all", "min_edge": None, "categories_allow": None,
 def _entry(eid, cat, price, qty, ts, side="yes", prob=None, source="live"):
     return {"type": "entry", "id": eid, "ts": ts, "strategy": cat, "venue": "kalshi",
             "ticker": "T-" + eid, "side": side, "entry_price": price, "contracts": qty,
-            "entry_fee": round(kalshi_fee_per_contract(price) * qty, 6),
+            "entry_fee": kalshi_fee(price, qty),
             "predicted_prob": prob, "source": source}
 
 
 def _settle(eid, cat, won, price, qty, source="live", recorded_fee=True, side="yes"):
     """Recorded fee -> realized is NET (reconcile() semantics); else GROSS + unverified."""
     gross = qty * (1.0 - price) if won else -qty * price
-    fee = kalshi_fee_per_contract(price) * qty
+    fee = kalshi_fee(price, qty)                      # what reconcile() records
     rec = {"type": "settlement", "entry_id": eid, "ticker": "T-" + eid, "strategy": cat,
            "result": side if won else ("no" if side == "yes" else "yes"), "won": won,
            "filled_contracts": qty, "source": source}
@@ -75,7 +75,7 @@ def _policy_file(obj, name):
 
 
 def run():
-    # 1. Fee inclusion: 21W/20L at P=0.5, 100 contracts -> gross +$50, fees 41*1.75 -> net < 0.
+    # 1. Fee inclusion: 21W/20L at P=0.5, 100 contracts -> gross +$50, fees 41*~1.75 -> net < 0.
     rows = []
     for k in range(41):
         rows += _pair(f"f{k}", "X", k < 21, k, price=0.5, qty=100, recorded_fee=False)
@@ -84,25 +84,33 @@ def run():
     assert abs(gross - 50.0) < 1e-6, gross
     rep, _ = G.replay(trades, G.load_policy(TAKE_ALL))
     assert rep["net"] < 0, rep
-    assert abs(rep["net"] - (50.0 - 41 * 1.75)) < 1e-6, rep["net"]
+    assert abs(rep["net"] - (50.0 - 41 * kalshi_fee(0.5, 100))) < 1e-6, rep["net"]
     assert all(t["fee_basis"] == "modeled" for t in trades)
 
-    # 2. Nonlinear fee 0.07*P*(1-P) per contract, never a flat 0.02.
+    # 2. Nonlinear fee ceil(0.07*C*P*(1-P)) to the cent per order, never a flat 0.02.
     e = _entry("n1", "X", 0.10, 100, "2026-09-01T00:00:00Z")
     s = _settle("n1", "X", True, 0.10, 100, recorded_fee=False)
     net, fee, basis = G.fee_true_net(e, s)
-    assert basis == "modeled" and abs(fee - 0.07 * 0.10 * 0.90 * 100) < 1e-9, fee
+    raw = 0.07 * 100 * 0.10 * 0.90
+    assert basis == "modeled" and fee == kalshi_fee(0.10, 100), fee
+    assert raw <= fee < raw + 0.01 + 1e-9 and abs(fee * 100 - round(fee * 100)) < 1e-9, fee
     assert abs(fee - 0.02 * 100) > 1.0, "flat fee used"
-    assert abs(net - (90.0 - 0.63)) < 1e-6, net
+    assert abs(net - (90.0 - fee)) < 1e-6, net
+    # per-order rounding: raw fee 0.0105 (P=0.5, C=0.6) is charged 0.02, not 0.0105
+    e6 = _entry("r1", "X", 0.5, 0.6, "2026-09-01T00:00:00Z")
+    s6 = _settle("r1", "X", False, 0.5, 0.6, recorded_fee=False)
+    n6, f6, b6 = G.fee_true_net(e6, s6)
+    assert abs(0.07 * 0.6 * 0.5 * 0.5 - 0.0105) < 1e-12
+    assert b6 == "modeled" and abs(f6 - 0.02) < 1e-12 and abs(n6 - (-0.30 - 0.02)) < 1e-9, (f6, n6)
     # recorded fee path: realized already net, must NOT be double-charged
     s2 = _settle("n1", "X", True, 0.10, 100, recorded_fee=True)
     net2, fee2, basis2 = G.fee_true_net(e, s2)
-    assert basis2 == "recorded" and abs(net2 - (90.0 - 0.63)) < 1e-6, (net2, basis2)
+    assert basis2 == "recorded" and abs(net2 - (90.0 - kalshi_fee(0.10, 100))) < 1e-6, (net2, basis2)
     # backfill-style row (no price/qty): won -> inferred price; lost -> 0.07*cost bound
     bw = {"type": "settlement", "realized_pnl_net": 0.34, "cost": 0.66, "won": True,
           "fee": None, "fee_status": "unverified_source", "result": "yes"}
     _, fw, bwb = G.fee_true_net({"entry_price": 0.0, "contracts": 0.0}, bw)
-    assert bwb == "modeled_inferred" and abs(fw - kalshi_fee_per_contract(0.66)) < 1e-9
+    assert bwb == "modeled_inferred" and abs(fw - 0.02) < 1e-9, fw   # ceil(0.0157) per order
     bl = dict(bw, realized_pnl_net=-0.77, cost=0.77, won=False, result="no")
     nl, fl, blb = G.fee_true_net({"entry_price": 0.0, "contracts": 0.0}, bl)
     assert blb == "modeled_bound" and abs(fl - 0.07 * 0.77) < 1e-9 and nl < -0.77
@@ -176,7 +184,7 @@ def run():
     st = rep["ledger_stats"]
     assert st["eligible"] == 1 and st["malformed_skipped"] >= 5, st
     assert st["duplicate_settlements_ignored"] == 1, st          # m1 settled twice
-    assert abs(rep["baseline"]["net"] - (5.0 - 0.175)) < 1e-6    # first settlement wins
+    assert abs(rep["baseline"]["net"] - (5.0 - kalshi_fee(0.5, 10))) < 1e-6  # first settlement wins
 
     # 10. Policy validation + min_edge (unknown edge -> skipped, not taken).
     try:
@@ -190,7 +198,7 @@ def run():
     trades, _ = G.build_trades(G.load_ledger(_book(rows, "edge.jsonl"))[0])
     pol = G.load_policy(dict(TAKE_ALL, name="e", min_edge=0.05, size_mult={"X": 2}))
     rep, _ = G.replay(trades, pol)
-    assert rep["n_taken"] == 1 and abs(rep["net"] - 2 * (5.0 - 0.175)) < 1e-6, rep
+    assert rep["n_taken"] == 1 and abs(rep["net"] - 2 * (5.0 - kalshi_fee(0.5, 10))) < 1e-6, rep
     code, _, err = _run_main(["--baseline", pa, "--candidate", "/nonexistent.json",
                               "--ledger", thin])
     assert code == 3 and "input error" in err

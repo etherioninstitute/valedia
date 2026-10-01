@@ -16,9 +16,10 @@ Categories are canonicalised with forward_test_ledger.canonical_category.
 Fees: a settlement's realized_pnl_net is taken as net when the ledger recorded the
 fee (reconcile()/settle_open() semantics). Otherwise (backfill:pnl_tracker rows,
 fee_status=unverified_source) realized P&L is treated as GROSS and the nonlinear
-Kalshi fee fee_engine.kalshi_fee_per_contract (0.07*P*(1-P) per contract) is
-subtracted — never a flat fee. When price/contracts are unknown the fee is the
-formula's upper bound 0.07*cost (P->0), i.e. conservative.
+Kalshi fee is subtracted as Kalshi charges it: forward_test_ledger.kalshi_fee =
+ceil(0.07*C*P*(1-P)) to the next cent per order — never a flat fee. When
+price/contracts are unknown the fee is the upper bound 0.07*cost (P->0),
+i.e. conservative.
 
 CLI:
   python3 backtest_gate.py --baseline a.json --candidate b.json \
@@ -33,8 +34,7 @@ from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from forward_test_ledger import canonical_category, _is_non_real_source  # noqa: E402
-from fee_engine import kalshi_fee_per_contract  # noqa: E402
+from forward_test_ledger import canonical_category, _is_non_real_source, kalshi_fee  # noqa: E402
 
 DEFAULT_LEDGER = os.path.join(os.path.dirname(os.path.dirname(HERE)),
                               "models", "forward_test_ledger.jsonl")
@@ -172,10 +172,10 @@ def fee_true_net(entry, sett):
     qty = _num(sett.get("filled_contracts")) or _num(entry.get("contracts"))
     cost = _num(sett.get("cost"))
     if price and 0 < price < 1 and qty and qty > 0:
-        fee, basis = kalshi_fee_per_contract(price) * qty, "modeled"
+        fee, basis = kalshi_fee(price, qty), "modeled"   # per-order ceil to the cent
     elif cost and cost > 0 and sett.get("won") is True and realized > 0:
         qty = cost + realized                         # $1 payout per contract
-        fee, basis = kalshi_fee_per_contract(cost / qty) * qty, "modeled_inferred"
+        fee, basis = kalshi_fee(cost / qty, qty), "modeled_inferred"
     elif cost and cost > 0:
         fee, basis = 0.07 * cost, "modeled_bound"     # 0.07*C*P*(1-P) <= 0.07*cost
     else:
@@ -369,7 +369,7 @@ def run_gate(ledger_path, baseline, candidate, live_only=False, **kw):
     report = evaluate(trades, load_policy(baseline), load_policy(candidate), **kw)
     report.update({"tool": "backtest_gate", "ledger": os.path.abspath(ledger_path),
                    "live_only": bool(live_only), "ledger_stats": stats,
-                   "fee_fn": "fee_engine.kalshi_fee_per_contract (0.07*P*(1-P))"})
+                   "fee_fn": "forward_test_ledger.kalshi_fee (ceil(0.07*C*P*(1-P)) per order)"})
     report["summary"] = summary_line(report)
     return report
 
