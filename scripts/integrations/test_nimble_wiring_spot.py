@@ -2,8 +2,8 @@
 """Nimble 2 wiring at every stock + crypto entry point. Fakes only: no network, no keys.
 
 For each point: shadow + a fake 'skip' leaves the decision unchanged (only a stamp is
-added); veto + skip → SKIP_NIMBLE and no cb_buy / alp_buy / paper fill; veto + buy at or
-above min_conf proceeds; engine down in veto blocks; sells are never blocked; and with
+added); veto + skip → SKIP_NIMBLE and no cb_buy / alp_buy / paper fill; veto + a sharp buy
+with p_buy over the required probability proceeds; engine down in veto blocks; sells are never blocked; and with
 VALEDIA_SYSTEMONE unset there is no POST and the behavior is identical.
 
 Run: python3 test_nimble_wiring_spot.py
@@ -31,6 +31,7 @@ import crypto_paper_safety as safety  # noqa: E402
 import daviddtech_paper as dav  # noqa: E402
 import dca_module  # noqa: E402
 import etoro_copy_paper as etoro  # noqa: E402
+import calibration_ledger as cl  # noqa: E402
 import nimble_decide as nd  # noqa: E402
 import nimble_wiring_spot as nws  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
@@ -38,6 +39,10 @@ import tc_auto_paper as tc  # noqa: E402
 import unified_brain as ub  # noqa: E402
 import vibe_shadow_paper as vibe  # noqa: E402
 from systemone_test_fakes import Scoped  # noqa: E402
+import valedia_config as vc  # noqa: E402
+
+vc._MODELS = tempfile.mkdtemp(prefix="nimspot_models_")  # no Etherion file: phi 1.0
+cl._reset_cache(items=[])  # no record: calibration is identity
 
 _S = Scoped(s1, LOG)
 _scoped_fakes = _S.fixture()
@@ -48,8 +53,9 @@ BARS = os.path.join(ROOT, "data", "crypto-paper", "bars_safety_pass.json")
 class Nim:
     """Fake Nimble transport: records every POST; answers with a fixed verdict."""
 
-    def __init__(self, choice="skip", conf=0.9, risk="4", exc=None):
+    def __init__(self, choice="skip", conf=0.9, risk="4", exc=None, p_buy=None):
         self.choice, self.conf, self.risk, self.exc, self.all = choice, conf, risk, exc, []
+        self.p_buy = (0.9 if choice == "buy" else 0.5) if p_buy is None else p_buy
 
     calls = property(lambda self: [c for c in self.all if c["state"].get("symbol") != "warmup"])
 
@@ -59,7 +65,8 @@ class Nim:
             raise self.exc
         return {"model": payload["model"], "answers": {
             "action": {"choice": self.choice, "confidence": self.conf,
-                       "probabilities": {"buy": 0.5, "hold": 0.25, "skip": 0.25}},
+                       "probabilities": {"buy": self.p_buy, "hold": (1 - self.p_buy) / 2,
+                                         "skip": (1 - self.p_buy) / 2}},
             "risk": {"choice": self.risk}}}
 
 def setup(mode=None, on=True, post=None):
@@ -88,11 +95,14 @@ def test_gate_modes_and_never_raises():
         post = setup(mode, post=Nim("skip"))
         assert nws.gate("crypto", "BTC-USD", {}, source="t", side="sell") is None
         assert post.all == []
-    # veto: buy at/above min_conf proceeds; low conf, skip, engine error all block
+    # veto: sharp buy over required proceeds; not sharp, low p_buy, skip, engine error block
     post = setup("veto", post=Nim("buy", 0.9))
     assert nws.blocked(nws.gate("stock", "SPY", {}, source="t")) is False
-    post = setup("veto", post=Nim("buy", 0.3))
+    post = setup("veto", post=Nim("buy", 0.01))
     assert nws.blocked(nws.gate("stock", "SPY", {}, source="t"))
+    post = setup("veto", post=Nim("buy", 0.9, p_buy=0.55))
+    v = nws.gate("stock", "SPY", {}, source="t")
+    assert nws.blocked(v) and v["reason"] == "veto_p_below_required" and v["required_p"] == 0.60
     post = setup("veto", post=Nim("skip"))
     assert nws.blocked(nws.gate("stock", "SPY", {}, source="t"))
     post = setup("veto", post=Nim(exc=ConnectionRefusedError("down")))
@@ -205,11 +215,11 @@ def test_unified_brain_buy_points():
     rpt, got = run_brain(BOTH)
     assert got["cb_buy"] == [] and got["alp_buy"] == [] and rpt.count("SKIP_NIMBLE") == 2
     assert "NO NEW TRADES" in rpt
-    # veto + buy at/above min_conf proceeds with the same orders; below blocks
+    # veto + sharp buy over required proceeds with the same orders; not sharp blocks
     setup("veto", post=Nim("buy", 0.9))
     rpt, got = run_brain(BOTH)
     assert got == base and "SKIP_NIMBLE" not in rpt
-    setup("veto", post=Nim("buy", 0.3))
+    setup("veto", post=Nim("buy", 0.01))
     assert run_brain(BOTH)[1]["cb_buy"] == []
     # veto: engine down (post raises) and engine unset both block, no order
     setup("veto", post=Nim(exc=ConnectionRefusedError("down")))
@@ -221,6 +231,23 @@ def test_unified_brain_buy_points():
     os.environ["VALEDIA_NIMBLE_MODE_CRYPTO"] = "veto"
     got = run_brain(BOTH)[1]
     assert got["cb_buy"] == [] and got["alp_buy"] == ["SPY"]
+
+def test_spot_economics():
+    e = nws.spot_economics("coinbase")
+    assert abs(e["roundtrip_fee_pct"] - 2.2) < 1e-9 and e["venue"] == "coinbase", e
+    assert abs(nd.break_even_p("crypto", e) - 0.511) < 1e-9
+    assert nws.spot_economics("alpaca")["roundtrip_fee_pct"] == 0.0
+    assert nws.spot_economics("paper") is None and nws.spot_economics(None) is None
+    # the gate stamps the economics-derived break-even but never posts it
+    post = setup("shadow", post=Nim("skip"))
+    v = nws.gate("crypto", "BTC-USD", {"fused": 80.0}, source="t", venue="coinbase")
+    assert abs(v["break_even_p"] - 0.511) < 1e-9 and v["required_p"] == 0.60, v
+    blob = json.dumps(post.calls[0])
+    assert "roundtrip" not in blob and "break_even" not in blob and "2.2" not in blob
+    # a high-fee venue lifts required_p above the floor
+    v = nws.gate("crypto", "BTC-USD", {}, source="t", economics={"roundtrip_fee_pct": 30.0})
+    assert abs(v["required_p"] - 0.67) < 1e-9 and v["allow"] is True  # shadow never blocks
+
 
 def test_unified_brain_sells_never_blocked():
     post = setup("veto", post=Nim("skip"))

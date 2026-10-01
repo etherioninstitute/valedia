@@ -145,12 +145,35 @@ def warm_once():
         return None
 
 
+def spot_economics(venue, row=None):
+    """{"roundtrip_fee_pct": ...} from fee_engine's STATIC schedule for `venue` (no network),
+    or None for an unknown / paper venue (the probability floor applies). Notional: the row's
+    amount / amount_usd / notional, else $100. Code only; never sent to the model.
+    """
+    try:
+        import fee_engine
+        v = str(venue or "").strip().lower()
+        if v not in fee_engine.STATIC_FEES:
+            return None
+        r = row if isinstance(row, dict) else {}
+        amt = 100.0
+        for k in ("amount", "amount_usd", "notional"):
+            if isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool) and r[k] > 0:
+                amt = float(r[k])
+                break
+        rt = fee_engine.roundtrip_cost(v, amt, use_static=True)["roundtrip_pct"]
+        return {"roundtrip_fee_pct": float(rt), "venue": v}
+    except Exception:
+        return None
+
+
 def gate(asset_class, symbol, row=None, *, source, side="buy", venue=None, label=None,
-         code_facts=None, news=None):
+         code_facts=None, news=None, economics=None):
     """Nimble verdict for one ENTRY candidate, or None when there is nothing to do.
 
     row: the decision point's own numbers (fused, q, fee_check, has_pos, ere, ...);
     stock_facts / crypto_facts turn them into booleans in code. Unknown stays None.
+    economics: break-even inputs for the veto rule (None -> spot_economics(venue, row)).
     """
     mode = "shadow"
     try:
@@ -170,7 +193,8 @@ def gate(asset_class, symbol, row=None, *, source, side="buy", venue=None, label
         return nd.decide_candidate(
             cls, {"symbol": sym, "venue": venue}, side=side, code_facts=facts,
             informed=informed, source=source, label=label,
-            post=_HOOKS["post"], get=_HOOKS["get"])
+            post=_HOOKS["post"], get=_HOOKS["get"],
+            economics=economics if economics is not None else spot_economics(venue, row))
     except Exception as e:  # a wiring error must never crash a decision point
         return _fallback(mode, mode != "veto", "wiring_" + type(e).__name__,
                          type(e).__name__)

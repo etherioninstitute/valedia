@@ -19,8 +19,13 @@ for _k in list(os.environ):
 LOG = os.path.join(tempfile.mkdtemp(prefix="nimdec_"), "decisions.jsonl")
 os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 
+import calibration_ledger as cl  # noqa: E402
 import nimble_decide as nd  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
+import valedia_config as vc  # noqa: E402
+
+vc._MODELS = tempfile.mkdtemp(prefix="nimdec_models_")  # no Etherion file: phi 1.0
+cl._reset_cache(items=[])  # no record: calibration is identity
 
 PIN = "24e550a16a70"
 OTHER = "deadbeef0000" + "1" * 52
@@ -104,8 +109,9 @@ def test_modes_resolution():
     assert nd.mode_for("stock") == "veto" and nd.mode_for("crypto") == "off"
     _reset(VALEDIA_NIMBLE_MODE_PREDICTION="VETO", VALEDIA_NIMBLE_MODE_STOCK="junk")
     assert nd.mode_for("prediction") == "veto" and nd.mode_for("stock") == "shadow"
-    _reset(VALEDIA_NIMBLE_MIN_CONF="junk", VALEDIA_NIMBLE_TIMEOUT_S="-3")
-    assert nd.min_conf() == 0.60 and nd.timeout_s() == 10.0
+    _reset(VALEDIA_NIMBLE_MIN_SHARPNESS="junk", VALEDIA_NIMBLE_TIMEOUT_S="-3")
+    assert nd.min_sharpness() == 0.05 and nd.timeout_s() == 10.0
+    assert nd.p_floor() == 0.60 and nd.base_margin() == 0.02
 
 
 def test_off_no_call():
@@ -114,7 +120,9 @@ def test_off_no_call():
     v = _decide(_post(choice="skip", calls=calls))
     assert v["allow"] is True and v["mode"] == "off" and not calls and not _lines()
     assert set(v) == {"action", "confidence", "risk", "mode", "allow", "reason",
-                      "latency_ms", "within_budget", "error", "p_action", "p_buy"}
+                      "latency_ms", "within_budget", "error", "p_action", "p_buy",
+                      "p_cal", "calibration", "required_p", "break_even_p", "margin",
+                      "phi_multiplier", "phi_source", "rule_reason"}
 
 
 def test_shadow_never_blocks():
@@ -135,7 +143,8 @@ def test_shadow_never_blocks():
 
 def test_veto_semantics():
     cases = [(_post("buy", 0.9), True, "veto_model_buy"),
-             (_post("buy", 0.5), False, "veto_low_confidence"),
+             (_post("buy", 0.5), False, "veto_p_below_required"),  # p_buy .5 < floor .60
+             (_post("buy", 0.01), False, "veto_not_sharp"),
              (_post("buy", None), True, "veto_model_buy"),  # confidence from probabilities
              (_post("hold", 0.9), False, "veto_model_hold"),
              (_post("skip", 0.9), False, "veto_model_skip"),
@@ -149,7 +158,7 @@ def test_veto_semantics():
     _reset(mode="veto")
     v = _decide(_post("buy", None))
     assert v["confidence"] == 0.9 and v["risk"] == 3
-    _reset(mode="veto", VALEDIA_NIMBLE_MIN_CONF="0.4")
+    _reset(mode="veto", VALEDIA_NIMBLE_P_FLOOR="0.4")
     assert _decide(_post("buy", 0.5))["allow"] is True
     _reset(mode="veto", enabled=False)
     v = _decide(_post())
@@ -191,7 +200,8 @@ def test_logging_and_state():
     assert len(rec) == 1
     r = rec[0]
     assert r["source"] == "nimble_decide:test" and r["label"]["code"] == "would_buy"
-    assert r["label"]["mode"] == "shadow" and r["label"]["min_conf"] == 0.60
+    assert r["label"]["mode"] == "shadow" and r["label"]["rule"]["min_sharpness"] == 0.05
+    assert r["label"]["rule"]["required_p"] == 0.60 and r["label"]["rule"]["phi_multiplier"] == 1.0
     assert r["label"]["informed_sources"]["mirofish"]["used"] is True
     state = calls[0]["payload"]["state"]
     assert state["symbol"] == "NVDA" and state["venue"] == "alpaca" and state["side"] == "buy"
@@ -302,8 +312,7 @@ def test_confidence_is_not_p_chosen():
     for k in ("action", "confidence", "risk", "mode", "allow", "reason", "latency_ms",
               "within_budget", "error"):  # existing keys kept
         assert k in v
-    # veto still uses confidence (not p_buy / p_action): skip is vetoed, a "buy" at the
-    # same near-coin-flip confidence is low_confidence even though p_buy is recorded
+    # veto: skip is vetoed; a "buy" at the same near-coin-flip confidence is not sharp
     _reset(mode="veto")
     v = _decide(post)
     assert v["allow"] is False and v["reason"] == "veto_model_skip" and v["p_buy"] == 0.4765
@@ -313,13 +322,14 @@ def test_confidence_is_not_p_chosen():
             "action": {"choice": "buy", "confidence": 0.00159,
                        "probabilities": {"buy": 0.5235, "skip": 0.4765}}, "risk": {"choice": "5"}}}
     v = _decide(post_buy)
-    assert v["allow"] is False and v["reason"] == "veto_low_confidence"
+    assert v["allow"] is False and v["reason"] == "veto_not_sharp"
     assert v["p_action"] == 0.5235 == v["p_buy"]
     # no probabilities: no invented odds
     def bare(url, payload, timeout):
         return {"model": payload["model"], "answers": {"action": {"choice": "buy", "confidence": 0.9}}}
     v = _decide(bare)
-    assert v["p_action"] is None and v["p_buy"] is None and v["allow"] is True
+    assert v["p_action"] is None and v["p_buy"] is None and v["allow"] is False
+    assert v["reason"] == "veto_no_p_buy"  # no odds: the profit rule cannot pass
     # engine off / exit: keys present, None
     _reset(mode="veto", enabled=False)
     v = _decide(post)

@@ -267,8 +267,6 @@ def _pre_create(opp, n, price_cents, r):
     if not pre["ok"]:
         _skip(r, 'SKIP_INFORMED', pre["reasons"])
         return None
-    if pre.get("jev") is not None:
-        r['jev'] = pre["jev"]
     return pre
 
 

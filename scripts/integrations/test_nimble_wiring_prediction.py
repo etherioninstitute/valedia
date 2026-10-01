@@ -23,6 +23,7 @@ for _k in list(os.environ):
 LOG = os.path.join(tempfile.mkdtemp(prefix="nimwire_"), "decisions.jsonl")
 os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 
+import calibration_ledger as cl  # noqa: E402
 import forward_test_ledger as ftl  # noqa: E402
 import informed_before_create as ibc  # noqa: E402
 import kalshi_auth  # noqa: E402
@@ -43,6 +44,9 @@ import test_vaughan_arb_paper as tva  # noqa: E402
 import test_weather_informed_admit as twx  # noqa: E402
 from test_poly_us import _restore  # noqa: E402
 
+vc._MODELS = tempfile.mkdtemp(prefix="nimwire_models_")  # no Etherion file: phi 1.0
+cl._reset_cache(items=[])  # no record: calibration is identity
+
 PIN = "24e550a16a70"
 VOLATILE = ("nimble", "ts")
 
@@ -58,8 +62,9 @@ def _get(url, timeout):
 class Nim:
     """Env + fake engine. choice None → engine down (the POST raises)."""
 
-    def __init__(self, mode="shadow", enabled=True, choice="skip", conf=0.9):
+    def __init__(self, mode="shadow", enabled=True, choice="skip", conf=0.9, p_buy=0.9):
         self.mode, self.enabled, self.choice, self.conf = mode, enabled, choice, conf
+        self.p_buy = p_buy
         self.posts = []
 
     def _post(self, url, payload, timeout):
@@ -68,7 +73,8 @@ class Nim:
             raise OSError("engine down")
         return {"model": payload["model"], "answers": {
             "action": {"choice": self.choice, "confidence": self.conf,
-                       "probabilities": {"buy": 0.9, "hold": 0.05, "skip": 0.05}},
+                       "probabilities": {"buy": self.p_buy, "hold": (1 - self.p_buy) / 2,
+                                         "skip": (1 - self.p_buy) / 2}},
             "risk": {"choice": "4"}}}
 
     def __enter__(self):
@@ -254,18 +260,24 @@ def test_point(name, run, ok, live):
     assert len(n.posts) == 1 and orders == 0, (name, len(n.posts), orders)
     assert blocked_status(name, r), (name, r)
     assert r["nimble"]["allow"] is False and r["nimble"]["reason"] == "veto_model_skip", (name, r["nimble"])
-    # veto + hold, and veto + buy under min_conf: blocked
-    for choice, conf, why in (("hold", 0.9, "veto_model_hold"), ("buy", 0.3, "veto_low_confidence")):
-        with Nim("veto", choice=choice, conf=conf):
+    # veto + hold, buy under the sharpness floor, buy with p_buy under the floor: blocked
+    for choice, conf, pb, why in (("hold", 0.9, 0.9, "veto_model_hold"),
+                                  ("buy", 0.01, 0.9, "veto_not_sharp"),
+                                  ("buy", 0.9, 0.55, "veto_p_below_required")):
+        with Nim("veto", choice=choice, conf=conf, p_buy=pb):
             r, orders = run()
         assert orders == 0 and blocked_status(name, r), (name, choice, r)
         assert r["nimble"]["reason"] == why, (name, r["nimble"])
-    # veto + buy at/above min_conf: proceeds exactly as the code decided
+    # veto + buy, sharp, p_buy over required: proceeds exactly as the code decided
     with Nim("veto", choice="buy", conf=0.9) as n:
         r, orders = run()
     assert ok(r) and orders == base_orders and strip(r) == strip(base), (name, r)
     assert r["nimble"]["allow"] is True and r["nimble"]["reason"] == "veto_model_buy", (name, r["nimble"])
-    with Nim("veto", choice="buy", conf=0.6):  # exactly min_conf allows
+    assert r["nimble"]["calibration"] == "identity" and r["nimble"]["phi_multiplier"] == 1.0
+    assert r["nimble"]["required_p"] >= 0.60, (name, r["nimble"])
+    blob = json.dumps(n.posts[0])  # economics are code-only: never in the posted state
+    assert "break_even" not in blob and "fee_per" not in blob and "price" not in blob, (name, blob)
+    with Nim("veto", choice="buy", conf=0.05):  # exactly the sharpness floor allows
         r, orders = run()
     assert ok(r) and orders == base_orders, (name, r)
     # veto + engine down: blocked (fail closed); veto + VALEDIA_SYSTEMONE unset: blocked, no POST
@@ -283,6 +295,31 @@ def test_point(name, run, ok, live):
     assert n.posts == [] and ok(r) and orders == base_orders, (name, r)
     assert r["nimble"]["reason"] == "mode_off", (name, r["nimble"])
     print("ok", name)
+
+
+def test_economics_for():
+    opp = {"platform": "kalshi", "side": "yes", "price": 0.8, "yes_ask": 81,
+           "ev_preflight": {"fee_per": 0.012, "half_spread": 0.01, "slip": 0.002}}
+    e = nw.economics_for(opp, "yes")
+    assert e["yes_price"] == 0.81 and e["fee_per_contract"] == 0.012 and e["half_spread"] is None
+    assert abs(nd.break_even_p("prediction", e) - 0.824) < 1e-9, e
+    e = nw.economics_for({"platform": "kalshi", "price": 0.3, "raw": {"no_ask": 0.31}}, "no")
+    assert e["side"] == "no" and e["no_price"] == 0.31  # NO buy uses the NO price
+    assert abs(e["fee_per_contract"] - 0.07 * 0.31 * 0.69) < 1e-12, e
+    e = nw.economics_for({"platform": "kalshi", "price": 0.4,
+                          "ev_preflight": {"fee_per": 0.01, "half_spread": 0.02}}, "yes")
+    assert e["half_spread"] == 0.02 and abs(nd.break_even_p("prediction", e) - 0.43) < 1e-9
+    # scanner-shaped opp: price = yes_ask / 100 on side no, no no_ask -> no break-even
+    scan = {"platform": "kalshi_scanner", "side": "no", "price": 64 / 100,
+            "raw": {"yes_ask": 64, "mid": 40}}
+    assert nw.economics_for(scan, "no") is None
+    assert nd.break_even_p("prediction", nw.economics_for(scan, "no"), "no") is None
+    e = nw.economics_for(dict(scan, price=0.37, price_side="no"), "no")  # explicitly NO
+    assert e["no_price"] == 0.37 and abs(nd.break_even_p("prediction", e) - 0.37 - 0.07 * 0.37 * 0.63) < 1e-9
+    assert nw.economics_for(dict(scan, no_price=0.36), "no")["no_price"] == 0.36
+    assert nw.economics_for({"price": 0.4}, None) is None  # no yes/no side: floor applies
+    assert nw.economics_for({"platform": "kalshi"}, "yes") is None
+    print("ok economics_for")
 
 
 def test_poly_run_level_veto():
@@ -376,6 +413,7 @@ def test_kalshi_executor_not_wired():
 def main():
     for name, run, ok, live in POINTS:
         test_point(name, run, ok, live)
+    test_economics_for()
     test_poly_run_level_veto()
     test_nimble_asked_only_after_code_gates()
     test_never_raises_and_modes()

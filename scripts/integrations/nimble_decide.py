@@ -12,28 +12,43 @@ decision in `label`.
 Modes (env VALEDIA_NIMBLE_MODE_STOCK / _CRYPTO / _PREDICTION, else
 VALEDIA_NIMBLE_MODE, else shadow):
 - off:    no call, allow True.
-- shadow: call when VALEDIA_SYSTEMONE=1, log, allow ALWAYS True.
-- veto:   allow only when the model says buy with confidence at or above
-          VALEDIA_NIMBLE_MIN_CONF (default 0.60). Engine off, error, refusal,
-          digest mismatch or timeout → allow False (fail-closed).
-Exits (side sell/exit/close, or candidate action sell / exit True) are never
-blocked and never sent: allow True in every mode. Veto can only remove an
-order; it never adds one, sizes, flips a side, or changes a price.
+- shadow: call when VALEDIA_SYSTEMONE=1, compute + stamp the veto rule, allow ALWAYS True.
+- veto:   allow only when the veto rule below passes. Engine off, error, refusal, digest
+          mismatch or timeout → allow False (fail-closed).
+Exits (side sell/exit/close, or candidate action sell / exit True) are never blocked and
+never sent. Veto only removes an order; it never adds, sizes, flips or reprices one.
 
-Confidence semantics (verified on Burton's Mac): Nimble's `confidence` is
-1 - normalized entropy of `probabilities`. It is NOT P(chosen action). Example:
-buy 0.4765 / skip 0.5235 gives choice skip with confidence 0.00159 (a near coin
-flip is "unconfident" even though skip won). Veto still uses `confidence` against
-VALEDIA_NIMBLE_MIN_CONF, unchanged. Every verdict also records `p_action`
-(probability of the chosen action) and `p_buy` (probability of buy), read from
-`probabilities` (None when absent), so a review can see the actual odds.
+Confidence semantics (verified on Burton's Mac): `confidence` = 1 - normalized entropy of
+`probabilities` (sharpness), NOT P(chosen): buy .4765 / skip .5235 → confidence .00159.
+Veto rule (entries only): allow iff action == "buy" and confidence >= min_sharpness (only a
+"not a coin flip" floor) and p_cal >= required_p, where
+  min_sharpness  VALEDIA_NIMBLE_MIN_SHARPNESS (0.05); old VALEDIA_NIMBLE_MIN_CONF is ignored;
+  p_cal          calibration_ledger.calibrate("nimble_decide:<source>", p_buy): identity under
+                 30 scorable decisions, then isotonic (`calibration` records which);
+  required_p     max(VALEDIA_NIMBLE_P_FLOOR (0.60), break_even_p + margin), floor if unknown;
+  margin         VALEDIA_NIMBLE_BASE_MARGIN (0.02) * phi_multiplier;
+  phi_multiplier 0.5 + 2.5 * (1 - rf), rf = valedia_config._risk_factor(), the SAME Etherion
+                 risk_level scalar dynamic_per_trade_cap uses: NORMAL 0.5 .. CAUTION 1.5 .. HALT
+                 3.0; missing / no risk_level / stale (VALEDIA_NIMBLE_PHI_MAX_AGE_H, 24) → 1.0.
+break_even_p from the caller's `economics` (code only, NEVER in the model state), else None:
+  prediction    price of the side bought: `yes_price` (else `price`) for a yes buy, `no_price`
+                ONLY for a no buy (> 1 = cents) + fee_per_contract + half_spread + slip.
+  stock/crypto  0.5 + roundtrip_fee_pct / 100 / 2 (percent, fee_engine.roundtrip_cost).
+                APPROXIMATION for a symmetric +-m outcome, exact break-even 0.5 + fee / (2 m):
+                this is m = 100% and UNDERSTATES it for real moves. `expected_move_pct` gives
+                0.5 + fee_pct / (2 move_pct); an explicit `break_even_p` is used as given.
+Reasons: veto_model_<hold|skip>|not_sharp|no_p_buy|p_below_required; allow = veto_model_buy.
+Shadow stamps all of it (would-be reason in `rule_reason`) and never blocks.
 
 This module never places an order and never fetches market data.
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
+from datetime import datetime
 
 import informed_facts as inf
 import systemone_hotpath_client as s1
@@ -41,7 +56,11 @@ import systemone_hotpath_client as s1
 CLASSES = ("stock", "crypto", "prediction")
 MODES = ("off", "shadow", "veto")
 DEFAULT_MODE = "shadow"
-MIN_CONF_DEFAULT = 0.60
+MIN_SHARPNESS_DEFAULT = 0.05
+P_FLOOR_DEFAULT = 0.60
+BASE_MARGIN_DEFAULT = 0.02
+PHI_MULT_LO, PHI_MULT_HI = 0.5, 3.0
+PHI_MAX_AGE_H_DEFAULT = 24.0
 TIMEOUT_S_DEFAULT = 10.0
 MANY_CAP_S_DEFAULT = 30.0
 ACTIONS = ("buy", "hold", "skip")
@@ -100,6 +119,7 @@ QUESTION_RISK = {
 QUESTIONS = {c: {"action": QUESTIONS_ACTION[c], "risk": QUESTION_RISK} for c in CLASSES}
 
 _WARMED = False
+_MIN_CONF_NOTED = False
 
 
 # ---------------------------------------------------------------- env + modes
@@ -120,8 +140,25 @@ def _env_float(key, default, lo, hi):
     return v if lo <= v <= hi else default
 
 
-def min_conf():
-    return _env_float("VALEDIA_NIMBLE_MIN_CONF", MIN_CONF_DEFAULT, 0.0, 1.0)
+def min_sharpness():
+    """VALEDIA_NIMBLE_MIN_SHARPNESS (0.05). Old VALEDIA_NIMBLE_MIN_CONF is IGNORED (one note)."""
+    global _MIN_CONF_NOTED
+    if os.environ.get("VALEDIA_NIMBLE_MIN_CONF", "").strip() and not _MIN_CONF_NOTED:
+        _MIN_CONF_NOTED = True
+        print("nimble_decide: VALEDIA_NIMBLE_MIN_CONF is deprecated and ignored; use "
+              "VALEDIA_NIMBLE_MIN_SHARPNESS (sharpness floor, default 0.05)", file=sys.stderr)
+    return _env_float("VALEDIA_NIMBLE_MIN_SHARPNESS", MIN_SHARPNESS_DEFAULT, 0.0, 1.0)
+
+
+min_conf = min_sharpness  # deprecated name
+
+
+def p_floor():
+    return _env_float("VALEDIA_NIMBLE_P_FLOOR", P_FLOOR_DEFAULT, 0.0, 1.0)
+
+
+def base_margin():
+    return _env_float("VALEDIA_NIMBLE_BASE_MARGIN", BASE_MARGIN_DEFAULT, 0.0, 1.0)
 
 
 def timeout_s():
@@ -241,6 +278,88 @@ def prediction_facts(opp, *, poly=False):
     }
 
 
+# ---------------------------------------------------------------- veto rule (docstring)
+def phi_multiplier(now=None):
+    """(multiplier in [0.5, 3.0], phi_source). Reuses valedia_config._risk_factor (Kelly cap)."""
+    try:
+        import valedia_config as vc
+        path = os.path.join(vc._MODELS, "latest_etherion_risk.json")
+        if not os.path.exists(path):
+            return 1.0, "etherion_missing"
+        with open(path) as f:
+            doc = json.load(f)
+        lvl = str(doc.get("risk_level") or "").strip().upper() if isinstance(doc, dict) else ""
+        if not lvl:
+            return 1.0, "etherion_no_risk_level"
+        try:
+            t = datetime.fromisoformat(str(doc.get("ts"))).timestamp()
+        except (TypeError, ValueError):
+            t = os.path.getmtime(path)
+        max_h = _env_float("VALEDIA_NIMBLE_PHI_MAX_AGE_H", PHI_MAX_AGE_H_DEFAULT, 0.0, 1e6)
+        if ((time.time() if now is None else now) - t) / 3600.0 > max_h:
+            return 1.0, "etherion_stale"
+        rf = min(max(float(vc._risk_factor()), 0.0), 1.0)
+        return round(PHI_MULT_LO + (PHI_MULT_HI - PHI_MULT_LO) * (1.0 - rf), 6), "etherion:" + lvl
+    except Exception as e:
+        return 1.0, "etherion_error_" + type(e).__name__
+
+
+def break_even_p(asset_class, economics, side=None):
+    """Break-even P(profitable) from caller economics (docstring), or None. Never raises."""
+    e = economics if isinstance(economics, dict) else {}
+    try:
+        given = _num(e.get("break_even_p"))
+        if given is not None:
+            return given if given >= 0.0 else None
+        if asset_class == "prediction":
+            sd = str(e.get("side") or side or "").strip().lower()
+            price = _num(e.get(sd + "_price")) if sd in ("yes", "no") else None
+            if price is None and sd == "yes":  # a NO buy needs no_price: never a YES price
+                price = _num(e.get("price"))
+            price = price / 100.0 if price is not None and price > 1.0 else price  # cents
+            if sd not in ("yes", "no") or price is None or not 0.0 < price < 1.0:
+                return None
+            extra = [_num(e.get(k)) for k in ("fee_per_contract", "half_spread", "slip")]
+            return round(price + sum(max(0.0, x) for x in extra if x is not None), 6)
+        if asset_class in ("stock", "crypto"):
+            rt, move = _num(e.get("roundtrip_fee_pct")), _num(e.get("expected_move_pct"))
+            if rt is None or rt < 0:
+                return None
+            return round(0.5 + rt / 2.0 / (move if move and move > 0 else 100.0), 6)
+    except Exception:
+        pass
+    return None
+
+
+def rule_inputs(asset_class, economics=None, side=None):
+    """Everything the veto rule needs before the model answers. Code only, never sent."""
+    be = break_even_p(asset_class, economics, side)
+    mult, phi_src = phi_multiplier()
+    margin, floor = round(base_margin() * mult, 6), p_floor()
+    return {"min_sharpness": min_sharpness(), "p_floor": floor, "break_even_p": be,
+            "margin": margin, "phi_multiplier": mult, "phi_source": phi_src,
+            "required_p": floor if be is None else max(floor, round(be + margin, 6))}
+
+
+def apply_rule(action, confidence, p_cal, rule):
+    """'veto_model_buy' when the rule allows, else the veto reason."""
+    if action != "buy":
+        return "veto_model_%s" % action
+    if confidence is None or confidence < rule["min_sharpness"]:
+        return "veto_not_sharp"
+    if p_cal is None:
+        return "veto_no_p_buy"
+    return "veto_p_below_required" if p_cal < rule["required_p"] else "veto_model_buy"
+
+
+def _calibrate(source, p_buy):
+    try:
+        import calibration_ledger as cl
+        return cl.calibrate_ex(source, p_buy)
+    except Exception:
+        return {"p_cal": p_buy, "calibration": "identity"}
+
+
 # ---------------------------------------------------------------- decide
 def _parse(body):
     ans = (body or {}).get("answers") or {}
@@ -272,12 +391,15 @@ def is_exit(candidate, side):
     return str(c.get("action") or "").strip().lower() in EXIT_SIDES
 
 
-def _verdict(mode, allow, reason, *, action=None, confidence=None, risk=None,
-             latency_ms=None, within_budget=False, error=None, p_action=None, p_buy=None):
-    return {"action": action, "confidence": confidence, "risk": risk, "mode": mode,
-            "allow": bool(allow), "reason": reason, "latency_ms": latency_ms,
-            "within_budget": bool(within_budget), "error": error,
-            "p_action": p_action, "p_buy": p_buy}
+VERDICT_EXTRA = ("action", "confidence", "risk", "latency_ms", "error", "p_action", "p_buy",
+                 "p_cal", "calibration", "required_p", "break_even_p", "margin",
+                 "phi_multiplier", "phi_source", "rule_reason")
+
+
+def _verdict(mode, allow, reason, *, within_budget=False, **kw):
+    v = {k: kw.get(k) for k in VERDICT_EXTRA}
+    v.update(mode=mode, allow=bool(allow), reason=reason, within_budget=bool(within_budget))
+    return v
 
 
 def _no_call(mode, exit_, reason):
@@ -305,12 +427,11 @@ def build_state(asset_class, candidate, side, code_facts, informed_facts_):
 
 
 def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None, source,
-                     label=None, post=None, get=None):
-    """Verdict {action, confidence, risk, mode, allow, reason, latency_ms, within_budget, error,
-    p_action, p_buy}. confidence = 1 - normalized entropy (NOT P(chosen)); see module docstring.
+                     label=None, post=None, get=None, economics=None):
+    """Verdict {mode, allow, reason, within_budget} + VERDICT_EXTRA. Rule: module docstring.
 
-    informed: informed_facts.informed_facts(...) output; None → computed here from
-    local files (no network); {} → no informed facts. Never raises.
+    informed: informed_facts.informed_facts(...) output; None → computed here from local
+    files (no network); {} → none. economics: break-even inputs, code only. Never raises.
     """
     cls = str(asset_class or "").strip().lower()
     mode = mode_for(cls)
@@ -330,7 +451,8 @@ def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None,
         inf_facts = informed.get("facts") if isinstance(informed, dict) else None
         state = build_state(cls, candidate, side, code_facts, inf_facts)
         warm(post=post, get=get)
-        log_label = {"code": label, "mode": mode, "min_conf": min_conf(),
+        rule = rule_inputs(cls, economics, side)
+        log_label = {"code": label, "mode": mode, "rule": rule,
                      "informed_sources": (informed or {}).get("sources")}
         res = s1.ask(state, QUESTIONS[cls], source="nimble_decide:%s" % source, label=log_label,
                      post=post, timeout=timeout_s(), parse=_parse, get=get)
@@ -338,25 +460,21 @@ def decide_candidate(asset_class, candidate, *, side, code_facts, informed=None,
         return _no_call(mode, False, "internal_" + type(e).__name__)
     ans = res.get("answers") or {}
     err = res.get("error") or (None if ans.get("action") else "bad_action")
-    out = dict(action=ans.get("action"), confidence=ans.get("confidence"), risk=ans.get("risk"),
-               p_action=ans.get("p_action"), p_buy=ans.get("p_buy"), latency_ms=res.get("latency_ms"), within_budget=res.get("within_budget"), error=err)
-    if mode == "shadow":
+    cal = _calibrate("nimble_decide:%s" % source, ans.get("p_buy"))
+    rr = "veto_engine_error" if err else apply_rule(
+        ans.get("action"), ans.get("confidence"), cal.get("p_cal"), rule)
+    out = dict(ans, **rule, **cal, latency_ms=res.get("latency_ms"), error=err, rule_reason=rr,
+               within_budget=res.get("within_budget"))  # _verdict keeps VERDICT_EXTRA keys only
+    if mode == "shadow":  # computed and stamped, never enforced
         return _verdict(mode, True, "shadow_error" if err else "shadow_logged", **out)
-    if err:
-        return _verdict(mode, False, "veto_engine_error", **out)
-    conf = ans.get("confidence")
-    if ans["action"] != "buy":
-        return _verdict(mode, False, "veto_model_" + ans["action"], **out)
-    if conf is None or conf < min_conf():
-        return _verdict(mode, False, "veto_low_confidence", **out)
-    return _verdict(mode, True, "veto_model_buy", **out)
+    return _verdict(mode, rr == "veto_model_buy", rr, **out)
 
 
 def decide_many(asset_class, items, *, source, cap_s=None, post=None, get=None,
                 clock=time.monotonic):
     """Sequential decide_candidate over items, in order, with a wall-clock cap.
 
-    items: dicts {candidate, side, code_facts, informed?, label?}. Once cap_s
+    items: dicts {candidate, side, code_facts, informed?, label?, economics?}. Once cap_s
     (default VALEDIA_NIMBLE_MANY_CAP_S, 30 s) has elapsed, no further calls are
     made; the rest get the mode default with reason cap_reached (shadow/off allow,
     veto blocks entries, exits always allowed). Returns one verdict per item.
@@ -376,5 +494,5 @@ def decide_many(asset_class, items, *, source, cap_s=None, post=None, get=None,
         out.append(decide_candidate(
             asset_class, it.get("candidate"), side=it.get("side"),
             code_facts=it.get("code_facts"), informed=it.get("informed"), source=source,
-            label=it.get("label"), post=post, get=get))
+            label=it.get("label"), post=post, get=get, economics=it.get("economics")))
     return out
