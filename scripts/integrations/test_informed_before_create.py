@@ -531,7 +531,7 @@ def test_executor_conviction_create_path():
         assert "informed_before_create" in exe and "create_preflight" in exe
         assert "create_preflight" in alloc
         assert "jev_shadow" not in exe
-        assert "jev_shadow" not in arb and "create_preflight" not in arb
+        assert "jev_shadow" not in arb  # arb is speed-path (strategy LATENCY_ARB): no Jev; it now runs create_preflight (see test_latency_arb_evidence)
     finally:
         ex.create_order, ex._size_contracts = orig_c, orig_s
         jev.http_post = real_post

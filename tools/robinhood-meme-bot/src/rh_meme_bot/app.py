@@ -11,6 +11,7 @@ from .cli import build_bot, main  # noqa: F401 - entry points stay importable fr
 from .config import Config
 from .decision import Engine, run_engine, validate_decision
 from .decision_engine import sanitize
+from .backoff import ENGINE_COOLDOWN, EngineBreaker
 from .decision_log import DecisionLog, read_records
 from .executor import DuplicatePoolError, Executor
 from .gates import evaluate_gates, first_failure
@@ -29,7 +30,7 @@ class Bot:
                  sink, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  decision_log: Optional[DecisionLog] = None,
                  perf: Callable[[], float] = time.perf_counter, redecide: bool = False,
-                 v4=None):
+                 v4=None, mono: Callable[[], float] = time.monotonic):
         self.cfg, self.reader, self.executor = cfg, reader, executor
         self.engine, self.sink, self._clock, self._perf = engine, sink, clock, perf
         self.log = decision_log
@@ -42,6 +43,9 @@ class Bot:
         self.stats = LatencyStats(cfg.decision_latency_budget_ms)
         self.quote_usd = QuoteUsd(reader, cfg.quote_tokens, profile=profile_for(cfg.chain_id))
         self.rechecks = RecheckBook(cfg.recheck_blocks)
+        self.breaker = EngineBreaker(cfg.engine_breaker_errors, cfg.engine_cooldown_s, mono)
+        self._cooldown_logged: set = set()  # pools already logged engine_cooldown this episode
+        self._head: Optional[int] = None  # newest chain head seen by run_once (block clock)
         self.v4 = v4
         self._v4_ready: Optional[bool] = None  # None = not verified yet; False = disabled
         self._errs: dict = {}
@@ -140,9 +144,15 @@ class Bot:
 
     def _evaluate(self, ev, state, entry, build_err, recheck: int) -> dict:
         ts = self._clock().isoformat(timespec="seconds")
+        cooldown = False
         if build_err:
             decision, _ = validate_decision(None)
             decision["error"], latency, within = build_err, None, False
+        elif self.breaker.is_open():  # cheap skip: no engine call while the breaker is open
+            decision, _ = validate_decision(None)
+            decision["error"], latency, within, cooldown = ENGINE_COOLDOWN, None, False, True
+            self.stats.warm, self.stats.last_error = False, ENGINE_COOLDOWN
+            self._cooldown_logged.add(ev.pool.lower())
         else:
             t0 = self._perf()
             decision, problem = run_engine(self.engine, state)
@@ -156,6 +166,10 @@ class Bot:
             latency = decision["latency_ms"] if decision["latency_ms"] is not None else wall
             within = self.stats.record(latency)
             self.stats.warm, self.stats.last_error = not decision["error"], decision["error"]
+            if self.breaker.record(bool(decision["error"])):
+                self.sink.action(
+                    f"engine circuit open: {self.breaker.consecutive} consecutive errors; no "
+                    f"engine calls for {self.cfg.engine_cooldown_s:g}s (pools log engine_cooldown)")
         final, gates = evaluate_gates(decision, state, self.cfg, ev.hooks)
         position = None
         has_pos = getattr(self.executor, "has_position", lambda pool: False)
@@ -174,8 +188,13 @@ class Bot:
                               "threshold": "no error", "passed": False})
         self.seen_pools.add(ev.pool.lower())
         self._log(ts, ev, state, decision, latency, within, gates, final, position, recheck)
+        retry_at = None  # per-pool backoff after a real engine error (a cooldown skip is not one)
+        if decision["error"] and not build_err and not cooldown and self.cfg.engine_retry_blocks:
+            retry_at = (ev.block_number if self._head is None else self._head) \
+                + self.cfg.engine_retry_blocks
         watched = not build_err and self.rechecks.consider(
-            ev, state, gates, final, recheck, engine_error=bool(decision["error"]))
+            ev, state, gates, final, recheck, engine_error=bool(decision["error"]),
+            retry_at=retry_at)
         self.sink.decision({
             "pool": ev.pool, "action": decision["action"], "confidence": decision["confidence"],
             "risk_score": decision["risk_score"], "latency_ms": latency, "within_budget": within,
@@ -223,9 +242,11 @@ class Bot:
             return outcomes
         for p in self.rechecks.expire(head):
             self.sink.action(f"recheck window over for pool {p.ev.pool} (block {p.until_block})")
-        for p in self.rechecks.due():
+        for p in self.rechecks.due(head):  # pools backing off after an engine error wait
             if p.ev.pool.lower() in fresh:
                 continue
+            if self.breaker.is_open() and p.ev.pool.lower() in self._cooldown_logged:
+                continue  # already logged engine_cooldown this episode: stay silent
             state, entry, err = self._facts(p.ev)
             if err or fingerprint(state) == p.facts:
                 continue  # unreadable now, or nothing changed: no model call, no log line
@@ -237,6 +258,8 @@ class Bot:
         """One poll iteration. RPC failures are reported, never raised."""
         outcomes: List[dict] = []
         self.verify_v4()
+        if not self.breaker.is_open():
+            self._cooldown_logged.clear()  # a new episode logs each pool once again
         events: List[PoolCreatedEvent] = []
         for label, w in list(self.watchers.items()):
             if label == "v4" and not self._v4_ready:
@@ -253,6 +276,7 @@ class Bot:
         if not heads:
             self._emit_engine()
             return outcomes
+        self._head = max(heads)
         scanned = " ".join(f"{k}_scanned_to={w.last_block}" for k, w in self.watchers.items())
         self.sink.status(f"head={max(heads)} {scanned} new_pools={len(events)}")
         for ev in sorted(events, key=lambda e: (e.block_number, e.log_index)):

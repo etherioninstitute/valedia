@@ -182,7 +182,7 @@ def test_recheck_engine_error_keeps_watch_and_retries(tmp_path):
     install_v4(rpc)
     install_weth_usdg(rpc, FACTORY)
     pid, liq, sqrt, tick = v4_meme_pool(rpc, 995, with_liquidity=False)
-    bot, _ = make(tmp_path, rpc)
+    bot, _ = make(tmp_path, rpc, ENGINE_RETRY_BLOCKS="1")  # error at 1003 -> re-ask from 1004
     assert bot.run_once()[0]["final_action"] == "skip"
     rpc.logs.append(modify_log(pid, FULL_LO, FULL_HI, liq, 1002))  # liquidity arrives...
     set_v4_pool(rpc, pid, sqrt, tick, liq)
@@ -208,7 +208,7 @@ def test_engine_error_watch_ends_with_window(tmp_path):
     install_v4(rpc)
     install_weth_usdg(rpc, FACTORY)
     pid, *_ = v4_meme_pool(rpc, 995)  # liquid pool, but Nimble is down at detection
-    bot, _ = make(tmp_path, rpc, RECHECK_BLOCKS="8")
+    bot, _ = make(tmp_path, rpc, RECHECK_BLOCKS="8", ENGINE_RETRY_BLOCKS="2")
     bot.nimble.fail = ConnectionError("down")
     assert bot.run_once()[0]["decision"]["error"]
     assert pid in bot.rechecks.pending

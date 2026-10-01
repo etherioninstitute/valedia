@@ -19,6 +19,9 @@ from requests.adapters import HTTPAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kalshi_auth import get, create_order
+from latency_arb_evidence import (  # noqa: F401 - re-exported: evidence + pre-create chain
+    ARB_EVIDENCE_VERSION, ARB_FV_SOURCE, arb_pre_create, build_arb_evidence,
+    heuristic_fair_value)
 
 # ═══ CONFIGURATION ═══
 KALSHI_SERIES = {
@@ -293,13 +296,13 @@ def find_kalshi_contract(signal):
                     # BTC pumped, strike is at or below spot → YES should be high
                     # If YES is still cheap (lagging), that's our edge
                     implied_prob = ya
-                    fair_value = max(0.5, 1.0 - distance_pct / 5)  # Rough estimate
+                    fair_value = heuristic_fair_value(distance_pct)  # Rough estimate
                     edge = int((fair_value - implied_prob) * 100)
                     side = 'yes'
                 elif direction == 'DOWN' and strike_type == 'T' and strike_price >= spot * 0.995:
                     # BTC dumped, strike is at or above spot → NO should be high
                     implied_prob = 1.0 - yb if yb > 0 else 1.0 - ya
-                    fair_value = max(0.5, 1.0 - distance_pct / 5)
+                    fair_value = heuristic_fair_value(distance_pct)
                     edge = int((fair_value - implied_prob) * 100)
                     side = 'no'
                 else:
@@ -319,6 +322,7 @@ def find_kalshi_contract(signal):
                     'distance_pct': round(distance_pct, 3),
                     'side': side,
                     'edge_cents': edge,
+                    'fair_value': round(fair_value, 4),
                     'signal': signal,
                     'exp': m.get('expected_expiration_time', '')[:16],
                 })
@@ -357,7 +361,7 @@ def load_arb_log():
     except: return {"trades": [], "stats": {}}
 
 def save_arb_log(log_data):
-    with open(ARB_LOG, 'w') as f: json.dump(log_data, f, indent=2)
+    with open(ARB_LOG, 'w') as f: json.dump(log_data, f, indent=2, default=str)
 
 def ack_status(order):
     """POST-ack is UNRECONCILED until Kalshi fill count > 0. Dry-run stays DRY_RUN."""
@@ -420,8 +424,17 @@ def execute_arb(contract, dry_run=True):
                  f"@{price_cents}c edge:{contract['edge_cents']}c "
                  f"${cost:.2f}→+${potential_profit:.2f}")
     else:
+        pre = arb_pre_create(contract, n_contracts, price_cents, result)
+        if pre is None:
+            # Refused before any order: record the evidence, leave cooldown/daily state alone.
+            log.warning(f"{result['status']}: {contract['ticker']} {result.get('error', '')}")
+            arb_log = load_arb_log()
+            arb_log["trades"].append(result)
+            save_arb_log(arb_log)
+            return result
         try:
-            order = create_order(contract['ticker'], side, n_contracts, price_cents)
+            order = create_order(contract['ticker'], side, n_contracts, price_cents,
+                                 informed=pre["informed"])
             result["status"] = ack_status(order)
             nested = order.get("order") if isinstance(order.get("order"), dict) else {}
             result["order_id"] = nested.get("order_id") or order.get("order_id") or "?"
