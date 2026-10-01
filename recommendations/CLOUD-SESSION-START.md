@@ -26,6 +26,10 @@ Context from it for this repo: session `2026-10-01-valedia-github-cloud` in wing
 (rooms `sessions`, `decisions`). This file and the docs above carry what you need.
 Record decisions in `RUFLO-STATUS.md`; a local agent copies them into MemPalace.
 
+## Orchestration
+`/opus-foreman` is available (`.claude/skills/opus-foreman` + `.claude/agents/opus-foreman-*`).
+In the cloud only Claude seats exist: Codex/Grok CLIs, `~/.foreman` consent flags, and Jev are absent, so route to Claude workers.
+
 ## Working rules
 - Work on a branch, open a PR against `valedia-v2-grok-build`. Burton merges.
 - Tests: plain `python3 scripts/integrations/test_*.py` (assert-based, no network).
