@@ -75,6 +75,21 @@ Updated: 2026-09-13 PT (seed — Claude Code must fill/expand from its live sess
    - Attach the JSON report + one-line summary to the change. Caveat: a policy tuned on this same ledger is in-sample;
      PASS on backfill-only rows is weak evidence — prefer `--live-only` once live settlements reach the min sample.
 
+   **Self-evolve (policy lab)** (tool: `scripts/self_evolve/valedia_policy_lab.py`, tests `test_valedia_policy_lab.py`; vendored `vendors/self-evolve` is never edited).
+   self-evolve's reflect → propose → evaluate → judge → accept loop runs over the trading POLICY with the backtest gate as its A-tier grader:
+   ```bash
+   python3 scripts/self_evolve/valedia_policy_lab.py init   --lab ~/.valedia-policy-lab   # git repo OUTSIDE the tree
+   python3 scripts/self_evolve/valedia_policy_lab.py evolve --lab ~/.valedia-policy-lab --max-rounds 3
+   python3 scripts/self_evolve/valedia_policy_lab.py status --lab ~/.valedia-policy-lab
+   python3 scripts/self_evolve/valedia_policy_lab.py export --lab ~/.valedia-policy-lab --run-id ID --out recommendations/policy_proposal.json
+   ```
+   - Only `policy/candidate.json` is evolvable; grader, gate copy, baseline, ledger snapshot are IMMUTABLE (sha256 pins in `<lab>/.git/`, PATCH-gate shim refuses other writes).
+   - Accept = visible slice PASS + strict fee-true gain + time-held-out last 30% not FAIL; INSUFFICIENT_DATA never passes. `export` re-checks with the real gate.
+   - Output is a PROPOSAL file only — nothing writes live config, crontab, models/ or allocator settings; a human applies it (or not).
+   - self-evolve's own `--live` means "real LLM agents" (not trading): the wrapper refuses it; `--llm-agents` opts in (costs tokens, needs node + cc/claude + codex).
+   - Default builtin mode has no policy proposer, so rounds end STATIC_REJECT at PROPOSE until a JSON-policy proposer is plugged in.
+   - On today's 38-trade backfill ledger the visible slice is INSUFFICIENT_DATA (< 30), so nothing can be accepted yet — by design.
+
 ## C. Audit checklist Ruflo runs (HOLDS/FAILS, auditor mode = verify only, no "improvements")
 - [ ] Live cron → `master_allocator` → `record_entry` writes to `forward_test_ledger.jsonl` (file:line + trace, not `/audit` alone)
 - [ ] `kalshi_executor.run` confirmed inert (no live caller); no live logic depends on it
