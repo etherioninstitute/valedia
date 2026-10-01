@@ -341,8 +341,13 @@ def test_intel_blend_uses_capped_weight_and_reads_snapshot():
         "fee_true_net": 4.0, "legacy_n": 0,
     }
     _write(os.path.join(md, "mirofish_accuracy_summary.json"), snap)
+    # gather() reads the live swarm through mirofish_intel_archive.load_for_fv,
+    # which only passes a fresh (as_of < 24h), non-neutral (|overall_bias-50| > 5)
+    # live body. A real swarm doc carries both; the bare fixture did not.
     _write(os.path.join(md, "mirofish_signal.json"), {
         "source": "mirofish_swarm", "status": "active",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "overall_bias": 80.0,
         "signals": {"BTC-USD": {"score": 100.0, "direction": "BUY"}},
     })
     _write(os.path.join(md, "latest_fusion.json"), {

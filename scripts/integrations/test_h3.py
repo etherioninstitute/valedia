@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import types
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -29,6 +30,35 @@ def _ack(oid="ack-1"):
 
 def _fills(oid, n=5, px=80):
     return {"fills": [{"order_id": oid, "count": n, "yes_price": px}]}
+
+
+def _admitted_sports_opp(series="ALLOC"):
+    """Fields that let a Kalshi sports allocation clear the create-time gates.
+
+    master_allocator.execute_allocations now runs two gates before create_order:
+    session_clocks.before_create (needs status + open/close schedule and a known
+    resolve) and informed_before_create.create_preflight (needs attestation,
+    fee-map row, fair value, edge, spread, depth, bankroll). These tests guard
+    fill-truth (EXECUTED only on a confirmed fill), so the opp must be admitted
+    for real and reach the POST. Session times are relative to now.
+    """
+    import kalshi_fee_map as kfm
+    now = datetime.now(timezone.utc)
+    return {
+        "market": {
+            "status": "active",
+            "open_time": (now - timedelta(hours=1)).isoformat(),
+            "close_time": (now + timedelta(hours=8)).isoformat(),
+            "expected_expiration_time": (now + timedelta(hours=5)).isoformat(),
+            "can_close_early": True,
+            "early_close_condition": "game end",
+        },
+        "sports_attestation": True,
+        "fmap": {series: kfm._row(series, 0.0, 0.0, "sports")},
+        "fv": 0.90, "fv_source": "model", "fv_confidence": True,
+        "edge": 0.10, "slip": 0.0, "bid": 0.79, "ask": 0.80,
+        "depth": 20, "bankroll": 10000,
+    }
 
 
 def _ledger():
@@ -134,6 +164,7 @@ def test_allocator_and_executor_poll():
             "platform": "kalshi", "type": "SPORTS", "ticker": "ALLOC-POLL",
             "title": "t", "side": "yes", "price": 0.80, "allocation": 4.0,
             "expected_profit": 0.5, "hours_to_resolve": 6, "raw": {},
+            **_admitted_sports_opp(),
         }
         o0 = ftl.open_position_count()
         out = ma.execute_allocations([alloc], dry_run=False)
@@ -144,7 +175,8 @@ def test_allocator_and_executor_poll():
         ke.get_fills = lambda: _fills("ke-poll", 2, 80)
         state = {"max_per_trade": 10.0, "max_deployable": 10.0, "balance": 100.0}
         opp = {"ticker": "KE-POLL", "strategy": "SPORTS", "side": "yes",
-               "price": 0.80, "edge": 0.05, "score": 50, "title": "t"}
+               "price": 0.80, "score": 50, "title": "t",
+               **dict(_admitted_sports_opp("KE"), edge=0.05)}
         result = ke.execute_trade(opp, state, dry_run=False)
         assert result["status"] == "EXECUTED", result
         assert result.get("fills_payload")

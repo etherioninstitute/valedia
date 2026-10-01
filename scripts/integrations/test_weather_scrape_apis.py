@@ -37,8 +37,14 @@ def test_nws_cli_nyc_pre():
     html = _read("nws_cli_nyc_2026-09-23.html")
     station = nws_cli.station_for(city="NY")
     assert station["wfo"] == "OKX" and station["issuedby"] == "NYC"
-    assert nws_cli.station_for(city="CHI") is None
-    assert nws_cli.station_for(city="Chicago") is None
+    # Chicago is mapped now (Kalshi CHI settles on Midway / LOT-MDW); the guard
+    # that an unmapped city returns None, never a guessed WFO, moves to a city
+    # that is still unmapped (O'Hare is not the Kalshi station).
+    assert nws_cli.station_for(city="ORD") is None
+    assert nws_cli.station_for(city="Atlantis") is None
+    chi = nws_cli.station_for(city="Chicago")
+    assert chi["wfo"] == "LOT" and chi["issuedby"] == "MDW", chi
+    assert nws_cli.station_for(city="CHI")["key"] == "MDW"
     parsed = nws_cli.parse(
         html, DAY, "maximum", station,
         source_url=nws_cli.product_url("OKX", "NYC"),
@@ -214,8 +220,10 @@ def test_httpx_is_preferred_and_unknown_city_refuses():
     assert client == "httpx" and body == "ok"
     assert seen["url"].startswith("https://forecast.weather.gov/")
     html = _read("nws_cli_nyc_2026-09-23.html")
+    # Unknown city must refuse, not guess a WFO. CHI is mapped now (Midway), so
+    # this uses an unmapped station (ORD).
     chi = wl.lookup(
-        "kalshi", "KXHIGHCHI-26SEP23-T72", observe_date=DAY, rules=RULES,
+        "kalshi", "KXHIGHORD-26SEP23-T72", observe_date=DAY, rules=RULES,
         fixtures={"cli_html": html})
     assert chi["unresolved"] == "station_unconfigured" and chi["settlement_fv"] is None
     rain = wl.lookup(
