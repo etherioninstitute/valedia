@@ -224,6 +224,45 @@ def test_dca_module_ambiguous_stub_then_resolve():
         assert [r for r in ftl._read() if r.get("order_id") == "z"]
 
 
+def test_dca_module_ledger_unreadable_skips_and_pairs_oldest_first():
+    import contextlib
+    import io
+    import dca_module
+    import dca_pending as dp
+    import forward_test_ledger as ftl
+    import test_spot_ledger_booking as tsb
+    paper = {"id": "a", "status": "accepted"}
+    with tsb.ledger():
+        orig = ftl._read
+        ftl._read = lambda: 1 / 0
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                out, calls = tsb.run_dca(tsb.cb_fill(0.0001, 50000, oid="q"), paper, False,
+                                         lookup=lambda t, s: [])
+        finally:
+            ftl._read = orig
+        assert calls["cb_buy"] == [] and "ledger unreadable" in out, (calls, out)
+        assert "skipping BTC-USD" in err.getvalue()
+        # two stubs (older first) vs venue orders listed newest-first → paired oldest-first
+        s1 = dca_module._stub_ambiguous("coinbase", "BTC-USD", 5.0, "502")
+        s2 = dca_module._stub_ambiguous("coinbase", "BTC-USD", 5.0, "504")
+        orders = [{"order_id": "new", "created_time": "2026-10-01T10:05:00Z",
+                   "filled_size": "0.0001", "average_filled_price": "50000"},
+                  {"order_id": "old", "created_time": "2026-10-01T10:00:00Z",
+                   "filled_size": "0.0001", "average_filled_price": "50000"}]
+        state, _lines = dca_module._resolve_stubs("coinbase", "BTC-USD", lambda t, s: orders)
+        assert state == "found"
+        rows = ftl._read()
+        eid_by_oid = {r.get("order_id"): r["id"] for r in rows if r.get("fill_status") == "FILLED"}
+        closes = {r["entry_id"]: r.get("fill_note") for r in rows if r.get("type") == "settlement"}
+        assert closes[s1] == "upgraded_to:" + eid_by_oid["old"], closes
+        assert closes[s2] == "upgraded_to:" + eid_by_oid["new"], closes
+    assert [o["order_id"] for o in dp.by_created(
+        [{"order_id": "x"}, {"order_id": "b", "created_time": "2"},
+         {"order_id": "a", "created_time": "1"}])] == ["a", "b", "x"]
+
+
 def test_dca_module_timeout_exception_is_stubbed():
     import dca_module
     import forward_test_ledger as ftl

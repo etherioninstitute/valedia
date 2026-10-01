@@ -55,6 +55,11 @@ def unbooked(orders, rows=None):
     return [o for o in orders or [] if not o.get("order_id") or str(o.get("order_id")) not in ids]
 
 
+def by_created(orders):
+    """Venue orders oldest first (created_time); orders without a time sort last."""
+    return sorted(orders or [], key=lambda o: (not o.get("created_time"), str(o.get("created_time") or "")))
+
+
 def _lookup(venue, lookup):
     if lookup is not None:
         return lookup
@@ -79,7 +84,7 @@ def resolve(engine, venue, lookup=None, book=None):
             acts.append(f"DCA: {pair} previous attempt unresolved (venue lookup failed); not re-buying")
             continue
         pend.pop(pair)
-        orders = unbooked(orders)
+        orders = by_created(unbooked(orders))
         if not orders:
             continue
         o = dict(orders[0], success=True, pair=pair)

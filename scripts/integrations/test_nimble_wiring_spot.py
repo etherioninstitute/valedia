@@ -292,7 +292,7 @@ def run_dca():
         # fake ledger: every function spot_ledger.book_buy calls, all inert (no writes)
         "forward_test_ledger": types.SimpleNamespace(
             book_spot_fill=lambda *a, **k: None, spot_ack_ok=lambda *a, **k: True,
-            record_unreconciled=lambda *a, **k: None,
+            record_unreconciled=lambda *a, **k: None, _read=lambda: [],
             extract_spot_fill=lambda *a, **k: {"complete": False, "price": 0.0, "qty": 0.0,
                                                "fee": None, "order_id": None}),
     }

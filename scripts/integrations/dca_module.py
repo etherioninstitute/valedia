@@ -58,7 +58,8 @@ def _book_dca(venue, ticker, resp):
 # (no order id, intended notional, reason ambiguous_5xx) is written instead. Before the next
 # buy of that ticker its open stubs are resolved against the venue's read-only
 # recent_buy_orders: found (and not already booked) → booked as the fill, stub closed, no
-# re-buy; none → stub closed, buy proceeds; lookup failed → ticker skipped this run.
+# re-buy; none → stub closed, buy proceeds; lookup or ledger read failed → ticker skipped.
+# Stubs (ts) and venue orders (created_time) are paired oldest-first.
 AMBIGUOUS_REASON = "ambiguous_5xx"
 
 
@@ -82,10 +83,11 @@ def _resolve_stubs(venue, ticker, lookup=None):
     import dca_pending as dp
     try:
         import forward_test_ledger as ftl
-        rows, done = ftl._read(), ftl._settled_ids()
-    except Exception as e:  # ledger unreadable: no known stub (logged, not silent)
-        print(f"[dca_module] ambiguous-stub read failed: {e}", file=sys.stderr)
-        return "clear", []
+        rows = ftl._read()
+        done = {r.get("entry_id") for r in rows if r.get("type") == "settlement"}
+    except Exception as e:  # ledger unreadable: a stub may exist → never buy blind
+        print(f"[dca_module] ambiguous-stub read failed, skipping {ticker}: {e}", file=sys.stderr)
+        return "unknown", [f"  {ticker}: ledger unreadable (stub check failed); not buying"]
     stubs = sorted((r for r in rows if r.get("type") == "entry"
                     and r.get("reason") == AMBIGUOUS_REASON and r.get("venue") == venue
                     and r.get("ticker") == ticker and r.get("id") not in done),
@@ -102,7 +104,7 @@ def _resolve_stubs(venue, ticker, lookup=None):
         return "unknown", [f"  {ticker}: earlier ambiguous buy unresolved (venue lookup failed); not re-buying"]
     import spot_ledger as sl
     import spot_reconcile as sr
-    orders, found, lines = dp.unbooked(orders, rows), 0, []
+    orders, found, lines = dp.by_created(dp.unbooked(orders, rows)), 0, []  # oldest first
     for st in stubs:
         if orders:
             o = dict(orders.pop(0), success=True)
