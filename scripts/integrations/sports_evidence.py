@@ -11,12 +11,18 @@ informed_before_create.ALLOWED_FV): the gate refuses it with "fv_source"
 until a real model/researched FV exists. Attestation is read from a file
 Burton signs; this module never synthesizes one.
 
+MiroFish (facts only): informed_facts.mirofish_facts for the favorite's team
+code, then the series, under mirofish_intel_archive.load_for_fv freshness rules
+(stale / non-swarm / near-neutral → absent). Recorded in the evidence and fed to
+the Nimble gate as the underlying; it never changes size or the INFORMED gate.
+
 (c) GOATWORTHY Post LLC. All rights reserved.
 """
 import json
 from datetime import datetime, timezone
 
 import forward_test_ledger as ftl
+import informed_facts as _inf
 
 SPORTS_EVIDENCE_VERSION = "sports-evidence-1"
 FV_METHOD = "kalshi_two_sided_mid_devig"
@@ -136,8 +142,49 @@ def fair_value_from_books(bet, fav_book, dog_book):
     return out
 
 
+_MF_FACTS = ("mirofish_fresh", "mirofish_has_symbol", "mirofish_agrees", "mirofish_conflicts",
+             "mirofish_macro_risk_off")
+
+
+def mirofish_keys(b):
+    """Team code (last ticker segment), then series. The favorite is the YES side."""
+    t = str((b or {}).get('fav_ticker') or "").upper()
+    parts = t.split("-")
+    keys = []
+    for k in ((parts[-1] if len(parts) > 2 else None), (b or {}).get('series'), parts[0] or None):
+        k = str(k or "").strip().upper()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def mirofish_evidence(b, paths=None, now=None):
+    """{key, facts, source, keys_tried}: MiroFish fresh/has_symbol/agrees/conflicts.
+
+    Direction "up" (YES on the favorite). The first key MiroFish has wins; else the
+    team key with has_symbol False. Never raises; facts are booleans.
+    """
+    keys = mirofish_keys(b)
+    out = None
+    for k in keys:
+        try:
+            f, src = _inf.mirofish_facts(k, "up", paths=paths, now=now)
+        except Exception as e:
+            f, src = {}, {"error": type(e).__name__}
+        cand = {"key": k, "facts": {n: bool(f.get(n, False)) for n in _MF_FACTS}, "source": src}
+        if out is None or cand["facts"]["mirofish_has_symbol"]:
+            out = cand
+        if cand["facts"]["mirofish_has_symbol"]:
+            break
+    if out is None:
+        out = {"key": None, "facts": {n: False for n in _MF_FACTS},
+               "source": {"used": False, "reason": "no_key"}}
+    out["keys_tried"] = keys
+    return out
+
+
 def build_sports_opp(b, get, attestation_path, bankroll=None, fv_fn=None, fmap=None,
-                     now=None, category="SPORTS"):
+                     now=None, category="SPORTS", mirofish_paths=None):
     """(opp, evidence) for one sized bet. Missing evidence is left absent, never faked."""
     ticker = b['fav_ticker']
     n = int(b.get('contracts') or 0)
@@ -171,6 +218,7 @@ def build_sports_opp(b, get, attestation_path, bankroll=None, fv_fn=None, fmap=N
         "market": {k: market.get(k) for k in _MARKET_KEYS if k in market} if market else None,
         "sports_attestation": att, "attestation_status": att_status,
         "order_price_cents": int(round(float(b['fav_price']) * 100)), "contracts": n,
+        "mirofish": mirofish_evidence(b, paths=mirofish_paths, now=now),
     }
     opp = {
         "platform": "kalshi", "type": category, "strategy": category, "category": category,
@@ -259,8 +307,17 @@ def _admit(b, r, build):
         _skip(r, 'SKIP_EVIDENCE', ["edge_fee_true_nonpositive"])
         return None, price_cents
     import nimble_wiring as _nw  # Nimble 2: last gate, entry removal only (shadow = log only)
+    mf = evidence.get("mirofish") or {}
+    gate_opp = dict(opp)  # MiroFish team/series as the underlying: facts only, not the order
+    if mf.get("key"):
+        gate_opp.update(underlying=mf["key"], direction="up")
     r['nimble'] = nv = _nw.gate(
-        opp, pre["informed"], source="sports_evidence", extra={"fee_true_edge": eft, "clock_ok": True})
+        gate_opp, pre["informed"], source="sports_evidence",
+        extra={"fee_true_edge": eft, "clock_ok": True},
+        label={"status": "admitted_by_code", "source": "sports_evidence",
+               "ticker": opp.get("ticker"), "underlying": mf.get("key")})
+    if isinstance(nv, dict) and mf.get("facts"):
+        nv = r['nimble'] = dict(nv, mirofish=dict(mf["facts"], key=mf.get("key")))
     if not nv["allow"]:
         _skip(r, 'SKIP_NIMBLE', [_nw.why(nv)])
         return None, price_cents

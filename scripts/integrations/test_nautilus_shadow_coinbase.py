@@ -199,8 +199,8 @@ def run():
             assert e.code == "live_denied"
         assert booked == []
 
-        # 9. Allocator Coinbase branch emits shadow, still does not POST, still FAILED
-        #    (place_market_order missing — live writer not cut over).
+        # 9. Allocator Coinbase branch emits shadow, still does not POST: allocator spot
+        #    execute is behind VALEDIA_ALLOCATOR_SPOT_EXECUTE (default OFF).
         qpath = _queue()
         orig_emit = sh.emit_allocator_shadow
 
@@ -216,8 +216,9 @@ def run():
             r = results[0]
             assert r.get("shadow_intent"), r
             assert r.get("shadow_dispatchable") is False, r
-            assert r["status"] == "FAILED", r
-            assert "place_market_order" in str(r.get("error", "")).lower() or "cannot import" in str(r.get("error", "")).lower() or "ImportError" in type(r.get("error", "")).__name__ or r["status"] == "FAILED"
+            assert os.environ.get("VALEDIA_ALLOCATOR_SPOT_EXECUTE") is None
+            assert r["status"] == "SKIP_ALLOCATOR_SPOT_DISABLED", r
+            assert "order_id" not in r, r
             with open(qpath) as f:
                 queued = [ln for ln in f if ln.strip()]
             assert queued, "allocator must enqueue a shadow Intent"

@@ -13,6 +13,10 @@ Sources (all offline; this module NEVER makes a network call):
   shape {SYM: {score, reasons, price}}) passed by the caller, plus the cached
   intel_sentiment prediction_log.json (per-ticker latest direction < 24h).
 - ERE: models/latest_etherion_risk.json, fresh < 24h by `timestamp` / `ts`.
+- FOMO radar (crypto only): fomo_radar_enrich.enrich over its existing data file
+  (data/crypto-paper/fomo_radar_fixture.json) when present. Exact symbol/pair
+  match only. Annotate only: never sizes money. A dated file older than 24h is
+  ignored; missing → every fomo_* fact False.
 - intel_layer is skipped: IntelLayer() fetches Fear/Greed over the network.
 
 Direction: "up" for buy/long, "down" for sell/short. A prediction side
@@ -24,6 +28,7 @@ import json
 import math
 import os
 
+import fomo_radar_enrich as fre
 import mirofish_intel_archive as mia
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +39,12 @@ MIROFISH_PATHS = (os.path.join(_ROOT, "models", "mirofish_signal.json"),
 ERE_PATHS = (os.path.join(_ROOT, "models", "latest_etherion_risk.json"),
              os.path.join(_HOME_MODELS, "latest_etherion_risk.json"))
 PREDICTION_LOG_PATHS = (os.path.join(_HOME_MODELS, "prediction_log.json"),)
+FOMO_PATHS = (fre.DEFAULT_FIXTURE,)
+# Wallet conviction = sum((score/100)^2) over trusted real-trade wallets
+# (fomo_radar_enrich.conviction). 1.5 ~ three trusted wallets at >= 71.
+FOMO_CONVICTION_HIGH = 1.5
+FOMO_FACTS = ("fomo_present", "fomo_wallet_conviction_high", "fomo_exit_signal",
+              "fomo_provenance_ok")
 
 MAX_AGE_S = mia.MAX_AGE_S  # ponytail: same 24h window as MiroFish
 # MiroFish macro rule: macro_bias under 40 is risk off, or more RISK_OFF than
@@ -225,15 +236,73 @@ def ere_facts(symbol, d, *, paths=None, now=None):
     return facts, {"used": False, "reason": "absent_or_stale"}
 
 
+def _fomo_tag(enr, symbol):
+    """Exact symbol/pair match only (a Kalshi ticker or Poly slug never matches by prefix)."""
+    keys = list(symbol_keys(symbol))
+    for k in list(keys):
+        if "/" in k:
+            keys.append(k.replace("/", "-"))
+    for k in keys:
+        for table in ((enr or {}).get("pairs") or {}, (enr or {}).get("symbols") or {}):
+            if k in table:
+                return k, table[k]
+    return None, None
+
+
+def fomo_facts(symbol, d, *, paths=None, asset_class=None, now=None):
+    """Offline FOMO radar tags for one crypto symbol. Direction-free facts.
+
+    present: the radar file has this symbol. conviction_high: provenance ok and
+    wallet_conviction >= FOMO_CONVICTION_HIGH. exit_signal: radar exit tag
+    (closed/trimmed by >= 2 sellers, provenance ok). provenance_ok: trusted
+    real wallets, not seeded. Non-crypto asset_class → not looked up.
+    """
+    facts = {k: False for k in FOMO_FACTS}
+    if asset_class is not None and str(asset_class).strip().lower() != "crypto":
+        return facts, {"used": False, "reason": "not_crypto"}
+    for p in paths or FOMO_PATHS:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        ts = doc.get("as_of") or doc.get("ts") or doc.get("timestamp") if isinstance(doc, dict) else None
+        src = {"used": True, "path": p, "dated": ts is not None, "annotate_only": True,
+               "note": doc.get("note") if isinstance(doc, dict) else None}
+        if ts is not None:
+            age = _age_s(ts, now)
+            src["age_s"] = age
+            if age is None or age >= MAX_AGE_S:
+                return facts, dict(src, used=False, reason="stale")
+        key, tag = _fomo_tag(fre.enrich(doc), symbol)
+        src["symbol_found"] = tag is not None
+        if tag is None:
+            return facts, src
+        ok = bool(tag.get("provenance_ok"))
+        conv = _num(tag.get("wallet_conviction"))
+        facts.update(fomo_present=True, fomo_provenance_ok=ok,
+                     fomo_wallet_conviction_high=ok and conv is not None and conv >= FOMO_CONVICTION_HIGH,
+                     fomo_exit_signal=tag.get("exit") == "exit")
+        src["tag"] = {"key": key, "wallet_conviction": conv, "burst": tag.get("burst"),
+                      "exit": tag.get("exit"), "seeded": tag.get("seeded"),
+                      "judgement_rank": tag.get("judgement_rank")}
+        return facts, src
+    return facts, {"used": False, "reason": "absent"}
+
+
 def informed_facts(symbol, side=None, *, direction=None, news=None, mirofish_paths=None,
-                   ere_paths=None, prediction_log_paths=None, now=None):
+                   ere_paths=None, prediction_log_paths=None, fomo_paths=None, asset_class=None,
+                   now=None):
     """{"facts": {booleans}, "sources": {provenance}}. Never raises, never fetches."""
     d = direction_of(side, direction)
     facts, sources = {}, {"direction": d, "intel_layer": "skipped_network"}
     for name, fn, kw in (
             ("mirofish", mirofish_facts, {"paths": mirofish_paths}),
             ("news", news_facts, {"news": news, "prediction_log_paths": prediction_log_paths}),
-            ("ere", ere_facts, {"paths": ere_paths})):
+            ("ere", ere_facts, {"paths": ere_paths}),
+            ("fomo", fomo_facts, {"paths": fomo_paths, "asset_class": asset_class})):
         try:
             f, s = fn(symbol, d, now=now, **kw)
         except Exception as e:  # a broken file must not break the caller
@@ -243,7 +312,7 @@ def informed_facts(symbol, side=None, *, direction=None, news=None, mirofish_pat
     for k in ("mirofish_fresh", "mirofish_has_symbol", "mirofish_agrees", "mirofish_conflicts",
               "mirofish_macro_risk_off", "news_present", "news_bullish", "news_bearish",
               "news_agrees", "news_conflicts", "ere_fresh", "ere_risk_off",
-              "ere_fade_side_conflict"):
+              "ere_fade_side_conflict") + FOMO_FACTS:
         facts[k] = bool(facts.get(k, False))
     facts["any_conflict"] = (facts["mirofish_conflicts"] or facts["news_conflicts"]
                              or facts["ere_fade_side_conflict"])
