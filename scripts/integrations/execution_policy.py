@@ -17,6 +17,8 @@ from market_state import MARKET_STATE, BookState
 import valedia_config as _cfg
 
 log = logging.getLogger("valedia.execution")
+RECONCILE_WINDOW_S = 3600   # keep a cancelled order tracked this long to catch a fill that raced the cancel
+MAX_CANCEL_ATTEMPTS = 5     # then stop retrying the cancel (still reconciled for fills)
 
 
 @dataclass
@@ -164,7 +166,7 @@ class MakerOrderManager:
             if order_id:
                 self._orders[order_id] = {"ticker": ticker, "side": side, "price": price_cents,
                                           "contracts": contracts, "strategy": strategy,
-                                          "placed_at": time.time(),
+                                          "placed_at": time.time(), "filled_recorded": 0,
                                           "max_age_s": max_age_s or self._max_age_seconds}
                 self._save()
                 log.info(f"  MAKER PLACED: {side} {contracts}x {ticker} @{price_cents}c (id={order_id[:12]})")
@@ -174,17 +176,23 @@ class MakerOrderManager:
             return None
 
     def _fills_by_order(self):
-        """order_id -> total filled count (best-effort from get_fills). {} on any error."""
+        """order_id -> cumulative filled count from get_fills. None when the read failed
+        (unknown is not zero: nothing is recorded or resized on an unknown fill state)."""
         try:
             raw = self._api().get_fills() or {}
-            out = {}
-            for f in raw.get("fills", []):
-                oid = f.get("order_id", "")
-                if oid:
-                    out[oid] = out.get(oid, 0.0) + float(f.get("count", 0) or 0)
-            return out
         except Exception:
-            return {}
+            return None
+        out = {}
+        for f in (raw.get("fills") or []) if isinstance(raw, dict) else []:
+            oid = f.get("order_id", "")
+            if not oid:
+                continue
+            c = f.get("count") if f.get("count") not in (None, "") else f.get("count_fp")
+            try:
+                out[oid] = out.get(oid, 0.0) + float(c or 0)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def _record_fill(self, info, filled):
         log.info(f"  MAKER FILLED: {info['side']} {filled:.0f}x {info['ticker']} @{info['price']}c")
@@ -195,31 +203,56 @@ class MakerOrderManager:
         except Exception:
             pass
 
+    def _sync_fill(self, oid, info, total):
+        """Record only the NEW filled contracts (venue count minus already recorded).
+        Fully filled → untrack. Returns True if state changed."""
+        done = float(info.get("filled_recorded", 0) or 0)
+        delta = float(total or 0) - done
+        if delta <= 0:
+            return False
+        self._record_fill(info, delta)
+        info["filled_recorded"] = done + delta
+        if info["filled_recorded"] >= float(info.get("contracts") or 0):
+            self._orders.pop(oid, None)
+        return True
+
+    def _cancel_tracked(self, oid, info, why):
+        """Cancel and KEEP tracking (cancelled_at) so a fill that raced the cancel is still
+        recorded next cycle. A failed cancel stays live and retries (never orphaned)."""
+        try:
+            self._cancel(oid, info.get("ticker"))
+        except Exception as e:
+            info["cancel_attempts"] = int(info.get("cancel_attempts", 0) or 0) + 1
+            log.debug(f"  cancel failed {oid}: {e}")
+            if info["cancel_attempts"] < MAX_CANCEL_ATTEMPTS:
+                return False
+            why = "cancel_failed"
+        info["cancelled_at"], info["cancel_reason"] = time.time(), why
+        log.info(f"  MAKER CANCEL ({why}): {info['ticker']} @{info['price']}c")
+        return True
+
     def check_and_manage(self):
-        """Record fills, cancel stale, reprice on book moves. Call each cron cycle (also picks up
-        orders placed in previous cycles, since state persists)."""
+        """Record ACTUAL fills, cancel stale, reprice on book moves. Call each cron cycle
+        (also picks up orders placed in previous cycles, since state persists)."""
         if not self._orders:
             return
         fills = self._fills_by_order()
-        changed = False
+        changed, now = False, time.time()
         for oid, info in list(self._orders.items()):
-            filled = fills.get(oid, 0)
-            if filled > 0:                                   # real fill -> record, stop tracking
-                self._record_fill(info, filled)
-                self._orders.pop(oid, None); changed = True
+            if fills is not None and self._sync_fill(oid, info, fills.get(oid, 0)):
+                changed = True
+            if oid not in self._orders:                      # fully filled
                 continue
-            if time.time() - info["placed_at"] > info["max_age_s"]:
-                try:
-                    self._cancel(oid, info.get("ticker"))
-                    log.info(f"  MAKER CANCEL (stale): {info['ticker']} @{info['price']}c")
-                except Exception as e:
-                    log.debug(f"  cancel failed {oid}: {e}")
-                self._orders.pop(oid, None); changed = True
+            if info.get("cancelled_at"):                     # reconcile late fills, then drop
+                if fills is not None and now - info["cancelled_at"] > RECONCILE_WINDOW_S:
+                    self._orders.pop(oid, None); changed = True
+                continue
+            if now - info["placed_at"] > info["max_age_s"]:
+                self._cancel_tracked(oid, info, "stale"); changed = True
                 continue
             book = MARKET_STATE.get_book_if_fresh(info["ticker"])
-            if book:
-                if self._check_reprice(oid, info, book):
-                    changed = True
+            if book and self._check_reprice(oid, info, book):
+                changed = True
         if changed:
             self._save()
 
@@ -233,22 +266,25 @@ class MakerOrderManager:
             self._replace_order(oid, info, best_bid + 1)          # book moved up -> improve
             return True
         elif cur > best_bid + 5:                                   # book moved down -> edge likely gone
-            try:
-                self._cancel(oid, info.get("ticker"))
-                log.info(f"  MAKER CANCEL (book moved): {info['ticker']} our={cur}c best_bid={best_bid}c")
-            except Exception:
-                pass
-            self._orders.pop(oid, None)
-            return True
+            return self._cancel_tracked(oid, info, "book_moved")
         return False
 
     def _replace_order(self, oid, info, new_price):
+        """Cancel, re-read fills (a cancelled order cannot fill further), then re-post ONLY
+        the unfilled remainder. Unknown fill state → no re-post (never more than approved)."""
         try:
-            self._cancel(oid, info.get("ticker"))
-            self._orders.pop(oid, None)
-            if self.place_maker_order(info["ticker"], info["side"], info["contracts"], new_price,
+            if not self._cancel_tracked(oid, info, "reprice") or info.get("cancel_reason") != "reprice":
+                return
+            fills = self._fills_by_order()
+            if fills is None:
+                return
+            self._sync_fill(oid, info, fills.get(oid, 0))
+            remaining = int(float(info.get("contracts") or 0) - float(info.get("filled_recorded", 0) or 0))
+            if remaining < 1:
+                return
+            if self.place_maker_order(info["ticker"], info["side"], remaining, new_price,
                                       strategy=info.get("strategy", ""), max_age_s=info["max_age_s"]):
-                log.info(f"  MAKER REPRICED: {info['ticker']} {info['price']}c -> {new_price}c")
+                log.info(f"  MAKER REPRICED: {info['ticker']} {info['price']}c -> {new_price}c x{remaining}")
         except Exception as e:
             log.debug(f"  maker replace failed: {e}")
 
@@ -256,16 +292,14 @@ class MakerOrderManager:
         for oid, info in list(self._orders.items()):
             if ticker and info["ticker"] != ticker:
                 continue
-            try:
-                self._cancel(oid, info.get("ticker"))
-            except Exception:
-                pass
-            self._orders.pop(oid, None)
+            if not info.get("cancelled_at"):
+                self._cancel_tracked(oid, info, "cancel_all")
         self._save()
 
     @property
     def active_orders(self):
-        return dict(self._orders)
+        """Resting (not cancelled) orders. Cancelled ones stay tracked only to reconcile fills."""
+        return {k: v for k, v in self._orders.items() if not v.get("cancelled_at")}
 
 
 if __name__ == "__main__":

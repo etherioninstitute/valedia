@@ -103,17 +103,30 @@ def ev_preflight(edge, P, C, M, half_spread=0.0, slip=0.0, role="taker"):
     }
 
 
+def _px(v):
+    """Dollars. Cent integers (>=1) are converted; junk is 0."""
+    try:
+        x = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return x / 100.0 if x >= 1 else max(0.0, x)
+
+
 def _book(opp):
+    """Traded-side bid/ask in dollars: top-level, then raw (allocator rows), then bid/ask."""
     side = str(opp.get("side") or "yes").lower()
-    price = float(opp.get("price") or 0)
-    if side in ("no", "sell"):
-        bid = float(opp.get("no_bid") or 0)
-        ask = float(opp.get("no_ask") or price)
-    else:
-        bid = float(opp.get("yes_bid") or 0)
-        ask = float(opp.get("yes_ask") or price)
-    if ask <= 0:
-        ask = price
+    price = _px(opp.get("price"))
+    raw = opp.get("raw") if isinstance(opp.get("raw"), dict) else {}
+    k = "no" if side in ("no", "sell") else "yes"
+
+    def first(*vals):
+        for v in vals:
+            x = _px(v)
+            if x > 0:
+                return x
+        return 0.0
+    bid = first(opp.get(k + "_bid"), raw.get(k + "_bid"), opp.get("bid"))
+    ask = first(opp.get(k + "_ask"), raw.get(k + "_ask"), opp.get("ask"), price)
     return bid, ask, side
 
 
@@ -141,11 +154,12 @@ def route(ticker, series=None, edge=0.0, bid=0.0, ask=0.0, C=1, slip=0.0,
     buy = str(action or "buy").lower() in ("buy", "yes")
     p_taker = kfm.p_exec(bid, ask, "buy" if buy else "sell", slip)
     try:
-        p_maker = max(0.01, min(0.99, float(bid if buy else ask)))
+        rest = float(bid if buy else ask)
     except (TypeError, ValueError):
-        p_maker = p_taker
-    if p_maker <= 0:
-        p_maker = p_taker
+        rest = 0.0
+    # Unknown resting side: price the maker leg at the executable P (conservative), never 0.01.
+    maker_price_known = rest > 0
+    p_maker = max(0.01, min(0.99, rest)) if maker_price_known else p_taker
     ev_m = ev_preflight(edge, p_maker, C, mm, 0.0, 0.0, "maker")
     ev_t = ev_preflight(edge, p_taker, C, tm, hs, slip, "taker")
     hurdle = taker_hurdle()
@@ -154,11 +168,12 @@ def route(ticker, series=None, edge=0.0, bid=0.0, ask=0.0, C=1, slip=0.0,
     if viable:
         prefer = "taker" if taker_clears else "maker"
     else:
-        prefer = "taker"
-        taker_clears = True
+        prefer = "taker"  # route label only; taker_clears now reports the real hurdle check
+        taker_clears = bool(ev_t["ok"] and ev_t["net"] >= hurdle)
     return {
         "prefer": prefer,
         "maker_viable": viable,
+        "maker_price_known": maker_price_known,
         "taker_clears": bool(taker_clears),
         "hurdle": hurdle,
         "maker_ev": ev_m,
@@ -315,7 +330,8 @@ def annotate(opp, contracts=1, slip=0.0, fmap=None, path=None):
     raw = opp.get("raw") if isinstance(opp.get("raw"), dict) else {}
     series = series or raw.get("series")
     bid, ask, side = _book(opp)
-    action = "sell" if side in ("no", "sell") else "buy"
+    # _book returns the traded side's own bid/ask, so buying NO is a buy on the NO book.
+    action = "sell" if side == "sell" else "buy"
     edge = _edge(opp)
     info = opp.get("fee_map") or kfm.consult(ticker, series=series, fmap=fmap)
     opp["fee_map"] = info

@@ -553,39 +553,19 @@ def execute_allocations(allocations, dry_run=False):
                     continue
                 price_cents = max(1, min(99, int(a["price"] * 100)))
                 n = max(1, int(a["allocation"] / a["price"]))
-                # Maker-vs-taker routing (we already vetted the trade, so ignore the plan's
-                # no_trade/fee veto — our EV is already fee-net; only take the maker/taker call).
-                action = "taker"
-                if build_execution_plan is not None:
-                    try:
-                        _raw = a.get("raw") or {}
-                        yb = int(_raw.get("yes_bid", 0) or 0); nb = int(_raw.get("no_bid", 0) or 0)
-                        book = MARKET_STATE.update_book(a["ticker"], {"orderbook": {
-                            "yes": [{"price": yb, "size": 1}], "no": [{"price": nb, "size": 1}]}}) if (yb > 0 and nb > 0) else None
-                        ep = build_execution_plan(a["ticker"], a["side"],
-                                                  a["expected_profit"] / (a["allocation"] + 0.01) * 100,
-                                                  price_cents, n, a.get("hours_to_resolve", 9999), book=book)
-                        if ep.action == "maker":
-                            action, price_cents = "maker", ep.price_cents
-                    except Exception:
-                        pass
+                # Maker-first routing (HOW, never WHETHER): maker_routing.py documents the rule.
                 try:
-                    import kalshi_profit as _kp
-                    proceed, a = _kp.annotate(a, contracts=n)
-                    r["ev_preflight"] = a.get("ev_preflight")
-                    r["maker_first"] = a.get("maker_first")
-                    if not proceed:
-                        r["status"] = "SKIP_EV_PREFLIGHT"
+                    import maker_routing as _mr
+                    go, a, rd = _mr.route_allocation(a, n, price_cents, _maker_mgr, _cfg,
+                                                     build_execution_plan)
+                    r.update(rd["row"])
+                    if not go:
+                        r["status"] = rd["status"]
+                        if rd.get("error"):
+                            r["error"] = rd["error"]
                         results.append(r)
                         continue
-                    mf = a.get("maker_first") or {}
-                    if _kp.maker_first_on() and mf.get("prefer") == "maker":
-                        if _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
-                            action = "maker"
-                        elif _kp.should_skip_taker(mf):
-                            r["status"] = "SKIP_MAKER_FIRST"
-                            results.append(r)
-                            continue
+                    action, price_cents = rd["action"], rd["price_cents"]
                 except Exception as e:
                     r["status"] = "SKIP_EV_PREFLIGHT"
                     r["error"] = f"ev preflight failed closed: {str(e)[:60]}"
