@@ -1,7 +1,7 @@
 """Kalshi Opportunity Alert — Cron Wrapper (7am brief)
 Scans Kalshi, prints the full opportunity report to the cron log, and — only if
 there is a positive modeled upside — sends Burton a short VERIFIED Signal brief:
-  Invested          = Kalshi open-position cost (broker, re-read to verify)
+  Open-position cost (Kalshi, broker) — re-read to verify
   Modeled if-all-win = sum of contracts x fee-net edge for the top unfenced picks
                        that fit cash. A best case if every pick wins — NOT profit,
                        NOT expected value, NOT fills.
@@ -9,6 +9,7 @@ Replaces kalshi_executor.send_opportunity_alert() for the cron path (that
 legacy path labelled the all-win sum "Estimated profit" and sent unverified).
 """
 import sys, os
+from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 STRATS = ["ARBITRAGE", "EXPIRY_SCALP", "NO_HARVEST", "SPORTS_FAVORITE", "MACRO_EDGE"]
@@ -78,18 +79,19 @@ def _brief(sv, kind, ke, get_positions, send_fn, now, state, opps):
     except Exception as e:
         return sv.withhold(kind, "source read failed", e, send_fn, now)
     picks = modeled_picks(ke, state, opps)
-    upside = sum(p["upside"] for p in picks)
+    upside = sv.dsum(p["upside"] for p in picks)  # exact decimal sum, one rounding
     if upside <= 0.005:
         print("[kalshi_alert] no positive modeled upside — nothing sent")
         return {"status": "not_hot", "sent": False, "text": ""}
     body = (f"Valedia 7am brief — Kalshi\n"
-            f"Invested: {sv.money(snap['invested'])} (Kalshi open-position cost, broker)\n"
+            f"Open-position cost (Kalshi, broker): {sv.money(snap['invested'])}\n"
             f"Modeled if-all-win: {sv.money(upside, signed=True)} ({len(picks)} picks that fit cash, fee-incl. sim)"
             f" — not profit, not EV, not fills")
     fit = _fit(state)
-    claims = [sv.claim("Invested", snap["invested"], snap2["invested"], "broker re-read"),
+    claims = [sv.claim("Open-position cost", snap["invested"], snap2["invested"], "broker re-read"),
               sv.claim("Modeled if-all-win", upside,
-                       sum(p["contracts"] * p["edge"] for p in picks), "contracts x edge", tol=0.01),
+                       sv.dsum(float(Decimal(str(p["contracts"])) * Decimal(str(p["edge"])))
+                               for p in picks), "contracts x edge", tol=0.01),
               sv.claim("picks fit cash", 0.0, max(0.0, sum(p["cost"] for p in picks) - fit),
                        "cash limit"),
               sv.claim("picks", len(picks), len(picks), "model", tol=0)]

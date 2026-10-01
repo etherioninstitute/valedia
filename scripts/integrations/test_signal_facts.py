@@ -26,6 +26,7 @@ import kalshi_auth
 import pnl_run
 
 NOW = datetime(2026, 10, 1, 23, 0, tzinfo=timezone.utc)
+AT_ = "Realized P&L (all-time, ledger, all venues, fee-incl.): "
 POS = {"market_positions": [{"ticker": "T", "position": 3, "market_exposure": 300}]}
 
 
@@ -52,7 +53,7 @@ def lines(**kw):
 def test_facts_attack_cases():
     ok = lines()
     assert ok == ["Cash (Kalshi, broker): $100.00", "Open-position cost (Kalshi, broker): $3.00",
-                  "Open positions (Kalshi, broker): 1", "Realized P&L (ledger, all venues, fee-incl.): −$12.34 (0W/1L)"], ok
+                  "Open positions (Kalshi, broker): 1", "Realized P&L (all-time, ledger, all venues, fee-incl.): −$12.34 (0W/1L)"], ok
     for name, kw in [("missing", {"get": lambda e: {}}), ("None", {"get": lambda e: {"balance": None}}),
                      ("renamed", {"get": lambda e: {"balance_dollars": "1234.56"}}),
                      ("garbage", {"get": lambda e: {"balance": "n/a"}}),
@@ -95,9 +96,9 @@ def test_facts_attack_cases():
             ("nan pnl", {"ledger": L(pnl=float("nan"))}, "unavailable (unparseable rows)"),
             ("string pnl", {"ledger": L(pnl="abc")}, "unavailable (unparseable rows)")]:
         got = lines(**kw)
-        assert got[3] == f"Realized P&L (ledger, all venues, fee-incl.): omitted — {why}", (name, got)
-    assert lines(ledger=L(pnl=-0.004))[3] == "Realized P&L (ledger, all venues, fee-incl.): $0.00 (0W/1L)"
-    assert lines(ledger=L(pnl=0.004))[3] == "Realized P&L (ledger, all venues, fee-incl.): $0.00 (1W/0L)"
+        assert got[3] == f"Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — {why}", (name, got)
+    assert lines(ledger=L(pnl=-0.004))[3] == "Realized P&L (all-time, ledger, all venues, fee-incl.): $0.00 (0W/1L)"
+    assert lines(ledger=L(pnl=0.004))[3] == "Realized P&L (all-time, ledger, all venues, fee-incl.): $0.00 (1W/0L)"
     assert lines(get=lambda e: {"balance": -500})[0] == "Cash (Kalshi, broker): −$5.00"
 
 
@@ -127,18 +128,19 @@ def test_pnl_ping_loss_and_settlement_time():
                            send_fn=lambda m: sent.append(m) or True, now=NOW)
     t = sent[0]
     assert r["status"] == "verified", r
-    assert "Invested: $40.00 (Kalshi open-position cost, broker)" in t, t
-    assert "Profit (all-time realized, ledger): −$10.34 (net loss) fee-incl., all venues · 1W/1L · settled last 24h −$12.34" in t, t
+    assert "Open-position cost (Kalshi, broker): $40.00" in t, t
+    assert "Realized P&L (all-time, ledger, all venues, fee-incl.): −$10.34 (net loss) · 1W/1L\nSettled last 24h (ledger): −$12.34" in t, t
     rest._fresh_dir()
     sent.clear()
     pnl_run.pnl_report(get_positions=pos, ledger=L(1, pnl=-0.004), send_fn=lambda m: sent.append(m) or True,
                        now=NOW)
-    assert "Profit (all-time realized, ledger): $0.00 fee-incl." in sent[0] and "-$0.00" not in sent[0] and "net loss" not in sent[0]
+    assert "Realized P&L (all-time, ledger, all venues, fee-incl.): $0.00 · 0W/1L" in sent[0] and "-$0.00" not in sent[0] and "net loss" not in sent[0]
     rest._fresh_dir()
     sent.clear()
     r = pnl_run.pnl_report(get_positions=pos, ledger=L(1, pnl=float("nan")),
                            send_fn=lambda m: sent.append(m) or True, now=NOW)
-    assert r["status"] == "withheld" and "ledger P&L rows unparseable" in sent[0], sent
+    assert r["status"] == "verified" and f"{AT_}omitted — 1 ledger row(s) unparseable" in sent[0], sent
+    assert "nan" not in sent[0].lower() and "$0.00" not in sent[0].split("Open-position")[0]
     rest._fresh_dir()
     sent.clear()
     fut = L(1, extra=[{"type": "entry", "id": "f", "source": "live",

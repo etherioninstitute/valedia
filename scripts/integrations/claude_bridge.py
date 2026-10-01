@@ -91,7 +91,8 @@ def verified_facts(get=None, get_positions=None, ledger=None, now=None):
         open_pos = f["positions"]["n"][0] if f["positions"] else 1  # unknown -> assume open
         limit = sv.LEDGER_STALE_OPEN_S if open_pos else sv.LEDGER_STALE_ANY_S
         if r1["bad"] or r2["bad"]:
-            f["why"]["ledger"] = "unavailable (unparseable rows)"
+            f["why"]["ledger"] = ("unavailable (conflicting duplicate settlements)" if r1["conflict"]
+                                  else "unavailable (unparseable rows)")
         elif abs(r1["total"] - r2["total"]) > sv.CENT or r1["rows"] != r2["rows"] \
                 or r1["wins"] != r2["wins"]:
             f["why"]["ledger"] = "re-read disagreed"
@@ -133,12 +134,12 @@ def facts_block(f):
     if f.get("ledger"):
         l = f["ledger"]
         t = l["total"][0]
-        lines.append(f"Realized P&L (ledger, all venues, fee-incl.): {sv.money(t, signed=True)} "
+        lines.append(f"Realized P&L (all-time, ledger, all venues, fee-incl.): {sv.money(t, signed=True)} "
                      f"({l['wins'][0]}W/{l['losses'][0]}L)")
         claims += [sv.claim("Realized P&L", t, l["total"][1], "ledger re-read"),
                    sv.claim("wins", l["wins"][0], l["wins"][1], "ledger re-read", tol=0)]
     else:
-        lines.append(f"Realized P&L (ledger, all venues, fee-incl.): omitted — "
+        lines.append(f"Realized P&L (all-time, ledger, all venues, fee-incl.): omitted — "
                      f"{why.get('ledger', 'unavailable')}")
     mm = f.get("open_mismatch")
     if mm and mm[0] != mm[1]:
