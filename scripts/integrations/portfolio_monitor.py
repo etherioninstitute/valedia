@@ -1,6 +1,6 @@
 """Portfolio Monitor — Checks ALL platforms and reports via Signal.
 Runs on cron. Reports balance, positions, and opportunities across
-every connected platform: Mercury, Alpaca, Kraken, Coinbase,
+every connected platform: Mercury, Alpaca, Kraken, OKX, Coinbase,
 Kalshi, Polymarket.
 """
 import os, sys, json, urllib.request
@@ -64,12 +64,20 @@ def check_kraken():
     except Exception as e:
         return f"Kraken: [API ERROR] {e}"
 
+def check_okx():
+    try:
+        from okx_client import OKXClient
+        return OKXClient().portfolio_summary()
+    except Exception as e:
+        return f"OKX: [API ERROR] {e}"
+
 def main():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"PORTFOLIO STATUS ({now})", ""]
     lines.append(check_mercury())
     lines.append(check_alpaca())
     lines.append(check_kraken())
+    lines.append(check_okx())
     lines.append("")
     lines.append("All platforms checked. Will report again at next scheduled scan.")
     return "\n".join(lines)

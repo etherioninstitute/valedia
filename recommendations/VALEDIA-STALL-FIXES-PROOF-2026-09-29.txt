@@ -1,0 +1,76 @@
+=== VALEDIA STALL FIXES 2026-09-29 13:22:49  ===
+
+## 1. DEFAULT_IDLE_TIMEOUT_SEC 240→900
+patched /Users/burtonchatelain/MemPalace/sources/repos/github/paperclip/packages/adapters/hermes/src/gateway/shared/constants.ts
+export const DEFAULT_IDLE_TIMEOUT_SEC = 900;
+patched UI /Users/burtonchatelain/MemPalace/sources/repos/github/paperclip/ui/src/adapters/hermes-gateway/config-fields.tsx
+patched doc /Users/burtonchatelain/MemPalace/sources/repos/github/paperclip/server/src/adapters/hermes-gateway-doc.ts
+
+## 2. Board reconcile (cosmetic in_progress → todo)
+PATCH VAL-1 → todo : HTTP 200 status=todo checkout=None exec=None
+PATCH VAL-8 → todo : HTTP 200 status=todo checkout=None exec=None
+PATCH VAL-11 → todo : HTTP 200 status=todo checkout=None exec=None
+
+## 3. Tip advancement (VAL-6/9/10/7 ACCEL order)
+PATCH VAL-9 tip-advance : HTTP 200 status=todo priority=high
+PATCH VAL-6 tip-advance : HTTP 200 status=todo priority=high
+PATCH VAL-10 tip-advance : HTTP 200 status=todo priority=high
+PATCH VAL-7 tip-advance : HTTP 200 status=todo priority=high
+
+## 4. Admission/heartbeat eligibility + Decider session hygiene
+PATCH agent Decider: HTTP 200 idle=900 sess=issue hb=True/1 tip_marker=True
+ clear-error Decider: HTTP 409 HTTP Error 409: Conflict
+PATCH agent Scout: HTTP 200 idle=900 sess=issue hb=True/1 tip_marker=True
+ clear-error Scout: HTTP 409 HTTP Error 409: Conflict
+PATCH agent Auditor: HTTP 200 idle=900 sess=issue hb=True/1 tip_marker=True
+ clear-error Auditor: HTTP 409 HTTP Error 409: Conflict
+PATCH agent CTO: HTTP 200 idle=900 sess=issue hb=True/1 tip_marker=True
+ clear-error CTO: HTTP 409 HTTP Error 409: Conflict
+VAL-1 session bump: HTTP 200 gen=0 status=todo
+decider sessions cols: ['id', 'source', 'user_id', 'session_key', 'chat_id', 'chat_type', 'thread_id', 'display_name', 'origin_json', 'expiry_finalized', 'model', 'model_config', 'system_prompt', 'system_prompt_hash', 'parent_session_id', 'started_at', 'ended_at', 'end_reason', 'message_count', 'tool_call_count', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens', 'cwd', 'git_branch', 'git_repo_root', 'git_metadata_generation', 'billing_provider', 'billing_base_url', 'billing_mode', 'estimated_cost_usd', 'actual_cost_usd', 'cost_status', 'cost_source', 'pricing_version', 'title', 'title_source', 'last_activity_at', 'last_activity_description', 'last_activity_provenance', 'api_call_count', 'handoff_state', 'handoff_platform', 'handoff_error', 'compression_failure_cooldown_until', 'compression_failure_error', 'compression_fallback_streak', 'compression_ineffective_count', 'compression_recovery_deadline', 'profile_name', 'rewind_count', 'archived', 'pinned', 'hidden', 'last_read_at', 'tool_names']
+decider sessions sample ids: ['paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:issue:58b1a2ee-2a18-4d98-afb3-451ce0270de8', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:issue:a404190c-6435-4134-9c1f-130c56113c22', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:issue:c6778eec-b1fa-4f6a-9c2a-aec2f8620ee7', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:issue:f1b0a109-0fce-49ae-a8bb-2511538e536c', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:run:115094e1-3938-4b4f-abdc-92073178fe38', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:run:3968fc58-c94d-4e85-bc3f-192975dd2c37', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:run:61d1f885-9cc1-47e5-8239-29c7ac35270c', 'paperclip:company:4fb233c2-27e9-4d0d-a217-2dc7205210a0:agent:16234474-029c-4852-abde-696dc25884e5:run:6393c5bb-08ce-4437-a32c-caaa368cda15']
+
+## 5. RuFlo PATH for CTO Hermes profile
+symlinked /Users/burtonchatelain/bin/ruflo -> /Users/burtonchatelain/.npm-global/bin/ruflo
+ruflo --version rc=0 out=ruflo v3.41.2
+
+ruflo_mcp_init: HTTP 200 body={"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"logging":{"level":"info"},"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true},"prompts":{"listChanged":true},"s
+
+## 6. GET proof
+BOARD:
+  VAL-1  todo         checkout=None exec=None active=None
+  VAL-10 todo         checkout=None exec=None active=None
+  VAL-11 todo         checkout=None exec=None active=None
+  VAL-12 todo         checkout=None exec=None active=None
+  VAL-13 done         checkout=None exec=None active=None
+  VAL-14 done         checkout=None exec=None active=None
+  VAL-3  todo         checkout=None exec=None active=None
+  VAL-4  backlog      checkout=None exec=None active=None
+  VAL-5  in_review    checkout=None exec=None active=None
+  VAL-6  todo         checkout=None exec=None active=None
+  VAL-7  todo         checkout=None exec=None active=None
+  VAL-8  todo         checkout=None exec=None active=None
+  VAL-9  todo         checkout=None exec=None active=None
+AGENTS:
+  Decider  status=idle     idle=900 timeout=3600 sess=issue hb_en=True maxR=1 tip_marker=True
+  Auditor  status=idle     idle=900 timeout=3600 sess=issue hb_en=True maxR=1 tip_marker=True
+  CTO      status=running  idle=900 timeout=3600 sess=issue hb_en=True maxR=1 tip_marker=True
+  Scout    status=idle     idle=900 timeout=3600 sess=issue hb_en=True maxR=1 tip_marker=True
+DASH tasks={'open': 11, 'inProgress': 0, 'blocked': 0, 'done': 2} agents={'active': 3, 'running': 1, 'paused': 0, 'error': 0}
+CONST: export const DEFAULT_IDLE_TIMEOUT_SEC = 900;
+
+PROOF_FILE=/tmp/valedia-stall-fixes-proof-20260929.txt
+DONE 2026-09-29 13:23:02 
+
+## 4b. Decider Hermes session archive 2026-09-29 13:23:15 
+backup /Users/burtonchatelain/.hermes/profiles/valedia-trading-decider/state.db.bak-stallfix-20260929-132315
+before f1b0a109 msgs=13 in_tok=47674 archived=0 ended=None err=None
+before a404190c msgs=2 in_tok=12587 archived=0 ended=None err=None
+before c6778eec msgs=17 in_tok=104055 archived=0 ended=None err=None
+before 58b1a2ee msgs=14 in_tok=111204 archived=0 ended=None err=None
+after  f1b0a109 archived=1 ended=2026-09-29T20:23:15.421748Z reason=valedia-stall-fixes-session-hygiene
+after  a404190c archived=1 ended=2026-09-29T20:23:15.422984Z reason=valedia-stall-fixes-session-hygiene
+after  c6778eec archived=1 ended=2026-09-29T20:23:15.423246Z reason=valedia-stall-fixes-session-hygiene
+after  58b1a2ee archived=1 ended=2026-09-29T20:23:15.423830Z reason=valedia-stall-fixes-session-hygiene
+VAL-1 conversationSessionGeneration now=0 status=todo
+Note: sessionKeyStrategy=issue + archived Hermes issue sessions = fresh wake context without keepalive daemons.

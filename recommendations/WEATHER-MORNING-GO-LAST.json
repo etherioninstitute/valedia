@@ -1,0 +1,68 @@
+{
+  "WEATHER_LIVE_decider": "valedia",
+  "WEATHER_LIVE_env": "1",
+  "WEATHER_LIVE_flipped_by_build": false,
+  "admitted": 0,
+  "admit_reason_counts": {},
+  "charter": "WEATHER-FIRST-LIVE-ADMIT-1",
+  "creates": 0,
+  "diagnosis": [
+    "0 fee-true official alerts inside (0.05, 0.90). nws_informed empty. admit() not called.",
+    "79 fee_true_ev rows are YES px 0.01 with no bid (SKIP_LOTTERY, one-sided). Top: KXHIGHMIA-26SEP25-T92 fv=0.369441 ev=286.9931.",
+    "9 in-band two-sided books have YES fv below the mid. Nearest: KXLOWTSEA-26SEP25-B53.5 fv=0.130559 mid=0.135 bid=0.11 ask=0.16 fee_true_ev=null count=0.",
+    "20 official books priced >= 0.90 have no fee_true_ev. Late gate unchanged.",
+    "144 books wrong_date. Evening CLI report date is 2026-09-25 on all 16 stations (not preliminary).",
+    "19:36 BOS B65.5 px 0.07 refuse stands on the ledger; rescan mid is 0.145 and fee_true_ev is null."
+  ],
+  "diagnosis_path": "/Users/burtonchatelain/.openclaw/workspace-v2/recommendations/WEATHER-MORNING-DIAGNOSIS.md",
+  "dry": false,
+  "fee_true_ev_buckets": {
+    "lottery<=0.05": 79
+  },
+  "first_live": {
+    "result": "no_trade",
+    "kalshi_post": false,
+    "creates": 0,
+    "ledger_appended": false,
+    "why": "no CLI-final INFORMED alert inside lottery/late gates"
+  },
+  "flip_allowed": true,
+  "grok_bot_routine": "paused",
+  "kalshi_post": false,
+  "n_alert": 0,
+  "n_fee_true_ev": 79,
+  "n_markets": 360,
+  "n_official_price": 137,
+  "n_price": 360,
+  "n_price_null": 0,
+  "n_series": 38,
+  "official_today_price_buckets": {
+    "in_band": 9,
+    "late>=0.90": 20,
+    "lottery<=0.05": 108
+  },
+  "owner": "grok-build",
+  "preflight": "PASS",
+  "settle_policy": "nws_free_only",
+  "skipped_non_nws": 0,
+  "stub_regression": {
+    "ticker": "KXHIGHDEN-26SEP25-T72",
+    "post": "stub",
+    "kalshi_post": false,
+    "before_reasons": ["fv_source", "fv_confidence", "edge_missing", "depth", "size"],
+    "after_reasons": [],
+    "create_order": true,
+    "count": 1,
+    "second_call": "max_creates",
+    "test": "test_weather_informed_admit.py PASS"
+  },
+  "tags": {
+    "near_neutral": 7,
+    "official": 137,
+    "station_unconfigured": 72,
+    "wrong_date": 144
+  },
+  "trading_halted": false,
+  "ts": "2026-09-26T03:13:53+00:00",
+  "weather_live_enabled": true
+}

@@ -11,6 +11,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import valedia_cockpit as cockpit
 import valedia_config as vc
 import valedia_controls as vctl
@@ -41,9 +44,20 @@ REQUIRED = (
     "LIVE_EXEC_FENCED",
     "LIVE_EXEC_FENCED_SERIES",
     "WEATHER_LIVE",
+    "WEATHER_SHADOW",
+    "OIL_SHADOW",
     "SCALPER_LIVE",
     "NAUTILUS_LIVE",
     "CRYPTO_PAPER_MODE",
+    "ETORO_MODE",
+    "ETORO_LIVE",
+    "ETORO_KEYS",
+    "VIBE_SHADOW_MODE",
+    "VIBE_SHADOW_LIVE",
+    "VIBE_BROKER_WRITE",
+    "MIROFISH_INTEL_AS_OF",
+    "MIROFISH_INTEL_STALE",
+    "MIROFISH_INTEL_USABLE_FOR_FV",
     "VALEDIA_VERSION",
     "GIT_SHA",
 )
@@ -61,6 +75,8 @@ OFF_BOOL = (
     "POLYMARKET_US_LIVE",
     "WEATHER_LIVE",
     "SCALPER_LIVE",
+    "VIBE_SHADOW_LIVE",
+    "VIBE_BROKER_WRITE",
     "NAUTILUS_LIVE",
     "NAUTILUS_ENABLED",
     "SPOT_RECONCILE_HTTP",
@@ -72,7 +88,11 @@ OFF_BOOL = (
 ENV_FLAGS = (
     "VALEDIA_JEV",
     "KALSHI_FEE_MAP_GATE",
+    "KALSHI_EV_PREFLIGHT_GATE",
+    "KALSHI_MAKER_FIRST",
+    "KALSHI_FILL_LEDGER_DEMOTE",
     "POLYMARKET_US_LIVE",
+    "POLYMARKET_US_HTTP",
     "VALEDIA_SELF_ADJUST",
 )
 
@@ -100,8 +120,8 @@ def _restore(name, prev):
 def test_defaults_and_shape():
     snap = vc.controls_snapshot()
     assert set(snap) >= {"version", "sha", "branch", "dirty", "items"}
-    assert snap["version"] == "0.57.0"
-    assert vc.VALEDIA_VERSION == "0.57.0"
+    assert snap["version"] == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.74.1"
     assert vc.VALEDIA_JEV is False
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.jev_enabled() is False
@@ -122,7 +142,16 @@ def test_defaults_and_shape():
     assert "OIL_BRACKET" in got["LIVE_EXEC_FENCED"]["value"]
     assert "KXWTI" in got["LIVE_EXEC_FENCED_SERIES"]["value"]
     assert got["CRYPTO_PAPER_MODE"]["value"] == "PAPER/SHADOW"
-    assert got["VALEDIA_VERSION"]["value"] == "0.57.0"
+    assert got["ETORO_MODE"]["value"] == "PAPER/SHADOW"
+    assert got["ETORO_MODE"]["source"] == "const"
+    assert got["ETORO_LIVE"]["value"] is False
+    assert got["VIBE_SHADOW_MODE"]["value"] == "PAPER/SHADOW"
+    assert got["VIBE_SHADOW_MODE"]["source"] == "const"
+    assert got["VIBE_SHADOW_LIVE"]["value"] is False
+    assert got["VIBE_BROKER_WRITE"]["value"] is False
+    assert got["ETORO_KEYS"]["value"] in ("present", "missing")
+    assert len(str(got["ETORO_KEYS"]["value"])) < 16
+    assert got["VALEDIA_VERSION"]["value"] == "0.74.1"
     assert got["POLY_LOOP_EDGE_PTS"]["value"] == 8.0
     assert got["POLY_LOOP_MAX_OPEN"]["value"] == 5
     assert got["POLY_LOOP_DD_STOP"]["value"] == 0.40
@@ -131,6 +160,10 @@ def test_defaults_and_shape():
     assert got["INFORMED_BEFORE_CREATE"]["source"] == "const"
     assert got["POLY_TAG_PRIOR_CREATE"]["value"] is False
     assert got["POLY_TAG_PRIOR_CREATE"]["source"] == "const"
+    assert got["KALSHI_FEE_MAP_REFRESH"]["source"] == "file"
+    assert got["KALSHI_FEE_MAP_REFRESH"]["value"] is True
+    assert got["POLYMARKET_US_HTTP"]["source"] == "const"
+    assert got["POLYMARKET_US_HTTP"]["value"] is False
 
 
 def test_env_source_does_not_stick():
@@ -184,7 +217,7 @@ def test_halt_file_source():
 def test_panel_and_html():
     p = cockpit.panel()
     assert "controls" in p
-    assert p["controls"]["version"] == "0.57.0"
+    assert p["controls"]["version"] == "0.74.1"
     names = {r["name"] for r in p["controls"]["items"]}
     for n in REQUIRED:
         assert n in names, n

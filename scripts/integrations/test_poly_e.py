@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import forward_test_ledger as ftl
 import intel_opportunity_gatherer as iog
 import nautilus_shadow_venues as sv
@@ -83,7 +86,7 @@ def test_hygiene_and_fence():
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.MIROFISH_AUTO_RAISE is False
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "polymarket_entertainment" not in cron
     cut = open(os.path.join(ROOT, "recommendations",

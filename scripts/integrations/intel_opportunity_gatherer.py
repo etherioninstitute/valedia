@@ -466,8 +466,12 @@ def gather(models_dir=_MODELS, listed=None):
     listed = listed if listed is not None else LISTED_CRYPTO
     md = models_dir
     opps = []
-    opps.extend(collect_mirofish(_load(os.path.join(md, "mirofish_signal.json")),
-                                 listed, accuracy=_mf_accuracy(md)))
+    try:
+        import mirofish_intel_archive as _mia
+        mf_doc = _mia.load_for_fv(os.path.join(md, "mirofish_signal.json"))
+    except Exception:
+        mf_doc = None
+    opps.extend(collect_mirofish(mf_doc or {}, listed, accuracy=_mf_accuracy(md)))
     opps.extend(collect_fusion(_load(os.path.join(md, "latest_fusion.json")), listed))
     opps.extend(collect_hot_list(_load(os.path.join(md, "hot_list.json")), listed))
     opps.extend(collect_hedge(_load(os.path.join(md, "hedge_fund_intel.json"))))

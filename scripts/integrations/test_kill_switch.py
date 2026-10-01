@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import alpaca_executor as alp
 import coinbase_trader as cb
 import execution_policy as ep
@@ -64,7 +67,7 @@ def test_hygiene_and_default_off():
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.trading_halted() is False
     assert vc.require_not_halted("probe") is False
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert vc.MIROFISH_AUTO_RAISE is False

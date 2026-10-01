@@ -13,6 +13,9 @@ from datetime import timedelta
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import nautilus_shadow_parity as sp
 import parity_run
 import test_slice12 as s12

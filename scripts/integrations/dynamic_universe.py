@@ -40,7 +40,9 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ENV_FILE    = os.path.expanduser("~/.openclaw/.env")
-MODELS_DIR  = os.path.expanduser("~/.openclaw/workspace/models")
+# workspace-v2 models. The old ~/.openclaw/workspace/models path is not this tree.
+_ROOT       = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+MODELS_DIR  = os.path.join(_ROOT, "models")
 HOT_LIST    = os.path.join(MODELS_DIR, "hot_list.json")
 WATCH_LOG   = os.path.join(MODELS_DIR, "discovery_log.json")
 

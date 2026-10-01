@@ -10,6 +10,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import fomo_radar_enrich as fr
 import valedia_config as vc
 
@@ -28,7 +31,7 @@ def _banned(src):
 def test_hygiene_and_fence():
     src = open(os.path.join(HERE, "fomo_radar_enrich.py")).read()
     _banned(src)
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.VALEDIA_TREASURY_AUTO is False

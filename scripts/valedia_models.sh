@@ -17,7 +17,7 @@ Usage:
   valedia_models.sh preset chat|reason|turbo   # Hermes only in v1
   valedia_models.sh mirofish-sync <tag> [--write]
   valedia_models.sh mirofish-report <tag> [--write]
-  valedia_models.sh mirofish-inference bionic|ollama [--write]
+  valedia_models.sh mirofish-inference bionic|ollama|split [--write]
 U
   exit 2
 }
@@ -132,8 +132,8 @@ PY
 cmd_preset() {
   local name="${1:-}"
   case "$name" in
-    chat)   cmd_hermes "qwen3.8-27b-obliterated-k" ;;
-    reason) cmd_hermes "ornith-1.5-k-m" ;;
+    chat)   cmd_hermes "qwen/qwen3.8-27b" ;;
+    reason) cmd_hermes "ornith-1.5-35b-a3b-mlx" ;;
     turbo)
       local turbo
       turbo=$(lms_list | grep -i 'turbo' | head -1 || true)
@@ -191,8 +191,8 @@ PY
 cmd_mf_inference() {
   local mode="${1:-}" write="${2:-}"
   case "$mode" in
-    bionic|ollama) ;;
-    *) echo "usage: $SELF mirofish-inference bionic|ollama [--write]"; exit 2 ;;
+    bionic|ollama|split) ;;
+    *) echo "usage: $SELF mirofish-inference bionic|ollama|split [--write]"; exit 2 ;;
   esac
   local pairs
   if [[ "$mode" == "bionic" ]]; then
@@ -200,13 +200,28 @@ cmd_mf_inference() {
       "MIROFISH_INFERENCE=bionic"
       "LLM_API_KEY=lm-studio"
       "LLM_BASE_URL=http://127.0.0.1:1234/v1"
-      "LLM_MODEL_NAME=qwen3.8-27b-obliterated-k"
-      "MIROFISH_REPORT_MODEL=ornith-1.5-k-m"
+      "LLM_MODEL_NAME=qwen/qwen3.8-27b"
+      "MIROFISH_REPORT_MODEL=ornith-1.5-35b-a3b-mlx"
+      "LLM_REPORT_BASE_URL=http://127.0.0.1:1234/v1"
       "EMBEDDING_API=openai"
       "EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5"
       "EMBEDDING_BASE_URL=http://127.0.0.1:1234"
       "OPENAI_API_KEY=lm-studio"
       "OPENAI_API_BASE_URL=http://127.0.0.1:1234/v1"
+    )
+  elif [[ "$mode" == "split" ]]; then
+    pairs=(
+      "MIROFISH_INFERENCE=split"
+      "LLM_API_KEY=lm-studio"
+      "LLM_BASE_URL=http://127.0.0.1:11435/v1"
+      "LLM_MODEL_NAME=qwen3-8b-mf:latest"
+      "MIROFISH_REPORT_MODEL=ornith-1.5-35b-a3b-mlx"
+      "LLM_REPORT_BASE_URL=http://127.0.0.1:1234/v1"
+      "EMBEDDING_API=ollama"
+      "EMBEDDING_MODEL=nomic-embed-text"
+      "EMBEDDING_BASE_URL=http://127.0.0.1:11435"
+      "OPENAI_API_KEY=lm-studio"
+      "OPENAI_API_BASE_URL=http://127.0.0.1:11435/v1"
     )
   else
     pairs=(
@@ -215,6 +230,7 @@ cmd_mf_inference() {
       "LLM_BASE_URL=http://localhost:11435/v1"
       "LLM_MODEL_NAME=qwen3-8b-mf:latest"
       "MIROFISH_REPORT_MODEL=ornith-1.5-mf:latest"
+      "LLM_REPORT_BASE_URL=http://localhost:11435/v1"
       "EMBEDDING_API=ollama"
       "EMBEDDING_MODEL=nomic-embed-text"
       "EMBEDDING_BASE_URL=http://localhost:11435"

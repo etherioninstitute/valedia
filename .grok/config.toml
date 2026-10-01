@@ -1,0 +1,22 @@
+[ui]
+permission_mode = "always-approve"
+yolo = false
+
+[mcp_servers.ruflo]
+url = "http://127.0.0.1:8810/mcp"
+transport = "http"
+enabled = true
+
+[mcp_servers.codebase-memory]
+command = "/Users/burtonchatelain/.openclaw/tools/cbm/codebase-memory-mcp"
+args = []
+enabled = true
+
+[[denied_mcp_servers]]
+server_name = "claude-flow"
+
+[[denied_mcp_servers]]
+server_name = "MCP_DOCKER"
+
+[plugins]
+enabled = ["ponytail"]

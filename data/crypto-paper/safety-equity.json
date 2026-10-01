@@ -1,0 +1,34 @@
+{
+  "ts": "2026-09-23T02:40:11.000626+00:00",
+  "valedia_version": "0.62.0",
+  "status": "PAPER/SHADOW",
+  "mode": "PAPER/SHADOW",
+  "create_order": false,
+  "live": false,
+  "source": "fixture",
+  "pair": "BTC-USDT",
+  "starting_equity": 10000.0,
+  "ending_equity": 9998.4995,
+  "would_have_pnl": -1.5005,
+  "n_fills": 1,
+  "fees_paid": 1.0005,
+  "fills": [
+    {
+      "ts": "2026-01-03T01:00:00+00:00",
+      "pair": "BTC-USDT",
+      "side": "buy",
+      "qty": 9.21802218,
+      "mid": 108.483141,
+      "px": 108.53738257,
+      "fee": 1.0005,
+      "role": "taker",
+      "source": "paper",
+      "inferred": true
+    }
+  ],
+  "cash": 8998.4995,
+  "positions": {
+    "BTC-USDT": 9.218022180976488
+  },
+  "note": "CE-1 paper fill after Ornith PASS; would-have only; no venue order"
+}

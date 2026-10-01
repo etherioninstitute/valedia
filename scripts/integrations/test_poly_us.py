@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import forward_test_ledger as ftl
 import poly_us_smoke as smoke
 import polymarket_order_body as pmob
@@ -136,7 +139,7 @@ def test_hygiene_and_fence():
     assert "websocket" in matrix.lower()
     assert "whoami_retail" in matrix.lower() or "retail identity" in matrix.lower()
     assert "api.prod.polymarketexchange.com" in matrix
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert 'self._request("GET", "/v1/whoami"' not in src
     assert "def whoami_retail" in src
     smoke_src = open(os.path.join(HERE, "poly_us_smoke.py")).read()

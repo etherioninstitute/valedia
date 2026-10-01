@@ -9,6 +9,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
+
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 sys.path.insert(0, os.path.expanduser("~/mirofish-offline/backend"))
 
 import valedia_config as vc
@@ -52,7 +56,7 @@ def test_healthcheck_helpers():
 
 
 def test_hygiene_and_version():
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.MIROFISH_AUTO_RAISE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
     sh = open(os.path.join(ROOT, "scripts", "valedia_models.sh")).read()

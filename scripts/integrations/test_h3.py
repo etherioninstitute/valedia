@@ -12,6 +12,9 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import forward_test_ledger as ftl
 import sports_engine as se
 import master_allocator as ma
@@ -182,10 +185,10 @@ def test_hygiene_and_version():
     assert "fills_payload=result.get(\"fills_payload\")" in ke_src
     assert "MIROFISH_AUTO_RAISE" not in se_src
     assert "--live" not in ftl_src
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.MIROFISH_AUTO_RAISE is False
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.version_stamp().startswith("v0.74.1 ")
 
 
 if __name__ == "__main__":

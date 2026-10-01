@@ -1,9 +1,9 @@
 {
-  "as_of": "2026-09-20T06:13:49Z",
+  "as_of": "2026-09-24T02:33:07Z",
   "counts": {
-    "maker_viable": 57,
-    "n_series": 79,
-    "ok": 74,
+    "maker_viable": 95,
+    "n_series": 117,
+    "ok": 112,
     "sports_maker_viable": 0,
     "sports_n": 4,
     "sports_taker_taxed": 0,
@@ -34,7 +34,7 @@
     }
   ],
   "kalshi_fee_map_gate_constant": false,
-  "kalshi_fee_map_gate_enabled": false,
+  "kalshi_fee_map_gate_enabled": true,
   "mode": "get",
   "series": {
     "KXA100MAX": {
@@ -104,7 +104,7 @@
       "taker_taxed": false
     },
     "KXAAAGASM": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "US gas price; fee_type=quadratic_with_maker_fees",
@@ -115,7 +115,7 @@
       "taker_taxed": false
     },
     "KXAMEND25": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -203,7 +203,7 @@
       "taker_taxed": false
     },
     "KXBALLONDOR": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Ballon d'Or; fee_type=quadratic_with_maker_fees",
@@ -214,7 +214,7 @@
       "taker_taxed": false
     },
     "KXBTC": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -225,7 +225,7 @@
       "taker_taxed": false
     },
     "KXBTCMAX150": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "When will bitcoin hit 150k?; fee_type=quadratic_with_maker_fees",
@@ -269,7 +269,7 @@
       "taker_taxed": false
     },
     "KXCABOUT": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -280,7 +280,7 @@
       "taker_taxed": false
     },
     "KXCANAL": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -291,7 +291,7 @@
       "taker_taxed": false
     },
     "KXCANTERRITORY": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -313,7 +313,7 @@
       "taker_taxed": false
     },
     "KXCOLONIZEMARS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -324,7 +324,7 @@
       "taker_taxed": false
     },
     "KXCPI": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "CPI; fee_type=quadratic_with_maker_fees",
@@ -335,7 +335,7 @@
       "taker_taxed": false
     },
     "KXCPIYOY": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Inflation; fee_type=quadratic_with_maker_fees",
@@ -346,7 +346,7 @@
       "taker_taxed": false
     },
     "KXDEELRIP": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -368,7 +368,7 @@
       "taker_taxed": false
     },
     "KXEARTHQUAKEJAPAN": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -379,7 +379,7 @@
       "taker_taxed": false
     },
     "KXEGGS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Egg prices; fee_type=quadratic_with_maker_fees",
@@ -401,7 +401,7 @@
       "taker_taxed": false
     },
     "KXEMMYCACTO": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Emmys Lead Comedy Actor; fee_type=quadratic_with_maker_fees",
@@ -412,7 +412,7 @@
       "taker_taxed": false
     },
     "KXEMMYCACTR": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Emmys Lead Comedy Actress; fee_type=quadratic_with_maker_fees",
@@ -423,7 +423,7 @@
       "taker_taxed": false
     },
     "KXEMMYCSERIES": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "Emmys Comedy Series; fee_type=quadratic_with_maker_fees",
@@ -434,7 +434,7 @@
       "taker_taxed": false
     },
     "KXERUPTSUPER": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -445,7 +445,7 @@
       "taker_taxed": false
     },
     "KXETH": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -467,7 +467,7 @@
       "taker_taxed": false
     },
     "KXEUEXITCOUNTRY": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -489,7 +489,7 @@
       "taker_taxed": false
     },
     "KXFED": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "fee_type=quadratic_with_maker_fees",
@@ -500,7 +500,7 @@
       "taker_taxed": false
     },
     "KXFEDCHAIRCONFIRM": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -511,7 +511,7 @@
       "taker_taxed": false
     },
     "KXFEDEND": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -522,7 +522,7 @@
       "taker_taxed": false
     },
     "KXFREDDIE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -533,7 +533,7 @@
       "taker_taxed": false
     },
     "KXFUSION": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -555,7 +555,7 @@
       "taker_taxed": false
     },
     "KXGDP": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "fee_type=quadratic_with_maker_fees",
@@ -577,7 +577,7 @@
       "taker_taxed": false
     },
     "KXGOLD": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -599,7 +599,7 @@
       "taker_taxed": false
     },
     "KXGREENLANDPRICE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -742,7 +742,7 @@
       "taker_taxed": false
     },
     "KXHABEAS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -753,7 +753,7 @@
       "taker_taxed": false
     },
     "KXHURRICANE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -764,7 +764,7 @@
       "taker_taxed": false
     },
     "KXIMPEACH": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -775,7 +775,7 @@
       "taker_taxed": false
     },
     "KXIMPEACHCABINET": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -786,7 +786,7 @@
       "taker_taxed": false
     },
     "KXINSURRECTION": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -863,7 +863,7 @@
       "taker_taxed": false
     },
     "KXIPO": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "fee_type=quadratic_with_maker_fees",
@@ -874,7 +874,7 @@
       "taker_taxed": false
     },
     "KXIPOFANNIE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -885,7 +885,7 @@
       "taker_taxed": false
     },
     "KXIPOOURA": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -907,7 +907,7 @@
       "taker_taxed": false
     },
     "KXJOBLESS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -918,7 +918,7 @@
       "taker_taxed": false
     },
     "KXJPMCEONEW": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -984,7 +984,7 @@
       "taker_taxed": false
     },
     "KXLONDONMAYOR": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1006,7 +1006,7 @@
       "taker_taxed": false
     },
     "KXMARSVRAIL": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1017,7 +1017,7 @@
       "taker_taxed": false
     },
     "KXMARTIAL": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1259,7 +1259,7 @@
       "taker_taxed": false
     },
     "KXMUSKTRILLION": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1347,7 +1347,7 @@
       "taker_taxed": false
     },
     "KXNBAGAME": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "fee_type=quadratic_with_maker_fees",
@@ -1468,7 +1468,7 @@
       "taker_taxed": false
     },
     "KXNEWPOPE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1479,7 +1479,7 @@
       "taker_taxed": false
     },
     "KXNEXTDEF": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1490,7 +1490,7 @@
       "taker_taxed": false
     },
     "KXNEXTDHSSEC": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1512,7 +1512,7 @@
       "taker_taxed": false
     },
     "KXNEXTISRAELPM": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1523,7 +1523,7 @@
       "taker_taxed": false
     },
     "KXNEXTSPEAKER": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1534,7 +1534,7 @@
       "taker_taxed": false
     },
     "KXNEXTUKPM": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1556,7 +1556,7 @@
       "taker_taxed": false
     },
     "KXNHLGAME": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 1.0,
       "maker_viable": false,
       "notes": "fee_type=quadratic_with_maker_fees",
@@ -1567,7 +1567,7 @@
       "taker_taxed": false
     },
     "KXOAIANTH": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1578,7 +1578,7 @@
       "taker_taxed": false
     },
     "KXOIL": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1600,7 +1600,7 @@
       "taker_taxed": false
     },
     "KXRAMPBREX": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1611,7 +1611,7 @@
       "taker_taxed": false
     },
     "KXROBOTMARS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1688,7 +1688,7 @@
       "taker_taxed": false
     },
     "KXSCOTUSCHANGE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1721,7 +1721,7 @@
       "taker_taxed": false
     },
     "KXTAFTHARTLEY": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1732,7 +1732,7 @@
       "taker_taxed": false
     },
     "KXTEMP": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1743,7 +1743,7 @@
       "taker_taxed": false
     },
     "KXTRILLIONAIRE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1765,7 +1765,7 @@
       "taker_taxed": false
     },
     "KXTRUMPPARDONS": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1776,7 +1776,7 @@
       "taker_taxed": false
     },
     "KXTRUMPREMOVE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1787,7 +1787,7 @@
       "taker_taxed": false
     },
     "KXTRUMPRESIGN": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1798,7 +1798,7 @@
       "taker_taxed": false
     },
     "KXUSAKIM": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1809,7 +1809,7 @@
       "taker_taxed": false
     },
     "KXVETOOVERRIDE": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1820,7 +1820,7 @@
       "taker_taxed": false
     },
     "KXWARMING": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1875,7 +1875,7 @@
       "taker_taxed": false
     },
     "KXWTI": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1886,7 +1886,7 @@
       "taker_taxed": false
     },
     "KXZELENSKYPUTIN": {
-      "as_of": "2026-09-20",
+      "as_of": "2026-09-23",
       "maker_multiplier": 0.0,
       "maker_viable": true,
       "notes": "fee_type=quadratic",
@@ -1895,8 +1895,426 @@
       "status": "ok",
       "taker_multiplier": 1.0,
       "taker_taxed": false
+    },
+    "KXHIGHNY": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHNY",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHCHI": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHCHI",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHDEN": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHDEN",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHAUS": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHAUS",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHMIA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHMIA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHLAX": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHLAX",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHPHIL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHPHIL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHHOU": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHHOU",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTLV": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTLV",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTNOLA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTNOLA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTPHX": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTPHX",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTDAL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTDAL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTBOS": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTBOS",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTDC": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTDC",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTSEA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTSEA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXHIGHTATL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXHIGHTATL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWNY": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWNY",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWCHI": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWCHI",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWDEN": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWDEN",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWAUS": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWAUS",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWMIA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWMIA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTLV": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTLV",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWLAX": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWLAX",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWPHIL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWPHIL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTCHI": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTCHI",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTAUS": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTAUS",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTDEN": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTDEN",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTPHX": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTPHX",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTPHIL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTPHIL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTDAL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTDAL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTHOU": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTHOU",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTBOS": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTBOS",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTDC": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTDC",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTSEA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTSEA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTATL": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTATL",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTLAX": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTLAX",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTNOLA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTNOLA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
+    },
+    "KXLOWTMIA": {
+      "as_of": "2026-09-23",
+      "maker_multiplier": 0.0,
+      "maker_viable": true,
+      "notes": "fee_type=quadratic",
+      "series_ticker": "KXLOWTMIA",
+      "source": "api",
+      "status": "ok",
+      "taker_multiplier": 1.0,
+      "taker_taxed": false
     }
   },
   "sports_unknown_series": [],
-  "valedia_version": "0.46.0"
+  "valedia_version": "0.61.0"
 }

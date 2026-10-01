@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "metric_count": 19,
+  "strategy": "GROK SuperTrend Strategy paper",
+  "currency": "USD",
+  "source": "internal_api",
+  "metrics": {
+    "net_profit": 16508.42126000001,
+    "net_profit_percent": 1.650842126000001,
+    "gross_profit": 41960.08191000001,
+    "gross_loss": 25451.660649999998,
+    "profit_factor": 1.6486186299203236,
+    "max_drawdown": 1712.2647299999953,
+    "max_drawdown_percent": 0.09543798663166608,
+    "total_trades": 341,
+    "winning_trades": 123,
+    "losing_trades": 218,
+    "percent_profitable": 0.36070381231671556,
+    "avg_trade": 48.41179255,
+    "largest_win": 2415.1574,
+    "largest_loss": 400.1033399999998,
+    "commission_paid": 1235.2387399999998,
+    "sharpe_ratio": 0.014835974966456635,
+    "sortino_ratio": 0.03392431200874323,
+    "buy_hold_return": 23518383.280000005,
+    "open_pl": 9.520000000000437
+  },
+  "symbol_requested": "NASDAQ:AAPL",
+  "asset_class": "equity",
+  "venue_label": "Alpaca/Webull",
+  "captured_at": "2026-09-29 20:19:55 PT"
+}

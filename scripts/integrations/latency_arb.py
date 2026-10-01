@@ -11,9 +11,11 @@ Architecture:
 
 (c) GOATWORTHY Post LLC — March 2026
 """
-import os, sys, json, time, hmac, hashlib, threading, logging
+import os, sys, json, time, hmac, hashlib, threading, logging, ssl
 from datetime import datetime, timezone, timedelta
 from collections import deque
+import requests
+from requests.adapters import HTTPAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kalshi_auth import get, create_order
@@ -41,6 +43,69 @@ ARB_STATE = os.path.join(MODELS, "latency_arb_state.json")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [LAT-ARB] %(message)s')
 log = logging.getLogger("latency_arb")
+
+
+# ═══ TLS: load verify locations once on the main thread ═══
+# OpenSSL 3 SIGSEGV (exit 139): concurrent SSL_CTX_load_verify_locations
+# from per-request SSLContext in the poller vs Kalshi GETs on main.
+
+class _PinnedTLSAdapter(HTTPAdapter):
+    def __init__(self, ssl_context, **kwargs):
+        self._ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+    def cert_verify(self, conn, url, verify, cert):
+        super().cert_verify(conn, url, verify, cert)
+        # requests would set conn.ca_certs=certifi and urllib3 would
+        # SSL_CTX_load_verify_locations on every GET (the SIGSEGV).
+        conn.ca_certs = None
+        conn.ca_cert_dir = None
+
+
+_HTTPS = None
+_SSL_CTX = None
+_HTTPS_LOCK = threading.Lock()
+
+
+def _make_ssl_context(cafile=None):
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def https_session(cafile=None):
+    """Build SSLContext + Session once. Call from the main thread first."""
+    global _HTTPS, _SSL_CTX
+    with _HTTPS_LOCK:
+        if _HTTPS is None:
+            _SSL_CTX = _make_ssl_context(cafile=cafile)
+            sess = requests.Session()
+            ad = _PinnedTLSAdapter(_SSL_CTX, pool_connections=8, pool_maxsize=8)
+            sess.mount("https://", ad)
+            sess.mount("http://", HTTPAdapter())
+            _HTTPS = sess
+        return _HTTPS
+
+
+def reset_https_session():
+    """Test helper. Next https_session() rebuilds the pinned Session."""
+    global _HTTPS, _SSL_CTX
+    with _HTTPS_LOCK:
+        if _HTTPS is not None:
+            try:
+                _HTTPS.close()
+            except Exception:
+                pass
+        _HTTPS = None
+        _SSL_CTX = None
 
 
 # ═══ STEP 1: PRICE INGESTION — Coinbase WebSocket ═══
@@ -92,7 +157,7 @@ class SpotPriceTracker:
     def poll_prices(self, interval=2.0):
         """Poll Coinbase for spot prices. Fallback when WS unavailable.
         Uses CoinGecko as backup (no auth needed)."""
-        import requests
+        sess = https_session()
         self._running = True
         log.info(f"Polling spot prices every {interval}s for {self.pairs}")
         
@@ -103,7 +168,7 @@ class SpotPriceTracker:
                     coin_id = pair.replace('-USD', '').lower()
                     coin_map = {'btc': 'bitcoin', 'eth': 'ethereum', 'sol': 'solana'}
                     cg_id = coin_map.get(coin_id, coin_id)
-                    r = requests.get(
+                    r = sess.get(
                         f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd',
                         timeout=3
                     )
@@ -470,7 +535,8 @@ def run(mode='scan', duration_min=30):
         print(report)
         return report
     
-    # Start price tracker
+    # Pin CA store on main thread before the poller starts.
+    https_session()
     tracker = SpotPriceTracker()
     tracker.start_polling(interval=2.0)
     

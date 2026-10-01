@@ -1,0 +1,75 @@
+{
+  "ok": true,
+  "verdict": "PASS",
+  "valedia_version": "0.37.0",
+  "fence": {
+    "ok": true,
+    "env_live": [],
+    "config_live": []
+  },
+  "fixture": {
+    "ok": true,
+    "models_dir": "/var/folders/hz/ngh5bp1x4sv1mlqp7d3d6v0r0000gn/T/mf_smoke_059kl9is",
+    "signal_path": "/var/folders/hz/ngh5bp1x4sv1mlqp7d3d6v0r0000gn/T/mf_smoke_059kl9is/mirofish_signal.json",
+    "steps": [
+      {
+        "step": "seed_advisory",
+        "ok": true
+      },
+      {
+        "step": "extractor",
+        "ok": true,
+        "direction": "BUY",
+        "score": 75,
+        "neural_enriched": true
+      },
+      {
+        "step": "ledger_ingest",
+        "ok": true,
+        "pred_id": "mf_20260913T063051_BTC-USD",
+        "hit": true,
+        "fee_true": true,
+        "n_pred": 1,
+        "n_scored": 1
+      },
+      {
+        "step": "intel_gatherer",
+        "ok": true,
+        "n_opps": 1,
+        "n_mirofish": 1,
+        "intents_enqueued": 0
+      }
+    ],
+    "ms": 6,
+    "overall_bias": 75.0,
+    "weight_unchanged": true
+  },
+  "live_lite": {
+    "status": "PASS",
+    "endpoint": "http://127.0.0.1:11435",
+    "model": "qwen3-8b-mf:latest",
+    "reply": "",
+    "ms": 7432
+  },
+  "wall_s": 7.439,
+  "wall_budget_s": 300,
+  "within_budget": true,
+  "overnight_still_covers": [
+    "full swarm ontology + multi-agent sim (mirofish_runner :5001)",
+    "live seed APIs (CoinGecko/Yahoo/Kalshi/news RSS)",
+    "real 5-day fee-true FTL corpus (n>=20 proven bar)",
+    "weight raise evidence (AUTO_RAISE stays False)"
+  ],
+  "scripts_touched": [
+    "mirofish_seed_accurate.py (advisory apply_seed_text only; no HTTP)",
+    "mirofish_signal_extractor.py (process_mirofish_report)",
+    "mirofish_neural_enrich.py (attach_to_signal + apply_seed_text)",
+    "mirofish_accuracy_ledger.py (record + score; mock FTL)",
+    "intel_opportunity_gatherer.py (gather/collect_mirofish; no enqueue)"
+  ],
+  "not_run": [
+    "mirofish_runner.run_simulation",
+    "mirofish_seed_accurate.build_seed",
+    "intent enqueue"
+  ]
+}

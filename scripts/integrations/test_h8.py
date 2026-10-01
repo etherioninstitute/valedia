@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import intel_fetch_fallback as iff
 import valedia_config as vc
 
@@ -52,8 +55,8 @@ def test_hygiene_and_version():
     assert vc.VALEDIA_SELF_ADJUST is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VENUE_WRITER["polymarket"] == "none"
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
+    assert vc.version_stamp().startswith("v0.74.1 ")
 
 
 def test_classify():

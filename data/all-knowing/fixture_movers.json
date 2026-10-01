@@ -1,0 +1,11 @@
+{
+  "rows": [
+    {"symbol": "PUMP", "class": "crypto", "chg_24h": 16.4, "buzz": 30, "price": 0.004, "reasons": ["fixture"]},
+    {"symbol": "QNT", "class": "crypto", "chg_24h": 16.1, "buzz": 22, "price": 98.5, "reasons": ["fixture"]},
+    {"symbol": "NOISE", "class": "crypto", "chg_24h": 2.1, "buzz": 999, "price": 1.0, "reasons": ["fixture_buzz"]},
+    {"symbol": "DUST", "class": "crypto", "chg_24h": 0.2, "buzz": 10, "price": 1.0, "reasons": ["fixture"]},
+    {"symbol": "SPY", "class": "etf", "chg_24h": 0.4, "buzz": 0, "price": 500.0, "reasons": ["yahoo"]},
+    {"symbol": "USO", "class": "oil", "chg_24h": 22.0, "buzz": 5, "price": 78.0, "reasons": ["oil"]},
+    {"symbol": "KXHIGHNY", "class": "weather", "chg_24h": null, "buzz": 0, "price": null, "reasons": ["weather_watch"]}
+  ]
+}

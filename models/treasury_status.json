@@ -1,0 +1,98 @@
+{
+  "ts": "2026-09-19T06:17:15.715076+00:00",
+  "valedia_version": "0.36.0",
+  "moves_money": false,
+  "compound_in_place": true,
+  "rebalancer_autoexec": false,
+  "polymarket_us_live": false,
+  "venues": [
+    {
+      "venue": "kalshi",
+      "writer": "valedia",
+      "hook": "kalshi_auth.get_balance",
+      "readable": false,
+      "cash": null,
+      "buying_power": null,
+      "floor": 25.0,
+      "status": "UNREAD",
+      "alert": null,
+      "note": null,
+      "error": "No module named 'requests'"
+    },
+    {
+      "venue": "polymarket_us",
+      "writer": "none",
+      "hook": "polymarket_us_client.balances",
+      "readable": true,
+      "cash": 30.552,
+      "buying_power": null,
+      "floor": 25.0,
+      "status": "OK",
+      "alert": null,
+      "note": null
+    },
+    {
+      "venue": "coinbase",
+      "writer": "valedia",
+      "hook": "coinbase_trader.get_balances",
+      "readable": false,
+      "cash": null,
+      "buying_power": null,
+      "floor": 20.0,
+      "status": "UNREAD",
+      "alert": null,
+      "note": null,
+      "error": "No module named 'jwt'"
+    },
+    {
+      "venue": "alpaca",
+      "writer": "valedia",
+      "hook": "alpaca_executor.get_account",
+      "readable": false,
+      "cash": null,
+      "buying_power": null,
+      "floor": 10.0,
+      "status": "UNREAD",
+      "alert": null,
+      "note": null,
+      "error": "No module named 'requests'"
+    },
+    {
+      "venue": "hyperliquid",
+      "writer": "none",
+      "hook": null,
+      "readable": false,
+      "cash": null,
+      "buying_power": null,
+      "floor": null,
+      "status": "DOCUMENT",
+      "alert": null,
+      "note": "no reader"
+    },
+    {
+      "venue": "kraken",
+      "writer": "none",
+      "hook": null,
+      "readable": false,
+      "cash": null,
+      "buying_power": null,
+      "floor": null,
+      "status": "DOCUMENT",
+      "alert": null,
+      "note": "no reader"
+    }
+  ],
+  "alerts": [],
+  "auto": {
+    "flag": false,
+    "executed": false,
+    "refused": true,
+    "reason": "this slice never moves money; first human fund still required"
+  },
+  "webhook": {
+    "posted": false,
+    "url": "",
+    "reason": "TREASURY_ALERT_WEBHOOK stub unused"
+  },
+  "fence": "No ACH/wire/card. No withdraw. VALEDIA_TREASURY_AUTO refused. REBALANCER_AUTOEXEC stays False."
+}

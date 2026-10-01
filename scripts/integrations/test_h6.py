@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import nautilus_fill_sink as sink
 import nautilus_intent as ni
 import nautilus_shadow_events as ev
@@ -119,8 +122,8 @@ def test_hygiene_and_version():
         assert "--live" not in src or name == "nautilus_fill_sink.py"
     src_ev = open(os.path.join(HERE, "nautilus_shadow_events.py")).read()
     assert "LiveNode" in src_ev
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
+    assert vc.version_stamp().startswith("v0.74.1 ")
     assert "last_qty" in ev.ORDER_FILLED_MAP
     _assert_fence()
 

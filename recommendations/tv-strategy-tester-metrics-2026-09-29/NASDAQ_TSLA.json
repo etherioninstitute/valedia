@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "metric_count": 19,
+  "strategy": "GROK SuperTrend Strategy paper",
+  "currency": "USD",
+  "source": "internal_api",
+  "metrics": {
+    "net_profit": 2638.685479999993,
+    "net_profit_percent": 0.26386854799999926,
+    "gross_profit": 11736.357549999995,
+    "gross_loss": 9097.672070000002,
+    "profit_factor": 1.290039634281959,
+    "max_drawdown": 1977.52355,
+    "max_drawdown_percent": 0.17587996056639474,
+    "total_trades": 121,
+    "winning_trades": 40,
+    "losing_trades": 81,
+    "percent_profitable": 0.3305785123966942,
+    "avg_trade": 21.80731802,
+    "largest_win": 1716.3300600000005,
+    "largest_loss": 576.53508,
+    "commission_paid": 266.43451999999996,
+    "sharpe_ratio": -0.008419490609980722,
+    "sortino_ratio": -0.02146509524513302,
+    "buy_hold_return": 1846997.2200000002,
+    "open_pl": -30.059999999999775
+  },
+  "symbol_requested": "NASDAQ:TSLA",
+  "asset_class": "equity",
+  "venue_label": "Alpaca/Webull",
+  "captured_at": "2026-09-29 20:20:27 PT"
+}

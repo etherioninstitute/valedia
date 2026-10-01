@@ -1,0 +1,384 @@
+{
+  "trades": [
+    {
+      "ts": "2026-09-23T04:38:56.809595+00:00",
+      "timestamp": "2026-09-23T04:38:56.809595+00:00",
+      "pass": false,
+      "bias": "long",
+      "failed_conditions": [
+        "ornith_down"
+      ],
+      "evidence": {
+        "long_ema": {
+          "pass": true,
+          "value": 106.14648142591258,
+          "threshold": 105.73825471609483
+        },
+        "close_above_sma": {
+          "pass": true,
+          "value": 108.062667,
+          "threshold": 106.18565020000001
+        },
+        "close_above_vwap": {
+          "pass": true,
+          "value": 108.062667,
+          "threshold": 106.1972942
+        },
+        "rsi_not_chase": {
+          "pass": true,
+          "value": 66.54979512950248,
+          "threshold": 70
+        },
+        "macd_line_pos": {
+          "pass": true,
+          "value": 0.4082267098177539,
+          "threshold": 0
+        },
+        "macd_hist_pos": {
+          "pass": true,
+          "value": 0.14819204509105688,
+          "threshold": 0
+        },
+        "pair_allowlist": {
+          "pass": true,
+          "value": "BTC-USDT",
+          "threshold": [
+            "BTC-USDT",
+            "ETH-USDT"
+          ]
+        },
+        "notional_clip": {
+          "pass": true,
+          "value": 0.1,
+          "threshold": 0.1
+        },
+        "qty_positive": {
+          "pass": true,
+          "value": 9.25388968976677,
+          "threshold": 0
+        },
+        "rsi_hot": {
+          "pass": false,
+          "value": 66.54979512950248,
+          "threshold": 75
+        }
+      },
+      "model": "down",
+      "route": "litellm:4000 alias ornith-1.5-k-m",
+      "symbol": "BTC-USDT",
+      "timeframe": "1h",
+      "price": 108.062667,
+      "indicators": {
+        "close": 108.062667,
+        "n": 48,
+        "ema_fast": 106.14648142591258,
+        "ema_slow": 105.73825471609483,
+        "rsi": 66.54979512950248,
+        "sma": 106.18565020000001,
+        "vwap": 106.1972942,
+        "macd_line": 0.4082267098177539,
+        "macd_signal": 0.260034664726697,
+        "macd_hist": 0.14819204509105688,
+        "side": "buy",
+        "qty": 9.25388968976677,
+        "notional_frac": 0.1,
+        "mid": 108.062667
+      },
+      "conditions": [
+        {
+          "id": "long_ema",
+          "label": "EMA(12) above EMA(26)",
+          "op": "gt",
+          "pass": true,
+          "actual": 106.14648142591258,
+          "threshold": 105.73825471609483
+        },
+        {
+          "id": "close_above_sma",
+          "label": "close above SMA(20)",
+          "op": "gt",
+          "pass": true,
+          "actual": 108.062667,
+          "threshold": 106.18565020000001
+        },
+        {
+          "id": "close_above_vwap",
+          "label": "close above VWAP(20)",
+          "op": "gt",
+          "pass": true,
+          "actual": 108.062667,
+          "threshold": 106.1972942
+        },
+        {
+          "id": "rsi_not_chase",
+          "label": "RSI(14) below 70",
+          "op": "lt",
+          "pass": true,
+          "actual": 66.54979512950248,
+          "threshold": 70
+        },
+        {
+          "id": "macd_line_pos",
+          "label": "MACD line above zero",
+          "op": "gt",
+          "pass": true,
+          "actual": 0.4082267098177539,
+          "threshold": 0
+        },
+        {
+          "id": "macd_hist_pos",
+          "label": "MACD histogram above zero",
+          "op": "gt",
+          "pass": true,
+          "actual": 0.14819204509105688,
+          "threshold": 0
+        },
+        {
+          "id": "pair_allowlist",
+          "label": "pair on the paper allowlist",
+          "op": "in",
+          "pass": true,
+          "actual": "BTC-USDT",
+          "threshold": [
+            "BTC-USDT",
+            "ETH-USDT"
+          ]
+        },
+        {
+          "id": "notional_clip",
+          "label": "notional at most 10% of cash",
+          "op": "lte",
+          "pass": true,
+          "actual": 0.1,
+          "threshold": 0.1
+        },
+        {
+          "id": "qty_positive",
+          "label": "quantity positive",
+          "op": "gt",
+          "pass": true,
+          "actual": 9.25388968976677,
+          "threshold": 0
+        },
+        {
+          "id": "rsi_hot",
+          "label": "RSI(14) above 75",
+          "op": "gt",
+          "pass": false,
+          "actual": 66.54979512950248,
+          "threshold": 75
+        }
+      ],
+      "allPass": false,
+      "paperTrading": true,
+      "orderPlaced": false,
+      "orderId": null,
+      "would_have_fill": null,
+      "create_order": false,
+      "live": false,
+      "mode": "PAPER/SHADOW",
+      "reason": "ornith_down",
+      "valedia_version": "0.63.0",
+      "tick": true,
+      "qwen_assist": {
+        "ok": false,
+        "model": "qwen3.8-27b",
+        "route": "litellm:4000 alias qwen3.8-27b",
+        "rank": [],
+        "picked": null,
+        "reason": "qwen_down"
+      }
+    },
+    {
+      "ts": "2026-09-23T04:57:07.924852+00:00",
+      "timestamp": "2026-09-23T04:57:07.924852+00:00",
+      "pass": false,
+      "bias": "long",
+      "failed_conditions": [
+        "ornith_down"
+      ],
+      "evidence": {
+        "long_ema": {
+          "pass": true,
+          "value": 106.14648142591258,
+          "threshold": 105.73825471609483
+        },
+        "close_above_sma": {
+          "pass": true,
+          "value": 108.062667,
+          "threshold": 106.18565020000001
+        },
+        "close_above_vwap": {
+          "pass": true,
+          "value": 108.062667,
+          "threshold": 106.1972942
+        },
+        "rsi_not_chase": {
+          "pass": true,
+          "value": 66.54979512950248,
+          "threshold": 70
+        },
+        "macd_line_pos": {
+          "pass": true,
+          "value": 0.4082267098177539,
+          "threshold": 0
+        },
+        "macd_hist_pos": {
+          "pass": true,
+          "value": 0.14819204509105688,
+          "threshold": 0
+        },
+        "pair_allowlist": {
+          "pass": true,
+          "value": "BTC-USDT",
+          "threshold": [
+            "BTC-USDT",
+            "ETH-USDT"
+          ]
+        },
+        "notional_clip": {
+          "pass": true,
+          "value": 0.1,
+          "threshold": 0.1
+        },
+        "qty_positive": {
+          "pass": true,
+          "value": 9.25388968976677,
+          "threshold": 0
+        },
+        "rsi_hot": {
+          "pass": false,
+          "value": 66.54979512950248,
+          "threshold": 75
+        }
+      },
+      "model": "down",
+      "route": "litellm:4000 alias ornith-1.5-k-m",
+      "symbol": "BTC-USDT",
+      "timeframe": "1h",
+      "price": 108.062667,
+      "indicators": {
+        "close": 108.062667,
+        "n": 48,
+        "ema_fast": 106.14648142591258,
+        "ema_slow": 105.73825471609483,
+        "rsi": 66.54979512950248,
+        "sma": 106.18565020000001,
+        "vwap": 106.1972942,
+        "macd_line": 0.4082267098177539,
+        "macd_signal": 0.260034664726697,
+        "macd_hist": 0.14819204509105688,
+        "side": "buy",
+        "qty": 9.25388968976677,
+        "notional_frac": 0.1,
+        "mid": 108.062667
+      },
+      "conditions": [
+        {
+          "id": "long_ema",
+          "label": "EMA(12) above EMA(26)",
+          "op": "gt",
+          "pass": true,
+          "actual": 106.14648142591258,
+          "threshold": 105.73825471609483
+        },
+        {
+          "id": "close_above_sma",
+          "label": "close above SMA(20)",
+          "op": "gt",
+          "pass": true,
+          "actual": 108.062667,
+          "threshold": 106.18565020000001
+        },
+        {
+          "id": "close_above_vwap",
+          "label": "close above VWAP(20)",
+          "op": "gt",
+          "pass": true,
+          "actual": 108.062667,
+          "threshold": 106.1972942
+        },
+        {
+          "id": "rsi_not_chase",
+          "label": "RSI(14) below 70",
+          "op": "lt",
+          "pass": true,
+          "actual": 66.54979512950248,
+          "threshold": 70
+        },
+        {
+          "id": "macd_line_pos",
+          "label": "MACD line above zero",
+          "op": "gt",
+          "pass": true,
+          "actual": 0.4082267098177539,
+          "threshold": 0
+        },
+        {
+          "id": "macd_hist_pos",
+          "label": "MACD histogram above zero",
+          "op": "gt",
+          "pass": true,
+          "actual": 0.14819204509105688,
+          "threshold": 0
+        },
+        {
+          "id": "pair_allowlist",
+          "label": "pair on the paper allowlist",
+          "op": "in",
+          "pass": true,
+          "actual": "BTC-USDT",
+          "threshold": [
+            "BTC-USDT",
+            "ETH-USDT"
+          ]
+        },
+        {
+          "id": "notional_clip",
+          "label": "notional at most 10% of cash",
+          "op": "lte",
+          "pass": true,
+          "actual": 0.1,
+          "threshold": 0.1
+        },
+        {
+          "id": "qty_positive",
+          "label": "quantity positive",
+          "op": "gt",
+          "pass": true,
+          "actual": 9.25388968976677,
+          "threshold": 0
+        },
+        {
+          "id": "rsi_hot",
+          "label": "RSI(14) above 75",
+          "op": "gt",
+          "pass": false,
+          "actual": 66.54979512950248,
+          "threshold": 75
+        }
+      ],
+      "allPass": false,
+      "paperTrading": true,
+      "orderPlaced": false,
+      "orderId": null,
+      "would_have_fill": null,
+      "create_order": false,
+      "live": false,
+      "mode": "PAPER/SHADOW",
+      "reason": "ornith_down",
+      "valedia_version": "0.64.0",
+      "tick": true,
+      "qwen_assist": {
+        "ok": false,
+        "reason": "off",
+        "model": "qwen3.8-27b",
+        "route": "litellm:4000 alias qwen3.8-27b",
+        "rank": [],
+        "picked": null
+      }
+    }
+  ],
+  "mode": "PAPER/SHADOW",
+  "create_order": false
+}

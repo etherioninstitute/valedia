@@ -1,0 +1,61 @@
+{
+  "ts": "2026-09-30T07:47:19.877139+00:00",
+  "paper_only": true,
+  "create_order": false,
+  "live": false,
+  "allowlist_widened": false,
+  "crypto_paper_allowlist": [
+    "BTC-USDT",
+    "ETH-USDT"
+  ],
+  "names": [
+    {
+      "symbol": "USO",
+      "class": "oil",
+      "laya": "watch",
+      "chg_24h": 22.0,
+      "impact_usd": 10.9368,
+      "sized": false
+    },
+    {
+      "symbol": "PUMP",
+      "class": "crypto",
+      "laya": "would_buy",
+      "chg_24h": 16.4,
+      "impact_usd": 8.1144,
+      "sized": true
+    },
+    {
+      "symbol": "QNT",
+      "class": "crypto",
+      "laya": "would_buy",
+      "chg_24h": 16.1,
+      "impact_usd": 7.9632,
+      "sized": true
+    },
+    {
+      "symbol": "NOISE",
+      "class": "crypto",
+      "laya": "watch",
+      "chg_24h": 2.1,
+      "impact_usd": 0.9072,
+      "sized": false
+    },
+    {
+      "symbol": "SPY",
+      "class": "etf",
+      "laya": "watch",
+      "chg_24h": 0.4,
+      "impact_usd": 0.0504,
+      "sized": false
+    },
+    {
+      "symbol": "KXHIGHNY",
+      "class": "weather",
+      "laya": "watch",
+      "chg_24h": null,
+      "impact_usd": null,
+      "sized": false
+    }
+  ]
+}

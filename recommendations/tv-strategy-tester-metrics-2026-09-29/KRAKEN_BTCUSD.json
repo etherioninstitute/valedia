@@ -1,0 +1,96 @@
+{
+  "symbol": "KRAKEN:BTCUSD",
+  "asset_class": "crypto",
+  "venue_label": "Kraken",
+  "ts": "2026-09-29T20:18:05.881600",
+  "set_symbol_rc": 0,
+  "set_symbol_out": "{\n  \"success\": true,\n  \"symbol\": \"KRAKEN:BTCUSD\",\n  \"chart_ready\": false\n}\n",
+  "live_symbol": "KRAKEN:BTCUSD",
+  "resolution": "D",
+  "studies": [
+    "GROK SuperTrend Strategy paper",
+    "Chart Patterns [Tradevisor] \u2014 Auto Detection, Measured Targets & Entry Signals",
+    "Overlay",
+    "Volume"
+  ],
+  "strategy_ok": true,
+  "metric_count": 19,
+  "strategy_name": "GROK SuperTrend Strategy paper",
+  "metrics": {
+    "net_profit": 5547.8274274607975,
+    "net_profit_percent": 0.5547827427460797,
+    "gross_profit": 16308.955107927,
+    "gross_loss": 10761.127680466203,
+    "profit_factor": 1.5155433140646881,
+    "max_drawdown": 2193.1334830779997,
+    "max_drawdown_percent": 0.12646389968265617,
+    "total_trades": 103,
+    "winning_trades": 42,
+    "losing_trades": 61,
+    "percent_profitable": 0.4077669902912621,
+    "avg_trade": 53.86240221,
+    "largest_win": 2409.422552697,
+    "largest_loss": 856.108483308,
+    "commission_paid": 304.95519813920004,
+    "sharpe_ratio": 0.07027581941890652,
+    "sortino_ratio": 0.16941539894922206,
+    "buy_hold_return": 1179448.0415914,
+    "open_pl": 389.55505310000007
+  },
+  "strategy_error": null,
+  "last": 83179.6,
+  "quote": {
+    "symbol": "KRAKEN:BTCUSD",
+    "last": 83179.6,
+    "volume": 182.00388996
+  },
+  "trade_count_sample": 5,
+  "trades_sample": [
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 72684.8,
+      "qty": 0.039047,
+      "time_index": 99
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 65950.3,
+      "qty": 0.045151,
+      "time_index": 100
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 74441.7,
+      "qty": 0.04417,
+      "time_index": 101
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 75456.5,
+      "qty": 0.040956,
+      "time_index": 102
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 66511.7,
+      "qty": 0.043708,
+      "time_index": 103
+    }
+  ],
+  "symbol_requested": "KRAKEN:BTCUSD"
+}

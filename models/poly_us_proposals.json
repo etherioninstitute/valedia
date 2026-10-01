@@ -1,0 +1,37 @@
+{
+  "ts": "2026-09-19T07:48:59.536075+00:00",
+  "valedia_version": "0.41.0",
+  "status": "DRY/SHADOW",
+  "mode": "DRY/SHADOW",
+  "create_order": false,
+  "live": false,
+  "polymarket_us_live": false,
+  "n": 1,
+  "proposals": [
+    {
+      "platform": "polymarket_us",
+      "type": "POLY_US_LEARN",
+      "ticker": "btc-100k",
+      "title": "btc 100k",
+      "side": "buy",
+      "price": 0.56,
+      "allocation": 5.0,
+      "quantity": 8,
+      "status": "DRY/SHADOW",
+      "mode": "DRY/SHADOW",
+      "create_order": false,
+      "tags": {
+        "nav": "CRYPTO",
+        "nav_tags": [
+          "crypto"
+        ],
+        "mirofish": false,
+        "neural_regime": null,
+        "persona": null
+      },
+      "note": "POLY-LEARN classroom; POLYMARKET_US_LIVE stays False"
+    }
+  ],
+  "error": null,
+  "note": "paper classroom; preview ok; create blocked"
+}

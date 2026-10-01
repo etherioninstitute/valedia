@@ -1,0 +1,26 @@
+ORNITH via LiteLLM :4000 auth — proof 2026-09-29 ~18:45 PT (M1 b3f456da-e4fc-42d6-8147-a47ad76a8982)
+
+DIAGNOSIS
+- FEED: ornith-1.5-k-m chat HTTP 401, health 200
+- LiteLLM log 18:30/18:37 PT: "No api key passed in" on POST /v1/chat/completions
+- master_key required for chat; /health public
+- Key: ~/.litellm/env LITELLM_MASTER_KEY (len 54) == master.key; config.yaml uses os.environ/LITELLM_MASTER_KEY (expanded by running process)
+
+FIX (workspace-v2 crypto_paper_safety.py)
+- _litellm_key: env → ~/.litellm/env → master.key
+- _http_post: always Bearer; missing key → ornith_auth URLError; HTTPError → ornith_http_<code>
+- judge: 401/ornith_auth → reason ornith_auth (+ ornith_error detail)
+- _content: fallback to reasoning_content when content empty
+
+DUAL-HOME
+- Changed: workspace-v2/scripts/integrations/crypto_paper_safety.py (+ CRYPTO-PAPER-DESK.md note)
+- NOT mirrored: workspace-accel-ornith (no CE-1 safety module; bars KLINES twin only)
+- NOT changed: ~/.litellm/config.yaml, launchd plist, M2
+
+PROOF
+1) GET http://127.0.0.1:4000/health → HTTP 200 (~61s); healthy Ornith Q4 endpoints ≥1
+2) POST chat no Authorization → HTTP 401 {"type":"auth_error",...}
+3) safety._http_post (env -u LITELLM_*) → HTTP 200, model ornith-1.5-k-m, content "PONG"
+4) python3 crypto_paper_run.py --safety → pass=true, model=ornith-1.5-k-m, create_order=false, live=false, would_have fill n=1
+
+FENCES HELD: no --live, no venue orders, no wallet/Poly/Kalshi flips.

@@ -1,0 +1,41 @@
+{
+  "ts": "2026-09-21T02:34:02.275800+00:00",
+  "slice": "POLY-LOOP",
+  "valedia_version": "0.52.0",
+  "status": "DRY/SHADOW",
+  "halted": false,
+  "create_order": false,
+  "live": false,
+  "polymarket_us_live": false,
+  "n": 0,
+  "proposals": [],
+  "blocked": [],
+  "skipped": 20,
+  "skip_reasons": {
+    "no_resolution": 20
+  },
+  "error": null,
+  "pull": {
+    "fetched": 20,
+    "dropped": {},
+    "query": {
+      "closed": false,
+      "archived": false
+    }
+  },
+  "self_fund": {
+    "paper_balance": 100.0,
+    "subscription": 20.0,
+    "reserve": 25.0,
+    "need": 45.0,
+    "covers": true,
+    "withdraw": false,
+    "note": "report only; no withdraw path"
+  },
+  "status_line": "open=0/5 dd_halted=0 paper=$100.00 vs sub+res=$45.00 covers=True live=0 create=0 cron_flag=0",
+  "ledger": "/Users/burtonchatelain/.openclaw/workspace-v2/data/poly-loop/ledger.jsonl",
+  "state": "/Users/burtonchatelain/.openclaw/workspace-v2/data/poly-loop/state.json",
+  "cron_flag": false,
+  "cron_note": "cron not installed",
+  "note": "POLY-LOOP paper desk; create stays on POLYMARKET_US_LIVE + US client"
+}

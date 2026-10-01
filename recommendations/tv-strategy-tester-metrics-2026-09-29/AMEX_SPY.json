@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "metric_count": 19,
+  "strategy": "GROK SuperTrend Strategy paper",
+  "currency": "USD",
+  "source": "internal_api",
+  "metrics": {
+    "net_profit": -918.7791000000025,
+    "net_profit_percent": -0.09187791000000024,
+    "gross_profit": 3930.3313799999996,
+    "gross_loss": 4849.110480000002,
+    "profit_factor": 0.8105262596532958,
+    "max_drawdown": 1107.5748400000011,
+    "max_drawdown_percent": 0.11070673193793068,
+    "total_trades": 264,
+    "winning_trades": 83,
+    "losing_trades": 181,
+    "percent_profitable": 0.3143939393939394,
+    "avg_trade": -3.480223864,
+    "largest_win": 313.87019999999995,
+    "largest_loss": 121.93808000000007,
+    "commission_paid": 446.82909999999976,
+    "sharpe_ratio": -0.4640099787273176,
+    "sortino_ratio": -0.5370594302332715,
+    "buy_hold_return": 165767.9,
+    "open_pl": -10.149999999999977
+  },
+  "symbol_requested": "AMEX:SPY",
+  "asset_class": "equity",
+  "venue_label": "Alpaca/Webull",
+  "captured_at": "2026-09-29 20:20:11 PT"
+}

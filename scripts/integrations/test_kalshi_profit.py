@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import kalshi_fee_map as kfm
 import kalshi_profit as kp
 import valedia_config as vc
@@ -171,13 +174,13 @@ def test_allocator_skip_when_ev_gate_on():
 
 
 def test_hygiene_and_call_sites():
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.KALSHI_EV_PREFLIGHT_GATE is False
     assert vc.KALSHI_MAKER_FIRST is False
     assert vc.KALSHI_FILL_LEDGER_DEMOTE is False
     assert vc.WEATHER_LIVE is False
-    assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
+    assert vc.POLYMARKET_US_LIVE is False
     src = open(os.path.join(HERE, "kalshi_profit.py")).read()
     for banned in ("create_order", "KALSHI_FEE_MAP_GATE=True",
                    "KALSHI_EV_PREFLIGHT_GATE = True",
@@ -191,6 +194,8 @@ def test_hygiene_and_call_sites():
     assert "KALSHI_MAKER_FIRST = False" in cfg
     assert "KALSHI_FILL_LEDGER_DEMOTE = False" in cfg
     assert "KALSHI_FEE_MAP_GATE = True" not in cfg
+    assert "POLYMARKET_US_LIVE = False" in cfg
+    assert "POLYMARKET_US_LIVE = True" not in cfg
     src_e = open(os.path.join(HERE, "kalshi_executor.py")).read()
     src_a = open(os.path.join(HERE, "master_allocator.py")).read()
     assert "kalshi_profit" in src_e and "kalshi_profit" in src_a

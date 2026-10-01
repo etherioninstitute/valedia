@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "metric_count": 19,
+  "strategy": "GROK SuperTrend Strategy paper",
+  "currency": "USD",
+  "source": "internal_api",
+  "metrics": {
+    "net_profit": -796.3131708800013,
+    "net_profit_percent": -0.07963131708800013,
+    "gross_profit": 1369.23797291,
+    "gross_loss": 2165.5511437900013,
+    "profit_factor": 0.6322815218825321,
+    "max_drawdown": 929.26391779,
+    "max_drawdown_percent": 0.09180842081418614,
+    "total_trades": 152,
+    "winning_trades": 45,
+    "losing_trades": 107,
+    "percent_profitable": 0.29605263157894735,
+    "avg_trade": -5.23890244,
+    "largest_win": 160.49841593999994,
+    "largest_loss": 69.84180420000011,
+    "commission_paid": 294.94883087999995,
+    "sharpe_ratio": -0.7950759182693203,
+    "sortino_ratio": -0.681454409112314,
+    "buy_hold_return": -2399.0390399999997,
+    "open_pl": 10.215689999999958
+  },
+  "symbol_requested": "FOREXCOM:GBPUSD",
+  "asset_class": "fx",
+  "venue_label": "FOREX.com",
+  "captured_at": "2026-09-29 20:21:00 PT"
+}

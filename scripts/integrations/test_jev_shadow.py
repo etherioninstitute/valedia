@@ -11,6 +11,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import jev_shadow as jev
 from mirofish_signal_extractor import process_mirofish_report
 import valedia_config as vc
@@ -80,7 +83,7 @@ def _boom(*_a, **_k):
 def test_hygiene_and_defaults():
     assert vc.VALEDIA_JEV is False
     assert vc.jev_enabled() is False
-    assert vc.VALEDIA_VERSION == "0.57.0"
+    assert vc.VALEDIA_VERSION == "0.74.1"
     src = open(os.path.join(HERE, "jev_shadow.py")).read()
     assert "VALEDIA_JEV = True" not in src
     assert "create_order" not in src

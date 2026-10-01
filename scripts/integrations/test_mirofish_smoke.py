@@ -14,6 +14,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import mirofish_accuracy_ledger as mal
 import mirofish_smoke as smoke
 import valedia_config as vc
@@ -163,9 +166,9 @@ def test_exit_nonzero_only_on_fixture_fail():
 
 def test_version_and_docs():
     _restore()
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.version_stamp().startswith("v0.74.1 ")
     rec = open(os.path.join(ROOT, "recommendations", "MIROFISH-SMOKE.md")).read()
     assert "fixture" in rec.lower()
     assert "overnight" in rec.lower()

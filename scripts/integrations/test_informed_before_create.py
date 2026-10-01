@@ -10,6 +10,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import informed_before_create as ibc
 import kalshi_auth as ka
 import kalshi_fee_map as kfm
@@ -54,6 +57,8 @@ def good_kalshi(**over):
         "fv_source": "model",
         "fv_confidence": True,
         "slip": 0.0,
+        "bid": 0.50,
+        "ask": 0.50,
         "depth": 20,
         "bankroll": 10000,
         "strategy": "MODEL",
@@ -76,6 +81,9 @@ def good_poly(**over):
         "exit_ok": True,
         "depth": 50,
         "bankroll": 10000,
+        "acceptingOrders": True,
+        "umaProposalTime": "2026-09-22T18:00:00+00:00",
+        "challengePeriodSeconds": 7200,
     }
     d.update(over)
     return d
@@ -98,7 +106,7 @@ def _quiet():
 
 def test_hygiene_and_snapshot():
     _quiet()
-    assert vc.VALEDIA_VERSION == "0.57.0"
+    assert vc.VALEDIA_VERSION == "0.74.1"
     assert vc.INFORMED_BEFORE_CREATE is True
     assert vc.POLY_TAG_PRIOR_CREATE is False
     assert vc.POLYMARKET_US_LIVE is False
@@ -184,6 +192,19 @@ def test_kalshi_admits_only_when_all_pass():
             "KXBTCY-1", "yes", 1, 50,
             informed=good_kalshi(mirofish_fusion=True, mirofish_score=50)))
         assert "mirofish_default_50" in err.reasons
+        err = _refused(lambda: ka.create_order(
+            "KXBTCY-1", "yes", 1, 50,
+            informed=good_kalshi(mirofish_fusion=True)))
+        assert "mirofish_default_50" in err.reasons
+        bare_book = good_kalshi()
+        bare_book.pop("bid")
+        bare_book.pop("ask")
+        err = _refused(lambda: ka.create_order("KXBTCY-1", "yes", 1, 50, informed=bare_book))
+        assert "spread_missing" in err.reasons
+        no_slip = good_kalshi()
+        no_slip.pop("slip")
+        err = _refused(lambda: ka.create_order("KXBTCY-1", "yes", 1, 50, informed=no_slip))
+        assert "slip_missing" in err.reasons
         # Real model FV is not refused just because a side score is 50.
         ka.create_order(
             "KXBTCY-1", "yes", 1, 50,
@@ -249,7 +270,16 @@ def test_fences_sports_oil_fee_gate_demote():
         ka.create_order(
             "KXNBAGAME-1", "yes", 1, 50,
             informed=good_kalshi(
-                series="KXNBAGAME", fmap=sports_map, sports_attestation=True))
+                series="KXNBAGAME", fmap=sports_map, sports_attestation=True,
+                now="2026-09-22T18:00:00+00:00",
+                market={
+                    "status": "active",
+                    "open_time": "2026-09-22T17:00:00+00:00",
+                    "close_time": "2026-09-22T23:00:00+00:00",
+                    "expected_expiration_time": "2026-09-22T20:30:00+00:00",
+                    "can_close_early": True,
+                    "early_close_condition": "game end",
+                }))
         assert posted == [1]
         _env("KALSHI_FEE_MAP_GATE", "1")
         assert kfm.gate_on() is True
@@ -265,13 +295,25 @@ def test_fences_sports_oil_fee_gate_demote():
             "KXTAX-1", "yes", 1, 50,
             informed=good_kalshi(series="KXTAX", fmap=tax_map))
         ledger = {"series": {"KXBTCY": {"n": 5, "score": 0.05}}, "strategy": {}}
+        # Annotate skip stays flag-gated. Create refuses on the evidence itself.
         assert kp.demote_blocks("KXBTCY-1", ledger=ledger) is False
-        ka.create_order(
-            "KXBTCY-1", "yes", 1, 50, informed=good_kalshi(ledger=ledger))
-        _env("KALSHI_FILL_LEDGER_DEMOTE", "1")
         err = _refused(lambda: ka.create_order(
             "KXBTCY-1", "yes", 1, 50, informed=good_kalshi(ledger=ledger)))
         assert "fill_ledger_demote" in err.reasons
+        thin = {"series": {"KXBTCY": {"n": 4, "score": 0.9}}, "strategy": {}}
+        ka.create_order("KXBTCY-1", "yes", 1, 50, informed=good_kalshi(ledger=thin))
+        empty = {"series": {}, "strategy": {}}
+        view = kp.ledger_view("KXBTCY-1", ledger=empty)
+        assert view["empty"] is True and view["score"] is None and view["demote"] is False
+        ka.create_order("KXBTCY-1", "yes", 1, 50, informed=good_kalshi(ledger=empty))
+        missing = kp.ledger_view("KXBTCY-1", path="/tmp/no-such-kalshi-fill-ledger.json")
+        assert missing["missing_file"] is True and missing["empty"] is True and missing["demote"] is False
+        err = _refused(lambda: ka.create_order(
+            "KXBTCY-1", "yes", 1, 50,
+            informed=good_kalshi(fmap=None, fee_map_path="/tmp/no-such-kalshi-fee-map.json")))
+        assert "fee_map_refresh" in err.reasons
+        _env("KALSHI_FILL_LEDGER_DEMOTE", "1")
+        assert kp.demote_blocks("KXBTCY-1", ledger=ledger) is True
     finally:
         ka.post = orig
         unpin_kelly(qe, old)
@@ -295,6 +337,11 @@ def test_ev_floor_uses_preflight():
                           bid=0.50, ask=0.50, slip=0.0)
         assert "ev_below_floor" not in ibc.kalshi_reasons(
             "KXCPI-1", "yes", 1, 50, informed=fat)
+        # 50¢ dome: maker fee is 0 on KXBTCY, but the floor is still above a 1¢ edge.
+        assert "ev_below_floor" in ibc.kalshi_reasons(
+            "KXBTCY-1", "yes", 1, 50, informed=good_kalshi(edge=0.01))
+        assert ibc.kalshi_reasons(
+            "KXBTCY-1", "yes", 1, 10, informed=good_kalshi(edge=0.05)) == []
     finally:
         unpin_kelly(qe, old)
 
@@ -378,6 +425,121 @@ def test_poly_loop_tag_prior_not_eligible():
     unpin_kelly(qe, old)
 
 
+def _roi_conviction():
+    return {
+        "ticker": "KXGDP-27APR29-T4.0",
+        "strategy": "CONVICTION_YES",
+        "side": "yes",
+        "price": 0.17,
+        "edge": 0.80,
+        "roi_pct": 488,
+        "predicted_prob": None,
+        "rationale": "YES@0.17 → 488% ROI if right",
+    }
+
+
+def test_conviction_refuses_without_fv_and_skips_jev():
+    _quiet()
+    calls = []
+    prev = _env("VALEDIA_JEV", "1")
+    prev_k = _env("TYPESAFE_API_KEY", "test-key")
+
+    def boom(*_a, **_k):
+        calls.append(1)
+        raise AssertionError("jev must not run on INFORMED refuse")
+
+    try:
+        pre = ibc.create_preflight(_roi_conviction(), 1, 17, post=boom)
+        assert pre["ok"] is False
+        assert pre["jev"] is None
+        assert "fv_missing" in pre["reasons"] or "fv_source" in pre["reasons"]
+        assert calls == []
+        assert "tag_prior" not in pre["informed"].get("fv_source", "")
+    finally:
+        _restore_env("VALEDIA_JEV", prev)
+        _restore_env("TYPESAFE_API_KEY", prev_k)
+
+
+def test_conviction_allows_with_fv_and_jev_fail_open():
+    _quiet()
+    qe, old = pin_kelly()
+    prev = _env("VALEDIA_JEV", "1")
+    prev_k = _env("TYPESAFE_API_KEY", "test-key")
+    opp = good_kalshi(strategy="CONVICTION_YES", ticker="KXBTCY-1", side="yes", price=0.50)
+    try:
+        off = _env("VALEDIA_JEV", None)
+        try:
+            pre = ibc.create_preflight(opp, 1, 50, post=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("off")))
+            assert pre["ok"] is True
+            assert pre["jev"] is None
+        finally:
+            _restore_env("VALEDIA_JEV", off)
+
+        def boom(*_a, **_k):
+            raise TimeoutError("slow")
+
+        pre = ibc.create_preflight(opp, 1, 50, post=boom)
+        assert pre["ok"] is True
+        assert pre["jev"]["fail_open"] is True
+        assert pre["jev"]["enabled"] is True
+
+        def stand(*_a, **_k):
+            return {"model": "jev-1.13.0", "answers": {
+                "action": {"choice": "stand_down", "confidence": 0.9},
+                "stand_down": {"noul": 0.99},
+                "report_usable": {"noul": 0.2},
+                "we_are_the_exit": {"noul": 0.1},
+            }}
+
+        pre = ibc.create_preflight(opp, 1, 50, post=stand)
+        assert pre["ok"] is True
+        assert pre["jev"]["action"] == "stand_down"
+        assert pre["jev"]["fail_open"] is False
+    finally:
+        unpin_kelly(qe, old)
+        _restore_env("VALEDIA_JEV", prev)
+        _restore_env("TYPESAFE_API_KEY", prev_k)
+
+
+def test_executor_conviction_create_path():
+    _quiet()
+    import kalshi_executor as ex
+    posted = []
+    orig_c, orig_s = ex.create_order, ex._size_contracts
+    ex._size_contracts = lambda *a, **k: 1
+    ex.create_order = lambda **k: posted.append(k) or {"order_id": "nope"}
+    ex.get_fills = lambda: {"fills": []}
+    state = {"max_per_trade": 10, "max_deployable": 10, "balance": 100}
+    qe, old = pin_kelly()
+    prev = _env("VALEDIA_JEV", "1")
+    prev_k = _env("TYPESAFE_API_KEY", "test-key")
+    import jev_shadow as jev
+    real_post = jev.http_post
+    jev.http_post = lambda *_a, **_k: (_ for _ in ()).throw(TimeoutError("slow"))
+    try:
+        refused = ex.execute_trade(_roi_conviction(), state, dry_run=False)
+        assert refused["status"] == "SKIP_INFORMED"
+        assert posted == []
+        opp = good_kalshi(strategy="CONVICTION_YES", ticker="KXBTCY-1", side="yes", price=0.50)
+        allowed = ex.execute_trade(opp, state, dry_run=False)
+        assert allowed["status"] in ("EXECUTED", "UNRECONCILED")
+        assert posted and posted[-1]["informed"]["fv_source"] == "model"
+        assert allowed["jev"]["fail_open"] is True
+        exe = open(os.path.join(HERE, "kalshi_executor.py")).read()
+        alloc = open(os.path.join(HERE, "master_allocator.py")).read()
+        arb = open(os.path.join(HERE, "latency_arb.py")).read()
+        assert "informed_before_create" in exe and "create_preflight" in exe
+        assert "create_preflight" in alloc
+        assert "jev_shadow" not in exe
+        assert "jev_shadow" not in arb and "create_preflight" not in arb
+    finally:
+        ex.create_order, ex._size_contracts = orig_c, orig_s
+        jev.http_post = real_post
+        unpin_kelly(qe, old)
+        _restore_env("VALEDIA_JEV", prev)
+        _restore_env("TYPESAFE_API_KEY", prev_k)
+
+
 if __name__ == "__main__":
     test_hygiene_and_snapshot()
     test_bare_kalshi_create_does_not_post()
@@ -386,4 +548,7 @@ if __name__ == "__main__":
     test_ev_floor_uses_preflight()
     test_poly_stays_blocked_and_informed()
     test_poly_loop_tag_prior_not_eligible()
+    test_conviction_refuses_without_fv_and_skips_jev()
+    test_conviction_allows_with_fv_and_jev_fail_open()
+    test_executor_conviction_create_path()
     print("INFORMED-BEFORE-CREATE: PASS")

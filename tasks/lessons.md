@@ -82,3 +82,5 @@ Standing rule going forward: no accuracy claim or sizing change is admissible un
 fee-inclusive, fill-reconciled forward-test ledger (forward_test_ledger.py) shows it.
 
 [2026-09-17] | Plan said do not auto-unblacklist weather/oil | Burton override: a blacklist is a pause, not a grave. Re-enable evaluation/sizing when TTL expires or fee-true net recovers. Do not re-arm Slice 8 live writers (weather create_order / scalper alp_buy). Pause on net, never WR after 3 trades.
+[2026-09-30] | Laya /health failed while a decide was still on the single sync worker | Do not stack a probe decide in front of the scan. Hit /health only when the worker is idle.
+[2026-09-30] | Hermes venv python App Data TCC is a separate identity from Hermes.app; FDA on the app bundle does not cover adhoc venv python. LaunchAgent PATH had no rg so search_files spawned /usr/bin/find. Fence find/search away from ~/Library/Containers instead of granting more TCC.

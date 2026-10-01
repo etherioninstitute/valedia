@@ -11,6 +11,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import kalshi_auth as ka
 import kalshi_fee_map as kfm
 import valedia_config as vc
@@ -165,17 +168,19 @@ def test_allocator_and_score_consult():
 
 
 def test_hygiene():
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.WEATHER_LIVE is False
     assert vc.MIROFISH_AUTO_RAISE is False
-    assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
+    assert vc.POLYMARKET_US_LIVE is False
     src = open(os.path.join(HERE, "kalshi_fee_map.py")).read()
     assert "create_order" not in src
     assert "VALEDIA_TRADING_HALT" not in src
     assert "KALSHI_FEE_MAP_GATE=True" not in open(os.path.join(HERE, "valedia_config.py")).read()
     cfg = open(os.path.join(HERE, "valedia_config.py")).read()
     assert "KALSHI_FEE_MAP_GATE = False" in cfg
+    assert "POLYMARKET_US_LIVE = False" in cfg
+    assert "POLYMARKET_US_LIVE = True" not in cfg
 
 
 def test_refresh_dry_persists_counts():

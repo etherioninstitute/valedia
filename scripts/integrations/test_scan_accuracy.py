@@ -13,6 +13,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import valedia_config as vc
 import master_allocator as ma
 import kalshi_executor as ke
@@ -43,7 +46,7 @@ def _opp(ticker, strategy, price, edge, title="t"):
 
 def test_hygiene_and_version():
     _restore_writers()
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.WEATHER_LIVE is False
     import polymarket_us_client as pmu
     assert pmu.live_enabled() is False

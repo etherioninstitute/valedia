@@ -292,8 +292,10 @@ def scan_for_edges(bankroll=300, min_edge_cents=3):
     # Load intelligence for probability estimation
     intel_sources = []
     try:
-        mf = json.load(open(os.path.join(MODELS, "mirofish_signal.json")))
-        intel_sources.append(("MiroFish", mf.get("overall_bias", 50) / 100, effective_mirofish_weight()))  # capped until proven; valedia_config
+        import mirofish_intel_archive as _mia
+        mf = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json"))
+        if mf:
+            intel_sources.append(("MiroFish", mf.get("overall_bias", 50) / 100, effective_mirofish_weight()))  # capped until proven; valedia_config
     except: pass
     try:
         ere = json.load(open(os.path.join(MODELS, "latest_etherion_risk.json")))

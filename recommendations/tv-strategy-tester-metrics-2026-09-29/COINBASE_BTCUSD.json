@@ -1,0 +1,96 @@
+{
+  "symbol": "COINBASE:BTCUSD",
+  "asset_class": "crypto",
+  "venue_label": "Coinbase",
+  "ts": "2026-09-29T20:17:31.679156",
+  "set_symbol_rc": 0,
+  "set_symbol_out": "{\n  \"success\": true,\n  \"symbol\": \"COINBASE:BTCUSD\",\n  \"chart_ready\": false\n}\n",
+  "live_symbol": "COINBASE:BTCUSD",
+  "resolution": "D",
+  "studies": [
+    "GROK SuperTrend Strategy paper",
+    "Chart Patterns [Tradevisor] \u2014 Auto Detection, Measured Targets & Entry Signals",
+    "Overlay",
+    "Volume"
+  ],
+  "strategy_ok": true,
+  "metric_count": 19,
+  "strategy_name": "GROK SuperTrend Strategy paper",
+  "metrics": {
+    "net_profit": 3212.0805727460956,
+    "net_profit_percent": 0.32120805727460955,
+    "gross_profit": 13448.114412427698,
+    "gross_loss": 10236.033839681602,
+    "profit_factor": 1.313801285053783,
+    "max_drawdown": 1688.6446227200013,
+    "max_drawdown_percent": 0.16886446227200014,
+    "total_trades": 101,
+    "winning_trades": 41,
+    "losing_trades": 60,
+    "percent_profitable": 0.40594059405940597,
+    "avg_trade": 31.80277795,
+    "largest_win": 2056.9345633559997,
+    "largest_loss": 1307.8312842740002,
+    "commission_paid": 252.28330782389995,
+    "sharpe_ratio": 0.031303857117790164,
+    "sortino_ratio": 0.058085672267823414,
+    "buy_hold_return": 6921878.305645821,
+    "open_pl": 330.76058056
+  },
+  "strategy_error": null,
+  "last": 83182.54,
+  "quote": {
+    "symbol": "COINBASE:BTCUSD",
+    "last": 83182.54,
+    "volume": 361.40907259
+  },
+  "trade_count_sample": 5,
+  "trades_sample": [
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 72683.26,
+      "qty": 0.033182,
+      "time_index": 97
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 65956.94,
+      "qty": 0.038368,
+      "time_index": 98
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 74446,
+      "qty": 0.037533,
+      "time_index": 99
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 75443.91,
+      "qty": 0.034806,
+      "time_index": 100
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 66516.18,
+      "qty": 0.037143,
+      "time_index": 101
+    }
+  ],
+  "symbol_requested": "COINBASE:BTCUSD"
+}

@@ -1,0 +1,30 @@
+
+======== 2026-09-28 23:05:10 PDT ========
+cwd: /Users/burtonchatelain/.openclaw/workspace-v2
+task: FLUX FREE REFERENCE DEEPEN (read-only packs; no trading/live).
+
+Existing draft to improve (do not delete packs):
+/Users/burtonchatelain/Library/CloudStorage/ProtonDrive-burtworthy@protonmail.com-folder/AI/Flux-Growth-Collection/FLUX-GROWTH-FREE-REFERENCE.md
+Companion index: FLUX-GROWTH-FREE-INDEX.json same folder.
+Source packs: same Flux-Growth-Collection folder.
+
+DEEPEN: open each pack README + key entry files; huge packs one level deeper; enrich enables/when-to-use; add implement notes (entry commands/files); keep Purpose map; fix wrong titles; all 33 items; evidence only.
+
+Overwrite BOTH ProtonDrive reference+index AND /Users/burtonchatelain/MemPalace/sources/shared-brain/ copies. Append status paragraph to $VALEDIA/recommendations/GROK-STATUS.md when done.
+==============================================
+I'll deepen the Flux free reference from the packs themselves: read the draft, index, and each pack's entry files, then overwrite both copies with evidence-only notes.The draft is a 33-item catalog. Next I’ll open each pack’s README and entry files and correct titles from those sources.A 23:05 pass already rewrote the catalog. I’ll check those claims against the pack files and deepen anything that is still thin or wrong.The 23:05 catalog is mostly sourced, but a few claims stop short of the files. I’ll fill those gaps: Uncaged parts 3–4, the ECC expansion, the 25 DM count, studio `pipeline/bin` commands, and which arena scripts actually sit in `examples/` versus `bin/`.The free-store catalog is deepened from the pack files and written to both homes. All **33** items stay. The purpose map is unchanged. Nothing in the packs was run.
+
+**Corrected against the files**
+
+- Cold DMs are 25 numbered scripts: openers 1–5, value-first 6–9, follow-ups 10–13, booking 14–16, warm 17–19, re-engagement 20–22, niche 23–25, then the personalization prompt.
+- Uncaged parts 3 and 4 are now in the entry: fleet plus recipient-layer checks, one outcome and one price, do not discount under the floor.
+- ECC is **Everything Claude Code** (`github.com/affaan-m/ECC`). The operator file has sections 0–10, including the `SM-[n]` experiment card and the eight sentience proxies.
+- Studio shot packs use `generate-shot-pack.cjs --concept=...` (`--shots`, `--aspect`, `--frames`, `--pic`, `--character`). `lf-assemble.cjs` takes a positional slug; the script header calls the draft **854×480**. `pipeline/bin/` commands are recorded, including the ones that exit without `memory/reel-publish-kit.json`.
+- Arena `bin/` is 17 scripts. The spec’s checked tools, plus `arena-critics-evolve.cjs`, are under `examples/` (the README says read those, do not run them). `harvest-yt-thumbnails.cjs` and `arena-rl-pipeline.cjs` are not in the pack. `examples/arena-rl-cycle.cjs` is a different file.
+
+**Written**
+
+- `.../Flux-Growth-Collection/FLUX-GROWTH-FREE-REFERENCE.md` and `FLUX-GROWTH-FREE-INDEX.json`
+- The same two files under `MemPalace/sources/shared-brain/`
+- Status paragraph appended to `recommendations/GROK-STATUS.md`
+GROK_EXIT:0

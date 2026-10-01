@@ -1,0 +1,61 @@
+//@version=5
+// PAPER. Boilerplate-shaped gates (inverse flip, MDD, session, RiskMTip, kill).
+// Engine: Trendhoo_45M. Not Waddah_1H_Anchor. Not TopG_5M_Scalp. No webhook.
+// Passphrase is a sentinel. Replace it in the TradingView alert dialog only.
+strategy("DAVIDDTECH Trendhoo_45M paper", overlay=true, pyramiding=0, process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// ponytail: PDF names Trendhoo SOL 45MIN and publishes stats only (WR 50.54, PF 1.109, 368 trades, net 154.69%). No lengths.
+// ponytail: EMA 21/55 is a public stand-in. Run the chart on 45m. Real Trendhoo source is not in the workspace.
+// ponytail: ATR(22) x 3 and the 5-bar swing buffer are the Waddah example. PDF does not publish a Trendhoo stop.
+// ponytail: tp1 / tp2 / breakeven strings omitted. JSON stays entry|exit. portfolio_risk 0.3 is the PDF 30% allocation.
+
+invFlip = input.bool(false, "Inverse flip")
+kill = input.bool(false, "Kill switch")
+maxPercDd = input.float(15.0, "maxPercDdTip", minval=0.1, step=0.1)
+useSession = input.bool(false, "Session filter")
+sess = input.session("0800-1600", "Session")
+riskMTip = input.float(1.5, "RiskMTip", minval=0.1, step=0.1)
+atpStopMult = input.float(3.0, "atp_stop_mult", minval=0.1, step=0.1)
+fastLen = input.int(21, "Fast EMA", minval=1)
+slowLen = input.int(55, "Slow EMA", minval=1)
+
+ALERT_ENTRY = '{"passphrase":"PASTE_PASSPHRASE_IN_TV_ALERT","timestamp":"{{timenow}}","strategy_id":"Trendhoo_45M","ticker":"{{ticker}}","action":"entry","subaccount":"paper","entry_price":{{close}},"volume":{{strategy.order.contracts}},"portfolio_risk":0.3}'
+
+f_alert(action) =>
+    str.replace(ALERT_ENTRY, '"action":"entry"', '"action":"' + action + '"')
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+rawLong = fast > slow
+rawShort = fast < slow
+wantLong = invFlip ? rawShort : rawLong
+wantShort = invFlip ? rawLong : rawShort
+
+var float peakEq = na
+peakEq := math.max(nz(peakEq, strategy.initial_capital), strategy.equity)
+ddPct = peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100.0 : 0.0
+inSess = not useSession or not na(time(timeframe.period, sess))
+allow = not kill and ddPct < maxPercDd and inSess and not na(fast) and not na(slow)
+
+float stopDist = ta.atr(22) * atpStopMult
+float qty = stopDist > 0 ? (strategy.equity * riskMTip / 100.0) / stopDist : 1.0
+float swingLow = ta.lowest(low, 5)[1]
+float swingHigh = ta.highest(high, 5)[1]
+
+if allow and wantLong and not wantShort and strategy.position_size == 0
+    strategy.entry("L", strategy.long, qty=qty, alert_message=f_alert("entry"))
+if allow and wantShort and not wantLong and strategy.position_size == 0
+    strategy.entry("S", strategy.short, qty=qty, alert_message=f_alert("entry"))
+
+if strategy.position_size > 0 and wantShort
+    strategy.close("L", alert_message=f_alert("exit"))
+if strategy.position_size < 0 and wantLong
+    strategy.close("S", alert_message=f_alert("exit"))
+
+if strategy.position_size > 0
+    strategy.exit("XL", from_entry="L", stop=math.min(strategy.position_avg_price - stopDist, swingLow), alert_message=f_alert("exit"))
+if strategy.position_size < 0
+    strategy.exit("XS", from_entry="S", stop=math.max(strategy.position_avg_price + stopDist, swingHigh), alert_message=f_alert("exit"))
+
+plot(fast, "Fast EMA", color=color.teal)
+plot(slow, "Slow EMA", color=color.gray)

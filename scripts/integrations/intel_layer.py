@@ -26,7 +26,11 @@ class IntelLayer:
     
     def __init__(self):
         self.ere = _load_json("latest_etherion_risk.json")
-        self.mirofish = _load_json("mirofish_signal.json")
+        try:
+            import mirofish_intel_archive as _mia
+            self.mirofish = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json")) or {}
+        except Exception:
+            self.mirofish = {}
         self.fusion = _load_json("latest_fusion.json")
         self.retrain = _load_json("latest_retrain.json")
         self.hedge = _load_json("hedge_fund_intel.json")

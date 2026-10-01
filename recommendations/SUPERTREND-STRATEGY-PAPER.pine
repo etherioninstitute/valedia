@@ -1,0 +1,49 @@
+//@version=6
+// PAPER/INTEL ONLY. Classic ATR SuperTrend trail for Strategy Tester.
+// Not an order sender. No webhook. No venue live.
+strategy("GROK SuperTrend Strategy paper", overlay=true, pyramiding=0,
+     process_orders_on_close=true, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10, initial_capital=10000, commission_type=strategy.commission.percent,
+     commission_value=0.1)
+
+atrPeriod = input.int(10, "ATR Length", minval=1)
+factor = input.float(3.0, "Factor", minval=0.1, step=0.1)
+src = input.source(hl2, "Source")
+
+atr = ta.atr(atrPeriod)
+upperBand = src + factor * atr
+lowerBand = src - factor * atr
+
+var float st = na
+var int dir = 1
+prevUpper = nz(upperBand[1], upperBand)
+prevLower = nz(lowerBand[1], lowerBand)
+upperBand := upperBand < prevUpper or close[1] > prevUpper ? upperBand : prevUpper
+lowerBand := lowerBand > prevLower or close[1] < prevLower ? lowerBand : prevLower
+
+if na(st[1])
+    dir := 1
+    st := lowerBand
+else if dir[1] == 1
+    if close < lowerBand
+        dir := -1
+        st := upperBand
+    else
+        dir := 1
+        st := lowerBand
+else
+    if close > upperBand
+        dir := 1
+        st := lowerBand
+    else
+        dir := -1
+        st := upperBand
+
+plot(st, "SuperTrend", color=dir == 1 ? color.green : color.red, linewidth=2)
+longCond = dir == 1 and dir[1] == -1
+shortCond = dir == -1 and dir[1] == 1
+
+if longCond
+    strategy.entry("L", strategy.long)
+if shortCond
+    strategy.entry("S", strategy.short)

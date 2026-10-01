@@ -1,0 +1,99 @@
+# Valedia local model switch (Burton 2026-09-18; dual-load 2026-09-19)
+
+**Goal:** one command to see and switch the local models Valedia/Hermes depend on — without touching trading fences or venue keys. Physical load/offload is separate from Hermes `model.default`.
+
+## Two layers
+
+| Layer | Tool | What it does |
+|-------|------|----------------|
+| **RAM load** | `~/bin/lms-thin-load.sh <lane>` | Unload/load GGUFs in Bionic/LMS (`lms`) |
+| **Agent default** | `scripts/valedia_models.sh hermes <id>` | Sets Hermes `model.default` to match what you loaded |
+
+Agents (Hermes, Valedia chat, RuVocal) do **not** auto-pick Q5 vs Q4. They call `:1234` with a model id. You (or a script/cron) pick the **lane** first.
+
+## Load lanes (`lms-thin-load.sh`)
+
+| Lane | Loads | When |
+|------|-------|------|
+| `solo` / `ornith` / `cron` | Ornith **Q5** (`ORNITH_SOLO_KEY`, default `ornith-1.5-k-m`) @ 131k ctx | Ornith-only quality |
+| `dual` | Ornith **Q4** + companion (~17GB) | Need Ornith **and** a second model |
+| `companion` | Companion only | Coding / 27B without Ornith |
+| `coding` / `hermes` / `valedia` | `qwen3.8-27b-obliterated-k` | Existing chat/coding |
+| `turbo` / `ruvocal` | turbo-coder (or twin-turbo fallback) | RuVocal |
+| `status` / `unload` / `roster` | ops | inspect / clear / print keys |
+
+**Hard rule (LLM Stack):** never co-load Ornith Q5 + ~17GB companion. `dual` refuses if `ORNITH_DUAL_KEY == ORNITH_SOLO_KEY`.
+
+### Planned Hub files (M2 dual + download)
+
+From `ornith-ai/Ornith-1.5-35B-A3B-GGUF`:
+
+- `Ornith-1.5-35B-Q5_K_M.gguf` → LMS key `ornith-1.5-k-m` (already on M1) or alias `ornith-1.5-q5-k-m`
+- `Ornith-1.5-35B-Q4_K_M.gguf` → LMS key **`ornith-1.5-q4-k-m`** (required for `dual`)
+- `mmproj-Ornith-1.5-35B-BF16.gguf` → `ornith-1.5-mmproj`
+
+Companion: `unsloth/Qwen3.8-27B-GGUF` → `Qwen3.8-27B-UD-Q4_K_XL.gguf` (~17.6GB) → LMS key **`qwen3.8-27b-ud-q4-k-xl`**.
+
+Until those keys exist: override, e.g.
+
+```bash
+COMPANION_KEY=qwen3.8-27b-twin-turbo-fable-cold-fusion-709-l-uncensored-nm-dau-neo-mtp \
+  lms-thin-load.sh companion
+```
+
+(`dual` still needs `ornith-1.5-q4-k-m` in the library — download Q4 first.)
+
+```bash
+lms-thin-load.sh roster     # resolved keys + library
+lms-thin-load.sh solo       # Q5 Ornith only
+lms-thin-load.sh dual       # Q4 + companion (after keys exist)
+lms-thin-load.sh companion  # ~17GB only
+lms-thin-load.sh unload
+```
+
+## Config lanes (`valedia_models.sh`)
+
+| Lane | Config surface | Endpoint |
+|------|----------------|----------|
+| **Hermes / Valedia chat** | `~/.hermes/config.yaml` → `model.default` + `custom:lms-local` | LMS `:1234` |
+| **RuVocal** | RuVocal / LMS loaded model (turbo-coder) | LMS `:1234` |
+| **MiroFish** | env: `LLM_MODEL_NAME`, `MIROFISH_REPORT_MODEL` | Bionic primary / Ollama fallback |
+| **neural-trader** | CLI only (no LLM agent personas) | native NAPI |
+
+Trading flags (`SPOT_RECONCILE_HTTP`, writers, etc.) are **out of scope** for this switcher.
+
+## CLI (`valedia_models.sh`)
+
+```bash
+scripts/valedia_models.sh list          # LMS + MiroFish tags
+scripts/valedia_models.sh show          # current Hermes default + MiroFish models
+scripts/valedia_models.sh hermes <id>   # set Hermes model.default (backup first)
+scripts/valedia_models.sh mirofish-sync <tag> [--write]
+scripts/valedia_models.sh mirofish-report <tag> [--write]
+```
+
+Presets (names only — resolve to real LMS/Ollama ids at runtime):
+
+| Preset | Hermes (LMS) | MiroFish sync | MiroFish report |
+|--------|--------------|---------------|-----------------|
+| `chat` | `qwen3.8-27b-obliterated-k` | `qwen3-8b-mf:latest` | `ornith-1.5-mf:latest` |
+| `reason` / solo | `ornith-1.5-k-m` (Q5) | unchanged | `ornith-1.5-mf:latest` |
+| `dual` | Ornith Q4 id **and** companion available on `:1234` | unchanged | unchanged |
+| `turbo` | twin-turbo / coder id if loaded | unchanged | unchanged |
+
+After `lms-thin-load.sh dual`, set Hermes to the id you want as *default* reply model (usually Ornith Q4 or companion), knowing both are loaded for API selection.
+
+## Rules
+
+1. Always backup config before write (`*.bak-modelswitch-<ts>`).
+2. Refuse unknown ids not returned by `list` / `lms ls`.
+3. Never change `EXEC_DRY_RUN`, writers, or API keys.
+4. RuVocal: document “load this in LMS” if API can’t hot-swap; don’t fight LMS UI.
+5. **RAM:** `solo` = Q5 only; `dual` = Q4 + ~17GB; never Q5 + ~17GB.
+6. LM Link: M2 can host Ornith; M1 keeps Flash-Next / chat — still use the same lane names; keys must exist on the machine that loads.
+
+## Success
+
+- Burton can `lms-thin-load.sh solo|dual|companion` without opening the LMS UI.
+- Hermes default stays one command via `valedia_models.sh`.
+- Dual-load is explicit and refuses the unsafe Q5+companion combo.

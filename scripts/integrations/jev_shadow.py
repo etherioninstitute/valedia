@@ -89,6 +89,14 @@ def _model():
 
 
 def _load_openclaw_env():
+    """Load ~/.openclaw/.env via setdefault. Prefer valedia_config wire."""
+    try:
+        import valedia_config as vc
+        if hasattr(vc, "ensure_openclaw_env"):
+            vc.ensure_openclaw_env()
+            return
+    except Exception:
+        pass
     path = os.path.expanduser("~/.openclaw/.env")
     if not os.path.exists(path):
         return
@@ -202,6 +210,113 @@ def annotate(doc, post=None):
     except Exception as e:
         doc["jev"] = _fail(type(e).__name__)
     return doc
+
+
+WEATHER_QUESTIONS = {
+    "agree": {
+        "type": "choice",
+        "instructions": (
+            "Given settle value, research tags, and the book price, do they agree? "
+            "Shadow only. Do not send."
+        ),
+        "criteria": {
+            "agree": "Settle and research point the same way versus the book.",
+            "disagree": "Settle and research conflict, or the book is the other side.",
+            "abstain": "Not enough to say.",
+        },
+    },
+    "confidence": {
+        "type": "noul",
+        "instructions": "Is that agree/disagree read confident? Shadow only.",
+        "criteria": {
+            "true": "Confident.",
+            "false": "Not confident.",
+        },
+    },
+    "status_honesty": {
+        "type": "choice",
+        "instructions": (
+            "Is the settlement status honest (final or observation), "
+            "or is a forecast being treated as final?"
+        ),
+        "criteria": {
+            "honest": "Final or observation, and research stays research.",
+            "forecast_as_final": "A forecast is being used as if it settled.",
+            "missing": "No settle value.",
+        },
+    },
+}
+
+
+def weather_state(bundle):
+    """Tiny weather bundle. No rules text, no keys, no order."""
+    b = bundle if isinstance(bundle, dict) else {}
+    sf = b.get("settlement_fv") if isinstance(b.get("settlement_fv"), dict) else {}
+    tags = []
+    for t in (b.get("research_tags") or [])[:6]:
+        if isinstance(t, dict):
+            tags.append(t.get("source"))
+    return {
+        "ticker": b.get("ticker"),
+        "settle_source": sf.get("source"),
+        "settle_value": sf.get("value"),
+        "settle_confidence": sf.get("confidence"),
+        "metric": sf.get("metric"),
+        "fv": b.get("fv"),
+        "price": b.get("price"),
+        "fee_true_ev": b.get("fee_true_ev"),
+        "tag": b.get("tag"),
+        "research": tags,
+    }
+
+
+def parse_weather_answers(body):
+    ans = (body or {}).get("answers") or {}
+    agree = ans.get("agree") or {}
+    honest = ans.get("status_honesty") or {}
+    return {
+        "enabled": True,
+        "fail_open": False,
+        "oms": False,
+        "model": (body or {}).get("model") or _model(),
+        "agree": agree.get("choice"),
+        "confidence": agree.get("confidence"),
+        "confidence_noul": _noul(ans, "confidence"),
+        "status_honesty": honest.get("choice"),
+    }
+
+
+def annotate_weather(bundle, post=None):
+    """Shadow stamp on a weather row. Off = identity. Fail-open.
+
+    Adds `jev` only. Does not resize, veto, or send. Agree is not a pass.
+    """
+    if not jev_on():
+        return bundle
+    bundle = dict(bundle or {})
+    key = api_key()
+    if not key:
+        bundle["jev"] = _fail("no_key")
+    else:
+        fn = post or http_post
+        try:
+            body = fn(
+                SYSTEMONE_URL,
+                {"state": weather_state(bundle), "model": _model(), "questions": WEATHER_QUESTIONS},
+                {
+                    "Authorization": "Bearer " + key,
+                    "Content-Type": "application/json",
+                },
+                _timeout(),
+            )
+            if not isinstance(body, dict) or "answers" not in body:
+                bundle["jev"] = _fail("bad_response")
+            else:
+                bundle["jev"] = parse_weather_answers(body)
+        except Exception as e:
+            bundle["jev"] = _fail(type(e).__name__)
+    bundle["jev"]["oms"] = False
+    return bundle
 
 
 def attach_to_signal(signal_doc, post=None):

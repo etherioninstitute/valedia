@@ -637,8 +637,10 @@ def run_brain():
     # MiroFish
     mirofish_signals = {}
     try:
+        import mirofish_intel_archive as _mia
         mfp = os.path.join(SYS["models_dir"], "mirofish_signal.json")
-        with open(mfp) as f: mf = json.load(f)
+        view = _mia.freshness_of(mfp)
+        mf = _mia.load_for_fv(mfp) or {}
         if mf.get("status") == "active":
             mirofish_signals = mf.get("signals", {})
             acc_note = ""
@@ -652,6 +654,10 @@ def run_brain():
                 acc_note = ""
             lines.append(f"MIROFISH: bias={mf.get('overall_bias',50):.0f} "
                          f"({len(mirofish_signals)} assets){acc_note}")
+        else:
+            lines.append(
+                "MIROFISH: not fuel stale=%s age_s=%s usable_for_fv=%s"
+                % (view.get("stale"), view.get("age_s"), view.get("usable_for_fv")))
     except Exception as e:
         lines.append(f"MIROFISH: signal unavailable — {str(e)[:50]}")
 

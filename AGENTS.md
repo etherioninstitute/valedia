@@ -224,3 +224,7 @@ After any correction from Burton, write to `tasks/lessons.md` immediately:
 ```
 
 Never make the same mistake twice.
+
+## Grok Build executor
+
+Burton: **Grok Build is the executor** — it codes and merges Valedia to a working system. This chat architects/audits/relays. See `recommendations/GROK-BUILD-LANE.md` and `recommendations/VALEDIA-SUBSUME-NAUTILUS.md`. North star: maximum profit under Valedia gates. Live risk = Valedia runtime only.

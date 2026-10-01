@@ -1,0 +1,53 @@
+=== 9077 ===
+COMMAND     PID            USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3.1 38059 burtonchatelain   20u  IPv4 0x837f0849e4e1d9b7      0t0  TCP 127.0.0.1:9077 (LISTEN)
+=== curl ===
+HTTP:200
+{"status":"healthy","database":"connected","db_acquire_ms":0.7,"db_pool_waiting":0,"db_pool_in_use":0,"db_pool_max":100,"db_pool_idle":5}
+=== diag ===
+{"ts":"2026-09-28T19:32:36.978Z","harness":"grok-build","event":"reflect_failed","ms":20,"bank":"coding-agent::workspace","timeoutMs":20000,"error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)","query":"DIAGNOSE ONLY — do not change any files, do not write MemPalace, do not trade, d"}
+{"ts":"2026-09-28T19:32:36.979Z","harness":"grok-build","event":"pages_failed","ms":1,"error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:36.997Z","harness":"deepen","event":"deepen_started","bank":"coding-agent::workspace"}
+{"ts":"2026-09-28T19:32:37.008Z","harness":"grok-build","event":"daemon_start_spawned","apiUrl":"http://127.0.0.1:9077"}
+{"ts":"2026-09-28T19:32:37.019Z","harness":"deepen","event":"deepen_failed","bank":"coding-agent::workspace","error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:37.021Z","harness":"deepen","event":"deepen_started","bank":"coding-agent::workspace"}
+{"ts":"2026-09-28T19:32:37.043Z","harness":"deepen","event":"deepen_failed","bank":"coding-agent::workspace","error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:37.058Z","harness":"claude-code","event":"reflect_failed","ms":21,"bank":"coding-agent::workspace","timeoutMs":20000,"error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)","query":"DIAGNOSE ONLY — do not change any files, do not write MemPalace, do not trade, d"}
+{"ts":"2026-09-28T19:32:37.059Z","harness":"claude-code","event":"pages_failed","ms":1,"error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:37.076Z","harness":"deepen","event":"deepen_started","bank":"coding-agent::workspace"}
+{"ts":"2026-09-28T19:32:37.103Z","harness":"deepen","event":"deepen_failed","bank":"coding-agent::workspace","error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:37.108Z","harness":"deepen","event":"deepen_started","bank":"coding-agent::workspace"}
+{"ts":"2026-09-28T19:32:37.137Z","harness":"deepen","event":"deepen_failed","bank":"coding-agent::workspace","error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)"}
+{"ts":"2026-09-28T19:32:49.069Z","harness":"grok-build","event":"session_start","bank":"coding-agent::workspace","pages":0,"ms":36}
+{"ts":"2026-09-28T19:32:49.194Z","harness":"claude-code","event":"daemon_start_spawned","apiUrl":"http://127.0.0.1:9077"}
+{"ts":"2026-09-28T19:33:01.246Z","harness":"claude-code","event":"session_start","bank":"coding-agent::workspace","pages":0,"ms":27}
+{"ts":"2026-09-28T19:33:07.999Z","harness":"grok-build","event":"daemon_start_spawned","apiUrl":"http://127.0.0.1:9077"}
+{"ts":"2026-09-28T19:33:48.112Z","harness":"grok-build","event":"retain_failed","ms":11,"error":"fetch failed: connect ECONNREFUSED 127.0.0.1:9077 (ECONNREFUSED)","session":"01a0e981-3e82-71d1-a367-3ea017ad61ac"}
+{"ts":"2026-09-28T19:33:48.362Z","harness":"claude-code","event":"daemon_start_spawned","apiUrl":"http://127.0.0.1:9077"}
+{"ts":"2026-09-28T19:34:29.122Z","harness":"grok-build","event":"daemon_start_spawned","apiUrl":"http://127.0.0.1:9077"}
+{"ts":"2026-09-28T19:35:46.184Z","harness":"grok-build","event":"daemon_start_failed","error":"Error: daemon.start failed with code 1: \u001b[?25l╭─────────────────── \u001b[1mStarting Daemon\u001b[0m...<truncated len=353286>
+{"ts":"2026-09-28T19:35:50.822Z","harness":"grok-build","event":"daemon_started","apiUrl":"http://127.0.0.1:9077","profile":"coding-agent"}
+{"ts":"2026-09-28T19:35:50.918Z","harness":"claude-code","event":"daemon_started","apiUrl":"http://127.0.0.1:9077","profile":"coding-agent"}
+{"ts":"2026-09-28T19:35:50.941Z","harness":"grok-build","event":"daemon_started","apiUrl":"http://127.0.0.1:9077","profile":"coding-agent"}
+{"ts":"2026-09-28T19:35:51.191Z","harness":"claude-code","event":"daemon_started","apiUrl":"http://127.0.0.1:9077","profile":"coding-agent"}
+
+=== pids ===
+39157       01:31 /Users/burtonchatelain/.pg0/installation/18.1.0/bin/postgres -D /Users/burtonchatelain/.pg0/instances/hindsight-embed-coding-agent/data -F -p 5432 -c log_filename
+39924       00:01 /bin/zsh -c builtin export PATH="/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"; snap=$(command cat <&3); builtin unsetopt aliases 2>/dev/null; builtin unalias -m 
+39953       00:00 /usr/bin/awk BEGIN{IGNORECASE=1} /hindsight-embed|daemon-start\.js|profiles\/coding-agent/ {print substr($0,1,180)}
+=== profile log ===
+2026-09-28 12:35:48,349 - INFO - root - DB pool metrics configured
+2026-09-28 12:35:48,353 - INFO - hindsight.loop_watchdog - Loop watchdog started (stall_threshold=1.00s, poll_interval=0.25s)
+2026-09-28 12:35:48,353 - INFO - root - Worker id: Burtons-Mac-Studio-M1 (source: hostname (default))
+2026-09-28 12:35:48,356 - INFO - root - Worker poller started (worker_id=Burtons-Mac-Studio-M1)
+2026-09-28 12:35:48,356 - INFO - root - Tenant extension started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:9077 (Press CTRL+C to quit)
+2026-09-28 12:35:48,366 - INFO - hindsight_api.worker.poller - Worker Burtons-Mac-Studio-M1 starting polling loop (max_slots=10, reservations=[consolidation=2], shared_pool=8)
+2026-09-28 12:35:48,874 - INFO - hindsight_api.worker.poller - [WORKER_STATS] worker=Burtons-Mac-Studio-M1 slots=0/10 | reserved: [consolidation=0/2(avail=2)] | shared=0/8(avail=8)
+Error: cannot bind 127.0.0.1:9077: [Errno 48] Address already in use
+2026-09-28 12:36:06,661 - INFO - hindsight_api.engine.maintenance - Maintenance: retention took 0.007s
+2026-09-28 12:36:06,665 - INFO - hindsight_api.engine.maintenance - Maintenance: consolidation reconcile took 0.004s
+2026-09-28 12:36:06,668 - INFO - hindsight_api.engine.maintenance - Maintenance: scheduled mental model refresh took 0.003s
+2026-09-28 12:36:19,078 - INFO - hindsight_api.worker.poller - [WORKER_STATS] worker=Burtons-Mac-Studio-M1 slots=0/10 | reserved: [consolidation=0/2(avail=2)] | shared=0/8(avail=8)
+2026-09-28 12:36:49,303 - INFO - hindsight_api.worker.poller - [WORKER_STATS] worker=Burtons-Mac-Studio-M1 slots=0/10 | reserved: [consolidation=0/2(avail=2)] | shared=0/8(avail=8)

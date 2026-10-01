@@ -1,0 +1,96 @@
+{
+  "symbol": "OKX:BTCUSDT",
+  "asset_class": "crypto",
+  "venue_label": "OKX",
+  "ts": "2026-09-29T20:18:40.883568",
+  "set_symbol_rc": 0,
+  "set_symbol_out": "{\n  \"success\": true,\n  \"symbol\": \"OKX:BTCUSDT\",\n  \"chart_ready\": false\n}\n",
+  "live_symbol": "OKX:BTCUSDT",
+  "resolution": "D",
+  "studies": [
+    "GROK SuperTrend Strategy paper",
+    "Chart Patterns [Tradevisor] \u2014 Auto Detection, Measured Targets & Entry Signals",
+    "Overlay",
+    "Volume"
+  ],
+  "strategy_ok": true,
+  "metric_count": 19,
+  "strategy_name": "GROK SuperTrend Strategy paper",
+  "metrics": {
+    "net_profit": 3064.5206446130987,
+    "net_profit_percent": 0.30645206446130985,
+    "gross_profit": 9722.682284554101,
+    "gross_loss": 6658.161639941002,
+    "profit_factor": 1.460265281970573,
+    "max_drawdown": 1439.9024218470004,
+    "max_drawdown_percent": 0.10254169907419088,
+    "total_trades": 67,
+    "winning_trades": 24,
+    "losing_trades": 43,
+    "percent_profitable": 0.3582089552238806,
+    "avg_trade": 45.7391141,
+    "largest_win": 2010.6010334460002,
+    "largest_loss": 708.2529905320001,
+    "commission_paid": 180.36248498690003,
+    "sharpe_ratio": 0.0609321588779639,
+    "sortino_ratio": 0.1625123211380883,
+    "buy_hold_return": 117764.32129950002,
+    "open_pl": 326.27902400000016
+  },
+  "strategy_error": null,
+  "last": 83202.7,
+  "quote": {
+    "symbol": "OKX:BTCUSDT",
+    "last": 83202.7,
+    "volume": 420.80794798
+  },
+  "trade_count_sample": 5,
+  "trades_sample": [
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 72678.3,
+      "qty": 0.032778,
+      "time_index": 63
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 66017.2,
+      "qty": 0.037907,
+      "time_index": 64
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 74418.2,
+      "qty": 0.037091,
+      "time_index": 65
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 75542.2,
+      "qty": 0.034396,
+      "time_index": 66
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 66564.3,
+      "qty": 0.03669,
+      "time_index": 67
+    }
+  ],
+  "symbol_requested": "OKX:BTCUSDT"
+}

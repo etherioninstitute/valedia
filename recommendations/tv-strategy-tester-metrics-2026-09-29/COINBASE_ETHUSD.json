@@ -1,0 +1,96 @@
+{
+  "symbol": "COINBASE:ETHUSD",
+  "asset_class": "crypto",
+  "venue_label": "Coinbase",
+  "ts": "2026-09-29T20:17:49.016889",
+  "set_symbol_rc": 0,
+  "set_symbol_out": "{\n  \"success\": true,\n  \"symbol\": \"COINBASE:ETHUSD\",\n  \"chart_ready\": false\n}\n",
+  "live_symbol": "COINBASE:ETHUSD",
+  "resolution": "D",
+  "studies": [
+    "GROK SuperTrend Strategy paper",
+    "Chart Patterns [Tradevisor] \u2014 Auto Detection, Measured Targets & Entry Signals",
+    "Overlay",
+    "Volume"
+  ],
+  "strategy_ok": true,
+  "metric_count": 19,
+  "strategy_name": "GROK SuperTrend Strategy paper",
+  "metrics": {
+    "net_profit": 60441.0966189,
+    "net_profit_percent": 6.04410966189,
+    "gross_profit": 91764.789445837,
+    "gross_loss": 31323.692826936996,
+    "profit_factor": 2.9295648489734685,
+    "max_drawdown": 5983.691897425,
+    "max_drawdown_percent": 0.08377799410278408,
+    "total_trades": 77,
+    "winning_trades": 39,
+    "losing_trades": 38,
+    "percent_profitable": 0.5064935064935064,
+    "avg_trade": 784.9493067,
+    "largest_win": 24815.407438683,
+    "largest_loss": 2165.492491501,
+    "commission_paid": 919.8316241000002,
+    "sharpe_ratio": 0.11101393599583709,
+    "sortino_ratio": 2.3511846601663007,
+    "buy_hold_return": 1694306.6143840002,
+    "open_pl": 3359.195886000001
+  },
+  "strategy_error": null,
+  "last": 2667.14,
+  "quote": {
+    "symbol": "COINBASE:ETHUSD",
+    "last": 2667.14,
+    "volume": 7120.778385
+  },
+  "trade_count_sample": 5,
+  "trades_sample": [
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 3323.38,
+      "qty": 3.8283,
+      "time_index": 73
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 2936.5,
+      "qty": 4.3717,
+      "time_index": 74
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 2178.67,
+      "qty": 5.4985,
+      "time_index": 75
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 2129.74,
+      "qty": 6.4464,
+      "time_index": 76
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 1805.51,
+      "qty": 7.1541,
+      "time_index": 77
+    }
+  ],
+  "symbol_requested": "COINBASE:ETHUSD"
+}

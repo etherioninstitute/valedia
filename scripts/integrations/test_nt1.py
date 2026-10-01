@@ -12,6 +12,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import mirofish_neural_enrich as mne
 import neural_trader_fence as ntf
 import test_slice13 as s13
@@ -112,10 +115,10 @@ def test_cli_still_denies_live():
 
 
 def test_version_contract():
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
     stamp = vc.version_stamp()
-    assert stamp.startswith("v0.57.0 ")
+    assert stamp.startswith("v0.74.1 ")
 
 
 if __name__ == "__main__":

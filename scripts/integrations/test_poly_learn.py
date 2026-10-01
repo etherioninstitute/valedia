@@ -13,6 +13,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import master_allocator as ma
 import poly_learn
 import poly_us_smoke as smoke
@@ -39,7 +42,7 @@ def test_hygiene_and_fence():
     assert pmob.LIVE_CLIENT_HOOK is None
     assert vc.VENUE_WRITER["polymarket"] == "none"
     assert pmu.live_enabled() is False
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "poly_learn" not in cron
     doc = open(os.path.join(ROOT, "recommendations", "POLY-LEARN.md")).read()

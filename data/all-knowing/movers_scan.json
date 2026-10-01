@@ -1,0 +1,1625 @@
+{
+  "ts": "2026-09-30T08:02:41.078922+00:00",
+  "status": "PAPER/SHADOW",
+  "origin": "live",
+  "error": null,
+  "bankroll_usd": 504.0,
+  "clip_frac": 0.1,
+  "print_bar_pct": 16.0,
+  "fee_table": "CRYPTO_FEE_PCT",
+  "fences": {
+    "create_order": false,
+    "live": false,
+    "nautilus_live": false,
+    "mirofish_auto_raise": false,
+    "crypto_paper_safety": "PAPER/SHADOW+ORNITH",
+    "crypto_paper_allowlist": [
+      "BTC-USDT",
+      "ETH-USDT"
+    ],
+    "allowlist_widened": false,
+    "oil": "NO_HARVEST",
+    "weather": "WATCH",
+    "laya": "coreml_http",
+    "jev": "seasoning_only",
+    "counts_toward_kelly": false
+  },
+  "laya": {
+    "enabled": true,
+    "backend": "coreml_http",
+    "fail_open": false,
+    "mode": "shadow",
+    "enforcement": "none",
+    "create_order": false,
+    "pack_id": "valedia-paper-v1",
+    "n_ok": 37,
+    "n": 37,
+    "latency_ms_max": 7320.54,
+    "informed_mirofish": true
+  },
+  "jev": {
+    "enabled": true,
+    "fail_open": false,
+    "model": "jev-1.13.0",
+    "action": "stand_down",
+    "action_confidence": 0.28,
+    "stand_down": 0.71,
+    "report_usable": 0.28,
+    "we_are_the_exit": 0.23,
+    "seasoning_only": true,
+    "changes_rank": false
+  },
+  "probe": {
+    "PUMP": {
+      "present": false,
+      "reason": "absent"
+    },
+    "QNT": {
+      "present": false,
+      "reason": "absent"
+    }
+  },
+  "notes": {
+    "coingecko_markets": "ok",
+    "tape": "coingecko",
+    "PUMP": "absent",
+    "QNT": "absent"
+  },
+  "n": 37,
+  "ranked": [
+    {
+      "symbol": "NEAR",
+      "class": "crypto",
+      "chg_24h": 6.461,
+      "buzz": 0.0,
+      "price": 5.06,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": 0.06161,
+      "impact_usd": 3.105124,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.375,
+          "edge_quality": 1.5134,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2412.57,
+        "client_ms": 2427.39
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "FIGR_HELOC",
+      "class": "crypto",
+      "chg_24h": 2.7212,
+      "buzz": 0.0,
+      "price": 1.03,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": 0.024212,
+      "impact_usd": 1.220295,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.5051,
+          "edge_quality": 1.5075,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 3426.1,
+        "client_ms": 3434.0
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "GLD",
+      "class": "etf",
+      "chg_24h": 1.32,
+      "buzz": 0.0,
+      "price": 382.89,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": 0.0102,
+      "impact_usd": 0.51408,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9484,
+          "edge_quality": 1.3306,
+          "venue_class": "equity"
+        },
+        "latency_ms": 2227.97,
+        "client_ms": 2239.57
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "SUI",
+      "class": "crypto",
+      "chg_24h": 1.0323,
+      "buzz": 0.0,
+      "price": 1.17,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": 0.007323,
+      "impact_usd": 0.369069,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.6716,
+          "edge_quality": 1.493,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2196.49,
+        "client_ms": 2209.93
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "TRX",
+      "class": "crypto",
+      "chg_24h": 0.771,
+      "buzz": 0.0,
+      "price": 0.338242,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": 0.00471,
+      "impact_usd": 0.237394,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.6629,
+          "edge_quality": 1.3724,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2411.13,
+        "client_ms": 2440.3
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "QQQ",
+      "class": "etf",
+      "chg_24h": 0.19,
+      "buzz": 0.0,
+      "price": 737.93,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": -0.0011,
+      "impact_usd": -0.05544,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.8488,
+          "edge_quality": 1.7041,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 5545.99,
+        "client_ms": 5581.19
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "USDS",
+      "class": "crypto",
+      "chg_24h": 0.0723,
+      "buzz": 0.0,
+      "price": 1.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.002277,
+      "impact_usd": -0.114756,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9938,
+          "edge_quality": 1.7454,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2166.44,
+        "client_ms": 2181.63
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "USDE",
+      "class": "crypto",
+      "chg_24h": 0.0025,
+      "buzz": 0.0,
+      "price": 0.99969,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.002975,
+      "impact_usd": -0.149935,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9837,
+          "edge_quality": 1.6406,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 1881.26,
+        "client_ms": 1890.2
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "USDT",
+      "class": "crypto",
+      "chg_24h": -0.0026,
+      "buzz": 0.0,
+      "price": 0.999672,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.003026,
+      "impact_usd": -0.152531,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9955,
+          "edge_quality": 1.5533,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2769.5,
+        "client_ms": 2790.06
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "DAI",
+      "class": "crypto",
+      "chg_24h": -0.0055,
+      "buzz": 0.0,
+      "price": 1.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.003055,
+      "impact_usd": -0.153962,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9927,
+          "edge_quality": 1.5403,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 6175.46,
+        "client_ms": 6265.51
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "USDC",
+      "class": "crypto",
+      "chg_24h": -0.0056,
+      "buzz": 0.0,
+      "price": 0.999857,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.003057,
+      "impact_usd": -0.154048,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.851,
+          "edge_quality": 1.7293,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2592.67,
+        "client_ms": 2612.55
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "LEO",
+      "class": "crypto",
+      "chg_24h": -0.0439,
+      "buzz": 0.0,
+      "price": 9.03,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.003439,
+      "impact_usd": -0.173346,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.8109,
+          "edge_quality": 1.6132,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2271.19,
+        "client_ms": 2303.75
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "SPY",
+      "class": "etf",
+      "chg_24h": -0.18,
+      "buzz": 0.0,
+      "price": 764.2,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": -0.0048,
+      "impact_usd": -0.24192,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9795,
+          "edge_quality": 1.7921,
+          "venue_class": "equity"
+        },
+        "latency_ms": 5028.33,
+        "client_ms": 5077.0
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "DIA",
+      "class": "etf",
+      "chg_24h": -0.22,
+      "buzz": 0.0,
+      "price": 512.88,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": -0.0052,
+      "impact_usd": -0.26208,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.4899,
+          "edge_quality": 1.7318,
+          "venue_class": "equity"
+        },
+        "latency_ms": 2670.44,
+        "client_ms": 2682.73
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "IWM",
+      "class": "etf",
+      "chg_24h": -0.36,
+      "buzz": 0.0,
+      "price": 279.01,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": -0.0066,
+      "impact_usd": -0.33264,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.6976,
+          "edge_quality": 1.6952,
+          "venue_class": "equity"
+        },
+        "latency_ms": 2268.71,
+        "client_ms": 2294.79
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "XRP",
+      "class": "crypto",
+      "chg_24h": -0.4611,
+      "buzz": 0.0,
+      "price": 1.5,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.007611,
+      "impact_usd": -0.383584,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9977,
+          "edge_quality": 1.552,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2519.25,
+        "client_ms": 2531.74
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "TLT",
+      "class": "etf",
+      "chg_24h": -0.5,
+      "buzz": 0.0,
+      "price": 78.23,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": -0.008,
+      "impact_usd": -0.4032,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9624,
+          "edge_quality": 1.6617,
+          "venue_class": "equity"
+        },
+        "latency_ms": 2186.49,
+        "client_ms": 2200.79
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "ZEC",
+      "class": "crypto",
+      "chg_24h": -0.6312,
+      "buzz": 0.0,
+      "price": 1413.86,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.009312,
+      "impact_usd": -0.46935,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.7107,
+          "edge_quality": 1.6321,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2394.53,
+        "client_ms": 2406.23
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "RAIN",
+      "class": "crypto",
+      "chg_24h": -0.7297,
+      "buzz": 0.0,
+      "price": 0.01241402,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.010297,
+      "impact_usd": -0.518944,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.5308,
+          "edge_quality": 1.5464,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2287.1,
+        "client_ms": 2302.56
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "BTC",
+      "class": "crypto",
+      "chg_24h": -0.7808,
+      "buzz": 0.0,
+      "price": 83323.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.010808,
+      "impact_usd": -0.544738,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 1.0,
+          "edge_quality": 1.6321,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 7320.54,
+        "client_ms": 7346.27
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "BNB",
+      "class": "crypto",
+      "chg_24h": -0.8087,
+      "buzz": 0.0,
+      "price": 759.33,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.011087,
+      "impact_usd": -0.558785,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.7044,
+          "edge_quality": 1.3102,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2374.96,
+        "client_ms": 2397.89
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "WBT",
+      "class": "crypto",
+      "chg_24h": -0.8359,
+      "buzz": 0.0,
+      "price": 83.3,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.011359,
+      "impact_usd": -0.572509,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9756,
+          "edge_quality": 1.5967,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2374.48,
+        "client_ms": 2382.6
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "SOL",
+      "class": "crypto",
+      "chg_24h": -0.8746,
+      "buzz": 0.0,
+      "price": 118.48,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.011746,
+      "impact_usd": -0.592003,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9206,
+          "edge_quality": 1.5933,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2362.31,
+        "client_ms": 2382.85
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "BCH",
+      "class": "crypto",
+      "chg_24h": -0.9567,
+      "buzz": 0.0,
+      "price": 308.08,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.012567,
+      "impact_usd": -0.633397,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.704,
+          "edge_quality": 1.6976,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2386.55,
+        "client_ms": 2408.39
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "XMR",
+      "class": "crypto",
+      "chg_24h": -1.0751,
+      "buzz": 0.0,
+      "price": 537.1,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.013751,
+      "impact_usd": -0.693035,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 1.0,
+          "edge_quality": 1.6208,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2230.99,
+        "client_ms": 2240.42
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "DOGE",
+      "class": "crypto",
+      "chg_24h": -1.3363,
+      "buzz": 0.0,
+      "price": 0.093776,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.016363,
+      "impact_usd": -0.824715,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9379,
+          "edge_quality": 1.5848,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2127.04,
+        "client_ms": 2146.15
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "UNI",
+      "class": "crypto",
+      "chg_24h": -1.3533,
+      "buzz": 0.0,
+      "price": 8.82,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.016533,
+      "impact_usd": -0.833283,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.5148,
+          "edge_quality": 1.5826,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2292.84,
+        "client_ms": 2302.8
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "ETH",
+      "class": "crypto",
+      "chg_24h": -1.399,
+      "buzz": 0.0,
+      "price": 2674.09,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.01699,
+      "impact_usd": -0.856321,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9802,
+          "edge_quality": 1.4619,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 6684.56,
+        "client_ms": 6702.65
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "XLM",
+      "class": "crypto",
+      "chg_24h": -2.4811,
+      "buzz": 0.0,
+      "price": 0.224716,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.027811,
+      "impact_usd": -1.401684,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.8172,
+          "edge_quality": 1.6956,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2513.38,
+        "client_ms": 2524.96
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "HYPE",
+      "class": "crypto",
+      "chg_24h": -2.6553,
+      "buzz": 0.0,
+      "price": 86.15,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.029552,
+      "impact_usd": -1.489446,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.2457,
+          "edge_quality": 1.5884,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2341.27,
+        "client_ms": 2357.15
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "LTC",
+      "class": "crypto",
+      "chg_24h": -2.73,
+      "buzz": 0.0,
+      "price": 66.88,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.0303,
+      "impact_usd": -1.527105,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.8578,
+          "edge_quality": 1.6569,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2275.64,
+        "client_ms": 2286.04
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "ADA",
+      "class": "crypto",
+      "chg_24h": -2.9426,
+      "buzz": 0.0,
+      "price": 0.244504,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.032426,
+      "impact_usd": -1.634245,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.5299,
+          "edge_quality": 1.5933,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2425.4,
+        "client_ms": 2439.2
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "AVAX",
+      "class": "crypto",
+      "chg_24h": -3.0505,
+      "buzz": 0.0,
+      "price": 11.11,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.033505,
+      "impact_usd": -1.688667,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9617,
+          "edge_quality": 1.5429,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2061.63,
+        "client_ms": 2095.0
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "CC",
+      "class": "crypto",
+      "chg_24h": -5.85,
+      "buzz": 0.0,
+      "price": 0.125219,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.0615,
+      "impact_usd": -3.09958,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9895,
+          "edge_quality": 1.6361,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2181.77,
+        "client_ms": 2203.94
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "LINK",
+      "class": "crypto",
+      "chg_24h": -5.8795,
+      "buzz": 0.0,
+      "price": 14.31,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.061795,
+      "impact_usd": -3.114473,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.7908,
+          "edge_quality": 1.626,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2275.92,
+        "client_ms": 2288.02
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "HBAR",
+      "class": "crypto",
+      "chg_24h": -9.1393,
+      "buzz": 0.0,
+      "price": 0.10615,
+      "quote_volume_usd": null,
+      "reasons": [
+        "coingecko_markets"
+      ],
+      "edge": -0.094393,
+      "impact_usd": -4.757397,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9772,
+          "edge_quality": 1.7727,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 3253.46,
+        "client_ms": 3310.55
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "KXHIGHNY",
+      "class": "weather",
+      "chg_24h": null,
+      "buzz": 0.0,
+      "price": null,
+      "quote_volume_usd": null,
+      "reasons": [
+        "weather_watch"
+      ],
+      "edge": null,
+      "impact_usd": null,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "laya_shadow": {
+        "backend": "coreml_http",
+        "fail_open": false,
+        "error": null,
+        "mode": "shadow",
+        "enforcement": "none",
+        "create_order": false,
+        "pack_id": "valedia-paper-v1",
+        "answers": {
+          "admit_paper": 0.9879,
+          "edge_quality": 1.5792,
+          "venue_class": "crypto"
+        },
+        "latency_ms": 2210.14,
+        "client_ms": 2226.99
+      },
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    }
+  ]
+}

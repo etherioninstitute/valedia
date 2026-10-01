@@ -1,0 +1,146 @@
+{
+  "desk": "CRYPTO-PAPER",
+  "mode": "PAPER/SHADOW",
+  "watchlist": [
+    "BTC-USDT",
+    "ETH-USDT"
+  ],
+  "timeframe": "1h",
+  "model": "ornith-1.5-k-m",
+  "route": "http://127.0.0.1:4000/v1/chat/completions",
+  "tick_assist": "qwen/qwen3.8-27b",
+  "tick_assist_role": "watchlist rank only; fail-open; cannot pass the gate",
+  "upstream_shape": "vaughanf1/claude-execute rules.json (watchlist, indicators, bias, entry, exit, risk) \u2014 checks are numeric, not prose",
+  "indicators": [
+    {
+      "id": "ema_fast",
+      "fn": "ema",
+      "period": 12,
+      "source": "close"
+    },
+    {
+      "id": "ema_slow",
+      "fn": "ema",
+      "period": 26,
+      "source": "close"
+    },
+    {
+      "id": "rsi",
+      "fn": "rsi",
+      "period": 14,
+      "source": "close"
+    },
+    {
+      "id": "sma",
+      "fn": "sma",
+      "period": 20,
+      "source": "close"
+    },
+    {
+      "id": "vwap",
+      "fn": "vwap",
+      "period": 20
+    },
+    {
+      "id": "macd",
+      "fn": "macd",
+      "fast": 12,
+      "slow": 26,
+      "signal": 9,
+      "source": "close"
+    }
+  ],
+  "bias_criteria": [
+    {
+      "id": "long_ema",
+      "bias": "long",
+      "op": "gt",
+      "left": "ema_fast",
+      "right": "ema_slow",
+      "label": "EMA(12) above EMA(26)"
+    },
+    {
+      "id": "short_ema",
+      "bias": "short",
+      "op": "lt",
+      "left": "ema_fast",
+      "right": "ema_slow",
+      "label": "EMA(12) below EMA(26)"
+    }
+  ],
+  "entry_rules": {
+    "long": [
+      {
+        "id": "close_above_sma",
+        "op": "gt",
+        "left": "close",
+        "right": "sma",
+        "label": "close above SMA(20)"
+      },
+      {
+        "id": "close_above_vwap",
+        "op": "gt",
+        "left": "close",
+        "right": "vwap",
+        "label": "close above VWAP(20)"
+      },
+      {
+        "id": "rsi_not_chase",
+        "op": "lt",
+        "left": "rsi",
+        "right": 70,
+        "label": "RSI(14) below 70"
+      },
+      {
+        "id": "macd_line_pos",
+        "op": "gt",
+        "left": "macd_line",
+        "right": 0,
+        "label": "MACD line above zero"
+      },
+      {
+        "id": "macd_hist_pos",
+        "op": "gt",
+        "left": "macd_hist",
+        "right": 0,
+        "label": "MACD histogram above zero"
+      }
+    ],
+    "short": []
+  },
+  "exit_rules": [
+    {
+      "id": "rsi_hot",
+      "op": "gt",
+      "left": "rsi",
+      "right": 75,
+      "label": "RSI(14) above 75"
+    }
+  ],
+  "risk_rules": [
+    {
+      "id": "pair_allowlist",
+      "op": "in",
+      "left": "pair",
+      "right": [
+        "BTC-USDT",
+        "ETH-USDT"
+      ],
+      "label": "pair on the paper allowlist"
+    },
+    {
+      "id": "notional_clip",
+      "op": "lte",
+      "left": "notional_frac",
+      "right": 0.1,
+      "label": "notional at most 10% of cash"
+    },
+    {
+      "id": "qty_positive",
+      "op": "gt",
+      "left": "qty",
+      "right": 0,
+      "label": "quantity positive"
+    }
+  ]
+}

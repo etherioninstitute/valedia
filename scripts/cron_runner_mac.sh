@@ -111,6 +111,16 @@ while [ $ATTEMPT -le $MAX_RETRIES ]; do
     OUTPUT=$(python3 "$SCRIPT" 2>&1)
     EXIT=$?
 
+    # Known OpenSSL SIGSEGV (139) / SIGABRT (134) on LATENCY ARB.
+    # Do not diagnose/retry (Crash Reporter storm). One clean log line.
+    if { [ "$EXIT" -eq 139 ] || [ "$EXIT" -eq 134 ]; } && \
+       { [ "$LABEL" = "LATENCY ARB" ] || [ "$SCRIPT" = "arb_run.py" ]; }; then
+        echo "[$LABEL] exit=$EXIT known OpenSSL/TLS crash — no retry" >> "$LOG"
+        OUTPUT="[openssl-tls-crash exit=$EXIT]"
+        SUCCESS=false
+        break
+    fi
+
     # Check for errors
     HAS_ERROR=false
     if [ $EXIT -ne 0 ]; then

@@ -582,15 +582,42 @@ def execute_allocations(allocations, dry_run=False):
                             r["status"] = "SKIP_MAKER_FIRST"
                             results.append(r)
                             continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    r["status"] = "SKIP_EV_PREFLIGHT"
+                    r["error"] = f"ev preflight failed closed: {str(e)[:60]}"
+                    results.append(r)
+                    continue
+                import session_clocks as _sc
+                blocked = _sc.before_create(a)
+                if blocked:
+                    r["status"], r["error"] = blocked
+                    results.append(r)
+                    continue
+                import informed_before_create as _ibc
+                pre = _ibc.create_preflight(a, n, price_cents)
+                if not pre["ok"]:
+                    r["status"] = "SKIP_INFORMED"
+                    r["error"] = ",".join(pre["reasons"])
+                    r["contracts"] = n
+                    results.append(r)
+                    continue
+                if pre.get("jev") is not None:
+                    r["jev"] = pre["jev"]
                 if action == "maker" and _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
                     oid = _maker_mgr.place_maker_order(a["ticker"], a["side"], n, price_cents,
-                                                       strategy=a.get("type", ""))
-                    r["status"] = "MAKER_PLACED"; r["contracts"] = n; r["order_id"] = str(oid)[:12]
-                    _clear_kalshi_failure(a["ticker"])
+                                                       strategy=a.get("type", ""),
+                                                       informed=pre["informed"])
+                    if not oid:
+                        r["status"] = "FAILED"
+                        r["error"] = "maker place refused"
+                        r["contracts"] = n
+                    else:
+                        r["status"] = "MAKER_PLACED"
+                        r["contracts"] = n
+                        r["order_id"] = str(oid)[:12]
+                        _clear_kalshi_failure(a["ticker"])
                 else:
-                    resp = create_order(a["ticker"], a["side"], n, price_cents)
+                    resp = create_order(a["ticker"], a["side"], n, price_cents, informed=pre["informed"])
                     r["contracts"] = n
                     _clear_kalshi_failure(a["ticker"])
                     # Fill-true only. Bare POST-ack is UNRECONCILED — never a live open.

@@ -12,6 +12,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import mirofish_accuracy_ledger as mal
 import mirofish_neural_enrich as mne
 from mirofish_signal_extractor import process_mirofish_report
@@ -194,10 +197,10 @@ def test_weight_math_unchanged_with_enriched_proven():
 
 
 def test_version_contract():
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
     stamp = vc.version_stamp()
-    assert stamp.startswith("v0.57.0 ")
+    assert stamp.startswith("v0.74.1 ")
     src = open(os.path.join(HERE, "valedia_config.py")).read()
     assert "VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md" in src
     assert "VALEDIA_SELF_ADJUST" in src

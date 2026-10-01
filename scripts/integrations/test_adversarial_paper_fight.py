@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import adversarial_paper_fight as apf
 import valedia_config as vc
 
@@ -151,7 +154,7 @@ def test_round_persist_mocked():
     assert doc["auto_raise"] is False
     assert doc["fusion_touched"] is False
     assert doc["intents"] == []
-    assert doc["valedia_version"] == "0.57.0"
+    assert doc["valedia_version"] == "0.74.1"
     assert doc["n"] == 3
     by = {r["symbol"]: r for r in doc["fights"]}
     assert by["BTC-USD"]["lenses"][0]["abstain"] is True
@@ -190,8 +193,8 @@ def test_cli_and_version():
     assert rc == 0
     rounds = [n for n in os.listdir(md) if n.startswith("adversarial_round_")]
     assert len(rounds) == 1
-    assert vc.VALEDIA_VERSION == "0.57.0"
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.version_stamp().startswith("v0.74.1 ")
     assert vc.MIROFISH_AUTO_RAISE is False
 
 

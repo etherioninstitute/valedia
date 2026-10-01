@@ -1,0 +1,255 @@
+{
+  "ts": "2026-09-30T07:47:19.877139+00:00",
+  "status": "PAPER/SHADOW",
+  "origin": "fixture",
+  "error": null,
+  "bankroll_usd": 504.0,
+  "clip_frac": 0.1,
+  "print_bar_pct": 16.0,
+  "fee_table": "CRYPTO_FEE_PCT",
+  "fences": {
+    "create_order": false,
+    "live": false,
+    "nautilus_live": false,
+    "mirofish_auto_raise": false,
+    "crypto_paper_safety": "PAPER/SHADOW+ORNITH",
+    "crypto_paper_allowlist": [
+      "BTC-USDT",
+      "ETH-USDT"
+    ],
+    "allowlist_widened": false,
+    "oil": "NO_HARVEST",
+    "weather": "WATCH",
+    "laya": "stub_no_coreml",
+    "jev": "seasoning_only",
+    "counts_toward_kelly": false
+  },
+  "jev": {
+    "enabled": true,
+    "fail_open": false,
+    "model": "jev-1.13.0",
+    "action": "stand_down",
+    "action_confidence": 0.23,
+    "stand_down": 0.69,
+    "report_usable": 0.28,
+    "we_are_the_exit": 0.26,
+    "seasoning_only": true,
+    "changes_rank": false
+  },
+  "probe": {
+    "PUMP": {
+      "present": true,
+      "chg_24h": 16.4,
+      "edge": 0.161,
+      "impact_usd": 8.1144,
+      "laya": "would_buy",
+      "sized": true,
+      "note": null
+    },
+    "QNT": {
+      "present": true,
+      "chg_24h": 16.1,
+      "edge": 0.158,
+      "impact_usd": 7.9632,
+      "laya": "would_buy",
+      "sized": true,
+      "note": null
+    }
+  },
+  "notes": {},
+  "n": 7,
+  "ranked": [
+    {
+      "symbol": "USO",
+      "class": "oil",
+      "chg_24h": 22.0,
+      "buzz": 5.0,
+      "price": 78.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "oil"
+      ],
+      "edge": 0.217,
+      "impact_usd": 10.9368,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": true,
+      "harvest": "NO_HARVEST",
+      "laya": "watch",
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "PUMP",
+      "class": "crypto",
+      "chg_24h": 16.4,
+      "buzz": 30.0,
+      "price": 0.004,
+      "quote_volume_usd": null,
+      "reasons": [
+        "fixture"
+      ],
+      "edge": 0.161,
+      "impact_usd": 8.1144,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_buy",
+      "would_have": {
+        "sized": true,
+        "notional_usd": 50.4,
+        "qty": 12600.0,
+        "entry_px": 0.004002,
+        "entry_fee_usd": 0.0504252,
+        "roundtrip_cost_usd": 0.1512,
+        "impact_usd": 8.1144,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "QNT",
+      "class": "crypto",
+      "chg_24h": 16.1,
+      "buzz": 22.0,
+      "price": 98.5,
+      "quote_volume_usd": null,
+      "reasons": [
+        "fixture"
+      ],
+      "edge": 0.158,
+      "impact_usd": 7.9632,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_buy",
+      "would_have": {
+        "sized": true,
+        "notional_usd": 50.4,
+        "qty": 0.51167513,
+        "entry_px": 98.54925,
+        "entry_fee_usd": 0.0504252,
+        "roundtrip_cost_usd": 0.1512,
+        "impact_usd": 7.9632,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "NOISE",
+      "class": "crypto",
+      "chg_24h": 2.1,
+      "buzz": 999.0,
+      "price": 1.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "fixture_buzz"
+      ],
+      "edge": 0.018,
+      "impact_usd": 0.9072,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "SPY",
+      "class": "etf",
+      "chg_24h": 0.4,
+      "buzz": 0.0,
+      "price": 500.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "yahoo"
+      ],
+      "edge": 0.001,
+      "impact_usd": 0.0504,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "DUST",
+      "class": "crypto",
+      "chg_24h": 0.2,
+      "buzz": 10.0,
+      "price": 1.0,
+      "quote_volume_usd": null,
+      "reasons": [
+        "fixture"
+      ],
+      "edge": -0.001,
+      "impact_usd": -0.0504,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "would_pass",
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    },
+    {
+      "symbol": "KXHIGHNY",
+      "class": "weather",
+      "chg_24h": null,
+      "buzz": 0.0,
+      "price": null,
+      "quote_volume_usd": null,
+      "reasons": [
+        "weather_watch"
+      ],
+      "edge": null,
+      "impact_usd": null,
+      "notional_cap_usd": 50.4,
+      "fee_roundtrip": 0.003,
+      "oil_fenced": false,
+      "harvest": null,
+      "laya": "watch",
+      "would_have": {
+        "sized": false,
+        "qty": null,
+        "create_order": false,
+        "live": false,
+        "venue_allowlist": false,
+        "counts_toward_kelly": false
+      }
+    }
+  ]
+}

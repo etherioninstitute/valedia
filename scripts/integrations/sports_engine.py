@@ -46,11 +46,15 @@ CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
 # These were all sitting idle. Now they boost every bet.
 
 def get_mirofish_bias():
-    """Read MiroFish swarm sentiment — overall market mood."""
+    """Swarm mood only when the live file is fresh and not near-neutral."""
     try:
-        mf = json.load(open(os.path.join(MODELS, "mirofish_signal.json")))
+        import mirofish_intel_archive as _mia
+        mf = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json"))
+        if not mf:
+            return 50
         return mf.get("overall_bias", 50)
-    except: return 50
+    except Exception:
+        return 50
 
 def get_ere_regime():
     """Read ERE v2.0 regime — are markets calm or turbulent?"""

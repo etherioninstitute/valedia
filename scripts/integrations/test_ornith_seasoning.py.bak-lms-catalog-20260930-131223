@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Ornith 1.5 9B seasoning. Mocked LMS. Live probe only if VALEDIA_ORNITH_SEASON_LIVE=1.
+
+Run: python3 test_ornith_seasoning.py
+"""
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+
+import ornith_seasoning as orn
+
+
+ROWS = [
+    {"symbol": "USO", "class": "oil", "chg_24h": 22.0},
+    {"symbol": "PUMP", "class": "crypto", "chg_24h": 16.4},
+]
+
+
+def _boom(*_a, **_k):
+    raise AssertionError("network")
+
+
+def test_hygiene_and_default_off():
+    src = open(os.path.join(HERE, "ornith_seasoning.py")).read()
+    for banned in ("subprocess", "lms unload", "create_order", "--live", "ORNITH_LOAD_APPLY"):
+        assert banned not in src, banned
+    assert "ornith-1.5-9b" in src
+    assert orn.LOAD_HINT.startswith("lms load ornith-1.5-9b")
+    assert "unload" not in orn.LOAD_HINT
+    assert orn.enabled() is False
+    os.environ["VALEDIA_ORNITH_SEASON"] = "true"
+    try:
+        assert orn.enabled() is False
+    finally:
+        os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+    out = orn.annotate(ROWS, get=_boom, post=_boom)
+    assert out["reason"] == "VALEDIA_ORNITH_SEASON_off"
+    assert out["fail_open"] is True
+    stamped = orn.stamp(ROWS)
+    assert stamped["seasoning_only"] is True
+    assert stamped["changes_rank"] is False
+
+
+def test_not_loaded_skips_chat_and_ignores_35b():
+    os.environ["VALEDIA_ORNITH_SEASON"] = "1"
+    try:
+        def listing():
+            return {"data": [
+                {"id": "ornith-1.5-35b-a3b", "state": "loaded", "loaded_context_length": 131072},
+                {"id": "ornith-1.5-9b", "state": "not-loaded"},
+                {"id": "qwen3.8-27b", "state": "not-loaded"},
+            ]}
+
+        out = orn.annotate(ROWS, get=listing, post=_boom)
+        assert out["reason"] == "not_loaded"
+        assert out["fail_open"] is True
+        assert out["detail"] == "state=not-loaded"
+        assert out["lms_load_cmd"] == orn.LOAD_HINT
+        assert out["note"] is None
+        missing = orn.annotate(ROWS, get=lambda: {"data": [
+            {"id": "ornith-1.5-35b-a3b", "state": "loaded"},
+        ]}, post=_boom)
+        assert missing["detail"] == "absent"
+        stamped = orn.stamp(ROWS, season=lambda _r: out)
+        assert stamped["changes_rank"] is False
+        assert stamped["seasoning_only"] is True
+    finally:
+        os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+
+
+def test_loaded_note_cannot_change_rank():
+    os.environ["VALEDIA_ORNITH_SEASON"] = "1"
+    calls = []
+    try:
+        def listing():
+            return {"data": [{"id": "ornith-1.5-9b", "state": "loaded"}]}
+
+        def post(payload, timeout):
+            calls.append(payload)
+            assert payload["model"] == "ornith-1.5-9b"
+            assert payload["max_tokens"] == 80
+            assert "Do not rank" in payload["messages"][0]["content"]
+            body = json.loads(payload["messages"][1]["content"])
+            assert body["rows"][0]["symbol"] == "USO"
+            assert "would_have" not in body["rows"][0]
+            return {"choices": [{"message": {"content":
+                "```json\n{\"note\":\"watch the print\",\"changes_rank\":true}\n```"}}]}
+
+        out = orn.annotate(ROWS, get=listing, post=post)
+        assert out["reason"] == "annotated"
+        assert out["fail_open"] is False
+        assert out["note"] == "watch the print"
+        assert "changes_rank" not in out
+        assert calls[0]["temperature"] == 0
+        stamped = orn.stamp(ROWS, season=lambda _r: {
+            "enabled": True, "reason": "annotated", "note": "put USO last",
+            "changes_rank": True,
+        })
+        assert stamped["changes_rank"] is False
+        assert stamped["note"] == "put USO last"
+        assert stamped["seasoning_only"] is True
+    finally:
+        os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+
+
+def test_fail_open_on_probe_and_chat():
+    os.environ["VALEDIA_ORNITH_SEASON"] = "1"
+    try:
+        def down():
+            raise TimeoutError("lms")
+
+        probe = orn.annotate(ROWS, get=down, post=_boom)
+        assert probe["fail_open"] is True
+        assert probe["reason"] == "probe_TimeoutError"
+
+        def post(_payload, _timeout):
+            raise TimeoutError("chat")
+
+        chat = orn.annotate(
+            ROWS,
+            get=lambda: {"data": [{"id": "ornith-1.5-9b@q4_k_m", "state": "idle"}]},
+            post=post,
+        )
+        assert chat["fail_open"] is True
+        assert chat["reason"] == "TimeoutError"
+        bad = orn.annotate(
+            ROWS,
+            get=lambda: {"data": [{"id": "ornith-1.5-9b", "state": "loaded"}]},
+            post=lambda _p, _t: {"choices": [{"message": {"content": ""}}]},
+        )
+        assert bad["reason"] == "bad_response"
+        def explode(_rows):
+            raise RuntimeError("x")
+
+        blown = orn.stamp(ROWS, season=explode)
+        assert blown["fail_open"] is True
+        assert blown["changes_rank"] is False
+    finally:
+        os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+
+
+def _states(doc):
+    models = doc.get("data") if isinstance(doc, dict) else doc
+    return {
+        m.get("id"): m.get("state")
+        for m in models if isinstance(m, dict)
+    }
+
+
+def test_live_probe_gated():
+    """Read-only. Runs only when VALEDIA_ORNITH_SEASON_LIVE=1. Never loads."""
+    if os.environ.get("VALEDIA_ORNITH_SEASON_LIVE") != "1":
+        return
+    before = _states(orn._http_json(orn.MODELS_URL))
+    os.environ["VALEDIA_ORNITH_SEASON"] = "1"
+    try:
+        out = orn.stamp([])
+    finally:
+        os.environ.pop("VALEDIA_ORNITH_SEASON", None)
+    after = _states(orn._http_json(orn.MODELS_URL))
+    assert before.get("ornith-1.5-35b-a3b") == after.get("ornith-1.5-35b-a3b")
+    assert before.get("ornith-1.5-9b") == after.get("ornith-1.5-9b")
+    assert out["seasoning_only"] is True
+    assert out["changes_rank"] is False
+    if before.get("ornith-1.5-9b") != "loaded":
+        assert out["reason"] == "not_loaded"
+        assert "unload" not in (out.get("lms_load_cmd") or "")
+    else:
+        assert out["fail_open"] is True or out["reason"] == "annotated"
+
+
+if __name__ == "__main__":
+    test_hygiene_and_default_off()
+    test_not_loaded_skips_chat_and_ignores_35b()
+    test_loaded_note_cannot_change_rank()
+    test_fail_open_on_probe_and_chat()
+    test_live_probe_gated()
+    print("PASS test_ornith_seasoning")

@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import forward_test_ledger as ftl
 import intel_opportunity_gatherer as iog
 import nautilus_shadow_coinbase as sh

@@ -19,8 +19,8 @@ OLLAMA = "http://127.0.0.1:11435"
 BACKEND = "http://127.0.0.1:5001/api"
 
 BIONIC_NEED = (
-    "qwen3.8-27b-obliterated-k",
-    "ornith-1.5-k-m",
+    "qwen/qwen3.8-27b",
+    "ornith-1.5-35b-a3b-mlx",
     "text-embedding-nomic-embed-text-v1.5",
 )
 OLLAMA_NEED = (
@@ -54,7 +54,7 @@ def envval(key, em=None):
 def inference_mode(em=None):
     em = em or envmap()
     v = (em.get("MIROFISH_INFERENCE") or "").strip().lower()
-    if v in ("bionic", "ollama"):
+    if v in ("bionic", "ollama", "split"):
         return v
     return "bionic" if ":1234" in (em.get("LLM_BASE_URL") or "") else "ollama"
 
@@ -98,8 +98,14 @@ try:
     r("PASS", "Bionic :1234 reachable", f"{len(have_b)} models")
     for need in BIONIC_NEED:
         ok = need in have_b
-        lvl = "PASS" if ok else ("FAIL" if mode == "bionic" else "WARN")
-        r(lvl, f"bionic model: {need}", "" if ok else "MISSING")
+        if mode == "split" and need == "qwen/qwen3.8-27b":
+            lvl = "PASS" if ok else "WARN"  # not on the sync path
+        elif mode == "split":
+            lvl = "PASS" if ok else "FAIL"  # ornith report + nomic embed
+        else:
+            lvl = "PASS" if ok else ("FAIL" if mode == "bionic" else "WARN")
+        detail = "" if ok else ("not on sync path" if mode == "split" and need.startswith("qwen3.8-27b") else "MISSING")
+        r(lvl, f"bionic model: {need}", detail)
 except Exception as e:
     r("FAIL" if mode == "bionic" else "WARN", "Bionic :1234 reachable", str(e)[:80])
 
@@ -108,7 +114,12 @@ try:
     r("PASS", "Ollama :11435 reachable (fallback)", f"{len(have_o)} tags")
     for need in OLLAMA_NEED:
         ok = need in have_o
-        lvl = "PASS" if ok else ("FAIL" if mode == "ollama" else "WARN")
+        if mode == "split" and need == "qwen3-8b-mf:latest":
+            lvl = "PASS" if ok else "FAIL"
+        elif mode == "ollama":
+            lvl = "PASS" if ok else "FAIL"
+        else:
+            lvl = "PASS" if ok else "WARN"
         r(lvl, f"ollama model: {need}", "" if ok else "MISSING — fallback incomplete")
 except Exception as e:
     r("FAIL" if mode == "ollama" else "WARN", "Ollama :11435 reachable", str(e)[:80])
@@ -141,10 +152,26 @@ r("PASS" if port_open("127.0.0.1", 7687) else "FAIL", "Neo4j :7687 reachable")
 # 4. Config split (report vs swarm model)
 print("\n[4] Model split (.env)")
 default_m, report_m = envval("LLM_MODEL_NAME", em), envval("MIROFISH_REPORT_MODEL", em)
-if mode == "bionic":
-    want_s, want_r = "qwen3.8-27b-obliterated-k", "ornith-1.5-k-m"
+if mode == "split":
+    r("PASS" if default_m == "qwen3-8b-mf:latest" else "FAIL",
+      f"SYNC model (LLM_MODEL_NAME) = {default_m}",
+      "" if default_m == "qwen3-8b-mf:latest" else "overnight ontology needs the 8B, not the 27B")
+    r("PASS" if report_m == "ornith-1.5-35b-a3b-mlx" else "FAIL",
+      f"REPORT model (MIROFISH_REPORT_MODEL) = {report_m}")
+    r("PASS" if ":11435" in (envval("LLM_BASE_URL", em) or "") else "FAIL",
+      f"LLM_BASE_URL = {envval('LLM_BASE_URL', em)}")
+    r("PASS" if ":1234" in (envval("LLM_REPORT_BASE_URL", em) or "") else "FAIL",
+      f"LLM_REPORT_BASE_URL = {envval('LLM_REPORT_BASE_URL', em)}")
+    emb_api = (envval("EMBEDDING_API", em) or "").lower()
+    emb_base = envval("EMBEDDING_BASE_URL", em) or ""
+    emb_ok = (emb_api == "ollama" and ":11435" in emb_base) or (emb_api == "openai" and ":1234" in emb_base)
+    r("PASS" if emb_ok else "WARN",
+      f"EMBEDDING_API={envval('EMBEDDING_API', em)} base={emb_base}",
+      "" if emb_ok else "split embed should stay on Ollama so a Bionic report load cannot unload it")
+elif mode == "bionic":
+    want_s, want_r = "qwen/qwen3.8-27b", "ornith-1.5-35b-a3b-mlx"
     r("PASS" if default_m == want_s else "WARN", f"DEFAULT/sync model (LLM_MODEL_NAME) = {default_m}",
-      "" if default_m == want_s else "expected qwen3.8-27b-obliterated-k (interim FAST on Bionic)")
+      "" if default_m == want_s else "expected qwen/qwen3.8-27b (FAST on Bionic)")
     r("PASS" if report_m == want_r else "WARN", f"REPORT-only model (MIROFISH_REPORT_MODEL) = {report_m}")
     r("PASS" if ":1234" in (envval("LLM_BASE_URL", em) or "") else "FAIL",
       f"LLM_BASE_URL = {envval('LLM_BASE_URL', em)}")
@@ -205,7 +232,7 @@ r("PASS" if os.path.exists(mk) else "WARN", "mirofish_ready marker exists",
 
 # 8. Live chat on the PRIMARY sync model (avoid loading a second LMS LLM)
 print("\n[8] Primary sync chat (short)")
-sync = envval("LLM_MODEL_NAME", em) or ("qwen3.8-27b-obliterated-k" if mode == "bionic" else "qwen3-8b-mf:latest")
+sync = envval("LLM_MODEL_NAME", em) or ("qwen/qwen3.8-27b" if mode == "bionic" else "qwen3-8b-mf:latest")
 chat_url = f"{BIONIC}/v1/chat/completions" if mode == "bionic" else f"{OLLAMA}/v1/chat/completions"
 try:
     out = http(chat_url, {

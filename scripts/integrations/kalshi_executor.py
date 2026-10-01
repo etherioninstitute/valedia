@@ -323,14 +323,14 @@ def _score_market(m, series):
         if not ok:
             return None
     except Exception:
-        pass
+        return None
     try:
         import kalshi_profit as _kp
         proceed, out = _kp.annotate(out)
         if not proceed:
             return None
     except Exception:
-        pass
+        return None
     return out
 
 
@@ -348,7 +348,7 @@ def _size_contracts(opp, state, cost_per):
         if not ok:
             return 0
     except Exception:
-        pass
+        return 0
     if cost_per <= 0 or cost_per >= 1.0:
         return 0
     max_spend = min(state["max_per_trade"], state["max_deployable"])
@@ -366,7 +366,7 @@ def _size_contracts(opp, state, cost_per):
         if not proceed:
             return 0
     except Exception:
-        pass
+        return 0
     return n
 
 
@@ -403,12 +403,21 @@ def execute_trade(opp, state, dry_run=False):
         result["status"] = "SKIP_LIVE_FENCE"
         result["error"] = "live exec fenced (strategy or oil ticker family)"
         return result
-    
+
+    import informed_before_create as ibc
+    pre = ibc.create_preflight(opp, n_contracts, price_cents)
+    if not pre["ok"]:
+        result["status"] = "SKIP_INFORMED"
+        result["error"] = ",".join(pre["reasons"])
+        return result
+    if pre.get("jev") is not None:
+        result["jev"] = pre["jev"]
+
     try:
         order = create_order(
             ticker=opp["ticker"], side=opp["side"],
             count=n_contracts, price_cents=price_cents,
-            order_type="limit"
+            order_type="limit", informed=pre["informed"],
         )
         result["order"] = order
         fill = {}
@@ -422,6 +431,9 @@ def execute_trade(opp, state, dry_run=False):
         result["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
         if fill.get("order_id"):
             result["order_id"] = fill["order_id"]
+    except ibc.InformedCreateRefused as e:
+        result["status"] = "SKIP_INFORMED"
+        result["error"] = ",".join(e.reasons)
     except Exception as e:
         result["status"] = "FAILED"
         result["error"] = str(e)[:200]
@@ -641,9 +653,21 @@ def run(dry_run=False, max_trades=5, min_score=40):
                     if live_maker:
                         contracts = _size_contracts(opp, state, plan.price_cents / 100.0)
                         if contracts > 0:
-                            oid = maker_mgr.place_maker_order(opp["ticker"], opp.get("side", "yes"),
-                                                              contracts, plan.price_cents,
-                                                              strategy=opp.get("strategy", ""))
+                            import informed_before_create as ibc
+                            pre = ibc.create_preflight(opp, contracts, plan.price_cents)
+                            if not pre["ok"]:
+                                lines.append(
+                                    f"  ⊘ SKIP_INFORMED {opp.get('ticker','?')} "
+                                    f"[{opp.get('strategy','?')}] {','.join(pre['reasons'])}")
+                                continue
+                            oid = maker_mgr.place_maker_order(
+                                opp["ticker"], opp.get("side", "yes"),
+                                contracts, plan.price_cents,
+                                strategy=opp.get("strategy", ""),
+                                informed=pre["informed"])
+                            if not oid:
+                                lines.append(f"  ⊘ maker refused {opp.get('ticker','?')}")
+                                continue
                             lines.append(f"  ◇ MAKER {opp.get('ticker','?')} {contracts}x @{plan.price_cents}c "
                                          f"(id={str(oid)[:12]}) — {plan.reason}")
                             trades_placed += 1
@@ -667,10 +691,22 @@ def run(dry_run=False, max_trades=5, min_score=40):
                 if live_maker:
                     contracts = _size_contracts(opp, state, (opp.get("price") or 0) or 0.01)
                     if contracts > 0:
+                        import informed_before_create as ibc
+                        px = int(round(float(opp.get("price") or 0) * 100))
+                        pre = ibc.create_preflight(opp, contracts, px)
+                        if not pre["ok"]:
+                            lines.append(
+                                f"  ⊘ SKIP_INFORMED {opp.get('ticker','?')} "
+                                f"[{opp.get('strategy','?')}] {','.join(pre['reasons'])}")
+                            continue
                         oid = maker_mgr.place_maker_order(
                             opp["ticker"], opp.get("side", "yes"),
-                            contracts, int(round(float(opp.get("price") or 0) * 100)),
-                            strategy=opp.get("strategy", ""))
+                            contracts, px,
+                            strategy=opp.get("strategy", ""),
+                            informed=pre["informed"])
+                        if not oid:
+                            lines.append(f"  ⊘ maker refused {opp.get('ticker','?')}")
+                            continue
                         lines.append(f"  ◇ MAKER-FIRST {opp.get('ticker','?')} {contracts}x "
                                      f"(id={str(oid)[:12]})")
                         trades_placed += 1

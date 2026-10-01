@@ -12,6 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import crypto_paper as cp
 import crypto_paper_run as cpr
 import valedia_config as vc
@@ -34,13 +37,13 @@ def test_hygiene_and_fence():
     for name in ("crypto_paper.py", "crypto_paper_run.py"):
         _banned(open(os.path.join(HERE, name)).read())
     src = open(os.path.join(HERE, "crypto_paper.py")).read()
-    assert "api.binance.com/api/v3/klines" in src
+    assert "api.binance.us/api/v3/klines" in src
     assert "/api/v3/order" not in src
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.VALEDIA_TRADING_HALT is False
     assert vc.VALEDIA_TREASURY_AUTO is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "crypto_paper" not in cron
     doc = open(os.path.join(ROOT, "recommendations", "CRYPTO-PAPER-DESK.md")).read()

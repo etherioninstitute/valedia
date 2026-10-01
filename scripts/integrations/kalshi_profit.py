@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 import kalshi_fee_map as kfm
 
 TAKER_HURDLE = 0.02
+# Quadratic fee peaks at 50¢. Extra floor inside ±10¢, full size at the peak.
+# ponytail: flat 2¢ tent. Swap for fee(P)-fee(wing) if the PDF coef changes.
+DOME_CENTER = 0.50
+DOME_BAND = 0.10
+DOME_PEAK = 0.02
 DEMOTE_THRESH = 0.03
 DEMOTE_MIN_N = 5
 EMA = 0.3
@@ -51,6 +56,17 @@ def taker_hurdle():
         except (TypeError, ValueError):
             pass
     return TAKER_HURDLE
+
+
+def dome_extra(P):
+    """Extra $/contract near the 50¢ fee dome. Zero outside the band."""
+    try:
+        dist = abs(float(P) - DOME_CENTER)
+    except (TypeError, ValueError):
+        return 0.0
+    if dist >= DOME_BAND:
+        return 0.0
+    return DOME_PEAK * (1.0 - dist / DOME_BAND)
 
 
 def half_spread(bid, ask):
@@ -177,7 +193,7 @@ def save_ledger(doc, path=None):
     try:
         import valedia_config as vc
         ver = vc.VALEDIA_VERSION
-        demote = bool(vc.KALSHI_FILL_LEDGER_DEMOTE)
+        demote = bool(vc.kalshi_fill_ledger_demote_enabled())
     except Exception:
         ver, demote = "unknown", False
     out = dict(doc or {})
@@ -244,16 +260,52 @@ def ingest_fills(rows, path=None, ledger=None):
     return n, doc
 
 
+def ledger_view(ticker, strategy=None, ledger=None, path=None):
+    """Read fill quality. Missing file or no rows is empty, not a zero score.
+
+    demote is evidence (n and score), not the env flag. Empty does not demote.
+    """
+    missing = False
+    if ledger is None:
+        p = path or DEFAULT_LEDGER
+        if not os.path.isfile(p):
+            missing = True
+            doc = {"series": {}, "strategy": {}}
+        else:
+            doc = load_ledger(p)
+    else:
+        doc = ledger if isinstance(ledger, dict) else {"series": {}, "strategy": {}}
+    ser = kfm.series_from_ticker(ticker)
+    best_n, best_score, saw, demote = 0, None, False, False
+    srow = (doc.get("series") or {}).get(ser) if ser else None
+    grow = (doc.get("strategy") or {}).get(strategy) if strategy else None
+    for row in (srow, grow):
+        if not isinstance(row, dict):
+            continue
+        n = int(row.get("n") or 0)
+        if n <= 0:
+            continue
+        saw = True
+        score = float(row.get("score") or 0)
+        if n >= best_n:
+            best_n, best_score = n, score
+        if n >= DEMOTE_MIN_N and score >= DEMOTE_THRESH:
+            demote = True
+    return {
+        "empty": not saw,
+        "missing_file": missing,
+        "series": ser,
+        "n": best_n,
+        "score": best_score,
+        "demote": demote,
+    }
+
+
 def demote_blocks(ticker, strategy=None, ledger=None, path=None):
+    """Annotate-skip. Still flag-gated. Create uses ledger_view, which is not."""
     if not fill_demote_on():
         return False
-    doc = ledger if ledger is not None else load_ledger(path)
-    ser = kfm.series_from_ticker(ticker)
-    for row in ((doc.get("series") or {}).get(ser),
-                (doc.get("strategy") or {}).get(strategy) if strategy else None):
-        if row and int(row.get("n") or 0) >= DEMOTE_MIN_N and float(row.get("score") or 0) >= DEMOTE_THRESH:
-            return True
-    return False
+    return bool(ledger_view(ticker, strategy, ledger=ledger, path=path)["demote"])
 
 
 def annotate(opp, contracts=1, slip=0.0, fmap=None, path=None):
@@ -273,18 +325,19 @@ def annotate(opp, contracts=1, slip=0.0, fmap=None, path=None):
     role = rt["prefer"]
     ev = rt["maker_ev"] if role == "maker" else rt["taker_ev"]
     opp["ev_preflight"] = ev
-    ser = kfm.series_from_ticker(ticker, series)
-    doc = load_ledger(path)
-    q = (doc.get("series") or {}).get(ser) or {}
+    view = ledger_view(
+        ticker, opp.get("strategy") or opp.get("type"), path=path)
     opp["fill_quality"] = {
-        "series": ser,
-        "n": int(q.get("n") or 0),
-        "score": float(q.get("score") or 0),
-        "would_block": demote_blocks(ticker, opp.get("strategy") or opp.get("type"), doc),
+        "series": view["series"],
+        "empty": view["empty"],
+        "missing_file": view["missing_file"],
+        "n": view["n"],
+        "score": view["score"],
+        "would_block": bool(fill_demote_on() and view["demote"]),
     }
     skip = False
     if ev_gate_on() and not ev.get("ok"):
         skip = True
-    if demote_blocks(ticker, opp.get("strategy") or opp.get("type"), doc):
+    if view["demote"] and fill_demote_on():
         skip = True
     return (not skip), opp

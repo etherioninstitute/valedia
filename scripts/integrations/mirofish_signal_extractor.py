@@ -62,7 +62,8 @@ def extract_signals_from_report(markdown_content, report_summary=""):
         # Find all occurrences and get surrounding context (200 chars each side)
         score = 0
         mentions = 0
-        for match in re.finditer(re.escape(keyword), text):
+        # Token boundary: "ada" must not match inside "adapting", "adapted", or "intraday".
+        for match in re.finditer(r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])", text):
             start = max(0, match.start() - 200)
             end = min(len(text), match.end() + 200)
             context = text[start:end]
@@ -363,6 +364,8 @@ def process_mirofish_report(report_json, enrichment=None, out_path=None):
         "overall_bias": round(overall, 1),
         "source": "mirofish_swarm"
     }
+    if isinstance(report_json, dict) and report_json.get("report_id"):
+        result["report_id"] = report_json["report_id"]
 
     dest = out_path or os.path.expanduser("~/.openclaw/workspace/models/mirofish_signal.json")
     # NT-2: stamp neural context when present. Does not change scores/bias/weight.
@@ -400,11 +403,12 @@ def process_mirofish_report(report_json, enrichment=None, out_path=None):
     except Exception:
         pass
 
-    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-    with open(dest, "w") as f:
-        json.dump(result, f, indent=2)
-
-    return result
+    import mirofish_intel_archive as _mia
+    run_id = None
+    if isinstance(report_json, dict):
+        run_id = (report_json.get("simulation_id") or report_json.get("report_id")
+                  or report_json.get("run_id"))
+    return _mia.publish_pass(result, live_path=dest, run_id=run_id)
 
 if __name__ == "__main__":
     # Test with a sample report

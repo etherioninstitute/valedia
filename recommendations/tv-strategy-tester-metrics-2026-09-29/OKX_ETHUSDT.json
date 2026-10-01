@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "metric_count": 19,
+  "strategy": "GROK SuperTrend Strategy paper",
+  "currency": "USDT",
+  "source": "internal_api",
+  "metrics": {
+    "net_profit": 5873.295314153007,
+    "net_profit_percent": 0.5873295314153006,
+    "gross_profit": 12409.957575882005,
+    "gross_loss": 6536.662261728998,
+    "profit_factor": 1.898515951870439,
+    "max_drawdown": 1328.0770833980005,
+    "max_drawdown_percent": 0.08198351886924767,
+    "total_trades": 63,
+    "winning_trades": 31,
+    "losing_trades": 32,
+    "percent_profitable": 0.49206349206349204,
+    "avg_trade": 93.22690975,
+    "largest_win": 3225.987840745001,
+    "largest_loss": 441.607533052,
+    "commission_paid": 184.79902684700002,
+    "sharpe_ratio": 0.11816642260836249,
+    "sortino_ratio": 0.3694065764423652,
+    "buy_hold_return": 106645.31331,
+    "open_pl": 651.138906
+  },
+  "symbol_requested": "OKX:ETHUSDT",
+  "asset_class": "crypto",
+  "venue_label": "OKX",
+  "captured_at": "2026-09-29 20:19:39 PT"
+}

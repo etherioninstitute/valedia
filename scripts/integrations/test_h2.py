@@ -11,6 +11,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import persona_lenses as pl
 from mirofish_signal_extractor import process_mirofish_report
 import valedia_config as vc
@@ -51,7 +54,7 @@ def test_hygiene():
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.REBALANCER_AUTOEXEC is False
-    assert vc.VALEDIA_VERSION == "0.57.0"
+    assert vc.VALEDIA_VERSION == "0.74.1"
 
 
 def test_buffett_crypto_abstains_equity_fear():

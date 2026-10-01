@@ -1,0 +1,96 @@
+{
+  "symbol": "KRAKEN:ETHUSD",
+  "asset_class": "crypto",
+  "venue_label": "Kraken",
+  "ts": "2026-09-29T20:18:22.876619",
+  "set_symbol_rc": 0,
+  "set_symbol_out": "{\n  \"success\": true,\n  \"symbol\": \"KRAKEN:ETHUSD\",\n  \"chart_ready\": false\n}\n",
+  "live_symbol": "KRAKEN:ETHUSD",
+  "resolution": "D",
+  "studies": [
+    "GROK SuperTrend Strategy paper",
+    "Chart Patterns [Tradevisor] \u2014 Auto Detection, Measured Targets & Entry Signals",
+    "Overlay",
+    "Volume"
+  ],
+  "strategy_ok": true,
+  "metric_count": 19,
+  "strategy_name": "GROK SuperTrend Strategy paper",
+  "metrics": {
+    "net_profit": 108207.65075927397,
+    "net_profit_percent": 10.820765075927396,
+    "gross_profit": 165710.77532552296,
+    "gross_loss": 57503.12456624899,
+    "profit_factor": 2.881769931207975,
+    "max_drawdown": 11033.509265109999,
+    "max_drawdown_percent": 0.0883545762417439,
+    "total_trades": 83,
+    "winning_trades": 42,
+    "losing_trades": 41,
+    "percent_profitable": 0.5060240963855421,
+    "avg_trade": 1303.706636,
+    "largest_win": 42261.328832534,
+    "largest_loss": 3679.352654699999,
+    "commission_paid": 1615.4691967259996,
+    "sharpe_ratio": 0.12531173402719667,
+    "sortino_ratio": 2.56994483194113,
+    "buy_hold_return": 39212205.74118901,
+    "open_pl": 5636.111728000001
+  },
+  "strategy_error": null,
+  "last": 2667.01,
+  "quote": {
+    "symbol": "KRAKEN:ETHUSD",
+    "last": 2667.01,
+    "volume": 1485.03294797
+  },
+  "trade_count_sample": 5,
+  "trades_sample": [
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 2178.97,
+      "qty": 9.5745,
+      "time_index": 79
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 1983.07,
+      "qty": 11.6029,
+      "time_index": 80
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 2369.39,
+      "qty": 11.0102,
+      "time_index": 81
+    },
+    {
+      "id": "S",
+      "type": "MARKET",
+      "side": "sell",
+      "entry": true,
+      "price": 2129.74,
+      "qty": 10.426,
+      "time_index": 82
+    },
+    {
+      "id": "L",
+      "type": "MARKET",
+      "side": "buy",
+      "entry": true,
+      "price": 1805.53,
+      "qty": 12.0053,
+      "time_index": 83
+    }
+  ],
+  "symbol_requested": "KRAKEN:ETHUSD"
+}

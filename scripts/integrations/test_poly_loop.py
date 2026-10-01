@@ -14,6 +14,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import poly_loop
 import valedia_config as vc
 from test_poly_us import _restore
@@ -81,7 +84,7 @@ def test_hygiene_and_fence():
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert vc.POLY_LOOP_EDGE_PTS == 8.0
     assert vc.POLY_LOOP_MAX_OPEN == 5
     assert vc.POLY_LOOP_DD_STOP == 0.40

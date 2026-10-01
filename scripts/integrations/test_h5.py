@@ -13,6 +13,9 @@ from decimal import Decimal
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# Unit tests assert git-default OFF without Burton's ~/.openclaw/.env flips.
+os.environ["OPENCLAW_SKIP_ENV"] = "1"
+
 import desk_roles as dr
 import hl_public_info as hpi
 import intel_opportunity_gatherer as iog
@@ -72,9 +75,9 @@ def test_hygiene():
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.MIROFISH_AUTO_RAISE is False
     assert hpi.http_enabled() is False
-    assert vc.VALEDIA_VERSION == "0.57.0", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     vc._STAMP_CACHE = None
-    assert vc.version_stamp().startswith("v0.57.0 ")
+    assert vc.version_stamp().startswith("v0.74.1 ")
 
 
 def test_desk_stages_and_ticket():
@@ -120,7 +123,7 @@ def test_hl_snapshot_injected_no_http():
     assert "/exchange" not in json.dumps(snap).lower() or "No /exchange" in snap["safety"]
     assert Decimal(snap["book"]["spread_bps"]) > 0
     assert "5" in snap["book"]["depth"]
-    assert snap["valedia_version"] == "0.57.0"
+    assert snap["valedia_version"] == "0.74.1"
     md = tempfile.mkdtemp(prefix="h5_hl_")
     path = hpi.write_snapshot(snap, models_dir=md)
     assert os.path.basename(path) == "hl_public_info.json"

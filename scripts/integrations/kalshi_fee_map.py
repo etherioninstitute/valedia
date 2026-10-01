@@ -378,6 +378,20 @@ def default_artifact_path():
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "..", "recommendations", "kalshi-fee-map.json"))
 
+def artifact_status(path=None):
+    out = {"healthy": False, "reason": "missing", "series": {}, "mode": None, "as_of": None}
+    try:
+        doc = json.load(open(path or default_artifact_path()))
+    except (OSError, ValueError, TypeError):
+        return out
+    if not isinstance(doc, dict):
+        out["reason"] = "shape"
+        return out
+    series = doc.get("series") if isinstance(doc.get("series"), dict) else {}
+    mode, as_of = doc.get("mode"), doc.get("as_of")
+    ok = mode == "get" and bool(series) and bool(as_of)
+    out.update(healthy=ok, reason="ok" if ok else "unhealthy", series=series, mode=mode, as_of=as_of)
+    return out
 
 def save_artifact(fmap, counts, mode, path=None, as_of=None, errors=None):
     path = path or default_artifact_path()
