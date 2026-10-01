@@ -1,0 +1,1129 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Valedia Kalshi Trade Path",
+    "quality_profile": "showcase",
+    "output": ".archify/workflow-valedia-kalshi-trade-path-20261001-162926/valedia-kalshi-trade-path.html",
+    "repository": {
+      "url": "https://github.com/etherioninstitute/valedia",
+      "provider": "github",
+      "revision": "2290388543c23ba0a9e815b51c98a733207bf0d4"
+    }
+  },
+  "lanes": [
+    {
+      "id": "alloc",
+      "label": "Live: allocator cycle"
+    },
+    {
+      "id": "skip",
+      "label": "Live: execute_allocations skip gates"
+    },
+    {
+      "id": "sports",
+      "label": "Live: sports engine path (separate entry)"
+    },
+    {
+      "id": "pre",
+      "label": "Live: pre-create gates, order, fill truth"
+    },
+    {
+      "id": "fill",
+      "label": "Live: fill outcome and ledger"
+    },
+    {
+      "id": "ledger",
+      "label": "Offline: ledger and pause feedback",
+      "variant": "exception"
+    },
+    {
+      "id": "bt",
+      "label": "Offline: backtest gate for edge changes",
+      "variant": "exception"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "cron_alloc",
+      "lane": "alloc",
+      "col": 0,
+      "type": "external",
+      "label": "1 allocator_run.py",
+      "sublabel": "cron :20 every 4h",
+      "sources": [
+        {
+          "path": "scripts/integrations/allocator_run.py",
+          "line": 5,
+          "end_line": 5,
+          "label": "cron :20/4h"
+        },
+        {
+          "path": "scripts/integrations/allocator_run.py",
+          "line": 11,
+          "end_line": 11,
+          "label": "run(live)"
+        },
+        {
+          "path": "scripts/install_cron.sh",
+          "line": 46,
+          "end_line": 46,
+          "label": "crontab"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "run",
+      "lane": "alloc",
+      "col": 1,
+      "type": "backend",
+      "label": "2 Allocator run()",
+      "sublabel": "capital, gather, rank",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 727,
+          "end_line": 729,
+          "label": "run()"
+        },
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 785,
+          "end_line": 787,
+          "label": "gather+rank"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "filt",
+      "lane": "alloc",
+      "col": 2,
+      "type": "security",
+      "label": "3 Allocate filters",
+      "sublabel": "pause, EV 3%, fee map",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 350,
+          "end_line": 369,
+          "label": "pre-size gates"
+        },
+        {
+          "path": "scripts/integrations/kalshi_profit.py",
+          "line": 311,
+          "end_line": 341,
+          "label": "annotate"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "size",
+      "lane": "alloc",
+      "col": 3,
+      "type": "backend",
+      "label": "4 Cap + half-Kelly",
+      "sublabel": "dynamic_per_trade_cap",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 371,
+          "end_line": 381,
+          "label": "cap, Kelly"
+        },
+        {
+          "path": "scripts/integrations/valedia_config.py",
+          "line": 737,
+          "end_line": 756,
+          "label": "dynamic cap"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "exec",
+      "lane": "alloc",
+      "col": 4,
+      "type": "backend",
+      "label": "5 Execute loop",
+      "sublabel": "execute_allocations()",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 434,
+          "end_line": 462,
+          "label": "entry, shadow"
+        },
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 822,
+          "end_line": 822,
+          "label": "called top 15"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "halt",
+      "lane": "alloc",
+      "col": 5,
+      "type": "security",
+      "label": "6 Trading halt",
+      "sublabel": "require_not_halted",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 464,
+          "end_line": 471,
+          "label": "HALTED"
+        },
+        {
+          "path": "scripts/integrations/valedia_config.py",
+          "line": 467,
+          "end_line": 472,
+          "label": "central gate"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "paused",
+      "lane": "skip",
+      "col": 5,
+      "type": "security",
+      "label": "7 Strategy pause",
+      "sublabel": "pnl_tracker TTL pause",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 473,
+          "end_line": 478,
+          "label": "SKIP_PAUSED"
+        },
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 315,
+          "end_line": 320,
+          "label": "is_strategy_paused"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "fence",
+      "lane": "skip",
+      "col": 4,
+      "type": "security",
+      "label": "8 Live-exec fence",
+      "sublabel": "weather/oil fenced",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 480,
+          "end_line": 487,
+          "label": "SKIP_LIVE_FENCE"
+        },
+        {
+          "path": "scripts/integrations/valedia_config.py",
+          "line": 613,
+          "end_line": 625,
+          "label": "live_exec_fenced"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "blk",
+      "lane": "skip",
+      "col": 3,
+      "type": "security",
+      "label": "9 Fail blacklist",
+      "sublabel": "3+ errors skipped",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 489,
+          "end_line": 494,
+          "label": "SKIP_BLACKLISTED"
+        },
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 430,
+          "end_line": 431,
+          "label": "count>=3"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "cat",
+      "lane": "skip",
+      "col": 2,
+      "type": "security",
+      "label": "10 Category gate",
+      "sublabel": "should_trade_category",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 496,
+          "end_line": 504,
+          "label": "SKIP_CATEGORY_GATE"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 743,
+          "end_line": 786,
+          "label": "fee-true net gate"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "intel",
+      "lane": "skip",
+      "col": 1,
+      "type": "security",
+      "label": "11 Intel vetting",
+      "sublabel": "fail-closed on error",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 506,
+          "end_line": 534,
+          "label": "SKIP_INTEL_*"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "held",
+      "lane": "skip",
+      "col": 0,
+      "type": "security",
+      "label": "12 Held position?",
+      "sublabel": "get_positions()",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 536,
+          "end_line": 549,
+          "label": "SKIP_HELD"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "sp_cron",
+      "lane": "sports",
+      "col": 1,
+      "type": "external",
+      "label": "sports_run.py",
+      "sublabel": "cron :00 every 2h",
+      "sources": [
+        {
+          "path": "scripts/integrations/sports_run.py",
+          "line": 3,
+          "end_line": 4,
+          "label": "cron :00/2h"
+        },
+        {
+          "path": "scripts/integrations/sports_run.py",
+          "line": 9,
+          "end_line": 9,
+          "label": "run(live)"
+        },
+        {
+          "path": "scripts/install_cron.sh",
+          "line": 45,
+          "end_line": 45,
+          "label": "crontab"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "sp_size",
+      "lane": "sports",
+      "col": 2,
+      "type": "backend",
+      "label": "size_bets()",
+      "sublabel": "cap + ftl.kalshi_fee",
+      "sources": [
+        {
+          "path": "scripts/integrations/sports_engine.py",
+          "line": 220,
+          "end_line": 227,
+          "label": "dynamic cap"
+        },
+        {
+          "path": "scripts/integrations/sports_engine.py",
+          "line": 254,
+          "end_line": 255,
+          "label": "kalshi_fee"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "sp_gate",
+      "lane": "sports",
+      "col": 3,
+      "type": "security",
+      "label": "Sports cat. gate",
+      "sublabel": "runs after sizing",
+      "sources": [
+        {
+          "path": "scripts/integrations/sports_engine.py",
+          "line": 455,
+          "end_line": 464,
+          "label": "should_trade_category"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "sp_exec",
+      "lane": "sports",
+      "col": 4,
+      "type": "backend",
+      "label": "execute_bets()",
+      "sublabel": "no informed= passed",
+      "sources": [
+        {
+          "path": "scripts/integrations/sports_engine.py",
+          "line": 270,
+          "end_line": 298,
+          "label": "SKIP_HELD, create"
+        },
+        {
+          "path": "scripts/integrations/sports_engine.py",
+          "line": 310,
+          "end_line": 312,
+          "label": "FAILED on raise"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "evpf",
+      "lane": "pre",
+      "col": 0,
+      "type": "security",
+      "label": "13 EV pre-flight",
+      "sublabel": "fee-net EV, maker",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 550,
+          "end_line": 589,
+          "label": "SKIP_EV_PREFLIGHT"
+        },
+        {
+          "path": "scripts/integrations/kalshi_profit.py",
+          "line": 311,
+          "end_line": 341,
+          "label": "annotate"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "clock",
+      "lane": "pre",
+      "col": 1,
+      "type": "security",
+      "label": "14 Session clock",
+      "sublabel": "before_create",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 590,
+          "end_line": 595,
+          "label": "SKIP_SESSION etc"
+        },
+        {
+          "path": "scripts/integrations/session_clocks.py",
+          "line": 336,
+          "end_line": 366,
+          "label": "before_create"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "informed",
+      "lane": "pre",
+      "col": 2,
+      "type": "security",
+      "label": "15 Informed gate",
+      "sublabel": "create_preflight",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 596,
+          "end_line": 603,
+          "label": "SKIP_INFORMED"
+        },
+        {
+          "path": "scripts/integrations/informed_before_create.py",
+          "line": 547,
+          "end_line": 560,
+          "label": "create_preflight"
+        },
+        {
+          "path": "scripts/integrations/informed_before_create.py",
+          "line": 261,
+          "end_line": 304,
+          "label": "kalshi_reasons"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "create",
+      "lane": "pre",
+      "col": 3,
+      "type": "cloud",
+      "label": "16 create_order",
+      "sublabel": "POST + halt re-check",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 620,
+          "end_line": 620,
+          "label": "call site"
+        },
+        {
+          "path": "scripts/integrations/kalshi_auth.py",
+          "line": 163,
+          "end_line": 174,
+          "label": "create_order"
+        },
+        {
+          "path": "scripts/integrations/kalshi_auth.py",
+          "line": 90,
+          "end_line": 90,
+          "label": "V2 endpoint"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "resolve",
+      "lane": "pre",
+      "col": 4,
+      "type": "backend",
+      "label": "17 Resolve fill",
+      "sublabel": "resolve_kalshi_fill",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 625,
+          "end_line": 628,
+          "label": "fill truth"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 449,
+          "end_line": 466,
+          "label": "resolve"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "book",
+      "lane": "pre",
+      "col": 5,
+      "type": "backend",
+      "label": "18 Book fill",
+      "sublabel": "book_kalshi_fill",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 629,
+          "end_line": 635,
+          "label": "book"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 469,
+          "end_line": 494,
+          "label": "book_kalshi_fill"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "unrec",
+      "lane": "fill",
+      "col": 4,
+      "type": "security",
+      "label": "UNRECONCILED",
+      "sublabel": "ack only, fee 0",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 638,
+          "end_line": 638,
+          "label": "status"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 238,
+          "end_line": 247,
+          "label": "record_unreconciled"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 481,
+          "end_line": 486,
+          "label": "incomplete fill"
+        }
+      ],
+      "width": 132,
+      "icon": "waiting",
+      "yOffset": 45
+    },
+    {
+      "id": "executed",
+      "lane": "fill",
+      "col": 4,
+      "type": "backend",
+      "label": "EXECUTED",
+      "sublabel": "fill.complete, FILLED",
+      "sources": [
+        {
+          "path": "scripts/integrations/master_allocator.py",
+          "line": 638,
+          "end_line": 638,
+          "label": "status"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 488,
+          "end_line": 494,
+          "label": "record_entry"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 30,
+          "end_line": 35,
+          "label": "kalshi_fee"
+        }
+      ],
+      "width": 132,
+      "icon": "success",
+      "yOffset": -45
+    },
+    {
+      "id": "ledger",
+      "lane": "fill",
+      "col": 3,
+      "type": "database",
+      "label": "Forward-test ledger",
+      "sublabel": "forward_test_ledger.jsonl",
+      "sources": [
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 24,
+          "end_line": 25,
+          "label": "LEDGER path"
+        },
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 85,
+          "end_line": 88,
+          "label": "_append"
+        }
+      ],
+      "width": 150
+    },
+    {
+      "id": "reconcile",
+      "lane": "ledger",
+      "col": 3,
+      "type": "backend",
+      "label": "reconcile() 6h",
+      "sublabel": "settle vs real fills",
+      "sources": [
+        {
+          "path": "scripts/integrations/forward_test_ledger.py",
+          "line": 513,
+          "end_line": 560,
+          "label": "settlement rows"
+        },
+        {
+          "path": "scripts/integrations/reconcile_run.py",
+          "line": 24,
+          "end_line": 27,
+          "label": "cron wrapper"
+        },
+        {
+          "path": "scripts/install_cron.sh",
+          "line": 50,
+          "end_line": 50,
+          "label": "crontab"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "writer",
+      "lane": "ledger",
+      "col": 4,
+      "type": "backend",
+      "label": "pnl_run pause",
+      "sublabel": "fee-true net only",
+      "sources": [
+        {
+          "path": "scripts/integrations/pnl_run.py",
+          "line": 8,
+          "end_line": 10,
+          "label": "run()"
+        },
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 328,
+          "end_line": 447,
+          "label": "update_strategy_blacklist"
+        },
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 262,
+          "end_line": 276,
+          "label": "fee-true only"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "registry",
+      "lane": "ledger",
+      "col": 5,
+      "type": "database",
+      "label": "Pause registry",
+      "sublabel": "strategy_blacklist.json",
+      "sources": [
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 165,
+          "end_line": 165,
+          "label": "path"
+        },
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 279,
+          "end_line": 312,
+          "label": "load, paused_until"
+        },
+        {
+          "path": "scripts/integrations/pnl_tracker.py",
+          "line": 445,
+          "end_line": 446,
+          "label": "write"
+        }
+      ],
+      "width": 140
+    },
+    {
+      "id": "pol",
+      "lane": "bt",
+      "col": 0,
+      "type": "external",
+      "label": "Policy JSONs",
+      "sublabel": "baseline + candidate",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 11,
+          "end_line": 14,
+          "label": "policy schema"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 65,
+          "end_line": 100,
+          "label": "load_policy"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "load",
+      "lane": "bt",
+      "col": 1,
+      "type": "backend",
+      "label": "build_trades()",
+      "sublabel": "fee-true settled rows",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 231,
+          "end_line": 290,
+          "label": "build_trades"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 158,
+          "end_line": 208,
+          "label": "fee_model"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "replay",
+      "lane": "bt",
+      "col": 2,
+      "type": "backend",
+      "label": "replay()",
+      "sublabel": "baseline vs candidate",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 311,
+          "end_line": 337,
+          "label": "replay"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 103,
+          "end_line": 115,
+          "label": "decide"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "mc",
+      "lane": "bt",
+      "col": 3,
+      "type": "backend",
+      "label": "monte_carlo()",
+      "sublabel": "paired bootstrap",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 339,
+          "end_line": 366,
+          "label": "paired bootstrap"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 44,
+          "end_line": 45,
+          "label": "defaults"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "verdict",
+      "lane": "bt",
+      "col": 4,
+      "type": "security",
+      "label": "Verdict",
+      "sublabel": "PASS FAIL INSUFF. DATA",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 369,
+          "end_line": 399,
+          "label": "evaluate"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 43,
+          "end_line": 43,
+          "label": "min-n floor"
+        },
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 49,
+          "end_line": 50,
+          "label": "exit codes"
+        }
+      ],
+      "width": 132
+    },
+    {
+      "id": "rule",
+      "lane": "bt",
+      "col": 5,
+      "type": "external",
+      "label": "Ship rule",
+      "sublabel": "docstring, unenforced",
+      "sources": [
+        {
+          "path": "scripts/integrations/backtest_gate.py",
+          "line": 1,
+          "end_line": 9,
+          "label": "must clear gate"
+        }
+      ],
+      "width": 132
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "from": "cron_alloc",
+      "to": "run",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e2",
+      "from": "run",
+      "to": "filt",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e3",
+      "from": "filt",
+      "to": "size",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e4",
+      "from": "size",
+      "to": "exec",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e5",
+      "from": "exec",
+      "to": "halt",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e6",
+      "from": "halt",
+      "to": "paused",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e7",
+      "from": "paused",
+      "to": "fence",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e8",
+      "from": "fence",
+      "to": "blk",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e9",
+      "from": "blk",
+      "to": "cat",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e10",
+      "from": "cat",
+      "to": "intel",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e11",
+      "from": "intel",
+      "to": "held",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e12",
+      "from": "held",
+      "to": "evpf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e13",
+      "from": "evpf",
+      "to": "clock",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e14",
+      "from": "clock",
+      "to": "informed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e15",
+      "from": "informed",
+      "to": "create",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e16",
+      "from": "create",
+      "to": "resolve",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e17",
+      "from": "resolve",
+      "to": "book",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e18",
+      "from": "book",
+      "to": "executed",
+      "variant": "default",
+      "label": "complete",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "e19",
+      "from": "book",
+      "to": "unrec",
+      "variant": "default",
+      "label": "incomplete",
+      "role": "branch",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "e20",
+      "from": "executed",
+      "to": "ledger",
+      "variant": "default",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "e21",
+      "from": "unrec",
+      "to": "ledger",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "e22",
+      "from": "ledger",
+      "to": "reconcile",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "e23",
+      "from": "reconcile",
+      "to": "writer",
+      "variant": "dashed"
+    },
+    {
+      "id": "e24",
+      "from": "writer",
+      "to": "registry",
+      "variant": "dashed"
+    },
+    {
+      "id": "e25",
+      "from": "registry",
+      "to": "paused",
+      "variant": "security",
+      "label": "TTL read",
+      "role": "return"
+    },
+    {
+      "id": "e26",
+      "from": "ledger",
+      "to": "load",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "top"
+    },
+    {
+      "id": "e27",
+      "from": "pol",
+      "to": "load",
+      "variant": "dashed"
+    },
+    {
+      "id": "e28",
+      "from": "load",
+      "to": "replay",
+      "variant": "dashed"
+    },
+    {
+      "id": "e29",
+      "from": "replay",
+      "to": "mc",
+      "variant": "dashed"
+    },
+    {
+      "id": "e30",
+      "from": "mc",
+      "to": "verdict",
+      "variant": "dashed"
+    },
+    {
+      "id": "e31",
+      "from": "verdict",
+      "to": "rule",
+      "variant": "dashed"
+    },
+    {
+      "id": "s1",
+      "from": "sp_cron",
+      "to": "sp_size",
+      "variant": "default"
+    },
+    {
+      "id": "s2",
+      "from": "sp_size",
+      "to": "sp_gate",
+      "variant": "default"
+    },
+    {
+      "id": "s3",
+      "from": "sp_gate",
+      "to": "sp_exec",
+      "variant": "default"
+    },
+    {
+      "id": "s4",
+      "from": "sp_exec",
+      "to": "create",
+      "variant": "dashed",
+      "label": "create_order"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "Code vs described order",
+      "items": [
+        "sports_run.py calls sports_engine.run, not execute_allocations; it has its own sizing and category gate (sports_engine.py:455-467)",
+        "Dynamic cap and half-Kelly run in allocate() (step 4) before execute_allocations, not after the clocks (master_allocator.py:371-381)",
+        "kalshi_fee is not a standalone gate: allocator uses fee map + kalshi_profit EV; kalshi_fee books entry_fee and sizes sports"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Fail-open vs fail-closed",
+      "items": [
+        "Fail-open: strategy pause, category gate (errors allow)",
+        "Fail-closed: intel vetting, EV pre-flight, clocks, informed pre-flight, create_order re-check",
+        "Bare POST ack is UNRECONCILED, never a live open (master_allocator.py:623-638)"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Offline side",
+      "items": [
+        "Pause registry is written only from fee-true category_stats; fee-blind P&L is report-only (pnl_tracker.py:237-276)",
+        "backtest_gate reads the ledger, writes nothing, no orders (backtest_gate.py:8-9); min-n hard floor 30 (:43); ship rule is documented, not enforced in code",
+        "Runtime ledger is ~/.openclaw/workspace/models (forward_test_ledger.py:24); backtest_gate defaults to repo models/ (backtest_gate.py:41)"
+      ]
+    }
+  ]
+}
