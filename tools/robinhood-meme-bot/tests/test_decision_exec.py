@@ -18,7 +18,7 @@ def test_stub_is_safe_skip_and_selectable():
 
 def test_default_engine_is_nimble2():
     eng = load_engine("")
-    assert isinstance(eng, NimbleEngine) and eng.model == "nimble2"
+    assert isinstance(eng, NimbleEngine) and eng.model == "nimble:latest"
 
 
 def test_plugin_loading_and_errors():
@@ -96,7 +96,7 @@ def test_config_defaults_and_validation():
     assert cfg.factory_address == "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
     assert (cfg.min_liquidity_usd, cfg.min_confidence, cfg.max_risk_score) == (20000.0, 0.70, 4)
     assert (cfg.decision_timeout_s, cfg.warmup_timeout_s) == (10.0, 120.0)
-    assert cfg.nimble_url == "http://127.0.0.1:11434/v1/systemone" and cfg.nimble_model == "nimble2"
+    assert cfg.nimble_url == "http://127.0.0.1:11434/v1/systemone" and cfg.nimble_model == "nimble:latest"
     assert cfg.nimble_allow_remote is False and cfg.decisions_log == "decisions.jsonl"
     a, b = "0x" + "ab" * 20, "0x" + "cd" * 20
     cfg = load_config(env={"MIN_CONFIDENCE": "0.9", "MAX_BLOCK_RANGE": "500",

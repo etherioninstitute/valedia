@@ -30,10 +30,11 @@ def test_request_shape_and_pin():
     out = eng.decide(STATE)
     (url, payload, timeout), = fake.requests
     assert url == "http://127.0.0.1:11434/v1/systemone" and timeout == 10.0
-    assert payload["model"] == "nimble2" and payload["keep_alive"] == "30m"
+    assert payload["model"] == "nimble:latest" and payload["keep_alive"] == "30m"
     assert payload["state"] == STATE and payload["questions"] == QUESTIONS
     assert set(payload) == {"model", "state", "questions", "keep_alive"}  # no temperature etc.
-    assert out["error"] is None and out["model"] == "nimble2"
+    assert out["error"] is None and out["model"] == "nimble:latest"
+    assert fake.tag_requests == [("http://127.0.0.1:11434/api/tags", 10.0)]  # digest pin
 
 
 def test_questions_contain_no_thresholds_and_risk_labels_are_choice():
@@ -76,7 +77,8 @@ def test_response_parsing_and_risk_expected():
     (lambda b: b["answers"]["risk_score"].update(choice="11"), "risk label"),
     (lambda b: b["answers"]["risk_score"].update(choice="0"), "risk label"),
     (lambda b: b["answers"].pop("risk_score"), "risk label"),
-    (lambda b: b.update(model="nimble"), "not Nimble 2"),
+    (lambda b: b.update(model="nimble:9b"), "not Nimble 2"),
+    (lambda b: b.update(model="jev:latest"), "not Nimble 2"),
 ])
 def test_malformed_responses_fail_closed(mutate, reason):
     body = nimble_body("buy", 0.9, "2")
@@ -102,7 +104,7 @@ def test_non_dict_response_fails_closed():
 
 
 def test_refused_pin_never_posts():
-    for bad in ("nimble", "jev-latest", "nimble:9b"):
+    for bad in ("jev-latest", "nimble:9b", "nimble:v1", "nimble:latest-v1"):
         eng, fake = engine(model=bad)
         out = eng.decide(STATE)
         assert out["action"] == "skip" and "Nimble 2" in out["error"] and fake.requests == []
@@ -155,9 +157,9 @@ def test_ask_nimble_module_function_refuses_bad_model(monkeypatch):
     monkeypatch.delenv("NIMBLE_MODEL", raising=False)
     from rh_meme_bot import decision_engine as de
     monkeypatch.setattr(de, "_DEFAULT", NimbleEngine(transport=FakeNimble()))
-    assert ask_nimble(STATE, QUESTIONS)["model"] == "nimble2"
+    assert ask_nimble(STATE, QUESTIONS)["model"] == "nimble:latest"
     with pytest.raises(de.NimbleError, match="refused"):
-        ask_nimble(STATE, QUESTIONS, model="nimble")
+        ask_nimble(STATE, QUESTIONS, model="nimble:9b")
 
 
 def test_timeouts_decision_vs_warmup_and_hard_cap():
@@ -207,7 +209,7 @@ def test_http_transport_keeps_raw_text_on_bad_json_and_http_error(monkeypatch):
             return self.resp
 
     monkeypatch.setattr(requests, "Session", Sess)
-    eng = NimbleEngine()  # default transport = requests
+    eng = NimbleEngine(model="nimble2")  # default transport = requests; explicit v2 name
     out = eng.decide(STATE)
     assert out["action"] == "skip" and "not JSON" in out["error"]
     assert out["raw"] == "<html>proxy error</html>"

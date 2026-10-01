@@ -16,6 +16,19 @@ SEL_LIQUIDITY = "0x1a686502"
 SEL_TOKEN0 = "0x0dfe1681"
 SEL_TOKEN1 = "0xd21220a7"
 SEL_BALANCE_OF = "0x70a08231"
+SEL_GET_POOL = "0x1698ee82"  # UniswapV3Factory.getPool(address,address,uint24)
+
+# --- Uniswap v4 (all verified against keccak in tests) ---
+# Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1,
+#            uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)
+V4_INITIALIZE_TOPIC = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+# ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower,
+#                 int24 tickUpper, int256 liquidityDelta, bytes32 salt)
+V4_MODIFY_LIQUIDITY_TOPIC = "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
+SEL_V4_GET_SLOT0 = "0xc815641c"  # StateView.getSlot0(bytes32)
+SEL_V4_GET_LIQUIDITY = "0xfa6793d5"  # StateView.getLiquidity(bytes32)
+SEL_V4_POOL_MANAGER = "0xdc4c90d3"  # StateView.poolManager() (ImmutableState)
+V4_DYNAMIC_FEE = 0x800000  # LPFeeLibrary.DYNAMIC_FEE_FLAG
 
 
 def strip0x(h: str) -> str:
@@ -50,6 +63,20 @@ def decode_address(data: str, index: int = 0) -> Optional[str]:
 def encode_balance_of(holder: str) -> str:
     """Calldata for balanceOf(holder)."""
     return SEL_BALANCE_OF + strip0x(holder).lower().rjust(64, "0")
+
+
+def encode_get_pool(token_a: str, token_b: str, fee: int) -> str:
+    """Calldata for UniswapV3Factory.getPool(tokenA, tokenB, fee)."""
+    return (SEL_GET_POOL + strip0x(token_a).lower().rjust(64, "0")
+            + strip0x(token_b).lower().rjust(64, "0") + format(fee, "064x"))
+
+
+def encode_bytes32_call(selector: str, word: str) -> str:
+    """Calldata for f(bytes32)."""
+    w = strip0x(word).lower()
+    if len(w) != 64:
+        raise ValueError(f"bad bytes32: {word!r}")
+    return selector + w
 
 
 def topic_to_address(topic: str) -> str:

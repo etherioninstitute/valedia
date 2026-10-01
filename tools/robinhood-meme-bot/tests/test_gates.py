@@ -5,7 +5,7 @@ from rh_meme_bot.gates import evaluate_gates, first_failure
 
 CFG = Config()  # 20000 / 0.70 / 4
 GOOD_STATE = {"liquidity_usd": 20000.0, "owner_renounced": True, "contract_has_code": True,
-              "price_in_quote": 0.5}
+              "price_in_quote": 0.5, "has_hooks": False, "dynamic_fee": False}
 GOOD_DEC = {"action": "buy", "confidence": 0.70, "risk_score": 4}
 
 
@@ -19,7 +19,7 @@ def failed(gates):
 
 def test_all_pass_at_exact_boundaries():
     final, gates = run()
-    assert final == "buy" and failed(gates) == [] and len(gates) == 7
+    assert final == "buy" and failed(gates) == [] and len(gates) == 9
     assert first_failure(gates) is None
     assert {"gate", "value", "threshold", "passed"} <= set(gates[0])
 
@@ -67,3 +67,34 @@ def test_thresholds_come_from_config():
     final, _ = evaluate_gates({"action": "buy", "confidence": 0.5, "risk_score": 6},
                               {**GOOD_STATE, "liquidity_usd": 100.0}, cfg)
     assert final == "buy"
+
+
+HOOK = "0x" + "40" * 19 + "c0"
+
+
+def test_hooks_gate_blocks_unless_allowlisted():
+    final, gates = evaluate_gates(GOOD_DEC, {**GOOD_STATE, "has_hooks": True}, CFG, HOOK)
+    assert final == "skip" and failed(gates) == ["v4_hooks"]
+    assert next(g for g in gates if g["gate"] == "v4_hooks")["value"] == HOOK
+    allow = Config(allowed_v4_hooks=frozenset({HOOK}))
+    assert evaluate_gates(GOOD_DEC, {**GOOD_STATE, "has_hooks": True}, allow,
+                          HOOK.upper().replace("0X", "0x"))[0] == "buy"
+    other = "0x" + "41" * 20
+    assert failed(evaluate_gates(GOOD_DEC, {**GOOD_STATE, "has_hooks": True}, allow,
+                                 other)[1]) == ["v4_hooks"]
+    assert failed(run(has_hooks=None)[1]) == ["v4_hooks"]  # unknown = fail-closed
+
+
+def test_dynamic_fee_gate_needs_opt_in():
+    assert failed(run(dynamic_fee=True)[1]) == ["v4_dynamic_fee"]
+    assert evaluate_gates(GOOD_DEC, {**GOOD_STATE, "dynamic_fee": True},
+                          Config(allow_dynamic_fee=True))[0] == "buy"
+    assert failed(run(dynamic_fee=None)[1]) == ["v4_dynamic_fee"]
+
+
+def test_only_liquidity_fails_ignores_model_gates():
+    from rh_meme_bot.gates import only_liquidity_fails
+    assert only_liquidity_fails(run({"action": "skip"}, liquidity_usd=0.0)[1])
+    assert not only_liquidity_fails(run(liquidity_usd=0.0, owner_renounced=False)[1])
+    assert not only_liquidity_fails(run()[1])
+    assert not only_liquidity_fails(run(liquidity_usd=0.0, has_hooks=True)[1])

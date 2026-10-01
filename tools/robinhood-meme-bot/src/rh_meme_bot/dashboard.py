@@ -30,9 +30,18 @@ def fmt_usd(v: Optional[float]) -> str:
 
 
 def flags(r: dict) -> str:
-    """Compact owner/code flags: R=renounced, O=owned, N=no owner(), code yes/no."""
+    """Compact flags: owner R=renounced/O=owned/N=no owner(), code Y/N, v4 hooks Y/N,
+    'dynfee' for a dynamic-fee v4 pool."""
     owner = {"renounced": "R", "no_owner_fn": "N"}.get(r.get("owner_status"), "O")
-    return f"owner:{owner} code:{'Y' if r.get('code') else 'N'}"
+    out = f"owner:{owner} code:{'Y' if r.get('code') else 'N'}"
+    if r.get("version") == "v4":
+        out += f" hooks:{'Y' if r.get('has_hooks') else 'N'}"
+        out += " dynfee" if r.get("dynamic_fee") else ""
+    return out
+
+
+def fee_text(r: dict) -> str:
+    return "dyn" if r.get("dynamic_fee") else str(r.get("fee"))
 
 
 def now_hms() -> str:
@@ -57,14 +66,15 @@ class PlainSink:
         self._w(f"[engine] {format_status(snap)}")
 
     def launch(self, r: dict) -> None:
-        self._w(f"[launch] {r['time']} pool={r['pool']} sym={r['symbol'] or '-'} fee={r['fee']} "
+        self._w(f"[launch] {r['time']} {r.get('version', 'v3')} pool={r['pool']} "
+                f"sym={r['symbol'] or '-'} fee={fee_text(r)} "
                 f"price={fmt_num(r['price'])} liq={fmt_usd(r['liquidity_usd'])} {flags(r)}")
 
     def decision(self, r: dict) -> None:
         why = f" first_fail={r['first_fail']}" if r.get("first_fail") else ""
         err = f" error={r['error']}" if r.get("error") else ""
         star = " BUY *" if r["final_action"] == "buy" else ""
-        self._w(f"[decision] pool={r['pool']} model={r['action']}@{r['confidence']:.2f} "
+        self._w(f"[decision] {r.get('version', 'v3')} pool={r['pool']} model={r['action']}@{r['confidence']:.2f} "
                 f"risk={r['risk_score']} {_lat(r)} final={r['final_action']}{star}{why}{err}")
 
     def action(self, text: str) -> None:
@@ -107,11 +117,12 @@ class Dashboard:
     # --- rendering ---
     def render(self) -> Layout:
         t = Table(expand=True, show_edge=False)
-        for col in ("time", "pool", "token", "fee", "price", "liquidity", "flags"):
+        for col in ("time", "ver", "pool", "token", "fee", "price", "liquidity", "flags"):
             t.add_column(col, overflow="fold")
         for r in self.launches:
-            t.add_row(r["time"], short(r["pool"]), r["symbol"] or short(r.get("token")),
-                      str(r["fee"]), fmt_num(r["price"]), fmt_usd(r["liquidity_usd"]), flags(r))
+            t.add_row(r["time"], r.get("version", "v3"), short(r["pool"]),
+                      r["symbol"] or short(r.get("token")), fee_text(r), fmt_num(r["price"]),
+                      fmt_usd(r["liquidity_usd"]), flags(r))
         d = Table(expand=True, show_edge=False)
         for col in ("pool", "model", "conf", "risk", "latency", "final", "first failing gate"):
             d.add_column(col, overflow="fold")

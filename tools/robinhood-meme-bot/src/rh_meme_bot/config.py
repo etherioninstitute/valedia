@@ -8,9 +8,12 @@ from typing import Mapping, Optional
 
 from dotenv import dotenv_values
 
+from .decision_engine import DEFAULT_NIMBLE_MODEL, DEFAULT_NIMBLE_URL, NIMBLE2_DIGEST
+from .profiles import profile_for
+
 DEFAULT_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
 DEFAULT_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
-DEFAULT_NIMBLE_URL = "http://127.0.0.1:11434/v1/systemone"
+_DIGEST_RE = re.compile(r"^[0-9a-fA-F]{12,64}$")
 _ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SYM_RE = re.compile(r"^[A-Za-z0-9_.-]{1,16}$")
 
@@ -24,8 +27,15 @@ class Config:
     rpc_url: str = DEFAULT_RPC_URL
     chain_id: int = 4663
     factory_address: str = DEFAULT_FACTORY.lower()
-    # address -> {"symbol": str, "usd": "stable" | "pool:<v3 pool address>"}
+    # address -> {"symbol": str, "usd": "stable" | "weth" | "pool:<v3 pool address>"}
+    # = built-in chain profile entries (profiles.py) overlaid by QUOTE_TOKENS
     quote_tokens: dict = field(default_factory=dict)
+    # Uniswap v4 ("" = v4 watcher disabled); defaults come from the chain profile
+    v4_pool_manager: str = ""
+    v4_state_view: str = ""
+    allowed_v4_hooks: frozenset = frozenset()  # hooks contracts allowed past the hooks gate
+    allow_dynamic_fee: bool = False
+    recheck_blocks: int = 300  # re-evaluate liquidity-only skips for this many blocks; 0 = off
     poll_interval_seconds: float = 5.0
     lookback_blocks: int = 200
     max_block_range: int = 2000
@@ -39,7 +49,8 @@ class Config:
     # "" = Nimble 2 (default); "stub" or "module:function" = other engine
     decision_engine: str = ""
     nimble_url: str = DEFAULT_NIMBLE_URL
-    nimble_model: str = "nimble2"
+    nimble_model: str = DEFAULT_NIMBLE_MODEL
+    nimble_digest: str = NIMBLE2_DIGEST  # digest prefix required for nimble / nimble:latest
     nimble_keep_alive: str = "30m"
     nimble_allow_remote: bool = False
     decision_timeout_s: float = 10.0  # hard cap per decision; exceeding it = skip
@@ -74,6 +85,14 @@ def _addr(env, key, default, errors) -> str:
     return raw.lower()
 
 
+def _opt_addr(env, key, default: Optional[str], errors) -> str:
+    """Address or "" (not configured). Empty env value falls back to the chain profile."""
+    raw = (env.get(key) or "").strip() or (default or "")
+    if raw and not _ADDR_RE.match(raw):
+        errors.append(f"{key}={raw!r}: expected 0x + 40 hex chars")
+    return raw.lower()
+
+
 def _bool(env, key, errors) -> bool:
     raw = (env.get(key) or "").strip().lower()
     if raw in ("", "0", "false", "no"):
@@ -82,6 +101,19 @@ def _bool(env, key, errors) -> bool:
         return True
     errors.append(f"{key}={raw!r}: expected 0 or 1")
     return False
+
+
+def _addr_list(env, key, errors) -> frozenset:
+    out = set()
+    for item in (env.get(key) or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not _ADDR_RE.match(item):
+            errors.append(f"{key} entry {item!r}: expected 0x + 40 hex chars")
+            continue
+        out.add(item.lower())
+    return frozenset(out)
 
 
 def parse_quote_tokens(raw: str, errors: list) -> dict:
@@ -113,11 +145,22 @@ def parse_config(env: Mapping[str, str]) -> Config:
     nurl = (env.get("NIMBLE_URL") or "").strip() or DEFAULT_NIMBLE_URL
     if not nurl.startswith(("http://", "https://")):
         errors.append(f"NIMBLE_URL={nurl!r}: must start with http:// or https://")
+    chain_id = _parse(env, "CHAIN_ID", int, 4663, errors, lo=1)
+    prof = profile_for(chain_id)
+    digest = (env.get("NIMBLE_DIGEST") or "").strip() or NIMBLE2_DIGEST
+    if not _DIGEST_RE.match(digest):
+        errors.append(f"NIMBLE_DIGEST={digest!r}: expected 12-64 hex chars")
     cfg = Config(
         rpc_url=rpc,
-        chain_id=_parse(env, "CHAIN_ID", int, 4663, errors, lo=1),
+        chain_id=chain_id,
         factory_address=_addr(env, "FACTORY_ADDRESS", DEFAULT_FACTORY, errors),
-        quote_tokens=parse_quote_tokens(env.get("QUOTE_TOKENS", ""), errors),
+        quote_tokens={**prof.quote_tokens(),
+                      **parse_quote_tokens(env.get("QUOTE_TOKENS", ""), errors)},
+        v4_pool_manager=_opt_addr(env, "V4_POOL_MANAGER", prof.v4_pool_manager, errors),
+        v4_state_view=_opt_addr(env, "V4_STATE_VIEW", prof.v4_state_view, errors),
+        allowed_v4_hooks=_addr_list(env, "ALLOWED_V4_HOOKS", errors),
+        allow_dynamic_fee=_bool(env, "ALLOW_DYNAMIC_FEE", errors),
+        recheck_blocks=_parse(env, "RECHECK_BLOCKS", int, 300, errors, lo=0),
         poll_interval_seconds=_parse(env, "POLL_INTERVAL_SECONDS", float, 5.0, errors,
                                      lo=0, lo_excl=True),
         lookback_blocks=_parse(env, "LOOKBACK_BLOCKS", int, 200, errors, lo=0),
@@ -130,7 +173,8 @@ def parse_config(env: Mapping[str, str]) -> Config:
         decisions_log=(env.get("DECISIONS_LOG") or "").strip() or "decisions.jsonl",
         decision_engine=(env.get("DECISION_ENGINE") or "").strip(),
         nimble_url=nurl,
-        nimble_model=(env.get("NIMBLE_MODEL") or "").strip() or "nimble2",
+        nimble_model=(env.get("NIMBLE_MODEL") or "").strip() or DEFAULT_NIMBLE_MODEL,
+        nimble_digest=digest.lower(),
         nimble_keep_alive=(env.get("NIMBLE_KEEP_ALIVE") or "").strip() or "30m",
         nimble_allow_remote=_bool(env, "NIMBLE_ALLOW_REMOTE", errors),
         decision_timeout_s=_parse(env, "DECISION_TIMEOUT_S", float, 10.0, errors,

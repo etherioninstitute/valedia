@@ -1,4 +1,4 @@
-"""Robinhood Chain reader: PoolCreated watcher, ERC-20 facts, Uniswap V3 pool price.
+"""Robinhood Chain reader: pool watcher, ERC-20 facts, Uniswap V3 pool price (v4: v4.py).
 
 Read-only. Every method is a JSON-RPC query; nothing here signs or sends transactions.
 """
@@ -23,6 +23,11 @@ class ChainMismatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class PoolCreatedEvent:
+    """Unified new-pool record for Uniswap v3 (PoolCreated) and v4 (Initialize).
+
+    ``pool`` is the dedupe key: the pool contract address (v3) or the bytes32 pool id (v4).
+    token0/token1 are the sorted currencies (v4 currency 0x0 = native ETH).
+    """
     pool: str
     token0: str
     token1: str
@@ -31,6 +36,24 @@ class PoolCreatedEvent:
     block_number: int
     tx_hash: str
     log_index: int
+    version: str = "v3"  # "v3" | "v4"
+    hooks: Optional[str] = None  # v4 hooks contract (0x0 = none); None for v3
+
+    @property
+    def pool_address(self) -> Optional[str]:
+        return self.pool if self.version == "v3" else None
+
+    @property
+    def pool_id(self) -> Optional[str]:
+        return self.pool if self.version == "v4" else None
+
+    @property
+    def has_hooks(self) -> bool:
+        return self.hooks is not None and self.hooks != abi.ZERO_ADDRESS
+
+    @property
+    def dynamic_fee(self) -> bool:
+        return self.version == "v4" and self.fee == abi.V4_DYNAMIC_FEE
 
 
 @dataclass(frozen=True)
@@ -160,6 +183,12 @@ class ChainReader:
         return abi.decode_uint(res) if res else None
 
     # --- Uniswap V3 pool ---------------------------------------------
+    def get_pool(self, token_a: str, token_b: str, fee: int) -> Optional[str]:
+        """Factory getPool; None when no pool exists (zero address) or the call fails."""
+        res = self._call(self.factory, abi.encode_get_pool(token_a, token_b, fee))
+        addr = abi.decode_address(res) if res else None
+        return None if addr in (None, abi.ZERO_ADDRESS) else addr
+
     def pool_tokens(self, pool: str) -> Tuple[Optional[str], Optional[str]]:
         t0, t1 = self._call(pool, abi.SEL_TOKEN0), self._call(pool, abi.SEL_TOKEN1)
         return (abi.decode_address(t0) if t0 else None, abi.decode_address(t1) if t1 else None)
@@ -181,11 +210,19 @@ class ChainReader:
 
 
 class PoolWatcher:
-    """Polls for new PoolCreated events in bounded block ranges and tracks progress."""
+    """Polls for new pool events in bounded block ranges and tracks progress.
+
+    ``fetch(from_block, to_block, skipped)`` defaults to the v3 PoolCreated reader; the v4
+    watcher passes V4Reader.fetch_initialize. Same chunking / lookback / last-block tracking.
+    """
 
     def __init__(self, reader: ChainReader, lookback: int = 200, max_range: int = 2000,
-                 on_error: Optional[Callable[[str], None]] = None):
+                 on_error: Optional[Callable[[str], None]] = None,
+                 fetch: Optional[Callable[..., List[PoolCreatedEvent]]] = None,
+                 label: str = "v3"):
         self.reader = reader
+        self.fetch = fetch or reader.fetch_pool_created
+        self.label = label
         self.lookback = lookback
         self.max_range = max(1, max_range)
         self.next_block: Optional[int] = None  # first block not yet processed
@@ -208,10 +245,10 @@ class PoolWatcher:
         while start <= head:
             end = min(head, start + self.max_range - 1)
             try:
-                events.extend(self.reader.fetch_pool_created(start, end, self.skipped))
+                events.extend(self.fetch(start, end, self.skipped))
             except RpcError as e:
                 # Keep progress made so far; retry this range on the next poll.
-                self._on_error(f"getLogs {start}-{end} failed: {e}")
+                self._on_error(f"{self.label} getLogs {start}-{end} failed: {e}")
                 break
             self.next_block = end + 1
             start = end + 1

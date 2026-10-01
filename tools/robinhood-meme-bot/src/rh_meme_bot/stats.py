@@ -41,4 +41,5 @@ def format_status(s: dict) -> str:
     hit = "-" if s["hit_rate"] is None else f"{s['hit_rate'] * 100:.0f}%"
     return (f"engine {s['model']} | {'warm' if s['warm'] else 'cold'} | last {ms(s['last_ms'])} | "
             f"p50 {ms(s['p50'])} p95 {ms(s['p95'])} | budget {s['budget_ms']:.0f}ms "
-            f"hit {hit} (n={s['n']})")
+            f"hit {hit} (n={s['n']})"
+            + (f" | watchers: {s['watchers']}" if s.get("watchers") else ""))
