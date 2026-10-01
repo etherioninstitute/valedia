@@ -62,13 +62,26 @@ The model's own calibrated temperature is not overridden.
 
 At startup `warmup()` makes one tiny call so the model is resident (`keep_alive`, default 30m).
 
-### Latency observability
+### Latency: timeout vs budget vs warmup
 
-The goal is a decision in under half a second; this cannot be measured from the build sandbox,
-so it is made observable instead. Each decision records `latency_ms` and `within_budget`
-(`DECISION_LATENCY_BUDGET_MS`, default 500). The dashboard status line shows model, warm/cold,
-last latency, p50/p95 over the session, and the budget hit-rate. The first call after a cold
-load is slow; check the warmup line and subsequent numbers on your hardware.
+Three separate knobs:
+
+| Setting | Default | Role |
+|---|---|---|
+| `WARMUP_TIMEOUT_S` | 120 | startup warmup call only; the first call cold-loads the 9B model |
+| `DECISION_TIMEOUT_S` | 10 | **hard cap** per decision; exceeding it (even if the server answers late) is a skip, fail-closed |
+| `DECISION_LATENCY_BUDGET_MS` | 500 | **observable target only**; never blocks or skips anything |
+
+The under-0.5 s goal depends on your hardware and on the model being warm; it could not be
+measured from the build sandbox, and warm latencies of 3-4 s were seen on a laptop with an
+earlier Nimble version and 3 questions. So a slower-than-budget decision still trades if it
+answers within the hard cap. Each decision records `latency_ms` and `within_budget`, and the
+dashboard status line shows model, warm/cold, last latency, p50/p95 over the session, and the
+**budget hit-rate** (share of decisions at or under the budget). Reading it: a hit-rate near
+100% means the 0.5 s target is met on your machine; a low hit-rate with p50 of a few seconds
+means decisions work but are slower than the target (smaller quant, more memory, or fewer
+questions would be the levers, not a higher timeout); decisions that exceed
+`DECISION_TIMEOUT_S` show up as skips with a `timeout` error in the log.
 
 ## Configure
 
@@ -95,7 +108,8 @@ NIMBLE_URL=http://127.0.0.1:11434/v1/systemone
 NIMBLE_MODEL=nimble2
 NIMBLE_KEEP_ALIVE=30m
 NIMBLE_ALLOW_REMOTE=0
-DECISION_TIMEOUT_S=2.0
+DECISION_TIMEOUT_S=10.0
+WARMUP_TIMEOUT_S=120
 DECISION_LATENCY_BUDGET_MS=500
 ```
 
@@ -144,6 +158,7 @@ informational boolean flags (`flag_*`) in the state.
 ```bash
 python -m rh_meme_bot                     # live rich dashboard (Ctrl+C to quit)
 python -m rh_meme_bot --headless --once   # one poll, plain lines, exit (CI-friendly)
+python -m rh_meme_bot --once --redecide   # also re-decide pools already in the decision log
 rh-meme-bot --headless                    # plain lines, continuous
 ```
 
@@ -166,6 +181,15 @@ python -m rh_meme_bot review --action buy --json      # full records
 python -m rh_meme_bot review --final skip             # filter by the post-gate outcome
 ```
 
+## Restarts and duplicates
+
+`PaperExecutor` reloads `POSITIONS_FILE` at start, continues position ids from the max, and
+refuses a second position for the same pool (a `duplicate_pool` gate failure is logged as a
+skip). Pools already in the decision log are not decided again after a restart inside
+`LOOKBACK_BLOCKS` (so the log keeps one line per decision); pass `--redecide` to decide them
+again. Pools whose earlier decision ended in an engine error (e.g. Ollama was down) are
+retried automatically.
+
 ## Plug in a different decision model
 
 `DECISION_ENGINE=` (empty) uses Nimble 2. `DECISION_ENGINE=stub` (or
@@ -178,7 +202,9 @@ def decide(state: dict) -> dict:
 ```
 
 `risk_score` is optional but required for a buy to pass the risk gate. Output is validated:
-unknown action, bad confidence, wrong type, or an exception becomes a skip and is logged.
+unknown action, bad confidence, wrong type, or an exception becomes a skip and is logged. Extra keys
+your engine returns are preserved in the decision log under `raw.extra`; an unparseable Nimble
+response body is logged as `raw` text (truncated to 4 KB).
 `state` keys: `token_address, symbol, decimals, total_supply, owner_renounced, owner_status,
 contract_has_code, pool_address, fee_tier, quote_symbol, price_in_quote, price_usd,
 liquidity_usd, quote_reserve_usd, meme_reserve_usd, tvl_usd, flag_*`. Unreadable facts are `None`.

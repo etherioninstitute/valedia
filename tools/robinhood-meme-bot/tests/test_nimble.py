@@ -29,7 +29,7 @@ def test_request_shape_and_pin():
     eng, fake = engine()
     out = eng.decide(STATE)
     (url, payload, timeout), = fake.requests
-    assert url == "http://127.0.0.1:11434/v1/systemone" and timeout == 2.0
+    assert url == "http://127.0.0.1:11434/v1/systemone" and timeout == 10.0
     assert payload["model"] == "nimble2" and payload["keep_alive"] == "30m"
     assert payload["state"] == STATE and payload["questions"] == QUESTIONS
     assert set(payload) == {"model", "state", "questions", "keep_alive"}  # no temperature etc.
@@ -158,3 +158,74 @@ def test_ask_nimble_module_function_refuses_bad_model(monkeypatch):
     assert ask_nimble(STATE, QUESTIONS)["model"] == "nimble2"
     with pytest.raises(de.NimbleError, match="refused"):
         ask_nimble(STATE, QUESTIONS, model="nimble")
+
+
+def test_timeouts_decision_vs_warmup_and_hard_cap():
+    eng, fake = engine()
+    eng.decide(STATE)
+    eng.warmup()
+    assert [r[2] for r in fake.requests] == [10.0, 120.0]  # decision cap vs cold-load warmup
+    eng2, fake2 = engine(timeout_s=3.0, warmup_timeout_s=45.0)
+    eng2.decide(STATE)
+    eng2.warmup()
+    assert [r[2] for r in fake2.requests] == [3.0, 45.0]
+    # transport ignores the timeout and answers late (11s > 10s cap): still fail-closed
+    clock = FakeClock()
+    eng3, _ = engine(FakeNimble(clock=clock, step_ms=11000), clock=clock)
+    out = eng3.decide(STATE)
+    assert out["action"] == "skip" and "timeout" in out["error"] and out["raw"]
+    # 3.5s (measured warm latency) is fine under the 10s cap but over the 500ms budget
+    clock = FakeClock()
+    eng4, _ = engine(FakeNimble(clock=clock, step_ms=3500), clock=clock)
+    out = eng4.decide(STATE)
+    assert out["error"] is None and out["latency_ms"] == pytest.approx(3500.0)
+
+
+def test_unparseable_body_is_kept_as_truncated_raw_text():
+    out = engine(FakeNimble(respond=lambda p: ["x", 1]))[0].decide(STATE)
+    assert out["raw"] == '["x", 1]' and "not a JSON object" in out["error"]
+    out = engine(FakeNimble(respond=lambda p: {"answers": "nope"}))[0].decide(STATE)
+    assert out["raw"] == {"answers": "nope"}  # dict bodies are kept as-is
+    huge = engine(FakeNimble(respond=lambda p: ["y" * 10000]))[0].decide(STATE)
+    assert len(huge["raw"]) < 4200 and "truncated" in huge["raw"]
+
+
+def test_http_transport_keeps_raw_text_on_bad_json_and_http_error(monkeypatch):
+    import requests
+
+    class Resp:
+        def __init__(self, code, text):
+            self.status_code, self.text = code, text
+
+        def json(self):
+            raise ValueError("Expecting value")
+
+    class Sess:
+        resp = Resp(200, "<html>proxy error</html>")
+
+        def post(self, *a, **k):
+            return self.resp
+
+    monkeypatch.setattr(requests, "Session", Sess)
+    eng = NimbleEngine()  # default transport = requests
+    out = eng.decide(STATE)
+    assert out["action"] == "skip" and "not JSON" in out["error"]
+    assert out["raw"] == "<html>proxy error</html>"
+    Sess.resp = Resp(500, "model crashed")
+    out = eng.decide(STATE)
+    assert "http 500" in out["error"] and out["raw"] == "model crashed"
+
+
+def test_module_level_decide_reads_dotenv(tmp_path, monkeypatch):
+    from rh_meme_bot import decision_engine as de
+    (tmp_path / ".env").write_text("NIMBLE_MODEL=nimble2:q4_k_m\nDECISION_TIMEOUT_S=7\n"
+                                   "WARMUP_TIMEOUT_S=90\n")
+    monkeypatch.chdir(tmp_path)
+    for k in ("NIMBLE_MODEL", "DECISION_TIMEOUT_S", "WARMUP_TIMEOUT_S"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(de, "_DEFAULT", None)
+    eng = de._default_engine()
+    assert eng.model == "nimble2:q4_k_m" and eng.timeout_s == 7.0 and eng.warmup_timeout_s == 90.0
+    monkeypatch.setenv("NIMBLE_MODEL", "nimble2")  # real environment wins over .env
+    monkeypatch.setattr(de, "_DEFAULT", None)
+    assert de._default_engine().model == "nimble2"

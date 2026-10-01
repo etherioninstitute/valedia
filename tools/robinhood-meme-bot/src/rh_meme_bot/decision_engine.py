@@ -74,8 +74,25 @@ QUESTIONS = {
 }
 
 
+RAW_LIMIT = 4096
+
+
+def raw_snippet(obj: Any, limit: int = RAW_LIMIT) -> str:
+    """Text form of an unparseable body / odd output, truncated for the decision log."""
+    if isinstance(obj, bytes):
+        obj = obj.decode("utf-8", errors="replace")
+    if not isinstance(obj, str):
+        try:
+            obj = json.dumps(obj, default=str)
+        except (TypeError, ValueError):
+            obj = repr(obj)
+    return obj if len(obj) <= limit else obj[:limit] + f"...[truncated {len(obj) - limit} chars]"
+
+
 class NimbleError(Exception):
-    pass
+    def __init__(self, message: str, raw: Any = None):
+        super().__init__(message)
+        self.raw = raw  # whatever the server returned, if anything
 
 
 def sanitize(obj: Any) -> Any:
@@ -102,8 +119,12 @@ def _http_transport() -> Callable[[str, dict, float], dict]:
         resp = session.post(url, data=json.dumps(payload, allow_nan=False), timeout=timeout,
                             headers={"Content-Type": "application/json"})
         if resp.status_code != 200:
-            raise NimbleError(f"http {resp.status_code}: {resp.text[:120]}")
-        return resp.json()
+            raise NimbleError(f"http {resp.status_code}: {resp.text[:120]}",
+                              raw=raw_snippet(resp.text))
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise NimbleError(f"response is not JSON: {e}", raw=raw_snippet(resp.text)) from e
 
     return post
 
@@ -121,17 +142,19 @@ def _num(v: Any) -> Optional[float]:
 
 class NimbleEngine:
     def __init__(self, url: str = DEFAULT_NIMBLE_URL, model: str = "nimble2",
-                 timeout_s: float = 2.0, keep_alive: str = "30m", allow_remote: bool = False,
+                 timeout_s: float = 10.0, keep_alive: str = "30m", allow_remote: bool = False,
                  transport: Optional[Callable[[str, dict, float], dict]] = None,
-                 clock: Callable[[], float] = time.perf_counter):
+                 clock: Callable[[], float] = time.perf_counter, warmup_timeout_s: float = 120.0):
         self.url, self.model, self.timeout_s = url, model, timeout_s
+        self.warmup_timeout_s = warmup_timeout_s
         self.keep_alive, self.allow_remote = keep_alive, allow_remote
         self._transport, self._clock = transport, clock
 
     @classmethod
     def from_config(cls, cfg: Config, transport=None, clock=time.perf_counter) -> "NimbleEngine":
         return cls(cfg.nimble_url, cfg.nimble_model, cfg.decision_timeout_s,
-                   cfg.nimble_keep_alive, cfg.nimble_allow_remote, transport, clock)
+                   cfg.nimble_keep_alive, cfg.nimble_allow_remote, transport, clock,
+                   cfg.warmup_timeout_s)
 
     @property
     def pin_ok(self) -> bool:
@@ -146,11 +169,16 @@ class NimbleEngine:
             return f"NIMBLE_URL host {host!r} is not loopback; set NIMBLE_ALLOW_REMOTE=1 to allow"
         return None
 
-    def ask(self, state: Any, questions: dict) -> dict:
-        """POST one System One request; returns the response body. Raises NimbleError."""
+    def ask(self, state: Any, questions: dict, timeout: Optional[float] = None) -> dict:
+        """POST one System One request; returns the response body. Raises NimbleError.
+
+        ``timeout`` is a hard cap: it is passed to the transport AND enforced on the measured
+        elapsed time, so a transport that ignores it still cannot yield a late answer.
+        """
         problem = self.config_problem()
         if problem:
             raise NimbleError(f"refused: {problem}")
+        timeout = self.timeout_s if timeout is None else timeout
         payload = {"model": self.model, "state": sanitize(state), "questions": questions,
                    "keep_alive": self.keep_alive}
         try:
@@ -159,32 +187,39 @@ class NimbleEngine:
             raise NimbleError(f"state not serializable: {e}") from e
         if self._transport is None:
             self._transport = _http_transport()
+        t0 = self._clock()
         try:
-            body = self._transport(self.url, payload, self.timeout_s)
+            body = self._transport(self.url, payload, timeout)
         except NimbleError:
             raise
         except Exception as e:  # noqa: BLE001 - down, timeout, bad json: all fail closed
             raise NimbleError(f"{type(e).__name__}: {e}") from e
+        if (self._clock() - t0) > timeout:
+            raise NimbleError(f"timeout: answer took longer than {timeout}s", raw=raw_snippet(body))
         if not isinstance(body, dict):
-            raise NimbleError("response is not a JSON object")
+            raise NimbleError("response is not a JSON object", raw=raw_snippet(body))
         return body
 
-    def decide(self, state: dict) -> dict:
+    def decide(self, state: dict, timeout: Optional[float] = None) -> dict:
         t0 = self._clock()
         body = None
         try:
-            body = self.ask(state, QUESTIONS)
+            body = self.ask(state, QUESTIONS, timeout)
             out = self._parse(body)
         except NimbleError as e:
-            return _fail(str(e), (self._clock() - t0) * 1000.0, self.model, body)
+            raw = e.raw if e.raw is not None else body
+            return _fail(str(e), (self._clock() - t0) * 1000.0, self.model, raw)
         out["latency_ms"] = round((self._clock() - t0) * 1000.0, 2)
         return out
 
     __call__ = decide
 
     def warmup(self) -> dict:
-        """One tiny decide so the model is resident (keep_alive keeps it loaded)."""
-        return self.decide({"warmup": True})
+        """One tiny decide so the model is resident (keep_alive keeps it loaded).
+
+        Uses its own, much longer timeout: the first call loads the 9B model into memory.
+        """
+        return self.decide({"warmup": True}, timeout=self.warmup_timeout_s)
 
     def _parse(self, body: dict) -> dict:
         resp_model = body.get("model")
@@ -228,7 +263,7 @@ def _default_engine() -> NimbleEngine:
     global _DEFAULT
     if _DEFAULT is None:
         from .config import load_config
-        _DEFAULT = engine_from_config(load_config(env_file=None))
+        _DEFAULT = engine_from_config(load_config())  # ./.env overlaid by the environment
     return _DEFAULT
 
 
@@ -237,7 +272,7 @@ def ask_nimble(state: Any, questions: dict, model: Optional[str] = None) -> dict
     eng = _default_engine()
     if model and model != eng.model:
         eng = NimbleEngine(eng.url, model, eng.timeout_s, eng.keep_alive, eng.allow_remote,
-                           eng._transport)
+                           eng._transport, warmup_timeout_s=eng.warmup_timeout_s)
     return eng.ask(state, questions)
 
 

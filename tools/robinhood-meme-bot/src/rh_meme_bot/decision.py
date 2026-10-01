@@ -12,7 +12,11 @@ import importlib
 import math
 from typing import Callable, Optional, Tuple
 
+from .decision_engine import raw_snippet
+
 ACTIONS = ("buy", "hold", "skip")
+_KNOWN = {"action", "confidence", "risk_score", "risk_expected", "latency_ms", "model", "raw",
+          "error"}
 Engine = Callable[[dict], dict]
 
 
@@ -31,6 +35,8 @@ def validate_decision(out: object) -> Tuple[dict, Optional[str]]:
     """Coerce arbitrary engine output into a valid decision. Returns (decision, problem)."""
     safe = {"action": "skip", "confidence": 0.0, "risk_score": None, "risk_expected": None,
             "latency_ms": None, "model": None, "raw": None, "error": None}
+    if out is not None:
+        safe["raw"] = {"invalid_output": raw_snippet(out)}  # keep what the engine said
     if not isinstance(out, dict):
         return safe, f"engine returned {type(out).__name__}, expected dict"
     action, conf = out.get("action"), out.get("confidence")
@@ -44,11 +50,15 @@ def validate_decision(out: object) -> Tuple[dict, Optional[str]]:
     risk = risk if isinstance(risk, int) and not isinstance(risk, bool) and 1 <= risk <= 10 \
         else None
     err = out.get("error")
+    extras = {k: v for k, v in out.items() if k not in _KNOWN}
+    raw = out.get("raw")
+    if extras:  # plugin-specific keys are preserved under raw, never dropped
+        raw = {"extra": extras} if raw is None else {"raw": raw, "extra": extras}
     dec = {"action": action, "confidence": float(conf), "risk_score": risk,
            "risk_expected": _finite(out.get("risk_expected")),
            "latency_ms": _finite(out.get("latency_ms")),
            "model": out.get("model") if isinstance(out.get("model"), str) else None,
-           "raw": out.get("raw"), "error": str(err) if err else None}
+           "raw": raw, "error": str(err) if err else None}
     if dec["error"]:  # an engine that reports an error can never buy
         dec["action"], dec["confidence"] = "skip", 0.0
     return dec, None
