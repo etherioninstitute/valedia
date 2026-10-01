@@ -9,8 +9,9 @@ A blocked verdict (`allow` False) means: status SKIP_NIMBLE, no order.
 
 Mode (VALEDIA_NIMBLE_MODE_PREDICTION, default shadow):
 - shadow: log only, allow ALWAYS (an unexpected error also allows, with the error logged).
-- veto:   only the model saying buy at >= VALEDIA_NIMBLE_MIN_CONF allows. An
-          engine that is off / down / erroring, or an unexpected error here, blocks.
+- veto:   only the profit-consistent rule (nimble_decide docstring: buy, sharp enough,
+          calibrated p_buy >= max(floor, break-even + margin)) allows. An engine that is
+          off / down / erroring, or an unexpected error here, blocks.
 - off:    no call, allow.
 A call happens only when VALEDIA_SYSTEMONE=1. Veto can only REMOVE an entry; it
 never adds, sizes, flips or reprices. Exits are never blocked (nimble_decide).
@@ -84,15 +85,56 @@ def _ev_net(opp):
     return net if isinstance(net, (int, float)) and not isinstance(net, bool) else None
 
 
+def _price(v):
+    v = v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return v / 100.0 if v is not None and v > 1.0 else v  # cents -> dollars
+
+
+def economics_for(opp, side):
+    """Break-even inputs for nimble_decide (code only, never sent to the model), or None.
+
+    price: the bought side's ask (yes_ask / no_ask on the opp or its raw) when present,
+    else opp `price` (allocator convention: the bought side's price, as kalshi_profit._book
+    reads it). fee_per_contract: ev_preflight fee_per (venue fee map), else
+    fee_engine.kalshi_fee_per_contract(price) on Kalshi, else a Poly `fee_prob`.
+    half_spread (only when price is not already the ask) and slip from ev_preflight.
+    No yes/no side or no price → None (the probability floor applies). Never raises.
+    """
+    try:
+        return _economics(opp, side)
+    except Exception:
+        return None
+
+
+def _economics(opp, side):
+    side = str(side or "").strip().lower()
+    if side not in ("yes", "no"):
+        return None
+    raw = opp.get("raw") if isinstance(opp.get("raw"), dict) else {}
+    ask = _price(opp.get(side + "_ask", raw.get(side + "_ask")))
+    price = ask if ask is not None and ask > 0 else _price(opp.get("price"))
+    if price is None or not 0.0 < price < 1.0:
+        return None
+    ev = opp.get("ev_preflight") if isinstance(opp.get("ev_preflight"), dict) else {}
+    fee = ev.get("fee_per")
+    if fee is None and "kalshi" in str(opp.get("platform") or opp.get("desk") or "kalshi"):
+        import fee_engine
+        fee = fee_engine.kalshi_fee_per_contract(price)
+    if fee is None:
+        fee = opp.get("fee_prob")
+    return {"side": side, "price": price, "fee_per_contract": fee, "slip": ev.get("slip"),
+            "half_spread": None if ask is not None and ask > 0 else ev.get("half_spread")}
+
+
 def gate(opp, informed=None, *, source, side=None, poly=False, label=None, news=None,
-         extra=None, post=None, get=None):
+         extra=None, post=None, get=None, economics=None):
     """Verdict dict (see nimble_decide.decide_candidate). Never raises.
 
     opp: the opportunity the code already admitted (allocator opp with `raw`, or a
     Poly row). informed: create_preflight's `informed` dict (merged into the code
     facts). extra: facts the caller's own gate has just established (e.g. clock_ok
     after session_clocks.before_create, fee_true_edge). Offline fact building is
-    skipped when no call can happen.
+    skipped when no call can happen. economics: break-even inputs (None → economics_for).
     """
     mode = _mode()
     try:
@@ -118,8 +160,10 @@ def gate(opp, informed=None, *, source, side=None, poly=False, label=None, news=
         inf_facts = inf.informed_facts(_symbol(opp), side, direction=direction_for(opp, side),
                                        news=news)
         code_label = label if label is not None else {"status": "admitted_by_code", "source": source}
+        econ = economics if economics is not None else economics_for(opp, side)
         return nd.decide_candidate(_ASSET, cand, side=side, code_facts=facts, informed=inf_facts,
-                                   source=source, label=code_label, post=post, get=get)
+                                   source=source, label=code_label, post=post, get=get,
+                                   economics=econ)
     except Exception as e:
         return _fallback(mode, e)
 
