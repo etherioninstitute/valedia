@@ -185,13 +185,17 @@ def run():
             bet = {'fav_ticker': 'SE-ACK', 'fav_title': 'X', 'fav_price': 0.80,
                    'contracts': 5, 'cost': 4.0, 'fee': 0.02, 'profit_if_win': 0.98,
                    'league': 'NBA', 'exp': '2026'}
-            res = se.execute_bets([bet], dry_run=False)
+            # sports_engine now runs the allocator pre-create chain; fake evidence sources.
+            from test_sports_evidence import admitted_sports_env, _kw
+            with admitted_sports_env(series=("SE",)) as env:
+                res = se.execute_bets([bet], dry_run=False, **_kw(env))
             assert res[0]['status'] == 'UNRECONCILED', res[0]
             assert ftl.open_position_count() == o0
             assert ftl.real_track_record()["n"] == n0
             se.create_order = lambda *a, **k: _fill("se-fill", 5, 80)
             bet2 = dict(bet, fav_ticker='SE-FILL')
-            res = se.execute_bets([bet2], dry_run=False)
+            with admitted_sports_env(series=("SE",)) as env:
+                res = se.execute_bets([bet2], dry_run=False, **_kw(env))
             assert res[0]['status'] == 'EXECUTED', res[0]
             assert ftl.open_position_count() == o0 + 1
             assert ftl.real_track_record()["n"] == n0  # still unsettled

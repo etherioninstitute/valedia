@@ -6,6 +6,7 @@ and settlement P&L fee-inclusive on losses. No network — deps are monkeypatche
 import sports_engine as se
 import forward_test_ledger as ftl
 import kalshi_auth
+from test_sports_evidence import admitted_sports_env, _kw
 
 
 def _game(price=0.80, edge=30):
@@ -35,13 +36,18 @@ def run():
     #    DRY_RUN records nothing / no order. book_kalshi_fill is stubbed (no disk).
     calls = {'orders': 0, 'books': []}
     se.create_order = lambda *a, **k: (calls.__setitem__('orders', calls['orders'] + 1) or
+                                       calls.__setitem__('last_kw', k) or
                                        {"order": {"order_id": "ack-only", "status": "resting"}})
     kalshi_auth.get_positions = lambda: {'market_positions': []}
     orig_book = se.ftl.book_kalshi_fill
     se.ftl.book_kalshi_fill = lambda *a, **k: calls['books'].append((a, k)) or "ft_stub"
 
-    res = se.execute_bets([_bet()], dry_run=False)
+    # Live path now runs the allocator pre-create chain on real evidence; the
+    # evidence sources (book GET, attestation file, model FV) are fakes here.
+    with admitted_sports_env() as env:
+        res = se.execute_bets([_bet()], dry_run=False, **_kw(env))
     assert res[0]['status'] == 'UNRECONCILED', res[0]
+    assert 'informed' in calls.get('last_kw', {}), "create_order must carry informed="
     assert calls['orders'] == 1 and len(calls['books']) == 1, calls
     assert calls['books'][0][0][0] == se.CATEGORY, "must book under SPORTS category"
 
@@ -49,7 +55,8 @@ def run():
     se.create_order = lambda *a, **k: (calls.__setitem__('orders', calls['orders'] + 1) or
                                        {"order": {"order_id": "f1", "status": "executed",
                                                   "fill_count": 5, "yes_price": 80}})
-    res = se.execute_bets([_bet()], dry_run=False)
+    with admitted_sports_env() as env:
+        res = se.execute_bets([_bet()], dry_run=False, **_kw(env))
     assert res[0]['status'] == 'EXECUTED', res[0]
     assert calls['orders'] == 1 and len(calls['books']) == 1, calls
 

@@ -8,7 +8,10 @@ Architecture:
   1. SCAN — Find all sports games resolving in next 24h
   2. FILTER — Only 70-85¢ favorites
   3. SIZE — min(edge table, dynamic_per_trade_cap); never 10% while unproven
-  4. EXECUTE — Limit at the ask; EXECUTED+live only on real fill data
+  4. EXECUTE — Limit at the ask, only after the allocator's pre-create chain
+     (EV preflight → session_clocks.before_create → informed create_preflight)
+     on real evidence (build_sports_opp). Missing evidence → SKIP_*, no order.
+     EXECUTED+live only on real fill data
   5. TRACK — fee-inclusive ledger (UNRECONCILED until fill-true)
 
 (c) GOATWORTHY Post LLC. All rights reserved.
@@ -163,6 +166,7 @@ def scan_games():
                         'game_id': game_id,
                         'league': league,
                         'series': series,
+                        'fav_market': fav,  # Kalshi market dict: status/open/close/expiry for session_clocks
                         'fav_ticker': fav['ticker'],
                         'fav_title': fav.get('title', '')[:50],
                         'fav_price': fav_price,
@@ -265,34 +269,67 @@ def size_bets(games, bankroll, per_trade_cap=None):
         })
     return bets
 
+# ═══ STEP 2b: EVIDENCE — sports_evidence.py (never placeholders, never synthesized) ═══
+import sports_evidence as _sev
+from sports_evidence import (  # noqa: F401  re-exported for callers/tests
+    SPORTS_EVIDENCE_VERSION, FV_METHOD, FV_COHERENCE_TOL, parse_orderbook,
+    fair_value_from_books, _skip, _pre_create)
+SPORTS_ATTESTATION_PATH = os.path.join(MODELS, "sports_attestation.json")
+SKIP_LOG_MAX = 500
+
+
+def load_sports_attestation(path=None, now=None):
+    return _sev.load_sports_attestation(path or SPORTS_ATTESTATION_PATH, now=now)
+
+
+def build_sports_opp(b, bankroll=None, fv_fn=None, fmap=None, now=None):
+    return _sev.build_sports_opp(b, get, SPORTS_ATTESTATION_PATH, bankroll=bankroll,
+                                 fv_fn=fv_fn, fmap=fmap, now=now, category=CATEGORY)
+
+
 # ═══ STEP 3: EXECUTE — Place orders ═══
 
-def execute_bets(bets, dry_run=False):
-    """Place limit orders for each bet. Skip if already holding."""
+def execute_bets(bets, dry_run=False, bankroll=None, fv_fn=None, fmap=None):
+    """Place limit orders for each bet. Skip if already holding.
+
+    Live path = same pre-create discipline as the allocator, on evidence from
+    build_sports_opp. Any missing evidence → SKIP_* with reasons, no order.
+    """
     from kalshi_auth import get_positions, get_fills
-    
+
     # Get existing positions to avoid duplicates
     pos = get_positions()
     held = {p.get('ticker','') for p in pos.get('market_positions',[])
             if abs(float(p.get('position_fp','0'))) > 0}
-    
+
     results = []
     for b in bets:
         r = {**b, 'ts': datetime.now(timezone.utc).isoformat()}
-        
+
         if b['fav_ticker'] in held:
             r['status'] = 'SKIP_HELD'
             results.append(r)
             continue
-        
+
         if dry_run:
             r['status'] = 'DRY_RUN'
             results.append(r)
             continue
-        
+
+        pre, price_cents = _sev.admit_bet(b, r, lambda x: build_sports_opp(
+            x, bankroll=bankroll, fv_fn=fv_fn, fmap=fmap))
+        if pre is None:  # r is SKIP_* with reasons; no order
+            results.append(r)
+            continue
         try:
-            price_cents = int(b['fav_price'] * 100)
-            resp = create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents)
+            import informed_before_create as _ibc
+            try:
+                resp = create_order(b['fav_ticker'], 'yes', b['contracts'], price_cents,
+                                    informed=pre["informed"])
+            except _ibc.InformedCreateRefused as e:
+                _skip(r, 'SKIP_INFORMED', e.reasons)
+                results.append(r)
+                continue
             fill, payload = ftl.resolve_kalshi_fill(resp, get_fills)
             r['order_id'] = fill.get('order_id')
             r['status'] = 'EXECUTED' if fill['complete'] else 'UNRECONCILED'
@@ -464,7 +501,7 @@ def run(dry_run=False):
         return report
 
     # Execute
-    results = execute_bets(bets, dry_run=dry_run)
+    results = execute_bets(bets, dry_run=dry_run, bankroll=bankroll)
     executed = [r for r in results if r['status'] == 'EXECUTED']
     skipped = [r for r in results if r['status'] != 'EXECUTED']
     
@@ -489,7 +526,13 @@ def run(dry_run=False):
                 "league": r["league"], "exp": r["exp"],
                 "ts": r["ts"], "status": r["status"],
                 "settled": False,
+                "evidence_version": r.get("evidence_version"),
+                "evidence": r.get("evidence"),
             })
+        elif str(r['status']).startswith('SKIP_'):  # refusals are recorded, never settled
+            _sev.record_skip(log, r)
+    if "skips" in log:
+        log["skips"] = log["skips"][-SKIP_LOG_MAX:]
     save_log(log)
     
     # Signal: money invested (only for real executions)

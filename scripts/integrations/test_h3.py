@@ -124,7 +124,10 @@ def test_sports_poll_upgrades_ack():
         bet = {'fav_ticker': 'SE-POLL', 'fav_title': 'X', 'fav_price': 0.80,
                'contracts': 5, 'cost': 4.0, 'fee': 0.02, 'profit_if_win': 0.98,
                'league': 'NBA', 'exp': '2026'}
-        res = se.execute_bets([bet], dry_run=False)
+        # sports_engine now runs the allocator pre-create chain; fake evidence sources.
+        from test_sports_evidence import admitted_sports_env, _kw
+        with admitted_sports_env(series=("SE",)) as env:
+            res = se.execute_bets([bet], dry_run=False, **_kw(env))
         assert res[0]['status'] == 'EXECUTED', res[0]
         assert ftl.open_position_count() == o0 + 1
         rec = [r for r in ftl._read() if r.get("ticker") == "SE-POLL"][0]
