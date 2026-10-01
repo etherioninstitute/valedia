@@ -164,6 +164,12 @@ def admit(order, post=None):
         cents = int(round(float(raw["price"]) * 100))
     reasons = ibc.kalshi_reasons(
         ticker, side, count, cents, order_type=order.get("order_type") or "limit", informed=info)
+    import nimble_wiring as _nw  # Nimble 2: last gate, entry removal only (shadow = log only)
+    nv = None if reasons else _nw.gate(
+        {"ticker": ticker, "side": side, "desk": "weather", "raw": raw}, info, source="weather_live",
+        extra={"fee_true_edge": raw.get("fee_true_ev")})
+    if nv is not None and not nv["allow"]:
+        reasons = [_nw.why(nv, "SKIP_NIMBLE")]
     row = {
         "ticker": ticker,
         "side": side,
@@ -178,10 +184,12 @@ def admit(order, post=None):
         "reasons": reasons,
         "reason": None if not reasons else reasons[0],
         "create_order": not reasons,
+        "nimble": nv,
     }
     ws.append_live_ledger(row)
     if reasons:
-        return {"create_order": False, "dispatchable": 0, "reasons": reasons, "ack": None}
+        return {"create_order": False, "dispatchable": 0, "reasons": reasons, "ack": None,
+                "nimble": nv, **({"status": "SKIP_NIMBLE"} if nv and not nv["allow"] else {})}
     ws.write_morning_alert([{
         "ticker": ticker,
         "fee_true_ev": raw.get("fee_true_ev") if raw.get("fee_true_ev") is not None else info.get("edge"),
@@ -196,4 +204,4 @@ def admit(order, post=None):
         ack = ka.create_order(ticker, side, count, cents, informed=info)
     else:
         ack = post(ticker, side, count, cents, info)
-    return {"create_order": True, "dispatchable": 1, "ack": ack, "reasons": []}
+    return {"create_order": True, "dispatchable": 1, "ack": ack, "reasons": [], "nimble": nv}

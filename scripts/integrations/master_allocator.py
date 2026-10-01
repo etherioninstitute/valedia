@@ -20,6 +20,7 @@ Capital flows to highest EV per unit time. Period.
 import os, sys, json, time, traceback
 from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimble_wiring as _nw  # Nimble 2 prediction wiring (lazy heavy imports; never raises)
 # Single sources (this is the LIVE authority — it MUST use them, not its own copies).
 try:
     import forward_test_ledger as _ftl                      # real fee-inclusive ledger
@@ -435,6 +436,7 @@ def execute_allocations(allocations, dry_run=False):
     """Execute allocations on the appropriate platform.
     FAIL-SAFE: Every trade must pass intel vetting. If intel errors, trade is SKIPPED."""
     results = []
+    _nw.warm_for_run(allocations, dry_run)  # Nimble 2: warm once per run (no-op unless VALEDIA_SYSTEMONE=1)
     # Manage maker orders resting from prior cycles first (record fills, cancel stale).
     _maker_mgr = None
     if MakerOrderManager is not None and not dry_run:
@@ -603,6 +605,12 @@ def execute_allocations(allocations, dry_run=False):
                     continue
                 if pre.get("jev") is not None:
                     r["jev"] = pre["jev"]
+                r["nimble"] = nv = _nw.gate(
+                    a, pre["informed"], source="master_allocator", extra={"clock_ok": True})
+                if not nv["allow"]:  # Nimble 2 veto: last gate, entry removal only
+                    r["status"], r["error"], r["contracts"] = "SKIP_NIMBLE", _nw.why(nv), n
+                    results.append(r)
+                    continue
                 if action == "maker" and _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
                     oid = _maker_mgr.place_maker_order(a["ticker"], a["side"], n, price_cents,
                                                        strategy=a.get("type", ""),

@@ -810,6 +810,10 @@ def evaluate_one(market, *, book=None, bbo=None, tags=None, bankroll=100.0,
         f"edge {base['edge_pts']}pts fv={fv_src} src={resolution_source(m)!r} "
         f"nav={(tags or {}).get('nav')} slip={base['slip']}"
     )
+    import nimble_wiring as _nw  # Nimble 2: last gate on a code-approved paper candidate
+    base["nimble"] = nv = _nw.poly_gate(base, official=resolution_source(m) is not None)
+    if not nv["allow"]:  # veto: paper row marked skipped; shadow never lands here
+        base["status"], base["reason"], base["create_eligible"] = "SKIP_NIMBLE", _nw.why(nv), False
     return base
 
 
