@@ -139,6 +139,8 @@ def test_phi_multiplier_monotone_bounded_and_missing():
     assert nd.phi_multiplier() == (1.0, "etherion_no_risk_level")
     _etherion("CRITICAL")  # unknown level → neutral 1.0, not NORMAL's 0.5
     assert nd.phi_multiplier() == (1.0, "etherion_unknown_level")
+    _etherion(" halt ")  # whitespace/case must not turn HALT into the loosest phi
+    assert vc._risk_factor() == 0.0 and nd.phi_multiplier()[0] == 3.0
     with open(ETH, "w") as f:
         f.write("{not json")
     m, src = nd.phi_multiplier()

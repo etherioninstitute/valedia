@@ -75,8 +75,14 @@ def market_buy(pair, usd_amount):
         oid = d.get("success_response", {}).get("order_id", "?")
         rec = {"success": success, "order_id": oid, "pair": pair, "usd": usd_amount}
         rec.update(_fill_fields(d))
+        if success is False:  # 2xx with success=false: Coinbase explicitly refused (error_response)
+            rec["rejected"] = True
+            rec["reject_reason"] = str((d.get("error_response") or {}).get("error")
+                                       or d.get("failure_reason") or "")[:120]
         return rec
-    return {"success": False, "error": r.text[:300]}
+    # 5xx / 408: the order may still have been created → ambiguous (caller must look it up).
+    return {"success": False, "error": r.text[:300], "http_status": r.status_code,
+            "ambiguous": r.status_code >= 500 or r.status_code == 408}
 
 def market_sell(pair, crypto_amount):
     """Market sell crypto_amount of base currency."""

@@ -12,6 +12,8 @@ become venue orders, and every gate below must hold BEFORE either leg is placed
     category EXACTLY ARB (or VALEDIA_ARB_CATEGORY), generated_at no older than
     VALEDIA_ARB_BACKTEST_MAX_AGE_H (168) at VALEDIA_ARB_BACKTEST_REPORT (default
     data/arb-live/backtest_arb.json). Missing / no generated_at / stale / FAIL → refuse.
+    Self-comparison refused: baseline/candidate names must differ, and their policies (if the
+    report carries `policies`) or else their replays must differ.
   6 allowlisted pair only (exact vaughan_arb_paper.PAIRS slug+ticker; never heuristic)
   7 Kalshi ticker family not fenced
   8 fee-true edge + paper risk limits (vaughan fee_true/_risk: min edge, daily exposure/loss)
@@ -32,6 +34,8 @@ Both-legs-or-none (documented, paper-simulated in test_arb_live.py):
         alert line in the live log (bounded by the size cap; close manually).
   Any exception after leg 1 → POST_LEG1_ERROR_*: same cancel/hedge path, alert, logged.
   Leg-1 POST exception → LEG1_ERROR (exposure unknown: counted + alert, no leg 2).
+  Leg-1 ack without fill fields and an unreadable fills endpoint → LEG1_UNKNOWN (counted at
+  the order size, alert, cancel attempted, no leg 2). An unknown Poly fill always alerts.
 Fills are booked fee-true via forward_test_ledger (Kalshi taker fee; Poly from the venue
 payload incl. partials; no payload but an order id → UNRECONCILED).
 No flag is flipped here. No keys are read here (the venue clients own that).
@@ -100,6 +104,8 @@ def backtest_proof(path=None, now=None, max_age_h=None, category=None):
         return False, "backtest_not_pass"
     if str(doc.get("category") or "") != str(category or ARB_CATEGORY):
         return False, "backtest_not_arb"
+    if _self_compare(doc):
+        return False, "backtest_self_compare"
     try:
         gen = datetime.fromisoformat(str(doc.get("generated_at")).replace("Z", "+00:00"))
         if gen.tzinfo is None:
@@ -110,6 +116,25 @@ def backtest_proof(path=None, now=None, max_age_h=None, category=None):
     if age < -300 or age > float(max_age_h or DEFAULT_BACKTEST_MAX_AGE_H) * 3600.0:
         return False, "backtest_stale"
     return True, "backtest_pass"
+
+
+def _canon(x):
+    return json.dumps(x, sort_keys=True, default=str)
+
+
+def _self_compare(doc):
+    """A candidate compared to itself proves nothing: names must differ, and the policies
+    (when the report carries them) or else the replays (minus the name) must differ."""
+    b = doc.get("baseline") if isinstance(doc.get("baseline"), dict) else {}
+    c = doc.get("candidate") if isinstance(doc.get("candidate"), dict) else {}
+    if not b or not c or str(b.get("name") or "") == str(c.get("name") or ""):
+        return True
+    pol = doc.get("policies") if isinstance(doc.get("policies"), dict) else {}
+    if pol.get("baseline") is not None and pol.get("candidate") is not None:
+        strip = lambda d: {k: v for k, v in dict(d).items() if k not in ("name", "description")}
+        return _canon(strip(pol["baseline"])) == _canon(strip(pol["candidate"]))
+    return _canon({k: v for k, v in b.items() if k != "name"}) == \
+        _canon({k: v for k, v in c.items() if k != "name"})
 
 
 def allowlisted(cand):
@@ -306,6 +331,12 @@ def _after_leg1(cand, ctx, kalshi, poly, env, clock, sleep, poly_fills_fn, k_ack
     if k_qty < 1:
         if st["k_oid"]:
             _safe(kalshi.cancel_order, st["k_oid"], tk)
+        explicit = any(k in {**k_ack, **nested} for k in ("fill_count", "filled_count",
+                                                          "filled_contracts"))
+        if not explicit and kpay is None:  # no fill fields AND no fills read: UNKNOWN, not 0
+            return _row(cand, "LEG1_UNKNOWN", orders=1, filled=True, alert=True,
+                        exposure_unknown=True, possible_contracts=ctx["n"],
+                        leg1_cancelled=bool(st["k_oid"]), **base)
         return _row(cand, "NONE_LEG1_UNFILLED", orders=1, **base)
     _safe(ftl.book_kalshi_fill, STRATEGY, tk, kside, k_ack, intended_source="live",
           fallback_price=ctx["kcents"] / 100.0, fallback_contracts=k_qty, fills_payload=kpay)
@@ -319,7 +350,7 @@ def _after_leg1(cand, ctx, kalshi, poly, env, clock, sleep, poly_fills_fn, k_ack
                                   sleep, poly_fills_fn)
         st["p_qty"] = int(float(pfill.get("qty") or 0)) if pfill.get("complete") else 0
     except Exception as e:
-        st["err"] = str(e)[:120]
+        st["err"], st["p_unknown"] = str(e)[:120], True  # create/poll raised: Poly fill unknown
     if st["p_qty"] >= k_qty:
         _book_poly(ftl, cand, body, st["p_ack"], st["p_qty"], p_pay)
         return _row(cand, "BOTH_FILLED", orders=st["orders"], filled=True, both_filled=True,
@@ -331,6 +362,7 @@ def _after_leg1(cand, ctx, kalshi, poly, env, clock, sleep, poly_fills_fn, k_ack
         if pay is not None:
             p_pay = pay
             st["p_qty"] = int(float(fill.get("qty") or 0)) if fill.get("complete") else 0
+        st["p_unknown"] = p_pay is None  # every Poly read failed: qty 0 is a guess
     _book_poly(ftl, cand, body, st["p_ack"], st["p_qty"], p_pay)
     return _unwind(cand, ctx, kalshi, poly, hedge_fn, st, base, "LEG2_FAILED", cancel_poly=False)
 
@@ -346,14 +378,16 @@ def _unwind(cand, ctx, kalshi, poly, hedge_fn, st, base, prefix, cancel_poly=Tru
     k_qty = st.get("k_qty")
     unmatched = None if k_qty is None else max(0, k_qty - int(st.get("p_qty") or 0))
     # filled=True: leg-1 exposure exists (or is unknown), so it counts toward daily exposure.
+    p_unknown = bool(st.get("p_unknown")) or (bool(p_id) and prefix != "LEG2_FAILED")
     kw = dict(orders=st["orders"], filled=True, both_filled=False, k_qty=k_qty,
               p_qty=st.get("p_qty"), unmatched=unmatched, error=st.get("err", ""),
+              poly_fill_unknown=p_unknown,
               leg1_cancelled=bool(st.get("k_oid")), leg2_cancelled=bool(p_id), **base)
     if unmatched == 0:
         return _row(cand, prefix + "_LEG1_MATCHED", alert=True, **kw)
     h = _safe(hedge_fn, tk, ctx["kopp"]["side"], unmatched) if (hedge_fn and unmatched) else None
     return _row(cand, prefix + ("_LEG1_HEDGED" if h is not None else "_LEG1_UNHEDGED"),
-                hedge=h, alert=h is None, **kw)
+                hedge=h, alert=h is None or p_unknown, **kw)
 
 
 def _safe(fn, *a, **k):
