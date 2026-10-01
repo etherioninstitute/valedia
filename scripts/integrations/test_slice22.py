@@ -54,7 +54,7 @@ def test_unreconciled_ftl_cannot_be_realized_pnl():
     assert body is not None and body.startswith("Profit:"), body
     assert "Realized (ledger, fee-incl.)" in body  # fee-true FTL rows only
     assert "9.99" not in body
-    assert "-1.25" in body
+    assert "−$1.25 (net loss)" in body and "-1.25" not in body  # real minus, money()
     assert "UNRECONCILED" not in body
 
 

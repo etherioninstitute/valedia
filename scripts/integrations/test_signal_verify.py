@@ -30,6 +30,7 @@ class _NoRelay:
 
 signal_send.subprocess = _NoRelay
 import signal_verify as sv
+import pnl_run
 import forward_test_ledger as ftl
 import settle_run as sr
 import kalshi_alert as ka
@@ -81,7 +82,7 @@ def _broker(exposure="3.20"):
 
 def test_pnl_report_figures_match_sources():
     d, send = _fresh_dir(), Sender()
-    res = sv.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
+    res = pnl_run.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "verified" and len(send.msgs) == 1, res
     t = send.msgs[0]
     assert "Invested: $3.20 (Kalshi open-position cost, broker)" in t, t
@@ -99,7 +100,7 @@ def test_pnl_report_figures_match_sources():
 def test_broker_mismatch_withholds_and_logs():
     d, send = _fresh_dir(), Sender()
     reads = iter([_broker("3.20")(), _broker("4.10")()])
-    res = sv.pnl_report(get_positions=lambda: next(reads), ledger=_ledger, send_fn=send, now=NOW)
+    res = pnl_run.pnl_report(get_positions=lambda: next(reads), ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "withheld", res
     t = send.msgs[0]
     assert t.startswith("Report withheld (11pm P&L): Invested does not match broker re-read"), t
@@ -119,7 +120,7 @@ def test_ledger_mismatch_withholds():
             recs.append({"type": "settlement", "entry_id": "e5", "realized_pnl_net": 3.0,
                          "won": True, "logged_at": "2026-10-01T22:59:00+00:00"})
         return recs
-    res = sv.pnl_report(get_positions=_broker(), ledger=ledger, send_fn=send, now=NOW)
+    res = pnl_run.pnl_report(get_positions=_broker(), ledger=ledger, send_fn=send, now=NOW)
     assert res["status"] == "withheld" and "Profit" in send.msgs[0], send.msgs
 
 
@@ -128,7 +129,7 @@ def test_source_failure_withholds_never_crashes():
 
     def boom():
         raise ConnectionError("kalshi down")
-    res = sv.pnl_report(get_positions=boom, ledger=_ledger, send_fn=send, now=NOW)
+    res = pnl_run.pnl_report(get_positions=boom, ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "withheld" and "source read failed" in send.msgs[0]
     assert "kalshi down" in json.dumps(_log(d)[-1])
     # verifier internal error -> still one withheld notice (never silent)
@@ -169,8 +170,8 @@ def test_unsourced_and_arithmetic():
 def test_dedupe_same_message_once():
     _fresh_dir()
     send = Sender()
-    a = sv.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
-    b = sv.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
+    a = pnl_run.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
+    b = pnl_run.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
     assert a["status"] == "verified" and b["status"] == "dedupe" and len(send.msgs) == 1
 
 
@@ -192,7 +193,7 @@ def test_settle_run_profit_verified_and_cursor():
         sr.run(send_fn=send)  # never crashes on sports-log failure
         assert len(send.msgs) == 1, send.msgs  # arb-log is never sent
         t = send.msgs[0]
-        assert "\nProfit: +1.25 (1W/1L settled) Realized (ledger, fee-incl.)" in t, t
+        assert "\nProfit: +$1.25 (1W/1L settled) Realized (ledger, fee-incl.)" in t, t
         assert t.startswith("⚠ STALE: settlement data is"), t  # 09-30 row is > 6h old
         assert "7.77" not in t and "9.99" not in t
         assert "✓ verified: ledger 2 settled rows" in t, t
@@ -222,7 +223,7 @@ def test_sports_invested_from_ledger_fills():
     send = Sender()
     r = sv.invested_ping(ex, ledger=lambda: recs, send_fn=send, now=NOW)
     assert r["status"] == "verified", r
-    assert send.msgs[0].startswith("Invested: 7.05 on 2 games (Kalshi fills + fees, ledger)")
+    assert send.msgs[0].startswith("Invested: $7.05 on 2 games (Kalshi fills + fees, ledger)")
     send = Sender()
     r = sv.invested_ping(ex + [{"order_id": "o3", "cost": 1.0}], ledger=lambda: recs,
                          send_fn=send, now=NOW)
@@ -246,7 +247,7 @@ def test_alert_modeled_never_profit():
                  state={"balance": 20.0, "max_deployable": 15.0}, opps=opps)
     assert r["status"] == "verified", r
     t = send.msgs[0]
-    assert "Invested: 3.20" in t and "Modeled if-all-win: +2.10 (2 picks that fit cash" in t, t
+    assert "Invested: $3.20" in t and "Modeled if-all-win: +$2.10 (2 picks that fit cash" in t, t
     for line in t.lower().splitlines():
         assert not line.startswith("profit") and "estimated profit" not in line
         if "profit" in line:
@@ -258,7 +259,7 @@ def test_alert_modeled_never_profit():
 
 
 def test_bridge_ai_answer_gated():
-    _fresh_dir()
+    d = _fresh_dir()
     facts = {"cash": (12.5, 12.5), "positions": {"invested": (3.2, 3.2), "n": (1, 1)},
              "ledger": None, "why": {"ledger": "STALE (no recent live rows)"}}
     send = Sender()
@@ -266,14 +267,12 @@ def test_bridge_ai_answer_gated():
                         send=True, send_fn=send, now=NOW)
     assert ok["status"] == "verified", ok
     t = send.msgs[0]
-    assert "AI note (wording only — no figures, see facts below):\nThe slate looks calm tonight." in t, t
-    assert "12.50 cash." not in t.split("Facts")[0] and "Cash (broker): $12.50" in t, t
-    assert "Realized P&L (ledger, fee-incl.): omitted — STALE" in t and t.endswith("✓ figures from broker/ledger only")
-    exp = cb.gate_answer("q2", "Expected profit next week: $40.00", facts, send=True,
-                         send_fn=send, now=NOW)
-    assert exp["status"] == "verified" and "40.00" not in send.msgs[-1] and "AI note" not in send.msgs[-1]
+    path = os.path.join(d, "ai_answers", "20261001T230000000000Z.txt")
+    assert t == "\n".join(cb.facts_block(facts)[0] + [cb.AI_LINE + path, cb.FOOTER]), t
+    assert "slate" not in t and "Cash (broker): $12.50" in t
+    assert "The slate looks calm tonight." in open(path).read()  # full answer saved locally
     local = cb.gate_answer("q3", "MLB lost $24.94", facts, send=False, now=NOW)
-    assert local["sent"] is False and "24.94" not in local["text"] and len(send.msgs) == 2
+    assert local["sent"] is False and "24.94" not in local["text"] and len(send.msgs) == 1
 
 
 def test_btc_day_date_guard():
