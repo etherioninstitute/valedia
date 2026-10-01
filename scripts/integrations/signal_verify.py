@@ -1,19 +1,19 @@
 """signal_verify.py — nothing reaches Burton on Signal unless every figure checks out.
 
-Each money figure names its source and is recomputed independently before send:
-broker (Kalshi positions, re-read), ledger (forward_test_ledger realized, fee-incl.,
-re-read) or a labelled model. Checks: figure == recompute, totals == sum of parts,
-counts match, freshness, and no money figure the claims don't back (shared money
-detector below). Failure -> one "Report withheld (<kind>): <reason>" with no
-numbers; full discrepancy -> data/signal/verify_log.jsonl. Dedupe via sent_log.jsonl.
-Never raises. Reporting only: no orders, keys or gates. (c) GOATWORTHY Post LLC
+Every figure names its source (broker re-read, fee-incl. ledger re-read, or a labelled
+model) and must equal an independent recompute; totals == parts; fresh; no unbacked
+figure. Failure -> one number-free "Report withheld (<kind>): <reason>"; detail ->
+data/signal/verify_log.jsonl. Dedupe: sent_log.jsonl. Never raises. Reporting only.
+(c) GOATWORTHY Post LLC
 """
 import hashlib
 import json
 import os
 import re
+import math
 import sys
 import unicodedata
+from decimal import ROUND_HALF_UP, Decimal
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,10 +26,8 @@ LOG_HINT = "see data/signal/verify_log.jsonl"
 LEDGER_STALE_OPEN_S = 36 * 3600   # no new ledger row for 36h while positions are open
 LEDGER_STALE_ANY_S = 7 * 86400    # no new ledger row for 7 days, positions or not
 
-# ── shared money detector: Signal text, LLM answers, legacy relays, ops alerts ──
-# Money line = money keyword, currency/% marker or signed decimal; every number on it
-# (any decimals, commas, k/m/b, sign) is a money figure. Dates/times/versions/IPs are
-# not. scripts/cron_runner.sh mirrors MONEY_WORDS in shell (keep in sync).
+# ── money detector for code-built pings: any number on a line with a money word,
+# currency/% marker or signed decimal must be backed by a claim. Dates/times/versions/IPs skipped.
 MONEY_WORDS = ("profit", "profits", "p&l", "p/l", "pnl", "gain", "gains", "gained", "loss",
                "losses", "lost", "net", "balance", "balances", "invested", "investment",
                "equity", "realized", "unrealized", "payout", "payouts", "return", "returns",
@@ -49,12 +47,10 @@ def _denoise(line):  # length-preserving, so token positions match the original 
     return _NOISE_RE.sub(lambda m: " " * len(m.group(0)), str(line or ""))
 
 
-def _tokens(line, pos=False):
-    out = []
-    for m in NUM_RE.finditer(_denoise(line)):
-        v = _f(m.group(1).replace(",", "")) * _MULT.get((m.group(2) or "").lower(), 1.0)
-        out.append((m.group(0).strip(), abs(v), m.start(1)) if pos else (m.group(0).strip(), abs(v)))
-    return out
+def _tokens(line):
+    return [(m.group(0).strip(), abs(_f(m.group(1).replace(",", ""))
+                                    * _MULT.get((m.group(2) or "").lower(), 1.0)))
+            for m in NUM_RE.finditer(_denoise(line))]
 
 
 def is_money_line(line):
@@ -90,17 +86,12 @@ def _is_num(c):
     return unicodedata.numeric(c, None) is not None
 
 
-# Latin look-alikes (Cyrillic/Greek) folded before number-word matching.
-_CONFUSABLE = str.maketrans("аеорсухіјѕкмтнвАЕОРСУХІЈЅКМТНВοαειкνтυΟΑΕΙΚΝΤΥΒΗΜΡΧΖ",
-                            "aeopcyxijskmtHBAEOPCYXIJSKMTHBoaeikvtuOAEIKNTYBHMPXZ")
-
-
 def scrub_numbers(text):
     """(clean, n): every numeral / number word -> "[n]". clean has no numeric char."""
     t = "".join("0" if _is_num(c) else c for c in str(text or ""))  # Ⅻ, ½, 十 before NFKC
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("\u2028", "\n").replace("\u2029", "\n")
-    t = "".join(c for c in t if unicodedata.category(c) != "Cf").translate(_CONFUSABLE)
+    t = "".join(c for c in t if unicodedata.category(c) != "Cf")
     marked = "".join("0" if _is_num(c) else c for c in t)
     out, n, last = [], 0, 0
     for m in _RUN_RE.finditer(marked):  # numeric runs incl. separators/exponent/k-m-b
@@ -128,25 +119,18 @@ def utcnow():
 
 
 def parse_ts(raw):
-    if isinstance(raw, datetime):
-        dt = raw
-    else:
-        try:
-            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        except Exception:
-            return None
+    try:
+        dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def fmt_age(sec):
     sec = int(abs(sec))
-    if sec < 60:
-        return f"{sec}s"
-    if sec < 3600:
-        return f"{sec // 60}m"
-    if sec < 86400:
-        return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
-    return f"{sec // 86400}d{(sec % 86400) // 3600}h"
+    return (f"{sec}s" if sec < 60 else f"{sec // 60}m" if sec < 3600
+            else f"{sec // 3600}h{(sec % 3600) // 60:02d}m" if sec < 86400
+            else f"{sec // 86400}d{(sec % 86400) // 3600}h")
 
 
 def hhmm(ts):
@@ -179,27 +163,61 @@ def _f(x):
         return 0.0
 
 
+def num(x):
+    """Strict number: finite float from int/float/numeric str; None for None, bool,
+    garbage, NaN, inf. Missing/garbage source values are OMITTED, never 0.00."""
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def money(v, signed=False):
+    """Round half away from zero to cents FIRST, then sign by the rounded value:
+    no "-$0.00"; negatives as "−$5.00" (U+2212); signed positives "+$5.00"."""
+    d = Decimal(str(abs(v))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    body = f"${d:,.2f}"
+    if d == 0:
+        return body
+    return ("−" if v < 0 else ("+" if signed else "")) + body
+
+
 # ── independent source readers ──────────────────────────────────────────────
 def _exposure(p):
     """Open-position cost in dollars (new *_dollars field, legacy cents fallback)."""
     if p.get("market_exposure_dollars") is not None:
-        return abs(_f(p.get("market_exposure_dollars")))
-    return abs(_f(p.get("market_exposure"))) / 100.0
+        v = num(p.get("market_exposure_dollars"))
+    else:
+        v = num(p.get("market_exposure"))
+        v = None if v is None else v / 100.0
+    if v is None:
+        raise ValueError("position exposure missing/unparseable")
+    return abs(v)
 
 
 def _qty(p):
     for k in ("position_fp", "position"):
         if p.get(k) is not None:
-            return _f(p.get(k))
-    return 0.0
+            v = num(p.get(k))
+            if v is None:
+                raise ValueError("position size unparseable")
+            return v
+    raise ValueError("position size missing")
 
 
 def broker_snapshot(get_positions=None, now=None):
     """One fresh broker read. Invested = sum of open-position cost (not market value)."""
     if get_positions is None:
         from kalshi_auth import get_positions  # network; never used in tests
-    raw = get_positions() or {}
-    rows = [p for p in (raw.get("market_positions") or []) if abs(_qty(p)) > 0]
+    raw = get_positions()
+    if not isinstance(raw, dict) or not isinstance(raw.get("market_positions"), list):
+        raise ValueError("positions payload missing market_positions")
+    if raw.get("incomplete") or raw.get("cursor"):  # more pages exist -> counts incomplete
+        raise ValueError("positions incomplete (pagination)")
+    rows = [p for p in raw["market_positions"] if abs(_qty(p)) > 0]
     vts = next((raw.get(k) for k in ("ts", "timestamp", "server_time", "as_of", "updated_time")
                 if raw.get(k)), None)  # the venue's own clock, when it sends one
     return {"invested": sum(_exposure(p) for p in rows), "n": len(rows),
@@ -214,10 +232,19 @@ def broker_fresh(snap, max_age_s=900):
     return [], f"broker time unknown (read {hhmm(snap['ts'])})"
 
 
-def ledger_latest(recs):
-    stamps = [parse_ts(r.get("logged_at") or r.get("ts")) for r in recs]
-    stamps = [t for t in stamps if t]
-    return max(stamps).astimezone(timezone.utc).isoformat() if stamps else None
+def ledger_latest(recs, now=None):
+    """(newest live entry/settlement time, future_flag). Paper/sandbox/backfill/
+    shadow/unreconciled and other row types do not count. A row dated > 5 min in
+    the future makes the ledger suspect (future_flag True -> treat as STALE)."""
+    now = now or utcnow()
+    ent = {r.get("id"): r for r in recs if r.get("type") == "entry"}
+    live = [r for r in recs if r.get("type") in ("entry", "settlement")
+            and not _non_real(r.get("source")) and not _unrec(r)
+            and (r.get("type") == "entry" or not _non_real(ent.get(r.get("entry_id"), {}).get("source")))]
+    stamps = [t for t in (parse_ts(r.get("logged_at") or r.get("ts")) for r in live) if t]
+    future = any((t - now).total_seconds() > 300 for t in stamps)
+    ok = [t for t in stamps if (t - now).total_seconds() <= 300]
+    return (max(ok).astimezone(timezone.utc).isoformat() if ok else None), future
 
 
 def read_ledger():
@@ -247,10 +274,11 @@ def ledger_realized(recs):
         if _unrec(e) or _unrec(s):
             continue
         rows.append(s)
-    parts = [_f(s.get("realized_pnl_net")) for s in rows]
+    vals = [num(s.get("realized_pnl_net")) for s in rows]
+    parts = [v for v in vals if v is not None]
     wins = sum(1 for s in rows if s.get("won"))
     return {"rows": len(rows), "settlements": rows, "parts": parts, "total": sum(parts),
-            "wins": wins, "losses": len(rows) - wins}
+            "wins": wins, "losses": len(rows) - wins, "bad": len(vals) - len(parts)}
 
 
 def ledger_open_kalshi(recs):
@@ -469,22 +497,3 @@ def profit_ping(parts, body, ledger=None, send_fn=None, now=None):
                    footer=[f"ledger {real['rows']} settled rows", hhmm(now)],
                    send_fn=send_fn, now=now, dedupe_window_s=7 * 86400,
                    dedupe_key="profit:" + ",".join(sorted(str(i) for i in new_ids)))
-
-
-# ── ops alerts (no figures): free text scrubbed, code-built lines kept ─────
-def strip_money(text):
-    """Back-compat name: (clean, n) from scrub_numbers — no numeral survives."""
-    return scrub_numbers(text)
-
-
-def ops_alert(kind, body, send_fn=None, now=None, dedupe_key=None, dedupe_window_s=0,
-              code_lines=()):
-    """Ops/health alert (watchdog etc.). `body` is free text: every numeral / number
-    word -> [n]. `code_lines` are built by the caller's code from ints it computed
-    (e.g. an age in minutes) and are kept verbatim. Never raises."""
-    clean, n = scrub_numbers(body)
-    text = "\n".join([clean] + [str(l) for l in code_lines])
-    notes = ["numbers in free text replaced by [n]; ops alerts carry no money"] if n else []
-    return deliver(kind, text, notes=notes, footer=["ops alert, no money figures"],
-                   send_fn=send_fn, now=now, dedupe_key=dedupe_key or text,
-                   dedupe_window_s=dedupe_window_s, info={"scrubbed": n})

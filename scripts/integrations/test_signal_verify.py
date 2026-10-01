@@ -84,11 +84,11 @@ def test_pnl_report_figures_match_sources():
     res = sv.pnl_report(get_positions=_broker(), ledger=_ledger, send_fn=send, now=NOW)
     assert res["status"] == "verified" and len(send.msgs) == 1, res
     t = send.msgs[0]
-    assert "Invested: 3.20 (Kalshi open-position cost, broker)" in t, t
+    assert "Invested: $3.20 (Kalshi open-position cost, broker)" in t, t
     # +2.50 - 1.25; unreconciled 9.99 and paper 5.00 excluded
-    assert "Profit: +1.25 Realized (ledger, fee-incl.) 1W/1L · last 24h +2.50" in t, t
+    assert "Profit: +$1.25 Realized (ledger, fee-incl.) 1W/1L · settled last 24h +$2.50" in t, t
     assert "9.99" not in t and "5.00" not in t
-    assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 21:00 UTC, "
+    assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 20:00 UTC, "
             "broker time unknown (read 23:00 UTC)") in t, t
     assert "⚠" not in t  # ledger open (e5) == broker open (KXA)
     rec = _log(d)[-1]
@@ -259,17 +259,19 @@ def test_alert_modeled_never_profit():
 
 def test_bridge_ai_answer_gated():
     _fresh_dir()
-    facts = {"broker": {"cash": (12.5, 12.5), "invested": (3.2, 3.2), "n": (1, 1)},
-             "ledger": None, "why": {"ledger": "ledger STALE (no recent rows)"}}
+    facts = {"cash": (12.5, 12.5), "positions": {"invested": (3.2, 3.2), "n": (1, 1)},
+             "ledger": None, "why": {"ledger": "STALE (no recent live rows)"}}
     send = Sender()
-    ok = cb.gate_answer("q", "You have $12.50 cash.", facts, send=True, send_fn=send, now=NOW)
+    ok = cb.gate_answer("q", "You have $12.50 cash. The slate looks calm tonight.", facts,
+                        send=True, send_fn=send, now=NOW)
     assert ok["status"] == "verified", ok
     t = send.msgs[0]
-    assert "You have $[n] cash." in t and "Cash (broker): $12.50" in t, t
-    assert "Realized P&L omitted — ledger STALE" in t and t.endswith("✓ figures from broker/ledger only")
+    assert "AI note (wording only — no figures, see facts below):\nThe slate looks calm tonight." in t, t
+    assert "12.50 cash." not in t.split("Facts")[0] and "Cash (broker): $12.50" in t, t
+    assert "Realized P&L (ledger, fee-incl.): omitted — STALE" in t and t.endswith("✓ figures from broker/ledger only")
     exp = cb.gate_answer("q2", "Expected profit next week: $40.00", facts, send=True,
                          send_fn=send, now=NOW)
-    assert exp["status"] == "verified" and "40.00" not in send.msgs[-1], send.msgs[-1]
+    assert exp["status"] == "verified" and "40.00" not in send.msgs[-1] and "AI note" not in send.msgs[-1]
     local = cb.gate_answer("q3", "MLB lost $24.94", facts, send=False, now=NOW)
     assert local["sent"] is False and "24.94" not in local["text"] and len(send.msgs) == 2
 

@@ -7,7 +7,7 @@
 # (stdout + ${CRON_LOG:-/root/.openclaw/logs/valedia-cron.log}). Signal gets ONE
 # fixed, code-built line with no figures:
 #   "Valedia job <LABEL> finished OK"   or   "Valedia job <LABEL> FAILED (see cron log)"
-# <LABEL> is reduced to letters, spaces, '_' and '-' (no digits, no symbols).
+# <LABEL> is shown only if it is one of the known install_cron.sh labels (allowlist).
 # Money reports go through signal_verify (pnl_run.py, settle_run.py,
 # kalshi_alert.py, sports_engine.py) — never through this runner.
 
@@ -27,12 +27,19 @@ echo "$OUTPUT"
 { mkdir -p "$(dirname "$LOG")" && printf '[%s] %s rc=%s\n%s\n---\n' \
     "$(date -u '+%Y-%m-%d %H:%M UTC')" "$LABEL" "$RC" "$OUTPUT" >> "$LOG"; } 2>/dev/null || true
 
-SAFE_LABEL=$(printf '%s' "$LABEL" | LC_ALL=C tr -cd 'A-Za-z _-' | head -c 40)
-[ -z "$SAFE_LABEL" ] && SAFE_LABEL="job"
+# Label ALLOWLIST = the labels of the active jobs in scripts/install_cron.sh
+# (test_signal_scrub.py asserts this list equals that file's set). Any other label
+# is dropped: the line then reads "Valedia job finished OK" with no label.
+KNOWN_LABELS="ASI SCAN|BRAIN CLOSE|BRAIN CRYPTO|BRAIN MIDDAY|DCA|DISCOVER|EOD PORTFOLIO|FUND CHECK|HEDGE INTEL|INSIDER|INTEL+SENTIMENT|LATENCY ARB|LEDGER RECONCILE|MARKET SCANNER|MASTER ALLOCATOR|ML RETRAIN|MORNING BRIEF|P&L TRACKER|QUANT ENGINE|REBALANCE|SELF-EVOLVE WEEKLY|SETTLEMENT|SHADOW PARITY|SPORTS ENGINE|WHALE MONITOR"
+JOB="Valedia job"
+IFS='|' read -r -a _KNOWN <<< "$KNOWN_LABELS"
+for _k in "${_KNOWN[@]}"; do
+    [ "$LABEL" = "$_k" ] && JOB="Valedia job $_k"
+done
 if [ "$RC" -eq 0 ]; then
-    MSG="Valedia job $SAFE_LABEL finished OK"
+    MSG="$JOB finished OK"
 else
-    MSG="Valedia job $SAFE_LABEL FAILED (see cron log)"
+    MSG="$JOB FAILED (see cron log)"
 fi
 
 # Send to Signal (fixed line only)
