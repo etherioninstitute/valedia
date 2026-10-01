@@ -44,11 +44,14 @@ def go(s, now, ret=True):
             raise ret
         return ret(m) if callable(ret) else ret
     sr.run(send_fn=send, now=now)
-    return [m.split("\nv0.")[0].split("\n✓ verified")[0] for m in sent]
+    return [m.split("\nv0.")[0].split("\n✓ verified")[0].split("\nledger scan count")[0] for m in sent]
 
 
-def rd(path):
-    return open(path).read().split() if os.path.isfile(path) else None
+def rd(path, raw=False):
+    """Record lines; the {"seeded_from_cursor": ...} marker line is dropped unless raw."""
+    if not os.path.isfile(path):
+        return None
+    return [l for l in open(path).read().split() if raw or not l.startswith("{")]
 
 
 def cut(path, n):
@@ -226,9 +229,10 @@ def test_sent_record_truncation_and_disagreement():
     assert go(s, mins(60)) == []
     s.__exit__()
     s = base()
-    for p in (paths(s)["sent"], paths(s)["bak"]):  # both cut at the same id: never re-reported
-        cut(p, 3)
-    assert go(s, mins(60)) == [] and {"a", "b"} <= sr.load_sent_ids()
+    for p in (paths(s)["sent"], paths(s)["bak"]):  # both cut inside b: the torn fragment is
+        cut(p, 3)  # discarded; b is in neither record (delivery was confirmed) -> reported normally
+    assert go(s, mins(60)) == [f"{P}+$5.00 (1W/0L)\n{AT}+$8.00 (2W/0L)"]
+    assert {"a", "b"} <= sr.load_sent_ids() and go(s, mins(120)) == []
     s.__exit__()
     s = base()  # last newline lost, then a new id appended: never merged into one line
     cut(paths(s)["sent"], 1)
@@ -263,7 +267,7 @@ def test_paused_once_per_day_with_count():
             os.remove(p)
             os.makedirs(p)
         s.append([ent("b", mins(-300)), st("b", 1.0, True, mins(30))])
-        want = ["Profit report paused — sent-record unreadable · 1 settlement(s) waiting"]
+        want = ["Profit report paused — sent-record unreadable · 1 settlement(s) waiting (ledger scan)"]
         assert go(s, mins(60)) == want
         assert go(s, mins(120)) == [] and go(s, mins(600)) == []  # not hourly
         assert go(s, mins(60 + 1440)) == want  # next day: once more
@@ -274,7 +278,7 @@ def test_bad_row_notice_survives_state_loss():
         s.write(A)
         assert go(s, mins(0)) == [MSG_A]
         s.write(A, ['{"type":"settlement","entry_id":"q","realiz'])
-        assert go(s, mins(30)) == ["⚠ 1 ledger row(s) unparseable — their figures withheld until fixed"]
+        assert go(s, mins(30)) == ["⚠ 1 ledger row(s) unparseable (ledger scan) — their figures withheld until fixed"]
         for p in srec._pair(sr.STATE_FILE):
             if os.path.exists(p):
                 open(p, "w").write("{garbage")
@@ -294,23 +298,23 @@ def _all_three(rows, now=mins(0)):
 def test_one_shared_selection():
     cases = {
         "int/str id collision": ([dict(ent("5", mins(-300)), id=5), st(5, 3.0, True, mins(-12)), ent("5", mins(-300)),
-                                  st("5", 10.0, True, mins(-11))], "1 ledger row(s) conflicting duplicate settlement"),
+                                  st("5", 10.0, True, mins(-11))], "2 ledger row(s) conflicting duplicate settlement (ledger scan)"),
         "paper settlement first": (A[:1] + [st("a", 3.0, True, mins(-30), source="paper"), A[1]], "+$3.00"),
         "unreconciled first, same": (A[:1] + [st("a", 3.0, True, mins(-30), fill_status="UNRECONCILED"), A[1]], "+$3.00"),
         "unreconciled first, diff": (A[:1] + [st("a", 2.9, True, mins(-30), fill_status="UNRECONCILED"), A[1]], "+$3.00"),
         "skew +3 min": ([ent("a", mins(-300)), st("a", -9.0, False, mins(3))], "−$9.00"),
         "no entry id": (A + [{"type": "settlement", "source": "live", "logged_at": mins(-5).isoformat(),
-                              "realized_pnl_net": 1, "won": True}], "1 ledger row(s) unparseable"),
+                              "realized_pnl_net": 1, "won": True}], "1 ledger row(s) unparseable (ledger scan)"),
         "settled_at +10h": (A + [ent("b", mins(-300)), st("b", -9.0, False, mins(-1), settled_at=mins(600).isoformat())],
-                            "1 ledger row(s) future-dated"),
+                            "1 ledger row(s) future-dated (ledger scan)"),
         "settlement_ts +10h": (A + [ent("b", mins(-300)), st("b", -9.0, False, mins(-1),
-                                                            settlement_ts=mins(600).isoformat())], "1 ledger row(s) future-dated"),
+                                                            settlement_ts=mins(600).isoformat())], "1 ledger row(s) future-dated (ledger scan)"),
         "mixed venues": ([ent("k", mins(-300)), st("k", 3.0, True, mins(-12)), ent("p", mins(-300), venue="polymarket"),
                           st("p", -2.0, False, mins(-11))], "+$1.00"),
     }
     for name, (rows, want) in cases.items():
         settle, eleven, facts = _all_three(rows)
-        if want.startswith("1 ledger"):
+        if want[0] in "12" and "ledger row" in want:
             assert eleven == [f"{AT}omitted — {want}"], (name, eleven)
             assert facts == f"{AT}omitted — {want}", (name, facts)
             assert all(want in m for m in settle), (name, settle)

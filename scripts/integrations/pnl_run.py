@@ -53,13 +53,13 @@ def _pnl_report(get_positions, ledger, send_fn, now):
     claim = sv.claim
     claims = [claim("Open-position cost", snap["invested"], snap2["invested"], "broker re-read"),
               claim("open positions", snap["n"], snap2["n"], "broker re-read", tol=0)]
+    allowed = []  # counts from the ledger scan: shown labelled "(ledger scan)", never claimed verified
     lines = [f"💰 Valedia P&L — {day.isoformat()}",
              f"Open-position cost (Kalshi, broker): {sv.money(snap['invested'])}"]
     reason = real["reason"] or real2["reason"]
     if reason:  # garbage / NaN / orphan / future / conflicting rows: never summed, never 0.00
         lines += [f"{ALL_TIME}: omitted — {reason}", f"Settled last 24h (ledger): omitted — {reason}"]
-        bad = max(real["bad"], real2["bad"])
-        claims.append(claim("bad rows", bad, bad, "ledger re-read", tol=0))
+        allowed.append(max(real["bad"], real2["bad"]))  # a ledger-scan count, labelled, not "verified"
     else:
         prof = sv.money(real["total"], signed=True)
         lines.append(f"{ALL_TIME}: {prof}{' (net loss)' if prof.startswith('−') else ''}"
@@ -70,16 +70,17 @@ def _pnl_report(get_positions, ledger, send_fn, now):
                    claim("losses", real["losses"], real2["losses"], "ledger re-read", tol=0)]
         (t1, untimed), (t2, _) = (lv.last_24h(r["settlements"], now) for r in (real, real2))
         if untimed:  # never a verified 0.00 for rows we cannot place in time
-            lines.append(f"Settled last 24h (ledger): omitted — {untimed} row(s) lack times")
-            claims.append(claim("untimed rows", untimed, untimed, "ledger re-read", tol=0))
+            lines.append(f"Settled last 24h (ledger): omitted — {untimed} row(s) lack times"
+                         " (ledger scan)")
+            allowed.append(untimed)
         else:
             lines.append(f"Settled last 24h (ledger): {sv.money(t1, signed=True)}")
             claims.append(claim("last 24h", t1, t2, "ledger re-read"))
     body = "\n".join(lines)
     notes, open_n = [], sv.ledger_open_kalshi(recs2)
     if open_n != snap2["n"]:
-        notes.append(f"ledger has {open_n} open Kalshi entries vs broker {snap2['n']} positions"
-                     " (not reconciled)")
+        notes.append(f"ledger has {open_n} open Kalshi entries (ledger scan) vs broker {snap2['n']}"
+                     " positions (not reconciled)")
     bfresh, bfoot = sv.broker_fresh(snap)
     lts, future = sv.ledger_latest(recs2, now)
     if future or not lts:  # suspect / unknown ledger time -> STALE, never plain verified
@@ -89,11 +90,11 @@ def _pnl_report(get_positions, ledger, send_fn, now):
         "ledger", lts, sv.LEDGER_STALE_OPEN_S if snap2["n"] else sv.LEDGER_STALE_ANY_S,
         policy="label")]
     return sv.deliver(kind, body, claims, bfresh + lfresh,
-                      footer=[f"ledger {real['rows']} settled rows"
+                      footer=[f"{real['rows']} settled rows (ledger scan)"
                               + (f", last row {sv.parse_ts(lts):%Y-%m-%d %H:%M} UTC" if lts
                                  else ", ledger time unknown"),
                               bfoot],
-                      notes=notes, send_fn=send_fn, dedupe_key=f"pnl:{day}",
+                      notes=notes, allowed=allowed, send_fn=send_fn, dedupe_key=f"pnl:{day}",
                       dedupe_window_s=20 * 3600, now=now)
 
 

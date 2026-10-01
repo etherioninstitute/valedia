@@ -32,10 +32,10 @@ NOW0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 mins = lambda m: NOW0 + timedelta(minutes=m)  # noqa: E731
 P = "Profit (settled since last report): "
 AT = "Realized P&L (all-time, ledger, all venues, fee-incl.): "
-WARN1 = "⚠ 1 ledger row(s) unparseable — all-time total omitted"
-NOTICE1 = "⚠ 1 ledger row(s) unparseable — their figures withheld until fixed"
-WARN_FUT = "⚠ 1 ledger row(s) future-dated — all-time total omitted"
-WARN_CONF = "⚠ 1 ledger row(s) conflicting duplicate settlement — all-time total omitted"
+WARN1 = "⚠ 1 ledger row(s) unparseable (ledger scan) — all-time total omitted"
+NOTICE1 = "⚠ 1 ledger row(s) unparseable (ledger scan) — their figures withheld until fixed"
+WARN_FUT = "⚠ 1 ledger row(s) future-dated (ledger scan) — all-time total omitted"
+WARN_CONF = "⚠ 2 ledger row(s) conflicting duplicate settlement (ledger scan) — all-time total omitted"
 
 
 def ent(i, t, **k):
@@ -83,7 +83,7 @@ class Settle:
     def run(self, now, result=True):
         sent = []
         sr.run(send_fn=lambda m: (sent.append(m), result)[1], now=now)
-        return [m.split("\nv0.")[0].split("\n✓ verified")[0] for m in sent]  # drop stamp/footer
+        return [m.split("\nv0.")[0].split("\n✓ verified")[0].split("\nledger scan count")[0] for m in sent]  # drop stamp/footer
 
 
 def test_base_ooo_skew():
@@ -232,7 +232,7 @@ def test_concurrent_runs_report_once():
         [p.join() for p in ps]
         lines = open(out).read().splitlines()
         assert len(lines) == 1 and lines[0].startswith(f"{P}+$3.00"), lines
-        assert open(s.sent_path).read().split() == ['"a"']
+        assert [l for l in open(s.sent_path).read().split() if l[0] == '"'] == ['"a"']
 
 
 POS = lambda: {"market_positions": [{"ticker": "A", "position": 1, "market_exposure": 250}]}  # noqa: E731
@@ -254,22 +254,23 @@ def test_pnl_24h_and_conflicts():
                         ("missing", st("b", -9.0, False, None))]:  # -> flagged like settle_run does
         r, t = _pnl(base + [ent("b", mins(-300)), extra])
         assert r["status"] == "verified", (name, r)
-        assert f"{AT}omitted — 1 ledger row(s) unparseable" in t, (name, t)
-        assert "Settled last 24h (ledger): omitted — 1 ledger row(s) unparseable" in t, (name, t)
+        assert f"{AT}omitted — 1 ledger row(s) unparseable (ledger scan)" in t, (name, t)
+        assert "Settled last 24h (ledger): omitted — 1 ledger row(s) unparseable (ledger scan)" in t, (name, t)
         assert "$0.00" not in t and "6.00" not in t and "9.00" not in t, (name, t)
     r, t = _pnl(base + [ent("b", mins(-300)), st("b", -9.0, False, mins(-10), settled_at="bad")])
-    assert "Settled last 24h (ledger): omitted — 1 row(s) lack times" in t, t
-    assert f"{AT}−$6.00 (net loss) · 1W/1L" in t and "$0.00" not in t, t
+    assert f"{AT}omitted — 1 ledger row(s) unparseable (ledger scan)" in t, t  # every time field
+    assert "Settled last 24h (ledger): omitted — 1 ledger row(s) unparseable" in t, t  # validated
+    assert "6.00" not in t and "$0.00" not in t, t
     r, t = _pnl(base + [ent("b", mins(-3000)), st("b", -9.0, False, mins(-10), ts=mins(-1800).isoformat())])
     assert "Settled last 24h (ledger): $0.00" in t, t  # settled 30h ago (ts), booked now
     r, t = _pnl(base + [ent("b", mins(-300)), st("b", -9.0, False, mins(-10))])
     assert "Settled last 24h (ledger): −$9.00" in t, t
     r, t = _pnl(base + [st("a", -50.0, False, mins(-5))])
-    assert f"{AT}omitted — 1 ledger row(s) conflicting duplicate settlement" in t, t
+    assert f"{AT}omitted — 2 ledger row(s) conflicting duplicate settlement (ledger scan)" in t, t
     assert "Open-position cost (Kalshi, broker): $2.50" in t and "-50" not in t and "50.00" not in t
     f = cb.verified_facts(get=lambda p: {"balance": 12345}, get_positions=POS,
                           ledger=lambda: base + [st("a", -50.0, False, mins(-5))], now=mins(0))
-    assert cb.facts_block(f)[0][4] == f"{AT}omitted — 1 ledger row(s) conflicting duplicate settlement"
+    assert cb.facts_block(f)[0][4] == f"{AT}omitted — 2 ledger row(s) conflicting duplicate settlement (ledger scan)"
 
 
 def test_sports_pings_survive_log_failures():

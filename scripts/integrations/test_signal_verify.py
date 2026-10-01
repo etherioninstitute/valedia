@@ -89,7 +89,7 @@ def test_pnl_report_figures_match_sources():
     # +2.50 - 1.25; unreconciled 9.99 and paper 5.00 excluded
     assert "Realized P&L (all-time, ledger, all venues, fee-incl.): +$1.25 · 1W/1L\nSettled last 24h (ledger): +$2.50" in t, t
     assert "9.99" not in t and "5.00" not in t
-    assert ("✓ verified: ledger 2 settled rows, last row 2026-10-01 20:00 UTC, "
+    assert ("✓ verified: 2 settled rows (ledger scan), last row 2026-10-01 20:00 UTC, "
             "broker time unknown (read 23:00 UTC)") in t, t
     assert "⚠" not in t  # ledger open (e5) == broker open (KXA)
     rec = _log(d)[-1]
@@ -191,7 +191,7 @@ def test_settle_run_profit_id_based():
         assert "\nProfit (settled since last report): +$1.25 (1W/1L)\n" in t, t
         assert "Realized P&L (all-time, ledger, all venues, fee-incl.): +$1.25 (1W/1L)" in t, t
         assert "7.77" not in t and "9.99" not in t and "5.00" not in t
-        assert "✓ verified: ledger 2 settled rows" in t, t
+        assert "✓ verified: 2 settled rows (ledger scan)" in t, t
         send2 = Sender()
         sr.run(send_fn=send2, now=NOW + timedelta(hours=1))
         assert send2.msgs == [], send2.msgs  # nothing reported twice

@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -144,8 +145,8 @@ def facts_block(f):
                      f"{why.get('ledger', 'unavailable')}")
     mm = f.get("open_mismatch")
     if mm and mm[0] != mm[1]:
-        lines.append(f"⚠ ledger/broker open-position mismatch ({mm[0]} vs {mm[1]}) — not reconciled")
-        claims.append(sv.claim("ledger open entries", mm[0], mm[0], "ledger re-read", tol=0))
+        lines.append(f"⚠ ledger/broker open-position mismatch (ledger scan {mm[0]} vs broker {mm[1]})"
+                     " — not reconciled")  # the ledger side is a scan, not a re-read: no claim
     return lines, claims
 
 
@@ -225,7 +226,8 @@ def gate_answer(question, response, facts, send=False, send_fn=None, now=None):
     path = save_answer(question, response, now)
     body = "\n".join(lines + [AI_LINE + (path or "(save failed, see bridge stdout)")])
     key = hashlib.sha1(f"{question}|{response}".encode()).hexdigest()
-    return sv.deliver("AI answer", body, claims, send_fn=send_fn, now=now, dedupe_key=key,
+    scan = [int(n) for n in re.findall(r"(\d+) ledger row\(s\)", body)]  # labelled "(ledger scan)"
+    return sv.deliver("AI answer", body, claims, send_fn=send_fn, now=now, dedupe_key=key, allowed=scan,
                       dedupe_window_s=600, transport=send, verified_line=FOOTER,
                       info={"answer_path": path})
 
