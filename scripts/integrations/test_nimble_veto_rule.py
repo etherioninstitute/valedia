@@ -31,7 +31,9 @@ import valedia_config as vc  # noqa: E402
 PIN = "24e550a16a70"
 MODELS = tempfile.mkdtemp(prefix="nimrule_models_")
 vc._MODELS = MODELS
-ETH = os.path.join(MODELS, "latest_etherion_risk.json")
+import ere_test_fixture  # ERE v3: healthy BOOK (multiplier 1.0, NORMAL) as the default
+ere_test_fixture.write_state(MODELS)
+ETH = os.path.join(MODELS, "latest_etherion_risk.json")  # retired file; kept for _etherion helper
 SECRET_PRICE = 0.7319  # a distinctive number that must never reach the model
 
 
@@ -123,42 +125,50 @@ def test_break_even_math():
 
 def test_phi_multiplier_monotone_bounded_and_missing():
     _reset()
-    assert nd.phi_multiplier() == (1.0, "etherion_missing")
-    seen = []
-    for lvl in ("NORMAL", "CAUTION", "ELEVATED", "WARNING", "HALT"):
-        _etherion(lvl)
-        m, src = nd.phi_multiplier()
-        assert src == "etherion:" + lvl and 0.5 <= m <= 3.0, (lvl, m)
-        # same quantity as the Kelly cap: rf = valedia_config._risk_factor()
-        assert abs(m - (0.5 + 2.5 * (1 - vc._risk_factor()))) < 1e-9
-        seen.append(m)
-    assert seen == sorted(seen) and seen[0] == 0.5 and seen[-1] == 3.0, seen
-    _etherion("NORMAL", age_h=48)
-    assert nd.phi_multiplier() == (1.0, "etherion_stale")
-    _etherion(raw={"timestamp": "2026-09-30 10:00 UTC", "signals": {}})  # alpha_risk_report shape
-    assert nd.phi_multiplier() == (1.0, "etherion_no_risk_level")
-    _etherion("CRITICAL")  # unknown level → neutral 1.0, not NORMAL's 0.5
-    assert nd.phi_multiplier() == (1.0, "etherion_unknown_level")
-    _etherion(" halt ")  # whitespace/case must not turn HALT into the loosest phi
-    assert vc._risk_factor() == 0.0 and nd.phi_multiplier()[0] == 3.0
-    with open(ETH, "w") as f:
-        f.write("{not json")
-    m, src = nd.phi_multiplier()
-    assert m == 1.0 and src.startswith("etherion_error_")
-    # margin follows phi: calm smaller, high risk larger
-    _etherion("NORMAL")
-    assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.01
-    _etherion("HALT")
-    assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.06
-    _etherion(None)
-    assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.02
+    import ere_test_fixture  # ERE v3: canonical gate; legacy file shapes are retired
+
+    def _break_state():
+        with open(os.path.join(MODELS, "ere_state.json"), "w") as f:
+            f.write("{broken")
+
+    try:
+        # Missing/invalid state -> reader CLOSED -> phi at its STRICTEST (3.0), never loose
+        _break_state()
+        assert nd.phi_multiplier() == (3.0, "etherion:v3")
+        seen = []
+        for mult in (1.0, 0.75, 0.5, 0.25, 0.0):
+            ere_test_fixture.write_state(MODELS, multiplier=mult)
+            m, src = nd.phi_multiplier()
+            assert src == "etherion:v3", (mult, src)
+            assert 0.5 <= m <= 3.0, (mult, m)
+            # same quantity as the Kelly cap: rf = valedia_config._risk_factor()
+            assert abs(m - (0.5 + 2.5 * (1 - vc._risk_factor()))) < 1e-9
+            seen.append(m)
+        assert seen == sorted(seen) and seen[0] == 0.5 and seen[-1] == 3.0, seen
+        # Zero multiplier (HALT) -> phi at its strictest, never a lift
+        assert seen[-1] == 3.0
+        # Invalid state again -> reader CLOSED -> strictest
+        _break_state()
+        assert nd.phi_multiplier() == (3.0, "etherion:v3")
+        # margin follows phi: calm smaller, high risk larger
+        ere_test_fixture.write_state(MODELS, multiplier=1.0)
+        assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.01
+        ere_test_fixture.write_state(MODELS, multiplier=0.0)
+        assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.06
+        # Missing state -> strictest margin, same as HALT (fail-closed)
+        _break_state()
+        assert nd.rule_inputs("crypto", {"roundtrip_fee_pct": 0})["margin"] == 0.06
+    finally:
+        # restore the module-default healthy book for sibling tests
+        ere_test_fixture.write_state(MODELS)
 
 
 def test_veto_grid():
-    econ = {"side": "yes", "price": 0.70, "fee_per_contract": 0.0147}  # be .7147, req .7347
+    econ = {"side": "yes", "price": 0.70, "fee_per_contract": 0.0147}  # be .7147
     _reset()
     req = nd.rule_inputs("prediction", econ)["required_p"]
-    assert abs(req - 0.7347) < 1e-9, req
+    # ERE v3 healthy book (module fixture): phi 0.5 -> margin 0.01 -> req .7247
+    assert abs(req - 0.7247) < 1e-9, req
     grid = [  # (choice, conf, p_buy, allow, reason)
         ("buy", 0.9, round(req + 0.001, 4), True, "veto_model_buy"),
         ("buy", 0.9, round(req - 0.001, 4), False, "veto_p_below_required"),
@@ -173,7 +183,7 @@ def test_veto_grid():
         assert v["allow"] is allow and v["reason"] == reason, (choice, conf, pb, v)
         assert v["rule_reason"] == reason and abs(v["break_even_p"] - 0.7147) < 1e-9
         assert v["calibration"] == "identity" and v["p_cal"] == pb
-        assert v["phi_multiplier"] == 1.0 and v["margin"] == 0.02
+        assert v["phi_multiplier"] == 0.5 and v["margin"] == 0.01
     # unknown economics → the floor alone
     _reset()
     v = _decide(_post("buy", 0.9, 0.61))
@@ -184,11 +194,11 @@ def test_veto_grid():
     _reset()
     v = _decide(_post("buy", 0.9, 0.62), economics={"side": "yes", "price": 0.10})
     assert v["allow"] is True and v["required_p"] == 0.60
-    # no-side buy uses the NO price
+    # no-side buy uses the NO price (margin 0.01 under the healthy book)
     _reset()
-    v = _decide(_post("buy", 0.9, 0.83), side="no",  # .83 < .82 + .02 (YES .2 would pass)
+    v = _decide(_post("buy", 0.9, 0.82), side="no",  # .82 < .82 + .01 (YES .2 would pass)
                 economics={"side": "no", "yes_price": 0.2, "no_price": 0.82})
-    assert v["allow"] is False and abs(v["required_p"] - 0.84) < 1e-9
+    assert v["allow"] is False and abs(v["required_p"] - 0.83) < 1e-9
     # calibration lowers an overconfident source's p_buy below required
     _reset()
     cl._reset_cache(items=[{"source": "nimble_decide:cal", "p": 0.9, "y": i % 2}

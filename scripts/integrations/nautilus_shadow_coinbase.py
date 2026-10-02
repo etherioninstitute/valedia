@@ -170,13 +170,12 @@ def compare_intent_to_post(intent, post: dict) -> dict:
 
 
 def _ere_level() -> str:
+    """Canonical ERE v3 reader. Fail-closed: missing/invalid state -> HALT."""
     try:
-        p = os.path.join(_MODELS, "latest_etherion_risk.json")
-        if os.path.exists(p):
-            return str(json.load(open(p)).get("risk_level", "UNKNOWN")).upper() or "UNKNOWN"
+        from ere_runtime import read_gate
+        return str(read_gate("BOOK", models_dir=_MODELS).get("risk_level", "HALT")).upper() or "HALT"
     except Exception:
-        pass
-    return "UNKNOWN"
+        return "HALT"
 
 
 def shadow_gates(over: Optional[dict] = None, note: Optional[str] = None) -> dict:

@@ -42,7 +42,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["coinbase"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
     vc.VENUE_WRITER["kraken"] = "none"
     for k in ("VALEDIA_TRADING_HALT", "VALEDIA_TRADING_HALT_FILE",
@@ -69,7 +69,7 @@ def test_hygiene_and_default_off():
     assert vc.require_not_halted("probe") is False
     assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     assert pmu.live_enabled() is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.MIROFISH_AUTO_RAISE is False
     assert vc.VALEDIA_SELF_ADJUST is False
     assert vc.REBALANCER_AUTOEXEC is False
@@ -261,7 +261,7 @@ def test_full_smoke_fence_notes_halt():
     row = smoke.check_fence()
     assert row["status"] == "PASS"
     assert row["extra"]["trading_halt"] is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     src = open(os.path.join(HERE, "valedia_full_smoke.py")).read()
     assert "trading_halt" in src
     assert 'POLYMARKET_US_LIVE"] = "1"' not in src

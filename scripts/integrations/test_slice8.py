@@ -17,6 +17,10 @@ sys.path.insert(0, HERE)
 os.environ["OPENCLAW_SKIP_ENV"] = "1"
 
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="slice8_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 import fee_engine as fe
 import unified_brain as ub  # before rebalancer/kelly, which insert the live tree
 sys.path.insert(0, HERE)

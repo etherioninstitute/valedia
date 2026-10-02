@@ -408,8 +408,12 @@ def _paused(strategy):
 
 
 def _ere_level(models_dir):
-    d = _load(os.path.join(models_dir, "latest_etherion_risk.json"))
-    return str(d.get("risk_level") or "UNKNOWN").upper() or "UNKNOWN"
+    """Canonical ERE v3 reader. Fail-closed: missing/invalid state -> HALT."""
+    try:
+        from ere_runtime import read_gate
+        return str(read_gate("BOOK", models_dir=models_dir).get("risk_level", "HALT")).upper() or "HALT"
+    except Exception:
+        return "HALT"
 
 
 def evaluate_gates(opp, models_dir=_MODELS, ere_level=None):

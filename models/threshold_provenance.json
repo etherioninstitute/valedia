@@ -1,0 +1,82 @@
+{
+  "version": {
+    "value": "ERE v3 (ere/2)",
+    "provenance": "Version/identity field; not a statistical threshold"
+  },
+  "config_id": {
+    "value": "ere3-research-unapproved",
+    "provenance": "Version/identity field; not a statistical threshold"
+  },
+  "assets": {
+    "value": [],
+    "provenance": "Version/identity field; not a statistical threshold"
+  },
+  "short": {
+    "value": 10,
+    "provenance": "PROTOCOL.md: fixed before holdout; ROC sensitivity required"
+  },
+  "reference": {
+    "value": 120,
+    "provenance": "PROTOCOL.md: disjoint six-month reference, not PDE constant"
+  },
+  "half_life": {
+    "value": 5.0,
+    "provenance": "PROTOCOL.md: fixed recent exponential weights"
+  },
+  "cut_q": {
+    "value": 0.95,
+    "provenance": "2020-2023 ROC + independent null margin; see frozen_thresholds.json"
+  },
+  "halt_q": {
+    "value": 1.0,
+    "provenance": "2020-2023 ROC: historical maximum; no distribution-free tail guarantee"
+  },
+  "min_scores": {
+    "value": 252,
+    "provenance": "Minimum reference sample policy; not a tail guarantee"
+  },
+  "max_history": {
+    "value": 4096,
+    "provenance": "Bounded baseline storage; deterministic oldest-first eviction"
+  },
+  "max_gross": {
+    "value": 1.0,
+    "provenance": "Unlevered operating scope; independent capital-risk policy"
+  },
+  "max_bar_age_s": {
+    "value": 345600.0,
+    "provenance": "Four calendar days; sleeve/session checks belong in adapter"
+  },
+  "heartbeat_ttl_s": {
+    "value": 5400.0,
+    "provenance": "Hourly producer, 30-minute lateness allowance; operational policy"
+  },
+  "position_ttl_s": {
+    "value": 5400.0,
+    "provenance": "Holdings snapshot maximum age; invalidate on every fill"
+  },
+  "feed_grace_s": {
+    "value": 900.0,
+    "provenance": "Completed-bar publication grace; operational policy, not forecast"
+  },
+  "baseline_embargo": {
+    "value": 60,
+    "provenance": "Annual reference embargo covers longest research comparator"
+  },
+  "fetch_timeout_s": {
+    "value": 20.0,
+    "provenance": "External producer network timeout; core performs no network I/O"
+  },
+  "caution_floor": {
+    "value": 0.75,
+    "provenance": "Display only: not a trading threshold"
+  },
+  "elevated_floor": {
+    "value": 0.5,
+    "provenance": "Display only: not a trading threshold"
+  },
+  "numeric_tol": {
+    "value": 1e-12,
+    "provenance": "Dimensionless floating-point comparison tolerance"
+  }
+}

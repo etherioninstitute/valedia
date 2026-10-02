@@ -32,7 +32,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     os.environ.pop("REBALANCER_AUTOEXEC", None)
     rr.set_spot_order_getter(None)
@@ -61,7 +61,7 @@ def _assert_fence(before=None):
     assert vc.REBALANCER_AUTOEXEC is False
     assert vc.VENUE_WRITER["coinbase"] == "valedia"
     assert vc.VENUE_WRITER["hyperliquid"] == "none"
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
 
 
 def _ledger():

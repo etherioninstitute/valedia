@@ -43,6 +43,10 @@ import nautilus_shadow_coinbase as nsc  # noqa: E402
 import nimble_wiring as nw  # noqa: E402
 import session_clocks as sc  # noqa: E402
 import valedia_config as vc  # noqa: E402
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="alloc_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 from test_kalshi_fill_ledger import _admitted_sports_opp, _fill  # noqa: E402
 
 FV_KEYS = ("fv", "fv_source", "fv_confidence")

@@ -31,7 +31,7 @@ def _restore():
     vc.NAUTILUS_SHADOW_VENUES = True
     vc.VENUE_WRITER["coinbase"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     os.environ.pop("VALEDIA_SELF_ADJUST", None)
     vc._STAMP_CACHE = None

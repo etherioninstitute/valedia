@@ -678,14 +678,15 @@ def _track_record_mult():
     except Exception:
         return KELLY_UNPROVEN_MULT
 
-def _risk_factor():
-    """Live risk scalar from latest_etherion_risk.json risk_level: NORMAL 1.0 .. HALT 0.0.
-    Defensive — any error returns 1.0 (neutral)."""
+def _risk_factor(scope="BOOK"):
+    """Canonical ERE v3 scalar; faults forbid new risk. No label remapping."""
     try:
-        lvl = str(_json.load(open(_os.path.join(_MODELS, "latest_etherion_risk.json"))).get("risk_level", "NORMAL")).strip().upper()
-        return {"NORMAL": 1.0, "CAUTION": 0.6, "ELEVATED": 0.5, "WARNING": 0.25, "HALT": 0.0, "DANGER": 0.0}.get(lvl, 1.0)
+        from ere_runtime import read_gate
+        return float(read_gate(scope, models_dir=_MODELS)["multiplier"])
     except Exception:
-        return 1.0
+        import logging
+        logging.getLogger("ere").exception("Kelly risk reader CLOSED")
+        return 0.0
 
 def category_track_record_mult(category):
     """Per-strategy Kelly scalar from fee-true category_stats (not the global mix).
@@ -734,20 +735,32 @@ def dynamic_per_trade_cap(regime="SIDEWAYS", track_record_mult=None, risk_factor
     """Per-trade position ceiling that BREATHES with regime + live track-record + live Etherion risk:
         cap = KELLY_BASE_CAP * regime_factor * track_record * risk, fused at KELLY_FUSE.
     track_record_mult / risk_factor default to None -> AUTO-SOURCED from the canonical state files
-    (brain_log.json recent hit-rate; latest_etherion_risk.json risk_level). Pass values to override.
+    (settled track record; ere_state.json via read_gate). An explicit risk value can only tighten.
     category: when set (and track_record_mult is None) uses category_track_record_mult so a
     hot grave/fake book cannot lift a different strategy. Paper/unreconciled/backfill cannot lift.
     - regime: favorable regime raises the ceiling so the regime-boosted Kelly fraction isn't clipped.
     Returns a capital fraction in [0, KELLY_FUSE]."""
-    rf = KELLY_REGIME_CAP_FACTOR.get(regime, 1.0)
-    if track_record_mult is not None:
-        tr = float(track_record_mult)
-    elif category:
-        tr = category_track_record_mult(category)
-    else:
-        tr = _track_record_mult()
-    risk = _risk_factor() if risk_factor is None else float(risk_factor)
+    try:
+        rf = KELLY_REGIME_CAP_FACTOR.get(regime, 1.0)
+        if track_record_mult is not None:
+            tr = float(track_record_mult)
+        elif category:
+            tr = category_track_record_mult(category)
+        else:
+            tr = _track_record_mult()
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    # Explicit per-asset risk never bypasses the canonical book gate. Use min,
+    # NOT a product, to avoid applying a shared gate twice.
+    import math
+    try:
+        canonical = float(_risk_factor())
+        risk = min(canonical, float(risk_factor)) if risk_factor is not None else canonical
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
     cap = KELLY_BASE_CAP * rf * max(0.0, tr) * max(0.0, risk)
+    if not math.isfinite(cap):
+        return 0.0
     return max(0.0, min(cap, KELLY_FUSE))
 
 # ── KNOWN DIVERGENCES — do NOT unify without a backtest (behavioral pass) ──

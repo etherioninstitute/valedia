@@ -21,6 +21,10 @@ import intel_opportunity_gatherer as iog
 import nautilus_intent as ni
 import pnl_tracker as pt
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="slice10_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 
 NOW = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
 
@@ -54,9 +58,9 @@ def _fresh_ts():
 def _models(md, files=None):
     for name, obj in (files or {}).items():
         _write(md, name, obj)
-    ere = os.path.join(md, "latest_etherion_risk.json")
-    if not os.path.exists(ere):
-        _write(md, "latest_etherion_risk.json", {"risk_level": "NORMAL"})
+    # ERE v3: canonical gate state so _ere_level reads a healthy book
+    import ere_test_fixture
+    ere_test_fixture.write_state(md)
     return md
 
 
@@ -263,7 +267,9 @@ def test_ere_halt_refuses():
     _restore_flags()
     md = _tmpdir()
     _models(md)
-    _write(md, "latest_etherion_risk.json", {"risk_level": "HALT"})
+    # ERE v3 HALT: valid state, multiplier 0 (canonical gate; legacy file retired)
+    import ere_test_fixture
+    ere_test_fixture.write_state(md, multiplier=0.0)
     qpath = os.path.join(md, "q.jsonl")
     orig_stats = ftl.category_stats
     orig_ov = ftl._overrides

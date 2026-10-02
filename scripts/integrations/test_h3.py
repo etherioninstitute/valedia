@@ -22,6 +22,10 @@ import master_allocator as ma
 import kalshi_auth
 import kalshi_executor as ke
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="h3_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 
 
 def _ack(oid="ack-1"):

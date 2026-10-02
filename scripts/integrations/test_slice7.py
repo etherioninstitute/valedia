@@ -22,7 +22,11 @@ import reconcile_run as rr
 import spot_order_get as sog
 import spot_reconcile as sr
 import sports_engine as se
-import valedia_config as vc
+import valedia_config as vc  # noqa: E402
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="slice7_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 
 import kelly_sizing as ks  # inserts live-tree path; put v2 back first
 sys.path.insert(0, HERE)

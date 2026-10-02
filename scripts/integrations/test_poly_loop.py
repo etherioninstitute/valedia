@@ -19,6 +19,10 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 
 import poly_loop
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="polyloop_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 from test_poly_us import _restore
 
 
@@ -79,7 +83,7 @@ def test_hygiene_and_fence():
         assert banned not in src, banned
     assert "POLY-LOOP" in src
     assert vc.POLYMARKET_US_LIVE is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.WEATHER_LIVE is False
     assert vc.SCALPER_LIVE is False
     assert vc.NAUTILUS_LIVE is False

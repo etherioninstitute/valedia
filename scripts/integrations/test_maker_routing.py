@@ -25,6 +25,10 @@ import kalshi_profit as kp  # noqa: E402
 import maker_routing as mr  # noqa: E402
 import master_allocator as ma  # noqa: E402
 import valedia_config as vc  # noqa: E402
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="maker_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 import test_h3 as h3  # noqa: E402
 
 FREE = 0.0  # maker multiplier 0 → maker_viable

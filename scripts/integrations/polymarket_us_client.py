@@ -68,7 +68,10 @@ def http_enabled():
 
 
 def load_openclaw_env():
-    """setdefault from ~/.openclaw/.env. Does not override existing env."""
+    """setdefault from ~/.openclaw/.env. Does not override existing env.
+    OPENCLAW_SKIP_ENV=1 (unit tests) keeps this process hermetic."""
+    if str(os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return False
     path = os.path.expanduser("~/.openclaw/.env")
     if not os.path.isfile(path):
         return False

@@ -31,7 +31,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["coinbase"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
     vc.VENUE_WRITER["kraken"] = "none"
     os.environ.pop("VALEDIA_TREASURY_AUTO", None)
@@ -63,7 +63,7 @@ def test_hygiene_and_fence():
     assert vc.TREASURY_ALERT_WEBHOOK == ""
     assert vc.treasury_alert_webhook() == ""
     assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.NAUTILUS_LIVE is False
     reb = open(os.path.join(HERE, "rebalancer.py")).read()

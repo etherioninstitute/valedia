@@ -222,28 +222,26 @@ def news_facts(symbol, d, *, news=None, prediction_log_paths=None, now=None):
 
 
 def ere_facts(symbol, d, *, paths=None, now=None):
-    """risk_off from risk_level; fade conflict: buy vs FADE_SHORT, sell vs FADE_LONG."""
+    """Risk-off from the canonical ERE v3 gate (valid state only). Absent/invalid
+    state is neutral here — the fail-closed sizing enforcement lives in the Kelly
+    cap (valedia_config._risk_factor), not in this evidence layer. Fade-conflict
+    (per-ticker FADE signals) is retired with ERE v2; it reports False."""
     facts = {"ere_fresh": False, "ere_risk_off": False, "ere_fade_side_conflict": False}
-    for p in paths or ERE_PATHS:
-        doc = _read(p)
-        if not doc:
-            continue
-        age = _age_s(doc.get("timestamp") or doc.get("ts"), now)
-        src = {"path": p, "age_s": age, "source": doc.get("source"),
-               "risk_level": doc.get("risk_level"), "regime": doc.get("regime")}
-        if age is None or age >= MAX_AGE_S:
-            src["used"] = False
-            continue
-        sig = _lookup(doc.get("signals"), symbol)
-        fade = str((sig or {}).get("signal") or "").upper() if isinstance(sig, dict) else ""
-        src.update(used=True, signal=fade or None)
-        facts.update(
-            ere_fresh=True,
-            ere_risk_off=str(doc.get("risk_level") or "").upper() in ERE_RISK_OFF_LEVELS,
-            ere_fade_side_conflict=(d == "up" and fade == "FADE_SHORT")
-            or (d == "down" and fade == "FADE_LONG"))
-        return facts, src
-    return facts, {"used": False, "reason": "absent_or_stale"}
+    try:
+        import ere_runtime
+        models_dir = paths[0] if paths else _HOME_MODELS
+        gate = ere_runtime.read_gate("BOOK", models_dir=models_dir)
+    except Exception as e:
+        return facts, {"used": False, "reason": "reader_error_" + type(e).__name__}
+    if gate.get("data_quality") != "OK":
+        return facts, {"used": False, "reason": "absent_or_invalid_state",
+                       "risk_level": gate.get("risk_level")}
+    risk_level = str(gate.get("risk_level") or "").upper()
+    return {
+        "ere_fresh": True,
+        "ere_risk_off": risk_level in ERE_RISK_OFF_LEVELS,
+        "ere_fade_side_conflict": False,
+    }, {"used": True, "risk_level": risk_level, "source": "ere/2"}
 
 
 def _fomo_tag(enr, symbol):

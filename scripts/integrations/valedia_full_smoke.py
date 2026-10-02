@@ -42,7 +42,7 @@ EXPECTED_WRITERS = {
     "coinbase": "valedia",
     "alpaca": "valedia",
     "kraken": "none",
-    "polymarket": "none",
+    "polymarket": "valedia",  # Burton decision 2026-10-01: keep "valedia" (config default)
     "hyperliquid": "none",
 }
 

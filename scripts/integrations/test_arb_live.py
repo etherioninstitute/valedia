@@ -21,6 +21,10 @@ import arb_live as al  # noqa: E402
 import forward_test_ledger as ftl  # noqa: E402
 import kalshi_fee_map as kfm  # noqa: E402
 import valedia_config as vc  # noqa: E402
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="arblive_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 import vaughan_arb_paper as va  # noqa: E402
 import test_vaughan_arb_paper as tva  # noqa: E402
 

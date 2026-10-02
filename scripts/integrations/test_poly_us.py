@@ -25,7 +25,7 @@ import valedia_config as vc
 def _restore():
     vc.NAUTILUS_ENABLED = False
     vc.NAUTILUS_LIVE = False
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.MIROFISH_AUTO_RAISE = False
     vc.VALEDIA_SELF_ADJUST = False
     os.environ.pop("POLYMARKET_US_LIVE", None)
@@ -118,7 +118,7 @@ def test_hygiene_and_fence():
     assert "api.polymarket.us" in src
     assert "gateway.polymarket.us" in src
     assert pmob.LIVE_CLIENT_HOOK is None
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.nautilus_may_dispatch("polymarket") is False
     assert pmu.live_enabled() is False
     assert pmu.http_enabled() is False

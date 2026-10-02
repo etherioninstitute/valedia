@@ -281,28 +281,15 @@ def prediction_facts(opp, *, poly=False):
 
 # ---------------------------------------------------------------- veto rule (docstring)
 def phi_multiplier(now=None):
-    """(multiplier in [0.5, 3.0], phi_source). Reuses valedia_config._risk_factor (Kelly cap)."""
+    """(multiplier in [0.5, 3.0], phi_source). Uses the canonical ERE v3 reader (vc._risk_factor).
+    m is a CONSERVATISM scalar: larger = stricter veto margin. rf=1 (NORMAL) -> 0.5;
+    rf=0 (HALT, incl. reader CLOSED/faults) -> 3.0. Fail-closed: never loose on a fault."""
     try:
         import valedia_config as vc
-        path = os.path.join(vc._MODELS, "latest_etherion_risk.json")
-        if not os.path.exists(path):
-            return 1.0, "etherion_missing"
-        with open(path) as f:
-            doc = json.load(f)
-        lvl = str(doc.get("risk_level") or "").strip().upper() if isinstance(doc, dict) else ""
-        if lvl not in KNOWN_RISK_LEVELS:  # unknown is neutral 1.0, not _risk_factor's NORMAL (0.5x)
-            return 1.0, "etherion_unknown_level" if lvl else "etherion_no_risk_level"
-        try:
-            t = datetime.fromisoformat(str(doc.get("ts"))).timestamp()
-        except (TypeError, ValueError):
-            t = os.path.getmtime(path)
-        max_h = _env_float("VALEDIA_NIMBLE_PHI_MAX_AGE_H", PHI_MAX_AGE_H_DEFAULT, 0.0, 1e6)
-        if ((time.time() if now is None else now) - t) / 3600.0 > max_h:
-            return 1.0, "etherion_stale"
         rf = min(max(float(vc._risk_factor()), 0.0), 1.0)
-        return round(PHI_MULT_LO + (PHI_MULT_HI - PHI_MULT_LO) * (1.0 - rf), 6), "etherion:" + lvl
+        return round(PHI_MULT_LO + (PHI_MULT_HI - PHI_MULT_LO) * (1.0 - rf), 6), "etherion:v3"
     except Exception as e:
-        return 1.0, "etherion_error_" + type(e).__name__
+        return PHI_MULT_HI, "etherion_error_" + type(e).__name__
 
 
 def break_even_p(asset_class, economics, side=None):

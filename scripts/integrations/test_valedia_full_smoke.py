@@ -35,7 +35,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["coinbase"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
     vc.VENUE_WRITER["kraken"] = "none"
     os.environ.pop("POLYMARKET_US_LIVE", None)
@@ -78,7 +78,7 @@ def test_hygiene_and_fence():
     assert "pnl.load_pnl" in src
     assert vc.MIROFISH_AUTO_RAISE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert pmu.live_enabled() is False
     fence = smoke.check_fence()
     assert fence["status"] == "PASS"
@@ -188,7 +188,7 @@ def test_fence_fail_on_live_flag():
         assert row["status"] == "FAIL"
         assert "writer" in row["reason"]
     finally:
-        vc.VENUE_WRITER["polymarket"] = "none"
+        vc.VENUE_WRITER["polymarket"] = "valedia"
     os.environ["POLYMARKET_US_LIVE"] = "1"
     try:
         row = smoke.check_fence()

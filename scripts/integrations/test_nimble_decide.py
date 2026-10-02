@@ -24,7 +24,9 @@ import nimble_decide as nd  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
 import valedia_config as vc  # noqa: E402
 
-vc._MODELS = tempfile.mkdtemp(prefix="nimdec_models_")  # no Etherion file: phi 1.0
+vc._MODELS = tempfile.mkdtemp(prefix="nimdec_models_")
+import ere_test_fixture  # ERE v3: healthy BOOK -> phi 0.5 (was neutral 1.0 on missing file)
+ere_test_fixture.write_state(vc._MODELS)
 cl._reset_cache(items=[])  # no record: calibration is identity
 
 PIN = "24e550a16a70"
@@ -204,7 +206,7 @@ def test_logging_and_state():
     r = rec[0]
     assert r["source"] == "nimble_decide:test" and r["label"]["code"] == "would_buy"
     assert r["label"]["mode"] == "shadow" and r["label"]["rule"]["min_sharpness"] == 0.05
-    assert r["label"]["rule"]["required_p"] == 0.60 and r["label"]["rule"]["phi_multiplier"] == 1.0
+    assert r["label"]["rule"]["required_p"] == 0.60 and r["label"]["rule"]["phi_multiplier"] == 0.5
     assert r["label"]["informed_sources"]["mirofish"]["used"] is True
     state = calls[0]["payload"]["state"]
     assert state["symbol"] == "NVDA" and state["venue"] == "alpaca" and state["side"] == "buy"

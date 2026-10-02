@@ -99,39 +99,15 @@ def refresh_all():
         with open(mf_path, "w") as f:
             json.dump(mirofish_data, f, indent=2)
     
-    # 4. Build ERE-compatible regime file
-    # Simple regime detection: F&G < 25 = volatile, > 75 = euphoric, else calm
-    if fg_val < 25:
-        regime = "VOLATILE"
-        risk_level = "HIGH"
-    elif fg_val > 75:
-        regime = "EUPHORIC"
-        risk_level = "ELEVATED"
-    else:
-        regime = "CALM"
-        risk_level = "NORMAL"
-    
-    ere_data = {
-        "regime": regime,
-        "risk_level": risk_level,
-        "fear_greed": fg_val,
-        "signals": {"SPY_TREND": regime, "VIX_REGIME": "FLAT" if regime == "CALM" else "STRESSED"},
-        "source": "intel_refresh (lightweight)",
-        "ts": ts,
-    }
-    ere_path = os.path.join(MODELS, "latest_etherion_risk.json")
-    with open(ere_path, "w") as f:
-        json.dump(ere_data, f, indent=2)
-    
-    return results, mirofish_data, ere_data
+    # Fear & Greed remains intelligence, never a risk-state writer.
+    return results, mirofish_data
 
 def run():
-    results, mf, ere = refresh_all()
+    results, mf = refresh_all()
     fg = results.get("fear_greed", {})
     print(f"Intel refreshed at {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
     print(f"  Fear/Greed: {fg.get('value','?')} ({fg.get('classification','?')})")
     print(f"  MiroFish bias: {mf.get('overall_bias','?')}")
-    print(f"  ERE regime: {ere.get('regime','?')} (risk: {ere.get('risk_level','?')})")
     crypto = results.get("crypto", {})
     if "error" not in crypto:
         for cg_id, d in crypto.items():

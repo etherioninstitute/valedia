@@ -113,7 +113,7 @@ def test_hygiene_and_snapshot():
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.KALSHI_FEE_MAP_GATE is False
     assert vc.KALSHI_EV_PREFLIGHT_GATE is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.NAUTILUS_LIVE is False
     assert vc.VALEDIA_TREASURY_AUTO is False
     assert vc.VALEDIA_TRADING_HALT is False
@@ -373,7 +373,7 @@ def test_poly_stays_blocked_and_informed():
     assert posted and posted[-1]["method"] == "POST"
     assert vc.POLYMARKET_US_LIVE is False
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
 
 
 def test_poly_loop_tag_prior_not_eligible():

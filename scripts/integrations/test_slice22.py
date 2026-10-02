@@ -114,10 +114,12 @@ def test_latency_arb_post_ack_unreconciled_cron_dry():
 
 
 def test_ere_still_fail_closed():
-    ere = ub.stage_ere_safety(np.linspace(100.0, 110.0, 80))
-    assert ere["status"] == "FAIL_CLOSED", ere
-    assert ere["multiplier"] == 1.0
-    assert ere["safe"] is True
+    # ERE v3: the reader itself is fail-closed. Without valid state the gate
+    # returns HALT/0 (safe False); the brain never treats that as tradeable.
+    ere = ub.stage_ere_safety("BTC-USD")
+    assert ere["status"] == "HALT", ere
+    assert ere["multiplier"] == 0.0
+    assert ere["safe"] is False
 
 
 def test_version_stamp_on_headers():

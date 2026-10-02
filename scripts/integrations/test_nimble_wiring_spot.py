@@ -41,7 +41,9 @@ import vibe_shadow_paper as vibe  # noqa: E402
 from systemone_test_fakes import Scoped  # noqa: E402
 import valedia_config as vc  # noqa: E402
 
-vc._MODELS = tempfile.mkdtemp(prefix="nimspot_models_")  # no Etherion file: phi 1.0
+vc._MODELS = tempfile.mkdtemp(prefix="nimspot_models_")
+import ere_test_fixture  # ERE v3: healthy BOOK -> phi 0.5 (was neutral 1.0 on missing file)
+ere_test_fixture.write_state(vc._MODELS)
 cl._reset_cache(items=[])  # no record: calibration is identity
 
 _S = Scoped(s1, LOG)
@@ -244,9 +246,9 @@ def test_spot_economics():
     assert abs(v["break_even_p"] - 0.511) < 1e-9 and v["required_p"] == 0.60, v
     blob = json.dumps(post.calls[0])
     assert "roundtrip" not in blob and "break_even" not in blob and "2.2" not in blob
-    # a high-fee venue lifts required_p above the floor
+    # a high-fee venue lifts required_p above the floor (phi 0.5 -> margin 0.01)
     v = nws.gate("crypto", "BTC-USD", {}, source="t", economics={"roundtrip_fee_pct": 30.0})
-    assert abs(v["required_p"] - 0.67) < 1e-9 and v["allow"] is True  # shadow never blocks
+    assert abs(v["required_p"] - 0.66) < 1e-9 and v["allow"] is True  # shadow never blocks
 
 
 def test_unified_brain_sells_never_blocked():

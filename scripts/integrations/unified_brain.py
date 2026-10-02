@@ -349,35 +349,16 @@ def stage_kernel(prices, asset_class="equity"):
 # STAGE 3: ERE SAFETY
 # ══════════════════════════════════════════════════════════════════════
 
-def stage_ere_safety(prices):
-    # Fail-open for sizing (safe/mult unchanged). Status must not say OK/safe-gated
-    # when the v2 API is missing cumulative_extremes and this path no-ops.
-    _safe = {"safe": True, "multiplier": 1.0, "status": "FAIL_CLOSED",
-             "phi_ratio": 0, "cascade_stable": True, "snr": 0.5}
+def stage_ere_safety(ticker):
+    """Read one dated state. Naked price arrays cannot establish freshness."""
     try:
-        from Etherion_Risk_Engine import SignalDecomposer, VarianceCascadeEngine, DrawdownGuard
-        ret = np.diff(np.log(np.clip(prices, 1e-10, None)))
-        if len(ret) < 30:
-            return {**_safe, "status": "INSUFFICIENT_DATA"}
-        cascade  = VarianceCascadeEngine()
-        matrix   = ret.reshape(-1, 1)
-        ladder   = cascade.energy_ladder_check(matrix)
-        extremes = cascade.cumulative_extremes(matrix)
-        guard    = DrawdownGuard(initial_capital=100)
-        guard.adaptive_threshold(ret)
-        check    = guard.check_guard(ret)
-        decomp   = SignalDecomposer(20)
-        snr      = decomp.signal_strength(prices)
-        mult     = 1.0
-        if check["action"] == "HALT_ALL":     mult = 0.30
-        elif check["action"] == "REDUCE_50%": mult = 0.50
-        if not ladder["stable"]:  mult *= 0.3
-        if not extremes["safe"]:  mult *= 0.5
-        return {"safe": mult > 0.05, "multiplier": round(mult, 2),
-                "status": check["status"], "phi_ratio": check.get("ratio", 0),
-                "cascade_stable": ladder["stable"], "snr": round(float(snr), 4)}
+        from ere_runtime import read_gate
+        return read_gate(ticker, models_dir=SYS["models_dir"])
     except Exception:
-        return _safe
+        import logging
+        logging.getLogger("ere").exception("Brain ERE stage CLOSED")
+        return {"safe": False, "multiplier": 0.0, "status": "HALT",
+                "level": "HALT", "halt": True, "data_quality": "INSUFFICIENT"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -397,8 +378,8 @@ def stage_fusion(kernel_sig, ere_safety, intel,
         (50 + intel_boost) * w["intel"] +
         50             * w["remainder"]
     )
-    deviation = (fused - 50) * ere_safety["multiplier"]
-    return round(float(np.clip(50 + deviation, 5, 95)), 1)
+    # ERE is a position-risk gate, not an alpha/confidence transform.
+    return round(float(np.clip(fused, 5, 95)), 1)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -427,8 +408,17 @@ def stage_kelly(fused_score, equity, max_pct=0.04, pos_multiplier=1.0,
             concurrent_bets=concurrent_bets,
         )
         usd = float(rec.get("position_usd") or 0)
-        usd = min(usd, float(equity) * float(max_pct)) * float(pos_multiplier)
-        return round(max(usd, 0.0), 2)
+        if rec.get("action") != "EXECUTE":
+            return 0.0  # SKIP records can still contain a positive diagnostic size.
+        from valedia_config import dynamic_per_trade_cap
+        import math
+        usd = float(rec.get("position_usd") or 0) * float(pos_multiplier)
+        cap = dynamic_per_trade_cap(regime, track_record_mult, risk_factor, category=category)
+        usd = min(usd, float(equity) * min(float(max_pct), cap))
+        if not all(math.isfinite(x) for x in (usd, float(equity), float(max_pct), float(pos_multiplier), cap)):
+            return 0.0
+        # Reapply the ceiling AFTER boosters; round down rather than through it.
+        return math.floor(max(usd, 0.0) * 100.0) / 100.0
     except Exception:
         return 0.0
 
@@ -805,17 +795,15 @@ def run_brain():
             prices = np.array(prices, dtype=float)
             mask = np.isfinite(prices) & (prices > 0)
             if not np.all(mask):
-                prices = prices[mask]
-                if len(prices) < 20:
-                    lines.append(f"  {name:6s} SKIP  NaN/Inf in price data")
-                    continue
+                lines.append(f"  {name:6s} SKIP invalid price data; no row deletion")
+                continue
             cur_price = float(prices[-1])
 
             # Stage 2: Kernel
             kernel = stage_kernel(prices, asset_cls)
 
             # Stage 3: ERE
-            ere = stage_ere_safety(prices)
+            ere = stage_ere_safety(ticker)
 
             # Stage 4: Filter v3
             q = compute_signal_quality(prices, kernel, asset_cls)
@@ -840,7 +828,7 @@ def run_brain():
                 stage_kelly(fused, base_equity,
                             max_pct=max_trade_pct,
                             pos_multiplier=q["pos_multiplier"] * conf_mult * disc_mult,
-                            expected_return_pct=exp_ret),
+                            expected_return_pct=exp_ret, risk_factor=ere["multiplier"]),
                 budget_left
             )
 

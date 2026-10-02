@@ -40,7 +40,7 @@ def test_hygiene_and_fence():
     assert "def get_bbo" in client_src
     assert "def get_book" in client_src
     assert pmob.LIVE_CLIENT_HOOK is None
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert pmu.live_enabled() is False
     assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
@@ -138,7 +138,7 @@ def test_preview_still_works_create_blocked():
         raise AssertionError("create must stay blocked")
     except pmu.LiveWriteBlocked:
         pass
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert os.environ.get("POLYMARKET_US_LIVE") in (None, "0", "false", "")
 
 

@@ -44,7 +44,9 @@ import test_vaughan_arb_paper as tva  # noqa: E402
 import test_weather_informed_admit as twx  # noqa: E402
 from test_poly_us import _restore  # noqa: E402
 
-vc._MODELS = tempfile.mkdtemp(prefix="nimwire_models_")  # no Etherion file: phi 1.0
+vc._MODELS = tempfile.mkdtemp(prefix="nimwire_models_")
+import ere_test_fixture  # ERE v3: valid gate state so phi reads a healthy book
+ere_test_fixture.write_state(vc._MODELS)
 cl._reset_cache(items=[])  # no record: calibration is identity
 
 PIN = "24e550a16a70"

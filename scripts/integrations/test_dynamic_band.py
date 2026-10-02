@@ -145,7 +145,7 @@ def test_flip_does_not_open_writers():
     os.environ["VALEDIA_SELF_ADJUST"] = "1"
     assert vc.self_adjust_enabled() is True
     assert vc.VENUE_WRITER["hyperliquid"] == "none"
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.NAUTILUS_LIVE is False
     assert vc.NAUTILUS_ENABLED is False
     assert vc.spot_reconcile_http_enabled() is False

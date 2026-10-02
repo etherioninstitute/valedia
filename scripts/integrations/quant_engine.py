@@ -297,8 +297,9 @@ def scan_for_edges(bankroll=300, min_edge_cents=3):
             intel_sources.append(("MiroFish", mf.get("overall_bias", 50) / 100, effective_mirofish_weight()))  # capped until proven; valedia_config
     except: pass
     try:
-        ere = json.load(open(os.path.join(MODELS, "latest_etherion_risk.json")))
-        regime = "calm" if "FLAT" in str(ere.get("signals", {})) else "volatile"
+        from ere_runtime import read_gate
+        gate = read_gate("BOOK", models_dir=MODELS)
+        regime = "calm" if gate.get("safe") and gate.get("multiplier", 0) >= 1.0 else "volatile"
         intel_sources.append(("ERE", 0.55 if regime == "calm" else 0.45, 0.10))
     except: pass
     

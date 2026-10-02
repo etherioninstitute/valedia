@@ -17,6 +17,10 @@ os.environ["OPENCLAW_SKIP_ENV"] = "1"
 import informed_before_create as ibc
 import kalshi_auth as ka
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="wxadmit_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 import weather_live
 import weather_morning_go as wmg
 import weather_shadow as ws

@@ -25,6 +25,10 @@ MODELS = os.path.expanduser("~/.openclaw/workspace/models")
 SPORTS_LOG = os.path.join(MODELS, "sports_engine_log.json")
 
 def _load_env():
+    # Same opt-out as valedia_config.ensure_openclaw_env: OPENCLAW_SKIP_ENV=1 keeps
+    # unit tests hermetic (the live ~/.openclaw/.env must never flip test gates).
+    if str(os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return
     env_path = os.path.expanduser("~/.openclaw/.env")
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -52,13 +56,11 @@ CATEGORY = "SPORTS"  # single ledger/gate bucket for the whole sports strategy
 # puts team/series facts on the evidence record and the Nimble verdict. Facts only.
 
 def get_ere_regime():
-    """Read ERE v2.0 regime — are markets calm or turbulent?"""
+    """Read canonical ERE v3 gate — are markets calm or turbulent?"""
     try:
-        ere = json.load(open(os.path.join(MODELS, "latest_etherion_risk.json")))
-        signals = ere.get("signals", {})
-        # If most signals are FLAT/MILD, markets are calm → sports favorites more reliable
-        flat_count = sum(1 for s in signals.values() if isinstance(s, dict) and s.get("signal") in ("FLAT", "MILD"))
-        return "CALM" if flat_count > len(signals) / 2 else "VOLATILE"
+        from ere_runtime import read_gate
+        gate = read_gate("BOOK", models_dir=MODELS)
+        return "CALM" if gate.get("safe") and gate.get("multiplier", 0) >= 1.0 else "VOLATILE"
     except: return "UNKNOWN"
 
 def get_fear_greed():

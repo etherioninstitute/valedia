@@ -25,7 +25,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     os.environ.pop("SPOT_RECONCILE_HTTP", None)
     os.environ.pop("REBALANCER_AUTOEXEC", None)
 
@@ -74,7 +74,7 @@ def test_fence_and_cutover_order():
     assert vc.VENUE_WRITER["kalshi"] == "valedia"
     assert vc.VENUE_WRITER["alpaca"] == "valedia"
     assert vc.VENUE_WRITER["hyperliquid"] == "none"
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.venue_writer("hyperliquid") != "nautilus"
     assert vc.venue_writer("polymarket") != "nautilus"
     assert vc.nautilus_may_dispatch("hyperliquid") is False
@@ -214,7 +214,7 @@ def test_pm_arb_shadow_never_dispatchable():
         assert rec["gates"]["live_flag"] is False
         assert rec.get("arb_candidate") is True
         assert rec.get("kind") == "polymarket_arb"
-        assert rec.get("venue_writer") == "none"
+        assert rec.get("venue_writer") == "valedia"
         assert rec.get("live_client_hook") is None
         assert rec.get("pm_send", {}).get("sent") is False
         assert rec.get("kalshi_ticker") == "KXBTCD-ARB"
@@ -297,7 +297,7 @@ def test_cannot_force_dispatch_even_with_nt_flags():
         os.remove(qpath)
         _restore()
     assert vc.VENUE_WRITER["hyperliquid"] == "none"
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.VENUE_WRITER["coinbase"] == "valedia"
     assert vc.nautilus_may_dispatch("hyperliquid") is False
 

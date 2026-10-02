@@ -25,7 +25,11 @@ class IntelLayer:
     """Unified intelligence layer. Query with any ticker, event, or question."""
     
     def __init__(self):
-        self.ere = _load_json("latest_etherion_risk.json")
+        try:
+            from ere_runtime import read_gate
+            self.ere = read_gate("BOOK", models_dir=MODELS)
+        except Exception:
+            self.ere = {}
         try:
             import mirofish_intel_archive as _mia
             self.mirofish = _mia.load_for_fv(os.path.join(MODELS, "mirofish_signal.json")) or {}
@@ -46,12 +50,9 @@ class IntelLayer:
         return 50
     
     def _detect_regime(self):
-        """BULL/BEAR/SIDEWAYS from ERE v2.0 + fusion data."""
-        # Check ERE Kolmogorov spectrum
-        signals = self.ere.get("signals", {})
-        spy_sig = signals.get("SPY", {})
-        regime_raw = spy_sig.get("regime", "MIXED")
-        
+        """BULL/BEAR/SIDEWAYS from fear/greed. ERE v2 per-asset signals are retired;
+        ERE v3 is a position-risk gate (self.ere = read_gate output) and does not
+        provide per-ticker regime signals."""
         # Check fear/greed
         if self.fear_greed <= 20: return "EXTREME_FEAR"
         elif self.fear_greed <= 35: return "FEAR"  

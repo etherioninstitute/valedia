@@ -34,6 +34,8 @@ except Exception:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def _load_env():
+    if str(os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return
     env_path = os.path.expanduser("~/.openclaw/.env")
     if os.path.exists(env_path):
         with open(env_path) as f:

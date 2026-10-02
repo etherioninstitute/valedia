@@ -130,23 +130,14 @@ def test_news_rules():
 
 def test_ere_freshness_and_fade():
     p = _write("e/mirofish_signal.json", _mf(age_h=30))
-    ere = _write("ere_fresh.json", {
-        "timestamp": (NOW - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M UTC"),
-        "risk_level": "HIGH", "signals": {"BTC": {"signal": "FADE_SHORT", "confidence": 70}}})
-    f = _facts("BTC-USD", "buy", p, ere_paths=[ere])["facts"]
-    assert f["ere_fresh"] and f["ere_risk_off"] and f["ere_fade_side_conflict"] and f["any_risk_off"]
-    f = _facts("BTC-USD", "sell", p, ere_paths=[ere])["facts"]
-    assert not f["ere_fade_side_conflict"]
-    calm = _write("ere_calm.json", {"ts": (NOW - timedelta(hours=1)).isoformat(),
-                                    "risk_level": "NORMAL", "source": "intel_refresh (lightweight)"})
-    f = _facts("SPY", "buy", p, ere_paths=[calm])["facts"]
-    assert f["ere_fresh"] and not f["ere_risk_off"]
-    old = _write("ere_old.json", {"ts": (NOW - timedelta(hours=25)).isoformat(), "risk_level": "HALT"})
-    r = _facts("SPY", "buy", p, ere_paths=[old])
-    assert not r["facts"]["ere_fresh"] and not r["facts"]["ere_risk_off"]
-    assert r["sources"]["ere"]["used"] is False
-    nots = _write("ere_nots.json", {"risk_level": "HALT"})
-    assert not _facts("SPY", "buy", p, ere_paths=[nots])["facts"]["ere_fresh"]
+    # ERE v3: ere_facts reads the canonical gate but only uses VALID state
+    # (data_quality OK). A missing models dir is neutral (not risk-off) — the
+    # fail-closed sizing enforcement lives in the Kelly cap. Fade-conflict retired.
+    f = _facts("BTC-USD", "buy", p, ere_paths=[NOPE])["facts"]
+    assert not f["ere_fresh"] and not f["ere_risk_off"] and not f["ere_fade_side_conflict"]
+    # Reader failure path (e.g. a file where the models dir should be) also neutral:
+    f = _facts("BTC-USD", "sell", p, ere_paths=[p + "/not_a_dir"])["facts"]
+    assert not f["ere_fresh"] and not f["ere_risk_off"] and not f["ere_fade_side_conflict"]
 
 
 def test_all_booleans_and_no_network():

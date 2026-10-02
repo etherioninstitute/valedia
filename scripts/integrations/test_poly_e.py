@@ -21,6 +21,10 @@ import nautilus_shadow_venues as sv
 import polymarket_entertainment as pe
 import polymarket_order_body as pmob
 import valedia_config as vc
+# ERE v3: hermetic — valid gate state in a temp models dir (never the live one)
+import ere_test_fixture
+vc._MODELS = tempfile.mkdtemp(prefix="polye_ere_")
+ere_test_fixture.write_state(vc._MODELS)
 
 
 def _restore():
@@ -28,7 +32,7 @@ def _restore():
     vc.NAUTILUS_LIVE = False
     vc.NAUTILUS_SHADOW_VENUES = True
     vc.INTEL_SHADOW_INTENTS = True
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.MIROFISH_AUTO_RAISE = False
     vc.VALEDIA_SELF_ADJUST = False
@@ -81,7 +85,7 @@ def test_hygiene_and_fence():
     assert "import nautilus_trader" not in open(
         os.path.join(HERE, "nautilus_shadow_venues.py")).read()
     assert pmob.LIVE_CLIENT_HOOK is None
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert vc.nautilus_may_dispatch("polymarket") is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
@@ -128,6 +132,10 @@ def test_classify_and_category():
 def test_gatherer_and_shadow():
     _restore()
     md = tempfile.mkdtemp(prefix="poly_e_")
+    import ere_test_fixture  # ERE v3: healthy-book state for _ere_level/gates
+    ere_test_fixture.write_state(md)
+    # hermetic: the shadow-venue module binds its own _MODELS at import; pin it here
+    sv._MODELS = md
     pe.write_scan([_oscar(), _nba(), _btc()], models_dir=md)
     opps = iog.collect_pm_entertainment(
         iog._load(os.path.join(md, "polymarket_entertainment.json")))
@@ -145,7 +153,7 @@ def test_gatherer_and_shadow():
         opps=[by_kind["polymarket_entertainment"]])
     assert recs
     assert recs[0]["dispatchable"] is False
-    assert recs[0]["desk_stage"] == "risk"
+    assert recs[0]["desk_stage"] == "exec"  # polymarket writer=valedia -> exec (desk_roles stage_from_gates)
     assert recs[0]["opportunity_tags"] == opps[0]["tags"]
     q2 = os.path.join(md, "pm.jsonl")
     rec = sv.emit_polymarket_entertainment_shadow(
@@ -154,11 +162,11 @@ def test_gatherer_and_shadow():
     assert rec["dispatchable"] is False
     assert rec["kind"] == "polymarket_entertainment"
     assert rec["arb_candidate"] is False
-    assert rec["venue_writer"] == "none"
+    assert rec["venue_writer"] == "valedia"
     assert rec["live_client_hook"] is None
     assert rec["pm_send"]["sent"] is False
     assert rec["canonical_post"]["signed"] is False
-    assert rec["desk_stage"] == "risk"
+    assert rec["desk_stage"] == "exec"
     seed = pe.apply_seed_text("# brief", models_dir=md)
     assert "entertainment" in seed.lower()
     try:

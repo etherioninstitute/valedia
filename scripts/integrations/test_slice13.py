@@ -34,7 +34,7 @@ def _restore():
     vc.VENUE_WRITER["kalshi"] = "valedia"
     vc.VENUE_WRITER["alpaca"] = "valedia"
     vc.VENUE_WRITER["hyperliquid"] = "none"
-    vc.VENUE_WRITER["polymarket"] = "none"
+    vc.VENUE_WRITER["polymarket"] = "valedia"
     vc.MIROFISH_WEIGHT = 0.10
     vc.FUSION_WEIGHTS["mirofish"] = vc.MIROFISH_WEIGHT
     vc.MIROFISH_UNPROVEN_CAP = 0.10

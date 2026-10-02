@@ -33,15 +33,13 @@ import kalshi_executor as ke
 
 
 def test_ere_fail_closed_status_not_ok():
-    long = np.linspace(100.0, 110.0, 80)
-    ere = ub.stage_ere_safety(long)
-    assert ere["status"] == "FAIL_CLOSED", ere
+    # ERE v3: stage_ere_safety reads the canonical gate by ticker. No valid
+    # state -> HALT/0 (fail-closed). It is a position-risk gate, not a scorer.
+    ere = ub.stage_ere_safety("BTC-USD")
+    assert ere["status"] == "HALT", ere
     assert ere["status"] != "OK"
-    assert ere["safe"] is True
-    assert ere["multiplier"] == 1.0
-    short = np.linspace(100.0, 101.0, 10)
-    ere2 = ub.stage_ere_safety(short)
-    assert ere2["status"] == "INSUFFICIENT_DATA", ere2
+    assert ere["safe"] is False
+    assert ere["multiplier"] == 0.0
 
 
 def test_dry_run_cannot_emit_bare_live():
@@ -100,7 +98,7 @@ def test_brain_acked_not_executed_fill():
     assert 'EXECUTED: {len(actions)} trades' not in src
     assert "ACKED:" in src
     assert "POST-ack, not fill-confirmed" in src
-    assert 'status": "FAIL_CLOSED"' in src
+    assert 'status": "HALT"' in src  # ERE v3 reader fail-closed contract
 
 
 def test_allocator_prints_unreconciled_status():

@@ -1,0 +1,9 @@
+{
+  "schema": "ere-positions/1",
+  "asof": "REPLACE_WITH_REAL_UTC_RECONCILIATION_TIME",
+  "complete": false,
+  "position_version": "REPLACE_ON_EVERY_FILL_OR_ORDER_RISK_CHANGE",
+  "nav": null,
+  "weights": {},
+  "binary_positions": []
+}

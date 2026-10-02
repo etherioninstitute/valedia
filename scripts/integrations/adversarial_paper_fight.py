@@ -296,7 +296,11 @@ def run_round(signal_doc=None, enrich=None, opps=None, ere=None, models_dir=None
     if enrich is None:
         enrich = mne.load_enrichment(_ENRICH)
     if ere is None:
-        ere = _load(_ERE)
+        try:
+            from ere_runtime import read_gate
+            ere = read_gate("BOOK", models_dir=_MODELS)
+        except Exception:
+            ere = {}
     doc = build_round(signal_doc=signal_doc or {}, enrich=enrich or {}, opps=opps, ere=ere or {}, now=now)
     if write:
         doc["path"] = persist(doc, models_dir=models_dir, ts=now or _now())
