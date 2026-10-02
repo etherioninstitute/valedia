@@ -4,7 +4,7 @@
 # Only sends clean output to Burton. Logs everything locally.
 # (c) GOATWORTHY Post LLC
 
-SCRIPTS="/Users/burtonchatelain/.openclaw/workspace/scripts/integrations"
+SCRIPTS="/Users/burtonchatelain/.openclaw/workspace-v3/scripts/integrations"
 ENV_FILE="/Users/burtonchatelain/.openclaw/.env"
 LOG="/Users/burtonchatelain/.openclaw/logs/valedia-cron.log"
 HEAL_LOG="/Users/burtonchatelain/.openclaw/logs/self-heal.log"
@@ -14,6 +14,10 @@ export OLLAMA_MODELS="/Volumes/NIMROD_SSD/ollama_models"
 
 # Source env
 set -a && source "$ENV_FILE" && set +a
+
+# Kalshi API key id: env-only, loaded from the operator's key file (never hardcoded, never committed)
+[ -z "$KALSHI_API_KEY_ID" ] && [ -r "$HOME/.openclaw/kalshi_api_key_id.txt" ] && \
+    export KALSHI_API_KEY_ID="$(head -1 "$HOME/.openclaw/kalshi_api_key_id.txt" | tr -d '[:space:]')"
 
 SCRIPT="$1"
 LABEL="${2:-CRON}"

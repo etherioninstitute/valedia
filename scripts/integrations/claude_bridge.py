@@ -41,7 +41,6 @@ EXIT = {"verified": 0, "withheld": 3}  # anything else (error/dedupe) -> 4: rout
 # ── verified facts (code only) ─────────────────────────────────────────────────
 def _broker_get():
     sys.path.insert(0, SCRIPTS_DIR)
-    os.environ.setdefault('KALSHI_API_KEY_ID', '86a77487-629d-43d7-a5c0-0058bd8f899a')
     os.environ.setdefault('KALSHI_PRIVATE_KEY_PATH',
                           '/Users/burtonchatelain/.openclaw/kalshi_private_key.pem')
     from kalshi_auth import get
