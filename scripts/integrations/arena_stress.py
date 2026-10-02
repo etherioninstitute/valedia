@@ -268,7 +268,7 @@ def main(argv=None):
     p.add_argument("--no-primes", action="store_true")
     args = p.parse_args(argv)
     apf.set_paths(models_dir=args.models, signal_path=args.signal,
-                  enrich_path=args.enrich, ere_path=args.ere)
+                  enrich_path=args.enrich)
     opps = apf._load(args.opps) if args.opps else None
     signal = apf._load(args.signal) if args.signal else None
     enrich = apf._load(args.enrich) if args.enrich else None

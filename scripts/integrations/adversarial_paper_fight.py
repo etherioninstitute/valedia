@@ -27,14 +27,15 @@ _f = mne._f
 # ponytail: Buffett = persona_lenses.buffett (H2); no second checklist
 
 
-def set_paths(models_dir=None, signal_path=None, enrich_path=None, ere_path=None):
-    global _MODELS, _SIGNAL, _ENRICH, _ERE
+def set_paths(models_dir=None, signal_path=None, enrich_path=None):
+    """ERE reads go through ere_runtime.read_gate (canonical, fail-closed); the
+    retired latest_etherion_risk.json default path is gone."""
+    global _MODELS, _SIGNAL, _ENRICH
     if models_dir:
         _MODELS = models_dir
     _SIGNAL = signal_path or os.path.join(_MODELS, "mirofish_signal.json")
     _ENRICH = enrich_path or os.path.join(_MODELS, "mirofish_neural_enrichment.json")
-    _ERE = ere_path or os.path.join(_MODELS, "latest_etherion_risk.json")
-    return _SIGNAL, _ENRICH, _ERE
+    return _SIGNAL, _ENRICH
 
 
 set_paths()
@@ -317,7 +318,7 @@ def main(argv=None):
     p.add_argument("--out", default=None)
     p.add_argument("--no-write", action="store_true")
     args = p.parse_args(argv)
-    set_paths(models_dir=args.models, signal_path=args.signal, enrich_path=args.enrich, ere_path=args.ere)
+    set_paths(models_dir=args.models, signal_path=args.signal, enrich_path=args.enrich)
     opps = _load(args.opps) if args.opps else None
     doc = run_round(opps=opps, models_dir=args.models, write=not args.no_write)
     if args.out and not args.no_write:

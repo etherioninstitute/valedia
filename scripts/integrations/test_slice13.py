@@ -353,7 +353,8 @@ def test_intel_blend_uses_capped_weight_and_reads_snapshot():
     _write(os.path.join(md, "latest_fusion.json"), {
         "results": [{"ticker": "BTC-USD", "composite_score": 80.0, "signal": "BUY"}],
     })
-    _write(os.path.join(md, "latest_etherion_risk.json"), {"risk_level": "NORMAL"})
+    import ere_test_fixture  # ERE v3: canonical gate state, not the retired file
+    ere_test_fixture.write_state(md)
 
     loaded = mal.read_summary(md)
     assert loaded["proven"] is True

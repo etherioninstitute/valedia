@@ -12,7 +12,8 @@ Sources (all offline; this module NEVER makes a network call):
 - News: a pre-fetched Finnhub buzz dict (dynamic_universe.scan_finnhub_news
   shape {SYM: {score, reasons, price}}) passed by the caller, plus the cached
   intel_sentiment prediction_log.json (per-ticker latest direction < 24h).
-- ERE: models/latest_etherion_risk.json, fresh < 24h by `timestamp` / `ts`.
+- ERE: ere_runtime.read_gate("BOOK") (canonical v3, fail-closed; retired
+  latest_etherion_risk.json reads are gone).
 - FOMO radar (crypto only): fomo_radar_enrich.enrich over the real radar feed
   file data/crypto-paper/fomo_radar.json (written by the real radar feed; absent
   today). Never the fixture. A file whose metadata marks it synthetic / fixture /
@@ -39,8 +40,8 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _HOME_MODELS = os.path.expanduser("~/.openclaw/workspace/models")
 MIROFISH_PATHS = (os.path.join(_ROOT, "models", "mirofish_signal.json"),
                   os.path.join(_HOME_MODELS, "mirofish_signal.json"))
-ERE_PATHS = (os.path.join(_ROOT, "models", "latest_etherion_risk.json"),
-             os.path.join(_HOME_MODELS, "latest_etherion_risk.json"))
+# ERE reads go through ere_runtime.read_gate (canonical v3); no direct
+# latest_etherion_risk.json paths remain.
 PREDICTION_LOG_PATHS = (os.path.join(_HOME_MODELS, "prediction_log.json"),)
 # Written by the real radar feed; absent today. Production never reads the
 # synthetic fixture (fomo_radar_enrich.DEFAULT_FIXTURE); tests pass paths explicitly.

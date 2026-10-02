@@ -105,7 +105,7 @@ Live charter lives in `~/.openclaw/workspace`. This session’s primary tree is 
 |---|---|---|
 | Unified Brain | `scripts/integrations/unified_brain.py` | Orchestrator: Config → Intel → Universe → Kernel → ERE → Fusion → Filter v3 → Kelly → Fee Gate → Execute → Log |
 | Kernel v16e | `scripts/integrations/kernel_predictor_v16e.py` | UGFT market functionals; adaptive SVD; `MANUSCRIPT_VERSION = UGFT-v32.9` |
-| Etherion Risk | `scripts/integrations/Etherion_Risk_Engine.py` | Heuristic NS/YM/Fusion mappings; writes `models/latest_etherion_risk.json`; HALT → size 0 |
+| Etherion Risk | `scripts/integrations/etherion_risk.py` + `ere_runtime.py` | ERE v3 (ere/2): pure deterministic core + locked producer writing `models/ere_state.json`; readers use the canonical fail-closed `read_gate`. Old `Etherion_Risk_Engine.py` (heuristic network mappings, `latest_etherion_risk.json`) is retired |
 | Signal fusion | `scripts/integrations/signal_fusion.py` | Parallel brain (weights ML 40 / tech 30 / sentiment 15 / vol 10 / whale 5) — **diverges** from `unified_brain` inline scheme (known; handoff B2) |
 | Kelly | `scripts/integrations/kelly_sizing.py` | Half-Kelly + `dynamic_per_trade_cap` + Thorp concurrent `f/√N` + Bayesian shrink |
 | Fee gate | `scripts/integrations/fee_engine.py` | Canonical Kalshi nonlinear fee; static schedules for Coinbase/Kraken/Alpaca/Polymarket |
@@ -510,9 +510,9 @@ Cutover of a venue = (a) Valedia scripts for that venue become read-only, (b) si
 
 Nautilus `RiskEngine` (`crates/risk/src/engine/mod.rs`): order field/notional/qty checks, rate limits, `TradingState`.
 
-Etherion: regime/cascade/QEI drawdown → `latest_etherion_risk.json` → `dynamic_per_trade_cap` and HALT.
+Etherion: regime/cascade/QEI drawdown → `ere_state.json` (ERE v3 canonical gate) → `dynamic_per_trade_cap` and HALT.
 
-**Policy:** NT RiskEngine is a **floor**. Map ERE `HALT`/`DANGER` → `TradingState::Halted`; `WARNING` → `Reducing`. NT max-notional ≤ Valedia fuse. If they disagree, **deny the order**. Never let NT be more aggressive than Valedia.
+**Policy:** NT RiskEngine is a **floor**. Map ERE `HALT` → `TradingState::Halted`; `WARNING` → `Reducing`. NT max-notional ≤ Valedia fuse. If they disagree, **deny the order**. Never let NT be more aggressive than Valedia.
 
 ### 4.5 Cron vs daemon
 

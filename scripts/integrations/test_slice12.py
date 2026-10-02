@@ -122,8 +122,8 @@ def _emit_intel_cb(qpath):
     ftl._overrides = lambda: {}
     ftl._learning_pause_until = lambda *a, **k: None
     md = tempfile.mkdtemp(prefix="slice12_")
-    with open(os.path.join(md, "latest_etherion_risk.json"), "w") as f:
-        json.dump({"risk_level": "NORMAL"}, f)
+    import ere_test_fixture  # ERE v3: canonical gate state, not the retired file
+    ere_test_fixture.write_state(md)
     try:
         recs = iog.emit_shadow_intents(models_dir=md, queue_path=qpath, opps=[{
             "kind": "crypto_listed", "strategy": "CRYPTO_BRACKET",
@@ -146,8 +146,8 @@ def _emit_intel_alpaca(qpath):
     ftl._overrides = lambda: {}
     ftl._learning_pause_until = lambda *a, **k: None
     md = tempfile.mkdtemp(prefix="slice12a_")
-    with open(os.path.join(md, "latest_etherion_risk.json"), "w") as f:
-        json.dump({"risk_level": "NORMAL"}, f)
+    import ere_test_fixture  # ERE v3: canonical gate state, not the retired file
+    ere_test_fixture.write_state(md)
     try:
         recs = iog.emit_shadow_intents(models_dir=md, queue_path=qpath, opps=[{
             "kind": "stock", "strategy": "STOCK_BUY", "venue": "alpaca",
