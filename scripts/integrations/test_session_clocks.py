@@ -159,7 +159,7 @@ def test_fence_stays_and_allocator_consults():
     assert "endDate" in snap["CLOCK_POLY_US"]["notes"]
     assert "close_time" in snap["CLOCK_KALSHI_SPORTS"]["notes"]
     assert vc.POLYMARKET_US_LIVE is False
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
 
 
 if __name__ == "__main__":

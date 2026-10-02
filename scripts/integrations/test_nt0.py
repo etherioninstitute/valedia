@@ -82,7 +82,7 @@ def test_flags_unchanged():
     assert vc.NAUTILUS_LIVE is False
     assert vc.VENUE_WRITER["coinbase"] == "valedia"
     assert vc.VENUE_WRITER["hyperliquid"] == "none"
-    assert vc.VENUE_WRITER["polymarket"] == "none"
+    assert vc.VENUE_WRITER["polymarket"] == "valedia"
     assert f["MIROFISH_AUTO_RAISE"] is False
     src = open(os.path.join(HERE, "valedia_config.py")).read()
     assert "neural-trader" not in src

@@ -137,7 +137,7 @@ def test_defaults_and_shape():
         assert got[n]["value"] is False, n
         assert got[n]["source"] == "const", n
     assert got["VENUE_WRITER.kalshi"]["value"] == "valedia"
-    assert got["VENUE_WRITER.polymarket"]["value"] == "none"
+    assert got["VENUE_WRITER.polymarket"]["value"] == "valedia"
     assert got["VENUE_WRITER.hyperliquid"]["value"] == "none"
     assert "OIL_BRACKET" in got["LIVE_EXEC_FENCED"]["value"]
     assert "KXWTI" in got["LIVE_EXEC_FENCED_SERIES"]["value"]
