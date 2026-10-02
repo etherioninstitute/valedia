@@ -44,6 +44,9 @@ PATH=/usr/local/bin:/opt/homebrew/bin:/Users/burtonchatelain/.npm-global/bin:/us
 # --- Intelligence (daily, overnight; PT) ---
 # MiroFish primary: real swarm, intel_refresh fallback; writes the mirofish_ready marker.
 0 1 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/mirofish_primary.sh # MIROFISH SWARM
+0 */4 * * * /Users/burtonchatelain/.openclaw/workspace-v3/scripts/cron_runner_mac.sh intel_refresh.py "INTEL REFRESH" 2>&1
+30 23 * * * /Users/burtonchatelain/.openclaw/workspace-v3/scripts/cron_runner_mac.sh kalshi_audit.py "KALSHI AUDIT" 2>&1
+*/30 * * * * /Users/burtonchatelain/.openclaw/workspace-v3/scripts/cron_runner_mac.sh watchdog.py "WATCHDOG" 2>&1
 0 1 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh ml_kernel_retrain.py "ML RETRAIN" 2>&1
 0 2 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh intel_sentiment.py "INTEL+SENTIMENT" 2>&1
 0 2 * * * /Users/burtonchatelain/.openclaw/workspace/scripts/cron_runner_mac.sh asi_scan.py "ASI SCAN" 2>&1

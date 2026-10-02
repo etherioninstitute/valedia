@@ -1,11 +1,11 @@
 ---
 description: >
-  Complete cron schedule for Valedia. 28 jobs on Mac Studio. Cron fields are the
+  Complete cron schedule for Valedia. 31 jobs on Mac Studio. Cron fields are the
   Mac's LOCAL clock (America/Los_Angeles, PT); UTC shown in parentheses (PDT, UTC-7).
   Source of truth is scripts/install_cron.sh; scripts/test_cron_schedule.py enforces this doc matches it.
 ---
 
-# cron-schedule (28 jobs)
+# cron-schedule (31 jobs)
 
 **Timezone.** The Mac clock is PT. Every `Schedule` column below is the literal crontab
 field (Mac-local PT). The parenthesised UTC is for PDT (UTC-7, Mar-Nov); during PST (UTC-8)
@@ -42,6 +42,9 @@ unless the Script column is a `.sh` (those are invoked directly).
 | `0 2 * * *` | 2:00 AM PT (09:00 UTC) | ASI SCAN | asi_scan.py | Full ASI pipeline |
 | `15 2 * * *` | 2:15 AM PT (09:15 UTC) | INSIDER | insider_mirror.py | SEC Form 4 insider buys |
 | `30 2 * * *` | 2:30 AM PT (09:30 UTC) | HEDGE INTEL | hedge_fund_intel.py | 13F institutional positions |
+| `0 */4 * * *` | every 4h at :00 | INTEL REFRESH | intel_refresh.py | Intel cache refresh (was live-only cut 2026-09-25; restored via installer) |
+| `30 23 * * *` | 11:30 PM PT (06:30 UTC +1d) | KALSHI AUDIT | kalshi_audit.py | Kalshi position/ledger audit (was live-only; now via installer) |
+| `*/30 * * * *` | every 30 min | WATCHDOG | watchdog.py | Cron self-heal watchdog (was live-only; now via installer, runs workspace-v3 code) |
 | `0 3 * * *` | 3:00 AM PT (10:00 UTC) | FUND CHECK | fund_pipeline.py | Mercury fund status |
 
 ## Market hours (Mon-Fri, PT)
