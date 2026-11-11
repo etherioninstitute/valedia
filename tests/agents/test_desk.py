@@ -127,3 +127,17 @@ def test_report_text_is_fenced_as_material_and_the_roster_is_validated(tmp_path)
         D.load_roster(bad)
     with pytest.raises(D.DeskError):
         desk.state("../../etc")
+
+
+def test_the_desk_sets_the_bots_time_budget_so_profile_and_room_cannot_disagree(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    seen = {}
+    monkeypatch.setattr(D.subprocess, "run", lambda argv, **k: seen.update(argv=argv, timeout=k.get("timeout")) or SimpleNamespace(returncode=0, stdout="{}"))
+    D.hermes_runner("researcher", {"profile": "res", "toolsets": "web", "run_budget": 1800, "timeout": 3600}, "PROMPT")
+    assert seen["argv"] == ["hermes", "-p", "res", "-z", "PROMPT", "-t", "web", "--run-budget", "1800.0"] and seen["timeout"] == 3600
+    real = D.load_roster()
+    assert real["researcher"]["run_budget"] < real["researcher"]["timeout"]
+    bad = tmp_path / "roster.json"
+    bad.write_text(json.dumps(dict(ROSTER, researcher={"profile": "res", "toolsets": "web", "run_budget": 4000, "timeout": 3600})))
+    with pytest.raises(D.DeskError, match="run_budget"):
+        D.load_roster(bad)

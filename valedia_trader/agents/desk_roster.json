@@ -1,5 +1,5 @@
 {
-  "note": "The research desk's three bots. Each is a Hermes profile with its own instructions, model and tools. toolsets 'clarify' means no tools at all (coordinating and filing need none); only the researcher reads the web. Timeouts are seconds per turn and are set long on purpose: a slow complete report beats a fast cut-off one. The caps stop the room and hand it to the owner.",
+  "note": "The research desk's three bots. Each is a Hermes profile with its own instructions, model and tools. toolsets 'clarify' means no tools at all (coordinating and filing need none); only the researcher reads the web. Two time limits per bot, in seconds: run_budget is soft (at 80% the bot is told to stop looking and write up; it replaces the profile's own budget for desk calls) and timeout is the hard stop above it. Both are long on purpose: a slow complete report beats a fast cut-off one. The caps stop the room and hand it to the owner.",
   "max_bot_turns": 7,
   "max_revisions": 2,
   "orchestrator": {
@@ -10,7 +10,8 @@
   "researcher": {
     "profile": "valedia-trading-scout",
     "toolsets": "web",
-    "timeout": 3600
+    "timeout": 3600,
+    "run_budget": 1800
   },
   "librarian": {
     "profile": "valedia-desk-librarian",
