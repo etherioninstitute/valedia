@@ -41,12 +41,41 @@ MODEL_PROFILES = {
 }
 DEFAULT_MODEL_PROFILE = 'qwen3.8-27b'
 MODEL_PROFILE_FILE = Path(__file__).with_name('mirofish_model_profile.json')
+# Further checkpoints are registered with `python -m valedia_trader.agents.mirofish_models add`. A
+# registered checkpoint is pinned exactly like the built-in ones; the two built-in profiles cannot be
+# overridden. Profiles registered for HTTP backends only (no pinned GGUF) are not native checkpoints.
+MODEL_REGISTRY_FILE = Path(__file__).with_name('mirofish_model_registry.json')
+HTTP_ONLY_PROFILES = set()
+
+
+def _registered_profiles():
+    if not MODEL_REGISTRY_FILE.exists():
+        return {}
+    out = {}
+    for name, row in json.loads(MODEL_REGISTRY_FILE.read_text()).get('profiles', {}).items():
+        if name in MODEL_PROFILES:
+            continue
+        if not row.get('native'):
+            HTTP_ONLY_PROFILES.add(name)
+            continue
+        out[name] = {
+            'tokenizer_root': Path(row['tokenizer_root']), 'weight_file': Path(row['weight_file']),
+            'weight_bytes': int(row['weight_bytes']), 'weight_sha256': str(row['weight_sha256']),
+            'tokenizer_model_type': row['tokenizer_model_type'], 'tokenizer_quant_bits': row.get('tokenizer_quant_bits'),
+            'gguf_selection': dict(row['gguf_selection'], sizeBytes=int(row['weight_bytes']), sourceSha256=str(row['weight_sha256'])),
+        }
+    return out
+
+
+MODEL_PROFILES.update(_registered_profiles())
 
 
 def active_model_profile():
     name = DEFAULT_MODEL_PROFILE
     if MODEL_PROFILE_FILE.exists():
         name = json.loads(MODEL_PROFILE_FILE.read_text()).get('profile')
+    if name in HTTP_ONLY_PROFILES:
+        raise NativeRefused('MiroFish model profile %r is registered for HTTP backends only; the native pipeline needs a pinned GGUF checkpoint' % name)
     if name not in MODEL_PROFILES:
         raise NativeRefused('unknown MiroFish model profile %r; expected one of %s' % (name, sorted(MODEL_PROFILES)))
     return name

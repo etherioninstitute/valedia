@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "qwen3.8-27b-mlx": {
+      "added_at": "2026-11-11T05:50:45+00:00",
+      "description": "Qwen3.8 27B MLX 4-bit in LM Studio: 34.9 tok/s against 25.3 for the GGUF on this Mac (2026-11-10); HTTP backends only",
+      "lmstudio_key": "qwen/qwen3.8-27b",
+      "max_context": 262144,
+      "native": false,
+      "ollama_tag": null
+    }
+  }
+}

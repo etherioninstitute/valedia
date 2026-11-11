@@ -498,8 +498,9 @@ def prepare_candidate(work):
     for name in ['mirofish_native_run.py','mirofish_native_gateway.py','mirofish_native_model.py','mirofish_native_graph.py','mirofish_native_startup.py','mirofish_native_children.py']:
         target=observer/name;target.write_bytes((PROJECT/'src'/name).read_bytes());target.chmod(0o444)
     for entry in (review,observer):  # the checkpoint choice travels with the candidate
-        if (PROJECT/'src/mirofish_model_profile.json').exists():
-            target=entry/'mirofish_model_profile.json';target.write_bytes((PROJECT/'src/mirofish_model_profile.json').read_bytes());target.chmod(0o444)
+        for carried in ('mirofish_model_profile.json','mirofish_model_registry.json'):
+            if (PROJECT/'src'/carried).exists():
+                target=entry/carried;target.write_bytes((PROJECT/'src'/carried).read_bytes());target.chmod(0o444)
     (builder/'sdk_native.mjs').write_text(SDK_SCRIPT)
     graph_configuration(work,62472)
     (builder/'observer.sb').write_text(observer_policy(work))

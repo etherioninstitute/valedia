@@ -20,6 +20,6 @@ Repository-map work must not import or execute trading modules or read state/led
 - `src/` is the legacy flat layer. Keep it byte-stable unless you are fixing a defect: several modules are pinned by content hash, the trading halt file is located relative to them, and many tests read their source by path. `valedia_trader/core/legacy.py` records the target domain of each module for when it is moved, one family at a time, with its tests.
 - Environment: `uv sync` (Python 3.12, `uv.lock`). New-code tests: `.venv/bin/python -m pytest tests`. Legacy tests: `tools/run_legacy_tests.sh` (sandboxed; restores `state/halt*.json`).
 - Credentials are read from `~/.hermes/.env` (override with `VALEDIA_ENV_FILE`). Never commit secrets; `state/` is ignored.
-- MiroFish model: `python -m valedia_trader.agents.mirofish_models use qwen3-8b|qwen3.8-27b`. A native candidate must be prepared again after switching.
+- MiroFish model: `python -m valedia_trader.agents.mirofish_models use <profile>` switches it; `add <name> --lmstudio-key KEY [--weights F.gguf --tokenizer DIR]` registers another model (pinned GGUF = native; otherwise HTTP backends only), `status` lists them. A native candidate must be prepared again after switching.
 - Backtests: `python -m valedia_trader.backtest.walkforward`. Every configuration evaluated is recorded in `artifacts/trials.sqlite`; do not delete it, the Deflated Sharpe gate depends on the true trial count.
 - No live orders without the owner's explicit confirmation.
