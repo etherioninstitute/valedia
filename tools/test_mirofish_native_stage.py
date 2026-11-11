@@ -129,6 +129,8 @@ class NativeStaging(unittest.TestCase):
         for bad in (s.ORIGINAL_SDK_PORT,s.SERVER_PORT,80,70000,'59671',59671.0):
             with self.assertRaises(RuntimeError):s.sdk_port_bytes(raw,bad)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.sdk_port_bytes(raw+b'\n',59671)
+        helper=(s.W16/s.SDK_HELPER_REL).read_text();moved_helper=s.sdk_port_helper(helper,59671);self.assertIn("ws://127.0.0.1:59671",moved_helper);self.assertNotIn('62298',moved_helper);self.assertEqual(len(helper),len(moved_helper))
+        with self.assertRaises(RuntimeError):s.sdk_port_helper(moved_helper,59671)                     # the reviewed port is no longer there
         policy='(version 1)\n(deny default)\n(allow network-outbound (remote ip "localhost:1235"))\n(allow network-outbound (remote ip "localhost:62298"))\n'
         moved=s.sdk_port_policy(policy,59671);self.assertIn('"localhost:59671"',moved);self.assertIn('"localhost:1235"',moved);self.assertNotIn('62298',moved);self.assertEqual(moved.count('allow network-outbound'),2)
         with self.assertRaises(RuntimeError):s.sdk_port_policy(policy.replace('62298','62299'),59671)   # the reviewed rule is not there
