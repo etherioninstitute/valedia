@@ -133,6 +133,8 @@ class NativeStaging(unittest.TestCase):
         moved=s.sdk_port_policy(policy,59671);self.assertIn('"localhost:59671"',moved);self.assertIn('"localhost:1235"',moved);self.assertNotIn('62298',moved);self.assertEqual(moved.count('allow network-outbound'),2)
         with self.assertRaises(RuntimeError):s.sdk_port_policy(policy.replace('62298','62299'),59671)   # the reviewed rule is not there
         with self.assertRaises(RuntimeError):s.sdk_port_policy(policy+policy,59671)                    # ambiguous
+        pathy=policy+'(allow file-read* (subpath "/work/run-p59671"))\n';self.assertIn('"localhost:59671"',s.sdk_port_policy(pathy,59671))  # the digits in a folder name are not a rule
+        with self.assertRaises(RuntimeError):s.sdk_port_policy(moved+'(allow network-outbound (remote ip "localhost:62298"))\n',59671)  # the new rule is already there
     def test_compact_prompt_changes_one_ast_constant_and_refuses_source_drift(self):
         source=s.W16/s.ONTOLOGY_REL;raw=source.read_bytes();changed=s.compact_ontology_bytes(raw);self.assertNotEqual(raw,changed)
         old=ast.parse(raw);new=ast.parse(changed)

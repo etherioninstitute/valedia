@@ -186,8 +186,8 @@ def sdk_port_bytes(raw,port):
     require(type(port) is int and 1024<=port<=65535 and port!=SERVER_PORT and port!=ORIGINAL_SDK_PORT,'SDK port delta needs a different valid loopback port')
     return closed_integer_delta(raw,MODEL_ORIGINAL_SHA,[(f'SDK_PORT = {ORIGINAL_SDK_PORT}',f'SDK_PORT = {port}',1,1)])
 def sdk_port_policy(text,port):
-    old=f'(allow network-outbound (remote ip "localhost:{ORIGINAL_SDK_PORT}"))';require(text.count(old)==1 and str(port) not in text,'observer policy SDK port rule missing or ambiguous')
-    return text.replace(old,f'(allow network-outbound (remote ip "localhost:{port}"))')
+    old=f'(allow network-outbound (remote ip "localhost:{ORIGINAL_SDK_PORT}"))';new=f'(allow network-outbound (remote ip "localhost:{port}"))';require(text.count(old)==1 and new not in text,'observer policy SDK port rule missing or ambiguous')
+    return text.replace(old,new)
 def integer_literals(source):return [n.value for n in ast.walk(ast.parse(source)) if isinstance(n,ast.Constant) and type(n.value) is int]
 def closed_integer_delta(raw,original_sha,edits):
     """Replace exact source fragments, each of which must occur exactly the stated number of times, and prove by the syntax tree
