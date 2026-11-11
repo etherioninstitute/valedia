@@ -194,14 +194,14 @@ EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master
 import os as _os, json as _json   # for auto-sourcing live track-record / risk state
 _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
 
-# Durable wire for Burton flips that live in ~/.hermes/.env (same file
+# Durable wire for Burton flips that live in ~/.hermes/secrets/trading.env (same file
 # cron_runner_mac.sh sources). LaunchAgents do not inherit that file; any
 # process that imports this module picks flags up via setdefault so a bare
 # `python3 .../all_knowing_movers_scan.py` sees VALEDIA_SYSTEMONE without a manual
 # export. Process env always wins. Opt out: OPENCLAW_SKIP_ENV=1 (unit tests).
 # Override path: OPENCLAW_ENV_FILE. This lane never sets a flip True in git.
 _OPENCLAW_ENV_LOADED = False
-_OPENCLAW_ENV_DEFAULT = _os.path.expanduser("~/.hermes/.env")
+_OPENCLAW_ENV_DEFAULT = _os.path.expanduser("~/.hermes/secrets/trading.env")
 
 
 def ensure_openclaw_env(path=None):

@@ -28,7 +28,7 @@ if False:  # RECOVERY: original import-time backend activation disabled.
 if False:  # RECOVERY: original import-time backend activation disabled.
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-KEY_FILE = "/Users/burtonchatelain/.openclaw/coinbase_key.json"
+KEY_FILE = os.environ.get("COINBASE_KEY_FILE") or os.path.expanduser("~/.hermes/secrets/coinbase_key.json")
 
 def _load_key():
     raise Unsupported("credential path disabled")

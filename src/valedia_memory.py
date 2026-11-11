@@ -301,7 +301,7 @@ def memory_status():
 
 if __name__ == "__main__":
     # Test the full memory system
-    _env_path = os.path.expanduser("~/.hermes/.env")
+    _env_path = os.path.expanduser("~/.hermes/secrets/trading.env")
     if os.path.isfile(_env_path):
         with open(_env_path) as _fh:
             for line in _fh:

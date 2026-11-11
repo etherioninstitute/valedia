@@ -26,10 +26,10 @@ SPORTS_LOG = os.path.join(MODELS, "sports_engine_log.json")
 
 def _load_env():
     # Same opt-out as valedia_config.ensure_openclaw_env: OPENCLAW_SKIP_ENV=1 keeps
-    # unit tests hermetic (the live ~/.hermes/.env must never flip test gates).
+    # unit tests hermetic (the live ~/.hermes/secrets/trading.env must never flip test gates).
     if str(os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
         return
-    env_path = os.path.expanduser("~/.hermes/.env")
+    env_path = os.path.expanduser("~/.hermes/secrets/trading.env")
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:

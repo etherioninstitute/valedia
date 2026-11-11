@@ -4,7 +4,7 @@ vaughan_arb_paper stays the paper desk. This module is the ONLY way an arb pair 
 become venue orders, and every gate below must hold BEFORE either leg is placed
 (any miss → a refused row and zero orders):
 
-  1 VALEDIA_ARB_LIVE on                        (env / ~/.hermes/.env; default OFF)
+  1 VALEDIA_ARB_LIVE on                        (env / ~/.hermes/secrets/trading.env; default OFF)
   2 trading halt off                           (valedia_config.trading_halted)
   3 venue_writer("kalshi") == venue_writer("polymarket") == "valedia"
   4 POLYMARKET_US_LIVE on for the Poly leg     (valedia_config.polymarket_us_live_enabled)

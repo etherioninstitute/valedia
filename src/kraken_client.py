@@ -7,7 +7,7 @@ import os, json, time, hashlib, hmac, base64, urllib.parse
 import requests
 
 # Load from secure JSON (env vars mangle +/= chars)
-_kraken_keys_path = "/Users/burtonchatelain/.openclaw/kraken_keys.json"
+_kraken_keys_path = os.path.expanduser("~/.hermes/secrets/kraken_keys.json")
 try:
     with open(_kraken_keys_path) as _kf:
         _kk = json.load(_kf)

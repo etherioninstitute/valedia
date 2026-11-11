@@ -69,7 +69,7 @@ def save_fee_cache(fees):
 def fetch_kraken_fees():
     """Fetch live Kraken fee schedule via API."""
     try:
-        with open("/Users/burtonchatelain/.openclaw/kraken_keys.json") as f:
+        with open(os.path.expanduser("~/.hermes/secrets/kraken_keys.json")) as f:
             keys = json.load(f)
         import hashlib, hmac, base64, urllib.parse
         api_key = keys["api_key"]

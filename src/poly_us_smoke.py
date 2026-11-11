@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """POLY-US-2 preview dry-run. Default LIVE off for standalone.
 
-Loads ~/.hermes/.env. Forces POLYMARKET_US_HTTP=1. Default force_live_off
+Loads ~/.hermes/secrets/trading.env. Forces POLYMARKET_US_HTTP=1. Default force_live_off
 keeps create_order LiveWriteBlocked. Full smoke may pass force_live_off=False
 when POLYMARKET_US_LIVE is already on: preview only, never create.
 Run: python3 poly_us_smoke.py

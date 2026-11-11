@@ -24,7 +24,7 @@ CONTABO_IP = os.environ.get("VALEDIA_VPS_EGRESS_IP", "85.239.234.32")
 # ponytail: a US key 50119s on www.okx.com. us.okx.com is the v5 host. OKX_BASE overrides.
 BASE = os.environ.get("OKX_BASE", "https://us.okx.com").rstrip("/")
 OKX_HOST = urllib.parse.urlparse(BASE).hostname or "www.okx.com"
-KEY_PATH = os.path.expanduser("~/.openclaw/okx_keys.json")
+KEY_PATH = os.path.expanduser("~/.hermes/secrets/okx_keys.json")
 
 
 class OKXError(RuntimeError):

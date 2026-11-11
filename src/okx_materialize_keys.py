@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write ~/.openclaw/okx_keys.json from the ProtonDrive OKX txt files.
+"""Write ~/.hermes/secrets/okx_keys.json from the ProtonDrive OKX txt files.
 
 Stdout is ok/path/mode only. Never prints key material.
 """
@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-DEST = os.path.expanduser("~/.openclaw/okx_keys.json")
+DEST = os.path.expanduser("~/.hermes/secrets/okx_keys.json")
 _PROTON = (
     "/Users/burtonchatelain/Library/CloudStorage/"
     "ProtonDrive-burtworthy@protonmail.com-folder/VPS/API Keys"
