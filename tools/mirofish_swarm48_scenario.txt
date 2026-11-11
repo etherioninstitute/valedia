@@ -1,0 +1,69 @@
+HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS. Every participant below is invented for this test; none is a real person or firm. Use exactly these 48 named participants as graph actors, no more and no fewer. The tickers SPY, TLT and GLD are discussion topics (a broad stock fund, a long government bond fund and a gold fund), not participants. The invented central bank is a topic, not a participant.
+
+Invented catalyst: the fictional Bank of Aldoria unexpectedly announces that it will pause shrinking its balance sheet. Imagine this drawing attention to SPY, TLT and GLD while inflation risk, crowded positioning and thin liquidity remain unresolved.
+
+The six pension funds (organizations; slow, liability-driven, wary of drawdowns):
+- Harrowgate Pension Trust, one of the pension funds.
+- Lindmere Teachers Retirement Fund, one of the pension funds.
+- Osterval Municipal Pension Board, one of the pension funds.
+- Calder Bay Public Employees Fund, one of the pension funds.
+- Thornwick Railway Pension Scheme, one of the pension funds.
+- Maristowe Health Workers Pension Fund, one of the pension funds.
+
+The six macro hedge funds (organizations; discretionary, opinionated about policy, fast to change view):
+- Vantor Macro Partners, one of the macro hedge funds.
+- Selwyn Ridge Capital, one of the macro hedge funds.
+- Kestrel Point Global Macro, one of the macro hedge funds.
+- Aldgrave Strategic Fund, one of the macro hedge funds.
+- Norhaven Discretionary Macro, one of the macro hedge funds.
+- Pellam Cross Capital, one of the macro hedge funds.
+
+The six trend-following funds (organizations; rule-based, follow price trends across assets, ignore narratives):
+- Quillon Systematic Trend, one of the trend-following funds.
+- Brightwater Managed Futures, one of the trend-following funds.
+- Tessmark Trend Program, one of the trend-following funds.
+- Ironvale Diversified Trend, one of the trend-following funds.
+- Hollin Fold Systematic, one of the trend-following funds.
+- Marrowby Trend Advisors, one of the trend-following funds.
+
+The six bond strategists (people; rates specialists who argue about term premium and duration risk):
+- Dara Okonkwo-Reyes, one of the bond strategists.
+- Ilse Vandermeer, one of the bond strategists.
+- Tomas Achterberg, one of the bond strategists.
+- Priya Nandakumar, one of the bond strategists.
+- Lucan Feroze, one of the bond strategists.
+- Greta Halvorsen, one of the bond strategists.
+
+The six gold dealers (organizations; report physical demand and distrust paper promises):
+- Auric Lane Bullion, one of the gold dealers.
+- Santerre Precious Metals, one of the gold dealers.
+- Kingsmoor Gold Exchange, one of the gold dealers.
+- Vellacott Bullion House, one of the gold dealers.
+- Ostrander Metals Desk, one of the gold dealers.
+- Fairhaven Gold Traders, one of the gold dealers.
+
+The six retail traders (people; post often, chase momentum, some are cautious savers):
+- Mira Tanaka-Bell, one of the retail traders.
+- Jonah Petrakis, one of the retail traders.
+- Sefa Aluko, one of the retail traders.
+- Rowan Castellano, one of the retail traders.
+- Imani Drummond, one of the retail traders.
+- Viktor Hask, one of the retail traders.
+
+The six financial journalists (people; ask for evidence, quote both sides, publish summaries):
+- Esme Radcliffe-Moyo, one of the financial journalists.
+- Hugo Lindqvist, one of the financial journalists.
+- Anneke Brouwer, one of the financial journalists.
+- Samir Qureshi, one of the financial journalists.
+- Talia Fenwick, one of the financial journalists.
+- Odalys Marrero, one of the financial journalists.
+
+The six risk officers (people; skeptical, focus on concentration, leverage and liquidity):
+- Casimir Dunmore, one of the risk officers.
+- Lien Hartono, one of the risk officers.
+- Bex Abernathy, one of the risk officers.
+- Farid Nouri, one of the risk officers.
+- Solveig Aaberg, one of the risk officers.
+- Matteo Granziera, one of the risk officers.
+
+Simulate three rounds of balanced discussion in which every participant takes part. Separate the invented scenario assumptions from the actual simulated outputs. No real prices, returns, observed market sentiment or execution clearance may be invented. Produce an evidence-grounded research report with uncertainty; do not force a BUY and do not fabricate missing data.

@@ -83,6 +83,45 @@ class NativeStaging(unittest.TestCase):
             with self.assertRaises(RuntimeError):load([good],schema=2)
             file=Path(folder)/'list.json';file.write_text(json.dumps({'schema':1,'revisions':[good]}))
             with self.assertRaisesRegex(RuntimeError,'input SHA changed'):s.acknowledged_revisions(file,'c'*64)  # an edited list no longer matches its pin
+    def test_closed_integer_delta_changes_only_the_stated_integers(self):
+        raw=b"limit = 40\nother = 40\nname = 'forty'\ndef f(x):\n    return x <= 4\n";digest=hashlib.sha256(raw).hexdigest()
+        changed=s.closed_integer_delta(raw,digest,[('limit = 40','limit = 640',1,1),('x <= 4','x <= 64',1,1)]);self.assertEqual(changed,b"limit = 640\nother = 40\nname = 'forty'\ndef f(x):\n    return x <= 64\n")
+        for edits in ([('missing = 1','missing = 2',1,1)],[('= 40','= 41',1,1)],                    # absent; present twice
+                      [("name = 'forty'","name = 'sixty'",1,1)],[('return x <= 4','return x >= 4',1,1)],  # a string; an operator
+                      [('limit = 40','limit = 640',1,2)]):                                      # fewer integers changed than claimed
+            with self.assertRaises(RuntimeError):s.closed_integer_delta(raw,digest,edits)
+        with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_integer_delta(raw+b'#',digest,[('limit = 40','limit = 640',1,1)])
+    def test_swarm_gateway_run_and_startup_change_exactly_the_closed_integers(self):
+        p=s.SWARM['swarm48'];self.assertEqual(s.PROFILES['swarm48'],(p['chats'],p['output']));self.assertGreaterEqual(p['output'],2*512+(p['chats']-2)*1536)  # every admitted call can reserve its cap
+        self.assertGreaterEqual(p['agents_bound'],p['actors']);self.assertGreaterEqual(p['history_records'],int(p['wall']/0.4)+1)                       # the host samples every 0.4 s
+        for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,12),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,6),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
+            raw=(s.W16/relative).read_bytes();changed=build(raw,'swarm48');before,after=s.integer_literals(raw),s.integer_literals(changed)
+            self.assertEqual(sum(a!=b for a,b in zip(before,after)),count,relative)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):build(raw+b'\n','swarm48')
+        gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm48').decode()
+        for text in ['chat_attempts: int = 640','"chat_attempts": 640,','output_total: int = 1000000','"wall_seconds": 14400,','request_bytes: int = 131072','client_seconds: int = 175','queue_seconds: int = 170','output_per_call: int = 4096','context: int = 32768']:self.assertIn(text,gateway)
+        run=s.swarm_run_bytes((s.W16/sorted(s.RUN_COPIES)[0]).read_bytes(),'swarm48').decode()
+        for text in ['time.monotonic() + 14280','<= 64, "actual generated participant count outside bound"','"max_rounds": 3,','deadline=start+14400;active=deadline-120',"receipt['wall_seconds']<=14400",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)"]:self.assertIn(text,run)
+        startup=s.swarm_startup_bytes((s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),'swarm48').decode()
+        for text in ['(30 if preflight else 14400)','MAX_RECORDS=36001','MAX_BYTES=64*1024*1024']:self.assertIn(text,startup)
+        self.assertEqual(len({s.sha(s.W16/r) for r in s.RUN_COPIES}),1);self.assertEqual(len({s.sha(s.W16/r) for r in s.STARTUP_COPIES}),1)
+    def test_swarm_selector_is_full_participation_with_two_requests_in_flight(self):
+        raw=(s.W16/s.SELECTOR_REL).read_bytes();changed=s.swarm_selector_bytes(raw,'swarm48')
+        self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(changed))],['len(agent_configs)','list(range(24))','1.0'])
+        self.assertEqual(changed.count(b'semaphore=2,'),2);self.assertEqual(changed.count(b'semaphore=30,'),0)
+        coverage=s.coverage_selector_bytes(raw);self.assertEqual(coverage.count(b'semaphore=30,'),2)  # the earlier profile is untouched by the new code path
+        self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(coverage))],['min(2, len(agent_configs))','list(range(24))','1.0'])
+        with self.assertRaisesRegex(RuntimeError,'source drift'):s.swarm_selector_bytes(raw+b'\n','swarm48')
+    def test_swarm_scenario_is_labelled_hypothetical_and_sealed_with_its_exact_bytes(self):
+        raw,seal=s.swarm_scenario('swarm48');value=json.loads(seal);text=raw.decode()
+        self.assertEqual((value['sha256'],value['bytes'],value['actor_count'],value['actual_model_calls_so_far']),(hashlib.sha256(raw).hexdigest(),len(raw),48,0))
+        self.assertIn('not market observations',value['kind']);self.assertTrue(text.startswith('HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS.'))
+        names=[line[2:].split(',')[0] for line in text.splitlines() if line.startswith('- ')];self.assertEqual((len(names),len(set(names))),(48,48))
+        for required in ['none is a real person or firm','not participants','do not force a BUY','No real prices']:self.assertIn(required,text)
+        original=dict(s.SWARM['swarm48']);s.SWARM['swarm48']=dict(original,scenario_sha256='0'*64)
+        try:
+            with self.assertRaisesRegex(RuntimeError,'swarm scenario changed'):s.swarm_scenario('swarm48')
+        finally:s.SWARM['swarm48']=original
     def test_compact_prompt_changes_one_ast_constant_and_refuses_source_drift(self):
         source=s.W16/s.ONTOLOGY_REL;raw=source.read_bytes();changed=s.compact_ontology_bytes(raw);self.assertNotEqual(raw,changed)
         old=ast.parse(raw);new=ast.parse(changed)
