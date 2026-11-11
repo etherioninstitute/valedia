@@ -28,7 +28,9 @@ if False:  # RECOVERY: original import-time backend activation disabled.
 if False:  # RECOVERY: original import-time backend activation disabled.
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-KEY_FILE = os.environ.get("COINBASE_KEY_FILE") or os.path.expanduser("~/.hermes/secrets/coinbase_key.json")
+# `os` is a recovery stub in this module, so the path is built without it.
+import pathlib as _pathlib
+KEY_FILE = str(_pathlib.Path.home() / ".hermes" / "secrets" / "coinbase_key.json")
 
 def _load_key():
     raise Unsupported("credential path disabled")

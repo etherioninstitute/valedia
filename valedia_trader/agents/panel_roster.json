@@ -1,0 +1,60 @@
+{
+  "approve_threshold": 0.55,
+  "min_deciders": 2,
+  "min_vetters": 1,
+  "veto_rule": "any",
+  "notes": "Scout and the 27B decider load Qwen3.8-27B (about 19 GB plus cache); on a 64 GB machine enable them only when other large models are unloaded.",
+  "members": [
+    {
+      "name": "valedia-trading-scout",
+      "role": "scout",
+      "backend": "hermes",
+      "profile": "valedia-trading-scout",
+      "timeout": 300,
+      "enabled": false
+    },
+    {
+      "name": "valedia-trading-decider",
+      "role": "decider",
+      "backend": "hermes",
+      "profile": "valedia-trading-decider",
+      "timeout": 180
+    },
+    {
+      "name": "nimble-v3",
+      "role": "decider",
+      "backend": "systemone",
+      "timeout": 150
+    },
+    {
+      "name": "qwen3-8b",
+      "role": "decider",
+      "backend": "chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "qwen3:8b",
+      "timeout": 150
+    },
+    {
+      "name": "qwen3.8-27b",
+      "role": "decider",
+      "backend": "chat",
+      "base_url": "http://127.0.0.1:1235/v1",
+      "model": "qwen3.8-27b",
+      "timeout": 300,
+      "enabled": false
+    },
+    {
+      "name": "valedia-trading-auditor",
+      "role": "vetter",
+      "backend": "hermes",
+      "profile": "valedia-trading-auditor",
+      "timeout": 180
+    },
+    {
+      "name": "nimble-v3-risk",
+      "role": "vetter",
+      "backend": "systemone",
+      "timeout": 150
+    }
+  ]
+}

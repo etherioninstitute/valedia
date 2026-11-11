@@ -5,10 +5,12 @@ halt file is located relative to them, and 75 tests read their source by path. T
 contract for moving a module into its domain package later, one family at a time, with its tests."""
 from __future__ import annotations
 
+import importlib
 import re
+import sys
 from pathlib import Path
 
-__all__ = ["DOMAINS", "domain_of", "domain_map", "SRC"]
+__all__ = ["DOMAINS", "domain_of", "domain_map", "load", "SRC"]
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 DOMAINS = ("core", "quant_engine", "agents", "venues", "data_and_fees", "execution_and_risk", "backtest")
@@ -50,3 +52,12 @@ def domain_of(module: str) -> str:
 def domain_map(src: Path = SRC) -> dict[str, str]:
     """Domain for every non-test legacy module currently in src/."""
     return {p.stem: domain_of(p.stem) for p in sorted(src.glob("*.py")) if not p.name.startswith("test_")}
+
+
+def load(module: str):
+    """Import a legacy flat module by name (src/ goes on sys.path once). Use it only for modules that
+    are free of import-time side effects, such as typed contracts."""
+    domain_of(module)
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    return importlib.import_module(module)
