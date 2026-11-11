@@ -56,9 +56,14 @@ The run shows the pipeline at scale. It is not a forecast and says nothing about
 | 1 | Graph built: 53 participants from the 48-name scenario (4.5 min, 14 model calls) | The producer caps a run at 4 participants and 1 round in five places beyond the worker ("Owned synthetic entity cap violated") | Each cap now follows the profile (64 and 3). The report check's one-hour freshness window follows the wall clock |
 | 2 | Past the caps; 27 personas written (31 min, 41 model calls) | The 28th persona reply ran to the 1,536-token cap. A reply cut off at its cap is fatal to the whole attempt, by design | Reply caps raised to 2,560 (personas, ontology, report text) and 1,024 (an agent's turn); output budget raised with them |
 
-Both stopped themselves, with cleanup proven and the model unloaded. Attempt 2 kept running on rule-based personas with a
+| 3 | All 53 personas and the simulation settings written (53 min, 77 calls); 11 agent turns of the simulation done | The run's own memory guard: free memory fell under its 30% floor four and a half minutes into the simulation. The run's own processes held steady near 26 GB; the fall came from outside its process memory | Nothing yet (see below) |
+All three stopped themselves, with cleanup proven and the model unloaded. Attempt 2 kept running on rule-based personas with a
 refusing gateway until it was told to stop, so a run that has lost its gateway should be stopped by hand (send the observer
 process a TERM signal; it cleans up).
+
+Memory through attempt 3 (64 GB machine): 87% free before launch, 55% with the model loaded, 39 to 45% during persona writing, then 36, 34, 32% and under 30% in the simulation. The run's guard allows 65% used before start and needs 30% free while running.
+
+The lesson is the obvious one: go up in steps. Jumping from 4 agents to 53 hit three separate guards in a row, an hour apiece. A 16-agent, 2-round profile would finish in well under an hour and show where memory starts to bind before a larger one is tried.
 
 Not yet shown: that a whole swarm completes. The pipeline was built as a fail-closed 4-agent check, where any single
 unknown or cut-off reply ends the attempt. A swarm makes about 400 calls, so the odds of one bad reply are much higher
