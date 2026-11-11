@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Optional Ornith 1.5 9B paper-tick seasoning. Default off. Fail-open.
+
+VALEDIA_ORNITH_SEASON=1 annotates the movers scan via local LMS.
+Never orders. Never loads or unloads. Chat is sent only when
+ornith-1.5-9b-mlx is already loaded — a completion against an unloaded
+id makes LMS JIT-load and can evict the resident 35B.
+
+# ponytail: one GET, then one short chat. No ornith_load_policy, that
+# module is the 35B desk id. Upgrade if a resident 9B needs its own floor.
+"""
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+
+MODEL = "ornith-1.5-9b-mlx"
+LMS = os.environ.get("VALEDIA_ORNITH_LMS", "http://127.0.0.1:1234").rstrip("/")
+MODELS_URL = LMS + "/api/v0/models"
+CHAT_URL = LMS + "/v1/chat/completions"
+TIMEOUT_S = 8.0
+PROBE_S = 2.0
+# Print-only. This module never executes it and never unloads.
+LOAD_HINT = "lms load ornith-1.5-9b-mlx -c 8192 --parallel 1 --gpu max --yes"
+
+
+def enabled():
+    return os.environ.get("VALEDIA_ORNITH_SEASON") == "1"
+
+
+def _timeout():
+    raw = os.environ.get("VALEDIA_ORNITH_SEASON_TIMEOUT")
+    if not raw:
+        return TIMEOUT_S
+    try:
+        return max(0.2, float(raw))
+    except (TypeError, ValueError):
+        return TIMEOUT_S
+
+
+def _off():
+    return {
+        "enabled": False,
+        "fail_open": True,
+        "reason": "VALEDIA_ORNITH_SEASON_off",
+        "model": MODEL,
+        "note": None,
+    }
+
+
+def _fail(reason, **extra):
+    out = {
+        "enabled": True,
+        "fail_open": True,
+        "reason": str(reason)[:80],
+        "model": MODEL,
+        "note": None,
+    }
+    out.update(extra)
+    return out
+
+
+def _is_9b(model_id):
+    mid = str(model_id or "")
+    return mid == MODEL or mid.startswith(MODEL + "@") or mid.startswith(MODEL + ":")
+
+
+def _loaded_state(state):
+    return str(state or "").lower() in ("loaded", "idle", "busy")
+
+
+def model_loaded(doc):
+    """True only when this 9B id is already loaded. Ignores every other id."""
+    models = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(models, list):
+        return False, "bad_models"
+    seen = None
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id") or m.get("key")
+        if not _is_9b(mid):
+            continue
+        seen = m
+        if _loaded_state(m.get("state") or m.get("status")):
+            return True, str(mid)
+    if seen is None:
+        return False, "absent"
+    state = seen.get("state") or seen.get("status") or "missing"
+    return False, "state=%s" % state
+
+
+def tiny(rows):
+    out = []
+    for r in (rows or [])[:8]:
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "symbol": r.get("symbol"),
+            "class": r.get("class"),
+            "chg_24h": r.get("chg_24h"),
+        })
+    return out
+
+
+def _http_json(url, payload=None, timeout=PROBE_S):
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def parse_note(body):
+    choices = (body or {}).get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return None
+    msg = choices[0].get("message") or {}
+    text = str(msg.get("content") or "").strip()
+    if not text:
+        return None
+    blob = text
+    if "```" in text:
+        fenced = [p for i, p in enumerate(text.split("```")) if i % 2 == 1]
+        blob = fenced[0] if fenced else text
+        if blob.lstrip().startswith("json"):
+            blob = blob.lstrip()[4:]
+    start = blob.find("{")
+    end = blob.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(blob[start:end + 1])
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and obj.get("note"):
+            return str(obj["note"])[:160]
+    return text[:160]
+
+
+def _chat_payload(rows, model_id):
+    return {
+        "model": model_id,
+        "temperature": 0,
+        "max_tokens": 80,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Paper seasoning only. Reply with one JSON object "
+                    "{\"note\":\"12 words max\"}. Do not rank, size, or order."
+                ),
+            },
+            {"role": "user", "content": json.dumps({"rows": tiny(rows)})},
+        ],
+    }
+
+
+def annotate(rows, get=None, post=None):
+    """Off and unloaded skip the chat. The note is not a rank."""
+    if not enabled():
+        return _off()
+    getter = get or (lambda: _http_json(MODELS_URL, timeout=PROBE_S))
+    try:
+        loaded, detail = model_loaded(getter())
+    except Exception as e:
+        return _fail("probe_%s" % type(e).__name__)
+    if not loaded:
+        return _fail("not_loaded", detail=detail, lms_load_cmd=LOAD_HINT)
+    poster = post or (
+        lambda payload, timeout: _http_json(CHAT_URL, payload, timeout=timeout))
+    try:
+        body = poster(_chat_payload(rows, detail), _timeout())
+    except Exception as e:
+        return _fail(type(e).__name__)
+    note = parse_note(body)
+    if not note:
+        return _fail("bad_response")
+    return {
+        "enabled": True,
+        "fail_open": False,
+        "reason": "annotated",
+        "model": detail,
+        "note": note,
+    }
+
+
+def stamp(rows, season=None):
+    """Caller contract: seasoning_only, changes_rank false, even if the note lies."""
+    fn = season or annotate
+    try:
+        out = fn(rows)
+    except Exception as e:
+        out = _fail(type(e).__name__)
+    if not isinstance(out, dict):
+        out = _fail("bad_stamp")
+    out = dict(out)
+    out["seasoning_only"] = True
+    out["changes_rank"] = False
+    return out

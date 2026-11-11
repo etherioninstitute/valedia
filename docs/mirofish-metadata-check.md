@@ -1,0 +1,15 @@
+# Owned MiroFish SDK metadata preflight
+
+`tools/mirofish_metadata_check.py` defaults to prepare/check only. It verifies the frozen W16 candidate, 713 selected pins, 318 original source hashes, SDK helper and three exact case bodies. It stages the unchanged helper under a new SSD work directory and writes bindings plus a root approval template. It does not load or generate.
+
+Use the qualified SSD Python with `-I -B` and `TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp`. The default work directory is `project/work/sol-foreman-qwen/valedia-resume-20261108/build/metadata-supported-once` under the SSD Qwen workspace.
+
+For one live metadata load, root fills the generated template with a fresh 32-hex nonce and an expiry within one hour. Run the same command with `--live --approval /absolute/root-approval.json --approval-sha256 EXACT_SHA256`. Approval binds driver, tests, controls, frozen candidate, helper source, model/profile, alias, case hashes and output paths. An exclusive claim consumes this work directory even on failure. Default preparation never creates an approval or claim.
+
+The driver uses reviewed SDKBridge, TemplateAdmission, signed resource sampler/history, resource_sample and monitor_resource_once with no gateway. It enforces 65% macrofree before load, 30% while running, 40 GiB conservative owned RSS and capsule age at most three seconds. Guard failure records the original bad sample before stopping only the owned SDK process group. Exact SDK formatted text, tokenizer counts and comparison to conservative frozen template branches are retained per case. The finite deadline is 600 seconds, including a 90-second cleanup tail; load is bounded to 180 seconds and each case to 45 seconds.
+
+There are no inference, embedding generation, graph, worker, broker or native-run calls. Only the new owned alias may be unloaded after actual instance, selected model and original embedding proof. Lost/poisoned replies trigger a fresh bridge; absence after a lost load remains UNKNOWN_LATE_LOAD. Never interpret that state as proven cleanup. Foreign models and the existing embedding are preserved. A new live attempt requires a separately reviewed decision and work directory; no automatic retry occurs.
+
+Run `tools/test_mirofish_metadata_check.py` with the same Python. Tests use fake SDK observations and do not constitute actual server formatter/tokenizer qualification.
+
+The supported scope explicitly refuses assistant-final continuation. The original controls and failed `metadata-once` live evidence remain unchanged. New `recon/metadata-supported/controls.json` binds one captured native strict payload and two labeled source-based representatives: actual report retry history ends USER after an earlier assistant without optional tool_calls; the valid JSON-string tool request/result cycle ends TOOL. Representatives are not historical captured payloads. The unchanged frozen TemplateAdmission must still match actual SDK formatting/counts. No general continuation support or suffix stripping is added.

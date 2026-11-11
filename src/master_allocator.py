@@ -1,0 +1,841 @@
+"""Valedia Master Capital Allocator — ASI Abundance Engine
+═══════════════════════════════════════════════════════════════════════════
+The brain above the brains. Scans ALL platforms, ALL asset types, ranks
+every opportunity by expected value, and deploys capital where the math
+says the return is highest. Beats RenTech by being omnivorous.
+
+PLATFORMS: Kalshi (predictions + weather), Coinbase (crypto), Alpaca (stocks)
+ASSET TYPES: Weather arb, prediction markets, crypto spot, equities, DeFi
+
+The allocator doesn't care WHAT the asset is — only:
+  1. Expected return (edge × probability)
+  2. Time to resolution (faster = better, compounds more)
+  3. Downside risk (max loss)
+  4. Liquidity (can we get in/out)
+
+Capital flows to highest EV per unit time. Period.
+
+(c) GOATWORTHY Post LLC. All rights reserved.
+"""
+from recovery_state import Unsupported, LazyUnqualified
+MARKET_STATE = LazyUnqualified()
+MakerOrderManager = LazyUnqualified()
+_cfg = LazyUnqualified()
+_ftl = LazyUnqualified()
+_nw = LazyUnqualified()
+build_execution_plan = LazyUnqualified()
+import os, sys, json, time, traceback
+from datetime import datetime, timezone, timedelta
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if False:  # RECOVERY: original import-time backend activation disabled.
+    import nimble_wiring as _nw  # Nimble 2 prediction wiring (lazy heavy imports; never raises)
+import allocator_paths as _ap  # scanner / spot execute routing (both flags default OFF)
+# Single sources (this is the LIVE authority — it MUST use them, not its own copies).
+if False:  # RECOVERY: original import-time backend activation disabled.
+    try:
+        import forward_test_ledger as _ftl                      # real fee-inclusive ledger
+        import valedia_config as _cfg
+        from execution_policy import build_execution_plan, MakerOrderManager
+        from market_state import MARKET_STATE
+    except Exception:
+        _ftl = None; _cfg = None; build_execution_plan = None; MakerOrderManager = None
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+def _load_env():
+    if str(os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return
+    env_path = os.path.expanduser("~/.openclaw/.env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+if False:  # RECOVERY: original import-time backend activation disabled.
+    _load_env()
+
+MODELS_DIR = os.path.expanduser("~/.openclaw/workspace/models")
+MAX_TOTAL_DEPLOY_PCT = 0.70   # Deploy up to 70% of total capital
+MIN_EV_PER_DOLLAR = 0.03      # Minimum 3% expected return to deploy
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: Gather capital from ALL platforms
+# ═══════════════════════════════════════════════════════════════
+
+def venue_deployable(cash, deployed, pct=MAX_TOTAL_DEPLOY_PCT):
+    """Per-venue fuse: (cash + positions) * pct - positions. Never mix other venues."""
+    cash = max(0.0, float(cash or 0))
+    deployed = max(0.0, float(deployed or 0))
+    return max(0.0, (cash + deployed) * float(pct) - deployed)
+
+
+def _writer_is_valedia(venue):
+    if _cfg is None:
+        return True
+    try:
+        return _cfg.venue_writer(venue) == "valedia"
+    except Exception:
+        return True
+
+
+def get_total_capital():
+    """Get available capital across platforms.
+
+    Deployable is per-venue. Kalshi-only (CB/Alpaca writer none) uses Kalshi
+    cash+positions fuse so Alpaca equity cannot zero Kalshi deployable.
+    """
+    capital = {"kalshi": 0.0, "kalshi_deployed": 0.0,
+               "coinbase_usd": 0.0, "coinbase_usdc": 0.0,
+               "alpaca": 0.0, "alpaca_equity": 0.0, "alpaca_deployed": 0.0,
+               "total": 0.0, "deployed": 0.0, "kalshi_deployable": 0.0,
+               "deployable": 0.0}
+    
+    # Kalshi
+    try:
+        from kalshi_auth import get_balance
+        bal = get_balance()
+        capital["kalshi"] = bal.get("balance", 0) / 100
+        capital["kalshi_deployed"] = bal.get("portfolio_value", 0) / 100
+    except: pass
+    
+    # Coinbase
+    try:
+        from coinbase_trader import get_balances
+        cb = get_balances()
+        capital["coinbase_usd"] = cb.get("USD", {}).get("balance", 0)
+        capital["coinbase_usdc"] = cb.get("USDC", {}).get("balance", 0)
+    except: pass
+    
+    # Alpaca
+    try:
+        from alpaca_executor import get_account
+        acct = get_account()
+        capital["alpaca"] = float(acct.get("cash", 0))
+        capital["alpaca_equity"] = float(acct.get("equity", 0))
+        capital["alpaca_deployed"] = max(
+            0.0, capital["alpaca_equity"] - capital["alpaca"])
+    except: pass
+
+    capital["kalshi_deployable"] = venue_deployable(
+        capital["kalshi"], capital["kalshi_deployed"])
+    cb_cash = capital["coinbase_usd"] + capital["coinbase_usdc"]
+    cb_deployable = venue_deployable(cb_cash, 0.0)
+    alp_deployable = venue_deployable(capital["alpaca"], capital["alpaca_deployed"])
+
+    deployable = 0.0
+    deployed = 0.0
+    if _writer_is_valedia("kalshi"):
+        deployable += capital["kalshi_deployable"]
+        deployed += capital["kalshi_deployed"]
+    if _writer_is_valedia("coinbase"):
+        deployable += cb_deployable
+    if _writer_is_valedia("alpaca"):
+        deployable += alp_deployable
+        deployed += capital["alpaca_deployed"]
+
+    capital["total"] = (capital["kalshi"] + cb_cash + capital["alpaca"])
+    capital["deployed"] = deployed
+    capital["deployable"] = max(0.0, deployable)
+    return capital
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: Gather ALL opportunities across ALL platforms
+# ═══════════════════════════════════════════════════════════════
+
+def _is_strategy_paused(name):
+    """Learning pause (TTL). Fail-open: errors / expired → not paused.
+    Live-exec fence is separate (is_killed_strategy) and is applied at execute."""
+    try:
+        from pnl_tracker import is_strategy_paused
+        return bool(is_strategy_paused(name))
+    except Exception:
+        return False
+
+
+def gather_all_opportunities():
+    """Collect every opportunity from every source into one unified list.
+    Each opportunity gets: expected_value_per_dollar, hours_to_resolve, platform.
+    Skips currently-paused strategies (TTL). Unpaused names re-enter evaluation
+    even if Slice 8 live-exec fenced — sizing/gating yes, live POST no."""
+    opps = []
+    
+    # ── SOURCE 1: Kalshi prediction markets ──
+    try:
+        from kalshi_executor import scan_all_markets
+        kalshi_opps = scan_all_markets()
+        for o in kalshi_opps:
+            if o["side"] in ("pending_intel", "both"): continue
+            # Learning pause: skip while unexpired. Not a grave.
+            if _is_strategy_paused(o.get("strategy", "")):
+                continue
+            hours = max(1, o.get("hours_to_exp", 720))
+            ev = o["edge"] / (o["price"] + 0.01)  # Return per dollar
+            ev_per_day = ev / (hours / 24 + 0.01)  # Annualized speed
+            opps.append({
+                "platform": "kalshi", "type": o["strategy"],
+                "ticker": o["ticker"], "title": o["title"][:50],
+                "side": o["side"], "price": o["price"],
+                "ev_per_dollar": round(ev, 4),
+                "ev_per_day": round(ev_per_day, 4),
+                "hours_to_resolve": round(hours, 1),
+                "edge_pct": o.get("roi_pct", o.get("edge_pct", 0)),
+                "max_loss_pct": 100,  # Binary: lose entire stake
+                "confidence": min(0.95, o["score"] / 100),
+                "raw": o,
+            })
+    except Exception as e:
+        print(f"  Kalshi scan error: {e}")
+    
+    # ── SOURCE 2: Weather scan stays HTTP-off (Slice 8). No find_edges.
+    # Evaluation of WEATHER_ARB happens if injected/scanned opps pass pause.
+    # Live create_order stays fenced at execute.
+    opps.extend(gather_weather_opportunities())
+    
+    # ── SOURCE 3: Crypto (Coinbase — from unified brain signals) ──
+    try:
+        fusion_path = os.path.join(MODELS_DIR, "latest_fusion.json")
+        if os.path.exists(fusion_path):
+            with open(fusion_path) as f:
+                fusion = json.load(f)
+            for ticker, sig in fusion.get("signals", {}).items():
+                score = sig.get("fused_score", 50)
+                if score > 65 or score < 35:  # Strong signal
+                    direction = "BUY" if score > 65 else "SELL"
+                    edge = abs(score - 50) / 50  # 0-1 scale
+                    opps.append({
+                        "platform": "coinbase", "type": f"CRYPTO_{direction}",
+                        "ticker": ticker, "title": f"{ticker} {direction} (fused={score})",
+                        "side": direction.lower(), "price": 1.0,
+                        "ev_per_dollar": round(edge * 0.15, 4),  # Conservative: 15% of edge
+                        "ev_per_day": round(edge * 0.15 / 5, 4),  # 5-day hold assumption
+                        "hours_to_resolve": 120,
+                        "edge_pct": round(edge * 15, 1),
+                        "max_loss_pct": 20,  # Crypto can drop 20%
+                        "confidence": min(0.8, score / 100),
+                        "raw": sig,
+                    })
+    except Exception as e:
+        print(f"  Crypto signal error: {e}")
+    
+    # ── SOURCE 4: Stocks (Alpaca — from unified brain) ──
+    try:
+        if os.path.exists(fusion_path):
+            with open(fusion_path) as f:
+                fusion = json.load(f)
+            for ticker, sig in fusion.get("signals", {}).items():
+                if "-USD" in ticker: continue  # Skip crypto (handled above)
+                score = sig.get("fused_score", 50)
+                if score > 65:
+                    edge = (score - 50) / 50
+                    opps.append({
+                        "platform": "alpaca", "type": "STOCK_BUY",
+                        "ticker": ticker, "title": f"{ticker} BUY (fused={score})",
+                        "side": "buy", "price": 1.0,
+                        "ev_per_dollar": round(edge * 0.10, 4),
+                        "ev_per_day": round(edge * 0.10 / 10, 4),
+                        "hours_to_resolve": 240,
+                        "edge_pct": round(edge * 10, 1),
+                        "max_loss_pct": 15,
+                        "confidence": min(0.7, score / 100),
+                        "raw": sig,
+                    })
+    except: pass
+    
+    # ── SOURCE 5b: POLY-LEARN classroom is NOT mixed into live gather.
+    # Paper proposals live in poly_learn.run() (DRY/SHADOW, never create_order).
+
+    # ── SOURCE 5: Kalshi Market Scanner (600+ market heuristic scoring) ──
+    try:
+        scanner_path = os.path.join(MODELS_DIR, "scanner_results.json")
+        if os.path.exists(scanner_path):
+            with open(scanner_path) as f:
+                scan = json.load(f)
+            # Only use if scan is less than 12 hours old
+            scan_ts = scan.get("ts", "")
+            if scan_ts:
+                scan_age = (datetime.now(timezone.utc) - 
+                           datetime.fromisoformat(scan_ts)).total_seconds()
+                if scan_age < 43200:  # 12 hours
+                    for m in scan.get("macro", []):
+                        if m.get("edge_score", 0) > 50:
+                            ev = m["edge_score"] / 1000
+                            days = m.get("days_to_close") or 30
+                            opps.append({
+                                "platform": "kalshi_scanner",
+                                "type": "SCANNER_MACRO",
+                                "ticker": m["ticker"],
+                                "title": m["title"][:50],
+                                "side": "yes" if m["mid"] > 50 else "no",
+                                "price": m["yes_ask"] / 100,
+                                "ev_per_dollar": round(ev, 4),
+                                "ev_per_day": round(ev / max(days, 1), 4),
+                                "hours_to_resolve": round(days * 24, 1),
+                                "edge_pct": round(m["edge_score"] / 10, 1),
+                                "max_loss_pct": 100,
+                                "confidence": min(0.6, m["edge_score"] / 200),
+                                "raw": m,
+                            })
+    except Exception as e:
+        print(f"  Scanner source error: {e}")
+    
+    return opps
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: RANK by Expected Value per Dollar per Day
+# ═══════════════════════════════════════════════════════════════
+# This is the key insight: a 500% ROI weather bet that resolves tomorrow
+# is infinitely better than a 500% ROI political bet that resolves in 2029.
+# EV/$/day is the universal currency for comparing ALL opportunities.
+
+def rank_opportunities(opps):
+    """Rank all opportunities by risk-adjusted EV per dollar per day."""
+    for o in opps:
+        # Composite score: EV/day × confidence × (1 / sqrt(max_loss))
+        # Penalizes high-loss bets, rewards high-confidence fast resolution
+        loss_adj = 1.0 / (o["max_loss_pct"] / 100 + 0.1) ** 0.5
+        o["composite_score"] = round(
+            o["ev_per_day"] * o["confidence"] * loss_adj * 1000, 2
+        )
+    # Deduplicate mutually exclusive markets (e.g., ETH/BTC brackets, game sides)
+    # Only keep the BEST opportunity per event series
+    seen_series = {}
+    deduped = []
+    for o in opps:
+        # Extract series: KXETH-26MAR2305, KXNBAGAME-26MAR22WASNYK, etc.
+        ticker = o.get("ticker", "")
+        parts = ticker.rsplit("-", 1)
+        series_key = parts[0] if len(parts) > 1 else ticker
+        
+        if series_key not in seen_series:
+            seen_series[series_key] = o
+            deduped.append(o)
+        # Replace if this one has higher composite score
+        elif o["composite_score"] > seen_series[series_key]["composite_score"]:
+            deduped.remove(seen_series[series_key])
+            seen_series[series_key] = o
+            deduped.append(o)
+    
+    return deduped
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: ALLOCATE capital to top opportunities
+# ═══════════════════════════════════════════════════════════════
+
+def gather_weather_opportunities():
+    """No NOAA/Kalshi HTTP. Weather live exec stays fenced; this is not a scan.
+
+    Evaluation/sizing of WEATHER_ARB is allowed when the learning pause has
+    expired and opps are injected or appear from other gather sources.
+    """
+    return []
+
+
+def gather_poly_us_opportunities(client=None, models_dir=None, limit=8):
+    """POLY-LEARN paper classroom. Dry/shadow only. Never create_order."""
+    try:
+        import poly_learn
+        c = client
+        return poly_learn.gather(c, limit=limit, models_dir=models_dir) if c else []
+    except Exception as e:
+        print(f"  Poly US learn skip: {e}")
+        return []
+
+
+def allocate(opps, capital):
+    """Distribute available capital across top opportunities.
+    Uses Kelly-inspired sizing: higher EV = larger allocation."""
+    deployable = capital["deployable"]
+    if deployable < 1:
+        return [], "No deployable capital"
+    
+    allocations = []
+    remaining = deployable
+    # Per-strategy ceiling from category_stats (fee-true). A hot fake/other
+    # category cannot lift this opp; paper/sandbox/unreconciled/backfill cannot
+    # lift. Falls back to 15% only if config is unavailable.
+    
+    for o in opps:
+        if remaining < 0.50: break
+        cat = o.get("type") or o.get("strategy")
+        # Pause = skip sizing. Unpaused (incl. weather/oil) may be sized/gated.
+        # Live-exec fence is applied at execute, not here.
+        if _is_strategy_paused(cat):
+            continue
+        if o["ev_per_dollar"] < MIN_EV_PER_DOLLAR: continue
+        if o.get("platform") in ("kalshi", "kalshi_scanner"):
+            try:
+                import kalshi_fee_map as _kfm
+                raw = o.get("raw") if isinstance(o.get("raw"), dict) else {}
+                ok, info = _kfm.allow(o.get("ticker"), series=raw.get("series"))
+                o["fee_map"] = info
+                if not ok:
+                    continue
+            except Exception:
+                pass
+            try:
+                import kalshi_profit as _kp
+                proceed, o = _kp.annotate(o)
+                if not proceed:
+                    continue
+            except Exception:
+                pass
+
+        try:
+            _cap = _cfg.dynamic_per_trade_cap(category=cat) if _cfg else 0.15
+        except Exception:
+            _cap = 0.15
+        max_per_opp = deployable * _cap
+        
+        # Kelly-inspired: bet proportional to edge × confidence
+        kelly_frac = o["ev_per_dollar"] * o["confidence"]
+        # Half-Kelly for safety
+        alloc = min(remaining * kelly_frac * 0.5, max_per_opp, remaining * 0.20)
+        alloc = max(0.50, round(alloc, 2))  # Minimum $0.50
+        
+        if alloc > remaining: alloc = remaining
+        
+        allocations.append({
+            "platform": o["platform"], "type": o["type"],
+            "ticker": o["ticker"], "title": o["title"],
+            "side": o["side"], "price": o["price"],
+            "allocation": alloc,
+            "ev_per_dollar": o["ev_per_dollar"],
+            "ev_per_day": o["ev_per_day"],
+            "composite_score": o["composite_score"],
+            "hours_to_resolve": o["hours_to_resolve"],
+            "confidence": o["confidence"],
+            "expected_profit": round(alloc * o["ev_per_dollar"], 2),
+            "raw": o.get("raw"),
+            "ev_preflight": o.get("ev_preflight"),
+            "maker_first": o.get("maker_first"),
+            "fill_quality": o.get("fill_quality"),
+        })
+        remaining -= alloc
+        
+        if len(allocations) >= 20: break  # Max 20 positions
+    
+    return allocations, f"${deployable:.2f} deployable, ${remaining:.2f} reserved"
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: EXECUTE across platforms
+# ═══════════════════════════════════════════════════════════════
+
+KALSHI_FAIL_PATH = os.path.join(MODELS_DIR, "kalshi_order_failures.json")
+
+def _load_kalshi_failures():
+    if os.path.exists(KALSHI_FAIL_PATH):
+        try: return json.load(open(KALSHI_FAIL_PATH))
+        except: pass
+    return {}
+
+def _record_kalshi_failure(ticker, error):
+    fails = _load_kalshi_failures()
+    fails[ticker] = {"count": fails.get(ticker, {}).get("count", 0) + 1, "last_error": error[:80]}
+    json.dump(fails, open(KALSHI_FAIL_PATH, "w"), indent=2)
+
+def _clear_kalshi_failure(ticker):
+    fails = _load_kalshi_failures()
+    if ticker in fails:
+        del fails[ticker]
+        json.dump(fails, open(KALSHI_FAIL_PATH, "w"), indent=2)
+
+def _is_kalshi_blacklisted(ticker):
+    fails = _load_kalshi_failures()
+    return fails.get(ticker, {}).get("count", 0) >= 3
+
+def execute_allocations(allocations, dry_run=True, *, recovery=None):
+    """Execute allocations on the appropriate platform.
+    FAIL-SAFE: Every trade must pass intel vetting. If intel errors, trade is SKIPPED."""
+    from recovery_runtime import allocator
+    return allocator(allocations, dry_run, recovery)
+    results = []
+    _nw.warm_for_run(allocations, dry_run)  # Nimble 2: warm once per run (no-op unless VALEDIA_SYSTEMONE=1)
+    # Manage maker orders resting from prior cycles first (record fills, cancel stale).
+    _maker_mgr = None
+    if MakerOrderManager is not None and not dry_run:
+        try:
+            _maker_mgr = MakerOrderManager()
+            _maker_mgr.check_and_manage()
+        except Exception:
+            _maker_mgr = None
+    for a in allocations:
+        r = {"ticker": a["ticker"], "platform": a["platform"],
+             "type": a["type"], "allocation": a["allocation"],
+             "expected_profit": a.get("expected_profit", 0)}
+        kpath = _ap.kalshi_path(a["platform"])  # kalshi_scanner only if VALEDIA_SCANNER_EXECUTE
+
+        plat = str(a.get("platform") or "").lower()
+        if plat in ("polymarket_us", "poly_us", "polymarket") or a.get("mode") == "DRY/SHADOW":
+            r["status"] = "DRY/SHADOW"
+            r["create_order"] = False
+            r["error"] = "POLY-LEARN classroom; never create_order"
+            results.append(r)
+            continue
+        
+        if dry_run:
+            r["status"] = "DRY_RUN"
+            results.append(r)
+            continue
+
+        if _cfg is not None:
+            try:
+                _cfg.require_not_halted("execute_allocations")
+            except _cfg.HaltedError as e:
+                r["status"] = "HALTED"
+                r["error"] = str(e)
+                results.append(r)
+                continue
+
+        cat = a.get("type") or a.get("strategy")
+        if _is_strategy_paused(cat):
+            r["status"] = "SKIP_PAUSED"
+            r["error"] = "learning pause (until TTL/evidence); not permanent"
+            results.append(r)
+            continue
+
+        # Slice 8 live-exec fence: weather/oil may be sized when unpaused, but
+        # this lane never places their orders. Unpause ≠ create_order / alp_buy.
+        # Oil also fenced by ticker family (KXWTI/KXOIL/WTI) when tagged NO_HARVEST.
+        if _cfg and _cfg.live_exec_fenced(cat, ticker=a.get("ticker")):
+            r["status"] = "SKIP_LIVE_FENCE"
+            r["error"] = "live exec fenced (Slice 8); evaluation/sizing only"
+            results.append(r)
+            continue
+        
+        # ── FAIL-SAFE: Skip blacklisted tickers (failed 3+ times) ──
+        if kpath and _is_kalshi_blacklisted(a["ticker"]):
+            r["status"] = "SKIP_BLACKLISTED"
+            r["error"] = "Failed 3+ times previously"
+            results.append(r)
+            continue
+
+        # ── Loss-based category gate (real fee-inclusive ledger; fail-open, never permanent) ──
+        if _ftl and kpath:
+            try:
+                ok, why = _ftl.should_trade_category(a.get("type", ""))
+            except Exception:
+                ok, why = True, ""
+            if not ok:
+                r["status"] = "SKIP_CATEGORY_GATE"; r["error"] = why
+                results.append(r); continue
+        
+        # ── FAIL-SAFE: Intel vetting gate ──
+        # If we can't verify the trade through the intelligence layer, SKIP it
+        if kpath:
+            try:
+                from intel_layer import get_intel
+                intel = get_intel()
+                ik = intel.get_kalshi_conviction(
+                    a["ticker"], a.get("title", ""), a["price"],
+                    a.get("hours_to_resolve", 24)
+                )
+                rec_side = ik["recommended_side"]
+                # Block trades where intel says SKIP or CONTRADICTS
+                if rec_side == "skip" and ik["confidence"] < 0.3:
+                    r["status"] = "SKIP_LOW_CONVICTION"
+                    r["error"] = f"Intel: skip, conv={ik['conviction_yes']:.0f}"
+                    results.append(r)
+                    continue
+                if (rec_side == "yes" and a["side"] == "no") or \
+                   (rec_side == "no" and a["side"] == "yes"):
+                    if ik["confidence"] > 0.5:
+                        r["status"] = "SKIP_INTEL_CONTRADICTS"
+                        r["error"] = f"Intel says {rec_side}, we say {a['side']}"
+                        results.append(r)
+                        continue
+            except Exception as e:
+                r["status"] = "SKIP_INTEL_ERROR"
+                r["error"] = f"Intel check failed: {str(e)[:60]}"
+                results.append(r)
+                continue
+        
+        try:
+            if kpath:
+                from kalshi_auth import create_order, get_positions, get_fills
+                # FAIL-SAFE: Check we don't already hold this ticker
+                existing = get_positions().get("market_positions", [])
+                already_held = any(
+                    p.get("ticker") == a["ticker"] and abs(float(p.get("position_fp", 0))) > 0
+                    for p in existing
+                )
+                if already_held:
+                    r["status"] = "SKIP_HELD"
+                    r["error"] = "Already holding position"
+                    results.append(r)
+                    continue
+                price_cents = max(1, min(99, int(a["price"] * 100)))
+                n = max(1, int(a["allocation"] / a["price"]))
+                # Maker-first routing (HOW, never WHETHER): maker_routing.py documents the rule.
+                try:
+                    import maker_routing as _mr
+                    go, a, rd = _mr.route_allocation(a, n, price_cents, _maker_mgr, _cfg,
+                                                     build_execution_plan)
+                    r.update(rd["row"])
+                    if not go:
+                        r["status"] = rd["status"]
+                        if rd.get("error"):
+                            r["error"] = rd["error"]
+                        results.append(r)
+                        continue
+                    action, price_cents = rd["action"], rd["price_cents"]
+                except Exception as e:
+                    r["status"] = "SKIP_EV_PREFLIGHT"
+                    r["error"] = f"ev preflight failed closed: {str(e)[:60]}"
+                    results.append(r)
+                    continue
+                import session_clocks as _sc
+                blocked = _sc.before_create(a)
+                if blocked:
+                    r["status"], r["error"] = blocked
+                    results.append(r)
+                    continue
+                import informed_before_create as _ibc
+                pre = _mr.preflight(_ibc, a, n, price_cents, rd["quoted_cents"])  # create_preflight (+ quote for maker)
+                if not pre["ok"]:
+                    r["status"] = "SKIP_INFORMED"
+                    r["error"] = ",".join(pre["reasons"])
+                    r["contracts"] = n
+                    results.append(r)
+                    continue
+                # The Nimble 2 verdict below is this create's only model note (no second call).
+                r["nimble"] = nv = _nw.gate(
+                    a, pre["informed"], source="master_allocator", extra={"clock_ok": True})
+                if not nv["allow"]:  # Nimble 2 veto: last gate, entry removal only
+                    r["status"], r["error"], r["contracts"] = "SKIP_NIMBLE", _nw.why(nv), n
+                    results.append(r)
+                    continue
+                if action == "maker" and _maker_mgr is not None and not getattr(_cfg, "EXEC_DRY_RUN", True):
+                    oid = _maker_mgr.place_maker_order(a["ticker"], a["side"], n, price_cents,
+                                                       strategy=a.get("type", ""),
+                                                       informed=pre["informed"])
+                    if not oid:
+                        r["status"] = "FAILED"
+                        r["error"] = "maker place refused"
+                        r["contracts"] = n
+                    else:
+                        r["status"] = "MAKER_PLACED"
+                        r["contracts"] = n
+                        r["order_id"] = str(oid)[:12]
+                        _clear_kalshi_failure(a["ticker"])
+                else:
+                    resp = create_order(a["ticker"], a["side"], n, price_cents, informed=pre["informed"])
+                    r["contracts"] = n
+                    _clear_kalshi_failure(a["ticker"])
+                    # Fill-true only. Bare POST-ack is UNRECONCILED — never a live open.
+                    # Incomplete ack → GET /portfolio/fills (same habit as maker check_and_manage).
+                    fill = {}
+                    if _ftl:
+                        try:
+                            fill, payload = _ftl.resolve_kalshi_fill(resp, get_fills)
+                            _ftl.book_kalshi_fill(
+                                _ftl.canonical_category(a.get("type", "KALSHI")),
+                                a["ticker"], a["side"], resp,
+                                intended_source="live",
+                                fallback_price=price_cents / 100.0,
+                                fallback_contracts=n,
+                                fills_payload=payload)
+                        except Exception:
+                            fill = {}
+                    r["status"] = "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+                    if fill.get("order_id"):
+                        r["order_id"] = fill["order_id"]
+            
+            elif a["platform"] == "coinbase":
+                if _cfg and _cfg.venue_writer("coinbase") != "valedia":
+                    r["status"] = "SKIP_WRITER"
+                    r["error"] = "coinbase writer not valedia (Kalshi-only stage)"
+                    results.append(r)
+                    continue
+                # Shadow Intent (Slice 2): never dispatchable; writer stays valedia.
+                try:
+                    from nautilus_shadow_coinbase import emit_allocator_shadow
+                    sh = emit_allocator_shadow(a)
+                    r["shadow_intent"] = sh.get("intent_id")
+                    r["shadow_dispatchable"] = bool(sh.get("dispatchable"))
+                except Exception as e:
+                    r["shadow_error"] = str(e)[:80]
+                # Crypto buy via the real Valedia writer (coinbase_trader.market_buy), fill-true.
+                _ap.spot_execute(a, "coinbase", r, cfg=_cfg, fill_status=spot_fill_status,
+                                 book=_ftl.book_spot_fill if _ftl else None)
+            
+            elif a["platform"] == "alpaca":
+                if _cfg and _cfg.venue_writer("alpaca") != "valedia":
+                    r["status"] = "SKIP_WRITER"
+                    r["error"] = "alpaca writer not valedia (Kalshi-only stage)"
+                    results.append(r)
+                    continue
+                # Stock buy via alpaca_executor.market_buy (ALPACA_PAPER honored), fill-true.
+                _ap.spot_execute(a, "alpaca", r, cfg=_cfg, fill_status=spot_fill_status,
+                                 book=_ftl.book_spot_fill if _ftl else None)
+            else:  # kalshi_scanner with VALEDIA_SCANNER_EXECUTE off, or unknown
+                r["status"], r["error"] = _ap.skip_unrouted(a["platform"])
+        except Exception as e:
+            r["status"] = "FAILED"
+            r["error"] = str(e)[:80]
+            # SELF-HEAL: Track Kalshi failures for auto-blacklisting
+            if kpath:
+                _record_kalshi_failure(a["ticker"], str(e))
+        results.append(r)
+    return results
+
+def spot_fill_status(venue, raw, ftl_mod=None):
+    """EXECUTED only when extract_spot_fill.complete. POST-ack → UNRECONCILED.
+
+    A venue rejection or writer exception stays FAILED at the caller.
+    """
+    mod = ftl_mod if ftl_mod is not None else _ftl
+    if not mod:
+        return "UNRECONCILED"
+    try:
+        fill = mod.extract_spot_fill(venue, raw if isinstance(raw, dict) else {})
+    except Exception:
+        return "UNRECONCILED"
+    return "EXECUTED" if fill.get("complete") else "UNRECONCILED"
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN: Full cycle
+# ═══════════════════════════════════════════════════════════════
+
+def run(dry_run=False, max_allocs=15):
+    """Full allocation cycle: gather → rank → allocate → execute → report."""
+    raise Unsupported("automatic allocator discovery/run is unqualified; use explicit execute_allocations recovery context")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        stamp = _cfg.version_stamp() if _cfg else ""
+    except Exception:
+        stamp = ""
+    banner = f"🧠 MASTER ALLOCATOR ({ts}) {'[DRY]' if dry_run else '[LIVE]'}"
+    if stamp:
+        banner = f"{banner} {stamp}"
+    lines = [banner, ""]
+
+    # Slice 10: MiroFish/intel → gated Intents. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST.
+    try:
+        from intel_opportunity_gatherer import emit_shadow_intents
+        n_intel = len(emit_shadow_intents() or [])
+        lines.append(f"INTEL SHADOW: {n_intel} gated Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"INTEL SHADOW: skip ({str(e)[:60]})")
+
+    # Slice 11: HL shorts + Polymarket arb shadow. Never mixed into live allocations.
+    # Fail-open. Never-dispatchable. No venue POST. Writer stays valedia/none.
+    try:
+        from nautilus_shadow_venues import emit_venue_expansion_shadows
+        n_v = len(emit_venue_expansion_shadows() or [])
+        lines.append(f"VENUE SHADOW: {n_v} HL/PM Intents (never-dispatchable)")
+    except Exception as e:
+        lines.append(f"VENUE SHADOW: skip ({str(e)[:60]})")
+
+    # POLY-LEARN: paper classroom. Never mixed into live execute. Never create_order.
+    try:
+        import poly_learn
+        poly_doc = poly_learn.run(models_dir=MODELS_DIR)
+        n_poly = int((poly_doc or {}).get("n") or 0)
+        lines.append(f"POLY-LEARN DRY/SHADOW: {n_poly} proposals (never create_order)")
+    except Exception as e:
+        lines.append(f"POLY-LEARN: skip ({str(e)[:60]})")
+
+    # POLY-LOOP: status only. Never mixed into live execute. Never create.
+    try:
+        import poly_loop
+        lines.append("POLY-LOOP: " + poly_loop.status_line())
+    except Exception as e:
+        lines.append(f"POLY-LOOP: skip ({str(e)[:60]})")
+    
+    # Capital
+    capital = get_total_capital()
+    lines.append(f"CAPITAL: Kalshi ${capital['kalshi']:.2f} | CB ${capital['coinbase_usd']:.2f}+${capital['coinbase_usdc']:.2f} USDC | Alpaca ${capital['alpaca']:.2f}")
+    lines.append(f"  Total: ${capital['total']:.2f} | Deployed: ${capital['deployed']:.2f} | Deployable: ${capital['deployable']:.2f}")
+    
+    if capital["deployable"] < 1:
+        lines.append("⚠ No deployable capital.")
+        report = "\n".join(lines)
+        print(report)
+        return report
+    
+    # Gather + Rank
+    opps = gather_all_opportunities()
+    opps = rank_opportunities(opps)
+    lines.append(f"\nSCANNED: {len(opps)} opportunities across all platforms")
+    
+    # Show top 10 by composite score
+    lines.append(f"\nTOP OPPORTUNITIES (ranked by EV/$/day × confidence):")
+    for o in opps[:10]:
+        lines.append(
+            f"  {o['composite_score']:6.1f} {o['platform']:15} {o['type']:18} "
+            f"EV:{o['ev_per_dollar']:+.0%}/$ {o['hours_to_resolve']:.0f}h "
+            f"conf:{o['confidence']:.0%} | {o['title'][:35]}"
+        )
+    
+    # Allocate
+    allocations, alloc_msg = allocate(opps[:50], capital)
+    lines.append(f"\nALLOCATION: {len(allocations)} positions | {alloc_msg}")
+    
+    total_deployed = sum(a["allocation"] for a in allocations)
+    total_ev = sum(a["expected_profit"] for a in allocations)
+    
+    # Show allocation by platform
+    by_plat = {}
+    for a in allocations:
+        p = a["platform"]
+        if p not in by_plat: by_plat[p] = {"n": 0, "alloc": 0, "ev": 0}
+        by_plat[p]["n"] += 1
+        by_plat[p]["alloc"] += a["allocation"]
+        by_plat[p]["ev"] += a["expected_profit"]
+    
+    lines.append(f"\n  Platform Breakdown:")
+    for p, d in sorted(by_plat.items(), key=lambda x: x[1]["ev"], reverse=True):
+        pct = d["alloc"] / (total_deployed + 0.01) * 100
+        lines.append(f"    {p:18} {d['n']:2} trades  ${d['alloc']:6.2f} ({pct:.0f}%)  EV: ${d['ev']:.2f}")
+    
+    lines.append(f"\n  TOTAL: ${total_deployed:.2f} deployed → ${total_ev:.2f} expected profit ({total_ev/(total_deployed+0.01)*100:.0f}% ROI)")
+    
+    # Execute
+    results = execute_allocations(allocations[:max_allocs], dry_run=dry_run)
+    lines.append(f"\nEXECUTION:")
+    for r in results:
+        st = r.get("status") or "?"
+        icon = ("✅" if st == "EXECUTED"
+                else "⏳" if st == "UNRECONCILED"
+                else "🔶" if st == "DRY_RUN"
+                else "📝" if str(st).startswith("PAPER_")  # Alpaca paper account: non-live
+                else "⏭" if str(st).startswith("SKIP")
+                else "❌")
+        lines.append(
+            f"  {icon} {st:16} {r['platform']:15} ${r['allocation']:.2f} "
+            f"→ EV ${r['expected_profit']:.2f} | {r['ticker'][:30]}"
+        )
+        if r.get("error"): lines.append(f"    ERR: {r['error']}")
+    
+    # Save state
+    try:
+        state_path = os.path.join(MODELS_DIR, "master_allocator_state.json")
+        with open(state_path, "w") as f:
+            json.dump({"ts": ts, "capital": capital, "n_opps": len(opps),
+                "n_allocs": len(allocations), "total_deployed": total_deployed,
+                "total_ev": total_ev, "by_platform": {k: {"n": v["n"], "alloc": round(v["alloc"],2), "ev": round(v["ev"],2)} for k,v in by_plat.items()}
+            }, f, indent=2)
+    except: pass
+    
+    report = "\n".join(lines)
+    print(report)
+    return report
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["dry-run","execute","capital"], default="dry-run")
+    p.add_argument("--max-allocs", type=int, default=15)
+    args = p.parse_args()
+    if args.mode == "capital":
+        c = get_total_capital()
+        for k,v in c.items(): print(f"  {k}: ${v:.2f}" if isinstance(v,float) else f"  {k}: {v}")
+    elif args.mode == "dry-run":
+        run(dry_run=True, max_allocs=args.max_allocs)
+    elif args.mode == "execute":
+        run(dry_run=False, max_allocs=args.max_allocs)

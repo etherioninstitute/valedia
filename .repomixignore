@@ -1,0 +1,14 @@
+# Defense in depth only. tools/repo_map.py stages its own allowlist and ignores repo config execution.
+state/**
+**/.env*
+**/keys/**
+**/secrets/**
+**/credentials/**
+**/models/**
+**/history/**
+**/histories/**
+**/outputs/**
+**/cache/**
+**/node_modules/**
+**/__pycache__/**
+.repo-map/**

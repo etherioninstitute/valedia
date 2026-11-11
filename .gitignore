@@ -1,0 +1,23 @@
+# runtime state, ledgers and caches never enter history
+state/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+.env
+.env.*
+*.pem
+*.key
+# generated repo map (rebuild with tools/repo_map.py ensure)
+.repo-map/generations/
+.repo-map/build.lock
+tools/repomix-runtime/node_modules/
+# local artefacts
+artifacts/
+.DS_Store

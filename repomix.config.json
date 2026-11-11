@@ -1,0 +1,39 @@
+{
+  "input": {
+    "maxFileSize": 4194304
+  },
+  "output": {
+    "style": "xml",
+    "filePath": "repomix.xml",
+    "files": false,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "includeFullDirectoryStructure": false,
+    "copyToClipboard": false,
+    "git": {
+      "sortByChanges": false,
+      "includeDiffs": false,
+      "includeLogs": false
+    }
+  },
+  "include": [
+    "src/**/*.py",
+    "docs/**/*.md",
+    "docs/**/*.txt",
+    "docs/**/*.json",
+    "tools/**/*.py",
+    "tools/**/*.sh",
+    "tools/**/*.json",
+    "tools/**/*.md",
+    "AGENTS.md"
+  ],
+  "ignore": {
+    "useGitignore": false,
+    "useDotIgnore": false,
+    "useDefaultPatterns": true,
+    "customPatterns": []
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}
