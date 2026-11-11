@@ -1,0 +1,509 @@
+{
+  "hypothesis_id": 23,
+  "idea": "On US exchange-traded funds from 1999 to 2011, hold long each fund whose trend, read at three speeds and scaled by its volatility, is clearly up, sized by inverse volatility, and hold cash otherwise",
+  "strategy": {
+    "name": "trend_blend_etf_1999_2011",
+    "version": "1.0.0",
+    "hypothesis": "Funds in an up-trend at several speeds keep rising for a while",
+    "market": [
+      "DBC",
+      "EEM",
+      "EFA",
+      "GLD",
+      "IEF",
+      "IWM",
+      "LQD",
+      "QQQ",
+      "SPY",
+      "TLT",
+      "XLE",
+      "XLF",
+      "XLK",
+      "XLU",
+      "XLV"
+    ],
+    "risk": {
+      "max_position_pct": 0.2,
+      "max_open_positions": 12,
+      "max_gross": 1.0,
+      "stop_loss_pct": null,
+      "take_profit_pct": null,
+      "max_holding_days": null
+    }
+  },
+  "strategy_file": "strategies/trend_blend_etf_1999_2011.json",
+  "attempt": 1,
+  "revisions_used": 0,
+  "revisions_allowed": 5,
+  "development_period": [
+    "1999-01-04",
+    "2008-10-02"
+  ],
+  "sealed_period": "sealed; not used by this test",
+  "out_of_sample_from": "2000-01-03",
+  "result": {
+    "start": "2000-01-03",
+    "end": "2008-10-02",
+    "years": 8.734126984126984,
+    "total_return": 0.5222733644123851,
+    "cagr": 0.049286791597318746,
+    "annual_vol": 0.07918378845140081,
+    "sharpe": 0.6472551432245846,
+    "sharpe_t_stat": 1.912869140812487,
+    "max_drawdown": 0.12235024495030888,
+    "profit_factor": 1.1403665453804557,
+    "annual_turnover": 3.4802575348836946,
+    "cost_bps_of_traded": 5.417465092404971,
+    "annual_cost_drag": 0.001885417370781179,
+    "daily_win_rate": 0.39300318037255794,
+    "trades": 70,
+    "trade_win_rate": 0.5571428571428572,
+    "mean_trade_pct": 0.06466017979069538
+  },
+  "walk_forward": [
+    {
+      "start": "2000-01-03",
+      "end": "2001-10-05",
+      "variant": "base",
+      "return": -0.045950256632818376,
+      "sharpe": -1.528125381594637
+    },
+    {
+      "start": "2001-10-08",
+      "end": "2003-07-08",
+      "variant": "base",
+      "return": 0.05866278157795679,
+      "sharpe": 0.7289870373556974
+    },
+    {
+      "start": "2003-07-09",
+      "end": "2005-04-06",
+      "variant": "base",
+      "return": 0.25234653372884774,
+      "sharpe": 1.3016889364364939
+    },
+    {
+      "start": "2005-04-07",
+      "end": "2007-01-04",
+      "variant": "base",
+      "return": 0.15701382287784815,
+      "sharpe": 0.9729718735941606
+    },
+    {
+      "start": "2007-01-05",
+      "end": "2008-10-02",
+      "variant": "base",
+      "return": 0.04016184397740519,
+      "sharpe": 0.2739730422892351
+    }
+  ],
+  "positive_windows": 0.8,
+  "deflated_sharpe": {
+    "variations_of_idea": 1,
+    "attempts_on_market": 1,
+    "for_idea": 0.9710824170289701,
+    "for_market": 0.9710824170289701,
+    "value": 0.9710824170289701,
+    "variance_of_attempt_sharpes": 0.00045433893684688776
+  },
+  "breaker": {
+    "double_costs": {
+      "start": "2000-01-03",
+      "end": "2008-10-02",
+      "years": 8.734126984126984,
+      "total_return": 0.4975610352018214,
+      "cagr": 0.047322354645214615,
+      "annual_vol": 0.07918614815373441,
+      "sharpe": 0.6235695119419778,
+      "sharpe_t_stat": 1.8428696767133035,
+      "max_drawdown": 0.12255555639781612,
+      "profit_factor": 1.1348640265809176,
+      "daily_win_rate": 0.39254884143571106
+    },
+    "delayed_fills": {
+      "start": "2000-01-03",
+      "end": "2008-10-02",
+      "years": 8.734126984126984,
+      "total_return": 0.528995581411783,
+      "cagr": 0.04981626846644005,
+      "annual_vol": 0.07974374241946633,
+      "sharpe": 0.6495927632016079,
+      "sharpe_t_stat": 1.9197776392057444,
+      "max_drawdown": 0.12389674249863447,
+      "profit_factor": 1.1413105231888943,
+      "daily_win_rate": 0.3907314856883235
+    },
+    "worst_periods": [
+      {
+        "start": "2002-04-24",
+        "end": "2002-07-23",
+        "market_return": -0.28483775408244116,
+        "strategy_return": -0.028157695533479132
+      },
+      {
+        "start": "2001-06-19",
+        "end": "2001-09-21",
+        "market_return": -0.21821697715599908,
+        "strategy_return": -0.008411179518218348
+      },
+      {
+        "start": "2001-01-04",
+        "end": "2001-04-04",
+        "market_return": -0.18587442101628682,
+        "strategy_return": -0.02152607035581311
+      },
+      {
+        "start": "2000-09-01",
+        "end": "2000-11-30",
+        "market_return": -0.1453996134705564,
+        "strategy_return": 0.0
+      },
+      {
+        "start": "2008-07-01",
+        "end": "2008-09-29",
+        "market_return": -0.13063821629658434,
+        "strategy_return": -0.04747230105423561
+      }
+    ],
+    "timing_null": {
+      "actual_gross_sharpe": 0.6711941825158814,
+      "null_median": 0.24807474632189902,
+      "null_95th": 1.1846813310394773,
+      "p_value": 0.08970099667774087,
+      "shifts": 300,
+      "average_book_held_throughout_sharpe": 0.3537169932872639,
+      "reading": "p is the share of randomly re-timed copies of this book that did at least as well; a high p means the rule's timing added nothing beyond its average exposure"
+    },
+    "market_basket": {
+      "start": "2000-01-03",
+      "end": "2008-10-02",
+      "years": 8.734126984126984,
+      "total_return": 0.2398142208797407,
+      "cagr": 0.024917048403216846,
+      "annual_vol": 0.16671956633419366,
+      "sharpe": 0.23095901556139725,
+      "sharpe_t_stat": 0.6825660302347478,
+      "max_drawdown": 0.46726871286275784,
+      "profit_factor": 1.04208359822827,
+      "daily_win_rate": 0.53430258973194
+    }
+  },
+  "prediction": {
+    "annual_return": 0.035,
+    "win_rate": 0.4,
+    "sharpe": 0.55,
+    "fail_if_sharpe_below": 0.3,
+    "fail_if_drawdown_above": 0.2,
+    "notes": "Parameters are the conventional ones (speeds 16/64, 32/128, 64/256; entry at half a typical trend; exit at zero) and were fixed before any run."
+  },
+  "versus_prediction": {
+    "annual_return": 0.014286791597318743,
+    "win_rate": 0.15714285714285714,
+    "sharpe": 0.0972551432245845
+  },
+  "where_it_loses": {
+    "worst_symbols": {
+      "XLV": -0.011473878361544784,
+      "DBC": 0.003785352486418937,
+      "LQD": 0.008415566456683041
+    },
+    "worst_window": {
+      "start": "2000-01-03",
+      "end": "2001-10-05",
+      "variant": "base",
+      "return": -0.045950256632818376,
+      "sharpe": -1.528125381594637
+    }
+  },
+  "exits": {
+    "exit rule": {
+      "count": 70,
+      "mean_pnl_pct": 0.06466017979069538
+    }
+  },
+  "checks": {
+    "prediction_failure_terms": {
+      "passed": true,
+      "detail": "Sharpe 0.65 (fails below 0.30), drawdown 12.2% (fails above 20%)"
+    },
+    "deflated_sharpe": {
+      "passed": true,
+      "detail": "0.971 against 0.95 (1 variations of the idea, 1 on the market)"
+    },
+    "walk_forward": {
+      "passed": true,
+      "detail": "80% of 5 windows made money"
+    },
+    "double_costs": {
+      "passed": true,
+      "detail": "Sharpe 0.62 at twice the trading costs"
+    },
+    "delayed_fills": {
+      "passed": true,
+      "detail": "Sharpe 0.65 with fills one day late"
+    },
+    "worst_periods": {
+      "passed": true,
+      "detail": "worst result in the market's 5 worst stretches: -4.7%"
+    }
+  },
+  "verdict": "pass (development); sealed test pending",
+  "diagnostics": {
+    "observations": 2201,
+    "start": "2000-01-03",
+    "end": "2008-10-02",
+    "uncertainty_of_the_mean": {
+      "formula": "2.1 and 2.2",
+      "mean_daily": 0.00020338140609197077,
+      "std_error": 0.00010632269701710224,
+      "ci95_daily": [
+        -5.121961136415377e-06,
+        0.0004118847733203569
+      ],
+      "sharpe_annual": 0.6472551432245846,
+      "sharpe_t_stat": 1.9128691408124876,
+      "years": 8.734126984126984,
+      "years_needed_for_t_of_2_at_this_sharpe": 9.547924388382459,
+      "ci95_annual": [
+        -0.001290734206376675,
+        0.10379496287672994
+      ],
+      "p_value_mean_zero": 0.05589450745771104,
+      "reading": "the 95% range for the average daily return; a range that includes zero means the edge is not established"
+    },
+    "win_rate": {
+      "formula": "1.1",
+      "active_days": 1598,
+      "wins": 865,
+      "losses": 733,
+      "posterior_mean": 0.54125,
+      "credible95": [
+        0.5167960051139684,
+        0.5656063163071436
+      ],
+      "reading": "win rate on days with a position, updated from an even prior; the range is what the data supports"
+    },
+    "tails": {
+      "formula": "1.5",
+      "student_t_df": 3.7883135563561208,
+      "tail_ratio_vs_normal_3sd": 6.098938471394907,
+      "normal_mass_within_3sd": 0.9973002039367398,
+      "reading": "degrees of freedom under about 5 mean fat tails: 3-sigma days come far more often than a normal curve says"
+    },
+    "by_market_state": {
+      "formula": "1.4",
+      "market_above_200d": {
+        "days": 1395,
+        "mean_daily": 0.00037929060660506155,
+        "annual_vol": 0.09460202762085544
+      },
+      "market_below_200d": {
+        "days": 706,
+        "mean_daily": -0.0001153936563819166,
+        "annual_vol": 0.042751067918498434
+      },
+      "mean_from_regimes": 0.0002130616253252869,
+      "variance_within_regimes_share": 0.997905841583486,
+      "reading": "where the return comes from by market state; a strategy that earns only in one state is a bet on that state"
+    },
+    "market_exposure": {
+      "formula": "8.1 and 2.3",
+      "beta": 0.2005203331934529,
+      "alpha_annual": 0.04353100132116414,
+      "alpha_t_stat": 1.7916627128037241,
+      "r_squared": 0.1782450289276929,
+      "sharpe_after_removing_beta": 0.6064447084336242,
+      "reading": "how much of the return is the market itself; alpha with a t-statistic under 2 is not distinguishable from zero"
+    },
+    "factor_exposure": {
+      "formula": "8.2",
+      "factors": [
+        "SPY",
+        "TLT",
+        "GLD"
+      ],
+      "betas": {
+        "SPY": 0.19458009998562312,
+        "TLT": 0.17315618001934205,
+        "GLD": 0.15432271497558167
+      },
+      "alpha_annual": 0.028383457467725918,
+      "r_squared": 0.27860450342298093,
+      "reading": "exposure to each tradable factor proxy; a high R-squared means the strategy can be replicated by holding them"
+    },
+    "multiple_testing": {
+      "formula": "2.5",
+      "variations": 1,
+      "best_p_raw": 0.02788240351174195,
+      "best_p_holm": 0.02788240351174195,
+      "chance_of_a_false_win_at_5pct": 0.05,
+      "survive_holm": 1,
+      "reading": "with this many tries, the chance that at least one looks significant by luck alone"
+    },
+    "serial_dependence": {
+      "formula": "5.2 and 5.3",
+      "ljung_box_p": 0.42070313741690035,
+      "serial_dependence": "noise",
+      "lag": 0,
+      "rho": -0.026051451683868004,
+      "stationary": true,
+      "adf_p": 0.0,
+      "kpss_p": 0.1,
+      "reading": "whether yesterday's result predicts today's, and whether the return series is stable enough to average at all"
+    },
+    "volatility_forecast": {
+      "formula": "5.5, 5.1 and 4.2",
+      "garch_persistence": 1.0000000000003355,
+      "forecast_annual_vol_next_5d": 0.07717294629768208,
+      "realized_annual_vol": 0.07918378845140081,
+      "scale_to_target_vol": 1.0,
+      "target_vol": 0.1,
+      "ewma_decay_fit": 0.995,
+      "reading": "the volatility the model expects over the next week, and how much to scale the book to run at the target"
+    },
+    "compounding": {
+      "formula": "4.5",
+      "arithmetic_annual": 0.05125211433517663,
+      "geometric_annual": 0.04928679159732785,
+      "volatility_drag_annual": 0.003135036176758098,
+      "reading": "what compounds is the geometric return: the average return minus about half the variance"
+    },
+    "time_scaling": {
+      "formula": "6.1",
+      "vol_5d_vs_sqrt_time": 0.9411932523381307,
+      "vol_21d_vs_sqrt_time": 0.8071267067260365,
+      "reading": "1.0 means risk grows with the square root of time; above 1 returns trend, below 1 they revert"
+    },
+    "ruin_and_target": {
+      "formula": "6.5 and 6.3",
+      "drawdown_limit": 0.2,
+      "profit_target": 0.035,
+      "p_target_before_limit": 0.9863842814161815,
+      "p_breach_limit_next_63d": 0.0,
+      "median_worst_drawdown_63d": 0.03488047909646497,
+      "reading": "if returns keep this mean and volatility: the chance of reaching the profit target before the drawdown limit stops the book"
+    },
+    "book_risk": {
+      "formula": "1.2, 3.1, 3.2, 3.3, 3.4, 3.5, 4.3, 4.4 and 6.2",
+      "assets_held": [
+        "DBC",
+        "EEM",
+        "EFA",
+        "GLD",
+        "IEF",
+        "IWM",
+        "LQD",
+        "QQQ",
+        "SPY",
+        "TLT",
+        "XLE",
+        "XLF",
+        "XLK",
+        "XLU",
+        "XLV"
+      ],
+      "expected_annual_return_by_asset": {
+        "DBC": 0.000753037665758059,
+        "EEM": 0.0009143555194607131,
+        "EFA": -0.0005423335451821712,
+        "GLD": 0.003081902105181971,
+        "IEF": 0.003773561325654984,
+        "IWM": -0.0003812594595353749,
+        "LQD": -0.00038238661208634696,
+        "QQQ": -0.000586974667771045,
+        "SPY": -0.0005637075068692697,
+        "TLT": 0.003622600152030983,
+        "XLE": 0.00410318327520599,
+        "XLF": -0.0041585003195467075,
+        "XLK": -0.0005602912778166138,
+        "XLU": 0.003643416253033234,
+        "XLV": 0.00041024598953620607
+      },
+      "expected_annual_return_of_average_book": 0.013126848897054611,
+      "mean_variance_weights": {
+        "DBC": 0.06841083123765059,
+        "EEM": 0.05621140282831999,
+        "EFA": -0.09491014554648763,
+        "GLD": 0.023563732342352567,
+        "IEF": 0.4404788238685856,
+        "IWM": -0.002460621449297064,
+        "LQD": -0.05788412909767062,
+        "QQQ": -0.013281036452181065,
+        "SPY": 0.035239410096959495,
+        "TLT": -0.05888967939209159,
+        "XLE": -0.024530218473884178,
+        "XLF": -0.007418509349118071,
+        "XLK": 0.025806481448775526,
+        "XLU": 0.0612409624649695,
+        "XLV": 0.02967401595165653
+      },
+      "p_current_book_breaches_limit_63d_no_drift": 0.0,
+      "condition_number_sample": 1240.4572986004487,
+      "condition_number_shrunk": 304.2576526378493,
+      "shrinkage": 0.022123802266821962,
+      "first_component_share": 0.6060518052695167,
+      "current_book_annual_vol": 0.03467087916053671,
+      "average_book_annual_vol": 0.07962790311669934,
+      "minimum_variance_weights": {
+        "DBC": 0.06950092586805284,
+        "EEM": -0.05689463832894931,
+        "EFA": -0.043451080882500076,
+        "GLD": 0.03953898664567339,
+        "IEF": 0.6275994741339543,
+        "IWM": 0.011549204891732882,
+        "LQD": 0.08800012504851695,
+        "QQQ": -0.005961656328515544,
+        "SPY": 0.16419776337909583,
+        "TLT": -0.07864332370992592,
+        "XLE": -0.021134138328110258,
+        "XLF": -0.0022825951170772213,
+        "XLK": 0.059823178910339586,
+        "XLU": 0.010459748528386478,
+        "XLV": 0.13769802528932612
+      },
+      "reading": "how concentrated the book's risk is; a first component near 1 means the assets move as one and diversification is nominal"
+    },
+    "pairs_check": {
+      "formula": "5.4",
+      "pair": [
+        "IEF",
+        "TLT"
+      ],
+      "correlation": 0.9313342667284936,
+      "cointegrated": false,
+      "p_value": 0.06290225263097252,
+      "hedge_ratio": 1.005859837640827,
+      "half_life_days": 23.54170257366434,
+      "reading": "whether the two most correlated holdings are tied together; if so, holding both is one bet and their gap tends to close"
+    },
+    "signal_quality": {
+      "formula": "10.4",
+      "precision": 0.5373857767183154,
+      "recall": 0.47984958138214845,
+      "f1": 0.5069905168859403,
+      "base_rate_up": 0.5279640382094025,
+      "reading": "of the asset-days it was long, the share that went up, against the share of all asset-days that went up"
+    },
+    "stability": {
+      "formula": "10.2",
+      "blocks": 5,
+      "block_sharpes": [
+        -0.97,
+        1.26,
+        1.2,
+        1.28,
+        0.02
+      ],
+      "share_positive": 0.8,
+      "worst_block_sharpe": -0.9748209831608008,
+      "reading": "the same strategy on consecutive stretches of time it was not chosen on"
+    },
+    "fair_game_test": {
+      "formula": "6.5",
+      "mean_increment": 0.00020338140609197077,
+      "p_value": 0.11178901491542208,
+      "looks_like_a_fair_game": true,
+      "reading": "a fair game has no edge; failing to reject it means the returns are consistent with luck"
+    }
+  }
+}

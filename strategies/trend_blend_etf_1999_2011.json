@@ -1,0 +1,43 @@
+{
+  "name": "trend_blend_etf_1999_2011",
+  "version": "1.0.0",
+  "hypothesis": "Funds in an up-trend at several speeds keep rising for a while",
+  "market": [
+    "DBC",
+    "EEM",
+    "EFA",
+    "GLD",
+    "IEF",
+    "IWM",
+    "LQD",
+    "QQQ",
+    "SPY",
+    "TLT",
+    "XLE",
+    "XLF",
+    "XLK",
+    "XLU",
+    "XLV"
+  ],
+  "entry": {
+    "rule": "trend_blend",
+    "fast": 16,
+    "speeds": 3,
+    "enter": 0.5,
+    "exit": 0.0,
+    "direction": "long"
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 25,
+    "position_vol": 0.02
+  },
+  "risk": {
+    "max_position_pct": 0.2,
+    "max_open_positions": 12,
+    "max_gross": 1.0,
+    "stop_loss_pct": null,
+    "take_profit_pct": null,
+    "max_holding_days": null
+  }
+}
