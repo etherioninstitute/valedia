@@ -181,14 +181,27 @@ class ChatMember(Member):
 
 
 class HermesProfileMember(Member):
-    """A Hermes profile answering one-shot (`hermes -p <profile> -z <prompt>`), with no tools."""
+    """A Hermes profile answering one-shot (`hermes -p <profile> -z <prompt>`), with no tools.
+
+    `toolsets` defaults to "clarify", which Hermes disables in one-shot mode, so the model gets no
+    tool definitions and no skills index. Measured on the local 27B: the prompt falls from about
+    15,700 tokens to about 1,950 and a cold call from 144 s to 54 s. Pass None to use the profile's
+    own toolsets. `reasoning` overrides the profile's reasoning effort for the call."""
+
+    REASONING = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
     def __init__(self, name: str, role: str, profile: str, model: str | None = None, timeout: float = 180.0,
-                 runner: Callable[[list[str], float], str] | None = None) -> None:
+                 runner: Callable[[list[str], float], str] | None = None, toolsets: str | None = "clarify",
+                 reasoning: str | None = None) -> None:
         super().__init__(name, role)
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
             raise ValueError("invalid profile name")
+        if toolsets is not None and not re.fullmatch(r"[a-z0-9_-]+(,[a-z0-9_-]+)*", toolsets):
+            raise ValueError("toolsets must be comma-separated toolset names")
+        if reasoning is not None and reasoning not in self.REASONING:
+            raise ValueError(f"reasoning must be one of {self.REASONING}")
         self.profile, self.model, self.timeout, self._run = profile, model, timeout, runner or self._subprocess
+        self.toolsets, self.reasoning = toolsets, reasoning
 
     @staticmethod
     def _subprocess(argv: list[str], timeout: float) -> str:
@@ -199,7 +212,8 @@ class HermesProfileMember(Member):
 
     def _ask(self, case):
         prompt = PROMPT.format(name=self.name, role=self.role, case=json.dumps(case, sort_keys=True, default=str))
-        argv = ["hermes", "-p", self.profile, "-z", prompt] + (["-m", self.model] if self.model else [])
+        argv = (["hermes", "-p", self.profile, "-z", prompt] + (["-t", self.toolsets] if self.toolsets else [])
+                + (["--reasoning", self.reasoning] if self.reasoning else []) + (["-m", self.model] if self.model else []))
         return parse_json_reply(self._run(argv, self.timeout))
 
 
@@ -349,7 +363,8 @@ def build_panel(roster: dict | None = None, ledger_path: str = ":memory:") -> De
             members.append(ChatMember(name, role, spec["base_url"], spec["model"], spec.get("timeout", 120.0),
                                       spec.get("allow_remote", False)))
         elif backend == "hermes":
-            members.append(HermesProfileMember(name, role, spec["profile"], spec.get("model"), spec.get("timeout", 180.0)))
+            members.append(HermesProfileMember(name, role, spec["profile"], spec.get("model"), spec.get("timeout", 180.0),
+                                               toolsets=spec.get("toolsets", "clarify"), reasoning=spec.get("reasoning")))
         else:
             raise ValueError(f"unknown backend '{backend}' for member '{name}'")
     return DecisionPanel(members, ledger=ForecastLedger(ledger_path),

@@ -110,6 +110,18 @@ def test_chat_and_hermes_members_use_their_transports():
     assert v.veto is True and argv_seen[0][:4] == ["hermes", "-p", "valedia-trading-auditor", "-z"]
     with pytest.raises(ValueError):
         pn.HermesProfileMember("x", "vetter", "bad profile; rm -rf")
+    assert argv_seen[0][-2:] == ["-t", "clarify"]                      # one-shot with no tools by default
+    seen: list = []
+    tuned = pn.HermesProfileMember("s", "scout", "p", model="m1", toolsets=None, reasoning="none",
+                                   runner=lambda argv, t: seen.append(argv) or '{"probability": 0.5, "veto": false, "rationale": "x"}')
+    assert tuned.ask(CASE).probability == 0.5 and "-t" not in seen[0] and seen[0][-4:] == ["--reasoning", "none", "-m", "m1"]
+    for bad in ({"toolsets": "web; rm -rf"}, {"toolsets": ""}, {"reasoning": "extreme"}):
+        with pytest.raises(ValueError):
+            pn.HermesProfileMember("x", "vetter", "p", **bad)
+    built = pn.build_panel({"members": [{"name": "h", "role": "decider", "backend": "hermes", "profile": "p", "reasoning": "low"},
+                                        {"name": "h2", "role": "vetter", "backend": "hermes", "profile": "p", "toolsets": None}]})
+    by_name = {m.name: m for m in built.members}
+    assert (by_name["h"].toolsets, by_name["h"].reasoning, by_name["h2"].toolsets) == ("clarify", "low", None)
     silent = pn.HermesProfileMember("d", "decider", "p", runner=lambda argv, t: "I cannot answer")
     assert not silent.ask(CASE).valid
 
