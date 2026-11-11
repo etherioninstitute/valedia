@@ -1,0 +1,31 @@
+{
+  "name": "pa_long_bond_credit_h18",
+  "version": "1.0.0",
+  "hypothesis": "Buy long-bond and credit ETFs (TLT, IEF, LQD) after a 10-day fall that is large relative to their 1-year volatility, and exit once the z-score returns toward zero.",
+  "market": [
+    "TLT",
+    "IEF",
+    "LQD"
+  ],
+  "entry": {
+    "rule": "reversion",
+    "lookback": 10,
+    "vol_window": 252,
+    "enter": 1.5,
+    "exit": 0.25,
+    "direction": "long"
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 60,
+    "position_vol": 0.01
+  },
+  "risk": {
+    "max_position_pct": 0.3,
+    "max_open_positions": 3,
+    "max_gross": 0.9,
+    "stop_loss_pct": 0.06,
+    "take_profit_pct": 0.04,
+    "max_holding_days": 20
+  }
+}

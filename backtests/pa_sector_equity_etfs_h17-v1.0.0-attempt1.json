@@ -1,0 +1,215 @@
+{
+  "hypothesis_id": 17,
+  "idea": "Buy sector and equity ETFs after a 20-day breakout to a new high inside a rising market, and exit when price falls back to the middle of the range.",
+  "strategy": {
+    "name": "pa_sector_equity_etfs_h17",
+    "version": "1.0.0",
+    "hypothesis": "Buy sector and equity ETFs after a 20-day breakout to a new high inside a rising market, and exit when price falls back to the middle of the range.",
+    "market": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "XLK",
+      "XLF",
+      "EFA",
+      "EEM"
+    ],
+    "risk": {
+      "max_position_pct": 0.2,
+      "max_open_positions": 5,
+      "max_gross": 1.0,
+      "stop_loss_pct": 0.08,
+      "take_profit_pct": null,
+      "max_holding_days": 60
+    }
+  },
+  "strategy_file": "strategies/pa_sector_equity_etfs_h17.json",
+  "attempt": 1,
+  "revisions_used": 0,
+  "revisions_allowed": 5,
+  "development_period": [
+    "2012-01-03",
+    "2023-02-17"
+  ],
+  "sealed_period": "sealed; not used by this test",
+  "out_of_sample_from": "2013-01-04",
+  "result": {
+    "start": "2013-01-04",
+    "end": "2023-02-17",
+    "years": 10.115079365079366,
+    "total_return": 0.1590801550870249,
+    "cagr": 0.014701739907950984,
+    "annual_vol": 0.03219641055322985,
+    "sharpe": 0.469442778200536,
+    "sharpe_t_stat": 1.493025790225028,
+    "max_drawdown": 0.061430839585523866,
+    "profit_factor": 1.1028521927378325,
+    "annual_turnover": 3.246978729592825,
+    "cost_bps_of_traded": 1.575260741567712,
+    "annual_cost_drag": 0.0005114838121432981,
+    "daily_win_rate": 0.42918791683012947,
+    "trades": 215,
+    "trade_win_rate": 0.42790697674418604,
+    "mean_trade_pct": 0.010067291058034953
+  },
+  "walk_forward": [
+    {
+      "start": "2013-01-04",
+      "end": "2015-01-13",
+      "variant": "base",
+      "return": 0.03357910909843542,
+      "sharpe": 0.47632850803658483
+    },
+    {
+      "start": "2015-01-14",
+      "end": "2017-01-23",
+      "variant": "base",
+      "return": -0.015319101022084669,
+      "sharpe": -0.30440432322010413
+    },
+    {
+      "start": "2017-01-24",
+      "end": "2019-02-01",
+      "variant": "base",
+      "return": 0.09929097464755565,
+      "sharpe": 1.1847565630230514
+    },
+    {
+      "start": "2019-02-04",
+      "end": "2021-02-10",
+      "variant": "base",
+      "return": 0.050454147781241465,
+      "sharpe": 0.747124749511665
+    },
+    {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": -0.013755778958513876,
+      "sharpe": -0.2648412718322061
+    }
+  ],
+  "positive_windows": 0.6,
+  "deflated_sharpe": {
+    "variations_of_idea": 1,
+    "attempts_on_market": 19,
+    "for_idea": 0.9271847484814469,
+    "for_market": 0.2900749945461578,
+    "value": 0.2900749945461578,
+    "variance_of_attempt_sharpes": 0.00047229821880402667
+  },
+  "breaker": {
+    "double_costs": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.15310680268791432,
+      "cagr": 0.014183555493790134,
+      "annual_vol": 0.0321902805587866,
+      "sharpe": 0.45365690737280784,
+      "sharpe_t_stat": 1.442820071101384,
+      "max_drawdown": 0.0627186358724382,
+      "profit_factor": 1.0992248764045969,
+      "daily_win_rate": 0.4272263632797175
+    },
+    "delayed_fills": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.14343721341508386,
+      "cagr": 0.013339575177636398,
+      "annual_vol": 0.03283707825189928,
+      "sharpe": 0.42000110712298816,
+      "sharpe_t_stat": 1.3357804486020102,
+      "max_drawdown": 0.05792774563664416,
+      "profit_factor": 1.0914378189708092,
+      "daily_win_rate": 0.42604943114947036
+    },
+    "worst_periods": [
+      {
+        "start": "2019-12-20",
+        "end": "2020-03-23",
+        "market_return": -0.31145677240933434,
+        "strategy_return": -0.015054656086033402
+      },
+      {
+        "start": "2018-09-25",
+        "end": "2018-12-24",
+        "market_return": -0.19350329319800375,
+        "strategy_return": -0.01634806452082882
+      },
+      {
+        "start": "2022-03-30",
+        "end": "2022-06-29",
+        "market_return": -0.1799023913706178,
+        "strategy_return": 0.0
+      },
+      {
+        "start": "2015-11-09",
+        "end": "2016-02-09",
+        "market_return": -0.14999085841118476,
+        "strategy_return": -0.012913617954372514
+      },
+      {
+        "start": "2015-05-28",
+        "end": "2015-08-25",
+        "market_return": -0.1346619676519656,
+        "strategy_return": -0.027956427878523926
+      }
+    ]
+  },
+  "prediction": {
+    "annual_return": 0.05,
+    "win_rate": 0.5,
+    "sharpe": 0.45,
+    "fail_if_sharpe_below": 0.25,
+    "fail_if_drawdown_above": 0.15,
+    "notes": ""
+  },
+  "versus_prediction": {
+    "annual_return": -0.03529826009204902,
+    "win_rate": -0.07209302325581396,
+    "sharpe": 0.01944277820053597
+  },
+  "where_it_loses": {
+    "worst_symbols": {
+      "BTC-USD": 0.0,
+      "XLE": 0.0,
+      "TLT": 0.0
+    },
+    "worst_window": {
+      "start": "2015-01-14",
+      "end": "2017-01-23",
+      "variant": "base",
+      "return": -0.015319101022084669,
+      "sharpe": -0.30440432322010413
+    }
+  },
+  "checks": {
+    "prediction_failure_terms": {
+      "passed": true,
+      "detail": "Sharpe 0.47 (fails below 0.25), drawdown 6.1% (fails above 15%)"
+    },
+    "deflated_sharpe": {
+      "passed": false,
+      "detail": "0.290 against 0.95 (1 variations of the idea, 19 on the market)"
+    },
+    "walk_forward": {
+      "passed": true,
+      "detail": "60% of 5 windows made money"
+    },
+    "double_costs": {
+      "passed": true,
+      "detail": "Sharpe 0.45 at twice the trading costs"
+    },
+    "delayed_fills": {
+      "passed": true,
+      "detail": "Sharpe 0.42 with fills one day late"
+    },
+    "worst_periods": {
+      "passed": true,
+      "detail": "worst result in the market's 5 worst stretches: -2.8%"
+    }
+  },
+  "verdict": "fail"
+}

@@ -1,0 +1,30 @@
+{
+  "name": "pa_long_crypto_only_h16",
+  "version": "1.0.0",
+  "hypothesis": "Go long crypto (BTC-USD, ETH-USD) only when a short-term 50-day vs 200-day moving-average cross turns positive, after a deep drawdown, and hold until the cross reverses.",
+  "market": [
+    "BTC-USD",
+    "ETH-USD"
+  ],
+  "entry": {
+    "rule": "ma_cross",
+    "fast": 50,
+    "slow": 200,
+    "enter": 0.02,
+    "exit": 0.0,
+    "direction": "long"
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 60,
+    "position_vol": 0.05
+  },
+  "risk": {
+    "max_position_pct": 0.3,
+    "max_open_positions": 2,
+    "max_gross": 0.6,
+    "stop_loss_pct": 0.2,
+    "take_profit_pct": null,
+    "max_holding_days": null
+  }
+}

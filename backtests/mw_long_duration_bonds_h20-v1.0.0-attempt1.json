@@ -1,0 +1,210 @@
+{
+  "hypothesis_id": 20,
+  "idea": "Buy long-duration bonds (TLT) and credit (LQD) when they have fallen sharply over a short window and the stock-bond correlation is only mildly positive, betting on mean reversion in rates.",
+  "strategy": {
+    "name": "mw_long_duration_bonds_h20",
+    "version": "1.0.0",
+    "hypothesis": "Buy long-duration bonds (TLT) and credit (LQD) when they have fallen sharply over a short window and the stock-bond correlation is only mildly positive, betting on mean reversion in rates.",
+    "market": [
+      "TLT",
+      "LQD"
+    ],
+    "risk": {
+      "max_position_pct": 0.5,
+      "max_open_positions": 2,
+      "max_gross": 1.0,
+      "stop_loss_pct": 0.06,
+      "take_profit_pct": 0.05,
+      "max_holding_days": 20
+    }
+  },
+  "strategy_file": "strategies/mw_long_duration_bonds_h20.json",
+  "attempt": 1,
+  "revisions_used": 0,
+  "revisions_allowed": 5,
+  "development_period": [
+    "2012-01-03",
+    "2023-02-17"
+  ],
+  "sealed_period": "sealed; not used by this test",
+  "out_of_sample_from": "2013-01-04",
+  "result": {
+    "start": "2013-01-04",
+    "end": "2023-02-17",
+    "years": 10.115079365079366,
+    "total_return": -0.02261212201724727,
+    "cagr": -0.0022585940293109452,
+    "annual_vol": 0.010089179833619906,
+    "sharpe": -0.2190711996540509,
+    "sharpe_t_stat": -0.69673869993866,
+    "max_drawdown": 0.038963917653636826,
+    "profit_factor": 0.9331226467832184,
+    "annual_turnover": 2.9281067225168513,
+    "cost_bps_of_traded": 1.7386345652376127,
+    "annual_cost_drag": 0.0005090907558472417,
+    "daily_win_rate": 0.15613966261278933,
+    "trades": 115,
+    "trade_win_rate": 0.6521739130434783,
+    "mean_trade_pct": -0.00019119475066692944
+  },
+  "walk_forward": [
+    {
+      "start": "2013-01-04",
+      "end": "2015-01-13",
+      "variant": "base",
+      "return": -0.009423367733939592,
+      "sharpe": -0.4369755350694451
+    },
+    {
+      "start": "2015-01-14",
+      "end": "2017-01-23",
+      "variant": "base",
+      "return": 0.003589606014317681,
+      "sharpe": 0.22071165067345044
+    },
+    {
+      "start": "2017-01-24",
+      "end": "2019-02-01",
+      "variant": "base",
+      "return": 0.005885364865642728,
+      "sharpe": 0.3395258466485044
+    },
+    {
+      "start": "2019-02-04",
+      "end": "2021-02-10",
+      "variant": "base",
+      "return": 0.006953571794497515,
+      "sharpe": 0.3926449598482056
+    },
+    {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": -0.029345262110355708,
+      "sharpe": -1.099577140887568
+    }
+  ],
+  "positive_windows": 0.6,
+  "deflated_sharpe": {
+    "variations_of_idea": 1,
+    "attempts_on_market": 22,
+    "for_idea": 0.24219594871,
+    "for_market": 0.0006432294808549372,
+    "value": 0.0006432294808549372,
+    "variance_of_attempt_sharpes": 0.0006554696478269564
+  },
+  "breaker": {
+    "double_costs": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": -0.027627230334189568,
+      "cagr": -0.00276589797330129,
+      "annual_vol": 0.010087908131279228,
+      "sharpe": -0.26951452781344504,
+      "sharpe_t_stat": -0.8571697330359199,
+      "max_drawdown": 0.041061216611429585,
+      "profit_factor": 0.9185934526579775,
+      "daily_win_rate": 0.15535504119262455
+    },
+    "delayed_fills": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": -0.004501486929587739,
+      "cagr": -0.0004459325475206777,
+      "annual_vol": 0.009671050086659463,
+      "sharpe": -0.04128567741108711,
+      "sharpe_t_stat": -0.1313058460030934,
+      "max_drawdown": 0.03404633469716789,
+      "profit_factor": 0.9872582132574217,
+      "daily_win_rate": 0.15849352687328364
+    },
+    "worst_periods": [
+      {
+        "start": "2022-07-27",
+        "end": "2022-10-24",
+        "market_return": -0.16016597040266822,
+        "strategy_return": -0.015360545306296935
+      },
+      {
+        "start": "2022-02-04",
+        "end": "2022-05-05",
+        "market_return": -0.14569514337283274,
+        "strategy_return": -0.00747941194408186
+      },
+      {
+        "start": "2020-12-16",
+        "end": "2021-03-18",
+        "market_return": -0.10503828469331677,
+        "strategy_return": -0.013309582721757751
+      },
+      {
+        "start": "2013-05-03",
+        "end": "2013-08-01",
+        "market_return": -0.10462624405052678,
+        "strategy_return": -0.01412855745677255
+      },
+      {
+        "start": "2016-09-02",
+        "end": "2016-12-01",
+        "market_return": -0.10112273156269913,
+        "strategy_return": -0.0036489486490147716
+      }
+    ]
+  },
+  "prediction": {
+    "annual_return": 0.03,
+    "win_rate": 0.55,
+    "sharpe": 0.4,
+    "fail_if_sharpe_below": 0.2,
+    "fail_if_drawdown_above": 0.15,
+    "notes": ""
+  },
+  "versus_prediction": {
+    "annual_return": -0.032258594029310944,
+    "win_rate": 0.10217391304347823,
+    "sharpe": -0.6190711996540509
+  },
+  "where_it_loses": {
+    "worst_symbols": {
+      "LQD": -0.01699500733902863,
+      "TLT": -0.00021234057879265106,
+      "XLK": 0.0
+    },
+    "worst_window": {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": -0.029345262110355708,
+      "sharpe": -1.099577140887568
+    }
+  },
+  "checks": {
+    "prediction_failure_terms": {
+      "passed": false,
+      "detail": "Sharpe -0.22 (fails below 0.20), drawdown 3.9% (fails above 15%)"
+    },
+    "deflated_sharpe": {
+      "passed": false,
+      "detail": "0.001 against 0.95 (1 variations of the idea, 22 on the market)"
+    },
+    "walk_forward": {
+      "passed": true,
+      "detail": "60% of 5 windows made money"
+    },
+    "double_costs": {
+      "passed": false,
+      "detail": "Sharpe -0.27 at twice the trading costs"
+    },
+    "delayed_fills": {
+      "passed": false,
+      "detail": "Sharpe -0.04 with fills one day late"
+    },
+    "worst_periods": {
+      "passed": true,
+      "detail": "worst result in the market's 5 worst stretches: -1.5%"
+    }
+  },
+  "verdict": "fail"
+}

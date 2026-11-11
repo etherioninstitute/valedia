@@ -1,0 +1,30 @@
+{
+  "name": "mw_long_energy_commodities_h19",
+  "version": "1.0.0",
+  "hypothesis": "Go long energy (XLE) and commodities (DBC) on a 12-month momentum signal that skips the latest month, using inverse-volatility sizing, as the energy-vs-market and commodity trend persists.",
+  "market": [
+    "XLE",
+    "DBC"
+  ],
+  "entry": {
+    "rule": "momentum",
+    "enter": 0.1,
+    "exit": 0.0,
+    "direction": "long",
+    "lookback": 252,
+    "skip": 21
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 63,
+    "position_vol": 0.02
+  },
+  "risk": {
+    "max_position_pct": 0.5,
+    "max_open_positions": 2,
+    "max_gross": 1.0,
+    "stop_loss_pct": 0.12,
+    "take_profit_pct": null,
+    "max_holding_days": null
+  }
+}

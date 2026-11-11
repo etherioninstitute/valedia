@@ -1,0 +1,210 @@
+{
+  "hypothesis_id": 16,
+  "idea": "Go long crypto (BTC-USD, ETH-USD) only when a short-term 50-day vs 200-day moving-average cross turns positive, after a deep drawdown, and hold until the cross reverses.",
+  "strategy": {
+    "name": "pa_long_crypto_only_h16",
+    "version": "1.0.0",
+    "hypothesis": "Go long crypto (BTC-USD, ETH-USD) only when a short-term 50-day vs 200-day moving-average cross turns positive, after a deep drawdown, and hold until the cross reverses.",
+    "market": [
+      "BTC-USD",
+      "ETH-USD"
+    ],
+    "risk": {
+      "max_position_pct": 0.3,
+      "max_open_positions": 2,
+      "max_gross": 0.6,
+      "stop_loss_pct": 0.2,
+      "take_profit_pct": null,
+      "max_holding_days": null
+    }
+  },
+  "strategy_file": "strategies/pa_long_crypto_only_h16.json",
+  "attempt": 1,
+  "revisions_used": 0,
+  "revisions_allowed": 5,
+  "development_period": [
+    "2012-01-03",
+    "2023-02-17"
+  ],
+  "sealed_period": "sealed; not used by this test",
+  "out_of_sample_from": "2013-01-04",
+  "result": {
+    "start": "2013-01-04",
+    "end": "2023-02-17",
+    "years": 10.115079365079366,
+    "total_return": 0.676046873120902,
+    "cagr": 0.05238208271017086,
+    "annual_vol": 0.05054848748341016,
+    "sharpe": 1.035397528450678,
+    "sharpe_t_stat": 3.293000307806949,
+    "max_drawdown": 0.07989295687225184,
+    "profit_factor": 1.3263081621282344,
+    "annual_turnover": 0.4898062587306631,
+    "cost_bps_of_traded": 32.613675191436755,
+    "annual_cost_drag": 0.001597438222897468,
+    "daily_win_rate": 0.2734405649274225,
+    "trades": 11,
+    "trade_win_rate": 0.45454545454545453,
+    "mean_trade_pct": 3.1906295036654684
+  },
+  "walk_forward": [
+    {
+      "start": "2013-01-04",
+      "end": "2015-01-13",
+      "variant": "base",
+      "return": 0.0,
+      "sharpe": 0.0
+    },
+    {
+      "start": "2015-01-14",
+      "end": "2017-01-23",
+      "variant": "base",
+      "return": 0.08892050404973073,
+      "sharpe": 1.1654062550861612
+    },
+    {
+      "start": "2017-01-24",
+      "end": "2019-02-01",
+      "variant": "base",
+      "return": 0.24882888026165362,
+      "sharpe": 1.80746923481448
+    },
+    {
+      "start": "2019-02-04",
+      "end": "2021-02-10",
+      "variant": "base",
+      "return": 0.2238002555859091,
+      "sharpe": 1.4941769791969424
+    },
+    {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": 0.007109079800525997,
+      "sharpe": 0.09197022794322553
+    }
+  ],
+  "positive_windows": 0.8,
+  "deflated_sharpe": {
+    "variations_of_idea": 1,
+    "attempts_on_market": 18,
+    "for_idea": 0.999500153637077,
+    "for_market": 0.8882867223719286,
+    "value": 0.8882867223719286,
+    "variance_of_attempt_sharpes": 0.0004913147570394708
+  },
+  "breaker": {
+    "double_costs": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.6492137528439423,
+      "cagr": 0.050704273271305667,
+      "annual_vol": 0.050521528418949496,
+      "sharpe": 1.0043363468054065,
+      "sharpe_t_stat": 3.194212665468474,
+      "max_drawdown": 0.08224050546286554,
+      "profit_factor": 1.314910381607541,
+      "daily_win_rate": 0.27304825421734014
+    },
+    "delayed_fills": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.7127395758803099,
+      "cagr": 0.054637628310917785,
+      "annual_vol": 0.05085835840731341,
+      "sharpe": 1.0715008483132225,
+      "sharpe_t_stat": 3.407824073706903,
+      "max_drawdown": 0.07593914528141799,
+      "profit_factor": 1.3397739937020088,
+      "daily_win_rate": 0.2738328756375049
+    },
+    "worst_periods": [
+      {
+        "start": "2022-03-31",
+        "end": "2022-06-30",
+        "market_return": -0.634355355991192,
+        "strategy_return": 0.0
+      },
+      {
+        "start": "2018-01-10",
+        "end": "2018-04-11",
+        "market_return": -0.5974964621369974,
+        "strategy_return": -0.050664729574346534
+      },
+      {
+        "start": "2014-10-15",
+        "end": "2015-01-14",
+        "market_return": -0.5557088357932438,
+        "strategy_return": 0.0
+      },
+      {
+        "start": "2018-09-17",
+        "end": "2018-12-14",
+        "market_return": -0.5516854676732112,
+        "strategy_return": 0.0
+      },
+      {
+        "start": "2018-05-15",
+        "end": "2018-08-13",
+        "market_return": -0.4635165707524943,
+        "strategy_return": -0.0030694342879004077
+      }
+    ]
+  },
+  "prediction": {
+    "annual_return": 0.15,
+    "win_rate": 0.42,
+    "sharpe": 0.6,
+    "fail_if_sharpe_below": 0.2,
+    "fail_if_drawdown_above": 0.35,
+    "notes": ""
+  },
+  "versus_prediction": {
+    "annual_return": -0.09761791728982913,
+    "win_rate": 0.034545454545454546,
+    "sharpe": 0.43539752845067803
+  },
+  "where_it_loses": {
+    "worst_symbols": {
+      "LQD": 0.0,
+      "XLK": 0.0,
+      "XLF": 0.0
+    },
+    "worst_window": {
+      "start": "2013-01-04",
+      "end": "2015-01-13",
+      "variant": "base",
+      "return": 0.0,
+      "sharpe": 0.0
+    }
+  },
+  "checks": {
+    "prediction_failure_terms": {
+      "passed": true,
+      "detail": "Sharpe 1.04 (fails below 0.20), drawdown 8.0% (fails above 35%)"
+    },
+    "deflated_sharpe": {
+      "passed": false,
+      "detail": "0.888 against 0.95 (1 variations of the idea, 18 on the market)"
+    },
+    "walk_forward": {
+      "passed": true,
+      "detail": "80% of 5 windows made money"
+    },
+    "double_costs": {
+      "passed": true,
+      "detail": "Sharpe 1.00 at twice the trading costs"
+    },
+    "delayed_fills": {
+      "passed": true,
+      "detail": "Sharpe 1.07 with fills one day late"
+    },
+    "worst_periods": {
+      "passed": true,
+      "detail": "worst result in the market's 5 worst stretches: -5.1%"
+    }
+  },
+  "verdict": "fail"
+}

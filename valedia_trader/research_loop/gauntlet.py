@@ -319,11 +319,13 @@ class Gauntlet:
                                   "sharpe": sharpe - prediction.sharpe},
             "where_it_loses": {"worst_symbols": {k: float(v) for k, v in contrib.head(3).items()},
                                "worst_window": min(per_window, key=lambda w: w["return"])},
+            "exits": _exit_reasons(events_used),
             "checks": {k: {"passed": ok, "detail": d} for k, (ok, d) in checks.items()},
             "verdict": "pass (development); sealed test pending" if passed else "fail",
         }
         regime = market_regime(dev[[m for m in strategy.market if m in dev.columns]].iloc[oos], dev)
-        ledger.record_backtest(hypothesis_id, _clean({k: report[k] for k in ("result", "positive_windows", "deflated_sharpe", "checks", "verdict")}),
+        ledger.record_backtest(hypothesis_id, _clean({k: report[k] for k in ("result", "positive_windows", "deflated_sharpe", "checks", "verdict",
+                                                                             "walk_forward", "where_it_loses", "exits")}),
                                regime, strategy_file, strategy.version, "untested" if passed else "failed")
         if not passed:
             failed = "; ".join(f"{k}: {d}" for k, (ok, d) in checks.items() if not ok)
@@ -331,6 +333,40 @@ class Gauntlet:
                               f"Largest losses came from {', '.join(contrib.head(3).index)}.", "gauntlet")
         self._save(self._report_path(strategy, f"attempt{report['attempt']}"), report)
         return report
+
+    def probe(self, hypothesis_id: int, version: str, candidates: dict[str, Strategy]) -> dict[str, dict]:
+        """Run candidate rewrites of an idea on the development period and return how each behaved:
+        score (out-of-sample Sharpe), per-window Sharpe, drawdown, trades and turnover. Every probe is
+        a counted variation under `version`, so probing raises the Deflated Sharpe bar and spends a
+        revision exactly as a full rewrite would."""
+        c, ledger = self.criteria, self.ledger
+        read_prediction(ledger, self.paths, hypothesis_id, next(iter(candidates.values())).name)
+        if ledger.sealed_used(hypothesis_id):
+            raise SealedPeriodUsed(f"hypothesis {hypothesis_id} has seen its sealed result; it is not revised any more")
+        known = {a["strategy_version"] for a in ledger.attempts(hypothesis_id)}
+        if version not in known and known and ledger.revisions(hypothesis_id) >= c.max_revisions:
+            ledger.set_status(hypothesis_id, "failed", f"needed more than {c.max_revisions} rewrites to pass", "gauntlet")
+            raise RevisionCapReached(f"hypothesis {hypothesis_id} has used its {c.max_revisions} revisions")
+        dev, dollar = self.dev_prices, self.dev_dollar_volume
+        windows = [idx for idx in np.array_split(np.arange(c.warmup_days, len(dev)), c.walk_forward_windows) if len(idx)]
+        oos = slice(windows[0][0], None)
+        out = {}
+        for label, s in candidates.items():
+            leaks = research.detect_lookahead(s.target_weights, dev.iloc[-min(len(dev), 900):], n_checks=3)
+            if leaks:
+                raise GauntletError(f"{s.name} ({label}) uses future data in columns {leaks}")
+            w, events = run_rules(s, dev)
+            res = run_backtest(dev, w, self.cost, dollar, capital=self.capital)
+            net = res.net.iloc[oos]
+            stats = _stats(net, res.turnover.iloc[oos], res.costs.iloc[oos])
+            ledger.record_attempt(hypothesis_id, "probe", _sharpe(net), int(net.notna().sum()), version,
+                                  {"variant": label, "sha": _fingerprint(s), "spec": _spec_of(s)})
+            in_span = [e for e in events if e["date"] >= dev.index[windows[0][0]]]
+            out[label] = {"score": stats.get("sharpe", float("nan")), "drawdown": stats.get("max_drawdown", float("nan")),
+                          "total_return": stats.get("total_return", float("nan")), "turnover": stats.get("annual_turnover", float("nan")),
+                          "tasks": {f"w{i + 1}": _sharpe(res.net.iloc[idx]) * math.sqrt(252.0) for i, idx in enumerate(windows)},
+                          **_trade_stats(in_span, dev.index[windows[0][0]], dev.index[-1]), "exits": _exit_reasons(in_span)}
+        return out
 
     def _deflated(self, net: pd.Series, hypothesis_id: int, market: str) -> dict:
         r = net.dropna().to_numpy(dtype=float)
@@ -409,6 +445,15 @@ def _clean(obj):
     if isinstance(obj, (np.integer, np.bool_)):
         return obj.item()
     return obj
+
+
+def _exit_reasons(events: list[dict]) -> dict:
+    """How positions were closed: count and mean result per kind of exit."""
+    groups: dict[str, list[float]] = {}
+    for e in events:
+        if e["action"] == "exit":
+            groups.setdefault(str(e["reason"]).split(":")[0], []).append(float(e["pnl_pct"]))
+    return {k: {"count": len(v), "mean_pnl_pct": float(np.mean(v))} for k, v in groups.items()}
 
 
 def _spec_of(strategy: Strategy) -> dict:

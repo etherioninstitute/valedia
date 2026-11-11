@@ -234,8 +234,8 @@ class PaperTrader:
                     why_now = "rebalance to the strategy's target weight"
                 reasoning = f"{why_now}; target weight {float(weights[sym].iloc[-1]):+.3f} of the strategy's capital"
                 entry = {"type": "decision", "hypothesis_id": hid, "strategy": s.name, "version": s.version, "symbol": sym,
-                         "market_conditions": cond, "order": order, "decision": "placed" if ok else "blocked",
-                         "risk_check": why, "reasoning": reasoning}
+                         "market_conditions": cond, "order": order, "account": dict(account),
+                         "decision": "placed" if ok else "blocked", "risk_check": why, "reasoning": reasoning}
                 if ok:
                     placed += 1
                     self.state["pending"].append({"strategy": s.name, "version": s.version, "symbol": sym, "units": delta,

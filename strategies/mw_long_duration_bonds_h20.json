@@ -1,0 +1,30 @@
+{
+  "name": "mw_long_duration_bonds_h20",
+  "version": "1.0.0",
+  "hypothesis": "Buy long-duration bonds (TLT) and credit (LQD) when they have fallen sharply over a short window and the stock-bond correlation is only mildly positive, betting on mean reversion in rates.",
+  "market": [
+    "TLT",
+    "LQD"
+  ],
+  "entry": {
+    "rule": "reversion",
+    "enter": 1.0,
+    "exit": 0.0,
+    "direction": "long",
+    "lookback": 10,
+    "vol_window": 126
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 63,
+    "position_vol": 0.01
+  },
+  "risk": {
+    "max_position_pct": 0.5,
+    "max_open_positions": 2,
+    "max_gross": 1.0,
+    "stop_loss_pct": 0.06,
+    "take_profit_pct": 0.05,
+    "max_holding_days": 20
+  }
+}

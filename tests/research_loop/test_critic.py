@@ -1,0 +1,117 @@
+import json
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from valedia_trader.research_loop import critic as cr
+from valedia_trader.research_loop import ledger as lg
+from valedia_trader.research_loop.paper import Journal
+
+LIMITS = {"max_daily_loss_pct": 2.0, "max_drawdown_pct": 8.0, "max_position_pct": 0.10, "max_open_positions": 5}
+
+
+@pytest.fixture
+def desk(tmp_path):
+    limits = tmp_path / "risk.json"
+    limits.write_text(json.dumps(LIMITS))
+    ledger = lg.HypothesisLedger()
+    hid = ledger.propose("Assets that rose keep rising for a while", "price-analyst", "us-etf")
+    ledger.register_prediction(hid, "prediction", {"annual_return": 0.10, "win_rate": 0.55, "sharpe": 0.9,
+                                                   "fail_if_sharpe_below": 0.3, "fail_if_drawdown_above": 0.2})
+    ledger.record_backtest(hid, {"result": {"cagr": 0.10, "annual_vol": 0.08, "max_drawdown": 0.06, "sharpe": 1.2}, "verdict": "pass"},
+                           "trending up", "strategies/mom.json", "1.0.0", "untested")
+    ledger.record_sealed(hid, {"verdict": "pass"}, "passed backtest only")
+    return ledger, Journal(tmp_path / "journal"), limits, hid
+
+
+def summaries(journal, start, daily_returns, name="mom"):
+    days = pd.bdate_range(start, periods=len(daily_returns))
+    for d, r in zip(days, daily_returns):
+        journal.write(d, {"type": "summary", "strategy_value_change": {name: r * 50_000.0}, "capital_per_strategy": 50_000.0})
+    return days
+
+
+def fill(journal, day, pnl, symbol="SPY", regime="choppy", reason="exit: stop loss: -10.0% against the position"):
+    journal.write(day, {"type": "fill", "strategy": "mom", "version": "1.0.0", "symbol": symbol, "units": -1.0, "price": 100.0,
+                        "fee": 0.1, "realized_pnl": pnl, "entry_conditions": {"regime": regime}, "reason": reason})
+
+
+def test_too_few_days_is_said_plainly_and_nothing_is_paused(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [0.001, -0.002, 0.0005, 0.001, -0.0005])
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert any("too few to judge" in f for f in out["findings"]) and ledger.get(hid)["status"] == "passed backtest only"
+    text = (journal.dir / f"review-{days[-1].date()}.md").read_text()
+    assert text.startswith("# Critic's review") and "### mom (passed backtest only)" in text and "Nothing to report." in text
+    assert ledger.get(hid)["paper_trading_result"]["days"] == 5 and "too few to judge" in ledger.get(hid)["lessons_learned"]
+
+
+def test_a_strategy_far_below_its_backtest_is_paused_and_the_ledger_says_why(desk):
+    ledger, journal, limits, hid = desk
+    rng = np.random.default_rng(0)
+    days = summaries(journal, "2026-09-01", (-0.002 + 0.004 * rng.standard_normal(30)).tolist())
+    for d in days[-4:-1]:
+        fill(journal, d, -120.0)
+    fill(journal, days[-1], 40.0, reason="exit: exit rule")
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    notes = " ".join(out["findings"])
+    assert "PAUSE mom" in notes and ledger.get(hid)["status"] == "paused"
+    assert "worse" in notes and "the prediction said 55%" in notes
+    assert "3 of mom's 3 losing trades this week were opened in a choppy market" in notes
+    assert "Repeating mistake: mom lost 3 times this week on SPY" in notes
+    assert "Repeating mistake: mom lost 3 times this week with the same exit exit: stop loss" in notes
+    h = ledger.get(hid)
+    assert "status -> paused" in h["lessons_learned"] and h["paper_trading_result"]["z_vs_backtest"] < -2
+    dry = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    assert dry["strategies"]["mom"]["result"]["status"] == "paused"
+
+
+def test_a_strategy_that_holds_up_for_weeks_passes_paper(desk):
+    ledger, journal, limits, hid = desk
+    rng = np.random.default_rng(1)
+    days = summaries(journal, "2026-09-01", (0.0006 + 0.003 * rng.standard_normal(25)).tolist())
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed paper" and out["strategies"]["mom"]["result"]["days"] == 25
+    assert not any("PAUSE" in f for f in out["findings"])
+
+
+def test_drawdown_deeper_than_the_whole_backtest_pauses_at_once(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [-0.03, -0.03, -0.02])
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "paused" and "deeper than the worst drawdown" in ledger.get(hid)["lessons_learned"]
+
+
+def test_an_order_that_got_past_the_limits_is_the_first_thing_reported(desk):
+    ledger, journal, limits, hid = desk
+    day = pd.Timestamp("2026-11-06")
+    account = {"equity": 100_000.0, "daily_loss_pct": 0.1, "drawdown_pct": 0.5, "open_positions": 1}
+    journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": "mom", "version": "1.0.0", "symbol": "SPY",
+                        "order": {"value": 40_000.0}, "account": account, "decision": "placed", "risk_check": "OK"})
+    journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": "mom", "version": "1.0.0", "symbol": "QQQ",
+                        "order": {"value": 4_000.0}, "account": account, "decision": "placed", "risk_check": "OK"})
+    for _ in range(3):
+        journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": "mom", "symbol": "TLT", "order": {"value": 1.0},
+                            "account": account, "decision": "blocked", "risk_check": "Too many open positions."})
+    journal.write(day, {"type": "kill_switch", "decision": "latched", "reasoning": "drawdown 8.20% reached the limit"})
+    out = cr.weekly_review(ledger, journal, day, {hid: "mom"}, limits)
+    assert out["kill_switch_failures"] == 1 and out["findings"][0].startswith("KILL SWITCH FAILURE: an order for SPY")
+    text = (journal.dir / "review-2026-11-06.md").read_text()
+    assert text.index("## Fix first") < text.index("## Strategies") and ledger.get(hid)["status"] == "paused"
+    assert "refused 3 orders this week for the same reason: Too many open positions." in text and "Kill switch latched" in text
+    assert any(f["hypothesis_id"] is None for f in ledger.findings())
+
+
+def test_narrator_gets_the_facts_and_cannot_break_the_review(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [0.001, 0.002])
+    seen = []
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, narrator=lambda p: seen.append(p) or "Nothing is proven yet.")
+    text = (journal.dir / f"review-{days[-1].date()}.md").read_text()
+    assert "Nothing is proven yet." in text and "written by a model from the numbers above" in text and "### mom" in seen[0]
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, narrator=lambda p: 1 / 0)
+    assert "(The narrator failed: ZeroDivisionError.)" in (journal.dir / f"review-{days[-1].date()}.md").read_text()
+    limits.write_text("{broken")
+    out = cr.weekly_review(ledger, journal, days[-1], {}, limits)
+    assert "could not be read" in out["findings"][0] and "No strategy is in paper trading." in (journal.dir / f"review-{days[-1].date()}.md").read_text()
