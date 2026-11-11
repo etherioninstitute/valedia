@@ -247,6 +247,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("paper-step")
     p.add_argument("--refresh", action="store_true", help="download the latest prices first")
     p.add_argument("--alpaca", action="store_true", help="also mirror orders to the Alpaca paper account")
+    p.add_argument("--webull", action="store_true", help="also mirror orders to Webull's test environment (never production)")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -320,6 +321,11 @@ def main(argv=None) -> int:
                 from valedia_trader.core.secrets import load_env, secret
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
+            if getattr(args, "webull", False):
+                from valedia_trader.venues.webull import WebullError, WebullVenue
+                venue = WebullVenue.from_secrets()
+                if venue.environment != "sandbox":             # the mirror is for the test environment only
+                    raise WebullError("paper-step --webull mirrors to Webull's test environment; set WEBULL_ENV=sandbox")
             trader = paper_trader(paths, venue=venue)
             if not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")

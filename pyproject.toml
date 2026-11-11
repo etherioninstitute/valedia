@@ -51,6 +51,7 @@ mirofish = ["neo4j>=5.20", "tokenizers>=0.19"]
 memory = ["openai>=1.40"]
 forecast = ["timesfm[torch]>=3.0.2"]
 paper = ["alpaca-py>=0.33"]
+webull = ["webull-openapi-python-sdk>=3.0.4"]
 
 [dependency-groups]
 dev = ["pytest>=8.2", "pytest-timeout>=2.3", "ruff>=0.6"]

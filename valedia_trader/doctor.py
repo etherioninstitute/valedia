@@ -147,6 +147,15 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
             notes.append(f"{label}: key on file"); ready += 1
         else:
             notes.append(f"{label}: a key is on file but it is not a paper key; the paper venue refuses it")
+    try:
+        from valedia_trader.venues.webull import LIVE_CONFIRMATION, load_live_confirmation
+        import os
+        if os.environ.get("WEBULL_APP_KEY"):
+            env = (os.environ.get("WEBULL_ENV") or "sandbox").lower()
+            live = load_live_confirmation(LIVE_CONFIRMATION) is not None
+            notes.append(f"Webull environment {env}; real-money orders " + ("CONFIRMED in config/webull_live.json" if live and env == "production" else "off"))
+    except Exception:
+        pass
     notes.append("the built-in paper book needs no key")
     return (OK if ready else ATTENTION), "; ".join(notes)
 
