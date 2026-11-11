@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nimble System One shadow client; unavailable until an LM Studio typed adapter is reviewed.
+"""Nimble System One shadow client. Loopback Ollama only. Fail-open.
 
 VALEDIA_SYSTEMONE=1 turns the movers scan onto POST /v1/systemone.
 Default off. Model pin is Nimble 2 (Bespoke-Nimble-9B-v2, 8192 ctx).
@@ -53,9 +53,13 @@ def _bounded_json(resp):
     return value
 
 def _steward_decision_post(payload, timeout):
-    """Nimble typed protocol has no verified LM Studio implementation; fail closed."""
-    raise RuntimeError("systemone_unavailable_lmstudio_protocol: disable VALEDIA_SYSTEMONE; "
-                       "Nimble typed /v1/systemone needs a separately reviewed LM Studio adapter")
+    """Nimble v3 typed decision through loopback Ollama: no redirects, bounded response."""
+    _check_url(DECIDE_URL)
+    data = json.dumps(payload, allow_nan=False).encode()
+    req = urllib.request.Request(
+        DECIDE_URL, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with _HTTP.open(req, timeout=timeout) as resp:
+        return _bounded_json(resp)
 
 def synthetic_smoke(get=None):
     """One exact, nonfinancial fixture through the same admitted client path."""
@@ -152,14 +156,13 @@ _INFORMED_PATHS = (
 
 
 def enabled():
-    # No verified LM Studio implementation of Nimble's typed System One protocol.
-    # Keep this optional advisory path unavailable; never silently use Ollama.
-    return False
+    # Explicit opt-in only (owner direction 2026-11-10: serve Nimble through Ollama). Shadow path.
+    return os.environ.get("VALEDIA_SYSTEMONE") == "1"
 
 
 def verify_digest(get=None, timeout=3.0, force=False):
-    """Legacy Ollama provenance cannot authorize LM Studio serving."""
-    return "systemone_unavailable_lmstudio_protocol"
+    """Verify the model digest via /api/tags (see systemone_pin). Cached per process."""
+    return _pin.verify_digest(get or _get, timeout, force)
 
 
 
@@ -325,11 +328,19 @@ def _check_url(url):
 
 
 def _post(url, payload, timeout):
-    raise RuntimeError("systemone_unavailable_lmstudio_protocol")
+    _check_url(url)
+    data = json.dumps(payload, allow_nan=False).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with _HTTP.open(req, timeout=timeout) as resp:
+        return _bounded_json(resp)
 
 
 def _get(url, timeout):
-    raise RuntimeError("systemone_unavailable_lmstudio_protocol")
+    _check_url(url)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with _HTTP.open(req, timeout=timeout) as resp:
+        return _bounded_json(resp)
 
 
 def _response_model_ok(body, pin):
@@ -350,9 +361,9 @@ def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=
     error is None only when a model answer came back from an allowed pin.
     """
     # Direct callers, including synthetic_smoke, must not bypass enabled().
-    # Never invoke injected post/get hooks or the old Ollama URL on either flag state.
-    return {"pin": None, "body": None, "error": "systemone_unavailable_lmstudio_protocol",
-            "answers": None, "cold": True, "latency_ms": 0.0, "within_budget": False}
+    if not enabled():
+        return {"pin": None, "body": None, "error": "systemone_disabled",
+                "answers": None, "cold": True, "latency_ms": 0.0, "within_budget": False}
     global _WARM
     state = finite_tree(state)
     t0 = time.perf_counter()
@@ -456,9 +467,6 @@ def health(get=None, timeout=3.0):
     For the floating `nimble:latest` it also checks the digest pin against
     /api/tags and caches the verdict for this process (digest field).
     """
-    return {"ok": False, "error": "systemone_unavailable_lmstudio_protocol",
-            "version": None, "model_present": False, "model": None,
-            "digest": None, "mode": "shadow", "enforcement": "none"}
     fn = get or _get
     raw = _raw_model()
     try:
