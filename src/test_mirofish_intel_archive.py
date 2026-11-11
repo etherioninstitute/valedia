@@ -163,7 +163,7 @@ def test_wires_version_and_no_venue():
         text = open(os.path.join(HERE, name)).read()
         assert "load_for_fv" in text or "publish_fail" in text, name
     import valedia_config as vc
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
     got = {r["name"]: r for r in vc.controls_snapshot()["items"]}
     for n in ("MIROFISH_INTEL_AS_OF", "MIROFISH_INTEL_STALE", "MIROFISH_INTEL_USABLE_FOR_FV"):
         assert got[n]["source"] == "file", n

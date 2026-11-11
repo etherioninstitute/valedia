@@ -66,8 +66,8 @@ def test_hygiene_and_version():
     assert vc.VALEDIA_SELF_ADJUST is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
-    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
-    assert vc.version_stamp().startswith("v0.74.1 ")
+    assert vc.VALEDIA_VERSION == "0.75.0", vc.VALEDIA_VERSION
+    assert vc.version_stamp().startswith("v0.75.0 ")
     assert ar.ARENA_MODE == "paper"
 
 
@@ -183,7 +183,7 @@ def test_persist_cli_and_wrap():
     assert saved["arena_mode"] == "paper"
     assert saved["ln_refused"] is True
     assert saved["funded"] is False
-    assert saved["valedia_version"] == "0.74.1"
+    assert saved["valedia_version"] == "0.75.0"
     assert saved["ftl_score"]["n_scored"] >= 1
     fight_src = open(os.path.join(HERE, "adversarial_paper_fight.py")).read()
     assert "arena_stress" in fight_src

@@ -230,7 +230,7 @@ def test_rate_gate_and_version():
     c.get("/api/v1/me")
     c.get("/api/v1/me")
     assert slept and slept[0] > 0
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
 
 
 def main():

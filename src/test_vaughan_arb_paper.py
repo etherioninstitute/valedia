@@ -196,7 +196,7 @@ def test_fenced_oil_series_and_parsers():
     })
     assert k["yes_ask"] == 0.62 and k["no_ask"] == 0.40
     assert va.MODE == "PAPER/SHADOW"
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
 
 
 def test_retention_tail():

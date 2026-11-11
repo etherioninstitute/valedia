@@ -107,7 +107,7 @@ def _quiet():
 
 def test_hygiene_and_snapshot():
     _quiet()
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
     assert vc.INFORMED_BEFORE_CREATE is True
     assert vc.POLY_TAG_PRIOR_CREATE is False
     assert vc.POLYMARKET_US_LIVE is False

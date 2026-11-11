@@ -31,9 +31,9 @@ _CACHE_TTL = 600     # 10 min
 
 def _env_key():
     key = os.environ.get("FRED_API_KEY", "")
-    if not key:  # Valedia keeps secrets in ~/.openclaw/.env
+    if not key:  # Valedia keeps secrets in ~/.hermes/.env
         try:
-            for line in open(os.path.expanduser("~/.openclaw/.env")):
+            for line in open(os.path.expanduser("~/.hermes/.env")):
                 line = line.strip()
                 if line.startswith("FRED_API_KEY=") and "=" in line:
                     key = line.split("=", 1)[1].strip()

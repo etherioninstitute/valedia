@@ -301,15 +301,16 @@ def memory_status():
 
 if __name__ == "__main__":
     # Test the full memory system
-    import subprocess
-    r = subprocess.run(
-        "set -a && source /Users/burtonchatelain/.openclaw/.env && env",
-        shell=True, capture_output=True, text=True
-    )
-    for line in r.stdout.split("\n"):
-        if "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    _env_path = os.path.expanduser("~/.hermes/.env")
+    if os.path.isfile(_env_path):
+        with open(_env_path) as _fh:
+            for line in _fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.replace("export ", "", 1).strip()
+                os.environ.setdefault(k, v.strip().strip('"').strip("'"))
 
     print("=== VALEDIA MEMORY SYSTEM TEST ===")
     print()

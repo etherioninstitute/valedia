@@ -774,6 +774,7 @@ def run_brain(*, recovery=None):
                 # Last resort: direct API call for 30d prices
                 if prices is None or len(prices) < 20:
                     try:
+                        import requests
                         _r = requests.get(
                             f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart",
                             params={"vs_currency": "usd", "days": "30"},
@@ -1070,13 +1071,14 @@ def run_brain(*, recovery=None):
 if __name__ == "__main__":
     # Auto-source .env if keys not already in environment
     if not os.environ.get("ALPACA_API_KEY"):
-        import subprocess
-        r = subprocess.run(
-            f"set -a && source {SYS['env_file']} && env",
-            shell=True, capture_output=True, text=True
-        )
-        for line in r.stdout.split("\n"):
-            if "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k, v)
+        _env_path = SYS['env_file']
+        if os.path.isfile(_env_path):
+            with open(_env_path) as _fh:
+                for line in _fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.replace("export ", "", 1).strip()
+                    os.environ.setdefault(k, v.strip().strip('"').strip("'"))
     print(run_brain())

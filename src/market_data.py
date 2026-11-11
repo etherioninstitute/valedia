@@ -73,14 +73,14 @@ def morning_market_brief():
     summary = get_market_summary()
     for s in summary:
         arrow = "🟢" if s["change_pct"] > 0 else "🔴" if s["change_pct"] < 0 else "⚪"
-        lines.append(f"  {arrow} {s[name]}: ${s[price]:,.2f} ({s[change_pct]:+.2f}%)")
+        lines.append(f"  {arrow} {s['name']}: ${s['price']:,.2f} ({s['change_pct']:+.2f}%)")
     
     # Key technicals
     lines.append("\nKey Technicals:")
     for ticker in ["SPY", "BTC-USD"]:
         sigs = technical_signals(ticker)
         if "error" not in sigs:
-            lines.append(f"  {ticker}: RSI={sigs[rsi_14]} ({sigs[rsi_signal]}) | Trend={sigs[trend]}")
+            lines.append(f"  {ticker}: RSI={sigs['rsi_14']} ({sigs['rsi_signal']}) | Trend={sigs['trend']}")
     
     return "\n".join(lines)
 

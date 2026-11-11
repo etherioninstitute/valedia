@@ -34,7 +34,7 @@ class Sender(rest.Sender):
 def test_detector_flags_every_adversarial_string():
     for s in ADVERSARIAL:
         assert bool(sv.money_tokens(s)), s
-    for s in ("scan ok v0.74.1 host 100.125.9.30 12 markets", "Cron log is 130 min stale (>2h)",
+    for s in ("scan ok v0.75.0 host 100.125.9.30 12 markets", "Cron log is 130 min stale (>2h)",
               "You have 3 open bets", "Report at 23:00 UTC on 2026-10-01", "Cash App ready"):
         assert not bool(sv.money_tokens(s)), s
 

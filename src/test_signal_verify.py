@@ -164,7 +164,7 @@ def test_unsourced_and_arithmetic():
                    send_fn=send, now=NOW)
     assert r["status"] == "withheld" and "Total does not match sum of parts" in send.msgs[-1]
     # version stamps are not money figures
-    assert sv.unsourced_figures("x v0.74.1 abc", []) == []
+    assert sv.unsourced_figures("x v0.75.0 abc", []) == []
 
 
 def test_dedupe_same_message_once():

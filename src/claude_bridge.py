@@ -42,7 +42,7 @@ EXIT = {"verified": 0, "withheld": 3}  # anything else (error/dedupe) -> 4: rout
 def _broker_get():
     sys.path.insert(0, SCRIPTS_DIR)
     os.environ.setdefault('KALSHI_PRIVATE_KEY_PATH',
-                          '/Users/burtonchatelain/.openclaw/kalshi_private_key.pem')
+                          os.path.expanduser('~/.hermes/secrets/kalshi_private_key.pem'))
     from kalshi_auth import get
     return get
 

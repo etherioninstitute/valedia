@@ -55,8 +55,8 @@ def test_hygiene_and_version():
     assert vc.VALEDIA_SELF_ADJUST is False
     assert vc.NAUTILUS_LIVE is False
     assert vc.VENUE_WRITER["polymarket"] == "valedia"
-    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
-    assert vc.version_stamp().startswith("v0.74.1 ")
+    assert vc.VALEDIA_VERSION == "0.75.0", vc.VALEDIA_VERSION
+    assert vc.version_stamp().startswith("v0.75.0 ")
 
 
 def test_classify():

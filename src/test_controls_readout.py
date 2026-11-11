@@ -120,8 +120,8 @@ def _restore(name, prev):
 def test_defaults_and_shape():
     snap = vc.controls_snapshot()
     assert set(snap) >= {"version", "sha", "branch", "dirty", "items"}
-    assert snap["version"] == "0.74.1"
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert snap["version"] == "0.75.0"
+    assert vc.VALEDIA_VERSION == "0.75.0"
     assert not hasattr(vc, "VALEDIA_" + "JEV")  # Jev retired: Nimble 2 is the only model
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.systemone_enabled() is False
@@ -151,7 +151,7 @@ def test_defaults_and_shape():
     assert got["VIBE_BROKER_WRITE"]["value"] is False
     assert got["ETORO_KEYS"]["value"] in ("present", "missing")
     assert len(str(got["ETORO_KEYS"]["value"])) < 16
-    assert got["VALEDIA_VERSION"]["value"] == "0.74.1"
+    assert got["VALEDIA_VERSION"]["value"] == "0.75.0"
     assert got["POLY_LOOP_EDGE_PTS"]["value"] == 8.0
     assert got["POLY_LOOP_MAX_OPEN"]["value"] == 5
     assert got["POLY_LOOP_DD_STOP"]["value"] == 0.40
@@ -217,7 +217,7 @@ def test_halt_file_source():
 def test_panel_and_html():
     p = cockpit.panel()
     assert "controls" in p
-    assert p["controls"]["version"] == "0.74.1"
+    assert p["controls"]["version"] == "0.75.0"
     names = {r["name"] for r in p["controls"]["items"]}
     for n in REQUIRED:
         assert n in names, n

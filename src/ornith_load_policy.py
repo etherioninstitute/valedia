@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -304,8 +305,11 @@ def maybe_apply(cmd: str, purpose: str) -> int:
         return 2
     print(f"APPLY: executing (ORNITH_LOAD_APPLY=1 purpose={purpose})")
     print(f"CMD: {cmd}")
+    if any(ch in cmd for ch in ";|&<>$`\n"):
+        print("APPLY blocked: shell metacharacters in command", file=sys.stderr)
+        return 2
     try:
-        subprocess.check_call(cmd, shell=True)
+        subprocess.check_call(shlex.split(cmd))
     except subprocess.CalledProcessError as e:
         print(f"APPLY failed: exit={e.returncode}", file=sys.stderr)
         return e.returncode or 1

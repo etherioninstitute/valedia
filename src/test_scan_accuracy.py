@@ -46,7 +46,7 @@ def _opp(ticker, strategy, price, edge, title="t"):
 
 def test_hygiene_and_version():
     _restore_writers()
-    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.75.0", vc.VALEDIA_VERSION
     assert vc.WEATHER_LIVE is False
     import polymarket_us_client as pmu
     assert pmu.live_enabled() is False

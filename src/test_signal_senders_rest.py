@@ -210,7 +210,7 @@ def test_cron_runner_sends_only_fixed_lines():
     ops = os.path.join(d0, "ops.py")
     fail = os.path.join(d0, "fail.py")
     open(money, "w").write('print("Profit today: $24.94 (+3.10) on 5 bets")\n')
-    open(ops, "w").write('print("scan ok v0.74.1 host 100.125.9.30 12 markets")\n')
+    open(ops, "w").write('print("scan ok v0.75.0 host 100.125.9.30 12 markets")\n')
     open(fail, "w").write('import sys\nprint("lost twelve dollars"); sys.exit(1)\n')
     r, sent, d = _run_sh("cron_runner.sh", [money, "PNL"], {"openclaw": _OPENCLAW})
     assert r.returncode == 0, r.stderr

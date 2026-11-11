@@ -91,7 +91,7 @@ def gate(action, env=None, hedge=False):
 
 def load_key_file(path=None):
     """Return only the eToro key names. Other .env lines are ignored."""
-    path = path or os.path.expanduser("~/.openclaw/.env")
+    path = path or os.path.expanduser("~/.hermes/.env")
     found = {}
     try:
         fh = open(path)

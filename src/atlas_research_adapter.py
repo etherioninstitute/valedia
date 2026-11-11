@@ -1,7 +1,7 @@
 """Bounded offline research derived from ATLAS Janus; never an execution authority.
 
 Upstream cf4349f15c9d68a67042f792973372f2e0231088, General Intelligence
-Capital MIT framework scope. See docs/ATLAS-LICENSE.txt. No upstream runtime
+Capital MIT framework scope. See THIRD_PARTY.md. No upstream runtime
 imports, placeholder outcome scoring, provider calls, state or self-modification.
 """
 from __future__ import annotations

@@ -94,7 +94,7 @@ def test_wired_into_morning_go():
 
 
 def test_version_and_fence():
-    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.75.0", vc.VALEDIA_VERSION
     assert "OIL_BRACKET" in vc.LIVE_EXEC_FENCED
     assert "KXWTI" in vc.LIVE_EXEC_FENCED_SERIES and "KXOIL" in vc.LIVE_EXEC_FENCED_SERIES
     informed = open(os.path.join(HERE, "informed_before_create.py")).read()

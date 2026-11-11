@@ -90,7 +90,7 @@ def test_hygiene_and_fence():
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.MIROFISH_AUTO_RAISE is False
-    assert vc.VALEDIA_VERSION == "0.74.1", vc.VALEDIA_VERSION
+    assert vc.VALEDIA_VERSION == "0.75.0", vc.VALEDIA_VERSION
     cron = open(os.path.join(ROOT, "scripts", "install_cron.sh")).read()
     assert "polymarket_entertainment" not in cron
     cut = open(os.path.join(ROOT, "recommendations",

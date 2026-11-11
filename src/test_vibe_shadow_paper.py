@@ -44,7 +44,7 @@ def test_fixture_fee_and_fence():
         assert r["live"] is False
         assert r["filled"] is False
         assert r["counts_toward_kelly"] is False
-        assert r["valedia_version"] == "0.74.1"
+        assert r["valedia_version"] == "0.75.0"
     assert ftl._is_non_real_source("vibe_shadow_paper") is True
 
 
@@ -108,7 +108,7 @@ def test_inventory_and_source_hygiene():
     for bad in ("subprocess", "urllib", "requests", "pickle", "eval(", "exec(",
                 "shell=True", "import socket"):
         assert bad not in src, bad
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
 
 
 def test_kill_switch_and_empty():

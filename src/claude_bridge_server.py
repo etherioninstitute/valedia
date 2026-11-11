@@ -16,12 +16,25 @@ fixed "AI answer not sent to Signal" line), or claude_router.sh / --router.
 
 (c) GOATWORTHY Post LLC
 """
-import http.server, json, subprocess, os, sys, threading
+import hmac, http.server, json, subprocess, os, sys, threading
 from datetime import datetime, timezone
 
 PORT = 7878
 CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
-sys.path.insert(0, os.path.expanduser("~/.openclaw/workspace/scripts/integrations"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+BIND_HOST = os.environ.get("CLAUDE_BRIDGE_HOST", "100.125.9.30")
+MAX_BODY = 64 * 1024
+
+
+def bridge_token():
+    """Shared secret required on every request (env CLAUDE_BRIDGE_TOKEN)."""
+    return os.environ.get("CLAUDE_BRIDGE_TOKEN", "")
+
+
+def authorized(headers):
+    expected = bridge_token()
+    got = headers.get("X-Bridge-Token", "") or ""
+    return bool(expected) and hmac.compare_digest(got.encode(), expected.encode())
 
 
 def get_portfolio_context():
@@ -36,8 +49,21 @@ class ClaudeBridgeHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         
-        length = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
+        if not authorized(self.headers):
+            self.send_response(401)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if length < 0 or length > MAX_BODY:
+                raise ValueError('body too large')
+            body = json.loads(self.rfile.read(length)) if length else {}
+            if not isinstance(body, dict):
+                raise ValueError('body must be an object')
+        except (ValueError, json.JSONDecodeError):
+            self.send_response(400)
+            self.end_headers()
+            return
         
         question = body.get('question', 'What is my portfolio status?')
         model = body.get('model', 'sonnet')
@@ -94,9 +120,11 @@ class ClaudeBridgeHandler(http.server.BaseHTTPRequestHandler):
         pass  # Suppress access logs
 
 def run():
-    server = http.server.HTTPServer(('100.125.9.30', PORT), ClaudeBridgeHandler)
+    if not bridge_token():
+        raise SystemExit('CLAUDE_BRIDGE_TOKEN is not set; refusing to serve unauthenticated')
+    server = http.server.HTTPServer((BIND_HOST, PORT), ClaudeBridgeHandler)
     print(f"Claude Bridge Server listening on port {PORT}")
-    print(f"Endpoint: POST http://100.125.9.30:{PORT}/ask")
+    print(f"Endpoint: POST http://{BIND_HOST}:{PORT}/ask")
     print(f"Auth: Claude Max ({CLAUDE_BIN})")
     server.serve_forever()
 

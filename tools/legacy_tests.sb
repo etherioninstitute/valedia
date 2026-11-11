@@ -1,0 +1,9 @@
+(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (remote unix-socket))
+(deny file-write*)
+(allow file-write*
+  (subpath "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader")
+  (subpath "/private/tmp") (subpath "/tmp") (subpath "/private/var/folders") (subpath "/dev"))

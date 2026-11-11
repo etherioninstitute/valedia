@@ -88,7 +88,7 @@ def test_indicators_and_rules():
     for name in ("crypto_paper_indicators.py", "crypto_paper_safety.py", "crypto_paper_run.py"):
         _banned(open(os.path.join(HERE, name)).read())
     assert "ornith-1.5-k-m" in open(os.path.join(HERE, "crypto_paper_safety.py")).read()
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
     assert vc.CRYPTO_PAPER_MODE == "PAPER/SHADOW"
     assert vc.CRYPTO_PAPER_SAFETY == "PAPER/SHADOW+ORNITH"
     assert vc.WEATHER_LIVE is False

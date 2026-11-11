@@ -17,7 +17,8 @@ copy. Hardcoded copies are exactly how the MiroFish weight drifted (0.10 vs 0.15
 MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module stamps live in the
                                     # canonical files + MANUSCRIPT_MANIFEST.md. Set to your authoritative version.
 
-# Runtime identity (0.74.1 = Kalshi dollars quote helper for weather morning-go).
+# Runtime identity (0.75.0 = unified valedia_trader package, quant engine, security hardening;
+# 0.74.1 = Kalshi dollars quote helper for weather morning-go).
 # Prior 0.74.0 = weather morning + live preflight (Jev retired; Nimble 2 notes).
 # Prior 0.73.0 = weather scrape lookup, shadow only; live exec stays fenced.
 # Prior 0.72.0 = oil/weather RESEARCH/SHADOW desks.
@@ -34,7 +35,7 @@ MANUSCRIPT_VERSION = "UGFT-v32.9"   # overarching framework version; per-module 
 # Prior 0.59.0 = session_clock + resolve_clock + fence_gate.
 # Prior 0.58.0 = PHASE-1 Kalshi create quality. Prior 0.57.0 = INFORMED-BEFORE-CREATE.
 # Not a substitute for MANUSCRIPT_VERSION.
-VALEDIA_VERSION = "0.74.1"
+VALEDIA_VERSION = "0.75.0"
 
 # ── AGREEING shared constants (wired into consumers; one definition) ──
 # MIROFISH_* caps. Design: recommendations/VALEDIA-MIROFISH-DYNAMIC-WEIGHT.md
@@ -193,14 +194,14 @@ EXEC_DRY_RUN = False   # LIVE maker orders enabled 2026-09-12 (wired into master
 import os as _os, json as _json   # for auto-sourcing live track-record / risk state
 _MODELS = _os.path.expanduser("~/.openclaw/workspace/models")
 
-# Durable wire for Burton flips that live in ~/.openclaw/.env (same file
+# Durable wire for Burton flips that live in ~/.hermes/.env (same file
 # cron_runner_mac.sh sources). LaunchAgents do not inherit that file; any
 # process that imports this module picks flags up via setdefault so a bare
 # `python3 .../all_knowing_movers_scan.py` sees VALEDIA_SYSTEMONE without a manual
 # export. Process env always wins. Opt out: OPENCLAW_SKIP_ENV=1 (unit tests).
 # Override path: OPENCLAW_ENV_FILE. This lane never sets a flip True in git.
 _OPENCLAW_ENV_LOADED = False
-_OPENCLAW_ENV_DEFAULT = _os.path.expanduser("~/.openclaw/.env")
+_OPENCLAW_ENV_DEFAULT = _os.path.expanduser("~/.hermes/.env")
 
 
 def ensure_openclaw_env(path=None):
@@ -217,7 +218,8 @@ def ensure_openclaw_env(path=None):
     skip = str(_os.environ.get("OPENCLAW_SKIP_ENV", "")).strip().lower()
     if skip in ("1", "true", "yes", "on"):
         return None
-    path = path or _os.environ.get("OPENCLAW_ENV_FILE") or _OPENCLAW_ENV_DEFAULT
+    path = (path or _os.environ.get("VALEDIA_ENV_FILE") or _os.environ.get("OPENCLAW_ENV_FILE")
+            or _OPENCLAW_ENV_DEFAULT)
     path = _os.path.expanduser(path)
     if not _os.path.isfile(path):
         return None

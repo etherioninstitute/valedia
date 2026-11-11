@@ -54,7 +54,7 @@ def test_hygiene():
     assert vc.NAUTILUS_LIVE is False
     assert vc.SPOT_RECONCILE_HTTP is False
     assert vc.REBALANCER_AUTOEXEC is False
-    assert vc.VALEDIA_VERSION == "0.74.1"
+    assert vc.VALEDIA_VERSION == "0.75.0"
 
 
 def test_buffett_crypto_abstains_equity_fear():

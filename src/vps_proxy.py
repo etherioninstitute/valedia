@@ -13,7 +13,7 @@ Usage:
 import subprocess, os, time, requests
 
 PROXY_PORT = 1080
-VPS_DIRECT_IP = "85.239.234.32"  # Direct IP — never use Tailscale IP (opens Safari for SSH auth)
+VPS_DIRECT_IP = os.environ.get("VALEDIA_VPS_EGRESS_IP", "85.239.234.32")  # Direct IP — never use Tailscale IP (opens Safari for SSH auth)
 
 def get_proxies():
     """Return SOCKS5 proxy dict for requests library."""
@@ -40,7 +40,7 @@ def start_tunnel():
             '-o', 'ServerAliveInterval=60',
             '-o', 'ServerAliveCountMax=3',
             '-o', 'ExitOnForwardFailure=yes',
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'StrictHostKeyChecking=yes',
             '-o', 'PasswordAuthentication=no',
             '-o', 'BatchMode=yes',
             f'root@{VPS_DIRECT_IP}'

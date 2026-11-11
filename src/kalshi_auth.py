@@ -21,7 +21,7 @@ if False:  # RECOVERY: original import-time backend activation disabled.
 
 import os
 API_KEY = os.environ.get("KALSHI_API_KEY_ID", "")
-PEM_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "/Users/burtonchatelain/.openclaw/kalshi_private_key.pem")
+PEM_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", os.path.expanduser("~/.hermes/secrets/kalshi_private_key.pem"))
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 _private_key = None

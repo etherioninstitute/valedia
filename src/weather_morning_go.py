@@ -4,7 +4,7 @@ Owner: Valedia runtime (Mac crontab / cron_runner). Grok Bot routine paused.
 
 Flow:
   1) weather_live_preflight — Valedia decides WEATHER_LIVE from this
-  2) PASS + flip_allowed → set WEATHER_LIVE=1 in ~/.openclaw/.env;
+  2) PASS + flip_allowed → set WEATHER_LIVE=1 in ~/.hermes/.env;
      FAIL → set WEATHER_LIVE=0 (Valedia owns the switch; not Grok Bot / chat)
   3) Read-only Kalshi open KXHIGH*/KXLOW* books (full fee-map series list)
   4) morning_scan with live FV lookup (refuse create on no_fv)
@@ -29,7 +29,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from kalshi_quote import yes_price
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-ENV_PATH = os.path.expanduser("~/.openclaw/.env")
+ENV_PATH = os.path.expanduser("~/.hermes/.env")
 REC = os.path.join(ROOT, "recommendations")
 
 _NWS_FV = frozenset({
@@ -52,7 +52,7 @@ def _log(msg):
 
 
 def _set_weather_live(on: bool) -> str:
-    """Persist WEATHER_LIVE in ~/.openclaw/.env and this process env. Valedia-owned."""
+    """Persist WEATHER_LIVE in ~/.hermes/.env and this process env. Valedia-owned."""
     want = "1" if on else "0"
     path = ENV_PATH
     try:
