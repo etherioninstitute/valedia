@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "valedia-trader"
+dynamic = ["version"]
+description = "Valedia Trader: multi-venue quantitative research, risk and execution engine"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # numerical core (PyPI arm64 wheels link numpy/scipy against Apple Accelerate)
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "pandas>=2.2",
+    "polars>=1.0",
+    "pyarrow>=16",
+    "duckdb>=1.0",
+    # statistics, time series, optimisation
+    "statsmodels>=0.14.2",
+    "arch>=7.0",
+    "scikit-learn>=1.5",
+    "cvxpy>=1.5",
+    "clarabel>=0.9",
+    "ecos>=2.0.14",
+    "osqp>=0.6.7",
+    "scs>=3.2.6",
+    "xgboost>=2.1",
+    "hmmlearn>=0.3.2",
+    # derivatives
+    "py_vollib>=1.0.1",
+    "py_lets_be_rational>=1.0.1",  # LetsBeRational backend that py_vollib imports but does not declare
+    "QuantLib>=1.35",
+    # venues, data and services used by the existing desks
+    "requests>=2.32",
+    "certifi",
+    "PySocks>=1.7.1",
+    "cryptography>=42",
+    "PyJWT>=2.8",
+    "yfinance>=0.2.40",
+    "exchange_calendars>=4.5",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+ta = ["TA-Lib>=0.6"]
+mirofish = ["neo4j>=5.20", "tokenizers>=0.19"]
+memory = ["openai>=1.40"]
+forecast = ["torch>=2.4", "huggingface_hub>=0.24"]
+
+[dependency-groups]
+dev = ["pytest>=8.2", "pytest-timeout>=2.3", "ruff>=0.6"]
+
+[tool.hatch.version]
+path = "valedia_trader/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["valedia_trader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+timeout = 300
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["tools/repomix-runtime", "state", ".repo-map"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "F401", "F811", "F841"]
