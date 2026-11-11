@@ -17,7 +17,7 @@ the commits, and the tool pins that list by its own hash.
 | Profile | Agents | Rounds | Model calls allowed | Wall clock | Purpose |
 |---|---|---|---|---|---|
 | `report64_coverage` | at most 4 (2 act per platform) | 1 | 64 | 40 min | The profile that completed on 2026-11-08 |
-| `swarm48` | 48 named, up to 64 | 3, every agent each round | 640 | 4 hours | A real swarm |
+| `swarm48` | 48 named (53 in the graph), up to 64 | 3, every agent each round | 640 | 4 hours | A real swarm |
 
 `swarm48` changes closed numbers only (gateway budgets, deadlines, the participant bound, the round count), three selector
 expressions, two concurrency integers, and the scenario with its seal. Per-call limits, the single dispatch slot, the
@@ -48,6 +48,21 @@ The run shows the pipeline at scale. It is not a forecast and says nothing about
 - **Its final verdict was a refusal, and that is by design.** The last step turns the report into a signal and refuses a
   neutral one as "not usable evidence" (within 5 points of 50; this report gave NVDA 50.7, hold). So `complete: true`
   needs a report that leans one way. A neutral outcome is a result, not a fault.
+
+## The swarm attempts of 2026-11-11
+
+| Attempt | How far it got | Why it stopped | What changed afterwards |
+|---|---|---|---|
+| 1 | Graph built: 53 participants from the 48-name scenario (4.5 min, 14 model calls) | The producer caps a run at 4 participants and 1 round in five places beyond the worker ("Owned synthetic entity cap violated") | Each cap now follows the profile (64 and 3). The report check's one-hour freshness window follows the wall clock |
+| 2 | Past the caps; 27 personas written (31 min, 41 model calls) | The 28th persona reply ran to the 1,536-token cap. A reply cut off at its cap is fatal to the whole attempt, by design | Reply caps raised to 2,560 (personas, ontology, report text) and 1,024 (an agent's turn); output budget raised with them |
+
+Both stopped themselves, with cleanup proven and the model unloaded. Attempt 2 kept running on rule-based personas with a
+refusing gateway until it was told to stop, so a run that has lost its gateway should be stopped by hand (send the observer
+process a TERM signal; it cleans up).
+
+Not yet shown: that a whole swarm completes. The pipeline was built as a fail-closed 4-agent check, where any single
+unknown or cut-off reply ends the attempt. A swarm makes about 400 calls, so the odds of one bad reply are much higher
+than in a 43-call check, and a failure late in the simulation costs two hours.
 
 ## Stage, gate, launch
 

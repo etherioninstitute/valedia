@@ -92,14 +92,15 @@ class NativeStaging(unittest.TestCase):
             with self.assertRaises(RuntimeError):s.closed_integer_delta(raw,digest,edits)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_integer_delta(raw+b'#',digest,[('limit = 40','limit = 640',1,1)])
     def test_swarm_gateway_run_and_startup_change_exactly_the_closed_integers(self):
-        p=s.SWARM['swarm48'];self.assertEqual(s.PROFILES['swarm48'],(p['chats'],p['output']));self.assertGreaterEqual(p['output'],2*512+(p['chats']-2)*1536)  # every admitted call can reserve its cap
+        p=s.SWARM['swarm48'];self.assertEqual(s.PROFILES['swarm48'],(p['chats'],p['output']));self.assertGreaterEqual(p['output'],2*512+(p['chats']-2)*max(p['caller_output'],p['native_output']))  # every admitted call can reserve its cap
+        self.assertLess(p['caller_output'],4096);self.assertLess(p['caller_output']/20,175)  # under the gateway's per-call ceiling, and writable inside the 175 s limit even at 20 tokens a second
         self.assertGreaterEqual(p['agents_bound'],p['actors']);self.assertGreaterEqual(p['history_records'],int(p['wall']/0.4)+1)                       # the host samples every 0.4 s
         for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,12),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,7),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
             raw=(s.W16/relative).read_bytes();changed=build(raw,'swarm48');before,after=s.integer_literals(raw),s.integer_literals(changed)
             self.assertEqual(sum(a!=b for a,b in zip(before,after)),count,relative)
             with self.assertRaisesRegex(RuntimeError,'original source drift'):build(raw+b'\n','swarm48')
         gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm48').decode()
-        for text in ['chat_attempts: int = 640','"chat_attempts": 640,','output_total: int = 1000000','"wall_seconds": 14400,','request_bytes: int = 131072','client_seconds: int = 175','queue_seconds: int = 170','output_per_call: int = 4096','context: int = 32768']:self.assertIn(text,gateway)
+        for text in ['chat_attempts: int = 640','"chat_attempts": 640,','output_total: int = 1700000','"output_total": 1700000,','"wall_seconds": 14400,','request_bytes: int = 131072','client_seconds: int = 175','queue_seconds: int = 170','output_per_call: int = 4096','context: int = 32768']:self.assertIn(text,gateway)
         run=s.swarm_run_bytes((s.W16/sorted(s.RUN_COPIES)[0]).read_bytes(),'swarm48').decode()
         for text in ['time.monotonic() + 14280','<= 64, "actual generated participant count outside bound"','"max_rounds": 3,','deadline=start+14400;active=deadline-120','research_only=False,max_age_seconds=14400)',"receipt['wall_seconds']<=14400",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)"]:self.assertIn(text,run)
         startup=s.swarm_startup_bytes((s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),'swarm48').decode()
@@ -111,12 +112,13 @@ class NativeStaging(unittest.TestCase):
         self.assertEqual(changed.count(b'semaphore=2,'),2);self.assertEqual(changed.count(b'semaphore=30,'),0)
         self.assertIn(b"or args.max_rounds != 3 or args.twitter_only",changed);self.assertIn(b"len(config['agent_configs']) <= 64):",changed)
         self.assertIn(b"'Owned child agent, round, platform or path cap violated'",changed)  # the refusal itself stays
+        self.assertIn(b"'max_tokens': 1024,",changed);self.assertNotIn(b"'max_tokens': 512,",changed)
         coverage=s.coverage_selector_bytes(raw);self.assertEqual(coverage.count(b'semaphore=30,'),2)  # the earlier profile is untouched by the new code path
         self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(coverage))],['min(2, len(agent_configs))','list(range(24))','1.0'])
         with self.assertRaisesRegex(RuntimeError,'source drift'):s.swarm_selector_bytes(raw+b'\n','swarm48')
     def test_swarm_lifts_every_producer_cap_by_one_integer_each_and_keeps_the_refusals(self):
         expected={'simulation_manager.py':[b'len(filtered.entities) <= 64:'],'simulation_config_generator.py':[b'len(entities) <= 64:'],
-                  'simulation_runner.py':[b'or max_rounds != 3 or enable_graph_memory_update',b"len(config['agent_configs']) <= 64):"],'owned_context_budget.py':[b'len(agents) <= 64:'],'mirofish_provenance.py':[b'<= self.max_age_seconds <= 14400:']}
+                  'simulation_runner.py':[b'or max_rounds != 3 or enable_graph_memory_update',b"len(config['agent_configs']) <= 64):"],'owned_context_budget.py':[b'len(agents) <= 64:',b'OUTPUT_COMPLETION_TOKENS = 1024'],'owned_caller_budget.py':[b'CALLER_OUTPUT_LIMIT = 2560'],'mirofish_provenance.py':[b'<= self.max_age_seconds <= 14400:']}
         self.assertEqual({Path(k).name for k in s.SWARM_PRODUCER},set(expected))
         for relative,(original,edits) in s.SWARM_PRODUCER.items():
             raw=(s.W16/relative).read_bytes();self.assertEqual(hashlib.sha256(raw).hexdigest(),original);changed=s.swarm_producer_bytes(relative,raw,'swarm48')
