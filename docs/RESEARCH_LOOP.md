@@ -14,10 +14,19 @@ python -m valedia_trader.research_loop research    # agents propose ideas (they 
 python -m valedia_trader.research_loop backtest 16 # development test of idea 16; counted in the ledger
 python -m valedia_trader.research_loop revise 16   # repair a failed idea within the revision cap
 python -m valedia_trader.research_loop seal 16     # its single sealed test
-python -m valedia_trader.research_loop paper-step --refresh   # one paper-trading day
+python -m valedia_trader.research_loop paper-step --refresh   # paper trading: every trading day not yet processed
 python -m valedia_trader.research_loop critic      # weekly post-mortem
 python -m valedia_trader.research_loop cycle --refresh        # all of the above, in order, once
 ```
+
+## Schedule
+
+A launchd job, `com.valedia.research-loop.weekly`, runs `cycle --refresh --critic --agent-timeout 1800` every Sunday at
+18:00 local time (at the next wake if the Mac is asleep). The job file is `tools/launchd/com.valedia.research-loop.weekly.plist`;
+its header has the install, remove and run-now commands. Output goes to `~/Library/Logs/valedia-research-loop.log`. If the SSD
+is not mounted the job says so in that log and does nothing. `--agent-timeout` is the one knob for how long a research agent
+may take (30 minutes here, against about 30 seconds typical); an agent that does not answer is noted in its memo and the cycle
+goes on. Each run adds at most six ideas, and every backtest it makes is counted.
 
 ## Where things are
 
@@ -104,4 +113,5 @@ sealed period, so nothing is in paper trading and the sealed period is unspent f
   this machine is not a paper key, and the venue refuses anything else.
 - The research agents' prose often names filters the rule library cannot express (for example a
   correlation threshold). The strategy that gets tested is the library version, which is simpler.
-- Nothing is scheduled. `cycle` runs when it is run.
+- Paper trading is a simulated book. A weekly run steps it through each trading day it missed, in order, which gives
+  the same book as running daily; a broker mirror cannot do that and would need a weekday run.

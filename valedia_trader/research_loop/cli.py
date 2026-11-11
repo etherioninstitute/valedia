@@ -116,14 +116,36 @@ def _strategy_for(paths: LoopPaths, ledger: HypothesisLedger, hid: int, file: st
     raise SpecError(f"no strategy file found for hypothesis {hid}; pass --file")
 
 
-def _asker(spec: str):
+def _account_limits(paths: LoopPaths) -> dict | None:
+    """The kill switch's limits for the research agents to design within; None if the file is unusable
+    (in which case the kill switch blocks every order anyway)."""
+    try:
+        return risk_gate.load_limits(paths.risk_limits)
+    except risk_gate.RiskConfigError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        return None
+
+
+def _asker(spec: str, timeout: float | None = None):
+    """An agent backend. `timeout` (seconds) is the one knob for how long an agent may take; None waits."""
     kind, _, rest = spec.partition(":")
     if kind == "hermes":
-        return research_mod.hermes_asker(rest)
+        return research_mod.hermes_asker(rest, timeout=timeout)
     if kind == "chat":
-        url, _, model = rest.rpartition("@")
-        return research_mod.chat_asker(url, model)
+        model, _, url = rest.partition("@")              # chat:<model>@<base-url>
+        return research_mod.chat_asker(url, model, **({"timeout": timeout} if timeout else {}))
     raise SystemExit(f"backend must be hermes:<profile> or chat:<model>@<base-url>, not {spec}")
+
+
+def paper_catch_up(trader: PaperTrader, prices: pd.DataFrame, active: dict[int, Strategy]) -> list[dict]:
+    """Step the paper book through every trading day it has not processed yet, oldest first, each
+    with prices up to that day only. A first run starts at the latest day: nothing is backfilled.
+    This makes a weekly run produce the same book a daily run would, because a decision at one
+    close is filled at the next close either way. It is for the simulated book only; orders cannot
+    be mirrored to a broker in the past."""
+    last = trader.state["last_day"]
+    days = [prices.index[-1]] if last is None else [d for d in prices.index if str(d.date()) > last]
+    return [trader.step(prices.loc[:day], active) for day in days]
 
 
 def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
@@ -136,13 +158,17 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     out: dict = {"date": str(pd.Timestamp.today().date())}
     if args.refresh:
         from valedia_trader.data_and_fees import prices as price_data
-        out["prices"] = price_data.refresh(args.data)
+        try:
+            out["prices"] = price_data.refresh(args.data)
+        except Exception as exc:  # a failed download must not stop the week; the stored prices are used
+            out["prices"] = {"error": f"{type(exc).__name__}: {exc}", "note": "continuing with the stored prices"}
     prices, dollar, cost = _market(args)
     g = Gauntlet(prices, dollar, cost, ledger, paths, Criteria())
     if not args.no_research:
-        roles = {role: _asker(args.backend) for role in ("price-analyst", "macro-watcher", "fundamentals-reader")}
+        roles = {role: _asker(args.backend, args.agent_timeout) for role in ("price-analyst", "macro-watcher", "fundamentals-reader")}
         res = research_mod.run_research(ledger, paths, g.dev_prices, g.dev_dollar_volume, MARKET, roles,
-                                        _asker(args.skeptic) if args.skeptic else None)
+                                        _asker(args.skeptic, args.agent_timeout) if args.skeptic else None,
+                                        account_limits=_account_limits(paths))
         out["research"] = {k: v.get("accepted", v.get("objections")) for k, v in res["roles"].items()}
     tested = {}
     for h in reversed(ledger.search(market=MARKET, status="untested")):
@@ -165,9 +191,8 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     active = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0] for s in PAPER_STATUSES for h in ledger.search(status=s)}
     journal = Journal(paths.journal)
     if active:
-        trader = PaperTrader(paths.journal, paths.risk_limits)
-        if trader.state["last_day"] != str(prices.index[-1].date()):
-            out["paper"] = trader.step(prices, active)
+        steps = paper_catch_up(PaperTrader(paths.journal, paths.risk_limits), prices, active)
+        out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date"}
     else:
         out["paper"] = "nothing has passed its backtest and sealed test"
     if args.critic or pd.Timestamp.today().dayofweek == 6:
@@ -211,6 +236,7 @@ def main(argv=None) -> int:
     p.add_argument("--backend", default="hermes:valedia-trading-decider")
     p.add_argument("--skeptic", default="hermes:valedia-trading-auditor")
     p.add_argument("--critic", action="store_true", help="run the weekly critic at the end (it always runs on Sundays)")
+    p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
 
     paths = LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths()
@@ -234,7 +260,7 @@ def main(argv=None) -> int:
             g = Gauntlet(prices, dollar, cost, ledger, paths)
             askers = {role: _asker(args.backend) for role in args.roles}
             out = research_mod.run_research(ledger, paths, g.dev_prices, g.dev_dollar_volume, MARKET, askers,
-                                            _asker(args.skeptic) if args.skeptic else None)
+                                            _asker(args.skeptic) if args.skeptic else None, account_limits=_account_limits(paths))
             print(json.dumps({k: v for k, v in out.items() if k != "accepted"}, indent=2))
             for r in out["accepted"]:
                 print(f"accepted #{r['hypothesis_id']}: {r['idea']}  ->  {r['strategy_file']}")
@@ -275,8 +301,11 @@ def main(argv=None) -> int:
             trader = PaperTrader(paths.journal, paths.risk_limits, venue=venue)
             if not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")
+            elif venue is not None:
+                print(json.dumps(trader.step(prices, active), indent=2))      # a broker mirror cannot trade in the past
             else:
-                print(json.dumps(trader.step(prices, active), indent=2))
+                steps = paper_catch_up(trader, prices, active)
+                print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date"}, indent=2))
         elif args.cmd == "critic":
             from valedia_trader.research_loop.paper import Journal
             names = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0].name

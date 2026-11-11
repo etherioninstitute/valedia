@@ -148,3 +148,26 @@ def test_tables_and_askers():
         rs.hermes_asker("bad profile; rm -rf")
     with pytest.raises(ValueError):
         rs.chat_asker("http://example.com/v1", "m")
+
+
+def test_strategies_are_held_to_the_accounts_kill_switch_limits(env):
+    paths, ledger, px = env
+    limits = {"max_daily_loss_pct": 2.0, "max_drawdown_pct": 8.0, "max_position_pct": 0.10, "max_open_positions": 5}
+    seen = []
+    greedy = idea(strategy={"entry": {"rule": "breakout", "lookback": 200, "enter": 1.0, "exit": 0.0},
+                            "risk": {"max_position_pct": 0.4, "max_open_positions": 8, "stop_loss_pct": 0.1}})
+    modest = idea("Gold rises when long bonds fall for three months", symbols=["GLD"],
+                  strategy={"entry": {"rule": "momentum", "lookback": 60, "enter": 0.02, "exit": 0.0}, "risk": {"max_position_pct": 0.05}})
+    out = rs.run_research(ledger, paths, px, None, "us-etf", {"price-analyst": lambda p: seen.append(p) or json.dumps({"ideas": [greedy, modest]})},
+                          today="2026-11-10", account_limits=limits)
+    assert "refuses any position above 10% of capital and any new position once 5 are open" in seen[0]
+    first, second = out["accepted"]
+    assert first["spec"]["risk"]["max_position_pct"] == 0.10 and first["spec"]["risk"]["max_open_positions"] == 5
+    assert first["cut_to_account_limits"] == ["max_position_pct 0.4 -> 0.1", "max_open_positions 8 -> 5"]
+    assert second["spec"]["risk"]["max_position_pct"] == 0.05 and "cut_to_account_limits" not in second     # already inside the limits
+    assert st.load_strategy(paths.root / first["strategy_file"]).risk.max_position_pct == 0.10               # the file is the cut version
+    assert "Cut to the account's limits: max_position_pct 0.4 -> 0.1" in (paths.research / "price-analyst-2026-11-10.md").read_text()
+    unbounded = rs.run_research(ledger, paths, px, None, "us-etf",
+                                {"price-analyst": lambda p: json.dumps({"ideas": [idea("Utilities lead when rates fall for a quarter", strategy=greedy["strategy"])]})},
+                                today="2026-11-11")
+    assert unbounded["accepted"][0]["spec"]["risk"]["max_position_pct"] == 0.4                               # no limits given: nothing is cut

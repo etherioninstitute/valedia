@@ -127,13 +127,23 @@ The prediction is what you expect a backtest net of costs to show and what would
 any backtest and can never be edited, so state what you actually believe."""
 
 
-def build_prompt(role: Role, market: str, symbols: list[str], as_of, table: str, tested: list[dict]) -> str:
+def _limits_line(account_limits: dict | None) -> str:
+    if not account_limits:
+        return ""
+    return (f"The account's kill switch refuses any position above {account_limits['max_position_pct']:.0%} of capital and any new "
+            f"position once {int(account_limits['max_open_positions'])} are open. Design within that: a strategy's max_position_pct and "
+            "max_open_positions are cut down to these limits before it is tested.\n\n")
+
+
+def build_prompt(role: Role, market: str, symbols: list[str], as_of, table: str, tested: list[dict],
+                 account_limits: dict | None = None) -> str:
     seen = "\n".join(f"- #{h['id']} [{h['status']}] {h['idea']}" + (f" (lesson: {h['lessons_learned'].strip().splitlines()[-1][:160]})"
                                                                    if h["lessons_learned"].strip() else "") for h in tested) or "- nothing yet"
     return (f"You are the {role.title}. Look only at {role.angle} for {market} ({', '.join(symbols)}).\n\n"
             f"Ideas already tested on this market, from the hypothesis ledger. Do not repeat any that failed unless market "
             f"conditions have clearly changed (then set conditions_changed to true and say what changed):\n{seen}\n\n"
             f"Your data, as of {pd.Timestamp(as_of).date()} (nothing later exists for you):\n{table}\n"
+            f"{_limits_line(account_limits)}"
             f"Propose at most {MAX_IDEAS} testable trading ideas. For each, state the idea in one sentence, why it might work, "
             f"the exact market conditions it needs, and what result would prove it wrong. Each idea must be expressed with "
             f"this rule library, because only these rules can be tested:\n{RULE_LIBRARY}\n\n{_REPLY_FORMAT}")
@@ -156,8 +166,11 @@ def _slug(role_key: str, idea: str, hypothesis_id: int) -> str:
     return ("_".join([prefix, *words])[:32].rstrip("_") + f"_h{hypothesis_id}")
 
 
-def _accept(raw: dict, role: Role, market: str, universe: list[str], ledger: HypothesisLedger, paths: LoopPaths) -> dict:
-    """Validate one proposed idea and, if it stands, record it with its strategy and prediction."""
+def _accept(raw: dict, role: Role, market: str, universe: list[str], ledger: HypothesisLedger, paths: LoopPaths,
+            account_limits: dict | None = None) -> dict:
+    """Validate one proposed idea and, if it stands, record it with its strategy and prediction. The
+    strategy's own position limits are cut down to the account's, so what is tested is what the kill
+    switch will let trade."""
     text = {k: " ".join(str(raw.get(k, "")).split()) for k in ("idea", "why", "conditions", "falsifier")}
     out: dict[str, Any] = {**text, "accepted": False}
     missing = [k for k, v in text.items() if len(v.split()) < 3]
@@ -167,6 +180,15 @@ def _accept(raw: dict, role: Role, market: str, universe: list[str], ledger: Hyp
     proposed = raw.get("strategy") if isinstance(raw.get("strategy"), dict) else {}
     draft = {"name": "draft_strategy", "version": "1.0.0", "hypothesis": text["idea"], "market": symbols,
              **{k: proposed[k] for k in ("entry", "sizing", "risk") if proposed.get(k) is not None}}
+    if account_limits and isinstance(draft.get("risk", {}), dict):
+        risk, defaults = dict(draft.get("risk", {})), st.StrategyRisk()
+        for key, cap in (("max_position_pct", float(account_limits["max_position_pct"])),
+                         ("max_open_positions", int(account_limits["max_open_positions"]))):
+            wanted = risk.get(key, getattr(defaults, key))
+            if isinstance(wanted, (int, float)) and not isinstance(wanted, bool) and wanted > cap:
+                risk[key] = cap
+                out.setdefault("cut_to_account_limits", []).append(f"{key} {wanted} -> {cap}")
+        draft["risk"] = risk
     try:
         st.RuleStrategy.from_spec(draft)
         prediction = Prediction(**{k: float(v) for k, v in (raw.get("prediction") or {}).items() if k != "notes"})
@@ -195,6 +217,8 @@ def _memo(role: Role, today: str, market: str, as_of, tested: list[dict], result
                   f"- Conditions it needs: {r.get('conditions', '')}", f"- What would prove it wrong: {r.get('falsifier', '')}"]
         if r["accepted"]:
             p = r["prediction"]
+            if r.get("cut_to_account_limits"):
+                lines.append("- Cut to the account's limits: " + ", ".join(r["cut_to_account_limits"]))
             lines += [f"- Recorded as hypothesis #{r['hypothesis_id']}, strategy `{r['strategy_file']}`",
                       f"- Prediction (now locked): {p['annual_return']:+.1%} a year, {p['win_rate']:.0%} winning trades, Sharpe "
                       f"{p['sharpe']:.2f}; failed if Sharpe is below {p['fail_if_sharpe_below']:.2f} or drawdown exceeds "
@@ -206,9 +230,11 @@ def _memo(role: Role, today: str, market: str, as_of, tested: list[dict], result
 
 
 def run_research(ledger: HypothesisLedger, paths: LoopPaths, dev_prices: pd.DataFrame, dev_dollar_volume: pd.DataFrame | None,
-                 market: str, askers: dict[str, Asker], skeptic: Asker | None = None, today: str | None = None) -> dict:
+                 market: str, askers: dict[str, Asker], skeptic: Asker | None = None, today: str | None = None,
+                 account_limits: dict | None = None) -> dict:
     """One research round. `askers` maps role keys to a function that sends a prompt to that agent
-    and returns its reply. Pass `gauntlet.dev_prices`: the agents must never see the sealed period."""
+    and returns its reply. Pass `gauntlet.dev_prices`: the agents must never see the sealed period.
+    `account_limits` are the kill switch's limits (config/risk.json); strategies are held to them."""
     today = today or str(date.today())
     unknown = set(askers) - set(ROLES)
     if unknown:
@@ -223,7 +249,8 @@ def run_research(ledger: HypothesisLedger, paths: LoopPaths, dev_prices: pd.Data
             replies[key] = (None, f"Skipped: {role.unavailable}.")
             continue
         try:
-            replies[key] = (ask(build_prompt(role, market, universe, as_of, role.table(dev_prices, dev_dollar_volume), tested)), "")
+            replies[key] = (ask(build_prompt(role, market, universe, as_of, role.table(dev_prices, dev_dollar_volume), tested,
+                                             account_limits)), "")
         except Exception as exc:  # one agent failing does not stop the others
             replies[key] = (None, f"The agent did not answer ({type(exc).__name__}: {exc}).")
     # 2. validate, record and write the memos
@@ -235,7 +262,7 @@ def run_research(ledger: HypothesisLedger, paths: LoopPaths, dev_prices: pd.Data
                 ideas = parse_ideas(reply)
                 if len(ideas) > MAX_IDEAS:
                     note = f"The agent proposed {len(ideas)} ideas; only the first {MAX_IDEAS} were considered."
-                results = [_accept(raw, role, market, universe, ledger, paths) for raw in ideas[:MAX_IDEAS]]
+                results = [_accept(raw, role, market, universe, ledger, paths, account_limits) for raw in ideas[:MAX_IDEAS]]
             except (ValueError, json.JSONDecodeError) as exc:
                 note = f"The reply could not be read ({exc})."
         memo = paths.research / f"{key}-{today}.md"

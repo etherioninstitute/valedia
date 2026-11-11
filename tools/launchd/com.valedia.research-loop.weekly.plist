@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The research loop, once a week: refresh prices, research, test, revise, seal, paper, critic.
+       Install:   cp tools/launchd/com.valedia.research-loop.weekly.plist ~/Library/LaunchAgents/
+                  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.valedia.research-loop.weekly.plist
+       Remove:    launchctl bootout gui/$(id -u)/com.valedia.research-loop.weekly
+                  rm ~/Library/LaunchAgents/com.valedia.research-loop.weekly.plist
+       Run now:   launchctl kickstart gui/$(id -u)/com.valedia.research-loop.weekly
+       Log:       ~/Library/Logs/valedia-research-loop.log (on the internal disk, so a missing SSD is still reported) -->
+  <key>Label</key><string>com.valedia.research-loop.weekly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-c</string>
+    <string>REPO=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader
+echo "=== $(date '+%F %T') weekly research loop"
+if [ ! -x "$REPO/.venv/bin/python" ]; then echo "SSD not mounted or the environment is missing; nothing was run"; exit 1; fi
+cd "$REPO" || exit 1
+exec .venv/bin/python -m valedia_trader.research_loop cycle --refresh --critic --agent-timeout 1800</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/burtonchatelain/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- Sunday 18:00 local time. If the Mac is asleep then, launchd runs it at the next wake. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>18</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/burtonchatelain/Library/Logs/valedia-research-loop.log</string>
+  <key>StandardErrorPath</key><string>/Users/burtonchatelain/Library/Logs/valedia-research-loop.log</string>
+</dict>
+</plist>
