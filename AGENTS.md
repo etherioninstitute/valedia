@@ -24,3 +24,4 @@ Repository-map work must not import or execute trading modules or read state/led
 - Backtests: `python -m valedia_trader.backtest.walkforward`. Every configuration evaluated is recorded in `artifacts/trials.sqlite`; do not delete it, the Deflated Sharpe gate depends on the true trial count.
 - No live orders without the owner's explicit confirmation.
 - `python -m valedia_trader.quant_engine` shows where each of the 50 formulas is used; `tests/quant_engine/test_wiring.py` fails if one is neither used nor explained. Try new analytics on synthetic series, never a tradable rule on real prices outside the ledger.
+- `python -m valedia_trader.doctor` checks every part of the trader through the code paths it uses (data, ledger, limits, kill switch, quant sheet, panel, local models, venues, schedule, MiroFish, repository). Run it after any change; `--live` also asks each panel member a question.
