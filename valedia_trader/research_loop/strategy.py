@@ -193,11 +193,29 @@ def _drift(px: pd.DataFrame, window: int = 250, horizon: int = 5) -> pd.DataFram
     return d.rolling(window).mean() / sd.where(sd > 0) * np.sqrt(horizon)
 
 
+def _trend_blend(px: pd.DataFrame, fast: int = 16, speeds: int = 3, vol_window: int = 25) -> pd.DataFrame:
+    """Trend at several speeds at once, each on the same scale, averaged.
+
+    For speed k the fast average spans `fast * 2**k` days and the slow one four times that. Their gap is
+    divided by the recent daily price volatility, then by its own average size so far (so every speed
+    counts equally and no future data is used), capped at +-2, and the speeds are averaged. About +1 is
+    an ordinary up-trend; 0 is none."""
+    vol = px.diff().ewm(span=vol_window, min_periods=vol_window).std()
+    parts = []
+    for k in range(int(speeds)):
+        f, sl = int(fast) * 2 ** k, int(fast) * 2 ** k * 4
+        raw = (px.ewm(span=f, min_periods=f).mean() - px.ewm(span=sl, min_periods=sl).mean()) / vol.where(vol > 0)
+        typical = raw.abs().expanding(min_periods=sl).mean()
+        parts.append((raw / typical.where(typical > 0)).clip(-2.0, 2.0))
+    return sum(parts) / len(parts)
+
+
 SCORES: dict[str, Callable[..., pd.DataFrame]] = {"momentum": _momentum, "breakout": _breakout, "reversion": _reversion,
-                                                  "ma_cross": _ma_cross, "drift": _drift}
+                                                  "ma_cross": _ma_cross, "drift": _drift, "trend_blend": _trend_blend}
 _SCORE_PARAMS = {"momentum": {"lookback": (5, 756), "skip": (0, 63)}, "breakout": {"lookback": (5, 504)},
                  "reversion": {"lookback": (1, 63), "vol_window": (10, 504)}, "ma_cross": {"fast": (2, 252), "slow": (5, 756)},
-                 "drift": {"window": (20, 756), "horizon": (1, 63)}}
+                 "drift": {"window": (20, 756), "horizon": (1, 63)},
+                 "trend_blend": {"fast": (2, 64), "speeds": (1, 4), "vol_window": (5, 126)}}
 
 
 def _size_equal(px: pd.DataFrame, risk: StrategyRisk) -> pd.DataFrame:

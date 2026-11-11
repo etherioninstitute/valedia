@@ -81,6 +81,7 @@ def test_a_real_edge_passes_development_then_its_one_sealed_test(env):
     assert set(rep["checks"]) == {"prediction_failure_terms", "deflated_sharpe", "walk_forward", "double_costs", "delayed_fills", "worst_periods"}
     assert len(rep["walk_forward"]) == 5 and rep["positive_windows"] >= 0.6 and rep["result"]["trades"] > 0
     assert len(rep["breaker"]["worst_periods"]) == 5
+    assert 0.0 < rep["breaker"]["timing_null"]["p_value"] <= 1.0 and "sharpe" in rep["breaker"]["market_basket"]      # reported, no new gate
     assert rep["breaker"]["double_costs"]["sharpe"] < rep["result"]["sharpe"]             # costs hurt
     assert rep["deflated_sharpe"]["variations_of_idea"] == 1 and rep["attempt"] == 1
     assert set(rep["versus_prediction"]) == {"annual_return", "win_rate", "sharpe"}
@@ -178,3 +179,19 @@ def test_breaker_helpers():
     spans = [(a, b) for a, b, _ in worst]
     assert all(a2 > b1 or b2 < a1 for i, (a1, b1) in enumerate(spans) for (a2, b2) in spans[i + 1:])    # no overlap
     assert gt.worst_periods(r.iloc[:10], 5, 63) == []
+
+
+def test_timing_null_tells_timing_skill_from_plain_exposure():
+    rng = np.random.default_rng(4); n = 1500
+    idx = pd.bdate_range("2018-01-01", periods=n)
+    r = pd.DataFrame({"A": rng.normal(0.0004, 0.01, n), "B": rng.normal(0.0004, 0.012, n)}, index=idx)
+    skilled = (r.shift(-1) > 0).astype(float) * 0.5                    # holds each asset only on the eve of an up day
+    exposed = pd.DataFrame(0.5, index=idx, columns=r.columns)          # always long: no timing at all
+    exposed.iloc[::7] = 0.0
+    a, b = gt.timing_null(skilled, r, n=120), gt.timing_null(exposed, r, n=120)
+    assert a["p_value"] < 0.02 and a["actual_gross_sharpe"] > a["null_95th"]
+    assert b["p_value"] > 0.10                                         # re-timed copies do just as well
+    assert abs(b["actual_gross_sharpe"] - b["average_book_held_throughout_sharpe"]) < 0.5
+    assert gt.timing_null(skilled, r, n=50)["p_value"] == gt.timing_null(skilled, r, n=50)["p_value"]      # seeded
+    assert "unavailable" in gt.timing_null(skilled.iloc[:30], r.iloc[:30])
+    assert "unavailable" in gt.timing_null(skilled * 0.0, r)

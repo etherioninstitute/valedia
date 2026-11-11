@@ -180,6 +180,35 @@ def _trade_stats(events: list[dict], lo, hi) -> dict:
             "mean_trade_pct": float(np.mean([e["pnl_pct"] for e in closed])) if closed else float("nan")}
 
 
+def timing_null(weights: pd.DataFrame, asset_returns: pd.DataFrame, n: int = 300, seed: int = 20261111, min_shift: int = 21) -> dict:
+    """Was the timing worth anything, or only the average exposure?
+
+    The strategy's own book is slid along the calendar by a random number of days (the same shift for every
+    asset, wrapping round), which keeps what it held, how much and for how long, and breaks only when. If the
+    real book does not beat most of these, its return came from being exposed, not from the rule. Gross of
+    costs on both sides: a shifted book trades exactly as much as the real one."""
+    cols = [c for c in weights.columns if c in asset_returns.columns and float(weights[c].abs().sum()) > 0]
+    w = weights[cols].to_numpy(float); r = asset_returns[cols].fillna(0.0).to_numpy(float)
+    days = len(w)
+    if not cols or days < 4 * min_shift:
+        return {"unavailable": "too little history or no positions"}
+
+    def sharpe(book: np.ndarray) -> float:
+        pnl = (book[:-1] * r[1:]).sum(axis=1)
+        sd = pnl.std(ddof=1)
+        return float(pnl.mean() / sd * math.sqrt(252.0)) if sd > 0 else 0.0
+
+    actual = sharpe(w)
+    rng = np.random.default_rng(seed)
+    nulls = np.array([sharpe(np.roll(w, int(k), axis=0)) for k in rng.integers(min_shift, days - min_shift, size=n)])
+    always = sharpe(np.tile(np.abs(w).mean(axis=0) * np.sign(w.sum(axis=0)), (days, 1)))          # the same average book, held throughout
+    return {"actual_gross_sharpe": actual, "null_median": float(np.median(nulls)), "null_95th": float(np.quantile(nulls, 0.95)),
+            "p_value": float((1 + (nulls >= actual).sum()) / (n + 1)), "shifts": int(n),
+            "average_book_held_throughout_sharpe": always,
+            "reading": "p is the share of randomly re-timed copies of this book that did at least as well; "
+                       "a high p means the rule's timing added nothing beyond its average exposure"}
+
+
 def _attempt_pvalues(ledger: HypothesisLedger, hypothesis_id: int) -> list[float]:
     """One-sided p-value of each counted variation's Sharpe (normal approximation), for the multiple-testing view."""
     out = []
@@ -308,7 +337,9 @@ class Gauntlet:
         worst = [{"start": str(a.date()), "end": str(b.date()), "market_return": mr,
                   "strategy_return": float(np.prod(1.0 + net.loc[a:b]) - 1.0)}
                  for a, b, mr in worst_periods(market, c.worst_periods, c.worst_period_days)]
-        breaker = {"double_costs": _stats(stress), "delayed_fills": _stats(delayed), "worst_periods": worst}
+        breaker = {"double_costs": _stats(stress), "delayed_fills": _stats(delayed), "worst_periods": worst,
+                   "timing_null": timing_null(base.weights.iloc[oos], dev.pct_change().iloc[oos]),      # reported, not a gate
+                   "market_basket": _stats(market)}
 
         sharpe, dd = headline.get("sharpe", float("nan")), headline.get("max_drawdown", float("nan"))
         worst_loss = min((w["strategy_return"] for w in worst), default=0.0)

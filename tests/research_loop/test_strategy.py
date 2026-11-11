@@ -162,3 +162,27 @@ STRATEGY = Hand()
         st.load_strategy(tmp_path / "notes.txt")
     with pytest.raises(st.SpecError, match="price data"):
         st.run_rules(s, frame(Z=[1, 2, 3]))
+
+
+def test_trend_blend_reads_trends_at_several_speeds_without_looking_ahead():
+    rng = np.random.default_rng(8); n = 900
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    up = 100 * np.exp(np.cumsum(0.0015 + 0.008 * rng.standard_normal(n)))
+    down = 100 * np.exp(np.cumsum(-0.0015 + 0.008 * rng.standard_normal(n)))
+    flat = 100 * np.exp(np.cumsum(0.008 * rng.standard_normal(n)))
+    px = pd.DataFrame({"UP": up, "DOWN": down, "FLAT": flat}, index=idx)
+    score = st.SCORES["trend_blend"](px, fast=8, speeds=3)
+    tail = score.iloc[-200:]
+    assert tail["UP"].mean() > 0.5 and tail["DOWN"].mean() < -0.5 and abs(tail["FLAT"].mean()) < tail["UP"].mean()
+    assert score.abs().max().max() <= 2.0 + 1e-9 and score.iloc[:100].isna().all().all()      # capped; silent until it has history
+    cut = st.SCORES["trend_blend"](px.iloc[:600], fast=8, speeds=3)
+    pd.testing.assert_frame_equal(cut, score.iloc[:600])                                    # later prices change nothing earlier
+    s = st.RuleStrategy.from_spec({"name": "blend_test", "version": "1.0.0", "hypothesis": "Trends at several speeds persist",
+                                   "market": ["UP", "DOWN", "FLAT"], "entry": {"rule": "trend_blend", "fast": 8, "speeds": 3, "enter": 0.5, "exit": 0.0},
+                                   "sizing": {"rule": "inverse_vol", "position_vol": 0.05}, "risk": {"max_position_pct": 0.5, "max_open_positions": 3, "stop_loss_pct": None}})
+    w, events = st.run_rules(s, px)
+    held = (w.iloc[200:] > 0).mean()
+    assert held["UP"] > 0.5 > held["FLAT"] and held["DOWN"] < 0.1 and any(e["action"] == "enter" for e in events)
+    assert (w >= 0).all().all()                                                             # long-only by default
+    with pytest.raises(st.SpecError):
+        st.RuleStrategy.from_spec({**s.to_spec(), "entry": {"rule": "trend_blend", "speeds": 9, "enter": 0.5, "exit": 0.0}})
