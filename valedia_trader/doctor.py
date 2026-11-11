@@ -203,8 +203,20 @@ def check_desk(paths: LoopPaths) -> tuple[str, str]:
         return FAIL, "no Hermes profile for the " + ", ".join(missing)
     d = D.Desk(paths, roster)
     waiting = [s["id"] for s in d.rooms_list() if s["status"] in ("awaiting owner", "stopped at the cap")]
-    text = f"3 bots, room capped at {roster['max_bot_turns']} turns; {len(d.index())} approved notes in the library"
+    text = f"4 seats, room capped at {roster['max_bot_turns']} turns; {len(d.index())} approved notes in the library"
     return (ATTENTION, text + f"; {len(waiting)} report(s) wait for your decision (`python -m valedia_trader.agents.desk list`)") if waiting else (OK, text)
+
+
+def check_team(paths: LoopPaths) -> tuple[str, str]:
+    from valedia_trader.agents import team as T
+    team = T.load_team()
+    problems = T.check(team)
+    seats = T.table(team)
+    text = f"{len(team['bots'])} bots fill {len(seats)} seats across the desk, the research round, the panel and the weekly review"
+    if not problems:
+        return OK, text + "; profiles, models and role files agree with team.json"
+    worst = FAIL if any(p["level"] == "fail" for p in problems) else ATTENTION
+    return worst, text + "; " + "; ".join(p["problem"] for p in problems[:3]) + (f"; and {len(problems) - 3} more" if len(problems) > 3 else "")
 
 
 def check_repo(paths: LoopPaths) -> tuple[str, str]:
@@ -218,7 +230,7 @@ def check_repo(paths: LoopPaths) -> tuple[str, str]:
 
 CHECKS: dict[str, Callable[..., tuple[str, str]]] = {
     "price history": check_data, "hypothesis ledger": check_ledger, "risk limits": check_risk_limits, "kill switch": check_kill_switch,
-    "quant sheet": check_quant_sheet, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
+    "quant sheet": check_quant_sheet, "team": check_team, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
     "research desk": check_desk, "schedules": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
 }
 

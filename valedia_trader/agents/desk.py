@@ -6,9 +6,10 @@
     python -m valedia_trader.agents.desk approve ID --who NAME   the librarian files it in the library
     python -m valedia_trader.agents.desk reject ID --who NAME --why TEXT
 
-The orchestrator turns a question into a brief and reviews the report. The researcher reads sources and
-reports findings with links. The librarian files a report in the library. Each is its own Hermes profile
-with its own instructions, model and tools; the room shares the conversation and nothing else.
+Four seats, filled by the trader's existing bots (valedia_trader/agents/team.json): the orchestrator turns a
+question into a brief (Decider), the researcher reads sources and reports findings with links (Scout), the
+reviewer attacks the report (Auditor), and the librarian files what the owner approved (Decider). Each bot is
+a Hermes profile with its own instructions, model and tools; the room shares the conversation and nothing else.
 
 What the code enforces, whatever the bots write:
 
@@ -39,8 +40,7 @@ from valedia_trader.research_loop import LoopPaths
 
 __all__ = ["Desk", "DeskError", "load_roster", "library_reading", "check_report", "ROLES", "STATUSES"]
 
-ROSTER = Path(__file__).with_name("desk_roster.json")
-ROLES = ("orchestrator", "researcher", "librarian")
+ROLES = ("orchestrator", "researcher", "reviewer", "librarian")
 STATUSES = ("running", "awaiting owner", "stopped at the cap", "failed", "approved", "rejected")
 _URL = re.compile(r"https?://[^\s<>\"')\]]+")
 Runner = Callable[[str, dict, str], str]                     # (role, role settings, prompt) -> reply text
@@ -58,32 +58,37 @@ class _CapReached(Exception):
     pass
 
 
-def load_roster(path: str | Path = ROSTER) -> dict:
-    roster = json.loads(Path(path).read_text())
+def load_roster(path: str | Path | None = None) -> dict:
+    """The desk's seats with their Hermes profile, tools and time limits. Without a path it comes from the team
+    file, which is where the seats are assigned; a path reads a roster written out in the same shape."""
+    if path is None:
+        from valedia_trader.agents import team
+        try:
+            roster = team.desk_roster()
+        except team.TeamError as exc:
+            raise DeskError(str(exc)) from None
+    else:
+        roster = json.loads(Path(path).read_text())
     for role in ROLES:
         spec = roster.get(role)
         if not isinstance(spec, dict) or not re.fullmatch(r"[A-Za-z0-9_.-]+", str(spec.get("profile", ""))):
             raise DeskError(f"the roster needs a profile for the {role}")
         if not re.fullmatch(r"[a-z0-9_-]+(,[a-z0-9_-]+)*", str(spec.get("toolsets", "clarify"))):
             raise DeskError(f"invalid toolsets for the {role}")
-        budget, timeout = spec.get("run_budget"), spec.get("timeout")
-        if budget is not None and (not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0
-                                   or (timeout is not None and budget >= timeout)):
-            raise DeskError(f"the {role}'s run_budget must be a number of seconds below its timeout")
     if not (1 <= int(roster.get("max_bot_turns", 0)) <= 20 and 0 <= int(roster.get("max_revisions", -1)) <= 5):
         raise DeskError("the roster needs max_bot_turns (1 to 20) and max_revisions (0 to 5)")
+    if roster["researcher"]["profile"] in (roster["orchestrator"]["profile"], roster["reviewer"]["profile"]):
+        raise DeskError("the researcher cannot brief or review its own report")
     return roster
 
 
 def hermes_runner(role: str, spec: dict, prompt: str) -> str:
     """One one-shot call to the role's Hermes profile. `clarify` alone means no tools at all.
 
-    Two time limits, both from the roster so they cannot disagree: `run_budget` is soft (at 80% Hermes tells
-    the bot to stop looking and write up what it has; it replaces the profile's own budget for this call) and
-    `timeout` is the hard stop above it."""
+    `timeout` is the hard stop. The bot's soft time budget (at 80% Hermes tells it to stop looking and write up)
+    is a setting of its profile: the one-shot call has no flag for it. The team file sets both and refuses a
+    budget that is not below the timeout."""
     argv = ["hermes", "-p", spec["profile"], "-z", prompt, "-t", spec.get("toolsets", "clarify")]
-    if spec.get("run_budget"):
-        argv += ["--run-budget", str(float(spec["run_budget"]))]
     if spec.get("reasoning"):
         argv += ["--reasoning", str(spec["reasoning"])]
     if spec.get("model"):
@@ -273,7 +278,7 @@ class Desk:
                     (d / "report.json").write_text(json.dumps(report, indent=2) + "\n")
                     requests = check_report(report)
                 if not requests:
-                    verdict = self._turn(d, state, "orchestrator", "review",
+                    verdict = self._turn(d, state, "reviewer", "review",
                                          _review_prompt(question, brief, report, int(self.roster["max_revisions"]) - state["revisions"]))
                     state["note_for_owner"] = _line(verdict.get("note_for_owner"), 600)
                     requests = [_line(r, 300) for r in (verdict.get("requests") or []) if _line(r, 300)][:6]

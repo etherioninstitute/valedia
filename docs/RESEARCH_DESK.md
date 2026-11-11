@@ -1,15 +1,17 @@
 # The research desk
 
-Three specialist bots in one capped room, and you decide what is kept.
+Four seats in one capped room, filled by the trader's existing bots, and you decide what is kept.
 
-| Bot | Hermes profile | Model | Tools | Job |
+| Seat | Bot (Hermes profile) | Model | Tools | Job |
 |---|---|---|---|---|
-| Orchestrator | `valedia-desk-orchestrator` | Claude Sonnet (your subscription) | none | Writes the brief, reviews the report against a rubric |
-| Researcher | `valedia-trading-scout` | local 27B | web only | Reads sources, reports findings with links |
-| Librarian | `valedia-desk-librarian` | local 27B | none | Files a report you approved as a short library note |
+| Orchestrator | Decider (`valedia-trading-decider`) | Claude Sonnet (your subscription) | none | Turns your question into a brief |
+| Researcher | Scout (`valedia-trading-scout`) | local 27B | web only | Reads sources, reports findings with links |
+| Reviewer | Auditor (`valedia-trading-auditor`) | Claude Sonnet | none | Attacks the report against a rubric |
+| Librarian | Decider (`valedia-trading-decider`) | Claude Sonnet | none | Files a report you approved as a short library note |
 
-The roster is `valedia_trader/agents/desk_roster.json`. Each bot has its own instructions (`SOUL.md` in its
-profile), model and tools. The room shares the conversation and nothing else.
+The seats are assigned in `valedia_trader/agents/team.json` (see `docs/TEAM.md`); there are no bots that exist only for
+the desk. The bot that writes the brief is not the one that reviews, and the Scout can do neither. The room shares the
+conversation and nothing else.
 
 ## Use
 
@@ -21,7 +23,7 @@ python -m valedia_trader.agents.desk approve ID --who Burton
 python -m valedia_trader.agents.desk reject ID --who Burton --why "sources too thin"
 ```
 
-`ask` runs the room and stops at `awaiting owner` (the orchestrator accepted the report) or `stopped at the
+`ask` runs the room and stops at `awaiting owner` (the reviewer accepted the report) or `stopped at the
 cap` (it did not, and the bots have used their turns). Either way the next move is yours. `approve` gives the
 librarian one turn to file the note in `research/library/`; from then on the research agents see its title and
 one-sentence takeaway in their prompts as outside reading.
@@ -38,9 +40,11 @@ one-sentence takeaway in their prompts as outside reading.
 
 ## Limits
 
-- The orchestrator judges whether a claim is supported by the evidence quoted beside it. It does not open
+- The reviewer judges whether a claim is supported by the evidence quoted beside it. It does not open
   the links. Open the ones a decision would rest on before you approve.
 - Published results cover periods the research agents are not shown. A note is marked as background, and an
   idea drawn from it still has to pass on data it has not seen; the ledger counts every variation as before.
 - Working rooms (`research/desk/`) are runtime state and are not committed. Approved notes
   (`research/library/`) are.
+- If a run is stopped or a turn hits its hard time limit, the Scout's turn keeps running inside the Hermes gateway and
+  keeps the local model busy until it ends (see Known limits in `docs/TEAM.md`).

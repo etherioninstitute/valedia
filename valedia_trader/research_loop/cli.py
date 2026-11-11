@@ -132,6 +132,16 @@ def _account_limits(paths: LoopPaths) -> dict | None:
         return None
 
 
+def _team_backend(role: str, fallback: str) -> str:
+    """The bot the team file assigns to a role (`hermes:<profile>`); the built-in one if that file is unusable."""
+    try:
+        from valedia_trader.agents import team
+        return team.backend(role)
+    except Exception as exc:                                  # the loop must still run paper trading with a broken team file
+        print(f"warning: team file unusable ({type(exc).__name__}: {exc}); using {fallback}", file=sys.stderr)
+        return fallback
+
+
 def _asker(spec: str, timeout: float | None = None):
     """An agent backend. `timeout` (seconds) is the one knob for how long an agent may take; None waits."""
     kind, _, rest = spec.partition(":")
@@ -236,12 +246,13 @@ def main(argv=None) -> int:
     ap.add_argument("--root", default=None, help="project root (default: the repository)")
     ap.add_argument("--data", default="artifacts/data")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    proposer, skeptic = _team_backend("proposer", "hermes:valedia-trading-decider"), _team_backend("skeptic", "hermes:valedia-trading-auditor")
     sub.add_parser("init")
     sub.add_parser("status")
     p = sub.add_parser("research")
     p.add_argument("--roles", nargs="+", default=["price-analyst", "macro-watcher", "fundamentals-reader"])
-    p.add_argument("--backend", default="hermes:valedia-trading-decider")
-    p.add_argument("--skeptic", default="hermes:valedia-trading-auditor")
+    p.add_argument("--backend", default=proposer)
+    p.add_argument("--skeptic", default=skeptic)
     for name in ("backtest", "seal"):
         p = sub.add_parser(name)
         p.add_argument("id", type=int)
@@ -262,8 +273,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("cycle", help="one full pass of the loop")
     p.add_argument("--refresh", action="store_true", help="download the latest prices first")
     p.add_argument("--no-research", action="store_true", help="skip the research round (test what is already untested)")
-    p.add_argument("--backend", default="hermes:valedia-trading-decider")
-    p.add_argument("--skeptic", default="hermes:valedia-trading-auditor")
+    p.add_argument("--backend", default=proposer)
+    p.add_argument("--skeptic", default=skeptic)
     p.add_argument("--critic", action="store_true", help="run the weekly critic at the end (it always runs on Sundays)")
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
