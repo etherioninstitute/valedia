@@ -115,3 +115,16 @@ def test_narrator_gets_the_facts_and_cannot_break_the_review(desk):
     limits.write_text("{broken")
     out = cr.weekly_review(ledger, journal, days[-1], {}, limits)
     assert "could not be read" in out["findings"][0] and "No strategy is in paper trading." in (journal.dir / f"review-{days[-1].date()}.md").read_text()
+
+
+def test_panel_scorecard_reads_verdicts_and_outcomes_from_the_journal():
+    from valedia_trader.research_loop.critic import panel_scorecard
+    def decision(sym, day, approve): return {"type": "decision", "strategy": "s", "symbol": sym, "day": day, "panel": {"available": True, "approve": approve}}
+    def settled(sym, day, right): return {"type": "panel_settled", "case_id": f"s:{sym}:{day}", "thesis_right": right}
+    entries = [decision("A", "2026-01-05", True), decision("B", "2026-01-05", False), decision("C", "2026-01-06", True),
+               {"type": "decision", "strategy": "s", "symbol": "D", "day": "2026-01-06", "panel": {"available": False}},
+               settled("A", "2026-01-05", True), settled("B", "2026-01-05", False), settled("C", "2026-01-06", False),
+               settled("D", "2026-01-06", True), {"type": "panel_settled", "case_id": "s:A:2026-01-05", "error": "x"}]
+    card = panel_scorecard(entries)
+    assert card == {"settled": 3, "approved": 2, "refused": 1, "approved_came_true": 0.5, "refused_came_true": 0.0}
+    assert panel_scorecard(entries[:4]) is None                       # nothing has reached its horizon yet

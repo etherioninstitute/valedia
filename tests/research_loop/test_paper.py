@@ -122,7 +122,8 @@ def test_operator_halt_file_stops_everything(setup, tmp_path):
     px, t = prices(), trader(setup, halt_file=halt)
     out = t.step(px.iloc[:12], {7: strat()})
     assert out["orders_placed"] == 0 and out["orders_blocked"] == 2
-    assert pp.PaperTrader.__init__.__defaults__[-2] == rg.HALT_FILE      # the default watches the system's own halt file
+    import inspect
+    assert inspect.signature(pp.PaperTrader.__init__).parameters["halt_file"].default == rg.HALT_FILE   # the default watches the system's own halt file
 
 
 class FakeAlpaca:
@@ -156,3 +157,77 @@ def test_alpaca_venue_only_ever_talks_to_a_paper_account():
     assert fake.orders[-1].time_in_force.value == "gtc"
     real = pp.AlpacaPaperVenue("PKNOTAREALKEY", "x")                 # the real client object, never called
     assert "paper-api" in str(real._client._base_url.value)
+
+
+class FakePanel:
+    """Stands in for the decision panel: answers from a script, remembers what it was asked and what was settled."""
+    def __init__(self, approve=True, fail=False, silent=False):
+        self.approve, self.fail, self.silent, self.cases, self.settled = approve, fail, silent, [], []
+
+    def evaluate(self, case_id, case):
+        self.cases.append((case_id, case))
+        if self.fail:
+            raise RuntimeError("panel offline")
+        verdicts = () if self.silent else (SimpleNamespace(member="decider-a", probability=0.7 if self.approve else 0.3, error=None),
+                                           SimpleNamespace(member="vetter-b", probability=0.1, error="timeout"))
+        return SimpleNamespace(approve=self.approve, probability=0.7 if self.approve else 0.3, vetoed=not self.approve,
+                               reasons=() if self.approve else ("vetter-b: event risk",), verdicts=verdicts, dissent=0.0)
+
+    def settle(self, case_id, outcome):
+        self.settled.append((case_id, outcome))
+
+
+FACTS = lambda prices, symbol: {"symbol": symbol, "momentum_20d_pct": 4.2}
+
+
+def test_shadow_mode_records_the_panel_but_never_blocks(setup):
+    px, panel = prices(), FakePanel(approve=False)
+    t = trader(setup, panel=panel, panel_mode="shadow", facts=FACTS)
+    out = t.step(px.iloc[:12], {7: strat()})
+    assert out["orders_placed"] == 2 and out["orders_blocked"] == 0            # a refusal is written down, not enforced
+    decisions = [e for e in t.journal.read() if e["type"] == "decision"]
+    assert all(e["panel"]["approve"] is False and e["panel"]["mode"] == "shadow" for e in decisions)
+    assert decisions[0]["panel"]["members"] == {"decider-a": 0.3, "vetter-b": "error: timeout"}
+    case_id, case = panel.cases[0]
+    assert case_id == f"mom_paper:UP:{px.index[11].date()}" and "closes higher over the next 5 trading days" in case["thesis"]
+    assert case["facts"]["momentum_20d_pct"] == 4.2 and case["facts"]["order_side"] == "buy" and case["facts"]["strategy"] == "mom_paper"
+    assert "closes lower" in panel.cases[1][1]["thesis"]                       # the short is judged on its own direction
+    assert len(t.state["panel_cases"]) == 2
+
+
+def test_veto_mode_blocks_on_a_refusal_and_on_an_unreachable_panel(setup, tmp_path):
+    px = prices()
+    refused = trader(setup, panel=FakePanel(approve=False), panel_mode="veto", facts=FACTS)
+    out = refused.step(px.iloc[:12], {7: strat()})
+    assert out["orders_placed"] == 0 and out["orders_blocked"] == 2
+    blocked = [e for e in refused.journal.read() if e["type"] == "decision"]
+    assert all(e["decision"] == "blocked" and "the panel refused: vetter-b: event risk" in e["risk_check"] for e in blocked)
+    for bad in (FakePanel(fail=True), FakePanel(silent=True)):                 # failing closed: no panel answer, no new risk
+        other = pp.PaperTrader(tmp_path / f"j{id(bad)}", setup[1], halt_file=None, panel=bad, panel_mode="veto", facts=FACTS)
+        res = other.step(px.iloc[:12], {7: strat()})
+        assert res["orders_placed"] == 0 and res["orders_blocked"] == 2
+        assert "could not be reached" in [e for e in other.journal.read() if e["type"] == "decision"][0]["risk_check"]
+    approved = pp.PaperTrader(tmp_path / "ok", setup[1], halt_file=None, panel=FakePanel(approve=True), panel_mode="veto", facts=FACTS)
+    assert approved.step(px.iloc[:12], {7: strat()})["orders_placed"] == 2
+
+
+def test_the_panel_is_scored_after_its_horizon_and_never_asked_about_exits(setup):
+    px, panel = prices(), FakePanel()
+    t = trader(setup, panel=panel, panel_mode="shadow", panel_horizon_days=3, facts=FACTS)
+    for k in range(11, 16):
+        t.step(px.iloc[: k + 1], {7: strat()})
+    first_day = str(px.index[11].date())
+    assert panel.settled[:2] == [(f"mom_paper:UP:{first_day}", 1), (f"mom_paper:DOWN:{first_day}", 1)]     # both theses came true
+    assert all(outcome == 1 for _, outcome in panel.settled)                  # the riser kept rising, the faller kept falling
+    settled = [e for e in t.journal.read() if e["type"] == "panel_settled"]
+    assert len(settled) == len(panel.settled) and all(e["thesis_right"] for e in settled)
+    assert all(c["decided_on"] > first_day for c in t.state["panel_cases"])   # only cases younger than the horizon stay open
+    asked = len(panel.cases)
+    flat = st.RuleStrategy.from_spec({**strat().to_spec(), "entry": {"rule": "momentum", "lookback": 10, "enter": 9.0, "exit": 8.0, "direction": "both"}})
+    t.step(px.iloc[:17], {7: flat})                                            # the book is closed out: orders that only reduce risk
+    assert len(panel.cases) == asked
+    with pytest.raises(ValueError):
+        trader(setup, panel_mode="veto")                                       # veto without a panel
+    with pytest.raises(ValueError):
+        trader(setup, panel=panel, panel_mode="always")
+    assert trader(setup).panel_mode == "off"

@@ -42,6 +42,22 @@ def _fmt(x: float, pct: bool = True) -> str:
     return f"{x:+.2%}" if pct else f"{x:.2f}"
 
 
+def panel_scorecard(entries: list[dict]) -> dict | None:
+    """How the decision panel's verdicts have turned out, from the journal alone. None until a case is settled."""
+    verdict = {}
+    for e in entries:
+        if e.get("type") == "decision" and isinstance(e.get("panel"), dict) and e["panel"].get("available"):
+            verdict[f"{e['strategy']}:{e['symbol']}:{e['day']}"] = bool(e["panel"]["approve"])
+    settled = [(verdict[e["case_id"]], bool(e["thesis_right"])) for e in entries
+               if e.get("type") == "panel_settled" and "thesis_right" in e and e.get("case_id") in verdict]
+    if not settled:
+        return None
+    approved = [right for ok, right in settled if ok]; refused = [right for ok, right in settled if not ok]
+    rate = lambda xs: (sum(xs) / len(xs)) if xs else None
+    return {"settled": len(settled), "approved": len(approved), "refused": len(refused),
+            "approved_came_true": rate(approved), "refused_came_true": rate(refused)}
+
+
 def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies: dict[int, str], limits_file: str | Path,
                   days: int = 7, rules: CriticRules | None = None, apply: bool = True,
                   narrator: Callable[[str], str] | None = None) -> dict:
@@ -78,6 +94,20 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     for e in week:
         if e["type"] == "kill_switch":
             findings.append((None, f"Kill switch {e['decision']} on {e['day']}: {e['reasoning']}"))
+
+    # ---- the decision panel against what happened
+    card = panel_scorecard(everything)
+    if card:
+        a, r = card["approved_came_true"], card["refused_came_true"]
+        text = (f"Decision panel: {card['settled']} judged orders have reached their horizon. It approved {card['approved']}"
+                + (f" ({a:.0%} went the predicted way)" if a is not None else "") + f" and refused {card['refused']}"
+                + (f" ({r:.0%} went the predicted way)" if r is not None else "") + ".")
+        if card["refused"] >= 10 and a is not None and r is not None:
+            text += (" Its refusals picked out worse orders; veto mode is worth considering." if r < a - 0.10
+                     else " Its refusals did no better than its approvals; keep it in shadow mode.")
+        else:
+            text += " Too few refusals to judge whether a veto would help."
+        findings.append((None, text))
 
     # ---- each strategy against its backtest and its prediction
     per_strategy = {}

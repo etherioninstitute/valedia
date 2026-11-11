@@ -1,0 +1,5 @@
+{
+  "mode": "shadow",
+  "horizon_days": 5,
+  "note": "shadow: the decision panel judges every risk-adding paper order and is scored after horizon_days, but blocks nothing. veto: a refusal or an unreachable panel blocks the order. off: the panel is not consulted. Move to veto only when the weekly review shows its refusals would have helped."
+}

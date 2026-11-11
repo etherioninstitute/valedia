@@ -31,6 +31,7 @@ import pandas as pd
 from valedia_trader.backtest.engine import CostModel, buy_and_hold, performance_report, run_backtest
 from valedia_trader.quant_engine import level10_ml_research as research
 from valedia_trader.research_loop import LoopPaths
+from valedia_trader.research_loop.diagnostics import diagnose
 from valedia_trader.research_loop.ledger import HypothesisLedger, LedgerError, SealedPeriodUsed, market_regime
 from valedia_trader.research_loop.strategy import Strategy, run_rules
 
@@ -179,6 +180,28 @@ def _trade_stats(events: list[dict], lo, hi) -> dict:
             "mean_trade_pct": float(np.mean([e["pnl_pct"] for e in closed])) if closed else float("nan")}
 
 
+def _attempt_pvalues(ledger: HypothesisLedger, hypothesis_id: int) -> list[float]:
+    """One-sided p-value of each counted variation's Sharpe (normal approximation), for the multiple-testing view."""
+    out = []
+    for a in ledger.attempts(hypothesis_id):
+        if a.get("sharpe") is None or not a.get("n_obs"):
+            continue
+        z = float(a["sharpe"]) * math.sqrt(float(a["n_obs"]))
+        out.append(0.5 * math.erfc(z / math.sqrt(2.0)))
+    return out
+
+
+def _diagnostics(ledger: HypothesisLedger, hypothesis_id: int, net: pd.Series, market: pd.Series | None,
+                 asset_returns: pd.DataFrame, weights: pd.DataFrame, prediction: "Prediction") -> dict:
+    """The sheet's view of a tested return stream. Information for the reader, the panel and the critic; never a gate."""
+    try:
+        return diagnose(net, benchmark=market, asset_returns=asset_returns, weights=weights,
+                        variation_pvalues=_attempt_pvalues(ledger, hypothesis_id),
+                        drawdown_limit=float(prediction.fail_if_drawdown_above), profit_target=max(0.02, float(prediction.annual_return)))
+    except Exception as exc:                                             # reports must survive a diagnostics fault
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+
 class Gauntlet:
     """Holds the full history, hands out only the development part, and runs the two tests."""
 
@@ -323,6 +346,7 @@ class Gauntlet:
             "checks": {k: {"passed": ok, "detail": d} for k, (ok, d) in checks.items()},
             "verdict": "pass (development); sealed test pending" if passed else "fail",
         }
+        report["diagnostics"] = _diagnostics(ledger, hypothesis_id, net, market, dev.pct_change().iloc[oos], base.weights.iloc[oos], prediction)
         regime = market_regime(dev[[m for m in strategy.market if m in dev.columns]].iloc[oos], dev)
         ledger.record_backtest(hypothesis_id, _clean({k: report[k] for k in ("result", "positive_windows", "deflated_sharpe", "checks", "verdict",
                                                                              "walk_forward", "where_it_loses", "exits")}),
@@ -419,6 +443,8 @@ class Gauntlet:
                   "versus_development": {"sharpe": sharpe - float((last.get("result") or {}).get("sharpe", float("nan")))},
                   "checks": {k: {"passed": ok, "detail": d} for k, (ok, d) in checks.items()},
                   "verdict": "pass" if passed else "fail"}
+        sealed_market = buy_and_hold(prices[[m for m in strategy.market if m in prices.columns]]).iloc[sl]
+        report["diagnostics"] = _diagnostics(ledger, hypothesis_id, res.net.iloc[sl], sealed_market, prices.pct_change().iloc[sl], res.weights.iloc[sl], prediction)
         ledger.record_sealed(hypothesis_id, _clean({k: report[k] for k in ("sealed_period", "market_regime", "result", "checks", "verdict")}),
                              "passed backtest only" if passed else "failed")
         if not passed:

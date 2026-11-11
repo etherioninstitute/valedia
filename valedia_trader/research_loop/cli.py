@@ -148,6 +148,28 @@ def paper_catch_up(trader: PaperTrader, prices: pd.DataFrame, active: dict[int, 
     return [trader.step(prices.loc[:day], active) for day in days]
 
 
+def panel_settings(paths: LoopPaths) -> dict:
+    """How the decision panel takes part in paper trading: config/panel.json, or off when the file is absent."""
+    path = paths.config / "panel.json"
+    cfg = {"mode": "off", "horizon_days": 5}
+    if path.is_file():
+        cfg.update(json.loads(path.read_text()))
+    if cfg["mode"] not in PaperTrader.PANEL_MODES:
+        raise risk_gate.RiskConfigError(f"config/panel.json: mode must be one of {PaperTrader.PANEL_MODES}")
+    return cfg
+
+
+def paper_trader(paths: LoopPaths, venue=None) -> PaperTrader:
+    """The paper trader with the decision panel attached as config/panel.json says."""
+    cfg = panel_settings(paths)
+    if cfg["mode"] == "off":
+        return PaperTrader(paths.journal, paths.risk_limits, venue=venue)
+    from valedia_trader.agents.panel import build_panel
+    panel = build_panel(ledger_path=str(paths.memory / "panel_forecasts.db"))
+    return PaperTrader(paths.journal, paths.risk_limits, venue=venue, panel=panel, panel_mode=cfg["mode"],
+                       panel_horizon_days=int(cfg.get("horizon_days", 5)))
+
+
 def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     """One pass of the loop. Each stage is the same code the single commands run, in the order the
     rules require: research sees the development period only; every untested idea gets its
@@ -191,7 +213,7 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     active = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0] for s in PAPER_STATUSES for h in ledger.search(status=s)}
     journal = Journal(paths.journal)
     if active:
-        steps = paper_catch_up(PaperTrader(paths.journal, paths.risk_limits), prices, active)
+        steps = paper_catch_up(paper_trader(paths), prices, active)
         out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date"}
     else:
         out["paper"] = "nothing has passed its backtest and sealed test"
@@ -298,7 +320,7 @@ def main(argv=None) -> int:
                 from valedia_trader.core.secrets import load_env, secret
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
-            trader = PaperTrader(paths.journal, paths.risk_limits, venue=venue)
+            trader = paper_trader(paths, venue=venue)
             if not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")
             elif venue is not None:

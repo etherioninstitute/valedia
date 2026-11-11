@@ -115,3 +115,26 @@ sealed period, so nothing is in paper trading and the sealed period is unspent f
   correlation threshold). The strategy that gets tested is the library version, which is simpler.
 - Paper trading is a simulated book. A weekly run steps it through each trading day it missed, in order, which gives
   the same book as running daily; a broker mirror cannot do that and would need a weekday run.
+
+## What every report also says (the quant sheet)
+
+Each development and sealed report carries a `diagnostics` block: the quant sheet's formulas applied to the tested return
+stream. It is information, never a gate; the pass/fail checks above are fixed before the test and are not changed by it.
+It answers what a gate cannot: the 95% range of the mean return and the Sharpe t-statistic, beta and alpha against the
+market, exposure to tradable factor proxies, how fat the tails are, results by market state, the multiple-testing view of
+the idea's variations, serial dependence, the volatility forecast and the scale that would hit a volatility target, the
+chance of reaching the predicted return before the failure drawdown, the book's covariance and concentration, a
+cointegration check of its two most correlated holdings, and stability across consecutive blocks.
+
+`python -m valedia_trader.quant_engine` prints where each of the sheet's 50 formulas is used: 42 are in the trading path,
+8 cannot apply (options pricing and order-book imbalance: the trader holds no options and works from daily bars). A test
+fails if a formula is neither used nor explained.
+
+## The decision panel in paper trading
+
+`config/panel.json` sets how the panel takes part: `shadow` (default here), `veto` or `off`. Every paper order that adds
+risk is put to the panel with facts computed in code (`diagnostics.order_facts`: momentum, volatility and its forecast,
+drawdown, value at risk, beta), so every member judges the same numbers. The verdict is written to the journal with the
+order. After `horizon_days` the case is scored against what the asset did, which gives each member a measured Brier
+score. In `veto` mode a refusal, or a panel that cannot be reached, blocks the order; the panel can never create one.
+The weekly review reports how approved and refused orders turned out and says when a veto would have helped.

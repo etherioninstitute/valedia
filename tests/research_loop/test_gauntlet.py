@@ -89,9 +89,13 @@ def test_a_real_edge_passes_development_then_its_one_sealed_test(env):
     assert h["strategy_file"] == "strategies/trend_test.json" and h["strategy_version"] == "1.0.0"
     saved = json.loads((paths.backtests / "trend_test-v1.0.0-attempt1.json").read_text())
     assert saved["verdict"] == rep["verdict"] and saved["sealed_period"].startswith("sealed")
+    diag = saved["diagnostics"]                                           # the sheet's view rides along; it adds no gate
+    assert "error" not in diag and diag["multiple_testing"]["variations"] == 1
+    assert diag["market_exposure"]["beta"] is not None and len(diag["book_risk"]["assets_held"]) >= 2
 
     sealed = g.seal(hid, momentum(), "strategies/trend_test.json")
     assert sealed["verdict"] == "pass" and sealed["sealed_period"][0] == str(g.sealed_start.date())
+    assert "formula" in sealed["diagnostics"]["uncertainty_of_the_mean"]
     assert ledger.get(hid)["status"] == "passed backtest only"
     with pytest.raises(lg.SealedPeriodUsed):
         g.seal(hid, momentum())                                           # once means once

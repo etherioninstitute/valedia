@@ -23,3 +23,4 @@ Repository-map work must not import or execute trading modules or read state/led
 - MiroFish model: `python -m valedia_trader.agents.mirofish_models use <profile>` switches it; `add <name> --lmstudio-key KEY [--weights F.gguf --tokenizer DIR]` registers another model (pinned GGUF = native; otherwise HTTP backends only), `status` lists them. A native candidate must be prepared again after switching.
 - Backtests: `python -m valedia_trader.backtest.walkforward`. Every configuration evaluated is recorded in `artifacts/trials.sqlite`; do not delete it, the Deflated Sharpe gate depends on the true trial count.
 - No live orders without the owner's explicit confirmation.
+- `python -m valedia_trader.quant_engine` shows where each of the 50 formulas is used; `tests/quant_engine/test_wiring.py` fails if one is neither used nor explained. Try new analytics on synthetic series, never a tradable rule on real prices outside the ledger.

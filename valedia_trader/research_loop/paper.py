@@ -20,7 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 import pandas as pd
 
-from valedia_trader.research_loop import risk_gate
+from valedia_trader.research_loop import diagnostics, risk_gate
 from valedia_trader.research_loop.ledger import market_regime
 from valedia_trader.research_loop.strategy import Strategy, run_rules
 
@@ -117,9 +117,20 @@ class AlpacaPaperVenue:
 class PaperTrader:
     """One fake-money account shared by the strategies that reached paper trading."""
 
+    PANEL_MODES = ("off", "shadow", "veto")
+
     def __init__(self, directory: str | Path, limits_file: str | Path, starting_cash: float = 100_000.0,
                  fee_bps: float = 1.0, slippage_bps: float = 2.0, venue: Venue | None = None,
-                 halt_file: str | Path | None = risk_gate.HALT_FILE, min_trade_pct: float = 0.002) -> None:
+                 halt_file: str | Path | None = risk_gate.HALT_FILE, min_trade_pct: float = 0.002,
+                 panel=None, panel_mode: str = "off", panel_horizon_days: int = 5, facts=None) -> None:
+        if panel_mode not in self.PANEL_MODES:
+            raise ValueError(f"panel_mode must be one of {self.PANEL_MODES}")
+        if panel_mode != "off" and panel is None:
+            raise ValueError("a panel is needed for shadow or veto mode")
+        # The decision panel sees every order that adds risk. In shadow mode its verdict is only written
+        # down; in veto mode a refusal (or an unreachable panel) blocks the order. It can never create one.
+        self.panel, self.panel_mode, self.panel_horizon = panel, panel_mode, int(panel_horizon_days)
+        self._facts = facts
         self.dir = Path(directory)
         self.journal = Journal(self.dir)
         self.limits_file, self.halt_file, self.venue = Path(limits_file), halt_file, venue
@@ -127,9 +138,10 @@ class PaperTrader:
         self.state_file, self.latch_file = self.dir / "paper_state.json", self.dir / "kill_switch.json"
         if self.state_file.exists():
             self.state = json.loads(self.state_file.read_text())
+            self.state.setdefault("panel_cases", [])
         else:
             self.state = {"starting_cash": starting_cash, "cash": starting_cash, "positions": {}, "pending": [],
-                          "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}}
+                          "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}, "panel_cases": []}
 
     # ---- book
     def _lot(self, strategy: str, symbol: str) -> dict:
@@ -178,6 +190,51 @@ class PaperTrader:
                                      "realized_pnl": realized, "entry_conditions": o.get("conditions"), "reason": o["reasoning"]})
         self.state["pending"] = still
 
+    # ---- decision panel
+    def _settle_panel(self, prices: pd.DataFrame) -> None:
+        """Score each open panel case whose horizon has passed: was the asset higher (for a buy) than when it was judged?"""
+        if self.panel is None:
+            return
+        still = []
+        for case in self.state.get("panel_cases", []):
+            later = prices.index[prices.index > pd.Timestamp(case["decided_on"])]
+            px = float(prices[case["symbol"]].iloc[-1]) if case["symbol"] in prices.columns else float("nan")
+            if len(later) < case["horizon_days"] or not np.isfinite(px):
+                still.append(case)
+                continue
+            outcome = int((px > case["price"]) if case["side"] == "buy" else (px < case["price"]))
+            try:
+                self.panel.settle(case["case_id"], outcome)
+                self.journal.write(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "symbol": case["symbol"],
+                                                      "thesis_right": bool(outcome), "price_then": case["price"], "price_now": px})
+            except Exception as exc:
+                self.journal.write(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "error": f"{type(exc).__name__}: {exc}"})
+        self.state["panel_cases"] = still
+
+    def _consult_panel(self, day, strategy: Strategy, symbol: str, prices: pd.DataFrame, order: dict, account: dict, px: float) -> dict:
+        """Put one risk-adding order to the panel with facts computed in code. Never raises."""
+        direction = "higher" if order["side"] == "buy" else "lower"
+        try:
+            facts = dict((self._facts or diagnostics.order_facts)(prices, symbol))
+        except Exception as exc:
+            facts = {"symbol": symbol, "facts_unavailable": f"{type(exc).__name__}: {exc}"}
+        facts.update({"strategy": strategy.name, "order_side": order["side"], "order_value_pct_of_equity": order["value"] / account["equity"] * 100.0,
+                      "account_drawdown_pct": account["drawdown_pct"], "open_positions": account["open_positions"], "risk_limits_breached": False})
+        case_id = f"{strategy.name}:{symbol}:{pd.Timestamp(day).date()}"
+        case = {"thesis": f"{symbol} closes {direction} over the next {self.panel_horizon} trading days", "facts": facts}
+        try:
+            d = self.panel.evaluate(case_id, case)
+        except Exception as exc:
+            return {"available": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}", "mode": self.panel_mode}
+        answered = [v for v in d.verdicts if v.error is None]
+        if not answered:
+            return {"available": False, "error": "no panel member answered", "mode": self.panel_mode}
+        self.state["panel_cases"].append({"case_id": case_id, "symbol": symbol, "side": order["side"], "price": px,
+                                          "decided_on": str(pd.Timestamp(day).date()), "horizon_days": self.panel_horizon})
+        return {"available": True, "mode": self.panel_mode, "approve": bool(d.approve), "probability": d.probability, "vetoed": bool(d.vetoed),
+                "dissent": d.dissent, "reasons": list(d.reasons)[:4],
+                "members": {v.member: (v.probability if v.error is None else f"error: {v.error[:60]}") for v in d.verdicts}}
+
     # ---- one trading day
     def step(self, prices: pd.DataFrame, strategies: dict[int, Strategy]) -> dict:
         """Run one day using `prices` up to and including today (its last row). `strategies` maps
@@ -189,6 +246,7 @@ class PaperTrader:
         previous = self.state["history"][-1]["equity"] if self.state["history"] else self.state["starting_cash"]
         before = self.state["history"][-1]["strategy_values"] if self.state["history"] else {}
         self._fill_pending(day, row)
+        self._settle_panel(prices)
         equity = self.equity(row)
         self.state["peak_equity"] = max(self.state["peak_equity"], equity)
         account = {"equity": equity, "daily_loss_pct": max(0.0, (previous - equity) / previous * 100.0),
@@ -225,6 +283,13 @@ class PaperTrader:
                 order = {"symbol": sym, "side": "buy" if delta > 0 else "sell", "value": value, "reduces_risk": bool(reduces),
                          "adds_to_existing": bool(lot["units"]), "position_value_after": abs(target) * px}
                 ok, why = risk_gate.check_order(order, account, limits, latch_file=self.latch_file, halt_file=self.halt_file)
+                panel_view = None
+                if ok and not reduces and self.panel_mode != "off":
+                    panel_view = self._consult_panel(day, s, sym, prices, order, account, px)
+                    if self.panel_mode == "veto" and not (panel_view["available"] and panel_view["approve"]):
+                        ok = False
+                        why = ("the panel could not be reached; in veto mode that blocks new risk" if not panel_view["available"]
+                               else "the panel refused: " + "; ".join(panel_view["reasons"] or ["below its approval threshold"]))
                 ev = latest.get(sym)
                 if ev is not None and ev["date"] == day:
                     why_now = f"{ev['action']}: {ev['reason']}"
@@ -236,6 +301,8 @@ class PaperTrader:
                 entry = {"type": "decision", "hypothesis_id": hid, "strategy": s.name, "version": s.version, "symbol": sym,
                          "market_conditions": cond, "order": order, "account": dict(account),
                          "decision": "placed" if ok else "blocked", "risk_check": why, "reasoning": reasoning}
+                if panel_view is not None:
+                    entry["panel"] = panel_view
                 if ok:
                     placed += 1
                     self.state["pending"].append({"strategy": s.name, "version": s.version, "symbol": sym, "units": delta,
