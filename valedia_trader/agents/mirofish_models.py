@@ -33,7 +33,8 @@ ENV_VAR = "VALEDIA_MIROFISH_MODEL"
 MODEL_ROOT = Path("/Volumes/NIMROD_SSD/Qwen-Weight-Space/models")
 TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                    "model.safetensors.index.json")
-BACKEND_URLS = {"lmstudio": "http://127.0.0.1:1234/v1", "ollama": "http://127.0.0.1:11434/v1"}
+# The local LM Studio-compatible server on this machine listens on 1235 and serves both checkpoints.
+BACKEND_URLS = {"lmstudio": "http://127.0.0.1:1235/v1", "ollama": "http://127.0.0.1:11434/v1"}
 
 
 @dataclass(frozen=True)
