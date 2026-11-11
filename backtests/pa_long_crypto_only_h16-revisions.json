@@ -1,0 +1,182 @@
+{
+  "hypothesis_id": 16,
+  "stopped": "no further edits to try",
+  "passed": false,
+  "best_version": "1.0.0",
+  "best_sharpe": 1.035397528450678,
+  "variations_counted": 6,
+  "revisions_used": 3,
+  "rounds": [
+    {
+      "version": "1.1.0",
+      "parent": "v1.0.0",
+      "probed": [
+        {
+          "label": "inv_more_hysteresis",
+          "dimension": "INV",
+          "kind": "more_hysteresis",
+          "description": "hold longer: lower the exit level from 0.0 to -0.02",
+          "ops": [
+            {
+              "op": "set",
+              "path": "entry.exit",
+              "value": -0.02
+            }
+          ],
+          "contrast": {
+            "score": 0.023584101773994393,
+            "drawdown": 0.004770314908173701,
+            "turnover": 0.005144232613501998,
+            "trades": 0
+          }
+        },
+        {
+          "label": "dom_longer_lookback",
+          "dimension": "DOM",
+          "kind": "longer_lookback",
+          "description": "slow the signal: slow 200 -> 300",
+          "ops": [
+            {
+              "op": "set",
+              "path": "entry.slow",
+              "value": 300
+            }
+          ],
+          "contrast": {
+            "score": 0.07601017255231213,
+            "drawdown": 0.032941155538477984,
+            "turnover": 0.041054696252900924,
+            "trades": -2
+          }
+        }
+      ],
+      "decision": [
+        "INV: best edit 'hold longer: lower the exit level from 0.0 to -0.02' changed the score by +0.024, not more than the margin 0.050",
+        "DOM: 'slow the signal: slow 200 -> 300' raised the score by +0.076 but worsened drawdown",
+        "KEEP_BASE: no edit was supported by the evidence"
+      ]
+    },
+    {
+      "version": "1.2.0",
+      "parent": "v1.0.0",
+      "probed": [
+        {
+          "label": "inv_remove_stop",
+          "dimension": "INV",
+          "kind": "remove_stop",
+          "description": "remove the stop and rely on the exit rule",
+          "ops": [
+            {
+              "op": "set",
+              "path": "risk.stop_loss_pct",
+              "value": null
+            }
+          ],
+          "contrast": {
+            "score": -0.012877003938705167,
+            "drawdown": -0.0009770720492415785,
+            "turnover": -0.059989475320540775,
+            "trades": -4
+          }
+        },
+        {
+          "label": "dom_shorter_lookback",
+          "dimension": "DOM",
+          "kind": "shorter_lookback",
+          "description": "speed up the signal: slow 200 -> 133",
+          "ops": [
+            {
+              "op": "set",
+              "path": "entry.slow",
+              "value": 133
+            }
+          ],
+          "contrast": {
+            "score": -0.10375496447751387,
+            "drawdown": 0.04059783421006491,
+            "turnover": 0.05505971353154715,
+            "trades": 2
+          }
+        }
+      ],
+      "decision": [
+        "INV: best edit 'remove the stop and rely on the exit rule' changed the score by -0.013, not more than the margin 0.050",
+        "DOM: best edit 'speed up the signal: slow 200 -> 133' changed the score by -0.104, not more than the margin 0.050",
+        "KEEP_BASE: no edit was supported by the evidence"
+      ]
+    },
+    {
+      "version": "1.3.0",
+      "parent": "v1.0.0",
+      "probed": [
+        {
+          "label": "dom_more_selective",
+          "dimension": "DOM",
+          "kind": "more_selective",
+          "description": "enter only on a stronger signal: 0.02 -> 0.03",
+          "ops": [
+            {
+              "op": "set",
+              "path": "entry.enter",
+              "value": 0.03
+            }
+          ],
+          "contrast": {
+            "score": -0.050472800963332065,
+            "drawdown": 0.0034679071551624308,
+            "turnover": -0.03572656132894597,
+            "trades": -2
+          }
+        }
+      ],
+      "decision": [
+        "DOM: best edit 'enter only on a stronger signal: 0.02 -> 0.03' changed the score by -0.050, not more than the margin 0.050",
+        "KEEP_BASE: no edit was supported by the evidence"
+      ]
+    }
+  ],
+  "archive": {
+    "best": "v1.0.0",
+    "per_task_best": {
+      "w1": [
+        0.0,
+        "v1.0.0"
+      ],
+      "w2": [
+        1.1654062550861612,
+        "v1.0.0"
+      ],
+      "w3": [
+        1.80746923481448,
+        "v1.0.0"
+      ],
+      "w4": [
+        1.4941769791969424,
+        "v1.0.0"
+      ],
+      "w5": [
+        0.09197022794322553,
+        "v1.0.0"
+      ]
+    },
+    "candidates": [
+      {
+        "id": "v1.0.0",
+        "parent": null,
+        "iteration": 0,
+        "depth": 1,
+        "mean_score": 1.035397528450678,
+        "per_task_scores": {
+          "w1": 0.0,
+          "w2": 1.1654062550861612,
+          "w3": 1.80746923481448,
+          "w4": 1.4941769791969424,
+          "w5": 0.09197022794322553
+        },
+        "children": 0,
+        "layers": []
+      }
+    ]
+  },
+  "strategy_file": "strategies/pa_long_crypto_only_h16.json"
+}

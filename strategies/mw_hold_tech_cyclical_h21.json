@@ -1,6 +1,6 @@
 {
   "name": "mw_hold_tech_cyclical_h21",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "hypothesis": "Hold tech and cyclical risk assets (XLK, QQQ, XLF) when a fast moving average is above a slow one, using the recovery in tech-vs-utilities as the risk-on confirmation.",
   "market": [
     "XLK",
@@ -10,7 +10,7 @@
   "entry": {
     "rule": "ma_cross",
     "enter": 0.02,
-    "exit": 0.0,
+    "exit": -0.02,
     "direction": "long",
     "fast": 50,
     "slow": 200

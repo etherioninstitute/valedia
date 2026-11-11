@@ -21,3 +21,7 @@ tools/repomix-runtime/node_modules/
 # local artefacts
 artifacts/
 .DS_Store
+# research loop runtime state (the journal itself and the reviews are kept)
+journal/paper_state.json
+journal/paper_state.json.tmp
+journal/kill_switch.json

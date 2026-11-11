@@ -9,6 +9,7 @@
     python -m valedia_trader.research_loop paper-step           one paper-trading day for the strategies that passed
     python -m valedia_trader.research_loop critic               the weekly post-mortem
     python -m valedia_trader.research_loop reset-kill-switch --who NAME
+    python -m valedia_trader.research_loop cycle                the whole loop once: research, test, revise, seal, paper, critic
 """
 from __future__ import annotations
 
@@ -125,6 +126,58 @@ def _asker(spec: str):
     raise SystemExit(f"backend must be hermes:<profile> or chat:<model>@<base-url>, not {spec}")
 
 
+def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
+    """One pass of the loop. Each stage is the same code the single commands run, in the order the
+    rules require: research sees the development period only; every untested idea gets its
+    development test; failures are revised within the cap; an idea that passes gets its one sealed
+    test; whatever has passed that is paper traded for the day; the critic reports on Sundays."""
+    from valedia_trader.research_loop.paper import Journal
+    from valedia_trader.research_loop.revision import RevisionEngine
+    out: dict = {"date": str(pd.Timestamp.today().date())}
+    if args.refresh:
+        from valedia_trader.data_and_fees import prices as price_data
+        out["prices"] = price_data.refresh(args.data)
+    prices, dollar, cost = _market(args)
+    g = Gauntlet(prices, dollar, cost, ledger, paths, Criteria())
+    if not args.no_research:
+        roles = {role: _asker(args.backend) for role in ("price-analyst", "macro-watcher", "fundamentals-reader")}
+        res = research_mod.run_research(ledger, paths, g.dev_prices, g.dev_dollar_volume, MARKET, roles,
+                                        _asker(args.skeptic) if args.skeptic else None)
+        out["research"] = {k: v.get("accepted", v.get("objections")) for k, v in res["roles"].items()}
+    tested = {}
+    for h in reversed(ledger.search(market=MARKET, status="untested")):
+        if h["variations_tried"] or ledger.prediction(h["id"]) is None:
+            continue                                        # already in progress, or has no prediction and cannot be tested
+        try:
+            strategy, file = _strategy_for(paths, ledger, h["id"], None)
+            report = g.develop(h["id"], strategy, file)
+            verdict = report["verdict"]
+            if verdict == "fail" and hasattr(strategy, "to_spec"):
+                revised = RevisionEngine(g, ledger, paths).revise(h["id"], strategy)
+                verdict = f"{'pass' if revised['passed'] else 'fail'} after {revised['revisions_used']} revisions"
+                strategy, file = _strategy_for(paths, ledger, h["id"], None)
+            if verdict.startswith("pass"):
+                verdict = "sealed test: " + g.seal(h["id"], strategy, file)["verdict"]
+            tested[h["id"]] = verdict
+        except (GauntletError, LedgerError, SpecError) as exc:
+            tested[h["id"]] = f"refused: {exc}"
+    out["tested"] = tested
+    active = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0] for s in PAPER_STATUSES for h in ledger.search(status=s)}
+    journal = Journal(paths.journal)
+    if active:
+        trader = PaperTrader(paths.journal, paths.risk_limits)
+        if trader.state["last_day"] != str(prices.index[-1].date()):
+            out["paper"] = trader.step(prices, active)
+    else:
+        out["paper"] = "nothing has passed its backtest and sealed test"
+    if args.critic or pd.Timestamp.today().dayofweek == 6:
+        names = {hid: s.name for hid, s in active.items()}
+        last = max((e["day"] for e in journal.read()), default=out["date"])
+        out["critic"] = critic_mod.weekly_review(ledger, journal, last, names, paths.risk_limits)["path"]
+    out["ledger"] = ledger.summary()
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="research_loop", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=None, help="project root (default: the repository)")
@@ -152,6 +205,12 @@ def main(argv=None) -> int:
     p.add_argument("--days", type=int, default=7)
     p = sub.add_parser("reset-kill-switch")
     p.add_argument("--who", required=True)
+    p = sub.add_parser("cycle", help="one full pass of the loop")
+    p.add_argument("--refresh", action="store_true", help="download the latest prices first")
+    p.add_argument("--no-research", action="store_true", help="skip the research round (test what is already untested)")
+    p.add_argument("--backend", default="hermes:valedia-trading-decider")
+    p.add_argument("--skeptic", default="hermes:valedia-trading-auditor")
+    p.add_argument("--critic", action="store_true", help="run the weekly critic at the end (it always runs on Sundays)")
     args = ap.parse_args(argv)
 
     paths = LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths()
@@ -229,6 +288,8 @@ def main(argv=None) -> int:
             print(out["path"])
             for f in out["findings"]:
                 print(" -", f)
+        elif args.cmd == "cycle":
+            print(json.dumps(run_cycle(args, paths, ledger), indent=2, default=str))
         elif args.cmd == "reset-kill-switch":
             trader = PaperTrader(paths.journal, paths.risk_limits)
             print("latch cleared" if trader.reset_latch(args.who, pd.Timestamp.today()) else "the latch was not set")

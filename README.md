@@ -12,6 +12,10 @@ tools/run_legacy_tests.sh                              # legacy flat layer, sand
 .venv/bin/python -m valedia_trader.agents.mirofish_models status
 ```
 
+## Research loop
+
+New ideas go through `python -m valedia_trader.research_loop` (research, backtest, revise, seal, paper-step, critic, or `cycle` for all of it). See [docs/RESEARCH_LOOP.md](docs/RESEARCH_LOOP.md).
+
 ## Layout
 
 | Path | Purpose |

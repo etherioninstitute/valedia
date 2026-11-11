@@ -16,6 +16,7 @@ Repository-map work must not import or execute trading modules or read state/led
 ## Layout since 0.75.0
 
 - `valedia_trader/` is the package for all new code: `core`, `quant_engine` (50 formulas, `formula_registry()`), `agents`, `venues`, `data_and_fees`, `execution_and_risk`, `backtest`. Tests live in `tests/`.
+- `valedia_trader/research_loop/` is the research process every new idea goes through (ledger, strategy shape, gauntlet, kill switch, paper trader, critic, capped revisions). Read `docs/RESEARCH_LOOP.md` before adding a strategy. Do not test an idea outside it: a backtest that is not in `memory/ledger.db` is not counted, and an uncounted backtest makes every Deflated Sharpe wrong. Never read prices past `Gauntlet.dev_prices` when developing an idea.
 - `src/` is the legacy flat layer. Keep it byte-stable unless you are fixing a defect: several modules are pinned by content hash, the trading halt file is located relative to them, and many tests read their source by path. `valedia_trader/core/legacy.py` records the target domain of each module for when it is moved, one family at a time, with its tests.
 - Environment: `uv sync` (Python 3.12, `uv.lock`). New-code tests: `.venv/bin/python -m pytest tests`. Legacy tests: `tools/run_legacy_tests.sh` (sandboxed; restores `state/halt*.json`).
 - Credentials are read from `~/.hermes/.env` (override with `VALEDIA_ENV_FILE`). Never commit secrets; `state/` is ignored.

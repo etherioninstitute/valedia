@@ -123,3 +123,18 @@ Verified rows are transcribed from the legacy fee constants (Kraken, Coinbase, A
 
 `alpaca/equity_regulatory`, `binance/perp`, `binance/spot`, `bybit/perp`, `bybit/spot`, `hyperliquid/perp`, `interactive_brokers/equity`, `interactive_brokers/option`, `kraken/perp`, `okx/perp`, `okx/spot`, `the_odds_api/sportsbook_bet`, `tradier/equity`, `tradier/option`.
 
+
+## Addendum, 2026-11-10 (later the same day)
+
+- Credentials moved to `~/.hermes/secrets/` (owner-only). Nimble v3 runs through Ollama and is pinned by digest.
+- `agents/panel.py`: deciders and vetters (Hermes profiles, Nimble v3, local Qwen) pooled in log-odds with veto and quorum.
+- TimesFM 2.5 (Apache weights) is installed and runs in its own process. Walk-forward verdict: no directional skill at a
+  5-day horizon (rank IC about 0; sleeve Sharpe -0.06 on the holdout; adding it lowered the blend from 1.08 to 0.96). Its
+  80% band was calibrated (80 to 82% coverage). TimesFM 3.0 weights were not used: their licence bars production use.
+- Agent-G2's guidance schedule is ported and used to measure models, not in the decision path. Measured: `qwen3:8b` with
+  thinking off solved 37% of the engine's sizing problems over 120 attempts with about two thirds of the worked steps
+  given (mostly two or more steps left to do), and 8 of 9 in a separate check with only the last step left. Small samples.
+- The Deflated Sharpe now counts distinct configurations (17 at the time, not 27 rows). The best blend's figures became
+  0.869 on the holdout and 0.923 on the full period, still under 0.95.
+- Meta-N and Harness2 are ported as the revision machinery of the research loop. See `docs/RESEARCH_LOOP.md` for the loop,
+  its rules, and the first round's results (six new ideas, none passed).

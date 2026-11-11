@@ -1,0 +1,221 @@
+{
+  "hypothesis_id": 21,
+  "idea": "Hold tech and cyclical risk assets (XLK, QQQ, XLF) when a fast moving average is above a slow one, using the recovery in tech-vs-utilities as the risk-on confirmation.",
+  "strategy": {
+    "name": "mw_hold_tech_cyclical_h21",
+    "version": "1.1.0",
+    "hypothesis": "Hold tech and cyclical risk assets (XLK, QQQ, XLF) when a fast moving average is above a slow one, using the recovery in tech-vs-utilities as the risk-on confirmation.",
+    "market": [
+      "XLK",
+      "QQQ",
+      "XLF"
+    ],
+    "risk": {
+      "max_position_pct": 0.4,
+      "max_open_positions": 3,
+      "max_gross": 1.0,
+      "stop_loss_pct": 0.1,
+      "take_profit_pct": null,
+      "max_holding_days": null
+    }
+  },
+  "strategy_file": "strategies/mw_hold_tech_cyclical_h21.json",
+  "attempt": 4,
+  "revisions_used": 1,
+  "revisions_allowed": 5,
+  "development_period": [
+    "2012-01-03",
+    "2023-02-17"
+  ],
+  "sealed_period": "sealed; not used by this test",
+  "out_of_sample_from": "2013-01-04",
+  "result": {
+    "start": "2013-01-04",
+    "end": "2023-02-17",
+    "years": 10.115079365079366,
+    "total_return": 0.5154604047238251,
+    "cagr": 0.04195521728411533,
+    "annual_vol": 0.04679009800116824,
+    "sharpe": 0.9018464598799377,
+    "sharpe_t_stat": 2.868251650574333,
+    "max_drawdown": 0.08448875993104976,
+    "profit_factor": 1.1998156750500326,
+    "annual_turnover": 0.6290848941151309,
+    "cost_bps_of_traded": 1.6420784899552632,
+    "annual_cost_drag": 0.00010330067729822406,
+    "daily_win_rate": 0.5072577481365241,
+    "trades": 15,
+    "trade_win_rate": 0.6666666666666666,
+    "mean_trade_pct": 0.3004865766955887
+  },
+  "walk_forward": [
+    {
+      "start": "2013-01-04",
+      "end": "2015-01-13",
+      "variant": "base",
+      "return": 0.14576407814465853,
+      "sharpe": 1.6687496160390287
+    },
+    {
+      "start": "2015-01-14",
+      "end": "2017-01-23",
+      "variant": "base",
+      "return": 0.039384131728721794,
+      "sharpe": 0.4911826696902114
+    },
+    {
+      "start": "2017-01-24",
+      "end": "2019-02-01",
+      "variant": "base",
+      "return": 0.06880247702247488,
+      "sharpe": 0.8600661662924579
+    },
+    {
+      "start": "2019-02-04",
+      "end": "2021-02-10",
+      "variant": "base",
+      "return": 0.15201949337566933,
+      "sharpe": 1.0494570142278046
+    },
+    {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": 0.03351320512035194,
+      "sharpe": 0.459911750857461
+    }
+  ],
+  "positive_windows": 1.0,
+  "deflated_sharpe": {
+    "variations_of_idea": 4,
+    "attempts_on_market": 31,
+    "for_idea": 0.9388697198364648,
+    "for_market": 0.6176729176320526,
+    "value": 0.6176729176320526,
+    "variance_of_attempt_sharpes": 0.0005917050475300918
+  },
+  "breaker": {
+    "double_costs": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.5138792547109543,
+      "cagr": 0.0418476915318442,
+      "annual_vol": 0.04678865167902935,
+      "sharpe": 0.899666949598937,
+      "sharpe_t_stat": 2.861319889749152,
+      "max_drawdown": 0.08459218036649707,
+      "profit_factor": 1.199278343706216,
+      "daily_win_rate": 0.5072577481365241
+    },
+    "delayed_fills": {
+      "start": "2013-01-04",
+      "end": "2023-02-17",
+      "years": 10.115079365079366,
+      "total_return": 0.4847691438751289,
+      "cagr": 0.03984976212622193,
+      "annual_vol": 0.0470928746330489,
+      "sharpe": 0.8534000934196039,
+      "sharpe_t_stat": 2.7141717969120136,
+      "max_drawdown": 0.0944869381180965,
+      "profit_factor": 1.1888239706828216,
+      "daily_win_rate": 0.5072577481365241
+    },
+    "worst_periods": [
+      {
+        "start": "2019-12-20",
+        "end": "2020-03-23",
+        "market_return": -0.28139396945959627,
+        "strategy_return": -0.0591746423618541
+      },
+      {
+        "start": "2018-09-25",
+        "end": "2018-12-24",
+        "market_return": -0.21759116652574395,
+        "strategy_return": -0.03309894471658259
+      },
+      {
+        "start": "2022-03-31",
+        "end": "2022-06-30",
+        "market_return": -0.2121887186621232,
+        "strategy_return": -0.004460238146404061
+      },
+      {
+        "start": "2015-11-09",
+        "end": "2016-02-09",
+        "market_return": -0.1500402787133035,
+        "strategy_return": -0.027641898776360696
+      },
+      {
+        "start": "2021-12-13",
+        "end": "2022-03-14",
+        "market_return": -0.1481707725093956,
+        "strategy_return": -0.04268953678667897
+      }
+    ]
+  },
+  "prediction": {
+    "annual_return": 0.07,
+    "win_rate": 0.42,
+    "sharpe": 0.5,
+    "fail_if_sharpe_below": 0.3,
+    "fail_if_drawdown_above": 0.25,
+    "notes": ""
+  },
+  "versus_prediction": {
+    "annual_return": -0.028044782715884675,
+    "win_rate": 0.24666666666666665,
+    "sharpe": 0.4018464598799377
+  },
+  "where_it_loses": {
+    "worst_symbols": {
+      "BTC-USD": 0.0,
+      "XLE": 0.0,
+      "TLT": 0.0
+    },
+    "worst_window": {
+      "start": "2021-02-11",
+      "end": "2023-02-17",
+      "variant": "base",
+      "return": 0.03351320512035194,
+      "sharpe": 0.459911750857461
+    }
+  },
+  "exits": {
+    "exit rule": {
+      "count": 10,
+      "mean_pnl_pct": 0.519660819297189
+    },
+    "stop loss": {
+      "count": 5,
+      "mean_pnl_pct": -0.13786190850761187
+    }
+  },
+  "checks": {
+    "prediction_failure_terms": {
+      "passed": true,
+      "detail": "Sharpe 0.90 (fails below 0.30), drawdown 8.4% (fails above 25%)"
+    },
+    "deflated_sharpe": {
+      "passed": false,
+      "detail": "0.618 against 0.95 (4 variations of the idea, 31 on the market)"
+    },
+    "walk_forward": {
+      "passed": true,
+      "detail": "100% of 5 windows made money"
+    },
+    "double_costs": {
+      "passed": true,
+      "detail": "Sharpe 0.90 at twice the trading costs"
+    },
+    "delayed_fills": {
+      "passed": true,
+      "detail": "Sharpe 0.85 with fills one day late"
+    },
+    "worst_periods": {
+      "passed": true,
+      "detail": "worst result in the market's 5 worst stretches: -5.9%"
+    }
+  },
+  "verdict": "fail"
+}

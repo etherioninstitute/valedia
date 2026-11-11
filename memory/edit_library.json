@@ -1,0 +1,184 @@
+[
+ {
+  "task": "h16",
+  "kind": "more_hysteresis",
+  "dimension": "INV",
+  "description": "hold longer: lower the exit level from 0.0 to -0.02",
+  "adopted": false,
+  "contrast": {
+   "score": 0.023584101773994393,
+   "drawdown": 0.004770314908173701,
+   "turnover": 0.005144232613501998,
+   "trades": 0
+  },
+  "lesson": "more_hysteresis (INV) on h16: score +0.024; not adopted"
+ },
+ {
+  "task": "h16",
+  "kind": "longer_lookback",
+  "dimension": "DOM",
+  "description": "slow the signal: slow 200 -> 300",
+  "adopted": false,
+  "contrast": {
+   "score": 0.07601017255231213,
+   "drawdown": 0.032941155538477984,
+   "turnover": 0.041054696252900924,
+   "trades": -2
+  },
+  "lesson": "longer_lookback (DOM) on h16: score +0.076; not adopted"
+ },
+ {
+  "task": "h16",
+  "kind": "remove_stop",
+  "dimension": "INV",
+  "description": "remove the stop and rely on the exit rule",
+  "adopted": false,
+  "contrast": {
+   "score": -0.012877003938705167,
+   "drawdown": -0.0009770720492415785,
+   "turnover": -0.059989475320540775,
+   "trades": -4
+  },
+  "lesson": "remove_stop (INV) on h16: score -0.013; not adopted"
+ },
+ {
+  "task": "h16",
+  "kind": "shorter_lookback",
+  "dimension": "DOM",
+  "description": "speed up the signal: slow 200 -> 133",
+  "adopted": false,
+  "contrast": {
+   "score": -0.10375496447751387,
+   "drawdown": 0.04059783421006491,
+   "turnover": 0.05505971353154715,
+   "trades": 2
+  },
+  "lesson": "shorter_lookback (DOM) on h16: score -0.104; not adopted"
+ },
+ {
+  "task": "h16",
+  "kind": "more_selective",
+  "dimension": "DOM",
+  "description": "enter only on a stronger signal: 0.02 -> 0.03",
+  "adopted": false,
+  "contrast": {
+   "score": -0.050472800963332065,
+   "drawdown": 0.0034679071551624308,
+   "turnover": -0.03572656132894597,
+   "trades": -2
+  },
+  "lesson": "more_selective (DOM) on h16: score -0.050; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "more_hysteresis",
+  "dimension": "INV",
+  "description": "hold longer: lower the exit level from 0.0 to -0.02",
+  "adopted": true,
+  "contrast": {
+   "score": 0.1308374221566697,
+   "drawdown": 6.905226748177284e-07,
+   "turnover": 0.004875202483254348,
+   "trades": -4
+  },
+  "lesson": "more_hysteresis (INV) on h21: score +0.131; adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "longer_lookback",
+  "dimension": "DOM",
+  "description": "slow the signal: slow 200 -> 300",
+  "adopted": false,
+  "contrast": {
+   "score": 0.03202948991084409,
+   "drawdown": -0.013969129932567048,
+   "turnover": -0.015765886209370916,
+   "trades": -4
+  },
+  "lesson": "longer_lookback (DOM) on h21: score +0.032; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "widen_stop",
+  "dimension": "INV",
+  "description": "widen the stop from 10% to 15%: 5 of 15 exits were stops",
+  "adopted": false,
+  "contrast": {
+   "score": -0.026285341443227028,
+   "drawdown": 0.007448892984228572,
+   "turnover": -0.060555409727759635,
+   "trades": -3
+  },
+  "lesson": "widen_stop (INV) on h21: score -0.026; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "shorter_lookback",
+  "dimension": "DOM",
+  "description": "speed up the signal: slow 200 -> 133",
+  "adopted": false,
+  "contrast": {
+   "score": -0.05153327665715113,
+   "drawdown": -0.011693874195038423,
+   "turnover": -0.04289476346842436,
+   "trades": 2
+  },
+  "lesson": "shorter_lookback (DOM) on h21: score -0.052; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "more_hysteresis",
+  "dimension": "INV",
+  "description": "hold longer: lower the exit level from -0.02 to -0.06",
+  "adopted": false,
+  "contrast": {
+   "score": -0.038133768508670896,
+   "drawdown": 1.358986051691602e-06,
+   "turnover": -0.05436422967204835,
+   "trades": -4
+  },
+  "lesson": "more_hysteresis (INV) on h21: score -0.038; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "more_selective",
+  "dimension": "DOM",
+  "description": "enter only on a stronger signal: 0.02 -> 0.03",
+  "adopted": false,
+  "contrast": {
+   "score": 0.000377379690153834,
+   "drawdown": -0.005843062347351324,
+   "turnover": -0.03770196345645549,
+   "trades": -1
+  },
+  "lesson": "more_selective (DOM) on h21: score +0.000; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "remove_stop",
+  "dimension": "INV",
+  "description": "remove the stop and rely on the exit rule",
+  "adopted": false,
+  "contrast": {
+   "score": -0.06441485708664285,
+   "drawdown": 0.023679029880252944,
+   "turnover": -0.06347397834698498,
+   "trades": -4
+  },
+  "lesson": "remove_stop (INV) on h21: score -0.064; not adopted"
+ },
+ {
+  "task": "h21",
+  "kind": "longer_lookback",
+  "dimension": "DOM",
+  "description": "slow the signal: slow 200 -> 300",
+  "adopted": false,
+  "contrast": {
+   "score": -0.04405375605532158,
+   "drawdown": -0.013968326643668538,
+   "turnover": -0.07548171633307243,
+   "trades": -3
+  },
+  "lesson": "longer_lookback (DOM) on h21: score -0.044; not adopted"
+ }
+]
