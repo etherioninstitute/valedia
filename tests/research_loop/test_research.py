@@ -171,3 +171,14 @@ def test_strategies_are_held_to_the_accounts_kill_switch_limits(env):
                                 {"price-analyst": lambda p: json.dumps({"ideas": [idea("Utilities lead when rates fall for a quarter", strategy=greedy["strategy"])]})},
                                 today="2026-11-11")
     assert unbounded["accepted"][0]["spec"]["risk"]["max_position_pct"] == 0.4                               # no limits given: nothing is cut
+
+
+def test_research_agents_are_called_without_tools(monkeypatch):
+    """Tool-free by code: an agent with file tools could read the sealed prices or another agent's memo."""
+    from types import SimpleNamespace
+    seen = {}
+    monkeypatch.setattr(rs.subprocess, "run", lambda argv, **k: seen.update(argv=argv) or SimpleNamespace(returncode=0, stdout="ok"))
+    assert rs.hermes_asker("valedia-trading-decider")("PROMPT") == "ok"
+    assert seen["argv"] == ["hermes", "-p", "valedia-trading-decider", "-z", "PROMPT", "-t", "clarify"]
+    with pytest.raises(ValueError):
+        rs.hermes_asker("valedia-trading-decider", toolsets="file; rm")

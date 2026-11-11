@@ -311,14 +311,20 @@ def run_research(ledger: HypothesisLedger, paths: LoopPaths, dev_prices: pd.Data
     return summary
 
 
-def hermes_asker(profile: str, timeout: float | None = None, model: str | None = None) -> Asker:
-    """Ask a Hermes profile one-shot (`hermes -p <profile> -z <prompt>`). No timeout by default: a
-    research memo may take a while, and the caller decides when to give up."""
+def hermes_asker(profile: str, timeout: float | None = None, model: str | None = None, toolsets: str = "clarify") -> Asker:
+    """Ask a Hermes profile one-shot (`hermes -p <profile> -z <prompt> -t <toolsets>`). No timeout by default: a
+    research memo may take a while, and the caller decides when to give up.
+
+    The call carries no tools (`clarify` alone means none). A research agent is given everything it may know in
+    its prompt; with file tools it could open the stored prices, which include the sealed period, or another
+    agent's memo, and both rules at the top of this module would then rest on the agent's good behaviour."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise ValueError("invalid profile name")
+    if not re.fullmatch(r"[a-z0-9_-]+(,[a-z0-9_-]+)*", toolsets):
+        raise ValueError("invalid toolsets")
 
     def ask(prompt: str) -> str:
-        argv = ["hermes", "-p", profile, "-z", prompt] + (["-m", model] if model else [])
+        argv = ["hermes", "-p", profile, "-z", prompt, "-t", toolsets] + (["-m", model] if model else [])
         out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         if out.returncode != 0:
             raise RuntimeError(f"hermes exited {out.returncode}")
