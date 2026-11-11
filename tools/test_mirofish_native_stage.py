@@ -51,6 +51,38 @@ class NativeStaging(unittest.TestCase):
             keys=['TMPDIR','XDG_CACHE_HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','HF_HOME','TORCH_HOME','MPLCONFIGDIR','NLTK_DATA','NUMBA_CACHE_DIR','SENTENCE_TRANSFORMERS_HOME']
             for key in keys:self.assertTrue(Path(env[key]).is_relative_to(producer/'tmp'));self.assertTrue(Path(env[key]).is_dir())
             self.assertTrue(Path(env['TIKTOKEN_CACHE_DIR']).is_relative_to(s.BASE));self.assertEqual(list((producer/'backend/uploads/reports').iterdir()),[]);self.assertEqual(list((root/'owned-source/paper_app/state').iterdir()),[]);self.assertEqual(list((producer/'backend/log').iterdir()),[]);self.assertEqual(list((producer/'backend/logs').iterdir()),[])
+    def test_acknowledged_list_is_pinned_and_every_entry_matches_the_file_on_disk(self):
+        table=s.acknowledged_revisions();self.assertEqual(len(table),69);self.assertEqual(s.sha(s.ACKNOWLEDGED_FILE),s.ACKNOWLEDGED_SHA)
+        before=json.loads((s.W16/'review98/before-hashes.json').read_text());frozen={row['path']:row['expected'] for row in before['original318']}
+        for path,row in table.items():
+            self.assertEqual(frozen[path],row['expected_parent_sha256']);self.assertEqual(s.sha(path),row['acknowledged_sha256']);self.assertTrue(row['commits'])
+        self.assertFalse({row['path'] for row in before['selected_candidate_files']}&set(table))  # nothing a candidate copies is on the list
+        drifted={row['path'] for row in before['original318'] if s.sha(row['path'])!=row['expected']}-{str(s.EXTRACTOR_CANONICAL)}
+        self.assertEqual(drifted,set(table))  # the list excuses exactly the files that differ, no more
+    def test_acknowledged_witness_accepts_only_the_exact_path_parent_and_bytes(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            root=Path(folder);file=root/'module.py';file.write_text('acknowledged bytes\n');row={'path':str(file),'expected':'a'*64}
+            table={str(file):{'path':str(file),'expected_parent_sha256':'a'*64,'acknowledged_sha256':s.sha(file),'commits':['abc1234']}}
+            witness=s.acknowledged_revision_witness(row,table);self.assertEqual(witness['kind'],'OWNER_ACKNOWLEDGED_CANONICAL_REVISION_NOT_COPIED')
+            with self.assertRaisesRegex(RuntimeError,'not in the acknowledged list'):s.acknowledged_revision_witness({'path':str(root/'other.py'),'expected':'a'*64},table)
+            with self.assertRaisesRegex(RuntimeError,'not in the acknowledged list'):s.acknowledged_revision_witness({'path':str(file),'expected':'b'*64},table)  # another frozen parent
+            file.write_text('changed again\n')
+            with self.assertRaisesRegex(RuntimeError,'changed after its acknowledged revision'):s.acknowledged_revision_witness(row,table)
+            real=root/'real.py';real.write_text('acknowledged bytes\n');file.unlink();file.symlink_to(real)
+            with self.assertRaises(RuntimeError):s.acknowledged_revision_witness(row,table)
+    def test_acknowledged_list_refuses_edits_other_folders_the_extractor_and_duplicates(self):
+        good={'path':str(s.ACKNOWLEDGED_SCOPE/'x.py'),'expected_parent_sha256':'a'*64,'acknowledged_sha256':'b'*64,'commits':[]}
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            def load(rows,schema=1):
+                file=Path(folder)/'list.json';file.write_text(json.dumps({'schema':schema,'revisions':rows}));return s.acknowledged_revisions(file,s.sha(file))
+            self.assertEqual(list(load([good])),[good['path']])
+            for bad in [dict(good,path=str(s.BASE/'valedia-trader/valedia_trader/x.py')),dict(good,path=str(s.EXTRACTOR_CANONICAL)),dict(good,path=str(s.ACKNOWLEDGED_SCOPE/'..'/'tools'/'x.py')),
+                        dict(good,acknowledged_sha256='a'*64),dict(good,acknowledged_sha256='short'),dict(good,path='src/x.py')]:
+                with self.assertRaises(RuntimeError):load([bad])
+            with self.assertRaises(RuntimeError):load([good,good])
+            with self.assertRaises(RuntimeError):load([good],schema=2)
+            file=Path(folder)/'list.json';file.write_text(json.dumps({'schema':1,'revisions':[good]}))
+            with self.assertRaisesRegex(RuntimeError,'input SHA changed'):s.acknowledged_revisions(file,'c'*64)  # an edited list no longer matches its pin
     def test_compact_prompt_changes_one_ast_constant_and_refuses_source_drift(self):
         source=s.W16/s.ONTOLOGY_REL;raw=source.read_bytes();changed=s.compact_ontology_bytes(raw);self.assertNotEqual(raw,changed)
         old=ast.parse(raw);new=ast.parse(changed)

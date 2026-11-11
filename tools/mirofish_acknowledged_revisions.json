@@ -1,0 +1,576 @@
+{
+ "schema": 1,
+ "decision": "The owner (Burton) approved on 2026-11-11 that these exact later revisions of original canonical files are accepted as known drift from the frozen 2026-11-06 review record.",
+ "scope": "Group 'original318' only, files under valedia-trader/src only, never the signal extractor (it has its own closed witness). None of these files is copied into a candidate: staging still copies the reviewed W16 bytes, so what a candidate runs is unchanged by this list. A pinned file that differs from its frozen hash and is not listed here with exactly its current hash is refused, as before.",
+ "revisions": [
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/arb_live.py",
+   "expected_parent_sha256": "066657d618e2480891c9f9b303feea6602c82c5b548dcc77f8a5493a4d740c74",
+   "acknowledged_sha256": "c1afb4ebd2d6d2433c04ca90d74757d8d029cafaae1c4ac9df66b6277d39b994",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/atlas_research_adapter.py",
+   "expected_parent_sha256": "699e047caf25a7f1e670c49444e72d67be7b50830d15075f5f1ff3991c147c74",
+   "acknowledged_sha256": "b12998033c3791101fa4800ae5d1d9662aaf5164aaaba1f781669d2f520de115",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/claude_bridge.py",
+   "expected_parent_sha256": "6a15d5874c225db1e04069b65f3aa763ec5ac9ef1fecb333d126db518b984a25",
+   "acknowledged_sha256": "cef54f84410a828097dca138ac9e561ec8a1f4f138604c528b03ec31410656f4",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/claude_bridge_server.py",
+   "expected_parent_sha256": "906ea7310badcfc441379b002ff32ed3625c65399b4e459ea9abed72b2c62ecd",
+   "acknowledged_sha256": "56c7404f22068488d60efb92830d59a79fdd63785b3d14da8197b88a1a148248",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/coinbase_trader.py",
+   "expected_parent_sha256": "67743742199760e1dbfb40f76184fbb04b185ddbb3ad3c146478b9d86f929e27",
+   "acknowledged_sha256": "f5e2f1a40ea159c895d8bbc46b15c3d5a9b96e1511978e008edbe11e833a55bd",
+   "commits": [
+    "084f543 2026-11-10 Add the decider/vetter panel and fix a coinbase import regression",
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/dynamic_universe.py",
+   "expected_parent_sha256": "7f8df72302860adf54ea659b6ec7a7e9870e11bd34523f0c9bdbcc6e25d76050",
+   "acknowledged_sha256": "ef04ea1e1de44e4364b6978602ba86ed9197095647cf261fa5590d956e9105ff",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/etoro_client.py",
+   "expected_parent_sha256": "c9156a65cdb472053d5b8c1121b2fe76b05aa8ee60610749e60f9e2e6e2eaf3a",
+   "acknowledged_sha256": "88604ab10344807b9964f6ed1f240235601e8a7e05d14ce1a69f4f3a291c8050",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/fee_engine.py",
+   "expected_parent_sha256": "799e174b1ab941400441c0ac6312dfe5540e5228a74ac057a81201e4f202a86d",
+   "acknowledged_sha256": "59cb2ff99838d9531dcee02596582262afbe148e996112c660c20630156c9d98",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/fred_macro.py",
+   "expected_parent_sha256": "59574162e0355a4e1f3ef9fd9dd4dce02ddb9404c6364528c337bb9011b826d6",
+   "acknowledged_sha256": "a22e3b6bcc35839d9b11b14b6245bd32aa16b07446b5276ae952ffa16d6a4fa5",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/kalshi_auth.py",
+   "expected_parent_sha256": "cfcc960d1139f5bea8577e1d1c2e7648f0c1bd1776d6b36753e0cf3c7216f35b",
+   "acknowledged_sha256": "c689466ae6603097390dba8024d652068bf7affb5bc525a1ae33b27f424c7914",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/kalshi_executor.py",
+   "expected_parent_sha256": "29a7d99637a1f1ad57c12e66d43babacc2fa63f61d86f04cfe534699c681856c",
+   "acknowledged_sha256": "8d29d403ad2e4fb210f527e507111f8f7bd0bbd8fa2531d5864355100d97c45a",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/kalshi_fee_map.py",
+   "expected_parent_sha256": "3cf20e867ff8625fe223dbcc816af5842cf997a2c1db764d0f167f0c8bb6ab52",
+   "acknowledged_sha256": "91f29332bbe8dc18cffa26c2464aa24c68c7f88d201f974a1d9756cf07508e42",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/kraken_client.py",
+   "expected_parent_sha256": "b6777454434e3196cba4ac438ea142ca1be2a299f777429a3de8dbdef56f6576",
+   "acknowledged_sha256": "a4754ff774b619fd7675b4eeee081fb13550fb756dc7aea476a66455d1cc205e",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/market_data.py",
+   "expected_parent_sha256": "050bfea9e31b3e1a546f02dd0c6d913b614909b06de6d9802d611a685f4b181a",
+   "acknowledged_sha256": "a438a5485b655be816c713089ea942d8210407d0283ee564b6c34c2bc8fe18b8",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/master_allocator.py",
+   "expected_parent_sha256": "c80f11c6aca12ad36181a8d4a4ba5bc5f34f9d855772dd3042cb4a829f0cd4cc",
+   "acknowledged_sha256": "6f473dc455e402a28e30ca7efc7605340117ccbd32c0e2a7289aa8660be53cb5",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/okx_client.py",
+   "expected_parent_sha256": "21b614ae93284a7c64ba95e7b1efb53f7966b979f147d9f9bfcb9abecb8c83e1",
+   "acknowledged_sha256": "46266ead5d4be2a022f4b122697451e04c60e4451faa545e2086924ff0801b5a",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/okx_materialize_keys.py",
+   "expected_parent_sha256": "433312f04bf4ab915720b16fb212e2c2aadf192ce19e2180f81adb093c599120",
+   "acknowledged_sha256": "a30088e3eb75418ea9c057fff11f38f0353b200c66bb7798b5d2db394e2a56f6",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/ornith_load_policy.py",
+   "expected_parent_sha256": "92a8500e91e8d91b057a0364c46719f52af95962ff7142a1a73927759a0c84a5",
+   "acknowledged_sha256": "76bbf792389eba397685249bce8e9e651f99cb3d2ef8cd68f5d2f24ad20bfb6d",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/pnl_tracker.py",
+   "expected_parent_sha256": "067091d62c9f5c61cb7b189b6289d4f49adb1f2444380ecd646848433d0681f6",
+   "acknowledged_sha256": "537e4e5e9cceb9b4ea93b30d224a701495cf0830abba66d8a50a322f2728967d",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/poly_us_smoke.py",
+   "expected_parent_sha256": "04a414a0d344429e2e971f0e900d5b56a66a22bb5e2bbd8eaee2481eb6bd97c7",
+   "acknowledged_sha256": "ee6199568c427479f977fd6632464b9581825444886841808ea673c771a13b4c",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/polymarket_us_client.py",
+   "expected_parent_sha256": "58ef97a2f848751a822a46670e98667cf51010fee76b1522acda44a7d09bc9a4",
+   "acknowledged_sha256": "5f4b488fcea0a77d5dc9300f94ec6181f4652b75cb64c4033731c8af8cebe8ba",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/quant_engine.py",
+   "expected_parent_sha256": "f333a76b90ac90dbf998d185564d0649c352636747c6e5f54abb605fdc9eb77a",
+   "acknowledged_sha256": "2da79b62a9841e43338747f90e3ad8974bb5e3e798b11465d9cb1a7b210e2f0f",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/settle_run.py",
+   "expected_parent_sha256": "80686c56cd25e3b7e2a697aa108954b29a63de44851b9a0e3118e3f475610b22",
+   "acknowledged_sha256": "6162b0bea72eb65177835783a264f8326d9138da5e86a1e92ae8cdfa9a7b690f",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/sports_engine.py",
+   "expected_parent_sha256": "706d4e71ab327c3dd8a6b2f24e5e2f0140114fcfe4b5f15b26af65ed2778b22f",
+   "acknowledged_sha256": "ce96b042240f9e38cf4250068387170be28e879171acc09be0c25d1dc5946534",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/systemone_hotpath_client.py",
+   "expected_parent_sha256": "6ec43a6bd170393b6cb2c69a4dbe63f2e0f3fa8073e90b58d8d8a1a1f8c21c19",
+   "acknowledged_sha256": "9cd2c6a6e7e72de688c78429bfbe65d497fe755c02ff6c9a5362f838e4b1c07a",
+   "commits": [
+    "1339dd1 2026-11-10 Restore the Nimble System One client on loopback Ollama for nimble-v3"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_adversarial_paper_fight.py",
+   "expected_parent_sha256": "4ee1091d9ac94a8a3e7624d85c322059c477b42bac1dffd9a3278d39655d3019",
+   "acknowledged_sha256": "8b8d6d5ccacc8b455f1f46f46b0bb1d95c9b5bface4f74e88a8b1c1f5ac0adfc",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_controls_readout.py",
+   "expected_parent_sha256": "2a919b789b7444ef2a376a8aaba27af49eca6979338c90c1a9f457de36cbc497",
+   "acknowledged_sha256": "3ae64c1b26c97da1a7c3bb9daf1a88a99ce804970a34dfec597b82cc225270af",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_crypto_paper.py",
+   "expected_parent_sha256": "950d7d6be1c04e46025d22a0d2b5451ca1aaf3bf16765b2699d7c24e8dcb3e35",
+   "acknowledged_sha256": "bf14402a09a222cb991221669454adace0e72494b9a9f4579982b869b140c4e2",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_crypto_paper_safety.py",
+   "expected_parent_sha256": "c0025aaf373c63ab71b443bd7d25bcf131b379472bbf6ef452d3dd3355f9d2b4",
+   "acknowledged_sha256": "a29d79bf4ceb27866a19083344b813f198ba0bbd8d2e04b691d352e73f2c3607",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_etoro_copy_paper.py",
+   "expected_parent_sha256": "67dcc19f88bf41ddff06cd8822d8cd5f72b1477438b10c7302a4f1e844ca2b40",
+   "acknowledged_sha256": "da9f56c4ec709bb1eaf2c2d5428ecdf0e560c5774725488571a68dd3713e59b5",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_fomo_radar.py",
+   "expected_parent_sha256": "367c5dc772a185b520ffd483c55e11cd3f0a8b5b5e346e8e132c9454c4e82ed6",
+   "acknowledged_sha256": "84da313e153a47e09b611d116f02c62112118b67d7f080fabae57a0509decb9d",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h2.py",
+   "expected_parent_sha256": "fb40252cbdb0e9bd1fc2132c6c7acd9a8a08d6f1680fc2ce8ed7faca3aa4185e",
+   "acknowledged_sha256": "21be419ceb36c6094124a37b85d685484c2ce8de4abd438ddf7065baddcf66c0",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h3.py",
+   "expected_parent_sha256": "a48b8acdd61ba05e220cb147cbc250444441c859972a176c649c29af5f5a1e02",
+   "acknowledged_sha256": "311949fefa5ca9a3280f73fd5dc00b4d1ae19d4e4ac1c854e439639543606c4f",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h4.py",
+   "expected_parent_sha256": "89892092053018715807c9b501836192e5a0b9cdaf0a724d1acf10c849dbd649",
+   "acknowledged_sha256": "3119f7b8c3cd27d1d826d305da0c66d00867922a4ef27daccf81dc27b0877edb",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h5.py",
+   "expected_parent_sha256": "f70915d69e09976073ff4dcc095208cb650d8302b8cfcd26d72a59c46e89a351",
+   "acknowledged_sha256": "c56d855bf2935addb6c1e71104fe1863b2cd86accdb0e3b70ec8547b870575af",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h6.py",
+   "expected_parent_sha256": "38f0a56c79a7337ac66dc280ebc706cb65c63d83b45452aa9ee457e1d3104268",
+   "acknowledged_sha256": "473baa2e556127c7fc71bba38e1074f99fc5d2ee377f53447746c3edc87f8474",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h7.py",
+   "expected_parent_sha256": "83889355096dcc79e414dda5a75b11cefe9652fa3f9977cef3a779768b1e48fc",
+   "acknowledged_sha256": "802bff17bb7df9e6c6c4d311ae98759bc306a800312e0e0396ba74d2d5941a97",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_h8.py",
+   "expected_parent_sha256": "7479a255dd0ad8f9d115d1fc5f5564c0eafcc89f162a40e11c210296809f7d52",
+   "acknowledged_sha256": "d7a7d146e9a4842ee2270d3c86cdfd6ca7fbdfd6011f67d2707146f168f8ad8a",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_informed_before_create.py",
+   "expected_parent_sha256": "d76c7551ecd62116ae3992898620609ffddf6b1332b72f4982b84956ab92036f",
+   "acknowledged_sha256": "ee0ca98839ea84690728cf4b9b55712e78a47481a492c6067aa1665aa18d10a8",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kalshi_fee_map.py",
+   "expected_parent_sha256": "9bf3c59c6deef25a4ee6744c581a5a402dd0ede2d93b216d4d43c9932e9f43e8",
+   "acknowledged_sha256": "9e714bd9ec95a0cc8060efe8f148692995d782d1820579780007c60e92cf4f67",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kalshi_orders_v2.py",
+   "expected_parent_sha256": "34c1f0d963d42caffd7af1967ecac8a75840a44b27073755017ce1695a107ec7",
+   "acknowledged_sha256": "1990ba9fc60f05c833799415c2e9c545f68d8a4d12b950fb6e1c59b20b76866b",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kalshi_profit.py",
+   "expected_parent_sha256": "99e8d3d636bf9ea8c1aea5af45c21846e869c8bd3a28a8f407c77d13236c8de5",
+   "acknowledged_sha256": "b75c613a4f8238e6e88186d42dd416dbaa3809a21656ad64242c2df625f0adf3",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kalshi_quote.py",
+   "expected_parent_sha256": "73226ab7be4f56d667b89e0a010b9dfdce76689d567bf7e930f6687a2b0b7630",
+   "acknowledged_sha256": "0ac59cd09775a41a8101431a3587d6da6d73719c2386be093734d2cf8e6348bc",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kill_switch.py",
+   "expected_parent_sha256": "5e91fd374ef064f04943c788b0b309770d87cdc54e3d14d00bbac40b6063ca7f",
+   "acknowledged_sha256": "905df1f547b0996df887a69e74f58d6920191d913a08a66d169e838fdc571bb6",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_mirofish_bionic.py",
+   "expected_parent_sha256": "1cf4367a3c9d4b94677bc89b322ef1c7bd84dd86023efd43866725abbf40d700",
+   "acknowledged_sha256": "0702fcff4dbd592ba31d166a7236ea4b1d1dd089c6ba726de1a28673a59bf766",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_mirofish_intel_archive.py",
+   "expected_parent_sha256": "d628efb8c891a5c6beb4fadc01f4f058521b47a8f07bf605db4c06b7a348049e",
+   "acknowledged_sha256": "49e394dd5943d63e8fe78ebff7d2b9dd0fb4fa6b328b7f8bfa45df0082960a1a",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_mirofish_smoke.py",
+   "expected_parent_sha256": "75b39f5440057c094c1ed481dfcfc2faddc2c61d17adbb043fada0061480fc4b",
+   "acknowledged_sha256": "2b3f558b052551e175e45c4258973ac8a0bb38e5623597d1510547a9a768b00b",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nt1.py",
+   "expected_parent_sha256": "c841a8ac8986c2426742cc0082297434ab696fa8cc38ed475714c6e8a9ba2b04",
+   "acknowledged_sha256": "d0c1952ce22cdd83e645485442283be94c0462440282bcc6755349605cede0d1",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nt2.py",
+   "expected_parent_sha256": "1f457e8520e673a06512e4652f0e5ba84566d118403f1049a67c0fbbb5672740",
+   "acknowledged_sha256": "c3dfadd6fcc63f2c07932eb8c83e8bb1b9ce7394a9a90c872ebc3973c77e6dfd",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_openterminal_valedia.py",
+   "expected_parent_sha256": "633b851f0f9baea797b3a6a1c9c012a90ad5c88bc393dc3d3eff7f37b63ef577",
+   "acknowledged_sha256": "13ea494279215ec967ed7c43a9fb8357e25054d0ef1248655ae95bd07de16be8",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_poly_e.py",
+   "expected_parent_sha256": "2306c5e5aed360472ac204c0203a212f476a409e8c1de4380c431ffc416e95f7",
+   "acknowledged_sha256": "812e2ee687d6212a0b01273e165ef0b9d90b79ec90289c75d8e23144f776af2f",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_poly_learn.py",
+   "expected_parent_sha256": "0caf3e57982efa63632a87d2a3981c2ef2b9da5ec183498314c64ce3ad4f9cd5",
+   "acknowledged_sha256": "1f52d85276d78958c2e5f28a34ee9e5fa48bd049835fcab83e0554d80669caaa",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_poly_loop.py",
+   "expected_parent_sha256": "f040cbc771a1863ce59baa402dc81d60e6414d3baa18c2bac842d491d3f6dc4d",
+   "acknowledged_sha256": "04f3fb592f0da1d8f999940e191cc134de436028a985cb9e95c25cffc5334be3",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_poly_us.py",
+   "expected_parent_sha256": "8fd17858c449369f9e3ff5b5ea2f8685f531c57be679d96b46e96d217b1460a2",
+   "acknowledged_sha256": "f5444838fe69f7f4648ab88fc1358df48ff3e8d3e7dc45a1e4558e15e55c5b97",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_scan_accuracy.py",
+   "expected_parent_sha256": "586f01911d641196971b604d7ecd3ee817760fa2bde173f6a3b97c99cca7e658",
+   "acknowledged_sha256": "b958ebbc201366e814e301fcf709b52c978288f5ccf12ea44b3887bac50da9d2",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_signal_gate.py",
+   "expected_parent_sha256": "41358119acf879de60a9ddb7b1c168a66b455b7cc1c912fb5a6e1d3e31671484",
+   "acknowledged_sha256": "76034fadb8674c0a11c02852e2df96b83798c29817bbd6d4fb0a575898a25353",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_signal_senders_rest.py",
+   "expected_parent_sha256": "24b1cf1f945178266a2f00a735742ce9075e8478c5aab4db913c2291f7bb293d",
+   "acknowledged_sha256": "80ab022aefdf9a3af4347412a7a9406a3bb64cf6c5c35da51cfb400e53b7106e",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_signal_verify.py",
+   "expected_parent_sha256": "e0a3848f9cb0ef85bf0f87a5c4ba893c9c23fdad0ee26c3d9be40a3e349fa0cc",
+   "acknowledged_sha256": "f0246f7b709c2633da4e635b4fe0e3a0f77553190c0561a5bbcb57f3cb8754dc",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_slice23.py",
+   "expected_parent_sha256": "7dc6117abee5ae3c708c3226ee08b58bedbe87bd2a836dc1a8e00fc4489ae8e1",
+   "acknowledged_sha256": "fa28549a0ecbec56f7b49f71445486f9d685abf646354eaf3d24c969c1735fae",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_treasury.py",
+   "expected_parent_sha256": "95c98ce9fe4a3382d38e17c5333956a664c76c2df95ad445d780a65bed330111",
+   "acknowledged_sha256": "dafa4930a063ffd7d0a917fdbdfa9e3befff8ce18eee10918773e0235b08d5cf",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_valedia_full_smoke.py",
+   "expected_parent_sha256": "7f20d77cb93a9ded3a4ba173eff10fa227edac6d0658bdc7bf55620927de5dd7",
+   "acknowledged_sha256": "3acad227a44d177c3569d9e8a103f34b0d519b93845a45dfa84399fdae120c43",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_vaughan_arb_paper.py",
+   "expected_parent_sha256": "8cc5a579fb29926d44db7cc7fb1019f80042f84d36eca1ea4613368188bb0960",
+   "acknowledged_sha256": "c5cfa0f5f04c909f15709930b84f760a148066fb79723c5e8c47f09aa1946b97",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_vibe_shadow_paper.py",
+   "expected_parent_sha256": "598d504bc60347e2b238848855bbcbd4d27c96eb53d40cb3fc9e0129e799035f",
+   "acknowledged_sha256": "19bf89094ff922d21273f3ea0be39700ec88990501d422988b73e0fb812a38dc",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/unified_brain.py",
+   "expected_parent_sha256": "6f3d08e4ac4c7adf3368e065f1f756ae32d799eec16d4598aa1f1719d415bf44",
+   "acknowledged_sha256": "57d13e269374ec8269504fd0fbe7030ee80a35b3bd17771657c914b5b990dd2e",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/valedia_config.py",
+   "expected_parent_sha256": "dc2207c48dfe7679bb4c44d9079a207a40f1d3ef0962637703dfa095f366d4f3",
+   "acknowledged_sha256": "bd8642d3950cd5340f305d0bd0fb955bf6997ee64db8eae32bb7b094fe895de3",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/valedia_memory.py",
+   "expected_parent_sha256": "8bfed4a42c6ba6c2cacbce02fdd8f1c14883d220fce2ca28189bd578303617b9",
+   "acknowledged_sha256": "7cb332f1e767f8337f610b019fc0ffab168893e5a79c8d4737fe40753f36fc8e",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/vps_proxy.py",
+   "expected_parent_sha256": "56590bc92b9dd54c6903049af34baabe96458ce7a0c37cc3c708647d69c9d7e4",
+   "acknowledged_sha256": "5ed754fd356ae89103a4fe20d332163fc23f77c4f3fd86fbb0b86a1fa64b0eb1",
+   "commits": [
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/weather_arb.py",
+   "expected_parent_sha256": "0684460b3be274b5da38734ec3b3137b38680ec99a7c57c3487c222d391766bb",
+   "acknowledged_sha256": "fe4346b35a3c5e0a6cf9cc5a19fcb09b13b45bd6cda8f4b764fc7b4a61c2c672",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/weather_morning_go.py",
+   "expected_parent_sha256": "5a4e6af1dfdc02f3eb6f08be75b7fd38b1e0ce61843a1bee6d8dcee50e4b270c",
+   "acknowledged_sha256": "993c4849b83e8c0bc9398ec3c66593fe788f84a37360dd1a83e577577b0245f2",
+   "commits": [
+    "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  }
+ ]
+}
