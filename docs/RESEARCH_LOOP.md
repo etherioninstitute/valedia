@@ -28,6 +28,8 @@ is not mounted the job says so in that log and does nothing. `--agent-timeout` i
 may take (30 minutes here, against about 30 seconds typical); an agent that does not answer is noted in its memo and the cycle
 goes on. Each run adds at most six ideas, and every backtest it makes is counted.
 
+A second job file, `tools/launchd/com.valedia.paper.daily.plist`, runs `paper-step --refresh` Monday to Friday at 14:30 local time, after the US close. It steps the built-in paper book through every finished trading day it has not processed yet, so the paper record and the panel's verdicts are made day by day and not reconstructed at the weekend. No broker is involved. It is not installed by default: the two install commands are at the top of the file. Its log is `~/Library/Logs/valedia-paper-daily.log`. Until it is installed, the weekly cycle catches the paper book up on Sundays.
+
 ## Where things are
 
 | Folder | Holds |

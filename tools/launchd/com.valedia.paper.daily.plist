@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Paper trading, every weekday after the US close: refresh prices, then step the paper book through every
+       finished trading day it has not processed yet. It uses the built-in paper book only: no broker, no order
+       leaves this Mac. While the US session is still open, today's unfinished bar is dropped by the code.
+       Install:   cp tools/launchd/com.valedia.paper.daily.plist ~/Library/LaunchAgents/
+                  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.valedia.paper.daily.plist
+       Remove:    launchctl bootout gui/$(id -u)/com.valedia.paper.daily
+                  rm ~/Library/LaunchAgents/com.valedia.paper.daily.plist
+       Run now:   launchctl kickstart gui/$(id -u)/com.valedia.paper.daily
+       Log:       ~/Library/Logs/valedia-paper-daily.log (on the internal disk, so a missing SSD is still reported) -->
+  <key>Label</key><string>com.valedia.paper.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-c</string>
+    <string>REPO=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader
+echo "=== $(date '+%F %T') daily paper step"
+if [ ! -x "$REPO/.venv/bin/python" ]; then echo "SSD not mounted or the environment is missing; nothing was run"; exit 1; fi
+cd "$REPO" || exit 1
+exec .venv/bin/python -m valedia_trader.research_loop paper-step --refresh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/burtonchatelain/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- Monday to Friday 14:30 local time (17:30 New York when this Mac is on Pacific time). If the Mac is asleep
+       then, launchd runs it at the next wake; missed days are caught up by the step itself. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/burtonchatelain/Library/Logs/valedia-paper-daily.log</string>
+  <key>StandardErrorPath</key><string>/Users/burtonchatelain/Library/Logs/valedia-paper-daily.log</string>
+</dict>
+</plist>

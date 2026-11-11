@@ -59,3 +59,24 @@ def test_a_broken_check_is_reported_not_raised(tmp_path, monkeypatch):
     monkeypatch.setitem(D.CHECKS, "repository", lambda paths: (_ for _ in ()).throw(RuntimeError("boom")))
     row = D.run(tmp_path, only=("repository",))[0]
     assert row["status"] == D.FAIL and "the check itself failed: RuntimeError: boom" in row["detail"]
+
+
+def test_schedule_check_names_each_job_and_fails_on_a_bad_exit(monkeypatch, tmp_path):
+    import subprocess
+    from types import SimpleNamespace
+    from valedia_trader import doctor as D
+    from valedia_trader.research_loop import LoopPaths
+
+    def launchd(listing):
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=listing))
+        return D.check_schedule(LoopPaths(tmp_path))
+
+    monkeypatch.setattr(D.Path, "home", classmethod(lambda cls: tmp_path))
+    status, text = launchd("-\t0\tcom.valedia.research-loop.weekly\n-\t0\tcom.valedia.paper.daily\n")
+    assert status == D.OK and "weekly cycle loaded" in text and "daily paper step loaded" in text and "has not run yet" in text
+    status, text = launchd("-\t0\tcom.valedia.research-loop.weekly\n")
+    assert status == D.ATTENTION and "daily paper step is not loaded" in text
+    status, _ = launchd("-\t0\tcom.valedia.research-loop.weekly\n-\t1\tcom.valedia.paper.daily\n")
+    assert status == D.FAIL
+    status, _ = launchd("-\t0\tcom.example.research-loop.weekly.other\n")
+    assert status == D.ATTENTION

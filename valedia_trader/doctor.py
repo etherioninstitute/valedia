@@ -161,18 +161,24 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
 
 
 def check_schedule(paths: LoopPaths) -> tuple[str, str]:
-    label = "com.valedia.research-loop.weekly"
+    jobs = (("com.valedia.research-loop.weekly", "weekly cycle", "valedia-research-loop.log", "Sundays 18:00"),
+            ("com.valedia.paper.daily", "daily paper step", "valedia-paper-daily.log", "weekdays 14:30"))
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10).stdout
     except Exception as exc:
         return ATTENTION, f"could not ask launchd ({type(exc).__name__})"
-    line = next((ln for ln in out.splitlines() if ln.endswith(label)), None)
-    if line is None:
-        return ATTENTION, "the weekly cycle is not loaded; see tools/launchd/"
-    log = Path.home() / "Library" / "Logs" / "valedia-research-loop.log"
-    code = line.split()[1]
-    ran = f"last exit code {code}" if log.exists() else "it has not run yet (Sundays 18:00)"
-    return (OK if code in ("0", "-") else FAIL), f"weekly cycle loaded; {ran}"
+    notes, status = [], OK
+    for label, name, log, when in jobs:
+        line = next((ln for ln in out.splitlines() if ln.split()[-1:] == [label]), None)
+        if line is None:
+            notes.append(f"the {name} is not loaded (see tools/launchd/)"); status = ATTENTION if status == OK else status
+            continue
+        code = line.split()[1]
+        ran = f"last exit code {code}" if (Path.home() / "Library" / "Logs" / log).exists() else f"it has not run yet ({when})"
+        notes.append(f"{name} loaded; {ran}")
+        if code not in ("0", "-"):
+            status = FAIL
+    return status, "; ".join(notes)
 
 
 def check_mirofish(paths: LoopPaths) -> tuple[str, str]:
@@ -213,7 +219,7 @@ def check_repo(paths: LoopPaths) -> tuple[str, str]:
 CHECKS: dict[str, Callable[..., tuple[str, str]]] = {
     "price history": check_data, "hypothesis ledger": check_ledger, "risk limits": check_risk_limits, "kill switch": check_kill_switch,
     "quant sheet": check_quant_sheet, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
-    "research desk": check_desk, "weekly schedule": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
+    "research desk": check_desk, "schedules": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
 }
 
 
