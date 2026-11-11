@@ -3,6 +3,7 @@ point-in-time and causal, and every acceptance gate fails closed."""
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 import warnings
@@ -455,9 +456,15 @@ def fit_hmm(features, n_states: int = 2, covariance_type: str = "full", n_iter: 
     x = _features(features, 20 * n_states)
     model = GaussianHMM(n_components=n_states, covariance_type=covariance_type, n_iter=n_iter,
                         random_state=random_state, tol=1e-4)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model.fit(x)
+    hmm_log = logging.getLogger("hmmlearn")
+    previous_level = hmm_log.level
+    hmm_log.setLevel(logging.ERROR)          # EM plateaus log a "not converging" line per fit
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(x)
+    finally:
+        hmm_log.setLevel(previous_level)
     if not (np.all(np.isfinite(model.means_)) and np.all(np.isfinite(model.transmat_))):
         raise ValueError("HMM fit produced non-finite parameters")
     order, names = _order_states(model)

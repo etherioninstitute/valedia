@@ -26,6 +26,7 @@ from valedia_trader.agents import darwinian as dw
 from valedia_trader.agents import specialists as sp
 from valedia_trader.backtest.engine import BacktestResult, CostModel, buy_and_hold, performance_report, run_backtest
 from valedia_trader.data_and_fees.venue_registry import VenueRegistry
+from valedia_trader.execution_and_risk.buffering import apply_buffer
 from valedia_trader.quant_engine import level10_ml_research as research
 
 CRYPTO = ("BTC-USD", "ETH-USD")
@@ -213,9 +214,13 @@ def main(argv=None) -> dict:
         CommitteeConfig("darwinian+kelly+cro+regimes", regimes=True),
         CommitteeConfig("darwinian+kelly+cro+reflexivity", reflexivity=True),
     ]
+    decided_by_name: dict[str, pd.DataFrame] = {}
     for cfg in configs:
         decided, diags[cfg.name] = run_committee(prices, targets, sleeve_net, cost, cfg, regime)
+        decided_by_name[cfg.name] = decided
         results[cfg.name] = evaluate(cfg.name, decided)
+    # cost control: a no-trade band around the Darwinian blend (width fixed a priori at 10%)
+    results["darwinian+buffer"] = evaluate("darwinian+buffer", apply_buffer(decided_by_name["darwinian"], prices, 0.10))
 
     # ---- one autoresearch cycle using period A only
     a_prices = prices.loc[:a_end]
@@ -264,7 +269,7 @@ def main(argv=None) -> dict:
         report["benchmarks"][name] = {"full": performance_report(_slice(r, START)),
                                       "selection": performance_report(_slice(r, START, a_end)),
                                       "holdout": performance_report(_slice(r, SPLIT))}
-    final = results["darwinian+kelly+cro"]
+    final = results["darwinian+buffer"]
     last = final.weights.iloc[-1]
     px = prices.ffill().iloc[-1]
     report["paper_order_plan"] = {

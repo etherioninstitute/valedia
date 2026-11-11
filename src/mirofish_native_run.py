@@ -439,11 +439,11 @@ def graph_environment(graph, original_home):
     return env
 
 def observer_policy(work,proxy_port=62471,graph_port=62472):
-    from mirofish_native_model import WEIGHT_FILE,SDK_PORT
+    from mirofish_native_model import WEIGHT_FILE,SDK_PORT,TOKENIZER_ROOT
     work=Path(work)
     text=worker_policy(work,work/'owned-source/observer-entry',proxy_port,graph_port)
     extra=['(allow dynamic-code-generation)']
-    for path in [JAVA,QWS/'models/Qwen3.8-27B-MLX-4bit',QWS/'runtime/flint-lmstudio-sdk-2.1.0']:
+    for path in [JAVA,TOKENIZER_ROOT,QWS/'runtime/flint-lmstudio-sdk-2.1.0']:
         extra.append('(allow file-read* file-map-executable (subpath '+_quote(path)+'))')
     extra += ['(allow file-read* file-write* (subpath '+_quote(work)+'))',
               '(allow file-read* file-write* (subpath '+_quote(RUNTIME/'tmp')+'))',
@@ -497,6 +497,9 @@ def prepare_candidate(work):
     observer=work/'owned-source/observer-entry';observer.mkdir()
     for name in ['mirofish_native_run.py','mirofish_native_gateway.py','mirofish_native_model.py','mirofish_native_graph.py','mirofish_native_startup.py','mirofish_native_children.py']:
         target=observer/name;target.write_bytes((PROJECT/'src'/name).read_bytes());target.chmod(0o444)
+    for entry in (review,observer):  # the checkpoint choice travels with the candidate
+        if (PROJECT/'src/mirofish_model_profile.json').exists():
+            target=entry/'mirofish_model_profile.json';target.write_bytes((PROJECT/'src/mirofish_model_profile.json').read_bytes());target.chmod(0o444)
     (builder/'sdk_native.mjs').write_text(SDK_SCRIPT)
     graph_configuration(work,62472)
     (builder/'observer.sb').write_text(observer_policy(work))

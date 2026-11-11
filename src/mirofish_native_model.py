@@ -15,14 +15,53 @@ import time
 import uuid
 from mirofish_native_gateway import NativeRefused, atomic, decode, encoded
 
-TOKENIZER_ROOT = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models/Qwen3.8-27B-MLX-4bit')
-WEIGHT_FILE = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf')
-WEIGHT_BYTES = 18973870528
-WEIGHT_SHA256 = 'c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747'
+# Checkpoint profiles. The active profile is named in mirofish_model_profile.json beside this file
+# (written by `python -m valedia_trader.agents.mirofish_models use <name>`); without that file the
+# checkpoint this pipeline was qualified on is used. A prepared candidate carries its own copy of the
+# file, so a candidate can never change checkpoint after preparation. Each profile is pinned by byte
+# size and SHA-256 and names the tokenizer origin its template admission is built from.
+_MODEL_ROOT = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models')
+MODEL_PROFILES = {
+    'qwen3.8-27b': {
+        'tokenizer_root': _MODEL_ROOT/'Qwen3.8-27B-MLX-4bit',
+        'weight_file': _MODEL_ROOT/'ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf',
+        'weight_bytes': 18973870528,
+        'weight_sha256': 'c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747',
+        'tokenizer_model_type': 'qwen3_5', 'tokenizer_quant_bits': 4,
+        'gguf_selection': {'modelKey': 'qwen3.8-27b', 'path': 'ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf', 'indexedModelIdentifier': 'ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf', 'format': 'gguf', 'publisher': 'ggml-org', 'architecture': 'qwen35', 'quantization': {'name': 'Q4_K_M', 'bits': 4}, 'sizeBytes': 18973870528, 'deviceIdentifier': None, 'vision': False, 'trainedForToolUse': True, 'maxContextLength': 262144, 'sourceSha256': 'c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747'},
+    },
+    'qwen3-8b': {
+        'tokenizer_root': _MODEL_ROOT/'Qwen3-8B-tokenizer',
+        'weight_file': _MODEL_ROOT/'lmstudio-library/Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf',
+        'weight_bytes': 5225374496,
+        'weight_sha256': 'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f',
+        'tokenizer_model_type': 'qwen3', 'tokenizer_quant_bits': None,
+        'gguf_selection': {'modelKey': 'qwen3-8b', 'path': 'Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf', 'indexedModelIdentifier': 'Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf', 'format': 'gguf', 'publisher': 'Qwen', 'architecture': 'qwen3', 'quantization': {'name': 'Q4_K_M', 'bits': 4}, 'sizeBytes': 5225374496, 'deviceIdentifier': None, 'vision': False, 'trainedForToolUse': True, 'maxContextLength': 40960, 'sourceSha256': 'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f'},
+    },
+}
+DEFAULT_MODEL_PROFILE = 'qwen3.8-27b'
+MODEL_PROFILE_FILE = Path(__file__).with_name('mirofish_model_profile.json')
+
+
+def active_model_profile():
+    name = DEFAULT_MODEL_PROFILE
+    if MODEL_PROFILE_FILE.exists():
+        name = json.loads(MODEL_PROFILE_FILE.read_text()).get('profile')
+    if name not in MODEL_PROFILES:
+        raise NativeRefused('unknown MiroFish model profile %r; expected one of %s' % (name, sorted(MODEL_PROFILES)))
+    return name
+
+
+ACTIVE_MODEL_PROFILE = active_model_profile()
+_PROFILE = MODEL_PROFILES[ACTIVE_MODEL_PROFILE]
+TOKENIZER_ROOT = _PROFILE['tokenizer_root']
+WEIGHT_FILE = _PROFILE['weight_file']
+WEIGHT_BYTES = _PROFILE['weight_bytes']
+WEIGHT_SHA256 = _PROFILE['weight_sha256']
 TOKENIZER_FILES = ('config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json')
 # Exact unambiguous public SDK group observed 2026-11-07T14:02:22Z.
 SDK_PORT = 62298
-GGUF_SELECTION = {'modelKey': 'qwen3.8-27b', 'path': 'ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf', 'indexedModelIdentifier': 'ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf', 'format': 'gguf', 'publisher': 'ggml-org', 'architecture': 'qwen35', 'quantization': {'name': 'Q4_K_M', 'bits': 4}, 'sizeBytes': 18973870528, 'deviceIdentifier': None, 'vision': False, 'trainedForToolUse': True, 'maxContextLength': 262144, 'sourceSha256': 'c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747'}
+GGUF_SELECTION = _PROFILE['gguf_selection']
 SDK_FILE = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/runtime/flint-lmstudio-sdk-2.1.0/node_modules/@lmstudio/sdk/dist/index.mjs')
 
 SDK_TOOL_SCHEMA_SOURCE_SHA256 = 'd44c6732b8d7abe4061cf42887dd95c537e2b85ad8000b83d25e7ed706a37b66'
@@ -38,7 +77,7 @@ const client=new LMStudioClient({baseUrl:'ws://127.0.0.1:__SDK_PORT__',clientIde
 const require=(ok,why)=>{if(!ok)throw Error(why)};
 const selection=__GGUF_SELECTION__;
 const key=selection?.modelKey??null, embeddingId='ym-research-embedding';
-const weightSize=18973870528,weightSha='c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747';
+const weightSize=__WEIGHT_BYTES__,weightSha='__WEIGHT_SHA256__';
 let owned=null,ownInfo=null,baselineEmbedding=null;
 const loadAbort=new AbortController();process.once('SIGTERM',()=>loadAbort.abort());process.once('SIGINT',()=>loadAbort.abort());
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
@@ -131,7 +170,7 @@ try{for await(const line of lines){
  try{const x=JSON.parse(line);id=x.id;const data=await action(x);const out=JSON.stringify({id,ok:true,data});require(Buffer.byteLength(out)<=524288,'SDK reply cap');process.stdout.write(out+'\n');}
  catch(e){process.stdout.write(JSON.stringify({id,ok:false,error:String(e).slice(0,1024)})+'\n');}
 }}finally{await client[Symbol.asyncDispose]();}
-""".replace("__GGUF_SELECTION__",json.dumps(GGUF_SELECTION,sort_keys=True)).replace("__SDK_PORT__",str(SDK_PORT)).replace("__SDK_TOOL_SCHEMA_JS__",SDK_TOOL_SCHEMA_JS)
+""".replace("__GGUF_SELECTION__",json.dumps(GGUF_SELECTION,sort_keys=True)).replace("__SDK_PORT__",str(SDK_PORT)).replace("__SDK_TOOL_SCHEMA_JS__",SDK_TOOL_SCHEMA_JS).replace("__WEIGHT_BYTES__",str(WEIGHT_BYTES)).replace("__WEIGHT_SHA256__",WEIGHT_SHA256)
 
 
 def require(ok, reason):
@@ -198,7 +237,7 @@ class TemplateAdmission:
         for name in ['config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json']:
             require(hashlib.sha256((TOKENIZER_ROOT/name).read_bytes()).hexdigest()==manifest[name], 'frozen native model/tokenizer file changed')
         config=decode((TOKENIZER_ROOT/'config.json').read_bytes())
-        require(config.get('model_type')=='qwen3_5' and config.get('quantization',{}).get('bits')==4,'frozen same-base tokenizer origin architecture/quantization drift')
+        require(config.get('model_type')==_PROFILE['tokenizer_model_type'] and (_PROFILE['tokenizer_quant_bits'] is None or config.get('quantization',{}).get('bits')==_PROFILE['tokenizer_quant_bits']),'frozen same-base tokenizer origin architecture/quantization drift')
         tokenizer_config=decode((TOKENIZER_ROOT/'tokenizer_config.json').read_bytes())
         self.tokenizer=Tokenizer.from_file(str(TOKENIZER_ROOT/'tokenizer.json'))
         self.tokens={key: tokenizer_config.get(key,'') for key in ['bos_token','eos_token','unk_token','pad_token']}
