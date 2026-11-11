@@ -154,3 +154,30 @@ def test_the_call_uses_only_flags_the_one_shot_form_accepts_and_the_budget_lives
     f.write_text(json.dumps(bad))
     with pytest.raises(T.TeamError, match="time budget"):
         T.load_team(f)
+
+
+def test_a_cut_off_room_is_resumed_at_review_with_unsourced_findings_dropped(tmp_path):
+    mixed = dict(GOOD, findings=GOOD["findings"] + [{"claim": "A second claim with only a site name.", "source": "example.org (page)", "evidence": "", "confidence": "medium"}])
+    desk, calls = make(tmp_path, {"orchestrator": [BRIEF], "researcher": [mixed, RuntimeError("the run was stopped")], "reviewer": [accept("Trust the linked finding.")],
+                                  "librarian": [NOTE]})
+    state = desk.ask("What does published evidence say about trend following?")
+    assert state["status"] == "failed" and "stopped" in state["error"]            # the second research turn never came back
+    with pytest.raises(D.DeskError):
+        desk.salvage(state["id"], " ")
+    done = desk.salvage(state["id"], "operator")
+    assert done["status"] == "awaiting owner" and done["salvaged_by"] == "operator" and "error" not in done
+    assert done["dropped_unsourced_findings"] == ["A second claim with only a site name."]
+    assert [c[0] for c in calls][-1] == "reviewer" and "Does it work?" in calls[-1][2] and "only a site name" not in calls[-1][2]
+    saved = json.loads((desk.rooms / state["id"] / "report.json").read_text())
+    assert len(saved["findings"]) == 1 and desk.index() == []                    # nothing is filed by a salvage
+    assert desk.approve(state["id"], "Burton")["status"] == "approved"          # and the owner's step still works after it
+    with pytest.raises(D.DeskError):
+        desk.salvage(state["id"], "operator")                                    # an approved room is not reopened
+
+
+def test_salvage_refuses_a_room_with_nothing_usable(tmp_path):
+    bare = dict(GOOD, findings=[{"claim": "No link at all here.", "source": "a book"}])
+    desk, _ = make(tmp_path, {"orchestrator": [BRIEF], "researcher": [bare, RuntimeError("stopped")]})
+    state = desk.ask("What does published evidence say about trend following?")
+    with pytest.raises(D.DeskError, match="nothing usable"):
+        desk.salvage(state["id"], "operator")

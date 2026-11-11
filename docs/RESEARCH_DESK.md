@@ -19,6 +19,7 @@ conversation and nothing else.
 python -m valedia_trader.agents.desk ask "What does published evidence say about X?"
 python -m valedia_trader.agents.desk list
 python -m valedia_trader.agents.desk show ID
+python -m valedia_trader.agents.desk salvage ID --who NAME     # a cut-off room: drop unsourced findings, ask the reviewer once
 python -m valedia_trader.agents.desk approve ID --who Burton
 python -m valedia_trader.agents.desk reject ID --who Burton --why "sources too thin"
 ```
@@ -48,3 +49,6 @@ one-sentence takeaway in their prompts as outside reading.
   (`research/library/`) are.
 - If a run is stopped or a turn hits its hard time limit, the Scout's turn keeps running inside the Hermes gateway and
   keeps the local model busy until it ends (see Known limits in `docs/TEAM.md`).
+- One research pass by the Scout on the local model took 39 minutes in the first real run (about four minutes a step).
+  A returned report costs another pass. Seating a cloud model as researcher in `team.json` would be much faster; it is
+  on the local model so the bulk reading stays free and private.

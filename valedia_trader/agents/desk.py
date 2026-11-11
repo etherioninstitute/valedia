@@ -3,6 +3,7 @@
     python -m valedia_trader.agents.desk ask "QUESTION"        run the room; ends "awaiting owner"
     python -m valedia_trader.agents.desk list
     python -m valedia_trader.agents.desk show ID
+    python -m valedia_trader.agents.desk salvage ID --who NAME   resume a cut-off room at the review step
     python -m valedia_trader.agents.desk approve ID --who NAME   the librarian files it in the library
     python -m valedia_trader.agents.desk reject ID --who NAME --why TEXT
 
@@ -298,6 +299,45 @@ class Desk:
         self._save(d, state)
         return state
 
+    # ---- picking up a room that was cut off
+    def salvage(self, room_id: str, who: str) -> dict:
+        """Resume a room that stopped after a report was saved but before a review (the run was stopped, or the
+        researcher's next turn never came back). Findings without a source link are dropped, by name of who asked,
+        and the reviewer gets one turn on what is left. Nothing is filed: the owner still decides."""
+        d, who = self._dir(room_id), _line(who, 60)
+        state = json.loads((d / "state.json").read_text())
+        if not who:
+            raise DeskError("salvage needs the name of who asked for it")
+        if state["status"] not in ("running", "failed", "stopped at the cap") or not (d / "report.json").is_file():
+            raise DeskError(f"room is {state['status']} or has no saved report; nothing to salvage")
+        report = json.loads((d / "report.json").read_text())
+        kept = [f for f in report["findings"] if _URL.fullmatch(str(f.get("source", "")).strip()) and _line(f.get("claim"), 10)]
+        dropped = [f["claim"][:160] for f in report["findings"] if f not in kept]
+        report["findings"] = kept
+        problems = check_report(report)
+        if problems:
+            raise DeskError("nothing usable is left in the report: " + "; ".join(problems))
+        (d / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        brief = {}
+        for line in (d / "room.jsonl").read_text().splitlines():
+            entry = json.loads(line)
+            if entry["kind"] == "brief" and not entry["error"]:
+                brief = _json(entry["reply"])
+        state.update(salvaged_by=who, salvaged_at=self._now().isoformat(timespec="seconds"), dropped_unsourced_findings=dropped)
+        try:
+            verdict = self._turn(d, state, "reviewer", "review", _review_prompt(state["question"], brief, report, 0), capped=False)
+        except DeskError as exc:
+            state.update(status="stopped at the cap", error=str(exc)[:300])
+            self._save(d, state)
+            raise
+        state["note_for_owner"] = _line(verdict.get("note_for_owner"), 600)
+        requests = [_line(r, 300) for r in (verdict.get("requests") or []) if _line(r, 300)][:6]
+        accepted = str(verdict.get("verdict", "")).strip().lower() == "accept"
+        state.update(status="awaiting owner" if accepted else "stopped at the cap", outstanding=[] if accepted else requests)
+        state.pop("error", None)
+        self._save(d, state)
+        return state
+
     # ---- the owner's decision
     def approve(self, room_id: str, who: str) -> dict:
         d, who = self._dir(room_id), _line(who, 60)
@@ -379,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("ask").add_argument("question")
     sub.add_parser("list")
     sub.add_parser("show").add_argument("id")
+    p = sub.add_parser("salvage", help="resume a cut-off room at the review step: drop findings without a link, ask the reviewer once")
+    p.add_argument("id"); p.add_argument("--who", required=True)
     p = sub.add_parser("approve"); p.add_argument("id"); p.add_argument("--who", required=True)
     p = sub.add_parser("reject"); p.add_argument("id"); p.add_argument("--who", required=True); p.add_argument("--why", required=True)
     args = ap.parse_args(argv)
@@ -399,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
             report = desk.rooms / args.id / "report.json"
             if report.is_file():
                 print(report.read_text())
+        elif args.cmd == "salvage":
+            print(json.dumps(desk.salvage(args.id, args.who), indent=2))
         elif args.cmd == "approve":
             print(json.dumps(desk.approve(args.id, args.who), indent=2))
         elif args.cmd == "reject":
