@@ -232,3 +232,17 @@ def test_regime_capital_gating():
     assert L10.regime_capital_multipliers([0.0, 0.0], table) == {"trend": 0.0, "market_making": 0.0}
     with pytest.raises(ValueError):
         L10.regime_capital_multipliers([0.5, 0.5], {"bad": [1.5, 0.0]})
+
+
+def test_trial_registry_counts_a_rerun_of_the_same_configuration_once():
+    reg = L10.TrialRegistry()
+    reg.record("a", 0.05, 500, {"lookback": 20})
+    reg.record("b", 0.02, 500)
+    reg.record("a", 0.05, 500, {"lookback": 20})            # identical re-run
+    reg.record("a", 0.07, 500, {"lookback": 40})            # same strategy, new parameters: a new trial
+    reg.record("b", 0.03, 500)                              # re-run after a data refresh: latest value wins
+    assert reg.n_trials() == 5 and reg.n_distinct() == 3
+    assert sorted(reg.distinct_sharpes()) == pytest.approx([0.03, 0.05, 0.07])
+    assert reg.distinct_sharpe_variance() == pytest.approx(np.var([0.03, 0.05, 0.07], ddof=1))
+    with pytest.raises(ValueError):
+        L10.TrialRegistry().distinct_sharpe_variance()

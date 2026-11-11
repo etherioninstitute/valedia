@@ -276,6 +276,22 @@ class TrialRegistry:
             raise ValueError("need at least 2 recorded trials")
         return float(s.var(ddof=1))
 
+    def distinct_sharpes(self) -> np.ndarray:
+        """One Sharpe per distinct configuration (strategy name and parameters), taking its latest
+        record. Running the same configuration again is the same trial, not a new one."""
+        rows = self._db.execute("SELECT sharpe FROM trials WHERE id IN (SELECT MAX(id) FROM trials "
+                                "GROUP BY strategy, params) ORDER BY id")
+        return np.array([row[0] for row in rows], dtype=float)
+
+    def n_distinct(self) -> int:
+        return int(self.distinct_sharpes().size)
+
+    def distinct_sharpe_variance(self) -> float:
+        s = self.distinct_sharpes()
+        if s.size < 2:
+            raise ValueError("need at least 2 distinct recorded trials")
+        return float(s.var(ddof=1))
+
     def close(self) -> None:
         self._db.close()
 

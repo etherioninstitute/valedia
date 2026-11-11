@@ -49,7 +49,8 @@ dependencies = [
 ta = ["TA-Lib>=0.6"]
 mirofish = ["neo4j>=5.20", "tokenizers>=0.19"]
 memory = ["openai>=1.40"]
-forecast = ["torch>=2.4", "huggingface_hub>=0.24"]
+forecast = ["timesfm[torch]>=3.0.2"]
+paper = ["alpaca-py>=0.33"]
 
 [dependency-groups]
 dev = ["pytest>=8.2", "pytest-timeout>=2.3", "ruff>=0.6"]

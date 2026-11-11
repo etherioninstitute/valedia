@@ -170,6 +170,8 @@ def main(argv=None) -> dict:
     ap.add_argument("--trials", default="artifacts/trials.sqlite")
     ap.add_argument("--capital", type=float, default=1_000_000.0)
     ap.add_argument("--mutations", type=int, default=3)
+    ap.add_argument("--forecast", choices=["none", "timesfm"], default="none",
+                    help="also evaluate the TimesFM forecast sleeve and its naive-drift control")
     args = ap.parse_args(argv)
 
     prices, dollar = load_universe(args.data)
@@ -222,6 +224,42 @@ def main(argv=None) -> dict:
     # cost control: a no-trade band around the Darwinian blend (width fixed a priori at 10%)
     results["darwinian+buffer"] = evaluate("darwinian+buffer", apply_buffer(decided_by_name["darwinian"], prices, 0.10))
 
+    # ---- foundation-model forecast sleeve, with a naive-drift control run through the same pipeline
+    forecast_report = None
+    forecast_names: list[str] = []
+    if args.forecast == "timesfm":
+        from valedia_trader.data_and_fees import timesfm_forecaster as tf
+        fparams = {"horizon": 5, "step": 5, "context": 512, "min_context": 128}     # fixed before any result was seen
+        windows = {"selection": (START, a_end), "holdout": (SPLIT, None),
+                   "after_checkpoint_published": (tf.CHECKPOINT.published, None)}
+        model = tf.TimesFMBackend()
+        # causality on the real model over a short prefix; the tolerance allows batch-order float noise
+        leaks["timesfm"] = research.detect_lookahead(
+            lambda df: tf.forecast_sleeve(df, tf.walk_forward_signals(df, model, **fparams)), prices.iloc[:700],
+            n_checks=2, rtol=1e-4, atol=1e-6)
+        if leaks["timesfm"]:
+            raise RuntimeError(f"look-ahead detected in the forecast sleeve: {leaks['timesfm']}")
+        quality, f_targets = {}, {}
+        for label, backend in (("timesfm", model), ("naive_drift", tf.NaiveDriftBackend())):
+            sig = tf.walk_forward_signals(prices, backend, cache_dir=Path(args.data).parent / "forecasts", **fparams)
+            quality[label] = tf.evaluate_signals(prices, sig, fparams["horizon"], fparams["step"], windows)
+            w = tf.forecast_sleeve(prices, sig)
+            for c in CRYPTO:
+                if c in w:
+                    w[c] = w[c].clip(lower=0.0)
+            f_targets[label] = w
+            results[f"sleeve:{label}"] = evaluate(f"sleeve:{label}", w)
+        model.close()
+        five = {**targets, "timesfm": f_targets["timesfm"]}
+        five_net = sleeve_net.assign(timesfm=results["sleeve:timesfm"].net)
+        cfg5 = CommitteeConfig("darwinian+timesfm", kelly=False, cro=False)
+        decided, diags[cfg5.name] = run_committee(prices, five, five_net, cost, cfg5, regime)
+        results["darwinian+timesfm+buffer"] = evaluate("darwinian+timesfm+buffer", apply_buffer(decided, prices, 0.10))
+        forecast_names = ["sleeve:timesfm", "sleeve:naive_drift", "darwinian+timesfm+buffer", "darwinian+buffer"]
+        forecast_report = {"checkpoint": {"name": tf.CHECKPOINT.name, "repo": tf.CHECKPOINT.repo, "revision": tf.CHECKPOINT.revision,
+                                          "license": tf.CHECKPOINT.license, "published": tf.CHECKPOINT.published},
+                           "params": fparams, "signal_quality": quality}
+
     # ---- one autoresearch cycle using period A only
     a_prices = prices.loc[:a_end]
 
@@ -244,7 +282,8 @@ def main(argv=None) -> dict:
     decided, diags[best_cfg.name] = run_committee(prices, t_targets, t_net, cost, best_cfg, regime)
     results[best_cfg.name] = evaluate(best_cfg.name, decided)
 
-    n_trials, v = trials.n_trials(), trials.sharpe_variance()
+    # The Deflated Sharpe uses distinct configurations: running the same one again is not a new trial.
+    n_trials, v = trials.n_distinct(), trials.distinct_sharpe_variance()
     bench = {"SPY buy-and-hold": buy_and_hold(prices[["SPY"]]), "BTC buy-and-hold": buy_and_hold(prices[["BTC-USD"]]),
              "equal-weight universe": buy_and_hold(prices)}
     report = {
@@ -255,7 +294,8 @@ def main(argv=None) -> dict:
         "costs": {"commission_bps_per_side": cost.fees_bps, "half_spread_bps_assumed": HALF_SPREAD_BPS,
                   "borrow_annual_assumed": BORROW_ANNUAL, "impact": "square-root law, Y = 1, 20-day dollar ADV",
                   "stale_fee_sources": stale[["venue", "product", "age_days"]].to_dict("records")},
-        "trials": {"n_trials_recorded": n_trials, "variance_of_trial_sharpes": v,
+        "trials": {"n_trials_recorded": n_trials, "rows_in_registry_including_reruns": trials.n_trials(),
+                   "variance_of_trial_sharpes": v,
                    "expected_max_sharpe_per_period": research.expected_max_sharpe(n_trials, v)},
         "lookahead_check": leaks,
         "autoresearch": {"mutations": outcomes, "tuned_params": tuned_params, "base_params": base_params},
@@ -269,6 +309,12 @@ def main(argv=None) -> dict:
         report["benchmarks"][name] = {"full": performance_report(_slice(r, START)),
                                       "selection": performance_report(_slice(r, START, a_end)),
                                       "holdout": performance_report(_slice(r, SPLIT))}
+    if forecast_report is not None:
+        pub = forecast_report["checkpoint"]["published"]
+        forecast_report["after_checkpoint_published"] = {
+            **{name: _report(results[name], pub, None, n_trials, v) for name in forecast_names},
+            **{f"benchmark:{name}": performance_report(_slice(r, pub)) for name, r in bench.items()}}
+        report["forecast"] = forecast_report
     final = results["darwinian+buffer"]
     last = final.weights.iloc[-1]
     px = prices.ffill().iloc[-1]
