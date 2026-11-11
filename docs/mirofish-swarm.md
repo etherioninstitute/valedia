@@ -37,6 +37,18 @@ The run shows the pipeline at scale. It is not a forecast and says nothing about
 - About 15 minutes for `report64_coverage`; an estimated 2.5 to 3.5 hours for `swarm48` (one model call at a time,
   roughly 400 calls). The estimate comes from the 2026-11-08 run's per-call times; a swarm has not been run before.
 
+## What the 2026-11-11 runs showed
+
+- **The model server's internal port moves.** The reviewed sources fix the port seen on 2026-11-08. The server app picks a new
+  one at every restart, so staging now detects the live port and carries it into the model source, the generated helper
+  script and the sandbox rule, as one more checked change. A staged folder is good only until the server app restarts;
+  stage again after that.
+- **The check run worked end to end**: own model loaded, graph qualified, 4 agents, 4 simulation calls, a three-section
+  report, 43 model calls in 881 s, cleanup proven.
+- **Its final verdict was a refusal, and that is by design.** The last step turns the report into a signal and refuses a
+  neutral one as "not usable evidence" (within 5 points of 50; this report gave NVDA 50.7, hold). So `complete: true`
+  needs a report that leans one way. A neutral outcome is a result, not a fault.
+
 ## Stage, gate, launch
 
 Each staged folder can be launched once. A gate is a small file naming the staged candidate's hash and an expiry at most
