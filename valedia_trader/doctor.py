@@ -187,6 +187,20 @@ def check_mirofish(paths: LoopPaths) -> tuple[str, str]:
                                              + "; a native run still needs the owner's decision on the staging guard")
 
 
+def check_desk(paths: LoopPaths) -> tuple[str, str]:
+    import os
+    from valedia_trader.agents import desk as D
+    roster = D.load_roster()
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    missing = [f"{role} ({roster[role]['profile']})" for role in D.ROLES if not (home / "profiles" / roster[role]["profile"] / "config.yaml").is_file()]
+    if missing:
+        return FAIL, "no Hermes profile for the " + ", ".join(missing)
+    d = D.Desk(paths, roster)
+    waiting = [s["id"] for s in d.rooms_list() if s["status"] in ("awaiting owner", "stopped at the cap")]
+    text = f"3 bots, room capped at {roster['max_bot_turns']} turns; {len(d.index())} approved notes in the library"
+    return (ATTENTION, text + f"; {len(waiting)} report(s) wait for your decision (`python -m valedia_trader.agents.desk list`)") if waiting else (OK, text)
+
+
 def check_repo(paths: LoopPaths) -> tuple[str, str]:
     try:
         dirty = subprocess.run(["git", "-C", str(paths.root), "status", "--porcelain"], capture_output=True, text=True, timeout=20).stdout.strip()
@@ -199,7 +213,7 @@ def check_repo(paths: LoopPaths) -> tuple[str, str]:
 CHECKS: dict[str, Callable[..., tuple[str, str]]] = {
     "price history": check_data, "hypothesis ledger": check_ledger, "risk limits": check_risk_limits, "kill switch": check_kill_switch,
     "quant sheet": check_quant_sheet, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
-    "weekly schedule": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
+    "research desk": check_desk, "weekly schedule": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
 }
 
 

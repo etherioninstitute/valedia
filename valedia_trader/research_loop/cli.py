@@ -116,6 +116,12 @@ def _strategy_for(paths: LoopPaths, ledger: HypothesisLedger, hid: int, file: st
     raise SpecError(f"no strategy file found for hypothesis {hid}; pass --file")
 
 
+def _reading(paths: LoopPaths) -> list[dict]:
+    """The research desk's owner-approved library notes, for the research agents' prompts."""
+    from valedia_trader.agents.desk import library_reading
+    return library_reading(paths)
+
+
 def _account_limits(paths: LoopPaths) -> dict | None:
     """The kill switch's limits for the research agents to design within; None if the file is unusable
     (in which case the kill switch blocks every order anyway)."""
@@ -190,7 +196,7 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
         roles = {role: _asker(args.backend, args.agent_timeout) for role in ("price-analyst", "macro-watcher", "fundamentals-reader")}
         res = research_mod.run_research(ledger, paths, g.dev_prices, g.dev_dollar_volume, MARKET, roles,
                                         _asker(args.skeptic, args.agent_timeout) if args.skeptic else None,
-                                        account_limits=_account_limits(paths))
+                                        account_limits=_account_limits(paths), reading=_reading(paths))
         out["research"] = {k: v.get("accepted", v.get("objections")) for k, v in res["roles"].items()}
     tested = {}
     for h in reversed(ledger.search(market=MARKET, status="untested")):
@@ -283,7 +289,8 @@ def main(argv=None) -> int:
             g = Gauntlet(prices, dollar, cost, ledger, paths)
             askers = {role: _asker(args.backend) for role in args.roles}
             out = research_mod.run_research(ledger, paths, g.dev_prices, g.dev_dollar_volume, MARKET, askers,
-                                            _asker(args.skeptic) if args.skeptic else None, account_limits=_account_limits(paths))
+                                            _asker(args.skeptic) if args.skeptic else None, account_limits=_account_limits(paths),
+                                            reading=_reading(paths))
             print(json.dumps({k: v for k, v in out.items() if k != "accepted"}, indent=2))
             for r in out["accepted"]:
                 print(f"accepted #{r['hypothesis_id']}: {r['idea']}  ->  {r['strategy_file']}")
