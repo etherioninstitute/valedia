@@ -122,6 +122,17 @@ class NativeStaging(unittest.TestCase):
         try:
             with self.assertRaisesRegex(RuntimeError,'swarm scenario changed'):s.swarm_scenario('swarm48')
         finally:s.SWARM['swarm48']=original
+    def test_sdk_port_is_one_integer_in_the_model_source_and_one_rule_in_the_policy(self):
+        raw=(s.W16/sorted(s.MODEL_COPIES)[0]).read_bytes();self.assertEqual(len({s.sha(s.W16/r) for r in s.MODEL_COPIES}),1)
+        changed=s.sdk_port_bytes(raw,59671);before,after=s.integer_literals(raw),s.integer_literals(changed)
+        self.assertEqual(sum(a!=b for a,b in zip(before,after)),1);self.assertIn(b'SDK_PORT = 59671',changed);self.assertNotIn(b'62298',changed)
+        for bad in (s.ORIGINAL_SDK_PORT,s.SERVER_PORT,80,70000,'59671',59671.0):
+            with self.assertRaises(RuntimeError):s.sdk_port_bytes(raw,bad)
+        with self.assertRaisesRegex(RuntimeError,'original source drift'):s.sdk_port_bytes(raw+b'\n',59671)
+        policy='(version 1)\n(deny default)\n(allow network-outbound (remote ip "localhost:1235"))\n(allow network-outbound (remote ip "localhost:62298"))\n'
+        moved=s.sdk_port_policy(policy,59671);self.assertIn('"localhost:59671"',moved);self.assertIn('"localhost:1235"',moved);self.assertNotIn('62298',moved);self.assertEqual(moved.count('allow network-outbound'),2)
+        with self.assertRaises(RuntimeError):s.sdk_port_policy(policy.replace('62298','62299'),59671)   # the reviewed rule is not there
+        with self.assertRaises(RuntimeError):s.sdk_port_policy(policy+policy,59671)                    # ambiguous
     def test_compact_prompt_changes_one_ast_constant_and_refuses_source_drift(self):
         source=s.W16/s.ONTOLOGY_REL;raw=source.read_bytes();changed=s.compact_ontology_bytes(raw);self.assertNotEqual(raw,changed)
         old=ast.parse(raw);new=ast.parse(changed)
