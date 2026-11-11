@@ -3,7 +3,7 @@
   "min_deciders": 2,
   "min_vetters": 1,
   "veto_rule": "any",
-  "notes": "Scout and the 27B decider load Qwen3.8-27B (MLX 4-bit in Bionic, model key qwen/qwen3.8-27b, about 16 GB plus cache); on a 64 GB machine enable them only when other large models are unloaded.",
+  "notes": "Scout and the 27B decider load Qwen3.8-27B (MLX 4-bit in Bionic, model key qwen/qwen3.8-27b, about 16 GB plus cache); on a 64 GB machine enable them only when other large models are unloaded. Hermes members answer with no tools by default (toolsets 'clarify', which Hermes switches off in one-shot mode). Give a member a tool only when its job needs one, by naming the toolset on that member, for example \"toolsets\": \"web\"; \"toolsets\": null uses the profile's own pruned set. Measured on the local 27B: a scout allowed the web tool took 97 s and searched although the prompt says to judge only the facts given; tool-free it takes 25-55 s.",
   "members": [
     {
       "name": "valedia-trading-scout",
