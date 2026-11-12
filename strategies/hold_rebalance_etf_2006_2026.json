@@ -1,0 +1,42 @@
+{
+  "name": "hold_rebalance_etf_2006_2026",
+  "version": "1.0.0",
+  "hypothesis": "Shares, bonds, gold and commodities pay for the risk of holding them, and a volatility-sized mix earns it steadily",
+  "market": [
+    "DBC",
+    "EEM",
+    "EFA",
+    "GLD",
+    "IEF",
+    "IWM",
+    "LQD",
+    "QQQ",
+    "SPY",
+    "TLT",
+    "XLE",
+    "XLF",
+    "XLK",
+    "XLU",
+    "XLV"
+  ],
+  "entry": {
+    "rule": "hold",
+    "enter": 1,
+    "exit": 0,
+    "direction": "long"
+  },
+  "sizing": {
+    "rule": "inverse_vol",
+    "vol_window": 25,
+    "position_vol": 0.02,
+    "rebalance_days": 21
+  },
+  "risk": {
+    "max_position_pct": 0.2,
+    "max_open_positions": 15,
+    "max_gross": 1.0,
+    "stop_loss_pct": null,
+    "take_profit_pct": null,
+    "max_holding_days": null
+  }
+}
