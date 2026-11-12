@@ -335,3 +335,37 @@ def test_with_rules_also_asks_the_two_rule_forecasters(tmp_path, monkeypatch, ca
     assert all(v["asked"] > 0 and v["answered"] == v["asked"] for v in out["asked"].values())
     assert set(out["counts"]["answers"]) == {"rule-momentum", "rule-above-200d"}
     assert len(set(out["counts"]["answers"].values())) == 1
+
+
+def test_a_wrong_way_forecaster_is_not_credited_by_the_rescaling():
+    led = _filled({"backwards": lambda y, k: 0.2 if y else 0.8}, _mixed())
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking_verdict"] == "ranks worse than chance" and s["rescaled_skill"] <= 0.05
+    led.close()
+
+
+def test_a_perfectly_separable_earlier_half_gives_the_same_rescaled_numbers_every_time():
+    led = _filled({"shy": lambda y, k: 0.10 if y else 0.05}, _mixed())
+    a, b = tm.scores(led, min_settled=30)[0], tm.scores(led, min_settled=30)[0]
+    keys = ("rescaled_brier", "rescaled_baseline_brier", "rescaled_skill", "rescaled_t_by_week", "rescaled_settled")
+    assert [a[k] for k in keys] == [b[k] for k in keys] and a["rescaled_skill"] > 0
+    led.close()
+
+
+def test_the_ranking_range_does_not_depend_on_the_order_the_rows_were_stored():
+    rng = np.random.default_rng(8)
+    outcomes = _mixed(100)
+    noise = [float(rng.standard_normal()) for _ in outcomes]
+    day0 = pd.Timestamp("2024-01-01")
+    def fill(order):
+        led = tm.TournamentLedger()
+        for k in order:
+            day = str((day0 + pd.Timedelta(days=7 * (k // 2))).date())
+            led.add([tm.Question(f"q{k:03d}", "funds", "forward", day, 5, "A", "t", {}, 0.5)])
+            led.record(f"q{k:03d}", "f", float(np.clip(0.5 + 0.1 * (2 * outcomes[k] - 1) + 0.3 * noise[k], 0.01, 0.99)), None, 1.0)
+            led.settle(f"q{k:03d}", outcomes[k])
+        return led
+    forward, backward = fill(range(100)), fill(reversed(range(100)))
+    a, b = tm.scores(forward, min_settled=30)[0], tm.scores(backward, min_settled=30)[0]
+    assert (a["ranking"], a["ranking_low"], a["ranking_high"]) == (b["ranking"], b["ranking_low"], b["ranking_high"])
+    forward.close(), backward.close()

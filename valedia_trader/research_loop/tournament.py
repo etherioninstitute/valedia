@@ -167,7 +167,7 @@ class TournamentLedger:
         return [dict(r) for r in self._db.execute(
             "SELECT f.forecaster, f.probability, q.market, q.kind, q.asked_on, q.baseline, o.outcome FROM forecasts f "
             "JOIN questions q ON q.id = f.question_id JOIN outcomes o ON o.question_id = q.id "
-            "WHERE f.error IS NULL AND f.probability IS NOT NULL")]
+            "WHERE f.error IS NULL AND f.probability IS NOT NULL ORDER BY q.asked_on, q.id, f.forecaster")]
 
     def counts(self) -> dict[str, Any]:
         one = lambda sql: self._db.execute(sql).fetchone()[0]
@@ -261,7 +261,7 @@ def _ranking(rows: list[dict]) -> tuple[float | None, float | None, float | None
     weeks: dict[tuple, list[int]] = {}
     for i, r in enumerate(rows):
         weeks.setdefault(_week(r["asked_on"]), []).append(i)
-    members = [np.array(v) for v in weeks.values()]
+    members = [np.array(weeks[k]) for k in sorted(weeks)]          # weeks in calendar order, however the rows were stored
     rng = np.random.default_rng(0)
     draws = []
     for _ in range(BOOTSTRAPS):
@@ -281,7 +281,9 @@ def _log_odds(p: np.ndarray) -> np.ndarray:
 
 def _rescaled(rows: list[dict], min_settled: int) -> dict:
     """Fit q = sigmoid(a + b * logit(p)) by log loss on the earlier half of the questions (split at the median
-    distinct ask date, a date never straddling the split), then score the later half with it. Empty (None) when
+    distinct ask date, a date never straddling the split), then score the later half with it. The slope b is held
+    between 0 and 10 and the shift a between -10 and 10: a forecaster that is reliably wrong-way is rescaled to a
+    constant, not credited, and a perfectly separable earlier half still has a finite fit. Empty (None) when
     either half has fewer than `min_settled` rows or the earlier half has only one outcome."""
     empty = {"rescaled_brier": None, "rescaled_baseline_brier": None, "rescaled_skill": None, "rescaled_t_by_week": None,
              "rescaled_settled": None}
@@ -298,7 +300,7 @@ def _rescaled(rows: list[dict], min_settled: int) -> dict:
     def log_loss(ab):
         z = ab[0] + ab[1] * xe
         return float(np.mean(np.logaddexp(0.0, z) - ye * z))          # -[y log q + (1-y) log(1-q)], q = sigmoid(z)
-    a, b = minimize(log_loss, x0=np.array([0.0, 1.0])).x
+    a, b = minimize(log_loss, x0=np.array([0.0, 1.0]), method="L-BFGS-B", bounds=[(-10.0, 10.0), (0.0, 10.0)]).x
     pl, yl, bl = (np.array([r[k] for r in late], dtype=float) for k in ("probability", "outcome", "baseline"))
     mine, base = (expit(a + b * _log_odds(pl)) - yl) ** 2, (bl - yl) ** 2
     t, _ = _t_by_week(late, mine - base)
