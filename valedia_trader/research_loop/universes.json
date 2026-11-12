@@ -1,0 +1,19 @@
+{
+  "note": "Assets the forecast tournament asks about, beyond the funds in data_and_fees/prices.py. These are today's large names: fine for forward questions and for blind questions scored against each asset's own base rate, but NOT a fair universe for backtesting a stock-picking or coin-picking strategy, because companies and coins that died are missing. Each universe keeps its prices in its own folder under artifacts/.",
+  "stocks": {
+    "folder": "artifacts/data_stocks",
+    "start": "2015-01-01",
+    "symbols": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "AVGO", "JPM", "LLY", "V", "UNH", "XOM", "MA", "COST", "HD", "PG", "JNJ", "WMT",
+                "NFLX", "BAC", "ABBV", "CRM", "ORCL", "CVX", "KO", "MRK", "AMD", "PEP", "ADBE", "TMO", "LIN", "CSCO", "ACN", "MCD", "WFC", "ABT", "IBM", "GE",
+                "QCOM", "DHR", "TXN", "VZ", "PM", "INTU", "AMGN", "CAT", "DIS", "NOW", "ISRG", "PFE", "NEE", "GS", "SPGI", "RTX", "CMCSA", "UBER", "AMAT", "T",
+                "LOW", "UNP", "HON", "AXP", "BKNG", "PGR", "TJX", "MS", "BLK", "COP", "ETN", "SYK", "C", "VRTX", "BSX", "LMT", "MDT", "ADP", "PANW", "REGN",
+                "ADI", "BA", "DE", "CB", "MU", "PLD", "GILD", "SBUX", "BMY", "SCHW", "UPS", "MO", "SO", "KLAC", "LRCX", "INTC", "CI", "DUK", "TMUS", "NKE",
+                "F", "GM", "PYPL"]
+  },
+  "crypto": {
+    "folder": "artifacts/data_crypto",
+    "start": "2017-01-01",
+    "symbols": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD", "LTC-USD", "DOT-USD", "TRX-USD", "BCH-USD",
+                "XLM-USD", "ATOM-USD", "ETC-USD", "HBAR-USD", "XMR-USD", "ALGO-USD", "FIL-USD", "AAVE-USD", "NEAR-USD", "SHIB-USD"]
+  }
+}

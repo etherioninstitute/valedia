@@ -16,6 +16,7 @@ prices before the question's day. Scores are Brier scores (the squared miss of t
 is better). Questions asked in the same week share the same market weather, so the test of "better than
 the baseline" counts each week once.
 
+    python -m valedia_trader.research_loop.tournament refresh --universe stocks       (or crypto: see universes.json)
     python -m valedia_trader.research_loop.tournament ask-blind --data artifacts/data --market funds --count 300
     python -m valedia_trader.research_loop.tournament ask-forward --data artifacts/data --market funds
     python -m valedia_trader.research_loop.tournament settle --data artifacts/data
@@ -41,7 +42,7 @@ from valedia_trader.agents import panel as panel_mod
 from valedia_trader.research_loop import LoopPaths, diagnostics
 
 __all__ = ["Question", "TournamentLedger", "direction_questions", "settle_directions", "ask", "scores", "base_rate",
-           "forecasters", "main"]
+           "forecasters", "universe", "refresh_universe", "main"]
 
 MIN_HISTORY = 253                 # a year of prices before an asset can be asked about
 HIDDEN_WHEN_BLIND = ("symbol", "as_of", "data_age_days")
@@ -265,6 +266,22 @@ def forecasters(names: Sequence[str] | None = None, roster: dict | None = None) 
     return list(panel_mod.build_panel({**roster, "members": [{**s, "enabled": True} for s in specs]}).members)
 
 
+def universe(name: str) -> dict:
+    """A named list of assets beyond the funds, and the folder its prices live in (universes.json)."""
+    known = {k: v for k, v in json.loads(Path(__file__).with_name("universes.json").read_text()).items() if isinstance(v, dict)}
+    if name not in known:
+        raise ValueError(f"no universe called '{name}'; there are: {', '.join(sorted(known))}")
+    return known[name]
+
+
+def refresh_universe(name: str, root: str | Path | None = None, download=None) -> dict:
+    """Download or update the universe's daily prices into its folder. Fails closed if any symbol comes back empty."""
+    from valedia_trader.data_and_fees import prices as price_data
+    u = universe(name)
+    folder = (Path(root) if root else LoopPaths().root) / u["folder"]
+    return price_data.refresh(folder, symbols=tuple(u["symbols"]), start=u["start"], download=download)
+
+
 def _sample_days(index: pd.DatetimeIndex, count: int, horizon: int, rng: np.random.Generator) -> list[pd.Timestamp]:
     """Past days at least a year in and far enough from the end to have resolved, one per week at most."""
     usable = index[MIN_HISTORY:len(index) - horizon - 1]
@@ -291,6 +308,7 @@ def main(argv=None) -> int:
             p.add_argument("--count", type=int, default=300, help="how many questions to draw")
             p.add_argument("--seed", type=int, default=0)
     sub.add_parser("score").add_argument("--min-settled", type=int, default=30)
+    sub.add_parser("refresh").add_argument("--universe", required=True, help="stocks or crypto: download or update its prices")
     args = ap.parse_args(argv)
     paths = LoopPaths(Path(args.root)) if args.root else LoopPaths()
     ledger = TournamentLedger(args.ledger or paths.memory / "tournament.sqlite")
@@ -298,6 +316,9 @@ def main(argv=None) -> int:
         if args.cmd == "score":
             rows = scores(ledger, args.min_settled)
             print(json.dumps({"counts": ledger.counts(), "scores": rows}, indent=1))
+            return 0
+        if args.cmd == "refresh":
+            print(json.dumps(refresh_universe(args.universe, paths.root), indent=1))
             return 0
         data = Path(args.data) if Path(args.data).is_absolute() else paths.root / args.data
         prices, _ = load_universe(data)

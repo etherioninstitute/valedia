@@ -125,3 +125,24 @@ def test_a_forecaster_that_repeats_the_baseline_is_not_distinguishable_from_it(t
     s = tm.scores(led, min_settled=30)[0]
     assert s["skill"] == pytest.approx(0.0, abs=1e-12) and s["verdict"] == "not distinguishable from the baseline"
     led.close()
+
+
+def test_universes_are_named_lists_with_their_own_price_folders():
+    stocks, crypto = tm.universe("stocks"), tm.universe("crypto")
+    assert len(stocks["symbols"]) >= 100 and len(set(stocks["symbols"])) == len(stocks["symbols"]) and "AAPL" in stocks["symbols"]
+    assert all(s.endswith("-USD") for s in crypto["symbols"]) and {"BTC-USD", "ETH-USD", "SOL-USD"} <= set(crypto["symbols"])
+    assert stocks["folder"] != crypto["folder"] and stocks["folder"].startswith("artifacts/")
+    with pytest.raises(ValueError, match="stocks"):
+        tm.universe("bonds")
+
+
+def test_refreshing_a_universe_downloads_its_symbols_into_its_folder(tmp_path):
+    seen = {}
+    def fake(tickers, begin):
+        seen["tickers"], seen["begin"] = list(tickers), begin
+        days = pd.bdate_range("2024-01-02", periods=5)
+        cols = pd.MultiIndex.from_product([["Close", "Volume"], list(tickers)])
+        return pd.DataFrame(1.0, index=days, columns=cols)
+    out = tm.refresh_universe("crypto", root=tmp_path, download=fake)
+    assert seen["tickers"] == tm.universe("crypto")["symbols"] and seen["begin"] == tm.universe("crypto")["start"]
+    assert (tmp_path / "artifacts/data_crypto/close.parquet").exists() and out["symbols"] == len(seen["tickers"])
