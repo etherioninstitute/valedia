@@ -186,3 +186,70 @@ def test_trend_blend_reads_trends_at_several_speeds_without_looking_ahead():
     assert (w >= 0).all().all()                                                             # long-only by default
     with pytest.raises(st.SpecError):
         st.RuleStrategy.from_spec({**s.to_spec(), "entry": {"rule": "trend_blend", "speeds": 9, "enter": 0.5, "exit": 0.0}})
+
+
+# ---- the calendar rule
+
+def nyse_frame(first, last, closed=(), **cols):
+    """Prices on weekdays from `first` to `last` except the exchange holidays in `closed`."""
+    days = pd.bdate_range(first, last).difference(pd.DatetimeIndex(list(closed)))
+    rng = np.random.default_rng(3)
+    return pd.DataFrame({k: 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days)))) for k in (cols or {"A": 0})}, index=days)
+
+
+def tom_spec(**entry):
+    return spec(name="tom_test", hypothesis="Shares rise around the turn of the month", market=["A", "B"],
+                entry={"rule": "turn_of_month", "enter": 1, "exit": 0, **entry})
+
+
+def test_turn_of_month_marks_the_close_before_each_session_of_the_window():
+    # New York sessions: 2 Jan is the first of January (1 Jan is a holiday), 31 Jan the last, 1, 2 and 5 Feb the
+    # first three of February. Row t is read at the close of t and earns the next session's return, so the
+    # mark sits one session before each window day.
+    px = nyse_frame("2023-12-27", "2024-02-08", closed=["2024-01-01", "2024-01-15"], A=0, B=0)
+    score = st.SCORES["turn_of_month"](px, before=1, after=3)
+    marked = {str(d.date()) for d in score.index[score["A"] == 1.0]}
+    assert marked == {"2023-12-28", "2023-12-29", "2024-01-02", "2024-01-03",
+                      "2024-01-30", "2024-01-31", "2024-02-01", "2024-02-02"}
+    assert set(np.unique(score.to_numpy())) == {0.0, 1.0} and score["A"].equals(score["B"])
+
+
+def test_turn_of_month_reads_the_exchange_calendar_past_the_last_row_of_data():
+    # 29 March 2024 is Good Friday: Thursday the 28th is the last session of March, and a rule that only
+    # counted weekdays, or only looked at the rows it was given, would not know it on Wednesday's close.
+    px = nyse_frame("2024-03-11", "2024-03-27")
+    score = st.SCORES["turn_of_month"](px, before=1, after=3)["A"]
+    assert score.iloc[-1] == 1.0 and score.iloc[:-1].sum() == 0.0
+    # the same close without the window before the month end: nothing to hold
+    assert st.SCORES["turn_of_month"](px, before=0, after=3)["A"].sum() == 0.0
+
+
+def test_turn_of_month_holds_from_the_close_before_the_window_to_its_last_close():
+    px = nyse_frame("2024-01-08", "2024-02-08", closed=["2024-01-15"], A=0, B=0)
+    s = st.RuleStrategy.from_spec(tom_spec(before=1, after=3) | {"risk": {"max_position_pct": 0.5, "max_open_positions": 2, "stop_loss_pct": None}})
+    w, events = st.run_rules(s, px)
+    held = [str(d.date()) for d in w.index[w["A"] > 0]]
+    assert held == ["2024-01-30", "2024-01-31", "2024-02-01", "2024-02-02"]          # earns 31 Jan and 1, 2, 5 Feb
+    assert w.loc["2024-01-30", ["A", "B"]].tolist() == [0.5, 0.5]
+    assert [(e["action"], str(e["date"].date())) for e in events if e["symbol"] == "A"] == [("enter", "2024-01-30"), ("exit", "2024-02-05")]
+
+
+def test_turn_of_month_ignores_prices_and_refuses_dates_off_the_calendar():
+    a = nyse_frame("2024-01-08", "2024-02-08", closed=["2024-01-15"])
+    b = a * np.linspace(3.0, 0.2, len(a))[:, None]
+    assert st.SCORES["turn_of_month"](a).equals(st.SCORES["turn_of_month"](b))
+    s = st.RuleStrategy.from_spec(tom_spec() | {"market": ["A"]})
+    assert detect_lookahead(s.target_weights, nyse_frame("2023-10-02", "2024-03-27"), n_checks=5) == []
+    with pytest.raises(st.SpecError, match="calendar"):
+        st.SCORES["turn_of_month"](nyse_frame("1985-01-02", "1985-03-01"))
+
+
+@pytest.mark.parametrize("entry", [{"before": 11}, {"after": -1}, {"before": True}, {"window": 3}])
+def test_turn_of_month_parameters_are_checked(entry):
+    with pytest.raises(st.SpecError):
+        st.RuleStrategy.from_spec(tom_spec(**entry))
+
+
+def test_research_agents_are_told_about_the_calendar_rule():
+    from valedia_trader.research_loop import research
+    assert "turn_of_month" in research.RULE_LIBRARY and "before in [0, 10]" in research.RULE_LIBRARY

@@ -17,6 +17,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -210,12 +211,40 @@ def _trend_blend(px: pd.DataFrame, fast: int = 16, speeds: int = 3, vol_window: 
     return sum(parts) / len(parts)
 
 
+@lru_cache(maxsize=1)
+def _exchange_sessions() -> pd.DatetimeIndex:
+    """Every New York Stock Exchange session from 1990 to about a year ahead: early closes count, holidays
+    and the exchange's unscheduled closures do not."""
+    import exchange_calendars
+    return exchange_calendars.get_calendar("XNYS", start="1990-01-01").sessions
+
+
+def _turn_of_month(px: pd.DataFrame, before: int = 1, after: int = 3) -> pd.DataFrame:
+    """1 when the next exchange session is one of the last `before` of a month or the first `after` of one, else 0: the calendar, not prices.
+
+    Row t is read at the close of t and the position it opens earns the next session's return, so the
+    rule looks one session ahead on the exchange calendar, which is published in advance. With enter 1
+    and exit 0 it holds from the close before the window to the window's last close. Every fund gets the
+    same score. Dates before 1990 or beyond the published calendar are refused."""
+    sessions = _exchange_sessions()
+    month = pd.Series(sessions.year * 12 + sessions.month, index=sessions)
+    in_window = ((month.groupby(month).cumcount(ascending=False) < int(before))
+                 | (month.groupby(month).cumcount() < int(after))).to_numpy()
+    if len(px.index) and (px.index[0] < sessions[0] or px.index[-1] > sessions[-1] - pd.Timedelta(days=45)):
+        raise SpecError(f"turn_of_month: the exchange calendar covers {sessions[0].date()} to about a year ahead, "
+                        f"and the prices run from {px.index[0].date()} to {px.index[-1].date()}")
+    mark = in_window[sessions.searchsorted(px.index, side="right")].astype(float)
+    return pd.DataFrame(np.repeat(mark[:, None], px.shape[1], axis=1), index=px.index, columns=px.columns)
+
+
 SCORES: dict[str, Callable[..., pd.DataFrame]] = {"momentum": _momentum, "breakout": _breakout, "reversion": _reversion,
-                                                  "ma_cross": _ma_cross, "drift": _drift, "trend_blend": _trend_blend}
+                                                  "ma_cross": _ma_cross, "drift": _drift, "trend_blend": _trend_blend,
+                                                  "turn_of_month": _turn_of_month}
 _SCORE_PARAMS = {"momentum": {"lookback": (5, 756), "skip": (0, 63)}, "breakout": {"lookback": (5, 504)},
                  "reversion": {"lookback": (1, 63), "vol_window": (10, 504)}, "ma_cross": {"fast": (2, 252), "slow": (5, 756)},
                  "drift": {"window": (20, 756), "horizon": (1, 63)},
-                 "trend_blend": {"fast": (2, 64), "speeds": (1, 4), "vol_window": (5, 126)}}
+                 "trend_blend": {"fast": (2, 64), "speeds": (1, 4), "vol_window": (5, 126)},
+                 "turn_of_month": {"before": (0, 10), "after": (0, 10)}}
 
 
 def _size_equal(px: pd.DataFrame, risk: StrategyRisk) -> pd.DataFrame:
