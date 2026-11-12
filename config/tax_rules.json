@@ -1,0 +1,9 @@
+{
+  "note": "This file is the single place the tax ledger's legal parameters live; code reads them from here and holds none of its own. Nothing here is tax advice. Every rule is unverified until verified_on carries the date it was checked against its primary source.",
+  "jurisdiction": "US federal",
+  "long_term": {"after_years": 1, "source": "IRC 1222; IRS Publication 550, holding period", "verified_on": null},
+  "wash_sale": {"window_days": 30, "applies_to": {"security": true, "crypto": false, "event_contract": false},
+                "source": "IRC 1091; IRS Publication 550, wash sales", "verified_on": null},
+  "wash_sale_same_purchase": {"remainder_is_replacement": false, "source": "Rev. Rul. 56-602, 1956-2 C.B. 527", "verified_on": null},
+  "lot_method": {"method": "FIFO", "source": "Treas. Reg. 1.1012-1(c) default", "verified_on": null}
+}
