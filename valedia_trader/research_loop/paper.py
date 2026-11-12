@@ -153,10 +153,20 @@ class PaperTrader:
                     for sym, lot in book.items() if lot["units"] and np.isfinite(prices_row.get(sym, np.nan)))
         return float(self.state["cash"] + value)
 
+    def funds_held(self) -> set[str]:
+        """Funds the account holds, or has an order in to open or add to."""
+        held = {sym for book in self.state["positions"].values() for sym, lot in book.items() if abs(lot["units"]) > 1e-12}
+        return held | {o["symbol"] for o in self.state["pending"] if not o["reduces_risk"]}
+
     def open_positions(self) -> int:
-        held = {(s, sym) for s, book in self.state["positions"].items() for sym, lot in book.items() if abs(lot["units"]) > 1e-12}
-        held |= {(o["strategy"], o["symbol"]) for o in self.state["pending"] if not o["reduces_risk"]}
-        return len(held)
+        """Positions of the account. A fund two strategies both hold is one position: the limits are the
+        account's, and one position is what the broker would show."""
+        return len(self.funds_held())
+
+    def _units_elsewhere(self, strategy: str, symbol: str) -> float:
+        """Units of the fund that the account holds or has ordered through its other strategies."""
+        lots = sum(book.get(symbol, {}).get("units", 0.0) for name, book in self.state["positions"].items() if name != strategy)
+        return float(lots + sum(o["units"] for o in self.state["pending"] if o["symbol"] == symbol and o["strategy"] != strategy))
 
     def _fill_pending(self, day, row: pd.Series) -> None:
         still = []
@@ -281,8 +291,10 @@ class PaperTrader:
                     continue
                 acted = True
                 reduces = abs(target) < abs(lot["units"]) and (target == 0 or np.sign(target) == np.sign(lot["units"]))
+                # the position limit and the position count are the account's: what this strategy and the others hold together
                 order = {"symbol": sym, "side": "buy" if delta > 0 else "sell", "value": value, "reduces_risk": bool(reduces),
-                         "adds_to_existing": bool(lot["units"]), "position_value_after": abs(target) * px}
+                         "adds_to_existing": sym in self.funds_held(),
+                         "position_value_after": abs(self._units_elsewhere(s.name, sym) + target) * px}
                 ok, why = risk_gate.check_order(order, account, limits, latch_file=self.latch_file, halt_file=self.halt_file)
                 panel_view = None
                 if ok and not reduces and self.panel_mode != "off":

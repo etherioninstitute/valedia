@@ -292,3 +292,31 @@ def test_benchmark_capital_is_fixed_on_the_strategys_first_day(setup):
     assert t.state["benchmarks"]["first"]["capital"] == 100_000.0
     assert out["benchmark_values"]["first"] == pytest.approx(_held(px, day + 1, day + 2))
     assert out["benchmark_values"]["second"] == 0.0 and t.state["benchmarks"]["second"]["start_day"] == str(px.index[day + 2].date())
+
+
+# ---- the account's limits are on the account: a fund held by two strategies is one position
+
+def test_two_strategies_in_one_fund_are_one_position_of_the_account(setup):
+    setup[1].write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.6, "max_open_positions": 2}))
+    px, t = prices(), trader(setup)
+    both = {7: strat("first_paper"), 8: strat("second_paper")}       # each wants UP and DOWN: two funds, four holdings
+    out = t.step(px.iloc[:12], both)
+    assert out["orders_placed"] == 4 and out["orders_blocked"] == 0
+    assert t.open_positions() == 2 and out["open_positions"] == 2    # the broker would show two positions
+    t.step(px.iloc[:13], both)
+    assert t.open_positions() == 2 and all(abs(lot["units"]) > 0 for book in t.state["positions"].values() for lot in book.values())
+
+
+def test_the_position_limit_is_on_the_accounts_whole_holding_of_a_fund(setup):
+    setup[1].write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.3, "max_open_positions": 5}))
+    px, t = prices(), trader(setup)
+    out = t.step(px.iloc[:12], {7: strat("first_paper"), 8: strat("second_paper")})
+    # each strategy has half the account and wants half of that in each fund: 25% is inside the 30% limit,
+    # but the second strategy's order would make the account's holding 50%
+    assert out["orders_placed"] == 2 and out["orders_blocked"] == 2
+    decisions = [e for e in t.journal.read() if e["type"] == "decision"]
+    assert {e["strategy"] for e in decisions if e["decision"] == "placed"} == {"first_paper"}
+    refused = [e for e in decisions if e["decision"] == "blocked"]
+    assert {e["strategy"] for e in refused} == {"second_paper"} and all(e["risk_check"] == "Order is larger than the position limit." for e in refused)
+    assert all(e["order"]["position_value_after"] == pytest.approx(2 * e["order"]["value"]) for e in refused)
+    assert all(e["order"]["adds_to_existing"] for e in refused)      # the account is already in the fund
