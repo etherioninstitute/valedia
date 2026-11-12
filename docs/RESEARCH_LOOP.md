@@ -39,7 +39,7 @@ A second job file, `tools/launchd/com.valedia.paper.daily.plist`, runs `paper-st
 | `backtests/` | locked predictions (`*-prediction.md`, read-only), test reports, revision histories |
 | `journal/` | every paper decision with its reasoning (`YYYY-MM-DD.jsonl`), weekly reviews |
 | `memory/` | `ledger.db` (the hypothesis ledger; not in git, back it up) and `edit_library.json` |
-| `config/risk.json` | the kill switch's limits. The numbers are the guide's examples: set your own |
+| `config/risk.json` | the kill switch's limits, the owner's to set. Set by Burton on 2026-11-12: stop at a 25% fall, 20% of the account in one fund, 15 funds; the 2% daily stop is still the guide's example. A fund two strategies both hold counts once |
 | `artifacts/data/` | price history (the guide's `data/`) |
 
 ## The rules and where each is enforced
@@ -184,5 +184,11 @@ The same fifteen funds, 2007-2026, described after both tests (a description, no
 | Half of each | 7.5% | 9.3% | 0.82 | 19% |
 
 Holding earns more. The trend rule gives up about 0.7% a year and roughly halves the worst fall (2008:
--1.8% against -16.4%). The account limits in `config/risk.json` are still the example ones: an 8% fall
-stops the account, and neither strategy has stayed inside 8% at full size.
+-1.8% against -16.4%).
+
+The example account limits (stop at an 8% fall, 5 positions of 10%) fitted neither strategy: neither has
+stayed inside 8% at full size. Burton set them on 2026-11-12 to a 25% stop, 20% in one fund and 15 funds, to
+run half of each (worst fall 19% in the description above, largest holding 19%). The position limits are the
+account's: a fund both strategies hold is one position, and its limit is on what they hold together. A
+sandbox replay of the last 40 trading days with both strategies placed 142 orders and blocked 4, all on one
+day that lost 2.6% (the 2% daily stop, which only delays new risk by a day).
