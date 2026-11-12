@@ -109,8 +109,8 @@ sealed period, so nothing is in paper trading and the sealed period is unspent f
 
 ## Not done
 
-- No strategy has passed, so there is no paper-trading record. The paper trader and critic were
-  checked by replaying 45 real trading days in a sandbox with a strategy marked as passed there only.
+- That round passed nothing. Two strategies have passed since (hypotheses 23 and 26, below); the paper
+  record began on 2026-11-11 and is too short to judge.
 - `AlpacaPaperVenue` is tested against a fake client. It has not been run against Alpaca: the key on
   this machine is not a paper key, and the venue refuses anything else.
 - The research agents' prose often names filters the rule library cannot express (for example a
@@ -149,3 +149,40 @@ with a price, rebalanced daily, no costs), started with the strategy's first-day
 filled. It is a yardstick, not a book: no orders, no risk checks, no costs, and the account's position limits do not
 apply to it. The weekly review reports how far each strategy is ahead of or behind it, with the number of days, and
 says so when the days are too few to mean anything. Design note: `docs/specs/2026-11-12-paper-benchmark-design.md`.
+
+## Beyond price rules, 2026-11-12
+
+Every rule in the library read prices, and 23 of the 24 ideas built from them had failed. Two additions
+let ideas of another kind be tested. The research agents see both in their rule list.
+
+| Addition | What it does |
+| --- | --- |
+| `turn_of_month` (entry rule) | 1 when the next New York session is one of the last `before` sessions of a month or the first `after` of one. Reads the exchange calendar (`exchange_calendars`), not prices, so it works on the last row of live data. |
+| `hold` (entry rule) | Always 1: every fund is entered at once and never left. |
+| `rebalance_days` (any sizing rule) | Every so many sessions a held position is reset to the size the sizing rule gives that day. Without it a position keeps the size it was opened with. |
+
+Two ideas were tested with them, each with its prediction locked before its data was downloaded.
+
+| # | Idea | Predicted Sharpe | Development | Sealed | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| 25 | Five share-index funds held only over the turn of the month, 2006-2026 | 0.30 | 0.29, Deflated Sharpe 0.867 | not used | failed |
+| 26 | The fifteen funds of hypothesis 23 held always, sized by volatility, reset every 21 sessions, 2006-2026 | 0.65 | 0.75, worst fall 29% | 0.84, worst fall 17% | passed |
+
+Hypothesis 25: the calendar days did no better than random days with the same exposure (p = 0.27).
+
+Hypothesis 26 needs two cautions. The gate counted it as the first try on a new market (Deflated Sharpe
+0.998). Counted against all 43 tries in the ledger it is 0.49. It is trusted for a different reason than a
+mined rule would be: nothing in it was fitted, and its return is the pay for holding shares, bonds, gold
+and commodities. And its proposer was not blind to the period.
+
+The same fifteen funds, 2007-2026, described after both tests (a description, not a test):
+
+| | Return a year | Volatility | Sharpe | Worst fall |
+| --- | --- | --- | --- | --- |
+| Holding (hypothesis 26) | 7.8% | 10.7% | 0.75 | 29% |
+| Trend rule (hypothesis 23) | 7.1% | 9.3% | 0.78 | 15% |
+| Half of each | 7.5% | 9.3% | 0.82 | 19% |
+
+Holding earns more. The trend rule gives up about 0.7% a year and roughly halves the worst fall (2008:
+-1.8% against -16.4%). The account limits in `config/risk.json` are still the example ones: an 8% fall
+stops the account, and neither strategy has stayed inside 8% at full size.

@@ -1,0 +1,338 @@
+{
+  "hypothesis_id": 26,
+  "strategy": {
+    "name": "hold_rebalance_etf_2006_2026",
+    "version": "1.0.0",
+    "hypothesis": "Shares, bonds, gold and commodities pay for the risk of holding them, and a volatility-sized mix earns it steadily",
+    "market": [
+      "DBC",
+      "EEM",
+      "EFA",
+      "GLD",
+      "IEF",
+      "IWM",
+      "LQD",
+      "QQQ",
+      "SPY",
+      "TLT",
+      "XLE",
+      "XLF",
+      "XLK",
+      "XLU",
+      "XLV"
+    ],
+    "risk": {
+      "max_position_pct": 0.2,
+      "max_open_positions": 15,
+      "max_gross": 1.0,
+      "stop_loss_pct": null,
+      "take_profit_pct": null,
+      "max_holding_days": null
+    }
+  },
+  "strategy_file": "strategies/hold_rebalance_etf_2006_2026.json",
+  "sealed_period": [
+    "2021-05-24",
+    "2026-11-12"
+  ],
+  "market_regime": "trending up",
+  "result": {
+    "start": "2021-05-24",
+    "end": "2026-11-12",
+    "years": 5.4603174603174605,
+    "total_return": 0.5479692148479189,
+    "cagr": 0.08331057569711708,
+    "annual_vol": 0.1018358955662486,
+    "sharpe": 0.8367764550853805,
+    "sharpe_t_stat": 1.9553225021623284,
+    "max_drawdown": 0.17164477301419978,
+    "profit_factor": 1.1558938412824569,
+    "annual_turnover": 3.400952090185587,
+    "cost_bps_of_traded": 1.8307601722664582,
+    "annual_cost_drag": 0.0006226327634498137,
+    "daily_win_rate": 0.5486918604651163,
+    "trades": 0,
+    "trade_win_rate": null,
+    "mean_trade_pct": null
+  },
+  "prediction": {
+    "annual_return": 0.065,
+    "win_rate": 0.5,
+    "sharpe": 0.65,
+    "fail_if_sharpe_below": 0.4,
+    "fail_if_drawdown_above": 0.35,
+    "notes": "What I expect, from the funds' long-run returns: about 56% in shares, 30% in bonds and 14% in gold and commodities once the sizes are scaled to 100%, earning about 6.5% a year on about 10% volatility, a Sharpe of 0.65, with a fall of about 28% in 2008. I expect it to pass the gate in development. Three things the reader should know. First, the share of winning trades does not apply: nothing is ever sold, so no trade closes; the 50% above is a placeholder. Second, I am not blind to this period: I have seen an equal-weight holding of these funds over 2012-2026 (hypothesis 23's comparison) and of five of them over 2006-2021 (hypothesis 25's), and I know the broad history of these markets. Third, the gate will count this as the first try on this market, but the same family was tried before (idea 4, a volatility-sized holding on 2012-2026: holdout Sharpe 0.84, failed on the deflated threshold among 15 seeded variations), and I chose to test it because holding kept beating the rules. So the Deflated Sharpe the gate reports is generous, and I will also report it counted against every try in the ledger."
+  },
+  "versus_development": {
+    "sharpe": 0.08899908708090987
+  },
+  "checks": {
+    "made_money": {
+      "passed": true,
+      "detail": "net return +54.8%"
+    },
+    "prediction_failure_terms": {
+      "passed": true,
+      "detail": "Sharpe 0.84 (fails below 0.40), drawdown 17.2% (fails above 35%)"
+    }
+  },
+  "verdict": "pass",
+  "diagnostics": {
+    "observations": 1376,
+    "start": "2021-05-24",
+    "end": "2026-11-12",
+    "uncertainty_of_the_mean": {
+      "formula": "2.1 and 2.2",
+      "mean_daily": 0.0003381503162395655,
+      "std_error": 0.0001729383852871411,
+      "ci95_daily": [
+        -1.1013173659899216e-06,
+        0.000677401949845121
+      ],
+      "sharpe_annual": 0.8367764550853805,
+      "sharpe_t_stat": 1.9553225021623284,
+      "years": 5.4603174603174605,
+      "years_needed_for_t_of_2_at_this_sharpe": 5.712695660650043,
+      "ci95_annual": [
+        -0.00027753197622946025,
+        0.17070529136097048
+      ],
+      "p_value_mean_zero": 0.05074733756923371,
+      "reading": "the 95% range for the average daily return; a range that includes zero means the edge is not established"
+    },
+    "win_rate": {
+      "formula": "1.1",
+      "active_days": 1376,
+      "wins": 755,
+      "losses": 621,
+      "posterior_mean": 0.548621190130624,
+      "credible95": [
+        0.5222937056108963,
+        0.5748149923481101
+      ],
+      "reading": "win rate on days with a position, updated from an even prior; the range is what the data supports"
+    },
+    "tails": {
+      "formula": "1.5",
+      "student_t_df": 4.736347678299286,
+      "tail_ratio_vs_normal_3sd": 4.4483951651366045,
+      "normal_mass_within_3sd": 0.9973002039367398,
+      "reading": "degrees of freedom under about 5 mean fat tails: 3-sigma days come far more often than a normal curve says"
+    },
+    "by_market_state": {
+      "formula": "1.4",
+      "market_above_200d": {
+        "days": 1046,
+        "mean_daily": 0.00036763162696149833,
+        "annual_vol": 0.08476200895569684
+      },
+      "market_below_200d": {
+        "days": 230,
+        "mean_daily": 0.00020534114251237768,
+        "annual_vol": 0.16522381652940063
+      },
+      "mean_from_regimes": 0.00033837863995264434,
+      "variance_within_regimes_share": 0.9999092867026396,
+      "reading": "where the return comes from by market state; a strategy that earns only in one state is a bet on that state"
+    },
+    "market_exposure": {
+      "formula": "8.1 and 2.3",
+      "beta": 0.8747578272466231,
+      "alpha_annual": -0.003945348714818742,
+      "alpha_t_stat": -0.6000086666083183,
+      "r_squared": 0.977321969959279,
+      "sharpe_after_removing_beta": -0.2572656745908003,
+      "reading": "how much of the return is the market itself; alpha with a t-statistic under 2 is not distinguishable from zero"
+    },
+    "factor_exposure": {
+      "formula": "8.2",
+      "factors": [
+        "SPY",
+        "TLT",
+        "GLD"
+      ],
+      "betas": {
+        "SPY": 0.5039497258002001,
+        "TLT": 0.14972828016087847,
+        "GLD": 0.12355864160069684
+      },
+      "alpha_annual": 0.00574486761358399,
+      "r_squared": 0.9084929481015297,
+      "reading": "exposure to each tradable factor proxy; a high R-squared means the strategy can be replicated by holding them"
+    },
+    "multiple_testing": {
+      "formula": "2.5",
+      "variations": 1,
+      "best_p_raw": 0.0014249834721498838,
+      "best_p_holm": 0.0014249834721498838,
+      "chance_of_a_false_win_at_5pct": 0.05,
+      "survive_holm": 1,
+      "reading": "with this many tries, the chance that at least one looks significant by luck alone"
+    },
+    "serial_dependence": {
+      "formula": "5.2 and 5.3",
+      "ljung_box_p": 0.8948046417356722,
+      "serial_dependence": "noise",
+      "lag": 0,
+      "rho": -0.02814059784649283,
+      "stationary": true,
+      "adf_p": 0.0,
+      "kpss_p": 0.1,
+      "reading": "whether yesterday's result predicts today's, and whether the return series is stable enough to average at all"
+    },
+    "volatility_forecast": {
+      "formula": "5.5, 5.1 and 4.2",
+      "garch_persistence": 0.9363265323819593,
+      "forecast_annual_vol_next_5d": 0.12796063936664803,
+      "realized_annual_vol": 0.1018358955662486,
+      "scale_to_target_vol": 0.7814903121378451,
+      "target_vol": 0.1,
+      "ewma_decay_fit": 0.942533401766392,
+      "reading": "the volatility the model expects over the next week, and how much to scale the book to run at the target"
+    },
+    "compounding": {
+      "formula": "4.5",
+      "arithmetic_annual": 0.08521387969237051,
+      "geometric_annual": 0.08331057569714329,
+      "volatility_drag_annual": 0.005185274812889946,
+      "reading": "what compounds is the geometric return: the average return minus about half the variance"
+    },
+    "time_scaling": {
+      "formula": "6.1",
+      "vol_5d_vs_sqrt_time": 0.9486560269378009,
+      "vol_21d_vs_sqrt_time": 0.8496112275066734,
+      "reading": "1.0 means risk grows with the square root of time; above 1 returns trend, below 1 they revert"
+    },
+    "ruin_and_target": {
+      "formula": "6.5 and 6.3",
+      "drawdown_limit": 0.35,
+      "profit_target": 0.065,
+      "p_target_before_limit": 0.99919406739071,
+      "p_breach_limit_next_63d": 0.0,
+      "median_worst_drawdown_63d": 0.04315061206338794,
+      "reading": "if returns keep this mean and volatility: the chance of reaching the profit target before the drawdown limit stops the book"
+    },
+    "book_risk": {
+      "formula": "1.2, 3.1, 3.2, 3.3, 3.4, 3.5, 4.3, 4.4 and 6.2",
+      "assets_held": [
+        "DBC",
+        "EEM",
+        "EFA",
+        "GLD",
+        "IEF",
+        "IWM",
+        "LQD",
+        "QQQ",
+        "SPY",
+        "TLT",
+        "XLE",
+        "XLF",
+        "XLK",
+        "XLU",
+        "XLV"
+      ],
+      "expected_annual_return_by_asset": {
+        "DBC": 0.008718663512655713,
+        "EEM": 0.004063080889964611,
+        "EFA": 0.006534423814701319,
+        "GLD": 0.009688708271773868,
+        "IEF": -0.001113961908426243,
+        "IWM": 0.003962291280797594,
+        "LQD": -0.0001199132566449292,
+        "QQQ": 0.009114354548207379,
+        "SPY": 0.009983698716537329,
+        "TLT": -0.0038622882768656825,
+        "XLE": 0.010528047441884975,
+        "XLF": 0.007334901247147127,
+        "XLK": 0.010029487842727522,
+        "XLU": 0.006069716210940572,
+        "XLV": 0.007704256536842625
+      },
+      "expected_annual_return_of_average_book": 0.08863546687224377,
+      "mean_variance_weights": {
+        "DBC": -0.011971845240661909,
+        "EEM": -0.05245070902761596,
+        "EFA": -0.01904572244967244,
+        "GLD": 0.0887687729501913,
+        "IEF": 0.09149750051809606,
+        "IWM": -0.11189761693916915,
+        "LQD": 0.006628737158153222,
+        "QQQ": 0.029956936592819616,
+        "SPY": -0.11897228892331262,
+        "TLT": -0.08913408781865388,
+        "XLE": 0.07300174465348426,
+        "XLF": 0.05936199717523245,
+        "XLK": 0.1392906932504309,
+        "XLU": 0.028509373349532713,
+        "XLV": 0.07951197395297387
+      },
+      "p_current_book_breaches_limit_63d_no_drift": 0.0,
+      "condition_number_sample": 738.4289951639764,
+      "condition_number_shrunk": 351.30983515126564,
+      "shrinkage": 0.01103490185446432,
+      "first_component_share": 0.49706439548156417,
+      "current_book_annual_vol": 0.10740041872243772,
+      "average_book_annual_vol": 0.10500171094094235,
+      "minimum_variance_weights": {
+        "DBC": 0.07945760724853036,
+        "EEM": 0.06687688774625,
+        "EFA": -0.07755715174246346,
+        "GLD": -0.023958617608392158,
+        "IEF": 0.9641949961055973,
+        "IWM": -0.08330592039329858,
+        "LQD": 0.37422932478332693,
+        "QQQ": -0.0677748415775525,
+        "SPY": 0.09827344446717312,
+        "TLT": -0.4568698019221967,
+        "XLE": -0.002171673233829566,
+        "XLF": 0.07480194122320917,
+        "XLK": 0.008888633245485049,
+        "XLU": -0.014623453827966468,
+        "XLV": 0.05953862548612728
+      },
+      "reading": "how concentrated the book's risk is; a first component near 1 means the assets move as one and diversification is nominal"
+    },
+    "pairs_check": {
+      "formula": "5.4",
+      "pair": [
+        "QQQ",
+        "XLK"
+      ],
+      "correlation": 0.9672396470797094,
+      "cointegrated": false,
+      "p_value": 0.5050895059085825,
+      "hedge_ratio": 0.8924219838248598,
+      "half_life_days": 132.22048834429108,
+      "reading": "whether the two most correlated holdings are tied together; if so, holding both is one bet and their gap tends to close"
+    },
+    "signal_quality": {
+      "formula": "10.4",
+      "precision": 0.5269618588338448,
+      "recall": 0.9987075332348597,
+      "f1": 0.689901469978636,
+      "base_rate_up": 0.5272585669781932,
+      "reading": "of the asset-days it was long, the share that went up, against the share of all asset-days that went up"
+    },
+    "stability": {
+      "formula": "10.2",
+      "blocks": 5,
+      "block_sharpes": [
+        -0.51,
+        1.5,
+        1.47,
+        1.72,
+        1.16
+      ],
+      "share_positive": 0.8,
+      "worst_block_sharpe": -0.5110875105175523,
+      "reading": "the same strategy on consecutive stretches of time it was not chosen on"
+    },
+    "fair_game_test": {
+      "formula": "6.5",
+      "mean_increment": 0.0003381503162395655,
+      "p_value": 0.10149467513846742,
+      "looks_like_a_fair_game": true,
+      "reading": "a fair game has no edge; failing to reject it means the returns are consistent with luck"
+    }
+  }
+}
