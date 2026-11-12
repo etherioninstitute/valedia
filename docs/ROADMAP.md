@@ -22,6 +22,10 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 | 1.9 | New idea families through the gate: carry, option premium, earnings and other events, pairs, intraday | not started (each needs its data first) |
 | 1.10 | Split of capital between passed strategies, tested out of sample (today: equal shares) | not started |
 | 1.11 | Costs by venue: Webull crypto spreads, Kalshi's fee formula, stock borrow fees, slippage by liquidity | not started |
+| 1.12 | Kronos, an open price-forecast model, as a tournament forecaster (from the owner's notes) | not started |
+| 1.13 | Kalshi weather markets against official forecast releases, tested on free history first (from the owner's notes) | not started |
+| 1.14 | Closing-line value as a fast skill measure for prediction-market forecasts (from the owner's notes) | not started |
+| 1.15 | Net the strategies' orders in one fund before placing them: in a 40-day replay about 45% of realised losses were deferred as wash sales, much of it one strategy trimming a fund the other holds or buys | not started |
 
 ## 2. Get smarter every day
 
@@ -33,6 +37,7 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 | 2.4 | Schedules: weekday paper step, daily tournament, weekly research and review | started: weekly loaded; the weekday job waits on two commands from the owner |
 | 2.5 | A check on the critic itself: do changes made after a review actually help? | not started |
 | 2.6 | New models tried automatically: add a model to the roster and the tournament ranks it | started: the roster is read; nothing adds models on its own |
+| 2.7 | Live decay monitor: halt a strategy when its live Sharpe falls under half the backtest's or its fall exceeds 1.5 times the backtest's (from the owner's notes) | not started |
 
 ## 3. Rules and tax
 
@@ -40,7 +45,7 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 | --- | --- | --- |
 | 3.1 | Tax-lot ledger: gains by day, month and year, short and long term, wash sales found and carried into the new lot | done 2026-11-12 (`execution_and_risk/tax.py`, blind-verified); its four legal parameters are still marked unverified |
 | 3.2 | Sourced reference of tax and platform rules, each with its link and date | done 2026-11-12 (`docs/RULES_AND_TAX.md`); open questions are named in it |
-| 3.3 | Every order checked for its tax effect before it is placed, and wash sales avoided or flagged by a policy the owner sets | not started |
+| 3.3 | Every order checked for its tax effect before it is placed, and wash sales avoided or flagged by a policy the owner sets | started 2026-11-13: every paper order and day summary carries a tax note (blind-verified); notes only, no avoidance policy yet; notes do not yet see other orders decided the same day |
 | 3.4 | Valedia answers tax questions on request from the ledger: today, this month, this year, what this trade would do | not started |
 | 3.5 | Platform rule checks before each order: day-trade counts, settlement in cash accounts, order types and hours, rate limits, position limits | not started |
 | 3.6 | Weekly re-read of the sources; any change in a rule is shown to the owner before the trader uses it | not started |
@@ -60,6 +65,7 @@ Nothing here is tax or legal advice; the ledger computes from the rules file and
 | 4.5 | Kill switch tested against the venue; alerts and a daily summary to the owner's phone | not started (Signal waits on the owner's login job) |
 | 4.6 | A longer paper record: the hold strategy joins at the next paper step | started |
 | 4.7 | A second venue for prediction markets (Kalshi's API, or event contracts through Webull) | not started |
+| 4.8 | Order handling for live trading: submit once, a timeout is unknown until reconciled, reconcile on restart, live orders approved by ticket number (from the owner's notes) | not started |
 
 ## 5. Keeping it safe and visible
 
