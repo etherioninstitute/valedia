@@ -58,6 +58,24 @@ def panel_scorecard(entries: list[dict]) -> dict | None:
             "approved_came_true": rate(approved), "refused_came_true": rate(refused)}
 
 
+def benchmark_comparison(entries: list[dict]) -> list[dict]:
+    """Each paper strategy against simply holding its own funds, from the journal's day summaries. `days` is the number
+    of days both were recorded, so the reader can see how little or how much the difference rests on."""
+    seen: dict[str, list[dict]] = {}
+    for e in entries:
+        if e.get("type") == "summary" and isinstance(e.get("benchmark_values"), dict):
+            for name in e["benchmark_values"]:
+                if name in e.get("strategy_values", {}):
+                    seen.setdefault(name, []).append(e)
+    rows = []
+    for name, days in sorted(seen.items()):
+        last = max(days, key=lambda e: e["day"])
+        mine, held, capital = float(last["strategy_values"][name]), float(last["benchmark_values"][name]), float(last.get("capital_per_strategy") or 0.0)
+        rows.append({"strategy": name, "days": len(days), "strategy_value": mine, "benchmark_value": held, "difference": mine - held,
+                     "difference_pct_of_capital": (mine - held) / capital * 100.0 if capital else None, "as_of": last["day"]})
+    return rows
+
+
 def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies: dict[int, str], limits_file: str | Path,
                   days: int = 7, rules: CriticRules | None = None, apply: bool = True,
                   narrator: Callable[[str], str] | None = None) -> dict:
@@ -107,6 +125,16 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                      else " Its refusals did no better than its approvals; keep it in shadow mode.")
         else:
             text += " Too few refusals to judge whether a veto would help."
+        findings.append((None, text))
+
+    # ---- each strategy against simply holding its funds
+    for row in benchmark_comparison(everything):
+        text = (f"{row['strategy']}: {row['strategy_value']:+,.0f} in paper against {row['benchmark_value']:+,.0f} for simply holding its funds "
+                f"over {row['days']} days")
+        if row["difference_pct_of_capital"] is not None:
+            text += f" ({row['difference_pct_of_capital']:+.2f}% of its capital)"
+        text += (". That is too few days to mean anything." if row["days"] < rules.min_days_to_judge else
+                 ". It is behind holding." if row["difference"] < 0 else ". It is ahead of holding.")
         findings.append((None, text))
 
     # ---- each strategy against its backtest and its prediction

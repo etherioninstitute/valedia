@@ -140,3 +140,12 @@ drawdown, value at risk, beta), so every member judges the same numbers. The ver
 order. After `horizon_days` the case is scored against what the asset did, which gives each member a measured Brier
 score. In `veto` mode a refusal, or a panel that cannot be reached, blocks the order; the panel can never create one.
 The weekly review reports how approved and refused orders turned out and says when a veto would have helped.
+
+## The benchmark every paper strategy is measured against
+
+Each day's summary carries `benchmark_values` beside `strategy_values`: what simply holding the strategy's own funds
+would have made over the same days, in dollars. It is the comparator the gate already uses (equal weight in every fund
+with a price, rebalanced daily, no costs), started with the strategy's first-day capital on the day its first orders
+filled. It is a yardstick, not a book: no orders, no risk checks, no costs, and the account's position limits do not
+apply to it. The weekly review reports how far each strategy is ahead of or behind it, with the number of days, and
+says so when the days are too few to mean anything. Design note: `docs/specs/2026-11-12-paper-benchmark-design.md`.

@@ -128,3 +128,24 @@ def test_panel_scorecard_reads_verdicts_and_outcomes_from_the_journal():
     card = panel_scorecard(entries)
     assert card == {"settled": 3, "approved": 2, "refused": 1, "approved_came_true": 0.5, "refused_came_true": 0.0}
     assert panel_scorecard(entries[:4]) is None                       # nothing has reached its horizon yet
+
+
+def test_benchmark_comparison_gives_both_numbers_and_the_day_count():
+    def day(d, value, bench, capital=100_000.0):
+        return {"type": "summary", "day": d, "strategy_values": {"mom": value}, "benchmark_values": {"mom": bench}, "capital_per_strategy": capital}
+    entries = [day("2026-11-10", 0.0, 0.0), day("2026-11-11", -5.0, 0.0), day("2026-11-12", 112.0, 640.0),
+               {"type": "summary", "day": "2026-11-09", "strategy_values": {"old": 1.0}}]            # written before the benchmark existed
+    rows = cr.benchmark_comparison(entries)
+    assert rows == [{"strategy": "mom", "days": 3, "strategy_value": 112.0, "benchmark_value": 640.0, "difference": -528.0,
+                     "difference_pct_of_capital": pytest.approx(-0.528), "as_of": "2026-11-12"}]
+    assert cr.benchmark_comparison([e for e in entries if "benchmark_values" not in e]) == []
+
+
+def test_the_weekly_review_says_where_each_strategy_stands_against_holding_its_funds(desk):
+    ledger, journal, limits, hid = desk
+    for d, value, bench in (("2026-11-10", 0.0, 0.0), ("2026-11-11", -5.0, 0.0), ("2026-11-12", 112.0, 640.0)):
+        journal.write(pd.Timestamp(d), {"type": "summary", "day": d, "equity": 100_000.0 + value, "strategy_values": {"mom": value},
+                                        "strategy_value_change": {"mom": 0.0}, "benchmark_values": {"mom": bench}, "capital_per_strategy": 100_000.0})
+    review = cr.weekly_review(ledger, journal, pd.Timestamp("2026-11-12"), {hid: "mom"}, limits, apply=False)
+    line = next(text for text in review["findings"] if "holding its funds" in text)
+    assert "mom" in line and "112" in line and "640" in line and "3 days" in line and "too few" in line

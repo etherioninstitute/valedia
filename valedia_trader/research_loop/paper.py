@@ -20,6 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 import pandas as pd
 
+from valedia_trader.backtest.engine import buy_and_hold
 from valedia_trader.research_loop import diagnostics, risk_gate
 from valedia_trader.research_loop.ledger import market_regime
 from valedia_trader.research_loop.strategy import Strategy, run_rules
@@ -326,12 +327,35 @@ class PaperTrader:
         summary = {"day": str(day.date()), "equity": equity, "daily_loss_pct": account["daily_loss_pct"],
                    "drawdown_pct": account["drawdown_pct"], "open_positions": account["open_positions"],
                    "orders_placed": placed, "orders_blocked": blocked, "strategy_values": {s: self._strategy_value(s, row) for s in self.state["positions"]},
-                   "strategy_value_change": by_strategy, "capital_per_strategy": share}
+                   "strategy_value_change": by_strategy, "capital_per_strategy": share,
+                   "benchmark_values": self._benchmark_values(prices, strategies, share)}
         self.state["history"].append(summary)
         self.state["last_day"] = str(day.date())
         self.journal.write(day, {"type": "summary", **summary})
         self._save()
         return summary
+
+    def _benchmark_values(self, prices: pd.DataFrame, strategies: dict[int, Strategy], share: float) -> dict[str, float]:
+        """What simply holding each strategy's funds would have made, in dollars, since its first orders filled.
+
+        The same comparator the research gate uses (`buy_and_hold`: equal weight in every fund with a price, rebalanced
+        daily, no costs), started with the capital the strategy had on its first paper day. It is a yardstick, not a book:
+        it places no orders, meets no risk check and pays no costs. Only the start day and capital are stored; the value
+        is recomputed from prices each day. A book saved before this existed takes both from its own history."""
+        books, out = self.state.setdefault("benchmarks", {}), {}
+        for s in strategies.values():
+            if s.name not in books:
+                began = next((h for h in self.state["history"] if s.name in h.get("strategy_values", {})), None)
+                books[s.name] = {"start_day": began["day"] if began else str(prices.index[-1].date()),
+                                 "capital": float(began["capital_per_strategy"] if began else share)}
+            funds = [m for m in s.market if m in prices.columns]
+            since = prices.index[prices.index > pd.Timestamp(books[s.name]["start_day"])]   # since[0] is the day its first orders filled
+            if len(since) < 2 or not funds:
+                out[s.name] = 0.0
+                continue
+            held = buy_and_hold(prices.loc[since[0]:, funds])
+            out[s.name] = float(books[s.name]["capital"] * (np.prod(1.0 + held.iloc[1:]) - 1.0))
+        return out
 
     def _strategy_value(self, strategy: str, row: pd.Series) -> float:
         """Open market value of a strategy's positions plus what it has realised so far."""

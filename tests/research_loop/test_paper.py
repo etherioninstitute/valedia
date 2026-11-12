@@ -231,3 +231,64 @@ def test_the_panel_is_scored_after_its_horizon_and_never_asked_about_exits(setup
     with pytest.raises(ValueError):
         trader(setup, panel=panel, panel_mode="always")
     assert trader(setup).panel_mode == "off"
+
+
+# ---- the "hold the funds" benchmark (docs/specs/2026-11-12-paper-benchmark-design.md)
+def _held(px, start_pos, upto_pos, capital=100_000.0):
+    """What the gate's own comparator makes from the close of `start_pos` to the close of `upto_pos`."""
+    from valedia_trader.backtest.engine import buy_and_hold
+    basket = buy_and_hold(px.iloc[: upto_pos + 1])
+    return capital * (float(np.prod(1.0 + basket.iloc[start_pos + 1:])) - 1.0)
+
+
+def test_benchmark_is_the_gates_held_basket_from_the_day_the_first_orders_fill(setup):
+    px, t, s, day = prices(), trader(setup), strat(), 11
+    first = t.step(px.iloc[: day + 1], {7: s})
+    assert first["benchmark_values"] == {"mom_paper": 0.0}             # decided today: nothing has been earned yet
+    second = t.step(px.iloc[: day + 2], {7: s})
+    assert second["benchmark_values"] == {"mom_paper": 0.0}            # the fill day is where both start counting
+    third = t.step(px.iloc[: day + 3], {7: s})
+    assert third["benchmark_values"]["mom_paper"] == pytest.approx(_held(px, day + 1, day + 2))
+    fourth = t.step(px.iloc[: day + 4], {7: s})
+    assert fourth["benchmark_values"]["mom_paper"] == pytest.approx(_held(px, day + 1, day + 3))
+    assert fourth["benchmark_values"]["mom_paper"] != pytest.approx(fourth["strategy_values"]["mom_paper"])   # a different thing from the book
+
+
+def test_benchmark_places_no_orders_and_leaves_the_book_alone(setup):
+    px, t, s, day = prices(), trader(setup), strat(), 11
+    for i in range(1, 5):
+        out = t.step(px.iloc[: day + i], {7: s})
+    row = px.iloc[day + 3]
+    held = sum(lot["units"] * float(row[sym]) for lot in [None] for sym, lot in t.state["positions"]["mom_paper"].items())
+    assert t.state["cash"] + held == pytest.approx(out["equity"])      # cash plus positions is still the whole account
+    kinds = {e["type"] for e in t.journal.read()}
+    assert kinds <= {"decision", "fill", "summary", "kill_switch", "panel_settled"}
+    assert not any("benchmark" in json.dumps(e) for e in t.journal.read() if e["type"] in ("decision", "fill"))
+    assert set(t.state["benchmarks"]["mom_paper"]) == {"start_day", "capital"}     # two facts; the value is recomputed from prices
+
+
+def test_a_book_saved_before_the_benchmark_existed_gets_it_from_its_own_history(setup):
+    px, s, day = prices(), strat(), 11
+    t = trader(setup)
+    t.step(px.iloc[: day + 1], {7: s})
+    t.step(px.iloc[: day + 2], {7: s})
+    t.state.pop("benchmarks")                                           # what a state file written by the older code looks like
+    for h in t.state["history"]:
+        h.pop("benchmark_values", None)
+    t._save()
+    again = trader(setup)
+    third = again.step(px.iloc[: day + 3], {7: s})
+    assert again.state["benchmarks"]["mom_paper"] == {"start_day": str(px.index[day].date()), "capital": 100_000.0}
+    assert third["benchmark_values"]["mom_paper"] == pytest.approx(_held(px, day + 1, day + 2))
+
+
+def test_benchmark_capital_is_fixed_on_the_strategys_first_day(setup):
+    px, t, day = prices(), trader(setup), 11
+    a, b = strat("first"), strat("second")
+    t.step(px.iloc[: day + 1], {7: a})
+    t.step(px.iloc[: day + 2], {7: a})
+    out = t.step(px.iloc[: day + 3], {7: a, 8: b})                      # a second strategy joins: capital per strategy halves
+    assert out["capital_per_strategy"] == pytest.approx(out["equity"] / 2)
+    assert t.state["benchmarks"]["first"]["capital"] == 100_000.0
+    assert out["benchmark_values"]["first"] == pytest.approx(_held(px, day + 1, day + 2))
+    assert out["benchmark_values"]["second"] == 0.0 and t.state["benchmarks"]["second"]["start_day"] == str(px.index[day + 2].date())
