@@ -11,7 +11,7 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1.1 | Forecast tournament: every forecaster (Nimble v3, local models, Hermes bots) asked the same questions and scored against a no-intelligence baseline | started: built, first blind batch scored 2026-11-12 |
+| 1.1 | Forecast tournament: every forecaster (Nimble v3, local models, Hermes bots) asked the same questions and scored against a no-intelligence baseline | started: built; first blind batch (293 fund questions): Nimble v3 0.444, Qwen 8B 0.276, base rate 0.243, so both worse as they stand |
 | 1.2 | Forward questions every trading day on funds, stocks and crypto, settled and scored automatically | not started (the command exists; it is not scheduled) |
 | 1.3 | Prediction-market questions in the tournament, scored against the market's own price (Kalshi and Polymarket history are free to read) | not started |
 | 1.4 | MiroFish swarm and the web-reading Scout as tournament forecasters | not started (no swarm run has completed yet) |
@@ -38,8 +38,8 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 
 | # | Item | Status |
 | --- | --- | --- |
-| 3.1 | Tax-lot ledger: gains by day, month and year, short and long term, wash sales found and carried into the new lot | started: being built 2026-11-12 |
-| 3.2 | Sourced reference of tax and platform rules, each with its link and date | started: being compiled 2026-11-12 |
+| 3.1 | Tax-lot ledger: gains by day, month and year, short and long term, wash sales found and carried into the new lot | done 2026-11-12 (`execution_and_risk/tax.py`, blind-verified); its four legal parameters are still marked unverified |
+| 3.2 | Sourced reference of tax and platform rules, each with its link and date | done 2026-11-12 (`docs/RULES_AND_TAX.md`); open questions are named in it |
 | 3.3 | Every order checked for its tax effect before it is placed, and wash sales avoided or flagged by a policy the owner sets | not started |
 | 3.4 | Valedia answers tax questions on request from the ledger: today, this month, this year, what this trade would do | not started |
 | 3.5 | Platform rule checks before each order: day-trade counts, settlement in cash accounts, order types and hours, rate limits, position limits | not started |
