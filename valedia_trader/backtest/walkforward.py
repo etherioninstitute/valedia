@@ -25,6 +25,7 @@ from valedia_trader.agents import autoresearch as ar
 from valedia_trader.agents import darwinian as dw
 from valedia_trader.agents import specialists as sp
 from valedia_trader.backtest.engine import BacktestResult, CostModel, buy_and_hold, performance_report, run_backtest
+from valedia_trader.data_and_fees.prices import UNIVERSE as CORE_UNIVERSE
 from valedia_trader.data_and_fees.venue_registry import VenueRegistry
 from valedia_trader.execution_and_risk.buffering import apply_buffer
 from valedia_trader.quant_engine import level10_ml_research as research
@@ -33,7 +34,9 @@ CRYPTO = ("BTC-USD", "ETH-USD")
 SPLIT = "2020-01-01"
 START = "2013-01-02"
 # Stated assumptions (not registry facts): half-spread per side and annual borrow on shorts.
-HALF_SPREAD_BPS = {"etf": 1.0, "crypto": 5.0}
+# "etf" is for the core universe's large, liquid funds. A fund outside it has not had its spread measured here, so it is
+# costed at the wider figure until someone does: a result must not look good because an unknown cost was assumed small.
+HALF_SPREAD_BPS = {"etf": 1.0, "crypto": 5.0, "etf_unvetted": 5.0}
 BORROW_ANNUAL = 0.02
 SEARCH_SPACE = {
     "trend": {"lookback": [63, 126, 189, 252], "skip": [0, 5, 10], "vol_window": [20, 40, 60]},
@@ -63,7 +66,11 @@ def load_universe(data_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Prices and dollar volume on the equity trading calendar (crypto sampled on those days)."""
     d = Path(data_dir)
     close, volume = pd.read_parquet(d / "close.parquet"), pd.read_parquet(d / "volume.parquet")
-    trading_days = close["SPY"].dropna().index
+    if "SPY" in close.columns:
+        trading_days = close["SPY"].dropna().index
+    else:                                # a folder of other funds: any day one of them traded is a trading day
+        listed = [c for c in close.columns if c not in CRYPTO]
+        trading_days = close[listed].dropna(how="all").index
     close, volume = close.loc[trading_days].sort_index(axis=1), volume.loc[trading_days].sort_index(axis=1)
     dollar = volume * close
     for c in CRYPTO:                     # the data vendor reports crypto volume in dollars already
@@ -76,7 +83,8 @@ def build_cost_model(columns, registry: VenueRegistry, as_of) -> CostModel:
     """Commission per side from the venue registry as of `as_of`; spread and borrow are assumptions."""
     fees, slip = {}, {}
     for c in columns:
-        venue, product, kind = ("kraken", "spot", "crypto") if c in CRYPTO else ("alpaca", "equity", "etf")
+        venue, product, kind = (("kraken", "spot", "crypto") if c in CRYPTO else
+                                ("alpaca", "equity", "etf" if c in CORE_UNIVERSE else "etf_unvetted"))
         fees[c] = registry.fee_for(venue, product, "taker", notional=10_000.0, as_of=as_of).bps
         slip[c] = HALF_SPREAD_BPS[kind]
     return CostModel(fees, slip, BORROW_ANNUAL, 0.0)
