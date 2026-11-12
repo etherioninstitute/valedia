@@ -1,0 +1,31 @@
+{
+  "name": "turn_of_month_share_funds_2006_2026",
+  "version": "1.0.0",
+  "hypothesis": "Share prices rise around the turn of the month because of month-end money flows",
+  "market": [
+    "EEM",
+    "EFA",
+    "IWM",
+    "QQQ",
+    "SPY"
+  ],
+  "entry": {
+    "rule": "turn_of_month",
+    "before": 1,
+    "after": 3,
+    "enter": 1,
+    "exit": 0,
+    "direction": "long"
+  },
+  "sizing": {
+    "rule": "equal"
+  },
+  "risk": {
+    "max_position_pct": 0.2,
+    "max_open_positions": 5,
+    "max_gross": 1.0,
+    "stop_loss_pct": null,
+    "take_profit_pct": null,
+    "max_holding_days": null
+  }
+}
