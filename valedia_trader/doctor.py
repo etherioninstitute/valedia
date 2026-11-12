@@ -188,9 +188,13 @@ def check_mirofish(paths: LoopPaths) -> tuple[str, str]:
         report = mm.verify(profile, probe_servers=False)
     except Exception as exc:
         return FAIL, f"{type(exc).__name__}: {exc}"
-    ready = bool(report.get("ready"))
-    return (ATTENTION if ready else FAIL), (f"model profile {profile.name} " + ("ready" if ready else "NOT ready")
-                                             + "; a native run still needs the owner's decision on the staging guard")
+    if not report.get("ready"):
+        return FAIL, f"model profile {profile.name} NOT ready"
+    decided = (paths.root / "tools" / "mirofish_acknowledged_revisions.json").is_file()
+    if not decided:
+        return ATTENTION, f"model profile {profile.name} ready; staging is refused until the owner decides on the staging guard"
+    return OK, (f"model profile {profile.name} ready; the staging guard carries the owner's decision; each run still needs its own staged "
+                "folder and one-use gate (docs/mirofish-swarm.md)")
 
 
 def check_desk(paths: LoopPaths) -> tuple[str, str]:
