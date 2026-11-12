@@ -103,7 +103,7 @@ SKEPTIC = Role("skeptic", "Skeptic", "why each idea will fail", None)
 def _library_help() -> str:
     lines = ["entry rules (a score; a long opens when score >= enter and closes when score <= exit; shorts mirror it):"]
     for name, fn in st.SCORES.items():
-        params = ", ".join(f"{k} in [{lo}, {hi}]" for k, (lo, hi) in st._SCORE_PARAMS[name].items())
+        params = ", ".join(f"{k} in [{lo}, {hi}]" for k, (lo, hi) in st._SCORE_PARAMS[name].items()) or "none"
         lines.append(f"  {name}: {fn.__doc__.strip().splitlines()[0]} Parameters: {params}.")
     lines.append('  every entry also needs "enter", "exit" (exit <= enter) and "direction": "long" | "short" | "both"')
     lines.append("sizing rules:")

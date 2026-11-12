@@ -63,6 +63,7 @@ class Strategy(ABC):
     hypothesis: str
     market: tuple[str, ...]
     risk: StrategyRisk
+    rebalance_days = None          # sessions between resizes of a held position; None keeps the size it was opened with
 
     @abstractmethod
     def entry(self, prices: pd.DataFrame) -> pd.DataFrame:
@@ -107,14 +108,17 @@ def run_rules(strategy: Strategy, prices: pd.DataFrame) -> tuple[pd.DataFrame, l
     record every entry and exit with the rule that caused it.
 
     Order of business on each bar: exits first (stop loss, take profit, time limit, exit rule), then
-    entries into free slots by strength. A position keeps the size it was opened with. Spot crypto is
-    never shorted. Gross exposure is scaled down to `risk.max_gross` if the positions exceed it."""
+    resizes, then entries into free slots by strength. A position keeps the size it was opened with,
+    unless the strategy sets `rebalance_days`: then every that many sessions held it is reset to the size
+    the sizing rule gives on that bar (left alone on a bar with no size). Spot crypto is never shorted.
+    Gross exposure is scaled down to `risk.max_gross` if the positions exceed it."""
     _check_identity(strategy)
     cols = [c for c in strategy.market if c in prices.columns]
     if not cols:
         raise SpecError(f"none of the strategy's market {strategy.market} is in the price data")
     px = prices[cols]
     risk = strategy.risk
+    every = strategy.rebalance_days
     entry = np.array(strategy.entry(px).reindex(index=px.index, columns=cols).fillna(0).to_numpy(), copy=True)
     exit_long = strategy.exit(px, 1).reindex(index=px.index, columns=cols).fillna(False).to_numpy(dtype=bool)
     exit_short = strategy.exit(px, -1).reindex(index=px.index, columns=cols).fillna(False).to_numpy(dtype=bool)
@@ -146,6 +150,16 @@ def run_rules(strategy: Strategy, prices: pd.DataFrame) -> tuple[pd.DataFrame, l
                                "price": float(p[t, j]), "reason": reason, "pnl_pct": float(move)})
                 side[j], weight[j], entry_px[j], held[j] = 0, 0.0, np.nan, 0
                 entry[t, j] = 0                              # closed on this bar: not reopened on the same bar
+        if every:
+            for j in np.flatnonzero((side != 0) & (held > 0) & (held % every == 0)):
+                if not (np.isfinite(p[t, j]) and np.isfinite(size[t, j]) and size[t, j] > 0):
+                    continue                                 # no price or no size today: the position is left as it is
+                new = min(float(size[t, j]), risk.max_position_pct)
+                if abs(new - weight[j]) > 1e-12:
+                    weight[j] = new
+                    events.append({"date": px.index[t], "symbol": cols[j], "action": "resize", "side": int(side[j]),
+                                   "price": float(p[t, j]), "reason": f"reset to the sizing rule's weight after {every} sessions",
+                                   "weight": new})
         free = risk.max_open_positions - int((side != 0).sum())
         if free > 0:
             want = [j for j in np.flatnonzero((entry[t] != 0) & (side == 0))
@@ -211,6 +225,11 @@ def _trend_blend(px: pd.DataFrame, fast: int = 16, speeds: int = 3, vol_window: 
     return sum(parts) / len(parts)
 
 
+def _hold(px: pd.DataFrame) -> pd.DataFrame:
+    """Always 1: hold every fund the whole time, with no timing at all. Use enter 1 and exit 0."""
+    return pd.DataFrame(1.0, index=px.index, columns=px.columns)
+
+
 @lru_cache(maxsize=1)
 def _exchange_sessions() -> pd.DatetimeIndex:
     """Every New York Stock Exchange session from 1990 to about a year ahead: early closes count, holidays
@@ -239,12 +258,12 @@ def _turn_of_month(px: pd.DataFrame, before: int = 1, after: int = 3) -> pd.Data
 
 SCORES: dict[str, Callable[..., pd.DataFrame]] = {"momentum": _momentum, "breakout": _breakout, "reversion": _reversion,
                                                   "ma_cross": _ma_cross, "drift": _drift, "trend_blend": _trend_blend,
-                                                  "turn_of_month": _turn_of_month}
+                                                  "turn_of_month": _turn_of_month, "hold": _hold}
 _SCORE_PARAMS = {"momentum": {"lookback": (5, 756), "skip": (0, 63)}, "breakout": {"lookback": (5, 504)},
                  "reversion": {"lookback": (1, 63), "vol_window": (10, 504)}, "ma_cross": {"fast": (2, 252), "slow": (5, 756)},
                  "drift": {"window": (20, 756), "horizon": (1, 63)},
                  "trend_blend": {"fast": (2, 64), "speeds": (1, 4), "vol_window": (5, 126)},
-                 "turn_of_month": {"before": (0, 10), "after": (0, 10)}}
+                 "turn_of_month": {"before": (0, 10), "after": (0, 10)}, "hold": {}}
 
 
 def _size_equal(px: pd.DataFrame, risk: StrategyRisk) -> pd.DataFrame:
@@ -258,7 +277,8 @@ def _size_inverse_vol(px: pd.DataFrame, risk: StrategyRisk, vol_window: int = 20
 
 
 SIZING: dict[str, Callable[..., pd.DataFrame]] = {"equal": _size_equal, "inverse_vol": _size_inverse_vol}
-_SIZING_PARAMS = {"equal": {}, "inverse_vol": {"vol_window": (5, 252), "position_vol": (0.001, 0.20)}}
+_RESIZE = {"rebalance_days": (1, 252)}       # any sizing rule: reset a held position to the rule's size every so many sessions
+_SIZING_PARAMS = {"equal": {**_RESIZE}, "inverse_vol": {"vol_window": (5, 252), "position_vol": (0.001, 0.20), **_RESIZE}}
 
 
 def _params(given: dict, allowed: dict[str, tuple], what: str) -> dict:
@@ -279,7 +299,8 @@ class RuleStrategy(Strategy):
 
     entry   {"rule": <score>, <score parameters>, "enter": x, "exit": y, "direction": "long" | "short" | "both"}
             long when score >= enter and closed when score <= exit; shorts mirror with the signs flipped
-    sizing  {"rule": "equal" | "inverse_vol", <parameters>}
+    sizing  {"rule": "equal" | "inverse_vol", <parameters>, "rebalance_days": n}   (rebalance_days is optional: without
+            it a position keeps the size it was opened with)
     risk    StrategyRisk fields
     """
     name: str
@@ -314,6 +335,7 @@ class RuleStrategy(Strategy):
         if srule not in SIZING:
             raise SpecError(f"sizing: rule must be one of {sorted(SIZING)}")
         self._srule, self._size_params = srule, _params(s, _SIZING_PARAMS[srule], f"sizing.{srule}")
+        self.rebalance_days = self._size_params.pop("rebalance_days", None)
 
     def score(self, prices: pd.DataFrame) -> pd.DataFrame:
         return SCORES[self._rule](prices, **self._score_params)

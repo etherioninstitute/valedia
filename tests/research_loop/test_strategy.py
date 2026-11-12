@@ -253,3 +253,77 @@ def test_turn_of_month_parameters_are_checked(entry):
 def test_research_agents_are_told_about_the_calendar_rule():
     from valedia_trader.research_loop import research
     assert "turn_of_month" in research.RULE_LIBRARY and "before in [0, 10]" in research.RULE_LIBRARY
+
+
+# ---- holding without timing, and resizing a held position
+
+def hold_spec(sizing=None, **risk):
+    return spec(name="hold_test", hypothesis="The funds earn their return for being held", market=["A", "B"],
+                entry={"rule": "hold", "enter": 1, "exit": 0}, sizing=sizing or {"rule": "equal"},
+                risk={"max_position_pct": 0.5, "max_open_positions": 2, "stop_loss_pct": None, **risk})
+
+
+def calm_then_wild(n=60, turn=30):
+    """A: half a percent a day up and down, then three percent. B: the same the other way round."""
+    step = np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+    a = 100.0 * np.cumprod(1.0 + step * np.where(np.arange(n) < turn, 0.005, 0.03))
+    b = 100.0 * np.cumprod(1.0 + step * np.where(np.arange(n) < turn, 0.03, 0.005))
+    return frame(A=a, B=b)
+
+
+def test_hold_enters_every_fund_at_once_and_never_leaves():
+    px = frame(A=np.linspace(100, 60, 40), B=np.linspace(100, 180, 40))
+    w, events = st.run_rules(st.RuleStrategy.from_spec(hold_spec()), px)
+    assert (w[["A", "B"]] == 0.5).all().all()                       # a falling fund is held like a rising one
+    assert [(e["action"], e["symbol"]) for e in events] == [("enter", "A"), ("enter", "B")]
+
+
+def test_a_position_keeps_its_entry_size_unless_the_strategy_asks_for_resizing():
+    px = calm_then_wild()
+    sizing = {"rule": "inverse_vol", "vol_window": 10, "position_vol": 0.02}
+    fixed = st.RuleStrategy.from_spec(hold_spec(sizing))
+    size = fixed.size(px)
+    w, events = st.run_rules(fixed, px)
+    assert w["A"].iloc[10:].nunique() == 1 and w["A"].iloc[10] == pytest.approx(size["A"].iloc[10])
+    assert {e["action"] for e in events} == {"enter"}
+
+    resized = st.RuleStrategy.from_spec(hold_spec({**sizing, "rebalance_days": 5}))
+    w5, events5 = st.run_rules(resized, px)
+    assert w5["A"].iloc[10:15].nunique() == 1                       # nothing changes between resizes
+    for bar in (15, 30, 50):                                        # 5, 20 and 40 sessions after the entry on bar 10
+        assert w5["A"].iloc[bar] == pytest.approx(size["A"].iloc[bar])
+    assert w5["A"].iloc[52] == pytest.approx(size["A"].iloc[50])    # held at the last resize until the next one
+    assert w5["A"].iloc[50] < 0.25 * w5["A"].iloc[20]               # six times the volatility: a much smaller position
+    assert w5["B"].iloc[50] > w5["B"].iloc[20]                      # and the fund that calmed down grew
+    moves = [e for e in events5 if e["action"] == "resize" and e["symbol"] == "A"]
+    assert [px.index.get_loc(e["date"]) for e in moves] == [30, 35, 40]             # only when the size really changed
+    assert moves[-1]["weight"] == pytest.approx(size["A"].iloc[40]) and "5 sessions" in moves[0]["reason"]
+
+
+def test_resizing_respects_the_position_cap_the_gross_cap_and_a_day_without_a_size():
+    px = calm_then_wild()
+    px.iloc[38:52, px.columns.get_loc("A")] = px["A"].iloc[38]      # A stops moving: no volatility, so no size, on bars 48-51
+    s = st.RuleStrategy.from_spec(hold_spec({"rule": "inverse_vol", "vol_window": 10, "position_vol": 0.2, "rebalance_days": 5},
+                                            max_position_pct=0.6, max_gross=1.0))
+    size = s.size(px)
+    w, _ = st.run_rules(s, px)
+    assert size["A"].iloc[50] != size["A"].iloc[50]                 # no size on bar 50, a resize day
+    assert w["A"].iloc[50] == w["A"].iloc[49] > 0                   # so the position is left as it was
+    assert (w.abs().sum(axis=1) <= 1.0 + 1e-12).all()               # two positions at the 60% cap are scaled to 100% in all
+    assert w.iloc[45].tolist() == pytest.approx([0.5, 0.5])
+
+
+@pytest.mark.parametrize("days", [0, 253, True, "monthly"])
+def test_rebalance_days_is_checked(days):
+    with pytest.raises(st.SpecError):
+        st.RuleStrategy.from_spec(hold_spec({"rule": "equal", "rebalance_days": days}))
+
+
+def test_resizing_survives_a_round_trip_and_is_offered_to_the_research_agents(tmp_path):
+    from valedia_trader.research_loop import research
+    s = st.RuleStrategy.from_spec(hold_spec({"rule": "inverse_vol", "rebalance_days": 21}))
+    again = st.load_strategy(st.save_spec(s, tmp_path))
+    assert again.rebalance_days == 21 and again.to_spec() == s.to_spec()
+    assert st.RuleStrategy.from_spec(hold_spec()).rebalance_days is None
+    assert "  hold: " in research.RULE_LIBRARY and "rebalance_days in [1, 252]" in research.RULE_LIBRARY
+    assert "Parameters: ." not in research.RULE_LIBRARY
