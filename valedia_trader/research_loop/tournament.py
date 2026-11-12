@@ -16,9 +16,15 @@ prices before the question's day. Scores are Brier scores (the squared miss of t
 is better). Questions asked in the same week share the same market weather, so the test of "better than
 the baseline" counts each week once.
 
+Two more measures separate a forecaster's ranking from its scaling. `ranking` is the chance that a case that
+came true got a higher forecast than one that did not (0.5 is a coin, 1 is perfect), with a 95% range from
+resampling whole weeks. The rescaled score refits the forecaster's probabilities on the earlier half of its
+questions only, then scores the later half, so a model that says "about 0.1" to everything but orders the
+cases well is not lost behind its scale. Two rule forecasters (`--with-rules`) give a model a one-line rule to beat.
+
     python -m valedia_trader.research_loop.tournament refresh --universe stocks       (or crypto: see universes.json)
     python -m valedia_trader.research_loop.tournament ask-blind --data artifacts/data --market funds --count 300
-    python -m valedia_trader.research_loop.tournament ask-forward --data artifacts/data --market funds
+    python -m valedia_trader.research_loop.tournament ask-forward --data artifacts/data --market funds --with-rules
     python -m valedia_trader.research_loop.tournament settle --data artifacts/data
     python -m valedia_trader.research_loop.tournament score
 """
@@ -37,12 +43,15 @@ from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
+from scipy.special import expit, logit
+from scipy.stats import rankdata
 
 from valedia_trader.agents import panel as panel_mod
 from valedia_trader.research_loop import LoopPaths, diagnostics
 
 __all__ = ["Question", "TournamentLedger", "direction_questions", "settle_directions", "ask", "scores", "base_rate",
-           "forecasters", "universe", "refresh_universe", "main"]
+           "forecasters", "reference_forecasters", "universe", "refresh_universe", "main"]
 
 MIN_HISTORY = 253                 # a year of prices before an asset can be asked about
 HIDDEN_WHEN_BLIND = ("symbol", "as_of", "data_age_days")
@@ -219,12 +228,96 @@ def _week(day: str) -> tuple[int, int]:
     return int(iso[0]), int(iso[1])
 
 
+BOOTSTRAPS = 500
+
+
+def _t_by_week(rows: list[dict], diff: np.ndarray) -> tuple[float, int]:
+    """The t statistic of the per-question differences with each ISO week counted once, and how many weeks."""
+    by_week: dict[tuple, list[float]] = {}
+    for r, d in zip(rows, diff):
+        by_week.setdefault(_week(r["asked_on"]), []).append(float(d))
+    weekly = np.array([np.mean(v) for v in by_week.values()])
+    spread = float(weekly.std(ddof=1)) if len(weekly) > 1 else 0.0
+    return (float(weekly.mean() / (spread / math.sqrt(len(weekly)))) if spread > 0 else 0.0), len(weekly)
+
+
+def _auc(p: np.ndarray, y: np.ndarray) -> float | None:
+    """Share of (came-true, did-not) pairs where the came-true case got the higher forecast; a tie counts one half."""
+    pos = int((y == 1).sum())
+    neg = len(y) - pos
+    if pos == 0 or neg == 0:
+        return None
+    ranks = rankdata(p)                                    # tied forecasts share their average rank, which is the half
+    return float((ranks[y == 1].sum() - pos * (pos + 1) / 2.0) / (pos * neg))
+
+
+def _ranking(rows: list[dict]) -> tuple[float | None, float | None, float | None]:
+    """The ranking and its 95% range from 500 resamples of whole ISO weeks (drawn with replacement, rows pooled).
+    A resample missing a whole outcome class is skipped. The same seed every time, so the range is reproducible."""
+    p, y = (np.array([r[k] for r in rows], dtype=float) for k in ("probability", "outcome"))
+    point = _auc(p, y)
+    if point is None:
+        return None, None, None
+    weeks: dict[tuple, list[int]] = {}
+    for i, r in enumerate(rows):
+        weeks.setdefault(_week(r["asked_on"]), []).append(i)
+    members = [np.array(v) for v in weeks.values()]
+    rng = np.random.default_rng(0)
+    draws = []
+    for _ in range(BOOTSTRAPS):
+        picked = np.concatenate([members[j] for j in rng.integers(0, len(members), len(members))])
+        got = _auc(p[picked], y[picked])
+        if got is not None:
+            draws.append(got)
+    if not draws:
+        return point, None, None
+    low, high = np.percentile(draws, [2.5, 97.5])
+    return point, float(low), float(high)
+
+
+def _log_odds(p: np.ndarray) -> np.ndarray:
+    return logit(np.clip(p, 0.01, 0.99))
+
+
+def _rescaled(rows: list[dict], min_settled: int) -> dict:
+    """Fit q = sigmoid(a + b * logit(p)) by log loss on the earlier half of the questions (split at the median
+    distinct ask date, a date never straddling the split), then score the later half with it. Empty (None) when
+    either half has fewer than `min_settled` rows or the earlier half has only one outcome."""
+    empty = {"rescaled_brier": None, "rescaled_baseline_brier": None, "rescaled_skill": None, "rescaled_t_by_week": None,
+             "rescaled_settled": None}
+    days = sorted({r["asked_on"] for r in rows})
+    cut = days[len(days) // 2]
+    early = [r for r in rows if r["asked_on"] < cut]
+    late = [r for r in rows if r["asked_on"] >= cut]
+    if len(early) < min_settled or len(late) < min_settled:
+        return empty
+    pe, ye = (np.array([r[k] for r in early], dtype=float) for k in ("probability", "outcome"))
+    if ye.min() == ye.max():
+        return empty
+    xe = _log_odds(pe)
+    def log_loss(ab):
+        z = ab[0] + ab[1] * xe
+        return float(np.mean(np.logaddexp(0.0, z) - ye * z))          # -[y log q + (1-y) log(1-q)], q = sigmoid(z)
+    a, b = minimize(log_loss, x0=np.array([0.0, 1.0])).x
+    pl, yl, bl = (np.array([r[k] for r in late], dtype=float) for k in ("probability", "outcome", "baseline"))
+    mine, base = (expit(a + b * _log_odds(pl)) - yl) ** 2, (bl - yl) ** 2
+    t, _ = _t_by_week(late, mine - base)
+    return {"rescaled_brier": float(mine.mean()), "rescaled_baseline_brier": float(base.mean()),
+            "rescaled_skill": float(1.0 - mine.mean() / base.mean()) if base.mean() > 0 else 0.0, "rescaled_t_by_week": t,
+            "rescaled_settled": len(late)}
+
+
 def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
     """Each forecaster against the baseline, per market and kind of question.
 
     skill is 1 minus the forecaster's Brier score over the baseline's on the same questions: above 0 is
     better than the baseline, 0 is the same, below 0 is worse. t_by_week tests the difference with each
-    week of questions counted once; -2 or lower is "beats the baseline", +2 or higher is "worse"."""
+    week of questions counted once; -2 or lower is "beats the baseline", +2 or higher is "worse".
+
+    ranking is the chance a case that came true got a higher forecast than one that did not (ties count
+    half; 0.5 is a coin), between ranking_low and ranking_high (95%, resampling whole weeks). The rescaled_*
+    keys are the same Brier comparison on the later half of the questions after the forecasts are rescaled
+    by a fit to the earlier half alone; None when there are too few questions to split."""
     groups: dict[tuple, list[dict]] = {}
     for r in ledger.scored_rows():
         groups.setdefault((r["forecaster"], r["market"], r["kind"]), []).append(r)
@@ -232,12 +325,7 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
     for (who, market, kind), rows in sorted(groups.items()):
         p, y, b = (np.array([r[k] for r in rows], dtype=float) for k in ("probability", "outcome", "baseline"))
         mine, base = (p - y) ** 2, (b - y) ** 2
-        by_week: dict[tuple, list[float]] = {}
-        for r, d in zip(rows, mine - base):
-            by_week.setdefault(_week(r["asked_on"]), []).append(float(d))
-        weekly = np.array([np.mean(v) for v in by_week.values()])
-        spread = float(weekly.std(ddof=1)) if len(weekly) > 1 else 0.0
-        t = float(weekly.mean() / (spread / math.sqrt(len(weekly)))) if spread > 0 else 0.0
+        t, weeks = _t_by_week(rows, mine - base)
         n = len(rows)
         if n < min_settled:
             verdict = f"too few resolved questions to judge ({n} of {min_settled})"
@@ -247,12 +335,36 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
             verdict = "worse than the baseline"
         else:
             verdict = "not distinguishable from the baseline"
-        out.append({"forecaster": who, "market": market, "kind": kind, "settled": n, "weeks": len(weekly),
+        ranking, low, high = _ranking(rows)
+        if n < min_settled:
+            ranking_verdict = "too few resolved questions to judge"
+        elif low is not None and low > 0.5:
+            ranking_verdict = "ranks better than chance"
+        elif high is not None and high < 0.5:
+            ranking_verdict = "ranks worse than chance"
+        else:
+            ranking_verdict = "ranking not distinguishable from chance"
+        out.append({"forecaster": who, "market": market, "kind": kind, "settled": n, "weeks": weeks,
                     "brier": float(mine.mean()), "baseline_brier": float(base.mean()),
                     "skill": float(1.0 - mine.mean() / base.mean()) if base.mean() > 0 else 0.0, "t_by_week": t,
                     "mean_forecast": float(p.mean()), "came_true": float(y.mean()),
-                    "right_side": float(np.mean((p >= 0.5) == (y == 1))), "verdict": verdict})
+                    "right_side": float(np.mean((p >= 0.5) == (y == 1))), "verdict": verdict,
+                    "ranking": ranking, "ranking_low": low, "ranking_high": high, "ranking_verdict": ranking_verdict,
+                    **_rescaled(rows, min_settled)})
     return out
+
+
+def reference_forecasters() -> list[panel_mod.Member]:
+    """Two forecasters that need no model, so a model can be compared with a one-line rule: `rule-momentum`
+    says 0.6 when the last 20 days rose and 0.4 when they did not, `rule-above-200d` says 0.6 above the
+    200-day average and 0.4 below it. Each says 0.5 when the fact is missing."""
+    def momentum(case):
+        m = case["facts"].get("momentum_20d_pct")
+        return (0.5 if m is None else 0.6 if m > 0 else 0.4), None, "20-day momentum rule"
+    def above(case):
+        a = case["facts"].get("above_200d_average")
+        return (0.5 if a is None else 0.6 if a else 0.4), None, "200-day average rule"
+    return [panel_mod.CallableMember("rule-momentum", "decider", momentum), panel_mod.CallableMember("rule-above-200d", "decider", above)]
 
 
 def forecasters(names: Sequence[str] | None = None, roster: dict | None = None) -> list[panel_mod.Member]:
@@ -303,6 +415,7 @@ def main(argv=None) -> int:
             p.add_argument("--market", required=True, help="a label for these assets: funds, stocks, crypto")
             p.add_argument("--horizon", type=int, default=5)
             p.add_argument("--forecasters", default="", help="comma-separated panel deciders (default: every enabled one)")
+            p.add_argument("--with-rules", action="store_true", help="also ask the two rule forecasters (momentum, above the 200-day average)")
             p.add_argument("--limit", type=int, default=None, help="at most this many questions per forecaster in this run")
         if name == "ask-blind":
             p.add_argument("--count", type=int, default=300, help="how many questions to draw")
@@ -339,7 +452,7 @@ def main(argv=None) -> int:
         else:
             qs = direction_questions(prices, list(prices.columns), prices.index[-1], args.horizon, args.market)
             added, settled, today = ledger.add(qs), 0, pd.Timestamp.now().normalize()
-        members = forecasters([n for n in args.forecasters.split(",") if n] or None)
+        members = forecasters([n for n in args.forecasters.split(",") if n] or None) + (reference_forecasters() if args.with_rules else [])
         asked = ask(ledger, members, today=today, limit=args.limit, progress=lambda s: print(s, file=sys.stderr, flush=True))
         print(json.dumps({"questions_added": added, "settled_now": settled, "asked": asked, "counts": ledger.counts()}, indent=1))
         return 0

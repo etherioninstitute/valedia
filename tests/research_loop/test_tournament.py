@@ -146,3 +146,192 @@ def test_refreshing_a_universe_downloads_its_symbols_into_its_folder(tmp_path):
     out = tm.refresh_universe("crypto", root=tmp_path, download=fake)
     assert seen["tickers"] == tm.universe("crypto")["symbols"] and seen["begin"] == tm.universe("crypto")["start"]
     assert (tmp_path / "artifacts/data_crypto/close.parquet").exists() and out["symbols"] == len(seen["tickers"])
+
+
+# ---- ranking, and the rescaled later-half score -------------------------------------------------------------------
+
+def _filled(forecasters, outcomes, baseline=0.5, market_name="funds", kind="forward"):
+    """A ledger with one question per week (ISO weeks, from 2024-01-01) and every forecaster's answer, all settled.
+    `forecasters` maps a name to fn(outcome, k) -> probability; `outcomes` is the list of what happened."""
+    led = tm.TournamentLedger()
+    day0 = pd.Timestamp("2024-01-01")
+    for k, y in enumerate(outcomes):
+        day = str((day0 + pd.Timedelta(days=7 * k)).date())
+        led.add([tm.Question(f"q{k}", market_name, kind, day, 5, "AAA", "AAA closes higher", {}, baseline)])
+        for name, fn in forecasters.items():
+            led.record(f"q{k}", name, fn(y, k), None, 1.0)
+        led.settle(f"q{k}", y)
+    return led
+
+
+def _mixed(n=80, seed=3):
+    return [int(v) for v in np.random.default_rng(seed).integers(0, 2, n)]
+
+
+def test_ranking_is_the_share_of_pairs_the_forecaster_puts_the_right_way_round_with_ties_half():
+    led = tm.TournamentLedger()
+    for k, (p, y) in enumerate([(0.8, 1), (0.4, 1), (0.6, 0), (0.1, 0)]):
+        led.add([tm.Question(f"q{k}", "funds", "forward", f"2024-01-{k + 1:02d}", 5, "A", "t", {}, 0.5)])
+        led.record(f"q{k}", "f", p, None, 1.0)
+        led.record(f"q{k}", "flat", 0.5, None, 1.0)
+        led.settle(f"q{k}", y)
+    s = {r["forecaster"]: r for r in tm.scores(led, min_settled=4)}
+    assert s["f"]["ranking"] == pytest.approx(0.75) and s["flat"]["ranking"] == pytest.approx(0.5)
+    led.close()
+
+
+def test_a_forecaster_with_only_one_kind_of_outcome_has_no_ranking():
+    led = _filled({"f": lambda y, k: 0.7}, [1] * 40)
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking"] is None and s["ranking_low"] is None and s["ranking_high"] is None
+    assert s["rescaled_skill"] is None and s["ranking_verdict"] == "ranking not distinguishable from chance"
+    led.close()
+
+
+def test_a_perfect_ranker_ranks_at_one_and_better_than_chance():
+    led = _filled({"sees_ahead": lambda y, k: 0.9 if y else 0.1}, _mixed())
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking"] == 1.0 and s["ranking_low"] == 1.0 and s["ranking_high"] == 1.0
+    assert s["ranking_verdict"] == "ranks better than chance"
+    led.close()
+
+
+def test_tiny_but_ordered_forecasts_lose_on_brier_yet_rank_perfectly_and_beat_the_baseline_once_rescaled():
+    led = _filled({"shy": lambda y, k: 0.10 if y else 0.05}, _mixed())
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["brier"] > s["baseline_brier"] and s["skill"] < 0 and s["verdict"] != "beats the baseline"
+    assert s["ranking"] == 1.0 and s["ranking_verdict"] == "ranks better than chance"
+    assert s["rescaled_skill"] > 0.5 and s["rescaled_brier"] < s["rescaled_baseline_brier"]
+    assert s["rescaled_settled"] == 40 and s["rescaled_t_by_week"] < -2
+    led.close()
+
+
+def test_the_rescaling_is_fitted_on_the_earlier_half_only():
+    # earlier half: forecasts carry no information; later half: a perfect signal. A fit that peeked at the later half
+    # would rescale it into a great score; a fit on the earlier half alone cannot.
+    outcomes = _mixed()
+    n = len(outcomes)
+    led = _filled({"late_oracle": lambda y, k: (0.5 + 0.01 * (k % 2)) if k < n // 2 else (0.9 if y else 0.1)}, outcomes)
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["rescaled_settled"] == n // 2 and s["rescaled_skill"] < 0.5
+    led.close()
+
+
+def test_a_coin_has_a_ranking_range_around_one_half_and_no_verdict_of_skill():
+    rng = np.random.default_rng(11)
+    led = _filled({"coin": lambda y, k: float(rng.uniform(0.05, 0.95))}, _mixed(120))
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking_low"] <= 0.5 <= s["ranking_high"] and s["ranking_low"] < s["ranking"] < s["ranking_high"]
+    assert s["ranking_verdict"] == "ranking not distinguishable from chance"
+    led.close()
+
+
+def test_an_inverted_forecaster_ranks_worse_than_chance():
+    led = _filled({"backwards": lambda y, k: 0.2 if y else 0.8}, _mixed())
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking"] == 0.0 and s["ranking_high"] == 0.0 and s["ranking_verdict"] == "ranks worse than chance"
+    led.close()
+
+
+def test_the_ranking_range_is_reproducible():
+    rng = np.random.default_rng(2)
+    led = _filled({"noisy": lambda y, k: float(np.clip(0.5 + 0.1 * (2 * y - 1) + 0.3 * rng.standard_normal(), 0.01, 0.99))}, _mixed(100))
+    a, b = tm.scores(led, min_settled=30)[0], tm.scores(led, min_settled=30)[0]
+    assert (a["ranking"], a["ranking_low"], a["ranking_high"]) == (b["ranking"], b["ranking_low"], b["ranking_high"])
+    assert 0.0 < a["ranking_low"] < a["ranking"] < a["ranking_high"] < 1.0
+    led.close()
+
+
+def test_the_ranking_bootstrap_resamples_whole_weeks_with_the_stated_seed():
+    # two questions a week, the true one usually forecast higher; the range must be what 500 draws of whole weeks
+    # (default_rng(0), weeks in the order they first appear) give, computed here the long way
+    rng = np.random.default_rng(4)
+    rows, led = [], tm.TournamentLedger()
+    day0 = pd.Timestamp("2024-01-01")
+    for k in range(40):
+        day = str((day0 + pd.Timedelta(days=7 * k)).date())
+        for j, y in enumerate((1, 0)):
+            p = float(np.clip(0.5 + 0.15 * (2 * y - 1) + 0.25 * rng.standard_normal(), 0.01, 0.99))
+            led.add([tm.Question(f"w{k}{j}", "funds", "forward", day, 5, "A", "t", {}, 0.5)])
+            led.record(f"w{k}{j}", "f", p, None, 1.0)
+            led.settle(f"w{k}{j}", y)
+            rows.append((k, p, y))
+    def auc(pairs):
+        wins = [(pp > qq) + 0.5 * (pp == qq) for pp, yy in pairs if yy == 1 for qq, yz in pairs if yz == 0]
+        return sum(wins) / len(wins)
+    draw = np.random.default_rng(0)
+    got = []
+    for _ in range(500):
+        picked = [r for w in draw.integers(0, 40, 40) for r in rows if r[0] == w]
+        got.append(auc([(p, y) for _, p, y in picked]))
+    low, high = np.percentile(got, [2.5, 97.5])
+    s = tm.scores(led, min_settled=30)[0]
+    assert s["ranking"] == pytest.approx(auc([(p, y) for _, p, y in rows]))
+    assert s["ranking_low"] == pytest.approx(low) and s["ranking_high"] == pytest.approx(high)
+    led.close()
+
+
+def test_too_few_resolved_questions_leave_the_rescaled_keys_empty_and_the_ranking_unjudged():
+    led = _filled({"f": lambda y, k: 0.9 if y else 0.1}, _mixed(20))
+    s = tm.scores(led, min_settled=30)[0]
+    assert all(s[k] is None for k in ("rescaled_brier", "rescaled_baseline_brier", "rescaled_skill", "rescaled_t_by_week", "rescaled_settled"))
+    assert s["ranking_verdict"] == "too few resolved questions to judge" and s["ranking"] == 1.0
+    led.close()
+
+
+def test_a_half_too_small_or_an_earlier_half_of_one_outcome_leaves_the_rescaled_keys_empty():
+    keys = ("rescaled_brier", "rescaled_baseline_brier", "rescaled_skill", "rescaled_t_by_week", "rescaled_settled")
+    led = _filled({"f": lambda y, k: 0.9 if y else 0.1}, _mixed(50))          # 50 rows: halves of 25 and 25, under 30
+    assert all(tm.scores(led, min_settled=30)[0][k] is None for k in keys)
+    led.close()
+    led = _filled({"f": lambda y, k: 0.9 if y else 0.1}, [1] * 40 + _mixed(40))  # the earlier half is all one outcome
+    s = tm.scores(led, min_settled=30)[0]
+    assert all(s[k] is None for k in keys) and s["ranking"] is not None
+    led.close()
+
+
+def test_the_new_measures_leave_the_old_ones_alone(tmp_path):
+    scores, led = _play(tmp_path, {"sees_ahead": lambda y, case: 0.8 if y else 0.2})
+    s = scores[0]
+    old = {"forecaster", "market", "kind", "settled", "weeks", "brier", "baseline_brier", "skill", "t_by_week", "mean_forecast",
+           "came_true", "right_side", "verdict"}
+    assert old <= set(s) and {"ranking", "ranking_low", "ranking_high", "ranking_verdict", "rescaled_brier", "rescaled_baseline_brier",
+                             "rescaled_skill", "rescaled_t_by_week", "rescaled_settled"} <= set(s)
+    assert s["ranking"] == 1.0 and s["settled"] == 180 and s["rescaled_settled"] == 90
+    led.close()
+
+
+def test_the_two_rule_forecasters_answer_from_the_fact_sheet():
+    rules = {m.name: m for m in tm.reference_forecasters()}
+    assert set(rules) == {"rule-momentum", "rule-above-200d"} and len(tm.reference_forecasters()) == 2
+    ask = lambda name, facts: rules[name].ask({"thesis": "t", "facts": facts}).probability
+    assert [ask("rule-momentum", {"momentum_20d_pct": v}) for v in (3.2, 0.0, -1.5, None)] == [0.6, 0.4, 0.4, 0.5]
+    assert ask("rule-momentum", {}) == 0.5
+    assert [ask("rule-above-200d", {"above_200d_average": v}) for v in (True, False, None)] == [0.6, 0.4, 0.5]
+    assert ask("rule-above-200d", {}) == 0.5
+
+
+def _price_folder(tmp_path, end=None, n=700):
+    days = pd.bdate_range(end=end, periods=n) if end is not None else pd.bdate_range("2023-01-02", periods=n)
+    px = market(n=n).set_axis(days)
+    folder = tmp_path / "prices"
+    folder.mkdir()
+    px.to_parquet(folder / "close.parquet")
+    (px * 0 + 1_000_000.0).to_parquet(folder / "volume.parquet")
+    return folder
+
+
+@pytest.mark.parametrize("command", ["ask-blind", "ask-forward"])
+def test_with_rules_also_asks_the_two_rule_forecasters(tmp_path, monkeypatch, capsys, command):
+    folder = _price_folder(tmp_path, end=pd.Timestamp.now().normalize() if command == "ask-forward" else None)
+    monkeypatch.setattr(tm, "forecasters", lambda names=None, roster=None: [])        # no model is called
+    extra = ["--count", "6"] if command == "ask-blind" else []
+    args = ["--root", str(tmp_path), "--ledger", str(tmp_path / "t.sqlite"), command, "--data", str(folder), "--market", "funds"]
+    assert tm.main(args + extra) == 0
+    assert json.loads(capsys.readouterr().out)["asked"] == {}                          # without the flag: only the panel (none here)
+    assert tm.main(args + extra + ["--with-rules"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out["asked"]) == {"rule-momentum", "rule-above-200d"}
+    assert all(v["asked"] > 0 and v["answered"] == v["asked"] for v in out["asked"].values())
+    assert set(out["counts"]["answers"]) == {"rule-momentum", "rule-above-200d"}
+    assert len(set(out["counts"]["answers"].values())) == 1
