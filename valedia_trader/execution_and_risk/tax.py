@@ -14,7 +14,9 @@ ledger replays the paper journal's fills in date order and keeps:
                A replacement is a different purchase from the one the sold units came from: each buy fill
                is one purchase, and every lot split off from it keeps that purchase's identity. Whether the
                still-held rest of the same purchase counts is itself a rule in the file
-               (`wash_sale_same_purchase.remainder_is_replacement`)
+               (`wash_sale_same_purchase.remainder_is_replacement`). When a wash sale splits a lot, the
+               part matched as a replacement (higher basis, earlier holding start) sits before the remainder
+               of the same purchase, so a later sale closes the replacement part first
 
 Every legal parameter comes from `config/tax_rules.json`; this module holds none of its own. Each report
 and check says which of those rules are still unverified, the date it is computed as of, and that it is
@@ -49,6 +51,10 @@ __all__ = ["TaxRules", "TaxLedger", "NOTE", "main"]
 NOTE = "Computed from the rules file; not tax advice."
 EPS = 1e-9                                    # units this close to zero are zero
 PERIOD = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+
+
+def _today() -> date:
+    return date.today()
 
 
 def _day(value) -> date:
@@ -188,6 +194,7 @@ class TaxLedger:
         self._sales: list[_Sale] = []
         self._fills: list[tuple] = []
         self._next = 0
+        self._nsales = 0
 
     # ---- building
     @classmethod
@@ -243,7 +250,8 @@ class TaxLedger:
             take = lot.units if lot.units <= left + EPS else left
             basis = lot.basis * take / lot.units
             long_from = _plus_years(lot.holding_start, self.rules.long_term_years)
-            closed.append(_Sale(f"sale-{len(self._sales) + len(closed) + 1}", symbol, cls, d, take, per_unit * take, basis,
+            self._nsales += 1
+            closed.append(_Sale(f"sale-{self._nsales}", symbol, cls, d, take, per_unit * take, basis,
                                 lot.id, lot.purchase_id, lot.purchase_date, lot.holding_start, "long" if d > long_from else "short",
                                 washable))
             lot.units, lot.basis = lot.units - take, lot.basis - basis
@@ -296,7 +304,7 @@ class TaxLedger:
 
     def _at(self, as_of) -> tuple["TaxLedger", date]:
         """This ledger as it stood at the end of `as_of` (default: the last fill's day, or today with no fills)."""
-        d = _day(as_of) if as_of is not None else (self.last_day or date.today())
+        d = _day(as_of) if as_of is not None else (self.last_day or _today())
         if self.last_day is None or d >= self.last_day:
             return self, d
         led = TaxLedger(self.rules)
@@ -381,9 +389,27 @@ class TaxLedger:
         return out
 
     # ---- pre-trade checks (on a copy; the ledger itself is never changed)
+    def _sim(self, symbol: str, d: date) -> "TaxLedger":
+        """A scratch copy holding only what a check of `symbol` on `d` can touch: its open lots and its sales inside
+        the window. Cheaper than copying the whole ledger, and the ledger itself is never changed."""
+        sim = TaxLedger(self.rules)
+        lo = d - timedelta(days=self.rules.window_days)
+        sim._lots = {symbol: copy.deepcopy(self._lots.get(symbol, []))}
+        sim._sales = copy.deepcopy([x for x in self._sales if x.symbol == symbol and x.sale_date >= lo])
+        sim._fills, sim._next, sim._nsales = self._fills[-1:], self._next, self._nsales
+        return sim
+
+    def _check_day(self, side: str, symbol: str, day) -> date:
+        d = _day(day)
+        if self.last_day is not None and d < self.last_day:
+            raise ValueError(f"cannot check a {side} of {symbol} on {d}: the ledger already holds fills through "
+                             f"{self.last_day}, so a check can only be for that day or later")
+        return d
+
     def check_sell(self, symbol: str, units: float, price: float, day, fee: float = 0.0, asset_class: str | None = None) -> dict:
         """What selling `units` of `symbol` at `price` on `day` would realise, by term, and what a wash sale would take."""
-        d, sim = _day(day), copy.deepcopy(self)
+        d = self._check_day("sell", symbol, day)
+        sim = self._sim(symbol, d)
         sales = sim.add_fill(d, symbol, -abs(float(units)), price, fee, asset_class)["closed"]
         recs = [sim._record(s, d) for s in sales]
         by = lambda key, term: sum(r[key] for r in recs if r["term"] == term)
@@ -402,7 +428,8 @@ class TaxLedger:
     def check_buy(self, symbol: str, units: float, day, asset_class: str | None = None) -> dict:
         """What buying `units` of `symbol` on `day` would do: which earlier loss sales it would wash, how much loss
         that disallows, and the first day a purchase would wash nothing."""
-        d, sim = _day(day), copy.deepcopy(self)
+        d = self._check_day("buy", symbol, day)
+        sim = self._sim(symbol, d)
         clean_from = self._clean_from(symbol, d)
         matches = sim.add_fill(d, symbol, abs(float(units)), 0.0, 0.0, asset_class)["matches"]   # matching ignores price
         matched = sum(m["units"] for m in matches)
@@ -423,7 +450,7 @@ def main(argv=None) -> int:
     rep = sub.add_parser("report", help="realised gain and loss for a period, by term")
     rep.add_argument("--journal", default=str(paths.journal))
     rep.add_argument("--period", default=None, help="YYYY, YYYY-MM or YYYY-MM-DD (default: the as-of year)")
-    rep.add_argument("--as-of", dest="as_of", default=None, help="default: the last fill's day")
+    rep.add_argument("--as-of", dest="as_of", default=None, help="default: today, or the last fill's day if that is later")
     chk = sub.add_parser("check", help="what a proposed buy or sale would do")
     chk.add_argument("--journal", default=str(paths.journal))
     chk.add_argument("--symbol", required=True)
@@ -436,12 +463,13 @@ def main(argv=None) -> int:
     try:
         led = TaxLedger.from_fills(Journal(args.journal).read(), TaxRules.load())
         if args.cmd == "report":
-            s = led.summary(args.period or str(_day(args.as_of).year if args.as_of else (led.last_day or date.today()).year),
-                            as_of=args.as_of)
+            today = _today()
+            as_of = _day(args.as_of) if args.as_of else (today if led.last_day is None or today > led.last_day else led.last_day)
+            s = led.summary(args.period or str(as_of.year), as_of=as_of)
             s["wash_sale_windows"] = led.wash_sale_windows(s["as_of"])
             print(json.dumps(s, indent=1))
             return 0
-        day = args.day or date.today().isoformat()
+        day = args.day or _today().isoformat()
         if args.side == "sell":
             if args.price is None:
                 raise ValueError("a sale check needs --price")

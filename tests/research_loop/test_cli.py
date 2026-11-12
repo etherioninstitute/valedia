@@ -89,3 +89,25 @@ def test_status_and_init_on_an_empty_project(tmp_path, capsys):
     (tmp_path / "config" / "risk.json").write_text("{broken")
     assert cli.main(["--root", str(tmp_path), "init"]) == 0                         # init never overwrites the limits file
     assert (tmp_path / "config" / "risk.json").read_text() == "{broken"
+
+
+# ---- tax notes are notes: a missing or damaged rules file never stops paper trading (T3 rev 2)
+
+def test_the_tax_rules_helper_is_none_without_a_file_rules_with_a_good_one_and_says_so_for_a_bad_one(tmp_path, capsys):
+    from valedia_trader.execution_and_risk.tax import TaxRules
+    from valedia_trader.research_loop import LoopPaths
+    paths = LoopPaths(root=tmp_path)
+    paths.config.mkdir(parents=True)
+    assert cli._tax_rules(paths) is None and capsys.readouterr().err == ""          # no file: tax notes simply off
+    good = (LoopPaths().config / "tax_rules.json").read_text()
+    (paths.config / "tax_rules.json").write_text(good)
+    rules = cli._tax_rules(paths)
+    assert isinstance(rules, TaxRules) and rules.window_days == 30 and capsys.readouterr().err == ""
+    (paths.config / "tax_rules.json").write_text("{ this is not json")
+    assert cli._tax_rules(paths) is None
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("tax notes are off:") and len(err[0]) > len("tax notes are off:")
+    (paths.config / "tax_rules.json").write_text(json.dumps({**json.loads(good), "lot_method": {"method": "LIFO"}}))
+    assert cli._tax_rules(paths) is None and "FIFO" in capsys.readouterr().err   # loads as JSON, refused by the rules
+    assert cli.paper_trader(paths).tax_rules is None                                  # the paper trader still builds
+    assert capsys.readouterr().err.startswith("tax notes are off:")

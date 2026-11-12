@@ -430,3 +430,55 @@ def test_the_command_line_reports_and_checks_from_a_journal(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["disallowed_loss"] == pytest.approx(40)
     assert tax.main(["check", "--journal", str(tmp_path), "--symbol", "XLE", "--side", "sell", "--units", "1",
                      "--day", "2025-06-12"]) == 2                          # a sale check needs a price
+
+
+# ---- T3 part A: three verifier notes
+
+
+def test_report_without_as_of_uses_today_when_today_is_later_than_the_last_fill(tmp_path, capsys, monkeypatch):
+    j = Journal(tmp_path)
+    j.write("2025-01-02", {"type": "fill", "symbol": "XLE", "units": 10, "price": 100.0, "fee": 0.0, "strategy": "s"})
+    j.write("2025-06-02", {"type": "fill", "symbol": "XLE", "units": -10, "price": 90.0, "fee": 0.0, "strategy": "s"})
+    monkeypatch.setattr(tax, "_today", lambda: tax.date(2025, 8, 1))
+    assert tax.main(["report", "--journal", str(tmp_path), "--period", "2025"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    # today 2025-08-01 is past the window (2025-06-02 + 30 = 2025-07-02): the -100 is final, nothing provisional
+    assert out["as_of"] == "2025-08-01" and out["provisional_records"] == 0 and out["wash_sale_windows"] == {}
+    monkeypatch.setattr(tax, "_today", lambda: tax.date(2025, 6, 1))          # today before the last fill: the last fill's day
+    assert tax.main(["report", "--journal", str(tmp_path), "--period", "2025"]) == 0
+    assert json.loads(capsys.readouterr().out)["as_of"] == "2025-06-02"
+    led = tax.TaxLedger.from_fills(j.read(), rules())
+    assert led.summary("2025")["as_of"] == "2025-06-02"                      # the library default is unchanged
+
+
+def test_a_check_for_a_day_before_the_last_fill_says_so_in_terms_of_the_check():
+    led = ledger(("2025-01-02", "XLE", 10, 100.0), ("2025-06-02", "XLE", -5, 90.0))
+    with pytest.raises(ValueError, match="cannot check a sell of XLE on 2025-06-01") as sell:
+        led.check_sell("XLE", 1, 90.0, "2025-06-01")
+    with pytest.raises(ValueError, match="cannot check a buy of XLE on 2025-05-01") as buy:
+        led.check_buy("XLE", 1, "2025-05-01")
+    assert all("date order" not in str(e.value) and "2025-06-02" in str(e.value) for e in (sell, buy))
+    assert led.check_buy("XLE", 1, "2025-06-02")["day"] == "2025-06-02"       # the last fill's own day is fine
+
+
+def test_the_replacement_part_of_a_split_lot_is_sold_before_the_rest_of_its_purchase():
+    # a buy after the loss sale, split by the wash sale: 10 of the 20 June units replace the January loss of 100
+    led = ledger(("2025-01-02", "XLE", 10, 100.0), ("2025-06-02", "XLE", -10, 90.0), ("2025-06-12", "XLE", 20, 92.0),
+                 ("2025-06-13", "XLE", -15, 100.0))
+    first, second = [r for r in led.realized() if r["sale_date"] == "2025-06-13"]
+    # replacement part first: 10 units, basis 920 + 100 = 1020, holding start 2025-01-12; proceeds 1000: loss 20
+    assert first["units"] == pytest.approx(10) and first["cost_basis"] == pytest.approx(1020)
+    assert first["holding_start"] == "2025-01-12" and first["gain_loss"] == pytest.approx(-20)
+    # then 5 of the remainder: basis 460, holding start its purchase date; proceeds 500: gain 40
+    assert second["units"] == pytest.approx(5) and second["cost_basis"] == pytest.approx(460)
+    assert second["holding_start"] == "2025-06-12" and second["gain_loss"] == pytest.approx(40)
+    assert first["purchase_id"] == second["purchase_id"]
+    # a buy before the loss sale, split the same way: 10 of the 20 May units replace; that part (basis 800 + 100 = 900,
+    # holding start 2025-05-23 - 151 days = 2024-12-23) is sold first: proceeds 950, gain 50
+    led = ledger(("2025-01-02", "XLE", 10, 100.0), ("2025-05-23", "XLE", 20, 80.0), ("2025-06-02", "XLE", -10, 90.0),
+                 ("2025-06-03", "XLE", -10, 95.0))
+    rec = only(led.realized(), sale_date="2025-06-03")
+    assert rec["cost_basis"] == pytest.approx(900) and rec["holding_start"] == "2024-12-23" and rec["gain_loss"] == pytest.approx(50)
+    left = only(led.open_lots("XLE"))
+    assert left["cost_basis"] == pytest.approx(800) and left["holding_start"] == "2025-05-23"
+    assert "replacement" in tax.__doc__ and "before the remainder" in tax.__doc__

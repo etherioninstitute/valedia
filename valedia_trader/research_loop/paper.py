@@ -9,6 +9,12 @@ nowhere and the refusal is journaled.
 The book kept here is the record used for attribution by strategy. Orders can also be mirrored to
 an Alpaca paper account (`AlpacaPaperVenue`), which refuses to be built on anything but paper keys
 and the paper endpoint. There is no live-money path in this module.
+
+Given tax rules (`tax_rules`), the trader also keeps the account's tax ledger (execution_and_risk/tax.py)
+and writes beside every order what it would do for tax, estimated at the decision price, and in each day's
+summary the year's realised result so far. These are notes only: they never block, delay, resize or
+reorder an order. A ledger that cannot take a fill (a short position, for one) stops, and from then on
+every note says it is unavailable and why; trading carries on exactly as with tax off.
 """
 from __future__ import annotations
 
@@ -123,7 +129,7 @@ class PaperTrader:
     def __init__(self, directory: str | Path, limits_file: str | Path, starting_cash: float = 100_000.0,
                  fee_bps: float = 1.0, slippage_bps: float = 2.0, venue: Venue | None = None,
                  halt_file: str | Path | None = risk_gate.HALT_FILE, min_trade_pct: float = 0.002,
-                 panel=None, panel_mode: str = "off", panel_horizon_days: int = 5, facts=None) -> None:
+                 panel=None, panel_mode: str = "off", panel_horizon_days: int = 5, facts=None, tax_rules=None) -> None:
         if panel_mode not in self.PANEL_MODES:
             raise ValueError(f"panel_mode must be one of {self.PANEL_MODES}")
         if panel_mode != "off" and panel is None:
@@ -143,6 +149,14 @@ class PaperTrader:
         else:
             self.state = {"starting_cash": starting_cash, "cash": starting_cash, "positions": {}, "pending": [],
                           "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}, "panel_cases": []}
+        # the account's tax ledger: built once from the journal's fills, then fed each new fill. Notes only.
+        self.tax_rules, self.tax_ledger, self.tax_unavailable = tax_rules, None, None
+        if tax_rules is not None:
+            try:
+                from valedia_trader.execution_and_risk.tax import TaxLedger
+                self.tax_ledger = TaxLedger.from_fills(self.journal.read(), tax_rules)
+            except Exception as exc:
+                self.tax_unavailable = f"the tax ledger could not take a fill: {exc}"
 
     # ---- book
     def _lot(self, strategy: str, symbol: str) -> dict:
@@ -199,7 +213,63 @@ class PaperTrader:
             self.journal.write(day, {"type": "fill", "strategy": o["strategy"], "version": o["version"], "symbol": o["symbol"],
                                      "units": o["units"], "price": fill, "fee": fee, "decided_on": o["decided_on"],
                                      "realized_pnl": realized, "entry_conditions": o.get("conditions"), "reason": o["reasoning"]})
+            self._tax_take(day, o["symbol"], o["units"], fill, fee)
         self.state["pending"] = still
+
+    # ---- tax notes (never change an order, a fill or the book)
+    def _tax_take(self, day, symbol: str, units: float, price: float, fee: float) -> None:
+        if self.tax_ledger is None or self.tax_unavailable is not None:
+            return
+        try:
+            self.tax_ledger.add_fill(str(pd.Timestamp(day).date()), symbol, float(units), float(price), float(fee))
+        except Exception as exc:
+            self.tax_unavailable = f"the tax ledger could not take a fill: {exc}"
+
+    def _tax_note(self, day, symbol: str, units: float, px: float) -> dict:
+        """What this order would do for tax at today's price. Never raises."""
+        if self.tax_unavailable is not None:
+            return {"unavailable": self.tax_unavailable}
+        d = str(pd.Timestamp(day).date())
+        try:
+            if units < 0:
+                c = self.tax_ledger.check_sell(symbol, -units, px, d)
+                st, lt = c["gain_loss"]["short_term"], c["gain_loss"]["long_term"]
+                parts = [f"{term} {'gain' if v >= 0 else 'loss'} of {abs(v):.2f}" for term, v in (("short-term", st), ("long-term", lt))
+                         if abs(v) >= 0.005]
+                effect = "would realise " + (" and ".join(f"a {p}" for p in parts) if parts else "no gain or loss")
+                if c["disallowed_loss"] > 0:
+                    bought = sorted({m["purchase_date"] for m in c["wash_sale"]["matches"]})
+                    effect += f"; {c['disallowed_loss']:.2f} of it would be disallowed as a wash sale against the purchase of {', '.join(bought)}"
+                if c["wash_sale"]["loss_at_risk"] > 0:
+                    effect += f"; buying {symbol} again before {c['wash_sale']['clean_from']} would make it a wash sale"
+                return {"side": "sell", "estimated_at_price": float(px), "gain_loss": {"short_term": st, "long_term": lt},
+                        "disallowed_loss": c["disallowed_loss"], "loss_at_risk": c["wash_sale"]["loss_at_risk"],
+                        "clean_from": c["wash_sale"]["clean_from"], "effect": effect + ".",
+                        "unverified_rules": c["unverified_rules"], "note": c["note"]}
+            c = self.tax_ledger.check_buy(symbol, units, d)
+            washes = [{"sale_date": m["sale_date"], "units": m["units"], "disallowed_loss": m["disallowed_loss"]} for m in c["matches"]]
+            if washes:
+                effect = ("would turn " + " and ".join(f"{w['disallowed_loss']:.2f} of the loss sold on {w['sale_date']}" for w in washes)
+                          + " into a wash sale, carried into this lot")
+            else:
+                effect = f"would wash no earlier loss of {symbol}"
+            return {"side": "buy", "disallowed_loss": c["disallowed_loss"], "washes": washes, "clean_from": c["clean_from"],
+                    "effect": effect + ".", "unverified_rules": c["unverified_rules"], "note": c["note"]}
+        except Exception as exc:
+            return {"unavailable": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+    def _tax_block(self, day) -> dict:
+        """The year's realised tax result so far, for the day's summary. Never raises."""
+        if self.tax_unavailable is not None:
+            return {"unavailable": self.tax_unavailable}
+        d = str(pd.Timestamp(day).date())
+        try:
+            s = self.tax_ledger.summary(d[:4], as_of=d)
+            return {"year": d[:4], "short_term_net": s["short_term"]["net_gain_loss"], "long_term_net": s["long_term"]["net_gain_loss"],
+                    "disallowed_loss": s["total"]["disallowed_loss"], "provisional_loss": s["total"]["provisional_loss"],
+                    "as_of": s["as_of"], "unverified_rules": s["unverified_rules"], "note": s["note"]}
+        except Exception as exc:
+            return {"unavailable": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
     # ---- decision panel
     def _settle_panel(self, prices: pd.DataFrame) -> None:
@@ -316,6 +386,8 @@ class PaperTrader:
                          "decision": "placed" if ok else "blocked", "risk_check": why, "reasoning": reasoning}
                 if panel_view is not None:
                     entry["panel"] = panel_view
+                if self.tax_rules is not None:
+                    entry["tax"] = self._tax_note(day, sym, delta, px)
                 if ok:
                     placed += 1
                     self.state["pending"].append({"strategy": s.name, "version": s.version, "symbol": sym, "units": delta,
@@ -341,6 +413,8 @@ class PaperTrader:
                    "orders_placed": placed, "orders_blocked": blocked, "strategy_values": {s: self._strategy_value(s, row) for s in self.state["positions"]},
                    "strategy_value_change": by_strategy, "capital_per_strategy": share,
                    "benchmark_values": self._benchmark_values(prices, strategies, share)}
+        if self.tax_rules is not None:
+            summary["tax"] = self._tax_block(day)
         self.state["history"].append(summary)
         self.state["last_day"] = str(day.date())
         self.journal.write(day, {"type": "summary", **summary})

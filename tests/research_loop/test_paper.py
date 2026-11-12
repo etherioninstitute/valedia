@@ -320,3 +320,166 @@ def test_the_position_limit_is_on_the_accounts_whole_holding_of_a_fund(setup):
     assert {e["strategy"] for e in refused} == {"second_paper"} and all(e["risk_check"] == "Order is larger than the position limit." for e in refused)
     assert all(e["order"]["position_value_after"] == pytest.approx(2 * e["order"]["value"]) for e in refused)
     assert all(e["order"]["adds_to_existing"] for e in refused)      # the account is already in the fund
+
+
+# ---- tax notes (T3): every order says what it would do for tax; tax off changes nothing
+
+from valedia_trader.execution_and_risk import tax as tx  # noqa: E402
+
+RULES = tx.TaxRules.load()
+DAY0 = 30                                                             # the first traded bar of the scripted market
+
+
+def scripted_market():
+    """One fund AAA: 30 bars of history near 100, then the closes the scripted script trades on."""
+    hist = list(100 + 0.5 * np.sin(np.arange(DAY0)))
+    closes = [100.0, 100.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+    return pd.DataFrame({"AAA": hist + closes}, index=pd.bdate_range("2025-11-24", periods=DAY0 + len(closes)))
+
+
+# the strategy's target weight in AAA on each traded bar: buy half, hold, trim to a quarter, hold, back to half
+SCRIPT = [0.5, 0.5, 0.25, 0.25, 0.5, 0.5, 0.5, 0.5]
+
+
+def long_only(name="tax_paper", market=("AAA",)):
+    return st.RuleStrategy.from_spec({
+        "name": name, "version": "1.0.0", "hypothesis": "A long-only book for the tax notes", "market": list(market),
+        "entry": {"rule": "momentum", "lookback": 10, "enter": 0.0, "exit": -0.02, "direction": "long"},
+        "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.5, "max_open_positions": 3, "stop_loss_pct": None}})
+
+
+@pytest.fixture
+def scripted(monkeypatch):
+    def run(s, prices):
+        w = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        w.iloc[-1, w.columns.get_loc("AAA")] = SCRIPT[len(prices) - 1 - DAY0]
+        return w, []
+    monkeypatch.setattr(pp, "run_rules", run)
+    return scripted_market()
+
+
+def no_costs(setup, directory=None, **kw):
+    kw.setdefault("halt_file", None)
+    return pp.PaperTrader(directory or setup[0], setup[1], fee_bps=0.0, slippage_bps=0.0, **kw)
+
+
+def notes(t):
+    return [e for e in t.journal.read() if e["type"] == "decision" and "order" in e]
+
+
+def test_tax_notes_give_the_numbers_for_a_trim_at_a_loss_and_a_buy_inside_its_window(setup, scripted):
+    px, t, s = scripted, no_costs(setup, tax_rules=RULES), long_only()
+    days = [t.step(px.iloc[: DAY0 + k + 1], {7: s}) for k in range(6)]
+    d = {e["day"]: e for e in notes(t)}
+    buy0 = d["2026-01-05"]["tax"]
+    # day 0: buy 0.5 x 100,000 / 100 = 500 units; nothing sold before, so nothing to wash
+    assert buy0["side"] == "buy" and buy0["disallowed_loss"] == 0 and buy0["washes"] == [] and buy0["clean_from"] == "2026-01-05"
+    trim = d["2026-01-07"]["tax"]
+    # day 2 at 80: equity 50,000 cash + 500 x 80 = 90,000; target 0.25 x 90,000 / 80 = 281.25, so sell 218.75.
+    # basis 218.75 x 100 = 21,875, proceeds 218.75 x 80 = 17,500: a short-term loss of 4,375. The rest of the same
+    # purchase is no replacement: nothing disallowed, all 4,375 at risk until 2026-01-07 + 31 = 2026-02-07
+    assert trim["side"] == "sell" and trim["estimated_at_price"] == pytest.approx(80.0)
+    assert trim["gain_loss"] == {"short_term": pytest.approx(-4375.0), "long_term": pytest.approx(0.0)}
+    assert trim["disallowed_loss"] == pytest.approx(0.0) and trim["loss_at_risk"] == pytest.approx(4375.0)
+    assert trim["clean_from"] == "2026-02-07"
+    assert trim["effect"] == "would realise a short-term loss of 4375.00; buying AAA again before 2026-02-07 would make it a wash sale."
+    back = d["2026-01-09"]["tax"]
+    # day 4: equity 67,500 cash + 281.25 x 80 = 90,000; target 0.5 x 90,000 / 80 = 562.5, so buy 281.25. The trim filled
+    # on 2026-01-08 at 80 (a loss of 20 a unit on 218.75 units); 218.75 of the new units wash it all: 4,375 disallowed
+    assert back["side"] == "buy" and back["disallowed_loss"] == pytest.approx(4375.0)
+    assert back["washes"] == [{"sale_date": "2026-01-08", "units": pytest.approx(218.75), "disallowed_loss": pytest.approx(4375.0)}]
+    assert back["clean_from"] == "2026-02-08"
+    assert back["effect"] == "would turn 4375.00 of the loss sold on 2026-01-08 into a wash sale, carried into this lot."
+    assert all(n["tax"]["unverified_rules"] == RULES.unverified() and n["tax"]["note"] == tx.NOTE for n in notes(t))
+    held = days[3]["tax"]                                            # 2026-01-08, after the trim filled
+    assert held == {"year": "2026", "short_term_net": pytest.approx(-4375.0), "long_term_net": pytest.approx(0.0),
+                    "disallowed_loss": pytest.approx(0.0), "provisional_loss": pytest.approx(4375.0), "as_of": "2026-01-08",
+                    "unverified_rules": RULES.unverified(), "note": tx.NOTE}
+    washed = days[5]["tax"]                                          # 2026-01-12, after the buy back filled
+    # the loss is now disallowed: -4,375 + 4,375 = 0 net, nothing provisional
+    assert washed["short_term_net"] == pytest.approx(0.0) and washed["disallowed_loss"] == pytest.approx(4375.0)
+    assert washed["provisional_loss"] == pytest.approx(0.0) and washed["as_of"] == "2026-01-12"
+    year = t.tax_ledger.summary("2026", as_of="2026-01-12")
+    assert washed["short_term_net"] + washed["long_term_net"] == pytest.approx(year["total"]["net_gain_loss"])   # it adds up
+    assert year["total"]["gain_loss"] + year["total"]["disallowed_loss"] == pytest.approx(year["total"]["net_gain_loss"])
+    lot = [x for x in t.tax_ledger.open_lots("AAA") if x["wash_adjustment"]]
+    assert lot and lot[0]["cost_basis"] == pytest.approx(218.75 * 80 + 4375.0)
+
+
+def _comparable(t):
+    """Everything the trader wrote and holds, with the tax notes and timestamps taken out."""
+    entries = []
+    for e in t.journal.read():
+        e = {k: v for k, v in e.items() if k not in ("timestamp", "tax")}
+        entries.append(json.dumps(e, sort_keys=True, default=str))
+    state = json.loads(json.dumps(t.state, default=str))
+    for h in state["history"]:
+        h.pop("tax", None)
+    return entries, json.dumps(state, sort_keys=True)
+
+
+def volatile(n=40, seed=3, funds=("F1", "F2", "F3")):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({f: 100 * np.exp(np.cumsum(0.03 * rng.standard_normal(n))) for f in funds},
+                        index=pd.bdate_range("2026-01-05", periods=n))
+
+
+def test_a_twin_with_tax_off_places_and_blocks_the_same_orders_and_ends_with_the_same_book(setup, tmp_path):
+    px, s = volatile(), long_only(market=("F1", "F2", "F3"))
+    on = pp.PaperTrader(tmp_path / "on", setup[1], halt_file=None, tax_rules=RULES, min_trade_pct=0.0005)
+    off = pp.PaperTrader(tmp_path / "off", setup[1], halt_file=None, min_trade_pct=0.0005)
+    for k in range(11, 40):
+        a, b = on.step(px.iloc[: k + 1], {7: s}), off.step(px.iloc[: k + 1], {7: s})
+        assert {k2: v for k2, v in a.items() if k2 != "tax"} == b and "tax" in a and "tax" not in b
+    assert _comparable(on) == _comparable(off)
+    assert on.state["cash"] == off.state["cash"] and on.state["positions"] == off.state["positions"]
+    assert not any("tax" in e for e in off.journal.read())                       # tax off: no new key anywhere
+    sides = {n["tax"].get("side") for n in notes(on)}
+    assert {"buy", "sell"} <= sides and on.tax_unavailable is None              # the long-only book was fully noted
+    assert all(json.dumps(n["tax"]) for n in notes(on))
+
+
+def test_a_long_and_short_book_keeps_trading_and_reports_tax_unavailable(setup, tmp_path):
+    px, s = prices(), strat()                                                    # long UP, short DOWN
+    on = pp.PaperTrader(tmp_path / "on", setup[1], halt_file=None, tax_rules=RULES)
+    off = pp.PaperTrader(tmp_path / "off", setup[1], halt_file=None)
+    out = [on.step(px.iloc[: k + 1], {7: s}) for k in range(11, 30)]
+    for k in range(11, 30):
+        off.step(px.iloc[: k + 1], {7: s})
+    assert _comparable(on) == _comparable(off)
+    first = {n["symbol"]: n["tax"] for n in notes(on) if n["day"] == str(px.index[11].date())}
+    assert first["UP"]["side"] == "buy" and "unavailable" in first["DOWN"]      # a short sale cannot be noted
+    assert "short" in on.tax_unavailable                                        # the DOWN fill took the ledger short
+    assert all(set(o["tax"]) == {"unavailable"} for o in out[1:])
+    assert all(set(n["tax"]) == {"unavailable"} for n in notes(on) if n["day"] > str(px.index[11].date()))
+    again = pp.PaperTrader(tmp_path / "on", setup[1], halt_file=None, tax_rules=RULES)     # still unavailable after a restart
+    assert "short" in again.tax_unavailable
+
+
+def test_a_restarted_trader_gives_the_same_tax_block(setup, tmp_path, scripted):
+    px, s = scripted, long_only()
+    whole = no_costs(setup, tmp_path / "whole", tax_rules=RULES)
+    runs = [whole.step(px.iloc[: DAY0 + k + 1], {7: s}) for k in range(8)]
+    part = no_costs(setup, tmp_path / "part", tax_rules=RULES)
+    for k in range(4):
+        part.step(px.iloc[: DAY0 + k + 1], {7: s})
+    restarted = no_costs(setup, tmp_path / "part", tax_rules=RULES)               # built once from the journal's fills
+    later = [restarted.step(px.iloc[: DAY0 + k + 1], {7: s}) for k in range(4, 8)]
+    assert [r["tax"] for r in later] == [r["tax"] for r in runs[4:]]
+    assert [n["tax"] for n in notes(restarted)] == [n["tax"] for n in notes(whole)]
+
+
+def test_a_tax_check_that_raises_blocks_nothing(setup, tmp_path, scripted):
+    px, s = scripted, long_only()
+    on = no_costs(setup, tmp_path / "on", tax_rules=RULES)
+    off = no_costs(setup, tmp_path / "off")
+
+    def boom(*a, **k):
+        raise RuntimeError("tax check exploded")
+    on.tax_ledger.check_sell = on.tax_ledger.check_buy = boom
+    for k in range(6):
+        on.step(px.iloc[: DAY0 + k + 1], {7: s})
+        off.step(px.iloc[: DAY0 + k + 1], {7: s})
+    assert _comparable(on) == _comparable(off)
+    assert notes(on) and all(n["tax"] == {"unavailable": "RuntimeError: tax check exploded"} for n in notes(on))
+    assert on.tax_unavailable is None and on.state["history"][-1]["tax"]["disallowed_loss"] == pytest.approx(4375.0)

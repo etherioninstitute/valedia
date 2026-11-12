@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from valedia_trader.execution_and_risk.tax import TaxRules
 from valedia_trader.research_loop import LoopPaths, risk_gate
 from valedia_trader.research_loop import critic as critic_mod
 from valedia_trader.research_loop import research as research_mod
@@ -175,15 +176,28 @@ def panel_settings(paths: LoopPaths) -> dict:
     return cfg
 
 
+def _tax_rules(paths: LoopPaths) -> TaxRules | None:
+    """The tax rules for the paper trader's tax notes, or None. Notes only: a missing file means no notes, and a file
+    that cannot be loaded says why on one line and also means no notes; paper trading runs either way."""
+    path = paths.config / "tax_rules.json"
+    if not path.is_file():
+        return None
+    try:
+        return TaxRules.load(path)
+    except Exception as exc:
+        print(f"tax notes are off: {path} could not be loaded ({type(exc).__name__}: {' '.join(str(exc).split())})", file=sys.stderr)
+        return None
+
+
 def paper_trader(paths: LoopPaths, venue=None) -> PaperTrader:
     """The paper trader with the decision panel attached as config/panel.json says."""
     cfg = panel_settings(paths)
     if cfg["mode"] == "off":
-        return PaperTrader(paths.journal, paths.risk_limits, venue=venue)
+        return PaperTrader(paths.journal, paths.risk_limits, venue=venue, tax_rules=_tax_rules(paths))
     from valedia_trader.agents.panel import build_panel
     panel = build_panel(ledger_path=str(paths.memory / "panel_forecasts.db"))
     return PaperTrader(paths.journal, paths.risk_limits, venue=venue, panel=panel, panel_mode=cfg["mode"],
-                       panel_horizon_days=int(cfg.get("horizon_days", 5)))
+                       panel_horizon_days=int(cfg.get("horizon_days", 5)), tax_rules=_tax_rules(paths))
 
 
 def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
