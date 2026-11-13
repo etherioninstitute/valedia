@@ -87,6 +87,8 @@ class World:
         self.fail_status = 404                              # rev 7: the status of a failed answer
         self.date_bad, self.date_bad_left = None, None      # rev 7: a Date "missing", "malformed" or "zoneless",
                                                             # on the next `date_bad_left` answers (None: on all)
+        self.fail_trades = set()                            # rev 10: tickers whose trade reads fail (books answer)
+        self._sorted = {}                                   # ticker: (tape length, created times, rows by created)
 
     def __call__(self, url):
         """The answer and, as every Kalshi answer carries, its HTTP Date header (the true time, to the second)."""
@@ -116,8 +118,20 @@ class World:
             at = int(q.get("cursor") or 0)
             nxt = str(at + size) if at + size < len(self.markets) else ""
             return json.dumps({"markets": self.markets[at:at + size], "cursor": nxt}).encode()
+        if path == "/markets/trades" and q.get("ticker") in self.fail_trades:
+            raise kd.HttpError(self.fail_status, url)
         if path == "/markets/trades":
-            tape = self.tape.get(q["ticker"], []) if "ticker" in q else [r for v in self.tape.values() for r in v]
+            if "ticker" in q:                               # rev 10: only the rows from min_ts on (the same answer)
+                import bisect
+                raw = self.tape.get(q["ticker"], [])
+                key = self._sorted.get(q["ticker"])
+                if key is None or key[0] != len(raw):
+                    rows_by = sorted(raw, key=lambda r: kd.iso_to_ts(r["created_time"]))
+                    key = (len(raw), [kd.iso_to_ts(r["created_time"]) for r in rows_by], rows_by)
+                    self._sorted[q["ticker"]] = key
+                tape = key[2][bisect.bisect_left(key[1], int(q.get("min_ts", 0))):]
+            else:
+                tape = [r for v in self.tape.values() for r in v]
             rows = [{k: v for k, v in r.items() if k != "_on_tape"} for r in tape
                     if int(q.get("min_ts", 0)) <= kd.iso_to_ts(r["created_time"]) <= self.clock.t
                     and r.get("_on_tape", 0) <= self.clock.t]
@@ -2501,11 +2515,12 @@ def run_cycle(col):
         col._go_off(str(e))
 
 
-def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0):
+def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0, per_minute=2):
     """A run on the test's own true clock with `events`, each (minute, kind, length[, market]): "network" (every
     request fails), "pause" (book reads fail for 3 minutes: the five-failure pause), "step" (the clock an hour
     back), "unwritable" (the store refuses writes), "one_sided" (that market's book one-sided), "sleep" (both
-    clocks stop: the machine sleeps) and "restart" (a new process on the same record), each for `length` minutes."""
+    clocks stop: the machine sleeps) and "restart" (a new process on the same record), each for `length` minutes;
+    rev 10: "trades_fail" (that market's trade reads fail, its book answers)."""
     import random
     rnd = random.Random(seed)
     mono = {}
@@ -2520,17 +2535,17 @@ def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0):
         k = 0
         for i in range(0, last + 1):
             for m in world.markets:
-                for _ in range(2):
+                for _ in range(per_minute):
                     k += 1
                     world.trade(m["ticker"], k, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, ol.TAPE_LAG_S))
     books = {m["ticker"]: book(0.40, 0.45) for m in world.markets}
     col.start()
     ends: dict = {}
-    i = 0
+    i, seen = 0, -1                                             # rev 10: what began or ended inside a jump, at once
     while i <= last:
         for e in events:
             start, kind, length = e[:3]
-            if start == i:
+            if seen < start <= i:
                 if kind == "network":
                     world.fail = True
                 elif kind == "pause":
@@ -2542,8 +2557,10 @@ def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0):
                     store.conn.execute("PRAGMA query_only = 1")
                 elif kind == "one_sided":
                     world.books[world.markets[e[3]]["ticker"]] = book(0.40, None)
+                elif kind == "trades_fail":
+                    world.fail_trades.add(world.markets[e[3]]["ticker"])
                 ends.setdefault(start + length, []).append(e)
-        for e in ends.pop(i, []):
+        for e in [x for k in sorted(k for k in ends if k <= i) for x in ends.pop(k)]:
             kind = e[1]
             if kind == "network":
                 world.fail = False
@@ -2556,6 +2573,9 @@ def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0):
             elif kind == "one_sided":
                 t = world.markets[e[3]]["ticker"]
                 world.books[t] = books[t]
+            elif kind == "trades_fail":
+                world.fail_trades.discard(world.markets[e[3]]["ticker"])
+        seen = i
         true.t = max(true.t, T0 + 60 * i + 0.5)
         run_cycle(col)
         jump = [e for e in events if e[0] == i and e[1] in ("sleep", "restart")]
@@ -2742,9 +2762,8 @@ def test_two_clock_offs_waiting_for_the_store_are_both_written_in_order(tmp_path
     rows = [(k, json.loads(d)) for k, d in store.conn.execute("SELECT kind, detail_json FROM events ORDER BY id")]
     offs = [d for k, d in rows if k == "clock_off"]
     assert len(offs) == 2 and "Date" in offs[0]["why"] and "stepped" in offs[1]["why"]
-    kinds = [k for k, _ in rows]
-    assert col.synced and kinds.index("clock_off") < len(kinds) - 1 - kinds[::-1].index("clock_off") < \
-        kinds.index("clock_on")
+    # rev 10: the return to sync in between gets its own clock_on, after its clock_off
+    assert col.synced and [k for k, _ in rows if k in ("clock_off", "clock_on")] == ["clock_off", "clock_on"] * 2
 
 
 def test_an_unreadable_cut_short_tail_gives_one_trades_lost_across_restarts(tmp_path):
@@ -2812,3 +2831,211 @@ def test_the_docstring_says_catch_up_tries_are_deliberate_and_what_a_pause_still
     doc = " ".join(ol.__doc__.split())
     assert "deliberate" in doc and ol.CATCH_UP_TRIES == 3
     assert "a pause that begins inside a selection" in doc and "selection_aborted" in doc
+
+
+# ================================================================= rev 10: the trade catch-up, compound sequences
+
+def trades_uncovered(world, store, now, margin=200.0):
+    """From the stored rows and events alone, against the test's own tape: the trades made while their market was
+    watched (from its watch's start to its drop, or now) that the tape offered, neither stored nor inside a
+    `trades_lost` interval of that market. Trades of the last `margin` seconds are left out (not read yet)."""
+    c = store.conn
+    stored = {r[0] for r in c.execute("SELECT trade_id FROM trades")}
+    lost: dict = {}
+    for tk, d in c.execute("SELECT ticker, detail_json FROM events WHERE kind = 'trades_lost'"):
+        d = json.loads(d)
+        lost.setdefault(tk, []).append((d["from_ts"], d["to_ts"]))
+    watched: dict = {}
+    for tk, a, b in c.execute("SELECT m.ticker, COALESCE(m.watch_start_ts, m.selected_ts), d.dropped_ts FROM markets m "
+                              "LEFT JOIN market_drops d ON d.watch_id = m.watch_id"):
+        watched.setdefault(tk, []).append((a, b if b is not None else now))
+    out = []
+    for tk, rows in world.tape.items():
+        for r in rows:
+            ts = kd.iso_to_ts(r["created_time"])
+            if ts > now - margin or r["_on_tape"] > now - 61 or r["trade_id"] in stored:
+                continue
+            if any(a <= ts <= b for a, b in watched.get(tk, [])) and not any(a <= ts <= b for a, b in lost.get(tk, [])):
+                out.append((r["trade_id"], ts))
+    return out
+
+
+@pytest.mark.parametrize("hole", ["network", "restart", "sleep"])
+def test_trade_reads_failing_on_after_a_hole_over_24_hours_extend_the_lost_interval(tmp_path, hole):
+    """The verifier's first sequence: a hole of 25 hours, then market A's trade reads go on failing for 4 hours
+    while its books answer, then they succeed."""
+    events = [(39, "trades_fail", 1500 + 240 + 2, 0), (40, hole, 1500)]
+    col, world, store, true, skew = scenario(tmp_path, events, 39 + 1742 + 60, n=2, per_minute=1)
+    assert col.synced and not world.fail_trades
+    a = world.markets[0]["ticker"]
+    lost = [json.loads(d) for (d,) in store.conn.execute("SELECT detail_json FROM events WHERE kind = 'trades_lost' "
+                                                         "AND ticker = ?", (a,))]
+    assert lost and max(x["to_ts"] for x in lost) > T0 + 60 * (39 + 1742) - ol.CATCH_UP_S - 300
+    assert trades_uncovered(world, store, true.t) == []
+
+
+@pytest.mark.parametrize("restarts", [False, True])
+def test_each_watch_of_a_market_whose_trades_cannot_be_read_gets_its_own_catch_up_and_trades_lost(tmp_path, restarts):
+    """The verifier's second sequence: a market whose trade reads never succeed is dropped, its tail fails its
+    three tries and gets `trades_lost`, then it is chosen again and dropped again."""
+    events = [(0, "trades_fail", 260, 0), (5, "one_sided", 70, 0), (100, "one_sided", 75, 0)]
+    if restarts:                                                # one inside each set of tries, one later
+        events += [(71, "restart", 1), (166, "restart", 1), (205, "restart", 1)]
+    col, world, store, true, skew = scenario(tmp_path, events, 280, n=1, slots=1, per_minute=1)
+    c = store.conn
+    a = world.markets[0]["ticker"]
+    assert c.execute("SELECT COUNT(*) FROM markets").fetchone()[0] >= 2          # chosen again
+    assert c.execute("SELECT COUNT(*) FROM market_drops").fetchone()[0] >= 2     # and dropped again
+    lost = [json.loads(d) for (d,) in c.execute("SELECT detail_json FROM events WHERE kind = 'trades_lost'")]
+    assert len([x for x in lost if x.get("cause") == "tail"]) == 2                 # one a watch, across restarts
+    tries = c.execute("SELECT COUNT(*) FROM events WHERE kind = 'catch_up_failed' AND ticker = ?", (a,)).fetchone()[0]
+    assert tries == 2 * ol.CATCH_UP_TRIES
+    assert trades_uncovered(world, store, true.t) == []
+
+
+def random_trade_events(rnd, n):
+    """A seeded sequence: trade-read failures of single markets (some lasting through a hole of over 24 hours),
+    long holes, drops (one-sided books) inside a failure and the re-choices after them, restarts, sleeps and
+    network outages; then everything answers again, with time to catch up."""
+    events, t = [], rnd.randint(3, 40)
+    for _ in range(rnd.randint(2, 5)):
+        kind = rnd.choice(["trades_fail", "trades_fail", "trades_fail", "one_sided", "one_sided", "restart",
+                           "sleep", "network"])
+        k = rnd.randrange(n)
+        if kind == "trades_fail":
+            length = rnd.choice([2, 10, 45, 120, 400, 1700, 1900])
+            events.append((t, kind, length, k))
+            if length >= 1700:                                  # it lasts through a hole of over 24 hours
+                hole = rnd.choice([1450, 1600])
+                events.append((t + rnd.randint(1, 30), rnd.choice(["restart", "sleep"]), hole))
+                t = events[-1][0] + hole + rnd.randint(2, 60)
+            elif length >= 120 and rnd.random() < 0.7:           # drops (and re-choices) inside it
+                for _ in range(rnd.randint(1, 2)):
+                    events.append((t + rnd.randint(1, 10), "one_sided", rnd.choice([31, 40]), k))
+                    t = events[-1][0] + events[-1][2] + rnd.randint(5, 50)
+            else:
+                t += rnd.randint(1, length + 30)
+            continue
+        if kind == "one_sided":
+            length = rnd.choice([31, 40, 80])
+            events.append((t, kind, length, k))
+        elif kind == "network":
+            length = rnd.choice([5, 30, 90])
+            events.append((t, kind, length))
+        else:
+            length = rnd.choice([3, 60, 300, 1450, 1600])
+            events.append((t, kind, length))
+        t += length + rnd.randint(2, 30)
+    end = max([e[0] + e[2] for e in events] + [t])
+    return events, end + 80                                     # time to catch up afterwards
+
+
+@pytest.mark.parametrize("chunk", range(8))
+def test_every_watched_trade_is_stored_or_covered_over_generated_sequences(tmp_path, chunk):
+    import random
+    for seed in range(25 * chunk, 25 * chunk + 25):              # 200 sequences in all
+        rnd = random.Random(5000 + seed)
+        n = rnd.choice([1, 2])
+        events, last = random_trade_events(rnd, n)
+        col, world, store, true, skew = scenario(tmp_path / str(seed), events, last, n=n, slots=rnd.choice([1, n]),
+                                                 seed=seed, per_minute=1)
+        missing = trades_uncovered(world, store, true.t)
+        assert missing == [], "seed %d, events %s: %d uncovered, first %s" % (seed, events, len(missing), missing[:3])
+
+
+def test_every_clock_off_written_is_followed_by_its_clock_on_in_order(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    col.start()
+    for i in range(0, 5):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    store.conn.execute("PRAGMA query_only = 1")                 # the disk is full while the clock flaps
+    for i in range(5, 14):
+        skew.offset = -3600.0 if i % 2 else 0.0                 # off (a step), then right again, five times
+        true.t = T0 + 60 * i + 0.5
+        run_cycle(col)
+    skew.offset = 0.0
+    store.conn.execute("PRAGMA query_only = 0")
+    for i in (14, 15):
+        true.t = T0 + 60 * i + 0.5
+        run_cycle(col)
+    kinds = [k for k in event_kinds(store) if k in ("clock_off", "clock_on")]
+    assert col.synced and kinds == ["clock_off", "clock_on"] * 5
+
+
+# ---------------------------------------------------------------- a store written by 09ecec7 (rev 9, collecting)
+
+OLD_PATH = ol.Path(__file__).resolve().parents[2] / ".foreman" / "scratch" / "T12r10_orderbook_loop_09ecec7.py"
+OLD_SHA = "63c7ef66e5edec60343dd0400e83aaed02b2f775fe9002eff2d8e006b00465e3"
+
+
+def rev9_module():
+    """09ecec7's orderbook_loop.py, exported to the scratch folder (`git show 09ecec7:...`), checked by its hash."""
+    import hashlib
+    import importlib.util
+    if not OLD_PATH.exists():
+        pytest.skip("09ecec7's module is not exported to %s" % OLD_PATH)
+    assert hashlib.sha256(OLD_PATH.read_bytes()).hexdigest() == OLD_SHA
+    import sys
+    spec = importlib.util.spec_from_file_location("orderbook_loop_09ecec7", OLD_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod                                # its dataclasses look their module up
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_store_written_by_09ecec7_is_continued_and_stays_readable_by_it(tmp_path):
+    import random
+    old = rev9_module()
+    rnd = random.Random(31)
+    true = Clock()
+    mono, skew = true.mono, Skewed(true)
+    world, model = World(true), Model(true)
+    world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i, close=T0 + 5 * 86400) for i in range(3)]
+    for m in world.markets:
+        world.books[m["ticker"]] = book(0.40, 0.45)
+    for i in range(0, 200):
+        for m in world.markets:
+            world.trade(m["ticker"], i * 10 + ord(m["ticker"][0]), T0 + 60 * (i - 1) + rnd.uniform(0, 60),
+                        lag=rnd.uniform(0, ol.TAPE_LAG_S))
+    path = tmp_path / "loop.sqlite"
+
+    def make(mod):
+        kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono, tries=1)
+        return mod.Collector(mod.Store(path), kalshi, mod.ModelClient(transport=model, clock=skew), clock=skew,
+                             monotonic=mono)
+
+    def minutes(col, a, b):
+        for i in range(a, b):
+            true.t = max(true.t, T0 + 60 * i + 0.5)
+            try:
+                col.cycle()
+            except Exception as e:
+                raise AssertionError("minute %d: %r" % (i, e)) from None
+
+    col = make(old)                                             # 09ecec7 writes the first 70 minutes
+    col.start()
+    world.fail_trades = {"A-E-M"}
+    minutes(col, 0, 20)
+    world.fail_trades = set()
+    minutes(col, 20, 70)
+    col.finish("stop")
+    col = make(ol)                                              # this version continues the same store
+    col.start()
+    world.fail_trades = {"B-E-M"}
+    minutes(col, 70, 90)
+    world.fail_trades = set()
+    minutes(col, 90, 150)
+    col.finish("stop")
+    store = ol.Store(path)
+    c = store.conn
+    assert {r[0] for r in c.execute("SELECT DISTINCT watch_id FROM decisions WHERE slot_ts > ?", (T0 + 4200,))} == \
+        {r[0] for r in c.execute("SELECT watch_id FROM markets")}                # deciding on, no new warm-up
+    assert trades_uncovered(world, store, true.t) == []
+    rows = old.day_status(old.Store(path), true.t)              # and 09ecec7 still reads it,
+    assert old.format_status(rows) and rows[0]["expected"] == ol.day_status(store, true.t)[0]["expected"]
+    col = make(old)                                             # and goes on writing it
+    col.start()
+    minutes(col, 150, 160)
+    n = c.execute("SELECT COUNT(*) FROM snapshots WHERE book_end_ts > ?", (T0 + 150 * 60,)).fetchone()[0]
+    assert n == 3 * 10

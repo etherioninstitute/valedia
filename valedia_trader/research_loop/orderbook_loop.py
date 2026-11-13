@@ -69,7 +69,9 @@ same 24-hour limit. A dropped market whose tail was cut short that way (or never
 tail: CATCH_UP_TRIES (3) tries, each failed one recorded as `catch_up_failed`, then one `trades_lost` for the
 hole. Both are deliberate: a tail that cannot be read (its book or trades keep failing) is not tried for ever,
 and its hole is recorded once; the tries and the event are in the record, so a restart neither forgets nor
-repeats them. A trade-window number (`trades_5m`, `volume_15m`, ...) is null unless the good trade reads cover
+repeats them; each watch of a market gets its own tries and its own `trades_lost`, however often it is chosen
+again. When the reads after a hole of more than 24 hours go on failing, each try that moves the 24-hour limit
+past trades never read extends the lost interval with one more `trades_lost`. A trade-window number (`trades_5m`, `volume_15m`, ...) is null unless the good trade reads cover
 the whole window without a hole up to its end, so while trade reads fail and books succeed it is null.
 
 The clock: no row is stored unless the collector's clock is known to be right. Two checks decide that:
@@ -88,7 +90,9 @@ from it (a read whose request began before the step and ended after it is thrown
 event (with our clock and the latest Date), and from then on makes exactly one cheap Kalshi request a minute
 (`/exchange/status`, no retry) and nothing else. When an answer's Date agrees and no step was seen during that
 request, it records `clock_on` (with the Date and our clock at that answer; if the store cannot take it then, at
-the next cycle that can, after every `clock_off` it could not take either, in order) and resumes exactly as after a stop of that
+the next cycle that can, after every `clock_off` it could not take either, in order; a return to sync whose
+`clock_on` the store could not take before the clock went off again gets its own `clock_on`, written after its
+`clock_off`, so every `clock_off` written is followed by its `clock_on`) and resumes exactly as after a stop of that
 length: the gap is recorded, watches that ran out are dropped and replaced, the trades are read back as above,
 and holes in the history give nulls and warm-ups by the usual rules. For `status` a period out of sync is a gap
 like any stop. During a pause after repeated failures the only request is that cheap check, made when the latest
@@ -842,6 +846,43 @@ class Store:
                 n += 1
         return n
 
+    def lost_until(self, ticker: str, last_read_ts: float | None) -> float | None:
+        """The latest end of the `trades_lost` intervals recorded for a hole after this last good read (None: never
+        read), or None when there is none."""
+        ends = []
+        for (d,) in self.conn.execute("SELECT detail_json FROM events WHERE kind = 'trades_lost' AND ticker = ?",
+                                      (ticker,)):
+            d = json.loads(d)
+            x = d.get("last_read_ts")
+            if d.get("cause") != "hole" or (x is None) != (last_read_ts is None) or \
+                    (x is not None and abs(x - last_read_ts) > 1e-3):
+                continue
+            ends.append(d["to_ts"])
+        return max(ends) if ends else None
+
+    def tail_events(self, kind: str, ticker: str, watch_id: int, last_read_ts: float | None) -> int:
+        """`catch_up_failed` or `trades_lost` (cause "tail") events of this watch's tail after this last good read.
+        One with no `watch_id` (written by 09ecec7) belongs to the watch of the ticker's latest drop at or before
+        it."""
+        drops = self.conn.execute("SELECT dropped_ts, watch_id FROM market_drops WHERE ticker = ? ORDER BY dropped_ts, "
+                                  "id", (ticker,)).fetchall()
+        n = 0
+        for ts, d in self.conn.execute("SELECT ts, detail_json FROM events WHERE kind = ? AND ticker = ?",
+                                       (kind, ticker)):
+            d = json.loads(d)
+            if kind == "trades_lost" and d.get("cause") != "tail":
+                continue
+            x = d.get("last_read_ts")
+            if (x is None) != (last_read_ts is None) or (x is not None and abs(x - last_read_ts) > 1e-3):
+                continue
+            wid = d.get("watch_id")
+            if wid is None:
+                before = [w for at, w in drops if at <= ts]
+                wid = before[-1] if before else None
+            if wid == watch_id:
+                n += 1
+        return n
+
     def last_trade_read(self, ticker: str) -> float | None:
         return self.conn.execute("SELECT MAX(trades_start_ts) FROM snapshots WHERE ticker = ? AND trades_ok = 1",
                                  (ticker,)).fetchone()[0]
@@ -1111,8 +1152,10 @@ class Collector:
         self._started = False                       # the `start` event is written once the clock is first right
         self._resume_due = False                    # in sync, but `start` or `clock_on` not yet written
         self._off_noted = False                     # the `clock_off` event of this period is written
-        self._off_rows: list[dict] = []             # `clock_off` events the store could not take yet, in order
-        self._lost_noted: set = set()               # (ticker, last good read, cause) whose `trades_lost` is written
+        self._off_rows: list[dict] = []             # `clock_off` (and their `clock_on`) events the store could not
+                                                    # take yet, in order
+        self._on_row: dict | None = None            # the `clock_on` of the latest return to sync, until written
+        self._lost_to: dict = {}                    # (ticker, last good read): how far its hole's `trades_lost` reach
                                                     # (a cache: the record itself is asked on a miss)
         self._warm_at: dict = {}                    # watch_id: when it is warm (`Store.warm_time`), once known
         self.n_requests = self.n_failures = self.n_model_calls = 0
@@ -1200,6 +1243,9 @@ class Collector:
     def _go_off(self, why: str) -> None:
         """Out of sync: nothing more is stored; one `clock_off` event (if the store can take it); the next cycles
         only check the clock, once a minute. The cycle in progress is forgotten, as after a stop."""
+        if self._resume_due and self._on_row is not None:   # back in sync before, but its clock_on not written:
+            self._off_rows.append(self._on_row)            # it goes before this clock_off, in order
+        self._on_row = None
         self.synced, self._resume_due = False, False
         self._minute = self._cycle_start = self._cycle_end = None
         self.paused_until, self.consecutive_fails = None, 0
@@ -1234,6 +1280,9 @@ class Collector:
         if self._stepped or self._disagree or not self._dated:
             return False
         self.synced, self._off_noted, self._undated, self._resume_due = True, False, 0, True
+        now = self._read()
+        self._on_row = ({**stamp("", now), "kind": "clock_on", "ticker": None,
+                         "detail_json": json.dumps(self._times(), default=str)} if self._started else None)
         try:
             self._resume()
         except Exception:                                # the store cannot be written: done at the next cycle
@@ -1285,7 +1334,7 @@ class Collector:
             for w, reason, at in ends:
                 ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", at),
                                      "reason": reason}, commit=False)
-        self._started, self._resume_due, self._last_beat, self._off_rows = True, False, now, []
+        self._started, self._resume_due, self._last_beat, self._off_rows, self._on_row = True, False, now, [], None
 
     # ---- small helpers
     def event(self, kind: str, ticker: str | None = None, **detail) -> None:
@@ -1526,7 +1575,8 @@ class Collector:
         """Dropped markets whose tail an outage cut short (their last good trades read, or the start of their watch
         when they were never read, more than TRADE_READBACK_S before the tail's end): read once more, as a tail,
         so their trades are caught up. The tries and the `trades_lost` are kept in the record (events
-        `catch_up_failed` and `trades_lost`), so a restart neither forgets nor repeats them."""
+        `catch_up_failed` and `trades_lost`), each for its own watch, so a restart neither forgets nor repeats them
+        and a market chosen again and dropped again gets new tries and, failing them, a new event for that watch."""
         out = []
         for wid, t, close_ts, dropped, last, first in self.store.conn.execute(
                 "SELECT m.watch_id, m.ticker, m.close_ts, d.dropped_ts, (SELECT MAX(s.trades_start_ts) FROM snapshots s "
@@ -1537,8 +1587,8 @@ class Collector:
             since = last if last is not None else first
             if t in exclude or since is None or end > now or since + TRADE_READBACK_S >= end:
                 continue
-            if (self.store.count_events("catch_up_failed", t, last) < CATCH_UP_TRIES
-                    and not self.store.count_events("trades_lost", t, last, cause="tail")):
+            if (self.store.tail_events("catch_up_failed", t, wid, last) < CATCH_UP_TRIES
+                    and not self.store.tail_events("trades_lost", t, wid, last)):
                 out.append({"watch_id": wid, "ticker": t, "close_ts": close_ts, "dropped_ts": dropped, "tail": True,
                             "catch_up": (last, end, since)})
         return out
@@ -1546,17 +1596,18 @@ class Collector:
     def _caught(self, w: dict) -> None:
         """After a catch-up read: done if its trades were read; otherwise one more failed try (`catch_up_failed`),
         and after CATCH_UP_TRIES of them, `trades_lost`. Both deliberate: a tail that cannot be read is not tried
-        for ever, and its hole is recorded once."""
+        for ever, and its hole is recorded once a watch: from TRADE_READBACK_S before its market's last good read
+        (or first watch, when never read) to the end of this watch's tail."""
         last, end, since = w["catch_up"]
-        t = w["ticker"]
+        t, wid = w["ticker"], w["watch_id"]
         if self.store.last_trade_read(t) != last:
             return
-        tries = self.store.count_events("catch_up_failed", t, last) + 1
-        self.event("catch_up_failed", t, last_read_ts=last, attempt=tries)
-        if tries >= CATCH_UP_TRIES and not self.store.count_events("trades_lost", t, last, cause="tail"):
+        tries = self.store.tail_events("catch_up_failed", t, wid, last) + 1
+        self.event("catch_up_failed", t, last_read_ts=last, attempt=tries, watch_id=wid)
+        if tries >= CATCH_UP_TRIES and not self.store.tail_events("trades_lost", t, wid, last):
             self.event("trades_lost", t, from_ts=since - TRADE_READBACK_S, from_iso=iso(since - TRADE_READBACK_S),
                        to_ts=end, to_iso=iso(end), why="its tail could not be read after an outage",
-                       last_read_ts=last, cause="tail")
+                       last_read_ts=last, cause="tail", watch_id=wid)
 
     def _skipped(self, prev_minute: float, upto: float) -> None:
         """The minutes after `prev_minute` and before `upto` had no cycle of their own because the cycle before
@@ -1651,7 +1702,10 @@ class Collector:
         """`min_ts` of a trades read whose book read ended at b1: TRADE_READBACK_S (150 s) before the market's last
         good trades read began, whatever came between (a pause, an outage, a sleep, a time out of sync, a restart, a
         store that could not be written), up to CATCH_UP_S (24 hours) back; a longer hole is recorded once as
-        `trades_lost` (in the record, so a restart does not repeat it). A market never read before: TRADE_READBACK_S
+        `trades_lost` (in the record, so a restart does not repeat it); while the reads after such a hole go on
+        failing, the limit moves on with each try, and each time it passes trades never read the lost interval is
+        extended by one more `trades_lost` (from where the last one ended), so the `trades_lost` intervals always
+        hold every unread stretch older than the limit. A market never read before: TRADE_READBACK_S
         before the start of its (first) watch, however long ago that was (a watch committed but not read yet, an
         outage right after a selection), and never less than FIRST_TRADES_S back; up to CATCH_UP_S likewise."""
         last = self.store.last_trade_read(ticker)
@@ -1661,15 +1715,23 @@ class Collector:
             min_ts = b1 - FIRST_TRADES_S if start is None else min(start - TRADE_READBACK_S, b1 - FIRST_TRADES_S)
         else:
             min_ts = last - TRADE_READBACK_S
-        if min_ts < b1 - CATCH_UP_S:
-            key = (ticker, last, "hole")
-            if key not in self._lost_noted and not self.store.count_events("trades_lost", ticker, last, cause="hole"):
-                self.event("trades_lost", ticker, from_ts=min_ts, from_iso=iso(min_ts), to_ts=b1 - CATCH_UP_S,
-                           to_iso=iso(b1 - CATCH_UP_S), why="the last good read is more than %d h back"
-                           % (CATCH_UP_S // 3600) if last is not None else "the watch began more than %d h back, "
-                           "never read" % (CATCH_UP_S // 3600), last_read_ts=last, cause="hole")
-            self._lost_noted.add(key)
-            min_ts = b1 - CATCH_UP_S
+        limit = b1 - CATCH_UP_S
+        if min_ts < limit:
+            key = (ticker, last)
+            done = self._lost_to.get(key)
+            if done is None:
+                done = self.store.lost_until(ticker, last)
+            if done is None or limit > done:             # first, or the limit has moved on past unread trades
+                start = min_ts if done is None else done
+                self.event("trades_lost", ticker, from_ts=start, from_iso=iso(start), to_ts=limit,
+                           to_iso=iso(limit), why=("the last good read is more than %d h back" % (CATCH_UP_S // 3600)
+                                                   if last is not None else "the watch began more than %d h back, "
+                                                   "never read" % (CATCH_UP_S // 3600))
+                           + ("" if done is None else "; the reads since failed too, so the limit moved on"),
+                           last_read_ts=last, cause="hole")
+                done = limit
+            self._lost_to[key] = done
+            min_ts = limit
         return int(min_ts)
 
     def snapshot(self, w: dict, tail: bool = False) -> int | None:
@@ -1727,8 +1789,8 @@ class Collector:
 
     # ---- decisions
     def _maybe_decide(self, w: dict, slot_ts: float, forced: bool, done: set, model_down: list) -> dict | None:
-        """The slot's decision for one market, if it has 30 minutes of snapshots (from `warm_from_ts` when it was
-        chosen again with its snapshots running on) and none was made yet."""
+        """The slot's decision for one market, if the watch is warm at this slot (`_warm`: an unbroken 30-minute run
+        of its market's snapshots; `warm_from_ts` is information only) and none was made yet."""
         if not forced:
             if w["watch_id"] in done:
                 return None
