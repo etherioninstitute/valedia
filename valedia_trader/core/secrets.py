@@ -10,7 +10,8 @@ remembering (loaded now or already in the environment) is remembered, when it is
 characters long. `load_env` remembers, under any name, a value of exactly 12, 15, 18, 21 or 24
 words of 3 to 8 lower-case letters (a recovery phrase); under a credential name (KEY, SECRET, TOKEN,
 PASSWORD, PASS, ACCOUNT) a value without whitespace (an account value only with a digit) and a
-value of 4 groups or more that all hold a digit (a spaced number); and under a phrase name
+value of 4 groups or more that all hold a digit, make 12 characters or more written together and
+include at least 4 groups of 4 characters or more (a spaced number); and under a phrase name
 (MNEMONIC, SEED, PHRASE, RECOVERY, WORDS) without a credential word a value with whitespace of 4
 words or groups or more. Plain words under a credential name are never remembered unless they have
 the recovery-phrase shape. It never remembers a path or a URL, a setting (a name
@@ -72,7 +73,14 @@ phrase split between standard output and standard error; colour codes, markup, z
 characters, accents or look-alike letters inside or around the words; spaced groups that are
 numbered (`1. g 2. g`); a held line when the process is killed or ends through `os._exit`; a held
 line printed twice after `fork`; and a TOTP secret or an IBAN written in spaced groups under a name
-with no credential or phrase word (`load_env` does not remember it)."""
+with no credential or phrase word (`load_env` does not remember it).
+
+Also: a line ending in phrase words has its tail held, so if the screen stream is replaced or the
+guard removed right after it, the tail appears after later output; on a terminal an `input()`
+prompt is written by Python outside the guard, so a secret placed in a prompt is not replaced;
+digits regrouped differently from the remembered value, a prefix glued to the first group or word,
+and a word split by a hyphen at a line break are not matched; and which streams may hold text is
+decided from sys.__stdout__ and sys.__stderr__ each time the guard wraps a stream."""
 from __future__ import annotations
 
 import atexit
@@ -209,7 +217,9 @@ def _worth_remembering(name: str, value: str) -> bool:
     only under a credential name or a phrase name (see `_looks_like_credential`), and never a path,
     a URL or a setting (a name ending in a setting ending): a value with whitespace of 4 words or
     groups or more, under a credential name only when every group holds a digit (a spaced number, or
-    spaced letters and digits: plain words are not remembered there); a value without whitespace
+    spaced letters and digits: plain words are not remembered there), the groups written together
+    make 12 characters or more and at least 4 of them have 4 characters or more (so a list of short
+    numbers such as `1 2 4 8 16` or `128 192 256 512` is left alone); a value without whitespace
     only under a credential name, and under an account-only name only when it has a digit. A phrase name alone never makes a value without
     whitespace remembered (so MNEMONIC_LANGUAGE=japanese, SEED_DATE=2024-01-01 and RANDOM_SEED are
     left alone)."""
@@ -223,7 +233,8 @@ def _worth_remembering(name: str, value: str) -> bool:
     if not (credential or phrase_name) or upper.endswith(_SETTING_ENDINGS) or _looks_like_a_place(value):
         return False
     if spaced:
-        spaced_number = all(w.isalnum() and any(c.isdigit() for c in w) for w in words)
+        spaced_number = (all(w.isalnum() and any(c.isdigit() for c in w) for w in words)
+                         and len("".join(words)) >= _HEX_RUN and sum(len(w) >= 4 for w in words) >= _PHRASE_WORDS)
         return len(words) >= _PHRASE_WORDS and (spaced_number or not credential)
     if not credential:
         return False

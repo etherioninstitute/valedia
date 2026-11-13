@@ -1192,3 +1192,18 @@ def test_load_env_leaves_plain_words_under_credential_names_alone(tmp_path):
     s.load_env(f, environ={})
     caught = sorted(k for k, v in settings.items() if s.redact(f"x {v} y")[1])
     assert caught == []
+
+
+# ---- rev 8 -------------------------------------------------------------------------------------
+
+def test_load_env_leaves_spaced_lists_of_short_numbers_alone(tmp_path):
+    rng = random.Random(70)
+    values = {"API_KEY_BACKOFF": "1 2 4 8 16", "PASS_RETRIES": "3 5 8 13", "KEY_SIZES": "128 192 256 512",
+              "CARD_KEY": " ".join(_groups(rng, 4)), "BACKUP_TOKEN": " ".join(_groups(rng, 5, True))}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in values.items() if s.redact(f"retry after {v} seconds")[1])
+    plain = s.redact("retry after 1, 2, 4, 8 seconds")[1]
+    assert caught == ["BACKUP_TOKEN", "CARD_KEY"] and plain == 0
