@@ -249,11 +249,23 @@ def _order_step_build():
     if _order_step_refused():
         return None
     try:
-        return _order_step_venue()
+        venue = _order_step_venue()
     except (WebullError, SecretError, OSError) as exc:
         print(f"refused: the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file "
               "and its WEBULL_ settings", file=sys.stderr)
         return None
+    return None if _order_step_events(venue) else venue
+
+
+def _order_step_events(venue) -> bool:
+    """True, with one line on stderr, when the venue is an Events venue (order_step.events_refusal: its name, or its
+    account class without a network read). The line is the order step's own words, nothing from the secrets file."""
+    from valedia_trader.execution_and_risk.order_step import events_refusal
+    why = events_refusal(venue)
+    if why is not None:
+        print(f"refused: {why}", file=sys.stderr)
+        return True
+    return False
 
 
 def order_step_command(args, paths: LoopPaths, venue=None) -> int:
@@ -265,6 +277,8 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
         venue = _order_step_build()
         if venue is None:
             return 2
+    elif _order_step_events(venue):                     # before the paper trader, the ledger or any file
+        return 2
     trader = PaperTrader(paths.journal, paths.risk_limits)
     ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
     orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)

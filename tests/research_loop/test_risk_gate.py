@@ -83,3 +83,35 @@ def test_the_limits_file_may_carry_a_daily_order_cap_and_nothing_else_extra(tmp_
     path.write_text(json.dumps({**rg.DEFAULT_LIMITS, "max_orders_per_week": 5}))
     with pytest.raises(rg.RiskConfigError):
         rg.load_limits(path)
+
+
+# ---- T13 rev 8: the gate's own look at the halt and latch files
+
+def _odd(tmp_path, how):
+    import os
+    p = tmp_path / f"odd-{how}"
+    if how == "dangling link":
+        os.symlink(tmp_path / "nowhere", p)
+    elif how == "link loop":
+        os.symlink(p, p)
+    elif how == "nul":
+        return str(p) + "\0x"
+    elif how == "under a regular file":
+        (tmp_path / "plain").write_text("x")
+        return tmp_path / "plain" / "halt.json"
+    return p
+
+
+@pytest.mark.parametrize("how", ["dangling link", "link loop", "nul", "under a regular file"])
+def test_a_halt_or_latch_file_is_there_unless_it_is_plainly_absent(tmp_path, how):
+    (tmp_path / "h").mkdir()
+    (tmp_path / "l").mkdir()
+    halt, latch = _odd(tmp_path / "h", how), _odd(tmp_path / "l", how)
+    assert check(order={"reduces_risk": True}, halt_file=halt) == (False, "Operator halt file is present. Trading stopped.")
+    assert check(latch_file=latch)[1].startswith("Max drawdown was hit earlier")
+    assert rg.file_is_there(halt) and rg.file_is_there(latch)
+
+
+def test_only_a_clean_no_such_file_is_absent_for_the_gate(tmp_path):
+    assert rg.file_is_there(None) is False and rg.file_is_there(tmp_path / "missing.json") is False
+    assert check(halt_file=tmp_path / "missing.json", latch_file=tmp_path / "missing2.json") == (True, "OK")

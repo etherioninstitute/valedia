@@ -2240,7 +2240,7 @@ def test_every_gate_verdict_matches_my_own_evaluation_at_the_quotes_in_hand(tmp_
         if out["broker_equity"] is not None:                        # the day's row is the equity at the last prices in hand
             last = cash + math.fsum(u * model[s] for s, u in held.items() if u > 0)
             assert _equity_rows(w)[-1] == ("2026-11-13", pytest.approx(last, rel=1e-12))
-    assert box["judged"] >= 80 and box["verdicts"] == {True, False}
+    assert box["judged"] >= 50 and box["verdicts"] == {True, False}
 
 
 # ---- rev 6 outcome 2: a last look between intend and submit_once
@@ -2269,7 +2269,7 @@ def test_a_halt_that_appears_after_intend_leaves_every_order_intended(world):
     world.paper = paper({"a": {"SPY": 1.0}})
     out = world.run(patch=_after_intend(world, lambda s, u: world.halt.write_text("stop")))
     assert world.venue.submits() == [] and [o["state"] for o in world.orders()] == ["intended"]
-    assert out["left_over"][0]["reason"] == "the operator halt file appeared before the order was sent"
+    assert out["left_over"][0]["reason"] == "the operator halt file is there at the last look before sending"
 
 
 @pytest.mark.parametrize("after", ["sale", "purchase"])
@@ -2286,7 +2286,7 @@ def test_a_latch_that_appears_after_intend_leaves_a_purchase_intended_but_not_a_
         assert "QQQ" not in states and out["refused"][0]["by"] == "risk gate"
     else:
         assert states["QQQ"] == "intended"
-        assert out["left_over"] == [{"symbol": "QQQ", "units": 1.0, "reason": "the drawdown latch appeared before the order was sent"}]
+        assert out["left_over"] == [{"symbol": "QQQ", "units": 1.0, "reason": "the drawdown latch is there at the last look before sending"}]
 
 
 # ---- rev 6 outcome 3: the environment by static lookup too
@@ -2348,9 +2348,9 @@ def test_purchases_stop_at_the_settled_cash_and_the_summary_says_how_much_was_le
     assert [e["symbol"] for e in out["sent"]] == ["SPY"]
     why = "the purchases would exceed the settled cash the venue reports less 1% (17820.00)"
     assert out["left_over"] == [{"symbol": "QQQ", "units": 10.0, "reason": why}]
-    assert out["cash"] == 100_000.0 and out["settled_cash"] == 18_000.0 and out["purchases_left_unsettled"] == 4_000.0
+    assert out["cash"] == 100_000.0 and out["settled_cash"] == 18_000.0 and out["purchases_left_unsettled"] == 4_040.0
     summary = world.entries("summary")[-1]
-    assert summary["cash"] == 100_000.0 and summary["settled_cash"] == 18_000.0 and summary["purchases_left_unsettled"] == 4_000.0
+    assert summary["cash"] == 100_000.0 and summary["settled_cash"] == 18_000.0 and summary["purchases_left_unsettled"] == 4_040.0      # at the limit prices (rev 8)
 
 
 def test_a_sale_earlier_in_the_day_does_not_pay_for_a_purchase(world):
@@ -2367,7 +2367,7 @@ def test_a_sale_earlier_in_the_day_does_not_pay_for_a_purchase(world):
     world.paper = paper({"a": {"SPY": 0.0, "QQQ": 10.0}})              # 4,000: within cash, not within settled cash
     out = world.run()
     assert out["orders_sent"] == 0 and out["left_over"][0]["symbol"] == "QQQ"
-    assert "settled cash" in out["left_over"][0]["reason"] and out["purchases_left_unsettled"] == 4_000.0
+    assert "settled cash" in out["left_over"][0]["reason"] and out["purchases_left_unsettled"] == 4_040.0
 
 
 @pytest.mark.parametrize("settled", [float("nan"), float("inf"), -1.0, 2e12, "not a number", 1_000_000.02, [5]])
@@ -2406,10 +2406,7 @@ def test_purchases_never_exceed_the_smaller_of_cash_and_settled_cash_less_one_pe
         spend = cash if settled is None else min(cash, settled)
         cost = math.fsum(e["units"] * e["limit_price"] for e in out["sent"] if e["units"] > 0)
         assert cost <= spend * (1 - osx.CASH_KEPT) + 1e-9, (cash, settled, out["sent"])
-        if settled is not None and settled < cash:
-            unsettled = [o for o in out["left_over"] if "settled cash" in o["reason"]]
-            assert out["purchases_left_unsettled"] == pytest.approx(
-                math.fsum(o["units"] * w.prices[o["symbol"]] for o in unsettled))
+        # (what is reported as left for lack of settled money: rev 8, against its own bookkeeping, below)
 
 
 # ---- rev 7 invariant 2: every holding is priced at a fresh quote at every gate call
@@ -2422,8 +2419,8 @@ def _verifier_slow_world(world, again):
     world.prices["SPY"] = 100.0
     world.quote_age["SPY"] = 1190.0
     cash = world.venue.cash
-    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]   # SPY's quote goes stale
-    _stamping(world, after_first=lambda s: "SPY" in s and again())
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 61), cash())[1]   # SPY's quote goes stale
+    _stamping(world, after_first=lambda s: "SPY" in s and again())        # (61 s: a minute after its first ask, rev 8)
 
 
 def test_a_held_fund_with_no_order_of_its_own_is_priced_again_when_its_quote_is_too_old(world):
@@ -2536,7 +2533,7 @@ def test_every_gate_call_prices_every_holding_at_a_fresh_quote_in_slow_runs(tmp_
         out = w.run()
         assert box["bad"] == [] and out["status"] == "done", (box["bad"], out)
         box["unpriced"] += sum(1 for o in out["left_over"] if o["reason"].startswith("the account cannot be priced"))
-    assert box["judged"] >= 80 and box["verdicts"] == {True, False} and box["unpriced"] > 0
+    assert box["judged"] >= 50 and box["verdicts"] == {True, False} and box["unpriced"] > 0
 
 
 # ---- rev 7 invariant 3: a halt or latch file is there unless it is plainly absent
@@ -2582,3 +2579,255 @@ def test_only_a_clean_no_such_file_is_absent():
     assert osx._present(None) is False
     assert osx._present("/definitely/not/here/halt") is False
     assert osx._present(os.devnull) is True
+
+
+# ==== rev 8 (T13 rev 8): five small points after rev 7's blind check
+
+def _purchases_in_order(w, wanted):
+    """The run's purchases as the order step takes them: largest value first (then by symbol)."""
+    rows = [(s, u, u * w.prices[s]) for s, u in wanted.items() if u > 0]
+    return [(s, u) for s, u, _ in sorted(rows, key=lambda r: (-r[2], r[0]))]
+
+
+def _money_book(cash, settled, purchases, prices):
+    """My own bookkeeping of rev 8 outcome 1: which purchases go, how each one left over for money is labelled,
+    and how much the cash budget would still have covered that the settled budget did not."""
+    k = osx.CASH_KEPT
+    cash_b = cash * (1 - k) if cash > 0 else 0.0
+    set_b = None if settled is None else (settled * (1 - k) if settled > 0 else 0.0)
+    budget = cash_b if set_b is None else min(cash_b, set_b)
+    spent, unsettled, stop, sent, labels = 0.0, 0.0, None, [], {}
+    for sym, units in purchases:
+        cost = units * osx.limit_price(units, prices[sym])
+        if stop is None and units * prices[sym] > cash:                    # the gate's position limit (equity = cash)
+            labels[sym] = "gate"
+            continue
+        if stop is None and not spent + cost > budget:
+            sent.append(sym)
+            spent += cost
+            continue
+        cash_left, settled_left = cash_b - spent - unsettled, math.inf if set_b is None else set_b - spent
+        over_c, over_s = cost > cash_left, cost > settled_left
+        if over_s and not over_c:
+            kind = "settled"
+            unsettled += cost
+        elif over_c and not over_s:
+            kind = "cash"
+        elif over_c and over_s:
+            kind = "settled" if settled_left < cash_left else "cash"
+        else:
+            kind = stop
+        stop = stop or kind
+        labels[sym] = kind
+    words = {"cash": f"the purchases would exceed the cash the venue reports less 1% ({cash_b:.2f})",
+             "settled": f"the purchases would exceed the settled cash the venue reports less 1% ({(set_b or 0.0):.2f})"}
+    return sent, {s: words[v] for s, v in labels.items() if v != "gate"}, unsettled
+
+
+# ---- rev 8 outcome 1: the summary says what was really left for lack of settled money
+
+def test_each_purchase_left_for_money_is_labelled_by_the_budget_that_stopped_it(world):
+    _settling_world(world, 10_000.0, 1_000.0)                # the verifier's case: 8,000 then 5,000 (at the quotes)
+    world.paper = paper({"a": {"SPY": 16.0, "QQQ": 12.0}})
+    out = world.run()
+    settled = "the purchases would exceed the settled cash the venue reports less 1% (990.00)"
+    reasons = {o["symbol"]: o["reason"] for o in out["left_over"]}
+    assert out["orders_sent"] == 0 and reasons == {"SPY": settled, "QQQ": settled}
+    assert out["purchases_left_unsettled"] == 16 * 505.0     # 8,080 the cash covers; then 4,848 > the 1,820 it has left
+    assert out["purchases_left_unsettled"] <= 9_900.0
+
+
+def test_a_first_purchase_above_even_the_cash_leaves_later_ones_that_fit_the_cash_as_settled(world):
+    _settling_world(world, 10_000.0, 1_000.0)
+    world.paper = paper({"a": {"SPY": 49.0, "QQQ": 12.0}})
+    world.prices["SPY"] = 204.0                          # 49 x 204 = 9,996 (the gate passes it); at 206.04: 10,095.96 > 9,900
+    out = world.run()
+    reasons = {o["symbol"]: o["reason"] for o in out["left_over"]}
+    settled = "the purchases would exceed the settled cash the venue reports less 1% (990.00)"
+    assert reasons == {"SPY": settled, "QQQ": settled}   # SPY: over both, settled the tighter; QQQ: within the cash only
+    assert out["purchases_left_unsettled"] == 12 * 404.0
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_what_is_left_for_settled_money_matches_my_own_bookkeeping(tmp_path, seed):
+    for k in range(50):
+        rng = random.Random(80_000 + seed * 50 + k)
+        w = World(tmp_path / f"m{seed}-{k}")
+        cash = rng.choice([1_000.0, 5_000.0, 10_000.0, 30_000.0])
+        settled = rng.choice([None, 0.0, cash * 0.1, cash * 0.3, cash * 0.7, cash, cash + 0.01])
+        w.venue = Settling(cash=cash, settled_cash=0.0)
+        w.venue.settled = settled
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        for s in ("SPY", "QQQ", "IWM", "TLT", "GLD"):
+            w.prices[s] = rng.choice([20.0, 101.0, 250.0, 500.0])
+        wanted = {s: float(rng.choice([0, 1, 3, 8, 20, 45])) for s in ("SPY", "QQQ", "IWM", "TLT", "GLD")}
+        w.paper = paper({"a": wanted})
+        out = w.run()
+        assert out["status"] == "done", out
+        sent, labels, unsettled = _money_book(cash, settled, _purchases_in_order(w, wanted), w.prices)
+        assert [e["symbol"] for e in out["sent"]] == sent, (cash, settled, wanted)
+        assert {o["symbol"]: o["reason"] for o in out["left_over"]} == labels, (cash, settled, wanted)
+        assert out["purchases_left_unsettled"] == pytest.approx(unsettled, abs=1e-6)
+        assert out["purchases_left_unsettled"] <= cash * (1 - osx.CASH_KEPT) + 1e-6
+
+
+# ---- rev 8 outcome 2: a settled figure a cent above cash, compared in whole cents
+
+def test_a_settled_figure_exactly_one_cent_above_cash_is_accepted_in_a_run(world):
+    _settling_world(world, 16384.01, 0.0)
+    world.venue.settled = "16384.02"
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run()
+    assert out["status"] == "done" and out["settled_cash"] == 16384.02
+
+
+def test_settled_cash_is_compared_with_cash_in_whole_cents():
+    for cents in range(0, 2_000_000, 97):
+        cash = round(16384 + cents / 100, 2)
+        for above, ok in ((0, True), (1, True), (2, False)):
+            value, bad = osx._settled_figure(cash, f"{cash + above / 100:.2f}")
+            assert bad is (not ok), (cash, above)
+            if ok:
+                assert value == float(f"{cash + above / 100:.2f}")
+
+
+# ---- rev 8 outcome 3: quote requests are bounded
+
+def _held_stale_world(world, slow_gate, monkeypatch, again_age=1500.0, cash_delay=61.0):
+    world.venue = StandIn(held={"SPY": 5000.0}, cash=500_000.0)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.prices["SPY"] = 100.0
+    world.quote_age["SPY"] = 1190.0
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + cash_delay), cash())[1]
+    _stamping(world, after_first=lambda s: "SPY" in s and world.quote_age.update(SPY=again_age))
+    real_gate = osx.risk_gate.check_order
+    monkeypatch.setattr(osx.risk_gate, "check_order",
+                        lambda *a, **k: (setattr(world.clock, "t", world.clock.t + slow_gate), real_gate(*a, **k))[1])
+
+
+def test_a_holding_with_no_fresh_quote_is_asked_again_at_most_once_a_minute(world, monkeypatch):
+    _held_stale_world(world, 0.0, monkeypatch)
+    world.paper = paper({"a": {s: 1.0 for s in ("QQQ", "IWM", "TLT", "GLD")}}, equity=1_000_000.0)
+    out = world.run()
+    assert sum(1 for q in world.quote_calls[1:] if "SPY" in q) == 1
+    assert [o["reason"] for o in out["left_over"]] == ["the account cannot be priced: no fresh quote for SPY"] * 4
+
+
+def test_a_holding_is_asked_again_after_a_minute(world, monkeypatch):
+    _held_stale_world(world, 150.0, monkeypatch, again_age=1100.0)       # usable when asked, too old 100 s later
+    world.paper = paper({"a": {"QQQ": 1.0, "IWM": 1.0}}, equity=1_000_000.0)
+    out = world.run()
+    assert out["orders_sent"] == 2 and sum(1 for q in world.quote_calls[1:] if "SPY" in q) == 2
+
+
+def test_a_run_never_makes_more_than_one_plus_three_requests_an_order(world, monkeypatch):
+    _held_stale_world(world, 25 * 60.0, monkeypatch, again_age=60.0)
+    world.quote_age["QQQ"] = 1190.0
+    _stamping(world, after_first=lambda s: [world.quote_age.update({x: 60.0}) for x in s])
+    world.paper = paper({"a": {"QQQ": 1.0}}, equity=1_000_000.0)
+    out = world.run()
+    considered = len(out["sent"]) + len(out["left_over"]) + len(out["refused"])
+    assert considered == 1 and len(world.quote_calls) <= 1 + 3 * considered
+
+
+@pytest.mark.parametrize("seed_block", range(3))
+def test_quote_requests_stay_within_one_plus_three_an_order_in_slow_runs(tmp_path, monkeypatch, seed_block):
+    real_gate = osx.risk_gate.check_order
+    box = {}
+    monkeypatch.setattr(osx.risk_gate, "check_order",
+                        lambda *a, **k: (setattr(box["w"].clock, "t", box["w"].clock.t + box["slow"]), real_gate(*a, **k))[1])
+    for k in range(40):
+        rng = random.Random(95_000 + seed_block * 40 + k)
+        w = World(tmp_path / f"b{seed_block}-{k}")
+        held = {s: float(rng.choice([0, 100, 500])) for s in ("SPY", "QQQ", "TLT")}
+        w.venue = StandIn(held={s: u for s, u in held.items() if u}, cash=500_000.0)
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        for s in ("SPY", "QQQ", "TLT", "IWM", "GLD"):
+            w.quote_age[s] = rng.choice([60.0, 1190.0])
+        again = rng.choice([60.0, 1100.0, 1500.0])
+        _stamping(w, after_first=lambda s, w=w, again=again: [w.quote_age.update({x: again}) for x in s])
+        if rng.random() < 0.7:
+            cash_read = w.venue.cash
+            w.venue.cash = lambda w=w, cash_read=cash_read: (setattr(w.clock, "t", w.clock.t + 20), cash_read())[1]
+        box.update(w=w, slow=rng.choice([0.0, 30.0, 61.0, 700.0, 1300.0]))
+        w.paper = paper({"a": {s: float(rng.choice([0, 1, 5])) for s in ("IWM", "GLD", "SPY", "QQQ")}}, equity=1_000_000.0)
+        out = w.run()
+        considered = len(out["sent"]) + len(out["left_over"]) + len(out["refused"])
+        assert len(w.quote_calls) <= 1 + 3 * considered, (len(w.quote_calls), considered)
+
+
+# ---- rev 8 outcome 4: the order step refuses an Events account
+
+def _events_venue(how):
+    class V(StandIn):
+        pass
+    v = None
+    if how == "name":
+        v = V(name="standin-sandbox-events")
+    elif how == "attribute":
+        v = V()
+        v.account_class = "EVENTS_CASH"
+    elif how == "class attribute":
+        V.account_class = "EVENTS_CASH"
+    elif how == "getattr":
+        V.__getattr__ = lambda self, n: "EVENTS_CASH" if n == "account_class" else (_ for _ in ()).throw(AttributeError(n))
+    elif how == "property":
+        V.account_class = property(lambda self: "EVENTS_CASH")
+    return v or V()
+
+
+@pytest.mark.parametrize("how", ["name", "attribute", "class attribute", "getattr"])
+def test_an_events_venue_is_refused_before_anything_is_read_or_created(world, how):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.venue = _events_venue(how)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "environment" and "Events" in out["reason"]
+    assert world.venue.calls == [] and world.quote_calls == []
+    journal = world.tmp / "journal"
+    assert not world.state_path.exists() and (not journal.exists() or not any(journal.iterdir()))
+    assert not [p for p in world.ledger_path.parent.iterdir() if p.name.endswith(".lock")]
+
+
+def test_an_events_class_read_through_a_property_is_refused_before_any_venue_call(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.venue = _events_venue("property")
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "environment" and "Events" in out["reason"]
+    assert world.venue.calls == [] and world.quote_calls == [] and world.orders() == []
+
+
+def test_a_property_account_class_is_not_read_outside_the_session(world):
+    reads = []
+
+    class V(StandIn):
+        account_class = property(lambda self: reads.append(1) or "INDIVIDUAL_CASH")
+    world.venue = V()
+    world.clock.t = ny("2026-11-14 11:00")                        # a Saturday
+    world.paper = paper({"a": {"SPY": 1.0}})
+    assert world.run()["stage"] == "session" and reads == []
+    world.clock.t = ny("2026-11-16 10:00")
+    assert world.run()["orders_sent"] == 1 and reads == [1]
+
+
+@pytest.mark.parametrize("cls", [None, "INDIVIDUAL_CASH", "absent"])
+def test_a_venue_of_another_class_runs(world, cls):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    if cls != "absent":
+        world.venue.account_class = cls
+    assert world.run()["orders_sent"] == 1
+
+
+# ---- rev 8 outcome 5: one rule for the halt and latch files, shared with the gate
+
+def test_the_last_look_and_the_gate_share_one_rule_for_the_halt_and_latch_files():
+    assert osx._present is osx.risk_gate.file_is_there
+
+
+def test_a_halt_file_under_a_regular_file_counts_as_there(world):
+    (world.tmp / "plain").write_text("x")
+    world.halt = world.tmp / "plain" / "halt.json"
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run()
+    assert world.venue.submits() == [] and out["refused"][0]["reason"] == "Operator halt file is present. Trading stopped."

@@ -10,17 +10,34 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 from valedia_trader.research_loop import REPO
 
-__all__ = ["DEFAULT_LIMITS", "OPTIONAL_LIMITS", "RiskConfigError", "load_limits", "write_default_limits", "check_order", "HALT_FILE"]
+__all__ = ["DEFAULT_LIMITS", "OPTIONAL_LIMITS", "RiskConfigError", "load_limits", "write_default_limits", "check_order", "HALT_FILE",
+           "file_is_there"]
 
 # The guide's example numbers. They are placeholders, not advice: set your own in config/risk.json.
 DEFAULT_LIMITS = {"max_daily_loss_pct": 2.0, "max_drawdown_pct": 8.0, "max_position_pct": 0.10, "max_open_positions": 5}
 # Keys the file may also carry. check_order does not read them: max_orders_per_day caps the order step's sending.
 OPTIONAL_LIMITS = ("max_orders_per_day",)
 HALT_FILE = REPO / "state" / "halt.json"          # the legacy operator kill switch; its presence stops everything
+
+
+def file_is_there(path) -> bool:
+    """Whether a halt or latch file is there: anything but a clean "no such file" counts as there, so a symlink (also
+    one to nothing or to itself), a path under a regular file, a path with a NUL byte and a path whose check raises
+    are all there. None means no such file is watched."""
+    if path is None:
+        return False
+    try:
+        os.lstat(path)                                   # not followed: a link of any kind is there
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return True
 
 
 class RiskConfigError(RuntimeError):
@@ -69,7 +86,7 @@ def check_order(order: dict, account: dict, limits: dict | None = None, limits_f
     account  {"equity", "daily_loss_pct", "drawdown_pct", "open_positions"}
     """
     try:
-        if halt_file is not None and Path(halt_file).exists():
+        if halt_file is not None and file_is_there(halt_file):
             return False, "Operator halt file is present. Trading stopped."
         if limits is None:
             limits = load_limits(limits_file) if limits_file is not None else None
@@ -81,7 +98,7 @@ def check_order(order: dict, account: dict, limits: dict | None = None, limits_f
             return False, "Order or account numbers are not usable. Order blocked."
         if order.get("reduces_risk") is True:
             return True, "OK (reduces an open position)"
-        if latch_file is not None and Path(latch_file).exists():
+        if latch_file is not None and file_is_there(latch_file):
             return False, "Max drawdown was hit earlier and the latch has not been reset. Trading stopped."
         if daily >= limits["max_daily_loss_pct"]:
             return False, "Daily loss limit hit. Trading stopped."

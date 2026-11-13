@@ -76,9 +76,9 @@ def check_risk_limits(paths: LoopPaths) -> tuple[str, str]:
 
 def check_kill_switch(paths: LoopPaths) -> tuple[str, str]:
     latch, halt = paths.journal / "kill_switch.json", risk_gate.HALT_FILE
-    if halt.exists():
+    if risk_gate.file_is_there(halt):
         return ATTENTION, f"operator halt file present ({halt}); all trading is stopped"
-    if latch.exists():
+    if risk_gate.file_is_there(latch):
         return ATTENTION, "drawdown latch is set; new risk is blocked until `reset-kill-switch --who NAME`"
     blocked, _ = risk_gate.check_order({"symbol": "X", "side": "buy", "value": 1.0, "reduces_risk": False, "position_value_after": 1.0},
                                        {"equity": 100.0, "daily_loss_pct": 0.0, "drawdown_pct": 0.0, "open_positions": 0}, None)

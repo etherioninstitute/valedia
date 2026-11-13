@@ -2,6 +2,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from valedia_trader import doctor as D
 from valedia_trader.research_loop import LoopPaths, risk_gate
@@ -80,3 +81,36 @@ def test_schedule_check_names_each_job_and_fails_on_a_bad_exit(monkeypatch, tmp_
     assert status == D.FAIL
     status, _ = launchd("-\t0\tcom.example.research-loop.weekly.other\n")
     assert status == D.ATTENTION
+
+
+# ---- T13 rev 8: the halt and latch looks are the risk gate's own rule
+
+def _odd(base, how):
+    import os
+    p = base / f"odd-{how}"
+    if how == "dangling link":
+        os.symlink(base / "nowhere", p)
+    elif how == "link loop":
+        os.symlink(p, p)
+    elif how == "under a regular file":
+        (base / "plain").write_text("x")
+        return base / "plain" / "halt.json"
+    return p
+
+
+@pytest.mark.parametrize("how", ["dangling link", "link loop", "under a regular file"])
+def test_a_halt_or_latch_file_that_is_not_plainly_absent_is_seen(tmp_path, monkeypatch, how):
+    p = _paths(tmp_path / "root")
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_drawdown_pct": 6.0}))
+    (tmp_path / "h").mkdir()
+    monkeypatch.setattr(risk_gate, "HALT_FILE", _odd(tmp_path / "h", how))
+    status, detail = D.check_kill_switch(p)
+    assert status == D.ATTENTION and "halt" in detail
+    monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
+    latch = p.journal / "kill_switch.json"
+    if how == "under a regular file":
+        return                                            # the latch's path is fixed inside the journal folder
+    import os
+    os.symlink(p.journal / "nowhere" if how == "dangling link" else latch, latch)
+    status, detail = D.check_kill_switch(p)
+    assert status == D.ATTENTION and "latch is set" in detail

@@ -1,3 +1,4 @@
+import argparse
 import json
 import sqlite3
 
@@ -287,6 +288,47 @@ def test_order_step_lets_every_error_but_webull_secrets_and_os_errors_through(or
     with pytest.raises(error):
         cli.main(["--root", str(root), "order-step"])
     assert "refused:" not in capsys.readouterr().err
+
+
+# ---- T13 rev 8 (cli): an Events venue is refused before the paper trader, the ledger or any file
+
+def _tree(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+@pytest.mark.parametrize("how", ["name", "class", "getattr"])
+def test_order_step_refuses_an_events_venue_with_one_plain_line_and_creates_nothing(order_step_project, monkeypatch, capsys,
+                                                                                    how):
+    root, venue = order_step_project
+    if how == "name":
+        venue.name = "webull-sandbox-events"
+    elif how == "class":
+        venue.account_class = "EVENTS_CASH"
+    else:
+        monkeypatch.setattr(type(venue), "__getattr__", lambda self, n: "EVENTS_CASH" if n == "account_class" else
+                            (_ for _ in ()).throw(AttributeError(n)), raising=False)
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert captured.out == "" and len(lines) == 1 and lines[0].startswith("refused:") and "Events" in lines[0]
+    assert _tree(root) == before and venue.calls == []
+
+
+def test_order_step_command_given_an_events_venue_creates_no_ledger(tmp_path, capsys):
+    venue = _Venue()
+    venue.name = "webull-sandbox-events"
+    paths = cli.LoopPaths(tmp_path)
+    before = _tree(tmp_path)
+    assert cli.order_step_command(argparse.Namespace(capital=None, fractional=False), paths, venue=venue) == 2
+    assert _tree(tmp_path) == before and capsys.readouterr().err.startswith("refused:")
+
+
+def test_order_step_reads_a_property_account_class_only_where_the_step_does(order_step_project, monkeypatch, capsys):
+    root, venue = order_step_project
+    reads = []
+    monkeypatch.setattr(type(venue), "account_class", property(lambda self: reads.append(1) or "INDIVIDUAL_CASH"), raising=False)
+    assert cli.main(["--root", str(root), "order-step"]) == 0 and reads == [1]       # once, by the step, in the session
 
 
 def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):
