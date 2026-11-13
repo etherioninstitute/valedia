@@ -212,6 +212,13 @@ book at 0.70 bid, 0.71 ask):
   real fee schedule for event contracts has not been read.
 - The Events account's balance answer has buying power and market value but no cash line.
 
+The same through the trader's own code (11:17 New York, `python -m valedia_trader.execution_and_risk.event_practice`,
+the order ledger of the Events account): a resting buy of one contract at 0.05 was accepted and, on the next
+run, cancelled; a buy with a limit of 0.46 filled at 0.45 and a sale with a limit of 0.43 filled at 0.44, each
+journaled once with a fee of 0.01 dollars; a further run journaled nothing and sent nothing. One contract of
+another game, bought by hand earlier, is in that ledger's starting position and is held to its result to see
+what settlement looks like.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,
