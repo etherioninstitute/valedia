@@ -1331,6 +1331,9 @@ class WebullVenue:
         # other venue keeps the name it had before event contracts were built.
         self._events = account_class == EVENTS_CLASS
         self._sent_events: dict[str, str] = {}            # client order id -> the event name this object sent under it
+        self._sent_sides: dict[str, str] = {}             # client order id -> BUY or SELL, as this object sent it
+        self._named_events: dict[str, str] = {}           # client order id -> the event name a caller gave (expected=)
+        self._named_sides: dict[str, str] = {}            # client order id -> the side a caller gave (expected_side=)
         suffix = "-events" if self._events else ""
         self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}{suffix}"
         self._confirmation_file = Path(confirmation_file)
@@ -1684,6 +1687,36 @@ class WebullVenue:
             raise WebullError(f"Webull's {where} has an event row whose outcome is not exactly yes or no")
         return f"{ticker}:{'yes' if outcome == 'yes' else 'no'}"
 
+    def _untyped_row_name(self, row: dict, kind: Any) -> str:
+        """The name of an open-order row of an Events venue that has no recognised instrument type: TICKER:outcome when
+        its symbol passes the ticker gate and its outcome is exactly yes or no; else the trader's naming of its symbol
+        as for any row; else, when only the ticker gate passes (a symbol longer than a stock's), the ticker. Otherwise
+        WebullError as for any row whose symbol is missing or not clean."""
+        ticker = _clean(row.get("symbol"), _EVENT_TICKER, self._secrets(), self._final)
+        outcome = row.get("event_outcome")
+        if ticker is not None and type(outcome) is str and outcome in EVENT_OUTCOMES:
+            return f"{ticker}:{'yes' if outcome == 'yes' else 'no'}"
+        try:
+            return _trader_symbol(self._symbol(row.get("symbol"), "open-order list"), kind)
+        except WebullError:
+            if ticker is None:
+                raise
+            return ticker
+
+    def _known_open_row_disagrees(self, cid: str, name: str, side: Any) -> str | None:
+        """Why an open-order row that carries the client order id of an order this venue knows disagrees with what was
+        sent (another name, or another side when the side sent is known), else None. Such a row is never read under
+        another name: open_orders raises it."""
+        known = self._known_name(cid)
+        if known is not None and name != known:
+            return ("Webull's open-order list names another ticker or outcome than was sent for an order this venue knows; "
+                    "it is not read under another name")
+        known_side = self._known_side(cid)
+        if known_side is not None and not (type(side) is str and side == known_side):
+            return ("Webull's open-order list gives another side than was sent for an order this venue knows; "
+                    "it is not read under another side")
+        return None
+
     def _read_event_positions(self) -> tuple[dict[tuple[str, str], float | None], list[dict], set]:
         """({(EVENT, event name): contracts or None}, [the other rows], {duplicated holdings}) from one position read
         of an Events venue. Only a row whose instrument_type is exactly EVENT is a holding; its quantity is read as for
@@ -1719,20 +1752,27 @@ class WebullVenue:
         return _decimal(qty) if qty is not None else Decimal(0)
 
     def _reserved_by_open_event_sells(self, name: str) -> Decimal:
-        """The unfilled remainder of every open sale of exactly this ticker and outcome (total minus filled, or the
-        total when the filled quantity is unreadable or above it). Open purchases and other names do not count.
-        WebullError, so the sale is not sent, when an open order of this ticker carries no recognised instrument type
-        or an open order of this name has an unreadable quantity or side."""
+        """The unfilled remainder (total minus filled, or the total when the filled quantity is unreadable or above it)
+        of every open sale that may be a sale of `name`: an EVENT row tied to an order this venue knows (it sent it, or
+        a caller named it) counts under its own name only, and open_orders has already checked that name (and the
+        side, when known) against what was sent; an EVENT row that cannot be tied to a known order counts when it is of
+        this ticker under EITHER outcome (the cautious count: a mislabelled or unknown open sale can only block a sale).
+        Open purchases and other tickers do not count. WebullError, so the sale is not sent, when an open order of this
+        ticker carries no recognised instrument type, or an open order that counts has an unreadable quantity or side."""
         ticker = name.partition(":")[0]
         reserved = Decimal(0)
         for o in self.open_orders():
-            given = o["instrument_type"]
+            given, sym = o["instrument_type"], o["symbol"]
+            of_ticker = type(sym) is str and sym.partition(":")[0] == ticker
             if type(given) is not str or given not in ORDER_INSTRUMENT_TYPES:
-                if o["symbol"] in (name, ticker):
+                if of_ticker:
                     raise WebullError(f"an open order for {ticker} carries no recognised instrument type; cannot tell what is already being sold")
                 continue
-            if given != EVENT_INSTRUMENT or o["symbol"] != name:
+            if given != EVENT_INSTRUMENT or not of_ticker:
                 continue
+            cid = o["client_order_id"]
+            if sym != name and cid is not None and self._known_name(cid) is not None:
+                continue                                                  # a known order of the other outcome, as sent
             if o["units"] is None:
                 raise WebullError(f"an open order for {name} has an unreadable quantity or side; cannot tell what is already being sold")
             if o["units"] >= 0:
@@ -1780,9 +1820,38 @@ class WebullVenue:
                 raise WebullError("the name expected for this order is not the name this venue sent under its client order id")
             return expected
         if sent is None:
+            sent = self._named_events.get(cid)
+        if sent is None:
             raise WebullError("this venue did not send the order under this tag, so it cannot check the ticker and outcome read "
                               "back against what was sent; pass the name that was sent (expected=)")
         return sent
+
+    def _known_name(self, cid: str) -> str | None:
+        """The event name this venue knows for the client order id: the one it sent, else the one a caller gave."""
+        return self._sent_events.get(cid) or self._named_events.get(cid)
+
+    def _known_side(self, cid: str) -> str | None:
+        """BUY or SELL as this venue sent the order under the client order id, else as a caller gave it; else None."""
+        return self._sent_sides.get(cid) or self._named_sides.get(cid)
+
+    def _name_order(self, cid: str, name: Any, side: Any = None) -> None:
+        """Remember what a caller says was sent under a client order id (the event name; the side when given), so that
+        order_status and open_orders check what Webull reads back against it. WebullError when the name is not an event
+        name, the side is not exactly BUY or SELL, or either differs from what this venue sent or was given before."""
+        if parse_event_name(name) is None:
+            raise WebullError("the name given for an order is not an event name (TICKER:yes or TICKER:no)")
+        if side is not None and not (type(side) is str and side in ("BUY", "SELL")):
+            raise WebullError("the side given for an order is not exactly BUY or SELL")
+        known = self._known_name(cid)
+        if known is not None and known != name:
+            raise WebullError("the name given for this order is not the name this venue sent or was given under its client order id")
+        known_side = self._known_side(cid)
+        if side is not None and known_side is not None and known_side != side:
+            raise WebullError("the side given for this order is not the side this venue sent or was given under its client order id")
+        if cid not in self._sent_events:
+            self._named_events[cid] = name
+        if side is not None and cid not in self._sent_sides:
+            self._named_sides[cid] = side
 
     # ---- orders
     def _guard_live(self, value: float | None) -> None:
@@ -1892,6 +1961,7 @@ class WebullVenue:
         except Exception as exc:
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
         self._sent_events[order["client_order_id"]] = symbol
+        self._sent_sides[order["client_order_id"]] = order["side"]
         return self._place(account, order, secrets, expected=symbol)
 
     def _event_environment(self) -> None:
@@ -2077,27 +2147,36 @@ class WebullVenue:
         not stop the others: each entry is {client_order_id, venue_order_id, symbol, status} with status one of
         cancel's words ("cancel requested", "not yet", "already finished", "no such order") or "error", with the gated
         error under "error". Cancelling only reduces exposure, so it is allowed in production without the written
-        live confirmation. If open_orders() itself fails, this raises and nothing is cancelled. Webull cancels only
-        orders placed through the API (docs common-order-cancel)."""
+        live confirmation. If open_orders() itself fails, this raises and nothing is cancelled, except that in an
+        Events venue a row of a known order whose name or side disagrees with what was sent is cancelled like the
+        others, and WebullError naming those rows (by client order id, with each one's cancel status) is raised only
+        after every cancel was attempted. Webull cancels only orders placed through the API (docs common-order-cancel)."""
         account = self.account_id
         out = []
-        for o in self.open_orders():
+        disagreeing: list[str] = []
+        for o in self._open_orders(None, disagreeing):
             entry = {"client_order_id": o["client_order_id"], "venue_order_id": o["venue_order_id"], "symbol": o["symbol"]}
             if not o["client_order_id"]:
                 out.append({**entry, "status": "error", "error": "no plain client order id; Webull cancels only orders placed through the API"})
                 continue
             status, error = self._cancel_one(account, o["client_order_id"])
             out.append({**entry, "status": status, **({"error": error} if status == "error" else {})})
+        if disagreeing:                                                   # only in an Events venue; every cancel was tried
+            done = {e["client_order_id"]: e["status"] for e in out}
+            raise WebullError("every open order was asked to cancel, but open orders of this venue disagree with what was sent "
+                              "(name or side): " + "; ".join(f"{cid} ({done.get(cid, 'not cancelled')})" for cid in disagreeing))
         return out
 
     # ---- what happened to orders (reading: allowed in both environments)
     @_public
-    def order_status(self, tag: str, expected: str | None = None) -> dict | None:
+    def order_status(self, tag: str, expected: str | None = None, expected_side: str | None = None) -> dict | None:
         """In an Events venue, `expected` is the event name the order was sent under (else the name this venue object
-        sent under the tag is used; with neither, WebullError before any call). The row read back must be of type
-        EVENT and carry exactly that ticker and outcome; another ticker or outcome raises WebullError: it is never read
-        as a fill. There `fee` is the one fee entry's (see _event_fee: None until something has filled), and the answer
-        also carries `symbol` (the event name) and `fee_type`. In any other venue `expected` plays no part.
+        sent or was given under the tag is used; with neither, WebullError before any call), and `expected_side` (BUY or
+        SELL) the side it was sent as, when the caller knows it; both are remembered for open_orders. The row read back
+        must be of type EVENT and carry exactly that ticker and outcome, and a side of exactly BUY or SELL that is the
+        side sent (this venue's own, else `expected_side`, when either is known); another ticker, outcome or side
+        raises WebullError: it is never read as a fill. There `fee` is the one fee entry's (see _event_fee: None until something has filled), and the answer
+        also carries `symbol` (the event name) and `fee_type`. In any other venue `expected` and `expected_side` play no part.
 
         What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
         raw_status}, or None only when the venue was built with confirmed_not_found=True and Webull gives one of the
@@ -2126,7 +2205,9 @@ class WebullVenue:
         cid = client_order_id(tag)
         if not self._events:
             return self._read_order(cid, self._confirmed_not_found)
-        return self._read_order(cid, self._confirmed_not_found, expected=self._expected_name(cid, expected))
+        name = self._expected_name(cid, expected)
+        self._name_order(cid, name, expected_side)
+        return self._read_order(cid, self._confirmed_not_found, expected=name)
 
     def _read_order(self, cid: str, recognise_not_found: bool, expected: str | None = None) -> dict | None:
         if self._events and parse_event_name(expected) is None:
@@ -2176,6 +2257,10 @@ class WebullVenue:
         if self._event_row_name(item, "order detail") != expected:
             raise WebullError("Webull's order detail for this client order id names another ticker or outcome than was sent; "
                               "it is not read as a fill")
+        side, sent_side = item.get("side"), self._known_side(cid)
+        if not (type(side) is str and side in ("BUY", "SELL")) or (sent_side is not None and side != sent_side):
+            raise WebullError("Webull's order detail for this client order id gives another side than was sent (or none that is "
+                              "exactly BUY or SELL); it is not read as a fill")
         out["fee"], out["fee_type"] = self._event_fee(item, out["filled_units"], secrets)
         out["symbol"] = expected
         return out
@@ -2188,16 +2273,36 @@ class WebullVenue:
                           "confirmed, so the outcome stays unknown (see confirmed_not_found)")
 
     @_public
-    def open_orders(self) -> list[dict]:
+    def open_orders(self, expected: dict | None = None) -> list[dict]:
         """Every open order of the account, following pagination_key to the last page (docs order-open: an absent
         key marks the last page). Each is {client_order_id and venue_order_id (plain ids, else None), symbol (the
         trader's naming; in an Events venue an EVENT row is named TICKER:outcome, see _event_row_name), instrument_type (as given if a short word, None when absent, else WITHHELD), units (signed:
         sells and shorts negative; None if unreadable or the side is not BUY, SELL or SHORT), state, filled_units,
         raw_status (the code shape, else WITHHELD)}. A malformed page (an entry that is not an object, a bare empty
         list, an order whose symbol is missing or not a clean symbol) or a pagination key that is not a non-empty
-        string raises WebullError."""
+        string raises WebullError.
+
+        In an Events venue only: `expected` maps tags to the event names their orders were sent under (as order_status
+        takes them; remembered like those). A row whose client order id this venue knows (it sent the order, or a
+        caller named it here or in order_status) must carry that name, and the side sent when known; anything else
+        raises WebullError, never a row under another name. A row with no recognised instrument type is named
+        TICKER:outcome when its symbol has the ticker shape and it carries an outcome of exactly yes or no, else by its
+        symbol as other rows are (a symbol too long for that, in the ticker shape, is kept as the ticker); its
+        instrument_type stays as given. In any other venue `expected` plays no part."""
+        return self._open_orders(expected)
+
+    def _open_orders(self, expected: dict | None = None, disagreeing: list[str] | None = None) -> list[dict]:
+        """open_orders; with `disagreeing` a list, a known row that disagrees with what was sent is listed there by
+        client order id (and kept in the answer) instead of raised, for cancel_all_open."""
         account = self.account_id
         secrets = self._secrets()
+        if self._events and expected is not None:
+            if not isinstance(expected, dict):
+                raise WebullError("the names expected for open orders are not a mapping of tags to event names")
+            for tag, name in expected.items():
+                if not isinstance(tag, str):
+                    raise WebullError("a tag expected among open orders is not a string")
+                self._name_order(client_order_id(tag), name)
         out: list[dict] = []
         key, seen, pages = None, set(), 0
         while True:
@@ -2211,10 +2316,18 @@ class WebullVenue:
                 kind = item.get("instrument_type")
                 if self._events and type(kind) is str and kind == EVENT_INSTRUMENT:      # an Events venue names the outcome
                     sym = self._event_row_name(item, "open-order list")
+                elif self._events and not (type(kind) is str and kind in ORDER_INSTRUMENT_TYPES):
+                    sym = self._untyped_row_name(item, kind)
                 else:
                     sym = _trader_symbol(self._symbol(item.get("symbol"), "open-order list"), kind)
+                cid = _plain_id(item.get("client_order_id"), secrets, self._final)
+                why = self._known_open_row_disagrees(cid, sym, item.get("side")) if self._events and cid is not None else None
+                if why is not None:
+                    if disagreeing is None:
+                        raise WebullError(why)
+                    disagreeing.append(cid)
                 qty, sign = _number(item.get("total_quantity")), _side_sign(item.get("side"))
-                out.append({"client_order_id": _plain_id(item.get("client_order_id"), secrets, self._final),
+                out.append({"client_order_id": cid,
                             "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
                             "symbol": sym, "instrument_type": _kind_word(kind, secrets, self._final),
                             "units": None if qty is None or sign is None else sign * abs(qty), "state": _state(item.get("status")),

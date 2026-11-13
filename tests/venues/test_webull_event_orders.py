@@ -235,7 +235,7 @@ def test_generated_orders_keep_their_outcome_and_side(tmp_path):
             filled = rng.randint(0, total - 1)
             open_rows.append(event_row(f"open-{j}", ticker=t, outcome=o, side=side, total=str(total), filled=str(filled)))
             if side == "SELL":
-                reserved[(t, o)] = reserved.get((t, o), 0) + total - filled
+                reserved.update({(t, x): reserved.get((t, x), 0) + total - filled for x in ("yes", "no")})
         t, o = rng.choice(tickers), rng.choice(["yes", "no"])
         contracts = rng.randint(1, 4)
         units = contracts if rng.random() < 0.4 else -contracts
@@ -588,7 +588,7 @@ def test_generated_sales_follow_my_own_count(tmp_path):
             filled = None if filled is None else min(filled, total)
             opens.append(event_row(f"o{j}", ticker=ot, outcome=oo, side=side, total=str(total),
                                    filled="x" if filled is None else str(filled)))
-            if side == "SELL" and (ot, oo) == (t, o):
+            if side == "SELL" and ot == t:
                 reserved += total if filled is None else total - filled
         contracts = rng.randint(1, 4)
         c = Client(positions=rows, open_rows=opens)
@@ -769,3 +769,192 @@ def test_a_ticker_outcome_or_fee_type_holding_a_secret_never_gets_out(tmp_path):
     with pytest.raises(wb.WebullError) as exc:
         v.order_status("t", expected=f"{secret_ticker}:yes")
     assert "APP-KEY" not in str(exc.value)
+
+
+# ---- rev 2: open orders checked against what was sent, the side read back, untyped rows with long tickers
+
+def test_rev2_our_open_sale_read_back_with_the_other_outcome_never_frees_a_sale(tmp_path):
+    """The case seen in the blind check: our open sale of 1 KXQ-1:yes read back as "no", 2 held; a second sale of 2
+    must not go, whether this venue sent the first sale (an error) or not (the cautious count)."""
+    rows = [position_row("KXQ-1", "yes", "2")]
+    c = Client(positions=rows)
+    v, _ = ev(tmp_path, c)
+    v.submit("KXQ-1:yes", -1, "first", limit_price=0.5)
+    c.open_rows = [event_row(wb.client_order_id("first"), ticker="KXQ-1", outcome="no", side="SELL")]
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("KXQ-1:yes", -2, "second", limit_price=0.5)
+    with pytest.raises(wb.WebullError):
+        v.open_orders()
+    assert len(c.placed()) == 1
+    fresh_client = Client(positions=rows, open_rows=list(c.open_rows))
+    fresh, _ = ev(tmp_path, fresh_client)
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        fresh.submit("KXQ-1:yes", -2, "second", limit_price=0.5)
+    fresh.submit("KXQ-1:yes", -1, "third", limit_price=0.5)              # 2 held, 1 in a sale of either outcome
+    assert len(fresh_client.placed()) == 1
+
+
+def test_rev2_open_orders_check_the_rows_a_caller_names(tmp_path):
+    cid = wb.client_order_id("mine")
+    row = event_row(cid, ticker="KXQ-1", outcome="no", side="SELL")
+    v, _ = ev(tmp_path, Client(open_rows=[row]))
+    assert v.open_orders()[0]["symbol"] == "KXQ-1:no"                   # not known: read as given
+    v, _ = ev(tmp_path, Client(open_rows=[row]))
+    with pytest.raises(wb.WebullError):
+        v.open_orders(expected={"mine": "KXQ-1:yes"})
+    v, _ = ev(tmp_path, Client(open_rows=[row]))
+    assert v.open_orders(expected={"mine": "KXQ-1:no"})[0]["symbol"] == "KXQ-1:no"
+    for bad in ({"mine": "kxq:yes"}, {"mine": 7}, ["mine"]):
+        with pytest.raises(wb.WebullError):
+            ev(tmp_path, Client(open_rows=[row]))[0].open_orders(expected=bad)
+    detail = {"client_order_id": cid, "orders": [event_row(cid, ticker="KXQ-1", outcome="yes", side="SELL")]}
+    v, c = ev(tmp_path, Client(open_rows=[row], details={cid: detail}, positions=[position_row("KXQ-1", "yes", "5")]))
+    v.order_status("mine", expected="KXQ-1:yes")                         # the caller's name, as order_status takes it
+    with pytest.raises(wb.WebullError):
+        v.open_orders()
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("KXQ-1:yes", -1, "next", limit_price=0.5)
+    assert c.placed() == []
+
+
+def test_rev2_generated_open_sales_never_free_a_sale(tmp_path):
+    """700 seeded accounts: some open orders this venue knows (sent by it, or named by its caller through order_status or
+    open_orders), some it does not, some read back with another ticker, outcome or side. By my own count: a known row
+    read back differently is an error; a known row is reserved under its own name only; an unknown open sale of the
+    ticker is reserved under both outcomes. The sale is sent exactly when nothing is in error and it fits."""
+    rng = random.Random(2611)
+    tickers = ["KXQ-1", "KXQ-2"]
+    sent = refused = errors = 0
+    for i in range(700):
+        c = Client(positions=[position_row(t, o, "50") for t in tickers for o in ("yes", "no")])
+        v, _ = ev(tmp_path, c)
+        known = []
+        for j in range(rng.randint(0, 3)):
+            t, o, side = rng.choice(tickers), rng.choice(["yes", "no"]), rng.choice(["BUY", "SELL"])
+            tag, how = f"k{i}-{j}", rng.choice(["submit", "status", "status-side", "expected"])
+            cid = wb.client_order_id(tag)
+            if how == "submit":
+                v.submit(f"{t}:{o}", 1 if side == "BUY" else -1, tag, limit_price=0.5)
+                kside = side
+            elif how.startswith("status"):
+                c.details[cid] = {"client_order_id": cid, "orders": [event_row(cid, ticker=t, outcome=o, side=side)]}
+                kside = side if how == "status-side" else None
+                v.order_status(tag, expected=f"{t}:{o}", **({"expected_side": side} if kside else {}))
+            else:
+                v.open_orders(expected={tag: f"{t}:{o}"})
+                kside = None
+            known.append((cid, t, o, side, kside))
+        T, O = rng.choice(tickers), rng.choice(["yes", "no"])
+        rows, reserved, error = [], 0, False
+        for cid, t, o, side, kside in known:
+            rt, ro, rs = t, o, side
+            r = rng.random()
+            if r < 0.2:
+                ro = "no" if o == "yes" else "yes"
+            elif r < 0.3:
+                rt = tickers[1] if t == tickers[0] else tickers[0]
+            elif r < 0.4:
+                rs = "SELL" if side == "BUY" else "BUY"
+            total = rng.randint(1, 3)
+            filled = rng.randint(0, total - 1)
+            rows.append(event_row(cid, ticker=rt, outcome=ro, side=rs, total=str(total), filled=str(filled)))
+            if (rt, ro) != (t, o) or (kside is not None and rs != kside):
+                error = True
+            elif rs == "SELL" and (t, o) == (T, O):
+                reserved += total - filled
+        for j in range(rng.randint(0, 3)):
+            t, o, side = rng.choice(tickers), rng.choice(["yes", "no"]), rng.choice(["BUY", "SELL"])
+            total = rng.randint(1, 3)
+            filled = rng.randint(0, total - 1)
+            rows.append(event_row(f"u{i}-{j}", ticker=t, outcome=o, side=side, total=str(total), filled=str(filled)))
+            if t == T and side == "SELL":
+                reserved += total - filled                                # either outcome: the cautious count
+        held = rng.randint(0, 6)
+        c.positions_rows = [position_row(T, O, str(held))]
+        c.open_rows = rows
+        contracts = rng.randint(1, 4)
+        before = len(c.placed())
+        if not error and contracts <= held - reserved:
+            v.submit(f"{T}:{O}", -contracts, f"s{i}", limit_price=0.5)
+            p = c.placed()[-1][2][0]
+            assert len(c.placed()) == before + 1 and (p["symbol"], p["event_outcome"], p["side"]) == (T, O, "SELL")
+            sent += 1
+        else:
+            with pytest.raises(wb.NotTransmitted):
+                v.submit(f"{T}:{O}", -contracts, f"s{i}", limit_price=0.5)
+            assert len(c.placed()) == before
+            refused += 1
+            errors += error
+    assert sent > 100 and refused > 100 and errors > 50
+
+
+def test_rev2_a_side_read_back_that_differs_from_the_side_sent_is_an_error(tmp_path):
+    cid = wb.client_order_id("t")
+    for units, back in ((1, "SELL"), (-1, "BUY"), (1, "SHORT"), (1, None), (1, "buy"), (-1, "SELL ")):
+        row = event_row(cid, side=back, status="FILLED", filled="1", price="0.50")
+        c = Client(positions=[position_row(quantity="3")], details={cid: {"client_order_id": cid, "orders": [row]}})
+        v, _ = ev(tmp_path, c)
+        v.submit(f"{TICKER}:yes", units, "t", limit_price=0.5)
+        with pytest.raises(wb.WebullError, match="side"):
+            v.order_status("t")
+    sold = event_row(cid, side="SELL", status="FILLED", filled="1", price="0.50")
+    for side, ok in (("SELL", True), (None, True), ("BUY", False), ("sell", False)):
+        v, _ = ev(tmp_path, Client(details={cid: {"client_order_id": cid, "orders": [sold]}}))
+        kw = {} if side is None else {"expected_side": side}
+        if ok:
+            assert v.order_status("t", expected=f"{TICKER}:yes", **kw)["filled_units"] == 1.0
+        else:
+            with pytest.raises(wb.WebullError):
+                v.order_status("t", expected=f"{TICKER}:yes", **kw)
+    v, c = ev(tmp_path, Client(positions=[position_row(quantity="3")]))
+    v.submit(f"{TICKER}:yes", 1, "bought", limit_price=0.5)
+    c.open_rows = [event_row(wb.client_order_id("bought"), side="SELL")]
+    with pytest.raises(wb.WebullError, match="side"):
+        v.open_orders()
+
+
+def test_rev2_an_untyped_open_row_with_a_long_ticker_is_read_in_an_events_venue(tmp_path):
+    long = TICKER                                                          # 27 characters
+    row = event_row("u1", ticker=long, outcome="no", side="SELL")
+    row.pop("instrument_type")
+    v, c = ev(tmp_path, Client(open_rows=[row], positions=[position_row(long, "yes", "1")]))
+    got = v.open_orders()
+    assert (got[0]["symbol"], got[0]["instrument_type"], got[0]["units"]) == (f"{long}:no", None, -1.0)
+    with pytest.raises(wb.NotTransmitted, match="no recognised instrument type"):   # an untyped row of the ticker blocks
+        v.submit(f"{long}:yes", -1, "s", limit_price=0.5)
+    for kind in (None, "event", "WHAT"):
+        bare = {k: x for k, x in row.items() if k != "event_outcome"}
+        if kind is not None:
+            bare["instrument_type"] = kind
+        v, c = ev(tmp_path, Client(open_rows=[bare], positions=[position_row(long, "yes", "1")]))
+        got = v.open_orders()
+        assert (got[0]["symbol"], got[0]["instrument_type"]) == (long, kind)
+        with pytest.raises(wb.NotTransmitted):                            # what it is cannot be told: no sale of it
+            v.submit(f"{long}:yes", -1, "s", limit_price=0.5)
+        assert c.placed() == []
+    v, c = ev(tmp_path, Client(open_rows=[{**row, "symbol": "kx-lower-case-ticker-long-name"}]))
+    with pytest.raises(wb.WebullError):
+        v.open_orders()
+    cash, _ = ev(tmp_path, Client(accounts=[{"account_id": "ACC-1", "account_class": "INDIVIDUAL_CASH"}], open_rows=[row]),
+                 cls="INDIVIDUAL_CASH")
+    with pytest.raises(wb.WebullError, match="not a clean symbol"):
+        cash.open_orders()                                                 # any other venue: as before
+
+
+def test_rev2_a_mismatched_open_row_does_not_stop_the_cancels(tmp_path):
+    """Cancelling only reduces exposure: every open row is cancelled by its client order id, also rows whose name or
+    side disagrees with what was sent; the disagreement is raised only after every cancel was attempted."""
+    v, c = ev(tmp_path, Client())
+    v.submit("KXQ-1:yes", 1, "a", limit_price=0.5)
+    v.submit("KXQ-1:yes", 1, "b", limit_price=0.5)
+    a, b = wb.client_order_id("a"), wb.client_order_id("b")
+    c.open_rows = [event_row(a, ticker="KXQ-1", outcome="no"), event_row(b, ticker="KXQ-1", side="SELL"),
+                   event_row("u1", ticker="KXQ-1")]
+    with pytest.raises(wb.WebullError) as caught:
+        v.cancel_all_open()
+    assert [x[2] for x in c.calls if x[0] == "cancel"] == [a, b, "u1"]
+    assert a in str(caught.value) and b in str(caught.value) and "u1" not in str(caught.value)
+    with pytest.raises(wb.WebullError):
+        v.open_orders()                                                    # the list itself still refuses the rows
+    c.open_rows = [event_row(a, ticker="KXQ-1"), event_row("u1", ticker="KXQ-1")]
+    assert [x["status"] for x in v.cancel_all_open()] == ["cancel requested", "cancel requested"]

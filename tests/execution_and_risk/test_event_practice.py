@@ -431,3 +431,29 @@ def test_nothing_secret_reaches_the_journal_or_the_summary(tmp_path):
     out = buy(w)
     text = json.dumps(out) + json.dumps(w.entries())
     assert KEY not in text and SECRET not in text and "x-app-key" not in text
+
+
+# ---- rev 2: a later run checks the side the ledger recorded
+
+def test_rev2_a_later_run_checks_the_side_the_ledger_recorded(tmp_path):
+    def later_venue():
+        return wb.WebullVenue(KEY, SECRET, environment="sandbox", client=w.exchange, account_class="EVENTS_CASH",
+                              limits=HIGH, sleep=lambda s: None, clock=lambda: 0.0,
+                              confirmation_file=tmp_path / "webull_live.json")
+    w = World(tmp_path)
+    w.quote(f"{T}:yes", 0.40, 0.71)
+    assert buy(w, limit="0.50")["status"] == "done"                      # rests: below the ask
+    cid = w.exchange.placed()[-1]["client_order_id"]
+    w.exchange.orders[cid]["side"] = "SELL"                               # read back as a sale (and fills as one)
+    w.quote(f"{T}:yes", 0.60, 0.71)
+    w.venue = later_venue()                                               # a later process: this object sent nothing
+    w.clock.t += 10
+    out = w.run(reconcile_only=True)
+    assert out["status"] != "done" and w.entries("fill") == [] and w.ledger.fills() == []
+    w.exchange.orders[cid].update(side="BUY", status="SUBMITTED", filled=0, price="0")
+    w.exchange.held.pop(f"{T}:yes", None)
+    w.quote(f"{T}:yes", 0.40, 0.45)                                       # now the purchase fills, as sent
+    w.venue = later_venue()
+    w.clock.t += 10
+    w.run(reconcile_only=True)
+    assert [(f["symbol"], f["units"]) for f in w.entries("fill")] == [(f"{T}:yes", 1.0)]

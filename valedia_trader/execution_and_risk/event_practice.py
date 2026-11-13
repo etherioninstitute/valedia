@@ -351,7 +351,10 @@ class _LedgerVenue:
         rec = self._ledger.order(tag)
         if rec is None or parse_event_name(rec.get("symbol")) is None:
             raise PracticeError("the ledger has no event name for this tag")
-        return self._venue.order_status(tag, expected=rec["symbol"])
+        units = _as_float(rec.get("units"))
+        if units is None or units == 0:
+            raise PracticeError("the ledger has no side for this tag")
+        return self._venue.order_status(tag, expected=rec["symbol"], expected_side="BUY" if units > 0 else "SELL")
 
     def positions(self):
         return self._venue.positions()
