@@ -85,3 +85,20 @@ roadmap wants (1.14) and a fair baseline for any sports forecaster, the pick lis
 - Whether a historical request with ten named books costs one region (as live requests do). The first call's
   usage header settles it; if it costs more, the book list is cut to keep the cap, Pinnacle kept.
 - Pinnacle's prices come from its public site and may lag.
+
+## Clarifications made on 2026-11-13, before any odds snapshot was bought or any price compared with a result
+
+Building the fetcher showed three places where the words above did not settle what to do. Each is fixed here,
+before any scoring, and none was chosen by looking at results.
+
+1. **Kalshi's price at the moment.** Kalshi writes no candle for a minute in which nothing changed. The price
+   used is the last candle that ends at or before the moment, within the hour before it; with no candle in that
+   hour the game is left out and counted.
+2. **Waves.** A wave starts at the earliest start not yet in a wave and takes every start within 90 minutes of
+   it, formed from all the league's games that day in the odds data, so each wave's snapshot falls 30 to 120
+   minutes before every start in it.
+3. **The day.** A league's day is the US-Eastern date of the game. A game that Kalshi lists under another date
+   is left out and counted.
+
+The choice made after the development period (margin and version of the books' probability) will be written
+under this section before any test-period snapshot is bought.
