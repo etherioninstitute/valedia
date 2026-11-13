@@ -23,7 +23,7 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 | 1.10 | Split of capital between passed strategies, tested out of sample (today: equal shares) | not started |
 | 1.11 | Costs by venue: Webull crypto spreads, Kalshi's fee formula, stock borrow fees, slippage by liquidity | not started |
 | 1.12 | Kronos, an open price-forecast model, as a tournament forecaster (from the owner's notes) | not started |
-| 1.13 | Kalshi weather markets against official forecast releases, tested on free history first (from the owner's notes) | not started |
+| 1.13 | Kalshi weather markets against official forecast releases, tested on free history first (from the owner's notes) | done 2026-11-13: tested on all 9,910 settled New York markets and failed. The market's price beats the public forecast; the trading rule lost 4.3 cents a contract in the test period (`docs/research/2026-11-13-kalshi-weather-result.md`). The history reader and evaluation stay for 1.3 and 1.14 |
 | 1.14 | Closing-line value as a fast skill measure for prediction-market forecasts (from the owner's notes) | not started |
 | 1.15 | Net the strategies' orders in one fund before placing them: in a 40-day replay about 45% of realised losses were deferred as wash sales, much of it one strategy trimming a fund the other holds or buys | not started |
 
