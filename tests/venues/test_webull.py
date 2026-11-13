@@ -43,8 +43,8 @@ class Response:
 class ServerException(Exception):
     """Shaped and named like the SDK's ServerException (webull/core/exception/exceptions.py:31-37); its text carries
     the key, as the SDK's own log lines do, so a test can see that it never reaches a message."""
-    def __init__(self, error_code, http_status=417, error_msg="business error"):
-        self.error_code, self.http_status, self.error_msg = error_code, http_status, error_msg
+    def __init__(self, error_code, error_msg, http_status, request_id=None):          # the SDK's argument order
+        self.error_code, self.error_msg, self.http_status, self.request_id = error_code, error_msg, http_status, request_id
 
     def __str__(self):
         return f"request headers: x-app-key={KEY} x-app-secret={SECRET}"
@@ -65,15 +65,21 @@ class FakeClient:
         self._accounts = ([{"account_id": "ACC-0001-1234", "account_type": "CASH", "account_class": account_class}] if accounts is None
                           else accounts)
         self._positions = positions or []
-        self._place_body = {"order_id": "o-1"} if place_body is None else place_body
+        self._place_body = place_body                 # None: the observed answer, {client_order_id, order_id} (see _placed_answer)
         self._details, self._cancel_fail = details or {}, set(cancel_fail)
         self._open_pages = {None: {"data": []}} if open_pages is None else open_pages
         self._balance = {"total_cash": "1000", "buying_power": "1000"} if balance is None else balance
         self.account_v2 = SimpleNamespace(get_account_list=lambda: self._log("accounts", Response(self._accounts)),
                                           get_account_balance=lambda a: self._log(("balance", a), self._answer(self._balance)),
                                           get_account_position=lambda a: self._log(("positions", a), Response(self._positions)))
-        self.order_v3 = SimpleNamespace(place_order=lambda a, orders: self._log(("place", a, orders), Response(self._place_body, self._order_status, "rejected: " + KEY)),
+        self.order_v3 = SimpleNamespace(place_order=lambda a, orders: self._log(("place", a, orders), Response(self._placed_answer(orders), self._order_status, "rejected: " + KEY)),
                                         cancel_order=self._cancel, get_order_detail=self._detail, list_order_open=self._open)
+
+    def _placed_answer(self, orders):
+        """What an accepted placement answers, as observed in the test environment: {client_order_id, order_id}."""
+        if self._place_body is not None:
+            return self._place_body
+        return {"client_order_id": orders[0]["client_order_id"], "order_id": "o-1"}
 
     def _log(self, what, res):
         self.calls.append(what)
@@ -88,7 +94,7 @@ class FakeClient:
     def _cancel(self, a, cid):
         self.calls.append(("cancel", a, cid))
         if cid in self._cancel_fail:
-            raise ServerError("ORDER_NOT_CANCELLABLE", 417, "the order can no longer be cancelled")
+            raise ServerError("ORDER_NOT_CANCELLABLE", "the order can no longer be cancelled", 417)
         return Response({"client_order_id": cid, "order_id": "v-" + cid[:4]})
 
     def _detail(self, a, cid):
@@ -289,7 +295,7 @@ def test_an_unlisted_status_is_unknown_never_filled_or_cancelled(tmp_path, raw):
     assert out["state"] == "unknown_status"
 
 
-NOT_FOUND_ANSWERS = [detail(), Response({"orders": []}), ServerError("ORDER_NOT_FOUND"),
+NOT_FOUND_ANSWERS = [detail(), Response({"orders": []}), ServerError("ORDER_NOT_FOUND", "business error", 417),
                      Response({"error_code": "ORDER_NOT_FOUND", "message": "order does not exist"}, 417)]
 MALFORMED_ANSWERS = [Response({"orders": ["junk"]}), Response([]), Response({"orders": [order("FILLED"), "junk"]}),
                      Response([detail(order("FILLED")), "junk"]), Response({"orders": None}), Response([[]])]
@@ -323,8 +329,8 @@ def test_the_not_found_flag_is_passed_through_from_secrets(tmp_path):
     assert v.order_status("t") is None
 
 
-@pytest.mark.parametrize("answer", [ConnectionError("no route to host " + KEY), ServerError("SYSTEM_ERROR", 500),
-                                    ServerError("UNAUTHORIZED", 401), ServerError("SDK.HttpError", None),
+@pytest.mark.parametrize("answer", [ConnectionError("no route to host " + KEY), ServerError("SYSTEM_ERROR", "business error", 500),
+                                    ServerError("UNAUTHORIZED", "business error", 401), ServerError("SDK.HttpError", "business error", None),
                                     Response({"error_code": "SYSTEM_ERROR"}, 500, "upstream " + KEY + " " + SECRET),
                                     Response(None, 404, "not found " + KEY), Response({}), Response(None),
                                     Response(detail(order("FILLED", cid="other-1"), order("FILLED", cid="other-2")))])
@@ -376,7 +382,7 @@ def test_open_orders_follow_every_page_to_the_end(tmp_path):
     looping = FakeClient(open_pages={None: {"data": [], "pagination_key": "same"}, "same": {"data": [], "pagination_key": "same"}})
     with pytest.raises(wb.WebullError, match="pagination"):
         wb.WebullVenue(KEY, SECRET, client=looping, confirmation_file=tmp_path / "x.json").open_orders()
-    broken = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", 500)})
+    broken = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", "business error", 500)})
     with pytest.raises(wb.WebullError) as exc:
         wb.WebullVenue(KEY, SECRET, client=broken, confirmation_file=tmp_path / "x.json").open_orders()
     assert KEY not in str(exc.value) and SECRET not in str(exc.value)
@@ -420,7 +426,7 @@ def test_check_reports_the_count_of_open_orders(tmp_path):
              "p2": {"data": [detail(order("SUBMITTED", cid="c-2"), cid="c-2")]}}
     report = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages=pages), confirmation_file=tmp_path / "x.json").check()
     assert report["open_orders"] == 2
-    broken = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", 500)})
+    broken = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", "business error", 500)})
     report = wb.WebullVenue(KEY, SECRET, client=broken, confirmation_file=tmp_path / "x.json").check()
     assert "open_orders" not in report and "SYSTEM_ERROR" in report["open_orders_error"] and KEY not in json.dumps(report)
     assert "balance" not in report and report["positions"] == 0          # the balance read worked: no error under its key
@@ -783,8 +789,8 @@ def test_a_token_directory_inside_the_repository_fails_closed(tmp_path, monkeypa
     assert "token_dir" not in sdk.seen and inside.exists() == existed
 
 
-@pytest.mark.parametrize("answer", [ServerError("order_not_found"), ServerError(" ORDER_NOT_FOUND "), ServerError("ORDER_NOT_FOUND", 500),
-                                    ServerError("ORDER_NOT_FOUND", 302), ServerError("ORDER_NOT_FOUND", None),
+@pytest.mark.parametrize("answer", [ServerError("order_not_found", "business error", 417), ServerError(" ORDER_NOT_FOUND ", "business error", 417), ServerError("ORDER_NOT_FOUND", "business error", 500),
+                                    ServerError("ORDER_NOT_FOUND", "business error", 302), ServerError("ORDER_NOT_FOUND", "business error", None),
                                     ConnectionError("transport"), Response({"error_code": "ORDER_NOT_FOUND"}, 500),
                                     Response({"error_code": "ORDER_NOT_FOUND"}, 201), Response({"error_code": "ORDER_NOT_FOUND"}, 302),
                                     Response({"error_code": "order_not_found"}, 417), Response({"orders": [], "status": "FILLED"}),
@@ -795,7 +801,7 @@ def test_with_the_flag_on_only_the_two_exact_answers_mean_no_such_order(tmp_path
     v, _ = status_venue(tmp_path, answer, confirmed_not_found=True)
     with pytest.raises(wb.WebullError):
         v.order_status("t")
-    for exact in (ServerError("ORDER_NOT_FOUND", 404), Response({"error_code": "ORDER_NOT_FOUND"}, 404), Response({"orders": []})):
+    for exact in (ServerError("ORDER_NOT_FOUND", "business error", 404), Response({"error_code": "ORDER_NOT_FOUND"}, 404), Response({"orders": []})):
         assert status_venue(tmp_path, exact, confirmed_not_found=True)[0].order_status("t") is None
 
 
@@ -913,7 +919,7 @@ def test_duplicate_or_absurd_holdings_never_license_a_sale(tmp_path):
         with pytest.raises(wb.NotTransmitted, match="long-only"):
             v.submit(sym, -1e6, "t")
     broken = FakeClient()
-    broken.account_v2.get_account_position = lambda a: (_ for _ in ()).throw(ServerError("SYSTEM_ERROR", 500))
+    broken.account_v2.get_account_position = lambda a: (_ for _ in ()).throw(ServerError("SYSTEM_ERROR", "business error", 500))
     bv = wb.WebullVenue(KEY, SECRET, client=broken, confirmation_file=tmp_path / "x.json")
     with pytest.raises(wb.NotTransmitted):
         bv.submit("SPY", -1.0, "t")
@@ -1221,7 +1227,7 @@ def test_an_open_sell_with_an_unreadable_total_stops_the_sale(tmp_path, total):
 
 def test_a_failed_open_order_read_stops_the_sale(tmp_path):
     client = FakeClient(positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "10"}],
-                        open_pages={None: ServerError("SYSTEM_BUSY", 500)})
+                        open_pages={None: ServerError("SYSTEM_BUSY", "business error", 500)})
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
     with pytest.raises(wb.NotTransmitted):
         v.submit("SPY", -1.0, "t")
@@ -1578,9 +1584,9 @@ def _plant_source(source, plant):
     the HTTP status, or a 200 answer."""
     def call(*a, endpoint):
         if source == "sdk_msg":
-            raise ServerException("SYSTEM_BUSY", 417, plant)
+            raise ServerException("SYSTEM_BUSY", plant, 417)
         if source == "sdk_fields":
-            exc = ServerException(plant, plant, "")
+            exc = ServerException(plant, "", plant)
             exc.request_id = plant
             raise exc
         if source == "exc_message":
@@ -1765,7 +1771,7 @@ def test_harmless_broker_messages_come_through_unchanged(tmp_path, sentence):
     assert wb._gate(sentence, secrets) == sentence
     assert wb._last_check(sentence, secrets) == sentence
     client = FakeClient()
-    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", 417, sentence))
+    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", sentence, 417))
     with pytest.raises(wb.WebullError) as exc:
         wb.WebullVenue("Kq7Zplantedkey0001", "Sx9Wplantedsecret0002", client=client, confirmation_file=tmp_path / "x.json").accounts()
     assert sentence in str(exc.value) and "SYSTEM_BUSY" in str(exc.value)
@@ -1995,7 +2001,7 @@ def test_only_the_sdks_server_exception_can_mean_no_such_order(tmp_path, name):
     v, _ = status_venue(tmp_path, exc, confirmed_not_found=True)
     with pytest.raises(wb.WebullError):
         v.order_status("t")
-    assert status_venue(tmp_path, ServerException("ORDER_NOT_FOUND", 404), confirmed_not_found=True)[0].order_status("t") is None
+    assert status_venue(tmp_path, ServerException("ORDER_NOT_FOUND", "business error", 404), confirmed_not_found=True)[0].order_status("t") is None
 
 
 def test_an_item_whose_client_order_id_is_empty_is_never_adopted(tmp_path):
@@ -2096,7 +2102,7 @@ WORD_SECRET = "zqplantedsecretwordx"                                      # a pl
 
 def _word_secret_venue(tmp_path, secret):
     client = FakeClient()
-    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", 417, f"denied {secret}"))
+    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", f"denied {secret}", 417))
     return wb.WebullVenue(KEY, secret, client=client, confirmation_file=tmp_path / "x.json")
 
 
@@ -2188,7 +2194,7 @@ def test_no_raised_error_carries_the_sdks_exception(tmp_path, source, endpoint):
     assert raised > 0 or source == "answer_all"                       # a well-formed answer may raise nothing
 
 
-AFTER_CALL = {"server": lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", 500)),
+AFTER_CALL = {"server": lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", "business error", 500)),
               "webull": lambda: (_ for _ in ()).throw(wb.WebullError("client trouble")),
               "not_transmitted": lambda: (_ for _ in ()).throw(wb.NotTransmitted("client says not sent")),
               "runtime": lambda: (_ for _ in ()).throw(RuntimeError("socket closed")),
@@ -2275,12 +2281,12 @@ def observed_detail(cid, *items):
     return {"client_order_id": cid, "combo_order_id": "COMBO-1", "combo_type": "NORMAL", "orders": list(items) or [observed_order(cid)]}
 
 
-NOT_PRESENT = ("OPENAPI_PARAM_ERR", 417, "Parameter error, Order not present.")
+NOT_PRESENT = ("OPENAPI_PARAM_ERR", "Parameter error, Order not present.", 417)     # the SDK's order: code, msg, status
 
 
 def refused(code, status=417, msg="refused"):
     def place(a, orders):
-        raise ServerException(code, status, msg)
+        raise ServerException(code, msg, status)
     return place
 
 
@@ -2382,8 +2388,8 @@ def test_a_repeated_client_order_id_with_the_order_there_is_accepted(tmp_path):
     assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
 
 
-@pytest.mark.parametrize("after", [RuntimeError("socket closed"), ServerException("SYSTEM_BUSY", 500, "busy"),
-                                   ServerException("OPENAPI_PARAM_ERR", 417, "Parameter error, quantity"), Response({"orders": ["junk"]})])
+@pytest.mark.parametrize("after", [RuntimeError("socket closed"), ServerException("SYSTEM_BUSY", "busy", 500),
+                                   ServerException("OPENAPI_PARAM_ERR", "Parameter error, quantity", 417), Response({"orders": ["junk"]})])
 def test_a_refusal_then_a_failing_or_odd_detail_read_is_unknown(tmp_path, after):
     cid = wb.client_order_id("t")
     client = FakeClient(details={cid: after})
@@ -2412,11 +2418,11 @@ def test_a_5xx_at_placement_is_unknown_with_no_detail_read(tmp_path, status):
     assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
 
 
-@pytest.mark.parametrize("answer, none", [(ServerException(*NOT_PRESENT), True), (ServerException("OPENAPI_PARAM_ERR", 400, "ORDER NOT PRESENT"), True),
-                                          (Response({"orders": []}), True), (ServerException("ORDER_NOT_FOUND"), True),
-                                          (ServerException("OPENAPI_PARAM_ERR", 417, "Parameter error, client_order_id"), False),
-                                          (ServerException("OPENAPI_PARAM_ERR", 500, "Parameter error, Order not present."), False),
-                                          (ServerException("openapi_param_err", 417, "Parameter error, Order not present."), False),
+@pytest.mark.parametrize("answer, none", [(ServerException(*NOT_PRESENT), True), (ServerException("OPENAPI_PARAM_ERR", "ORDER NOT PRESENT", 400), True),
+                                          (Response({"orders": []}), True), (ServerException("ORDER_NOT_FOUND", "business error", 417), True),
+                                          (ServerException("OPENAPI_PARAM_ERR", "Parameter error, client_order_id", 417), False),
+                                          (ServerException("OPENAPI_PARAM_ERR", "Parameter error, Order not present.", 500), False),
+                                          (ServerException("openapi_param_err", "Parameter error, Order not present.", 417), False),
                                           (RuntimeError("Parameter error, Order not present."), False)])
 def test_no_such_order_as_observed(tmp_path, answer, none):
     v, _ = status_venue(tmp_path, answer, confirmed_not_found=True)
@@ -2431,11 +2437,11 @@ def test_no_such_order_as_observed(tmp_path, answer, none):
 
 
 @pytest.mark.parametrize("answer, word", [(None, "cancel requested"),
-                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT", 417, "pending"), "not yet"),
-                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", 417, "cannot cancel"), "already finished"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT", "pending", 417), "not yet"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", "cannot cancel", 417), "already finished"),
                                           (ServerException(*NOT_PRESENT), "no such order"),
-                                          (ServerException("SYSTEM_BUSY", 500, "busy"), "error"),
-                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", 500, "x"), "error")])
+                                          (ServerException("SYSTEM_BUSY", "busy", 500), "error"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", "x", 500), "error")])
 def test_cancel_reports_the_four_observed_answers(tmp_path, answer, word):
     page = {"data": [detail(order("PENDING", cid="c-1"), cid="c-1")]}
     client = FakeClient(open_pages={None: page})
@@ -2575,7 +2581,7 @@ def test_thirty_reads_at_once_are_spread_on_the_live_table(tmp_path, monkeypatch
     assert len(stamps) == 30
     assert _most_in_a_window(stamps, 2) <= 1 < 2                             # 80% of 2 per 2 s, rounded down: 1
     assert _most_in_a_window([t for _, t in times], 60) <= 48                  # 80% of the overall 60 a minute
-    assert stamps[-1] == 58.0                                               # no slower than the window needs
+    assert stamps[-1] == 87.0                                               # rev 9: 1 per 2 s counted as 3 s (window + 1 s)
 
 
 def test_a_burst_under_the_limits_is_not_delayed(tmp_path, monkeypatch):
@@ -2602,7 +2608,7 @@ def test_the_paper_table(tmp_path, monkeypatch):
     for _ in range(30):
         v.balance()
     stamps = [t for _, t in times]
-    assert stamps[:24] == [0.0] * 24 and stamps[24:] == [60.0] * 6          # 80% of 30 a minute: 24
+    assert stamps[:24] == [0.0] * 24 and stamps[24:] == [61.0] * 6          # 80% of 30 a minute: 24 (rev 9: per 61 s)
     assert v.check()["rate_limits"]["calls"]["balance"] == [30, 60.0] and v.check()["rate_limits"]["share_used"] == 0.8
 
 
@@ -2615,7 +2621,7 @@ def test_a_429_on_a_read_is_retried_with_waits_and_then_raises(tmp_path, how):
     def balance(a):
         answers.append(clock.now)
         if how == "raised":
-            raise ServerException("TOO_MANY_REQUESTS", 429, "Too many requests")
+            raise ServerException("TOO_MANY_REQUESTS", "Too many requests", 429)
         return Response({"error_code": "TOO_MANY_REQUESTS"}, 429)
     client.account_v2.get_account_balance = balance
     v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
@@ -2651,7 +2657,7 @@ def test_a_429_on_cancel_is_not_retried(tmp_path):
 
     def cancel(a, cid):
         client.calls.append(("cancel", a, cid))
-        raise ServerException("TOO_MANY_REQUESTS", 429, "Too many requests")
+        raise ServerException("TOO_MANY_REQUESTS", "Too many requests", 429)
     client.order_v3.cancel_order = cancel
     client._open_pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}}
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
@@ -2670,7 +2676,7 @@ def test_a_replaced_table(tmp_path):
                        clock=clock, sleep=clock.sleep)
     for _ in range(4):
         v.balance()
-    assert [t for _, t in times] == [0.0, 10.0, 20.0, 30.0]
+    assert [t for _, t in times] == [0.0, 11.0, 22.0, 33.0]                # rev 9: the window counted 1 s longer
     assert v.check()["rate_limits"]["calls"]["balance"] == [1, 10.0]
 
 
@@ -2702,5 +2708,161 @@ def test_fifteen_sells_in_a_row_on_the_live_table_never_break_a_limit(tmp_path, 
         assert _most_in_a_window(stamps, window) <= max(1, int(calls * 0.8)), name
     assert _most_in_a_window([t for _, t in times], 60) <= 48
     assert len([n for n, _ in times if n == "place_order"]) == 15
-    assert clock.now == 28.0                                                 # measured: 15 sells take 28 s on the fake clock
+    assert clock.now == 42.0                                                 # measured (rev 9): 15 sells take 42 s on the fake clock
 
+
+# ---- T9 rev 9: small repairs after blind verification of rev 8
+
+@pytest.mark.parametrize("answer", [ServerException(*NOT_PRESENT), Response({"orders": []})])
+def test_a_repeat_that_cannot_be_found_is_unknown_never_rejected(tmp_path, answer):
+    cid = wb.client_order_id("t")
+    client = FakeClient(details={cid: answer})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("OPENAPI_TRADE_PLACE_ORDER_REPEAT")(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert type(exc.value) is wb.WebullError and not isinstance(exc.value, wb.OrderRejected)
+    assert "outcome unknown" in str(exc.value) and "read the order's status" in str(exc.value)
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+def _closed_most(stamps, window):
+    """The most calls in any closed span [t, t + window], the way Webull may count."""
+    return max((sum(1 for u in stamps if t <= u <= t + window) for t in stamps), default=0)
+
+
+def _gaps(times):
+    """For each place_order call, the seconds since the latest holdings read before it."""
+    out, last = [], None
+    for name, t in times:
+        if name == "get_account_position":
+            last = t
+        elif name == "place_order" and last is not None:
+            out.append(t - last)
+    return out
+
+
+def _no_limit_broken(times, table):
+    kinds = {"get_account_list": "account_list", "get_account_balance": "balance", "get_account_position": "positions",
+             "get_order_detail": "order_detail", "list_order_open": "open_orders", "place_order": "place", "cancel_order": "cancel"}
+    for name, kind in kinds.items():
+        calls, window = table[kind]
+        assert _closed_most([t for n, t in times if n == name], window) <= calls, name
+    calls, window = table["all"]
+    assert _closed_most([t for _, t in times], window) <= calls
+
+
+def test_after_45_cancels_a_sale_reads_its_holdings_at_most_5_seconds_before_it_places(tmp_path):
+    clock = FakeClock()
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}])
+    times = _timed(client, clock)
+    live = REAL_RATE_LIMITS["production"]
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", limits=live, clock=clock, sleep=clock.sleep)
+    for i in range(45):
+        assert v.cancel(f"c{i}")["status"] == "cancel requested"
+    assert v.submit("SPY", -1.0, "sell")["status"] == "accepted"
+    gaps = _gaps(times)
+    assert len(gaps) == 1 and gaps[0] <= 5, gaps
+    _no_limit_broken(times, live)
+    TIMINGS["45 cancels then a sale, live table"] = clock.now
+
+
+def test_fifteen_sales_on_the_paper_table_read_holdings_at_most_5_seconds_before_placing(tmp_path):
+    clock = FakeClock()
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "15", "instrument_type": "EQUITY"}])
+    times = _timed(client, clock)
+    paper_table = REAL_RATE_LIMITS["sandbox"]
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", limits=paper_table, clock=clock, sleep=clock.sleep)
+    for i in range(15):
+        assert v.submit("SPY", -1.0, f"sell-{i}")["status"] == "accepted"
+    gaps = _gaps(times)
+    assert len(gaps) == 15 and max(gaps) <= 5, gaps
+    _no_limit_broken(times, paper_table)
+    TIMINGS["fifteen sales, paper table"] = clock.now
+
+
+@pytest.mark.parametrize("slow_reads, placed", [(1, True), (3, True), (4, False), (10, False)])
+def test_holdings_older_than_5_seconds_are_read_again_three_times_at_most(tmp_path, slow_reads, placed):
+    clock = FakeClock()
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}])
+    reads = []
+    real = client.account_v2.get_account_position
+
+    def positions(a):
+        reads.append(clock.now)
+        res = real(a)
+        if len(reads) <= slow_reads:
+            clock.now += 6                                                # this read returns 6 s later
+        return res
+    client.account_v2.get_account_position = positions
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    if placed:
+        assert v.submit("SPY", -1.0, "sell")["status"] == "accepted"
+        assert len(reads) == slow_reads + 1 and len(client.placed()) == 1
+    else:
+        with pytest.raises(wb.NotTransmitted, match="holdings"):
+            v.submit("SPY", -1.0, "sell")
+        assert len(reads) == 4 and client.placed() == []                  # one read and three re-reads
+    assert len(_opens(client)) == len(reads)                              # open orders are read again with the holdings
+
+
+@pytest.mark.parametrize("trouble", ["sleep_raises", "clock_raises"])
+def test_a_failure_while_waiting_for_the_place_slot_is_not_transmitted(tmp_path, trouble):
+    clock = FakeClock()
+
+    def sleep(seconds):
+        if trouble == "sleep_raises":
+            raise RuntimeError("interrupted")
+        clock.now += seconds
+        clock.broken = True
+
+    def read_clock():
+        if getattr(clock, "broken", False):
+            raise OSError("clock unavailable")
+        return clock.now
+    table = {**{k: (10 ** 6, 1) for k in wb.CALL_KINDS}, "place": (1, 10)}
+    client = FakeClient()
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", limits=table, clock=read_clock, sleep=sleep)
+    assert v.submit("SPY", 1.0, "t1")["status"] == "accepted"
+    with pytest.raises(wb.NotTransmitted) as exc:
+        v.submit("SPY", 1.0, "t2")                                        # must wait for the place slot, and cannot
+    assert "outcome unknown" not in str(exc.value) and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("readings", [[2_000_000.0, 0.0, -1_000_000.0], [100.0, 50.0], [5.0, -1e12]])
+def test_no_sleep_is_longer_than_the_longest_window(tmp_path, readings):
+    sleeps = []
+    state = {"i": 0, "offset": 0.0}
+
+    def clock():                                                          # a clock that goes backwards, then moves with the sleeps
+        value = readings[min(state["i"], len(readings) - 1)] + state["offset"]
+        state["i"] += 1
+        return value
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        state["offset"] += seconds
+    table = {**{k: (10 ** 6, 1) for k in wb.CALL_KINDS}, "balance": (2, 60)}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(), account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", limits=table,
+                       clock=clock, sleep=sleep)
+    for _ in range(4):
+        v.balance()
+    longest = max(s for _, s in table.values())
+    assert sleeps and max(sleeps) <= longest + 1, sleeps
+
+
+def test_two_full_bursts_one_window_apart_never_crowd_a_closed_window(tmp_path):
+    clock = FakeClock()
+    client = FakeClient()
+    times = _timed(client, clock)
+    table = {**{k: (10 ** 6, 1) for k in wb.CALL_KINDS}, "balance": (5, 10)}
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", limits=table,
+                       clock=clock, sleep=clock.sleep)
+    for _ in range(8):
+        v.balance()
+    stamps = [t for _, t in times]
+    assert stamps == [0.0] * 4 + [11.0] * 4                               # 80% of 5 is 4, per window counted as 10 + 1 s
+    assert _closed_most(stamps, 10) <= 4
+
+
+TIMINGS: dict = {}

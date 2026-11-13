@@ -1042,6 +1042,9 @@ RATE_LIMITS = {
 }
 RATE_SHARE = 0.8                                  # the pacer uses 80% of every limit (at least one call per window)
 READ_RETRY_WAITS = (2, 4, 8)                      # a 429 on a read: 4 tries in all, waiting 2, 4 and 8 seconds
+SALE_READ_MAX_AGE = 5.0                           # at most this many seconds from the holdings read to the order call
+SALE_REREADS = 3                                  # then open orders and holdings are read again, at most this often
+REPEAT_CODE = "OPENAPI_TRADE_PLACE_ORDER_REPEAT"  # Webull: an order with this client order id already exists
 _default_clock, _default_sleep = time.monotonic, time.sleep
 
 
@@ -1067,32 +1070,67 @@ class _Pacer:
     """A sliding-window pacer: before a call of `kind` it waits until fewer than the allowed number of calls of that
     kind, and fewer than the allowed number of calls of every kind together ("all"), were made in the last window.
     Allowed = RATE_SHARE of each limit, rounded down, at least 1. It counts calls rather than spacing them, so a burst
-    inside the limits is not slowed. In any span of a window's length (half-open) at most the allowed number fall."""
+    inside the limits is not slowed. Each window is counted WINDOW_MARGIN (one second) longer than Webull states it, so
+    that two full bursts one stated window apart never fall inside one window counted with both ends.
+
+    Time is the injected clock, but never earlier than a call already recorded or than where the pacer's own sleeps
+    have brought it (a clock that goes backwards cannot make it ask for a long sleep), and no single sleep is longer
+    than the longest stated window plus one second.
+
+    The pacer belongs to one venue object. A second WebullVenue, or a second process, on the same App Key keeps its
+    own count and is not seen here; if together they pass Webull's limit, a read that then gets a 429 is tried again
+    as WebullVenue._paced states, and place, replace and cancel are not."""
 
     MAX_ROUNDS = 10_000
+    WINDOW_MARGIN = 1.0
 
     def __init__(self, table: dict[str, tuple[int, float]], clock, sleep):
-        self.allowed = {k: (max(1, math.floor(n * RATE_SHARE)), s) for k, (n, s) in table.items()}
+        self.allowed = {k: (max(1, math.floor(n * RATE_SHARE)), s + self.WINDOW_MARGIN) for k, (n, s) in table.items()}
+        self.longest_sleep = max(s for _, s in table.values()) + 1.0
         self.clock, self.sleep = clock, sleep
         self.times: dict[str, list[float]] = {k: [] for k in table}
+        self.floor = -math.inf
 
-    def _delay(self, kind: str, now: float) -> float:
+    def now(self) -> float:
+        """The clock's time, never earlier than a recorded call or than the end of the pacer's last sleep."""
+        t = float(self.clock())
+        if not math.isfinite(t):
+            raise WebullError("the pacer's clock did not give a finite time")
+        self.floor = max(self.floor, t)
+        return self.floor
+
+    def last(self, kind: str) -> float | None:
+        """When the latest call of `kind` was recorded, or None."""
+        return self.times[kind][-1] if self.times[kind] else None
+
+    def _delay(self, kind: str, now: float, need: int = 1) -> float:
         n, window = self.allowed[kind]
+        need = min(need, n)
         times = self.times[kind]
         while times and times[0] <= now - window:
             times.pop(0)
-        return times[len(times) - n] + window - now if len(times) >= n else 0.0
+        over = len(times) - (n - need)                                    # how many recorded calls must first leave
+        return times[over - 1] + window - now if over > 0 else 0.0
 
-    def wait(self, kind: str) -> None:
+    def wait_free(self, needs: dict[str, int]) -> float:
+        """Wait until all the calls in `needs` ({kind: count}) could be made at once, recording nothing; the time."""
+        total = sum(needs.values())
         for _ in range(self.MAX_ROUNDS):
-            now = float(self.clock())
-            delay = max(self._delay(kind, now), self._delay("all", now))
+            now = self.now()
+            delay = max([self._delay(k, now, m) for k, m in needs.items()] + [self._delay("all", now, total)])
             if delay <= 0:
-                self.times[kind].append(now)
-                self.times["all"].append(now)
-                return
-            self.sleep(delay)
+                return now
+            pause = min(delay, self.longest_sleep)
+            self.sleep(pause)
+            self.floor = now + pause
         raise WebullError("the pacer's clock does not move forward while it waits")
+
+    def wait(self, kind: str) -> float:
+        """Wait for one call of `kind` and record it; the time recorded."""
+        now = self.wait_free({kind: 1})
+        self.times[kind].append(now)
+        self.times["all"].append(now)
+        return now
 
 
 def _too_many(exc_or_res: Any, raised: bool) -> bool:
@@ -1122,7 +1160,9 @@ class WebullVenue:
         `account_class` (from WEBULL_ACCOUNT_CLASS in from_secrets): the class of the account to trade, such as
         INDIVIDUAL_CASH or CRYPTO; see the account_id property for how the account is chosen.
 
-        Pacing: every SDK call waits for the venue's pacer (_Pacer): `limits` replaces the environment's table in
+        Pacing: every SDK call waits for the venue's pacer (_Pacer), which belongs to this object only: a second
+        venue object or a second process on the same App Key is not seen by it, and a read that then gets a 429 is
+        tried again as _paced states. `limits` replaces the environment's table in
         RATE_LIMITS ({kind: (calls, seconds)} for every kind in CALL_KINDS; a malformed table is refused), and
         `clock` / `sleep` replace time.monotonic / time.sleep (tests pass a fake clock and never really sleep).
 
@@ -1518,17 +1558,23 @@ class WebullVenue:
 
         Everything that can refuse (choosing the account, the order fitting the account's class, the session, the
         long-only check, the live guard, building the payload) runs before the single place_order call, and any
-        failure there raises NotTransmitted: the order was certainly not sent. For a sell, the open orders are read
-        first and the holding second, so a fill between the two reads can only make the free amount look smaller;
-        the sale is allowed only when its amount is not above the holding minus the open sells, rounded DOWN to the
-        quantity step.
+        failure there raises NotTransmitted: the order was certainly not sent. Waiting for the place slot is part of
+        that: a failure while waiting (the pacer's sleep or clock failing) is NotTransmitted, because place_order has
+        not been called. For a sell, the open orders are read first and the holding second, so a fill between the two
+        reads can only make the free amount look smaller; the sale is allowed only when its amount is not above the
+        holding minus the open sells, rounded DOWN to the quantity step. A sale first waits until the two reads and
+        the order call could all be made at once, then reads; if more than SALE_READ_MAX_AGE (5) seconds on the clock
+        still pass between the holdings read and the order call, it reads open orders and holdings again and checks
+        again, at most SALE_REREADS (3) times, and is then NotTransmitted.
 
         After the place_order call: when it fails with the SDK's ServerException and a 4xx status (Webull answered and
         refused; a 429 included: place is never retried), the order's detail is read once under the same client order
         id. If the order is there, submit returns it as accepted (this covers OPENAPI_TRADE_PLACE_ORDER_REPEAT: the
         same client order id was sent before and that order exists); if the detail gives the "no such order" answer
         (see order_status; recognised here whatever confirmed_not_found says, because it follows a refusal), submit
-        raises OrderRejected: Webull refused and no order exists. If the detail call fails or answers anything else,
+        raises OrderRejected: Webull refused and no order exists. The exception is OPENAPI_TRADE_PLACE_ORDER_REPEAT:
+        there Webull says an order with this client order id exists, so "no such order" on the detail read leaves the
+        outcome unknown (read the order's status before anything else), never OrderRejected. If the detail call fails or answers anything else,
         and on every other failure of the order call (no answer, a 5xx, a transport error, an unreadable status), it
         raises a plain WebullError of UNKNOWN OUTCOME: the order may or may not have reached Webull, so read
         order_status(tag) before retrying (the same tag gives the same client order id). A caller using the order
@@ -1545,17 +1591,13 @@ class WebullVenue:
             account = self.account_id
             self._fits(crypto)
             secrets = self._secrets()
-            if amount < 0:                                                # the holding must be established, or no sale
-                reserved = self._reserved_by_open_sells(symbol)           # open sells first, then the holding
-                held = self._held(symbol)
-                step = Decimal(1).scaleb(-QUANTITY_STEP_DECIMALS["crypto" if crypto else "equity"])
-                free = (held - reserved).quantize(step, rounding=ROUND_FLOOR)
-                if _decimal(abs(amount)) > free:
-                    raise NotTransmitted(f"selling {abs(amount):g} {symbol} with {float(held):g} held and {float(reserved):g} in open sells "
-                                         "would open a short; this venue is long-only")
+            read_at = self._check_sale(symbol, amount, crypto) if amount < 0 else None    # the holding must be established
             reference = limit_price if limit_price is not None else price
             self._guard_live(abs(amount) * float(reference) if reference else None)
             order = order_payload(symbol, units, tag, limit_price, session)
+            placed_at = self._pacer.wait("place")                         # the place slot, taken before the call
+            if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:
+                raise NotTransmitted(f"the holdings were read {placed_at - read_at:.0f} seconds before the order call could be made; not sent")
         except NotTransmitted:                                            # raised here, or rebuilt through the gate by _call
             raise
         except WebullError as exc:
@@ -1564,7 +1606,7 @@ class WebullVenue:
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
         detail, refused = None, None
         try:
-            res = self._paced("place", self._client.order_v3.place_order, account, [order])   # the only order call
+            res = self._client.order_v3.place_order(account, [order])   # the only order call; its slot is already taken
         except NotTransmitted as exc:                                     # raised from inside the call: still unknown
             detail = "the order call began and then failed: " + _gate(exc, secrets)
         except WebullError as exc:
@@ -1577,6 +1619,9 @@ class WebullVenue:
             if found is not None:
                 return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": found["venue_order_id"],
                         "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
+            if reason is None and type(refused[0]) is str and refused[0] == REPEAT_CODE:
+                reason = ("Webull says an order with this client order id already exists (OPENAPI_TRADE_PLACE_ORDER_REPEAT), "
+                          "but its detail reads as no such order")
             if reason is None:
                 code = _code(refused[0], secrets)
                 code = code if code != CODE_WITHHELD and self._final(code) == code else None
@@ -1604,6 +1649,26 @@ class WebullVenue:
             venue_order_id = None
         return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": venue_order_id,
                 "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
+
+    def _check_sale(self, symbol: str, amount: float, crypto: bool) -> float:
+        """The long-only check for a sale, read fresh: wait until open orders, holdings and the order call could all be
+        made at once, read open orders then holdings, check, and wait for the place slot. If more than
+        SALE_READ_MAX_AGE seconds have then passed since the holdings read began, read and check again, at most
+        SALE_REREADS times; then NotTransmitted. Returns when the holdings read was made."""
+        step = Decimal(1).scaleb(-QUANTITY_STEP_DECIMALS["crypto" if crypto else "equity"])
+        for _ in range(1 + SALE_REREADS):
+            self._pacer.wait_free({"open_orders": 1, "positions": 1, "place": 1})
+            reserved = self._reserved_by_open_sells(symbol)               # open sells first, then the holding
+            held = self._held(symbol)
+            read_at = self._pacer.last("positions")
+            free = (held - reserved).quantize(step, rounding=ROUND_FLOOR)
+            if _decimal(abs(amount)) > free:
+                raise NotTransmitted(f"selling {abs(amount):g} {symbol} with {float(held):g} held and {float(reserved):g} in open sells "
+                                     "would open a short; this venue is long-only")
+            if read_at is not None and self._pacer.wait_free({"place": 1}) - read_at <= SALE_READ_MAX_AGE:
+                return read_at
+        raise NotTransmitted(f"the holdings could not be read within {SALE_READ_MAX_AGE:g} seconds of the order call after "
+                             f"{SALE_REREADS} re-reads; not sent")
 
     def _after_refusal(self, cid: str, secrets: _Secrets) -> tuple[dict | None, str | None]:
         """One read of the order's detail after Webull refused the order call: (the order as order_status reads it,
