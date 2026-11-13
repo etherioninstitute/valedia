@@ -176,3 +176,78 @@ def test_the_only_way_out_is_a_get(monkeypatch):
     for verb in ("POST", "PUT", "DELETE", "PATCH"):
         assert '"%s"' % verb not in src and "'%s'" % verb not in src
     assert "data=" not in src
+
+
+# ---- open markets, order book, trades and series (additions for the order-book loop) ----
+
+def test_open_markets_pages_open_non_combo_markets_with_the_close_window():
+    p1 = {"markets": [{"ticker": "A-1"}, {"ticker": "B-1"}], "cursor": "c1"}
+    p2 = {"markets": [{"ticker": "C-1"}], "cursor": ""}
+    c, _ = client({("/markets", (("status", "open"), ("mve_filter", "exclude"), ("cursor", "c1"))): p2,
+                   ("/markets", (("status", "open"), ("mve_filter", "exclude"))): p1})
+    got = c.open_markets(min_close_ts=1000, max_close_ts=2000)
+    assert [m["ticker"] for m in got] == ["A-1", "B-1", "C-1"]
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c.fetch.urls[0]).query))
+    assert q == {"status": "open", "mve_filter": "exclude", "limit": "1000", "min_close_ts": "1000",
+                 "max_close_ts": "2000"}
+    c, _ = client({("/markets", (("status", "open"),)): {"markets": [], "cursor": None}})
+    assert c.open_markets() == []
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c.fetch.urls[0]).query))
+    assert "min_close_ts" not in q and "max_close_ts" not in q
+
+
+def test_orderbook_turns_ascending_bids_into_best_first_levels():
+    body = {"orderbook_fp": {"yes_dollars": [["0.4000", "3089.00"], ["0.4600", "31298.15"], ["0.4700", "1126.49"]],
+                             "no_dollars": [["0.4500", "15251.97"], ["0.5100", "36618.31"], ["0.5200", "113806.80"]]}}
+    c, _ = client({("/markets/T-1/orderbook", (("depth", "10"),)): body})
+    book = c.orderbook("T-1")
+    assert book == {"yes": [(0.47, 1126.49), (0.46, 31298.15), (0.40, 3089.0)],
+                    "no": [(0.52, 113806.8), (0.51, 36618.31), (0.45, 15251.97)]}
+    assert kd.best_quote(book) == {"bid": 0.47, "bid_size": 1126.49, "ask": 0.48, "ask_size": 113806.8}
+
+
+def test_an_empty_or_one_sided_book_comes_back_as_such():
+    c, _ = client({("/markets/E-1/orderbook", ()): {"orderbook_fp": {"yes_dollars": None, "no_dollars": []}},
+                   ("/markets/O-1/orderbook", ()): {"orderbook_fp": {"no_dollars": [["0.3000", "5.00"]]}}})
+    assert c.orderbook("E-1", depth=3) == {"yes": [], "no": []}
+    one = c.orderbook("O-1")
+    assert one == {"yes": [], "no": [(0.30, 5.0)]}
+    assert kd.best_quote(one) == {"bid": None, "bid_size": None, "ask": 0.70, "ask_size": 5.0}
+    assert "depth=3" in c.fetch.urls[0]
+    c, _ = client({("/markets/X-1/orderbook", ()): {"something": 1}})
+    with pytest.raises(kd.KalshiDataError):
+        c.orderbook("X-1")
+
+
+def _trade(i, ts, side="yes", count="2.00"):
+    return {"trade_id": "id-%d" % i, "ticker": "T-1", "created_time": ts, "yes_price_dollars": "0.4800",
+            "no_price_dollars": "0.5200", "count_fp": count, "taker_side": side, "is_block_trade": False}
+
+
+def test_trades_follow_the_cursor_and_ask_in_seconds():
+    p1 = {"trades": [_trade(3, "2026-11-13T05:56:04.912752Z"), _trade(2, "2026-11-13T05:55:57.79377Z", "no")],
+          "cursor": "k1"}
+    p2 = {"trades": [_trade(1, "2026-11-13T05:55:00Z", count="10.50")], "cursor": ""}
+    c, _ = client({("/markets/trades", (("ticker", "T-1"), ("cursor", "k1"))): p2,
+                   ("/markets/trades", (("ticker", "T-1"),)): p1})
+    got = c.trades("T-1", min_ts=1794549300.7, max_ts=1794549400)
+    assert [t["trade_id"] for t in got] == ["id-3", "id-2", "id-1"]
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c.fetch.urls[0]).query))
+    assert q == {"ticker": "T-1", "min_ts": "1794549300", "max_ts": "1794549400", "limit": "1000"}
+    assert got[1] == {"trade_id": "id-2", "ticker": "T-1", "created_time": "2026-11-13T05:55:57.79377Z",
+                      "created_ts": 1794549357.79377, "yes_price": 0.48, "no_price": 0.52, "count": 2.0,
+                      "taker_side": "no", "is_block_trade": False}
+    assert got[2]["count"] == 10.5 and got[2]["created_ts"] == 1794549300.0
+    c, _ = client({("/markets/trades", ()): {"trades": [], "cursor": None}})
+    c.trades("T-1", min_ts=5)
+    assert "max_ts" not in c.fetch.urls[0]
+
+
+def test_series_gives_its_fee_fields():
+    c, _ = client({("/series/KXNFLGAME", ()): {"series": {"ticker": "KXNFLGAME", "title": "NFL",
+                                                          "fee_type": "quadratic_with_maker_fees",
+                                                          "fee_multiplier": 1, "frequency": "custom"}}})
+    assert c.series("KXNFLGAME") == {"ticker": "KXNFLGAME", "title": "NFL", "fee_type": "quadratic_with_maker_fees",
+                                     "fee_multiplier": 1.0}
+    c, _ = client({("/series/S", ()): {"series": {"ticker": "S"}}})
+    assert c.series("S") == {"ticker": "S", "title": None, "fee_type": None, "fee_multiplier": None}

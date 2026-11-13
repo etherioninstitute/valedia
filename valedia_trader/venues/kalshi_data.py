@@ -9,18 +9,24 @@ first and then the other. The two tiers spell the same numbers differently (`clo
 
 Politeness: at most three requests a second, and a 429 or a server error is retried after a growing wait, up to
 five tries in all, then it stops with a clear error.
+
+Live data for the order-book loop (also GET only, through the same pacing and retries): `open_markets` pages the
+open, non-combo markets; `orderbook` reads the best levels of a book (Kalshi sends bids only, ascending, best
+last; a yes ask is one minus the best no bid, see `best_quote`); `trades` reads a market's tape between two times
+in seconds, following the cursor; `series` gives a series' fee fields.
 """
 from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
 __all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "urllib_get", "normalize_market", "normalize_candle",
-           "KalshiData"]
+           "KalshiData", "normalize_levels", "best_quote", "normalize_trade", "iso_to_ts"]
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 USER_AGENT = "valedia-trader-research/1.0"
@@ -106,6 +112,33 @@ def normalize_candle(row: dict) -> dict:
             "price": block("price", PRICE_KEYS), "yes_bid": block("yes_bid", BOOK_KEYS), "yes_ask": block("yes_ask", BOOK_KEYS)}
 
 
+def normalize_levels(rows) -> list[tuple[float, float]]:
+    """One side of a book as [(price in dollars, size in contracts), ...], best (highest) bid first. Kalshi sends
+    each side ascending with the best bid last, as dollar and fixed-point strings; a missing side is empty."""
+    out = [(float(p), float(q)) for p, q in (rows or [])]
+    return sorted(out, key=lambda lv: lv[0], reverse=True)
+
+
+def best_quote(book: dict) -> dict:
+    """Best yes bid and its size, and the yes ask (one minus the best no bid) and its size. None for a missing side."""
+    yes, no = book.get("yes") or [], book.get("no") or []
+    return {"bid": yes[0][0] if yes else None, "bid_size": yes[0][1] if yes else None,
+            "ask": round(1.0 - no[0][0], 6) if no else None, "ask_size": no[0][1] if no else None}
+
+
+def iso_to_ts(text: str) -> float:
+    """A UTC ISO time as Kalshi writes it ("2026-11-13T05:56:04.912752Z") in epoch seconds."""
+    return datetime.fromisoformat(text).timestamp()
+
+
+def normalize_trade(row: dict) -> dict:
+    """One trade of the tape with numbers as floats and its time also in epoch seconds."""
+    return {"trade_id": row["trade_id"], "ticker": row.get("ticker"), "created_time": row["created_time"],
+            "created_ts": iso_to_ts(row["created_time"]), "yes_price": _num(_pick(row, "yes_price")),
+            "no_price": _num(_pick(row, "no_price")), "count": _num(_pick(row, "count")),
+            "taker_side": row.get("taker_side"), "is_block_trade": row.get("is_block_trade")}
+
+
 class KalshiData:
     """Read-only client. `fetch(url) -> bytes` is the transport (urllib by default; a fake in tests)."""
 
@@ -178,3 +211,57 @@ class KalshiData:
             if rows:
                 return [normalize_candle(r) for r in rows]
         return []
+
+    def open_markets_pages(self, min_close_ts: int | None = None, max_close_ts: int | None = None):
+        """Each page (a list of market objects) of the open markets, combos excluded, closing in the window.
+
+        `min_close_ts` and `max_close_ts` (epoch seconds) are filtered by the server. Confirmed on 2026-11-13 by two
+        GETs of /markets with `status=open&mve_filter=exclude&limit=5`: with `min_close_ts` = now + 3 h and
+        `max_close_ts` = now + 30 days every market returned closed on 2026-12-13, inside the window; with
+        `min_close_ts` = now + 300 days only markets closing in 2099 came back. Both answered 200 together with
+        `status=open`."""
+        params: dict = {"status": "open", "mve_filter": "exclude", "limit": 1000}
+        if min_close_ts is not None:
+            params["min_close_ts"] = int(min_close_ts)
+        if max_close_ts is not None:
+            params["max_close_ts"] = int(max_close_ts)
+        cursor, seen = None, set()
+        while True:
+            page = self.get_json("/markets", dict(params, cursor=cursor) if cursor else dict(params))
+            if "markets" not in page:
+                raise KalshiDataError("no 'markets' in the answer from /markets (keys %s)" % sorted(page))
+            rows = page["markets"] or []
+            yield rows
+            cursor = page.get("cursor")
+            if not cursor or not rows or cursor in seen:
+                return
+            seen.add(cursor)
+
+    def open_markets(self, min_close_ts: int | None = None, max_close_ts: int | None = None) -> list[dict]:
+        """All open markets, combos excluded, closing in the window (see `open_markets_pages` for the filters)."""
+        return [m for page in self.open_markets_pages(min_close_ts, max_close_ts) for m in page]
+
+    def orderbook(self, ticker: str, depth: int = 10) -> dict:
+        """{"yes": [(price, size), ...], "no": [...]}: the best `depth` bids of each side, best first, prices in
+        dollars and sizes in contracts as floats parsed from the strings. An empty side is an empty list."""
+        body = self.get_json("/markets/%s/orderbook" % ticker, {"depth": int(depth)})
+        book = body.get("orderbook_fp")
+        if not isinstance(book, dict):
+            raise KalshiDataError("no 'orderbook_fp' in the order book of %s (keys %s)" % (ticker, sorted(body)))
+        return {"yes": normalize_levels(book.get("yes_dollars"))[:depth],
+                "no": normalize_levels(book.get("no_dollars"))[:depth]}
+
+    def trades(self, ticker: str, min_ts: float, max_ts: float | None = None) -> list[dict]:
+        """The trades of one market from `min_ts` (epoch seconds, as the API wants: not milliseconds) to `max_ts`
+        or now, newest first as Kalshi sends them, across cursor pages."""
+        params: dict = {"ticker": ticker, "min_ts": int(min_ts)}
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        params["limit"] = 1000
+        return [normalize_trade(r) for r in self.pages("/markets/trades", params, "trades")]
+
+    def series(self, ticker: str) -> dict:
+        """A series' ticker, title, `fee_type` and `fee_multiplier` (None when the series does not say)."""
+        row = self.get_json("/series/%s" % ticker).get("series") or {}
+        return {"ticker": row.get("ticker", ticker), "title": row.get("title"), "fee_type": row.get("fee_type"),
+                "fee_multiplier": _num(row.get("fee_multiplier"))}
