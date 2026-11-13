@@ -221,9 +221,16 @@ def _order_step_environment(environ=None) -> str:
 
 
 def _order_step_refused() -> bool:
-    """True, with one line on stderr, when the configured environment is not the test environment."""
-    from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT
-    if _order_step_environment() == TEST_ENVIRONMENT:
+    """True, with one line on stderr, when the configured environment is not the test environment, or when the
+    secrets file cannot be loaded (the line names the error's class only, nothing from the file or its path)."""
+    from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT, _venue_error
+    try:
+        configured = _order_step_environment()
+    except Exception as exc:
+        print(f"refused: the trading secrets file could not be loaded ({_venue_error(exc)}); it must be readable by its "
+              "owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
+        return True
+    if configured == TEST_ENVIRONMENT:
         return False
     print(f"refused: the order step runs against Webull's test environment ({TEST_ENVIRONMENT}) only and WEBULL_ENV "
           "names another; live trading is not built", file=sys.stderr)

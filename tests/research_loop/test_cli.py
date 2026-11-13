@@ -162,6 +162,9 @@ class _Venue:
         return {"status": "cancel requested"}
 
 
+REAL_ORDER_STEP_ENVIRONMENT = cli._order_step_environment   # before any fixture replaces it
+
+
 @pytest.fixture
 def order_step_project(tmp_path, monkeypatch):
     from valedia_trader.execution_and_risk import order_step
@@ -224,6 +227,27 @@ def test_order_step_refuses_a_configured_environment_other_than_the_sandbox_befo
 def test_order_step_reads_the_configured_environment_as_the_webull_adapter_does():
     assert cli._order_step_environment({"WEBULL_ENV": " Production "}) == "production"
     assert cli._order_step_environment({}) == "sandbox" and cli._order_step_environment({"WEBULL_ENV": ""}) == "sandbox"
+
+
+@pytest.mark.parametrize("error", ["refused", "unreadable"])
+def test_order_step_ends_with_one_plain_line_when_the_secrets_file_cannot_be_loaded(order_step_project, monkeypatch, capsys, error):
+    from valedia_trader.core import secrets
+    root, venue = order_step_project
+
+    def load_env(*a, **k):                                              # never the real file
+        if error == "refused":
+            raise secrets.SecretError("/somewhere/trading.env is readable by group or others; WEBULL_APP_SECRET=Zq-from-the-file")
+        raise UnicodeDecodeError("utf-8", b"Zq-from-the-file", 0, 1, "invalid start byte")
+    monkeypatch.setattr(secrets, "load_env", load_env)
+    monkeypatch.setattr(cli, "_order_step_environment", REAL_ORDER_STEP_ENVIRONMENT)
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    before = sorted(p.relative_to(root) for p in root.rglob("*"))
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert captured.out == "" and len(lines) == 1 and lines[0].startswith("refused:")
+    assert "Zq" not in captured.err and "trading.env" not in captured.err and "Traceback" not in captured.err
+    assert sorted(p.relative_to(root) for p in root.rglob("*")) == before
 
 
 def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):

@@ -305,7 +305,10 @@ def test_any_failure_in_the_first_steps_sends_nothing_and_journals_why(world, ho
     assert out["status"] == "stopped" and out["stage"] == stage and out["orders_sent"] == 0
     assert "submit" not in world.venue.names() and not [o for o in world.orders() if o["state"] != "intended"]
     stops = world.entries("stopped")
-    assert stops and stops[-1]["stage"] == stage and len(stops[-1]["reason"]) > 10
+    if stage in ("environment", "clock"):                          # before the lock: returned only, nothing written (rev 4)
+        assert stops == [] and len(out["reason"]) > 10
+    else:
+        assert stops and stops[-1]["stage"] == stage and len(stops[-1]["reason"]) > 10
 
 
 def test_an_unclean_reconcile_sends_nothing(world):
@@ -648,12 +651,12 @@ def test_equity_is_the_venues_cash_plus_every_holding_at_the_quotes(world):
     world.paper = paper({"a": {"SPY": 2.0}})
     out = world.run()
     assert out["broker_equity"] == 20_000.0 + 10 * 50.0
-    world.prices.pop("OWN")                                               # a holding without a quote: equity unknown,
-    world.paper = paper({"a": {"SPY": 4.0}})                              # every order refused by the gate
+    world.prices.pop("OWN")                                               # a holding without a quote: equity unusable,
+    world.paper = paper({"a": {"SPY": 4.0}})                              # the run stops before any order (rev 4)
     world.later()
     out = world.run()
-    assert out["broker_equity"] is None and out["orders_sent"] == 0
-    assert out["refused"][0]["by"] == "risk gate" and "not usable" in out["refused"][0]["reason"]
+    assert out["broker_equity"] is None and out["orders_sent"] == 0 and world.venue.submits() == [world.orders()[0]["tag"]]
+    assert out["status"] == "stopped" and out["stage"] == "prices" and "no usable quote for OWN" in out["reason"]
 
 
 def test_a_halt_file_refuses_everything_and_a_latch_refuses_new_risk_only(world):
@@ -1693,8 +1696,11 @@ def test_a_hostile_answer_at_any_read_stops_the_run_or_leaves_an_order_over_and_
     out = world.run()                                               # never raises
     assert out["status"] in ("done", "stopped") and out.get("stage") != "unexpected"
     assert json.dumps(out) and "hostile" not in json.dumps(out)
-    last = [e for e in _journal_lines(world) if e.get("type") == "order_step"][-1]
-    assert last["event"] == "summary" and last["batch"] == out["batch"]
+    mine = [e for e in _journal_lines(world) if e.get("type") == "order_step" and e.get("batch") == out["batch"]]
+    if where in ("name", "environment", "host"):                    # refused before the lock: nothing written (rev 4)
+        assert out["stage"] == "environment" and mine == []
+    else:
+        assert mine[-1]["event"] == "summary"
 
 
 def test_an_unexpected_failure_after_the_lock_is_still_journaled_with_a_summary(world, monkeypatch):
@@ -1722,3 +1728,189 @@ def test_a_host_given_by_getattr_must_also_be_a_plain_attribute_naming_the_sandb
         assert out["orders_sent"] == 1
     else:
         assert out["stage"] == "environment" and world.venue.calls == []
+
+
+# ==== rev 4 (T13 rev 4): the last small repairs
+
+def _bytes_of(root):
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+# ---- rev 4 outcome 1: a run that does not hold the lock writes nothing to the journal
+
+def test_a_run_that_finds_the_lock_taken_writes_nothing_and_a_torn_line_from_a_crash_is_recorded_once(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.venue.fill_at_once = 1.0
+    world.run()
+    today = world.tmp / "journal" / "2026-11-13.jsonl"
+    with today.open("a") as fh:
+        fh.write('{"type": "order_step", "event": "fi')                 # an earlier crash mid-write
+    world.paper = paper({"a": {"SPY": 12.0}})
+    world.later()
+    outs = {}
+    real_scan = osx._Run._scan_journal
+
+    def scan(self):                                                     # A holds the lock; B comes now and finds it taken
+        if "B" not in outs:
+            outs["B"] = world.run()
+        return real_scan(self)
+    monkeypatch.setattr(osx._Run, "_scan_journal", scan)
+    outs["A"] = world.run()
+    monkeypatch.setattr(osx._Run, "_scan_journal", real_scan)
+    world.paper = paper({"a": {"SPY": 15.0}})
+    world.later()
+    outs["C"] = world.run()
+    world.next_day()
+    world.paper = paper({"a": {"SPY": 16.0}})
+    outs["D"] = world.run()
+    assert outs["B"]["status"] == "stopped" and outs["B"]["stage"] == "session"
+    assert [outs[k]["status"] for k in "ACD"] == ["done"] * 3 and [outs[k]["orders_sent"] for k in "ACD"] == [1, 1, 1]
+    entries = _journal_lines(world)
+    assert sum(1 for e in entries if e.get("event") == "torn_line") == 1
+    assert [e["fill_id"] for e in entries if e.get("event") == "fill"] == [1, 2, 3, 4]   # every fill once, none glued away
+    assert not any(e.get("batch") == outs["B"]["batch"] for e in entries)                 # B wrote nothing
+
+
+@pytest.mark.parametrize("why", ["environment", "lock taken", "clock"])
+def test_a_run_stopped_before_the_lock_returns_its_summary_and_changes_no_file(world, why):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.run()
+    world.later()
+    held = None
+    if why == "environment":
+        world.venue.environment = "production"
+    elif why == "lock taken":
+        held = osx._RunLock(str(world.state_path))
+        assert held.acquire()
+    else:
+        world.clock.t = float("nan")
+    before = _bytes_of(world.tmp)
+    try:
+        out = world.run()
+    finally:
+        if held:
+            held.release()
+    assert out["status"] == "stopped" and out["stage"] in ("environment", "session", "clock")
+    assert _bytes_of(world.tmp) == before
+
+
+# ---- rev 4 outcome 2: a huge finite number is not believed
+
+def _one_run(world, cash=None, price=None, held=None):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    if cash is not None:
+        world.venue.cash_value = cash
+    if held is not None:
+        world.venue.held = held
+    if price is not None:
+        world.prices["SPY"] = price
+    out = world.run()
+    st = osx.OrderStepState(world.state_path)
+    try:
+        return out, st.peak()
+    finally:
+        st.close()
+
+
+@pytest.mark.parametrize("cash, usable", [(1e12, True), (math.nextafter(1e12, math.inf), False), (1e308, False),
+                                          (0.0, True), (-0.01, False)])
+def test_cash_outside_zero_to_a_trillion_is_unusable_and_stops_before_any_order_recording_nothing(world, cash, usable):
+    out, peak = _one_run(world, cash=cash)
+    if usable:
+        assert out["status"] == "done" and peak == cash
+    else:
+        assert out["status"] == "stopped" and out["stage"] == "prices" and out["orders_sent"] == 0 and peak is None
+        assert world.venue.submits() == [] and out["broker_equity"] is None
+
+
+def test_equity_above_a_trillion_is_unusable_and_stops_before_any_order_recording_nothing(world):
+    out, peak = _one_run(world, cash=1e12, held={"OWN": 1.0})                  # 1e12 + 50
+    assert out["status"] == "stopped" and out["stage"] == "prices" and peak is None and world.venue.submits() == []
+
+
+@pytest.mark.parametrize("price, usable", [(1e7, True), (math.nextafter(1e7, math.inf), False), (0.01, True), (0.0, False),
+                                           (-1.0, False)])
+def test_a_quote_price_outside_zero_to_ten_million_is_unusable(world, price, usable):
+    out, _ = _one_run(world, cash=1e11, price=price)
+    if usable:
+        assert out["orders_sent"] == 1
+    else:
+        assert out["orders_sent"] == 0 and out["skipped"][0]["reason"] == "the quote's price is not a positive number up to 10,000,000"
+
+
+def test_a_quote_asked_for_again_above_ten_million_leaves_its_order_over(world):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    first = world.quotes
+    world.quotes = lambda s: first(s) if not world.quote_calls else {x: (2e7, world.clock.t) for x in s}
+    _slow_venue(world, 25)
+    out = world.run()
+    assert out["orders_sent"] == 1 and out["left_over"][0]["reason"].endswith("the quote's price is not a positive number "
+                                                                               "up to 10,000,000")
+
+
+@pytest.mark.parametrize("units, usable", [(1e12, True), (math.nextafter(1e12, math.inf), False)])
+def test_a_position_above_a_trillion_units_is_unusable(world, units, usable):
+    world.prices["OWN"] = 1e-6
+    out, _ = _one_run(world, cash=1_000.0, held={"OWN": units})
+    if usable:
+        assert world.baseline() == {"OWN": units}
+    else:
+        assert out["stage"] == "baseline" and world.venue.names() == ["positions"]
+
+
+def test_the_bounds_are_named_constants():
+    assert (osx.MAX_CASH, osx.MAX_QUOTE_PRICE, osx.MAX_UNITS) == (1e12, 1e7, 1e12)
+
+
+# ---- rev 4 outcome 3: the order of the last checks before sending
+
+def test_a_slow_risk_gate_never_leaves_a_quote_older_than_the_limit_at_intend(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    world.quote_age.update(SPY=600.0, QQQ=600.0)
+    stamped, first = {}, world.quotes
+
+    def quotes(symbols):
+        out = first(symbols)
+        for s, (_, t) in out.items():
+            stamped[s] = t
+        for s in symbols:
+            world.quote_age[s] = 60.0                                        # an ask from now on is fresh
+        return out
+    world.quotes = quotes
+    real_gate = osx.risk_gate.check_order
+
+    def slow_gate(*a, **k):
+        world.clock.t += 15 * 60
+        return real_gate(*a, **k)
+    monkeypatch.setattr(osx.risk_gate, "check_order", slow_gate)
+    ages = []
+
+    def watch(led):
+        real = led.intend
+        led.intend = lambda tag, sym, *a, **k: ages.append(world.clock.t - stamped[sym]) or real(tag, sym, *a, **k)
+    out = world.run(patch=watch)
+    assert out["orders_sent"] == 2 and ages and max(ages) <= osx.QUOTE_MAX_AGE_SECONDS
+
+
+def test_a_slow_environment_read_never_lets_submit_once_begin_after_the_window(world):
+    world.clock.t = ny("2026-11-13 15:44:40")
+    world.paper = paper({"a": {"SPY": 1.0}})
+    slow = {"on": False}
+
+    class V(StandIn):
+        @property
+        def environment(self):
+            if slow["on"]:
+                world.clock.t += 40
+            return "sandbox"
+    world.venue = V()
+    submitted_at = []
+    real_submit = world.venue.submit
+    world.venue.submit = lambda *a, **k: submitted_at.append(world.clock.t) or real_submit(*a, **k)
+
+    def watch(led):
+        real = led.intend
+        led.intend = lambda *a, **k: (slow.update(on=True), real(*a, **k))[1]
+    out = world.run(patch=watch)
+    assert submitted_at == [] and [o["state"] for o in world.orders()] == ["intended"]
+    assert out["left_over"][0]["reason"] == "the session window closed during the run"

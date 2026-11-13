@@ -18,7 +18,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  stops the run with no further venue call.
     lock         one run at a time per state file. Only the venue's name, environment and host are read before the
                  lock; everything below runs under it, and once it is held a summary is always journaled: a fault
-                 of the run's own stops it at stage "unexpected" rather than raising.
+                 of the run's own stops it at stage "unexpected" rather than raising. A run stopped before the lock
+                 (clock, environment, lock taken) only returns its summary: it writes nothing anywhere. Every
+                 journal write happens under the lock, after the journal scan.
     journal      every journal file is read line by line before any venue call. A torn last line of the newest file
                  (a crash mid-write) is skipped, recorded once and reported in the summary (`torn_lines`); a torn
                  line anywhere else stops the run. The torn line stays in the file, and the journal's other readers
@@ -36,8 +38,12 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  journaled once (keyed by its fill id), the journal file fsynced, and only then marked applied. A
                  blocked ledger, or an order still open at the broker, stops the run.
  5. targets      per symbol, each strategy's paper units held plus pending, summed, times capital / paper equity.
- 6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing or not a positive
-                 finite number: no order for that symbol.
+ 6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, or a price not above
+                 0 or above MAX_QUOTE_PRICE: no order for that symbol. The venue's cash, and the broker equity (cash
+                 plus holdings at the quotes), must be finite numbers from 0 to MAX_CASH, and every held symbol must
+                 have a usable quote; otherwise the run stops before any order and records no equity or peak. A
+                 position above MAX_UNITS in size is unusable too (the baseline is not recorded; a broker book that
+                 large stops the run).
  7. differences  target minus broker book, rounded toward zero (whole shares, or FRACTIONAL_DECIMALS decimals with
                  `fractional`); a sale never exceeds the broker book; less than the paper trader's smallest trade
                  is dropped. The strategies' parts of each order sum to it exactly (order_parts).
@@ -47,13 +53,13 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports,
                  less CASH_KEPT, would be exceeded at the limit prices; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
-10. send         just before each order is intended its quote's age is checked again on the clock; older than
-                 QUOTE_MAX_AGE_SECONDS, the quote function is asked once more for that symbol, and an unusable
-                 answer leaves the order over. The limit price comes from the quote in hand at that moment. The
-                 session window is checked on the clock immediately before ledger.intend and again immediately
-                 before ledger.submit_once; an order failing either is left over (one already intended stays
-                 `intended`, never sent). A day limit order in the regular session through ledger.intend and
-                 ledger.submit_once. A refusal is journaled and the run goes on; an unknown outcome stops the run
+10. send         for each order, in this order: the risk gate (at the quote in hand); the quote's age on the clock
+                 (older than QUOTE_MAX_AGE_SECONDS, the quote function is asked once more for that symbol, and an
+                 unusable answer leaves the order over; the limit price comes from the quote in hand then); the
+                 environment and host read; the window check; ledger.intend; the environment and host read and the
+                 window check again; ledger.submit_once. Nothing that can take time sits between a window check and
+                 the call it guards; an order failing the second check stays `intended`, never sent. A day limit
+                 order in the regular session. A refusal is journaled and the run goes on; an unknown outcome stops the run
                  at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
                  stop or a left-over order, in the order step's own words.
 11. after        reconcile once more, journal the fills, return and journal a summary.
@@ -111,6 +117,9 @@ SESSION_AFTER_OPEN = pd.Timedelta(minutes=5)      # 09:35 on a 09:30 open
 SESSION_BEFORE_CLOSE = pd.Timedelta(minutes=15)   # 15:45 on a 16:00 close, 12:45 on a 13:00 half-day
 QUOTE_MAX_AGE_SECONDS = 20 * 60
 QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than this after now is not believed
+MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
+MAX_QUOTE_PRICE = 1e7                             # a quote price must be above 0 and at most this
+MAX_UNITS = 1e12                                  # a position size above this (in size) is unusable
 DEFAULT_MAX_ORDERS_PER_DAY = 40
 BUY_ABOVE = Decimal("0.01")                       # purchase limit: quote plus 1%, rounded down to the cent
 SELL_BELOW = Decimal("0.01")                      # sale limit: quote less 1%, rounded up to the cent
@@ -436,8 +445,8 @@ def _read_quote_unguarded(raw, now: float) -> tuple[float | None, float | None, 
     except Exception:
         return None, None, "the quote is not a price and a time"
     price = _as_float(price)
-    if price is None or price <= 0:
-        return None, None, "the quote's price is not a positive finite number"
+    if price is None or price <= 0 or price > MAX_QUOTE_PRICE:
+        return None, None, f"the quote's price is not a positive number up to {MAX_QUOTE_PRICE:,.0f}"
     try:
         t = _quote_time(when)
     except Exception:
@@ -723,9 +732,12 @@ class _Run:
         self.torn_lines: list[dict] = []
         self.paper_read: PaperTargets | None = None
         self._line_ended = False
+        self._locked = False
 
     # -- helpers
     def _write(self, entry: dict) -> None:
+        if not self._locked:                             # a run without the lock writes nothing anywhere
+            raise RuntimeError("the order step wrote to the journal without holding the lock")
         if not self._line_ended:                         # a torn last line from a crash must not swallow this entry
             self._line_ended = True
             path = self._journal_file(self.day)
@@ -769,6 +781,7 @@ class _Run:
         lock = _RunLock(path)
         if not lock.acquire():                           # everything below runs under the lock
             return self._finish("stopped", "session", "another order step is running on this venue's state file")
+        self._locked = True                              # from here on the journal may be written
         try:
             try:
                 self._scan_journal()                     # before anything is asked of the venue
@@ -797,6 +810,8 @@ class _Run:
             self._reconcile_and_cancel(baseline)         # 4
             paper = self.paper_read                      # 5
             book = broker_book(self.ledger.fills())
+            if any(abs(u) > MAX_UNITS for u in book.values()):
+                raise _Stop("reconcile", f"a position in the broker book is above {MAX_UNITS:,.0f} units in size; a person must look")
             capital = paper.equity if self.capital is None else self.capital
             if not _finite(capital) or capital <= 0:
                 raise _Stop("targets", f"the capital must be a positive finite number, not {capital!r}")
@@ -952,7 +967,8 @@ class _Run:
                                     "positions can no longer tell the owner's holdings from this program's. A person must look")
         try:
             held = {sym: _as_float(units) for sym, units in dict(self.venue.positions()).items()}
-            bad = sum(1 for sym, units in held.items() if not (_plain(_SYMBOL, sym) and units is not None and units >= 0))
+            bad = sum(1 for sym, units in held.items()
+                      if not (_plain(_SYMBOL, sym) and units is not None and 0 <= units <= MAX_UNITS))
         except Exception as exc:
             raise _Stop("baseline", f"the venue's positions could not be read: {_venue_error(exc)}") from None
         if bad:
@@ -1106,7 +1122,8 @@ class _Run:
             cash = answer.get("cash") if isinstance(answer, dict) else None
             if isinstance(cash, str):
                 cash = float(cash)
-            return _as_float(cash)
+            cash = _as_float(cash)
+            return cash if cash is not None and 0.0 <= cash <= MAX_CASH else None
         except Exception:
             return None
 
@@ -1161,21 +1178,23 @@ class _Run:
         held = {sym: math.fsum((baseline.get(sym, 0.0), book.get(sym, 0.0))) for sym in set(baseline) | set(book)}
         unpriced = [sym for sym, u in held.items() if u > UNITS_EPS and sym not in prices]
         value = math.fsum(u * prices[sym] for sym, u in held.items() if u > UNITS_EPS and sym in prices)
-        equity = (cash + value) if cash is not None and not unpriced else float("nan")
+        bounds = f"a finite number from 0 to {MAX_CASH:,.0f}"
+        if cash is None:                                 # unusable: stop before any order, record nothing
+            raise _Stop("prices", f"the venue's cash is not a usable number ({bounds}); nothing is sent")
+        if unpriced:
+            raise _Stop("prices", f"the broker equity cannot be worked out: no usable quote for {', '.join(sorted(unpriced))}; "
+                                  "nothing is sent")
+        equity = _as_float(cash + value)
+        if equity is None or not 0.0 <= equity <= MAX_CASH:
+            raise _Stop("prices", f"the broker equity is not a usable number ({bounds}); nothing is sent")
         previous, peak = self.state.previous_equity(self.day), self.state.peak()
-        if _finite(equity):
-            self.state.record_equity(self.day, equity)
-            self.broker_equity = equity
-            peak = equity if peak is None else max(peak, equity)
-            daily = max(0.0, (previous - equity) / previous * 100.0) if previous else 0.0
-            drawdown = max(0.0, (peak - equity) / peak * 100.0) if peak else 0.0
-        else:
-            daily = drawdown = float("nan")
+        self.state.record_equity(self.day, equity)
+        self.broker_equity = equity
+        peak = equity if peak is None else max(peak, equity)
+        daily = max(0.0, (previous - equity) / previous * 100.0) if previous else 0.0
+        drawdown = max(0.0, (peak - equity) / peak * 100.0) if peak else 0.0
         account = {"equity": equity, "daily_loss_pct": daily, "drawdown_pct": drawdown,
                    "open_positions": sum(1 for u in held.values() if u > UNITS_EPS)}
-        if not _finite(equity):
-            why = (f"no usable quote for {', '.join(sorted(unpriced))}" if unpriced else "the venue's cash is not a usable number")
-            self._write({"event": "account", "equity": None, "reason": f"the broker equity cannot be worked out: {why}"})
         try:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
@@ -1200,18 +1219,19 @@ class _Run:
             if units > 0 and purchases_stopped:
                 self._leave(c, purchases_stopped)
                 continue
-            quote, stale = self._fresh_quote(sym, c["quote"])
-            if quote is None:
-                self._leave(c, stale)
-                continue
-            limit = limit_price(units, quote, reduces)   # from the quote in hand now
-            order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote, "reduces_risk": bool(reduces),
-                     "adds_to_existing": owned_here > UNITS_EPS, "position_value_after": abs(owned_here + units) * quote}
+            gated = c["quote"]                           # 1. the risk gate, at the quote in hand
+            order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * gated, "reduces_risk": bool(reduces),
+                     "adds_to_existing": owned_here > UNITS_EPS, "position_value_after": abs(owned_here + units) * gated}
             ok, why = risk_gate.check_order(order, dict(account), limits, limits_file=None if limits else self.limits_file,
                                             latch_file=self.latch_file, halt_file=self.halt_file)
             if not ok:
                 self._refuse(c, "risk gate", why, order=order, account=account)
                 continue
+            quote, stale = self._fresh_quote(sym, gated)  # 2. the quote's age on the clock, asked again once if too old
+            if quote is None:
+                self._leave(c, stale)
+                continue
+            limit = limit_price(units, quote, reduces)   # from the quote in hand now
             if limit is None:
                 self._refuse(c, "order step", f"no positive limit price comes from the quote {quote}")
                 continue
@@ -1223,18 +1243,18 @@ class _Run:
                 continue
             tag = f"{self.batch}-{sym}"
             watch = _SubmitWatch(self.venue)
-            self._check_environment()                    # read again before every order ...
-            if self._now() > self.window_end:            # the window, on the clock, just before intend ...
-                self._leave(c, "the session window closed during the run")
+            self._check_environment()                    # 3. the environment and host, read again ...
+            if self._now() > self.window_end:            # 4. ... then the window, on the clock, with nothing between
+                self._leave(c, "the session window closed during the run")   #    it and intend
                 continue
             try:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
-                if self._now() > self.window_end:        # ... and just before submit_once: it stays intended
-                    self.state.note_outcome(tag, "not sent")
+                self._check_environment()                # 5. the environment and host again ...
+                if self._now() > self.window_end:        # ... then the window, with nothing between it and submit_once
+                    self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
                     self._leave(c, "the session window closed during the run")
                     continue
-                self._check_environment()                # ... and immediately before it is sent
                 rec = self.ledger.submit_once(watch, tag)
             except OrdersBlocked:
                 words = "; ".join(self._ledger_words(self.ledger.orders(OPEN_STATES), {}))
@@ -1294,6 +1314,8 @@ class _Run:
                    "broker_equity": self.broker_equity if _finite(self.broker_equity) else None,
                    "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines}
         try:
+            if not self._locked:                         # stopped before the lock: returned (and printed) only
+                return summary
             if status == "stopped":
                 self._write({"event": "stopped", "stage": stage, "reason": reason})
             self._write({"event": "summary", **summary})
