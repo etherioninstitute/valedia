@@ -15,6 +15,9 @@ order to production on its own:
 Credentials come from the secrets file (WEBULL_APP_KEY, WEBULL_APP_SECRET, optional WEBULL_ACCOUNT_ID,
 WEBULL_ENV = sandbox | production). They are never printed or logged: the SDK's own logger, which writes whole
 requests with their headers when a call fails, is silenced, and errors are rebuilt from status fields only.
+Raised messages may carry Webull's own error text (its error_code and up to 160 characters of its message):
+those are Webull's words about the answer; nothing that was sent to Webull (headers, keys, the request) is ever
+copied into a message.
 The SDK is imported only when a real connection is made (it opens a session at once, a network call), so tests
 and the rest of the trader do not need it installed. Webull may ask for a one-time approval in its app the
 first time a key is used (token-based two-factor check).
@@ -47,10 +50,15 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
 * No such order: NOT CONFIRMED. The order-detail page documents only 200, 401, 417 and 500 answers, and the
   error-code page (developer.webull.hk/apis/docs/error-codes.md; developer.webull.com has none) lists no
   order-not-found code. A search engine's copy of an older Webull HK error table (developer.webull.hk/api-doc/
-  develop/error, which now redirects) listed ORDER_NOT_FOUND as "the order does not exist". So "no such order"
-  is read from exactly two answers: a 200 whose order list is empty, or the error code ORDER_NOT_FOUND (on an
-  SDK ServerException, SDK core/exception/exceptions.py:31-37, or on a non-200 body). Everything else, a bare
-  404 included, is a failure. Check this against the test environment before relying on it.
+  develop/error, which now redirects) listed ORDER_NOT_FOUND as "the order does not exist". Nothing documents
+  that a 200 with an empty `orders` list means "no such order" either. Two answers are candidates: a 200 in the
+  documented combo shape whose `orders` is an explicitly empty list, and the error code ORDER_NOT_FOUND (on an
+  SDK ServerException, SDK core/exception/exceptions.py:31-37, or on a non-200 body). order_status returns None
+  for them only when the venue is built with confirmed_not_found=True; by default (False) both raise
+  WebullError saying that what they mean is not yet confirmed. Turn the flag on only after the answer has been
+  observed in Webull's test environment for a client order id that was never sent. Everything else, a bare
+  404, a bare [] and an `orders` list holding anything that is not an object included, raises: nothing
+  malformed is ever read as "no such order" or silently skipped.
 * order_v3.list_order_open(account_id, pagination_key=None): SDK order_operation_v3.py:204, GET
   /trading/orders/open-orders/list with the v3 version header (SDK trade/request/v3/get_order_open_request_v2.py).
   Docs /apis/docs/reference/order-open: the body is {data: [combo, ...], pagination_key}, each combo shaped
@@ -69,6 +77,13 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   200-299 (SDK core/client.py:357-359 and 424-428) and ClientException(error_code, error_msg) for a transport
   failure (SDK core/client.py:328). The SDK logs the whole request with its headers before raising
   (core/client.py:360-362), which is why its logger is silenced.
+* Logging: TradeClient.__init__ calls _init_logger (SDK trade/trade_client.py:41-47), which, unless the ApiClient
+  says its loggers are set (_stream_logger_set / _file_logger_set, line 43), points logger "webull.core" at INFO
+  and adds a StreamHandler on stdout and a TimedRotatingFileHandler on webull_trade_sdk.log in the working
+  directory (SDK core/client.py:393-422). This adapter sets both flags before building TradeClient, quiets every
+  "webull" logger before and after construction (removing and closing any handler but a NullHandler), and
+  removes webull_trade_sdk.log if construction created it empty. Not confirmed against a real TradeClient
+  (none is built in tests).
 """
 from __future__ import annotations
 
@@ -95,7 +110,8 @@ __all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfir
 # A status not in this table is `unknown_status`, never filled or cancelled.
 ORDER_STATES = {"PENDING": "open", "SUBMITTED": "open", "PARTIAL_FILLED": "partly_filled", "PARTIAL FILLED": "partly_filled",
                 "FILLED": "filled", "CANCELLED": "cancelled", "FAILED": "rejected"}
-# The one answer read as "no such order" besides an empty order list. Not confirmed for the US API: see the module notes.
+# The error code read as "no such order" (with an empty `orders` list), and only with confirmed_not_found=True.
+# Not confirmed for the US API: see the module notes.
 ORDER_NOT_FOUND_CODES = frozenset({"ORDER_NOT_FOUND"})
 
 
@@ -121,13 +137,21 @@ def order_payload(symbol: str, units: float, tag: str, limit_price: float | None
     """One order in Webull's format. `units` is signed: positive buys, negative sells what is held."""
     if not units:
         raise NotTransmitted("an order needs a non-zero quantity")
+    try:
+        amount = float(units)
+    except (TypeError, ValueError):
+        raise NotTransmitted(f"the quantity {units!r} is not a number") from None
+    if not math.isfinite(amount):
+        raise NotTransmitted(f"the quantity {units!r} is not a finite number")
     crypto = symbol.upper().endswith("-USD")
+    quantity = f"{abs(amount):.8f}".rstrip("0").rstrip(".") if crypto else f"{abs(amount):.5f}".rstrip("0").rstrip(".")
+    if float(quantity) == 0:
+        raise NotTransmitted(f"the quantity {abs(amount):g} rounds to 0 at Webull's {'8' if crypto else '5'} decimal places; an order needs a non-zero quantity")
     order = {"combo_type": "NORMAL", "client_order_id": client_order_id(tag), "market": "US",
              "symbol": symbol.upper().replace("-", "") if crypto else symbol.upper(),
              "instrument_type": "CRYPTO" if crypto else "EQUITY",
              "order_type": "LIMIT" if limit_price is not None else "MARKET",
-             "quantity": f"{abs(float(units)):.8f}".rstrip("0").rstrip(".") if crypto else f"{abs(float(units)):.5f}".rstrip("0").rstrip("."),
-             "side": "BUY" if units > 0 else "SELL", "time_in_force": "GTC" if crypto else "DAY", "entrust_type": "QTY"}
+             "quantity": quantity, "side": "BUY" if amount > 0 else "SELL", "time_in_force": "GTC" if crypto else "DAY", "entrust_type": "QTY"}
     if limit_price is not None:
         order["limit_price"] = f"{float(limit_price):.2f}"
     if not crypto:
@@ -151,12 +175,38 @@ def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION) -> dict | None:
     return data if ok else None
 
 
+# TradeClient._init_logger (SDK trade/trade_client.py:41-47) points logger "webull.core" at INFO and adds a StreamHandler
+# on stdout and a TimedRotatingFileHandler on this file in the working directory (SDK core/client.py:393-422).
+SDK_LOGGERS = ("webull", "webull.core", "webull.core.client")
+SDK_LOG_FILE = "webull_trade_sdk.log"
+
+
 def _quiet_sdk_logging() -> None:
-    """The SDK logs whole requests, headers included, when a call fails. Keep the App Key out of every log."""
-    for name in ("webull", "webull.core.client"):
+    """The SDK logs whole requests, headers included, when a call fails. Keep the App Key out of every log: every
+    "webull" logger is set above CRITICAL and stops propagating, and every handler the SDK added (anything but a
+    NullHandler) is removed and closed. Run before and after the client is built: building it re-dirties them."""
+    names = set(SDK_LOGGERS) | {n for n in logging.root.manager.loggerDict if n == "webull" or n.startswith("webull.")}
+    for name in sorted(names):
         log = logging.getLogger(name)
         log.setLevel(logging.CRITICAL + 1)
         log.propagate = False
+        for handler in list(log.handlers):
+            if isinstance(handler, logging.NullHandler):
+                continue
+            log.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+
+def _remove_new_empty_sdk_log(existed_before: bool, path: Path) -> None:
+    """Remove the SDK's log file if building the client created it and nothing was written to it."""
+    try:
+        if not existed_before and path.is_file() and path.stat().st_size == 0:
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _safe(exc: BaseException) -> str:
@@ -224,30 +274,42 @@ def _trader_symbol(symbol: Any, instrument_type: Any) -> str:
 
 
 def _order_items(body: Any) -> list[dict] | None:
-    """Every order item in a documented combo {orders: [...]}, a plain order, or a list of either.
-    None when the body has none of those shapes."""
+    """Every order item in a documented combo {orders: [...]}, a plain order, or a list of either. None (an
+    unexpected shape) when the body is none of those, when an `orders` entry or a list element is not an object,
+    or when a list nests a list: nothing malformed is skipped."""
     if isinstance(body, list):
-        found = [_order_items(b) for b in body]
-        if any(f is None for f in found):
-            return None
-        return [item for f in found for item in f]
+        found = [_combo_items(b) for b in body]
+        return None if any(f is None for f in found) else [item for f in found for item in f]
+    return _combo_items(body)
+
+
+def _combo_items(body: Any) -> list[dict] | None:
     if not isinstance(body, dict):
         return None
-    if isinstance(body.get("orders"), list):
-        return [o for o in body["orders"] if isinstance(o, dict)]
-    if "status" in body:
-        return [body]
-    return None
+    if "orders" in body:
+        orders = body["orders"]
+        return orders if isinstance(orders, list) and all(isinstance(o, dict) for o in orders) else None
+    return [body] if "status" in body else None
+
+
+def _side_sign(side: Any) -> float | None:
+    side = side.strip().upper() if isinstance(side, str) else None
+    return 1.0 if side == "BUY" else -1.0 if side in ("SELL", "SHORT") else None
 
 
 def _fee(item: dict) -> float | None:
     """commission.actual_commission plus every fees[].actual_value; None if none is given or one is unreadable."""
     values = []
-    commission = item.get("commission")
-    if isinstance(commission, dict) and "actual_commission" in commission:
-        values.append(commission["actual_commission"])
-    if isinstance(item.get("fees"), list):
-        values += [f.get("actual_value") for f in item["fees"] if isinstance(f, dict)]
+    commission, fees = item.get("commission"), item.get("fees")
+    if commission is not None:
+        if not isinstance(commission, dict):
+            return None
+        if "actual_commission" in commission:
+            values.append(commission["actual_commission"])
+    if fees is not None:
+        if not isinstance(fees, list) or not all(isinstance(f, dict) for f in fees):
+            return None
+        values += [f.get("actual_value") for f in fees]
     if not values:
         return None
     numbers = [_number(v) for v in values]
@@ -267,7 +329,8 @@ class WebullVenue:
     """Orders and account reads on one Webull account."""
 
     def __init__(self, app_key: str, app_secret: str, environment: str = "sandbox", account_id: str | None = None,
-                 client: Any | None = None, confirmation_file: str | Path = LIVE_CONFIRMATION, region: str = "us") -> None:
+                 client: Any | None = None, confirmation_file: str | Path = LIVE_CONFIRMATION, region: str = "us",
+                 confirmed_not_found: bool = False) -> None:
         if environment not in HOSTS:
             raise WebullError(f"environment must be one of {sorted(HOSTS)}")
         if not str(app_key).strip() or not str(app_secret).strip():
@@ -280,15 +343,23 @@ class WebullVenue:
                 from webull.trade.trade_client import TradeClient
             except ImportError as exc:
                 raise WebullError("the Webull SDK is not installed: uv pip install 'webull-openapi-python-sdk>=3.0.4'") from exc
+            sdk_log = Path.cwd() / SDK_LOG_FILE
+            sdk_log_existed = sdk_log.exists()
             _quiet_sdk_logging()
             try:                                             # the SDK opens a session here: this is a network call
                 api = ApiClient(app_key, app_secret, region)
                 api.add_endpoint(region, self.host)
+                # TradeClient adds its stdout and file loggers only when neither of these is set (SDK trade_client.py:43).
+                api._stream_logger_set = api._file_logger_set = True
                 client = TradeClient(api)
             except Exception as exc:
                 raise WebullError(f"could not open a Webull session on {self.host}: {_safe(exc)}") from None
+            finally:
+                _quiet_sdk_logging()
+                _remove_new_empty_sdk_log(sdk_log_existed, sdk_log)
         self._client = client
         self._account_id = account_id
+        self._confirmed_not_found = confirmed_not_found is True
 
     @classmethod
     def from_secrets(cls, environ=None, **kwargs) -> "WebullVenue":
@@ -303,7 +374,10 @@ class WebullVenue:
     # ---- reading (allowed in both environments)
     def accounts(self) -> list[dict]:
         body = _call(self._client.account_v2.get_account_list)
-        return body if isinstance(body, list) else list(body.get("accounts", body.get("data", [])))
+        rows = body if isinstance(body, list) else body.get("accounts", body.get("data", [])) if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise WebullError("Webull's account list has an unexpected shape")
+        return list(rows)
 
     @property
     def account_id(self) -> str:
@@ -311,6 +385,8 @@ class WebullVenue:
             found = self.accounts()
             if len(found) != 1:
                 raise WebullError(f"{len(found)} accounts are visible; set WEBULL_ACCOUNT_ID to choose one")
+            if found[0].get("account_id") in (None, ""):
+                raise WebullError("Webull's account list names no account_id")
             self._account_id = str(found[0]["account_id"])
         return self._account_id
 
@@ -320,7 +396,9 @@ class WebullVenue:
     def positions(self) -> dict[str, float]:
         """Held quantity by the trader's own symbol names (crypto as BTC-USD)."""
         body = _call(self._client.account_v2.get_account_position, self.account_id)
-        rows = body if isinstance(body, list) else list(body.get("positions", body.get("holdings", body.get("data", []))))
+        rows = body if isinstance(body, list) else body.get("positions", body.get("holdings", body.get("data", []))) if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise WebullError("Webull's position list has an unexpected shape")
         out: dict[str, float] = {}
         for row in rows:
             sym = str(row.get("symbol", "")).upper()
@@ -354,7 +432,8 @@ class WebullVenue:
         payload) runs before the single place_order call, and any failure there raises NotTransmitted: the order
         was certainly not sent. An error raised after the place_order call began is a plain WebullError of
         UNKNOWN OUTCOME: the order may or may not have reached Webull, so read order_status(tag) before retrying
-        (the same tag gives the same client order id, which Webull keeps unique per account)."""
+        (the same tag gives the same client order id, which Webull keeps unique per account). Whatever the client
+        raises once place_order has been called, a NotTransmitted included, leaves as a plain WebullError."""
         try:
             account = self.account_id
             if units < 0:
@@ -370,7 +449,10 @@ class WebullVenue:
             raise NotTransmitted(f"not sent: {exc}") from None
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
             raise NotTransmitted(f"not sent: {type(exc).__name__}: {str(exc)[:160]}") from None
-        body = _call(self._client.order_v3.place_order, account, [order])      # the only order call; nothing refuses after it
+        try:
+            body = _call(self._client.order_v3.place_order, account, [order])  # the only order call; nothing refuses after it
+        except NotTransmitted as exc:                                     # raised from inside the call: outcome unknown
+            raise WebullError(f"outcome unknown: the order call began and then failed: {exc}") from None
         return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": self._venue_order_id(body, order["client_order_id"]),
                 "environment": self.environment, "side": order["side"], "quantity": order["quantity"],
                 "response": body if isinstance(body, (dict, list)) else str(body)[:200]}
@@ -408,9 +490,13 @@ class WebullVenue:
     # ---- what happened to orders (reading: allowed in both environments)
     def order_status(self, tag: str) -> dict | None:
         """What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
-        raw_status}, or None only when Webull positively answers that no such order exists (an empty order list, or
-        the error code ORDER_NOT_FOUND; see the module notes, not confirmed for the US API). Any other failure,
-        an unreachable venue included, raises WebullError: it never looks like "no such order".
+        raw_status}, or None only when the venue was built with confirmed_not_found=True and Webull gives one of the
+        two answers read as "no such order": a 200 in the documented combo shape whose `orders` is an explicitly
+        empty list, or the error code ORDER_NOT_FOUND. Neither is documented for the US API (see the module notes),
+        so with the default confirmed_not_found=False both raise WebullError; turn the flag on only after that answer
+        has been observed in Webull's test environment for an id that was never sent. Any other failure (an
+        unreachable venue, a malformed answer such as {"orders": ["junk"]} or a bare []) raises WebullError: it
+        never looks like "no such order".
 
         `state` comes from ORDER_STATES; `filled_units` is unsigned; a number that is absent or unreadable is None,
         never 0 (filled_units is 0.0 only when Webull says 0); avg_price is None when Webull gives 0 (nothing filled);
@@ -423,18 +509,18 @@ class WebullVenue:
             raise
         except Exception as exc:
             if _not_found_code(getattr(exc, "error_code", None)):
-                return None
+                return self._no_such_order("the error code ORDER_NOT_FOUND")
             raise WebullError("Webull call failed: " + _safe(exc)) from None
         if getattr(res, "status_code", None) != 200:
             err = _json(res)
             if isinstance(err, dict) and _not_found_code(err.get("error_code")):
-                return None
+                return self._no_such_order("the error code ORDER_NOT_FOUND")
         body = _body(res)
+        if isinstance(body, dict) and isinstance(body.get("orders"), list) and not body["orders"]:
+            return self._no_such_order("an empty order list")
         items = _order_items(body)
-        if items is None:
-            raise WebullError(f"Webull's order detail has no order list (a {type(body).__name__}); cannot tell what happened")
-        if not items:
-            return None
+        if not items:                                                     # None (malformed) or a bare empty list
+            raise WebullError(f"Webull's order detail has an unexpected shape (a {type(body).__name__}); cannot tell what happened")
         mine = [o for o in items if o.get("client_order_id") == cid]
         if not mine and len(items) == 1 and not items[0].get("client_order_id"):
             mine = items
@@ -445,29 +531,38 @@ class WebullVenue:
         return {"state": _state(item.get("status")), "filled_units": _filled_units(item), "avg_price": price if price else None,
                 "fee": _fee(item), "venue_order_id": str(item["order_id"]) if item.get("order_id") else None, "raw_status": item.get("status")}
 
+    def _no_such_order(self, answer: str) -> None:
+        if self._confirmed_not_found:
+            return None
+        raise WebullError(f"Webull shows no order under this client order id ({answer}); what that answer means is not yet "
+                          "confirmed, so the outcome stays unknown (see confirmed_not_found)")
+
     def open_orders(self) -> list[dict]:
         """Every open order of the account, following pagination_key to the last page (docs order-open: an absent
         key marks the last page). Each is {client_order_id, venue_order_id, symbol (the trader's naming), units
-        (signed: sells negative; None if unreadable), state, filled_units, raw_status}."""
+        (signed: sells and shorts negative; None if unreadable or the side is not BUY, SELL or SHORT), state,
+        filled_units, raw_status}. A malformed page (an entry that is not an object, a bare empty list) or a
+        pagination key that is not a non-empty string raises WebullError."""
         account = self.account_id
         out: list[dict] = []
         key, seen = None, set()
         while True:
             body = _call(self._client.order_v3.list_order_open, account) if key is None else _call(self._client.order_v3.list_order_open, account, key)
             rows = body.get("data") if isinstance(body, dict) else body      # a body without a `data` list is not "none open"
-            items = _order_items(rows) if isinstance(rows, list) else None
-            if items is None:
+            items = _order_items(rows) if isinstance(rows, list) and (rows or isinstance(body, dict)) else None
+            if items is None:                                             # a bare top-level [] is malformed too
                 raise WebullError("Webull's open-order list has an unexpected shape")
             for item in items:
-                qty = _number(item.get("total_quantity"))
-                sign = -1.0 if str(item.get("side", "")).upper() in ("SELL", "SHORT") else 1.0
+                qty, sign = _number(item.get("total_quantity")), _side_sign(item.get("side"))
                 out.append({"client_order_id": item.get("client_order_id"), "venue_order_id": str(item["order_id"]) if item.get("order_id") else None,
                             "symbol": _trader_symbol(item.get("symbol"), item.get("instrument_type")),
-                            "units": None if qty is None else sign * abs(qty), "state": _state(item.get("status")),
+                            "units": None if qty is None or sign is None else sign * abs(qty), "state": _state(item.get("status")),
                             "filled_units": _filled_units(item), "raw_status": item.get("status")})
             key = body.get("pagination_key") if isinstance(body, dict) else None
-            if not key:
+            if key is None:
                 return out
+            if not isinstance(key, str) or not key:
+                raise WebullError(f"Webull's pagination key is not a non-empty string (a {type(key).__name__})")
             if key in seen:
                 raise WebullError("Webull repeated a pagination key; stopping rather than looping")
             seen.add(key)
@@ -475,18 +570,27 @@ class WebullVenue:
     def cash(self) -> dict:
         """{cash, settled_cash, buying_power, currency} from the balance call (docs account-balance). `cash` is
         total_cash_balance, else the currency entry's cash_balance; settled_cash and buying_power come from the
-        account_currency_assets entry in total_asset_currency (USD, or the only entry, when that is not given).
-        A field that is absent or unreadable is None."""
+        account_currency_assets entry in total_asset_currency, and are None when there is no entry in that currency
+        (another currency's figures are never labelled with it). Only when total_asset_currency is absent is the
+        only entry used, and `currency` is then that entry's own currency. A field that is absent or unreadable is
+        None; an account_currency_assets that is not a list of objects raises WebullError."""
         body = self.balance()
         if not isinstance(body, dict):
             raise WebullError(f"Webull's balance answer is a {type(body).__name__}, not an object")
+        assets = body.get("account_currency_assets")
+        assets = [] if assets is None else assets
+        if not isinstance(assets, list) or not all(isinstance(a, dict) for a in assets):
+            raise WebullError("Webull's balance has an unexpected shape: account_currency_assets is not a list of objects")
         currency = body.get("total_asset_currency")
-        assets = [a for a in body.get("account_currency_assets") or [] if isinstance(a, dict)]
-        wanted = str(currency or "USD").upper()
-        entry = next((a for a in assets if str(a.get("currency", "")).upper() == wanted), assets[0] if len(assets) == 1 else {})
+        if currency:
+            currency = str(currency)
+            entry = next((a for a in assets if str(a.get("currency", "")).upper() == currency.upper()), {})
+        else:
+            entry = assets[0] if len(assets) == 1 else {}
+            currency = str(entry["currency"]) if entry.get("currency") else None
         cash = _number(body.get("total_cash_balance"))
         return {"cash": cash if cash is not None else _number(entry.get("cash_balance")), "settled_cash": _number(entry.get("settled_cash")),
-                "buying_power": _number(entry.get("buying_power")), "currency": str(currency) if currency else None}
+                "buying_power": _number(entry.get("buying_power")), "currency": currency}
 
     # ---- a read-only readiness report
     def check(self) -> dict:
@@ -497,9 +601,12 @@ class WebullVenue:
             bal = self.balance()
             report["balance_fields"] = sorted(bal)[:20] if isinstance(bal, dict) else type(bal).__name__
             report["positions"] = len(self.positions())
-            report["open_orders"] = len(self.open_orders())
         except WebullError as exc:
             report["balance"] = str(exc)
+        try:
+            report["open_orders"] = len(self.open_orders())
+        except WebullError as exc:
+            report["open_orders_error"] = str(exc)
         confirmation = load_live_confirmation(self._confirmation_file)
         report["real_money_orders"] = ("off: test environment" if self.environment != "production" else
                                        "off: no written confirmation" if confirmation is None else

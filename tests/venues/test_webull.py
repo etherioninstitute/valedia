@@ -1,4 +1,8 @@
+import io
 import json
+import logging
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -200,9 +204,9 @@ def detail(*orders, cid=None):
     return {"client_order_id": cid or wb.client_order_id("t"), "combo_order_id": "C-1", "combo_type": "NORMAL", "orders": list(orders)}
 
 
-def status_venue(tmp_path, answer, tag="t", env="sandbox"):
+def status_venue(tmp_path, answer, tag="t", env="sandbox", **kw):
     client = FakeClient(details={wb.client_order_id(tag): answer})
-    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json"), client
+    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json", **kw), client
 
 
 def test_refusals_made_here_are_marked_not_transmitted_and_nothing_is_sent(tmp_path):
@@ -254,10 +258,38 @@ def test_an_unlisted_status_is_unknown_never_filled_or_cancelled(tmp_path, raw):
     assert out["state"] == "unknown_status"
 
 
-@pytest.mark.parametrize("answer", [detail(), Response({"orders": []}), ServerError("ORDER_NOT_FOUND"),
-                                    Response({"error_code": "ORDER_NOT_FOUND", "message": "order does not exist"}, 417)])
-def test_order_status_is_none_only_when_webull_says_there_is_no_such_order(tmp_path, answer):
-    assert status_venue(tmp_path, answer)[0].order_status("t") is None
+NOT_FOUND_ANSWERS = [detail(), Response({"orders": []}), ServerError("ORDER_NOT_FOUND"),
+                     Response({"error_code": "ORDER_NOT_FOUND", "message": "order does not exist"}, 417)]
+MALFORMED_ANSWERS = [Response({"orders": ["junk"]}), Response([]), Response({"orders": [order("FILLED"), "junk"]}),
+                     Response([detail(order("FILLED")), "junk"]), Response({"orders": None}), Response([[]])]
+
+
+@pytest.mark.parametrize("answer", NOT_FOUND_ANSWERS)
+def test_order_status_is_none_only_when_webull_says_there_is_no_such_order_and_that_answer_is_confirmed(tmp_path, answer):
+    assert status_venue(tmp_path, answer, confirmed_not_found=True)[0].order_status("t") is None
+
+
+@pytest.mark.parametrize("answer", NOT_FOUND_ANSWERS)
+def test_an_unconfirmed_no_such_order_answer_raises_by_default(tmp_path, answer):
+    v, _ = status_venue(tmp_path, answer)
+    with pytest.raises(wb.WebullError, match="not yet confirmed") as exc:
+        v.order_status("t")
+    assert KEY not in str(exc.value) and SECRET not in str(exc.value)
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("answer", MALFORMED_ANSWERS)
+def test_a_malformed_order_detail_raises_and_is_never_no_such_order(tmp_path, answer, confirmed):
+    v, _ = status_venue(tmp_path, answer, confirmed_not_found=confirmed)
+    with pytest.raises(wb.WebullError, match="unexpected shape"):
+        v.order_status("t")
+
+
+def test_the_not_found_flag_is_passed_through_from_secrets(tmp_path):
+    env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET}
+    client = FakeClient(details={wb.client_order_id("t"): detail()})
+    v = wb.WebullVenue.from_secrets(env, client=client, confirmation_file=tmp_path / "x.json", confirmed_not_found=True)
+    assert v.order_status("t") is None
 
 
 @pytest.mark.parametrize("answer", [ConnectionError("no route to host " + KEY), ServerError("SYSTEM_ERROR", 500),
@@ -359,4 +391,154 @@ def test_check_reports_the_count_of_open_orders(tmp_path):
     assert report["open_orders"] == 2
     broken = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", 500)})
     report = wb.WebullVenue(KEY, SECRET, client=broken, confirmation_file=tmp_path / "x.json").check()
-    assert "open_orders" not in report and "SYSTEM_ERROR" in report["balance"] and KEY not in json.dumps(report)
+    assert "open_orders" not in report and "SYSTEM_ERROR" in report["open_orders_error"] and KEY not in json.dumps(report)
+    assert "balance" not in report and report["positions"] == 0          # the balance read worked: no error under its key
+
+
+# ---- T9 rev 2: repairs after blind verification
+
+@pytest.mark.parametrize("page", [{"data": ["junk"]}, {"data": [{"orders": ["junk"]}]}, {"data": [detail(order("SUBMITTED")), 3]}, [],
+                                  {"data": [{"orders": None}]}])
+def test_a_malformed_open_order_list_raises_and_nothing_is_skipped(tmp_path, page):
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError, match="unexpected shape"):
+        v.open_orders()
+
+
+@pytest.mark.parametrize("key", [{"next": 2}, ["p2"], 2, ""])
+def test_a_pagination_key_that_is_not_a_string_raises_webull_error_everywhere(tmp_path, key):
+    pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")], "pagination_key": key}}
+    make = lambda: wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages=pages), confirmation_file=tmp_path / "x.json")  # noqa: E731
+    with pytest.raises(wb.WebullError, match="pagination key"):
+        make().open_orders()
+    client_v = make()
+    with pytest.raises(wb.WebullError, match="pagination key"):
+        client_v.cancel_all_open()
+    assert [c for c in client_v._client.calls if c[0] == "cancel"] == []        # nothing is cancelled from a list that failed
+    report = make().check()
+    assert "pagination key" in report["open_orders_error"] and "open_orders" not in report
+
+
+@pytest.mark.parametrize("bad", [{"accounts": "not a list"}, "accounts", [3], [{"no_id": 1}], 7, {"accounts": [None]}])
+def test_malformed_account_and_position_answers_raise_webull_error(tmp_path, bad):
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(accounts=bad), confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError):
+        _ = v.account_id
+    for rows in (["junk"], "junk", [{"symbol": "SPY", "quantity": "1"}, 3]):
+        p = wb.WebullVenue(KEY, SECRET, client=FakeClient(positions=rows), confirmation_file=tmp_path / "x.json")
+        with pytest.raises(wb.WebullError):
+            p.positions()
+
+
+def test_cash_never_labels_another_currencys_figures(tmp_path):
+    hkd_only = {"total_asset_currency": "USD", "total_cash_balance": "100",
+                "account_currency_assets": [{"currency": "HKD", "cash_balance": "780", "settled_cash": "700", "buying_power": "750"}]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=hkd_only), confirmation_file=tmp_path / "x.json")
+    assert v.cash() == {"cash": 100.0, "settled_cash": None, "buying_power": None, "currency": "USD"}
+    no_total = {"account_currency_assets": [{"currency": "HKD", "cash_balance": "780", "settled_cash": "700", "buying_power": "750"}]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=no_total), confirmation_file=tmp_path / "x.json")
+    assert v.cash() == {"cash": 780.0, "settled_cash": 700.0, "buying_power": 750.0, "currency": "HKD"}
+    for bad in ({"account_currency_assets": "x"}, {"account_currency_assets": ["junk"]}):
+        with pytest.raises(wb.WebullError, match="unexpected shape"):
+            wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=bad), confirmation_file=tmp_path / "x.json").cash()
+
+
+def _dirty_sdk_loggers(log_file, stream):
+    """What TradeClient._init_logger does (SDK trade_client.py:41-47, core/client.py:393-422): logger 'webull.core'
+    at DEBUG then INFO, a StreamHandler on stdout and a TimedRotatingFileHandler on webull_trade_sdk.log."""
+    from logging.handlers import TimedRotatingFileHandler
+    log = logging.getLogger("webull.core")
+    log.setLevel(logging.DEBUG)
+    log.propagate = True
+    stream_handler, file_handler = logging.StreamHandler(stream), TimedRotatingFileHandler(filename=str(log_file), when="H", encoding="utf-8")
+    log.addHandler(stream_handler)
+    log.addHandler(file_handler)
+    log.setLevel(logging.INFO)
+    return stream_handler, file_handler
+
+
+
+def test_the_sdks_loggers_are_quiet_and_their_handlers_closed_after_quieting(tmp_path):
+    stream, log_file = io.StringIO(), tmp_path / "webull_trade_sdk.log"
+    stream_handler, file_handler = _dirty_sdk_loggers(log_file, stream)
+    try:
+        wb._quiet_sdk_logging()
+        core = logging.getLogger("webull.core")
+        assert stream_handler not in core.handlers and file_handler not in core.handlers
+        assert file_handler.stream is None                                   # closed
+        assert not core.isEnabledFor(logging.CRITICAL) and core.propagate is False
+        logging.getLogger("webull.core.client").error("request headers x-app-key=%s", KEY)
+        core.error("request headers x-app-key=%s", KEY)
+        assert stream.getvalue() == "" and log_file.read_text() == ""
+    finally:
+        for h in (stream_handler, file_handler):
+            logging.getLogger("webull.core").removeHandler(h)
+            h.close()
+
+
+def test_an_empty_sdk_log_created_while_building_the_client_is_removed(tmp_path, monkeypatch):
+    """A stand-in SDK whose TradeClient dirties the loggers and creates the log file the way the real one does."""
+    monkeypatch.chdir(tmp_path)
+    stream, seen = io.StringIO(), {}
+
+    class FakeApiClient:
+        def __init__(self, key, secret, region):
+            pass
+
+        def add_endpoint(self, region, host):
+            seen["host"] = host
+
+    class FakeTradeClient:
+        def __init__(self, api):
+            seen["flags"] = (getattr(api, "_stream_logger_set", False), getattr(api, "_file_logger_set", False))
+            seen["handlers"] = _dirty_sdk_loggers(tmp_path / "webull_trade_sdk.log", stream)    # as if it ignored the flags
+            self.account_v2 = self.order_v3 = None
+
+    monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=FakeApiClient))
+    monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=FakeTradeClient))
+    wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json")
+    assert seen["host"] == wb.SANDBOX_HOST and seen["flags"] == (True, True)    # the SDK is told its loggers are already set
+    assert not (tmp_path / "webull_trade_sdk.log").exists()
+    core = logging.getLogger("webull.core")
+    assert all(h not in core.handlers for h in seen["handlers"]) and not core.isEnabledFor(logging.CRITICAL)
+    core.error("x-app-key=%s", KEY)
+    assert stream.getvalue() == ""
+    kept = tmp_path / "webull_trade_sdk.log"                              # a log that was there before is never removed
+    kept.write_text("older lines\n")
+    wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json")
+    assert kept.read_text() == "older lines\n"
+    for h in seen["handlers"]:
+        h.close()
+
+
+@pytest.mark.parametrize("side", [None, "", "HOLD", 1])
+def test_an_open_order_with_an_unknown_side_has_no_units(tmp_path, side):
+    item = order("SUBMITTED", cid="c-1", side=side)
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: {"data": [detail(item, cid="c-1")]}}), confirmation_file=tmp_path / "x.json")
+    assert v.open_orders()[0]["units"] is None
+    short = order("SUBMITTED", cid="c-2", side="SHORT", total_quantity="3")
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: {"data": [detail(short, cid="c-2")]}}), confirmation_file=tmp_path / "x.json")
+    assert v.open_orders()[0]["units"] == -3.0
+
+
+def test_nothing_out_of_submit_after_place_order_began_is_not_transmitted(tmp_path):
+    for raised in (wb.NotTransmitted("a refusal raised inside the SDK call"), wb.LiveTradingNotConfirmed("inside the call")):
+        client = FakeClient()
+        client.order_v3.place_order = lambda a, orders, raised=raised: (client.calls.append(("place", a, orders)), (_ for _ in ()).throw(raised))[1]
+        v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+        with pytest.raises(wb.WebullError) as exc:
+            v.submit("SPY", 1.0, "t")
+        assert not isinstance(exc.value, wb.NotTransmitted) and len(client.placed()) == 1 and "unknown" in str(exc.value)
+
+
+@pytest.mark.parametrize("units", [float("nan"), float("inf"), -float("inf"), 4e-6, -4e-6, 1e-9])
+def test_units_that_are_not_finite_or_format_to_zero_are_not_transmitted(tmp_path, units):
+    with pytest.raises(wb.NotTransmitted):
+        wb.order_payload("SPY", units, "t")
+    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}])
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", units, "t")
+    with pytest.raises(wb.NotTransmitted):
+        wb.order_payload("BTC-USD", units / 1000 if abs(units) == 4e-6 else units, "t")      # crypto rounds to 8 places
+    assert client.placed() == []
+    assert wb.order_payload("BTC-USD", 4e-6, "t")["quantity"] == "0.000004"            # small but not zero: allowed
