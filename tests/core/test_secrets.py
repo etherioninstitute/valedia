@@ -204,16 +204,16 @@ def test_guard_redacts_print_stderr_and_a_traceback(capsys):
 
 def test_guard_catches_a_secret_split_across_two_writes(tmp_path, monkeypatch):
     value = _made_up(random.Random(8), 32)
-    target = open(tmp_path / "out.txt", "w")                  # a real file: the guard holds an unfinished line
+    target = _Screen()                                        # the process's standard output: it holds back
     monkeypatch.setattr(sys, "stdout", target)
+    monkeypatch.setattr(sys, "__stdout__", target)
     _remember(value)
     sys.stdout.write("key " + value[:13])
     sys.stdout.write(value[13:] + " end\n")
     sys.stdout.write("tail without newline")
     sys.stdout.flush()
     s.remove_output_guard()
-    target.close()
-    out = (tmp_path / "out.txt").read_text()
+    out = "".join(target.parts)
     leaked = _leaks(out, value)
     kept = out == "key <secret> end\ntail without newline"
     assert not leaked and kept
@@ -264,19 +264,28 @@ class _Stream:
         return 97
 
 
+class _Screen(_Stream):
+    """A stand-in for the process's own standard output (file number 1) that records every write."""
+
+    def fileno(self):
+        return 1
+
+
 def test_guard_keeps_the_stream_attributes_installs_once_and_removes_cleanly(monkeypatch):
-    out, err = _Stream(), _Stream()
+    out, err = _Screen(), _Stream()                          # the screen holds back, another stream never does
     monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "__stdout__", out)
     monkeypatch.setattr(sys, "stderr", err)
     s.install_output_guard()
     first = sys.stdout
     s.install_output_guard()
     assert sys.stdout is first and first is not out
-    assert sys.stdout.isatty() and sys.stdout.fileno() == 97 and sys.stdout.encoding == "latin-1" and sys.stdout.mode == "w"
+    assert sys.stdout.isatty() and sys.stdout.fileno() == 1 and sys.stdout.encoding == "latin-1" and sys.stdout.mode == "w"
     sys.stdout.write("plain text, no secret here\n")
     sys.stdout.writelines(["a", "b\n"])
     sys.stdout.write("held")
-    assert out.parts == ["plain text, no secret here\n", "ab\n"]
+    sys.stderr.write("not held")
+    assert out.parts == ["plain text, no secret here\n", "ab\n"] and err.parts == ["not held"]
     sys.stdout.flush()
     assert out.parts[-1] == "held" and out.flushes == 1
     s.remove_output_guard()
@@ -769,16 +778,15 @@ def test_a_phrase_broken_by_lines_or_writes_never_reaches_the_screen(tmp_path, c
     assert code == 0 and not leaked and "MARK start" in out and "MARK end" in out and "<secret>" in out + err
 
 
-class _Ledger(_Stream):
-    """A stand-in real file (it has a file number) that records every write it receives."""
 
 
 def test_with_a_phrase_remembered_ordinary_lines_go_out_before_the_write_returns(monkeypatch):
     rng = random.Random(40)
     phrase = _phrase(rng, 12)
     others = [w for w in WORDS if w not in phrase]
-    target = _Ledger()
+    target = _Screen()
     monkeypatch.setattr(sys, "stdout", target)
+    monkeypatch.setattr(sys, "__stdout__", target)
     s.remember(" ".join(phrase))
     late, written = 0, ""
     for _ in range(10_000):
@@ -793,8 +801,9 @@ def test_with_a_phrase_remembered_ordinary_lines_go_out_before_the_write_returns
 
 
 def test_with_no_phrase_remembered_the_timing_is_as_before(monkeypatch):
-    target = _Ledger()
+    target = _Screen()
     monkeypatch.setattr(sys, "stdout", target)
+    monkeypatch.setattr(sys, "__stdout__", target)
     _remember(_made_up(random.Random(41), 32))
     steps = []
     for text in ("a", "b\n", "c\r", "d"):
@@ -831,38 +840,6 @@ def test_nothing_written_to_a_guarded_stream_is_lost(tmp_path, case):
     code, out, err = _run_child(tmp_path, IN_MEMORY_CASES[case], MADE_UP_CHILD_TOKEN=value)
     leaked = _leaks(out + err, value)
     assert code == 0 and not leaked and "OK" in out and "LOST" not in out
-
-
-def test_load_env_leaves_ordinary_settings_alone(tmp_path):
-    settings = {"KEYBOARD_LAYOUT": "us english qwerty standard", "TOKEN_SCOPES": "read write trade admin",
-                "API_KEY_NOTE": "rotate this key monthly", "WEBULL_ACCOUNT_LABEL": "main brokerage account two",
-                "MNEMONIC_LANGUAGE": "japanese", "MNEMONIC_WORDLIST": "english"}
-    f = tmp_path / "trading.env"
-    f.write_text("".join(f"{k}={v}\n" for k, v in settings.items()))
-    os.chmod(f, 0o600)
-    s.load_env(f, environ={})
-    caught = sorted(k for k, v in settings.items() if s.redact(f"x {v} y")[1])
-    assert caught == []
-
-
-def test_load_env_remembers_phrases_under_every_phrase_name(tmp_path):
-    rng = random.Random(42)
-    names = ["WALLET_SEED", "SEED", "WALLET_WORDS", "BIP39_WORDS", "WALLET_PHRASE", "WALLET_MNEMONIC", "RECOVERY_CODE"]
-    values = {n: " ".join(_phrase(rng, 12)) for n in names}
-    values["BROKER_KEY"] = " ".join(_phrase(rng, 12))                          # 12 words, letters only
-    values["OTHER_KEY"] = " ".join(_phrase(rng, 11) + ["w0rd"])               # 12 words, one not letters only
-    values["SHORT_TOKEN"] = " ".join(_phrase(rng, 8))                         # 8 words under a non-phrase name
-    values["MNEMONIC_SALT"] = _made_up(rng, 12) + "9"                         # no whitespace, not purely letters
-    f = tmp_path / "trading.env"
-    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
-    os.chmod(f, 0o600)
-    s.load_env(f, environ={})
-    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
-    assert caught == sorted(names + ["BROKER_KEY", "MNEMONIC_SALT"])
-    doc = s._looks_like_credential.__doc__.upper()
-    listed = all(w in doc for w in ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "ACCOUNT", "MNEMONIC", "SEED", "PHRASE",
-                                    "RECOVERY", "WORDS"))
-    assert listed
 
 
 def test_any_short_run_of_non_letters_between_phrase_words_counts_as_a_separator():
@@ -921,7 +898,7 @@ def test_the_guard_never_wraps_a_stream_that_already_reaches_a_guard(monkeypatch
 def test_remove_inside_a_redirect_leaves_nothing_redacting(tmp_path):
     body = ("secrets.secret('MADE_UP_CHILD_TOKEN')\n"
             "with contextlib.redirect_stdout(io.StringIO()):\n    secrets.remove_output_guard()\n"
-            "g = sys.stdout\nactive = isinstance(g, secrets._GuardedStream) and getattr(g, '_active', True)\n"
+            "g = sys.stdout\nactive = isinstance(g, secrets._GuardedStream) and secrets._guard_wanted\n"
             "secrets.remember('another-made-up-value-1234')\n"
             "h = sys.stdout\nlayers = 0\nwhile h is not None:\n"
             "    layers += isinstance(h, secrets._GuardedStream)\n    h = h.__dict__.get('_stream')\n"
@@ -1007,19 +984,6 @@ def test_spaced_groups_broken_by_lines_or_writes_never_reach_the_screen(tmp_path
     assert code == 0 and not leaked and "MARK end" in out and "<secret>" in out
 
 
-def test_load_env_remembers_spaced_numbers_under_credential_and_phrase_names(tmp_path):
-    rng = random.Random(52)
-    values = {"CARD_KEY": " ".join(_groups(rng, 4)), "BACKUP_TOKEN": " ".join(_groups(rng, 5, True)),
-              "WALLET_SEED": " ".join(_groups(rng, 4)), "PIN_NOTE_KEY": "account 2 of 3",
-              "SCOPE_TOKEN": "read write trade admin"}
-    f = tmp_path / "trading.env"
-    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
-    os.chmod(f, 0o600)
-    s.load_env(f, environ={})
-    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
-    assert caught == ["BACKUP_TOKEN", "CARD_KEY", "WALLET_SEED"]
-
-
 def _number_lines(rng, groups, n):
     """Ordinary lines of spaced numbers: dates, times, prices, table rows, where the remembered
     groups turn up often, one at a time or a few together."""
@@ -1054,3 +1018,177 @@ def test_ordinary_spaced_numbers_are_never_replaced_unless_four_groups_match():
         replaced += n
         leaked += _group_leaks(out, groups)
     assert replaced == expected and not leaked
+
+
+# ---- rev 7 -------------------------------------------------------------------------------------
+
+LOST_CASES = {
+    "the verifier's case": (
+        "with open('out.txt', 'w') as f, contextlib.redirect_stdout(f):\n"
+        "    secrets.redact('x')\n    sys.stdout.write('{\"r\":1}')\n"
+        "print('OK' if open('out.txt').read() == '{\"r\":1}' else 'LOST')"),
+    "a phrase word at the end of a line in a file": (
+        "secrets.remember(os.environ['MADE_UP_CHILD_PHRASE'])\nW = os.environ['MADE_UP_CHILD_PHRASE'].split()\n"
+        "with open('out.txt', 'w') as f, contextlib.redirect_stdout(f):\n"
+        "    secrets.redact('x')\n    print('first', W[0])\n"
+        "print('OK' if open('out.txt').read() == 'first ' + W[0] + '\\n' else 'LOST')"),
+    "a file set as stdout and closed": (
+        "f = open('out.txt', 'w')\nsys.stdout = f\nsecrets.ensure_output_guard()\nprint('partial', end='')\n"
+        "f.close()\nsys.stdout = sys.__stdout__\n"
+        "print('OK' if open('out.txt').read() == 'partial' else 'LOST')"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(LOST_CASES))
+def test_text_written_to_a_file_the_program_opened_is_never_lost(tmp_path, case):
+    value = _made_up(random.Random(case), 32)
+    body = "secrets.secret('MADE_UP_CHILD_TOKEN')\n" + LOST_CASES[case]
+    code, out, err = _run_child(tmp_path, body, MADE_UP_CHILD_TOKEN=value,
+                                MADE_UP_CHILD_PHRASE=" ".join(_phrase(random.Random(case), 12)))
+    leaked = _leaks(out + err, value)
+    assert code == 0 and not leaked and out.split() == ["OK"]
+
+
+_SEQUENCES = '''
+import random
+from pathlib import Path
+seed = int(os.environ['SEQ_SEED'])
+rng = random.Random(seed)
+secrets.secret('MADE_UP_CHILD_TOKEN')
+secrets.remember(os.environ['MADE_UP_CHILD_PHRASE'])
+W = os.environ['MADE_UP_CHILD_PHRASE'].split()
+SOME = [W[0], W[5], W[10]]                       # phrase words, never 4 in a row
+
+class Tee:
+    def __init__(self, stream):
+        self.stream = stream
+    def write(self, text):
+        return self.stream.write(text)
+    def flush(self):
+        self.stream.flush()
+
+expected, screen, lost, made = {}, [], 0, 0
+
+def close(entry):
+    global lost
+    name, stack, kind, obj = entry
+    if kind == 'buffer':
+        lost += obj.getvalue() != ''.join(expected[name])
+    stack.close()
+
+for _ in range(10):
+    open_now = []
+    for step in range(rng.randint(5, 30)):
+        op = rng.random()
+        if op < 0.2 and len(open_now) < 4:
+            stack, kind = contextlib.ExitStack(), rng.choice(['file', 'file', 'buffer', 'tee'])
+            name = f'{seed}-{made}'
+            made += 1
+            if kind == 'buffer':
+                obj = target = io.StringIO()
+            else:
+                obj = stack.enter_context(open(name + '.txt', 'w'))
+                target = Tee(obj) if kind == 'tee' else obj
+            stack.enter_context(contextlib.redirect_stdout(target))
+            open_now.append((name, stack, kind, obj))
+            expected[name] = []
+        elif op < 0.35 and open_now:
+            close(open_now.pop())
+        elif op < 0.5:
+            rng.choice([lambda: secrets.redact('x'), secrets.ensure_output_guard, lambda: secrets.redact_json({'a': 1})])()
+        else:
+            text = rng.choice(['{"r":%d}' % step, 'line %d\\n' % step, 'part%d ' % step, '\\r', 'p%d' % step,
+                               rng.choice(SOME) + rng.choice(['\\n', ' ', ''])])
+            if rng.random() < 0.6:
+                sys.stdout.write(text)
+            else:
+                print(text, end='')
+            (expected[open_now[-1][0]] if open_now else screen).append(text)
+    while open_now:
+        close(open_now.pop())
+for name, parts in expected.items():
+    if Path(name + '.txt').exists():
+        with open(name + '.txt', newline='') as back:      # read back exactly, carriage returns too
+            lost += back.read() != ''.join(parts)
+Path(f'screen-{seed}.txt').write_text(''.join(screen))
+Path(f'result-{seed}.txt').write_text(f'{lost} {len(expected)}')
+'''
+
+
+def test_300_sequences_of_opens_redirects_writes_and_closes_lose_nothing(tmp_path):
+    phrase = " ".join(_phrase(random.Random(60), 12))
+    lost = targets = sequences = screens_lost = 0
+    for seed in range(30):
+        code, out, _ = _run_child(tmp_path, _SEQUENCES, SEQ_SEED=str(seed), MADE_UP_CHILD_PHRASE=phrase,
+                                  MADE_UP_CHILD_TOKEN=_made_up(random.Random(seed), 32))
+        a, b = (tmp_path / f"result-{seed}.txt").read_text().split() if code == 0 else ("1", "0")
+        lost, targets, sequences = lost + int(a), targets + int(b), sequences + 10
+        screens_lost += out != (tmp_path / f"screen-{seed}.txt").read_text() if code == 0 else 1
+    assert sequences == 300 and targets > 300 and lost == 0 and screens_lost == 0
+
+
+def test_load_env_leaves_ordinary_settings_alone(tmp_path):
+    rng = random.Random(61)
+    settings = {"SEED_DATE": "2024-01-01", "MNEMONIC_LANGUAGE": "japanese", "MNEMONIC_WORDLIST": "bip39_english.txt",
+                "RANDOM_SEED": "20261112", "APP_SCOPES": " ".join(_phrase(rng, 14)),
+                "RELEASE_NOTE": " ".join(w.capitalize() + rng.choice([",", ".", "", ";"]) for w in _phrase(rng, 20))}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in settings.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in settings.items() if s.redact(f"x {v} y")[1])
+    assert caught == []
+
+
+def test_load_env_remembers_a_recovery_phrase_under_any_name(tmp_path):
+    rng = random.Random(62)
+    values = {}
+    for name in ("WALLET", "BACKUP", "COLD_STORAGE", "METAMASK", "THING_SEVEN"):
+        values[name + "_A"] = " ".join(_phrase(rng, 12))
+        values[name + "_B"] = " ".join(_phrase(rng, 24))
+    values["THING_EIGHT"] = " ".join(_phrase(rng, 13))                 # 13 words, no hint in the name: left alone
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
+    assert caught == sorted(k for k in values if k != "THING_EIGHT")
+
+
+def test_load_env_name_rules_for_credential_and_phrase_names(tmp_path):
+    rng = random.Random(63)
+    values = {"WALLET_SEED": " ".join(_phrase(rng, 12)), "BIP39_WORDS": " ".join(_phrase(rng, 4)),
+              "RECOVERY_CODE": " ".join(_groups(rng, 4)), "BROKER_KEY": " ".join(_phrase(rng, 5) + ["w0rd"]),
+              "CARD_KEY": " ".join(_groups(rng, 4)), "BACKUP_TOKEN": " ".join(_groups(rng, 5, True)),
+              "MNEMONIC_SALT": _made_up(rng, 12) + "9", "SEED_HEX": _made_up(rng, 32, "0123456789abcdef"),
+              "NOTE_TOKEN": " ".join(_phrase(rng, 3)), "WEBULL_ACCOUNT_ID": "acct" + _made_up(rng, 8, string.digits)}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
+    assert caught == ["BACKUP_TOKEN", "BIP39_WORDS", "CARD_KEY", "RECOVERY_CODE", "WALLET_SEED", "WEBULL_ACCOUNT_ID"]
+    doc = s._looks_like_credential.__doc__.upper()
+    listed = all(w in doc for w in ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "ACCOUNT", "MNEMONIC", "SEED", "PHRASE",
+                                    "RECOVERY", "WORDS"))
+    assert listed
+
+
+def test_short_letters_inside_spaced_groups_are_not_a_phrase():
+    rng = random.Random(64)
+    groups = [_made_up(rng, 1, string.digits) + c + _made_up(rng, 2, string.digits) for c in "abcde"]
+    s.remember(" ".join(groups))
+    plain = [s.redact(text)[1] for text in ("list a, b, c, d here", "a b c d e", "(a) (b) (c) (d)")]
+    _, whole = s.redact("card " + " ".join(groups[:4]) + " end")
+    assert plain == [0, 0, 0] and whole == 1
+
+
+def test_load_env_leaves_plain_words_under_credential_names_alone(tmp_path):
+    settings = {"KEYBOARD_LAYOUT": "us english qwerty standard", "TOKEN_SCOPES": "read write trade admin",
+                "API_KEY_NOTE": "rotate this key monthly", "WEBULL_ACCOUNT_LABEL": "my cash account 2"}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in settings.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in settings.items() if s.redact(f"x {v} y")[1])
+    assert caught == []

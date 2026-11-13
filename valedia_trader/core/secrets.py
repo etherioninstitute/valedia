@@ -5,14 +5,18 @@ Default file: ~/.hermes/secrets/trading.env (override with VALEDIA_ENV_FILE). Va
 logged, printed or included in exceptions.
 
 A tripwire guards the exits as a second line of defence. Every credential this module hands out
-through `secret`, every value handed to `remember`, and every value `load_env` finds under a
-credential, account or phrase name (loaded now or already in the environment) is remembered, when
-it is at least 8 characters long. `load_env` never remembers a path or a URL, a setting (a name
-ending in _DIR, _PATH, _FILE, _URL, _HOST, _PORT, _TYPE, _ENV, _MODE, _NAME or _REGION), or an
-account value with no digit. A value holding whitespace is remembered only under a name holding
-MNEMONIC, SEED, PHRASE, RECOVERY or WORDS with 4 words or more, or when it has 12 words or more that
-are all letters only; under a phrase name without a credential word, a value of letters only is
-left alone (see `_worth_remembering`). `redact` and `redact_json` replace any piece of a
+through `secret`, every value handed to `remember`, and every value `load_env` finds worth
+remembering (loaded now or already in the environment) is remembered, when it is at least 8
+characters long. `load_env` remembers, under any name, a value of exactly 12, 15, 18, 21 or 24
+words of 3 to 8 lower-case letters (a recovery phrase); under a credential name (KEY, SECRET, TOKEN,
+PASSWORD, PASS, ACCOUNT) a value without whitespace (an account value only with a digit) and a
+value of 4 groups or more that all hold a digit (a spaced number); and under a phrase name
+(MNEMONIC, SEED, PHRASE, RECOVERY, WORDS) without a credential word a value with whitespace of 4
+words or groups or more. Plain words under a credential name are never remembered unless they have
+the recovery-phrase shape. It never remembers a path or a URL, a setting (a name
+ending in _DIR, _PATH, _FILE, _URL, _HOST, _PORT, _TYPE, _ENV, _MODE, _NAME or _REGION), or, because
+of a phrase name alone, a value without whitespace (see `_worth_remembering`). `redact` and
+`redact_json` replace any piece of a
 remembered secret in a text or a JSON-like record, and the first time a secret is remembered an
 output guard wraps standard output, standard error and every logging handler so that nothing printed
 or logged carries one. `child_env` is the environment to give a child process: without the trading
@@ -25,25 +29,26 @@ to 11 such characters (a short account number) is caught only whole and standing
 a longer run of them. What this gives up: a piece of 8 to 11 characters of a digit-only or hex-only
 secret, or of the hex form of any secret, passes.
 
-A secret of 4 words or more (a wallet recovery phrase) is matched as words, a word being a run of
-letters: any 4 consecutive words of it, in any letter case, with 0 to 6 characters that are not
+A secret of 4 words or more (a wallet recovery phrase) whose runs of letters all have 3 letters or
+more is matched as words, a word being a run of letters: any 4 consecutive words of it, in any letter case, with 0 to 6 characters that are not
 letters between each two (whitespace and line breaks, punctuation, digits: so a numbered list and
 words written together are caught), are replaced. A word of it with 8 characters or more that is
 not purely letters also counts alone. What this gives up: fewer than 4 consecutive words of a
 phrase pass, and so do words with 7 or more non-letters between them.
 
-A secret of 4 words or more that holds a digit (groups of digits, or of letters and digits, such as
-a card number written in fours) is also matched as a sequence of groups, a group being a run of
-letters and digits: any 4 consecutive groups, with 0 to 6 other characters between each two, ending
-where a group ends, are replaced, across line breaks and writes as for a phrase. Its groups written
-together count as an ordinary piece when they make 12 characters or more. Under a credential name,
-`load_env` remembers such a value when every word of it has a digit.
+A secret of 4 words or more that holds a digit or is not matched as words (groups of digits, or of
+letters and digits, such as a card number written in fours) is matched as a sequence of groups, a
+group being a run of letters and digits: any 4 consecutive groups, with 0 to 6 other characters
+between each two, ending where a group ends, are replaced. Its groups written together count as an
+ordinary piece when they make 12 characters or more.
 
-On standard output and standard error (when they are real files or terminals) a phrase is caught
-also across line breaks and separate writes: the end of a line that could start such a run is held
-back until the next write settles it (see `_GuardedStream`); an explicit flush between the pieces
-lets them through. A stream that is not a real file (an `io.StringIO`, a capture object) holds
-nothing, so there a secret or phrase split across two writes passes.
+Only on the process's two original screen streams (sys.__stdout__ on file descriptor 1 and
+sys.__stderr__ on 2) is text ever held back: there a secret split across two writes, and a phrase
+or spaced groups across line breaks and separate writes, are caught, because the end of a line
+that could start such a run waits for the next write that settles it (see `_GuardedStream`). Every
+other target the guard wraps (a file, a redirect target, an `io.StringIO`, a capture object, a
+tee) gets each write redacted on its own and passed on at once. What this gives up: on such a
+target a secret, a phrase or spaced groups split across two writes pass.
 
 The guard re-checks standard output and standard error at every call to `secret`, `load_env`,
 `remember`, `redact`, `redact_json` (so every journal write) and `child_env`, and wraps a stream
@@ -59,7 +64,15 @@ processes' own output; log handlers that send the raw record rather than formatt
 datagram and HTTP handlers send `extra=` fields as they are); a secret split across two writes
 inside one line longer than 64 KB; and the forms that still pass: JSON `\\/` escaping of a slash,
 text in which JSON has escaped the secret's own characters (`\\uXXXX`, `\\"`, `\\\\`), account
-numbers written grouped or with dashes, a second layer of encoding (base64 of hex, and so on)."""
+numbers written grouped or with dashes, a second layer of encoding (base64 of hex, and so on).
+
+Also still passing, on the screen: an explicit flush between the pieces of a phrase; a phrase
+spread over separate log records (each record is flushed); an `input()` prompt between pieces; a
+phrase split between standard output and standard error; colour codes, markup, zero-width
+characters, accents or look-alike letters inside or around the words; spaced groups that are
+numbered (`1. g 2. g`); a held line when the process is killed or ends through `os._exit`; a held
+line printed twice after `fork`; and a TOTP secret or an IBAN written in spaced groups under a name
+with no credential or phrase word (`load_env` does not remember it)."""
 from __future__ import annotations
 
 import atexit
@@ -73,7 +86,6 @@ import re
 import stat
 import sys
 import threading
-import weakref
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
 
@@ -155,7 +167,8 @@ _SETTING_ENDINGS = ("_DIR", "_PATH", "_FILE", "_URL", "_HOST", "_PORT", "_TYPE",
 _QUOTES = "\"'`"
 _TOKEN = re.compile(r"[^\s\"'`]+")
 _PHRASE_WORDS = 4                          # a secret of this many words or more is matched as words
-_LONG_PHRASE = 12                          # ... and under any credential name from this many letter-only words
+_PHRASE_LENGTHS = (12, 15, 18, 21, 24)     # word counts of a recovery phrase, remembered under any name
+_SHORT_LETTERS = 3                         # a phrase's runs of letters must have at least this many
 _GAP = 6                                   # at most this many non-letters between two words of a phrase
 _LETTER_RUN = re.compile(r"[^\W\d_]+")
 _NON_LETTERS = re.compile(r"[\W\d_]+")
@@ -191,24 +204,29 @@ def _looks_like_a_place(value: str) -> bool:
 
 
 def _worth_remembering(name: str, value: str) -> bool:
-    """What `load_env` remembers of a value under a credential name: never a path, a URL or a setting
-    (a name ending in a setting ending). A value with whitespace only when the name holds a phrase
-    word and the value has 4 words or more, or when the value has 12 words or more, every one letters
-    only. Under a name holding a phrase word but no credential word, a value without whitespace only
-    when it is not purely letters (so MNEMONIC_LANGUAGE=japanese is left alone). Under an
-    account-only name, only a value with a digit."""
+    """What `load_env` remembers of a value it takes from the file. Under any name at all: a value of
+    exactly 12, 15, 18, 21 or 24 words, each of 3 to 8 lower-case letters (a recovery phrase). Then
+    only under a credential name or a phrase name (see `_looks_like_credential`), and never a path,
+    a URL or a setting (a name ending in a setting ending): a value with whitespace of 4 words or
+    groups or more, under a credential name only when every group holds a digit (a spaced number, or
+    spaced letters and digits: plain words are not remembered there); a value without whitespace
+    only under a credential name, and under an account-only name only when it has a digit. A phrase name alone never makes a value without
+    whitespace remembered (so MNEMONIC_LANGUAGE=japanese, SEED_DATE=2024-01-01 and RANDOM_SEED are
+    left alone)."""
+    words = value.split()
+    spaced = any(c.isspace() for c in value)
+    if spaced and len(words) in _PHRASE_LENGTHS and all(3 <= len(w) <= 8 and w.isalpha() and w.islower() for w in words):
+        return True
     upper = name.upper()
     credential = any(word in upper for word in _CREDENTIAL_WORDS)
     phrase_name = any(word in upper for word in _PHRASE_NAME_WORDS)
     if not (credential or phrase_name) or upper.endswith(_SETTING_ENDINGS) or _looks_like_a_place(value):
         return False
-    if any(c.isspace() for c in value):
-        words = value.split()
-        spaced_number = len(words) >= _PHRASE_WORDS and all(w.isalnum() and any(c.isdigit() for c in w) for w in words)
-        return ((phrase_name and len(words) >= _PHRASE_WORDS) or spaced_number
-                or (len(words) >= _LONG_PHRASE and all(w.isalpha() for w in words)))
-    if phrase_name and not credential:
-        return not value.isalpha()
+    if spaced:
+        spaced_number = all(w.isalnum() and any(c.isdigit() for c in w) for w in words)
+        return len(words) >= _PHRASE_WORDS and (spaced_number or not credential)
+    if not credential:
+        return False
     account_only = not any(word in upper for word in _CREDENTIAL_WORDS if word != "ACCOUNT")
     return not (account_only and not any(c.isdigit() for c in value))
 
@@ -261,8 +279,9 @@ def _pieces_of(value: str) -> tuple[set, set, set, list]:
     folded = _fold(value)
     words, groups = _LETTER_RUN.findall(folded), _ALNUM_RUN.findall(folded)
     if len(value.split()) >= _PHRASE_WORDS and max(len(words), len(groups)) >= _PHRASE_WORDS:
-        sequences = [("letters", tuple(words))] if len(words) >= _PHRASE_WORDS else []
-        if len(groups) >= _PHRASE_WORDS and any(c.isdigit() for c in folded):
+        as_letters = len(words) >= _PHRASE_WORDS and all(len(w) >= _SHORT_LETTERS for w in words)
+        sequences = [("letters", tuple(words))] if as_letters else []
+        if len(groups) >= _PHRASE_WORDS and (not as_letters or any(c.isdigit() for c in folded)):
             sequences.append(("groups", tuple(groups)))
         parts: tuple[set, set, set, list] = (set(), set(), set(), sequences)
         for word in value.split():
@@ -568,11 +587,16 @@ def tripped() -> int:
     return _count
 
 
-def _usable_fileno(stream) -> bool:
-    try:
-        return isinstance(stream.fileno(), int) and stream.fileno() >= 0
-    except Exception:
-        return False
+def _is_screen(stream) -> bool:
+    """Whether the stream is one of the process's two original screen streams: sys.__stdout__ on file
+    descriptor 1 or sys.__stderr__ on file descriptor 2."""
+    for original, fd in ((sys.__stdout__, 1), (sys.__stderr__, 2)):
+        if stream is not None and stream is original:
+            try:
+                return stream.fileno() == fd
+            except Exception:
+                return False
+    return False
 
 
 def _tail_start(folded: str, start: int, index) -> int:
@@ -605,53 +629,46 @@ def _tail_start_of(folded: str, start: int, entry) -> int:
     return best
 
 
-_wrappers: "weakref.WeakSet[_GuardedStream]" = weakref.WeakSet()   # every guard made, for flushing
-
-
 class _GuardedStream:
     """A thin writer in front of a text stream: every write goes through `redact`.
 
-    In front of a real file or terminal (a stream with a usable `fileno()`), an unfinished line is
-    held back so a secret split across two writes is still caught, and, while a phrase is
-    remembered, so is the end of a line that is 1 to 3 consecutive words of a phrase that another
-    word of it could continue (one word per line, three words and a break, a word per write): the
-    run is replaced whole once it is complete. Held text goes out with the next write that settles
-    it, on `flush()`, on `close()` and at exit; an explicit flush between the pieces of a secret or a
-    phrase lets the pieces through. A line that does not end in phrase words goes out before `write`
-    returns, and so does a line ending in a carriage return.
+    Only in front of the process's two original screen streams (see `_is_screen`) is any text held
+    back: an unfinished line, so a secret split across two writes is still caught, and, while a
+    phrase or spaced groups are remembered, the end of a line that is 1 to 3 consecutive words of one
+    that another word of it could continue (one word per line, three words and a break, a word per
+    write), so the run is replaced whole once it is complete. Held text goes out with the next write
+    that settles it, on `flush()`, on `close()`, when the guard is removed and at exit. A line that
+    does not end in such words goes out before `write` returns, and so does a line ending in a
+    carriage return.
 
-    In front of anything else (an `io.StringIO`, a capture object, a redirect target) nothing is
-    held: each write is redacted and passed on at once, so reading the target straight after a
-    write shows everything written; a secret or phrase split across two writes there passes.
+    In front of anything else (a file, a redirect target, an `io.StringIO`, a capture object, a
+    tee) nothing is ever held: each write is redacted on its own and passed on in the same call. What
+    this gives up: there a secret, a phrase or spaced groups split across two writes pass.
 
-    A guard switched off by `remove_output_guard` stays where it is but passes everything through
-    untouched (after sending on anything it held); installing the guard again switches it back on
-    instead of wrapping it again. Everything else (attributes, `with`, iteration) behaves as the
-    wrapped stream does."""
+    While the guard is off (after `remove_output_guard`) every guard passes text through untouched;
+    installing the guard again switches them all back on. Everything else (attributes, `with`,
+    iteration) behaves as the wrapped stream does."""
 
     _HOLD_LIMIT = 1 << 16                     # a line longer than this goes out at its last space
 
-    def __init__(self, stream) -> None:
+    def __init__(self, stream, holds: bool = False) -> None:
         self._stream = stream
+        self._holds = holds
         self._pending = ""
         self._write_lock = threading.RLock()
-        self._holds = _usable_fileno(stream)
-        self._active = True
-        _wrappers.add(self)
 
     def write(self, text):
         if not isinstance(text, str):
             return self._stream.write(text)
+        if not self._holds:
+            self._stream.write(_redact_text(text, _pieces)[0] if _guard_wanted else text)
+            return len(text)
         with self._write_lock:
-            pieces = _pieces
-            if not self._active:
+            if _guard_wanted:
+                self._write_held(self._pending + text, _pieces)
+            else:
                 self._send_pending()
                 self._stream.write(text)
-            elif not self._holds:
-                self._send_pending()
-                self._stream.write(_redact_text(text, pieces)[0])
-            else:
-                self._write_held(self._pending + text, pieces)
         return len(text)
 
     def _write_held(self, data: str, pieces) -> None:
@@ -683,8 +700,8 @@ class _GuardedStream:
             self._stream.write(_redact_text(pending, _pieces)[0])
 
     def _emit_pending(self, timeout: float = -1) -> None:
-        if not self._write_lock.acquire(timeout=timeout):
-            return                                 # its writer is busy; what it holds goes out at exit
+        if not self._holds or not self._write_lock.acquire(timeout=timeout):
+            return
         try:
             self._send_pending()
         finally:
@@ -793,7 +810,7 @@ _guard_wanted = False                      # on from the first install until rem
 
 _CHAIN = ("_stream", "stream", "wrapped", "_wrapped")   # where a wrapper keeps the stream it writes to
 _CHAIN_DEPTH = 8
-_installed: dict = {}                      # "stdout"/"stderr" -> the guard last found or put there
+_screens: list = []                        # the guards of the two screen streams, made once and kept
 
 
 def _chain(stream):
@@ -813,60 +830,42 @@ def _guard_in(stream):
     return next((s for s in _chain(stream) if isinstance(s, _GuardedStream)), None)
 
 
-def _is_guarded(stream) -> bool:
-    if stream is None:
-        return True
-    guard = stream if isinstance(stream, _GuardedStream) else _guard_in(stream)
-    return guard is not None and guard._active
-
-
-def _wrap_streams() -> tuple[bool, list]:
-    """With `_lock` held: guard sys.stdout and sys.stderr (switching a guard in their chain back on,
-    or wrapping them). Returns whether a stream was wrapped and the guards left behind by a stream
-    that was replaced, whose held text the caller sends on (without `_lock`)."""
-    wrapped, left = False, []
+def _wrap_streams() -> bool:
+    """With `_lock` held: wrap sys.stdout and sys.stderr unless their chain already reaches a
+    guard. A screen stream gets its one guard back (so what it holds is never dropped); anything
+    else gets a guard that holds nothing. Returns whether a stream was wrapped."""
+    wrapped = False
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
-        if stream is None:
+        if stream is None or _guard_in(stream) is not None:
             continue
-        guard = _guard_in(stream)
-        if guard is None:
-            guard = _GuardedStream(stream)
-            setattr(sys, name, guard)
-            wrapped = True
-        guard._active = True
-        old = _installed.get(name)
-        if old is not None and old is not guard and all(s is not old for s in _chain(guard)):
-            left.append(old)
-        _installed[name] = guard
-    return wrapped, left
-
-
-def _send_left(left) -> None:
-    for guard in left:
-        try:
-            guard._emit_pending(timeout=1.0)
-        except Exception:
-            pass
+        guard = None
+        if _is_screen(stream):
+            guard = next((g for g in _screens if g._stream is stream), None)
+            if guard is None:
+                guard = _GuardedStream(stream, holds=True)
+                _screens.append(guard)
+        setattr(sys, name, guard or _GuardedStream(stream))
+        wrapped = True
+    return wrapped
 
 
 def ensure_output_guard() -> bool:
     """While any secret is remembered and the guard is on, wrap sys.stdout or sys.stderr again if
     either was replaced since (and put the logging hooks back if they were lost). A stream whose
-    chain of wrapped streams already reaches a guard (see `_chain`) is not wrapped again. Text still
-    held for a replaced stream is written to that stream first. Returns whether a stream had to be
-    wrapped. A stream replaced between two calls is unguarded in between."""
+    chain of wrapped streams already reaches a guard (see `_chain`) is not wrapped again. Returns
+    whether a stream had to be wrapped. A stream replaced between two calls is unguarded in between."""
     if not _guard_wanted or _pieces is _NOTHING:
         return False
-    if _logging_on and _is_guarded(getattr(sys, "stdout", None)) and _is_guarded(getattr(sys, "stderr", None)):
+    out, err = getattr(sys, "stdout", None), getattr(sys, "stderr", None)
+    if _logging_on and (out is None or _guard_in(out)) and (err is None or _guard_in(err)):
         return False
     with _lock:
         if not _guard_wanted:
             return False
-        wrapped, left = _wrap_streams()
+        wrapped = _wrap_streams()
         if not _logging_on:
             _install_logging()
-    _send_left(left)
     return wrapped
 
 
@@ -876,8 +875,8 @@ def install_output_guard() -> None:
     message, its arguments, the exception text and the stack text, and `logging.Handler.format`
     (which every standard handler uses to make its text) passes its result through `redact`. Called
     by itself the first time a secret is remembered; calling it again is harmless (nothing is
-    wrapped twice). Text holding no secret passes unchanged, only an unfinished line waits for its
-    newline, carriage return or a flush.
+    wrapped twice). Text holding no secret passes unchanged; only on the two screen streams does an
+    unfinished line wait for its newline, carriage return or a flush.
 
     Not covered: writes made straight to a file descriptor (os.write, sys.stdout.buffer,
     sys.__stdout__, sys.__stderr__, a handler's own file written without `Handler.format`), a
@@ -886,47 +885,42 @@ def install_output_guard() -> None:
     global _at_exit_registered, _guard_wanted
     with _lock:
         _guard_wanted = True
-        _, left = _wrap_streams()
+        _wrap_streams()
         _install_logging()
         if not _at_exit_registered:
             atexit.register(_flush_guarded)
             _at_exit_registered = True
-    _send_left(left)
 
 
 def remove_output_guard() -> None:
     """Undo `install_output_guard`: put the original streams back where sys.stdout or sys.stderr is
-    a guard, switch every guard off, send on what they hold and flush, and restore logging exactly
-    as it was. Harmless when the guard is not installed.
+    a guard, switch every guard off, send on what the screen guards hold and flush them, and
+    restore logging exactly as it was. Harmless when the guard is not installed.
 
     Called inside a redirect (`contextlib.redirect_stdout` and the like), it cannot reach the stream
     the redirect will put back when it ends: if that stream is a guard, the guard stays in place but
-    switched off, passing everything through untouched, until the guard is installed again (which
-    switches it back on rather than wrapping it a second time)."""
+    off, passing everything through untouched, until the guard is installed again (which switches it
+    back on rather than wrapping it a second time)."""
     global _guard_wanted
     with _lock:
         _guard_wanted = False
-        current = []
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)
             if isinstance(stream, _GuardedStream):
-                current.append(stream)
                 setattr(sys, name, stream._stream)
-        guards = list(_wrappers)
-        for guard in guards:
-            guard._active = False
-        _installed.clear()
+        screens = list(_screens)
+        _screens[:] = [g for g in screens if g._stream is sys.__stdout__ or g._stream is sys.__stderr__]
         _remove_logging()
-    for guard in guards:                           # outside `_lock`: a writer may hold a guard's lock
+    for guard in screens:                          # outside `_lock`: a writer may hold a guard's lock
         try:
-            guard.flush() if guard in current else guard._emit_pending()
+            guard.flush()
         except Exception:
             pass
 
 
 def _flush_guarded() -> None:
-    """At exit: send on what every guard still holds (waiting at most a second for a busy writer)."""
-    for guard in list(_wrappers):
+    """At exit: send on what the screen guards still hold (waiting at most a second for a busy writer)."""
+    for guard in list(_screens):
         try:
             guard._emit_pending(timeout=1.0)
             flush = getattr(guard._stream, "flush", None)
