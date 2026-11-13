@@ -11,6 +11,9 @@ developer.webull.com on 2026-11-11 and again on 2026-11-13, and checked against 
 - It is long-only: only rows marked as stock or crypto count as holdings, open sells are deducted, and an order that
   would sell more than is free is refused before anything is sent.
 - Quantities and limit prices are sent exactly as given or not at all; nothing is rounded.
+- It chooses its account by class (`WEBULL_ACCOUNT_CLASS`, for example `INDIVIDUAL_CASH`), refuses an order that
+  does not fit the account, tells a refusal by Webull apart from an unknown outcome, and paces its own calls under
+  Webull's limits (accepted for test use 2026-11-13 after two more blind checks; not cleared for real money).
 - No key, secret or account number can leave it: it passes on only text of a harmless shape and never hands back
   Webull's raw answer. Its request log and its login token are kept out of the repository
   (`~/.valedia/webull/<environment>/`).
@@ -39,7 +42,7 @@ Add to `~/.hermes/secrets/trading.env` (mode 600). Never paste keys anywhere els
     WEBULL_APP_KEY=...
     WEBULL_APP_SECRET=...
     WEBULL_ENV=sandbox
-    # WEBULL_ACCOUNT_ID=...   only if the key sees more than one account
+    WEBULL_ACCOUNT_CLASS=INDIVIDUAL_CASH   # which of the key's accounts to trade: stocks and funds use the cash account
 
 ### 3. Check the connection (read-only)
 
@@ -74,8 +77,10 @@ requests a minute for the Trading API):
 | Most market-data calls | 30 a minute | 60 a minute (300 for stock data bought for programs) |
 
 Going over a limit is answered with HTTP 429 and the request is not processed; Webull warns that doing it repeatedly
-can get the address blocked for a time. The adapter does not pace itself yet (a change is in progress). A normal day
-for the two fund strategies is a few dozen calls.
+can get the address blocked for a time. The adapter paces itself: it stays at 80% of every limit, with
+at most 48 calls a minute on the live side and 24 on the paper side, and it reads holdings at most 5 seconds before a
+sale goes out. The pacing belongs to one running program: a second program on the same key is not seen by it. A normal
+day for the two fund strategies is a few dozen calls. Market data is never read from Webull (the owner's rule).
 
 ## Observed in Webull's test environment (2026-11-13, read-only, the owner's paper key)
 
@@ -115,6 +120,18 @@ cancelled; the account ended with no open order and no holding):
 - The adapter's own readings matched what Webull held: order status (open, nothing filled), the open-order list,
   cash (1,000,000 practice dollars), holdings (none), cancel-all.
 
+## The final adapter against the paper account (2026-11-13)
+
+- Accounts are chosen by class: five paper accounts, the Individual Cash one used.
+- An order outside the hours of its session comes back as a refusal with Webull's code
+  (`OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT`), not as an unknown outcome. A session of `ALL` was refused at
+  03:24 New York time and accepted at 03:58; the exact hours of each session are not documented and not yet mapped.
+- A resting limit order reads as open; cancel answers `cancel requested`, a second cancel `already finished`, and
+  the order then reads as cancelled. A tag never sent cancels as `no such order` and, with the option on, reads as
+  no order at all.
+- The same order sent twice is one order at Webull.
+- Not seen yet: the answer `not yet` to a cancel, a fill, fees.
+
 ## Still to observe there, because Webull does not document them
 
 - a fill: how soon it shows, how fees arrive, what a holding row looks like (a one-share buy and sell is set to run at the next open);
@@ -134,7 +151,8 @@ A production order needs all of: `WEBULL_ENV=production`; a file `config/webull_
     {"account_id": "<your account id>", "confirmed_by": "<your name>", "max_order_value": 250,
      "i_understand_this_trades_real_money": true}
 
-naming the same account the key trades; an order value at or under `max_order_value`; and a known price for the order.
+naming the same account the key trades (the id Webull's API uses is a long internal one that the console does not
+show; how you confirm the live account will be changed to the account's class and last characters before go-live); an order value at or under `max_order_value`; and a known price for the order.
 The paper mirror passes no price, so it can never trade live even with that file present. A live execution path is
 deliberately not wired: it is the last step, taken with you, after the order path has been proven in the test
 environment, a strategy has a paper record, and the order-handling code has been reviewed by a model from another
