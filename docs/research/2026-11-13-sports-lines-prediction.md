@@ -131,3 +131,9 @@ were found from team names and times only; no price, probability or result had b
    clarification 6 (a start within six hours before that time) therefore refuses true games. It becomes: the
    start is no more than 12 hours before and no more than 3 hours after Kalshi's expected expiration, on the
    same US-Eastern date. Two games between the same teams on one date are both left out as ambiguous.
+
+## Closed on 2026-11-13 after the development period
+
+No choice of margin or version was stored and no test-period snapshot was bought. The development period
+(1,407 games) gave 0 to 4 trades at every setting, so the 150 trades the pass line needs could not be reached;
+the idea is recorded as failed. See `2026-11-13-sports-lines-result.md`.
