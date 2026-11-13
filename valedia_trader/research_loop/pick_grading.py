@@ -1,5 +1,5 @@
 """Grading of the public pick lists, exactly as the locked prediction says: docs/research/2026-11-13-pick-lists-prediction.md
-(commit 5f9183c, with its clarifications 1 to 21). Research only: nothing here sends anything to an exchange or a broker.
+(commit 5f9183c, with its clarifications 1 to 22). Research only: nothing here sends anything to an exchange or a broker.
 
     python -m valedia_trader.research_loop.pick_grading <command> [--store DIR] [--picks FILE]
 
@@ -42,8 +42,9 @@ Commands:
   "KC/BUF OVER 47.5" keep their codes; "IND STRONG ML" has none).
   No model proposes anything. The rule's fingerprint (`fingerprint()`, over the parsed code of every function a run
   of a command that writes match rows can reach from the entry point down: `_cli`, `main`, the store and grader
-  set-up, `cmd_match` and `cmd_daily`; the constants they read and the store's tables as written in the source, and
-  the word list) is stored with every row. It is of the source alone, never of a value the process holds, so it is
+  set-up, `cmd_match` and `cmd_daily`; the constants they read and the store's tables as written in the source, with
+  every module-level statement that changes one in place (`LEAGUE_WORDS["x"] = ...`, `LEAGUE_WORDS.update(...)`,
+  also from another module through its alias), and the word list) is stored with every row. It is of the source alone, never of a value the process holds, so it is
   the same imported or run with `python -m` or by path, before and after a store was opened, in any process
   (`fingerprints` prints both fingerprints and opens no store, so its word list is the system one). The word list
   is the grading store's own copy: the first `match` (or `daily`) run keeps the list in use (the system file, or
@@ -59,14 +60,18 @@ Commands:
   league's scores are bought only when one of its matched games started more than 3 hours ago, has no final yet and
   started less than 3 days ago, and no scores list of that league was asked for in the last 6 hours. A final listed 3
   days or more after the start is not used: the game is not graded (clarification 14). Before a choice, the final of
-  a game that a pick of a test-period thread is matched to is dropped from the scores list before it is stored (the
-  count dropped is shown), and no Kalshi settlement of that game's day is fetched.
+  a game that a pick of a test-period thread is matched to, and of every game the schedule starts at or after
+  `BOUNDARY` (2026-12-13 00:00 US-Eastern, clarification 22), is dropped from the scores list before it is stored (the
+  count dropped is shown); no Kalshi settlement of the day of a game a test-period pick is matched to is fetched, and
+  of a market Kalshi dates `KALSHI_BOUNDARY_DAY` or later only those of games the schedule starts before the boundary
+  are stored (Kalshi dates a game starting between 00:00 and 05:59 US-Eastern the day before).
   Question B: a pick on a game Kalshi lists (a stored code table's event or a stored market's event dated the game's
   US-Eastern date or the day before, with both team names) waits for Kalshi's result (`kalshi_not_settled`), and seven
   days after the start is not graded (`kalshi_never_settled`); a game Kalshi does not list is graded on the scores
   alone. Before a choice, every reader holds a game that a test-period pick is matched to (whenever, under any
-  fingerprint): its final and Kalshi's result are not read, a development pick on it is `held_for_test`, and `status`
-  and every evaluation give how many picks and league-days are held.
+  fingerprint), and every game the schedule starts at or after `BOUNDARY`, matched or not (the boundary is the clock,
+  clarification 22): its final and Kalshi's result are not read, a development pick on it is `held_for_test`, and
+  `status` and every evaluation give how many picks and league-days are held.
 - `evaluate --period development|test`, `choose --version N`, `daily`, `status`, `fingerprints`. The test period is scored once: when
   the counts that can be known without reading a result reach the margin (clarification 15: Question A's chosen
   version, 158 contracts on 20 days; Question B, 315 graded picks) or at the last date, 2027-03-31, never again; the
@@ -82,9 +87,11 @@ Commands:
 Gates: no command reads a result (Kalshi's settled listing, a score, an evaluation) before an `audit-pass` with at most
 2 wrong exists for the current matching fingerprint, nor while a list was stored after the last `match` run. The first
 command that reads a result freezes the fingerprint: from then on any command refuses when the fingerprint differs.
-Results of test-period picks are not read before a choice is stored, no settlement of a day of the test period is
-fetched before a choice (also for a development game on that day), and without a choice no scores are bought from
-06:00 US-Eastern on the test period's first day.
+Results of test-period picks are not read before a choice is stored, nor any result of a game that starts at or after
+2026-12-13 00:00 US-Eastern (`BOUNDARY`, clarification 22), whether or not a pick is matched to it: it is neither
+fetched for its day, stored nor read. No settlement of a day of the test period is fetched before a choice (also for
+a development game on that day), and without a choice no scores are bought from 06:00 US-Eastern on the test period's
+first day. A command refused because the store is frozen under another fingerprint creates nothing.
 
 The grading store refuses UPDATE, DELETE and an INSERT that repeats a natural key (so INSERT OR REPLACE cannot rewrite
 it); writers hold `grading.lock` (one at a time); `status` opens the stores read-only; a store of another layout is
@@ -176,6 +183,10 @@ END_A_COUNT, END_B_COUNT = 158, 315         # the test period ends when these (5
 MIN_FORM_CHARS = 3                          # a team's name form shorter than this is never matched
 NO_RUN_CAP = 10 ** 9                        # the ledger's run cap is not used here; the monthly cap is
 TEST_CHOICE_CUTOFF = datetime(2026, 12, 14, 6, tzinfo=ET)
+BOUNDARY = datetime(2026, 12, 13, 0, tzinfo=ET)   # no result of a game starting then or later before a choice (cl. 22)
+BOUNDARY_TS = int(BOUNDARY.timestamp())
+KALSHI_BOUNDARY_DAY = date(2026, 12, 12)    # Kalshi dates a 00:00-05:59 game the day before: from this date on, a
+                                            # market may be of a game from the boundary on
 TEST_SCORED_FROM = date(2027, 4, 4)         # a test ending by date is scored from 00:00 US-Eastern this day (cl. 21)
 KALSHI_WAIT = 7 * 86400                     # a pick waiting for Kalshi's result is not graded this long after the start
 SCORE_WAIT_DAYS = 4                         # a test ending by the counts: this many days after the last counted date
@@ -731,8 +742,12 @@ _MISSING = object()
 
 @lru_cache(maxsize=32)
 def _bindings_of(path: str, stamp: tuple) -> dict[str, tuple[tuple[str, ast.AST], ...]]:
-    """Every module-level statement of a source file that binds a name (an assignment, an import, a class), as
-    written: {name: ((dump, tree), ...)}. A class is kept without its methods (they are reached by name)."""
+    """Every module-level statement of a source file that binds a name (an assignment, an import, a class) or changes
+    one without binding it, as written: {name: ((dump, tree), ...)}. A class is kept without its methods (they are
+    reached by name). A statement that changes a name's value in place (a subscript or an attribute assigned,
+    augmented or deleted: `LEAGUE_WORDS["x"] = ...`; a statement that calls a method of it or is a call given it:
+    `LEAGUE_WORDS.update(...)`, `dict.update(LEAGUE_WORDS, ...)`) is kept under that name, and under "alias.name"
+    when it starts from a module alias (`sl._TOKEN_MAP.update(...)`), so the table's fingerprint holds it."""
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     out: dict[str, list] = {}
 
@@ -745,10 +760,47 @@ def _bindings_of(path: str, stamp: tuple) -> dict[str, tuple[tuple[str, ast.AST]
         elif isinstance(t, ast.Starred):
             yield from names(t.value)
 
+    def roots(t):
+        """The name an expression starts from, and that name with its first attribute ("sl._TOKEN_MAP")."""
+        chain = []
+        while isinstance(t, (ast.Attribute, ast.Subscript, ast.Starred)):
+            if isinstance(t, ast.Attribute):
+                chain.append(t.attr)
+            t = t.value
+        if isinstance(t, ast.Name):
+            yield t.id
+            if chain:
+                yield "%s.%s" % (t.id, chain[-1])
+
+    def changed(st):
+        """The names a statement changes in place without binding them."""
+        targets = st.targets if isinstance(st, (ast.Assign, ast.Delete)) else \
+            [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []
+        todo = list(targets)
+        while todo:
+            t = todo.pop()
+            if isinstance(t, (ast.Tuple, ast.List)):
+                todo.extend(t.elts)
+            elif isinstance(t, ast.Starred):
+                todo.append(t.value)
+            elif isinstance(t, (ast.Subscript, ast.Attribute)):
+                yield from roots(t)
+            elif isinstance(t, ast.Name) and isinstance(st, ast.Delete):
+                yield t.id
+        if isinstance(st, ast.Expr):
+            for call in ast.walk(st.value):
+                if isinstance(call, ast.Call):
+                    if isinstance(call.func, (ast.Attribute, ast.Subscript)):
+                        yield from roots(call.func)
+                    for a in [*call.args, *(k.value for k in call.keywords)]:
+                        yield from roots(a)
+
     def visit(body):
         for st in body:
             bound: list[str] = []
             node = st
+            for n in dict.fromkeys(changed(st)):
+                out.setdefault(n, []).append((ast.dump(st, include_attributes=False), st))
             if isinstance(st, ast.Assign):
                 bound = [n for tg in st.targets for n in names(tg)]
             elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
@@ -841,7 +893,11 @@ def _scope(roots: Sequence[str], wide: bool, skip: Sequence[str] = ()) -> dict:
         key = "%s.%s" % (label, name)
         if key in consts:
             return
-        found = _bindings(mods[label][0]).get(name, ())
+        found = list(_bindings(mods[label][0]).get(name, ()))
+        for ns, _ in mods.values():                       # a statement of another module changing it by an alias
+            for alias in sorted(n for n, v in ns.items() if isinstance(v, types.ModuleType)
+                                and v.__name__ == mods[label][1]):
+                found += _bindings(ns).get("%s.%s" % (alias, name), ())
         consts[key] = [d for d, _ in found] or "not bound in the source"
         walks.extend((node, label) for _, node in found)
 
@@ -1649,14 +1705,26 @@ def _test_matched(store: GradingStore) -> dict[str, tuple[str, date]]:
     return out
 
 
+def _after_boundary(store: GradingStore) -> dict[str, tuple[str, date]]:
+    """The games the schedule starts at or after `BOUNDARY` (`schedule_games`: the earliest start any list gives),
+    whether or not a pick is matched to them: {game id: (league, the game's US-Eastern date)}."""
+    return {g["id"]: (g["league"], g["day"]) for g in schedule_games(store.lists()) if g["start_ts"] >= BOUNDARY_TS}
+
+
 def _held(store: GradingStore) -> tuple[set[str], set[tuple[str, date]]]:
-    """Before a choice: the games held for the test (`_test_matched`, whenever and under whatever fingerprint the
-    test-period pick was matched) and their league-days. No reader reads their finals or Kalshi's results, and a
-    development pick on one has the outcome `held_for_test`. After the choice nothing is held."""
+    """Before a choice: the games held for the test and their league-days. A game is held when a test-period pick is
+    matched to it (`_test_matched`, whenever and under whatever fingerprint), and every game the schedule starts at or
+    after `BOUNDARY` is held by the clock, matched or not (clarification 22). No reader reads their finals or Kalshi's
+    results, and a development pick on one has the outcome `held_for_test`. The league-days are those of the games a
+    test-period pick is matched to and of the games held by the clock that a pick is matched to. After the choice
+    nothing is held."""
     if store.choice() is not None:
         return set(), set()
     held = _test_matched(store)
-    return set(held), set(held.values())
+    late = _after_boundary(store)
+    matched = {r["game_id"] for r in store.rows("SELECT DISTINCT game_id FROM matches WHERE status = 'matched' AND "
+                                                 "game_id IS NOT NULL")}
+    return set(held) | set(late), set(held.values()) | {late[g] for g in sorted(matched & set(late))}
 
 
 def _held_report(store: GradingStore, fp: str) -> dict:
@@ -1701,20 +1769,60 @@ def _kalshi_listed(store: GradingStore, kview, game_ids: Iterable[str]) -> set[s
                                           for k in on.get((g["league"], d), ()))}
 
 
+def _day_ts(d: date) -> int:
+    return int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
+
+
+def _settled_before_choice(gr: Grader, league: str, d: date, cutoff: float, gl: Sequence[dict],
+                           before: set[str]) -> dict:
+    """Before a choice, Kalshi's settled markets dated `d`, a date from `KALSHI_BOUNDARY_DAY` on (Kalshi dates a game
+    starting between 00:00 and 05:59 US-Eastern the day before, so that date may hold games from the boundary on):
+    listed as `kalshi_history.fetch_settled` lists them, and stored only for an event that `sports_lines.pair_games`
+    pairs (strictly: titles, codes and dates, no result) with a game in `before`, the games the schedule starts before
+    `BOUNDARY` (clarification 22). Nothing is recorded as listed, so after the choice the date is listed in full."""
+    series = LEAGUES[league][1]
+    tiers = []
+    if _day_ts(d) < cutoff:
+        tiers.append(("historical", "/historical/markets", {}))
+    if _day_ts(d + timedelta(days=kh.SETTLE_DAYS)) > cutoff:
+        tiers.append(("live", "/markets", {"status": "settled", "min_close_ts": _day_ts(d),
+                                           "max_close_ts": _day_ts(d + timedelta(days=kh.SETTLE_DAYS + 1))}))
+    out = {"stored": 0, "held": 0}
+    for tier, path, extra in tiers:
+        by: dict[str, list[dict]] = {}
+        for row in gr.kalshi.pages(path, {"series_ticker": series, **extra, "limit": 1000}, "markets"):
+            ticker = str(row.get("ticker") or "")
+            if ticker and kh.event_date(ticker) == d and row.get("status") in ("finalized", "settled"):
+                by.setdefault(row.get("event_ticker") or ticker.rsplit("-", 1)[0], []).append(row)
+        kev = [sl.kalshi_event(league, event, ms) for event, ms in sorted(by.items())]
+        keep = {p["kalshi_event"] for p in sl.pair_games(kev, gl, None)[0] if p["odds_event_id"] in before}
+        for event, ms in sorted(by.items()):
+            if event not in keep:
+                out["held"] += len(ms)
+                continue
+            for row in ms:
+                gr.kstore.put_market(row, tier, series)
+                out["stored"] += 1
+    return out
+
+
 def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     """Kalshi's settled markets of the days of the matched games that have started, per league, and the strict
     pairing of `sports_lines.pair_games` (no model). Before a choice no day of the test period is fetched, not even
-    for a development game on it, nor the day of a game a test-period pick is matched to. Errors of one league are
-    recorded and the others go on."""
+    for a development game on it, nor the day of a game a test-period pick is matched to, nor any day for a game the
+    schedule starts at or after `BOUNDARY`; and a date from `KALSHI_BOUNDARY_DAY` on is stored only for the games
+    before the boundary (`_settled_before_choice`). Errors of one league are recorded and the others go on."""
     out: dict[str, Any] = {}
     games = schedule_games(gr.store.lists())
     by_league: dict[str, set] = {}
     no_choice = gr.store.choice() is None
-    held = _held(gr.store)[1]
+    held_ids, held = _held(gr.store)
     for r in rows:
         d = sl.eastern_date(r["start"])
         if _ts(r["start"]) < now.timestamp() and not (no_choice and (d >= PERIODS["test"][0]
-                                                                      or (r["league"], d) in held)):
+                                                                      or (r["league"], d) in held
+                                                                      or r["game_id"] in held_ids
+                                                                      or _ts(r["start"]) >= BOUNDARY_TS)):
             by_league.setdefault(r["league"], set()).add(d)
     if not by_league:
         return out
@@ -1724,16 +1832,21 @@ def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
         gr.error(None, exc)
         return {"error": type(exc).__name__}
     have = gr.store.pairs()
+    before = {g["id"] for g in games if g["start_ts"] < BOUNDARY_TS}
     for league, days in sorted(by_league.items()):
         series = LEAGUES[league][1]
         try:
-            for d in sorted(days):
-                fresh = (now.astimezone(ET).date() - d).days <= kh.SETTLE_DAYS + 1
-                kh.fetch_settled(gr.kalshi, gr.kstore, series, d, d, cutoff, refresh=fresh)
             lo, hi = min(days) - timedelta(days=1), max(days) + timedelta(days=1)
-            kev = sl.kalshi_events(gr.kstore, league, lo, hi)
             gl = [{"id": g["id"], "league": league, "home": g["home"], "away": g["away"], "commence": g["start"],
                    "day": g["day"]} for g in games if g["league"] == league and g["start_known"] and lo <= g["day"] <= hi]
+            held_markets = 0
+            for d in sorted(days):
+                if no_choice and d >= KALSHI_BOUNDARY_DAY:
+                    held_markets += _settled_before_choice(gr, league, d, cutoff, gl, before)["held"]
+                    continue
+                fresh = (now.astimezone(ET).date() - d).days <= kh.SETTLE_DAYS + 1
+                kh.fetch_settled(gr.kalshi, gr.kstore, series, d, d, cutoff, refresh=fresh)
+            kev = sl.kalshi_events(gr.kstore, league, lo, hi)
             pairs, left, _ = sl.pair_games(kev, gl, None, taken_odds=set(have),
                                            taken_kalshi={p["kalshi_event"] for p in have.values()})
             at = gr.now()
@@ -1745,7 +1858,8 @@ def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
             for p in pairs:
                 have[p["odds_event_id"]] = {"game_id": p["odds_event_id"], "kalshi_event": p["kalshi_event"],
                                             "home_ticker": p["home_ticker"], "away_ticker": p["away_ticker"]}
-            out[league] = {"days": len(days), "kalshi_events": len(kev), "paired_now": len(pairs), "left": left}
+            out[league] = {"days": len(days), "kalshi_events": len(kev), "paired_now": len(pairs), "left": left,
+                           "markets_held_before_choice": held_markets}
         except (kh.KalshiHistoryError, kd.HttpError, OSError) as exc:
             gr.error(league, exc)
             out[league] = "error: %s" % type(exc).__name__
@@ -1807,6 +1921,25 @@ def cmd_prices(gr: Grader) -> dict:
     return out
 
 
+def _dropped_before_storing(e, held: set[str], starts: dict[str, int], no_choice: bool) -> bool:
+    """Whether a scores answer's entry is dropped before the answer is stored: a game held for the test (`_held`),
+    and, before a choice, any game the schedule does not start before `BOUNDARY`: one the schedule lacks by its own
+    `commence_time`, and one with no readable time at all (clarification 22)."""
+    if not isinstance(e, dict):
+        return False
+    gid = str(e.get("id"))
+    if gid in held:
+        return True
+    if not no_choice:
+        return False
+    if gid in starts:
+        return starts[gid] >= BOUNDARY_TS
+    try:
+        return _ts(e.get("commence_time")) >= BOUNDARY_TS
+    except (TypeError, ValueError):
+        return True
+
+
 def _scores_asked_since(gr: Grader, path: str, since: float) -> bool:
     last = gr.ledger.db.execute("SELECT MAX(at) FROM calls WHERE path = ?", (path,)).fetchone()[0]
     return last is not None and _ts(last) > since
@@ -1826,7 +1959,9 @@ def cmd_results(gr: Grader) -> dict:
         s = _ts(r["start"])
         if s + SCORES_AFTER < t < s + FINAL_WITHIN and r["game_id"] not in listed:
             pending[r["league"]] = pending.get(r["league"], 0) + 1
-    no_choice_late = gr.store.choice() is None and now >= TEST_CHOICE_CUTOFF
+    no_choice = gr.store.choice() is None
+    no_choice_late = no_choice and now >= TEST_CHOICE_CUTOFF
+    starts = {g["id"]: g["start_ts"] for g in schedule_games(gr.store.lists())} if no_choice else {}
     for league, n in sorted(pending.items()):
         sport = LEAGUES[league][0]
         path, params = f"/v4/sports/{sport}/scores/", {"daysFrom": SCORES_DAYS, "dateFormat": "iso"}
@@ -1844,7 +1979,7 @@ def cmd_results(gr: Grader) -> dict:
                                 lambda s=sport: gr.odds.scores(s, days_from=SCORES_DAYS, key="free", retries=0))
             if not isinstance(body, list):
                 raise oa.OddsApiError("scores answer is not a list")
-            kept = [e for e in body if not (isinstance(e, dict) and str(e.get("id")) in held)]
+            kept = [e for e in body if not _dropped_before_storing(e, held, starts, no_choice)]
             at, raw = gr.now(), _canon(kept)
             with gr.store.writing(at) as c:
                 c.execute("INSERT INTO scores (league, fetched_at, sha256, raw) VALUES (?, ?, ?, ?)",
@@ -2363,6 +2498,24 @@ def _one_record(root: Path, picks: Path) -> str | None:
     return identity
 
 
+def _refuse_frozen(db: Path) -> None:
+    """Before anything is created or opened for writing: a grading store frozen under another fingerprint than this
+    code's (with the store's own word list) is refused here, read-only, so a refused command creates nothing (not a
+    table an older store lacks, not the lock file). The writers check again under the lock."""
+    if not db.is_file():
+        return
+    store = GradingStore(db, readonly=True)
+    try:
+        kept = store.word_list()
+        frozen = store.frozen()
+    finally:
+        store.close()
+    fp = fingerprint(kept["sha256"] if kept is not None else None)
+    if frozen and frozen["fingerprint"] != fp:
+        raise Refused("the matching rule is frozen at %s (a result was read); the code's fingerprint is now %s"
+                      % (frozen["fingerprint"][:12], fp[:12]))
+
+
 def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
     clock = clock or _system_clock
     ap = argparse.ArgumentParser(prog="pick_grading", description="Grade the stored pick lists (research).")
@@ -2396,6 +2549,7 @@ def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
         return 0
     root, picks = Path(args.store), Path(args.picks)
     identity = _one_record(root, picks)
+    _refuse_frozen(root / STORE_FILE)
 
     if args.cmd == "status":
         store = GradingStore(root / STORE_FILE, readonly=True)

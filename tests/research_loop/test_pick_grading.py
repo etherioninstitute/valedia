@@ -1968,12 +1968,18 @@ def test_test_period_picks_wait_for_a_choice(tmp_path, capsys):
 LATE = {"title": "Pick of the Day - 12/13/26 (Sunday)", "thread": "2026-12-13T12:00:00Z", "seen": "2026-12-13T20:00:00Z",
         "start": "2026-12-14T03:00:00Z", "schedule": "2026-12-13T19:00:00Z", "match": "2026-12-13T23:00:00Z",
         "event": "26DEC13"}
+# Clarification 22: no result of a game from 2026-12-13 00:00 US-Eastern on is read before the choice, so the worlds
+# whose development games must be read before a choice are dated a day earlier, with games before that moment.
+LATE12 = {"title": "Pick of the Day - 12/12/26 (Saturday)", "thread": "2026-12-12T12:00:00Z",
+          "seen": "2026-12-12T20:00:00Z", "start": "2026-12-13T03:00:00Z", "schedule": "2026-12-12T19:00:00Z",
+          "match": "2026-12-12T23:00:00Z", "event": "26DEC12"}             # games at 22:00 US-Eastern on 2026-12-12
+EVE12 = dict(LATE12, start="2026-12-13T04:30:00Z")                       # games at 23:30 US-Eastern on 2026-12-12
 
 
 @pytest.mark.parametrize("now, bought", [("2026-12-14T10:59:59Z", True), ("2026-12-14T11:00:00Z", False)])
 def test_without_a_choice_no_scores_are_bought_once_the_test_period_has_begun(tmp_path, capsys, now, bought):
-    env, games = setup_big(tmp_path, capsys, LATE)
-    settle_world(env, games, LATE)
+    env, games = setup_big(tmp_path, capsys, LATE12)
+    settle_world(env, games, LATE12)
     env.audit(capsys)
     env.clock.set(now)                                      # 06:00 US-Eastern on the test period's first day
     out = env.out(capsys, "results")
@@ -2059,7 +2065,8 @@ def test_no_settlement_of_a_test_period_day_is_fetched_before_a_choice_even_for_
     env.clock.set("2026-12-14T10:00:00Z")                  # 05:00 US-Eastern, more than three hours after the start
     r = env.out(capsys, "results")
     env.out(capsys, "prices")
-    assert r["picks"] == 42 and not any("/markets" in u for u in env.kalshi.urls)
+    # a game from 2026-12-13 00:00 US-Eastern on is held before the choice (clarification 22): no row is read
+    assert r["picks"] == 0 and not any("/markets" in u for u in env.kalshi.urls)
     k = env.root / "kalshi.sqlite"
     if k.exists():
         db = sqlite3.connect(k)
@@ -2161,23 +2168,21 @@ def test_question_b_waits_for_kalshi_where_kalshi_lists_the_game_and_uses_the_sc
 
 # ---------------------------------------------------------------- rev 4, outcome 3: no test-period final before a choice
 
-EVE = dict(LATE, start="2026-12-14T04:30:00Z")              # development games at 23:30 US-Eastern on 2026-12-13
-
-
 def test_before_a_choice_no_final_or_settlement_of_a_game_a_test_period_pick_is_matched_to_is_stored(tmp_path, capsys):
-    w, games = big_world(EVE)
-    w.thread("t2", "Pick of the Day - 12/14/26 (Monday)", "2026-12-14T03:00:00Z")
-    w.comment("t2c", "author_t2", [("2026-12-14T04:00:00Z", ml(games[0][1].split()[1]), "+110")], tid="t2")
+    """A pick of the 12/14 thread matched to a development game before the boundary (the matching-based hold)."""
+    w, games = big_world(EVE12)
+    w.thread("t2", "Pick of the Day - 12/14/26 (Monday)", "2026-12-13T03:00:00Z")
+    w.comment("t2c", "author_t2", [("2026-12-13T04:00:00Z", ml(games[0][1].split()[1]), "+110")], tid="t2")
     env = Env(tmp_path, w)
-    env.odds.events["basketball_nba"] = [ev(g, h, a, EVE["start"]) for g, h, a in games]
-    env.clock.set(EVE["schedule"])
+    env.odds.events["basketball_nba"] = [ev(g, h, a, EVE12["start"]) for g, h, a in games]
+    env.clock.set(EVE12["schedule"])
     env.out(capsys, "schedule")
-    env.clock.set("2026-12-14T04:10:00Z")
+    env.clock.set("2026-12-13T04:10:00Z")
     env.out(capsys, "match")
     assert (env.rows()["t2c"]["status"], env.rows()["t2c"]["game_id"]) == ("matched", "g00")
-    settle_world(env, games, EVE)
+    settle_world(env, games, EVE12)
     env.audit(capsys)
-    env.clock.set("2026-12-14T10:00:00Z")                  # 05:00 US-Eastern on 2026-12-14, no choice
+    env.clock.set("2026-12-13T10:00:00Z")                  # 05:00 US-Eastern on 2026-12-13, no choice
     r = env.out(capsys, "results")
     assert r["scores"]["NBA"]["games_listed"] == N_GAMES - 1 and r["scores"]["NBA"]["dropped_test_period"] == 1
     s = env.store()
@@ -2292,58 +2297,90 @@ def _assert_held_then_released(env, capsys, now):
     assert res["held_for_test"] == {"picks": 0, "league_days": 0}
 
 
-def test_a_game_is_held_for_the_test_when_the_test_pick_is_matched_after_its_final_was_stored_a_late_parse(
-        tmp_path, capsys):
-    env, w, games = _held_env(tmp_path, capsys, EVE, "2026-12-14T03:00:00Z", "2026-12-14T04:00:00Z")
-    env.clock.set("2026-12-14T04:10:00Z")
+def _late_parse_held(tmp_path, capsys):
+    """The verifier's first order, on games before the boundary: the test pick's parse is stored at 09:00Z, after
+    game 0's final was stored; the next `match` holds game 0."""
+    env, w, games = _held_env(tmp_path, capsys, EVE12, "2026-12-13T03:00:00Z", "2026-12-13T04:00:00Z")
+    env.clock.set("2026-12-13T04:10:00Z")
     env.out(capsys, "match")
     assert "t2c" not in env.rows()                                         # its parse is not stored yet
-    settle_world(env, games, EVE)
+    settle_world(env, games, EVE12)
     env.audit(capsys)
-    env.clock.set("2026-12-14T08:00:00Z")
+    env.clock.set("2026-12-13T08:00:00Z")
     r = env.out(capsys, "results")                                          # game 0's final is stored
     assert r["scores"]["NBA"]["dropped_test_period"] == 0
-    w.parse_later(env.picks, "t2c", "2026-12-14T09:00:00Z")
-    env.clock.set("2026-12-14T09:30:00Z")
+    w.parse_later(env.picks, "t2c", "2026-12-13T09:00:00Z")
+    env.clock.set("2026-12-13T09:30:00Z")
     env.out(capsys, "match")
     assert (env.rows()["t2c"]["status"], env.rows()["t2c"]["game_id"]) == ("matched", "g00")
-    _assert_held_then_released(env, capsys, "2026-12-14T10:30:00Z")
+    return env, games
+
+
+def test_a_game_is_held_for_the_test_when_the_test_pick_is_matched_after_its_final_was_stored_a_late_parse(
+        tmp_path, capsys):
+    env, games = _late_parse_held(tmp_path, capsys)
+    _assert_held_then_released(env, capsys, "2026-12-13T10:30:00Z")
 
 
 def test_a_game_is_held_for_the_test_when_results_ran_after_the_last_match(tmp_path, capsys):
-    env, w, games = _held_env(tmp_path, capsys, LATE, "2026-12-14T01:00:00Z", "2026-12-14T02:00:00Z")
-    env.clock.set("2026-12-14T00:30:00Z")
+    env, w, games = _held_env(tmp_path, capsys, LATE12, "2026-12-13T01:00:00Z", "2026-12-13T02:00:00Z")
+    env.clock.set("2026-12-13T00:30:00Z")
     env.out(capsys, "match")                                                # the last match before the results
-    settle_world(env, games, LATE)
+    settle_world(env, games, LATE12)
     env.audit(capsys)
-    w.parse_later(env.picks, "t2c", "2026-12-14T02:05:00Z")                 # the test pick reaches the pick store
-    env.clock.set("2026-12-14T06:30:00Z")
+    w.parse_later(env.picks, "t2c", "2026-12-13T02:05:00Z")                 # the test pick reaches the pick store
+    env.clock.set("2026-12-13T06:30:00Z")
     r = env.out(capsys, "results")                                          # unmatched yet: game 0's final is stored
     assert r["scores"]["NBA"]["dropped_test_period"] == 0
-    env.clock.set("2026-12-14T07:00:00Z")
+    env.clock.set("2026-12-13T07:00:00Z")
     env.out(capsys, "match")
     assert env.rows()["t2c"]["game_id"] == "g00"
-    _assert_held_then_released(env, capsys, "2026-12-14T08:00:00Z")
+    _assert_held_then_released(env, capsys, "2026-12-13T08:00:00Z")
 
 
 def test_a_game_matched_by_a_test_pick_under_an_earlier_fingerprint_only_is_held(tmp_path, capsys):
-    env, games = setup_big(tmp_path, capsys, EVE)
-    settle_world(env, games, EVE)
+    env, games = setup_big(tmp_path, capsys, EVE12)
+    settle_world(env, games, EVE12)
     env.audit(capsys)
-    env.clock.set("2026-12-14T08:00:00Z")
+    env.clock.set("2026-12-13T08:00:00Z")
     env.out(capsys, "results")
     s = env.store()
     row = dict(s.rows("SELECT * FROM matches WHERE game_id = 'g00' ORDER BY id LIMIT 1")[0])
     s.close()
     row.update(id=None, comment_id="old_t", thread_id="t_old", thread_date="2026-12-14", fingerprint="0" * 64,
-               at="2026-12-14T08:00:00Z")                                   # a test pick's row under an older rule
+               at="2026-12-13T08:00:00Z")                                   # a test pick's row under an older rule
     db = sqlite3.connect(env.root / pg.STORE_FILE)
     db.execute("INSERT INTO matches (%s) VALUES (%s)" % (", ".join(row), ", ".join("?" * len(row))), list(row.values()))
     db.commit()
     db.close()
-    env.clock.set("2026-12-14T09:00:00Z")
+    env.clock.set("2026-12-13T09:00:00Z")
     res = env.out(capsys, "evaluate", "--period", "development")
     assert res["B"]["not_graded"].get("held_for_test") == 2 and res["held_for_test"] == {"picks": 2, "league_days": 1}
+
+
+# ---------------------------------------------------------------- rev 6, outcome 4: the hold in test_counts and results
+
+def test_the_test_counts_leave_out_a_game_held_for_the_test(tmp_path, capsys):
+    """Game 0's final and Kalshi's settlement were stored before the test pick on it was matched: before the choice
+    the test counts leave the pick out, after it they count it."""
+    env, games = _late_parse_held(tmp_path, capsys)
+    env.clock.set("2026-12-13T10:00:00Z")
+    tc = env.out(capsys, "status")["test_counts"]
+    assert tc["B_graded"] == 0 and tc["versions"]["1"] == {"contracts": 0, "days": 0}
+    env.out(capsys, "choose", "--version", "1")
+    assert env.out(capsys, "status")["test_counts"]["B_graded"] == 1
+
+
+def test_results_leave_out_the_rows_of_a_game_held_for_the_test(tmp_path, capsys):
+    """42 development picks are matched, 2 of them (authors 0 and 22) to game 0, which the test pick holds."""
+    env, games = _late_parse_held(tmp_path, capsys)
+    env.clock.set("2026-12-13T10:00:00Z")
+    r = env.out(capsys, "results")
+    assert r["picks"] == 40 and r["test_waits_for_choice"] == 1
+    s = env.store()
+    detail = json.loads(s.rows("SELECT detail FROM result_reads ORDER BY id")[-1]["detail"])
+    s.close()
+    assert detail["picks"] == 40
 
 
 # ---------------------------------------------------------------- rev 5, outcome 2: fingerprints of the source alone
@@ -2508,3 +2545,239 @@ def test_a_game_kalshi_lists_only_in_its_stored_markets_waits_for_kalshi(tmp_pat
     assert p["pairing"]["NBA"]["paired_now"] == N_GAMES - 1
     res = env.out(capsys, "evaluate", "--period", "development")
     assert res["B"]["not_graded"] == {"kalshi_not_settled": 2}
+
+
+# ---------------------------------------------------------------- rev 6, outcome 1: the boundary is the clock
+
+BOUNDARY_AT = "2026-12-13T05:00:00Z"                       # 2026-12-13 00:00 US-Eastern (clarification 22)
+TWIN_KINDS = (                                            # kind, games, thread, first seen, start, Kalshi's date
+    ("p", 10, "tA", "2026-12-12T20:00:00Z", "2026-12-13T01:00:00Z", "26DEC12"),   # 20:00 US-Eastern 12/12: before
+    ("q", 4, "tA", "2026-12-12T21:00:00Z", "2026-12-13T05:30:00Z", "26DEC12"),    # 00:30 US-Eastern 12/13: Kalshi
+    ("r", 10, "tB", "2026-12-13T20:00:00Z", "2026-12-14T01:00:00Z", "26DEC13"))   # dates it 12/12; 20:00 on 12/13
+TWIN_LATE = ("p03b", "q01b", "r04b")                      # picks whose parse is stored later (see the orders)
+
+
+def _twin_games():
+    teams = team_names(2 * sum(n for _, n, *_ in TWIN_KINDS))
+    out, k = [], 0
+    for kind, n, tid, seen, start, kday in TWIN_KINDS:
+        for i in range(n):
+            out.append({"id": "%s%02d" % (kind, i), "i": i, "tid": tid, "seen": plus(seen, 120 * i), "start": start,
+                        "kday": kday, "home": "%s %s" % teams[2 * k], "away": "%s %s" % teams[2 * k + 1],
+                        "after": ts(start) >= ts(BOUNDARY_AT)})
+            k += 1
+    return out
+
+
+def _twin_env(tmp_path, flip):
+    """Development threads of 12/12 (games before the boundary and games of 00:30 US-Eastern on 12/13) and of 12/13;
+    two authors back each game's home team. `flip`: every result of a game from the boundary on is the other one
+    (Kalshi's result, the final, and the candles from the start on)."""
+    games = _twin_games()
+    w = PickWorld()
+    w.thread("tA", "Pick of the Day - 12/12/26 (Saturday)", "2026-12-12T12:00:00Z")
+    w.thread("tB", "Pick of the Day - 12/13/26 (Sunday)", "2026-12-13T12:00:00Z")
+    for g in games:
+        for j, suffix in enumerate(("a", "b")):
+            cid = g["id"] + suffix
+            w.comment(cid, "author_" + cid, [(plus(g["seen"], 30 * j), ml(g["home"].split()[1]), "+110")], tid=g["tid"])
+            if cid in TWIN_LATE:
+                w.unparsed.add(cid)
+    env = Env(tmp_path, w)
+    env.world = w
+    env.odds.events["basketball_nba"] = [ev(g["id"], g["home"], g["away"], g["start"]) for g in games]
+    markets, scores = [], []
+    for g in games:
+        home_wins = (g["i"] % 2 == 0) != (flip and g["after"])
+        event = "KXNBAGAME-%s%s" % (g["kday"], g["id"].upper())
+        expected = plus(g["start"], 3 * 3600)
+        markets += [kmarket(event, "H" + g["id"].upper(), g["home"].split()[0], "yes" if home_wins else "no", expected),
+                    kmarket(event, "A" + g["id"].upper(), g["away"].split()[0], "no" if home_wins else "yes", expected)]
+        for code in ("H", "A"):
+            ticker = "%s-%s%s" % (event, code, g["id"].upper())
+            base = ts(g["seen"]) // 60 * 60 - 120
+            late = (.88, .90) if (flip and g["after"]) == (code == "H") else (.10, .12)
+            env.kalshi.candles[ticker] = [kcandle(base + 60 * j, .48, .50) for j in range(30)] + [
+                kcandle(ts(g["start"]) + 60 * j, *late) for j in range(30)]                 # from the start on
+        scores.append({"id": g["id"], "sport_key": "basketball_nba", "commence_time": g["start"], "completed": True,
+                       "home_team": g["home"], "away_team": g["away"],
+                       "scores": [{"name": g["home"], "score": "110" if home_wins else "100"},
+                                  {"name": g["away"], "score": "100" if home_wins else "110"}]})
+    for gid, start, flipped in (("x98", "2026-12-13T02:00:00Z", False), ("x99", "2026-12-13T06:00:00Z", flip)):
+        scores.append({"id": gid, "sport_key": "basketball_nba", "commence_time": start, "completed": True,  # games
+                       "home_team": "Xaton Xirs", "away_team": "Yaton Yirs",          # the schedule does not list
+                       "scores": [{"name": "Xaton Xirs", "score": "90" if flipped else "80"},
+                                  {"name": "Yaton Yirs", "score": "80" if flipped else "90"}]})
+    env.kalshi.markets["KXNBAGAME"] = markets
+    env.odds.scores["basketball_nba"] = scores
+    return env, games
+
+
+TWIN_ORDERS = {
+    "results_late_parses_between": (
+        ("schedule", "2026-12-12T19:00:00Z"), ("match", "2026-12-12T23:00:00Z"), ("audit", "2026-12-12T23:05:00Z"),
+        ("prices", "2026-12-13T00:30:00Z"), ("evaluate", "2026-12-13T00:40:00Z"),
+        ("results", "2026-12-13T04:30:00Z"), ("evaluate", "2026-12-13T04:40:00Z"),
+        ("parse q01b", "2026-12-13T05:00:00Z"), ("match", "2026-12-13T05:10:00Z"), ("evaluate", "2026-12-13T05:20:00Z"),
+        ("results", "2026-12-13T10:40:00Z"), ("evaluate", "2026-12-13T10:50:00Z"),
+        ("parse p03b", "2026-12-13T11:00:00Z"), ("match", "2026-12-13T11:10:00Z"), ("evaluate", "2026-12-13T11:20:00Z"),
+        ("schedule", "2026-12-13T19:00:00Z"), ("match", "2026-12-13T19:05:00Z"), ("evaluate", "2026-12-13T19:10:00Z"),
+        ("results", "2026-12-14T06:00:00Z"), ("prices", "2026-12-14T06:10:00Z"),
+        ("parse r04b", "2026-12-14T06:20:00Z"), ("match", "2026-12-14T06:30:00Z"), ("evaluate", "2026-12-14T06:40:00Z")),
+    "results_first_parses_after": (
+        ("schedule", "2026-12-12T19:00:00Z"), ("match", "2026-12-12T23:00:00Z"), ("audit", "2026-12-12T23:05:00Z"),
+        ("results", "2026-12-13T10:40:00Z"), ("parse p03b", "2026-12-13T10:45:00Z"), ("match", "2026-12-13T10:50:00Z"),
+        ("evaluate", "2026-12-13T10:55:00Z"), ("prices", "2026-12-13T11:00:00Z"), ("evaluate", "2026-12-13T11:05:00Z"),
+        ("parse q01b", "2026-12-13T11:10:00Z"), ("parse r04b", "2026-12-13T11:10:00Z"),
+        ("match", "2026-12-13T11:15:00Z"), ("evaluate", "2026-12-13T11:20:00Z"),
+        ("results", "2026-12-14T06:00:00Z"), ("schedule", "2026-12-14T06:05:00Z"), ("match", "2026-12-14T06:10:00Z"),
+        ("prices", "2026-12-14T06:20:00Z"), ("evaluate", "2026-12-14T06:30:00Z")),
+}
+
+
+def _twin_run(tmp_path, capsys, flip, order):
+    env, games = _twin_env(tmp_path, flip)
+    evals = []
+    for step, at in TWIN_ORDERS[order]:
+        env.clock.set(at)
+        if step.startswith("parse "):
+            env.world.parse_later(env.picks, step.split()[1], at)
+        elif step == "audit":
+            env.audit(capsys)
+        elif step == "evaluate":
+            evals.append(env.out(capsys, "evaluate", "--period", "development"))
+        else:
+            env.out(capsys, step)
+    after = {g["id"] for g in games if g["after"]} | {"x99"}
+    s = env.store()
+    finals = {e["id"] for r in s.rows("SELECT raw FROM scores") for e in json.loads(r["raw"])}
+    pairs = set(s.pairs())
+    s.close()
+    k = sqlite3.connect(env.root / "kalshi.sqlite")
+    markets = {kh.event_date(t) and t.split("-")[1][7:].lower() for (t,) in k.execute("SELECT ticker FROM markets")}
+    k.close()
+    stored = {"finals": finals, "pairs": pairs, "markets": markets, "after": after,
+              "before": {g["id"] for g in games if not g["after"]}}
+    env.clock.set("2026-12-14T12:30:00Z")                    # the choice: from now on everything is read
+    env.out(capsys, "choose", "--version", "1")
+    env.out(capsys, "results")
+    env.out(capsys, "prices")
+    chosen = env.out(capsys, "evaluate", "--period", "development")
+    return evals, chosen, stored
+
+
+@pytest.mark.parametrize("order", sorted(TWIN_ORDERS))
+def test_before_the_choice_no_result_of_a_game_from_the_boundary_on_is_read_a_twin_run(tmp_path, capsys, order):
+    """Clarification 22. Twin runs: in the second every result of a game that starts from 2026-12-13 00:00 US-Eastern
+    on is the other one. Every development evaluation before the choice is identical in both, whatever the order of
+    commands and parses; the games before the boundary are read; after the choice the twins differ."""
+    evals, chosen, stored = _twin_run(tmp_path / "plain", capsys, False, order)
+    evals_f, chosen_f, stored_f = _twin_run(tmp_path / "flipped", capsys, True, order)
+    assert len(evals) == len(evals_f) >= 4
+    for k, (a, b) in enumerate(zip(evals, evals_f)):
+        assert a == b, (order, k)
+    for st in (stored, stored_f):                 # before the choice nothing of a game from the boundary on is stored
+        assert not (st["finals"] | st["pairs"] | st["markets"]) & st["after"], st
+        assert st["before"] <= st["finals"] & st["pairs"] & st["markets"], st     # and every game before it is
+    last = evals[-1]
+    assert last["B"]["n"] == 20 and last["A"]["1"]["n"] == 10                 # the games before the boundary
+    assert last["B"]["not_graded"] == {"held_for_test": 28} and last["held_for_test"]["picks"] == 28
+    assert last["A"]["1"]["not_bought"] == {"held_for_test": 14}
+    assert chosen["B"]["n"] == chosen_f["B"]["n"] == 40 and chosen["B"]["mean"] != chosen_f["B"]["mean"]
+
+
+# ---------------------------------------------------------------- rev 6, outcome 2: a table changed without a name bound
+
+def test_a_statement_that_changes_a_table_without_binding_a_name_changes_the_fingerprints(tmp_path):
+    """A module-level statement that changes a table the fingerprints read (a subscript assignment, an augmented one, a
+    mutating method call, a call given the table, in a loop, or in another module's table through its alias) is part of
+    the fingerprinted source, even when it leaves the value as it was."""
+    base, sbase = pg.fingerprint(), pg.scoring_fingerprint()
+    anchor = "\nREASONS = (                                 # why a counted pick is not graded (matching)\n"
+    assert anchor in Path(pg.__file__).read_text()
+    statements = {
+        "subscript": 'LEAGUE_WORDS["nfl"] = ("NFL",)',
+        "new_key": 'LEAGUE_WORDS["probasketball"] = ("NBA",)',
+        "method": "LEAGUE_WORDS.update({})",
+        "call_with_it": "dict.update(LEAGUE_WORDS, {})",
+        "augmented": 'LEAGUE_WORDS["nba"] += ()',
+        "loop": "for _k in ():\n    LEAGUE_WORDS[_k] = ()",
+        "other_module": "sl._TOKEN_MAP.update({})",
+        "both_scopes": 'LEAGUES["NBA"] = LEAGUES["NBA"]',
+    }
+    for name, st in statements.items():
+        mod = _copy_with_text(tmp_path, "mutation_" + name, lambda src, st=st: src.replace(anchor, "\n" + st + anchor, 1))
+        if name != "new_key":                                   # these leave every value as it was
+            assert mod.LEAGUE_WORDS == pg.LEAGUE_WORDS and mod.LEAGUES == pg.LEAGUES, name
+        assert mod.fingerprint() != base, name
+        if name == "both_scopes":
+            assert mod.scoring_fingerprint() != sbase, name
+
+
+# ---------------------------------------------------------------- rev 6, outcome 3: a refused command creates nothing
+
+def _folder_state(root):
+    files = {p.name: p.read_bytes() for p in sorted(root.iterdir())}
+    c = sqlite3.connect("file:" + urllib.parse.quote(str((root / pg.STORE_FILE).resolve())) + "?mode=ro", uri=True)
+    try:
+        master = sorted(c.execute("SELECT type, name, sql FROM sqlite_master"))
+    finally:
+        c.close()
+    return files, master
+
+
+def test_a_refused_command_on_a_store_frozen_under_another_fingerprint_creates_nothing(tmp_path, capsys):
+    env, games = setup_big(tmp_path, capsys)
+    _as_layout_3_of_3da5011(env)                              # a store without the word-list table
+    db = sqlite3.connect(env.root / pg.STORE_FILE)
+    db.execute("INSERT INTO frozen (id, fingerprint, at) VALUES (1, ?, ?)", ("f" * 64, DEV["match"]))
+    db.commit()
+    db.close()
+    (env.root / pg.LOCK_FILE).unlink(missing_ok=True)
+    before = _folder_state(env.root)
+    env.clock.set("2026-11-15T12:00:00Z")
+    for cmd in (["schedule"], ["match"], ["daily"], ["audit-sample", "--out", str(env.audit_dir)],
+                ["audit-pass", "--sample", "1", "--wrong", "0"], ["prices"], ["results"],
+                ["evaluate", "--period", "development"], ["evaluate", "--period", "test"], ["choose", "--version", "1"],
+                ["status"]):
+        with pytest.raises(pg.Refused, match="frozen"):
+            env.run(*cmd)
+        assert _folder_state(env.root) == before, cmd
+    assert not env.audit_dir.exists()
+
+
+# ---------------------------------------------------------------- rev 6, outcome 4: the word list's two guards
+
+def test_a_stored_word_list_that_does_not_fit_its_hash_is_refused(tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text("no\nway\nis\nthe\nplay\ntake\ntonight\n")
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    env = _word_env(tmp_path, capsys)
+    env.clock.set("2026-11-13T19:00:00Z")
+    env.out(capsys, "match")
+    c = sqlite3.connect(env.root / pg.STORE_FILE)                 # the copy damaged, its hash left as it was
+    c.execute("DROP TRIGGER no_update_word_lists")
+    c.execute("UPDATE word_lists SET raw = raw || char(10) || 'zzz'")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(pg, "_WORD_SETS", {})                    # a new process reads the copy afresh
+    env.clock.set("2026-11-13T20:00:00Z")
+    for cmd in ("match", "daily"):
+        with pytest.raises(pg.Refused, match="does not fit its hash"):
+            env.run(cmd)
+
+
+@pytest.mark.parametrize("content", ["", "\n  \n\t\n"])
+def test_an_empty_word_file_counts_as_missing(tmp_path, capsys, monkeypatch, content):
+    empty = tmp_path / "words"
+    empty.write_text(content)
+    monkeypatch.setattr(pg, "WORDS_FILE", empty, raising=False)
+    env = _word_env(tmp_path, capsys)
+    n = len(set(pg.FALLBACK_WORDS))
+    assert env.out(capsys, "status")["word_list"] == {"kept": False, "source": "built-in fallback", "words": n}
+    env.clock.set("2026-11-13T19:00:00Z")
+    env.out(capsys, "match")
+    kept = env.out(capsys, "status")["word_list"]
+    assert kept["kept"] is True and kept["source"] == "built-in fallback" and kept["words"] == n
+    r = env.rows()
+    assert r["c9"]["reason"] == "no_team_named" and r["c2"]["status"] == "matched"       # "no" is a word
