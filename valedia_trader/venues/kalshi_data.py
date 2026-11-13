@@ -251,6 +251,15 @@ class KalshiData:
         return {"yes": normalize_levels(book.get("yes_dollars"))[:depth],
                 "no": normalize_levels(book.get("no_dollars"))[:depth]}
 
+    def orderbook_raw(self, ticker: str, depth: int = 10) -> dict:
+        """The `orderbook_fp` object of one market's order book exactly as Kalshi sent it (dollar strings, bids
+        ascending), nothing parsed, so a caller can keep a malformed level as it came."""
+        body = self.get_json("/markets/%s/orderbook" % ticker, {"depth": int(depth)})
+        book = body.get("orderbook_fp")
+        if not isinstance(book, dict):
+            raise KalshiDataError("no 'orderbook_fp' in the order book of %s (keys %s)" % (ticker, sorted(body)))
+        return book
+
     def trades(self, ticker: str, min_ts: float, max_ts: float | None = None) -> list[dict]:
         """The trades of one market from `min_ts` (epoch seconds, as the API wants: not milliseconds) to `max_ts`
         or now, newest first as Kalshi sends them, across cursor pages."""

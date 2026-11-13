@@ -219,6 +219,16 @@ def test_an_empty_or_one_sided_book_comes_back_as_such():
         c.orderbook("X-1")
 
 
+def test_orderbook_raw_gives_the_book_exactly_as_sent():
+    raw = {"yes_dollars": [["0.5000", "-3.00"], ["abc", "1.00"]], "no_dollars": [["0.5500", "2.00"]]}
+    c, _ = client({("/markets/R-1/orderbook", (("depth", "10"),)): {"orderbook_fp": raw}})
+    assert c.orderbook_raw("R-1") == raw                      # nothing parsed, so a bad level can be kept as sent
+    assert "depth=10" in c.fetch.urls[0]
+    c, _ = client({("/markets/X-1/orderbook", ()): {"something": 1}})
+    with pytest.raises(kd.KalshiDataError):
+        c.orderbook_raw("X-1")
+
+
 def _trade(i, ts, side="yes", count="2.00"):
     return {"trade_id": "id-%d" % i, "ticker": "T-1", "created_time": ts, "yes_price_dollars": "0.4800",
             "no_price_dollars": "0.5200", "count_fp": count, "taker_side": side, "is_block_trade": False}

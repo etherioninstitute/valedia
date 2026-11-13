@@ -10,44 +10,76 @@ depend on anything that happened after t.
     python -m valedia_trader.research_loop.orderbook_loop select      # the markets it would watch, and why
     python -m valedia_trader.research_loop.orderbook_loop status      # coverage, latency and errors by UTC day
 
-What happens each minute (`Collector.cycle`):
+What happens each minute (`Collector.cycle`), in this order:
 
-* snapshot  for each watched market, the ten best levels a side of its book and the trades since the last read
-            (deduplicated by `trade_id`), each request stamped with its start and end time;
-* decide    every five minutes per market, on that market's own phase (the minutes of the hour where
+* snapshot  first, for every watched market (by watch number, the same order each minute) and then for every
+            market in its tail (below): the ten best levels a side of its book and the trades since the last read
+            (deduplicated by `trade_id`), each request stamped with its start and end time. A book that is
+            crossed (best bid at or above best ask), has a negative size or a malformed price is stored as sent
+            (`raw_json`), marked `invalid` with the reason, and never decided on;
+* decide    then, every five minutes per market, on that market's own phase (the minutes of the hour where
             minute mod 5 equals its phase, 0 to 4, given at selection and spread evenly), once it has 30 minutes
-            of snapshots, right after its snapshot: build the numeric state from what was stored at or before that moment
+            of snapshots: build the numeric state from what was stored strictly before that moment
             (`state_at`), check the pinned model tag, ask the six questions of `BATTERY` in one call, and store
-            the state, the answers and one status;
-* drop      a market after 12 hours of watching, 30 minutes before it closes, or when its book has been one-sided
-            for 30 minutes;
-* select    every six hours, fill the free places from all open markets by the rule of the prediction
-            (`select_markets`), at the end of a minute whose next minute has the fewest decisions (its phase is
-            the least used), and give each new market the least-used phase (`assign_phases`);
+            the state, the answers and one status. The call has a hard limit of MODEL_LIMIT_S (10 s): an answer
+            not in by then is abandoned and the slot is stored as `late`, with no answers. A call is not started
+            when fewer than 12 s of the minute are left (also `late`), so the decisions never push the next
+            minute's snapshots back;
+* drop      a market after 12 hours of watching, 30 minutes before it closes, or when its book has been one-sided,
+            empty or invalid for 30 minutes. A dropped market is read on (book and trades once a minute, marked
+            `tail`, no decisions) for 35 minutes after its drop or until it closes, whichever comes first, so the
+            outcomes of its last decisions can be rebuilt;
+* select    every six hours on a fixed grid (from the first selection), fill the free places from all open markets
+            by the rule of the prediction (`select_markets`), and give each new market the least-used phase
+            (`assign_phases`). A watch's 12 hours run from the start of the selection that chose it, so they
+            end on the grid: at a reselection the watches that have run 12 hours, or will within two minutes, are
+            ended first and their places filled in the same transaction, and nothing is left unwatched in
+            between. A market may be chosen again; when its snapshots ran on without a break (its tail included)
+            it needs no new 30-minute warm-up. Whenever nothing is watched, for whatever reason, a selection runs
+            at once, off the grid (recorded as `selection_off_grid`), and again each minute until one succeeds.
+            While a selection reads, each new minute still gets its cycle (`_tick`);
 * heartbeat one row with the requests and failures since the last one.
+
+If a cycle runs into the next minute the next one starts at once (event `overrun`); a clock that goes back is
+recorded (event `clock_back`) and the loop carries on.
+
+The selection reads a live book only for markets whose cached quote (the market object, cached about five
+seconds) is within five cents of the band (best bid at least 5, best ask at most 95, spread at most 20 cents);
+the live book then decides by the rule itself. This screen is a practical addition to the prediction's rule:
+reading the 45,000 books of all open markets is not possible, and each selection records how many markets it
+screened out (`screened_out`).
 
 Load at twenty markets. Kalshi: one book and one trades page per market per minute, 20 x 2 = 40 GET a minute,
 under the 45 allowed; the client's pacing keeps them at most three a second, so they take about 14 s. A trades
-page holds 1,000 trades, so a second page is needed only above 1,000 trades a minute in one market. The
-selection every six hours is a burst outside that steady state: one page per 1,000 open markets in the close
-window plus one book per market read (it stops once the places are full), at the same three a second. Model:
-one call per market every five minutes, and the twenty markets are spread over five phases, 20 / 5 = 4 a
-phase, so every minute makes exactly 4 calls, under the 5 allowed, in that minute and not only on average (with
-fewer markets after drops a phase holds at most 4, since a new market always takes the least-used phase).
-Measured on 2026-11-13 with this battery: about 11,000 input tokens and 2.7 s a call when warm, so a minute
-takes about 14 s of reads plus 4 x 2.7 = 11 s of model time, well inside the minute. Each call is preceded by two
-loopback GETs (`/api/tags`, `/api/version`) to check the pin.
+page holds 1,000 trades, so a second page is needed only above 1,000 trades a minute in one market. Tails add
+two GET a minute each while they last (35 minutes at most), still through the same pacing: ten markets ended at
+a reselection and not chosen again add 20 GET a minute for 35 minutes, about 7 s more of reads. The selection
+every six hours is a burst outside that steady state: one page per 1,000 open markets in the close window plus
+one book per market read (it stops once the places are full), at the same three a second. Model: one call per
+market every five minutes, and the twenty markets are spread over five phases, 20 / 5 = 4 a phase, so every
+minute makes exactly 4 calls, under the 5 allowed, in that minute and not only on average (with fewer markets
+after drops a phase holds at most 4, since a new market always takes the least-used phase). Measured on
+2026-11-13 with the final battery: about 12,900 input tokens and 3.1 to 3.3 s a call when warm (5.4 s cold), so a
+minute takes about 14 s of reads plus 4 x 3.3 = 13 s of model time; at worst 14 s + 4 x 10 s = 54 s, still inside
+the minute. Each call
+is preceded by two loopback GETs (`/api/tags`, `/api/version`, 2 s limit each) to check the pin.
 
 Hosts: Kalshi only at https://api.elections.kalshi.com/trade-api/v2 through `KalshiData` (GET only, no key);
 the model only at http://127.0.0.1:11434 (`ModelClient` refuses any other address). No secrets, no child process.
 
 The record is one sqlite file, append-only: triggers refuse every UPDATE and DELETE. Times are kept as UTC ISO
-text and as epoch seconds.
+text and as epoch seconds. Two limits of that guarantee: an `INSERT OR REPLACE` (or `REPLACE`) from another
+connection deletes the old row without firing the DELETE trigger (sqlite runs delete triggers on REPLACE only
+with recursive triggers on), so it could get past them; this code never uses it. And the file grows: at twenty
+markets 28,800 snapshots and 5,760 decisions a day (about 0.7 KB and 2 KB each on the smoke record of
+2026-11-13), plus the trades and the indexes: up to about 1.2 GB after three weeks, depending on how much the
+markets trade.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import math
 import re
@@ -70,8 +102,9 @@ from valedia_trader.research_loop import REPO
 from valedia_trader.venues import kalshi_data as kd
 
 __all__ = ["BATTERY", "BATTERY_ID", "STATE_KEYS", "TABLES", "Selection", "select_markets", "resolve_selection",
-           "series_of", "assign_phases", "phase_of_minute", "book_summary", "state_at", "request_bytes", "battery_id", "Store", "ModelClient",
-           "ModelUnavailable", "Collector", "day_status", "format_status", "stop_on_signals", "main"]
+           "series_of", "assign_phases", "phase_of_minute", "parse_book", "book_summary", "reference", "state_at",
+           "request_bytes", "battery_id", "Store", "ModelClient", "ModelUnavailable", "ModelTimeout", "Collector",
+           "day_status", "format_status", "stop_on_signals", "main"]
 
 UTC = timezone.utc
 v3 = legacy.load("systemone_v3_candidate")
@@ -98,15 +131,21 @@ TAG = v3.TAG                      # nimble-v3:9b-mxfp8, checked on every call
 # ---- the ticket's settings
 WARMUP_S = 1800                   # a market needs 30 minutes of snapshots before its first decision
 STALE_S = 90                      # no call when the newest snapshot is older than this
-MODEL_LIMIT_S = 10.0              # an answer after this is stored but marked `late`
-MODEL_HARD_TIMEOUT_S = 30.0       # the connection is given up after this (`model_unavailable`); my choice
+MODEL_LIMIT_S = 10.0              # hard limit: an answer not in after this is abandoned (`late`, no answers)
+PIN_TIMEOUT_S = 2.0               # each of the two pin-check GETs
+CALL_RESERVE_S = 2.0              # no call is started with less than MODEL_LIMIT_S + this left in the minute
 FAILS_BEFORE_PAUSE, PAUSE_S = 5, 300
 TRADE_OVERLAP_S = 5               # each trades read starts 5 s before the previous one began
 FIRST_TRADES_S = 60               # a new market's first read goes back one minute
 MAX_BACKFILL_S = 3600             # after a stop the tape is read again from where it stopped, at most an hour back
-# Books are read only for markets whose cached quote (the market object, cached about five seconds) is within
-# two cents of the band; the live book then decides. This keeps the selection to a few hundred book reads.
-CACHE_MARGIN_C = 2.0
+# Books are read only for markets whose cached quote is within five cents of the band (see the module docstring:
+# a practical addition to the prediction's rule); the live book then decides.
+CACHE_MARGIN_C = 5.0
+TAIL_S = 35 * 60                  # a dropped market is read on for 35 minutes, or until it closes
+REF_WINDOW_S = 30                 # a history reference is the snapshot nearest its target within 30 s either side
+WINDOW_SHARE = 0.9                # a window number needs a snapshot in at least 90% of the window's minutes
+HISTORY_S = 3600 + 2 * REF_WINDOW_S + 60   # how far back a decision reads the record
+RESELECT_AHEAD_S = 120            # at a reselection, watches whose 12 hours end within this are ended first
 
 STATUSES = ("ok", "late", "model_unavailable", "tag_mismatch", "stale_data", "error")
 TABLES = ("selections", "markets", "market_drops", "snapshots", "trades", "decisions", "heartbeats", "events")
@@ -151,9 +190,11 @@ def _c(dollars: float) -> float:
 
 _STATE_TEXT = ("The state is computed in code from one prediction market's order book and recent trades. Prices, "
                "the mid, the spread and changes are in cents (0 to 100); sizes, depths and volumes are in contracts; "
-               "times are in minutes; imbalances and shares are fractions from 0 to 1; a change is the value now "
-               "minus the value then; null means not known yet. The bid is the best offer to buy yes and the ask "
-               "the best offer to sell yes. ")
+               "times are in minutes; imbalances and shares are fractions from 0 to 1; an imbalance is the buy "
+               "side's share: the size bid to buy yes divided by that size plus the size offered to sell yes; "
+               "spread_vs_60m_median is the spread now divided by its median over the last 60 minutes; a change "
+               "is the value now minus the value then; null means not known yet. The bid is the best offer to buy "
+               "yes and the ask the best offer to sell yes. ")
 
 BATTERY: dict = {
     "up_15m": {
@@ -176,9 +217,10 @@ BATTERY: dict = {
                               "away from the mid now"}},
     "toxic_15m": {
         "type": "noul",
-        "instructions": _STATE_TEXT + ("Question: take the first trade in the next 15 minutes; its direction is up "
-                                       "if its taker bought yes and down if its taker bought no. Will the mid 15 "
-                                       "minutes after that trade be beyond the mid just before it, in that trade's "
+        "instructions": _STATE_TEXT + ("Question: this question concerns the case where a trade happens in the "
+                                       "next 15 minutes. Take the first such trade; its direction is up if its "
+                                       "taker bought yes and down if its taker bought no. Will the mid 15 minutes "
+                                       "after that trade be beyond the mid just before it, in that trade's "
                                        "direction?"),
         "criteria": {"true": "the mid 15 minutes after the first trade is beyond the mid just before it on the "
                              "taker's side: higher if the taker bought yes, lower if the taker bought no",
@@ -208,11 +250,17 @@ BATTERY: dict = {
 }
 
 
+def _questions_bytes(battery: dict) -> bytes:
+    """The questions exactly as they appear in the body sent to the model: the typed request's `questions`,
+    compact JSON, in order, nothing sorted."""
+    req = v3.make_request({"x": 1}, battery, tag=TAG)
+    return json.dumps(req["questions"], separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
 def battery_id(battery: dict) -> str:
-    """SHA-256 of the battery's canonical JSON: [[name, question], ...] in order, keys sorted, no spaces."""
-    text = json.dumps([[name, q] for name, q in battery.items()], sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False)
-    return sha256(text.encode("utf-8"))
+    """SHA-256 of the exact question bytes sent, in order (a different order of questions or options is a
+    different battery)."""
+    return sha256(_questions_bytes(battery))
 
 
 BATTERY_ID = battery_id(BATTERY)
@@ -266,24 +314,30 @@ class Selection:
     markets_seen: int = 0
     pages: int = 0
 
+    @property
+    def screened_out(self) -> int:
+        """Markets skipped on their cached quote, without reading their book."""
+        return sum(1 for k in self.kinds.values() if k == "cached_quote")
+
 
 def _vol24(m: dict) -> float | None:
     return _num(m.get("volume_24h_fp", m.get("volume_24h")))
 
 
 def select_markets(markets: Iterable[dict], books: dict, now: float, *, slots: int = WATCH_COUNT,
-                   watched: Iterable[dict] = (), excluded: Iterable[str] = ()) -> Selection:
+                   watched: Iterable[dict] = ()) -> Selection:
     """The prediction's rule, as a pure function of the market objects, the live books read so far
     ({ticker: book or None when it could not be read}) and the time.
 
     In order: open; whole-cent prices (`linear_cent`); at least 500 contracts in 24 hours; closing between 3 hours
-    and 30 days from now; not watched already or before; a cached quote near the band (see CACHE_MARGIN_C). The
+    and 30 days from now; not being watched; a cached quote near the band (see CACHE_MARGIN_C, a practical
+    addition to the prediction's rule). A market watched before may be chosen again. The
     candidates left are taken most traded first, at most four from one series and twenty in all (the markets
     being watched keep their places and count toward their series); each needs a live book with a best bid of at
     least 10 cents, a best ask of at most 90 and a spread of 3 to 15 cents."""
     sel = Selection()
     watched = list(watched)
-    excluded, watched_t = set(excluded), {m["ticker"] for m in watched}
+    watched_t = {m["ticker"] for m in watched}
     per_series = Counter(series_of(m) for m in watched)
     places = slots - len(watched)
 
@@ -314,13 +368,11 @@ def select_markets(markets: Iterable[dict], books: dict, now: float, *, slots: i
         if t in watched_t:
             no(t, "being_watched", "being watched")
             continue
-        if t in excluded:
-            no(t, "watched_before", "watched before")
-            continue
         bid, ask = _num(m.get("yes_bid_dollars")), _num(m.get("yes_ask_dollars"))
         if bid is None or ask is None or not (_c(bid) >= MIN_BID_C - CACHE_MARGIN_C and
                                               _c(ask) <= MAX_ASK_C + CACHE_MARGIN_C and
-                                              MIN_SPREAD_C - 1 <= _c(ask) - _c(bid) <= MAX_SPREAD_C + CACHE_MARGIN_C):
+                                              MIN_SPREAD_C - CACHE_MARGIN_C <= _c(ask) - _c(bid)
+                                              <= MAX_SPREAD_C + CACHE_MARGIN_C):
             no(t, "cached_quote", "cached quote %s/%s cents is far from the band (book not read)"
                % ("-" if bid is None else "%g" % _c(bid), "-" if ask is None else "%g" % _c(ask)))
             continue
@@ -367,17 +419,17 @@ def select_markets(markets: Iterable[dict], books: dict, now: float, *, slots: i
 
 
 def resolve_selection(markets: list[dict], fetch_book: Callable[[str], dict | None], now, *, slots: int = WATCH_COUNT,
-                      watched: Iterable[dict] = (), excluded: Iterable[str] = ()) -> Selection:
+                      watched: Iterable[dict] = ()) -> Selection:
     """Run `select_markets` to the end, reading each book it asks for, one at a time and only while places
     remain. `now` is a time or a clock, read once."""
     now = now() if callable(now) else now
-    watched, excluded = list(watched), set(excluded)
-    first = select_markets(markets, {}, now, slots=slots, watched=watched, excluded=excluded)
+    watched = list(watched)
+    first = select_markets(markets, {}, now, slots=slots, watched=watched)
     early = {t for t, k in first.kinds.items() if k != "not_reached"}
     keep = [m for m in markets if m["ticker"] not in early]
     books: dict = {}
     while True:
-        sel = select_markets(keep, books, now, slots=slots, watched=watched, excluded=excluded)
+        sel = select_markets(keep, books, now, slots=slots, watched=watched)
         if sel.need_book is None:
             break
         books[sel.need_book] = fetch_book(sel.need_book)
@@ -389,9 +441,43 @@ def resolve_selection(markets: list[dict], fetch_book: Callable[[str], dict | No
 
 # ============================================================================ snapshots and the state
 
-def book_summary(book: dict) -> dict:
+def parse_book(raw: dict, depth: int = DEPTH) -> tuple[dict, str | None]:
+    """A raw `orderbook_fp` as sent, parsed to {"yes": [(price, size), ...], "no": [...]} best first, and the
+    reason it is invalid (None when it is valid): a malformed price (not a number, or not between 0 and 1 dollars),
+    a negative size, or a crossed book (best yes bid at or above the best yes ask). A malformed book parses to
+    two empty sides."""
+    empty: dict = {"yes": [], "no": []}
+    out: dict = {}
+    for side in ("yes", "no"):
+        rows = raw.get(side + "_dollars") if isinstance(raw, dict) else None
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            return empty, "malformed %s side (%r)" % (side, rows)
+        levels = []
+        for r in rows:
+            try:
+                p, q = float(r[0]), float(r[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return empty, "malformed level %r on the %s side" % (r, side)
+            if not (math.isfinite(p) and math.isfinite(q)) or not 0.0 < p < 1.0:
+                return empty, "malformed price %r on the %s side" % (r[0], side)
+            if q < 0:
+                return empty, "negative size %r on the %s side" % (r[1], side)
+            levels.append((p, q))
+        out[side] = sorted(levels, key=lambda lv: lv[0], reverse=True)[:depth]
+    q = kd.best_quote(out)
+    if q["bid"] is not None and q["ask"] is not None and q["bid"] >= q["ask"]:
+        return out, "crossed: best bid %g at or above best ask %g" % (q["bid"], q["ask"])
+    return out, None
+
+
+def book_summary(book: dict, invalid: str | None = None) -> dict:
     """Best yes bid and ask with their sizes, the mid and the spread (dollars), and the book's state: two_sided,
-    one_sided_yes (bids to buy yes only), one_sided_no, or empty."""
+    one_sided_yes (bids to buy yes only), one_sided_no, empty, or invalid (then nothing else is given)."""
+    if invalid:
+        return {"book_state": "invalid", "best_bid": None, "best_bid_size": None, "best_ask": None,
+                "best_ask_size": None, "mid": None, "spread": None}
     q = kd.best_quote(book)
     has_yes, has_no = q["bid"] is not None, q["ask"] is not None
     state = "two_sided" if has_yes and has_no else "one_sided_yes" if has_yes else "one_sided_no" if has_no else "empty"
@@ -421,13 +507,23 @@ def _spread_c(s: dict) -> float | None:
     return round(_c(1.0 - s["no"][0][0]) - _c(s["yes"][0][0]), 4)
 
 
-def _at(snaps: list[dict], target: float) -> dict | None:
-    """The latest snapshot whose book read ended at or before `target`, if it ended within STALE_S of it."""
-    best = None
+def reference(snaps: list[dict], target: float) -> dict | None:
+    """The snapshot whose book read ended nearest `target`, among those within REF_WINDOW_S (30 s) either side;
+    None when there is none. `snaps` are already only those finished strictly before the decision time."""
+    best, best_d = None, None
     for s in snaps:
-        if s["book_end_ts"] <= target:
-            best = s
-    return best if best is not None and best["book_end_ts"] >= target - STALE_S else None
+        d = abs(s["book_end_ts"] - target)
+        if d <= REF_WINDOW_S and (best_d is None or d < best_d):
+            best, best_d = s, d
+    return best
+
+
+def _window_full(snaps: list[dict], t: float, minutes: int) -> bool:
+    """At least 90% of the window's minutes (counted back from t) hold a snapshot, and its far edge has a
+    reference (`reference`)."""
+    bins = {int((t - s["book_end_ts"]) // 60) for s in snaps if t - 60 * minutes < s["book_end_ts"] < t}
+    need = -(-9 * minutes // 10)                       # 90%, rounded up: 27 of 30, 54 of 60
+    return len(bins) >= need and reference(snaps, t - 60 * minutes) is not None
 
 
 def _covered_from(snaps: list[dict]) -> float | None:
@@ -447,11 +543,16 @@ def _covered_from(snaps: list[dict]) -> float | None:
 
 
 def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_ts: float) -> dict:
-    """The numeric state the model sees at time t: a pure function of the snapshots finished by t and the trades
-    created and seen by t. Everything later is ignored. Numbers only, rounded; null where it cannot be computed
-    yet; no ticker, title, date or time of day."""
-    snaps = sorted((s for s in snapshots if s["end_ts"] <= t), key=lambda s: s["book_end_ts"])
-    tr = [x for x in trades if x["created_ts"] <= t and x["seen_ts"] <= t]
+    """The numeric state the model sees at time t: a pure function of the snapshots finished strictly before t and
+    the trades created and seen strictly before t. Everything later is ignored, and so is every snapshot marked
+    invalid. Numbers only, rounded; null where it cannot be computed yet; no ticker, title, date or time of day.
+
+    Each history reference (the mid 1, 5, 15, 30 and 60 minutes back, and the far edge of each window) is the
+    snapshot nearest its target among those within 30 s either side (`reference`); none, and the number is null.
+    `max_1m_mid_move_30m_cents` and `spread_vs_60m_median` are null unless at least 90% of their window's minutes
+    (27 of 30, 54 of 60) hold a snapshot."""
+    snaps = sorted((s for s in snapshots if s["end_ts"] < t and not s.get("invalid")), key=lambda s: s["book_end_ts"])
+    tr = [x for x in trades if x["created_ts"] < t and x["seen_ts"] < t]
     out = dict.fromkeys(STATE_KEYS)
     out["minutes_to_close"] = _r((close_ts - t) / 60.0, 0)
     if snaps:
@@ -474,15 +575,15 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
             if tot_b + tot_a > 0:
                 out["imbalance_10_levels"] = _r(tot_b / (tot_b + tot_a), 2)
             for k in (1, 5, 15, 30, 60):
-                ref = _at(snaps, t - 60 * k)
+                ref = reference(snaps, t - 60 * k)
                 ref_mid = _mid_c(ref) if ref is not None else None
                 out["mid_change_%dm_cents" % k] = _r(mid - ref_mid, 1) if ref_mid is not None else None
-            if _at(snaps, t - 1800) is not None:
+            if _window_full(snaps, t, 30):
                 moves = [abs(_mid_c(b) - _mid_c(a)) for a, b in zip(snaps, snaps[1:])
                          if b["book_end_ts"] > t - 1800 and b["book_end_ts"] - a["book_end_ts"] <= STALE_S
                          and _mid_c(a) is not None and _mid_c(b) is not None]
                 out["max_1m_mid_move_30m_cents"] = _r(max(moves), 1) if moves else None
-            if _at(snaps, t - 3600) is not None:
+            if _window_full(snaps, t, 60):
                 spreads = [_spread_c(s) for s in snaps if s["book_end_ts"] > t - 3600 and _spread_c(s) is not None]
                 med = statistics.median(spreads) if spreads else 0
                 out["spread_vs_60m_median"] = _r(spread / med, 2) if med > 0 else None
@@ -503,19 +604,19 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS selections (id INTEGER PRIMARY KEY, started_iso TEXT, started_ts REAL, finished_iso TEXT,
     finished_ts REAL, markets_seen INTEGER, pages INTEGER, books_read INTEGER, chosen INTEGER, reasons_json TEXT,
-    reason_counts_json TEXT);
+    reason_counts_json TEXT, kind TEXT, screened_out INTEGER, ended INTEGER);
 CREATE TABLE IF NOT EXISTS markets (watch_id INTEGER PRIMARY KEY, selection_id INTEGER, ticker TEXT, series TEXT,
     selected_iso TEXT, selected_ts REAL, close_iso TEXT, close_ts REAL, market_json TEXT, book_json TEXT,
-    fee_type TEXT, fee_multiplier REAL, why TEXT, phase INTEGER);
+    fee_type TEXT, fee_multiplier REAL, why TEXT, phase INTEGER, watch_start_iso TEXT, watch_start_ts REAL,
+    warm_from_ts REAL);
 CREATE TABLE IF NOT EXISTS market_drops (id INTEGER PRIMARY KEY, watch_id INTEGER UNIQUE, ticker TEXT,
     dropped_iso TEXT, dropped_ts REAL, reason TEXT);
 CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY, watch_id INTEGER, ticker TEXT,
     book_start_iso TEXT, book_start_ts REAL, book_end_iso TEXT, book_end_ts REAL,
     trades_start_iso TEXT, trades_start_ts REAL, trades_end_iso TEXT, trades_end_ts REAL, end_iso TEXT, end_ts REAL,
     trades_min_ts INTEGER, trades_ok INTEGER, book_state TEXT, yes_json TEXT, no_json TEXT,
-    best_bid REAL, best_bid_size REAL, best_ask REAL, best_ask_size REAL, mid REAL, spread REAL, new_trades INTEGER);
-CREATE INDEX IF NOT EXISTS snapshots_watch ON snapshots (watch_id, book_end_ts);
-CREATE INDEX IF NOT EXISTS snapshots_ticker ON snapshots (ticker, trades_start_ts);
+    best_bid REAL, best_bid_size REAL, best_ask REAL, best_ask_size REAL, mid REAL, spread REAL, new_trades INTEGER,
+    tail INTEGER DEFAULT 0, invalid_reason TEXT, raw_json TEXT);
 CREATE TABLE IF NOT EXISTS trades (trade_id TEXT PRIMARY KEY, ticker TEXT, created_iso TEXT, created_ts REAL,
     yes_price REAL, no_price REAL, count REAL, taker_side TEXT, is_block_trade INTEGER, seen_iso TEXT, seen_ts REAL,
     snapshot_id INTEGER);
@@ -532,6 +633,18 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, iso TEXT, ts REAL, ki
 CREATE VIEW IF NOT EXISTS market_watch AS SELECT m.*, d.dropped_iso, d.dropped_ts, d.reason AS drop_reason
     FROM markets m LEFT JOIN market_drops d ON d.watch_id = m.watch_id;
 """
+# Indexes, made after the columns a record from an earlier revision gets added (`Store.__init__`).
+_INDEXES = """
+CREATE INDEX IF NOT EXISTS snapshots_watch ON snapshots (watch_id, book_end_ts);
+CREATE INDEX IF NOT EXISTS snapshots_ticker ON snapshots (ticker, trades_start_ts);
+CREATE INDEX IF NOT EXISTS snapshots_ticker_end ON snapshots (ticker, book_end_ts);
+CREATE INDEX IF NOT EXISTS drops_ts ON market_drops (dropped_ts);
+"""
+# Columns added after a record may have been started: (table, column, type).
+_ADDED = (("markets", "phase", "INTEGER"), ("markets", "watch_start_iso", "TEXT"), ("markets", "watch_start_ts", "REAL"),
+          ("markets", "warm_from_ts", "REAL"), ("selections", "kind", "TEXT"), ("selections", "screened_out", "INTEGER"),
+          ("selections", "ended", "INTEGER"), ("snapshots", "tail", "INTEGER DEFAULT 0"),
+          ("snapshots", "invalid_reason", "TEXT"), ("snapshots", "raw_json", "TEXT"))
 
 
 class Store:
@@ -543,9 +656,12 @@ class Store:
         self.path = path
         self.conn = sqlite3.connect(str(path))
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")    # with WAL: durable at each checkpoint, a lot faster
         self.conn.executescript(_SCHEMA)
-        if "phase" not in {r[1] for r in self.conn.execute("PRAGMA table_info(markets)")}:
-            self.conn.execute("ALTER TABLE markets ADD COLUMN phase INTEGER")   # a record made before rev 2
+        for table, col, kind in _ADDED:                   # a record made by an earlier revision
+            if col not in {r[1] for r in self.conn.execute("PRAGMA table_info(%s)" % table)}:
+                self.conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, kind))
+        self.conn.executescript(_INDEXES)
         for table in TABLES:
             for verb in ("UPDATE", "DELETE"):
                 self.conn.execute("CREATE TRIGGER IF NOT EXISTS no_%s_%s BEFORE %s ON %s BEGIN "
@@ -556,54 +672,91 @@ class Store:
     def close(self) -> None:
         self.conn.close()
 
-    def insert(self, table: str, row: dict, or_ignore: bool = False) -> int:
-        """One row, committed. Returns its rowid (0 when ignored as a duplicate)."""
+    def insert(self, table: str, row: dict, or_ignore: bool = False, commit: bool = True) -> int:
+        """One row, committed (or, with commit False, left to the caller's transaction). Returns its rowid (0 when
+        ignored as a duplicate)."""
         assert table in TABLES
         cols = list(row)
         sql = "INSERT %sINTO %s (%s) VALUES (%s)" % ("OR IGNORE " if or_ignore else "", table, ",".join(cols),
                                                       ",".join("?" * len(cols)))
-        with self.conn:
+        if not commit:
             cur = self.conn.execute(sql, [row[c] for c in cols])
+        else:
+            with self.conn:
+                cur = self.conn.execute(sql, [row[c] for c in cols])
         return cur.lastrowid if cur.rowcount else 0
 
     def watched(self) -> list[dict]:
-        rows = self.conn.execute("SELECT watch_id, ticker, series, selected_ts, close_ts, market_json, phase "
-                                 "FROM markets WHERE watch_id NOT IN (SELECT watch_id FROM market_drops) "
-                                 "ORDER BY watch_id")
+        rows = self.conn.execute("SELECT watch_id, ticker, series, selected_ts, close_ts, market_json, phase, "
+                                 "watch_start_ts, warm_from_ts FROM markets "
+                                 "WHERE watch_id NOT IN (SELECT watch_id FROM market_drops) ORDER BY watch_id")
         return [{"watch_id": w, "ticker": t, "series": s, "selected_ts": sel, "close_ts": c, "market": json.loads(m),
-                 "phase": p or 0} for w, t, s, sel, c, m, p in rows.fetchall()]
+                 "phase": p or 0, "watch_start_ts": ws if ws is not None else sel, "warm_from_ts": wf}
+                for w, t, s, sel, c, m, p, ws, wf in rows.fetchall()]
 
-    def ever_watched(self) -> set[str]:
-        return {r[0] for r in self.conn.execute("SELECT ticker FROM markets")}
+    def tails(self, now: float, exclude: Iterable[str] = ()) -> list[dict]:
+        """The dropped markets still to be read: dropped less than TAIL_S ago, not closed, not watched again; one
+        per ticker (its latest watch), in the order of their drops."""
+        exclude = set(exclude)
+        out: dict = {}
+        for wid, t, close_ts, dropped in self.conn.execute(
+                "SELECT m.watch_id, m.ticker, m.close_ts, d.dropped_ts FROM market_drops d JOIN markets m "
+                "ON m.watch_id = d.watch_id WHERE d.dropped_ts > ? AND d.dropped_ts <= ? AND m.close_ts > ? "
+                "ORDER BY d.id", (now - TAIL_S, now, now)).fetchall():
+            if t not in exclude:
+                out.pop(t, None)
+                out[t] = {"watch_id": wid, "ticker": t, "close_ts": close_ts, "dropped_ts": dropped, "tail": True}
+        return list(out.values())
 
     def last_trade_read(self, ticker: str) -> float | None:
         return self.conn.execute("SELECT MAX(trades_start_ts) FROM snapshots WHERE ticker = ? AND trades_ok = 1",
                                  (ticker,)).fetchone()[0]
 
+    def warm_from(self, ticker: str, t: float) -> float | None:
+        """For a market chosen at t: when its run of snapshots began, if its snapshots (an earlier watch or that
+        watch's tail) ran up to t without a break; None when it starts afresh (its warm-up then runs from its
+        own first snapshot)."""
+        wid, newest = self.conn.execute("SELECT watch_id, MAX(book_end_ts) FROM snapshots WHERE ticker = ?",
+                                        (ticker,)).fetchone()
+        if newest is None or newest < t - STALE_S:
+            return None
+        warm, first = self.conn.execute("SELECT warm_from_ts, (SELECT MIN(book_end_ts) FROM snapshots WHERE "
+                                        "watch_id = ?) FROM markets WHERE watch_id = ?", (wid, wid)).fetchone()
+        return warm if warm is not None else first
+
     def history(self, watch_id: int, t: float) -> tuple[list[dict], list[dict], float]:
-        """The watch's snapshots finished by t, its market's trades created and seen by t, and its close time."""
+        """The market's snapshots finished strictly before t (from every watch of it and their tails, the last
+        HISTORY_S only), its trades created and seen before t over the same span, and its close time."""
         ticker, close_ts = self.conn.execute("SELECT ticker, close_ts FROM markets WHERE watch_id = ?",
                                              (watch_id,)).fetchone()
         rows = self.conn.execute("SELECT book_end_ts, end_ts, trades_ok, trades_min_ts, trades_start_ts, yes_json, "
-                                 "no_json FROM snapshots WHERE watch_id = ? AND end_ts <= ? ORDER BY book_end_ts",
-                                 (watch_id, t)).fetchall()
+                                 "no_json, invalid_reason FROM snapshots WHERE ticker = ? AND book_end_ts >= ? AND "
+                                 "end_ts < ? ORDER BY book_end_ts", (ticker, t - HISTORY_S, t)).fetchall()
         snaps = [{"book_end_ts": a, "end_ts": b, "trades_ok": c, "trades_min_ts": d, "trades_start_ts": e,
-                  "yes": [tuple(x) for x in json.loads(y)], "no": [tuple(x) for x in json.loads(n)]}
-                 for a, b, c, d, e, y, n in rows]
+                  "yes": [tuple(x) for x in json.loads(y)], "no": [tuple(x) for x in json.loads(n)], "invalid": bad}
+                 for a, b, c, d, e, y, n, bad in rows]
         trades = [{"created_ts": a, "seen_ts": b, "count": c, "taker_side": d} for a, b, c, d in self.conn.execute(
-            "SELECT created_ts, seen_ts, count, taker_side FROM trades WHERE ticker = ? AND created_ts <= ? "
-            "AND seen_ts <= ? ORDER BY created_ts", (ticker, t, t)).fetchall()]
+            "SELECT created_ts, seen_ts, count, taker_side FROM trades WHERE ticker = ? AND created_ts >= ? AND "
+            "created_ts < ? AND seen_ts < ? ORDER BY created_ts", (ticker, t - HISTORY_S, t, t)).fetchall()]
         return snaps, trades, close_ts
 
 
 # ============================================================================ the model
 
 class ModelUnavailable(Exception):
-    """The model could not be reached, or did not answer in MODEL_HARD_TIMEOUT_S."""
+    """The model could not be reached, or the connection failed on the way."""
 
 
 class ModelHttpError(Exception):
     """The model's server answered with an HTTP error."""
+
+
+class ModelTimeout(Exception):
+    """No answer within MODEL_LIMIT_S; the call was abandoned."""
+
+    def __init__(self, latency: float):
+        super().__init__("no answer within %g s (abandoned after %.1f s)" % (MODEL_LIMIT_S, latency))
+        self.latency = latency
 
 
 def _loopback(url: str) -> bool:
@@ -619,7 +772,9 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def loopback_http(url: str, data: bytes | None, timeout: float) -> bytes:
-    """GET (no body) or POST (JSON body) to the loopback model server; no redirects, at most 1 MB back."""
+    """GET (no body) or POST (JSON body) to the loopback model server; no redirects, at most 1 MB back. A timeout
+    comes out as TimeoutError, any other failure to get an answer (refused, reset, a broken HTTP exchange) as
+    ModelUnavailable, an HTTP error status as ModelHttpError."""
     if not _loopback(url):
         raise ValueError("the model is loopback-only")
     req = urllib.request.Request(url, data=data, method="GET" if data is None else "POST",
@@ -629,11 +784,20 @@ def loopback_http(url: str, data: bytes | None, timeout: float) -> bytes:
             raw = resp.read(1_048_577)
     except urllib.error.HTTPError as e:
         raise ModelHttpError("HTTP %s from %s" % (e.code, url)) from None
-    except (urllib.error.URLError, OSError) as e:
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise TimeoutError(str(e.reason)) from None
+        raise ModelUnavailable("%s: %s" % (type(e).__name__, e)) from None
+    except TimeoutError:
+        raise
+    except (OSError, http.client.HTTPException) as e:
         raise ModelUnavailable("%s: %s" % (type(e).__name__, e)) from None
     if len(raw) > 1_048_576:
         raise ModelHttpError("oversize response")
     return raw
+
+
+_UNREACHABLE = (ModelUnavailable, OSError, http.client.HTTPException)
 
 
 class ModelClient:
@@ -649,12 +813,12 @@ class ModelClient:
     def pin(self) -> tuple[str | None, str | None, str | None]:
         """(None, digest, None) when the pinned tag is there with the pinned digest; else (status, digest, why)."""
         try:
-            tags = json.loads(self.http(self.base + "/api/tags", None, 5.0))
-            version = json.loads(self.http(self.base + "/api/version", None, 5.0)).get("version")
-        except ModelUnavailable as e:
-            return "model_unavailable", None, str(e)
-        except (ModelHttpError, ValueError, AttributeError) as e:
-            return "error", None, "tag check: %s" % e
+            tags = json.loads(self.http(self.base + "/api/tags", None, PIN_TIMEOUT_S))
+            version = json.loads(self.http(self.base + "/api/version", None, PIN_TIMEOUT_S)).get("version")
+        except _UNREACHABLE as e:
+            return "model_unavailable", None, "tag check: %s: %s" % (type(e).__name__, e)
+        except Exception as e:                           # anything else still gives the slot its row
+            return "error", None, "tag check: %s: %s" % (type(e).__name__, e)
         digest = next((r.get("digest") for r in (tags.get("models") or []) if isinstance(r, dict)
                        and r.get("name") == TAG), None) if isinstance(tags, dict) else None
         if v3.pinned_tag(tags, version) != TAG:
@@ -663,10 +827,27 @@ class ModelClient:
         return None, digest, None
 
     def ask(self, body: bytes) -> tuple[bytes, float]:
-        """POST the request; the raw answer and the seconds it took."""
+        """POST the request; the raw answer and the seconds it took. The call runs in its own thread and is
+        abandoned (ModelTimeout) if no answer is in after MODEL_LIMIT_S, whatever the socket does."""
         t0 = self.clock()
-        raw = self.http(self.base + "/v1/systemone", body, MODEL_HARD_TIMEOUT_S)
-        return raw, self.clock() - t0
+        box: dict = {}
+
+        def call():
+            try:
+                box["raw"] = self.http(self.base + "/v1/systemone", body, MODEL_LIMIT_S)
+            except BaseException as e:                   # handed to the caller below
+                box["exc"] = e
+        th = threading.Thread(target=call, name="model-call", daemon=True)
+        th.start()
+        th.join(MODEL_LIMIT_S + 0.5)
+        latency = self.clock() - t0
+        if th.is_alive() or isinstance(box.get("exc"), TimeoutError):
+            raise ModelTimeout(latency)
+        if "exc" in box:
+            raise box["exc"]
+        if latency > MODEL_LIMIT_S:
+            raise ModelTimeout(latency)
+        return box["raw"], latency
 
 
 # ============================================================================ the collector
@@ -692,6 +873,10 @@ class Collector:
         self.paused_until: float | None = None
         self.consecutive_fails = 0
         self._last_beat: float | None = None
+        self._cycle_start: float | None = None      # when the latest cycle began
+        self._minute: float | None = None           # the minute of the latest cycle
+        self._selecting = False                     # a selection is reading: cycles still run, but select nothing
+        self._dry = False
         self.n_requests = self.n_failures = self.n_model_calls = 0
         inner = kalshi.fetch
 
@@ -732,7 +917,8 @@ class Collector:
     # ---- start and stop
     def start(self) -> None:
         """Record the start; after an earlier run, record the gap since its last heartbeat and stop watching the
-        markets whose watch ran out meanwhile. The others are watched on."""
+        markets whose watch ran out meanwhile. The others are watched on. With nothing watched, the first cycle
+        selects at once."""
         now = self.clock()
         self.event("start", None, battery_id=BATTERY_ID, tag=TAG)
         last = self.store.conn.execute("SELECT MAX(ts) FROM heartbeats").fetchone()[0]
@@ -748,13 +934,26 @@ class Collector:
         self.event(kind, None)
 
     def run(self, wait: Callable[[float], Any] | None = None) -> None:
-        """Cycle once a minute, just after the minute turns, until `stop` is set."""
+        """Cycle once a minute, just after the minute turns, until `stop` is set. With nothing watched the first
+        cycle runs at once (it selects). A cycle that ran into the next minute is followed at once (`overrun`);
+        after the clock went back, the next cycle waits only for the next minute."""
         wait = wait or self.stop.wait
+        first = True
         while not self.stop.is_set():
             now = self.clock()
-            wait((math.floor(now / 60) + 1) * 60 + 0.2 - now)
-            if self.stop.is_set():
-                break
+            if not (first and not self.watched()):
+                if self._minute is None or now < self._cycle_start:
+                    target = math.floor(now / 60) * 60 + 60
+                else:
+                    target = self._minute + 60
+                if now < target:
+                    wait(target + 0.2 - now)
+                    if self.stop.is_set():
+                        break
+                else:
+                    self.event("overrun", None, minute_ts=self._minute, minute_iso=iso(self._minute),
+                               late_s=now - target)
+            first = False
             try:
                 self.cycle()
             except Exception as e:                       # never let one cycle end the loop
@@ -763,18 +962,31 @@ class Collector:
 
     # ---- one minute
     def cycle(self, force_decision: bool = False, allow_select: bool = True) -> list[dict]:
-        """For each watched market its snapshot and, on a slot (or always when forced), its decision right after
-        it, so the state is never older than that one read; then drops, a selection if one is due, and a
+        """First every snapshot (the watched markets by watch number, then the tails), then this minute's
+        decisions from the record as it stands at each call, then drops, a selection if one is due, and a
         heartbeat. Returns the decisions made."""
         start = self.clock()
         minute = math.floor(start / 60) * 60
-        if self._last_beat is not None and start - self._last_beat > 2 * 60:     # e.g. the Mac slept
+        if self._cycle_start is not None and start < self._cycle_start:
+            self.event("clock_back", None, from_ts=self._cycle_start, from_iso=iso(self._cycle_start), to_ts=start,
+                       to_iso=iso(start), seconds=start - self._cycle_start)
+        elif self._last_beat is not None and start - self._last_beat > 2 * 60:     # e.g. the Mac slept
             self.event("gap", None, from_ts=self._last_beat, from_iso=iso(self._last_beat), to_ts=start,
                        to_iso=iso(start), seconds=start - self._last_beat)
+        self._cycle_start, self._minute = start, minute
         if self.paused() and start >= self.paused_until:
             self.paused_until = None
             self.event("pause_end", None)
         watched = self.watched()
+        tails = self.store.tails(start, exclude={w["ticker"] for w in watched})
+        for w in watched + tails:
+            if self.stop.is_set():
+                break
+            if not self.paused():                       # paused: no request, but a slot still gets its row
+                try:
+                    self.snapshot(w, tail=bool(w.get("tail")))
+                except Exception as e:
+                    self._fail(w["ticker"], "snapshot", e)
         phase = phase_of_minute(minute)
         done = {r[0] for r in self.store.conn.execute("SELECT watch_id FROM decisions WHERE slot_ts = ? AND "
                                                       "forced = 0", (minute,))}
@@ -783,22 +995,22 @@ class Collector:
         for w in watched:
             if self.stop.is_set():
                 break
-            if not self.paused():                       # paused: no request, but a slot still gets its row
-                try:
-                    self.snapshot(w)
-                except Exception as e:
-                    self._fail(w["ticker"], "snapshot", e)
-            if (force_decision or w["phase"] == phase) and not self.stop.is_set():
+            if force_decision or w["phase"] == phase:
                 d = self._maybe_decide(w, minute, force_decision, done, model_down)
                 if d is not None:
                     made.append(d)
         now = self.clock()
-        for w in watched:
-            reason = self._expired(w, now) or self._one_sided(w)
+        can_select = allow_select and not self._selecting and not self.stop.is_set() and not self.paused()
+        due = self._selection_due(minute) if can_select else None
+        for w in watched:                                # a 12-hour end waits for the reselection that is due
+            reason = self._expired(w, now, keep_12h=due == "grid" or self._selecting) or self._one_sided(w)
             if reason:
                 self.drop(w, reason)
-        if allow_select and not self.stop.is_set() and not self.paused() and self._selection_due(minute):
-            self.select()
+        if can_select and due is None and not self.watched():
+            due = "off_grid"
+            self.event("selection_off_grid", None, why="nothing watched")
+        if due:
+            self.select(kind=due)
         self._last_beat = self.clock()
         self.store.insert("heartbeats", {**stamp("", self._last_beat), "watched": len(self.watched()),
                                          "kalshi_requests": self.n_requests, "kalshi_failures": self.n_failures,
@@ -806,28 +1018,29 @@ class Collector:
         self.n_requests = self.n_failures = self.n_model_calls = 0
         return made
 
-    def _selection_due(self, minute: float) -> bool:
-        """Six hours after the last selection (or at once on a new record), at the end of a minute whose next
-        minute belongs to a least-used phase, so the selection's burst delays the fewest decisions."""
-        last = self.store.conn.execute("SELECT MAX(started_ts) FROM selections").fetchone()[0]
-        if last is None:
-            return True
-        if minute - last < RESELECT_S - 60:
-            return False
-        count = Counter({p: 0 for p in range(PHASES)})
-        count.update(w["phase"] for w in self.watched())
-        return count[phase_of_minute(minute + 60)] == min(count.values())
+    def _tick(self) -> None:
+        """Inside a selection: when a new minute has begun, run its cycle (snapshots, decisions, drops) first."""
+        if not self._dry and self._minute is not None and math.floor(self.clock() / 60) * 60 > self._minute:
+            self.cycle(allow_select=False)
+
+    def _selection_due(self, minute: float) -> str | None:
+        """'grid' on a new record, and at the minute six hours after the last selection on the grid."""
+        last = self.store.conn.execute("SELECT MAX(started_ts) FROM selections WHERE kind IS NULL OR "
+                                       "kind = 'grid'").fetchone()[0]
+        if last is None or minute >= math.floor(last / 60) * 60 + RESELECT_S:
+            return "grid"
+        return None
 
     @staticmethod
-    def _expired(w: dict, now: float) -> str | None:
-        if now >= w["selected_ts"] + WATCH_MAX_S:
+    def _expired(w: dict, now: float, keep_12h: bool = False) -> str | None:
+        if not keep_12h and now >= w["watch_start_ts"] + WATCH_MAX_S:
             return "watched 12 hours"
         if now >= w["close_ts"] - STOP_BEFORE_CLOSE_S:
             return "30 minutes before it closes"
         return None
 
     def _one_sided(self, w: dict) -> str | None:
-        """'one-sided' once every snapshot over the last 30 loop minutes (by minute number) was not two-sided."""
+        """Once every snapshot of this watch over the last 30 loop minutes (by minute number) was not two-sided."""
         c = self.store.conn
         last_two = c.execute("SELECT MAX(book_end_ts) FROM snapshots WHERE watch_id = ? AND book_state = 'two_sided'",
                              (w["watch_id"],)).fetchone()[0]
@@ -837,21 +1050,23 @@ class Collector:
         if first is None:
             return None
         if math.floor(newest / 60) - math.floor(first / 60) >= ONE_SIDED_MINUTES:
-            return "book one-sided or empty for 30 minutes"
+            return "book one-sided, empty or invalid for 30 minutes"
         return None
 
     # ---- snapshots
-    def snapshot(self, w: dict) -> int | None:
-        """One snapshot of one market: its book, then its new trades, written in one transaction."""
+    def snapshot(self, w: dict, tail: bool = False) -> int | None:
+        """One snapshot of one market: its book, then its new trades, written in one transaction. `tail`: read
+        after its drop (no decisions are made on it)."""
         ticker = w["ticker"]
         b0 = self.clock()
         try:
-            book = self.kalshi.orderbook(ticker, DEPTH)
+            raw = self.kalshi.orderbook_raw(ticker, DEPTH)
         except Exception as e:
             self._fail(ticker, "orderbook", e)
             return None
         b1 = self.clock()
         self._ok()
+        book, bad = parse_book(raw)
         last = self.store.last_trade_read(ticker)
         min_ts = int(last - TRADE_OVERLAP_S) if last is not None else int(b1 - FIRST_TRADES_S)
         min_ts = max(min_ts, int(b1 - MAX_BACKFILL_S))
@@ -864,12 +1079,13 @@ class Collector:
             ok = 0
             self._fail(ticker, "trades", e)
         t1 = self.clock()
-        s = book_summary(book)
+        s = book_summary(book, bad)
         row = {"watch_id": w["watch_id"], "ticker": ticker, **stamp("book_start", b0), **stamp("book_end", b1),
                **(stamp("trades_start", t0) if ok else {"trades_start_iso": None, "trades_start_ts": None}),
                **(stamp("trades_end", t1) if ok else {"trades_end_iso": None, "trades_end_ts": None}),
                **stamp("end", t1), "trades_min_ts": min_ts if ok else None, "trades_ok": ok,
-               "yes_json": json.dumps(book["yes"]), "no_json": json.dumps(book["no"]), **s}
+               "yes_json": json.dumps(book["yes"]), "no_json": json.dumps(book["no"]), **s, "tail": int(tail),
+               "invalid_reason": bad, "raw_json": json.dumps(raw) if bad else None}
         conn = self.store.conn
         fresh, seen = [], set()
         for x in trades:                                 # trades already stored by an earlier, overlapping read
@@ -894,19 +1110,18 @@ class Collector:
 
     # ---- decisions
     def _maybe_decide(self, w: dict, slot_ts: float, forced: bool, done: set, model_down: list) -> dict | None:
-        """The slot's decision for one market, if it has 30 minutes of snapshots and none was made yet."""
+        """The slot's decision for one market, if it has 30 minutes of snapshots (from `warm_from_ts` when it was
+        chosen again with its snapshots running on) and none was made yet."""
         if not forced:
             if w["watch_id"] in done:
                 return None
-            first = self.store.conn.execute("SELECT MIN(book_end_ts) FROM snapshots WHERE watch_id = ?",
-                                            (w["watch_id"],)).fetchone()[0]
-            if first is None or first > slot_ts - WARMUP_S:
+            anchor = w.get("warm_from_ts")
+            if anchor is None:
+                anchor = self.store.conn.execute("SELECT MIN(book_end_ts) FROM snapshots WHERE watch_id = ?",
+                                                 (w["watch_id"],)).fetchone()[0]
+            if anchor is None or anchor > slot_ts - WARMUP_S:
                 return None
-        try:
-            return self.decide(w, slot_ts, forced=forced, model_down=model_down)
-        except Exception as e:                           # one bad market never stops the slot
-            self.event("error", w["ticker"], request="decision", error="%s: %s" % (type(e).__name__, e))
-            return None
+        return self.decide(w, slot_ts, forced=forced, model_down=model_down)
 
     def request_for(self, watch_id: int, t: float) -> bytes:
         """The exact request the model would get for this watch at time t."""
@@ -914,25 +1129,34 @@ class Collector:
         return request_bytes(state_at(snaps, trades, t, close_ts))
 
     def decide(self, w: dict, slot_ts: float, forced: bool = False, model_down: list | None = None) -> dict:
-        """One decision: state, pin check, one call, one status, one row. `model_down` carries, within a slot, that
-        the model was unreachable, so the other markets of that slot are marked without a call each."""
+        """One decision: state, pin check, one call, one status, one row, whatever fails on the way. `model_down`
+        carries, within a slot, that the model was unreachable, so the other markets of that slot are marked
+        without a call each."""
         model_down = model_down if model_down is not None else []
         t = self.clock()
-        snaps, trades, close_ts = self.store.history(w["watch_id"], t)
         row = {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("slot", slot_ts), **stamp("decision", t),
                "forced": int(forced), "battery_id": BATTERY_ID, "model_tag": TAG}
-        newest = snaps[-1]["book_end_ts"] if snaps else None
-        if newest is None or t - newest > STALE_S:
-            row.update(status="stale_data", error="newest snapshot %s" % (
-                "missing" if newest is None else "%.0f s old" % (t - newest)))
-        else:
-            state = state_at(snaps, trades, t, close_ts)
-            body = request_bytes(state)
-            row.update(state_json=json.dumps(state, separators=(",", ":")), request_sha256=sha256(body))
-            if model_down:
-                row.update(status="model_unavailable", error="model unreachable earlier in this slot; not called")
+        try:
+            snaps, trades, close_ts = self.store.history(w["watch_id"], t)
+            newest = snaps[-1] if snaps else None
+            if newest is None or t - newest["book_end_ts"] > STALE_S:
+                row.update(status="stale_data", error="newest snapshot %s" % (
+                    "missing" if newest is None else "%.0f s old" % (t - newest["book_end_ts"])))
+            elif newest["invalid"]:
+                row.update(status="stale_data", error="newest snapshot is an invalid book: %s" % newest["invalid"])
             else:
-                self._call(row, body, model_down)
+                state = state_at(snaps, trades, t, close_ts)
+                body = request_bytes(state)
+                row.update(state_json=json.dumps(state, separators=(",", ":")), request_sha256=sha256(body))
+                if model_down:
+                    row.update(status="model_unavailable", error="model unreachable earlier in this slot; not called")
+                elif not forced and self.clock() > slot_ts + 60 - MODEL_LIMIT_S - CALL_RESERVE_S:
+                    row.update(status="late", error="not called: under %g s left in the minute"
+                               % (MODEL_LIMIT_S + CALL_RESERVE_S))
+                else:
+                    self._call(row, body, model_down)
+        except Exception as e:                           # one bad market never stops the slot, and keeps its row
+            row.update(status="error", error="%s: %s" % (type(e).__name__, e))
         self.store.insert("decisions", row)
         return row
 
@@ -947,12 +1171,18 @@ class Collector:
         self.n_model_calls += 1
         try:
             raw, latency = self.model.ask(body)
-        except ModelUnavailable as e:
-            model_down.append(True)
-            row.update(status="model_unavailable", error=str(e))
+        except ModelTimeout as e:                        # abandoned: no answer is kept
+            row.update(status="late", latency_s=e.latency, error=str(e))
             return
         except ModelHttpError as e:
             row.update(status="error", error=str(e))
+            return
+        except _UNREACHABLE as e:
+            model_down.append(True)
+            row.update(status="model_unavailable", error="%s: %s" % (type(e).__name__, e))
+            return
+        except Exception as e:
+            row.update(status="error", error="%s: %s" % (type(e).__name__, e))
             return
         row.update(raw_response=raw.decode("utf-8", errors="replace"), latency_s=latency)
         try:
@@ -961,13 +1191,21 @@ class Collector:
             row.update(status="error", error="unreadable answer: %s" % e)
             return
         row.update(answers_json=json.dumps(parsed["answers"]), input_tokens=parsed["usage"]["input_tokens"],
-                   output_tokens=parsed["usage"]["output_tokens"], model_tag=parsed["model"],
-                   status="late" if latency > MODEL_LIMIT_S else "ok")
+                   output_tokens=parsed["usage"]["output_tokens"], model_tag=parsed["model"], status="ok")
 
     # ---- selection
-    def select(self, dry_run: bool = False, max_pages: int | None = None) -> Selection | None:
-        """Read the open markets closing in the window, apply the rule, and (unless a dry run) record the
-        selection and start watching the chosen. `max_pages` is for smoke tests only."""
+    def select(self, dry_run: bool = False, max_pages: int | None = None, kind: str = "grid") -> Selection | None:
+        """Read the open markets closing in the window, apply the rule, and (unless a dry run) in one transaction
+        end the watches whose 12 hours are up (or will be within two minutes), record the selection and start
+        watching the chosen. A new minute that begins while it reads gets its cycle first (`_tick`). `max_pages`
+        is for smoke tests only."""
+        self._selecting, self._dry = True, dry_run
+        try:
+            return self._select(dry_run, max_pages, kind)
+        finally:
+            self._selecting, self._dry = False, False
+
+    def _select(self, dry_run: bool, max_pages: int | None, kind: str) -> Selection | None:
         t0 = self.clock()
         markets, pages = [], 0
         try:
@@ -977,15 +1215,18 @@ class Collector:
                 pages += 1
                 if max_pages and pages >= max_pages:
                     break
+                self._tick()
             self._ok()
         except Exception as e:
             if not dry_run:
                 self._fail(None, "markets", e)
             return None
         current = self.watched()
-        excluded = self.store.ever_watched() - {w["ticker"] for w in current}
+        ending = [w for w in current if w["watch_start_ts"] + WATCH_MAX_S <= t0 + RESELECT_AHEAD_S]
+        staying = [w for w in current if w not in ending]
 
         def fetch(ticker):
+            self._tick()
             if self.paused():
                 raise _SelectionAborted("paused after repeated failures")
             try:
@@ -998,8 +1239,8 @@ class Collector:
                 return None
         try:
             sel = resolve_selection(markets, fetch, self.clock, slots=self.slots,
-                                    watched=[w["market"] for w in current], excluded=excluded)
-        except _SelectionAborted as e:                   # not recorded, so it is due again five minutes later
+                                    watched=[w["market"] for w in staying])
+        except _SelectionAborted as e:                   # not recorded, so it is due again a minute later
             if not dry_run:
                 self.event("selection_aborted", None, why=str(e))
             return None
@@ -1011,6 +1252,7 @@ class Collector:
         for t in sel.chosen:
             s = series_of(by_ticker[t])
             if s not in fees:
+                self._tick()
                 try:
                     fees[s] = self.kalshi.series(s)
                     self._ok()
@@ -1018,22 +1260,31 @@ class Collector:
                     self._fail(t, "series", e)
                     fees[s] = {"fee_type": None, "fee_multiplier": None}
         t1 = self.clock()
+        still = {w["watch_id"] for w in self.watched()}  # a cycle during the read may have dropped one meanwhile
+        ending = [w for w in ending if w["watch_id"] in still]
+        phases = dict(zip(sel.chosen, assign_phases([w["phase"] for w in staying if w["watch_id"] in still],
+                                                    len(sel.chosen))))
+        warm = {t: self.store.warm_from(t, t1) for t in sel.chosen}
         kept = {t: r for t, r in sel.reasons.items() if sel.kinds[t] not in OBJECT_KINDS}
-        sid = self.store.insert("selections", {**stamp("started", t0), **stamp("finished", t1),
-                                               "markets_seen": sel.markets_seen, "pages": pages,
-                                               "books_read": len(sel.books), "chosen": len(sel.chosen),
-                                               "reasons_json": json.dumps(kept),
-                                               "reason_counts_json": json.dumps(Counter(sel.kinds.values()))})
-        phases = dict(zip(sel.chosen, assign_phases([w["phase"] for w in current], len(sel.chosen))))
-        for t in sel.chosen:
-            m = by_ticker[t]
-            close = kd.iso_to_ts(m["close_time"])
-            fee = fees[series_of(m)]
-            self.store.insert("markets", {"selection_id": sid, "ticker": t, "series": series_of(m),
-                                          **stamp("selected", t1), **stamp("close", close), "market_json": json.dumps(m),
-                                          "book_json": json.dumps(sel.books[t]), "fee_type": fee.get("fee_type"),
-                                          "fee_multiplier": fee.get("fee_multiplier"), "why": sel.why[t],
-                                          "phase": phases[t]})
+        ins = self.store.insert
+        with self.store.conn:                            # the ends, the selection and its markets: all or nothing
+            for w in ending:
+                ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", t1),
+                                     "reason": "watched 12 hours"}, commit=False)
+            sid = ins("selections", {**stamp("started", t0), **stamp("finished", t1), "markets_seen": sel.markets_seen,
+                                     "pages": pages, "books_read": len(sel.books), "chosen": len(sel.chosen),
+                                     "reasons_json": json.dumps(kept),
+                                     "reason_counts_json": json.dumps(Counter(sel.kinds.values())), "kind": kind,
+                                     "screened_out": sel.screened_out, "ended": len(ending)}, commit=False)
+            for t in sel.chosen:
+                m = by_ticker[t]
+                close = kd.iso_to_ts(m["close_time"])
+                fee = fees[series_of(m)]
+                ins("markets", {"selection_id": sid, "ticker": t, "series": series_of(m), **stamp("selected", t1),
+                                **stamp("close", close), "market_json": json.dumps(m),
+                                "book_json": json.dumps(sel.books[t]), "fee_type": fee.get("fee_type"),
+                                "fee_multiplier": fee.get("fee_multiplier"), "why": sel.why[t], "phase": phases[t],
+                                **stamp("watch_start", t0), "warm_from_ts": warm[t]}, commit=False)
         return sel
 
 
@@ -1045,7 +1296,9 @@ def _day(ts: float) -> str:
 
 def day_status(store: Store, now: float) -> list[dict]:
     """Per UTC day: decision slots expected (every slot of every watch on its own phase's five-minute grid, from
-    30 minutes after its first snapshot to its drop or now) and collected (a non-forced decision with answers: `ok` or `late`), the share,
+    30 minutes after its first snapshot, or after `warm_from_ts` when it was chosen again with its snapshots running
+    on, to its drop or now) and collected (a non-forced decision with answers: `ok`), the share; market-minutes
+    watched (each watch from its market row to its drop or now) and their share of the nominal 20 x 1440;
     the model's latency median and 95th percentile (nearest rank) over answered calls, the count of each status,
     Kalshi requests and failures (from the heartbeats) and error events."""
     c = store.conn
@@ -1053,23 +1306,32 @@ def day_status(store: Store, now: float) -> list[dict]:
 
     def day(d):
         return days.setdefault(d, {"day": d, "expected": 0, "collected": 0, "share": None,
+                                   "watched_minutes": 0.0, "watched_share": None,
                                    "statuses": dict.fromkeys(STATUSES, 0), "latencies": [], "requests": 0,
                                    "failures": 0, "errors": 0})
     rows = c.execute("SELECT m.watch_id, m.selected_ts, d.dropped_ts, (SELECT MIN(book_end_ts) FROM snapshots s "
-                     "WHERE s.watch_id = m.watch_id), m.phase FROM markets m LEFT JOIN market_drops d "
+                     "WHERE s.watch_id = m.watch_id), m.phase, m.warm_from_ts FROM markets m LEFT JOIN market_drops d "
                      "ON d.watch_id = m.watch_id").fetchall()
-    for _, selected, dropped, first, phase in rows:
-        start = (first if first is not None else selected) + WARMUP_S
+    for _, selected, dropped, first, phase, warm in rows:
         end = min(dropped if dropped is not None else now, now)
+        a = selected
+        while a < end:                                 # the watch's minutes, split at each UTC midnight
+            midnight = (math.floor(a / 86400) + 1) * 86400
+            b = min(end, midnight)
+            day(_day(a))["watched_minutes"] += (b - a) / 60.0
+            a = b
+        anchor = warm if warm is not None else first if first is not None else selected
+        start = anchor + WARMUP_S
         offset = 60 * (phase or 0)                     # the market's own grid: minutes where minute mod 5 == phase
         s = math.ceil((start - offset) / SLOT_S) * SLOT_S + offset
         while s < end:
             day(_day(s))["expected"] += 1
             s += SLOT_S
-    for slot, status, latency in c.execute("SELECT slot_ts, status, latency_s FROM decisions WHERE forced = 0"):
+    for slot, status, latency, answers in c.execute("SELECT slot_ts, status, latency_s, answers_json FROM decisions "
+                                                    "WHERE forced = 0"):
         d = day(_day(slot))
         d["statuses"][status] = d["statuses"].get(status, 0) + 1
-        if status in ("ok", "late"):
+        if status == "ok" or (status == "late" and answers is not None):   # a late answer kept before rev 3
             d["collected"] += 1
             if latency is not None:
                 d["latencies"].append(latency)
@@ -1084,6 +1346,7 @@ def day_status(store: Store, now: float) -> list[dict]:
         r = days[d]
         lat = sorted(r.pop("latencies"))
         r["share"] = r["collected"] / r["expected"] if r["expected"] else None
+        r["watched_share"] = r["watched_minutes"] / (WATCH_COUNT * 1440)
         r["latency_median"] = statistics.median(lat) if lat else None
         r["latency_p95"] = lat[math.ceil(0.95 * len(lat)) - 1] if lat else None
         out.append(r)
@@ -1092,15 +1355,16 @@ def day_status(store: Store, now: float) -> list[dict]:
 
 def format_status(rows: list[dict]) -> str:
     head = ("day         expected collected  share    ok  late unavail  tag stale error  lat_med  lat_p95  "
-            "requests failures errors")
+            "requests failures errors  watched_min watched")
     lines = [head]
     for r in rows:
         s = r["statuses"]
-        lines.append("%-10s  %8d %9d %6s %5d %5d %7d %4d %5d %5d %8s %8s %9d %8d %6d" % (
+        lines.append("%-10s  %8d %9d %6s %5d %5d %7d %4d %5d %5d %8s %8s %9d %8d %6d %12.0f %6.1f%%" % (
             r["day"], r["expected"], r["collected"], "-" if r["share"] is None else "%.1f%%" % (100 * r["share"]),
             s["ok"], s["late"], s["model_unavailable"], s["tag_mismatch"], s["stale_data"], s["error"],
             "-" if r["latency_median"] is None else "%.2f" % r["latency_median"],
-            "-" if r["latency_p95"] is None else "%.2f" % r["latency_p95"], r["requests"], r["failures"], r["errors"]))
+            "-" if r["latency_p95"] is None else "%.2f" % r["latency_p95"], r["requests"], r["failures"], r["errors"],
+            r["watched_minutes"], 100 * r["watched_share"]))
     return "\n".join(lines)
 
 
