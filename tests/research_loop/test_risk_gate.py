@@ -63,3 +63,23 @@ def test_limits_file_is_validated_and_never_overwritten(tmp_path):
     path.write_text("{oops")
     with pytest.raises(rg.RiskConfigError):
         rg.load_limits(path)
+
+
+def test_the_limits_file_may_carry_a_daily_order_cap_and_nothing_else_extra(tmp_path):
+    path = tmp_path / "risk.json"
+    path.write_text(json.dumps({**rg.DEFAULT_LIMITS, "max_orders_per_day": 12}))
+    limits = rg.load_limits(path)
+    assert limits["max_orders_per_day"] == 12 and {k: limits[k] for k in rg.DEFAULT_LIMITS} == rg.DEFAULT_LIMITS
+    assert rg.check_order({"value": 5_000.0}, OK_ACCOUNT, limits, halt_file=None) == (True, "OK")   # the gate ignores it
+    path.write_text(json.dumps({**rg.DEFAULT_LIMITS, "max_orders_per_day": 1.0}))
+    assert rg.load_limits(path)["max_orders_per_day"] == 1
+    for bad in (0, -3, 2.5, True, "40", None, 1e308 * 10):
+        path.write_text(json.dumps({**rg.DEFAULT_LIMITS, "max_orders_per_day": bad}))
+        with pytest.raises(rg.RiskConfigError):
+            rg.load_limits(path)
+    path.write_text(json.dumps({k: v for k, v in rg.DEFAULT_LIMITS.items() if k != "max_open_positions"} | {"max_orders_per_day": 5}))
+    with pytest.raises(rg.RiskConfigError):                      # the optional key does not stand in for a required one
+        rg.load_limits(path)
+    path.write_text(json.dumps({**rg.DEFAULT_LIMITS, "max_orders_per_week": 5}))
+    with pytest.raises(rg.RiskConfigError):
+        rg.load_limits(path)

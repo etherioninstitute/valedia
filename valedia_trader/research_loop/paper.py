@@ -233,6 +233,20 @@ class PaperTrader:
         account's, and one position is what the broker would show."""
         return len(self.funds_held())
 
+    def wanted_units(self) -> dict[str, dict[str, float]]:
+        """Per strategy and fund, the units held plus the units of its pending orders: what the book will hold once
+        its orders fill. Read only (nothing in the state is created or changed); entries that come to zero are left
+        out. The order step sizes the broker's orders from this."""
+        out: dict[str, dict[str, float]] = {}
+        for strategy, book in self.state["positions"].items():
+            for sym, lot in book.items():
+                out.setdefault(strategy, {})[sym] = out.get(strategy, {}).get(sym, 0.0) + float(lot["units"])
+        for o in self.state["pending"]:
+            s, sym = o["strategy"], o["symbol"]
+            out.setdefault(s, {})[sym] = out.get(s, {}).get(sym, 0.0) + float(o["units"])
+        cleaned = {s: {sym: u for sym, u in book.items() if abs(u) > 1e-12} for s, book in out.items()}
+        return {s: book for s, book in cleaned.items() if book}
+
     def _units_elsewhere(self, strategy: str, symbol: str) -> float:
         """Units of the fund that the account holds or has ordered through its other strategies."""
         lots = sum(book.get(symbol, {}).get("units", 0.0) for name, book in self.state["positions"].items() if name != strategy)

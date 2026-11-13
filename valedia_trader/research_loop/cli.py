@@ -7,6 +7,8 @@
     python -m valedia_trader.research_loop revise <id>          repair a failed idea: propose, probe, compose, within the cap
     python -m valedia_trader.research_loop seal <id>            the idea's single sealed test
     python -m valedia_trader.research_loop paper-step           one paper-trading day for the strategies that passed
+    python -m valedia_trader.research_loop order-step           send the paper book's differences to Webull's test environment
+                                                                (once a day, inside the regular session; never production)
     python -m valedia_trader.research_loop critic               the weekly post-mortem
     python -m valedia_trader.research_loop reset-kill-switch --who NAME
     python -m valedia_trader.research_loop cycle                the whole loop once: research, test, revise, seal, paper, critic
@@ -200,6 +202,38 @@ def paper_trader(paths: LoopPaths, venue=None) -> PaperTrader:
                        panel_horizon_days=int(cfg.get("horizon_days", 5)), tax_rules=_tax_rules(paths))
 
 
+def _order_step_venue():
+    """Webull's venue from the secrets file. The order step itself refuses anything but the test environment, before
+    any call to it."""
+    from valedia_trader.venues.webull import WebullVenue
+    return WebullVenue.from_secrets()
+
+
+def order_step_command(args, paths: LoopPaths) -> int:
+    """One order step against the venue `_order_step_venue` gives; prints the summary. 0 when the run went through,
+    2 when it stopped."""
+    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.venues.webull import WebullError
+    try:
+        venue = _order_step_venue()
+    except WebullError as exc:
+        print(f"refused: the Webull venue could not be set up: {exc}", file=sys.stderr)
+        return 2
+    trader = PaperTrader(paths.journal, paths.risk_limits)
+    ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
+    orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
+    try:
+        out = order_step.run_order_step(
+            ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
+            journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
+            clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
+            fractional=args.fractional)
+    finally:
+        orders.close()
+    print(json.dumps(out, indent=2, default=str))
+    return 0 if out["status"] == "done" else 2
+
+
 def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     """One pass of the loop. Each stage is the same code the single commands run, in the order the
     rules require: research sees the development period only; every untested idea gets its
@@ -278,7 +312,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("paper-step")
     p.add_argument("--refresh", action="store_true", help="download the latest prices first")
     p.add_argument("--alpaca", action="store_true", help="also mirror orders to the Alpaca paper account")
-    p.add_argument("--webull", action="store_true", help="also mirror orders to Webull's test environment (never production)")
+    p.add_argument("--webull", action="store_true", help="no longer sends anything: orders reach Webull only through order-step")
+    p = sub.add_parser("order-step", help="send the paper book's differences to Webull's test environment, inside market hours")
+    p.add_argument("--capital", type=float, default=None,
+                   help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
+    p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -342,7 +380,13 @@ def main(argv=None) -> int:
                     print(f"    -> Sharpe {r['sharpe']:.2f}, Deflated Sharpe {r['deflated_sharpe']:.3f}, {r['verdict']}")
             print(f"stopped: {out['stopped']}; best v{out['best_version']} (Sharpe {out['best_sharpe']:.2f}); "
                   f"{out['variations_counted']} variations counted, {out['revisions_used']} revisions used; passed: {out['passed']}")
+        elif args.cmd == "order-step":
+            return order_step_command(args, paths)
         elif args.cmd == "paper-step":
+            if args.webull:                                    # the paper step runs after the close; Webull refuses those orders
+                print("refused: paper-step no longer sends anything to Webull. Orders reach Webull's test environment only "
+                      "through `order-step`, run once a day inside the regular session.", file=sys.stderr)
+                return 2
             if args.refresh:
                 from valedia_trader.data_and_fees import prices as price_data
                 print("prices:", price_data.refresh(args.data))
@@ -353,11 +397,6 @@ def main(argv=None) -> int:
                 from valedia_trader.core.secrets import load_env, secret
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
-            if getattr(args, "webull", False):
-                from valedia_trader.venues.webull import WebullError, WebullVenue
-                venue = WebullVenue.from_secrets()
-                if venue.environment != "sandbox":             # the mirror is for the test environment only
-                    raise WebullError("paper-step --webull mirrors to Webull's test environment; set WEBULL_ENV=sandbox")
             trader = paper_trader(paths, venue=venue)
             if not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")

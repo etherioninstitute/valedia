@@ -124,3 +124,104 @@ def test_a_rules_file_missing_a_key_turns_tax_notes_off_with_one_line(tmp_path, 
     assert cli._tax_rules(paths) is None
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1 and err[0].startswith("tax notes are off:") and "wash_sale.window_days" in err[0]
+
+
+# ---- the order step on the command line; paper-step no longer sends to Webull (T13)
+
+class _Venue:
+    """A stand-in for Webull's test environment: no network."""
+    environment = "sandbox"
+    name = "standin-sandbox"
+
+    def __init__(self):
+        self.calls, self.book = [], {}
+
+    def positions(self):
+        self.calls.append("positions")
+        return {}
+
+    def cash(self):
+        self.calls.append("cash")
+        return {"cash": 1_000_000.0}
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE"):
+        self.calls.append("submit")
+        self.book[tag] = {"symbol": symbol, "units": units, "limit": limit_price, "state": "open"}
+        return {"status": "accepted"}
+
+    def order_status(self, tag):
+        self.calls.append("order_status")
+        if tag not in self.book:
+            return None
+        return {"state": self.book[tag]["state"], "filled_units": 0.0, "avg_price": None, "fee": None, "venue_order_id": None,
+                "raw_status": None}
+
+    def cancel(self, tag):
+        self.calls.append("cancel")
+        self.book[tag]["state"] = "cancelled"
+        return {"status": "cancel requested"}
+
+
+@pytest.fixture
+def order_step_project(tmp_path, monkeypatch):
+    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.research_loop import risk_gate
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "risk.json").write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0,
+                                                               "max_position_pct": 0.6, "max_open_positions": 5}))
+    (tmp_path / "journal").mkdir()
+    (tmp_path / "journal" / "paper_state.json").write_text(json.dumps({
+        "starting_cash": 100_000.0, "cash": 98_000.0, "positions": {"a": {"SPY": {"units": 4.0, "cost": 500.0}}},
+        "pending": [{"strategy": "a", "version": "1", "symbol": "SPY", "units": 1.5, "decided_on": "2026-11-12", "reduces_risk": False,
+                     "reasoning": "r", "conditions": None}],
+        "history": [{"day": "2026-11-12", "equity": 100_000.0, "capital_per_strategy": 100_000.0}], "peak_equity": 100_000.0,
+        "last_day": "2026-11-12", "realized": {}, "panel_cases": []}))
+    venue = _Venue()
+    now = pd.Timestamp("2026-11-13 10:00", tz="America/New_York").timestamp()
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: venue)
+    monkeypatch.setattr(order_step, "wall_clock", lambda: now)
+    monkeypatch.setattr(order_step, "minute_quotes", lambda symbols: {s: (500.0, now - 60) for s in symbols})
+    monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
+    return tmp_path, venue
+
+
+def test_order_step_sends_the_paper_books_difference_to_the_test_environment(order_step_project, capsys):
+    root, venue = order_step_project
+    assert cli.main(["--root", str(root), "order-step"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["sent"][0]["units"] == 5.0   # 4 held + 1.5 pending, whole shares
+    assert [o["units"] for o in venue.book.values()] == [5.0] and list(venue.book.values())[0]["limit"] == 505.0
+    assert (root / "memory" / "orders-standin-sandbox.sqlite").is_file() and (root / "memory" / "order_step-standin-sandbox.sqlite").is_file()
+    journal = [json.loads(line) for line in (root / "journal" / "2026-11-13.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in journal if e["type"] == "order_step"] == ["baseline", "order", "summary"]
+    assert cli.main(["--root", str(root), "order-step", "--fractional", "--capital", "200000"]) == 0   # the same day again
+    out = json.loads(capsys.readouterr().out)
+    assert out["sent"][0]["units"] == 11.0 and out["cancels"][0]["answer"] == "cancel requested"
+
+
+def test_order_step_refuses_production_before_any_venue_call(order_step_project, capsys):
+    root, venue = order_step_project
+    venue.environment = "production"
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "stopped" and out["stage"] == "environment" and venue.calls == []
+
+
+def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):
+    from valedia_trader.venues import webull
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: pytest.fail("a Webull venue was built")))
+    monkeypatch.setattr(cli, "_market", lambda args: pytest.fail("paper-step --webull went on to trade"))
+    assert cli.main(["--root", str(tmp_path), "paper-step", "--webull"]) == 2
+    err = capsys.readouterr().err
+    assert "order-step" in err and "no longer" in err
+
+
+def test_paper_step_alpaca_still_mirrors_to_the_alpaca_paper_account(tmp_path, monkeypatch, capsys):
+    from valedia_trader.core import secrets
+    built = []
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: {"ALPACA_API_KEY": "PKTEST", "ALPACA_SECRET_KEY": "s"}[name])
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: built.append((key, secret)) or "venue")
+    monkeypatch.setattr(cli, "_market", lambda args: (prices(), None, None))
+    assert cli.main(["--root", str(tmp_path), "paper-step", "--alpaca"]) == 0
+    assert built == [("PKTEST", "s")] and "nothing to paper trade" in capsys.readouterr().out

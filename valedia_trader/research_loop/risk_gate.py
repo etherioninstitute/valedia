@@ -14,10 +14,12 @@ from pathlib import Path
 
 from valedia_trader.research_loop import REPO
 
-__all__ = ["DEFAULT_LIMITS", "RiskConfigError", "load_limits", "write_default_limits", "check_order", "HALT_FILE"]
+__all__ = ["DEFAULT_LIMITS", "OPTIONAL_LIMITS", "RiskConfigError", "load_limits", "write_default_limits", "check_order", "HALT_FILE"]
 
 # The guide's example numbers. They are placeholders, not advice: set your own in config/risk.json.
 DEFAULT_LIMITS = {"max_daily_loss_pct": 2.0, "max_drawdown_pct": 8.0, "max_position_pct": 0.10, "max_open_positions": 5}
+# Keys the file may also carry. check_order does not read them: max_orders_per_day caps the order step's sending.
+OPTIONAL_LIMITS = ("max_orders_per_day",)
 HALT_FILE = REPO / "state" / "halt.json"          # the legacy operator kill switch; its presence stops everything
 
 
@@ -31,9 +33,15 @@ def load_limits(path: str | Path) -> dict:
         limits = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise RiskConfigError(f"cannot read risk limits from {path}: {exc}") from exc
-    if not isinstance(limits, dict) or set(limits) != set(DEFAULT_LIMITS):
-        raise RiskConfigError(f"risk limits must have exactly the keys {sorted(DEFAULT_LIMITS)}")
-    for key, value in limits.items():
+    if not isinstance(limits, dict) or not set(DEFAULT_LIMITS) <= set(limits) <= set(DEFAULT_LIMITS) | set(OPTIONAL_LIMITS):
+        raise RiskConfigError(f"risk limits must have exactly the keys {sorted(DEFAULT_LIMITS)}, "
+                              f"and may also have {sorted(OPTIONAL_LIMITS)}")
+    if "max_orders_per_day" in limits:
+        cap = limits["max_orders_per_day"]
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap < 1 or int(cap) != cap:
+            raise RiskConfigError("max_orders_per_day must be a whole number of at least 1")
+        limits["max_orders_per_day"] = int(cap)
+    for key, value in ((k, limits[k]) for k in DEFAULT_LIMITS):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise RiskConfigError(f"{key} must be a positive number")
     if limits["max_position_pct"] > 1.0 or limits["max_daily_loss_pct"] > 100 or limits["max_drawdown_pct"] > 100:

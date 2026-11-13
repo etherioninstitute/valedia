@@ -607,3 +607,29 @@ def test_a_buy_note_names_each_sale_date_once():
     note = pp.tax_buy_note(led.check_buy("AAA", 20, "2025-12-15"), "2025-12-15")
     assert len(note["washes"]) == 2 and note["disallowed_loss"] == pytest.approx(200.0)
     assert note["effect"] == "would turn 200.00 of the loss sold on 2025-12-10 into a wash sale, carried into this lot."
+
+
+# ---- what the order step reads: per strategy and fund, units held plus pending (T13)
+
+def test_wanted_units_are_held_plus_pending_per_strategy_and_reading_them_changes_nothing(setup):
+    t = trader(setup)
+    t.state["positions"] = {"a": {"UP": {"units": 10.0, "cost": 100.0}, "DOWN": {"units": 0.0, "cost": 0.0}},
+                            "b": {"UP": {"units": -4.0, "cost": 90.0}}}
+    t.state["pending"] = [{"strategy": "a", "symbol": "UP", "units": 2.5}, {"strategy": "a", "symbol": "UP", "units": -0.5},
+                          {"strategy": "b", "symbol": "DOWN", "units": 3.0}, {"strategy": "c", "symbol": "NEW", "units": 7.0},
+                          {"strategy": "b", "symbol": "UP", "units": 4.0}]
+    before = json.dumps(t.state, sort_keys=True)
+    assert t.wanted_units() == {"a": {"UP": 12.0}, "b": {"DOWN": 3.0}, "c": {"NEW": 7.0}}   # zeros are left out
+    assert json.dumps(t.state, sort_keys=True) == before                     # read only: no lot or strategy is created
+    assert pp.PaperTrader(setup[0].parent / "other", setup[1], halt_file=None).wanted_units() == {}   # a new book
+
+
+def test_wanted_units_after_a_real_step_match_the_book_and_the_orders(setup):
+    px, t, s = prices(), trader(setup), strat()
+    t.step(px.iloc[:12], {7: s})
+    t.step(px.iloc[:13], {7: s})
+    wanted = t.wanted_units()["mom_paper"]
+    for sym in ("UP", "DOWN"):
+        held = t.state["positions"]["mom_paper"][sym]["units"]
+        pending = sum(o["units"] for o in t.state["pending"] if o["symbol"] == sym)
+        assert wanted.get(sym, 0.0) == pytest.approx(held + pending)
