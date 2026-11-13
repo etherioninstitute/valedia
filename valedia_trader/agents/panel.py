@@ -205,7 +205,8 @@ class HermesProfileMember(Member):
 
     @staticmethod
     def _subprocess(argv: list[str], timeout: float) -> str:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        from valedia_trader.core.secrets import child_env
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=child_env())
         if out.returncode != 0:
             raise RuntimeError(f"hermes exited {out.returncode}")
         return out.stdout

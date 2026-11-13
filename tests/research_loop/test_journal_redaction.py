@@ -99,3 +99,14 @@ def test_a_planted_secret_never_reaches_the_journal_file(tmp_path):
     back = journal.read()
     assert len(back) == 1 and back[0]["secret_redacted"] == 5 and back[0]["units"] == 3.0 and back[0]["venue"]["name"] == "webull"
     assert list(back[0])[-1] == "secret_redacted"
+
+
+def test_an_account_number_held_as_a_number_never_reaches_the_journal(tmp_path):
+    rng = random.Random(3)
+    account = int("4" + _made_up(rng, 9, string.digits))
+    s.remember(str(account))
+    journal = pp.Journal(tmp_path / "journal")
+    record = journal.write("2026-03-03", {"type": "fill", "account": account, "by_account": {account: 2.5}, "units": 2.5})
+    text = (tmp_path / "journal" / "2026-03-03.jsonl").read_text()
+    leaked = _leaks(text, str(account))
+    assert not leaked and record["secret_redacted"] == 2 and record["units"] == 2.5

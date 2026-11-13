@@ -5,34 +5,46 @@ Default file: ~/.hermes/secrets/trading.env (override with VALEDIA_ENV_FILE). Va
 logged, printed or included in exceptions.
 
 A tripwire guards the exits as a second line of defence. Every credential this module hands out
-(through `secret`, or loaded by `load_env` under a credential or account name) is remembered, when it is
-at least 8 characters long. `redact` and `redact_json` replace any piece of a remembered secret in a
-text or a JSON-like record, and the first time a secret is remembered an output guard wraps
-standard output, standard error and the root logger so that nothing printed or logged carries one.
-`tripped` says how many replacements have been made; nothing else about them is ever exposed.
+through `secret`, every value handed to `remember`, and every value `load_env` finds under a
+credential or account name (loaded now or already in the environment) is remembered, when it is at
+least 8 characters long. `load_env` never remembers a path or a URL, a setting (a name ending in
+_DIR, _PATH, _FILE, _URL, _HOST, _PORT, _TYPE, _ENV, _MODE, _NAME or _REGION), a value holding
+whitespace, or an account value with no digit. `redact` and `redact_json` replace any piece of a
+remembered secret in a text or a JSON-like record, and the first time a secret is remembered an
+output guard wraps standard output, standard error and every logging handler so that nothing printed
+or logged carries one. `child_env` is the environment to give a child process: without the trading
+file's variables. `tripped` says how many replacements have been made; nothing else about them is
+ever exposed.
 
 A piece made only of the characters 0-9 and a-f counts from 12 characters, every other piece from
 8, so ordinary numbers, prices and hashes are never mistaken for a secret. A remembered value of 8
 to 11 such characters (a short account number) is caught only whole and standing alone, not inside
 a longer run of them. What this gives up: a piece of 8 to 11 characters of a digit-only or hex-only
-secret, or of the hex form of any secret, passes."""
+secret, or of the hex form of any secret, passes.
+
+Still not covered: writes made straight to a file descriptor (os.write, sys.stdout.buffer,
+sys.__stdout__, sys.__stderr__); files other than the journal (paper_state.json, the desk's files,
+ledgers, backtest reports); a logging handler that builds its text without `Handler.format`; child
+processes' own output; and the forms that still pass: JSON `\\/` escaping of a slash, account
+numbers written grouped or with dashes, a second layer of encoding (base64 of hex, and so on)."""
 from __future__ import annotations
 
 import atexit
 import base64
 import hashlib
 import logging
+import math
 import os
 import re
 import stat
 import sys
 import threading
-import weakref
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
 
 __all__ = ["env_file_path", "load_env", "secret", "SecretError", "DEFAULT_ENV_FILE", "SECRETS_DIR",
-           "redact", "redact_json", "tripped", "install_output_guard", "remove_output_guard"]
+           "redact", "redact_json", "tripped", "remember", "child_env", "install_output_guard",
+           "remove_output_guard"]
 
 SECRETS_DIR = Path("~/.hermes/secrets").expanduser()
 DEFAULT_ENV_FILE = SECRETS_DIR / "trading.env"
@@ -62,7 +74,8 @@ def parse_env(text: str) -> dict[str, str]:
 
 def load_env(path: str | Path | None = None, environ=None, override: bool = False) -> list[str]:
     """Load KEY=VALUE pairs into the environment and return the names loaded. A file readable by
-    group or others is refused. A missing file loads nothing (and returns an empty list)."""
+    group or others is refused. A missing file loads nothing (and returns an empty list). A name
+    already set is left alone (unless `override`), but its value is remembered all the same."""
     env = os.environ if environ is None else environ
     p = Path(path).expanduser() if path else env_file_path(env)
     if not p.is_file():
@@ -71,11 +84,13 @@ def load_env(path: str | Path | None = None, environ=None, override: bool = Fals
         raise SecretError(f"{p} is readable by group or others; run chmod 600 on it")
     loaded = []
     for key, value in parse_env(p.read_text()).items():
+        _hidden_names.add(key)
         if override or key not in env:
             env[key] = value
             loaded.append(key)
-            if _looks_like_credential(key):
-                _remember(value)
+        current = env.get(key, "")
+        if _worth_remembering(key, current):
+            remember(current)
     return loaded
 
 
@@ -85,7 +100,8 @@ def secret(name: str, environ=None) -> str:
     value = env.get(name, "")
     if not value.strip():
         raise SecretError(f"credential {name} is not set (expected in {env_file_path(env)})")
-    _remember(value)
+    _hidden_names.add(name)
+    remember(value)
     return value
 
 
@@ -97,11 +113,13 @@ _HEX_CHARS = "0123456789abcdef"
 _SHORT_HEX = re.compile(r"(?<![0-9a-f])[0-9a-f]{8,11}(?![0-9a-f])")
 _MASK = "<secret>"
 _CREDENTIAL_WORDS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "ACCOUNT")
+_SETTING_ENDINGS = ("_DIR", "_PATH", "_FILE", "_URL", "_HOST", "_PORT", "_TYPE", "_ENV", "_MODE", "_NAME", "_REGION")
 _QUOTES = "\"'`"
 _TOKEN = re.compile(r"[^\s\"'`]+")
 
 _lock = threading.RLock()
 _seen: set[str] = set()                    # a digest of each remembered secret, so each is processed once
+_hidden_names: set[str] = set()            # names from the trading file or served by `secret`: kept from children
 _NOTHING: tuple[frozenset[str], frozenset[str], frozenset[str]] = (frozenset(), frozenset(), frozenset())
 _pieces = _NOTHING                         # (8-character runs holding a non-hex character, 12-character
                                            #  hex-only runs, short hex-only values), all folded
@@ -113,6 +131,22 @@ def _looks_like_credential(name: str) -> bool:
     ACCOUNT (an account number is not a credential, but it is the owner's and stays private)."""
     upper = name.upper()
     return any(word in upper for word in _CREDENTIAL_WORDS)
+
+
+def _looks_like_a_place(value: str) -> bool:
+    return value.startswith(("/", "~", "./", "../")) or "://" in value
+
+
+def _worth_remembering(name: str, value: str) -> bool:
+    """What `load_env` remembers: a value under a credential or account name that is not a path, a
+    URL, a setting, text with whitespace, or (under an account-only name) a value with no digit."""
+    upper = name.upper()
+    if not _looks_like_credential(name) or upper.endswith(_SETTING_ENDINGS):
+        return False
+    if _looks_like_a_place(value) or any(c.isspace() for c in value):
+        return False
+    account_only = not any(word in upper for word in _CREDENTIAL_WORDS if word != "ACCOUNT")
+    return not (account_only and not any(c.isdigit() for c in value))
 
 
 def _fold(text: str) -> str:
@@ -166,12 +200,17 @@ def _pieces_of(value: str) -> tuple[set[str], set[str], set[str]]:
     return mixed, hexed, short
 
 
-def _remember(value) -> None:
-    """Remember a credential (8 characters or more) and make sure the output guard is on."""
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+
+
+def remember(value) -> None:
+    """Hand the tripwire a value to keep out of every output (for example an account id read from a
+    broker). Values shorter than 8 characters are ignored. Turns the output guard on."""
     global _pieces
     if not isinstance(value, str) or len(value) < _RUN:
         return
-    digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+    digest = _digest(value)
     with _lock:
         if digest not in _seen:
             _seen.add(digest)
@@ -180,11 +219,28 @@ def _remember(value) -> None:
 
 
 def _forget_all() -> None:
-    """For tests only: forget every remembered secret. The count of replacements is kept."""
+    """For tests only: forget every remembered secret and name. The count of replacements is kept."""
     global _pieces
     with _lock:
         _seen.clear()
+        _hidden_names.clear()
         _pieces = _NOTHING
+
+
+def child_env(extra=None) -> dict:
+    """The environment for a child process: this process's environment merged with `extra`, without
+    every variable loaded from the trading file or served by `secret` (by name) and without any
+    variable whose value is, or holds, a remembered secret. Nothing else is removed."""
+    pieces = _pieces
+    out = {}
+    for name, value in {**os.environ, **(extra or {})}.items():
+        if name in _hidden_names:
+            continue
+        if pieces is not _NOTHING and isinstance(value, str) and len(value) >= _RUN and \
+                (_digest(value) in _seen or _spans(value, pieces)):
+            continue
+        out[name] = value
+    return out
 
 
 def _is_boundary(c: str) -> bool:
@@ -261,23 +317,52 @@ def redact(text: str) -> tuple[str, int]:
 
 
 def redact_json(obj):
-    """`redact` over every string inside a JSON-like structure, keys included. Other values are
-    checked as the text the journal would write for them (`str`). Returns the structure and the
-    number of replacements; when nothing is replaced the very same object comes back."""
+    """`redact` over every string inside a JSON-like structure, keys included. A number (value or
+    key) whose plain decimal text `redact` would replace becomes the string `<secret>`; every other
+    number is left as it is. Other values are checked as the text the journal would write for them
+    (`str`). Returns the structure and the number of replacements; when nothing is replaced the very
+    same object comes back."""
     if _pieces is _NOTHING:
         return obj, 0
     return _redact_any(obj)
 
 
+def _plain_number(x) -> str | None:
+    """The plain decimal text of a number: digits for an integer (and an integral float), else repr."""
+    try:
+        if isinstance(x, float):
+            if not math.isfinite(x):
+                return None
+            return str(int(x)) if x.is_integer() and abs(x) < 1e18 else repr(x)
+        return str(x)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _redact_number(x):
+    text = _plain_number(x)
+    if text is None or len(text) < _RUN:
+        return x, 0
+    _, n = redact(text)
+    return (_MASK, n) if n else (x, 0)
+
+
 def _redact_any(obj):
     if isinstance(obj, str):
         return redact(obj)
-    if obj is None or isinstance(obj, (bool, int, float)):
+    if obj is None or isinstance(obj, bool):
         return obj, 0
+    if isinstance(obj, (int, float)):
+        return _redact_number(obj)
     if isinstance(obj, dict):
         out, total = {}, 0
         for key, value in obj.items():
-            key2, a = _redact_any(key) if isinstance(key, str) else (key, 0)
+            if isinstance(key, str):
+                key2, a = _redact_any(key)
+            elif isinstance(key, (int, float)) and not isinstance(key, bool):
+                key2, a = _redact_number(key)
+            else:
+                key2, a = key, 0
             if a:
                 key2 = _distinct(key2, out, obj)
             value2, b = _redact_any(value)
@@ -317,7 +402,8 @@ def tripped() -> int:
 class _GuardedStream:
     """A thin writer in front of a text stream: every write goes through `redact`. An unfinished
     line is held back so a secret split across two writes is still caught; it goes out on the next
-    newline, on `flush()` and at exit. Every other attribute is the wrapped stream's own."""
+    newline or carriage return, on `flush()`, on `close()` and at exit. Everything else (attributes,
+    `with`, iteration) behaves as the wrapped stream does."""
 
     _HOLD_LIMIT = 1 << 16                     # a line longer than this goes out at its last space
 
@@ -331,7 +417,7 @@ class _GuardedStream:
             return self._stream.write(text)
         with self._write_lock:
             data = self._pending + text
-            cut = data.rfind("\n") + 1
+            cut = max(data.rfind("\n"), data.rfind("\r")) + 1
             if not cut and len(data) > self._HOLD_LIMIT:
                 cut = max(data.rfind(" "), data.rfind("\t")) + 1 or len(data)
             self._pending = data[cut:]
@@ -343,14 +429,36 @@ class _GuardedStream:
         for line in lines:
             self.write(line)
 
-    def flush(self) -> None:
+    def _emit_pending(self) -> None:
         with self._write_lock:
-            if self._pending:
+            if self._pending and not getattr(self._stream, "closed", False):
                 pending, self._pending = self._pending, ""
                 self._stream.write(redact(pending)[0])
+
+    def flush(self) -> None:
+        self._emit_pending()
         flush = getattr(self._stream, "flush", None)
         if flush is not None:
             flush()
+
+    def close(self) -> None:
+        self._emit_pending()
+        self._stream.close()
+
+    def __enter__(self):
+        enter = getattr(self._stream, "__enter__", None)
+        if enter is not None:
+            enter()                                # the wrapped stream's own checks (a closed stream refuses)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._stream)
 
     def __getattr__(self, name):
         if name == "_stream":
@@ -358,72 +466,110 @@ class _GuardedStream:
         return getattr(self._stream, name)
 
 
-class _RedactingFilter(logging.Filter):
-    """Redacts a log record's final message (and its traceback text) before any handler writes it."""
+# ---- logging: every record, through every handler -------------------------------------------------
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            clean, n = redact(record.getMessage())
+_logging_on = False
+_format_hook = None                        # what Handler.format is while the guard is on
+_factory_hook = None                       # the record factory while the guard is on
+_saved_format = None                       # what was there before
+_saved_factory = None
+
+
+def _redact_record(record: logging.LogRecord) -> None:
+    """Replace secrets in a new record's message (with its arguments), exception text and stack text."""
+    try:
+        clean, n = redact(record.getMessage())
+        if n:
+            record.msg, record.args = clean, None
+        if record.exc_info and record.exc_info[0] is not None and not record.exc_text:
+            clean, n = redact(logging.Formatter().formatException(record.exc_info))
             if n:
-                record.msg, record.args = clean, None
-            if record.exc_info and record.exc_info[0] is not None:
-                text = record.exc_text or logging.Formatter().formatException(record.exc_info)
-                clean, n = redact(text)
-                if n:
-                    record.exc_text = clean
-            if record.stack_info:
-                clean, n = redact(record.stack_info)
-                if n:
-                    record.stack_info = clean
-        except Exception:
-            pass
-        return True
+                record.exc_text = clean
+        if record.stack_info:
+            clean, n = redact(record.stack_info)
+            if n:
+                record.stack_info = clean
+    except Exception:
+        pass                                   # logging reports its own formatting errors later
 
 
-_FILTER = _RedactingFilter()
-_filtered_handlers: "weakref.WeakSet[logging.Handler]" = weakref.WeakSet()
+def _make_format_hook(previous):
+    def format_hook(handler, record):
+        text = previous(handler, record)
+        return redact(text)[0] if _logging_on else text
+    return format_hook
+
+
+def _make_factory_hook(previous):
+    def factory_hook(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        if _logging_on:
+            _redact_record(record)
+        return record
+    return factory_hook
+
+
+def _install_logging() -> None:
+    global _logging_on, _format_hook, _factory_hook, _saved_format, _saved_factory
+    if _format_hook is None or logging.Handler.format is not _format_hook:
+        _saved_format = logging.Handler.format
+        _format_hook = _make_format_hook(_saved_format)
+        logging.Handler.format = _format_hook
+    if _factory_hook is None or logging.getLogRecordFactory() is not _factory_hook:
+        _saved_factory = logging.getLogRecordFactory()
+        _factory_hook = _make_factory_hook(_saved_factory)
+        logging.setLogRecordFactory(_factory_hook)
+    _logging_on = True
+
+
+def _remove_logging() -> None:
+    global _logging_on, _format_hook, _factory_hook
+    _logging_on = False                        # a hook someone else has wrapped since now passes text through
+    if _format_hook is not None and logging.Handler.format is _format_hook:
+        logging.Handler.format = _saved_format
+    if _factory_hook is not None and logging.getLogRecordFactory() is _factory_hook:
+        logging.setLogRecordFactory(_saved_factory)
+    _format_hook = _factory_hook = None
+
+
 _at_exit_registered = False
 
 
 def install_output_guard() -> None:
-    """Wrap sys.stdout and sys.stderr in a redacting writer, and add a redacting filter to the root
-    logger and to each of its handlers. Called by itself the first time a secret is remembered;
-    calling it again is harmless (nothing is wrapped twice). Text holding no secret passes
-    unchanged, only an unfinished line waits for its newline or a flush.
+    """Wrap sys.stdout and sys.stderr in a redacting writer, and redact every log record from any
+    logger through any handler, created before or after: the record factory replaces secrets in the
+    message, its arguments, the exception text and the stack text, and `logging.Handler.format`
+    (which every standard handler uses to make its text) passes its result through `redact`. Called
+    by itself the first time a secret is remembered; calling it again is harmless (nothing is
+    wrapped twice). Text holding no secret passes unchanged, only an unfinished line waits for its
+    newline, carriage return or a flush.
 
-    Not covered: writes made straight to a file descriptor (os.write, sys.stdout.buffer, a
-    handler's own file), handlers added to the root logger later that write somewhere other than
-    sys.stderr, and child processes, which have streams of their own."""
+    Not covered: writes made straight to a file descriptor (os.write, sys.stdout.buffer,
+    sys.__stdout__, sys.__stderr__, a handler's own file written without `Handler.format`), a
+    handler that formats without the standard path, other files, and child processes, which have
+    streams of their own (give them `child_env()`)."""
     global _at_exit_registered
     with _lock:
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)
             if stream is not None and not isinstance(stream, _GuardedStream):
                 setattr(sys, name, _GuardedStream(stream))
-        root = logging.getLogger()
-        root.addFilter(_FILTER)
-        for handler in list(root.handlers):
-            if _FILTER not in handler.filters:
-                handler.addFilter(_FILTER)
-                _filtered_handlers.add(handler)
+        _install_logging()
         if not _at_exit_registered:
             atexit.register(_flush_guarded)
             _at_exit_registered = True
 
 
 def remove_output_guard() -> None:
-    """Undo `install_output_guard`: flush what is held back, put the original streams back and take
-    the logging filter off. Harmless when the guard is not installed."""
+    """Undo `install_output_guard`: flush what is held back, put the original streams back and
+    restore logging exactly as it was. Harmless when the guard is not installed."""
     with _lock:
         _flush_guarded()
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)
             if isinstance(stream, _GuardedStream):
                 setattr(sys, name, stream._stream)
-        logging.getLogger().removeFilter(_FILTER)
-        for handler in list(_filtered_handlers):
-            handler.removeFilter(_FILTER)
-        _filtered_handlers.clear()
+        _remove_logging()
 
 
 def _flush_guarded() -> None:

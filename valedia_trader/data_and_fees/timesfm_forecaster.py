@@ -206,10 +206,11 @@ class TimesFMBackend:
         self._dir = tempfile.mkdtemp(prefix="timesfm-")
         log = open(Path(self._dir, "worker.log"), "w")
         env = {**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONUNBUFFERED": "1"}
+        from valedia_trader.core.secrets import child_env
         self._proc = subprocess.Popen(
             [sys.executable, str(WORKER), str(self.checkpoint.path), str(self.max_context), str(self.max_horizon),
              str(self.batch_size)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1,
-            cwd=self._dir, env=env)
+            cwd=self._dir, env=child_env(env))
         log.close()
         atexit.register(self.close)
         if self._reply()[0] != "ready":

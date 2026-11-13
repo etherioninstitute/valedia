@@ -94,7 +94,8 @@ def hermes_runner(role: str, spec: dict, prompt: str) -> str:
         argv += ["--reasoning", str(spec["reasoning"])]
     if spec.get("model"):
         argv += ["-m", str(spec["model"])]
-    out = subprocess.run(argv, capture_output=True, text=True, timeout=spec.get("timeout"), stdin=subprocess.DEVNULL)
+    from valedia_trader.core.secrets import child_env
+    out = subprocess.run(argv, capture_output=True, text=True, timeout=spec.get("timeout"), stdin=subprocess.DEVNULL, env=child_env())
     if out.returncode != 0:
         raise DeskError(f"the {role} did not answer (hermes exited {out.returncode})")
     return out.stdout

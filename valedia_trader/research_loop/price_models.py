@@ -84,8 +84,9 @@ class KronosForecaster:
         self._log = tempfile.TemporaryFile(mode="w+")
         env = {**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONUNBUFFERED": "1"}
         try:
+            from valedia_trader.core.secrets import child_env
             self._proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True,
-                                          bufsize=1, cwd=tempfile.gettempdir(), env=env)
+                                          bufsize=1, cwd=tempfile.gettempdir(), env=child_env(env))
             ready = self._read(lambda msg: msg.get("ready") is True)
         except (_WorkerDied, OSError) as exc:
             self.close()
