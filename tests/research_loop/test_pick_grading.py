@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import sqlite3
+import sys
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -816,7 +817,7 @@ def test_no_code_is_a_name_unless_all_five_leagues_have_a_table(tmp_path, capsys
         env.kalshi.kevents[SERIES[lg]] = [kevent(lg, "26NOV13", teams[2 * j + 1][3:5], teams[2 * j][3:5])
                                           for j in range(2)]
     out = env.out(capsys, "schedule")
-    assert str(out["kalshi_codes"]["NHL"]).startswith("error") and out["kalshi_codes"]["NBA"] == {"events": 2}
+    assert str(out["kalshi_codes"]["NHL"]).startswith("error") and out["kalshi_codes"]["NBA"] == {"events": 2, "unreadable": 0}
     env.clock.set("2026-11-14T12:00:00Z")
     env.out(capsys, "match")
     r = env.rows()
@@ -828,7 +829,7 @@ def test_schedule_stores_code_tables_from_the_events_lists_with_at_most_thirty_r
     kings_schedule(env)
     env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", "26NOV13", ("BOS", "Boston"), ("SAC", "Sacramento"))]
     out = env.out(capsys, "schedule")
-    assert out["kalshi_codes"]["NBA"] == {"events": 1}
+    assert out["kalshi_codes"]["NBA"] == {"events": 1, "unreadable": 0}
     assert len(env.kalshi.urls) == 5 and all("/events?" in u and "min_close_ts=" in u for u in env.kalshi.urls)
     assert not any("/markets" in u for u in env.kalshi.urls)          # no market is read, of any event
     s = env.store()
@@ -845,7 +846,7 @@ def test_schedule_stores_code_tables_from_the_events_lists_with_at_most_thirty_r
     env.clock.set("2026-11-13T17:00:00Z")
     out = env.out(capsys, "schedule")
     assert len(env.kalshi.urls) == 30 and out["NBA"]["games"] == 1
-    assert out["kalshi_codes"]["NFL"] == {"events": 0}        # an empty first page ends the listing
+    assert out["kalshi_codes"]["NFL"] == {"events": 0, "unreadable": 0}        # an empty first page ends the listing
     assert all(str(out["kalshi_codes"][lg]).startswith("error") for lg in ("NBA", "NHL", "NCAAF", "NCAAMB"))
     s = env.store()
     assert s.one("SELECT COUNT(*) AS n FROM code_fetches")["n"] == 6           # an unfinished listing is no table
@@ -877,7 +878,9 @@ TEMPLATES = (("Take {} ML", True, False), ("Hammer {} tonight ML", False, False)
              ("{} TONIGHT ML", True, True))                               # capitals with another word: no code
 
 
-def shared_env(tmp_path, capsys, world, fail=()):
+def shared_env(tmp_path, capsys, world, fail=(), unreadable=(), extra=None):
+    """The SHARED world: its games, and Kalshi's events lists; `unreadable` leagues have their events' sub-titles
+    written with names instead of codes ("Pitaton vs Caraton (Nov 13)"), `extra` adds events to a league's list."""
     env = Env(tmp_path, world)
     env.kalshi.fail = set(fail)
     env.clock.set("2026-11-13T15:00:00Z")
@@ -886,18 +889,21 @@ def shared_env(tmp_path, capsys, world, fail=()):
                                          SHARED_STARTS[lg][j], SPORT[lg]) for j in range(2)]
         env.kalshi.kevents[SERIES[lg]] = [kevent(lg, "26NOV13", teams[2 * j + 1][1:][::-1], teams[2 * j][1:][::-1])
                                           for j in range(2)]
-    env.out(capsys, "schedule")
+        if lg in unreadable:
+            for e in env.kalshi.kevents[SERIES[lg]]:
+                e["sub_title"] = e["title"] + " (Nov 13)"
+        env.kalshi.kevents[SERIES[lg]] += (extra or {}).get(lg, [])
+    env.schedule_out = env.out(capsys, "schedule")
     env.clock.set("2026-11-14T12:00:00Z")
     env.out(capsys, "match")
     return env
 
 
-def test_a_code_names_a_team_only_from_complete_tables_generated_1100_picks_with_shared_codes(
-        tmp_path, capsys, monkeypatch):
-    words = tmp_path / "words"
-    words.write_text(ENGLISH)
-    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
-    rng = random.Random(16)
+def shared_picks(n_picks, seed):
+    """`n_picks` generated picks on the SHARED world's games, each naming its team by Kalshi code only, with labels:
+    the game and side meant, whether the game had begun, whether the code may name it (the oracle), and whether the
+    code is one that several leagues share."""
+    rng = random.Random(seed)
     owners = {}
     for lg, teams in SHARED.items():
         for j, (full, _, code) in enumerate(teams):
@@ -905,7 +911,7 @@ def test_a_code_names_a_team_only_from_complete_tables_generated_1100_picks_with
     w = PickWorld()
     w.thread()
     labels = {}
-    for n in range(1100):
+    for n in range(n_picks):
         lg = rng.choice(sorted(SHARED))
         j = rng.randrange(4)
         full, _, code = SHARED[lg][j]
@@ -925,18 +931,77 @@ def test_a_code_names_a_team_only_from_complete_tables_generated_1100_picks_with
         usable = (before or code.lower() not in ENGLISH.split()) and len(scope) == 1 and not caps_blocked
         labels[cid] = {"game": gid, "side": "home" if j % 2 == 0 else "away", "begun": begun, "usable": usable,
                        "risky": begun and len(owners[code]) > 1}
+    return w, labels
+
+
+def wrong_matches(rows, labels):
+    return [(c, r["game_id"], labels[c]) for c, r in rows.items() if r["status"] == "matched" and (
+        r["game_id"] != labels[c]["game"] or r["side"] != labels[c]["side"])]
+
+
+def test_a_code_names_a_team_only_from_complete_tables_generated_1100_picks_with_shared_codes(
+        tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    w, labels = shared_picks(1100, 16)
     env = shared_env(tmp_path, capsys, w)
     rows = env.rows()
     assert set(rows) == set(labels)
-    wrong = [(c, r["game_id"], labels[c]) for c, r in rows.items() if r["status"] == "matched" and (
-        r["game_id"] != labels[c]["game"] or r["side"] != labels[c]["side"])]
-    assert wrong == []
+    assert wrong_matches(rows, labels) == []
     for c, r in rows.items():                                   # the oracle: matched exactly when it should be
         assert (r["status"] == "matched") == (labels[c]["usable"] and not labels[c]["begun"]), (c, r["reason"])
     assert sum(1 for c in rows if rows[c]["status"] == "matched") > 150
     assert sum(1 for c in labels if labels[c]["risky"]) > 300
     env2 = shared_env(tmp_path / "four", capsys, w, fail=[SERIES["NHL"]])  # one league's table missing: no code at all
     assert not any(r["status"] == "matched" for r in env2.rows().values())
+
+
+# ---------------------------------------------------------------- rev 4, outcome 1: a table read in full only
+
+def test_a_league_whose_events_carry_names_instead_of_codes_has_no_complete_table_verifier_scenario(
+        tmp_path, capsys, monkeypatch):
+    """The verifier's case: the NFL's events said "Pitaton vs Caraton (Nov 13)"; CAR and PIT, which the NHL shares,
+    then seemed the NHL's alone, and NFL picks went to the NHL's later games. Now no code names a team at all."""
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    w, labels = shared_picks(1100, 21)
+    env = shared_env(tmp_path, capsys, w, unreadable=("NFL",))
+    rows = env.rows()
+    assert set(rows) == set(labels) and wrong_matches(rows, labels) == []
+    assert not any(r["status"] == "matched" for r in rows.values())        # every pick named its team by code only
+    assert env.schedule_out["kalshi_codes"]["NFL"] == {"events": 2, "unreadable": 2}
+    assert env.schedule_out["kalshi_codes"]["NHL"] == {"events": 2, "unreadable": 0}
+    st = env.out(capsys, "status")
+    assert st["code_readability"]["NFL"]["unreadable"] == 2 and st["code_readability"]["NHL"]["unreadable"] == 0
+    s = env.store()
+    raw = json.loads(s.one("SELECT t.raw FROM code_tables t WHERE t.league = 'NFL'")["raw"])
+    s.close()
+    assert len(raw) == 2                                                    # stored as listed, unreadable events kept
+
+
+def _fillers(n):
+    """`n` more NBA events with readable codes, on other days, of teams that play no stored game."""
+    return [kevent("NBA", "26NOV%02d" % (1 + k % 12), ("Z%03d" % k, "Zeton%d" % k), ("Y%03d" % k, "Yeton%d" % k))
+            for k in range(n)]
+
+
+@pytest.mark.parametrize("bad", [1, 0])
+def test_one_unreadable_event_among_two_hundred_switches_every_code_off(tmp_path, capsys, monkeypatch, bad):
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    w, labels = shared_picks(600, 5)
+    odd = kevent("NBA", "26NOV12", ("BOS", "Bosaton"), ("PHX", "Phoaton"))
+    if bad:
+        odd["sub_title"] = "Bosaton vs Phoaton (Nov 12)"
+    env = shared_env(tmp_path, capsys, w, extra={"NBA": _fillers(197) + [odd]})
+    rows = env.rows()
+    assert wrong_matches(rows, labels) == []
+    matched = sum(1 for r in rows.values() if r["status"] == "matched")
+    assert (matched == 0) if bad else (matched > 50)
+    assert env.schedule_out["kalshi_codes"]["NBA"] == {"events": 200, "unreadable": bad}
 
 
 # ---------------------------------------------------------------- invariant 4: codes that are English words
@@ -1524,26 +1589,37 @@ def test_a_changed_fingerprint_before_any_result_needs_a_new_audit(tmp_path, cap
 
 # ---------------------------------------------------------------- invariant 5: the fingerprint covers what match reaches
 
+NOT_A_MATCH_RUN = {"cmd_schedule", "cmd_audit_sample", "cmd_audit_pass", "cmd_prices", "cmd_results", "cmd_evaluate",
+                   "cmd_choose", "cmd_daily", "status"}                   # the other commands main dispatches to
+
+
 def _reachable_from_match():
-    """The module's functions and methods that `cmd_match` can reach, read from the source with ast: names of
-    module-level functions, and methods of the module's classes by attribute name; with the helpers of
-    sports_lines and pick_lists named on the way."""
+    """The module's functions and methods that a `match` run can reach, read from the source with ast, from the entry
+    point down (`_cli`, which the module's `__main__` line calls; then `main`, its set-up and `cmd_match`): names of
+    module-level functions other than the other commands, the special methods (`__init__`...) of the module's classes
+    named, and methods of the module's classes by attribute name; with the helpers of sports_lines and pick_lists
+    named on the way."""
     tree = ast.parse(Path(pg.__file__).read_text())
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    assert {n for n in funcs if n.startswith("cmd_")} - {"cmd_match"} <= NOT_A_MATCH_RUN
     methods = {}
-    for c in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+    for c in classes.values():
         for m in c.body:
             if isinstance(m, ast.FunctionDef):
                 methods.setdefault(m.name, []).append((c.name, m))
-    seen, todo, helpers = {}, [("", "cmd_match", funcs["cmd_match"])], set()
+    seen, todo, helpers = {}, [("", "_cli", funcs["_cli"])], set()
     while todo:
         cls, name, node = todo.pop()
         if (cls, name) in seen:
             continue
         seen[(cls, name)] = node
         for sub in ast.walk(node):
-            if isinstance(sub, ast.Name) and sub.id in funcs:
+            if isinstance(sub, ast.Name) and sub.id in funcs and sub.id not in NOT_A_MATCH_RUN:
                 todo.append(("", sub.id, funcs[sub.id]))
+            elif isinstance(sub, ast.Name) and sub.id in classes:
+                todo += [(sub.id, m.name, m) for m in classes[sub.id].body
+                         if isinstance(m, ast.FunctionDef) and m.name.startswith("__")]
             elif isinstance(sub, ast.Attribute):
                 if isinstance(sub.value, ast.Name) and sub.value.id in ("sl", "pl"):
                     helpers.add((sub.value.id, sub.attr))
@@ -1571,6 +1647,8 @@ def _copy_with_probe(tmp_path, n, node=None):
 def test_every_function_match_can_reach_is_inside_the_fingerprint(tmp_path):
     reach, helpers = _reachable_from_match()
     assert ("", "cmd_match") in reach and ("", "_match_thread") in reach and ("", "evaluate_comment") in reach
+    assert ("", "main") in reach and ("Grader", "__init__") in reach and ("GradingStore", "__init__") in reach
+    assert ("", "_one_record") in reach and ("", "cmd_evaluate") not in reach
     base = _copy_with_probe(tmp_path, 0).fingerprint()
     assert base == pg.fingerprint()                           # the fingerprint does not depend on where the file is
     missed = []
@@ -1655,7 +1733,7 @@ def test_the_scoring_code_is_pinned_at_the_choice(tmp_path, capsys, monkeypatch)
     assert ch["choice"] == 1 and len(ch["scoring_fingerprint"]) == 64
     assert "pg.purchase_quote" in pg.scoring_scope()["functions"] and "pg.cmd_evaluate" in pg.scoring_scope()["functions"]
     monkeypatch.setattr(pg, "MAX_ASK", 0.94)                       # a repair of the scoring code after the choice
-    env.clock.set("2027-03-31T12:00:00Z")
+    env.clock.set("2027-04-04T12:00:00Z")                  # the test is scored once its games are over
     with pytest.raises(pg.Refused, match="pinned"):
         env.run("evaluate", "--period", "test")
     assert not any(e["kind"] == "test_result" for e in sl.scoring_entries(env.root))
@@ -1682,7 +1760,8 @@ def test_the_test_period_is_refused_before_the_counts_or_the_last_day_and_scored
     assert env.out(capsys, "choose", "--version", "2")["choice"] == 2
     with pytest.raises(pg.Refused, match="once"):
         env.run("choose", "--version", "1")
-    for now in ("2026-12-20T12:00:00Z", "2027-03-31T03:59:59Z"):          # 2027-03-30, 23:59:59 US-Eastern
+    for now in ("2026-12-20T12:00:00Z", "2027-03-31T04:00:00Z",
+                "2027-04-04T03:59:59Z"):                                    # 2027-04-03, 23:59:59 US-Eastern
         env.clock.set(now)
         with pytest.raises(pg.Refused, match="counts"):
             env.run("evaluate", "--period", "test")
@@ -1692,7 +1771,7 @@ def test_the_test_period_is_refused_before_the_counts_or_the_last_day_and_scored
     assert "mean" not in json.dumps(st) and "ci95" not in json.dumps(st)
     with pytest.raises(SystemExit):
         env.run("evaluate", "--period", "test", "--more-data")
-    env.clock.set("2027-03-31T04:00:00Z")                                   # 2027-03-31 00:00 US-Eastern
+    env.clock.set("2027-04-04T04:00:00Z")                                   # 2027-04-04 00:00 US-Eastern
     first = env.out(capsys, "evaluate", "--period", "test")
     assert first["choice"] == 2 and first["A"]["2"]["n"] == 0 and first["A"]["2"]["mean"] == "not shown"
     assert first["pass_lines"] == {"A_counts_reached": False, "B_counts_reached": False, "A_passes": False,
@@ -1718,7 +1797,7 @@ def test_test_period_picks_wait_for_a_choice(tmp_path, capsys):
     env.out(capsys, "choose", "--version", "1")
     r = env.out(capsys, "results")
     assert r["picks"] == 42 and r["scores"]["NBA"]["games_listed"] == N_GAMES
-    env.clock.set("2027-03-31T12:00:00Z")
+    env.clock.set("2027-04-04T12:00:00Z")                  # the test is scored once its games are over
     res = env.out(capsys, "evaluate", "--period", "test")
     assert res["B"]["n"] == 42 and res["A"]["1"]["n"] == 0 and res["A"]["1"]["not_bought"] == {"no_candle": 22}
 
@@ -1789,6 +1868,13 @@ def test_the_test_period_is_scored_once_both_counts_are_reached_and_ends_on_that
     assert tc["versions"]["1"] == {"contracts": SEASON_DAYS * SEASON_GAMES, "days": SEASON_DAYS}
     assert tc["B_graded"] == SEASON_DAYS * SEASON_GAMES and tc["reached_on"] == days[END].isoformat()
     assert "mean" not in json.dumps(st)
+    reached = days[END]                                      # scored four days after the last counted thread's date
+    opens = datetime(reached.year, reached.month, reached.day, 5, tzinfo=UTC) + timedelta(days=4)   # 00:00 Eastern
+    env.clock.set(iso(opens - timedelta(seconds=1)))
+    with pytest.raises(pg.Refused, match="four days"):
+        env.run("evaluate", "--period", "test")
+    assert not any(e["kind"] == "test_result" for e in sl.scoring_entries(env.root))
+    env.clock.set(iso(opens))
     res = env.out(capsys, "evaluate", "--period", "test")
     assert res["end"] == days[END].isoformat()
     assert (res["A"]["1"]["n"], res["A"]["1"]["days"]) == ((END + 1) * SEASON_GAMES, END + 1)
@@ -1882,3 +1968,123 @@ def test_daily_goes_on_after_one_leagues_error_and_prints_no_comment_text(tmp_pa
     printed = capsys.readouterr().out
     for word in ("author", "someone", "+110", "Lokars ML"):
         assert word not in printed
+
+
+# ---------------------------------------------------------------- rev 4, outcome 2: Question B waits where Kalshi lists
+
+def test_question_b_waits_for_kalshi_where_kalshi_lists_the_game_and_uses_the_scores_alone_where_it_does_not(
+        tmp_path, capsys):
+    w, games = big_world()
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev(g, h, a, DEV["start"]) for g, h, a in games]
+    _, home, away = games[1]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", DEV["event"], ("AWY", away.split()[0]), ("HME", home.split()[0]))]
+    env.clock.set(DEV["schedule"])
+    env.out(capsys, "schedule")
+    env.clock.set(DEV["match"])
+    env.out(capsys, "match")
+    settle_world(env, games)
+    env.kalshi.markets["KXNBAGAME"] = [m for m in env.kalshi.markets["KXNBAGAME"]   # Kalshi settled neither game 1
+                                       if not m["event_ticker"].endswith(("G01", "G02"))]   # nor game 2
+    env.audit(capsys)
+    env.clock.set(DEV["after"])
+    env.out(capsys, "prices")
+    env.out(capsys, "results")
+    res = env.out(capsys, "evaluate", "--period", "development")
+    # game 1 (authors 1 and 23) is in Kalshi's events list: it waits for Kalshi; game 2 (authors 2 and 24) is not
+    # listed anywhere: graded on the scores alone
+    assert res["B"]["not_graded"] == {"kalshi_not_settled": 2} and res["B"]["n"] == 40
+
+
+# ---------------------------------------------------------------- rev 4, outcome 3: no test-period final before a choice
+
+EVE = dict(LATE, start="2026-12-14T04:30:00Z")              # development games at 23:30 US-Eastern on 2026-12-13
+
+
+def test_before_a_choice_no_final_or_settlement_of_a_game_a_test_period_pick_is_matched_to_is_stored(tmp_path, capsys):
+    w, games = big_world(EVE)
+    w.thread("t2", "Pick of the Day - 12/14/26 (Monday)", "2026-12-14T03:00:00Z")
+    w.comment("t2c", "author_t2", [("2026-12-14T04:00:00Z", ml(games[0][1].split()[1]), "+110")], tid="t2")
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev(g, h, a, EVE["start"]) for g, h, a in games]
+    env.clock.set(EVE["schedule"])
+    env.out(capsys, "schedule")
+    env.clock.set("2026-12-14T04:10:00Z")
+    env.out(capsys, "match")
+    assert (env.rows()["t2c"]["status"], env.rows()["t2c"]["game_id"]) == ("matched", "g00")
+    settle_world(env, games, EVE)
+    env.audit(capsys)
+    env.clock.set("2026-12-14T10:00:00Z")                  # 05:00 US-Eastern on 2026-12-14, no choice
+    r = env.out(capsys, "results")
+    assert r["scores"]["NBA"]["games_listed"] == N_GAMES - 1 and r["scores"]["NBA"]["dropped_test_period"] == 1
+    s = env.store()
+    stored = [e["id"] for row in s.rows("SELECT raw FROM scores") for e in json.loads(row["raw"])]
+    s.close()
+    assert "g00" not in stored and len(stored) == N_GAMES - 1
+    assert not any("/markets" in u for u in env.kalshi.urls)     # game 0's day is not fetched from Kalshi either
+    env.out(capsys, "choose", "--version", "1")
+    env.out(capsys, "results")
+    assert any("/markets" in u for u in env.kalshi.urls)
+
+
+# ---------------------------------------------------------------- rev 4, outcome 4: one fingerprint, any entry point
+
+def _run_as_main():
+    """The module's code run as `python -m` runs it: executed afresh in a namespace named __main__, here with no
+    command, which argparse refuses before anything is opened."""
+    path = Path(pg.__file__)
+    ns = {"__name__": "__main__", "__file__": str(path), "__package__": "valedia_trader.research_loop",
+          "__builtins__": __builtins__}
+    old = sys.argv
+    sys.argv = ["pick_grading"]
+    try:
+        with pytest.raises(SystemExit):
+            exec(compile(path.read_text(), str(path), "exec"), ns)
+    finally:
+        sys.argv = old
+    return ns
+
+
+def test_the_fingerprints_do_not_depend_on_how_the_module_was_started(tmp_path, capsys):
+    ns = _run_as_main()
+    assert ns["__name__"] == "__main__" and ns["main"] is not pg.main
+    assert ns["scoring_fingerprint"]() == pg.scoring_fingerprint()
+    assert ns["fingerprint"]() == pg.fingerprint()
+    env = Env(tmp_path, two_league_world("NBA"))
+    ns["DEFAULT_PICKS"], ns["DEFAULT_STORE"] = pg.DEFAULT_PICKS, pg.DEFAULT_STORE      # the temporary defaults
+    capsys.readouterr()
+    assert ns["main"](["--store", str(env.root), "--picks", str(env.picks), "choose", "--version", "1"],
+                      clock=env.clock) == 0
+    printed = json.loads(capsys.readouterr().out)
+    s = env.store()
+    pin = s.scoring_pin()
+    s.close()
+    assert pin == printed["scoring_fingerprint"] == pg.scoring_fingerprint()
+
+
+# ---------------------------------------------------------------- rev 4, outcome 5: from the entry point down
+
+def test_a_change_in_main_or_the_set_up_of_a_match_run_changes_the_matching_fingerprint(tmp_path):
+    base, sbase = pg.fingerprint(), pg.scoring_fingerprint()
+
+    def clock_shift(src):                                    # the verifier's edit: the clock shifted inside main
+        return src.replace("    clock = clock or _system_clock\n", "    clock = clock or _system_clock\n"
+                           "    clock = (lambda c: (lambda: c() + timedelta(hours=1)))(clock)\n", 1)
+
+    def grader(src):
+        return src.replace("        self.store = GradingStore(self.root / STORE_FILE)\n",
+                           "        self.store = GradingStore(self.root / STORE_FILE)\n        self._extra = 1\n", 1)
+
+    def pairing(src):
+        return src.replace("    identity = pick_store_identity(picks)\n",
+                           "    identity = pick_store_identity(picks)\n    _extra = 1\n", 1)
+    for name, change in (("clock_shift", clock_shift), ("grader", grader), ("pairing", pairing)):
+        assert change(Path(pg.__file__).read_text()) != Path(pg.__file__).read_text(), name
+        assert _copy_with_text(tmp_path, name, change).fingerprint() != base, name
+
+    def evaluate(src):                                       # another command's code: not a match run's
+        return src.replace("def cmd_evaluate(gr: Grader, period: str, code_changed: str | None = None) -> dict:\n",
+                           "def cmd_evaluate(gr: Grader, period: str, code_changed: str | None = None) -> dict:\n"
+                           "    _extra = 1\n", 1)
+    mod = _copy_with_text(tmp_path, "evaluate", evaluate)
+    assert mod.fingerprint() == base and mod.scoring_fingerprint() != sbase

@@ -1,5 +1,5 @@
 """Grading of the public pick lists, exactly as the locked prediction says: docs/research/2026-11-13-pick-lists-prediction.md
-(commit 5f9183c, with its clarifications 1 to 20). Research only: nothing here sends anything to an exchange or a broker.
+(commit 5f9183c, with its clarifications 1 to 21). Research only: nothing here sends anything to an exchange or a broker.
 
     python -m valedia_trader.research_loop.pick_grading <command> [--store DIR] [--picks FILE]
 
@@ -24,7 +24,8 @@ Commands:
 - `schedule`: The Odds API's free events list of each of the five leagues, stored as fetched, and the table of team
   codes of each of Kalshi's five game series, from its events list of every status (keyless, at most 30 requests a run;
   an event carries its title and no result, and no market is read). A league's table is stored only when its listing
-  ended within the run's requests. `schedule --date YYYY-MM-DD` buys the historical list of a missed day (1 credit a
+  ended within the run's requests; it is stored as listed, and an event that does not give two readable codes ("CODE vs
+  CODE (Mon DD)") is counted (`unreadable`, shown by `schedule` and `status`). `schedule --date YYYY-MM-DD` buys the historical list of a missed day (1 credit a
   league, the paid key), as of 06:00 US-Eastern that day. A game's start is the earliest `commence_time` any stored
   list gives for it, whenever that list was fetched (clarification 8); a game counts only if a list fetched before
   that start held it, and lists that differ on its start by more than 30 minutes flag it.
@@ -33,14 +34,16 @@ Commands:
   none), any date; a pick names team T only when no other known team is named at least as fully (a whole name beats a
   city or a nickname; a tie is not graded); then T must play exactly one game of the window (clarification 9). A
   selection that names teams of two different games, or bets against the team it names, is not graded (clarification
-  18). Kalshi's codes count as names only from complete tables (clarification 16): every league has a table fetched in
-  the last 7 days; a code written in capitals names a team only when it belongs to one team alone across all stored
+  18). Kalshi's codes count as names only from complete tables (clarification 16): every league's latest table was
+  fetched in the last 7 days and every event of it gave two readable codes (clarification 21); a code written in capitals names a team only when it belongs to one team alone across all stored
   tables, or within the league the comment writes; a code that is also an English word counts only directly before
   the bet's marker or as the selection's only other word; in a selection written wholly in capitals no word is a code
   when it holds a word besides team codes and the bet's own markers (clarification 20: "LAL ML", "BOS -4.5" and
   "KC/BUF OVER 47.5" keep their codes; "IND STRONG ML" has none).
-  No model proposes anything. The rule's fingerprint (`fingerprint()`, over the parsed code of every function `match`
-  can reach, the constants they read, the store's tables and the word list) is stored with every row.
+  No model proposes anything. The rule's fingerprint (`fingerprint()`, over the parsed code of every function a
+  `match` run can reach from the entry point down: `_cli`, `main`, the store and grader set-up and `cmd_match`; the
+  constants they read, the store's tables and the word list) is stored with every row. It is the same whatever way the
+  module was started (imported or run with `python -m`).
 - `audit-sample [--out DIR]`: 40 matched picks beside the comment text they were graded from, in a file outside the
   repository. The draw's seed comes from the fingerprint; there is one sample a fingerprint. `audit-pass --sample N
   --wrong K` records the lead's count for that sample, once. More than 2 wrong closes the fingerprint for good; only a
@@ -50,11 +53,19 @@ Commands:
 - `results`: Kalshi's settlement of the paired games and The Odds API's scores (`daysFrom=3`, 2 credits a league). A
   league's scores are bought only when one of its matched games started more than 3 hours ago, has no final yet and
   started less than 3 days ago, and no scores list of that league was asked for in the last 6 hours. A final listed 3
-  days or more after the start is not used: the game is not graded (clarification 14).
+  days or more after the start is not used: the game is not graded (clarification 14). Before a choice, the final of
+  a game that a pick of a test-period thread is matched to is dropped from the scores list before it is stored (the
+  count dropped is shown), and no Kalshi settlement of that game's day is fetched.
+  Question B: a pick on a game Kalshi lists (a stored code table's event or a stored market's event, matched to the game
+  by its date and both team names) waits for Kalshi's result (`kalshi_not_settled`); a game Kalshi does not list is
+  graded on the scores alone.
 - `evaluate --period development|test`, `choose --version N`, `daily`, `status`. The test period is scored once: when
   the counts that can be known without reading a result reach the margin (clarification 15: Question A's chosen
-  version, 158 contracts on 20 days; Question B, 315 graded picks) or from 2027-03-31 US-Eastern, never earlier and
-  never again; the period ends on the thread date on which both were first reached; the pass lines stay 150 and 300.
+  version, 158 contracts on 20 days; Question B, 315 graded picks) or at the last date, 2027-03-31, never again; the
+  period ends on the thread date on which both were first reached; the pass lines stay 150 and 300. It is scored when
+  its games are over (clarification 21): when it ends by date, not before 2027-04-04 00:00 US-Eastern; when it ends by
+  the counts, not before 00:00 US-Eastern four days after the last counted thread's date (the same wait: a thread's
+  games start until 06:00 the next day and a final is used if listed within three days of the start).
   `choose` pins the scoring code (`scoring_fingerprint()`, over everything `prices`, `results` and `evaluate` reach);
   `evaluate --period test` refuses a changed scoring code unless `--code-changed "<reason>"` is given, and then the
   reason, both fingerprints and the time are written to the scoring log and the result (clarification 17). `status`
@@ -156,6 +167,8 @@ END_A_COUNT, END_B_COUNT = 158, 315         # the test period ends when these (5
 MIN_FORM_CHARS = 3                          # a team's name form shorter than this is never matched
 NO_RUN_CAP = 10 ** 9                        # the ledger's run cap is not used here; the monthly cap is
 TEST_CHOICE_CUTOFF = datetime(2026, 12, 14, 6, tzinfo=ET)
+TEST_SCORED_FROM = date(2027, 4, 4)         # a test ending by date is scored from 00:00 US-Eastern this day (cl. 21)
+SCORE_WAIT_DAYS = 4                         # a test ending by the counts: this many days after the last counted date
 
 LEAGUE_WORDS = {                            # the league as written (lower case, letters and digits only)
     "nfl": ("NFL",), "nba": ("NBA",), "nhl": ("NHL",), "hockey": ("NHL",),
@@ -373,6 +386,12 @@ def _event_codes(e: dict) -> list[tuple[str, str]] | None:
     names = str(e.get("title") or "").split(" vs ")
     names = names if len(names) == 2 else ["", ""]
     return [(m.group(1), names[0].strip()), (m.group(2), names[1].strip())]
+
+
+def _unreadable(events: Iterable) -> int:
+    """The events of a listing that do not give two readable codes: no event ticker, or a sub-title not of the form
+    "CODE vs CODE (Mon DD)" (clarification 21: one makes that league's table incomplete)."""
+    return sum(1 for e in events if not (isinstance(e, dict) and e.get("event_ticker") and _event_codes(e) is not None))
 
 
 def name_index(lists: Iterable[dict], code_tables: Iterable[dict] | None) -> dict:
@@ -682,7 +701,9 @@ def _matched_row(o: dict, g: dict, known_at: str) -> dict:
 
 # ---------------------------------------------------------------- the fingerprints: everything a command can reach
 
-_MATCH_ROOTS = ("cmd_match",)
+_MATCH_ROOTS = ("_cli", "main", "cmd_match")    # a match run, from the entry point (`__main__` calls `_cli`) down
+_NOT_A_MATCH_RUN = ("cmd_schedule", "cmd_audit_sample", "cmd_audit_pass", "cmd_prices", "cmd_results", "cmd_evaluate",
+                    "cmd_choose", "cmd_daily", "status")          # the other commands `main` dispatches to
 _SCORING_ROOTS = ("cmd_prices", "cmd_results", "cmd_evaluate")
 _MISSING = object()
 
@@ -731,11 +752,13 @@ def _parsed(fn: Callable) -> tuple[ast.AST | None, str]:
     return tree, ast.dump(tree, annotate_fields=True, include_attributes=False)
 
 
-def _scope(roots: Sequence[str], wide: bool) -> dict:
-    """Every function and method the `roots` can reach, found from the parsed code: module-level names, methods of
-    this module's classes and of `pick_lists.Store` by attribute name (`wide`: also of the classes of sports_lines,
-    kalshi_history, kalshi_data and odds_api), the helpers borrowed from those modules (and what they reach there),
-    and every module-level constant on the way."""
+def _scope(roots: Sequence[str], wide: bool, skip: Sequence[str] = ()) -> dict:
+    """Every function and method the `roots` can reach, found from the parsed code: module-level names (not those in
+    `skip`), the special methods (`__init__`...) of a class named, methods of this module's classes and of
+    `pick_lists.Store` by attribute name (`wide`: also of the classes of sports_lines, kalshi_history, kalshi_data and
+    odds_api), the helpers borrowed from those modules (and what they reach there), and every module-level constant on
+    the way. A module's own names (`__name__`, `__file__`...) are left out: they say how the module was started, not
+    what it does."""
     mods = {"pg": (globals(), __name__), "sl": (vars(sl), sl.__name__), "pl": (vars(pl), pl.__name__),
             "kh": (vars(kh), kh.__name__)}
     if wide:
@@ -756,9 +779,13 @@ def _scope(roots: Sequence[str], wide: bool) -> dict:
     todo: list[tuple[str, Callable, str]] = [("pg." + r, globals()[r], "pg") for r in roots]
 
     def take(label: str, name: str, v) -> None:
+        if name.startswith("__") and name.endswith("__"):
+            return
         f = inspect.unwrap(v) if callable(v) else v
         if inspect.isfunction(f) and f.__module__ == mods[label][1]:
             todo.append(("%s.%s" % (label, name), f, label))
+        elif isinstance(v, type) and v.__module__ == mods[label][1]:
+            todo.extend((qual, m, label) for n, qual, m in _members(v, label) if n.startswith("__") and n.endswith("__"))
         elif not callable(v) and not isinstance(v, types.ModuleType):
             consts["%s.%s" % (label, name)] = _plain(v)
     while todo:
@@ -774,7 +801,7 @@ def _scope(roots: Sequence[str], wide: bool) -> dict:
         for node in ast.walk(tree):
             if isinstance(node, ast.Name):
                 v = ns.get(node.id, _MISSING)
-                if v is not _MISSING:
+                if v is not _MISSING and not (label == "pg" and node.id in skip):
                     take(label, node.id, v)
             elif isinstance(node, ast.Attribute):
                 if isinstance(node.value, ast.Name) and node.value.id in aliases:
@@ -789,8 +816,9 @@ def _scope(roots: Sequence[str], wide: bool) -> dict:
 
 
 def fingerprint_scope() -> dict:
-    """What the matching fingerprint covers: everything `cmd_match` can reach (see `_scope`)."""
-    return _scope(_MATCH_ROOTS, wide=False)
+    """What the matching fingerprint covers: everything a `match` run can reach from the entry point down (`_cli`,
+    `main` with the store and grader set-up, `cmd_match`), not the other commands (see `_scope`)."""
+    return _scope(_MATCH_ROOTS, wide=False, skip=_NOT_A_MATCH_RUN)
 
 
 def scoring_scope() -> dict:
@@ -981,15 +1009,28 @@ class GradingStore:
     def lists(self) -> list[dict]:
         return self.rows("SELECT league, as_of, raw FROM schedules ORDER BY id")
 
+    def _latest_code_fetches(self, now: str | None = None) -> list[dict]:
+        """Each league's latest code table fetch (at or before `now`): league, time, events and the table's raw."""
+        cond, args = ("WHERE fetched_at <= ? ", (now,)) if now is not None else ("", ())
+        return self.rows("SELECT f.league, f.fetched_at, f.events, t.raw FROM code_fetches f JOIN code_tables t ON "
+                         "t.id = f.table_id WHERE f.id IN (SELECT MAX(id) FROM code_fetches %sGROUP BY league) "
+                         "ORDER BY f.league" % cond, args)
+
     def code_tables(self, now: str) -> list[dict] | None:
-        """Every stored code table ({league, raw}), when every league has one fetched within `CODE_FRESH` of `now`;
-        None otherwise (the codes are then names of nothing)."""
+        """Every stored code table ({league, raw}), when every league's latest table was fetched within `CODE_FRESH`
+        of `now` and every event of it gave two readable codes (clarification 21); None otherwise (the codes are then
+        names of nothing)."""
         since = _from_ts(_ts(now) - CODE_FRESH)
-        fresh = {r["league"] for r in self.rows("SELECT DISTINCT league FROM code_fetches WHERE fetched_at >= ? "
-                                                 "AND fetched_at <= ?", (since, now))}
-        if not set(LEAGUES) <= fresh:
+        complete = {r["league"] for r in self._latest_code_fetches(now)
+                    if r["fetched_at"] >= since and _unreadable(_list_body(r["raw"])) == 0}
+        if not set(LEAGUES) <= complete:
             return None
         return self.rows("SELECT league, raw FROM code_tables ORDER BY id")
+
+    def code_readability(self) -> dict[str, dict]:
+        """Each league's latest code table fetch: its time, events and how many of them gave no two readable codes."""
+        return {r["league"]: {"fetched_at": r["fetched_at"], "events": r["events"],
+                              "unreadable": _unreadable(_list_body(r["raw"]))} for r in self._latest_code_fetches()}
 
     def list_ids(self) -> tuple[int, int]:
         """The latest schedule list and code table fetch stored (0 for none)."""
@@ -1156,8 +1197,10 @@ def _kalshi_codes(gr: Grader) -> dict:
     """The table of team codes of each of the five game series, from Kalshi's events list of every status (events
     with a market closing after now minus `CODE_LOOKBACK`; an event carries its title and no result, and no market is
     read), each event kept as event ticker, title and sub-title only. At most `CODE_REQUESTS` requests a run; a league
-    whose listing fails or does not end within them gets no table this run (recorded; the others go on). A table is
-    stored once by content, and every complete fetch is recorded with its time (`code_fetches`)."""
+    whose listing fails or does not end within them gets no table this run (recorded; the others go on). Every event
+    listed is kept (one without a ticker too), so a table holds what was listed and its unreadable events can be
+    counted (`_unreadable`). A table is stored once by content, and every fetch whose listing ended is recorded with its
+    time (`code_fetches`)."""
     out: dict[str, Any] = {}
     client = gr.kalshi
     old = client.max_requests
@@ -1172,11 +1215,15 @@ def _kalshi_codes(gr: Grader) -> dict:
                 gr.error(league, exc)
                 out[league] = "error: %s" % type(exc).__name__
                 continue
-            kept = {}
+            kept, odd = {}, []
             for e in rows:
-                if isinstance(e, dict) and e.get("event_ticker"):
-                    kept[str(e["event_ticker"])] = {k: e.get(k) for k in ("event_ticker", "title", "sub_title")}
-            raw, now = _canon([kept[k] for k in sorted(kept)]), gr.now()
+                row = {k: (e.get(k) if isinstance(e, dict) else None) for k in ("event_ticker", "title", "sub_title")}
+                if row["event_ticker"]:
+                    kept[str(row["event_ticker"])] = row
+                else:
+                    odd.append(row)
+            events = [kept[k] for k in sorted(kept)] + sorted(odd, key=_canon)
+            raw, now = _canon(events), gr.now()
             with gr.store.writing(now) as c:
                 row = c.execute("SELECT id FROM code_tables WHERE league = ? AND sha256 = ?",
                                 (league, _sha(raw))).fetchone()
@@ -1186,8 +1233,8 @@ def _kalshi_codes(gr: Grader) -> dict:
                 if c.execute("SELECT 1 FROM code_fetches WHERE league = ? AND fetched_at = ?",
                              (league, now)).fetchone() is None:
                     c.execute("INSERT INTO code_fetches (league, fetched_at, table_id, events, requests) "
-                              "VALUES (?, ?, ?, ?, ?)", (league, now, tid, len(kept), client.requests - before))
-            out[league] = {"events": len(kept)}
+                              "VALUES (?, ?, ?, ?, ?)", (league, now, tid, len(events), client.requests - before))
+            out[league] = {"events": len(events), "unreadable": _unreadable(events)}
     finally:
         client.max_requests = old
     return out
@@ -1459,17 +1506,64 @@ def _eligible(gr: Grader, rows: Sequence[dict]) -> tuple[list[dict], int]:
     return out, waiting
 
 
+def _test_matched(store: GradingStore) -> dict[str, tuple[str, date]]:
+    """The games any pick of a test-period thread was ever matched to (any fingerprint): {game id: (league, the
+    game's US-Eastern date)}. Before a choice their finals are not stored and their days are not fetched from Kalshi."""
+    out = {}
+    for r in store.rows("SELECT DISTINCT game_id, league, start, thread_date FROM matches WHERE status = 'matched' "
+                        "AND game_id IS NOT NULL AND start IS NOT NULL"):
+        if _period_of(r["thread_date"]) == "test":
+            out[r["game_id"]] = (r["league"], sl.eastern_date(r["start"]))
+    return out
+
+
+def _kalshi_listed(store: GradingStore, kview, game_ids: Iterable[str]) -> set[str]:
+    """The games among `game_ids` that Kalshi lists: an event of a stored code table, or of the stored markets, of
+    the game's league and US-Eastern date whose two teams are the game's two teams by `sports_lines`' name rule
+    (titles and names only; no result is read). Question B waits for Kalshi's result on these."""
+    want = set(game_ids)
+    games = [g for g in schedule_games(store.lists()) if g["id"] in want]
+    if not games:
+        return set()
+    events = []
+    for r in store.rows("SELECT league, raw FROM code_tables ORDER BY id"):
+        for e in _list_body(r["raw"]):
+            pair = _event_codes(e) if isinstance(e, dict) else None
+            day = kh.event_date(str(e.get("event_ticker") or "")) if pair is not None else None
+            if day is not None:
+                events.append({"event": str(e["event_ticker"]), "league": r["league"], "day": day,
+                               "teams": [{"code": c, "name": n, "ticker": ""} for c, n in pair]})
+    series = {s: lg for lg, (_, s) in LEAGUES.items()}
+    by: dict[tuple, list[dict]] = {}
+    for m in kview.markets():
+        lg, ticker = series.get(m.get("series")), m.get("ticker")
+        if lg and ticker:
+            by.setdefault((lg, m.get("event_ticker") or ticker.rsplit("-", 1)[0]), []).append(m)
+    for (lg, event), ms in sorted(by.items()):
+        k = sl.kalshi_event(lg, event, ms)
+        if k["day"] is not None:
+            events.append(k)
+    on: dict[tuple, list[dict]] = {}
+    for k in events:
+        on.setdefault((k["league"], k["day"]), []).append(k)
+    return {g["id"] for g in games
+            if any(sl._ways(k, g, sl._key_match) for k in on.get((g["league"], g["day"]), ()))}
+
+
 def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     """Kalshi's settled markets of the days of the matched games that have started, per league, and the strict
     pairing of `sports_lines.pair_games` (no model). Before a choice no day of the test period is fetched, not even
-    for a development game on it. Errors of one league are recorded and the others go on."""
+    for a development game on it, nor the day of a game a test-period pick is matched to. Errors of one league are
+    recorded and the others go on."""
     out: dict[str, Any] = {}
     games = schedule_games(gr.store.lists())
     by_league: dict[str, set] = {}
     no_choice = gr.store.choice() is None
+    held = set(_test_matched(gr.store).values()) if no_choice else set()
     for r in rows:
         d = sl.eastern_date(r["start"])
-        if _ts(r["start"]) < now.timestamp() and not (no_choice and d >= PERIODS["test"][0]):
+        if _ts(r["start"]) < now.timestamp() and not (no_choice and (d >= PERIODS["test"][0]
+                                                                      or (r["league"], d) in held)):
             by_league.setdefault(r["league"], set()).add(d)
     if not by_league:
         return out
@@ -1579,6 +1673,7 @@ def cmd_results(gr: Grader) -> dict:
         if s + SCORES_AFTER < t < s + FINAL_WITHIN and r["game_id"] not in listed:
             pending[r["league"]] = pending.get(r["league"], 0) + 1
     no_choice_late = gr.store.choice() is None and now >= TEST_CHOICE_CUTOFF
+    held = set(_test_matched(gr.store)) if gr.store.choice() is None else set()
     for league, n in sorted(pending.items()):
         sport = LEAGUES[league][0]
         path, params = f"/v4/sports/{sport}/scores/", {"daysFrom": SCORES_DAYS, "dateFormat": "iso"}
@@ -1596,11 +1691,13 @@ def cmd_results(gr: Grader) -> dict:
                                 lambda s=sport: gr.odds.scores(s, days_from=SCORES_DAYS, key="free", retries=0))
             if not isinstance(body, list):
                 raise oa.OddsApiError("scores answer is not a list")
-            at, raw = gr.now(), _canon(body)
+            kept = [e for e in body if not (isinstance(e, dict) and str(e.get("id")) in held)]
+            at, raw = gr.now(), _canon(kept)
             with gr.store.writing(at) as c:
                 c.execute("INSERT INTO scores (league, fetched_at, sha256, raw) VALUES (?, ?, ?, ?)",
                           (league, at, _sha(raw), raw))
-            out["scores"][league] = {"games_listed": len(body), "picks_waiting": n}
+            out["scores"][league] = {"games_listed": len(kept), "dropped_test_period": len(body) - len(kept),
+                                     "picks_waiting": n}
         except sl.LedgerStop as exc:
             gr.odds_stopped = True
             gr.error(league, exc)
@@ -1783,6 +1880,7 @@ def test_counts(store: GradingStore, kview, fp: str) -> dict:
     a, b = PERIODS["test"]
     rows = [r for r in _rows_of(store, fp, a, b) if r["status"] == "matched"]
     pairs, settled = store.pairs(), _kalshi_settled(kview)
+    listed_k = _kalshi_listed(store, kview, {r["game_id"] for r in rows})
     listed = _finals_listed(store, {r["game_id"]: _ts(r["start"]) for r in rows})
     per_version: dict[int, dict[str, int]] = {}
     for v in VERSIONS:
@@ -1799,7 +1897,8 @@ def test_counts(store: GradingStore, kview, fp: str) -> dict:
     for r in rows:
         p = pairs.get(r["game_id"])
         if _b_pre(r) is None and r["game_id"] in listed and (
-                p is None or (p["home_ticker"] in settled and p["away_ticker"] in settled)):
+                (p is None and r["game_id"] not in listed_k) or
+                (p is not None and p["home_ticker"] in settled and p["away_ticker"] in settled)):
             bdays[r["thread_date"]] = bdays.get(r["thread_date"], 0) + 1
     choice, reached = store.choice(), None
     if choice is not None:
@@ -1840,6 +1939,7 @@ def compute(gr: Grader, period: str, versions: Sequence[int], end: date | None =
     now = gr.clock()
     pairs, kres = gr.store.pairs(), _kalshi_results(gr.kstore)
     finals = _finals(gr.store, {r["game_id"]: _ts(r["start"]) for r in matched})
+    listed_k = _kalshi_listed(gr.store, gr.kstore, {r["game_id"] for r in matched})
     out: dict[str, Any] = {"period": period, "start": a.isoformat(), "end": b.isoformat(), "fingerprint": gr.fp,
                            "seed": SEED, "reps": REPS, "picks": len(rows), "by_outcome": dict(sorted(reasons.items())),
                            "A": {}, "B": {}}
@@ -1886,7 +1986,8 @@ def compute(gr: Grader, period: str, versions: Sequence[int], end: date | None =
             g = {"reason": "test_waits_for_choice"}
         else:
             p = pairs.get(r["game_id"])
-            g = grade_b(r, finals.get(r["game_id"]), _kalshi_winner(p, kres), p is not None)
+            g = grade_b(r, finals.get(r["game_id"]), _kalshi_winner(p, kres),
+                        p is not None or r["game_id"] in listed_k)
             if g.get("reason") == "no_score":
                 g = {"reason": _no_final(r["start"], now)}
         if "reason" in g:
@@ -1937,13 +2038,23 @@ def cmd_evaluate(gr: Grader, period: str, code_changed: str | None = None) -> di
     gr.need_gate()
     gr.need_current()
     counts = test_counts(gr.store, gr.kstore, gr.fp)
-    today, last = gr.clock().astimezone(ET).date(), PERIODS["test"][1]
-    if counts["reached_on"] is None and today < last:
-        v = counts["versions"][str(choice)]
-        raise Refused("the test period is scored once, at the end: the counts are not reached (Question A, version %d: "
-                      "%d contracts on %d days of %d on %d; Question B: %d graded of %d) and %s US-Eastern has not "
-                      "come; nothing was read or scored" % (choice, v["contracts"], v["days"], END_A_COUNT, A_DAYS,
-                                                            counts["B_graded"], END_B_COUNT, last.isoformat()))
+    now_t, last = gr.clock(), PERIODS["test"][1]
+    if counts["reached_on"] is None:
+        opens = datetime.combine(TEST_SCORED_FROM, dtime(0), tzinfo=ET)
+        if now_t < opens:
+            v = counts["versions"][str(choice)]
+            raise Refused("the test period is scored once, when its games are over: the counts are not reached "
+                          "(Question A, version %d: %d contracts on %d days of %d on %d; Question B: %d graded of %d) "
+                          "and %s 00:00 US-Eastern has not come; nothing was read or scored"
+                          % (choice, v["contracts"], v["days"], END_A_COUNT, A_DAYS, counts["B_graded"], END_B_COUNT,
+                             TEST_SCORED_FROM.isoformat()))
+    else:
+        reached = date.fromisoformat(counts["reached_on"])
+        opens = datetime.combine(reached + timedelta(days=SCORE_WAIT_DAYS), dtime(0), tzinfo=ET)
+        if now_t < opens:
+            raise Refused("the counts were reached on %s; the test is scored four days after that date, from %s "
+                          "US-Eastern, when its games are over (clarification 21); nothing was read or scored"
+                          % (reached.isoformat(), opens.isoformat()))
     end = date.fromisoformat(counts["reached_on"]) if counts["reached_on"] else last
     change = None
     if pinned != now_fp:
@@ -2004,6 +2115,7 @@ def status(store: GradingStore, fp: str, kview) -> dict:
                 "SELECT league, COUNT(*) AS n FROM schedules GROUP BY league ORDER BY league")},
             "code_tables": n("SELECT COUNT(*) FROM code_tables"), "code_fetches": {r["league"]: r["at"] for r in store.rows(
                 "SELECT league, MAX(fetched_at) AS at FROM code_fetches GROUP BY league ORDER BY league")},
+            "code_readability": store.code_readability(),
             "bound": store.bound(), "scoring_pin": store.scoring_pin(), **readings(store),
             "games": len(schedule_games(store.lists())), "picks": len(latest), "by_outcome": dict(sorted(outcome.items())),
             "audits": n("SELECT COUNT(*) FROM audits"), "audit_passes": n("SELECT COUNT(*) FROM audit_passes"),
