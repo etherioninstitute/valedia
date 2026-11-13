@@ -149,3 +149,41 @@ def test_the_weekly_review_says_where_each_strategy_stands_against_holding_its_f
     review = cr.weekly_review(ledger, journal, pd.Timestamp("2026-11-12"), {hid: "mom"}, limits, apply=False)
     line = next(text for text in review["findings"] if "holding its funds" in text)
     assert "mom" in line and "112" in line and "640" in line and "3 days" in line and "too few" in line
+
+
+# ---- T20 rev 2: a review of a journal with a skipped line says so and decides nothing in the safer direction
+
+def _torn(journal, day):
+    with (journal.dir / f"{pd.Timestamp(day).date()}.jsonl").open("a") as fh:
+        fh.write('{"type": "summary", "strategy_value_change": {"mom": -90')
+
+
+def test_a_review_with_a_skipped_line_says_so_first_is_marked_incomplete_and_promotes_nothing(desk):
+    ledger, journal, limits, hid = desk
+    rng = np.random.default_rng(1)
+    days = summaries(journal, "2026-09-01", (0.0006 + 0.003 * rng.standard_normal(25)).tolist())
+    _torn(journal, days[10])
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    first = (journal.dir / f"review-{days[-1].date()}.md").read_text().splitlines()[0]
+    assert "INCOMPLETE" in first and f"{days[10].date()}.jsonl line" in first
+    assert out["incomplete"] is True and out["skipped_lines"] == [{"file": f"{days[10].date()}.jsonl", "line": 2}]
+    assert ledger.get(hid)["status"] == "passed backtest only"                       # the same journal, undamaged, promotes (above)
+    assert any("no reason to pause" in f and "cannot say" in f for f in out["findings"])
+    assert out["findings"][0].startswith("INCOMPLETE")
+
+
+def test_a_review_with_a_skipped_line_still_orders_the_pause_it_can_justify(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [-0.03, -0.03, -0.02])
+    _torn(journal, days[0])
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "paused" and out["incomplete"] is True
+    assert not any("cannot say" in f for f in out["findings"] if "PAUSE" in f)
+
+
+def test_a_review_of_a_clean_journal_is_not_marked_incomplete(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [0.001, -0.002, 0.0005])
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert out["incomplete"] is False and out["skipped_lines"] == []
+    assert (journal.dir / f"review-{days[-1].date()}.md").read_text().startswith("# Critic's review")

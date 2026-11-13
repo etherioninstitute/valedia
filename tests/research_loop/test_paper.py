@@ -850,3 +850,55 @@ def test_tripping_the_latch_with_nothing_there_still_writes_it_once(setup):
         t.step(crash.iloc[: k + 1], {7: s})
     assert json.loads(t.latch_file.read_text())["drawdown_pct"] >= 3.0 and not t.latch_file.is_symlink()
     assert [e["decision"] for e in t.journal.read() if e["type"] == "kill_switch"] == ["latched"]
+
+
+# ---- T20 rev 2: a skipped line is never silent where a figure needs every entry
+
+def _torn_after_a_buy(directory):
+    j = pp.Journal(directory)
+    j.write("2026-03-02", {"type": "fill", "symbol": "XLE", "units": 10, "price": 100.0, "fee": 0.0, "strategy": "s"})
+    with (directory / "2026-03-03.jsonl").open("w") as fh:
+        fh.write('{"type": "fill", "day": "2026-03-03", "symbol": "XLE", "units": -10, "price": 9')       # the sale, cut short
+    return j
+
+
+def test_read_complete_names_the_file_and_line_of_a_skipped_line_and_never_its_text(tmp_path):
+    j = _torn_after_a_buy(tmp_path / "journal")
+    with pytest.raises(pp.JournalDamaged) as err:
+        j.read_complete()
+    text = str(err.value)
+    assert isinstance(err.value, ValueError) and "2026-03-03.jsonl line 1" in text and "\n" not in text
+    assert "XLE" not in text and "units" not in text and err.value.skipped == [{"file": "2026-03-03.jsonl", "line": 1}]
+    assert [e["day"] for e in j.read_complete(until="2026-03-02")] == ["2026-03-02"]       # a clean stretch reads as before
+
+
+def test_a_torn_sell_line_makes_the_paper_trader_mark_tax_unavailable_and_say_why(setup, tmp_path):
+    _torn_after_a_buy(tmp_path / "damaged")
+    t = pp.PaperTrader(tmp_path / "damaged", setup[1], halt_file=None, tax_rules=RULES)
+    assert t.tax_ledger is None
+    assert t.tax_unavailable.startswith("the tax ledger could not take a fill: ")
+    assert "2026-03-03.jsonl line 1" in t.tax_unavailable and "XLE" not in t.tax_unavailable
+    px = prices()
+    out = t.step(px.iloc[:12], {7: strat()})
+    assert out["tax"] == {"unavailable": t.tax_unavailable}
+
+
+def test_the_days_summary_counts_skipped_lines_of_the_last_30_days_only_when_there_are_some(setup, tmp_path):
+    px, s = prices(), strat()
+    clean = pp.PaperTrader(tmp_path / "clean", setup[1], halt_file=None)
+    assert "skipped_journal_lines" not in clean.step(px.iloc[:12], {7: s})
+    t = pp.PaperTrader(tmp_path / "damaged", setup[1], halt_file=None)
+    near, far = str(px.index[5].date()), str(px.index[11].date() - pd.Timedelta(days=60))
+    (t.dir / f"{near}.jsonl").write_text('{"type": "note", "n": 1}\n{"type": "no\n')
+    (t.dir / f"{far}.jsonl").write_text('{"type": "no\n')                                   # too old to count
+    out = t.step(px.iloc[:12], {7: s})
+    assert out["skipped_journal_lines"] == 1
+    assert [e["skipped_journal_lines"] for e in t.journal.read() if e["type"] == "summary"] == [1]
+
+
+def test_reset_latch_on_a_directory_says_it_is_a_directory(setup):
+    t = _tripped(setup)
+    t.latch_file.mkdir(parents=True)
+    with pytest.raises(pp.LatchResetError) as err:
+        t.reset_latch("burton", "2026-03-02")
+    assert "directory" in str(err.value) and str(t.latch_file) in str(err.value) and "\n" not in str(err.value)

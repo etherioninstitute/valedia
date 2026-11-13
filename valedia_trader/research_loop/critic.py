@@ -22,7 +22,7 @@ import pandas as pd
 
 from valedia_trader.research_loop import risk_gate
 from valedia_trader.research_loop.ledger import HypothesisLedger
-from valedia_trader.research_loop.paper import Journal
+from valedia_trader.research_loop.paper import Journal, describe_skipped
 
 __all__ = ["CriticRules", "weekly_review"]
 
@@ -86,8 +86,15 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     as_of = pd.Timestamp(as_of)
     since = as_of - pd.Timedelta(days=days - 1)
     everything = journal.read(until=as_of)
+    skipped = [dict(s) for s in getattr(journal, "skipped_lines", [])]
+    incomplete = bool(skipped)
     week = [e for e in everything if e["day"] >= str(since.date())]
     findings: list[tuple[int | None, str]] = []
+    incomplete_text = (f"INCOMPLETE REVIEW: {len(skipped)} journal line{'s' if len(skipped) != 1 else ''} could not be read "
+                       f"({describe_skipped(skipped)}). The figures below leave out whatever was on them: no strategy is promoted "
+                       "and none is called free of reason to pause; a pause the readable entries justify is still ordered.")
+    if incomplete:
+        findings.append((None, incomplete_text))
 
     # ---- audit of the kill switch
     try:
@@ -194,7 +201,7 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
             if apply and status not in ("paused", "failed", "retired"):
                 ledger.set_status(hid, "paused", pause, "critic")
                 status = "paused"
-        elif (status == "passed backtest only" and n >= rules.promote_days and math.isfinite(z) and z >= rules.promote_min_z
+        elif (not incomplete and status == "passed backtest only" and n >= rules.promote_days and math.isfinite(z) and z >= rules.promote_min_z
               and live_total > 0):
             notes.append(f"{name} has held up for {n} paper days (z {_fmt(z, False)} against its backtest).")
             if apply:
@@ -202,7 +209,11 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                 status = "passed paper"
         elif n < rules.min_days_to_judge:
             notes.append(f"{name} has {n} paper days. That is too few to judge; the bar is {rules.min_days_to_judge}.")
+        if incomplete and not pause:
+            notes.append(f"{name}: the journal is missing entries, so this review cannot say there is no reason to pause it.")
         result["status"] = status
+        if incomplete:
+            result["incomplete"] = True
         ledger.record_paper(hid, {**result, "as_of": str(as_of.date())})
         for note in notes:
             findings.append((hid, note))
@@ -211,7 +222,7 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     for hid, text in findings:
         ledger.add_lesson(hid, text, "critic")
 
-    lines = [f"# Critic's review, {since.date()} to {as_of.date()}", ""]
+    lines = ([f"**{incomplete_text}**", ""] if incomplete else []) + [f"# Critic's review, {since.date()} to {as_of.date()}", ""]
     urgent = [t for _, t in findings if t.startswith("KILL SWITCH FAILURE")]
     if urgent:
         lines += ["## Fix first", ""] + [f"- {t}" for t in urgent] + [""]
@@ -237,4 +248,5 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
             body += f"\n(The narrator failed: {type(exc).__name__}.)\n"
     path = journal.dir / f"review-{as_of.date()}.md"
     path.write_text(body)
-    return {"path": str(path), "findings": [t for _, t in findings], "strategies": per_strategy, "kill_switch_failures": len(escaped)}
+    return {"path": str(path), "findings": [t for _, t in findings], "strategies": per_strategy, "kill_switch_failures": len(escaped),
+            "incomplete": incomplete, "skipped_lines": skipped}

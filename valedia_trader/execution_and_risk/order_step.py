@@ -29,9 +29,10 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  journal write happens under the lock, after the journal scan.
     journal      every journal file is read line by line before any venue call. A torn last line of the newest file
                  (a crash mid-write) is skipped, recorded once and reported in the summary (`torn_lines`); a torn
-                 line anywhere else stops the run. The torn line stays in the file, and the journal's other readers
-                 (Journal.read, used by the weekly critic and the tax notes) still stop on it; that repair belongs to
-                 paper.py, in a later ticket.
+                 line anywhere else stops the run. The torn line stays in the file. The journal's other readers
+                 (Journal.read) skip it and list it in `skipped_lines`; the tax notes and the tax command refuse to
+                 compute from it, the weekly critic marks its review incomplete, and Journal.write starts the next
+                 entry on a new line.
  2. session      inside the regular session of a trading day, SESSION_AFTER_OPEN after the open to
                  SESSION_BEFORE_CLOSE before the close (09:35 to 15:45 New York time on a full day; earlier on a
                  half-day), from the exchange calendar. Outside it nothing is read from the venue.

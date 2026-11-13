@@ -114,3 +114,25 @@ def test_a_halt_or_latch_file_that_is_not_plainly_absent_is_seen(tmp_path, monke
     os.symlink(p.journal / "nowhere" if how == "dangling link" else latch, latch)
     status, detail = D.check_kill_switch(p)
     assert status == D.ATTENTION and "latch is set" in detail
+
+
+# ---- T20 rev 2: damaged journal lines among the checks
+
+def test_the_journal_check_reports_damaged_lines_of_the_last_30_days_by_file_and_line(tmp_path):
+    p = _paths(tmp_path)
+    assert D.check_journal(p)[0] == D.OK and "journal" in D.CHECKS
+    today = pd.Timestamp.now().normalize()
+    near, far = (today - pd.Timedelta(days=5)).date(), (today - pd.Timedelta(days=60)).date()
+    (p.journal / f"{near}.jsonl").write_text('{"type": "note"}\n{"type": "no\n[1]\n')
+    (p.journal / f"{far}.jsonl").write_text('{"type": "no\n')                       # older than 30 days: not looked at
+    status, detail = D.check_journal(p)
+    assert status == D.ATTENTION and "2 damaged" in detail and f"{near}.jsonl line 2" in detail and f"{near}.jsonl line 3" in detail
+    assert str(far) not in detail and "type" not in detail
+
+
+def test_the_journal_check_on_a_clean_journal_is_ok_and_creates_nothing(tmp_path):
+    p = LoopPaths(tmp_path)
+    assert D.check_journal(p)[0] == D.OK and not p.journal.exists()
+    p.journal.mkdir()
+    (p.journal / f"{pd.Timestamp.now().date()}.jsonl").write_text('{"type": "note"}\n')
+    assert D.check_journal(p) == (D.OK, "no damaged lines in the last 30 days")

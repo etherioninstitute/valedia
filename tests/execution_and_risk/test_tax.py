@@ -520,3 +520,23 @@ def test_a_check_can_see_fills_placed_before_it_the_same_day():
     # the earlier same-day buy of 4 replaces 4 of the 10 loss units: 80 disallowed, 120 still at risk
     assert c["disallowed_loss"] == pytest.approx(80) and c["wash_sale"]["loss_at_risk"] == pytest.approx(120)
     assert c["held_units"] == pytest.approx(14)
+
+
+# ---- T20 rev 2: no figure from a journal with a skipped line
+
+def _journal_with_a_buy_and_a_torn_sell(tmp_path):
+    j = Journal(tmp_path)
+    j.write("2025-01-02", {"type": "fill", "symbol": "XLE", "units": 10, "price": 100.0, "fee": 0.0, "strategy": "s"})
+    (tmp_path / "2025-06-02.jsonl").write_text('{"type": "fill", "day": "2025-06-02", "symbol": "XLE", "units": -10, "pri')
+
+
+@pytest.mark.parametrize("argv", [["report", "--period", "2025", "--as-of", "2025-06-05"],
+                                  ["check", "--symbol", "XLE", "--side", "buy", "--units", "4", "--day", "2025-06-12"],
+                                  ["check", "--symbol", "XLE", "--side", "sell", "--units", "4", "--price", "90", "--day", "2025-06-12"]])
+def test_the_command_line_computes_nothing_from_a_journal_with_a_skipped_line(tmp_path, capsys, argv):
+    _journal_with_a_buy_and_a_torn_sell(tmp_path)
+    assert tax.main([argv[0], "--journal", str(tmp_path), *argv[1:]]) == 2
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert captured.out == "" and len(lines) == 1 and lines[0].startswith("tax: ")
+    assert "2025-06-02.jsonl line 1" in lines[0] and "XLE" not in lines[0] and "units" not in lines[0]

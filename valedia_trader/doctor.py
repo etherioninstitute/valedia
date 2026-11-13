@@ -85,6 +85,22 @@ def check_kill_switch(paths: LoopPaths) -> tuple[str, str]:
     return (OK, "armed; an order with no limits supplied is refused") if blocked is False else (FAIL, "an order with no limits was allowed")
 
 
+def check_journal(paths: LoopPaths) -> tuple[str, str]:
+    """Lines of the journal files of the last 30 days that are not complete entries (a crash in the middle of a write, or
+    damage): the tax notes and the weekly review stop trusting a journal with such a line. Nothing is created."""
+    from valedia_trader.research_loop.paper import DAMAGE_WINDOW_DAYS, Journal, describe_skipped
+    if not paths.journal.is_dir():
+        return OK, "no journal yet"
+    journal = Journal(paths.journal)
+    journal.read(since=pd.Timestamp.now().normalize() - pd.Timedelta(days=DAMAGE_WINDOW_DAYS))
+    skipped = journal.skipped_lines
+    if not skipped:
+        return OK, f"no damaged lines in the last {DAMAGE_WINDOW_DAYS} days"
+    return ATTENTION, (f"{len(skipped)} damaged line{'s' if len(skipped) != 1 else ''} in the last {DAMAGE_WINDOW_DAYS} days "
+                       f"({describe_skipped(skipped)}); tax figures are unavailable and the weekly review is marked incomplete "
+                       "until a person repairs or removes them")
+
+
 def check_quant_sheet(paths: LoopPaths) -> tuple[str, str]:
     from valedia_trader.quant_engine.wiring import summary
     s = summary()
@@ -238,7 +254,7 @@ def check_repo(paths: LoopPaths) -> tuple[str, str]:
 
 CHECKS: dict[str, Callable[..., tuple[str, str]]] = {
     "price history": check_data, "hypothesis ledger": check_ledger, "risk limits": check_risk_limits, "kill switch": check_kill_switch,
-    "quant sheet": check_quant_sheet, "team": check_team, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
+    "journal": check_journal, "quant sheet": check_quant_sheet, "team": check_team, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
     "research desk": check_desk, "schedules": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
 }
 

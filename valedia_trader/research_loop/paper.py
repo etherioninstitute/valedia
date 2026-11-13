@@ -84,12 +84,31 @@ def tax_buy_note(c: dict, day: str) -> dict:
             "clean_from": c["clean_from"], "effect": effect + ".", "unverified_rules": c["unverified_rules"], "note": c["note"]}
 
 
+DAMAGE_WINDOW_DAYS = 30                               # how far back the owner is told about damaged journal lines
+
+
 class VenueError(RuntimeError):
     pass
 
 
 class LatchResetError(RuntimeError):
     """The drawdown latch is there and cannot be removed (a directory, no permission, ...)."""
+
+
+def describe_skipped(skipped: list[dict], limit: int = 8) -> str:
+    """`2026-03-02.jsonl line 2, 2026-03-03.jsonl line 1`: where the skipped lines are, never what is on them."""
+    text = ", ".join(f"{s['file']} line {s['line']}" for s in skipped[:limit])
+    return text + (f", and {len(skipped) - limit} more" if len(skipped) > limit else "")
+
+
+class JournalDamaged(ValueError):
+    """A journal has lines that are not complete entries, and the caller needs every entry for what it computes."""
+
+    def __init__(self, skipped: list[dict]) -> None:
+        self.skipped = [dict(s) for s in skipped]
+        n = len(self.skipped)
+        super().__init__(f"the journal has {n} line{'s' if n != 1 else ''} that {'are' if n != 1 else 'is'} not a complete entry "
+                         f"({describe_skipped(self.skipped)}); nothing that needs every entry is computed from it")
 
 
 class Journal:
@@ -139,6 +158,14 @@ class Journal:
                     else:
                         skipped.append({"file": path.name, "line": number})
         self.skipped_lines = skipped
+        return out
+
+    def read_complete(self, since=None, until=None) -> list[dict]:
+        """`read`, for a caller whose figures need every entry: raises JournalDamaged (a ValueError naming each skipped
+        line's file and number) when `read` skipped any line."""
+        out = self.read(since=since, until=until)
+        if self.skipped_lines:
+            raise JournalDamaged(self.skipped_lines)
         return out
 
 
@@ -236,7 +263,7 @@ class PaperTrader:
         if tax_rules is not None:
             try:
                 from valedia_trader.execution_and_risk.tax import TaxLedger
-                self.tax_ledger = TaxLedger.from_fills(self.journal.read(), tax_rules)
+                self.tax_ledger = TaxLedger.from_fills(self.journal.read_complete(), tax_rules)
             except Exception as exc:
                 self.tax_unavailable = f"the tax ledger could not take a fill: {exc}"
 
@@ -505,6 +532,9 @@ class PaperTrader:
                    "benchmark_values": self._benchmark_values(prices, strategies, share)}
         if self.tax_rules is not None:
             summary["tax"] = self._tax_block(day)
+        self.journal.read(since=day - pd.Timedelta(days=DAMAGE_WINDOW_DAYS))      # only to learn what it cannot read
+        if self.journal.skipped_lines:                    # visible to the owner: lines the journal could not read
+            summary["skipped_journal_lines"] = len(self.journal.skipped_lines)
         self.state["history"].append(summary)
         self.state["last_day"] = str(day.date())
         self.journal.write(day, {"type": "summary", **summary})
@@ -560,6 +590,9 @@ class PaperTrader:
         except FileNotFoundError:
             return False                                         # gone between the check and the removal
         except (OSError, ValueError) as exc:
+            if self.latch_file.is_dir() and not self.latch_file.is_symlink():      # macOS reports this one as a permission error
+                raise LatchResetError(f"the drawdown latch {self.latch_file} is a directory, not a latch file; "
+                                      "nothing was cleared; remove it by hand") from exc
             raise LatchResetError(f"the drawdown latch {self.latch_file} is there and cannot be removed "
                                   f"({type(exc).__name__}); remove it by hand") from exc
         self.state["peak_equity"] = self.state["history"][-1]["equity"] if self.state["history"] else self.state["starting_cash"]

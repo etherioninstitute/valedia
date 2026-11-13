@@ -496,7 +496,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     from valedia_trader.research_loop.paper import Journal       # the journal's reader; imported only when needed
     try:
-        led = TaxLedger.from_fills(Journal(args.journal).read(), TaxRules.load())
+        led = TaxLedger.from_fills(Journal(args.journal).read_complete(), TaxRules.load())   # JournalDamaged is a ValueError: exit 2, no figure
         if args.cmd == "report":
             today = _today()
             as_of = _day(args.as_of) if args.as_of else (today if led.last_day is None or today > led.last_day else led.last_day)
