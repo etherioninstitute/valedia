@@ -177,6 +177,25 @@ environment, a strategy has a paper record, and the order-handling code has been
 family or you have waived that. As of 2026-11-13 two strategies have passed their backtests and sealed tests; the
 paper record is days old.
 
+## Event contracts: the Events account trades Kalshi's markets (seen 2026-11-13, test environment)
+
+Webull's documents never name the exchange behind its event contracts. A read-only probe
+(`python -m valedia_trader.venues.webull_events probe --out <file outside the repository>`; instrument lists only,
+no price, order or account call) compared Webull's lists with Kalshi's public list:
+
+| Series | Kalshi open markets | Listed by Webull as tradable under the same ticker |
+| --- | --- | --- |
+| NBA games (KXNBAGAME) | 64 | 64 |
+| NFL games (KXNFLGAME) | 52 | 52 |
+| NHL games (KXNHLGAME) | 98 | 98 |
+| College football, men's college basketball | 506 and 354 | 298 each of the first 300 read (the probe's page cap stopped the read) |
+
+The only markets Webull listed that Kalshi's open list did not were the previous day's games, marked not tradable.
+Webull listed more than 2,000 series in eleven categories (sports 931, elections 495, politics 162, entertainment
+142, financials 117 among them). Price step: one cent. So the tickers are Kalshi's, prices and history can be
+read from Kalshi's public feed, and orders would go through the Events Cash account. Event orders are not built:
+the adapter refuses them.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,
