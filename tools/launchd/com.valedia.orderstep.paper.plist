@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.valedia.orderstep.paper</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>S=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-deploy/orderstep-paper.sh
+if [ ! -f "$S" ]; then echo "=== $(date '+%F %T') SSD not mounted; nothing was run"; exit 1; fi
+exec /bin/zsh "$S"</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/burtonchatelain/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-orderstep-paper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-orderstep-paper.log</string>
+</dict>
+</plist>

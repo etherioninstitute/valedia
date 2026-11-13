@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.valedia.orderbook-collector</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>REPO=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader
+D=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-deploy/collector
+echo "=== $(date '+%F %T') order-book collector starting"
+if [ ! -x "$REPO/.venv/bin/python" ] || [ ! -d "$D/valedia_trader" ]; then echo "SSD not mounted or the pinned copy is missing; will try again in a minute"; exit 1; fi
+cd "$D" || exit 1
+export PYTHONPATH="$D" PYTHONDONTWRITEBYTECODE=1
+exec "$REPO/.venv/bin/python" -m valedia_trader.research_loop.orderbook_loop collect --db "$REPO/memory/orderbook_loop.sqlite"</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/burtonchatelain/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-orderbook-collector.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-orderbook-collector.log</string>
+</dict>
+</plist>

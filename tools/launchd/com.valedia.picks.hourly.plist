@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.valedia.picks.hourly</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>S=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-deploy/picks-hourly.sh
+if [ ! -f "$S" ]; then echo "=== $(date '+%F %T') SSD not mounted; nothing was run"; exit 1; fi
+exec /bin/zsh "$S"</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/burtonchatelain/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>7</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-picks-hourly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/burtonchatelain/Library/Logs/valedia-picks-hourly.log</string>
+</dict>
+</plist>
