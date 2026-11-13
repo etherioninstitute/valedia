@@ -633,3 +633,220 @@ def test_wanted_units_after_a_real_step_match_the_book_and_the_orders(setup):
         held = t.state["positions"]["mom_paper"][sym]["units"]
         pending = sum(o["units"] for o in t.state["pending"] if o["symbol"] == sym)
         assert wanted.get(sym, 0.0) == pytest.approx(held + pending)
+
+
+# ---- T20: a torn journal line stops no reader; a write never glues onto it
+
+def _journal_file(directory, day="2026-03-02"):
+    return directory / f"{day}.jsonl"
+
+
+def test_journal_read_skips_a_line_cut_short_and_never_raises(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    j.write("2026-03-02", {"type": "note", "n": 1})
+    with _journal_file(j.dir).open("a") as fh:
+        fh.write('{"type": "note", "n": 2, "reasoning": "cut sho')           # a kill in the middle of a write
+    assert [e["n"] for e in j.read()] == [1]
+
+
+def test_journal_remembers_what_it_skipped_by_file_and_line_never_the_text(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    j.write("2026-03-02", {"type": "note", "n": 1})
+    path = _journal_file(j.dir)
+    path.write_text(path.read_text() + '{"n": 2, "x": "Zq-TEXT-OF-THE-TORN-LINE\n\n' + json.dumps({"n": 3}) + "\n[1, 2]\n12\nnot json\n")
+    assert [e["n"] for e in j.read()] == [1, 3]
+    assert j.skipped_lines == [{"file": "2026-03-02.jsonl", "line": 2}, {"file": "2026-03-02.jsonl", "line": 5},
+                               {"file": "2026-03-02.jsonl", "line": 6}, {"file": "2026-03-02.jsonl", "line": 7}]
+    assert "Zq" not in json.dumps(j.skipped_lines)
+    assert j.read(since="2026-03-03") == [] and j.skipped_lines == []               # what it remembers is the last read's
+
+
+def test_journal_read_skips_bytes_that_are_not_text(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    j.write("2026-03-02", {"type": "note", "n": 1})
+    with _journal_file(j.dir).open("ab") as fh:
+        fh.write(b'{"n": 2, "x": "\xff\xfe\x80"}\n\x00\x00\x00\n' + b"[" * 100_000 + b"\n")
+    j.write("2026-03-02", {"type": "note", "n": 4})
+    assert [e["n"] for e in j.read()] == [1, 4] and [s["line"] for s in j.skipped_lines] == [2, 3, 4]
+
+
+def test_journal_write_after_a_torn_last_line_starts_on_a_new_line(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    j.write("2026-03-02", {"type": "note", "n": 1})
+    with _journal_file(j.dir).open("a") as fh:
+        fh.write('{"type": "note", "n": 2, "reaso')
+    j.write("2026-03-02", {"type": "note", "n": 3})
+    j.write("2026-03-02", {"type": "note", "n": 4})
+    lines = _journal_file(j.dir).read_text().split("\n")
+    assert lines[1] == '{"type": "note", "n": 2, "reaso' and json.loads(lines[2])["n"] == 3 and lines[-1] == ""
+    assert [e["n"] for e in j.read()] == [1, 3, 4] and j.skipped_lines == [{"file": "2026-03-02.jsonl", "line": 2}]
+
+
+def test_journal_write_adds_no_blank_line_to_a_clean_file_or_a_new_one(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    for n in range(3):
+        j.write("2026-03-02", {"type": "note", "n": n})
+    text = _journal_file(j.dir).read_text()
+    assert text.count("\n") == 3 and "\n\n" not in text and j.skipped_lines == []
+
+
+def test_journal_entries_that_are_valid_come_back_exactly_and_in_order(tmp_path):
+    j = pp.Journal(tmp_path / "journal")
+    written = [j.write(d, {"type": "note", "n": n, "text": "café   line", "nested": {"a": [1, 2.5, None]}})
+               for n, d in enumerate(["2026-03-03", "2026-03-02", "2026-03-02", "2026-03-04"])]
+    by_day = sorted(written, key=lambda r: r["day"])                                # files in date order, lines in write order
+    assert j.read() == by_day and j.skipped_lines == []
+    assert j.read(since="2026-03-03", until="2026-03-03") == [r for r in written if r["day"] == "2026-03-03"]
+
+
+@pytest.mark.parametrize("seed", range(320))
+def test_journal_survives_kills_in_the_middle_of_write_and_torn_lines_anywhere(tmp_path, seed):
+    """Seeded: 320 journals. Random entries over three days; some writes are cut at a random byte (a kill), some
+    junk lines are put in at random places. Every complete entry comes back, in order, and nothing raises."""
+    rng = np.random.default_rng(seed)
+    j = pp.Journal(tmp_path / "journal")
+    expected: dict[str, list[int]] = {}
+    for n in range(int(rng.integers(1, 14))):
+        day = f"2026-03-0{int(rng.integers(2, 5))}"
+        path = _journal_file(j.dir, day)
+        before = path.read_bytes() if path.exists() else b""
+        word = "".join(rng.choice(list("abc {}[]\":,\\\n\u00e9")) for _ in range(int(rng.integers(0, 30))))
+        j.write(day, {"type": "note", "n": n, "word": word})
+        appended = path.read_bytes()[len(before):]                                  # what this write put on the file
+        roll = rng.random()
+        if roll < 0.35:                                                             # killed part-way through this write
+            cut = int(rng.integers(0, len(appended)))                               # keeps 0 .. all but the final newline
+            path.write_bytes(before + appended[:cut])
+            lead = 1 if appended.startswith(b"\n") else 0
+            if cut - lead >= len(appended) - lead - 1:                              # the whole record, only its newline lost
+                expected.setdefault(day, []).append(n)
+        else:
+            expected.setdefault(day, []).append(n)
+            if roll < 0.55:                                                         # junk put in after it, with or without a newline
+                with path.open("ab") as fh:
+                    fh.write(bytes(rng.integers(0, 256, int(rng.integers(1, 12)), dtype=np.uint8)).replace(b"\n", b"") +
+                             (b"\n" if rng.random() < 0.5 else b""))
+    out = j.read()
+    assert [e["n"] for e in out] == [n for day in sorted(expected) for n in expected[day]]
+    assert all(set(s) == {"file", "line"} for s in j.skipped_lines)
+    assert [e["n"] for e in pp.Journal(j.dir).read()] == [e["n"] for e in out]       # a new object reads the same
+
+
+# ---- T20: reset_latch clears a latch that is a link, and says so when it cannot
+
+def _tripped(setup):
+    t = trader(setup)
+    t.state["history"] = [{"day": "2026-03-02", "equity": 90_000.0, "capital_per_strategy": 90_000.0}]
+    t.state["peak_equity"] = 120_000.0
+    return t
+
+
+def test_reset_latch_removes_a_dangling_link_as_a_link(setup, tmp_path):
+    t = _tripped(setup)
+    t.dir.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "nowhere.json"
+    t.latch_file.symlink_to(target)
+    assert not t.latch_file.exists() and rg.file_is_there(t.latch_file)           # the gate blocks on it
+    assert t.reset_latch("burton", "2026-03-02") is True
+    assert not t.latch_file.is_symlink() and not target.exists()                   # the link is gone, nothing was made at its end
+    assert t.state["peak_equity"] == 90_000.0
+    assert [e["decision"] for e in t.journal.read() if e["type"] == "kill_switch"] == ["reset"]
+
+
+def test_reset_latch_removes_a_link_loop(setup):
+    t = _tripped(setup)
+    t.dir.mkdir(parents=True, exist_ok=True)
+    other = t.dir / "loop-b"
+    other.symlink_to(t.latch_file)
+    t.latch_file.symlink_to(other)
+    assert t.reset_latch("burton", "2026-03-02") is True
+    assert not t.latch_file.is_symlink() and other.is_symlink()                    # only the latch is removed
+
+
+def test_reset_latch_never_deletes_what_a_link_points_to(setup, tmp_path):
+    t = _tripped(setup)
+    t.dir.mkdir(parents=True, exist_ok=True)
+    precious = tmp_path / "precious.json"
+    precious.write_text("keep me")
+    t.latch_file.symlink_to(precious)
+    assert t.reset_latch("burton", "2026-03-02") is True
+    assert precious.read_text() == "keep me" and not t.latch_file.is_symlink()
+
+
+def test_reset_latch_on_a_plain_file_still_clears_it_and_on_nothing_returns_false(setup):
+    t = _tripped(setup)
+    t.dir.mkdir(parents=True, exist_ok=True)
+    t.latch_file.write_text("{}")
+    assert t.reset_latch("burton", "2026-03-02") is True and not rg.file_is_there(t.latch_file)
+    assert t.reset_latch("burton", "2026-03-02") is False
+
+
+def test_reset_latch_that_is_a_directory_raises_a_clear_error_naming_the_path(setup):
+    t = _tripped(setup)
+    t.latch_file.mkdir(parents=True)
+    (t.latch_file / "inside").write_text("x")
+    with pytest.raises(pp.LatchResetError) as err:
+        t.reset_latch("burton", "2026-03-02")
+    assert str(t.latch_file) in str(err.value) and t.latch_file.is_dir() and (t.latch_file / "inside").exists()
+    assert t.state["peak_equity"] == 120_000.0 and [e for e in t.journal.read() if e["type"] == "kill_switch"] == []
+
+
+def test_reset_latch_with_no_permission_to_remove_raises_a_clear_error_naming_the_path(setup):
+    t = _tripped(setup)
+    t.dir.mkdir(parents=True, exist_ok=True)
+    t.latch_file.write_text("{}")
+    t.dir.chmod(0o500)
+    try:
+        with pytest.raises(pp.LatchResetError) as err:
+            t.reset_latch("burton", "2026-03-02")
+    finally:
+        t.dir.chmod(0o700)
+    assert str(t.latch_file) in str(err.value) and t.latch_file.exists() and t.state["peak_equity"] == 120_000.0
+
+
+# ---- T20 (second round): tripping the latch never writes through what is already at the latch path
+
+@pytest.mark.parametrize("how", ["dangling link", "link loop", "plain file", "directory"])
+def test_tripping_the_latch_never_follows_or_replaces_what_is_already_there(setup, tmp_path, how):
+    setup[1].write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 3.0, "max_position_pct": 0.6, "max_open_positions": 5}))
+    px, t, s = prices(), trader(setup), strat()
+    crash = px.copy()
+    crash.iloc[14:, 0] = crash.iloc[13, 0] * 0.80
+    crash.iloc[14:, 1] = crash.iloc[13, 1] * 1.20
+    target = tmp_path / "inside" / "nowhere.json"                                    # a path inside a temporary folder
+    for k in range(11, 14):                                                             # positions open, nothing latched yet
+        t.step(crash.iloc[: k + 1], {7: s})
+    if how == "dangling link":
+        t.latch_file.symlink_to(target)
+    elif how == "link loop":
+        other = t.dir / "loop-b"
+        other.symlink_to(t.latch_file)
+        t.latch_file.symlink_to(other)
+    elif how == "plain file":
+        t.latch_file.write_text("earlier")
+    else:
+        t.latch_file.mkdir()
+    hit = t.step(crash.iloc[:15], {7: s})                                               # the day the drawdown reaches the limit
+    assert hit["drawdown_pct"] >= 3.0
+    assert not target.exists() and not target.parent.exists()                           # nothing was made at the end of the link
+    assert rg.file_is_there(t.latch_file)                                               # still there, so the gate blocks
+    assert t.latch_file.is_symlink() == (how in ("dangling link", "link loop"))
+    if how == "plain file":
+        assert t.latch_file.read_text() == "earlier"
+    assert [e for e in t.journal.read() if e["type"] == "kill_switch"] == []            # it was already set: no new trip
+    for k in range(15, 20):
+        t.step(crash.iloc[: k + 1], {7: s})
+    after = [e for e in t.journal.read(since=crash.index[14]) if e["type"] == "decision" and "order" in e]
+    assert after and all(e["decision"] == "blocked" for e in after if not e["order"]["reduces_risk"])
+
+
+def test_tripping_the_latch_with_nothing_there_still_writes_it_once(setup):
+    setup[1].write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 3.0, "max_position_pct": 0.6, "max_open_positions": 5}))
+    px, t, s = prices(), trader(setup), strat()
+    crash = px.copy()
+    crash.iloc[14:, 0] = crash.iloc[13, 0] * 0.80
+    crash.iloc[14:, 1] = crash.iloc[13, 1] * 1.20
+    for k in range(11, 20):
+        t.step(crash.iloc[: k + 1], {7: s})
+    assert json.loads(t.latch_file.read_text())["drawdown_pct"] >= 3.0 and not t.latch_file.is_symlink()
+    assert [e["decision"] for e in t.journal.read() if e["type"] == "kill_switch"] == ["latched"]

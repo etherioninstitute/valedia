@@ -29,7 +29,7 @@ from valedia_trader.research_loop import critic as critic_mod
 from valedia_trader.research_loop import research as research_mod
 from valedia_trader.research_loop.gauntlet import Criteria, Gauntlet, GauntletError
 from valedia_trader.research_loop.ledger import HypothesisLedger, LedgerError
-from valedia_trader.research_loop.paper import AlpacaPaperVenue, PaperTrader
+from valedia_trader.research_loop.paper import AlpacaPaperVenue, LatchResetError, PaperTrader
 from valedia_trader.research_loop.strategy import SpecError, Strategy, load_strategy
 
 MARKET = "us-etf+crypto"
@@ -202,9 +202,31 @@ def paper_trader(paths: LoopPaths, venue=None) -> PaperTrader:
                        panel_horizon_days=int(cfg.get("horizon_days", 5)), tax_rules=_tax_rules(paths))
 
 
+ORDER_STEP_ACCOUNT_CLASSES = ("INDIVIDUAL_CASH", "INDIVIDUAL_MARGIN")
+
+
+class _AccountClassNotNamed(Exception):
+    """WEBULL_ACCOUNT_CLASS is missing or not a stock account class; says nothing of the value."""
+
+
+def _order_step_account_class_named(environ=None) -> None:
+    """Raises _AccountClassNotNamed unless WEBULL_ACCOUNT_CLASS is INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, read as
+    WebullVenue.from_secrets reads it (stripped, upper-cased; the secrets file is loaded first when no `environ` is
+    given). With the account chosen by WEBULL_ACCOUNT_ID alone an Events account would take the Cash venue's name and
+    be refused only inside the session, after files were made."""
+    import os
+    if environ is None:
+        from valedia_trader.core.secrets import load_env
+        load_env()
+        environ = os.environ
+    if (environ.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() not in ORDER_STEP_ACCOUNT_CLASSES:
+        raise _AccountClassNotNamed()
+
+
 def _order_step_venue():
-    """Webull's venue from the secrets file. The order step itself refuses anything but the test environment, before
-    any call to it."""
+    """Webull's venue from the secrets file, after the account class is found named there (nothing is built before).
+    The order step itself refuses anything but the test environment, before any call to it."""
+    _order_step_account_class_named()
     from valedia_trader.venues.webull import WebullVenue
     return WebullVenue.from_secrets()
 
@@ -250,6 +272,10 @@ def _order_step_build():
         return None
     try:
         venue = _order_step_venue()
+    except _AccountClassNotNamed:
+        print("refused: the order step needs the account class named: set WEBULL_ACCOUNT_CLASS to INDIVIDUAL_CASH or "
+              "INDIVIDUAL_MARGIN (WEBULL_ACCOUNT_ID alone does not say which kind of account it is)", file=sys.stderr)
+        return None
     except (WebullError, SecretError, OSError) as exc:
         print(f"refused: the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file "
               "and its WEBULL_ settings", file=sys.stderr)
@@ -486,7 +512,7 @@ def main(argv=None) -> int:
         elif args.cmd == "reset-kill-switch":
             trader = PaperTrader(paths.journal, paths.risk_limits)
             print("latch cleared" if trader.reset_latch(args.who, pd.Timestamp.today()) else "the latch was not set")
-    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError) as exc:
+    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     finally:

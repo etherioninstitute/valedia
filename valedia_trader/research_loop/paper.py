@@ -19,6 +19,7 @@ every note says it is unavailable and why; trading carries on exactly as with ta
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -87,12 +88,17 @@ class VenueError(RuntimeError):
     pass
 
 
+class LatchResetError(RuntimeError):
+    """The drawdown latch is there and cannot be removed (a directory, no permission, ...)."""
+
+
 class Journal:
     """Append-only decision log: one JSON line per decision in `journal/YYYY-MM-DD.jsonl`."""
 
     def __init__(self, directory: str | Path) -> None:
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self.skipped_lines: list[dict] = []              # the lines the last `read` skipped: file name and line number only
 
     def write(self, day, entry: dict) -> dict:
         """Append one record. Any piece of a remembered secret is replaced first, and the record
@@ -102,17 +108,37 @@ class Journal:
         record, replaced = redact_json(record)
         if replaced:
             record["secret_redacted"] = replaced
-        with (self.dir / f"{record['day']}.jsonl").open("a") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        line = (json.dumps(record, default=str) + "\n").encode("utf-8")
+        with (self.dir / f"{record['day']}.jsonl").open("a+b") as fh:
+            if fh.seek(0, os.SEEK_END):                  # a file whose last line has no newline ends in a torn line (a kill
+                fh.seek(-1, os.SEEK_END)                 # in the middle of a write): the new entry starts on its own line
+                if fh.read(1) != b"\n":
+                    line = b"\n" + line
+            fh.write(line)                               # one write, so a kill leaves at most one torn line
         return record
 
     def read(self, since=None, until=None) -> list[dict]:
+        """The entries in date order, each file in the order written. A line that is not a complete JSON object (one cut
+        short by a kill, or damaged) is skipped and never raises; `skipped_lines` then holds `{"file", "line"}` for each
+        such line of this read (never any of its text), so a caller can report it."""
         lo = str(pd.Timestamp(since).date()) if since is not None else ""
         hi = str(pd.Timestamp(until).date()) if until is not None else "9999"
         out: list[dict] = []
+        skipped: list[dict] = []
         for path in sorted(self.dir.glob("????-??-??.jsonl")):
             if lo <= path.stem <= hi:
-                out += [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+                for number, raw in enumerate(path.read_bytes().split(b"\n"), 1):
+                    if not raw.strip():
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        entry = None
+                    if isinstance(entry, dict):
+                        out.append(entry)
+                    else:
+                        skipped.append({"file": path.name, "line": number})
+        self.skipped_lines = skipped
         return out
 
 
@@ -397,8 +423,8 @@ class PaperTrader:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
             limits = None                                  # check_order will then block every order
-        if limits and account["drawdown_pct"] >= limits["max_drawdown_pct"] and not self.latch_file.exists():
-            self.latch_file.write_text(json.dumps({"tripped_on": str(day.date()), "drawdown_pct": account["drawdown_pct"]}))
+        if (limits and account["drawdown_pct"] >= limits["max_drawdown_pct"] and not risk_gate.file_is_there(self.latch_file)
+                and self._trip_latch({"tripped_on": str(day.date()), "drawdown_pct": account["drawdown_pct"]})):
             self.journal.write(day, {"type": "kill_switch", "decision": "latched",
                                      "reasoning": f"drawdown {account['drawdown_pct']:.2f}% reached the limit; new risk is blocked until the latch is reset"})
 
@@ -513,11 +539,29 @@ class PaperTrader:
                          if lot["units"] and np.isfinite(row.get(sym, np.nan)))
         return float(open_value + self.state["realized"].get(strategy, 0.0))
 
+    def _trip_latch(self, body: dict) -> bool:
+        """Create the latch file, only when nothing is at its path: never through a link, never over what is there. False
+        when something (a file, a link of any kind, a directory) turned up first: the latch then counts as set."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.latch_file, flags, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(body))
+        return True
+
     def reset_latch(self, who: str, day) -> bool:
         """A person clears the drawdown latch. The reset is journaled; the high-water mark restarts."""
-        if not self.latch_file.exists():
+        if not risk_gate.file_is_there(self.latch_file):         # as the risk gate sees it: a link of any kind is there
             return False
-        self.latch_file.unlink()
+        try:
+            self.latch_file.unlink()                             # a link is removed as a link, never followed
+        except FileNotFoundError:
+            return False                                         # gone between the check and the removal
+        except (OSError, ValueError) as exc:
+            raise LatchResetError(f"the drawdown latch {self.latch_file} is there and cannot be removed "
+                                  f"({type(exc).__name__}); remove it by hand") from exc
         self.state["peak_equity"] = self.state["history"][-1]["equity"] if self.state["history"] else self.state["starting_cash"]
         self.journal.write(day, {"type": "kill_switch", "decision": "reset", "reasoning": f"latch cleared by {who}"})
         self._save()

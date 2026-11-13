@@ -164,6 +164,7 @@ class _Venue:
 
 
 REAL_ORDER_STEP_ENVIRONMENT = cli._order_step_environment   # before any fixture replaces it
+REAL_ORDER_STEP_VENUE = cli._order_step_venue
 
 
 @pytest.fixture
@@ -349,3 +350,85 @@ def test_paper_step_alpaca_still_mirrors_to_the_alpaca_paper_account(tmp_path, m
     monkeypatch.setattr(cli, "_market", lambda args: (prices(), None, None))
     assert cli.main(["--root", str(tmp_path), "paper-step", "--alpaca"]) == 0
     assert built == [("PKTEST", "s")] and "nothing to paper trade" in capsys.readouterr().out
+
+
+# ---- T20: the order step needs the account class to be named, before the venue or any file
+
+def _class_run(root, monkeypatch, capsys, value, built):
+    """The real `_order_step_venue` with the Webull adapter replaced, WEBULL_ACCOUNT_CLASS set to `value` (None: unset)."""
+    from valedia_trader.venues import webull
+    monkeypatch.setenv("WEBULL_ACCOUNT_CLASS", "x")                       # so the undo restores whatever it was
+    if value is None:
+        monkeypatch.delenv("WEBULL_ACCOUNT_CLASS")
+    else:
+        monkeypatch.setenv("WEBULL_ACCOUNT_CLASS", value)
+    monkeypatch.setattr(cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: built.append(1) or _Venue()))
+    before = _tree(root)
+    code = cli.main(["--root", str(root), "order-step"])
+    return code, capsys.readouterr(), before
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "EVENTS_CASH", "CRYPTO", "FUTURES", "INDIVIDUAL", "Zq-not-a-class-but-secret-looking"])
+def test_order_step_refuses_without_a_named_stock_account_class_before_building_anything(order_step_project, monkeypatch, capsys,
+                                                                                          value):
+    root, venue = order_step_project
+    built = []
+    code, captured, before = _class_run(root, monkeypatch, capsys, value, built)
+    lines = captured.err.strip().splitlines()
+    assert code == 2 and built == [] and captured.out == ""
+    assert len(lines) == 1 and lines[0].startswith("refused:") and "WEBULL_ACCOUNT_CLASS" in lines[0]
+    assert "INDIVIDUAL_CASH" in lines[0] and "INDIVIDUAL_MARGIN" in lines[0]
+    assert "Zq" not in captured.err and "Traceback" not in captured.err
+    assert _tree(root) == before and venue.calls == []                    # no folder, no ledger, no state file
+
+
+@pytest.mark.parametrize("value", ["INDIVIDUAL_CASH", "INDIVIDUAL_MARGIN", " individual_cash "])
+def test_order_step_goes_on_when_the_class_is_a_stock_account_class(order_step_project, monkeypatch, capsys, value):
+    root, venue = order_step_project
+    built = []
+    code, captured, _ = _class_run(root, monkeypatch, capsys, value, built)
+    assert built == [1] and "WEBULL_ACCOUNT_CLASS" not in captured.err
+
+
+def test_order_step_reads_the_class_from_the_loaded_secrets_by_name(order_step_project, monkeypatch, capsys, tmp_path):
+    root, venue = order_step_project
+    env_file = tmp_path / "elsewhere" / "trading.env"
+    env_file.parent.mkdir()
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(env_file))
+    env_file.write_text("WEBULL_ACCOUNT_ID=Zq-an-account-id-value\n")
+    env_file.chmod(0o600)
+    built = []
+    code, captured, before = _class_run(root, monkeypatch, capsys, None, built)       # an id alone does not name the class
+    assert code == 2 and built == [] and "WEBULL_ACCOUNT_CLASS" in captured.err and "Zq" not in captured.err
+    assert _tree(root) == before
+    env_file.write_text("WEBULL_ACCOUNT_ID=Zq-an-account-id-value\nWEBULL_ACCOUNT_CLASS=INDIVIDUAL_MARGIN\n")
+    code, captured, _ = _class_run(root, monkeypatch, capsys, None, built)
+    assert built == [1] and "WEBULL_ACCOUNT_CLASS" not in captured.err
+
+
+def test_order_step_given_a_venue_directly_is_not_asked_for_the_class(order_step_project, monkeypatch, capsys):
+    root, venue = order_step_project
+    monkeypatch.delenv("WEBULL_ACCOUNT_CLASS", raising=False)
+    assert cli.main(["--root", str(root), "order-step"]) == 0               # the fixture's venue stands in for `_order_step_venue`
+
+
+# ---- T20 (second round): reset-kill-switch on a latch that cannot be removed ends with one plain line
+
+def test_reset_kill_switch_that_cannot_remove_the_latch_refuses_with_one_plain_line(tmp_path, capsys):
+    latch = tmp_path / "journal" / "kill_switch.json"
+    latch.mkdir(parents=True)
+    (latch / "inside").write_text("x")
+    assert cli.main(["--root", str(tmp_path), "reset-kill-switch", "--who", "burton"]) == 2
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert captured.out == "" and len(lines) == 1 and lines[0].startswith("refused:") and str(latch) in lines[0]
+    assert "Traceback" not in captured.err and latch.is_dir() and (latch / "inside").exists()
+
+
+def test_reset_kill_switch_still_clears_a_latch_that_is_a_dangling_link(tmp_path, capsys):
+    latch = tmp_path / "journal" / "kill_switch.json"
+    latch.parent.mkdir(parents=True)
+    latch.symlink_to(tmp_path / "nowhere.json")
+    assert cli.main(["--root", str(tmp_path), "reset-kill-switch", "--who", "burton"]) == 0
+    assert "latch cleared" in capsys.readouterr().out and not latch.is_symlink() and not (tmp_path / "nowhere.json").exists()
