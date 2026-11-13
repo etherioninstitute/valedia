@@ -1914,3 +1914,188 @@ def test_a_slow_environment_read_never_lets_submit_once_begin_after_the_window(w
     out = world.run(patch=watch)
     assert submitted_at == [] and [o["state"] for o in world.orders()] == ["intended"]
     assert out["left_over"][0]["reason"] == "the session window closed during the run"
+
+
+# ==== rev 5 (T13 rev 5): the risk gate judges the quote that is used
+
+def _stamping(world, after_first=None):
+    """Quotes that remember when each one in hand was stamped; `after_first(symbols)` runs after the first ask."""
+    stamped, first = {}, world.quotes
+
+    def quotes(symbols):
+        if world.quote_calls and after_first:
+            after_first(symbols)
+        out = first(symbols)
+        for s, (_, t) in out.items():
+            stamped[s] = t
+        return out
+    world.quotes = quotes
+    return stamped
+
+
+def _intends(world):
+    seen = []
+
+    def patch(led):
+        real = led.intend
+        led.intend = lambda tag, sym, units, ref, **k: seen.append((sym, units, ref, world.clock.t)) or real(tag, sym, units, ref, **k)
+    return seen, patch
+
+
+# ---- rev 5 outcome 1: the gate judges the order at the quote intend will use
+
+def test_a_quote_asked_for_again_is_judged_by_the_risk_gate(world):
+    world.limits.write_text(json.dumps({**GENEROUS, "max_position_pct": 0.1}))      # 10% of 1,000,000
+    world.venue.cash_value = 1_000_000.0
+    world.prices["SPY"] = 100.0
+    world.quote_age["SPY"] = 1190.0
+    world.paper = paper({"a": {"SPY": 900.0}}, equity=1_000_000.0)
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]   # the first quote goes stale
+    _stamping(world, after_first=lambda s: (world.prices.update(SPY=1000.0), world.quote_age.update(SPY=60.0)))
+    out = world.run()
+    assert world.venue.submits() == [] and out["orders_sent"] == 0
+    assert out["refused"][0]["by"] == "risk gate" and out["refused"][0]["reason"] == "Order is larger than the position limit."
+    assert world.entries("refused")[-1]["order"]["position_value_after"] == 900 * 1000.0
+
+
+def test_a_slow_environment_read_after_the_gate_sends_the_order_back_for_a_fresh_quote(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.quote_age["SPY"] = 600.0
+    stamped = _stamping(world, after_first=lambda s: world.quote_age.update(SPY=60.0))
+    slow = {"on": False}
+
+    class V(StandIn):
+        @property
+        def environment(self):
+            if slow["on"]:
+                world.clock.t += 11 * 60
+            return "sandbox"
+    world.venue = V()
+    real_gate = osx.risk_gate.check_order
+    monkeypatch.setattr(osx.risk_gate, "check_order", lambda *a, **k: (slow.update(on=True), real_gate(*a, **k))[1])
+    seen, patch = _intends(world)
+    out = world.run(patch=patch)
+    assert out["orders_sent"] == 1 and len(world.quote_calls) == 2
+    assert all(t - stamped[sym] <= osx.QUOTE_MAX_AGE_SECONDS for sym, _, _, t in seen)
+
+
+def test_a_quote_that_goes_stale_twice_while_the_order_is_checked_leaves_it_over(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    real_gate = osx.risk_gate.check_order
+
+    def slow_gate(*a, **k):
+        world.clock.t += 25 * 60
+        return real_gate(*a, **k)
+    monkeypatch.setattr(osx.risk_gate, "check_order", slow_gate)
+    out = world.run()
+    assert world.venue.submits() == [] and world.orders() == [] and len(world.quote_calls) == 2
+    assert out["left_over"][0]["reason"] == "the quote went stale again while the order was checked"
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_every_order_sent_passes_the_risk_gate_at_the_quote_actually_used(tmp_path, monkeypatch, seed_block):
+    from valedia_trader.research_loop import risk_gate
+    real_gate = risk_gate.check_order
+    calls = []
+    clock_box = {}
+
+    def gate(order, account, *a, **k):
+        calls.append((dict(order), dict(account)))
+        clock_box["w"].clock.t += clock_box["gate"]
+        return real_gate(order, account, *a, **k)
+    monkeypatch.setattr(osx.risk_gate, "check_order", gate)
+    checked = 0
+    for k in range(50):
+        rng = random.Random(seed_block * 50 + k)
+        w = World(tmp_path / f"g{seed_block}-{k}")
+        clock_box.update(w=w, gate=rng.choice([0.0, 0.0, 400.0, 1300.0]))
+        w.clock.t = ny(f"2026-11-13 {rng.choice(['10:00', '13:30', '15:20'])}")
+        limits = {**GENEROUS, "max_position_pct": rng.choice([0.05, 0.1, 0.3, 1.0])}
+        w.limits.write_text(json.dumps(limits))
+        cash = rng.choice([100_000.0, 1_000_000.0])
+        held = {s: float(rng.choice([0, 0, 10])) for s in ("SPY", "QQQ")}
+        w.venue = StandIn(held={s: u for s, u in held.items() if u}, cash=cash)
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        for s in ("SPY", "QQQ", "IWM"):
+            w.prices[s] = rng.choice([20.0, 100.0, 500.0])
+            w.quote_age[s] = rng.choice([60.0, 1190.0])
+        factor = rng.choice([0.5, 1.0, 2.0, 10.0])
+        again_age = rng.choice([60.0, 60.0, 1500.0])
+
+        def after_first(symbols, w=w, factor=factor, again_age=again_age):
+            for s in symbols:
+                w.prices[s] *= factor
+                w.quote_age[s] = again_age
+        _stamping(w, after_first=after_first)
+        if rng.random() < 0.5:
+            cash_read = w.venue.cash
+            w.venue.cash = lambda w=w, cash_read=cash_read: (setattr(w.clock, "t", w.clock.t + 20), cash_read())[1]
+        w.paper = paper({"a": {s: float(rng.choice([0, 50, 300, 900, 2000])) for s in ("SPY", "QQQ", "IWM")}}, equity=cash)
+        calls.clear()
+        seen, patch = _intends(w)
+        out = w.run(patch=patch)
+        sent = {e["symbol"]: e for e in out["sent"]}
+        for sym, units, ref, _ in seen:
+            if sym not in sent:
+                continue
+            owned = held.get(sym, 0.0)
+            reduces = units < 0 and owned > 0 and abs(owned + units) < abs(owned)
+            mine = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * ref, "reduces_risk": reduces,
+                    "adds_to_existing": owned > 1e-12, "position_value_after": abs(owned + units) * ref}
+            judged = [(o, a) for o, a in calls if o["symbol"] == sym]
+            assert judged and judged[-1][0] == mine                          # the gate saw the quote intend used
+            account = judged[-1][1]
+            assert account["equity"] == out["broker_equity"]
+            ok, why = real_gate(mine, account, limits)
+            assert ok, (sym, units, ref, why)
+            assert sent[sym]["quote"] == ref and sent[sym]["limit_price"] == osx.limit_price(units, ref, reduces)
+            checked += 1
+    assert checked > 20
+
+
+# ---- rev 5 outcome 3: a quote whose time cannot be read is unusable
+
+class OddTime(datetime):
+    mode = "nan"
+
+    def timestamp(self):
+        if OddTime.mode == "nan":
+            return float("nan")
+        raise OverflowError("no time")
+
+
+@pytest.mark.parametrize("mode", ["nan", "raises"])
+def test_a_quote_whose_time_gives_no_finite_timestamp_is_unusable(world, mode):
+    from datetime import timezone
+    OddTime.mode = mode
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.quote_override["SPY"] = (500.0, OddTime(2026, 11, 13, 15, 0, tzinfo=timezone.utc))
+    out = world.run()
+    assert out["orders_sent"] == 0 and out["skipped"][0]["symbol"] == "SPY"
+
+
+# ---- rev 5 outcome 4: the order's own size is bounded
+
+def test_an_order_above_max_units_in_size_is_left_over(world):
+    world.prices["SPY"] = 1e-6
+    world.venue.cash_value = 1e7
+    world.paper = paper({"a": {"SPY": 2e12}})
+    out = world.run()
+    assert world.venue.submits() == [] and world.orders() == []
+    assert out["left_over"] == [{"symbol": "SPY", "units": 2e12, "reason": "the order is above 1,000,000,000,000 units in size"}]
+
+
+# ---- rev 5 outcome 5: the host names the sandbox as a whole label
+
+@pytest.mark.parametrize("host, runs", [("api.sandbox.webull.com", True), ("sandbox", True), ("api.webull.com/?sandbox", False),
+                                        ("sandboxapi.webull.com", False), ("api.sandbox_x.webull.com", False),
+                                        ("api.webull.com#sandbox", False), ("api.sandbox.webull.com ", False)])
+def test_the_host_must_name_the_sandbox_as_one_of_its_labels(world, host, runs):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.venue.host = host
+    out = world.run()
+    if runs:
+        assert out["orders_sent"] == 1
+    else:
+        assert out["stage"] == "environment" and world.venue.calls == []

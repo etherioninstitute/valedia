@@ -237,19 +237,36 @@ def _order_step_refused() -> bool:
     return True
 
 
-def order_step_command(args, paths: LoopPaths) -> int:
-    """One order step against the venue `_order_step_venue` gives; prints the summary. 0 when the run went through,
-    2 when it stopped. A configured environment other than the test environment is refused before any venue is built
-    or any file created."""
-    from valedia_trader.execution_and_risk import order_step
-    from valedia_trader.venues.webull import WebullError
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, AssertionError, SyntaxError)
+
+
+def _order_step_build():
+    """The venue for the order step, or None after one plain line on stderr: when the configured environment is not
+    the test environment, or the secrets file cannot be loaded, or the venue cannot be built. The line names the
+    error's class (and a plain code) only, never anything from the secrets file or a path inside it. A programming
+    error is let through."""
+    from valedia_trader.execution_and_risk.order_step import _venue_error
     if _order_step_refused():
-        return 2
+        return None
     try:
-        venue = _order_step_venue()
-    except WebullError as exc:
-        print(f"refused: the Webull venue could not be set up: {exc}", file=sys.stderr)
-        return 2
+        return _order_step_venue()
+    except _PROGRAMMING_ERRORS:
+        raise
+    except Exception as exc:
+        print(f"refused: the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file "
+              "and its WEBULL_ settings", file=sys.stderr)
+        return None
+
+
+def order_step_command(args, paths: LoopPaths, venue=None) -> int:
+    """One order step against the venue `_order_step_venue` gives (built here when not given); prints the summary.
+    0 when the run went through, 2 when it stopped. The command line builds the venue before any folder or file is
+    made, and refuses a configured environment other than the test environment before building it."""
+    from valedia_trader.execution_and_risk import order_step
+    if venue is None:
+        venue = _order_step_build()
+        if venue is None:
+            return 2
     trader = PaperTrader(paths.journal, paths.risk_limits)
     ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
     orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
@@ -361,8 +378,11 @@ def main(argv=None) -> int:
     p.add_argument("--critic", action="store_true", help="run the weekly critic at the end (it always runs on Sundays)")
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
-    if args.cmd == "order-step" and _order_step_refused():     # before any folder or file is made
-        return 2
+    venue = None
+    if args.cmd == "order-step":                                # before any folder or file is made
+        venue = _order_step_build()
+        if venue is None:
+            return 2
 
     paths = LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths()
     paths.ensure()
@@ -414,7 +434,7 @@ def main(argv=None) -> int:
             print(f"stopped: {out['stopped']}; best v{out['best_version']} (Sharpe {out['best_sharpe']:.2f}); "
                   f"{out['variations_counted']} variations counted, {out['revisions_used']} revisions used; passed: {out['passed']}")
         elif args.cmd == "order-step":
-            return order_step_command(args, paths)
+            return order_step_command(args, paths, venue=venue)
         elif args.cmd == "paper-step":
             if args.webull:                                    # the paper step runs after the close; Webull refuses those orders
                 print("refused: paper-step no longer sends anything to Webull. Orders reach Webull's test environment only "

@@ -12,7 +12,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
 
  1. environment  the venue must be the test environment: its `environment` a plain str equal to TEST_ENVIRONMENT
                  (a subclass is refused) and, when it has a `host` (by a static lookup or an ordinary getattr, so
-                 also through __getattr__), both answers a plain str containing "sandbox"; and the ledger must treat
+                 also through __getattr__), both answers a plain str of letters, digits, dots and hyphens with
+                 "sandbox" as one of its dot-separated labels (so a property or __getattr__-only host, whose static
+                 lookup is not a plain str, is refused); and the ledger must treat
                  exactly the adapter's NotTransmitted and OrderRejected as not sent. Checked before any venue call,
                  and read again before each order is intended and immediately before each submit_once; any failure
                  stops the run with no further venue call.
@@ -38,8 +40,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  journaled once (keyed by its fill id), the journal file fsynced, and only then marked applied. A
                  blocked ledger, or an order still open at the broker, stops the run.
  5. targets      per symbol, each strategy's paper units held plus pending, summed, times capital / paper equity.
- 6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, or a price not above
-                 0 or above MAX_QUOTE_PRICE: no order for that symbol. The venue's cash, and the broker equity (cash
+ 6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, a time whose
+                 timestamp() is not finite or raises, or a price not above 0 or above MAX_QUOTE_PRICE: no order for
+                 that symbol. The venue's cash, and the broker equity (cash
                  plus holdings at the quotes), must be finite numbers from 0 to MAX_CASH, and every held symbol must
                  have a usable quote; otherwise the run stops before any order and records no equity or peak. A
                  position above MAX_UNITS in size is unusable too (the baseline is not recorded; a broker book that
@@ -53,13 +56,18 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports,
                  less CASH_KEPT, would be exceeded at the limit prices; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
-10. send         for each order, in this order: the risk gate (at the quote in hand); the quote's age on the clock
-                 (older than QUOTE_MAX_AGE_SECONDS, the quote function is asked once more for that symbol, and an
-                 unusable answer leaves the order over; the limit price comes from the quote in hand then); the
-                 environment and host read; the window check; ledger.intend; the environment and host read and the
-                 window check again; ledger.submit_once. Nothing that can take time sits between a window check and
-                 the call it guards; an order failing the second check stays `intended`, never sent. A day limit
-                 order in the regular session. A refusal is journaled and the run goes on; an unknown outcome stops the run
+10. send         an order above MAX_UNITS in size is left over, never sent. For each other order, in this order:
+                  a. the quote's age on the clock: older than QUOTE_MAX_AGE_SECONDS, the quote function is asked
+                     once more for that symbol, and an unusable answer leaves the order over;
+                  b. the risk gate, at that quote (the limit price, order value, cash check and position value all
+                     come from it);
+                  c. the environment and host read;
+                  d. the quote's age again: too old, back to (a) once; too old the second time, the order is left
+                     over. What is sent always uses the quote of the last round's (b), the one the gate judged;
+                  e. the window check, then ledger.intend;
+                  f. the environment and host read, the window check again, then ledger.submit_once.
+                 Nothing that can take time sits between a window check and the call it guards; an order failing the
+                 second check stays `intended`, never sent. A day limit order in the regular session. A refusal is journaled and the run goes on; an unknown outcome stops the run
                  at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
                  stop or a left-over order, in the order step's own words.
 11. after        reconcile once more, journal the fills, return and journal a summary.
@@ -79,6 +87,10 @@ Points to know:
    name when that is a plain identifier and its `code` when that is capitals, digits and underscores (up to 64);
    from a venue answer, only fields the order step names itself (a state or status word from a fixed list,
    numbers, plain symbols and tags). The ledger's own file keeps the venue's text.
+ - ledger.submit_once reads the venue's name and waits for its own write lock before it calls the venue, so with
+   slow venue attributes the venue call can begin after the window check (the real adapter's attributes are plain).
+ - A second kill while the torn-line record is being written, or another program appending to the journal after a
+   torn order-step line, still stops the step until a person looks.
 
 The order step keeps a small sqlite state file (OrderStepState) beside the ledger, one per venue name: the baseline,
 the equity of each run, and the orders sent each day. Every write is one transaction. Everything a run needs is
@@ -181,6 +193,14 @@ def _local_error(exc: BaseException) -> str:
     if isinstance(exc, OrdersBlocked):
         return "OrdersBlocked (the order ledger is blocked)"
     return _describe(exc)
+
+
+_HOST = re.compile(r"[A-Za-z0-9.-]{1,253}")
+
+
+def _sandbox_host(host) -> bool:
+    """A plain str of letters, digits, dots and hyphens with `sandbox` as one of its dot-separated labels."""
+    return _plain(_HOST, host) and TEST_ENVIRONMENT in host.split(".")
 
 
 def _status_word(answer) -> str:
@@ -424,7 +444,10 @@ def _quote_time(t) -> float | None:
     if isinstance(t, datetime):                       # pandas Timestamps are datetimes too
         if t.tzinfo is None:
             return None                               # a time without a zone cannot be compared with the clock
-        return float(t.timestamp())
+        try:
+            return _as_float(t.timestamp())           # a timestamp that is not finite, or raises: no usable time
+        except Exception:
+            return None
     return None
 
 
@@ -907,7 +930,7 @@ class _Run:
         except Exception:
             raise _Stop("environment", "the venue's host could not be read") from None
         if static is not _ABSENT or dynamic is not _ABSENT:
-            if not all(type(h) is str and "sandbox" in h for h in (static, dynamic)):
+            if not all(_sandbox_host(h) for h in (static, dynamic)):
                 raise _Stop("environment", "the venue's host is not a plain str attribute naming the sandbox")
 
     # -- the paper book's day
@@ -1096,11 +1119,15 @@ class _Run:
                 self.quote_times[sym] = t
         return prices, why_not
 
+    def _quote_fresh(self, sym: str) -> bool:
+        """Whether the quote in hand for `sym` is within QUOTE_MAX_AGE_SECONDS on the clock now."""
+        t, now = self.quote_times.get(sym), self._now()
+        return t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= QUOTE_MAX_AGE_SECONDS
+
     def _fresh_quote(self, sym: str, quote: float) -> tuple[float | None, str | None]:
         """The quote in hand when it is still within QUOTE_MAX_AGE_SECONDS on the clock; else one more ask of the
         quote function for this symbol. (price, None), or (None, why) when the new quote is not usable."""
-        t, now = self.quote_times.get(sym), self._now()
-        if t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= QUOTE_MAX_AGE_SECONDS:
+        if self._quote_fresh(sym):
             return quote, None
         old = f"the quote is older than {QUOTE_MAX_AGE_SECONDS // 60} minutes"
         try:
@@ -1219,38 +1246,52 @@ class _Run:
             if units > 0 and purchases_stopped:
                 self._leave(c, purchases_stopped)
                 continue
-            gated = c["quote"]                           # 1. the risk gate, at the quote in hand
-            order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * gated, "reduces_risk": bool(reduces),
-                     "adds_to_existing": owned_here > UNITS_EPS, "position_value_after": abs(owned_here + units) * gated}
-            ok, why = risk_gate.check_order(order, dict(account), limits, limits_file=None if limits else self.limits_file,
-                                            latch_file=self.latch_file, halt_file=self.halt_file)
-            if not ok:
-                self._refuse(c, "risk gate", why, order=order, account=account)
+            if abs(units) > MAX_UNITS:
+                self._leave(c, f"the order is above {MAX_UNITS:,.0f} units in size")
                 continue
-            quote, stale = self._fresh_quote(sym, gated)  # 2. the quote's age on the clock, asked again once if too old
-            if quote is None:
-                self._leave(c, stale)
+            quote, judged = c["quote"], None
+            for round_ in (1, 2):
+                quote, stale = self._fresh_quote(sym, quote)   # 1. a fresh quote in hand (asked again once if too old)
+                if quote is None:
+                    self._leave(c, stale)
+                    break
+                order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote,
+                         "reduces_risk": bool(reduces), "adds_to_existing": owned_here > UNITS_EPS,
+                         "position_value_after": abs(owned_here + units) * quote}
+                ok, why = risk_gate.check_order(order, dict(account), limits,        # 2. the risk gate, on that quote
+                                                limits_file=None if limits else self.limits_file,
+                                                latch_file=self.latch_file, halt_file=self.halt_file)
+                if not ok:
+                    self._refuse(c, "risk gate", why, order=order, account=account)
+                    break
+                limit = limit_price(units, quote, reduces)
+                if limit is None:
+                    self._refuse(c, "order step", f"no positive limit price comes from the quote {quote}")
+                    break
+                cost = units * limit if units > 0 else 0.0
+                if units > 0 and spent + cost > budget:
+                    purchases_stopped = (f"the purchases would exceed the cash the venue reports less {CASH_KEPT:.0%} "
+                                         f"({budget:.2f})")
+                    self._leave(c, purchases_stopped)
+                    break
+                self._check_environment()                # 3. the environment and host, read again
+                if self._quote_fresh(sym):               # 4. the quote still fresh on the clock: judged at it
+                    judged = (quote, limit, order, cost)
+                    break
+                if round_ == 2:                          # ... stale again: back to 1 once, then left over
+                    self._leave(c, "the quote went stale again while the order was checked")
+            if judged is None:
                 continue
-            limit = limit_price(units, quote, reduces)   # from the quote in hand now
-            if limit is None:
-                self._refuse(c, "order step", f"no positive limit price comes from the quote {quote}")
-                continue
-            cost = units * limit if units > 0 else 0.0
-            if units > 0 and spent + cost > budget:
-                purchases_stopped = (f"the purchases would exceed the cash the venue reports less {CASH_KEPT:.0%} "
-                                     f"({budget:.2f})" if cash is not None else "the venue's cash is not a usable number")
-                self._leave(c, purchases_stopped)
-                continue
+            quote, limit, order, cost = judged
             tag = f"{self.batch}-{sym}"
             watch = _SubmitWatch(self.venue)
-            self._check_environment()                    # 3. the environment and host, read again ...
-            if self._now() > self.window_end:            # 4. ... then the window, on the clock, with nothing between
-                self._leave(c, "the session window closed during the run")   #    it and intend
+            if self._now() > self.window_end:            # 5. the window, on the clock, immediately before intend
+                self._leave(c, "the session window closed during the run")
                 continue
             try:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
-                self._check_environment()                # 5. the environment and host again ...
+                self._check_environment()                # 6. the environment and host again ...
                 if self._now() > self.window_end:        # ... then the window, with nothing between it and submit_once
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
                     self._leave(c, "the session window closed during the run")

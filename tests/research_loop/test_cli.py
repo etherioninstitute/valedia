@@ -250,6 +250,36 @@ def test_order_step_ends_with_one_plain_line_when_the_secrets_file_cannot_be_loa
     assert sorted(p.relative_to(root) for p in root.rglob("*")) == before
 
 
+@pytest.mark.parametrize("error", ["missing credential", "webull", "os"])
+def test_order_step_ends_with_one_plain_line_and_creates_nothing_when_the_venue_cannot_be_built(order_step_project, monkeypatch,
+                                                                                                capsys, error):
+    from valedia_trader.core import secrets
+    from valedia_trader.venues.webull import WebullError
+    root, venue = order_step_project
+
+    def build():
+        if error == "missing credential":
+            raise secrets.SecretError("credential WEBULL_APP_KEY is not set (expected in /somewhere/trading.env) Zq-file")
+        if error == "webull":
+            raise WebullError("could not open a session for account Zq-file in /somewhere/trading.env")
+        raise PermissionError(13, "Permission denied", "/somewhere/trading.env")
+    monkeypatch.setattr(cli, "_order_step_venue", build)
+    before = sorted(p.relative_to(root) for p in root.rglob("*"))
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert captured.out == "" and len(lines) == 1 and lines[0].startswith("refused:")
+    assert "Zq" not in captured.err and "trading.env" not in captured.err and "somewhere" not in captured.err
+    assert sorted(p.relative_to(root) for p in root.rglob("*")) == before        # no folder, no ledger file
+
+
+def test_order_step_lets_a_programming_error_in_building_the_venue_through(order_step_project, monkeypatch):
+    root, venue = order_step_project
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: (_ for _ in ()).throw(TypeError("a bug")))
+    with pytest.raises(TypeError):
+        cli.main(["--root", str(root), "order-step"])
+
+
 def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):
     from valedia_trader.venues import webull
     monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: pytest.fail("a Webull venue was built")))
