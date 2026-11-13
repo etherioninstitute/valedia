@@ -1,10 +1,13 @@
-"""Tests for research_loop/pick_grading.py (rev 2). Every store is built here, in tmp_path; nothing touches the network,
-the local model, Reddit, the real pick store, the real grading store or the real secrets file."""
+"""Tests for research_loop/pick_grading.py (rev 3). Every store is built here, in tmp_path; nothing touches the network,
+the local model, Reddit, the real pick store, the real grading store or the real secrets file (the module's defaults are
+pointed into tmp_path for every test)."""
 import ast
 import importlib.util
 import json
+import os
 import random
 import re
+import shutil
 import sqlite3
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
@@ -25,6 +28,15 @@ D = date(2026, 11, 13)
 TITLE = "Pick of the Day - 11/13/26 (Friday)"
 SPORT = {lg: sport for lg, (sport, _) in sl.LEAGUES.items()}
 SERIES = {lg: series for lg, (_, series) in sl.LEAGUES.items()}
+REAL_DEFAULTS = (getattr(pg, "DEFAULT_PICKS", None), getattr(pg, "DEFAULT_STORE", None))
+
+
+@pytest.fixture(autouse=True)
+def _defaults_in_tmp(tmp_path_factory, monkeypatch):
+    """The real pick store and the real grading store are never read: the defaults point into a temporary folder."""
+    d = tmp_path_factory.mktemp("defaults")
+    monkeypatch.setattr(pg, "DEFAULT_PICKS", d / "picks.sqlite", raising=False)
+    monkeypatch.setattr(pg, "DEFAULT_STORE", d / "grading", raising=False)
 
 
 def T(text):
@@ -169,14 +181,21 @@ def odds_client(transport):
 class KalshiTransport:
     def __init__(self):
         self.markets, self.open, self.candles, self.urls, self.endless = {}, {}, {}, [], False
+        self.kevents, self.fail = {}, set()
 
     def __call__(self, url):
         self.urls.append(url)
         parts = urllib.parse.urlsplit(url)
         path = parts.path.split("/trade-api/v2", 1)[1]
         q = dict(urllib.parse.parse_qsl(parts.query))
+        if q.get("series_ticker") in self.fail:
+            raise kd.HttpError(404, url)
         if path == "/historical/cutoff":
             return json.dumps({"market_settled_ts": "2026-01-01T00:00:00Z"}).encode()
+        if path == "/events":
+            rows = self.kevents.get(q.get("series_ticker"), [])
+            return json.dumps({"events": rows, "milestones": [],
+                               "cursor": "c%d" % len(self.urls) if self.endless else ""}).encode()
         if path == "/markets" and q.get("status") == "open":
             rows = self.open.get(q.get("series_ticker"), [])
             return json.dumps({"markets": rows, "cursor": "c%d" % len(self.urls) if self.endless else ""}).encode()
@@ -190,8 +209,8 @@ class KalshiTransport:
         raise kd.HttpError(404, url)
 
     def result_urls(self):
-        """Every request other than an open-market listing (settled markets, candles, the cutoff)."""
-        return [u for u in self.urls if "status=open" not in u]
+        """Every request other than an events listing (settled markets, candles, the cutoff)."""
+        return [u for u in self.urls if "status=open" not in u and "/events?" not in u]
 
 
 def kalshi_client(transport):
@@ -211,6 +230,16 @@ def kmarket(event, code, city, result, expected):
 def kopen(event, code, name):
     return {"ticker": event + "-" + code, "event_ticker": event, "title": name + " wins", "yes_sub_title": name,
             "no_sub_title": name, "status": "active", "result": ""}
+
+
+def kevent(league, day, a, b):
+    """One event of Kalshi's events list, in its real shape: a = (code, Kalshi name), b likewise."""
+    series = SERIES[league]
+    return {"event_ticker": "%s-%s%s%s" % (series, day, a[0], b[0]), "series_ticker": series,
+            "title": "%s vs %s" % (a[1], b[1]), "sub_title": "%s vs %s (Nov 13)" % (a[0], b[0]),
+            "category": "Sports", "mutually_exclusive": True, "collateral_return_type": "", "strike_period": "",
+            "product_metadata": {"competition_scope": "Game"}, "settlement_sources": [], "exchange_index": 0,
+            "last_updated_ts": "2026-11-13T00:00:00Z"}
 
 
 def kcandle(end_ts, bid, ask):
@@ -431,6 +460,54 @@ def test_markets_leagues_and_totals(tmp_path, capsys):
     assert r["c5"]["reason"] == "side_unclear"
 
 
+def two_games_env(tmp_path, capsys, picks):
+    w = PickWorld()
+    w.thread()
+    for cid, f in picks.items():
+        w.comment(cid, "a" + cid, [("2026-11-13T18:00:00Z", f, "-110")])
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev("g1", "Kaloton Lokars", "Pesuton Supers", "2026-11-14T00:00:00Z"),
+                                         ev("g2", "Miraton Ramirs", "Doteton Tedors", "2026-11-14T01:00:00Z")]
+    env.out(capsys, "schedule")
+    env.clock.set("2026-11-13T19:00:00Z")
+    env.out(capsys, "match")
+    return env.rows()
+
+
+def total(sel, a, b):
+    return {"market": "total", "selection": sel, "line": 210.5, "event": {"side_a": a, "side_b": b}}
+
+
+def test_a_selection_naming_teams_of_two_different_games_is_not_graded(tmp_path, capsys):
+    r = two_games_env(tmp_path, capsys, {
+        "t1": total("Kaloton Lokars/Ramirs o210.5", "Kaloton Lokars", "Ramirs"),     # A in full, another game's team
+        "t2": total("Kaloton Lokars/Supers o210.5", "Kaloton Lokars", "Supers"),     # both teams of one game
+        "m1": {"market": "moneyline", "selection": "Kaloton Lokars ML, Tedors next"},
+        "m2": {"market": "spread", "selection": "Miraton Ramirs -3.5 then Lokars", "line": -3.5},
+        "m3": {"market": "spread", "selection": "Ramirs -3.5 then Lokars", "line": -3.5}})   # a tie: shared
+    assert r["m3"]["reason"] == "name_shared"
+    assert r["t1"]["reason"] == "teams_of_two_games" and r["m1"]["reason"] == "teams_of_two_games"
+    assert r["m2"]["reason"] == "teams_of_two_games"
+    assert (r["t2"]["status"], r["t2"]["game_id"]) == ("matched", "g1")
+
+
+def test_a_selection_betting_against_the_team_it_names_is_not_graded(tmp_path, capsys):
+    sel = {"f1": "Fade Lokars ML", "f2": "against the Lokars ML", "f3": "anti-Lokars ML", "f4": "Not Lokars ML",
+           "f5": "vs Lokars ML", "f6": "FADE LOKARS", "ok1": "Lokars ML not a lock", "ok2": "Lokars ML, fade the public"}
+    r = two_games_env(tmp_path, capsys, {k: {"market": "moneyline", "selection": v} for k, v in sel.items()})
+    for k in ("f1", "f2", "f3", "f4", "f5", "f6"):
+        assert r[k]["reason"] == "bets_against", k
+    assert r["ok1"]["status"] == r["ok2"]["status"] == "matched"
+
+
+def test_the_opponent_named_less_fully_still_makes_the_side_unclear(tmp_path, capsys):
+    r = two_games_env(tmp_path, capsys, {
+        "s1": {"market": "moneyline", "selection": "Kaloton Lokars over Supers ML"},
+        "s2": {"market": "spread", "selection": "Kaloton Lokars -3.5 vs Pesuton", "line": -3.5}})
+    assert r["s1"]["reason"] == "side_unclear" and r["s2"]["reason"] in ("side_unclear", "bets_against")
+    assert r["s1"]["status"] == "not_graded"
+
+
 def test_no_model_proposes_matches(tmp_path):
     assert not hasattr(pg, "LocalModelProposer") and not hasattr(pg, "PROPOSER_SYSTEM")
     with pytest.raises(SystemExit):
@@ -614,13 +691,13 @@ def lookalike_env(tmp_path, capsys, world):
     games = {}
     for lg, teams in LOOKALIKES.items():
         events = []
+        env.kalshi.kevents[SERIES[lg]] = []
         for j in range(2):
             (h, _, _, hc, hk), (a, _, _, ac, ak) = teams[2 * j], teams[2 * j + 1]
             gid = "%s%d" % (lg.lower(), j)
             events.append(ev(gid, h, a, LOOK_STARTS[lg][j], SPORT[lg]))
             games[gid] = (lg, h, a, LOOK_STARTS[lg][j])
-            event = "%s-26NOV13%s%s" % (SERIES[lg], ac, hc)
-            env.kalshi.open.setdefault(SERIES[lg], []).extend([kopen(event, hc, hk), kopen(event, ac, ak)])
+            env.kalshi.kevents[SERIES[lg]].append(kevent(lg, "26NOV13", (ac, ak), (hc, hk)))
         env.odds.events[SPORT[lg]] = events
     env.clock.set("2026-11-13T15:00:00Z")
     env.out(capsys, "schedule")
@@ -653,9 +730,9 @@ def test_a_pick_names_a_team_only_against_every_team_known_generated_1200_picks(
         league = rng.choice([None, LEAGUE_WORD[lg]])
         text = form(entry, kind)
         if market == "moneyline":
-            f = {"market": "moneyline", "selection": text + " ML"}
+            f = {"market": "moneyline", "selection": "Take " + text + " ML"}
         elif market == "spread":
-            f = {"market": "spread", "selection": text + " -3.5", "line": -3.5}
+            f = {"market": "spread", "selection": "Take " + text + " -3.5", "line": -3.5}
         else:
             other = form(opp, rng.choice(["full", "city", "nick", "code"]))
             f = {"market": "total", "selection": "%s/%s o210.5" % (text, other), "line": 210.5,
@@ -683,10 +760,16 @@ def test_a_kalshi_code_names_a_team_only_in_capitals_and_never_one_another_leagu
     w = PickWorld()
     w.thread()
     seen = "2026-11-13T22:00:00Z"
-    w.comment("c1", "a1", [(seen, ml("KAL"), "-110")])                       # NBA and NHL share it
-    w.comment("c2", "a2", [(seen, ml("KAL", "NBA"), "-110")])
-    w.comment("c3", "a3", [(seen, ml("kal", "NBA"), "-110")])                # not in capitals
-    w.comment("c4", "a4", [(seen, ml("SUN"), "-110")])                       # one league's code
+    sel = {"c1": ("Take KAL ML", None),          # the NBA and the NHL share it: no name without a league
+           "c2": ("Take KAL ML", "NBA"),
+           "c3": ("Take kal ML", "NBA"),         # not in capitals
+           "c4": ("Take SUN ML", None),          # one team's code across all five tables
+           "c11": ("KAL ML", "NBA"),             # in capitals with no word besides the code and the marker: a code
+           "c15": ("KAL STRONG ML", "NBA"),      # in capitals with another word: no code
+           "c12": ("Take NOK ML", "NFL"), "c13": ("Take NOK ML", "CFB"), "c14": ("Take NOK ML", None)}
+    for cid, (text, lg) in sel.items():
+        w.comment(cid, "a" + cid, [(seen, dict({"market": "moneyline", "selection": text},
+                                                **({"league": lg} if lg else {})), "-110")])
     w.comment("c5", "a5", [(seen, ml("Kaloton", "NBA"), "-110")])            # Kaloton Supers is known too
     w.comment("c6", "a6", [(seen, ml("Blue Visurs"), "-110")])               # the longer name holds "Visurs"
     w.comment("c7", "a7", [(seen, ml("Visurs"), "-110")])
@@ -697,37 +780,247 @@ def test_a_kalshi_code_names_a_team_only_in_capitals_and_never_one_another_leagu
     env.clock.set("2026-11-14T12:00:00Z")
     env.out(capsys, "match")
     r = env.rows()
-    assert r["c1"]["reason"] == "name_shared"
+    assert r["c1"]["reason"] == "no_team_named"
     assert (r["c2"]["status"], r["c2"]["team"]) == ("matched", "Kaloton Lokars")
-    assert r["c3"]["reason"] == "no_team_named"
+    assert r["c3"]["reason"] == "no_team_named" and r["c15"]["reason"] == "no_team_named"
+    assert (r["c11"]["status"], r["c11"]["team"]) == ("matched", "Kaloton Lokars")
     assert (r["c4"]["status"], r["c4"]["team"]) == ("matched", "Sunoton Ravirs")
+    assert (r["c12"]["status"], r["c12"]["team"]) == ("matched", "Nokaton Pedors")
+    assert (r["c13"]["status"], r["c13"]["team"]) == ("matched", "Nokaton St Kanors")
+    assert r["c14"]["reason"] == "no_team_named"
     assert r["c5"]["reason"] == "name_shared"
     assert (r["c6"]["status"], r["c6"]["team"]) == ("matched", "Doteton Blue Visurs")
     assert r["c7"]["reason"] == "name_shared"
     assert (r["c8"]["status"], r["c8"]["team"]) == ("matched", "Nokaton Pedors")
     assert r["c9"]["reason"] == "name_shared"
     assert (r["c10"]["status"], r["c10"]["league"], r["c10"]["game_id"]) == ("matched", "NCAAMB", "ncaamb0")
+    env.clock.set("2026-11-20T15:00:01Z")                    # the latest tables are now more than 7 days old
+    env.out(capsys, "match")
+    r = env.rows()
+    assert all(r[c]["reason"] == "no_team_named" for c in ("c2", "c4", "c12", "c13"))
+    assert r["c8"]["status"] == "matched"
 
 
-def test_schedule_stores_the_codes_of_open_markets_only_with_at_most_ten_requests(tmp_path, capsys):
+def test_no_code_is_a_name_unless_all_five_leagues_have_a_table(tmp_path, capsys):
+    w = PickWorld()
+    w.thread()
+    w.comment("c2", "a2", [("2026-11-13T22:00:00Z", {"market": "moneyline", "selection": "Take KAL ML",
+                                                     "league": "NBA"}, "-110")])
+    w.comment("c4", "a4", [("2026-11-13T22:00:00Z", {"market": "moneyline", "selection": "Take SUN ML"}, "-110")])
+    env = Env(tmp_path, w)
+    env.kalshi.fail = {SERIES["NHL"]}                        # only four leagues' tables can be listed
+    env.clock.set("2026-11-13T15:00:00Z")
+    for lg, teams in LOOKALIKES.items():
+        env.odds.events[SPORT[lg]] = [ev("%s%d" % (lg.lower(), j), teams[2 * j][0], teams[2 * j + 1][0],
+                                         LOOK_STARTS[lg][j], SPORT[lg]) for j in range(2)]
+        env.kalshi.kevents[SERIES[lg]] = [kevent(lg, "26NOV13", teams[2 * j + 1][3:5], teams[2 * j][3:5])
+                                          for j in range(2)]
+    out = env.out(capsys, "schedule")
+    assert str(out["kalshi_codes"]["NHL"]).startswith("error") and out["kalshi_codes"]["NBA"] == {"events": 2}
+    env.clock.set("2026-11-14T12:00:00Z")
+    env.out(capsys, "match")
+    r = env.rows()
+    assert r["c2"]["reason"] == r["c4"]["reason"] == "no_team_named"
+
+
+def test_schedule_stores_code_tables_from_the_events_lists_with_at_most_thirty_requests(tmp_path, capsys):
     env = Env(tmp_path, two_league_world("NBA"))
     kings_schedule(env)
-    settled = dict(kmarket("KXNBAGAME-26NOV13BOSSAC", "BOS", "Boston", "yes", "2026-11-14T03:00:00Z"))
-    env.kalshi.open["KXNBAGAME"] = [kopen("KXNBAGAME-26NOV13BOSSAC", "SAC", "Sacramento"), settled]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", "26NOV13", ("BOS", "Boston"), ("SAC", "Sacramento"))]
     out = env.out(capsys, "schedule")
-    assert out["kalshi_codes"]["NBA"] == {"markets": 1}
-    assert all("status=open" in u for u in env.kalshi.urls) and len(env.kalshi.urls) == 5
+    assert out["kalshi_codes"]["NBA"] == {"events": 1}
+    assert len(env.kalshi.urls) == 5 and all("/events?" in u and "min_close_ts=" in u for u in env.kalshi.urls)
+    assert not any("/markets" in u for u in env.kalshi.urls)          # no market is read, of any event
     s = env.store()
-    raw = " ".join(r["raw"] for r in s.rows("SELECT raw FROM kalshi_lists"))
+    tables = s.rows("SELECT league, raw FROM code_tables")
+    fetches = s.rows("SELECT league, fetched_at FROM code_fetches")
     s.close()
-    assert "BOSSAC-SAC" in raw and "BOSSAC-BOS" not in raw and "Boston" not in raw and '"result"' not in raw
+    assert sorted(t["league"] for t in tables) == sorted(pg.LEAGUES) and len(fetches) == 5   # empty tables count
+    raw = json.loads([t for t in tables if t["league"] == "NBA"][0]["raw"])
+    assert all(json.loads(t["raw"]) == [] for t in tables if t["league"] != "NBA")
+    assert raw == [{"event_ticker": "KXNBAGAME-26NOV13BOSSAC", "sub_title": "BOS vs SAC (Nov 13)",
+                    "title": "Boston vs Sacramento"}]
     env.kalshi.urls.clear()
-    env.kalshi.endless = True                                 # pages without end: the run stops at 10 requests
+    env.kalshi.endless = True                                 # pages without end: the run stops at 30 requests
     env.clock.set("2026-11-13T17:00:00Z")
     out = env.out(capsys, "schedule")
-    assert len(env.kalshi.urls) == 10 and out["NBA"]["games"] == 1
-    assert out["kalshi_codes"]["NFL"] == {"markets": 0}       # an empty first page ends the listing
-    assert all(out["kalshi_codes"][lg].startswith("error") for lg in ("NBA", "NHL", "NCAAF", "NCAAMB"))
+    assert len(env.kalshi.urls) == 30 and out["NBA"]["games"] == 1
+    assert out["kalshi_codes"]["NFL"] == {"events": 0}        # an empty first page ends the listing
+    assert all(str(out["kalshi_codes"][lg]).startswith("error") for lg in ("NBA", "NHL", "NCAAF", "NCAAMB"))
+    s = env.store()
+    assert s.one("SELECT COUNT(*) AS n FROM code_fetches")["n"] == 6           # an unfinished listing is no table
+    s.close()
+
+
+# ---------------------------------------------------------------- invariant 3: codes from complete tables only
+
+SHARED = {   # league -> [(full name, Kalshi name, code)]; games: team 0 v 1 and team 2 v 3
+    "NFL": [("Caraton Panirs", "Caraton", "CAR"), ("Pitaton Stelirs", "Pitaton", "PIT"),
+            ("Dalaton Cowirs", "Dalaton", "DAL"), ("Minaton Vikirs", "Minaton", "MNV")],
+    "NHL": [("Caraton Hurirs", "Caraton", "CAR"), ("Pitaton Pengirs", "Pitaton", "PIT"),
+            ("Dalaton Starirs", "Dalaton", "DAL"), ("Edmaton Oilirs", "Edmaton", "EDM")],
+    "NBA": [("Dalaton Mavirs", "Dalaton", "DAL"), ("Minaton Timirs", "Minaton", "MNV"),
+            ("Bosaton Celirs", "Bosaton", "BOS"), ("Phoaton Sunirs", "Phoaton", "PHX")],
+    "NCAAF": [("Iowaton Hawkirs", "Iowaton", "IOWT"), ("Ohiaton Bucirs", "Ohiaton", "OSU"),
+              ("Bamaton Tidirs", "Bamaton", "BAMA"), ("Texaton Longirs", "Texaton", "TEXT")],
+    "NCAAMB": [("Iowaton Hawkirs", "Iowaton", "IOWT"), ("Ohiaton Bucirs", "Ohiaton", "OSU"),
+               ("Dukaton Devirs", "Dukaton", "DUKE"), ("Kanaton Jayirs", "Kanaton", "KANT")],
+}
+SHARED_STARTS = {"NFL": ("2026-11-13T23:00:00Z", "2026-11-13T23:30:00Z"),
+                 "NHL": ("2026-11-14T01:00:00Z", "2026-11-14T01:30:00Z"),
+                 "NBA": ("2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z"),
+                 "NCAAF": ("2026-11-13T22:30:00Z", "2026-11-14T00:30:00Z"),
+                 "NCAAMB": ("2026-11-14T02:30:00Z", "2026-11-14T03:00:00Z")}
+ENGLISH = "car\npit\ntext\nduke\ntake\ntonight\nhammer\n"
+TEMPLATES = (("Take {} ML", True, False), ("Hammer {} tonight ML", False, False), ("Take {} -3.5", True, False),
+             ("{} ML", True, False), ("{} -3.5", True, False),            # capitals, nothing but the code and marker
+             ("{} TONIGHT ML", True, True))                               # capitals with another word: no code
+
+
+def shared_env(tmp_path, capsys, world, fail=()):
+    env = Env(tmp_path, world)
+    env.kalshi.fail = set(fail)
+    env.clock.set("2026-11-13T15:00:00Z")
+    for lg, teams in SHARED.items():
+        env.odds.events[SPORT[lg]] = [ev("%s%d" % (lg.lower(), j), teams[2 * j][0], teams[2 * j + 1][0],
+                                         SHARED_STARTS[lg][j], SPORT[lg]) for j in range(2)]
+        env.kalshi.kevents[SERIES[lg]] = [kevent(lg, "26NOV13", teams[2 * j + 1][1:][::-1], teams[2 * j][1:][::-1])
+                                          for j in range(2)]
+    env.out(capsys, "schedule")
+    env.clock.set("2026-11-14T12:00:00Z")
+    env.out(capsys, "match")
+    return env
+
+
+def test_a_code_names_a_team_only_from_complete_tables_generated_1100_picks_with_shared_codes(
+        tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    rng = random.Random(16)
+    owners = {}
+    for lg, teams in SHARED.items():
+        for j, (full, _, code) in enumerate(teams):
+            owners.setdefault(code, set()).add((lg, full))
+    w = PickWorld()
+    w.thread()
+    labels = {}
+    for n in range(1100):
+        lg = rng.choice(sorted(SHARED))
+        j = rng.randrange(4)
+        full, _, code = SHARED[lg][j]
+        gid, start = "%s%d" % (lg.lower(), j // 2), SHARED_STARTS[lg][j // 2]
+        begun = rng.random() < 0.5
+        seen = plus(start, rng.randint(60, 5400) if begun else -rng.randint(60, 5400))
+        template, before, caps_blocked = rng.choice(TEMPLATES)
+        written = rng.random() < 0.5
+        f = {"market": "spread" if "-3.5" in template else "moneyline", "selection": template.format(code)}
+        if f["market"] == "spread":
+            f["line"] = -3.5
+        if written:
+            f["league"] = LEAGUE_WORD[lg]
+        cid = "c%04d" % n
+        w.comment(cid, "author%04d" % n, [(seen, f, "-110")])
+        scope = {o for o in owners[code] if not written or o[0] == lg}
+        usable = (before or code.lower() not in ENGLISH.split()) and len(scope) == 1 and not caps_blocked
+        labels[cid] = {"game": gid, "side": "home" if j % 2 == 0 else "away", "begun": begun, "usable": usable,
+                       "risky": begun and len(owners[code]) > 1}
+    env = shared_env(tmp_path, capsys, w)
+    rows = env.rows()
+    assert set(rows) == set(labels)
+    wrong = [(c, r["game_id"], labels[c]) for c, r in rows.items() if r["status"] == "matched" and (
+        r["game_id"] != labels[c]["game"] or r["side"] != labels[c]["side"])]
+    assert wrong == []
+    for c, r in rows.items():                                   # the oracle: matched exactly when it should be
+        assert (r["status"] == "matched") == (labels[c]["usable"] and not labels[c]["begun"]), (c, r["reason"])
+    assert sum(1 for c in rows if rows[c]["status"] == "matched") > 150
+    assert sum(1 for c in labels if labels[c]["risky"]) > 300
+    env2 = shared_env(tmp_path / "four", capsys, w, fail=[SERIES["NHL"]])  # one league's table missing: no code at all
+    assert not any(r["status"] == "matched" for r in env2.rows().values())
+
+
+# ---------------------------------------------------------------- invariant 4: codes that are English words
+
+def test_an_english_word_code_counts_only_before_the_bet_also_in_a_selection_all_in_capitals(
+        tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text("no\nway\nis\nthe\nplay\ntake\ntonight\n")
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    sel = {"c1": ("moneyline", "NO WAY ML"), "c2": ("moneyline", "Take NO ML"), "c3": ("moneyline", "NO ML"),
+           "c4": ("moneyline", "No way, NO is the play ML"), "c5": ("spread", "Take NO -4.5"),
+           "c6": ("moneyline", "NO ml"), "c7": ("moneyline", "Take WAR ML"), "c8": ("moneyline", "Take WAR tonight ML"),
+           "c9": ("moneyline", "Take NO tonight ML"), "c10": ("spread", "Take NO 4.5 points")}
+    w = PickWorld()
+    w.thread()
+    for cid, (market, text) in sel.items():
+        f = {"market": market, "selection": text}
+        if market == "spread":
+            f["line"] = -4.5 if "-" in text else 4.5
+        w.comment(cid, "a" + cid, [("2026-11-13T18:00:00Z", f, "-110")])
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev("g1", "Noraton Pelirs", "Waraton Bulirs", "2026-11-14T00:00:00Z")]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", "26NOV13", ("WAR", "Waraton"), ("NO", "Noraton"))]
+    env.clock.set("2026-11-13T17:00:00Z")
+    env.out(capsys, "schedule")
+    env.clock.set("2026-11-13T19:00:00Z")
+    env.out(capsys, "match")
+    r = env.rows()
+    for c in ("c1", "c4", "c9"):
+        assert r[c]["reason"] == "no_team_named", c
+    for c, team in (("c2", "Noraton Pelirs"), ("c3", "Noraton Pelirs"), ("c5", "Noraton Pelirs"),
+                    ("c6", "Noraton Pelirs"),
+                    ("c7", "Waraton Bulirs"), ("c8", "Waraton Bulirs"), ("c10", "Noraton Pelirs")):
+        assert (r[c]["status"], r[c]["team"]) == ("matched", team), (c, r[c]["reason"])
+    monkeypatch.setattr(pg, "WORDS_FILE", tmp_path / "missing", raising=False)
+    fallback = pg._english_words()
+    assert "no" in fallback and "was" in fallback and len(fallback) < 2000
+
+
+def test_a_selection_in_capitals_keeps_its_codes_unless_it_holds_another_word(tmp_path, capsys, monkeypatch):
+    """Clarification 20: the capitals rule takes the codes only from a selection holding a word besides team codes and
+    the bet's markers (ML, a line, over / under and o / u, numbers, "/", "@", "vs" between two codes)."""
+    words = tmp_path / "words"
+    words.write_text("no\nway\nstrong\nis\n")
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    sel = {"p1": {"market": "moneyline", "selection": "LAL ML"},
+           "p2": {"market": "spread", "selection": "BOS -4.5", "line": -4.5, "league": "NBA"},
+           "p3": {"market": "total", "selection": "KC/BUF OVER 47.5", "line": 47.5},
+           "p4": {"market": "total", "selection": "KC @ BUF O47.5", "line": 47.5},
+           "p5": {"market": "total", "selection": "KC VS BUF UNDER 47", "line": 47},
+           "p6": {"market": "moneyline", "selection": "MTL ML"},
+           "n1": {"market": "moneyline", "selection": "IND STRONG ML"},      # IND is not English: the capitals rule
+           "n2": {"market": "moneyline", "selection": "NO WAY ML"},
+           "n3": {"market": "total", "selection": "KC/BUF OVER 47.5 LOCK", "line": 47.5},
+           "s1": {"market": "moneyline", "selection": "BOS ML"},             # the NBA's and the NHL's code
+           "s2": {"market": "spread", "selection": "BOS -4.5", "line": -4.5},
+           "s3": {"market": "moneyline", "selection": "BOS ML", "league": "NHL"}}
+    w = PickWorld()
+    w.thread()
+    for cid, f in sel.items():
+        w.comment(cid, "a" + cid, [("2026-11-13T18:00:00Z", f, "-110")])
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev("nba1", "Lalaton Lakirs", "Bosaton Celirs", "2026-11-14T00:00:00Z")]
+    env.odds.events[SPORT["NFL"]] = [
+        ev("nfl1", "Kanaton Chiefirs", "Bufaton Bilirs", "2026-11-14T01:00:00Z", SPORT["NFL"]),
+        ev("nfl2", "Indaton Coltirs", "Noraton Saintirs", "2026-11-14T01:00:00Z", SPORT["NFL"])]
+    env.odds.events[SPORT["NHL"]] = [ev("nhl1", "Bosaton Brirs", "Montaton Canirs", "2026-11-14T00:30:00Z",
+                                        SPORT["NHL"])]
+    env.kalshi.kevents[SERIES["NBA"]] = [kevent("NBA", "26NOV13", ("BOS", "Bosaton"), ("LAL", "Lalaton"))]
+    env.kalshi.kevents[SERIES["NFL"]] = [kevent("NFL", "26NOV13", ("BUF", "Bufaton"), ("KC", "Kanaton")),
+                                         kevent("NFL", "26NOV13", ("NO", "Noraton"), ("IND", "Indaton"))]
+    env.kalshi.kevents[SERIES["NHL"]] = [kevent("NHL", "26NOV13", ("MTL", "Montaton"), ("BOS", "Bosaton"))]
+    env.clock.set("2026-11-13T17:00:00Z")
+    env.out(capsys, "schedule")
+    env.clock.set("2026-11-13T19:00:00Z")
+    env.out(capsys, "match")
+    r = env.rows()
+    for c, team in (("p1", "Lalaton Lakirs"), ("p2", "Bosaton Celirs"), ("p6", "Montaton Canirs"),
+                    ("s3", "Bosaton Brirs")):
+        assert (r[c]["status"], r[c]["team"]) == ("matched", team), (c, r[c]["reason"])
+    for c in ("p3", "p4", "p5"):
+        assert (r[c]["status"], r[c]["game_id"], r[c]["side"]) == ("matched", "nfl1", None), (c, r[c]["reason"])
+    for c in ("n1", "n2", "n3", "s1", "s2"):
+        assert r[c]["reason"] == "no_team_named", (c, r[c]["status"], r[c].get("team"))
 
 
 # ---------------------------------------------------------------- the store
@@ -775,28 +1068,95 @@ def test_status_reads_only_and_one_writer_at_a_time(tmp_path, capsys):
             env.run("match")
 
 
-def test_the_real_pick_store_is_graded_into_the_default_grading_store_only(tmp_path, capsys, monkeypatch):
-    defaults = (getattr(pg, "DEFAULT_PICKS", None), getattr(pg, "DEFAULT_STORE", None))
-    real_picks, real_store = tmp_path / "real" / "picks.sqlite", tmp_path / "real" / "grading"
-    two_league_world("NBA").build(real_picks)
-    two_league_world("NBA").build(tmp_path / "test-picks.sqlite")
-    monkeypatch.setattr(pg, "DEFAULT_PICKS", real_picks, raising=False)
-    monkeypatch.setattr(pg, "DEFAULT_STORE", real_store, raising=False)
-    odds = OddsTransport()
+def other_world(seen="2026-11-13T11:00:00Z", tid="t9"):
+    """A pick store of another identity: its first thread and payload differ."""
+    w = PickWorld()
+    w.thread(tid, seen=seen)
+    w.comment("c1", "alice", [("2026-11-13T20:00:00Z", ml("Kings", "NBA"), "-110")], tid=tid)
+    return w
+
+
+def runner(odds=None):
+    odds = odds or OddsTransport()
 
     def run(store, picks, *cmd):
         return pg.main(["--store", str(store), "--picks", str(picks), *(cmd or ("schedule",))],
                        odds_client=odds_client(odds), kalshi_client=kalshi_client(KalshiTransport()), clock=Clock())
+    return run
+
+
+def test_the_defaults_are_the_real_stores():
+    assert REAL_DEFAULTS == (pg.REPO / "memory" / "pick_lists.sqlite", pg.REPO / "artifacts" / "pick_grading")
+
+
+def test_the_real_pick_store_is_graded_into_the_default_grading_store_only(tmp_path, capsys, monkeypatch):
+    real_picks, real_store = tmp_path / "real" / "picks.sqlite", tmp_path / "real" / "grading"
+    two_league_world("NBA").build(real_picks)
+    other_world().build(tmp_path / "test-picks.sqlite")
+    monkeypatch.setattr(pg, "DEFAULT_PICKS", real_picks, raising=False)
+    monkeypatch.setattr(pg, "DEFAULT_STORE", real_store, raising=False)
+    run = runner()
     for store, picks in ((tmp_path / "elsewhere", real_picks),
                          (tmp_path / "elsewhere", tmp_path / "real" / ".." / "real" / "picks.sqlite"),
                          (real_store, tmp_path / "test-picks.sqlite")):
         for cmd in (("schedule",), ("status",), ("match",)):
-            with pytest.raises(pg.Refused, match="one grading store"):
+            with pytest.raises(pg.Refused, match="one record"):
                 run(store, picks, *cmd)
     assert not (tmp_path / "elsewhere").exists() and not real_store.exists()
     assert run(real_store, real_picks) == 0
     assert run(tmp_path / "any", tmp_path / "test-picks.sqlite") == 0
-    assert defaults == (pg.REPO / "memory" / "pick_lists.sqlite", pg.REPO / "artifacts" / "pick_grading")
+
+
+def test_a_copy_of_the_real_pick_store_does_not_reset_the_one_time_rules(tmp_path, capsys, monkeypatch):
+    real_picks, real_store = tmp_path / "real" / "picks.sqlite", tmp_path / "real" / "grading"
+    two_league_world("NBA").build(real_picks)
+    monkeypatch.setattr(pg, "DEFAULT_PICKS", real_picks, raising=False)
+    monkeypatch.setattr(pg, "DEFAULT_STORE", real_store, raising=False)
+    run = runner()
+    assert run(real_store, real_picks) == 0                            # the default grading store is bound now
+    copies = tmp_path / "copies"
+    copies.mkdir()
+    shutil.copyfile(real_picks, copies / "cp.sqlite")                  # the verifier's case
+    os.symlink(real_picks, copies / "symlink.sqlite")
+    os.link(real_picks, copies / "hardlink.sqlite")
+    shutil.copyfile(real_picks, copies / "appended.sqlite")
+    db = sqlite3.connect(copies / "appended.sqlite")
+    db.execute("INSERT INTO threads VALUES ('t2', 'sub', 'u', 'Pick of the Day - 11/14/26', 'bot', NULL, NULL, "
+               "'2026-11-14T12:00:00Z')")
+    db.commit()
+    db.close()
+    for name in ("cp", "symlink", "hardlink", "appended"):
+        for cmd in (("schedule",), ("status",), ("match",), ("audit-sample", "--out", str(tmp_path / "audit"))):
+            with pytest.raises(pg.Refused, match="one record"):
+                run(tmp_path / ("store-" + name), copies / (name + ".sqlite"), *cmd)
+        assert not (tmp_path / ("store-" + name)).exists()
+    other_world().build(tmp_path / "other.sqlite")                    # the default store takes no other identity
+    os.replace(tmp_path / "other.sqlite", real_picks)
+    with pytest.raises(pg.Refused, match="one record"):
+        run(real_store, real_picks, "match")
+    other_world().build(tmp_path / "x.sqlite")
+    other_world(seen="2026-11-13T10:00:00Z", tid="t8").build(tmp_path / "y.sqlite")
+    assert run(tmp_path / "xs", tmp_path / "x.sqlite") == 0            # any store binds to its first pick store
+    with pytest.raises(pg.Refused, match="one record"):
+        run(tmp_path / "xs", tmp_path / "y.sqlite", "match")
+    st = pg.GradingStore(real_store / pg.STORE_FILE, readonly=True)
+    assert len(st.one("SELECT identity FROM bound")["identity"]) == 64
+    st.close()
+
+
+def test_a_store_of_another_layout_is_refused_without_creating_anything_beside_it(tmp_path):
+    g = tmp_path / "g"
+    g.mkdir()
+    db = sqlite3.connect(g / pg.STORE_FILE)
+    db.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, at TEXT NOT NULL, command TEXT NOT NULL, "
+               "fingerprint TEXT NOT NULL)")
+    db.commit()
+    db.close()
+    two_league_world("NBA").build(tmp_path / "p.sqlite")
+    for cmd in ("match", "schedule", "status"):
+        with pytest.raises(pg.Refused, match="layout"):
+            pg.main(["--store", str(g), "--picks", str(tmp_path / "p.sqlite"), cmd], clock=Clock())
+    assert sorted(os.listdir(g)) == [pg.STORE_FILE]
 
 
 # ---------------------------------------------------------------- credits
@@ -1226,6 +1586,89 @@ def test_every_function_match_can_reach_is_inside_the_fingerprint(tmp_path):
     assert "pl.Store.version_before" in scope
 
 
+def _copy_with_text(tmp_path, name, change):
+    path = tmp_path / ("pg_text_%s.py" % name)
+    path.write_text(change(Path(pg.__file__).read_text()))
+    spec = importlib.util.spec_from_file_location("pg_text_%s" % name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_comments_blank_lines_and_docstrings_do_not_change_the_fingerprint_but_code_constants_and_tables_do(tmp_path):
+    base = pg.fingerprint()
+
+    def comment(src):
+        return src.replace("def cmd_match(gr: Grader) -> dict:\n",
+                           "def cmd_match(gr: Grader) -> dict:\n    # a comment only\n\n    # and another\n", 1)
+
+    def docstring(src):
+        return src.replace('"""One version of a pick against the games of its window',
+                           '"""Reworded: one version of a pick against the games of its window', 1)
+    for name, change in (("comment", comment), ("docstring", docstring)):
+        assert change(Path(pg.__file__).read_text()) != Path(pg.__file__).read_text(), name
+        assert _copy_with_text(tmp_path, name, change).fingerprint() == base, name
+
+    def statement(src):
+        return src.replace("def cmd_match(gr: Grader) -> dict:\n",
+                           "def cmd_match(gr: Grader) -> dict:\n    _unused = 1\n", 1)
+
+    def constant(src):
+        return src.replace("MIN_FORM_CHARS = 3", "MIN_FORM_CHARS = 4", 1)
+
+    def table(src):
+        return src.replace("CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY, ",
+                           "CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY, extra TEXT, ", 1)
+    for name, change in (("statement", statement), ("constant", constant), ("table", table)):
+        assert change(Path(pg.__file__).read_text()) != Path(pg.__file__).read_text(), name
+        assert _copy_with_text(tmp_path, name, change).fingerprint() != base, name
+
+
+def test_every_reading_ever_made_is_listed_by_status_every_evaluation_and_the_scoring_log(tmp_path, capsys, monkeypatch):
+    env, games = setup_big(tmp_path, capsys)
+    settle_world(env, games)
+    a = env.out(capsys, "audit-sample", "--out", str(env.audit_dir))
+    env.out(capsys, "audit-pass", "--sample", str(a["audit_id"]), "--wrong", "3")
+    fp_a = pg.fingerprint()
+    monkeypatch.setitem(pg.LEAGUE_WORDS, "pro basketball", ("NBA",))               # a changed rule: a new reading
+    env.out(capsys, "match")
+    b = env.out(capsys, "audit-sample", "--out", str(env.audit_dir))
+    env.out(capsys, "audit-pass", "--sample", str(b["audit_id"]), "--wrong", "0")
+    env.clock.set("2026-11-15T12:00:00Z")
+    env.out(capsys, "prices")
+    env.out(capsys, "results")
+    st = env.out(capsys, "status")
+    got = [(x["fingerprint"], x["sample"], x["wrong"]) for x in st["readings"]]
+    assert got == [(fp_a, a["audit_id"], 3), (pg.fingerprint(), b["audit_id"], 0)]
+    assert all(x["at"] for x in st["readings"]) and st["fingerprints_audited"] == 2
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["readings"] == st["readings"] and res["fingerprints_audited"] == 2
+    log = [e for e in sl.scoring_entries(env.root) if e["kind"] == "evaluate_development"]
+    assert log[-1]["result"]["readings"] == st["readings"]
+
+
+def test_the_scoring_code_is_pinned_at_the_choice(tmp_path, capsys, monkeypatch):
+    env, games = setup_big(tmp_path, capsys)
+    env.clock.set("2026-11-15T12:00:00Z")
+    env.audit(capsys)
+    ch = env.out(capsys, "choose", "--version", "1")
+    assert ch["choice"] == 1 and len(ch["scoring_fingerprint"]) == 64
+    assert "pg.purchase_quote" in pg.scoring_scope()["functions"] and "pg.cmd_evaluate" in pg.scoring_scope()["functions"]
+    monkeypatch.setattr(pg, "MAX_ASK", 0.94)                       # a repair of the scoring code after the choice
+    env.clock.set("2027-03-31T12:00:00Z")
+    with pytest.raises(pg.Refused, match="pinned"):
+        env.run("evaluate", "--period", "test")
+    assert not any(e["kind"] == "test_result" for e in sl.scoring_entries(env.root))
+    res = env.out(capsys, "evaluate", "--period", "test", "--code-changed", "the ask cap repaired")
+    cc = res["code_changed"]
+    assert cc["reason"] == "the ask cap repaired" and cc["at_choice"] == ch["scoring_fingerprint"]
+    assert cc["now"] == pg.scoring_fingerprint() != cc["at_choice"] and cc["at"]
+    log = sl.scoring_entries(env.root)
+    entry = [e for e in log if e["kind"] == "code_changed"][0]
+    assert entry["reason"] == "the ask cap repaired" and entry["at_choice"] == ch["scoring_fingerprint"]
+    assert [e for e in log if e["kind"] == "test_result"][0]["result"]["code_changed"] == cc
+
+
 # ---------------------------------------------------------------- invariant 4: the test period, scored once at the end
 
 def test_the_test_period_is_refused_before_the_counts_or_the_last_day_and_scored_once(tmp_path, capsys):
@@ -1236,7 +1679,7 @@ def test_the_test_period_is_refused_before_the_counts_or_the_last_day_and_scored
         env.run("evaluate", "--period", "test")
     with pytest.raises(ValueError):
         env.run("choose", "--version", "4")
-    assert env.out(capsys, "choose", "--version", "2") == {"choice": 2}
+    assert env.out(capsys, "choose", "--version", "2")["choice"] == 2
     with pytest.raises(pg.Refused, match="once"):
         env.run("choose", "--version", "1")
     for now in ("2026-12-20T12:00:00Z", "2027-03-31T03:59:59Z"):          # 2027-03-30, 23:59:59 US-Eastern
@@ -1297,10 +1740,12 @@ def test_without_a_choice_no_scores_are_bought_once_the_test_period_has_begun(tm
         assert out["scores"]["NBA"].startswith("refused: no choice stored")
 
 
-SEASON_DAYS, SEASON_GAMES = 21, 16
-
-
-def test_the_test_period_is_scored_once_both_counts_are_reached_and_ends_on_that_day(tmp_path, capsys):
+@pytest.mark.parametrize("SEASON_DAYS, SEASON_GAMES, END", [
+    (21, 16, 19),       # A's 20th day: 320 contracts and 320 picks, past 158 and 315
+    (22, 15, 20),       # 300 picks on the 20th day reach the pass line, not the margin of 315: the 21st day ends it
+])
+def test_the_test_period_is_scored_once_both_counts_are_reached_and_ends_on_that_day(
+        tmp_path, capsys, SEASON_DAYS, SEASON_GAMES, END):
     teams = team_names(2 * SEASON_GAMES)
     games = [("%s %s" % teams[2 * k], "%s %s" % teams[2 * k + 1]) for k in range(SEASON_GAMES)]
     w = PickWorld()
@@ -1342,17 +1787,38 @@ def test_the_test_period_is_scored_once_both_counts_are_reached_and_ends_on_that
     st = env.out(capsys, "status")
     tc = st["test_counts"]
     assert tc["versions"]["1"] == {"contracts": SEASON_DAYS * SEASON_GAMES, "days": SEASON_DAYS}
-    assert tc["B_graded"] == SEASON_DAYS * SEASON_GAMES and tc["reached_on"] == days[19].isoformat()
+    assert tc["B_graded"] == SEASON_DAYS * SEASON_GAMES and tc["reached_on"] == days[END].isoformat()
     assert "mean" not in json.dumps(st)
     res = env.out(capsys, "evaluate", "--period", "test")
-    assert res["end"] == days[19].isoformat()                              # A's 20th day; B passed 300 on day 19
-    assert (res["A"]["1"]["n"], res["A"]["1"]["days"]) == (20 * SEASON_GAMES, 20)
-    assert res["B"]["n"] == 20 * SEASON_GAMES
+    assert res["end"] == days[END].isoformat()
+    assert (res["A"]["1"]["n"], res["A"]["1"]["days"]) == ((END + 1) * SEASON_GAMES, END + 1)
+    assert res["B"]["n"] == (END + 1) * SEASON_GAMES
     assert res["pass_lines"]["A_counts_reached"] and res["pass_lines"]["B_counts_reached"]
     again = env.out(capsys, "evaluate", "--period", "test")
     assert "scored once" in again["note"]
     kinds = [e["kind"] for e in sl.scoring_entries(env.root)]
     assert kinds.count("test_result") == 1 and kinds[-1] == "test_result_shown"
+
+
+BOUNDARY = dict(LATE, start="2026-12-14T05:30:00Z", event="26DEC14")    # a development game on 2026-12-14 (00:30 ET)
+
+
+def test_no_settlement_of_a_test_period_day_is_fetched_before_a_choice_even_for_a_development_game(tmp_path, capsys):
+    env, games = setup_big(tmp_path, capsys, BOUNDARY)
+    settle_world(env, games, BOUNDARY)
+    env.audit(capsys)
+    env.clock.set("2026-12-14T10:00:00Z")                  # 05:00 US-Eastern, more than three hours after the start
+    r = env.out(capsys, "results")
+    env.out(capsys, "prices")
+    assert r["picks"] == 42 and not any("/markets" in u for u in env.kalshi.urls)
+    k = env.root / "kalshi.sqlite"
+    if k.exists():
+        db = sqlite3.connect(k)
+        assert db.execute("SELECT COUNT(*) FROM markets").fetchone()[0] == 0
+        db.close()
+    env.out(capsys, "choose", "--version", "1")
+    env.out(capsys, "results")
+    assert any("/markets" in u for u in env.kalshi.urls)
 
 
 # ---------------------------------------------------------------- invariant 9: scores are not bought again and again

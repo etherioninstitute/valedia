@@ -1,34 +1,50 @@
 """Grading of the public pick lists, exactly as the locked prediction says: docs/research/2026-11-13-pick-lists-prediction.md
-(commit 5f9183c, with its clarifications 1 to 14). Research only: nothing here sends anything to an exchange or a broker.
+(commit 5f9183c, with its clarifications 1 to 20). Research only: nothing here sends anything to an exchange or a broker.
 
     python -m valedia_trader.research_loop.pick_grading <command> [--store DIR] [--picks FILE]
+
+What the guards are for (the lead's ruling, clarification 19): the one-time rules (one reading per rule, one scoring,
+one record) protect the operator from mistakes and from quiet self-deception; they cannot stop an operator who edits the
+code or builds a second checkout, and do not claim to. What they do is not be reset by a slip or a flag, and leave a
+record nobody can miss: every reading ever made is printed by `status`, by every evaluation and in the scoring log.
 
 The stores live in one folder (`--store`, default `artifacts/pick_grading/`, which the repository's `artifacts/` line in
 `.gitignore` keeps out of git): `grading.sqlite` (this module's own store, append-only, layout `LAYOUT`), `credits.sqlite`
 (the credit ledger of `sports_lines.CreditLedger`), `kalshi.sqlite` (`kalshi_history.HistoryStore`) and `scoring.log`.
 The pick store (`--picks`) is opened read-only through `pick_lists.Store`; comment text reaches grading only through its
-`version_before(comment_id, moment)`. One record (clarification 13): the real pick store (`DEFAULT_PICKS`) is graded into
-the default grading store (`DEFAULT_STORE`) only, and that store takes no other pick store; any other pairing is refused.
+`version_before(comment_id, moment)`. One record (clarification 13): a pick store has an identity taken from its own
+first rows (`pick_store_identity`: the first thread's id and first-seen time and the first payload's kind, key, sha256
+and fetch time). A grading store is bound to the identity of the first pick store it grades and refuses any other; the
+real pick store (`DEFAULT_PICKS`) is graded into the default grading store (`DEFAULT_STORE`) only; and a pick store
+whose identity the default grading store is bound to is refused with any other grading store, whatever its path (a
+copy, a link, a copy with more rows).
 
 Commands:
 
-- `schedule`: The Odds API's free events list of each of the five leagues, stored as fetched, and the team codes and
-  names of the open markets of Kalshi's five game series (keyless, at most 10 requests a run; an open market carries no
-  result, and nothing of a settled market is kept). `schedule --date YYYY-MM-DD` buys the historical list of a missed
-  day (1 credit a league, the paid key), as of 06:00 US-Eastern that day. A game's start is the earliest
-  `commence_time` any stored list gives for it, whenever that list was fetched (clarification 8); a game counts only
-  if a list fetched before that start held it, and lists that differ on its start by more than 30 minutes flag it.
+- `schedule`: The Odds API's free events list of each of the five leagues, stored as fetched, and the table of team
+  codes of each of Kalshi's five game series, from its events list of every status (keyless, at most 30 requests a run;
+  an event carries its title and no result, and no market is read). A league's table is stored only when its listing
+  ended within the run's requests. `schedule --date YYYY-MM-DD` buys the historical list of a missed day (1 credit a
+  league, the paid key), as of 06:00 US-Eastern that day. A game's start is the earliest `commence_time` any stored
+  list gives for it, whenever that list was fetched (clarification 8); a game counts only if a list fetched before
+  that start held it, and lists that differ on its start by more than 30 minutes flag it.
 - `match`: one row a counted pick (`matches`), matched or not graded with one reason of `REASONS`. A comment's words are
   compared with every team known from the stored lists of the leagues its league field allows (all five when it names
-  none), any date, and with Kalshi's codes written in capitals; a pick names team T only when no other known team is
-  named at least as fully (a whole name beats a city, a nickname or a code; a tie is not graded); then T must play
-  exactly one game of the window (clarification 9). No model proposes anything. The rule's fingerprint
-  (`fingerprint()`, over every function and constant `match` can reach and the borrowed helpers) is stored with every
-  row.
+  none), any date; a pick names team T only when no other known team is named at least as fully (a whole name beats a
+  city or a nickname; a tie is not graded); then T must play exactly one game of the window (clarification 9). A
+  selection that names teams of two different games, or bets against the team it names, is not graded (clarification
+  18). Kalshi's codes count as names only from complete tables (clarification 16): every league has a table fetched in
+  the last 7 days; a code written in capitals names a team only when it belongs to one team alone across all stored
+  tables, or within the league the comment writes; a code that is also an English word counts only directly before
+  the bet's marker or as the selection's only other word; in a selection written wholly in capitals no word is a code
+  when it holds a word besides team codes and the bet's own markers (clarification 20: "LAL ML", "BOS -4.5" and
+  "KC/BUF OVER 47.5" keep their codes; "IND STRONG ML" has none).
+  No model proposes anything. The rule's fingerprint (`fingerprint()`, over the parsed code of every function `match`
+  can reach, the constants they read, the store's tables and the word list) is stored with every row.
 - `audit-sample [--out DIR]`: 40 matched picks beside the comment text they were graded from, in a file outside the
   repository. The draw's seed comes from the fingerprint; there is one sample a fingerprint. `audit-pass --sample N
   --wrong K` records the lead's count for that sample, once. More than 2 wrong closes the fingerprint for good; only a
-  changed rule gets a new reading (clarification 10).
+  changed rule gets a new reading (clarification 10). Every reading is listed with every evaluation.
 - `prices`: Kalshi's single-game events paired with the matched moneyline games (`sports_lines.pair_games`, strict, no
   model), and one-minute candles up to the purchase moment and never past the game's start (Question A).
 - `results`: Kalshi's settlement of the paired games and The Odds API's scores (`daysFrom=3`, 2 credits a league). A
@@ -36,19 +52,24 @@ Commands:
   started less than 3 days ago, and no scores list of that league was asked for in the last 6 hours. A final listed 3
   days or more after the start is not used: the game is not graded (clarification 14).
 - `evaluate --period development|test`, `choose --version N`, `daily`, `status`. The test period is scored once: when
-  both counts of the prediction are reached (Question A's chosen version: 150 contracts on 20 days; Question B: 300
-  graded picks) or from 2027-03-31 US-Eastern, never earlier and never again; the period ends on the thread date on
-  which both counts were first reached. `status` shows the counts so far without reading a result.
+  the counts that can be known without reading a result reach the margin (clarification 15: Question A's chosen
+  version, 158 contracts on 20 days; Question B, 315 graded picks) or from 2027-03-31 US-Eastern, never earlier and
+  never again; the period ends on the thread date on which both were first reached; the pass lines stay 150 and 300.
+  `choose` pins the scoring code (`scoring_fingerprint()`, over everything `prices`, `results` and `evaluate` reach);
+  `evaluate --period test` refuses a changed scoring code unless `--code-changed "<reason>"` is given, and then the
+  reason, both fingerprints and the time are written to the scoring log and the result (clarification 17). `status`
+  shows the counts so far without reading a result.
 
 Gates: no command reads a result (Kalshi's settled listing, a score, an evaluation) before an `audit-pass` with at most
 2 wrong exists for the current matching fingerprint, nor while a list was stored after the last `match` run. The first
 command that reads a result freezes the fingerprint: from then on any command refuses when the fingerprint differs.
-Results of test-period picks are not read before a choice is stored, and without a choice no scores are bought from
+Results of test-period picks are not read before a choice is stored, no settlement of a day of the test period is
+fetched before a choice (also for a development game on that day), and without a choice no scores are bought from
 06:00 US-Eastern on the test period's first day.
 
 The grading store refuses UPDATE, DELETE and an INSERT that repeats a natural key (so INSERT OR REPLACE cannot rewrite
 it); writers hold `grading.lock` (one at a time); `status` opens the stores read-only; a store of another layout is
-refused. A clock that reads earlier than the latest time in the grading store is refused. Nothing a commenter wrote is
+refused before anything is created beside it. A clock that reads earlier than the latest time in the grading store is refused. Nothing a commenter wrote is
 printed or logged: output holds counts, league codes, the schedule's team names and hashes; comment text appears only
 in the audit file, as quoted data.
 """
@@ -85,8 +106,9 @@ from valedia_trader.venues import kalshi_history as kh
 from valedia_trader.venues import odds_api as oa
 
 __all__ = ["PERIODS", "REASONS", "GradingStore", "Refused", "ClockBehind", "fingerprint", "fingerprint_scope",
-           "team_forms", "name_index", "named_teams", "match_text", "over_under", "thread_date", "window_end",
-           "schedule_games", "evaluate_comment", "purchase_quote", "grade_b", "day_interval", "test_counts", "main"]
+           "scoring_fingerprint", "scoring_scope", "pick_store_identity", "team_forms", "name_index", "named_teams",
+           "match_text", "over_under", "thread_date", "window_end", "schedule_games", "evaluate_comment",
+           "purchase_quote", "grade_b", "day_interval", "test_counts", "readings", "main"]
 
 UTC = timezone.utc
 ET = ZoneInfo("America/New_York")
@@ -94,7 +116,7 @@ LEAGUES = dict(sl.LEAGUES)                  # league -> (Odds API sport key, Kal
 PERIODS = {"development": (date(2026, 11, 13), date(2026, 12, 13)), "test": (date(2026, 12, 14), date(2027, 3, 31))}
 DEFAULT_STORE = REPO / "artifacts" / "pick_grading"
 DEFAULT_PICKS = REPO / "memory" / "pick_lists.sqlite"
-LAYOUT = 2                                  # the grading store's layout (rev 1 wrote layout 1, without this mark)
+LAYOUT = 3                                  # the grading store's layout (rev 1 wrote no mark, rev 2 wrote 2)
 PROMPT_HASH = pl.PROMPT_HASH                # parses graded: only those made under the prompt in force
 GRADED_MARKETS = ("moneyline", "spread", "total")
 WINDOW_END_HOUR = 6                         # a game must start before 06:00 US-Eastern on the day after the thread's date
@@ -114,13 +136,23 @@ SCORES_EVERY = 6 * 3600                     # ... and at most once in this long 
 FINAL_WITHIN = 3 * 86400                    # a final listed this long after the start or later is not used
 HISTORICAL_COST = 1
 HISTORICAL_HOUR_ET = 6
-CODE_REQUESTS = 10                          # keyless Kalshi requests for the open markets' codes, a run
-OPEN_STATUSES = ("active", "open", "initialized")
+CODE_REQUESTS = 30                          # keyless Kalshi requests for the code tables, a run
+CODE_LOOKBACK = 30 * 86400                  # the events listed: those with a market closing after now minus this
+CODE_FRESH = 7 * 86400                      # codes count only when every league has a table fetched this recently
 CODE_FORM = re.compile(r"^[A-Z][A-Z0-9]{1,5}$")
+EVENT_CODES = re.compile(r"^([A-Z][A-Z0-9]{1,5}) vs ([A-Z][A-Z0-9]{1,5})(?: \(|$)")
+WORDS_FILE = Path("/usr/share/dict/words")  # English words, compared without case
+FALLBACK_WORDS = ("a", "all", "am", "an", "and", "are", "as", "at", "be", "bet", "big", "but", "by", "can", "car",
+                  "day", "den", "do", "for", "go", "had", "has", "he", "hit", "i", "if", "in", "is", "it", "let",
+                  "lock", "man", "max", "me", "min", "my", "net", "no", "not", "now", "of", "on", "one", "or", "out",
+                  "pick", "pit", "play", "sea", "so", "sun", "take", "the", "to", "top", "two", "up", "us", "van",
+                  "was", "way", "we", "win", "yes", "you")
+AGAINST_WORDS = ("fade", "against", "anti", "not", "vs")
 SEED = 20261113
 REPS = 10_000
 VERSIONS = (1, 2, 3)
 A_COUNT, A_DAYS, B_COUNT = 150, 20, 300     # the pass lines' counts
+END_A_COUNT, END_B_COUNT = 158, 315         # the test period ends when these (5% above) are reached (clarification 15)
 MIN_FORM_CHARS = 3                          # a team's name form shorter than this is never matched
 NO_RUN_CAP = 10 ** 9                        # the ledger's run cap is not used here; the monthly cap is
 TEST_CHOICE_CUTOFF = datetime(2026, 12, 14, 6, tzinfo=ET)
@@ -135,8 +167,8 @@ LEAGUE_WORDS = {                            # the league as written (lower case,
 
 REASONS = (                                 # why a counted pick is not graded (matching)
     "no_thread_date", "not_first_of_author", "no_market", "market_not_graded", "league_not_graded", "no_selection",
-    "no_team_named", "name_shared", "no_game_in_window", "more_than_one_game", "side_unclear",
-    "pick_seen_after_start", "version_not_a_pick", "version_names_other_team", "no_text_before_start",
+    "no_team_named", "name_shared", "no_game_in_window", "more_than_one_game", "side_unclear", "teams_of_two_games",
+    "bets_against", "pick_seen_after_start", "version_not_a_pick", "version_names_other_team", "no_text_before_start",
     "no_start_known", "start_disagrees")
 A_REASONS = ("test_waits_for_choice", "no_kalshi_pair", "no_candle", "no_candle_within_10_minutes", "no_bid_ask",
              "ask_above_0.95", "spread_above_5_cents", "no_kalshi_result", "no_score_yet", "no_final_in_3_days",
@@ -234,25 +266,96 @@ def team_forms(full: str) -> frozenset:
     return frozenset(f for f in out if len("".join(f)) >= MIN_FORM_CHARS and not "".join(f).isdigit())
 
 
-def _words(text) -> list[tuple[str, str]]:
-    """The words of `text` exactly as `sports_lines._tokens` reads them, each beside its spelling as written (case
-    kept), so a Kalshi code can be required in capitals at the same place."""
+def _normal(text) -> str:
     s = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode()
-    s = s.replace("&", "").replace("'", "")
+    return s.replace("&", "").replace("'", "")
+
+
+def _spans(text) -> list[tuple[str, str, int, int]]:
+    """The words of `text` exactly as `sports_lines._tokens` reads them: (word, spelling as written, start, end) in the
+    normalised text, so a Kalshi code can be required in capitals at the same place."""
+    s = _normal(text)
     out = []
-    for raw in re.split(r"[^A-Za-z0-9]+", s):
-        if raw:
-            low = raw.lower()
-            word = sl._TOKEN_MAP.get(low, low)
-            if word:
-                out.append((word, raw))
+    for m in re.finditer(r"[A-Za-z0-9]+", s):
+        low = m.group().lower()
+        word = sl._TOKEN_MAP.get(low, low)
+        if word:
+            out.append((word, m.group(), m.start(), m.end()))
     return out
 
 
+def _words(text) -> list[tuple[str, str]]:
+    return [(w, raw) for w, raw, _, _ in _spans(text)]
+
+
+@lru_cache(maxsize=4)
+def _read_words(path: str, stamp: tuple) -> frozenset:
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return frozenset(FALLBACK_WORDS)
+    return frozenset(w.strip().lower() for w in text.split() if w.strip())
+
+
+def _english_words() -> frozenset:
+    """The system word list (`WORDS_FILE`, lower case), or the small built-in `FALLBACK_WORDS` when it is missing."""
+    try:
+        st = os.stat(WORDS_FILE)
+        stamp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return frozenset(FALLBACK_WORDS)
+    return _read_words(str(WORDS_FILE), stamp)
+
+
+_CHUNK_SPLIT = re.compile(r"[\s/@,;:!?()\[\]\"]+")
+_SIGNED = re.compile(r"^[+-]\d+(?:\.\d+)?$")
+_LINE_FORM = re.compile(r"^[ouOU]?[+-]?(\d+(?:\.\d+)?)$")
+
+
+def _chunks(s: str) -> list[str]:
+    return [c.strip(".") for c in _CHUNK_SPLIT.split(s) if c.strip(".")]
+
+
+def _is_marker(chunk: str, line) -> bool:
+    """The bet's own marker: ML, moneyline, a signed number, or the line (also joined to o / u)."""
+    c = chunk.lower()
+    if c in ("ml", "moneyline") or _SIGNED.match(c):
+        return True
+    m = _LINE_FORM.match(c)
+    return bool(m and line is not None and abs(float(m.group(1)) - abs(float(line))) < 1e-9)
+
+
+_BET_WORDS = ("ml", "moneyline", "over", "under", "o", "u")
+_NUMBER = re.compile(r"^[ou]?[+-]?\d+(?:\.\d+)?$")
+
+
+def _another_word(s: str, codes: dict) -> bool:
+    """Clarification 20: whether a text holds a word besides team codes (of any stored table) and the bet's own
+    markers (ML, moneyline, over / under and o / u, numbers and a line, "/" and "@", "vs" between two codes)."""
+    known = set().union(*(codes[lg] for lg in codes))
+    chunks = _chunks(s)
+    for i, c in enumerate(chunks):
+        if c in known or c.lower() in _BET_WORDS or _NUMBER.match(c.lower()):
+            continue
+        if c.lower() == "vs" and 0 < i < len(chunks) - 1 and chunks[i - 1] in known and chunks[i + 1] in known:
+            continue
+        return True
+    return False
+
+
+def _where_a_pick_puts_its_team(s: str, start: int, end: int, raw: str, line) -> bool:
+    """A word standing directly before the bet's marker, or the only word of the text besides that marker."""
+    rest = _chunks(s[end:])
+    if rest and _is_marker(rest[0], line) and not s[end:end + 1].isalnum():
+        return True
+    chunks = _chunks(s)
+    return chunks.count(raw) == 1 and all(c == raw or _is_marker(c, line) for c in chunks)
+
+
 def _code_teams(code: str, kalshi_name: str, names: Iterable[str]) -> set:
-    """The teams of one league a Kalshi market's code may stand for: those whose name `names_match` accepts for
-    Kalshi's name ("Vegas" for "Vegas Golden Knights"), and, for a name written as code and nickname ("VGK Golden
-    Knights"), those whose name ends with that nickname after words of its own."""
+    """The teams of one league a Kalshi code may stand for: those whose name `names_match` accepts for Kalshi's name
+    ("Vegas" for "Vegas Golden Knights"), and, for a name written as code and nickname ("CIN Bengals"), those whose
+    name ends with that nickname after words of its own."""
     out = {n for n in names if kalshi_name and sl.names_match(kalshi_name, n)}
     parts = kalshi_name.split()
     if len(parts) > 1 and parts[0] == code:
@@ -261,13 +364,24 @@ def _code_teams(code: str, kalshi_name: str, names: Iterable[str]) -> set:
     return out
 
 
-def name_index(lists: Iterable[dict], code_lists: Iterable[dict]) -> dict:
+def _event_codes(e: dict) -> list[tuple[str, str]] | None:
+    """[(code, Kalshi name)] of an events-list entry ("CIN vs WAS (Nov 23)", "Cincinnati vs Washington"); names are
+    empty when the title does not split; None when the sub-title carries no two codes."""
+    m = EVENT_CODES.match(str(e.get("sub_title") or ""))
+    if not m:
+        return None
+    names = str(e.get("title") or "").split(" vs ")
+    names = names if len(names) == 2 else ["", ""]
+    return [(m.group(1), names[0].strip()), (m.group(2), names[1].strip())]
+
+
+def name_index(lists: Iterable[dict], code_tables: Iterable[dict] | None) -> dict:
     """Every team known: the teams of every stored events list ({league, raw}) of the five leagues, any date, by
-    league, with each form that names them (`team_forms`; rank 2 for the whole name, 1 for a city or a nickname), and
-    the codes of Kalshi's stored open markets ({league, raw}). A code names the one team of its league that
-    `_code_teams` finds, where a Kalshi event whose two codes' candidates fit exactly one stored game settles both;
-    a code that finds none, or more than one over all its events, stays a name of no team: it can tie with a team,
-    never match one."""
+    league, with each form that names them (`team_forms`; rank 2 for the whole name, 1 for a city or a nickname); and,
+    when `code_tables` is given (None: the tables are not complete), the owners of each Kalshi code by league from all
+    stored tables ({league, raw}). In each event the two codes go to the teams `_code_teams` finds, an event whose two
+    codes' candidates fit exactly one stored game settling both; a code whose owner is found in no event stands for one
+    unknown team of its league. A code names a team only when its owners in the leagues compared are that one team."""
     teams: dict[str, set] = {lg: set() for lg in LEAGUES}
     played: dict[str, set] = {lg: set() for lg in LEAGUES}
     for r in lists:
@@ -288,36 +402,43 @@ def name_index(lists: Iterable[dict], code_lists: Iterable[dict]) -> dict:
             for f in sorted(team_forms(name)):
                 forms[lg].setdefault(f, []).append(((lg, name), 2 if f == full else 1))
                 longest = max(longest, len(f))
-    events: dict[tuple, dict] = {}
-    for r in code_lists:
-        if r["league"] not in teams:
+    if code_tables is None:
+        return {"forms": forms, "codes": None, "longest": longest}
+    resolved: dict[tuple, set] = {}
+    for r in code_tables:
+        lg = r["league"]
+        if lg not in teams:
             continue
-        for m in _list_body(r["raw"]):
-            code = kh.team_code(str(m.get("ticker") or ""))
-            if CODE_FORM.match(code):
-                events.setdefault((r["league"], str(m.get("event_ticker") or "")), {}).setdefault(code, set()).update(
-                    _code_teams(code, str(m.get("yes_sub_title") or ""), teams[r["league"]]))
-    found: dict[tuple, set] = {}
-    for (lg, _), by_code in sorted(events.items()):
-        if len(by_code) == 2:              # an event's two teams: when one stored game alone fits both, that settles it
-            (c1, s1), (c2, s2) = sorted(by_code.items())
+        for e in _list_body(r["raw"]):
+            pair = _event_codes(e)
+            if pair is None:
+                continue
+            (c1, n1), (c2, n2) = pair
+            s1, s2 = _code_teams(c1, n1, teams[lg]), _code_teams(c2, n2, teams[lg])
             fit = [(x, y) for x in sorted(s1) for y in sorted(s2) if frozenset((x, y)) in played[lg]]
             if len(fit) == 1:
-                by_code = {c1: {fit[0][0]}, c2: {fit[0][1]}}
-        for code, hits in by_code.items():
-            found.setdefault((lg, code), set()).update(hits)
+                s1, s2 = {fit[0][0]}, {fit[0][1]}
+            for code, hits in ((c1, s1), (c2, s2)):
+                resolved.setdefault((lg, code), set()).update(hits)
     codes: dict[str, dict] = {lg: {} for lg in LEAGUES}
-    for (lg, code), hits in sorted(found.items()):
-        codes[lg][code] = (lg, next(iter(hits))) if len(hits) == 1 else ("code", lg, code)
+    for (lg, code), hits in sorted(resolved.items()):
+        codes[lg][code] = frozenset((lg, n) for n in hits) if hits else frozenset({("code", lg, code)})
     return {"forms": forms, "codes": codes, "longest": longest}
 
 
-def named_teams(text: str, leagues: Sequence[str], index: dict) -> dict:
-    """The known teams of `leagues` that `text` names, each with how fully (2: the whole name; 1: a city, a nickname
-    or a Kalshi code, the code only as a whole word written in capitals). A form standing inside a longer form of
-    another team is not counted ("Blue Devils" names Duke, not New Jersey)."""
-    words = _words(text)
-    low = [w for w, _ in words]
+def _named(text: str, leagues: Sequence[str], index: dict, line=None) -> tuple[dict, dict, list[str]]:
+    """({team: how fully}, {team: first word index}, words) for one text. A form standing inside a longer form of
+    another team is not counted ("Blue Devils" names Duke, not New Jersey). A code counts (rank 1) only as a whole word
+    in capitals, from complete tables, when its owners in `leagues` are one known team, and not in a text written wholly
+    in capitals that holds another word (`_another_word`, clarification 20); a code that is also an English word only
+    where a pick puts its team."""
+    s = _normal(text)
+    spans = _spans(text)
+    low = [w for w, _, _, _ in spans]
+    letters = [c for c in s if c.isalpha()]
+    all_caps = bool(letters) and all(c.isupper() for c in letters) and (
+        index["codes"] is None or _another_word(s, index["codes"]))
+    english = _english_words() if index["codes"] is not None and not all_caps else frozenset()
     hits = []
     for i in range(len(low)):
         for n in range(1, min(index["longest"], len(low) - i) + 1):
@@ -325,33 +446,46 @@ def named_teams(text: str, leagues: Sequence[str], index: dict) -> dict:
             for lg in leagues:
                 for key, rank in index["forms"][lg].get(f, ()):
                     hits.append((i, i + n, key, rank))
-        raw = words[i][1]
-        if raw.isupper() and CODE_FORM.match(raw):
-            for lg in leagues:
-                key = index["codes"][lg].get(raw)
-                if key is not None:
-                    hits.append((i, i + 1, key, 1))
-    out: dict = {}
+        _, raw, a, b = spans[i]
+        if index["codes"] is None or all_caps or not raw.isupper() or not CODE_FORM.match(raw):
+            continue
+        if raw.lower() in english and not _where_a_pick_puts_its_team(s, a, b, raw, line):
+            continue
+        owners = frozenset().union(*(index["codes"][lg].get(raw, frozenset()) for lg in leagues))
+        if len(owners) == 1 and len(next(iter(owners))) == 2:
+            hits.append((i, i + 1, next(iter(owners)), 1))
+    ranks: dict = {}
+    first: dict = {}
     for h in hits:
         if any(o[2] != h[2] and o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits):
             continue
-        out[h[2]] = max(out.get(h[2], 0), h[3])
-    return out
+        ranks[h[2]] = max(ranks.get(h[2], 0), h[3])
+        first[h[2]] = min(first.get(h[2], h[0]), h[0])
+    return ranks, first, low
+
+
+def named_teams(text: str, leagues: Sequence[str], index: dict, line=None) -> dict:
+    """The known teams of `leagues` that `text` names, each with how fully (2: the whole name; 1: a city, a nickname
+    or a Kalshi code, see `_named`)."""
+    return _named(text, leagues, index, line)[0]
 
 
 def _plays(key: tuple, g: dict) -> bool:
     return len(key) == 2 and key[0] == g["league"] and key[1] in (g["home"], g["away"])
 
 
-def _resolve(text: str, market: str, leagues: Sequence[str], window: Sequence[dict], index: dict) -> dict:
-    """One version's words against every known team, then against the games of the window."""
-    named = named_teams(text, leagues, index)
+def _resolve(pieces: Sequence[str], market: str, leagues: Sequence[str], window: Sequence[dict], index: dict,
+             line=None) -> dict:
+    """One version's words (the selection first, then a total's two sides) against every known team, then against the
+    games of the window."""
+    named: dict = {}
+    for text in pieces:
+        for k, r in _named(text, leagues, index, line)[0].items():
+            named[k] = max(named.get(k, 0), r)
     if not named:
         return {"reason": "no_team_named"}
     top = max(named.values())
     best = sorted(k for k, r in named.items() if r == top)
-    if any(len(k) != 2 for k in best):
-        return {"reason": "name_shared"}                  # a code of no known team ties with what it stands beside
     if market != "total":
         if len(best) == 2:
             together = [g for g in window if all(_plays(k, g) for k in best)]
@@ -368,6 +502,11 @@ def _resolve(text: str, market: str, leagues: Sequence[str], window: Sequence[di
         side = "home" if g["home"] == key[1] else "away"
         if (g["league"], g["away" if side == "home" else "home"]) in named:
             return {"reason": "side_unclear"}
+        if any(not _plays(k, g) for k in named):
+            return {"reason": "teams_of_two_games"}
+        _, first, low = _named(pieces[0], leagues, index, line)
+        if key in first and any(w in AGAINST_WORDS for w in low[:first[key]]):
+            return {"reason": "bets_against"}
         return {"game": g, "side": side}
     if len(best) > 2:
         return {"reason": "name_shared"}
@@ -376,6 +515,8 @@ def _resolve(text: str, market: str, leagues: Sequence[str], window: Sequence[di
         return {"reason": "no_game_in_window"}
     if len(games) > 1 or not all(_plays(k, games[0]) for k in best):
         return {"reason": "more_than_one_game"}
+    if any(not _plays(k, games[0]) for k in named):
+        return {"reason": "teams_of_two_games"}
     return {"game": games[0], "side": None}
 
 
@@ -384,7 +525,8 @@ def match_text(fields: dict, window: Sequence[dict], index: dict) -> dict:
     Moneyline and spread are read from the selection, a total from the selection and both sides of the event. A pick
     names team T only when no other known team (`name_index`) of the leagues its league field allows is named at least
     as fully; T must then play exactly one game of the window. For a moneyline or a spread T's opponent must not be
-    named; for a total the one or two teams named most fully must be of one game of the window."""
+    named and no word of `AGAINST_WORDS` may stand before T; for a total the one or two teams named most fully must be
+    of one game of the window. Any other team named must play in that same game."""
     market = fields.get("market")
     if not market:
         return {"reason": "no_market"}
@@ -394,12 +536,18 @@ def match_text(fields: dict, window: Sequence[dict], index: dict) -> dict:
     if leagues is None:
         return {"reason": "league_not_graded", "market": market}
     sel = fields.get("selection")
+    try:
+        line = float(fields["line"]) if fields.get("line") is not None else None
+    except (TypeError, ValueError):
+        line = None
+    pieces = [str(sel or "")]
     if market == "total":
         ev = fields.get("event") if isinstance(fields.get("event"), dict) else {}
-        text = " ".join(str(x) for x in (sel, ev.get("side_a"), ev.get("side_b")) if x)
+        pieces += [str(x) for x in (ev.get("side_a"), ev.get("side_b")) if x]
+    if any(p.strip() for p in pieces):
+        out = _resolve(pieces, market, leagues, window, index, line)
     else:
-        text = str(sel or "")
-    out = _resolve(text, market, leagues, window, index) if text.strip() else {"reason": "no_selection"}
+        out = {"reason": "no_selection"}
     out["market"] = market
     return out
 
@@ -532,9 +680,10 @@ def _matched_row(o: dict, g: dict, known_at: str) -> dict:
             "known_at": known_at, "start": g["start"]}
 
 
-# ---------------------------------------------------------------- the fingerprint: everything `match` can reach
+# ---------------------------------------------------------------- the fingerprints: everything a command can reach
 
-_SCOPE_ROOT = "cmd_match"
+_MATCH_ROOTS = ("cmd_match",)
+_SCORING_ROOTS = ("cmd_prices", "cmd_results", "cmd_evaluate")
 _MISSING = object()
 
 
@@ -565,26 +714,50 @@ def _members(cls: type, label: str) -> Iterable[tuple[str, str, Callable]]:
             yield name, "%s.%s.%s" % (label, cls.__name__, name), f
 
 
-def fingerprint_scope() -> dict:
-    """What the matching fingerprint covers, found from the source: every function and method `cmd_match` can reach
-    (module-level names, and methods of this module's classes and of `pick_lists.Store` by attribute name), the
-    helpers it borrows from sports_lines, pick_lists and kalshi_history (and what they reach in their own modules),
-    and every module-level constant on the way. {"functions": [names], "constants": [names], ...sources and values}."""
-    ctx = {"pg": (globals(), __name__), "sl": (vars(sl), sl.__name__), "pl": (vars(pl), pl.__name__),
-           "kh": (vars(kh), kh.__name__)}
-    by_module = {mn: label for label, (_, mn) in ctx.items()}
+def _parsed(fn: Callable) -> tuple[ast.AST | None, str]:
+    """A function's parsed code, docstrings removed: (tree, dump). Comments, blank lines and docstrings do not reach
+    the dump; every executed statement, name and constant does. A function without source (generated) dumps its
+    name only."""
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(fn))))
+    except (OSError, TypeError):
+        return None, "no source: %s" % getattr(fn, "__qualname__", "?")
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)) and body and \
+                isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and \
+                isinstance(body[0].value.value, str):
+            node.body = body[1:] or [ast.Pass()]
+    return tree, ast.dump(tree, annotate_fields=True, include_attributes=False)
+
+
+def _scope(roots: Sequence[str], wide: bool) -> dict:
+    """Every function and method the `roots` can reach, found from the parsed code: module-level names, methods of
+    this module's classes and of `pick_lists.Store` by attribute name (`wide`: also of the classes of sports_lines,
+    kalshi_history, kalshi_data and odds_api), the helpers borrowed from those modules (and what they reach there),
+    and every module-level constant on the way."""
+    mods = {"pg": (globals(), __name__), "sl": (vars(sl), sl.__name__), "pl": (vars(pl), pl.__name__),
+            "kh": (vars(kh), kh.__name__)}
+    if wide:
+        mods.update({"kd": (vars(kd), kd.__name__), "oa": (vars(oa), oa.__name__)})
+    by_module = {mn: label for label, (_, mn) in mods.items()}
     methods: dict[str, list[tuple[str, Callable, str]]] = {}
-    own = [v for v in globals().values() if isinstance(v, type) and v.__module__ == __name__]
-    for cls, label in [(c, "pg") for c in own] + [(pl.Store, "pl")]:
+    classes = [(v, "pg") for v in globals().values() if isinstance(v, type) and v.__module__ == __name__]
+    classes.append((pl.Store, "pl"))
+    if wide:
+        for label in ("sl", "kh", "kd", "oa"):
+            ns, mn = mods[label]
+            classes += [(v, label) for v in ns.values() if isinstance(v, type) and v.__module__ == mn]
+    for cls, label in classes:
         for name, qual, f in _members(cls, label):
             methods.setdefault(name, []).append((qual, f, label))
     funcs: dict[str, str] = {}
     consts: dict[str, Any] = {}
-    todo: list[tuple[str, Callable, str]] = [("pg." + _SCOPE_ROOT, globals()[_SCOPE_ROOT], "pg")]
+    todo: list[tuple[str, Callable, str]] = [("pg." + r, globals()[r], "pg") for r in roots]
 
     def take(label: str, name: str, v) -> None:
         f = inspect.unwrap(v) if callable(v) else v
-        if inspect.isfunction(f) and f.__module__ == ctx[label][1]:
+        if inspect.isfunction(f) and f.__module__ == mods[label][1]:
             todo.append(("%s.%s" % (label, name), f, label))
         elif not callable(v) and not isinstance(v, types.ModuleType):
             consts["%s.%s" % (label, name)] = _plain(v)
@@ -592,12 +765,13 @@ def fingerprint_scope() -> dict:
         qual, fn, label = todo.pop()
         if qual in funcs:
             continue
-        src = textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))
-        funcs[qual] = src
-        ns = ctx[label][0]
+        tree, funcs[qual] = _parsed(fn)
+        if tree is None:
+            continue
+        ns = mods[label][0]
         aliases = {n: by_module[v.__name__] for n, v in ns.items()
                    if isinstance(v, types.ModuleType) and v.__name__ in by_module}
-        for node in ast.walk(ast.parse(src)):
+        for node in ast.walk(tree):
             if isinstance(node, ast.Name):
                 v = ns.get(node.id, _MISSING)
                 if v is not _MISSING:
@@ -605,17 +779,40 @@ def fingerprint_scope() -> dict:
             elif isinstance(node, ast.Attribute):
                 if isinstance(node.value, ast.Name) and node.value.id in aliases:
                     other = aliases[node.value.id]
-                    v = ctx[other][0].get(node.attr, _MISSING)
+                    v = mods[other][0].get(node.attr, _MISSING)
                     if v is not _MISSING:
                         take(other, node.attr, v)
                 todo.extend(methods.get(node.attr, ()))
+    consts["pg._SCHEMA"] = _plain(_SCHEMA)                          # the store's tables
+    consts["pg._KEYS"] = _plain(_KEYS)
     return {"functions": sorted(funcs), "constants": sorted(consts), "sources": funcs, "values": consts}
 
 
+def fingerprint_scope() -> dict:
+    """What the matching fingerprint covers: everything `cmd_match` can reach (see `_scope`)."""
+    return _scope(_MATCH_ROOTS, wide=False)
+
+
+def scoring_scope() -> dict:
+    """What the scoring fingerprint covers: everything `prices`, `results` and `evaluate` can reach."""
+    return _scope(_SCORING_ROOTS, wide=True)
+
+
 def fingerprint() -> str:
-    """The matching rule's fingerprint: sha256 over the source of every function `fingerprint_scope` finds and the
-    values of the constants they read."""
+    """The matching rule's fingerprint: sha256 over the parsed code of every function `fingerprint_scope` finds, the
+    values of the constants they read, the store's tables and the English word list the codes are judged by."""
     s = fingerprint_scope()
+    return _sha(_canon({"code": s["sources"], "constants": s["values"], "words": _words_sha(_english_words())}))
+
+
+@lru_cache(maxsize=4)
+def _words_sha(words: frozenset) -> str:
+    return _sha("\n".join(sorted(words)))
+
+
+def scoring_fingerprint() -> str:
+    """The scoring code's fingerprint (same kind as `fingerprint`), pinned by `choose`."""
+    s = scoring_scope()
     return _sha(_canon({"code": s["sources"], "constants": s["values"]}))
 
 
@@ -633,8 +830,11 @@ CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, at TEXT NOT NULL, comma
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY, league TEXT NOT NULL, sport TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('live', 'historical')), asked TEXT, as_of TEXT NOT NULL, fetched_at TEXT NOT NULL,
     sha256 TEXT NOT NULL, raw TEXT NOT NULL, UNIQUE (league, kind, as_of, sha256));
-CREATE TABLE IF NOT EXISTS kalshi_lists (id INTEGER PRIMARY KEY, league TEXT NOT NULL, series TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS bound (id INTEGER PRIMARY KEY CHECK (id = 1), identity TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS code_tables (id INTEGER PRIMARY KEY, league TEXT NOT NULL, series TEXT NOT NULL,
     fetched_at TEXT NOT NULL, sha256 TEXT NOT NULL, raw TEXT NOT NULL, UNIQUE (league, sha256));
+CREATE TABLE IF NOT EXISTS code_fetches (id INTEGER PRIMARY KEY, league TEXT NOT NULL, fetched_at TEXT NOT NULL,
+    table_id INTEGER NOT NULL, events INTEGER NOT NULL, requests INTEGER NOT NULL, UNIQUE (league, fetched_at));
 CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, comment_id TEXT NOT NULL,
     thread_id TEXT NOT NULL, thread_date TEXT, author_key TEXT, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
     reason TEXT, league TEXT, game_id TEXT, side TEXT, team TEXT, market TEXT, line REAL, ou TEXT, version_id INTEGER,
@@ -650,19 +850,22 @@ CREATE TABLE IF NOT EXISTS kalshi_pairs (game_id TEXT PRIMARY KEY, kalshi_event 
     day TEXT, home_ticker TEXT NOT NULL, away_ticker TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scores (id INTEGER PRIMARY KEY, league TEXT NOT NULL, fetched_at TEXT NOT NULL,
     sha256 TEXT NOT NULL, raw TEXT NOT NULL, UNIQUE (league, fetched_at, sha256));
-CREATE TABLE IF NOT EXISTS choice (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS choice (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, at TEXT NOT NULL,
+    scoring_fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS test_results (id INTEGER PRIMARY KEY CHECK (id = 1), at TEXT NOT NULL, period_end TEXT NOT NULL,
     raw TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, at TEXT NOT NULL, command TEXT NOT NULL, league TEXT,
     kind TEXT NOT NULL, detail TEXT);
 """
 _KEYS = {"layout": [("id",)], "runs": [("id",)], "schedules": [("id",), ("league", "kind", "as_of", "sha256")],
-         "kalshi_lists": [("id",), ("league", "sha256")], "matches": [("id",), ("run_id", "comment_id")],
+         "bound": [("id",)], "code_tables": [("id",), ("league", "sha256")],
+         "code_fetches": [("id",), ("league", "fetched_at")], "matches": [("id",), ("run_id", "comment_id")],
          "audits": [("id",), ("fingerprint",)], "audit_passes": [("id",), ("audit_id",)], "frozen": [("id",)],
          "result_reads": [("id",)], "kalshi_pairs": [("game_id",), ("kalshi_event",)],
          "scores": [("id",), ("league", "fetched_at", "sha256")], "choice": [("id",)], "test_results": [("id",)],
          "errors": [("id",)]}
-_TIMES = (("runs", "at"), ("schedules", "fetched_at"), ("kalshi_lists", "fetched_at"), ("matches", "at"),
+_TIMES = (("runs", "at"), ("schedules", "fetched_at"), ("bound", "at"), ("code_tables", "fetched_at"),
+          ("code_fetches", "fetched_at"), ("matches", "at"),
           ("audits", "at"), ("audit_passes", "at"), ("frozen", "at"), ("result_reads", "at"), ("kalshi_pairs", "at"),
           ("scores", "fetched_at"), ("choice", "at"), ("test_results", "at"), ("errors", "at"))
 
@@ -778,14 +981,29 @@ class GradingStore:
     def lists(self) -> list[dict]:
         return self.rows("SELECT league, as_of, raw FROM schedules ORDER BY id")
 
-    def code_lists(self) -> list[dict]:
-        return self.rows("SELECT league, raw FROM kalshi_lists ORDER BY id")
+    def code_tables(self, now: str) -> list[dict] | None:
+        """Every stored code table ({league, raw}), when every league has one fetched within `CODE_FRESH` of `now`;
+        None otherwise (the codes are then names of nothing)."""
+        since = _from_ts(_ts(now) - CODE_FRESH)
+        fresh = {r["league"] for r in self.rows("SELECT DISTINCT league FROM code_fetches WHERE fetched_at >= ? "
+                                                 "AND fetched_at <= ?", (since, now))}
+        if not set(LEAGUES) <= fresh:
+            return None
+        return self.rows("SELECT league, raw FROM code_tables ORDER BY id")
 
     def list_ids(self) -> tuple[int, int]:
-        """The latest schedule list and Kalshi code list stored (0 for none)."""
+        """The latest schedule list and code table fetch stored (0 for none)."""
         a = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM schedules").fetchone()[0]
-        b = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM kalshi_lists").fetchone()[0]
+        b = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM code_fetches").fetchone()[0]
         return int(a), int(b)
+
+    def bound(self) -> str | None:
+        r = self.one("SELECT identity FROM bound WHERE id = 1")
+        return None if r is None else r["identity"]
+
+    def scoring_pin(self) -> str | None:
+        r = self.one("SELECT scoring_fingerprint FROM choice WHERE id = 1")
+        return None if r is None else r["scoring_fingerprint"]
 
 
 class _KalshiView:
@@ -934,36 +1152,42 @@ def _no_retry(client):
 
 # ---------------------------------------------------------------- schedule
 
-def _is_open(m) -> bool:
-    return isinstance(m, dict) and bool(m.get("ticker")) and not m.get("result") and m.get("status") in OPEN_STATUSES
-
-
 def _kalshi_codes(gr: Grader) -> dict:
-    """The team codes and names of the open markets of the five game series, stored as listed (ticker, event, title,
-    name, status; nothing else, and nothing of a market that is not open). At most `CODE_REQUESTS` requests a run;
-    a league whose listing fails is recorded and the others go on."""
+    """The table of team codes of each of the five game series, from Kalshi's events list of every status (events
+    with a market closing after now minus `CODE_LOOKBACK`; an event carries its title and no result, and no market is
+    read), each event kept as event ticker, title and sub-title only. At most `CODE_REQUESTS` requests a run; a league
+    whose listing fails or does not end within them gets no table this run (recorded; the others go on). A table is
+    stored once by content, and every complete fetch is recorded with its time (`code_fetches`)."""
     out: dict[str, Any] = {}
     client = gr.kalshi
     old = client.max_requests
     client.max_requests = client.requests + CODE_REQUESTS
+    since = int(gr.clock().timestamp()) - CODE_LOOKBACK
     try:
         for league, (_, series) in LEAGUES.items():
+            before = client.requests
             try:
-                rows = client.pages("/markets", {"series_ticker": series, "status": "open", "limit": 1000}, "markets")
+                rows = client.pages("/events", {"series_ticker": series, "limit": 200, "min_close_ts": since}, "events")
             except (kh.KalshiHistoryError, kd.HttpError, OSError) as exc:
                 gr.error(league, exc)
                 out[league] = "error: %s" % type(exc).__name__
                 continue
-            kept = sorted(({k: m.get(k) for k in ("ticker", "event_ticker", "title", "yes_sub_title", "status")}
-                           for m in rows if _is_open(m)), key=lambda m: str(m["ticker"]))
-            if kept:
-                raw, now = _canon(kept), gr.now()
-                with gr.store.writing(now) as c:
-                    if c.execute("SELECT 1 FROM kalshi_lists WHERE league = ? AND sha256 = ?",
-                                 (league, _sha(raw))).fetchone() is None:
-                        c.execute("INSERT INTO kalshi_lists (league, series, fetched_at, sha256, raw) VALUES (?, ?, ?, ?, ?)",
-                                  (league, series, now, _sha(raw), raw))
-            out[league] = {"markets": len(kept)}
+            kept = {}
+            for e in rows:
+                if isinstance(e, dict) and e.get("event_ticker"):
+                    kept[str(e["event_ticker"])] = {k: e.get(k) for k in ("event_ticker", "title", "sub_title")}
+            raw, now = _canon([kept[k] for k in sorted(kept)]), gr.now()
+            with gr.store.writing(now) as c:
+                row = c.execute("SELECT id FROM code_tables WHERE league = ? AND sha256 = ?",
+                                (league, _sha(raw))).fetchone()
+                tid = row[0] if row else c.execute(
+                    "INSERT INTO code_tables (league, series, fetched_at, sha256, raw) VALUES (?, ?, ?, ?, ?)",
+                    (league, series, now, _sha(raw), raw)).lastrowid
+                if c.execute("SELECT 1 FROM code_fetches WHERE league = ? AND fetched_at = ?",
+                             (league, now)).fetchone() is None:
+                    c.execute("INSERT INTO code_fetches (league, fetched_at, table_id, events, requests) "
+                              "VALUES (?, ?, ?, ?, ?)", (league, now, tid, len(kept), client.requests - before))
+            out[league] = {"events": len(kept)}
     finally:
         client.max_requests = old
     return out
@@ -1094,7 +1318,7 @@ def cmd_match(gr: Grader) -> dict:
     upto = gr.store.list_ids()
     lists = gr.store.lists()
     games = schedule_games(lists)
-    index = name_index(lists, gr.store.code_lists())
+    index = name_index(lists, gr.store.code_tables(gr.now()))
     picks = gr.picks()
     try:
         outcomes = []
@@ -1123,7 +1347,8 @@ def cmd_match(gr: Grader) -> dict:
     return {"picks": len(outcomes), "by_outcome": dict(sorted(counts.items())), "rows_written": written,
             "games_in_schedule": len(games), "teams_known": sum(len({k for v in f.values() for k, _ in v})
                                                                 for f in index["forms"].values()),
-            "codes_known": sum(len(c) for c in index["codes"].values()), "fingerprint": gr.fp}
+            "codes_known": None if index["codes"] is None else sum(len(c) for c in index["codes"].values()),
+            "codes_in_use": index["codes"] is not None, "fingerprint": gr.fp}
 
 
 # ---------------------------------------------------------------- the audit gate
@@ -1236,13 +1461,16 @@ def _eligible(gr: Grader, rows: Sequence[dict]) -> tuple[list[dict], int]:
 
 def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     """Kalshi's settled markets of the days of the matched games that have started, per league, and the strict
-    pairing of `sports_lines.pair_games` (no model). Errors of one league are recorded and the others go on."""
+    pairing of `sports_lines.pair_games` (no model). Before a choice no day of the test period is fetched, not even
+    for a development game on it. Errors of one league are recorded and the others go on."""
     out: dict[str, Any] = {}
     games = schedule_games(gr.store.lists())
     by_league: dict[str, set] = {}
+    no_choice = gr.store.choice() is None
     for r in rows:
-        if _ts(r["start"]) < now.timestamp():
-            by_league.setdefault(r["league"], set()).add(sl.eastern_date(r["start"]))
+        d = sl.eastern_date(r["start"])
+        if _ts(r["start"]) < now.timestamp() and not (no_choice and d >= PERIODS["test"][0]):
+            by_league.setdefault(r["league"], set()).add(d)
     if not by_league:
         return out
     try:
@@ -1550,7 +1778,8 @@ def test_counts(store: GradingStore, kview, fp: str) -> dict:
     """The test period's counts so far, without reading any result: Question A's contracts (a pair, a quote by the
     purchase rule, a settled market and a final listed in time) and days for each version, Question B's gradable picks
     (the pick's own conditions, a final listed in time, a settled pair where Kalshi lists the game), and the first
-    thread date on which the chosen version's counts and B's are both reached (None before a choice)."""
+    thread date on which the chosen version's counts and B's both reach the margin of clarification 15 (158 contracts
+    on 20 days, 315 picks; None before a choice)."""
     a, b = PERIODS["test"]
     rows = [r for r in _rows_of(store, fp, a, b) if r["status"] == "matched"]
     pairs, settled = store.pairs(), _kalshi_settled(kview)
@@ -1578,13 +1807,24 @@ def test_counts(store: GradingStore, kview, fp: str) -> dict:
         for day in sorted(set(per_version[choice]) | set(bdays)):
             n = per_version[choice].get(day, 0)
             ca, cd, cb = ca + n, cd + (1 if n else 0), cb + bdays.get(day, 0)
-            if ca >= A_COUNT and cd >= A_DAYS and cb >= B_COUNT:
+            if ca >= END_A_COUNT and cd >= A_DAYS and cb >= END_B_COUNT:
                 reached = day
                 break
     return {"choice": choice, "versions": {str(v): {"contracts": sum(d.values()), "days": len(d)}
                                            for v, d in per_version.items()},
             "B_graded": sum(bdays.values()), "reached_on": reached,
-            "needed": {"A_contracts": A_COUNT, "A_days": A_DAYS, "B_graded": B_COUNT, "last_day": b.isoformat()}}
+            "needed": {"A_contracts": END_A_COUNT, "A_days": A_DAYS, "B_graded": END_B_COUNT, "last_day": b.isoformat(),
+                       "pass_lines": {"A_contracts": A_COUNT, "A_days": A_DAYS, "B_graded": B_COUNT}}}
+
+
+def readings(store: GradingStore) -> dict:
+    """Every reading ever recorded in the store: each sample drawn (fingerprint, sample id, wrong count or None while
+    unanswered, the time of the answer or of the draw), and how many different fingerprints were audited."""
+    rows = store.rows("SELECT a.id AS sample, a.fingerprint, a.at AS drawn, p.wrong, p.at AS answered FROM audits a "
+                      "LEFT JOIN audit_passes p ON p.audit_id = a.id ORDER BY a.id")
+    return {"readings": [{"fingerprint": r["fingerprint"], "sample": r["sample"], "wrong": r["wrong"],
+                          "at": r["answered"] or r["drawn"], "drawn": r["drawn"]} for r in rows],
+            "fingerprints_audited": len({r["fingerprint"] for r in rows})}
 
 
 def compute(gr: Grader, period: str, versions: Sequence[int], end: date | None = None) -> dict:
@@ -1671,10 +1911,10 @@ def _pass_lines(res: dict, version: int) -> dict:
     return out
 
 
-def cmd_evaluate(gr: Grader, period: str) -> dict:
+def cmd_evaluate(gr: Grader, period: str, code_changed: str | None = None) -> dict:
     if period == "development":
         gr.reading_results({"evaluate": period})
-        res = compute(gr, period, VERSIONS)
+        res = dict(compute(gr, period, VERSIONS), **readings(gr.store))
         gr.scoring("evaluate_development", {"result": res})
         return res
     choice = gr.store.choice()
@@ -1686,7 +1926,14 @@ def cmd_evaluate(gr: Grader, period: str) -> dict:
     stored = gr.store.one("SELECT raw FROM test_results WHERE id = 1")
     if stored is not None:
         gr.scoring("test_result_shown", {"stored_sha256": _sha(stored["raw"])})
-        return dict(json.loads(stored["raw"]), note="the stored test result: the test period is scored once")
+        out = json.loads(stored["raw"])
+        out["readings_at_scoring"] = {k: out.get(k) for k in ("readings", "fingerprints_audited")}
+        out.update(readings(gr.store))
+        return dict(out, note="the stored test result: the test period is scored once")
+    pinned, now_fp = gr.store.scoring_pin(), scoring_fingerprint()
+    if pinned != now_fp and not (code_changed and code_changed.strip()):
+        raise Refused("the scoring code was pinned at the choice (%s) and is now %s: give --code-changed \"<reason>\" "
+                      "to score with the changed code; nothing was read or scored" % (pinned[:12], now_fp[:12]))
     gr.need_gate()
     gr.need_current()
     counts = test_counts(gr.store, gr.kstore, gr.fp)
@@ -1695,14 +1942,21 @@ def cmd_evaluate(gr: Grader, period: str) -> dict:
         v = counts["versions"][str(choice)]
         raise Refused("the test period is scored once, at the end: the counts are not reached (Question A, version %d: "
                       "%d contracts on %d days of %d on %d; Question B: %d graded of %d) and %s US-Eastern has not "
-                      "come; nothing was read or scored" % (choice, v["contracts"], v["days"], A_COUNT, A_DAYS,
-                                                            counts["B_graded"], B_COUNT, last.isoformat()))
+                      "come; nothing was read or scored" % (choice, v["contracts"], v["days"], END_A_COUNT, A_DAYS,
+                                                            counts["B_graded"], END_B_COUNT, last.isoformat()))
     end = date.fromisoformat(counts["reached_on"]) if counts["reached_on"] else last
+    change = None
+    if pinned != now_fp:
+        change = {"reason": code_changed.strip(), "at_choice": pinned, "now": now_fp, "at": gr.now()}
+        gr.scoring("code_changed", change)
     gr.reading_results({"evaluate": period, "end": end.isoformat()})
     res = compute(gr, period, (choice,), end=end)
     res["choice"] = choice
     res["counts_reached_on"] = counts["reached_on"]
     res["pass_lines"] = _pass_lines(res, choice)
+    res["scoring_fingerprint"] = now_fp
+    res["code_changed"] = change
+    res.update(readings(gr.store))
     now = gr.now()
     with gr.store.writing(now) as c:
         c.execute("INSERT INTO test_results (id, at, period_end, raw) VALUES (1, ?, ?, ?)",
@@ -1716,11 +1970,12 @@ def cmd_choose(gr: Grader, version: int) -> dict:
         raise ValueError("the version must be one of %s" % (VERSIONS,))
     if gr.store.choice() is not None or any(e.get("kind") == "choice" for e in sl.scoring_entries(gr.root)):
         raise Refused("a choice is already stored; it is made once")
-    now = gr.now()
+    now, sfp = gr.now(), scoring_fingerprint()
     with gr.store.writing(now) as c:
-        c.execute("INSERT INTO choice (id, version, at) VALUES (1, ?, ?)", (int(version), now))
-    gr.scoring("choice", {"choice": int(version)})
-    return {"choice": int(version)}
+        c.execute("INSERT INTO choice (id, version, at, scoring_fingerprint) VALUES (1, ?, ?, ?)",
+                  (int(version), now, sfp))
+    gr.scoring("choice", {"choice": int(version), "scoring_fingerprint": sfp})
+    return {"choice": int(version), "scoring_fingerprint": sfp}
 
 
 def cmd_daily(gr: Grader) -> dict:
@@ -1747,7 +2002,9 @@ def status(store: GradingStore, fp: str, kview) -> dict:
             "gate_open": store.gate_open(fp), "closed": store.closed(fp), "choice": store.choice(),
             "schedules": {r["league"]: r["n"] for r in store.rows(
                 "SELECT league, COUNT(*) AS n FROM schedules GROUP BY league ORDER BY league")},
-            "kalshi_code_lists": n("SELECT COUNT(*) FROM kalshi_lists"),
+            "code_tables": n("SELECT COUNT(*) FROM code_tables"), "code_fetches": {r["league"]: r["at"] for r in store.rows(
+                "SELECT league, MAX(fetched_at) AS at FROM code_fetches GROUP BY league ORDER BY league")},
+            "bound": store.bound(), "scoring_pin": store.scoring_pin(), **readings(store),
             "games": len(schedule_games(store.lists())), "picks": len(latest), "by_outcome": dict(sorted(outcome.items())),
             "audits": n("SELECT COUNT(*) FROM audits"), "audit_passes": n("SELECT COUNT(*) FROM audit_passes"),
             "kalshi_pairs": n("SELECT COUNT(*) FROM kalshi_pairs"), "scores_fetched": n("SELECT COUNT(*) FROM scores"),
@@ -1765,6 +2022,55 @@ def _same_path(a: Path, b: Path) -> bool:
         return a.exists() and b.exists() and os.path.samefile(a, b)
     except OSError:
         return False
+
+
+def pick_store_identity(path: Path) -> str | None:
+    """A pick store's identity, from its own first rows, which never change in an append-only store: sha256 over the
+    first thread (by row order: id and first-seen time) and the first payload (kind, key, sha256, fetch time). None
+    for a missing or empty store. A byte copy, a link or a copy with more rows has the same identity."""
+    if not Path(path).is_file():
+        return None
+    store = pl.Store(path, readonly=True, create=False)
+    try:
+        t = store.rows("SELECT thread_id, first_seen FROM threads ORDER BY rowid LIMIT 1")
+        p = store.rows("SELECT kind, key, sha256, fetched_at FROM payloads ORDER BY id LIMIT 1")
+    finally:
+        store.close()
+    if not t and not p:
+        return None
+    return _sha("pick-store:" + _canon({"thread": t[0] if t else None, "payload": p[0] if p else None}))
+
+
+def _bound_to(db: Path) -> str | None:
+    """The identity a grading store is bound to (read-only; a store of another layout is refused here, before
+    anything is created beside it)."""
+    store = GradingStore(db, readonly=True)
+    try:
+        return store.bound()
+    finally:
+        store.close()
+
+
+def _one_record(root: Path, picks: Path) -> str | None:
+    """Clarification 13: the pairing rules, checked before anything is opened for writing or created. Returns the
+    pick store's identity."""
+    if _same_path(picks, DEFAULT_PICKS) != _same_path(root, DEFAULT_STORE):
+        raise Refused("one record: the real pick store %s is graded into one grading store only, %s, and that store "
+                      "takes no other pick store; nothing was done" % (DEFAULT_PICKS, DEFAULT_STORE))
+    identity = pick_store_identity(picks)
+    default_db = Path(DEFAULT_STORE) / STORE_FILE
+    if identity is not None and not _same_path(root, DEFAULT_STORE) and default_db.is_file() and \
+            _bound_to(default_db) == identity:
+        raise Refused("one record: the pick store %s has the identity %s, which the default grading store %s is "
+                      "bound to; it is graded there only, whatever its path (a copy or a link included); nothing was "
+                      "done" % (picks, identity[:12], DEFAULT_STORE))
+    own_db = root / STORE_FILE
+    if own_db.is_file():
+        bound = _bound_to(own_db)
+        if bound is not None and bound != identity:
+            raise Refused("one record: the grading store %s is bound to the pick store of identity %s, not to %s (%s); "
+                          "nothing was done" % (root, bound[:12], picks, (identity or "none")[:12]))
+    return identity
 
 
 def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
@@ -1785,17 +2091,17 @@ def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
     p.add_argument("--wrong", type=int, required=True)
     sub.add_parser("prices", help="Kalshi pairing and candles up to the purchase moment (Question A)")
     sub.add_parser("results", help="Kalshi settlement and The Odds API's scores")
-    sub.add_parser("evaluate", help="the counts and both questions for a period").add_argument(
-        "--period", choices=["development", "test"], required=True)
+    p = sub.add_parser("evaluate", help="the counts and both questions for a period")
+    p.add_argument("--period", choices=["development", "test"], required=True)
+    p.add_argument("--code-changed", metavar="REASON", help="score the test period although the scoring code changed "
+                   "after the choice; the reason and both fingerprints are recorded")
     sub.add_parser("choose", help="store the version of Question A chosen on development").add_argument(
         "--version", type=int, required=True)
     sub.add_parser("daily", help="schedule, match, and prices and results when the gate is open")
     sub.add_parser("status", help="counts only")
     args = ap.parse_args(argv)
     root, picks = Path(args.store), Path(args.picks)
-    if _same_path(picks, DEFAULT_PICKS) != _same_path(root, DEFAULT_STORE):
-        raise Refused("one record: the real pick store %s is graded into one grading store only, %s, and that store "
-                      "takes no other pick store; nothing was done" % (DEFAULT_PICKS, DEFAULT_STORE))
+    identity = _one_record(root, picks)
     fp = fingerprint()
 
     if args.cmd == "status":
@@ -1822,6 +2128,13 @@ def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
                 raise Refused("the matching rule is frozen at %s (a result was read); the code's fingerprint is now %s"
                               % (frozen["fingerprint"][:12], gr.fp[:12]))
             gr.store.refuse_behind(gr.now())
+            bound = gr.store.bound()
+            if bound is not None and bound != identity:
+                raise Refused("one record: the grading store %s is bound to another pick store; nothing was done" % root)
+            if bound is None and identity is not None:
+                now = gr.now()
+                with gr.store.writing(now) as c:
+                    c.execute("INSERT INTO bound (id, identity, at) VALUES (1, ?, ?)", (identity, now))
             if args.cmd == "schedule":
                 out = cmd_schedule(gr, args.date, args.hist_key)
             elif args.cmd == "match":
@@ -1835,7 +2148,7 @@ def main(argv=None, *, odds_client=None, kalshi_client=None, clock=None) -> int:
             elif args.cmd == "results":
                 out = cmd_results(gr)
             elif args.cmd == "evaluate":
-                out = cmd_evaluate(gr, args.period)
+                out = cmd_evaluate(gr, args.period, args.code_changed)
             elif args.cmd == "choose":
                 out = cmd_choose(gr, args.version)
             else:
