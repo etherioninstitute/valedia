@@ -1,5 +1,5 @@
 """Sportsbook lines against Kalshi's price for the same game: research code for the locked prediction in
-docs/research/2026-11-13-sports-lines-prediction.md (with its six clarifications). It buys history, pairs games and
+docs/research/2026-11-13-sports-lines-prediction.md (with its eight clarifications). It buys history, pairs games and
 scores them. It has no way to trade: nothing here sends anything to an exchange or a broker.
 
 The steps (each a command of `main`, run in this order; every store lives in one folder, `--store`):
@@ -16,21 +16,28 @@ The steps (each a command of `main`, run in this order; every store lives in one
    its own sqlite file, one process at a time). It begins with the free sports call, which refreshes the month's
    remaining figure and confirms what calls left pending by a crash really used. Each HTTP attempt is the ledger's
    own: both caps checked before it, a pending row written before it and completed after it with that attempt's
-   headers, at most 3 attempts a snapshot. The run stops (exit code 3) after an answer without usage headers, or when
-   a call costs other than expected (the book list is not cut; the lead decides). A snapshot already stored, or whose
-   answer the ledger already holds, is never bought again. Test-period snapshots are refused until a choice is stored.
+   headers, at most 3 attempts a snapshot. The run stops (exit code 3) after an answer without usage headers, when
+   a call costs other than expected (the book list is not cut; the lead decides), when a paid answer reports a
+   charge of 0 or less, and when the free call reports a cost. An expected cost is never below the documented rule's.
+   A snapshot already stored, or whose answer the ledger already holds, is never bought again. Test-period snapshots
+   are refused until a choice is stored.
 4. `pair`: a Kalshi event and an Odds API game are one game only when (a) both team names match by `names_match`
    (one strict rule that honours qualifying words in both directions) and each Kalshi name matches only one team of
-   the league in the odds data, (b) the game starts within six hours before Kalshi's expected end of the game and not
-   after it, on the same US-Eastern date, and (c) no other game satisfies (a) and (b) for the event and no other
-   event satisfies them for the game. Anything else is left out as `ambiguous` or `no_match`. What code leaves out is
+   the league in the odds data (a hockey market written as a code and a nickname, "VGK Golden Knights" under the
+   title "St. Louis at Vegas Winner?", matches by `nickname_match` with its city from the title: clarification 7),
+   (b) the game starts no more than 12 hours before and no more than 3 hours after Kalshi's expected expiration, on
+   the same US-Eastern date (clarification 8), and (c) no other game satisfies (a) and (b) for the event and no other
+   event satisfies them for the game, and the two teams meet only once that date on either side (two games between
+   the same teams on one date are both left out, whatever their times). Anything else is left out as `ambiguous` or
+   `no_match`. What code leaves out is
    offered to the injected resolver (by default the local model, `LocalModelResolver`); a proposal is kept only if it
    passes the same three checks, so it can never pair what the checks refuse. Every proposal is logged.
 5. `kalshi-candles`: one-minute candles of both contracts of each paired game, only for the hour that ends at the
    minute of the game's wave snapshot. A window that came back empty is asked once more on a later run.
 6. `evaluate --period dev`: both questions of the prediction for each margin and each version of the books'
    probability. `choose` stores the one choice; `evaluate --period test` then runs once with it, only when every
-   planned test snapshot is stored, pairing has run on them and candles are stored for every paired game.
+   planned test snapshot is stored, pairing has run on them and candles are stored for every paired game, and only
+   with the choice that `scoring.log` holds. `evaluate` runs one process at a time (a lock beside `scoring.log`).
 
 The choice and the test result are also appended, with the sha256 of the three store files, to `scoring.log` beside
 the stores; `choose` and `evaluate --period test` refuse when that file already holds a choice or a test result,
@@ -73,8 +80,9 @@ from valedia_trader.venues import kalshi_history as kh
 from valedia_trader.venues import odds_api as oa
 
 __all__ = ["LEAGUES", "BOOKS", "PERIODS", "MARGINS", "VERSIONS", "CreditLedger", "CreditCapError", "LedgerStop",
-           "LedgerBusy", "Refused", "LinesStore", "select_waves", "all_waves", "eastern_date", "first_snapshot_time",
-           "paid_snapshot", "refresh_usage", "buy", "make_plan", "fetch_odds", "names_match", "pair_games",
+           "Busy", "LedgerBusy", "Refused", "LinesStore", "select_waves", "all_waves", "eastern_date",
+           "first_snapshot_time", "paid_snapshot", "refresh_usage", "buy", "make_plan", "fetch_odds", "names_match",
+           "nickname_match", "kalshi_event", "kalshi_events", "pair_games",
            "LocalModelResolver", "kalshi_fee", "book_probabilities", "books_p", "quote_at", "collect_games",
            "evaluate_games", "test_readiness", "main"]
 
@@ -96,7 +104,8 @@ WAVE_SPAN = timedelta(minutes=90)
 WAVE_LEAD = timedelta(minutes=30)
 MAX_WAVES = 3
 STALE = timedelta(minutes=10)          # clarification 5
-PAIR_WINDOW = timedelta(hours=6)       # clarification 6
+PAIR_BEFORE = timedelta(hours=12)      # clarification 8: the start at most this long before Kalshi's expiration
+PAIR_AFTER = timedelta(hours=3)        # ... and at most this long after it
 HISTORY_CAP = 9000
 MONTHLY_CAP = 20000
 FREE_MONTHLY_CAP = 500
@@ -117,15 +126,36 @@ class CreditCapError(RuntimeError):
 
 class LedgerStop(RuntimeError):
     """The run stops: the ledger saw a charge it cannot count safely (an answer without usage headers, or a cost
-    other than the one expected). The ledger row of that call says what was seen; the lead decides what to do."""
+    other than the one expected, a paid answer charged nothing, a free call that cost something). The ledger row of
+    that call and its event say what was seen; the lead decides what to do."""
 
 
-class LedgerBusy(RuntimeError):
+class Busy(RuntimeError):
+    """Another process holds a lock this step needs (the credit ledger, or scoring)."""
+
+
+class LedgerBusy(Busy):
     """Another process holds the credit ledger."""
 
 
 class Refused(RuntimeError):
     """A step the locked prediction does not allow now (the test period before a choice, a second test run...)."""
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, message: str, error: type = Busy):
+    """One process at a time: an exclusive, non-blocking lock on `path`; `error(message)` when another holds it."""
+    f = open(path, "a")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise error(message) from None
+    try:
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
 
 
 def _iso(t: datetime) -> str:
@@ -190,8 +220,8 @@ _SPENT = ("COALESCE(SUM(CASE WHEN status = 'not_sent' THEN 0 WHEN charged IS NUL
 
 
 class CreditLedger:
-    """Every Odds API attempt, before and after. Before: its cost (by the documented rule, or the cost last charged
-    for that rule if the two differed) is checked against the cap of the run (everything this ledger has spent with
+    """Every Odds API attempt, before and after. Before: its cost (`expected_cost`: the documented rule's, or more if
+    the rule was last charged more) is checked against the cap of the run (everything this ledger has spent with
     that key) and against the month (the monthly cap less the ledger's spend this UTC month, and no more than the last
     `x-requests-remaining` header said, less what is still uncertain since), and a `pending` row is written with that
     cost. After: the row is completed with that attempt's three usage headers and its status:
@@ -199,7 +229,8 @@ class CreditLedger:
     - `done` (an answer with headers; the answer itself is stored in the row, so it is never bought twice),
     - `http_error` (an error answer with headers), `not_sent` (nothing was sent: no charge),
     - `unanswered` (sent, no answer came back) and `no_headers` (an answer without usage headers; the run stops),
-      both counted at their expected cost until `reconcile` confirms the real use from a later call's headers,
+      both counted at their expected cost until `reconcile` confirms the real use from a later answer's headers
+      (in the same run, or the next run's free call),
     - `confirmed` (an uncertain row settled by `reconcile`).
 
     A row left `pending` by a crash is counted at its expected cost in the same way. Parameters are stored without
@@ -211,6 +242,7 @@ class CreditLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.caps = {"paid": int(monthly_cap), "free": int(free_monthly_cap)}
         self.clock = clock
+        self.settled: dict = {"confirmed": 0}         # what the last answer's headers settled (`reconcile`)
         self.db = sqlite3.connect(str(self.path))
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -228,8 +260,15 @@ class CreditLedger:
 
     # what has been spent
     def expected_cost(self, rule: str, rule_cost: int) -> int:
-        row = self.db.execute("SELECT cost FROM costs WHERE rule = ? ORDER BY id DESC LIMIT 1", (rule,)).fetchone()
-        return int(row["cost"]) if row else int(rule_cost)
+        """What an attempt by `rule` is counted at before its answer (and after, if none comes back): the largest of
+        the documented rule's cost, the cost last learned for the rule and the cost its last answer was charged; never
+        below the rule's cost. A free rule (cost 0) learns nothing and stays 0."""
+        if int(rule_cost) <= 0:
+            return int(rule_cost)
+        learned = self.db.execute("SELECT cost FROM costs WHERE rule = ? ORDER BY id DESC LIMIT 1", (rule,)).fetchone()
+        seen = self.db.execute("SELECT charged FROM calls WHERE rule = ? AND charged IS NOT NULL AND (status = 'done' "
+                               "OR (status IS NULL AND ok = 1)) ORDER BY id DESC LIMIT 1", (rule,)).fetchone()
+        return max([int(rule_cost)] + [int(r[0]) for r in (learned, seen) if r is not None])
 
     def spent(self, key: str = "paid") -> int:
         return int(self.db.execute("SELECT %s FROM calls WHERE key = ?" % _SPENT, (key,)).fetchone()[0])
@@ -279,7 +318,9 @@ class CreditLedger:
                 empty: Callable[[Any], bool] = lambda body: False, keep: Callable[[Any], Any] | None = None) -> Any:
         """One HTTP attempt (`send` must not retry): caps checked, a pending row written, the attempt made, the row
         completed. Raises the client's error after recording it, and `LedgerStop` (after `keep(answer)`) when the
-        answer has no usage headers or costs other than expected."""
+        answer has no usage headers, costs other than expected, is a paid answer charged 0 or less (counted at its
+        expected cost, an event) or is a free answer that cost something (counted as spent, an event). An answer
+        with headers settles what earlier attempts left uncertain (`reconcile`)."""
         expected = self.expected_cost(rule, rule_cost)
         self.check(key, expected, cap)
         clean = {k: v for k, v in params.items() if k.lower() not in ("apikey", "api_key", "x-api-key")}
@@ -314,20 +355,39 @@ class CreditLedger:
                              "stops. Row %d of the ledger says so and counts %d credits until a later run's free call "
                              "confirms the use" % (path, rid, expected))
         charged = int(usage["last"])
-        self._finish(rid, "done", charged, usage, body=blob, ok=True)
-        if charged != expected and not (charged == 0 and empty(body)):
-            now = _iso(self.clock())
+        free = int(rule_cost) <= 0
+        nothing = not free and charged <= 0 and not (charged == 0 and empty(body))
+        # a paid answer that reports no charge is counted at its expected cost: the header is not believed below it
+        self._finish(rid, "done", expected if nothing else charged, usage, body=blob, ok=True)
+        self.settled = self.reconcile(key)
+        heads = (usage["remaining"], usage["used"], usage["last"])
+
+        def stop(kind: str, detail: dict, message: str):
             self.db.execute("INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
-                            (now, "cost_differs", _canon({"rule": rule, "expected": expected, "charged": charged})))
-            self.db.execute("INSERT INTO costs (at, rule, cost) VALUES (?, ?, ?)", (now, rule, charged))
+                            (_iso(self.clock()), kind, _canon(dict(detail, rule=rule))))
             self.db.commit()
             if keep is not None:
                 keep(body)
-            raise LedgerStop("a call by the rule %s cost %d credits, not the %d expected (headers: remaining %s, used "
-                             "%s, last %s): the run stops before the next call. The book list is not cut; the lead "
-                             "decides. The ledger now expects %d a call, so `plan` shows the new cost and running "
-                             "fetch-odds again buys at it" % (rule, charged, expected, usage["remaining"],
-                                                              usage["used"], usage["last"], charged))
+            raise LedgerStop(message)
+
+        if free and charged > 0:
+            stop("free_call_charged", {"charged": charged},
+                 "the free call %s reported a cost of %d credits (headers: remaining %s, used %s, last %s): it is "
+                 "counted as spent and the run stops. Later runs are not blocked by it; their caps count it"
+                 % ((path, charged) + heads))
+        if nothing:
+            stop("charged_nothing", {"expected": expected, "charged": charged},
+                 "a paid answer by the rule %s reported a charge of %d (headers: remaining %s, used %s, last %s): "
+                 "the run stops. The ledger counts it at %d and keeps expecting %d a call; the lead decides"
+                 % ((rule, charged) + heads + (expected, self.expected_cost(rule, rule_cost))))
+        if not free and charged != expected and not (charged == 0 and empty(body)):
+            self.db.execute("INSERT INTO costs (at, rule, cost) VALUES (?, ?, ?)", (_iso(self.clock()), rule, charged))
+            now_expected = self.expected_cost(rule, rule_cost)
+            stop("cost_differs", {"expected": expected, "charged": charged},
+                 "a call by the rule %s cost %d credits, not the %d expected (headers: remaining %s, used %s, last "
+                 "%s): the run stops before the next call. The book list is not cut; the lead decides. The ledger "
+                 "now expects %d a call (never less than the rule's %d), so `plan` shows that cost and running "
+                 "fetch-odds again buys at it" % ((rule, charged, expected) + heads + (now_expected, rule_cost)))
         return body
 
     def _finish(self, rid: int, status: str, charged: int | None, usage: dict, body: bytes | None = None,
@@ -382,18 +442,10 @@ class CreditLedger:
     @contextlib.contextmanager
     def lock(self):
         """One process at a time per ledger (an exclusive lock on `<ledger>.lock`)."""
-        f = open(self.path.with_name(self.path.name + ".lock"), "a")
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            f.close()
-            raise LedgerBusy("another process holds the credit ledger %s; this run stops without a call"
-                             % self.path) from None
-        try:
+        with file_lock(self.path.with_name(self.path.name + ".lock"),
+                       "another process holds the credit ledger %s; this run stops without a call" % self.path,
+                       LedgerBusy):
             yield self
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            f.close()
 
     def calls(self) -> list[dict]:
         return [dict({k: r[k] for k in r.keys() if k != "body"}, params=json.loads(r["params"]))
@@ -434,9 +486,10 @@ def paid_snapshot(client: oa.OddsApiClient, ledger: CreditLedger, sport: str, wh
 
 def refresh_usage(client: oa.OddsApiClient, ledger: CreditLedger, key: str = "paid") -> dict:
     """The free sports call (`/v4/sports`, no credit) through the ledger: its headers give the month's remaining
-    figure afresh and settle what calls left pending or unanswered really used (`CreditLedger.reconcile`)."""
+    figure afresh and settle what calls left pending or unanswered really used (`CreditLedger.reconcile`, run by
+    the attempt once its answer is in). Raises `LedgerStop` if it reports a cost: counted, an event, the run stops."""
     ledger.attempt(key, "sports", 0, 0, "/v4/sports", {}, lambda: client.sports_with(key=key, retries=0), client)
-    return ledger.reconcile(key)
+    return ledger.settled
 
 
 # ---------------------------------------------------------------- the store
@@ -603,24 +656,58 @@ def append_scoring(root: Path, kind: str, payload: dict, clock: Callable[[], dat
 
 # ---------------------------------------------------------------- Kalshi events from the store
 
+_HOCKEY_TITLE = re.compile(r"^\s*(?P<away>\S.*?)\s+at\s+(?P<home>\S.*?)\s+Winner\??\s*$")
+_TEAM_CODE = re.compile(r"^[A-Z]{2,4}$")
+
+
+def _hockey_form(league: str, rows: Sequence[dict]) -> tuple[dict, list[str]] | None:
+    """Clarification 7: an NHL event whose two markets are written as a code and a nickname ("VGK Golden Knights")
+    under one title "<away city> at <home city> Winner?" gives ({"away": city, "home": city}, the nicknames in row
+    order). Anything else (another league, a plain name, another title, titles that disagree) gives None."""
+    if league != "NHL" or len(rows) != 2:
+        return None
+    titles, nicknames = set(), []
+    for r in rows:
+        sub = (r.get("yes_sub_title") or "").split()
+        m = _HOCKEY_TITLE.match(r.get("title") or "")
+        if m is None or len(sub) < 2 or not _TEAM_CODE.match(sub[0]):
+            return None
+        titles.add((m.group("away"), m.group("home")))
+        nicknames.append(" ".join(sub[1:]))
+    if len(titles) != 1:
+        return None
+    away, home = titles.pop()
+    return {"away": away, "home": home}, nicknames
+
+
+def kalshi_event(league: str, event: str, rows: Sequence[dict]) -> dict:
+    """One Kalshi game event from its markets: code, team name (`yes_sub_title`), ticker of each contract, the
+    expected expiration, and for a hockey market written as code and nickname the title's cities (`cities`) and
+    each team's `nickname`."""
+    rows = sorted(rows, key=lambda r: r["ticker"])
+    out = {"event": event, "league": league, "day": kh.event_date(event) or kh.event_date(rows[0]["ticker"]),
+           "expected": rows[0].get("expected_expiration_time") or rows[0].get("occurrence_datetime") or "",
+           "teams": [{"code": kh.team_code(r["ticker"]), "name": r.get("yes_sub_title") or "",
+                      "ticker": r["ticker"]} for r in rows],
+           "markets": {r["ticker"]: r for r in rows}}
+    form = _hockey_form(league, rows)
+    if form is not None:
+        out["cities"] = form[0]
+        for t, nickname in zip(out["teams"], form[1]):
+            t["nickname"] = nickname
+    return out
+
+
 def kalshi_events(kstore: kh.HistoryStore, league: str, start: date, end: date) -> list[dict]:
     """Kalshi game events of a league in [start, end] (the US-Eastern date of the ticker), each with its two
-    contracts: code, team name (`yes_sub_title`), ticker, result and close."""
+    contracts (`kalshi_event`)."""
     by: dict[str, list[dict]] = {}
     for m in kstore.markets(LEAGUES[league][1]):
         d = kh.event_date(m["ticker"])
         if d is None or not (start <= d <= end):
             continue
         by.setdefault(m.get("event_ticker") or m["ticker"].rsplit("-", 1)[0], []).append(m)
-    out = []
-    for event, rows in sorted(by.items()):
-        rows = sorted(rows, key=lambda r: r["ticker"])
-        out.append({"event": event, "league": league, "day": kh.event_date(event) or kh.event_date(rows[0]["ticker"]),
-                    "expected": rows[0].get("expected_expiration_time") or rows[0].get("occurrence_datetime") or "",
-                    "teams": [{"code": kh.team_code(r["ticker"]), "name": r.get("yes_sub_title") or "",
-                               "ticker": r["ticker"]} for r in rows],
-                    "markets": {r["ticker"]: r for r in rows}})
-    return out
+    return [kalshi_event(league, event, rows) for event, rows in sorted(by.items())]
 
 
 def league_days(kstore: kh.HistoryStore, league: str, start: date, end: date) -> dict[date, int]:
@@ -886,6 +973,19 @@ def names_match(kalshi_name: str, odds_name: str) -> bool:
     return used == set(range(n)) and not any(qual[n:])
 
 
+@lru_cache(maxsize=None)
+def nickname_match(city: str, nickname: str, odds_name: str) -> bool:
+    """Clarification 7, for a hockey market written as a code and a nickname: the nickname (the sub-title without its
+    code) is the end of the Odds API's name, word for word and whole, and the city from Kalshi's title starts it by
+    `names_match` (the same rule and qualifying words: "LA" for "Los Angeles", "St. Louis" for "St Louis"; a form the
+    rule cannot read, "Mtl", is refused). The city must keep words of its own before the nickname."""
+    nick = _tokens(nickname)
+    words, inner = _parts(odds_name)
+    if not nick or inner or "(" in (nickname or "") or len(words) <= len(nick):
+        return False
+    return [t for t, _ in words[-len(nick):]] == nick and names_match(city, odds_name)
+
+
 def _name_key(name: str) -> tuple:
     k, kin = _parts(name)
     return tuple(t for t, _ in k), tuple(kin)
@@ -910,23 +1010,37 @@ def odds_games(lstore: LinesStore, league: str, start: date, end: date) -> list[
 
 
 def _in_window(k: dict, g: dict) -> bool:
-    """(b): the game starts within six hours before Kalshi's expected end of the game, and not after it."""
+    """(b), clarification 8: the game starts no more than 12 hours before Kalshi's expected expiration and no more
+    than 3 hours after it (the same US-Eastern date is checked by the callers)."""
     if not k.get("expected") or not g.get("commence"):
         return False
     try:
         end, start = _parse(k["expected"]), _parse(g["commence"])
     except (TypeError, ValueError):
         return False
-    return end - PAIR_WINDOW <= start <= end
+    return end - PAIR_BEFORE <= start <= end + PAIR_AFTER
 
 
-def _ways(k: dict, g: dict, ok: Callable[[str, str], bool]) -> list[tuple[dict, dict]]:
-    """Every way to put the two Kalshi teams on the game's home and away team by `ok(kalshi name, full name)`."""
+def _team_key(k: dict, team: dict, side: str) -> tuple:
+    """What a Kalshi team is matched by on one side of a game: the title's city for that side and the nickname for a
+    hockey market written as code and nickname (clarification 7), else its name."""
+    cities = k.get("cities")
+    if cities and team.get("nickname"):
+        return ("nickname", cities.get(side) or "", team["nickname"])
+    return ("name", team["name"])
+
+
+def _key_match(key: tuple, full: str) -> bool:
+    return nickname_match(key[1], key[2], full) if key[0] == "nickname" else names_match(key[1], full)
+
+
+def _ways(k: dict, g: dict, ok: Callable[[tuple, str], bool]) -> list[tuple[dict, dict]]:
+    """Every way to put the two Kalshi teams on the game's home and away team by `ok(team key, full name)`."""
     teams = k.get("teams") or []
     if len(teams) != 2:
         return []
     return [(h, a) for h, a in ((teams[0], teams[1]), (teams[1], teams[0]))
-            if ok(h["name"], g["home"] or "") and ok(a["name"], g["away"] or "")]
+            if ok(_team_key(k, h, "home"), g["home"] or "") and ok(_team_key(k, a, "away"), g["away"] or "")]
 
 
 def _pair(kevent: dict, game: dict, home: dict, away: dict, source: str) -> dict:
@@ -952,30 +1066,46 @@ def pair_games(kevents: Sequence[dict], games: Sequence[dict], resolver: Callabl
                 league_names.setdefault(g["league"], {}).setdefault(_name_key(full), full)
     hits: dict[tuple, int] = {}
 
-    def unique(league: str, kname: str) -> bool:
-        if (league, kname) not in hits:
-            hits[(league, kname)] = sum(names_match(kname, full) for full in league_names.get(league, {}).values())
-        return hits[(league, kname)] == 1
+    def unique(league: str, key: tuple) -> bool:
+        if (league, key) not in hits:
+            hits[(league, key)] = sum(_key_match(key, full) for full in league_names.get(league, {}).values())
+        return hits[(league, key)] == 1
 
     fits: dict[str, list[tuple[dict, list]]] = {}          # event -> [(game, ways)] passing (a) and (b)
     claims: dict[str, list[str]] = {}                      # game id -> events passing (a) and (b) for it
     near_misses: set[str] = set()                          # events whose names match a game but not uniquely
+    same_day: dict[str, list[str]] = {}                    # event -> games that date its teams match, any start
+    same_day_k: dict[str, list[str]] = {}                  # game id -> events that date whose teams match it
     for k in kevents:
         for g in by_day.get((k["league"], k["day"]), []):
+            if _ways(k, g, _key_match):
+                same_day.setdefault(k["event"], []).append(g["id"])
+                same_day_k.setdefault(g["id"], []).append(k["event"])
             if not _in_window(k, g):
                 continue
-            if _ways(k, g, names_match):
+            if _ways(k, g, _key_match):
                 near_misses.add(k["event"])
-            ways = _ways(k, g, lambda kn, full, lg=k["league"]: names_match(kn, full) and unique(lg, kn))
+            ways = _ways(k, g, lambda key, full, lg=k["league"]: _key_match(key, full) and unique(lg, key))
             if ways:
                 fits.setdefault(k["event"], []).append((g, ways))
                 claims.setdefault(g["id"], []).append(k["event"])
+
+    def met_twice(k: dict) -> str | None:
+        """Clarification 8: the same two teams twice that date, on either side, leaves every such game out."""
+        if len(same_day.get(k["event"], [])) > 1:
+            return "two games between the same teams that day"
+        if any(len(same_day_k.get(gid, [])) > 1 for gid in same_day.get(k["event"], [])):
+            return "two Kalshi events between the same teams that day"
+        return None
 
     def verdict(k: dict, g: dict) -> tuple[str | None, tuple | None]:
         """None and (home, away) when the pair passes (a), (b) and (c) and neither side is taken; else why not."""
         mine = [w for x, w in fits.get(k["event"], []) if x["id"] == g["id"]]
         if not mine:
             return "the team names do not match by the rule", None
+        twice = met_twice(k)
+        if twice:
+            return twice, None
         if len(fits[k["event"]]) > 1:
             return "another game that day also matches", None
         if len(mine[0]) != 1:
@@ -993,18 +1123,22 @@ def pair_games(kevents: Sequence[dict], games: Sequence[dict], resolver: Callabl
             return "league differs", None
         if g["day"] != k["day"]:
             return "date differs (%s against %s)" % (g["day"], k["day"]), None
+        twice = met_twice(k)
+        if twice:
+            return twice, None
         if not _in_window(k, g):
-            return ("start %s is not within six hours before Kalshi's expected end %s"
+            return ("start %s is not between 12 hours before and 3 hours after Kalshi's expected expiration %s"
                     % (g["commence"], k.get("expected") or "(none)")), None
         teams = proposal.get("teams")
         knames = {t["name"]: t for t in k["teams"]}
-        if not isinstance(teams, dict) or set(teams) != set(knames) or \
-                sorted(str(v) for v in teams.values()) != sorted([g["home"], g["away"]]):
+        if not isinstance(teams, dict) or set(teams) != set(knames) or len(knames) != 2 or \
+                sorted(str(v) for v in teams.values()) != sorted([g["home"], g["away"]]) or g["home"] == g["away"]:
             return "teams do not agree with the game", None
         for kname, full in sorted(teams.items()):
-            if not names_match(kname, full):
+            key = _team_key(k, knames[kname], "home" if full == g["home"] else "away")
+            if not _key_match(key, full):
                 return "team name %r does not match %r by the rule" % (kname, full), None
-            if not unique(k["league"], kname):
+            if not unique(k["league"], key):
                 return "team name %r matches more than one team of the league" % kname, None
         why, hw = verdict(k, g)
         if why is None and {hw[0]["name"]: g["home"], hw[1]["name"]: g["away"]} != teams:
@@ -1024,7 +1158,7 @@ def pair_games(kevents: Sequence[dict], games: Sequence[dict], resolver: Callabl
                 taken_o.add(cands[0][0]["id"])
                 taken_k.add(k["event"])
                 continue
-        left[k["event"]] = "ambiguous" if cands or k["event"] in near_misses else "no_match"
+        left[k["event"]] = "ambiguous" if cands or k["event"] in near_misses or met_twice(k) else "no_match"
 
     log: list[dict] = []
     if resolver is not None:
@@ -1478,14 +1612,30 @@ def _period_dates(name: str, periods: dict) -> list[tuple[str, date, date]]:
 
 def _evaluate(name: str, root: Path, lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger,
               periods: dict, leagues, clock) -> dict:
+    """`evaluate`, one process at a time (the ledger's kind of lock, on `scoring.log.lock` beside the log)."""
+    with file_lock(Path(root) / (SCORING_LOG + ".lock"),
+                   "another process holds the scoring lock %s; nothing is scored" % (Path(root) / (SCORING_LOG + ".lock"))):
+        return _evaluate_locked(name, root, lstore, kstore, ledger, periods, leagues, clock)
+
+
+def _evaluate_locked(name: str, root: Path, lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger,
+                     periods: dict, leagues, clock) -> dict:
     start, end = periods[name]
     if name == "test":
-        if any(e.get("kind") == "test_result" for e in scoring_entries(root)):
+        entries = scoring_entries(root)
+        if any(e.get("kind") == "test_result" for e in entries):
             raise Refused("%s already holds a test result: the test period is scored once, whatever the stores say"
                           % (root / SCORING_LOG))
         choice = lstore.choice()
         if choice is None:
             raise Refused("the test period is scored only with a stored choice (`choose` first)")
+        logged = [e.get("choice") for e in entries if e.get("kind") == "choice"]
+        if not logged:
+            raise Refused("%s holds no choice: the test period is scored only with the choice written there"
+                          % (root / SCORING_LOG))
+        if len(logged) != 1 or not _same_choice(logged[0], choice):
+            raise Refused("the choice in the store %s differs from the choice in %s %s; nothing is scored"
+                          % (_canon(choice), root / SCORING_LOG, _canon(logged)))
         if lstore.result("test") is not None:
             raise Refused("the test period has already been scored once; its stored result stands")
         missing = test_readiness(lstore, kstore, ledger, periods)
@@ -1503,6 +1653,11 @@ def _evaluate(name: str, root: Path, lstore: LinesStore, kstore: kh.HistoryStore
         append_scoring(root, "test_result", {"result": result}, clock)
         lstore.put_result("test", result, _iso(clock()))
     return out
+
+
+def _same_choice(logged, choice: dict) -> bool:
+    return (isinstance(logged, dict) and set(logged) == {"margin", "version"} and logged["version"] == choice["version"]
+            and isinstance(logged["margin"], (int, float)) and abs(float(logged["margin"]) - choice["margin"]) < 1e-12)
 
 
 def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_client: kh.HistoryClient | None = None,
@@ -1597,7 +1752,7 @@ def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_clien
 def _cli(argv=None, **kwargs) -> int:
     try:
         return main(argv, **kwargs)
-    except LedgerBusy as exc:
+    except Busy as exc:
         print("stopped: %s" % exc, file=sys.stderr)
         return 2
     except (Refused, CreditCapError, ValueError) as exc:

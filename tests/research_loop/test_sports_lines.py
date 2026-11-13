@@ -57,15 +57,15 @@ def snap(stamp, events):
 class OddsTransport:
     """The Odds API: the free sports list, and historical odds answered by (sport, date) from a dict or a function.
     Usage headers as the API sends them (`used` grows by each charge); `headers=False` leaves them out of the odds
-    answers. Records every call with its params."""
-    def __init__(self, routes, last="10", remaining=None, used=0, headers=True):
+    answers. `sports_cost`: what the free sports call reports it cost. Records every call with its params."""
+    def __init__(self, routes, last="10", remaining=None, used=0, headers=True, sports_cost=0):
         self.routes, self.last, self.calls = routes, last, []
-        self.remaining, self.used, self.headers = remaining, used, headers
+        self.remaining, self.used, self.headers, self.sports_cost = remaining, used, headers, sports_cost
 
     def __call__(self, url, params, timeout):
         self.calls.append((url, dict(params)))
         if url.endswith("/v4/sports"):
-            body, cost, send = [], 0, True
+            body, cost, send = [], self.sports_cost, True
         else:
             sport, when = url.rstrip("/").split("/")[-2], params.get("date")
             body = self.routes(sport, when) if callable(self.routes) else self.routes.get((sport, when), snap(when, []))
@@ -419,6 +419,117 @@ def test_a_ledger_made_before_rev_2_stays_usable(tmp_path):
     assert ledger.spent() == 20 and ledger.calls()[1]["status"] == "done"
 
 
+# ---------------------------------------------------------------- rev 3: the four ledger points (outcomes 3, 4, 6)
+
+def test_a_paid_answer_charged_nothing_is_an_event_stops_the_run_and_never_lowers_the_expected_cost(tmp_path):
+    ledger = sl.CreditLedger(tmp_path / "credits.sqlite", clock=Clock())
+    t = OddsTransport(one_day_routes(*("2026-01-%02dT16:00:00Z" % i for i in range(5, 10))), last="0")
+    client = odds_client(t)
+    kept = []
+    with pytest.raises(sl.LedgerStop, match="charge of 0"):
+        sl.paid_snapshot(client, ledger, "basketball_nba", "2026-01-05T16:00:00Z", cap=100, keep=kept.append)
+    assert len(kept) == 1                                                 # the answer itself is kept
+    assert [e["kind"] for e in ledger.events()] == ["charged_nothing"]
+    assert ledger.expected_cost(sl.SNAPSHOT_RULE, 10) == 10              # 0 is never learned
+    assert ledger.spent() == 10                                           # ... and the answer counts its expected cost
+    t.last = "-3"
+    with pytest.raises(sl.LedgerStop, match="charge of -3"):
+        sl.paid_snapshot(client, ledger, "basketball_nba", "2026-01-06T16:00:00Z", cap=100)
+    t.last = "5"                                                          # below the rule: an event, a stop, not learned
+    with pytest.raises(sl.LedgerStop, match="5"):
+        sl.paid_snapshot(client, ledger, "basketball_nba", "2026-01-07T16:00:00Z", cap=100)
+    assert [e["kind"] for e in ledger.events()] == ["charged_nothing", "charged_nothing", "cost_differs"]
+    assert ledger.expected_cost(sl.SNAPSHOT_RULE, 10) == 10 and ledger.spent() == 25
+    t.last = "10"
+    sl.paid_snapshot(client, ledger, "basketball_nba", "2026-01-08T16:00:00Z", cap=35)   # the caps still hold:
+    with pytest.raises(sl.CreditCapError, match="cap of 44"):                         # 35 spent + 10 > 44
+        sl.paid_snapshot(client, ledger, "basketball_nba", "2026-01-09T16:00:00Z", cap=44)
+    assert len(t.odds_calls()) == 4
+
+
+def broken_transport(sent):
+    def broken(url, params, timeout):
+        sent.append(url)
+        raise ConnectionError("down")
+    return broken
+
+
+def test_a_lost_answer_counts_at_the_larger_of_the_rule_and_the_last_cost_seen(tmp_path):
+    ledger = sl.CreditLedger(tmp_path / "credits.sqlite", clock=Clock())
+    ledger.db.execute("INSERT INTO calls (at, key, rule, path, params, expected, charged, remaining, used, last, ok, "
+                      "status) VALUES ('2026-11-13T01:00:00Z', 'paid', ?, '/v4/x', '{}', 10, 20, 980, 20, 20, 1, "
+                      "'done')", (sl.SNAPSHOT_RULE,))                     # the last answer by the rule cost 20
+    ledger.db.commit()
+    sent = []
+    with pytest.raises(sl.CreditCapError, match="cap of 65"):
+        sl.paid_snapshot(odds_client(broken_transport(sent)), ledger, "basketball_nba", "2026-01-05T16:00:00Z",
+                         cap=65)
+    rows = ledger.calls()[1:]
+    assert len(sent) == 2 and [(r["status"], r["expected"]) for r in rows] == [("unanswered", 20)] * 2
+    assert ledger.spent() == 60                                           # 20 + 20 + 20: a third would pass 65
+    low = sl.CreditLedger(tmp_path / "low.sqlite", clock=Clock())        # a cost of 0 learned by rev 2
+    low.db.execute("INSERT INTO costs (at, rule, cost) VALUES ('2026-11-13T01:00:00Z', ?, 0)", (sl.SNAPSHOT_RULE,))
+    low.db.commit()
+    sent.clear()
+    with pytest.raises(sl.CreditCapError, match="cap of 25"):
+        sl.paid_snapshot(odds_client(broken_transport(sent)), low, "basketball_nba", "2026-01-05T16:00:00Z", cap=25)
+    assert len(sent) == 2 and low.spent() == 20 and low.expected_cost(sl.SNAPSHOT_RULE, 10) == 10
+
+
+@pytest.mark.parametrize("charged_by_the_api", [True, False])
+def test_a_lost_answer_stays_counted_until_a_later_answer_settles_it(tmp_path, charged_by_the_api):
+    ledger = sl.CreditLedger(tmp_path / "credits.sqlite", clock=Clock())
+    t = OddsTransport(one_day_routes("2026-01-05T16:00:00Z"), remaining=1000, used=100)
+    sl.refresh_usage(odds_client(t), ledger)                              # the free call: used 100
+    lost = [True]
+
+    def once_lost(url, params, timeout):
+        if lost and not charged_by_the_api:
+            lost.pop()
+            raise ConnectionError("nothing reached the API")
+        answer = t(url, params, timeout)
+        if lost:
+            lost.pop()
+            raise ConnectionError("the answer was lost")
+        return answer
+
+    tight = sl.CreditLedger(tmp_path / "tight.sqlite", clock=Clock())   # a retry only if both caps hold with it
+    sl.refresh_usage(odds_client(OddsTransport({}, remaining=1000, used=100)), tight)
+    sent = []
+    with pytest.raises(sl.CreditCapError, match="cap of 15"):
+        sl.paid_snapshot(odds_client(broken_transport(sent)), tight, "basketball_nba", "2026-01-05T16:00:00Z", cap=15)
+    assert len(sent) == 1 and tight.spent() == 10
+    body = sl.paid_snapshot(odds_client(once_lost), ledger, "basketball_nba", "2026-01-05T16:00:00Z", cap=100)
+    assert body["data"]
+    rows = ledger.calls()
+    assert [r["status"] for r in rows] == ["done", "confirmed", "done"]   # settled by the second answer's headers
+    assert rows[1]["charged"] == (10 if charged_by_the_api else 0)
+    assert ledger.spent() == (20 if charged_by_the_api else 10)
+
+
+def test_a_free_call_that_reports_a_cost_is_spent_and_an_event_stops_the_run_and_blocks_no_later_run(tmp_path,
+                                                                                                     capsys):
+    store_dir = setup_world(tmp_path)
+    t = OddsTransport(world_routes(), sports_cost=1)
+
+    def run(cap):
+        rc = sl.main(["--store", str(store_dir), "fetch-odds", "--period", "dev", "--cap", str(cap), "--leagues",
+                      "NBA"], odds_client=odds_client(t), clock=Clock(), periods=PERIODS)
+        return rc, json.loads(capsys.readouterr().out)
+
+    rc, out = run(9000)
+    ledger = sl.CreditLedger(store_dir / "credits.sqlite", clock=Clock())
+    assert rc == 3 and out["stopped_by"] == "ledger" and "free" in out["stopped"] and t.odds_calls() == []
+    assert ledger.spent() == 1 and [e["kind"] for e in ledger.events()] == ["free_call_charged"]
+    assert json.loads(ledger.events()[0]["detail"])["charged"] == 1
+    assert ledger.expected_cost("sports", 0) == 0                         # nothing learned for the free call
+    t.sports_cost = 0
+    rc, out = run(40)                                                     # the 1 counts against a later cap ...
+    assert rc == 0 and out["stopped_by"] == "plan" and out["bought"] == 0 and t.odds_calls() == []
+    rc, out = run(41)                                                     # ... and blocks nothing beyond it
+    assert rc == 0 and out["stopped"] is None and len(t.odds_calls()) == 4 and out["spent_after"] == 41
+
+
 # ---------------------------------------------------------------- a small world: stores built by the commands
 
 NBA_BOOKS_1 = {"pinnacle": (1.80, 2.10), "draftkings": (1.75, 2.15), "fanduel": (1.85, 2.00)}
@@ -731,42 +842,70 @@ def test_pairing_by_league_teams_eastern_date_and_start_with_consecutive_days():
     assert p["home_ticker"].endswith("-MIA") and p["away_ticker"].endswith("-BOS") and p["source"] == "code"
 
 
-def test_the_start_must_lie_within_six_hours_before_kalshis_expected_end():
-    k = [kev("KXNBAGAME-26JAN10BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-11T03:30:00Z")]
-    for start, ok in (("2026-01-10T21:30:00Z", True), ("2026-01-10T21:29:00Z", False),
-                      ("2026-01-11T03:30:00Z", True), ("2026-01-11T03:31:00Z", False)):
+def test_the_start_lies_from_twelve_hours_before_to_three_hours_after_kalshis_expected_expiration():
+    """Clarification 8 (rev 3; this replaces rev 2's six-hours-before-and-not-after test)."""
+    k = [kev("KXNBAGAME-26JAN10BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-10T23:00:00Z")]
+    for start, ok in (("2026-01-10T11:00:00Z", True), ("2026-01-10T10:59:00Z", False),    # 12 hours before
+                      ("2026-01-11T02:00:00Z", True), ("2026-01-11T02:01:00Z", False)):   # 3 hours after
         pairs, left, _ = sl.pair_games(k, [ogame("x", "Miami Heat", "Boston Celtics", start)])
         assert (len(pairs) == 1) is ok and (left == {} if ok else left == {"no_match": 1}), start
+        assert sl.eastern_date(start) == date(2026, 1, 10)               # all on the event's Eastern date
+    football = kev("KXNFLGAME-26JAN10KCDEN", [("KC", "Kansas City"), ("DEN", "Denver")], league="NFL",
+                   expected="2026-01-11T01:00:00Z")
+    pairs, _, _ = sl.pair_games([football], [ogame("f", "Denver Broncos", "Kansas City Chiefs",
+                                                   "2026-01-11T01:30:00Z", "NFL")])        # 30 minutes after
+    assert [p["odds_event_id"] for p in pairs] == ["f"]
+    afternoon = kev("KXNBAGAME-26JAN10BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-11T03:30:00Z")
+    pairs, _, _ = sl.pair_games([afternoon], [ogame("a", "Miami Heat", "Boston Celtics",
+                                                    "2026-01-10T18:40:00Z")])               # 8 h 50 min before
+    assert [p["odds_event_id"] for p in pairs] == ["a"]
+    late = kev("KXNBAGAME-26JAN10BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-11T06:00:00Z")
+    pairs, left, _ = sl.pair_games([late], [ogame("n", "Miami Heat", "Boston Celtics",
+                                                  "2026-01-11T05:30:00Z")])                 # inside, but 11 January
+    assert pairs == [] and left == {"no_match": 1}
     pairs, left, _ = sl.pair_games([dict(k[0], expected="")], [ogame("x", "Miami Heat", "Boston Celtics",
                                                                      "2026-01-11T00:30:00Z")])
-    assert pairs == [] and left == {"no_match": 1}                       # no expected end: never guessed
+    assert pairs == [] and left == {"no_match": 1}                       # no expected expiration: never guessed
+
+    def outside(kevent, candidates):                                     # a proposal meets the same window
+        return {"odds_event_id": "x", "teams": {"Miami": "Miami Heat", "Boston": "Boston Celtics"}}
+
+    pairs, left, log = sl.pair_games(k, [ogame("x", "Miami Heat", "Boston Celtics", "2026-01-10T10:59:00Z")],
+                                     resolver=outside)
+    assert pairs == [] and "12 hours" in log[0]["reason"]
 
 
-def test_a_doubleheader_is_paired_by_the_time_check_not_by_order():
+def test_two_games_between_the_same_teams_on_one_date_are_both_left_out_as_ambiguous():
+    """Clarification 8 (rev 3; this replaces rev 2's doubleheader-paired-by-the-time-check test)."""
     first = kev("KXNBAGAME-26JAN10BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-10T20:30:00Z")
     second = kev("KXNBAGAME-26JAN10BOSMIAG2", [("BOS", "Boston"), ("MIA", "Miami")], day=date(2026, 1, 10),
                  expected="2026-01-11T03:30:00Z")
     o = [ogame("late", "Miami Heat", "Boston Celtics", "2026-01-11T00:30:00Z"),
          ogame("early", "Miami Heat", "Boston Celtics", "2026-01-10T17:30:00Z")]
     pairs, left, _ = sl.pair_games([second, first], o, resolver=None)
-    assert {p["kalshi_event"]: p["odds_event_id"] for p in pairs} == {first["event"]: "early", second["event"]: "late"}
+    assert pairs == [] and left == {"ambiguous": 2}                      # not by order, not by nearest time
     pairs, left, _ = sl.pair_games([second], o, resolver=None)           # Kalshi lists only the late game
-    assert [p["odds_event_id"] for p in pairs] == ["late"] and left == {}
+    assert pairs == [] and left == {"ambiguous": 1}
     pairs, left, _ = sl.pair_games([first], o, resolver=None)            # ... or only the early one
-    assert [p["odds_event_id"] for p in pairs] == ["early"] and left == {}
-    close = [ogame("g1", "Miami Heat", "Boston Celtics", "2026-01-10T22:00:00Z"),
-             ogame("g2", "Miami Heat", "Boston Celtics", "2026-01-10T23:30:00Z")]
-    pairs, left, _ = sl.pair_games([second], close, resolver=None)       # both start inside the window
+    assert pairs == [] and left == {"ambiguous": 1}
+    far = [o[1], ogame("night", "Miami Heat", "Boston Celtics", "2026-01-11T04:30:00Z")]   # 11:30 pm Eastern
+    pairs, left, _ = sl.pair_games([first], far, resolver=None)          # the second game outside the window
     assert pairs == [] and left == {"ambiguous": 1}
 
     def pick_one(kevent, candidates):                                    # a proposal cannot break the tie
-        return {"odds_event_id": "g2", "teams": {"Miami": "Miami Heat", "Boston": "Boston Celtics"}}
+        return {"odds_event_id": "late", "teams": {"Miami": "Miami Heat", "Boston": "Boston Celtics"}}
 
-    pairs, left, log = sl.pair_games([second], close, resolver=pick_one)
-    assert pairs == [] and left == {"ambiguous": 1} and "another game" in log[0]["reason"]
+    pairs, left, log = sl.pair_games([second], o, resolver=pick_one)
+    assert pairs == [] and left == {"ambiguous": 1} and "same teams" in log[0]["reason"]
     both = [dict(second, event="KXNBAGAME-26JAN10BOSMIAG3"), second]
-    pairs, left, _ = sl.pair_games(both, [close[1]], resolver=None)      # two events for one game
+    pairs, left, _ = sl.pair_games(both, [o[0]], resolver=None)          # two events for one game
     assert pairs == [] and left == {"ambiguous": 2}
+    pairs, left, log = sl.pair_games([first, second], [o[0]], resolver=pick_one)   # one of them outside the window
+    assert pairs == [] and left == {"ambiguous": 2} and all("same teams" in r["reason"] for r in log)
+    nxt = kev("KXNBAGAME-26JAN11BOSMIA", [("BOS", "Boston"), ("MIA", "Miami")], expected="2026-01-12T03:30:00Z")
+    pairs, left, _ = sl.pair_games([second, nxt], [o[0], ogame("n", "Miami Heat", "Boston Celtics",
+                                                                "2026-01-12T00:30:00Z")])
+    assert len(pairs) == 2 and left == {}                                # the same teams on two dates: both paired
 
 
 def test_the_verifiers_lookalikes_are_never_paired_by_code_or_by_a_proposal():
@@ -903,6 +1042,9 @@ def team(entry):
             "ambiguous": len(entry) > 3}
 
 
+EXPIRY_OFFSETS = [-2.5, -0.5, 1, 2.5, 3, 9, 11.5]   # Kalshi's expected expiration less the start, in hours (rev 3)
+
+
 def make_slate(rng, n):
     """One league-day with its true games, then the traps: a missing true game beside a lookalike, a doubleheader,
     the same teams the next day, a copy of a game in another league, a game missing on either side. Every event and
@@ -914,11 +1056,12 @@ def make_slate(rng, n):
     m = rng.randint(2, min(6, len(pool) // 2 - 1))
     picks = rng.sample(pool, 2 * m)
     kevents, games, truth_k, truth_g, traps = [], [], {}, {}, []
+    doubled: set[str] = set()
 
     def add(gid, home, away, start, d, kalshi=True, odds=True, odds_league=None):
         if kalshi:
             e = {"event": "KX%sGAME-S%dX%s" % (league, n, gid), "league": league, "day": d,
-                 "expected": iso(start + timedelta(hours=rng.choice([2.5, 3, 3.5]))),
+                 "expected": iso(start + timedelta(hours=rng.choice(EXPIRY_OFFSETS))),
                  "teams": [{"code": "A", "name": away["kalshi"], "ticker": "S%d%s-A" % (n, gid)},
                            {"code": "H", "name": home["kalshi"], "ticker": "S%d%s-H" % (n, gid)}]}
             rng.shuffle(e["teams"])
@@ -965,6 +1108,7 @@ def make_slate(rng, n):
         if i == 0 and rng.random() < 0.4:                  # a doubleheader: the same teams 4 to 6 hours later
             add("dh%d" % i, h, a, start + timedelta(hours=rng.choice([4, 4.5, 5, 6])), day)
             traps.append("doubleheader")
+            doubled.update({gid, "dh%d" % i})              # rev 3 (clarification 8): both left out as ambiguous
         if rng.random() < 0.25:                            # the same two teams the next day
             nxt = start + timedelta(days=1, minutes=30 * rng.randrange(-4, 5))
             add("next%d" % i, h, a, nxt, sl.eastern_date(iso(nxt)))
@@ -977,6 +1121,7 @@ def make_slate(rng, n):
         add("bg%d" % j, rest[j], rest[(j + 1) % len(rest)], base - timedelta(days=3) + timedelta(hours=j % 6),
             day - timedelta(3), kalshi=False)
     clean = {e["event"] for e in kevents if truth_k[e["event"]] in {truth_g[g["id"]] for g in games}
+             and truth_k[e["event"]] not in doubled
              and not any(t["ambiguous"] for t in pool if t["kalshi"] in [x["name"] for x in e["teams"]])}
     return kevents, games, truth_k, truth_g, clean, traps
 
@@ -1004,6 +1149,8 @@ def test_generated_slates_pair_no_wrong_game_and_count_every_refusal():
             assert all(not r["accepted"] for r in log)
             paired = {p["kalshi_event"] for p in pairs}
             assert clean <= paired, (n, clean - paired)
+            doubled = {"g0", "dh0"} if "doubleheader" in traps else set()
+            assert not any(truth_k[p["kalshi_event"]] in doubled for p in pairs), n
             if resolver is None:
                 totals["events"] += len(kevents)
                 totals["paired"] += len(pairs)
@@ -1014,6 +1161,253 @@ def test_generated_slates_pair_no_wrong_game_and_count_every_refusal():
     assert all(seen_traps.get(t, 0) >= 30 for t in ("lookalike", "odds_missing", "kalshi_missing", "doubleheader",
                                                     "next_day", "other_league")), seen_traps
     assert totals["refused"]["no_match"] >= 200 and totals["paired"] >= 600, totals
+
+
+# --- hockey teams written as a code and a nickname (rev 3, clarification 7)
+
+def hmarket(event, code, sub, title, result="yes", expected="2026-01-11T06:00:00Z"):
+    return dict(kmarket(event, code, sub, result, close=expected, expected=expected), title=title)
+
+
+def test_hockey_nickname_rule_takes_the_city_from_the_title_and_the_whole_nickname_at_the_end():
+    assert sl.nickname_match("St. Louis", "Blues", "St Louis Blues")
+    assert sl.nickname_match("Vegas", "Golden Knights", "Vegas Golden Knights")
+    assert sl.nickname_match("LA", "Kings", "Los Angeles Kings") and sl.nickname_match("Los Angeles", "Kings",
+                                                                                       "Los Angeles Kings")
+    assert sl.nickname_match("NY", "Rangers", "New York Rangers") and sl.nickname_match("New York", "Islanders",
+                                                                                       "New York Islanders")
+    assert sl.nickname_match("Montreal", "Canadiens", "Montréal Canadiens")
+    assert sl.nickname_match("Edmonton", "Oilers", "Edmonton Oilers")
+    assert not sl.nickname_match("New York", "Rangers", "New York Islanders")
+    assert not sl.nickname_match("Anaheim", "Kings", "Los Angeles Kings")        # the city must start the name
+    assert not sl.nickname_match("Los Angeles", "Kings", "Sacramento Kings")
+    assert not sl.nickname_match("Vegas", "Golden Knights", "Vegas Knights")     # the whole nickname is the end
+    assert not sl.nickname_match("New York", "Rangers", "New York Rangers Alumni")
+    assert not sl.nickname_match("Columbus", "Blue Jackets", "Columbus Jackets Blue")
+    assert not sl.nickname_match("Vegas", "Golden Knights", "Vegas Golden Knights (W)")
+    assert not sl.nickname_match("Mtl", "Canadiens", "Montréal Canadiens")       # a short form the rule cannot read
+    assert not sl.nickname_match("Las Vegas", "Golden Knights", "Vegas Golden Knights")
+    assert not sl.nickname_match("Louis", "Blues", "St Louis Blues")             # qualifying words as now
+    assert not sl.nickname_match("St. Louis", "Blues", "Louis Blues")
+    assert not sl.nickname_match("Jersey", "Devils", "New Jersey Devils")
+    assert not sl.nickname_match("Blues", "Blues", "Blues")                      # the city needs its own words
+
+
+def test_hockey_teams_written_as_a_code_and_a_nickname_are_paired_by_the_title_cities(tmp_path):
+    kstore = kh.HistoryStore(tmp_path / "kalshi.sqlite")
+    stl, edm = "KXNHLGAME-26JAN10STLVGK", "KXNHLGAME-26JAN10EDMLA"
+    nyr, mtl = "KXNHLGAME-26JAN10NYRBOS", "KXNHLGAME-26JAN10MTLTOR"
+    rows = [hmarket(stl, "STL", "STL Blues", "St. Louis at Vegas Winner?", "no"),
+            hmarket(stl, "VGK", "VGK Golden Knights", "St. Louis at Vegas Winner?"),
+            hmarket(edm, "EDM", "EDM Oilers", "Edmonton at Los Angeles Winner?", "no"),
+            hmarket(edm, "LA", "LA Kings", "Edmonton at Los Angeles Winner?"),
+            hmarket(nyr, "NYR", "NYR Rangers", "New York at Boston Winner?", "no"),
+            hmarket(nyr, "BOS", "BOS Bruins", "New York at Boston Winner?"),
+            hmarket(mtl, "MTL", "MTL Canadiens", "Mtl at Toronto Winner?", "no"),          # a form the rule refuses
+            hmarket(mtl, "TOR", "TOR Maple Leafs", "Mtl at Toronto Winner?")]
+    for m in rows:
+        kstore.put_market(m, "historical", "KXNHLGAME")
+    start = "2026-01-11T00:00:00Z"
+    games = [ogame("g-stl", "Vegas Golden Knights", "St Louis Blues", start, "NHL"),
+             ogame("g-edm", "Los Angeles Kings", "Edmonton Oilers", start, "NHL"),
+             ogame("g-nyi", "Boston Bruins", "New York Islanders", start, "NHL"),        # the other New York club
+             ogame("g-mtl", "Toronto Maple Leafs", "Montréal Canadiens", start, "NHL"),
+             ogame("bg1", "Anaheim Ducks", "New York Rangers", "2026-01-07T03:00:00Z", "NHL"),
+             ogame("bg2", "Sacramento Kings", "Los Angeles Lakers", start, "NBA")]
+    kev_ = sl.kalshi_events(kstore, "NHL", date(2026, 1, 10), date(2026, 1, 10))
+    assert {e["event"]: e["cities"] for e in kev_}[stl] == {"away": "St. Louis", "home": "Vegas"}
+    reasons = {}
+    pairs, left, _ = sl.pair_games(kev_, games, reasons=reasons)
+    got = {p["kalshi_event"]: (p["odds_event_id"], p["home_ticker"], p["away_ticker"]) for p in pairs}
+    assert got == {stl: ("g-stl", stl + "-VGK", stl + "-STL"), edm: ("g-edm", edm + "-LA", edm + "-EDM")}
+    assert reasons == {nyr: "no_match", mtl: "no_match"} and left == {"no_match": 2}
+    swapped = [dict(games[0], home="St Louis Blues", away="Vegas Golden Knights")]   # home and away disagree
+    assert sl.pair_games([e for e in kev_ if e["event"] == stl], swapped)[1] == {"no_match": 1}
+    plain = sl.kalshi_event("NHL", "KXNHLGAME-26JAN10BOSMTL", [kmarket("KXNHLGAME-26JAN10BOSMTL", "BOS", "Boston", "no"),
+                                                              kmarket("KXNHLGAME-26JAN10BOSMTL", "MTL", "Montreal",
+                                                                      "yes")])
+    assert "cities" not in plain                                          # a plain name keeps the plain rule
+    pairs, _, _ = sl.pair_games([plain], [ogame("p", "Montréal Canadiens", "Boston Bruins", "2026-01-11T03:00:00Z",
+                                                "NHL")])
+    assert len(pairs) == 1
+    other = sl.kalshi_event("NBA", "KXNBAGAME-26JAN10PHXLAL", [
+        hmarket("KXNBAGAME-26JAN10PHXLAL", "PHX", "PHX Suns", "Phoenix at Los Angeles Winner?"),
+        hmarket("KXNBAGAME-26JAN10PHXLAL", "LAL", "LAL Lakers", "Phoenix at Los Angeles Winner?")])
+    assert "cities" not in other                                          # the hockey shape is read for NHL only
+    mixed = sl.kalshi_event("NHL", stl, [rows[0], dict(rows[1], title="Vegas at St. Louis Winner?")])
+    assert "cities" not in mixed                                          # titles that disagree are not read
+
+    def propose(kevent, candidates):                                      # a proposal meets the same hockey rule
+        return {"odds_event_id": "g-nyi", "teams": {"NYR Rangers": "New York Islanders", "BOS Bruins": "Boston Bruins"}}
+
+    pairs, left, log = sl.pair_games([e for e in kev_ if e["event"] == nyr], games, resolver=propose)
+    assert pairs == [] and log and not log[0]["accepted"] and "rule" in log[0]["reason"]
+
+
+NHL_CLUBS = [   # code, nickname, the Odds API's name, title city forms the rule reads, forms it refuses, city family
+    ("ANA", "Ducks", "Anaheim Ducks", ["Anaheim"], [], "la"),
+    ("BOS", "Bruins", "Boston Bruins", ["Boston"], [], None),
+    ("BUF", "Sabres", "Buffalo Sabres", ["Buffalo"], [], None),
+    ("CGY", "Flames", "Calgary Flames", ["Calgary"], [], None),
+    ("CAR", "Hurricanes", "Carolina Hurricanes", ["Carolina"], [], None),
+    ("CHI", "Blackhawks", "Chicago Blackhawks", ["Chicago"], [], None),
+    ("COL", "Avalanche", "Colorado Avalanche", ["Colorado"], [], None),
+    ("CBJ", "Blue Jackets", "Columbus Blue Jackets", ["Columbus"], [], None),
+    ("DAL", "Stars", "Dallas Stars", ["Dallas"], [], None),
+    ("DET", "Red Wings", "Detroit Red Wings", ["Detroit"], [], None),
+    ("EDM", "Oilers", "Edmonton Oilers", ["Edmonton"], [], None),
+    ("FLA", "Panthers", "Florida Panthers", ["Florida"], [], None),
+    ("LA", "Kings", "Los Angeles Kings", ["Los Angeles", "LA", "L.A."], [], "la"),
+    ("MIN", "Wild", "Minnesota Wild", ["Minnesota"], [], None),
+    ("MTL", "Canadiens", "Montréal Canadiens", ["Montreal", "Montréal"], ["Mtl"], None),
+    ("NSH", "Predators", "Nashville Predators", ["Nashville"], [], None),
+    ("NJ", "Devils", "New Jersey Devils", ["New Jersey", "NJ"], ["Jersey"], "ny"),
+    ("NYI", "Islanders", "New York Islanders", ["New York", "NY", "New York I"], [], "ny"),
+    ("NYR", "Rangers", "New York Rangers", ["New York", "NY", "New York R"], [], "ny"),
+    ("OTT", "Senators", "Ottawa Senators", ["Ottawa"], [], None),
+    ("PHI", "Flyers", "Philadelphia Flyers", ["Philadelphia"], [], None),
+    ("PIT", "Penguins", "Pittsburgh Penguins", ["Pittsburgh"], [], None),
+    ("SJ", "Sharks", "San Jose Sharks", ["San Jose", "SJ"], [], None),
+    ("SEA", "Kraken", "Seattle Kraken", ["Seattle"], [], None),
+    ("STL", "Blues", "St Louis Blues", ["St. Louis", "Saint Louis", "St Louis"], ["Louis"], None),
+    ("TB", "Lightning", "Tampa Bay Lightning", ["Tampa Bay", "TB"], ["Bay"], None),
+    ("TOR", "Maple Leafs", "Toronto Maple Leafs", ["Toronto"], [], None),
+    ("UTA", "Mammoth", "Utah Mammoth", ["Utah"], [], None),
+    ("VAN", "Canucks", "Vancouver Canucks", ["Vancouver"], [], None),
+    ("VGK", "Golden Knights", "Vegas Golden Knights", ["Vegas"], ["Las Vegas"], None),
+    ("WSH", "Capitals", "Washington Capitals", ["Washington"], [], None),
+    ("WPG", "Jets", "Winnipeg Jets", ["Winnipeg"], [], None)]
+
+
+def make_hockey_slate(rng, n):
+    """One NHL day written as Kalshi writes hockey (code + nickname, cities in the title), through
+    `sl.kalshi_event`, with its traps: the other club of a city in a missing game's slot, a game missing on either
+    side, home and away swapped, an expiration outside the window, a title city the rule refuses, a doubleheader, the
+    same teams the next day. Returns the generator's own labels and the events it expects paired (`clean`)."""
+    clubs = {c[0]: c for c in NHL_CLUBS}
+    day = date(2026, 1, 5) + timedelta(days=n % 50)
+    base = datetime(day.year, day.month, day.day, 16, tzinfo=UTC)
+    forced = (["NYR", "NYI"] if rng.random() < 0.5 else []) + (["LA", "ANA"] if rng.random() < 0.5 else [])
+    m = rng.randint(max(2, len(forced) // 2), 8)
+    picks = forced + rng.sample([c for c in clubs if c not in forced], 2 * m - len(forced))
+    rng.shuffle(picks)
+    kevents, games, truth_k, truth_g, traps, unclean = [], [], {}, {}, [], set()
+
+    def add(gid, home, away, start, d, kalshi=True, odds=True, swap=False, offset=None, refuse=False):
+        if kalshi:
+            forms = {}
+            for side, code in (("home", home), ("away", away)):
+                good, bad = clubs[code][3], clubs[code][4]
+                forms[side] = rng.choice(bad) if refuse and bad and side == refuse else rng.choice(good)
+            event = "KXNHLGAME-%s%s%s%s" % (d.strftime("%y%b%d").upper(), away, home, gid.upper())
+            exp = iso(start + timedelta(hours=offset if offset is not None else rng.choice(EXPIRY_OFFSETS)))
+            title = "%s at %s Winner?" % (forms["away"], forms["home"])
+            rows = [hmarket(event, code, "%s %s" % (code, clubs[code][1]), title, expected=exp) for code in (away, home)]
+            rng.shuffle(rows)
+            e = sl.kalshi_event("NHL", event, rows)
+            kevents.append(e)
+            truth_k[e["event"]] = gid
+        if odds:
+            h, a = (away, home) if swap else (home, away)
+            g = {"id": "h%d-%s" % (n, gid), "league": "NHL", "home": clubs[h][2], "away": clubs[a][2],
+                 "commence": iso(start), "day": sl.eastern_date(iso(start))}
+            games.append(g)
+            truth_g[g["id"]] = gid
+
+    used = set(picks)
+    for i in range(m):
+        h, a = picks[2 * i], picks[2 * i + 1]
+        start = base + timedelta(minutes=30 * rng.randrange(0, 7 if i == 0 else 14))
+        gid, roll = "g%d" % i, rng.random()
+        if roll < 0.15:                                    # the true game missing, the city's other club in its slot
+            look = [c for c in clubs if clubs[c][5] and clubs[c][5] in (clubs[h][5], clubs[a][5]) and c not in used]
+            if look:
+                lk = rng.choice(look)
+                lh, la_ = (lk, a) if clubs[lk][5] == clubs[h][5] else (h, lk)
+                used.add(lk)
+                add(gid, h, a, start, day, odds=False)
+                add("look%d" % i, lh, la_, start, day, kalshi=False)
+                traps.append("lookalike")
+                continue
+        if roll < 0.22:
+            add(gid, h, a, start, day, odds=False)
+            traps.append("odds_missing")
+            continue
+        if roll < 0.29:
+            add(gid, h, a, start, day, kalshi=False)
+            traps.append("kalshi_missing")
+            continue
+        if roll < 0.36 and {h, a} != {"NYR", "NYI"}:      # (a swap between two clubs of one city cannot be seen)
+            add(gid, h, a, start, day, swap=True)
+            traps.append("swapped")
+            unclean.add(gid)
+            continue
+        if roll < 0.43:
+            add(gid, h, a, start, day, offset=rng.choice([-3.5, 12.5, 14]))
+            traps.append("outside_window")
+            unclean.add(gid)
+            continue
+        side = "home" if clubs[h][4] else "away"
+        if roll < 0.55 and clubs[h if side == "home" else a][4]:
+            add(gid, h, a, start, day, refuse=side)
+            traps.append("refused_form")
+            unclean.add(gid)
+            continue
+        add(gid, h, a, start, day)
+        if i == 0 and rng.random() < 0.35:
+            add("dh%d" % i, h, a, start + timedelta(hours=rng.choice([4, 5, 6])), day)
+            traps.append("doubleheader")
+            unclean.update({gid, "dh%d" % i})
+        if rng.random() < 0.2:
+            nxt = start + timedelta(days=1, minutes=30 * rng.randrange(-4, 5))
+            add("next%d" % i, h, a, nxt, sl.eastern_date(iso(nxt)))
+            traps.append("next_day")
+    if {"NYR", "NYI"} <= used:
+        traps.append("both_new_york")
+    if {"LA", "ANA"} <= used:
+        traps.append("both_los_angeles_area")
+    rest = list(clubs)
+    rng.shuffle(rest)
+    for j in range(0, len(rest), 2):                       # every club also plays three days earlier
+        add("bg%d" % j, rest[j], rest[j + 1], base - timedelta(days=3) + timedelta(hours=j % 6),
+            day - timedelta(3), kalshi=False)
+    clean = {e["event"] for e in kevents if truth_k[e["event"]] in set(truth_g.values())
+             and truth_k[e["event"]] not in unclean}
+    return kevents, games, truth_k, truth_g, clean, traps
+
+
+def test_generated_hockey_slates_of_all_32_clubs_pair_every_true_game_and_no_wrong_one():
+    assert len(NHL_CLUBS) == 32 and len({c[2] for c in NHL_CLUBS}) == 32
+    rng = random.Random(20261114)
+    totals = {"events": 0, "paired": 0, "clean": 0, "refused": {}}
+    seen: dict[str, int] = {}
+
+    def adversary(kevent, candidates):
+        g = rng.choice(candidates)
+        names = [t["name"] for t in kevent["teams"]]
+        return {"odds_event_id": g["id"], "teams": {names[0]: g["home"], names[1]: g["away"]}}
+
+    for n in range(300):
+        kevents, games, truth_k, truth_g, clean, traps = make_hockey_slate(rng, n)
+        assert all("cities" in e for e in kevents)                       # every event read in the hockey shape
+        for t in traps:
+            seen[t] = seen.get(t, 0) + 1
+        for resolver in (None, adversary):
+            pairs, left, log = sl.pair_games(kevents, games, resolver=resolver)
+            wrong = [p for p in pairs if truth_k[p["kalshi_event"]] != truth_g[p["odds_event_id"]]]
+            assert not wrong, (n, wrong)
+            assert {p["kalshi_event"] for p in pairs} == clean, (n, traps)
+            assert sum(left.values()) + len(pairs) == len(kevents) and set(left) <= {"no_match", "ambiguous"}
+            if resolver is None:
+                totals["events"] += len(kevents)
+                totals["paired"] += len(pairs)
+                totals["clean"] += len(clean)
+                for r, c in left.items():
+                    totals["refused"][r] = totals["refused"].get(r, 0) + c
+    assert all(seen.get(t, 0) >= 20 for t in ("lookalike", "odds_missing", "swapped", "outside_window",
+                                              "refused_form", "doubleheader", "next_day", "both_new_york",
+                                              "both_los_angeles_area")), seen
+    assert totals["paired"] == totals["clean"] >= 600, totals
 
 
 def test_resolver_proposals_are_logged_and_never_override_the_checks(tmp_path, capsys):
@@ -1299,6 +1693,71 @@ def test_the_test_period_is_scored_once_with_everything_stored_and_a_log_beside_
         run("evaluate", "--period", "test")
     with pytest.raises(sl.Refused, match="scoring.log"):
         run("choose", "--margin", "0.02", "--version", "median")
+
+
+def test_test_scoring_refuses_unless_the_stores_choice_is_the_logged_choice_and_holds_a_lock(tmp_path, capsys):
+    import fcntl
+
+    store_dir = setup_world(tmp_path, periods=T2, candles=False)
+    args = ["--store", str(store_dir)]
+
+    def run(*more):
+        return sl.main(args + list(more), clock=Clock(), periods=T2)
+
+    assert run("choose", "--margin", "0.03", "--version", "pinnacle") == 0
+    store = sl.LinesStore(store_dir / "lines.sqlite")
+    for change in ("version = 'median'", "version = 'pinnacle', margin = 0.02"):
+        store.db.execute("UPDATE choice SET " + change)
+        store.db.commit()
+        with pytest.raises(sl.Refused, match="differs"):
+            run("evaluate", "--period", "test")
+    store.db.execute("UPDATE choice SET margin = 0.03")
+    store.db.commit()
+    log = store_dir / "scoring.log"
+    text = log.read_text()
+    log.unlink()
+    with pytest.raises(sl.Refused, match="no choice"):
+        run("evaluate", "--period", "test")
+    log.write_text(text)
+    with pytest.raises(sl.Refused, match="snapshot"):                     # they agree: readiness speaks next
+        run("evaluate", "--period", "test")
+    with open(store_dir / "scoring.log.lock", "a") as f:                  # another process is scoring
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for period in ("test", "dev"):
+            with pytest.raises(sl.Busy, match="another process"):
+                run("evaluate", "--period", period)
+        capsys.readouterr()
+        assert sl._cli(args + ["evaluate", "--period", "test"], clock=Clock(), periods=T2) == 2
+        assert "stopped: another process" in capsys.readouterr().err
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    assert issubclass(sl.LedgerBusy, sl.Busy)
+    capsys.readouterr()
+    assert run("evaluate", "--period", "dev") == 0                         # free again
+
+
+def test_a_store_paired_before_rev_3_keeps_every_pair_and_a_new_run_only_adds(tmp_path, capsys):
+    """Pairs a rev 2 run stored (here: one written as rev 2 wrote it) are never changed; a new run adds the rest."""
+    store_dir = setup_world(tmp_path)
+    assert sl.main(["--store", str(store_dir), "fetch-odds", "--period", "dev", "--cap", "9000", "--leagues", "NBA"],
+                   odds_client=odds_client(OddsTransport(world_routes())), clock=Clock(), periods=PERIODS) == 0
+    store = sl.LinesStore(store_dir / "lines.sqlite")
+    old = {"kalshi_event": EVENING, "odds_event_id": "o1", "league": "NBA", "day": date(2026, 1, 10),
+           "home_ticker": EVENING + "-MIA", "away_ticker": EVENING + "-BOS", "home_team": "Miami Heat",
+           "away_team": "Boston Celtics", "source": "code"}
+    store.put_pair(old, "2026-11-12T09:00:00Z")
+    store.db.commit()
+    before = store.pairs()
+    capsys.readouterr()
+    assert sl.main(["--store", str(store_dir), "pair", "--period", "dev", "--leagues", "NBA", "--no-resolver"],
+                   clock=Clock(), periods=PERIODS) == 0
+    out = json.loads(capsys.readouterr().out)["NBA"]
+    assert out["paired_before"] == 1 and out["paired_now"] == 2
+    after = sl.LinesStore(store_dir / "lines.sqlite").pairs()
+    assert [p for p in after if p["kalshi_event"] == EVENING] == before
+    assert {p["kalshi_event"] for p in after} == {EARLY, EVENING, LATE}
+    sl.main(["--store", str(store_dir), "pair", "--period", "dev", "--leagues", "NBA", "--no-resolver"],
+            clock=Clock(), periods=PERIODS)
+    assert sl.LinesStore(store_dir / "lines.sqlite").pairs() == after   # a second run changes nothing
 
 
 def test_kalshi_candles_are_fetched_only_around_each_moment(tmp_path):
