@@ -7,6 +7,8 @@ import urllib.error
 from collections import Counter
 import urllib.parse
 from datetime import datetime, timezone
+from email.utils import formatdate
+import inspect
 
 import pytest
 
@@ -15,6 +17,20 @@ from valedia_trader.research_loop import orderbook_loop as ol
 from valedia_trader.venues import kalshi_data as kd
 
 v3 = legacy.load("systemone_v3_candidate")
+# rev 6: answers carry their Date header and the collector takes a monotonic clock. Detected rather than assumed so
+# that the same tests can be run against a collector without the rule, to see them fail.
+DATED = hasattr(kd, "urllib_get_dated")
+MONO = "monotonic" in inspect.signature(ol.Collector).parameters
+
+
+def make_collector(store, kalshi, model, *, clock, monotonic=None, **kw):
+    if MONO:
+        kw["monotonic"] = monotonic or clock.mono
+    return ol.Collector(store, kalshi, model, clock=clock, **kw)
+
+
+def main_kw(clock):
+    return {"clock": clock, **({"monotonic": clock.mono} if MONO else {})}
 UTC = timezone.utc
 T0 = 1794549600            # 2026-11-13 06:00:00 UTC, on the hour
 D0 = 1794528000            # 2026-11-13 00:00:00 UTC
@@ -37,6 +53,10 @@ class Clock:
 
     def sleep(self, s):
         self.t += s
+
+    def mono(self):
+        """The monotonic clock beside it: it moves with this clock, never stepping (rev 6)."""
+        return self.t
 
 
 # ---------------------------------------------------------------- stand-in Kalshi
@@ -62,13 +82,21 @@ class World:
         self.page_size, self.book_delay = None, {}          # markets a page (None: one page); seconds a book read takes
         self.request_delay = 0.0                            # seconds every request takes (rev 4)
         self.trade_page = None                              # trades a page (None: one page)
+        self.on_request, self.date_offset = None, 0.0       # rev 6: a hook inside each request; a Date that is off
 
     def __call__(self, url):
+        """The answer and, as every Kalshi answer carries, its HTTP Date header (the true time, to the second)."""
+        body = self._answer(url)
+        return (body, formatdate(int(self.clock.t + self.date_offset), usegmt=True)) if DATED else body
+
+    def _answer(self, url):
         self.urls.append(url)
         self.clock.t += self.request_delay
         parts = urllib.parse.urlsplit(url)
         assert url.startswith(kd.BASE_URL + "/") and parts.scheme == "https"
         path, q = parts.path.split("/trade-api/v2", 1)[1], dict(urllib.parse.parse_qsl(parts.query))
+        if self.on_request is not None:
+            self.on_request(path)
         if self.fail or path in self.fail_paths:
             raise kd.HttpError(404, url)
         if path == "/markets":
@@ -98,6 +126,8 @@ class World:
             b = self.books.get(path.split("/")[2], {"yes": [], "no": []})
             return json.dumps({"orderbook_fp": {"yes_dollars": levels_api(b["yes"]),
                                                 "no_dollars": levels_api(b["no"])}}).encode()
+        if path == "/exchange/status":
+            return b'{"exchange_active": true, "trading_active": true}'
         if path.startswith("/series/"):
             s = path.split("/")[2]
             return json.dumps({"series": {"ticker": s, **self.fees.get(s, {"fee_type": "quadratic",
@@ -147,6 +177,7 @@ class Model:
                  exc=None):
         self.clock, self.latency, self.digest, self.body, self.down, self.post_down = clock, latency, digest, body, down, post_down
         self.exc, self.posts, self.urls = exc, [], []
+        self.on_post = None                                 # rev 6: a hook inside each call
 
     def __call__(self, url, data, timeout):
         self.urls.append(url)
@@ -159,6 +190,8 @@ class Model:
             return b'{"version": "0.40.16"}'
         assert url.endswith("/v1/systemone") and data is not None and timeout == ol.MODEL_LIMIT_S
         self.posts.append(data)
+        if self.on_post is not None:
+            self.on_post()
         if self.post_down:
             raise ol.ModelUnavailable("connection refused")
         if self.exc is not None:
@@ -177,7 +210,7 @@ def rig(tmp_path, clock=None, **model_kw):
     model = Model(clock, **model_kw)
     store = ol.Store(tmp_path / "loop.sqlite")
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
-    col = ol.Collector(store, kalshi, ol.ModelClient(transport=model, clock=clock), clock=clock)
+    col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=clock), clock=clock)
     return col, world, model, store, clock
 
 
@@ -598,7 +631,7 @@ def test_resuming_after_a_stop_keeps_watching_and_records_the_gap(tmp_path):
     store.close()
     clock.t = T0 + 30 * 60 + 0.5
     store2 = ol.Store(tmp_path / "loop.sqlite")
-    col2 = ol.Collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+    col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                         ol.ModelClient(transport=model, clock=clock), clock=clock)
     col2.start()
     gap = store2.conn.execute("SELECT detail_json FROM events WHERE kind = 'gap'").fetchone()
@@ -617,7 +650,7 @@ def test_resuming_after_the_watch_ran_out_drops_it_and_selects_at_once(tmp_path)
     store.close()
     clock.t = T0 + 13 * 3600 + 60.5
     store2 = ol.Store(tmp_path / "loop.sqlite")
-    col2 = ol.Collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+    col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                         ol.ModelClient(transport=model, clock=clock), clock=clock)
     col2.start()
     assert col2.watched() == []
@@ -771,7 +804,7 @@ def test_select_prints_what_it_would_watch_and_writes_nothing(tmp_path, capsys):
     world.books["A-E-M"] = book(0.40, 0.45)
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
     db = tmp_path / "x.sqlite"
-    assert ol.main(["select", "--db", str(db)], kalshi=kalshi, model=None, clock=clock) == 0
+    assert ol.main(["select", "--db", str(db)], kalshi=kalshi, model=None, **main_kw(clock)) == 0
     out = capsys.readouterr().out
     assert "A-E-M" in out and "spread 5" in out and "cached quote" in out
     store = ol.Store(db)
@@ -787,7 +820,7 @@ def test_once_runs_one_full_cycle_and_marks_its_decisions_as_forced(tmp_path, ca
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
     db = tmp_path / "x.sqlite"
     assert ol.main(["once", "--db", str(db)], kalshi=kalshi, model=ol.ModelClient(transport=model, clock=clock),
-                   clock=clock) == 0
+                   **main_kw(clock)) == 0
     store = ol.Store(db)
     d = decisions(store)
     assert len(d) == 1 and d[0]["forced"] == 1 and d[0]["status"] == "ok"
@@ -841,7 +874,7 @@ def test_phases_are_spread_evenly_when_selected_and_kept_across_a_restart(tmp_pa
     store.close()
     clock.t += 3600
     store2 = ol.Store(tmp_path / "loop.sqlite")
-    col2 = ol.Collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+    col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                         ol.ModelClient(transport=model, clock=clock), clock=clock)
     col2.start()
     assert {w["ticker"]: w["phase"] for w in col2.watched()} == now
@@ -1082,7 +1115,7 @@ def test_a_selection_is_one_transaction_and_a_restart_with_nothing_watched_selec
     store.close()
     clock.t += 30
     store2 = ol.Store(tmp_path / "loop.sqlite")
-    col2 = ol.Collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+    col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                         ol.ModelClient(transport=model, clock=clock), clock=clock)
     col2.start()
     col2.cycle()
@@ -1225,31 +1258,6 @@ def test_an_invalid_book_is_stored_as_such_never_decided_on_and_dropped_after_th
     assert "invalid" in reason and int(when // 60) - int(T0 // 60) == 61
 
 
-# ---------------------------------------------------------------- item 11: the clock goes back
-
-def test_a_clock_that_goes_back_is_recorded_and_the_loop_carries_on(tmp_path):
-    col, world, model, store, clock = started(tmp_path)
-    run_minutes(col, clock, 1, 40)
-    n = len(decisions(store))
-    clock.t = T0 + 36 * 60 + 0.5                                # four minutes back: more than 120 s, a new era
-    col.cycle()
-    ev = store.conn.execute("SELECT detail_json FROM events WHERE kind = 'clock_back'").fetchall()
-    assert len(ev) == 1 and json.loads(ev[0][0])["seconds"] == pytest.approx(-240, abs=2)
-    run_minutes(col, clock, 41, 46)
-    assert len(decisions(store)) == n                           # rev 5: the new watch warms up from nothing
-    waits = []
-
-    def wait(s):
-        waits.append(s)
-        clock.t += s
-        if len(waits) >= 2:
-            col.stop.set()
-    clock.t = T0 + 10 * 60 + 5.0                                # an hour back, inside a run
-    col.run(wait=wait)
-    assert len(waits) == 2 and all(0 <= w <= 60.2 for w in waits)
-    assert store.conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'clock_back'").fetchone()[0] == 2
-
-
 # ================================================================= rev 4
 
 # ---------------------------------------------------------------- item 1: references aimed at the newest snapshot
@@ -1355,7 +1363,7 @@ def test_status_counts_each_slot_once_and_no_stopped_minute_as_watched(tmp_path)
         if i == stop_from:
             i = stop_to
             clock.t = T0 + 60 * i + 0.3
-            col = ol.Collector(store, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+            col = make_collector(store, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                                ol.ModelClient(transport=model, clock=clock), clock=clock, slots=6)
             col.start()
         model.latency = 12.0 if i in late else 0.8
@@ -1470,7 +1478,7 @@ def test_a_restart_after_an_overdue_grid_point_selects_off_grid_and_keeps_the_gr
     store.close()
     clock.t = T0 + 7 * 3600 + 0.5                                  # 12:00 passed while stopped
     store2 = ol.Store(tmp_path / "loop.sqlite")
-    col2 = ol.Collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
+    col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
                         ol.ModelClient(transport=model, clock=clock), clock=clock)
     col2.start()
     run_minutes(col2, clock, 420, 721)
@@ -1485,25 +1493,6 @@ def test_with_nothing_qualifying_selections_back_off_to_every_five_minutes_after
     run_minutes(col, clock, 0, 20)
     got = [int((s - T0) // 60) for (s,) in store.conn.execute("SELECT started_ts FROM selections ORDER BY id")]
     assert got == [0, 1, 2, 7, 12, 17]
-
-
-def test_after_the_clock_goes_back_a_day_reselection_and_watch_ends_carry_on(tmp_path):
-    col, world, model, store, clock = started(tmp_path, n=2)       # chosen at 06:00
-    run_minutes(col, clock, 1, 600)                                # to 16:00
-    col.kalshi.pacer.last = None    # the pacing runs on time.monotonic, which a wall clock set back does not move
-    run_minutes(col, clock, 601 - 1440, 601 - 1440 + 600)          # the clock is set back a day, then runs 10 h
-    c = store.conn
-    assert c.execute("SELECT COUNT(*) FROM events WHERE kind = 'clock_back'").fetchone()[0] == 1
-    # rev 5: a new era. Both watches end at once, a selection runs in the first minute after the step, and the
-    # grid runs from there.
-    drops = c.execute("SELECT ticker, dropped_ts, reason FROM market_drops ORDER BY id").fetchall()
-    assert sorted((t, int((d - T0) // 60)) for t, d, _ in drops) == [("A-E-M", -839), ("B-E-M", -839)]
-    assert all("clock went back" in r for _, _, r in drops)
-    after = [(k, int((s - T0) // 60)) for k, s in c.execute("SELECT kind, started_ts FROM selections WHERE "
-                                                            "started_ts < ? ORDER BY id", (T0,))]
-    assert after == [("grid", -839), ("grid", -479)]
-    assert sorted(w["ticker"] for w in col.watched()) == ["A-E-M", "B-E-M"]   # chosen again, in the new era
-    assert all(w["watch_id"] > 2 for w in col.watched())
 
 
 # ---------------------------------------------------------------- item 7: the preamble
@@ -1626,127 +1615,6 @@ def test_on_simulated_days_with_wandering_times_the_window_numbers_follow_the_mi
         assert nulls == 0
 
 
-# ---------------------------------------------------------------- outcome 2: a clock step starts a new era
-
-class Skewed:
-    """The collector's clock: the true clock (Kalshi's tape, the model, the pacing) plus an offset the test sets."""
-    def __init__(self, true):
-        self.true, self.offset = true, 0.0
-
-    def __call__(self):
-        return self.true() + self.offset
-
-
-def skew_rig(tmp_path, n=4):
-    true = Clock()
-    skew = Skewed(true)
-    world, model = World(true), Model(true)
-    store = ol.Store(tmp_path / "loop.sqlite")
-    kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=true, tries=1)
-    col = ol.Collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew)
-    world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i, close=T0 + 5 * 86400) for i in range(n)]
-    for m in world.markets:
-        world.books[m["ticker"]] = book(0.40, 0.45)
-    return col, world, store, true, skew
-
-
-# true minute -> the collector's clock offset from then on; the step that matters is the one back
-STEPS = {"hour_ahead_then_back": ({121: 3600.0, 181: 0.0}, 181),
-         "day_ahead_then_back": ({121: 86400.0, 181: 0.0}, 181),
-         "day_behind": ({121: -86400.0}, 121)}
-
-
-@pytest.mark.parametrize("case", list(STEPS))
-def test_a_clock_step_back_starts_a_new_era_that_reads_nothing_older_and_loses_no_trade(tmp_path, case):
-    import random
-    rnd = random.Random(3)
-    steps, back = STEPS[case]
-    col, world, store, true, skew = skew_rig(tmp_path)
-    world.trade_page = 50
-    n = 0
-    for m in world.markets:                                     # a day of tape before the start
-        for k in range(2880):
-            n += 1
-            world.trade(m["ticker"], n, T0 - 86400 + 30 * k + rnd.uniform(0, 30))
-    col.start()
-    calls = []
-    history = store.history
-
-    def spy(watch_id, t):
-        out = history(watch_id, t)
-        calls.append((true.t, watch_id, out))
-        return out
-    store.history = spy
-    per_minute, cut = {}, None
-    c = store.conn
-    for i in range(0, 361):
-        if i in steps:
-            skew.offset = steps[i]
-        if i == back:                                           # what was stored before the step, by row
-            cut = (c.execute("SELECT MAX(id) FROM snapshots").fetchone()[0],
-                   c.execute("SELECT MAX(rowid) FROM trades").fetchone()[0],
-                   c.execute("SELECT MAX(id) FROM decisions").fetchone()[0])
-        for m in world.markets:
-            for _ in range(2):
-                n += 1
-                world.trade(m["ticker"], n, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, 30))
-        before = len(world.urls)
-        true.t = max(true.t, T0 + 60 * i + 0.5)
-        col.cycle()
-        per_minute[i] = len(world.urls) - before
-    # no trade made after the first step and on the tape by the last read is lost
-    since = T0 + 60 * min(steps)
-    made = {r["trade_id"] for v in world.tape.values() for r in v
-            if kd.iso_to_ts(r["created_time"]) >= since and r["_on_tape"] <= T0 + 60 * 360 - 1}
-    stored = {r[0] for r in c.execute("SELECT trade_id FROM trades")}
-    assert len(made) > 1500 and len(made - stored) == 0
-    # requests stay within the normal bound: one book and one trades page a market a minute, plus a selection's
-    # page, books and series, plus the tails
-    assert max(per_minute.values()) <= 2 * 4 + 1 + 4 + 4 + 2 * 4, sorted(per_minute.items(), key=lambda x: -x[1])[:3]
-    # no decision after the step reads a snapshot or a trade stored before it
-    new_snaps = {(t, b) for t, b in c.execute("SELECT ticker, book_end_ts FROM snapshots WHERE id > ?", (cut[0],))}
-    new_trades = {(a, b) for a, b in c.execute("SELECT created_ts, seen_ts FROM trades WHERE rowid > ?", (cut[1],))}
-    tickers = dict(c.execute("SELECT watch_id, ticker FROM markets"))
-    after = [x for x in calls if x[0] > T0 + 60 * back]
-    assert len(after) > 100
-    for _, wid, (snaps, trades, _close) in after:
-        assert snaps and all((tickers[wid], s["book_end_ts"]) in new_snaps for s in snaps)
-        assert all((x["created_ts"], x["seen_ts"]) in new_trades for x in trades)
-    ok_after = c.execute("SELECT COUNT(*) FROM decisions WHERE status = 'ok' AND id > ?", (cut[2],)).fetchone()[0]
-    assert ok_after > 100
-    # the era: one event, every watch ended at the step, and the new era chose again at once
-    eras = [json.loads(d) for (d,) in c.execute("SELECT detail_json FROM events WHERE kind = 'clock_back'")]
-    assert len(eras) == 1 and eras[0]["era"] == 1
-    ids = eras[0]["ids"]
-    assert {r for (r,) in c.execute("SELECT reason FROM market_drops WHERE id > ?", (ids["market_drops"],))} \
-        == {"the clock went back: a new era"}
-    assert len(col.watched()) == 4 and all(w["watch_id"] > ids["markets"] for w in col.watched())
-    # status: each era by its own times, no share above 100%, and the eras listed
-    rows = ol.day_status(store, skew())
-    assert all(r["share"] is None or r["share"] <= 1.0 for r in rows)
-    assert all(r["watched_share"] <= 1.0 for r in rows)
-    assert {r["era"] for r in rows} == {0, 1}
-    assert all(r["share"] is None or r["share"] <= 1.0 for r in rows)
-    assert all(r["watched_share"] <= 1.0 for r in rows)
-    text = ol.format_status(rows, ol.era_list(store))
-    assert "era 1" in text and "went back" in text
-
-
-def test_a_step_back_of_up_to_120_seconds_changes_nothing_but_the_event(tmp_path):
-    col, world, model, store, clock = started(tmp_path, n=2)
-    run_minutes(col, clock, 1, 40)
-    n, watched = len(decisions(store)), [w["watch_id"] for w in col.watched()]
-    clock.t = T0 + 40 * 60 + 0.5 - 90                           # 90 s back
-    col.cycle()
-    ev = [json.loads(d) for (d,) in store.conn.execute("SELECT detail_json FROM events WHERE kind = 'clock_back'")]
-    assert len(ev) == 1 and ev[0]["era"] is None
-    run_minutes(col, clock, 41, 46)
-    assert [w["watch_id"] for w in col.watched()] == watched
-    assert store.conn.execute("SELECT COUNT(*) FROM market_drops").fetchone()[0] == 0
-    assert len(decisions(store)) == n + 3                       # slots 06:41, 06:45 and 06:46 go on as before
-    assert ol.era_list(store) == [ol.era_list(store)[0]]
-
-
 # ---------------------------------------------------------------- outcome 3: three small things
 
 def test_a_slot_skipped_because_the_cycle_before_overran_gets_a_late_row(tmp_path):
@@ -1823,3 +1691,305 @@ def test_the_kalshi_transport_gives_up_after_its_limit():
     with pytest.raises(kd.HttpError):
         ol.bounded_fetch(refused, limit=0.2)("x")
     assert ol.kalshi_client().fetch.limit == 30.0               # what `collect` and `once` use
+
+
+# ================================================================= rev 6: nothing stored unless the clock is right
+
+class Skewed:
+    """The collector's wall clock: the test's own true clock plus an offset the test steps. Every reading is
+    logged (value -> the true time it was read at), so each stored time can be traced back."""
+    def __init__(self, true):
+        self.true, self.offset, self.log = true, 0.0, {}
+
+    def __call__(self):
+        t = self.true()
+        v = t + self.offset
+        self.log[v] = t
+        return v
+
+
+class Recorder:
+    """The record's connection, passed through; it notes the true time and the offset at every INSERT, and once
+    a write is committed calls `after(tables)` with the tables it wrote."""
+    def __init__(self, conn, true, skew):
+        self.conn, self.true, self.skew = conn, true, skew
+        self.writes, self.after, self.pending = [], None, []
+
+    def execute(self, sql, *a):
+        import re
+        cur = self.conn.execute(sql, *a)
+        m = re.match(r"\s*INSERT (?:OR \w+ )?INTO (\w+)", sql)
+        if m:
+            self.writes.append((m.group(1), self.true.t, self.skew.offset))
+            self.pending.append(m.group(1))
+            if not self.conn.in_transaction:
+                self._done()
+        return cur
+
+    def _done(self):
+        tables, self.pending = self.pending, []
+        if tables and self.after is not None:
+            self.after(tables)
+
+    def __enter__(self):
+        self.conn.__enter__()
+        return self
+
+    def __exit__(self, *a):
+        out = self.conn.__exit__(*a)
+        self._done()
+        return out
+
+    def __getattr__(self, k):
+        return getattr(self.conn, k)
+
+
+def sync_rig(tmp_path, n=4):
+    true = Clock()
+    skew = Skewed(true)
+    world, model = World(true), Model(true)
+    store = ol.Store(tmp_path / "loop.sqlite")
+    rec = Recorder(store.conn, true, skew)
+    store.conn = rec
+    kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=true.mono, tries=1)
+    col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew, monotonic=true.mono)
+    world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i, close=T0 + 5 * 86400) for i in range(n)]
+    for m in world.markets:
+        world.books[m["ticker"]] = book(0.40, 0.45)
+    return col, world, model, store, rec, true, skew
+
+
+POINTS = ["before_snapshots", "between_snapshot_reads", "inside_a_request", "between_snapshots_and_decisions",
+          "during_a_model_call", "during_a_selection", "wrong_from_the_start"]
+SIZES = [3.0, 150.0, 3600.0, 86400.0]
+
+
+@pytest.mark.parametrize("sign", [-1, 1], ids=["back", "ahead"])
+@pytest.mark.parametrize("size", SIZES, ids=["3s", "150s", "1h", "1d"])
+@pytest.mark.parametrize("point", POINTS)
+def test_nothing_is_stored_unless_the_clock_is_right(tmp_path, point, size, sign):
+    import random
+    rnd = random.Random(7)
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path)
+    step_min = 0 if point in ("during_a_selection", "wrong_from_the_start") else 40
+    right_min = step_min + 8                                    # the clock is set right again
+    armed = {"on": False, "n": 0}
+
+    def fire():
+        armed["on"] = False
+        skew.offset = sign * size
+
+    def counter(k):
+        def hook(*_):
+            if armed["on"]:
+                armed["n"] += 1
+                if armed["n"] == k:
+                    fire()
+        return hook
+    if point == "between_snapshot_reads":
+        rec.after = lambda tables: counter(2)() if "snapshots" in tables else None
+    elif point == "between_snapshots_and_decisions":
+        rec.after = lambda tables: counter(4)() if "snapshots" in tables else None
+    elif point == "inside_a_request":
+        world.on_request = counter(3)
+    elif point == "during_a_model_call":
+        model.on_post = counter(1)
+    elif point == "during_a_selection":
+        world.on_request = lambda path: counter(1)() if path == "/markets" else None
+    if point == "wrong_from_the_start":
+        skew.offset = sign * size
+    elif point == "during_a_selection":
+        armed["on"] = True
+    col.start()
+    calls = []
+    history = store.history
+
+    def spy(watch_id, t):
+        out = history(watch_id, t)
+        calls.append(out)
+        return out
+    store.history = spy
+    n, timeline, per_cycle = 0, [], []
+    for i in range(0, 91):
+        for m in world.markets:
+            for _ in range(2):
+                n += 1
+                world.trade(m["ticker"], n, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, 30))
+        if i == step_min and point == "before_snapshots":
+            skew.offset = sign * size
+        elif i == step_min and point not in ("during_a_selection", "wrong_from_the_start"):
+            armed.update(on=True, n=0)
+        if i == right_min:
+            skew.offset = 0.0
+        began = getattr(col, "synced", True)
+        before = len(world.urls)
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        col.cycle()
+        per_cycle.append((i, began, getattr(col, "synced", True), len(world.urls) - before))
+        timeline.append((true.t, getattr(col, "synced", True)))
+    c = store.conn
+    # every snapshot, trade, decision and heartbeat was written, and its times read, while the two clocks agreed
+    kept = ("snapshots", "trades", "decisions", "heartbeats")
+    assert all(abs(off) <= 122 for table, _, off in rec.writes if table in kept)
+    stamps = []
+    for row in c.execute("SELECT book_start_ts, book_end_ts, trades_start_ts, trades_end_ts, end_ts FROM snapshots"):
+        stamps += [x for x in row if x is not None]
+    stamps += [x for (x,) in c.execute("SELECT seen_ts FROM trades")]
+    stamps += [x for (x,) in c.execute("SELECT decision_ts FROM decisions")]
+    stamps += [x for (x,) in c.execute("SELECT ts FROM heartbeats")]
+    assert stamps and all(abs(v - skew.log[v]) <= 122 for v in stamps)
+    # no decision's state uses a row read while they did not
+    for snaps, trades, _close in calls:
+        assert all(abs(s["book_end_ts"] - skew.log[s["book_end_ts"]]) <= 122 for s in snaps)
+        assert all(abs(x["seen_ts"] - skew.log[x["seen_ts"]]) <= 122 for x in trades)
+    # no trade made while the collector was in sync is lost
+    stored = {r[0] for r in c.execute("SELECT trade_id FROM trades")}
+    end = timeline[-1][0]
+    lost = []
+    for v in world.tape.values():
+        for r in v:
+            ts = kd.iso_to_ts(r["created_time"])
+            if ts < T0 or r["_on_tape"] > end - 61:
+                continue
+            before = [s for t, s in timeline if t <= ts]
+            after = [s for t, s in timeline if t > ts]
+            if before and after and before[-1] and after[0] and r["trade_id"] not in stored:
+                lost.append(r["trade_id"])
+    assert lost == []
+    # once the clock is right again, the collector is back within two minutes
+    right = T0 + 60 * right_min
+    assert any(table == "snapshots" and right < t <= right + 120 for table, t, _ in rec.writes)
+    assert getattr(col, "synced", True) and [w for w in col.watched()]
+    # while out of sync, at most one Kalshi request a minute
+    assert all(k <= 1 for i, began, ended, k in per_cycle if not began and not ended)
+    if size > 122:
+        assert any(not began for _, began, _, _ in per_cycle)   # it did go out of sync
+    rows = ol.day_status(store, skew())
+    assert all("era" not in r and (r["share"] is None or r["share"] <= 1) for r in rows)
+
+
+def test_the_two_thresholds_are_named_and_both_clocks_are_injected():
+    assert ol.STEP_TOLERANCE_S == 2.0 and ol.CLOCK_AGREE_S == 120.0
+    params = inspect.signature(ol.Collector).parameters
+    assert "clock" in params and "monotonic" in params
+    assert "monotonic" in inspect.signature(ol.main).parameters
+
+
+def test_a_step_of_more_than_two_seconds_is_detected_and_one_of_less_is_not(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    col.start()
+    for i in range(0, 5):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    skew.offset = 1.9                                           # within the tolerance: nothing happens
+    true.t = T0 + 5 * 60 + 0.5
+    col.cycle()
+    kinds = [k for (k,) in store.conn.execute("SELECT kind FROM events")]
+    assert col.synced and "clock_off" not in kinds
+    beats = store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0]
+    skew.offset = 1.9 + 2.1                                     # a step of 2.1 s
+    true.t = T0 + 6 * 60 + 0.5
+    before = len(world.urls)
+    col.cycle()
+    assert not col.synced and len(world.urls) == before         # stopped at its first clock reading
+    assert store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0] == beats
+    true.t = T0 + 7 * 60 + 0.5                                  # 4 s off agrees with the Date header: back
+    col.cycle()
+    kinds = [k for (k,) in store.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert col.synced and kinds.count("clock_off") == 1 and kinds.count("clock_on") == 1
+    assert store.conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone()[0] == beats + 1
+
+
+def test_a_date_header_more_than_120_seconds_off_stops_the_storing_until_it_agrees(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    col.start()
+    for i in range(0, 5):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    snaps = store.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    world.date_offset = 125.0                                   # Kalshi's Date disagrees; no step on our side
+    per = []
+    for i in range(5, 12):
+        before = len(world.urls)
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+        per.append(len(world.urls) - before)
+    assert not col.synced and per == [1] * 7     # the read that disagreed, then one cheap request a minute
+    assert store.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == snaps   # that read thrown away
+    world.date_offset = 119.0
+    true.t = T0 + 12 * 60 + 0.5
+    col.cycle()
+    kinds = [k for (k,) in store.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert col.synced and kinds.count("clock_off") == 1 and kinds.count("clock_on") == 1
+    assert kinds.index("clock_off") < kinds.index("clock_on") < len(kinds) - kinds[::-1].index("gap")
+    assert store.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == snaps + 2
+
+
+def test_at_start_nothing_but_one_event_is_stored_until_the_clock_agrees(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    skew.offset = -150.0
+    col.start()
+    for i in range(0, 4):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    c = store.conn
+    assert [k for (k,) in c.execute("SELECT kind FROM events")] == ["clock_off"]
+    assert sum(c.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ol.TABLES if t != "events") == 0
+    assert len(world.urls) == 5                                 # one at the start, one each minute
+    skew.offset = 0.0
+    true.t = T0 + 4 * 60 + 0.5
+    col.cycle()
+    assert col.synced and [w["ticker"] for w in col.watched()] and \
+        c.execute("SELECT kind FROM selections").fetchone()[0] == "grid"
+
+
+# ---------------------------------------------------------------- outcome 4: an overrun that also drops
+
+def test_a_slot_skipped_by_an_overrun_gets_its_row_when_that_cycle_also_drops_the_watch(tmp_path):
+    col, world, model, store, clock = started(tmp_path, n=5)    # one market on each phase
+    run_minutes(col, clock, 1, 10)
+    two = [w for w in col.watched() if w["phase"] == 2][0]
+    world.books[two["ticker"]] = book(0.40, None)               # one-sided from 06:11: dropped at the 30th minute
+    run_minutes(col, clock, 11, 40)
+    assert two["watch_id"] in [w["watch_id"] for w in col.watched()]
+    for m in world.markets:                                     # minute 41: every book read takes 25 s
+        world.book_delay[m["ticker"]] = 25.0
+    clock.t = T0 + 41 * 60 + 0.5
+    col.cycle()
+    for m in world.markets:
+        world.book_delay[m["ticker"]] = 0.0
+    assert clock.t > T0 + 43 * 60 and two["watch_id"] not in [w["watch_id"] for w in col.watched()]
+    col.cycle()                                                 # the next one at once: minute 06:43
+    rows = store.conn.execute("SELECT status, error FROM decisions WHERE watch_id = ? AND slot_ts = ?",
+                              (two["watch_id"], T0 + 42 * 60)).fetchall()
+    assert len(rows) == 1 and rows[0][0] == "late" and "overran" in rows[0][1]
+
+
+# ---------------------------------------------------------------- outcome 5: abandoned request threads
+
+def test_with_four_abandoned_requests_still_running_no_new_one_is_started():
+    import threading
+    gate = threading.Event()
+    calls = []
+
+    def slow(url):
+        calls.append(url)
+        gate.wait(10)
+        return b"{}"
+    get = ol.bounded_fetch(slow, limit=0.05)
+    for _ in range(4):
+        with pytest.raises(TimeoutError):
+            get("u")
+    assert len(calls) == 4
+    with pytest.raises(TimeoutError, match="still running"):
+        get("u")                                                # a failed request, and not started
+    assert len(calls) == 4 and ol.MAX_ABANDONED == 4
+    gate.set()
+    for _ in range(100):
+        if get.alive() == 0:
+            break
+        threading.Event().wait(0.01)
+    gate.clear()
+    assert ol.bounded_fetch(lambda url: b"ok", limit=0.05)("u") == b"ok"
+    gate.set()
+    assert get("u") == b"{}" and len(calls) == 5

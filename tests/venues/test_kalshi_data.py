@@ -261,3 +261,25 @@ def test_series_gives_its_fee_fields():
                                      "fee_multiplier": 1.0}
     c, _ = client({("/series/S", ()): {"series": {"ticker": "S"}}})
     assert c.series("S") == {"ticker": "S", "title": None, "fee_type": None, "fee_multiplier": None}
+
+
+# ---- rev 6 of the order-book loop: the Date header handed back, nothing else changed ----
+
+def test_the_date_header_is_handed_back_and_existing_callers_see_no_difference(monkeypatch):
+    class Resp:
+        status = 200
+        headers = {"Date": "Fri, 13 Nov 2026 06:00:00 GMT"}
+        def read(self): return b'{"x": 1}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda req, timeout=None: Resp())
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
+    assert kd.urllib_get_dated(url) == (b'{"x": 1}', "Fri, 13 Nov 2026 06:00:00 GMT")
+    assert kd.urllib_get(url) == b'{"x": 1}'                             # as before: the body only
+    # a transport may hand back (body, date): the client reads the body as before and keeps the date
+    routes = {("/series/KXA", ()): {"series": {"ticker": "KXA", "fee_type": "quadratic", "fee_multiplier": 1}}}
+    plain, _ = client(routes)
+    dated = kd.KalshiData(fetch=lambda u: (FakeTransport(routes)(u), "Fri, 13 Nov 2026 06:00:01 GMT"),
+                          sleep=FakeClock().sleep, clock=FakeClock())
+    assert plain.series("KXA") == dated.series("KXA")
+    assert plain.last_date is None and dated.last_date == "Fri, 13 Nov 2026 06:00:01 GMT"

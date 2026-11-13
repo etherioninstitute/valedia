@@ -53,23 +53,24 @@ ends the loop: when the record cannot be written (a full disk) it writes one lin
 each minute, and records the gap once it can write again. A store outage (or a stop) longer than an hour loses
 the trades older than that hour: a trades read never goes back more than an hour.
 
-The clock. When it reads more than 120 seconds earlier than the latest time stored in the current era, the
-collector records a `clock_back` event and starts a new era (`Store.begin_era`): every watch is ended at once
-(dropped, "the clock went back: a new era"), the grid restarts from the new time with a selection in the same
-cycle, and every new watch warms up from nothing. The event keeps each table's last row number; rows above them
-are the era's, and nothing stored before the era's start is ever read for a state, a reference, a window, a
-trade read's start or a tail. `status` counts each era by its own rows and times and lists the eras. A step back
-of 120 seconds or less changes nothing but the event. Kalshi's tape keeps its own time whatever our clock does:
-each trades read gives a lower bound of how far the tape runs ahead of our clock (its newest trade's time less
-ours), and when the reads of the last five cycles show our clock more than two minutes off, the start of each
-read (`min_ts`) is moved onto the tape's time, so a clock set ahead or behind neither loses trades nor reads the
-tape again from far back. After any jump the first bound comes from one GET of the exchange's newest trade.
-While our clock is that far off, the trade numbers of the state compare Kalshi's trade times with our clock and
-are wrong or null; the era rule ends that once the clock is set back.
+The clock: no row is stored unless the collector's clock is known to be right. Two checks decide that:
+* a step detector, with no network: every reading of the wall clock also reads the monotonic clock, and when the
+  wall clock has moved by more than STEP_TOLERANCE_S (2 s) more or less than the monotonic one since the previous
+  reading, the clock has stepped (a sleep of the machine looks the same, and is handled the same);
+* agreement with the exchange: every Kalshi answer carries an HTTP Date header, and our clock agrees when it is
+  within CLOCK_AGREE_S (120 s) of it.
+At start, after any step and whenever a Date disagrees, the collector is out of sync: it finishes nothing of the
+cycle it is in and stores nothing more from it (a read whose request began before the step and ended after it is
+thrown away), writes one `clock_off` event, and from then on makes one cheap Kalshi request a minute
+(`/exchange/status`) and nothing else. When an answer's Date agrees and no step was seen during that request, it
+records `clock_on` and resumes exactly as after a stop of that length: the gap is recorded, watches that ran out
+are dropped and replaced, and holes in the history give nulls and warm-ups by the usual rules. For `status` a
+period out of sync is a gap like any stop.
 
 No single Kalshi request may take longer than 30 seconds (KALSHI_REQUEST_LIMIT_S): `collect`, `once` and
 `select` use a transport that gives up at that limit (`bounded_fetch`), and the collector treats any answer that
-took longer as a failed request.
+took longer as a failed request. An abandoned request's thread ends by itself within about the same time; while
+MAX_ABANDONED (4) are still running, no new request is started (each such is a failed request).
 
 Where this differs from the prediction's words:
 
@@ -115,6 +116,7 @@ markets trade.
 from __future__ import annotations
 
 import argparse
+import email.utils
 import hashlib
 import http.client
 import json
@@ -141,7 +143,7 @@ from valedia_trader.venues import kalshi_data as kd
 __all__ = ["BATTERY", "BATTERY_ID", "STATE_KEYS", "TABLES", "Selection", "select_markets", "resolve_selection",
            "series_of", "assign_phases", "phase_of_minute", "parse_book", "book_summary", "reference", "state_at",
            "request_bytes", "battery_id", "Store", "ModelClient", "ModelUnavailable", "ModelTimeout", "Collector",
-           "day_status", "era_list", "format_status", "window", "bounded_fetch", "kalshi_client", "stop_on_signals",
+           "day_status", "format_status", "window", "bounded_fetch", "kalshi_client", "stop_on_signals",
            "main"]
 
 UTC = timezone.utc
@@ -184,13 +186,11 @@ REF_WINDOW_S = 30                 # a history reference is the snapshot nearest 
 WINDOW_SHARE = 0.9                # a window number needs a snapshot in at least 90% of the window's minutes
 HISTORY_S = 3600 + 2 * REF_WINDOW_S + 60   # how far back a decision reads the record
 RESELECT_AHEAD_S = 120            # at a reselection, watches whose 12 hours end within this are ended first
-CLOCK_STEP_S = 120                # the clock reading more than this before the latest stored time starts a new era
-YOUNG_ERA_S = 600                 # a market's first trades read in the first ten minutes of an era goes back to it
-LEAD_CYCLES = 5                   # the tape's lead on our clock is judged on the trades reads of the last 5 cycles
 KALSHI_REQUEST_LIMIT_S = 30.0     # no single Kalshi request may take longer: it is then a failed request
-# Each table's row number, by which an era's rows are told apart (times cannot be: the clock is what went wrong).
-ERA_KEYS = (("snapshots", "id"), ("trades", "rowid"), ("decisions", "id"), ("heartbeats", "id"),
-            ("events", "id"), ("selections", "id"), ("markets", "watch_id"), ("market_drops", "id"))
+MAX_ABANDONED = 4                 # with this many abandoned requests still running, no new one is started
+STEP_TOLERANCE_S = 2.0            # the wall clock moving this much more or less than the monotonic one: a step
+CLOCK_AGREE_S = 120.0             # our clock agrees with Kalshi's Date header when within this of it
+SYNC_PATH = "/exchange/status"    # the one cheap request a minute while out of sync
 
 STATUSES = ("ok", "late", "model_unavailable", "tag_mismatch", "stale_data", "error")
 TABLES = ("selections", "markets", "market_drops", "snapshots", "trades", "decisions", "heartbeats", "events")
@@ -755,93 +755,46 @@ class Store:
                 cur = self.conn.execute(sql, [row[c] for c in cols])
         return cur.lastrowid if cur.rowcount else 0
 
-    # ---- eras: a clock that went back more than CLOCK_STEP_S starts a new one; nothing older is read again
-    def eras(self) -> list[dict]:
-        """Every era, oldest first: {"n", "start_ts", "from_ts", "ids"}. Era 0 begins with the record; each later
-        one with a `clock_back` event that started it, whose `ids` are each table's last row number before it
-        (`ERA_KEYS`). Rows above those numbers belong to the era."""
-        out = [{"n": 0, "start_ts": None, "from_ts": None, "ids": {t: 0 for t, _ in ERA_KEYS}}]
-        for ts, d in self.conn.execute("SELECT ts, detail_json FROM events WHERE kind = 'clock_back' ORDER BY id"):
-            j = json.loads(d)
-            if j.get("era"):
-                out.append({"n": j["era"], "start_ts": ts, "from_ts": j.get("from_ts"),
-                            "ids": {t: int(j["ids"].get(t) or 0) for t, _ in ERA_KEYS}})
-        return out
-
-    def era(self) -> dict:
-        """The current era (cached; `begin_era` moves it on)."""
-        if getattr(self, "_era", None) is None:
-            self._era = self.eras()[-1]
-        return self._era
-
-    def since(self, table: str) -> int:
-        """The last row number of `table` before the current era."""
-        return self.era()["ids"][table]
-
-    def latest_time(self) -> float | None:
-        """The latest time stored in the current era, of any kind."""
-        parts = ("SELECT MAX(ts) FROM heartbeats WHERE id > ?", "SELECT MAX(ts) FROM events WHERE id > ?",
-                 "SELECT MAX(end_ts) FROM snapshots WHERE id > ?", "SELECT MAX(decision_ts) FROM decisions WHERE id > ?",
-                 "SELECT MAX(finished_ts) FROM selections WHERE id > ?",
-                 "SELECT MAX(selected_ts) FROM markets WHERE watch_id > ?",
-                 "SELECT MAX(dropped_ts) FROM market_drops WHERE id > ?", "SELECT MAX(seen_ts) FROM trades WHERE rowid > ?")
-        tables = ("heartbeats", "events", "snapshots", "decisions", "selections", "markets", "market_drops", "trades")
-        got = [self.conn.execute(q, (self.since(t),)).fetchone()[0] for q, t in zip(parts, tables)]
-        got = [x for x in got if x is not None]
-        return max(got) if got else None
-
-    def begin_era(self, now: float, from_ts: float, reason: str) -> dict:
-        """In one transaction: the `clock_back` event that starts a new era (with each table's last row number) and
-        the end of every watch. Only new rows are written."""
-        ids = {t: self.conn.execute("SELECT MAX(%s) FROM %s" % (k, t)).fetchone()[0] or 0 for t, k in ERA_KEYS}
-        n = self.era()["n"] + 1
-        open_ = self.watched()
-        with self.conn:
-            self.insert("events", {**stamp("", now), "kind": "clock_back", "ticker": None,
-                                   "detail_json": json.dumps({"from_ts": from_ts, "from_iso": iso(from_ts), "to_ts": now,
-                                                              "to_iso": iso(now), "seconds": now - from_ts, "era": n,
-                                                              "ids": ids})}, commit=False)
-            for w in open_:
-                self.insert("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", now),
-                                             "reason": reason}, commit=False)
-        self._era = {"n": n, "start_ts": now, "from_ts": from_ts, "ids": ids}
-        return self._era
-
     def watched(self) -> list[dict]:
-        """The watches of the current era not dropped."""
+        """The watches not dropped."""
         rows = self.conn.execute("SELECT watch_id, ticker, series, selected_ts, close_ts, market_json, phase, "
-                                 "watch_start_ts, warm_from_ts FROM markets WHERE watch_id > ? AND "
-                                 "watch_id NOT IN (SELECT watch_id FROM market_drops) ORDER BY watch_id",
-                                 (self.since("markets"),))
+                                 "watch_start_ts, warm_from_ts FROM markets "
+                                 "WHERE watch_id NOT IN (SELECT watch_id FROM market_drops) ORDER BY watch_id")
         return [{"watch_id": w, "ticker": t, "series": s, "selected_ts": sel, "close_ts": c, "market": json.loads(m),
                  "phase": p or 0, "watch_start_ts": ws if ws is not None else sel, "warm_from_ts": wf}
                 for w, t, s, sel, c, m, p, ws, wf in rows.fetchall()]
 
+    def watched_at(self, t: float) -> list[dict]:
+        """The watches that were watched at time t: chosen by then and not dropped before it."""
+        rows = self.conn.execute("SELECT m.watch_id, m.ticker, m.phase, m.warm_from_ts FROM markets m LEFT JOIN "
+                                 "market_drops d ON d.watch_id = m.watch_id WHERE m.selected_ts <= ? AND "
+                                 "(d.dropped_ts IS NULL OR d.dropped_ts > ?) ORDER BY m.watch_id", (t, t))
+        return [{"watch_id": w, "ticker": tk, "phase": p or 0, "warm_from_ts": wf} for w, tk, p, wf in rows.fetchall()]
+
     def tails(self, now: float, exclude: Iterable[str] = ()) -> list[dict]:
-        """The dropped markets still to be read: watches of the current era dropped less than TAIL_S ago, not
-        closed, not watched again; one per ticker (its latest watch), in the order of their drops."""
+        """The dropped markets still to be read: dropped less than TAIL_S ago, not closed, not watched again; one
+        per ticker (its latest watch), in the order of their drops."""
         exclude = set(exclude)
         out: dict = {}
         for wid, t, close_ts, dropped in self.conn.execute(
                 "SELECT m.watch_id, m.ticker, m.close_ts, d.dropped_ts FROM market_drops d JOIN markets m "
-                "ON m.watch_id = d.watch_id WHERE m.watch_id > ? AND d.dropped_ts > ? AND d.dropped_ts <= ? AND "
-                "m.close_ts > ? ORDER BY d.id", (self.since("markets"), now - TAIL_S, now, now)).fetchall():
+                "ON m.watch_id = d.watch_id WHERE d.dropped_ts > ? AND d.dropped_ts <= ? AND m.close_ts > ? "
+                "ORDER BY d.id", (now - TAIL_S, now, now)).fetchall():
             if t not in exclude:
                 out.pop(t, None)
                 out[t] = {"watch_id": wid, "ticker": t, "close_ts": close_ts, "dropped_ts": dropped, "tail": True}
         return list(out.values())
 
     def last_trade_read(self, ticker: str) -> float | None:
-        """When the market's latest good trades read of the current era began."""
-        return self.conn.execute("SELECT MAX(trades_start_ts) FROM snapshots WHERE ticker = ? AND trades_ok = 1 AND "
-                                 "id > ?", (ticker, self.since("snapshots"))).fetchone()[0]
+        return self.conn.execute("SELECT MAX(trades_start_ts) FROM snapshots WHERE ticker = ? AND trades_ok = 1",
+                                 (ticker,)).fetchone()[0]
 
     def warm_from(self, ticker: str, t: float) -> float | None:
-        """For a market chosen at t: when its run of snapshots began, if its snapshots of the current era (an
-        earlier watch or that watch's tail) ran up to t without a break; None when it starts afresh (its warm-up
-        then runs from its own first snapshot)."""
+        """For a market chosen at t: when its run of snapshots began, if its snapshots (an earlier watch or that
+        watch's tail) ran up to t without a break; None when it starts afresh (its warm-up then runs from its
+        own first snapshot)."""
         wid, newest = self.conn.execute("SELECT watch_id, MAX(book_end_ts) FROM snapshots WHERE ticker = ? AND "
-                                        "book_end_ts <= ? AND id > ?", (ticker, t, self.since("snapshots"))).fetchone()
+                                        "book_end_ts <= ?", (ticker, t)).fetchone()
         if newest is None or newest < t - STALE_S:
             return None
         warm, first = self.conn.execute("SELECT warm_from_ts, (SELECT MIN(book_end_ts) FROM snapshots WHERE "
@@ -849,22 +802,19 @@ class Store:
         return warm if warm is not None else first
 
     def history(self, watch_id: int, t: float) -> tuple[list[dict], list[dict], float]:
-        """The market's snapshots of the current era finished strictly before t (from every watch of it and their
-        tails, the last HISTORY_S only), its trades of the era created and seen before t over the same span, and
-        its close time."""
+        """The market's snapshots finished strictly before t (from every watch of it and their tails, the last
+        HISTORY_S only), its trades created and seen before t over the same span, and its close time."""
         ticker, close_ts = self.conn.execute("SELECT ticker, close_ts FROM markets WHERE watch_id = ?",
                                              (watch_id,)).fetchone()
         rows = self.conn.execute("SELECT book_end_ts, end_ts, trades_ok, trades_min_ts, trades_start_ts, yes_json, "
                                  "no_json, invalid_reason FROM snapshots WHERE ticker = ? AND book_end_ts >= ? AND "
-                                 "end_ts < ? AND id > ? ORDER BY book_end_ts",
-                                 (ticker, t - HISTORY_S, t, self.since("snapshots"))).fetchall()
+                                 "end_ts < ? ORDER BY book_end_ts", (ticker, t - HISTORY_S, t)).fetchall()
         snaps = [{"book_end_ts": a, "end_ts": b, "trades_ok": c, "trades_min_ts": d, "trades_start_ts": e,
                   "yes": [tuple(x) for x in json.loads(y)], "no": [tuple(x) for x in json.loads(n)], "invalid": bad}
                  for a, b, c, d, e, y, n, bad in rows]
         trades = [{"created_ts": a, "seen_ts": b, "count": c, "taker_side": d} for a, b, c, d in self.conn.execute(
             "SELECT created_ts, seen_ts, count, taker_side FROM trades WHERE ticker = ? AND created_ts >= ? AND "
-            "created_ts < ? AND seen_ts < ? AND rowid > ? ORDER BY created_ts",
-            (ticker, t - HISTORY_S, t, t, self.since("trades"))).fetchall()]
+            "created_ts < ? AND seen_ts < ? ORDER BY created_ts", (ticker, t - HISTORY_S, t, t)).fetchall()]
         return snaps, trades, close_ts
 
 
@@ -979,11 +929,20 @@ class ModelClient:
 
 # ============================================================================ the collector
 
-def bounded_fetch(fetch: Callable[[str], bytes], limit: float = KALSHI_REQUEST_LIMIT_S) -> Callable[[str], bytes]:
+def bounded_fetch(fetch: Callable[[str], Any], limit: float = KALSHI_REQUEST_LIMIT_S) -> Callable[[str], Any]:
     """`fetch` with a hard limit on each request: an answer not in after `limit` seconds raises TimeoutError (a
     failed request) and is abandoned. The request runs in a short-lived daemon thread; with `kalshi_client` its own
-    socket timeout is the same limit, so that thread ends by itself soon after."""
-    def get(url: str) -> bytes:
+    socket timeout is the same limit, so that thread ends by itself soon after. While MAX_ABANDONED abandoned
+    threads are still running, no new request is started: that too raises TimeoutError. `get.alive()` counts them."""
+    abandoned: list[threading.Thread] = []
+
+    def alive() -> int:
+        abandoned[:] = [th for th in abandoned if th.is_alive()]
+        return len(abandoned)
+
+    def get(url: str):
+        if alive() >= MAX_ABANDONED:
+            raise TimeoutError("%d abandoned Kalshi requests still running; none started" % MAX_ABANDONED)
         box: dict = {}
 
         def work():
@@ -995,18 +954,25 @@ def bounded_fetch(fetch: Callable[[str], bytes], limit: float = KALSHI_REQUEST_L
         th.start()
         th.join(limit)
         if th.is_alive():
+            abandoned.append(th)
             raise TimeoutError("no answer from Kalshi within %g s" % limit)
         if "exc" in box:
             raise box["exc"]
         return box["body"]
-    get.limit = limit
+    get.limit, get.alive = limit, alive
     return get
 
 
 def kalshi_client() -> kd.KalshiData:
-    """The client `collect` and `once` use: keyless GET at the client's own pacing, each request at most
-    KALSHI_REQUEST_LIMIT_S."""
-    return kd.KalshiData(fetch=bounded_fetch(lambda url: kd.urllib_get(url, timeout=KALSHI_REQUEST_LIMIT_S)), tries=3)
+    """The client `collect`, `once` and `select` use: keyless GET at the client's own pacing, each request at most
+    KALSHI_REQUEST_LIMIT_S, each answer with its Date header."""
+    return kd.KalshiData(fetch=bounded_fetch(lambda url: kd.urllib_get_dated(url, timeout=KALSHI_REQUEST_LIMIT_S)),
+                         tries=3)
+
+
+class _OutOfSync(BaseException):
+    """The clock is not known to be right: the cycle stops where it is and nothing more of it is stored. A
+    BaseException, so that no `except Exception` on the way can keep the cycle going."""
 
 
 class _SelectionAborted(Exception):
@@ -1021,12 +987,13 @@ def stop_on_signals(stop: threading.Event) -> dict:
 
 
 class Collector:
-    """The loop. `clock()` is epoch seconds (injected in tests); `kalshi` is a `KalshiData` (its own pacing)."""
+    """The loop. `clock()` is epoch seconds and `monotonic` the monotonic clock beside it (both injected in tests);
+    `kalshi` is a `KalshiData` (its own pacing)."""
 
     def __init__(self, store: Store, kalshi: kd.KalshiData, model: ModelClient, *, clock: Callable[[], float] = time.time,
-                 slots: int = WATCH_COUNT):
+                 monotonic: Callable[[], float] = time.monotonic, slots: int = WATCH_COUNT):
         self.store, self.kalshi, self.model, self.slots = store, kalshi, model, slots
-        self._wall = clock
+        self._wall, self._mono = clock, monotonic
         self.stop = threading.Event()
         self.paused_until: float | None = None
         self.consecutive_fails = 0
@@ -1034,35 +1001,123 @@ class Collector:
         self._cycle_start: float | None = None      # when the latest cycle began
         self._cycle_end: float | None = None        # when the latest cycle ended
         self._minute: float | None = None           # the minute of the latest cycle
-        self._latest: float | None = None           # the latest clock reading of the current era
         self._selecting = False                     # a selection is reading: cycles still run, but select nothing
         self._dry = False
-        self._cycles = self._depth = 0
-        self._calibrate = False                     # judge the tape's time before the next reads
-        self._lead: list[tuple[int, float]] = []    # (cycle, newest trade's time less our time at its read's end)
-        self._read_lead: dict[str, float] = {}      # the tape's lead judged at each market's latest trades read
+        self._depth = 0                             # cycles running (a selection's `_tick` runs one inside another)
+        # the clock (see the module docstring): nothing is stored unless `synced`
+        self.synced = False
+        self._prev: tuple[float, float] | None = None   # the previous (wall, monotonic) reading
+        self._stepped = False                       # a step seen since the flag was last cleared
+        self._disagree = False                      # the latest Date header disagreed
+        self._dated = False                         # the latest answer had a Date header
+        self.clock_offset: float | None = None      # our clock less the latest Date header, in seconds
+        self._started = False                       # the `start` event is written once the clock is first right
+        self._off_noted = False                     # the `clock_off` event of this period is written
         self.n_requests = self.n_failures = self.n_model_calls = 0
         inner = kalshi.fetch
 
         def counted(url):
+            self.clock()                                 # in sync: a step before the request stops it here
             self.n_requests += 1
-            t0 = self.clock()
-            body = inner(url)
-            took = self.clock() - t0
+            m0 = self._mono()
+            answer = inner(url)
+            t1, took = self._read(), self._mono() - m0
+            date = answer[1] if isinstance(answer, tuple) else None
+            self._dated = date is not None
+            if date is not None:
+                self._agree(date, t1)
+            self.clock()                                 # a step during the request, or a Date that disagrees
             if took > KALSHI_REQUEST_LIMIT_S:            # an answer this slow is a failed request
                 raise TimeoutError("request took %.1f s, over the %g s limit" % (took, KALSHI_REQUEST_LIMIT_S))
-            return body
+            return answer
         kalshi.fetch = counted
 
+    # ---- the clock
+    def _read(self) -> float:
+        """One reading of the wall clock, with the monotonic one beside it; a difference in how far they moved
+        since the previous reading of more than STEP_TOLERANCE_S is a step."""
+        w, m = self._wall(), self._mono()
+        if self._prev is not None and abs((w - self._prev[0]) - (m - self._prev[1])) > STEP_TOLERANCE_S:
+            self._stepped = True
+        self._prev = (w, m)
+        return w
+
     def clock(self) -> float:
-        """The wall clock; the latest reading of the era is kept, to see the clock going back."""
-        t = self._wall()
-        if self._latest is None or t > self._latest:
-            self._latest = t
-        return t
+        """The wall clock. While in sync, a step or a disagreeing Date stops the cycle here (`_OutOfSync`)."""
+        w = self._read()
+        if self.synced and (self._stepped or self._disagree):
+            raise _OutOfSync("the clock stepped" if self._stepped else
+                             "the clock is %.0f s off Kalshi's Date header" % self.clock_offset)
+        return w
+
+    def _agree(self, date: str, t: float) -> None:
+        try:
+            kalshi_ts = email.utils.parsedate_to_datetime(date).timestamp()
+        except (TypeError, ValueError):
+            return
+        self.clock_offset = t - kalshi_ts
+        self._disagree = abs(self.clock_offset) > CLOCK_AGREE_S
+
+    def _guard(self) -> None:
+        """Before every write: the clock is known to be right, now."""
+        self.clock()
+        if not self.synced:
+            raise _OutOfSync("the clock is not known to be right")
+
+    def _go_off(self, why: str) -> None:
+        """Out of sync: nothing more is stored; one `clock_off` event (if the store can take it); the next cycles
+        only check the clock. The cycle in progress is forgotten, as after a stop."""
+        self.synced = False
+        self._minute = self._cycle_start = self._cycle_end = None
+        self.paused_until, self.consecutive_fails = None, 0
+        if not self._off_noted:
+            self._off_noted = True
+            try:
+                self.store.insert("events", {**stamp("", self._read()), "kind": "clock_off", "ticker": None,
+                                             "detail_json": json.dumps({"why": why, "offset_s": self.clock_offset})})
+            except Exception:                            # a store that cannot be written: nothing to add
+                pass
+
+    def _resync(self) -> bool:
+        """The one cheap request; in sync again when its answer's Date agrees and no step was seen meanwhile.
+        Then resume as after a stop (`_resume`). A step before the check is taken in by this reading: the Date
+        then says whether the clock is right."""
+        self._read()
+        self._stepped = self._disagree = self._dated = False
+        try:
+            self.kalshi.get_json(SYNC_PATH)
+        except Exception:
+            return False
+        if self._stepped or self._disagree or not self._dated:
+            return False
+        self.synced, self._off_noted = True, False
+        self._resume()
+        return True
+
+    def _resume(self) -> None:
+        """Record the start (the first time) or `clock_on`; after earlier rows, record the gap since the last
+        heartbeat and stop watching the markets whose watch ran out meanwhile. The others are watched on. With
+        nothing watched, the cycle selects at once."""
+        now = self.clock()
+        if not self._started:
+            self._started = True
+            self.event("start", None, battery_id=BATTERY_ID, tag=TAG)
+        else:
+            self.event("clock_on", None, offset_s=self.clock_offset)
+        last = self.store.conn.execute("SELECT MAX(ts) FROM heartbeats").fetchone()[0]
+        if last is not None:
+            self.event("gap", None, from_ts=last, from_iso=iso(last), to_ts=now, to_iso=iso(now), seconds=now - last)
+        for w in self.watched():
+            reason = self._expired(w, now)
+            if reason:                                   # recorded as ending when it ran out, not at the restart
+                ran_out = min(x for x in (w["watch_start_ts"] + WATCH_MAX_S, w["close_ts"] - STOP_BEFORE_CLOSE_S)
+                              if x <= now)
+                self.drop(w, reason + " (while stopped)", at=max(ran_out, last if last is not None else ran_out))
+        self._last_beat = now
 
     # ---- small helpers
     def event(self, kind: str, ticker: str | None = None, **detail) -> None:
+        self._guard()
         self.store.insert("events", {**stamp("", self.clock()), "kind": kind, "ticker": ticker,
                                      "detail_json": json.dumps(detail, default=str)})
 
@@ -1087,44 +1142,36 @@ class Collector:
                        until_iso=iso(self.paused_until))
 
     def drop(self, w: dict, reason: str, at: float | None = None) -> None:
+        self._guard()
         self.store.insert("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"],
                                            **stamp("dropped", self.clock() if at is None else at), "reason": reason})
 
     # ---- start and stop
     def start(self) -> None:
-        """Record the start; after an earlier run, record the gap since its last heartbeat and stop watching the
-        markets whose watch ran out meanwhile. The others are watched on. With nothing watched, the first cycle
-        selects at once."""
-        now = self.clock()
-        if self._clock_went_back(now):               # a new era: nothing of the earlier one goes on
-            self.event("start", None, battery_id=BATTERY_ID, tag=TAG)
-            self._last_beat = now
-            return
-        self.event("start", None, battery_id=BATTERY_ID, tag=TAG)
-        last = self.store.conn.execute("SELECT MAX(ts) FROM heartbeats WHERE id > ?",
-                                       (self.store.since("heartbeats"),)).fetchone()[0]
-        if last is not None:
-            self.event("gap", None, from_ts=last, from_iso=iso(last), to_ts=now, to_iso=iso(now), seconds=now - last)
-        for w in self.watched():
-            reason = self._expired(w, now)
-            if reason:                                   # recorded as ending when it ran out, not at the restart
-                ran_out = min(x for x in (w["watch_start_ts"] + WATCH_MAX_S, w["close_ts"] - STOP_BEFORE_CLOSE_S)
-                              if x <= now)
-                self.drop(w, reason + " (while stopped)", at=max(ran_out, last if last is not None else ran_out))
-        self._last_beat = now
+        """Out of sync until the clock is known to be right; then the start is recorded and the record resumed
+        (`_resume`). If it is not right yet, one `clock_off` event, and each cycle checks again."""
+        self.synced = False
+        try:
+            if not self._resync():
+                self._go_off("at start: " + ("the clock stepped" if self._stepped else
+                                             "no Date header" if not self._dated else
+                                             "the clock is %.0f s off Kalshi's Date header" % self.clock_offset
+                                             if self._disagree else "Kalshi could not be reached"))
+        except _OutOfSync as e:
+            self._go_off(str(e))
 
     def finish(self, kind: str = "stop") -> None:
-        self.event(kind, None)
+        if self.synced:
+            self.event(kind, None)
 
     def run(self, wait: Callable[[float], Any] | None = None) -> None:
         """Cycle once a minute, just after the minute turns, until `stop` is set. With nothing watched the first
-        cycle runs at once (it selects). A cycle that ran into the next minute is followed at once (`overrun`);
-        after the clock went back, the next cycle waits only for the next minute."""
+        cycle runs at once (it selects). A cycle that ran into the next minute is followed at once (`overrun`)."""
         wait = wait or self.stop.wait
         first = True
         while not self.stop.is_set():
             try:
-                now = self.clock()
+                now = self._read()
                 if not (first and not self.watched()):
                     if self._minute is None or now < self._cycle_start:
                         target = math.floor(now / 60) * 60 + 60
@@ -1134,93 +1181,71 @@ class Collector:
                         wait(target + 0.2 - now)
                         if self.stop.is_set():
                             break
-                    else:
+                    elif self.synced:
                         try:
                             self.event("overrun", None, minute_ts=self._minute, minute_iso=iso(self._minute),
                                        late_s=now - target)
-                        except Exception:                # the cycle below reports a store that cannot be written
+                        except (Exception, _OutOfSync):  # the cycle below reports it
                             pass
                 first = False
                 self.cycle()
             except Exception as e:                       # nothing but a stop ends the loop
                 self._record_failure(e)
+            except _OutOfSync as e:
+                self._go_off(str(e))
         try:
             self.finish("stop")
-        except Exception as e:
+        except (Exception, _OutOfSync) as e:
             self._record_failure(e)
 
-    def _record_failure(self, exc: Exception) -> None:
+    def _record_failure(self, exc: BaseException) -> None:
         """Record a failed cycle; when even that cannot be written (a full disk), one line to standard error. The
         loop tries again at the next minute and, once it can write, records the gap."""
         try:
             self.event("error", None, request="cycle", error="%s: %s" % (type(exc).__name__, exc))
-        except Exception as e:
+        except (Exception, _OutOfSync) as e:
             print("orderbook_loop %s: cannot write the record (%s: %s); trying again next minute"
-                  % (iso(self.clock()), type(e).__name__, e), file=sys.stderr, flush=True)
+                  % (iso(self._read()), type(e).__name__, e), file=sys.stderr, flush=True)
 
     # ---- one minute
     def cycle(self, force_decision: bool = False, allow_select: bool = True) -> list[dict]:
-        """First every snapshot (the watched markets by watch number, then the tails), then this minute's
-        decisions from the record as it stands at each call, then drops, a selection if one is due, and a
-        heartbeat. Returns the decisions made."""
+        """Out of sync: only the one cheap request (`_resync`). In sync: first every snapshot (the watched markets
+        by watch number, then the tails), then this minute's decisions from the record as it stands at each call,
+        then drops, a selection if one is due, and a heartbeat. Returns the decisions made."""
         self._depth += 1
         try:
+            if not self.synced:
+                if self._depth > 1 or not self._resync():
+                    self._go_off("still out of sync")
+                    return []
             return self._cycle(force_decision, allow_select)
+        except _OutOfSync as e:
+            if self._depth > 1:                          # inside a selection: the outer cycle stops too
+                raise
+            self._go_off(str(e))
+            return []
         finally:
             self._depth -= 1
-            self._cycle_end = self.clock()
-
-    def _clock_went_back(self, now: float) -> bool:
-        """Compare `now` with the latest time stored in the era. More than CLOCK_STEP_S earlier: a `clock_back`
-        event and a new era (`Store.begin_era`: every watch ends at once; the grid, the warm-ups and the trade reads
-        start afresh). Earlier by less: the event only. Returns whether a new era began."""
-        if not getattr(self, "_seeded", False):        # the record's own latest time, once
-            self._seeded = True
-            db = self.store.latest_time()
-            if db is not None and db > self._latest:
-                self._latest = db
-        back = self._latest - now if self._latest is not None else 0.0
-        if back <= 0:
-            return False
-        if back <= CLOCK_STEP_S:                         # the event, once until the clock has caught up
-            if getattr(self, "_noted", None) != self._latest:
-                self._noted = self._latest
-                self.event("clock_back", None, from_ts=self._latest, from_iso=iso(self._latest), to_ts=now,
-                           to_iso=iso(now), seconds=now - self._latest, era=None)
-            return False
-        self._lead = [(c, x + back) for c, x in self._lead]   # measured on the old clock: still a lower bound
-        if self.paused_until is not None:
-            self.paused_until -= back
-        self.store.begin_era(now, self._latest, "the clock went back: a new era")
-        self._latest, self._last_beat, self._read_lead = now, now, {}
-        return True
+            if self.synced:
+                self._cycle_end = self._read()
 
     def _cycle(self, force_decision: bool, allow_select: bool) -> list[dict]:
         start = self.clock()
         minute = math.floor(start / 60) * 60
-        prev, prev_minute, prev_end = self._cycle_start, self._minute, self._cycle_end
+        prev_minute, prev_end = self._minute, self._cycle_end
         self._cycle_start, self._minute = start, minute   # first, so a failed write cannot make the loop spin
-        self._cycles += 1
         if self._depth > 1:                              # inside a selection: the cycle around it is still running
             prev_end = start
-        if self._clock_went_back(start):
-            prev_minute = None
-            self._calibrate = True
-        else:
-            if prev is not None and start - prev > CLOCK_STEP_S:
-                self._lead, self._calibrate = [], True   # a step ahead (or a sleep): judge the tape afresh
-            if self._last_beat is not None and start - self._last_beat > 2 * 60:
-                self.event("gap", None, from_ts=self._last_beat, from_iso=iso(self._last_beat), to_ts=start,
-                           to_iso=iso(start), seconds=start - self._last_beat)     # e.g. the Mac slept
+        if self._last_beat is not None and start - self._last_beat > 2 * 60:
+            self.event("gap", None, from_ts=self._last_beat, from_iso=iso(self._last_beat), to_ts=start,
+                       to_iso=iso(start), seconds=start - self._last_beat)     # e.g. a stop of the store
         if self.paused() and start >= self.paused_until:
             self.paused_until = None
             self.event("pause_end", None)
-        watched = self.watched()
         if prev_minute is not None and prev_end is not None and not force_decision:
-            self._skipped(watched, prev_minute, min(minute, math.floor(prev_end / 60) * 60 + 60))
+            self._skipped(prev_minute, min(minute, math.floor(prev_end / 60) * 60 + 60))
+        watched = self.watched()
         tails = self.store.tails(start, exclude={w["ticker"] for w in watched})
-        if self._calibrate and (watched or tails) and not self.paused():
-            self._tape_time()
         for w in watched + tails:
             if self.stop.is_set():
                 break
@@ -1259,22 +1284,25 @@ class Collector:
         return made
 
     def _beat(self) -> None:
+        self._guard()
         self._last_beat = self.clock()
         self.store.insert("heartbeats", {**stamp("", self._last_beat), "watched": len(self.watched()),
                                          "kalshi_requests": self.n_requests, "kalshi_failures": self.n_failures,
                                          "model_calls": self.n_model_calls, "paused": int(self.paused())})
         self.n_requests = self.n_failures = self.n_model_calls = 0
 
-    def _skipped(self, watched: list[dict], prev_minute: float, upto: float) -> None:
+    def _skipped(self, prev_minute: float, upto: float) -> None:
         """The minutes after `prev_minute` and before `upto` had no cycle of their own because the cycle before
-        was still running: each slot due in them gets its row, `late`, with the reason."""
+        was still running: each slot due in them gets its row, `late`, with the reason, for every watch that was
+        watched in that minute (also one the overrunning cycle dropped later)."""
         m = prev_minute + 60
         while m < upto:
             phase = phase_of_minute(m)
             done = {r[0] for r in self.store.conn.execute("SELECT watch_id FROM decisions WHERE slot_ts = ? AND "
                                                           "forced = 0", (m,))}
-            for w in watched:
+            for w in self.store.watched_at(m):
                 if w["phase"] == phase and w["watch_id"] not in done and self._warm(w, m):
+                    self._guard()
                     self.store.insert("decisions", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("slot", m),
                                                     **stamp("decision", self.clock()), "status": "late", "forced": 0,
                                                     "battery_id": BATTERY_ID, "model_tag": TAG,
@@ -1291,9 +1319,9 @@ class Collector:
         return anchor is not None and anchor <= slot_ts - WARMUP_S
 
     def _selections(self, limit: int) -> list[tuple[int, float, int, str]]:
-        """The latest selections of the current era, newest first: (id, start, chosen, kind)."""
-        return self.store.conn.execute("SELECT id, started_ts, chosen, kind FROM selections WHERE id > ? "
-                                       "ORDER BY id DESC LIMIT ?", (self.store.since("selections"), limit)).fetchall()
+        """The latest selections, newest first: (id, start, chosen, kind)."""
+        return self.store.conn.execute("SELECT id, started_ts, chosen, kind FROM selections ORDER BY id DESC LIMIT ?",
+                                       (limit,)).fetchall()
 
     def _backing_off(self, minute: float) -> bool:
         """After three selections in a row that chose nothing, the next comes five minutes after the last."""
@@ -1308,14 +1336,14 @@ class Collector:
             self.cycle(allow_select=False)
 
     def _selection_due(self, minute: float) -> str | None:
-        """'grid' at the start of a record or of an era and at each grid point (the era's first selection's minute
-        plus a multiple of six hours); 'off_grid' when the latest grid point passed with no selection since (a
-        stop, or a selection that could not finish), which leaves the grid where it is."""
-        first = self.store.conn.execute("SELECT id, started_ts FROM selections WHERE (kind IS NULL OR kind = 'grid') "
-                                        "AND id > ? ORDER BY id LIMIT 1", (self.store.since("selections"),)).fetchone()
+        """'grid' on a new record and at each grid point (the first selection's minute plus a multiple of six
+        hours); 'off_grid' when the latest grid point passed with no selection since (a stop, or a selection that
+        could not finish), which leaves the grid where it is."""
+        first = self.store.conn.execute("SELECT started_ts FROM selections WHERE kind IS NULL OR kind = 'grid' "
+                                        "ORDER BY id LIMIT 1").fetchone()
         if first is None:
             return "grid"
-        anchor = math.floor(first[1] / 60) * 60
+        anchor = math.floor(first[0] / 60) * 60
         if minute < anchor:
             return None
         g = anchor + math.floor((minute - anchor) / RESELECT_S) * RESELECT_S
@@ -1346,49 +1374,12 @@ class Collector:
         return None
 
     # ---- snapshots
-    def _tape_time(self) -> None:
-        """After the clock jumped (ahead, or back into a new era) or the loop slept: one GET of the exchange's
-        newest trade, whose time less ours is the first lower bound of the tape's lead (`tape_lead`)."""
-        try:
-            page = self.kalshi.get_json("/markets/trades", {"limit": 1})
-            self._ok()
-        except Exception as e:
-            self._fail(None, "newest trade", e)
-            return
-        t = self.clock()
-        self._calibrate = False
-        rows = page.get("trades") or []
-        if rows:
-            self._lead.append((self._cycles, kd.normalize_trade(rows[0])["created_ts"] - t))
-
-    def tape_lead(self) -> float:
-        """How far Kalshi's tape runs ahead of our clock (negative: behind it), when the trades read in the last
-        LEAD_CYCLES cycles show it off by more than CLOCK_STEP_S; else 0. Each read gives a lower bound (its newest
-        trade's time less our time at its end: a trade is never made after Kalshi's now), so the trade reads it
-        moves can only start earlier than they need to, never later."""
-        recent = [x for c, x in self._lead if c > self._cycles - LEAD_CYCLES]
-        self._lead = [(c, x) for c, x in self._lead if c > self._cycles - LEAD_CYCLES]
-        if not recent:
-            return 0.0
-        lead = max(recent)
-        return lead if abs(lead) > CLOCK_STEP_S else 0.0
-
     def _trades_from(self, ticker: str, b1: float) -> int:
-        """`min_ts` of a trades read whose book read ended at b1 (our clock): 120 s before the latest read of the era
-        began; a first read one minute back, or to the era's start when the era began less than ten minutes ago
-        (so no trade made after a clock step is lost); never more than an hour back. All on the tape's time: when
-        our clock is more than two minutes off it (`tape_lead`), each time is moved by the lead judged at that
-        read (the latest read's own lead is kept with it)."""
-        lead = self.tape_lead()
+        """`min_ts` of a trades read whose book read ended at b1: 120 s before the latest read began, or one minute
+        back for a first read; never more than an hour back."""
         last = self.store.last_trade_read(ticker)
-        if last is not None:
-            min_ts = last + self._read_lead.get(ticker, 0.0) - TRADE_OVERLAP_S
-        else:
-            min_ts = b1 + lead - FIRST_TRADES_S
-            began = self.store.era()["start_ts"]
-            if began is not None and b1 - began < YOUNG_ERA_S:
-                min_ts = min(min_ts, began + lead - TRADE_OVERLAP_S)
-        return int(max(min_ts, b1 + lead - MAX_BACKFILL_S))
+        min_ts = last - TRADE_OVERLAP_S if last is not None else b1 - FIRST_TRADES_S
+        return int(max(min_ts, b1 - MAX_BACKFILL_S))
 
     def snapshot(self, w: dict, tail: bool = False) -> int | None:
         """One snapshot of one market: its book, then its new trades, written in one transaction. `tail`: read
@@ -1413,10 +1404,6 @@ class Collector:
             ok = 0
             self._fail(ticker, "trades", e)
         t1 = self.clock()
-        if trades:
-            self._lead.append((self._cycles, max(x["created_ts"] for x in trades) - t1))
-        if ok:
-            self._read_lead[ticker] = self.tape_lead()
         s = book_summary(book, bad)
         row = {"watch_id": w["watch_id"], "ticker": ticker, **stamp("book_start", b0), **stamp("book_end", b1),
                **(stamp("trades_start", t0) if ok else {"trades_start_iso": None, "trades_start_ts": None}),
@@ -1433,6 +1420,7 @@ class Collector:
             if conn.execute("SELECT 1 FROM trades WHERE trade_id = ?", (x["trade_id"],)).fetchone() is None:
                 fresh.append(x)
         row["new_trades"] = len(fresh)
+        self._guard()                                    # a step at any point of this read: nothing of it is kept
         with conn:                                       # the snapshot and its new trades in one transaction
             cols = list(row)
             sid = conn.execute("INSERT INTO snapshots (%s) VALUES (%s)" % (",".join(cols), ",".join("?" * len(cols))),
@@ -1491,6 +1479,7 @@ class Collector:
                     self._call(row, body, model_down)
         except Exception as e:                           # one bad market never stops the slot, and keeps its row
             row.update(status="error", error="%s: %s" % (type(e).__name__, e))
+        self._guard()
         self.store.insert("decisions", row)
         return row
 
@@ -1536,12 +1525,16 @@ class Collector:
         self._selecting, self._dry = True, dry_run
         try:
             return self._select(dry_run, max_pages, kind)
+        except _OutOfSync as e:
+            if self._depth:                              # inside a cycle: the cycle stops
+                raise
+            self._go_off(str(e))
+            return None
         finally:
             self._selecting, self._dry = False, False
 
     def _select(self, dry_run: bool, max_pages: int | None, kind: str) -> Selection | None:
         t0 = self.clock()
-        era = self.store.era()["n"]
         markets, pages = [], 0
         try:
             for page in self.kalshi.open_markets_pages(min_close_ts=int(t0 + MIN_CLOSE_S),
@@ -1596,9 +1589,6 @@ class Collector:
                     self._fail(t, "series", e)
                     fees[s] = {"fee_type": None, "fee_multiplier": None}
         t1 = self.clock()
-        if self.store.era()["n"] != era:                 # the clock went back while it read: the new era selects
-            self.event("selection_aborted", None, why="the clock went back during the selection")
-            return None
         still = {w["watch_id"] for w in self.watched()}  # a cycle during the read may have dropped one meanwhile
         ending = [w for w in ending if w["watch_id"] in still]
         phases = dict(zip(sel.chosen, assign_phases([w["phase"] for w in staying if w["watch_id"] in still],
@@ -1606,6 +1596,7 @@ class Collector:
         warm = {t: self.store.warm_from(t, t1) for t in sel.chosen}
         kept = {t: r for t, r in sel.reasons.items() if sel.kinds[t] not in OBJECT_KINDS}
         ins = self.store.insert
+        self._guard()
         with self.store.conn:                            # the ends, the selection and its markets: all or nothing
             for w in ending:
                 ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", t1),
@@ -1634,51 +1625,30 @@ def _day(ts: float) -> str:
 
 
 def day_status(store: Store, now: float) -> list[dict]:
-    """Per era (`Store.eras`: a clock that went back more than two minutes starts a new one) and UTC day, each era
-    counted by its own rows and times only: decision slots expected (every slot of every watch on its own phase's
-    five-minute grid, from 30 minutes after its first snapshot, or after `warm_from_ts` when it was chosen again
-    with its snapshots running on, but never before the watch itself began, so each slot of a market chosen again
-    is counted once, to its drop, the era's end or now; slots while the loop was stopped count, uncollected) and
-    collected (one of those slots with a non-forced decision with answers: `ok`), the share, which so cannot pass
-    100%; market-minutes watched (each watch from its market row to its drop, the era's end or now, counting only
-    the minutes in which the loop was running and not paused, that is wrote a heartbeat that was not paused) and
-    their share of the nominal 20 x 1440; the model's latency median and 95th percentile (nearest rank) over
-    answered calls, the count of each status, Kalshi requests and failures (from the heartbeats) and error
-    events."""
-    eras = store.eras()
-    out = []
-    for k, e in enumerate(eras):
-        nxt = eras[k + 1] if k + 1 < len(eras) else None
-        end = nxt["from_ts"] if nxt is not None else now
-        out += _era_status(store, e, nxt["ids"] if nxt is not None else None, end)
-    return out
-
-
-def _era_status(store: Store, era: dict, upto: dict | None, era_end: float) -> list[dict]:
+    """Per UTC day: decision slots expected (every slot of every watch on its own phase's five-minute grid, from
+    30 minutes after its first snapshot, or after `warm_from_ts` when it was chosen again with its snapshots running
+    on, but never before the watch itself began, so each slot of a market chosen again is counted once, to its drop
+    or now; slots while the loop was stopped or out of sync count, uncollected) and collected (one of those slots
+    with a non-forced decision with answers: `ok`), the share, which so cannot pass 100%; market-minutes watched
+    (each watch from its market row to its drop or now, counting only the minutes in which the loop was running and
+    not paused, that is wrote a heartbeat that was not paused) and their share of the nominal 20 x 1440; the model's
+    latency median and 95th percentile (nearest rank) over answered calls, the count of each status, Kalshi
+    requests and failures (from the heartbeats) and error events."""
     c = store.conn
-    lo = era["ids"]
-
-    def rows(sql: str, table: str, key: str, params: tuple = ()) -> list:
-        """`sql` (with a WHERE clause) limited to the era's rows of `table`."""
-        if upto is None:
-            return c.execute(sql + " AND %s > ?" % key, params + (lo[table],)).fetchall()
-        return c.execute(sql + " AND %s > ? AND %s <= ?" % (key, key), params + (lo[table], upto[table])).fetchall()
     days: dict[str, dict] = {}
 
     def day(d):
-        return days.setdefault(d, {"era": era["n"], "day": d, "expected": 0, "collected": 0, "share": None,
+        return days.setdefault(d, {"day": d, "expected": 0, "collected": 0, "share": None,
                                    "watched_minutes": 0.0, "watched_share": None,
                                    "statuses": dict.fromkeys(STATUSES, 0), "latencies": [], "requests": 0,
                                    "failures": 0, "errors": 0})
-    alive = {int(ts // 60) for (ts,) in rows("SELECT ts FROM heartbeats WHERE paused = 0", "heartbeats", "id")}
-    last_drop = upto["market_drops"] if upto is not None else None
+    alive = {int(ts // 60) for (ts,) in c.execute("SELECT ts FROM heartbeats WHERE paused = 0")}
     slots: set = set()
-    for _, ticker, selected, drop_id, dropped, first, phase, warm in rows(
-            "SELECT m.watch_id, m.ticker, m.selected_ts, d.id, d.dropped_ts, (SELECT MIN(book_end_ts) FROM snapshots s "
+    for _, ticker, selected, dropped, first, phase, warm in c.execute(
+            "SELECT m.watch_id, m.ticker, m.selected_ts, d.dropped_ts, (SELECT MIN(book_end_ts) FROM snapshots s "
             "WHERE s.watch_id = m.watch_id), m.phase, m.warm_from_ts FROM markets m LEFT JOIN market_drops d "
-            "ON d.watch_id = m.watch_id WHERE 1", "markets", "m.watch_id"):
-        ended_here = dropped is not None and (last_drop is None or drop_id <= last_drop)
-        end = min(dropped if ended_here else era_end, era_end)     # a watch ended by the next era: at this one's end
+            "ON d.watch_id = m.watch_id").fetchall():
+        end = dropped if dropped is not None else now
         for m in range(int(selected // 60), int(end // 60) + 1):     # only minutes the loop was running
             a, b = max(selected, 60.0 * m), min(end, 60.0 * m + 60)
             if b > a and m in alive:
@@ -1694,8 +1664,8 @@ def _era_status(store: Store, era: dict, upto: dict | None, era_end: float) -> l
                 day(_day(s))["expected"] += 1
             s += SLOT_S
     got: set = set()
-    for ticker, slot, status, latency, answers in rows("SELECT ticker, slot_ts, status, latency_s, answers_json "
-                                                       "FROM decisions WHERE forced = 0", "decisions", "id"):
+    for ticker, slot, status, latency, answers in c.execute("SELECT ticker, slot_ts, status, latency_s, answers_json "
+                                                            "FROM decisions WHERE forced = 0").fetchall():
         d = day(_day(slot))
         d["statuses"][status] = d["statuses"].get(status, 0) + 1
         answered = status == "ok" or (status == "late" and answers is not None)   # a late answer kept before rev 3
@@ -1704,11 +1674,11 @@ def _era_status(store: Store, era: dict, upto: dict | None, era_end: float) -> l
             d["collected"] += 1
             if latency is not None:
                 d["latencies"].append(latency)
-    for ts, req, fail in rows("SELECT ts, kalshi_requests, kalshi_failures FROM heartbeats WHERE 1", "heartbeats", "id"):
+    for ts, req, fail in c.execute("SELECT ts, kalshi_requests, kalshi_failures FROM heartbeats").fetchall():
         d = day(_day(ts))
         d["requests"] += req or 0
         d["failures"] += fail or 0
-    for (ts,) in rows("SELECT ts FROM events WHERE kind = 'error'", "events", "id"):
+    for (ts,) in c.execute("SELECT ts FROM events WHERE kind = 'error'").fetchall():
         day(_day(ts))["errors"] += 1
     out = []
     for d in sorted(days):
@@ -1722,26 +1692,13 @@ def _era_status(store: Store, era: dict, upto: dict | None, era_end: float) -> l
     return out
 
 
-def era_list(store: Store) -> list[str]:
-    """One line per era: when it began and, for a later one, from which time the clock went back."""
-    out = []
-    for e in store.eras():
-        if e["n"] == 0:
-            out.append("era 0: from the start of the record")
-        else:
-            out.append("era %d: from %s; the clock went back %.0f s, from %s" % (
-                e["n"], iso(e["start_ts"]), e["from_ts"] - e["start_ts"], iso(e["from_ts"])))
-    return out
-
-
-def format_status(rows: list[dict], eras: list[str] | None = None) -> str:
-    head = ("era day         expected collected  share    ok  late unavail  tag stale error  lat_med  lat_p95  "
-            "requests failures errors  watched_min watched")
-    lines = list(eras or []) + [head]
+def format_status(rows: list[dict]) -> str:
+    lines = ["day         expected collected  share    ok  late unavail  tag stale error  lat_med  lat_p95  "
+             "requests failures errors  watched_min watched"]
     for r in rows:
         s = r["statuses"]
-        lines.append("%3d %-10s  %8d %9d %6s %5d %5d %7d %4d %5d %5d %8s %8s %9d %8d %6d %12.0f %6.1f%%" % (
-            r.get("era", 0), r["day"], r["expected"], r["collected"],
+        lines.append("%-10s  %8d %9d %6s %5d %5d %7d %4d %5d %5d %8s %8s %9d %8d %6d %12.0f %6.1f%%" % (
+            r["day"], r["expected"], r["collected"],
             "-" if r["share"] is None else "%.1f%%" % (100 * r["share"]),
             s["ok"], s["late"], s["model_unavailable"], s["tag_mismatch"], s["stale_data"], s["error"],
             "-" if r["latency_median"] is None else "%.2f" % r["latency_median"],
@@ -1768,7 +1725,7 @@ def _print_selection(sel: Selection, out=None) -> None:
 
 
 def main(argv=None, *, kalshi: kd.KalshiData | None = None, model: ModelClient | None = None,
-         clock: Callable[[], float] | None = None) -> int:
+         clock: Callable[[], float] | None = None, monotonic: Callable[[], float] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="orderbook_loop", description="Collect Kalshi books and Nimble v3's battery.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("collect", "once", "select", "status"):
@@ -1781,11 +1738,12 @@ def main(argv=None, *, kalshi: kd.KalshiData | None = None, model: ModelClient |
     clock = clock or time.time
     store = Store(a.db)
     if a.cmd == "status":
-        print(format_status(day_status(store, clock()), era_list(store)))
+        print(format_status(day_status(store, clock())))
         return 0
     kalshi = kalshi or kalshi_client()
     model = model or ModelClient(clock=clock)
-    col = Collector(store, kalshi, model, clock=clock, slots=getattr(a, "max_markets", WATCH_COUNT))
+    col = Collector(store, kalshi, model, clock=clock, monotonic=monotonic or time.monotonic,
+                    slots=getattr(a, "max_markets", WATCH_COUNT))
     if a.cmd == "select":
         sel = col.select(dry_run=True, max_pages=a.max_pages)
         if sel is None:
@@ -1795,12 +1753,19 @@ def main(argv=None, *, kalshi: kd.KalshiData | None = None, model: ModelClient |
         return 0
     if a.cmd == "once":
         col.start()
+        if not col.synced:
+            print("the clock is not known to be right (%s): nothing stored but the clock_off event"
+                  % ("no Date header" if col.clock_offset is None else "%.0f s off Kalshi's Date header"
+                     % col.clock_offset))
+            return 1
         if not col.watched():
             sel = col.select(max_pages=a.max_pages)
             if sel is not None:
                 _print_selection(sel)
         made = col.cycle(force_decision=True, allow_select=False)
         col.finish("once")
+        print("clock less Kalshi's Date header: %s s" % (None if col.clock_offset is None else
+                                                        "%.1f" % col.clock_offset))
         for i, d in enumerate(made):
             print("decision %s: %s latency %s" % (d["ticker"], d["status"], d.get("latency_s")))
             if i == 0:

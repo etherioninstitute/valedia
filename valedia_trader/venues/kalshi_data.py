@@ -63,10 +63,17 @@ class Pacer:
 
 def urllib_get(url: str, timeout: float = 60.0) -> bytes:
     """GET a URL and return the body. A non-200 answer raises HttpError with its status (and Retry-After if sent)."""
+    return urllib_get_dated(url, timeout)[0]
+
+
+def urllib_get_dated(url: str, timeout: float = 60.0) -> tuple[bytes, str | None]:
+    """As `urllib_get`, and the answer's HTTP Date header with it (None when it has none). `KalshiData` takes a
+    transport that answers either way."""
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+            headers = getattr(resp, "headers", None)
+            return resp.read(), (headers.get("Date") if headers is not None else None)
     except urllib.error.HTTPError as e:
         retry = e.headers.get("Retry-After") if e.headers else None
         try:
@@ -146,6 +153,7 @@ class KalshiData:
                  tries: int = 5, sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self.fetch, self.base_url, self.tries, self.sleep = fetch, base_url.rstrip("/"), tries, sleep
         self.pacer = Pacer(1.0 / max_per_second + 0.01, sleep, clock)    # a hair over 1/3 s: never 4 in a second
+        self.last_date: str | None = None     # the Date header of the latest answer, when the transport hands it back
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
         """GET base + path with the query `params`; retries 429 and 5xx with waits of 1, 2, 4, 8 s (or Retry-After)."""
@@ -158,6 +166,8 @@ class KalshiData:
             self.pacer.wait()
             try:
                 body = self.fetch(url)
+                if isinstance(body, tuple):            # (body, Date header) from a dated transport
+                    body, self.last_date = body
             except HttpError as e:
                 if e.status == 429 or e.status >= 500:
                     last = e
