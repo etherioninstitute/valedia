@@ -202,14 +202,18 @@ def test_guard_redacts_print_stderr_and_a_traceback(capsys):
     assert not leaked and "<secret>" in out and err.count("<secret>") == 3 and "RuntimeError" in err
 
 
-def test_guard_catches_a_secret_split_across_two_writes(capsys):
+def test_guard_catches_a_secret_split_across_two_writes(tmp_path, monkeypatch):
     value = _made_up(random.Random(8), 32)
+    target = open(tmp_path / "out.txt", "w")                  # a real file: the guard holds an unfinished line
+    monkeypatch.setattr(sys, "stdout", target)
     _remember(value)
     sys.stdout.write("key " + value[:13])
     sys.stdout.write(value[13:] + " end\n")
     sys.stdout.write("tail without newline")
     sys.stdout.flush()
-    out, _ = capsys.readouterr()
+    s.remove_output_guard()
+    target.close()
+    out = (tmp_path / "out.txt").read_text()
     leaked = _leaks(out, value)
     kept = out == "key <secret> end\ntail without newline"
     assert not leaked and kept
@@ -584,39 +588,22 @@ def test_remember_hands_the_tripwire_a_value_learned_elsewhere():
 
 import re  # noqa: E402
 
-WORDS = """able about above across act add after again against age ago air all almost alone along already also always
-among amount animal answer any appear apple area arm army around art ask away baby back bad bag ball bank base basket
-beach bear beat beauty bed before begin behind bell best better between big bird black blood blue board boat body bone
-book born both bottle bottom box boy brain bread break bridge bright bring brother brown build burn busy buy cake call
-camera camp can capital captain car card care carry case cat catch cause center chair chance change charge cheap check
-child choose church circle city class clean clear climb clock close cloud coast coat cold color come common company
-cook cool corner cost cotton count country course cover cow crowd cry cup current cut dance dark daughter day dead deal
-dear deep desert design desk detail develop dinner direct doctor dog door double down draw dream dress drink drive drop
-dry during dust duty early earth east easy eat edge effect egg eight either electric else empty end enemy energy engine
-enjoy enough enter equal evening event every exact example except expect face fact fair fall family famous farm fast
-father fear feel few field fight figure fill final find fine finger finish fire first fish five flat floor flower fly
-follow food foot force forest forget form forward four free fresh friend front fruit full future game garden gas gate
-general gentle gift girl give glad glass gold good grass great green ground group grow guess guide hair half hall hand
-happy hard hat head health hear heart heavy help here high hill history hold hole holiday home hope horse hospital hot
-hotel hour house huge human hundred hunt hurry husband ice idea inch include industry inside iron island job join joy
-jump just keep key kind king kitchen knee knife know lady lake land language large last late laugh lead learn leave
-left leg less letter level library lift light like line lion list listen little live long look lose loud love low lucky
-machine main major make market master matter meal measure meat meet member metal method middle might mile milk mind
-minute miss modern moment money month moon morning mother motor mountain mouse mouth move music name nation nature near
-neck need never news next nice night noise north nose note number ocean offer office often oil old open orange order
-other outside owner page paint paper parent park part party pass past path pay peace pen people period person picture
-piece place plain plan plant play please pocket poem point police poor popular power present price print problem
-produce public pull push quick quiet race radio rain raise reach read ready real reason record red remember report rest
-rich ride right ring river road rock roof room rope round rule run safe salt sand save school science sea season seat
-second seed sell send sense serve seven shake shape share sharp sheep shell ship shoe shop short shoulder show side sign
-silver simple sing sister sit six size skin sky sleep slow small smile snow soft soil soldier solve song soon sound
-south space speak special speed spend spring square stand star start station stay steel step stick still stone stop
-store storm story street strong student study sugar summer sun supply sure surface sweet swim table tail take talk tall
-teach team tell ten test thank thick thin thing think three throw tiny today together tomorrow tone tool tooth top total
-touch town track trade train travel tree trip trouble true trust try turn twelve twenty two type under unit until upon
-use usual valley value very village visit voice wait walk wall want warm wash watch water wave way wear weather week
-weight west wheel white whole wide wife wild win wind window winter wise wish woman wonder wood word work world write
-yard year yellow young zero""".split()
+def _word_list(n=600, seed=587):
+    """A list of ordinary words built at run time: from the system dictionary when there is one,
+    otherwise made-up pronounceable words. Never typed out by hand."""
+    path = Path("/usr/share/dict/words")
+    rng = random.Random(seed)
+    if path.is_file():
+        pool = sorted({w for w in path.read_text().split() if w.isalpha() and w.islower() and 4 <= len(w) <= 8})
+        if len(pool) >= n:
+            return rng.sample(pool, n)
+    made = set()
+    while len(made) < n:
+        made.add("".join(rng.choice("bcdfghklmnprstvz") + rng.choice("aeiou") for _ in range(rng.randint(2, 4))))
+    return sorted(made)
+
+
+WORDS = _word_list()
 
 
 def _phrase(rng, n):
@@ -624,9 +611,9 @@ def _phrase(rng, n):
 
 
 def _phrase_leaks(text, words):
-    """True when any 4 consecutive words of the phrase appear in the text in order, ignoring case and
-    with whitespace or a single comma, hyphen or underscore between them."""
-    seq = re.findall(r"[^\W_]+", text.lower())
+    """True when any 4 consecutive words of the phrase appear in the text in order as separate words,
+    ignoring case and whatever stands between them."""
+    seq = re.findall(r"[^\W\d_]+", text.lower())
     grams = {tuple(words[i:i + 4]) for i in range(len(words) - 3)}
     return any(tuple(seq[i:i + 4]) in grams for i in range(len(seq) - 3))
 
@@ -678,25 +665,25 @@ def test_ordinary_sentences_are_never_replaced_unless_four_words_match():
         s.secret("MADE_UP_MNEMONIC", {"MADE_UP_MNEMONIC": " ".join(words)})
     grams = {tuple(w[i:i + 4]) for w in phrases for i in range(len(w) - 3)}
 
-    def has_gram(seq):
-        return any(tuple(seq[i:i + 4]) in grams for i in range(len(seq) - 3))
-
-    plain, matching = [], []
+    sentences = []
     for _ in range(20_000):
         seq = _phrase(rng, rng.randint(6, 18))
         text = " ".join(w + ("," if rng.random() < 0.1 else "") for w in seq)
-        sentence = text[0].upper() + text[1:].rstrip(",") + "."
-        (matching if has_gram(seq) else plain).append(sentence)
-    body = "\n".join(plain)
+        sentences.append(text[0].upper() + text[1:].rstrip(",") + ".")
+    body = "\n".join(sentences)
+    seq = re.findall(r"[^\W\d_]+", body.lower())           # independent count: every word of the body, in order
+    starts = [i for i in range(len(seq) - 3) if tuple(seq[i:i + 4]) in grams]
+    regions = sum(1 for k, i in enumerate(starts) if k == 0 or i > starts[k - 1] + 3)
     out, n = s.redact(body)
-    same = out == body
-    assert len(plain) >= 19_900 and n == 0 and same
+    leaked = any(_phrase_leaks(out, w) for w in phrases)
+    same = out == body if not regions else True
+    assert n == regions and not leaked and same
     planted = []
     for _ in range(200):
         words = rng.choice(phrases)
         i = rng.randrange(len(words) - 3)
         planted.append(" ".join(_phrase(rng, 3) + words[i:i + 4] + _phrase(rng, 3)) + ".")
-    caught = [s.redact(x) for x in planted + matching]
+    caught = [s.redact(x) for x in planted]
     assert all(k >= 1 and not any(_phrase_leaks(o, w) for w in phrases) for o, k in caught)
 
 
@@ -748,3 +735,322 @@ def test_a_stream_replaced_after_the_guard_is_wrapped_again_at_the_next_call(tmp
     done = subprocess.run([sys.executable, "child.py"], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
     leaked = _leaks(done.stdout + done.stderr, value)
     assert done.returncode == 0 and not leaked and done.stdout.count("<secret>") == 1 and done.stderr.count("<secret>") == 1
+
+
+# ---- rev 6 -------------------------------------------------------------------------------------
+
+def _run_child(tmp_path, body, timeout=60, **env_extra):
+    """Run `body` in a child Python with the guard's module imported; return code, stdout, stderr."""
+    script = "import contextlib, io, os, sys, threading\nfrom valedia_trader.core import secrets\n" + body + "\n"
+    (tmp_path / "child.py").write_text(script)
+    env = {**os.environ, "PYTHONPATH": str(REPO), **env_extra}
+    done = subprocess.run([sys.executable, "child.py"], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=timeout)
+    return done.returncode, done.stdout, done.stderr
+
+
+PHRASE_SCREEN_CASES = {
+    "one word per line": "for w in W:\n    print(w)",
+    "three words, a break, three words": "print(' '.join(W[:3]) + '\\n' + ' '.join(W[3:6]))",
+    "a word per write": "for w in W[:6]:\n    sys.stdout.write(w + ' ')\nsys.stdout.write('\\n')",
+    "a numbered list": "for i, w in enumerate(W, 1):\n    print(f'{i}. {w}')",
+    "one word per line on stderr": "for w in W[:5]:\n    print(w, file=sys.stderr)",
+    "upper case with blank lines": "for w in W[:6]:\n    print(w.upper())\n    print()",
+    "a word per write with line breaks": "for w in W[2:9]:\n    sys.stdout.write(w)\n    sys.stdout.write('\\n')",
+}
+
+
+@pytest.mark.parametrize("case", sorted(PHRASE_SCREEN_CASES))
+def test_a_phrase_broken_by_lines_or_writes_never_reaches_the_screen(tmp_path, case):
+    words = _phrase(random.Random(case), 12)
+    body = ("secrets.secret('MADE_UP_CHILD_PHRASE')\nW = os.environ['MADE_UP_CHILD_PHRASE'].split()\nprint('MARK start')\n"
+            + PHRASE_SCREEN_CASES[case] + "\nprint('MARK end')")
+    code, out, err = _run_child(tmp_path, body, MADE_UP_CHILD_PHRASE=" ".join(words))
+    leaked = _phrase_leaks(out, words) or _phrase_leaks(err, words)
+    assert code == 0 and not leaked and "MARK start" in out and "MARK end" in out and "<secret>" in out + err
+
+
+class _Ledger(_Stream):
+    """A stand-in real file (it has a file number) that records every write it receives."""
+
+
+def test_with_a_phrase_remembered_ordinary_lines_go_out_before_the_write_returns(monkeypatch):
+    rng = random.Random(40)
+    phrase = _phrase(rng, 12)
+    others = [w for w in WORDS if w not in phrase]
+    target = _Ledger()
+    monkeypatch.setattr(sys, "stdout", target)
+    s.remember(" ".join(phrase))
+    late, written = 0, ""
+    for _ in range(10_000):
+        line = " ".join(rng.choice(others) for _ in range(rng.randint(3, 12))) + "\n"
+        sys.stdout.write(line)
+        written += line
+        late += "".join(target.parts) != written
+    sys.stdout.write("progress 10%\r")
+    shown = "".join(target.parts) == written + "progress 10%\r"
+    s.remove_output_guard()
+    assert late == 0 and shown
+
+
+def test_with_no_phrase_remembered_the_timing_is_as_before(monkeypatch):
+    target = _Ledger()
+    monkeypatch.setattr(sys, "stdout", target)
+    _remember(_made_up(random.Random(41), 32))
+    steps = []
+    for text in ("a", "b\n", "c\r", "d"):
+        sys.stdout.write(text)
+        steps.append("".join(target.parts))
+    sys.stdout.flush()
+    steps.append("".join(target.parts))
+    s.remove_output_guard()
+    assert steps == ["", "ab\n", "ab\nc\r", "ab\nc\r", "ab\nc\rd"]
+
+
+IN_MEMORY_CASES = {
+    "a redirect to a buffer": (
+        "with contextlib.redirect_stdout(io.StringIO()) as buf:\n"
+        "    secrets.secret('MADE_UP_CHILD_TOKEN')\n"
+        "    sys.stdout.write('partial-no-newline')\n"
+        "    got = buf.getvalue()\n"
+        "print('OK' if got == 'partial-no-newline' else 'LOST')"),
+    "a string buffer set after the guard": (
+        "secrets.secret('MADE_UP_CHILD_TOKEN')\nV = os.environ['MADE_UP_CHILD_TOKEN']\n"
+        "sys.stdout = io.StringIO()\nsecrets.redact('x' * 9)\n"
+        "print('A', end='')\nprint('B', end='')\nprint(' ' + V, end='')\n"
+        "got = sys.stdout.getvalue()\nsys.stdout = sys.__stdout__\n"
+        "print('OK' if got == 'AB <secret>' else 'LOST')"),
+    "text held for the old stream": (
+        "secrets.secret('MADE_UP_CHILD_TOKEN')\nsys.stdout.write('OK-held-partial ')\n"
+        "sys.stdout = io.StringIO()\nsecrets.redact('x' * 9)\nsys.stdout = sys.__stdout__\nprint('end')"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(IN_MEMORY_CASES))
+def test_nothing_written_to_a_guarded_stream_is_lost(tmp_path, case):
+    value = _made_up(random.Random(case), 32)
+    code, out, err = _run_child(tmp_path, IN_MEMORY_CASES[case], MADE_UP_CHILD_TOKEN=value)
+    leaked = _leaks(out + err, value)
+    assert code == 0 and not leaked and "OK" in out and "LOST" not in out
+
+
+def test_load_env_leaves_ordinary_settings_alone(tmp_path):
+    settings = {"KEYBOARD_LAYOUT": "us english qwerty standard", "TOKEN_SCOPES": "read write trade admin",
+                "API_KEY_NOTE": "rotate this key monthly", "WEBULL_ACCOUNT_LABEL": "main brokerage account two",
+                "MNEMONIC_LANGUAGE": "japanese", "MNEMONIC_WORDLIST": "english"}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in settings.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in settings.items() if s.redact(f"x {v} y")[1])
+    assert caught == []
+
+
+def test_load_env_remembers_phrases_under_every_phrase_name(tmp_path):
+    rng = random.Random(42)
+    names = ["WALLET_SEED", "SEED", "WALLET_WORDS", "BIP39_WORDS", "WALLET_PHRASE", "WALLET_MNEMONIC", "RECOVERY_CODE"]
+    values = {n: " ".join(_phrase(rng, 12)) for n in names}
+    values["BROKER_KEY"] = " ".join(_phrase(rng, 12))                          # 12 words, letters only
+    values["OTHER_KEY"] = " ".join(_phrase(rng, 11) + ["w0rd"])               # 12 words, one not letters only
+    values["SHORT_TOKEN"] = " ".join(_phrase(rng, 8))                         # 8 words under a non-phrase name
+    values["MNEMONIC_SALT"] = _made_up(rng, 12) + "9"                         # no whitespace, not purely letters
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
+    assert caught == sorted(names + ["BROKER_KEY", "MNEMONIC_SALT"])
+    doc = s._looks_like_credential.__doc__.upper()
+    listed = all(w in doc for w in ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "ACCOUNT", "MNEMONIC", "SEED", "PHRASE",
+                                    "RECOVERY", "WORDS"))
+    assert listed
+
+
+def test_any_short_run_of_non_letters_between_phrase_words_counts_as_a_separator():
+    words = _phrase(random.Random(43), 12)
+    s.remember(" ".join(words))
+    four = words[3:7]
+    forms = {"numbered": " ".join(f"{i}. {w}" for i, w in enumerate(four, 4)), "together": "".join(four)}
+    for sep in ("+", ".", "/", ";", "|", ":", "--", ",,", "\u2013", " 7 ", "\t\t", "...!!", "(1) "):
+        forms[repr(sep)] = sep.join(four)
+    results = {}
+    for name, planted in forms.items():
+        out, n = s.redact(f"start {planted} stop")
+        results[name] = n >= 1 and not _phrase_leaks(out, words) and "".join(four) not in out.lower()
+    assert all(results.values()), sorted(k for k, ok in results.items() if not ok)
+    out, n = s.redact(" ".join(words[3:5]) + " !!!!!!! " + " ".join(words[5:7]))   # a gap of 7 breaks the run
+    assert n == 0
+
+
+class _Tee:
+    """A wrapper of the common kind: writes go on to `stream`."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        return self.stream.write(text)
+
+    def flush(self):
+        self.stream.flush()
+
+
+def _guard_layers(stream):
+    layers, seen = 0, 0
+    while stream is not None and seen < 200:
+        layers += isinstance(stream, s._GuardedStream)
+        stream = stream.__dict__.get("_stream") or stream.__dict__.get("stream")
+        seen += 1
+    return layers
+
+
+def test_the_guard_never_wraps_a_stream_that_already_reaches_a_guard(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    _remember(_made_up(random.Random(44), 32))
+    for _ in range(8):
+        sys.stdout = _Tee(sys.stdout)
+        s.redact("plain text here")
+    after_eight = _guard_layers(sys.stdout)
+    for _ in range(42):
+        sys.stdout = _Tee(sys.stdout)
+        s.redact("plain text here")
+    after_fifty = _guard_layers(sys.stdout)
+    s.remove_output_guard()
+    assert after_eight == 1 and after_fifty <= 6
+
+
+def test_remove_inside_a_redirect_leaves_nothing_redacting(tmp_path):
+    body = ("secrets.secret('MADE_UP_CHILD_TOKEN')\n"
+            "with contextlib.redirect_stdout(io.StringIO()):\n    secrets.remove_output_guard()\n"
+            "g = sys.stdout\nactive = isinstance(g, secrets._GuardedStream) and getattr(g, '_active', True)\n"
+            "secrets.remember('another-made-up-value-1234')\n"
+            "h = sys.stdout\nlayers = 0\nwhile h is not None:\n"
+            "    layers += isinstance(h, secrets._GuardedStream)\n    h = h.__dict__.get('_stream')\n"
+            "print('ACTIVE' if active else 'INERT', layers)")
+    code, out, _ = _run_child(tmp_path, body, MADE_UP_CHILD_TOKEN=_made_up(random.Random(45), 32))
+    assert code == 0 and out.split() == ["INERT", "1"]
+
+
+def test_eight_writers_and_a_guard_switched_2000_times_never_deadlock(tmp_path):
+    body = ("V = secrets.secret('MADE_UP_CHILD_TOKEN')\n"
+            "stop, counts = threading.Event(), [0] * 8\n"
+            "def writer(i):\n    n = 0\n    while not stop.is_set() or n < 300:\n"
+            "        sys.stdout.write(f't{i} {n} {V}\\n' if n % 10 == 0 else f't{i} {n}\\n')\n"
+            "        n += 1\n    counts[i] = n\n"
+            "threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]\n"
+            "for t in threads:\n    t.start()\n"
+            "for _ in range(2000):\n    secrets.install_output_guard()\n    secrets.ensure_output_guard()\n"
+            "    secrets.remove_output_guard()\n"
+            "stop.set()\nfor t in threads:\n    t.join()\nsys.stdout.flush()\n"
+            "print('COUNTS', *counts)")
+    value = _made_up(random.Random(46), 32)
+    try:
+        code, out, _ = _run_child(tmp_path, body, timeout=60, MADE_UP_CHILD_TOKEN=value)
+    except subprocess.TimeoutExpired:
+        code, out = None, ""
+    lines = out.replace(value, "<secret>").splitlines()
+    counts = [int(x) for x in lines[-1].split()[1:]] if lines and lines[-1].startswith("COUNTS") else []
+    expected = sorted(f"t{i} {n} <secret>" if n % 10 == 0 else f"t{i} {n}" for i in range(len(counts)) for n in range(counts[i]))
+    ok = code == 0 and len(counts) == 8 and sorted(lines[:-1]) == expected
+    assert ok
+
+
+# ---- rev 6 follow-up: values of spaced groups of digits or of letters and digits ---------------
+
+def _groups(rng, n, mixed=False):
+    """Made-up groups: four digits each, or two letters and two digits each."""
+    if mixed:
+        return [_made_up(rng, 2, string.ascii_lowercase) + _made_up(rng, 2, string.digits) for _ in range(n)]
+    return [_made_up(rng, 4, string.digits) for _ in range(n)]
+
+
+def _group_leaks(text, groups):
+    """True when any 4 consecutive groups appear in the text in order as separate runs of letters and
+    digits, ignoring case and whatever stands between them."""
+    seq = re.findall(r"[^\W_]+", text.lower())
+    grams = {tuple(groups[i:i + 4]) for i in range(len(groups) - 3)}
+    return any(tuple(seq[i:i + 4]) in grams for i in range(len(seq) - 3))
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_value_of_spaced_groups_is_caught_as_a_sequence(mixed):
+    rng = random.Random(50 + mixed)
+    groups = _groups(rng, 6, mixed)
+    s.remember(" ".join(groups))
+    four = groups[1:5]
+    forms = {"spaced": " ".join(four), "dashes": "-".join(four), "lines": "\n".join(four), "together": "".join(four),
+             "upper": " ".join(four).upper(), "commas": ", ".join(four), "slashes": " / ".join(four),
+             "first four": " ".join(groups[:4]), "last four": "  ".join(groups[2:])}
+    results = {}
+    for name, planted in forms.items():
+        out, n = s.redact(f"card {planted} end")
+        results[name] = n >= 1 and not _group_leaks(out, groups) and "".join(four) not in out.lower()
+    assert all(results.values()), sorted(k for k, ok in results.items() if not ok)
+    out, n = s.redact("x " + " ".join(groups[:3]) + " y")                      # three groups pass
+    out2, n2 = s.redact(" ".join(groups[:2]) + " ...!!!! " + " ".join(groups[2:4]))  # a gap of 7 breaks
+    assert n == 0 and n2 == 0
+
+
+GROUP_SCREEN_CASES = {
+    "one group per line": "for g in G:\n    print(g)",
+    "a group per write": "for g in G[:5]:\n    sys.stdout.write(g)\n    sys.stdout.write(' ')\nprint()",
+    "two, a break, two": "print(' '.join(G[:2]) + '\\n' + ' '.join(G[2:4]))",
+}
+
+
+@pytest.mark.parametrize("case", sorted(GROUP_SCREEN_CASES))
+def test_spaced_groups_broken_by_lines_or_writes_never_reach_the_screen(tmp_path, case):
+    groups = _groups(random.Random(case), 6)
+    body = ("secrets.secret('MADE_UP_CHILD_CARD')\nG = os.environ['MADE_UP_CHILD_CARD'].split()\nprint('MARK start')\n"
+            + GROUP_SCREEN_CASES[case] + "\nprint('MARK end')")
+    code, out, err = _run_child(tmp_path, body, MADE_UP_CHILD_CARD=" ".join(groups))
+    leaked = _group_leaks(out, groups) or _group_leaks(err, groups)
+    assert code == 0 and not leaked and "MARK end" in out and "<secret>" in out
+
+
+def test_load_env_remembers_spaced_numbers_under_credential_and_phrase_names(tmp_path):
+    rng = random.Random(52)
+    values = {"CARD_KEY": " ".join(_groups(rng, 4)), "BACKUP_TOKEN": " ".join(_groups(rng, 5, True)),
+              "WALLET_SEED": " ".join(_groups(rng, 4)), "PIN_NOTE_KEY": "account 2 of 3",
+              "SCOPE_TOKEN": "read write trade admin"}
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    caught = sorted(k for k, v in values.items() if s.redact(f"x {v} y")[1])
+    assert caught == ["BACKUP_TOKEN", "CARD_KEY", "WALLET_SEED"]
+
+
+def _number_lines(rng, groups, n):
+    """Ordinary lines of spaced numbers: dates, times, prices, table rows, where the remembered
+    groups turn up often, one at a time or a few together."""
+    def num():
+        r = rng.random()
+        if r < 0.35:
+            return rng.choice(groups)
+        if r < 0.6:
+            return _made_up(rng, 4, string.digits)
+        if r < 0.75:
+            return f"{rng.randint(1, 9999)}.{rng.randint(0, 99):02d}"
+        if r < 0.9:
+            return f"{rng.randint(2000, 2030)}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"
+        return f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}"
+    seps = [" ", "  ", ", ", " | ", "/", "-", "\t", " : "]
+    return [rng.choice(seps).join(num() for _ in range(rng.randint(2, 9))) for _ in range(n)]
+
+
+def test_ordinary_spaced_numbers_are_never_replaced_unless_four_groups_match():
+    rng = random.Random(53)
+    groups = _groups(rng, 4)
+    s.remember(" ".join(groups))
+    lines = _number_lines(rng, groups, 200_000)
+    gram = tuple(groups)
+    expected = replaced = leaked = 0
+    for k in range(0, len(lines), 1000):
+        chunk = "\n".join(lines[k:k + 1000])
+        seq = re.findall(r"[^\W_]+", chunk.lower())
+        starts = [i for i in range(len(seq) - 3) if tuple(seq[i:i + 4]) == gram]
+        expected += sum(1 for j, i in enumerate(starts) if j == 0 or i > starts[j - 1] + 3)
+        out, n = s.redact(chunk)
+        replaced += n
+        leaked += _group_leaks(out, groups)
+    assert replaced == expected and not leaked
