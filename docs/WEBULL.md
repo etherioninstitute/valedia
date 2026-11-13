@@ -196,6 +196,21 @@ Webull listed more than 2,000 series in eleven categories (sports 931, elections
 read from Kalshi's public feed, and orders would go through the Events Cash account. Event orders are not built:
 the adapter refuses them.
 
+One practice order by hand in the paper Events account (10:03 New York, one NBA game market, Kalshi's public
+book at 0.70 bid, 0.71 ask):
+
+- An event order is a limit order with `instrument_type` EVENT, an `event_outcome` of yes or no, a whole quantity,
+  a price in dollars, time in force DAY. A resting buy of 1 yes contract at 0.01 was accepted, read as submitted,
+  showed in the open orders, and cancelled cleanly.
+- A buy of 1 yes contract with a limit of 0.72 filled within 3 seconds at 0.71, Kalshi's ask at that moment. A
+  sale with a limit of 0.69 filled within 10 seconds at 0.70, Kalshi's bid. So the paper side fills at the real
+  book's prices, not at the limit.
+- The holding is one row: the market's ticker, `instrument_type` EVENT, `event_outcome` yes, quantity, cost.
+- Every event order carries one fee entry from the moment it is accepted. The round trip cost 0.03 dollars: one
+  cent of spread and about one cent a contract a side. The fee entry's fields were not printed and Webull's
+  real fee schedule for event contracts has not been read.
+- The Events account's balance answer has buying power and market value but no cash line.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,
