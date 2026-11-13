@@ -95,7 +95,13 @@ class Journal:
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def write(self, day, entry: dict) -> dict:
+        """Append one record. Any piece of a remembered secret is replaced first, and the record
+        then says how many replacements were made (`secret_redacted`)."""
+        from valedia_trader.core.secrets import redact_json
         record = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "day": str(pd.Timestamp(day).date()), **entry}
+        record, replaced = redact_json(record)
+        if replaced:
+            record["secret_redacted"] = replaced
         with (self.dir / f"{record['day']}.jsonl").open("a") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
         return record
