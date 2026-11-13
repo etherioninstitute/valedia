@@ -70,6 +70,7 @@ TERMINAL = frozenset({"filled", "cancelled", "rejected", "expired", "refused"})
 UNSETTLED = ("sent", "unknown")                           # fate not known: blocks every further submit
 CHECKED = ("sent", "unknown", "accepted", "partly_filled")  # what a reconcile asks the venue about (plus rechecks)
 FINISHED = ("filled", "cancelled", "expired")             # asked again for late fees and averages
+STATUS_KEYS = ("state", "filled_units", "avg_price", "fee", "venue_order_id", "raw_status")
 VENUE_STATES = {"open": "accepted", "partly_filled": "partly_filled", "filled": "filled", "cancelled": "cancelled",
                 "rejected": "rejected", "expired": "expired"}
 _SETTLED_BY_VENUE = {"accepted", "partly_filled", "filled", "cancelled", "rejected", "expired"}
@@ -130,15 +131,20 @@ def _describe(exc: BaseException) -> str:
     try:
         text = str(exc)
     except Exception:
-        return name
-    return f"{name}: {text[:MAX_TEXT]}"
+        return _storable(name)
+    return _storable(f"{name}: {text[:MAX_TEXT]}")
 
 
 def _safe_repr(x) -> str:
     try:
-        return repr(x)[:MAX_TEXT]
+        return _storable(repr(x)[:MAX_TEXT])
     except Exception:
         return f"<{type(x).__name__} that cannot be shown>"
+
+
+def _storable(text: str) -> str:
+    """Text from outside made safe to store: anything UTF-8 cannot encode (a lone surrogate) becomes '?'."""
+    return str(text).encode("utf-8", "replace").decode("utf-8")
 
 
 def _finite(x) -> bool:
@@ -167,7 +173,7 @@ def _tol(units: float) -> float:
     return REL_TOL * max(1.0, abs(units))
 
 
-LAYOUT_VERSION = 2                                        # PRAGMA user_version of a file this module writes
+LAYOUT_VERSION = 3                                        # PRAGMA user_version of a file this module writes
 SCHEMA = [
     "CREATE TABLE IF NOT EXISTS orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, "
     "reference_price REAL NOT NULL, limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, created REAL NOT NULL, "
@@ -193,6 +199,16 @@ SCHEMA = [
     "BEGIN SELECT RAISE(ABORT, 'a fill row may only be marked applied'); END",
     "CREATE TRIGGER IF NOT EXISTS fills_no_delete BEFORE DELETE ON fills "
     "BEGIN SELECT RAISE(ABORT, 'fill rows are never deleted'); END",
+    "CREATE TABLE IF NOT EXISTS attention (id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT NOT NULL, kind TEXT NOT NULL, "
+    "time REAL NOT NULL, reason TEXT NOT NULL, closed_by TEXT, closed_note TEXT, closed_time REAL)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS attention_one_open ON attention (tag, kind) WHERE closed_time IS NULL",
+    "CREATE TRIGGER IF NOT EXISTS attention_only_close BEFORE UPDATE ON attention "
+    "WHEN NOT (OLD.closed_time IS NULL AND NEW.closed_time IS NOT NULL AND NEW.closed_by IS NOT NULL "
+    "AND NEW.closed_note IS NOT NULL AND NEW.id IS OLD.id AND NEW.tag IS OLD.tag AND NEW.kind IS OLD.kind "
+    "AND NEW.time IS OLD.time AND NEW.reason IS OLD.reason) "
+    "BEGIN SELECT RAISE(ABORT, 'an attention item may only be closed'); END",
+    "CREATE TRIGGER IF NOT EXISTS attention_no_delete BEFORE DELETE ON attention "
+    "BEGIN SELECT RAISE(ABORT, 'attention items are never deleted'); END",
 ]
 SQLITE_INT = (-(2 ** 63), 2 ** 63 - 1)
 
@@ -231,9 +247,13 @@ class OrderLedger:
             with self._write():
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
                 ours = self._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
+                anything = self._db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
                 if ours and version != LAYOUT_VERSION:
                     raise OrderError(f"the ledger file {path} was written by a different version of this module "
                                      f"(layout {version}, this module writes layout {LAYOUT_VERSION}); it is not opened")
+                if not ours and (anything or version != 0):   # only a new or empty database becomes a ledger
+                    raise OrderError(f"the file {path} is a database but not an order ledger (it has other tables or "
+                                     f"user_version {version}); it is not opened")
                 if not ours:
                     for statement in SCHEMA:
                         self._db.execute(statement)
@@ -323,6 +343,8 @@ class OrderLedger:
         return rec
 
     def order(self, tag: str) -> dict | None:
+        if isinstance(tag, str) and not _utf8(tag):
+            return None                                   # no tag on file can be one that UTF-8 cannot encode
         rows = self._read("SELECT * FROM orders WHERE tag = ?", (tag,))
         return self._record(rows[0]) if rows else None
 
@@ -338,6 +360,8 @@ class OrderLedger:
 
     def events(self, tag: str | None = None) -> list[dict]:
         sql, args = "SELECT tag, time, from_state, to_state, note FROM events", ()
+        if isinstance(tag, str) and not _utf8(tag):
+            return []
         if tag is not None:
             sql, args = sql + " WHERE tag = ?", (tag,)
         return [{"tag": r["tag"], "time": r["time"], "from": r["from_state"], "to": r["to_state"], "note": r["note"]}
@@ -346,6 +370,8 @@ class OrderLedger:
     def fills(self, tag: str | None = None) -> list[dict]:
         """Every fill row, oldest first; only the order's when `tag` is given."""
         sql, args = "SELECT * FROM fills", ()
+        if isinstance(tag, str) and not _utf8(tag):
+            return []
         if tag is not None:
             sql, args = sql + " WHERE tag = ?", (tag,)
         return [dict(r) for r in self._read(sql + " ORDER BY id", args)]
@@ -357,6 +383,10 @@ class OrderLedger:
     def mark_applied(self, ids: Iterable[int]) -> int:
         """Mark fill rows applied to the book. Returns how many changed. Only plain ints (not bools) in sqlite's
         integer range are ids; anything else, and an applied or unknown id, changes nothing and does not raise."""
+        try:
+            ids = list(ids)
+        except TypeError:
+            raise OrderError(f"mark_applied takes an iterable of fill ids, not {_safe_repr(ids)}") from None
         wanted = [i for i in ids if type(i) is int and SQLITE_INT[0] <= i <= SQLITE_INT[1]]
         if not wanted:
             return 0
@@ -373,6 +403,34 @@ class OrderLedger:
         if not rows:
             return None
         return {"time": rows[0]["time"], "clean": bool(rows[0]["clean"]), "summary": json.loads(rows[0]["summary"])}
+
+    def attention(self, open_only: bool = True) -> list[dict]:
+        """Items a person must look at (an order found at the venue after it was declared never arrived), oldest
+        first; only the open ones unless `open_only` is False. Every open item blocks further orders."""
+        sql = "SELECT * FROM attention" + (" WHERE closed_time IS NULL" if open_only else "") + " ORDER BY id"
+        return [dict(r) for r in self._read(sql)]
+
+    def close_attention(self, id: int, who: str, note: str) -> dict:
+        """Close an open attention item, saying who looked and what they found."""
+        if not isinstance(who, str) or not who.strip() or not isinstance(note, str) or not note.strip() \
+                or not _utf8(who) or not _utf8(note):
+            raise OrderError("closing an attention item needs who did it and a note saying what they found")
+        if type(id) is not int or not SQLITE_INT[0] <= id <= SQLITE_INT[1]:
+            raise OrderError(f"no attention item has id {_safe_repr(id)}")
+        with self._write():
+            rows = self._read("SELECT * FROM attention WHERE id = ?", (id,))
+            if not rows:
+                raise OrderError(f"no attention item has id {id}")
+            if rows[0]["closed_time"] is not None:
+                raise OrderError(f"attention item {id} is already closed")
+            self._db.execute("UPDATE attention SET closed_by = ?, closed_note = ?, closed_time = ? WHERE id = ?",
+                             (who.strip(), note.strip(), self.clock(), id))
+        return dict(self._read("SELECT * FROM attention WHERE id = ?", (id,))[0])
+
+    def _flag(self, tag: str, kind: str, reason: str) -> None:
+        """Open an attention item (inside the caller's write transaction); one open item per tag and kind."""
+        self._db.execute("INSERT OR IGNORE INTO attention (tag, kind, time, reason) VALUES (?,?,?,?)",
+                         (tag, kind, self.clock(), reason))
 
     def close(self) -> None:
         try:
@@ -408,8 +466,8 @@ class OrderLedger:
             raise OrderError(f"an order needs a tag that is text encodable as UTF-8, not {_safe_repr(tag)}")
         if not isinstance(symbol, str) or not symbol or not _utf8(symbol):
             raise OrderError(f"an order needs a symbol that is text encodable as UTF-8, not {_safe_repr(symbol)}")
-        if isinstance(batch, str) and not _utf8(batch):
-            raise OrderError(f"the batch must be text encodable as UTF-8, not {_safe_repr(batch)}")
+        if batch is not None and (not isinstance(batch, str) or not _utf8(batch)):
+            raise OrderError(f"the batch must be None or text encodable as UTF-8, not {_safe_repr(batch)}")
         if not _finite(units) or abs(units) < MIN_UNITS:
             raise OrderError(f"units must be a finite number at least {MIN_UNITS} in size, not {_safe_repr(units)}")
         if not _finite(reference_price) or reference_price <= 0:
@@ -447,7 +505,8 @@ class OrderLedger:
 
         The only way a person changes an order's state. The order becomes `never_arrived`, so the recheck in
         `reconcile` still catches it if it turns up at the venue after all."""
-        if not isinstance(who, str) or not who.strip() or not isinstance(note, str) or not note.strip():
+        if not isinstance(who, str) or not who.strip() or not isinstance(note, str) or not note.strip() \
+                or not _utf8(who) or not _utf8(note):
             raise OrderError("settling an order by hand needs who did it and a note saying what they saw")
         with self._write():
             rec = self.order(tag)
@@ -468,6 +527,9 @@ class OrderLedger:
         waiting = self._read("SELECT COUNT(*) FROM fills WHERE applied = 0")[0][0]
         if waiting:
             reasons.append(f"{waiting} fill{'' if waiting == 1 else 's'} not yet applied to the book")
+        for item in self.attention():
+            reasons.append(f"attention item {item['id']} for order {item['tag']} is open: {item['reason']} "
+                           "(close it with close_attention once a person has looked)")
         last = self.last_reconcile()
         if last is None:
             reasons.append("no reconcile recorded yet")
@@ -493,7 +555,10 @@ class OrderLedger:
         The check of `blocked(max_age_seconds)` and the change `intended -> sent` are one write transaction: the
         caller that makes the change is the only one that calls the venue. Another caller gets OrdersBlocked while
         that order is in flight, or the record once it is settled; neither calls the venue."""
-        name = str(getattr(venue, "name", "") or "")
+        try:
+            name = _storable(getattr(venue, "name", "") or "")
+        except Exception:
+            name = "?"
         with self._write():
             reasons = self.blocked(max_age_seconds)
             if reasons:
@@ -517,15 +582,18 @@ class OrderLedger:
         try:
             accepted = isinstance(result, dict) and result.get("status") == "accepted"
             vid = result.get("venue_order_id") if accepted else None
-            vid = str(vid) if vid is not None else None
+            vid = _storable(vid) if vid is not None else None
         except Exception:
             vid = None
         with self._write():
             if accepted and not self._cas(tag, "sent", "accepted", None, venue_order_id=vid):
                 now_state = self.order(tag)["state"]
                 if now_state in ("unknown", "never_arrived"):
-                    self._cas(tag, now_state, "accepted", f"the venue's acceptance arrived late, after the order was "
-                              f"marked {now_state}", venue_order_id=vid)
+                    late = self._cas(tag, now_state, "accepted", f"the venue's acceptance arrived late, after the order "
+                                     f"was marked {now_state}", venue_order_id=vid)
+                    if late and now_state == "never_arrived":
+                        self._flag(tag, "late_acceptance", "the venue's acceptance arrived late, after the order had "
+                                   "been declared never arrived; check that no replacement was sent")
             elif not accepted:
                 note = f"the venue did not say accepted: {_safe_repr(result)}"
                 self._cas(tag, "sent", "unknown", note, note=note)
@@ -548,7 +616,9 @@ class OrderLedger:
         `settle_seconds` must be longer than the longest time a submit call can take: an order still absent at the
         venue that long after it was sent is declared never arrived. Never raises because of one order, one venue
         call or anything the venue returns; the reconcile is always recorded, and lists a fill or an update only
-        when the write behind it was committed (an order whose write failed is unresolved)."""
+        when the write behind it was committed (an order whose write failed is unresolved). An order the venue
+        reported cancelled or rejected with nothing filled is not asked again; if the venue later contradicts
+        that, only the position comparison shows it."""
         now = self.clock()
         out = {"clean": False, "orders_checked": 0, "updated": [], "fills": [], "unresolved": [], "anomalies": [],
                "position_differences": {}, "positions_error": None, "recheck_errors": [], "time": now}
@@ -607,7 +677,10 @@ class OrderLedger:
             else:
                 out["unresolved"].append({"tag": tag, "reason": f"status could not be read: {_describe(exc)}"})
             return
-        self._apply(tag, status, recheck, now, settle_seconds, out)
+        try:
+            self._apply(tag, status, recheck, now, settle_seconds, out)
+        except Exception as exc:                          # nothing a venue returns may stop the loop
+            out["unresolved"].append({"tag": tag, "reason": f"the venue's answer could not be used: {_describe(exc)}"})
 
     def _apply(self, tag: str, status, recheck: bool, now: float, settle_seconds: float, out: dict) -> None:
         """Use one venue answer. What to do is decided from the order as re-read inside the write transaction, so an
@@ -617,11 +690,21 @@ class OrderLedger:
                 {"tag": tag, "reason": f"the venue's status is not a dict: {_safe_repr(status)}"})
             return
         if status is not None:
-            bad = [k for k in ("filled_units", "avg_price", "fee") if status.get(k) is not None and not _finite(status.get(k))]
-            if bad:
-                out["anomalies"].append({"tag": tag, "reason": "not a finite number: " + ", ".join(
-                    f"{k}={_safe_repr(status.get(k))}" for k in bad)})
+            try:                                          # a plain copy: an odd mapping cannot raise later
+                status = {k: status.get(k) for k in STATUS_KEYS}
+            except Exception as exc:
+                out["unresolved"].append({"tag": tag, "reason": f"the venue's status could not be read: {_describe(exc)}"})
                 return
+            if status["filled_units"] is not None and not _finite(status["filled_units"]):
+                out["anomalies"].append({"tag": tag, "reason": "the venue's filled_units is not a finite number: "
+                                         f"{_safe_repr(status['filled_units'])}"})
+                return
+            status["bad"] = [k for k in ("avg_price", "fee") if status[k] is not None and not _finite(status[k])]
+            for k in status["bad"]:                       # that piece only: ignored, the units are still taken
+                status[k] = None
+            for k in ("venue_order_id", "raw_status"):
+                if status[k] is not None:
+                    status[k] = _storable(status[k])
         local: dict[str, list] = {k: [] for k in ("fills", "updated", "unresolved", "anomalies", "recheck_errors")}
         try:
             with self._write():
@@ -636,8 +719,10 @@ class OrderLedger:
                         self._apply_status(rec, status, now, local, "open")
                 elif state == "never_arrived":
                     if status is not None:                # proof the order exists wins over never_arrived
-                        local["anomalies"].append({"tag": tag, "reason": "declared never arrived, but the venue has an "
-                                                   f"order with this tag ({_safe_repr(status.get('state'))})"})
+                        reason = (f"declared never arrived, but the venue has an order with this tag "
+                                  f"({_safe_repr(status.get('state'))})")
+                        local["anomalies"].append({"tag": tag, "reason": reason})
+                        self._flag(tag, "turned_up", reason + "; check that no replacement was sent")
                         self._apply_status(rec, status, now, local, "turned_up")
                 elif state in FINISHED:
                     if status is None:
@@ -676,6 +761,8 @@ class OrderLedger:
         def anomaly(reason: str) -> None:
             out["anomalies"].append({"tag": tag, "reason": reason})
 
+        for k in status.get("bad", ()):
+            anomaly(f"the venue's {k} is not a finite number; it is ignored")
         if vstate not in VENUE_STATES:
             where = out["recheck_errors"] if mode == "finished" else out["unresolved"]
             where.append({"tag": tag, "reason": f"the venue's state is {vstate!r} (raw {_safe_repr(status.get('raw_status'))})"})
@@ -693,11 +780,12 @@ class OrderLedger:
             return anomaly(f"the venue reports {filled} filled, more than the order's {size}")
         new = VENUE_STATES[vstate]
         if mode == "finished":
-            if new != state:
+            if said and filled > old + tol:               # taken whatever state it carries, and a person should look
+                anomaly(f"the order is {state} with {old} filled, but the venue now says {vstate} with {filled} filled")
+                new = state
+            elif new != state:
                 return anomaly(f"the order is {state} with {old} filled, but the venue now says {vstate} with "
                                f"{filled if said else 'no amount'}")
-            if said and filled > old + tol:               # taken, and a person should look
-                anomaly(f"the order is {state} with {old} filled, but the venue now says {filled} filled")
         else:
             if vstate == "filled" and filled < size - tol:    # filled is only believed when the whole size is accounted for
                 new = state

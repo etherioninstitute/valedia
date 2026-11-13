@@ -880,7 +880,7 @@ def test_a_non_numeric_average_on_one_order_does_not_lose_the_others_fills():
         intend(led, tag=t)
         led.submit_once(venue, t)
     venue.set("a", state="partly_filled", filled_units=2.0, avg_price=90.0, fee=0.1)
-    venue.set("b", state="partly_filled", filled_units=3.0, avg_price="ninety", fee=0.1)
+    venue.set("b", state="partly_filled", filled_units="three", avg_price=90.5, fee=0.1)   # rev 6: an amount, not an average
     venue.set("c", state="partly_filled", filled_units=5.0, avg_price=91.0, fee=0.2)
     clock.t += 5
     result = led.reconcile(venue, {})
@@ -891,9 +891,9 @@ def test_a_non_numeric_average_on_one_order_does_not_lose_the_others_fills():
     assert [f["tag"] for f in led.unapplied_fills()] == ["a", "c"]
 
 
-@pytest.mark.parametrize("field, value", [("avg_price", float("nan")), ("fee", float("inf")), ("filled_units", "4"),
-                                          ("fee", "x"), ("filled_units", float("nan"))])
-def test_a_present_but_non_finite_number_is_an_anomaly_and_changes_nothing(field, value):
+@pytest.mark.parametrize("field, value", [("filled_units", "4"), ("filled_units", float("nan")),
+                                          ("filled_units", float("inf"))])
+def test_a_present_but_non_finite_amount_is_an_anomaly_and_changes_nothing(field, value):
     led, venue, _ = _accepted()
     venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
     venue.set("s1-XLE-2026-11-12", **{field: value})
@@ -1300,7 +1300,7 @@ def test_a_finished_order_with_nothing_filled_is_not_asked_again():
     assert venue.status_calls == []
 
 
-@pytest.mark.parametrize("change", [{"filled_units": 3.0}, {"state": "filled", "filled_units": 10.0}, {"state": "expired"}])
+@pytest.mark.parametrize("change", [{"filled_units": 3.0}, {"state": "filled", "filled_units": 4.0}, {"state": "expired"}])
 def test_a_smaller_amount_or_a_changed_state_on_a_finished_order_is_an_anomaly(change):
     led, venue, _ = _accepted()
     venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
@@ -1657,3 +1657,231 @@ def test_a_wedged_rollback_on_a_memory_ledger_says_it_must_be_discarded():
     with pytest.raises(OrderError, match="discarded"):
         with led._write():
             raise sqlite3.OperationalError("disk I/O error")
+
+
+# ---- rev 6: attention items, bad pieces beside a rise, text from the venue, odd status objects, input checks
+
+
+def _turned_up(tmp_path, clock):
+    """An order declared never arrived that then turns up at the venue, filled; its fill applied to the book."""
+    led, venue = _crash_and_reopen(tmp_path, "crash_before", clock)
+    clock.t += 121
+    led.reconcile(venue, {})
+    venue._take("XLE", 10.0, TAG)
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.5)
+    venue.held = {"XLE": 10.0}
+    clock.t += 60
+    found = led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in found["fills"]])
+    return led, venue, found
+
+
+def test_a_turned_up_order_keeps_orders_blocked_until_a_person_closes_the_attention_item(tmp_path):
+    clock = Clock()
+    led, venue, found = _turned_up(tmp_path, clock)
+    assert not found["clean"] and led.order(TAG)["state"] == "filled"
+    (item,) = led.attention()
+    assert item["tag"] == TAG and item["closed_time"] is None and "never arrived" in item["reason"]
+    for _ in range(3):
+        clock.t += 60
+        assert led.reconcile(venue, {"XLE": 10.0})["clean"]
+        reasons = led.blocked()
+        assert len(reasons) == 1 and TAG in reasons[0] and "never arrived" in reasons[0]
+    with pytest.raises(OrderError):
+        led.close_attention(item["id"], "", "looked")
+    with pytest.raises(OrderError):
+        led.close_attention(item["id"], "Burton", " ")
+    with pytest.raises(OrderError):
+        led.close_attention(item["id"] + 100, "Burton", "no such item")
+    closed = led.close_attention(item["id"], "Burton", "no replacement was sent; the 10 units are wanted")
+    assert closed["closed_by"] == "Burton" and closed["closed_time"] == clock.t and "replacement" in closed["closed_note"]
+    assert led.blocked() == [] and led.attention() == [] and led.attention(open_only=False) == [closed]
+    with pytest.raises(OrderError):
+        led.close_attention(item["id"], "Burton", "again")
+
+
+def test_a_late_acceptance_over_never_arrived_opens_one_attention_item(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(on_submit=lambda tag: b.settle_by_hand(tag, "Burton", "not in the app yet"))
+    ready(a, venue)
+    intend(a)
+    assert a.submit_once(venue, TAG)["state"] == "accepted"
+    (item,) = a.attention()
+    assert item["tag"] == TAG and "late" in item["reason"]
+    assert any(TAG in r and "late" in r for r in a.blocked())
+
+
+def test_a_late_acceptance_over_unknown_opens_no_attention_item(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a = ledger(path, clock)
+
+    def mark_unknown(tag):
+        raw = sqlite3.connect(str(path))
+        raw.execute("UPDATE orders SET state = 'unknown' WHERE tag = ?", (tag,))
+        raw.commit()
+        raw.close()
+
+    venue = FakeVenue(on_submit=mark_unknown)
+    ready(a, venue)
+    intend(a)
+    assert a.submit_once(venue, TAG)["state"] == "accepted" and a.attention() == []
+
+
+def test_two_reconciles_racing_over_a_turned_up_order_open_one_attention_item(tmp_path):
+    clock = Clock()
+    path = tmp_path / "orders.sqlite"
+    a, venue = _crash_and_reopen(tmp_path, "crash_before", clock)
+    clock.t += 121
+    a.reconcile(venue, {})
+    b = ledger(path, clock)
+    racing = RacingVenue()
+    racing.book = venue.book
+    racing._take("XLE", 10.0, TAG)
+    racing.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    racing.other = b
+    a.reconcile(racing, {})
+    assert len(a.attention()) == 1 and len(a.fills()) == 1
+    a.reconcile(racing, {})                                            # found again while the item is open: still one
+    assert len(a.attention(open_only=False)) == 1
+
+
+def test_attention_rows_are_never_deleted_and_only_closed(tmp_path):
+    clock = Clock()
+    led, venue, _ = _turned_up(tmp_path, clock)
+    raw = sqlite3.connect(str(tmp_path / "orders.sqlite"))
+    for sql in ("DELETE FROM attention", "UPDATE attention SET reason = 'edited'",
+                "UPDATE attention SET closed_time = 1"):
+        with pytest.raises(sqlite3.DatabaseError):
+            raw.execute(sql)
+    raw.rollback()
+    raw.close()
+    (item,) = led.attention()
+    led.close_attention(item["id"], "Burton", "checked")
+    raw = sqlite3.connect(str(tmp_path / "orders.sqlite"))
+    with pytest.raises(sqlite3.DatabaseError):
+        raw.execute("UPDATE attention SET closed_time = NULL, closed_by = NULL, closed_note = NULL")
+    raw.close()
+
+
+@pytest.mark.parametrize("field, value", [("avg_price", float("nan")), ("avg_price", float("inf")), ("avg_price", "x"),
+                                          ("fee", float("nan")), ("fee", float("-inf")), ("fee", "x")])
+def test_a_bad_average_or_fee_beside_a_rise_in_units_drops_only_that_piece(field, value):
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
+    led.reconcile(venue, {})
+    before = led.order(TAG)
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.6)
+    venue.set(TAG, **{field: value})
+    result = led.reconcile(venue, {})
+    assert [x["tag"] for x in result["anomalies"]] == [TAG] and not result["clean"]
+    (row,) = result["fills"]
+    rec = led.order(TAG)
+    assert row["units"] == 2.0 and rec["filled_units"] == 6.0
+    if field == "avg_price":
+        assert row["price"] is None and row["price_covers_units"] is None and row["fee"] == pytest.approx(0.2)
+        assert (rec["priced_units"], rec["priced_avg"]) == (before["priced_units"], before["priced_avg"])
+    else:
+        assert row["fee"] is None and row["price"] == 90.0 and rec["fee"] == before["fee"]
+
+
+def test_text_from_the_venue_that_is_not_utf8_is_made_storable():
+    class Venue(FakeVenue):
+        def submit(self, symbol, units, tag, price=None, limit_price=None):
+            self.calls.append(tag)
+            if tag == "a":
+                raise ValueError("bad \ud800 text")
+            self._take(symbol, units, tag)
+            return {"status": "accepted", "venue_order_id": "V\udfff1"}
+
+    led, venue = ledger(), Venue()
+    venue.name = "fake\ud800"
+    ready(led, venue)
+    intend(led, tag="a")
+    intend(led, tag="b")
+    rec = led.submit_once(venue, "a")
+    assert rec["state"] == "unknown" and rec["note"].startswith("ValueError: bad ")
+    led.settle_by_hand("a", "Burton", "not in the app")
+    rec = led.submit_once(venue, "b")
+    assert rec["state"] == "accepted" and rec["venue_order_id"].startswith("V")
+    venue.set("b", state="partly_filled", filled_units=1.0, avg_price=90.0, fee=0.0, raw_status="PART\udc00")
+    led.reconcile(venue, {})
+    assert led.order("b")["raw_status"].startswith("PART") and led.order("b")["filled_units"] == 1.0
+
+
+def test_a_reading_method_given_a_tag_that_is_not_utf8_behaves_as_for_an_unknown_tag():
+    led = ledger()
+    intend(led)
+    bad = "s1\ud800"
+    assert led.order(bad) is None and led.events(bad) == [] and led.fills(bad) == []
+    with pytest.raises(OrderError, match="no order"):
+        led.settle_by_hand(bad, "Burton", "x")
+
+
+class RaisingGet(dict):
+    def get(self, *a, **k):
+        raise RuntimeError("this status cannot be read")
+
+
+def test_a_status_whose_get_raises_makes_only_that_order_unresolved():
+    class Venue(FakeVenue):
+        def order_status(self, tag):
+            got = super().order_status(tag)
+            return RaisingGet(got) if tag == "b" else got
+
+    clock = Clock()
+    led, venue = ledger(clock=clock), Venue()
+    ready(led, venue)
+    for t in ("a", "b", "c"):
+        intend(led, tag=t)
+        led.submit_once(venue, t)
+        venue.set(t, state="partly_filled", filled_units=2.0, avg_price=90.0, fee=0.0)
+    clock.t += 5
+    result = led.reconcile(venue, {})
+    assert [f["tag"] for f in result["fills"]] == ["a", "c"] and [u["tag"] for u in result["unresolved"]] == ["b"]
+    assert not any(a["tag"] is None for a in result["anomalies"]) and led.last_reconcile()["time"] == clock.t
+
+
+def test_a_finished_order_reported_with_another_state_and_a_larger_amount_takes_the_units():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=3.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled")
+    led.reconcile(venue, {})
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=91.0, fee=0.0)
+    result = led.reconcile(venue, {})
+    (row,) = result["fills"]
+    assert row["units"] == 7.0 and [a["tag"] for a in result["anomalies"]] == [TAG]
+    assert led.order(TAG)["state"] == "cancelled" and led.order(TAG)["filled_units"] == 10.0
+
+
+def test_a_sqlite_file_that_is_not_empty_and_not_a_ledger_is_refused(tmp_path):
+    other = tmp_path / "other.sqlite"
+    raw = sqlite3.connect(str(other))
+    raw.execute("CREATE TABLE notes (x TEXT)")
+    raw.commit()
+    raw.close()
+    with pytest.raises(OrderError, match="not an order ledger"):
+        ledger(other)
+    versioned = tmp_path / "versioned.sqlite"
+    raw = sqlite3.connect(str(versioned))
+    raw.execute("PRAGMA user_version = 5")
+    raw.close()
+    with pytest.raises(OrderError, match="not an order ledger"):
+        ledger(versioned)
+    empty = tmp_path / "empty.sqlite"
+    sqlite3.connect(str(empty)).close()
+    intend(ledger(empty))
+
+
+def test_intend_refuses_a_batch_that_is_not_a_string():
+    led = ledger()
+    with pytest.raises(OrderError, match="batch"):
+        intend(led, batch=5)
+    assert led.orders() == [] and intend(led, batch="b1")["batch"] == "b1"
+
+
+@pytest.mark.parametrize("ids", [5, None, 1.5])
+def test_mark_applied_refuses_an_argument_that_is_not_an_iterable_of_ids(ids):
+    with pytest.raises(OrderError):
+        ledger().mark_applied(ids)
