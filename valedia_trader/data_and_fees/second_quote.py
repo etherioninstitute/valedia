@@ -30,23 +30,44 @@ anything else is None and the rest of the answer stays. The symbol in the answer
 No result at all (None) unless a usable last price, or a usable bid and ask, remains. `cboe_quote` never raises on an
 answer, however hostile; it raises ValueError only for a symbol that fails the symbol rule, before any request.
 
-Decisions the brief left open:
-- "The same New York trading day": the New York calendar date of `last_trade_time` must equal the New York date of
-  `fetched_at`, and the trade must not be more than 5 minutes after `fetched_at` (a quote from the future is not
-  trusted). On a weekend or a holiday that means "no second quote": it is the safe side, the order step does not trade
-  then.
+Freshness (rev 2): a quote hours old must not approve a price now, so `compare` takes the caller's clock `now` (an aware
+datetime; `compare` never reads a clock) and says "no second quote" unless ALL of these hold:
+  (a) `last_trade_time`, read as New York time, is at most `max_age_seconds` (default 1800) before `now` and at most 300
+      seconds after it;
+  (b) the quote was fetched at most 120 seconds before `now` and not after it;
+  (c) the answer's own snapshot `timestamp` (read as UTC, returned as `snapshot_at`) is within 120 seconds of the fetch
+      time, either side; a missing or unreadable snapshot time fails.
+Around a daylight-saving change a New York wall-clock time can mean two instants (the repeated hour in November) or none
+(the missing hour in March). Every instant it could mean must satisfy (a), so such a time is accepted only when it is
+recent under every reading (with the default 30 minutes that means it is refused).
+The quote's symbol must equal the `symbol` given to `compare`.
+
+Time limit (rev 2): one try, redirects included, has ONE deadline of 10 seconds, enforced three ways: a check before every
+read and between redirects on the injected clock (`urllib_fetch(..., clock=)`), a socket timeout of whatever is left of it
+on each request, and a watchdog thread that shuts the sockets of the request at the deadline whatever the server is doing
+(a trickling body or trickling headers). Redirects are followed by this module itself, never by urllib, and a redirect's
+own body is never read. `cboe_quote` also counts a try that took more than 10 seconds on its own clock as failed.
+
+Strict JSON (rev 2): an answer with a repeated key at any level is unusable. A band that its own last trade contradicts
+(bid and ask usable, last price outside them by more than the tolerance) is not a band: "no second quote".
+
+Other decisions:
 - A bid above the ask is not a band; the last price is used if there is one, otherwise there is no second quote.
 - `compare`: an unusable first price is "disagree" (never "agree"), and a second quote that is not usable is reported
-  first as "no second quote". A tolerance that is not a number from 0 to 1 raises ValueError (a programming error).
+  first as "no second quote". A tolerance that is not a number from 0 to 1, an age limit that is not a positive number, or
+  a `now` that is not an aware datetime raises ValueError (a programming error).
 - The comparison is exact: each float is read as the decimal it prints as, so "exactly on the band" means exactly.
 """
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import re
+import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -65,15 +86,21 @@ SOURCE = "cboe-delayed"
 MAX_TRIES = 2
 RETRY_WAIT_SECONDS = 2.0
 TIMEOUT_SECONDS = 5.0
+DEADLINE_SECONDS = 10.0                 # one try, redirects included
+MAX_FETCH_AGE_SECONDS = 120             # the quote was fetched at most this long before `now`
+MAX_SNAPSHOT_SKEW_SECONDS = 120         # the answer's snapshot time is this close to the fetch time
+DEFAULT_MAX_AGE_SECONDS = 1800          # the last trade is at most this old
 MAX_BODY_BYTES = 65536                  # real answers are about 520 bytes
 MAX_REDIRECTS = 2
 MAX_PRICE = 1e7
 MAX_SYMBOLS = 10
-FUTURE_SLACK_SECONDS = 300
+FUTURE_SLACK_SECONDS = 300              # a trade this far ahead of `now` is clock skew, more is not trusted
+REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 NEW_YORK = ZoneInfo("America/New_York")
 
 _SYMBOL = re.compile(r"[A-Z]{1,6}(?:[.-][A-Z])?")
 _TRADE_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")
+_SNAPSHOT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
 def valid_symbol(symbol: Any) -> bool:
@@ -95,28 +122,114 @@ def _allowed_url(url: Any) -> bool:
         return False
 
 
-class _Redirects(urllib.request.HTTPRedirectHandler):
-    """Follows a redirect only to https on one of the two Cboe hosts, and at most MAX_REDIRECTS of them."""
-    max_redirections = MAX_REDIRECTS
-
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Stops urllib following redirects: `urllib_fetch` follows them itself, under its deadline, to the two hosts only."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _allowed_url(newurl):
-            return None                                                  # urllib then raises the redirect as an HTTPError
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return None
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None                                                      # the redirect then surfaces as an HTTPError
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def _shut(sock) -> None:
+    for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+        try:
+            action()
+        except Exception:
+            pass
+
+
+class _Budget:
+    """One deadline for a whole request: `check()` raises TimeoutError once `seconds` have passed on `clock` (or the
+    watchdog has fired); a timer thread shuts every registered socket at the deadline in real time, whatever the server
+    is doing. Call `cancel()` when the request is over."""
+    def __init__(self, clock: Callable[[], float], seconds: float):
+        self.clock, self.end = clock, clock() + seconds
+        self.fired = threading.Event()
+        self._socks: list = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def remaining(self) -> float:
+        return self.end - self.clock()
+
+    def check(self) -> None:
+        if self.fired.is_set() or self.remaining() <= 0:
+            raise TimeoutError("the request passed its %g-second deadline" % DEADLINE_SECONDS)
+
+    def register(self, sock) -> None:
+        with self._lock:
+            if not self.fired.is_set():
+                self._socks.append(sock)
+                return
+        _shut(sock)                                                      # registered after the deadline: closed at once
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired.set()
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            _shut(sock)
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
+class _Conn(http.client.HTTPSConnection):
+    """An HTTPS connection whose sockets (the raw one and the TLS one) are registered with the request's budget."""
+    _budget: _Budget | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        create = self._create_connection
+
+        def create_registered(*a, **k):
+            sock = create(*a, **k)
+            if self._budget is not None:
+                self._budget.register(sock)
+            return sock
+        self._create_connection = create_registered
+
+    def connect(self):
+        super().connect()
+        if self._budget is not None:
+            self._budget.register(self.sock)
+
+
+class _BudgetHTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        budget = getattr(req, "_budget", None)
+
+        def connection(host, **kwargs):
+            conn = _Conn(host, **kwargs)
+            conn._budget = budget
+            return conn
+        return self.do_open(connection, req, context=self._context)
 
 
 def _build_opener(https_handler=None) -> urllib.request.OpenerDirector:
-    """An opener with no proxy from the environment and the redirect rule above."""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _Redirects(),
-                                       https_handler if https_handler is not None else urllib.request.HTTPSHandler())
+    """An opener with no proxy from the environment, no automatic redirects, and (by default) the budgeted HTTPS handler."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects(),
+                                       https_handler if https_handler is not None else _BudgetHTTPS())
 
 
-def _read_capped(f, limit: int) -> bytes:
-    """Read the whole of `f` if it is at most `limit` bytes, never more than `limit + 1` bytes of it; ValueError if longer."""
+def _read_capped(f, limit: int, budget: _Budget | None = None) -> bytes:
+    """Read the whole of `f` if it is at most `limit` bytes, never more than `limit + 1` bytes of it; ValueError if
+    longer. With a budget, its deadline is checked before every read (a read gives what has arrived, `read1`, so a body
+    that trickles is looked at again and again) and once more at the end."""
+    reader = getattr(f, "read1", None) or f.read
     chunks, total = [], 0
     while True:
-        chunk = f.read(min(65536, limit + 1 - total))
+        if budget is not None:
+            budget.check()
+        chunk = reader(min(8192, limit + 1 - total))
         if not chunk:
+            if budget is not None:
+                budget.check()
             return b"".join(chunks)
         chunks.append(chunk)
         total += len(chunk)
@@ -124,21 +237,59 @@ def _read_capped(f, limit: int) -> bytes:
             raise ValueError("the answer is longer than %d bytes" % limit)
 
 
-def urllib_fetch(url: str, timeout: float, opener: urllib.request.OpenerDirector | None = None) -> bytes:
-    """GET `url` (https, a Cboe host) and return the body, at most MAX_BODY_BYTES. Anything else raises."""
+def urllib_fetch(url: str, timeout: float, opener: urllib.request.OpenerDirector | None = None,
+                 clock: Callable[[], float] = time.monotonic, deadline: float = DEADLINE_SECONDS) -> bytes:
+    """GET `url` (https, a Cboe host) and return the body, at most MAX_BODY_BYTES, within one `deadline` for the whole
+    request, redirects included (TimeoutError when it passes). Redirects are followed here, at most MAX_REDIRECTS and only
+    to https on the two Cboe hosts; a redirect's body is never read. Anything else raises."""
     if not _allowed_url(url):
         raise ValueError("not a Cboe https URL")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, method="GET")
-    with (opener or _build_opener()).open(req, timeout=timeout) as resp:
-        status = getattr(resp, "status", None) or resp.getcode()
-        if status != 200:
-            raise urllib.error.HTTPError(url, status, "not 200", None, None)
-        if not _allowed_url(resp.geturl()):
-            raise ValueError("answered from another place")
-        return _read_capped(resp, MAX_BODY_BYTES)
+    opener = opener or _build_opener()
+    budget = _Budget(clock, deadline)
+    try:
+        current = url
+        for hop in range(MAX_REDIRECTS + 1):
+            budget.check()
+            req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, method="GET")
+            req._budget = budget
+            try:
+                with opener.open(req, timeout=min(float(timeout), budget.remaining())) as resp:
+                    status = getattr(resp, "status", None) or resp.getcode()
+                    if status != 200:
+                        raise urllib.error.HTTPError(current, status, "not 200", None, None)
+                    if not _allowed_url(resp.geturl()):
+                        raise ValueError("answered from another place")
+                    return _read_capped(resp, MAX_BODY_BYTES, budget)
+            except urllib.error.HTTPError as e:
+                location = e.headers.get("Location") if e.headers is not None else None
+                if e.code not in REDIRECT_CODES or hop == MAX_REDIRECTS or not location:
+                    raise
+                target = urllib.parse.urljoin(current, location)
+                if not _allowed_url(target):
+                    raise
+                e.close()                                                # its body is not read
+                current = target
+        raise AssertionError("unreachable")                              # the loop returns or raises
+    except Exception:
+        if budget.fired.is_set():
+            raise TimeoutError("the request passed its deadline") from None
+        raise
+    finally:
+        budget.cancel()
 
 
 # ---- the reader
+
+def _epoch(x: Any) -> float | None:
+    """x as seconds if it is a finite int or float (not a boolean), else None."""
+    if type(x) not in (int, float):
+        return None
+    try:
+        f = float(x)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
 
 def _number(x: Any) -> float | None:
     """x as a float if it is a JSON number (not a boolean), finite, above 0 and at most MAX_PRICE; else None."""
@@ -151,11 +302,31 @@ def _number(x: Any) -> float | None:
     return f if math.isfinite(f) and 0 < f <= MAX_PRICE else None
 
 
+def _no_repeated_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("a repeated key")
+        out[key] = value
+    return out
+
+
+def _snapshot(text: Any) -> float | None:
+    """The answer's `timestamp` ("YYYY-MM-DD HH:MM:SS", UTC) in seconds, or None."""
+    if type(text) is not str or _SNAPSHOT.fullmatch(text) is None:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def _parse(raw: Any, symbol: str, fetched_at: float) -> dict | None:
     if type(raw) is not bytes or len(raw) > MAX_BODY_BYTES:
         return None
     try:
-        doc = json.loads(raw.decode("utf-8"))             # NaN and Infinity parse, and `_number` then refuses them
+        # NaN and Infinity parse, and `_number` then refuses them; a repeated key anywhere makes the answer unusable
+        doc = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_repeated_keys)
         if type(doc) is not dict or type(doc.get("data")) is not dict:
             return None
         data = doc["data"]
@@ -168,39 +339,40 @@ def _parse(raw: Any, symbol: str, fetched_at: float) -> dict | None:
         if type(when) is not str or _TRADE_TIME.fullmatch(when) is None or _trade_time(when) is None:
             when = None
         return {"symbol": symbol, "bid": bid, "ask": ask, "last": last, "last_trade_time": when,
-                "fetched_at": fetched_at, "source": SOURCE}
+                "snapshot_at": _snapshot(doc.get("timestamp")), "fetched_at": fetched_at, "source": SOURCE}
     except Exception:                                                    # bad JSON, bad UTF-8, too deep, anything
         return None
 
 
 def cboe_quote(symbol: str, fetch: Callable[[str, float], Any] = urllib_fetch, clock: Callable[[], float] = time.time,
                sleep: Callable[[float], Any] = time.sleep) -> dict | None:
-    """The delayed quote of `symbol` from Cboe as {symbol, bid, ask, last, last_trade_time, fetched_at, source}, or None.
+    """The delayed quote of `symbol` from Cboe as {symbol, bid, ask, last, last_trade_time, snapshot_at, fetched_at,
+    source}, or None. `snapshot_at` is the answer's own `timestamp` as UTC seconds (None if missing or unreadable).
 
     One GET of BASE_URL; at most MAX_TRIES tries, RETRY_WAIT_SECONDS apart, TIMEOUT_SECONDS each, retried only when
-    the fetch itself fails. An answer that is read but unusable is None at once. ValueError (before any request)
+    the fetch itself fails or takes more than DEADLINE_SECONDS on `clock`. An answer that is read but unusable is None at once. ValueError (before any request)
     only for a symbol that fails `valid_symbol`."""
     if not valid_symbol(symbol):
         raise ValueError("not a symbol this module asks for: %r" % (symbol,))
     url = BASE_URL % symbol
-    raw = None
+    raw, fetched_at = None, None
     for attempt in range(MAX_TRIES):
         try:
+            started = _epoch(clock())
             raw = fetch(url, TIMEOUT_SECONDS)
+            fetched_at = _epoch(clock())
+            if started is None or fetched_at is None:
+                raise ValueError("the clock gave no time")
+            if fetched_at - started > DEADLINE_SECONDS:
+                raise TimeoutError("the try took longer than its deadline")
             break
         except Exception:
             raw = None
             if attempt + 1 < MAX_TRIES:
                 sleep(RETRY_WAIT_SECONDS)
-    if raw is None:
+    if raw is None or fetched_at is None:
         return None
-    try:
-        fetched_at = clock()
-    except Exception:
-        return None
-    if type(fetched_at) not in (int, float) or not math.isfinite(fetched_at):
-        return None
-    return _parse(raw, symbol, float(fetched_at))
+    return _parse(raw, symbol, fetched_at)
 
 
 # ---- the comparison
@@ -217,53 +389,88 @@ def _trade_time(text: str) -> datetime | None:
         return None
 
 
-def _is_todays_trade(text: Any, fetched_at: Any) -> bool:
-    """The trade time (New York wall clock) is on the New York day of `fetched_at` and not after it by over 5 minutes."""
+def _trade_instants(text: Any) -> tuple[float, ...] | None:
+    """Every instant (seconds) a New York wall-clock trade time can mean: one for an ordinary time, two for the repeated
+    hour of the November change and for the missing hour of the March one. None if the text is not a readable time."""
     if type(text) is not str or _TRADE_TIME.fullmatch(text) is None:
-        return False
-    if type(fetched_at) not in (int, float) or not math.isfinite(fetched_at):
-        return False
-    trade = _trade_time(text)
-    if trade is None:
-        return False
+        return None
+    wall = _trade_time(text)
+    if wall is None:
+        return None
     try:
-        today = datetime.fromtimestamp(fetched_at, NEW_YORK).date()
-        return trade.date() == today and trade.timestamp() <= fetched_at + FUTURE_SLACK_SECONDS
+        return tuple(wall.replace(fold=fold).timestamp() for fold in (0, 1))
     except (OverflowError, OSError, ValueError):
-        return False
+        return None
+
+
+def _why_not_fresh(second: dict, now: float, max_age: float) -> str | None:
+    """None if the quote is fresh by all three rules (see the module docstring), else the reason it is not."""
+    fetched, snapshot = _epoch(second.get("fetched_at")), _epoch(second.get("snapshot_at"))
+    if fetched is None:
+        return "no fetch time"
+    if not 0 <= now - fetched <= MAX_FETCH_AGE_SECONDS:
+        return "not fetched within the last %d seconds" % MAX_FETCH_AGE_SECONDS
+    if snapshot is None:
+        return "no snapshot time"
+    if abs(snapshot - fetched) > MAX_SNAPSHOT_SKEW_SECONDS:
+        return "the snapshot time is not within %d seconds of the fetch" % MAX_SNAPSHOT_SKEW_SECONDS
+    instants = _trade_instants(second.get("last_trade_time"))
+    if instants is None:
+        return "no readable trade time"
+    if not all(now - max_age <= u <= now + FUTURE_SLACK_SECONDS for u in instants):
+        return "the last trade is more than %g seconds old or %d seconds ahead" % (max_age, FUTURE_SLACK_SECONDS)
+    return None
 
 
 def _verdict(verdict: str, difference: float | None, basis: str) -> dict:
     return {"verdict": verdict, "difference": difference, "basis": basis}
 
 
-def compare(first_price: Any, second: Any, tolerance: float = 0.01) -> dict:
-    """Judge the first source's price against the second quote (what `cboe_quote` returns).
+def compare(first_price: Any, second: Any, *, symbol: Any, now: datetime, tolerance: float = 0.01,
+            max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS) -> dict:
+    """Judge the first source's price against the second quote (what `cboe_quote` returns), at the caller's time `now`.
 
-    {verdict: "agree" | "disagree" | "no second quote", difference, basis}. With a usable bid and ask (bid not above
-    ask) the first price must lie from bid less `tolerance` x mid to ask plus `tolerance` x mid (inclusive); otherwise
-    from last less to last plus `tolerance` x last. `difference` is (first - mid) / mid, or (first - last) / last, as
-    a fraction. A second quote with no trade time, a trade time not on today's New York day, or no usable price is
-    "no second quote". ValueError for a tolerance that is not a number from 0 to 1."""
+    {verdict: "agree" | "disagree" | "no second quote", difference, basis}. "No second quote" unless the quote is for
+    `symbol` and fresh by all three rules in the module docstring (trade age against `now` and `max_age_seconds`, fetch
+    age, snapshot time), and, when it has a usable bid and ask, its last price is not outside them by more than the
+    tolerance. With a usable bid and ask (bid not above ask) the first price must lie from bid less `tolerance` x mid to
+    ask plus `tolerance` x mid (inclusive); otherwise from last less to last plus `tolerance` x last. `difference` is
+    (first - mid) / mid, or (first - last) / last, as a fraction. `now` is an aware datetime: this function reads no
+    clock. ValueError for a tolerance not in 0..1, an age limit that is not a positive number, or a `now` that is not aware."""
     if type(tolerance) not in (int, float) or not math.isfinite(tolerance) or not 0 <= tolerance <= 1:
         raise ValueError("tolerance must be a number from 0 to 1")
+    if type(max_age_seconds) not in (int, float) or not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
+        raise ValueError("max_age_seconds must be a positive number")
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be an aware datetime")
+    try:
+        now_ts = now.timestamp()
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("now is not a usable time") from None
     if type(second) is not dict:
         return _verdict("no second quote", None, "no second quote")
-    if not _is_todays_trade(second.get("last_trade_time"), second.get("fetched_at")):
-        return _verdict("no second quote", None, "last trade not on today's New York day, or no trade time")
+    if type(symbol) is not str or second.get("symbol") != symbol:
+        return _verdict("no second quote", None, "the quote is for another symbol")
+    why = _why_not_fresh(second, now_ts, float(max_age_seconds))
+    if why is not None:
+        return _verdict("no second quote", None, why)
     bid, ask, last = _number(second.get("bid")), _number(second.get("ask")), _number(second.get("last"))
     band = bid is not None and ask is not None and bid <= ask
     if not band and last is None:
         return _verdict("no second quote", None, "no usable bid and ask, and no usable last price")
-    first = _number(first_price)
-    if first is None:
-        return _verdict("disagree", None, "the first price is not usable")
-    f, tol = _exact(first), _exact(tolerance)
+    tol = _exact(tolerance)
     if band:
         b, a = _exact(bid), _exact(ask)
         mid = (b + a) / 2
-        agree = b - tol * mid <= f <= a + tol * mid
-        return _verdict("agree" if agree else "disagree", float((f - mid) / mid), "bid/ask band")
+        lo, hi = b - tol * mid, a + tol * mid
+        if last is not None and not lo <= _exact(last) <= hi:
+            return _verdict("no second quote", None, "the last trade contradicts the bid and ask")
+    first = _number(first_price)
+    if first is None:
+        return _verdict("disagree", None, "the first price is not usable")
+    f = _exact(first)
+    if band:
+        return _verdict("agree" if lo <= f <= hi else "disagree", float((f - mid) / mid), "bid/ask band")
     ref = _exact(last)
     return _verdict("agree" if abs(f - ref) <= tol * ref else "disagree", float((f - ref) / ref), "last price")
 
@@ -335,8 +542,12 @@ def probe(symbols, first_quotes: Callable[[list], Any] | None = None, fetch: Cal
         if reading is None:
             diff, verdict = "n/a", "n/a"
         else:
-            res = compare(reading[0], second)
-            diff = "%+.2f%%" % (res["difference"] * 100) if res["difference"] is not None else "n/a"
+            res = compare(reading[0], second, symbol=sym, now=datetime.fromtimestamp(clock(), timezone.utc))
+            if res["difference"] is None:
+                diff = "n/a"
+            else:
+                percent = round(res["difference"] * 100, 2)
+                diff = "0.00%" if percent == 0 else "%+.2f%%" % percent
             verdict = "%s [%s]" % (res["verdict"], res["basis"])
         out("%s  %s | %s | %s | %s" % (sym, left, right, diff, verdict))
     return 0

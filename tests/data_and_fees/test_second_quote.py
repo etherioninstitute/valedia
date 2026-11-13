@@ -7,19 +7,24 @@ import io
 import json
 import math
 import random
+import time
 import urllib.error
 import urllib.request
 import urllib.response
 from datetime import datetime, timezone
 from email.message import Message
 from fractions import Fraction
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from valedia_trader.data_and_fees import second_quote as sq
 
-NOW = datetime(2026, 11, 13, 21, 30, 3, tzinfo=timezone.utc).timestamp()          # 16:30 in New York, after the close
+NOW = datetime(2026, 11, 13, 21, 20, 3, tzinfo=timezone.utc).timestamp()          # 16:20:03 in New York
 CLOCK = lambda: NOW                                                                # noqa: E731
+NOW_DT = datetime.fromtimestamp(NOW, timezone.utc)
+PNOW = datetime(2026, 11, 13, 21, 29, 0, tzinfo=timezone.utc).timestamp()         # 16:29:00: the real answers' trade is 29 min old
+PCLOCK = lambda: PNOW                                                              # noqa: E731
 
 REAL_SPY = (b'{"timestamp": "2026-11-13 21:28:34", "data": {"symbol": "SPY", "security_type": "stock", "exchange_id": 3, '
             b'"current_price": 752.54, "price_change": -2.75, "price_change_percent": -0.3632, "bid": 752.5, "ask": 752.55, '
@@ -64,6 +69,7 @@ def test_the_real_spy_answer_is_read_into_the_plain_result():
     fake = Fake(REAL_SPY)
     out = sq.cboe_quote("SPY", fetch=fake, clock=CLOCK, sleep=lambda s: None)
     assert out == {"symbol": "SPY", "bid": 752.5, "ask": 752.55, "last": 752.54, "last_trade_time": "2026-11-13T16:00:00",
+                   "snapshot_at": datetime(2026, 11, 13, 21, 28, 34, tzinfo=timezone.utc).timestamp(),
                    "fetched_at": NOW, "source": "cboe-delayed"}
     assert fake.calls == [(URL % "SPY", 5.0)]                  # one request, the symbol alone in the path, a 5 s timeout
 
@@ -275,6 +281,11 @@ class Counting(io.BytesIO):
         self.total += len(b)
         return b
 
+    def read1(self, n=-1):
+        b = super().read1(n)
+        self.total += len(b)
+        return b
+
 
 A = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/SPY.json"
 B = "https://cdn-api.cboe.com/api/global/delayed_quotes/quotes/SPY.json"
@@ -373,24 +384,233 @@ def test_the_module_starts_no_child_process():
         assert word not in src
 
 
-# ---- compare
+# ---- outcome 4: strict JSON objects (a repeated key is an unusable answer)
 
-FETCHED = NOW                                                       # 16:30 New York on 2026-11-13
+def test_a_duplicate_key_at_any_level_is_no_result():
+    good = answer()
+    assert quote(raw=good) is not None
+    cases = {
+        "top-level": b'{"timestamp": "2026-11-13 21:28:34", "symbol": "SPY", "symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0}}',
+        "data-symbol": b'{"symbol": "SPY", "data": {"symbol": "SPY", "symbol": "SPY", "current_price": 100.0}}',
+        "data-price": b'{"symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0, "current_price": 100.0}}',
+        "data-key-twice-with-different-values": b'{"symbol": "SPY", "data": {"symbol": "SPY", "bid": 99.9, "ask": 100.1, "bid": 1.0}}',
+        "data-twice": b'{"symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0}, "data": {"symbol": "SPY", "current_price": 200.0}}',
+        "nested-in-an-unused-field": b'{"symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0, "x": {"a": 1, "a": 2}}}',
+        "inside-a-list": b'{"symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0, "x": [{"a": 1, "a": 1}]}}',
+        "timestamp-twice": b'{"timestamp": "2026-11-13 21:28:34", "timestamp": "2026-11-13 21:28:35", "symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0}}',
+        "escaped-spelling": b'{"symbol": "SPY", "data": {"symbol": "SPY", "current_price": 100.0, "cur\\u0072ent_price": 5.0}}',
+    }
+    for name, raw in cases.items():
+        fake = Fake(raw)
+        assert sq.cboe_quote("SPY", fetch=fake, clock=CLOCK, sleep=lambda s: None) is None, name
+        assert len(fake.calls) == 1
 
 
-def sec(bid=None, ask=None, last=None, ltt="2026-11-13T16:00:00", fetched=FETCHED):
-    return {"symbol": "SPY", "bid": bid, "ask": ask, "last": last, "last_trade_time": ltt, "fetched_at": fetched,
-            "source": "cboe-delayed"}
+def test_an_answer_with_no_repeated_key_is_still_read_whatever_the_order():
+    raw = b'{"symbol": "SPY", "data": {"last_trade_time": "2026-11-13T16:00:00", "ask": 100.1, "bid": 99.9, "current_price": 100.0, "symbol": "SPY"}, "timestamp": "2026-11-13 21:28:34"}'
+    out = quote(raw=raw)
+    assert out["last"] == 100.0 and out["bid"] == 99.9 and out["ask"] == 100.1
 
 
-def verdict(first, second, tol=0.01):
-    return sq.compare(first, second, tol)["verdict"]
+# ---- the snapshot time (outcome 1c): `snapshot_at`
+
+def test_the_snapshot_time_is_returned_as_utc_seconds():
+    spy = sq.cboe_quote("SPY", fetch=Fake(REAL_SPY), clock=CLOCK, sleep=lambda s: None)
+    assert spy["snapshot_at"] == datetime(2026, 11, 13, 21, 28, 34, tzinfo=UTC).timestamp()
+    xle = sq.cboe_quote("XLE", fetch=Fake(REAL_XLE), clock=CLOCK, sleep=lambda s: None)
+    assert xle["snapshot_at"] == datetime(2026, 11, 13, 21, 28, 35, tzinfo=UTC).timestamp()
+    assert set(spy) == {"symbol", "bid", "ask", "last", "last_trade_time", "snapshot_at", "fetched_at", "source"}
+
+
+def test_a_missing_or_unreadable_snapshot_time_is_none_and_the_rest_stays():
+    base = json.loads(answer())
+    for bad in (None, "", "2026-11-13T21:28:34", "2026-11-13 21:28:34Z", "2026-13-13 21:28:34", "2026-11-13 25:28:34", 20261113,
+                ["2026-11-13 21:28:34"], "yesterday", "2026-11-13 21:28", " 2026-11-13 21:28:34"):
+        doc = dict(base)
+        doc["timestamp"] = bad
+        out = quote(raw=json.dumps(doc).encode())
+        assert out is not None and out["snapshot_at"] is None and out["last"] == 100.0, bad
+    doc = dict(base)
+    del doc["timestamp"]
+    out = quote(raw=json.dumps(doc).encode())
+    assert out is not None and out["snapshot_at"] is None
+
+
+# ---- outcome 3: one deadline for the whole request
+
+class FakeClock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class Trickle:
+    """A body that gives one byte per read and takes `cost` seconds of the fake clock for each."""
+    closed = False
+
+    def __init__(self, clock, cost=4.0):
+        self.clock, self.cost, self.reads = clock, cost, 0
+
+    def read1(self, n=-1):
+        self.reads += 1
+        self.clock.t += self.cost
+        return b"x"
+
+    read = read1
+
+    def close(self):
+        pass
+
+
+class Timed(FakeHTTPS):
+    """The fake HTTPS handler, each answer taking some fake-clock seconds, and the timeout of each request recorded."""
+    def __init__(self, routes, clock, cost):
+        super().__init__(routes)
+        self.clock, self.cost, self.timeouts = clock, cost, []
+
+    def https_open(self, req):
+        self.timeouts.append(req.timeout)
+        self.clock.t += self.cost.get(req.full_url, 0)
+        return super().https_open(req)
+
+
+def test_a_body_arriving_one_byte_every_four_seconds_is_cut_off_at_the_deadline():
+    fc = FakeClock()
+    body = Trickle(fc)
+    handler = FakeHTTPS({A: (200, None, body)})
+    with pytest.raises(TimeoutError):
+        sq.urllib_fetch(A, 5.0, opener=sq._build_opener(handler), clock=fc)
+    assert body.reads == 3 and fc.t == 12.0           # the third read began at 8 s, before the deadline; none began after it
+    assert sq.DEADLINE_SECONDS == 10.0
+
+
+def test_the_deadline_covers_the_redirect_and_the_second_request_gets_only_what_is_left():
+    fc = FakeClock()
+    handler = Timed({A: (307, B, io.BytesIO(b"")), B: (200, None, io.BytesIO(REAL_SPY))}, fc, {A: 6.0, B: 6.0})
+    with pytest.raises(TimeoutError):
+        sq.urllib_fetch(A, 5.0, opener=sq._build_opener(handler), clock=fc)
+    assert handler.seen == [A, B] and handler.timeouts == [5.0, 4.0]
+
+
+def test_a_redirect_after_the_deadline_is_not_followed():
+    fc = FakeClock()
+    handler = Timed({A: (307, B, io.BytesIO(b"")), B: (200, None, io.BytesIO(REAL_SPY))}, fc, {A: 10.5})
+    with pytest.raises(TimeoutError):
+        sq.urllib_fetch(A, 5.0, opener=sq._build_opener(handler), clock=fc)
+    assert handler.seen == [A]
+
+
+def test_an_answer_inside_the_deadline_is_returned():
+    fc = FakeClock()
+    handler = Timed({A: (307, B, io.BytesIO(b"")), B: (200, None, io.BytesIO(REAL_SPY))}, fc, {A: 4.0, B: 5.0})
+    assert sq.urllib_fetch(A, 5.0, opener=sq._build_opener(handler), clock=fc) == REAL_SPY
+    assert handler.timeouts == [5.0, 5.0]
+
+
+def test_a_redirect_body_is_never_read():
+    fc = FakeClock()
+    big = Counting(b"y" * BIG)
+    handler = Timed({A: (307, B, big), B: (200, None, io.BytesIO(REAL_SPY))}, fc, {})
+    assert sq.urllib_fetch(A, 5.0, opener=sq._build_opener(handler), clock=fc) == REAL_SPY
+    assert big.total == 0
+
+
+def test_a_try_that_overruns_ten_seconds_on_the_callers_clock_fails():
+    fc = FakeClock(NOW)
+    calls, sleeps = [], []
+
+    def slow(url, timeout):
+        calls.append(url)
+        fc.t += 2100.0                                   # thirty-five minutes, then a good answer
+        return REAL_SPY
+    assert sq.cboe_quote("SPY", fetch=slow, clock=fc, sleep=sleeps.append) is None
+    assert len(calls) == 2 and sleeps == [2.0]
+
+    def ten(url, timeout):
+        fc.t += 10.0
+        return REAL_SPY
+    assert sq.cboe_quote("SPY", fetch=ten, clock=fc, sleep=sleeps.append) is not None          # exactly the deadline is fine
+
+    def over(url, timeout):
+        fc.t += 10.5
+        return REAL_SPY
+    assert sq.cboe_quote("SPY", fetch=over, clock=fc, sleep=sleeps.append) is None
+
+
+def test_the_watchdog_shuts_a_socket_at_the_deadline_and_can_be_cancelled():
+    import socket
+    a, b = socket.socketpair()
+    b.settimeout(5.0)
+    budget = sq._Budget(time.monotonic, 0.2)
+    budget.register(a)
+    assert budget.fired.wait(3.0)
+    assert b.recv(1) == b""                              # the far end sees the connection closed
+    b.close()
+    quiet = sq._Budget(time.monotonic, 0.2)
+    quiet.cancel()
+    assert not quiet.fired.wait(0.5)
+    c, d = socket.socketpair()
+    late = sq._Budget(time.monotonic, 0.05)
+    late.fired.wait(3.0)
+    late.register(c)                                     # registering after the deadline closes it at once
+    d.settimeout(3.0)
+    assert d.recv(1) == b""
+    d.close()
+
+
+def test_the_real_opener_connects_through_the_watchdog_and_never_reads_a_proxy_from_the_environment(monkeypatch):
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    opener = sq._build_opener()
+    kinds = {type(h).__name__ for h in opener.handlers}
+    assert "ProxyHandler" not in kinds                   # an empty proxy table registers no handler at all
+    assert "_BudgetHTTPS" in kinds and "_NoRedirects" in kinds and "HTTPRedirectHandler" not in kinds
+
+
+# ---- compare (rev 2: age is judged against the caller's `now`)
+
+NY = ZoneInfo("America/New_York")
+UTC = timezone.utc
+
+
+def sec(bid=None, ask=None, last=None, ltt="2026-11-13T16:00:00", fetched=NOW - 5, snapshot=NOW - 35, symbol="SPY"):
+    """A second quote as `cboe_quote` returns it. By default: the trade 20 minutes old, fetched 5 s before `NOW`, the
+    snapshot 30 s before the fetch."""
+    return {"symbol": symbol, "bid": bid, "ask": ask, "last": last, "last_trade_time": ltt, "snapshot_at": snapshot,
+            "fetched_at": fetched, "source": "cboe-delayed"}
+
+
+def judge(first, second, tol=0.01, now=NOW_DT, symbol="SPY", **kw):
+    return sq.compare(first, second, symbol=symbol, now=now, tolerance=tol, **kw)
+
+
+def verdict(first, second, tol=0.01, **kw):
+    return judge(first, second, tol, **kw)["verdict"]
+
+
+def at(seconds_before_now, now=NOW):
+    """The New York wall-clock text of the instant `seconds_before_now` before `now`."""
+    return datetime.fromtimestamp(now - seconds_before_now, NY).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def test_compare_returns_the_three_fields_and_nothing_else():
-    out = sq.compare(100.0, sec(99.98, 100.02))
+    out = judge(100.0, sec(99.98, 100.02))
     assert set(out) == {"verdict", "difference", "basis"}
     assert out["verdict"] == "agree" and out["difference"] == 0.0 and out["basis"] == "bid/ask band"
+
+
+def test_the_symbol_now_and_options_are_keywords_only():
+    s = sec(99.98, 100.02)
+    with pytest.raises(TypeError):
+        sq.compare(100.0, s, "SPY", NOW_DT)
+    with pytest.raises(TypeError):
+        sq.compare(100.0, s, symbol="SPY")                              # `now` is required
+    with pytest.raises(TypeError):
+        sq.compare(100.0, s, now=NOW_DT)                                # so is `symbol`
+    with pytest.raises(TypeError):
+        sq.compare(100.0, s, 0.01, symbol="SPY", now=NOW_DT)
 
 
 def test_the_band_edges_are_inside_and_a_cent_beyond_is_outside():
@@ -421,7 +641,7 @@ def test_a_band_with_no_width_works():
 
 def test_a_bid_above_the_ask_is_not_a_band_and_the_last_price_is_used():
     s = sec(100.5, 100.0, last=100.2)
-    out = sq.compare(101.2, s)
+    out = judge(101.2, s)
     assert out["basis"] == "last price" and out["verdict"] == "agree"
     assert verdict(101.21, s) == "disagree"
     assert verdict(100.2, sec(100.5, 100.0)) == "no second quote"       # crossed and no last: nothing to judge against
@@ -429,33 +649,30 @@ def test_a_bid_above_the_ask_is_not_a_band_and_the_last_price_is_used():
 
 def test_without_both_sides_the_last_price_is_used_and_without_a_last_there_is_no_quote():
     for s in (sec(None, 100.1, last=100.0), sec(99.9, None, last=100.0), sec(None, None, last=100.0)):
-        out = sq.compare(101.0, s)
+        out = judge(101.0, s)
         assert out["basis"] == "last price" and out["verdict"] == "agree" and abs(out["difference"] - 0.01) < 1e-12
         assert verdict(101.01, s) == "disagree"
         assert verdict(99.0, s) == "agree" and verdict(98.99, s) == "disagree"
     for s in (sec(None, 100.1), sec(99.9, None), sec(None, None)):
-        assert sq.compare(100.0, s) == {"verdict": "no second quote", "difference": None, "basis": s_basis(s)}
-
-
-def s_basis(s):
-    return sq.compare(100.0, s)["basis"]
+        out = judge(100.0, s)
+        assert out["verdict"] == "no second quote" and out["difference"] is None
 
 
 def test_the_band_is_preferred_over_the_last_price_when_both_exist():
-    s = sec(99.0, 101.0, last=150.0)
-    assert sq.compare(100.0, s)["basis"] == "bid/ask band" and verdict(100.0, s) == "agree"
+    s = sec(99.0, 101.0, last=100.5)
+    assert judge(100.0, s)["basis"] == "bid/ask band" and verdict(100.0, s) == "agree"
     assert verdict(150.0, s) == "disagree"
 
 
 def test_difference_is_the_signed_fraction_from_the_mid_or_the_last():
-    assert math.isclose(sq.compare(102.0, sec(99.0, 101.0))["difference"], 0.02)
-    assert math.isclose(sq.compare(98.0, sec(99.0, 101.0))["difference"], -0.02)
-    assert math.isclose(sq.compare(95.0, sec(last=100.0))["difference"], -0.05)
+    assert math.isclose(judge(102.0, sec(99.0, 101.0))["difference"], 0.02)
+    assert math.isclose(judge(98.0, sec(99.0, 101.0))["difference"], -0.02)
+    assert math.isclose(judge(95.0, sec(last=100.0))["difference"], -0.05)
 
 
 def test_a_quote_from_an_earlier_day_is_never_agree():
     for ltt in ("2026-11-12T16:00:00", "2026-11-12T23:59:59", "2025-11-13T16:00:00", "2026-10-13T16:00:00"):
-        out = sq.compare(100.0, sec(99.98, 100.02, last=100.0, ltt=ltt))
+        out = judge(100.0, sec(99.98, 100.02, last=100.0, ltt=ltt))
         assert out["verdict"] == "no second quote" and out["difference"] is None
 
 
@@ -468,40 +685,19 @@ def test_a_missing_or_unreadable_time_is_no_second_quote():
     assert verdict(100.0, s) == "no second quote"
 
 
-def test_the_trading_day_is_the_new_york_day_not_the_utc_day():
-    late = datetime(2026, 11, 14, 1, 30, tzinfo=timezone.utc).timestamp()          # 20:30 on the 13th in New York
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-13T16:00:00", fetched=late)) == "agree"
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-14T00:30:00", fetched=late)) == "no second quote"
-    early = datetime(2026, 11, 13, 4, 59, tzinfo=timezone.utc).timestamp()          # 23:59 on the 12th in New York
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-12T16:00:00", fetched=early)) == "agree"
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-13T00:00:00", fetched=early)) == "no second quote"
-
-
-def test_summer_time_is_handled():
-    fetched = datetime(2026, 7, 14, 3, 30, tzinfo=timezone.utc).timestamp()         # 23:30 on the 13th in New York (UTC-4)
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-07-13T16:00:00", fetched=fetched)) == "agree"
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-07-14T00:10:00", fetched=fetched)) == "no second quote"
-
-
-def test_a_trade_time_in_the_future_is_no_second_quote():
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-13T17:30:00")) == "no second quote"          # an hour ahead of 16:30
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-13T16:34:00")) == "agree"                    # within the allowed 5 min
-    assert verdict(100.0, sec(99.98, 100.02, ltt="2026-11-13T16:36:00")) == "no second quote"
-
-
 def test_garbage_in_place_of_a_second_quote_is_no_second_quote_and_never_an_exception():
     for bad in (None, "x", 5, [], {}, {"bid": 1.0}, sec(99.98, 100.02, fetched=None), sec(99.98, 100.02, fetched="now"),
                 sec(99.98, 100.02, fetched=float("nan")), sec(99.98, 100.02, fetched=True), sec(99.98, 100.02, fetched=float("inf")),
                 sec(bid="99", ask="101", last="100"), sec(bid=float("nan"), ask=float("nan"), last=float("nan")),
                 sec(bid=-1.0, ask=-2.0, last=-3.0), sec(bid=0, ask=0, last=0), sec(bid=1e9, ask=1e9, last=1e9),
                 sec(bid=True, ask=True, last=True), sec(bid=[1], ask={}, last=None)):
-        assert sq.compare(100.0, bad) == {"verdict": "no second quote", "difference": None, "basis": sq.compare(100.0, bad)["basis"]}
-        assert sq.compare(100.0, bad)["verdict"] == "no second quote"
+        out = judge(100.0, bad)
+        assert out["verdict"] == "no second quote" and out["difference"] is None
 
 
 def test_an_unusable_first_price_is_never_agree():
     for bad in (None, float("nan"), float("inf"), -1.0, 0.0, 0, True, "100", [], 1e8):
-        out = sq.compare(bad, sec(99.98, 100.02))
+        out = judge(bad, sec(99.98, 100.02))
         assert out["verdict"] == "disagree" and out["difference"] is None
 
 
@@ -512,19 +708,195 @@ def test_no_second_quote_is_reported_before_a_bad_first_price():
 def test_a_bad_tolerance_is_refused():
     for bad in (float("nan"), float("inf"), -0.01, True, "0.01", None, 1.5, [0.01]):
         with pytest.raises(ValueError):
-            sq.compare(100.0, sec(99.98, 100.02), bad)
+            judge(100.0, sec(99.98, 100.02), bad)
+
+
+# ---- outcome 1: a quote hours old must not approve a current price
+
+def test_a_0931_trade_does_not_approve_a_price_at_1559():
+    now = datetime(2026, 11, 13, 15, 59, 0, tzinfo=NY)
+    t = now.timestamp()
+    s = sec(99.98, 100.02, last=100.0, ltt="2026-11-13T09:31:00", fetched=t - 1, snapshot=t - 10)
+    out = judge(100.0, s, now=now)
+    assert out["verdict"] == "no second quote" and out["difference"] is None
+    fresh = sec(99.98, 100.02, last=100.0, ltt="2026-11-13T15:58:30", fetched=t - 1, snapshot=t - 10)
+    assert judge(100.0, fresh, now=now)["verdict"] == "agree"
+
+
+@pytest.mark.parametrize("age,ok", [(0, True), (1, True), (1799, True), (1800, True), (1801, False), (7200, False),
+                                    (-1, True), (-299, True), (-300, True), (-301, False), (-3600, False)])
+def test_the_trade_must_be_at_most_1800_seconds_before_now_and_300_after(age, ok):
+    out = judge(100.0, sec(99.98, 100.02, ltt=at(age)))
+    assert out["verdict"] == ("agree" if ok else "no second quote")
+
+
+def test_the_age_limit_is_the_callers_to_set():
+    s = sec(99.98, 100.02, ltt=at(60))
+    assert verdict(100.0, s, max_age_seconds=60) == "agree"
+    assert verdict(100.0, s, max_age_seconds=59) == "no second quote"
+    assert verdict(100.0, s, max_age_seconds=59.5) == "no second quote"
+    assert verdict(100.0, sec(99.98, 100.02, ltt=at(3600)), max_age_seconds=3600) == "agree"
+
+
+@pytest.mark.parametrize("before,ok", [(0, True), (1, True), (119, True), (120, True), (121, False), (3600, False),
+                                       (-1, False), (-120, False)])
+def test_the_quote_must_have_been_fetched_at_most_120_seconds_before_now_and_not_after(before, ok):
+    t = NOW - before
+    out = judge(100.0, sec(99.98, 100.02, fetched=t, snapshot=t - 10))
+    assert out["verdict"] == ("agree" if ok else "no second quote")
+
+
+@pytest.mark.parametrize("offset,ok", [(-121, False), (-120, True), (-119, True), (-1, True), (0, True), (1, True),
+                                       (119, True), (120, True), (121, False), (-3600, False), (3600, False)])
+def test_the_snapshot_must_be_within_120_seconds_of_the_fetch(offset, ok):
+    fetched = NOW - 5
+    out = judge(100.0, sec(99.98, 100.02, fetched=fetched, snapshot=fetched + offset))
+    assert out["verdict"] == ("agree" if ok else "no second quote")
+
+
+def test_a_missing_or_unreadable_snapshot_time_is_no_second_quote():
+    for snap in (None, "2026-11-13 21:19:00", True, float("nan"), float("inf"), "", [NOW], {}):
+        assert verdict(100.0, sec(99.98, 100.02, snapshot=snap)) == "no second quote", snap
+    s = sec(99.98, 100.02)
+    del s["snapshot_at"]
+    assert verdict(100.0, s) == "no second quote"
+
+
+def test_a_snapshot_in_the_future_is_no_second_quote_even_with_a_fresh_trade():
+    fetched = NOW - 5
+    assert verdict(100.0, sec(99.98, 100.02, fetched=fetched, snapshot=fetched + 500)) == "no second quote"
+    assert verdict(100.0, sec(99.98, 100.02, fetched=fetched, snapshot=NOW + 1000)) == "no second quote"
+
+
+def test_a_snapshot_that_is_stale_is_no_second_quote_even_with_a_fresh_trade():
+    fetched = NOW - 5
+    assert verdict(100.0, sec(99.98, 100.02, fetched=fetched, snapshot=fetched - 600)) == "no second quote"
+
+
+def test_now_may_be_in_any_time_zone_and_is_an_instant():
+    s = sec(99.98, 100.02)
+    for tz in (UTC, NY, ZoneInfo("Asia/Tokyo"), timezone.utc):
+        assert verdict(100.0, s, now=NOW_DT.astimezone(tz)) == "agree"
+
+
+def test_now_must_be_an_aware_datetime_and_the_age_limit_a_positive_number():
+    s = sec(99.98, 100.02)
+    for bad in (datetime(2026, 11, 13, 21, 20, 3), NOW, None, "2026-11-13T21:20:03Z", 5, [NOW_DT]):
+        with pytest.raises(ValueError):
+            sq.compare(100.0, s, symbol="SPY", now=bad)
+    for bad in (0, -1, float("nan"), float("inf"), True, "1800", None, [1800]):
+        with pytest.raises(ValueError):
+            sq.compare(100.0, s, symbol="SPY", now=NOW_DT, max_age_seconds=bad)
+
+
+def test_compare_never_reads_a_clock(monkeypatch):
+    import inspect
+    def boom(*a, **k):
+        raise AssertionError("a clock was read")
+    monkeypatch.setattr(sq.time, "time", boom)
+    monkeypatch.setattr(sq.time, "monotonic", boom)
+    assert verdict(100.0, sec(99.98, 100.02)) == "agree"
+    src = inspect.getsource(sq.compare)
+    assert "time.time" not in src and "monotonic" not in src and ".now(" not in src and "utcnow" not in src
+
+
+def test_daylight_saving_change_days_spring_forward():
+    now = datetime(2026, 3, 8, 7, 10, 0, tzinfo=UTC)                    # 03:10 EDT; the clock jumped 02:00 -> 03:00
+    t = now.timestamp()
+
+    def v(ltt, **kw):
+        return judge(100.0, sec(99.98, 100.02, ltt=ltt, fetched=t - 5, snapshot=t - 15), now=now, **kw)["verdict"]
+    assert v("2026-03-08T01:59:59") == "agree"                          # 06:59:59 UTC, 10 minutes before
+    assert v("2026-03-08T03:00:00") == "agree"                          # 07:00 UTC
+    assert v("2026-03-08T02:30:00") == "no second quote"                # a wall time that did not exist
+    assert v("2026-03-08T02:00:00") == "no second quote"
+    assert v("2026-03-08T00:50:00") == "no second quote"                # 05:50 UTC, 80 minutes before
+    assert v("2026-03-08T02:05:00") == "no second quote"                # read as EDT it is 65 minutes old
+    assert v("2026-03-08T02:05:00", max_age_seconds=7200) == "agree"    # both readings (07:05 and 06:05 UTC) are recent
+    assert v("2026-03-08T02:30:00", max_age_seconds=7200) == "no second quote"    # read as EST it is 20 minutes ahead
+
+
+def test_daylight_saving_change_days_fall_back():
+    def v(now_utc, ltt, **kw):
+        now = datetime(2026, 11, 1, *now_utc, tzinfo=UTC)
+        t = now.timestamp()
+        return judge(100.0, sec(99.98, 100.02, ltt=ltt, fetched=t - 5, snapshot=t - 15), now=now, **kw)["verdict"]
+    # 01:00-01:59 happens twice (05:00-05:59 UTC in EDT, then 06:00-06:59 UTC in EST)
+    assert v((5, 20, 0), "2026-11-01T01:10:00") == "no second quote"    # read as EST it would be 50 minutes ahead
+    assert v((6, 20, 0), "2026-11-01T01:10:00") == "no second quote"    # read as EDT it would be 70 minutes old
+    assert v((6, 20, 0), "2026-11-01T01:10:00", max_age_seconds=7200) == "agree"
+    assert v((5, 20, 0), "2026-11-01T00:50:00") == "agree"              # 04:50 UTC: exactly 1800 s
+    assert v((7, 5, 0), "2026-11-01T02:00:00") == "agree"               # 07:00 UTC
+    assert v((7, 5, 0), "2026-11-01T01:50:00") == "no second quote"     # ambiguous: 05:50 UTC is 75 minutes old
+
+
+def test_the_quote_age_works_across_midnight_in_new_york():
+    now = datetime(2026, 11, 14, 0, 5, 0, tzinfo=NY)                    # 00:05 the next day
+    t = now.timestamp()
+    s = sec(99.98, 100.02, ltt="2026-11-13T23:50:00", fetched=t - 5, snapshot=t - 15)
+    assert judge(100.0, s, now=now)["verdict"] == "agree"
+
+
+def test_the_real_answer_read_at_1629_agrees_and_at_1630_is_a_half_hour_old_trade():
+    spy = sq.cboe_quote("SPY", fetch=Fake(REAL_SPY), clock=lambda: PNOW, sleep=lambda s: None)
+    now = datetime.fromtimestamp(PNOW, UTC)
+    out = sq.compare(752.6, spy, symbol="SPY", now=now)
+    assert out["verdict"] == "agree" and out["basis"] == "bid/ask band"
+    later = sq.cboe_quote("SPY", fetch=Fake(REAL_SPY), clock=lambda: PNOW + 63, sleep=lambda s: None)    # 16:30:03, trade 1803 s old
+    assert sq.compare(752.6, later, symbol="SPY", now=datetime.fromtimestamp(PNOW + 63, UTC))["verdict"] == "no second quote"
+    assert sq.compare(752.6, later, symbol="SPY", now=datetime.fromtimestamp(PNOW + 63, UTC), max_age_seconds=1803)["verdict"] == "agree"
+
+
+# ---- outcome 2: the quote's symbol must be the symbol asked for
+
+def test_the_quote_must_be_for_the_symbol_given():
+    s = sec(99.98, 100.02)
+    assert verdict(100.0, s) == "agree"
+    assert verdict(100.0, sec(99.98, 100.02, symbol="QQQ")) == "no second quote"
+    assert verdict(100.0, s, symbol="QQQ") == "no second quote"
+    for bad in (None, 5, ["SPY"], "spy", "SPY ", b"SPY"):
+        assert verdict(100.0, s, symbol=bad) == "no second quote", bad
+    for bad in (None, 5, ["SPY"], "spy"):
+        assert verdict(100.0, sec(99.98, 100.02, symbol=bad)) == "no second quote", bad
+    no_symbol = sec(99.98, 100.02)
+    del no_symbol["symbol"]
+    assert verdict(100.0, no_symbol) == "no second quote"
+
+
+# ---- outcome 5: a band that its own last trade contradicts is not a band
+
+def test_a_last_trade_outside_the_band_by_more_than_the_tolerance_is_suspect_data():
+    s = sec(99.0, 101.0, last=105.0)                                    # band 99..101, tolerance 1 % of the mid is 1.00
+    out = judge(100.0, s)
+    assert out["verdict"] == "no second quote" and out["difference"] is None
+    assert verdict(105.0, s) == "no second quote"                       # even a first price that matches the last
+    assert verdict(100.0, sec(99.0, 101.0, last=102.0)) == "agree"      # exactly on the edge: fine
+    assert verdict(100.0, sec(99.0, 101.0, last=102.01)) == "no second quote"
+    assert verdict(100.0, sec(99.0, 101.0, last=98.0)) == "agree"
+    assert verdict(100.0, sec(99.0, 101.0, last=97.99)) == "no second quote"
+    assert verdict(100.0, sec(99.0, 101.0, last=101.01), 0.0) == "no second quote"
+    assert verdict(100.0, sec(99.0, 101.0, last=101.0), 0.0) == "agree"
+    assert verdict(100.0, sec(99.0, 101.0, last=100.0), 0.0) == "agree"
+
+
+def test_the_last_trade_check_applies_only_when_there_is_a_usable_band():
+    assert verdict(105.0, sec(100.5, 100.0, last=105.0)) == "agree"     # a crossed pair is no band: the last price is used
+    assert verdict(105.0, sec(None, 100.0, last=105.0)) == "agree"
+    assert verdict(100.0, sec(99.0, 101.0, last=None)) == "agree"
 
 
 # ---- compare against an independent calculation on generated cases (whole numbers, no floats in the oracle)
 
 def _oracle(first_c, bid_c, ask_c, last_c, ltt, tol_t):
-    """Prices in whole cents, tolerance in ten-thousandths, the time as a string; the answer from integer arithmetic."""
-    if ltt is None or ltt[:10] != "2026-11-13":
+    """Prices in whole cents, tolerance in ten-thousandths, the trade time a string on 2026-11-13 (now is 16:20:03);
+    the answer from integer arithmetic."""
+    if ltt not in ("2026-11-13T16:00:00", "2026-11-13T16:19:00"):         # 20 or 1 minute old: recent; anything else is not
         return "no second quote", None
     if bid_c is not None and ask_c is not None and bid_c <= ask_c:
-        # first >= bid - t/10000 * mid  and  first <= ask + t/10000 * mid, mid = (bid + ask) / 2
         lo = Fraction(bid_c) - Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2)
         hi = Fraction(ask_c) + Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2)
+        if last_c is not None and not (lo <= last_c <= hi):
+            return "no second quote", None                              # the last trade contradicts the band
         ref = Fraction(bid_c + ask_c, 2)
         return ("agree" if lo <= first_c <= hi else "disagree"), float((first_c - ref) / ref)
     if last_c is not None:
@@ -535,16 +907,20 @@ def _oracle(first_c, bid_c, ask_c, last_c, ltt, tol_t):
 
 def test_a_thousand_generated_cases_agree_with_the_independent_calculation():
     rng = random.Random(20261113)
-    seen = {"agree": 0, "disagree": 0, "no second quote": 0, "band": 0, "last": 0}
+    seen = {"agree": 0, "disagree": 0, "no second quote": 0, "band": 0, "last": 0, "contradicted": 0}
     for i in range(3000):
         bid = rng.randint(100, 2_000_000)
         ask = bid + rng.randint(0, 5000)
-        last = rng.randint(100, 2_000_000)
+        last = rng.randint(bid - 3000 if bid > 4000 else 100, ask + 3000)  # near the band most of the time
+        if rng.random() < 0.3:
+            last = rng.randint(100, 2_000_000)
+        elif rng.random() < 0.4:
+            last = rng.randint(bid, ask)
         tol_t = rng.choice([0, 1, 5, 50, 100, 100, 100, 250, 1000, rng.randint(0, 10000)])
         kind = rng.random()
         bid_c, ask_c, last_c = bid, ask, last
         if kind < 0.10:
-            bid_c, ask_c = ask, bid                                                  # crossed (or equal)
+            bid_c, ask_c = ask, bid
         elif kind < 0.20:
             bid_c = None
         elif kind < 0.30:
@@ -553,8 +929,8 @@ def test_a_thousand_generated_cases_agree_with_the_independent_calculation():
             bid_c = ask_c = None
         if rng.random() < 0.15:
             last_c = None
-        ltt = rng.choice(["2026-11-13T16:00:00", "2026-11-13T09:31:00", "2026-11-12T16:00:00", None, "2026-11-13T16:00:00"])
-        # first price: often right on the edge of whatever band will be used, a cent either way
+        ltt = rng.choice(["2026-11-13T16:00:00", "2026-11-13T16:19:00", "2026-11-13T09:31:00", "2026-11-12T16:00:00", None,
+                          "2026-11-13T16:00:00"])
         if bid_c is not None and ask_c is not None and bid_c <= ask_c and rng.random() < 0.6:
             edge = rng.choice([bid_c - Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2),
                                ask_c + Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2)])
@@ -564,20 +940,78 @@ def test_a_thousand_generated_cases_agree_with_the_independent_calculation():
         else:
             first_c = rng.randint(100, 2_000_000)
         first_c = max(first_c, 1)
-        second = {"symbol": "SPY", "bid": None if bid_c is None else bid_c / 100, "ask": None if ask_c is None else ask_c / 100,
-                  "last": None if last_c is None else last_c / 100, "last_trade_time": ltt, "fetched_at": NOW,
-                  "source": "cboe-delayed"}
+        second = sec(None if bid_c is None else bid_c / 100, None if ask_c is None else ask_c / 100,
+                     None if last_c is None else last_c / 100, ltt)
         want, want_diff = _oracle(first_c, bid_c, ask_c, last_c, ltt, tol_t)
-        got = sq.compare(first_c / 100, second, tol_t / 10000)
+        got = judge(first_c / 100, second, tol_t / 10000)
         assert got["verdict"] == want, (i, first_c, bid_c, ask_c, last_c, ltt, tol_t, got)
         if want_diff is None:
             assert got["difference"] is None
         else:
             assert math.isclose(got["difference"], want_diff, rel_tol=1e-9, abs_tol=1e-12), (i, got, want_diff)
         seen[want] += 1
-        if want != "no second quote":
-            seen["band" if bid_c is not None and ask_c is not None and bid_c <= ask_c else "last"] += 1
+        if ltt in ("2026-11-13T16:00:00", "2026-11-13T16:19:00"):
+            if want != "no second quote":
+                seen["band" if bid_c is not None and ask_c is not None and bid_c <= ask_c else "last"] += 1
+            elif bid_c is not None and ask_c is not None and bid_c <= ask_c and last_c is not None:
+                seen["contradicted"] += 1
     assert min(seen.values()) > 100, seen                                            # every branch was exercised a lot
+
+
+# the age rule on generated cases, with an oracle that does not use the time zone database: United States daylight time
+# in 2026 runs from 2026-03-08 07:00 UTC to 2026-11-01 06:00 UTC, and New York is 4 hours behind UTC during it, else 5.
+
+DST_START = datetime(2026, 3, 8, 7, 0, 0, tzinfo=UTC).timestamp()
+DST_END = datetime(2026, 11, 1, 6, 0, 0, tzinfo=UTC).timestamp()
+
+
+def _wall_offset(u):
+    return -4 * 3600 if DST_START <= u < DST_END else -5 * 3600
+
+
+def _instants_of(wall):
+    """Every instant (seconds) a New York wall-clock reading (given as seconds as if UTC) can mean: one for an ordinary
+    time, two for the repeated hour, and for the missing hour both of the two readings an offset change allows."""
+    candidates = (wall + 4 * 3600, wall + 5 * 3600)
+    valid = [u for u in candidates if wall == u + _wall_offset(u)]
+    return valid or list(candidates)
+
+
+def test_four_thousand_generated_cases_of_the_age_rule_including_the_daylight_saving_days():
+    rng = random.Random(1113)
+    days = [datetime(2026, 3, d, tzinfo=UTC).timestamp() for d in (7, 8, 9)] + \
+           [datetime(2026, m, d, tzinfo=UTC).timestamp() for m, d in ((10, 31), (11, 1), (11, 2))]
+    seen = {"agree": 0, "no second quote": 0, "ambiguous": 0, "missing": 0}
+    for i in range(4000):
+        max_age = rng.choice([1800, 1800, 1800, 60, 3600, rng.randint(1, 7200)])
+        edge = rng.choice([-max_age - 1, -max_age, -max_age + 1, 301, 300, 299, 0, rng.randint(-max_age - 600, 600)])
+        if rng.random() < 0.3:
+            # a wall time read straight off the clock around a change, whatever it means; now placed relative to it
+            centre = rng.choice([DST_START, DST_END])
+            wall = float(int(centre) + _wall_offset(centre) + rng.randint(-7200, 7200))
+            instants = _instants_of(wall)
+            now_u = float(rng.choice(instants) - edge)
+        else:
+            base = rng.choice(days) if rng.random() < 0.7 else datetime(2026, 1, 1, tzinfo=UTC).timestamp() + rng.randint(0, 364 * 86400)
+            now_u = float(int(base) + rng.randint(0, 86399))
+            trade_u = now_u + edge
+            wall = float(int(trade_u + _wall_offset(trade_u)))
+            instants = _instants_of(wall)
+        text = datetime.fromtimestamp(wall, UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        ok_a = all(now_u - max_age <= u <= now_u + 300 for u in instants)
+        fetched_before = rng.choice([-1, 0, 1, 119, 120, 121, rng.randint(-60, 300)])
+        fetched = now_u - fetched_before
+        ok_b = 0 <= fetched_before <= 120
+        snap_offset = rng.choice([-121, -120, -119, 0, 119, 120, 121, rng.randint(-300, 300)])
+        ok_c = -120 <= snap_offset <= 120
+        second = sec(99.98, 100.02, None, text, fetched=fetched, snapshot=fetched + snap_offset)
+        want = "agree" if (ok_a and ok_b and ok_c) else "no second quote"
+        got = sq.compare(100.0, second, symbol="SPY", now=datetime.fromtimestamp(now_u, UTC), max_age_seconds=max_age)
+        assert got["verdict"] == want, (i, text, now_u, max_age, fetched_before, snap_offset, instants, got)
+        seen[want] += 1
+        if len(instants) == 2 and instants[0] != instants[1]:
+            seen["ambiguous" if wall in (u + _wall_offset(u) for u in instants) else "missing"] += 1
+    assert seen["agree"] > 300 and seen["no second quote"] > 300 and seen["ambiguous"] > 10 and seen["missing"] > 10, seen
 
 
 # ---- the probe
@@ -606,7 +1040,7 @@ FIRST_T = datetime(2026, 11, 13, 20, 59, tzinfo=timezone.utc).timestamp()
 def test_the_probe_prints_both_prices_both_times_the_difference_and_the_verdict():
     calls, out = [], Out()
     fake = Fake(REAL_SPY)
-    code = sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}, calls), fetch=fake, clock=CLOCK,
+    code = sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}, calls), fetch=fake, clock=PCLOCK,
                     sleep=lambda s: None, out=out)
     text = "\n".join(out.lines)
     assert code == 0 and calls == [["SPY"]] and len(fake.calls) == 1
@@ -617,7 +1051,7 @@ def test_the_probe_prints_both_prices_both_times_the_difference_and_the_verdict(
 def test_the_probe_reports_a_disagreement_and_a_missing_second_quote():
     out = Out()
     sq.probe(["SPY", "XLE"], first_quotes=first_source({"SPY": (800.0, FIRST_T), "XLE": (64.8, FIRST_T)}),
-             fetch=Fake(REAL_SPY, b"garbage"), clock=CLOCK, sleep=lambda s: None, out=out)
+             fetch=Fake(REAL_SPY, b"garbage"), clock=PCLOCK, sleep=lambda s: None, out=out)
     spy = [l for l in out.lines if l.startswith("SPY")]
     assert len(spy) == 1 and "disagree" in spy[0] and "+6.3" in spy[0]
     xle = [l for l in out.lines if l.startswith("XLE")]
@@ -626,14 +1060,14 @@ def test_the_probe_reports_a_disagreement_and_a_missing_second_quote():
 
 def test_the_probe_survives_the_first_source_failing_or_missing_a_symbol():
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source(RuntimeError("down")), fetch=Fake(REAL_SPY), clock=CLOCK, sleep=lambda s: None, out=out)
+    sq.probe(["SPY"], first_quotes=first_source(RuntimeError("down")), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
     line = [l for l in out.lines if l.startswith("SPY")][0]
     assert "first source failed" in line and "752.54" in line and "agree" not in line.replace("disagree", "")
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({}), fetch=Fake(REAL_SPY), clock=CLOCK, sleep=lambda s: None, out=out)
+    sq.probe(["SPY"], first_quotes=first_source({}), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
     assert "no first quote" in [l for l in out.lines if l.startswith("SPY")][0]
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({"SPY": (float("nan"), FIRST_T)}), fetch=Fake(REAL_SPY), clock=CLOCK,
+    sq.probe(["SPY"], first_quotes=first_source({"SPY": (float("nan"), FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
              sleep=lambda s: None, out=out)
     assert "no first quote" in [l for l in out.lines if l.startswith("SPY")][0]
 
@@ -641,26 +1075,26 @@ def test_the_probe_survives_the_first_source_failing_or_missing_a_symbol():
 def test_the_probe_takes_at_most_ten_symbols_and_refuses_before_any_request():
     syms = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    sq.probe(syms, first_quotes=first_source({}, calls), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out)
+    sq.probe(syms, first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out)
     assert calls == [syms] and len(fake.calls) == 10                      # ten is fine, one request each
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    assert sq.probe(syms + ["K"], first_quotes=first_source({}, calls), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out) == 2
+    assert sq.probe(syms + ["K"], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
     assert calls == [] and fake.calls == [] and any("at most 10" in l for l in out.lines)
 
 
 def test_the_probe_refuses_a_bad_symbol_before_any_request():
     for bad in ("spy", "SPY?x=1", "TOOLONGX", "", "SPY/../x"):
         calls, fake, out = [], Fake(REAL_SPY), Out()
-        assert sq.probe(["SPY", bad], first_quotes=first_source({}, calls), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out) == 2
+        assert sq.probe(["SPY", bad], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
         assert calls == [] and fake.calls == []
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    assert sq.probe([], first_quotes=first_source({}, calls), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out) == 2
+    assert sq.probe([], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
     assert calls == [] and fake.calls == []
 
 
 def test_a_repeated_symbol_is_fetched_once():
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    sq.probe(["SPY", "SPY"], first_quotes=first_source({}, calls), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out)
+    sq.probe(["SPY", "SPY"], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out)
     assert calls == [["SPY"]] and len(fake.calls) == 1
 
 
@@ -669,16 +1103,16 @@ def test_the_default_first_source_is_the_order_steps_own_function_by_import(monk
     seen = []
     monkeypatch.setattr(order_step, "minute_quotes", lambda symbols: seen.append(list(symbols)) or {"SPY": (752.6, FIRST_T)})
     out = Out()
-    sq.probe(["SPY"], fetch=Fake(REAL_SPY), clock=CLOCK, sleep=lambda s: None, out=out)
+    sq.probe(["SPY"], fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
     assert seen == [["SPY"]] and "752.6" in "\n".join(out.lines)
 
 
 def test_main_runs_the_probe_subcommand_and_refuses_bad_arguments():
     out = Out()
-    assert sq.main(["probe", "SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), clock=CLOCK,
+    assert sq.main(["probe", "SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
                    sleep=lambda s: None, out=out) == 0
     fake = Fake(REAL_SPY)
-    assert sq.main(["probe", "spy"], first_quotes=first_source({}), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=Out()) == 2
+    assert sq.main(["probe", "spy"], first_quotes=first_source({}), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=Out()) == 2
     assert fake.calls == []
     with pytest.raises(SystemExit) as e:
         sq.main([], fetch=fake, out=Out())
@@ -688,3 +1122,37 @@ def test_main_runs_the_probe_subcommand_and_refuses_bad_arguments():
     with pytest.raises(SystemExit):
         sq.main(["nonsense", "SPY"], fetch=fake, out=Out())
     assert fake.calls == []
+
+
+def test_the_probe_prints_zero_as_0_00_percent_never_minus_zero():
+    for first in (752.525, 752.524, 752.526):
+        out = Out()
+        sq.probe(["SPY"], first_quotes=first_source({"SPY": (first, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
+                 sleep=lambda s: None, out=out)
+        line = [l for l in out.lines if l.startswith("SPY")][0]
+        assert "| 0.00% |" in line and "-0.00%" not in line and "+0.00%" not in line, line
+    out = Out()
+    sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.4, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
+    assert "| -0.02% |" in [l for l in out.lines if l.startswith("SPY")][0]
+
+
+def test_the_probe_gives_compare_the_symbol_and_the_callers_clock(monkeypatch):
+    seen = []
+    real = sq.compare
+
+    def spy(first, second, **kw):
+        seen.append(kw)
+        return real(first, second, **kw)
+    monkeypatch.setattr(sq, "compare", spy)
+    sq.probe(["SPY", "XLE"], first_quotes=first_source({"SPY": (752.6, FIRST_T), "XLE": (64.8, FIRST_T)}),
+             fetch=Fake(REAL_SPY, REAL_XLE), clock=PCLOCK, sleep=lambda s: None, out=Out())
+    assert [k["symbol"] for k in seen] == ["SPY", "XLE"]
+    assert all(k["now"] == datetime.fromtimestamp(PNOW, timezone.utc) and k["now"].tzinfo is not None for k in seen)
+
+
+def test_the_probe_judges_age_by_its_clock():
+    out = Out()
+    sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), clock=lambda: PNOW + 3600,
+             sleep=lambda s: None, out=out)
+    line = [l for l in out.lines if l.startswith("SPY")][0]
+    assert "no second quote" in line and "agree" not in line
