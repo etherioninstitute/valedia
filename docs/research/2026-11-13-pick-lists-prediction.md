@@ -155,3 +155,7 @@ strict side: every one can only remove picks, never add them.
 19. **What the guards are.** One reading per rule and one scoring are kept by the code against slips and are
     recorded so that every reading ever made is printed with the result. They cannot stop someone who changes
     the code; the record is what makes that visible.
+20. **A selection in capitals (a narrowing of 16, same day, before any result).** The rule "in a selection
+    written wholly in capitals no word counts as a code" applies only when the selection holds at least one
+    word besides team codes and the bet's own markers (ML, a line, over or under, numbers). "LAL ML" and
+    "BOS -4.5" are codes; "IND STRONG ML" is not.
