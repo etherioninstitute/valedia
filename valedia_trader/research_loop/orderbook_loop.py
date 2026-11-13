@@ -21,8 +21,10 @@ What happens each minute (`Collector.cycle`), in this order:
             crossed (best bid at or above best ask), has a negative size or a malformed price is stored as sent
             (`raw_json`), marked `invalid` with the reason, and never decided on;
 * decide    then, every five minutes per market, on that market's own phase (the minutes of the hour where
-            minute mod 5 equals its phase, 0 to 4, given at selection and spread evenly), once it has 30 minutes
-            of snapshots: build the numeric state from what was stored strictly before that moment
+            minute mod 5 equals its phase, 0 to 4, given at selection and spread evenly), once it is warm: its
+            market's snapshots have held an unbroken run (no two consecutive ones more than STALE_S, 90 s, apart)
+            covering the 30 minutes before some moment at or after its choice (`Store.warm_time`; from then on
+            to its drop, a later hole giving nulls and `stale_data` by the usual rules): build the numeric state from what was stored strictly before that moment
             (`state_at`: "now" is the newest snapshot, and every history reference, and every minute of the 30-
             and 60-minute windows, is aimed at that snapshot's time less the horizon), check the pinned model
             tag, ask the six questions of `BATTERY` in one call, and store
@@ -43,13 +45,17 @@ What happens each minute (`Collector.cycle`), in this order:
             (`assign_phases`). A watch's 12 hours run from the start of the selection that chose it, so they
             end on the grid: at a reselection the watches that have run 12 hours, or will within two minutes, are
             ended first and their places filled in the same transaction, and nothing is left unwatched in
-            between. A market may be chosen again; when its snapshots ran on without a break (its tail included)
-            it needs no new 30-minute warm-up. Whenever nothing is watched, for whatever reason, a selection runs
+            between. A market may be chosen again; it inherits the run of snapshots of its earlier watch (its tail
+            included) only as far back as that run is unbroken up to the choice, so when its snapshots ran on
+            without a break it needs no new 30-minute warm-up, and after any break it does. Whenever nothing is watched, for whatever reason, a selection runs
             at once, off the grid (recorded as `selection_off_grid`), and again each minute until one chooses
             something; after three selections in a row that chose nothing, every five minutes. While a selection
             reads, each new minute still gets its cycle (`_tick`);
 * heartbeat one row with the requests and failures since the last one, written before any selection, and also
-            as soon as a cycle that has run into a new minute makes its next request or decision there.
+            as soon as a cycle that has run into a new minute makes its next request or decision there, and when
+            a cycle still makes a request or a decision ALIVE_S (50 s) into its own minute with no heartbeat in
+            it yet (so the minute in which an overrunning cycle starts has one, unless its last request there
+            began earlier and ran past the minute's end).
 
 If a cycle runs into the next minute the next one starts at once (event `overrun`); a minute it ran right through
 gets no cycle of its own, so each slot due in it gets its row, `late`, with the reason. Nothing but a stop signal
@@ -57,8 +63,14 @@ ends the loop: when the record cannot be written (a full disk) it writes one lin
 each minute, and records the gap once it can write again. Each trades read goes back to the market's last good
 one (less TRADE_READBACK_S), whatever came between: a pause, an outage, a sleep, a time out of sync, a restart, a
 store that could not be written; at most CATCH_UP_S (24 hours) back, and a longer hole is recorded once as
-`trades_lost`. A dropped market whose tail was cut short that way is read once more, as a tail (CATCH_UP_TRIES
-tries; then `trades_lost`). A market never read before goes back one minute.
+`trades_lost`. A market never read before goes back to TRADE_READBACK_S before the start of its watch (a watch
+chosen and then not read, as when an outage begins between a selection's book reads and its commit), with the
+same 24-hour limit. A dropped market whose tail was cut short that way (or never read) is read once more, as a
+tail: CATCH_UP_TRIES (3) tries, each failed one recorded as `catch_up_failed`, then one `trades_lost` for the
+hole. Both are deliberate: a tail that cannot be read (its book or trades keep failing) is not tried for ever,
+and its hole is recorded once; the tries and the event are in the record, so a restart neither forgets nor
+repeats them. A trade-window number (`trades_5m`, `volume_15m`, ...) is null unless the good trade reads cover
+the whole window without a hole up to its end, so while trade reads fail and books succeed it is null.
 
 The clock: no row is stored unless the collector's clock is known to be right. Two checks decide that:
 * a step detector, with no network: every reading of the wall clock also reads the monotonic clock, and when the
@@ -76,11 +88,13 @@ from it (a read whose request began before the step and ended after it is thrown
 event (with our clock and the latest Date), and from then on makes exactly one cheap Kalshi request a minute
 (`/exchange/status`, no retry) and nothing else. When an answer's Date agrees and no step was seen during that
 request, it records `clock_on` (with the Date and our clock at that answer; if the store cannot take it then, at
-the next cycle that can, after a `clock_off` it could not take either) and resumes exactly as after a stop of that
+the next cycle that can, after every `clock_off` it could not take either, in order) and resumes exactly as after a stop of that
 length: the gap is recorded, watches that ran out are dropped and replaced, the trades are read back as above,
 and holes in the history give nulls and warm-ups by the usual rules. For `status` a period out of sync is a gap
 like any stop. During a pause after repeated failures the only request is that cheap check, made when the latest
-Date that agreed is more than DATELESS_MAX_S less 65 s old, so the clock stays known through the pause.
+Date that agreed is more than DATELESS_MAX_S less 65 s old, so the clock stays known through the pause; a pause
+that begins inside a selection (in a cycle run while it reads) ends that selection before its next request
+(`selection_aborted`; no more market pages, books or fee reads), and it is due again after the pause.
 
 No single Kalshi request may take longer than 30 seconds (KALSHI_REQUEST_LIMIT_S): `collect`, `once` and
 `select` use a transport that gives up at that limit (`bounded_fetch`), and the collector treats any answer that
@@ -217,6 +231,7 @@ TRADE_READBACK_S = TAPE_LAG_S + 2 * CLOCK_AGREE_S + READBACK_MARGIN_S   # 150 s:
                                   # this far before the previous one began (late tape, our clock off by the threshold)
 CATCH_UP_S = 24 * 3600            # a trades read goes back to the market's last good one, at most this far
 CATCH_UP_TRIES = 3                # a dropped market's tail cut short by an outage: read once more, this many tries
+ALIVE_S = 50.0                    # a cycle still busy this far into its own minute writes that minute's heartbeat
 
 STATUSES = ("ok", "late", "model_unavailable", "tag_mismatch", "stale_data", "error")
 TABLES = ("selections", "markets", "market_drops", "snapshots", "trades", "decisions", "heartbeats", "events")
@@ -613,10 +628,11 @@ def window(snaps: list[dict], minutes: int) -> dict[int, dict] | None:
     return got if len(got) - 1 >= need else None
 
 
-def _covered_from(snaps: list[dict]) -> float | None:
-    """How far back the trade reads known so far cover the tape without a hole: each read covers from its
-    `trades_min_ts` to its start, and the chain holds while each earlier read started at or after the later one's
-    `trades_min_ts`."""
+def _covered(snaps: list[dict]) -> tuple[float, float] | None:
+    """The span the trade reads known so far cover without a hole, ending with the latest good read: (from, to).
+    Each read covers from its `trades_min_ts` to its start, and the chain holds while each earlier read started at
+    or after the later one's `trades_min_ts`. `to` is the latest good read's start: anything after it (reads that
+    failed since) is not covered."""
     reads = sorted((s for s in snaps if s.get("trades_ok") and s.get("trades_min_ts") is not None),
                    key=lambda s: s["trades_start_ts"])
     if not reads:
@@ -626,7 +642,7 @@ def _covered_from(snaps: list[dict]) -> float | None:
         if r["trades_start_ts"] < covered:
             break
         covered = min(covered, r["trades_min_ts"])
-    return covered
+    return covered, reads[-1]["trades_start_ts"]
 
 
 def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_ts: float) -> dict:
@@ -637,7 +653,8 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
     "Now" is the newest valid snapshot finished before t. Every history reference (the mid 1, 5, 15, 30 and 60
     minutes back, and the far edge of each window) is aimed at that snapshot's book time less the horizon, and is
     the snapshot nearest that target among the earlier ones within 30 s either side (`reference`), so it is never
-    the newest snapshot itself; none, and the number is null. The trade windows end at the same time.
+    the newest snapshot itself; none, and the number is null. The trade windows end at the same time, and are
+    null unless the good trade reads cover the whole window without a hole up to its end (`_covered`).
     `max_1m_mid_move_30m_cents` and `spread_vs_60m_median` are computed from the snapshots of their window's
     minutes, found by the same rule (`window`: minute k is the snapshot nearest now less k minutes, each snapshot
     used once), and are null only when fewer than 90% of the minutes (27 of 30, 54 of 60) are covered. The move
@@ -682,9 +699,9 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
                 spreads = [x for x in (_spread_c(s) for s in w60.values()) if x is not None]
                 med = statistics.median(spreads) if spreads else 0
                 out["spread_vs_60m_median"] = _r(spread / med, 2) if med > 0 else None
-    covered = _covered_from(snaps)
-    for w in (5, 15):
-        if covered is None or covered > a - 60 * w:
+    covered = _covered(snaps)
+    for w in (5, 15):                                  # null unless the reads cover the whole window, to its end
+        if covered is None or covered[0] > a - 60 * w or covered[1] < a:
             continue
         win = [x for x in tr if a - 60 * w < x["created_ts"] <= a]
         vol = sum(x["count"] for x in win)
@@ -792,10 +809,11 @@ class Store:
 
     def watched_at(self, t: float) -> list[dict]:
         """The watches that were watched at time t: chosen by then and not dropped before it."""
-        rows = self.conn.execute("SELECT m.watch_id, m.ticker, m.phase, m.warm_from_ts FROM markets m LEFT JOIN "
-                                 "market_drops d ON d.watch_id = m.watch_id WHERE m.selected_ts <= ? AND "
+        rows = self.conn.execute("SELECT m.watch_id, m.ticker, m.phase, m.warm_from_ts, m.selected_ts FROM markets m "
+                                 "LEFT JOIN market_drops d ON d.watch_id = m.watch_id WHERE m.selected_ts <= ? AND "
                                  "(d.dropped_ts IS NULL OR d.dropped_ts > ?) ORDER BY m.watch_id", (t, t))
-        return [{"watch_id": w, "ticker": tk, "phase": p or 0, "warm_from_ts": wf} for w, tk, p, wf in rows.fetchall()]
+        return [{"watch_id": w, "ticker": tk, "phase": p or 0, "warm_from_ts": wf, "selected_ts": sel}
+                for w, tk, p, wf, sel in rows.fetchall()]
 
     def tails(self, now: float, exclude: Iterable[str] = ()) -> list[dict]:
         """The dropped markets still to be read: dropped less than TAIL_S ago, not closed, not watched again; one
@@ -811,21 +829,55 @@ class Store:
                 out[t] = {"watch_id": wid, "ticker": t, "close_ts": close_ts, "dropped_ts": dropped, "tail": True}
         return list(out.values())
 
+    def count_events(self, kind: str, ticker: str, last_read_ts: float | None, cause: str | None = None) -> int:
+        """Events of this kind for this ticker whose `last_read_ts` is this one (None: never read), and with this
+        `cause` when given."""
+        n = 0
+        for (d,) in self.conn.execute("SELECT detail_json FROM events WHERE kind = ? AND ticker = ?", (kind, ticker)):
+            d = json.loads(d)
+            x = d.get("last_read_ts")
+            if (x is None) != (last_read_ts is None) or (x is not None and abs(x - last_read_ts) > 1e-3):
+                continue
+            if cause is None or d.get("cause") == cause:
+                n += 1
+        return n
+
     def last_trade_read(self, ticker: str) -> float | None:
         return self.conn.execute("SELECT MAX(trades_start_ts) FROM snapshots WHERE ticker = ? AND trades_ok = 1",
                                  (ticker,)).fetchone()[0]
 
     def warm_from(self, ticker: str, t: float) -> float | None:
-        """For a market chosen at t: when its run of snapshots began, if its snapshots (an earlier watch or that
-        watch's tail) ran up to t without a break; None when it starts afresh (its warm-up then runs from its
-        own first snapshot)."""
-        wid, newest = self.conn.execute("SELECT watch_id, MAX(book_end_ts) FROM snapshots WHERE ticker = ? AND "
-                                        "book_end_ts <= ?", (ticker, t)).fetchone()
-        if newest is None or newest < t - STALE_S:
+        """For a market chosen at t: when its unbroken run of snapshots (of any earlier watch of it or its tail; no
+        two consecutive ones more than STALE_S apart) that reaches up to t began; None when its newest snapshot is
+        more than STALE_S before t. Stored with the watch for information only: the warm-up is `warm_time`."""
+        times = [b for (b,) in self.conn.execute("SELECT book_end_ts FROM snapshots WHERE ticker = ? AND "
+                                                 "book_end_ts <= ? ORDER BY book_end_ts DESC", (ticker, t))]
+        if not times or times[0] < t - STALE_S:
             return None
-        warm, first = self.conn.execute("SELECT warm_from_ts, (SELECT MIN(book_end_ts) FROM snapshots WHERE "
-                                        "watch_id = ?) FROM markets WHERE watch_id = ?", (wid, wid)).fetchone()
-        return warm if warm is not None else first
+        start = times[0]
+        for b in times[1:]:
+            if start - b > STALE_S:
+                break
+            start = b
+        return start
+
+    def warm_time(self, ticker: str, chosen: float) -> float | None:
+        """When a watch of `ticker` chosen at `chosen` is warm: the first moment u, at or after the choice, at
+        which the market's snapshots (of every watch of it and their tails) hold an unbroken run covering the
+        WARMUP_S (30 minutes) before u: the run began at or before u - WARMUP_S, no two consecutive snapshots of
+        it are more than STALE_S apart, and its last one is at most STALE_S before u. So a run inherited from an
+        earlier watch counts only as far back as it is unbroken up to the choice. None while that has not
+        happened yet. It depends on no snapshot after u."""
+        r0 = prev = None
+        for (b,) in self.conn.execute("SELECT book_end_ts FROM snapshots WHERE ticker = ? AND book_end_ts >= ? "
+                                      "ORDER BY book_end_ts", (ticker, chosen - WARMUP_S - STALE_S)):
+            if prev is None or b - prev > STALE_S:
+                r0 = b                                   # a new run begins here
+            prev = b
+            u = max(b, r0 + WARMUP_S, chosen)
+            if u <= b + STALE_S:
+                return u
+        return None
 
     def history(self, watch_id: int, t: float) -> tuple[list[dict], list[dict], float]:
         """The market's snapshots finished strictly before t (from every watch of it and their tails, the last
@@ -1059,9 +1111,10 @@ class Collector:
         self._started = False                       # the `start` event is written once the clock is first right
         self._resume_due = False                    # in sync, but `start` or `clock_on` not yet written
         self._off_noted = False                     # the `clock_off` event of this period is written
-        self._off_row: dict | None = None           # a `clock_off` the store could not take yet
-        self._lost_noted: set = set()               # (ticker, last good read) whose `trades_lost` is written
-        self._catch_tries: dict = {}                # (ticker, last good read): tries of a cut-short tail
+        self._off_rows: list[dict] = []             # `clock_off` events the store could not take yet, in order
+        self._lost_noted: set = set()               # (ticker, last good read, cause) whose `trades_lost` is written
+                                                    # (a cache: the record itself is asked on a miss)
+        self._warm_at: dict = {}                    # watch_id: when it is warm (`Store.warm_time`), once known
         self.n_requests = self.n_failures = self.n_model_calls = 0
         inner = kalshi.fetch
 
@@ -1153,19 +1206,19 @@ class Collector:
         if not self._off_noted:
             self._off_noted = True
             now = self._read()
-            self._off_row = {**stamp("", now), "kind": "clock_off", "ticker": None,
-                             "detail_json": json.dumps({"why": why, **self._times(), "clock_ts": now})}
+            self._off_rows.append({**stamp("", now), "kind": "clock_off", "ticker": None,
+                                   "detail_json": json.dumps({"why": why, **self._times(), "clock_ts": now})})
             self._write_off()
 
     def _write_off(self) -> None:
-        """The `clock_off` of this period, if not written yet (a store that could not take it is tried again each
-        minute, and at the latest just before the `clock_on`)."""
-        if self._off_row is not None:
+        """The `clock_off` events not written yet, in order (a store that could not take them is tried again each
+        minute, and at the latest just before the `clock_on`). A later one never replaces an earlier one."""
+        while self._off_rows:
             try:
-                self.store.insert("events", self._off_row)
-                self._off_row = None
+                self.store.insert("events", self._off_rows[0])
             except Exception:
-                pass
+                return
+            self._off_rows.pop(0)
 
     def _check_due(self) -> bool:
         return self._last_check is None or self._mono() - self._last_check >= SYNC_EVERY_S - 1.0
@@ -1220,8 +1273,8 @@ class Collector:
         ins = self.store.insert
         self._guard()
         with self.store.conn:
-            if self._off_row is not None:                # the clock_off the store could not take then
-                ins("events", self._off_row, commit=False)
+            for row in self._off_rows:                   # the clock_offs the store could not take then
+                ins("events", row, commit=False)
             if first:
                 ins("events", ev("start", battery_id=BATTERY_ID, tag=TAG), commit=False)
             else:
@@ -1232,7 +1285,7 @@ class Collector:
             for w, reason, at in ends:
                 ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", at),
                                      "reason": reason}, commit=False)
-        self._started, self._resume_due, self._last_beat, self._off_row = True, False, now, None
+        self._started, self._resume_due, self._last_beat, self._off_rows = True, False, now, []
 
     # ---- small helpers
     def event(self, kind: str, ticker: str | None = None, **detail) -> None:
@@ -1454,42 +1507,56 @@ class Collector:
 
     def _alive(self) -> None:
         """A cycle that has run into a new minute writes that minute's heartbeat, so a minute it runs right
-        through still shows the loop alive in it."""
+        through still shows the loop alive in it; and a cycle still making a request or a decision ALIVE_S (50 s)
+        into its own minute with no heartbeat in that minute yet writes one then, so the minute in which an
+        overrunning cycle starts has its heartbeat too (one whose last request before the minute's end begins
+        earlier and runs past it leaves that minute without one)."""
         if not self.synced or self._minute is None or self._last_beat is None:
             return
-        m = math.floor(self.clock() / 60) * 60
-        if m > self._minute and m > math.floor(self._last_beat / 60) * 60:
+        now = self.clock()
+        m = math.floor(now / 60) * 60
+        beat_m = math.floor(self._last_beat / 60) * 60
+        if (m > self._minute and m > beat_m) or (m == self._minute and beat_m < m and now - m >= ALIVE_S):
             try:
                 self._beat()
             except Exception:                            # a store that cannot be written: the cycle reports it
                 pass
 
     def _catch_ups(self, now: float, exclude: set) -> list[dict]:
-        """Dropped markets whose tail an outage cut short (their last good trades read more than TRADE_READBACK_S
-        before the tail's end): read once more, as a tail, so their trades are caught up."""
+        """Dropped markets whose tail an outage cut short (their last good trades read, or the start of their watch
+        when they were never read, more than TRADE_READBACK_S before the tail's end): read once more, as a tail,
+        so their trades are caught up. The tries and the `trades_lost` are kept in the record (events
+        `catch_up_failed` and `trades_lost`), so a restart neither forgets nor repeats them."""
         out = []
-        for wid, t, close_ts, dropped, last in self.store.conn.execute(
+        for wid, t, close_ts, dropped, last, first in self.store.conn.execute(
                 "SELECT m.watch_id, m.ticker, m.close_ts, d.dropped_ts, (SELECT MAX(s.trades_start_ts) FROM snapshots s "
-                "WHERE s.ticker = m.ticker AND s.trades_ok = 1) FROM market_drops d JOIN markets m "
+                "WHERE s.ticker = m.ticker AND s.trades_ok = 1), (SELECT MIN(COALESCE(x.watch_start_ts, "
+                "x.selected_ts)) FROM markets x WHERE x.ticker = m.ticker) FROM market_drops d JOIN markets m "
                 "ON m.watch_id = d.watch_id WHERE d.id IN (SELECT MAX(id) FROM market_drops GROUP BY ticker)").fetchall():
             end = min(dropped + TAIL_S, close_ts)
-            if t in exclude or last is None or end > now or last + TRADE_READBACK_S >= end:
+            since = last if last is not None else first
+            if t in exclude or since is None or end > now or since + TRADE_READBACK_S >= end:
                 continue
-            if self._catch_tries.get((t, last), 0) < CATCH_UP_TRIES:
+            if (self.store.count_events("catch_up_failed", t, last) < CATCH_UP_TRIES
+                    and not self.store.count_events("trades_lost", t, last, cause="tail")):
                 out.append({"watch_id": wid, "ticker": t, "close_ts": close_ts, "dropped_ts": dropped, "tail": True,
-                            "catch_up": (last, end)})
+                            "catch_up": (last, end, since)})
         return out
 
     def _caught(self, w: dict) -> None:
-        """After a catch-up read: done if its trades were read; after CATCH_UP_TRIES failed tries, `trades_lost`."""
-        last, end = w["catch_up"]
-        if self.store.last_trade_read(w["ticker"]) != last:
+        """After a catch-up read: done if its trades were read; otherwise one more failed try (`catch_up_failed`),
+        and after CATCH_UP_TRIES of them, `trades_lost`. Both deliberate: a tail that cannot be read is not tried
+        for ever, and its hole is recorded once."""
+        last, end, since = w["catch_up"]
+        t = w["ticker"]
+        if self.store.last_trade_read(t) != last:
             return
-        key = (w["ticker"], last)
-        self._catch_tries[key] = self._catch_tries.get(key, 0) + 1
-        if self._catch_tries[key] >= CATCH_UP_TRIES:
-            self.event("trades_lost", w["ticker"], from_ts=last - TRADE_READBACK_S, from_iso=iso(last - TRADE_READBACK_S),
-                       to_ts=end, to_iso=iso(end), why="its tail could not be read after an outage")
+        tries = self.store.count_events("catch_up_failed", t, last) + 1
+        self.event("catch_up_failed", t, last_read_ts=last, attempt=tries)
+        if tries >= CATCH_UP_TRIES and not self.store.count_events("trades_lost", t, last, cause="tail"):
+            self.event("trades_lost", t, from_ts=since - TRADE_READBACK_S, from_iso=iso(since - TRADE_READBACK_S),
+                       to_ts=end, to_iso=iso(end), why="its tail could not be read after an outage",
+                       last_read_ts=last, cause="tail")
 
     def _skipped(self, prev_minute: float, upto: float) -> None:
         """The minutes after `prev_minute` and before `upto` had no cycle of their own because the cycle before
@@ -1510,13 +1577,19 @@ class Collector:
             m += 60
 
     def _warm(self, w: dict, slot_ts: float) -> bool:
-        """Whether the watch has its 30 minutes of snapshots at this slot (from `warm_from_ts` when it was chosen
-        again with its snapshots running on)."""
-        anchor = w.get("warm_from_ts")
-        if anchor is None:
-            anchor = self.store.conn.execute("SELECT MIN(book_end_ts) FROM snapshots WHERE watch_id = ?",
-                                             (w["watch_id"],)).fetchone()[0]
-        return anchor is not None and anchor <= slot_ts - WARMUP_S
+        """Whether the watch is warm at this slot: its market's snapshots held an unbroken run covering the 30
+        minutes before a moment at or after its choice and at or before the slot (`Store.warm_time`)."""
+        wid = w["watch_id"]
+        u = self._warm_at.get(wid)
+        if u is None:
+            sel = w.get("selected_ts")
+            if sel is None:
+                sel = self.store.conn.execute("SELECT selected_ts FROM markets WHERE watch_id = ?", (wid,)).fetchone()[0]
+            u = self.store.warm_time(w["ticker"], sel)
+            if u is None:
+                return False
+            self._warm_at[wid] = u                       # rows are only added later in time: it stays
+        return u <= slot_ts
 
     def _selections(self, limit: int) -> list[tuple[int, float, int, str]]:
         """The latest selections, newest first: (id, start, chosen, kind)."""
@@ -1578,17 +1651,24 @@ class Collector:
         """`min_ts` of a trades read whose book read ended at b1: TRADE_READBACK_S (150 s) before the market's last
         good trades read began, whatever came between (a pause, an outage, a sleep, a time out of sync, a restart, a
         store that could not be written), up to CATCH_UP_S (24 hours) back; a longer hole is recorded once as
-        `trades_lost`. A market never read before: one minute back."""
+        `trades_lost` (in the record, so a restart does not repeat it). A market never read before: TRADE_READBACK_S
+        before the start of its (first) watch, however long ago that was (a watch committed but not read yet, an
+        outage right after a selection), and never less than FIRST_TRADES_S back; up to CATCH_UP_S likewise."""
         last = self.store.last_trade_read(ticker)
         if last is None:
-            return int(b1 - FIRST_TRADES_S)
-        min_ts = last - TRADE_READBACK_S
+            start = self.store.conn.execute("SELECT MIN(COALESCE(watch_start_ts, selected_ts)) FROM markets WHERE "
+                                            "ticker = ?", (ticker,)).fetchone()[0]
+            min_ts = b1 - FIRST_TRADES_S if start is None else min(start - TRADE_READBACK_S, b1 - FIRST_TRADES_S)
+        else:
+            min_ts = last - TRADE_READBACK_S
         if min_ts < b1 - CATCH_UP_S:
-            if (ticker, last) not in self._lost_noted:
-                self._lost_noted.add((ticker, last))
+            key = (ticker, last, "hole")
+            if key not in self._lost_noted and not self.store.count_events("trades_lost", ticker, last, cause="hole"):
                 self.event("trades_lost", ticker, from_ts=min_ts, from_iso=iso(min_ts), to_ts=b1 - CATCH_UP_S,
                            to_iso=iso(b1 - CATCH_UP_S), why="the last good read is more than %d h back"
-                           % (CATCH_UP_S // 3600))
+                           % (CATCH_UP_S // 3600) if last is not None else "the watch began more than %d h back, "
+                           "never read" % (CATCH_UP_S // 3600), last_read_ts=last, cause="hole")
+            self._lost_noted.add(key)
             min_ts = b1 - CATCH_UP_S
         return int(min_ts)
 
@@ -1755,7 +1835,13 @@ class Collector:
                 if max_pages and pages >= max_pages:
                     break
                 self._tick()
+                if self.paused():                        # a pause began inside the selection: no more pages
+                    raise _SelectionAborted("paused after repeated failures")
             self._ok()
+        except _SelectionAborted as e:                   # not recorded, so it is due again a minute later
+            if not dry_run:
+                self.event("selection_aborted", None, why=str(e))
+            return None
         except Exception as e:
             if not dry_run:
                 self._fail(None, "markets", e)
@@ -1793,6 +1879,9 @@ class Collector:
             s = series_of(by_ticker[t])
             if s not in fees:
                 self._tick()
+                if self.paused():                        # nor a fee read
+                    self.event("selection_aborted", None, why="paused after repeated failures")
+                    return None
                 try:
                     fees[s] = self.kalshi.series(s)
                     self._ok()
@@ -1838,9 +1927,9 @@ def _day(ts: float) -> str:
 
 def day_status(store: Store, now: float) -> list[dict]:
     """Per UTC day: decision slots expected (every slot of every watch on its own phase's five-minute grid, from
-    30 minutes after its first snapshot, or after `warm_from_ts` when it was chosen again with its snapshots running
-    on, but never before the watch itself began, so each slot of a market chosen again is counted once, to its drop
-    or now; slots while the loop was stopped or out of sync count, uncollected) and collected (one of those slots
+    the moment it is warm (`Store.warm_time`: an unbroken 30-minute run of its market's snapshots, never before
+    the watch itself began, so each slot of a market chosen again is counted once) to its drop or now; a watch
+    never warm has none; slots of a warm watch while the loop was stopped or out of sync count, uncollected) and collected (one of those slots
     with a non-forced decision with answers: `ok`), the share, which so cannot pass 100%; market-minutes watched
     (each watch from its market row to its drop or now, counting only the minutes in which the loop was running and
     not paused, that is wrote a heartbeat that was not paused) and their share of the nominal 20 x 1440; the model's
@@ -1856,18 +1945,17 @@ def day_status(store: Store, now: float) -> list[dict]:
                                    "failures": 0, "errors": 0})
     alive = {int(ts // 60) for (ts,) in c.execute("SELECT ts FROM heartbeats WHERE paused = 0")}
     slots: set = set()
-    for _, ticker, selected, dropped, first, phase, warm in c.execute(
-            "SELECT m.watch_id, m.ticker, m.selected_ts, d.dropped_ts, (SELECT MIN(book_end_ts) FROM snapshots s "
-            "WHERE s.watch_id = m.watch_id), m.phase, m.warm_from_ts FROM markets m LEFT JOIN market_drops d "
+    for _, ticker, selected, dropped, phase in c.execute(
+            "SELECT m.watch_id, m.ticker, m.selected_ts, d.dropped_ts, m.phase FROM markets m LEFT JOIN market_drops d "
             "ON d.watch_id = m.watch_id").fetchall():
         end = dropped if dropped is not None else now
         for m in range(int(selected // 60), int(end // 60) + 1):     # only minutes the loop was running
             a, b = max(selected, 60.0 * m), min(end, 60.0 * m + 60)
             if b > a and m in alive:
                 day(_day(60 * m))["watched_minutes"] += (b - a) / 60.0
-        anchor = warm if warm is not None else first if first is not None else selected
-        start = max(anchor + WARMUP_S, selected)       # a market chosen again: its earlier slots belong to the
-                                                       # earlier watch
+        start = store.warm_time(ticker, selected)      # never before the watch itself: a market chosen again
+        if start is None or start > now:               # has its earlier slots counted for the earlier watch
+            continue
         offset = 60 * (phase or 0)                     # the market's own grid: minutes where minute mod 5 == phase
         s = math.ceil((start - offset) / SLOT_S) * SLOT_S + offset
         while s < end:

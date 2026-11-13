@@ -767,9 +767,10 @@ def test_status_on_a_synthetic_three_day_record(tmp_path):
     ins = store.insert
     w = ins("markets", {"selection_id": 1, "ticker": "A-E-M", "series": "A", **ol.stamp("selected", D0),
                         **ol.stamp("close", D0 + 9 * 86400), "market_json": "{}", "book_json": "{}", "why": "x"})
-    ins("snapshots", {"watch_id": w, "ticker": "A-E-M", **ol.stamp("book_start", D0 + 29.5),
-                      **ol.stamp("book_end", D0 + 30), **ol.stamp("end", D0 + 30.5), "book_state": "two_sided",
-                      "trades_ok": 1, "new_trades": 0, "yes_json": "[]", "no_json": "[]"})
+    for k in range(31):                                         # rev 9: the unbroken 30 minutes a warm-up needs
+        ins("snapshots", {"watch_id": w, "ticker": "A-E-M", **ol.stamp("book_start", D0 + 29.5 + 60 * k),
+                          **ol.stamp("book_end", D0 + 30 + 60 * k), **ol.stamp("end", D0 + 30.5 + 60 * k),
+                          "book_state": "two_sided", "trades_ok": 1, "new_trades": 0, "yes_json": "[]", "no_json": "[]"})
     ins("market_drops", {"watch_id": w, "ticker": "A-E-M", **ol.stamp("dropped", D0 + 2 * 86400 + 43200),
                          "reason": "watched 12 hours"})
 
@@ -916,10 +917,11 @@ def test_status_counts_each_markets_own_grid(tmp_path):
     wb = ins("markets", {"selection_id": 1, "ticker": "B-E-M", "series": "B", **ol.stamp("selected", D0 + 500),
                          **ol.stamp("close", D0 + 9 * 86400), "market_json": "{}", "book_json": "{}", "why": "x",
                          "phase": 3})
-    for w, t in ((wa, D0 + 30), (wb, D0 + 600)):
-        ins("snapshots", {"watch_id": w, "ticker": "X", **ol.stamp("book_start", t - 0.5), **ol.stamp("book_end", t),
-                          **ol.stamp("end", t + 0.5), "book_state": "two_sided", "trades_ok": 1, "new_trades": 0,
-                          "yes_json": "[]", "no_json": "[]"})
+    for w, tk, t0 in ((wa, "A-E-M", D0 + 30), (wb, "B-E-M", D0 + 600)):
+        for t in (t0 + 60 * k for k in range(31)):              # rev 9: the unbroken 30 minutes a warm-up needs
+            ins("snapshots", {"watch_id": w, "ticker": tk, **ol.stamp("book_start", t - 0.5),
+                              **ol.stamp("book_end", t), **ol.stamp("end", t + 0.5), "book_state": "two_sided",
+                              "trades_ok": 1, "new_trades": 0, "yes_json": "[]", "no_json": "[]"})
     ins("market_drops", {"watch_id": wb, "ticker": "B-E-M", **ol.stamp("dropped", D0 + 43200), "reason": "x"})
     # A: minutes 1, 6, 11, ... from 00:31 (the first after 00:30:30) to 23:56: 282 slots
     # B: minutes 3, 8, 13, ... from 00:43 (the first after 00:40:00) to 11:58: 136 slots
@@ -1318,6 +1320,36 @@ def test_on_simulated_days_every_reference_is_aimed_at_the_newest_snapshot(tmp_p
 
 # ---------------------------------------------------------------- item 2: status counts each slot once
 
+def warm_times_from_rows(store):
+    """For each watch, from the stored rows alone: the first moment u, from its choice on, at which its market's
+    snapshots (of any watch of it, tails included) hold an unbroken run reaching back 30 minutes before u: the run
+    starts at or before u - 1800, no two consecutive snapshots of it are more than 90 s apart, and one of them lies
+    in [u - 90, u]. None when that never happens. (Written apart from the module's code.)"""
+    c = store.conn
+    by: dict = {}
+    for tk, b in c.execute("SELECT ticker, book_end_ts FROM snapshots ORDER BY book_end_ts"):
+        by.setdefault(tk, []).append(b)
+    out = {}
+    for wid, tk, sel in c.execute("SELECT watch_id, ticker, selected_ts FROM markets"):
+        times, runs = by.get(tk, []), []
+        for b in times:
+            if runs and b - runs[-1][-1] <= 90:
+                runs[-1].append(b)
+            else:
+                runs.append([b])
+        best = None
+        for run in runs:
+            lo = max(run[0] + 1800, sel)
+            for b in run:                                       # the first u >= lo with a snapshot in [u - 90, u]
+                if b >= lo - 90:
+                    best = max(lo, b)
+                    break
+            if best is not None:
+                break
+        out[wid] = best
+    return out
+
+
 def independent_status(store, now):
     """Expected slots, collected slots and watched minutes per UTC day, counted minute by minute from the raw
     record, not with the module's code."""
@@ -1333,12 +1365,7 @@ def independent_status(store, now):
     for wid, tk, b in c.execute("SELECT watch_id, ticker, book_end_ts FROM snapshots ORDER BY book_end_ts"):
         by_ticker.setdefault(tk, []).append(b)
         first.setdefault(wid, b)
-    anchor, last_watch = {}, {}
-    for wid, tk, sel, end, ph in watches:                       # chosen again with its reads running on: no warm-up
-        earlier = [b for b in by_ticker.get(tk, []) if b <= sel]
-        p = last_watch.get(tk)
-        anchor[wid] = anchor[p] if p is not None and earlier and earlier[-1] >= sel - 90 else first.get(wid)
-        last_watch[tk] = wid
+    warm = warm_times_from_rows(store)                          # rev 9: an unbroken run of 30 minutes
     slots, watched = set(), Counter()
     for wid, tk, sel, end, ph in watches:
         end = min(end, now)
@@ -1346,7 +1373,7 @@ def independent_status(store, now):
             lo, hi = max(sel, 60.0 * m), min(end, 60.0 * m + 60)
             if hi > lo and m in alive:
                 watched[day(60 * m)] += (hi - lo) / 60
-            if m % 5 == ph and sel <= 60 * m < end and anchor[wid] is not None and 60 * m >= anchor[wid] + 1800:
+            if m % 5 == ph and sel <= 60 * m < end and warm[wid] is not None and 60 * m >= warm[wid]:
                 slots.add((tk, 60.0 * m))
     expected = Counter(day(s) for _, s in slots)
     ok = Counter(day(s) for tk, s, st in c.execute("SELECT ticker, slot_ts, status FROM decisions WHERE forced = 0")
@@ -2448,3 +2475,340 @@ def test_a_clock_off_the_store_could_not_take_is_written_when_it_can_and_before_
 def test_the_docstring_no_longer_says_a_pause_makes_no_request_or_most_slots_are_late_at_0_9_s():
     doc = " ".join(ol.__doc__.split())
     assert "makes no request for five minutes" not in doc and "0.9 s a request and more" not in doc
+
+
+
+# ================================================================= rev 9: invariants
+
+def assert_warm_rule(store, now):
+    """No decision, and no slot counted as due, before the watch's market has an unbroken 30-minute run."""
+    warm = warm_times_from_rows(store)
+    bad = [(wid, slot) for wid, slot in store.conn.execute("SELECT watch_id, slot_ts FROM decisions WHERE forced = 0")
+           if warm[wid] is None or slot < warm[wid]]
+    assert bad == []
+    expected, _, _ = independent_status(store, now)
+    assert {r["day"]: r["expected"] for r in ol.day_status(store, now) if r["expected"]} == \
+        {d: n for d, n in expected.items() if n}
+
+
+def run_cycle(col):
+    """One cycle as `run` makes it: a failure is recorded (or, with the store refusing writes, reported)."""
+    try:
+        col.cycle()
+    except Exception as e:
+        col._record_failure(e)
+    except ol._OutOfSync as e:
+        col._go_off(str(e))
+
+
+def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0):
+    """A run on the test's own true clock with `events`, each (minute, kind, length[, market]): "network" (every
+    request fails), "pause" (book reads fail for 3 minutes: the five-failure pause), "step" (the clock an hour
+    back), "unwritable" (the store refuses writes), "one_sided" (that market's book one-sided), "sleep" (both
+    clocks stop: the machine sleeps) and "restart" (a new process on the same record), each for `length` minutes."""
+    import random
+    rnd = random.Random(seed)
+    mono = {}
+
+    def make(true):
+        mono["m"] = Mono(true)
+        return mono["m"]
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=n, mono=make)
+    if slots:
+        col.slots = slots
+    if trades:
+        k = 0
+        for i in range(0, last + 1):
+            for m in world.markets:
+                for _ in range(2):
+                    k += 1
+                    world.trade(m["ticker"], k, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, ol.TAPE_LAG_S))
+    books = {m["ticker"]: book(0.40, 0.45) for m in world.markets}
+    col.start()
+    ends: dict = {}
+    i = 0
+    while i <= last:
+        for e in events:
+            start, kind, length = e[:3]
+            if start == i:
+                if kind == "network":
+                    world.fail = True
+                elif kind == "pause":
+                    world.fail_paths = {"/markets/%s/orderbook" % m["ticker"] for m in world.markets}
+                    length = 3
+                elif kind == "step":
+                    skew.offset = -3600.0
+                elif kind == "unwritable":
+                    store.conn.execute("PRAGMA query_only = 1")
+                elif kind == "one_sided":
+                    world.books[world.markets[e[3]]["ticker"]] = book(0.40, None)
+                ends.setdefault(start + length, []).append(e)
+        for e in ends.pop(i, []):
+            kind = e[1]
+            if kind == "network":
+                world.fail = False
+            elif kind == "pause":
+                world.fail_paths = set()
+            elif kind == "step":
+                skew.offset = 0.0
+            elif kind == "unwritable":
+                store.conn.execute("PRAGMA query_only = 0")
+            elif kind == "one_sided":
+                t = world.markets[e[3]]["ticker"]
+                world.books[t] = books[t]
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        run_cycle(col)
+        jump = [e for e in events if e[0] == i and e[1] in ("sleep", "restart")]
+        if jump:
+            kind, length = jump[0][1], jump[0][2]
+            true.t += length * 60
+            if kind == "sleep":
+                mono["m"].slept += length * 60
+            i += length
+            if kind == "restart":
+                kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono["m"], tries=1)
+                col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+                                     monotonic=mono["m"], slots=slots or ol.WATCH_COUNT)
+                true.t = max(true.t, T0 + 60 * i + 0.5)
+                col.start()
+        i += 1
+    return col, world, store, true, skew
+
+
+# ---------------------------------------------------------------- invariant 1: warm-up needs an unbroken run
+
+GAPS = ([("network", L, b) for b in ("warm_up", "outside", "in_pause") for L in (6, 30, 65, 120, 780, 1500)]
+        + [("sleep", 120, "in_pause"), ("sleep", 780, "outside"), ("restart", 180, "outside"),
+           ("restart", 780, "outside"), ("restart", 20, "warm_up"), ("unwritable", 20, "warm_up"),
+           ("unwritable", 65, "outside"), ("unwritable", 65, "in_pause")])
+
+
+@pytest.mark.parametrize("kind,minutes,begin", GAPS, ids=["%s-%dm-%s" % g for g in GAPS])
+def test_no_decision_before_an_unbroken_30_minute_run_whatever_the_gap(tmp_path, kind, minutes, begin):
+    """The verifier's case is network-780m-in_pause: a 13-hour outage that begins in a pause."""
+    at = {"warm_up": 10, "outside": 40, "in_pause": 43}[begin]
+    events = [(40, "pause", 3)] if begin == "in_pause" else []
+    events.append((at, kind, minutes))
+    last = at + minutes + 75
+    col, world, store, true, skew = scenario(tmp_path, events, last, trades=False)
+    assert col.synced
+    assert store.conn.execute("SELECT COUNT(*) FROM decisions WHERE forced = 0").fetchone()[0] > 0
+    assert_warm_rule(store, skew())
+
+
+def random_events(rnd, n):
+    """A seeded sequence of gaps and re-choices that do not overlap."""
+    events, t = [], rnd.randint(5, 45)
+    for _ in range(rnd.randint(2, 6)):
+        kind = rnd.choice(["network", "network", "pause", "step", "unwritable", "one_sided", "one_sided", "sleep",
+                           "restart"])
+        length = rnd.choice([2, 5, 20, 40, 70, 200, 760, 1500]) if kind not in ("pause", "one_sided") else \
+            (3 if kind == "pause" else rnd.choice([31, 40, 60]))
+        events.append((t, kind, length) + ((rnd.randrange(n),) if kind == "one_sided" else ()))
+        t += (length if kind != "pause" else 3) + rnd.randint(3, 50)
+    return events, t + rnd.randint(35, 70)
+
+
+@pytest.mark.parametrize("chunk", range(8))
+def test_the_warm_up_rule_holds_over_generated_sequences_of_gaps_and_re_choices(tmp_path, chunk):
+    import random
+    for seed in range(25 * chunk, 25 * chunk + 25):              # 200 sequences in all
+        rnd = random.Random(1000 + seed)
+        n = rnd.choice([2, 3])
+        events, last = random_events(rnd, n)
+        col, world, store, true, skew = scenario(tmp_path / str(seed), events, last, n=n,
+                                                 slots=rnd.choice([1, n]), trades=False, seed=seed)
+        try:
+            assert_warm_rule(store, skew())
+        except AssertionError as e:
+            raise AssertionError("seed %d, events %s: %s" % (seed, events, e)) from None
+
+
+# ---------------------------------------------------------------- invariant 2: a watch never read
+
+@pytest.mark.parametrize("minutes", [65, 120])
+def test_an_outage_between_a_selections_book_reads_and_its_commit_loses_no_trade(tmp_path, minutes):
+    import random
+    rnd = random.Random(23)
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    last = minutes + 60
+    k = 0
+    for i in range(0, last + 1):
+        for m in world.markets:
+            for _ in range(2):
+                k += 1
+                world.trade(m["ticker"], k, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, ol.TAPE_LAG_S))
+    began = {}
+
+    def hook(path):
+        if path.startswith("/series/") and not began:            # after the books, before the commit
+            began["t"] = true.t
+            world.fail = True
+    world.on_request = hook
+    col.start()
+    for i in range(0, last + 1):
+        if began and i == int((began["t"] - T0) // 60) + minutes:
+            world.fail = False
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        col.cycle()
+    c = store.conn
+    start = c.execute("SELECT MIN(watch_start_ts) FROM markets").fetchone()[0]
+    assert began and start < began["t"] and len(col.watched()) == 2
+    stored = {r[0] for r in c.execute("SELECT trade_id FROM trades")}
+    want = {r["trade_id"] for v in world.tape.values() for r in v
+            if kd.iso_to_ts(r["created_time"]) >= start and r["_on_tape"] <= true.t - 61}
+    assert len(want) > 200 and want - stored == set()
+    assert "trades_lost" not in event_kinds(store)
+
+
+# ---------------------------------------------------------------- invariant 3: trade windows need every read
+
+def window_read(snaps, a, minutes):
+    """From stored snapshot rows: whether the good trade reads cover (a - 60 * minutes, a] without a hole."""
+    spans = sorted((s["trades_min_ts"], s["trades_start_ts"]) for s in snaps if s["trades_ok"])
+    lo, hi = a - 60 * minutes, a
+    at = lo
+    for x, y in spans:
+        if x <= at < y or x <= at <= y:
+            at = max(at, y)
+    return at >= hi
+
+
+@pytest.mark.parametrize("failing", [1, 5, 20])
+def test_a_trade_window_is_null_unless_every_read_covering_it_succeeded(tmp_path, failing):
+    import random
+    runs = []
+    for k, fail in enumerate((False, True)):
+        rnd = random.Random(29)
+        col, world, model, store, rec, true, skew = sync_rig(tmp_path / str(k), n=5)
+        n = 0
+        for i in range(0, 101):
+            for m in world.markets:
+                for _ in range(3):
+                    n += 1
+                    world.trade(m["ticker"], n, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, 20))
+        col.start()
+        for i in range(0, 101):
+            if fail and i == 60:
+                world.fail_paths = {"/markets/trades"}          # books still answer, trade reads fail
+            if fail and i == 60 + failing:
+                world.fail_paths = set()
+            true.t = max(true.t, T0 + 60 * i + 0.5)
+            col.cycle()
+        rows = store.conn.execute("SELECT watch_id, ticker, slot_ts, decision_ts, state_json FROM decisions "
+                                  "WHERE forced = 0 AND state_json IS NOT NULL ORDER BY id").fetchall()
+        runs.append((store, {(tk, slot): (wid, t, json.loads(st)) for wid, tk, slot, t, st in rows}))
+    (_, control), (store, failed) = runs
+    unread = 0
+    for key, (wid, t, state) in failed.items():
+        snaps, _, _ = store.history(wid, t)
+        valid = [s for s in snaps if not s["invalid"]]
+        a = valid[-1]["book_end_ts"]
+        for w in (5, 15):
+            names = ("trades_%dm" % w, "volume_%dm" % w, "yes_taker_share_%dm" % w)
+            if not window_read(snaps, a, w):
+                unread += 1
+                assert all(state[x] is None for x in names), (key, w, state)
+            elif key in control:
+                assert [state[x] for x in names] == [control[key][2][x] for x in names], (key, w)
+    assert unread > 0
+
+
+# ---------------------------------------------------------------- low 4 to 8
+
+def test_two_clock_offs_waiting_for_the_store_are_both_written_in_order(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
+    col.start()
+    for i in range(0, 5):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    store.conn.execute("PRAGMA query_only = 1")                 # the disk is full from here
+    world.date_offset = -100.0
+    true.t = T0 + 5 * 60 + 0.5
+    run_cycle(col)                                              # off (a Date 100 s away): not written
+    world.date_offset = 0.0
+    true.t = T0 + 6 * 60 + 0.5
+    run_cycle(col)                                              # right again, but clock_on cannot be written
+    assert col.synced
+    skew.offset = -3600.0
+    true.t = T0 + 7 * 60 + 0.5
+    run_cycle(col)                                              # the clock steps: off again, not written either
+    assert not col.synced
+    skew.offset = 0.0
+    store.conn.execute("PRAGMA query_only = 0")
+    for i in (8, 9):
+        true.t = T0 + 60 * i + 0.5
+        run_cycle(col)
+    rows = [(k, json.loads(d)) for k, d in store.conn.execute("SELECT kind, detail_json FROM events ORDER BY id")]
+    offs = [d for k, d in rows if k == "clock_off"]
+    assert len(offs) == 2 and "Date" in offs[0]["why"] and "stepped" in offs[1]["why"]
+    kinds = [k for k, _ in rows]
+    assert col.synced and kinds.index("clock_off") < len(kinds) - 1 - kinds[::-1].index("clock_off") < \
+        kinds.index("clock_on")
+
+
+def test_an_unreadable_cut_short_tail_gives_one_trades_lost_across_restarts(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=3)
+    col.start()
+    for i in range(0, 41):
+        true.t = T0 + 60 * i + 0.5
+        col.cycle()
+    gone = world.markets[0]["ticker"]
+    world.fail = True                                           # 13 hours without Kalshi: every watch runs out
+    for i in range(41, 821):
+        true.t = T0 + 60 * i + 0.5
+        run_cycle(col)
+    world.fail = False
+    world.markets = world.markets[1:]                           # not chosen again,
+    world.fail_paths = {"/markets/%s/orderbook" % gone}         # and its book can no longer be read
+    lost = []
+    for k in range(4):                                          # four processes on the same record
+        for i in range(6):
+            true.t += 60
+            run_cycle(col)
+        lost.append([t for (t,) in store.conn.execute("SELECT ticker FROM events WHERE kind = 'trades_lost'")])
+        kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=true.mono, tries=1)
+        col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+                             monotonic=true.mono)
+        col.start()
+    tries = store.conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'catch_up_failed' AND ticker = ?",
+                               (gone,)).fetchone()[0]
+    assert lost[0].count(gone) == 1 and lost[-1].count(gone) == 1 and tries == ol.CATCH_UP_TRIES
+
+
+def test_the_minute_in_which_the_first_overrunning_cycle_starts_gets_its_heartbeat(tmp_path):
+    col, world, model, store, clock = started(tmp_path, n=5)
+    run_minutes(col, clock, 1, 40)
+    for m in world.markets:
+        world.book_delay[m["ticker"]] = 14.0                    # 70 s of books: into 06:42
+    clock.t = T0 + 41 * 60 + 0.5
+    col.cycle()
+    assert clock.t > T0 + 42 * 60
+    beats = {int((ts - T0) // 60) for (ts,) in store.conn.execute("SELECT ts FROM heartbeats")}
+    assert {40, 41, 42} <= beats
+
+
+def test_a_pause_that_begins_inside_a_selection_stops_its_market_pages(tmp_path):
+    col, world, model, store, clock = rig(tmp_path)
+    world.markets = [mkt("M%03d-E-M" % i, vol=1000 + i) for i in range(40)]
+    for m in world.markets:
+        world.books[m["ticker"]] = book(0.40, 0.45)
+    col.start()
+    col.select()
+    run_minutes(col, clock, 1, 3)
+    world.page_size, world.markets_delay = 5, 8 * 25.0           # eight pages of 25 s each: into the next minutes
+    world.fail_paths = {"/markets/%s/orderbook" % m["ticker"] for m in world.markets}
+    seen = []
+    world.on_request = lambda path: seen.append((path, col.paused()))
+    clock.t = T0 + 4 * 60 + 0.5
+    assert col.select(kind="grid") is None                      # a cycle inside it fails five times: a pause
+    kinds = event_kinds(store)
+    assert "pause" in kinds and kinds[-1] == "selection_aborted"
+    assert [p for p, paused in seen if paused and p != ol.SYNC_PATH] == []
+    assert 0 < len([p for p, _ in seen if p == "/markets"]) < 8
+
+
+def test_the_docstring_says_catch_up_tries_are_deliberate_and_what_a_pause_still_sends():
+    doc = " ".join(ol.__doc__.split())
+    assert "deliberate" in doc and ol.CATCH_UP_TRIES == 3
+    assert "a pause that begins inside a selection" in doc and "selection_aborted" in doc
