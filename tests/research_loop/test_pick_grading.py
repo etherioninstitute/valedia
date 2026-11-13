@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
@@ -86,6 +87,7 @@ class PickWorld:
     def __init__(self):
         self.items = []
         self.n = 0
+        self.unparsed = set()                  # comments whose versions get no parse at build (see `parse_later`)
 
     def _add(self, when, kind, data):
         self.n += 1
@@ -126,6 +128,8 @@ class PickWorld:
                         "role, deleted, backend, payload_id, change) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (d["cid"], d["version"], d["author"], body, "utf8", pl.sha256_text(body), when, d["role"],
                          int(d["deleted"]), "oauth", pid, "first" if d["first"] else "edit")).lastrowid
+                    if d["cid"] in self.unparsed:
+                        continue
                     dec = pl.decimal_from_odds(d["odds"]) if d["odds"] else None
                     parse = store.conn.execute(
                         "INSERT INTO parses (version_id, prompt_hash, model, parsed_at, status, reason, is_pick, "
@@ -138,6 +142,28 @@ class PickWorld:
         finally:
             store.close()
         return path
+
+    def parse_later(self, path, cid, when):
+        """The parse of `cid`'s versions, stored at `when` (a parse that came after the comment)."""
+        db = sqlite3.connect(path)
+        try:
+            for _, _, kind, d in sorted(self.items, key=lambda x: (x[0], x[1])):
+                if kind != "version" or d["cid"] != cid:
+                    continue
+                vid = db.execute("SELECT id FROM comment_versions WHERE comment_id = ? AND version = ?",
+                                 (cid, d["version"])).fetchone()[0]
+                f = d["fields"]
+                dec = pl.decimal_from_odds(d["odds"]) if d["odds"] else None
+                parse = db.execute("INSERT INTO parses (version_id, prompt_hash, model, parsed_at, status, reason, is_pick, "
+                                   "decimal_odds, raw_output) VALUES (?,?,?,?,?,?,?,?,?)",
+                                   (vid, pl.PROMPT_HASH, "m", when, "ok", None, 1 if f else 0, dec, "{}")).lastrowid
+                for k, v in (f or {}).items():
+                    val = json.dumps(v) if k == "event" else (None if v is None else str(v))
+                    db.execute("INSERT INTO parse_fields (parse_id, field, value, phrase, kept, reason) "
+                               "VALUES (?,?,?,?,?,?)", (parse, k, val, "p", 1, None))
+            db.commit()
+        finally:
+            db.close()
 
 
 def ml(team, league=None):
@@ -1041,6 +1067,118 @@ def test_an_english_word_code_counts_only_before_the_bet_also_in_a_selection_all
     assert "no" in fallback and "was" in fallback and len(fallback) < 2000
 
 
+# ---------------------------------------------------------------- the grading store's own copy of the word list
+
+def _word_env(tmp_path, capsys):
+    """"Take NO tonight ML" is not graded while "no" is an English word, and names the Noraton team once it is not."""
+    w = PickWorld()
+    w.thread()
+    for cid, text in (("c2", "Take NO ML"), ("c9", "Take NO tonight ML")):
+        w.comment(cid, "a" + cid, [("2026-11-13T18:00:00Z", {"market": "moneyline", "selection": text}, "-110")])
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev("g1", "Noraton Pelirs", "Waraton Bulirs", "2026-11-14T00:00:00Z")]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", "26NOV13", ("WAR", "Waraton"), ("NO", "Noraton"))]
+    env.clock.set("2026-11-13T17:00:00Z")
+    env.out(capsys, "schedule")
+    return env
+
+
+def _as_layout_3_of_3da5011(env):
+    """The store as 3da5011 wrote it: layout 3, no word-list table (and so none of its triggers)."""
+    c = sqlite3.connect(str(env.root / pg.STORE_FILE))
+    for t in ("no_update_word_lists", "no_delete_word_lists", "no_replace_word_lists"):
+        c.execute("DROP TRIGGER IF EXISTS %s" % t)
+    c.execute("DROP TABLE IF EXISTS word_lists")
+    c.commit()
+    assert c.execute("SELECT version FROM layout").fetchone()[0] == 3
+    c.close()
+
+
+def _word_rows(env, fp):
+    s = env.store()
+    try:
+        return {r["comment_id"]: r for r in s.latest_matches(fp)}
+    finally:
+        s.close()
+
+
+def test_a_store_of_3da5011_takes_its_copy_of_the_word_list_on_its_first_match_and_keeps_it(
+        tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text("no\nway\nis\nthe\nplay\ntake\ntonight\n")
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    env = _word_env(tmp_path, capsys)
+    _as_layout_3_of_3da5011(env)
+    before = env.out(capsys, "status")                                       # read only: the old store has no copy
+    assert before["word_list"] == {"kept": False, "source": "file %s" % words, "words": 7}
+    env.clock.set("2026-11-13T19:00:00Z")
+    first = env.out(capsys, "match")
+    st = env.out(capsys, "status")
+    kept = st["word_list"]
+    assert kept["kept"] is True and kept["source"] == "file %s" % words and kept["words"] == 7
+    assert kept["at"] == "2026-11-13T19:00:00Z"
+    assert st["fingerprint"] == first["fingerprint"] == pg.fingerprint()     # the copy is the file it was taken from
+    r = _word_rows(env, first["fingerprint"])
+    assert r["c9"]["reason"] == "no_team_named" and r["c2"]["status"] == "matched"
+
+    words.write_text("way\nis\nthe\nplay\ntake\ntonight\nlock\n")            # a system update: "no" is gone
+    os.utime(words, ns=(1, 1))
+    assert pg.fingerprint() != first["fingerprint"]                          # the system file's own fingerprint moved
+    env.clock.set("2026-11-13T20:00:00Z")
+    again = env.out(capsys, "match")
+    assert again["fingerprint"] == first["fingerprint"] and again["rows_written"] == 0
+    assert again["by_outcome"] == first["by_outcome"]
+    assert _word_rows(env, first["fingerprint"]) == r                         # no match row changed
+    assert env.out(capsys, "status")["word_list"] == kept                     # the copy was not rewritten
+    env.clock.set("2026-11-14T20:00:00Z")
+    env.out(capsys, "daily")
+    assert env.out(capsys, "status")["word_list"] == kept
+
+    c = sqlite3.connect(str(env.root / pg.STORE_FILE))                        # and cannot be
+    try:
+        for sql in ("UPDATE word_lists SET raw = 'x'", "DELETE FROM word_lists",
+                    "INSERT INTO word_lists (id, source, words, sha256, raw, at) VALUES (1, 's', 1, 'h', 'x', 't')"):
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                c.execute(sql)
+        assert c.execute("SELECT COUNT(*) FROM word_lists").fetchone()[0] == 1
+    finally:
+        c.close()
+
+
+def test_a_frozen_rule_survives_a_change_of_the_system_word_list(tmp_path, capsys, monkeypatch):
+    """A result read freezes the fingerprint; a later system update of the word list leaves every command running."""
+    words = tmp_path / "words"
+    words.write_text("no\nway\nis\nthe\nplay\ntake\ntonight\n")
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    env = _word_env(tmp_path, capsys)
+    env.clock.set("2026-11-13T19:00:00Z")
+    fp = env.out(capsys, "match")["fingerprint"]
+    c = sqlite3.connect(str(env.root / pg.STORE_FILE))
+    c.execute("INSERT INTO frozen (id, fingerprint, at) VALUES (1, ?, '2026-11-13T19:00:00Z')", (fp,))
+    c.commit()
+    c.close()
+    words.write_text("way\n")
+    os.utime(words, ns=(2, 2))
+    env.clock.set("2026-11-13T20:00:00Z")
+    assert env.out(capsys, "status")["fingerprint"] == fp
+    assert env.out(capsys, "match")["fingerprint"] == fp
+
+
+def test_without_the_system_word_list_the_store_keeps_the_built_in_one(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(pg, "WORDS_FILE", tmp_path / "missing", raising=False)
+    env = _word_env(tmp_path, capsys)
+    n = len(set(pg.FALLBACK_WORDS))
+    assert env.out(capsys, "status")["word_list"] == {"kept": False, "source": "built-in fallback", "words": n}
+    env.clock.set("2026-11-13T19:00:00Z")
+    fp = env.out(capsys, "match")["fingerprint"]
+    kept = env.out(capsys, "status")["word_list"]
+    assert kept["kept"] is True and kept["source"] == "built-in fallback" and kept["words"] == n
+    (tmp_path / "missing").write_text("way\n")                               # the file appears later: not read
+    env.clock.set("2026-11-13T20:00:00Z")
+    assert env.out(capsys, "match")["fingerprint"] == fp
+    assert env.out(capsys, "status")["word_list"] == kept
+
+
 def test_a_selection_in_capitals_keeps_its_codes_unless_it_holds_another_word(tmp_path, capsys, monkeypatch):
     """Clarification 20: the capitals rule takes the codes only from a selection holding a word besides team codes and
     the bet's markers (ML, a line, over / under and o / u, numbers, "/", "@", "vs" between two codes)."""
@@ -1533,11 +1671,11 @@ def test_one_reading_per_rule(tmp_path, capsys, monkeypatch):
     s = env2.store()
     assert s.one("SELECT keys FROM audits")["keys"] == keys
     s.close()
-    monkeypatch.setitem(pg.LEAGUE_WORDS, "pro basketball", ("NBA",))               # a changed rule: a new reading
-    env.out(capsys, "match")
-    b = env.out(capsys, "audit-sample", "--out", str(env.audit_dir))
+    changed = _changed_rule(tmp_path, monkeypatch)                                 # a changed rule: a new reading
+    _out_with(changed, env, capsys, "match")
+    b = _out_with(changed, env, capsys, "audit-sample", "--out", str(env.audit_dir))
     assert b["audit_id"] != a["audit_id"]
-    assert env.out(capsys, "audit-pass", "--sample", str(b["audit_id"]), "--wrong", "0")["gate_open"] is True
+    assert _out_with(changed, env, capsys, "audit-pass", "--sample", str(b["audit_id"]), "--wrong", "0")["gate_open"]
 
 
 def test_results_wait_for_a_match_run_after_the_latest_list(tmp_path, capsys):
@@ -1556,6 +1694,28 @@ def test_results_wait_for_a_match_run_after_the_latest_list(tmp_path, capsys):
     env.out(capsys, "results")
 
 
+def _changed_rule(tmp_path, monkeypatch):
+    """This module with one more league word in its source: a changed matching rule (a runtime change of a value is
+    not one: the fingerprint is of the source). Its defaults point into the temporary folder too."""
+    mod = _copy_with_text(tmp_path, "changed_rule", lambda src: src.replace(
+        '    "nfl": ("NFL",), "nba": ("NBA",),', '    "probasketball": ("NBA",), "nfl": ("NFL",), "nba": ("NBA",),', 1))
+    assert mod.fingerprint() != pg.fingerprint()
+    monkeypatch.setattr(mod, "DEFAULT_PICKS", pg.DEFAULT_PICKS)
+    monkeypatch.setattr(mod, "DEFAULT_STORE", pg.DEFAULT_STORE)
+    return mod
+
+
+def _run_with(mod, env, *args):
+    argv = ["--store", str(env.root), "--picks", str(env.picks), *args]
+    return mod.main(argv, odds_client=odds_client(env.odds), kalshi_client=kalshi_client(env.kalshi), clock=env.clock)
+
+
+def _out_with(mod, env, capsys, *args):
+    capsys.readouterr()
+    assert _run_with(mod, env, *args) == 0
+    return json.loads(capsys.readouterr().out)
+
+
 def test_a_changed_fingerprint_after_a_result_makes_every_command_refuse(tmp_path, capsys, monkeypatch):
     env, games = setup_big(tmp_path, capsys)
     settle_world(env, games)
@@ -1563,34 +1723,34 @@ def test_a_changed_fingerprint_after_a_result_makes_every_command_refuse(tmp_pat
     env.audit(capsys)
     env.out(capsys, "match")                                # before a result: the rule may still be repaired
     env.out(capsys, "results")
-    monkeypatch.setitem(pg.LEAGUE_WORDS, "pro basketball", ("NBA",))
+    changed = _changed_rule(tmp_path, monkeypatch)
     for cmd in (["status"], ["schedule"], ["match"], ["prices"], ["results"], ["daily"], ["choose", "--version", "1"],
                 ["evaluate", "--period", "development"], ["audit-sample", "--out", str(env.audit_dir)]):
-        with pytest.raises(pg.Refused, match="frozen"):
-            env.run(*cmd)
-    monkeypatch.delitem(pg.LEAGUE_WORDS, "pro basketball")
+        with pytest.raises(changed.Refused, match="frozen"):
+            _run_with(changed, env, *cmd)
     assert env.run("status") == 0
 
 
 def test_a_changed_fingerprint_before_any_result_needs_a_new_audit(tmp_path, capsys, monkeypatch):
     env, games = setup_big(tmp_path, capsys)
     env.audit(capsys)
-    monkeypatch.setitem(pg.LEAGUE_WORDS, "pro basketball", ("NBA",))
+    changed = _changed_rule(tmp_path, monkeypatch)
     env.clock.set("2026-11-15T12:00:00Z")
-    env.out(capsys, "match")                                 # every pick gets a row under the new fingerprint
-    with pytest.raises(pg.Refused, match="audit-pass"):
-        env.run("results")
+    capsys.readouterr()
+    assert _run_with(changed, env, "match") == 0             # every pick gets a row under the new fingerprint
+    with pytest.raises(changed.Refused, match="audit-pass"):
+        _run_with(changed, env, "results")
     s = env.store()
-    assert len(s.latest_matches(pg.fingerprint())) == 44
+    assert len(s.latest_matches(changed.fingerprint())) == 44
     assert {r["fingerprint"] for r in s.rows("SELECT DISTINCT fingerprint FROM matches")} == \
-        {pg.fingerprint(), s.one("SELECT fingerprint FROM audits")["fingerprint"]}
+        {changed.fingerprint(), s.one("SELECT fingerprint FROM audits")["fingerprint"]}
     s.close()
 
 
 # ---------------------------------------------------------------- invariant 5: the fingerprint covers what match reaches
 
 NOT_A_MATCH_RUN = {"cmd_schedule", "cmd_audit_sample", "cmd_audit_pass", "cmd_prices", "cmd_results", "cmd_evaluate",
-                   "cmd_choose", "cmd_daily", "status"}                   # the other commands main dispatches to
+                   "cmd_choose", "status"}             # the other commands main dispatches to (daily writes match rows)
 
 
 def _reachable_from_match():
@@ -1602,7 +1762,7 @@ def _reachable_from_match():
     tree = ast.parse(Path(pg.__file__).read_text())
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-    assert {n for n in funcs if n.startswith("cmd_")} - {"cmd_match"} <= NOT_A_MATCH_RUN
+    assert {n for n in funcs if n.startswith("cmd_")} - {"cmd_match", "cmd_daily"} <= NOT_A_MATCH_RUN
     methods = {}
     for c in classes.values():
         for m in c.body:
@@ -1648,7 +1808,7 @@ def test_every_function_match_can_reach_is_inside_the_fingerprint(tmp_path):
     reach, helpers = _reachable_from_match()
     assert ("", "cmd_match") in reach and ("", "_match_thread") in reach and ("", "evaluate_comment") in reach
     assert ("", "main") in reach and ("Grader", "__init__") in reach and ("GradingStore", "__init__") in reach
-    assert ("", "_one_record") in reach and ("", "cmd_evaluate") not in reach
+    assert ("", "_one_record") in reach and ("", "cmd_evaluate") not in reach and ("", "cmd_daily") in reach
     base = _copy_with_probe(tmp_path, 0).fingerprint()
     assert base == pg.fingerprint()                           # the fingerprint does not depend on where the file is
     missed = []
@@ -1708,18 +1868,18 @@ def test_every_reading_ever_made_is_listed_by_status_every_evaluation_and_the_sc
     a = env.out(capsys, "audit-sample", "--out", str(env.audit_dir))
     env.out(capsys, "audit-pass", "--sample", str(a["audit_id"]), "--wrong", "3")
     fp_a = pg.fingerprint()
-    monkeypatch.setitem(pg.LEAGUE_WORDS, "pro basketball", ("NBA",))               # a changed rule: a new reading
-    env.out(capsys, "match")
-    b = env.out(capsys, "audit-sample", "--out", str(env.audit_dir))
-    env.out(capsys, "audit-pass", "--sample", str(b["audit_id"]), "--wrong", "0")
+    changed = _changed_rule(tmp_path, monkeypatch)                                 # a changed rule: a new reading
+    _out_with(changed, env, capsys, "match")
+    b = _out_with(changed, env, capsys, "audit-sample", "--out", str(env.audit_dir))
+    _out_with(changed, env, capsys, "audit-pass", "--sample", str(b["audit_id"]), "--wrong", "0")
     env.clock.set("2026-11-15T12:00:00Z")
-    env.out(capsys, "prices")
-    env.out(capsys, "results")
-    st = env.out(capsys, "status")
+    _out_with(changed, env, capsys, "prices")
+    _out_with(changed, env, capsys, "results")
+    st = _out_with(changed, env, capsys, "status")
     got = [(x["fingerprint"], x["sample"], x["wrong"]) for x in st["readings"]]
-    assert got == [(fp_a, a["audit_id"], 3), (pg.fingerprint(), b["audit_id"], 0)]
+    assert got == [(fp_a, a["audit_id"], 3), (changed.fingerprint(), b["audit_id"], 0)]
     assert all(x["at"] for x in st["readings"]) and st["fingerprints_audited"] == 2
-    res = env.out(capsys, "evaluate", "--period", "development")
+    res = _out_with(changed, env, capsys, "evaluate", "--period", "development")
     assert res["readings"] == st["readings"] and res["fingerprints_audited"] == 2
     log = [e for e in sl.scoring_entries(env.root) if e["kind"] == "evaluate_development"]
     assert log[-1]["result"]["readings"] == st["readings"]
@@ -1732,15 +1892,18 @@ def test_the_scoring_code_is_pinned_at_the_choice(tmp_path, capsys, monkeypatch)
     ch = env.out(capsys, "choose", "--version", "1")
     assert ch["choice"] == 1 and len(ch["scoring_fingerprint"]) == 64
     assert "pg.purchase_quote" in pg.scoring_scope()["functions"] and "pg.cmd_evaluate" in pg.scoring_scope()["functions"]
-    monkeypatch.setattr(pg, "MAX_ASK", 0.94)                       # a repair of the scoring code after the choice
+    repaired = _copy_with_text(tmp_path, "ask_cap", lambda src: src.replace("MAX_ASK = 0.95", "MAX_ASK = 0.94", 1))
+    monkeypatch.setattr(repaired, "DEFAULT_PICKS", pg.DEFAULT_PICKS)   # a repair of the scoring code after the choice
+    monkeypatch.setattr(repaired, "DEFAULT_STORE", pg.DEFAULT_STORE)
+    assert repaired.fingerprint() == pg.fingerprint() and repaired.scoring_fingerprint() != pg.scoring_fingerprint()
     env.clock.set("2027-04-04T12:00:00Z")                  # the test is scored once its games are over
-    with pytest.raises(pg.Refused, match="pinned"):
-        env.run("evaluate", "--period", "test")
+    with pytest.raises(repaired.Refused, match="pinned"):
+        _run_with(repaired, env, "evaluate", "--period", "test")
     assert not any(e["kind"] == "test_result" for e in sl.scoring_entries(env.root))
-    res = env.out(capsys, "evaluate", "--period", "test", "--code-changed", "the ask cap repaired")
+    res = _out_with(repaired, env, capsys, "evaluate", "--period", "test", "--code-changed", "the ask cap repaired")
     cc = res["code_changed"]
     assert cc["reason"] == "the ask cap repaired" and cc["at_choice"] == ch["scoring_fingerprint"]
-    assert cc["now"] == pg.scoring_fingerprint() != cc["at_choice"] and cc["at"]
+    assert cc["now"] == repaired.scoring_fingerprint() != cc["at_choice"] and cc["at"]
     log = sl.scoring_entries(env.root)
     entry = [e for e in log if e["kind"] == "code_changed"][0]
     assert entry["reason"] == "the ask cap repaired" and entry["at_choice"] == ch["scoring_fingerprint"]
@@ -2078,7 +2241,10 @@ def test_a_change_in_main_or_the_set_up_of_a_match_run_changes_the_matching_fing
     def pairing(src):
         return src.replace("    identity = pick_store_identity(picks)\n",
                            "    identity = pick_store_identity(picks)\n    _extra = 1\n", 1)
-    for name, change in (("clock_shift", clock_shift), ("grader", grader), ("pairing", pairing)):
+
+    def daily(src):                                          # daily writes match rows too
+        return src.replace("def cmd_daily(gr: Grader) -> dict:\n", "def cmd_daily(gr: Grader) -> dict:\n    _extra = 1\n", 1)
+    for name, change in (("clock_shift", clock_shift), ("grader", grader), ("pairing", pairing), ("daily", daily)):
         assert change(Path(pg.__file__).read_text()) != Path(pg.__file__).read_text(), name
         assert _copy_with_text(tmp_path, name, change).fingerprint() != base, name
 
@@ -2088,3 +2254,257 @@ def test_a_change_in_main_or_the_set_up_of_a_match_run_changes_the_matching_fing
                            "    _extra = 1\n", 1)
     mod = _copy_with_text(tmp_path, "evaluate", evaluate)
     assert mod.fingerprint() == base and mod.scoring_fingerprint() != sbase
+
+
+# ---------------------------------------------------------------- rev 5, outcomes 1 and 5: held whenever it was matched
+
+def _held_world(day, thread_seen, test_seen):
+    """`big_world(day)` and a pick of the 2026-12-14 thread on game 0's home team, first seen at `test_seen`."""
+    w, games = big_world(day)
+    w.thread("t2", "Pick of the Day - 12/14/26 (Monday)", thread_seen)
+    w.comment("t2c", "author_t2", [(test_seen, ml(games[0][1].split()[1]), "+110")], tid="t2")
+    w.unparsed.add("t2c")
+    return w, games
+
+
+def _held_env(tmp_path, capsys, day, thread_seen, test_seen):
+    w, games = _held_world(day, thread_seen, test_seen)
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev(g, h, a, day["start"]) for g, h, a in games]
+    env.clock.set(day["schedule"])
+    env.out(capsys, "schedule")
+    return env, w, games
+
+
+def _assert_held_then_released(env, capsys, now):
+    """Before a choice game 0 is held (its final and Kalshi's result are stored, but not read); after `choose` it is
+    read. Authors 0 and 22 back game 0's home team in the development thread."""
+    env.clock.set(now)
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["not_graded"].get("held_for_test") == 2 and res["B"]["n"] == 40
+    assert res["A"]["1"]["not_bought"].get("held_for_test") == 1
+    assert res["held_for_test"] == {"picks": 2, "league_days": 1}
+    st = env.out(capsys, "status")
+    assert st["held_for_test"] == {"picks": 2, "league_days": 1}
+    env.out(capsys, "choose", "--version", "1")
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert "held_for_test" not in res["B"]["not_graded"] and res["B"]["n"] == 42
+    assert res["held_for_test"] == {"picks": 0, "league_days": 0}
+
+
+def test_a_game_is_held_for_the_test_when_the_test_pick_is_matched_after_its_final_was_stored_a_late_parse(
+        tmp_path, capsys):
+    env, w, games = _held_env(tmp_path, capsys, EVE, "2026-12-14T03:00:00Z", "2026-12-14T04:00:00Z")
+    env.clock.set("2026-12-14T04:10:00Z")
+    env.out(capsys, "match")
+    assert "t2c" not in env.rows()                                         # its parse is not stored yet
+    settle_world(env, games, EVE)
+    env.audit(capsys)
+    env.clock.set("2026-12-14T08:00:00Z")
+    r = env.out(capsys, "results")                                          # game 0's final is stored
+    assert r["scores"]["NBA"]["dropped_test_period"] == 0
+    w.parse_later(env.picks, "t2c", "2026-12-14T09:00:00Z")
+    env.clock.set("2026-12-14T09:30:00Z")
+    env.out(capsys, "match")
+    assert (env.rows()["t2c"]["status"], env.rows()["t2c"]["game_id"]) == ("matched", "g00")
+    _assert_held_then_released(env, capsys, "2026-12-14T10:30:00Z")
+
+
+def test_a_game_is_held_for_the_test_when_results_ran_after_the_last_match(tmp_path, capsys):
+    env, w, games = _held_env(tmp_path, capsys, LATE, "2026-12-14T01:00:00Z", "2026-12-14T02:00:00Z")
+    env.clock.set("2026-12-14T00:30:00Z")
+    env.out(capsys, "match")                                                # the last match before the results
+    settle_world(env, games, LATE)
+    env.audit(capsys)
+    w.parse_later(env.picks, "t2c", "2026-12-14T02:05:00Z")                 # the test pick reaches the pick store
+    env.clock.set("2026-12-14T06:30:00Z")
+    r = env.out(capsys, "results")                                          # unmatched yet: game 0's final is stored
+    assert r["scores"]["NBA"]["dropped_test_period"] == 0
+    env.clock.set("2026-12-14T07:00:00Z")
+    env.out(capsys, "match")
+    assert env.rows()["t2c"]["game_id"] == "g00"
+    _assert_held_then_released(env, capsys, "2026-12-14T08:00:00Z")
+
+
+def test_a_game_matched_by_a_test_pick_under_an_earlier_fingerprint_only_is_held(tmp_path, capsys):
+    env, games = setup_big(tmp_path, capsys, EVE)
+    settle_world(env, games, EVE)
+    env.audit(capsys)
+    env.clock.set("2026-12-14T08:00:00Z")
+    env.out(capsys, "results")
+    s = env.store()
+    row = dict(s.rows("SELECT * FROM matches WHERE game_id = 'g00' ORDER BY id LIMIT 1")[0])
+    s.close()
+    row.update(id=None, comment_id="old_t", thread_id="t_old", thread_date="2026-12-14", fingerprint="0" * 64,
+               at="2026-12-14T08:00:00Z")                                   # a test pick's row under an older rule
+    db = sqlite3.connect(env.root / pg.STORE_FILE)
+    db.execute("INSERT INTO matches (%s) VALUES (%s)" % (", ".join(row), ", ".join("?" * len(row))), list(row.values()))
+    db.commit()
+    db.close()
+    env.clock.set("2026-12-14T09:00:00Z")
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["not_graded"].get("held_for_test") == 2 and res["held_for_test"] == {"picks": 2, "league_days": 1}
+
+
+# ---------------------------------------------------------------- rev 5, outcome 2: fingerprints of the source alone
+
+FRESH_PROCESS = """
+import json, sys
+from valedia_trader.data_and_fees import pick_lists as pl
+from valedia_trader.research_loop import pick_grading as pg
+before = [pg.fingerprint(), pg.scoring_fingerprint()]
+s = pl.Store(sys.argv[1], readonly=True, create=False)
+s.close()
+g = pg.GradingStore(sys.argv[2])
+g.close()
+print(json.dumps({"before": before, "after": [pg.fingerprint(), pg.scoring_fingerprint()]}))
+"""
+
+
+def _python(args, cwd):
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(pg.REPO))
+    return subprocess.run([sys.executable, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600)
+
+
+def test_the_fingerprints_are_of_the_source_alone_in_any_process_and_from_any_entry_point(tmp_path):
+    env = Env(tmp_path, two_league_world("NBA"))
+    pl.Store(env.picks, readonly=True, create=False).close()               # this process has opened a store
+    here = [pg.fingerprint(), pg.scoring_fingerprint()]
+    r = _python(["-c", FRESH_PROCESS, str(env.picks), str(tmp_path / "g" / pg.STORE_FILE)], tmp_path)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout)
+    assert got["before"] == got["after"] == here                           # a fresh import, before and after a store
+    for args in (["-m", "valedia_trader.research_loop.pick_grading", "fingerprints"],
+                 [str(Path(pg.__file__)), "fingerprints"]):                 # python -m, and a run by path
+        r = _python(args, tmp_path)
+        assert r.returncode == 0, (args, r.stderr)
+        out = json.loads(r.stdout)
+        assert [out["fingerprint"], out["scoring_fingerprint"]] == here, args
+
+
+def test_a_runtime_value_of_a_module_does_not_reach_the_fingerprints(monkeypatch):
+    base = [pg.fingerprint(), pg.scoring_fingerprint()]
+    monkeypatch.setattr(pl, "_EXPECTED", {("table", "x", "x", "sql")})       # a lazy cache filled
+    monkeypatch.setattr(pg, "LEAGUES", dict(pg.LEAGUES, XFL=("x", "y")))    # a module value changed at run time
+    assert [pg.fingerprint(), pg.scoring_fingerprint()] == base
+
+
+# ---------------------------------------------------------------- rev 5, outcome 4: no wait for Kalshi for ever
+
+def _listed_env(tmp_path, capsys, start, kday, drop=("G01", "G02")):
+    """Big world whose games start at `start`; Kalshi's events list holds game 1 dated `kday`; games 1 and 2 have
+    no settled market."""
+    day = dict(DEV, start=start)
+    w, games = big_world(day)
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev(g, h, a, start) for g, h, a in games]
+    _, home, away = games[1]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", kday, ("AWY", away.split()[0]), ("HME", home.split()[0]))]
+    env.clock.set(day["schedule"])
+    env.out(capsys, "schedule")
+    env.clock.set(day["match"])
+    env.out(capsys, "match")
+    settle_world(env, games, day)
+    env.kalshi.markets["KXNBAGAME"] = [m for m in env.kalshi.markets["KXNBAGAME"]
+                                       if not m["event_ticker"].endswith(tuple(drop))]
+    env.audit(capsys)
+    return env, games
+
+
+def test_a_pick_waiting_for_kalshi_is_not_graded_seven_days_after_the_start(tmp_path, capsys):
+    env, games = _listed_env(tmp_path, capsys, DEV["start"], DEV["event"])
+    env.clock.set(DEV["after"])
+    env.out(capsys, "prices")
+    env.out(capsys, "results")
+    env.clock.set("2026-11-20T23:59:59Z")                                   # 7 days after 2026-11-14 00:00Z, less 1 s
+    assert env.out(capsys, "evaluate", "--period", "development")["B"]["not_graded"] == {"kalshi_not_settled": 2}
+    env.clock.set("2026-11-21T00:00:00Z")
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["not_graded"] == {"kalshi_never_settled": 2} and res["B"]["n"] == 40
+
+
+@pytest.mark.parametrize("kday, waits", [("26NOV14", True), ("26NOV13", True), ("26NOV12", False)])
+def test_kalshi_lists_a_game_on_its_eastern_date_or_the_day_before(tmp_path, capsys, kday, waits):
+    env, games = _listed_env(tmp_path, capsys, "2026-11-14T05:30:00Z", kday)    # 00:30 US-Eastern on 2026-11-14
+    env.clock.set("2026-11-15T12:00:00Z")
+    env.out(capsys, "prices")
+    env.out(capsys, "results")
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["not_graded"] == ({"kalshi_not_settled": 2} if waits else {}) and res["B"]["n"] == (40 if waits else 42)
+
+
+# ---------------------------------------------------------------- rev 5, outcome 6: behaviours no test caught
+
+def test_an_event_without_a_ticker_is_kept_and_counted_unreadable(tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    w, labels = shared_picks(300, 7)
+    nameless = dict(kevent("NBA", "26NOV12", ("BOS", "Bosaton"), ("PHX", "Phoaton")), event_ticker=None)
+    env = shared_env(tmp_path, capsys, w, extra={"NBA": [nameless]})
+    assert env.schedule_out["kalshi_codes"]["NBA"] == {"events": 3, "unreadable": 1}
+    s = env.store()
+    raw = json.loads(s.one("SELECT raw FROM code_tables WHERE league = 'NBA'")["raw"])
+    s.close()
+    assert len(raw) == 3 and sum(1 for e in raw if not e["event_ticker"]) == 1      # kept in the stored table
+    assert not any(r["status"] == "matched" for r in env.rows().values())
+
+
+def test_the_latest_code_table_of_a_league_is_judged_not_an_older_one(tmp_path, capsys, monkeypatch):
+    words = tmp_path / "words"
+    words.write_text(ENGLISH)
+    monkeypatch.setattr(pg, "WORDS_FILE", words, raising=False)
+    w, labels = shared_picks(600, 9)
+    env = shared_env(tmp_path, capsys, w, unreadable=("NFL",))           # the first NFL table is unreadable
+    assert not any(r["status"] == "matched" for r in env.rows().values())
+    for e in env.kalshi.kevents[SERIES["NFL"]]:                       # the NFL's codes have three letters
+        e["sub_title"] = "%s vs %s (Nov 13)" % (e["event_ticker"][-6:-3], e["event_ticker"][-3:])
+    env.clock.set("2026-11-14T13:00:00Z")
+    env.out(capsys, "schedule")                                           # the latest NFL table reads in full
+    env.clock.set("2026-11-14T14:00:00Z")
+    env.out(capsys, "match")
+    rows = env.rows()
+    assert wrong_matches(rows, labels) == [] and sum(1 for r in rows.values() if r["status"] == "matched") > 50
+    for e in env.kalshi.kevents[SERIES["NFL"]]:
+        e["sub_title"] = e["title"] + " (Nov 13)"
+    env.clock.set("2026-11-14T15:00:00Z")
+    env.out(capsys, "schedule")                                           # and the latest is unreadable again
+    env.clock.set("2026-11-14T16:00:00Z")
+    env.out(capsys, "match")
+    assert not any(r["status"] == "matched" for r in env.rows().values())
+
+
+def test_the_test_counts_wait_for_kalshi_where_kalshi_lists_the_game(tmp_path, capsys):
+    w, games = big_world(TEST)
+    env = Env(tmp_path, w)
+    env.odds.events["basketball_nba"] = [ev(g, h, a, TEST["start"]) for g, h, a in games]
+    _, home, away = games[1]
+    env.kalshi.kevents["KXNBAGAME"] = [kevent("NBA", TEST["event"], ("AWY", away.split()[0]), ("HME", home.split()[0]))]
+    env.clock.set(TEST["schedule"])
+    env.out(capsys, "schedule")
+    env.clock.set(TEST["match"])
+    env.out(capsys, "match")
+    settle_world(env, games, TEST)
+    env.kalshi.markets["KXNBAGAME"] = [m for m in env.kalshi.markets["KXNBAGAME"]
+                                       if not m["event_ticker"].endswith(("G01", "G02"))]
+    env.audit(capsys)
+    env.out(capsys, "choose", "--version", "1")
+    env.clock.set(TEST["after"])
+    env.out(capsys, "results")
+    assert env.out(capsys, "status")["test_counts"]["B_graded"] == 40       # game 1's two picks wait for Kalshi
+
+
+def test_a_game_kalshi_lists_only_in_its_stored_markets_waits_for_kalshi(tmp_path, capsys):
+    """Two settled Kalshi events of game 1 on one day (a doubleheader, or a look-alike): no pair is made, and the
+    stored markets still say Kalshi lists the game, so its picks wait, and seven days on are not graded."""
+    env, games = _listed_env(tmp_path, capsys, DEV["start"], "26NOV01", drop=())   # the events list dates it elsewhere
+    _, home, away = games[1]
+    expected = plus(DEV["start"], 3 * 3600)
+    env.kalshi.markets["KXNBAGAME"] += [kmarket("KXNBAGAME-26NOV13G01B", "H01", home.split()[0], "yes", expected),
+                                        kmarket("KXNBAGAME-26NOV13G01B", "A01", away.split()[0], "no", expected)]
+    env.clock.set(DEV["after"])
+    p = env.out(capsys, "prices")
+    env.out(capsys, "results")
+    assert p["pairing"]["NBA"]["paired_now"] == N_GAMES - 1
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["not_graded"] == {"kalshi_not_settled": 2}
