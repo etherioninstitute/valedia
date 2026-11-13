@@ -92,3 +92,26 @@ with the maker fee applied everywhere. Markets with spreads of 3 cents or more a
 The collector runs on one Mac; gaps are recorded and days below 80% coverage do not count. Kalshi may
 limit unauthenticated reads without notice. A pass here would be a reason to test with real resting
 orders in a paper account, not a reason to trade.
+
+## Notes written before collection began (2026-11-13)
+
+Nothing has been collected into the research record and no answer has been compared with an outcome.
+
+1. **The battery in force.** The questions' wording was tightened while the collector was built, before any
+   collection. The battery whose hash is logged with every answer is
+   `3e07adb11ae25c23b334bb9f9576208854686cdb1177d0728026d2d9bd927730`; it does not change from here on.
+2. **The collector in force** is commit 09ecec7. It was checked blind eight times. The last check confirmed
+   the warm-up rule (no decision before a market has 30 unbroken minutes of snapshots), 2.3 million simulated
+   trades with none missing across outages of 6 minutes to 25 hours, and no look-ahead; it left two known
+   gaps: when the trade reads of one market keep failing for more than 24 hours, or across a drop and a
+   re-choice of that market, some trades are neither stored nor marked as lost.
+3. **A rule fixed now because of those gaps.** Anything that needs the trade tape (a paper fill in the five
+   minutes after a decision; `toxic_15m`) counts only where the stored trade reads cover the whole stretch
+   it needs, judged from the spans of the successful reads stored with the snapshots, never from the event
+   rows. A slot without that cover is left out of the quoting comparison for all three rules alike, and the
+   number left out is reported. Outcomes that need only mid prices are not affected.
+4. **Replacing the collector.** A later revision that has passed a blind check may replace this one during the
+   development period, at a restart recorded in the store. The test period runs on one revision.
+5. A shakedown run of the previous revision against the live feed (about an hour, into a scratch file that is
+   not part of the record: 20 markets, every decision slot collected, no failed request) was made first.
+   Nothing from it is used.
