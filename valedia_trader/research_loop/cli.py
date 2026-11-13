@@ -209,11 +209,35 @@ def _order_step_venue():
     return WebullVenue.from_secrets()
 
 
+def _order_step_environment(environ=None) -> str:
+    """The Webull environment the venue would be built for, read as WebullVenue.from_secrets reads it (WEBULL_ENV,
+    default sandbox). With no `environ`, the secrets file is loaded first, as from_secrets does."""
+    import os
+    if environ is None:
+        from valedia_trader.core.secrets import load_env
+        load_env()
+        environ = os.environ
+    return (environ.get("WEBULL_ENV") or "sandbox").strip().lower()
+
+
+def _order_step_refused() -> bool:
+    """True, with one line on stderr, when the configured environment is not the test environment."""
+    from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT
+    if _order_step_environment() == TEST_ENVIRONMENT:
+        return False
+    print(f"refused: the order step runs against Webull's test environment ({TEST_ENVIRONMENT}) only and WEBULL_ENV "
+          "names another; live trading is not built", file=sys.stderr)
+    return True
+
+
 def order_step_command(args, paths: LoopPaths) -> int:
     """One order step against the venue `_order_step_venue` gives; prints the summary. 0 when the run went through,
-    2 when it stopped."""
+    2 when it stopped. A configured environment other than the test environment is refused before any venue is built
+    or any file created."""
     from valedia_trader.execution_and_risk import order_step
     from valedia_trader.venues.webull import WebullError
+    if _order_step_refused():
+        return 2
     try:
         venue = _order_step_venue()
     except WebullError as exc:
@@ -330,6 +354,8 @@ def main(argv=None) -> int:
     p.add_argument("--critic", action="store_true", help="run the weekly critic at the end (it always runs on Sundays)")
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
+    if args.cmd == "order-step" and _order_step_refused():     # before any folder or file is made
+        return 2
 
     paths = LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths()
     paths.ensure()

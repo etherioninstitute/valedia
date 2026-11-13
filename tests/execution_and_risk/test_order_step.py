@@ -1490,3 +1490,235 @@ def test_the_parts_sum_to_the_order_exactly_over_ten_thousand_generated_orders()
             impossible += 1
             assert not units.is_integer() and abs(math.fsum(got) - units) <= 2 * math.ulp(big)
     assert orders > 9_500 and whole > 4_000 and impossible < 100
+
+
+# ==== rev 3 (T13 rev 3): four small repairs after the second blind verification
+
+def _journal_lines(world):
+    out = []
+    for f in sorted((world.tmp / "journal").glob("*.jsonl")):
+        for line in f.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def _before_the_lock(monkeypatch, other):
+    """Run `other` (another order step) at the moment this run asks for the lock, as a second process would."""
+    real, state = osx._RunLock.acquire, {"done": False}
+
+    def acquire(self):
+        if not state["done"]:
+            state["done"] = True
+            other()
+        return real(self)
+    monkeypatch.setattr(osx._RunLock, "acquire", acquire)
+
+
+# ---- rev 3 outcome 1: the lock comes first; the journal and the paper book are read under it
+
+def test_a_fill_journaled_by_a_run_that_dies_while_this_one_waits_for_the_lock_is_not_journaled_again(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.run()
+    world.venue.fill(world.venue.submits()[0], 10.0)
+    world.later()
+
+    def other():                                                    # B: journals the fill, dies before marking it applied
+        def die(led):
+            led.mark_applied = lambda ids: (_ for _ in ()).throw(Crash("killed after the journal write"))
+        with pytest.raises(Crash):
+            world.run(patch=die)
+    _before_the_lock(monkeypatch, other)
+    out = world.run()                                               # A
+    assert out["status"] == "done"
+    ids = [e["fill_id"] for e in _journal_lines(world) if e.get("event") == "fill"]
+    assert ids == [1]
+
+
+def test_a_torn_line_left_by_a_run_that_dies_while_this_one_waits_for_the_lock_is_recorded(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.run()
+    world.venue.fill(world.venue.submits()[0], 10.0)
+    world.later()
+
+    def other():                                                    # B: dies half way through writing the fill
+        real = world.journal.write
+
+        def torn(day, entry):
+            if entry.get("event") == "fill":
+                with (world.tmp / "journal" / f"{day}.jsonl").open("a") as fh:
+                    fh.write('{"type": "order_step", "event": "fi')
+                raise Crash("killed mid-write")
+            return real(day, entry)
+        world.journal.write = torn
+        try:
+            with pytest.raises(Crash):
+                world.run()
+        finally:
+            del world.journal.write
+    _before_the_lock(monkeypatch, other)
+    out = world.run()                                               # A
+    assert out["status"] == "done" and len(out["torn_lines"]) == 1
+    assert [e["fill_id"] for e in _journal_lines(world) if e.get("event") == "fill"] == [1]
+    world.later()
+    assert world.run()["status"] == "done"                          # and every later run goes on
+
+
+def test_nothing_but_the_venues_name_environment_and_host_is_read_before_the_lock(world, monkeypatch):
+    seen = []
+    world.paper = lambda: seen.append("paper") or paper({"a": {"SPY": 1.0}}, day="2026-11-12")
+    real_scan = osx._Run._scan_journal
+    monkeypatch.setattr(osx._Run, "_scan_journal", lambda self: seen.append("journal") or real_scan(self))
+    _before_the_lock(monkeypatch, lambda: seen.append("lock"))
+    assert world.run()["status"] == "done"
+    assert seen[0] == "lock" and set(seen[1:]) == {"journal", "paper"}
+
+
+# ---- rev 3 outcome 2: the window is checked on the clock just before intend and just before submit_once
+
+def test_an_order_whose_second_quote_ask_runs_past_the_window_is_left_over(world):
+    world.clock.t = ny("2026-11-13 15:44:30")                       # the window ends at 15:45
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.quote_age["SPY"] = 1190                                   # good at first, too old by the time of the order
+    cash = world.venue.cash
+
+    def slow_cash():
+        world.clock.t += 20
+        return cash()
+    world.venue.cash = slow_cash
+    first = world.quotes
+
+    def quotes(symbols):
+        out = first(symbols)
+        if len(world.quote_calls) > 1:                              # the second ask takes 110 s
+            world.clock.t += 110
+            world.quote_age["SPY"] = 0
+            out = first(symbols)
+        return out
+    world.quotes = quotes
+    out = world.run()
+    assert world.venue.submits() == [] and world.orders() == []
+    assert out["left_over"] == [{"symbol": "SPY", "units": 1.0, "reason": "the session window closed during the run"}]
+
+
+def test_an_order_intended_as_the_window_closes_is_not_sent_and_stays_intended(world):
+    world.clock.t = ny("2026-11-13 15:44:50")
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+
+    def slow(led):
+        real = led.intend
+
+        def intend(*a, **k):
+            out = real(*a, **k)
+            world.clock.t += 20                                     # 15:45:10 by the time it would be sent
+            return out
+        led.intend = intend
+    out = world.run(patch=slow)
+    assert world.venue.submits() == [] and [o["state"] for o in world.orders()] == ["intended"]
+    assert [x["reason"] for x in out["left_over"]] == ["the session window closed during the run"] * 2
+    world.next_day()
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run()
+    assert out["orders_sent"] == 1 and [o["state"] for o in world.orders()] == ["intended", "accepted"]
+
+
+# ---- rev 3 outcome 3: nothing a venue or a quote function returns or raises makes the run raise
+
+def _boom(*a, **k):
+    raise RuntimeError("hostile")
+
+
+class Hostile:
+    """An answer whose every method raises."""
+    __getattr__ = __getitem__ = __iter__ = __len__ = __bool__ = __float__ = __int__ = __index__ = _boom
+    __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = __str__ = __repr__ = __format__ = __contains__ = __hash__ = _boom
+
+
+class HostileDict(dict):
+    get = __getitem__ = __iter__ = items = keys = values = __len__ = __contains__ = __bool__ = __repr__ = _boom
+
+
+class HostileFloat(float):
+    __float__ = __le__ = __lt__ = __ge__ = __gt__ = __eq__ = __ne__ = __bool__ = __repr__ = __str__ = __format__ = _boom
+    __hash__ = _boom
+
+
+class HostileStr(str):
+    __float__ = _boom
+
+
+def _plant(world, where):
+    v, now = world.venue, lambda: world.clock.t
+    if where.startswith("cash"):
+        answer = {"cash answer": Hostile, "cash mapping": lambda: HostileDict(cash=1.0),
+                  "cash value": lambda: {"cash": HostileFloat(1e6)}, "cash text": lambda: {"cash": HostileStr("1e6")}}[where]
+        v.cash = lambda: answer()
+    elif where.startswith("quote"):
+        answer = {"quotes answer": lambda s: Hostile(), "quotes mapping": lambda s: HostileDict({x: (500.0, now()) for x in s}),
+                  "quote": lambda s: {x: Hostile() for x in s}, "quote price": lambda s: {x: (HostileFloat(500.0), now()) for x in s},
+                  "quote time": lambda s: {x: (500.0, HostileFloat(now())) for x in s}}[where]
+        world.quotes = answer
+    elif where == "second quote ask":
+        first = world.quotes
+        world.quotes = lambda s: first(s) if not world.quote_calls else {x: (HostileFloat(1.0), now()) for x in s}
+        _slow_venue(world, 25)
+    elif where.startswith("positions"):
+        v.positions = {"positions answer": lambda: Hostile(), "positions mapping": lambda: HostileDict(SPY=1.0),
+                       "positions units": lambda: {"SPY": HostileFloat(1.0)}}[where]
+    elif where == "submit answer":
+        v.submit = lambda *a, **k: Hostile()
+    elif where == "order status":
+        v.order_status = lambda tag: Hostile()
+    elif where == "cancel answer":
+        v.cancel = lambda tag: Hostile()
+    elif where in ("name", "environment", "host"):
+        setattr(v, where, Hostile())
+
+
+HOSTILE = ["cash answer", "cash mapping", "cash value", "cash text", "quotes answer", "quotes mapping", "quote", "quote price",
+           "quote time", "second quote ask", "positions answer", "positions mapping", "positions units", "submit answer",
+           "order status", "cancel answer", "name", "environment", "host"]
+
+
+@pytest.mark.parametrize("where", HOSTILE)
+def test_a_hostile_answer_at_any_read_stops_the_run_or_leaves_an_order_over_and_a_summary_is_journaled(world, where):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    if where in ("order status", "cancel answer"):                  # these are read for orders already open
+        world.run()
+        world.later()
+        world.paper = paper({"a": {"SPY": 2.0, "QQQ": 2.0}})
+    _plant(world, where)
+    out = world.run()                                               # never raises
+    assert out["status"] in ("done", "stopped") and out.get("stage") != "unexpected"
+    assert json.dumps(out) and "hostile" not in json.dumps(out)
+    last = [e for e in _journal_lines(world) if e.get("type") == "order_step"][-1]
+    assert last["event"] == "summary" and last["batch"] == out["batch"]
+
+
+def test_an_unexpected_failure_after_the_lock_is_still_journaled_with_a_summary(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    monkeypatch.setattr(osx._Run, "_differences", _boom)            # stands for a fault of the order step's own
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "unexpected" and out["reason"].endswith("RuntimeError")
+    assert [e for e in _journal_lines(world) if e.get("type") == "order_step"][-1]["event"] == "summary"
+
+
+# ---- rev 3 outcome 4: a host that comes through __getattr__ is seen
+
+@pytest.mark.parametrize("host, runs", [("api.webull.com", False), ("api.sandbox.webull.com", False), (None, True)])
+def test_a_host_given_by_getattr_must_also_be_a_plain_attribute_naming_the_sandbox(world, host, runs):
+    world.paper = paper({"a": {"SPY": 1.0}})
+
+    class V(StandIn):
+        def __getattr__(self, name):
+            if name == "host" and host is not None:
+                return host
+            raise AttributeError(name)
+    world.venue = V()
+    out = world.run()
+    if runs:
+        assert out["orders_sent"] == 1
+    else:
+        assert out["stage"] == "environment" and world.venue.calls == []

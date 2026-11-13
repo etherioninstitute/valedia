@@ -179,6 +179,7 @@ def order_step_project(tmp_path, monkeypatch):
     venue = _Venue()
     now = pd.Timestamp("2026-11-13 10:00", tz="America/New_York").timestamp()
     monkeypatch.setattr(cli, "_order_step_venue", lambda: venue)
+    monkeypatch.setattr(cli, "_order_step_environment", lambda environ=None: "sandbox", raising=False)   # never the secrets file
     monkeypatch.setattr(order_step, "wall_clock", lambda: now)
     monkeypatch.setattr(order_step, "minute_quotes", lambda symbols: {s: (500.0, now - 60) for s in symbols})
     monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
@@ -205,6 +206,24 @@ def test_order_step_refuses_production_before_any_venue_call(order_step_project,
     assert cli.main(["--root", str(root), "order-step"]) == 2
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "stopped" and out["stage"] == "environment" and venue.calls == []
+
+
+@pytest.mark.parametrize("configured", ["production", "live", ""])
+def test_order_step_refuses_a_configured_environment_other_than_the_sandbox_before_building_anything(
+        order_step_project, monkeypatch, capsys, configured):
+    root, venue = order_step_project
+    monkeypatch.setattr(cli, "_order_step_environment", lambda environ=None: configured)
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    before = sorted(p.relative_to(root) for p in root.rglob("*"))
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and len(captured.err.strip().splitlines()) == 1 and "sandbox" in captured.err
+    assert sorted(p.relative_to(root) for p in root.rglob("*")) == before        # no ledger, no state file, nothing
+
+
+def test_order_step_reads_the_configured_environment_as_the_webull_adapter_does():
+    assert cli._order_step_environment({"WEBULL_ENV": " Production "}) == "production"
+    assert cli._order_step_environment({}) == "sandbox" and cli._order_step_environment({"WEBULL_ENV": ""}) == "sandbox"
 
 
 def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):

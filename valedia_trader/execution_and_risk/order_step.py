@@ -11,13 +11,19 @@ baseline (what the account held before the first order step: recorded once, neve
 One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journaled and returned.
 
  1. environment  the venue must be the test environment: its `environment` a plain str equal to TEST_ENVIRONMENT
-                 (a subclass is refused) and, when it has a `host`, a plain str containing "sandbox"; and the ledger
-                 must treat exactly the adapter's NotTransmitted and OrderRejected as not sent. Checked before any
-                 venue call, and read again before each order is intended and immediately before each submit_once;
-                 any failure stops the run with no further venue call.
+                 (a subclass is refused) and, when it has a `host` (by a static lookup or an ordinary getattr, so
+                 also through __getattr__), both answers a plain str containing "sandbox"; and the ledger must treat
+                 exactly the adapter's NotTransmitted and OrderRejected as not sent. Checked before any venue call,
+                 and read again before each order is intended and immediately before each submit_once; any failure
+                 stops the run with no further venue call.
+    lock         one run at a time per state file. Only the venue's name, environment and host are read before the
+                 lock; everything below runs under it, and once it is held a summary is always journaled: a fault
+                 of the run's own stops it at stage "unexpected" rather than raising.
     journal      every journal file is read line by line before any venue call. A torn last line of the newest file
                  (a crash mid-write) is skipped, recorded once and reported in the summary (`torn_lines`); a torn
-                 line anywhere else stops the run.
+                 line anywhere else stops the run. The torn line stays in the file, and the journal's other readers
+                 (Journal.read, used by the weekly critic and the tax notes) still stop on it; that repair belongs to
+                 paper.py, in a later ticket.
  2. session      inside the regular session of a trading day, SESSION_AFTER_OPEN after the open to
                  SESSION_BEFORE_CLOSE before the close (09:35 to 15:45 New York time on a full day; earlier on a
                  half-day), from the exchange calendar. Outside it nothing is read from the venue.
@@ -43,9 +49,13 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  York day across runs. What is not sent is journaled, not queued.
 10. send         just before each order is intended its quote's age is checked again on the clock; older than
                  QUOTE_MAX_AGE_SECONDS, the quote function is asked once more for that symbol, and an unusable
-                 answer leaves the order over. The limit price comes from the quote in hand at that moment. A day
-                 limit order in the regular session through ledger.intend and ledger.submit_once. A refusal is
-                 journaled and the run goes on; an unknown outcome stops the run at once.
+                 answer leaves the order over. The limit price comes from the quote in hand at that moment. The
+                 session window is checked on the clock immediately before ledger.intend and again immediately
+                 before ledger.submit_once; an order failing either is left over (one already intended stays
+                 `intended`, never sent). A day limit order in the regular session through ledger.intend and
+                 ledger.submit_once. A refusal is journaled and the run goes on; an unknown outcome stops the run
+                 at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
+                 stop or a left-over order, in the order step's own words.
 11. after        reconcile once more, journal the fills, return and journal a summary.
 
 Points to know:
@@ -173,7 +183,7 @@ def _status_word(answer) -> str:
 
 
 def _number_or_none(x):
-    return float(x) if _finite(x) else None
+    return _as_float(x)
 
 
 def _sync_file(path: str | Path) -> None:
@@ -190,13 +200,20 @@ def _sync_file(path: str | Path) -> None:
             os.close(fd)
 
 
-def _finite(x) -> bool:
-    if isinstance(x, bool) or not isinstance(x, (int, float)):
-        return False
+def _as_float(x) -> float | None:
+    """A plain finite float from an int or a float (subclasses included), else None. Never raises, whatever `x`'s
+    methods do."""
     try:
-        return math.isfinite(float(x))
-    except (OverflowError, ValueError):
-        return False
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return None
+        v = float(x)
+        return v if type(v) is float and math.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _finite(x) -> bool:
+    return _as_float(x) is not None
 
 
 def _is_crypto(symbol: str) -> bool:
@@ -393,8 +410,8 @@ def _hhmm(seconds: float) -> str:
 
 
 def _quote_time(t) -> float | None:
-    if _finite(t):
-        return float(t)
+    if _as_float(t) is not None:
+        return _as_float(t)
     if isinstance(t, datetime):                       # pandas Timestamps are datetimes too
         if t.tzinfo is None:
             return None                               # a time without a zone cannot be compared with the clock
@@ -403,14 +420,23 @@ def _quote_time(t) -> float | None:
 
 
 def _read_quote(raw, now: float) -> tuple[float | None, float | None, str | None]:
-    """(price, time, None) for a usable quote, else (None, None, why), in the order step's own words."""
+    """(price, time, None) for a usable quote, else (None, None, why), in the order step's own words. Never raises,
+    whatever the quote's methods do."""
+    try:
+        return _read_quote_unguarded(raw, now)
+    except Exception:
+        return None, None, "the quote could not be read"
+
+
+def _read_quote_unguarded(raw, now: float) -> tuple[float | None, float | None, str | None]:
     if raw is None:
         return None, None, "no quote"
     try:
         price, when = (raw["price"], raw["time"]) if isinstance(raw, dict) else (raw[0], raw[1])
     except Exception:
         return None, None, "the quote is not a price and a time"
-    if not _finite(price) or price <= 0:
+    price = _as_float(price)
+    if price is None or price <= 0:
         return None, None, "the quote's price is not a positive finite number"
     try:
         t = _quote_time(when)
@@ -423,7 +449,7 @@ def _read_quote(raw, now: float) -> tuple[float | None, float | None, str | None
         return None, None, f"the quote is {age / 60:.1f} minutes old, more than {QUOTE_MAX_AGE_SECONDS // 60}"
     if age < -QUOTE_MAX_AHEAD_SECONDS:
         return None, None, f"the quote is stamped {-age:.0f} s after now"
-    return float(price), t, None
+    return price, t, None
 
 
 def usable_quote(raw, now: float) -> tuple[float | None, str | None]:
@@ -736,18 +762,21 @@ class _Run:
         stamp = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
         try:
-            self._environment()                          # 1
-            self._scan_journal()                         # before anything is asked of the venue
-            self._session(now)                           # 2
-            self.paper_read = self._paper()              # 5, read now: a stale book stops before any venue call
-            self._paper_day(self.paper_read)
+            self._environment()                          # 1: the venue's name, environment and host only
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         path = self.state_arg.path if isinstance(self.state_arg, OrderStepState) else str(self.state_arg)
         lock = _RunLock(path)
-        if not lock.acquire():
+        if not lock.acquire():                           # everything below runs under the lock
             return self._finish("stopped", "session", "another order step is running on this venue's state file")
         try:
+            try:
+                self._scan_journal()                     # before anything is asked of the venue
+                self._session(now)                       # 2
+                self.paper_read = self._paper()          # 5, read now: a stale book stops before any venue call
+                self._paper_day(self.paper_read)
+            except _Stop as stop:
+                return self._finish("stopped", stop.stage, stop.reason)
             try:
                 self.state = self.state_arg if isinstance(self.state_arg, OrderStepState) else OrderStepState(path, self.clock)
             except (OrderStepError, sqlite3.Error, OSError) as exc:
@@ -757,6 +786,8 @@ class _Run:
             finally:
                 if not isinstance(self.state_arg, OrderStepState):
                     self.state.close()
+        except Exception as exc:                         # a fault of the order step's own: still stopped and journaled
+            return self._finish("stopped", "unexpected", f"the run failed unexpectedly: {_venue_error(exc)}")
         finally:
             lock.release()
 
@@ -853,16 +884,16 @@ class _Run:
             raise _Stop("environment", f"the order step runs against the test environment ({TEST_ENVIRONMENT}, a plain "
                                        "str) only; this venue's environment is not that. Live trading is not built")
         try:
-            present = inspect.getattr_static(self.venue, "host", _ABSENT) is not _ABSENT
+            static = inspect.getattr_static(self.venue, "host", _ABSENT)
         except Exception:
-            present = True
-        if present:
-            try:
-                host = self.venue.host
-            except Exception:
-                raise _Stop("environment", "the venue's host could not be read") from None
-            if type(host) is not str or "sandbox" not in host:
-                raise _Stop("environment", "the venue's host is not a plain str naming the sandbox")
+            static = None                                # present but unreadable: refused below
+        try:
+            dynamic = getattr(self.venue, "host", _ABSENT)   # also a host that comes through __getattr__
+        except Exception:
+            raise _Stop("environment", "the venue's host could not be read") from None
+        if static is not _ABSENT or dynamic is not _ABSENT:
+            if not all(type(h) is str and "sandbox" in h for h in (static, dynamic)):
+                raise _Stop("environment", "the venue's host is not a plain str attribute naming the sandbox")
 
     # -- the paper book's day
     def _paper_day(self, p: PaperTargets) -> None:
@@ -920,8 +951,8 @@ class _Run:
             raise _Stop("baseline", "no baseline is recorded but the order ledger already has orders; the account's "
                                     "positions can no longer tell the owner's holdings from this program's. A person must look")
         try:
-            held = dict(self.venue.positions())
-            bad = sum(1 for sym, units in held.items() if not (_plain(_SYMBOL, sym) and _finite(units) and units >= 0))
+            held = {sym: _as_float(units) for sym, units in dict(self.venue.positions()).items()}
+            bad = sum(1 for sym, units in held.items() if not (_plain(_SYMBOL, sym) and units is not None and units >= 0))
         except Exception as exc:
             raise _Stop("baseline", f"the venue's positions could not be read: {_venue_error(exc)}") from None
         if bad:
@@ -1071,13 +1102,13 @@ class _Run:
             answer = self.venue.cash()
         except Exception as exc:
             raise _Stop("prices", f"the venue's cash could not be read: {_venue_error(exc)}") from None
-        cash = answer.get("cash") if isinstance(answer, dict) else None
-        if isinstance(cash, str):
-            try:
+        try:                                             # whatever the answer's methods do: no usable number
+            cash = answer.get("cash") if isinstance(answer, dict) else None
+            if isinstance(cash, str):
                 cash = float(cash)
-            except ValueError:
-                cash = None
-        return float(cash) if _finite(cash) else None
+            return _as_float(cash)
+        except Exception:
+            return None
 
     # -- 7
     def _differences(self, book, per_strategy, prices, why_not, min_value) -> list[dict]:
@@ -1193,9 +1224,16 @@ class _Run:
             tag = f"{self.batch}-{sym}"
             watch = _SubmitWatch(self.venue)
             self._check_environment()                    # read again before every order ...
+            if self._now() > self.window_end:            # the window, on the clock, just before intend ...
+                self._leave(c, "the session window closed during the run")
+                continue
             try:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
+                if self._now() > self.window_end:        # ... and just before submit_once: it stays intended
+                    self.state.note_outcome(tag, "not sent")
+                    self._leave(c, "the session window closed during the run")
+                    continue
                 self._check_environment()                # ... and immediately before it is sent
                 rec = self.ledger.submit_once(watch, tag)
             except OrdersBlocked:
