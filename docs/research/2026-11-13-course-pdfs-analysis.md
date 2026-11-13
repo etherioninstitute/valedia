@@ -51,7 +51,9 @@ in "similarly", and a lesson called "Disable Paper Trading". None of these was f
 
 Weak points the readers found in the course's bot, and where Valedia stands on each:
 
-- A pending trade never expires. Here an order not sent within six hours of being decided is not sent.
+- A pending trade never expires. Here this is only partly covered: the ledger refuses to send when its last
+  check against the broker is more than six hours old, but an order that was decided and never sent does not
+  expire by its own age. That expiry is part of the approval piece still to build (4.8).
 - The risk check is not repeated at approval. Here: to build with approval by ticket (4.8).
 - There are no exits and no loss limits. Here the rules set holdings in both directions and the risk gate stops the day.
 - There is no test on unseen data. Here the sealed period is the gate.
