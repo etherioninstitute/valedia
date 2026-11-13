@@ -22,7 +22,7 @@ What the real answer looked like (four requests on 2026-11-13, SPY and XLE, one 
   last print was "2026-11-13T16:00:00" (the closing print) and XLE's "2026-11-13T15:59:59", while the HTTP Date header
   said 21:30 GMT (16:30 New York). It is treated as New York time here.
 - `timestamp` has no zone either and reads as UTC (21:28:34 against the server's 21:30:03 GMT): it is when the snapshot
-  was taken, not when the stock traded. It is not used.
+  was taken, not when the stock traded. It is returned as `snapshot_at` and `compare` uses it (rule (c) below).
 - Every number came as a JSON number. Both SPY and the sector fund had a bid and an ask after the close.
 
 Parsing is strict: every number must be a JSON number (not a string, not a boolean), finite, above 0 and at most 1e7;
@@ -37,9 +37,14 @@ datetime; `compare` never reads a clock) and says "no second quote" unless ALL o
   (b) the quote was fetched at most 120 seconds before `now` and not after it;
   (c) the answer's own snapshot `timestamp` (read as UTC, returned as `snapshot_at`) is within 120 seconds of the fetch
       time, either side; a missing or unreadable snapshot time fails.
-Around a daylight-saving change a New York wall-clock time can mean two instants (the repeated hour in November) or none
-(the missing hour in March). Every instant it could mean must satisfy (a), so such a time is accepted only when it is
-recent under every reading (with the default 30 minutes that means it is refused).
+Repeated and missing hours: `last_trade_time` is a New York wall-clock reading with no zone, and twice a year it can mean
+more than one instant. On the November change day 01:00-01:59 happens twice (two instants an hour apart); on the March
+change day 02:00-02:59 never happens (read as standard time or as daylight time, again two instants an hour apart). The
+rule is that EVERY instant the reading could mean must satisfy (a), so such a time is accepted only when it is recent under
+every reading. Under the default limit (1800 s, a window of 2100 s with the 300 s allowance for the future) that never
+happens, so a time in either hour is refused. With an age limit of an hour or more (`max_age_seconds` >= 3600, a window wider
+than the hour between the readings) a time in the missing hour, or in the repeated hour, can be accepted when both readings
+of it are recent.
 The quote's symbol must equal the `symbol` given to `compare`.
 
 Time limit (rev 2): one try, redirects included, has ONE deadline of 10 seconds, enforced three ways: a check before every
@@ -50,6 +55,21 @@ own body is never read. `cboe_quote` also counts a try that took more than 10 se
 
 Strict JSON (rev 2): an answer with a repeated key at any level is unusable. A band that its own last trade contradicts
 (bid and ask usable, last price outside them by more than the tolerance) is not a band: "no second quote".
+
+Crossed band (rev 3): when bid and ask are both usable numbers and the bid is above the ask the data is suspect and the
+verdict is "no second quote", whatever the last price (rev 2 fell back to the last price, which let bid 102, ask 100, last
+500 agree with a first price of 500). When only one of the two is usable the last price is still used.
+
+Environment (rev 3): the opener ignores the proxy variables, and its TLS context is built by hand so that it does not honour
+SSLKEYLOGFILE (the standard `ssl.create_default_context` opens the named file and logs the session keys to it). Server and
+host name are still verified, TLS 1.2 at least. The system's trusted-certificate locations are still read, and OpenSSL
+itself reads SSL_CERT_FILE and SSL_CERT_DIR for them: those two are not neutralised here.
+
+Name lookup (rev 3): `getaddrinfo` cannot be interrupted, so the lookup runs in one daemon thread (named
+"second-quote-lookup") and the try waits for it only as long as the deadline allows; then the try fails with TimeoutError and
+the thread is abandoned. At most one such thread exists at a time: while an abandoned lookup is still waiting, a later try
+fails at once without starting another. The thread ends when the resolver answers or at the process's normal exit (it is a
+daemon); the connection itself is then made by this module to the address given, under the same deadline and watchdog.
 
 Other decisions:
 - A bid above the ask is not a band; the last price is used if there is one, otherwise there is no second quote.
@@ -66,6 +86,7 @@ import json
 import math
 import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -179,20 +200,92 @@ class _Budget:
         self._timer.cancel()
 
 
+def _tls_context() -> ssl.SSLContext:
+    """The TLS context of the real opener, built by hand: server and host name verified, TLS 1.2 at least, the ALPN and
+    post-handshake settings `http.client` would add, and, unlike `ssl.create_default_context`, no SSLKEYLOGFILE (that
+    function opens the file the variable names and logs session keys to it)."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    context.set_alpn_protocols(["http/1.1"])
+    if context.post_handshake_auth is not None:
+        context.post_handshake_auth = True
+    return context
+
+
+_lookup_guard = threading.Lock()
+_pending_lookup: threading.Thread | None = None
+
+
+def _resolve(host: str, port: int, budget: "_Budget | None") -> list:
+    """`socket.getaddrinfo` inside the request's deadline. The call cannot be interrupted, so it runs in a daemon thread
+    that is waited for only as long as the budget allows; past that the try fails (TimeoutError) and the thread is left to
+    finish alone. Only one such thread at a time: while an abandoned one is alive, the next lookup fails at once."""
+    global _pending_lookup
+    if budget is not None:
+        budget.check()
+    box: dict = {}
+
+    def work():
+        try:
+            box["result"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except BaseException as e:                                      # handed back to the waiting try
+            box["error"] = e
+    with _lookup_guard:
+        if _pending_lookup is not None and _pending_lookup.is_alive():
+            raise TimeoutError("an earlier name lookup is still waiting")
+        thread = threading.Thread(target=work, name="second-quote-lookup", daemon=True)
+        _pending_lookup = thread
+        thread.start()
+    thread.join(max(budget.remaining(), 0.0) if budget is not None else DEADLINE_SECONDS)
+    if thread.is_alive():
+        raise TimeoutError("the name lookup did not answer within the deadline")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _connect_timeout(timeout: Any, budget: "_Budget | None") -> float:
+    seconds = float(timeout) if type(timeout) in (int, float) and timeout > 0 else DEADLINE_SECONDS
+    return min(seconds, max(budget.remaining(), 0.001)) if budget is not None else seconds
+
+
+def _connect(address, timeout, source_address, budget: "_Budget | None"):
+    """`socket.create_connection` with the lookup inside the deadline and every socket under the watchdog."""
+    host, port = address
+    error: OSError | None = None
+    for family, kind, proto, _canonical, target in _resolve(host, port, budget):
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            if budget is not None:
+                budget.register(sock)
+            sock.settimeout(_connect_timeout(timeout, budget))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(target)
+            return sock
+        except OSError as e:
+            error = e
+            if sock is not None:
+                sock.close()
+            if budget is not None and (budget.fired.is_set() or budget.remaining() <= 0):
+                break
+    try:
+        raise error if error is not None else OSError("getaddrinfo returns an empty list")
+    finally:
+        error = None
+
+
 class _Conn(http.client.HTTPSConnection):
-    """An HTTPS connection whose sockets (the raw one and the TLS one) are registered with the request's budget."""
+    """An HTTPS connection whose lookup, connection and sockets (the raw one and the TLS one) are under the request's budget."""
     _budget: _Budget | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        create = self._create_connection
-
-        def create_registered(*a, **k):
-            sock = create(*a, **k)
-            if self._budget is not None:
-                self._budget.register(sock)
-            return sock
-        self._create_connection = create_registered
+        self._create_connection = lambda address, timeout, source_address: _connect(address, timeout, source_address, self._budget)
 
     def connect(self):
         super().connect()
@@ -201,6 +294,9 @@ class _Conn(http.client.HTTPSConnection):
 
 
 class _BudgetHTTPS(urllib.request.HTTPSHandler):
+    def __init__(self):
+        super().__init__(context=_tls_context())
+
     def https_open(self, req):
         budget = getattr(req, "_budget", None)
 
@@ -270,9 +366,9 @@ def urllib_fetch(url: str, timeout: float, opener: urllib.request.OpenerDirector
                 e.close()                                                # its body is not read
                 current = target
         raise AssertionError("unreachable")                              # the loop returns or raises
-    except Exception:
-        if budget.fired.is_set():
-            raise TimeoutError("the request passed its deadline") from None
+    except Exception as e:
+        if budget.fired.is_set() or budget.remaining() <= 0 or isinstance(getattr(e, "reason", None), TimeoutError):
+            raise TimeoutError("the request passed its deadline") from None      # urllib wraps a stalled connect or lookup
         raise
     finally:
         budget.cancel()
@@ -432,9 +528,9 @@ def compare(first_price: Any, second: Any, *, symbol: Any, now: datetime, tolera
 
     {verdict: "agree" | "disagree" | "no second quote", difference, basis}. "No second quote" unless the quote is for
     `symbol` and fresh by all three rules in the module docstring (trade age against `now` and `max_age_seconds`, fetch
-    age, snapshot time), and, when it has a usable bid and ask, its last price is not outside them by more than the
-    tolerance. With a usable bid and ask (bid not above ask) the first price must lie from bid less `tolerance` x mid to
-    ask plus `tolerance` x mid (inclusive); otherwise from last less to last plus `tolerance` x last. `difference` is
+    age, snapshot time), its bid and ask, when both are usable, are not crossed (bid above ask), and its last price is not
+    outside them by more than the tolerance. With a usable bid and ask the first price must lie from bid less `tolerance` x
+    mid to ask plus `tolerance` x mid (inclusive); otherwise from last less to last plus `tolerance` x last. `difference` is
     (first - mid) / mid, or (first - last) / last, as a fraction. `now` is an aware datetime: this function reads no
     clock. ValueError for a tolerance not in 0..1, an age limit that is not a positive number, or a `now` that is not aware."""
     if type(tolerance) not in (int, float) or not math.isfinite(tolerance) or not 0 <= tolerance <= 1:
@@ -455,7 +551,9 @@ def compare(first_price: Any, second: Any, *, symbol: Any, now: datetime, tolera
     if why is not None:
         return _verdict("no second quote", None, why)
     bid, ask, last = _number(second.get("bid")), _number(second.get("ask")), _number(second.get("last"))
-    band = bid is not None and ask is not None and bid <= ask
+    if bid is not None and ask is not None and bid > ask:
+        return _verdict("no second quote", None, "bid above ask: crossed, suspect data")
+    band = bid is not None and ask is not None
     if not band and last is None:
         return _verdict("no second quote", None, "no usable bid and ask, and no usable last price")
     tol = _exact(tolerance)

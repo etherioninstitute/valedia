@@ -6,7 +6,11 @@ volatility fields."""
 import io
 import json
 import math
+import functools
 import random
+import socket
+import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -569,6 +573,170 @@ def test_the_real_opener_connects_through_the_watchdog_and_never_reads_a_proxy_f
     assert "_BudgetHTTPS" in kinds and "_NoRedirects" in kinds and "HTTPRedirectHandler" not in kinds
 
 
+# ---- rev 3: the TLS setup takes nothing from the environment (SSLKEYLOGFILE)
+
+def test_the_tls_context_of_the_real_opener_does_not_honour_sslkeylogfile(monkeypatch, tmp_path):
+    keys = tmp_path / "keys.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keys))
+    opener = sq._build_opener()
+    handler = [h for h in opener.handlers if type(h).__name__ == "_BudgetHTTPS"][0]
+    assert handler._context.keylog_filename is None
+    assert not keys.exists()                                           # nothing opened, nothing written
+    ctx = sq._tls_context()
+    assert ctx.keylog_filename is None and not keys.exists()
+    assert sq._BudgetHTTPS()._context.keylog_filename is None and not keys.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_standard_library_would_have_honoured_it_which_is_why_the_context_is_built_by_hand(monkeypatch, tmp_path):
+    keys = tmp_path / "keys.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keys))
+    assert ssl.create_default_context().keylog_filename == str(keys)   # the default would log: the control for the test above
+
+
+def test_the_tls_context_still_verifies_the_server_and_the_host_name():
+    ctx = sq._tls_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert ctx.get_ca_certs() or ctx.cert_store_stats() is not None
+
+
+# ---- rev 3: the name lookup is inside the deadline
+
+class Stuck:
+    """A name lookup that does not answer until released (a safety limit of 4 s, then it fails)."""
+    def __init__(self):
+        self.release, self.calls = threading.Event(), 0
+
+    def __call__(self, *a, **k):
+        self.calls += 1
+        self.release.wait(4.0)
+        raise socket.gaierror(-2, "released")
+
+
+def _lookup_threads():
+    return [t for t in threading.enumerate() if t.name == "second-quote-lookup"]
+
+
+def _wait_for(condition, seconds=2.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not condition():
+        time.sleep(0.01)
+    return condition()
+
+
+def test_a_resolver_that_does_not_answer_fails_the_try_at_the_deadline_and_never_piles_up_threads(monkeypatch):
+    baseline = threading.active_count()
+    stuck = Stuck()
+    monkeypatch.setattr(socket, "getaddrinfo", stuck)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        sq.urllib_fetch(A, 5.0, deadline=0.3)
+    assert time.monotonic() - started < 2.0                            # the deadline, not the resolver's own 4 s
+    assert stuck.calls == 1 and len(_lookup_threads()) == 1 and _lookup_threads()[0].daemon
+    for _ in range(3):                                                  # more tries while that lookup still hangs
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
+            sq.urllib_fetch(A, 5.0, deadline=0.3)
+        assert time.monotonic() - began < 2.0
+    assert stuck.calls == 1 and len(_lookup_threads()) == 1             # no second lookup, no second thread
+    stuck.release.set()
+    assert _wait_for(lambda: not _lookup_threads())
+    assert _wait_for(lambda: threading.active_count() == baseline)      # the deadline timers are gone too
+    fast = Stuck()                                                      # a fresh resolver that fails at once
+    fast.release.set()
+    monkeypatch.setattr(socket, "getaddrinfo", fast)
+    with pytest.raises(urllib.error.URLError):                          # the lookup runs again once the old one is over
+        sq.urllib_fetch(A, 5.0, deadline=5.0)
+    assert fast.calls == 1
+    assert _wait_for(lambda: threading.active_count() == baseline)
+
+
+def test_cboe_quote_with_the_real_fetch_is_none_when_the_lookup_stalls_and_leaves_no_thread(monkeypatch):
+    baseline = threading.active_count()
+    stuck = Stuck()
+    monkeypatch.setattr(socket, "getaddrinfo", stuck)
+    sleeps = []
+    started = time.monotonic()
+    assert sq.cboe_quote("SPY", fetch=functools.partial(sq.urllib_fetch, deadline=0.3), sleep=sleeps.append) is None
+    assert time.monotonic() - started < 3.0 and sleeps == [2.0] and stuck.calls == 1
+    stuck.release.set()
+    assert _wait_for(lambda: not _lookup_threads()) and _wait_for(lambda: threading.active_count() == baseline)
+
+
+def test_a_lookup_that_answers_gives_the_address_the_connection_goes_to(monkeypatch):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    calls = []
+
+    def lookup(host, port_, *a, **k):
+        calls.append((host, port_))
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    budget = sq._Budget(time.monotonic, 5.0)
+    try:
+        conn = sq._Conn("cdn.cboe.com", timeout=5.0, context=sq._tls_context())
+        conn._budget = budget
+        sock = conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+        peer, _ = srv.accept()
+        assert sock.getpeername() == ("127.0.0.1", port) and calls == [("cdn.cboe.com", 443)]
+        assert sock in budget._socks                                    # the socket is under the watchdog
+        sock.close()
+        peer.close()
+    finally:
+        budget.cancel()
+        srv.close()
+    assert not _lookup_threads()
+
+
+def test_a_failed_lookup_or_connection_is_an_oserror_and_the_next_address_is_tried(monkeypatch):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    good = srv.getsockname()[1]
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    refused = dead.getsockname()[1]
+    dead.close()                                                        # nothing listens there now
+
+    def make(addresses):
+        return lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p)) for p in addresses]
+    budget = sq._Budget(time.monotonic, 5.0)
+    conn = sq._Conn("cdn.cboe.com", timeout=5.0, context=sq._tls_context())
+    conn._budget = budget
+    try:
+        monkeypatch.setattr(socket, "getaddrinfo", make([refused]))
+        with pytest.raises(OSError):
+            conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+        monkeypatch.setattr(socket, "getaddrinfo", make([]))
+        with pytest.raises(OSError):
+            conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(-2, "no such name")))
+        with pytest.raises(OSError):
+            conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+        monkeypatch.setattr(socket, "getaddrinfo", make([refused, good]))
+        sock = conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+        assert sock.getpeername() == ("127.0.0.1", good)
+        sock.close()
+    finally:
+        budget.cancel()
+        srv.close()
+
+
+def test_no_lookup_is_started_once_the_deadline_has_passed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: calls.append(a) or [])
+    budget = sq._Budget(time.monotonic, 0.05)
+    assert budget.fired.wait(3.0)
+    conn = sq._Conn("cdn.cboe.com", timeout=5.0, context=sq._tls_context())
+    conn._budget = budget
+    with pytest.raises(TimeoutError):
+        conn._create_connection(("cdn.cboe.com", 443), 5.0, None)
+    assert calls == []
+
+
 # ---- compare (rev 2: age is judged against the caller's `now`)
 
 NY = ZoneInfo("America/New_York")
@@ -639,12 +807,24 @@ def test_a_band_with_no_width_works():
     assert verdict(101.0, s) == "agree" and verdict(101.01, s) == "disagree"
 
 
-def test_a_bid_above_the_ask_is_not_a_band_and_the_last_price_is_used():
-    s = sec(100.5, 100.0, last=100.2)
-    out = judge(101.2, s)
-    assert out["basis"] == "last price" and out["verdict"] == "agree"
-    assert verdict(101.21, s) == "disagree"
-    assert verdict(100.2, sec(100.5, 100.0)) == "no second quote"       # crossed and no last: nothing to judge against
+def test_a_crossed_band_is_no_quote_whatever_the_last_price():
+    for s in (sec(100.5, 100.0, last=100.2), sec(100.5, 100.0), sec(102.0, 100.0, last=500.0), sec(100.01, 100.0, last=100.0),
+              sec(102.0, 100.0, last=102.0), sec(102.0, 100.0, last=100.0), sec(1e7, 5e-324, last=100.0)):
+        for first in (100.0, 100.2, 101.2, 500.0, 102.0):
+            out = judge(first, s)
+            assert out == {"verdict": "no second quote", "difference": None, "basis": out["basis"]}, (s, first, out)
+            assert "crossed" in out["basis"]
+    assert verdict(500.0, sec(102.0, 100.0, last=500.0)) == "no second quote"       # the case that read "agree"
+    assert verdict(500.0, sec(102.0, 100.0, last=500.0), 0.0) == "no second quote"
+    assert verdict(500.0, sec(102.0, 100.0, last=500.0), 1.0) == "no second quote"
+
+
+def test_a_band_with_equal_bid_and_ask_is_not_crossed_and_one_usable_side_still_uses_the_last_price():
+    assert verdict(100.0, sec(100.0, 100.0, last=100.0)) == "agree"
+    for s in (sec(102.0, None, last=500.0), sec(None, 100.0, last=500.0), sec(102.0, -1.0, last=500.0), sec(0, 100.0, last=500.0),
+              sec(102.0, float("nan"), last=500.0), sec(102.0, "100", last=500.0)):
+        out = judge(500.0, s)
+        assert out["verdict"] == "agree" and out["basis"] == "last price", s
 
 
 def test_without_both_sides_the_last_price_is_used_and_without_a_last_there_is_no_quote():
@@ -880,8 +1060,8 @@ def test_a_last_trade_outside_the_band_by_more_than_the_tolerance_is_suspect_dat
 
 
 def test_the_last_trade_check_applies_only_when_there_is_a_usable_band():
-    assert verdict(105.0, sec(100.5, 100.0, last=105.0)) == "agree"     # a crossed pair is no band: the last price is used
-    assert verdict(105.0, sec(None, 100.0, last=105.0)) == "agree"
+    assert verdict(105.0, sec(None, 100.0, last=105.0)) == "agree"      # only one side is usable: the last price is used
+    assert verdict(105.0, sec(100.5, None, last=105.0)) == "agree"
     assert verdict(100.0, sec(99.0, 101.0, last=None)) == "agree"
 
 
@@ -892,6 +1072,8 @@ def _oracle(first_c, bid_c, ask_c, last_c, ltt, tol_t):
     the answer from integer arithmetic."""
     if ltt not in ("2026-11-13T16:00:00", "2026-11-13T16:19:00"):         # 20 or 1 minute old: recent; anything else is not
         return "no second quote", None
+    if bid_c is not None and ask_c is not None and bid_c > ask_c:
+        return "no second quote", None                                  # a crossed band is no quote
     if bid_c is not None and ask_c is not None and bid_c <= ask_c:
         lo = Fraction(bid_c) - Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2)
         hi = Fraction(ask_c) + Fraction(tol_t, 10000) * Fraction(bid_c + ask_c, 2)
@@ -907,7 +1089,7 @@ def _oracle(first_c, bid_c, ask_c, last_c, ltt, tol_t):
 
 def test_a_thousand_generated_cases_agree_with_the_independent_calculation():
     rng = random.Random(20261113)
-    seen = {"agree": 0, "disagree": 0, "no second quote": 0, "band": 0, "last": 0, "contradicted": 0}
+    seen = {"agree": 0, "disagree": 0, "no second quote": 0, "band": 0, "last": 0, "contradicted": 0, "crossed": 0}
     for i in range(3000):
         bid = rng.randint(100, 2_000_000)
         ask = bid + rng.randint(0, 5000)
@@ -953,7 +1135,9 @@ def test_a_thousand_generated_cases_agree_with_the_independent_calculation():
         if ltt in ("2026-11-13T16:00:00", "2026-11-13T16:19:00"):
             if want != "no second quote":
                 seen["band" if bid_c is not None and ask_c is not None and bid_c <= ask_c else "last"] += 1
-            elif bid_c is not None and ask_c is not None and bid_c <= ask_c and last_c is not None:
+            elif bid_c is not None and ask_c is not None and bid_c > ask_c:
+                seen["crossed"] += 1
+            elif bid_c is not None and ask_c is not None and last_c is not None:
                 seen["contradicted"] += 1
     assert min(seen.values()) > 100, seen                                            # every branch was exercised a lot
 
