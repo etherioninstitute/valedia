@@ -203,3 +203,103 @@ def test_normalize_and_stale_quote_filter():
     props = oa.normalize_odds(prop)
     assert props["outcome"].tolist() == ["Jayson Tatum Over"]      # the unpriced leg is dropped
     assert isinstance(props, pd.DataFrame)
+
+
+# historical endpoints, usage headers and which key
+TEN = ["pinnacle", "draftkings", "fanduel", "betmgm", "williamhill_us", "betrivers", "espnbet", "fanatics", "lowvig",
+       "betonlineag"]
+SNAP = {"timestamp": "2026-01-10T15:55:00Z", "previous_timestamp": "2026-01-10T15:50:00Z",
+        "next_timestamp": "2026-01-10T16:00:00Z", "data": [EVENT]}
+
+
+def test_historical_cost_follows_the_documented_rule():
+    assert oa.historical_cost("h2h", bookmakers=TEN) == 10                  # up to 10 books = one region
+    assert oa.historical_cost("h2h", bookmakers=TEN + ["bovada"]) == 20     # 11 to 20 books = two regions
+    assert oa.historical_cost("h2h,spreads,totals", regions="us") == 30
+    assert oa.historical_cost("h2h", regions="us,uk,eu") == 30
+    assert oa.historical_cost(["h2h", "totals"], regions="us,uk") == 40
+
+
+def test_historical_odds_uses_the_paid_key_read_at_call_time_and_keeps_the_usage_headers():
+    keys = {"ODDS_API_KEY": "PAID-KEY-0001", "ODDS_API_KEY_FREE": "FREE-KEY-0002"}
+    asked = []
+
+    def reader(name):
+        asked.append(name)
+        return keys[name]
+
+    transport = FakeTransport([(200, {"X-Requests-Remaining": "19990", "x-requests-used": "10", "x-requests-last": "10"},
+                                SNAP)])
+    client = oa.OddsApiClient(transport, key_reader=reader)
+    assert asked == []                                                      # nothing read before a call
+    body = client.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", bookmakers=TEN)
+    assert body["timestamp"] == "2026-01-10T15:55:00Z" and asked == ["ODDS_API_KEY"]
+    url, params = transport.calls[0]
+    assert url == "https://api.the-odds-api.com/v4/historical/sports/basketball_nba/odds"
+    assert params == {"date": "2026-01-10T16:00:00Z", "markets": "h2h", "bookmakers": ",".join(TEN),
+                      "oddsFormat": "decimal", "dateFormat": "iso", "apiKey": "PAID-KEY-0001"}
+    assert client.last_usage == {"remaining": 19990, "used": 10, "last": 10}
+    assert client.requests_remaining == 19990 and client.requests_last == 10
+
+
+def test_historical_odds_is_never_asked_with_the_free_key():
+    transport = FakeTransport([])
+    client = oa.OddsApiClient(transport, key_reader=lambda name: "FREE-KEY-0002")
+    with pytest.raises(oa.OddsApiError, match="paid key"):
+        client.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", bookmakers=TEN, key="free")
+    assert transport.calls == []
+    with pytest.raises(ValueError):
+        client.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", bookmakers=TEN, key="mine")
+
+
+def test_historical_events_may_use_the_free_key():
+    asked = []
+    transport = FakeTransport([(200, {"x-requests-remaining": "499", "x-requests-used": "1", "x-requests-last": "1"},
+                                {"timestamp": "2026-01-10T16:00:00Z", "data": []})])
+    client = oa.OddsApiClient(transport, key_reader=lambda name: asked.append(name) or "FREE-KEY-0002")
+    client.historical_events("icehockey_nhl", "2026-01-10T16:00:00Z", key="free")
+    assert asked == ["ODDS_API_KEY_FREE"]
+    url, params = transport.calls[0]
+    assert url.endswith("/v4/historical/sports/icehockey_nhl/events") and params["apiKey"] == "FREE-KEY-0002"
+    assert client.last_usage == {"remaining": 499, "used": 1, "last": 1}
+
+
+def test_usage_is_reset_per_call_and_missing_headers_read_as_none():
+    transport = FakeTransport([(200, {"x-requests-last": "10", "x-requests-remaining": "5"}, SNAP), (200, {}, SNAP)])
+    client = oa.OddsApiClient(transport, key_reader=lambda name: "PAID-KEY-0001")
+    client.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", bookmakers=TEN)
+    client.historical_odds("basketball_nba", "2026-01-11T16:00:00Z", bookmakers=TEN)
+    assert client.last_usage == {"remaining": None, "used": None, "last": None}
+
+
+def test_keyed_calls_never_leak_either_key(monkeypatch):
+    def missing(name):
+        raise oa.OddsApiError(f"{name} is not set")
+
+    with pytest.raises(oa.OddsApiError, match="ODDS_API_KEY"):
+        oa.OddsApiClient(FakeTransport([]), key_reader=missing).historical_odds("basketball_nba", "2026-01-10", TEN)
+    boom = ConnectionError("https://api.the-odds-api.com/v4/historical?apiKey=PAID-KEY-0001 refused")
+    client = oa.OddsApiClient(FakeTransport([boom]), max_retries=0, key_reader=lambda n: "PAID-KEY-0001")
+    with pytest.raises(oa.OddsApiError) as err:
+        client.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", TEN)
+    assert "PAID-KEY-0001" not in str(err.value) and "PAID-KEY-0001" not in repr(client)
+    denied = oa.OddsApiClient(FakeTransport([(401, {"x-requests-last": "0"}, {"message": "bad FREE-KEY-0002"})]),
+                              key_reader=lambda n: "FREE-KEY-0002")
+    with pytest.raises(oa.OddsApiError) as err:
+        denied.historical_events("basketball_nba", "2026-01-10T16:00:00Z", key="free")
+    assert "FREE-KEY-0002" not in str(err.value) and denied.last_usage["last"] == 0
+
+
+def test_default_key_reader_goes_through_the_secrets_loader(monkeypatch):
+    from valedia_trader.core import secrets
+    seen = []
+    real_load, real_secret = secrets.load_env, secrets.secret
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: seen.append("load_env") or real_load(*a, **k))
+    monkeypatch.setattr(secrets, "secret", lambda name, environ=None: seen.append(name) or real_secret(name, environ))
+    monkeypatch.setenv("ODDS_API_KEY", "PAID-KEY-FROM-ENV-1")
+    assert oa.read_key("ODDS_API_KEY") == "PAID-KEY-FROM-ENV-1"
+    assert seen == ["load_env", "ODDS_API_KEY"]
+    monkeypatch.delenv("ODDS_API_KEY_FREE", raising=False)
+    with pytest.raises(oa.OddsApiError) as err:
+        oa.read_key("ODDS_API_KEY_FREE")
+    assert "ODDS_API_KEY_FREE" in str(err.value)
