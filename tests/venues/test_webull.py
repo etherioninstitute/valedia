@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,12 @@ from valedia_trader.core.secrets import SecretError
 from valedia_trader.venues import webull as wb
 
 KEY, SECRET = "app-key-do-not-print", "app-secret-do-not-print"
+
+
+@pytest.fixture(autouse=True)
+def _home_is_temporary(tmp_path, monkeypatch):
+    """Every test runs with HOME in a temporary folder, so a venue built without a client never touches the real one."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 class Response:
@@ -703,7 +710,11 @@ class _TokenSdk:
                 import os
                 from pathlib import Path
                 raw = api.get_token_dir() or os.getenv("WEBULL_OPENAPI_TOKEN_DIR") or "conf"
+                sdk.seen["raw"] = raw
+                raw = raw.strip()                                          # as the SDK does (token_storage.py:71-73)
                 d = Path(raw).expanduser().absolute()
+                if any(q.exists() and os.path.samefile(q, wb.REPO) for q in (d, *d.parents)):
+                    raise AssertionError("the stand-in SDK refuses to write a token inside the repository")
                 sdk.seen["token_dir"] = d
                 d.mkdir(parents=True, exist_ok=True)
                 (d / "token.txt").write_text("the-access-token\n")
@@ -789,3 +800,250 @@ def test_a_negative_filled_quantity_is_unreadable(tmp_path):
     page = {"data": [detail(order("PARTIAL_FILLED", cid="c-1", filled_quantity="-1"), cid="c-1")]}
     v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
     assert v.open_orders()[0]["filled_units"] is None
+
+
+# ---- T9 rev 4: third repair after blind verification
+
+def _decimals(x):
+    from decimal import Decimal
+    return max(0, -Decimal(repr(abs(x))).as_tuple().exponent)
+
+
+def test_generated_quantities_are_sent_exactly_or_not_at_all(tmp_path):
+    import random
+    from decimal import Decimal
+    rng = random.Random(20261112)
+    held = [{"symbol": "SPY", "quantity": "1000000000", "instrument_type": "EQUITY"},
+            {"symbol": "BTCUSD", "quantity": "1000000000", "instrument_type": "CRYPTO"}]
+    accepted = refused = 0
+    for i in range(1200):
+        symbol, step = ("BTC-USD", 8) if i % 2 else ("SPY", 5)
+        k = rng.randint(0, 11)
+        x = float(Decimal(rng.randint(1, 10 ** rng.randint(1, 12))).scaleb(-k)) * rng.choice((1, -1))
+        on_step = x != 0 and abs(x) <= 1e9 and _decimals(x) <= step
+        v, client = venue(tmp_path, positions=held)
+        if on_step:
+            out = v.submit(symbol, x, f"g{i}")
+            sent = client.placed()[0][2][0]["quantity"]
+            assert float(sent) == abs(x) and out["quantity"] == sent and out["side"] == ("BUY" if x > 0 else "SELL"), (x, sent)
+            accepted += 1
+        else:
+            with pytest.raises(wb.NotTransmitted):
+                v.submit(symbol, x, f"g{i}")
+            with pytest.raises(wb.NotTransmitted):
+                wb.order_payload(symbol, x, "t")
+            assert client.placed() == [], x
+            refused += 1
+    assert accepted > 250 and refused > 250
+
+
+def test_the_examples_found_are_refused_not_rounded(tmp_path):
+    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "0.000006", "instrument_type": "EQUITY"}])
+    with pytest.raises(wb.NotTransmitted, match="step"):
+        v.submit("SPY", -6e-6, "t")                                       # was sent as a sell of 0.00001, more than held
+    with pytest.raises(wb.NotTransmitted, match="step"):
+        wb.order_payload("SPY", 6e-6, "t")
+    with pytest.raises(wb.NotTransmitted, match="step"):
+        wb.order_payload("BTC-USD", 1.123456789, "t")
+    assert client.placed() == []
+    assert wb.order_payload("SPY", 0.00001, "t")["quantity"] == "0.00001"
+
+
+@pytest.mark.parametrize("units", [True, False, "5", "-2", "1.0", None, [1], {"q": 1}, b"1", complex(1, 0)])
+def test_booleans_strings_and_other_types_are_not_quantities(tmp_path, units):
+    with pytest.raises(wb.NotTransmitted):
+        wb.order_payload("SPY", units, "t")
+    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "10", "instrument_type": "EQUITY"}])
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", units, "t")
+    assert client.placed() == []
+
+
+def test_a_quantity_or_limit_above_the_sanity_ceiling_is_not_transmitted(tmp_path):
+    v, client = venue(tmp_path)
+    for units, limit in ((1e9 + 1, None), (2e9, None), (1.0, 1e9 + 1), (1.0, 1e300), (1.0, float(10 ** 300))):
+        with pytest.raises(wb.NotTransmitted, match="ceiling"):
+            v.submit("SPY", units, "t", limit_price=limit)
+        with pytest.raises(wb.NotTransmitted, match="ceiling"):
+            wb.order_payload("BTC-USD", units, "t", limit_price=limit)
+    assert client.placed() == []
+    assert v.submit("SPY", 1e9, "t")["quantity"] == "1000000000"
+    assert wb.order_payload("SPY", 1.0, "t", limit_price=1e9)["limit_price"] == "1000000000.00"
+
+
+def test_duplicate_or_absurd_holdings_never_license_a_sale(tmp_path):
+    for rows in ([{"symbol": "SPY", "quantity": "5"}, {"symbol": "SPY", "quantity": "5"}],
+                 [{"symbol": "BTCUSD", "quantity": "1", "instrument_type": "CRYPTO"}, {"symbol": "BTC-USD", "quantity": "1"}],
+                 [{"symbol": "SPY", "quantity": "5"}, {"symbol": "spy", "quantity": "junk"}]):
+        v, client = venue(tmp_path, positions=rows)
+        with pytest.raises(wb.WebullError, match="more than one row"):
+            v.positions()
+        sym = "BTC-USD" if "BTC" in json.dumps(rows) else "SPY"
+        with pytest.raises(wb.NotTransmitted):
+            v.submit(sym, -1.0, "t")
+        assert client.placed() == []
+    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "1e300"}, {"symbol": "QQQ", "quantity": "1000000000001"},
+                                           {"symbol": "IWM", "quantity": "1000000000000"}])
+    assert v.positions() == {"IWM": 1e12}                                  # above 1e12 gives no holding
+    for sym in ("SPY", "QQQ"):
+        with pytest.raises(wb.NotTransmitted, match="long-only"):
+            v.submit(sym, -1e6, "t")
+    broken = FakeClient()
+    broken.account_v2.get_account_position = lambda a: (_ for _ in ()).throw(ServerError("SYSTEM_ERROR", 500))
+    bv = wb.WebullVenue(KEY, SECRET, client=broken, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.NotTransmitted):
+        bv.submit("SPY", -1.0, "t")
+    assert client.placed() == [] and broken.placed() == []
+
+
+def test_a_token_directory_spelled_in_another_case_inside_the_repository_is_refused(tmp_path, monkeypatch):
+    import os
+    swapped = str(wb.REPO).swapcase()
+    if swapped == str(wb.REPO) or not os.path.exists(swapped):
+        pytest.skip("case-sensitive filesystem: a path in other letters is another directory here")
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    for inside in (os.path.join(swapped, "conf"), os.path.join(swapped, "conf", "deeper", "still"), swapped):
+        existed = os.path.exists(os.path.join(str(wb.REPO), "conf"))
+        with pytest.raises(wb.WebullError, match="outside the repository"):
+            wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json", token_dir=inside)
+        assert "raw" not in sdk.seen and os.path.exists(os.path.join(str(wb.REPO), "conf")) == existed
+
+
+def test_a_token_directory_reaching_the_repository_through_a_link_or_dots_is_refused(tmp_path, monkeypatch):
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    link = tmp_path / "link"
+    link.symlink_to(wb.REPO, target_is_directory=True)
+    for inside in (link / "conf", wb.REPO / "valedia_trader" / ".." / "conf", Path("/") / ".." / str(wb.REPO).lstrip("/") / "conf"):
+        with pytest.raises(wb.WebullError, match="outside the repository"):
+            wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json", token_dir=inside)
+    assert "raw" not in sdk.seen and not (wb.REPO / "conf").exists()
+
+
+@pytest.mark.parametrize("name", ["trail ", " lead", "\ttab", "both \n"])
+def test_a_token_directory_with_surrounding_whitespace_is_refused(tmp_path, monkeypatch, name):
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    text = name + str(tmp_path / "t") if name[0].isspace() else str(tmp_path / "t") + "/" + name     # the whole text's ends
+    for spelled in (text, Path(text)):
+        with pytest.raises(wb.WebullError, match="whitespace"):
+            wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json", token_dir=spelled)
+    assert "raw" not in sdk.seen and not (tmp_path / "t").exists()
+
+
+def test_the_directory_handed_to_the_sdk_is_exactly_the_one_made_private(tmp_path, monkeypatch):
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    wanted = tmp_path / "a" / "b"
+    wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json", token_dir=wanted)
+    assert sdk.seen["raw"] == str(wanted) and (wanted.stat().st_mode & 0o777) == 0o700 and (wanted / "token.txt").is_file()
+
+
+class TransportError(Exception):
+    """Shaped like the SDK's ClientException for an HTTP failure (core/client.py:328): the HTTP library's text,
+    with the request URL and its query string, ends up in error_msg."""
+    error_code = "SDK.HttpError"
+
+    def __init__(self, text):
+        self.error_msg = text
+
+
+URL_TEXT = ("HTTPSConnectionPool(host='api.sandbox.webull.com', port=443): Max retries exceeded with url: "
+            "/trading/orders/get?account_id=ACC-0001-1234&client_order_id=abc (Caused by NewConnectionError: refused) "
+            "see https://api.sandbox.webull.com/trading/assets/balances/get?account_id=ACC-0001-1234 account ACC-0001-1234")
+
+
+def test_a_transport_error_never_carries_the_url_or_the_account_id(tmp_path):
+    client = FakeClient(details={wb.client_order_id("t"): TransportError(URL_TEXT)}, open_pages={None: TransportError(URL_TEXT)},
+                        balance=TransportError(URL_TEXT))
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), (_ for _ in ()).throw(TransportError(URL_TEXT)))[1]
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    messages = []
+    for call in (lambda: v.order_status("t"), v.open_orders, v.cash, lambda: v.submit("SPY", 1.0, "t"), v.cancel_all_open):
+        with pytest.raises(wb.WebullError) as exc:
+            call()
+        messages.append(str(exc.value))
+    messages.append(v.check()["open_orders_error"])
+    for m in messages:
+        assert "ACC-0001-1234" not in m and "/trading/" not in m and "?" not in m and "https://" not in m and "account_id=" not in m, m
+        assert "<url>" in m or "<account>" in m, m
+    assert "SDK.HttpError" in messages[0] and "max retries exceeded" in messages[0].lower()
+
+
+def _deep(n=60000):
+    x = []
+    for _ in range(n):
+        x = [x]
+    return x
+
+
+HUGE_TEXT_INT = 10 ** 5000                                                 # str() of it raises ValueError (4,300-digit limit)
+
+
+@pytest.mark.parametrize("odd", ["HUGE", "DEEP"])
+def test_values_no_json_decoder_makes_still_raise_only_webull_error(tmp_path, odd):
+    odd = _deep() if odd == "DEEP" else HUGE_TEXT_INT
+    item = order("FILLED", order_id=odd, symbol=odd)
+    page = {"data": [detail(item)]}
+    client = FakeClient(details={wb.client_order_id("t"): Response(detail(item))}, open_pages={None: page},
+                        positions=[{"symbol": odd, "quantity": "1"}], accounts=[{"account_id": odd, "account_type": odd}])
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", account_id="ACC-0001-1234")
+    for call in (lambda: v.order_status("t"), v.open_orders, v.cancel_all_open, v.positions, v.check, v.accounts):
+        try:
+            call()
+        except wb.WebullError as exc:
+            assert type(exc) is wb.WebullError and len(str(exc)) < 400
+        except Exception as exc:
+            pytest.fail(f"{type(exc).__name__} left a public method")
+
+
+def test_an_unreadable_answer_after_a_placed_order_is_still_accepted(tmp_path):
+    class Unreadable(Response):
+        def json(self):
+            raise RecursionError("maximum recursion depth exceeded")
+    for place_body in (Unreadable(None), Response({"order_id": HUGE_TEXT_INT}), Response({"order_id": _deep()}), Response(_deep(2000))):
+        client = FakeClient()
+        client.order_v3.place_order = lambda a, orders, b=place_body: (client.calls.append(("place", a, orders)), b)[1]
+        v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+        out = v.submit("SPY", 1.0, "t")
+        assert out["status"] == "accepted" and out["venue_order_id"] is None and len(client.placed()) == 1
+
+
+def test_a_negative_filled_price_is_no_average(tmp_path):
+    out = status_venue(tmp_path, detail(order("FILLED", filled_quantity="1", filled_price="-10.5")))[0].order_status("t")
+    assert out["avg_price"] is None and out["filled_units"] == 1.0
+
+
+@pytest.mark.parametrize("body", [{"orders": [], "error_code": "SYSTEM_BUSY"}, {"orders": [], "message": "busy"},
+                                  {"orders": [], "client_order_id": "someone-else"}, {"orders": [], "client_order_id": None},
+                                  {"orders": [], "status": "FILLED"}])
+def test_with_the_flag_on_an_empty_list_that_says_anything_else_raises(tmp_path, body):
+    v, _ = status_venue(tmp_path, Response(body), confirmed_not_found=True)
+    with pytest.raises(wb.WebullError):
+        v.order_status("t")
+    for ok in ({"orders": []}, {"orders": [], "client_order_id": wb.client_order_id("t"), "combo_type": "NORMAL"}):
+        assert status_venue(tmp_path, Response(ok), confirmed_not_found=True)[0].order_status("t") is None
+
+
+def test_open_orders_stop_after_two_hundred_pages(tmp_path):
+    def chain(n):
+        pages = {None: {"data": [], "pagination_key": "p1"}}
+        for i in range(1, n):
+            pages[f"p{i}"] = {"data": [], "pagination_key": f"p{i + 1}"} if i < n - 1 else {"data": []}
+        return pages
+    ok = FakeClient(open_pages=chain(200))
+    assert wb.WebullVenue(KEY, SECRET, client=ok, confirmation_file=tmp_path / "x.json").open_orders() == []
+    assert len([c for c in ok.calls if c[0] == "open"]) == 200
+    too_many = FakeClient(open_pages=chain(201))
+    with pytest.raises(wb.WebullError, match="200 pages"):
+        wb.WebullVenue(KEY, SECRET, client=too_many, confirmation_file=tmp_path / "x.json").open_orders()
+    assert len([c for c in too_many.calls if c[0] == "open"]) == 200
+
+
+@pytest.mark.parametrize("raw", ["filled", "Filled", " FILLED", "FILLED ", "partial filled", "PARTIAL_FILLED ", "Cancelled", "submitted"])
+def test_a_status_is_matched_exactly_as_documented(tmp_path, raw):
+    assert status_venue(tmp_path, detail(order(raw)))[0].order_status("t")["state"] == "unknown_status"
+    page = {"data": [detail(order(raw, cid="c-1"), cid="c-1")]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
+    assert v.open_orders()[0]["state"] == "unknown_status"
