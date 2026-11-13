@@ -29,3 +29,7 @@ journal/kill_switch.json
 config/webull_live.json
 # research desk working rooms (approved notes in research/library/ are kept)
 research/desk/
+
+# the Webull SDK writes whole requests, headers included, to this file in the working directory
+webull_trade_sdk.log
+*.log
