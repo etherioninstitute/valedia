@@ -16,9 +16,12 @@ Credentials come from the secrets file (WEBULL_APP_KEY, WEBULL_APP_SECRET, optio
 WEBULL_ENV = sandbox | production). They are never printed or logged: the SDK's own logger, which writes whole
 requests with their headers when a call fails, is silenced, and errors are rebuilt from status fields only.
 Raised messages may carry Webull's own error text (its error_code and up to 160 characters of its message, or
-the HTTP library's text for a transport failure). That text is scrubbed before it is used: anything that looks
-like a URL, an absolute path or a query string becomes <url>, and the account id becomes <account>, so nothing
-that was sent to Webull (headers, keys, the request, its URL) is copied into a message.
+the HTTP library's text for a transport failure). Every text taken from an exception or an error body, on every
+path including the constructor, is scrubbed before it is used: the App Key becomes <app-key>, the App Secret
+<app-secret> and the account id, when known, <account> (replaced in the whole text before it is cut, so no
+fragment survives the cut), then anything that looks like a URL, an absolute path or a query string becomes
+<url>. Nothing that was sent to Webull (headers, keys, the request, its URL) is copied into a message. Reading
+an exception's fields can never raise: a field that cannot be read counts as absent.
 The SDK is imported only when a real connection is made (it opens a session at once, a network call), so tests
 and the rest of the trader do not need it installed. Webull may ask for a one-time approval in its app the
 first time a key is used (token-based two-factor check).
@@ -93,6 +96,14 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   sub-penny rule, SEC Regulation NMS Rule 612; Webull's own increments are not documented on developer.webull.com);
   crypto 8 decimals (an assumption: the docs give 8 decimals for crypto quantities only). Both are to be
   checked in the test environment.
+* Positions: docs /apis/docs/reference/account-position (read 2026-11-12). The 200 body is a bare list of rows
+  {position_id, symbol, quantity, instrument_type, currency, last_price, cost_price, unrealized_profit_loss,
+  option_strategy, event_outcome, legs}; instrument_type is one of EQUITY, OPTION, FUTURES, CRYPTO, EVENT, and
+  the page's example row is symbol "AAPL", instrument_type "OPTION", quantity "1". Only a row whose
+  instrument_type is exactly EQUITY or CRYPTO is a holding (positions()); every other row, one with no, an
+  empty or an unrecognised instrument_type included, is reported apart (other_positions()) and licenses no sale.
+* Selling: what may be sold is the holding minus the unfilled remainder of every open sell for the same symbol
+  and instrument type, read with open_orders() in the same submit, before the order call.
 * Numbers: every number Webull sends is read with one rule: absent, unreadable, too large for a float (a huge
   JSON integer) or not finite means None (positions() skips such a row, and a holding above 1e12), a negative
   filled quantity or filled price is None, and a status is matched exactly as documented (else unknown_status).
@@ -146,6 +157,10 @@ MAX_ORDER_UNITS = 1e9
 MAX_LIMIT_PRICE = 1e9
 MAX_HOLDING_UNITS = 1e12
 MAX_OPEN_ORDER_PAGES = 200
+# docs account-position (read 2026-11-12): instrument_type is one of EQUITY, OPTION, FUTURES, CRYPTO, EVENT.
+HOLDING_TYPES = frozenset({"EQUITY", "CRYPTO"})                       # the only rows that are holdings
+ORDER_INSTRUMENT_TYPES = frozenset({"EQUITY", "OPTION", "FUTURES", "CRYPTO", "EVENT"})
+EMPTY_ANSWER_KEYS = frozenset({"client_order_id", "combo_order_id", "combo_type", "orders"})
 # Quantity steps: crypto 8 decimals (docs common-order-place, field quantity: "Crypto trading supports quantities with
 # up to 8 decimal places"); equities 5 decimals (NOT CONFIRMED: Webull documents fractional quantities without a step).
 QUANTITY_STEP_DECIMALS = {"crypto": 8, "equity": 5}
@@ -337,42 +352,92 @@ _URL = re.compile(r"""[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'"<>()]+"""                
                   r"""|(?<![\w.])/[\w.\-~%]+(?:/[\w.\-~%]*)+""")                 # an absolute path /a/b
 
 
-def _text(value: Any, limit: int) -> str:
-    """str(value)[:limit], or a placeholder when the value cannot be written as text at all."""
+Hidden = tuple  # ((text to hide, placeholder), ...): the App Key, the App Secret and the account id when known
+
+
+def _hidden(app_key: Any, app_secret: Any, account: Any = None) -> Hidden:
+    """The words never to repeat in a message, each as given and trimmed, with their placeholders."""
+    pairs = []
+    for value, placeholder in ((app_key, "<app-key>"), (app_secret, "<app-secret>"), (account, "<account>")):
+        try:
+            text = value if isinstance(value, str) else None if value is None else str(value)
+        except Exception:
+            text = None
+        for word in {text, text.strip()} if text else ():
+            if word:
+                pairs.append((word, placeholder))
+    return tuple(pairs)
+
+
+def _hide(text: str, hidden: Hidden = ()) -> str:
+    """text with every hidden word replaced by its placeholder, in one pass, longest first (a placeholder is
+    never searched again). Run on the whole text before it is cut, so no fragment of a secret survives a cut."""
+    pairs = [(w, p) for w, p in hidden if w]
+    if not pairs:
+        return text
+    names = dict(sorted(pairs, key=lambda wp: len(wp[0])))            # a word given twice keeps one placeholder
+    pattern = re.compile("|".join(re.escape(w) for w in sorted(names, key=len, reverse=True)))
+    return pattern.sub(lambda m: names[m.group(0)], text)
+
+
+def _attr(obj: Any, name: str) -> Any:
+    """getattr(obj, name, None) that never raises: a property that raises counts as absent."""
     try:
-        return str(value)[:limit]
+        return getattr(obj, name, None)
     except Exception:
-        return f"<unreadable {type(value).__name__}>"
+        return None
 
 
-def _scrub(text: str, account: str | None = None) -> str:
-    """Webull's or the HTTP library's words with anything that looks like a URL or a query string replaced by
-    <url>, and the account id, when known, by <account>: nothing sent to Webull is copied into a message."""
-    if account:
-        text = text.replace(account, "<account>")
-    return _URL.sub("<url>", text)
+def _type_name(value: Any, hidden: Hidden = ()) -> str:
+    try:
+        return _hide(str(type(value).__name__), hidden)[:80]
+    except Exception:
+        return "object"
 
 
-def _safe(exc: BaseException, account: str | None = None) -> str:
+def _text(value: Any, limit: int, hidden: Hidden = ()) -> str:
+    """str(value) with the hidden words replaced, then cut to `limit`; a placeholder when the value cannot be
+    written as text at all."""
+    try:
+        text = str(value)
+        return _hide(text, hidden)[:limit]
+    except Exception:
+        return f"<unreadable {_type_name(value, hidden)}>"
+
+
+def _scrub(text: str, hidden: Hidden = ()) -> str:
+    """Webull's or the HTTP library's words with the App Key, the App Secret and the account id replaced by their
+    placeholders, and anything that looks like a URL or a query string by <url>: nothing sent to Webull is copied
+    into a message. Callers cut the text (and so bound the URL search) after hiding and before this."""
+    return _URL.sub("<url>", _hide(text, hidden))
+
+
+def _safe(exc: BaseException, hidden: Hidden = ()) -> str:
     """A short description of an SDK failure built from its status fields, never from the request it carried.
     error_msg is Webull's or the HTTP library's text (a transport ClientException carries the request URL there,
-    SDK core/client.py:328), so it is scrubbed of URLs, query strings and the account id."""
-    parts = [_text(getattr(exc, k, None), 60) for k in ("http_status", "error_code") if getattr(exc, k, None) is not None]
-    msg = _scrub(_text(getattr(exc, "error_msg", "") or "", 400), account)[:160]
-    return _scrub(f"{type(exc).__name__}" + (f" ({', '.join(parts)})" if parts else "") + (f": {msg}" if msg else ""), account)
+    SDK core/client.py:328), so it is scrubbed. No field read here can raise (see _attr)."""
+    parts = [_text(_attr(exc, k), 60, hidden) for k in ("http_status", "error_code") if _attr(exc, k) is not None]
+    msg = _attr(exc, "error_msg")
+    msg = _scrub(_text(msg, 400, hidden), hidden)[:160] if msg else ""
+    return _scrub(_type_name(exc, hidden) + (f" ({', '.join(parts)})" if parts else "") + (f": {msg}" if msg else ""), hidden)
 
 
-def _call(fn, *args) -> Any:
-    """Run one SDK call. The SDK raises on some failures and returns a non-200 response on others. In every call
-    this module makes, the first argument, when there is one, is the account id; it is kept out of messages."""
-    account = args[0] if args and isinstance(args[0], str) else None
+def _rebuilt(exc: WebullError, hidden: Hidden) -> WebullError:
+    """A WebullError (or NotTransmitted) raised by the client, rebuilt with its text scrubbed."""
+    cls = NotTransmitted if isinstance(exc, NotTransmitted) else WebullError
+    return cls(_scrub(_text(exc, 400, hidden), hidden))
+
+
+def _call(fn, *args, hidden: Hidden = ()) -> Any:
+    """Run one SDK call. The SDK raises on some failures and returns a non-200 response on others. Every text
+    taken from the failure is scrubbed of the hidden words (the venue passes its App Key, App Secret and account id)."""
     try:
         res = fn(*args)
-    except WebullError:
-        raise
+    except WebullError as exc:
+        raise _rebuilt(exc, hidden) from None
     except Exception as exc:
-        raise WebullError("Webull call failed: " + _safe(exc, account)) from None
-    return _body(res, account)
+        raise WebullError("Webull call failed: " + _safe(exc, hidden)) from None
+    return _body(res, hidden)
 
 
 def _reading(method):
@@ -397,16 +462,16 @@ def _json(res: Any) -> Any:
         return None
 
 
-def _body(res: Any, account: str | None = None) -> Any:
+def _body(res: Any, hidden: Hidden = ()) -> Any:
     """The JSON body of an SDK response, or an error that names the status but never the credentials.
 
     The error is built from the documented error fields (error_code, message) only, never from the raw response
-    text, which is not under this module's control."""
-    status = getattr(res, "status_code", None)
+    text, which is not under this module's control; both, and the status, are scrubbed of the hidden words."""
+    status = _attr(res, "status_code")
     if status != 200:
         err = _json(res)
-        parts = [_scrub(_text(err.get(k), 120), account) for k in ("error_code", "message") if isinstance(err, dict) and err.get(k) is not None]
-        raise WebullError(f"Webull answered {_text(status, 20)}" + (f": {', '.join(parts)}" if parts else ""))
+        parts = [_scrub(_text(err.get(k), 120, hidden), hidden) for k in ("error_code", "message") if isinstance(err, dict) and err.get(k) is not None]
+        raise WebullError(f"Webull answered {_scrub(_text(status, 20, hidden), hidden)}" + (f": {', '.join(parts)}" if parts else ""))
     try:
         return res.json()
     except Exception:
@@ -426,8 +491,11 @@ def _number(value: Any) -> float | None:
 
 def _not_found_code(code: Any, http_status: Any) -> bool:
     """The exact code ORDER_NOT_FOUND (no case folding, no trimming) with a 4xx HTTP status."""
-    return (isinstance(code, str) and code in ORDER_NOT_FOUND_CODES and isinstance(http_status, int)
-            and not isinstance(http_status, bool) and 400 <= http_status < 500)
+    try:
+        return (type(code) is str and code in ORDER_NOT_FOUND_CODES and isinstance(http_status, int)
+                and not isinstance(http_status, bool) and 400 <= http_status < 500)
+    except Exception:
+        return False
 
 
 def _trader_symbol(symbol: Any, instrument_type: Any) -> str:
@@ -514,6 +582,8 @@ class WebullVenue:
             raise WebullError("a Webull App Key and App Secret are required")
         self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}"
         self._confirmation_file = Path(confirmation_file)
+        self._credential_words = _hidden(app_key, app_secret)       # kept only to be replaced in messages
+        hidden = _hidden(app_key, app_secret, account_id)
         if client is None:
             try:
                 from webull.core.client import ApiClient
@@ -534,13 +604,20 @@ class WebullVenue:
                 api._stream_logger_set = api._file_logger_set = True
                 client = TradeClient(api)
             except Exception as exc:
-                raise WebullError(f"could not open a Webull session on {self.host}: {_safe(exc)}") from None
+                raise WebullError(f"could not open a Webull session on {self.host}: {_safe(exc, hidden)}") from None
             finally:
                 _quiet_sdk_logging()
                 _remove_new_empty_sdk_log(sdk_log_existed, sdk_log)
         self._client = client
         self._account_id = account_id
         self._confirmed_not_found = confirmed_not_found is True
+
+    def _secret_words(self) -> Hidden:
+        """The App Key, the App Secret and the account id (when known): never repeated in a message."""
+        return self._credential_words + _hidden(None, None, self._account_id)
+
+    def _call(self, fn, *args) -> Any:
+        return _call(fn, *args, hidden=self._secret_words())
 
     @classmethod
     def from_secrets(cls, environ=None, **kwargs) -> "WebullVenue":
@@ -555,7 +632,7 @@ class WebullVenue:
     # ---- reading (allowed in both environments)
     @_reading
     def accounts(self) -> list[dict]:
-        body = _call(self._client.account_v2.get_account_list)
+        body = self._call(self._client.account_v2.get_account_list)
         rows = body if isinstance(body, list) else body.get("accounts", body.get("data", [])) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             raise WebullError("Webull's account list has an unexpected shape")
@@ -575,32 +652,93 @@ class WebullVenue:
 
     @_reading
     def balance(self) -> dict:
-        return _call(self._client.account_v2.get_account_balance, self.account_id)
+        return self._call(self._client.account_v2.get_account_balance, self.account_id)
 
     @_reading
     def positions(self) -> dict[str, float]:
-        """Held quantity by the trader's own symbol names (crypto as BTC-USD). A symbol in more than one row raises
-        WebullError (an unexpected shape: whether Webull ever splits a holding over rows is to be checked in the test
-        environment), so a sale can never be licensed by adding rows up. A quantity that is unreadable, not finite or
-        above MAX_HOLDING_UNITS gives that row no holding."""
-        body = _call(self._client.account_v2.get_account_position, self.account_id)
+        """Held quantity by the trader's own symbol names (crypto as BTC-USD), from the rows whose instrument_type
+        is exactly EQUITY (keyed by symbol) or CRYPTO (BTCUSD keyed as BTC-USD). Docs /apis/docs/reference/
+        account-position (read 2026-11-12) list the instrument types EQUITY, OPTION, FUTURES, CRYPTO and EVENT, and
+        give as their example a row with symbol AAPL, instrument_type OPTION, quantity "1": such a row is not a
+        holding of AAPL. Every row that is not EQUITY or CRYPTO, including one with no, an empty or an unrecognised
+        instrument_type, gives no holding and is returned by other_positions() instead; that a real row always
+        carries its instrument_type is to be checked in the test environment.
+
+        A symbol in more than one EQUITY row, or in more than one CRYPTO row, raises WebullError (an unexpected
+        shape: whether Webull ever splits a holding over rows is to be checked in the test environment), so a sale
+        can never be licensed by adding rows up; so does an EQUITY and a CRYPTO row under the same name here. An
+        EQUITY row and, say, an OPTION row for the same symbol are not duplicates. A quantity that is unreadable,
+        not finite or above MAX_HOLDING_UNITS gives that row no holding."""
+        return self._flatten(self._read_positions()[0])
+
+    @staticmethod
+    def _flatten(holdings: dict[tuple[str, str], float | None]) -> dict[str, float]:
+        names = [sym for _, sym in holdings]
+        for sym in names:
+            if names.count(sym) > 1:
+                raise WebullError(f"Webull's position list has {sym} in more than one row (as EQUITY and as CRYPTO); cannot tell what is held")
+        return {sym: qty for (_, sym), qty in holdings.items() if qty is not None}
+
+    @_reading
+    def other_positions(self) -> list[dict]:
+        """Every position row that is not a holding in positions() (its instrument_type is not exactly EQUITY or
+        CRYPTO: an OPTION, FUTURES or EVENT row, or one with no, an empty or an unrecognised type), as
+        {symbol (as given), instrument_type (as given, or None), quantity (a float, or None if unreadable)}."""
+        return self._read_positions()[1]
+
+    def _read_positions(self) -> tuple[dict[tuple[str, str], float | None], list[dict]]:
+        """({(EQUITY or CRYPTO, the trader's symbol): quantity or None}, [the other rows]) from one position read."""
+        body = self._call(self._client.account_v2.get_account_position, self.account_id)
         rows = body if isinstance(body, list) else body.get("positions", body.get("holdings", body.get("data", []))) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             raise WebullError("Webull's position list has an unexpected shape")
-        out: dict[str, float] = {}
-        seen: set[str] = set()
+        holdings: dict[tuple[str, str], float | None] = {}
+        others: list[dict] = []
         for row in rows:
-            sym = str(row.get("symbol", "")).upper()
-            if str(row.get("instrument_type", "")).upper() == "CRYPTO" and sym.endswith("USD") and "-" not in sym:
-                sym = sym[:-3] + "-USD"
-            if sym in seen:
-                raise WebullError(f"Webull's position list has {sym} in more than one row; cannot tell what is held")
-            seen.add(sym)
+            kind = row.get("instrument_type")
             qty = _number(row.get("quantity", row.get("qty", row.get("position", 0))))
-            if qty is None or abs(qty) > MAX_HOLDING_UNITS:               # unreadable, absurd or not finite: no holding
+            if qty is not None and abs(qty) > MAX_HOLDING_UNITS:          # absurd: no holding
+                qty = None
+            if type(kind) is not str or kind not in HOLDING_TYPES:
+                others.append({"symbol": row.get("symbol"), "instrument_type": kind, "quantity": qty})
                 continue
-            out[sym] = qty
-        return out
+            sym = _trader_symbol(row.get("symbol", ""), kind)
+            if (kind, sym) in holdings:
+                raise WebullError(f"Webull's position list has {sym} in more than one row (both {kind}); cannot tell what is held")
+            holdings[(kind, sym)] = qty
+        return holdings, others
+
+    def _held(self, symbol: str) -> float:
+        """The holding a sale of `symbol` may draw on: its CRYPTO row for a crypto symbol, else its EQUITY row."""
+        holdings, _ = self._read_positions()
+        kind, sym = ("CRYPTO" if _is_crypto(symbol) else "EQUITY"), symbol.upper()
+        if ("EQUITY", sym) in holdings and ("CRYPTO", sym) in holdings:
+            raise WebullError(f"Webull's position list has {sym} as both EQUITY and CRYPTO; cannot tell what is held")
+        return holdings.get((kind, sym)) or 0.0
+
+    def _reserved_by_open_sells(self, symbol: str) -> float:
+        """The unfilled remainder of every open sell for `symbol` and its instrument type: total minus filled, or
+        the total when the filled quantity is unreadable (or above the total). Raises WebullError, so the sale is
+        not sent, when the open orders cannot be read, or when an open order for this symbol has an unreadable total
+        or side (units None), or carries no recognised instrument_type (it could be this very holding)."""
+        kind, sym = ("CRYPTO" if _is_crypto(symbol) else "EQUITY"), symbol.upper()
+        names = {sym, sym.replace("-", "")}
+        reserved = 0.0
+        for o in self.open_orders():
+            given = o["instrument_type"]
+            if type(given) is not str or given not in ORDER_INSTRUMENT_TYPES:
+                if o["symbol"] in names:
+                    raise WebullError(f"an open order for {sym} carries no recognised instrument type; cannot tell what is already being sold")
+                continue
+            if given != kind or o["symbol"] != sym:
+                continue
+            if o["units"] is None:
+                raise WebullError(f"an open order for {sym} has an unreadable quantity or side; cannot tell what is already being sold")
+            if o["units"] >= 0:
+                continue
+            total, filled = abs(o["units"]), o["filled_units"]
+            reserved += total - filled if filled is not None and filled <= total else total
+        return reserved
 
     # ---- orders
     def _guard_live(self, value: float | None) -> None:
@@ -629,29 +767,33 @@ class WebullVenue:
             amount, _ = _quantity(units, _is_crypto(symbol))                 # a malformed quantity is refused first
             account = self.account_id
             if amount < 0:                                                # the holding must be established, or no sale
-                held = self.positions().get(symbol.upper(), 0.0)
-                if abs(amount) > held + 1e-9:
-                    raise NotTransmitted(f"selling {abs(amount):g} {symbol} with {held:g} held would open a short; this venue is long-only")
+                held = self._held(symbol)
+                reserved = self._reserved_by_open_sells(symbol)           # open sells already draw on it
+                if abs(amount) > held - reserved + 1e-9:
+                    raise NotTransmitted(f"selling {abs(amount):g} {symbol} with {held:g} held and {reserved:g} in open sells "
+                                         "would open a short; this venue is long-only")
             reference = limit_price if limit_price is not None else price
             self._guard_live(abs(amount) * float(reference) if reference else None)
             order = order_payload(symbol, units, tag, limit_price)
-        except NotTransmitted:
+        except NotTransmitted:                                            # raised here, or rebuilt scrubbed by _call
             raise
         except WebullError as exc:
-            raise NotTransmitted(f"not sent: {exc}") from None
+            raise NotTransmitted("not sent: " + _scrub(_text(exc, 400, self._secret_words()), self._secret_words())) from None
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
-            raise NotTransmitted(f"not sent: {type(exc).__name__}: {str(exc)[:160]}") from None
+            hidden = self._secret_words()
+            raise NotTransmitted(f"not sent: {_type_name(exc, hidden)}: {_scrub(_text(exc, 400, hidden), hidden)[:160]}") from None
+        hidden = self._secret_words()
         try:
             res = self._client.order_v3.place_order(account, [order])   # the only order call; nothing refuses after it
         except NotTransmitted as exc:                                     # raised from inside the call: outcome unknown
-            raise WebullError(f"outcome unknown: the order call began and then failed: {exc}") from None
-        except WebullError:
-            raise
+            raise WebullError("outcome unknown: the order call began and then failed: " + _scrub(_text(exc, 400, hidden), hidden)) from None
+        except WebullError as exc:
+            raise _rebuilt(exc, hidden) from None
         except Exception as exc:
-            raise WebullError("Webull call failed: " + _safe(exc, account)) from None
-        if getattr(res, "status_code", None) != 200:
+            raise WebullError("Webull call failed: " + _safe(exc, hidden)) from None
+        if _attr(res, "status_code") != 200:
             try:
-                _body(res, account)
+                _body(res, hidden)
             except WebullError:
                 raise
             except Exception as exc:
@@ -683,7 +825,7 @@ class WebullVenue:
 
     @_reading
     def cancel(self, tag: str) -> dict:
-        return {"status": "cancel requested", "response": _call(self._client.order_v3.cancel_order, self.account_id, client_order_id(tag))}
+        return {"status": "cancel requested", "response": self._call(self._client.order_v3.cancel_order, self.account_id, client_order_id(tag))}
 
     @_reading
     def cancel_all_open(self) -> list[dict]:
@@ -699,7 +841,7 @@ class WebullVenue:
                 out.append({**entry, "status": "error", "error": "no client order id; Webull cancels only orders placed through the API"})
                 continue
             try:
-                out.append({**entry, "status": "cancel requested", "response": _call(self._client.order_v3.cancel_order, account, o["client_order_id"])})
+                out.append({**entry, "status": "cancel requested", "response": self._call(self._client.order_v3.cancel_order, account, o["client_order_id"])})
             except WebullError as exc:
                 out.append({**entry, "status": "error", "error": str(exc)})
         return out
@@ -710,7 +852,8 @@ class WebullVenue:
         """What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
         raw_status}, or None only when the venue was built with confirmed_not_found=True and Webull gives one of the
         two answers read as "no such order": a 200 in the documented combo shape whose `orders` is an explicitly
-        empty list (and which carries no status, error_code, message or other order's client_order_id), or the
+        empty list and whose keys are all among client_order_id, combo_order_id, combo_type and orders (with any
+        client_order_id ours), or the
         exact error code ORDER_NOT_FOUND with a 4xx status. Neither is documented for the US API (see the module notes),
         so with the default confirmed_not_found=False both raise WebullError; turn the flag on only after that answer
         has been observed in Webull's test environment for an id that was never sent. Any other failure (an
@@ -719,25 +862,32 @@ class WebullVenue:
 
         `state` comes from ORDER_STATES; `filled_units` is unsigned; a number that is absent or unreadable is None,
         never 0 (filled_units is 0.0 only when Webull says 0); avg_price is None when Webull gives 0 (nothing filled);
-        `fee` is the actual commission plus the actual fees."""
+        `fee` is the actual commission plus the actual fees.
+
+        A combo that carries a client_order_id other than ours raises WebullError, whatever it holds. A single
+        item without a client_order_id is read as ours only inside a combo that names our id or names none."""
         cid = client_order_id(tag)
         account = self.account_id
+        hidden = self._secret_words()
         try:
             res = self._client.order_v3.get_order_detail(account, cid)
-        except WebullError:
-            raise
+        except WebullError as exc:
+            raise _rebuilt(exc, hidden) from None
         except Exception as exc:
-            if _not_found_code(getattr(exc, "error_code", None), getattr(exc, "http_status", None)):    # the SDK's ServerException
+            if _not_found_code(_attr(exc, "error_code"), _attr(exc, "http_status")):    # the SDK's ServerException
                 return self._no_such_order("the error code ORDER_NOT_FOUND")
-            raise WebullError("Webull call failed: " + _safe(exc, account)) from None
-        if getattr(res, "status_code", None) != 200:
+            raise WebullError("Webull call failed: " + _safe(exc, hidden)) from None
+        if _attr(res, "status_code") != 200:
             err = _json(res)
-            if isinstance(err, dict) and _not_found_code(err.get("error_code"), getattr(res, "status_code", None)):
+            if isinstance(err, dict) and _not_found_code(err.get("error_code"), _attr(res, "status_code")):
                 return self._no_such_order("the error code ORDER_NOT_FOUND")
-        body = _body(res, account)
+        body = _body(res, hidden)
         if (isinstance(body, dict) and isinstance(body.get("orders"), list) and not body["orders"]
-                and not {"status", "error_code", "message"} & body.keys() and body.get("client_order_id", cid) == cid):
+                and body.keys() <= EMPTY_ANSWER_KEYS and body.get("client_order_id", cid) == cid):
             return self._no_such_order("an empty order list")
+        combos = body if isinstance(body, list) else [body]
+        if any(isinstance(c, dict) and "orders" in c and "client_order_id" in c and c["client_order_id"] != cid for c in combos):
+            raise WebullError("Webull's order detail names another client order id; cannot tell what happened to this order")
         items = _order_items(body)
         if not items:                                                     # None (malformed) or a bare empty list
             raise WebullError(f"Webull's order detail has an unexpected shape (a {type(body).__name__}); cannot tell what happened")
@@ -760,7 +910,8 @@ class WebullVenue:
     @_reading
     def open_orders(self) -> list[dict]:
         """Every open order of the account, following pagination_key to the last page (docs order-open: an absent
-        key marks the last page). Each is {client_order_id, venue_order_id, symbol (the trader's naming), units
+        key marks the last page). Each is {client_order_id, venue_order_id, symbol (the trader's naming),
+        instrument_type (as given, None when absent), units
         (signed: sells and shorts negative; None if unreadable or the side is not BUY, SELL or SHORT), state,
         filled_units, raw_status}. A malformed page (an entry that is not an object, a bare empty list) or a
         pagination key that is not a non-empty string raises WebullError."""
@@ -768,7 +919,7 @@ class WebullVenue:
         out: list[dict] = []
         key, seen, pages = None, set(), 0
         while True:
-            body = _call(self._client.order_v3.list_order_open, account) if key is None else _call(self._client.order_v3.list_order_open, account, key)
+            body = self._call(self._client.order_v3.list_order_open, account) if key is None else self._call(self._client.order_v3.list_order_open, account, key)
             pages += 1
             rows = body.get("data") if isinstance(body, dict) else body      # a body without a `data` list is not "none open"
             items = _order_items(rows) if isinstance(rows, list) and (rows or isinstance(body, dict)) else None
@@ -777,7 +928,7 @@ class WebullVenue:
             for item in items:
                 qty, sign = _number(item.get("total_quantity")), _side_sign(item.get("side"))
                 out.append({"client_order_id": item.get("client_order_id"), "venue_order_id": str(item["order_id"]) if item.get("order_id") else None,
-                            "symbol": _trader_symbol(item.get("symbol"), item.get("instrument_type")),
+                            "symbol": _trader_symbol(item.get("symbol"), item.get("instrument_type")), "instrument_type": item.get("instrument_type"),
                             "units": None if qty is None or sign is None else sign * abs(qty), "state": _state(item.get("status")),
                             "filled_units": _filled_units(item), "raw_status": item.get("status")})
             key = body.get("pagination_key") if isinstance(body, dict) else None
@@ -799,7 +950,8 @@ class WebullVenue:
         (another currency's figures are never labelled with it). When total_asset_currency is absent or empty, the
         totals carry no currency, so total_cash_balance is not used: everything comes from the single entry, `cash`
         from its cash_balance and `currency` from its own currency (all None without one such entry). A field that is absent or unreadable is
-        None; an account_currency_assets that is not a list of objects raises WebullError."""
+        None; an account_currency_assets that is not a list of objects, or that holds more than one entry in the
+        wanted currency, raises WebullError."""
         body = self.balance()
         if not isinstance(body, dict):
             raise WebullError(f"Webull's balance answer is a {type(body).__name__}, not an object")
@@ -811,7 +963,10 @@ class WebullVenue:
         if currency is not None and not isinstance(currency, str):
             raise WebullError("Webull's balance has an unexpected shape: total_asset_currency is not a string")
         if currency:                                                      # Webull attached this currency to the totals
-            entry = next((a for a in assets if str(a.get("currency", "")).upper() == currency.upper()), {})
+            matches = [a for a in assets if str(a.get("currency", "")).upper() == currency.upper()]
+            if len(matches) > 1:
+                raise WebullError(f"Webull's balance has more than one account_currency_assets entry in {currency}; cannot tell which holds the cash")
+            entry = matches[0] if matches else {}
             cash = _number(body.get("total_cash_balance"))
             cash = cash if cash is not None else _number(entry.get("cash_balance"))
         else:                                                             # no currency on the totals: only the single entry
@@ -832,7 +987,9 @@ class WebullVenue:
         try:
             bal = self.balance()
             report["balance_fields"] = sorted(bal)[:20] if isinstance(bal, dict) else type(bal).__name__
-            report["positions"] = len(self.positions())
+            holdings, others = self._read_positions()
+            report["positions"] = len(self._flatten(holdings))
+            report["other_positions"] = len(others)
         except WebullError as exc:
             report["balance"] = str(exc)
         try:

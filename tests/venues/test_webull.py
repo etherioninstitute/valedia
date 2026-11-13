@@ -346,8 +346,8 @@ def test_open_orders_follow_every_page_to_the_end(tmp_path):
     client = FakeClient(open_pages=pages)
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
     assert v.open_orders() == [
-        {"client_order_id": "c-spy", "venue_order_id": "WB-5", "symbol": "SPY", "units": 2.0, "state": "open", "filled_units": 0.0, "raw_status": "SUBMITTED"},
-        {"client_order_id": "c-btc", "venue_order_id": "WB-7", "symbol": "BTC-USD", "units": -0.003, "state": "partly_filled", "filled_units": 0.001, "raw_status": "PARTIAL_FILLED"}]
+        {"client_order_id": "c-spy", "venue_order_id": "WB-5", "symbol": "SPY", "instrument_type": "EQUITY", "units": 2.0, "state": "open", "filled_units": 0.0, "raw_status": "SUBMITTED"},
+        {"client_order_id": "c-btc", "venue_order_id": "WB-7", "symbol": "BTC-USD", "instrument_type": "CRYPTO", "units": -0.003, "state": "partly_filled", "filled_units": 0.001, "raw_status": "PARTIAL_FILLED"}]
     assert [c[2] for c in client.calls if c[0] == "open"] == [None, "page-2"]
     looping = FakeClient(open_pages={None: {"data": [], "pagination_key": "same"}, "same": {"data": [], "pagination_key": "same"}})
     with pytest.raises(wb.WebullError, match="pagination"):
@@ -635,8 +635,8 @@ def test_a_huge_or_infinite_number_is_unreadable_not_an_overflow(tmp_path):
     assert (out["filled_units"], out["avg_price"], out["fee"]) == (None, None, None)
     big_fees = order("FILLED", filled_quantity="1", fees=[{"actual_value": 1e308}, {"actual_value": 1e308}])   # the sum overflows to inf
     assert status_venue(tmp_path, detail(big_fees))[0].order_status("t")["fee"] is None
-    rows = [{"symbol": "SPY", "quantity": HUGE}, {"symbol": "QQQ", "quantity": "1e999"}, {"symbol": "IWM", "quantity": "nan"},
-            {"symbol": "DIA", "quantity": "3"}]
+    rows = [{"symbol": "SPY", "quantity": HUGE, "instrument_type": "EQUITY"}, {"symbol": "QQQ", "quantity": "1e999", "instrument_type": "EQUITY"}, {"symbol": "IWM", "quantity": "nan", "instrument_type": "EQUITY"},
+            {"symbol": "DIA", "quantity": "3", "instrument_type": "EQUITY"}]
     v = wb.WebullVenue(KEY, SECRET, client=FakeClient(positions=rows), confirmation_file=tmp_path / "x.json")
     assert v.positions() == {"DIA": 3.0}                                  # unreadable quantities are skipped, never infinite
     with pytest.raises(wb.NotTransmitted, match="long-only"):
@@ -872,9 +872,9 @@ def test_a_quantity_or_limit_above_the_sanity_ceiling_is_not_transmitted(tmp_pat
 
 
 def test_duplicate_or_absurd_holdings_never_license_a_sale(tmp_path):
-    for rows in ([{"symbol": "SPY", "quantity": "5"}, {"symbol": "SPY", "quantity": "5"}],
-                 [{"symbol": "BTCUSD", "quantity": "1", "instrument_type": "CRYPTO"}, {"symbol": "BTC-USD", "quantity": "1"}],
-                 [{"symbol": "SPY", "quantity": "5"}, {"symbol": "spy", "quantity": "junk"}]):
+    for rows in ([{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}, {"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}],
+                 [{"symbol": "BTCUSD", "quantity": "1", "instrument_type": "CRYPTO"}, {"symbol": "BTC-USD", "quantity": "1", "instrument_type": "CRYPTO"}],
+                 [{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}, {"symbol": "spy", "quantity": "junk", "instrument_type": "EQUITY"}]):
         v, client = venue(tmp_path, positions=rows)
         with pytest.raises(wb.WebullError, match="more than one row"):
             v.positions()
@@ -882,8 +882,8 @@ def test_duplicate_or_absurd_holdings_never_license_a_sale(tmp_path):
         with pytest.raises(wb.NotTransmitted):
             v.submit(sym, -1.0, "t")
         assert client.placed() == []
-    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "1e300"}, {"symbol": "QQQ", "quantity": "1000000000001"},
-                                           {"symbol": "IWM", "quantity": "1000000000000"}])
+    v, client = venue(tmp_path, positions=[{"symbol": "SPY", "quantity": "1e300", "instrument_type": "EQUITY"}, {"symbol": "QQQ", "quantity": "1000000000001", "instrument_type": "EQUITY"},
+                                           {"symbol": "IWM", "quantity": "1000000000000", "instrument_type": "EQUITY"}])
     assert v.positions() == {"IWM": 1e12}                                  # above 1e12 gives no holding
     for sym in ("SPY", "QQQ"):
         with pytest.raises(wb.NotTransmitted, match="long-only"):
@@ -987,7 +987,7 @@ def test_values_no_json_decoder_makes_still_raise_only_webull_error(tmp_path, od
     item = order("FILLED", order_id=odd, symbol=odd)
     page = {"data": [detail(item)]}
     client = FakeClient(details={wb.client_order_id("t"): Response(detail(item))}, open_pages={None: page},
-                        positions=[{"symbol": odd, "quantity": "1"}], accounts=[{"account_id": odd, "account_type": odd}])
+                        positions=[{"symbol": odd, "quantity": "1", "instrument_type": "EQUITY"}], accounts=[{"account_id": odd, "account_type": odd}])
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", account_id="ACC-0001-1234")
     for call in (lambda: v.order_status("t"), v.open_orders, v.cancel_all_open, v.positions, v.check, v.accounts):
         try:
@@ -1047,3 +1047,400 @@ def test_a_status_is_matched_exactly_as_documented(tmp_path, raw):
     page = {"data": [detail(order(raw, cid="c-1"), cid="c-1")]}
     v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
     assert v.open_orders()[0]["state"] == "unknown_status"
+
+
+# ---- T9 rev 5: options and other instruments, open sells, secrets in error texts, unreadable exceptions
+
+OPTION_ROW = {"symbol": "AAPL", "instrument_type": "OPTION", "quantity": "1"}          # docs account-position, example row
+
+
+def test_the_documented_option_row_alone_is_no_holding_and_licenses_no_sale(tmp_path):
+    v, client = venue(tmp_path, positions=[dict(OPTION_ROW)])
+    assert v.positions() == {}
+    assert v.other_positions() == [{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": 1.0}]
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("AAPL", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_an_option_beside_the_stock_is_not_a_duplicate_and_does_not_add_to_it(tmp_path):
+    v, client = venue(tmp_path, positions=[{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "10"}, dict(OPTION_ROW)])
+    assert v.positions() == {"AAPL": 10.0}
+    assert v.other_positions() == [{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": 1.0}]
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("AAPL", -11.0, "t1")
+    assert len(client.placed()) == 0
+    assert v.submit("AAPL", -10.0, "t2")["status"] == "accepted" and len(client.placed()) == 1
+
+
+def test_an_option_beside_a_crypto_holding(tmp_path):
+    v, client = venue(tmp_path, positions=[{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "0.5"}, dict(OPTION_ROW)])
+    assert v.positions() == {"BTC-USD": 0.5}
+    assert v.other_positions() == [{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": 1.0}]
+    assert v.submit("BTC-USD", -0.5, "t")["status"] == "accepted" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("given", ["ABSENT", None, "", "equity", "Crypto", " EQUITY", "STOCK", "FUTURES", "EVENT", "OPTION", 7])
+def test_a_row_without_a_known_holding_type_is_reported_apart_and_licenses_no_sale(tmp_path, given):
+    row = {"symbol": "SPY", "quantity": "3"} if given == "ABSENT" else {"symbol": "SPY", "quantity": "3", "instrument_type": given}
+    v, client = venue(tmp_path, positions=[row])
+    assert v.positions() == {}
+    assert v.other_positions() == [{"symbol": "SPY", "instrument_type": None if given == "ABSENT" else given, "quantity": 3.0}]
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_other_positions_give_an_unreadable_quantity_as_none(tmp_path):
+    v, _ = venue(tmp_path, positions=[{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": "junk"},
+                                      {"symbol": "X", "instrument_type": "EVENT", "quantity": "1e300"}])
+    assert v.other_positions() == [{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": None},
+                                   {"symbol": "X", "instrument_type": "EVENT", "quantity": None}]
+
+
+def test_duplicates_are_judged_within_equities_and_within_crypto(tmp_path):
+    for rows in ([{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "1"}, {"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "1"}],
+                 [{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}, {"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}],
+                 [{"symbol": "BTC-USD", "instrument_type": "EQUITY", "quantity": "1"}, {"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}]):
+        v, client = venue(tmp_path, positions=rows)
+        with pytest.raises(wb.WebullError, match="more than one row"):
+            v.positions()
+        with pytest.raises(wb.NotTransmitted):
+            v.submit(rows[0]["symbol"] if rows[0]["instrument_type"] == "EQUITY" and "-" not in rows[0]["symbol"] else "BTC-USD", -1.0, "t")
+        assert len(client.placed()) == 0
+    v, _ = venue(tmp_path, positions=[{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "2"}, dict(OPTION_ROW), dict(OPTION_ROW)])
+    assert v.positions() == {"AAPL": 2.0} and len(v.other_positions()) == 2
+
+
+def test_a_crypto_sale_is_licensed_only_by_a_crypto_row(tmp_path):
+    v, client = venue(tmp_path, positions=[{"symbol": "BTC-USD", "instrument_type": "EQUITY", "quantity": "5"}])
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("BTC-USD", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_check_reports_the_count_of_other_positions(tmp_path):
+    v, _ = venue(tmp_path, positions=[{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "2"}, dict(OPTION_ROW),
+                                      {"symbol": "ES", "instrument_type": "FUTURES", "quantity": "1"}])
+    report = v.check()
+    assert report["positions"] == 1 and report["other_positions"] == 2
+
+
+def _open_sell(cid, total, filled="0", symbol="SPY", kind="EQUITY", side="SELL", status="SUBMITTED"):
+    item = order(status, cid=cid, symbol=symbol, side=side, total_quantity=total, filled_quantity=filled)
+    if kind is None:
+        item.pop("instrument_type")
+    else:
+        item["instrument_type"] = kind
+    return detail(item, cid=cid)
+
+
+def _seller(tmp_path, held, *open_rows, symbol="SPY", kind="EQUITY", open_page=None):
+    client = FakeClient(positions=[{"symbol": symbol, "instrument_type": kind, "quantity": held}])
+    client._open_pages = {None: {"data": list(open_rows)}} if open_page is None else {None: open_page}
+    return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json"), client
+
+
+def _opens(client):
+    return [c for c in client.calls if isinstance(c, tuple) and c[0] == "open"]
+
+
+def test_one_open_sell_of_the_whole_holding_leaves_nothing_to_sell(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "10"))
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -10.0, "t")
+    assert len(client.placed()) == 0 and len(_opens(client)) == 1
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "4"))
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -7.0, "t")
+    assert len(client.placed()) == 0
+    assert v.submit("SPY", -6.0, "t2")["status"] == "accepted" and len(client.placed()) == 1
+    assert client.calls.index(_opens(client)[-1]) < client.calls.index(client.placed()[0])     # read before the order call
+
+
+def test_several_open_sells_are_added_up(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "3"), _open_sell("c-2", "4"))
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -4.0, "t")
+    assert len(client.placed()) == 0
+    assert v.submit("SPY", -3.0, "t2")["status"] == "accepted" and len(client.placed()) == 1
+
+
+def test_a_partly_filled_open_sell_reserves_only_its_remainder(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "10", filled="6", status="PARTIAL_FILLED"))
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -7.0, "t")
+    assert len(client.placed()) == 0
+    assert v.submit("SPY", -6.0, "t2")["status"] == "accepted" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("filled", ["junk", None, "-1", "11"])
+def test_an_open_sell_whose_fill_is_unreadable_reserves_its_whole_total(tmp_path, filled):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "8", filled=filled))
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -3.0, "t")
+    assert len(client.placed()) == 0
+    assert v.submit("SPY", -2.0, "t2")["status"] == "accepted" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("total", ["junk", None, "nan", "1e999"])
+def test_an_open_sell_with_an_unreadable_total_stops_the_sale(tmp_path, total):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", total))
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_a_failed_open_order_read_stops_the_sale(tmp_path):
+    client = FakeClient(positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "10"}],
+                        open_pages={None: ServerError("SYSTEM_BUSY", 500)})
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0 and len(_opens(client)) == 1
+    v, client = _seller(tmp_path, "10", open_page={"data": ["junk"]})
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_open_buys_other_symbols_and_other_instruments_reserve_nothing(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "10", side="BUY"), _open_sell("c-2", "10", symbol="QQQ"),
+                        _open_sell("c-3", "10", kind="OPTION"))
+    assert v.submit("SPY", -10.0, "t")["status"] == "accepted" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("kind", [None, "", "equity", "STOCK"])
+def test_an_open_order_for_the_symbol_with_no_known_type_stops_the_sale(tmp_path, kind):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "1", kind=kind))
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_an_open_order_with_an_unknown_side_for_the_symbol_stops_the_sale(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "1", side="HOLD"))
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", -1.0, "t")
+    assert len(client.placed()) == 0
+
+
+def test_an_open_crypto_sell_reserves_the_crypto_holding(tmp_path):
+    v, client = _seller(tmp_path, "1", _open_sell("c-1", "0.6", symbol="BTCUSD", kind="CRYPTO"), symbol="BTCUSD", kind="CRYPTO")
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("BTC-USD", -0.5, "t")
+    assert len(client.placed()) == 0
+    assert v.submit("BTC-USD", -0.4, "t2")["status"] == "accepted" and len(client.placed()) == 1
+
+
+def test_a_buy_makes_no_open_order_read(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "10"))
+    assert v.submit("SPY", 5.0, "t")["status"] == "accepted"
+    assert _opens(client) == [] and len(client.placed()) == 1
+    assert not [c for c in client.calls if isinstance(c, tuple) and c[0] == "positions"]
+
+
+def test_open_orders_give_the_instrument_type_as_given(tmp_path):
+    v, _ = _seller(tmp_path, "1", _open_sell("c-1", "1", kind="OPTION"), _open_sell("c-2", "1", kind=None), _open_sell("c-3", "1", kind="equity"))
+    assert [o["instrument_type"] for o in v.open_orders()] == ["OPTION", None, "equity"]
+
+
+PK, PS, PA = "Kq7Zplantedkey0001", "Sx9Wplantedsecret0002", "ACC-0001-1234"
+PLANT = f"key={PK} secret={PS} account={PA}"
+
+
+class Planted(Exception):
+    def __init__(self, **fields):
+        super().__init__(PLANT)
+        self.__dict__.update(fields)
+
+    def __str__(self):
+        return PLANT
+
+
+PLANT_KINDS = ["sdk_text", "sdk_text_padded", "fields", "message", "webull_error", "not_transmitted", "body", "body_padded", "status"]
+RAISING_KINDS = PLANT_KINDS[:6]
+CARRIED_KINDS = {"sdk_text", "fields", "webull_error", "not_transmitted", "body", "status"}      # their text reaches a message
+
+
+def _planted(kind):
+    """What a failing SDK call does, for each place a planted text can come from: the SDK's error text, an
+    exception's other fields, an exception's own message, an error body, the HTTP status."""
+    if kind == "sdk_text":
+        raise Planted(error_code="SYSTEM_BUSY", http_status=417, error_msg=PLANT)
+    if kind == "sdk_text_padded":                                         # the secrets straddle the cut at 400 characters
+        raise Planted(error_code="SYSTEM_BUSY", http_status=417, error_msg="x" * 390 + PLANT)
+    if kind == "fields":
+        raise Planted(error_code=PLANT, http_status=PLANT, error_msg="")
+    if kind == "message":
+        raise RuntimeError(PLANT)
+    if kind == "webull_error":
+        raise wb.WebullError(PLANT)
+    if kind == "not_transmitted":
+        raise wb.NotTransmitted(PLANT)
+    if kind == "body":
+        return Response({"error_code": PLANT, "message": PLANT}, 417)
+    if kind == "body_padded":                                             # straddling the cut at 120 characters
+        return Response({"error_code": "x" * 110 + PLANT, "message": "y" * 115 + PLANT}, 417)
+    return Response({}, PLANT)                                            # "status"
+
+
+def _leaks(text, secrets=(PK, PS, PA)):
+    return [s[i:i + 8] for s in secrets for i in range(len(s) - 7) if s[i:i + 8] in text]
+
+
+ENDPOINTS = ["accounts", "balance", "positions", "open", "detail", "cancel", "place"]
+PUBLIC = {"accounts": lambda v: v.accounts(), "balance": lambda v: v.balance(), "positions": lambda v: v.positions(),
+          "other_positions": lambda v: v.other_positions(), "cash": lambda v: v.cash(), "check": lambda v: v.check(),
+          "open_orders": lambda v: v.open_orders(), "cancel": lambda v: v.cancel("t"), "cancel_all_open": lambda v: v.cancel_all_open(),
+          "order_status": lambda v: v.order_status("t"), "submit_buy": lambda v: v.submit("SPY", 1.0, "t"),
+          "submit_sell": lambda v: v.submit("SPY", -1.0, "t2")}
+
+
+def _planted_client(kind, endpoint):
+    client = FakeClient(positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "5"}],
+                        open_pages={None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}},
+                        details={wb.client_order_id("t"): Response(detail(order("FILLED")))})
+    fail = lambda *a: _planted(kind)                                      # noqa: E731
+    target = {"accounts": (client.account_v2, "get_account_list"), "balance": (client.account_v2, "get_account_balance"),
+              "positions": (client.account_v2, "get_account_position"), "open": (client.order_v3, "list_order_open"),
+              "detail": (client.order_v3, "get_order_detail"), "cancel": (client.order_v3, "cancel_order"),
+              "place": (client.order_v3, "place_order")}[endpoint]
+    setattr(*target, fail)
+    return client
+
+
+@pytest.mark.parametrize("kind", PLANT_KINDS)
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_no_secret_planted_in_an_error_text_reaches_any_message(tmp_path, kind, endpoint):
+    texts = []
+    for name, call in PUBLIC.items():
+        v = wb.WebullVenue(PK, PS, client=_planted_client(kind, endpoint), account_id=PA, confirmation_file=tmp_path / "x.json")
+        try:
+            out = call(v)
+        except wb.WebullError as exc:
+            texts.append((name, str(exc)))
+            continue
+        if name == "check":
+            texts.append((name, json.dumps(out, default=str)))
+        elif name == "cancel_all_open":
+            texts.append((name, json.dumps([o.get("error") for o in out])))
+    v = wb.WebullVenue(PK, PS, client=_planted_client(kind, endpoint), confirmation_file=tmp_path / "x.json")   # account not yet known
+    try:
+        v.account_id
+    except wb.WebullError as exc:
+        texts.append(("account_id", str(exc)))
+        assert not _leaks(str(exc), (PK, PS)), str(exc)
+    for name, text in texts:
+        if name != "account_id":
+            assert not _leaks(text), f"{name}: {text}"
+    if kind in CARRIED_KINDS and endpoint != "accounts":
+        assert any("<app-key>" in t for _, t in texts), texts           # the text is carried, with the secrets replaced
+
+
+@pytest.mark.parametrize("kind", RAISING_KINDS)
+@pytest.mark.parametrize("where", ["api", "trade"])
+def test_the_constructor_never_repeats_a_secret(tmp_path, monkeypatch, kind, where):
+    class ApiClient:
+        def __init__(self, key, secret, region):
+            if where == "api":
+                _planted(kind)
+
+        def add_endpoint(self, region, host):
+            pass
+
+        def set_token_dir(self, token_dir):
+            pass
+
+    class TradeClient:
+        def __init__(self, api):
+            _planted(kind)
+
+    monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=ApiClient))
+    monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=TradeClient))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(wb.WebullError) as exc:
+        wb.WebullVenue(PK, PS, account_id=PA, confirmation_file=tmp_path / "x.json")
+    assert not _leaks(str(exc.value)), str(exc.value)
+    if kind in CARRIED_KINDS - {"webull_error", "not_transmitted"}:
+        assert "<app-key>" in str(exc.value) and "<account>" in str(exc.value)
+
+
+class Unreadable(Exception):
+    """An exception none of whose fields can be read."""
+    @property
+    def error_code(self):
+        raise RuntimeError("error_code cannot be read")
+
+    http_status = error_msg = error_code
+
+    def __str__(self):
+        raise RuntimeError("str cannot be read")
+
+
+def test_an_exception_whose_fields_cannot_be_read_leaves_only_as_webull_error(tmp_path, monkeypatch):
+    hits = []
+
+    def boom(*a):
+        hits.append(a)
+        raise Unreadable()
+    for endpoint, call, want in (("place", lambda v: v.submit("SPY", 1.0, "t"), wb.WebullError),
+                                 ("positions", lambda v: v.submit("SPY", -1.0, "t"), wb.NotTransmitted),
+                                 ("open", lambda v: v.submit("SPY", -1.0, "t"), wb.NotTransmitted),
+                                 ("detail", lambda v: v.order_status("t"), wb.WebullError),
+                                 ("accounts", lambda v: v.accounts(), wb.WebullError),
+                                 ("cancel", lambda v: v.cancel("t"), wb.WebullError)):
+        client = _planted_client("sdk_text", endpoint)
+        setattr(*{"place": (client.order_v3, "place_order"), "positions": (client.account_v2, "get_account_position"),
+                  "open": (client.order_v3, "list_order_open"), "detail": (client.order_v3, "get_order_detail"),
+                  "accounts": (client.account_v2, "get_account_list"), "cancel": (client.order_v3, "cancel_order")}[endpoint], boom)
+        v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json")
+        with pytest.raises(wb.WebullError) as exc:
+            call(v)
+        assert isinstance(exc.value, want) and (want is wb.WebullError) == (type(exc.value) is wb.WebullError), endpoint
+        placed = len([h for h in hits if len(h) == 2 and isinstance(h[1], list)]) if endpoint == "place" else len(client.placed())
+        assert placed == (1 if endpoint == "place" else 0), endpoint
+        hits.clear()
+    v = wb.WebullVenue(KEY, SECRET, client=_planted_client("sdk_text", "cancel"), confirmation_file=tmp_path / "x.json")
+    v._client.order_v3.cancel_order = boom
+    assert v.cancel_all_open()[0]["status"] == "error"
+
+    class ApiClient:
+        def __init__(self, key, secret, region):
+            raise Unreadable()
+    monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=ApiClient))
+    monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=object))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(wb.WebullError):
+        wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json")
+
+
+def test_a_combo_that_names_another_order_is_never_adopted(tmp_path):
+    bare = order("FILLED", filled_quantity="1")
+    bare.pop("client_order_id")
+    for body in (detail(bare, cid="someone-else"), [detail(bare, cid="someone-else")],
+                 detail(order("FILLED"), cid="someone-else"), {**detail(bare), "client_order_id": None}):
+        for confirmed in (False, True):
+            v, _ = status_venue(tmp_path, Response(body), confirmed_not_found=confirmed)
+            with pytest.raises(wb.WebullError, match="another"):
+                v.order_status("t")
+    assert status_venue(tmp_path, Response(detail(bare)))[0].order_status("t")["state"] == "filled"     # our own combo: read
+
+
+@pytest.mark.parametrize("body", [{"orders": [], "code": "SYSTEM_BUSY"}, {"orders": [], "msg": "busy"}, {"orders": [], "data": None},
+                                  {"orders": [], "success": False}, {"orders": [], "combo_type": "NORMAL", "error": "x"}])
+def test_with_the_flag_on_an_empty_list_beside_any_other_key_raises(tmp_path, body):
+    v, _ = status_venue(tmp_path, Response(body), confirmed_not_found=True)
+    with pytest.raises(wb.WebullError):
+        v.order_status("t")
+    ok = {"orders": [], "client_order_id": wb.client_order_id("t"), "combo_order_id": "C-1", "combo_type": "NORMAL"}
+    assert status_venue(tmp_path, Response(ok), confirmed_not_found=True)[0].order_status("t") is None
+
+
+def test_two_balance_entries_in_the_wanted_currency_raise(tmp_path):
+    body = {"total_asset_currency": "USD", "total_cash_balance": "10",
+            "account_currency_assets": [{"currency": "USD", "cash_balance": "10", "settled_cash": "9", "buying_power": "8"},
+                                        {"currency": "usd", "cash_balance": "5", "settled_cash": "5", "buying_power": "5"}]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=body), confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError, match="more than one"):
+        v.cash()
