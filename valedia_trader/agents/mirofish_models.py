@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from valedia_trader.core.secrets import child_env
+
 __all__ = ["ModelProfile", "PROFILES", "ALIASES", "DEFAULT_PROFILE", "PROFILE_FILE", "REGISTRY_FILE", "ENV_VAR", "resolve",
            "profiles", "active", "use", "add", "remove", "verify", "backend_env", "apply_env_file", "BACKEND_URLS",
            "TOKENIZER_FILES", "lmstudio_listing", "ProfileError"]
@@ -171,7 +173,8 @@ def lmstudio_listing(lms: str | None = None) -> dict[str, dict]:
     """LM Studio's own record of the models on disk, by model key (empty if the CLI is missing)."""
     exe = lms or str(Path.home() / ".lmstudio/bin/lms")
     try:
-        out = subprocess.run([exe, "ls", "--json"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        out = subprocess.run([exe, "ls", "--json"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                             env=child_env())
         return {m["modelKey"]: m for m in json.loads(out.stdout) if isinstance(m, dict) and m.get("modelKey")}
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return {}

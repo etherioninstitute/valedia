@@ -13,6 +13,8 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import numpy as np
 import pandas as pd
 
+from valedia_trader.core.secrets import child_env
+
 __all__ = ["ParamStore", "InMemoryParamStore", "GitParamStore", "AutoresearchLoop", "MutationOutcome",
            "period_sharpe"]
 
@@ -68,7 +70,8 @@ class GitParamStore:
             self.commit("autoresearch: initial agent parameters")
 
     def _git(self, *args: str) -> str:
-        out = subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True)
+        out = subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True,
+                             env=child_env())
         return out.stdout.strip()
 
     def _read(self) -> dict[str, dict[str, Any]]:
