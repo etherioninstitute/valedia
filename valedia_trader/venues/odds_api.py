@@ -387,8 +387,8 @@ class OddsApiClient:
                retries: int | None = None) -> list[dict[str, Any]]:
         """GET /v4/sports/{sport}/scores/: live and upcoming games and, with `days_from` 1 to 3, the games completed
         in that many past days with both teams' scores. 2 credits with `days_from`, 1 without. A `days_from` outside
-        1 to 3 is refused before anything is sent."""
-        if days_from is not None and (isinstance(days_from, bool) or int(days_from) not in (1, 2, 3)):
+        1 to 3, or anything but the integer 1, 2 or 3 (a float, a string, a bool), is refused before anything is sent."""
+        if days_from is not None and not (type(days_from) is int and days_from in (1, 2, 3)):
             raise ValueError("days_from must be 1, 2 or 3 (or None)")
         return self._get_with(f"/v4/sports/{sport}/scores/", {"daysFrom": days_from, "dateFormat": "iso"}, key,
                               retries)

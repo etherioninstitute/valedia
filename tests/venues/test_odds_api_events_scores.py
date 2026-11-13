@@ -58,7 +58,7 @@ def test_scores_with_and_without_days_from():
     assert p2 == {"dateFormat": "iso", "apiKey": "FREE-KEY-0002"}          # no daysFrom: nothing sent for it
 
 
-@pytest.mark.parametrize("bad", [0, 4, -1, True])
+@pytest.mark.parametrize("bad", [0, 4, -1, True, False, 2.5, 2.0, "2", 3.0])
 def test_scores_refuses_a_days_from_outside_one_to_three_before_sending(bad):
     t = Transport([])
     with pytest.raises(ValueError):
