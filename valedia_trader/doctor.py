@@ -164,7 +164,8 @@ def check_schedule(paths: LoopPaths) -> tuple[str, str]:
     jobs = (("com.valedia.research-loop.weekly", "weekly cycle", "valedia-research-loop.log", "Sundays 18:00"),
             ("com.valedia.paper.daily", "daily paper step", "valedia-paper-daily.log", "weekdays 14:30"))
     try:
-        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10).stdout
+        from valedia_trader.core.secrets import child_env
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10, env=child_env()).stdout
     except Exception as exc:
         return ATTENTION, f"could not ask launchd ({type(exc).__name__})"
     notes, status = [], OK
@@ -225,8 +226,11 @@ def check_team(paths: LoopPaths) -> tuple[str, str]:
 
 def check_repo(paths: LoopPaths) -> tuple[str, str]:
     try:
-        dirty = subprocess.run(["git", "-C", str(paths.root), "status", "--porcelain"], capture_output=True, text=True, timeout=20).stdout.strip()
-        head = subprocess.run(["git", "-C", str(paths.root), "log", "--oneline", "-1"], capture_output=True, text=True, timeout=20).stdout.strip()
+        from valedia_trader.core.secrets import child_env
+        dirty = subprocess.run(["git", "-C", str(paths.root), "status", "--porcelain"], capture_output=True, text=True, timeout=20,
+                               env=child_env()).stdout.strip()
+        head = subprocess.run(["git", "-C", str(paths.root), "log", "--oneline", "-1"], capture_output=True, text=True, timeout=20,
+                              env=child_env()).stdout.strip()
     except Exception as exc:
         return ATTENTION, f"git not available ({type(exc).__name__})"
     return (OK, head[:70]) if not dirty else (ATTENTION, f"{len(dirty.splitlines())} uncommitted changes; {head[:50]}")

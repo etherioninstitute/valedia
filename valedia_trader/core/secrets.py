@@ -22,10 +22,23 @@ to 11 such characters (a short account number) is caught only whole and standing
 a longer run of them. What this gives up: a piece of 8 to 11 characters of a digit-only or hex-only
 secret, or of the hex form of any secret, passes.
 
+A secret of 4 words or more (a wallet recovery phrase) is matched as words: any 4 consecutive words
+of it, in any letter case, with whitespace or a single comma, hyphen or underscore between them,
+are replaced. A word of it with 8 characters or more that is not purely letters also counts alone.
+What this gives up: fewer than 4 consecutive words of a phrase pass.
+
+The guard re-checks standard output and standard error at every call to `secret`, `load_env`,
+`remember`, `redact`, `redact_json` (so every journal write) and `child_env`, and wraps a stream
+that was replaced since; `ensure_output_guard` does the same on demand. A stream replaced between
+two such calls is unguarded in between.
+
 Still not covered: writes made straight to a file descriptor (os.write, sys.stdout.buffer,
 sys.__stdout__, sys.__stderr__); files other than the journal (paper_state.json, the desk's files,
 ledgers, backtest reports); a logging handler that builds its text without `Handler.format`; child
-processes' own output; and the forms that still pass: JSON `\\/` escaping of a slash, account
+processes' own output; log handlers that send the raw record rather than formatted text (socket,
+datagram and HTTP handlers send `extra=` fields as they are); a secret split across two writes
+inside one line longer than 64 KB; and the forms that still pass: JSON `\\/` escaping of a slash,
+text in which JSON has escaped the secret's own characters (`\\uXXXX`, `\\"`, `\\\\`), account
 numbers written grouped or with dashes, a second layer of encoding (base64 of hex, and so on)."""
 from __future__ import annotations
 
@@ -44,7 +57,7 @@ from urllib.parse import quote, quote_plus, unquote
 
 __all__ = ["env_file_path", "load_env", "secret", "SecretError", "DEFAULT_ENV_FILE", "SECRETS_DIR",
            "redact", "redact_json", "tripped", "remember", "child_env", "install_output_guard",
-           "remove_output_guard"]
+           "remove_output_guard", "ensure_output_guard"]
 
 SECRETS_DIR = Path("~/.hermes/secrets").expanduser()
 DEFAULT_ENV_FILE = SECRETS_DIR / "trading.env"
@@ -76,6 +89,7 @@ def load_env(path: str | Path | None = None, environ=None, override: bool = Fals
     """Load KEY=VALUE pairs into the environment and return the names loaded. A file readable by
     group or others is refused. A missing file loads nothing (and returns an empty list). A name
     already set is left alone (unless `override`), but its value is remembered all the same."""
+    ensure_output_guard()
     env = os.environ if environ is None else environ
     p = Path(path).expanduser() if path else env_file_path(env)
     if not p.is_file():
@@ -96,6 +110,7 @@ def load_env(path: str | Path | None = None, environ=None, override: bool = Fals
 
 def secret(name: str, environ=None) -> str:
     """Strict lookup of one credential from the environment."""
+    ensure_output_guard()
     env = os.environ if environ is None else environ
     value = env.get(name, "")
     if not value.strip():
@@ -112,17 +127,21 @@ _HEX_RUN = 12                              # ... when the piece is made only of 
 _HEX_CHARS = "0123456789abcdef"
 _SHORT_HEX = re.compile(r"(?<![0-9a-f])[0-9a-f]{8,11}(?![0-9a-f])")
 _MASK = "<secret>"
-_CREDENTIAL_WORDS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "ACCOUNT")
+_CREDENTIAL_WORDS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "MNEMONIC", "SEED_PHRASE", "RECOVERY_PHRASE", "ACCOUNT")
 _SETTING_ENDINGS = ("_DIR", "_PATH", "_FILE", "_URL", "_HOST", "_PORT", "_TYPE", "_ENV", "_MODE", "_NAME", "_REGION")
 _QUOTES = "\"'`"
 _TOKEN = re.compile(r"[^\s\"'`]+")
+_PHRASE_WORDS = 4                          # a secret of this many words or more is matched as words
+_WORD = re.compile(r"[^\W_]+")
+_WORD_GAP = re.compile(r"\s+|\s*[,_-]\s*")
 
 _lock = threading.RLock()
 _seen: set[str] = set()                    # a digest of each remembered secret, so each is processed once
 _hidden_names: set[str] = set()            # names from the trading file or served by `secret`: kept from children
-_NOTHING: tuple[frozenset[str], frozenset[str], frozenset[str]] = (frozenset(), frozenset(), frozenset())
+_NOTHING: tuple = (frozenset(), frozenset(), frozenset(), frozenset(), None)
 _pieces = _NOTHING                         # (8-character runs holding a non-hex character, 12-character
-                                           #  hex-only runs, short hex-only values), all folded
+                                           #  hex-only runs, short hex-only values, 4-word runs of phrases,
+                                           #  a pattern finding the phrases' words), all folded
 _count = 0                                 # replacements made in this process
 
 
@@ -139,11 +158,12 @@ def _looks_like_a_place(value: str) -> bool:
 
 def _worth_remembering(name: str, value: str) -> bool:
     """What `load_env` remembers: a value under a credential or account name that is not a path, a
-    URL, a setting, text with whitespace, or (under an account-only name) a value with no digit."""
+    URL, a setting, text with whitespace and fewer than 4 words, or (under an account-only name) a
+    value with no digit."""
     upper = name.upper()
     if not _looks_like_credential(name) or upper.endswith(_SETTING_ENDINGS):
         return False
-    if _looks_like_a_place(value) or any(c.isspace() for c in value):
+    if _looks_like_a_place(value) or (any(c.isspace() for c in value) and len(value.split()) < _PHRASE_WORDS):
         return False
     account_only = not any(word in upper for word in _CREDENTIAL_WORDS if word != "ACCOUNT")
     return not (account_only and not any(c.isdigit() for c in value))
@@ -186,9 +206,21 @@ def _windows(text: str, n: int):
     return (text[i:i + n] for i in range(len(text) - n + 1))
 
 
-def _pieces_of(value: str) -> tuple[set[str], set[str], set[str]]:
-    """The 8-character runs that hold a non-hex character, the 12-character hex-only runs, and the
-    value itself when it is a short (8 to 11) hex-only value."""
+def _pieces_of(value: str) -> tuple[set, set, set, set]:
+    """The 8-character runs that hold a non-hex character, the 12-character hex-only runs, the value
+    itself when it is a short (8 to 11) hex-only value, and, for a phrase of 4 words or more, its
+    runs of 4 consecutive words (then only its words of 8 characters or more that are not purely
+    letters give ordinary pieces)."""
+    if len(value.split()) >= _PHRASE_WORDS:
+        words = _WORD.findall(_fold(value))
+        grams = {tuple(words[i:i + _PHRASE_WORDS]) for i in range(len(words) - _PHRASE_WORDS + 1)}
+        parts: tuple[set, set, set, set] = (set(), set(), set(), grams)
+        for word in value.split():
+            word = word.strip(",.;:_-")
+            if len(word) >= _RUN and not word.isalpha():
+                for whole, piece in zip(parts, _pieces_of(word)):
+                    whole.update(piece)
+        return parts
     mixed: set[str] = set()
     hexed: set[str] = set()
     for form in _forms(value):
@@ -197,7 +229,12 @@ def _pieces_of(value: str) -> tuple[set[str], set[str], set[str]]:
         hexed.update(run for run in _windows(folded, _HEX_RUN) if _is_hex(run))
     folded = _fold(value)
     short = {folded} if len(folded) < _HEX_RUN and _is_hex(folded) else set()
-    return mixed, hexed, short
+    return mixed, hexed, short, set()
+
+
+def _word_pattern(grams) -> re.Pattern | None:
+    words = sorted({w for gram in grams for w in gram}, key=len, reverse=True)
+    return re.compile("(?:" + "|".join(map(re.escape, words)) + r")(?![^\W_])") if words else None
 
 
 def _digest(value: str) -> str:
@@ -206,15 +243,20 @@ def _digest(value: str) -> str:
 
 def remember(value) -> None:
     """Hand the tripwire a value to keep out of every output (for example an account id read from a
-    broker). Values shorter than 8 characters are ignored. Turns the output guard on."""
+    broker). A number is remembered as its plain decimal text; anything that is neither a string nor
+    a number is ignored, and so are values shorter than 8 characters. Turns the output guard on."""
     global _pieces
+    ensure_output_guard()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = _plain_number(value)
     if not isinstance(value, str) or len(value) < _RUN:
         return
     digest = _digest(value)
     with _lock:
         if digest not in _seen:
             _seen.add(digest)
-            _pieces = tuple(old | frozenset(new) for old, new in zip(_pieces, _pieces_of(value)))
+            joined = tuple(old | frozenset(new) for old, new in zip(_pieces[:4], _pieces_of(value)))
+            _pieces = joined + (_word_pattern(joined[3]),)
     install_output_guard()
 
 
@@ -231,6 +273,7 @@ def child_env(extra=None) -> dict:
     """The environment for a child process: this process's environment merged with `extra`, without
     every variable loaded from the trading file or served by `secret` (by name) and without any
     variable whose value is, or holds, a remembered secret. Nothing else is removed."""
+    ensure_output_guard()
     pieces = _pieces
     out = {}
     for name, value in {**os.environ, **(extra or {})}.items():
@@ -257,13 +300,34 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return out
 
 
+def _phrase_hits(folded: str, grams, pattern) -> list[tuple[int, int]]:
+    """Runs of 4 consecutive words of a remembered phrase, with whitespace or a single comma, hyphen
+    or underscore between them."""
+    found, run = [], []
+    for m in pattern.finditer(folded):
+        start = m.start()
+        if start and folded[start - 1].isalnum():          # the end of a longer word
+            run = []
+            continue
+        if run and not _WORD_GAP.fullmatch(folded, run[-1][1], start):
+            run = []
+        run.append((start, m.end(), m.group()))
+        if len(run) >= _PHRASE_WORDS and tuple(w for _, _, w in run[-_PHRASE_WORDS:]) in grams:
+            found.append((run[-_PHRASE_WORDS][0], m.end()))
+        if len(run) > 2 * _PHRASE_WORDS:
+            del run[:-_PHRASE_WORDS]
+    return found
+
+
 def _hits(folded: str, pieces) -> list[tuple[int, int]]:
-    mixed, hexed, short = pieces
+    mixed, hexed, short, grams, pattern = pieces
     found = [(i, i + _RUN) for i in range(len(folded) - _RUN + 1) if folded[i:i + _RUN] in mixed] if mixed else []
     if hexed:
         found += [(i, i + _HEX_RUN) for i in range(len(folded) - _HEX_RUN + 1) if folded[i:i + _HEX_RUN] in hexed]
     if short:
         found += [m.span() for m in _SHORT_HEX.finditer(folded) if m.group() in short]
+    if grams:
+        found += _phrase_hits(folded, grams, pattern)
     return found
 
 
@@ -300,6 +364,7 @@ def redact(text: str) -> tuple[str, int]:
     case and in its URL-encoded, base64 or hex form; URL-encoded text is also searched decoded. A
     piece made only of 0-9 and a-f counts from 12 characters (see the module docstring)."""
     global _count
+    ensure_output_guard()
     pieces = _pieces
     if pieces is _NOTHING or not isinstance(text, str) or len(text) < _RUN:
         return text, 0
@@ -322,6 +387,7 @@ def redact_json(obj):
     number is left as it is. Other values are checked as the text the journal would write for them
     (`str`). Returns the structure and the number of replacements; when nothing is replaced the very
     same object comes back."""
+    ensure_output_guard()
     if _pieces is _NOTHING:
         return obj, 0
     return _redact_any(obj)
@@ -533,6 +599,33 @@ def _remove_logging() -> None:
 
 
 _at_exit_registered = False
+_guard_wanted = False                      # on from the first install until remove_output_guard
+
+
+def _wrap_streams() -> bool:
+    wrapped = False
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is not None and not isinstance(stream, _GuardedStream):
+            setattr(sys, name, _GuardedStream(stream))
+            wrapped = True
+    return wrapped
+
+
+def ensure_output_guard() -> bool:
+    """While any secret is remembered and the guard is on, wrap sys.stdout or sys.stderr again if
+    either was replaced since (and put the logging hooks back if they were lost). Returns whether a
+    stream had to be wrapped. A stream replaced between two calls is unguarded in between."""
+    if not _guard_wanted or _pieces is _NOTHING:
+        return False
+    out, err = getattr(sys, "stdout", None), getattr(sys, "stderr", None)
+    if (out is None or isinstance(out, _GuardedStream)) and (err is None or isinstance(err, _GuardedStream)) and _logging_on:
+        return False
+    with _lock:
+        wrapped = _wrap_streams()
+        if not _logging_on:
+            _install_logging()
+    return wrapped
 
 
 def install_output_guard() -> None:
@@ -548,12 +641,10 @@ def install_output_guard() -> None:
     sys.__stdout__, sys.__stderr__, a handler's own file written without `Handler.format`), a
     handler that formats without the standard path, other files, and child processes, which have
     streams of their own (give them `child_env()`)."""
-    global _at_exit_registered
+    global _at_exit_registered, _guard_wanted
     with _lock:
-        for name in ("stdout", "stderr"):
-            stream = getattr(sys, name, None)
-            if stream is not None and not isinstance(stream, _GuardedStream):
-                setattr(sys, name, _GuardedStream(stream))
+        _guard_wanted = True
+        _wrap_streams()
         _install_logging()
         if not _at_exit_registered:
             atexit.register(_flush_guarded)
@@ -563,7 +654,9 @@ def install_output_guard() -> None:
 def remove_output_guard() -> None:
     """Undo `install_output_guard`: flush what is held back, put the original streams back and
     restore logging exactly as it was. Harmless when the guard is not installed."""
+    global _guard_wanted
     with _lock:
+        _guard_wanted = False
         _flush_guarded()
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)

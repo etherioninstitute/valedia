@@ -325,7 +325,8 @@ def hermes_asker(profile: str, timeout: float | None = None, model: str | None =
 
     def ask(prompt: str) -> str:
         argv = ["hermes", "-p", profile, "-z", prompt, "-t", toolsets] + (["-m", model] if model else [])
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        from valedia_trader.core.secrets import child_env
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=child_env())
         if out.returncode != 0:
             raise RuntimeError(f"hermes exited {out.returncode}")
         return out.stdout

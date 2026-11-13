@@ -387,6 +387,9 @@ def test_no_ordinary_number_or_hash_is_ever_replaced():
     env["MADE_UP_ACCOUNT_ID"] = make(string.digits, 12)
     for name in env:
         s.secret(name, env)
+    words = random.Random(160)
+    for n in (12, 24):                                            # two recovery phrases as well
+        s.remember(" ".join(words.choice(WORDS) for _ in range(n)))
     floats = [rng.uniform(-1.0, 1.0) * 10.0 ** rng.randint(-12, 15) for _ in range(800_000)]
     ints = [rng.randrange(10 ** rng.randint(8, 19)) for _ in range(200_000)]
     hashes = [f"{rng.getrandbits(256):064x}" for _ in range(20_000)]
@@ -540,7 +543,7 @@ def test_paths_urls_plain_words_and_settings_are_never_remembered(tmp_path):
     good, digits = _made_up(rng, 30), "AC" + _made_up(rng, 10, string.digits)
     lines = {"WEBULL_OPENAPI_TOKEN_DIR": "/tmp/made-up/token-folder", "BROKER_TOKEN": "https://example.invalid/path/abcdefgh",
              "WEBULL_ACCOUNT_TYPE": "individual", "MAIN_ACCOUNT": "brokeragemain", "HOME_KEY": "~/made-up/keyfolder",
-             "REL_KEY": "./made-up/relative", "UP_KEY": "../made-up/upwards", "SPACE_KEY": "made up words here",
+             "REL_KEY": "./made-up/relative", "UP_KEY": "../made-up/upwards", "SPACE_KEY": "three made-up words",
              "KEY_PATH": "relative-made-up-path", "API_KEY_FILE": "keyfile-made-up", "TOKEN_URL": "tokens.example.invalid",
              "SECRET_HOST": "secrets-host-name", "SECRET_PORT": "123456789", "PASS_MODE": "interactive",
              "KEY_NAME": "my-key-name-here", "KEY_REGION": "us-east-region", "WEBULL_ENV": "production-mode",
@@ -552,7 +555,8 @@ def test_paths_urls_plain_words_and_settings_are_never_remembered(tmp_path):
     caught = {k for k, v in lines.items() if s.redact(f"x {v} y")[1]}
     assert caught == {"GOOD_KEY", "WEBULL_ACCOUNT_ID"}
     s.secret("SOME_DIR", {"SOME_DIR": "/made-up/served/path"})     # the caller says it is a secret
-    assert s.redact("at /made-up/served/path now")[1] == 1
+    served = s.redact("at /made-up/served/path now")[1]
+    assert served == 1
 
 
 def test_a_value_already_in_the_environment_is_remembered_and_left_alone(tmp_path):
@@ -564,11 +568,183 @@ def test_a_value_already_in_the_environment_is_remembered_and_left_alone(tmp_pat
     env = {"BROKER_API_KEY": present, "OTHER_DIR": "/made-up/other"}
     loaded = s.load_env(f, environ=env)
     kept = env["BROKER_API_KEY"] == present
-    assert loaded == [] and kept and s.redact(f"a {present} b")[1] == 1 and s.redact("at /made-up/other")[1] == 0
+    counts = (s.redact(f"a {present} b")[1], s.redact("at /made-up/other")[1])
+    assert loaded == [] and kept and counts == (1, 0)
 
 
 def test_remember_hands_the_tripwire_a_value_learned_elsewhere():
     rng = random.Random(21)
     value, short = _made_up(rng, 16), _made_up(rng, 7)
     assert s.remember(value) is None and s.remember(short) is None
-    assert s.redact(f"id {value}")[1] == 1 and s.redact(f"id {short}")[1] == 0
+    counts = (s.redact(f"id {value}")[1], s.redact(f"id {short}")[1])
+    assert counts == (1, 0)
+
+
+# ---- rev 5 -------------------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+WORDS = """able about above across act add after again against age ago air all almost alone along already also always
+among amount animal answer any appear apple area arm army around art ask away baby back bad bag ball bank base basket
+beach bear beat beauty bed before begin behind bell best better between big bird black blood blue board boat body bone
+book born both bottle bottom box boy brain bread break bridge bright bring brother brown build burn busy buy cake call
+camera camp can capital captain car card care carry case cat catch cause center chair chance change charge cheap check
+child choose church circle city class clean clear climb clock close cloud coast coat cold color come common company
+cook cool corner cost cotton count country course cover cow crowd cry cup current cut dance dark daughter day dead deal
+dear deep desert design desk detail develop dinner direct doctor dog door double down draw dream dress drink drive drop
+dry during dust duty early earth east easy eat edge effect egg eight either electric else empty end enemy energy engine
+enjoy enough enter equal evening event every exact example except expect face fact fair fall family famous farm fast
+father fear feel few field fight figure fill final find fine finger finish fire first fish five flat floor flower fly
+follow food foot force forest forget form forward four free fresh friend front fruit full future game garden gas gate
+general gentle gift girl give glad glass gold good grass great green ground group grow guess guide hair half hall hand
+happy hard hat head health hear heart heavy help here high hill history hold hole holiday home hope horse hospital hot
+hotel hour house huge human hundred hunt hurry husband ice idea inch include industry inside iron island job join joy
+jump just keep key kind king kitchen knee knife know lady lake land language large last late laugh lead learn leave
+left leg less letter level library lift light like line lion list listen little live long look lose loud love low lucky
+machine main major make market master matter meal measure meat meet member metal method middle might mile milk mind
+minute miss modern moment money month moon morning mother motor mountain mouse mouth move music name nation nature near
+neck need never news next nice night noise north nose note number ocean offer office often oil old open orange order
+other outside owner page paint paper parent park part party pass past path pay peace pen people period person picture
+piece place plain plan plant play please pocket poem point police poor popular power present price print problem
+produce public pull push quick quiet race radio rain raise reach read ready real reason record red remember report rest
+rich ride right ring river road rock roof room rope round rule run safe salt sand save school science sea season seat
+second seed sell send sense serve seven shake shape share sharp sheep shell ship shoe shop short shoulder show side sign
+silver simple sing sister sit six size skin sky sleep slow small smile snow soft soil soldier solve song soon sound
+south space speak special speed spend spring square stand star start station stay steel step stick still stone stop
+store storm story street strong student study sugar summer sun supply sure surface sweet swim table tail take talk tall
+teach team tell ten test thank thick thin thing think three throw tiny today together tomorrow tone tool tooth top total
+touch town track trade train travel tree trip trouble true trust try turn twelve twenty two type under unit until upon
+use usual valley value very village visit voice wait walk wall want warm wash watch water wave way wear weather week
+weight west wheel white whole wide wife wild win wind window winter wise wish woman wonder wood word work world write
+yard year yellow young zero""".split()
+
+
+def _phrase(rng, n):
+    return [rng.choice(WORDS) for _ in range(n)]
+
+
+def _phrase_leaks(text, words):
+    """True when any 4 consecutive words of the phrase appear in the text in order, ignoring case and
+    with whitespace or a single comma, hyphen or underscore between them."""
+    seq = re.findall(r"[^\W_]+", text.lower())
+    grams = {tuple(words[i:i + 4]) for i in range(len(words) - 3)}
+    return any(tuple(seq[i:i + 4]) in grams for i in range(len(seq) - 3))
+
+
+def test_a_phrase_is_caught_as_any_four_consecutive_words():
+    rng = random.Random(30)
+    words = _phrase(rng, 12)
+    s.secret("WALLET_MNEMONIC", {"WALLET_MNEMONIC": " ".join(words)})
+    forms = {"spaces": " ".join(words), "mixed whitespace": " \t".join(words[:6]) + "\n\n  " + "   ".join(words[6:]),
+             "commas": ",".join(words), "comma space": ", ".join(words), "hyphens": "-".join(words), "underscores": "_".join(words),
+             "upper": " ".join(words).upper(), "title": " ".join(w.title() for w in words), "json": json.dumps({"m": " ".join(words)}),
+             "four from the middle": " ".join(words[4:8]), "in a sentence": "my words are " + " ".join(words[2:6]) + " today."}
+    results = {}
+    for name, planted in forms.items():
+        out, n = s.redact(f"before {planted} after")
+        results[name] = (n >= 1, not _phrase_leaks(out, words), out.startswith("before ") and out.endswith(" after"))
+    assert all(all(r) for r in results.values()), sorted(k for k, r in results.items() if not all(r))
+    exact = s.redact("my words are " + " ".join(words[2:6]) + " today.")[0] == "my words are <secret> today."
+    three = " ".join(words[4:7])
+    out, n3 = s.redact(f"only {three} here")
+    assert exact and n3 == 0 and out == f"only {three} here"
+
+
+def test_a_phrase_word_that_is_not_purely_letters_counts_alone():
+    rng = random.Random(31)
+    odd = _made_up(rng, 11, string.ascii_lowercase + string.digits) + "7"
+    words = _phrase(rng, 6) + [odd] + _phrase(rng, 5)
+    s.remember(" ".join(words))
+    long_word = max(words[:6], key=len)
+    counts = (s.redact(f"token {odd} here")[1], s.redact(f"a {long_word} b")[1])
+    assert counts == (1, 0)
+
+
+def test_load_env_remembers_a_phrase_of_four_words_or_more(tmp_path):
+    rng = random.Random(32)
+    phrase, two, three = (" ".join(_phrase(rng, n)) for n in (12, 2, 3))
+    f = tmp_path / "trading.env"
+    f.write_text(f"WALLET_SEED_PHRASE={phrase}\nBROKER_KEY={two}\nNOTE_TOKEN={three}\nKEY_DIR=/made up/four word path\n")
+    os.chmod(f, 0o600)
+    s.load_env(f, environ={})
+    counts = [s.redact(f"x {v} y")[1] for v in (phrase, two, three, "/made up/four word path")]
+    assert counts == [1, 0, 0, 0]
+
+
+def test_ordinary_sentences_are_never_replaced_unless_four_words_match():
+    rng = random.Random(33)
+    phrases = [_phrase(rng, 12), _phrase(rng, 24)]
+    for words in phrases:
+        s.secret("MADE_UP_MNEMONIC", {"MADE_UP_MNEMONIC": " ".join(words)})
+    grams = {tuple(w[i:i + 4]) for w in phrases for i in range(len(w) - 3)}
+
+    def has_gram(seq):
+        return any(tuple(seq[i:i + 4]) in grams for i in range(len(seq) - 3))
+
+    plain, matching = [], []
+    for _ in range(20_000):
+        seq = _phrase(rng, rng.randint(6, 18))
+        text = " ".join(w + ("," if rng.random() < 0.1 else "") for w in seq)
+        sentence = text[0].upper() + text[1:].rstrip(",") + "."
+        (matching if has_gram(seq) else plain).append(sentence)
+    body = "\n".join(plain)
+    out, n = s.redact(body)
+    same = out == body
+    assert len(plain) >= 19_900 and n == 0 and same
+    planted = []
+    for _ in range(200):
+        words = rng.choice(phrases)
+        i = rng.randrange(len(words) - 3)
+        planted.append(" ".join(_phrase(rng, 3) + words[i:i + 4] + _phrase(rng, 3)) + ".")
+    caught = [s.redact(x) for x in planted + matching]
+    assert all(k >= 1 and not any(_phrase_leaks(o, w) for w in phrases) for o, k in caught)
+
+
+def test_remember_takes_a_number_as_its_plain_decimal_text():
+    rng = random.Random(34)
+    account = int("9" + _made_up(rng, 11, string.digits))
+    s.remember(account)
+    s.remember(True)
+    s.remember(None)
+    s.remember(87654321.0)
+    counts = (s.redact(f"acct {account} here")[1], s.redact("value 87654321 here")[1], s.redact("flag True and None here")[1])
+    assert counts == (1, 1, 0)
+
+
+def test_ensure_output_guard_wraps_a_replaced_stream_once(monkeypatch):
+    _remember(_made_up(random.Random(35), 32))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    first, second = s.ensure_output_guard(), s.ensure_output_guard()
+    assert first is True and second is False and isinstance(sys.stdout, s._GuardedStream)
+    s.remove_output_guard()
+
+
+REWRAP_CALLS = {
+    "secret": "secrets.secret('MADE_UP_CHILD_TOKEN')",
+    "load_env": "secrets.load_env('missing.env')",
+    "remember": "secrets.remember('x' * 3)",
+    "redact": "secrets.redact('nothing here')",
+    "redact_json": "secrets.redact_json({'a': 1})",
+    "child_env": "secrets.child_env()",
+    "ensure_output_guard": "assert secrets.ensure_output_guard() is True",
+    "journal write": "from valedia_trader.research_loop.paper import Journal; Journal('journal').write('2026-01-05', {'type': 'note'})",
+}
+
+
+@pytest.mark.parametrize("call", sorted(REWRAP_CALLS))
+@pytest.mark.parametrize("how", ["replaced", "redirect closed"])
+def test_a_stream_replaced_after_the_guard_is_wrapped_again_at_the_next_call(tmp_path, call, how):
+    value = _made_up(random.Random(call + how), 32)
+    if how == "replaced":
+        setup = ("secrets.secret('MADE_UP_CHILD_TOKEN')\n"
+                 "sys.stdout = os.fdopen(os.dup(1), 'w')\nsys.stderr = os.fdopen(os.dup(2), 'w')\n")
+    else:
+        setup = ("with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+                 "    secrets.secret('MADE_UP_CHILD_TOKEN')\n")
+    script = ("import contextlib, io, os, sys\nfrom valedia_trader.core import secrets\n" + setup + REWRAP_CALLS[call] + "\n"
+              "V = os.environ['MADE_UP_CHILD_TOKEN']\nprint('MARK', V)\nprint('MARK', V, file=sys.stderr)\n")
+    (tmp_path / "child.py").write_text(script)
+    env = {**os.environ, "MADE_UP_CHILD_TOKEN": value, "PYTHONPATH": str(REPO)}
+    done = subprocess.run([sys.executable, "child.py"], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    leaked = _leaks(done.stdout + done.stderr, value)
+    assert done.returncode == 0 and not leaked and done.stdout.count("<secret>") == 1 and done.stderr.count("<secret>") == 1

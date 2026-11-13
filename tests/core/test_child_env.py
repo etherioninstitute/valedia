@@ -105,3 +105,37 @@ def test_the_timesfm_worker_sees_none_of_them(trading, tmp_path, monkeypatch):
         backend.close()
     ok = _clean(json.loads((tmp_path / "names.json").read_text()), trading)
     assert ok
+
+
+def _fake_program(tmp_path, monkeypatch, name, seen):
+    """A stand-in on PATH that appends the names of its environment to `seen` and prints nothing."""
+    fake = tmp_path / "bin" / name
+    fake.parent.mkdir(exist_ok=True)
+    fake.write_text(f"#!{sys.executable}\nimport json, os\nopen({str(seen)!r}, 'a').write(json.dumps(sorted(os.environ)) + '\\n')\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_a_research_agent_sees_none_of_them(trading, tmp_path, monkeypatch):
+    from valedia_trader.research_loop import research as R
+    fake = tmp_path / "bin" / "hermes"
+    fake.parent.mkdir()
+    fake.write_text(f"#!{sys.executable}\n{PRINT_NAMES}\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+    out = R.hermes_asker("p", timeout=60)("prompt")
+    ok = _clean(json.loads(out), trading)
+    assert ok
+
+
+def test_the_doctors_launchctl_and_git_see_none_of_them(trading, tmp_path, monkeypatch):
+    from valedia_trader import doctor as Doc
+    from valedia_trader.research_loop import LoopPaths
+    seen = tmp_path / "seen.jsonl"
+    _fake_program(tmp_path, monkeypatch, "launchctl", seen)
+    _fake_program(tmp_path, monkeypatch, "git", seen)
+    Doc.check_schedule(LoopPaths(tmp_path))
+    Doc.check_repo(LoopPaths(tmp_path))
+    runs = [json.loads(line) for line in seen.read_text().splitlines()]
+    ok = len(runs) == 3 and all(_clean(r, trading) for r in runs)
+    assert ok
