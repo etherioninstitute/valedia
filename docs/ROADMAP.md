@@ -22,7 +22,7 @@ Status words: **done**, **started**, **not started**, **waiting on the owner**.
 | 1.9 | New idea families through the gate: carry, option premium, earnings and other events, pairs, intraday | not started (each needs its data first) |
 | 1.10 | Split of capital between passed strategies, tested out of sample (today: equal shares) | not started |
 | 1.11 | Costs by venue: Webull crypto spreads, Kalshi's fee formula, stock borrow fees, slippage by liquidity | not started |
-| 1.12 | Kronos, an open price-forecast model, as a tournament forecaster (from the owner's notes) | done 2026-11-13: tested on 24,126 questions dated after its training and failed. No ranking skill in any of six groups (funds, stocks, crypto; one and five days), and far worse than the base rate as it stands (`docs/research/2026-11-13-kronos-result.md`). The forecaster stays in the tournament; a repair to its price downloader is in progress |
+| 1.12 | Kronos, an open price-forecast model, as a tournament forecaster (from the owner's notes) | done 2026-11-13: tested on 24,126 questions dated after its training and failed. No ranking skill in any of six groups (funds, stocks, crypto; one and five days), and far worse than the base rate as it stands (`docs/research/2026-11-13-kronos-result.md`). The forecaster stays in the tournament; its price downloader was repaired and blind-verified the same day |
 | 1.13 | Kalshi weather markets against official forecast releases, tested on free history first (from the owner's notes) | done 2026-11-13: tested on all 9,910 settled New York markets and failed. The market's price beats the public forecast; the trading rule lost 4.3 cents a contract in the test period (`docs/research/2026-11-13-kalshi-weather-result.md`). The history reader and evaluation stay for 1.3 and 1.14 |
 | 1.14 | Closing-line value as a fast skill measure for prediction-market forecasts (from the owner's notes) | not started |
 | 1.15 | Net the strategies' orders in one fund before placing them: in a 40-day replay about 45% of realised losses were deferred as wash sales, much of it one strategy trimming a fund the other holds or buys | not started |
@@ -59,13 +59,13 @@ Nothing here is tax or legal advice; the ledger computes from the rules file and
 | # | Item | Status |
 | --- | --- | --- |
 | 4.1 | Webull API keys and the API application | waiting on the owner |
-| 4.2 | Whole order path proven in Webull's test environment, then one small live order the owner confirms | not started |
-| 4.3 | Daily reconciliation of the book with the broker: positions, cash, real fills, partial fills, refusals | not started |
+| 4.2 | Whole order path proven in Webull's test environment, then one small live order the owner confirms | not started (needs 4.1). To observe there, because Webull does not document them: how it answers for an order that does not exist; the quantity step for stocks and the price steps; whether one holding is ever split over several rows; how far its open-order and position answers lag behind fills; whether any answer repeats a key |
+| 4.3 | Daily reconciliation of the book with the broker: positions, cash, real fills, partial fills, refusals | started 2026-11-13: the order ledger (`execution_and_risk/orders.py`, blind-verified by five fresh verifiers) checks every open order against the broker, records each fill and late fee once, and compares positions. Not yet connected to the trader's book; cash is not compared yet |
 | 4.4 | Splits, dividends, half-days and holidays handled | started: the exchange calendar is in; corporate actions are not |
 | 4.5 | Kill switch tested against the venue; alerts and a daily summary to the owner's phone | not started (Signal waits on the owner's login job) |
 | 4.6 | A longer paper record: the hold strategy joins at the next paper step | started |
 | 4.7 | A second venue for prediction markets (Kalshi's API, or event contracts through Webull) | not started |
-| 4.8 | Order handling for live trading: submit once, a timeout is unknown until reconciled, reconcile on restart, live orders approved by ticket number (from the owner's notes) | not started |
+| 4.8 | Order handling for live trading: submit once, a timeout is unknown until reconciled, reconcile on restart, live orders approved by ticket number (from the owner's notes) | started 2026-11-13: the order ledger is built and accepted for test use (an order is sent at most once however many copies of the program run; an unknown outcome blocks further orders until the broker confirms or a person settles it; an order that turns up after being declared lost stays flagged until a person closes it). The Webull adapter's order-status reading is in its last repair round. Not built: the piece that turns the strategies' decisions into ledger orders, and approval by ticket number. Not cleared for real money until a reviewer from another model family has looked or the owner waives that (5.4) |
 
 ## 5. Keeping it safe and visible
 
@@ -76,3 +76,5 @@ Nothing here is tax or legal advice; the ledger computes from the rules file and
 | 5.3 | One page for the owner: strategies, paper results against holding, forecaster leaderboard, tax so far, limits | not started |
 | 5.4 | An independent reviewer from another model family for code that can move money (needs the Codex or Grok command-line tool on this Mac) | waiting on the owner |
 | 5.5 | The 2% daily stop is still the guide's example number | waiting on the owner |
+| 5.6 | Keys can never reach a file or the screen: the broker adapter passes on only text of a harmless shape and no raw broker answer; a guard on the journal and on everything printed replaces any piece of any loaded key | started 2026-11-13 (owner's request): both pieces are being built |
+| 5.7 | Risk limits the newsletter's design lists and the trader lacks: data too old, repeated connection errors, a slow model answer; a kill switch that closes positions and alerts the owner's phone | not started |
