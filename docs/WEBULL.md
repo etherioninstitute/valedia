@@ -188,7 +188,8 @@ no price, order or account call) compared Webull's lists with Kalshi's public li
 | NBA games (KXNBAGAME) | 64 | 64 |
 | NFL games (KXNFLGAME) | 52 | 52 |
 | NHL games (KXNHLGAME) | 98 | 98 |
-| College football, men's college basketball | 506 and 354 | 298 each of the first 300 read (the probe's page cap stopped the read) |
+| College football (KXNCAAFGAME) | 506 | 506 |
+| Men's college basketball (KXNCAAMBGAME) | 354 | 354 |
 
 The only markets Webull listed that Kalshi's open list did not were the previous day's games, marked not tradable.
 Webull listed more than 2,000 series in eleven categories (sports 931, elections 495, politics 162, entertainment
