@@ -467,7 +467,7 @@ def test_partial_fills_are_reported_exactly_once_with_the_price_of_each_incremen
     assert fill["fee"] == pytest.approx(1.5)
     rec = led.order("sell")
     assert rec["state"] == "filled" and rec["filled_units"] == 10.0 and rec["avg_price"] == 102.0 and rec["fee"] == 2.5
-    assert led.reconcile(venue, {})["fills"] == [] and led.reconcile(venue, {})["orders_checked"] == 0
+    assert led.reconcile(venue, {})["fills"] == [] and led.reconcile(venue, {})["orders_checked"] == 1   # asked again for late fees
 
 
 def test_a_fill_without_an_average_price_or_fee_is_reported_with_none():
@@ -929,11 +929,12 @@ def test_fee_increases_sum_to_the_last_fee_total_over_random_sequences():
     rng = random.Random(7)
     for _ in range(200):
         led, venue, _ = _accepted()
-        tag, total, last_fee, last_avg_point = "s1-XLE-2026-11-12", 0.0, None, None
+        tag, total, cost, last_fee, last_avg_point = "s1-XLE-2026-11-12", 0.0, 0.0, None, None
         while total < 10.0:
-            total = min(10.0, total + rng.choice([0.5, 1.0, 2.5]))
+            inc = min(10.0 - total, rng.choice([0.5, 1.0, 2.5]))
+            total, cost = total + inc, cost + inc * round(rng.uniform(90, 110), 2)   # averages from real prices
             fee = None if rng.random() < 0.4 else round(rng.uniform(0, 1), 3) + (last_fee or 0.0)
-            avg = None if (rng.random() < 0.4 and total < 10.0) else round(rng.uniform(90, 110), 2)
+            avg = None if (rng.random() < 0.4 and total < 10.0) else cost / total
             last_fee = fee if fee is not None else last_fee
             last_avg_point = (total, avg) if avg is not None else last_avg_point
             venue.set(tag, state="filled" if total >= 10.0 else "partly_filled", filled_units=total, avg_price=avg, fee=fee)
@@ -1136,21 +1137,314 @@ def test_fill_rows_can_only_be_marked_applied(tmp_path):
     raw.close()
 
 
-def test_a_ledger_file_from_rev_2_gains_what_is_missing_on_open(tmp_path):
+REV3_LAYOUT = (
+    "CREATE TABLE orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, reference_price REAL NOT NULL, "
+    "limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, created REAL NOT NULL, sent_at REAL, updated REAL NOT NULL, "
+    "venue TEXT, venue_order_id TEXT, filled_units REAL NOT NULL DEFAULT 0, avg_price REAL, fee REAL, raw_status TEXT, note TEXT);"
+    "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT NOT NULL, time REAL NOT NULL, from_state TEXT, "
+    "to_state TEXT NOT NULL, note TEXT);"
+    "INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES ('old', 'XLE', 10, 90, 'accepted', 1, 1);")
+
+
+@pytest.mark.parametrize("version", [0, 99])
+def test_a_ledger_file_with_another_layout_version_is_refused(tmp_path, version):
     path = tmp_path / "old.sqlite"
     raw = sqlite3.connect(str(path))
-    raw.executescript(
-        "CREATE TABLE orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, reference_price REAL NOT NULL, "
-        "limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, created REAL NOT NULL, sent_at REAL, updated REAL NOT NULL, "
-        "venue TEXT, venue_order_id TEXT, filled_units REAL NOT NULL DEFAULT 0, avg_price REAL, fee REAL, raw_status TEXT, note TEXT);"
-        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT NOT NULL, time REAL NOT NULL, from_state TEXT, "
-        "to_state TEXT NOT NULL, note TEXT);"
-        "CREATE TABLE reconciles (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, clean INTEGER NOT NULL, summary TEXT NOT NULL);"
-        "INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES ('old', 'XLE', 10, 90, 'accepted', 1, 1);")
+    raw.executescript(REV3_LAYOUT + f"PRAGMA user_version = {version};")
     raw.close()
-    led, venue = ledger(path), FakeVenue()
-    venue._take("XLE", 10.0, "old")
-    venue.set("old", state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
-    venue.held = {"XLE": 10.0}
+    with pytest.raises(OrderError, match="different version of this module"):
+        ledger(path)
+    raw = sqlite3.connect(str(path))
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == version          # nothing about the file was changed
+    assert [r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE name = 'fills'")] == []
+    raw.close()
+
+
+def test_a_new_ledger_file_carries_the_current_layout_version_and_reopens(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    ledger(path).close()
+    raw = sqlite3.connect(str(path))
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == orders.LAYOUT_VERSION >= 1
+    raw.close()
+    intend(ledger(path))
+
+
+# ---- rev 4: fee and price from every report, late reports, late acceptance, failed writes
+
+
+TAG = "s1-XLE-2026-11-12"
+
+
+def test_a_fee_that_rises_without_units_makes_an_adjustment_row():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=None, fee=1.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="partly_filled", filled_units=4.0, fee=1.5)
+    second = led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled", filled_units=4.0, fee=1.5)
+    third = led.reconcile(venue, {})
+    rows = led.fills(TAG)
+    assert [(r["units"], r["fee"]) for r in rows] == [(4.0, 1.0), (0.0, 0.5)]
+    assert [f["id"] for f in second["fills"]] == [rows[1]["id"]] and third["fills"] == []
+    assert led.order(TAG)["fee"] == 1.5 and led.order(TAG)["state"] == "cancelled"
+    assert [f["id"] for f in led.unapplied_fills()] == [r["id"] for r in rows] and "2 fills" in led.blocked()[0]
+
+
+def test_a_late_average_for_filled_units_makes_a_priced_adjustment_row():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=None, fee=None)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=100.0)
+    (row,) = led.reconcile(venue, {})["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (0.0, 100.0, 4.0, None)
+    assert led.reconcile(venue, {})["fills"] == []                              # the same average again: nothing new
+    rec = led.order(TAG)
+    assert rec["avg_price"] == 100.0 and rec["priced_units"] == 4.0 and rec["filled_units"] == 4.0
+
+
+def test_an_average_without_an_amount_is_not_used():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=None)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="partly_filled", filled_units=None, avg_price=100.0)  # which units does it cover? unknown
+    assert led.reconcile(venue, {})["fills"] == [] and led.order(TAG)["priced_units"] == 0.0
+
+
+def test_a_fee_total_that_falls_is_an_anomaly_and_changes_nothing():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=1.0)
+    led.reconcile(venue, {})
+    before = led.order(TAG)
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.5)
     result = led.reconcile(venue, {})
-    assert result["clean"] and [core(f) for f in result["fills"]] == [{"tag": "old", "symbol": "XLE", "units": 10.0, "price": 90.0, "fee": 0.0}]
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and "fee" in result["anomalies"][0]["reason"]
+    assert result["fills"] == [] and led.order(TAG) == before and len(led.fills()) == 1
+
+
+def test_an_average_that_implies_a_negative_price_is_an_anomaly_and_changes_nothing():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=100.0, fee=0.0)
+    led.reconcile(venue, {})
+    before = led.order(TAG)
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=50.0)    # the 2 new units would cost -50 each
+    result = led.reconcile(venue, {})
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and result["fills"] == [] and led.order(TAG) == before
+
+
+def test_fee_and_average_after_filled_are_taken_from_a_late_report():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, TAG)
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=None, fee=None)
+    led.reconcile(venue, {})
+    assert led.order(TAG)["state"] == "filled"
+    clock.t += 3600
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=2.0)
+    venue.status_calls.clear()
+    result = led.reconcile(venue, {})
+    assert venue.status_calls == [TAG] and result["anomalies"] == []
+    (row,) = result["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (0.0, 90.0, 10.0, 2.0)
+    assert led.order(TAG)["fee"] == 2.0 and led.order(TAG)["state"] == "filled"
+
+
+def test_fee_and_average_after_a_cancel_with_a_partial_fill_are_taken():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=None, fee=0.4)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled", filled_units=4.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled", filled_units=4.0, avg_price=100.0, fee=0.6)
+    (row,) = led.reconcile(venue, {})["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (0.0, 100.0, 4.0, pytest.approx(0.2))
+    assert led.order(TAG)["state"] == "cancelled"
+
+
+def test_a_finished_order_is_not_asked_again_after_recheck_seconds():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, TAG)
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=None)
+    led.reconcile(venue, {})
+    clock.t += 259200 + 1
+    venue.set(TAG, fee=2.0)
+    venue.status_calls.clear()
+    result = led.reconcile(venue, {})
+    assert venue.status_calls == [] and result["fills"] == [] and led.order(TAG)["fee"] is None
+
+
+def test_a_finished_order_with_nothing_filled_is_not_asked_again():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="cancelled", filled_units=0.0)
+    led.reconcile(venue, {})
+    venue.status_calls.clear()
+    led.reconcile(venue, {})
+    assert venue.status_calls == []
+
+
+@pytest.mark.parametrize("change", [{"filled_units": 5.0}, {"state": "filled", "filled_units": 10.0}, {"state": "expired"}])
+def test_a_changed_amount_or_state_on_a_finished_order_is_an_anomaly(change):
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled")
+    led.reconcile(venue, {})
+    before, rows = led.order(TAG), led.fills()
+    venue.set(TAG, **change)
+    result = led.reconcile(venue, {})
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and not result["clean"]
+    assert led.order(TAG) == before and led.fills() == rows
+
+
+def test_a_status_error_on_a_finished_order_goes_to_recheck_errors():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 10.0}
+    led.reconcile(venue, {})
+    venue.status_raises.add(TAG)
+    result = led.reconcile(venue, {})
+    assert result["clean"] and [e["tag"] for e in result["recheck_errors"]] == [TAG]
+
+
+def test_fee_and_price_totals_hold_when_reports_repeat_the_same_amount():
+    rng = random.Random(4)
+    for _ in range(400):
+        led, venue, clock = _accepted()
+        total = cost = fee_total = 0.0
+        last_fee = last_avg_point = None
+        for _step in range(rng.randint(2, 16)):
+            if total < 10.0 and rng.random() < 0.45:
+                inc = min(10.0 - total, rng.choice([0.5, 1.0, 2.5, 4.0]))
+                total, cost = total + inc, cost + inc * round(rng.uniform(90, 110), 2)
+            if rng.random() < 0.4:
+                fee_total += round(rng.uniform(0, 0.5), 3)
+            units = total if rng.random() < 0.85 else None
+            avg = cost / total if (total > 0 and rng.random() < 0.5) else None
+            fee = fee_total if rng.random() < 0.6 else None
+            venue.set(TAG, state="filled" if total >= 10.0 else ("partly_filled" if total > 0 else "open"),
+                      filled_units=units, avg_price=avg, fee=fee)
+            clock.t += 60
+            result = led.reconcile(venue, {})
+            assert result["anomalies"] == [], result["anomalies"]
+            if fee is not None:
+                last_fee = fee
+            if avg is not None and units is not None:
+                last_avg_point = (avg, units)
+        rows, rec = led.fills(TAG), led.order(TAG)
+        assert math.fsum(r["units"] for r in rows) == pytest.approx(rec["filled_units"])
+        assert math.fsum(r["fee"] for r in rows if r["fee"] is not None) == pytest.approx(last_fee or 0.0)
+        priced = [r for r in rows if r["price"] is not None]
+        if last_avg_point is not None:
+            avg, at = last_avg_point
+            assert math.fsum(r["price"] * r["price_covers_units"] for r in priced) == pytest.approx(avg * at)
+            assert math.fsum(r["price_covers_units"] for r in priced) == pytest.approx(at)
+            assert all(r["price"] >= 0 for r in priced)
+
+
+def test_a_late_acceptance_wins_over_never_arrived_set_while_the_submit_was_in_flight(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(on_submit=lambda tag: b.settle_by_hand(tag, "Burton", "not in the app yet"))
+    ready(a, venue)
+    intend(a)
+    rec = a.submit_once(venue, TAG)
+    assert rec["state"] == "accepted" and rec["venue_order_id"] == f"V-{TAG}"
+    last = a.events(TAG)[-1]
+    assert (last["from"], last["to"]) == ("never_arrived", "accepted") and "late" in last["note"]
+
+
+def test_a_late_acceptance_wins_over_unknown(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a = ledger(path, clock)
+
+    def mark_unknown(tag):                                  # no public path does this mid-flight; a raw write stands in
+        raw = sqlite3.connect(str(path))
+        raw.execute("UPDATE orders SET state = 'unknown' WHERE tag = ?", (tag,))
+        raw.commit()
+        raw.close()
+
+    venue = FakeVenue(on_submit=mark_unknown)
+    ready(a, venue)
+    intend(a)
+    rec = a.submit_once(venue, TAG)
+    assert rec["state"] == "accepted" and rec["venue_order_id"] == f"V-{TAG}"
+    assert (a.events(TAG)[-1]["from"], a.events(TAG)[-1]["to"]) == ("unknown", "accepted")
+
+
+class HookedStatusVenue(FakeVenue):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.before_status = None
+
+    def order_status(self, tag):
+        hook, self.before_status = self.before_status, None
+        if hook is not None:
+            hook(tag)
+        return super().order_status(tag)
+
+
+def test_never_arrived_set_by_hand_during_a_reconcile_that_reads_open_is_turned_up(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = HookedStatusVenue(mode="raise_after_taking")
+    ready(a, venue)
+    intend(a)
+    assert a.submit_once(venue, TAG)["state"] == "unknown"
+    venue.before_status = lambda tag: b.settle_by_hand(tag, "Burton", "looked in the app")
+    result = a.reconcile(venue, {})
+    assert not result["clean"] and [x["tag"] for x in result["anomalies"]] == [TAG]
+    assert a.order(TAG)["state"] == "accepted"
+    assert (a.events(TAG)[-1]["from"], a.events(TAG)[-1]["to"]) == ("never_arrived", "accepted")
+
+
+def test_a_failed_commit_leaves_the_ledger_usable_and_other_connections_unblocked(tmp_path, monkeypatch):
+    monkeypatch.setattr(orders, "BUSY_SECONDS", 0.2)
+    path = tmp_path / "orders.sqlite"
+    led = ledger(path)
+    reader = sqlite3.connect(str(path), isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM orders").fetchall()           # a read transaction held past the busy timeout
+    with pytest.raises(OrderError, match="could not be written"):
+        intend(led, tag="x")
+    assert not led._db.in_transaction
+    other = sqlite3.connect(str(path), timeout=0.2, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")                                   # the failed writer holds no lock
+    other.execute("ROLLBACK")
+    reader.execute("ROLLBACK")
+    reader.close()
+    assert led.order("x") is None and intend(led, tag="x")["state"] == "intended"
+    other.execute("BEGIN IMMEDIATE")
+    other.execute("ROLLBACK")
+    other.close()
+
+
+def test_a_failed_rollback_does_not_hide_the_original_error():
+    led = ledger()
+    with pytest.raises(OrderError, match="database or disk is full"):
+        with led._write():
+            led._db.execute("ROLLBACK")                                # sqlite has already rolled back by itself
+            raise sqlite3.OperationalError("database or disk is full")
+    assert not led._db.in_transaction
+    assert intend(led)["state"] == "intended"
+
+
+def test_mark_applied_ignores_anything_that_is_not_a_plain_int_id():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    (row,) = led.fills()
+    assert row["id"] == 1
+    assert led.mark_applied([2 ** 70, -(2 ** 70), 1.9, 1.0, True, "1", None]) == 0
+    assert led.unapplied_fills() == [led.fills()[0]]
+    assert led.mark_applied([1]) == 1
+
+
+@pytest.mark.parametrize("bad", [("notatype",), (int,), (ValueError, 3), 5])
+def test_not_sent_must_hold_exception_classes(bad):
+    with pytest.raises(OrderError, match="not_sent"):
+        OrderLedger(":memory:", not_sent=bad)
+    assert OrderLedger(":memory:", not_sent=(ValueError, LocalRefusal)).not_sent == (ValueError, LocalRefusal)
