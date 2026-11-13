@@ -114,3 +114,20 @@ under this section before any test-period snapshot is bought.
 6. **Pairing is strict** (same date). A pair needs both team names to match with their qualifying words (State,
    Tech and the like), a start within six hours before Kalshi's expected end of the game, and no second game
    that day that would also match; a game that is ambiguous is left out and counted, never guessed.
+
+## Two more clarifications, 2026-11-13, after the first pairing run and before any price was compared with a result
+
+The development-period snapshots were bought (326 snapshots, 3,260 credits, 5 January to 2 February 2026) and
+paired by the strict rule. The pairing counts showed two things about how Kalshi writes its markets. Both
+were found from team names and times only; no price, probability or result had been looked at.
+
+7. **Hockey names.** Kalshi writes a hockey team as a code and a nickname ("VGK Golden Knights") and puts the
+   cities in the market's title ("St. Louis at Vegas Winner?"), so the strict rule matched 2 of 231 hockey
+   games. For a market written that way, a team matches when its nickname is the end of the odds name and the
+   city in Kalshi's title is its start, both with their qualifying words; the rest of clarification 6 is
+   unchanged (uniqueness both ways, the time check, ambiguous games left out).
+8. **The time check.** Kalshi's "expected expiration" is not always the game's expected end: a football game
+   started 30 minutes after it, and afternoon basketball games started nine hours before it. The window of
+   clarification 6 (a start within six hours before that time) therefore refuses true games. It becomes: the
+   start is no more than 12 hours before and no more than 3 hours after Kalshi's expected expiration, on the
+   same US-Eastern date. Two games between the same teams on one date are both left out as ambiguous.
