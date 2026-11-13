@@ -120,3 +120,53 @@ Nothing has been collected into the research record and no answer has been compa
    two gaps of note 2: a blind check found no trade neither stored nor marked as lost in 200 generated
    sequences, and decisions identical to the previous revision's wherever there was no gap (4,658 compared).
    The rule of note 3 stays in force all the same.
+
+## Clarifications for the scoring (2026-11-13, written before the first development day began; no answer has been compared with an outcome)
+
+Raised by the builder of the evaluation code. Where the text above could be read two ways, the stricter reading
+is taken. None was chosen with data in sight.
+
+1. **What is scored.** Only an ordinary decision with answers under the battery in force, the first for its
+   market and slot. A late or forced row is not scored.
+2. **A day counts** on the collector's own count of slots (at least 80% collected, compared in whole numbers),
+   less any answered slot under another battery, and only once the day has ended. The yardsticks are fitted
+   on counted development days only.
+3. **Periods.** The first full day is the first UTC day that starts at or after the first start of
+   collection. A period is complete one hour after its last day ends.
+4. **The end of the test.** The first day from the 14th on at which 10 days have counted, at the latest the
+   21st. Without 10 counted days the idea cannot pass.
+5. **"Now" and "later".** Now is the mid and spread of the state the model was shown. A later mid is the
+   nearest two-sided snapshot that began after the decision, within 30 seconds of the target time; a
+   one-sided book there leaves the outcome unknown and the slot out of that question.
+6. **Paths** (`move_15m`, `regime`) need a two-sided book in every minute of the window. "At least half the
+   spread" includes exactly half.
+7. **`toxic_15m`.** The window is the 15 minutes after the decision. Two first trades of opposite sides at the
+   same moment leave it unknown. The mid just before the trade is the latest two-sided snapshot ended before
+   it, at most 90 seconds old. A mid that does not move counts as false. The trade tape must be covered for
+   the whole 15 minutes.
+8. **`regime`** quiet: the end within one cent and the whole path within two cents either way. It is reported
+   as accuracy and is not part of the pass line.
+9. **Quotes** come from the state the model was shown. With a spread under 3 cents or a one-sided book no rule
+   can quote: the slot earns zero for all three and stays in the averages.
+10. **Fills.** A resting buy fills on a trade whose taker sold at or below its price, a resting sell on one
+    whose taker bought at or above; each side at most once, at our own price; valued from the first such
+    trade's time. A fill that cannot be valued leaves the slot out for all three rules, and is counted.
+11. **The plain rule** takes an imbalance from 0.3 to 0.7 inclusive; a missing input means no quote. **The
+    model rule** reads `quote_env` as its expected score and `move_15m` as its probability.
+12. **The maker fee**, where a series has one: 0.0175 x price x (1 - price) a contract times the series'
+    multiplier, rounded up to a whole cent, because the paper rule rests one contract and a one-contract order
+    pays a whole cent. This is the strictest reading and the one that most lowers the quoting result; the
+    result with no maker fee and with the fee everywhere is reported beside it, as said above. A series whose
+    fee type is unknown is charged.
+13. **Yardstick splits** use the state the model was shown (the sign of its 15-minute mid change; whether the
+    mid moved half the spread in the 15 minutes before; the top-of-book imbalance against the first trade's
+    side). A group never seen in development takes the plain rate.
+14. **Judgment.** For each question a by-day t statistic on each day's mean difference (fewer than two days or
+    no spread between days: no statistic, which fails); the pooled Brier score must also be lower. Ranking
+    counts ties as half. Ranges come from 2,000 resamples of whole days with a fixed seed.
+15. **Policy.** The mean profit per slot over all slots; the model rule must be above zero, above the always
+    rule and above the plain rule, each difference with a by-day t statistic of 2 or more, judged on the
+    result with each series' own fee.
+16. **Trade-tape cover** (note 3 above) is the union of the stretches that successful trade reads covered,
+    less the 60 seconds by which the tape may lag; a read stored with a snapshot whose book was invalid still
+    counts as a read.
