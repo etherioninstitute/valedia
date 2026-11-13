@@ -137,3 +137,21 @@ strict side: every one can only remove picks, never add them.
 12. **A minute with no bid** on Kalshi is not a quote: nothing is bought in it.
 13. **One record.** The real pick store is graded into one grading store only.
 14. **A game with no final score three days after its start** is not graded.
+
+## Clarifications after the second check of the code (2026-11-13, still before any pick has been compared with a result)
+
+15. **Ending the test with a margin.** Some picks turn out not gradable only when results are read (the two
+    sources disagree on the winner). So the test period ends on the first thread date on which the counts that
+    can be known without reading a result reach 158 contracts on 20 days and 315 picks (5% above the pass
+    lines), or on 2027-03-31. The pass lines stay 150 and 300.
+16. **Team codes.** A code names a team only from complete tables of all five leagues' codes, and only when
+    it belongs to one team alone (across the five leagues, or within the league the comment writes). A capital
+    word that is also an ordinary English word counts only where a pick puts its team, directly before the bet;
+    in a selection written wholly in capitals no word counts as a code.
+17. **The scoring code is pinned** when the version for Question A is chosen. If a fault in it has to be
+    repaired afterwards, the repair, its reason and both versions are written into the result.
+18. **A pick against a team** ("fade", "against") and a selection naming teams of two different games are not
+    graded.
+19. **What the guards are.** One reading per rule and one scoring are kept by the code against slips and are
+    recorded so that every reading ever made is printed with the result. They cannot stop someone who changes
+    the code; the record is what makes that visible.
