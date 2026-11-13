@@ -1,10 +1,13 @@
 """The evaluation of the order-book loop, exactly as its locked prediction says.
 
-The prediction is docs/research/2026-11-13-orderbook-loop-prediction.md (with its notes 1 to 6, written before
-collection began); every rule and threshold below comes from it, and nothing is tuned on data. The collector's
-record (`orderbook_loop.py`) is opened read-only (`mode=ro`) always; this module keeps its own small append-only
-store (default `artifacts/orderbook_eval/`, one writer at a time) for the yardsticks it fits and the result it scores.
-No network, no model call, no Kalshi request.
+The prediction is docs/research/2026-11-13-orderbook-loop-prediction.md (with its notes 1 to 6 and its
+clarifications 1 to 25); every rule and threshold below comes from it, and nothing is tuned on data. The collector's
+record (`orderbook_loop.py`) is opened read-only (`mode=ro`) always. Reading it can create its two side files (the
+`-wal` and `-shm` beside it, as SQLite does for any reader of a WAL-mode store) and never changes the store's own
+bytes; a record that cannot be read so (a read-only folder without its `-shm` file) is refused plainly. This module
+keeps its own small append-only store (default `artifacts/orderbook_eval/`, one writer at a time; INSERT OR REPLACE,
+UPDATE and DELETE are refused) for the yardsticks it fits and the result it scores. No network, no model call, no
+Kalshi request.
 
     python -m valedia_trader.research_loop.orderbook_eval status      --db <record>  # days, periods, cover
     python -m valedia_trader.research_loop.orderbook_eval fit         --db <record>  # the yardsticks, once
@@ -22,7 +25,8 @@ or the more literal one and is listed for a dated clarification):
   and counted (`now_mismatch`). Reading: the yes/no answers are the typed `noul` probabilities; `quote_env` is the
   rubric's expected `score`.
 * Outcomes use only snapshots that began after the decision (`book_start_ts` after `decision_ts`) and trades created
-  after it; "now" is the state's mid at the now snapshot's book time `a`. "The mid h minutes later" is the snapshot
+  after it; "now" is the state's mid at the now snapshot's book time `a`, from which the later targets are aimed
+  (clarification 17). "The mid h minutes later" is the snapshot
   whose book read ended nearest a + h within 30 s either side (the collector's `reference`), among the valid ones;
   a one-sided book there gives no mid, and then the outcome is not known. A path of one-minute mids (minutes 1 to
   15, or 1 to 30) is taken by the collector's window rule (minute k: the snapshot nearest a + 60k within 30 s, each
@@ -31,9 +35,12 @@ or the more literal one and is listed for a dated clarification):
   - `up_15m` / `down_15m`: the mid at a + 15 min above / below the mid now (equal: both false).
   - `move_15m`: some minute of the 15 is at least half the spread now away from the mid now (exactly half counts).
   - `toxic_15m`: the first trade created in (decision, decision + 15 min] (several at the same first moment with
-    different taker sides: not known); its direction is up when its taker bought yes. "The mid just before it" is
-    the latest valid snapshot whose book read ended before the trade (the now snapshot included, with the state's
-    mid); reading: it must have ended at most 90 s (the collector's STALE_S) before the trade. The outcome is true
+    different taker sides: not known); its direction is up when its taker bought yes. "The mid just before it"
+    (clarification 7) is the latest two-sided valid snapshot whose book read ended before the trade (clarification
+    22: by its book end time), at most 90 s (the collector's STALE_S) before it; one-sided books are passed over.
+    The candidates are the snapshots before the decision (the now snapshot with the state's mid, and those before
+    it) and those that began after it; reading: one that began before the decision and finished after it is in
+    neither, as for every outcome. The outcome is true
     when the mid at the trade + 15 min is beyond that mid on the taker's side. Note 3: counted only where the trade
     reads cover the whole 15 minutes (below); a slot without cover is left out and counted.
   - `regime` (not part of the pass line; reported as the share of answers that named it): quiet when the mid at
@@ -43,12 +50,13 @@ or the more literal one and is listed for a dated clarification):
     mean-reverting. A null `mid_change_30m_cents` leaves it unknown.
 * Tape cover (note 3): judged only from the spans of the successful trade reads stored with the snapshots, never from
   the event rows. A read covers the trades created from its `trades_min_ts` to its start (the collector's span, as in
-  `_covered`) less 60 s (reading: the tape's lag, TAPE_LAG_S, so that a trade printed late inside the stretch has
-  been read); the spans of all successful reads are merged where they touch, and a stretch is covered when one merged
+  `_covered`) less 90 s (clarification 19: COVER_SHORTEN_S, the tape's lag TAPE_LAG_S of 60 s and the 30 s,
+  CLOCK_AGREE_S, the collector tolerates between its clock and Kalshi's); the spans of all successful reads are merged where they touch, and a stretch is covered when one merged
   span holds all of it. A paper fill needs (decision, decision + 5 min]; `toxic_15m` needs (decision, decision +
   15 min].
 * Paper quoting. At each slot, from the state: a buy one cent above the best bid and a sell one cent below the best
-  ask, for five minutes. Reading: with a spread under 3 cents (the two quotes would meet or cross) or a one-sided
+  ask, for five minutes. A slot is in the policy only when the tape covers its fill window, decided before anything
+  else (clarification 21). Reading: with a spread under 3 cents (the two quotes would meet or cross) or a one-sided
   book no rule can quote, and the slot earns zero for all three. A buy fills on the first trade in (decision,
   decision + 5 min] whose taker sold (taker side `no`) at or below its price; a sell, on the first whose taker bought
   yes at or above its price; each fills at its own price, one contract. Each fill is valued at the mid 15 minutes
@@ -59,9 +67,13 @@ or the more literal one and is listed for a dated clarification):
   (`quote_env` 2.0 or more and `move_15m` below 0.5).
 * The maker fee, one contract at price P (dollars): M x 0.0175 x P x (1 - P), rounded up to a whole cent (reading: the
   secondary source's formula, rounded up as a cent-precision account pays it; at every price on these markets it is
-  one cent when M is 1). Three variants: `series` (the main one: where the market's series fee type is
-  `quadratic_with_maker_fees`, with the series' multiplier; reading: an unknown fee type is charged), `none`, and
-  `everywhere` (every market, with its multiplier, or 1 where it has none or zero).
+  one cent when M is 1). Three variants: `series` (the main one: every market is charged, with its series'
+  multiplier, except where its fee type is one known to carry no maker fee), `none`, and `everywhere` (every
+  market, with its multiplier). Clarification 20: a missing, empty or unrecognised fee type is charged; a
+  multiplier that is missing, not a number (an int or float; a text is not one) or not above zero (or not finite)
+  is taken as 1. The fee types known to carry no maker fee, NO_MAKER_FEE_TYPES, are only `quadratic`: Kalshi's
+  series API gives `quadratic` (taker fee only) and `quadratic_with_maker_fees` (the recon notes R2 A6, R3 1f/5
+  and R4 in .foreman/scratch, from the series records and Kalshi's fee schedule); matched exactly.
 * Days and periods. A day counts when at least 80% of its decision slots were collected (the collector's own count,
   `day_status`; less any slot answered under another battery, so the share can only fall), judged in integers. The
   first full UTC day is the first that begins at or after the collection's first `start` event. Development: the
@@ -70,11 +82,12 @@ or the more literal one and is listed for a dated clarification):
   every outcome window of its last decisions has closed.
 * Yardsticks, fitted on the development period only, over the decisions whose outcome is known: (a) the plain rate
   at which each yes/no question came true; (b) that rate split by one number known at the decision: for `up_15m` and
-  `down_15m` the sign of the state's `mid_change_15m_cents` (up, down, flat, unknown); for `move_15m` whether some
-  minute of the last 15 (the collector's `window` over the snapshots before the decision) was at least half the
-  spread now away from the mid now (moved, still, unknown when the window is not covered); for `toxic_15m` whether
+  `down_15m` the sign of the state's `mid_change_15m_cents` (up, down, flat, unknown); for `move_15m` (clarification 23)
+  whether the state's absolute `mid_change_15m_cents` is at least half its `spread_cents` (moved, still; unknown
+  when either is null); for `toxic_15m` whether
   the state's `imbalance_top` leans to the first trade's taker side (above 0.5 for a yes taker, below 0.5 for a no
-  taker; unknown when null). A group not seen in development takes the plain rate.
+  taker; exactly 0.5 leans to neither, clarification 22; unknown when null). The previous 30-minute move of
+  `regime` is the state's `mid_change_30m_cents`. A group not seen in development takes the plain rate.
 * Judgment, per yes/no question on the counted test days: the Brier score of the model and of each yardstick; each
   difference's by-day t statistic (the mean over days of each day's mean of yardstick Brier less model Brier, over its
   standard error; fewer than two days or no spread: no t, which fails); the ranking (AUC, ties count half) and its 95%
@@ -142,9 +155,11 @@ T_LINE, RANK_LINE, MIN_PASSING = 2.0, 0.5, 2
 # ---- readings (see the docstring)
 REF_S = ol.REF_WINDOW_S                      # 30 s either side, the collector's reference rule
 STALE_S = ol.STALE_S                         # the mid just before a trade: at most 90 s before it
-TAPE_LAG_S = ol.TAPE_LAG_S                   # a stretch is covered by a read begun at least 60 s after its end
+TAPE_LAG_S = ol.TAPE_LAG_S                   # a trade reaches the tape up to 60 s late
+COVER_SHORTEN_S = ol.TAPE_LAG_S + ol.CLOCK_AGREE_S   # 90 s: a stretch is covered by a read begun 90 s after its end
 MIN_QUOTE_SPREAD_C = 3.0                     # under this the buy and the sell would meet: no quote
-MAKER_RATE, MAKER_FEE_TYPE = 0.0175, "quadratic_with_maker_fees"
+MAKER_RATE = 0.0175
+NO_MAKER_FEE_TYPES = ("quadratic",)          # fee types known to carry no maker fee (recon R2 A6, R3, R4)
 OUTCOME_WAIT_S = 3600                        # a period is complete an hour after its last day ends
 AFTER_S = 2 * HORIZON_S + 2 * REF_S          # how far after a decision its outcomes can reach
 BOOTSTRAP, SEED = 2000, 20261113
@@ -153,7 +168,7 @@ DEFAULT_DIR = REPO / "artifacts" / "orderbook_eval"
 EVAL_DB, LOCK_FILE = "orderbook_eval.sqlite", "writer.lock"
 SPLIT_BY = {"up_15m": "sign of the state's mid_change_15m_cents",
             "down_15m": "sign of the state's mid_change_15m_cents",
-            "move_15m": "a minute of the last 15 at least half the spread now from the mid now",
+            "move_15m": "the state's |mid_change_15m_cents| at least half its spread_cents",
             "toxic_15m": "the state's imbalance_top leans to the first trade's taker side"}
 DEV_LABEL = ("DEVELOPMENT PERIOD: may be looked at to find faults; yardsticks fitted in-sample; nothing here is the "
              "test")
@@ -185,8 +200,13 @@ def open_record(path) -> ol.Store:
     p = Path(path).resolve()
     if not p.is_file():
         raise Refused("no collector record at %s" % p)
-    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(p)), uri=True)
-    conn.execute("PRAGMA query_only = ON")
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(p)), uri=True)
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as e:
+        raise Refused("cannot read the record at %s read-only (%s): a WAL-mode record in a read-only folder needs its "
+                      "-shm file beside it" % (p, e)) from None
     store = ol.Store.__new__(ol.Store)          # no __init__: it would create tables and set the journal mode
     store.path, store.conn = p, conn
     return store
@@ -282,15 +302,15 @@ def test_end(per: dict, counted: set, now: float) -> tuple:
 
 class Reads:
     """The successful trade reads of one market (from its snapshots). Each covers the trades created from its
-    `trades_min_ts` (where it asked from) to its start less TAPE_LAG_S (a trade reaches the tape up to a minute late),
-    the collector's span (`_covered`: from `trades_min_ts` to the start) less the lag; the spans of all successful
+    `trades_min_ts` (where it asked from) to its start less COVER_SHORTEN_S (90 s: the tape's lag and the clock
+    difference the collector tolerates, clarification 19), the collector's span (`_covered`: from `trades_min_ts` to the start) less the lag; the spans of all successful
     reads are merged where they touch or overlap, as `_covered` chains them."""
 
     def __init__(self, snaps: Iterable[dict]):
-        spans = sorted((s["trades_min_ts"], s["trades_start_ts"] - TAPE_LAG_S) for s in snaps
+        spans = sorted((s["trades_min_ts"], s["trades_start_ts"] - COVER_SHORTEN_S) for s in snaps
                        if s.get("trades_ok") and s.get("trades_min_ts") is not None
                        and s.get("trades_start_ts") is not None
-                       and s["trades_min_ts"] <= s["trades_start_ts"] - TAPE_LAG_S)
+                       and s["trades_min_ts"] <= s["trades_start_ts"] - COVER_SHORTEN_S)
         merged: list = []
         for lo, hi in spans:
             if merged and lo <= merged[-1][1]:
@@ -363,9 +383,12 @@ def mid_outcomes(mid0, spread0, prev30, a, after: list) -> dict:
     return out
 
 
-def toxic_outcome(mid0, a, decision_ts: float, after: list, trades: list) -> tuple:
+def toxic_outcome(mid0, a, decision_ts: float, after: list, trades: list, prior: list = ()) -> tuple:
     """(`toxic_15m`, the first trade's taker side): (None, None) without a trade in (decision, decision + 15 min] or
-    when its first moment has trades of both sides; (None, side) when the mids around it are not known."""
+    when its first moment has trades of both sides; (None, side) when the mids around it are not known. The mid just
+    before the trade (clarification 7) is the latest two-sided snapshot whose book ended before it, at most 90 s
+    old: among `prior` (the valid snapshots finished before the decision; the now snapshot, whose book ended at `a`,
+    with the state's mid `mid0`) and `after` (those begun after it)."""
     win = [x for x in trades if decision_ts < x["created_ts"] <= decision_ts + HORIZON_S]
     if not win:
         return None, None
@@ -374,9 +397,13 @@ def toxic_outcome(mid0, a, decision_ts: float, after: list, trades: list) -> tup
     if len(sides) != 1 or not sides <= {"yes", "no"}:
         return None, None
     side = sides.pop()
-    before = [s for s in after if s["book_end_ts"] < t1]
-    b_ts, b_mid = (before[-1]["book_end_ts"], before[-1]["mid"]) if before else (a, mid0)
-    if b_ts is None or b_mid is None or t1 - b_ts > STALE_S:
+    cands = [(s["book_end_ts"], s["mid"]) for s in prior if s["book_end_ts"] != a]
+    cands += [(a, mid0)] + [(s["book_end_ts"], s["mid"]) for s in after]
+    two = [(ts, m) for ts, m in cands if ts is not None and m is not None and ts < t1]
+    if not two:
+        return None, side
+    b_ts, b_mid = max(two, key=lambda x: x[0])
+    if t1 - b_ts > STALE_S:
         return None, side
     m = _mid_at(after, t1 + HORIZON_S)
     if m is None:
@@ -438,25 +465,36 @@ def maker_fee_c(price_c: float, multiplier: float = 1.0) -> float:
     return float(math.ceil(round(multiplier * MAKER_RATE * p * (1 - p) * 100.0, 6)))
 
 
+def fee_multiplier(m) -> float:
+    """Clarification 20: a multiplier that is missing, not a number or not above zero is taken as 1."""
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or not math.isfinite(m) or m <= 0:
+        return 1.0
+    return float(m)
+
+
 def fill_fee_c(variant: str, price_c: float, fee_type: str | None, multiplier: float | None) -> float:
+    """One fill's maker fee (cents) under a variant. `series`: uncharged only when the fee type is one known to carry
+    no maker fee (NO_MAKER_FEE_TYPES, matched exactly); a missing, empty or unrecognised type is charged."""
     if variant == "none":
         return 0.0
     if variant == "series":
-        if fee_type is not None and fee_type != MAKER_FEE_TYPE:
+        if isinstance(fee_type, str) and fee_type in NO_MAKER_FEE_TYPES:
             return 0.0
-        return maker_fee_c(price_c, 1.0 if multiplier is None else multiplier)
+        return maker_fee_c(price_c, fee_multiplier(multiplier))
     if variant == "everywhere":
-        return maker_fee_c(price_c, multiplier if multiplier else 1.0)
+        return maker_fee_c(price_c, fee_multiplier(multiplier))
     raise ValueError("fee variant must be one of %s" % (VARIANTS,))
 
 
 # ============================================================================ the observations
 
-def _sign_group(x) -> str:
+def sign_group(x) -> str:
+    """`up_15m` / `down_15m` split: the sign of the state's `mid_change_15m_cents`."""
     return "unknown" if x is None else "up" if x > 0 else "down" if x < 0 else "flat"
 
 
-def _lean_group(side, imb) -> str | None:
+def lean_group(side, imb) -> str | None:
+    """`toxic_15m` split: the state's `imbalance_top` against the first trade's taker side (0.5 leans to neither)."""
     if side is None:
         return None
     if imb is None:
@@ -464,16 +502,12 @@ def _lean_group(side, imb) -> str | None:
     return "leans" if (side == "yes" and imb > 0.5) or (side == "no" and imb < 0.5) else "not"
 
 
-def _move_group(before: list, mid0, spread0) -> str:
-    if mid0 is None or spread0 is None or not before:
+def move_group(change15, spread) -> str:
+    """`move_15m` split (clarifications 13 and 23): whether the state's absolute `mid_change_15m_cents` is at least
+    half its `spread_cents`; a state lacking either forms its own group."""
+    if change15 is None or spread is None:
         return "unknown"
-    w = ol.window(before, HORIZON_S // 60)
-    if w is None:
-        return "unknown"
-    mids = [s["mid"] for k, s in w.items() if k > 0 and s["mid"] is not None]
-    if not mids:
-        return "unknown"
-    return "moved" if max(abs(m - mid0) for m in mids) >= spread0 / 2 - EPS else "still"
+    return "moved" if abs(change15) >= spread / 2 - EPS else "still"
 
 
 class Tape:
@@ -543,10 +577,12 @@ class Tape:
         o["toxic_cover"] = self.reads.covers(dts, dts + HORIZON_S)
         side = None
         if o["toxic_cover"]:
-            o["outcomes"]["toxic_15m"], side = toxic_outcome(mid0, a, dts, after, self.trades_in(dts, dts + HORIZON_S))
-        g15 = _sign_group(state.get("mid_change_15m_cents"))
-        o["groups"].update(up_15m=g15, down_15m=g15, move_15m=_move_group(self.before(i, dts), mid0, spread0),
-                           toxic_15m=_lean_group(side, state.get("imbalance_top")))
+            o["outcomes"]["toxic_15m"], side = toxic_outcome(mid0, a, dts, after, self.trades_in(dts, dts + HORIZON_S),
+                                                             prior=self.before(i, dts))
+        g15 = sign_group(state.get("mid_change_15m_cents"))
+        o["groups"].update(up_15m=g15, down_15m=g15,
+                           move_15m=move_group(state.get("mid_change_15m_cents"), state.get("spread_cents")),
+                           toxic_15m=lean_group(side, state.get("imbalance_top")))
         p = o["policy"]
         if not self.reads.covers(dts, dts + QUOTE_S):
             p["status"] = "no_cover"
@@ -790,8 +826,8 @@ CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY, at TEXT NOT NULL, comman
 
 
 class EvalStore:
-    """The evaluation's own store: append-only (triggers refuse UPDATE and DELETE), one writer (an exclusive lock on
-    the folder's lock file for as long as it is open)."""
+    """The evaluation's own store: append-only (triggers refuse UPDATE, DELETE, and an INSERT, so INSERT OR REPLACE
+    too, onto a row id already there), one writer (an exclusive lock on the folder's lock file while it is open)."""
 
     def __init__(self, folder):
         self.dir = Path(folder)
@@ -808,6 +844,9 @@ class EvalStore:
             for verb in ("UPDATE", "DELETE"):
                 self.conn.execute("CREATE TRIGGER IF NOT EXISTS no_%s_%s BEFORE %s ON %s BEGIN SELECT RAISE(ABORT, "
                                   "'append-only: no %s on %s'); END" % (verb.lower(), table, verb, table, verb, table))
+            self.conn.execute("CREATE TRIGGER IF NOT EXISTS no_replace_%s BEFORE INSERT ON %s WHEN EXISTS (SELECT 1 "
+                              "FROM %s WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append-only: no INSERT OR "
+                              "REPLACE on %s'); END" % (table, table, table, table))
         self.conn.commit()
 
     def close(self) -> None:
@@ -890,6 +929,8 @@ def cmd_status(db, eval_dir, now: float) -> str:
         n_dec[d, "all"] += 1
         n_dec[d, "ok"] += status == "ok" and battery == BATTERY_IN_FORCE
     held = _peek_eval(eval_dir)
+    folder = Path(eval_dir).resolve()
+    is_default = folder == DEFAULT_DIR.resolve()
     counted = set(counted_days(table, days))
     end, reached = test_end(per, counted, now)
     tf = per["test_first"]
@@ -902,6 +943,8 @@ def cmd_status(db, eval_dir, now: float) -> str:
                  len([d for d in counted if tf <= d <= per["test_max_last"]]),
                  "complete, ends %s%s" % (end, "" if reached else " WITHOUT 10 counted days") if end else
                  "not complete"),
+             "evaluation folder %s (%s; the score-once lock is per folder)" % (
+                 folder, "the default" if is_default else "not the default, %s" % DEFAULT_DIR.resolve()),
              "fit stored: %s; test result stored: %s" % (
                  "no" if held["fit"] is None else "yes (%s, %s)" % (held["fit"][0], held["fit"][1][:12]),
                  "no" if held["result"] is None else "yes (%s)" % held["result"][0]),
@@ -1053,6 +1096,10 @@ def main(argv=None, *, clock: Callable[[], float] | None = None) -> int:
             out = cmd_development(a.db, a.eval_dir, now)
     except Refused as e:
         print("refused: %s" % e, file=sys.stderr)
+        return 2
+    except sqlite3.Error as e:
+        print("refused: the record or the evaluation's store could not be read or written (%s: %s); nothing was "
+              "changed" % (type(e).__name__, e), file=sys.stderr)
         return 2
     print(json.dumps(out, indent=1, sort_keys=True, allow_nan=False))
     return 0

@@ -5,8 +5,10 @@ built through the collector's own `Store` in a temporary folder; nothing opens t
 import hashlib
 import json
 import math
+import os
 import random
 import sqlite3
+import stat
 import statistics
 from datetime import date, datetime, timedelta, timezone
 
@@ -17,6 +19,7 @@ from valedia_trader.research_loop import orderbook_eval as oe
 from valedia_trader.research_loop import orderbook_loop as ol
 
 UTC = timezone.utc
+MK = "quadratic_with_maker_fees"                 # the fee type that carries a maker fee
 D0 = datetime(2026, 11, 14, tzinfo=UTC).timestamp()      # the first full UTC day of the generated records
 START = D0 - 1800                                        # collection began 2026-11-13 23:30 UTC
 A = START + 60 * 40 + 2                                  # a decision's "now" snapshot (minute 40) ...
@@ -63,6 +66,16 @@ def test_the_mid_later_is_the_snapshot_nearest_the_horizon_within_thirty_seconds
     assert oe.mid_outcomes(50.0, 4.0, 0.0, A, one_sided)["up_15m"] is None
     assert oe.mid_outcomes(None, None, 0.0, A, path([50.0] * 31)) == dict.fromkeys(
         ("up_15m", "down_15m", "move_15m", "regime"))
+
+
+def test_later_is_aimed_from_the_states_now_and_the_nearest_snapshot_decides_whatever_its_book():
+    # clarification 17: the target is the now snapshot's book end (A) plus 15 minutes, not the decision (A + 18)
+    two = path([50.0] * 14) + [snap(A + 875, 51.0), snap(A + 925, 49.0)]   # 25 s either side of A + 900
+    assert oe.mid_outcomes(50.0, 4.0, 0.0, A, two)["up_15m"] is True        # from DTS + 900 it would be 49.0
+    # clarification 18: a one-sided book at the nearest snapshot leaves it unknown, a two-sided one 10 s further
+    # off is not preferred
+    near = path([50.0] * 14) + [snap(A + 900, None), snap(A + 910, 51.0)]
+    assert oe.mid_outcomes(50.0, 4.0, 0.0, A, near)["up_15m"] is None
 
 
 def test_a_move_of_exactly_half_the_spread_counts_and_a_little_less_does_not():
@@ -138,6 +151,42 @@ def test_the_mid_just_before_the_trade_is_the_latest_snapshot_before_it_and_must
     assert oe.toxic_outcome(50.0, A, DTS, stale, [trade(DTS + 200, "yes")]) == (None, "yes")
 
 
+def test_the_mid_just_before_the_trade_is_the_latest_two_sided_snapshot_at_most_90_seconds_old():
+    mids = [51.0] * 32
+    mids[1] = None                                     # minute 2 (A + 120) is one-sided
+    mids[16] = 52.0                                    # minute 17 (A + 1020): nearest 15 minutes after A + 140
+    after = path(mids)
+    # a trade at A + 140: the latest book before it is one-sided; the two-sided one at A + 60 is 80 s old
+    assert oe.toxic_outcome(50.0, A, DTS, after, [trade(A + 140, "yes")]) == (True, "yes")
+    # at A + 151 the two-sided one is 91 s old: not known
+    assert oe.toxic_outcome(50.0, A, DTS, after, [trade(A + 151, "yes")]) == (None, "yes")
+    # the "now" snapshot one-sided: an earlier two-sided snapshot, ended before the trade, can be it
+    prior = [snap(A - 60, 49.0), snap(A, None)]
+    assert oe.toxic_outcome(None, A, DTS, path([52.0] * 32), [trade(A + 25, "yes")], prior=prior) == (True, "yes")
+    assert oe.toxic_outcome(None, A, DTS, path([52.0] * 32), [trade(A + 31, "yes")], prior=prior) == (None, "yes")
+
+
+def test_ended_before_a_trade_is_judged_by_the_books_end_time():
+    # clarification 22: a book read that ended 1 s before the trade counts, though its trades read ran past it
+    mids = [50.0] * 32
+    mids[16] = 52.0
+    after = path(mids)
+    after.insert(1, {"book_start_ts": A + 96, "book_end_ts": A + 99, "end_ts": A + 110, "mid": 53.0})
+    assert oe.toxic_outcome(50.0, A, DTS, after, [trade(A + 100, "yes")]) == (False, "yes")   # 52 is below 53
+    assert oe.lean_group("yes", 0.5) == oe.lean_group("no", 0.5) == "not"                       # 0.5 leans to neither
+    assert (oe.lean_group("yes", 0.51), oe.lean_group("no", 0.49), oe.lean_group("no", None)) == (
+        "leans", "leans", "unknown")
+
+
+def test_the_move_split_comes_from_the_state_the_model_was_shown():
+    # clarifications 13 and 23: |mid_change_15m_cents| at least half spread_cents; a state lacking either: own group
+    assert oe.move_group(2.0, 4.0) == oe.move_group(-2.0, 4.0) == oe.move_group(1.5, 3.0) == "moved"
+    assert oe.move_group(1.5, 4.0) == oe.move_group(0.0, 4.0) == "still"
+    assert oe.move_group(None, 4.0) == oe.move_group(2.0, None) == "unknown"
+    assert oe.sign_group(1.0) == "up" and oe.sign_group(-0.5) == "down" and oe.sign_group(0.0) == "flat"
+    assert oe.sign_group(None) == "unknown"
+
+
 # ================================================================= paper quoting
 
 def test_quotes_rest_one_cent_inside_the_book_and_need_room():
@@ -195,10 +244,17 @@ def test_each_fill_is_valued_against_the_mid_fifteen_minutes_after_it():
 def test_the_maker_fee_and_its_three_variants():
     assert oe.maker_fee_c(50.0) == 1.0 and oe.maker_fee_c(10.0) == 1.0 and oe.maker_fee_c(50.0, 0.0) == 0.0
     assert oe.maker_fee_c(50.0, 3.0) == 2.0           # 3 x 0.0175 x 0.25 = 1.3125 cents, rounded up
-    mk, quad = oe.MAKER_FEE_TYPE, "quadratic"
+    mk, quad = MK, "quadratic"
     assert oe.fill_fee_c("series", 50.0, mk, 1.0) == 1.0
     assert oe.fill_fee_c("series", 50.0, quad, 1.0) == 0.0
     assert oe.fill_fee_c("series", 50.0, None, None) == 1.0          # unknown fee type: charged
+    assert oe.NO_MAKER_FEE_TYPES == ("quadratic",)
+    for unknown in ("", "  ", "flat", "Quadratic", "quadratic_with_maker_fees_v2"):   # empty or unrecognised
+        assert oe.fill_fee_c("series", 50.0, unknown, 1.0) == 1.0, unknown
+    for bad in (None, 0.0, -2.0, float("nan"), float("inf"), "x", ""):  # not a number or not above zero: 1
+        assert oe.fill_fee_c("series", 50.0, mk, bad) == 1.0, bad
+        assert oe.fill_fee_c("everywhere", 50.0, quad, bad) == 1.0, bad
+    assert oe.fill_fee_c("series", 50.0, mk, 3.0) == 2.0 and oe.fill_fee_c("series", 50.0, quad, 3.0) == 0.0
     assert oe.fill_fee_c("none", 50.0, mk, 1.0) == 0.0
     assert oe.fill_fee_c("everywhere", 50.0, quad, 1.0) == 1.0
     assert oe.fill_fee_c("everywhere", 50.0, quad, 0.0) == 1.0
@@ -217,18 +273,20 @@ def test_tape_cover_is_judged_from_the_spans_of_the_successful_reads():
     spec = [(1000 + 60 * k, 1000 + 60 * (k - 1) - 150) for k in range(20)]
     assert oe.Reads(reads(*spec)).covers(1100, 1400)
     # reads 6 to 8 failed and read 9 asked only from 30 s before its start (as after a hole of over 24 hours): the
-    # trades created after 1240 (read 5's start, 1300, less the lag) and before 1390 (read 10's read-back) are unread
+    # trades created after 1210 (read 5's start, 1300, less 90 s) and before 1390 (read 10's read-back) are unread
     hole = reads(*spec[:6]) + reads(*spec[6:9], ok=0) + reads((1540, 1510)) + reads(
         *[(1000 + 60 * k, 1000 + 60 * (k - 1) - 150) for k in range(10, 20)])
     r = oe.Reads(hole)
-    assert not r.covers(1100, 1400) and not r.covers(1250, 1380) and not r.covers(1100, 1241)
-    assert r.covers(1100, 1240) and r.covers(1390, 1700)
+    assert not r.covers(1100, 1400) and not r.covers(1250, 1380) and not r.covers(1100, 1211)
+    assert r.covers(1100, 1210) and r.covers(1390, 1700)
     # failed reads alone leave no hole: the next good read asks from 150 s before the last good one began
     failed = reads(*spec[:6]) + reads(*spec[6:8], ok=0) + reads((1480, 1300 - 150)) + reads(*spec[9:])
     assert oe.Reads(failed).covers(1100, 1400)
     assert oe.Reads(reads(*[(st, None) for st, _ in spec])).covers(1100, 1400) is False
-    # the stretch counts only when a read began at least the tape's lag (60 s) after its end
-    assert oe.Reads(reads(*spec[:8])).covers(1100, 1360) and not oe.Reads(reads(*spec[:8])).covers(1100, 1361)
+    # clarification 19: the stretch counts only when a read began at least 90 s after its end (60 s of tape lag,
+    # 30 s of clock difference)
+    assert oe.Reads(reads(*spec[:8])).covers(1100, 1330) and not oe.Reads(reads(*spec[:8])).covers(1100, 1331)
+    assert oe.COVER_SHORTEN_S == 90
     assert oe.Reads(reads(*spec)).covers(790, 1100) and not oe.Reads(reads(*spec)).covers(789, 1100)
 
 
@@ -271,6 +329,9 @@ def test_the_test_period_is_extended_until_it_has_ten_counted_days_and_at_most_t
     assert oe.test_end(per, later, day17) == (tf + timedelta(days=16), True)
     never = oe.day_end(per["test_max_last"]) + oe.OUTCOME_WAIT_S
     assert oe.test_end(per, nine, never) == (per["test_max_last"], False)
+    # clarification 3: one hour, written out
+    last = oe.day_end(date(2026, 12, 2))
+    assert oe.test_end(per, every, last + 3599) == (None, False) and oe.test_end(per, every, last + 3600)[1]
 
 
 # ================================================================= records built through the collector's Store
@@ -368,7 +429,7 @@ def write_record(path, markets, decisions, *, start=START, n_min, drop=True):
     return path
 
 
-def one_market(books, trades=(), reads=None, ticker="AAA-1", fee_type=oe.MAKER_FEE_TYPE):
+def one_market(books, trades=(), reads=None, ticker="AAA-1", fee_type=MK):
     m = {"ticker": ticker, "series": ticker.split("-")[0], "fee_type": fee_type, "mult": 1.0, "phase": 0,
          "books": books, "trades": list(trades)}
     if reads is not None:
@@ -411,12 +472,14 @@ def test_a_day_counts_from_the_collectors_own_slot_count_at_exactly_eighty_perce
 def test_a_decision_under_another_battery_is_not_collected_and_not_scored(tmp_path):
     n = 35 + 50
     books = flat_books(n)
-    ds = [dec(35 + 5 * k, books[0]) for k in range(8)] + [dec(75, books[0]), dec(80, books[0], battery="0" * 64)]
+    ds = [dec(35 + 5 * k, books[0]) for k in range(8)] + [dec(75, books[0]), dec(80, books[0], battery="0" * 64),
+                                                          dec(37, books[0], battery="0" * 64)]   # 37: off the grid
     rec = oe.open_record(write_record(tmp_path / "b.sqlite", [one_market(books)], ds, start=D0, n_min=n))
+    assert ol.day_status(rec, D0 + 2 * 86400)[0]["collected"] == 10      # the collector counts neither battery
     row = oe.day_table(rec, D0 + 2 * 86400)[date(2026, 11, 14)]
-    assert (row["expected"], row["collected"], row["other_battery"]) == (10, 9, 1)
+    assert (row["expected"], row["collected"], row["other_battery"]) == (10, 8, 2)   # clarification 25
     ob = oe.observe(rec, [date(2026, 11, 14)])
-    assert len(ob["obs"]) == 9 and ob["counts"]["other_battery"] == 1
+    assert len(ob["obs"]) == 9 and ob["counts"]["other_battery"] == 2
 
 
 def test_a_slot_without_tape_cover_is_left_out_for_all_three_rules_and_counted(tmp_path):
@@ -425,15 +488,17 @@ def test_a_slot_without_tape_cover_is_left_out_for_all_three_rules_and_counted(t
     rds = ["good"] * n
     rds[41:45] = ["fail", "fail", "fail", "break"]        # a hole in the trade reads just after minute 40
     trades = [(START + 60 * 40 + 60, "no", 49.0), (START + 60 * 60 + 60, "no", 49.0)]
-    ds = [dec(40, books[0], answers=answers(qe=3.0, move=0.1)), dec(60, books[0], answers=answers(qe=3.0, move=0.1))]
+    ds = [dec(40, books[0], answers=answers(qe=3.0, move=0.1)), dec(60, books[0], answers=answers(qe=3.0, move=0.1)),
+          dec(41, books[0], state=state_of(books[0], spread_cents=2.0))]   # cannot quote, and no cover: left out
     rec = oe.open_record(write_record(tmp_path / "c.sqlite", [one_market(books, trades, rds)], ds, n_min=n))
     ob = oe.observe(rec, [oe.day_of(START + 2400)])
-    first, second = ob["obs"]
+    first, narrow, second = ob["obs"]
+    assert narrow["policy"]["status"] == "no_cover"                   # clarification 21: cover is decided first
     assert first["policy"]["status"] == "no_cover" and not first["toxic_cover"]
     assert first["outcomes"]["toxic_15m"] is None and first["outcomes"]["up_15m"] is False   # mids are not affected
     assert second["policy"]["status"] == "quoted" and second["toxic_cover"]
     pol = oe.policy(ob["obs"])
-    assert pol["slots"] == 1 and pol["left_out_no_cover"] == 1
+    assert pol["slots"] == 1 and pol["left_out_no_cover"] == 2 and pol["no_quote_possible"] == 0
     v = pol["variants"]["none"]
     assert {r: v["rules"][r]["slots"] for r in oe.RULES} == {"always": 1, "plain": 1, "model": 1}
     assert v["rules"]["always"]["mean"] == 1.0                       # bought at 49, mid 50 fifteen minutes later
@@ -466,11 +531,40 @@ def lookahead_record(path, after_change=False, before_change=False):
 def test_no_look_ahead(tmp_path):
     def outcome(p):
         o = oe.observe(oe.open_record(p), [oe.day_of(DTS)])["obs"][0]
-        return o["outcomes"], o["regime"], o["policy"]
+        return o["outcomes"], o["regime"], o["policy"], o["groups"]
     base = outcome(lookahead_record(tmp_path / "base.sqlite"))
     assert base == outcome(lookahead_record(tmp_path / "after.sqlite", after_change=True))
     assert base == outcome(lookahead_record(tmp_path / "before.sqlite", before_change=True))
     assert any(v is not None for v in base[0].values()) and base[2]["status"] == "quoted"
+
+
+def test_a_later_mid_comes_only_from_a_snapshot_that_began_after_the_decision(tmp_path):
+    # clarifications 5 and 17: a book read that began 2 s before the decision and ended 25 s after it is not "later",
+    # though it is nearest the first minute's target; that minute is then not covered and move_15m is unknown
+    n = 100
+    books = flat_books(n)
+    books[41] = ("bad",)
+    p = write_record(tmp_path / "s.sqlite", [one_market(books)], [dec(40, books[40])], n_min=n)
+    st = ol.Store(p)
+    st.insert("snapshots", {"watch_id": 1, "ticker": "AAA-1", **ol.stamp("book_start", DTS - 2),
+                            **ol.stamp("book_end", DTS + 25), **ol.stamp("trades_start", DTS + 26),
+                            **ol.stamp("trades_end", DTS + 27), **ol.stamp("end", DTS + 27),
+                            "trades_min_ts": int(DTS - 150), "trades_ok": 1, "book_state": "two_sided",
+                            "yes_json": "[[0.58, 10.0]]", "no_json": "[[0.38, 10.0]]", "best_bid": 0.58,
+                            "best_ask": 0.62, "mid": 0.6, "spread": 0.04, "new_trades": 0})
+    st.close()
+    o = oe.observe(oe.open_record(p), [oe.day_of(DTS)])["obs"][0]
+    assert o["outcomes"]["move_15m"] is None and o["outcomes"]["up_15m"] is False
+
+
+def test_the_yardstick_groups_are_read_from_the_state(tmp_path):
+    n = 100
+    books = flat_books(n)                              # the books never move ...
+    st = state_of(books[40], mid_change_15m_cents=-3.0, imbalance_top=0.8)   # ... the state says the mid fell 3
+    rec = oe.open_record(write_record(tmp_path / "g.sqlite", [one_market(books, [(DTS + 40, "no", 50.0)])],
+                                      [dec(40, books[40], state=st)], n_min=n))
+    o = oe.observe(rec, [oe.day_of(DTS)])["obs"][0]
+    assert o["groups"] == {"up_15m": "down", "down_15m": "down", "move_15m": "moved", "toxic_15m": "not"}
 
 
 def test_the_decisions_inputs_are_read_from_the_state_never_recomputed(tmp_path):
@@ -493,7 +587,7 @@ def test_the_decisions_inputs_are_read_from_the_state_never_recomputed(tmp_path)
 
 # ================================================================= a generated record: 5 development and 14 test days
 
-MARKETS = (("AAA-26NOV-X", "AAA", oe.MAKER_FEE_TYPE, 1.0, 0), ("BBB-26NOV-Y", "BBB", "quadratic", 1.0, 2))
+MARKETS = (("AAA-26NOV-X", "AAA", MK, 1.0, 0), ("BBB-26NOV-Y", "BBB", "quadratic", 1.0, 2))
 N_MIN = (19 * 86400 + 1800 + 5400) // 60
 LOW = {date(2026, 11, 16): 0.25, date(2026, 11, 23): 0.3}      # a development and a test day under 80%
 P_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -541,7 +635,7 @@ def generate(path, seed=11):
             mv = min(0.9, max(0.1, (0.8 if moved else 0.2) + rnd.choice((-0.1, 0.0, 0.1))))
             st = state_of(b, imbalance_top=rnd.choice((0.2, 0.3, 0.5, 0.7, 0.8, None)),
                           trades_5m=rnd.choice((0, 1, 2, 3, 4, None)),
-                          mid_change_15m_cents=rnd.choice((-1.0, 0.0, 1.0, None)),
+                          mid_change_15m_cents=rnd.choice((-2.5, -1.0, 0.0, 1.0, 2.0, None)),
                           mid_change_30m_cents=rnd.choice((-1.5, 0.0, 2.0, None)))
             ans = answers(up=rnd.choice(P_LEVELS), down=rnd.choice(P_LEVELS), move=mv, toxic=rnd.choice(P_LEVELS),
                           regime=rnd.choice(("trending", "mean_reverting", "quiet")), qe=rnd.uniform(0.0, 3.0))
@@ -570,12 +664,12 @@ def _minute_near(ts):
 
 def _holes(rds):
     """Each hole in created time: after the last good read g before a `break` read b, the trades from g's start less
-    the 60 s lag to b's start less 150 s (where the read after b asks from) are never read."""
+    90 s (clarification 19) to b's start less 150 s (where the read after b asks from) are never read."""
     out = []
     for b, kind in enumerate(rds):
         if kind == "break":
             g = max(m for m in range(b) if rds[m] != "fail")
-            out.append((START + 60 * g + 2.5 - 60, int(START + 60 * b + 2.5 - 150)))
+            out.append((START + 60 * g + 2.5 - 90, int(START + 60 * b + 2.5 - 150)))
     return out
 
 
@@ -623,23 +717,19 @@ def independent(markets, decisions):
         win = sorted(x for x in m["trades"] if dts < x[0] <= dts + 900)
         if tox_cover and win:
             t1, side = win[0][0], win[0][1]
-            j = math.floor((t1 - START - 2) / 60)          # the latest minute whose book is before the trade
-            while j > i and books[j][0] == "bad":
+            j = math.floor((t1 - START - 2) / 60)          # the latest minute whose book is two-sided and
+            while books[j][0] != "ok":                      # ended before the trade (clarification 7)
                 j -= 1
             before = mid0 if j == i else _mid(books[j])
-            if t1 - (START + 60 * j + 2) <= 90 and before is not None:
+            if t1 - (START + 60 * j + 2) <= 90:
                 after = mid_at(_minute_near(t1 + 900))
                 if after is not None:
                     o["y"]["toxic_15m"] = after > before if side == "yes" else after < before
         c15 = st["mid_change_15m_cents"]
         o["g"]["up_15m"] = o["g"]["down_15m"] = ("unknown" if c15 is None else "up" if c15 > 0 else "down"
                                                  if c15 < 0 else "flat")
-        o["g"]["move_15m"] = "unknown"
-        if mid0 is not None:
-            back = [k for k in range(1, 16) if books[i - k][0] != "bad"]
-            mids = [_mid(books[i - k]) for k in back if _mid(books[i - k]) is not None]
-            if len(back) >= 14 and mids:
-                o["g"]["move_15m"] = "moved" if max(abs(x - mid0) for x in mids) >= sp0 / 2 else "still"
+        o["g"]["move_15m"] = ("unknown" if c15 is None or sp0 is None else      # clarification 23
+                              "moved" if abs(c15) >= sp0 / 2 else "still")
         imb = st["imbalance_top"]
         o["g"]["toxic_15m"] = None if side is None else "unknown" if imb is None else (
             "leans" if (side == "yes" and imb > 0.5) or (side == "no" and imb < 0.5) else "not")
@@ -679,7 +769,7 @@ def independent(markets, decisions):
 
 
 def ind_fee(variant, fee_type, price):
-    if variant == "none" or (variant == "series" and fee_type != oe.MAKER_FEE_TYPE):
+    if variant == "none" or (variant == "series" and fee_type == "quadratic"):   # clarification 20
         return 0.0
     return float(math.ceil(0.0175 * (price / 100) * (1 - price / 100) * 100 - 1e-12))
 
@@ -828,8 +918,10 @@ def test_a_generated_record_is_scored_as_an_independent_calculation_says(generat
             assert g[k] == pytest.approx(w[k], rel=1e-9), (q, k)
         assert g["ranking_95"] == pytest.approx(w["ranking_95"], rel=1e-9), q
         assert g["pass"] == w["pass"], q
+        assert g["seed"] == [20261113, list(ol.BATTERY).index(q)]        # clarification 24
     assert res["judgment"]["toxic_15m"]["left_out_no_cover"] == sum(not o["tox_cover"] for o in test_obs) > 0
     assert res["judgment"]["move_15m"]["pass"] is True                # the generator gave move_15m real skill
+    assert {o["g"]["move_15m"] for o in test_obs} == {"moved", "still", "unknown"}
 
     pw = ind_policy(test_obs)
     pg = res["policy"]
@@ -891,6 +983,7 @@ def test_status_shows_each_day_its_period_and_cover_and_reads_no_answer(generate
     assert " no " in lines["2026-11-16"] and "test " in lines["2026-11-19"] and " no " in lines["2026-11-23"]
     assert "before" in lines["2026-11-13"]
     assert "first full day 2026-11-14" in out and "no tape cover" in out
+    assert "evaluation folder %s (not the default" % (tmp_path / "e") in out
     assert not (tmp_path / "e").exists()                                 # status writes nothing
 
 
@@ -980,6 +1073,49 @@ def test_development_numbers_are_labelled_and_can_be_asked_for_again(generated, 
     es = oe.EvalStore(ev)
     assert es.fit() is None and es.result() is None and len(es.log_entries()) == 2
     es.close()
+
+
+def test_the_fit_waits_one_hour_after_the_fifth_development_day(generated, tmp_path, capsys):
+    path, _, _ = generated
+    last = oe.day_end(date(2026, 11, 18))
+    ev = str(tmp_path / "e")
+    assert run(capsys, "fit", "--db", str(path), "--eval-dir", ev, now=last + 3599)[0] == 2
+    assert run(capsys, "fit", "--db", str(path), "--eval-dir", ev, now=last + 3600)[0] == 0
+
+
+def test_insert_or_replace_is_refused_on_the_evaluations_tables(tmp_path):
+    es = oe.EvalStore(tmp_path / "e")
+    es.put_fit("2026-11-19T01:00:00Z", "r", START, {"questions": {}}, {"a": "b"})
+    es.put_result("2026-12-03T01:00:00Z", "f", "c", {"x": 1})
+    es.log("2026-12-03T01:00:00Z", "score", {})
+    for sql in ("INSERT OR REPLACE INTO fit (id, at, record, collection_start_ts, fitted_json, fitted_sha256, "
+                "code_json, code_sha256) VALUES (1, 'x', 'x', 0, '{}', 'x', '{}', 'x')",
+                "REPLACE INTO result (id, at, fitted_sha256, code_sha256, result_json, result_sha256) "
+                "VALUES (1, 'x', 'x', 'x', '{}', 'x')",
+                "INSERT OR REPLACE INTO log (id, at, command, detail_json) VALUES (1, 'x', 'x', '{}')"):
+        with pytest.raises(sqlite3.DatabaseError):
+            es.conn.execute(sql)
+    assert es.fit()["fitted"] == {"questions": {}} and es.result()["result"] == {"x": 1}
+    assert [e["command"] for e in es.log_entries()] == ["score"]
+    es.log("2026-12-03T02:00:00Z", "score_shown", {})                   # an ordinary append still works
+    es.close()
+
+
+def test_a_record_in_a_read_only_folder_without_its_side_files_is_a_plain_refusal(tmp_path, capsys):
+    folder = tmp_path / "ro"
+    folder.mkdir()
+    p = write_record(folder / "r.sqlite", [one_market(flat_books(60))], [], n_min=60)
+    assert sorted(x.name for x in folder.iterdir()) == ["r.sqlite"]   # no -wal, no -shm
+    before = record_sha(p)
+    os.chmod(folder, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        for cmd in ("status", "fit", "score", "development"):
+            code, out, err = run(capsys, cmd, "--db", str(p), "--eval-dir", str(tmp_path / "e"), now=D0 + 40 * 86400)
+            assert code == 2 and err.startswith("refused:") and "Traceback" not in err + out, (cmd, err)
+            assert "read-only" in err or (cmd == "score" and "fit" in err), err   # score refuses without a fit first
+    finally:
+        os.chmod(folder, stat.S_IRWXU)
+    assert record_sha(p) == before
 
 
 def test_one_writer_at_a_time(tmp_path):
