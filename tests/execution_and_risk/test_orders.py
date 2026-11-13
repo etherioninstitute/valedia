@@ -1,5 +1,10 @@
+import math
+import multiprocessing
+import os
 import random
 import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 
@@ -140,13 +145,15 @@ def test_happy_path_intend_submit_reconcile_fill():
     venue.set("s1-XLE-2026-11-12", state="filled", filled_units=10.0, avg_price=90.5, fee=1.0, raw_status="FILLED")
     venue.held = {"XLE": 10.0}
     clock.t += 30
-    result = led.reconcile(venue, {"XLE": 10.0})
+    result = led.reconcile(venue, {})                               # the book does not hold the new fill yet
     assert result["clean"] and result["orders_checked"] == 1 and result["time"] == clock.t
-    assert result["fills"] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 10.0, "price": 90.5, "fee": 1.0}]
+    assert [core(f) for f in result["fills"]] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 10.0, "price": 90.5, "fee": 1.0}]
     assert result["updated"] == [{"tag": "s1-XLE-2026-11-12", "from": "accepted", "to": "filled"}]
     assert led.order("s1-XLE-2026-11-12")["state"] == "filled"
     assert [(e["from"], e["to"]) for e in led.events("s1-XLE-2026-11-12")] == [
         (None, "intended"), ("intended", "sent"), ("sent", "accepted"), ("accepted", "filled")]
+    assert "not yet applied" in led.blocked()[0]
+    assert led.mark_applied([f["id"] for f in result["fills"]]) == 1
     assert led.blocked() == []
     assert led.last_reconcile()["clean"] is True and led.last_reconcile()["time"] == clock.t
 
@@ -245,9 +252,9 @@ def test_a_venue_that_raises_after_taking_the_order_is_settled_by_reconcile():
     assert led.order("s1-XLE-2026-11-12")["venue_order_id"] == "V-s1-XLE-2026-11-12"
     venue.set("s1-XLE-2026-11-12", state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
     venue.held = {"XLE": 10.0}
-    second = led.reconcile(venue, {"XLE": 10.0})
+    second = led.reconcile(venue, {})
     assert led.order("s1-XLE-2026-11-12")["state"] == "filled" and second["clean"]
-    assert second["fills"] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 10.0, "price": 90.0, "fee": 0.0}]
+    assert [core(f) for f in second["fills"]] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 10.0, "price": 90.0, "fee": 0.0}]
 
 
 def test_a_keyboard_interrupt_leaves_the_order_in_sent():
@@ -449,7 +456,7 @@ def test_partial_fills_are_reported_exactly_once_with_the_price_of_each_incremen
     led.submit_once(venue, "sell")
     venue.set("sell", state="partly_filled", filled_units=4.0, avg_price=100.0, fee=1.0)
     r1 = led.reconcile(venue, {})
-    assert r1["fills"] == [{"tag": "sell", "symbol": "XLE", "units": -4.0, "price": 100.0, "fee": 1.0}]
+    assert [core(f) for f in r1["fills"]] == [{"tag": "sell", "symbol": "XLE", "units": -4.0, "price": 100.0, "fee": 1.0}]
     assert led.order("sell")["state"] == "partly_filled" and led.order("sell")["filled_units"] == 4.0
     r2 = led.reconcile(venue, {})
     assert r2["fills"] == [] and r2["updated"] == []
@@ -507,8 +514,9 @@ def test_position_differences_over_the_union_of_symbols():
     venue.held = {"XLE": 10.0, "SPY": 3.0, "GLD": 1.0}
     result = led.reconcile(venue, {"XLE": 10.0 + 1e-9, "SPY": 2.0, "TLT": 4.0})
     assert not result["clean"]
-    assert result["position_differences"] == {"GLD": {"book": 0.0, "venue": 1.0}, "SPY": {"book": 2.0, "venue": 3.0},
-                                              "TLT": {"book": 4.0, "venue": 0.0}}
+    assert result["position_differences"] == {"GLD": {"book": 0.0, "venue": 1.0, "unapplied": 0.0},
+                                              "SPY": {"book": 2.0, "venue": 3.0, "unapplied": 0.0},
+                                              "TLT": {"book": 4.0, "venue": 0.0, "unapplied": 0.0}}
 
 
 def test_venue_positions_raising_makes_the_reconcile_not_clean_and_says_why():
@@ -646,7 +654,7 @@ def test_filled_with_an_amount_short_of_the_size_is_unresolved_and_the_increase_
     led, venue, _ = _accepted()
     venue.set("s1-XLE-2026-11-12", state="filled", filled_units=7.0, avg_price=90.0, fee=0.7)
     first = led.reconcile(venue, {})
-    assert first["fills"] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 7.0, "price": 90.0, "fee": 0.7}]
+    assert [core(f) for f in first["fills"]] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 7.0, "price": 90.0, "fee": 0.7}]
     assert [u["tag"] for u in first["unresolved"]] == ["s1-XLE-2026-11-12"] and not first["clean"]
     rec = led.order("s1-XLE-2026-11-12")
     assert rec["state"] == "accepted" and rec["filled_units"] == 7.0 and rec["avg_price"] == 90.0 and rec["fee"] == 0.7
@@ -660,6 +668,7 @@ def test_filled_with_no_amount_when_the_stored_total_is_the_whole_size_moves_to_
     venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=10.0, avg_price=90.0, fee=1.0)
     led.reconcile(venue, {})
     venue.set("s1-XLE-2026-11-12", state="filled", filled_units=None, avg_price=None, fee=None)
+    venue.held = {"XLE": 10.0}                                          # the book plus its unapplied fill
     result = led.reconcile(venue, {})
     assert result["fills"] == [] and result["unresolved"] == [] and result["clean"]
     assert result["updated"] == [{"tag": "s1-XLE-2026-11-12", "from": "partly_filled", "to": "filled"}]
@@ -672,6 +681,7 @@ def test_partly_filled_then_a_status_with_no_amount_keeps_the_totals():
     venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
     led.reconcile(venue, {})
     venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=None, avg_price=None, fee=None)
+    venue.held = {"XLE": 4.0}                                           # the book plus its unapplied fill
     result = led.reconcile(venue, {})
     assert result["anomalies"] == [] and result["fills"] == [] and result["clean"]
     rec = led.order("s1-XLE-2026-11-12")
@@ -710,3 +720,437 @@ def test_submit_once_passes_max_age_seconds_to_blocked():
     assert "old" in err.value.reasons[0] and venue.calls == [] and led.order("a")["state"] == "intended"
     assert led.submit_once(venue, "a", max_age_seconds=60)["state"] == "accepted"
     assert led.submit_once(venue, "b")["state"] == "accepted"          # default limit is 6 h
+
+
+# ---- rev 3: several ledgers on one file, durable fills, prices and fees, rechecks
+
+
+CORE = ("tag", "symbol", "units", "price", "fee")
+
+
+def core(fill):
+    return {k: fill[k] for k in CORE}
+
+
+class FileVenue:
+    """A venue for child processes: every submit appends one line to `calls` in its directory."""
+    name = "file"
+
+    def __init__(self, directory):
+        self.calls = Path(directory) / "calls"
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        fd = os.open(self.calls, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        try:
+            os.write(fd, f"{os.getpid()} {tag}\n".encode())
+        finally:
+            os.close(fd)
+        time.sleep(0.002)
+        return {"status": "accepted", "venue_order_id": "V"}
+
+    def order_status(self, tag):
+        return None
+
+    def positions(self):
+        return {}
+
+
+def _race_worker(paths, barrier, errors):
+    for path in paths:
+        try:
+            barrier.wait(timeout=30)
+            led = OrderLedger(path)
+            try:
+                led.submit_once(FileVenue(Path(path).parent), "race")
+            except OrdersBlocked:
+                pass                                         # the other process's order is in flight: no call
+            led.close()
+        except BaseException as exc:                         # every failure is reported to the parent
+            Path(errors, f"{os.getpid()}-{Path(path).parent.name}").write_text(f"{type(exc).__name__}: {exc}")
+
+
+def test_two_processes_racing_submit_once_make_one_venue_call_in_every_trial(tmp_path):
+    trials = 50
+    paths = []
+    for i in range(trials):
+        d = tmp_path / f"t{i}"
+        led = OrderLedger(d / "orders.sqlite")
+        led.reconcile(FileVenue(d), {})
+        led.intend("race", "XLE", 10.0, 90.0)
+        led.close()
+        paths.append(str(d / "orders.sqlite"))
+    errors = tmp_path / "errors"
+    errors.mkdir()
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    procs = [ctx.Process(target=_race_worker, args=(paths, barrier, str(errors))) for _ in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+    assert [p.exitcode for p in procs] == [0, 0]
+    assert sorted(e.read_text() for e in errors.iterdir()) == []
+    counts = [len((Path(p).parent / "calls").read_text().splitlines()) if (Path(p).parent / "calls").exists() else 0
+              for p in paths]
+    assert counts == [1] * trials
+    for p in paths:
+        led = OrderLedger(p)
+        assert led.order("race")["state"] == "accepted"
+        assert [(e["from"], e["to"]) for e in led.events("race")] == [(None, "intended"), ("intended", "sent"), ("sent", "accepted")]
+        led.close()
+
+
+def test_a_stale_object_cannot_move_an_order_backwards(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    clock = Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+
+    def b_settles_it(tag):                                   # while a's submit is in flight, b reconciles it to filled
+        venue.set(tag, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+        b.reconcile(venue, {})
+
+    venue = FakeVenue(mode="accept")
+    ready(a, venue)
+    intend(a)
+    venue.on_submit = lambda tag: (venue._take("XLE", 10.0, tag), b_settles_it(tag))
+    venue.mode = "raise"                                    # a then sees an exception: must not write unknown over filled
+    rec = a.submit_once(venue, "s1-XLE-2026-11-12")
+    assert rec["state"] == "filled" and a.order("s1-XLE-2026-11-12")["state"] == "filled"
+    assert [(e["from"], e["to"]) for e in a.events("s1-XLE-2026-11-12")] == [
+        (None, "intended"), ("intended", "sent"), ("sent", "filled")]
+    assert len(venue.calls) == 1
+
+
+def test_a_stale_accepted_result_does_not_overwrite_a_fill(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    clock = Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(mode="accept")
+    ready(a, venue)
+    intend(a)
+
+    def settle(tag):
+        venue._take("XLE", 10.0, tag)
+        venue.set(tag, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+        b.reconcile(venue, {})
+
+    venue.on_submit = settle
+    assert a.submit_once(venue, "s1-XLE-2026-11-12")["state"] == "filled"
+    assert a.events("s1-XLE-2026-11-12")[-1]["to"] == "filled"
+
+
+class RacingVenue(FakeVenue):
+    """On the first status call, another ledger reconciles first (it finishes before this one goes on)."""
+
+    def __init__(self):
+        super().__init__()
+        self.other = None
+        self.other_result = None
+
+    def order_status(self, tag):
+        got = super().order_status(tag)
+        other, self.other = self.other, None
+        if other is not None:
+            self.other_result = other.reconcile(self, {})
+        return got
+
+
+def test_two_reconciles_racing_create_one_fill_row(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    clock = Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = RacingVenue()
+    ready(a, venue)
+    intend(a)
+    a.submit_once(venue, "s1-XLE-2026-11-12")
+    venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
+    venue.other = b
+    first = a.reconcile(venue, {})
+    assert first["fills"] == []
+    rows = a.fills()
+    assert len(rows) == 1 and core(rows[0]) == {"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 4.0, "price": 90.0, "fee": 0.4}
+    assert [f["id"] for f in venue.other_result["fills"]] == [rows[0]["id"]]
+
+
+def test_a_non_numeric_average_on_one_order_does_not_lose_the_others_fills():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    for t in ("a", "b", "c"):
+        intend(led, tag=t)
+        led.submit_once(venue, t)
+    venue.set("a", state="partly_filled", filled_units=2.0, avg_price=90.0, fee=0.1)
+    venue.set("b", state="partly_filled", filled_units=3.0, avg_price="ninety", fee=0.1)
+    venue.set("c", state="partly_filled", filled_units=5.0, avg_price=91.0, fee=0.2)
+    clock.t += 5
+    result = led.reconcile(venue, {})
+    assert [f["tag"] for f in result["fills"]] == ["a", "c"] and not result["clean"]
+    assert [x["tag"] for x in result["anomalies"]] == ["b"]
+    assert led.order("b")["filled_units"] == 0.0 and led.order("b")["state"] == "accepted"
+    assert led.last_reconcile()["time"] == clock.t and len(led.last_reconcile()["summary"]["fills"]) == 2
+    assert [f["tag"] for f in led.unapplied_fills()] == ["a", "c"]
+
+
+@pytest.mark.parametrize("field, value", [("avg_price", float("nan")), ("fee", float("inf")), ("filled_units", "4"),
+                                          ("fee", "x"), ("filled_units", float("nan"))])
+def test_a_present_but_non_finite_number_is_an_anomaly_and_changes_nothing(field, value):
+    led, venue, _ = _accepted()
+    venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
+    venue.set("s1-XLE-2026-11-12", **{field: value})
+    before = led.order("s1-XLE-2026-11-12")
+    result = led.reconcile(venue, {})
+    assert [x["tag"] for x in result["anomalies"]] == ["s1-XLE-2026-11-12"] and result["fills"] == []
+    assert led.order("s1-XLE-2026-11-12") == before and led.fills() == []
+
+
+def test_fee_and_price_sequences_with_reports_that_lack_them():
+    led, venue, _ = _accepted()
+    tag = "s1-XLE-2026-11-12"
+    venue.set(tag, state="partly_filled", filled_units=4.0, avg_price=100.0, fee=1.0)
+    (f1,) = led.reconcile(venue, {})["fills"]
+    venue.set(tag, state="partly_filled", filled_units=6.0, avg_price=None, fee=None)
+    (f2,) = led.reconcile(venue, {})["fills"]
+    venue.set(tag, state="filled", filled_units=10.0, avg_price=110.0, fee=3.0)
+    (f3,) = led.reconcile(venue, {})["fills"]
+    assert [f["units"] for f in (f1, f2, f3)] == [4.0, 2.0, 4.0]
+    assert [f["fee"] for f in (f1, f2, f3)] == [1.0, None, 2.0]
+    assert f1["price"] == 100.0 and f1["price_covers_units"] == 4.0
+    assert f2["price"] is None and f2["price_covers_units"] is None
+    assert f3["price"] == pytest.approx(116.66666666666667) and f3["price_covers_units"] == 6.0
+    priced = [f for f in (f1, f2, f3) if f["price"] is not None]
+    assert sum(f["price"] * f["price_covers_units"] for f in priced) == pytest.approx(110.0 * 10)
+    assert sum(f["price_covers_units"] for f in priced) == 10.0
+    rec = led.order(tag)
+    assert rec["state"] == "filled" and rec["fee"] == 3.0 and rec["avg_price"] == 110.0
+    assert [f["id"] for f in led.fills(tag)] == sorted(f["id"] for f in (f1, f2, f3))
+
+
+def test_fee_increases_sum_to_the_last_fee_total_over_random_sequences():
+    rng = random.Random(7)
+    for _ in range(200):
+        led, venue, _ = _accepted()
+        tag, total, last_fee, last_avg_point = "s1-XLE-2026-11-12", 0.0, None, None
+        while total < 10.0:
+            total = min(10.0, total + rng.choice([0.5, 1.0, 2.5]))
+            fee = None if rng.random() < 0.4 else round(rng.uniform(0, 1), 3) + (last_fee or 0.0)
+            avg = None if (rng.random() < 0.4 and total < 10.0) else round(rng.uniform(90, 110), 2)
+            last_fee = fee if fee is not None else last_fee
+            last_avg_point = (total, avg) if avg is not None else last_avg_point
+            venue.set(tag, state="filled" if total >= 10.0 else "partly_filled", filled_units=total, avg_price=avg, fee=fee)
+            led.reconcile(venue, {})
+        rows = led.fills(tag)
+        assert math.fsum(r["units"] for r in rows) == pytest.approx(10.0)
+        assert math.fsum(r["fee"] for r in rows if r["fee"] is not None) == pytest.approx(last_fee or 0.0)
+        priced = [r for r in rows if r["price"] is not None]
+        assert math.fsum(r["price"] * r["price_covers_units"] for r in priced) == pytest.approx(last_avg_point[1] * 10.0)
+        assert math.fsum(r["price_covers_units"] for r in priced) == pytest.approx(10.0)
+
+
+def test_unapplied_fills_mark_applied_and_the_blocked_reason():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    intend(led, tag="a")
+    intend(led, tag="b")
+    led.submit_once(venue, "a")
+    led.submit_once(venue, "b")
+    venue.set("a", state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+    venue.set("b", state="partly_filled", filled_units=3.0, avg_price=91.0, fee=0.0)
+    venue.held = {"XLE": 13.0}
+    result = led.reconcile(venue, {})
+    assert result["clean"]
+    reasons = led.blocked()
+    assert len(reasons) == 1 and "2 fills" in reasons[0] and "applied" in reasons[0]
+    ids = [f["id"] for f in led.unapplied_fills()]
+    assert ids == sorted(ids) and [f["tag"] for f in led.unapplied_fills()] == ["a", "b"]
+    assert led.mark_applied(ids[:1]) == 1
+    assert "1 fill " in led.blocked()[0]
+    assert led.mark_applied(ids) == 1 and led.mark_applied(ids) == 0 and led.mark_applied([999_999]) == 0
+    assert led.unapplied_fills() == [] and led.blocked() == []
+    assert all(f["applied"] == 1 and f["applied_time"] == clock.t for f in led.fills())
+
+
+def test_the_position_comparison_counts_unapplied_fills():
+    led, venue, _ = _accepted()
+    venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 4.0}
+    assert led.reconcile(venue, {})["clean"]                            # the book does not hold the fill yet
+    wrong = led.reconcile(venue, {"XLE": 4.0})                           # holding it and an unapplied row counts it twice
+    assert not wrong["clean"] and wrong["position_differences"]["XLE"]["venue"] == 4.0
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    assert led.reconcile(venue, {"XLE": 4.0})["clean"]
+
+
+def test_a_clock_behind_the_latest_reconcile_blocks():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    clock.t -= 1
+    reasons = led.blocked()
+    assert len(reasons) == 1 and "clock is behind" in reasons[0]
+
+
+def test_a_never_arrived_order_that_later_appears_is_an_anomaly_moves_and_creates_its_fills(tmp_path):
+    clock = Clock()
+    led, venue = _crash_and_reopen(tmp_path, "crash_before", clock)
+    clock.t += 121
+    led.reconcile(venue, {})
+    assert led.order("s1-XLE-2026-11-12")["state"] == "never_arrived"
+    venue._take("XLE", 10.0, "s1-XLE-2026-11-12")                     # the venue was slow: it shows up after all
+    venue.set("s1-XLE-2026-11-12", state="filled", filled_units=10.0, avg_price=90.0, fee=0.5)
+    clock.t += 3600
+    result = led.reconcile(venue, {})
+    assert not result["clean"] and [a["tag"] for a in result["anomalies"]] == ["s1-XLE-2026-11-12"]
+    assert led.order("s1-XLE-2026-11-12")["state"] == "filled"
+    assert [core(f) for f in result["fills"]] == [{"tag": "s1-XLE-2026-11-12", "symbol": "XLE", "units": 10.0, "price": 90.0, "fee": 0.5}]
+    last = led.events("s1-XLE-2026-11-12")[-1]
+    assert (last["from"], last["to"]) == ("never_arrived", "filled") and "never arrived" in last["note"]
+
+
+def test_a_never_arrived_order_that_does_not_appear_is_left_alone_and_stops_being_asked(tmp_path):
+    clock = Clock()
+    led, venue = _crash_and_reopen(tmp_path, "crash_before", clock)
+    clock.t += 121
+    led.reconcile(venue, {})
+    venue.status_calls.clear()
+    clock.t += 86400
+    result = led.reconcile(venue, {})
+    assert result["clean"] and venue.status_calls == ["s1-XLE-2026-11-12"] and result["unresolved"] == []
+    clock.t += 259200 - 86400 + 1                                        # just over 3 days after it was marked
+    venue.status_calls.clear()
+    assert led.reconcile(venue, {})["clean"] and venue.status_calls == []
+    assert led.order("s1-XLE-2026-11-12")["state"] == "never_arrived"
+
+
+def test_settle_by_hand_moves_an_unknown_order_to_never_arrived_and_the_recheck_still_applies():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue(mode="raise")
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, "s1-XLE-2026-11-12")
+    with pytest.raises(OrderError):
+        led.settle_by_hand("s1-XLE-2026-11-12", "", "looked in the app")
+    with pytest.raises(OrderError):
+        led.settle_by_hand("s1-XLE-2026-11-12", "Burton", " ")
+    rec = led.settle_by_hand("s1-XLE-2026-11-12", "Burton", "not in the Webull app's order list")
+    assert rec["state"] == "never_arrived"
+    last = led.events("s1-XLE-2026-11-12")[-1]
+    assert (last["from"], last["to"]) == ("unknown", "never_arrived")
+    assert "Burton" in last["note"] and "not in the Webull app's order list" in last["note"]
+    assert led.reconcile(venue, {})["clean"] and led.blocked() == []
+    with pytest.raises(OrderError):
+        led.settle_by_hand("s1-XLE-2026-11-12", "Burton", "again")
+    venue._take("XLE", 10.0, "s1-XLE-2026-11-12")
+    assert not led.reconcile(venue, {})["clean"] and led.order("s1-XLE-2026-11-12")["state"] == "accepted"
+
+
+def test_settle_by_hand_refuses_an_order_whose_fate_is_known():
+    led, venue, _ = _accepted()
+    with pytest.raises(OrderError):
+        led.settle_by_hand("s1-XLE-2026-11-12", "Burton", "x")
+    with pytest.raises(OrderError):
+        led.settle_by_hand("nope", "Burton", "x")
+
+
+@pytest.mark.parametrize("held, book", [({"XLE": float("nan")}, {"XLE": 1.0}), ({"XLE": 1.0}, {"XLE": float("nan")}),
+                                        ({"XLE": "ten"}, {}), ({}, {"XLE": None})])
+def test_a_position_that_is_not_a_finite_number_is_a_difference(held, book):
+    led, venue = ledger(), FakeVenue()
+    venue.held = held
+    result = led.reconcile(venue, book)
+    assert not result["clean"] and list(result["position_differences"]) == ["XLE"]
+
+
+def test_intend_refuses_an_order_below_the_size_floor():
+    led = ledger()
+    with pytest.raises(OrderError):
+        intend(led, tag="tiny", units=5e-10)
+    with pytest.raises(OrderError):
+        intend(led, tag="tiny2", units=-9.9e-9)
+    assert intend(led, tag="small", units=1e-8)["units"] == 1e-8
+
+
+def test_a_tiny_order_called_filled_with_nothing_filled_is_unresolved():
+    led, venue = ledger(), FakeVenue()
+    ready(led, venue)
+    intend(led, tag="small", units=1e-8)
+    led.submit_once(venue, "small")
+    venue.set("small", state="filled", filled_units=0.0)
+    result = led.reconcile(venue, {})
+    assert [u["tag"] for u in result["unresolved"]] == ["small"] and led.order("small")["state"] == "accepted"
+
+
+def test_the_fill_tolerance_is_relative_to_the_order_size_at_1e8_units():
+    led, venue = ledger(), FakeVenue()
+    ready(led, venue)
+    intend(led, tag="big", units=1e8)
+    intend(led, tag="big2", units=1e8)
+    led.submit_once(venue, "big")
+    led.submit_once(venue, "big2")
+    venue.set("big", state="filled", filled_units=math.nextafter(1e8, math.inf), avg_price=1.0)
+    venue.set("big2", state="filled", filled_units=1e8 * (1 - 1e-10), avg_price=1.0)
+    venue.held = {"XLE": 2e8}
+    result = led.reconcile(venue, {})
+    assert result["anomalies"] == [] and result["unresolved"] == []
+    assert led.order("big")["state"] == "filled" and led.order("big2")["state"] == "filled"
+
+
+def test_an_exception_whose_str_raises_still_gives_unknown():
+    class BadStr(Exception):
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    class Venue(FakeVenue):
+        def submit(self, *a, **k):
+            self.calls.append(a)
+            raise BadStr()
+
+    led, venue = ledger(), Venue()
+    ready(led, venue)
+    intend(led)
+    rec = led.submit_once(venue, "s1-XLE-2026-11-12")
+    assert rec["state"] == "unknown" and rec["note"].startswith("BadStr")
+
+
+def test_fill_rows_can_only_be_marked_applied(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    led, venue, _ = _accepted()
+    led = ledger(path)
+    venue = FakeVenue()
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, "s1-XLE-2026-11-12")
+    venue.set("s1-XLE-2026-11-12", state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    (row,) = led.fills()
+    raw = sqlite3.connect(str(path))
+    for sql in ("UPDATE fills SET units = 5", "DELETE FROM fills", "UPDATE fills SET applied = 1, price = 1"):
+        with pytest.raises(sqlite3.DatabaseError):
+            raw.execute(sql)
+    raw.rollback()
+    raw.close()
+    assert led.mark_applied([row["id"]]) == 1
+    raw = sqlite3.connect(str(path))
+    with pytest.raises(sqlite3.DatabaseError):
+        raw.execute("UPDATE fills SET applied = 0")
+    raw.close()
+
+
+def test_a_ledger_file_from_rev_2_gains_what_is_missing_on_open(tmp_path):
+    path = tmp_path / "old.sqlite"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, reference_price REAL NOT NULL, "
+        "limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, created REAL NOT NULL, sent_at REAL, updated REAL NOT NULL, "
+        "venue TEXT, venue_order_id TEXT, filled_units REAL NOT NULL DEFAULT 0, avg_price REAL, fee REAL, raw_status TEXT, note TEXT);"
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT NOT NULL, time REAL NOT NULL, from_state TEXT, "
+        "to_state TEXT NOT NULL, note TEXT);"
+        "CREATE TABLE reconciles (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, clean INTEGER NOT NULL, summary TEXT NOT NULL);"
+        "INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES ('old', 'XLE', 10, 90, 'accepted', 1, 1);")
+    raw.close()
+    led, venue = ledger(path), FakeVenue()
+    venue._take("XLE", 10.0, "old")
+    venue.set("old", state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 10.0}
+    result = led.reconcile(venue, {})
+    assert result["clean"] and [core(f) for f in result["fills"]] == [{"tag": "old", "symbol": "XLE", "units": 10.0, "price": 90.0, "fee": 0.0}]
