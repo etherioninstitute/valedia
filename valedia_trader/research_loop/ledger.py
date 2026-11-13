@@ -171,26 +171,36 @@ class HypothesisLedger:
         return int(cur.lastrowid)
 
     def set_status(self, hypothesis_id: int, status: str, reason: str = "", source: str = "system") -> None:
+        """Change the idea's status and write the reason, in one transaction: a kill at any point leaves both or neither."""
         if status not in STATUSES:
             raise ValueError(f"status must be one of {STATUSES}")
         self.get(hypothesis_id)
-        self._db.execute("UPDATE hypotheses SET status = ? WHERE id = ?", (status, int(hypothesis_id)))
+        try:
+            self._db.execute("UPDATE hypotheses SET status = ? WHERE id = ?", (status, int(hypothesis_id)))
+            if reason:
+                self._lesson_rows(hypothesis_id, f"status -> {status}: {reason}", source)
+        except BaseException:
+            self._db.rollback()
+            raise
         self._db.commit()
-        if reason:
-            self.add_lesson(hypothesis_id, f"status -> {status}: {reason}", source)
 
     def add_lesson(self, hypothesis_id: int | None, lesson: str, source: str = "critic") -> None:
         """Append a dated lesson to the idea (and to `findings`). Lessons are only ever added."""
+        if self._lesson_rows(hypothesis_id, lesson, source):
+            self._db.commit()
+
+    def _lesson_rows(self, hypothesis_id: int | None, lesson: str, source: str) -> bool:
+        """Write a lesson's rows without committing. False (nothing written) for an empty lesson."""
         lesson = " ".join(str(lesson).split())
         if not lesson:
-            return
+            return False
         stamp = _now()
         self._db.execute("INSERT INTO findings (hypothesis_id, source, finding, recorded_at) VALUES (?, ?, ?, ?)",
                          (hypothesis_id, source, lesson, stamp))
         if hypothesis_id is not None:
             self._db.execute("UPDATE hypotheses SET lessons_learned = lessons_learned || ? WHERE id = ?",
                              (f"[{stamp[:10]} {source}] {lesson}\n", int(hypothesis_id)))
-        self._db.commit()
+        return True
 
     def findings(self, hypothesis_id: int | None = None) -> list[dict]:
         sql, args = "SELECT * FROM findings", ()

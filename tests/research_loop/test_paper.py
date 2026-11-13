@@ -902,3 +902,271 @@ def test_reset_latch_on_a_directory_says_it_is_a_directory(setup):
     with pytest.raises(pp.LatchResetError) as err:
         t.reset_latch("burton", "2026-03-02")
     assert "directory" in str(err.value) and str(t.latch_file) in str(err.value) and "\n" not in str(err.value)
+
+
+# ---- T29: a held fund with no price that day is valued at its last price, never at nothing; it is not traded; the
+# book adds up every day
+
+def _adds_up(summaries, start=100_000.0):
+    """Invariant 3: the strategies' value changes sum to the book's equity change, every day, to relative 1e-9."""
+    previous = start
+    for s in summaries:
+        change = sum(s["strategy_value_change"].values())
+        assert abs(change - (s["equity"] - previous)) <= 1e-9 * max(1.0, abs(s["equity"])), s["day"]
+        previous = s["equity"]
+
+
+def _held_now(t):
+    return {sym for book in t.state["positions"].values() for sym, lot in book.items() if lot["units"]}
+
+
+def _schedule_rules(schedules):
+    """A `run_rules` stand-in: strategy `name`'s target weights on bar i are `schedules[name][i]`."""
+    def run(s, prices):
+        w = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        for sym, weight in schedules[s.name][len(prices) - 1].items():
+            w.iloc[-1, w.columns.get_loc(sym)] = weight
+        return w, []
+    return run
+
+
+GAP_KINDS = ("one day", "several days", "several funds", "first day held", "last day")
+LEVELS = (-0.4, 0.0, 0.4)                     # weight steps of 0.4 against a 15% no-trade band: trades happen only when a
+                                              # schedule changes, never from drift
+
+
+def _gap_history(seed):
+    """A seeded history: 2 to 4 funds, 1 to 3 scripted strategies joining on decision days, and gaps of the seed's kind
+    (and maybe a second kind) placed where neither history would trade the fund: never on a decision day or the day its
+    orders fill. Returns prices with gaps, the same prices gap-filled with the last known price, the schedules, the join
+    days, the gaps by day and the kinds used."""
+    rng = np.random.default_rng(seed)
+    k, n = int(rng.integers(2, 5)), int(rng.integers(16, 23))
+    funds = [f"G{i}" for i in range(k)]
+    px = pd.DataFrame({f: 50 * np.exp(np.cumsum(0.012 * rng.standard_normal(n))) for f in funds},
+                      index=pd.bdate_range("2026-02-02", periods=n))
+    decide = [0]
+    while decide[-1] + 6 < n - 2 and len(decide) < 4:
+        decide.append(decide[-1] + int(rng.integers(3, 6)))
+    busy = set(decide) | {d + 1 for d in decide}
+    names = [f"strat_{j}" for j in range(int(rng.integers(1, 4)))]
+    joins = {names[0]: 0, **{nm: int(rng.choice(decide)) for nm in names[1:]}}
+    markets, schedules = {}, {}
+    for nm in names:
+        markets[nm] = sorted(rng.choice(funds, size=int(rng.integers(1, k + 1)), replace=False).tolist())
+        weights, now = [], {f: 0.0 for f in markets[nm]}
+        for i in range(n):
+            if i in decide and i >= joins[nm]:
+                now = {f: float(rng.choice(LEVELS)) for f in markets[nm]}
+                if i == joins[nm] and not any(now.values()):
+                    now[markets[nm][0]] = 0.4                      # every strategy holds something from its first day
+            weights.append(dict(now))
+        schedules[nm] = weights
+    free = [i for i in range(1, n) if i not in busy]
+    gaps: dict[int, set[str]] = {}
+    kinds = [GAP_KINDS[seed % len(GAP_KINDS)]] + ([str(rng.choice(GAP_KINDS))] if rng.random() < 0.5 else [])
+    used = []
+    for kind in kinds:
+        if kind == "one day":
+            gaps.setdefault(int(rng.choice(free)), set()).add(str(rng.choice(funds)))
+        elif kind == "several days":
+            start, f = int(rng.choice(free)), str(rng.choice(funds))
+            for i in range(start, min(n, start + int(rng.integers(2, 5)))):
+                if i in free:
+                    gaps.setdefault(i, set()).add(f)
+        elif kind == "several funds":
+            gaps.setdefault(int(rng.choice(free)), set()).update(rng.choice(funds, size=min(k, int(rng.integers(2, 4))), replace=False).tolist())
+        elif kind == "first day held":
+            held = [(min(i for i in decide if any(schedules[nm][i].get(f) for nm in names)) + 2, f) for f in funds
+                    if any(schedules[nm][i].get(f) for nm in names for i in decide)]
+            held = [(i, f) for i, f in held if i in free]
+            if not held:
+                continue
+            i, f = held[int(rng.integers(len(held)))]
+            gaps.setdefault(i, set()).add(f)
+        elif kind == "last day" and n - 1 in free:
+            gaps.setdefault(n - 1, set()).add(str(rng.choice(funds)))
+        else:
+            continue
+        used.append(kind)
+    gapped = px.copy()
+    for i, fs in gaps.items():
+        for f in fs:
+            gapped.iloc[i, gapped.columns.get_loc(f)] = np.inf if rng.random() < 0.2 else np.nan
+    filled = gapped.where(np.isfinite(gapped)).ffill()
+    strategies = {nm: long_only(nm, market=tuple(markets[nm])) for nm in names}
+    return gapped, filled, schedules, joins, strategies, gaps, used
+
+
+def _run(directory, limits, frame, strategies, joins, after_step=None):
+    t = pp.PaperTrader(directory, limits, halt_file=None, min_trade_pct=0.15)
+    out = []
+    for i in range(len(frame)):
+        active = {j + 1: s for j, (nm, s) in enumerate(strategies.items()) if joins[nm] <= i}
+        out.append(t.step(frame.iloc[: i + 1], active))
+        if after_step is not None:
+            after_step(t, i, out[-1])
+    return t, out
+
+
+SAME = ("equity", "strategy_values", "strategy_value_change", "capital_per_strategy", "benchmark_values", "daily_loss_pct",
+        "drawdown_pct", "open_positions", "orders_placed", "orders_blocked")
+
+
+@pytest.mark.parametrize("block", range(6))
+def test_a_history_with_price_gaps_values_the_book_exactly_as_the_same_history_gap_filled(setup, tmp_path, monkeypatch, block):
+    """Invariants 1 to 3 on 300 seeded histories (50 a block), every gap kind, against the same history gap-filled. The
+    limits refuse nothing here: a refused order is retried every day, on a gap day too, and that retry is a decision about
+    a fund without a price, which the history with gaps rightly never makes."""
+    limits = tmp_path / "loose.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 90.0, "max_drawdown_pct": 90.0, "max_position_pct": 1.0, "max_open_positions": 20}))
+    kinds: dict[str, int] = {}
+    carried = 0
+    for seed in range(block * 50, block * 50 + 50):
+        gapped, filled, schedules, joins, strategies, gaps, used = _gap_history(seed)
+        for kind in used:
+            kinds[kind] = kinds.get(kind, 0) + 1
+        monkeypatch.setattr(pp, "run_rules", _schedule_rules(schedules))
+        stale_seen = {}
+
+        def check(t, i, summary):
+            stale_seen[i] = (sorted(_held_now(t) & gaps.get(i, set())), summary.get("stale_prices"))
+
+        tg, a = _run(tmp_path / f"gap{seed}", limits, gapped, strategies, joins, after_step=check)
+        tf, b = _run(tmp_path / f"filled{seed}", limits, filled, strategies, joins)
+        for x, y in zip(a, b):
+            assert {key: x[key] for key in SAME} == {key: y[key] for key in SAME}, (seed, x["day"], used)
+            assert x["orders_blocked"] == 0
+            assert "stale_prices" not in y
+        _adds_up(a)
+        _adds_up(b)
+        for t in (tg, tf):                                          # nothing traded a gapped fund on its gap day
+            for e in t.journal.read():
+                i = gapped.index.get_loc(pd.Timestamp(e["day"]))
+                if e.get("symbol") in gaps.get(i, set()):
+                    assert e["type"] not in ("fill", "decision"), (seed, e)
+        assert tg.state["positions"] == tf.state["positions"] and tg.state["cash"] == tf.state["cash"]
+        for i, (want, named) in stale_seen.items():                 # named when not empty, and only then
+            assert named == (want or None), (seed, i)
+        carried += sum(bool(want) for want, _ in stale_seen.values())
+    assert all(kinds.get(kind, 0) >= 8 for kind in GAP_KINDS), kinds
+    assert carried >= 40, carried                                  # the gaps did fall on held funds, many times
+
+
+def _two_funds_one_day_gap(setup, monkeypatch, fill_gap=False, **kw):
+    """AAA and BBB; the strategy buys both on bar 30, they fill on bar 31; BBB has no price on bar 33."""
+    px = scripted_market()
+    px["BBB"] = 50.0 + np.arange(len(px)) * 0.25
+    if not fill_gap:
+        px.iloc[DAY0 + 3, px.columns.get_loc("BBB")] = np.nan
+    else:
+        px.iloc[DAY0 + 3, px.columns.get_loc("BBB")] = px["BBB"].iloc[DAY0 + 2]
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t = no_costs(setup, min_trade_pct=0.15, **kw)
+    s = long_only("two", market=("AAA", "BBB"))
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(5)]
+    return t, out, px
+
+
+def test_a_held_fund_with_no_price_keeps_its_last_price_in_equity_strategy_value_and_capital(setup, monkeypatch, tmp_path):
+    t, out, px = _two_funds_one_day_gap(setup, monkeypatch)
+    lots = t.state["positions"]["two"]
+    gap = out[3]
+    carried = float(px["BBB"].iloc[DAY0 + 2])                      # the last price the book used for BBB
+    assert gap["equity"] == pytest.approx(out[2]["equity"] + lots["AAA"]["units"] * (float(px["AAA"].iloc[DAY0 + 3]) - float(px["AAA"].iloc[DAY0 + 2])))
+    assert gap["strategy_values"]["two"] == pytest.approx(lots["AAA"]["units"] * (float(px["AAA"].iloc[DAY0 + 3]) - lots["AAA"]["cost"])
+                                                          + lots["BBB"]["units"] * (carried - lots["BBB"]["cost"]))
+    assert gap["capital_per_strategy"] == gap["equity"]
+    _adds_up(out)
+    assert gap["stale_prices"] == ["BBB"] and all("stale_prices" not in o for i, o in enumerate(out) if i != 3)
+    twin, filled, _ = _two_funds_one_day_gap(setup, monkeypatch, fill_gap=True, directory=tmp_path / "filled")
+    assert [o["equity"] for o in out] == [o["equity"] for o in filled]
+    assert [o["benchmark_values"] for o in out] == [o["benchmark_values"] for o in filled]
+
+
+def test_on_a_day_with_no_price_the_fund_is_not_traded_and_its_order_waits(setup, monkeypatch, tmp_path):
+    """Invariant 2: AAA and BBB are bought on bar 30; BBB has no price on bar 31, the fill day. BBB's order stays pending,
+    no fill, no tax lot, no realised result; its wanted units are carried; AAA fills as usual; BBB fills on bar 32."""
+    px = scripted_market()
+    px["BBB"] = 50.0 + np.arange(len(px)) * 0.25
+    px.iloc[DAY0 + 1, px.columns.get_loc("BBB")] = np.nan
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t, s = no_costs(setup, tax_rules=RULES, min_trade_pct=0.15), long_only("two", market=("AAA", "BBB"))
+    t.step(px.iloc[: DAY0 + 1], {7: s})
+    wanted = t.wanted_units()
+    day1 = t.step(px.iloc[: DAY0 + 2], {7: s})
+    fills = [e for e in t.journal.read() if e["type"] == "fill"]
+    assert [f["symbol"] for f in fills] == ["AAA"]
+    assert [o["symbol"] for o in t.state["pending"]] == ["BBB"] and t.wanted_units() == wanted
+    assert t.state["positions"]["two"]["BBB"]["units"] == 0.0 and t.state["realized"]["two"] == 0.0
+    assert t.tax_ledger.open_lots("BBB") == [] and len(t.tax_ledger.open_lots("AAA")) == 1
+    assert not any(e.get("symbol") == "BBB" for e in t.journal.read(since=px.index[DAY0 + 1]) if e["type"] == "decision")
+    assert "stale_prices" not in day1                               # BBB was not held yet: nothing carried
+    t.step(px.iloc[: DAY0 + 3], {7: s})
+    bbb = [e for e in t.journal.read() if e["type"] == "fill" and e["symbol"] == "BBB"]
+    assert len(bbb) == 1 and bbb[0]["price"] == pytest.approx(float(px["BBB"].iloc[DAY0 + 2])) and t.state["pending"] == []
+
+
+def test_a_held_fund_with_no_earlier_price_in_the_data_is_valued_at_its_cost(setup, monkeypatch):
+    t, out, px = _two_funds_one_day_gap(setup, monkeypatch)
+    lot = t.state["positions"]["two"]["BBB"]
+    blank = px.iloc[: DAY0 + 6].copy()
+    blank["BBB"] = np.nan                                           # a frame that has no price for BBB at all
+    later = t.step(blank, {7: long_only("two", market=("AAA", "BBB"))})
+    aaa = t.state["positions"]["two"]["AAA"]
+    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * lot["cost"])
+    _adds_up(out + [later])
+    assert later["stale_prices"] == ["BBB"]
+
+
+class _Clock(pp.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return pp.datetime(2026, 1, 1, tzinfo=tz)
+
+
+def _plain_history(seed, directory, limits):
+    """A gap-free seeded history with real momentum strategies (long-only and long-short) joining on different days and
+    a restart from the state file half-way; returns the bytes of every journal file, the state file and the summaries."""
+    rng = np.random.default_rng(seed)
+    funds = [f"P{i}" for i in range(int(rng.integers(2, 4)))]
+    n = int(rng.integers(24, 32))
+    px = pd.DataFrame({f: 80 * np.exp(np.cumsum(float(rng.normal(0, 0.004)) + 0.015 * rng.standard_normal(n))) for f in funds},
+                      index=pd.bdate_range("2026-03-02", periods=n))
+    strategies = {}
+    for j in range(int(rng.integers(1, 4))):
+        strategies[j + 1] = (int(rng.integers(11, 16)), st.RuleStrategy.from_spec({
+            "name": f"mom_{j}", "version": "1.0.0", "hypothesis": "Assets that rose over ten days keep rising",
+            "market": sorted(rng.choice(funds, size=int(rng.integers(1, len(funds) + 1)), replace=False).tolist()),
+            "entry": {"rule": "momentum", "lookback": int(rng.integers(5, 11)), "enter": float(rng.choice([0.01, 0.02, 0.03])),
+                      "exit": float(rng.choice([0.0, -0.01])), "direction": str(rng.choice(["both", "long"]))},
+            "sizing": {"rule": "equal"}, "risk": {"max_position_pct": float(rng.choice([0.3, 0.5])), "max_open_positions": 3,
+                                                   "stop_loss_pct": None}}))
+    kw = {"fee_bps": float(rng.choice([0.0, 1.0, 5.0])), "slippage_bps": float(rng.choice([0.0, 2.0])),
+          "min_trade_pct": float(rng.choice([0.0005, 0.002, 0.01])), "halt_file": None}
+    t, summaries, restart = pp.PaperTrader(directory, limits, **kw), [], int(rng.integers(13, n - 2))
+    for i in range(11, n):
+        if i == restart:
+            t = pp.PaperTrader(directory, limits, **kw)            # the nightly job continues a state file
+        summaries.append(t.step(px.iloc[: i + 1], {h: s for h, (join, s) in strategies.items() if join <= i}))
+    files = sorted(p for p in directory.iterdir() if p.is_file())
+    return [(p.name, p.read_bytes()) for p in files], json.dumps(summaries).encode()
+
+
+# sha-256 of 200 gap-free histories as the base (7837ac4) writes them: every journal file and state file byte for byte,
+# and every summary. Re-pin only in a change that means to alter what the paper trader writes on a day with every price.
+PLAIN_DIGEST = "8949314e8489f08b19a12deb02632f68596ba7b43cced2328fcd3453f2c82244"
+
+
+def test_where_no_price_is_missing_every_journal_entry_state_file_and_summary_is_as_before(setup, tmp_path, monkeypatch):
+    """Invariant 4 on 200 gap-free histories (with a restart from the state file in each): byte for byte the base."""
+    import hashlib
+    monkeypatch.setattr(pp, "datetime", _Clock)
+    digest = hashlib.sha256()
+    for seed in range(200):
+        files, summaries = _plain_history(seed, tmp_path / f"h{seed}", setup[1])
+        for name, body in files:
+            digest.update(name.encode() + b"\0" + body + b"\0")
+        digest.update(summaries + b"\1")
+        assert b"stale_prices" not in summaries
+    assert digest.hexdigest() == PLAIN_DIGEST

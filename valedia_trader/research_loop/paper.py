@@ -271,9 +271,41 @@ class PaperTrader:
     def _lot(self, strategy: str, symbol: str) -> dict:
         return self.state["positions"].setdefault(strategy, {}).setdefault(symbol, {"units": 0.0, "cost": 0.0})
 
-    def equity(self, prices_row: pd.Series) -> float:
-        value = sum(lot["units"] * float(prices_row[sym]) for book in self.state["positions"].values()
-                    for sym, lot in book.items() if lot["units"] and np.isfinite(prices_row.get(sym, np.nan)))
+    @staticmethod
+    def _mark(sym: str, lot: dict, row: pd.Series, carried: dict[str, float] | None) -> float:
+        """The price a held lot is valued at: today's when it is finite, else the last finite price before today
+        (`carried`), else the lot's cost. A held position is never valued at nothing."""
+        px = float(row.get(sym, np.nan))
+        if np.isfinite(px):
+            return px
+        if carried and sym in carried:
+            return carried[sym]
+        return float(lot["cost"])
+
+    def _carried_prices(self, prices: pd.DataFrame) -> dict[str, float]:
+        """For each fund the book holds that has no finite price today: the last finite price before today in `prices`
+        (left out when there is none: the lot is then valued at its cost)."""
+        row, out = prices.iloc[-1], {}
+        for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
+            if np.isfinite(float(row.get(sym, np.nan))):
+                continue
+            if sym in prices.columns:
+                earlier = prices[sym].iloc[:-1].to_numpy(dtype=float)
+                earlier = earlier[np.isfinite(earlier)]
+                if earlier.size:
+                    out[sym] = float(earlier[-1])
+        return out
+
+    def _stale_funds(self, prices_row: pd.Series) -> list[str]:
+        """The funds the book holds that have no finite price in `prices_row`, sorted."""
+        return sorted({sym for book in self.state["positions"].values() for sym, lot in book.items()
+                       if lot["units"] and not np.isfinite(float(prices_row.get(sym, np.nan)))})
+
+    def equity(self, prices_row: pd.Series, carried: dict[str, float] | None = None) -> float:
+        """Cash plus every held lot at `_mark`: a fund with no finite price in `prices_row` is valued at its `carried`
+        price, or at the lot's cost."""
+        value = sum(lot["units"] * self._mark(sym, lot, prices_row, carried) for book in self.state["positions"].values()
+                    for sym, lot in book.items() if lot["units"])
         return float(self.state["cash"] + value)
 
     def funds_held(self) -> set[str]:
@@ -432,7 +464,12 @@ class PaperTrader:
     # ---- one trading day
     def step(self, prices: pd.DataFrame, strategies: dict[int, Strategy]) -> dict:
         """Run one day using `prices` up to and including today (its last row). `strategies` maps
-        the ledger's hypothesis id to the strategy. Returns the day's summary."""
+        the ledger's hypothesis id to the strategy. Returns the day's summary.
+
+        A fund with no finite price today is not traded: its pending orders wait and no new order is decided for it.
+        If the book holds it, it is valued at the last finite price before today in `prices` (at the lot's cost when
+        there is none) in the equity, the strategy values, the capital per strategy and the benchmarks alike, and the
+        summary names it in `stale_prices` (present only on such a day)."""
         day = prices.index[-1]
         if self.state["last_day"] is not None and str(day.date()) <= self.state["last_day"]:
             raise ValueError(f"{day.date()} was already processed; paper trading only moves forward")
@@ -441,7 +478,9 @@ class PaperTrader:
         before = self.state["history"][-1]["strategy_values"] if self.state["history"] else {}
         self._fill_pending(day, row)
         self._settle_panel(prices)
-        equity = self.equity(row)
+        stale = self._stale_funds(row)
+        carried = self._carried_prices(prices) if stale else None
+        equity = self.equity(row, carried)
         self.state["peak_equity"] = max(self.state["peak_equity"], equity)
         account = {"equity": equity, "daily_loss_pct": max(0.0, (previous - equity) / previous * 100.0),
                    "drawdown_pct": max(0.0, (self.state["peak_equity"] - equity) / self.state["peak_equity"] * 100.0),
@@ -524,12 +563,15 @@ class PaperTrader:
                 self.journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": s.name, "version": s.version,
                                          "market_conditions": cond, "decision": "no trade",
                                          "reasoning": "positions already match the strategy's targets"})
-        by_strategy = {s: self._strategy_value(s, row) - before.get(s, 0.0) for s in self.state["positions"]}
+        by_strategy = {s: self._strategy_value(s, row, carried) - before.get(s, 0.0) for s in self.state["positions"]}
         summary = {"day": str(day.date()), "equity": equity, "daily_loss_pct": account["daily_loss_pct"],
                    "drawdown_pct": account["drawdown_pct"], "open_positions": account["open_positions"],
-                   "orders_placed": placed, "orders_blocked": blocked, "strategy_values": {s: self._strategy_value(s, row) for s in self.state["positions"]},
+                   "orders_placed": placed, "orders_blocked": blocked,
+                   "strategy_values": {s: self._strategy_value(s, row, carried) for s in self.state["positions"]},
                    "strategy_value_change": by_strategy, "capital_per_strategy": share,
                    "benchmark_values": self._benchmark_values(prices, strategies, share)}
+        if stale:
+            summary["stale_prices"] = stale
         if self.tax_rules is not None:
             summary["tax"] = self._tax_block(day)
         self.journal.read(since=day - pd.Timedelta(days=DAMAGE_WINDOW_DAYS))      # only to learn what it cannot read
@@ -547,7 +589,8 @@ class PaperTrader:
         The same comparator the research gate uses (`buy_and_hold`: equal weight in every fund with a price, rebalanced
         daily, no costs), started with the capital the strategy had on its first paper day. It is a yardstick, not a book:
         it places no orders, meets no risk check and pays no costs. Only the start day and capital are stored; the value
-        is recomputed from prices each day. A book saved before this existed takes both from its own history."""
+        is recomputed from prices each day. A book saved before this existed takes both from its own history. A day on
+        which a fund has no finite price carries its last finite price, as the book does."""
         books, out = self.state.setdefault("benchmarks", {}), {}
         for s in strategies.values():
             if s.name not in books:
@@ -559,14 +602,18 @@ class PaperTrader:
             if len(since) < 2 or not funds:
                 out[s.name] = 0.0
                 continue
-            held = buy_and_hold(prices.loc[since[0]:, funds])
+            frame = prices[funds]
+            if not np.isfinite(frame.to_numpy(dtype=float)).all():          # a gap: carry the last finite price
+                frame = frame.where(np.isfinite(frame)).ffill()
+            held = buy_and_hold(frame.loc[since[0]:])
             out[s.name] = float(books[s.name]["capital"] * (np.prod(1.0 + held.iloc[1:]) - 1.0))
         return out
 
-    def _strategy_value(self, strategy: str, row: pd.Series) -> float:
-        """Open market value of a strategy's positions plus what it has realised so far."""
-        open_value = sum(lot["units"] * (float(row[sym]) - lot["cost"]) for sym, lot in self.state["positions"].get(strategy, {}).items()
-                         if lot["units"] and np.isfinite(row.get(sym, np.nan)))
+    def _strategy_value(self, strategy: str, row: pd.Series, carried: dict[str, float] | None = None) -> float:
+        """Open market value of a strategy's positions plus what it has realised so far, each lot at the same `_mark`
+        as in `equity`, so the strategies' values always add up to the book's."""
+        open_value = sum(lot["units"] * (self._mark(sym, lot, row, carried) - lot["cost"])
+                         for sym, lot in self.state["positions"].get(strategy, {}).items() if lot["units"])
         return float(open_value + self.state["realized"].get(strategy, 0.0))
 
     def _trip_latch(self, body: dict) -> bool:

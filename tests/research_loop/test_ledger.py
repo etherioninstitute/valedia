@@ -130,3 +130,116 @@ def test_market_regime_labels():
     assert lg.market_regime(wild, reference=flat) == "high volatility"
     assert lg.market_regime(pd.DataFrame({"a": up, "b": up * 2})) == "trending up"
     assert lg.market_regime(up.iloc[:5]) == "choppy"
+
+
+# ---- T29: a status change and its reason are one write
+
+def _consistent(path):
+    """Every idea's status is the one its last status finding names (or the first status, with none), and its lessons
+    hold one line per finding: the status and its reason were written together or not at all."""
+    con = sqlite3.connect(str(path))
+    try:
+        for hid, status, lessons in con.execute("SELECT id, status, lessons_learned FROM hypotheses"):
+            rows = [r[0] for r in con.execute("SELECT finding FROM findings WHERE hypothesis_id = ? ORDER BY id", (hid,))]
+            said = [r for r in rows if r.startswith("status -> ")]
+            assert status == (said[-1][len("status -> "):].split(":")[0] if said else "untested"), (hid, status, said[-1:])
+            assert lessons.count("\n") == len(rows)
+    finally:
+        con.close()
+
+
+CHILD = """
+import sys
+from valedia_trader.research_loop.ledger import HypothesisLedger
+led = HypothesisLedger(sys.argv[1])
+ids = [r[0] for r in led._db.execute("SELECT id FROM hypotheses ORDER BY id")]
+print("ready", flush=True)
+i = int(sys.argv[2])
+while True:
+    for h in ids:
+        i += 1
+        led.set_status(h, ("paused", "passed paper")[i % 2], f"round {i} of the critic", "critic")
+"""
+
+
+def test_a_kill_at_any_point_leaves_the_status_and_its_reason_both_or_neither(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    root = str(Path(lg.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    rng = np.random.default_rng(29)
+    chains = [tmp_path / f"ledger{c}.db" for c in range(5)]
+    for path in chains:
+        led = lg.HypothesisLedger(path)
+        for k in range(3):
+            led.propose(f"Idea number {k} about a different thing {path.stem}", "price-analyst", "us-etf")
+        led.close()
+    kills = 0
+    for rnd in range(22):                                          # 5 chains x 22 rounds = 110 kills
+        children = [subprocess.Popen([sys.executable, "-B", "-c", CHILD, str(p), str(rnd * 100_000)], env=env, cwd=str(tmp_path),
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for p in chains]
+        for child in children:
+            assert child.stdout.readline().strip() == "ready"
+        time.sleep(float(rng.uniform(0.005, 0.06)))
+        for child in children:
+            time.sleep(float(rng.uniform(0.0, 0.004)))
+            child.kill()                                           # SIGKILL to the child this test started, by its pid
+        for child in children:
+            child.wait()
+            child.stdout.close()
+            kills += 1
+        for path in chains:
+            _consistent(path)
+    assert kills >= 100
+    led = lg.HypothesisLedger(chains[0])                           # and the ledger carries on after the last kill
+    assert led.summary()["paused"] + led.summary()["passed paper"] + led.summary()["untested"] == 3
+
+
+class _FailingFindings:
+    """The ledger's connection, except that writing a finding fails: the status must not be left changed."""
+
+    def __init__(self, db):
+        self._real = db
+
+    def execute(self, sql, *args):
+        if sql.startswith("INSERT INTO findings"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_a_status_whose_reason_cannot_be_written_is_not_changed(tmp_path):
+    led = lg.HypothesisLedger(tmp_path / "ledger.db")
+    a = led.propose("Idea A", "price-analyst", "us-etf")
+    led.set_status(a, "passed paper", "held up for 20 days", "critic")
+    real, led._db = led._db, _FailingFindings(led._db)
+    with pytest.raises(sqlite3.OperationalError):
+        led.set_status(a, "paused", "drawdown deeper than the backtest", "critic")
+    led._db = real
+    led.close()
+    again = lg.HypothesisLedger(tmp_path / "ledger.db")
+    assert again.get(a)["status"] == "passed paper" and "status -> paused" not in again.get(a)["lessons_learned"]
+    _consistent(tmp_path / "ledger.db")
+    again.set_status(a, "paused", "drawdown deeper than the backtest", "critic")
+    assert again.get(a)["status"] == "paused" and "status -> paused: drawdown" in again.get(a)["lessons_learned"]
+    again.set_status(a, "retired")                                 # no reason: the status alone, as before
+    assert again.get(a)["status"] == "retired" and len(again.findings(a)) == 2
+
+
+def test_a_ledger_file_written_before_is_continued_with_the_same_layout(tmp_path):
+    path = tmp_path / "ledger.db"
+    led = lg.HypothesisLedger(path)
+    a = led.propose("Idea A", "price-analyst", "us-etf")
+    led.set_status(a, "paused", "first reason", "critic")
+    schema = sorted(tuple(r) for r in led._db.execute("SELECT type, name, sql FROM sqlite_master"))
+    led.close()
+    led = lg.HypothesisLedger(path)
+    led.set_status(a, "passed paper", "second reason", "critic")
+    assert sorted(tuple(r) for r in led._db.execute("SELECT type, name, sql FROM sqlite_master")) == schema
+    assert [f["finding"] for f in led.findings(a)] == ["status -> paused: first reason", "status -> passed paper: second reason"]
+    _consistent(path)

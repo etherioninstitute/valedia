@@ -149,8 +149,11 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     for hid, name in strategies.items():
         h = ledger.get(hid)
         summaries = [e for e in everything if e["type"] == "summary" and name in e.get("strategy_value_change", {})]
-        returns = np.array([e["strategy_value_change"][name] / e["capital_per_strategy"] for e in summaries], dtype=float)
-        in_week = np.array([e["strategy_value_change"][name] / e["capital_per_strategy"] for e in summaries
+        # a day's change was earned on the capital the day started with: the capital per strategy of the day before
+        # (a strategy's first day: its own first capital). The day's own capital shrinks when strategies join.
+        started = [e["capital_per_strategy"] for e in summaries[:1]] + [e["capital_per_strategy"] for e in summaries[:-1]]
+        returns = np.array([e["strategy_value_change"][name] / cap for e, cap in zip(summaries, started)], dtype=float)
+        in_week = np.array([e["strategy_value_change"][name] / cap for e, cap in zip(summaries, started)
                             if e["day"] >= str(since.date())], dtype=float)
         closed = [e for e in everything if e["type"] == "fill" and e["strategy"] == name and e.get("realized_pnl") is not None]
         losers = [e for e in closed if e["realized_pnl"] < 0 and e["day"] >= str(since.date())]

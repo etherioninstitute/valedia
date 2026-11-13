@@ -187,3 +187,32 @@ def test_a_review_of_a_clean_journal_is_not_marked_incomplete(desk):
     out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
     assert out["incomplete"] is False and out["skipped_lines"] == []
     assert (journal.dir / f"review-{days[-1].date()}.md").read_text().startswith("# Critic's review")
+
+
+# ---- T29: a day's change is measured against the capital it started with
+
+def test_a_days_change_is_divided_by_the_capital_of_the_day_before_and_a_first_day_by_its_own(desk):
+    ledger, journal, limits, hid = desk
+    late_id = ledger.propose("Bonds that fell keep falling for a while", "price-analyst", "us-etf")
+    days = pd.bdate_range("2026-11-02", periods=5)
+    # mom loses 1% of its capital every day. A second strategy joins on the fourth day and the capital per strategy
+    # halves; mom's positions that day were still sized from the day before, so its loss that day is still 1,000.
+    capital = [100_000.0, 100_000.0, 100_000.0, 50_000.0, 50_000.0]
+    mom = [-1_000.0, -1_000.0, -1_000.0, -1_000.0, -500.0]
+    late = [None, None, None, -500.0, -500.0]                        # 1% of its own first capital, then of the day before
+    for d, cap, m, x in zip(days, capital, mom, late):
+        change = {"mom": m} if x is None else {"mom": m, "late": x}
+        journal.write(d, {"type": "summary", "strategy_value_change": change, "capital_per_strategy": cap})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom", late_id: "late"}, limits, apply=False)
+    a, b = out["strategies"]["mom"]["result"], out["strategies"]["late"]["result"]
+    assert a["total_return"] == pytest.approx(0.99 ** 5 - 1) and a["max_drawdown"] == pytest.approx(1 - 0.99 ** 5)
+    assert a["week_return"] == pytest.approx(0.99 ** 5 - 1) and a["annualised_return"] == pytest.approx(-0.01 * 252)
+    assert b["total_return"] == pytest.approx(0.99 ** 2 - 1) and b["days"] == 2
+    assert ledger.get(hid)["paper_trading_result"]["max_drawdown"] == pytest.approx(1 - 0.99 ** 5)
+
+
+def test_with_one_capital_throughout_the_returns_are_as_before(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [0.01, -0.02, 0.005])
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    assert out["strategies"]["mom"]["result"]["total_return"] == pytest.approx(1.01 * 0.98 * 1.005 - 1)
