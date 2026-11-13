@@ -163,3 +163,8 @@ strict side: every one can only remove picks, never add them.
     2027-03-31 count and the scoring is made on or after 2027-04-04, when their games have results. If it ends
     by the counts, the scoring is made three days or more after the last counted thread's date. A league's
     table of team codes is complete only if every listed game gave two readable codes.
+22. **The boundary between development and test, by the clock (same day, before any result).** Until the
+    version for Question A is chosen, no result is read of any game that starts on or after 2026-12-13 00:00
+    US-Eastern, whether or not a test-period pick has been matched to it yet. So the version is chosen on the
+    games before that moment; picks of the 12/13 thread on later games are shown after the choice and decide
+    nothing.
