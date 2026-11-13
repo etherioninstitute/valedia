@@ -4,9 +4,16 @@ Every outside thing is a stand-in: the folders are a temporary tree, `launchctl`
 (the program launcher is replaced for the whole module), the clock, the free disk space and the exchange calendar
 are given to the checks. No real notification is shown, nothing real is read, nothing is created in the repository.
 All secrets and account numbers here are made up."""
+import fcntl
 import json
+import os
+import random
 import sqlite3
 import subprocess
+import sys
+import threading
+import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +73,7 @@ class World:
         self.journal = Journal(self.root / "journal")
         self.journal.write(LAST_SESSION, {"type": "summary", "equity": 100000.0})
         self.write_picks_log(end_ago=1200)
+        self.write_weekly_log(ran_ago=86400)
         self.write_heartbeat(ago=60)
         self.ledger_path = self.root / "memory" / "orders-webull-sandbox.sqlite"
         self.make_ledger()
@@ -115,6 +123,11 @@ class World:
         elif start_ago is not None:
             lines += [f"{iso(NOW - start_ago)} start", *extra]
         (self.logs / "valedia-picks-hourly.log").write_text("\n".join(lines) + "\n")
+
+    def write_weekly_log(self, ran_ago=None, lines=()):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - ran_ago)) if ran_ago is not None else None
+        body = ([f"=== {stamp} weekly research loop", "cycle output"] if stamp else []) + list(lines)
+        (self.logs / "valedia-research-loop.log").write_text("\n".join(body) + "\n")
 
     def write_heartbeat(self, ago):
         store = ol.Store(self.root / "memory" / "orderbook_loop.sqlite")
@@ -199,6 +212,12 @@ def paper_off(w): w.journal.write(LAST_SESSION, {"type": "summary", "equity": 10
 def disk_on(w): w.free = 5 * 10 ** 9 - 1
 def disk_off(w): w.free = 5 * 10 ** 9
 
+ORDERSTEP = "com.valedia.orderstep.paper"
+def orderstep_on(w): w.jobs = [j for j in w.jobs if j[2] != ORDERSTEP] + [("-", "0", ORDERSTEP)]
+def orderstep_off(w): w.jobs = [j for j in w.jobs if j[2] != ORDERSTEP]
+def weekly_on(w): w.write_weekly_log(ran_ago=8 * 86400 + 1)
+def weekly_off(w): w.write_weekly_log(ran_ago=3600)
+
 CONDITIONS = {
     "halt file": (halt_on, halt_off, "switch:halt"),
     "latch": (latch_on, latch_off, "switch:latch"),
@@ -212,6 +231,8 @@ CONDITIONS = {
     "damaged journal line": (damage_on, damage_off, "journal:damaged"),
     "paper step missing": (paper_on, paper_off, "paper:no-entry"),
     "disk low": (disk_on, disk_off, "disk:low"),
+    "order step not run today": (orderstep_on, orderstep_off, "orderstep:no-run"),
+    "weekly loop not run": (weekly_on, weekly_off, "weekly:no-run"),
 }
 
 
@@ -266,7 +287,7 @@ def test_the_stopped_order_step_names_its_stage_and_reason(world):
 
 
 @pytest.mark.parametrize("reason", ["outside the regular session window 09:35 to 15:45 New York time (it is 06:10)",
-                                    "2026-11-26 (Thursday) is not a trading day", "2026-11-26 is a market holiday"])
+                                    "2026-11-26 (Thursday) is not a trading day", "2026-11-28 (Saturday) is not a trading day"])
 def test_a_stop_for_the_market_being_closed_is_ordinary_and_raises_nothing(world, reason):
     world.write_step("stopped", "session", reason)
     assert watch(world).raised == []
@@ -275,7 +296,13 @@ def test_a_stop_for_the_market_being_closed_is_ordinary_and_raises_nothing(world
 @pytest.mark.parametrize("stage, reason", [("session", "another order step is running on this venue's state file"),
                                            ("session", "the exchange calendar could not be loaded: OSError"),
                                            ("environment", "outside the regular session window"),    # only stage session is ordinary
-                                           ("send", "2026-11-26 is a market holiday")])
+                                           ("send", "2026-11-26 is a market holiday"),
+                                           ("session", "2026-11-26 is a market holiday"),           # a word inside a text is not a reason
+                                           ("session", "the exchange calendar could not be loaded: the holiday table is missing"),
+                                           ("session", "the exchange calendar could not answer for 2026-11-26: holiday"),
+                                           ("session", "outside the regular session window 09:35 to 15:45"),     # not the exact text
+                                           ("session", "outside the regular session window 09:35 to 15:45 New York time (it is 06:10) "
+                                                       "and the calendar could not be loaded")])
 def test_every_other_stop_still_raises(world, stage, reason):
     world.write_step("stopped", stage, reason)
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
@@ -284,7 +311,8 @@ def test_every_other_stop_still_raises(world, stage, reason):
 def test_an_ordinary_stop_after_a_real_one_clears_the_alert(world):
     world.write_step("stopped", "send", "the venue refused the session", day="2026-11-12")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
-    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45", day="2026-11-13")
+    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)",
+                     day="2026-11-13")
     assert [c.key for c in watch(world).cleared] == ["step-stopped:webull-sandbox"]
 
 
@@ -615,3 +643,472 @@ def test_the_default_environment_points_at_the_repository(tmp_path):
     assert env.logs_dir == Path.home() / "Library" / "Logs"
     assert env.launch_agents_dir == Path.home() / "Library" / "LaunchAgents"
     assert env.free_bytes(tmp_path) > 0 and callable(env.launchctl) and len(env.sessions()) > 1000
+
+
+
+# =====================================================================================================================
+# rev 2: what the blind check found
+# =====================================================================================================================
+
+PHRASE = "alpha bravo candle delta eagle frost gamma hotel india juliet kilo lemon"        # 12 words of 3 to 8 letters
+TRADING = {"BROKER_API_KEY": "Zq8Lm2Xv9Rt4Wc7Yb1Nh5Jd3Kf6Gs0Pa", "BROKER_API_SECRET": "Hn4Tb7Qw2Ze9Ux5Cv8Ml3Kj6Ar1Sd0Fg",
+           "WALLET_MNEMONIC": PHRASE, "WEBULL_ACCOUNT_ID": "987654321098", "WEBULL_ENV": "production",
+           "WEBULL_BASE_URL": "https://example.invalid/api"}
+
+
+@pytest.fixture
+def trading_file(tmp_path, monkeypatch):
+    """A made-up trading file, its path given to the real commands the way the package finds it (VALEDIA_ENV_FILE); the
+    tests never call remember(): only the commands' own registration can make its values known."""
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in TRADING.items()))
+    os.chmod(f, 0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    for k in TRADING:
+        monkeypatch.delenv(k, raising=False)
+    return f
+
+
+def four_words(phrase=PHRASE):
+    w = phrase.split()
+    return [" ".join(w[i:i + 4]) for i in range(len(w) - 3)]
+
+
+def leaked(text):
+    low = text.lower()
+    return [name for name in ("BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID")
+            if TRADING[name].lower() in low or TRADING[name][:12].lower() in low] + [g for g in four_words() if g in low]
+
+
+def plant_everywhere(w):
+    """Every value of the trading file in a source the watch reads: an order tag, a journal reason, a job label, a log line."""
+    w.unknown_order(tag=f"paper-{TRADING['BROKER_API_KEY']}")
+    w.write_step("stopped", "send", f"the venue said {TRADING['BROKER_API_SECRET']} for account {TRADING['WEBULL_ACCOUNT_ID']}; "
+                                    f"the words were {PHRASE}")
+    w.jobs = w.jobs + [("-", "9", f"com.valedia.{TRADING['BROKER_API_KEY']}")]
+    w.write_picks_log(end_ago=600, extra=[f"match failed for {TRADING['BROKER_API_SECRET']} {PHRASE}"])
+
+
+def test_a_real_watch_never_writes_or_prints_a_value_of_the_trading_file(world, trading_file, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    plant_everywhere(world)
+    before = dict(os.environ)
+    assert al.main(["watch", "--notify"], env=world.env()) == 1
+    assert al.main(["list"], env=world.env()) == 1
+    seen = capsys.readouterr()
+    assert os.environ == before                                                      # nothing was exported
+    assert len(world.lines()) >= 4 and len(spy.calls) >= 4
+    texts = [seen.out, seen.err, world.alerts_file.read_text(), " ".join(" ".join(c) for c in spy.calls),
+             (world.alerts_file.parent / "notifications.jsonl").read_text()]
+    for text in texts:
+        assert leaked(text) == [], leaked(text)
+    assert "<secret>" in world.alerts_file.read_text()
+
+
+def test_the_registration_exports_nothing_and_a_child_never_gets_the_values(world, trading_file, monkeypatch):
+    before = dict(os.environ)
+    assert al.main(["list"], env=world.env()) == 0
+    assert os.environ == before and not set(TRADING) & set(os.environ)
+    assert not set(TRADING) & set(s.child_env())
+
+
+def test_a_trading_file_that_cannot_be_read_is_exit_two_and_nothing_is_written(world, trading_file, capsys):
+    for mode in (0o644, 0o000):
+        os.chmod(trading_file, mode)
+        for argv in (["watch"], ["watch", "--notify"], ["list"]):
+            assert al.main(argv, env=world.env()) == 2, (mode, argv)
+            err = capsys.readouterr()
+            assert "trading file" in err.err and "nothing was done" in err.err and leaked(err.out + err.err) == []
+            assert not world.alerts_file.exists() and not (world.alerts_file.parent / "notifications.jsonl").exists()
+    os.chmod(trading_file, 0o600)
+
+
+def test_a_missing_trading_file_is_no_reason_to_stop(world, tmp_path, monkeypatch):
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(tmp_path / "there-is-no-trading-file.env"))
+    assert al.main(["watch"], env=world.env()) == 0
+
+
+def test_the_trading_file_of_the_environment_can_be_named_by_the_env(world, tmp_path):
+    f = tmp_path / "other.env"
+    f.write_text(f"BROKER_API_KEY={TRADING['BROKER_API_KEY']}\n")
+    os.chmod(f, 0o600)
+    env = world.env()
+    env.trading_file = f
+    assert al.register_trading_file(env) == {"BROKER_API_KEY": TRADING["BROKER_API_KEY"]}
+    assert al.clean(f"a {TRADING['BROKER_API_KEY']} b") == "a <secret> b"
+
+
+# ----------------------------------------------------------------------------------------------- order ids: last 4 only
+
+TAG = "os-20261113-143501-a1b2c3-XLE"
+
+
+def test_a_ledger_tag_is_shown_as_the_last_four_of_its_random_part_and_its_fund():
+    assert al.clean(f"order {TAG} is unknown") == "order …b2c3-XLE is unknown"
+    assert al.clean("os-20261113-143501-a1b2c3-BRK.B filled.") == "…b2c3-BRK.B filled."
+    assert al.clean("os-20261113-143501-a1b2c3-BTC-USD, then") == "…b2c3-BTC-USD, then"
+    assert al.clean(al.clean(f"order {TAG}")) == al.clean(f"order {TAG}")                  # shown once, stable when cleaned again
+
+
+def test_other_order_ids_are_shown_as_their_last_four_characters():
+    cases = {"order V-1234567890 is open": "order …7890 is open", "Order ID: 7f3a9c2e51b84d60 failed": "Order ID: …4d60 failed",
+             "venue_order_id=ABCD1234efgh5678": "venue_order_id=…5678", "client order id paper-XLE-batch-0007": "client order id …0007",
+             "tag abcdefghijklmnopqrst was sent": "tag …qrst was sent", "clientOrderId: Z9y8X7w6V5u4": "clientOrderId: …V5u4"}
+    for text, want in cases.items():
+        assert al.clean(text) == want, text
+
+
+def test_ordinary_words_and_names_are_not_taken_for_ids():
+    for text in ("order cancelled by the venue", "the order ledger orders-webull-sandbox is blocked", "orders:orders-webull-sandbox",
+                 "id 20261113 is a date", "the client authentication failed", "orders sent 2, refused 1"):
+        assert al.clean(text) == text, text
+
+
+def test_generated_texts_with_tags_and_ids_never_keep_one_whole():
+    rng = random.Random(2026)
+    alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    lead = ["order", "Order", "order id", "Order ID:", "id=", "client order id", "client_order_id=", "venue_order_id:", "orderId", "tag",
+            "clientOrderId:", "order number"]
+    tail = ["is unknown", "was refused by the venue", "", "filled 5 at 60.0", "(XLE +5)"]
+    for i in range(2000):
+        if i % 2:
+            rand, sym = "".join(rng.choice("0123456789abcdef") for _ in range(6)), rng.choice(["XLE", "SPY", "BRK.B", "BTC-USD", "QQQ"])
+            tag = f"os-2026{rng.randint(1, 12):02d}{rng.randint(1, 28):02d}-{rng.randint(0, 23):02d}{rng.randint(0, 59):02d}{rng.randint(0, 59):02d}-{rand}-{sym}"
+            text = f"{rng.choice(['order', 'the ledger refused to send', 'the outcome of order', ''])} {tag} {rng.choice(tail)}".strip()
+            out = al.clean(text)
+            assert tag not in out and f"…{rand[-4:]}-{sym}" in out, (text, out)
+        else:
+            ident = "".join(rng.choice(alnum + "-_") for _ in range(rng.randint(8, 36))).strip("-_") + str(rng.randint(0, 9))
+            text = f"{rng.choice(lead)} {ident} {rng.choice(tail)}".replace("= ", "=").replace(": ", ": ").strip()
+            out = al.clean(text)
+            assert ident not in out and f"…{ident[-4:]}" in out, (text, out)
+
+
+def test_a_whole_order_tag_reaches_no_output_in_any_source(world, capsys, monkeypatch):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    world.unknown_order(tag=TAG)                                                                    # the ledger's own blocked() names it
+    world.write_step("stopped", "send", f"order {TAG} could not be recorded or sent; the venue id was V-1234567890")
+    world.jobs = world.jobs + [("-", "9", "com.valedia.order-1234567890abcdef")]
+    world.write_picks_log(end_ago=600, extra=[f"match failed for order {TAG} id 1a2b3c4d5e6f7a8b"])
+    assert al.main(["watch", "--notify"], env=world.env()) == 1
+    al.main(["list"], env=world.env())
+    out = capsys.readouterr()
+    for text in (out.out, out.err, world.alerts_file.read_text(), " ".join(" ".join(c) for c in spy.calls)):
+        assert TAG not in text and "a1b2c3" not in text and "1234567890" not in text and "1a2b3c4d5e6f7a8b" not in text
+    assert any("…b2c3-XLE" in x["detail"] for x in world.lines())
+
+
+# ----------------------------------------------------------------------------------------------- the read-only opening
+
+def test_a_store_is_opened_read_only_and_cannot_be_made_writable(tmp_path):
+    db = tmp_path / "x.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t (a)")
+    c.commit()
+    c.close()
+    before = (db.read_bytes(), db.stat().st_mtime_ns)
+    conn = al.open_readonly(db)
+    conn.execute("PRAGMA query_only = OFF")                       # even a connection told it may write cannot: the file is mode=ro
+    for sql in ("INSERT INTO t VALUES (1)", "CREATE TABLE z (a)", "DROP TABLE t"):
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(sql)
+    conn.close()
+    assert (db.read_bytes(), db.stat().st_mtime_ns) == before and sorted(p.name for p in tmp_path.iterdir()) == ["x.sqlite"]
+
+
+def test_a_busy_store_is_waited_for_only_as_long_as_the_budget_and_then_said_busy(tmp_path):
+    db = tmp_path / "x.sqlite"
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("CREATE TABLE t (a)")
+    c.execute("BEGIN EXCLUSIVE")
+    t0 = time.monotonic()
+    conn = al.open_readonly(db, timeout=0.4)
+    with pytest.raises(sqlite3.OperationalError) as e:
+        conn.execute("SELECT COUNT(*) FROM t")
+        conn.execute("SELECT COUNT(*) FROM t")
+    took = time.monotonic() - t0
+    assert 0.3 <= took < 2.0 and "busy" in al.describe(e.value)
+    t1 = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError):                 # the budget is for the store in all, not for each statement
+        conn.execute("SELECT 1 FROM t")
+    assert time.monotonic() - t1 < 0.2
+    c.execute("ROLLBACK")
+    assert al.open_readonly(db).execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+
+
+def make_hot_journal(db):
+    """A store a writer was killed in the middle of: a journal of the pages it was changing is left beside the file."""
+    code = (f"import sqlite3, os\nc = sqlite3.connect({str(db)!r}, isolation_level=None)\nc.execute('PRAGMA cache_size = 10')\n"
+            "c.execute('BEGIN')\nc.execute('CREATE TABLE IF NOT EXISTS junk (a)')\n"
+            "c.executemany('INSERT INTO junk VALUES (?)', [('x' * 200,)] * 3000)\nos._exit(0)\n")
+    p = subprocess.Popen([sys.executable, "-I", "-c", code])
+    assert p.wait() == 0
+    assert (db.parent / (db.name + "-journal")).stat().st_size > 0
+
+
+def test_a_store_that_needs_recovery_is_said_so_and_left_exactly_as_it_was(tmp_path):
+    db = tmp_path / "x.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t (a)")
+    c.executemany("INSERT INTO t VALUES (?)", [("y" * 200,)] * 500)
+    c.commit()
+    c.close()
+    make_hot_journal(db)
+
+    def state():
+        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(tmp_path.iterdir())}
+    before = state()
+    with pytest.raises(sqlite3.OperationalError) as e:
+        al.open_readonly(db).execute("SELECT COUNT(*) FROM t")
+    assert "recover" in al.describe(e.value)
+    assert state() == before
+
+
+# ----------------------------------------------------------------------------------------------- shown only once acknowledged
+
+class Flaky:
+    """A sender that fails the first `fail` times and then answers."""
+    name = "phone"
+
+    def __init__(self, fail=0):
+        self.fail, self.calls = fail, []
+
+    def send(self, alert):
+        self.calls.append(alert.key)
+        if len(self.calls) <= self.fail:
+            raise OSError("no signal")
+
+
+def test_an_alert_whose_notification_failed_is_tried_again_on_each_later_watch_until_it_is_shown(world):
+    halt_on(world)
+    phone = Flaky(fail=2)
+    r1 = watch(world, senders=[phone])
+    assert keys(r1) == ["switch:halt"] and r1.shown == [] and r1.failures
+    r2 = watch(world, senders=[phone])                                    # still open and not shown: tried again
+    assert r2.raised == [] and r2.shown == [] and r2.failures and len(phone.calls) == 2
+    r3 = watch(world, senders=[phone])
+    assert [a.key for a in r3.shown] == ["switch:halt"] and r3.failures == [] and len(phone.calls) == 3
+    r4 = watch(world, senders=[phone])                                    # shown: never again
+    assert r4.shown == [] and len(phone.calls) == 3 and len(world.lines()) == 1
+
+
+def test_a_failing_sender_is_tried_five_times_in_all_and_then_the_alert_is_left_to_list_and_the_page(world, capsys):
+    halt_on(world)
+    phone = Flaky(fail=99)
+    for n in range(1, 8):
+        r = watch(world, senders=[phone])
+        assert len(phone.calls) == min(n, 5)
+        assert bool(r.failures) == (n <= 5)                               # after the fifth, nothing more is tried and nothing fails
+    assert al.main(["list"], env=world.env()) == 1
+    out = capsys.readouterr().out
+    assert "switch:halt" in out and "not shown" in out and "5 times" in out
+    states = al.read_notifications(al.notifications_file(world.root))
+    assert "5 times" in al.notification_note(states, world.lines()[0])
+
+
+def test_a_later_watch_with_notify_shows_an_alert_raised_by_a_watch_without_it(world, monkeypatch):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    halt_on(world)
+    assert al.main(["watch"], env=world.env()) == 1 and spy.calls == []        # recorded, never shown (also what a kill leaves)
+    assert al.main(["watch", "--notify"], env=world.env()) == 1 and len(spy.calls) == 1
+    assert al.main(["watch", "--notify"], env=world.env()) == 1 and len(spy.calls) == 1
+
+
+def test_an_osascript_that_fails_is_retried_and_then_shown_once(world, monkeypatch):
+    halt_on(world)
+    bad = Spy(returncode=1)
+    monkeypatch.setattr(al.subprocess, "run", bad)
+    assert al.main(["watch", "--notify"], env=world.env()) == 2 and len(bad.calls) == 1
+    good = Spy()
+    monkeypatch.setattr(al.subprocess, "run", good)
+    assert al.main(["watch", "--notify"], env=world.env()) == 1 and len(good.calls) == 1
+    assert al.main(["watch", "--notify"], env=world.env()) == 1 and len(good.calls) == 1
+
+
+def test_an_alert_raised_again_after_it_cleared_is_a_new_alert_for_the_notifier(world):
+    phone = Flaky()
+    halt_on(world)
+    watch(world, senders=[phone])
+    halt_off(world)
+    watch(world, senders=[phone])
+    halt_on(world)
+    time_later = world.env()
+    time_later.now = NOW + 60
+    al.watch(time_later, senders=[phone])
+    assert phone.calls == ["switch:halt", "switch:halt"]
+
+
+# ----------------------------------------------------------------------------------------------- small ones
+
+HIDDEN = "\u202e\u200b\u2066\u0007\u001b\u0085\ufeff"
+
+
+def test_format_and_control_characters_never_reach_the_file_the_page_or_a_notification(world, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    world.write_step("stopped", "send", f"the {HIDDEN}venue{HIDDEN} said{HIDDEN} no \x1b[31mred\x1b[0m")
+    world.jobs = world.jobs + [("-", "9", f"com.valedia.job{HIDDEN}x")]
+    assert al.main(["watch", "--notify"], env=world.env()) == 1
+    al.main(["list"], env=world.env())
+    out = capsys.readouterr().out
+    strings = [out, " ".join(" ".join(c) for c in spy.calls)]
+    for line in world.alerts_file.read_text().splitlines():
+        strings += [str(v) for v in json.loads(line).values()]
+    for text in strings:
+        assert not [c for c in text if unicodedata.category(c) in ("Cf", "Cc") and c != "\n"], repr(text)
+    assert any("the venue said no" in x for x in strings)
+
+
+def test_a_secret_split_by_invisible_characters_is_still_caught(trading_file, world):
+    al.register_trading_file(world.env())
+    key = TRADING["BROKER_API_KEY"]
+    assert key[:10] not in al.clean(key[:10] + "\u200b" + key[10:])
+
+
+def test_list_on_a_folder_or_an_unreadable_alert_file_is_exit_two(world, capsys):
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.mkdir()
+    assert al.main(["list"], env=world.env()) == 2
+    assert capsys.readouterr().err
+    world.alerts_file.rmdir()
+    world.alerts_file.write_text("{}\n")
+    os.chmod(world.alerts_file, 0o000)
+    try:
+        assert al.main(["list"], env=world.env()) == 2
+    finally:
+        os.chmod(world.alerts_file, 0o600)
+
+
+def test_the_watch_on_a_folder_as_the_alert_file_is_exit_two(world):
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.mkdir()
+    assert al.main(["watch"], env=world.env()) == 2
+
+
+# ----------------------------------------------------------------------------------------------- the two new conditions
+
+def test_the_order_step_condition_only_applies_to_a_loaded_job_on_a_trading_day_after_ten_thirty_new_york(world):
+    orderstep_on(world)
+    after = datetime(2026, 11, 13, 15, 30, 0, tzinfo=timezone.utc).timestamp()           # 10:30:00 New York
+    for now, expect in ((after, False), (after + 1, True), (after - 3600, False)):
+        env = world.env()
+        env.now = now
+        assert ("orderstep:no-run" in [a.key for a in al.run_checks(env)[0]]) is expect, now
+    saturday = world.env()
+    saturday.now = datetime(2026, 11, 14, 18, 0, tzinfo=timezone.utc).timestamp()
+    assert "orderstep:no-run" not in [a.key for a in al.run_checks(saturday)[0]]
+    orderstep_off(world)                                                                  # not loaded: nothing to say
+    assert "orderstep:no-run" not in [a.key for a in al.run_checks(world.env())[0]]
+
+
+def test_a_journaled_order_step_run_of_today_clears_it_and_one_of_another_day_does_not(world):
+    orderstep_on(world)
+    world.write_step("ok", day="2026-11-12")
+    assert "orderstep:no-run" in keys(watch(world))
+    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)",
+                     day="2026-11-13")                                                     # any run counts as a run
+    assert [c.key for c in watch(world).cleared] == ["orderstep:no-run"]
+
+
+def test_the_weekly_condition_boundaries_and_a_loop_that_never_ran(world):
+    for ago, expect in ((8 * 86400 - 5, False), (8 * 86400, False), (8 * 86400 + 1, True)):
+        world.write_weekly_log(ran_ago=ago)
+        assert ("weekly:no-run" in [a.key for a in al.run_checks(world.env())[0]]) is expect, ago
+    log = world.logs / "valedia-research-loop.log"
+    log.unlink()
+    plist = world.agents / f"{LABELS[3]}.plist"
+    for age_days, expect in ((2, False), (9, True)):
+        os.utime(plist, (NOW - age_days * 86400, NOW - age_days * 86400))
+        assert ("weekly:no-run" in [a.key for a in al.run_checks(world.env())[0]]) is expect, age_days
+    plist.unlink()
+    assert "weekly:no-run" in [a.key for a in al.run_checks(world.env())[0]]
+    world.jobs = [j for j in world.jobs if j[2] != LABELS[3]]                              # not loaded: the job alert says it
+    assert "weekly:no-run" not in [a.key for a in al.run_checks(world.env())[0]]
+
+
+def test_a_long_weekly_log_is_searched_for_its_last_run_line(world):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - 3600))
+    (world.logs / "valedia-research-loop.log").write_text(f"=== {stamp} weekly research loop\n" + "agent output line\n" * 300000)
+    assert "weekly:no-run" not in [a.key for a in al.run_checks(world.env())[0]]
+
+
+# ----------------------------------------------------------------------------------------------- the mutants the mutation run asked for
+
+def test_the_damage_window_is_thirty_days_to_the_day(world):
+    inside, outside = world.root / "journal" / "2026-10-14.jsonl", world.root / "journal" / "2026-10-13.jsonl"   # 30 and 31 days before
+    outside.write_text('{"half a line\n')
+    assert "journal:damaged" not in keys(watch(world))
+    inside.write_text('{"half a line\n')
+    (a,) = [x for x in watch(world).raised if x.key == "journal:damaged"]
+    assert "2026-10-14.jsonl line 1" in a.detail and "2026-10-13" not in a.detail
+
+
+def test_the_watch_waits_for_the_lock_on_the_alert_file(world):
+    path = world.alerts_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    held = path.open("a+b")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    done, out = threading.Event(), []
+    halt_on(world)
+
+    def run():
+        out.append(watch(world))
+        done.set()
+
+    th = threading.Thread(target=run)
+    th.start()
+    try:
+        assert not done.wait(1.0), "the watch wrote while another process held the alert file"
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+    assert done.wait(15)
+    th.join()
+    assert keys(out[0]) == ["switch:halt"] and len(world.lines()) == 1
+
+
+def test_two_watches_started_together_raise_an_alert_once(world):
+    halt_on(world)
+    results, gate = [], threading.Barrier(2)
+
+    def run():
+        gate.wait()
+        results.append(watch(world))
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(30)
+    assert sorted(len(r.raised) for r in results) == [0, 1] and len(world.lines()) == 1
+
+
+def test_the_watch_function_itself_registers_the_trading_file_when_it_is_not_started_by_main(world, trading_file):
+    plant_everywhere(world)
+    watch(world)
+    assert leaked(world.alerts_file.read_text()) == []
+
+
+class Killed(BaseException):
+    """What a kill looks like to a sender: nothing comes back."""
+
+
+def test_a_run_killed_before_the_sender_answered_leaves_the_alert_not_shown_and_it_is_tried_again(world):
+    halt_on(world)
+
+    class Dies:
+        name = "phone"
+
+        def send(self, alert):
+            raise Killed()
+
+    with pytest.raises(Killed):
+        watch(world, senders=[Dies()])
+    assert len(world.lines()) == 1                                         # the alert was written first
+    states = al.read_notifications(al.notifications_file(world.root))
+    assert not any(st["shown"] for st in states.values())
+    phone = Flaky()
+    assert [a.key for a in watch(world, senders=[phone]).shown] == ["switch:halt"]

@@ -6,8 +6,12 @@ to the page. Nothing real is read, nothing is created in the repository. Every t
 hostile markup, a made-up secret and a made-up account number, and the page is checked by parsing it."""
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
+import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -363,7 +367,7 @@ def test_broker_section_has_open_orders_recent_fills_with_fees_and_the_step_summ
 
 def test_a_run_outside_market_hours_is_shown_as_that_not_as_a_failure(world):
     world.journal.write("2026-11-13", {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": "stopped",
-                                       "stage": "session", "reason": "outside the regular session window 09:35 to 15:45 New York time",
+                                       "stage": "session", "reason": "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)",
                                        "orders_sent": 0, "sent": [], "refused": [], "left_over": []})
     world.journal.write("2026-11-14", {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": "stopped",
                                        "stage": "session", "reason": "another order step is running on this venue's state file",
@@ -565,10 +569,10 @@ def test_a_busy_store_makes_that_one_section_say_busy(world, monkeypatch):
     real = al.open_readonly
 
     def busy_for(*names):
-        def fake(path, timeout=2.0):
+        def fake(path, timeout=5.0, row_factory=True):
             if Path(path).name in names:
                 raise sqlite3.OperationalError("database is locked")
-            return real(path, timeout)
+            return real(path, timeout, row_factory)
         return fake
 
     for names, title in ((("ledger.db",), "Strategies"), ((world.ledger_path.name,), "Broker (paper)"),
@@ -579,16 +583,19 @@ def test_a_busy_store_makes_that_one_section_say_busy(world, monkeypatch):
         assert all(page.sections[t] == baseline[t] for t in TITLES if t != title), title
 
 
-def _locked(*a, **kw):
-    raise sqlite3.OperationalError("database is locked")
-
-
-@pytest.mark.parametrize("module, name", [(pl, "Store"), (pg, "GradingStore")])
-def test_busy_pick_stores_say_busy_for_the_research_section_only(world, monkeypatch, module, name):
+@pytest.mark.parametrize("name", ["pick_lists.sqlite", "grading.sqlite"])
+def test_busy_pick_stores_say_busy_for_the_research_section_only(world, monkeypatch, name):
     baseline = world.page().sections
-    monkeypatch.setattr(module, name, _locked)
+    real = al.open_readonly
+
+    def fake(path, timeout=5.0, row_factory=True):
+        if Path(path).name == name:
+            raise sqlite3.OperationalError("database is locked")
+        return real(path, timeout, row_factory)
+
+    monkeypatch.setattr(al, "open_readonly", fake)
     page = world.page()
-    assert "busy" in page.sections["Research tests in progress"].lower()
+    assert "unavailable" in page.sections["Research tests in progress"].lower() and "busy" in page.sections["Research tests in progress"].lower()
     assert "2026-11-13" in page.sections["Research tests in progress"]                       # the order-book part is still there
     assert all(page.sections[t] == baseline[t] for t in TITLES if t != "Research tests in progress")
 
@@ -605,3 +612,219 @@ def test_the_page_still_builds_when_every_source_is_gone(world):
     for title in TITLES:
         assert "Newest data: none" in page.sections[title] or "unavailable" in page.sections[title].lower() \
             or "not there" in page.sections[title].lower() or "cannot read" in page.sections[title].lower(), title
+
+
+
+# =====================================================================================================================
+# rev 2: what the blind check found
+# =====================================================================================================================
+
+PHRASE = "alpha bravo candle delta eagle frost gamma hotel india juliet kilo lemon"
+TRADING = {"BROKER_API_KEY": "Zq8Lm2Xv9Rt4Wc7Yb1Nh5Jd3Kf6Gs0Pa", "BROKER_API_SECRET": "Hn4Tb7Qw2Ze9Ux5Cv8Ml3Kj6Ar1Sd0Fg",
+           "WALLET_MNEMONIC": PHRASE, "WEBULL_ACCOUNT_ID": "987654321098", "WEBULL_ENV": "production"}
+
+
+@pytest.fixture
+def trading_file(tmp_path, monkeypatch):
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in TRADING.items()))
+    os.chmod(f, 0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    for k in TRADING:
+        monkeypatch.delenv(k, raising=False)
+    return f
+
+
+@pytest.fixture
+def bare_world(tmp_path):
+    """A world in which the test itself never calls remember(): only the command's own registration can hide a value."""
+    return World(tmp_path)
+
+
+def leaked(text):
+    low = text.lower()
+    words = PHRASE.split()
+    grams = [" ".join(words[i:i + 4]) for i in range(len(words) - 3)]
+    return [n for n in ("BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID")
+            if TRADING[n].lower() in low or TRADING[n][:12].lower() in low] + [g for g in grams if g in low]
+
+
+def plant_everywhere(w):
+    values = f"{TRADING['BROKER_API_KEY']} {TRADING['BROKER_API_SECRET']} account {TRADING['WEBULL_ACCOUNT_ID']} words {PHRASE}"
+    w.journal.write("2026-11-13", {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": "stopped",
+                                   "stage": "send", "reason": f"the venue said {values}", "orders_sent": 0, "sent": [], "refused": [],
+                                   "left_over": []})
+    w.journal.write("2026-11-12", {"type": "summary", "equity": 1.0, "strategy_values": {}, "benchmark_values": {},
+                                   "tax": {"unavailable": f"the ledger could not take a fill: {values}"}})
+    (w.logs / "valedia-paper-daily.log").write_text(f"done {values}\n")
+    w.jobs = w.jobs + [("-", "9", f"com.valedia.{TRADING['BROKER_API_KEY']}")]
+    state = json.loads((w.root / "journal" / "paper_state.json").read_text())
+    state["positions"]["mom_a"][f"S{TRADING['BROKER_API_KEY']}"] = {"units": 1.0, "cost": 1.0}
+    (w.root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    (w.root / "artifacts" / "owner" / "alerts.jsonl").write_text(json.dumps(
+        {"time": iso(NOW), "level": "critical", "key": "switch:halt", "title": f"Halt {values}", "detail": "d"}) + "\n")
+
+
+def test_the_real_build_registers_the_trading_file_and_no_value_reaches_any_section(bare_world, trading_file, capsys):
+    w = bare_world
+    plant_everywhere(w)
+    env = w.env()
+    env.environ = None                                                                     # as the real command: read the file itself
+    before = dict(os.environ)
+    out = w.tmp / "out" / "index.html"
+    assert op.main(["build", "--out", str(out)], env=env) == 0
+    assert os.environ == before and not set(TRADING) & set(os.environ)                      # nothing was exported
+    html = out.read_text()
+    seen = capsys.readouterr()
+    assert leaked(html) == [] and leaked(seen.out + seen.err) == []
+    page = Page(html)
+    for title in ("Strategies", "Paper account", "Broker (paper)", "Tax so far", "Health"):
+        assert leaked(page.sections[title]) == [], title
+    assert "&lt;secret&gt;" in html
+
+
+def test_the_webull_word_is_read_from_the_trading_file_and_nothing_else_of_it_is_kept(bare_world, trading_file):
+    env = bare_world.env()
+    env.environ = None
+    op.build(env, out=bare_world.tmp / "o.html")
+    text = Page((bare_world.tmp / "o.html").read_text()).sections["Limits and switches"]
+    assert "not sandbox" in text and "production" not in text and not set(TRADING) & set(os.environ)
+    os.environ["WEBULL_ENV"] = "sandbox"                                                    # the environment wins, as for the trader
+    try:
+        env2 = bare_world.env()
+        env2.environ = None
+        op.build(env2, out=bare_world.tmp / "o2.html")
+        assert "not sandbox" not in Page((bare_world.tmp / "o2.html").read_text()).sections["Limits and switches"]
+    finally:
+        del os.environ["WEBULL_ENV"]
+
+
+def test_a_trading_file_that_cannot_be_read_stops_the_build_with_nothing_written(bare_world, trading_file, capsys):
+    out = bare_world.tmp / "out" / "index.html"
+    for mode in (0o644, 0o000):
+        os.chmod(trading_file, mode)
+        assert op.main(["build", "--out", str(out)], env=bare_world.env()) == 2
+        err = capsys.readouterr().err
+        assert "trading file" in err and leaked(err) == [] and not out.exists()
+    os.chmod(trading_file, 0o600)
+
+
+def test_a_missing_trading_file_builds_the_page(bare_world, tmp_path, monkeypatch):
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(tmp_path / "no-trading-file.env"))
+    out = bare_world.tmp / "out" / "index.html"
+    assert op.main(["build", "--out", str(out)], env=bare_world.env()) == 0 and out.is_file()
+
+
+def test_a_whole_order_tag_or_id_is_shown_by_its_last_characters_only(world):
+    tag = "os-20261113-143501-a1b2c3-XLE"
+    world.journal.write("2026-11-13", {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": "stopped",
+                                       "stage": "send", "reason": f"order {tag} could not be recorded or sent; venue_order_id=V-1234567890",
+                                       "orders_sent": 0, "sent": [], "refused": [], "left_over": []})
+    world.journal.write("2026-11-12", {"type": "summary", "equity": 1.0, "strategy_values": {}, "benchmark_values": {},
+                                       "tax": {"unavailable": f"order {tag} is unknown, client order id 7f3a9c2e51b84d60"}})
+    (world.logs / "valedia-paper-daily.log").write_text(f"order {tag} id 9988776655aabbcc\n")
+    html = world.html()
+    for whole in (tag, "a1b2c3", "1234567890", "7f3a9c2e51b84d60", "9988776655aabbcc"):
+        assert whole not in html, whole
+    assert "…b2c3-XLE" in html and "…7890" in html and "…bbcc" in html
+
+
+# ----------------------------------------------------------------------------------------------- stores are only read
+
+def store_files(world):
+    return [world.root / "memory" / "pick_lists.sqlite", world.root / "artifacts" / "pick_grading" / "grading.sqlite"]
+
+
+def state_of(world):
+    return {str(p.relative_to(world.tmp)): (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(world.tmp.rglob("*"))
+            if p.is_file() and not p.name.endswith(("-wal", "-shm")) and "out" not in p.relative_to(world.tmp).parts[:1]}
+
+
+def make_hot_journal(db):
+    code = (f"import sqlite3, os\nc = sqlite3.connect({str(db)!r}, isolation_level=None)\nc.execute('PRAGMA cache_size = 10')\n"
+            "c.execute('BEGIN')\nc.execute('CREATE TABLE IF NOT EXISTS junk (a)')\n"
+            "c.executemany('INSERT INTO junk VALUES (?)', [('x' * 200,)] * 3000)\nos._exit(0)\n")
+    p = subprocess.Popen([sys.executable, "-I", "-c", code])
+    assert p.wait() == 0
+    assert (db.parent / (db.name + "-journal")).stat().st_size > 0
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["pick store", "grading store"])
+def test_a_store_that_needs_recovery_is_said_so_and_is_not_touched(world, which):
+    baseline = world.page().sections
+    db = store_files(world)[which]
+    make_hot_journal(db)
+    before = state_of(world)
+    names_before = sorted(p.name for p in db.parent.iterdir())
+    page = world.page()
+    text = page.sections["Research tests in progress"].lower()
+    assert "unavailable" in text and "needs its own program to recover it" in text
+    assert state_of(world) == before and sorted(p.name for p in db.parent.iterdir()) == names_before
+    assert all(page.sections[t] == baseline[t] for t in TITLES if t != "Research tests in progress")
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["pick store", "grading store"])
+def test_a_store_held_by_a_writer_is_said_busy_within_five_seconds_and_is_not_touched(world, which):
+    db = store_files(world)[which]
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        before = state_of(world)
+        t0 = time.monotonic()
+        page = world.page()
+        took = time.monotonic() - t0
+        assert took < 5.0 + 3.0                                                              # 5 s of waiting for the store, and no more
+        text = page.sections["Research tests in progress"].lower()
+        assert "unavailable" in text and "busy" in text
+        assert state_of(world) == before
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_the_page_never_opens_a_store_through_a_class_that_can_write(world, monkeypatch):
+    from valedia_trader.data_and_fees import pick_lists
+
+    def refuse(*a, **k):
+        raise AssertionError("a store class that can recover, write or migrate was used")
+    monkeypatch.setattr(pick_lists.Store, "__init__", refuse)
+    monkeypatch.setattr(pg.GradingStore, "__init__", refuse)
+    text = world.page().sections["Research tests in progress"]
+    assert "threads" in text.lower() and "gate" in text.lower() and "unavailable" not in text.lower()
+
+
+# ----------------------------------------------------------------------------------------------- small ones
+
+def test_a_non_finite_equity_is_left_out_of_the_chart(world):
+    state = json.loads((world.root / "journal" / "paper_state.json").read_text())
+    state["history"][1]["equity"] = float("nan")
+    state["history"][2]["equity"] = float("inf")
+    (world.root / "journal" / "paper_state.json").write_text(json.dumps(state))            # json writes NaN and Infinity
+    html = world.html()
+    page = Page(html)
+    assert page.points == [2] and "nan" not in html.lower() and "inf" not in html.lower().replace("information", "")
+
+
+def test_the_open_alerts_say_whether_each_was_shown(world):
+    from valedia_trader.core import alerts as a
+    rows = a.open_alerts(a.alerts_file(world.root))
+    (world.root / "artifacts" / "owner" / "notifications.jsonl").write_text(
+        "".join(json.dumps({"time": iso(NOW), "sender": "mac", "key": rows[0]["key"], "since": rows[0]["time"], "result": "failed"}) + "\n"
+                for _ in range(5)))
+    text = world.page().sections["Health"]
+    assert "not shown" in text and "5 times" in text
+    (world.root / "artifacts" / "owner" / "notifications.jsonl").write_text(
+        json.dumps({"time": iso(NOW), "sender": "mac", "key": rows[0]["key"], "since": rows[0]["time"], "result": "shown"}) + "\n")
+    assert "Notification" in world.page().sections["Health"] and "shown" in world.page().sections["Health"]
+
+
+def test_a_ledger_tag_in_the_order_tables_is_shown_as_the_random_tail_and_its_fund(world):
+    tag = "os-20261113-143501-a1b2c3-XLE"
+    db = sqlite3.connect(world.ledger_path)
+    db.execute("INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES (?, 'XLE', 5, 60.0, 'accepted', ?, ?)",
+               (tag, NOW - 100, NOW - 90))
+    db.execute("INSERT INTO fills (tag, symbol, units, price, fee, time, applied) VALUES (?, 'XLE', 5, 60.0, 0.01, ?, 1)", (tag, NOW - 80))
+    db.commit()
+    db.close()
+    html = world.html()
+    assert tag not in html and "a1b2c3" not in html and html.count("…b2c3-XLE") >= 2

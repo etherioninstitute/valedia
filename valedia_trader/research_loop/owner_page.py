@@ -7,11 +7,16 @@ it; default `artifacts/owner/index.html`). Eight sections, each under its own he
 newest data: Strategies, Paper account, Broker (paper), Forecasters, Tax so far, Limits and switches, Research tests in
 progress, Health.
 
-The page only reads. Every sqlite file is opened read-only with a short wait, and is read through its own module's
-reading code (the ledger of ideas, the tournament, the order ledger, the order-book collector's `day_status`, the pick
-store's and the grading store's `status`, the risk gate, the journal). A source that is missing, cannot be read or is
-busy (a live job is writing it) makes that one section, or that one part of it, say so in plain words; the page is
-still written. Every text that comes from a file or from a program's output is passed through `alerts.clean` (the
+The page only reads. Every sqlite file is opened by this module itself, read-only (`mode=ro`) and waiting at most 5
+seconds in all for a writer, never through a class that can write, recover or migrate, and is read through its own
+module's reading code (the ledger of ideas, the tournament, the order ledger, the order-book collector's `day_status`,
+the pick store's and the grading store's `status`, the risk gate, the journal). A source that is missing, cannot be
+read, is busy (a live job is writing it) or needs its own program to recover a journal a killed writer left makes that
+one section, or that one part of it, say so in plain words ("Unavailable: busy", "Unavailable: needs its own program to
+recover it"); its bytes, modification time and side files stay as they were. The one change a read can make: reading a
+WAL store (the order-book collector's) creates, when they are absent, an empty `-wal` file and a `-shm` file of 32,768
+bytes. Before it reads anything the command registers every value of the trading file with the output guard (into a
+private dictionary: nothing goes into the process environment), and reads the Webull environment word from it. Every text that comes from a file or from a program's output is passed through `alerts.clean` (the
 package's output guard, then any long run of digits becomes `<number>`) and then HTML-escaped. An order is shown only by
 the last 4 characters of its tag, the pick lists only by counts, and no result of any research test is shown.
 """
@@ -82,6 +87,13 @@ def pct(x, signed: bool = True) -> str:
     return "n/a" if not math.isfinite(v) else (f"{v:+.2%}" if signed else f"{v:.2%}")
 
 
+def _finite(x) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
 def when(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -110,6 +122,14 @@ def newest_text(candidates) -> str:
     return str(best[1])[:10] if isinstance(best[1], str) and len(best[1]) == 10 else when(best[0])
 
 
+def short_id(tag) -> str:
+    """An order is shown by the last 4 characters of its id only: `…0007`. A ledger tag (`os-20261113-143501-a1b2c3-XLE`) by the
+    last 4 of its random part and its fund: `…b2c3-XLE`."""
+    text = str(tag)
+    shaped = al.hide_order_ids(text)
+    return shaped if shaped != text else "…" + text[-4:]
+
+
 def table(headers: list[str], rows: list[list[str]]) -> str:
     head = "".join(f"<th>{E(h)}</th>" for h in headers)
     body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
@@ -126,7 +146,11 @@ def problem(exc: BaseException, what: str = "") -> str:
     if isinstance(exc, al.SourceMissing):
         return para(f"Not available{label}: {E(exc)}.", "problem")
     if al.is_busy(exc):
-        return para(f"Busy{label}: another process is writing the file just now. Build the page again in a moment.", "problem")
+        return para(f"Unavailable{label}: busy. Another process is writing the file just now; build the page again in a moment.",
+                    "problem")
+    if al.needs_recovery(exc):
+        return para(f"Unavailable{label}: needs its own program to recover it. A writer was stopped part-way; the page does "
+                    "not touch the file.", "problem")
     return para(f"Unavailable{label}: {E(al.describe(exc))}.", "problem")
 
 
@@ -269,7 +293,8 @@ def paper_section(env: al.Env, ctx: Context) -> tuple[list, str]:
     state = json.loads(path.read_text())
     if not isinstance(state, dict):
         raise ValueError("paper_state.json is not a record")
-    history = [(str(r.get("day"))[:10], float(r["equity"])) for r in state.get("history", []) if isinstance(r, dict) and "equity" in r]
+    history = [(str(r.get("day"))[:10], float(r["equity"])) for r in state.get("history", [])
+               if isinstance(r, dict) and "equity" in r and _finite(r["equity"])]
     positions = [[E(strategy), E(sym), num(lot.get("units"), 4), num(lot.get("cost"))]
                  for strategy, book in sorted((state.get("positions") or {}).items()) if isinstance(book, dict)
                  for sym, lot in sorted(book.items()) if isinstance(lot, dict) and abs(float(lot.get("units") or 0.0)) > 1e-12]
@@ -309,12 +334,12 @@ def broker_part(path: Path, env: al.Env, ctx: Context) -> tuple[list, str]:
     recent = [f for f in fills if f["time"] >= env.now - FILLS_DAYS * 86400]
     body = [f"<h3>{E(name)}</h3>"]
     body.append(table(["Order (last 4)", "Fund", "Units", "State", "Updated"],
-                      [["…" + E(str(o["tag"])[-4:]), E(o["symbol"]), num(o["units"], 4), E(o["state"]), E(when(o["updated"]))]
+                      [[E(short_id(o["tag"])), E(o["symbol"]), num(o["units"], 4), E(o["state"]), E(when(o["updated"]))]
                        for o in open_orders]) if open_orders else para("No open orders."))
     body.append(f"<h3>Fills of the last {FILLS_DAYS} days</h3>")
     if recent:
         body.append(table(["Order (last 4)", "Fund", "Units", "Price", "Fee", "Time"],
-                          [["…" + E(str(f["tag"])[-4:]), E(f["symbol"]), num(f["units"], 4), num(f["price"]), num(f["fee"]),
+                          [[E(short_id(f["tag"])), E(f["symbol"]), num(f["units"], 4), num(f["price"]), num(f["fee"]),
                             E(when(f["time"]))] for f in recent]))
         body.append(para(f"Fees in these fills: {E(num(sum(float(f['fee'] or 0.0) for f in recent)))}."))
     else:
@@ -409,12 +434,11 @@ def tax_section(env: al.Env, ctx: Context) -> tuple[list, str]:
 def webull_environment(env: al.Env) -> str:
     """`sandbox` or `not sandbox`, read as the trader reads WEBULL_ENV (default sandbox). Never a key."""
     from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT
-    environ = env.environ
-    if environ is None:
-        from valedia_trader.core.secrets import load_env
-        load_env()
-        environ = os.environ
-    return TEST_ENVIRONMENT if (environ.get("WEBULL_ENV") or TEST_ENVIRONMENT).strip().lower() == TEST_ENVIRONMENT else f"not {TEST_ENVIRONMENT}"
+    if env.environ is not None:
+        word = env.environ.get("WEBULL_ENV")
+    else:                                   # as the trader reads it: the environment first, then the trading file; nothing is exported
+        word = os.environ.get("WEBULL_ENV") or al.register_trading_file(env).get("WEBULL_ENV")
+    return TEST_ENVIRONMENT if (word or TEST_ENVIRONMENT).strip().lower() == TEST_ENVIRONMENT else f"not {TEST_ENVIRONMENT}"
 
 
 def limits_section(env: al.Env, ctx: Context) -> tuple[list, str]:
@@ -461,15 +485,13 @@ def orderbook_part(env: al.Env) -> tuple[list, str]:
 def picks_part(env: al.Env) -> tuple[list, str]:
     from valedia_trader.data_and_fees import pick_lists
     path = env.paths.memory / "pick_lists.sqlite"
-    if not path.is_file():
-        raise al.SourceMissing("pick_lists.sqlite is not there")
-    store = pick_lists.Store(path, readonly=True, create=False, lock=False)
+    store = object.__new__(pick_lists.Store)          # the store's own reading code on our own read-only connection: its
+    store.path, store.conn = path, al.open_readonly(path, row_factory=False)   # constructor can recover (write) and migrate
     try:
-        store.conn.execute("PRAGMA busy_timeout = 2000")
         st = pick_lists.status(store)
         newest = store.latest_time()
     finally:
-        store.close()
+        store.conn.close()
     rows = [[label, str(st[k])] for label, k in (("Threads", "threads"), ("Comments", "comments"), ("Comment versions", "versions"),
                                                  ("Parsed", "parsed"), ("Not parsed", "unparsed"), ("Set aside", "set_aside"))]
     return [newest], "<h3>Pick lists: collection</h3>" + table(["Count of", "Number"], rows)
@@ -478,12 +500,14 @@ def picks_part(env: al.Env) -> tuple[list, str]:
 def grading_part(env: al.Env) -> tuple[list, str]:
     from valedia_trader.research_loop import pick_grading as pg
     root = env.root / "artifacts" / "pick_grading"
-    if not (root / pg.STORE_FILE).is_file():
-        raise al.SourceMissing(f"{pg.STORE_FILE} is not there")
-    store = pg.GradingStore(root / pg.STORE_FILE, readonly=True)
-    kview = pg._KalshiView(root / "kalshi.sqlite")
+    store = object.__new__(pg.GradingStore)
+    store.path, store.conn = root / pg.STORE_FILE, al.open_readonly(root / pg.STORE_FILE)
+    kview = object.__new__(pg._KalshiView)
+    kview.conn = al.open_readonly(root / "kalshi.sqlite", row_factory=False) if (root / "kalshi.sqlite").is_file() else None
     try:
-        store.conn.execute("PRAGMA busy_timeout = 2000")
+        layout = store.conn.execute("SELECT version FROM layout WHERE id = 1").fetchone()
+        if layout is None or layout[0] != pg.LAYOUT:
+            raise pg.Refused("the grading store is of another layout than this code reads")
         kept = store.word_list()
         fp = pg.fingerprint(kept["sha256"] if kept is not None else None)
         frozen = store.frozen()
@@ -491,7 +515,7 @@ def grading_part(env: al.Env) -> tuple[list, str]:
             raise pg.Refused("the matching rule is frozen at an earlier fingerprint and the code's has changed")
         st = pg.status(store, fp, kview)
     finally:
-        store.close()
+        store.conn.close()
         kview.close()
     rows = [["Games on the schedules", str(st["games"])], ["Picks matched to a game", str(st["picks"])],
             ["Errors recorded", str(st["errors"])]]
@@ -546,8 +570,10 @@ def health_section(env: al.Env, ctx: Context) -> tuple[list, str]:
     body.append("<h3>Open alerts of the watchdog</h3>")
     try:
         rows = al.open_alerts(al.alerts_file(env.root))
-        body.append(table(["Level", "Key", "What", "Since"], [[E(r.get("level"), 20), E(r.get("key"), 80), E(r.get("title"), 200),
-                                                              E(r.get("time"), 40)] for r in rows]) if rows else para("No open alerts."))
+        states = al.read_notifications(al.notifications_file(env.root))
+        body.append(table(["Level", "Key", "What", "Since", "Notification"],
+                          [[E(r.get("level"), 20), E(r.get("key"), 80), E(r.get("title"), 200), E(r.get("time"), 40),
+                            E(al.notification_note(states, r), 120)] for r in rows]) if rows else para("No open alerts."))
     except Exception as exc:
         body.append(problem(exc, "alerts"))
     return times, "".join(body)
@@ -560,6 +586,7 @@ SECTIONS = [("Strategies", "strategies", strategies_section), ("Paper account", 
 
 
 def render(env: al.Env) -> str:
+    al.register_trading_file(env)                     # before anything is read: every value of the trading file known to the guard
     ctx = Context(env)
     parts = []
     for title, ident, fn in SECTIONS:
@@ -593,6 +620,9 @@ def main(argv=None, env: al.Env | None = None) -> int:
     args = ap.parse_args(argv)
     try:
         path = build(env or al.Env.default(args.root), out=args.out)
+    except al.TradingFileError as exc:
+        print(f"the page was not built: {exc}", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"could not write the page: {al.describe(exc)}", file=sys.stderr)
         return 2
