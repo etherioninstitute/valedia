@@ -14,8 +14,9 @@ What happens each minute (`Collector.cycle`), in this order:
 
 * snapshot  first, for every watched market (by watch number, the same order each minute) and then for every
             market in its tail (below): the ten best levels a side of its book and the trades since the last read
-            (each read looks back 120 s before the previous read began, because trades can reach the tape late,
-            and a trade is stored once by its `trade_id`), each request stamped with its start and end time. A
+            (each read looks back TRADE_READBACK_S, 150 s, before the previous read began: trades reach the tape up
+            to a minute late and our clock may be off by up to the 30 s of the clock rule, twice, plus a margin;
+            a trade is stored once by its `trade_id`), each request stamped with its start and end time. A
             book that is
             crossed (best bid at or above best ask), has a negative size or a malformed price is stored as sent
             (`raw_json`), marked `invalid` with the reason, and never decided on;
@@ -51,26 +52,35 @@ If a cycle runs into the next minute the next one starts at once (event `overrun
 gets no cycle of its own, so each slot due in it gets its row, `late`, with the reason. Nothing but a stop signal
 ends the loop: when the record cannot be written (a full disk) it writes one line to standard error, tries again
 each minute, and records the gap once it can write again. A store outage (or a stop) longer than an hour loses
-the trades older than that hour: a trades read never goes back more than an hour.
+the trades older than that hour: a trades read never goes back more than an hour, except the first read of a
+market after `clock_on` (below).
 
 The clock: no row is stored unless the collector's clock is known to be right. Two checks decide that:
 * a step detector, with no network: every reading of the wall clock also reads the monotonic clock, and when the
   wall clock has moved by more than STEP_TOLERANCE_S (2 s) more or less than the monotonic one since the previous
   reading, the clock has stepped (a sleep of the machine looks the same, and is handled the same);
 * agreement with the exchange: every Kalshi answer carries an HTTP Date header, and our clock agrees when it is
-  within CLOCK_AGREE_S (120 s) of it.
-At start, after any step and whenever a Date disagrees, the collector is out of sync: it finishes nothing of the
-cycle it is in and stores nothing more from it (a read whose request began before the step and ended after it is
-thrown away), writes one `clock_off` event, and from then on makes one cheap Kalshi request a minute
-(`/exchange/status`) and nothing else. When an answer's Date agrees and no step was seen during that request, it
-records `clock_on` and resumes exactly as after a stop of that length: the gap is recorded, watches that ran out
-are dropped and replaced, and holes in the history give nulls and warm-ups by the usual rules. For `status` a
-period out of sync is a gap like any stop.
+  within CLOCK_AGREE_S (30 s) of it. Only a Date that parses to a time with a zone counts; one that is missing,
+  malformed or has no zone confirms nothing.
+The collector is in sync only after a Date that agrees. At start, after any step, whenever a Date disagrees,
+after UNDATED_MAX (3) answers in a row without a usable Date and after DATELESS_MAX_S (5 minutes, monotonic)
+without a Date that agrees, it is out of sync: it finishes nothing of the cycle it is in and stores nothing more
+from it (a read whose request began before the step and ended after it is thrown away), writes one `clock_off`
+event (with our clock and the latest Date), and from then on makes exactly one cheap Kalshi request a minute
+(`/exchange/status`, no retry) and nothing else. When an answer's Date agrees and no step was seen during that
+request, it records `clock_on` (with the Date and our clock at that answer; if the store cannot take it then, at
+the next cycle that can) and resumes exactly as after a stop of that length: the gap is recorded, watches that ran
+out are dropped and replaced, and holes in the history give nulls and warm-ups by the usual rules. Each market
+read in the last cycle before the gap has its next trades read go back to its last one less TRADE_READBACK_S, up
+to RESUME_BACKFILL_S (24 hours; beyond that the hole is recorded as `trades_lost`), a market dropped meanwhile
+once more, as a tail. For `status` a period out of sync is a gap like any stop. A pause after repeated failures
+makes no request for five minutes, so it ends out of sync, and the first check after it brings it back.
 
 No single Kalshi request may take longer than 30 seconds (KALSHI_REQUEST_LIMIT_S): `collect`, `once` and
 `select` use a transport that gives up at that limit (`bounded_fetch`), and the collector treats any answer that
-took longer as a failed request. An abandoned request's thread ends by itself within about the same time; while
-MAX_ABANDONED (4) are still running, no new request is started (each such is a failed request).
+took longer as a failed request. An abandoned request's thread lives until its connection ends (its socket has the
+same 30 s timeout for each read, so a connection that trickles can keep it longer); while MAX_ABANDONED (4) of them
+are still running, no new request is started (each such is a failed request) until one ends.
 
 Where this differs from the prediction's words:
 
@@ -90,8 +100,9 @@ screened out (`screened_out`).
 Load at twenty markets. Kalshi: one book and one trades page per market per minute, 20 x 2 = 40 GET a minute,
 under the 45 allowed; the client's pacing keeps them at most three a second, so they take about 14 s. A trades
 page holds 1,000 trades, so a second page is needed only above 1,000 trades a minute in one market. Tails add
-two GET a minute each while they last (35 minutes at most), still through the same pacing: ten markets ended at
-a reselection and not chosen again add 20 GET a minute for 35 minutes, about 7 s more of reads. The selection
+two GET a minute each while they last (35 minutes at most), still through the same pacing: twenty tails (every
+place ended at a reselection and none chosen again) add 40 GET a minute, 80 in all, about 27 s of reads, for
+up to 35 minutes. The selection
 every six hours is a burst outside that steady state: one page per 1,000 open markets in the close window plus
 one book per market read (it stops once the places are full), at the same three a second. Model: one call per
 market every five minutes, and the twenty markets are spread over five phases, 20 / 5 = 4 a phase, so every
@@ -175,7 +186,6 @@ MODEL_LIMIT_S = 10.0              # hard limit: an answer not in after this is a
 PIN_TIMEOUT_S = 2.0               # each of the two pin-check GETs
 CALL_RESERVE_S = 2.0              # no call is started with less than MODEL_LIMIT_S + this left in the minute
 FAILS_BEFORE_PAUSE, PAUSE_S = 5, 300
-TRADE_OVERLAP_S = 120             # each trades read looks back 120 s before the previous one began (late tape)
 FIRST_TRADES_S = 60               # a new market's first read goes back one minute
 MAX_BACKFILL_S = 3600             # after a stop the tape is read again from where it stopped, at most an hour back
 # Books are read only for markets whose cached quote is within five cents of the band (see the module docstring:
@@ -189,8 +199,16 @@ RESELECT_AHEAD_S = 120            # at a reselection, watches whose 12 hours end
 KALSHI_REQUEST_LIMIT_S = 30.0     # no single Kalshi request may take longer: it is then a failed request
 MAX_ABANDONED = 4                 # with this many abandoned requests still running, no new one is started
 STEP_TOLERANCE_S = 2.0            # the wall clock moving this much more or less than the monotonic one: a step
-CLOCK_AGREE_S = 120.0             # our clock agrees with Kalshi's Date header when within this of it
+CLOCK_AGREE_S = 30.0              # our clock agrees with Kalshi's Date header when within this of it
+UNDATED_MAX = 3                   # this many answers in a row without a usable Date: out of sync
+DATELESS_MAX_S = 300.0            # this long (monotonic) without a Date that agrees: out of sync
 SYNC_PATH = "/exchange/status"    # the one cheap request a minute while out of sync
+SYNC_EVERY_S = 60.0               # out of sync: one such request this often, with no retry
+TAPE_LAG_S = 60.0                 # a trade reaches the tape up to this late
+READBACK_MARGIN_S = 30.0
+TRADE_READBACK_S = TAPE_LAG_S + 2 * CLOCK_AGREE_S + READBACK_MARGIN_S   # 150 s: each trades read looks back
+                                  # this far before the previous one began (late tape, our clock off by the threshold)
+RESUME_BACKFILL_S = 24 * 3600     # after clock_on, a market's first trades read goes back to its last one, this far
 
 STATUSES = ("ok", "late", "model_unavailable", "tag_mismatch", "stale_data", "error")
 TABLES = ("selections", "markets", "market_drops", "snapshots", "trades", "decisions", "heartbeats", "events")
@@ -970,6 +988,20 @@ def kalshi_client() -> kd.KalshiData:
                          tries=3)
 
 
+def _date_header_ts(date: str | None) -> float | None:
+    """An HTTP Date header as epoch seconds; None when it is missing, malformed or has no zone (only such a Date
+    can confirm the clock)."""
+    if not date:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(date)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if dt is None or dt.tzinfo is None:              # "-0000" and no zone at all both come back without one
+        return None
+    return dt.timestamp()
+
+
 class _OutOfSync(BaseException):
     """The clock is not known to be right: the cycle stops where it is and nothing more of it is stored. A
     BaseException, so that no `except Exception` on the way can keep the cycle going."""
@@ -1008,24 +1040,30 @@ class Collector:
         self.synced = False
         self._prev: tuple[float, float] | None = None   # the previous (wall, monotonic) reading
         self._stepped = False                       # a step seen since the flag was last cleared
-        self._disagree = False                      # the latest Date header disagreed
-        self._dated = False                         # the latest answer had a Date header
-        self.clock_offset: float | None = None      # our clock less the latest Date header, in seconds
+        self._disagree = False                      # the latest usable Date header disagreed
+        self._dated = False                         # the latest answer had a usable Date header (one with a zone)
+        self._undated = 0                           # answers in a row without a usable Date header
+        self._confirmed: float | None = None        # monotonic time of the latest Date that agreed
+        self._date_ts: float | None = None          # the latest usable Date header, as epoch seconds
+        self._date_clock: float | None = None       # our clock at the end of that answer
+        self.clock_offset: float | None = None      # our clock less the latest usable Date header, in seconds
+        self._last_check: float | None = None       # monotonic time of the latest sync check
         self._started = False                       # the `start` event is written once the clock is first right
+        self._resume_due = False                    # in sync, but `start` or `clock_on` not yet written
         self._off_noted = False                     # the `clock_off` event of this period is written
+        self._deep: set = set()                     # after clock_on: markets whose first trades read is still to come
+        self._lost_noted: set = set()
+        self._catch_up: dict = {}                   # after clock_on: dropped meanwhile, read once more (as a tail)
         self.n_requests = self.n_failures = self.n_model_calls = 0
         inner = kalshi.fetch
 
         def counted(url):
-            self.clock()                                 # in sync: a step before the request stops it here
+            t0 = self.clock()                            # in sync: a step before the request stops it here
             self.n_requests += 1
             m0 = self._mono()
             answer = inner(url)
             t1, took = self._read(), self._mono() - m0
-            date = answer[1] if isinstance(answer, tuple) else None
-            self._dated = date is not None
-            if date is not None:
-                self._agree(date, t1)
+            self._date(answer[1] if isinstance(answer, tuple) else None, t0, t1)
             self.clock()                                 # a step during the request, or a Date that disagrees
             if took > KALSHI_REQUEST_LIMIT_S:            # an answer this slow is a failed request
                 raise TimeoutError("request took %.1f s, over the %g s limit" % (took, KALSHI_REQUEST_LIMIT_S))
@@ -1042,21 +1080,49 @@ class Collector:
         self._prev = (w, m)
         return w
 
+    def _unknown(self) -> str | None:
+        """Why the clock is not known to be right (None when it is)."""
+        if self._stepped:
+            return "the clock stepped"
+        if self._disagree:
+            return "the clock is %.0f s off Kalshi's Date header" % self.clock_offset
+        if self._undated >= UNDATED_MAX:
+            return "%d answers in a row without a usable Date header" % self._undated
+        if self._confirmed is None or self._prev[1] - self._confirmed > DATELESS_MAX_S:
+            return "no Date header that agrees for over %g s" % DATELESS_MAX_S
+        return None
+
     def clock(self) -> float:
-        """The wall clock. While in sync, a step or a disagreeing Date stops the cycle here (`_OutOfSync`)."""
+        """The wall clock. While in sync, a step, a disagreeing Date, UNDATED_MAX answers in a row without a
+        usable Date or DATELESS_MAX_S without one that agrees stop the cycle here (`_OutOfSync`)."""
         w = self._read()
-        if self.synced and (self._stepped or self._disagree):
-            raise _OutOfSync("the clock stepped" if self._stepped else
-                             "the clock is %.0f s off Kalshi's Date header" % self.clock_offset)
+        if self.synced:
+            why = self._unknown()
+            if why:
+                raise _OutOfSync(why)
         return w
 
-    def _agree(self, date: str, t: float) -> None:
-        try:
-            kalshi_ts = email.utils.parsedate_to_datetime(date).timestamp()
-        except (TypeError, ValueError):
+    def _date(self, date: str | None, t0: float, t1: float) -> None:
+        """Weigh one answer's Date header. Only one that parses to a time with a zone counts. It covers one second
+        and was stamped while the request ran (our clock t0 to t1), so our clock less Kalshi's lies between
+        t0 - (date + 1) and t1 - date; it agrees when that range reaches within CLOCK_AGREE_S of zero."""
+        ts = _date_header_ts(date)
+        if ts is None:
+            self._dated, self._undated = False, self._undated + 1
             return
-        self.clock_offset = t - kalshi_ts
-        self._disagree = abs(self.clock_offset) > CLOCK_AGREE_S
+        self._dated, self._undated = True, 0
+        self._date_ts, self._date_clock = ts, t1
+        lo, hi = t0 - (ts + 1), t1 - ts
+        self.clock_offset = (lo + hi) / 2
+        self._disagree = hi < -CLOCK_AGREE_S or lo > CLOCK_AGREE_S
+        if not self._disagree:
+            self._confirmed = self._mono()
+
+    def _times(self) -> dict:
+        """Our clock and the latest Date header, so that a gap can be placed in true time."""
+        return {"offset_s": self.clock_offset, "clock_ts": self._date_clock, "date_ts": self._date_ts,
+                "date_iso": iso(self._date_ts) if self._date_ts is not None else None,
+                "date_clock_ts": self._date_clock}
 
     def _guard(self) -> None:
         """Before every write: the clock is known to be right, now."""
@@ -1066,54 +1132,94 @@ class Collector:
 
     def _go_off(self, why: str) -> None:
         """Out of sync: nothing more is stored; one `clock_off` event (if the store can take it); the next cycles
-        only check the clock. The cycle in progress is forgotten, as after a stop."""
-        self.synced = False
+        only check the clock, once a minute. The cycle in progress is forgotten, as after a stop."""
+        self.synced, self._resume_due = False, False
         self._minute = self._cycle_start = self._cycle_end = None
         self.paused_until, self.consecutive_fails = None, 0
         if not self._off_noted:
             self._off_noted = True
+            now = self._read()
             try:
-                self.store.insert("events", {**stamp("", self._read()), "kind": "clock_off", "ticker": None,
-                                             "detail_json": json.dumps({"why": why, "offset_s": self.clock_offset})})
+                self.store.insert("events", {**stamp("", now), "kind": "clock_off", "ticker": None,
+                                             "detail_json": json.dumps({"why": why, **self._times(), "clock_ts": now})})
             except Exception:                            # a store that cannot be written: nothing to add
                 pass
 
+    def _check_due(self) -> bool:
+        return self._last_check is None or self._mono() - self._last_check >= SYNC_EVERY_S - 1.0
+
     def _resync(self) -> bool:
-        """The one cheap request; in sync again when its answer's Date agrees and no step was seen meanwhile.
-        Then resume as after a stop (`_resume`). A step before the check is taken in by this reading: the Date
-        then says whether the clock is right."""
+        """The one cheap request, with no retry; in sync again when its answer's Date agrees and no step was seen
+        meanwhile. Then resume as after a stop (`_resume`). A step before the check is taken in by this reading:
+        the Date then says whether the clock is right."""
         self._read()
         self._stepped = self._disagree = self._dated = False
-        try:
-            self.kalshi.get_json(SYNC_PATH)
-        except Exception:
+        if not self._check():
             return False
         if self._stepped or self._disagree or not self._dated:
             return False
-        self.synced, self._off_noted = True, False
-        self._resume()
+        self.synced, self._off_noted, self._undated, self._resume_due = True, False, 0, True
+        try:
+            self._resume()
+        except Exception:                                # the store cannot be written: done at the next cycle
+            pass
         return True
+
+    def _check(self) -> bool:
+        """The one cheap request, with no retry. Whether it was answered."""
+        self._last_check = self._mono()
+        tries, self.kalshi.tries = self.kalshi.tries, 1
+        try:
+            self.kalshi.get_json(SYNC_PATH)
+            return True
+        except Exception:
+            return False
+        finally:
+            self.kalshi.tries = tries
 
     def _resume(self) -> None:
         """Record the start (the first time) or `clock_on`; after earlier rows, record the gap since the last
         heartbeat and stop watching the markets whose watch ran out meanwhile. The others are watched on. With
-        nothing watched, the cycle selects at once."""
+        nothing watched, the cycle selects at once. In one transaction, so a store that cannot take it is tried
+        again at the next cycle. After `clock_on`, each market read in the last cycle before the gap has its next
+        trades read go back to its last one (up to a day), the dropped meanwhile once more, as a tail."""
         now = self.clock()
-        if not self._started:
-            self._started = True
-            self.event("start", None, battery_id=BATTERY_ID, tag=TAG)
-        else:
-            self.event("clock_on", None, offset_s=self.clock_offset)
+        first = not self._started
         last = self.store.conn.execute("SELECT MAX(ts) FROM heartbeats").fetchone()[0]
-        if last is not None:
-            self.event("gap", None, from_ts=last, from_iso=iso(last), to_ts=now, to_iso=iso(now), seconds=now - last)
+        recent = {}
+        if not first and last is not None:
+            for wid, t, close_ts in self.store.conn.execute(
+                    "SELECT s.watch_id, s.ticker, m.close_ts FROM snapshots s JOIN markets m ON m.watch_id = s.watch_id "
+                    "WHERE s.end_ts > ? ORDER BY s.id", (last - 2 * 60,)).fetchall():
+                recent[t] = {"watch_id": wid, "ticker": t, "close_ts": close_ts, "tail": True}
+        ends = []
         for w in self.watched():
             reason = self._expired(w, now)
             if reason:                                   # recorded as ending when it ran out, not at the restart
                 ran_out = min(x for x in (w["watch_start_ts"] + WATCH_MAX_S, w["close_ts"] - STOP_BEFORE_CLOSE_S)
                               if x <= now)
-                self.drop(w, reason + " (while stopped)", at=max(ran_out, last if last is not None else ran_out))
-        self._last_beat = now
+                ends.append((w, reason + " (while stopped)", max(ran_out, last if last is not None else ran_out)))
+
+        def ev(kind, **detail):
+            return {**stamp("", now), "kind": kind, "ticker": None, "detail_json": json.dumps(detail, default=str)}
+        ins = self.store.insert
+        self._guard()
+        with self.store.conn:
+            if first:
+                ins("events", ev("start", battery_id=BATTERY_ID, tag=TAG), commit=False)
+            else:
+                ins("events", ev("clock_on", **self._times()), commit=False)
+            if last is not None:
+                ins("events", ev("gap", from_ts=last, from_iso=iso(last), to_ts=now, to_iso=iso(now),
+                                 seconds=now - last), commit=False)
+            for w, reason, at in ends:
+                ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", at),
+                                     "reason": reason}, commit=False)
+        self._started, self._resume_due, self._last_beat = True, False, now
+        if not first:
+            watched = {w["ticker"] for w in self.watched()}
+            self._deep, self._lost_noted = set(recent), set()
+            self._catch_up = {t: r for t, r in recent.items() if t not in watched}
 
     # ---- small helpers
     def event(self, kind: str, ticker: str | None = None, **detail) -> None:
@@ -1143,8 +1249,30 @@ class Collector:
 
     def drop(self, w: dict, reason: str, at: float | None = None) -> None:
         self._guard()
-        self.store.insert("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"],
-                                           **stamp("dropped", self.clock() if at is None else at), "reason": reason})
+        now = self.clock() if at is None else at
+        with self.store.conn:
+            if at is None:
+                self._rows_before_drop(w, now)
+            self.store.insert("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"],
+                                               **stamp("dropped", now), "reason": reason}, commit=False)
+
+    def _rows_before_drop(self, w: dict, now: float) -> None:
+        """Before a watch is dropped: each slot of it after the latest cycle's minute, up to and including the
+        current minute, that has no row gets its `late` row (the cycle of that minute will not see the watch)."""
+        if self._minute is None:
+            return
+        m, upto = self._minute + 60, math.floor(now / 60) * 60
+        while m <= upto:
+            if phase_of_minute(m) == w["phase"] and self._warm(w, m) and self.store.conn.execute(
+                    "SELECT 1 FROM decisions WHERE watch_id = ? AND slot_ts = ? AND forced = 0",
+                    (w["watch_id"], m)).fetchone() is None:
+                why = ("the cycle before overran this minute" if m < upto else
+                       "the watch was dropped before this minute's cycle")
+                self.store.insert("decisions", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("slot", m),
+                                                **stamp("decision", self.clock()), "status": "late", "forced": 0,
+                                                "battery_id": BATTERY_ID, "model_tag": TAG,
+                                                "error": "not called: " + why}, commit=False)
+            m += 60
 
     # ---- start and stop
     def start(self) -> None:
@@ -1154,7 +1282,7 @@ class Collector:
         try:
             if not self._resync():
                 self._go_off("at start: " + ("the clock stepped" if self._stepped else
-                                             "no Date header" if not self._dated else
+                                             "no usable Date header" if not self._dated else
                                              "the clock is %.0f s off Kalshi's Date header" % self.clock_offset
                                              if self._disagree else "Kalshi could not be reached"))
         except _OutOfSync as e:
@@ -1171,6 +1299,15 @@ class Collector:
         first = True
         while not self.stop.is_set():
             try:
+                if not self.synced and self._last_check is not None:   # out of sync: one check a minute
+                    due = self._last_check + SYNC_EVERY_S - self._mono()
+                    if due > 0:
+                        wait(due)
+                        if self.stop.is_set():
+                            break
+                    first = False
+                    self.cycle()
+                    continue
                 now = self._read()
                 if not (first and not self.watched()):
                     if self._minute is None or now < self._cycle_start:
@@ -1214,8 +1351,8 @@ class Collector:
         then drops, a selection if one is due, and a heartbeat. Returns the decisions made."""
         self._depth += 1
         try:
-            if not self.synced:
-                if self._depth > 1 or not self._resync():
+            if not self.synced:                          # one check a minute, and nothing else
+                if self._depth > 1 or not self._check_due() or not self._resync():
                     self._go_off("still out of sync")
                     return []
             return self._cycle(force_decision, allow_select)
@@ -1230,6 +1367,8 @@ class Collector:
                 self._cycle_end = self._read()
 
     def _cycle(self, force_decision: bool, allow_select: bool) -> list[dict]:
+        if self._resume_due:                             # back in sync, but the store could not take it then
+            self._resume()
         start = self.clock()
         minute = math.floor(start / 60) * 60
         prev_minute, prev_end = self._minute, self._cycle_end
@@ -1242,10 +1381,19 @@ class Collector:
         if self.paused() and start >= self.paused_until:
             self.paused_until = None
             self.event("pause_end", None)
+        if self.paused() and self._prev[1] - self._confirmed > DATELESS_MAX_S - SYNC_EVERY_S - 5:
+            self._check()                                # paused: the one cheap request, so the clock stays known
         if prev_minute is not None and prev_end is not None and not force_decision:
             self._skipped(prev_minute, min(minute, math.floor(prev_end / 60) * 60 + 60))
         watched = self.watched()
         tails = self.store.tails(start, exclude={w["ticker"] for w in watched})
+        read = {w["ticker"] for w in watched + tails}
+        for t in list(self._catch_up):                   # after clock_on: once more, for the trades of the gap
+            if t in read:
+                del self._catch_up[t]
+        tails += list(self._catch_up.values())
+        self._catch_up = {}
+        self._deep &= {w["ticker"] for w in tails} | read   # a market not read on keeps no claim to the long read
         for w in watched + tails:
             if self.stop.is_set():
                 break
@@ -1375,11 +1523,21 @@ class Collector:
 
     # ---- snapshots
     def _trades_from(self, ticker: str, b1: float) -> int:
-        """`min_ts` of a trades read whose book read ended at b1: 120 s before the latest read began, or one minute
-        back for a first read; never more than an hour back."""
+        """`min_ts` of a trades read whose book read ended at b1: TRADE_READBACK_S (150 s) before the latest read
+        began, or one minute back for a first read; never more than an hour back, except for the first read of a
+        market after `clock_on`, which goes back to its last read up to RESUME_BACKFILL_S (24 hours; a longer hole
+        is recorded as `trades_lost`)."""
         last = self.store.last_trade_read(ticker)
-        min_ts = last - TRADE_OVERLAP_S if last is not None else b1 - FIRST_TRADES_S
-        return int(max(min_ts, b1 - MAX_BACKFILL_S))
+        if last is None:
+            return int(b1 - FIRST_TRADES_S)
+        min_ts = last - TRADE_READBACK_S
+        cap = RESUME_BACKFILL_S if ticker in self._deep else MAX_BACKFILL_S
+        if min_ts < b1 - cap and ticker in self._deep and ticker not in self._lost_noted:
+            self._lost_noted.add(ticker)                 # out of sync for over a day: what the tape cannot give back
+            self.event("trades_lost", ticker, from_ts=min_ts, from_iso=iso(min_ts), to_ts=b1 - cap,
+                       to_iso=iso(b1 - cap), why="out of sync for longer than the %d h a read goes back"
+                       % (cap // 3600))
+        return int(max(min_ts, b1 - cap))
 
     def snapshot(self, w: dict, tail: bool = False) -> int | None:
         """One snapshot of one market: its book, then its new trades, written in one transaction. `tail`: read
@@ -1432,6 +1590,8 @@ class Collector:
                     (x["trade_id"], ticker, x["created_time"], x["created_ts"], x["yes_price"], x["no_price"], x["count"],
                      x["taker_side"], None if x.get("is_block_trade") is None else int(bool(x["is_block_trade"])),
                      iso(t1), t1, sid))
+        if ok:
+            self._deep.discard(ticker)
         return sid
 
     # ---- decisions
@@ -1599,6 +1759,7 @@ class Collector:
         self._guard()
         with self.store.conn:                            # the ends, the selection and its markets: all or nothing
             for w in ending:
+                self._rows_before_drop(w, t1)
                 ins("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"], **stamp("dropped", t1),
                                      "reason": "watched 12 hours"}, commit=False)
             sid = ins("selections", {**stamp("started", t0), **stamp("finished", t1), "markets_seen": sel.markets_seen,
