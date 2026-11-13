@@ -118,3 +118,22 @@ Raised by the builder of the grading code; none was chosen with a result in sigh
    recomputed with the frozen rule on each run and the latest row counts.
 6. **Fewer than 40 matched picks:** the reading of 40 waits until there are 40; no result is read before it.
 7. **The test period is scored once, at the end:** when the counts are reached or on 2027-03-31, not before.
+
+## Clarifications after the first check of the code (2026-11-13, still before any pick has been compared with a result)
+
+A blind check of the grading code found ways the rules above could be bent. Each is closed here, on the
+strict side: every one can only remove picks, never add them.
+
+8. **A game's start** is the earliest start time that any stored schedule list gives for it. Text and purchases
+   count only before that moment. A game counts only if a list fetched before that moment held it.
+9. **Naming a team.** A comment's words are compared with every team known from the stored lists of the five
+   leagues, not only the teams playing in the window. A pick is matched only when one team is named more
+   fully than any other; a tie is not graded. Kalshi's own team codes, written in capitals, count as names.
+   No model proposes matches: the sentence above that allowed it is withdrawn.
+10. **One reading per rule.** If the reading of 40 matched picks finds more than 2 wrong, that matching rule is
+    closed for good; a new reading needs a changed rule. The reader does not choose which 40 are drawn.
+11. **The test period is scored once:** when both counts are reached or on 2027-03-31, never earlier, and
+    never again.
+12. **A minute with no bid** on Kalshi is not a quote: nothing is bought in it.
+13. **One record.** The real pick store is graded into one grading store only.
+14. **A game with no final score three days after its start** is not graded.
