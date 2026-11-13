@@ -379,6 +379,20 @@ class OddsApiClient:
         """GET /v4/sports with the named key: free of charge, and it refreshes the usage headers."""
         return self._get_with("/v4/sports", {}, key, retries)
 
+    def events(self, sport: str, key: str = "free", retries: int | None = None) -> list[dict[str, Any]]:
+        """GET /v4/sports/{sport}/events: upcoming and live games (id, teams, commence_time); 0 credits."""
+        return self._get_with(f"/v4/sports/{sport}/events", {"dateFormat": "iso"}, key, retries)
+
+    def scores(self, sport: str, days_from: int | None = None, key: str = "free",
+               retries: int | None = None) -> list[dict[str, Any]]:
+        """GET /v4/sports/{sport}/scores/: live and upcoming games and, with `days_from` 1 to 3, the games completed
+        in that many past days with both teams' scores. 2 credits with `days_from`, 1 without. A `days_from` outside
+        1 to 3 is refused before anything is sent."""
+        if days_from is not None and (isinstance(days_from, bool) or int(days_from) not in (1, 2, 3)):
+            raise ValueError("days_from must be 1, 2 or 3 (or None)")
+        return self._get_with(f"/v4/sports/{sport}/scores/", {"daysFrom": days_from, "dateFormat": "iso"}, key,
+                              retries)
+
 
 def normalize_odds(events, now=None, max_age_seconds: float | None = None) -> pd.DataFrame:
     """Flatten v4 odds JSON (a list of events or one event) into tidy rows: event_id, sport, commence_time,

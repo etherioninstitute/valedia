@@ -102,3 +102,19 @@ claim for themselves are shown as claimed and never used.
 - The odds a comment quotes may never have been on offer; Question B takes them as written.
 - One source, one community, one season.
 - Code is checked blind by the same model family that builds it.
+
+## Clarifications (2026-11-13, written before any pick has been compared with a result)
+
+Raised by the builder of the grading code; none was chosen with a result in sight.
+
+1. **When a pick counts as seen.** For Question A the purchase clock starts when the pick's text was first
+   seen: the earliest stored version from which every later version before the start names the same team. A
+   comment first seen as something else and edited into a pick counts from the edit's first sighting.
+2. **Agreement (versions 2 and 3)** counts moneyline picks only.
+3. **A tied game** in Question B is a push for a moneyline pick.
+4. **A model's proposal** for an unmatched pick is accepted only when the name standing in the comment belongs
+   to no other team with a game in the window.
+5. **The matching rule is frozen** from the first result read; the schedule keeps growing, so a pick's match is
+   recomputed with the frozen rule on each run and the latest row counts.
+6. **Fewer than 40 matched picks:** the reading of 40 waits until there are 40; no result is read before it.
+7. **The test period is scored once, at the end:** when the counts are reached or on 2027-03-31, not before.
