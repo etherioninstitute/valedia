@@ -140,7 +140,7 @@ behave differently.
   beside `account_type` (only CASH or MARGIN). The API's `account_id` is a long internal id the owner cannot see
   or type, so the venue chooses its account by class (WEBULL_ACCOUNT_CLASS; see the account_id property). Crypto
   has its own account: stocks and funds trade in INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, crypto only in CRYPTO,
-  event contracts in EVENTS_CASH (not built); an order that does not fit the account's class is not sent.
+  event contracts in EVENTS_CASH (see "Event contracts" below); an order that does not fit the account's class is not sent.
 * A refusal at placement is HTTP 417 with a code of Webull's own (outside hours
   OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT; fractional shares overnight OPENAPI_FRACT_ONLY_DAY_ORDER; a price
   off the step OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED), and the order then does not exist. The same client order
@@ -159,6 +159,39 @@ behave differently.
   are sent with at most 2 decimals at every price (see _limit_text).
 * Crypto time in force (Webull's place-order page, not observed): a crypto MARKET order supports only IOC, a crypto
   LIMIT order DAY or GTC; this adapter sends IOC and GTC.
+
+Event contracts (added 2026-11-13, T19; docs/specs/2026-11-13-event-orders-design.md, part 1). Observed in the test
+environment's Events Cash account the same day, by raw SDK calls (none of it documented or seen on the live side):
+
+* An order is the stock order's shape with instrument_type EVENT, the Kalshi ticker as symbol, event_outcome "yes"
+  (a "no" order was not observed), order_type LIMIT, entrust_type QTY, time in force DAY, no support_trading_session,
+  sent through the same order_v3.place_order. It was accepted; a purchase filled 3 to 10 seconds later at Kalshi's ask, a
+  sale at Kalshi's bid. Detail and open-order rows carry symbol (the ticker), side, status (SUBMITTED, FILLED,
+  CANCELLED seen), event_outcome, filled_quantity, filled_price and limit_price (four decimals), commission {} and
+  fees: ONE entry {type EXCHANGE_FEE, actual_value, receivable_value} from the moment the order is accepted, before any
+  fill, and none after a cancel. A position row is {symbol (the ticker), instrument_type EVENT, event_outcome,
+  quantity, cost, ...}. The balance answer has buying_power per currency and no cash line. Not observed: a no-outcome
+  order, a partial fill, more than one contract, settlement, a refusal code for an event order.
+* A venue built with the account class EVENTS_CASH (and only such a venue) trades event contracts, and only them. It
+  names an event contract `TICKER:yes` or `TICKER:no` (parse_event_name: the ticker starts with an ASCII capital
+  letter, holds only A-Z, 0-9, dot and hyphen, at most 80 characters; the outcome exactly yes or no), in positions,
+  open orders, order status and submit. Its name is webull-<environment>-events, so the order ledger, the state and
+  the lock files kept per venue name are its own; every other venue keeps the name webull-<environment>.
+* submit there sends only whole contracts, an explicit limit with at most two decimals from 0.01 to 0.99 (never
+  rounded), time in force DAY; the session is ignored. A purchase of `T:no` is a BUY with event_outcome no, a sale of
+  `T:no` a SELL with event_outcome no of no contracts held: the outcome is copied from the name and from nothing
+  else. A sale is long-only per ticker and outcome, on holdings read at most 5 seconds before the order call, as for
+  stocks. Event orders go only to the test environment: environment "sandbox" by a static and an ordinary lookup and a
+  host with "sandbox" as a whole label, checked before anything is read; the production environment refuses them in
+  this adapter whatever config/webull_live.json says.
+* A venue of any other class refuses every name holding a colon (every event name) before anything is read or sent;
+  apart from that, its behaviour is that of rev 9 for the same inputs.
+* order_status there checks the row read back against the name sent (given as `expected`, or remembered by this
+  venue object from its own submit): another ticker or outcome is an error, never a fill. Its fee is the one fee
+  entry's actual_value (plus commission.actual_commission when given), and only once something has filled: the entry
+  present on an accepted, unfilled order is not a fee paid.
+* cash() there gives the buying power as `cash` and settled_cash None (not given).
+* Settlement (a contract held to the result leaving the account without an order) is not handled here.
 """
 from __future__ import annotations
 
@@ -168,6 +201,7 @@ import binascii
 import functools
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -188,7 +222,7 @@ REPO = Path(__file__).resolve().parents[2]
 LIVE_CONFIRMATION = REPO / "config" / "webull_live.json"
 
 __all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfirmed", "OrderRejected", "RateLimitHit", "order_payload",
-           "client_order_id", "load_live_confirmation", "ORDER_STATES"]
+           "client_order_id", "load_live_confirmation", "ORDER_STATES", "EVENTS_CLASS", "parse_event_name", "event_order_payload"]
 
 # Webull's order status -> the trader's order state. Source: developer.webull.com/apis/docs/reference/order-detail
 # (read 2026-11-12), field orders[].status; "PARTIAL FILLED" is the SDK's spelling (webull/trade/common/order_status.py:25).
@@ -350,6 +384,95 @@ def _limit_text(limit_price: Any, crypto: bool) -> str:
                              "rounded to be sent; choose the tick yourself, because rounding a limit changes the worst price accepted")
     whole, _, frac = text.partition(".")
     return f"{whole}.{frac.ljust(2, '0')}"
+
+
+# ---- event contracts (T19; see the module notes, "Event contracts")
+
+EVENTS_CLASS = "EVENTS_CASH"                      # the only account class that trades event contracts
+EVENT_INSTRUMENT = "EVENT"
+EVENT_OUTCOMES = ("yes", "no")
+MAX_EVENT_CONTRACTS = 1_000_000                   # a sanity ceiling, far above any cap the trader sets
+EVENT_LIMIT_LOW, EVENT_LIMIT_HIGH = Decimal("0.01"), Decimal("0.99")
+TEST_ENVIRONMENT = "sandbox"
+_EVENT_TICKER = re.compile(r"[A-Z][A-Z0-9.\-]{0,79}")
+_FEE_TYPE = re.compile(r"[A-Z_]{1,48}")
+_HOST_TEXT = re.compile(r"[A-Za-z0-9.\-]{1,253}")
+
+
+def parse_event_name(name: Any) -> tuple[str, str] | None:
+    """(ticker, outcome) for an event contract's name, `TICKER:yes` or `TICKER:no`, else None. The name must be a plain
+    str (not a subclass); the ticker starts with an ASCII capital letter, holds only A-Z, 0-9, dot and hyphen, and has
+    at most 80 characters; the outcome is exactly yes or no."""
+    if type(name) is not str:
+        return None
+    ticker, colon, outcome = str.partition(name, ":")
+    if not colon or outcome not in EVENT_OUTCOMES or _EVENT_TICKER.fullmatch(ticker) is None:
+        return None
+    return ticker, ("yes" if outcome == "yes" else "no")
+
+
+def _event_contracts(units: Any) -> tuple[int, str]:
+    """(signed whole contracts, the text sent) or NotTransmitted. `units` must be an int or a float (not a bool),
+    finite, non-zero, exactly a whole number and at most MAX_EVENT_CONTRACTS in size. Never rounded."""
+    if isinstance(units, bool) or not isinstance(units, (int, float)):
+        raise NotTransmitted(f"event contracts must be a whole number given as an int or a float, not a {type(units).__name__}")
+    try:
+        amount = float(units)
+    except (TypeError, ValueError, OverflowError):
+        raise NotTransmitted("the number of contracts cannot be read as a number") from None
+    if not math.isfinite(amount) or amount == 0:
+        raise NotTransmitted("an event order needs a finite, non-zero number of contracts")
+    if abs(amount) > MAX_EVENT_CONTRACTS:
+        raise NotTransmitted(f"the number of contracts is above the sanity ceiling of {MAX_EVENT_CONTRACTS:,}")
+    if not amount.is_integer() or not units == int(amount):
+        raise NotTransmitted("event orders are for whole contracts only; the number is not rounded")
+    n = int(amount)
+    return n, str(abs(n))
+
+
+def _event_limit_text(limit_price: Any) -> str:
+    """The limit price as sent, always with two decimals ("0.72"), or NotTransmitted: an event order is always a limit;
+    the price must be an int or a float (not a bool), finite, written with at most two decimals (its shortest decimal,
+    never rounded), from 0.01 to 0.99."""
+    if limit_price is None:
+        raise NotTransmitted("an event order is always a limit order: give a limit price from 0.01 to 0.99")
+    if isinstance(limit_price, bool) or not isinstance(limit_price, (int, float)):
+        raise NotTransmitted(f"a limit price must be an int or a float, not a {type(limit_price).__name__}")
+    try:
+        price = float(limit_price)
+    except (TypeError, ValueError, OverflowError):
+        raise NotTransmitted("the limit price cannot be read as a number") from None
+    text = _shortest_text(price, 2) if math.isfinite(price) else None
+    if text is None:
+        raise NotTransmitted("an event limit price must be a finite number with at most two decimals; it is never rounded")
+    d = Decimal(text)
+    if not EVENT_LIMIT_LOW <= d <= EVENT_LIMIT_HIGH:
+        raise NotTransmitted("an event limit price must be from 0.01 to 0.99")
+    return f"{d:.2f}"
+
+
+def event_order_payload(name: Any, units: Any, tag: str, limit_price: Any) -> dict:
+    """One event-contract order in the shape accepted in Webull's test environment (2026-11-13), or NotTransmitted.
+    `name` is `TICKER:yes` or `TICKER:no` (parse_event_name); `units` is signed whole contracts: positive buys that
+    outcome, negative sells that outcome held. The outcome sent is the name's own, whatever the side: buying `T:no` is
+    a BUY of no, never a SELL of yes. Always a LIMIT order (see _event_limit_text), quantity in whole contracts
+    (entrust_type QTY), time in force DAY, no trading session."""
+    parts = parse_event_name(name)
+    if parts is None:
+        raise NotTransmitted("an event order needs the name TICKER:yes or TICKER:no (the ticker in capitals, digits, dots and "
+                             "hyphens, at most 80 characters)")
+    ticker, outcome = parts
+    signed, quantity = _event_contracts(units)
+    limit = _event_limit_text(limit_price)
+    return {"combo_type": "NORMAL", "client_order_id": client_order_id(tag), "market": "US", "symbol": ticker,
+            "instrument_type": EVENT_INSTRUMENT, "order_type": "LIMIT", "quantity": quantity, "side": "BUY" if signed > 0 else "SELL",
+            "time_in_force": "DAY", "entrust_type": "QTY", "limit_price": limit, "event_outcome": outcome}
+
+
+def _plain_sandbox_host(host: Any) -> bool:
+    """A plain str of letters, digits, dots and hyphens with `sandbox` as one of its dot-separated labels (the order
+    step's whole-label rule, execution_and_risk/order_step.py _sandbox_host)."""
+    return type(host) is str and _HOST_TEXT.fullmatch(host) is not None and TEST_ENVIRONMENT in str.split(host, ".")
 
 
 def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION) -> dict | None:
@@ -1158,7 +1281,8 @@ class WebullVenue:
         ledger's recheck is the backstop.
 
         `account_class` (from WEBULL_ACCOUNT_CLASS in from_secrets): the class of the account to trade, such as
-        INDIVIDUAL_CASH or CRYPTO; see the account_id property for how the account is chosen.
+        INDIVIDUAL_CASH or CRYPTO; see the account_id property for how the account is chosen. EVENTS_CASH makes this an
+        Events venue (see the module notes, "Event contracts"), named webull-<environment>-events.
 
         Pacing: every SDK call waits for the venue's pacer (_Pacer), which belongs to this object only: a second
         venue object or a second process on the same App Key is not seen by it, and a read that then gets a 429 is
@@ -1203,7 +1327,12 @@ class WebullVenue:
             raise WebullError("the pacer's clock and sleep must be callables")
         self._sleep = sleep
         self._pacer = _Pacer(self._limits, clock, sleep)
-        self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}"
+        # An Events venue trades event contracts only, under its own name (so its own ledger, state and lock files); every
+        # other venue keeps the name it had before event contracts were built.
+        self._events = account_class == EVENTS_CLASS
+        self._sent_events: dict[str, str] = {}            # client order id -> the event name this object sent under it
+        suffix = "-events" if self._events else ""
+        self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}{suffix}"
         self._confirmation_file = Path(confirmation_file)
         self._app_key, self._app_secret = app_key, app_secret    # kept only to be withheld from every text
         self._account_id = None
@@ -1385,7 +1514,7 @@ class WebullVenue:
 
     def _fits(self, crypto: bool) -> None:
         """NotTransmitted unless the order's instrument type trades in this account's class: stocks and funds in
-        INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, crypto only in CRYPTO (event contracts, EVENTS_CASH, are not built). An
+        INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, crypto only in CRYPTO (event contracts only through an Events venue, _submit_event). An
         account of no readable class fits nothing."""
         kind = "CRYPTO" if crypto else "EQUITY"
         cls = self.account_class
@@ -1430,7 +1559,12 @@ class WebullVenue:
 
     @_public
     def positions(self) -> dict[str, float]:
-        """Held quantity by the trader's own symbol names (crypto as BTC-USD), from the rows whose instrument_type
+        """In an Events venue: contracts held by event name ({TICKER:yes or TICKER:no: contracts}) from the rows whose
+        instrument_type is exactly EVENT; every other row goes to other_positions(). An EVENT row whose ticker is not
+        a clean ticker (parse_event_name) or whose event_outcome is not exactly yes or no raises WebullError, and so
+        does one name in more than one row. In any other venue, as follows.
+
+        Held quantity by the trader's own symbol names (crypto as BTC-USD), from the rows whose instrument_type
         is exactly EQUITY (keyed by symbol) or CRYPTO (BTCUSD keyed as BTC-USD). Docs /apis/docs/reference/
         account-position (read 2026-11-12) list the instrument types EQUITY, OPTION, FUTURES, CRYPTO and EVENT, and
         give as their example a row with symbol AAPL, instrument_type OPTION, quantity "1": such a row is not a
@@ -1476,7 +1610,9 @@ class WebullVenue:
 
     def _read_positions(self) -> tuple[dict[tuple[str, str], float | None], list[dict], set]:
         """({(EQUITY or CRYPTO, the trader's symbol): quantity or None}, [the other rows], {duplicated holdings})
-        from one position read."""
+        from one position read; in an Events venue ({(EVENT, event name): ...}, ...) (see _read_event_positions)."""
+        if self._events:
+            return self._read_event_positions()
         body = self._call("positions", self._client.account_v2.get_account_position, self.account_id)
         rows = body if isinstance(body, list) else body.get("positions", body.get("holdings", body.get("data", []))) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
@@ -1535,6 +1671,119 @@ class WebullVenue:
             reserved += total - filled if filled is not None and filled <= total else total
         return reserved
 
+    # ---- event contracts: reading
+    def _event_row_name(self, row: dict, where: str) -> str:
+        """The event name `TICKER:outcome` of an EVENT row of an answer, or WebullError. The ticker passes the gate's
+        rules for a value handed back (_clean: the ticker shape, no run of a secret, the last check unchanged); the
+        outcome must be exactly the str yes or no, and what is returned is the module's own word for it."""
+        ticker = _clean(row.get("symbol"), _EVENT_TICKER, self._secrets(), self._final)
+        if ticker is None:
+            raise WebullError(f"Webull's {where} has an event row whose ticker is missing or not a clean ticker")
+        outcome = row.get("event_outcome")
+        if type(outcome) is not str or outcome not in EVENT_OUTCOMES:
+            raise WebullError(f"Webull's {where} has an event row whose outcome is not exactly yes or no")
+        return f"{ticker}:{'yes' if outcome == 'yes' else 'no'}"
+
+    def _read_event_positions(self) -> tuple[dict[tuple[str, str], float | None], list[dict], set]:
+        """({(EVENT, event name): contracts or None}, [the other rows], {duplicated holdings}) from one position read
+        of an Events venue. Only a row whose instrument_type is exactly EVENT is a holding; its quantity is read as for
+        stocks (the documented `quantity` only; unreadable, not finite or above MAX_HOLDING_UNITS gives None)."""
+        body = self._call("positions", self._client.account_v2.get_account_position, self.account_id)
+        rows = body if isinstance(body, list) else body.get("positions", body.get("holdings", body.get("data", []))) if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise WebullError("Webull's position list has an unexpected shape")
+        secrets = self._secrets()
+        holdings: dict[tuple[str, str], float | None] = {}
+        others: list[dict] = []
+        duplicated: set = set()
+        for row in rows:
+            kind = row.get("instrument_type")
+            qty = _number(row.get("quantity"))
+            if qty is not None and abs(qty) > MAX_HOLDING_UNITS:
+                qty = None
+            if type(kind) is str and kind == EVENT_INSTRUMENT:
+                key = (EVENT_INSTRUMENT, self._event_row_name(row, "position list"))
+                if key in holdings:
+                    duplicated.add(key)
+                holdings[key] = qty
+            else:
+                others.append({"symbol": self._symbol(row.get("symbol"), "position list"),
+                               "instrument_type": _kind_word(kind, secrets, self._final), "quantity": qty})
+        return holdings, others, duplicated
+
+    def _event_held(self, name: str) -> Decimal:
+        """The contracts of `name` a sale may draw on; any duplicated holding fails closed."""
+        holdings, _, duplicated = self._read_positions()
+        self._flatten(holdings, duplicated)
+        qty = holdings.get((EVENT_INSTRUMENT, name))
+        return _decimal(qty) if qty is not None else Decimal(0)
+
+    def _reserved_by_open_event_sells(self, name: str) -> Decimal:
+        """The unfilled remainder of every open sale of exactly this ticker and outcome (total minus filled, or the
+        total when the filled quantity is unreadable or above it). Open purchases and other names do not count.
+        WebullError, so the sale is not sent, when an open order of this ticker carries no recognised instrument type
+        or an open order of this name has an unreadable quantity or side."""
+        ticker = name.partition(":")[0]
+        reserved = Decimal(0)
+        for o in self.open_orders():
+            given = o["instrument_type"]
+            if type(given) is not str or given not in ORDER_INSTRUMENT_TYPES:
+                if o["symbol"] in (name, ticker):
+                    raise WebullError(f"an open order for {ticker} carries no recognised instrument type; cannot tell what is already being sold")
+                continue
+            if given != EVENT_INSTRUMENT or o["symbol"] != name:
+                continue
+            if o["units"] is None:
+                raise WebullError(f"an open order for {name} has an unreadable quantity or side; cannot tell what is already being sold")
+            if o["units"] >= 0:
+                continue
+            total, filled = _decimal(abs(o["units"])), o["filled_units"]
+            filled = _decimal(filled) if filled is not None else None
+            reserved += total - filled if filled is not None and filled <= total else total
+        return reserved
+
+    def _event_fee(self, item: dict, filled: float | None, secrets: _Secrets) -> tuple[float | None, str | None]:
+        """(fee, fee type) of an event order row. The fee is the actual_value of the one fees entry (plus
+        commission.actual_commission when given), and None when nothing has filled (the entry is there from the moment
+        the order is accepted: it is not a fee paid), when there is not exactly one entry, or when a value is
+        unreadable or negative. The fee type is the entry's `type` in the code shape holding no run of a secret, None
+        when absent, else WITHHELD."""
+        fees = item.get("fees")
+        one = isinstance(fees, list) and len(fees) == 1 and isinstance(fees[0], dict)
+        fee_type = None
+        if one and fees[0].get("type") is not None:
+            fee_type = _clean(fees[0].get("type"), _FEE_TYPE, secrets, self._final) or WITHHELD
+        if filled is None or not filled > 0 or not one:
+            return None, fee_type
+        value = _number(fees[0].get("actual_value"))
+        if value is None or value < 0:
+            return None, fee_type
+        commission = item.get("commission")
+        if commission is not None:
+            if not isinstance(commission, dict):
+                return None, fee_type
+            if "actual_commission" in commission:
+                extra = _number(commission["actual_commission"])
+                if extra is None or extra < 0:
+                    return None, fee_type
+                value += extra
+        return (value + 0.0 if math.isfinite(value) else None), fee_type
+
+    def _expected_name(self, cid: str, expected: Any) -> str:
+        """The event name an order read back must carry: `expected` when given (it must be an event name), else the name
+        this venue object sent under the client order id; WebullError when neither is known or they differ."""
+        sent = self._sent_events.get(cid)
+        if expected is not None:
+            if parse_event_name(expected) is None:
+                raise WebullError("the name expected for this order is not an event name (TICKER:yes or TICKER:no)")
+            if sent is not None and sent != expected:
+                raise WebullError("the name expected for this order is not the name this venue sent under its client order id")
+            return expected
+        if sent is None:
+            raise WebullError("this venue did not send the order under this tag, so it cannot check the ticker and outcome read "
+                              "back against what was sent; pass the name that was sent (expected=)")
+        return sent
+
     # ---- orders
     def _guard_live(self, value: float | None) -> None:
         if self.environment != "production":
@@ -1567,6 +1816,9 @@ class WebullVenue:
         still pass between the holdings read and the order call, it reads open orders and holdings again and checks
         again, at most SALE_REREADS (3) times, and is then NotTransmitted.
 
+        In an Events venue the order is an event contract's, and only that: see _submit_event. In any other venue a
+        `symbol` holding a colon (every event name) is NotTransmitted before anything is read or sent.
+
         After the place_order call: when it fails with the SDK's ServerException and a 4xx status (Webull answered and
         refused; a 429 included: place is never retried), the order's detail is read once under the same client order
         id. If the order is there, submit returns it as accepted (this covers OPENAPI_TRADE_PLACE_ORDER_REPEAT: the
@@ -1583,6 +1835,11 @@ class WebullVenue:
         Returns only values this module built or validated: {status "accepted", client_order_id, venue_order_id (the
         documented order_id when it is a plain id holding no run of a secret, else None), environment, side,
         quantity}. Webull's answer itself is never handed back."""
+        if self._events:
+            return self._submit_event(symbol, units, tag, limit_price)
+        if isinstance(symbol, str) and str.find(symbol, ":") >= 0:
+            raise NotTransmitted("a name holding a colon is an event contract's (TICKER:yes or TICKER:no); event orders are sent "
+                                 "only by a venue built for the EVENTS_CASH class, never by this one")
         secrets = self._secrets()
         try:
             crypto = _is_crypto(symbol)
@@ -1604,6 +1861,85 @@ class WebullVenue:
             raise NotTransmitted(f"not sent: {_plain(exc)}") from None    # built here from gated parts
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
+        return self._place(account, order, secrets)
+
+    def _submit_event(self, symbol: Any, units: Any, tag: str, limit_price: Any) -> dict:
+        """submit in an Events venue. Everything that can refuse runs before the single place_order call and raises
+        NotTransmitted: first the test environment (_event_environment, before anything is read: production refuses
+        whatever config/webull_live.json says), then the order itself (event_order_payload: the name, whole contracts,
+        the limit), then the account (its class must be EVENTS_CASH), then for a sale the long-only check per ticker and
+        outcome (_check_event_sale), then the place slot. The session and the reference price play no part. After the
+        call, as for stocks (_place), with the row read after a refusal checked against the name sent. The name is
+        remembered under the client order id before the call, for order_status."""
+        secrets = self._secrets()
+        try:
+            self._event_environment()
+            order = event_order_payload(symbol, units, tag, limit_price)
+            account = self.account_id
+            cls = self.account_class
+            if cls != EVENTS_CLASS:
+                raise NotTransmitted(f"an event order does not fit this account (class {cls or 'unknown'}): it trades only in "
+                                     f"{EVENTS_CLASS}")
+            secrets = self._secrets()
+            read_at = self._check_event_sale(symbol, int(order["quantity"])) if order["side"] == "SELL" else None
+            placed_at = self._pacer.wait("place")
+            if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:
+                raise NotTransmitted(f"the holdings were read {placed_at - read_at:.0f} seconds before the order call could be made; not sent")
+        except NotTransmitted:
+            raise
+        except WebullError as exc:
+            raise NotTransmitted(f"not sent: {_plain(exc)}") from None
+        except Exception as exc:
+            raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
+        self._sent_events[order["client_order_id"]] = symbol
+        return self._place(account, order, secrets, expected=symbol)
+
+    def _event_environment(self) -> None:
+        """LiveTradingNotConfirmed unless this venue is plainly the test environment: `environment` a plain str equal to
+        "sandbox" by a static lookup (inspect.getattr_static: a property or a class-level answer is refused) and by an
+        ordinary one, and `host` by both lookups a plain str with "sandbox" as a whole dot-separated label. Reads no
+        file and calls nothing: no confirmation file changes it."""
+        found = []
+        for name in ("environment", "host"):
+            try:
+                static = inspect.getattr_static(self, name, None)
+            except Exception:
+                static = None
+            try:
+                ordinary = getattr(self, name, None)
+            except Exception:
+                ordinary = None
+            found.append((static, ordinary))
+        env_ok = all(type(e) is str and e == TEST_ENVIRONMENT for e in found[0])
+        host_ok = all(_plain_sandbox_host(h) for h in found[1])
+        if not (env_ok and host_ok):
+            raise LiveTradingNotConfirmed("event orders are sent only in Webull's test environment (sandbox), and this venue is "
+                                          "not plainly that; no confirmation file changes this")
+
+    def _check_event_sale(self, name: str, contracts: int) -> float:
+        """The long-only check for a sale of event contracts, as _check_sale does it for stocks: wait until open orders,
+        holdings and the order call could all be made at once, read open orders then holdings, allow the sale only
+        when `contracts` is not above the contracts held of exactly this ticker and outcome less the unfilled part of
+        its open sales (rounded DOWN to whole contracts), and re-read when more than SALE_READ_MAX_AGE seconds would
+        pass before the order call, at most SALE_REREADS times; then NotTransmitted. Returns when the holdings read was
+        made."""
+        for _ in range(1 + SALE_REREADS):
+            self._pacer.wait_free({"open_orders": 1, "positions": 1, "place": 1})
+            reserved = self._reserved_by_open_event_sells(name)
+            held = self._event_held(name)
+            read_at = self._pacer.last("positions")
+            free = (held - reserved).to_integral_value(rounding=ROUND_FLOOR)
+            if Decimal(contracts) > free:
+                raise NotTransmitted(f"selling {contracts} {name} with {float(held):g} held and {float(reserved):g} in open sales "
+                                     "would open a short; this venue is long-only")
+            if read_at is not None and self._pacer.wait_free({"place": 1}) - read_at <= SALE_READ_MAX_AGE:
+                return read_at
+        raise NotTransmitted(f"the holdings could not be read within {SALE_READ_MAX_AGE:g} seconds of the order call after "
+                             f"{SALE_REREADS} re-reads; not sent")
+
+    def _place(self, account: str, order: dict, secrets: _Secrets, expected: str | None = None) -> dict:
+        """The single place_order call and what follows it (see submit). `expected`: the event name sent, for the
+        detail read after a refusal (None for stocks and crypto)."""
         detail, refused = None, None
         try:
             res = self._client.order_v3.place_order(account, [order])   # the only order call; its slot is already taken
@@ -1615,7 +1951,7 @@ class WebullVenue:
             detail = "Webull call failed: " + _safe(exc, secrets)
             refused = _refusal(exc)
         if refused is not None:                                           # Webull answered 4xx: one detail read decides
-            found, reason = self._after_refusal(order["client_order_id"], secrets)
+            found, reason = self._after_refusal(order["client_order_id"], secrets, expected)
             if found is not None:
                 return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": found["venue_order_id"],
                         "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
@@ -1670,13 +2006,13 @@ class WebullVenue:
         raise NotTransmitted(f"the holdings could not be read within {SALE_READ_MAX_AGE:g} seconds of the order call after "
                              f"{SALE_REREADS} re-reads; not sent")
 
-    def _after_refusal(self, cid: str, secrets: _Secrets) -> tuple[dict | None, str | None]:
+    def _after_refusal(self, cid: str, secrets: _Secrets, expected: str | None = None) -> tuple[dict | None, str | None]:
         """One read of the order's detail after Webull refused the order call: (the order as order_status reads it,
         None) when it exists; (None, None) on the "no such order" answer; (None, why) when the read fails or answers
-        anything else (the outcome stays unknown)."""
+        anything else (the outcome stays unknown). `expected`: the event name sent, in an Events venue."""
         reason = None
         try:
-            found = self._read_order(cid, recognise_not_found=True)
+            found = self._read_order(cid, recognise_not_found=True, expected=expected)
         except WebullError as exc:
             found, reason = None, "reading the order's detail after the refusal failed: " + _plain(exc)
         except Exception as exc:
@@ -1756,8 +2092,14 @@ class WebullVenue:
 
     # ---- what happened to orders (reading: allowed in both environments)
     @_public
-    def order_status(self, tag: str) -> dict | None:
-        """What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
+    def order_status(self, tag: str, expected: str | None = None) -> dict | None:
+        """In an Events venue, `expected` is the event name the order was sent under (else the name this venue object
+        sent under the tag is used; with neither, WebullError before any call). The row read back must be of type
+        EVENT and carry exactly that ticker and outcome; another ticker or outcome raises WebullError: it is never read
+        as a fill. There `fee` is the one fee entry's (see _event_fee: None until something has filled), and the answer
+        also carries `symbol` (the event name) and `fee_type`. In any other venue `expected` plays no part.
+
+        What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
         raw_status}, or None only when the venue was built with confirmed_not_found=True and Webull gives one of the
         answers read as "no such order":
         (a) the answer observed in the test environment (2026-11-13) on the cash and events accounts: the SDK's
@@ -1781,9 +2123,14 @@ class WebullVenue:
         A combo that carries a client_order_id other than ours raises WebullError, whatever it holds. A single
         item is read as ours without its own client_order_id only when that key is absent or None (not "") and its
         combo names our id or names none."""
-        return self._read_order(client_order_id(tag), self._confirmed_not_found)
+        cid = client_order_id(tag)
+        if not self._events:
+            return self._read_order(cid, self._confirmed_not_found)
+        return self._read_order(cid, self._confirmed_not_found, expected=self._expected_name(cid, expected))
 
-    def _read_order(self, cid: str, recognise_not_found: bool) -> dict | None:
+    def _read_order(self, cid: str, recognise_not_found: bool, expected: str | None = None) -> dict | None:
+        if self._events and parse_event_name(expected) is None:
+            raise WebullError("an event order is read only against the event name it was sent under")
         account = self.account_id
         secrets = self._secrets()
         try:
@@ -1818,9 +2165,20 @@ class WebullVenue:
             raise WebullError(f"Webull's order detail holds {len(items)} orders and {len(mine)} carry this client order id")
         item = mine[0]
         price = _number(item.get("filled_price"))
-        return {"state": _state(item.get("status")), "filled_units": _filled_units(item), "avg_price": price if price and price > 0 else None,
-                "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
-                "raw_status": _status_word(item.get("status"), secrets, self._final)}
+        out = {"state": _state(item.get("status")), "filled_units": _filled_units(item), "avg_price": price if price and price > 0 else None,
+               "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
+               "raw_status": _status_word(item.get("status"), secrets, self._final)}
+        if not self._events:
+            return out
+        kind = item.get("instrument_type")
+        if not (type(kind) is str and kind == EVENT_INSTRUMENT):
+            raise WebullError("Webull's order detail for an event order is not of the type EVENT; it is not read as a fill")
+        if self._event_row_name(item, "order detail") != expected:
+            raise WebullError("Webull's order detail for this client order id names another ticker or outcome than was sent; "
+                              "it is not read as a fill")
+        out["fee"], out["fee_type"] = self._event_fee(item, out["filled_units"], secrets)
+        out["symbol"] = expected
+        return out
 
     @staticmethod
     def _no_such_order(answer: str, recognise: bool) -> None:
@@ -1833,7 +2191,7 @@ class WebullVenue:
     def open_orders(self) -> list[dict]:
         """Every open order of the account, following pagination_key to the last page (docs order-open: an absent
         key marks the last page). Each is {client_order_id and venue_order_id (plain ids, else None), symbol (the
-        trader's naming), instrument_type (as given if a short word, None when absent, else WITHHELD), units (signed:
+        trader's naming; in an Events venue an EVENT row is named TICKER:outcome, see _event_row_name), instrument_type (as given if a short word, None when absent, else WITHHELD), units (signed:
         sells and shorts negative; None if unreadable or the side is not BUY, SELL or SHORT), state, filled_units,
         raw_status (the code shape, else WITHHELD)}. A malformed page (an entry that is not an object, a bare empty
         list, an order whose symbol is missing or not a clean symbol) or a pagination key that is not a non-empty
@@ -1851,7 +2209,10 @@ class WebullVenue:
                 raise WebullError("Webull's open-order list has an unexpected shape")
             for item in items:
                 kind = item.get("instrument_type")
-                sym = _trader_symbol(self._symbol(item.get("symbol"), "open-order list"), kind)
+                if self._events and type(kind) is str and kind == EVENT_INSTRUMENT:      # an Events venue names the outcome
+                    sym = self._event_row_name(item, "open-order list")
+                else:
+                    sym = _trader_symbol(self._symbol(item.get("symbol"), "open-order list"), kind)
                 qty, sign = _number(item.get("total_quantity")), _side_sign(item.get("side"))
                 out.append({"client_order_id": _plain_id(item.get("client_order_id"), secrets, self._final),
                             "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
@@ -1878,7 +2239,16 @@ class WebullVenue:
         three-letter code, the totals carry no currency, so total_cash_balance is not used: everything comes from the
         single entry, `cash` from its cash_balance and `currency` from its own currency (all None without one such
         entry). A field that is absent or unreadable is None; more than one entry in the wanted currency raises
-        WebullError."""
+        WebullError.
+
+        In an Events venue (whose balance answer has buying power and no cash line, observed 2026-11-13) `cash` is the
+        buying power, chosen as above, and settled_cash is None: not given."""
+        out = self._cash_fields()
+        if self._events:
+            return {"cash": out["buying_power"], "settled_cash": None, "buying_power": out["buying_power"], "currency": out["currency"]}
+        return out
+
+    def _cash_fields(self) -> dict:
         body = self.balance()
         assets = body["account_currency_assets"]
         currency = body.get("total_asset_currency")
@@ -1927,7 +2297,8 @@ class WebullVenue:
         except WebullError as exc:
             report["open_orders_error"] = self._final(_plain(exc, 10 ** 6))
         confirmation = load_live_confirmation(self._confirmation_file)
-        report["real_money_orders"] = ("off: test environment" if self.environment != "production" else
+        report["real_money_orders"] = ("off: event orders are sent in the test environment only" if self._events else
+                                       "off: test environment" if self.environment != "production" else
                                        "off: no written confirmation" if confirmation is None else
                                        f"on for the account ending {confirmation['account_id'][-4:]}, up to {confirmation['max_order_value']:,.0f} per order")
         return report
