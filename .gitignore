@@ -33,3 +33,6 @@ research/desk/
 # the Webull SDK writes whole requests, headers included, to this file in the working directory
 webull_trade_sdk.log
 *.log
+
+# the Webull SDK stores its access token in plain text under the working directory
+/conf/
