@@ -170,3 +170,36 @@ is taken. None was chosen with data in sight.
 16. **Trade-tape cover** (note 3 above) is the union of the stretches that successful trade reads covered,
     less the 60 seconds by which the tape may lag; a read stored with a snapshot whose book was invalid still
     counts as a read.
+
+## Further clarifications for the scoring (2026-11-13, 22:37 UTC, before the first development day began; no answer has been compared with an outcome)
+
+Raised by the blind check of the evaluation code, which ran on generated records only. Where that code differed
+from clarifications 7 and 13, the code is being changed to the written text, not the text to the code. The rest
+are readings the text left open; each is fixed here before any real slot can be scored.
+
+17. **The clock of "later".** The target of "15 minutes later" and "30 minutes later", and the start of the
+    paths, is the end time of the book snapshot the state was built on (the state's own "now", from which the
+    collector aimed every look-back) plus 15 or 30 minutes. The snapshots used must still have begun after the
+    decision (clarification 5). `toxic_15m` and the fills run from the decision time, as written.
+18. **The later mid** (clarification 5) comes from the nearest valid snapshot within 30 seconds of the target;
+    at equal distance the earlier one. If that snapshot's book is one-sided the outcome is unknown, even when a
+    two-sided snapshot lies a little further off: no snapshot is preferred for the state of its book.
+19. **Trade-tape cover** (replacing the 60 seconds of clarification 16): each covered stretch is shortened by 90
+    seconds, 60 for the lag of the tape and 30 for the difference the collector tolerates between its clock and
+    Kalshi's.
+20. **The maker fee** (clarification 12): a series goes uncharged only when its fee type is one known to carry
+    no maker fee. A missing, empty or unrecognised fee type is charged. A multiplier that is missing, not a
+    number or not above zero is taken as 1.
+21. **Membership of the policy.** A slot is in the policy averages only if the trade tape covers its fill
+    window, whether or not any rule could quote in it: cover is decided before anything else, so the set of
+    slots does not depend on any rule. Within covered slots clarification 9 holds.
+22. **Edges.** The fill window is the 300 seconds after the decision, the decision instant excluded and the
+    300th second included. "Ended before" a trade is judged by a snapshot's book end time. An imbalance of
+    exactly 0.5 leans to neither side.
+23. **Yardstick inputs from the state** (clarification 13): for `move_15m` the split is whether the absolute
+    15-minute mid change in the state is at least half the state's spread; the previous 30-minute move for
+    `regime` is the state's own 30-minute mid change. A state lacking the figure forms a group of its own.
+24. **Resampling.** The seed is the pair (20261113, the question's position in the battery); percentiles by
+    linear interpolation.
+25. **A day's count** (clarification 2) is reduced by every answered slot under another battery, including one
+    the collector itself did not count.
