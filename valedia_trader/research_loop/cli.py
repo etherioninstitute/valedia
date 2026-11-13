@@ -9,6 +9,8 @@
     python -m valedia_trader.research_loop paper-step           one paper-trading day for the strategies that passed
     python -m valedia_trader.research_loop order-step           send the paper book's differences to Webull's test environment
                                                                 (once a day, inside the regular session; never production)
+    python -m valedia_trader.research_loop order-step --propose the same up to the moment before sending: a ticket, nothing sent
+    python -m valedia_trader.research_loop order-step --approve NUMBER   send only that ticket's orders, each checked afresh
     python -m valedia_trader.research_loop critic               the weekly post-mortem
     python -m valedia_trader.research_loop reset-kill-switch --who NAME
     python -m valedia_trader.research_loop cycle                the whole loop once: research, test, revise, seal, paper, critic
@@ -297,7 +299,10 @@ def _order_step_events(venue) -> bool:
 def order_step_command(args, paths: LoopPaths, venue=None) -> int:
     """One order step against the venue `_order_step_venue` gives (built here when not given); prints the summary.
     0 when the run went through, 2 when it stopped. The command line builds the venue before any folder or file is
-    made, and refuses a configured environment other than the test environment before building it."""
+    made, and refuses a configured environment other than the test environment before building it. With --propose
+    the run writes a ticket and sends nothing; its number is printed once, on a line of its own after the summary
+    (it is never journaled). With --approve NUMBER the run sends only that ticket's orders, each after fresh checks.
+    Without either flag the run is called exactly as before."""
     from valedia_trader.execution_and_risk import order_step
     if venue is None:
         venue = _order_step_build()
@@ -305,6 +310,11 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
             return 2
     elif _order_step_events(venue):                     # before the paper trader, the ledger or any file
         return 2
+    ticket = {}                                          # nothing new is passed to a run without the flags
+    if getattr(args, "propose", False):
+        ticket["propose"] = True
+    elif getattr(args, "approve", None) is not None:
+        ticket["approve"] = args.approve
     trader = PaperTrader(paths.journal, paths.risk_limits)
     ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
     orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
@@ -313,10 +323,16 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
             clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
-            fractional=args.fractional)
+            fractional=args.fractional, **ticket)
     finally:
         orders.close()
+    number = out.pop("ticket_number", None) if ticket else None
     print(json.dumps(out, indent=2, default=str))
+    if number is not None:
+        again = "".join([f" --capital {args.capital!r}" if args.capital is not None else "",
+                         " --fractional" if args.fractional else ""])
+        print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
+              f"order-step --approve NUMBER{again})")
     return 0 if out["status"] == "done" else 2
 
 
@@ -403,6 +419,11 @@ def main(argv=None) -> int:
     p.add_argument("--capital", type=float, default=None,
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
     p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")
+    ticket = p.add_mutually_exclusive_group()
+    ticket.add_argument("--propose", action="store_true",
+                        help="write a ticket of the orders instead of sending them; nothing is sent, the number is printed")
+    ticket.add_argument("--approve", metavar="NUMBER", default=None,
+                        help="send only the orders of this ticket (six digits, within 15 minutes), each after fresh checks")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)

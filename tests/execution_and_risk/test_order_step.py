@@ -2831,3 +2831,959 @@ def test_a_halt_file_under_a_regular_file_counts_as_there(world):
     world.paper = paper({"a": {"SPY": 1.0}})
     out = world.run()
     assert world.venue.submits() == [] and out["refused"][0]["reason"] == "Operator halt file is present. Trading stopped."
+
+
+# ==== T22a: approval of a batch by ticket number, in the test environment (the go-live gate, step 1)
+#
+# A propose run writes a ticket and sends nothing; an approve run sends at most what its ticket holds, each order
+# only after the fresh checks; a ticket is used once; a number cannot be guessed into a send; tickets are an
+# append-only record in their own file; nothing secret gets out; a run without the new flags is the base's, byte for byte.
+
+import hashlib
+import importlib.util
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+from valedia_trader.execution_and_risk.orders import OrderLedger as _Ledger
+
+BASE_COMMIT = "c7765b9780f9e2bde4d6bc02cdd9231c34748060"   # T22a's base: the order step before tickets
+ACCOUNT = "Zq9ACCT77310055XK"                               # a made-up account id: it must never appear anywhere
+
+
+class Booked(StandIn):
+    """The stand-in, naming its account as the adapter's account_id property does (a network read there)."""
+    account = ACCOUNT
+
+    @property
+    def account_id(self):
+        self.calls.append(("account_id", None))
+        if isinstance(self.account, BaseException):
+            raise self.account
+        return self.account
+
+
+def ticket_world(tmp, venue=None):
+    w = World(tmp)
+    w.venue = venue if venue is not None else Booked()
+    w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+    return w
+
+
+@pytest.fixture
+def tw(tmp_path):
+    return ticket_world(tmp_path / "w")
+
+
+def ticket_rows(w, table):
+    path = osx.ticket_path_for(w.state_path)
+    if not Path(path).exists():
+        return []
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+    finally:
+        con.close()
+
+
+def propose(w, **kw):
+    return w.run(propose=True, **kw)
+
+
+def approve(w, number, **kw):
+    return w.run(approve=number, **kw)
+
+
+def _proposed(w, wanted, **kw):
+    w.paper = paper(wanted)
+    out = propose(w, **kw)
+    assert out["status"] == "done" and out["ticket"]["orders"], out
+    return out, out["ticket_number"]
+
+
+def _all_text(w, outs=()):
+    texts = [json.dumps(o, default=str) for o in outs]
+    texts += [f.read_bytes().decode("utf-8", "replace") for f in sorted((w.tmp / "journal").glob("*.jsonl"))]
+    for p in (w.state_path, osx.ticket_path_for(w.state_path)):
+        if Path(p).exists():
+            texts.append(Path(p).read_bytes().decode("utf-8", "replace"))
+    return "\n".join(texts)
+
+
+def wrong_other_number(number):
+    return f"{(int(number) + 1) % 1_000_000:06d}"
+
+
+# ---- invariant 1: a propose run sends nothing and intends nothing
+
+def test_a_propose_run_writes_a_ticket_and_sends_and_intends_nothing(tw):
+    tw.venue.held = {"OWN": 3.0}
+    tw.paper = paper({"a": {"SPY": 10.0, "QQQ": 4.0}})
+    out = propose(tw)
+    assert out["status"] == "done" and out["mode"] == "propose" and out["orders_sent"] == 0 and out["sent"] == []
+    assert "submit" not in tw.venue.names() and tw.orders() == []                      # nothing intended, nothing sent
+    number = out["ticket_number"]
+    assert isinstance(number, str) and len(number) == 6 and number.isdigit()
+    t = out["ticket"]
+    assert t["number_ends"] == number[-2:]
+    assert [(o["fund"], o["side"], o["units"], o["quote"], o["limit"], o["value"]) for o in t["orders"]] == [
+        ("SPY", "buy", 10.0, 500.0, 505.0, 5000.0), ("QQQ", "buy", 4.0, 400.0, 404.0, 1600.0)]
+    assert t["equity"] == 1_000_000.0 + 3 * 50.0 and t["cash"] == 1_000_000.0 and t["settled_cash"] is None
+    created, expires = pd.Timestamp(t["created"]), pd.Timestamp(t["expires"])
+    assert created.timestamp() == tw.clock.t and (expires - created).total_seconds() == osx.TICKET_LIFE_SECONDS == 15 * 60
+    entries = tw.entries()
+    assert [e["event"] for e in entries] == ["baseline", "ticket", "summary"]
+    ticket_entry = entries[1]
+    assert ticket_entry["number_ends"] == number[-2:] and ticket_entry["orders"] == t["orders"]
+    assert ticket_entry["expires"] == t["expires"]
+    journal_text = "".join(f.read_text() for f in (tw.tmp / "journal").glob("*.jsonl"))
+    assert number not in journal_text                                                  # the full number is never journaled
+    assert "ticket_number" not in tw.entries("summary")[-1]
+    assert [r["number"] for r in ticket_rows(tw, "tickets")] == [number]
+
+
+def test_a_propose_run_reconciles_and_cancels_this_ledgers_open_orders_as_an_ordinary_run_does(tw):
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    tw.run()
+    first = tw.venue.submits()[0]
+    tw.venue.calls.clear()
+    tw.later()
+    tw.paper = paper({"a": {"SPY": 12.0}})
+    out = propose(tw)
+    names = tw.venue.names()
+    assert ("cancel", first) in tw.venue.calls and "submit" not in names
+    assert out["ticket"]["orders"][0]["units"] == 12.0 and [o["state"] for o in tw.orders()] == ["cancelled"]
+
+
+def test_a_propose_run_never_reaches_intend_or_submit_once_even_through_the_ledger(tw, monkeypatch):
+    calls = []
+    monkeypatch.setattr(_Ledger, "intend", lambda self, *a, **k: calls.append("intend"))
+    monkeypatch.setattr(_Ledger, "submit_once", lambda self, *a, **k: calls.append("submit_once"))
+    tw.paper = paper({"a": {"SPY": 10.0, "QQQ": -0.0, "IWM": 3.0}})
+    out = propose(tw)
+    assert out["status"] == "done" and calls == [] and len(out["ticket"]["orders"]) == 2
+
+
+def test_a_propose_run_with_nothing_to_send_makes_no_ticket(tw):
+    tw.paper = paper({})
+    out = propose(tw)
+    assert out["status"] == "done" and out["ticket"]["orders"] == [] and out["ticket"]["number_ends"] is None
+    assert "ticket_number" not in out and ticket_rows(tw, "tickets") == []
+
+
+class KillVenue(Watched):
+    """The random venue, naming its account; every call is a point where the process may die."""
+    killer = None
+
+    def _tick(self, where):
+        if self.killer is not None:
+            self.killer.tick(where)
+
+    @property
+    def account_id(self):
+        self._tick("account_id")
+        self.calls.append(("account_id", None))
+        return ACCOUNT
+
+    def positions(self):
+        self._tick("positions")
+        return super().positions()
+
+    def cash(self):
+        self._tick("cash")
+        return super().cash()
+
+    def cancel(self, tag):
+        self._tick("cancel")
+        return super().cancel(tag)
+
+    def order_status(self, tag):
+        self._tick("order_status")
+        return super().order_status(tag)
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE"):
+        self._tick("submit")
+        out = super().submit(symbol, units, tag, price, limit_price, session)
+        self._tick("after submit")
+        return out
+
+
+class Killer:
+    """Dies (raises Crash) at the n-th point it is asked about; n None: never."""
+
+    def __init__(self, at):
+        self.at, self.n, self.where = at, 0, None
+
+    def tick(self, where):
+        self.n += 1
+        if self.at is not None and self.n == self.at:
+            self.where = where
+            raise Crash(where)
+
+
+def _kill_points(monkeypatch, box):
+    """Every write of the ledger, the state file and the ticket file, before and after, is a point where the process
+    may die (box["killer"])."""
+    def wrap(cls, name):
+        real = getattr(cls, name)
+
+        def method(self, *a, **k):
+            if box.get("killer"):
+                box["killer"].tick(f"before {name}")
+            out = real(self, *a, **k)
+            if box.get("killer"):
+                box["killer"].tick(f"after {name}")
+            return out
+        monkeypatch.setattr(cls, name, method)
+    for name in ("intend", "submit_once", "reconcile", "mark_applied"):
+        wrap(_Ledger, name)
+    for name in ("record_equity", "note_sending", "note_outcome", "settle_sends", "record_baseline"):
+        wrap(osx.OrderStepState, name)
+    for name in ("create", "mark_used", "mark_expired", "note_outcome", "note_attempt"):
+        wrap(osx.TicketBook, name)
+
+
+def _random_world(tmp, rng, killer=None):
+    held = {"OWN": float(rng.randint(0, 5)), "SPY": float(rng.choice([0, 0, 3]))}
+    v = KillVenue(rng, {s: u for s, u in held.items() if u}, cash=rng.choice([5_000.0, 50_000.0, 1e7]))
+    w = ticket_world(tmp, v)
+    w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": rng.choice([1, 2, 3, 40])}))
+    return w, held
+
+
+def _random_paper(rng):
+    return paper({s: {sym: float(rng.choice([0, 0, 2, 5, 9, 12.5, -3])) for sym in ("SPY", "QQQ", "IWM")} for s in ("a", "b")})
+
+
+def _killing_quotes(w, box):
+    real = w.quotes
+
+    def quotes(symbols):
+        if box.get("killer"):
+            box["killer"].tick("quotes")
+        return real(symbols)
+    w.quotes = quotes
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_a_propose_run_never_intends_or_sends_whatever_happens(tmp_path, monkeypatch, seed_block):
+    """50 scenarios per block, 300 in all: random earlier runs, then propose runs that die at a random point."""
+    box = {}
+    _kill_points(monkeypatch, box)
+    intends = []
+    real_intend = _Ledger.intend
+
+    def intend(self, *a, **k):
+        intends.append(box.get("phase"))
+        return real_intend(self, *a, **k)
+    monkeypatch.setattr(_Ledger, "intend", intend)
+    killed = tickets = 0
+    for k in range(50):
+        rng = random.Random(120_000 + seed_block * 50 + k)
+        w, _ = _random_world(tmp_path / f"p{seed_block}-{k}", rng)
+        _killing_quotes(w, box)
+        for sym in ("SPY", "QQQ", "IWM"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25])
+            w.quote_age[sym] = rng.choice([60.0, 60.0, 1500.0])
+        for _ in range(rng.randint(0, 2)):                                # earlier ordinary runs leave orders about
+            box["phase"] = "ordinary"
+            w.paper = _random_paper(rng)
+            w.run()
+            w.venue.market()
+            w.later(rng.choice([1, 30]))
+        for _ in range(rng.randint(1, 3)):
+            w.paper = _random_paper(rng)
+            box["phase"] = "propose"
+            box["killer"] = w.venue.killer = Killer(rng.choice([None] * 10 + list(range(1, 40))))
+            before_orders = [(o["tag"], o["state"]) for o in w.orders()]
+            before_submits = len(w.venue.submits())
+            try:
+                out = propose(w)
+                tickets += bool(out.get("ticket_number"))
+            except Crash:
+                killed += 1
+            finally:
+                box["killer"] = w.venue.killer = None
+            assert len(w.venue.submits()) == before_submits                # no venue order call
+            assert [t for t, _ in before_orders] == [o["tag"] for o in w.orders()]   # no new intent in the ledger
+            w.venue.market()
+            w.later(rng.choice([1, 5]))
+        assert "propose" not in intends
+    assert killed > 20 and tickets > 10
+
+
+# ---- invariant 2: an approve run sends at most what its ticket holds, each order after the fresh checks
+
+def test_an_approve_run_sends_the_tickets_orders_through_the_ledger(tw):
+    out, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 4.0}})
+    tw.later(5)
+    tw.venue.calls.clear()
+    out = approve(tw, number)
+    assert out["status"] == "done" and out["mode"] == "approve" and out["orders_sent"] == 2
+    assert sorted((o["symbol"], o["units"]) for o in tw.orders()) == [("QQQ", 4.0), ("SPY", 10.0)]
+    assert [(o["fund"], o["outcome"]) for o in out["ticket"]["orders"]] == [("SPY", "sent"), ("QQQ", "sent")]
+    assert all(o["tag"].startswith(out["batch"]) for o in out["ticket"]["orders"])
+    names = tw.venue.names()                                                # the account, cash and quotes read again
+    assert names.count("submit") == 2 and "account_id" in names and "cash" in names and "quotes" in names
+    assert names.index("account_id") < names.index("positions") < names.index("quotes") < names.index("submit")
+    assert [e["event"] for e in tw.entries()][-3:] == ["order", "order", "summary"]
+    outcomes = ticket_rows(tw, "outcomes")
+    assert [(r["line"], r["outcome"]) for r in outcomes] == [(0, "sent"), (1, "sent")]
+    assert [r["fate"] for r in ticket_rows(tw, "fates")] == ["used"]
+
+
+def test_an_order_whose_wanted_size_or_side_changed_is_dropped_and_the_rest_go_on(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 4.0, "IWM": 2.0, "TLT": 3.0}})
+    tw.paper = paper({"a": {"SPY": 11.0, "QQQ": 4.0, "IWM": 0.0, "GLD": 1.0, "TLT": 2.0}})   # SPY more, IWM gone, TLT fewer
+    tw.later(2)
+    out = approve(tw, number)
+    by = {o["fund"]: o for o in out["ticket"]["orders"]}
+    assert by["QQQ"]["outcome"] == "sent" and [o["symbol"] for o in tw.orders()] == ["QQQ"]
+    for sym in ("SPY", "IWM", "TLT"):
+        assert by[sym]["outcome"] == "dropped" and "wanted" in by[sym]["reason"]
+    assert {"symbol": "GLD", "units": 1.0, "reason": "not on the ticket"} in out["skipped"]
+    assert sorted(e["symbol"] for e in tw.entries("dropped")) == ["IWM", "SPY", "TLT"]
+
+
+def test_fractional_units_must_match_to_within_a_billionth(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 1.23456, "QQQ": 2.5}}, fractional=True)
+    tw.paper = paper({"a": {"SPY": 1.23456, "QQQ": 2.50001}})
+    out = approve(tw, number, fractional=True)
+    by = {o["fund"]: o["outcome"] for o in out["ticket"]["orders"]}
+    assert by == {"SPY": "sent", "QQQ": "dropped"} and [o["units"] for o in tw.orders()] == [1.23456]
+
+
+@pytest.mark.parametrize("move, sent", [(0.0, True), (0.004, True), (0.005, True), (-0.005, True), (0.0051, False),
+                                        (-0.006, False), (0.02, False)])
+def test_an_order_whose_fresh_quote_moved_more_than_half_a_percent_is_dropped(tw, move, sent):
+    assert osx.TICKET_QUOTE_MOVE == 0.005
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 1.0}})
+    tw.prices["SPY"] = 500.0 * (1 + move)
+    out = approve(tw, number)
+    by = {o["fund"]: o for o in out["ticket"]["orders"]}
+    assert by["QQQ"]["outcome"] == "sent"
+    assert (by["SPY"]["outcome"] == "sent") is sent
+    if not sent:
+        assert "0.5%" in by["SPY"]["reason"] and "SPY" not in units_sent(tw)
+
+
+def test_a_quote_asked_for_again_during_the_approve_is_the_one_compared_with_the_ticket(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.quote_age["SPY"] = 1190.0                                           # usable when asked, too old once cash is read
+    real_cash, real = tw.venue.cash, tw.quotes
+
+    def cash():
+        tw.clock.t += 30
+        return real_cash()
+
+    def quotes(symbols):
+        out = real(symbols)
+        if len(tw.quote_calls) >= 3:                                       # the approve's second ask: the price moved
+            out = {s: (510.0 if s == "SPY" else q[0], tw.clock.t - 60.0) for s, q in out.items()}
+        return out
+    tw.venue.cash, tw.quotes = cash, quotes
+    out = approve(tw, number)
+    assert out["ticket"]["orders"][0]["outcome"] == "dropped" and "0.5%" in out["ticket"]["orders"][0]["reason"]
+    assert tw.venue.submits() == []
+
+
+def test_an_order_the_risk_gate_now_refuses_is_dropped_and_a_reducing_sale_still_goes(tw):
+    tw.venue.held = {}
+    tw.paper = paper({"a": {"SPY": 4.0}})
+    tw.run()
+    tw.venue.fill(tw.venue.submits()[0])
+    tw.later(30)
+    _, number = _proposed(tw, {"a": {"SPY": 1.0, "QQQ": 2.0}})
+    tw.latch.write_text("{}")                                               # the drawdown latch appears
+    out = approve(tw, number)
+    by = {o["fund"]: o for o in out["ticket"]["orders"]}
+    assert by["SPY"]["outcome"] == "sent" and by["QQQ"]["outcome"] == "dropped" and "latch" in by["QQQ"]["reason"]
+
+
+def test_every_ordinary_check_still_applies_to_an_approved_order(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 1.0}})
+    tw.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": 1}))   # the day's cap, now one order
+    out = approve(tw, number)
+    by = {o["fund"]: o for o in out["ticket"]["orders"]}
+    assert by["SPY"]["outcome"] == "sent" and by["QQQ"]["outcome"] == "dropped" and "cap" in by["QQQ"]["reason"]
+
+
+def test_a_ticket_expires_fifteen_minutes_after_it_was_made(tmp_path):
+    assert 0 < osx.TICKET_LIFE_SECONDS == 15 * 60 <= osx.TICKET_LIFE_MAX_SECONDS == 60 * 60
+    for after, goes in ((15 * 60, True), (15 * 60 + 1, False), (59 * 60, False)):
+        w = ticket_world(tmp_path / f"e{after}")
+        _, number = _proposed(w, {"a": {"SPY": 10.0}})
+        w.clock.t += after
+        w.venue.calls.clear()
+        out = approve(w, number)
+        if goes:
+            assert out["status"] == "done" and out["orders_sent"] == 1
+        else:
+            assert out["status"] == "stopped" and out["stage"] == "ticket" and "expired" in out["reason"]
+            assert w.venue.submits() == [] and w.orders() == []
+            assert [r["fate"] for r in ticket_rows(w, "fates")] == ["expired"]
+            assert [r["outcome"] for r in ticket_rows(w, "outcomes")] == ["expired"]
+
+
+def test_a_ticket_that_expires_while_the_approve_runs_sends_nothing_more(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 1.0}})
+    tw.later(14)
+    _slow_venue(tw, 2)                                                     # the first submit takes two minutes
+    out = approve(tw, number)
+    by = {o["fund"]: o for o in out["ticket"]["orders"]}
+    assert by["SPY"]["outcome"] == "sent" and by["QQQ"]["outcome"] == "dropped" and "expired" in by["QQQ"]["reason"]
+    assert len(tw.venue.submits()) == 1
+
+
+def test_a_ticket_that_expires_between_intend_and_submit_once_leaves_the_order_intended(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.later(14)
+    out = tw.run(approve=number, patch=_after_intend(tw, lambda s, u: setattr(tw.clock, "t", tw.clock.t + 120)))
+    assert tw.venue.submits() == [] and [o["state"] for o in tw.orders()] == ["intended"]
+    assert out["ticket"]["orders"][0]["outcome"] == "dropped" and "expired" in out["ticket"]["orders"][0]["reason"]
+
+
+@pytest.mark.parametrize("how", ["another day", "another account", "another venue", "another capital", "fractional",
+                                 "wrong number", "not digits", "five digits", "seven digits", "used", "expired"])
+def test_a_ticket_that_does_not_fit_this_run_sends_nothing_with_one_plain_reason(tmp_path, how):
+    w = ticket_world(tmp_path / "w")
+    _, number = _proposed(w, {"a": {"SPY": 10.0}})
+    kw = {}
+    if how == "another day":
+        w.next_day()
+        w.paper = paper({"a": {"SPY": 10.0}})
+    elif how == "another account":
+        w.venue.account = "Zq9OTHERACCOUNT1"
+    elif how == "another venue":
+        w.venue.name = "standin2-sandbox"                                    # the same files, another venue's name
+    elif how == "another capital":
+        kw["capital"] = 200_000.0
+    elif how == "fractional":
+        kw["fractional"] = True
+    elif how == "wrong number":
+        number = wrong_other_number(number)
+    elif how == "not digits":
+        number = "12a456"
+    elif how == "five digits":
+        number = number[:5]
+    elif how == "seven digits":
+        number = number + "1"
+    elif how == "used":
+        assert approve(w, number)["orders_sent"] == 1
+    elif how == "expired":
+        w.later(16)
+    w.venue.calls.clear()
+    submits = len(w.venue.submits())
+    before = [(o["tag"], o["state"]) for o in w.orders()]
+    out = approve(w, number, **kw)
+    assert out["status"] == "stopped" and out["stage"] == "ticket" and out["orders_sent"] == 0
+    assert isinstance(out["reason"], str) and len(out["reason"]) < 200 and "\n" not in out["reason"]
+    assert len(w.venue.submits()) == submits and [(o["tag"], o["state"]) for o in w.orders()] == before
+    assert "submit" not in w.venue.names() and "positions" not in w.venue.names()   # stopped before the account is read
+    assert number not in out["reason"] and ACCOUNT not in json.dumps(out)
+
+
+def test_an_approve_outside_the_session_reads_nothing(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t = ny("2026-11-13 16:30")
+    tw.venue.calls.clear()
+    out = approve(tw, number)
+    assert out["stage"] == "session" and tw.venue.calls == [] and ticket_rows(tw, "attempts") == []
+
+
+def test_orders_not_on_the_ticket_are_never_sent(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.paper = paper({"a": {"SPY": 10.0, "QQQ": 5.0, "IWM": 3.0}})
+    out = approve(tw, number)
+    assert [o["symbol"] for o in tw.orders()] == ["SPY"] and out["orders_sent"] == 1
+    assert sorted(s["symbol"] for s in out["skipped"] if s["reason"] == "not on the ticket") == ["IWM", "QQQ"]
+
+
+def _sent_model(lines, now_ok, moves, changed, halted, latched, reducing):
+    """What may be sent: the ticket's lines whose wanted size is unchanged, whose quote moved 0.5% or less, while
+    the ticket is live and nothing stops it."""
+    if not now_ok or halted:
+        return set()
+    return {ln["fund"] for ln in lines if ln["fund"] not in changed and abs(moves.get(ln["fund"], 0.0)) <= 0.005 + 1e-12
+            and (not latched or ln["fund"] in reducing)}
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_an_approve_run_sends_at_most_what_its_ticket_allows_over_generated_scenarios(tmp_path, seed_block):
+    """50 scenarios per block, 300 in all: a ticket, then the world changes at random, then an approve (or two)."""
+    full = partial = 0
+    for k in range(50):
+        rng = random.Random(130_000 + seed_block * 50 + k)
+        w = ticket_world(tmp_path / f"a{seed_block}-{k}")
+        held0 = {sym: float(rng.choice([0, 0, 2, 6])) for sym in ("SPY", "QQQ")}
+        if any(held0.values()):                                            # some holdings of this program to sell
+            w.paper = paper({"a": dict(held0)})
+            w.run()
+            for tag in w.venue.submits():
+                w.venue.fill(tag)
+            w.later(30)
+        wanted = {"a": {sym: float(rng.choice([0, 1, 3, 7])) for sym in ("SPY", "QQQ", "IWM", "TLT")}}
+        w.paper = paper(wanted)
+        fractional = rng.random() < 0.2
+        capital = rng.choice([None, None, 150_000.0])
+        out = propose(w, fractional=fractional, capital=capital)
+        lines = out["ticket"]["orders"]
+        if not lines:
+            continue
+        number = out["ticket_number"]
+        moves = {sym: rng.choice([0.0, 0.0, 0.003, -0.005, 0.0049, 0.0051, -0.01, 0.03]) for sym in ("SPY", "QQQ", "IWM", "TLT")}
+        for sym, m in moves.items():
+            w.prices[sym] = w.prices[sym] * (1 + m)
+        changed = set()
+        if rng.random() < 0.3:                                             # the paper book changes for one fund
+            sym = rng.choice(["SPY", "QQQ", "IWM", "TLT"])
+            wanted = {"a": {**wanted["a"], sym: wanted["a"][sym] + rng.choice([1.0, 2.0])}}   # a size that moves
+            w.paper = paper(wanted)
+            changed.add(sym)
+        minutes = rng.choice([0, 1, 5, 14, 15, 16, 40])
+        w.later(minutes)
+        halted, latched = rng.random() < 0.1, rng.random() < 0.15
+        if halted:
+            w.halt = w.tmp / "halt.json"
+            w.halt.write_text("{}")
+        if latched:
+            w.latch.write_text("{}")
+        right = rng.random() < 0.85
+        reducing = {ln["fund"] for ln in lines if ln["side"] == "sell"}
+        allowed = _sent_model(lines, right and minutes <= 15, moves, changed, halted, latched, reducing)
+        submits_before = len(w.venue.submits())
+        out2 = approve(w, number if right else wrong_other_number(number), fractional=fractional, capital=capital)
+        sent = [o for o in w.orders() if o["batch"] == out2["batch"] and o["state"] not in ("intended",)]
+        assert len(w.venue.submits()) - submits_before == len(sent)
+        units = {ln["fund"]: ln["units"] for ln in lines}
+        for o in sent:
+            assert o["symbol"] in allowed, (seed_block, k, o["symbol"], allowed, moves, changed, minutes, out2["ticket"])
+            assert o["units"] == units[o["symbol"]]                              # the ticket's units, never more
+        assert len({o["symbol"] for o in sent}) == len(sent)
+        if allowed:
+            assert {o["symbol"] for o in sent} == allowed                     # nothing else stood in the way here
+            full += 1
+        partial += len(allowed) < len(lines)
+        if right:
+            again = approve(w, number, fractional=fractional, capital=capital)    # never twice
+            assert again["status"] == "stopped" and again["orders_sent"] == 0
+    assert full > 10 and partial > 10, (full, partial)
+
+
+# ---- invariant 3: a ticket is used once
+
+def test_a_second_approve_of_the_same_number_sends_nothing(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert approve(tw, number)["orders_sent"] == 1
+    tw.later(1)
+    out = approve(tw, number)
+    assert out["stage"] == "ticket" and "used" in out["reason"] and len(tw.venue.submits()) == 1
+
+
+def test_the_ticket_is_marked_used_durably_before_the_first_intend(tw, monkeypatch):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    seen = []
+    real = _Ledger.intend
+
+    def intend(self, *a, **k):
+        seen.append([r["fate"] for r in ticket_rows(tw, "fates")])       # read from the file by another connection
+        return real(self, *a, **k)
+    monkeypatch.setattr(_Ledger, "intend", intend)
+    approve(tw, number)
+    assert seen == [["used"]]
+
+
+def test_a_kill_after_the_used_mark_and_before_intend_leaves_a_used_ticket_and_nothing_sent(tw, monkeypatch):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 1.0}})
+    monkeypatch.setattr(_Ledger, "intend", lambda self, *a, **k: (_ for _ in ()).throw(Crash("killed")))
+    with pytest.raises(Crash):
+        approve(tw, number)
+    monkeypatch.undo()
+    assert tw.venue.submits() == [] and [r["fate"] for r in ticket_rows(tw, "fates")] == ["used"]
+    out = approve(tw, number)
+    assert out["stage"] == "ticket" and "used" in out["reason"] and tw.venue.submits() == []
+
+
+def test_a_kill_between_intend_and_submit_sends_nothing_later_and_the_next_run_settles_it(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+
+    def crash_at_submit(led):
+        led.submit_once = lambda *a, **k: (_ for _ in ()).throw(Crash("killed"))
+    with pytest.raises(Crash):
+        tw.run(approve=number, patch=crash_at_submit)
+    assert approve(tw, number)["stage"] == "ticket" and tw.venue.submits() == []
+    tw.later(30)
+    tw.paper = paper({})
+    tw.run()                                                               # an ordinary run settles what was intended
+    assert tw.venue.submits() == [] and [o["state"] for o in tw.orders()] == ["intended"]
+    st = osx.OrderStepState(tw.state_path)
+    try:
+        assert st.sent_on("2026-11-13") == 0
+    finally:
+        st.close()
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_a_ticket_sends_each_order_at_most_once_whatever_kills_its_approve_runs(tmp_path, monkeypatch, seed_block):
+    """50 scenarios per block, 300 in all: a ticket, an approve that dies at a random point, more approves."""
+    box = {}
+    _kill_points(monkeypatch, box)
+    killed = reached = 0
+    for k in range(50):
+        rng = random.Random(140_000 + seed_block * 50 + k)
+        w, _ = _random_world(tmp_path / f"u{seed_block}-{k}", rng)
+        w.venue.nice = True
+        w.venue.cash_value = 1e7
+        _killing_quotes(w, box)
+        w.paper = paper({"a": {sym: float(rng.choice([1, 3, 7])) for sym in ("SPY", "QQQ", "IWM")}})
+        out = propose(w)
+        number = out.get("ticket_number")
+        if not number:
+            continue
+        lines = {ln["fund"]: ln["units"] for ln in out["ticket"]["orders"]}
+        w.venue.nice = rng.random() < 0.5
+        tags = []
+        for attempt in range(3):
+            w.later(rng.choice([0, 1, 2]))
+            box["killer"] = w.venue.killer = Killer(rng.randint(1, 30) if attempt == 0 else rng.choice([None, None, rng.randint(1, 30)]))
+            used_before = bool(ticket_rows(w, "fates"))
+            submits_before = len(w.venue.submits())
+            try:
+                approve(w, number)
+            except Crash:
+                killed += 1
+            finally:
+                box["killer"] = w.venue.killer = None
+            if used_before:                                                # a used ticket sends nothing new
+                assert len(w.venue.submits()) == submits_before
+            tags += w.venue.submits()[submits_before:]
+            reached += bool(ticket_rows(w, "fates")) and not used_before
+        sent = [t for t in tags]
+        assert len(sent) == len(set(sent))
+        symbols = [o["symbol"] for o in w.orders() if o["tag"] in set(sent)]
+        assert len(symbols) == len(set(symbols)) and set(symbols) <= set(lines)   # each line at most once
+        for o in w.orders():
+            if o["tag"] in set(sent):
+                assert o["units"] == lines[o["symbol"]]
+        w.later(30)
+        w.venue.nice = True
+        box["phase"] = "ordinary"
+        w.run()                                                            # intended orders are settled, never sent
+        intended = {o["tag"] for o in w.orders() if o["state"] == "intended"}
+        assert not (intended & set(w.venue.submits()))
+        assert len(w.venue.taken) == len(set(w.venue.taken))
+    assert killed > 30 and reached > 20, (killed, reached)
+
+
+# ---- invariant 4: a number is not guessable into a send
+
+def test_ticket_numbers_are_six_digits_from_the_systems_secure_random_source(monkeypatch):
+    import secrets
+    asked = []
+    monkeypatch.setattr(secrets, "randbelow", lambda n: asked.append(n) or 42)
+    assert osx.ticket_number() == "000042" and asked == [1_000_000]
+    assert osx.secrets is secrets
+
+
+def test_a_number_already_used_today_is_not_given_again(tw, monkeypatch):
+    import secrets
+    numbers = iter([7, 7, 7, 8])
+    monkeypatch.setattr(secrets, "randbelow", lambda n: next(numbers))
+    _, first = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.later(1)
+    _, second = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert (first, second) == ("000007", "000008")
+
+
+def test_three_wrong_numbers_in_a_new_york_day_lock_approval_until_the_next_propose(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    for _ in range(3):
+        out = approve(tw, wrong_other_number(number))
+        assert out["stage"] == "ticket" and "no ticket" in out["reason"]
+    out = approve(tw, number)                                              # the right number, now locked
+    assert out["stage"] == "ticket" and "locked" in out["reason"] and tw.venue.submits() == []
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})                       # a new propose lifts the lock
+    assert approve(tw, number)["orders_sent"] == 1
+    assert len(ticket_rows(tw, "attempts")) == 4
+
+
+def test_wrong_numbers_of_an_earlier_day_do_not_count_today(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    for _ in range(3):
+        approve(tw, wrong_other_number(number))
+    assert "locked" in approve(tw, number)["reason"]
+    tw.next_day()
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    out = approve(tw, number)                                              # a new day, no propose: not locked
+    assert out["stage"] == "ticket" and "locked" not in out["reason"] and "another day" in out["reason"]
+
+
+def test_a_wrong_number_after_three_today_but_before_any_propose_stays_locked(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    for n in ("000000", "abcdef", ""):
+        approve(tw, n if n != number else "999999")
+    tw.later(10)
+    assert "locked" in approve(tw, number)["reason"]
+
+
+# ---- invariant 5: tickets are a record, append-only, in their own file
+
+def test_tickets_their_lines_and_what_became_of_each_are_kept_in_their_own_file(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 4.0}})
+    tw.prices["QQQ"] = 420.0
+    out = approve(tw, number)
+    path = osx.ticket_path_for(tw.state_path)
+    assert Path(path).name == "order_step-standin-sandbox.tickets.sqlite" and Path(path).parent == tw.state_path.parent
+    (ticket,) = ticket_rows(tw, "tickets")
+    assert ticket["number"] == number and ticket["venue"] == "standin-sandbox" and ticket["capital"] == 100_000.0
+    assert ticket["expires"] - ticket["created"] == osx.TICKET_LIFE_SECONDS and ticket["day"] == "2026-11-13"
+    assert [(r["line"], r["symbol"], r["side"], r["units"]) for r in ticket_rows(tw, "lines")] == [
+        (0, "SPY", "buy", 10.0), (1, "QQQ", "buy", 4.0)]
+    rows = {r["line"]: r for r in ticket_rows(tw, "outcomes")}
+    assert rows[0]["outcome"] == "sent" and rows[0]["tag"] == out["ticket"]["orders"][0]["tag"]
+    assert rows[1]["outcome"] == "dropped" and "0.5%" in rows[1]["reason"] and rows[1]["tag"] is None
+    assert [r["fate"] for r in ticket_rows(tw, "fates")] == ["used"]
+
+
+@pytest.mark.parametrize("statement", [
+    "UPDATE tickets SET expires = expires + 3600", "DELETE FROM tickets", "UPDATE lines SET units = 99",
+    "DELETE FROM lines", "DELETE FROM fates", "UPDATE fates SET fate = 'expired'", "DELETE FROM outcomes",
+    "UPDATE outcomes SET outcome = 'dropped'", "DELETE FROM attempts", "UPDATE meta SET value = 'x'", "DELETE FROM meta",
+    "INSERT OR REPLACE INTO fates (day, number, fate, time, batch) SELECT day, number, 'used', 0, 'x' FROM fates",
+    "INSERT OR REPLACE INTO tickets SELECT * FROM tickets",
+    "INSERT OR REPLACE INTO meta (key, value) SELECT key, 'other' FROM meta"])
+def test_the_ticket_file_refuses_every_update_delete_and_replacement(tw, statement):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    approve(tw, wrong_other_number(number))
+    approve(tw, number)
+    path = osx.ticket_path_for(tw.state_path)
+    con = sqlite3.connect(path)
+    try:
+        before = {t: con.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall()
+                  for t in ("tickets", "lines", "fates", "outcomes", "attempts", "meta")}
+        with pytest.raises(sqlite3.DatabaseError):
+            con.execute(statement)
+        con.rollback()
+        assert before == {t: con.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in before}
+    finally:
+        con.close()
+
+
+def test_the_ticket_file_refuses_a_file_that_is_not_its_own(tmp_path):
+    other = tmp_path / "other.sqlite"
+    con = sqlite3.connect(other)
+    con.execute("CREATE TABLE something (x)")
+    con.commit()
+    con.close()
+    with pytest.raises(osx.OrderStepError):
+        osx.TicketBook(other)
+    state = tmp_path / "state.sqlite"
+    osx.OrderStepState(state).close()
+    with pytest.raises(osx.OrderStepError):
+        osx.TicketBook(state)                                              # the state file is not a ticket file
+    book = osx.TicketBook(tmp_path / "t.sqlite")
+    book.close()
+    assert osx.TicketBook(tmp_path / "t.sqlite").layout() == osx.TICKET_LAYOUT
+
+
+@pytest.fixture(scope="module")
+def base_osx(tmp_path_factory):
+    """The order step of T22a's base commit, from git, loaded under its own name."""
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{BASE_COMMIT}:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True, check=True).stdout
+    folder = tmp_path_factory.mktemp("base_order_step")
+    path = folder / "order_step_t22a_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t22a_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t22a_base"] = mod
+    spec.loader.exec_module(mod)
+    assert not hasattr(mod, "TicketBook")
+    return mod
+
+
+def _dump(path):
+    if not Path(path).exists():
+        return None
+    con = sqlite3.connect(path)
+    try:
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        return {"version": con.execute("PRAGMA user_version").fetchone()[0],
+                "schema": sorted(r[0] for r in con.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL")),
+                "rows": {t: con.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in tables}}
+    finally:
+        con.close()
+
+
+def test_the_state_files_layout_is_unchanged_and_the_base_reads_and_continues_it(tmp_path, base_osx):
+    w = ticket_world(tmp_path / "w")
+    w.paper = paper({"a": {"SPY": 2.0}})
+    _run_with(base_osx, w)                                                 # a state file written by the base ...
+    w.later(5)
+    _, number = _proposed(w, {"a": {"SPY": 10.0}})                        # ... continued by tickets
+    approve(w, number)
+    assert _dump(w.state_path)["version"] == 1
+    assert set(_dump(w.state_path)["rows"]) <= {"meta", "baseline", "equity", "sends", "sqlite_sequence"}
+    st = base_osx.OrderStepState(w.state_path)                             # ... and read by the base again
+    st.close()
+    w.later(30)
+    w.paper = paper({"a": {"SPY": 12.0}})
+    out = _run_with(base_osx, w)
+    assert out["status"] == "done" and out["orders_sent"] == 1
+
+
+# ---- invariant 6: nothing secret or unexpected gets out
+
+def test_no_account_id_reaches_the_ticket_the_summary_the_journal_or_any_file(tw, capsys):
+    outs = []
+    out, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 4.0}})
+    outs.append(out)
+    outs.append(approve(tw, wrong_other_number(number)))
+    tw.later(1)
+    outs.append(approve(tw, number))
+    outs.append(approve(tw, number))
+    text = _all_text(tw, outs)
+    assert ACCOUNT not in text and ACCOUNT[-8:] not in text
+    (ticket,) = ticket_rows(tw, "tickets")
+    assert len(ticket["account"]) == 64 and ticket["account"] != hashlib.sha256(ACCOUNT.encode()).hexdigest()   # keyed
+
+
+def test_another_ticket_file_keys_the_same_account_differently(tmp_path):
+    a, b = osx.TicketBook(tmp_path / "a.sqlite"), osx.TicketBook(tmp_path / "b.sqlite")
+    try:
+        assert a.account_hash(ACCOUNT) != b.account_hash(ACCOUNT) and a.account_hash(ACCOUNT) == a.account_hash(ACCOUNT)
+    finally:
+        a.close()
+        b.close()
+
+
+class LeakyBooked(Leaky):
+    account = ACCOUNT
+
+    @property
+    def account_id(self):
+        if isinstance(self.account, BaseException):
+            raise self.account
+        return self.account
+
+
+def test_nothing_the_venue_says_reaches_a_ticket_or_its_summaries(tmp_path):
+    outs, worlds = [], []
+    w = ticket_world(tmp_path / "w", LeakyBooked())
+    worlds.append(w)
+    out, number = _proposed(w, {"a": {"SPY": 1.0, "QQQ": 1.0, "IWM": 1.0, "TLT": 1.0}})
+    outs.append(out)
+    w.venue.submit_mode = ["accept", "refuse", "reject", "reject marked code"]
+    outs.append(approve(w, number))
+    w2 = ticket_world(tmp_path / "w2", LeakyBooked())
+    worlds.append(w2)
+    w2.venue.account = ConnectionError(f"account list failed: {MARK} {ACCOUNT}")
+    w2.paper = paper({"a": {"SPY": 1.0}})
+    outs.append(propose(w2))
+    assert outs[-1]["stage"] == "ticket" and "ConnectionError" in outs[-1]["reason"]
+    w3 = ticket_world(tmp_path / "w3", LeakyBooked())
+    worlds.append(w3)
+    w3.venue.account = MARK                                                 # not a plain id
+    w3.paper = paper({"a": {"SPY": 1.0}})
+    outs.append(propose(w3))
+    assert outs[-1]["stage"] == "ticket"
+    text = "\n".join(_all_text(x, outs) for x in worlds)
+    assert MARK not in text and "leak" not in text and ACCOUNT not in text
+    assert "SOME_CODE" in text and "NotTransmitted" in text
+
+
+# ---- invariant 7: the scheduled paper path is untouched, byte for byte
+
+def test_an_ordinary_run_reads_no_account_and_makes_no_ticket_file(tw):
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    out = tw.run()
+    assert "account_id" not in tw.venue.names() and not Path(osx.ticket_path_for(tw.state_path)).exists()
+    assert "mode" not in out and "ticket" not in out and "dropped" not in out
+
+
+def _run_with(mod, w, **kw):
+    led = mod.open_ledger(w.ledger_path, clock=w.clock)
+    book = w.paper
+    if isinstance(book, osx.PaperTargets):
+        book = mod.PaperTargets(**dataclasses.asdict(book))
+        if book.day == AUTO:
+            prev = CAL.sessions[CAL.sessions.searchsorted(ny_day(w.clock.t)) - 1]
+            book = dataclasses.replace(book, day=str(prev.date()))
+    try:
+        return mod.run_order_step(ledger=led, venue=w.venue, paper=book, quotes=w.quotes, journal=w.journal,
+                                  limits_file=w.limits, state=w.state_path, clock=w.clock, calendar=CAL,
+                                  halt_file=w.halt, latch_file=w.latch, **kw)
+    finally:
+        led.close()
+
+
+_STAMP = re.compile(rb'"timestamp": "[^"]*"')
+
+
+def _scenario(mod, tmp, seed, monkeypatch):
+    """One generated scenario driven through `mod`: what the venue, the quote source, the journal, the ledger and
+    the state file saw, run by run."""
+    rng = random.Random(seed)
+    urandom = random.Random(seed + 1)
+    monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
+    held = {"OWN": float(rng.randint(0, 5)), "SPY": float(rng.choice([0, 0, 3]))}
+    venue = KillVenue(rng, {s: u for s, u in held.items() if u}, cash=rng.choice([5_000.0, 50_000.0, 1e7]))
+    w = ticket_world(tmp, venue)
+    w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": rng.choice([1, 2, 3, 40])}))
+    kw = {}
+    if rng.random() < 0.3:
+        kw["fractional"] = True
+    if rng.random() < 0.3:
+        kw["capital"] = rng.choice([50_000.0, 250_000.0])
+    seen = []
+    for day in range(3):
+        w.venue.nice = day == 2
+        w.paper = _random_paper(rng)
+        for sym in ("SPY", "QQQ", "IWM"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25])
+            w.quote_age[sym] = rng.choice([60.0, 60.0, 1500.0])
+        if rng.random() < 0.1:
+            w.latch.write_text("{}")
+        elif w.latch.exists():
+            w.latch.unlink()
+        for run in range(rng.randint(1, 2)):
+            if run:
+                w.later(rng.choice([1, 30]))
+            w.venue.calls.clear()
+            w.venue.killer = Killer(rng.choice([None, None, None, rng.randint(1, 25)]))
+            try:
+                out = _run_with(mod, w, **kw)
+            except Crash as crash:
+                out = {"crashed": str(crash)}
+            w.venue.killer = None
+            seen.append({"calls": list(w.venue.calls), "summary": json.dumps(out, sort_keys=True, default=str),
+                         "journal": {f.name: _STAMP.sub(b'"timestamp": "T"', f.read_bytes())    # the journal's wall clock
+                                     for f in sorted((w.tmp / "journal").glob("*"))},
+                         "state": _dump(w.state_path), "ledger": _dump(w.ledger_path),
+                         "files": sorted(str(p.relative_to(w.tmp)) for p in w.tmp.rglob("*") if p.is_file())})
+            w.venue.market()
+        w.next_day()
+    monkeypatch.undo()
+    return seen
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_a_run_without_the_new_flags_is_the_base_byte_for_byte_over_generated_scenarios(tmp_path, monkeypatch, base_osx,
+                                                                                        seed_block):
+    """50 scenarios per block, 300 in all, each driven through the base and through this revision."""
+    sends = crashes = 0
+    for k in range(50):
+        seed = 150_000 + seed_block * 50 + k
+        base = _scenario(base_osx, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            for key in b:
+                assert b[key] == m[key], (seed, i, key)
+        sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        crashes += sum(1 for r in mine if "crashed" in r["summary"])
+    assert sends > 50 and crashes > 5

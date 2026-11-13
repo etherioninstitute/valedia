@@ -432,3 +432,66 @@ def test_reset_kill_switch_still_clears_a_latch_that_is_a_dangling_link(tmp_path
     latch.symlink_to(tmp_path / "nowhere.json")
     assert cli.main(["--root", str(tmp_path), "reset-kill-switch", "--who", "burton"]) == 0
     assert "latch cleared" in capsys.readouterr().out and not latch.is_symlink() and not (tmp_path / "nowhere.json").exists()
+
+
+# ---- T22a: the order step's ticket flow on the command line (propose, approve), in the test environment
+
+CLI_ACCOUNT = "ZqCLIACCOUNT0042"                                       # made up; never printed
+
+
+def _ticket_out(text):
+    lines = text.rstrip("\n").splitlines()
+    number_lines = [ln for ln in lines if ln.startswith("ticket number: ")]
+    body = "\n".join(ln for ln in lines if not ln.startswith("ticket number: "))
+    return json.loads(body), number_lines
+
+
+def test_order_step_propose_then_approve_on_the_command_line(order_step_project, capsys):
+    root, venue = order_step_project
+    venue.account_id = CLI_ACCOUNT
+    assert cli.main(["--root", str(root), "order-step", "--propose"]) == 0
+    captured = capsys.readouterr()
+    out, number_lines = _ticket_out(captured.out)
+    assert out["status"] == "done" and out["mode"] == "propose" and "submit" not in venue.calls and venue.book == {}
+    assert len(number_lines) == 1
+    number = number_lines[0].split()[2]
+    assert len(number) == 6 and number.isdigit() and captured.out.count(number) == 1   # printed once, beside the summary
+    assert "--approve NUMBER" in number_lines[0] and out["ticket"]["number_ends"] == number[-2:]
+    assert [(o["fund"], o["side"], o["units"]) for o in out["ticket"]["orders"]] == [("SPY", "buy", 5.0)]
+    journal_text = (root / "journal" / "2026-11-13.jsonl").read_text()
+    assert number not in journal_text and CLI_ACCOUNT not in journal_text + captured.out + captured.err
+    assert (root / "memory" / "order_step-standin-sandbox.tickets.sqlite").is_file()
+
+    assert cli.main(["--root", str(root), "order-step", "--approve", number]) == 0
+    captured = capsys.readouterr()
+    out, number_lines = _ticket_out(captured.out)
+    assert number_lines == [] and out["orders_sent"] == 1 and venue.calls.count("submit") == 1
+    assert [(o["fund"], o["outcome"]) for o in out["ticket"]["orders"]] == [("SPY", "sent")]
+
+    assert cli.main(["--root", str(root), "order-step", "--approve", number]) == 2        # used once
+    out, _ = _ticket_out(capsys.readouterr().out)
+    assert out["stage"] == "ticket" and "used" in out["reason"] and venue.calls.count("submit") == 1
+    wrong = f"{(int(number) + 1) % 1_000_000:06d}"
+    assert cli.main(["--root", str(root), "order-step", "--approve", wrong]) == 2         # a wrong number
+    out, _ = _ticket_out(capsys.readouterr().out)
+    assert out["stage"] == "ticket" and "no ticket" in out["reason"] and venue.calls.count("submit") == 1
+
+
+def test_order_step_propose_and_approve_together_are_refused_before_anything_is_made(order_step_project, capsys):
+    root, venue = order_step_project
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--root", str(root), "order-step", "--propose", "--approve", "123456"])
+    assert exc.value.code == 2 and venue.calls == [] and not (root / "memory").exists()
+
+
+def test_order_step_without_the_new_flags_calls_the_step_exactly_as_before(order_step_project, monkeypatch, capsys):
+    from valedia_trader.execution_and_risk import order_step
+    root, venue = order_step_project
+    seen = []
+    monkeypatch.setattr(order_step, "run_order_step", lambda **kw: seen.append(sorted(kw)) or {"status": "done"})
+    assert cli.main(["--root", str(root), "order-step"]) == 0
+    assert seen == [["capital", "clock", "fractional", "halt_file", "journal", "latch_file", "ledger", "limits_file", "paper",
+                     "quotes", "state", "venue"]]                    # the base's keywords, nothing more
+    assert capsys.readouterr().out == json.dumps({"status": "done"}, indent=2) + "\n"
+    assert cli.order_step_command(argparse.Namespace(capital=None, fractional=False), cli.LoopPaths(root), venue=venue) == 0
+    assert "propose" not in seen[-1] and "approve" not in seen[-1]

@@ -127,14 +127,39 @@ Points to know:
 The order step keeps a small sqlite state file (OrderStepState) beside the ledger, one per venue name: the baseline,
 the equity of each run, and the orders sent each day. Every write is one transaction. Everything a run needs is
 passed in; nothing here builds a broker client.
+
+Approval of a batch by ticket number (docs/specs/2026-11-13-go-live-gate-design.md, step 1; still the test
+environment only). Without `propose` or `approve` a run is exactly the one above. With them it works in two runs:
+ - propose  steps 1 to 10 up to the moment before intend: instead of intend, each order that passed every check
+            becomes a line of a ticket (fund, side, units, quote, limit, value), counted against the caps as if it
+            were sent. The ledger handed to the run cannot intend or send (_NoSend). After step 11 the ticket is
+            written: a six-digit number from the system's secure random source (`secrets`), the lines, the equity and
+            cash read, the time and an expiry TICKET_LIFE_SECONDS later, bound to the venue's name, a keyed hash of
+            its account id (read only in these runs), the New York day, the capital and the share mode. Nothing is
+            intended or sent. The journal gets one `ticket` entry holding the number's last two digits only; the
+            full number is returned beside the summary (`ticket_number`, never journaled).
+ - approve  the run checks, before any other venue call: approval not locked (WRONG_NUMBERS_MAX refused approvals
+            this New York day since the latest ticket), the number six digits, a ticket of that number made today for
+            this venue, not used, not expired, of this capital and share mode; then the account read again matches.
+            Any failure: one plain reason, nothing sent, the refusal recorded. Then steps 3 to 10 run afresh; on
+            entering the sending stage, before the first intend, the ticket is marked used (one row, committed; a
+            second mark fails). An order is sent only when the fresh targets want the same fund, side and units
+            (fractional: within TICKET_UNITS_SAME), its quote (the one the gate judged) is within TICKET_QUOTE_MOVE of
+            the ticket's, the ticket is still live (checked before intend and again at the last look), and every check
+            of an ordinary run passes; otherwise it is dropped with the reason. Orders not on the ticket are not sent.
+Tickets live in their own file beside the state file (ticket_path_for, TicketBook): append-only tables, natural keys,
+no update, no delete, no replacement; the state file's layout is unchanged.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import inspect
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -152,7 +177,8 @@ from valedia_trader.venues.webull import EVENTS_CLASS, NotTransmitted, OrderReje
 
 __all__ = ["TEST_ENVIRONMENT", "NOT_SENT", "PaperTargets", "OrderStepState", "OrderStepError", "run_order_step",
            "paper_targets", "open_ledger", "ledger_path_for", "state_path_for", "broker_book", "targets", "strategy_holdings",
-           "round_units", "limit_price", "market_window", "max_orders_per_day", "minute_quotes", "wall_clock"]
+           "round_units", "limit_price", "market_window", "max_orders_per_day", "minute_quotes", "wall_clock",
+           "TicketBook", "ticket_path_for", "ticket_number", "TICKET_LIFE_SECONDS", "TICKET_QUOTE_MOVE"]
 
 TEST_ENVIRONMENT = "sandbox"                      # the only environment a run accepts (WebullVenue.environment)
 NOT_SENT = (NotTransmitted, OrderRejected)        # the adapter's answers that mean no order exists
@@ -177,6 +203,12 @@ OPEN_STATES = ("accepted", "partly_filled", "sent", "unknown")   # orders that m
 UNITS_EPS = 1e-12
 CENT = Decimal("0.01")
 MAX_TEXT = 200
+TICKET_LIFE_MAX_SECONDS = 60 * 60                 # a ticket never lives longer than this
+TICKET_LIFE_SECONDS = 15 * 60                     # a ticket can be approved for this long after it was made
+TICKET_QUOTE_MOVE = 0.005                         # an approved order's fresh quote within 0.5% of the ticket's
+TICKET_UNITS_SAME = 1e-9                          # fractional units: the same within this
+WRONG_NUMBERS_MAX = 3                             # refused approvals in a New York day that lock approval
+assert 0 < TICKET_LIFE_SECONDS <= TICKET_LIFE_MAX_SECONDS
 
 
 class OrderStepError(RuntimeError):
@@ -202,6 +234,7 @@ _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _SYMBOL = re.compile(r"[A-Za-z0-9./-]{1,24}")
 _TAG = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,128}")
 CANCEL_WORDS = ("cancel requested", "not yet", "already finished", "no such order")   # WebullVenue.cancel's words
 STATUS_WORDS = ("accepted", "pending", "open", "rejected", "refused", "unknown")      # a submit answer's status words
 
@@ -523,6 +556,10 @@ def market_window(calendar, now: float) -> tuple[float | None, float | None, str
     return start.timestamp(), end.timestamp(), None
 
 
+def _iso(seconds: float) -> str:
+    return pd.Timestamp(seconds, unit="s", tz="UTC").tz_convert(NEW_YORK).isoformat()
+
+
 def _hhmm(seconds: float) -> str:
     return pd.Timestamp(seconds, unit="s", tz="UTC").tz_convert(NEW_YORK).strftime("%H:%M")
 
@@ -753,6 +790,185 @@ class OrderStepState:
         return n
 
 
+TICKET_LAYOUT = 1
+TICKET_KIND = "order-step tickets"
+_NUMBER = re.compile(r"[0-9]{6}")
+_TICKET_TABLES = {
+    "meta": ("key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL", ("key",)),
+    "tickets": ("day TEXT NOT NULL, number TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, venue TEXT NOT NULL, "
+                "account TEXT NOT NULL, capital REAL NOT NULL, fractional INTEGER NOT NULL, equity REAL, cash REAL, "
+                "settled_cash REAL, batch TEXT NOT NULL, PRIMARY KEY (day, number)", ("day", "number")),
+    "lines": ("day TEXT NOT NULL, number TEXT NOT NULL, line INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL "
+              "CHECK (side IN ('buy', 'sell')), units REAL NOT NULL, quote REAL NOT NULL, limit_price REAL NOT NULL, "
+              "value REAL NOT NULL, PRIMARY KEY (day, number, line)", ("day", "number", "line")),
+    "fates": ("day TEXT NOT NULL, number TEXT NOT NULL, fate TEXT NOT NULL CHECK (fate IN ('used', 'expired')), "
+              "time REAL NOT NULL, batch TEXT NOT NULL, PRIMARY KEY (day, number)", ("day", "number")),
+    "outcomes": ("day TEXT NOT NULL, number TEXT NOT NULL, line INTEGER NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN "
+                 "('sent', 'dropped', 'left over', 'expired')), tag TEXT, reason TEXT, time REAL NOT NULL, batch TEXT NOT NULL, "
+                 "PRIMARY KEY (day, number, line)", ("day", "number", "line")),
+    "attempts": ("batch TEXT NOT NULL PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, reason TEXT NOT NULL, "
+                 "after_ticket INTEGER", ("batch",)),
+}
+
+
+def _ticket_schema() -> list[str]:
+    out = []
+    for table, (columns, key) in _TICKET_TABLES.items():
+        same = " AND ".join(f"{c} IS NEW.{c}" for c in key)
+        out += [f"CREATE TABLE IF NOT EXISTS {table} ({columns})",
+                f"CREATE TRIGGER IF NOT EXISTS {table}_no_update BEFORE UPDATE ON {table} "
+                f"BEGIN SELECT RAISE(ABORT, '{table} rows are append-only'); END",
+                f"CREATE TRIGGER IF NOT EXISTS {table}_no_delete BEFORE DELETE ON {table} "
+                f"BEGIN SELECT RAISE(ABORT, '{table} rows are never deleted'); END",
+                f"CREATE TRIGGER IF NOT EXISTS {table}_no_replace BEFORE INSERT ON {table} "
+                f"WHEN EXISTS (SELECT 1 FROM {table} WHERE {same}) "
+                f"BEGIN SELECT RAISE(ABORT, '{table} rows are never replaced'); END"]
+    return out
+
+
+def ticket_number() -> str:
+    """A ticket's number: six digits from the system's secure random source."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def ticket_path_for(state_path: str | Path) -> str | Path:
+    """The ticket file for a state file: beside it (order_step-<venue>.tickets.sqlite)."""
+    if str(state_path) == ":memory:":
+        return ":memory:"
+    p = Path(state_path)
+    return p.with_name(f"{p.stem}.tickets.sqlite")
+
+
+class TicketBook:
+    """The tickets of the propose and approve runs, in their own small file: each ticket, its lines, what became of
+    the ticket (used or expired, once) and of each line (once), and every refused approval. Append-only: no row is
+    updated, deleted or replaced (triggers), every write is one IMMEDIATE transaction. Holds the random key of the
+    account hash, made once with the file."""
+
+    def __init__(self, path: str | Path, clock: Callable[[], float] = time.time) -> None:
+        self.path, self.clock = str(path), clock
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        self._db.row_factory = sqlite3.Row
+        try:
+            self._db.execute("PRAGMA synchronous = FULL")
+            with self._write():
+                version = self._db.execute("PRAGMA user_version").fetchone()[0]
+                tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                if tables:
+                    kind = None
+                    if version == TICKET_LAYOUT and tables == set(_TICKET_TABLES):
+                        row = self._db.execute("SELECT value FROM meta WHERE key = 'kind'").fetchone()
+                        kind = row[0] if row else None
+                    if kind != TICKET_KIND:
+                        raise OrderStepError(f"{path} is not an order-step ticket file of layout {TICKET_LAYOUT}; it is not opened")
+                else:
+                    if version != 0:
+                        raise OrderStepError(f"{path} is a database of another kind; it is not opened")
+                    for statement in _ticket_schema():
+                        self._db.execute(statement)
+                    self._db.execute("INSERT INTO meta (key, value) VALUES ('kind', ?)", (TICKET_KIND,))
+                    self._db.execute("INSERT INTO meta (key, value) VALUES ('account_key', ?)", (os.urandom(32).hex(),))
+                    self._db.execute(f"PRAGMA user_version = {TICKET_LAYOUT}")
+            self._key = bytes.fromhex(self._db.execute("SELECT value FROM meta WHERE key = 'account_key'").fetchone()[0])
+        except BaseException:
+            self._db.close()
+            raise
+
+    @contextmanager
+    def _write(self):
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        self._db.execute("COMMIT")
+
+    def close(self) -> None:
+        self._db.close()
+
+    def layout(self) -> int:
+        return int(self._db.execute("PRAGMA user_version").fetchone()[0])
+
+    def account_hash(self, account_id: str) -> str:
+        """The account as the ticket records it: HMAC-SHA256 under this file's own random key."""
+        return hmac.new(self._key, account_id.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def find(self, number: str) -> list[dict]:
+        return [dict(r) for r in self._db.execute("SELECT * FROM tickets WHERE number = ? ORDER BY rowid", (number,))]
+
+    def taken(self, day: str, number: str) -> bool:
+        return self._db.execute("SELECT 1 FROM tickets WHERE day = ? AND number = ?", (day, number)).fetchone() is not None
+
+    def lines(self, day: str, number: str) -> list[dict]:
+        return [dict(r) for r in self._db.execute("SELECT * FROM lines WHERE day = ? AND number = ? ORDER BY line", (day, number))]
+
+    def fate(self, day: str, number: str) -> dict | None:
+        row = self._db.execute("SELECT * FROM fates WHERE day = ? AND number = ?", (day, number)).fetchone()
+        return dict(row) if row else None
+
+    def outcomes(self, day: str, number: str) -> dict[int, dict]:
+        return {int(r["line"]): dict(r) for r in self._db.execute("SELECT * FROM outcomes WHERE day = ? AND number = ?", (day, number))}
+
+    def create(self, ticket: dict, lines: list[dict]) -> None:
+        """Write a ticket and its lines, in one transaction."""
+        cols = ("day", "number", "created", "expires", "venue", "account", "capital", "fractional", "equity", "cash",
+                "settled_cash", "batch")
+        with self._write():
+            self._db.execute(f"INSERT INTO tickets ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                             tuple(ticket[c] for c in cols))
+            self._db.executemany("INSERT INTO lines (day, number, line, symbol, side, units, quote, limit_price, value) "
+                                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 [(ticket["day"], ticket["number"], ln["line"], ln["fund"], ln["side"], ln["units"],
+                                   ln["quote"], ln["limit"], ln["value"]) for ln in lines])
+
+    def mark_used(self, day: str, number: str, batch: str) -> None:
+        """Mark the ticket used by `batch`; refused (OrderStepError) when it already has a fate."""
+        try:
+            with self._write():
+                self._db.execute("INSERT INTO fates (day, number, fate, time, batch) VALUES (?, ?, 'used', ?, ?)",
+                                 (day, number, float(self.clock()), batch))
+        except sqlite3.IntegrityError:
+            raise OrderStepError("the ticket has been used or has expired") from None
+
+    def mark_expired(self, day: str, number: str, batch: str) -> None:
+        """Record that the ticket expired unused, and each of its lines as expired; nothing when it has a fate."""
+        with self._write():
+            if self._db.execute("SELECT 1 FROM fates WHERE day = ? AND number = ?", (day, number)).fetchone():
+                return
+            now = float(self.clock())
+            self._db.execute("INSERT INTO fates (day, number, fate, time, batch) VALUES (?, ?, 'expired', ?, ?)",
+                             (day, number, now, batch))
+            for (line,) in self._db.execute("SELECT line FROM lines WHERE day = ? AND number = ? ORDER BY line",
+                                            (day, number)).fetchall():
+                self._db.execute("INSERT INTO outcomes (day, number, line, outcome, tag, reason, time, batch) "
+                                 "VALUES (?, ?, ?, 'expired', NULL, 'the ticket expired unused', ?, ?)",
+                                 (day, number, line, now, batch))
+
+    def note_outcome(self, day: str, number: str, line: int, outcome: str, tag: str | None, reason: str | None,
+                     batch: str) -> None:
+        with self._write():
+            self._db.execute("INSERT INTO outcomes (day, number, line, outcome, tag, reason, time, batch) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             (day, number, int(line), outcome, tag, reason, float(self.clock()), batch))
+
+    def note_attempt(self, batch: str, day: str, reason: str) -> None:
+        """A refused approval, recorded with the latest ticket written before it (its rowid)."""
+        with self._write():
+            self._db.execute("INSERT INTO attempts (batch, day, time, reason, after_ticket) "
+                             "VALUES (?, ?, ?, ?, (SELECT MAX(rowid) FROM tickets))", (batch, day, float(self.clock()), reason))
+
+    def wrong_count(self, day: str) -> int:
+        """Refused approvals on `day` since the latest ticket was written (a propose that writes one lifts the lock)."""
+        return int(self._db.execute("SELECT COUNT(*) FROM attempts WHERE day = ? AND after_ticket IS "
+                                    "(SELECT MAX(rowid) FROM tickets)", (day,)).fetchone()[0])
+
+
 class _RunLock:
     """One run at a time per state file: an exclusive lock on a file beside it, released when the process ends."""
 
@@ -814,18 +1030,44 @@ class _SubmitWatch:
         return getattr(self._venue, name)
 
 
+class _NoSend:
+    """The order ledger as a propose run holds it: everything but intend and submit_once."""
+
+    def __init__(self, ledger) -> None:
+        self._ledger = ledger
+
+    def intend(self, *a, **k):
+        raise RuntimeError("a propose run never intends an order")
+
+    def submit_once(self, *a, **k):
+        raise RuntimeError("a propose run never sends an order")
+
+    def __getattr__(self, name):
+        return getattr(self._ledger, name)
+
+
 _ABSENT = object()
 
 
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
-                   latch_file=None, capital: float | None = None, fractional: bool = False) -> dict:
+                   latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
+                   approve: str | None = None) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
-    Never raises because of the venue, the quotes or the paper book; a crash of the process mid-run is safe."""
-    return _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
-                capital, fractional).go()
+    Never raises because of the venue, the quotes or the paper book; a crash of the process mid-run is safe.
+    `propose` writes a ticket instead of sending; `approve` (the ticket's number) sends only what that ticket holds."""
+    mode = "propose" if propose else ("approve" if approve is not None else None)
+    run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
+               capital, fractional)
+    if mode is not None:
+        run.mode, run.approve_number = mode, approve
+        if propose and approve is not None:
+            run.mode = "both"
+        elif propose:
+            run.ledger = _NoSend(ledger)
+    return run.go()
 
 
 class _Run:
@@ -860,6 +1102,17 @@ class _Run:
         self._line_ended = False
         self._locked = False
         self._class_later = False
+        self.mode = None                                 # None (an ordinary run), "propose" or "approve"
+        self.approve_number = None
+        self.tickets: TicketBook | None = None
+        self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
+        self.ticket_lines: list[dict] = []
+        self.ticket_out: dict[int, dict] = {}            # approve: what became of each line in this run
+        self.ticket_used = False
+        self.ticket_number_made = None
+        self.account = None
+        self.dropped: list[dict] = []
+        self.capital_used = None
 
     # -- helpers
     def _write(self, entry: dict) -> None:
@@ -900,6 +1153,8 @@ class _Run:
             return self._finish("stopped", stop.stage, stop.reason)
         stamp = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
+        if self.mode == "both":                          # before the lock: writes nothing anywhere
+            return self._finish("stopped", "ticket", "propose and approve cannot be asked for in one run")
         try:
             self._environment()                          # 1: the venue's name, environment and host only
         except _Stop as stop:
@@ -923,8 +1178,18 @@ class _Run:
             except (OrderStepError, sqlite3.Error, OSError) as exc:
                 return self._finish("stopped", "baseline", f"the order step's state file could not be opened: {_describe(exc)}")
             try:
+                if self.mode is not None:                # the ticket file, beside the state file, under the same lock
+                    try:
+                        self.tickets = TicketBook(ticket_path_for(path), self.clock)
+                    except (OrderStepError, sqlite3.Error, OSError) as exc:
+                        return self._finish("stopped", "ticket", f"the ticket file could not be opened: {_describe(exc)}")
                 return self._rest(now)
             finally:
+                if self.tickets is not None:
+                    try:
+                        self.tickets.close()
+                    except sqlite3.Error:
+                        pass
                 if not isinstance(self.state_arg, OrderStepState):
                     self.state.close()
         except Exception as exc:                         # a fault of the order step's own: still stopped and journaled
@@ -933,6 +1198,13 @@ class _Run:
             lock.release()
 
     def _rest(self, now: float) -> dict:
+        if self.mode is not None:                        # the ticket's checks and the account, before any other venue call
+            try:
+                self._ticket_first(now)
+            except _Stop as stop:
+                return self._finish("stopped", stop.stage, stop.reason)
+            except (OrderStepError, sqlite3.Error, OSError) as exc:
+                return self._finish("stopped", "ticket", f"the ticket file failed: {_local_error(exc)}; nothing is sent")
         try:
             baseline = self._baseline()                  # 3
             self._reconcile_and_cancel(baseline)         # 4
@@ -943,6 +1215,7 @@ class _Run:
             capital = paper.equity if self.capital is None else self.capital
             if not _finite(capital) or capital <= 0:
                 raise _Stop("targets", f"the capital must be a positive finite number, not {capital!r}")
+            self.capital_used = float(capital)
             self.paper_equity = paper.equity
             self.target_units, per_strategy = targets(paper, float(capital))
             min_value = paper.min_trade_pct * paper.share * float(capital) / paper.equity
@@ -966,7 +1239,178 @@ class _Run:
             return self._finish("stopped", "after", stop.reason)
         except (OrderError, sqlite3.Error, OSError) as exc:
             return self._finish("stopped", "after", f"the last reconcile could not be completed: {_local_error(exc)}")
+        if self.mode == "propose":
+            try:
+                self._make_ticket()
+            except _Stop as stop:
+                return self._finish("stopped", stop.stage, stop.reason)
+            except (OrderStepError, sqlite3.Error, OSError) as exc:
+                return self._finish("stopped", "ticket", f"the ticket could not be written: {_local_error(exc)}")
         return self._finish("done", None, None)
+
+    # -- tickets (propose and approve runs only)
+    def _refuse_ticket(self, why: str) -> None:
+        self.tickets.note_attempt(self.batch, self.day, why)
+        raise _Stop("ticket", f"{why}; nothing is sent")
+
+    def _ticket_first(self, now: float) -> None:
+        """Approve: the ticket's own checks (no venue call). Both: the account, read now, as its keyed hash."""
+        if self.mode == "approve":
+            self._check_ticket(now)
+        try:
+            account = self.venue.account_id
+        except Exception as exc:
+            raise _Stop("ticket", f"the venue's account could not be read: {_venue_error(exc)}; nothing is sent") from None
+        if not _plain(_ACCOUNT, account):
+            raise _Stop("ticket", "the venue's account is not a plain id; nothing is sent")
+        self.account = self.tickets.account_hash(account)
+        if self.mode == "approve" and not hmac.compare_digest(self.account, str(self.ticket["account"])):
+            self._refuse_ticket("that ticket was made for another account")
+
+    def _check_ticket(self, now: float) -> None:
+        book, number = self.tickets, self.approve_number
+        if book.wrong_count(self.day) >= WRONG_NUMBERS_MAX:
+            self._refuse_ticket(f"approval is locked after {WRONG_NUMBERS_MAX} refused numbers today, until the next propose")
+        if not _plain(_NUMBER, number):
+            self._refuse_ticket("the number is not six digits")
+        rows = book.find(number)
+        today = [r for r in rows if r["day"] == self.day]
+        if not rows:
+            self._refuse_ticket("no ticket has that number")
+        if not today:
+            self._refuse_ticket("that ticket was made for another day")
+        t = today[0]
+        if t["venue"] != self.name:
+            self._refuse_ticket("that ticket was made for another venue")
+        fate = book.fate(t["day"], t["number"])
+        if fate is not None:
+            self._refuse_ticket("that ticket has been used" if fate["fate"] == "used" else "that ticket has expired")
+        if now > t["expires"]:
+            book.mark_expired(t["day"], t["number"], self.batch)
+            self._refuse_ticket(f"that ticket has expired ({TICKET_LIFE_SECONDS // 60} minutes after it was made)")
+        if now < t["created"]:
+            self._refuse_ticket("that ticket was made after now on the clock")
+        capital = self.paper_read.equity if self.capital is None else self.capital
+        if _as_float(capital) is None or float(capital) != t["capital"]:
+            self._refuse_ticket("that ticket was made for another capital")
+        if bool(t["fractional"]) != self.fractional:
+            self._refuse_ticket("that ticket was made " + ("with" if t["fractional"] else "without") + " fractional units")
+        self.ticket = t
+        self.ticket_lines = [{"line": int(ln["line"]), "fund": ln["symbol"], "side": ln["side"], "units": float(ln["units"]),
+                              "quote": float(ln["quote"]), "limit": float(ln["limit_price"]), "value": float(ln["value"])}
+                             for ln in book.lines(t["day"], t["number"])]
+
+    def _make_ticket(self) -> None:
+        """Propose: write the ticket of this run's lines (none: no ticket) and journal it without its number."""
+        if not self.ticket_lines:
+            return
+        now = self._now()
+        for _ in range(100):
+            number = ticket_number()
+            if not self.tickets.taken(self.day, number):
+                break
+        else:
+            raise _Stop("ticket", "no free ticket number could be drawn")
+        ticket = {"day": self.day, "number": number, "created": now, "expires": now + TICKET_LIFE_SECONDS,
+                  "venue": self.name, "account": self.account, "capital": self.capital_used,
+                  "fractional": int(self.fractional), "equity": self.broker_equity, "cash": self.cash_read,
+                  "settled_cash": self.settled_cash, "batch": self.batch}
+        self.tickets.create(ticket, self.ticket_lines)
+        self.ticket, self.ticket_number_made = ticket, number
+        self._write({"event": "ticket", **self._ticket_view()})
+
+    def _ticket_view(self) -> dict:
+        t = self.ticket
+        return {"number_ends": t["number"][-2:], "orders": [dict(ln) for ln in self.ticket_lines], "equity": t["equity"],
+                "cash": t["cash"], "settled_cash": t["settled_cash"], "created": _iso(t["created"]),
+                "expires": _iso(t["expires"])}
+
+    def _line(self, c: dict) -> dict:
+        return next(ln for ln in self.ticket_lines if ln["line"] == c["line"])
+
+    def _same_size(self, units: float, line: dict) -> bool:
+        """The same side and the same units as the ticket's line (fractional: within TICKET_UNITS_SAME, never more)."""
+        t = line["units"]
+        if ("buy" if units > 0 else "sell") != line["side"] or (t > 0) != (units > 0):
+            return False
+        if self.fractional:
+            return abs(units - t) <= TICKET_UNITS_SAME and abs(units) <= abs(t)
+        return units == t
+
+    def _ticket_candidates(self, candidates: list[dict]) -> list[dict]:
+        """Approve: the fresh candidates that match a line of the ticket, each carrying its line; every other line is
+        dropped with its reason, every other candidate is not sent ("not on the ticket")."""
+        fresh = {c["symbol"]: c for c in candidates}
+        why_not = {x["symbol"]: x["reason"] for x in self.skipped + self.refused}
+        out = []
+        for ln in self.ticket_lines:
+            c = fresh.pop(ln["fund"], None)
+            stub = {"symbol": ln["fund"], "units": ln["units"], "line": ln["line"]}
+            if c is None:
+                why = why_not.get(ln["fund"])
+                self._drop(stub, "the order is no longer wanted by the fresh targets" + (f" ({why})" if why else ""))
+            elif not self._same_size(c["units"], ln):
+                self._drop(stub, f"the wanted size changed: the ticket holds {ln['units']:+g}, the fresh targets want "
+                                 f"{c['units']:+g}")
+            else:
+                out.append({**c, "line": ln["line"]})
+        for c in fresh.values():
+            self.skipped.append({"symbol": c["symbol"], "units": c["units"], "reason": "not on the ticket"})
+        return out
+
+    def _ticket_live(self) -> str | None:
+        """Why the ticket no longer lets this run send (expired on the clock, or not marked used by this run), or None."""
+        if self._now() > self.ticket["expires"]:
+            return "the ticket expired before the order was sent"
+        fate = self.tickets.fate(self.ticket["day"], self.ticket["number"])
+        if fate is None or fate["fate"] != "used" or fate["batch"] != self.batch:
+            return "the ticket is not held by this run"
+        return None
+
+    def _ticket_check(self, c: dict, quote: float) -> str | None:
+        """Approve, before intend: the ticket still live, the size still the line's, the quote judged within
+        TICKET_QUOTE_MOVE of the ticket's."""
+        line = self._line(c)
+        why = self._ticket_live()
+        if why is not None:
+            return why
+        if not self._same_size(c["units"], line):
+            return "the wanted size changed"
+        if not abs(quote - line["quote"]) <= TICKET_QUOTE_MOVE * line["quote"]:
+            return (f"the fresh quote {quote:g} is more than {TICKET_QUOTE_MOVE:.1%} from the ticket's quote "
+                    f"{line['quote']:g}")
+        return None
+
+    def _ticket_note(self, c: dict, outcome: str, tag: str | None = None, reason: str | None = None) -> None:
+        if self.mode != "approve" or "line" not in c:
+            return
+        self.tickets.note_outcome(self.ticket["day"], self.ticket["number"], c["line"], outcome, tag, reason, self.batch)
+        self.ticket_out[c["line"]] = {"outcome": outcome, "tag": tag, "reason": reason}
+
+    def _drop(self, c: dict, reason: str) -> None:
+        item = {"symbol": c["symbol"], "units": c["units"], "reason": reason}
+        self.dropped.append(item)
+        self._write({"event": "dropped", **item})
+        self._ticket_note(c, "dropped", reason=reason)
+
+    def _ticket_summary(self) -> dict:
+        if self.mode == "propose":
+            if self.ticket_number_made is not None:
+                return self._ticket_view()
+            return {"number_ends": None, "orders": [],
+                    "reason": "nothing to propose" if self.ticket_lines == [] else "no ticket was written"}
+        out = []
+        for ln in self.ticket_lines:
+            got = self.ticket_out.get(ln["line"])
+            item = {"line": ln["line"], "fund": ln["fund"], "side": ln["side"], "units": ln["units"]}
+            if got is None:
+                item.update(outcome="left over", reason="the run stopped before this order was reached" if self.ticket_used
+                            else "the run stopped before sending; the ticket is not used")
+            else:
+                item.update(outcome=got["outcome"], **({"tag": got["tag"]} if got["tag"] else {}),
+                            **({"reason": got["reason"]} if got["reason"] else {}))
+            out.append(item)
+        return {"number_ends": self.ticket["number"][-2:] if self.ticket else None, "orders": out}
 
     # -- the journal as it is on disk
     def _journal_file(self, day: str) -> Path | None:
@@ -1425,6 +1869,14 @@ class _Run:
             if over_cash:
                 return "settled" if settled_left < cash_left else "cash"
             return None
+        if self.mode == "approve":                       # the sending stage: the ticket is used before the first intend
+            try:
+                self.tickets.mark_used(self.ticket["day"], self.ticket["number"], self.batch)
+            except OrderStepError as exc:
+                raise _Stop("ticket", f"{exc}; nothing is sent") from None
+            self.ticket_used = True
+            self._write({"event": "ticket_used", "number_ends": self.ticket["number"][-2:]})
+            candidates = self._ticket_candidates(candidates)
         sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
         buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
         for c in sales + buys:
@@ -1483,16 +1935,31 @@ class _Run:
             if judged is None:
                 continue
             quote, limit, order, cost = judged
+            if self.mode == "approve":                   # the ticket: live, the same size, the quote within its band
+                why = self._ticket_check(c, quote)
+                if why is not None:
+                    self._drop(c, why)
+                    continue
             tag = f"{self.batch}-{sym}"
             watch = _SubmitWatch(self.venue)
             if self._now() > self.window_end:            # 5. the window, on the clock, immediately before intend
                 self._leave(c, "the session window closed during the run")
+                continue
+            if self.mode == "propose":                   # a line of the ticket instead of intend: nothing is intended
+                self.ticket_lines.append({"line": len(self.ticket_lines), "fund": sym, "side": order["side"], "units": units,
+                                          "quote": quote, "limit": limit, "value": abs(units) * quote})
+                sent_today += 1                          # counted against the caps as if it were sent
+                spent += cost
+                if units > 0 and owned_here <= UNITS_EPS:
+                    opened += 1
                 continue
             try:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
                 self._check_environment()                # 6. the environment and host again ...
                 late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
+                if late is None and self.mode == "approve":
+                    late = self._ticket_live()           # ... the ticket still live and this run's ...
                 if late is None and self._now() > self.window_end:   # ... then the window, nothing between it and submit_once
                     late = "the session window closed during the run"
                 if late is not None:
@@ -1508,6 +1975,8 @@ class _Run:
                                     "reconcile settles it") from None
             outcome = rec["state"] if rec.get("state") in STATES else "unknown"
             self.state.note_outcome(tag, outcome)
+            if outcome not in ("refused", "accepted"):
+                self._ticket_note(c, "sent", tag=tag, reason=f"handed to the venue; its outcome is {outcome}")
             if outcome == "refused":
                 why = f"the venue did not take it: {_venue_error(watch.error)}" if watch.error is not None else "the venue did not take it"
                 self._refuse(c, "venue", why, tag=tag)
@@ -1530,6 +1999,7 @@ class _Run:
                      "value": abs(units) * quote, "tag": tag, "parts": c["parts"], "reduces_risk": bool(reduces)}
             self.sent.append(entry)
             self._write({"event": "order", **entry, "state": outcome})
+            self._ticket_note(c, "sent", tag=tag)
 
     def _equity(self, cash: float, held: dict, in_hand: dict) -> float:
         """The venue's cash plus every holding at its quote in hand; a number outside 0 to MAX_CASH stops the run."""
@@ -1553,11 +2023,13 @@ class _Run:
         item = {"symbol": c["symbol"], "units": c["units"], "reason": reason}
         self.left_over.append(item)
         self._write({"event": "left_over", **item})
+        self._ticket_note(c, "dropped", reason=reason)
 
     def _refuse(self, c: dict, by: str, reason: str, **extra) -> None:
         item = {"symbol": c["symbol"], "units": c["units"], "by": by, "reason": str(reason)[:MAX_TEXT * 2]}
         self.refused.append(item)
         self._write({"event": "refused", **item, **extra})
+        self._ticket_note(c, "dropped", reason=f"refused by the {by}: {item['reason']}")
 
     # -- 11
     def _finish(self, status: str, stage: str | None, reason: str | None) -> dict:
@@ -1577,6 +2049,16 @@ class _Run:
                    "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines,
                    "cash": self.cash_read, "settled_cash": self.settled_cash,
                    "purchases_left_unsettled": self.purchases_left_unsettled}
+        if self.mode is not None:
+            if self.mode == "approve" and self.ticket_used:  # lines the run never reached: left over, on the record
+                try:
+                    for ln in self.ticket_lines:
+                        if ln["line"] not in self.ticket_out:
+                            self.tickets.note_outcome(self.ticket["day"], self.ticket["number"], ln["line"], "left over",
+                                                      None, "the run stopped before this order was reached", self.batch)
+                except Exception:
+                    pass
+            summary.update(mode=self.mode, dropped=self.dropped, ticket=self._ticket_summary())
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only
                 return summary
@@ -1585,4 +2067,6 @@ class _Run:
             self._write({"event": "summary", **summary})
         except Exception as exc:                         # the summary is still returned
             summary["journal_error"] = _describe(exc)
+        if self.ticket_number_made is not None:          # returned beside the summary, never journaled
+            summary["ticket_number"] = self.ticket_number_made
         return summary
