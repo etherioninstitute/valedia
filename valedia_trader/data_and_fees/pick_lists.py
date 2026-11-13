@@ -39,6 +39,8 @@ comment that holds two or more picks comes back from the local model with every 
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -217,15 +219,65 @@ def _plain_beside(c: str) -> bool:
     return c.isspace() or (c.isascii() and (c.isalpha() or c in _ASCII_PUNCT))
 
 
+_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")      # fillers and blanks that show nothing
+
+
+def _skipped(c: str) -> bool:
+    """Whitespace, or a character that shows nothing of its own: invisible, a format character, a control
+    character or a combining mark (one that draws a slash or a fraction is not skipped). The number rule looks
+    past these."""
+    return (c.isspace() or c in _INVISIBLE_LETTERS or unicodedata.category(c) in ("Cf", "Cc", "Mn", "Mc", "Me")) \
+        and not _fraction_or_slash(c)
+
+
+def _fraction_or_slash(c: str) -> bool:
+    name = unicodedata.name(c, "")
+    return any(w in name for w in ("FRACTION", "SLASH", "SOLIDUS", "DIVISION"))
+
+
+def _numeral(c: str) -> bool:
+    return unicodedata.category(c)[0] == "N" or any(w in unicodedata.name(c, "") for w in ("DIGIT", "NUMERAL", "NUMBER"))
+
+
+def _spoils(s: str, k: int, step: int, fraction: bool) -> bool:
+    """Does what stands from `k` on (step 1: after a token, step -1: before it), past skipped characters, make
+    the number unusable? Yes for a fraction, a slash or a numeral of any kind (by Unicode name or category), for
+    any other character outside ASCII that is not a letter, and for an ASCII digit that is part of a fraction
+    with this number: a number of digits running into a fraction or slash, or this token itself a fraction."""
+    n = len(s)
+    while 0 <= k < n and _skipped(s[k]):
+        k += step
+    if not 0 <= k < n:
+        return False
+    c = s[k]
+    if c in "0123456789":
+        if fraction:
+            return True
+        while 0 <= k < n and s[k] in "0123456789":
+            k += step
+        while 0 <= k < n and _skipped(s[k]):
+            k += step
+        return 0 <= k < n and _fraction_or_slash(s[k])
+    if c.isascii():
+        return _fraction_or_slash(c)                 # / and \\
+    return _fraction_or_slash(c) or _numeral(c) or not c.isalpha()
+
+
 def _usable(s: str, toks: list) -> list[bool]:
     """For each number token of `s`: is it plain, and plain beside it? A whole number and a fraction with only
-    whitespace between them (1 1/2, 1 ½) are both unusable."""
+    whitespace between them (1 1/2, 1 ½) are both unusable, and so is any number that has, past whitespace,
+    invisible, format and combining characters, a fraction, a slash, a numeral of any kind or a character outside
+    ASCII that is not a letter on either side (`_spoils`)."""
     flags = [all(c in _PLAIN_TOKEN for c in t) and (a == 0 or _plain_beside(s[a - 1])) and (e == len(s) or _plain_beside(s[e]))
              for a, e, t in toks]
     for k in range(len(toks) - 1):
         (_, e, t), (a2, _, t2) = toks[k], toks[k + 1]
         if a2 > e and s[e:a2].isspace() and re.fullmatch(r"[+-]?[0-9]+", t) and ("/" in t2 or t2[-1] in "¼½¾"):
             flags[k] = flags[k + 1] = False
+    for k, (a, e, t) in enumerate(toks):
+        if flags[k]:
+            frac = "/" in t or t[-1] in "¼½¾"
+            flags[k] = not (_spoils(s, e, 1, False) or _spoils(s, a - 1, -1, frac))
     return flags
 
 
@@ -510,6 +562,9 @@ def hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
+_SURROGATE = re.compile("[\udc80-\udcff]")
+
+
 class ScriptFetcher:
     """Fetching goes through Hermes' own Reddit skill: its script `reddit.py` run as a child process with `--json`,
     never a browser and never a direct call. `user` and `thread` return the text the script printed, unread. The
@@ -522,19 +577,25 @@ class ScriptFetcher:
     def _run(self, args: list[str]) -> str:
         cmd = [sys.executable, str(hermes_home() / SKILL_SCRIPT), "--json"] + args
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=self.timeout, env=child_env(),
-                               stdin=subprocess.DEVNULL, check=False)
+            # bytes that are not UTF-8 come through as lone surrogates, so standard error is still read for a 429
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+                               timeout=self.timeout, env=child_env(), stdin=subprocess.DEVNULL, check=False)
         except UnicodeDecodeError:
             raise UndecodableOutput("the skill script printed something that is not UTF-8") from None
         except subprocess.TimeoutExpired:
             raise FetchError("the skill script timed out") from None
         except OSError as e:
             raise FetchError(f"the skill script could not be started ({type(e).__name__})") from None
-        limited = bool(_RATE_LIMIT.search(p.stderr or ""))
+        err = _SURROGATE.sub("\ufffd", p.stderr or "")
+        limited = bool(_RATE_LIMIT.search(err))
         if p.returncode != 0:
             if limited:
                 raise RateLimited("the source is rate limiting")
-            raise FetchError(f"the skill script exited {p.returncode}: " + _clean(p.stderr or "")[:200])
+            raise FetchError(f"the skill script exited {p.returncode}: " + _clean(err)[:200])
+        if _SURROGATE.search(p.stdout or ""):
+            if limited:
+                raise RateLimited("the source is rate limiting")
+            raise UndecodableOutput("the skill script printed something that is not UTF-8")
         try:
             json.loads(p.stdout)
         except ValueError:
@@ -598,8 +659,10 @@ _KEYS = {
 _INGEST_TIMES = (("threads", "first_seen"), ("payloads", "fetched_at"), ("comments", "first_seen"),
                  ("comment_versions", "seen_at"), ("thread_fetches", "fetched_at"), ("sightings", "seen_at"),
                  ("ingest_failures", "failed_at"))
-# every time the module writes from its own clock (the source's own times, posted_at and source_time, are not ours):
-# the clock check compares against the latest of them, so no command writes under a clock set back
+# every time the module writes from its own clock (the source's own times, posted_at and source_time, are not ours).
+# Two things keep a clock set back from writing: ingest, parse and export hold the store's lock file for their whole
+# run (one writer at a time), and every write compares its time with the latest of these inside its own transaction
+# (`Store.writing`), so a time earlier than one already in the store is never written, whoever wrote that one
 CLOCK_TIMES = _INGEST_TIMES + (("parses", "parsed_at"), ("parse_attempts", "attempted_at"))
 
 _VERSION_COLS = ("id", "comment_id", "version", "author", "body", "body_enc", "body_sha256", "seen_at", "role", "deleted",
@@ -770,27 +833,59 @@ def _create(path: Path) -> None:
         tmp.unlink()
 
 
+LOCK_SUFFIX = ".lock"
+
+
+def _take_lock(path: Path) -> int:
+    """The exclusive lock of the store at `path`: a file beside it (`<store>.lock`, never a link), held until the
+    command ends (a kill releases it). Another command holding it raises StoreError."""
+    lp = Path(str(path) + LOCK_SUFFIX)
+    try:
+        fd = os.open(lp, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        raise StoreError(f"{lp}: the lock file cannot be used ({type(e).__name__})") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise StoreError(f"{path}: another command (ingest, parse or export) is using the store; nothing was done") from None
+    return fd
+
+
 class Store:
     """One sqlite file, insert-only: a trigger on every table refuses UPDATE, DELETE, an INSERT that repeats an
     existing key (which is what INSERT OR REPLACE does to history) and, for the times ingest writes, a time earlier
     than the last row's. A comment whose body changed gets a new version row; the older rows stay as they were. The
     file's header is read before SQLite opens it; a file that is not a store of this layout is refused (StoreError)
     and left alone; a store left by a kill is rolled back to its last commit; on opening, every table, key, index
-    and trigger of the layout must be there, exactly. `readonly` opens it for reading only."""
+    and trigger of the layout must be there, exactly. `readonly` opens it for reading only. `lock` takes the
+    store's exclusive lock file for as long as it is open (the command line does for ingest, parse and export).
+    Every write goes through `writing`, which checks the clock inside the transaction."""
 
-    def __init__(self, path, readonly: bool = False, create: bool = True):
-        self.path = Path(path)
+    def __init__(self, path, readonly: bool = False, create: bool = True, lock: bool = False):
+        self.path, self._lock_fd = Path(path), None
         if self.path.exists() and not self.path.is_file():
             raise StoreError(f"{path} is not a file")
-        if not self.path.exists():
-            if readonly or not create:
-                raise StoreError(f"no store at {path}")
-            try:
+        if self.path.exists():
+            _check_header(self.path)                 # before anything is made beside it: a foreign file gets no lock file
+        elif readonly or not create:
+            raise StoreError(f"no store at {path}")
+        try:
+            if lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                _create(self.path)
-            except (sqlite3.Error, OSError) as e:
-                raise StoreError(f"{path}: the store could not be created ({_clean(e)[:120]})") from None
-        _check_header(self.path)
+                self._lock_fd = _take_lock(self.path)
+            if not self.path.exists():
+                try:
+                    _create(self.path)
+                except (sqlite3.Error, OSError) as e:
+                    raise StoreError(f"{path}: the store could not be created ({_clean(e)[:120]})") from None
+                _check_header(self.path)
+            self._open(path, readonly)
+        except BaseException:
+            self._unlock()
+            raise
+
+    def _open(self, path, readonly: bool) -> None:
         try:
             _recover(self.path)
             if readonly:
@@ -809,8 +904,32 @@ class Store:
             raise StoreError(f"{path} is not a pick-list store of the current layout (layout {LAYOUT}): its tables, keys "
                              "or triggers differ")
 
+    def _unlock(self) -> None:
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)                  # closing the file releases the lock
+            self._lock_fd = None
+
     def close(self) -> None:
-        self.conn.close()
+        try:
+            self.conn.close()
+        finally:
+            self._unlock()
+
+    @contextlib.contextmanager
+    def writing(self, now: str):
+        """One write transaction at time `now`: it takes SQLite's write lock first (BEGIN IMMEDIATE), then compares
+        `now` with the latest time already in the store, every writer's included; an earlier time raises
+        ClockBehind and nothing of this transaction is written. Commits at the end, rolls back on any error."""
+        if self.conn.in_transaction:
+            raise RuntimeError("a write transaction is already open")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            refuse_clock_behind(self, now, "this write was not made and the run stops")
+            yield
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def rows(self, sql: str, args=()) -> list[dict]:
         cur = self.conn.execute(sql, args)
@@ -878,7 +997,7 @@ class Store:
     def record_failure(self, thread_id: str, payload_sha256, now: str, kind: str, detail=None) -> None:
         """One failure of a thread (`kind`: fetch_error, not_json, no_comment_list, store_error), counted since the
         thread's last good fetch: after MAX_THREAD_FAILURES in a row the thread is set aside."""
-        with self.conn:
+        with self.writing(now):
             self._failure_row(thread_id, payload_sha256, now, kind, detail)
 
     def threads_set_aside(self) -> list[str]:
@@ -889,7 +1008,7 @@ class Store:
             (MAX_THREAD_FAILURES,))]
 
     def record_attempt(self, version_id: int, prompt_hash: str, now: str, reason: str) -> None:
-        with self.conn:
+        with self.writing(now):
             self.conn.execute("INSERT INTO parse_attempts (version_id, prompt_hash, attempted_at, reason) VALUES (?,?,?,?)",
                               (version_id, prompt_hash, now, _s(reason)))
 
@@ -933,7 +1052,7 @@ def _role(author, user: str, moderators) -> str:
 
 
 def _store_listing(store: Store, text: str, user: str, now: str, pattern: re.Pattern, res: dict) -> list[str]:
-    with store.conn:
+    with store.writing(now):
         store.payload("user", user.casefold(), text, now)
     try:
         entries = json.loads(text)
@@ -969,7 +1088,7 @@ def _store_thread(store: Store, url: str, text: str, now: str, user: str, modera
                               (tid, sha)).fetchone():
             res["skipped_failed"] += 1
             return
-        with store.conn:
+        with store.writing(now):
             try:
                 _store_thread_rows(store, canonical, sub, tid, text, now, user, moderators, res)
             except _BadThread as e:
@@ -977,11 +1096,15 @@ def _store_thread(store: Store, url: str, text: str, now: str, user: str, modera
                 res["errors"].append(f"thread {tid}: " + ("the answer is not JSON" if e.kind == "not_json" else
                                                           "the answer has no comment list"))
                 res["thread_failures"] += 1
+    except ClockBehind:
+        raise                                                                    # the run stops: nothing was written
     except Exception as e:                                                       # noqa: BLE001 - one odd thread must not stop the run
         res["errors"].append(f"thread {tid}: could not be stored ({type(e).__name__})")
         res["thread_failures"] += 1
         try:
             store.record_failure(tid, sha, now, "store_error", type(e).__name__)
+        except ClockBehind:
+            raise
         except Exception:                                                        # noqa: BLE001
             pass
 
@@ -1401,11 +1524,12 @@ def parse_pending(store: Store, parser, *, clock, prompt_hash: str | None = None
                        "fields": [], "decimal_odds": None}
         else:
             checked = check_output(body, out)
-        with store.conn:
+        at = iso(clock())
+        with store.writing(at):
             pid = store.conn.execute(
                 "INSERT INTO parses (version_id, prompt_hash, model, parsed_at, status, reason, is_pick, decimal_odds, "
                 "raw_output) VALUES (?,?,?,?,?,?,?,?,?)",
-                (vid, h, model, iso(clock()), checked["status"], checked["reason"],
+                (vid, h, model, at, checked["status"], checked["reason"],
                  None if checked["is_pick"] is None else int(checked["is_pick"]), checked["decimal_odds"], _s(raw))).lastrowid
             for f in checked["fields"]:
                 store.conn.execute("INSERT INTO parse_fields (parse_id, field, value, phrase, kept, reason) VALUES (?,?,?,?,?,?)",
@@ -1481,8 +1605,9 @@ def status(store: Store) -> dict:
 
 
 def verify(store: Store) -> dict:
-    """Re-compute every stored body's hash (comment versions and raw payloads) and check that the times ingest wrote
-    never decrease with the row order. Lists the row ids that differ."""
+    """Re-compute every stored body's hash (comment versions and raw payloads) and check every time the module
+    writes (`CLOCK_TIMES`): a time earlier than the time of any earlier row of its table is counted. Lists the row
+    ids whose hash differs."""
     bad_versions, bad_payloads, n_v, n_p = [], [], 0, 0
     for r in store.rows("SELECT id, body, body_enc, body_sha256 FROM comment_versions ORDER BY id"):
         n_v += 1
@@ -1501,8 +1626,9 @@ def verify(store: Store) -> dict:
         if not ok:
             bad_payloads.append(r["id"])
     unsorted = {}
-    for t, col in _INGEST_TIMES:
-        k = store.rows(f"SELECT COUNT(*) AS n FROM (SELECT {col} AS x, LAG({col}) OVER (ORDER BY rowid) AS p FROM {t}) WHERE x < p")[0]["n"]
+    for t, col in CLOCK_TIMES:                       # a time earlier than the time of any earlier row of its table
+        k = store.rows(f"SELECT COUNT(*) AS n FROM (SELECT {col} AS x, MAX({col}) OVER (ORDER BY rowid ROWS BETWEEN "
+                       f"UNBOUNDED PRECEDING AND 1 PRECEDING) AS p FROM {t}) WHERE x < p")[0]["n"]
         if k:
             unsorted[f"{t}.{col}"] = k
     return {"versions_checked": n_v, "versions_differ": bad_versions, "payloads_checked": n_p, "payloads_differ": bad_payloads,
@@ -2137,7 +2263,8 @@ def main(argv=None, *, fetcher=None, parser=None, clock=None, sleep=None, out=No
         say(str(e))
         return 2
     try:
-        store = Store(a.store, readonly=a.cmd in ("status", "export"), create=a.cmd == "ingest")
+        store = Store(a.store, readonly=a.cmd in ("status", "export"), create=a.cmd == "ingest",
+                      lock=a.cmd in ("ingest", "parse", "export"))
     except StoreError as e:
         say(_clean(e))
         return 2

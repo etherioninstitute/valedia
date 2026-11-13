@@ -1719,7 +1719,8 @@ def test_status_and_export_leave_the_store_file_untouched(tmp_path):
     before = path.read_bytes()
     assert run_cli(["status", "--store", str(path)])[0] == 0
     assert run_cli(["export", "--store", str(path), "--wiki", str(tmp_path / "w")], clock=FakeClock("2031-01-01T00:00:00Z"))[0] == 0                    # rev 4 (outcome 1): parse and export refuse a clock earlier than the store's latest time
-    assert path.read_bytes() == before and sorted(p.name for p in tmp_path.iterdir()) == ["s.sqlite", "w"]
+    assert path.read_bytes() == before and sorted(p.name for p in tmp_path.iterdir()) == ["s.sqlite", "s.sqlite.lock", "w"]
+    # rev 5 (outcome 1): export holds the store's lock file, which stays beside the store (empty)
 
 
 def test_export_removes_pages_it_wrote_earlier_that_no_longer_exist_and_touches_nothing_else(store, tmp_path):
@@ -3218,3 +3219,433 @@ def test_the_docstring_and_schema_page_say_record_and_book_are_as_claimed_and_ne
     page = " ".join((tmp_path / "wiki" / "SCHEMA.md").read_text().split())
     assert re.search(r"record and the book are whatever the comment states anywhere in it.{0,120}never used for grading", page)
     assert re.search(r"two or more picks.{0,160}empty", page)
+
+
+# =============================================================================================================
+# rev 5: one writer at a time and every write checks the clock; numbers beside a fraction; a 429 among odd bytes
+# =============================================================================================================
+
+# ---- rev 5, 1: commands at once ---------------------------------------------------------------------------------
+
+def no_pick(body):
+    return {"is_pick": False, **{k: None for k in pl.FIELDS}}
+
+
+def test_the_verifiers_sequence_a_parse_committed_in_the_middle_of_an_ingest_stops_that_ingest(tmp_path):
+    path = tmp_path / "s.sqlite"
+    a, b = pl.Store(path), pl.Store(path)
+    ingest(a, one_thread_fetcher(comment("c1", "alice", "Lakers -3")), clock=FakeClock("2026-11-13T16:00:00Z", step=0))
+
+    def parse_meanwhile(seconds):                       # the ingest waits between requests; a parse runs and commits
+        assert parse(b, RecordingParser(no_pick), clock=FakeClock("2026-11-13T18:00:00Z", step=0))["parsed"] == 1
+
+    f = one_thread_fetcher(comment("c1", "alice", "Celtics +3"))
+    with pytest.raises(pl.ClockBehind):
+        pl.ingest(a, f, clock=FakeClock("2026-11-13T17:00:00Z", step=0), sleep=parse_meanwhile, wait_seconds=60)
+    assert len(f.calls) == 2                                                    # the thread was fetched, not stored
+    assert [v["body"] for v in a.versions("c1")] == ["Lakers -3"]
+    assert a.version_before("c1", "2026-11-13T17:30:00Z")["body"] == "Lakers -3"
+    assert a.rows("SELECT MAX(seen_at) AS t FROM sightings")[0]["t"] == "2026-11-13T16:00:00Z"
+    a.close(), b.close()
+
+
+def test_a_clock_going_back_in_the_middle_of_a_parse_run_stops_it_and_that_write_is_not_made(store):
+    ingest(store, one_thread_fetcher(*[comment(f"c{i}", f"u{i}", f"Lakers -{i}") for i in range(1, 4)]),
+           clock=FakeClock("2026-11-13T16:00:00Z", step=0))
+    with pytest.raises(pl.ClockBehind):
+        parse(store, RecordingParser(no_pick), clock=ListClock("2026-11-13T18:00:00Z", "2026-11-13T18:00:00Z", "2026-11-13T17:00:00Z"))
+    # the reading checked at the start is the first parse's time; the third reading is earlier: not written
+    assert [r["parsed_at"] for r in store.rows("SELECT parsed_at FROM parses ORDER BY id")] == ["2026-11-13T18:00:00Z"] * 2
+    with pytest.raises(pl.ClockBehind):                                         # an attempt is a write too
+        parse(store, RecordingParser(lambda b: RuntimeError("down")), prompt_hash="h2",
+              clock=ListClock("2026-11-13T18:05:00Z", "2026-11-13T18:05:00Z", "2026-11-13T18:01:00Z"))
+    assert [r["attempted_at"] for r in store.rows("SELECT attempted_at FROM parse_attempts")] == ["2026-11-13T18:05:00Z"] * 2
+
+
+def test_every_write_of_an_ingest_checks_the_latest_time_inside_its_transaction(store, tmp_path):
+    ingest(store, one_thread_fetcher(comment("c1", "alice", "Lakers -3")), clock=FakeClock("2026-11-13T16:00:00Z", step=0))
+    other = pl.Store(store.path)
+    other.record_attempt(1, "h", "2026-11-13T18:00:00Z", "made up")                 # another writer commits later
+    other.close()
+    for t in ("2026-11-13T17:59:59Z", "2026-11-13T17:00:00Z"):
+        with pytest.raises(pl.ClockBehind):
+            store.record_failure("abc123", None, t, "fetch_error")
+        with pytest.raises(pl.ClockBehind):
+            store.record_attempt(1, "h", t, "x")
+    assert store.rows("SELECT COUNT(*) AS n FROM ingest_failures")[0]["n"] == 0
+    store.record_failure("abc123", None, "2026-11-13T18:00:00Z", "fetch_error")     # the same second is not earlier
+    assert store.rows("SELECT COUNT(*) AS n FROM ingest_failures")[0]["n"] == 1
+
+
+def test_one_command_at_a_time_holds_the_store_and_a_second_stops_with_one_line_and_writes_nothing(tmp_path):
+    s = made_store(tmp_path)
+    s.close()
+    path = tmp_path / "s.sqlite"
+    holder = pl.Store(path, lock=True)
+    before = path.read_bytes()
+    for argv, kw in ((["ingest", "--store", str(path), "--wait", "60"], {"fetcher": FakeFetcher(users=[[]]), "sleep": FakeSleep()}),
+                     (["parse", "--store", str(path)], {"parser": RecordingParser(no_pick)}),
+                     (["export", "--store", str(path), "--wiki", str(tmp_path / "w")], {})):
+        code, out = run_cli(argv, clock=FakeClock("2031-01-01T00:00:00Z"), **kw)
+        assert code == 2 and len(lines_of(out)) == 1 and "another command" in out, (argv[0], out)
+    assert kw == {} and not (tmp_path / "w").exists() and path.read_bytes() == before
+    code, out = run_cli(["status", "--store", str(path), "--verify"])           # status needs no lock
+    assert code == 0 and "versions: 3" in out
+    holder.close()
+    code, out = run_cli(["export", "--store", str(path), "--wiki", str(tmp_path / "w")], clock=FakeClock("2031-01-01T00:00:00Z"))
+    assert code == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["s.sqlite", "s.sqlite.lock", "w"]
+
+
+def test_a_foreign_file_gets_no_lock_file(tmp_path):
+    for name, p in foreign_files(tmp_path).items():
+        data = p.read_bytes()
+        for cmd in ("ingest", "parse", "export"):
+            argv = [cmd, "--store", str(p)] + (["--wiki", str(tmp_path / "w")] if cmd == "export" else [])
+            code, out = run_cli(argv, fetcher=FakeFetcher(), parser=RecordingParser(no_pick), clock=FakeClock(), sleep=FakeSleep())
+            assert code == 2 and p.read_bytes() == data
+        assert not Path(str(p) + ".lock").exists(), name
+
+
+LOCK_CHILD = r'''
+import json, sys, time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from valedia_trader.data_and_fees import pick_lists as pl
+
+cmd, store, go, wiki = sys.argv[1:5]
+
+
+class SlowClock:
+    """The first reading takes 3 s, so the command holds the store at least that long."""
+
+    def __init__(self):
+        self.t, self.first = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc), True
+
+    def __call__(self):
+        if self.first:
+            self.first = False
+            time.sleep(3)
+        self.t += timedelta(seconds=1)
+        return self.t
+
+
+class Fetcher:
+    def user(self, name):
+        return json.dumps([{"title": "Pick of the Day", "url": "https://www.reddit.com/r/sportsbook/comments/abc123/potd/"}])
+
+    def thread(self, url):
+        return json.dumps({"title": "Pick of the Day", "author": "sbpotdbot", "url": url, "body": "", "comments": [
+            {"author": f"user{i}", "created": "2026-11-13T15:00:00+00:00", "body": f"{cmd} {sys.argv[5]} pick {i}",
+             "url": f"https://www.reddit.com/r/sportsbook/comments/abc123/potd/c{i}/"} for i in range(3)]})
+
+
+def parser(body):
+    return {"is_pick": False, **{k: None for k in pl.FIELDS}}
+
+
+print("ready", flush=True)
+while not Path(go).exists():
+    time.sleep(0.002)
+argv = [cmd, "--store", store] + (["--wait", "60"] if cmd == "ingest" else []) + (["--wiki", wiki] if cmd == "export" else [])
+sys.exit(pl.main(argv, fetcher=Fetcher(), parser=parser, clock=SlowClock(), sleep=lambda s: None))
+'''
+
+
+def test_four_commands_started_together_on_one_store_exactly_one_writes(tmp_path):
+    script = tmp_path / "lock_child.py"
+    script.write_text(LOCK_CHILD)
+    winners = []
+    for rnd_i in range(3):
+        d = tmp_path / f"r{rnd_i}"
+        d.mkdir()
+        s = made_store(d)
+        before = snapshot(s)
+        s.close()
+        go = d / "go"
+        cmds = ["ingest", "ingest", "parse", "export"]
+        procs = [spawn(script, c, d / "s.sqlite", go, d / "wiki", f"p{j}", cwd=tmp_path) for j, c in enumerate(cmds)]
+        for p in procs:
+            assert p.stdout.readline().strip() == "ready"
+        go.write_text("")
+        outs = [p.communicate(timeout=60) for p in procs]
+        codes = [p.returncode for p in procs]
+        assert sorted(codes) == [0, 2, 2, 2], (codes, outs)
+        win = codes.index(0)
+        for j, (o, e) in enumerate(outs):
+            if j != win:
+                assert len(lines_of(o)) == 1 and "another command" in o and e == "", (o, e)
+        s = pl.Store(d / "s.sqlite", readonly=True)
+        after = snapshot(s)
+        s.close()
+        changed = {t for t in pl.TABLES if after[t] != before[t]}
+        want = {"ingest": {"payloads", "comment_versions", "comments", "thread_fetches", "sightings"},
+                "parse": {"parses", "parse_fields"}, "export": set()}[cmds[win]]
+        assert changed <= want and (changed or cmds[win] == "export"), (cmds[win], changed)
+        if cmds[win] == "ingest":                                               # only the winner's texts
+            bodies = {r["body"] for r in after["comment_versions"]} - {r["body"] for r in before["comment_versions"]}
+            assert bodies and all(b.startswith(f"ingest p{win} ") for b in bodies), bodies
+        assert (d / "wiki").exists() is (cmds[win] == "export")
+        winners.append(cmds[win])
+    assert len(winners) == 3
+
+
+class GenClock:
+    """Readings from `start` a step apart; from reading `back_at` on, `back_by` seconds earlier."""
+
+    def __init__(self, start, step, back_at=None, back_by=0):
+        self.start, self.step, self.back_at, self.back_by, self.n = start, step, back_at, back_by, 0
+
+    def __call__(self):
+        t = self.start + timedelta(seconds=self.step * self.n)
+        if self.back_at is not None and self.n >= self.back_at:
+            t -= timedelta(seconds=self.back_by)
+        self.n += 1
+        return t
+
+
+def test_generated_sequences_of_commands_and_clocks_never_let_version_before_return_text_seen_later(tmp_path):
+    rnd = random.Random(505)
+    violations, refusals, checks, sequences = [], 0, 0, 0
+    base = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+    for n in range(300):
+        path = tmp_path / f"q{n}.sqlite"
+        a, b = pl.Store(path), pl.Store(path)
+        snaps = []                                       # (largest version id, latest time), in the real order of events
+
+        def snap():
+            snaps.append((a.conn.execute("SELECT COALESCE(MAX(id), 0) FROM comment_versions").fetchone()[0], a.latest_time() or ""))
+
+        now = [base]
+
+        def clock():
+            start = now[0] + timedelta(minutes=rnd.choice([-120, -30, -1, 0, 0, 1, 5, 30, 90]))   # sometimes back at the start
+            now[0] = max(now[0], start)
+            back = rnd.random() < 0.35                                                       # sometimes back in the middle
+            return GenClock(start, rnd.choice([0, 1, 30]), back_at=rnd.randint(1, 3) if back else None,
+                            back_by=rnd.choice([1, 60, 3600]))
+
+        def fetcher():
+            return one_thread_fetcher(*[comment(f"c{i}", f"u{i}", rnd.choice(["Lakers -3", "Celtics +3", "Over 220", f"Lakers -{i}"]))
+                                        for i in range(rnd.randint(1, 3))])
+
+        def run(op, st):
+            nonlocal refusals
+            try:
+                if op == "ingest":
+                    pl.ingest(st, fetcher(), clock=clock(), sleep=lambda s: None, wait_seconds=60)
+                elif op == "parse":
+                    pl.parse_pending(st, RecordingParser(no_pick), clock=clock(), prompt_hash=f"h{rnd.randint(0, 3)}")
+                elif op == "ingest_with_a_parse_meanwhile":
+                    def meanwhile(seconds):
+                        snap()
+                        run("parse", b)
+                        snap()
+                    pl.ingest(st, fetcher(), clock=clock(), sleep=meanwhile, wait_seconds=60)
+                else:                                                               # a parse with an ingest meanwhile
+                    def answer(body):
+                        snap()
+                        run("ingest", b)
+                        snap()
+                        return no_pick(body)
+                    pl.parse_pending(st, RecordingParser(answer), clock=clock(), prompt_hash=f"h{rnd.randint(4, 7)}")
+            except pl.ClockBehind:
+                refusals += 1
+
+        for _ in range(rnd.randint(3, 7)):
+            snap()
+            run(rnd.choice(["ingest", "parse", "ingest_with_a_parse_meanwhile", "parse_with_an_ingest_meanwhile"]), a)
+            snap()
+        sequences += 1
+        times = sorted({r["t"] for t, c in pl.CLOCK_TIMES for r in a.rows(f"SELECT {c} AS t FROM {t}")})
+        moments = sorted({x for t in times for x in (t, (datetime.fromisoformat(t.replace("Z", "+00:00")) + timedelta(seconds=1))
+                                                        .strftime("%Y-%m-%dT%H:%M:%SZ"))})
+        for cid in [r["comment_id"] for r in a.rows("SELECT comment_id FROM comments")]:
+            for m in moments:
+                v = a.version_before(cid, m)
+                checks += 1
+                if v is None:
+                    continue
+                known = max((lt for vid, lt in snaps if vid < v["id"]), default="")
+                if known and known >= m:                 # the store already held a time at or after m before this text came
+                    violations.append((n, cid, m, v["seen_at"], known))
+        a.close(), b.close()
+    assert sequences == 300 and violations == [], (len(violations), violations[:5])
+    assert refusals > 100 and checks > 5000, (refusals, checks)
+
+
+def test_status_verify_reports_a_time_earlier_than_any_earlier_row_of_its_table(store, tmp_path):
+    ingest(store, one_thread_fetcher(comment("c1", "alice", "Lakers -3")), clock=FakeClock("2026-11-13T16:00:00Z", step=0))
+    c = store.conn
+    for t in ("2026-11-13T18:00:00Z", "2026-11-13T16:30:00Z", "2026-11-13T17:00:00Z"):       # 2 earlier than the 18:00 row
+        c.execute("INSERT INTO parse_attempts (version_id, prompt_hash, attempted_at, reason) VALUES (1, 'h', ?, 'x')", (t,))
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE name = 'time_order_ingest_failures'").fetchone()[0]
+    c.execute("DROP TRIGGER time_order_ingest_failures")                        # a person with the file
+    for t in ("2026-11-13T19:00:00Z", "2026-11-13T18:59:00Z"):
+        c.execute("INSERT INTO ingest_failures (failed_at, thread_id, kind, after_fetch_id) VALUES (?, 'abc123', 'x', 0)", (t,))
+    c.execute(sql)
+    c.commit()
+    v = pl.verify(store)
+    assert v["times_out_of_order"] == {"parse_attempts.attempted_at": 2, "ingest_failures.failed_at": 1}, v["times_out_of_order"]
+    code, out = run_cli(["status", "--store", str(store.path), "--verify"])
+    assert code == 1 and "times out of order: parse_attempts.attempted_at=2, ingest_failures.failed_at=1" in out \
+        or "ingest_failures.failed_at=1, parse_attempts.attempted_at=2" in out, out
+
+
+# ---- rev 5, 2: a whole number beside a fraction ------------------------------------------------------------------
+
+@pytest.mark.parametrize("body,field,value,phrase,kept", [
+    ("Lakers ML 1 1∕2u", "units", 1, "1", False),                    # a division slash
+    ("Lakers ML 1 1∕2u", "units", 1.5, "1 1∕2u", False),
+    ("Lakers ML 1 1⁄2u", "units", 1, "1", False),                    # a fraction slash
+    ("Lakers ML 1 1／2u", "units", 1, "1", False),                   # a fullwidth slash
+    ("Lakers ML 1 1/2u", "units", 1, "1", False),
+    ("Lakers ML 1 ⅓u", "units", 1, "1", False),
+    ("Lakers ML 1 ⅓u", "units", 4 / 3, "1 ⅓u", False),
+    ("Lakers ML 2 ⅔u", "units", 2, "2", False),
+    ("Lakers ML 1 ​½u", "units", 1, "1", False),                # a zero-width space before the fraction
+    ("Lakers ML 1 ­½u", "units", 1, "1", False),                # a soft hyphen
+    ("Lakers ML 1 ́½u", "units", 1, "1", False),                # a combining mark
+    ("Lakers ML 1 ⁠½u", "units", 1, "1", False),
+    ("Lakers ML 1 ​1/2u", "units", 1, "1", False),
+    ("Lakers ML 1 ⁠​1⁄2u", "units", 1, "1", False),
+    ("Lakers ML ½ 1u", "units", 1, "1u", False),                     # looking back: a fraction before
+    ("Lakers ML 1∕2 ​3u", "units", 3, "3u", False),
+    ("Lakers ML ٣ 1u", "units", 1, "1u", False),                     # a numeral of another script beside
+    ("Lakers ML 1 ٣u", "units", 1, "1", False),
+    ("Over 9.5u", "units", 9.5, "9.5", False),                       # a phrase that cuts a word, as before
+    # the true counterparts
+    ("Lakers ML 1u", "units", 1, "1u", True),
+    ("Lakers ML 1½u", "units", 1.5, "1½u", True),
+    ("Lakers ML 1.5u", "units", 1.5, "1.5u", True),
+    ("Lakers ML 1/2u", "units", 0.5, "1/2u", True),
+    ("Lakers ML 2u", "units", 2, "2u", True),
+    ("Over 9.5u", "units", 9.5, "9.5u", True),
+    ("Lakers ML -110 2u", "units", 2, "2u", True),                   # a price and a stake side by side
+    ("Lakers ML -110 2u", "odds_as_written", "-110", "-110", True),
+    ("Lakers -3.5 -110 1u", "line", -3.5, "-3.5", True),
+    ("Lakers -3.5 Über alles", "line", -3.5, "-3.5", True),           # a letter of another script after a space
+])
+def test_a_whole_number_beside_a_fraction_is_unusable_whatever_stands_between(body, field, value, phrase, kept):
+    res = checked(body, only(**{field: {"value": value, "phrase": phrase}}))
+    assert (field in kept_fields(res)) is kept, (body, field, value, phrase, res["fields"])
+
+
+def unicode_pools():
+    """Every Unicode character of each kind the rule must handle, found at run time."""
+    import unicodedata as ud
+    pools = {"numeral": [], "slash": [], "fraction": [], "format": [], "combining": []}
+    for i in range(0x110000):
+        c = chr(i)
+        cat, name = ud.category(c), ud.name(c, "")
+        if cat in ("Nd", "Nl", "No") and not "0" <= c <= "9":    # two plain numbers side by side are two numbers
+            pools["numeral"].append(c)
+        if "SLASH" in name or "SOLIDUS" in name or "DIVISION" in name:
+            pools["slash"].append(c)
+        if "FRACTION" in name:
+            pools["fraction"].append(c)
+        if cat == "Cf":
+            pools["format"].append(c)
+        if cat in ("Mn", "Mc", "Me"):
+            pools["combining"].append(c)
+    return pools
+
+
+def fraction_cases(rnd, n, pools):
+    """(body, field, value, phrase, true?, kind) with labels of our own. A whole number with a fraction, a slash
+    or a numeral of any kind beside it (whatever whitespace, format characters or combining marks stand between)
+    has no true value; plain counterparts keep theirs."""
+    word = lambda: rnd.choice(["Lakers", "ML", "tonight", "lock", "play", "(", ")", "!"])   # noqa: E731
+    gap = lambda: "".join(rnd.choice([" ", " ", " ", " "] + [rnd.choice(pools["format"]), rnd.choice(pools["combining"])])
+                          for _ in range(rnd.randint(1, 3)))                                    # noqa: E731
+    out = []
+    while len(out) < n:
+        kind = rnd.choice(["fraction", "slash", "numeral", "before", "plain", "plain", "price_and_stake"])
+        w = rnd.randint(1, 9)
+        if kind == "fraction":
+            f = rnd.choice(pools["fraction"])
+            g = gap()
+            body = f"{word()} {w}{g}{f}u {word()}"
+            fv = __import__("unicodedata").numeric(f, 0) or 0.5
+            for val, ph in ((float(w), str(w)), (w + fv, f"{w}{g}{f}u"), (fv, f"{f}u")):
+                out.append((body, "units", val, ph, False, kind))
+        elif kind == "slash":
+            s, g = rnd.choice(pools["slash"]), gap()
+            body = f"{word()} {w}{g}1{s}2u {word()}"
+            for val, ph in ((float(w), str(w)), (w + 0.5, f"{w}{g}1{s}2u"), (0.5, f"1{s}2u"), (1.0, "1"), (2.0, "2u")):
+                out.append((body, "units", val, ph, False, kind))
+        elif kind == "numeral":
+            d, g = rnd.choice(pools["numeral"]), gap()
+            body = f"{word()} {w}{g}{d}u {word()}"
+            out.append((body, "units", float(w), str(w), False, kind))
+        elif kind == "before":
+            x, g = rnd.choice(pools["fraction"] + pools["slash"] + pools["numeral"]), gap()
+            body = f"{word()} {x}{g}{w}u {word()}"
+            out.append((body, "units", float(w), f"{w}u", False, kind))
+        elif kind == "plain":
+            v = rnd.choice([1, 2, 3, 0.5, 1.5, 2.5])
+            tok = rnd.choice([_num(v)] + ([f"{int(v)}½"] if v % 1 == 0.5 and v > 1 else []))
+            body = f"{word()} {tok}u {word()}"
+            out.append((body, "units", float(v), f"{tok}u", True, kind))
+            out.append((body, "units", float(v) + 1, f"{tok}u", False, kind))
+        else:
+            price, u = rnd.choice(["-110", "+150", "-120"]), rnd.choice([1, 2, 3])
+            body = f"Lakers ML {price} {u}u {word()}"
+            out.append((body, "units", float(u), f"{u}u", True, kind))
+            out.append((body, "odds_as_written", price, price, True, kind))
+    return out[:n]
+
+
+def test_eight_thousand_generated_cases_of_numbers_beside_fractions_keep_no_wrong_fact():
+    pools = unicode_pools()
+    assert all(len(v) > 20 for v in pools.values()), {k: len(v) for k, v in pools.items()}
+    cases = fraction_cases(random.Random(505), 8000, pools)
+    assert len(cases) == 8000
+    wrong, true_total, true_kept = [], 0, 0
+    for body, field, value, phrase, truth, kind in cases:
+        k = field in kept_fields(checked(body, only(**{field: {"value": value, "phrase": phrase}})))
+        if k and not truth:
+            wrong.append((kind, body, value, phrase))
+        if truth:
+            true_total += 1
+            true_kept += k
+    assert wrong == [], (len(wrong), wrong[:5])
+    assert true_total > 1500 and true_kept == true_total, (true_kept, true_total)
+
+
+# ---- rev 5, 3: a 429 among bytes that are not UTF-8 --------------------------------------------------------------
+
+class RawRun:
+    """Stands in for subprocess.run with raw bytes on both streams, decoding them as subprocess does for the
+    arguments it is given."""
+
+    def __init__(self, stdout=b"[]", stderr=b"", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+    def __call__(self, cmd, **kw):
+        out, err = self.stdout, self.stderr
+        if kw.get("text") or kw.get("encoding"):
+            out = out.decode(kw.get("encoding") or "utf-8", kw.get("errors") or "strict")
+            err = err.decode(kw.get("encoding") or "utf-8", kw.get("errors") or "strict")
+        return subprocess.CompletedProcess(cmd, self.returncode, out, err)
+
+
+def test_a_429_in_standard_error_is_a_rate_limit_even_beside_bytes_that_are_not_utf8(monkeypatch):
+    f = pl.ScriptFetcher()
+    monkeypatch.setattr(pl.subprocess, "run", RawRun(b"", b"\xff\xfe reddit: 429 rate-limited, sleeping 61s \x80", returncode=2))
+    with pytest.raises(pl.RateLimited):
+        f.user("sbpotdbot")
+    monkeypatch.setattr(pl.subprocess, "run", RawRun(b"[1]", b"HTTP 429 \xc3\x28 for https://x"))
+    with pytest.raises(pl.RateLimited) as e:
+        f.user("sbpotdbot")
+    assert e.value.result == "[1]"
+    monkeypatch.setattr(pl.subprocess, "run", RawRun(b"[1]", b"\xff\xfe a warning"))      # the counterparts
+    assert f.user("sbpotdbot") == "[1]"
+    monkeypatch.setattr(pl.subprocess, "run", RawRun(b"[\xff]", b""))
+    with pytest.raises(pl.FetchError) as e:
+        f.user("sbpotdbot")
+    assert e.value.kind == "not_utf8"
+    monkeypatch.setattr(pl.subprocess, "run", RawRun(b"", b"\xff HTTP 500 for https://x", returncode=2))
+    with pytest.raises(pl.FetchError) as e:
+        f.user("sbpotdbot")
+    assert not isinstance(e.value, pl.RateLimited)
