@@ -44,7 +44,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, a time whose
                  timestamp() is not finite or raises, or a price not above 0 or above MAX_QUOTE_PRICE: no order for
                  that symbol. The venue's cash, and the broker equity (cash
-                 plus holdings at the quotes), must be finite numbers from 0 to MAX_CASH, and every held symbol must
+                 plus holdings at the quotes), must be finite numbers from 0 to MAX_CASH; the venue's settled cash,
+                 when it gives one (the key present and not None), a finite number from 0 to MAX_CASH and at most
+                 the cash plus SETTLED_ABOVE_CASH (a cent); and every held symbol must
                  have a usable quote; otherwise the run stops before any order and records no equity or peak. A
                  position above MAX_UNITS in size is unusable too (the baseline is not recorded; a broker book that
                  large stops the run).
@@ -54,12 +56,19 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  8. risk gate    risk_gate.check_order against the broker account as it is at that moment, priced at the quotes in
                  hand (equity = the venue's cash as read plus every holding, the baseline and the broker book with
                  this run's fills so far, at its latest usable quote, so a quote asked for again in step 10 prices
-                 the account too; the day's loss against the equity recorded at the last run on an earlier day; the
+                 the account too; before each call every holding whose quote in hand is older than
+                 QUOTE_MAX_AGE_SECONDS is asked for again, in one ask, and when one still has no usable fresh quote
+                 the account cannot be priced: an order that adds risk is left over with that reason, a sale that
+                 reduces risk is still judged, the stale holding kept at its last usable price; the day's loss against the equity recorded at the last run on an earlier day; the
                  fall from the peak of the earlier runs and this equity; positions held), latch and halt files
                  honoured. The run's own equity row is kept at the same prices (set again whenever they change), so
                  the next run's day's loss and peak use them.
- 9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports,
-                 less CASH_KEPT, would be exceeded at the limit prices; at most max_orders_per_day sent in one New
+ 9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports
+                 (or its settled cash, when given and smaller), less CASH_KEPT, would be exceeded at the limit
+                 prices, so a purchase never spends unsettled money: a sale's proceeds (this run's or an earlier
+                 run's that day) reach the cash at once but not the settled cash. Purchases left over for lack of
+                 settled money are counted at their quotes in hand in the summary's `purchases_left_unsettled`,
+                 beside the `cash` and `settled_cash` read; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
 10. send         an order above MAX_UNITS in size is left over, never sent. For each other order, in this order:
                   a. the quote's age on the clock: older than QUOTE_MAX_AGE_SECONDS, the quote function is asked
@@ -80,6 +89,10 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
 11. after        reconcile once more, journal the fills, return and journal a summary.
 
 Points to know:
+ - A halt or latch file is there unless it is plainly absent: the step's own last look counts a symlink (also one
+   to nothing or to itself) and any path whose check raises as there; only a clean "no such file" is absent.
+   risk_gate.check_order looks with Path.exists(), which answers False for a dangling link, a link loop or a path
+   with a NUL byte, so the gate lets those through; the last look before submit_once catches them.
  - Every sale is priced at the quote less SELL_BELOW_REDUCING (2%): the program never sells more than it owns, so
    every sale reduces a holding and counts as reducing risk.
  - reconcile is given the baseline plus the fills already applied; the ledger adds the fills not yet applied.
@@ -144,6 +157,7 @@ DEFAULT_MAX_ORDERS_PER_DAY = 40
 BUY_ABOVE = Decimal("0.01")                       # purchase limit: quote plus 1%, rounded down to the cent
 SELL_BELOW = Decimal("0.01")                      # sale limit: quote less 1%, rounded up to the cent
 SELL_BELOW_REDUCING = Decimal("0.02")             # ... less 2% when the sale reduces risk
+SETTLED_ABOVE_CASH = 0.01                         # settled cash may exceed cash by at most a cent (rounding)
 CASH_KEPT = 0.01                                  # purchases may use the venue's cash less 1%
 FRACTIONAL_DECIMALS = 5
 OPEN_STATES = ("accepted", "partly_filled", "sent", "unknown")   # orders that may still be open at the broker
@@ -224,13 +238,18 @@ def _number_or_none(x):
 
 
 def _present(path) -> bool:
-    """Whether a halt or latch file is there; None means no such file is watched; an error counts as there."""
+    """Whether a halt or latch file is there: anything but a clean "no such file" counts as there, so a symlink (also
+    one to nothing or to itself) is there, and so is a path whose check raises or cannot be made. None means no such
+    file is watched."""
     if path is None:
         return False
     try:
-        return Path(path).exists()
+        os.lstat(path)                                   # not followed: a link of any kind is there
+    except FileNotFoundError:
+        return False
     except Exception:
         return True
+    return True
 
 
 def _sync_file(path: str | Path) -> None:
@@ -776,6 +795,10 @@ class _Run:
         self.target_units: dict[str, float] = {}
         self.broker_equity = None
         self.paper_equity = None
+        self.cash_read = None                            # the venue's cash and settled cash as read, when usable
+        self.settled_cash = None
+        self._settled_unusable = False
+        self.purchases_left_unsettled = 0.0
         self.window_end = None
         self._seen_fill_ids: set | None = None
         self.quote_times: dict[str, float] = {}
@@ -1171,6 +1194,21 @@ class _Run:
         self.quote_times[sym] = t
         return price, None
 
+    def _ask_again(self, symbols: list[str]) -> dict[str, float]:
+        """One more ask of the quote function for these symbols: {symbol: price} for each usable answer (its time
+        kept). An ask that fails gives nothing."""
+        try:
+            raw = dict(self.quotes(list(symbols)) or {})
+        except Exception:
+            return {}
+        got, now = {}, self._now()
+        for sym in symbols:
+            price, t, _ = _read_quote(raw.get(sym), now)
+            if price is not None:
+                self.quote_times[sym] = t
+                got[sym] = price
+        return got
+
     def _cash(self) -> float | None:
         try:
             answer = self.venue.cash()
@@ -1181,9 +1219,24 @@ class _Run:
             if isinstance(cash, str):
                 cash = float(cash)
             cash = _as_float(cash)
-            return cash if cash is not None and 0.0 <= cash <= MAX_CASH else None
+            cash = cash if cash is not None and 0.0 <= cash <= MAX_CASH else None
         except Exception:
+            cash = None
+        if cash is None:
             return None
+        try:                                             # missing or None: no settled cash given, as before
+            settled = answer.get("settled_cash")
+            if settled is not None:
+                if isinstance(settled, str):
+                    settled = float(settled)
+                settled = _as_float(settled)
+                if settled is None or not 0.0 <= settled <= MAX_CASH or settled > cash + SETTLED_ABOVE_CASH:
+                    self._settled_unusable = True
+                    settled = None
+        except Exception:
+            self._settled_unusable, settled = True, None
+        self.cash_read, self.settled_cash = cash, settled
+        return cash
 
     # -- 7
     def _differences(self, book, per_strategy, prices, why_not, min_value) -> list[dict]:
@@ -1237,6 +1290,9 @@ class _Run:
         unpriced = [sym for sym, u in held.items() if u > UNITS_EPS and sym not in prices]
         if cash is None:                                 # unusable: stop before any order, record nothing
             raise _Stop("prices", f"the venue's cash is not a usable number ({_EQUITY_BOUNDS}); nothing is sent")
+        if self._settled_unusable:
+            raise _Stop("prices", f"the venue's settled cash is not a usable number ({_EQUITY_BOUNDS}, at most the cash "
+                                  f"plus {SETTLED_ABOVE_CASH:.2f}); nothing is sent")
         if unpriced:
             raise _Stop("prices", f"the broker equity cannot be worked out: no usable quote for {', '.join(sorted(unpriced))}; "
                                   "nothing is sent")
@@ -1247,8 +1303,15 @@ class _Run:
         self.broker_equity = equity
         opened = sum(1 for u in held.values() if u > UNITS_EPS)
 
-        def account_now() -> dict:
-            """The account at the quotes in hand now; the day's row (and so the peak) is kept at the same prices."""
+        def account_now() -> tuple[dict, list[str]]:
+            """The account at the quotes in hand now, and the holdings it could not price at a fresh quote. A holding
+            whose quote in hand is too old is asked for again first (all of them in one ask); one with no usable
+            fresh quote then is kept at its last usable price and named. The day's row (and so the peak) is kept at
+            the same prices."""
+            stale = sorted(s for s, u in held.items() if u > UNITS_EPS and not self._quote_fresh(s))
+            if stale:
+                in_hand.update(self._ask_again(stale))
+            unpriced = sorted(s for s, u in held.items() if u > UNITS_EPS and not self._quote_fresh(s))
             now_equity = self._equity(cash, held, in_hand)
             if now_equity != self.broker_equity:
                 self.state.reprice_equity(row, now_equity)
@@ -1257,16 +1320,18 @@ class _Run:
             return {"equity": now_equity,
                     "daily_loss_pct": max(0.0, (previous - now_equity) / previous * 100.0) if previous else 0.0,
                     "drawdown_pct": max(0.0, (peak - now_equity) / peak * 100.0) if peak else 0.0,
-                    "open_positions": opened}
+                    "open_positions": opened}, unpriced
         try:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
             limits = None                                # check_order then refuses with the file's own error
         cap = max_orders_per_day(limits)
         sent_today = self.state.sent_on(self.day)
-        budget = cash * (1.0 - CASH_KEPT) if cash is not None and cash > 0 else 0.0
+        settled = self.settled_cash
+        spendable = cash if settled is None else min(cash, settled)        # never unsettled money
+        budget = spendable * (1.0 - CASH_KEPT) if spendable > 0 else 0.0
         spent = 0.0
-        purchases_stopped = None
+        purchases_stopped, stopped_by_settlement = None, False
         sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
         buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
         for c in sales + buys:
@@ -1280,19 +1345,25 @@ class _Run:
                 self._leave(c, f"the day's cap of {cap} orders is reached")
                 continue
             if units > 0 and purchases_stopped:
+                if stopped_by_settlement:
+                    self.purchases_left_unsettled += abs(units) * in_hand.get(sym, c["quote"])
                 self._leave(c, purchases_stopped)
                 continue
             if abs(units) > MAX_UNITS:
                 self._leave(c, f"the order is above {MAX_UNITS:,.0f} units in size")
                 continue
-            quote, judged = c["quote"], None
+            quote, judged = in_hand.get(sym, c["quote"]), None   # the latest quote in hand (a holding's may be newer)
             for round_ in (1, 2):
                 quote, stale = self._fresh_quote(sym, quote)   # 1. a fresh quote in hand (asked again once if too old)
                 if quote is None:
                     self._leave(c, stale)
                     break
                 in_hand[sym] = quote                       # the account below is priced with it
-                account = account_now()
+                account, unpriced = account_now()        # ... every holding at a fresh quote, asked again if too old
+                quote = in_hand[sym]
+                if unpriced and not reduces:
+                    self._leave(c, f"the account cannot be priced: no fresh quote for {', '.join(unpriced)}")
+                    break
                 order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote,
                          "reduces_risk": bool(reduces), "adds_to_existing": owned_here > UNITS_EPS,
                          "position_value_after": abs(owned_here + units) * quote}
@@ -1308,8 +1379,12 @@ class _Run:
                     break
                 cost = units * limit if units > 0 else 0.0
                 if units > 0 and spent + cost > budget:
-                    purchases_stopped = (f"the purchases would exceed the cash the venue reports less {CASH_KEPT:.0%} "
+                    stopped_by_settlement = settled is not None and spent + cost <= cash * (1.0 - CASH_KEPT)
+                    money = "settled cash" if stopped_by_settlement else "cash"
+                    purchases_stopped = (f"the purchases would exceed the {money} the venue reports less {CASH_KEPT:.0%} "
                                          f"({budget:.2f})")
+                    if stopped_by_settlement:
+                        self.purchases_left_unsettled += abs(units) * quote
                     self._leave(c, purchases_stopped)
                     break
                 self._check_environment()                # 3. the environment and host, read again
@@ -1412,7 +1487,9 @@ class _Run:
                    "orders_sent": len(self.sent), "sent": self.sent, "refused": self.refused, "left_over": self.left_over,
                    "skipped": self.skipped, "cancels": self.cancels, "filled_so_far": mine, "fills_journaled": self.fills_journaled,
                    "broker_equity": self.broker_equity if _finite(self.broker_equity) else None,
-                   "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines}
+                   "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines,
+                   "cash": self.cash_read, "settled_cash": self.settled_cash,
+                   "purchases_left_unsettled": self.purchases_left_unsettled}
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only
                 return summary

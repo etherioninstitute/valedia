@@ -2306,3 +2306,279 @@ def test_the_environment_must_be_a_plain_str_by_static_lookup_too(world, how):
     world.venue = V()
     out = world.run()
     assert out["stage"] == "environment" and world.venue.calls == []
+
+
+# ==== rev 7 (T13 rev 7): three more repairs before any live use
+
+class Settling(StandIn):
+    """A stand-in whose cash() also gives settled cash as Webull does: a sale's proceeds reach `cash` at once and
+    `settled_cash` not that day; a purchase lowers both at once. `settled` overrides what cash() reports."""
+
+    def __init__(self, *a, settled_cash=None, **k):
+        super().__init__(*a, **k)
+        self.settled_value = self.cash_value if settled_cash is None else settled_cash
+        self.settled = AUTO
+
+    def fill(self, tag, amount=None):
+        o = self.book[tag]
+        done = super().fill(tag, amount)
+        if o["units"] > 0:
+            self.settled_value -= done * o["limit"]
+        return done
+
+    def cash(self):
+        answer = super().cash()
+        answer["settled_cash"] = self.settled_value if self.settled == AUTO else self.settled
+        if self.settled == "missing":
+            del answer["settled_cash"]
+        return answer
+
+
+def _settling_world(world, cash, settled, held=None):
+    world.venue = Settling(held=held, cash=cash, settled_cash=settled)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+
+
+# ---- rev 7 invariant 1: purchases never spend unsettled money
+
+def test_purchases_stop_at_the_settled_cash_and_the_summary_says_how_much_was_left(world):
+    _settling_world(world, 100_000.0, 18_000.0)
+    world.paper = paper({"a": {"SPY": 30.0, "QQQ": 10.0}})             # 15,000 then 4,000 at the quotes
+    out = world.run()
+    assert [e["symbol"] for e in out["sent"]] == ["SPY"]
+    why = "the purchases would exceed the settled cash the venue reports less 1% (17820.00)"
+    assert out["left_over"] == [{"symbol": "QQQ", "units": 10.0, "reason": why}]
+    assert out["cash"] == 100_000.0 and out["settled_cash"] == 18_000.0 and out["purchases_left_unsettled"] == 4_000.0
+    summary = world.entries("summary")[-1]
+    assert summary["cash"] == 100_000.0 and summary["settled_cash"] == 18_000.0 and summary["purchases_left_unsettled"] == 4_000.0
+
+
+def test_a_sale_earlier_in_the_day_does_not_pay_for_a_purchase(world):
+    _settling_world(world, 10_000.0, 10_000.0)
+    world.venue.fill_at_once = 1.0
+    world.paper = paper({"a": {"SPY": 15.0}})                          # yesterday: 15 SPY bought (7,575 at the limit)
+    world.run()
+    world.next_day()
+    world.venue.settled_value = world.venue.cash_value                 # it settled overnight
+    world.paper = paper({"a": {"SPY": 0.0}})
+    world.run()                                                        # 10:00 the sale: cash up at once, settled not
+    assert world.venue.cash_value > 9_000.0 and world.venue.settled_value < 2_500.0
+    world.later(60)
+    world.paper = paper({"a": {"SPY": 0.0, "QQQ": 10.0}})              # 4,000: within cash, not within settled cash
+    out = world.run()
+    assert out["orders_sent"] == 0 and out["left_over"][0]["symbol"] == "QQQ"
+    assert "settled cash" in out["left_over"][0]["reason"] and out["purchases_left_unsettled"] == 4_000.0
+
+
+@pytest.mark.parametrize("settled", [float("nan"), float("inf"), -1.0, 2e12, "not a number", 1_000_000.02, [5]])
+def test_an_unusable_settled_cash_stops_the_run_before_anything_is_sent(world, settled):
+    _settling_world(world, 1_000_000.0, 0.0)
+    world.venue.settled = settled
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "prices" and world.venue.submits() == []
+    assert "settled cash is not a usable number" in out["reason"] and _equity_rows(world) == []
+
+
+@pytest.mark.parametrize("settled", [None, "missing", 1_000_000.01, "250000.5"])
+def test_a_settled_cash_that_is_missing_or_within_a_cent_of_cash_lets_the_run_go_on(world, settled):
+    _settling_world(world, 1_000_000.0, 0.0)
+    world.venue.settled = settled
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["cash"] == 1_000_000.0
+    assert out["settled_cash"] == {None: None, "missing": None, 1_000_000.01: 1_000_000.01, "250000.5": 250000.5}[settled]
+    assert out["purchases_left_unsettled"] == 0.0
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_purchases_never_exceed_the_smaller_of_cash_and_settled_cash_less_one_percent(tmp_path, seed):
+    for k in range(25):
+        rng = random.Random(70_000 + seed * 25 + k)
+        w = World(tmp_path / f"s{seed}-{k}")
+        cash = rng.choice([5_000.0, 20_000.0, 100_000.0])
+        settled = rng.choice([None, 0.0, cash * 0.1, cash * 0.5, cash])
+        w.venue = Settling(cash=cash, settled_cash=0.0)
+        w.venue.settled = settled
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        w.paper = paper({"a": {s: float(rng.choice([0, 1, 5, 20, 60])) for s in ("SPY", "QQQ", "IWM", "TLT")}})
+        out = w.run()
+        spend = cash if settled is None else min(cash, settled)
+        cost = math.fsum(e["units"] * e["limit_price"] for e in out["sent"] if e["units"] > 0)
+        assert cost <= spend * (1 - osx.CASH_KEPT) + 1e-9, (cash, settled, out["sent"])
+        if settled is not None and settled < cash:
+            unsettled = [o for o in out["left_over"] if "settled cash" in o["reason"]]
+            assert out["purchases_left_unsettled"] == pytest.approx(
+                math.fsum(o["units"] * w.prices[o["symbol"]] for o in unsettled))
+
+
+# ---- rev 7 invariant 2: every holding is priced at a fresh quote at every gate call
+
+def _verifier_slow_world(world, again):
+    world.limits.write_text(json.dumps({**GENEROUS, "max_daily_loss_pct": 2.0}))
+    world.venue = StandIn(held={"SPY": 5000.0}, cash=500_000.0)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    _seed_equity(world, [("2026-11-12", 1_000_000.0)])
+    world.prices["SPY"] = 100.0
+    world.quote_age["SPY"] = 1190.0
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]   # SPY's quote goes stale
+    _stamping(world, after_first=lambda s: "SPY" in s and again())
+
+
+def test_a_held_fund_with_no_order_of_its_own_is_priced_again_when_its_quote_is_too_old(world):
+    _verifier_slow_world(world, lambda: (world.prices.update(SPY=90.0), world.quote_age.update(SPY=60.0)))
+    world.paper = paper({"a": {"QQQ": 10.0}}, equity=1_000_000.0)
+    out = world.run()
+    assert world.venue.submits() == [] and out["refused"][0]["reason"] == "Daily loss limit hit. Trading stopped."
+    account = world.entries("refused")[-1]["account"]
+    assert account["equity"] == 950_000.0 and account["daily_loss_pct"] == pytest.approx(5.0)
+    assert ["SPY"] in world.quote_calls[1:]
+
+
+def test_with_no_fresh_quote_for_a_holding_a_purchase_is_left_over_and_a_reducing_sale_still_goes(world):
+    world.venue = StandIn(held={"SPY": 5000.0}, cash=500_000.0)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.venue.fill_at_once = 1.0
+    world.paper = paper({"a": {"IWM": 10.0}}, equity=1_000_000.0)
+    assert world.run()["orders_sent"] == 1                                         # day 1: 10 IWM owned
+    world.next_day()
+    world.prices["SPY"] = 100.0
+    world.quote_age["SPY"] = 1190.0
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]
+    world.quote_calls.clear()
+    _stamping(world, after_first=lambda s: "SPY" in s and world.quote_age.update(SPY=1500.0))   # no fresh quote comes
+    world.paper = paper({"a": {"IWM": 0.0, "QQQ": 10.0}}, equity=1_000_000.0)
+    out = world.run()
+    assert [e["symbol"] for e in out["sent"]] == ["IWM"] and out["sent"][0]["units"] == -10.0
+    assert out["left_over"] == [{"symbol": "QQQ", "units": 10.0,
+                                 "reason": "the account cannot be priced: no fresh quote for SPY"}]
+    assert [o["symbol"] for o in world.orders() if o["batch"] == out["batch"]] == ["IWM"]
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_every_gate_call_prices_every_holding_at_a_fresh_quote_in_slow_runs(tmp_path, monkeypatch, seed_block):
+    from valedia_trader.research_loop import risk_gate
+    real_gate = risk_gate.check_order
+    box = {}
+
+    def gate(order, account, *a, **k):
+        w, model, held = box["w"], box["model"], box["held"]
+        now = w.clock.t
+        stale = [s for s, u in held.items() if u > 0 and not (-osx.QUOTE_MAX_AHEAD_SECONDS <= now - model[s][1]
+                                                               <= osx.QUOTE_MAX_AGE_SECONDS)]
+        if stale and not order["reduces_risk"]:
+            box["bad"].append(("judged with a stale holding", order["symbol"], stale))
+        equity = box["cash"] + math.fsum(u * model[s][0] for s, u in held.items() if u > 0)
+        peak = max(box["prior_peak"], equity)
+        mine = {"equity": equity, "daily_loss_pct": max(0.0, (box["previous"] - equity) / box["previous"] * 100.0),
+                "drawdown_pct": max(0.0, (peak - equity) / peak * 100.0),
+                "open_positions": sum(1 for u in held.values() if u > 0) + len(box["opened"])}
+        verdict = real_gate(order, account, *a, **k)
+        if account != pytest.approx(mine, rel=1e-12, abs=1e-9) or verdict != real_gate(order, mine, *a, **k):
+            box["bad"].append((order["symbol"], account, mine, verdict))
+        box["judged"] += 1
+        box["verdicts"].add(verdict[0])
+        w.clock.t += box["slow"]
+        return verdict
+    monkeypatch.setattr(osx.risk_gate, "check_order", gate)
+    box.update(judged=0, verdicts=set(), unpriced=0)
+    for k in range(50):
+        rng = random.Random(90_000 + seed_block * 50 + k)
+        w = World(tmp_path / f"q{seed_block}-{k}")
+        w.clock.t = ny(f"2026-11-13 {rng.choice(['10:00', '13:30', '15:00'])}")
+        limits = {**GENEROUS, "max_daily_loss_pct": rng.choice([2.0, 5.0, 99.0]), "max_drawdown_pct": rng.choice([3.0, 10.0, 99.0]),
+                  "max_position_pct": rng.choice([0.2, 1.0])}
+        w.limits.write_text(json.dumps(limits))
+        cash = rng.choice([100_000.0, 500_000.0])
+        held = {s: float(rng.choice([0, 1000, 5000])) for s in ("SPY", "QQQ", "TLT")}
+        w.venue = StandIn(held={s: u for s, u in held.items() if u}, cash=cash)
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        for s in ("SPY", "QQQ", "TLT", "IWM", "GLD"):
+            w.prices[s] = rng.choice([20.0, 50.0, 100.0])
+            w.quote_age[s] = rng.choice([60.0, 600.0, 1190.0])
+        first_equity = cash + sum(u * w.prices[s] for s, u in held.items())
+        previous = first_equity * rng.choice([0.95, 1.0, 1.03])
+        prior_peak = max(previous, first_equity * rng.choice([1.0, 1.05, 1.2]))
+        _seed_equity(w, [("2026-11-10", prior_peak), ("2026-11-12", previous)])
+        factor = rng.choice([0.5, 0.9, 1.0, 1.1])
+        again_age = rng.choice([60.0, 60.0, 300.0, 1500.0])
+        model = {}
+        base = w.quotes
+
+        def quotes(symbols, w=w, base=base, model=model, factor=factor, again_age=again_age):
+            if w.quote_calls:
+                for s in symbols:
+                    w.prices[s] *= factor
+                    w.quote_age[s] = again_age
+            out = base(symbols)
+            for s, (p, t) in out.items():
+                if w.clock.t - t <= osx.QUOTE_MAX_AGE_SECONDS:
+                    model[s] = (p, t)
+            return out
+        w.quotes = quotes
+        if rng.random() < 0.6:
+            cash_read = w.venue.cash
+            w.venue.cash = lambda w=w, cash_read=cash_read: (setattr(w.clock, "t", w.clock.t + 20), cash_read())[1]
+        opened = set()
+        real_submit = w.venue.submit
+
+        def submit(symbol, units, *a, held=held, opened=opened, real_submit=real_submit, **kw):
+            answer = real_submit(symbol, units, *a, **kw)
+            if units > 0 and not held.get(symbol):
+                opened.add(symbol)
+            return answer
+        w.venue.submit = submit
+        box.update(w=w, model=model, held=held, cash=cash, previous=previous, prior_peak=prior_peak, opened=opened,
+                   slow=rng.choice([0.0, 400.0, 900.0, 1300.0]), bad=[])
+        w.paper = paper({"a": {s: float(rng.choice([0, 10, 100, 1000])) for s in ("IWM", "GLD", "SPY")}}, equity=first_equity)
+        out = w.run()
+        assert box["bad"] == [] and out["status"] == "done", (box["bad"], out)
+        box["unpriced"] += sum(1 for o in out["left_over"] if o["reason"].startswith("the account cannot be priced"))
+    assert box["judged"] >= 80 and box["verdicts"] == {True, False} and box["unpriced"] > 0
+
+
+# ---- rev 7 invariant 3: a halt or latch file is there unless it is plainly absent
+
+def _odd_path(tmp, how):
+    import os
+    p = tmp / f"odd-{how}"
+    if how == "dangling link":
+        os.symlink(tmp / "nowhere", p)
+    elif how == "link loop":
+        os.symlink(p, p)
+    elif how == "link to a file":
+        (tmp / "real").write_text("x")
+        os.symlink(tmp / "real", p)
+    elif how == "nul":
+        return str(p) + "\0x"
+    elif how == "unreadable":
+        class Raising(os.PathLike):
+            def __fspath__(self):
+                raise RuntimeError("no path")
+        return Raising()
+    return p
+
+
+@pytest.mark.parametrize("how", ["dangling link", "link loop", "link to a file", "nul", "unreadable"])
+def test_a_halt_file_that_is_not_plainly_absent_counts_as_there(world, how):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.halt = _odd_path(world.tmp, how)
+    out = world.run()
+    assert world.venue.submits() == [] and out["orders_sent"] == 0
+
+
+@pytest.mark.parametrize("how", ["dangling link", "link loop", "nul", "unreadable"])
+def test_a_latch_file_that_is_not_plainly_absent_stops_a_purchase(world, how):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    world.latch = _odd_path(world.tmp, how)
+    out = world.run()
+    assert world.venue.submits() == [] and out["orders_sent"] == 0
+
+
+def test_only_a_clean_no_such_file_is_absent():
+    import os
+    assert osx._present(None) is False
+    assert osx._present("/definitely/not/here/halt") is False
+    assert osx._present(os.devnull) is True
