@@ -280,6 +280,15 @@ def test_order_step_lets_a_programming_error_in_building_the_venue_through(order
         cli.main(["--root", str(root), "order-step"])
 
 
+@pytest.mark.parametrize("error", [RuntimeError, ValueError, KeyError, LookupError, ZeroDivisionError])
+def test_order_step_lets_every_error_but_webull_secrets_and_os_errors_through(order_step_project, monkeypatch, capsys, error):
+    root, venue = order_step_project                                     # rev 6 outcome 4
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: (_ for _ in ()).throw(error("a bug")))
+    with pytest.raises(error):
+        cli.main(["--root", str(root), "order-step"])
+    assert "refused:" not in capsys.readouterr().err
+
+
 def test_paper_step_webull_no_longer_sends_and_names_the_order_step(tmp_path, monkeypatch, capsys):
     from valedia_trader.venues import webull
     monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: pytest.fail("a Webull venue was built")))

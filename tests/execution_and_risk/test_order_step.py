@@ -1897,12 +1897,11 @@ def test_a_slow_environment_read_never_lets_submit_once_begin_after_the_window(w
     world.paper = paper({"a": {"SPY": 1.0}})
     slow = {"on": False}
 
-    class V(StandIn):
-        @property
-        def environment(self):
-            if slow["on"]:
+    class V(StandIn):                                   # slow to read; a plain str by static lookup (rev 6)
+        def __getattribute__(self, name):
+            if name == "environment" and slow["on"]:
                 world.clock.t += 40
-            return "sandbox"
+            return super().__getattribute__(name)
     world.venue = V()
     submitted_at = []
     real_submit = world.venue.submit
@@ -1965,12 +1964,12 @@ def test_a_slow_environment_read_after_the_gate_sends_the_order_back_for_a_fresh
     stamped = _stamping(world, after_first=lambda s: world.quote_age.update(SPY=60.0))
     slow = {"on": False}
 
-    class V(StandIn):
-        @property
-        def environment(self):
-            if slow["on"]:
+    class V(StandIn):                                   # slow to read; a plain str by static lookup (rev 6)
+        def __getattribute__(self, name):
+            if name == "environment" and slow["on"]:
                 world.clock.t += 11 * 60
-            return "sandbox"
+                slow["on"] = False                      # once: a later slow read is rev 6's last look, below
+            return super().__getattribute__(name)
     world.venue = V()
     real_gate = osx.risk_gate.check_order
     monkeypatch.setattr(osx.risk_gate, "check_order", lambda *a, **k: (slow.update(on=True), real_gate(*a, **k))[1])
@@ -2045,8 +2044,7 @@ def test_every_order_sent_passes_the_risk_gate_at_the_quote_actually_used(tmp_pa
                     "adds_to_existing": owned > 1e-12, "position_value_after": abs(owned + units) * ref}
             judged = [(o, a) for o, a in calls if o["symbol"] == sym]
             assert judged and judged[-1][0] == mine                          # the gate saw the quote intend used
-            account = judged[-1][1]
-            assert account["equity"] == out["broker_equity"]
+            account = judged[-1][1]                                          # (the account itself: rev 6, below)
             ok, why = real_gate(mine, account, limits)
             assert ok, (sym, units, ref, why)
             assert sent[sym]["quote"] == ref and sent[sym]["limit_price"] == osx.limit_price(units, ref, reduces)
@@ -2099,3 +2097,212 @@ def test_the_host_must_name_the_sandbox_as_one_of_its_labels(world, host, runs):
         assert out["orders_sent"] == 1
     else:
         assert out["stage"] == "environment" and world.venue.calls == []
+
+
+# ==== rev 6 (T13 rev 6): four repairs before any live use
+
+def _equity_rows(world):
+    st = osx.OrderStepState(world.state_path)
+    try:
+        return [(d, e) for d, e in st._db.execute("SELECT day, equity FROM equity ORDER BY id")]
+    finally:
+        st.close()
+
+
+def _seed_equity(world, rows):
+    st = osx.OrderStepState(world.state_path)
+    try:
+        for day, equity in rows:
+            st.record_equity(day, equity)
+    finally:
+        st.close()
+
+
+# ---- rev 6 outcome 1: the account the gate sees is priced at the quotes in hand
+
+def test_the_account_is_priced_again_when_a_held_funds_quote_is_asked_again(world):
+    world.limits.write_text(json.dumps({**GENEROUS, "max_daily_loss_pct": 2.0}))
+    world.venue = StandIn(held={"SPY": 5000.0}, cash=500_000.0)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    _seed_equity(world, [("2026-11-12", 1_000_000.0)])
+    world.prices["SPY"] = 100.0
+    world.quote_age["SPY"] = 1190.0
+    world.paper = paper({"a": {"SPY": 10.0}}, equity=1_000_000.0)
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]   # the first quote goes stale
+    _stamping(world, after_first=lambda s: (world.prices.update(SPY=90.0), world.quote_age.update(SPY=60.0)))
+    out = world.run()
+    assert world.venue.submits() == [] and out["orders_sent"] == 0
+    assert out["refused"][0]["by"] == "risk gate" and out["refused"][0]["reason"] == "Daily loss limit hit. Trading stopped."
+    account = world.entries("refused")[-1]["account"]
+    assert account["equity"] == 950_000.0 and account["daily_loss_pct"] == pytest.approx(5.0)
+    assert out["broker_equity"] == 950_000.0
+    assert _equity_rows(world) == [("2026-11-12", 1_000_000.0), ("2026-11-13", 950_000.0)]   # recorded at the same prices
+
+
+def test_the_peak_and_the_fall_from_it_use_the_quotes_in_hand(world):
+    world.limits.write_text(json.dumps({**GENEROUS, "max_drawdown_pct": 3.0}))
+    world.venue = StandIn(held={"SPY": 5000.0}, cash=500_000.0)
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    _seed_equity(world, [("2026-11-10", 1_000_000.0), ("2026-11-12", 990_000.0)])
+    world.prices["SPY"] = 110.0                                      # 1,050,000 at the first quote: a new peak
+    world.quote_age["SPY"] = 1190.0
+    world.paper = paper({"a": {"SPY": 10.0}}, equity=1_000_000.0)
+    cash = world.venue.cash
+    world.venue.cash = lambda: (setattr(world.clock, "t", world.clock.t + 20), cash())[1]
+    _stamping(world, after_first=lambda s: (world.prices.update(SPY=90.0), world.quote_age.update(SPY=60.0)))
+    out = world.run()                                                # 950,000 now: 5% below the peak of 1,000,000
+    assert out["orders_sent"] == 0 and out["refused"][0]["reason"] == "Max drawdown hit. Trading stopped."
+    assert world.entries("refused")[-1]["account"]["drawdown_pct"] == pytest.approx(5.0)
+    st = osx.OrderStepState(world.state_path)
+    try:
+        assert st.peak() == 1_000_000.0                              # the stale 1,050,000 is not kept as a peak
+    finally:
+        st.close()
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_every_gate_verdict_matches_my_own_evaluation_at_the_quotes_in_hand(tmp_path, monkeypatch, seed_block):
+    from valedia_trader.research_loop import risk_gate
+    real_gate = risk_gate.check_order
+    box = {}
+
+    def gate(order, account, *a, **k):
+        w, model = box["w"], box["model"]
+        held = box["held"]
+        value = math.fsum(u * model[s] for s, u in held.items() if u > 0)
+        equity = box["cash"] + value
+        peak = max(box["prior_peak"], equity)
+        mine = {"equity": equity, "daily_loss_pct": max(0.0, (box["previous"] - equity) / box["previous"] * 100.0),
+                "drawdown_pct": max(0.0, (peak - equity) / peak * 100.0),
+                "open_positions": sum(1 for u in held.values() if u > 0) + len(box["opened"])}
+        verdict = real_gate(order, account, *a, **k)
+        if account != pytest.approx(mine, rel=1e-12, abs=1e-9) or verdict != real_gate(order, mine, *a, **k):
+            box["bad"].append((order["symbol"], account, mine, verdict))      # raising here would be the run's own fault
+        box["judged"] += 1
+        box["verdicts"].add(verdict[0])
+        w.clock.t += box["slow"]
+        return verdict
+    monkeypatch.setattr(osx.risk_gate, "check_order", gate)
+    box.update(judged=0, verdicts=set())
+    for k in range(50):
+        rng = random.Random(10_000 + seed_block * 50 + k)
+        w = World(tmp_path / f"r{seed_block}-{k}")
+        w.clock.t = ny(f"2026-11-13 {rng.choice(['10:00', '13:30', '15:20'])}")
+        limits = {**GENEROUS, "max_daily_loss_pct": rng.choice([2.0, 5.0, 99.0]), "max_drawdown_pct": rng.choice([3.0, 10.0, 99.0]),
+                  "max_position_pct": rng.choice([0.2, 1.0])}
+        w.limits.write_text(json.dumps(limits))
+        cash = rng.choice([100_000.0, 500_000.0])
+        held = {s: float(rng.choice([0, 1000, 5000])) for s in ("SPY", "QQQ", "IWM")}
+        w.venue = StandIn(held={s: u for s, u in held.items() if u}, cash=cash)
+        w.state_path = osx.state_path_for(w.ledger_path, w.venue.name)
+        for s in ("SPY", "QQQ", "IWM"):
+            w.prices[s] = rng.choice([20.0, 50.0, 100.0])
+            w.quote_age[s] = rng.choice([60.0, 1190.0])
+        first_equity = cash + sum(u * w.prices[s] for s, u in held.items())
+        previous = first_equity * rng.choice([0.95, 1.0, 1.03])
+        prior_peak = max(previous, first_equity * rng.choice([1.0, 1.05, 1.2]))
+        _seed_equity(w, [("2026-11-10", prior_peak), ("2026-11-12", previous)])
+        factor = rng.choice([0.5, 0.9, 1.0, 1.1])
+        again_age = rng.choice([60.0, 60.0, 1500.0])
+        model = {}
+        base = w.quotes
+
+        def quotes(symbols, w=w, base=base, model=model, factor=factor, again_age=again_age):
+            if w.quote_calls:
+                for s in symbols:
+                    w.prices[s] *= factor
+                    w.quote_age[s] = again_age
+            out = base(symbols)
+            for s, (p, t) in out.items():
+                if w.clock.t - t <= osx.QUOTE_MAX_AGE_SECONDS:
+                    model[s] = p
+            return out
+        w.quotes = quotes
+        if rng.random() < 0.6:
+            cash_read = w.venue.cash
+            w.venue.cash = lambda w=w, cash_read=cash_read: (setattr(w.clock, "t", w.clock.t + 20), cash_read())[1]
+        opened = set()
+        real_submit = w.venue.submit
+
+        def submit(symbol, units, *a, held=held, opened=opened, real_submit=real_submit, **kw):
+            answer = real_submit(symbol, units, *a, **kw)
+            if units > 0 and not held.get(symbol):
+                opened.add(symbol)
+            return answer
+        w.venue.submit = submit
+        box.update(w=w, model=model, held=held, cash=cash, previous=previous, prior_peak=prior_peak, opened=opened,
+                   slow=rng.choice([0.0, 0.0, 400.0, 1300.0]))
+        w.paper = paper({"a": {s: float(rng.choice([0, 10, 100, 1000])) for s in ("SPY", "QQQ", "IWM")}}, equity=first_equity)
+        box["bad"] = []
+        out = w.run()
+        assert box["bad"] == [] and out["status"] == "done", (box["bad"], out)
+        if out["broker_equity"] is not None:                        # the day's row is the equity at the last prices in hand
+            last = cash + math.fsum(u * model[s] for s, u in held.items() if u > 0)
+            assert _equity_rows(w)[-1] == ("2026-11-13", pytest.approx(last, rel=1e-12))
+    assert box["judged"] >= 80 and box["verdicts"] == {True, False}
+
+
+# ---- rev 6 outcome 2: a last look between intend and submit_once
+
+def _after_intend(world, act):
+    def patch(led):
+        real = led.intend
+
+        def intend(tag, sym, units, *a, **k):
+            rec = real(tag, sym, units, *a, **k)
+            act(sym, units)
+            return rec
+        led.intend = intend
+    return patch
+
+
+def test_a_quote_that_goes_stale_after_intend_leaves_the_order_intended(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run(patch=_after_intend(world, lambda s, u: setattr(world.clock, "t", world.clock.t + 25 * 60)))
+    assert world.venue.submits() == [] and [o["state"] for o in world.orders()] == ["intended"]
+    assert out["left_over"] == [{"symbol": "SPY", "units": 1.0, "reason": "the quote went stale before the order was sent"}]
+
+
+def test_a_halt_that_appears_after_intend_leaves_every_order_intended(world):
+    world.halt = world.tmp / "HALT"
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run(patch=_after_intend(world, lambda s, u: world.halt.write_text("stop")))
+    assert world.venue.submits() == [] and [o["state"] for o in world.orders()] == ["intended"]
+    assert out["left_over"][0]["reason"] == "the operator halt file appeared before the order was sent"
+
+
+@pytest.mark.parametrize("after", ["sale", "purchase"])
+def test_a_latch_that_appears_after_intend_leaves_a_purchase_intended_but_not_a_reducing_sale(world, after):
+    world.venue.fill_at_once = 1.0
+    world.paper = paper({"a": {"SPY": 10.0}})
+    assert world.run()["orders_sent"] == 1
+    world.next_day()
+    world.paper = paper({"a": {"SPY": 0.0, "QQQ": 1.0}})                 # the sale goes first, then the purchase
+    out = world.run(patch=_after_intend(world, lambda s, u: (u < 0) == (after == "sale") and world.latch.write_text("{}")))
+    states = {o["symbol"]: o["state"] for o in world.orders() if o["batch"] == out["batch"]}
+    assert [e["symbol"] for e in out["sent"]] == ["SPY"] and states["SPY"] in ("accepted", "filled")
+    if after == "sale":                                                   # the purchase then meets the latch at the gate
+        assert "QQQ" not in states and out["refused"][0]["by"] == "risk gate"
+    else:
+        assert states["QQQ"] == "intended"
+        assert out["left_over"] == [{"symbol": "QQQ", "units": 1.0, "reason": "the drawdown latch appeared before the order was sent"}]
+
+
+# ---- rev 6 outcome 3: the environment by static lookup too
+
+@pytest.mark.parametrize("how", ["property", "static production"])
+def test_the_environment_must_be_a_plain_str_by_static_lookup_too(world, how):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    if how == "property":
+        class V(StandIn):
+            environment = property(lambda self: "sandbox")
+    else:
+        class V(StandIn):
+            environment = "production"
+
+            def __getattribute__(self, name):
+                return "sandbox" if name == "environment" else super().__getattribute__(name)
+    world.venue = V()
+    out = world.run()
+    assert out["stage"] == "environment" and world.venue.calls == []

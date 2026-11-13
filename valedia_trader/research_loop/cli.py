@@ -237,22 +237,20 @@ def _order_step_refused() -> bool:
     return True
 
 
-_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, AssertionError, SyntaxError)
-
-
 def _order_step_build():
     """The venue for the order step, or None after one plain line on stderr: when the configured environment is not
-    the test environment, or the secrets file cannot be loaded, or the venue cannot be built. The line names the
-    error's class (and a plain code) only, never anything from the secrets file or a path inside it. A programming
-    error is let through."""
+    the test environment, or the secrets file cannot be loaded, or building the venue raises WebullError, the
+    secrets loader's SecretError or an OSError. The line names the error's class (and a plain code) only, never
+    anything from the secrets file or a path inside it. Every other exception is a programming error and goes
+    through."""
+    from valedia_trader.core.secrets import SecretError
     from valedia_trader.execution_and_risk.order_step import _venue_error
+    from valedia_trader.venues.webull import WebullError
     if _order_step_refused():
         return None
     try:
         return _order_step_venue()
-    except _PROGRAMMING_ERRORS:
-        raise
-    except Exception as exc:
+    except (WebullError, SecretError, OSError) as exc:
         print(f"refused: the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file "
               "and its WEBULL_ settings", file=sys.stderr)
         return None

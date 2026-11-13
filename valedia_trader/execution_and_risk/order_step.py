@@ -11,7 +11,8 @@ baseline (what the account held before the first order step: recorded once, neve
 One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journaled and returned.
 
  1. environment  the venue must be the test environment: its `environment` a plain str equal to TEST_ENVIRONMENT
-                 (a subclass is refused) and, when it has a `host` (by a static lookup or an ordinary getattr, so
+                 by a static lookup and by an ordinary getattr (a subclass, a property or an answer only through
+                 __getattribute__ is refused) and, when it has a `host` (by a static lookup or an ordinary getattr, so
                  also through __getattr__), both answers a plain str of letters, digits, dots and hyphens with
                  "sandbox" as one of its dot-separated labels (so a property or __getattr__-only host, whose static
                  lookup is not a plain str, is refused); and the ledger must treat
@@ -50,9 +51,13 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  7. differences  target minus broker book, rounded toward zero (whole shares, or FRACTIONAL_DECIMALS decimals with
                  `fractional`); a sale never exceeds the broker book; less than the paper trader's smallest trade
                  is dropped. The strategies' parts of each order sum to it exactly (order_parts).
- 8. risk gate    risk_gate.check_order against the broker account as it is now (equity = the venue's cash plus
-                 holdings at the quotes; the day's loss against the equity recorded at the last run on an earlier
-                 day; the fall from the recorded peak; positions held), latch and halt files honoured.
+ 8. risk gate    risk_gate.check_order against the broker account as it is at that moment, priced at the quotes in
+                 hand (equity = the venue's cash as read plus every holding, the baseline and the broker book with
+                 this run's fills so far, at its latest usable quote, so a quote asked for again in step 10 prices
+                 the account too; the day's loss against the equity recorded at the last run on an earlier day; the
+                 fall from the peak of the earlier runs and this equity; positions held), latch and halt files
+                 honoured. The run's own equity row is kept at the same prices (set again whenever they change), so
+                 the next run's day's loss and peak use them.
  9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports,
                  less CASH_KEPT, would be exceeded at the limit prices; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
@@ -65,10 +70,12 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                   d. the quote's age again: too old, back to (a) once; too old the second time, the order is left
                      over. What is sent always uses the quote of the last round's (b), the one the gate judged;
                   e. the window check, then ledger.intend;
-                  f. the environment and host read, the window check again, then ledger.submit_once.
+                  f. the environment and host read; a last look: the quote's age once more, the halt file and (for an
+                     order that adds risk) the latch file; the window check again, then ledger.submit_once.
                  Nothing that can take time sits between a window check and the call it guards; an order failing the
-                 second check stays `intended`, never sent. A day limit order in the regular session. A refusal is journaled and the run goes on; an unknown outcome stops the run
-                 at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
+                 last look or the second window check stays `intended`, never sent, and is reported left over with
+                 the reason. A day limit order in the regular session. A refusal is journaled and the run goes on;
+                 an unknown outcome stops the run at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
                  stop or a left-over order, in the order step's own words.
 11. after        reconcile once more, journal the fills, return and journal a summary.
 
@@ -132,6 +139,7 @@ QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than t
 MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
 MAX_QUOTE_PRICE = 1e7                             # a quote price must be above 0 and at most this
 MAX_UNITS = 1e12                                  # a position size above this (in size) is unusable
+_EQUITY_BOUNDS = f"a finite number from 0 to {MAX_CASH:,.0f}"
 DEFAULT_MAX_ORDERS_PER_DAY = 40
 BUY_ABOVE = Decimal("0.01")                       # purchase limit: quote plus 1%, rounded down to the cent
 SELL_BELOW = Decimal("0.01")                      # sale limit: quote less 1%, rounded up to the cent
@@ -213,6 +221,16 @@ def _status_word(answer) -> str:
 
 def _number_or_none(x):
     return _as_float(x)
+
+
+def _present(path) -> bool:
+    """Whether a halt or latch file is there; None means no such file is watched; an error counts as there."""
+    if path is None:
+        return False
+    try:
+        return Path(path).exists()
+    except Exception:
+        return True
 
 
 def _sync_file(path: str | Path) -> None:
@@ -621,11 +639,20 @@ class OrderStepState:
         row = self._db.execute("SELECT MAX(equity) FROM equity").fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
-    def record_equity(self, day: str, equity: float) -> None:
+    def record_equity(self, day: str, equity: float) -> int:
+        """Record a run's equity; returns the row's id (for reprice_equity)."""
         if not _finite(equity):
             raise OrderStepError(f"equity must be a finite number, not {equity!r}")
         with self._write():
-            self._db.execute("INSERT INTO equity (day, time, equity) VALUES (?, ?, ?)", (day, float(self.clock()), float(equity)))
+            cur = self._db.execute("INSERT INTO equity (day, time, equity) VALUES (?, ?, ?)", (day, float(self.clock()), float(equity)))
+        return int(cur.lastrowid)
+
+    def reprice_equity(self, row: int, equity: float) -> None:
+        """Set the equity of this run's row again, when a quote in hand has changed during the run."""
+        if not _finite(equity):
+            raise OrderStepError(f"equity must be a finite number, not {equity!r}")
+        with self._write():
+            self._db.execute("UPDATE equity SET time = ?, equity = ? WHERE id = ?", (float(self.clock()), float(equity), int(row)))
 
     def sent_on(self, day: str) -> int:
         """Orders handed to the ledger for sending on `day` and not known to have stayed unsent. An order whose outcome
@@ -915,10 +942,14 @@ class _Run:
     # -- 1, read again before every order
     def _check_environment(self) -> None:
         try:
+            static_env = inspect.getattr_static(self.venue, "environment", _ABSENT)
+        except Exception:
+            static_env = None
+        try:
             env = self.venue.environment
         except Exception:
             env = None
-        if type(env) is not str or env != TEST_ENVIRONMENT:
+        if not all(type(e) is str and e == TEST_ENVIRONMENT for e in (static_env, env)):
             raise _Stop("environment", f"the order step runs against the test environment ({TEST_ENVIRONMENT}, a plain "
                                        "str) only; this venue's environment is not that. Live trading is not built")
         try:
@@ -1204,24 +1235,29 @@ class _Run:
     def _send(self, candidates, baseline, book, prices, cash) -> None:
         held = {sym: math.fsum((baseline.get(sym, 0.0), book.get(sym, 0.0))) for sym in set(baseline) | set(book)}
         unpriced = [sym for sym, u in held.items() if u > UNITS_EPS and sym not in prices]
-        value = math.fsum(u * prices[sym] for sym, u in held.items() if u > UNITS_EPS and sym in prices)
-        bounds = f"a finite number from 0 to {MAX_CASH:,.0f}"
         if cash is None:                                 # unusable: stop before any order, record nothing
-            raise _Stop("prices", f"the venue's cash is not a usable number ({bounds}); nothing is sent")
+            raise _Stop("prices", f"the venue's cash is not a usable number ({_EQUITY_BOUNDS}); nothing is sent")
         if unpriced:
             raise _Stop("prices", f"the broker equity cannot be worked out: no usable quote for {', '.join(sorted(unpriced))}; "
                                   "nothing is sent")
-        equity = _as_float(cash + value)
-        if equity is None or not 0.0 <= equity <= MAX_CASH:
-            raise _Stop("prices", f"the broker equity is not a usable number ({bounds}); nothing is sent")
-        previous, peak = self.state.previous_equity(self.day), self.state.peak()
-        self.state.record_equity(self.day, equity)
+        in_hand = dict(prices)                           # every holding at its latest usable quote
+        equity = self._equity(cash, held, in_hand)
+        previous, prior_peak = self.state.previous_equity(self.day), self.state.peak()
+        row = self.state.record_equity(self.day, equity)
         self.broker_equity = equity
-        peak = equity if peak is None else max(peak, equity)
-        daily = max(0.0, (previous - equity) / previous * 100.0) if previous else 0.0
-        drawdown = max(0.0, (peak - equity) / peak * 100.0) if peak else 0.0
-        account = {"equity": equity, "daily_loss_pct": daily, "drawdown_pct": drawdown,
-                   "open_positions": sum(1 for u in held.values() if u > UNITS_EPS)}
+        opened = sum(1 for u in held.values() if u > UNITS_EPS)
+
+        def account_now() -> dict:
+            """The account at the quotes in hand now; the day's row (and so the peak) is kept at the same prices."""
+            now_equity = self._equity(cash, held, in_hand)
+            if now_equity != self.broker_equity:
+                self.state.reprice_equity(row, now_equity)
+                self.broker_equity = now_equity
+            peak = now_equity if prior_peak is None else max(prior_peak, now_equity)
+            return {"equity": now_equity,
+                    "daily_loss_pct": max(0.0, (previous - now_equity) / previous * 100.0) if previous else 0.0,
+                    "drawdown_pct": max(0.0, (peak - now_equity) / peak * 100.0) if peak else 0.0,
+                    "open_positions": opened}
         try:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
@@ -1255,6 +1291,8 @@ class _Run:
                 if quote is None:
                     self._leave(c, stale)
                     break
+                in_hand[sym] = quote                       # the account below is priced with it
+                account = account_now()
                 order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote,
                          "reduces_risk": bool(reduces), "adds_to_existing": owned_here > UNITS_EPS,
                          "position_value_after": abs(owned_here + units) * quote}
@@ -1292,9 +1330,12 @@ class _Run:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
                 self._check_environment()                # 6. the environment and host again ...
-                if self._now() > self.window_end:        # ... then the window, with nothing between it and submit_once
+                late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
+                if late is None and self._now() > self.window_end:   # ... then the window, nothing between it and submit_once
+                    late = "the session window closed during the run"
+                if late is not None:
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
-                    self._leave(c, "the session window closed during the run")
+                    self._leave(c, late)
                     continue
                 rec = self.ledger.submit_once(watch, tag)
             except OrdersBlocked:
@@ -1322,11 +1363,29 @@ class _Run:
             sent_today += 1
             spent += cost
             if units > 0 and owned_here <= UNITS_EPS:
-                account["open_positions"] += 1
+                opened += 1
             entry = {"symbol": sym, "units": units, "side": order["side"], "limit_price": limit, "quote": quote,
                      "value": abs(units) * quote, "tag": tag, "parts": c["parts"], "reduces_risk": bool(reduces)}
             self.sent.append(entry)
             self._write({"event": "order", **entry, "state": outcome})
+
+    def _equity(self, cash: float, held: dict, in_hand: dict) -> float:
+        """The venue's cash plus every holding at its quote in hand; a number outside 0 to MAX_CASH stops the run."""
+        equity = _as_float(cash + math.fsum(u * in_hand[sym] for sym, u in held.items() if u > UNITS_EPS))
+        if equity is None or not 0.0 <= equity <= MAX_CASH:
+            raise _Stop("prices", f"the broker equity is not a usable number ({_EQUITY_BOUNDS}); nothing more is sent")
+        return equity
+
+    def _last_look(self, sym: str, reduces: bool) -> str | None:
+        """Why an intended order may not be sent after all (its quote is too old now, the halt file or, for an order
+        that adds risk, the latch has appeared), or None. A file that cannot be looked at counts as there."""
+        if not self._quote_fresh(sym):
+            return "the quote went stale before the order was sent"
+        if _present(self.halt_file):
+            return "the operator halt file appeared before the order was sent"
+        if not reduces and _present(self.latch_file):
+            return "the drawdown latch appeared before the order was sent"
+        return None
 
     def _leave(self, c: dict, reason: str) -> None:
         item = {"symbol": c["symbol"], "units": c["units"], "reason": reason}
