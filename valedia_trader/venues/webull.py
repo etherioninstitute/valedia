@@ -51,9 +51,11 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   error-code page (developer.webull.hk/apis/docs/error-codes.md; developer.webull.com has none) lists no
   order-not-found code. A search engine's copy of an older Webull HK error table (developer.webull.hk/api-doc/
   develop/error, which now redirects) listed ORDER_NOT_FOUND as "the order does not exist". Nothing documents
-  that a 200 with an empty `orders` list means "no such order" either. Two answers are candidates: a 200 in the
-  documented combo shape whose `orders` is an explicitly empty list, and the error code ORDER_NOT_FOUND (on an
-  SDK ServerException, SDK core/exception/exceptions.py:31-37, or on a non-200 body). order_status returns None
+  that a 200 with an empty `orders` list means "no such order" either. Two answers are candidates, read
+  exactly: (a) a 200 whose body is an object with `orders` an empty list and no `status` key, and (b) the exact
+  code ORDER_NOT_FOUND (no case folding, no trimming) with a 4xx HTTP status, carried by the SDK's server-error
+  exception (it has `error_code` and `http_status`, SDK core/exception/exceptions.py:31-37; a transport
+  ClientException has no `http_status` and never counts) or by a non-2xx answer's body. order_status returns None
   for them only when the venue is built with confirmed_not_found=True; by default (False) both raise
   WebullError saying that what they mean is not yet confirmed. Turn the flag on only after the answer has been
   observed in Webull's test environment for a client order id that was never sent. Everything else, a bare
@@ -73,6 +75,20 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   /trading/assets/balances/get. Docs /apis/docs/reference/account-balance: total_asset_currency,
   total_cash_balance, and account_currency_assets [{currency, cash_balance, settled_cash, buying_power, ...}],
   all strings.
+* Token: the SDK writes its access token in plain text (token, expiry, status, one per line) to token.txt in a
+  directory chosen as: ApiClient.set_token_dir (SDK core/client.py:171-172, read by ClientInitializer.init_token
+  via get_token_dir, SDK core/http/initializer/client_initializer.py:60), else $WEBULL_OPENAPI_TOKEN_DIR, else
+  "conf" under the working directory (SDK core/http/initializer/token/token_storage.py:48-50 and 70-86; written
+  by token_manager.py:96-104 with default file permissions). This adapter calls set_token_dir with a private
+  directory, ~/.valedia/webull/<environment>/ unless `token_dir` is given, created with mode 0700, and refuses a
+  directory inside the repository.
+* Limit prices: never rounded; a price that is not a finite number above zero, or not already on the tick, is
+  refused before any call (NotTransmitted). Ticks: equities 2 decimals at 1.00 and above, 4 below (the US
+  sub-penny rule, SEC Regulation NMS Rule 612; Webull's own increments are not documented on developer.webull.com);
+  crypto 8 decimals (an assumption: the docs give 8 decimals for crypto quantities only). Both are to be
+  checked in the test environment.
+* Numbers: every number Webull sends is read with one rule: absent, unreadable, too large for a float (a huge
+  JSON integer) or not finite means None (positions() skips such a row), and a negative filled quantity is None.
 * Errors: the SDK raises ServerException(error_code, error_msg, http_status, request_id) for any answer outside
   200-299 (SDK core/client.py:357-359 and 424-428) and ClientException(error_code, error_msg) for a transport
   failure (SDK core/client.py:328). The SDK logs the whole request with its headers before raising
@@ -92,6 +108,8 @@ import hashlib
 import json
 import logging
 import math
+import numbers
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -139,7 +157,7 @@ def order_payload(symbol: str, units: float, tag: str, limit_price: float | None
         raise NotTransmitted("an order needs a non-zero quantity")
     try:
         amount = float(units)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise NotTransmitted(f"the quantity {units!r} is not a number") from None
     if not math.isfinite(amount):
         raise NotTransmitted(f"the quantity {units!r} is not a finite number")
@@ -153,10 +171,33 @@ def order_payload(symbol: str, units: float, tag: str, limit_price: float | None
              "order_type": "LIMIT" if limit_price is not None else "MARKET",
              "quantity": quantity, "side": "BUY" if amount > 0 else "SELL", "time_in_force": "GTC" if crypto else "DAY", "entrust_type": "QTY"}
     if limit_price is not None:
-        order["limit_price"] = f"{float(limit_price):.2f}"
+        order["limit_price"] = _limit_text(limit_price, crypto)
     if not crypto:
         order["support_trading_session"] = "CORE"
     return order
+
+
+def _limit_text(limit_price: Any, crypto: bool) -> str:
+    """The limit price exactly as given, or NotTransmitted. It is never rounded: rounding a limit changes the worst
+    price the trader accepts, so the caller must choose the tick. Ticks: equities at most 2 decimals at 1.00 or
+    above and at most 4 below 1.00 (the US sub-penny rule, SEC Regulation NMS Rule 612; Webull's own increments are
+    not documented on developer.webull.com, read 2026-11-12); crypto at most 8 decimals (an ASSUMPTION: the docs
+    give 8 decimals for crypto quantities only). Both are to be checked in the test environment."""
+    if isinstance(limit_price, bool) or not isinstance(limit_price, numbers.Real):
+        raise NotTransmitted(f"a limit price must be a number, not a {type(limit_price).__name__}")
+    try:
+        price = float(limit_price)
+    except (TypeError, ValueError, OverflowError):
+        raise NotTransmitted("the limit price cannot be read as a number") from None
+    if not math.isfinite(price) or not price > 0:
+        raise NotTransmitted(f"a limit price must be a finite number above zero, not {price!r}")
+    places = 8 if crypto else 2 if price >= 1 else 4
+    text = f"{price:.{places}f}"
+    if float(text) != price or float(text) == 0:
+        raise NotTransmitted(f"the limit price {price!r} is not on the tick of {places} decimal places and would have to be "
+                             "rounded to be sent; choose the tick yourself, because rounding a limit changes the worst price accepted")
+    whole, frac = text.split(".")
+    return f"{whole}.{frac.rstrip('0').ljust(2, '0')}"
 
 
 def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION) -> dict | None:
@@ -198,6 +239,24 @@ def _quiet_sdk_logging() -> None:
                 handler.close()
             except Exception:
                 pass
+
+
+def _private_token_dir(token_dir: str | Path | None, environment: str) -> Path:
+    """The SDK's token directory: outside the repository, created if needed, owner-only (0700). Fails closed."""
+    d = Path(token_dir).expanduser() if token_dir is not None else Path.home() / ".valedia" / "webull" / environment
+    d = d.resolve()
+    repo = REPO.resolve()
+    if d == repo or repo in d.parents:
+        raise WebullError(f"the SDK token directory must be outside the repository, not {d}")
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(d, 0o700)
+        mode = d.stat().st_mode
+    except OSError as exc:
+        raise WebullError(f"could not prepare the private token directory {d}: {exc.strerror or type(exc).__name__}") from None
+    if not d.is_dir() or mode & 0o077:
+        raise WebullError(f"the token directory {d} is not private (mode {mode & 0o777:o})")
+    return d
 
 
 def _remove_new_empty_sdk_log(existed_before: bool, path: Path) -> None:
@@ -256,13 +315,15 @@ def _number(value: Any) -> float | None:
         return None
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):                       # OverflowError: a JSON integer beyond float range
         return None
     return out if math.isfinite(out) else None
 
 
-def _not_found_code(code: Any) -> bool:
-    return str(code or "").strip().upper() in ORDER_NOT_FOUND_CODES
+def _not_found_code(code: Any, http_status: Any) -> bool:
+    """The exact code ORDER_NOT_FOUND (no case folding, no trimming) with a 4xx HTTP status."""
+    return (isinstance(code, str) and code in ORDER_NOT_FOUND_CODES and isinstance(http_status, int)
+            and not isinstance(http_status, bool) and 400 <= http_status < 500)
 
 
 def _trader_symbol(symbol: Any, instrument_type: Any) -> str:
@@ -286,9 +347,9 @@ def _order_items(body: Any) -> list[dict] | None:
 def _combo_items(body: Any) -> list[dict] | None:
     if not isinstance(body, dict):
         return None
-    if "orders" in body:
+    if "orders" in body:                                                # a combo must hold at least one order object
         orders = body["orders"]
-        return orders if isinstance(orders, list) and all(isinstance(o, dict) for o in orders) else None
+        return orders if isinstance(orders, list) and orders and all(isinstance(o, dict) for o in orders) else None
     return [body] if "status" in body else None
 
 
@@ -313,7 +374,10 @@ def _fee(item: dict) -> float | None:
     if not values:
         return None
     numbers = [_number(v) for v in values]
-    return None if any(n is None for n in numbers) else sum(numbers)
+    if any(n is None for n in numbers):
+        return None
+    total = sum(numbers)
+    return total if math.isfinite(total) else None
 
 
 def _state(raw: Any) -> str:
@@ -322,7 +386,7 @@ def _state(raw: Any) -> str:
 
 def _filled_units(item: dict) -> float | None:
     n = _number(item.get("filled_quantity"))
-    return None if n is None else abs(n)
+    return None if n is None or n < 0 else n + 0.0                      # a negative fill is unreadable; -0.0 becomes 0.0
 
 
 class WebullVenue:
@@ -330,7 +394,16 @@ class WebullVenue:
 
     def __init__(self, app_key: str, app_secret: str, environment: str = "sandbox", account_id: str | None = None,
                  client: Any | None = None, confirmation_file: str | Path = LIVE_CONFIRMATION, region: str = "us",
-                 confirmed_not_found: bool = False) -> None:
+                 confirmed_not_found: bool = False, token_dir: str | Path | None = None) -> None:
+        """`confirmed_not_found` (default False): read the two "no such order" answers (see order_status) as None.
+        Turn it on only after that answer has been observed in Webull's test environment for an id that was never
+        sent, and only together with a generous `settle_seconds` in the order ledger, chosen from the lag observed
+        there: the detail call can show an empty list for a while after an order was placed, and with the flag on
+        that reads as "never arrived" once the settle time has passed. The ledger's recheck is the backstop.
+
+        `token_dir`: where the SDK keeps its access token when a real client is built (the SDK writes it in plain
+        text). Default ~/.valedia/webull/<environment>/; created with mode 0700; a directory inside the repository
+        is refused."""
         if environment not in HOSTS:
             raise WebullError(f"environment must be one of {sorted(HOSTS)}")
         if not str(app_key).strip() or not str(app_secret).strip():
@@ -343,12 +416,16 @@ class WebullVenue:
                 from webull.trade.trade_client import TradeClient
             except ImportError as exc:
                 raise WebullError("the Webull SDK is not installed: uv pip install 'webull-openapi-python-sdk>=3.0.4'") from exc
+            private_tokens = _private_token_dir(token_dir, environment)
             sdk_log = Path.cwd() / SDK_LOG_FILE
             sdk_log_existed = sdk_log.exists()
             _quiet_sdk_logging()
             try:                                             # the SDK opens a session here: this is a network call
                 api = ApiClient(app_key, app_secret, region)
                 api.add_endpoint(region, self.host)
+                # The SDK writes its access token to <dir>/token.txt; without this it uses $WEBULL_OPENAPI_TOKEN_DIR or
+                # conf/ under the working directory (SDK core/client.py:171, token_storage.py:48-86, token_manager.py:96-104).
+                api.set_token_dir(str(private_tokens))
                 # TradeClient adds its stdout and file loggers only when neither of these is set (SDK trade_client.py:43).
                 api._stream_logger_set = api._file_logger_set = True
                 client = TradeClient(api)
@@ -385,7 +462,7 @@ class WebullVenue:
             found = self.accounts()
             if len(found) != 1:
                 raise WebullError(f"{len(found)} accounts are visible; set WEBULL_ACCOUNT_ID to choose one")
-            if found[0].get("account_id") in (None, ""):
+            if not isinstance(found[0].get("account_id"), str) or not found[0]["account_id"]:
                 raise WebullError("Webull's account list names no account_id")
             self._account_id = str(found[0]["account_id"])
         return self._account_id
@@ -404,11 +481,10 @@ class WebullVenue:
             sym = str(row.get("symbol", "")).upper()
             if str(row.get("instrument_type", "")).upper() == "CRYPTO" and sym.endswith("USD") and "-" not in sym:
                 sym = sym[:-3] + "-USD"
-            qty = row.get("quantity", row.get("qty", row.get("position", 0)))
-            try:
-                out[sym] = out.get(sym, 0.0) + float(qty)
-            except (TypeError, ValueError):
+            qty = _number(row.get("quantity", row.get("qty", row.get("position", 0))))
+            if qty is None:                                               # unreadable, too large or not finite: skipped
                 continue
+            out[sym] = out.get(sym, 0.0) + qty
         return out
 
     # ---- orders
@@ -508,15 +584,15 @@ class WebullVenue:
         except WebullError:
             raise
         except Exception as exc:
-            if _not_found_code(getattr(exc, "error_code", None)):
+            if _not_found_code(getattr(exc, "error_code", None), getattr(exc, "http_status", None)):    # the SDK's ServerException
                 return self._no_such_order("the error code ORDER_NOT_FOUND")
             raise WebullError("Webull call failed: " + _safe(exc)) from None
         if getattr(res, "status_code", None) != 200:
             err = _json(res)
-            if isinstance(err, dict) and _not_found_code(err.get("error_code")):
+            if isinstance(err, dict) and _not_found_code(err.get("error_code"), getattr(res, "status_code", None)):
                 return self._no_such_order("the error code ORDER_NOT_FOUND")
         body = _body(res)
-        if isinstance(body, dict) and isinstance(body.get("orders"), list) and not body["orders"]:
+        if isinstance(body, dict) and isinstance(body.get("orders"), list) and not body["orders"] and "status" not in body:
             return self._no_such_order("an empty order list")
         items = _order_items(body)
         if not items:                                                     # None (malformed) or a bare empty list
@@ -571,8 +647,9 @@ class WebullVenue:
         """{cash, settled_cash, buying_power, currency} from the balance call (docs account-balance). `cash` is
         total_cash_balance, else the currency entry's cash_balance; settled_cash and buying_power come from the
         account_currency_assets entry in total_asset_currency, and are None when there is no entry in that currency
-        (another currency's figures are never labelled with it). Only when total_asset_currency is absent is the
-        only entry used, and `currency` is then that entry's own currency. A field that is absent or unreadable is
+        (another currency's figures are never labelled with it). When total_asset_currency is absent or empty, the
+        totals carry no currency, so total_cash_balance is not used: everything comes from the single entry, `cash`
+        from its cash_balance and `currency` from its own currency (all None without one such entry). A field that is absent or unreadable is
         None; an account_currency_assets that is not a list of objects raises WebullError."""
         body = self.balance()
         if not isinstance(body, dict):
@@ -582,15 +659,20 @@ class WebullVenue:
         if not isinstance(assets, list) or not all(isinstance(a, dict) for a in assets):
             raise WebullError("Webull's balance has an unexpected shape: account_currency_assets is not a list of objects")
         currency = body.get("total_asset_currency")
-        if currency:
-            currency = str(currency)
+        if currency is not None and not isinstance(currency, str):
+            raise WebullError("Webull's balance has an unexpected shape: total_asset_currency is not a string")
+        if currency:                                                      # Webull attached this currency to the totals
             entry = next((a for a in assets if str(a.get("currency", "")).upper() == currency.upper()), {})
-        else:
+            cash = _number(body.get("total_cash_balance"))
+            cash = cash if cash is not None else _number(entry.get("cash_balance"))
+        else:                                                             # no currency on the totals: only the single entry
             entry = assets[0] if len(assets) == 1 else {}
-            currency = str(entry["currency"]) if entry.get("currency") else None
-        cash = _number(body.get("total_cash_balance"))
-        return {"cash": cash if cash is not None else _number(entry.get("cash_balance")), "settled_cash": _number(entry.get("settled_cash")),
-                "buying_power": _number(entry.get("buying_power")), "currency": currency}
+            currency = entry.get("currency") if isinstance(entry.get("currency"), str) and entry.get("currency") else None
+            if currency is None:
+                return {"cash": None, "settled_cash": None, "buying_power": None, "currency": None}
+            cash = _number(entry.get("cash_balance"))
+        return {"cash": cash, "settled_cash": _number(entry.get("settled_cash")), "buying_power": _number(entry.get("buying_power")),
+                "currency": currency}
 
     # ---- a read-only readiness report
     def check(self) -> dict:

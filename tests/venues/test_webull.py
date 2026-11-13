@@ -479,14 +479,18 @@ def test_the_sdks_loggers_are_quiet_and_their_handlers_closed_after_quieting(tmp
 def test_an_empty_sdk_log_created_while_building_the_client_is_removed(tmp_path, monkeypatch):
     """A stand-in SDK whose TradeClient dirties the loggers and creates the log file the way the real one does."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))                  # rev 3: the token directory goes under HOME
     stream, seen = io.StringIO(), {}
 
     class FakeApiClient:
         def __init__(self, key, secret, region):
-            pass
+            self._token_dir = None
 
         def add_endpoint(self, region, host):
             seen["host"] = host
+
+        def set_token_dir(self, token_dir):
+            self._token_dir = token_dir
 
     class FakeTradeClient:
         def __init__(self, api):
@@ -542,3 +546,246 @@ def test_units_that_are_not_finite_or_format_to_zero_are_not_transmitted(tmp_pat
         wb.order_payload("BTC-USD", units / 1000 if abs(units) == 4e-6 else units, "t")      # crypto rounds to 8 places
     assert client.placed() == []
     assert wb.order_payload("BTC-USD", 4e-6, "t")["quantity"] == "0.000004"            # small but not zero: allowed
+
+
+# ---- T9 rev 3: second repair after blind verification
+
+HUGE = 10 ** 400                                                          # float(HUGE) raises OverflowError
+WEIRD = [None, True, False, 0, -1, HUGE, -HUGE, 1e308, float("inf"), float("nan"), "", "x", "1e999", "-0", [], [None], ["junk"],
+         {}, {"a": 1}, "ORDER_NOT_FOUND"]
+
+
+def _mutations(template):
+    """The template itself, the template replaced whole by each odd value, and every field at every level replaced by each."""
+    yield template
+    for w in WEIRD:
+        yield w
+    if isinstance(template, dict):
+        for k, v in template.items():
+            for w in WEIRD:
+                yield {**template, k: w}
+            for sub in list(_mutations(v))[1 + len(WEIRD):]:
+                yield {**template, k: sub}
+    elif isinstance(template, list):
+        for i, v in enumerate(template):
+            for w in WEIRD:
+                yield template[:i] + [w] + template[i + 1:]
+            for sub in list(_mutations(v))[1 + len(WEIRD):]:
+                yield template[:i] + [sub] + template[i + 1:]
+
+
+ITEM = order("PARTIAL_FILLED", cid=wb.client_order_id("t"), symbol="BTCUSD", instrument_type="CRYPTO", side="SELL", total_quantity="2",
+             filled_quantity="1", filled_price="10", commission={"actual_commission": "0.5"}, fees=[{"actual_value": "0.1"}])
+TEMPLATES = {
+    "detail": detail(ITEM),
+    "open": {"data": [detail(ITEM)], "pagination_key": None},
+    "balance": {"total_asset_currency": "USD", "total_cash_balance": "10",
+                "account_currency_assets": [{"currency": "USD", "cash_balance": "10", "settled_cash": "9", "buying_power": "8"}]},
+    "positions": [{"symbol": "SPY", "quantity": "2", "instrument_type": "EQUITY"}],
+    "accounts": [{"account_id": "ACC-0001-1234", "account_type": "CASH"}],
+}
+CALLS = {"detail": ["order_status"], "open": ["open_orders", "cancel_all_open", "check"], "balance": ["cash", "check", "balance"],
+         "positions": ["positions", "check"], "accounts": ["accounts", "check", "order_status", "cash"]}
+
+
+def _fuzz_venue(tmp_path, endpoint, body, status=200):
+    client = FakeClient()
+    answer = Response(body, status)
+    if endpoint == "detail":
+        client._details = {wb.client_order_id("t"): answer}
+    elif endpoint == "open":
+        client._open_pages = {None: answer}
+    elif endpoint == "balance":
+        client._balance = answer
+    elif endpoint == "positions":
+        client.account_v2.get_account_position = lambda a: answer
+    else:
+        client.account_v2.get_account_list = lambda: answer
+    return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+
+
+@pytest.mark.parametrize("endpoint", sorted(TEMPLATES))
+def test_generated_malformed_answers_raise_only_webull_error_from_every_public_method(tmp_path, endpoint):
+    cases = 0
+    for body in _mutations(TEMPLATES[endpoint]):
+        for status in (200, 417):
+            for method in CALLS[endpoint]:
+                v = _fuzz_venue(tmp_path, endpoint, body, status)
+                try:
+                    out = getattr(v, method)("t") if method == "order_status" else getattr(v, method)()
+                except wb.WebullError:
+                    out = "raised"
+                except Exception as exc:                                  # anything else is the failure under test
+                    pytest.fail(f"{method} on {endpoint} {status} {body!r:.200} raised {type(exc).__name__}: {exc!s:.100}")
+                if method == "order_status":
+                    assert out is not None, f"None with the default flag for {body!r:.200}"
+                cases += 1
+    assert cases > 100
+
+
+def test_a_huge_or_infinite_number_is_unreadable_not_an_overflow(tmp_path):
+    out = status_venue(tmp_path, detail(order("FILLED", filled_quantity=HUGE, filled_price=HUGE, commission={"actual_commission": HUGE})))[0].order_status("t")
+    assert (out["filled_units"], out["avg_price"], out["fee"]) == (None, None, None)
+    big_fees = order("FILLED", filled_quantity="1", fees=[{"actual_value": 1e308}, {"actual_value": 1e308}])   # the sum overflows to inf
+    assert status_venue(tmp_path, detail(big_fees))[0].order_status("t")["fee"] is None
+    rows = [{"symbol": "SPY", "quantity": HUGE}, {"symbol": "QQQ", "quantity": "1e999"}, {"symbol": "IWM", "quantity": "nan"},
+            {"symbol": "DIA", "quantity": "3"}]
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(positions=rows), confirmation_file=tmp_path / "x.json")
+    assert v.positions() == {"DIA": 3.0}                                  # unreadable quantities are skipped, never infinite
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("QQQ", -1.0, "t")                                        # an infinite holding cannot license a sale
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance={"total_asset_currency": "USD", "total_cash_balance": HUGE}), confirmation_file=tmp_path / "x.json")
+    assert v.cash()["cash"] is None
+
+
+EQUITY_BAD_LIMITS = [0.000019, float("nan"), float("inf"), -5, 0, -0.0, 10.005, 1.234, 0.12345, "abc", "10.00", True, [10]]
+CRYPTO_BAD_LIMITS = [0.000000001, float("nan"), float("-inf"), -5, 0, 1.123456789, "x"]
+
+
+@pytest.mark.parametrize("symbol, limit", [("SPY", x) for x in EQUITY_BAD_LIMITS] + [("BTC-USD", x) for x in CRYPTO_BAD_LIMITS])
+def test_a_limit_price_that_is_not_positive_finite_or_on_the_tick_is_not_transmitted(tmp_path, symbol, limit):
+    with pytest.raises(wb.NotTransmitted):
+        wb.order_payload(symbol, 1.0, "t", limit_price=limit)
+    held = [{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}, {"symbol": "BTCUSD", "quantity": "5", "instrument_type": "CRYPTO"}]
+    for env in ("sandbox", "production"):
+        v, client = venue(tmp_path, env=env, positions=held)
+        for units in (1.0, -1.0):
+            with pytest.raises(wb.NotTransmitted):
+                v.submit(symbol, units, "t", price=100.0, limit_price=limit)
+        assert client.placed() == []
+
+
+@pytest.mark.parametrize("symbol, limit, sent", [("SPY", 10.01, "10.01"), ("SPY", 180, "180.00"), ("SPY", 1.0, "1.00"), ("SPY", 0.1234, "0.1234"),
+                                                 ("SPY", 0.5, "0.50"), ("SPY", 0.0001, "0.0001"), ("BTC-USD", 80000, "80000.00"),
+                                                 ("BTC-USD", 0.00012345, "0.00012345"), ("BTC-USD", 65432.12345678, "65432.12345678")])
+def test_the_limit_price_sent_is_exactly_the_price_given(tmp_path, symbol, limit, sent):
+    text = wb.order_payload(symbol, 1.0, "t", limit_price=limit)["limit_price"]
+    assert text == sent and float(text) == float(limit) and float(text) > 0
+    v, client = venue(tmp_path)
+    v.submit(symbol, 1.0, "t", limit_price=limit)
+    assert client.placed()[0][2][0]["limit_price"] == sent
+
+
+def test_the_live_cap_still_uses_the_limit_price(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    (tmp_path / "webull_live.json").write_text(json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000,
+                                                           "i_understand_this_trades_real_money": True}))
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
+        v.submit("SPY", 2.0, "t", price=100.0, limit_price=600.0)          # valued at the limit: 1,200 > 1,000
+    assert client.placed() == []
+    v.submit("SPY", 2.0, "t", price=900.0, limit_price=400.0)             # valued at the limit: 800 <= 1,000
+    assert client.placed()[0][2][0]["limit_price"] == "400.00"
+
+
+class _TokenSdk:
+    """Stand-ins for ApiClient and TradeClient. TradeClient writes a token where the SDK would: the directory set with
+    ApiClient.set_token_dir, else $WEBULL_OPENAPI_TOKEN_DIR, else conf/ under the working directory
+    (webull/core/http/initializer/token/token_storage.py:48-86, token_manager.py:96-104)."""
+    def __init__(self):
+        self.seen = {}
+        sdk = self
+
+        class ApiClient:
+            def __init__(self, key, secret, region):
+                self._token_dir = None
+
+            def add_endpoint(self, region, host):
+                pass
+
+            def set_token_dir(self, token_dir):
+                self._token_dir = token_dir
+
+            def get_token_dir(self):
+                return self._token_dir
+
+        class TradeClient:
+            def __init__(self, api):
+                import os
+                from pathlib import Path
+                raw = api.get_token_dir() or os.getenv("WEBULL_OPENAPI_TOKEN_DIR") or "conf"
+                d = Path(raw).expanduser().absolute()
+                sdk.seen["token_dir"] = d
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "token.txt").write_text("the-access-token\n")
+                self.account_v2 = self.order_v3 = None
+
+        self.ApiClient, self.TradeClient = ApiClient, TradeClient
+
+    def install(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=self.ApiClient))
+        monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=self.TradeClient))
+
+
+def test_the_sdks_token_goes_to_a_private_directory_outside_the_repository(tmp_path, monkeypatch):
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    work, home = tmp_path / "work", tmp_path / "home"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("WEBULL_OPENAPI_TOKEN_DIR", raising=False)
+    wb.WebullVenue(KEY, SECRET, environment="sandbox", confirmation_file=tmp_path / "x.json")
+    private = home / ".valedia" / "webull" / "sandbox"
+    assert sdk.seen["token_dir"] == private and (private / "token.txt").is_file()
+    assert (private.stat().st_mode & 0o777) == 0o700
+    assert not (work / "conf").exists() and not list(work.rglob("token.txt"))
+    custom = tmp_path / "tokens" / "mine"
+    custom.mkdir(parents=True, mode=0o755)
+    custom.chmod(0o755)                                                    # an existing directory is tightened to 0700
+    wb.WebullVenue.from_secrets({"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, "WEBULL_ENV": "production"},
+                                confirmation_file=tmp_path / "x.json", token_dir=custom)
+    assert sdk.seen["token_dir"] == custom and (custom.stat().st_mode & 0o777) == 0o700
+    assert not (work / "conf").exists()
+
+
+def test_a_token_directory_inside_the_repository_fails_closed(tmp_path, monkeypatch):
+    sdk = _TokenSdk()
+    sdk.install(monkeypatch)
+    inside = wb.REPO / "conf"
+    existed = inside.exists()
+    with pytest.raises(wb.WebullError, match="outside the repository"):
+        wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json", token_dir=inside)
+    assert "token_dir" not in sdk.seen and inside.exists() == existed
+
+
+@pytest.mark.parametrize("answer", [ServerError("order_not_found"), ServerError(" ORDER_NOT_FOUND "), ServerError("ORDER_NOT_FOUND", 500),
+                                    ServerError("ORDER_NOT_FOUND", 302), ServerError("ORDER_NOT_FOUND", None),
+                                    ConnectionError("transport"), Response({"error_code": "ORDER_NOT_FOUND"}, 500),
+                                    Response({"error_code": "ORDER_NOT_FOUND"}, 201), Response({"error_code": "ORDER_NOT_FOUND"}, 302),
+                                    Response({"error_code": "order_not_found"}, 417), Response({"orders": [], "status": "FILLED"}),
+                                    Response({"orders": [], "status": None}), Response({"error_code": "ORDER_NOT_FOUND"}, 200)])
+def test_with_the_flag_on_only_the_two_exact_answers_mean_no_such_order(tmp_path, answer):
+    if isinstance(answer, ConnectionError):
+        answer = type("TransportError", (Exception,), {"error_code": "ORDER_NOT_FOUND", "error_msg": "x"})()
+    v, _ = status_venue(tmp_path, answer, confirmed_not_found=True)
+    with pytest.raises(wb.WebullError):
+        v.order_status("t")
+    for exact in (ServerError("ORDER_NOT_FOUND", 404), Response({"error_code": "ORDER_NOT_FOUND"}, 404), Response({"orders": []})):
+        assert status_venue(tmp_path, exact, confirmed_not_found=True)[0].order_status("t") is None
+
+
+def test_cash_reports_the_total_only_with_the_currency_webull_attached(tmp_path):
+    entry = {"currency": "HKD", "cash_balance": "780", "settled_cash": "700", "buying_power": "750"}
+    for top in ({}, {"total_asset_currency": ""}, {"total_asset_currency": None}):
+        body = {**top, "total_cash_balance": "100", "account_currency_assets": [entry]}
+        v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=body), confirmation_file=tmp_path / "x.json")
+        assert v.cash() == {"cash": 780.0, "settled_cash": 700.0, "buying_power": 750.0, "currency": "HKD"}
+    body = {"total_cash_balance": "100", "account_currency_assets": [{"currency": "HKD", "settled_cash": "1"}]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance=body), confirmation_file=tmp_path / "x.json")
+    assert v.cash() == {"cash": None, "settled_cash": 1.0, "buying_power": None, "currency": "HKD"}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(balance={"total_cash_balance": "100"}), confirmation_file=tmp_path / "x.json")
+    assert v.cash() == {"cash": None, "settled_cash": None, "buying_power": None, "currency": None}
+
+
+def test_an_open_order_combo_with_an_empty_order_list_raises(tmp_path):
+    page = {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1"), {"client_order_id": "c-2", "combo_type": "NORMAL", "orders": []}]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError, match="unexpected shape"):
+        v.open_orders()
+
+
+def test_a_negative_filled_quantity_is_unreadable(tmp_path):
+    assert status_venue(tmp_path, detail(order("PARTIAL_FILLED", filled_quantity="-0.4")))[0].order_status("t")["filled_units"] is None
+    page = {"data": [detail(order("PARTIAL_FILLED", cid="c-1", filled_quantity="-1"), cid="c-1")]}
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages={None: page}), confirmation_file=tmp_path / "x.json")
+    assert v.open_orders()[0]["filled_units"] is None
