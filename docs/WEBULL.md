@@ -62,9 +62,20 @@ Add to `~/.hermes/secrets/trading.env` (mode 600). Never paste keys anywhere els
 | Event contracts (prediction markets), with depth | the API key only |
 | Stocks and ETFs, live or historical | a separate OpenAPI subscription (Nasdaq Basic for quotes, TotalView for depth), bought on the website under your avatar: **Advanced Quotes**, **OpenAPI Advanced Quotes**. A subscription in the phone app does not count, and only one device may use it at a time |
 
-Limits: most market-data calls allow 60 requests a minute per kind of call in production (30 on the paper side);
-the stock data bought for programs allows 300. The limits for trading calls are on Webull's rate-limits page and
-have not been read into this guide yet.
+Limits, per kind of call and per key (Webull's rate-limits page, read 2026-11-13; the owner's console states 60
+requests a minute for the Trading API):
+
+| Call | Paper side | Live side |
+| --- | --- | --- |
+| Account list | 30 a minute | 10 in 30 seconds |
+| Balance, positions | 30 a minute | 2 in 2 seconds |
+| Order status, open orders, order history | 30 a minute | 2 in 2 seconds |
+| Place, change, cancel an order | 30 a minute | 600 a minute |
+| Most market-data calls | 30 a minute | 60 a minute (300 for stock data bought for programs) |
+
+Going over a limit is answered with HTTP 429 and the request is not processed; Webull warns that doing it repeatedly
+can get the address blocked for a time. The adapter does not pace itself yet (a change is in progress). A normal day
+for the two fund strategies is a few dozen calls.
 
 ## Observed in Webull's test environment (2026-11-13, read-only, the owner's paper key)
 
