@@ -36,11 +36,22 @@ was read: an event row's `symbol` is read as the event symbol.
 Kept per row, where present (a field absent from the row is absent from the output): series_symbol, event_symbol,
 market_symbol, name (from `name`, else `title`), category, tradable_status, fractionable, can_close_early,
 expected_exp_date, latest_exp_date, price_ranges [{start, end, step}], yes_condition. Everything else is dropped, and
-instrument_id above all (it is not printed). Symbols are kept only in their own shape (letters, digits, dots,
-hyphens, underscores, up to 80) and holding no run of a secret, else None; codes (category, tradable_status) only in
-the upper-case code shape, else <withheld>; free text (name, yes_condition) through the gate of webull.py, word by
-word; booleans only as booleans (or the exact words true / false); dates only as a date, a date and time, or an epoch
-number; prices as finite numbers.
+instrument_id above all (it is not printed). Rev 2 (after the blind check: a digits-only, account-number-shaped
+string got through every field that merely matched by shape, and a lenient number reader kept "1_000", non-ASCII
+digits, "1e-400" and negatives):
+
+* a series, event or market symbol is kept only when it starts with an ASCII capital letter, holds only A-Z, 0-9,
+  dots and hyphens, is at most 80 characters and holds no run of a secret; else it is <withheld> and the probe counts
+  it as unreadable;
+* codes (category, tradable_status) only in the upper-case code shape, else <withheld>;
+* free text (name or title, yes_condition) goes through the gate of webull.py word by word, and then every word that
+  holds a run of 7 or more digits is <withheld>;
+* booleans only as booleans (or the exact words true / false), else None;
+* a date field is kept only when it parses as a real calendar date (YYYY-MM-DD) or ISO date and time, from 2020 to
+  2100, or is a whole-number epoch (seconds or milliseconds) in the same range; else the field is dropped;
+* a price-range number (start, end, step) is kept only when its text is plain ASCII digits with at most one point,
+  finite, from 0 to 1 inclusive, and a step only above 0; else that number is dropped (a market with no usable step
+  reports none).
 
 Safety, all reused by import from the accepted adapter webull.py, which is not edited: the client is built as there
 (private token folder, the SDK's loggers silenced, its new empty log file removed: DataClient's file is
@@ -48,16 +59,25 @@ webull_data_sdk.log), every call goes through webull._call (an SDK failure is re
 method through webull._public (only WebullError leaves, after the last check), and every text taken from an answer
 through webull's _clean / _gate and the last check. Pacing: webull._Pacer with Webull's limit for these GETs, 30 in
 60 s in the test environment and 60 in 60 s in production (developer.webull.com rate-limits, as read by the recon),
-of which 80% is used; a 429 is tried again after 2, 4 and 8 s, as the adapter does for reads. Every SDK call made,
-a retry included, counts towards `max_requests`; at the cap no further call is made.
+of which 80% is used; a 429 is tried again after 2, 4 and 8 s, as the adapter does for reads. Every call this module
+makes to the three list methods, a retry included, is paced and counts towards `max_requests`; at the cap no further
+such call is made. Building the session is NOT counted or paced by this module: DataClient's constructor makes the
+SDK's own configuration and token calls (and Webull may ask for a one-time approval in its app then).
 
 The probe refuses to run unless the environment is the test environment: WEBULL_ENV (default sandbox, as
 WebullVenue.from_secrets reads it) must be "sandbox", and the host the reader would use must have "sandbox" as one
 whole dot-separated label (the order step's rule, execution_and_risk/order_step.py _sandbox_host, rewritten here so
-that this read-only module does not import the order machinery; a test checks the two agree). Both are checked before
-the credentials are read and before the first request. At most PROBE_WEBULL_REQUESTS (20) Webull and
-PROBE_KALSHI_REQUESTS (10) Kalshi requests a run (Kalshi through kalshi_data.KalshiData, keyless, its retries counted).
-It writes only the file given by --out, which must be outside the repository.
+that this read-only module does not import the order machinery; a test checks the two agree). Without an `environ`
+the secrets file is loaded first (load_env, as from_secrets does); the environment is then checked before the App Key
+and Secret are taken, before the session is built and before any request: no request is made before that check.
+At most PROBE_WEBULL_REQUESTS (20) Webull and PROBE_KALSHI_REQUESTS (10) Kalshi requests a run (Kalshi through
+kalshi_data.KalshiData, keyless, its retries counted). The market pages are shared by the series asked: each gets
+PROBE_MARKET_BUDGET (15) // the number asked, at least 1 (one series: 15 pages; five: 3 each), and the report says
+per series how many pages it was allowed (webull_page_allowance). The comparison of Webull's and Kalshi's symbols is
+case-sensitive on purpose: both write tickers in capitals, and a symbol that differs only in case is a different
+symbol, shown as a difference, never as a match. It writes only the file given by --out, which must be outside the
+repository. A SystemExit, KeyboardInterrupt or GeneratorExit raised inside an SDK call ends the command with one
+plain line naming only that kind, and exit code 2.
 """
 from __future__ import annotations
 
@@ -66,14 +86,16 @@ import functools
 import json
 import os
 import re
+import math
 import sys
 import time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from valedia_trader.venues import kalshi_data
 from valedia_trader.venues.webull import (HOSTS, NO_SECRETS, READ_RETRY_WAITS, REPO, WITHHELD, RateLimitHit, WebullError, _call,
-                                          _checked_error, _class_name, _clean, _gate, _last_check, _number, _Pacer, _plain,
+                                          _checked_error, _class_name, _clean, _gate, _last_check, _Pacer, _plain,
                                           _private_token_dir, _public, _quiet_sdk_logging, _remove_new_empty_sdk_log, _safe,
                                           _secrets_of, _too_many)
 
@@ -93,15 +115,20 @@ DATA_SDK_LOG_FILE = "webull_data_sdk.log"         # DataClient._init_logger (SDK
 PROBE_WEBULL_REQUESTS = 20
 PROBE_KALSHI_REQUESTS = 10
 PROBE_SERIES_PAGES = 4                            # the whole series list, for the count by category
-PROBE_MARKET_PAGES = 3                            # per asked series; 4 + 1 + 5 x 3 = 20
+PROBE_MARKET_BUDGET = 15                          # market pages shared by the series asked; 4 + 1 + 15 = 20
 PROBE_KALSHI_PAGES = 2                            # per asked series; 5 x 2 = 10
 PROBE_MAX_SERIES = 10
 EXAMPLES = 5
 DEFAULT_SERIES = ("KXNFLGAME", "KXNBAGAME", "KXNHLGAME", "KXNCAAFGAME", "KXNCAAMBGAME")
 
-_EVENT_SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,79}")
+_EVENT_SYMBOL = re.compile(r"[A-Z][A-Z0-9.\-]{0,79}")   # an ASCII capital first; A-Z, 0-9, dots, hyphens; at most 80
 _CODE_WORD = re.compile(r"[A-Z][A-Z_]{0,31}")
-_DATE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?|\d{9,14}")
+_DIGIT_RUN = re.compile(r"[0-9]{7}")              # a word holding 7 or more digits in a row is withheld from free text
+# A date's text before it is parsed: ASCII only, a calendar date first (YYYY-MM-DD), then at most a time part.
+_DATE_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9:.+\-Z]{1,30})?")
+DATE_YEARS = (2020, 2100)                         # inclusive
+EPOCH_SECONDS = (1577836800, 4133980800)          # 2020-01-01T00:00Z to 2101-01-01T00:00Z (exclusive)
+_PLAIN_DECIMAL = re.compile(r"[0-9]{1,20}(?:\.[0-9]{1,20})?")
 _PAGE_KEY = re.compile(r"[!-~]{1,1024}")          # printable ASCII, no whitespace: only ever sent back to Webull
 _HOST = re.compile(r"[A-Za-z0-9.-]{1,253}")
 MAX_PRICE_RANGES = 20
@@ -138,15 +165,32 @@ def _symbol_list(symbols: Any) -> str | None:
         return None
     items = [symbols] if isinstance(symbols, str) else list(symbols) if isinstance(symbols, (list, tuple)) else None
     if not items or len(items) > MAX_SYMBOLS or not all(type(s) is str and _EVENT_SYMBOL.fullmatch(s) for s in items):
-        raise WebullError(f"symbols must be 1 to {MAX_SYMBOLS} event symbols (letters, digits, dots, hyphens, underscores)")
+        raise WebullError(f"symbols must be 1 to {MAX_SYMBOLS} event symbols (a capital letter, then capitals, digits, dots, hyphens)")
     return ",".join(items)
+
+
+def _readable(symbol: Any) -> bool:
+    """Whether a cleaned symbol is a symbol (not WITHHELD, not None)."""
+    return type(symbol) is str and _EVENT_SYMBOL.fullmatch(symbol) is not None
+
+
+def _no_digit_runs(text: str) -> str:
+    """text with every whitespace-separated word holding 7 or more digits in a row replaced by WITHHELD, and
+    neighbouring WITHHELD words made one."""
+    out: list[str] = []
+    for word in text.split():
+        if _DIGIT_RUN.search(word):
+            word = WITHHELD
+        if not (word == WITHHELD and out and out[-1] == WITHHELD):
+            out.append(word)
+    return " ".join(out)
 
 
 def _one_symbol(value: Any, what: str) -> str | None:
     if value is None:
         return None
     if type(value) is not str or not _EVENT_SYMBOL.fullmatch(value):
-        raise WebullError(f"the {what} must be an event symbol (letters, digits, dots, hyphens, underscores, up to 80)")
+        raise WebullError(f"the {what} must be an event symbol (a capital letter, then capitals, digits, dots, hyphens; up to 80)")
     return value
 
 
@@ -340,16 +384,21 @@ class WebullEvents:
                            functools.partial(self._clean_row, symbol_as="market_symbol"), max_pages)
 
     # ---- cleaning
-    def _sym(self, value: Any) -> str | None:
-        return _clean(value, _EVENT_SYMBOL, self._secrets(), self._final)
+    def _sym(self, value: Any) -> str:
+        """A series, event or market symbol in its strict shape (see _EVENT_SYMBOL) holding no run of a secret, else
+        WITHHELD (never a symbol: it does not fit the shape)."""
+        return _clean(value, _EVENT_SYMBOL, self._secrets(), self._final) or WITHHELD
 
     def _code_word(self, value: Any) -> str:
         return _clean(value, _CODE_WORD, self._secrets(), self._final) or WITHHELD
 
     def _text(self, value: Any) -> str:
+        """Free text: every word holding 7 or more digits in a row withheld, then the gate, then the same digit rule
+        again on what the gate kept (neighbouring WITHHELD words become one), then the last check."""
         if type(value) is not str:
             return WITHHELD
-        text = _gate(value, self._secrets(), 160)
+        text = _gate(_no_digit_runs(_plain(value)), self._secrets(), 160)
+        text = _no_digit_runs(text)
         return text if self._final(text) == text else WITHHELD
 
     @staticmethod
@@ -361,19 +410,50 @@ class WebullEvents:
         return None
 
     def _date(self, value: Any) -> str | int | None:
-        if type(value) is int and 0 < value < 10 ** 14:
-            return value
-        return _clean(value, _DATE, self._secrets(), self._final)
+        """The value as given when it is a real calendar date (YYYY-MM-DD) or ISO date and time, parsed, in DATE_YEARS,
+        or a whole-number epoch in seconds or milliseconds in the same range; else None (the field is dropped)."""
+        if type(value) is int:
+            lo, hi = EPOCH_SECONDS
+            return value if lo <= value < hi or lo * 1000 <= value < hi * 1000 else None
+        text = _clean(value, _DATE_TEXT, self._secrets(), self._final)
+        if text is None:
+            return None
+        try:
+            parsed = date.fromisoformat(text) if len(text) == 10 else datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return text if DATE_YEARS[0] <= parsed.year <= DATE_YEARS[1] else None
 
     @staticmethod
     def _price(value: Any) -> float | None:
-        return _number(value) if type(value) in (str, int, float) else None
+        """A price-range number: its text (a str as given, an int or float as repr writes it) plain ASCII digits with
+        at most one point, finite, from 0 to 1 inclusive; else None."""
+        if type(value) is str:
+            text = value
+        elif type(value) in (int, float):
+            text = repr(value)
+        else:
+            return None
+        if not _PLAIN_DECIMAL.fullmatch(text):
+            return None
+        x = float(text)
+        return x if math.isfinite(x) and 0.0 <= x <= 1.0 else None
 
     def _ranges(self, value: Any) -> list[dict] | None:
+        """[{start, end, step}], each number kept only as _price allows and a step only above 0; a number that is not
+        kept is left out of its range."""
         items = [value] if isinstance(value, dict) else value if isinstance(value, list) else None
         if items is None or len(items) > MAX_PRICE_RANGES or not all(isinstance(i, dict) for i in items):
             return None
-        return [{k: self._price(i.get(k)) for k in ("start", "end", "step") if k in i} for i in items]
+        out = []
+        for item in items:
+            kept = {}
+            for k in ("start", "end", "step"):
+                x = self._price(item.get(k)) if k in item else None
+                if x is not None and (k != "step" or x > 0):
+                    kept[k] = x
+            out.append(kept)
+        return out
 
     def _clean_row(self, row: dict, symbol_as: str) -> dict:
         """Only the listed fields that the row has, each in its own shape (see the module notes)."""
@@ -396,8 +476,8 @@ class WebullEvents:
             if key in row:
                 out[key] = self._flag(row[key])
         for key in ("expected_exp_date", "latest_exp_date"):
-            if key in row:
-                out[key] = self._date(row[key])
+            if key in row and (when := self._date(row[key])) is not None:
+                out[key] = when
         if "price_ranges" in row:
             out["price_ranges"] = self._ranges(row["price_ranges"])
         return out
@@ -407,7 +487,8 @@ class WebullEvents:
 
 def compare(webull_symbols: Iterable[str], kalshi_symbols: Iterable[str], examples: int = EXAMPLES) -> dict:
     """Sizes of the intersection and of each difference of two symbol sets, and up to `examples` symbols (sorted, the
-    first ones) from each of the three."""
+    first ones) from each of the three. Case-sensitive on purpose: Webull and Kalshi both write tickers in capitals,
+    and a symbol that differs only in case is another symbol, counted as a difference, never as a match."""
     a, b = set(webull_symbols), set(kalshi_symbols)
     parts = {"both": a & b, "webull_only": a - b, "kalshi_only": b - a}
     return {**{k: len(v) for k, v in parts.items()}, "examples": {k: sorted(v)[:examples] for k, v in parts.items()}}
@@ -464,7 +545,7 @@ def _kalshi_open(kalshi: kalshi_data.KalshiData, series_symbol: str, reader: Web
                 raise kalshi_data.KalshiDataError("no 'markets' list in Kalshi's answer")
             for row in rows:
                 t = reader._sym(row.get("ticker")) if isinstance(row, dict) else None
-                if t is None:
+                if not _readable(t):
                     unreadable += 1
                 else:
                     tickers.add(t)
@@ -493,7 +574,8 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
           token_dir=None) -> tuple[dict, WebullEvents]:
     """The probe's report (values this module built, symbols that passed their shape rule, gated error texts) and the
     reader (for its last check). Refuses (ProbeRefused, no request made) unless the environment is the test
-    environment. With no `environ`, the secrets file is loaded first, as WebullVenue.from_secrets does."""
+    environment. With no `environ`, the secrets file is loaded first, as WebullVenue.from_secrets does; the
+    environment is checked after that and before the App Key and Secret are taken or any request is made."""
     asked = list(series_symbols)
     if not 1 <= len(asked) <= PROBE_MAX_SERIES or len(set(asked)) != len(asked) or not all(
             type(s) is str and _EVENT_SYMBOL.fullmatch(s) for s in asked):
@@ -502,7 +584,7 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
     env = os.environ if environ is None else environ
     if environ is None:
         load_env()
-    environment = _check_environment(env)                             # before the credentials and any request
+    environment = _check_environment(env)                             # before the key is taken and any request
     reader = WebullEvents(secret("WEBULL_APP_KEY", env), secret("WEBULL_APP_SECRET", env), environment=environment,
                           client=client, token_dir=token_dir, max_requests=PROBE_WEBULL_REQUESTS, clock=clock, sleep=sleep,
                           also_withhold=[v for v in ((env.get("WEBULL_ACCOUNT_ID") or "").strip(),) if v])
@@ -515,14 +597,15 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
             c = row.get("category") or "absent"
             by_category[c] = by_category.get(c, 0) + 1
         report["series_listing"] = {"series": len(everything), "pages": everything.pages, "complete": everything.complete,
-                                    "stopped": everything.stopped}
+                                    "stopped": everything.stopped,
+                                    "unreadable_symbols": sum(not _readable(r.get("series_symbol")) for r in everything)}
     except WebullError as exc:
         report["series_listing"] = {"error": _error_text(exc, reader), "complete": False}
     report["series_by_category"] = dict(sorted(by_category.items()))
 
     try:
         found = reader.series(symbols=asked, max_pages=1)
-        listed: set | None = {r.get("series_symbol") for r in found}
+        listed: set | None = {r.get("series_symbol") for r in found if _readable(r.get("series_symbol"))}
         listed_error = None
     except WebullError as exc:
         listed, listed_error = None, _error_text(exc, reader)
@@ -530,20 +613,21 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
     fetch = _capped(kalshi_data.urllib_get if kalshi_fetch is None else kalshi_fetch, PROBE_KALSHI_REQUESTS)
     kalshi = kalshi_data.KalshiData(fetch, sleep=time.sleep if sleep is None else sleep)
     per_series: dict = {}
+    allowance = max(1, PROBE_MARKET_BUDGET // len(asked))             # one series: 15 pages; five: 3 each
     for s in asked:
-        item: dict = {"webull_lists_series": None if listed is None else s in listed}
+        item: dict = {"webull_lists_series": None if listed is None else s in listed, "webull_page_allowance": allowance}
         if listed_error is not None:
             item["webull_series_error"] = listed_error
         webull_symbols: set = set()
         try:
-            rows = reader.markets(series_symbol=s, max_pages=PROBE_MARKET_PAGES)
+            rows = reader.markets(series_symbol=s, max_pages=allowance)
             status: dict = {}
             steps: set = set()
             unreadable = 0
             for m in rows:
                 st = m.get("tradable_status") or "absent"
                 status[st] = status.get(st, 0) + 1
-                if m.get("market_symbol"):
+                if _readable(m.get("market_symbol")):
                     webull_symbols.add(m["market_symbol"])
                 else:
                     unreadable += 1
@@ -568,6 +652,9 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
     report["requests"] = {"webull": reader.requests, "webull_cap": PROBE_WEBULL_REQUESTS,
                           "kalshi": fetch.count, "kalshi_cap": PROBE_KALSHI_REQUESTS}
     return report, reader
+
+
+STOPPING_KINDS = (KeyboardInterrupt, SystemExit, GeneratorExit)
 
 
 def _own(exc: BaseException) -> bool:
@@ -604,6 +691,10 @@ def main(argv: list[str] | None = None, *, environ: dict | None = None, client: 
         else:
             name = _class_name(exc, NO_SECRETS) if _own(exc) else WITHHELD
             print(_last_check(f"not ready: {name}: {_gate(exc, NO_SECRETS, 400)}", ()), file=sys.stderr)
+        return 2
+    except BaseException as exc:                      # SystemExit, KeyboardInterrupt, GeneratorExit from inside a call
+        kind = next((k.__name__ for k in STOPPING_KINDS if isinstance(exc, k)), "a stop")
+        print(f"stopped: {kind} during the probe; nothing was written", file=sys.stderr)
         return 2
     return 0
 
