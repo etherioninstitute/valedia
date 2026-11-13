@@ -1,0 +1,104 @@
+# Prediction, written before any pick is graded: do public pick lists beat the price?
+
+2026-11-13. Roadmap 1.19, at the owner's request. Locked by the commit that adds this file. Nothing below has
+been looked at: no stored pick has been compared with a result, a score or a later price.
+
+## The idea
+
+A Reddit bot posts a "Pick of the Day" thread every day and people write one pick each under it. If some of
+those picks know something the price does not, buying the picked side should pay. The base rate says no:
+public picks, on average, lose the bookmaker's margin. This test decides whether the lists earn any weight.
+
+## What counts as a pick
+
+- A comment in a thread collected by `data_and_fees/pick_lists.py`, not by a moderator, not deleted, read out
+  by the local model under the prompt in force (hash `5c33f300...3e47`) as a pick, with its fields checked
+  against the comment's own words.
+- **Only text first seen before the game began.** The version used is `version_before(comment, game start)`.
+  A comment first seen after the start is not counted. An edit seen after the start is ignored. A collection
+  run that was missed costs picks, never honesty.
+- One pick an author a thread: the first one seen.
+- Markets graded: moneyline, spread, total. Player props, parlays and everything else are counted and
+  reported as not graded.
+- Leagues: NFL, NBA, NHL, college football, men's college basketball.
+- **Matching a pick to a game:** by code. The schedule is The Odds API's free events list for the five
+  leagues. A pick is matched when its team (for a total, both teams or one) names exactly one game that starts
+  after the comment was first seen and before 06:00 US-Eastern on the day after the thread's date. No match,
+  or more than one, means not graded, with the reason counted. The local 27B model may propose a team for a
+  pick the code could not match; a proposal is accepted only when the same uniqueness rule then holds and
+  the team's name, as the schedule spells its city or nickname, stands in the comment as whole words.
+- Before any result is read, the lead reads 40 matched picks beside their comments (as data) and counts wrong
+  matches. More than 2 wrong of 40: the matching rule is repaired and re-checked, still before any result.
+  After the first result is read, the matching rule does not change.
+
+## Question A: can the picks be traded on Kalshi?
+
+This is the question that matters for trading, because the Events account trades Kalshi's contracts.
+
+For each counted moneyline pick: buy one contract of the picked team in Kalshi's single-game series at the
+ask of the first one-minute candle that ends at least 60 seconds after the comment was first seen, if that
+candle ends within 10 minutes and before the game's start, the ask is at most 0.95 and the spread at most
+5 cents. Hold to the result. Fee: Kalshi's taker fee, 0.07 x price x (1 - price) a contract, rounded up to
+the cent on an order of 100. Profit a contract: result minus ask minus fee. A team picked by several authors
+in one thread is bought once, at the first of them.
+
+Three versions, chosen between in development only:
+1. every counted pick;
+2. only a team picked by at least 2 authors in the thread before the start (bought when the second is seen);
+3. only a team picked by at least 3 (bought when the third is seen).
+
+## Question B: do the picks win at the odds they quote?
+
+Information only: it cannot be traded as it stands. For each counted moneyline, spread or total pick whose
+comment gives odds (decimal odds between 1.30 and 4.00 after conversion) and, for a spread or total, a line:
+return a unit staked at the odds as written. Win: odds minus 1. Loss: minus 1. Push: 0. Final scores include
+overtime. Scores come from The Odds API's scores list; the winner must agree with Kalshi's result where
+Kalshi lists the game, and a disagreement means not graded and is counted. A total is graded only when the
+comment's selection says over or under in whole words or as `o`/`u` joined to the line.
+
+## Periods
+
+- **Development:** threads dated 2026-11-13 to 2026-12-13. Here, and only here, the version for Question A
+  is chosen (1, 2 or 3). The choice is committed in a note under this file before any result of a test-period
+  game is read.
+- **Test:** threads dated from 2026-12-14 until the counts below are reached, at the latest 2027-03-31.
+  Scored once.
+
+## Pass lines (test period only)
+
+- **A passes** when at least 150 contracts were bought on at least 20 days, the mean profit a contract is
+  above 0, and the lower end of its 95% interval (whole days resampled) is above 0.
+- **B passes** when at least 300 picks were graded, the mean return a unit is above 0, and the lower end of
+  its 95% interval (whole days resampled) is above 0.
+- Counts not reached by 2027-03-31: not shown, which is a fail.
+
+A pass on A sends the rule to paper trading on the Events account with the same rule, nothing more. A pass
+on B alone gives the lists a place as an input to forecasts, with no orders. A fail gives them no weight:
+the wiki stays as reading matter.
+
+## Stopping early
+
+At the end of development the test may be called off as futile if the picks counted a day make the test
+counts unreachable by the end date, or if every version of A has a mean profit below minus 2 cents a contract
+with an upper interval end below 0. Stopping can only turn a possible pass into a fail.
+
+## What I expect
+
+A fail on both. A: about minus 1 to minus 2 cents a contract (the fee and half the spread), chance of a pass
+about 1 in 15. B: about minus 3% to minus 5% a unit, chance of a pass about 1 in 15. The likeliest way to
+"not shown" is too few picks: the first two threads held about 3 gradable moneylines and 8 gradable single
+picks a day.
+
+## Later, not part of this test
+
+Whether an author's own graded record predicts their later picks (the step that could give single authors a
+weight) needs several hundred graded picks. It gets its own locked prediction then. Records that authors
+claim for themselves are shown as claimed and never used.
+
+## Limits known in advance
+
+- Collection runs only when started: an hourly schedule waits for the owner's yes. Picks first seen after
+  the start are lost.
+- The odds a comment quotes may never have been on offer; Question B takes them as written.
+- One source, one community, one season.
+- Code is checked blind by the same model family that builds it.
