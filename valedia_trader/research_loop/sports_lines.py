@@ -1,6 +1,6 @@
 """Sportsbook lines against Kalshi's price for the same game: research code for the locked prediction in
-docs/research/2026-11-13-sports-lines-prediction.md. It buys history, pairs games and scores them. It has no way to
-trade: nothing here sends anything to an exchange or a broker.
+docs/research/2026-11-13-sports-lines-prediction.md (with its six clarifications). It buys history, pairs games and
+scores them. It has no way to trade: nothing here sends anything to an exchange or a broker.
 
 The steps (each a command of `main`, run in this order; every store lives in one folder, `--store`):
 
@@ -9,35 +9,58 @@ The steps (each a command of `main`, run in this order; every store lives in one
 2. `plan`: no paid call. Per league and US-Eastern day with a Kalshi game: one Odds API snapshot at 16:00 UTC, then
    one 30 minutes before each of the (at most three) biggest waves of starts (`select_waves`). A day whose 16:00
    snapshot is stored is planned exactly; any other day at its upper bound, 1 + 3 snapshots. The test period is always
-   reserved in full; if the budget (the cap less what the ledger has spent, and no more than this month's remaining
-   credits) would be passed, whole days are dropped from the end of the development period, and the plan says so.
+   reserved in full, for all five leagues whatever `--leagues` names (`reserved_for_test`); if the budget (the cap
+   less what the ledger has spent, and no more than this month's remaining credits) would be passed, whole days are
+   dropped from the end of the development period, and the plan says so (`left_for_dev`).
 3. `fetch-odds`: buys the plan, day by day from the start, every call through the credit ledger (`CreditLedger`,
-   its own sqlite file). A snapshot already stored is never bought again. Test-period snapshots are refused until a
-   choice is stored (`choose`).
-4. `pair`: a Kalshi event and an Odds API event are one game when the league, both teams and the US-Eastern date
-   agree. Code first (`names_match`, then a code table learned from the code's own pairs); what code cannot settle is
-   offered to the injected resolver (by default the local model, `LocalModelResolver`), whose proposal is kept only if
-   the date and both teams then pass the checks. Every proposal is logged; accepted ones are listed by `resolved`.
-5. `kalshi-candles`: one-minute candles of both contracts of each paired game, only for the minute that ends at or
-   before the game's wave snapshot and the hour before it.
+   its own sqlite file, one process at a time). It begins with the free sports call, which refreshes the month's
+   remaining figure and confirms what calls left pending by a crash really used. Each HTTP attempt is the ledger's
+   own: both caps checked before it, a pending row written before it and completed after it with that attempt's
+   headers, at most 3 attempts a snapshot. The run stops (exit code 3) after an answer without usage headers, or when
+   a call costs other than expected (the book list is not cut; the lead decides). A snapshot already stored, or whose
+   answer the ledger already holds, is never bought again. Test-period snapshots are refused until a choice is stored.
+4. `pair`: a Kalshi event and an Odds API game are one game only when (a) both team names match by `names_match`
+   (one strict rule that honours qualifying words in both directions) and each Kalshi name matches only one team of
+   the league in the odds data, (b) the game starts within six hours before Kalshi's expected end of the game and not
+   after it, on the same US-Eastern date, and (c) no other game satisfies (a) and (b) for the event and no other
+   event satisfies them for the game. Anything else is left out as `ambiguous` or `no_match`. What code leaves out is
+   offered to the injected resolver (by default the local model, `LocalModelResolver`); a proposal is kept only if it
+   passes the same three checks, so it can never pair what the checks refuse. Every proposal is logged.
+5. `kalshi-candles`: one-minute candles of both contracts of each paired game, only for the hour that ends at the
+   minute of the game's wave snapshot. A window that came back empty is asked once more on a later run.
 6. `evaluate --period dev`: both questions of the prediction for each margin and each version of the books'
-   probability. `choose` stores the one choice; `evaluate --period test` then runs once with it and stores its result.
+   probability. `choose` stores the one choice; `evaluate --period test` then runs once with it, only when every
+   planned test snapshot is stored, pairing has run on them and candles are stored for every paired game.
 
-At the moment of a game (its wave snapshot's own reported time): the books' probability uses only that snapshot;
-Kalshi's bid and ask come from the candle of the minute that ends at or before that time, and candles after it, or
-after the market's close, are never read.
+The choice and the test result are also appended, with the sha256 of the three store files, to `scoring.log` beside
+the stores; `choose` and `evaluate --period test` refuse when that file already holds a choice or a test result,
+whatever the stores say. This guards against a slip, not against a person: someone who deletes `scoring.log` (or
+copies the stores without it) can score again. The outside check is the lead's commit of the choice under the
+prediction before any test-period snapshot is bought.
+
+At the moment of a game (its wave snapshot's own reported time): start times, which form the waves, come from the
+day's 16:00 UTC snapshot, also for a wave whose snapshot falls before 16:00 UTC; the books' probability uses only the
+wave's own snapshot; Kalshi's bid and ask come from the last candle that ends at or before that time, within the hour
+before it, and candles after it, or after the market's close, are never read. A wave snapshot reported more than ten
+minutes before the time asked for is not used: its games are left out as `stale_snapshot`.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
 import unicodedata
 import urllib.request
+import zlib
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterable, Sequence
@@ -49,10 +72,11 @@ from valedia_trader.research_loop import REPO
 from valedia_trader.venues import kalshi_history as kh
 from valedia_trader.venues import odds_api as oa
 
-__all__ = ["LEAGUES", "BOOKS", "PERIODS", "MARGINS", "VERSIONS", "CreditLedger", "CreditCapError", "Refused",
-           "LinesStore", "select_waves", "all_waves", "eastern_date", "first_snapshot_time", "paid_snapshot", "buy",
-           "make_plan", "fetch_odds", "names_match", "pair_games", "LocalModelResolver", "kalshi_fee",
-           "book_probabilities", "books_p", "quote_at", "collect_games", "evaluate_games", "main"]
+__all__ = ["LEAGUES", "BOOKS", "PERIODS", "MARGINS", "VERSIONS", "CreditLedger", "CreditCapError", "LedgerStop",
+           "LedgerBusy", "Refused", "LinesStore", "select_waves", "all_waves", "eastern_date", "first_snapshot_time",
+           "paid_snapshot", "refresh_usage", "buy", "make_plan", "fetch_odds", "names_match", "pair_games",
+           "LocalModelResolver", "kalshi_fee", "book_probabilities", "books_p", "quote_at", "collect_games",
+           "evaluate_games", "test_readiness", "main"]
 
 UTC = timezone.utc
 ET = ZoneInfo("America/New_York")
@@ -71,18 +95,33 @@ FIRST_HOUR_UTC = 16
 WAVE_SPAN = timedelta(minutes=90)
 WAVE_LEAD = timedelta(minutes=30)
 MAX_WAVES = 3
+STALE = timedelta(minutes=10)          # clarification 5
+PAIR_WINDOW = timedelta(hours=6)       # clarification 6
 HISTORY_CAP = 9000
 MONTHLY_CAP = 20000
 FREE_MONTHLY_CAP = 500
+MAX_ATTEMPTS = 3                       # HTTP attempts for one snapshot in one run
+RETRY_STATUS = (429, 500, 502, 503, 504)
 SNAPSHOT_RULE = "historical_odds:h2h:%d_books" % len(BOOKS)
 SEED = 20261113
 REPS = 2000
 RESOLVER_URL = "http://127.0.0.1:1235/v1"
 RESOLVER_MODEL = "qwen/qwen3.8-27b"
+SCORING_LOG = "scoring.log"
+STORE_FILES = ("lines.sqlite", "kalshi.sqlite", "credits.sqlite")
 
 
 class CreditCapError(RuntimeError):
     """A paid call refused before it was made: it would pass the cap or the month's credits."""
+
+
+class LedgerStop(RuntimeError):
+    """The run stops: the ledger saw a charge it cannot count safely (an answer without usage headers, or a cost
+    other than the one expected). The ledger row of that call says what was seen; the lead decides what to do."""
+
+
+class LedgerBusy(RuntimeError):
+    """Another process holds the credit ledger."""
 
 
 class Refused(RuntimeError):
@@ -145,13 +184,26 @@ def day_games(first: dict, day: date) -> list[dict]:
 
 # ---------------------------------------------------------------- the credit ledger
 
+_UNCERTAIN = "('pending', 'unanswered', 'no_headers')"
+_SPENT = ("COALESCE(SUM(CASE WHEN status = 'not_sent' THEN 0 WHEN charged IS NULL AND status IN %s THEN expected "
+          "ELSE COALESCE(charged, 0) END), 0)" % _UNCERTAIN)
+
+
 class CreditLedger:
-    """Every Odds API call, before and after. Before: its cost (by the documented rule, or the cost last charged for
-    that rule if the two differed) is checked against the cap of the run (everything this ledger has spent with that
-    key) and against the month (the monthly cap less the ledger's spend this UTC month, and no more than the last
-    `x-requests-remaining` header said). After: the three usage headers are stored, and a charge different from the
-    expected cost is an event and becomes the cost of that rule from then on. A call that fails without headers is
-    counted at its expected cost. Parameters are stored without the key."""
+    """Every Odds API attempt, before and after. Before: its cost (by the documented rule, or the cost last charged
+    for that rule if the two differed) is checked against the cap of the run (everything this ledger has spent with
+    that key) and against the month (the monthly cap less the ledger's spend this UTC month, and no more than the last
+    `x-requests-remaining` header said, less what is still uncertain since), and a `pending` row is written with that
+    cost. After: the row is completed with that attempt's three usage headers and its status:
+
+    - `done` (an answer with headers; the answer itself is stored in the row, so it is never bought twice),
+    - `http_error` (an error answer with headers), `not_sent` (nothing was sent: no charge),
+    - `unanswered` (sent, no answer came back) and `no_headers` (an answer without usage headers; the run stops),
+      both counted at their expected cost until `reconcile` confirms the real use from a later call's headers,
+    - `confirmed` (an uncertain row settled by `reconcile`).
+
+    A row left `pending` by a crash is counted at its expected cost in the same way. Parameters are stored without
+    the key. Rows written before rev 2 (no status) count what they charged."""
 
     def __init__(self, path: str | Path, monthly_cap: int = MONTHLY_CAP, free_monthly_cap: int = FREE_MONTHLY_CAP,
                  clock: Callable[[], datetime] = _system_clock):
@@ -164,35 +216,49 @@ class CreditLedger:
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, key TEXT, rule TEXT,
                 path TEXT, params TEXT, expected INTEGER, charged INTEGER, remaining INTEGER, used INTEGER,
-                last INTEGER, ok INTEGER, error TEXT);
+                last INTEGER, ok INTEGER, error TEXT, status TEXT, request_key TEXT, body BLOB);
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, kind TEXT, detail TEXT);
             CREATE TABLE IF NOT EXISTS costs (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, rule TEXT, cost INTEGER);
         """)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(calls)")}
+        for col, kind in (("status", "TEXT"), ("request_key", "TEXT"), ("body", "BLOB")):
+            if col not in have:                       # a ledger written before rev 2
+                self.db.execute("ALTER TABLE calls ADD COLUMN %s %s" % (col, kind))
         self.db.commit()
 
+    # what has been spent
     def expected_cost(self, rule: str, rule_cost: int) -> int:
         row = self.db.execute("SELECT cost FROM costs WHERE rule = ? ORDER BY id DESC LIMIT 1", (rule,)).fetchone()
         return int(row["cost"]) if row else int(rule_cost)
 
     def spent(self, key: str = "paid") -> int:
-        return int(self.db.execute("SELECT COALESCE(SUM(charged), 0) FROM calls WHERE key = ?", (key,)).fetchone()[0])
+        return int(self.db.execute("SELECT %s FROM calls WHERE key = ?" % _SPENT, (key,)).fetchone()[0])
 
     def month_spent(self, key: str = "paid") -> int:
         month = self.clock().astimezone(UTC).strftime("%Y-%m")
-        return int(self.db.execute("SELECT COALESCE(SUM(charged), 0) FROM calls WHERE key = ? AND substr(at, 1, 7) = ?",
+        return int(self.db.execute("SELECT %s FROM calls WHERE key = ? AND substr(at, 1, 7) = ?" % _SPENT,
                                    (key, month)).fetchone()[0])
 
+    def _last_remaining_row(self, key: str):
+        return self.db.execute("SELECT id, remaining FROM calls WHERE key = ? AND remaining IS NOT NULL ORDER BY id "
+                               "DESC LIMIT 1", (key,)).fetchone()
+
     def last_remaining(self, key: str = "paid") -> int | None:
-        row = self.db.execute("SELECT remaining FROM calls WHERE key = ? AND remaining IS NOT NULL ORDER BY id DESC "
-                              "LIMIT 1", (key,)).fetchone()
+        row = self._last_remaining_row(key)
         return None if row is None else int(row["remaining"])
+
+    def _uncertain_after(self, key: str, row_id: int) -> int:
+        return int(self.db.execute("SELECT COALESCE(SUM(expected), 0) FROM calls WHERE key = ? AND id > ? AND "
+                                   "charged IS NULL AND status IN %s" % _UNCERTAIN, (key, row_id)).fetchone()[0])
 
     def month_remaining(self, key: str = "paid") -> int:
         left = self.caps[key] - self.month_spent(key)
-        header = self.last_remaining(key)
-        return left if header is None else min(left, header)
+        row = self._last_remaining_row(key)
+        return left if row is None else min(left, int(row["remaining"]) - self._uncertain_after(key, row["id"]))
 
     def check(self, key: str, cost: int, cap: int) -> None:
+        if cost <= 0:
+            return
         spent = self.spent(key)
         if spent + cost > cap:
             raise CreditCapError("refused: %d spent + %d would pass the cap of %d" % (spent, cost, cap))
@@ -200,62 +266,184 @@ class CreditLedger:
         if month + cost > self.caps[key]:
             raise CreditCapError("refused: %d used this month by the ledger + %d would pass the monthly cap of %d"
                                  % (month, cost, self.caps[key]))
-        header = self.last_remaining(key)
-        if header is not None and cost > header:
-            raise CreditCapError("refused: %d credits needed, the last x-requests-remaining said %d" % (cost, header))
+        row = self._last_remaining_row(key)
+        if row is not None:
+            open_ = self._uncertain_after(key, row["id"])
+            if cost > int(row["remaining"]) - open_:
+                raise CreditCapError("refused: %d credits needed, the last x-requests-remaining said %d%s"
+                                     % (cost, row["remaining"], " (%d of them uncertain since)" % open_ if open_ else ""))
 
-    def call(self, key: str, rule: str, rule_cost: int, cap: int, path: str, params: dict, do: Callable[[], Any],
-             client: oa.OddsApiClient, empty: Callable[[Any], bool] = lambda body: False) -> Any:
+    # one attempt
+    def attempt(self, key: str, rule: str, rule_cost: int, cap: int, path: str, params: dict, send: Callable[[], Any],
+                client: oa.OddsApiClient, request_key: str | None = None,
+                empty: Callable[[Any], bool] = lambda body: False, keep: Callable[[Any], Any] | None = None) -> Any:
+        """One HTTP attempt (`send` must not retry): caps checked, a pending row written, the attempt made, the row
+        completed. Raises the client's error after recording it, and `LedgerStop` (after `keep(answer)`) when the
+        answer has no usage headers or costs other than expected."""
         expected = self.expected_cost(rule, rule_cost)
         self.check(key, expected, cap)
         clean = {k: v for k, v in params.items() if k.lower() not in ("apikey", "api_key", "x-api-key")}
+        cur = self.db.execute("INSERT INTO calls (at, key, rule, path, params, expected, ok, status, request_key) "
+                              "VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?)",
+                              (_iso(self.clock()), key, rule, path, _canon(clean), expected, request_key))
+        rid = cur.lastrowid
+        self.db.commit()
         try:
-            body = do()
-        except Exception as exc:
+            body = send()
+        except oa.OddsApiError as exc:
             usage = dict(client.last_usage)
-            charged = usage["last"] if usage["last"] is not None else expected
-            self._record(key, rule, path, clean, expected, charged, usage, False, type(exc).__name__)
+            if not getattr(client, "attempts_sent", 1):
+                self._finish(rid, "not_sent", 0, usage, error=str(exc))
+            elif exc.status is None:
+                self._finish(rid, "unanswered", None, usage, error=str(exc))
+            elif usage["last"] is None:
+                self._finish(rid, "no_headers", None, usage, error="HTTP %s" % exc.status)
+                raise LedgerStop("an answer (HTTP %s) to %s came without usage headers, so its cost cannot be seen: "
+                                 "the run stops. Row %d of the ledger says so and counts %d credits until a later "
+                                 "run's free call confirms the use" % (exc.status, path, rid, expected)) from exc
+            else:
+                self._finish(rid, "http_error", usage["last"], usage, error="HTTP %s" % exc.status)
             raise
         usage = dict(client.last_usage)
-        charged = usage["last"] if usage["last"] is not None else expected
-        self._record(key, rule, path, clean, expected, charged, usage, True, None)
-        free_empty = charged == 0 and empty(body)
-        if usage["last"] is not None and charged != expected and not free_empty:
+        blob = zlib.compress(_canon(body).encode())
+        if usage["last"] is None:
+            self._finish(rid, "no_headers", None, usage, body=blob, ok=True)
+            if keep is not None:
+                keep(body)
+            raise LedgerStop("the answer to %s came without usage headers, so its cost cannot be seen: the run "
+                             "stops. Row %d of the ledger says so and counts %d credits until a later run's free call "
+                             "confirms the use" % (path, rid, expected))
+        charged = int(usage["last"])
+        self._finish(rid, "done", charged, usage, body=blob, ok=True)
+        if charged != expected and not (charged == 0 and empty(body)):
             now = _iso(self.clock())
             self.db.execute("INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
                             (now, "cost_differs", _canon({"rule": rule, "expected": expected, "charged": charged})))
             self.db.execute("INSERT INTO costs (at, rule, cost) VALUES (?, ?, ?)", (now, rule, charged))
             self.db.commit()
+            if keep is not None:
+                keep(body)
+            raise LedgerStop("a call by the rule %s cost %d credits, not the %d expected (headers: remaining %s, used "
+                             "%s, last %s): the run stops before the next call. The book list is not cut; the lead "
+                             "decides. The ledger now expects %d a call, so `plan` shows the new cost and running "
+                             "fetch-odds again buys at it" % (rule, charged, expected, usage["remaining"],
+                                                              usage["used"], usage["last"], charged))
         return body
 
-    def _record(self, key, rule, path, params, expected, charged, usage, ok, error) -> None:
-        self.db.execute("INSERT INTO calls (at, key, rule, path, params, expected, charged, remaining, used, last, ok, "
-                        "error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (_iso(self.clock()), key, rule, path, _canon(params), expected, charged, usage["remaining"],
-                         usage["used"], usage["last"], 1 if ok else 0, error))
+    def _finish(self, rid: int, status: str, charged: int | None, usage: dict, body: bytes | None = None,
+                ok: bool = False, error: str | None = None) -> None:
+        self.db.execute("UPDATE calls SET status = ?, charged = ?, remaining = ?, used = ?, last = ?, ok = ?, "
+                        "error = ?, body = ? WHERE id = ?",
+                        (status, charged, usage.get("remaining"), usage.get("used"), usage.get("last"), 1 if ok else 0,
+                         error, body, rid))
         self.db.commit()
 
+    def stored_answer(self, request_key: str) -> Any:
+        """The answer of an earlier call with the same request, if the ledger holds one."""
+        row = self.db.execute("SELECT body FROM calls WHERE request_key = ? AND body IS NOT NULL ORDER BY id DESC "
+                              "LIMIT 1", (request_key,)).fetchone()
+        return None if row is None else json.loads(zlib.decompress(row["body"]))
+
+    def reconcile(self, key: str = "paid") -> dict:
+        """Settle uncertain rows (pending, unanswered, no headers) from `x-requests-used`: what the account used
+        between the last header before them and the latest header after them, less what the calls with headers in
+        between were charged, is what they cost. Set in row order, each at most its expected cost, any rest on the
+        last (an event says so). Nothing is settled across a monthly reset or without a header on both sides."""
+        rows = self.db.execute("SELECT id, expected FROM calls WHERE key = ? AND charged IS NULL AND status IN %s "
+                               "ORDER BY id" % _UNCERTAIN, (key,)).fetchall()
+        if not rows:
+            return {"confirmed": 0}
+        before = self.db.execute("SELECT id, used, at FROM calls WHERE key = ? AND used IS NOT NULL AND id < ? "
+                                 "ORDER BY id DESC LIMIT 1", (key, rows[0]["id"])).fetchone()
+        after = self.db.execute("SELECT id, used, at FROM calls WHERE key = ? AND used IS NOT NULL AND id > ? "
+                                "ORDER BY id DESC LIMIT 1", (key, rows[0]["id"])).fetchone()
+        if before is None or after is None:
+            return {"confirmed": 0, "open": len(rows), "note": "no usage header on both sides of the open rows"}
+        if before["at"][:7] != after["at"][:7] or after["used"] < before["used"]:
+            return {"confirmed": 0, "open": len(rows), "note": "a monthly reset lies between the headers"}
+        known = int(self.db.execute("SELECT COALESCE(SUM(last), 0) FROM calls WHERE key = ? AND id > ? AND id <= ? "
+                                    "AND last IS NOT NULL", (key, before["id"], after["id"])).fetchone()[0])
+        rest = int(after["used"]) - int(before["used"]) - known
+        todo = [r for r in rows if r["id"] < after["id"]]
+        now = _iso(self.clock())
+        if rest < 0 or not todo:
+            return {"confirmed": 0, "open": len(rows), "note": "the headers do not settle the open rows"}
+        for i, r in enumerate(todo):
+            cost = min(int(r["expected"]), rest) if i < len(todo) - 1 else rest
+            rest -= cost
+            self.db.execute("UPDATE calls SET status = 'confirmed', charged = ?, error = COALESCE(error || '; ', '') "
+                            "|| 'confirmed from x-requests-used' WHERE id = ?", (cost, r["id"]))
+        self.db.execute("INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
+                        (now, "confirmed", _canon({"rows": [r["id"] for r in todo], "from_used": [before["used"],
+                                                                                                 after["used"]]})))
+        self.db.commit()
+        return {"confirmed": len(todo), "open": len(rows) - len(todo)}
+
+    @contextlib.contextmanager
+    def lock(self):
+        """One process at a time per ledger (an exclusive lock on `<ledger>.lock`)."""
+        f = open(self.path.with_name(self.path.name + ".lock"), "a")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            raise LedgerBusy("another process holds the credit ledger %s; this run stops without a call"
+                             % self.path) from None
+        try:
+            yield self
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+
     def calls(self) -> list[dict]:
-        return [dict(r, params=json.loads(r["params"])) for r in self.db.execute("SELECT * FROM calls ORDER BY id")]
+        return [dict({k: r[k] for k in r.keys() if k != "body"}, params=json.loads(r["params"]))
+                for r in self.db.execute("SELECT * FROM calls ORDER BY id")]
 
     def events(self) -> list[dict]:
         return [dict(r) for r in self.db.execute("SELECT * FROM events ORDER BY id")]
 
 
-def paid_snapshot(client: oa.OddsApiClient, ledger: CreditLedger, sport: str, when: str, cap: int) -> dict:
-    """One historical h2h snapshot of the ten books, with the paid key, through the ledger."""
-    params = {"date": when, "markets": "h2h", "bookmakers": ",".join(BOOKS)}
-    return ledger.call("paid", SNAPSHOT_RULE, oa.historical_cost("h2h", BOOKS), cap,
-                       "/v4/historical/sports/%s/odds" % sport, params,
-                       lambda: client.historical_odds(sport, when, BOOKS, markets="h2h", key="paid"), client,
-                       empty=lambda body: not (isinstance(body, dict) and body.get("data")))
+def _snapshot_request(sport: str, when: str) -> tuple[str, dict]:
+    return "/v4/historical/sports/%s/odds" % sport, {"date": when, "markets": "h2h", "bookmakers": ",".join(BOOKS)}
+
+
+def _request_key(path: str, params: dict) -> str:
+    return _canon({"path": path, "params": params})
+
+
+def paid_snapshot(client: oa.OddsApiClient, ledger: CreditLedger, sport: str, when: str, cap: int,
+                  keep: Callable[[Any], Any] | None = None) -> dict:
+    """One historical h2h snapshot of the ten books, with the paid key, through the ledger: at most 3 attempts, each
+    its own ledger row with the caps checked before it; a retry only after a 429 or 5xx answer or no answer."""
+    path, params = _snapshot_request(sport, when)
+    sleep = getattr(client, "_sleep", lambda s: None)
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return ledger.attempt("paid", SNAPSHOT_RULE, oa.historical_cost("h2h", BOOKS), cap, path, params,
+                                  lambda: client.historical_odds(sport, when, BOOKS, markets="h2h", key="paid",
+                                                                 retries=0),
+                                  client, request_key=_request_key(path, params),
+                                  empty=lambda body: not (isinstance(body, dict) and body.get("data")), keep=keep)
+        except oa.OddsApiError as exc:
+            again = getattr(client, "attempts_sent", 0) > 0 and (exc.status is None or exc.status in RETRY_STATUS)
+            if not again or attempt == MAX_ATTEMPTS - 1:
+                raise
+            sleep(getattr(client, "backoff", 1.0) * 2 ** attempt)
+    raise AssertionError("unreachable")
+
+
+def refresh_usage(client: oa.OddsApiClient, ledger: CreditLedger, key: str = "paid") -> dict:
+    """The free sports call (`/v4/sports`, no credit) through the ledger: its headers give the month's remaining
+    figure afresh and settle what calls left pending or unanswered really used (`CreditLedger.reconcile`)."""
+    ledger.attempt(key, "sports", 0, 0, "/v4/sports", {}, lambda: client.sports_with(key=key, retries=0), client)
+    return ledger.reconcile(key)
 
 
 # ---------------------------------------------------------------- the store
 
 class LinesStore:
-    """sqlite: snapshots (keyed by league and the time asked), pairs, the pairing log, the choice and the test result.
-    Nothing fetched or decided is overwritten; a different copy of a snapshot goes to `differences`."""
+    """sqlite: snapshots (keyed by league and the time asked), pairs, the pairing log and runs, the choice and the
+    test result. Nothing fetched or decided is overwritten; a different copy of a snapshot goes to `differences`."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -273,6 +461,8 @@ class LinesStore:
                 proposal TEXT, accepted INTEGER, reason TEXT, source TEXT, at TEXT);
             CREATE TABLE IF NOT EXISTS unpaired (id INTEGER PRIMARY KEY AUTOINCREMENT, kalshi_event TEXT, league TEXT,
                 day TEXT, reason TEXT, at TEXT);
+            CREATE TABLE IF NOT EXISTS pair_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, league TEXT, period TEXT,
+                snapshots_seen INTEGER, at TEXT);
             CREATE TABLE IF NOT EXISTS choice (id INTEGER PRIMARY KEY CHECK (id = 1), margin REAL, version TEXT,
                 at TEXT);
             CREATE TABLE IF NOT EXISTS results (period TEXT PRIMARY KEY, raw TEXT, at TEXT);
@@ -290,6 +480,10 @@ class LinesStore:
     def snapshots(self, league: str | None = None) -> list[dict]:
         q = "SELECT * FROM snapshots" + (" WHERE league = ?" if league else "") + " ORDER BY requested_at"
         return [dict(r, raw=json.loads(r["raw"])) for r in self.db.execute(q, (league,) if league else ())]
+
+    def count_snapshots(self, league: str, start: date, end: date) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM snapshots WHERE league = ? AND day >= ? AND day <= ?",
+                                   (league, start.isoformat(), end.isoformat())).fetchone()[0])
 
     def put_snapshot(self, league: str, requested_at: str, kind: str, day: date, body: dict) -> str:
         raw = _canon(body)
@@ -333,6 +527,15 @@ class LinesStore:
             out[r["kalshi_event"]] = r["reason"]
         return out
 
+    def put_pair_run(self, league: str, period: str, snapshots_seen: int, at: str) -> None:
+        self.db.execute("INSERT INTO pair_runs (league, period, snapshots_seen, at) VALUES (?, ?, ?, ?)",
+                        (league, period, snapshots_seen, at))
+
+    def pair_run(self, league: str, period: str) -> dict | None:
+        r = self.db.execute("SELECT * FROM pair_runs WHERE league = ? AND period = ? ORDER BY id DESC LIMIT 1",
+                            (league, period)).fetchone()
+        return None if r is None else dict(r)
+
     def accepted_proposals(self) -> list[dict]:
         rows = self.db.execute("SELECT p.kalshi_event, p.odds_event_id, p.source, p.home_team, p.away_team, "
                                "p.home_ticker, p.away_ticker, p.day, p.created_at FROM pairs p "
@@ -359,6 +562,43 @@ class LinesStore:
             raise Refused("the %s period has already been scored" % period)
         self.db.execute("INSERT INTO results VALUES (?, ?, ?)", (period, _canon(result), at))
         self.db.commit()
+
+
+# ---------------------------------------------------------------- scoring.log beside the stores
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scoring_entries(root: Path) -> list[dict]:
+    """The lines of `scoring.log` (none when the file is missing). A line that is not JSON refuses everything that
+    reads the log: the file is only ever appended to."""
+    path = Path(root) / SCORING_LOG
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            raise Refused("%s has a line that is not JSON; it is never rewritten, look at it" % path) from None
+    return out
+
+
+def append_scoring(root: Path, kind: str, payload: dict, clock: Callable[[], datetime]) -> None:
+    root = Path(root)
+    entry = {"kind": kind, "at": _iso(clock()),
+             "sha256": {name: _sha256(root / name) for name in STORE_FILES if (root / name).exists()}, **payload}
+    with open(root / SCORING_LOG, "a") as f:
+        f.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # ---------------------------------------------------------------- Kalshi events from the store
@@ -407,20 +647,29 @@ def _day_snapshots(lstore: LinesStore, league: str, day: date) -> tuple[list[dic
     return out, True
 
 
+def _period_leagues(name: str, leagues: Sequence[str]) -> tuple[str, ...]:
+    """The test period is always all five leagues; the development period the leagues named."""
+    return tuple(LEAGUES) if name == "test" else tuple(leagues)
+
+
 def make_plan(lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger, cap: int,
               leagues: Sequence[str] = tuple(LEAGUES), periods: dict | None = None,
               days_map: dict | None = None) -> dict:
     """What the rule would buy for each period, and its cost, without any call. See the module text for the drop.
-    `days_map` ({(period, league): {day: events}}) saves re-reading the Kalshi store."""
+    The test period is planned (and reserved) for all five leagues whatever `leagues` names. `days_map`
+    ({(period, league): {day: events}}) saves re-reading the Kalshi store."""
     periods = periods or PERIODS
-    days_map = days_map if days_map is not None else {
-        (n, lg): league_days(kstore, lg, *periods[n]) for n in periods for lg in leagues}
+    days_map = dict(days_map or {})
+    for n in periods:
+        for lg in _period_leagues(n, leagues):
+            if (n, lg) not in days_map:
+                days_map[(n, lg)] = league_days(kstore, lg, *periods[n])
     unit = ledger.expected_cost(SNAPSHOT_RULE, oa.historical_cost("h2h", BOOKS))
     out: dict[str, Any] = {}
     by_date: dict[str, dict[date, int]] = {}
     for name, (start, end) in periods.items():
         snaps, dates = [], {}
-        for league in leagues:
+        for league in _period_leagues(name, leagues):
             for day in sorted(days_map[(name, league)]):
                 needed, exact = _day_snapshots(lstore, league, day)
                 for s in needed:
@@ -456,12 +705,13 @@ def make_plan(lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger,
     if not fits:
         notes.append("the test period alone (%d credits, upper bound) does not fit the budget of %d; it is never cut"
                      % (reserved, budget))
-    unlisted = ["%s:%s" % (n, lg) for n in periods for lg in leagues
+    unlisted = ["%s:%s" % (n, lg) for n in periods for lg in _period_leagues(n, leagues)
                 if not kstore.listed_any(LEAGUES[lg][1], *periods[n])]
     if unlisted:
         notes.append("Kalshi markets not listed for %s: run `kalshi-markets --period all` first, or this plan is "
                      "short" % ", ".join(unlisted))
     out.update({"cap": cap, "spent": spent, "month_remaining": month, "budget": budget, "unit_cost": unit,
+                "reserved_for_test": reserved, "left_for_dev": budget - reserved,
                 "total_cost": total, "fits": fits, "unlisted": unlisted,
                 "note": "; ".join(notes) or "everything fits"})
     return out
@@ -469,14 +719,23 @@ def make_plan(lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger,
 
 def buy(client: oa.OddsApiClient, ledger: CreditLedger, lstore: LinesStore, league: str, when: datetime, kind: str,
         day: date, cap: int, clock: Callable[[], datetime]) -> dict | None:
-    """One snapshot of a league at `when` (stored if new; never bought again). None for a time not yet past."""
+    """One snapshot of a league at `when` (stored if new; never bought again, also when only the ledger holds its
+    answer). None for a time not yet past."""
     at = _iso(when)
     have = lstore.snapshot(league, at)
     if have is not None:
         return have
     if when > clock():
         return None
-    body = paid_snapshot(client, ledger, LEAGUES[league][0], at, cap)
+    sport = LEAGUES[league][0]
+
+    def keep(body):
+        if isinstance(body, dict) and "timestamp" in body:
+            lstore.put_snapshot(league, at, kind, day, body)
+
+    body = ledger.stored_answer(_request_key(*_snapshot_request(sport, at)))
+    if body is None:
+        body = paid_snapshot(client, ledger, sport, at, cap, keep=keep)
     if not isinstance(body, dict) or "timestamp" not in body:
         raise oa.OddsApiError("historical odds answer without a timestamp for %s at %s" % (league, at))
     lstore.put_snapshot(league, at, kind, day, body)
@@ -486,60 +745,80 @@ def buy(client: oa.OddsApiClient, ledger: CreditLedger, lstore: LinesStore, leag
 def fetch_odds(period: str, client: oa.OddsApiClient, ledger: CreditLedger, lstore: LinesStore,
                kstore: kh.HistoryStore, cap: int, clock: Callable[[], datetime], leagues: Sequence[str] = tuple(LEAGUES),
                periods: dict | None = None, progress: Callable[[str], Any] = lambda s: None) -> dict:
-    """Buy the plan of one period, day by day from its start. Development days are re-planned before each day and the
-    run stops at the first dropped day; a refusal by the ledger stops it too (and is reported)."""
+    """Buy the plan of one period, day by day from its start, holding the ledger's lock. It begins with the free
+    sports call. Development days are re-planned before each day and the run stops at the first dropped day; a cap
+    refusal stops it too, and so do a ledger stop and a failed call (`stopped_by` says which)."""
     periods = periods or PERIODS
     if period == "test" and lstore.choice() is None:
         raise Refused("test-period snapshots are refused until a choice is stored (`choose`)")
-    if period == "dev" and "test" in periods:
-        missing = [lg for lg in leagues if not kstore.listed_any(LEAGUES[lg][1], *periods["test"])]
-        if missing:
-            raise Refused("the test period's Kalshi markets are not listed for %s, so its credits cannot be reserved: "
-                          "run `kalshi-markets --period all` first" % ", ".join(missing))
-    start, end = periods[period]
-    days_map = {(n, lg): league_days(kstore, lg, *periods[n]) for n in periods for lg in leagues}
-    days = sorted({d for league in leagues for d in days_map[(period, league)]})
-    out = {"period": period, "days": len(days), "bought": 0, "already_stored": 0, "not_yet": 0, "stopped": None,
-           "spent_before": ledger.spent("paid")}
-    for day in days:
-        if period == "dev":
-            plan = make_plan(lstore, kstore, ledger, cap, leagues, periods, days_map)
-            if day.isoformat() in plan["dev"]["dropped_dates"]:
-                out["stopped"] = "day %s and later dropped by the plan: %s" % (day, plan["note"])
-                break
+    with ledger.lock():
+        if period == "dev" and "test" in periods:
+            missing = [lg for lg in LEAGUES if not kstore.listed_any(LEAGUES[lg][1], *periods["test"])]
+            if missing:
+                raise Refused("the test period's Kalshi markets are not listed for %s, so its credits cannot be "
+                              "reserved: run `kalshi-markets --period all` first" % ", ".join(missing))
+        days_map = {(n, lg): league_days(kstore, lg, *periods[n]) for n in periods
+                    for lg in set(_period_leagues(n, leagues)) | set(leagues)}
+        days = sorted({d for league in leagues for d in days_map[(period, league)]})
+        out: dict[str, Any] = {"period": period, "days": len(days), "bought": 0, "already_stored": 0, "not_yet": 0,
+                               "stopped": None, "stopped_by": None}
         try:
-            for league in leagues:
-                if day not in days_map[(period, league)]:
-                    continue
-                at = first_snapshot_time(day)
-                had = lstore.snapshot(league, _iso(at)) is not None
-                first = buy(client, ledger, lstore, league, at, "first", day, cap, clock)
-                if first is None:
-                    out["not_yet"] += 1
-                    continue
-                out["already_stored" if had else "bought"] += 1
-                starts = [_parse(e["commence_time"]) for e in day_games(first["raw"], day)]
-                for when, _ in select_waves(starts):
-                    had = lstore.snapshot(league, _iso(when)) is not None
-                    got = buy(client, ledger, lstore, league, when, "wave", day, cap, clock)
-                    if got is None:
+            out["usage"] = refresh_usage(client, ledger)
+        except (LedgerStop, oa.OddsApiError, CreditCapError) as exc:
+            out.update(stopped="the free sports call: %s" % exc, stopped_by="ledger" if isinstance(exc, LedgerStop)
+                       else "error", spent_before=ledger.spent("paid"), spent_after=ledger.spent("paid"))
+            return out
+        out["spent_before"] = ledger.spent("paid")
+        for day in days:
+            if period == "dev":
+                plan = make_plan(lstore, kstore, ledger, cap, leagues, periods, days_map)
+                if day.isoformat() in plan["dev"]["dropped_dates"]:
+                    out.update(stopped="day %s and later dropped by the plan: %s" % (day, plan["note"]),
+                               stopped_by="plan")
+                    break
+            try:
+                for league in leagues:
+                    if day not in days_map[(period, league)]:
+                        continue
+                    at = first_snapshot_time(day)
+                    had = lstore.snapshot(league, _iso(at)) is not None
+                    first = buy(client, ledger, lstore, league, at, "first", day, cap, clock)
+                    if first is None:
                         out["not_yet"] += 1
-                    else:
-                        out["already_stored" if had else "bought"] += 1
-        except CreditCapError as exc:
-            out["stopped"] = str(exc)
-            break
-        progress("%s: %s done, %d bought so far" % (period, day, out["bought"]))
-    out["spent_after"] = ledger.spent("paid")
+                        continue
+                    out["already_stored" if had else "bought"] += 1
+                    starts = [_parse(e["commence_time"]) for e in day_games(first["raw"], day)]
+                    for when, _ in select_waves(starts):
+                        had = lstore.snapshot(league, _iso(when)) is not None
+                        got = buy(client, ledger, lstore, league, when, "wave", day, cap, clock)
+                        if got is None:
+                            out["not_yet"] += 1
+                        else:
+                            out["already_stored" if had else "bought"] += 1
+            except CreditCapError as exc:
+                out.update(stopped=str(exc), stopped_by="cap")
+                break
+            except LedgerStop as exc:
+                out.update(stopped=str(exc), stopped_by="ledger")
+                break
+            except oa.OddsApiError as exc:
+                out.update(stopped="a call failed after its attempts: %s" % exc, stopped_by="error")
+                break
+            progress("%s: %s done, %d bought so far" % (period, day, out["bought"]))
+        out["spent_after"] = ledger.spent("paid")
     return out
 
 
 # ---------------------------------------------------------------- team names
 
-_TOKEN_MAP = {"state": "st", "saint": "st", "and": "", "the": "", "of": ""}
-QUALIFIERS = {"st", "am", "tech", "oh", "fl", "college", "university", "u", "intl", "international", "central",
-              "eastern", "western", "northern", "southern", "north", "south", "east", "west", "northeast",
-              "northwest", "southeast", "southwest", "upstate"}
+_TOKEN_MAP = {"state": "st", "saint": "st", "university": "u", "univ": "u", "mt": "mount", "ft": "fort", "and": "",
+              "the": "", "of": ""}
+QUALIFIERS = frozenset({
+    "st", "tech", "am", "at", "atlantic", "valley", "city", "international", "intl", "college", "u", "central",
+    "eastern", "western", "northern", "southern", "north", "south", "east", "west", "northeast", "northwest",
+    "southeast", "southwest", "northeastern", "northwestern", "southeastern", "southwestern", "upstate", "gulf",
+    "coast", "christian", "baptist", "poly", "wesleyan", "mount", "fort", "pacific", "commonwealth", "military",
+    "methodist", "lutheran"})                  # bracketed parts ("(OH)") are compared on their own
 
 
 def _tokens(text: str) -> list[str]:
@@ -549,80 +828,67 @@ def _tokens(text: str) -> list[str]:
     return [t for t in (_TOKEN_MAP.get(t, t) for t in s.split()) if t]
 
 
-def _split(name: str) -> tuple[list[str], list[str]]:
-    """Tokens outside and inside parentheses: "Miami (OH) RedHawks" -> (["miami", "redhawks"], ["oh"])."""
+def _parts(name: str) -> tuple[list[tuple[str, bool]], list[str]]:
+    """The tokens outside brackets, each with a flag for a qualifying word (one of QUALIFIERS, or the first word after
+    a hyphen: "Texas A&M-Corpus Christi"), and the bracketed tokens, sorted: "Miami (OH) RedHawks" ->
+    ([("miami", False), ("redhawks", False)], ["oh"])."""
     inner = " ".join(re.findall(r"\(([^)]*)\)", name or ""))
     outer = re.sub(r"\([^)]*\)", " ", name or "")
-    return _tokens(outer), _tokens(inner)
+    head, *tail = re.split(r"[-–]", outer, maxsplit=1)
+    out = [(t, t in QUALIFIERS) for t in _tokens(head)]
+    out += [(t, i == 0 or t in QUALIFIERS) for i, t in enumerate(_tokens(tail[0]) if tail else [])]
+    return out, sorted(_tokens(inner))
 
 
-def _cover(k: list[str], o: list[str]) -> set[int] | None:
-    """Indexes of `o` that the tokens of `k` account for (equal tokens, then acronyms of consecutive tokens, then
-    single letters as initials), or None when a token of `k` is not accounted for."""
+@lru_cache(maxsize=None)
+def names_match(kalshi_name: str, odds_name: str) -> bool:
+    """Code's one team-name rule. Kalshi's short name must account for the start of the Odds API's full name, word by
+    word (the same word; an acronym of consecutive words such as NY; a single letter as the initial of an ordinary
+    word, "Los Angeles L"), and what is left of the full name (the nickname) must hold no qualifying word. A
+    qualifying word ("State", "Tech", "A&M", a compass word, "Atlantic", "Valley", "City", a word after a hyphen...)
+    on Kalshi's side must appear as itself in the full name, and bracketed parts must be the same on both sides. So a
+    name with a qualifying word never matches the same name without it, in either direction: "Florida" is neither
+    "Florida State" nor "Florida Atlantic", "Kansas St." is not "Kansas", "Michigan" is not "Central Michigan"."""
+    k, kin = _parts(kalshi_name)
+    o, oin = _parts(odds_name)
+    if not k or not o or kin != oin:
+        return False
+    words = [t for t, _ in o]
+    qual = [q for _, q in o]
     used: set[int] = set()
-    rest = []
-    for t in k:
-        i = next((i for i, x in enumerate(o) if x == t and i not in used), None)
-        if i is None:
-            rest.append(t)
-        else:
+    rest: list[str] = []
+    for t, q in k:
+        i = next((i for i, x in enumerate(words) if x == t and i not in used), None)
+        if i is not None:
             used.add(i)
+        elif q:
+            return False
+        else:
+            rest.append(t)
     for t in rest:
-        hit = None
+        hit: set[int] | None = None
         if len(t) >= 2:
-            for i in range(len(o)):
-                for n in range(2, len(o) - i + 1):
-                    span = range(i, i + n)
-                    if "".join(o[j][0] for j in span) == t and any(j not in used for j in span):
-                        hit = set(span)
+            for i in range(len(words)):
+                for n in range(2, len(words) - i + 1):
+                    span = set(range(i, i + n))
+                    if not span & used and "".join(words[j][0] for j in range(i, i + n)) == t:
+                        hit = span
                         break
                 if hit:
                     break
         else:
-            i = next((i for i, x in enumerate(o) if x.startswith(t) and i not in used), None)
+            i = next((i for i, x in enumerate(words) if x.startswith(t) and i not in used and not qual[i]), None)
             hit = None if i is None else {i}
         if not hit:
-            return None
+            return False
         used |= hit
-    return used
+    n = len(used)
+    return used == set(range(n)) and not any(qual[n:])
 
 
-def names_match(kalshi_name: str, odds_name: str) -> bool:
-    """Code's team-name rule. Every word of Kalshi's short name must be accounted for in the Odds API's full name
-    (the same word; an acronym such as NY or NYI; a single letter as an initial, "Los Angeles L"); a bracketed part
-    must agree when both names have one; and a word left over in the full name must not be one that names a
-    different school ("State", "Tech", "A&M", a direction...), so "Florida" is not "Florida State"."""
-    k, kp = _split(kalshi_name)
-    o, op = _split(odds_name)
-    if not k or not o:
-        return False
-    if op and kp != op:
-        return False
-    used = _cover(k, o)
-    if used is None:
-        return False
-    return not any(o[i] in QUALIFIERS for i in range(len(o)) if i not in used)
-
-
-def _abbreviates(t: str, word: str) -> bool:
-    """A Kalshi abbreviation of at least three letters of one word: its first letter, then the rest in order."""
-    if len(t) < 3 or not word or t[0] != word[0]:
-        return False
-    it = iter(word[1:])
-    return all(c in it for c in t[1:])
-
-
-def loosely_names(kalshi_name: str, odds_name: str) -> bool:
-    """The resolver's check: some word of the Kalshi name is a word, an acronym, an initial or an abbreviation
-    ("Phx", "Dnvr") of the Odds API name, and the strict rule's qualifier test still holds."""
-    k, kp = _split(kalshi_name)
-    o, op = _split(odds_name)
-    if not k or not o or (op and kp and kp != op):
-        return False
-    for t in k:
-        if t in o or (len(t) >= 2 and _cover([t], o) is not None) or any(_abbreviates(t, w) for w in o):
-            return True
-    return False
+def _name_key(name: str) -> tuple:
+    k, kin = _parts(name)
+    return tuple(t for t, _ in k), tuple(kin)
 
 
 # ---------------------------------------------------------------- pairing
@@ -643,21 +909,24 @@ def odds_games(lstore: LinesStore, league: str, start: date, end: date) -> list[
     return sorted(seen.values(), key=lambda g: (g["commence"], g["id"]))
 
 
-def _assign(kevent: dict, game: dict, table: dict[str, str]) -> list[tuple[dict, dict]]:
-    """Every way to put the two Kalshi teams on the game's home and away team by name or by the code table:
-    a list of (home team, away team) pairs."""
-    teams = kevent["teams"]
+def _in_window(k: dict, g: dict) -> bool:
+    """(b): the game starts within six hours before Kalshi's expected end of the game, and not after it."""
+    if not k.get("expected") or not g.get("commence"):
+        return False
+    try:
+        end, start = _parse(k["expected"]), _parse(g["commence"])
+    except (TypeError, ValueError):
+        return False
+    return end - PAIR_WINDOW <= start <= end
+
+
+def _ways(k: dict, g: dict, ok: Callable[[str, str], bool]) -> list[tuple[dict, dict]]:
+    """Every way to put the two Kalshi teams on the game's home and away team by `ok(kalshi name, full name)`."""
+    teams = k.get("teams") or []
     if len(teams) != 2:
         return []
-
-    def ok(t, name):
-        return names_match(t["name"], name) or table.get(t["code"]) == name
-
-    out = []
-    for h, a in ((teams[0], teams[1]), (teams[1], teams[0])):
-        if ok(h, game["home"]) and ok(a, game["away"]):
-            out.append((h, a))
-    return out
+    return [(h, a) for h, a in ((teams[0], teams[1]), (teams[1], teams[0]))
+            if ok(h["name"], g["home"] or "") and ok(a["name"], g["away"] or "")]
 
 
 def _pair(kevent: dict, game: dict, home: dict, away: dict, source: str) -> dict:
@@ -667,94 +936,130 @@ def _pair(kevent: dict, game: dict, home: dict, away: dict, source: str) -> dict
 
 
 def pair_games(kevents: Sequence[dict], games: Sequence[dict], resolver: Callable | None = None,
-               taken_odds: Iterable[str] = (), taken_kalshi: Iterable[str] = ()) -> tuple[list[dict], dict, list]:
-    """Pairs of one league: (pairs, unpaired Kalshi events counted by reason, the resolver's proposals). An event or
-    game already paired (`taken_*`) is never paired again."""
+               taken_odds: Iterable[str] = (), taken_kalshi: Iterable[str] = (),
+               reasons: dict | None = None) -> tuple[list[dict], dict, list]:
+    """Pairs: (pairs, unpaired Kalshi events counted by reason, the resolver's proposals). The three checks of the
+    module text decide; `games` is all the odds data of the period (its team names form each league's name list for
+    check (a)). An event or game already paired (`taken_*`) is never paired again, and still counts in check (c).
+    `reasons`, when given, receives each unpaired event's reason (`ambiguous` or `no_match`)."""
     taken_o, taken_k = set(taken_odds), set(taken_kalshi)
+    by_day: dict[tuple, list[dict]] = {}
+    league_names: dict[str, dict[tuple, str]] = {}
+    for g in games:
+        by_day.setdefault((g["league"], g["day"]), []).append(g)
+        for full in (g["home"], g["away"]):
+            if full:
+                league_names.setdefault(g["league"], {}).setdefault(_name_key(full), full)
+    hits: dict[tuple, int] = {}
+
+    def unique(league: str, kname: str) -> bool:
+        if (league, kname) not in hits:
+            hits[(league, kname)] = sum(names_match(kname, full) for full in league_names.get(league, {}).values())
+        return hits[(league, kname)] == 1
+
+    fits: dict[str, list[tuple[dict, list]]] = {}          # event -> [(game, ways)] passing (a) and (b)
+    claims: dict[str, list[str]] = {}                      # game id -> events passing (a) and (b) for it
+    near_misses: set[str] = set()                          # events whose names match a game but not uniquely
+    for k in kevents:
+        for g in by_day.get((k["league"], k["day"]), []):
+            if not _in_window(k, g):
+                continue
+            if _ways(k, g, names_match):
+                near_misses.add(k["event"])
+            ways = _ways(k, g, lambda kn, full, lg=k["league"]: names_match(kn, full) and unique(lg, kn))
+            if ways:
+                fits.setdefault(k["event"], []).append((g, ways))
+                claims.setdefault(g["id"], []).append(k["event"])
+
+    def verdict(k: dict, g: dict) -> tuple[str | None, tuple | None]:
+        """None and (home, away) when the pair passes (a), (b) and (c) and neither side is taken; else why not."""
+        mine = [w for x, w in fits.get(k["event"], []) if x["id"] == g["id"]]
+        if not mine:
+            return "the team names do not match by the rule", None
+        if len(fits[k["event"]]) > 1:
+            return "another game that day also matches", None
+        if len(mine[0]) != 1:
+            return "the teams fit the game both ways", None
+        if claims.get(g["id"]) != [k["event"]]:
+            return "another Kalshi event also matches this game", None
+        if g["id"] in taken_o or k["event"] in taken_k:
+            return "already paired", None
+        return None, mine[0][0]
+
+    def check_proposal(k: dict, g: dict | None, proposal: dict) -> tuple[str | None, tuple | None]:
+        if g is None or g["id"] in taken_o:
+            return "unknown or already paired game", None
+        if g["league"] != k["league"]:
+            return "league differs", None
+        if g["day"] != k["day"]:
+            return "date differs (%s against %s)" % (g["day"], k["day"]), None
+        if not _in_window(k, g):
+            return ("start %s is not within six hours before Kalshi's expected end %s"
+                    % (g["commence"], k.get("expected") or "(none)")), None
+        teams = proposal.get("teams")
+        knames = {t["name"]: t for t in k["teams"]}
+        if not isinstance(teams, dict) or set(teams) != set(knames) or \
+                sorted(str(v) for v in teams.values()) != sorted([g["home"], g["away"]]):
+            return "teams do not agree with the game", None
+        for kname, full in sorted(teams.items()):
+            if not names_match(kname, full):
+                return "team name %r does not match %r by the rule" % (kname, full), None
+            if not unique(k["league"], kname):
+                return "team name %r matches more than one team of the league" % kname, None
+        why, hw = verdict(k, g)
+        if why is None and {hw[0]["name"]: g["home"], hw[1]["name"]: g["away"]} != teams:
+            return "teams do not agree with the game", None
+        return why, hw
+
     pairs: list[dict] = []
     left: dict[str, str] = {}
-    open_k = [k for k in kevents if k["event"] not in taken_k]
-    for k in open_k:
-        if len(k["teams"]) != 2:
-            left[k["event"]] = "kalshi_event_incomplete"
-    open_k = [k for k in open_k if k["event"] not in left]
-
-    def free_games():
-        return [g for g in games if g["id"] not in taken_o]
-
-    def code_round(table: dict[str, str]) -> None:
-        cands = {k["event"]: [g for g in free_games() if g["day"] == k["day"] and _assign(k, g, table)]
-                 for k in open_k if k["event"] not in done}
-        groups: dict[tuple, list[dict]] = {}
-        for k in open_k:
-            if k["event"] in cands and cands[k["event"]]:
-                groups.setdefault(tuple(sorted(g["id"] for g in cands[k["event"]])), []).append(k)
-        for ids, ks in groups.items():
-            if len(ids) != len(ks):
-                continue                                   # more games than events, or the other way: ambiguous
-            gs = sorted((g for g in free_games() if g["id"] in ids), key=lambda g: (g["commence"], g["id"]))
-            ks = sorted(ks, key=lambda k: (k["expected"], k["event"]))
-            if len(gs) != len(ks):
+    for k in kevents:
+        if k["event"] in taken_k:
+            continue
+        cands = fits.get(k["event"], [])
+        if len(cands) == 1:
+            why, hw = verdict(k, cands[0][0])
+            if why is None:
+                pairs.append(_pair(k, cands[0][0], hw[0], hw[1], "code"))
+                taken_o.add(cands[0][0]["id"])
+                taken_k.add(k["event"])
                 continue
-            chosen = []
-            for k, g in zip(ks, gs):
-                ways = _assign(k, g, table)
-                if len(ways) != 1:
-                    break
-                chosen.append((k, g, ways[0]))
-            else:
-                for k, g, (h, a) in chosen:
-                    pairs.append(_pair(k, g, h, a, "code"))
-                    taken_o.add(g["id"])
-                    done.add(k["event"])
-
-    done: set[str] = set()
-    code_round({})
-    learned: dict[str, set[str]] = {}
-    for p in pairs:
-        k = next(x for x in open_k if x["event"] == p["kalshi_event"])
-        for t in k["teams"]:
-            learned.setdefault(t["code"], set()).add(p["home_team"] if t["ticker"] == p["home_ticker"]
-                                                     else p["away_team"])
-    table = {c: next(iter(v)) for c, v in learned.items() if len(v) == 1}
-    code_round(table)
+        left[k["event"]] = "ambiguous" if cands or k["event"] in near_misses else "no_match"
 
     log: list[dict] = []
-    for k in open_k:
-        if k["event"] in done:
-            continue
-        near = [g for g in free_games() if abs((g["day"] - k["day"]).days) <= 1]
-        exact = [g for g in near if g["day"] == k["day"] and _assign(k, g, table)]
-        why = "ambiguous" if len(exact) > 1 or any(len(_assign(k, g, table)) > 1 for g in exact) else "no_match"
-        if resolver is None or not near:
-            left[k["event"]] = why
-            continue
+    if resolver is not None:
         source = "resolver:%s" % getattr(resolver, "source", getattr(resolver, "__name__", "resolver"))
-        try:
-            proposal = resolver(k, near)
-        except Exception as exc:                                  # a broken resolver leaves the game out
-            left[k["event"]] = "resolver_error"
-            log.append({"kalshi_event": k["event"], "proposal": {"error": type(exc).__name__}, "accepted": False,
-                        "reason": "resolver error", "source": source})
-            continue
-        if not proposal or not proposal.get("odds_event_id"):
-            left[k["event"]] = why
-            log.append({"kalshi_event": k["event"], "proposal": proposal, "accepted": False,
-                        "reason": "no proposal", "source": source})
-            continue
-        verdict, assign = _check_proposal(k, proposal, free_games(), table)
-        log.append({"kalshi_event": k["event"], "proposal": proposal, "accepted": verdict is None,
-                    "reason": verdict or "accepted", "source": source})
-        if verdict is not None:
-            left[k["event"]] = "resolver_refused"
-            continue
-        g, h, a = assign
-        pairs.append(_pair(k, g, h, a, source))
-        taken_o.add(g["id"])
-        done.add(k["event"])
+        for k in kevents:
+            if k["event"] not in left:
+                continue
+            near = [g for g in games if g["league"] == k["league"] and g["id"] not in taken_o
+                    and abs((g["day"] - k["day"]).days) <= 1]
+            if not near:
+                continue
+            try:
+                proposal = resolver(k, near)
+            except Exception as exc:                              # a broken resolver leaves the game out
+                log.append({"kalshi_event": k["event"], "proposal": {"error": type(exc).__name__}, "accepted": False,
+                            "reason": "resolver error", "source": source})
+                continue
+            if not isinstance(proposal, dict) or not proposal.get("odds_event_id"):
+                log.append({"kalshi_event": k["event"], "proposal": proposal, "accepted": False,
+                            "reason": "no proposal", "source": source})
+                continue
+            g = next((x for x in games if x["id"] == proposal.get("odds_event_id")), None)
+            why, hw = check_proposal(k, g, proposal)
+            log.append({"kalshi_event": k["event"], "proposal": proposal, "accepted": why is None,
+                        "reason": why or "accepted", "source": source})
+            if why is None:
+                pairs.append(_pair(k, g, hw[0], hw[1], source))
+                taken_o.add(g["id"])
+                taken_k.add(k["event"])
+                del left[k["event"]]
     counts: dict[str, int] = {}
     for reason in left.values():
         counts[reason] = counts.get(reason, 0) + 1
+    if reasons is not None:
+        reasons.update(left)
     _check_unique(pairs)
     return pairs, counts, log
 
@@ -762,32 +1067,6 @@ def pair_games(kevents: Sequence[dict], games: Sequence[dict], resolver: Callabl
 def _check_unique(pairs: list[dict]) -> None:
     if len({p["odds_event_id"] for p in pairs}) != len(pairs) or len({p["kalshi_event"] for p in pairs}) != len(pairs):
         raise AssertionError("a game was paired twice")
-
-
-def _check_proposal(k: dict, proposal: dict, free: list[dict], table: dict[str, str]):
-    """None and the assignment when a resolver's proposal passes the checks, else the reason it is refused."""
-    g = next((x for x in free if x["id"] == proposal.get("odds_event_id")), None)
-    if g is None:
-        return "unknown or already paired game", None
-    if g["league"] != k["league"]:
-        return "league differs", None
-    if g["day"] != k["day"]:
-        return "date differs (%s against %s)" % (g["day"], k["day"]), None
-    teams = proposal.get("teams")
-    if not isinstance(teams, dict) or len(k["teams"]) != 2:
-        return "teams missing", None
-    names = {t["name"]: t for t in k["teams"]}
-    if set(teams) != set(names) or sorted(teams.values()) != sorted([g["home"], g["away"]]):
-        return "teams do not agree with the game", None
-    home = next(names[n] for n, v in teams.items() if v == g["home"])
-    away = next(names[n] for n, v in teams.items() if v == g["away"])
-    for t, full in ((home, g["home"]), (away, g["away"])):
-        known = table.get(t["code"])
-        if known is not None and known != full:
-            return "team %s is %s by the code table" % (t["code"], known), None
-        if known is None and not loosely_names(t["name"], full):
-            return "team name %r does not resemble %r" % (t["name"], full), None
-    return None, (g, home, away)
 
 
 class LocalModelResolver:
@@ -834,51 +1113,31 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
 
 
 def run_pairing(lstore: LinesStore, kstore: kh.HistoryStore, start: date, end: date, resolver: Callable | None,
-                leagues: Sequence[str], clock: Callable[[], datetime]) -> dict:
+                leagues: Sequence[str], clock: Callable[[], datetime], period: str | None = None) -> dict:
+    """Pair each league of the period and record the run (with how many of the period's snapshots it saw)."""
     at = _iso(clock())
     out: dict[str, Any] = {}
     for league in leagues:
         have = lstore.pairs(league)
         kev = kalshi_events(kstore, league, start, end)
         games = odds_games(lstore, league, start, end)
+        reasons: dict[str, str] = {}
         pairs, left, log = pair_games(kev, games, resolver, taken_odds={p["odds_event_id"] for p in have},
-                                      taken_kalshi={p["kalshi_event"] for p in have})
+                                      taken_kalshi={p["kalshi_event"] for p in have}, reasons=reasons)
         for p in pairs:
             lstore.put_pair(p, at)
         for rec in log:
             lstore.log_proposal(rec, at)
-        paired_now = {p["kalshi_event"] for p in pairs} | {p["kalshi_event"] for p in have}
-        reasons = {}
-        if left:
-            reasons = _reasons(kev, games, paired_now, pairs, log, left)
-        for event, reason in reasons.items():
-            day = next(k["day"] for k in kev if k["event"] == event)
-            lstore.put_unpaired(event, league, day, reason, at)
+        days = {k["event"]: k["day"] for k in kev}
+        for event, reason in sorted(reasons.items()):
+            lstore.put_unpaired(event, league, days[event], reason, at)
+        if period is not None:
+            lstore.put_pair_run(league, period, lstore.count_snapshots(league, start, end), at)
         lstore.db.commit()
         out[league] = {"kalshi_events": len(kev), "odds_games": len(games), "paired_before": len(have),
                        "paired_now": len(pairs), "left_out": left,
-                       "by_resolver": sum(p["source"] != "code" for p in pairs)}
-    return out
-
-
-def _reasons(kev, games, paired, pairs, log, counts) -> dict[str, str]:
-    """The reason of each still-unpaired event (pair_games counts them; this recovers them one by one)."""
-    out = {}
-    refused = {r["kalshi_event"] for r in log if not r["accepted"] and r["reason"] not in ("no proposal",
-                                                                                           "resolver error")}
-    errored = {r["kalshi_event"] for r in log if r["reason"] == "resolver error"}
-    for k in kev:
-        if k["event"] in paired:
-            continue
-        if len(k["teams"]) != 2:
-            out[k["event"]] = "kalshi_event_incomplete"
-        elif k["event"] in errored:
-            out[k["event"]] = "resolver_error"
-        elif k["event"] in refused:
-            out[k["event"]] = "resolver_refused"
-        else:
-            same_day = [g for g in games if g["day"] == k["day"] and _assign(k, g, {})]
-            out[k["event"]] = "ambiguous" if len(same_day) > 1 else "no_match"
+                       "by_resolver": sum(p["source"] != "code" for p in pairs),
+                       "proposals_refused": sum(not r["accepted"] for r in log)}
     return out
 
 
@@ -979,6 +1238,8 @@ def collect_games(lstore: LinesStore, kstore: kh.HistoryStore, start: date, end:
 
 
 def _game(kstore: kh.HistoryStore, league: str, k: dict, p: dict, first: dict | None, by_at: dict) -> dict:
+    """One paired game at its moment. Start times (and so the wave) come from the day's 16:00 UTC snapshot; the
+    books' prices only from the wave's own snapshot; Kalshi's quotes only from candles at or before its time."""
     g = {"league": league, "day": k["day"], "kalshi_event": k["event"], "odds_event_id": p["odds_event_id"],
          "home_team": p["home_team"], "away_team": p["away_team"], "moment": None, "books": {}, "home": None,
          "away": None, "y": None, "reason": None}
@@ -1000,6 +1261,9 @@ def _game(kstore: kh.HistoryStore, league: str, k: dict, p: dict, first: dict | 
     wave = by_at.get(_iso(wave_at))
     if wave is None:
         g["reason"] = "no_wave_snapshot"
+        return g
+    if not wave.get("timestamp") or _parse(wave["timestamp"]) < wave_at - STALE:
+        g["reason"] = "stale_snapshot"                     # clarification 5
         return g
     wev = next((e for e in wave["raw"].get("data") or [] if e.get("id") == p["odds_event_id"]), None)
     if wev is None:
@@ -1127,9 +1391,14 @@ def evaluate_games(games: Sequence[dict], margins: Sequence[float] = MARGINS, ve
 
 # ---------------------------------------------------------------- Kalshi fetches driven by the pairs
 
+def _moment_window(moment: str) -> tuple[int, int]:
+    end = int(_parse(moment).timestamp()) // 60 * 60
+    return end - QUOTE_HOUR, end
+
+
 def candle_moments(lstore: LinesStore, kstore: kh.HistoryStore, start: date, end: date,
                    leagues: Sequence[str]) -> dict[str, list[float]]:
-    """For each contract of each paired game with a wave snapshot: the moment its quote is needed."""
+    """For each contract of each paired game with a usable wave snapshot: the moment its quote is needed."""
     out: dict[str, list[float]] = {}
     games, _ = collect_games(lstore, kstore, start, end, leagues)
     pairs = {p["kalshi_event"]: p for p in lstore.pairs()}
@@ -1144,17 +1413,55 @@ def candle_moments(lstore: LinesStore, kstore: kh.HistoryStore, start: date, end
 
 def fetch_kalshi_candles(client: kh.HistoryClient, lstore: LinesStore, kstore: kh.HistoryStore, start: date,
                          end: date, leagues: Sequence[str]) -> dict:
+    keys = ("windows_fetched", "windows_cached", "windows_empty", "candles_stored")
     moments = candle_moments(lstore, kstore, start, end, leagues)
+    total = dict({"markets": len(moments)}, **{k: 0 for k in keys})
     if not moments:
-        return {"markets": 0, "windows_fetched": 0, "windows_cached": 0, "candles_stored": 0}
+        return total
     cutoff = kh.cutoff_ts(client, kstore)
     rows = {m["ticker"]: m for m in kstore.markets()}
-    total = {"markets": len(moments), "windows_fetched": 0, "windows_cached": 0, "candles_stored": 0}
     for ticker, ms in sorted(moments.items()):
         got = kh.fetch_candles(client, kstore, rows[ticker], ms, cutoff)
-        for k in ("windows_fetched", "windows_cached", "candles_stored"):
-            total[k] += got[k]
+        for k in keys:
+            total[k] += got.get(k, 0)
     return total
+
+
+# ---------------------------------------------------------------- the test period's guards
+
+def test_readiness(lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger, periods: dict) -> list[str]:
+    """What is missing before the test period may be scored (empty when nothing is): every planned test snapshot of
+    the five leagues stored, pairing run on all of them, and candles stored for both contracts of every paired game
+    with a moment (a window that came back empty counts only once asked twice)."""
+    start, end = periods["test"]
+    plan = make_plan(lstore, kstore, ledger, 10 ** 9, tuple(LEAGUES), {"test": periods["test"]})
+    out = []
+    if plan["unlisted"]:
+        out.append("Kalshi markets are not listed for %s (`kalshi-markets --period test`)" % ", ".join(plan["unlisted"]))
+    need = [s for s in plan["test"]["snapshots"] if s["cost"] > 0]
+    if need:
+        out.append("%d planned test snapshots are not stored, the first %s %s %s (`fetch-odds --period test`)"
+                   % (len(need), need[0]["league"], need[0]["day"], need[0]["at"] or "(a wave, time not yet known)"))
+    if out:
+        return out
+    stale = [lg for lg in LEAGUES if (run := lstore.pair_run(lg, "test")) is None
+             or run["snapshots_seen"] != lstore.count_snapshots(lg, start, end)]
+    if stale:
+        return ["pairing has not run on every stored test snapshot of %s (`pair --period test`)" % ", ".join(stale)]
+    games, _ = collect_games(lstore, kstore, start, end, tuple(LEAGUES))
+    pairs = {p["kalshi_event"]: p for p in lstore.pairs()}
+    lacking = []
+    for g in games:
+        if g["moment"] is None:
+            continue
+        s, e = _moment_window(g["moment"])
+        p = pairs[g["kalshi_event"]]
+        lacking += ["%s at %s" % (t, g["moment"]) for t in (p["home_ticker"], p["away_ticker"])
+                    if not kstore.covered(t, s, e)]
+    if lacking:
+        out.append("candles are not stored for %d contracts of paired games (`kalshi-candles --period test`): %s%s"
+                   % (len(lacking), ", ".join(lacking[:10]), " ..." if len(lacking) > 10 else ""))
+    return out
 
 
 # ---------------------------------------------------------------- the commands
@@ -1169,15 +1476,22 @@ def _period_dates(name: str, periods: dict) -> list[tuple[str, date, date]]:
     return [(n, *periods[n]) for n in names]
 
 
-def _evaluate(name: str, lstore: LinesStore, kstore: kh.HistoryStore, periods: dict, leagues, clock) -> dict:
+def _evaluate(name: str, root: Path, lstore: LinesStore, kstore: kh.HistoryStore, ledger: CreditLedger,
+              periods: dict, leagues, clock) -> dict:
     start, end = periods[name]
     if name == "test":
+        if any(e.get("kind") == "test_result" for e in scoring_entries(root)):
+            raise Refused("%s already holds a test result: the test period is scored once, whatever the stores say"
+                          % (root / SCORING_LOG))
         choice = lstore.choice()
         if choice is None:
             raise Refused("the test period is scored only with a stored choice (`choose` first)")
         if lstore.result("test") is not None:
             raise Refused("the test period has already been scored once; its stored result stands")
-        margins, versions = (choice["margin"],), (choice["version"],)
+        missing = test_readiness(lstore, kstore, ledger, periods)
+        if missing:
+            raise Refused("the test period is not ready to be scored: " + "; ".join(missing))
+        margins, versions, leagues = (choice["margin"],), (choice["version"],), tuple(LEAGUES)
     else:
         choice, margins, versions = None, MARGINS, VERSIONS
     games, pairing = collect_games(lstore, kstore, start, end, leagues)
@@ -1185,7 +1499,9 @@ def _evaluate(name: str, lstore: LinesStore, kstore: kh.HistoryStore, periods: d
            "pairing": pairing, "seed": SEED, "reps": REPS,
            "results": evaluate_games(games, margins, versions, SEED, REPS)}
     if name == "test":
-        lstore.put_result("test", out, _iso(clock()))
+        result = json.loads(json.dumps(out, default=str))
+        append_scoring(root, "test_result", {"result": result}, clock)
+        lstore.put_result("test", result, _iso(clock()))
     return out
 
 
@@ -1204,8 +1520,10 @@ def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_clien
 
     with_leagues(sub.add_parser("kalshi-markets", help="Kalshi's settled game markets (keyless)")).add_argument(
         "--period", choices=["dev", "test", "all"], required=True)
-    p = with_leagues(sub.add_parser("plan", help="what the rule would buy, no paid call"))
-    p.add_argument("--period", choices=["dev", "test", "all"], default="all")
+    p = with_leagues(sub.add_parser("plan", help="what the rule would buy, no paid call; the test period is always "
+                                                 "reserved for all five leagues"))
+    p.add_argument("--period", choices=["dev", "test", "all"], default="all",
+                   help="whose snapshots are listed (both periods are always planned)")
     p.add_argument("--cap", type=int, default=HISTORY_CAP)
     p.add_argument("--monthly-cap", type=int, default=MONTHLY_CAP)
     p = with_leagues(sub.add_parser("fetch-odds", help="buy the plan's snapshots through the credit ledger"))
@@ -1217,7 +1535,8 @@ def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_clien
     p.add_argument("--no-resolver", action="store_true", help="code only; leave what code cannot pair")
     with_leagues(sub.add_parser("kalshi-candles", help="candles around each paired game's moment (keyless)")).add_argument(
         "--period", choices=["dev", "test"], required=True)
-    p = with_leagues(sub.add_parser("evaluate", help="the two questions (dev: every choice; test: once, the choice)"))
+    p = with_leagues(sub.add_parser("evaluate", help="the two questions (dev: every choice; test: once, the choice, "
+                                                     "all five leagues)"))
     p.add_argument("--period", choices=["dev", "test"], required=True)
     p = sub.add_parser("choose", help="store the one choice made on the development period")
     p.add_argument("--margin", type=float, required=True)
@@ -1230,6 +1549,7 @@ def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_clien
     if getattr(args, "monthly_cap", None) is not None:
         ledger.caps["paid"] = int(args.monthly_cap)
     leagues = getattr(args, "leagues", list(LEAGUES))
+    rc = 0
     out: Any
     if args.cmd == "kalshi-markets":
         client = kalshi_client or kh.HistoryClient()
@@ -1239,37 +1559,47 @@ def main(argv=None, *, odds_client: oa.OddsApiClient | None = None, kalshi_clien
             out[name] = {lg: kh.fetch_settled(client, kstore, LEAGUES[lg][1], start, end, cutoff) for lg in leagues}
         out["requests"] = client.requests
     elif args.cmd == "plan":
-        names = list(periods) if args.period == "all" else [args.period]
-        out = make_plan(lstore, kstore, ledger, args.cap, leagues, {n: periods[n] for n in names})
+        out = make_plan(lstore, kstore, ledger, args.cap, leagues, periods)
+        for n in periods:
+            if args.period not in ("all", n):
+                out[n]["snapshots_not_listed"] = len(out[n]["snapshots"])
+                out[n]["snapshots"] = []
     elif args.cmd == "fetch-odds":
         if args.period == "test" and lstore.choice() is None:
             raise Refused("test-period snapshots are refused until a choice is stored (`choose`)")
         client = odds_client or oa.OddsApiClient()
         out = fetch_odds(args.period, client, ledger, lstore, kstore, args.cap, clock, leagues, periods,
                          progress=lambda s: print(s, file=sys.stderr, flush=True))
+        rc = 3 if out["stopped_by"] in ("ledger", "error") else 0
     elif args.cmd == "pair":
         start, end = periods[args.period]
         res = None if args.no_resolver else (resolver or LocalModelResolver())
-        out = run_pairing(lstore, kstore, start, end, res, leagues, clock)
+        out = run_pairing(lstore, kstore, start, end, res, leagues, clock, period=args.period)
     elif args.cmd == "kalshi-candles":
         start, end = periods[args.period]
         out = fetch_kalshi_candles(kalshi_client or kh.HistoryClient(), lstore, kstore, start, end, leagues)
     elif args.cmd == "evaluate":
-        out = _evaluate(args.period, lstore, kstore, periods, leagues, clock)
+        out = _evaluate(args.period, root, lstore, kstore, ledger, periods, leagues, clock)
     elif args.cmd == "choose":
         if not any(abs(args.margin - m) < 1e-9 for m in MARGINS):
             raise ValueError("the margin must be one of %s" % (MARGINS,))
+        if any(e.get("kind") == "choice" for e in scoring_entries(root)):
+            raise Refused("%s already holds a choice: it is made once, whatever the stores say" % (root / SCORING_LOG))
         lstore.put_choice(float(args.margin), args.version, _iso(clock()))
+        append_scoring(root, "choice", {"choice": lstore.choice()}, clock)
         out = {"choice": lstore.choice()}
     else:
         out = lstore.accepted_proposals()
     print(json.dumps(out, indent=1, default=str))
-    return 0
+    return rc
 
 
-def _cli() -> int:
+def _cli(argv=None, **kwargs) -> int:
     try:
-        return main()
+        return main(argv, **kwargs)
+    except LedgerBusy as exc:
+        print("stopped: %s" % exc, file=sys.stderr)
+        return 2
     except (Refused, CreditCapError, ValueError) as exc:
         print("refused: %s" % exc, file=sys.stderr)
         return 2

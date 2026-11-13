@@ -15,7 +15,9 @@ can be sent. At most 5 requests a second; a 429, a server error or a network err
 (Retry-After if sent, else 1, 2, 4 s), at most 4 tries in all. `max_requests` caps a run.
 
 The store never overwrites a fetched fact: the same thing fetched again and found different is written to
-`differences`, and the first copy is kept. A listing or a candle window already fetched is not asked again.
+`differences`, and the first copy is kept. A listing already fetched is not asked again; a candle window that
+brought candles is not asked again, and one that came back empty is recorded as empty and asked once more on a
+later run (then no more).
 """
 from __future__ import annotations
 
@@ -144,6 +146,8 @@ class HistoryStore:
                 fetched_at TEXT, PRIMARY KEY (ticker, end_ts));
             CREATE TABLE IF NOT EXISTS windows (ticker TEXT, start_ts INTEGER, end_ts INTEGER, tier TEXT, n INTEGER,
                 fetched_at TEXT, PRIMARY KEY (ticker, start_ts, end_ts));
+            CREATE TABLE IF NOT EXISTS candle_asks (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT,
+                start_ts INTEGER, end_ts INTEGER, tier TEXT, n INTEGER, fetched_at TEXT);
             CREATE TABLE IF NOT EXISTS listings (series TEXT, tier TEXT, start TEXT, end TEXT, n INTEGER,
                 fetched_at TEXT, PRIMARY KEY (series, tier, start, end));
             CREATE TABLE IF NOT EXISTS cutoffs (fetched_at TEXT, raw TEXT);
@@ -194,12 +198,26 @@ class HistoryStore:
         rows = self.db.execute("SELECT raw FROM candles WHERE ticker = ? ORDER BY end_ts", (ticker,))
         return [kd.normalize_candle(json.loads(r["raw"])) for r in rows]
 
+    def window_state(self, ticker: str, start: int, end: int) -> str:
+        """What is known of the candles of one market in [start, end]: "filled" (an answer with candles covers it),
+        "empty_once" (asked once, nothing came: ask again on a later run), "empty_final" (asked twice, nothing came)
+        or "missing". Rows of `windows` (the table before rev 2) are read as asks too."""
+        rows = []
+        for table in ("windows", "candle_asks"):
+            rows += self.db.execute("SELECT n FROM %s WHERE ticker = ? AND start_ts <= ? AND end_ts >= ?" % table,
+                                    (ticker, start, end)).fetchall()
+        if any((r[0] or 0) > 0 for r in rows):
+            return "filled"
+        return {0: "missing", 1: "empty_once"}.get(len(rows), "empty_final")
+
     def covered(self, ticker: str, start: int, end: int) -> bool:
-        return self.db.execute("SELECT 1 FROM windows WHERE ticker = ? AND start_ts <= ? AND end_ts >= ?",
-                               (ticker, start, end)).fetchone() is not None
+        """Nothing more to ask: candles came, or the window came back empty twice."""
+        return self.window_state(ticker, start, end) in ("filled", "empty_final")
 
     def put_window(self, ticker: str, start: int, end: int, tier: str, n: int) -> None:
-        self.db.execute("INSERT OR IGNORE INTO windows VALUES (?, ?, ?, ?, ?, ?)", (ticker, start, end, tier, n, _now()))
+        """Record one ask of a window and how many candles came (0 for an empty answer)."""
+        self.db.execute("INSERT INTO candle_asks (ticker, start_ts, end_ts, tier, n, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (ticker, start, end, tier, n, _now()))
         self.db.commit()
 
     def listed(self, series: str, tier: str, start: date, end: date) -> bool:
@@ -299,7 +317,7 @@ def fetch_candles(client: HistoryClient, store: HistoryStore, market: dict, mome
     first = "historical" if settled and iso_ts(settled) < cutoff else "live"
     paths = {"historical": "/historical/markets/%s/candlesticks" % ticker,
              "live": "/series/%s/markets/%s/candlesticks" % (series, ticker)}
-    out = {"windows_fetched": 0, "windows_cached": 0, "candles_stored": 0}
+    out = {"windows_fetched": 0, "windows_cached": 0, "windows_empty": 0, "candles_stored": 0}
     for start, end in windows(moments):
         if store.covered(ticker, start, end):
             out["windows_cached"] += 1
@@ -321,4 +339,5 @@ def fetch_candles(client: HistoryClient, store: HistoryStore, market: dict, mome
                 out["candles_stored"] += 1
         store.put_window(ticker, start, end, used, len(rows))
         out["windows_fetched"] += 1
+        out["windows_empty"] += 0 if rows else 1
     return out

@@ -303,3 +303,33 @@ def test_default_key_reader_goes_through_the_secrets_loader(monkeypatch):
     with pytest.raises(oa.OddsApiError) as err:
         oa.read_key("ODDS_API_KEY_FREE")
     assert "ODDS_API_KEY_FREE" in str(err.value)
+
+
+def test_a_failure_before_sending_leaves_no_usage_and_nothing_sent():
+    t = FakeTransport([(200, {"x-requests-last": "10", "x-requests-remaining": "90"}, SNAP)])
+    keys = iter(["PAID-KEY-0001"])
+
+    def reader(name):
+        try:
+            return next(keys)
+        except StopIteration:
+            raise oa.OddsApiError(f"{name} is not set") from None
+
+    c = oa.OddsApiClient(t, key_reader=reader)
+    c.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", TEN)
+    assert c.attempts_sent == 1 and c.last_usage["last"] == 10
+    with pytest.raises(oa.OddsApiError):
+        c.historical_odds("basketball_nba", "2026-01-11T16:00:00Z", TEN)
+    assert c.attempts_sent == 0 and c.last_usage == {"remaining": None, "used": None, "last": None}
+
+
+def test_retries_can_be_turned_off_per_call_and_errors_carry_the_status():
+    t = FakeTransport([(429, {"x-requests-last": "0"}, None)] * 5)
+    c = oa.OddsApiClient(t, key_reader=lambda n: "PAID-KEY-0001", max_retries=3, sleep=lambda s: None)
+    with pytest.raises(oa.OddsApiError) as err:
+        c.historical_odds("basketball_nba", "2026-01-10T16:00:00Z", TEN, retries=0)
+    assert len(t.calls) == 1 and err.value.status == 429 and c.attempts_sent == 1
+    boom = oa.OddsApiClient(FakeTransport([ConnectionError("x")]), key_reader=lambda n: "PAID-KEY-0001")
+    with pytest.raises(oa.OddsApiError) as err:
+        boom.sports_with("paid", retries=0)
+    assert err.value.status is None and boom.attempts_sent == 1

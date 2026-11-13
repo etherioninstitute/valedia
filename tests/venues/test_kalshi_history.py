@@ -162,7 +162,7 @@ def test_candles_route_by_the_cutoff_and_fall_back_on_404(tmp_path):
     c, t, _ = make(routes)
     cutoff = kh.cutoff_ts(c)
     got = kh.fetch_candles(c, store, old, [m + 30], cutoff)
-    assert got == {"windows_fetched": 1, "windows_cached": 0, "candles_stored": 2}
+    assert got == {"windows_fetched": 1, "windows_cached": 0, "windows_empty": 0, "candles_stored": 2}
     assert "/historical/markets/" in t.urls[-1]
     q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(t.urls[-1]).query))
     assert q == {"start_ts": str(m - 3600), "end_ts": str(m), "period_interval": "1"}   # the minute and the hour before
@@ -216,3 +216,37 @@ def test_a_listing_already_stored_is_not_fetched_again(tmp_path):
     again = kh.fetch_settled(c, store, "KXNBAGAME", date(2026, 1, 5), date(2026, 3, 1))
     assert len(t.urls) == n and again["cached"] is True
     assert kh.iso_ts("2026-09-13T00:00:00Z") == datetime(2026, 9, 13, tzinfo=UTC).timestamp()
+
+
+def test_an_empty_window_is_recorded_and_asked_once_more_on_a_later_run(tmp_path):
+    store = kh.HistoryStore(tmp_path / "k.sqlite")
+    old = mkt("KXNBAGAME-26JAN10TORPHI-TOR", "2026-01-11T03:00:00Z")
+    hist = "/historical/markets/%s/candlesticks" % old["ticker"]
+    live = "/series/KXNBAGAME/markets/%s/candlesticks" % old["ticker"]
+    c, t, _ = make({(hist, ()): {"candlesticks": []}, (live, ()): {"candlesticks": []}})
+    cutoff = kh.iso_ts(CUTOFF["market_settled_ts"])
+    first = kh.fetch_candles(c, store, old, [1768086000], cutoff)
+    assert first["windows_fetched"] == 1 and first["windows_empty"] == 1
+    assert store.window_state(old["ticker"], 1768082400, 1768086000) == "empty_once"
+    n = len(t.urls)
+    second = kh.fetch_candles(c, store, old, [1768086000], cutoff)              # a later run asks once more
+    assert len(t.urls) > n and second["windows_fetched"] == 1
+    assert store.window_state(old["ticker"], 1768082400, 1768086000) == "empty_final"
+    n = len(t.urls)
+    third = kh.fetch_candles(c, store, old, [1768086000], cutoff)               # and then no more
+    assert len(t.urls) == n and third["windows_cached"] == 1
+    assert store.window_state(old["ticker"], 0, 10) == "missing"
+
+
+def test_a_store_made_before_rev_2_stays_usable(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite"
+    db = sqlite3.connect(str(path))
+    db.executescript("""CREATE TABLE windows (ticker TEXT, start_ts INTEGER, end_ts INTEGER, tier TEXT, n INTEGER,
+        fetched_at TEXT, PRIMARY KEY (ticker, start_ts, end_ts));
+        INSERT INTO windows VALUES ('A', 0, 3600, 'live', 61, 'x'), ('B', 0, 3600, 'live', 0, 'x');""")
+    db.commit()
+    db.close()
+    store = kh.HistoryStore(path)
+    assert store.window_state("A", 0, 3600) == "filled" and store.covered("A", 0, 3600)
+    assert store.window_state("B", 0, 3600) == "empty_once" and not store.covered("B", 0, 3600)

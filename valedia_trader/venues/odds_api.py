@@ -218,7 +218,12 @@ def kelly_stakes(fair_probabilities_, decimal_odds, bankroll: float, multiplier:
 
 # ---------------------------------------------------------------- API client
 class OddsApiError(RuntimeError):
-    """An Odds API request failed. The message never contains the API key."""
+    """An Odds API request failed. The message never contains the API key. `status` is the HTTP status of the last
+    answer, or None when no answer came (a network error, or nothing was sent)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 Transport = Callable[[str, dict[str, Any], float], tuple[int, Mapping[str, str], Any]]
@@ -284,6 +289,7 @@ class OddsApiClient:
         self.requests_used: int | None = None
         self.requests_last: int | None = None
         self.last_usage: dict[str, int | None] = {"remaining": None, "used": None, "last": None}
+        self.attempts_sent = 0               # requests handed to the transport by the last call
 
     def __repr__(self) -> str:
         return f"OddsApiClient(remaining={self.requests_remaining}, used={self.requests_used})"
@@ -294,20 +300,26 @@ class OddsApiClient:
             raise OddsApiError("ODDS_API_KEY is not set")
         return self._send(path, params, key)
 
-    def _get_with(self, path: str, params: dict[str, Any], key: str) -> Any:
-        """GET with the named key ("paid" or "free"), read now; the usage headers land in `last_usage`."""
+    def _get_with(self, path: str, params: dict[str, Any], key: str, retries: int | None = None) -> Any:
+        """GET with the named key ("paid" or "free"), read now; the usage headers land in `last_usage`.
+        `retries` overrides `max_retries` for this call (0: one attempt only)."""
+        self.last_usage = {"remaining": None, "used": None, "last": None}
+        self.attempts_sent = 0
         if key not in KEY_ENV:
             raise ValueError("key must be 'paid' or 'free'")
         value = str(self._key_reader(KEY_ENV[key]) or "").strip()
         if not value:
             raise OddsApiError(f"{KEY_ENV[key]} is not set")
-        return self._send(path, params, value)
+        return self._send(path, params, value, retries)
 
-    def _send(self, path: str, params: dict[str, Any], key: str) -> Any:
+    def _send(self, path: str, params: dict[str, Any], key: str, retries: int | None = None) -> Any:
         query = {k: v for k, v in params.items() if v is not None}
         self.last_usage = {"remaining": None, "used": None, "last": None}
-        last = "no attempt made"
-        for attempt in range(self.max_retries + 1):
+        self.attempts_sent = 0
+        last, last_status = "no attempt made", None
+        tries = self.max_retries if retries is None else int(retries)
+        for attempt in range(tries + 1):
+            self.attempts_sent += 1
             try:
                 status, headers, body = self._transport(BASE_URL + path, {**query, "apiKey": key}, self.timeout)
             except Exception as exc:  # network errors: report the type only, never the URL with the key
@@ -321,12 +333,12 @@ class OddsApiClient:
                         setattr(self, attr, self.last_usage[field])
                 if status == 200:
                     return body
-                last = f"HTTP {status}"
+                last, last_status = f"HTTP {status}", status
                 if status not in (429, 500, 502, 503, 504):
                     break
-            if attempt < self.max_retries:
+            if attempt < tries:
                 self._sleep(self.backoff * 2**attempt)
-        raise OddsApiError(f"GET {path} failed: {last}")
+        raise OddsApiError(f"GET {path} failed: {last}", last_status if last.startswith("HTTP") else None)
 
     def sports(self, all_sports: bool = False) -> list[dict[str, Any]]:
         """GET /v4/sports (does not count against the quota)."""
@@ -346,7 +358,7 @@ class OddsApiClient:
                           "oddsFormat": odds_format, "bookmakers": bookmakers})
 
     def historical_odds(self, sport: str, date: str, bookmakers, markets: str = "h2h", key: str = "paid",
-                        odds_format: str = "decimal") -> dict[str, Any]:
+                        odds_format: str = "decimal", retries: int | None = None) -> dict[str, Any]:
         """GET /v4/historical/sports/{sport}/odds?date=: the closest snapshot at or before `date` (its own
         `timestamp`, `previous_timestamp`, `next_timestamp` and `data`). Paid plans only, so the free key is
         refused here before anything is sent. Costs `historical_cost(markets, bookmakers)`."""
@@ -357,15 +369,15 @@ class OddsApiClient:
         books = bookmakers if isinstance(bookmakers, str) else ",".join(bookmakers)
         return self._get_with(f"/v4/historical/sports/{sport}/odds",
                               {"date": date, "markets": markets, "bookmakers": books, "oddsFormat": odds_format,
-                               "dateFormat": "iso"}, key)
+                               "dateFormat": "iso"}, key, retries)
 
     def historical_events(self, sport: str, date: str, key: str = "free") -> dict[str, Any]:
         """GET /v4/historical/sports/{sport}/events?date= (1 credit, nothing when empty; all plans)."""
         return self._get_with(f"/v4/historical/sports/{sport}/events", {"date": date, "dateFormat": "iso"}, key)
 
-    def sports_with(self, key: str = "paid") -> list[dict[str, Any]]:
+    def sports_with(self, key: str = "paid", retries: int | None = None) -> list[dict[str, Any]]:
         """GET /v4/sports with the named key: free of charge, and it refreshes the usage headers."""
-        return self._get_with("/v4/sports", {}, key)
+        return self._get_with("/v4/sports", {}, key, retries)
 
 
 def normalize_odds(events, now=None, max_age_seconds: float | None = None) -> pd.DataFrame:
