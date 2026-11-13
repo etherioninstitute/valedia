@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.parse
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2781,3 +2782,172 @@ def test_an_empty_word_file_counts_as_missing(tmp_path, capsys, monkeypatch, con
     assert kept["kept"] is True and kept["source"] == "built-in fallback" and kept["words"] == n
     r = env.rows()
     assert r["c9"]["reason"] == "no_team_named" and r["c2"]["status"] == "matched"       # "no" is a word
+
+
+# ---------------------------------------------------------------- rev 7, outcome 1: the whole folder, byte for byte
+
+class _Kill(BaseException):
+    """The process is killed where it stands: no handler of the module catches it."""
+
+
+TWIN_KILLS = {                   # order -> {step: where that step's run is killed}
+    "results_late_parses_between": {5: "after_the_ledger", 19: "kalshi_listing"},
+    "results_first_parses_after": {3: "after_the_ledger", 7: "kalshi_listing"},
+}
+
+
+def _folder_bytes(root):
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _ledger_bodies(root, part):
+    """The answers the credit ledger keeps for the calls whose path holds `part`, in call order."""
+    c = sqlite3.connect(root / "credits.sqlite")
+    try:
+        return [json.loads(zlib.decompress(b)) for (b,) in
+                c.execute("SELECT body FROM calls WHERE path LIKE ? AND body IS NOT NULL ORDER BY id", ("%" + part + "%",))]
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("order", sorted(TWIN_ORDERS))
+def test_before_the_choice_a_twin_run_leaves_the_whole_grading_folder_byte_for_byte_identical(tmp_path, capsys,
+                                                                                             monkeypatch, order):
+    """Clarification 22, the whole folder: in two orders of commands, and with the run killed once right after the
+    credit ledger kept a scores answer and once in the middle of Kalshi's settled listing, every file of the grading
+    folder (the store, the credit ledger, the Kalshi store, the scoring log, the locks) is byte for byte the same in
+    the twin whose held results are all flipped, after every step before the choice; and so is every command's output.
+    The Kalshi store's own wall-clock stamp (`kalshi_history._now`, not a result) is fixed for both twins."""
+    monkeypatch.setattr(kh, "_now", lambda: "2026-12-12T00:00:00+00:00")
+    armed = {}
+    reconcile, transport = sl.CreditLedger.reconcile, KalshiTransport.__call__
+
+    def killed_after_the_ledger(self, *a, **k):
+        if armed.pop("after_the_ledger", False):
+            raise _Kill("after the ledger kept the answer")
+        return reconcile(self, *a, **k)
+
+    def killed_in_a_listing(self, url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        if q.get("status") == "settled" and armed.pop("kalshi_listing", False):
+            raise _Kill(url)
+        return transport(self, url)
+
+    monkeypatch.setattr(sl.CreditLedger, "reconcile", killed_after_the_ledger)
+    monkeypatch.setattr(KalshiTransport, "__call__", killed_in_a_listing)
+    run, twins = tmp_path / "run", []                 # both twins run at the same path, one at a time
+    for flip in (False, True):
+        twins.append((_twin_env(run, flip)[0], tmp_path / ("flipped" if flip else "plain")))
+        run.rename(twins[-1][1])
+    kills = TWIN_KILLS[order]
+    for k, (step, at) in enumerate(TWIN_ORDERS[order]):
+        outs, folders = [], []
+        for env, home in twins:
+            home.rename(run)
+            env.clock.set(at)
+            if step.startswith("parse "):
+                env.world.parse_later(env.picks, step.split()[1], at)
+            elif step == "audit":
+                env.audit(capsys)
+            elif k in kills:
+                armed[kills[k]] = True
+                capsys.readouterr()
+                with pytest.raises(_Kill):
+                    env.run(step)
+                assert not armed, (order, k, step)                       # the kill did happen
+            else:
+                outs.append(env.out(capsys, step, *(("--period", "development") if step == "evaluate" else ())))
+            folders.append(_folder_bytes(env.root))
+            run.rename(home)
+        a, b = folders
+        assert sorted(a) == sorted(b) and [n for n in a if a[n] != b[n]] == [], (order, k, step)
+        assert not outs or outs[0] == outs[1], (order, k, step)
+    for _, home in twins:                              # the ledger did keep scores answers, and none of a held game
+        kept = {e["id"] for body in _ledger_bodies(home / "grading", "/scores") for e in body}
+        assert kept and not kept & ({"x99"} | {g["id"] for g in _twin_games() if g["after"]}), kept
+
+
+# ---------------------------------------------------------------- rev 7, outcome 2: the edges of the boundary
+
+EDGE_KINDS = (("p", 10, "tA", "2026-12-12T20:00:00Z", "2026-12-13T01:00:00Z", "26DEC12"),   # 20:00 US-Eastern 12/12
+              ("e", 10, "tA", "2026-12-12T21:00:00Z", BOUNDARY_AT, "26DEC12"))            # exactly the boundary
+
+
+def _edge_env(tmp_path, capsys, monkeypatch):
+    """Games of 12/12 before the boundary (p) and starting exactly at it (e), and in the scores answer: p00 with a
+    `commence_time` after the boundary and e00 with one before it (the schedule's start decides), games the schedule
+    lacks at the boundary exactly (x96), with no time (x97), before it (x98) and after it (x99); and one game on 12/14
+    nobody picks (u00)."""
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, "TWIN_KINDS", EDGE_KINDS)
+    monkeypatch.setattr(mod, "TWIN_LATE", ())
+    env, games = _twin_env(tmp_path, False)
+    env.odds.events["basketball_nba"].append(ev("u00", "Uaton Uirs", "Vaton Virs", "2026-12-15T01:00:00Z"))
+    scores = env.odds.scores["basketball_nba"]
+    by = {e["id"]: e for e in scores}
+    by["p00"]["commence_time"] = "2026-12-13T06:00:00Z"
+    by["e00"]["commence_time"] = "2026-12-13T04:00:00Z"
+    for gid, start in (("x96", BOUNDARY_AT), ("x97", None)):
+        e = dict(by["x98"], id=gid, commence_time=start)
+        if start is None:
+            del e["commence_time"]
+        scores.append(e)
+    for step, at in (("schedule", "2026-12-12T19:00:00Z"), ("match", "2026-12-12T23:00:00Z"),
+                     ("audit", "2026-12-12T23:05:00Z"), ("results", "2026-12-13T10:40:00Z"),
+                     ("prices", "2026-12-13T10:50:00Z")):
+        env.clock.set(at)
+        if step == "audit":
+            env.audit(capsys)
+        else:
+            env.out(capsys, step)
+    return env, games
+
+
+def _stored_finals(env):
+    s = env.store()
+    try:
+        return {e["id"] for r in s.rows("SELECT raw FROM scores") for e in json.loads(r["raw"])}
+    finally:
+        s.close()
+
+
+def test_the_edges_of_the_boundary_in_what_is_stored_and_graded(tmp_path, capsys, monkeypatch):
+    """A game starting exactly at 2026-12-13 00:00 US-Eastern is held; an entry with no readable time is dropped; for
+    a game the schedule lists, the schedule's start decides, not the answer's `commence_time` (both ways); the same
+    holds for what the credit ledger keeps; the league-days held are those of the held games a pick is matched to."""
+    env, _ = _edge_env(tmp_path, capsys, monkeypatch)
+    p, e = {"p%02d" % i for i in range(10)}, {"e%02d" % i for i in range(10)}
+    want = p | {"x98"}
+    assert _stored_finals(env) == want
+    assert [{e["id"] for e in body} for body in _ledger_bodies(env.root, "/scores")] == [want]
+    res = env.out(capsys, "evaluate", "--period", "development")
+    assert res["B"]["n"] == 20 and res["B"]["not_graded"] == {"held_for_test": 20}
+    assert res["held_for_test"] == {"picks": 20, "league_days": 1}
+    assert res["A"]["1"]["n"] == 10 and res["A"]["1"]["not_bought"] == {"held_for_test": 10}
+    env.clock.set("2026-12-14T12:30:00Z")                    # the choice: from now on the whole answer is kept
+    env.out(capsys, "choose", "--version", "1")
+    env.out(capsys, "results")
+    full = p | e | {"x96", "x97", "x98", "x99"}
+    assert {e["id"] for e in _ledger_bodies(env.root, "/scores")[-1]} == full
+    assert _stored_finals(env) == full
+
+
+def test_a_market_of_a_game_from_the_boundary_on_is_not_stored_before_the_choice_even_when_it_pairs(
+        tmp_path, capsys, monkeypatch):
+    """The `before` filter of `_settled_before_choice`: with a pairing that dates a game the way Kalshi does (a start
+    between 00:00 and 05:59 US-Eastern counts as the day before), a game starting exactly at the boundary pairs with
+    its Kalshi event of 12/12, and still none of its markets is stored before the choice."""
+    pair_games = sl.pair_games
+
+    def kalshi_dated(kev, games, *a, **k):
+        return pair_games(kev, [dict(g, day=(T(g["commence"]).astimezone(pg.ET) - timedelta(hours=6)).date())
+                                for g in games], *a, **k)
+
+    monkeypatch.setattr(sl, "pair_games", kalshi_dated)
+    env, _ = _edge_env(tmp_path, capsys, monkeypatch)
+    k = sqlite3.connect(env.root / "kalshi.sqlite")
+    stored = {t.split("-")[1][7:].lower() for (t,) in k.execute("SELECT ticker FROM markets")}
+    k.close()
+    assert stored == {"p%02d" % i for i in range(10)}
+    out = env.out(capsys, "prices")
+    assert out["pairing"]["NBA"]["markets_held_before_choice"] == 20                     # e's 10 events, 2 markets each

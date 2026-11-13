@@ -62,7 +62,9 @@ Commands:
   days or more after the start is not used: the game is not graded (clarification 14). Before a choice, the final of
   a game that a pick of a test-period thread is matched to, and of every game the schedule starts at or after
   `BOUNDARY` (2026-12-13 00:00 US-Eastern, clarification 22), is dropped from the scores list before it is stored (the
-  count dropped is shown); no Kalshi settlement of the day of a game a test-period pick is matched to is fetched, and
+  count dropped is shown), and so from the copy of the answer the credit ledger keeps (`calls.body`, written by
+  `sports_lines.CreditLedger.attempt`: it holds the kept entries only, while the credits spent and the call are
+  recorded as for any call; after a choice it holds the whole answer); no Kalshi settlement of the day of a game a test-period pick is matched to is fetched, and
   of a market Kalshi dates `KALSHI_BOUNDARY_DAY` or later only those of games the schedule starts before the boundary
   are stored (Kalshi dates a game starting between 00:00 and 05:59 US-Eastern the day before).
   Question B: a pick on a game Kalshi lists (a stored code table's event or a stored market's event dated the game's
@@ -92,6 +94,19 @@ Results of test-period picks are not read before a choice is stored, nor any res
 fetched for its day, stored nor read. No settlement of a day of the test period is fetched before a choice (also for
 a development game on that day), and without a choice no scores are bought from 06:00 US-Eastern on the test period's
 first day. A command refused because the store is frozen under another fingerprint creates nothing.
+
+Known limits, stated plainly:
+
+- A game starting between 00:00 and 05:59 US-Eastern never pairs with Kalshi: `sports_lines.pair_games` pairs an event
+  only with a game of the event's own date, and Kalshi dates such a game the day before. Its picks are never graded on
+  Question B's Kalshi side and never bought on Question A.
+- The fingerprints see a module-level statement that changes a table in place only in the forms listed under `match`.
+  They do not see: a call inside an assignment's value (`X = LEAGUE_WORDS.update(...)`), the headers of `assert`, `if`
+  and `for` statements, a helper function called at module level that changes a table, `setattr`, `vars()` and
+  `globals()`, the bodies of `match` statements and of classes, a default argument, a change through a full dotted
+  module path (`valedia_trader.research_loop.sports_lines._TOKEN_MAP.update(...)`), and the package's `__init__`.
+- The fingerprints, like every guard here, guard against slips, not against intent (clarification 19): anyone who
+  edits the code on purpose can change what they cover.
 
 The grading store refuses UPDATE, DELETE and an INSERT that repeats a natural key (so INSERT OR REPLACE cannot rewrite
 it); writers hold `grading.lock` (one at a time); `status` opens the stores read-only; a store of another layout is
@@ -1808,10 +1823,12 @@ def _settled_before_choice(gr: Grader, league: str, d: date, cutoff: float, gl: 
 
 def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     """Kalshi's settled markets of the days of the matched games that have started, per league, and the strict
-    pairing of `sports_lines.pair_games` (no model). Before a choice no day of the test period is fetched, not even
-    for a development game on it, nor the day of a game a test-period pick is matched to, nor any day for a game the
-    schedule starts at or after `BOUNDARY`; and a date from `KALSHI_BOUNDARY_DAY` on is stored only for the games
-    before the boundary (`_settled_before_choice`). Errors of one league are recorded and the others go on."""
+    pairing of `sports_lines.pair_games` (no model). Before a choice no day is fetched for a held game (`_held`: every
+    game the schedule starts at or after `BOUNDARY`, so every game of the test period, and every game a test-period
+    pick is matched to), nor for any game on a league-day `_held` holds; and a date from
+    `KALSHI_BOUNDARY_DAY` on is stored only for the games before the boundary (`_settled_before_choice`). The callers
+    pass rows of a current `match` run (`need_current`) with held games left out, and a row's start is the schedule's
+    start, so no separate clock condition is needed here. Errors of one league are recorded and the others go on."""
     out: dict[str, Any] = {}
     games = schedule_games(gr.store.lists())
     by_league: dict[str, set] = {}
@@ -1819,10 +1836,8 @@ def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     held_ids, held = _held(gr.store)
     for r in rows:
         d = sl.eastern_date(r["start"])
-        if _ts(r["start"]) < now.timestamp() and not (no_choice and (d >= PERIODS["test"][0]
-                                                                      or (r["league"], d) in held
-                                                                      or r["game_id"] in held_ids
-                                                                      or _ts(r["start"]) >= BOUNDARY_TS)):
+        if _ts(r["start"]) < now.timestamp() and not (no_choice and ((r["league"], d) in held
+                                                                      or r["game_id"] in held_ids)):
             by_league.setdefault(r["league"], set()).add(d)
     if not by_league:
         return out
@@ -1940,6 +1955,17 @@ def _dropped_before_storing(e, held: set[str], starts: dict[str, int], no_choice
         return True
 
 
+def _scores_kept(answer, held: set[str], starts: dict[str, int], no_choice: bool, seen: dict) -> Any:
+    """What of a scores answer is kept anywhere, the credit ledger's copy included (`sports_lines.CreditLedger`
+    keeps what the send it is given returns): the entries `_dropped_before_storing` does not drop. `seen["listed"]`
+    receives how many entries the answer had. An answer that is not a list is returned as it is (it has no entries,
+    and the caller refuses it)."""
+    if not isinstance(answer, list):
+        return answer
+    seen["listed"] = len(answer)
+    return [e for e in answer if not _dropped_before_storing(e, held, starts, no_choice)]
+
+
 def _scores_asked_since(gr: Grader, path: str, since: float) -> bool:
     last = gr.ledger.db.execute("SELECT MAX(at) FROM calls WHERE path = ?", (path,)).fetchone()[0]
     return last is not None and _ts(last) > since
@@ -1975,16 +2001,18 @@ def cmd_results(gr: Grader) -> dict:
             out["scores"][league] = "waits: this league's scores were asked for in the last 6 hours"
             continue
         try:
-            body = gr.odds_call("free", "scores:daysFrom=%d" % SCORES_DAYS, SCORES_COST, path, params,
-                                lambda s=sport: gr.odds.scores(s, days_from=SCORES_DAYS, key="free", retries=0))
-            if not isinstance(body, list):
+            seen: dict[str, int] = {}
+            kept = gr.odds_call("free", "scores:daysFrom=%d" % SCORES_DAYS, SCORES_COST, path, params,
+                                lambda s=sport, seen=seen: _scores_kept(
+                                    gr.odds.scores(s, days_from=SCORES_DAYS, key="free", retries=0),
+                                    held, starts, no_choice, seen))
+            if not isinstance(kept, list):
                 raise oa.OddsApiError("scores answer is not a list")
-            kept = [e for e in body if not _dropped_before_storing(e, held, starts, no_choice)]
             at, raw = gr.now(), _canon(kept)
             with gr.store.writing(at) as c:
                 c.execute("INSERT INTO scores (league, fetched_at, sha256, raw) VALUES (?, ?, ?, ?)",
                           (league, at, _sha(raw), raw))
-            out["scores"][league] = {"games_listed": len(kept), "dropped_test_period": len(body) - len(kept),
+            out["scores"][league] = {"games_listed": len(kept), "dropped_test_period": seen["listed"] - len(kept),
                                      "picks_waiting": n}
         except sl.LedgerStop as exc:
             gr.odds_stopped = True
