@@ -128,8 +128,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import math
@@ -287,7 +289,8 @@ SDK_LOG_FILE = "webull_trade_sdk.log"
 def _quiet_sdk_logging() -> None:
     """The SDK logs whole requests, headers included, when a call fails. Keep the App Key out of every log: every
     "webull" logger is set above CRITICAL and stops propagating, and every handler the SDK added (anything but a
-    NullHandler) is removed and closed. Run before and after the client is built: building it re-dirties them."""
+    NullHandler) is removed and closed. Run before and after the client is built: building it re-dirties them.
+    The HTTP library's request log is quieted too (_quiet_http_logging)."""
     names = set(SDK_LOGGERS) | {n for n in logging.root.manager.loggerDict if n == "webull" or n.startswith("webull.")}
     for name in sorted(names):
         log = logging.getLogger(name)
@@ -301,6 +304,19 @@ def _quiet_sdk_logging() -> None:
                 handler.close()
             except Exception:
                 pass
+    _quiet_http_logging()
+
+
+HTTP_LOGGERS = ("urllib3.connectionpool",)
+
+
+def _quiet_http_logging() -> None:
+    """The HTTP library logs each request's path at DEBUG, and the SDK puts the account id in the query string:
+    urllib3.connectionpool is set to WARNING unless a higher level is already set there."""
+    for name in HTTP_LOGGERS:
+        log = logging.getLogger(name)
+        if log.level < logging.WARNING:
+            log.setLevel(logging.WARNING)
 
 
 def _private_token_dir(token_dir: str | Path | None, environment: str) -> Path:
@@ -365,6 +381,8 @@ def _remove_new_empty_sdk_log(existed_before: bool, path: Path) -> None:
 WITHHELD = "<withheld>"
 CODE_WITHHELD = "<code withheld>"
 TEXT_WITHHELD = "text withheld"
+OUTCOME_UNKNOWN = ("outcome unknown: the order may or may not have reached Webull; read the order's status (order_status) "
+                   "before retrying anything. ")
 PLACEHOLDERS = frozenset({WITHHELD, CODE_WITHHELD})
 SECRET_RUN = 6                                                          # a run of this many characters of a secret
 MAX_GATE_INPUT = 4000                                                   # longer text is cut before it is judged
@@ -379,12 +397,14 @@ _TOKENS = re.compile(r"<code withheld>|\S+")
 
 
 class _Secrets:
-    """The App Key, the App Secret and the account id (when known), in every form a disguise could take: as given,
-    trimmed, lower and upper case, URL-encoded, base64 (standard and URL-safe, with and without padding, starting
-    at each of the first three characters so that the base64 of any part lines up with one of them) and hex. Held
-    lower-cased as the set of their runs of SECRET_RUN characters (a form shorter than that is held whole)."""
+    """The gate's view of the App Key, the App Secret and the account ids, in every form a disguise could take: as
+    given, trimmed, lower and upper case, URL-encoded, base64 (standard and URL-safe, with and without padding, and
+    for a secret sitting at each of the three byte offsets inside a longer base64 text, every character fixed by
+    the secret alone) and hex. Held lower-cased as the set of their runs of SECRET_RUN characters (a form shorter
+    than that is held whole). `words` keeps the plain values, for the last check, which builds its own search."""
 
     def __init__(self, words: tuple[str, ...]):
+        self.words = words
         runs: set[str] = set()
         whole: set[str] = set()
         for form in _forms(words):
@@ -412,6 +432,12 @@ def _forms(words: tuple[str, ...]) -> set[str]:
             for start in range(3):
                 for enc in (base64.b64encode(raw[start:]).decode(), base64.urlsafe_b64encode(raw[start:]).decode()):
                     out.update({enc, enc.rstrip("=")})
+            for offset in range(3):                                   # the secret at byte offset 0, 1 or 2 of a group
+                enc = base64.b64encode(b"\0" * offset + raw).decode().rstrip("=")
+                lead = (0, 2, 3)[offset]                                  # characters that also hold the bytes before
+                tail = 1 if (offset + len(raw)) % 3 else 0                # the last one also holds the byte after
+                core = enc[lead:len(enc) - tail]
+                out.update({core, core.replace("+", "-").replace("/", "_")})
     return {f for f in out if f}
 
 
@@ -518,16 +544,20 @@ def _gate(value: Any, secrets: _Secrets, limit: int = 160) -> str:
         return WITHHELD
 
 
-def _last_check(text: Any, secrets: _Secrets) -> str:
-    """THE LAST CHECK, separate from the gate on purpose: it builds its own search from the secrets' forms and looks
-    at the whole text, with and without its whitespace, and URL-decoded up to three times. If any run of a secret is
-    still there, without regard to case, the whole text becomes TEXT_WITHHELD. Never raises."""
+def _last_check(text: Any, words: Any) -> str:
+    """THE LAST CHECK, written apart from the gate on purpose: it never uses _forms, _Secrets.runs or anything the
+    gate's search is built from. From the plain secret values alone (`words`, or a _Secrets' .words; a venue
+    always passes its own complete set, see WebullVenue._final) it builds its own forms (_final_forms) and one
+    case-blind regular expression, and looks at the whole text, with and without its whitespace, and URL-decoded
+    up to three times. If any run of SECRET_RUN characters of a secret is still there, the whole text becomes
+    TEXT_WITHHELD. Never raises."""
     try:
         whole = str.__getitem__(text, slice(None)) if isinstance(text, str) else _plain(text, 10 ** 6)
-        pattern = _last_check_pattern(secrets)
+        values = words.words if isinstance(words, _Secrets) else tuple(words or ())
+        pattern = _final_pattern(tuple(sorted({v for v in values if isinstance(v, str) and v.strip()})))
         if pattern is None:
             return whole
-        variants = [whole, re.sub(r"\s+", "", whole)]
+        variants = [whole, "".join(whole.split())]
         for v in list(variants):
             for _ in range(3):
                 v = urllib.parse.unquote(v, errors="replace")
@@ -537,27 +567,60 @@ def _last_check(text: Any, secrets: _Secrets) -> str:
         return TEXT_WITHHELD
 
 
+def _final_forms(value: str) -> list[str]:
+    """The last check's own forms of one secret, built with binascii and a hand-written percent-encoding (not with
+    the gate's _forms): as given and trimmed (case is ignored by the search), percent-encoded (spaces also as +),
+    hex, and base64 in both alphabets: whole with and without padding, and for each byte offset 0, 1, 2 inside a
+    longer text the characters fixed by the secret alone."""
+    found: list[str] = []
+    for v in (value, value.strip()):
+        data = v.encode("utf-8", "surrogatepass")
+        percent = "".join(chr(b) if chr(b).isascii() and (chr(b).isalnum() or chr(b) in "-._~") else "%%%02X" % b for b in data)
+        found += [v, percent, percent.replace("%20", "+"), binascii.hexlify(data).decode()]
+        for shift in range(3):
+            coded = binascii.b2a_base64(bytes(shift) + data, newline=False).decode()
+            found += [coded] if shift == 0 else []
+            bare = coded.rstrip("=")
+            cut = bare[(0, 2, 3)[shift]:]
+            if (shift + len(data)) % 3:
+                cut = cut[:-1]
+            found += [bare if shift == 0 else cut, cut]
+    out = []
+    for f in found:
+        out += [f, f.translate(str.maketrans("+/", "-_"))]
+    return [f for f in out if f]
+
+
 @functools.lru_cache(maxsize=256)
-def _last_check_pattern(secrets: _Secrets):
-    needles = set(secrets.whole) | set(secrets.runs)
-    return re.compile("|".join(re.escape(n) for n in sorted(needles, key=len, reverse=True)), re.IGNORECASE) if needles else None
+def _final_pattern(values: tuple[str, ...]):
+    needles: set[str] = set()
+    for value in values:
+        for form in _final_forms(value):
+            if len(form) <= SECRET_RUN:
+                needles.add(form)
+            else:
+                needles.update(form[k:k + SECRET_RUN] for k in range(len(form) - SECRET_RUN + 1))
+    if not needles:
+        return None
+    return re.compile("|".join(re.escape(n) for n in sorted(needles, key=len, reverse=True)), re.IGNORECASE)
 
 
 def _code(value: Any, secrets: _Secrets) -> str:
     """An error_code as shown in a message: itself if it has the code shape and holds no run of a secret, else
     CODE_WITHHELD. (The comparison with ORDER_NOT_FOUND uses the raw value; see _not_found_code.)"""
     try:
-        if type(value) is str and _CODE.fullmatch(value) and not secrets.found(value.lower()) and _last_check(value, secrets) == value:
+        if type(value) is str and _CODE.fullmatch(value) and not secrets.found(value.lower()):
             return value
     except Exception:
         pass
     return CODE_WITHHELD
 
 
-def _clean(value: Any, pattern: re.Pattern, secrets: _Secrets) -> str | None:
-    """value if it is a str that fully matches `pattern` and holds no run of a secret, else None."""
+def _clean(value: Any, pattern: re.Pattern, secrets: _Secrets, final=None) -> str | None:
+    """value if it is a str that fully matches `pattern`, holds no run of a secret, and passes `final` (the
+    venue's last check) unchanged; else None."""
     try:
-        if type(value) is str and pattern.fullmatch(value) and not secrets.found(value.lower()) and _last_check(value, secrets) == value:
+        if type(value) is str and pattern.fullmatch(value) and not secrets.found(value.lower()) and (final is None or final(value) == value):
             return value
     except Exception:
         pass
@@ -568,10 +631,12 @@ _SYMBOL = re.compile(r"[A-Za-z0-9./\-]{1,24}")
 _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 _STATUS = re.compile(r"(?=.{1,48}\Z)[A-Z_]+(?: [A-Z_]+)*")
 _KIND = re.compile(r"[A-Za-z_]{1,24}")
+_ACCOUNT_TYPE = re.compile(r"[A-Z_]{1,24}")
+_CLASS = re.compile(r"[A-Za-z][A-Za-z0-9]{0,47}")
 _CURRENCY = re.compile(r"[A-Za-z]{3}")
 
 
-def _plain_id(value: Any, secrets: _Secrets) -> str | None:
+def _plain_id(value: Any, secrets: _Secrets, final=None) -> str | None:
     """An id from an answer (an order id, a client order id, an account id): digits, letters, hyphens and
     underscores, up to 64 characters, holding no run of a secret; an int is written in digits. Else None."""
     if isinstance(value, int) and not isinstance(value, bool):
@@ -579,27 +644,37 @@ def _plain_id(value: Any, secrets: _Secrets) -> str | None:
             value = str(int(value)) if abs(value) < 10 ** 64 else None
         except Exception:
             return None
-    return _clean(value, _ID, secrets)
+    return _clean(value, _ID, secrets, final)
 
 
-def _status_word(value: Any, secrets: _Secrets) -> str | None:
+def _status_word(value: Any, secrets: _Secrets, final=None) -> str | None:
     """A raw status as handed back: None when absent, itself in the code shape (spaces allowed, as in the SDK's
     "PARTIAL FILLED"), else WITHHELD."""
     if value is None:
         return None
-    return _clean(value, _STATUS, secrets) or WITHHELD
+    return _clean(value, _STATUS, secrets, final) or WITHHELD
 
 
-def _kind_word(value: Any, secrets: _Secrets) -> str | None:
+def _kind_word(value: Any, secrets: _Secrets, final=None) -> str | None:
     """An instrument_type as handed back: None when absent, itself if it is a short word, else WITHHELD."""
     if value is None:
         return None
-    return _clean(value, _KIND, secrets) or WITHHELD
+    return _clean(value, _KIND, secrets, final) or WITHHELD
 
 
 def _type_name(value: Any) -> str:
     try:
         return _plain(type(value).__name__, 200)
+    except Exception:
+        return WITHHELD
+
+
+def _class_name(value: Any, secrets: _Secrets) -> str:
+    """The class name of a failure, as shown: a class name comes from code, not from Webull's servers, so it is shown
+    when it is a plain identifier of letters and digits, up to 48, holding no run of a secret; else WITHHELD."""
+    name = _type_name(value)
+    try:
+        return name if _CLASS.fullmatch(name) and not secrets.found(name.lower()) else WITHHELD
     except Exception:
         return WITHHELD
 
@@ -624,10 +699,13 @@ def _status_code(res: Any) -> int | None:
 def _safe(exc: BaseException, secrets: _Secrets) -> str:
     """A short description of an SDK failure, every part through the gate: its class name, http_status, error_code
     (CODE_WITHHELD unless it has the code shape) and error_msg. No field read here can raise (see _attr)."""
-    status, code, msg = _attr(exc, "http_status"), _attr(exc, "error_code"), _attr(exc, "error_msg")
-    parts = ([_gate(status, secrets, 20)] if status is not None else []) + ([_code(code, secrets)] if code is not None else [])
-    msg = _gate(msg, secrets) if msg else ""
-    return _gate(_type_name(exc), secrets, 60) + (f" ({', '.join(parts)})" if parts else "") + (f": {msg}" if msg else "")
+    try:
+        status, code, msg = _attr(exc, "http_status"), _attr(exc, "error_code"), _attr(exc, "error_msg")
+        parts = ([_gate(status, secrets, 20)] if status is not None else []) + ([_code(code, secrets)] if code is not None else [])
+        msg = _gate(msg, secrets) if msg is not None else ""          # never a truth test on Webull's object
+        return _class_name(exc, secrets) + (f" ({', '.join(parts)})" if parts else "") + (f": {msg}" if msg else "")
+    except Exception:
+        return WITHHELD
 
 
 def _rebuilt(exc: WebullError, secrets: _Secrets) -> WebullError:
@@ -648,36 +726,44 @@ def _call(fn, *args, secrets: _Secrets = NO_SECRETS) -> Any:
     return _body(res, secrets)
 
 
-def _checked_error(exc: WebullError, secrets: _Secrets) -> WebullError:
-    """exc itself if its text passes the last check, else the same kind of error saying TEXT_WITHHELD."""
+def _checked_error(exc: WebullError, final) -> WebullError:
+    """exc itself if its text passes the last check (`final`), else the same kind of error saying TEXT_WITHHELD.
+    Either way it leaves with no link to anything it was raised from (see _bare)."""
     text = _plain(exc, 10 ** 6)
-    checked = _last_check(text, secrets)
-    if checked == text:
-        return exc
-    cls = LiveTradingNotConfirmed if isinstance(exc, LiveTradingNotConfirmed) else NotTransmitted if isinstance(exc, NotTransmitted) else WebullError
-    return cls(checked)
+    checked = final(text)
+    if checked != text:
+        cls = LiveTradingNotConfirmed if isinstance(exc, LiveTradingNotConfirmed) else NotTransmitted if isinstance(exc, NotTransmitted) else WebullError
+        exc = cls(checked)
+    return _bare(exc)
+
+
+def _bare(exc: WebullError) -> WebullError:
+    """The error with no reference to the SDK's exception or response: no __cause__, no __context__, and no
+    traceback (whose frames would hold them as local variables). The caller raises it outside any except block,
+    so that Python does not attach the exception being handled as its __context__ again."""
+    exc.__cause__ = None
+    exc.__context__ = None
+    exc.__suppress_context__ = False
+    return exc.with_traceback(None)
 
 
 def _public(fn):
     """A public method raises only WebullError (its kind kept: NotTransmitted stays NotTransmitted) and every text it
     raises has passed the last check. Any other exception raised inside (a value no JSON decoder makes, such as a
     5,000-digit integer or nesting 60,000 deep) becomes a WebullError naming only the gated class. What a method
-    hands back is built here: Webull's strings in it went through _clean (which ends in the last check) or are
+    hands back is built here: Webull's strings in it went through _clean (which ends in the venue's last check) or are
     error texts given the last check where they are stored; the module's own values (its client order id, the
     quantity it sent) are not searched, so a number of ours that happens to look like part of a hex-encoded secret
     is not withheld from the caller."""
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        secrets = self._secrets()
         try:
             return fn(self, *args, **kwargs)
         except WebullError as exc:
-            checked = _checked_error(exc, secrets)
-            if checked is exc:
-                raise
-            raise checked from None
+            err = _checked_error(exc, self._final)
         except Exception as exc:
-            raise _checked_error(WebullError(f"Webull's answer could not be read ({_gate(_type_name(exc), secrets, 60)})"), secrets) from None
+            err = _checked_error(WebullError(f"Webull's answer could not be read ({_class_name(exc, self._secrets())})"), self._final)
+        raise err                                                         # outside the except blocks: no __context__
     return wrapper
 
 
@@ -814,7 +900,24 @@ class WebullVenue:
 
         `token_dir`: where the SDK keeps its access token when a real client is built (the SDK writes it in plain
         text). Default ~/.valedia/webull/<environment>/; created with mode 0700; a directory inside the repository
-        is refused."""
+        is refused.
+
+        Nothing but WebullError leaves the constructor, and it carries no link to what the SDK raised. Every account
+        id the venue is given or learns is handed to valedia_trader.core.secrets.remember when that function exists
+        (looked up at that moment; nothing happens without it), and the HTTP library's request log
+        (urllib3.connectionpool) is set to WARNING unless a higher level is already set."""
+        err = None
+        try:
+            self._setup(app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir)
+        except WebullError as exc:
+            err = exc
+        except Exception as exc:
+            err = WebullError(f"could not set up the Webull venue ({_class_name(exc, _secrets_of(app_key, app_secret, account_id))})")
+        if err is not None:
+            words = (app_key, app_secret, account_id) if all(isinstance(w, str) or w is None for w in (app_key, app_secret, account_id)) else ()
+            raise _checked_error(err, lambda text: _last_check(text, words))
+
+    def _setup(self, app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir) -> None:
         if environment not in HOSTS:
             raise WebullError(f"environment must be one of {sorted(HOSTS)}")
         if not str(app_key).strip() or not str(app_secret).strip():
@@ -822,13 +925,16 @@ class WebullVenue:
         self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}"
         self._confirmation_file = Path(confirmation_file)
         self._app_key, self._app_secret = app_key, app_secret    # kept only to be withheld from every text
+        self._account_id = None
+        self._seen_accounts: set[str] = set()
+        _quiet_http_logging()
         secrets = _secrets_of(app_key, app_secret, account_id)
         if client is None:
             try:
                 from webull.core.client import ApiClient
                 from webull.trade.trade_client import TradeClient
-            except ImportError as exc:
-                raise WebullError("the Webull SDK is not installed: uv pip install 'webull-openapi-python-sdk>=3.0.4'") from exc
+            except ImportError:
+                raise WebullError("the Webull SDK is not installed: uv pip install 'webull-openapi-python-sdk>=3.0.4'") from None
             private_tokens = _private_token_dir(token_dir, environment)
             sdk_log = Path.cwd() / SDK_LOG_FILE
             sdk_log_existed = sdk_log.exists()
@@ -843,21 +949,48 @@ class WebullVenue:
                 api._stream_logger_set = api._file_logger_set = True
                 client = TradeClient(api)
             except Exception as exc:
-                text = _last_check(f"could not open a Webull session on {self.host}: {_safe(exc, secrets)}", secrets)
+                text = _last_check(f"could not open a Webull session on {self.host}: {_safe(exc, secrets)}", (app_key, app_secret, account_id))
                 raise WebullError(text) from None
             finally:
                 _quiet_sdk_logging()
                 _remove_new_empty_sdk_log(sdk_log_existed, sdk_log)
         self._client = client
+        if account_id is not None:
+            self._learn(account_id)
         self._account_id = account_id
         self._confirmed_not_found = confirmed_not_found is True
 
     def __repr__(self) -> str:
         return f"WebullVenue({self.name})"
 
+    def _words(self) -> tuple:
+        """The venue's complete secret set: the App Key, the App Secret, the account id when known and every account
+        id seen in an answer."""
+        known = {self._account_id} if isinstance(self._account_id, str) else set()
+        # an account id shorter than SECRET_RUN has no run to search for; matched whole it would withhold every
+        # message holding, say, the letter A
+        return (self._app_key, self._app_secret, *sorted(a for a in known | self._seen_accounts if len(a.strip()) >= SECRET_RUN))
+
     def _secrets(self, with_account: bool = True) -> _Secrets:
-        """The App Key, the App Secret and (unless told otherwise) the account id when known."""
-        return _secrets_of(self._app_key, self._app_secret, self._account_id if with_account else None)
+        """The gate's secrets: the complete set, or (with_account False) only the App Key and App Secret."""
+        return _secrets_of(*self._words()) if with_account else _secrets_of(self._app_key, self._app_secret)
+
+    def _final(self, text: Any) -> str:
+        """The last check with the venue's complete secret set, whatever any caller has passed to the gate."""
+        return _last_check(text, self._words())
+
+    def _learn(self, account_id: Any) -> None:
+        """Remember an account id seen in an answer or given: withheld from every text from now on, and handed to
+        valedia_trader.core.secrets.remember when that function exists."""
+        if not isinstance(account_id, str) or not account_id.strip():
+            return
+        self._seen_accounts.add(account_id)
+        try:
+            remember = getattr(importlib.import_module("valedia_trader.core.secrets"), "remember", None)
+            if callable(remember):
+                remember(account_id)
+        except Exception:
+            pass
 
     def _call(self, fn, *args) -> Any:
         return _call(fn, *args, secrets=self._secrets())
@@ -876,14 +1009,18 @@ class WebullVenue:
     @_public
     def accounts(self) -> list[dict]:
         """[{account_id, account_type}]: the account id when it is a plain id (digits, letters, hyphens, underscores,
-        up to 64) holding no run of the App Key or App Secret, else None; the type when it is a short word, else None."""
+        up to 64) holding no run of the App Key or App Secret (an account id may look like another), else None; the
+        type when it is a short upper-case word in the code shape holding no run of the key, the secret or any
+        account id seen, else None. Every account id in the answer is learned (see _learn)."""
         body = self._call(self._client.account_v2.get_account_list)
         rows = body if isinstance(body, list) else body.get("accounts", body.get("data", [])) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             raise WebullError("Webull's account list has an unexpected shape")
-        credentials = self._secrets(with_account=False)
-        return [{"account_id": _plain_id(r.get("account_id"), credentials),
-                 "account_type": _clean(r.get("account_type"), _KIND, credentials)} for r in rows]
+        for r in rows:
+            self._learn(r.get("account_id"))
+        credentials, everything = self._secrets(with_account=False), self._secrets()
+        return [{"account_id": _plain_id(r.get("account_id"), credentials, lambda s: _last_check(s, credentials.words)),
+                 "account_type": _clean(r.get("account_type"), _ACCOUNT_TYPE, everything, self._final)} for r in rows]
 
     @property
     @_public
@@ -894,6 +1031,7 @@ class WebullVenue:
                 raise WebullError(f"{len(found)} accounts are visible; set WEBULL_ACCOUNT_ID to choose one")
             if not found[0]["account_id"]:
                 raise WebullError("Webull's account list names no plain account_id")
+            self._learn(found[0]["account_id"])
             self._account_id = found[0]["account_id"]
         return self._account_id
 
@@ -918,7 +1056,7 @@ class WebullVenue:
 
         def kept(source: dict, numbers: tuple[str, ...], code: str) -> dict:
             out: dict = {}
-            cur = _clean(source.get(code), _CURRENCY, secrets)
+            cur = _clean(source.get(code), _CURRENCY, secrets, self._final)
             if cur is not None:
                 out[code] = cur
             for name in numbers:
@@ -972,7 +1110,7 @@ class WebullVenue:
     def _symbol(self, value: Any, where: str) -> str:
         """A symbol from an answer: up to 24 letters, digits, dots, hyphens and slashes, holding no run of a secret.
         Anything else (missing, padded, longer, other characters) is an unexpected shape."""
-        sym = _clean(value, _SYMBOL, self._secrets())
+        sym = _clean(value, _SYMBOL, self._secrets(), self._final)
         if sym is None:
             raise WebullError(f"Webull's {where} has a row whose symbol is missing or not a clean symbol")
         return sym
@@ -995,7 +1133,7 @@ class WebullVenue:
             if qty is not None and abs(qty) > MAX_HOLDING_UNITS:          # absurd: no holding
                 qty = None
             if type(kind) is not str or kind not in HOLDING_TYPES:
-                others.append({"symbol": sym, "instrument_type": _kind_word(kind, secrets), "quantity": qty})
+                others.append({"symbol": sym, "instrument_type": _kind_word(kind, secrets, self._final), "quantity": qty})
                 continue
             sym = _trader_symbol(sym, kind)
             if (kind, sym) in holdings:
@@ -1092,43 +1230,48 @@ class WebullVenue:
         except WebullError as exc:
             raise NotTransmitted(f"not sent: {_plain(exc)}") from None    # built here from gated parts
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
-            raise NotTransmitted(f"not sent: {_gate(_type_name(exc), secrets, 60)}: {_gate(exc, secrets)}") from None
+            raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
+        detail = None
         try:
             res = self._client.order_v3.place_order(account, [order])   # the only order call; nothing refuses after it
-        except NotTransmitted as exc:                                     # raised from inside the call: outcome unknown
-            raise WebullError("outcome unknown: the order call began and then failed: " + _gate(exc, secrets)) from None
+        except NotTransmitted as exc:                                     # raised from inside the call: still unknown
+            detail = "the order call began and then failed: " + _gate(exc, secrets)
         except WebullError as exc:
-            raise WebullError("outcome unknown: " + _gate(exc, secrets)) from None
+            detail = "the client failed: " + _gate(exc, secrets)
         except Exception as exc:
-            raise WebullError("outcome unknown: Webull call failed: " + _safe(exc, secrets)) from None
-        try:                                                              # everything after the call, in one guarded block
-            status = _status_code(res)
-            if status is None:
-                raise WebullError("outcome unknown: the answer to the order call carries no readable status")
-            if status != 200:
-                _body(res, secrets)                                       # raises, naming the status and the gated error
-                raise WebullError(f"outcome unknown: Webull answered {status}")
-        except WebullError:
-            raise
-        except Exception as exc:
-            raise WebullError(f"outcome unknown: Webull's answer could not be read ({_gate(_type_name(exc), secrets, 60)})") from None
+            detail = "Webull call failed: " + _safe(exc, secrets)
+        if detail is None:
+            try:                                                          # everything after the call, in one guarded block
+                status = _status_code(res)
+                if status is None:
+                    detail = "the answer to the order call carries no readable status"
+                elif status != 200:
+                    try:
+                        _body(res, secrets)                               # raises, naming the status and the gated error
+                        detail = f"Webull answered {status}"
+                    except WebullError as exc:
+                        detail = _plain(exc)
+            except Exception as exc:
+                detail = f"Webull's answer could not be read ({_class_name(exc, secrets)})"
+        if detail is not None:
+            raise WebullError(OUTCOME_UNKNOWN + self._final(detail))     # outside every except block
         # Webull answered 200: the order was placed. Reading the answer can no longer turn it into an error.
         try:
-            venue_order_id = self._venue_order_id(_json(res), order["client_order_id"], secrets)
+            venue_order_id = self._venue_order_id(_json(res), order["client_order_id"], secrets, self._final)
         except Exception:
             venue_order_id = None
         return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": venue_order_id,
                 "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
 
     @staticmethod
-    def _venue_order_id(body: Any, cid: str, secrets: _Secrets) -> str | None:
+    def _venue_order_id(body: Any, cid: str, secrets: _Secrets, final=None) -> str | None:
         """`order_id` of the place-order answer (docs common-order-place); inside an order list, the item with our id.
         Kept only as a plain id (see _plain_id)."""
         if isinstance(body, dict) and body.get("order_id"):
-            return _plain_id(body["order_id"], secrets)
+            return _plain_id(body["order_id"], secrets, final)
         items = _order_items(body) or []
         mine = [o for o in items if o.get("client_order_id") == cid and o.get("order_id")]
-        return _plain_id(mine[0]["order_id"], secrets) if mine else None
+        return _plain_id(mine[0]["order_id"], secrets, final) if mine else None
 
     @_public
     def cancel(self, tag: str) -> dict:
@@ -1155,7 +1298,7 @@ class WebullVenue:
                 self._call(self._client.order_v3.cancel_order, account, o["client_order_id"])
                 out.append({**entry, "status": "cancel requested"})
             except WebullError as exc:
-                out.append({**entry, "status": "error", "error": _last_check(_plain(exc, 10 ** 6), self._secrets())})
+                out.append({**entry, "status": "error", "error": self._final(_plain(exc, 10 ** 6))})
         return out
 
     # ---- what happened to orders (reading: allowed in both environments)
@@ -1214,8 +1357,8 @@ class WebullVenue:
         item = mine[0]
         price = _number(item.get("filled_price"))
         return {"state": _state(item.get("status")), "filled_units": _filled_units(item), "avg_price": price if price and price > 0 else None,
-                "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets) if item.get("order_id") else None,
-                "raw_status": _status_word(item.get("status"), secrets)}
+                "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
+                "raw_status": _status_word(item.get("status"), secrets, self._final)}
 
     def _no_such_order(self, answer: str) -> None:
         if self._confirmed_not_found:
@@ -1247,11 +1390,11 @@ class WebullVenue:
                 kind = item.get("instrument_type")
                 sym = _trader_symbol(self._symbol(item.get("symbol"), "open-order list"), kind)
                 qty, sign = _number(item.get("total_quantity")), _side_sign(item.get("side"))
-                out.append({"client_order_id": _plain_id(item.get("client_order_id"), secrets),
-                            "venue_order_id": _plain_id(item.get("order_id"), secrets) if item.get("order_id") else None,
-                            "symbol": sym, "instrument_type": _kind_word(kind, secrets),
+                out.append({"client_order_id": _plain_id(item.get("client_order_id"), secrets, self._final),
+                            "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
+                            "symbol": sym, "instrument_type": _kind_word(kind, secrets, self._final),
                             "units": None if qty is None or sign is None else sign * abs(qty), "state": _state(item.get("status")),
-                            "filled_units": _filled_units(item), "raw_status": _status_word(item.get("status"), secrets)})
+                            "filled_units": _filled_units(item), "raw_status": _status_word(item.get("status"), secrets, self._final)})
             key = body.get("pagination_key") if isinstance(body, dict) else None
             if key is None:
                 return out
@@ -1306,11 +1449,11 @@ class WebullVenue:
             report["positions"] = len(self._flatten(holdings, duplicated))
             report["other_positions"] = len(others)
         except WebullError as exc:
-            report["balance"] = _last_check(_plain(exc, 10 ** 6), self._secrets())
+            report["balance"] = self._final(_plain(exc, 10 ** 6))
         try:
             report["open_orders"] = len(self.open_orders())
         except WebullError as exc:
-            report["open_orders_error"] = _last_check(_plain(exc, 10 ** 6), self._secrets())
+            report["open_orders_error"] = self._final(_plain(exc, 10 ** 6))
         confirmation = load_live_confirmation(self._confirmation_file)
         report["real_money_orders"] = ("off: test environment" if self.environment != "production" else
                                        "off: no written confirmation" if confirmation is None else
@@ -1327,12 +1470,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         venue = WebullVenue.from_secrets()
         if args.cmd == "check":
-            secrets = venue._secrets()
-            print(_last_check(json.dumps(venue.check(), indent=2, default=str), secrets))
+            print(venue._final(json.dumps(venue.check(), indent=2, default=str)))
     except Exception as exc:
         secrets = venue._secrets() if isinstance(venue, WebullVenue) else NO_SECRETS
-        text = f"not ready: {_gate(_type_name(exc), secrets, 60)}: {_gate(exc, secrets, 400)}"
-        print(_last_check(text, secrets), file=sys.stderr)
+        name = _class_name(exc, secrets)
+        if not isinstance(venue, WebullVenue) and str(getattr(type(exc), "__module__", "")).split(".")[0] not in ("builtins", "valedia_trader"):
+            name = WITHHELD                                               # no venue, so no secrets to check a foreign name against
+        text = f"not ready: {name}: {_gate(exc, secrets, 400)}"
+        print(venue._final(text) if isinstance(venue, WebullVenue) else _last_check(text, ()), file=sys.stderr)
         return 2
     return 0
 

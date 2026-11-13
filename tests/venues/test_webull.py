@@ -1788,7 +1788,9 @@ def test_the_last_check_works_on_its_own(tmp_path, monkeypatch):
         for endpoint in ("accounts", "detail", "place"):
             seen = _run_everything(tmp_path, key, secret, account, source, endpoint, f"denied {key}")
             _assert_no_leak(seen, key, secret, account, _Collect())
-            assert any(how == "raised" and "text withheld" in what for _, how, what in seen), (source, endpoint)
+            # rev 7: a class name is judged by its own rule (_class_name), not by the gate, so it is withheld there
+            assert any(how == "raised" and ("text withheld" in what or (source == "class_name" and "<withheld>" in what))
+                       for _, how, what in seen), (source, endpoint)
 
 
 def test_submit_and_cancels_hand_back_no_raw_answer(tmp_path):
@@ -2002,3 +2004,208 @@ def test_a_position_row_without_a_clean_symbol_is_an_unexpected_shape(tmp_path, 
     for call in (v.positions, v.other_positions):
         with pytest.raises(wb.WebullError, match="symbol"):
             call()
+
+
+# ---- T9 rev 7: account ids, base64 offsets, class names, independent last check, clean exceptions, unknown outcome
+
+def test_an_account_type_is_a_short_code_never_an_account_id(tmp_path):
+    rows = [{"account_id": "ACC-0001-1234", "account_type": "ACC-0001-1234"}, {"account_id": "ACCOUNTXYZW", "account_type": "CASH"},
+            {"account_id": "ACC-3", "account_type": "ACCOUNTXYZW"}, {"account_id": "ACC-4", "account_type": "cash"}]
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(accounts=rows), account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json")
+    assert [a["account_type"] for a in v.accounts()] == [None, "CASH", None, None]
+    assert [a["type"] for a in v.check()["accounts"]] == [None, "CASH", None, None]
+
+
+def test_every_string_handed_back_is_checked_against_every_account_id_seen(tmp_path):
+    page = {"data": [detail(order("SUBMITTED", cid="c-1", symbol="ACCOUNTXYZW"), cid="c-1")]}
+    client = FakeClient(accounts=[{"account_id": "ACC-0001-1234", "account_type": "CASH"}, {"account_id": "ACCOUNTXYZW", "account_type": "CASH"}],
+                        open_pages={None: page})
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json")
+    v.accounts()                                                          # the venue has now seen ACCOUNTXYZW
+    with pytest.raises(wb.WebullError, match="symbol"):
+        v.open_orders()
+
+
+def test_base64_at_every_byte_offset_is_found_for_every_piece_of_six_or_more(tmp_path):
+    rng = _random.Random(31)
+    checked = 0
+    for _ in range(60):
+        secret = _random_secret(rng, rng.choice(SECRET_FORMATS))
+        gate = wb._secrets_of(secret)
+        for offset in range(3):
+            for _ in range(4):
+                length = rng.randint(6, len(secret))
+                start = rng.randint(0, len(secret) - length)
+                piece = secret[start:start + length].encode()
+                prefix = bytes(rng.randrange(256) for _ in range(offset + 3 * rng.randint(0, 2)))
+                suffix = bytes(rng.randrange(256) for _ in range(rng.randint(0, 5)))
+                for enc in (_b64.b64encode(prefix + piece + suffix).decode(), _b64.urlsafe_b64encode(prefix + piece + suffix).decode().rstrip("=")):
+                    assert gate.found(enc.lower()), (secret, offset, piece, enc)
+                    assert wb._last_check(f"x {enc} y", (secret,)) == wb.TEXT_WITHHELD, (secret, offset, piece, enc)
+                    checked += 1
+    assert checked >= 1000
+
+
+@pytest.mark.parametrize("name, shown", [("ServerException", True), ("TimeoutError", True), ("HTTP2Error", True),
+                                         ("Err_x", False), ("A" * 49, False), ("Kq7Zplantedkey0001Error", False), ("bad name", False)])
+def test_a_failures_class_name_is_shown_when_it_is_a_plain_identifier(tmp_path, name, shown):
+    client = FakeClient()
+    exc = type(name, (Exception,), {"error_code": "SYSTEM_BUSY", "http_status": 417, "error_msg": "busy"})()
+    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(exc)
+    with pytest.raises(wb.WebullError) as got:
+        wb.WebullVenue("Kq7Zplantedkey0001", SECRET, client=client, confirmation_file=tmp_path / "x.json").accounts()
+    assert (f"Webull call failed: {name} (417, SYSTEM_BUSY): busy" == str(got.value)) is shown, str(got.value)
+    if not shown:
+        assert str(got.value).startswith("Webull call failed: <withheld> (417, SYSTEM_BUSY)")
+
+
+WORD_SECRET = "zqplantedsecretwordx"                                      # a plain lower-case word: the shape rule keeps it
+
+
+def _word_secret_venue(tmp_path, secret):
+    client = FakeClient()
+    client.account_v2.get_account_list = lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", 417, f"denied {secret}"))
+    return wb.WebullVenue(KEY, secret, client=client, confirmation_file=tmp_path / "x.json")
+
+
+def test_the_last_check_withholds_what_the_gate_missed_with_a_form_removed(tmp_path, monkeypatch):
+    secret = WORD_SECRET + "a"
+    original = wb._forms
+    monkeypatch.setattr(wb, "_forms", lambda words: {f for f in original(words) if f.lower() != secret.lower()})
+    assert "zqplantedsecretwordxa" in wb._gate(f"denied {secret}", wb._secrets_of(KEY, secret))     # the gate is defeated
+    with pytest.raises(wb.WebullError) as exc:
+        _word_secret_venue(tmp_path, secret).accounts()
+    assert str(exc.value) == wb.TEXT_WITHHELD
+
+
+def test_the_last_check_withholds_what_the_gate_missed_with_no_secrets(tmp_path, monkeypatch):
+    secret = WORD_SECRET + "b"
+    monkeypatch.setattr(wb.WebullVenue, "_secrets", lambda self, *a, **k: wb.NO_SECRETS)
+    with pytest.raises(wb.WebullError) as exc:
+        _word_secret_venue(tmp_path, secret).accounts()
+    assert str(exc.value) == wb.TEXT_WITHHELD
+    assert wb._last_check(f"denied {secret}", wb.NO_SECRETS) == f"denied {secret}"   # alone, the module function knows nothing
+    v = _word_secret_venue(tmp_path, secret)
+    assert v._final(f"denied {secret}") == wb.TEXT_WITHHELD                            # the venue's check takes its own set
+
+
+class _Unbool:
+    def __bool__(self):
+        raise RuntimeError("no truth value")
+
+    def __str__(self):
+        raise RuntimeError("no text")
+
+
+class _Odd(Exception):
+    error_msg = _Unbool()
+    error_code = _Unbool()
+    http_status = _Unbool()
+
+    def __str__(self):
+        raise RuntimeError("no text")
+
+
+@pytest.mark.parametrize("where", ["api", "endpoint", "token", "trade"])
+@pytest.mark.parametrize("what", ["odd", "unreadable", "webull", "value"])
+def test_nothing_but_webull_error_leaves_the_constructor(tmp_path, monkeypatch, where, what):
+    def fail():
+        raise {"odd": _Odd(), "unreadable": Unreadable(), "webull": wb.WebullError("x"), "value": ValueError("y")}[what]
+
+    class ApiClient:
+        def __init__(self, k, s, region):
+            if where == "api":
+                fail()
+
+        def add_endpoint(self, region, host):
+            if where == "endpoint":
+                fail()
+
+        def set_token_dir(self, d):
+            if where == "token":
+                fail()
+
+    class TradeClient:
+        def __init__(self, api):
+            fail()
+
+    monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=ApiClient))
+    monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=TradeClient))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(wb.WebullError) as exc:
+        wb.WebullVenue(KEY, SECRET, confirmation_file=tmp_path / "x.json")
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+
+
+@pytest.mark.parametrize("source", ["sdk_msg", "exc_message", "webull_error", "not_transmitted", "error_body", "status", "answer_all"])
+@pytest.mark.parametrize("endpoint", sorted(ENDPOINT_TARGETS))
+def test_no_raised_error_carries_the_sdks_exception(tmp_path, source, endpoint):
+    raised = 0
+    for name, call in METHODS.items():
+        v = _planted_venue(tmp_path, KEY, SECRET, "ACC-0001-1234", source, endpoint, "busy")
+        try:
+            call(v)
+        except wb.WebullError as exc:
+            assert exc.__context__ is None and exc.__cause__ is None, (name, repr(exc.__context__))
+            raised += 1
+    v = _planted_venue(tmp_path, KEY, SECRET, "ACC-0001-1234", source, endpoint, "busy", known=False)
+    try:
+        v.account_id
+    except wb.WebullError as exc:
+        assert exc.__context__ is None and exc.__cause__ is None
+    assert raised > 0 or source == "answer_all"                       # a well-formed answer may raise nothing
+
+
+AFTER_CALL = {"server": lambda: (_ for _ in ()).throw(ServerException("SYSTEM_BUSY", 500)),
+              "webull": lambda: (_ for _ in ()).throw(wb.WebullError("client trouble")),
+              "not_transmitted": lambda: (_ for _ in ()).throw(wb.NotTransmitted("client says not sent")),
+              "runtime": lambda: (_ for _ in ()).throw(RuntimeError("socket closed")),
+              "417": lambda: Response({"error_code": "INSUFFICIENT_FUNDS", "message": "Insufficient buying power"}, 417),
+              "500": lambda: Response(None, 500), "text_status": lambda: Response({}, "200"),
+              "compare": lambda: Response({}, _StatusRaises()), "property": lambda: _PropertyRaises()}
+
+
+@pytest.mark.parametrize("how", sorted(AFTER_CALL))
+def test_every_error_after_the_order_call_says_the_outcome_is_unknown(tmp_path, how):
+    client = FakeClient()
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), AFTER_CALL[how]())[1]
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError) as exc:
+        v.submit("SPY", 1.0, "t")
+    text = str(exc.value)
+    assert type(exc.value) is wb.WebullError and len(client.placed()) == 1
+    assert "outcome unknown" in text and "read the order's status" in text and "before retrying" in text, text
+
+
+def test_a_learned_account_id_is_handed_to_secrets_remember_when_it_exists(tmp_path, monkeypatch):
+    import valedia_trader.core.secrets as core_secrets
+    seen = []
+    monkeypatch.setattr(core_secrets, "remember", lambda value, *a, **k: seen.append(value), raising=False)
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    assert v.account_id == "ACC-0001-1234" and "ACC-0001-1234" in seen
+    monkeypatch.delattr(core_secrets, "remember", raising=False)
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    assert v.account_id == "ACC-0001-1234"                                # without remember nothing breaks
+
+    def broken(value, *a, **k):
+        raise RuntimeError("remember failed")
+    monkeypatch.setattr(core_secrets, "remember", broken, raising=False)
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    assert v.account_id == "ACC-0001-1234"
+
+
+def test_the_http_librarys_debug_log_is_quieted(tmp_path):
+    log = logging.getLogger("urllib3.connectionpool")
+    old = log.level
+    try:
+        log.setLevel(logging.DEBUG)
+        wb._quiet_sdk_logging()
+        assert log.level == logging.WARNING
+        log.setLevel(logging.ERROR)
+        wb._quiet_sdk_logging()
+        assert log.level == logging.ERROR                                 # a higher level already set is kept
+        log.setLevel(logging.NOTSET)
+        wb.WebullVenue(KEY, SECRET, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+        assert log.level == logging.WARNING
+    finally:
+        log.setLevel(old)
