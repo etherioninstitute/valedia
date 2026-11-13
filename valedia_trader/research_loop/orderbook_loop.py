@@ -14,13 +14,16 @@ What happens each minute (`Collector.cycle`), in this order:
 
 * snapshot  first, for every watched market (by watch number, the same order each minute) and then for every
             market in its tail (below): the ten best levels a side of its book and the trades since the last read
-            (deduplicated by `trade_id`), each request stamped with its start and end time. A book that is
+            (each read looks back 120 s before the previous read began, because trades can reach the tape late,
+            and a trade is stored once by its `trade_id`), each request stamped with its start and end time. A
+            book that is
             crossed (best bid at or above best ask), has a negative size or a malformed price is stored as sent
             (`raw_json`), marked `invalid` with the reason, and never decided on;
 * decide    then, every five minutes per market, on that market's own phase (the minutes of the hour where
             minute mod 5 equals its phase, 0 to 4, given at selection and spread evenly), once it has 30 minutes
             of snapshots: build the numeric state from what was stored strictly before that moment
-            (`state_at`), check the pinned model tag, ask the six questions of `BATTERY` in one call, and store
+            (`state_at`: "now" is the newest snapshot, and every history reference is aimed at that snapshot's
+            time less the horizon), check the pinned model tag, ask the six questions of `BATTERY` in one call, and store
             the state, the answers and one status. The call has a hard limit of MODEL_LIMIT_S (10 s): an answer
             not in by then is abandoned and the slot is stored as `late`, with no answers. A call is not started
             when fewer than 12 s of the minute are left (also `late`), so the decisions never push the next
@@ -29,19 +32,33 @@ What happens each minute (`Collector.cycle`), in this order:
             empty or invalid for 30 minutes. A dropped market is read on (book and trades once a minute, marked
             `tail`, no decisions) for 35 minutes after its drop or until it closes, whichever comes first, so the
             outcomes of its last decisions can be rebuilt;
-* select    every six hours on a fixed grid (from the first selection), fill the free places from all open markets
+* select    every six hours on a fixed grid (from the first selection; a grid point missed while stopped is made
+            up at once, recorded off the grid, and the grid stays), fill the free places from all open markets
             by the rule of the prediction (`select_markets`), and give each new market the least-used phase
             (`assign_phases`). A watch's 12 hours run from the start of the selection that chose it, so they
             end on the grid: at a reselection the watches that have run 12 hours, or will within two minutes, are
             ended first and their places filled in the same transaction, and nothing is left unwatched in
             between. A market may be chosen again; when its snapshots ran on without a break (its tail included)
             it needs no new 30-minute warm-up. Whenever nothing is watched, for whatever reason, a selection runs
-            at once, off the grid (recorded as `selection_off_grid`), and again each minute until one succeeds.
-            While a selection reads, each new minute still gets its cycle (`_tick`);
-* heartbeat one row with the requests and failures since the last one.
+            at once, off the grid (recorded as `selection_off_grid`), and again each minute until one chooses
+            something; after three selections in a row that chose nothing, every five minutes. While a selection
+            reads, each new minute still gets its cycle (`_tick`);
+* heartbeat one row with the requests and failures since the last one, written before any selection.
 
-If a cycle runs into the next minute the next one starts at once (event `overrun`); a clock that goes back is
-recorded (event `clock_back`) and the loop carries on.
+If a cycle runs into the next minute the next one starts at once (event `overrun`). A clock that goes back is
+recorded (event `clock_back`) and the loop carries on: the grid and the start of every watch are re-based by the
+same seconds, so reselections and 12-hour ends come when they would have. Nothing but a stop signal ends the loop:
+when the record cannot be written (a full disk) it writes one line to standard error, tries again each minute,
+and records the gap once it can write again.
+
+Where this differs from the prediction's words:
+
+* a watch's 12 hours are counted from the start of the selection that chose it, so they can differ from 12 hours
+  of reads by the length of a selection (seconds to a few minutes);
+* volume and the ranking use Kalshi's cached 24-hour volume of the market object;
+* places freed between grid points (a market dropped near its close or for a one-sided book) stay empty until the
+  next grid point, unless nothing at all is watched;
+* the cached-quote screen below.
 
 The selection reads a live book only for markets whose cached quote (the market object, cached about five
 seconds) is within five cents of the band (best bid at least 5, best ask at most 95, spread at most 20 cents);
@@ -59,8 +76,8 @@ one book per market read (it stops once the places are full), at the same three 
 market every five minutes, and the twenty markets are spread over five phases, 20 / 5 = 4 a phase, so every
 minute makes exactly 4 calls, under the 5 allowed, in that minute and not only on average (with fewer markets
 after drops a phase holds at most 4, since a new market always takes the least-used phase). Measured on
-2026-11-13 with the final battery: about 12,900 input tokens and 3.1 to 3.3 s a call when warm (5.4 s cold), so a
-minute takes about 14 s of reads plus 4 x 3.3 = 13 s of model time; at worst 14 s + 4 x 10 s = 54 s, still inside
+2026-11-13 with the final battery (rev 4): about 14,000 input tokens and 3.4 to 3.5 s a call when warm (5.7 s cold),
+so a minute takes about 14 s of reads plus 4 x 3.5 = 14 s of model time; at worst 14 s + 4 x 10 s = 54 s, still inside
 the minute. Each call
 is preceded by two loopback GETs (`/api/tags`, `/api/version`, 2 s limit each) to check the pin.
 
@@ -135,7 +152,7 @@ MODEL_LIMIT_S = 10.0              # hard limit: an answer not in after this is a
 PIN_TIMEOUT_S = 2.0               # each of the two pin-check GETs
 CALL_RESERVE_S = 2.0              # no call is started with less than MODEL_LIMIT_S + this left in the minute
 FAILS_BEFORE_PAUSE, PAUSE_S = 5, 300
-TRADE_OVERLAP_S = 5               # each trades read starts 5 s before the previous one began
+TRADE_OVERLAP_S = 120             # each trades read looks back 120 s before the previous one began (late tape)
 FIRST_TRADES_S = 60               # a new market's first read goes back one minute
 MAX_BACKFILL_S = 3600             # after a stop the tape is read again from where it stopped, at most an hour back
 # Books are read only for markets whose cached quote is within five cents of the band (see the module docstring:
@@ -189,9 +206,11 @@ def _c(dollars: float) -> float:
 # ============================================================================ the battery
 
 _STATE_TEXT = ("The state is computed in code from one prediction market's order book and recent trades. Prices, "
-               "the mid, the spread and changes are in cents (0 to 100); sizes, depths and volumes are in contracts; "
+               "the mid and the spread are in cents from 0 to 100; changes are in cents and can be negative; "
+               "sizes, depths and volumes are in contracts; "
                "times are in minutes; imbalances and shares are fractions from 0 to 1; an imbalance is the buy "
                "side's share: the size bid to buy yes divided by that size plus the size offered to sell yes; "
+               "yes_taker_share is the share of the contracts traded in the window where the taker bought yes; "
                "spread_vs_60m_median is the spread now divided by its median over the last 60 minutes; a change "
                "is the value now minus the value then; null means not known yet. The bid is the best offer to buy "
                "yes and the ask the best offer to sell yes. ")
@@ -398,6 +417,9 @@ def select_markets(markets: Iterable[dict], books: dict, now: float, *, slots: i
         if b is None:
             no(t, "no_book", "book could not be read")
             continue
+        if b.get("invalid"):
+            no(t, "invalid_book", "book invalid: %s" % b["invalid"])
+            continue
         q = kd.best_quote(b)
         if q["bid"] is None or q["ask"] is None:
             no(t, "one_sided", "book one-sided or empty")
@@ -518,12 +540,12 @@ def reference(snaps: list[dict], target: float) -> dict | None:
     return best
 
 
-def _window_full(snaps: list[dict], t: float, minutes: int) -> bool:
-    """At least 90% of the window's minutes (counted back from t) hold a snapshot, and its far edge has a
-    reference (`reference`)."""
-    bins = {int((t - s["book_end_ts"]) // 60) for s in snaps if t - 60 * minutes < s["book_end_ts"] < t}
+def _window_full(snaps: list[dict], a: float, minutes: int) -> bool:
+    """At least 90% of the window's minutes (counted back from `a`, the newest snapshot's time, which is the
+    last of `snaps`) hold a snapshot, and its far edge has a reference (`reference`)."""
+    bins = {int((a - s["book_end_ts"]) // 60) for s in snaps if a - 60 * minutes < s["book_end_ts"] <= a}
     need = -(-9 * minutes // 10)                       # 90%, rounded up: 27 of 30, 54 of 60
-    return len(bins) >= need and reference(snaps, t - 60 * minutes) is not None
+    return len(bins) >= need and reference(snaps[:-1], a - 60 * minutes) is not None
 
 
 def _covered_from(snaps: list[dict]) -> float | None:
@@ -547,14 +569,17 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
     the trades created and seen strictly before t. Everything later is ignored, and so is every snapshot marked
     invalid. Numbers only, rounded; null where it cannot be computed yet; no ticker, title, date or time of day.
 
-    Each history reference (the mid 1, 5, 15, 30 and 60 minutes back, and the far edge of each window) is the
-    snapshot nearest its target among those within 30 s either side (`reference`); none, and the number is null.
+    "Now" is the newest valid snapshot finished before t. Every history reference (the mid 1, 5, 15, 30 and 60
+    minutes back, and the far edge of each window) is aimed at that snapshot's book time less the horizon, and is
+    the snapshot nearest that target among the earlier ones within 30 s either side (`reference`), so it is never
+    the newest snapshot itself; none, and the number is null. The trade windows end at the same time.
     `max_1m_mid_move_30m_cents` and `spread_vs_60m_median` are null unless at least 90% of their window's minutes
     (27 of 30, 54 of 60) hold a snapshot."""
     snaps = sorted((s for s in snapshots if s["end_ts"] < t and not s.get("invalid")), key=lambda s: s["book_end_ts"])
     tr = [x for x in trades if x["created_ts"] < t and x["seen_ts"] < t]
     out = dict.fromkeys(STATE_KEYS)
     out["minutes_to_close"] = _r((close_ts - t) / 60.0, 0)
+    a = snaps[-1]["book_end_ts"] if snaps else t        # the time every reference and window is aimed from
     if snaps:
         now = snaps[-1]
         yes, no = now["yes"], now["no"]
@@ -575,23 +600,23 @@ def state_at(snapshots: Iterable[dict], trades: Iterable[dict], t: float, close_
             if tot_b + tot_a > 0:
                 out["imbalance_10_levels"] = _r(tot_b / (tot_b + tot_a), 2)
             for k in (1, 5, 15, 30, 60):
-                ref = reference(snaps, t - 60 * k)
+                ref = reference(snaps[:-1], a - 60 * k)
                 ref_mid = _mid_c(ref) if ref is not None else None
                 out["mid_change_%dm_cents" % k] = _r(mid - ref_mid, 1) if ref_mid is not None else None
-            if _window_full(snaps, t, 30):
-                moves = [abs(_mid_c(b) - _mid_c(a)) for a, b in zip(snaps, snaps[1:])
-                         if b["book_end_ts"] > t - 1800 and b["book_end_ts"] - a["book_end_ts"] <= STALE_S
-                         and _mid_c(a) is not None and _mid_c(b) is not None]
+            if _window_full(snaps, a, 30):
+                moves = [abs(_mid_c(y) - _mid_c(x)) for x, y in zip(snaps, snaps[1:])
+                         if y["book_end_ts"] > a - 1800 and y["book_end_ts"] - x["book_end_ts"] <= STALE_S
+                         and _mid_c(x) is not None and _mid_c(y) is not None]
                 out["max_1m_mid_move_30m_cents"] = _r(max(moves), 1) if moves else None
-            if _window_full(snaps, t, 60):
-                spreads = [_spread_c(s) for s in snaps if s["book_end_ts"] > t - 3600 and _spread_c(s) is not None]
+            if _window_full(snaps, a, 60):
+                spreads = [_spread_c(s) for s in snaps if s["book_end_ts"] > a - 3600 and _spread_c(s) is not None]
                 med = statistics.median(spreads) if spreads else 0
                 out["spread_vs_60m_median"] = _r(spread / med, 2) if med > 0 else None
     covered = _covered_from(snaps)
     for w in (5, 15):
-        if covered is None or covered > t - 60 * w:
+        if covered is None or covered > a - 60 * w:
             continue
-        win = [x for x in tr if x["created_ts"] > t - 60 * w]
+        win = [x for x in tr if a - 60 * w < x["created_ts"] <= a]
         vol = sum(x["count"] for x in win)
         out["trades_%dm" % w], out["volume_%dm" % w] = len(win), _r(vol, 0)
         out["yes_taker_share_%dm" % w] = (_r(sum(x["count"] for x in win if x["taker_side"] == "yes") / vol, 2)
@@ -686,13 +711,35 @@ class Store:
                 cur = self.conn.execute(sql, [row[c] for c in cols])
         return cur.lastrowid if cur.rowcount else 0
 
+    def shifts(self) -> list[tuple[float, int, int]]:
+        """Each time the clock went back: (seconds, last selection id, last watch id) at that moment. Every
+        selection and watch recorded by then is re-based by those seconds (`shift`)."""
+        out = []
+        for (d,) in self.conn.execute("SELECT detail_json FROM events WHERE kind = 'clock_back' ORDER BY id"):
+            j = json.loads(d)
+            out.append((float(j["seconds"]), int(j.get("max_selection_id") or 0), int(j.get("max_watch_id") or 0)))
+        return out
+
+    @staticmethod
+    def shift(shifts: list, *, selection_id: int | None = None, watch_id: int | None = None) -> float:
+        if selection_id is not None:
+            return sum(x for x, sid, _ in shifts if sid >= selection_id)
+        return sum(x for x, _, wid in shifts if wid >= watch_id)
+
     def watched(self) -> list[dict]:
+        """The watches not dropped, their start and warm-up times re-based after any clock_back (`shift`)."""
+        sh = self.shifts()
         rows = self.conn.execute("SELECT watch_id, ticker, series, selected_ts, close_ts, market_json, phase, "
                                  "watch_start_ts, warm_from_ts FROM markets "
                                  "WHERE watch_id NOT IN (SELECT watch_id FROM market_drops) ORDER BY watch_id")
-        return [{"watch_id": w, "ticker": t, "series": s, "selected_ts": sel, "close_ts": c, "market": json.loads(m),
-                 "phase": p or 0, "watch_start_ts": ws if ws is not None else sel, "warm_from_ts": wf}
-                for w, t, s, sel, c, m, p, ws, wf in rows.fetchall()]
+        out = []
+        for w, t, s, sel, c, m, p, ws, wf in rows.fetchall():
+            d = self.shift(sh, watch_id=w)
+            out.append({"watch_id": w, "ticker": t, "series": s, "selected_ts": sel, "close_ts": c,
+                        "market": json.loads(m), "phase": p or 0,
+                        "watch_start_ts": (ws if ws is not None else sel) + d,
+                        "warm_from_ts": wf + d if wf is not None else None, "shift": d})
+        return out
 
     def tails(self, now: float, exclude: Iterable[str] = ()) -> list[dict]:
         """The dropped markets still to be read: dropped less than TAIL_S ago, not closed, not watched again; one
@@ -716,13 +763,13 @@ class Store:
         """For a market chosen at t: when its run of snapshots began, if its snapshots (an earlier watch or that
         watch's tail) ran up to t without a break; None when it starts afresh (its warm-up then runs from its
         own first snapshot)."""
-        wid, newest = self.conn.execute("SELECT watch_id, MAX(book_end_ts) FROM snapshots WHERE ticker = ?",
-                                        (ticker,)).fetchone()
+        wid, newest = self.conn.execute("SELECT watch_id, MAX(book_end_ts) FROM snapshots WHERE ticker = ? AND "
+                                        "book_end_ts <= ?", (ticker, t)).fetchone()
         if newest is None or newest < t - STALE_S:
             return None
         warm, first = self.conn.execute("SELECT warm_from_ts, (SELECT MIN(book_end_ts) FROM snapshots WHERE "
                                         "watch_id = ?) FROM markets WHERE watch_id = ?", (wid, wid)).fetchone()
-        return warm if warm is not None else first
+        return (warm if warm is not None else first) + self.shift(self.shifts(), watch_id=wid)
 
     def history(self, watch_id: int, t: float) -> tuple[list[dict], list[dict], float]:
         """The market's snapshots finished strictly before t (from every watch of it and their tails, the last
@@ -910,9 +957,9 @@ class Collector:
             self.event("pause", None, failures=FAILS_BEFORE_PAUSE, until_ts=self.paused_until,
                        until_iso=iso(self.paused_until))
 
-    def drop(self, w: dict, reason: str) -> None:
+    def drop(self, w: dict, reason: str, at: float | None = None) -> None:
         self.store.insert("market_drops", {"watch_id": w["watch_id"], "ticker": w["ticker"],
-                                           **stamp("dropped", self.clock()), "reason": reason})
+                                           **stamp("dropped", self.clock() if at is None else at), "reason": reason})
 
     # ---- start and stop
     def start(self) -> None:
@@ -926,8 +973,10 @@ class Collector:
             self.event("gap", None, from_ts=last, from_iso=iso(last), to_ts=now, to_iso=iso(now), seconds=now - last)
         for w in self.watched():
             reason = self._expired(w, now)
-            if reason:
-                self.drop(w, reason + " (while stopped)")
+            if reason:                                   # recorded as ending when it ran out, not at the restart
+                ran_out = min(x for x in (w["watch_start_ts"] + WATCH_MAX_S, w["close_ts"] - STOP_BEFORE_CLOSE_S)
+                              if x <= now)
+                self.drop(w, reason + " (while stopped)", at=max(ran_out, last if last is not None else ran_out))
         self._last_beat = now
 
     def finish(self, kind: str = "stop") -> None:
@@ -940,25 +989,40 @@ class Collector:
         wait = wait or self.stop.wait
         first = True
         while not self.stop.is_set():
-            now = self.clock()
-            if not (first and not self.watched()):
-                if self._minute is None or now < self._cycle_start:
-                    target = math.floor(now / 60) * 60 + 60
-                else:
-                    target = self._minute + 60
-                if now < target:
-                    wait(target + 0.2 - now)
-                    if self.stop.is_set():
-                        break
-                else:
-                    self.event("overrun", None, minute_ts=self._minute, minute_iso=iso(self._minute),
-                               late_s=now - target)
-            first = False
             try:
+                now = self.clock()
+                if not (first and not self.watched()):
+                    if self._minute is None or now < self._cycle_start:
+                        target = math.floor(now / 60) * 60 + 60
+                    else:
+                        target = self._minute + 60
+                    if now < target:
+                        wait(target + 0.2 - now)
+                        if self.stop.is_set():
+                            break
+                    else:
+                        try:
+                            self.event("overrun", None, minute_ts=self._minute, minute_iso=iso(self._minute),
+                                       late_s=now - target)
+                        except Exception:                # the cycle below reports a store that cannot be written
+                            pass
+                first = False
                 self.cycle()
-            except Exception as e:                       # never let one cycle end the loop
-                self.event("error", None, request="cycle", error="%s: %s" % (type(e).__name__, e))
-        self.finish("stop")
+            except Exception as e:                       # nothing but a stop ends the loop
+                self._record_failure(e)
+        try:
+            self.finish("stop")
+        except Exception as e:
+            self._record_failure(e)
+
+    def _record_failure(self, exc: Exception) -> None:
+        """Record a failed cycle; when even that cannot be written (a full disk), one line to standard error. The
+        loop tries again at the next minute and, once it can write, records the gap."""
+        try:
+            self.event("error", None, request="cycle", error="%s: %s" % (type(exc).__name__, exc))
+        except Exception as e:
+            print("orderbook_loop %s: cannot write the record (%s: %s); trying again next minute"
+                  % (iso(self.clock()), type(e).__name__, e), file=sys.stderr, flush=True)
 
     # ---- one minute
     def cycle(self, force_decision: bool = False, allow_select: bool = True) -> list[dict]:
@@ -967,13 +1031,17 @@ class Collector:
         heartbeat. Returns the decisions made."""
         start = self.clock()
         minute = math.floor(start / 60) * 60
-        if self._cycle_start is not None and start < self._cycle_start:
-            self.event("clock_back", None, from_ts=self._cycle_start, from_iso=iso(self._cycle_start), to_ts=start,
-                       to_iso=iso(start), seconds=start - self._cycle_start)
+        prev = self._cycle_start
+        self._cycle_start, self._minute = start, minute   # first, so a failed write cannot make the loop spin
+        if prev is not None and start < prev:            # re-base the grid and the watches
+            c = self.store.conn
+            self.event("clock_back", None, from_ts=prev, from_iso=iso(prev), to_ts=start,
+                       to_iso=iso(start), seconds=start - prev,
+                       max_selection_id=c.execute("SELECT MAX(id) FROM selections").fetchone()[0],
+                       max_watch_id=c.execute("SELECT MAX(watch_id) FROM markets").fetchone()[0])
         elif self._last_beat is not None and start - self._last_beat > 2 * 60:     # e.g. the Mac slept
             self.event("gap", None, from_ts=self._last_beat, from_iso=iso(self._last_beat), to_ts=start,
                        to_iso=iso(start), seconds=start - self._last_beat)
-        self._cycle_start, self._minute = start, minute
         if self.paused() and start >= self.paused_until:
             self.paused_until = None
             self.event("pause_end", None)
@@ -1003,20 +1071,39 @@ class Collector:
         can_select = allow_select and not self._selecting and not self.stop.is_set() and not self.paused()
         due = self._selection_due(minute) if can_select else None
         for w in watched:                                # a 12-hour end waits for the reselection that is due
-            reason = self._expired(w, now, keep_12h=due == "grid" or self._selecting) or self._one_sided(w)
+            reason = self._expired(w, now, keep_12h=due is not None or self._selecting) or self._one_sided(w)
             if reason:
                 self.drop(w, reason)
-        if can_select and due is None and not self.watched():
+        if due == "off_grid":
+            self.event("selection_off_grid", None, why="a grid point was missed")
+        elif can_select and due is None and not self.watched() and not self._backing_off(minute):
             due = "off_grid"
             self.event("selection_off_grid", None, why="nothing watched")
+        self._beat()                                     # before the selection, so a long one leaves no hole
         if due:
             self.select(kind=due)
+        return made
+
+    def _beat(self) -> None:
         self._last_beat = self.clock()
         self.store.insert("heartbeats", {**stamp("", self._last_beat), "watched": len(self.watched()),
                                          "kalshi_requests": self.n_requests, "kalshi_failures": self.n_failures,
                                          "model_calls": self.n_model_calls, "paused": int(self.paused())})
         self.n_requests = self.n_failures = self.n_model_calls = 0
-        return made
+
+    def _selections(self, limit: int) -> list[tuple[int, float, int, str]]:
+        """The latest selections, newest first: (id, start re-based after any clock_back, chosen, kind)."""
+        sh = self.store.shifts()
+        rows = self.store.conn.execute("SELECT id, started_ts, chosen, kind FROM selections ORDER BY id DESC LIMIT ?",
+                                       (limit,)).fetchall()
+        return [(i, st + self.store.shift(sh, selection_id=i), n, k) for i, st, n, k in rows]
+
+    def _backing_off(self, minute: float) -> bool:
+        """After three selections in a row that chose nothing, the next comes five minutes after the last."""
+        last = self._selections(3)
+        if len(last) < 3 or any(n for _, _, n, _ in last):
+            return False
+        return minute - math.floor(last[0][1] / 60) * 60 < 5 * 60
 
     def _tick(self) -> None:
         """Inside a selection: when a new minute has begun, run its cycle (snapshots, decisions, drops) first."""
@@ -1024,12 +1111,20 @@ class Collector:
             self.cycle(allow_select=False)
 
     def _selection_due(self, minute: float) -> str | None:
-        """'grid' on a new record, and at the minute six hours after the last selection on the grid."""
-        last = self.store.conn.execute("SELECT MAX(started_ts) FROM selections WHERE kind IS NULL OR "
-                                       "kind = 'grid'").fetchone()[0]
-        if last is None or minute >= math.floor(last / 60) * 60 + RESELECT_S:
+        """'grid' on a new record and at each grid point (the first selection's minute plus a multiple of six
+        hours, re-based after any clock_back); 'off_grid' when the latest grid point passed with no selection
+        since (a stop, or a selection that could not finish), which leaves the grid where it is."""
+        first = self.store.conn.execute("SELECT id, started_ts FROM selections WHERE kind IS NULL OR kind = 'grid' "
+                                        "ORDER BY id LIMIT 1").fetchone()
+        if first is None:
             return "grid"
-        return None
+        anchor = math.floor((first[1] + self.store.shift(self.store.shifts(), selection_id=first[0])) / 60) * 60
+        if minute < anchor:
+            return None
+        g = anchor + math.floor((minute - anchor) / RESELECT_S) * RESELECT_S
+        if self._selections(1)[0][1] >= g:
+            return None
+        return "grid" if minute == g else "off_grid"
 
     @staticmethod
     def _expired(w: dict, now: float, keep_12h: bool = False) -> str | None:
@@ -1119,6 +1214,8 @@ class Collector:
             if anchor is None:
                 anchor = self.store.conn.execute("SELECT MIN(book_end_ts) FROM snapshots WHERE watch_id = ?",
                                                  (w["watch_id"],)).fetchone()[0]
+                if anchor is not None:
+                    anchor += w.get("shift", 0.0)
             if anchor is None or anchor > slot_ts - WARMUP_S:
                 return None
         return self.decide(w, slot_ts, forced=forced, model_down=model_down)
@@ -1230,13 +1327,14 @@ class Collector:
             if self.paused():
                 raise _SelectionAborted("paused after repeated failures")
             try:
-                b = self.kalshi.orderbook(ticker, DEPTH)
-                self._ok()
-                return b
+                raw = self.kalshi.orderbook_raw(ticker, DEPTH)
             except Exception as e:
                 if not dry_run:
                     self._fail(ticker, "orderbook", e)
                 return None
+            self._ok()                                   # an invalid book is an answer, not a failed request
+            book, bad = parse_book(raw)
+            return dict(book, invalid=bad) if bad else book
         try:
             sel = resolve_selection(markets, fetch, self.clock, slots=self.slots,
                                     watched=[w["market"] for w in staying])
@@ -1297,8 +1395,11 @@ def _day(ts: float) -> str:
 def day_status(store: Store, now: float) -> list[dict]:
     """Per UTC day: decision slots expected (every slot of every watch on its own phase's five-minute grid, from
     30 minutes after its first snapshot, or after `warm_from_ts` when it was chosen again with its snapshots running
-    on, to its drop or now) and collected (a non-forced decision with answers: `ok`), the share; market-minutes
-    watched (each watch from its market row to its drop or now) and their share of the nominal 20 x 1440;
+    on, but never before the watch itself began, so each slot of a market chosen again is counted once, to its
+    drop or now; slots while the loop was stopped count, uncollected) and collected (a non-forced decision with
+    answers: `ok`), the share; market-minutes watched (each watch from its market row to its drop or now, counting
+    only the minutes in which the loop was running, that is wrote a heartbeat) and their share of the nominal
+    20 x 1440;
     the model's latency median and 95th percentile (nearest rank) over answered calls, the count of each status,
     Kalshi requests and failures (from the heartbeats) and error events."""
     c = store.conn
@@ -1309,19 +1410,19 @@ def day_status(store: Store, now: float) -> list[dict]:
                                    "watched_minutes": 0.0, "watched_share": None,
                                    "statuses": dict.fromkeys(STATUSES, 0), "latencies": [], "requests": 0,
                                    "failures": 0, "errors": 0})
+    alive = {int(ts // 60) for (ts,) in c.execute("SELECT ts FROM heartbeats")}
     rows = c.execute("SELECT m.watch_id, m.selected_ts, d.dropped_ts, (SELECT MIN(book_end_ts) FROM snapshots s "
                      "WHERE s.watch_id = m.watch_id), m.phase, m.warm_from_ts FROM markets m LEFT JOIN market_drops d "
                      "ON d.watch_id = m.watch_id").fetchall()
     for _, selected, dropped, first, phase, warm in rows:
         end = min(dropped if dropped is not None else now, now)
-        a = selected
-        while a < end:                                 # the watch's minutes, split at each UTC midnight
-            midnight = (math.floor(a / 86400) + 1) * 86400
-            b = min(end, midnight)
-            day(_day(a))["watched_minutes"] += (b - a) / 60.0
-            a = b
+        for m in range(int(selected // 60), int(end // 60) + 1):     # only minutes the loop was running
+            lo, hi = max(selected, 60.0 * m), min(end, 60.0 * m + 60)
+            if hi > lo and m in alive:
+                day(_day(60 * m))["watched_minutes"] += (hi - lo) / 60.0
         anchor = warm if warm is not None else first if first is not None else selected
-        start = anchor + WARMUP_S
+        start = max(anchor + WARMUP_S, selected)       # a market chosen again: its earlier slots belong to the
+                                                       # earlier watch
         offset = 60 * (phase or 0)                     # the market's own grid: minutes where minute mod 5 == phase
         s = math.ceil((start - offset) / SLOT_S) * SLOT_S + offset
         while s < end:
