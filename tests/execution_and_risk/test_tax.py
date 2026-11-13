@@ -482,3 +482,41 @@ def test_the_replacement_part_of_a_split_lot_is_sold_before_the_rest_of_its_purc
     left = only(led.open_lots("XLE"))
     assert left["cost_basis"] == pytest.approx(800) and left["holding_start"] == "2025-05-23"
     assert "replacement" in tax.__doc__ and "before the remainder" in tax.__doc__
+
+
+# ---- T5a F5: every key the ledger reads must be in the rules file
+
+
+@pytest.mark.parametrize("path", [("jurisdiction",), ("long_term", "after_years"), ("wash_sale", "window_days"),
+                                  ("wash_sale", "applies_to"), ("wash_sale_same_purchase", "remainder_is_replacement"),
+                                  ("lot_method", "method")])
+def test_a_rules_file_missing_a_key_the_ledger_reads_is_refused_at_load(tmp_path, path):
+    def drop(raw):
+        node = raw
+        for k in path[:-1]:
+            node = node[k]
+        node.pop(path[-1])
+    with pytest.raises(ValueError, match=".".join(path)):
+        edited_rules(tmp_path, drop)
+
+
+def test_same_day_interactions_report_what_the_days_orders_do_to_each_other():
+    led = ledger(("2026-01-02", "AAA", 10, 100.0), ("2026-01-02", "BBB", 10, 100.0))
+    # AAA: sell 10 at 80 (loss 200), then buy 4: 4 x 20 = 80 washed. BBB: a sale at a gain and a buy: nothing interacts
+    out = led.same_day_interactions([("2026-01-12", "AAA", -10, 80.0), ("2026-01-12", "BBB", -5, 120.0),
+                                     ("2026-01-12", "AAA", 4, 80.0), ("2026-01-12", "BBB", 5, 120.0)])
+    assert out == [{"symbol": "AAA", "sale_units": pytest.approx(10), "buy_units": pytest.approx(4), "disallowed_loss": pytest.approx(80)}]
+    # buy first, then the sale: the 2026-01-02 lot is closed (FIFO) and the same-day buy is its replacement
+    out = led.same_day_interactions([("2026-01-12", "AAA", 4, 80.0), ("2026-01-12", "AAA", -10, 80.0)])
+    assert out == [{"symbol": "AAA", "sale_units": pytest.approx(10), "buy_units": pytest.approx(4), "disallowed_loss": pytest.approx(80)}]
+    assert led.open_lots("AAA")[0]["units"] == pytest.approx(10)                 # the ledger itself is unchanged
+
+
+def test_a_check_can_see_fills_placed_before_it_the_same_day():
+    led = ledger(("2026-01-02", "AAA", 10, 100.0))
+    c = led.check_buy("AAA", 4, "2026-01-12", before=[("2026-01-12", -10, 80.0)])
+    assert c["disallowed_loss"] == pytest.approx(80) and c["matches"][0]["sale_date"] == "2026-01-12"
+    c = led.check_sell("AAA", 10, 80.0, "2026-01-12", before=[("2026-01-12", 4, 80.0)])
+    # the earlier same-day buy of 4 replaces 4 of the 10 loss units: 80 disallowed, 120 still at risk
+    assert c["disallowed_loss"] == pytest.approx(80) and c["wash_sale"]["loss_at_risk"] == pytest.approx(120)
+    assert c["held_units"] == pytest.approx(14)

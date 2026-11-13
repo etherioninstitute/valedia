@@ -29,9 +29,58 @@ import pandas as pd
 from valedia_trader.backtest.engine import buy_and_hold
 from valedia_trader.research_loop import diagnostics, risk_gate
 from valedia_trader.research_loop.ledger import market_regime
-from valedia_trader.research_loop.strategy import Strategy, run_rules
+from valedia_trader.research_loop.strategy import Strategy, _exchange_sessions, run_rules
 
 __all__ = ["Journal", "PaperTrader", "Venue", "AlpacaPaperVenue", "VenueError", "market_conditions"]
+
+
+_SESSIONS: list = []
+
+
+def next_session(day) -> str:
+    """The exchange session after `day`, when an order decided at its close fills; `day` itself if the calendar
+    cannot answer."""
+    d = pd.Timestamp(day).normalize()
+    try:
+        if not _SESSIONS:
+            _SESSIONS.append(_exchange_sessions())
+        sessions = _SESSIONS[0]
+        i = sessions.searchsorted(d, side="right")
+        if i < len(sessions):
+            return str(sessions[i].date())
+    except Exception:
+        pass
+    return str(d.date())
+
+
+def tax_sell_note(c: dict, px: float, day: str) -> dict:
+    """The compact note for a sale, from `TaxLedger.check_sell`."""
+    st, lt = c["gain_loss"]["short_term"], c["gain_loss"]["long_term"]
+    parts = [f"{term} {'gain' if v >= 0 else 'loss'} of {abs(v):.2f}" for term, v in (("short-term", st), ("long-term", lt)) if abs(v) >= 0.005]
+    effect = "would realise " + (" and ".join(f"a {p}" for p in parts) if parts else "no gain or loss")
+    if c["disallowed_loss"] > 0:
+        bought = sorted({m["purchase_date"] for m in c["wash_sale"]["matches"]})
+        effect += f"; {c['disallowed_loss']:.2f} of it would be disallowed as a wash sale against the purchase of {', '.join(bought)}"
+    if c["wash_sale"]["loss_at_risk"] > 0:
+        effect += f"; buying {c['symbol']} again before {c['wash_sale']['clean_from']} would make it a wash sale"
+    return {"side": "sell", "estimated_at_price": float(px), "estimated_for_day": str(day), "gain_loss": {"short_term": st, "long_term": lt},
+            "disallowed_loss": c["disallowed_loss"], "loss_at_risk": c["wash_sale"]["loss_at_risk"],
+            "clean_from": c["wash_sale"]["clean_from"], "effect": effect + ".", "unverified_rules": c["unverified_rules"], "note": c["note"]}
+
+
+def tax_buy_note(c: dict, day: str) -> dict:
+    """The compact note for a purchase, from `TaxLedger.check_buy`; the sentence names each sale date once."""
+    washes = [{"sale_date": m["sale_date"], "units": m["units"], "disallowed_loss": m["disallowed_loss"]} for m in c["matches"]]
+    by_date: dict[str, float] = {}
+    for w in washes:
+        by_date[w["sale_date"]] = by_date.get(w["sale_date"], 0.0) + w["disallowed_loss"]
+    if by_date:
+        effect = ("would turn " + " and ".join(f"{v:.2f} of the loss sold on {k}" for k, v in by_date.items())
+                  + " into a wash sale, carried into this lot")
+    else:
+        effect = f"would wash no earlier loss of {c['symbol']}"
+    return {"side": "buy", "estimated_for_day": str(day), "disallowed_loss": c["disallowed_loss"], "washes": washes,
+            "clean_from": c["clean_from"], "effect": effect + ".", "unverified_rules": c["unverified_rules"], "note": c["note"]}
 
 
 class VenueError(RuntimeError):
@@ -151,6 +200,7 @@ class PaperTrader:
                           "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}, "panel_cases": []}
         # the account's tax ledger: built once from the journal's fills, then fed each new fill. Notes only.
         self.tax_rules, self.tax_ledger, self.tax_unavailable = tax_rules, None, None
+        self._tax_today, self._tax_fill_day = [], None        # in memory only: the orders placed so far this step
         if tax_rules is not None:
             try:
                 from valedia_trader.execution_and_risk.tax import TaxLedger
@@ -226,47 +276,37 @@ class PaperTrader:
             self.tax_unavailable = f"the tax ledger could not take a fill: {exc}"
 
     def _tax_note(self, day, symbol: str, units: float, px: float) -> dict:
-        """What this order would do for tax at today's price. Never raises."""
+        """What this order would do for tax at today's price, as of the session it fills, taking the orders placed
+        earlier today as filled first. Never raises."""
         if self.tax_unavailable is not None:
             return {"unavailable": self.tax_unavailable}
-        d = str(pd.Timestamp(day).date())
         try:
+            d = self._tax_fill_day
+            before = [(d, u, p) for sym, u, p in self._tax_today if sym == symbol]
             if units < 0:
-                c = self.tax_ledger.check_sell(symbol, -units, px, d)
-                st, lt = c["gain_loss"]["short_term"], c["gain_loss"]["long_term"]
-                parts = [f"{term} {'gain' if v >= 0 else 'loss'} of {abs(v):.2f}" for term, v in (("short-term", st), ("long-term", lt))
-                         if abs(v) >= 0.005]
-                effect = "would realise " + (" and ".join(f"a {p}" for p in parts) if parts else "no gain or loss")
-                if c["disallowed_loss"] > 0:
-                    bought = sorted({m["purchase_date"] for m in c["wash_sale"]["matches"]})
-                    effect += f"; {c['disallowed_loss']:.2f} of it would be disallowed as a wash sale against the purchase of {', '.join(bought)}"
-                if c["wash_sale"]["loss_at_risk"] > 0:
-                    effect += f"; buying {symbol} again before {c['wash_sale']['clean_from']} would make it a wash sale"
-                return {"side": "sell", "estimated_at_price": float(px), "gain_loss": {"short_term": st, "long_term": lt},
-                        "disallowed_loss": c["disallowed_loss"], "loss_at_risk": c["wash_sale"]["loss_at_risk"],
-                        "clean_from": c["wash_sale"]["clean_from"], "effect": effect + ".",
-                        "unverified_rules": c["unverified_rules"], "note": c["note"]}
-            c = self.tax_ledger.check_buy(symbol, units, d)
-            washes = [{"sale_date": m["sale_date"], "units": m["units"], "disallowed_loss": m["disallowed_loss"]} for m in c["matches"]]
-            if washes:
-                effect = ("would turn " + " and ".join(f"{w['disallowed_loss']:.2f} of the loss sold on {w['sale_date']}" for w in washes)
-                          + " into a wash sale, carried into this lot")
-            else:
-                effect = f"would wash no earlier loss of {symbol}"
-            return {"side": "buy", "disallowed_loss": c["disallowed_loss"], "washes": washes, "clean_from": c["clean_from"],
-                    "effect": effect + ".", "unverified_rules": c["unverified_rules"], "note": c["note"]}
+                return tax_sell_note(self.tax_ledger.check_sell(symbol, -units, px, d, before=before), px, d)
+            return tax_buy_note(self.tax_ledger.check_buy(symbol, units, d, before=before), d)
         except Exception as exc:
             return {"unavailable": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
     def _tax_block(self, day) -> dict:
-        """The year's realised tax result so far, for the day's summary. Never raises."""
+        """The year's realised tax result so far, for the day's summary, and what today's placed orders would do to
+        each other once filled. Never raises."""
         if self.tax_unavailable is not None:
             return {"unavailable": self.tax_unavailable}
         d = str(pd.Timestamp(day).date())
         try:
             s = self.tax_ledger.summary(d[:4], as_of=d)
+            last = self.tax_ledger.summary(str(int(d[:4]) - 1), as_of=d)
+            among = []
+            for sym in dict.fromkeys(sym for sym, _, _ in self._tax_today):
+                try:
+                    among += self.tax_ledger.same_day_interactions([(self._tax_fill_day, x, u, p) for x, u, p in self._tax_today if x == sym])
+                except Exception as exc:
+                    among.append({"symbol": sym, "unavailable": f"{type(exc).__name__}: {str(exc)[:200]}"})
             return {"year": d[:4], "short_term_net": s["short_term"]["net_gain_loss"], "long_term_net": s["long_term"]["net_gain_loss"],
                     "disallowed_loss": s["total"]["disallowed_loss"], "provisional_loss": s["total"]["provisional_loss"],
+                    "provisional_loss_from_last_year": last["total"]["provisional_loss"], "among_todays_orders": among,
                     "as_of": s["as_of"], "unverified_rules": s["unverified_rules"], "note": s["note"]}
         except Exception as exc:
             return {"unavailable": f"{type(exc).__name__}: {str(exc)[:200]}"}
@@ -343,6 +383,8 @@ class PaperTrader:
                                      "reasoning": f"drawdown {account['drawdown_pct']:.2f}% reached the limit; new risk is blocked until the latch is reset"})
 
         placed = blocked = 0
+        if self.tax_rules is not None:
+            self._tax_today, self._tax_fill_day = [], next_session(day)
         share = equity / max(len(strategies), 1)
         for hid, s in strategies.items():
             weights, events = run_rules(s, prices)
@@ -388,6 +430,8 @@ class PaperTrader:
                     entry["panel"] = panel_view
                 if self.tax_rules is not None:
                     entry["tax"] = self._tax_note(day, sym, delta, px)
+                    if ok:
+                        self._tax_today.append((sym, float(delta), float(px)))
                 if ok:
                     placed += 1
                     self.state["pending"].append({"strategy": s.name, "version": s.version, "symbol": sym, "units": delta,

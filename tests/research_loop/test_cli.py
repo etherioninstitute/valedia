@@ -111,3 +111,16 @@ def test_the_tax_rules_helper_is_none_without_a_file_rules_with_a_good_one_and_s
     assert cli._tax_rules(paths) is None and "FIFO" in capsys.readouterr().err   # loads as JSON, refused by the rules
     assert cli.paper_trader(paths).tax_rules is None                                  # the paper trader still builds
     assert capsys.readouterr().err.startswith("tax notes are off:")
+
+
+
+def test_a_rules_file_missing_a_key_turns_tax_notes_off_with_one_line(tmp_path, capsys):
+    from valedia_trader.research_loop import LoopPaths
+    paths = LoopPaths(root=tmp_path)
+    paths.config.mkdir(parents=True)
+    raw = json.loads((LoopPaths().config / "tax_rules.json").read_text())
+    raw["wash_sale"].pop("window_days")
+    (paths.config / "tax_rules.json").write_text(json.dumps(raw))
+    assert cli._tax_rules(paths) is None
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("tax notes are off:") and "wash_sale.window_days" in err[0]

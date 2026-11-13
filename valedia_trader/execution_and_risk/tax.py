@@ -50,6 +50,8 @@ __all__ = ["TaxRules", "TaxLedger", "NOTE", "main"]
 
 NOTE = "Computed from the rules file; not tax advice."
 EPS = 1e-9                                    # units this close to zero are zero
+REQUIRED_KEYS = (("jurisdiction",), ("long_term", "after_years"), ("wash_sale", "window_days"), ("wash_sale", "applies_to"),
+                 ("wash_sale_same_purchase", "remainder_is_replacement"), ("lot_method", "method"))
 PERIOD = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
 
 
@@ -81,9 +83,12 @@ class TaxRules:
     def load(cls, path: str | Path | None = None) -> "TaxRules":
         path = Path(path) if path is not None else LoopPaths().config / "tax_rules.json"
         rules = cls(json.loads(Path(path).read_text()), str(path))
-        if not isinstance(rules.raw.get("wash_sale_same_purchase"), dict) or \
-                "remainder_is_replacement" not in rules.raw["wash_sale_same_purchase"]:
-            raise ValueError("the rules file has no wash_sale_same_purchase.remainder_is_replacement")
+        for keys in REQUIRED_KEYS:                    # every key the ledger reads, refused at load when absent
+            node = rules.raw
+            for k in keys:
+                if not isinstance(node, dict) or k not in node:
+                    raise ValueError(f"the rules file has no {'.'.join(keys)}")
+                node = node[k]
         if rules.lot_method != "FIFO":
             raise ValueError(f"only the FIFO lot method is implemented; the rules file says {rules.lot_method!r}")
         return rules
@@ -237,7 +242,7 @@ class TaxLedger:
             lot_id = self._id(symbol)
             lot = _Lot(lot_id, symbol, cls, units, units * price + fee, d, d, purchase_id=lot_id)
             lots.append(lot)
-            out = {"matches": self._match_new_buy(lots, lot, d) if washable else []}
+            out = {"matches": self._match_new_buy(lots, lot, d) if washable else [], "purchase_id": lot_id}
         self._fills.append((d, symbol, units, price, fee, asset_class))
         return out
 
@@ -297,7 +302,7 @@ class TaxLedger:
         lot.used_as_replacement = True
         match = {"replacement_lot": lot.id, "purchase_date": lot.purchase_date.isoformat(), "units": lot.units,
                  "disallowed_loss": disallowed, "holding_days_added": sale.held_days, "sale_id": sale.id,
-                 "sale_date": sale.sale_date.isoformat(), "loss_per_unit": sale.loss_per_unit}
+                 "sale_date": sale.sale_date.isoformat(), "loss_per_unit": sale.loss_per_unit, "purchase_id": lot.purchase_id}
         sale.matches.append(match)
         lot.replaces.append({"sale_id": sale.id, "sale_date": sale.sale_date.isoformat(), "disallowed_loss": disallowed})
         return match
@@ -389,15 +394,42 @@ class TaxLedger:
         return out
 
     # ---- pre-trade checks (on a copy; the ledger itself is never changed)
-    def _sim(self, symbol: str, d: date) -> "TaxLedger":
+    def _sim(self, symbol: str, d: date, before=()) -> "TaxLedger":
         """A scratch copy holding only what a check of `symbol` on `d` can touch: its open lots and its sales inside
-        the window. Cheaper than copying the whole ledger, and the ledger itself is never changed."""
+        the window, with `before` ((day, units, price[, fee]) fills of the symbol, in order) applied to it. Cheaper than
+        copying the whole ledger, and the ledger itself is never changed."""
         sim = TaxLedger(self.rules)
-        lo = d - timedelta(days=self.rules.window_days)
+        first = min([d] + [_day(f[0]) for f in before])
+        lo = first - timedelta(days=self.rules.window_days)
         sim._lots = {symbol: copy.deepcopy(self._lots.get(symbol, []))}
         sim._sales = copy.deepcopy([x for x in self._sales if x.symbol == symbol and x.sale_date >= lo])
         sim._fills, sim._next, sim._nsales = self._fills[-1:], self._next, self._nsales
+        for f in before:
+            sim.add_fill(f[0], symbol, f[1], f[2], f[3] if len(f) > 3 else 0.0)
         return sim
+
+    def same_day_interactions(self, fills) -> list[dict]:
+        """What a day's orders would do to each other once all have filled: `fills` are (day, symbol, units, price)
+        in the order decided. Per symbol, the loss that a sale among them would have disallowed by a purchase among
+        them (either order). Symbols where nothing interacts are left out. The ledger itself is never changed."""
+        out, symbols = [], list(dict.fromkeys(f[1] for f in fills))
+        for sym in symbols:
+            mine = [f for f in fills if f[1] == sym]
+            sim = self._sim(sym, min(_day(f[0]) for f in mine))
+            bought, sold, sales = set(), 0.0, []
+            for day, _, units, price in mine:
+                done = sim.add_fill(day, sym, units, price)
+                if units > 0:
+                    bought.add(done["purchase_id"])
+                else:
+                    sold += -float(units)
+                    sales += done["closed"]
+            # a sale keeps every match made against it, whether the purchase came before or after it
+            washed = sum(m["disallowed_loss"] for x in sales for m in x.matches if m["purchase_id"] in bought)
+            if washed > EPS:
+                out.append({"symbol": sym, "sale_units": sold, "buy_units": sum(float(f[2]) for f in mine if f[2] > 0),
+                            "disallowed_loss": washed})
+        return out
 
     def _check_day(self, side: str, symbol: str, day) -> date:
         d = _day(day)
@@ -406,16 +438,19 @@ class TaxLedger:
                              f"{self.last_day}, so a check can only be for that day or later")
         return d
 
-    def check_sell(self, symbol: str, units: float, price: float, day, fee: float = 0.0, asset_class: str | None = None) -> dict:
-        """What selling `units` of `symbol` at `price` on `day` would realise, by term, and what a wash sale would take."""
+    def check_sell(self, symbol: str, units: float, price: float, day, fee: float = 0.0, asset_class: str | None = None,
+                   before=()) -> dict:
+        """What selling `units` of `symbol` at `price` on `day` would realise, by term, and what a wash sale would take.
+        `before`: (day, units, price) fills of the symbol taken to happen first (orders placed earlier the same day)."""
         d = self._check_day("sell", symbol, day)
-        sim = self._sim(symbol, d)
+        sim = self._sim(symbol, d, before)
+        held = sum(lot.units for lot in sim._lots.get(symbol, []))
         sales = sim.add_fill(d, symbol, -abs(float(units)), price, fee, asset_class)["closed"]
         recs = [sim._record(s, d) for s in sales]
         by = lambda key, term: sum(r[key] for r in recs if r["term"] == term)
         risk = sum(s.open_loss_units() * s.loss_per_unit for s in sales)
         return {"symbol": symbol, "side": "sell", "units": abs(float(units)), "price": float(price), "day": d.isoformat(),
-                "held_units": sum(lot.units for lot in self._lots.get(symbol, [])),
+                "held_units": held,
                 "proceeds": sum(r["proceeds"] for r in recs), "cost_basis": sum(r["cost_basis"] for r in recs),
                 "gain_loss": {"short_term": by("gain_loss", "short"), "long_term": by("gain_loss", "long")},
                 "allowed_gain_loss": {"short_term": by("allowed_gain_loss", "short"), "long_term": by("allowed_gain_loss", "long")},
@@ -425,12 +460,12 @@ class TaxLedger:
                               "loss_at_risk": risk, "clean_from": sim._clean_from(symbol, d)},
                 "portions": recs, "as_of": d.isoformat(), **self.rules.stamp()}
 
-    def check_buy(self, symbol: str, units: float, day, asset_class: str | None = None) -> dict:
+    def check_buy(self, symbol: str, units: float, day, asset_class: str | None = None, before=()) -> dict:
         """What buying `units` of `symbol` on `day` would do: which earlier loss sales it would wash, how much loss
-        that disallows, and the first day a purchase would wash nothing."""
+        that disallows, and the first day a purchase would wash nothing. `before` as for `check_sell`."""
         d = self._check_day("buy", symbol, day)
-        sim = self._sim(symbol, d)
-        clean_from = self._clean_from(symbol, d)
+        sim = self._sim(symbol, d, before)
+        clean_from = sim._clean_from(symbol, d)
         matches = sim.add_fill(d, symbol, abs(float(units)), 0.0, 0.0, asset_class)["matches"]   # matching ignores price
         matched = sum(m["units"] for m in matches)
         return {"symbol": symbol, "side": "buy", "units": abs(float(units)), "day": d.isoformat(),

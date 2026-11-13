@@ -373,16 +373,17 @@ def test_tax_notes_give_the_numbers_for_a_trim_at_a_loss_and_a_buy_inside_its_wi
     d = {e["day"]: e for e in notes(t)}
     buy0 = d["2026-01-05"]["tax"]
     # day 0: buy 0.5 x 100,000 / 100 = 500 units; nothing sold before, so nothing to wash
-    assert buy0["side"] == "buy" and buy0["disallowed_loss"] == 0 and buy0["washes"] == [] and buy0["clean_from"] == "2026-01-05"
+    assert buy0["side"] == "buy" and buy0["disallowed_loss"] == 0 and buy0["washes"] == [] and buy0["clean_from"] == "2026-01-06"   # T5a F2: as of the fill day
     trim = d["2026-01-07"]["tax"]
     # day 2 at 80: equity 50,000 cash + 500 x 80 = 90,000; target 0.25 x 90,000 / 80 = 281.25, so sell 218.75.
     # basis 218.75 x 100 = 21,875, proceeds 218.75 x 80 = 17,500: a short-term loss of 4,375. The rest of the same
-    # purchase is no replacement: nothing disallowed, all 4,375 at risk until 2026-01-07 + 31 = 2026-02-07
+    # purchase is no replacement: nothing disallowed, all 4,375 at risk. T5a F2: estimated for the fill day 2026-01-08,
+    # so clean from 2026-01-08 + 31 = 2026-02-08
     assert trim["side"] == "sell" and trim["estimated_at_price"] == pytest.approx(80.0)
     assert trim["gain_loss"] == {"short_term": pytest.approx(-4375.0), "long_term": pytest.approx(0.0)}
     assert trim["disallowed_loss"] == pytest.approx(0.0) and trim["loss_at_risk"] == pytest.approx(4375.0)
-    assert trim["clean_from"] == "2026-02-07"
-    assert trim["effect"] == "would realise a short-term loss of 4375.00; buying AAA again before 2026-02-07 would make it a wash sale."
+    assert trim["clean_from"] == "2026-02-08"
+    assert trim["effect"] == "would realise a short-term loss of 4375.00; buying AAA again before 2026-02-08 would make it a wash sale."
     back = d["2026-01-09"]["tax"]
     # day 4: equity 67,500 cash + 281.25 x 80 = 90,000; target 0.5 x 90,000 / 80 = 562.5, so buy 281.25. The trim filled
     # on 2026-01-08 at 80 (a loss of 20 a unit on 218.75 units); 218.75 of the new units wash it all: 4,375 disallowed
@@ -394,7 +395,8 @@ def test_tax_notes_give_the_numbers_for_a_trim_at_a_loss_and_a_buy_inside_its_wi
     held = days[3]["tax"]                                            # 2026-01-08, after the trim filled
     assert held == {"year": "2026", "short_term_net": pytest.approx(-4375.0), "long_term_net": pytest.approx(0.0),
                     "disallowed_loss": pytest.approx(0.0), "provisional_loss": pytest.approx(4375.0), "as_of": "2026-01-08",
-                    "unverified_rules": RULES.unverified(), "note": tx.NOTE}
+                    "unverified_rules": RULES.unverified(), "note": tx.NOTE,
+                    "provisional_loss_from_last_year": 0.0, "among_todays_orders": []}   # T5a F1/F3: two new keys
     washed = days[5]["tax"]                                          # 2026-01-12, after the buy back filled
     # the loss is now disallowed: -4,375 + 4,375 = 0 net, nothing provisional
     assert washed["short_term_net"] == pytest.approx(0.0) and washed["disallowed_loss"] == pytest.approx(4375.0)
@@ -483,3 +485,125 @@ def test_a_tax_check_that_raises_blocks_nothing(setup, tmp_path, scripted):
     assert _comparable(on) == _comparable(off)
     assert notes(on) and all(n["tax"] == {"unavailable": "RuntimeError: tax check exploded"} for n in notes(on))
     assert on.tax_unavailable is None and on.state["history"][-1]["tax"]["disallowed_loss"] == pytest.approx(4375.0)
+
+
+# ---- T5a: notes see the same day's orders, are dated on the fill day, and January shows December's open losses
+
+from valedia_trader.research_loop.strategy import _exchange_sessions  # noqa: E402
+
+HIST = 30
+
+
+def session_market(start, closes):
+    """One fund AAA on real exchange sessions: 30 sessions of history near 100, then `closes` from `start`."""
+    sessions = _exchange_sessions()
+    i = sessions.searchsorted(pd.Timestamp(start))
+    idx = sessions[i - HIST: i + len(closes)]
+    return pd.DataFrame({"AAA": list(100 + 0.5 * np.sin(np.arange(HIST))) + list(closes)}, index=idx)
+
+
+@pytest.fixture
+def by_name(monkeypatch):
+    """Scripted target weights in AAA per strategy name, one per traded session."""
+    scripts = {}
+
+    def run(s, prices):
+        w = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+        w.iloc[-1, w.columns.get_loc("AAA")] = scripts[s.name][len(prices) - 1 - HIST]
+        return w, []
+    monkeypatch.setattr(pp, "run_rules", run)
+    return scripts
+
+
+class RefuseB:
+    """A veto panel that approves everything but the strategy named tax_b."""
+    def evaluate(self, case_id, case):
+        ok = not case_id.startswith("tax_b:")
+        v = SimpleNamespace(member="m", probability=0.7 if ok else 0.3, error=None)
+        return SimpleNamespace(approve=ok, probability=v.probability, vetoed=not ok, reasons=() if ok else ("no",),
+                               verdicts=(v,), dissent=0.0)
+
+    def settle(self, case_id, outcome):
+        pass
+
+
+def three_way(setup, directory, by_name, panel=None):
+    # 2026-01-07 (Wed) A buys; 2026-01-09 (Fri) at 80, A trims while B and C buy; they fill on Monday 2026-01-12
+    px = session_market("2026-01-07", [100.0, 100.0, 80.0, 80.0])
+    by_name.update({"tax_a": [0.5, 0.5, 0.25, 0.25], "tax_b": [0.0, 0.0, 0.1, 0.1], "tax_c": [0.0, 0.0, 0.1, 0.1]})
+    kw = {"panel": panel, "panel_mode": "veto", "facts": FACTS} if panel else {}
+    t = no_costs(setup, directory, tax_rules=RULES, starting_cash=900_000.0, **kw)
+    strats = {1: long_only("tax_a"), 2: long_only("tax_b"), 3: long_only("tax_c")}
+    days = [t.step(px.iloc[: HIST + k + 1], strats) for k in range(3)]
+    return t, {e["strategy"]: e for e in notes(t) if e["day"] == "2026-01-09"}, days[2]["tax"]
+
+
+def test_a_buy_note_sees_a_sale_decided_earlier_the_same_day(setup, tmp_path, by_name):
+    t, n, block = three_way(setup, tmp_path / "all", by_name)
+    # 900,000 cash, three strategies: 300,000 each. A buys 0.5 x 300,000 / 100 = 1,500 units, filled at 100.
+    # Friday at 80: equity 750,000 + 1,500 x 80 = 870,000, so 290,000 each. A's target 0.25 x 290,000 / 80 = 906.25:
+    # sell 593.75 at a loss of 20 a unit = 11,875. B and C each buy 0.1 x 290,000 / 80 = 362.5
+    assert n["tax_a"]["tax"]["side"] == "sell" and n["tax_a"]["tax"]["gain_loss"]["short_term"] == pytest.approx(-11875.0)
+    assert n["tax_a"]["tax"]["disallowed_loss"] == pytest.approx(0.0)             # nothing bought yet when A decided
+    # B's note sees A's sale: 362.5 units x 20 = 7,250 washed, sold on the fill day 2026-01-12
+    b = n["tax_b"]["tax"]
+    assert b["disallowed_loss"] == pytest.approx(7250.0) and b["washes"][0]["sale_date"] == "2026-01-12"
+    assert b["effect"] == "would turn 7250.00 of the loss sold on 2026-01-12 into a wash sale, carried into this lot."
+    # C's note sees both: 593.75 - 362.5 = 231.25 loss units left, x 20 = 4,625
+    assert n["tax_c"]["tax"]["disallowed_loss"] == pytest.approx(4625.0)
+    # the day's block: all three filled together, 7,250 + 4,625 = 11,875 of the loss is washed
+    assert block["among_todays_orders"] == [{"symbol": "AAA", "sale_units": pytest.approx(593.75), "buy_units": pytest.approx(725.0),
+                                             "disallowed_loss": pytest.approx(11875.0)}]
+    assert all(e["tax"]["estimated_for_day"] == "2026-01-12" for e in n.values())   # Friday's orders fill on Monday
+
+
+def test_a_blocked_order_is_not_counted_among_the_days_orders(setup, tmp_path, by_name):
+    t, n, block = three_way(setup, tmp_path / "veto", by_name, panel=RefuseB())
+    assert n["tax_b"]["decision"] == "blocked" and n["tax_c"]["decision"] == "placed"
+    # B's own note still says what it would have done (7,250); C's note ignores B: 362.5 x 20 = 7,250, not 4,625
+    assert n["tax_b"]["tax"]["disallowed_loss"] == pytest.approx(7250.0)
+    assert n["tax_c"]["tax"]["disallowed_loss"] == pytest.approx(7250.0)
+    assert block["among_todays_orders"] == [{"symbol": "AAA", "sale_units": pytest.approx(593.75), "buy_units": pytest.approx(362.5),
+                                             "disallowed_loss": pytest.approx(7250.0)}]
+
+
+def year_end(setup, by_name):
+    # sessions 2025-12-22, 23, 24, 26 (25 is Christmas), 29, 30, 31, 2026-01-02
+    px = session_market("2025-12-22", [100.0, 100.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0])
+    by_name["tax_a"] = [0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+    t = no_costs(setup, tax_rules=RULES)
+    return px, t, [t.step(px.iloc[: HIST + k + 1], {1: long_only("tax_a")}) for k in range(8)]
+
+
+def test_a_note_is_dated_on_the_next_session_and_its_clean_from_matches_the_ledger_after_the_fill(setup, by_name):
+    px, t, days = year_end(setup, by_name)
+    trim = next(e["tax"] for e in notes(t) if e["day"] == "2025-12-24")
+    # decided Wednesday 2025-12-24; Christmas is closed, so it fills Friday 2025-12-26. 500 units bought at 100, then at 80
+    # equity 90,000: target 281.25, sell 218.75, a loss of 4,375; clean from 2025-12-26 + 31 = 2026-01-26
+    assert trim["estimated_for_day"] == "2025-12-26" and trim["clean_from"] == "2026-01-26"
+    fill = next(e for e in t.journal.read() if e["type"] == "fill" and e["units"] < 0)
+    assert fill["day"] == "2025-12-26"
+    assert t.tax_ledger.wash_sale_windows("2025-12-26")["AAA"]["clean_from"] == trim["clean_from"]
+    first = next(e["tax"] for e in notes(t) if e["day"] == "2025-12-22")
+    assert first["estimated_for_day"] == "2025-12-23"
+
+
+def test_the_january_block_shows_last_years_open_losses(setup, by_name):
+    px, t, days = year_end(setup, by_name)
+    dec31, jan2 = days[6]["tax"], days[7]["tax"]
+    # the 4,375 loss sold 2025-12-26 stays provisional until 2026-01-25
+    assert dec31["year"] == "2025" and dec31["provisional_loss"] == pytest.approx(4375.0)
+    assert dec31["provisional_loss_from_last_year"] == pytest.approx(0.0)
+    assert jan2["year"] == "2026" and jan2["provisional_loss"] == pytest.approx(0.0) and jan2["short_term_net"] == pytest.approx(0.0)
+    assert jan2["provisional_loss_from_last_year"] == pytest.approx(4375.0)
+
+
+def test_a_buy_note_names_each_sale_date_once():
+    led = tx.TaxLedger(RULES)
+    # two purchases of 10 at 100, both more than 30 days before a sale of all 20 at 90 on 2025-12-10: two portions,
+    # each a loss of 100 on the same sale date. Buying 20 on 2025-12-15 washes both: 200 in all
+    for f in (("2025-11-03", "AAA", 10, 100.0), ("2025-11-04", "AAA", 10, 100.0), ("2025-12-10", "AAA", -20, 90.0)):
+        led.add_fill(*f)
+    note = pp.tax_buy_note(led.check_buy("AAA", 20, "2025-12-15"), "2025-12-15")
+    assert len(note["washes"]) == 2 and note["disallowed_loss"] == pytest.approx(200.0)
+    assert note["effect"] == "would turn 200.00 of the loss sold on 2025-12-10 into a wash sale, carried into this lot."
