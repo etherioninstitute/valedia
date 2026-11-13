@@ -102,3 +102,15 @@ before any scoring, and none was chosen by looking at results.
 
 The choice made after the development period (margin and version of the books' probability) will be written
 under this section before any test-period snapshot is bought.
+
+4. **Start times are schedule facts, not prices** (added 2026-11-13 after the fetcher's blind check, still before
+   any odds snapshot was bought). A league's start times for the day are taken from its 16:00 UTC snapshot and
+   are used to form the waves, also for a wave whose own snapshot falls before 16:00 UTC (a noon kickoff in
+   the east). Start times are published days ahead, so this lets nothing about the game's outcome or its
+   prices into a decision. Every price and every probability still comes only from the wave's own snapshot
+   and from Kalshi candles at or before that snapshot's time.
+5. **A snapshot that is not fresh is not used** (same date). If the time The Odds API reports for a snapshot is
+   more than 10 minutes before the time asked for, the games of that wave are left out and counted.
+6. **Pairing is strict** (same date). A pair needs both team names to match with their qualifying words (State,
+   Tech and the like), a start within six hours before Kalshi's expected end of the game, and no second game
+   that day that would also match; a game that is ambiguous is left out and counted, never guessed.
