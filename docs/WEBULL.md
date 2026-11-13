@@ -81,9 +81,34 @@ have not been read into this guide yet.
   `settled_cash`, `buying_power`); the events account gives `buying_power` but no cash fields; an account with nothing
   in it lists positions as `[]` and open orders as `{"data": []}`.
 
+Practice orders on the paper cash account the same night (limit buys of one SPY share far below the market, each
+cancelled; the account ended with no open order and no holding):
+
+- Outside regular hours an ordinary order is refused at once, not queued (HTTP 417,
+  `OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT`). The overnight session takes limit orders marked for it
+  (`support_trading_session` `NIGHT`).
+- An accepted order answers `{client_order_id, order_id}` and is visible in the order detail on the very next read
+  (about 0.2 s later, five reads over two seconds, four orders): no "not present" gap was seen. Its first status is
+  `SUBMITTED`, or `PENDING` for a moment; a cancel sent while it is `PENDING` is refused
+  (`OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT`) and works a little later.
+- The same client order id sent twice is refused: `OPENAPI_TRADE_PLACE_ORDER_REPEAT`. Webull itself enforces "send
+  once".
+- A refusal at placement is always HTTP 417 with its own code, and the order then does not exist ("Order not
+  present"). Seen: outside hours; fractional shares in the overnight session (`OPENAPI_FRACT_ONLY_DAY_ORDER`); a price
+  off the step (`OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED`: "Price increment should be 0.01 when price is equal to
+  or greater than 0.9999").
+- A cancel answers `{client_order_id, order_id}` and the status is `CANCELLED` on the next read; cancelling again is
+  refused (`OPENAPI_ORDER_CAN_NOT_BE_CANCEL`); cancelling an order that never existed answers "Order not present".
+- Below one dollar a limit of 0.5001 was accepted but stored as 0.50, and 0.50001 was refused. So Webull may round a
+  sub-dollar limit; the adapter should send at most two decimals there too.
+- The adapter's own readings matched what Webull held: order status (open, nothing filled), the open-order list,
+  cash (1,000,000 practice dollars), holdings (none), cancel-all.
+
 ## Still to observe there, because Webull does not document them
 
-- whether an order that was just placed can briefly answer "not present" (the adapter's `confirmed_not_found` stays off until this is known);
+- a fill: how soon it shows, how fees arrive, what a holding row looks like (a one-share buy and sell is set to run at the next open);
+- fractional quantities in the regular session;
+- the same checks on the live side before any real order (the paper side may not behave identically);
 - the quantity step for stocks and the price steps;
 - whether one holding is ever split over several rows, and whether every row carries its instrument type;
 - how far its open-order and position answers lag behind fills, and how late fees arrive;
