@@ -1210,25 +1210,39 @@ def test_an_average_without_an_amount_is_not_used():
     assert led.reconcile(venue, {})["fills"] == [] and led.order(TAG)["priced_units"] == 0.0
 
 
-def test_a_fee_total_that_falls_is_an_anomaly_and_changes_nothing():
+def test_a_fee_total_that_falls_beside_a_rise_in_units_drops_only_the_fee():
     led, venue, _ = _accepted()
     venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=1.0)
     led.reconcile(venue, {})
-    before = led.order(TAG)
     venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.5)
     result = led.reconcile(venue, {})
     assert [a["tag"] for a in result["anomalies"]] == [TAG] and "fee" in result["anomalies"][0]["reason"]
-    assert result["fills"] == [] and led.order(TAG) == before and len(led.fills()) == 1
+    (row,) = result["fills"]
+    assert (row["units"], row["fee"], row["price"], row["price_covers_units"]) == (2.0, None, 90.0, 2.0)
+    rec = led.order(TAG)
+    assert rec["filled_units"] == 6.0 and rec["fee"] == 1.0 and not result["clean"]
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.5)
+    again = led.reconcile(venue, {})                                   # still lower: still an anomaly, no new row
+    assert again["fills"] == [] and [a["tag"] for a in again["anomalies"]] == [TAG]
+    venue.set(TAG, state="partly_filled", filled_units=7.0, avg_price=90.0, fee=1.25)
+    (row,) = led.reconcile(venue, {})["fills"]
+    assert (row["units"], row["fee"]) == (1.0, 0.25) and led.order(TAG)["fee"] == 1.25
 
 
-def test_an_average_that_implies_a_negative_price_is_an_anomaly_and_changes_nothing():
+def test_an_average_that_implies_a_negative_price_beside_a_rise_in_units_drops_only_the_price():
     led, venue, _ = _accepted()
     venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=100.0, fee=0.0)
     led.reconcile(venue, {})
-    before = led.order(TAG)
-    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=50.0)    # the 2 new units would cost -50 each
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=50.0, fee=0.0)  # 2 new units at -50 each
     result = led.reconcile(venue, {})
-    assert [a["tag"] for a in result["anomalies"]] == [TAG] and result["fills"] == [] and led.order(TAG) == before
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and not result["clean"]
+    (row,) = result["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (2.0, None, None, 0.0)
+    rec = led.order(TAG)
+    assert (rec["filled_units"], rec["priced_units"], rec["priced_avg"], rec["avg_price"]) == (6.0, 4.0, 100.0, 100.0)
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=100.0)       # a sane average prices them later
+    (row,) = led.reconcile(venue, {})["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"]) == (0.0, 100.0, 2.0)
 
 
 def test_fee_and_average_after_filled_are_taken_from_a_late_report():
@@ -1286,8 +1300,8 @@ def test_a_finished_order_with_nothing_filled_is_not_asked_again():
     assert venue.status_calls == []
 
 
-@pytest.mark.parametrize("change", [{"filled_units": 5.0}, {"state": "filled", "filled_units": 10.0}, {"state": "expired"}])
-def test_a_changed_amount_or_state_on_a_finished_order_is_an_anomaly(change):
+@pytest.mark.parametrize("change", [{"filled_units": 3.0}, {"state": "filled", "filled_units": 10.0}, {"state": "expired"}])
+def test_a_smaller_amount_or_a_changed_state_on_a_finished_order_is_an_anomaly(change):
     led, venue, _ = _accepted()
     venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
     led.reconcile(venue, {})
@@ -1448,3 +1462,198 @@ def test_not_sent_must_hold_exception_classes(bad):
     with pytest.raises(OrderError, match="not_sent"):
         OrderLedger(":memory:", not_sent=bad)
     assert OrderLedger(":memory:", not_sent=(ValueError, LocalRefusal)).not_sent == (ValueError, LocalRefusal)
+
+
+# ---- rev 5: only committed writes are reported, finished orders' late amounts, odd venue data, read errors
+
+
+class LockingVenue(FakeVenue):
+    """Before the status call for `lock_at`, another connection starts holding a read transaction (so that order's
+    COMMIT cannot finish within the busy timeout); before the status call for `free_at`, it lets go."""
+
+    def __init__(self, path, lock_at, free_at):
+        super().__init__()
+        self.path, self.lock_at, self.free_at, self.reader = path, lock_at, free_at, None
+
+    def order_status(self, tag):
+        if tag == self.lock_at and self.reader is None:
+            self.reader = sqlite3.connect(str(self.path), isolation_level=None)
+            self.reader.execute("BEGIN")
+            self.reader.execute("SELECT COUNT(*) FROM orders").fetchall()
+        if tag == self.free_at and self.reader is not None:
+            self.reader.execute("ROLLBACK")
+            self.reader.close()
+            self.reader = None
+        return super().order_status(tag)
+
+
+def test_a_failed_commit_on_one_order_among_several_reports_only_what_was_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(orders, "BUSY_SECONDS", 0.2)
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    led = ledger(path, clock)
+    venue = LockingVenue(path, lock_at=None, free_at=None)
+    ready(led, venue)
+    for t in ("a", "b", "c"):
+        intend(led, tag=t)
+        led.submit_once(venue, t)
+    for t, n in (("a", 2.0), ("b", 4.0), ("c", 6.0)):
+        venue.set(t, state="partly_filled", filled_units=n, avg_price=90.0, fee=0.1)
+    venue.lock_at, venue.free_at = "b", "c"
+    result = led.reconcile(venue, {})
+    assert [f["tag"] for f in result["fills"]] == ["a", "c"] and [u["tag"] for u in result["updated"]] == ["a", "c"]
+    assert [u["tag"] for u in result["unresolved"]] == ["b"] and "could not be written" in result["unresolved"][0]["reason"]
+    assert not result["clean"] and led.order("b")["filled_units"] == 0.0 and led.order("b")["state"] == "accepted"
+    on_disk = led.fills()
+    assert on_disk == result["fills"] == led.unapplied_fills()
+    assert led.last_reconcile()["summary"]["fills"] == result["fills"]
+    venue.lock_at = venue.free_at = None
+    later = led.reconcile(venue, {})                                    # the lock is gone: b's fill is written now
+    (row,) = later["fills"]
+    assert row["tag"] == "b" and row["units"] == 4.0 and row["id"] not in [f["id"] for f in result["fills"]]
+    assert [f["tag"] for f in led.fills()] == ["a", "c", "b"] and len({f["id"] for f in led.fills()}) == 3
+
+
+def test_a_cancelled_order_reported_without_an_amount_gets_its_fill_when_the_amount_comes():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="cancelled", filled_units=None)
+    led.reconcile(venue, {})
+    assert led.order(TAG)["state"] == "cancelled" and led.order(TAG)["filled_units"] == 0.0
+    venue.set(TAG, state="cancelled", filled_units=3.0, avg_price=90.0, fee=0.3)
+    venue.held = {"XLE": 3.0}
+    result = led.reconcile(venue, {})
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and not result["clean"]
+    (row,) = result["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (3.0, 90.0, 3.0, 0.3)
+    rec = led.order(TAG)
+    assert rec["state"] == "cancelled" and rec["filled_units"] == 3.0
+    assert led.reconcile(venue, {})["fills"] == []
+
+
+def test_an_expired_order_whose_amount_rises_later_gets_its_fill():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="expired", filled_units=None)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="expired", filled_units=6.0, avg_price=91.0, fee=0.0)
+    result = led.reconcile(venue, {})
+    (row,) = result["fills"]
+    assert row["units"] == 2.0 and row["price"] == pytest.approx((91.0 * 6 - 90.0 * 4) / 2)
+    assert [a["tag"] for a in result["anomalies"]] == [TAG] and led.order(TAG)["state"] == "expired"
+
+
+def test_a_position_key_that_is_not_a_string_is_a_positions_error_and_the_reconcile_is_recorded():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    venue.held = {("XLE",): 1.0}
+    result = led.reconcile(venue, {})
+    assert not result["clean"] and "('XLE',)" in result["positions_error"]
+    assert led.last_reconcile()["time"] == clock.t and led.last_reconcile()["clean"] is False
+
+
+def test_a_book_position_key_that_is_not_a_string_is_a_positions_error():
+    led, venue = ledger(), FakeVenue()
+    result = led.reconcile(venue, {1: 1.0})
+    assert not result["clean"] and result["positions_error"] and led.last_reconcile() is not None
+
+
+READERS = [("order", ("a",)), ("orders", ()), ("events", ()), ("fills", ()), ("unapplied_fills", ()),
+           ("last_reconcile", ()), ("blocked", ())]
+
+
+@pytest.mark.parametrize("method, args", READERS)
+def test_every_reading_method_raises_order_error_under_a_held_lock(tmp_path, monkeypatch, method, args):
+    monkeypatch.setattr(orders, "BUSY_SECONDS", 0.2)
+    path = tmp_path / "orders.sqlite"
+    led = ledger(path)
+    intend(led, tag="a")
+    locker = sqlite3.connect(str(path), isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")                                  # no one may read until it lets go
+    try:
+        with pytest.raises(OrderError, match="could not be read"):
+            getattr(led, method)(*args)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    getattr(led, method)(*args)
+
+
+def test_the_constructor_raises_order_error_under_a_held_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(orders, "BUSY_SECONDS", 0.2)
+    path = tmp_path / "orders.sqlite"
+    ledger(path).close()
+    locker = sqlite3.connect(str(path), isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(OrderError, match="ledger"):
+            ledger(path)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+
+
+def test_a_file_that_is_not_a_database_is_refused_with_order_error(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    path.write_bytes(b"this is not a sqlite database at all, just some text " * 40)
+    led = None
+    with pytest.raises(OrderError, match="not a database"):
+        led = ledger(path)
+    assert led is None
+
+
+@pytest.mark.parametrize("field, value", [("tag", "bad\ud800tag"), ("symbol", "X\udfffLE"), ("units", 10 ** 400),
+                                          ("price", 10 ** 400), ("limit_price", -(10 ** 400))])
+def test_intend_refuses_text_that_is_not_utf8_and_numbers_that_are_not_finite_floats(field, value):
+    led = ledger()
+    kw = {"tag": "t", "symbol": "XLE", "units": 10.0, "price": 90.0}
+    if field == "limit_price":
+        with pytest.raises(OrderError):
+            intend(led, **kw, limit_price=value)
+    else:
+        kw[field] = value
+        with pytest.raises(OrderError):
+            intend(led, **kw)
+    assert led.orders() == []
+
+
+class WedgedRollback:
+    """A connection whose ROLLBACK fails and leaves it inside its transaction."""
+
+    def __init__(self, real):
+        self.real = real
+
+    def execute(self, sql, *args):
+        if sql.strip().upper() == "ROLLBACK":
+            raise sqlite3.OperationalError("cannot roll back")
+        return self.real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def test_a_wedged_rollback_on_a_file_ledger_reopens_its_connection(tmp_path, monkeypatch):
+    monkeypatch.setattr(orders, "BUSY_SECONDS", 0.2)
+    path = tmp_path / "orders.sqlite"
+    led = ledger(path)
+    led._db = WedgedRollback(led._db)
+    reader = sqlite3.connect(str(path), isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM orders").fetchall()           # makes the COMMIT fail
+    with pytest.raises(OrderError):
+        intend(led, tag="x")
+    assert not isinstance(led._db, WedgedRollback) and not led._db.in_transaction
+    other = sqlite3.connect(str(path), timeout=0.2, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")                                   # nothing of the failed write holds a lock
+    other.execute("ROLLBACK")
+    other.close()
+    reader.execute("ROLLBACK")
+    reader.close()
+    assert led.order("x") is None and intend(led, tag="x")["state"] == "intended"
+
+
+def test_a_wedged_rollback_on_a_memory_ledger_says_it_must_be_discarded():
+    led = ledger()
+    led._db = WedgedRollback(led._db)
+    with pytest.raises(OrderError, match="discarded"):
+        with led._write():
+            raise sqlite3.OperationalError("disk I/O error")
