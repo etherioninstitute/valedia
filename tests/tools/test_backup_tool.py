@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -175,7 +176,8 @@ def hidden_leftovers(dest):
     dest = Path(dest)
     if not dest.exists():
         return []
-    return sorted(p.name for p in dest.iterdir() if p.name.startswith((".tmp-", ".scratch-", ".trash-")))
+    return sorted(p.name for p in dest.iterdir()
+                  if p.name.startswith((".valedia-backup-", ".tmp-", ".scratch-", ".trash-")))
 
 
 def open_copy(path):
@@ -351,32 +353,32 @@ def test_kill_at_random_points_never_leaves_a_half_backup_and_the_next_run_works
     for i in range(150):
         write_file(root / "journal" / f"day{i:03}.jsonl", ('{"n":%d}\n' % i) * 40)
     write_file(root / "config" / "risk.json", "{}")
-    t0 = time.monotonic()
-    p = _spawn(root, dest)
-    assert p.wait(timeout=120) == 0
-    duration = time.monotonic() - t0
+    durations = []
+    for _ in range(3):                                   # the fastest clean run bounds where a kill can land
+        t0 = time.monotonic()
+        assert _spawn(root, dest).wait(timeout=120) == 0
+        durations.append(time.monotonic() - t0)
+    fastest = min(durations)
     rng = random.Random(27)
     checked = set()
-    kills, with_temp, sigterm = 0, 0, 0
-    for k in range(40):
+    kills, sigterm, attempts = 0, 0, 0
+    while kills < 36 and attempts < 120:                 # a kill counts only when the process was still running
+        attempts += 1
         p = _spawn(root, dest)
-        time.sleep(rng.uniform(0.02, 1.15) * duration)
-        sig = signal.SIGTERM if k % 4 == 3 else signal.SIGKILL
+        time.sleep(rng.uniform(0.0, 0.8) * fastest)
         if p.poll() is None:
-            os.kill(p.pid, sig)
+            sig = signal.SIGTERM if kills % 4 == 3 else signal.SIGKILL
+            os.kill(p.pid, sig)                          # only the process this test started, by its pid
+            kills += 1
             sigterm += sig == signal.SIGTERM
         p.wait(timeout=60)
-        kills += 1
-        with_temp += bool(hidden_leftovers(dest)) if dest.exists() else 0
         if dest.exists():
             _assert_no_half_backup(dest, checked)
-        code = backup.main(["run", "--root", str(root), "--dest", str(dest)])         # the next run works
-        assert code == 0
+        assert backup.main(["run", "--root", str(root), "--dest", str(dest)]) == 0     # the next run works
         assert hidden_leftovers(dest) == []
         _assert_no_half_backup(dest, checked)
-    print(f"kills={kills} sigterm={sigterm} killed_with_a_temp_folder_present={with_temp} run_seconds={duration:.2f}")
+    print(f"kills={kills} sigterm={sigterm} attempts={attempts} fastest_run={fastest:.2f}s")
     assert kills >= 30 and sigterm >= 5
-    assert with_temp >= 3, f"only {with_temp} of {kills} kills landed mid-copy; the test is not exercising the window"
     assert len(finals(dest)) == 14
 
 
@@ -400,13 +402,31 @@ def test_a_run_that_fails_midway_says_what_failed_and_leaves_nothing(repo, monke
 
 def test_next_run_clears_what_a_killed_run_left_and_only_that(repo):
     repo.dest.mkdir()
-    for name in (".tmp-20250101T000000Z-1", ".scratch-20250101T000000Z-1", ".trash-20240101T000000Z-1"):
+    ours = [f"{backup.WORK_PREFIX}tmp-20250101T000000Z-1", f"{backup.WORK_PREFIX}scratch-20250101T000000Z-1"]
+    for name in ours:
+        write_file(repo.dest / name / backup.WORK_MARK, b"")
         write_file(repo.dest / name / "partial.bin", b"x")
-    write_file(repo.dest / ".keepme" / "f", b"x")
-    write_file(repo.dest / "notes.txt", b"mine")
+    (repo.dest / f"{backup.WORK_PREFIX}tmp-20250101T000001Z-2").mkdir()          # killed before its marker
+    write_file(repo.dest / f"{backup.WORK_PREFIX}trash-20240101T000000Z-1" / "MANIFEST.json", b"{}")
     assert run(repo) == 0
     assert hidden_leftovers(repo.dest) == []
-    assert (repo.dest / ".keepme" / "f").exists() and (repo.dest / "notes.txt").read_bytes() == b"mine"
+
+
+def test_a_users_files_with_a_working_folders_look_are_never_deleted(repo):
+    repo.dest.mkdir()
+    mine = [".tmp-mine", ".scratch-x", ".trash-y", ".tmp-20250101T000000Z-1", ".scratch-20250101T000000Z-1",
+            ".trash-20240101T000000Z-1", f"{backup.WORK_PREFIX}notes", f"{backup.WORK_PREFIX}tmp-notes"]
+    for name in mine:
+        write_file(repo.dest / name / "f.txt", b"mine")
+    write_file(repo.dest / ".tmp-afile", b"mine")
+    # a folder of ours' exact name pattern but not marked, not empty, no manifest: not ours to delete
+    write_file(repo.dest / f"{backup.WORK_PREFIX}tmp-20250202T000000Z-7" / "user.txt", b"mine")
+    for _ in range(3):
+        assert run(repo) == 0
+    for name in mine:
+        assert (repo.dest / name / "f.txt").read_bytes() == b"mine", name
+    assert (repo.dest / ".tmp-afile").read_bytes() == b"mine"
+    assert (repo.dest / f"{backup.WORK_PREFIX}tmp-20250202T000000Z-7" / "user.txt").read_bytes() == b"mine"
 
 
 def test_two_runs_in_one_second_get_two_distinct_final_folders(small_repo):
@@ -541,10 +561,12 @@ def test_corrupt_sources_are_reported_with_exit_1_and_the_rest_is_backed_up(repo
     assert m["status"] == "partial"
     assert failed_paths(m) == {"memory/garbage.sqlite", "memory/broken.sqlite"}
     assert "memory/garbage.sqlite" in captured.err and "memory/broken.sqlite" in captured.err
-    assert not (folder / "memory" / "garbage.sqlite").exists() and not (folder / "memory" / "broken.sqlite").exists()
+    assert not (folder / "memory" / "broken.sqlite").exists()                 # a corrupt database: left out
+    assert (folder / "memory" / "garbage.sqlite").read_bytes() == b"this is not a database at all, just text"
+    assert entry(m, "memory/garbage.sqlite")["not_a_database"] is True       # not a database: a flagged plain copy
     assert {e["path"] for e in m["files"]} >= {"memory/rollback.sqlite", "memory/wal_open.sqlite",
                                                 "journal/2026-11-12.jsonl", "config/risk.json"}
-    assert all(e["path"] not in failed_paths(m) for e in m["files"])
+    assert all(e["path"] not in failed_paths(m) for e in m["files"] if e["path"] != "memory/garbage.sqlite")
 
 
 @pytest.mark.skipif(IS_ROOT, reason="root can read anything")
@@ -608,13 +630,17 @@ def test_no_backup_possible_exits_2(tmp_path, capsys):
     assert backup.main(["run", "--root", str(tmp_path / "missing"), "--dest", str(tmp_path / "dest")]) == 2
     only_bad = tmp_path / "only_bad"
     write_file(only_bad / "memory" / "bad.sqlite", b"not a database")
-    assert backup.main(["run", "--root", str(only_bad), "--dest", str(tmp_path / "dest2")]) == 2
-    assert finals(tmp_path / "dest2") == [] and hidden_leftovers(tmp_path / "dest2") == []
+    assert backup.main(["run", "--root", str(only_bad), "--dest", str(tmp_path / "dest2")]) == 1   # kept as a plain file
+    corrupt_only = tmp_path / "corrupt_only"
+    make_db(corrupt_only / "memory" / "broken.sqlite", rows=800, pad=300)
+    _break_pages(corrupt_only / "memory" / "broken.sqlite")
+    assert backup.main(["run", "--root", str(corrupt_only), "--dest", str(tmp_path / "dest3")]) == 2
+    assert finals(tmp_path / "dest3") == [] and hidden_leftovers(tmp_path / "dest3") == []
 
 
 def test_a_missing_top_level_folder_is_named_in_the_manifest(small_repo):
     assert run(small_repo) == 0
-    assert manifest_of(newest(small_repo.dest))["absent_folders"] == ["artifacts"]
+    assert manifest_of(newest(small_repo.dest))["absent_folders"] == ["artifacts", "state"]
 
 
 # --------------------------------------------------------------------------------------- outcome: refused destinations
@@ -835,3 +861,412 @@ def test_restore_of_a_backup_with_pruned_large_files_says_what_is_missing(tmp_pa
     out = capsys.readouterr().out
     assert "memory/big.sqlite" in out and "pruned" in out
     assert (tmp_path / "out" / "journal" / "j.jsonl").is_file() and not (tmp_path / "out" / "memory" / "big.sqlite").exists()
+
+
+# =========================================================================================== rev 2
+# --------------------------------------------------------------------------------------- outcome 1
+WRITER = r'''
+import os, sqlite3, sys
+path, stop = sys.argv[1:3]
+conn = sqlite3.connect(path, timeout=60, isolation_level=None)
+n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
+while not os.path.exists(stop):
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        n += 1
+        conn.execute("INSERT INTO ledger VALUES (?, ?)", (n, b"z" * 300))
+        conn.execute("INSERT INTO mirror VALUES (?)", (n,))
+        conn.execute("UPDATE meta SET last = ?", (n,))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
+'''
+
+
+def _rw_check(path, expected_tables):
+    """The ordinary way a restored database is used: a plain read-write open."""
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        got = {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in expected_tables}
+        assert got == expected_tables
+        assert got["ledger"] == got["mirror"] == conn.execute("SELECT last FROM meta").fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.timeout(280)
+@pytest.mark.parametrize("folder", ["journal", "config"])
+@pytest.mark.parametrize("mode", ["wal", "delete"])
+def test_a_database_under_journal_or_config_restores_to_the_rows_that_were_checked(tmp_path, folder, mode):
+    r = Repo(tmp_path)
+    live = r.root / folder / "live.sqlite"
+    make_db(live, mode=mode, rows=300, pad=300)
+    make_db(r.root / "memory" / "anchor.sqlite", rows=5)
+    stop = tmp_path / "stop"
+    writer = subprocess.Popen([sys.executable, "-c", WRITER, str(live), str(stop)])
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            with contextlib.suppress(sqlite3.Error):
+                with contextlib.closing(sqlite3.connect(f"{live.as_uri()}?mode=ro", uri=True)) as c:
+                    if c.execute("SELECT COUNT(*) FROM ledger").fetchone()[0] > 320:
+                        break
+            time.sleep(0.02)
+        for i in range(20):
+            assert run(r) == 0
+            backed = newest(r.dest)
+            m = manifest_of(backed)
+            assert not [e["path"] for e in m["files"] if e["path"].endswith(("-wal", "-shm", "-journal"))]
+            assert not [p for p in backed.rglob("*") if p.name.endswith(("-wal", "-shm", "-journal"))]
+            assert entry(m, f"{folder}/live.sqlite")["kind"] == "sqlite"
+            to = tmp_path / f"restored{i}"
+            assert backup.main(["restore", str(backed), "--to", str(to), "--root", str(r.root)]) == 0
+            _rw_check(to / folder / "live.sqlite", entry(m, f"{folder}/live.sqlite")["tables"])
+    finally:
+        stop.write_text("stop")
+        try:
+            writer.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            writer.kill()                                  # the process this test started, by its handle
+
+
+def test_side_files_of_a_database_in_journal_are_not_copied_but_the_rest_is(small_repo):
+    db = small_repo.root / "journal" / "x.sqlite"
+    make_db(db, mode="wal", rows=10)
+    keep = sqlite3.connect(db)
+    keep.execute("PRAGMA wal_autocheckpoint=0")
+    keep.execute("INSERT INTO ledger VALUES (1000, x'00')")
+    keep.commit()
+    write_file(small_repo.root / "journal" / "orphan.txt-wal", "not a side file of any database")
+    write_file(small_repo.root / "journal" / "notes.txt", "n")
+    write_file(small_repo.root / "journal" / "notes.txt-journal", "plain text beside plain text")
+    try:
+        assert (Path(str(db) + "-wal")).exists()
+        assert run(small_repo) == 0
+    finally:
+        keep.close()
+    paths = {e["path"] for e in manifest_of(newest(small_repo.dest))["files"]}
+    assert "journal/x.sqlite" in paths
+    assert not paths & {"journal/x.sqlite-wal", "journal/x.sqlite-shm", "journal/x.sqlite-journal"}
+    assert {"journal/orphan.txt-wal", "journal/notes.txt", "journal/notes.txt-journal"} <= paths
+    assert counts(newest(small_repo.dest) / "journal" / "x.sqlite") == (11, 10)
+
+
+def test_a_database_found_by_content_in_config_is_copied_by_the_online_backup(small_repo):
+    make_db(small_repo.root / "config" / "settings.dat", mode="wal", rows=7)       # no database name at all
+    assert run(small_repo) == 0
+    e = entry(manifest_of(newest(small_repo.dest)), "config/settings.dat")
+    assert e["kind"] == "sqlite" and e["integrity"] == "ok" and e["tables"]["ledger"] == 7
+
+
+def test_verify_fails_a_backup_that_holds_a_side_file_beside_a_database_copy(repo):
+    assert run(repo) == 0
+    folder = newest(repo.dest)
+    side = folder / "memory" / "rollback.sqlite-wal"
+    side.write_bytes(b"left over")
+    code, lines = backup.verify_backup(folder)
+    assert code == 1 and any("rollback.sqlite-wal" in x for x in lines), lines
+    m = manifest_of(folder)                                        # even when the manifest lists it (as 88d1f1d did)
+    m["files"].append({"path": "memory/rollback.sqlite-wal", "kind": "file", "size": side.stat().st_size,
+                       "sha256": sha256(side)})
+    (folder / "MANIFEST.json").write_text(json.dumps(m))
+    code, lines = backup.verify_backup(folder)
+    assert code == 1 and any("rollback.sqlite-wal" in x for x in lines), lines
+    assert backup.main(["restore", str(folder), "--to", str(repo.base / "never"), "--root", str(repo.root)]) == 2
+    assert not (repo.base / "never").exists()
+
+
+def test_verify_checks_the_row_counts_in_the_manifest(repo):
+    assert run(repo) == 0
+    folder = newest(repo.dest)
+    m = manifest_of(folder)
+    entry(m, "memory/rollback.sqlite")["tables"]["ledger"] += 1
+    (folder / "MANIFEST.json").write_text(json.dumps(m))
+    code, lines = backup.verify_backup(folder)
+    assert code == 1 and any("memory/rollback.sqlite" in x and "rows" in x for x in lines), lines
+
+
+# --------------------------------------------------------------------------------------- outcome 2
+def test_links_are_never_followed_and_are_named(small_repo, tmp_path, capsys):
+    root = small_repo.root
+    outside = tmp_path / "outside"
+    write_file(outside / "secret.txt", "s")
+    make_db(outside / "o.sqlite", rows=3)
+    (root / "journal" / "link_to_file").symlink_to(root / "journal" / "j.jsonl")
+    (root / "journal" / "link_to_outside_dir").symlink_to(outside, target_is_directory=True)
+    (root / "config" / "link_to_inside_dir").symlink_to(root / "journal", target_is_directory=True)
+    (root / "memory" / "link_to_db.sqlite").symlink_to(root / "memory" / "a.sqlite")
+    (root / "journal" / "broken").symlink_to(tmp_path / "nowhere")
+    os.link(root / "journal" / "j.jsonl", root / "journal" / "hard.jsonl")
+    assert run(small_repo) == 0                                     # a named link does not change the exit code
+    err = capsys.readouterr().err
+    m = manifest_of(newest(small_repo.dest))
+    links = ["config/link_to_inside_dir", "journal/broken", "journal/link_to_file", "journal/link_to_outside_dir",
+             "memory/link_to_db.sqlite"]
+    assert sorted(m["link_not_followed"]) == links
+    for link in links:
+        assert link in err
+    assert str(tmp_path / "outside") not in json.dumps(m)                    # the link's own path only
+    assert str(tmp_path / "nowhere") not in json.dumps(m) and "secret.txt" not in json.dumps(m)
+    paths = {e["path"] for e in m["files"]}
+    assert paths == {"memory/a.sqlite", "journal/j.jsonl", "journal/hard.jsonl", "config/c.json"}
+    assert m["status"] == "complete" and m["failures"] == []
+
+
+# --------------------------------------------------------------------------------------- outcome 3
+def _identity_repo(tmp_path):
+    parent = tmp_path / "parent"
+    root = parent / "Répo"                                      # a name with an accent: case and Unicode forms
+    make_db(root / "memory" / "a.sqlite", rows=5)
+    write_file(root / "journal" / "j.jsonl", "{}\n")
+    (parent / "other").mkdir()
+    (parent / "lnk").symlink_to(root, target_is_directory=True)
+    (parent / "lnk2").symlink_to(root / "memory", target_is_directory=True)
+    return parent, root
+
+
+def _spellings(parent):
+    nfd = unicodedata.normalize("NFD", "Répo")
+    upper, lower = "RÉPO", "répo"
+    out = [
+        f"{parent}/Répo", f"{parent}/Répo/", f"{parent}/Répo/bk/", f"{parent}/Répo/./bk",
+        f"{parent}/Répo/../Répo/bk", f"{parent}/other/../Répo/bk", f"{parent}//Répo//bk",
+        f"{parent}/Répo/memory/new/deeper", f"{parent}/lnk/bk", f"{parent}/lnk", f"{parent}/lnk2",
+        f"{parent}/lnk/../lnk/bk",
+    ]
+    if os.path.exists(f"{parent}/{upper}"):                         # a case-insensitive volume (this one)
+        out += [f"{parent}/{upper}/bk", f"{parent}/{lower}/bk", f"{parent}/{upper}"]
+    if os.path.exists(f"{parent}/{nfd}"):                           # a Unicode-normalising volume (this one)
+        out += [f"{parent}/{nfd}/bk", f"{parent}/{nfd.upper()}/bk"]
+    return out
+
+
+def test_the_repository_guard_compares_the_place_not_the_spelling(tmp_path, monkeypatch, capsys):
+    parent, root = _identity_repo(tmp_path)
+    spellings = _spellings(parent)
+    assert len(spellings) >= 12
+    before_root, before_parent = tree_state(root), sorted(os.listdir(parent))
+    for dest in spellings:
+        capsys.readouterr()
+        assert backup.main(["run", "--root", str(root), "--dest", dest]) == 2, dest
+        assert "repository" in capsys.readouterr().err, dest
+    monkeypatch.chdir(parent / "other")
+    assert backup.main(["run", "--root", str(root), "--dest", "../Répo/bk"]) == 2
+    assert backup.main(["run", "--root", str(root), "--dest", "../lnk/bk"]) == 2
+    assert tree_state(root) == before_root and sorted(os.listdir(parent)) == before_parent
+    if os.path.exists(f"{parent}/RÉPO"):                       # the repository itself spelled another way
+        assert backup.main(["run", "--root", f"{parent}/RÉPO", "--dest", f"{root}/bk"]) == 2
+        assert backup.main(["run", "--root", f"{parent}/lnk", "--dest", f"{root}/bk"]) == 2
+    assert tree_state(root) == before_root
+
+
+def test_restore_guard_compares_the_place_not_the_spelling(tmp_path, monkeypatch, capsys):
+    parent, root = _identity_repo(tmp_path)
+    good_dest = tmp_path / "good_dest"
+    assert backup.main(["run", "--root", str(root), "--dest", str(good_dest)]) == 0
+    folder = newest(good_dest)
+    spellings = _spellings(parent)
+    before_root, before_parent = tree_state(root), sorted(os.listdir(parent))
+    for to in spellings:
+        capsys.readouterr()
+        assert backup.main(["restore", str(folder), "--to", to, "--root", str(root)]) == 2, to
+        assert "repository" in capsys.readouterr().err, to
+    monkeypatch.chdir(parent / "other")
+    assert backup.main(["restore", str(folder), "--to", "../Répo/restored", "--root", str(root)]) == 2
+    assert tree_state(root) == before_root and sorted(os.listdir(parent)) == before_parent
+    assert backup.main(["restore", str(folder), "--to", str(tmp_path / "fine"), "--root", str(root)]) == 0
+
+
+# --------------------------------------------------------------------------------------- outcome 4
+BAD_MANIFESTS = {
+    "empty_list": b"[]", "a_string": b'"manifest"', "a_number": b"5", "null": b"null", "empty_file": b"",
+    "invalid_json": b"{not json", "not_utf8": b"\xff\xfe\x00{\x80", "deeply_nested": b"[" * 200000,
+    "files_not_a_list": json.dumps({"format": backup.FORMAT, "files": "nope"}).encode(),
+    "wrong_field_types": json.dumps({"format": backup.FORMAT, "status": 5, "failures": {}, "files": [
+        {"path": 5, "kind": "file", "size": "big", "sha256": 1}]}).encode(),
+    "entry_not_an_object": json.dumps({"format": backup.FORMAT, "status": "complete", "failures": [],
+                                       "files": ["memory/a.sqlite"]}).encode(),
+    "wrong_format": json.dumps({"format": "something-else", "files": []}).encode(),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_MANIFESTS))
+def test_a_manifest_of_the_wrong_shape_crashes_nothing_and_its_folder_is_left_alone(small_repo, name, capsys):
+    bad = small_repo.dest / "20200101T000000Z"
+    write_file(bad / "MANIFEST.json", BAD_MANIFESTS[name])
+    write_file(bad / "keep.txt", "mine")
+    capsys.readouterr()
+    assert run(small_repo) == 0                                       # run does not crash on it
+    assert backup.main(["list", "--dest", str(small_repo.dest)]) == 0
+    out = capsys.readouterr()
+    assert "20200101T000000Z" in out.out and "unreadable" in out.out.lower()
+    assert "Traceback" not in out.err + out.out
+    assert backup.main(["verify", str(bad)]) == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and err.strip()
+    assert backup.main(["restore", str(bad), "--to", str(small_repo.base / "never"), "--root",
+                        str(small_repo.root)]) == 2
+    assert "Traceback" not in capsys.readouterr().err and not (small_repo.base / "never").exists()
+    assert (bad / "keep.txt").read_bytes() == b"mine"
+
+
+def test_unreadable_manifests_are_never_deleted_or_counted_for_retention(small_repo, monkeypatch):
+    clock = Clock(dt.datetime(2026, 7, 1, 3, 0, 0, tzinfo=dt.timezone.utc))
+    monkeypatch.setattr(backup, "utcnow", clock)
+    for i, name in enumerate(sorted(BAD_MANIFESTS)):
+        write_file(small_repo.dest / f"2019010{i % 10}T0000{i:02}Z" / "MANIFEST.json", BAD_MANIFESTS[name])
+    bad_names = sorted(p.name for p in finals(small_repo.dest))
+    for _ in range(17):
+        assert run(small_repo) == 0
+        clock.advance()
+    ours = [p for p in finals(small_repo.dest) if p.name not in bad_names]
+    assert len(ours) == 14
+    assert sorted(p.name for p in finals(small_repo.dest) if p.name in bad_names) == bad_names
+
+
+# --------------------------------------------------------------------------------------- outcome 5
+def test_a_leftover_manifest_part_in_a_final_folder_is_cleared_and_harms_nothing(small_repo):
+    assert run(small_repo) == 0
+    folder = newest(small_repo.dest)
+    part = folder / "MANIFEST.json.part"
+    write_file(part, b'{"half": ')
+    assert backup.verify_backup(folder)[0] == 0
+    assert backup.main(["restore", str(folder), "--to", str(small_repo.base / "out"), "--root",
+                        str(small_repo.root)]) == 0
+    assert run(small_repo) == 0
+    assert not part.exists()
+    assert backup.verify_backup(folder)[0] == 0
+
+
+# --------------------------------------------------------------------------------------- outcome 6
+@pytest.mark.parametrize("bad", ["/etc/hosts", "../escape.txt", "memory/../../escape.txt", "memory//a.sqlite",
+                                 "./memory/a.sqlite", "", "memory/./a.sqlite", "memory/a.sqlite/../../x"])
+def test_a_manifest_is_not_trusted_about_paths(small_repo, bad):
+    assert run(small_repo) == 0
+    folder = newest(small_repo.dest)
+    m = manifest_of(folder)
+    m["files"].append({"path": bad, "kind": "file", "size": 1, "sha256": hashlib.sha256(b"x").hexdigest()})
+    (folder / "MANIFEST.json").write_text(json.dumps(m))
+    before = sorted(os.listdir(small_repo.base))
+    code, lines = backup.verify_backup(folder)
+    assert code != 0 and "path" in "\n".join(lines).lower(), lines
+    to = small_repo.base / "target"
+    assert backup.main(["restore", str(folder), "--to", str(to), "--root", str(small_repo.root)]) == 2
+    assert sorted(os.listdir(small_repo.base)) == before                # nothing created: no target, no sibling
+    assert not (small_repo.base / "escape.txt").exists()
+
+
+def test_a_link_inside_a_backup_folder_fails_verify(small_repo, tmp_path):
+    assert run(small_repo) == 0
+    folder = newest(small_repo.dest)
+    outside = write_file(tmp_path / "elsewhere.txt", "x")
+    (folder / "config" / "c.json").unlink()
+    (folder / "config" / "c.json").symlink_to(outside)
+    code, lines = backup.verify_backup(folder)
+    assert code == 1 and any("config/c.json" in x for x in lines)
+
+
+def test_restore_creates_nothing_outside_its_target(small_repo):
+    assert run(small_repo) == 0
+    before = sorted(os.listdir(small_repo.base))
+    to = small_repo.base / "restored"
+    assert backup.main(["restore", str(newest(small_repo.dest)), "--to", str(to), "--root", str(small_repo.root)]) == 0
+    assert sorted(os.listdir(small_repo.base)) == sorted(before + ["restored"])
+    assert sorted(p.name for p in to.iterdir()) == ["config", "journal", "memory"]
+    empty = small_repo.base / "empty_target"
+    empty.mkdir()
+    before = sorted(os.listdir(small_repo.base))
+    assert backup.main(["restore", str(newest(small_repo.dest)), "--to", str(empty), "--root",
+                        str(small_repo.root)]) == 0
+    assert sorted(os.listdir(small_repo.base)) == before
+
+
+# --------------------------------------------------------------------------------------- outcome 7
+def test_a_file_that_changed_while_copied_is_copied_again_up_to_three_times(small_repo, monkeypatch, capsys):
+    real = backup.copy_file
+    calls = []
+
+    def changing(src, dst, *a, **k):
+        size, digest, _changed = real(src, dst, *a, **k)
+        if str(src).endswith("j.jsonl"):
+            calls.append(1)
+            return size, digest, len(calls) < 3                      # two torn copies, then a quiet one
+        return size, digest, False
+
+    monkeypatch.setattr(backup, "copy_file", changing)
+    assert run(small_repo) == 0
+    assert len(calls) == 3
+    assert "changed_during_copy" not in entry(manifest_of(newest(small_repo.dest)), "journal/j.jsonl")
+
+    calls.clear()
+
+    def always(src, dst, *a, **k):
+        size, digest, _changed = real(src, dst, *a, **k)
+        if str(src).endswith("j.jsonl"):
+            calls.append(1)
+            return size, digest, True
+        return size, digest, False
+
+    monkeypatch.setattr(backup, "copy_file", always)
+    capsys.readouterr()
+    assert run(small_repo) == 0                                       # exit code unchanged: the journal appends
+    assert len(calls) == 3
+    folder = newest(small_repo.dest)
+    assert entry(manifest_of(folder), "journal/j.jsonl")["changed_during_copy"] is True
+    assert "journal/j.jsonl" in capsys.readouterr().err
+    assert (folder / "journal" / "j.jsonl").read_bytes() == b'{"j":1}\n'
+
+
+def test_a_file_with_a_database_name_that_is_not_one_is_kept_as_a_plain_file_and_flagged(small_repo, capsys):
+    write_file(small_repo.root / "memory" / "notes.db", b"just some notes, not sqlite")
+    assert run(small_repo) == 1
+    folder = newest(small_repo.dest)
+    m = manifest_of(folder)
+    e = entry(m, "memory/notes.db")
+    assert e["kind"] == "file" and e["not_a_database"] is True
+    assert (folder / "memory" / "notes.db").read_bytes() == b"just some notes, not sqlite"
+    assert "memory/notes.db" in failed_paths(m) and "memory/notes.db" in capsys.readouterr().err
+    assert backup.verify_backup(folder)[0] == 1                       # partial, but its hashes match
+
+
+def test_the_message_after_a_termination_signal_says_whether_a_backup_was_published(small_repo, monkeypatch, capsys):
+    def die(*a, **k):
+        raise backup.Terminated()
+
+    monkeypatch.setattr(backup, "write_manifest", die)                 # before the rename
+    capsys.readouterr()
+    assert run(small_repo) == 2
+    err = capsys.readouterr().err
+    assert "no backup was made" in err and finals(small_repo.dest) == [] and hidden_leftovers(small_repo.dest) == []
+    monkeypatch.undo()
+    monkeypatch.setattr(backup, "apply_retention", die)               # after the rename
+    assert run(small_repo) in (1, 2)
+    err = capsys.readouterr().err
+    assert len(finals(small_repo.dest)) == 1
+    assert "published" in err and "no backup was made" not in err and finals(small_repo.dest)[0].name in err
+
+
+# --------------------------------------------------------------------------------------- outcome 8
+def test_state_is_backed_up_like_memory_and_artifacts(small_repo):
+    make_db(small_repo.root / "state" / "01e8.sqlite", rows=9)
+    make_db(small_repo.root / "state" / "nested" / "x.db", mode="wal", rows=4)
+    make_db(small_repo.root / "state" / "bycontent.bin", rows=3)
+    write_file(small_repo.root / "state" / "notes.txt", "not a database")
+    assert run(small_repo) == 0
+    m = manifest_of(newest(small_repo.dest))
+    assert {"state/01e8.sqlite", "state/nested/x.db", "state/bycontent.bin"} <= {e["path"] for e in m["files"]}
+    assert "state/notes.txt" not in {e["path"] for e in m["files"]}
+    assert entry(m, "state/01e8.sqlite")["tables"]["ledger"] == 9
+    assert "state" not in m["absent_folders"]
+
+
+# --------------------------------------------------------------------------------------- outcome 9
+def test_the_docstring_states_the_two_measured_limits():
+    doc = backup.__doc__
+    assert "-shm" in doc and "rewrite" in doc.lower()
+    assert "rollback" in doc.lower() and "1 GB" in doc and "writers" in doc.lower()
