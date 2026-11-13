@@ -66,9 +66,24 @@ Limits: most market-data calls allow 60 requests a minute per kind of call in pr
 the stock data bought for programs allows 300. The limits for trading calls are on Webull's rate-limits page and
 have not been read into this guide yet.
 
-## To observe in Webull's test environment, because Webull does not document them
+## Observed in Webull's test environment (2026-11-13, read-only, the owner's paper key)
 
-- how it answers for an order that does not exist (the adapter's `confirmed_not_found` stays off until this is seen);
+- The connection works; real-money orders report "off: test environment".
+- The paper side has five practice accounts: Individual Margin, Individual Cash, Futures, Events Cash and Crypto.
+  Each row of the account list carries `account_class` (`INDIVIDUAL_CASH`, `EVENTS_CASH`, `CRYPTO`, ...) and
+  `account_label` beside `account_type` (only `CASH` or `MARGIN`). Crypto has its own account.
+- The `account_id` the API uses is a long internal id. It is not the 8-character account number the console shows,
+  so an account has to be chosen by its class, not by typing an id.
+- An order that was never sent: on the Individual Cash and Events Cash accounts the answer is HTTP 417 with error code
+  `OPENAPI_PARAM_ERR` and the message "Parameter error, Order not present."; on the Crypto account it is HTTP 200 with
+  `{"orders": []}`. Neither is the `ORDER_NOT_FOUND` code the adapter was written to look for.
+- Balances: the cash account answers with the documented fields (`total_cash_balance`, and per currency `cash_balance`,
+  `settled_cash`, `buying_power`); the events account gives `buying_power` but no cash fields; an account with nothing
+  in it lists positions as `[]` and open orders as `{"data": []}`.
+
+## Still to observe there, because Webull does not document them
+
+- whether an order that was just placed can briefly answer "not present" (the adapter's `confirmed_not_found` stays off until this is known);
 - the quantity step for stocks and the price steps;
 - whether one holding is ever split over several rows, and whether every row carries its instrument type;
 - how far its open-order and position answers lag behind fills, and how late fees arrive;
