@@ -55,6 +55,12 @@ decides. It works in two runs:
   exactly as today (one send, an unknown outcome blocks, each fill journaled once).
 - A ticket can be used once. A ticket past its expiry, a wrong number, or a ticket made for another account,
   day or environment does nothing. Tickets are kept append-only with what became of each.
+- Settled while building (2026-11-13): the full number is printed once, on its own line, and is kept in no
+  file but the ticket file; summaries and the journal hold only its last two digits. Only the latest ticket is
+  live: a new proposal supersedes every earlier unused one. Three refused approvals in a day lock approval until
+  the next proposal. Each ticket order ends as exactly one of: sent (with its tag), not sent (with the reason),
+  left over (the run ended before it was reached), and until the order ledger knows, unknown; every later run
+  completes what a killed run left open, so the record always adds up against what the broker holds.
 
 Running without approval in live mode is not built. Whether the trader may ever send live orders unattended is
 a later decision of the owner's, after a live record exists.
