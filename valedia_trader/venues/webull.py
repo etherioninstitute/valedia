@@ -55,7 +55,8 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   (SDK trade/common/order_status.py:21-25) writes "PARTIAL FILLED" with a space and has no PENDING. Both
   spellings are mapped. No documented status means expired, so nothing maps to `expired` yet; an expired order
   that Webull reports under a status not in the table shows as `unknown_status`.
-* No such order: NOT CONFIRMED. The order-detail page documents only 200, 401, 417 and 500 answers, and the
+* No such order (as read from the docs on 2026-11-12; what the test environment answers is at the end of these
+  notes, and order_status reads those answers too). The order-detail page documents only 200, 401, 417 and 500 answers, and the
   error-code page (developer.webull.hk/apis/docs/error-codes.md; developer.webull.com has none) lists no
   order-not-found code. A search engine's copy of an older Webull HK error table (developer.webull.hk/api-doc/
   develop/error, which now redirects) listed ORDER_NOT_FOUND as "the order does not exist". Nothing documents
@@ -92,14 +93,14 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   directory, ~/.valedia/webull/<environment>/ unless `token_dir` is given, created with mode 0700, and refuses a
   directory inside the repository.
 * Quantities: never rounded. `units` must be a real number (not a bool, not a string), finite, non-zero, at most
-  1e9, and already on the step; the caller rounds down to the step itself, and the text sent parses back to
-  exactly abs(units). Steps: crypto 8 decimals (docs common-order-place, field quantity); equities 5 decimals (NOT
+  1e9, and already on the step; the caller rounds down to the step itself. The text sent is the shortest decimal
+  that reads back to the same number (repr), and a quantity whose shortest decimal has more decimals than the step
+  is refused. Steps: crypto 8 decimals (docs common-order-place, field quantity); equities 5 decimals (NOT
   CONFIRMED: Webull documents fractional quantities without a step; check in the test environment).
 * Limit prices: never rounded; a price that is not a finite number above zero, above 1e9, or not already on the
-  tick, is refused before any call (NotTransmitted). Ticks: equities 2 decimals at 1.00 and above, 4 below (the US
-  sub-penny rule, SEC Regulation NMS Rule 612; Webull's own increments are not documented on developer.webull.com);
-  crypto 8 decimals (an assumption: the docs give 8 decimals for crypto quantities only). Both are to be
-  checked in the test environment.
+  tick, is refused before any call (NotTransmitted). Ticks: equities 2 decimals at every price (below 1.00 too:
+  observed in the test environment, see the end of these notes); crypto 8 decimals (an assumption: the docs give 8
+  decimals for crypto quantities only). The text sent is the shortest decimal that reads back to the price.
 * Positions: docs /apis/docs/reference/account-position (read 2026-11-12). The 200 body is a bare list of rows
   {position_id, symbol, quantity, instrument_type, currency, last_price, cost_price, unrealized_profit_loss,
   option_strategy, event_outcome, legs}; instrument_type is one of EQUITY, OPTION, FUTURES, CRYPTO, EVENT, and
@@ -123,6 +124,41 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   "webull" logger before and after construction (removing and closing any handler but a NullHandler), and
   removes webull_trade_sdk.log if construction created it empty. Not confirmed against a real TradeClient
   (none is built in tests).
+
+* Pacing: Webull limits each kind of call per app key and answers 429 past a limit (developer.webull.com/apis/docs/
+  rate-limits, read 2026-11-13; the table is RATE_LIMITS). Every SDK call waits for the venue's sliding-window pacer,
+  which uses 80% of each limit and of an overall limit (60 a minute live, from the owner's console; 30 on the paper
+  side). A 429 on a read is tried again after 2, 4 and 8 seconds, then raises RateLimitHit; place, replace and cancel
+  are never retried here.
+
+Observed in the test environment, 2026-11-13 (the owner's paper key; docs/WEBULL.md, the two "Observed in Webull's
+test environment" parts). None of this is documented by Webull, and the live side has not been observed: it may
+behave differently.
+
+* Accounts: a paper key sees five accounts. Each row of the account list carries `account_class` (seen
+  INDIVIDUAL_MARGIN, INDIVIDUAL_CASH, FUTURES, EVENTS_CASH, CRYPTO) and `account_label` ("Individual Cash", ...)
+  beside `account_type` (only CASH or MARGIN). The API's `account_id` is a long internal id the owner cannot see
+  or type, so the venue chooses its account by class (WEBULL_ACCOUNT_CLASS; see the account_id property). Crypto
+  has its own account: stocks and funds trade in INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, crypto only in CRYPTO,
+  event contracts in EVENTS_CASH (not built); an order that does not fit the account's class is not sent.
+* A refusal at placement is HTTP 417 with a code of Webull's own (outside hours
+  OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT; fractional shares overnight OPENAPI_FRACT_ONLY_DAY_ORDER; a price
+  off the step OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED), and the order then does not exist. The same client order
+  id sent twice is refused with OPENAPI_TRADE_PLACE_ORDER_REPEAT: that order already exists. submit therefore
+  reads the order's detail once after a 4xx refusal (see submit and OrderRejected).
+* No such order: on the cash and events accounts HTTP 417, code OPENAPI_PARAM_ERR, message "Parameter error, Order
+  not present."; on the crypto account HTTP 200 with {"orders": []}. ORDER_NOT_FOUND was never seen. An accepted
+  order was visible in its detail on the very next read in every case seen (four orders, reads from 0.2 s after
+  placing): no "not present" gap was observed, on the paper side only.
+* Cancel answers {client_order_id, order_id}; a cancel while the order is still PENDING is refused with
+  OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT (it works a little later); cancelling again is refused with
+  OPENAPI_ORDER_CAN_NOT_BE_CANCEL; cancelling an order that never existed answers "Order not present".
+* Sessions: an ordinary order outside regular hours is refused, not queued. The overnight session takes limit
+  orders marked support_trading_session NIGHT.
+* Sub-dollar limits: a limit of 0.5001 was accepted and stored as 0.50, and 0.50001 was refused, so equity limits
+  are sent with at most 2 decimals at every price (see _limit_text).
+* Crypto time in force (Webull's place-order page, not observed): a crypto MARKET order supports only IOC, a crypto
+  LIMIT order DAY or GTC; this adapter sends IOC and GTC.
 """
 from __future__ import annotations
 
@@ -139,6 +175,7 @@ import numbers
 import os
 import re
 import sys
+import time
 import urllib.parse
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
@@ -150,8 +187,8 @@ HOSTS = {"sandbox": SANDBOX_HOST, "production": PRODUCTION_HOST}
 REPO = Path(__file__).resolve().parents[2]
 LIVE_CONFIRMATION = REPO / "config" / "webull_live.json"
 
-__all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfirmed", "order_payload", "client_order_id",
-           "load_live_confirmation", "ORDER_STATES"]
+__all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfirmed", "OrderRejected", "RateLimitHit", "order_payload",
+           "client_order_id", "load_live_confirmation", "ORDER_STATES"]
 
 # Webull's order status -> the trader's order state. Source: developer.webull.com/apis/docs/reference/order-detail
 # (read 2026-11-12), field orders[].status; "PARTIAL FILLED" is the SDK's spelling (webull/trade/common/order_status.py:25).
@@ -161,6 +198,13 @@ ORDER_STATES = {"PENDING": "open", "SUBMITTED": "open", "PARTIAL_FILLED": "partl
 # The error code read as "no such order" (with an empty `orders` list), and only with confirmed_not_found=True.
 # Not confirmed for the US API: see the module notes.
 ORDER_NOT_FOUND_CODES = frozenset({"ORDER_NOT_FOUND"})
+# Observed in the test environment, 2026-11-13: an id never sent answers 417, this code, "Parameter error, Order not present."
+NOT_PRESENT_CODE, NOT_PRESENT_TEXT = "OPENAPI_PARAM_ERR", "order not present"
+CANCEL_ANSWERS = {"OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT": "not yet",       # still being submitted: try again
+                  "OPENAPI_ORDER_CAN_NOT_BE_CANCEL": "already finished"}
+# Which account classes an order may trade in (observed in the test environment, 2026-11-13).
+ACCOUNT_CLASSES_FOR = {"EQUITY": frozenset({"INDIVIDUAL_CASH", "INDIVIDUAL_MARGIN"}), "CRYPTO": frozenset({"CRYPTO"})}
+TRADING_SESSIONS = ("CORE", "ALL", "NIGHT")
 # Sanity ceilings: no order of this trader is this large, and they stop absurd text being sent or trusted.
 MAX_ORDER_UNITS = 1e9
 MAX_LIMIT_PRICE = 1e9
@@ -185,6 +229,20 @@ class NotTransmitted(WebullError):
 
 class LiveTradingNotConfirmed(NotTransmitted):
     """A production order was attempted without the owner's written confirmation."""
+
+
+class RateLimitHit(WebullError):
+    """A read answered 429 (too many requests) on every try (see WebullVenue._paced)."""
+
+
+class OrderRejected(WebullError):
+    """Webull answered the order call and refused it, and a read of the order's detail then showed that no order
+    exists under its client order id. Not a NotTransmitted (the order did reach Webull), but its outcome is known:
+    nothing was placed. `code` is Webull's error code in the code shape, else None."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def client_order_id(tag: str) -> str:
@@ -215,36 +273,66 @@ def _quantity(units: Any, crypto: bool) -> tuple[float, str]:
     if abs(amount) > MAX_ORDER_UNITS:
         raise NotTransmitted(f"the quantity {abs(amount):g} is above the sanity ceiling of {MAX_ORDER_UNITS:g} units")
     places = QUANTITY_STEP_DECIMALS["crypto" if crypto else "equity"]
-    text = f"{abs(amount):.{places}f}"
-    if float(text) != abs(amount):
+    text = _shortest_text(abs(amount), places)
+    if text is None:
         raise NotTransmitted(f"the quantity {abs(amount)!r} is not on the step of {places} decimal places and would have to be "
                              "rounded to be sent; round it down to the step yourself")
-    return amount, text.rstrip("0").rstrip(".")
+    return amount, text
 
 
-def order_payload(symbol: str, units: float, tag: str, limit_price: float | None = None) -> dict:
+def _shortest_text(x: float, places: int) -> str | None:
+    """The shortest decimal that reads back to x (repr), written without an exponent and without trailing zeros, or
+    None when it has more than `places` decimals. Never a longer decimal that merely reads back to the same float
+    (99107813.158 written to 8 places is 99107813.15800001)."""
+    d = Decimal(repr(float(x)))
+    if not d.is_finite() or d.as_tuple().exponent < -places:
+        return None
+    text = f"{d:f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _session(session: Any, crypto: bool, limit_price: Any) -> str:
+    """The trading session sent as support_trading_session, or NotTransmitted: CORE (regular hours, the default), ALL
+    or NIGHT. Outside regular hours an ordinary order is refused, not queued (observed in the test environment,
+    2026-11-13). The overnight session takes limit orders only. Crypto trades around the clock and takes none."""
+    if type(session) is not str or session not in TRADING_SESSIONS:
+        raise NotTransmitted(f"the session must be one of {', '.join(TRADING_SESSIONS)}")
+    if crypto and session != "CORE":
+        raise NotTransmitted("crypto takes no trading session; leave the session at CORE")
+    if session == "NIGHT" and limit_price is None:
+        raise NotTransmitted("the overnight session (NIGHT) takes limit orders only")
+    return session
+
+
+def order_payload(symbol: str, units: float, tag: str, limit_price: float | None = None, session: str = "CORE") -> dict:
     """One order in Webull's format. `units` is signed: positive buys, negative sells what is held. Neither the
-    quantity nor the limit price is ever rounded (see _quantity and _limit_text): what is sent is what was asked."""
+    quantity nor the limit price is ever rounded (see _quantity and _limit_text): what is sent is what was asked.
+    Time in force: DAY for equities; for crypto IOC on a MARKET order and GTC on a LIMIT order (Webull's
+    place-order page: a crypto market order supports only IOC). `session` see _session."""
     crypto = _is_crypto(symbol)
     amount, quantity = _quantity(units, crypto)
+    session = _session(session, crypto, limit_price)
+    tif = ("IOC" if limit_price is None else "GTC") if crypto else "DAY"
     order = {"combo_type": "NORMAL", "client_order_id": client_order_id(tag), "market": "US",
              "symbol": symbol.upper().replace("-", "") if crypto else symbol.upper(),
              "instrument_type": "CRYPTO" if crypto else "EQUITY",
              "order_type": "LIMIT" if limit_price is not None else "MARKET",
-             "quantity": quantity, "side": "BUY" if amount > 0 else "SELL", "time_in_force": "GTC" if crypto else "DAY", "entrust_type": "QTY"}
+             "quantity": quantity, "side": "BUY" if amount > 0 else "SELL", "time_in_force": tif, "entrust_type": "QTY"}
     if limit_price is not None:
         order["limit_price"] = _limit_text(limit_price, crypto)
     if not crypto:
-        order["support_trading_session"] = "CORE"
+        order["support_trading_session"] = session
     return order
 
 
 def _limit_text(limit_price: Any, crypto: bool) -> str:
     """The limit price exactly as given, or NotTransmitted. It is never rounded: rounding a limit changes the worst
-    price the trader accepts, so the caller must choose the tick. Ticks: equities at most 2 decimals at 1.00 or
-    above and at most 4 below 1.00 (the US sub-penny rule, SEC Regulation NMS Rule 612; Webull's own increments are
-    not documented on developer.webull.com, read 2026-11-12); crypto at most 8 decimals (an ASSUMPTION: the docs
-    give 8 decimals for crypto quantities only). Both are to be checked in the test environment."""
+    price the trader accepts, so the caller must choose the tick. Ticks: equities at most 2 decimals at every price.
+    Below 1.00 the US sub-penny rule would allow 4, but in the test environment (2026-11-13) a limit of 0.5001 was
+    accepted and stored by Webull as 0.50 and 0.50001 was refused: Webull rounds there, so "sent exactly or not at
+    all" needs 2 decimals below 1.00 too, until more is known. Crypto at most 8 decimals (an ASSUMPTION: the docs
+    give 8 decimals for crypto quantities only). The text is the shortest decimal reading back to the price, with
+    at least 2 decimals."""
     if isinstance(limit_price, bool) or not isinstance(limit_price, numbers.Real):
         raise NotTransmitted(f"a limit price must be a number, not a {type(limit_price).__name__}")
     try:
@@ -255,13 +343,13 @@ def _limit_text(limit_price: Any, crypto: bool) -> str:
         raise NotTransmitted(f"a limit price must be a finite number above zero, not {price!r}")
     if price > MAX_LIMIT_PRICE:
         raise NotTransmitted(f"the limit price is above the sanity ceiling of {MAX_LIMIT_PRICE:g}")
-    places = 8 if crypto else 2 if price >= 1 else 4
-    text = f"{price:.{places}f}"
-    if float(text) != price or float(text) == 0:
+    places = 8 if crypto else 2
+    text = _shortest_text(price, places)
+    if text is None:
         raise NotTransmitted(f"the limit price {price!r} is not on the tick of {places} decimal places and would have to be "
                              "rounded to be sent; choose the tick yourself, because rounding a limit changes the worst price accepted")
-    whole, frac = text.split(".")
-    return f"{whole}.{frac.rstrip('0').ljust(2, '0')}"
+    whole, _, frac = text.partition(".")
+    return f"{whole}.{frac.ljust(2, '0')}"
 
 
 def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION) -> dict | None:
@@ -390,6 +478,7 @@ MAX_GATE_INPUT = 4000                                                   # longer
 _WORD = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")                     # letters, with an inner apostrophe or hyphen
 _NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 _CODE = re.compile(r"[A-Z_]{1,48}")
+_ERROR_CODE = re.compile(r"[A-Z_]{1,64}")    # an error_code: observed ones run to 50 characters
 _LEAD = "([{\"'$#"
 _TRAIL = ")]}\"'.,;:!?%"
 _PUNCT = re.compile(r"""[-.,;:!?()\[\]{}"'&/+=*#$%@]{1,8}""")
@@ -609,7 +698,7 @@ def _code(value: Any, secrets: _Secrets) -> str:
     """An error_code as shown in a message: itself if it has the code shape and holds no run of a secret, else
     CODE_WITHHELD. (The comparison with ORDER_NOT_FOUND uses the raw value; see _not_found_code.)"""
     try:
-        if type(value) is str and _CODE.fullmatch(value) and not secrets.found(value.lower()):
+        if type(value) is str and _ERROR_CODE.fullmatch(value) and not secrets.found(value.lower()):
             return value
     except Exception:
         pass
@@ -632,6 +721,8 @@ _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 _STATUS = re.compile(r"(?=.{1,48}\Z)[A-Z_]+(?: [A-Z_]+)*")
 _KIND = re.compile(r"[A-Za-z_]{1,24}")
 _ACCOUNT_TYPE = re.compile(r"[A-Z_]{1,24}")
+_ACCOUNT_CLASS = re.compile(r"[A-Z_]{1,32}")
+_LABEL = re.compile(r"(?=.{1,30}\Z)[A-Za-z]+(?: [A-Za-z]+)*")
 _CLASS = re.compile(r"[A-Za-z][A-Za-z0-9]{0,47}")
 _CURRENCY = re.compile(r"[A-Za-z]{3}")
 
@@ -714,11 +805,13 @@ def _rebuilt(exc: WebullError, secrets: _Secrets) -> WebullError:
     return cls("Webull's client failed: " + _gate(exc, secrets))
 
 
-def _call(fn, *args, secrets: _Secrets = NO_SECRETS) -> Any:
-    """Run one SDK call. The SDK raises on some failures and returns a non-200 response on others; every text
-    taken from the failure passes through the gate."""
+def _call(paced, kind: str, fn, *args, secrets: _Secrets = NO_SECRETS) -> Any:
+    """Run one SDK call through the venue's pacer (`paced`, see WebullVenue._paced). The SDK raises on some failures
+    and returns a non-200 response on others; every text taken from the failure passes through the gate."""
     try:
-        res = fn(*args)
+        res = paced(kind, fn, *args)
+    except RateLimitHit:                                                  # the module's own words
+        raise
     except WebullError as exc:
         raise _rebuilt(exc, secrets) from None
     except Exception as exc:
@@ -732,8 +825,12 @@ def _checked_error(exc: WebullError, final) -> WebullError:
     text = _plain(exc, 10 ** 6)
     checked = final(text)
     if checked != text:
-        cls = LiveTradingNotConfirmed if isinstance(exc, LiveTradingNotConfirmed) else NotTransmitted if isinstance(exc, NotTransmitted) else WebullError
-        exc = cls(checked)
+        if isinstance(exc, OrderRejected):
+            code = exc.code if type(exc.code) is str and final(exc.code) == exc.code else None
+            exc = OrderRejected(checked, code)
+        else:
+            cls = LiveTradingNotConfirmed if isinstance(exc, LiveTradingNotConfirmed) else NotTransmitted if isinstance(exc, NotTransmitted) else WebullError
+            exc = cls(checked)
     return _bare(exc)
 
 
@@ -818,6 +915,49 @@ def _not_found_code(exc_or_res_kind: str, code: Any, http_status: Any) -> bool:
         return False
 
 
+def _refusal(exc: Any) -> tuple[Any, Any, int] | None:
+    """(raw error_code, raw error_msg, http_status) when `exc` is the SDK's ServerException (by class name) with a 4xx
+    status: Webull answered and refused. Else None (a 5xx, a transport failure, anything unreadable). The raw values
+    are used only for comparisons, never shown."""
+    try:
+        status = _attr(exc, "http_status")
+        if _type_name(exc) == "ServerException" and type(status) is int and 400 <= status < 500:
+            return _attr(exc, "error_code"), _attr(exc, "error_msg"), status
+    except Exception:
+        pass
+    return None
+
+
+def _not_present(kind: str, code: Any, msg: Any, http_status: Any) -> bool:
+    """The "no such order" answer observed in the test environment (2026-11-13): the SDK's ServerException with a 4xx
+    status, code exactly OPENAPI_PARAM_ERR and a message holding "order not present" (any case), or ORDER_NOT_FOUND as
+    before (see _not_found_code). The message is read raw, before gating, only for this comparison."""
+    try:
+        if _not_found_code(kind, code, http_status):
+            return True
+        return (kind == "ServerException" and type(code) is str and code == NOT_PRESENT_CODE and type(http_status) is int
+                and 400 <= http_status < 500 and isinstance(msg, str)
+                and NOT_PRESENT_TEXT in str.lower(str.__getitem__(msg, slice(0, MAX_GATE_INPUT))))
+    except Exception:
+        return False
+
+
+def _cancel_word(kind: str, code: Any, msg: Any, http_status: Any) -> str | None:
+    """Cancel's word for a refusal (observed in the test environment, 2026-11-13), or None: a 4xx carried by the SDK's
+    ServerException (kind "ServerException") or a non-2xx answer's body (kind "answer") with code exactly
+    OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT ("not yet") or OPENAPI_ORDER_CAN_NOT_BE_CANCEL ("already
+    finished"), or the "no such order" answer (_not_present: "no such order")."""
+    try:
+        if _not_present(kind, code, msg, http_status):
+            return "no such order"
+        if (kind in ("ServerException", "answer") and type(code) is str and code in CANCEL_ANSWERS
+                and type(http_status) is int and 400 <= http_status < 500):
+            return CANCEL_ANSWERS[code]
+    except Exception:
+        pass
+    return None
+
+
 def _trader_symbol(symbol: str, instrument_type: Any) -> str:
     """Webull's (already clean) symbol under the trader's own name: crypto BTCUSD comes back as BTC-USD."""
     sym = symbol.upper()
@@ -886,17 +1026,105 @@ def _decimal(x: float) -> Decimal:
     return Decimal(repr(float(x)))
 
 
+# ---- pacing
+#
+# Webull limits each kind of call per app key and answers HTTP 429 past a limit ("the request is rejected, no partial
+# processing occurs"); repeated breaches can block the address for a time. Per-call limits: developer.webull.com/apis/
+# docs/rate-limits (read 2026-11-13). The overall limit: the owner's Webull console states 60 requests a minute for the
+# Trading API (live side); the paper side's 30 per 60 s is taken as its overall limit too. {kind: (calls, seconds)}.
+CALL_KINDS = ("account_list", "balance", "positions", "order_detail", "open_orders", "place", "replace", "cancel", "all")
+READ_KINDS = frozenset({"account_list", "balance", "positions", "order_detail", "open_orders"})
+RATE_LIMITS = {
+    "sandbox": {"account_list": (30, 60), "balance": (30, 60), "positions": (30, 60), "order_detail": (30, 60),
+                "open_orders": (30, 60), "place": (30, 60), "replace": (30, 60), "cancel": (30, 60), "all": (30, 60)},
+    "production": {"account_list": (10, 30), "balance": (2, 2), "positions": (2, 2), "order_detail": (2, 2),
+                   "open_orders": (2, 2), "place": (600, 60), "replace": (600, 60), "cancel": (600, 60), "all": (60, 60)},
+}
+RATE_SHARE = 0.8                                  # the pacer uses 80% of every limit (at least one call per window)
+READ_RETRY_WAITS = (2, 4, 8)                      # a 429 on a read: 4 tries in all, waiting 2, 4 and 8 seconds
+_default_clock, _default_sleep = time.monotonic, time.sleep
+
+
+def _limit_table(table: Any) -> dict[str, tuple[int, float]]:
+    """A copy of a limit table, or WebullError: a dict with exactly the kinds in CALL_KINDS, each (calls, seconds) with
+    calls a whole number of at least 1 and seconds a finite number above zero."""
+    if not isinstance(table, dict) or set(table) != set(CALL_KINDS):
+        raise WebullError(f"a limit table must name exactly these kinds of call: {', '.join(CALL_KINDS)}")
+    out = {}
+    for kind in CALL_KINDS:
+        entry = table[kind]
+        ok = isinstance(entry, (tuple, list)) and len(entry) == 2
+        calls, seconds = entry if ok else (None, None)
+        ok = (ok and type(calls) is int and calls >= 1 and isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+              and math.isfinite(seconds) and seconds > 0)
+        if not ok:
+            raise WebullError(f"the limit for {kind} must be (calls, seconds): a whole number of calls of at least 1 and seconds above zero")
+        out[kind] = (calls, float(seconds))
+    return out
+
+
+class _Pacer:
+    """A sliding-window pacer: before a call of `kind` it waits until fewer than the allowed number of calls of that
+    kind, and fewer than the allowed number of calls of every kind together ("all"), were made in the last window.
+    Allowed = RATE_SHARE of each limit, rounded down, at least 1. It counts calls rather than spacing them, so a burst
+    inside the limits is not slowed. In any span of a window's length (half-open) at most the allowed number fall."""
+
+    MAX_ROUNDS = 10_000
+
+    def __init__(self, table: dict[str, tuple[int, float]], clock, sleep):
+        self.allowed = {k: (max(1, math.floor(n * RATE_SHARE)), s) for k, (n, s) in table.items()}
+        self.clock, self.sleep = clock, sleep
+        self.times: dict[str, list[float]] = {k: [] for k in table}
+
+    def _delay(self, kind: str, now: float) -> float:
+        n, window = self.allowed[kind]
+        times = self.times[kind]
+        while times and times[0] <= now - window:
+            times.pop(0)
+        return times[len(times) - n] + window - now if len(times) >= n else 0.0
+
+    def wait(self, kind: str) -> None:
+        for _ in range(self.MAX_ROUNDS):
+            now = float(self.clock())
+            delay = max(self._delay(kind, now), self._delay("all", now))
+            if delay <= 0:
+                self.times[kind].append(now)
+                self.times["all"].append(now)
+                return
+            self.sleep(delay)
+        raise WebullError("the pacer's clock does not move forward while it waits")
+
+
+def _too_many(exc_or_res: Any, raised: bool) -> bool:
+    """A 429: the SDK's ServerException with http_status 429, or an answer with status 429."""
+    if raised:
+        return _type_name(exc_or_res) == "ServerException" and type(_attr(exc_or_res, "http_status")) is int and _attr(exc_or_res, "http_status") == 429
+    return _status_code(exc_or_res) == 429
+
+
+_UNSET = object()                                                       # the account's class, not looked up yet
+
+
 class WebullVenue:
     """Orders and account reads on one Webull account."""
 
     def __init__(self, app_key: str, app_secret: str, environment: str = "sandbox", account_id: str | None = None,
                  client: Any | None = None, confirmation_file: str | Path = LIVE_CONFIRMATION, region: str = "us",
-                 confirmed_not_found: bool = False, token_dir: str | Path | None = None) -> None:
-        """`confirmed_not_found` (default False): read the two "no such order" answers (see order_status) as None.
-        Turn it on only after that answer has been observed in Webull's test environment for an id that was never
-        sent, and only together with a generous `settle_seconds` in the order ledger, chosen from the lag observed
-        there: the detail call can show an empty list for a while after an order was placed, and with the flag on
-        that reads as "never arrived" once the settle time has passed. The ledger's recheck is the backstop.
+                 confirmed_not_found: bool = False, token_dir: str | Path | None = None, account_class: str | None = None,
+                 limits: dict | None = None, clock: Any = None, sleep: Any = None) -> None:
+        """`confirmed_not_found` (default False): read the "no such order" answers (see order_status) as None. Turn
+        it on only together with a generous `settle_seconds` in the order ledger: the detail call could show "not
+        present" for a while after an order was placed, and with the flag on that reads as "never arrived" once the
+        settle time has passed. In the test environment (2026-11-13) an accepted order was visible on the very next
+        read in every case seen (four orders, reads from 0.2 s), so no gap was observed, on the paper side only. The
+        ledger's recheck is the backstop.
+
+        `account_class` (from WEBULL_ACCOUNT_CLASS in from_secrets): the class of the account to trade, such as
+        INDIVIDUAL_CASH or CRYPTO; see the account_id property for how the account is chosen.
+
+        Pacing: every SDK call waits for the venue's pacer (_Pacer): `limits` replaces the environment's table in
+        RATE_LIMITS ({kind: (calls, seconds)} for every kind in CALL_KINDS; a malformed table is refused), and
+        `clock` / `sleep` replace time.monotonic / time.sleep (tests pass a fake clock and never really sleep).
 
         `token_dir`: where the SDK keeps its access token when a real client is built (the SDK writes it in plain
         text). Default ~/.valedia/webull/<environment>/; created with mode 0700; a directory inside the repository
@@ -908,7 +1136,8 @@ class WebullVenue:
         (urllib3.connectionpool) is set to WARNING unless a higher level is already set."""
         err = None
         try:
-            self._setup(app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir)
+            self._setup(app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir,
+                        account_class, limits, clock, sleep)
         except WebullError as exc:
             err = exc
         except Exception as exc:
@@ -917,11 +1146,23 @@ class WebullVenue:
             words = (app_key, app_secret, account_id) if all(isinstance(w, str) or w is None for w in (app_key, app_secret, account_id)) else ()
             raise _checked_error(err, lambda text: _last_check(text, words))
 
-    def _setup(self, app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir) -> None:
+    def _setup(self, app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir,
+               account_class=None, limits=None, clock=None, sleep=None) -> None:
         if environment not in HOSTS:
             raise WebullError(f"environment must be one of {sorted(HOSTS)}")
         if not str(app_key).strip() or not str(app_secret).strip():
             raise WebullError("a Webull App Key and App Secret are required")
+        if account_class is not None and not (type(account_class) is str and _ACCOUNT_CLASS.fullmatch(account_class)):
+            raise WebullError("the account class must be an upper-case code such as INDIVIDUAL_CASH or CRYPTO")
+        self._wanted_class = account_class
+        self._account_class: Any = _UNSET
+        self._limits = _limit_table(RATE_LIMITS[environment] if limits is None else limits)
+        clock = _default_clock if clock is None else clock
+        sleep = _default_sleep if sleep is None else sleep
+        if not callable(clock) or not callable(sleep):
+            raise WebullError("the pacer's clock and sleep must be callables")
+        self._sleep = sleep
+        self._pacer = _Pacer(self._limits, clock, sleep)
         self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}"
         self._confirmation_file = Path(confirmation_file)
         self._app_key, self._app_secret = app_key, app_secret    # kept only to be withheld from every text
@@ -992,8 +1233,30 @@ class WebullVenue:
         except Exception:
             pass
 
-    def _call(self, fn, *args) -> Any:
-        return _call(fn, *args, secrets=self._secrets())
+    def _call(self, kind: str, fn, *args) -> Any:
+        return _call(self._paced, kind, fn, *args, secrets=self._secrets())
+
+    def _paced(self, kind: str, fn, *args) -> Any:
+        """One SDK call of `kind`, made once the pacer allows it. For a read (READ_KINDS), a 429 (raised or answered)
+        is tried again after 2, 4 and 8 seconds, 4 tries in all, and then raises WebullError saying the limit was hit.
+        Place, replace and cancel are made once, never retried here: their 429 goes back to the caller as it came."""
+        tries = 1 + len(READ_RETRY_WAITS) if kind in READ_KINDS else 1
+        for attempt in range(tries):
+            if attempt:
+                self._sleep(READ_RETRY_WAITS[attempt - 1])
+            self._pacer.wait(kind)
+            if tries == 1:
+                return fn(*args)
+            try:
+                res = fn(*args)
+            except Exception as exc:
+                if not _too_many(exc, True):
+                    raise
+                continue
+            if not _too_many(res, False):
+                return res
+        raise RateLimitHit(f"Webull's rate limit was hit: the {kind} call answered 429 (too many requests) on all {tries} tries, "
+                          f"waiting {', '.join(str(w) for w in READ_RETRY_WAITS)} seconds between them")
 
     @classmethod
     def from_secrets(cls, environ=None, **kwargs) -> "WebullVenue":
@@ -1003,37 +1266,93 @@ class WebullVenue:
         if environ is None:
             load_env()
         return cls(secret("WEBULL_APP_KEY", env), secret("WEBULL_APP_SECRET", env), environment=(env.get("WEBULL_ENV") or "sandbox").strip().lower(),
-                   account_id=(env.get("WEBULL_ACCOUNT_ID") or "").strip() or None, **kwargs)
+                   account_id=(env.get("WEBULL_ACCOUNT_ID") or "").strip() or None,
+                   account_class=(env.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() or None, **kwargs)
 
     # ---- reading (allowed in both environments)
     @_public
     def accounts(self) -> list[dict]:
-        """[{account_id, account_type}]: the account id when it is a plain id (digits, letters, hyphens, underscores,
-        up to 64) holding no run of the App Key or App Secret (an account id may look like another), else None; the
-        type when it is a short upper-case word in the code shape holding no run of the key, the secret or any
-        account id seen, else None. Every account id in the answer is learned (see _learn)."""
-        body = self._call(self._client.account_v2.get_account_list)
+        """[{account_id, account_type, account_class, account_label}]. account_id: a plain id (digits, letters,
+        hyphens, underscores, up to 64) holding no run of the venue's complete secret set (_words()) other than the
+        account ids listed in this very answer (an id is not withheld from its own listing, nor because it looks like
+        another listed id), else None. account_type (CASH or MARGIN seen) and account_class (INDIVIDUAL_CASH, CRYPTO,
+        ... seen) only in the upper-case code shape, account_label ("Individual Cash" seen) only as letters and
+        single spaces up to 30 characters, each holding no run of the key, the secret or any account id seen, else
+        None. Every account id in the answer is learned (see _learn)."""
+        body = self._call("account_list", self._client.account_v2.get_account_list)
         rows = body if isinstance(body, list) else body.get("accounts", body.get("data", [])) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             raise WebullError("Webull's account list has an unexpected shape")
         for r in rows:
             self._learn(r.get("account_id"))
-        credentials, everything = self._secrets(with_account=False), self._secrets()
-        return [{"account_id": _plain_id(r.get("account_id"), credentials, lambda s: _last_check(s, credentials.words)),
-                 "account_type": _clean(r.get("account_type"), _ACCOUNT_TYPE, everything, self._final)} for r in rows]
+        listed = {r.get("account_id") for r in rows if isinstance(r.get("account_id"), str)}
+        words = self._words()
+        others = (*words[:2], *(w for w in words[2:] if w not in listed))      # the key and the secret always
+        for_ids, everything = _secrets_of(*others), self._secrets()
+        return [{"account_id": _plain_id(r.get("account_id"), for_ids, lambda s: _last_check(s, others)),
+                 "account_type": _clean(r.get("account_type"), _ACCOUNT_TYPE, everything, self._final),
+                 "account_class": _clean(r.get("account_class"), _ACCOUNT_CLASS, everything, self._final),
+                 "account_label": _clean(r.get("account_label"), _LABEL, everything, self._final)} for r in rows]
 
     @property
     @_public
     def account_id(self) -> str:
-        if self._account_id is None:
-            found = self.accounts()
-            if len(found) != 1:
-                raise WebullError(f"{len(found)} accounts are visible; set WEBULL_ACCOUNT_ID to choose one")
-            if not found[0]["account_id"]:
-                raise WebullError("Webull's account list names no plain account_id")
-            self._learn(found[0]["account_id"])
-            self._account_id = found[0]["account_id"]
+        """The account this venue trades, chosen in this order: an account_id given to the constructor (with an
+        account_class also given, the account list must show that id with that class); else the one account of the
+        account_class given (WEBULL_ACCOUNT_CLASS), which must be exactly one; else the only account visible; else
+        WebullError naming the classes visible. Webull's account_id is a long internal id the owner cannot see or
+        type (observed in the test environment, 2026-11-13), so the class is the way to choose."""
+        if self._account_id is None or (self._wanted_class is not None and self._account_class is _UNSET):
+            chosen, cls = self._choose_account()
+            self._learn(chosen)
+            self._account_id, self._account_class = chosen, cls
         return self._account_id
+
+    def _choose_account(self) -> tuple[str, str | None]:
+        rows, given, wanted = self.accounts(), self._account_id, self._wanted_class
+        if given is not None:                                             # only reached with a class to check
+            mine = [r for r in rows if r["account_id"] == given]
+            cls = mine[0]["account_class"] if len(mine) == 1 else None
+            if cls != wanted:
+                raise WebullError(f"the account given (WEBULL_ACCOUNT_ID) is not of the class {wanted} (WEBULL_ACCOUNT_CLASS): it is "
+                                  + (cls if cls else "not in the account list with a readable class"))
+            return given, cls
+        classes = ", ".join(sorted({r["account_class"] or "unknown" for r in rows})) or "none"
+        if wanted is not None:
+            mine = [r for r in rows if r["account_class"] == wanted]
+            if len(mine) != 1:
+                raise WebullError(f"{len(mine)} accounts of the class {wanted} are visible (classes visible: {classes}); set "
+                                  "WEBULL_ACCOUNT_CLASS to a class that names exactly one account")
+        elif len(rows) == 1:
+            mine = rows
+        else:
+            raise WebullError(f"{len(rows)} accounts are visible (classes: {classes}); set WEBULL_ACCOUNT_CLASS to choose one "
+                              "(or WEBULL_ACCOUNT_ID to Webull's internal id)")
+        if not mine[0]["account_id"]:
+            raise WebullError("Webull's account list names no plain account_id")
+        return mine[0]["account_id"], mine[0]["account_class"]
+
+    @property
+    @_public
+    def account_class(self) -> str | None:
+        """The class of this venue's account (INDIVIDUAL_CASH, CRYPTO, ...), looked up once in the account list; None
+        when the list shows no readable class for it. Read-only."""
+        account = self.account_id
+        if self._account_class is _UNSET:
+            mine = [r for r in self.accounts() if r["account_id"] == account]
+            self._account_class = mine[0]["account_class"] if len(mine) == 1 else None
+        return self._account_class
+
+    def _fits(self, crypto: bool) -> None:
+        """NotTransmitted unless the order's instrument type trades in this account's class: stocks and funds in
+        INDIVIDUAL_CASH or INDIVIDUAL_MARGIN, crypto only in CRYPTO (event contracts, EVENTS_CASH, are not built). An
+        account of no readable class fits nothing."""
+        kind = "CRYPTO" if crypto else "EQUITY"
+        cls = self.account_class
+        if cls not in ACCOUNT_CLASSES_FOR[kind]:
+            raise NotTransmitted(f"a {'crypto' if crypto else 'stock or fund'} order does not fit this account (class {cls or 'unknown'}): "
+                                 f"it trades only in {' or '.join(sorted(ACCOUNT_CLASSES_FOR[kind]))}; choose the account with "
+                                 "WEBULL_ACCOUNT_CLASS")
 
     @_public
     def balance(self) -> dict:
@@ -1042,7 +1361,7 @@ class WebullVenue:
         buying_power}]; a field that is absent, unreadable or not of that shape is left out. An answer that is not an
         object, an account_currency_assets that is not a list of objects, or a total_asset_currency that is not a
         string raises WebullError."""
-        body = self._call(self._client.account_v2.get_account_balance, self.account_id)
+        body = self._call("balance", self._client.account_v2.get_account_balance, self.account_id)
         if not isinstance(body, dict):
             raise WebullError(f"Webull's balance answer is a {type(body).__name__}, not an object")
         assets = body.get("account_currency_assets")
@@ -1118,7 +1437,7 @@ class WebullVenue:
     def _read_positions(self) -> tuple[dict[tuple[str, str], float | None], list[dict], set]:
         """({(EQUITY or CRYPTO, the trader's symbol): quantity or None}, [the other rows], {duplicated holdings})
         from one position read."""
-        body = self._call(self._client.account_v2.get_account_position, self.account_id)
+        body = self._call("positions", self._client.account_v2.get_account_position, self.account_id)
         rows = body if isinstance(body, list) else body.get("positions", body.get("holdings", body.get("data", []))) if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             raise WebullError("Webull's position list has an unexpected shape")
@@ -1191,19 +1510,29 @@ class WebullVenue:
             raise LiveTradingNotConfirmed(f"order value {value:,.2f} is above the confirmed cap of {confirmation['max_order_value']:,.2f}")
 
     @_public
-    def submit(self, symbol: str, units: float, tag: str, price: float | None = None, limit_price: float | None = None) -> dict:
-        """Place one order. `price` is the last known price, used only to value the order for the live cap.
+    def submit(self, symbol: str, units: float, tag: str, price: float | None = None, limit_price: float | None = None,
+               session: str = "CORE") -> dict:
+        """Place one order. `price` is the last known price, used only to value the order for the live cap. `session`:
+        CORE (regular hours, the default), ALL or NIGHT, sent as support_trading_session; NIGHT takes limit orders
+        only, crypto takes none (see _session).
 
-        Everything that can refuse (choosing the account, the long-only check, the live guard, building the
-        payload) runs before the single place_order call, and any failure there raises NotTransmitted: the order
-        was certainly not sent. For a sell, the open orders are read first and the holding second, so a fill
-        between the two reads can only make the free amount look smaller; the sale is allowed only when its amount
-        is not above the holding minus the open sells, rounded DOWN to the quantity step.
+        Everything that can refuse (choosing the account, the order fitting the account's class, the session, the
+        long-only check, the live guard, building the payload) runs before the single place_order call, and any
+        failure there raises NotTransmitted: the order was certainly not sent. For a sell, the open orders are read
+        first and the holding second, so a fill between the two reads can only make the free amount look smaller;
+        the sale is allowed only when its amount is not above the holding minus the open sells, rounded DOWN to the
+        quantity step.
 
-        An error raised after the place_order call began is a plain WebullError of UNKNOWN OUTCOME: the order may or
-        may not have reached Webull, so read order_status(tag) before retrying (the same tag gives the same client
-        order id, which Webull keeps unique per account). Whatever the client raises once place_order has been
-        called, a NotTransmitted included, and whatever is wrong with its answer, leaves as a plain WebullError.
+        After the place_order call: when it fails with the SDK's ServerException and a 4xx status (Webull answered and
+        refused; a 429 included: place is never retried), the order's detail is read once under the same client order
+        id. If the order is there, submit returns it as accepted (this covers OPENAPI_TRADE_PLACE_ORDER_REPEAT: the
+        same client order id was sent before and that order exists); if the detail gives the "no such order" answer
+        (see order_status; recognised here whatever confirmed_not_found says, because it follows a refusal), submit
+        raises OrderRejected: Webull refused and no order exists. If the detail call fails or answers anything else,
+        and on every other failure of the order call (no answer, a 5xx, a transport error, an unreadable status), it
+        raises a plain WebullError of UNKNOWN OUTCOME: the order may or may not have reached Webull, so read
+        order_status(tag) before retrying (the same tag gives the same client order id). A caller using the order
+        ledger passes not_sent=(NotTransmitted, OrderRejected).
 
         Returns only values this module built or validated: {status "accepted", client_order_id, venue_order_id (the
         documented order_id when it is a plain id holding no run of a secret, else None), environment, side,
@@ -1212,7 +1541,9 @@ class WebullVenue:
         try:
             crypto = _is_crypto(symbol)
             amount, _ = _quantity(units, crypto)                          # a malformed quantity is refused first
+            _session(session, crypto, limit_price)
             account = self.account_id
+            self._fits(crypto)
             secrets = self._secrets()
             if amount < 0:                                                # the holding must be established, or no sale
                 reserved = self._reserved_by_open_sells(symbol)           # open sells first, then the holding
@@ -1224,22 +1555,33 @@ class WebullVenue:
                                          "would open a short; this venue is long-only")
             reference = limit_price if limit_price is not None else price
             self._guard_live(abs(amount) * float(reference) if reference else None)
-            order = order_payload(symbol, units, tag, limit_price)
+            order = order_payload(symbol, units, tag, limit_price, session)
         except NotTransmitted:                                            # raised here, or rebuilt through the gate by _call
             raise
         except WebullError as exc:
             raise NotTransmitted(f"not sent: {_plain(exc)}") from None    # built here from gated parts
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
-        detail = None
+        detail, refused = None, None
         try:
-            res = self._client.order_v3.place_order(account, [order])   # the only order call; nothing refuses after it
+            res = self._paced("place", self._client.order_v3.place_order, account, [order])   # the only order call
         except NotTransmitted as exc:                                     # raised from inside the call: still unknown
             detail = "the order call began and then failed: " + _gate(exc, secrets)
         except WebullError as exc:
             detail = "the client failed: " + _gate(exc, secrets)
         except Exception as exc:
             detail = "Webull call failed: " + _safe(exc, secrets)
+            refused = _refusal(exc)
+        if refused is not None:                                           # Webull answered 4xx: one detail read decides
+            found, reason = self._after_refusal(order["client_order_id"], secrets)
+            if found is not None:
+                return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": found["venue_order_id"],
+                        "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
+            if reason is None:
+                code = _code(refused[0], secrets)
+                code = code if code != CODE_WITHHELD and self._final(code) == code else None
+                raise OrderRejected("Webull refused the order and no order exists under its client order id: " + self._final(detail), code)
+            detail += "; " + reason
         if detail is None:
             try:                                                          # everything after the call, in one guarded block
                 status = _status_code(res)
@@ -1263,6 +1605,23 @@ class WebullVenue:
         return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": venue_order_id,
                 "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
 
+    def _after_refusal(self, cid: str, secrets: _Secrets) -> tuple[dict | None, str | None]:
+        """One read of the order's detail after Webull refused the order call: (the order as order_status reads it,
+        None) when it exists; (None, None) on the "no such order" answer; (None, why) when the read fails or answers
+        anything else (the outcome stays unknown)."""
+        reason = None
+        try:
+            found = self._read_order(cid, recognise_not_found=True)
+        except WebullError as exc:
+            found, reason = None, "reading the order's detail after the refusal failed: " + _plain(exc)
+        except Exception as exc:
+            found, reason = None, f"reading the order's detail after the refusal failed ({_class_name(exc, secrets)})"
+        if found is None and reason is None:
+            return None, None
+        if found is not None and not isinstance(found, dict):
+            return None, "the order's detail after the refusal could not be read"
+        return found, reason
+
     @staticmethod
     def _venue_order_id(body: Any, cid: str, secrets: _Secrets, final=None) -> str | None:
         """`order_id` of the place-order answer (docs common-order-place); inside an order list, the item with our id.
@@ -1275,18 +1634,50 @@ class WebullVenue:
 
     @_public
     def cancel(self, tag: str) -> dict:
-        """Ask Webull to cancel the order sent under `tag`: {"status": "cancel requested"} once Webull answers 200.
-        Webull's answer itself is not handed back."""
-        self._call(self._client.order_v3.cancel_order, self.account_id, client_order_id(tag))
-        return {"status": "cancel requested"}
+        """Ask Webull to cancel the order sent under `tag`. Returns {"status": ...}, one of: "cancel requested" (Webull
+        answered 200); "not yet" (OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT: the order is still being
+        submitted; try again shortly); "already finished" (OPENAPI_ORDER_CAN_NOT_BE_CANCEL); "no such order" (the
+        answer order_status reads as no such order). None of those raises; any other failure raises WebullError with
+        the gated text. Cancel is never retried here (a 429 included). Webull's answer itself is not handed back."""
+        status, error = self._cancel_one(self.account_id, client_order_id(tag))
+        if status == "error":
+            raise WebullError(error)
+        return {"status": status}
+
+    def _cancel_one(self, account: str, cid: str) -> tuple[str, str | None]:
+        """(one of the cancel words, None) or ("error", the gated text) for one cancel_order call."""
+        secrets = self._secrets()
+        word, error = None, None
+        try:
+            res = self._paced("cancel", self._client.order_v3.cancel_order, account, cid)
+        except WebullError as exc:
+            error = _plain(_rebuilt(exc, secrets))
+        except Exception as exc:
+            word = _cancel_word(_type_name(exc), _attr(exc, "error_code"), _attr(exc, "error_msg"), _attr(exc, "http_status"))
+            error = None if word else "Webull call failed: " + _safe(exc, secrets)
+        else:
+            status = _status_code(res)
+            err = _json(res) if status != 200 else None
+            if isinstance(err, dict):
+                word = _cancel_word("answer", err.get("error_code"), err.get("message"), status)
+            if word is None:
+                try:
+                    _body(res, secrets)
+                    word = "cancel requested"
+                except WebullError as exc:
+                    error = _plain(exc)
+        if word is not None:
+            return word, None
+        return "error", self._final(error or "the cancel failed")
 
     @_public
     def cancel_all_open(self) -> list[dict]:
         """Cancel every order open_orders() returns, one cancel_order call each by client order id. One failure does
-        not stop the others: each entry is {client_order_id, venue_order_id, symbol, status ("cancel requested" or
-        "error")} with the gated error under "error". Cancelling only reduces exposure, so it is allowed in
-        production without the written live confirmation. If open_orders() itself fails, this raises and nothing is
-        cancelled. Webull cancels only orders placed through the API (docs common-order-cancel)."""
+        not stop the others: each entry is {client_order_id, venue_order_id, symbol, status} with status one of
+        cancel's words ("cancel requested", "not yet", "already finished", "no such order") or "error", with the gated
+        error under "error". Cancelling only reduces exposure, so it is allowed in production without the written
+        live confirmation. If open_orders() itself fails, this raises and nothing is cancelled. Webull cancels only
+        orders placed through the API (docs common-order-cancel)."""
         account = self.account_id
         out = []
         for o in self.open_orders():
@@ -1294,11 +1685,8 @@ class WebullVenue:
             if not o["client_order_id"]:
                 out.append({**entry, "status": "error", "error": "no plain client order id; Webull cancels only orders placed through the API"})
                 continue
-            try:
-                self._call(self._client.order_v3.cancel_order, account, o["client_order_id"])
-                out.append({**entry, "status": "cancel requested"})
-            except WebullError as exc:
-                out.append({**entry, "status": "error", "error": self._final(_plain(exc, 10 ** 6))})
+            status, error = self._cancel_one(account, o["client_order_id"])
+            out.append({**entry, "status": status, **({"error": error} if status == "error" else {})})
         return out
 
     # ---- what happened to orders (reading: allowed in both environments)
@@ -1306,14 +1694,19 @@ class WebullVenue:
     def order_status(self, tag: str) -> dict | None:
         """What Webull says about the order sent under `tag`: {state, filled_units, avg_price, fee, venue_order_id,
         raw_status}, or None only when the venue was built with confirmed_not_found=True and Webull gives one of the
-        two answers read as "no such order": a 200 in the documented combo shape whose `orders` is an explicitly
-        empty list and whose keys are all among client_order_id, combo_order_id, combo_type and orders (with any
-        client_order_id ours), or the exact error code ORDER_NOT_FOUND with a 4xx status, raised by the SDK's
-        ServerException (by class name) or in a non-2xx answer's body. Neither is documented for the US API (see the
-        module notes), so with the default confirmed_not_found=False both raise WebullError; turn the flag on only
-        after that answer has been observed in Webull's test environment for an id that was never sent. Any other
-        failure (an unreachable venue, a malformed answer such as {"orders": ["junk"]} or a bare []) raises
-        WebullError: it never looks like "no such order".
+        answers read as "no such order":
+        (a) the answer observed in the test environment (2026-11-13) on the cash and events accounts: the SDK's
+            ServerException (by class name) with a 4xx status, code exactly OPENAPI_PARAM_ERR and a message holding
+            "order not present" in any case (the raw message is read only for this comparison). Any other
+            OPENAPI_PARAM_ERR raises;
+        (b) the answer observed on the crypto account: a 200 in the documented combo shape whose `orders` is an
+            explicitly empty list and whose keys are all among client_order_id, combo_order_id, combo_type and orders
+            (with any client_order_id ours);
+        (c) the exact error code ORDER_NOT_FOUND with a 4xx status, raised by the SDK's ServerException or in a non-2xx
+            answer's body (never seen there; kept from the older Webull HK table).
+        With the default confirmed_not_found=False they raise WebullError saying what they mean is not confirmed for
+        reading as "never arrived" (see the constructor). Any other failure (an unreachable venue, a malformed answer
+        such as {"orders": ["junk"]} or a bare []) raises WebullError: it never looks like "no such order".
 
         `state` comes from ORDER_STATES; `filled_units` is unsigned; a number that is absent or unreadable is None,
         never 0 (filled_units is 0.0 only when Webull says 0); avg_price is None when Webull gives 0 (nothing filled);
@@ -1323,26 +1716,30 @@ class WebullVenue:
         A combo that carries a client_order_id other than ours raises WebullError, whatever it holds. A single
         item is read as ours without its own client_order_id only when that key is absent or None (not "") and its
         combo names our id or names none."""
-        cid = client_order_id(tag)
+        return self._read_order(client_order_id(tag), self._confirmed_not_found)
+
+    def _read_order(self, cid: str, recognise_not_found: bool) -> dict | None:
         account = self.account_id
         secrets = self._secrets()
         try:
-            res = self._client.order_v3.get_order_detail(account, cid)
+            res = self._paced("order_detail", self._client.order_v3.get_order_detail, account, cid)
+        except RateLimitHit:
+            raise
         except WebullError as exc:
             raise _rebuilt(exc, secrets) from None
         except Exception as exc:
-            if _not_found_code(_type_name(exc), _attr(exc, "error_code"), _attr(exc, "http_status")):
-                return self._no_such_order("the error code ORDER_NOT_FOUND")
+            if _not_present(_type_name(exc), _attr(exc, "error_code"), _attr(exc, "error_msg"), _attr(exc, "http_status")):
+                return self._no_such_order("a no-such-order error code", recognise_not_found)
             raise WebullError("Webull call failed: " + _safe(exc, secrets)) from None
         status = _status_code(res)
         if status != 200:
             err = _json(res)
             if isinstance(err, dict) and _not_found_code("answer", err.get("error_code"), status):
-                return self._no_such_order("the error code ORDER_NOT_FOUND")
+                return self._no_such_order("the error code ORDER_NOT_FOUND", recognise_not_found)
         body = _body(res, secrets)
         if (isinstance(body, dict) and isinstance(body.get("orders"), list) and not body["orders"]
                 and body.keys() <= EMPTY_ANSWER_KEYS and body.get("client_order_id", cid) == cid):
-            return self._no_such_order("an empty order list")
+            return self._no_such_order("an empty order list", recognise_not_found)
         combos = body if isinstance(body, list) else [body]
         if any(isinstance(c, dict) and "orders" in c and "client_order_id" in c and c["client_order_id"] != cid for c in combos):
             raise WebullError("Webull's order detail names another client order id; cannot tell what happened to this order")
@@ -1360,10 +1757,11 @@ class WebullVenue:
                 "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
                 "raw_status": _status_word(item.get("status"), secrets, self._final)}
 
-    def _no_such_order(self, answer: str) -> None:
-        if self._confirmed_not_found:
+    @staticmethod
+    def _no_such_order(answer: str, recognise: bool) -> None:
+        if recognise:
             return None
-        raise WebullError(f"Webull shows no order under this client order id ({answer}); what that answer means is not yet "
+        raise WebullError(f"Webull shows no order under this client order id ({answer}); reading that as \"never arrived\" is not yet "
                           "confirmed, so the outcome stays unknown (see confirmed_not_found)")
 
     @_public
@@ -1380,7 +1778,7 @@ class WebullVenue:
         out: list[dict] = []
         key, seen, pages = None, set(), 0
         while True:
-            body = self._call(self._client.order_v3.list_order_open, account) if key is None else self._call(self._client.order_v3.list_order_open, account, key)
+            body = self._call("open_orders", self._client.order_v3.list_order_open, account) if key is None else self._call("open_orders", self._client.order_v3.list_order_open, account, key)
             pages += 1
             rows = body.get("data") if isinstance(body, dict) else body      # a body without a `data` list is not "none open"
             items = _order_items(rows) if isinstance(rows, list) and (rows or isinstance(body, dict)) else None
@@ -1438,10 +1836,19 @@ class WebullVenue:
     @_public
     def check(self) -> dict:
         """A readiness report holding only values this module built: counts, field names it chose, the last four
-        characters of each plain account id, each account's short type, and errors (already gated)."""
+        characters of each plain account id with its short type, class and label and whether this venue would use
+        it (and why none, if it cannot choose), the limit table the pacer uses, and errors (already gated)."""
         accounts = self.accounts()
+        try:
+            used, choice_error = self.account_id, None
+        except WebullError as exc:
+            used, choice_error = None, self._final(_plain(exc, 10 ** 6))
         report = {"environment": self.environment, "host": self.host,
-                  "accounts": [{"account_id_ending": (a["account_id"] or "")[-4:], "type": a["account_type"]} for a in accounts]}
+                  "accounts": [{"account_id_ending": (a["account_id"] or "")[-4:], "type": a["account_type"], "class": a["account_class"],
+                                "label": a["account_label"], "used": used is not None and a["account_id"] == used} for a in accounts],
+                  "rate_limits": {"share_used": RATE_SHARE, "calls": {k: [n, s] for k, (n, s) in self._limits.items()}}}
+        if choice_error is not None:
+            report["account_choice"] = choice_error
         try:
             bal = self.balance()
             report["balance_fields"] = sorted(bal)

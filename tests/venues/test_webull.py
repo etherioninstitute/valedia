@@ -20,6 +20,18 @@ def _home_is_temporary(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
+REAL_RATE_LIMITS = {env: dict(table) for env, table in getattr(wb, "RATE_LIMITS", {}).items()}
+HIGH_LIMITS = {kind: (10 ** 9, 1) for kind in getattr(wb, "CALL_KINDS", ())}
+
+
+@pytest.fixture(autouse=True)
+def _pacing_never_waits(monkeypatch):
+    """Every venue a test builds without its own limits gets limits so high that the pacer never waits, and a sleep that
+    never really sleeps (T9 rev 8 addendum: with the limits set very high every earlier test passes unchanged)."""
+    monkeypatch.setattr(wb, "RATE_LIMITS", {env: dict(HIGH_LIMITS) for env in REAL_RATE_LIMITS}, raising=False)
+    monkeypatch.setattr(wb, "_default_sleep", lambda seconds: None, raising=False)
+
+
 class Response:
     def __init__(self, body, status=200, text=""):
         self._body, self.status_code, self.text = body, status, text
@@ -48,9 +60,10 @@ class FakeClient:
     `open_pages` maps a pagination key (None for the first page) to a list_order_open body; `balance` is the
     balance body; `cancel_fail` is a set of client order ids whose cancel raises."""
     def __init__(self, accounts=None, positions=None, order_status=200, place_body=None, details=None, open_pages=None,
-                 balance=None, cancel_fail=()):
+                 balance=None, cancel_fail=(), account_class="INDIVIDUAL_CASH"):
         self.calls, self._order_status = [], order_status
-        self._accounts = [{"account_id": "ACC-0001-1234", "account_type": "CASH"}] if accounts is None else accounts
+        self._accounts = ([{"account_id": "ACC-0001-1234", "account_type": "CASH", "account_class": account_class}] if accounts is None
+                          else accounts)
         self._positions = positions or []
         self._place_body = {"order_id": "o-1"} if place_body is None else place_body
         self._details, self._cancel_fail = details or {}, set(cancel_fail)
@@ -92,8 +105,13 @@ class FakeClient:
         return [c for c in self.calls if isinstance(c, tuple) and c[0] == "place"]
 
 
+def _class_for(symbol):
+    """The account class an order for `symbol` trades in (observed in the test environment, 2026-11-13)."""
+    return "CRYPTO" if symbol.upper().endswith("-USD") else "INDIVIDUAL_CASH"
+
+
 def venue(tmp_path, env="sandbox", **kw):
-    client = kw.pop("client", None) or FakeClient(**{k: kw.pop(k) for k in ("accounts", "positions", "order_status") if k in kw})
+    client = kw.pop("client", None) or FakeClient(**{k: kw.pop(k) for k in ("accounts", "positions", "order_status", "account_class") if k in kw})
     return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json", **kw), client
 
 
@@ -161,11 +179,14 @@ def test_errors_never_carry_the_credentials_and_accounts_must_be_unambiguous(tmp
     two, _ = venue(tmp_path, accounts=[{"account_id": "A"}, {"account_id": "B"}])
     with pytest.raises(wb.WebullError, match="WEBULL_ACCOUNT_ID"):
         two.submit("SPY", 1.0, "t")
-    chosen, client = venue(tmp_path, accounts=[{"account_id": "A"}, {"account_id": "B"}], account_id="B")
+    # rev 8: an order must fit the account's class, so the chosen account carries one
+    chosen, client = venue(tmp_path, accounts=[{"account_id": "A"}, {"account_id": "B", "account_class": "INDIVIDUAL_CASH"}], account_id="B")
     chosen.submit("SPY", 1.0, "t")
     assert client.placed()[0][1] == "B"
     report = venue(tmp_path)[0].check()
-    assert report["accounts"] == [{"account_id_ending": "1234", "type": "CASH"}] and report["real_money_orders"] == "off: test environment"
+    # rev 8: each account also shows its class, its label and whether it is the one used
+    assert report["accounts"] == [{"account_id_ending": "1234", "type": "CASH", "class": "INDIVIDUAL_CASH", "label": None, "used": True}]
+    assert report["real_money_orders"] == "off: test environment"
     assert KEY not in json.dumps(report) and SECRET not in json.dumps(report)
     for bad in ({"environment": "live"}, {}):
         with pytest.raises(wb.WebullError):
@@ -658,20 +679,20 @@ def test_a_limit_price_that_is_not_positive_finite_or_on_the_tick_is_not_transmi
         wb.order_payload(symbol, 1.0, "t", limit_price=limit)
     held = [{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}, {"symbol": "BTCUSD", "quantity": "5", "instrument_type": "CRYPTO"}]
     for env in ("sandbox", "production"):
-        v, client = venue(tmp_path, env=env, positions=held)
+        v, client = venue(tmp_path, env=env, positions=held, account_class=_class_for(symbol))   # rev 8: the fitting account
         for units in (1.0, -1.0):
             with pytest.raises(wb.NotTransmitted):
                 v.submit(symbol, units, "t", price=100.0, limit_price=limit)
         assert client.placed() == []
 
 
-@pytest.mark.parametrize("symbol, limit, sent", [("SPY", 10.01, "10.01"), ("SPY", 180, "180.00"), ("SPY", 1.0, "1.00"), ("SPY", 0.1234, "0.1234"),
-                                                 ("SPY", 0.5, "0.50"), ("SPY", 0.0001, "0.0001"), ("BTC-USD", 80000, "80000.00"),
+@pytest.mark.parametrize("symbol, limit, sent", [("SPY", 10.01, "10.01"), ("SPY", 180, "180.00"), ("SPY", 1.0, "1.00"), ("SPY", 0.12, "0.12"),
+                                                 ("SPY", 0.5, "0.50"), ("SPY", 0.01, "0.01"), ("BTC-USD", 80000, "80000.00"),
                                                  ("BTC-USD", 0.00012345, "0.00012345"), ("BTC-USD", 65432.12345678, "65432.12345678")])
 def test_the_limit_price_sent_is_exactly_the_price_given(tmp_path, symbol, limit, sent):
     text = wb.order_payload(symbol, 1.0, "t", limit_price=limit)["limit_price"]
     assert text == sent and float(text) == float(limit) and float(text) > 0
-    v, client = venue(tmp_path)
+    v, client = venue(tmp_path, account_class=_class_for(symbol))       # rev 8: crypto trades only in the CRYPTO account
     v.submit(symbol, 1.0, "t", limit_price=limit)
     assert client.placed()[0][2][0]["limit_price"] == sent
 
@@ -824,7 +845,7 @@ def test_generated_quantities_are_sent_exactly_or_not_at_all(tmp_path):
         k = rng.randint(0, 11)
         x = float(Decimal(rng.randint(1, 10 ** rng.randint(1, 12))).scaleb(-k)) * rng.choice((1, -1))
         on_step = x != 0 and abs(x) <= 1e9 and _decimals(x) <= step
-        v, client = venue(tmp_path, positions=held)
+        v, client = venue(tmp_path, positions=held, account_class=_class_for(symbol))     # rev 8: the fitting account
         if on_step:
             out = v.submit(symbol, x, f"g{i}")
             sent = client.placed()[0][2][0]["quantity"]
@@ -1077,7 +1098,8 @@ def test_an_option_beside_the_stock_is_not_a_duplicate_and_does_not_add_to_it(tm
 
 
 def test_an_option_beside_a_crypto_holding(tmp_path):
-    v, client = venue(tmp_path, positions=[{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "0.5"}, dict(OPTION_ROW)])
+    v, client = venue(tmp_path, positions=[{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "0.5"}, dict(OPTION_ROW)],
+                      account_class="CRYPTO")                              # rev 8: crypto trades only in the CRYPTO account
     assert v.positions() == {"BTC-USD": 0.5}
     assert v.other_positions() == [{"symbol": "AAPL", "instrument_type": "OPTION", "quantity": 1.0}]
     assert v.submit("BTC-USD", -0.5, "t")["status"] == "accepted" and len(client.placed()) == 1
@@ -1106,18 +1128,19 @@ def test_duplicates_are_judged_within_equities_and_within_crypto(tmp_path):
     for rows in ([{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "1"}, {"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "1"}],
                  [{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}, {"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}],
                  [{"symbol": "BTC-USD", "instrument_type": "EQUITY", "quantity": "1"}, {"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "1"}]):
-        v, client = venue(tmp_path, positions=rows)
+        sym = rows[0]["symbol"] if rows[0]["instrument_type"] == "EQUITY" and "-" not in rows[0]["symbol"] else "BTC-USD"
+        v, client = venue(tmp_path, positions=rows, account_class=_class_for(sym))        # rev 8: the fitting account
         with pytest.raises(wb.WebullError, match="more than one row"):
             v.positions()
-        with pytest.raises(wb.NotTransmitted):
-            v.submit(rows[0]["symbol"] if rows[0]["instrument_type"] == "EQUITY" and "-" not in rows[0]["symbol"] else "BTC-USD", -1.0, "t")
+        with pytest.raises(wb.NotTransmitted, match="more than one row"):
+            v.submit(sym, -1.0, "t")
         assert len(client.placed()) == 0
     v, _ = venue(tmp_path, positions=[{"symbol": "AAPL", "instrument_type": "EQUITY", "quantity": "2"}, dict(OPTION_ROW), dict(OPTION_ROW)])
     assert v.positions() == {"AAPL": 2.0} and len(v.other_positions()) == 2
 
 
 def test_a_crypto_sale_is_licensed_only_by_a_crypto_row(tmp_path):
-    v, client = venue(tmp_path, positions=[{"symbol": "BTC-USD", "instrument_type": "EQUITY", "quantity": "5"}])
+    v, client = venue(tmp_path, positions=[{"symbol": "BTC-USD", "instrument_type": "EQUITY", "quantity": "5"}], account_class="CRYPTO")   # rev 8
     with pytest.raises(wb.NotTransmitted, match="long-only"):
         v.submit("BTC-USD", -1.0, "t")
     assert len(client.placed()) == 0
@@ -1140,7 +1163,8 @@ def _open_sell(cid, total, filled="0", symbol="SPY", kind="EQUITY", side="SELL",
 
 
 def _seller(tmp_path, held, *open_rows, symbol="SPY", kind="EQUITY", open_page=None):
-    client = FakeClient(positions=[{"symbol": symbol, "instrument_type": kind, "quantity": held}])
+    client = FakeClient(positions=[{"symbol": symbol, "instrument_type": kind, "quantity": held}],
+                        account_class="CRYPTO" if kind == "CRYPTO" else "INDIVIDUAL_CASH")      # rev 8: the fitting account
     client._open_pages = {None: {"data": list(open_rows)}} if open_page is None else {None: open_page}
     return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json"), client
 
@@ -1587,7 +1611,7 @@ METHODS = {"accounts": lambda v: v.accounts(), "balance": lambda v: v.balance(),
 
 
 def _planted_venue(tmp_path, key, secret, account, source, endpoint, plant, known=True):
-    client = FakeClient(accounts=[{"account_id": account, "account_type": "CASH"}],
+    client = FakeClient(accounts=[{"account_id": account, "account_type": "CASH", "account_class": "INDIVIDUAL_CASH"}],   # rev 8: orders fit
                         positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "5"}],
                         open_pages={None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}},
                         details={wb.client_order_id("t"): Response(detail(order("FILLED")))})
@@ -1768,7 +1792,9 @@ def test_the_gate_withholds_every_shape_that_is_not_plainly_harmless(token):
 def test_an_error_code_is_shown_only_in_the_code_shape():
     secrets = wb._secrets_of("Kq7Zplantedkey0001", "Sx9Wplantedsecret0002")
     assert wb._code("ORDER_NOT_FOUND", secrets) == "ORDER_NOT_FOUND"
-    for bad in ("SDK.HttpError", "order_not_found", "E1001", "A" * 49, 417, None, "KQ7ZPLANTEDKEY", " BUSY"):
+    # rev 8: Webull's observed codes run to 50 characters (OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT), so up to 64 are shown
+    assert wb._code("OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT", secrets) == "OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT"
+    for bad in ("SDK.HttpError", "order_not_found", "E1001", "A" * 65, 417, None, "KQ7ZPLANTEDKEY", " BUSY"):
         assert wb._code(bad, secrets) == "<code withheld>"
 
 
@@ -1788,6 +1814,10 @@ def test_the_last_check_works_on_its_own(tmp_path, monkeypatch):
         for endpoint in ("accounts", "detail", "place"):
             seen = _run_everything(tmp_path, key, secret, account, source, endpoint, f"denied {key}")
             _assert_no_leak(seen, key, secret, account, _Collect())
+            if source == "sdk_msg" and endpoint == "place":
+                # rev 8: a 417 at placement is followed by one detail read; this one shows the order, so it was accepted
+                assert ("submit_buy", "returned") in [(name, how) for name, how, _ in seen]
+                continue
             # rev 7: a class name is judged by its own rule (_class_name), not by the gate, so it is withheld there
             assert any(how == "raised" and ("text withheld" in what or (source == "class_name" and "<withheld>" in what))
                        for _, how, what in seen), (source, endpoint)
@@ -1831,8 +1861,9 @@ def test_accounts_return_only_the_id_and_a_short_type(tmp_path):
             {"account_id": "ACC 2", "account_type": "a type that is far too long to be a short word"},
             {"account_id": "id-" + KEY, "account_type": "MARGIN"}]
     v = wb.WebullVenue(KEY, SECRET, client=FakeClient(accounts=rows), confirmation_file=tmp_path / "x.json")
-    assert v.accounts() == [{"account_id": "ACC-0001-1234", "account_type": "CASH"}, {"account_id": None, "account_type": None},
-                            {"account_id": None, "account_type": "MARGIN"}]
+    none = {"account_class": None, "account_label": None}                # rev 8: the class and label are returned too
+    assert v.accounts() == [{"account_id": "ACC-0001-1234", "account_type": "CASH", **none}, {"account_id": None, "account_type": None, **none},
+                            {"account_id": None, "account_type": "MARGIN", **none}]
 
 
 @pytest.mark.parametrize("raw, kept", [("PARTIAL FILLED", "PARTIAL FILLED"), ("FILLED", "FILLED"), ("filled", "<withheld>"),
@@ -1907,7 +1938,8 @@ def test_only_the_documented_quantity_field_is_a_holding(tmp_path, row):
 
 
 def test_a_sale_may_not_exceed_the_free_amount_rounded_down_to_the_step(tmp_path):
-    v, client = venue(tmp_path, positions=[{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "0.000004799"}])
+    v, client = venue(tmp_path, positions=[{"symbol": "BTCUSD", "instrument_type": "CRYPTO", "quantity": "0.000004799"}],
+                      account_class="CRYPTO")                              # rev 8: crypto trades only in the CRYPTO account
     with pytest.raises(wb.NotTransmitted, match="long-only"):
         v.submit("BTC-USD", -0.0000048, "t")
     assert v.submit("BTC-USD", -0.00000479, "t2")["status"] == "accepted" and len(client.placed()) == 1
@@ -2209,3 +2241,466 @@ def test_the_http_librarys_debug_log_is_quieted(tmp_path):
         assert log.level == logging.WARNING
     finally:
         log.setLevel(old)
+
+
+# ---- T9 rev 8: what the test environment taught (docs/WEBULL.md, "Observed in Webull's test environment")
+
+# The five paper accounts as observed (the internal ids are made up here; the real ones are long and not typed by anyone).
+PAPER_ACCOUNTS = [
+    {"account_id": "8174402917735510001", "account_type": "MARGIN", "account_class": "INDIVIDUAL_MARGIN", "account_label": "Individual Margin"},
+    {"account_id": "8174402917735510002", "account_type": "CASH", "account_class": "INDIVIDUAL_CASH", "account_label": "Individual Cash"},
+    {"account_id": "8174402917735510003", "account_type": "MARGIN", "account_class": "FUTURES", "account_label": "Futures"},
+    {"account_id": "8174402917735510004", "account_type": "CASH", "account_class": "EVENTS_CASH", "account_label": "Events Cash"},
+    {"account_id": "8174402917735510005", "account_type": "CASH", "account_class": "CRYPTO", "account_label": "Crypto"},
+]
+CASH_ID, CRYPTO_ID = PAPER_ACCOUNTS[1]["account_id"], PAPER_ACCOUNTS[4]["account_id"]
+
+
+def paper(tmp_path, **kw):
+    client = kw.pop("client", None) or FakeClient(accounts=[dict(r) for r in PAPER_ACCOUNTS], **{k: kw.pop(k) for k in ("positions",) if k in kw})
+    return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", **kw), client
+
+
+def observed_order(cid, status="SUBMITTED", **fields):
+    """One order of the observed detail answer: 17 fields, commission {} and fees [] before a fill."""
+    item = {"client_order_id": cid, "order_id": "ORD-777", "symbol": "SPY", "side": "BUY", "status": status, "instrument_type": "EQUITY",
+            "total_quantity": "1", "filled_quantity": "0", "filled_price": "0", "order_type": "LIMIT", "limit_price": "100.00",
+            "time_in_force": "DAY", "entrust_type": "QTY", "support_trading_session": "CORE", "place_time_at": "1763000000000",
+            "commission": {}, "fees": [], **fields}
+    assert len(item) == 17
+    return item
+
+
+def observed_detail(cid, *items):
+    return {"client_order_id": cid, "combo_order_id": "COMBO-1", "combo_type": "NORMAL", "orders": list(items) or [observed_order(cid)]}
+
+
+NOT_PRESENT = ("OPENAPI_PARAM_ERR", 417, "Parameter error, Order not present.")
+
+
+def refused(code, status=417, msg="refused"):
+    def place(a, orders):
+        raise ServerException(code, status, msg)
+    return place
+
+
+def _calls(client, kind):
+    return [c for c in client.calls if isinstance(c, tuple) and c[0] == kind]
+
+
+def test_accounts_carry_their_class_and_label_in_their_shapes(tmp_path):
+    v, _ = paper(tmp_path)
+    got = v.accounts()
+    assert [(a["account_class"], a["account_label"], a["account_type"]) for a in got] == [
+        (r["account_class"], r["account_label"], r["account_type"]) for r in PAPER_ACCOUNTS]
+    bad = [{"account_id": "8174402917735510002", "account_class": c, "account_label": lab}
+           for c, lab in [("individual_cash", "Individual  Cash"), ("A" * 33, "L" * 31), ("CASH-1", "Cash 2"), (7, ["x"]),
+                          ("X_SECRETACCTZQ", "Secretacctzq Cash")]]
+    bad.append({"account_id": "SECRETACCTZQ", "account_class": "INDIVIDUAL_CASH", "account_label": "Individual Cash"})   # its id is now seen
+    v, _ = paper(tmp_path, client=FakeClient(accounts=bad))
+    got = v.accounts()
+    assert all(a["account_class"] is None and a["account_label"] is None for a in got[:-1])
+    assert (got[-1]["account_class"], got[-1]["account_label"]) == ("INDIVIDUAL_CASH", "Individual Cash")
+
+
+def test_the_account_is_chosen_by_class(tmp_path):
+    v, client = paper(tmp_path)
+    with pytest.raises(wb.WebullError, match="WEBULL_ACCOUNT_CLASS") as exc:
+        v.account_id
+    for r in PAPER_ACCOUNTS:
+        assert r["account_class"] in str(exc.value)                      # the classes visible are named
+    v, client = paper(tmp_path, account_class="CRYPTO")
+    assert v.account_id == CRYPTO_ID and v.account_class == "CRYPTO" and v.account_id == CRYPTO_ID
+    assert len([c for c in client.calls if c == "accounts"]) == 1         # looked up once
+    with pytest.raises(AttributeError):
+        v.account_class = "INDIVIDUAL_CASH"                               # read-only
+    for wanted in ("OPTIONS", "EVENTS"):
+        with pytest.raises(wb.WebullError, match="0 accounts of the class"):
+            paper(tmp_path, account_class=wanted)[0].account_id
+    two = [dict(PAPER_ACCOUNTS[1]), {**PAPER_ACCOUNTS[1], "account_id": "8174402917735510009"}]
+    with pytest.raises(wb.WebullError, match="2 accounts of the class"):
+        paper(tmp_path, client=FakeClient(accounts=two), account_class="INDIVIDUAL_CASH")[0].account_id
+    v, _ = paper(tmp_path, account_id=CASH_ID, account_class="INDIVIDUAL_CASH")
+    assert v.account_id == CASH_ID and v.account_class == "INDIVIDUAL_CASH"
+    with pytest.raises(wb.WebullError, match="not of the class CRYPTO"):
+        paper(tmp_path, account_id=CASH_ID, account_class="CRYPTO")[0].account_id
+    v, _ = paper(tmp_path, account_id=CASH_ID)                            # an id alone: its class is looked up
+    assert v.account_class == "INDIVIDUAL_CASH"
+    for bad in ("crypto", "", 7, "CRYPTO ACCOUNT"):
+        with pytest.raises(wb.WebullError, match="account class"):
+            paper(tmp_path, account_class=bad)
+    env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, "WEBULL_ACCOUNT_CLASS": " crypto "}
+    v = wb.WebullVenue.from_secrets(env, client=FakeClient(accounts=[dict(r) for r in PAPER_ACCOUNTS]), confirmation_file=tmp_path / "x.json")
+    assert v.account_id == CRYPTO_ID
+
+
+def test_check_shows_each_accounts_class_label_and_which_is_used(tmp_path):
+    report = paper(tmp_path, account_class="INDIVIDUAL_CASH")[0].check()
+    assert report["accounts"][1] == {"account_id_ending": "0002", "type": "CASH", "class": "INDIVIDUAL_CASH", "label": "Individual Cash", "used": True}
+    assert [a["used"] for a in report["accounts"]] == [False, True, False, False, False] and "account_choice" not in report
+    report = paper(tmp_path)[0].check()
+    assert not any(a["used"] for a in report["accounts"]) and "WEBULL_ACCOUNT_CLASS" in report["account_choice"]
+    assert KEY not in json.dumps(report) and SECRET not in json.dumps(report)
+
+
+@pytest.mark.parametrize("cls, symbol, fits", [("INDIVIDUAL_CASH", "SPY", True), ("INDIVIDUAL_MARGIN", "SPY", True), ("CRYPTO", "SPY", False),
+                                               ("EVENTS_CASH", "SPY", False), ("FUTURES", "SPY", False), ("CRYPTO", "BTC-USD", True),
+                                               ("INDIVIDUAL_CASH", "BTC-USD", False), ("INDIVIDUAL_MARGIN", "BTC-USD", False),
+                                               ("EVENTS_CASH", "BTC-USD", False), (None, "SPY", False), (None, "BTC-USD", False)])
+def test_an_order_must_fit_the_accounts_class(tmp_path, cls, symbol, fits):
+    rows = [{"account_id": "7Q4Z-9X1K-0001", "account_type": "CASH", **({"account_class": cls} if cls else {})}]
+    v, client = paper(tmp_path, client=FakeClient(accounts=rows))
+    if fits:
+        assert v.submit(symbol, 1.0, "t")["status"] == "accepted" and len(client.placed()) == 1
+    else:
+        with pytest.raises(wb.NotTransmitted, match="does not fit this account"):
+            v.submit(symbol, 1.0, "t")
+        assert client.placed() == []
+
+
+def test_a_refusal_then_not_present_is_order_rejected(tmp_path):
+    cid = wb.client_order_id("t")
+    client = FakeClient(details={cid: ServerException(*NOT_PRESENT)})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)),
+                                                     refused("OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT")(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")       # confirmed_not_found stays False
+    with pytest.raises(wb.OrderRejected) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert not isinstance(exc.value, wb.NotTransmitted) and isinstance(exc.value, wb.WebullError)
+    assert exc.value.code == "OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT" and "outcome unknown" not in str(exc.value)
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1 and _calls(client, "detail")[0][2] == cid
+    assert exc.value.__context__ is None and exc.value.__cause__ is None and KEY not in str(exc.value)
+
+
+def test_a_repeated_client_order_id_with_the_order_there_is_accepted(tmp_path):
+    cid = wb.client_order_id("t")
+    client = FakeClient(details={cid: Response(observed_detail(cid))})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("OPENAPI_TRADE_PLACE_ORDER_REPEAT")(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    out = v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert out == {"status": "accepted", "client_order_id": cid, "venue_order_id": "ORD-777", "environment": "sandbox", "side": "BUY", "quantity": "1"}
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+@pytest.mark.parametrize("after", [RuntimeError("socket closed"), ServerException("SYSTEM_BUSY", 500, "busy"),
+                                   ServerException("OPENAPI_PARAM_ERR", 417, "Parameter error, quantity"), Response({"orders": ["junk"]})])
+def test_a_refusal_then_a_failing_or_odd_detail_read_is_unknown(tmp_path, after):
+    cid = wb.client_order_id("t")
+    client = FakeClient(details={cid: after})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("OPENAPI_FRACT_ONLY_DAY_ORDER")(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError) as exc:
+        v.submit("SPY", 1.0, "t")
+    assert type(exc.value) is wb.WebullError and "outcome unknown" in str(exc.value)
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_a_5xx_at_placement_is_unknown_with_no_detail_read(tmp_path, status):
+    client = FakeClient()
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("SYSTEM_BUSY", status)(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError, match="outcome unknown") as exc:
+        v.submit("SPY", 1.0, "t")
+    assert type(exc.value) is wb.WebullError and len(client.placed()) == 1 and _calls(client, "detail") == []
+    cid = wb.client_order_id("t2")                                      # the contrast: a 4xx is decided by one detail read
+    client = FakeClient(details={cid: ServerException(*NOT_PRESENT)})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("SYSTEM_BUSY", status - 83)(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.OrderRejected):
+        v.submit("SPY", 1.0, "t2")
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+@pytest.mark.parametrize("answer, none", [(ServerException(*NOT_PRESENT), True), (ServerException("OPENAPI_PARAM_ERR", 400, "ORDER NOT PRESENT"), True),
+                                          (Response({"orders": []}), True), (ServerException("ORDER_NOT_FOUND"), True),
+                                          (ServerException("OPENAPI_PARAM_ERR", 417, "Parameter error, client_order_id"), False),
+                                          (ServerException("OPENAPI_PARAM_ERR", 500, "Parameter error, Order not present."), False),
+                                          (ServerException("openapi_param_err", 417, "Parameter error, Order not present."), False),
+                                          (RuntimeError("Parameter error, Order not present."), False)])
+def test_no_such_order_as_observed(tmp_path, answer, none):
+    v, _ = status_venue(tmp_path, answer, confirmed_not_found=True)
+    if none:
+        assert v.order_status("t") is None
+        with pytest.raises(wb.WebullError, match="not yet confirmed"):
+            status_venue(tmp_path, answer)[0].order_status("t")          # the default stays False
+    else:
+        with pytest.raises(wb.WebullError) as exc:
+            v.order_status("t")
+        assert "not yet confirmed" not in str(exc.value)
+
+
+@pytest.mark.parametrize("answer, word", [(None, "cancel requested"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_SUBMIT", 417, "pending"), "not yet"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", 417, "cannot cancel"), "already finished"),
+                                          (ServerException(*NOT_PRESENT), "no such order"),
+                                          (ServerException("SYSTEM_BUSY", 500, "busy"), "error"),
+                                          (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", 500, "x"), "error")])
+def test_cancel_reports_the_four_observed_answers(tmp_path, answer, word):
+    page = {"data": [detail(order("PENDING", cid="c-1"), cid="c-1")]}
+    client = FakeClient(open_pages={None: page})
+
+    def cancel(a, cid):
+        client.calls.append(("cancel", a, cid))
+        if answer is not None:
+            raise answer
+        return Response({"client_order_id": cid, "order_id": "ORD-1"})
+    client.order_v3.cancel_order = cancel
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    if word == "error":
+        with pytest.raises(wb.WebullError):
+            v.cancel("t")
+    else:
+        assert v.cancel("t") == {"status": word}
+    entry = v.cancel_all_open()[0]
+    assert entry["status"] == word and (("error" in entry) == (word == "error"))
+    assert KEY not in json.dumps(entry)
+
+
+def test_trading_sessions(tmp_path):
+    assert wb.order_payload("SPY", 1.0, "t")["support_trading_session"] == "CORE"
+    assert wb.order_payload("SPY", 1.0, "t", session="ALL")["support_trading_session"] == "ALL"
+    assert wb.order_payload("SPY", 1.0, "t", limit_price=100.0, session="NIGHT")["support_trading_session"] == "NIGHT"
+    v, client = venue(tmp_path)
+    assert v.submit("SPY", 1.0, "t", limit_price=100.0, session="NIGHT")["status"] == "accepted"
+    assert client.placed()[0][2][0]["support_trading_session"] == "NIGHT"
+    for bad in ("night", "EXTENDED", "", None, 1, "CORE "):
+        with pytest.raises(wb.NotTransmitted, match="session"):
+            v.submit("SPY", 1.0, "t2", limit_price=100.0, session=bad)
+    with pytest.raises(wb.NotTransmitted, match="limit orders only"):
+        v.submit("SPY", 1.0, "t3", session="NIGHT")
+    c, crypto_client = venue(tmp_path, account_class="CRYPTO")
+    with pytest.raises(wb.NotTransmitted, match="session"):
+        c.submit("BTC-USD", 0.01, "t4", limit_price=80000.0, session="NIGHT")
+    assert len(client.placed()) == 1 and crypto_client.placed() == []
+
+
+def test_crypto_market_orders_are_ioc_and_limits_gtc():
+    assert wb.order_payload("BTC-USD", 0.01, "t")["time_in_force"] == "IOC"
+    assert wb.order_payload("BTC-USD", 0.01, "t", limit_price=80000)["time_in_force"] == "GTC"
+    assert wb.order_payload("SPY", 1.0, "t")["time_in_force"] == "DAY" == wb.order_payload("SPY", 1.0, "t", limit_price=10.0)["time_in_force"]
+
+
+@pytest.mark.parametrize("limit, sent", [(0.5001, None), (0.50001, None), (0.1234, None), (0.0001, None), (0.005, None), (0.5, "0.50"),
+                                         (0.99, "0.99"), (0.01, "0.01"), (1.5, "1.50")])
+def test_sub_dollar_limits_have_at_most_two_decimals(tmp_path, limit, sent):
+    if sent is None:
+        with pytest.raises(wb.NotTransmitted, match="tick of 2 decimal"):
+            wb.order_payload("SPY", 1.0, "t", limit_price=limit)
+    else:
+        assert wb.order_payload("SPY", 1.0, "t", limit_price=limit)["limit_price"] == sent
+
+
+def test_accounts_check_each_account_id_with_the_venues_complete_set(tmp_path):
+    known = "KNOWNACCOUNT77"
+    rows = [{"account_id": "ACC-" + known, "account_type": "CASH", "account_class": "INDIVIDUAL_CASH"},
+            {"account_id": "8174402917735510002", "account_type": "CASH", "account_class": "INDIVIDUAL_CASH"}]
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(accounts=rows), account_id=known, confirmation_file=tmp_path / "x.json")
+    assert [a["account_id"] for a in v.accounts()] == [None, "8174402917735510002"]
+    similar = [{"account_id": "8174402917735510002"}, {"account_id": "8174402917735510013"}]     # listed ids never hide each other
+    v = wb.WebullVenue(KEY, SECRET, client=FakeClient(accounts=similar), confirmation_file=tmp_path / "x.json")
+    assert [a["account_id"] for a in v.accounts()] == ["8174402917735510002", "8174402917735510013"]
+
+
+def test_quantity_text_is_the_shortest_decimal(tmp_path):
+    import random
+    from decimal import Decimal
+    assert wb.order_payload("BTC-USD", 99107813.158, "t")["quantity"] == "99107813.158"
+    assert wb.order_payload("BTC-USD", 1e-8, "t")["quantity"] == "0.00000001"
+    assert wb.order_payload("SPY", 180.0, "t")["quantity"] == "180"
+    rng = random.Random(13)
+    checked = 0
+    for _ in range(3000):
+        crypto = rng.random() < 0.5
+        places = 8 if crypto else 5
+        x = float(Decimal(rng.randint(1, 10 ** 12)).scaleb(-rng.randint(0, places)))
+        if x > 1e9:
+            continue
+        text = wb.order_payload("BTC-USD" if crypto else "SPY", x, "t")["quantity"]
+        assert Decimal(text) == Decimal(repr(x)) and "e" not in text.lower(), (x, text)
+        checked += 1
+    assert checked > 1000
+    for x, sym in ((0.123456789, "BTC-USD"), (1.000000001, "BTC-USD"), (2.123456, "SPY")):
+        with pytest.raises(wb.NotTransmitted, match="not on the step"):
+            wb.order_payload(sym, x, "t")
+
+
+# ---- T9 rev 8, outcome 10: the adapter paces itself
+
+class FakeClock:
+    def __init__(self):
+        self.now, self.slept = 0.0, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _timed(client, clock):
+    """Record (kind of call, time on the fake clock) for every SDK call the client gets."""
+    times = []
+    for holder, names in (("account_v2", ("get_account_list", "get_account_balance", "get_account_position")),
+                          ("order_v3", ("place_order", "cancel_order", "get_order_detail", "list_order_open"))):
+        ns = getattr(client, holder)
+        for name in names:
+            def wrapped(*a, _fn=getattr(ns, name), _name=name):
+                times.append((_name, clock.now))
+                return _fn(*a)
+            setattr(ns, name, wrapped)
+    return times
+
+
+def _most_in_a_window(stamps, window):
+    """The most calls in any half-open span [t, t + window)."""
+    return max((sum(1 for u in stamps if t <= u < t + window) for t in stamps), default=0)
+
+
+def _real_limits(monkeypatch):
+    monkeypatch.setattr(wb, "RATE_LIMITS", REAL_RATE_LIMITS)
+
+
+def test_thirty_reads_at_once_are_spread_on_the_live_table(tmp_path, monkeypatch):
+    _real_limits(monkeypatch)
+    clock = FakeClock()
+    client = FakeClient()
+    times = _timed(client, clock)
+    v = wb.WebullVenue(KEY, SECRET, environment="sandbox", client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json",
+                       limits=REAL_RATE_LIMITS["production"], clock=clock, sleep=clock.sleep)
+    for _ in range(30):
+        v.balance()
+    stamps = [t for name, t in times if name == "get_account_balance"]
+    assert len(stamps) == 30
+    assert _most_in_a_window(stamps, 2) <= 1 < 2                             # 80% of 2 per 2 s, rounded down: 1
+    assert _most_in_a_window([t for _, t in times], 60) <= 48                  # 80% of the overall 60 a minute
+    assert stamps[-1] == 58.0                                               # no slower than the window needs
+
+
+def test_a_burst_under_the_limits_is_not_delayed(tmp_path, monkeypatch):
+    _real_limits(monkeypatch)
+    clock = FakeClock()
+    client = FakeClient()
+    times = _timed(client, clock)
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    for _ in range(12):
+        v.balance()
+        v.positions()
+    assert clock.slept == [] and len(times) == 24 and all(t == 0.0 for _, t in times)
+
+
+def test_the_paper_table(tmp_path, monkeypatch):
+    _real_limits(monkeypatch)
+    assert wb.RATE_LIMITS["sandbox"]["balance"] == (30, 60) and wb.RATE_LIMITS["sandbox"]["all"] == (30, 60)
+    assert wb.RATE_LIMITS["production"]["balance"] == (2, 2) and wb.RATE_LIMITS["production"]["account_list"] == (10, 30)
+    assert wb.RATE_LIMITS["production"]["place"] == (600, 60) and wb.RATE_LIMITS["production"]["all"] == (60, 60)
+    clock = FakeClock()
+    client = FakeClient()
+    times = _timed(client, clock)
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    for _ in range(30):
+        v.balance()
+    stamps = [t for _, t in times]
+    assert stamps[:24] == [0.0] * 24 and stamps[24:] == [60.0] * 6          # 80% of 30 a minute: 24
+    assert v.check()["rate_limits"]["calls"]["balance"] == [30, 60.0] and v.check()["rate_limits"]["share_used"] == 0.8
+
+
+@pytest.mark.parametrize("how", ["raised", "answered"])
+def test_a_429_on_a_read_is_retried_with_waits_and_then_raises(tmp_path, how):
+    clock = FakeClock()
+    client = FakeClient()
+    answers = []
+
+    def balance(a):
+        answers.append(clock.now)
+        if how == "raised":
+            raise ServerException("TOO_MANY_REQUESTS", 429, "Too many requests")
+        return Response({"error_code": "TOO_MANY_REQUESTS"}, 429)
+    client.account_v2.get_account_balance = balance
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    with pytest.raises(wb.WebullError, match="rate limit was hit") as exc:
+        v.balance()
+    assert answers == [0.0, 2.0, 6.0, 14.0] and clock.slept == [2, 4, 8]
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+    left = iter([429, 429, 200])
+    client.account_v2.get_account_balance = lambda a: Response({"total_cash_balance": "5"}, next(left))
+    assert v.balance()["total_cash_balance"] == 5.0                         # a later answer within the tries is read
+
+
+@pytest.mark.parametrize("detail_answer, outcome", [("present", "accepted"), ("absent", "rejected"), ("fails", "unknown")])
+def test_a_429_on_place_is_not_retried_and_one_detail_read_decides(tmp_path, detail_answer, outcome):
+    cid = wb.client_order_id("t")
+    answer = {"present": Response(observed_detail(cid)), "absent": ServerException(*NOT_PRESENT), "fails": RuntimeError("down")}[detail_answer]
+    clock = FakeClock()
+    client = FakeClient(details={cid: answer})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused("TOO_MANY_REQUESTS", 429)(a, orders))
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    if outcome == "accepted":
+        assert v.submit("SPY", 1.0, "t")["status"] == "accepted"
+    else:
+        with pytest.raises(wb.OrderRejected if outcome == "rejected" else wb.WebullError) as exc:
+            v.submit("SPY", 1.0, "t")
+        assert (type(exc.value) is wb.WebullError) == (outcome == "unknown")
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1 and clock.slept == []
+
+
+def test_a_429_on_cancel_is_not_retried(tmp_path):
+    clock = FakeClock()
+    client = FakeClient()
+
+    def cancel(a, cid):
+        client.calls.append(("cancel", a, cid))
+        raise ServerException("TOO_MANY_REQUESTS", 429, "Too many requests")
+    client.order_v3.cancel_order = cancel
+    client._open_pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}}
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
+    with pytest.raises(wb.WebullError, match="429"):
+        v.cancel("t")
+    assert v.cancel_all_open()[0]["status"] == "error"
+    assert len(_calls(client, "cancel")) == 2 and clock.slept == []
+
+
+def test_a_replaced_table(tmp_path):
+    table = {**{k: (10 ** 6, 1) for k in wb.CALL_KINDS}, "balance": (1, 10)}
+    clock = FakeClock()
+    client = FakeClient()
+    times = _timed(client, clock)
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_id="ACC-0001-1234", confirmation_file=tmp_path / "x.json", limits=table,
+                       clock=clock, sleep=clock.sleep)
+    for _ in range(4):
+        v.balance()
+    assert [t for _, t in times] == [0.0, 10.0, 20.0, 30.0]
+    assert v.check()["rate_limits"]["calls"]["balance"] == [1, 10.0]
+
+
+@pytest.mark.parametrize("change", ["missing", "extra", "zero", "fraction", "bool", "no_window", "inf_window", "text", "short", "not_a_dict"])
+def test_a_malformed_table_is_refused(tmp_path, change):
+    good = {k: (30, 60) for k in wb.CALL_KINDS}
+    table = {"missing": {k: v for k, v in good.items() if k != "cancel"}, "extra": {**good, "orders": (1, 1)},
+             "zero": {**good, "balance": (0, 60)}, "fraction": {**good, "balance": (1.5, 60)}, "bool": {**good, "balance": (True, 60)},
+             "no_window": {**good, "balance": (1, 0)}, "inf_window": {**good, "balance": (1, float("inf"))},
+             "text": {**good, "balance": ("1", 60)}, "short": {**good, "balance": (1,)}, "not_a_dict": [("balance", (1, 1))]}[change]
+    with pytest.raises(wb.WebullError, match="limit"):
+        wb.WebullVenue(KEY, SECRET, client=FakeClient(), confirmation_file=tmp_path / "x.json", limits=table)
+
+
+def test_fifteen_sells_in_a_row_on_the_live_table_never_break_a_limit(tmp_path, monkeypatch):
+    clock = FakeClock()
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "15", "instrument_type": "EQUITY"}])
+    times = _timed(client, clock)
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", limits=REAL_RATE_LIMITS["production"],
+                       clock=clock, sleep=clock.sleep)
+    for i in range(15):
+        assert v.submit("SPY", -1.0, f"sell-{i}")["status"] == "accepted"
+    live = REAL_RATE_LIMITS["production"]
+    kinds = {"get_account_list": "account_list", "get_account_balance": "balance", "get_account_position": "positions",
+             "get_order_detail": "order_detail", "list_order_open": "open_orders", "place_order": "place", "cancel_order": "cancel"}
+    for name, kind in kinds.items():
+        stamps = [t for n, t in times if n == name]
+        calls, window = live[kind]
+        assert _most_in_a_window(stamps, window) <= max(1, int(calls * 0.8)), name
+    assert _most_in_a_window([t for _, t in times], 60) <= 48
+    assert len([n for n, _ in times if n == "place_order"]) == 15
+    assert clock.now == 28.0                                                 # measured: 15 sells take 28 s on the fake clock
+
