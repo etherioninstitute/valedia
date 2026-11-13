@@ -42,9 +42,9 @@ more than one instant. On the November change day 01:00-01:59 happens twice (two
 change day 02:00-02:59 never happens (read as standard time or as daylight time, again two instants an hour apart). The
 rule is that EVERY instant the reading could mean must satisfy (a), so such a time is accepted only when it is recent under
 every reading. Under the default limit (1800 s, a window of 2100 s with the 300 s allowance for the future) that never
-happens, so a time in either hour is refused. With an age limit of an hour or more (`max_age_seconds` >= 3600, a window wider
-than the hour between the readings) a time in the missing hour, or in the repeated hour, can be accepted when both readings
-of it are recent.
+happens, so a time in either hour is refused. With an age limit of 3300 s or more (the window is the limit plus the 300 s
+allowance, so from 3300 s it is as wide as the hour between the readings) a time in the missing hour, or in the repeated
+hour, can be accepted when both readings of it are recent.
 The quote's symbol must equal the `symbol` given to `compare`.
 
 Time limit (rev 2): one try, redirects included, has ONE deadline of 10 seconds, enforced three ways: a check before every
@@ -72,7 +72,7 @@ fails at once without starting another. The thread ends when the resolver answer
 daemon); the connection itself is then made by this module to the address given, under the same deadline and watchdog.
 
 Other decisions:
-- A bid above the ask is not a band; the last price is used if there is one, otherwise there is no second quote.
+- A bid above the ask (both usable) is suspect data: "no second quote" whatever the last price (see "Crossed band").
 - `compare`: an unusable first price is "disagree" (never "agree"), and a second quote that is not usable is reported
   first as "no second quote". A tolerance that is not a number from 0 to 1, an age limit that is not a positive number, or
   a `now` that is not an aware datetime raises ValueError (a programming error).
