@@ -40,7 +40,7 @@ from valedia_trader.data_and_fees import ohlc as ohlc_data
 from valedia_trader.research_loop import LoopPaths
 from valedia_trader.research_loop import tournament as tm
 
-__all__ = ["KronosForecaster", "window_for", "future_days", "dense_questions", "ask_price_model", "ohlc_universe", "main"]
+__all__ = ["KronosForecaster", "WorkerUnavailable", "window_for", "future_days", "dense_questions", "ask_price_model", "ohlc_universe", "main"]
 
 TRADING_LAB = Path(__file__).resolve().parents[3] / "trading-lab"
 KRONOS_PYTHON = TRADING_LAB / "runtime" / "venv" / "bin" / "python"
@@ -57,9 +57,15 @@ def _is_coin(symbol: str) -> bool:
     return symbol.endswith("-USD")
 
 
+class WorkerUnavailable(RuntimeError):
+    """The worker failed to become ready twice in a row: the installation is broken, so the run stops
+    instead of loading the model again for every question."""
+
+
 class KronosForecaster:
     """Kronos as a tournament forecaster. The worker starts on the first question, is restarted once if it
-    dies during a request, and is closed at exit. `worker_argv` replaces the worker's command (for tests)."""
+    dies during a request, and is closed at exit. Two failed starts in a row raise WorkerUnavailable.
+    `worker_argv` replaces the worker's command (for tests)."""
 
     def __init__(self, name: str = "kronos-small", python=KRONOS_PYTHON, source=KRONOS_SOURCE, model=KRONOS_MODEL,
                  tokenizer=KRONOS_TOKENIZER, paths: int = 30, context: int = 400, worker_argv: Sequence[str] | None = None):
@@ -68,6 +74,7 @@ class KronosForecaster:
         self.device: str | None = None
         self._proc: subprocess.Popen | None = None
         self._log = None
+        self._failed_starts = 0
         atexit.register(self.close)
 
     def _start(self) -> None:
@@ -76,9 +83,17 @@ class KronosForecaster:
         self.close()
         self._log = tempfile.TemporaryFile(mode="w+")
         env = {**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONUNBUFFERED": "1"}
-        self._proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True,
-                                      bufsize=1, cwd=tempfile.gettempdir(), env=env)
-        ready = self._read(lambda msg: msg.get("ready") is True)
+        try:
+            self._proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log, text=True,
+                                          bufsize=1, cwd=tempfile.gettempdir(), env=env)
+            ready = self._read(lambda msg: msg.get("ready") is True)
+        except (_WorkerDied, OSError) as exc:
+            self.close()
+            self._failed_starts += 1
+            if self._failed_starts >= 2:
+                raise WorkerUnavailable(f"the Kronos worker failed to start twice in a row, so the run stops: {exc}") from exc
+            raise _WorkerDied(f"the Kronos worker did not start: {exc}") from exc
+        self._failed_starts = 0
         self.device = ready.get("device")
 
     def _log_tail(self) -> str:
@@ -234,6 +249,8 @@ def ask_price_model(ledger: tm.TournamentLedger, forecaster: KronosForecaster, o
         else:
             try:
                 p = forecaster.probability_up(window, future_days(ohlc, q["symbol"], q["asked_on"], q["horizon"]), _seed(q["id"]))
+            except WorkerUnavailable:
+                raise                                       # a broken installation stops the run; this question stays unasked
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]
         ledger.record(q["id"], forecaster.name, p, error, (time.perf_counter() - started) * 1000.0)
@@ -276,6 +293,9 @@ class _Only:
     def record(self, *args) -> None:
         self._ledger.record(*args)
 
+    def settle(self, question_id: str, outcome: int) -> bool:
+        return self._ledger.settle(question_id, outcome)
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="price_models", description="Ask price-forecast models the tournament's direction questions.")
@@ -308,11 +328,18 @@ def main(argv=None) -> int:
     log = lambda s: print(s, file=sys.stderr, flush=True)
     try:
         qs = dense_questions(close, list(close.columns), args.not_before, end, args.horizon, args.universe, args.per_day, args.seed)
-        added, settled = ledger.add(qs), tm.settle_directions(ledger, close)
+        added = ledger.add(qs)
+        mine = {q["id"] for q in ledger.questions() if q["market"] == args.universe}   # other markets keep their own calendar
+        settled = tm.settle_directions(_Only(ledger, mine), close)
         before = ledger.answered(forecaster.name)
         started = time.perf_counter()
-        asked = ask_price_model(ledger, forecaster, bars, args.not_before, markets=[args.universe], horizon=args.horizon,
-                                limit=args.limit, progress=log)
+        try:
+            asked = ask_price_model(ledger, forecaster, bars, args.not_before, markets=[args.universe], horizon=args.horizon,
+                                    limit=args.limit, progress=log)
+        except WorkerUnavailable as exc:                    # answers already given stay recorded; the rest stay unasked
+            print(json.dumps({"stopped": str(exc), "questions_added": added, "settled_now": settled, "counts": ledger.counts()},
+                             indent=1), file=sys.stderr)
+            return 1
         seconds = time.perf_counter() - started
         out = {"questions_added": added, "settled_now": settled, "asked": {forecaster.name: asked}, "device": forecaster.device,
                "paths": args.paths, "seconds_per_question": round(seconds / asked["asked"], 3) if asked["asked"] else None}

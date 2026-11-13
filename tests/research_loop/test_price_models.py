@@ -11,6 +11,12 @@ from valedia_trader.research_loop import tournament as tm
 FAKE_WORKER = r'''
 import json, os, sys
 log, mode, deltas = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+with open(log + ".starts", "a") as fh:
+    fh.write("start\n")
+if mode == "never_ready" or (mode == "ready_once" and os.path.exists(log + ".started")):
+    print("cannot load the model", file=sys.stderr, flush=True)
+    sys.exit(5)
+open(log + ".started", "w").close()
 print("some library chatter on stdout", flush=True)
 print(json.dumps({"ready": True, "device": "fake"}), flush=True)
 for line in sys.stdin:
@@ -221,3 +227,50 @@ def test_dense_questions_never_overlap_one_symbols_windows_and_sampling_is_repro
     again = pm.dense_questions(close, ["UPP", "DWN", "FLT"], idx[300], idx[600], 5, "funds", per_day=1, seed=3)
     assert [q.to_row() for q in one] == [q.to_row() for q in again]
     assert len(one) == len({q.asked_on for q in qs}) and len({q.asked_on for q in one}) == len(one)
+
+
+def test_a_worker_that_cannot_start_stops_the_run_after_two_failed_starts(tmp_path):
+    ohlc = market_ohlc()
+    idx = ohlc["close"].index
+    led = ledger_with_questions(tmp_path, ohlc, [idx[500], idx[510]])          # four questions
+    fc, log = fake_forecaster(tmp_path, mode="ready_once")
+    assert pm.ask_price_model(led, fc, ohlc, "2020-01-01", limit=1)["answered"] == 1
+    fc.close()                                                                # every later start fails
+    with pytest.raises(pm.WorkerUnavailable, match="start"):
+        pm.ask_price_model(led, fc, ohlc, "2020-01-01")
+    assert len((tmp_path / "requests-fake-kronos.log.starts").read_text().splitlines()) == 3   # one good start, two failed
+    assert led.counts()["answers"] == {"fake-kronos": 1} and led.counts()["failed_calls"] == {}  # the rest left unasked
+    never, _ = fake_forecaster(tmp_path, mode="never_ready", name="never")
+    with pytest.raises(pm.WorkerUnavailable, match="cannot load the model"):
+        pm.ask_price_model(led, never, ohlc, "2020-01-01")
+    assert len((tmp_path / "requests-never.log.starts").read_text().splitlines()) == 2
+    assert "never" not in led.counts()["answers"] and "never" not in led.counts()["failed_calls"]
+    led.close()
+
+
+def test_ask_kronos_settles_only_the_questions_of_its_own_market(tmp_path, monkeypatch):
+    days = pd.date_range("2023-01-01", periods=800)                           # coins trade every calendar day
+    rng = np.random.default_rng(4)
+    btc = 100 * np.exp(np.cumsum(0.02 * rng.standard_normal(len(days))))
+    spy = pd.Series(100 * np.exp(np.cumsum(0.01 * rng.standard_normal(len(days)))), index=days).where(days.dayofweek < 5)
+    close = pd.DataFrame({"BTC-USD": btc, "SPY": spy}, index=days)
+    bars = {"open": close * 0.999, "high": close * 1.01, "low": close * 0.99, "close": close, "volume": close * 0 + 1e6}
+    folder = tmp_path / "artifacts" / "ohlc_funds"
+    folder.mkdir(parents=True)
+    for f, frame in bars.items():
+        frame.to_parquet(folder / f"{f}.parquet")
+    day = next(d for d in days[-40:] if d.dayofweek == 0)
+    ledger_file = tmp_path / "t.sqlite"
+    led = tm.TournamentLedger(ledger_file)
+    assert led.add(tm.direction_questions(close, ["BTC-USD"], day, 5, "crypto", blind=True)) == 1
+    led.close()
+    fc, _ = fake_forecaster(tmp_path)
+    monkeypatch.setattr(pm, "KronosForecaster", lambda **kw: fc)
+    assert pm.main(["--root", str(tmp_path), "ask-kronos", "--universe", "funds", "--horizon", "5", "--not-before", str(day.date()),
+                    "--ledger", str(ledger_file)]) == 0
+    led = tm.TournamentLedger(ledger_file)
+    on_day = {(q["market"], q["symbol"]) for q in led.questions() if q["asked_on"] == str(day.date())}
+    settled = {(r["market"], r["symbol"]) for r in led.settled() if r["asked_on"] == str(day.date())}
+    assert {("funds", "BTC-USD"), ("crypto", "BTC-USD")} <= on_day
+    assert ("funds", "BTC-USD") in settled and ("crypto", "BTC-USD") not in settled    # five calendar days, not five weekdays
+    led.close()

@@ -52,6 +52,21 @@ def test_refresh_fails_closed_when_one_field_is_missing_for_a_symbol(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_refresh_fails_closed_when_a_symbols_volume_is_missing_or_the_volume_column_is_absent(tmp_path):
+    ohlc.refresh_ohlc(tmp_path, ("SPY", "GLD"), "2012-01-01", download=lambda t, b: _raw(t))
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    no_volume = _raw(("SPY", "GLD"), last_day="2024-04-30")
+    no_volume[("Volume", "GLD")] = np.nan
+    with pytest.raises(RuntimeError, match=r"volume.*GLD"):
+        ohlc.refresh_ohlc(tmp_path, ("SPY", "GLD"), "2012-01-01", download=lambda t, b: no_volume)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before          # byte-identical, nothing new
+    no_column = _raw(("SPY", "GLD"), last_day="2024-04-30").drop(columns="Volume", level=0)
+    with pytest.raises(RuntimeError, match=r"volume.*GLD.*SPY"):
+        ohlc.refresh_ohlc(tmp_path, ("SPY", "GLD"), "2012-01-01", download=lambda t, b: no_column)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+    assert not list(tmp_path.glob("*.new.parquet"))
+
+
 def test_refresh_never_stores_a_bar_for_a_session_still_running(tmp_path, monkeypatch):
     from valedia_trader.data_and_fees import prices
     monkeypatch.setattr(prices, "drop_unfinished_session", lambda c, v, now=None: (c.iloc[:-1], v.iloc[:-1], True))
