@@ -2,6 +2,7 @@
 
 Every test uses a stand-in venue, a ledger and a state file in a temporary folder, a fake clock and fake quotes.
 Nothing here builds a Webull client or touches the network."""
+import dataclasses
 import json
 import math
 import random
@@ -130,8 +131,16 @@ class StandIn:
         return [t for m, t in self.calls if m == "submit"]
 
 
-def paper(wanted, equity=100_000.0, share=None, min_trade_pct=0.0):
-    return osx.PaperTargets(wanted=wanted, equity=equity, share=equity if share is None else share, min_trade_pct=min_trade_pct)
+AUTO = "auto"                                     # the paper book's day: the session before the run's day
+
+
+def paper(wanted, equity=100_000.0, share=None, min_trade_pct=0.0, day=AUTO):
+    return osx.PaperTargets(wanted=wanted, equity=equity, share=equity if share is None else share, min_trade_pct=min_trade_pct,
+                            day=day)
+
+
+def ny_day(t):
+    return pd.Timestamp(t, unit="s", tz="UTC").tz_convert("America/New_York").normalize().tz_localize(None)
 
 
 class World:
@@ -169,8 +178,12 @@ class World:
         led = ledger or self.ledger()
         if patch:
             patch(led)
+        book = self.paper
+        if isinstance(book, osx.PaperTargets) and getattr(book, "day", None) == AUTO:
+            prev = CAL.sessions[CAL.sessions.searchsorted(ny_day(self.clock.t)) - 1] if math.isfinite(self.clock.t) else None
+            book = dataclasses.replace(book, day=None if prev is None else str(prev.date()))
         try:
-            return osx.run_order_step(ledger=led, venue=self.venue, paper=self.paper, quotes=self.quotes, journal=self.journal,
+            return osx.run_order_step(ledger=led, venue=self.venue, paper=book, quotes=self.quotes, journal=self.journal,
                                       limits_file=self.limits, state=self.state_path, clock=self.clock, calendar=CAL,
                                       halt_file=self.halt, latch_file=self.latch, **kw)
         finally:
@@ -1139,3 +1152,341 @@ def test_the_journals_readers_take_the_order_steps_entries_in_their_stride(world
     assert critic.panel_scorecard(entries) is None and critic.benchmark_comparison(entries) == []
     review = critic.weekly_review(HypothesisLedger(), world.journal, "2026-11-13", {}, world.limits)
     assert review["kill_switch_failures"] == 0 and str(world.tmp) in review["path"]
+
+
+# ==== rev 2 (T13 rev 2): repairs after blind verification
+
+def _slow_venue(world, minutes, after_first=None):
+    """The adapter paces itself: each submit takes `minutes` on the clock."""
+    original = world.venue.submit
+
+    def slow(*a, **k):
+        out = original(*a, **k)
+        world.clock.t += minutes * 60
+        if after_first and len(world.venue.submits()) == 1:
+            after_first()
+        return out
+    world.venue.submit = slow
+
+
+# ---- rev 2 outcome 1: a quote that ages while the run sends is checked again before its order is intended
+
+def test_a_quote_that_ages_past_the_limit_while_the_run_sends_is_asked_for_again(world):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0, "IWM": 1.0}})          # sent SPY, QQQ, IWM (largest value first)
+    _slow_venue(world, 15, after_first=lambda: world.prices.update(IWM=210.0))
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 3
+    assert world.quote_calls == [["IWM", "QQQ", "SPY"], ["IWM"]]               # QQQ at 16 minutes is still good; IWM at 31 is not
+    by = {o["symbol"]: o for o in world.orders()}
+    assert (by["SPY"]["reference_price"], by["QQQ"]["reference_price"]) == (500.0, 400.0)
+    assert (by["IWM"]["reference_price"], by["IWM"]["limit_price"]) == (210.0, 212.1)   # the limit comes from the quote in hand
+
+
+@pytest.mark.parametrize("again", ["missing", "stale", "raises", "not a number"])
+def test_a_quote_asked_for_again_that_is_unusable_leaves_its_order_over(world, again):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0, "IWM": 1.0}})
+    first = world.quotes
+
+    def quotes(symbols):
+        if world.quote_calls:
+            if again == "raises":
+                world.quote_calls.append(list(symbols))
+                raise TimeoutError("price source down")
+            if again == "missing":
+                world.prices.pop("IWM", None)
+            elif again == "stale":
+                world.quote_age["IWM"] = 25 * 60
+            else:
+                world.quote_override["IWM"] = (float("nan"), world.clock.t)
+        return first(symbols)
+    world.quotes = quotes
+    _slow_venue(world, 15)
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 2 and len(world.quote_calls) == 2
+    assert [x["symbol"] for x in out["left_over"]] == ["IWM"] and out["left_over"][0]["reason"].startswith("the quote is older than")
+    assert "IWM" not in units_sent(world) and world.entries("left_over")[-1]["symbol"] == "IWM"
+
+
+# ---- rev 2 outcome 2: the venue's own text never reaches the journal, the summary or the state file
+
+MARK = "Zq<leak>"                                                               # not a symbol, not a code, not an identifier
+
+
+class Leaky(StandIn):
+    """Every answer and every error carries MARK."""
+
+    def _maybe_raise(self, method):
+        if method in self.raise_on:
+            raise ConnectionError(f"{method} failed: {MARK}")
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE"):
+        mode = self.submit_mode.pop(0) if isinstance(self.submit_mode, list) and self.submit_mode else "accept"
+        self.calls.append(("submit", tag))
+        if mode == "accept":
+            self._take(symbol, units, tag, limit_price)
+            return {"status": "accepted", "venue_order_id": MARK, "message": MARK}
+        if mode == "refuse":
+            raise NotTransmitted(f"refused: {MARK}")
+        if mode == "reject":
+            raise OrderRejected(f"rejected: {MARK}", "SOME_CODE")
+        if mode == "reject marked code":
+            raise OrderRejected(f"rejected: {MARK}", MARK)
+        if mode == "odd":
+            self._take(symbol, units, tag, limit_price)
+            return {"status": MARK}
+        raise ConnectionError(f"reset: {MARK}")
+
+    def order_status(self, tag):
+        out = super().order_status(tag)
+        if out is not None:
+            out.update(raw_status=MARK, venue_order_id=MARK, note=MARK)
+            if self.odd_state:
+                out["state"] = MARK
+        return out
+
+    odd_state = False
+    odd_positions = False
+
+    def positions(self):
+        out = super().positions()
+        return {**out, "SPY": MARK} if self.odd_positions else out
+
+    def cash(self):
+        out = super().cash()
+        return {**out, "currency": MARK, "message": MARK}
+
+    def cancel(self, tag):
+        out = super().cancel(tag)
+        return {**out, "message": MARK} if self.cancel_answer != MARK else {"status": MARK}
+
+
+def test_nothing_the_venue_says_in_its_own_words_reaches_the_journal_the_summary_or_the_state_file(world):
+    world.venue = Leaky()
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0, "IWM": 1.0, "TLT": 1.0, "GLD": 1.0}})
+    outs = []
+
+    def run(**setup):
+        for k, v in setup.items():
+            setattr(world.venue, k, v)
+        world.later(30)
+        outs.append(world.run())
+        for k in setup:
+            setattr(world.venue, k, type(world.venue).__dict__.get(k, StandIn.__dict__.get(k, getattr(StandIn(), k, None))))
+        world.venue.raise_on = set()
+        world.venue.cancel_answer = "cancel requested"
+        return outs[-1]
+    run(submit_mode=["accept", "refuse", "reject", "reject marked code", "odd"])   # refusals, then an answer that is not "accepted"
+    run(raise_on={"cancel"})                                                         # the cancel error
+    run(cancel_answer=MARK)                                                          # a cancel answer that is not a cancel word
+    run(odd_state=True)                                                              # a state that is not a state
+    run(odd_positions=True)                                                          # positions that are not numbers
+    run(raise_on={"positions"})
+    run(raise_on={"cash"})
+    run(raise_on={"order_status"})
+    run(submit_mode=["lose"])                                                        # the error of an unknown outcome
+    world.quotes = lambda symbols: (_ for _ in ()).throw(ValueError(MARK))
+    run()
+    w2 = World(world.tmp / "baseline")
+    w2.venue = Leaky(held={MARK: 1.0})                                               # a position that is not a symbol
+    w2.paper = world.paper
+    outs.append(w2.run())
+    w3 = World(world.tmp / "environment")
+    w3.venue = Leaky()
+    w3.venue.environment = MARK
+    outs.append(w3.run())
+    w4 = World(world.tmp / "baseline error")
+    w4.venue = Leaky()
+    w4.venue.raise_on = {"positions"}                                                # the baseline's read fails
+    w4.paper = world.paper
+    outs.append(w4.run())
+    w5 = World(world.tmp / "attention")                                              # the ledger's attention text
+    w5.venue = Leaky()
+    w5.paper = world.paper
+    w5.venue.submit_mode = ["lose"]
+    outs.append(w5.run())
+    lost = w5.venue.submits()[0]
+    w5.later(30)
+    outs.append(w5.run())                                                            # the lost order: never arrived
+    w5.venue.book[lost] = {"symbol": "SPY", "units": 1.0, "limit": 505.0, "filled": 0.0, "state": "open"}
+    w5.venue.odd_state = True                                                        # ... then it turns up, its state MARK
+    w5.later(30)
+    outs.append(w5.run())
+    assert w5.ledger().attention() and outs[-1]["stage"] == "reconcile"
+    assert any(o["status"] == "stopped" for o in outs) and any(o["refused"] for o in outs)
+    worlds = (world, w2, w3, w4, w5)
+    texts = [json.dumps(o) for o in outs]
+    texts += [f.read_text() for w in worlds for f in sorted((w.tmp / "journal").glob("*.jsonl"))]
+    texts += [w.state_path.read_bytes().decode("utf-8", "replace") for w in worlds if w.state_path.exists()]
+    assert all(MARK not in t and "leak" not in t for t in texts)
+    everything = "".join(texts)
+    assert "SOME_CODE" in everything and "NotTransmitted" in everything and "ConnectionError" in everything   # own words kept
+
+
+def test_a_venue_error_keeps_its_class_name_and_a_code_only_when_they_are_plain():
+    class Odd(Exception):
+        pass
+    assert osx._venue_error(OrderRejected("text Zq", "SOME_CODE_9")) == "OrderRejected (code SOME_CODE_9)"
+    assert osx._venue_error(OrderRejected("text Zq", "bad code")) == "OrderRejected"
+    assert osx._venue_error(OrderRejected("text", "A" * 65)) == "OrderRejected"
+    odd = type("Not an identifier", (Exception,), {})
+    assert osx._venue_error(odd("x")) == "an exception" and osx._venue_error(Odd("Zq")) == "Odd"
+
+
+# ---- rev 2 outcome 3: a paper book days old is not followed
+
+@pytest.mark.parametrize("run_at, book_day, runs", [
+    ("2026-11-13 10:00", "2026-11-12", True),          # one session old
+    ("2026-11-13 10:00", "2026-11-13", True),          # the paper step already ran today
+    ("2026-11-13 10:00", "2026-11-11", False),         # two sessions old
+    ("2026-11-16 10:00", "2026-11-13", True),          # across a weekend: Friday's book on Monday
+    ("2026-11-16 10:00", "2026-11-12", False),
+    ("2026-11-27 10:00", "2026-11-25", True),          # across the Thanksgiving holiday
+    ("2026-11-27 10:00", "2026-11-24", False),
+    ("2026-11-27 10:00", "2026-11-26", False),         # the holiday itself is no session
+    ("2026-11-13 10:00", "2026-11-16", False),         # a book from the future
+    ("2026-11-13 10:00", None, False)])                # a book that does not say
+def test_the_paper_book_must_be_from_the_session_before_or_today(world, run_at, book_day, runs):
+    world.clock.t = ny(run_at)
+    world.paper = paper({"a": {"SPY": 1.0}}, day=book_day)
+    out = world.run()
+    if runs:
+        assert out["status"] == "done" and out["orders_sent"] == 1
+    else:
+        assert out["status"] == "stopped" and out["stage"] == "targets" and world.venue.calls == []
+        assert "paper book" in world.entries("stopped")[-1]["reason"]
+
+
+def test_paper_targets_carry_the_paper_books_last_day(tmp_path):
+    from valedia_trader.research_loop.paper import PaperTrader
+    limits = tmp_path / "risk.json"
+    limits.write_text(json.dumps(GENEROUS))
+    t = PaperTrader(tmp_path / "journal", limits, halt_file=None)
+    t.state["history"] = [{"day": "2026-11-12", "equity": 90_000.0, "capital_per_strategy": 45_000.0}]
+    t.state["last_day"] = "2026-11-12"
+    assert osx.paper_targets(t).day == "2026-11-12"
+
+
+# ---- rev 2 outcome 4: the environment and the host, read again before every send
+
+class Sly(str):
+    pass
+
+
+@pytest.mark.parametrize("env, host, runs", [
+    (Sly("sandbox"), None, False), ("sandbox", "api.webull.com", False), ("sandbox", "api.sandbox.webull.com", True),
+    ("sandbox", Sly("api.sandbox.webull.com"), False), ("sandbox", 42, False), ("sandbox", "raise", False)])
+def test_the_environment_must_be_a_plain_str_and_a_host_must_name_the_sandbox(world, env, host, runs):
+    world.paper = paper({"a": {"SPY": 1.0}})
+
+    class V(StandIn):
+        environment = env
+    if host == "raise":
+        V.host = property(lambda self: (_ for _ in ()).throw(RuntimeError("no host")))
+    elif host is not None:
+        V.host = host
+    world.venue = V()
+    out = world.run()
+    if runs:
+        assert out["orders_sent"] == 1
+    else:
+        assert out["stage"] == "environment" and world.venue.calls == []
+
+
+@pytest.mark.parametrize("change", [("environment", "production"), ("environment", Sly("sandbox")), ("host", "api.webull.com")])
+def test_the_environment_is_read_again_before_every_send_and_a_change_stops_with_no_further_call(world, change):
+    world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    world.venue.host = "api.sandbox.webull.com"
+    _slow_venue(world, 0, after_first=lambda: setattr(world.venue, *change))
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "environment" and out["orders_sent"] == 1
+    assert world.venue.names()[-1] == "submit" and len(world.venue.submits()) == 1
+    assert [o["symbol"] for o in world.orders()] == ["SPY"]
+
+
+# ---- rev 2 outcome 5: the journal on disk
+
+def test_a_fills_journal_entry_is_synced_to_disk_before_the_fill_is_marked_applied(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.run()
+    world.venue.fill(world.venue.submits()[0], 10.0)
+    world.later()
+    events = []
+    real_sync, real_write = osx._sync_file, world.journal.write
+    monkeypatch.setattr(osx, "_sync_file", lambda path: events.append(("sync", str(path))) or real_sync(path))
+    world.journal.write = lambda day, entry: events.append(("write", entry.get("event"))) or real_write(day, entry)
+
+    def spy(led):
+        real = led.mark_applied
+        led.mark_applied = lambda ids: events.append(("mark", list(ids))) or real(ids)
+    world.run(patch=spy)
+    i = events.index(("write", "fill"))
+    assert events[i + 1] == ("sync", str(world.tmp / "journal" / "2026-11-13.jsonl")) and events[i + 2] == ("mark", [1])
+
+
+def test_a_torn_last_line_of_the_journal_is_skipped_and_reported_and_stays_skipped(world):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.venue.fill_at_once = 1.0
+    world.run()
+    today = world.tmp / "journal" / "2026-11-13.jsonl"
+    lines = len(today.read_text().splitlines())
+    with today.open("a") as fh:
+        fh.write('{"type": "decision", "day": "2026-11-13", "strat')                 # a crash mid-write
+    world.later()
+    out = world.run()
+    assert out["status"] == "done" and out["torn_lines"] == [{"file": "2026-11-13.jsonl", "line": lines + 1}]
+    text = today.read_text().splitlines()
+    assert text[lines].startswith('{"type": "decision"') and json.loads(text[lines + 1])["event"] == "torn_line"   # its own line
+    world.paper = paper({"a": {"SPY": 12.0}})
+    world.later()
+    out = world.run()                                                                 # no longer the last line, but known
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["torn_lines"] == [{"file": "2026-11-13.jsonl", "line": lines + 1}]
+    whole = [json.loads(line) for n, line in enumerate(today.read_text().splitlines()) if line.strip() and n != lines]
+    assert [e["fill_id"] for e in whole if e.get("event") == "fill"] == [1, 2]       # each fill journaled once, the torn line kept
+
+
+@pytest.mark.parametrize("where", ["middle of today", "an earlier day"])
+def test_a_torn_line_anywhere_else_stops_the_run_before_any_venue_call(world, where):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.run()
+    name = "2026-11-13.jsonl" if where == "middle of today" else "2026-11-12.jsonl"
+    path = world.tmp / "journal" / name
+    with path.open("a") as fh:
+        fh.write('{"type": "decision", "da\n' + json.dumps({"type": "decision", "day": name[:10]}) + "\n")
+    world.later()
+    world.venue.calls.clear()
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "journal" and world.venue.calls == []
+    assert name in out["reason"]
+
+
+# ---- rev 2 outcome 6: the stored parts sum to the order exactly
+
+def test_the_parts_sum_to_the_order_exactly_over_ten_thousand_generated_orders():
+    from valedia_trader.execution_and_risk.orders import allocate
+    rng = random.Random(13)
+    orders = whole = impossible = 0
+    for _ in range(10_000):
+        parts = [{"strategy": f"s{i}", "units": rng.uniform(-50, 50) * rng.choice([1, 1e-3, 7.3, 1e3])} for i in range(rng.randint(1, 5))]
+        net = math.fsum(p["units"] for p in parts)
+        if abs(net) < 1e-6:
+            continue
+        units = osx.round_units(net * rng.choice([1.0, 0.5, 0.999]), fractional=rng.random() < 0.5)
+        if units == 0:
+            continue
+        orders += 1
+        whole += units.is_integer()
+        given = sorted(allocate(parts, units).items())
+        out = osx.order_parts(parts, units)
+        got = [p["units"] for p in out]
+        assert [p["strategy"] for p in out] == [s for s, _ in given]
+        big = max(abs(u) for _, u in given)
+        assert all(abs(a - u) <= 8 * math.ulp(big) for a, (_, u) in zip(got, given))     # absorbing moves a part by ulps only
+        # Floats near these parts sum exactly to `units` only when `units` is a multiple of the finest ulp among them
+        # (their exact sum is always such a multiple). That fails only for fractional orders with crossing parts.
+        if (units / min(math.ulp(u) for _, u in given)).is_integer():
+            assert sum(got) == units and math.fsum(got) == units and math.fsum([*got, -units]) == 0.0
+        else:
+            impossible += 1
+            assert not units.is_integer() and abs(math.fsum(got) - units) <= 2 * math.ulp(big)
+    assert orders > 9_500 and whole > 4_000 and impossible < 100

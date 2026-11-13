@@ -10,32 +10,59 @@ baseline (what the account held before the first order step: recorded once, neve
 
 One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journaled and returned.
 
- 1. environment  the venue must be the test environment (TEST_ENVIRONMENT) and the ledger must treat the adapter's
-                 NotTransmitted and OrderRejected as not sent; checked before any venue call.
+ 1. environment  the venue must be the test environment: its `environment` a plain str equal to TEST_ENVIRONMENT
+                 (a subclass is refused) and, when it has a `host`, a plain str containing "sandbox"; and the ledger
+                 must treat exactly the adapter's NotTransmitted and OrderRejected as not sent. Checked before any
+                 venue call, and read again before each order is intended and immediately before each submit_once;
+                 any failure stops the run with no further venue call.
+    journal      every journal file is read line by line before any venue call. A torn last line of the newest file
+                 (a crash mid-write) is skipped, recorded once and reported in the summary (`torn_lines`); a torn
+                 line anywhere else stops the run.
  2. session      inside the regular session of a trading day, SESSION_AFTER_OPEN after the open to
                  SESSION_BEFORE_CLOSE before the close (09:35 to 15:45 New York time on a full day; earlier on a
                  half-day), from the exchange calendar. Outside it nothing is read from the venue.
+    paper book   read now, and followed only when its last day is the exchange session before the run's day or the
+                 run's day itself; an older (or newer, or unnamed) book stops the run before any venue call.
  3. baseline     recorded from the venue's positions when none is recorded and the ledger has no orders; with no
                  baseline and orders on the ledger, the run stops.
  4. reconcile    reconcile (positions given: baseline plus the fills already applied; the ledger adds the rest);
                  ask the venue to cancel every order of this ledger still open; reconcile again. Every new fill is
-                 journaled once (keyed by its fill id) and marked applied. A blocked ledger, or an order still open
-                 at the broker, stops the run.
+                 journaled once (keyed by its fill id), the journal file fsynced, and only then marked applied. A
+                 blocked ledger, or an order still open at the broker, stops the run.
  5. targets      per symbol, each strategy's paper units held plus pending, summed, times capital / paper equity.
  6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing or not a positive
                  finite number: no order for that symbol.
  7. differences  target minus broker book, rounded toward zero (whole shares, or FRACTIONAL_DECIMALS decimals with
                  `fractional`); a sale never exceeds the broker book; less than the paper trader's smallest trade
-                 is dropped.
+                 is dropped. The strategies' parts of each order sum to it exactly (order_parts).
  8. risk gate    risk_gate.check_order against the broker account as it is now (equity = the venue's cash plus
                  holdings at the quotes; the day's loss against the equity recorded at the last run on an earlier
                  day; the fall from the recorded peak; positions held), latch and halt files honoured.
  9. caps         sales first, then purchases, largest value first; purchases stop once the cash the venue reports,
                  less CASH_KEPT, would be exceeded at the limit prices; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
-10. send         a day limit order in the regular session through ledger.intend and ledger.submit_once. A refusal
-                 is journaled and the run goes on; an unknown outcome stops the run at once.
+10. send         just before each order is intended its quote's age is checked again on the clock; older than
+                 QUOTE_MAX_AGE_SECONDS, the quote function is asked once more for that symbol, and an unusable
+                 answer leaves the order over. The limit price comes from the quote in hand at that moment. A day
+                 limit order in the regular session through ledger.intend and ledger.submit_once. A refusal is
+                 journaled and the run goes on; an unknown outcome stops the run at once.
 11. after        reconcile once more, journal the fills, return and journal a summary.
+
+Points to know:
+ - Every sale is priced at the quote less SELL_BELOW_REDUCING (2%): the program never sells more than it owns, so
+   every sale reduces a holding and counts as reducing risk.
+ - reconcile is given the baseline plus the fills already applied; the ledger adds the fills not yet applied.
+ - The baseline counts toward the broker equity, the position count and the position limit of the risk gate,
+   though it is never sold and never counted as this program's.
+ - The ledger and the state file are kept per venue name (ledger_path_for, state_path_for), not per account: one
+   account needs one home folder; two order steps on one account would each find the other's fills in the
+   venue's positions and stop at the reconcile.
+ - An order left `intended` by a crash (between intend and submit_once) stays `intended`; it is never sent later,
+   and settle_sends records it as not sent.
+ - Only the order step's own words reach the journal, the summary and the state file: from a venue error, its class
+   name when that is a plain identifier and its `code` when that is capitals, digits and underscores (up to 64);
+   from a venue answer, only fields the order step names itself (a state or status word from a fixed list,
+   numbers, plain symbols and tags). The ledger's own file keeps the venue's text.
 
 The order step keeps a small sqlite state file (OrderStepState) beside the ledger, one per venue name: the baseline,
 the equity of each run, and the orders sent each day. Every write is one transaction. Everything a run needs is
@@ -43,6 +70,7 @@ passed in; nothing here builds a broker client.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -58,7 +86,7 @@ from typing import Callable
 
 import pandas as pd
 
-from valedia_trader.execution_and_risk.orders import OrderError, OrderLedger, OrdersBlocked, allocate, net_orders
+from valedia_trader.execution_and_risk.orders import STATES, OrderError, OrderLedger, OrdersBlocked, allocate, net_orders
 from valedia_trader.research_loop import risk_gate
 from valedia_trader.venues.webull import NotTransmitted, OrderRejected
 
@@ -102,6 +130,66 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text[:MAX_TEXT]}" if text else type(exc).__name__
 
 
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_CODE = re.compile(r"[A-Z0-9_]{1,64}")
+_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_SYMBOL = re.compile(r"[A-Za-z0-9./-]{1,24}")
+_TAG = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+CANCEL_WORDS = ("cancel requested", "not yet", "already finished", "no such order")   # WebullVenue.cancel's words
+STATUS_WORDS = ("accepted", "pending", "open", "rejected", "refused", "unknown")      # a submit answer's status words
+
+
+def _plain(pattern: re.Pattern, x) -> bool:
+    return type(x) is str and pattern.fullmatch(x) is not None
+
+
+def _venue_error(exc: BaseException) -> str:
+    """An error from the venue or the quote function in the order step's own words: its class name when that is a
+    plain identifier, and its `code` when that is capitals, digits and underscores (up to 64). Never its text."""
+    name = type(exc).__name__
+    words = name if _plain(_IDENTIFIER, name) else "an exception"
+    try:
+        code = getattr(exc, "code", None)
+    except Exception:
+        code = None
+    return f"{words} (code {code})" if _plain(_CODE, code) else words
+
+
+def _local_error(exc: BaseException) -> str:
+    """An error of the ledger, the state file or the journal. A blocked ledger's reasons can hold the venue's words,
+    so they are not repeated."""
+    if isinstance(exc, OrdersBlocked):
+        return "OrdersBlocked (the order ledger is blocked)"
+    return _describe(exc)
+
+
+def _status_word(answer) -> str:
+    try:
+        word = answer.get("status") if isinstance(answer, dict) else None
+    except Exception:
+        word = None
+    return repr(word) if type(word) is str and word in STATUS_WORDS else "an answer without a status word"
+
+
+def _number_or_none(x):
+    return float(x) if _finite(x) else None
+
+
+def _sync_file(path: str | Path) -> None:
+    """Make what was written to `path` durable: fsync the file (F_FULLFSYNC where the system has it), then its folder."""
+    import fcntl
+    for target, flags in ((str(path), os.O_RDONLY), (os.path.dirname(str(path)) or ".", os.O_RDONLY)):
+        fd = os.open(target, flags)
+        try:
+            try:
+                fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            except (AttributeError, OSError):
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def _finite(x) -> bool:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return False
@@ -121,12 +209,14 @@ def _is_crypto(symbol: str) -> bool:
 @dataclass(frozen=True)
 class PaperTargets:
     """What the paper book wants: per strategy and symbol, units held plus pending (PaperTrader.wanted_units); the
-    paper equity those units were sized against; the capital per strategy (the paper step's `share`); and the paper
-    trader's `min_trade_pct`."""
+    paper equity those units were sized against; the capital per strategy (the paper step's `share`); the paper
+    trader's `min_trade_pct`; and the paper book's last day (YYYY-MM-DD). A run follows only a book whose day is
+    the session before the run's day or the run's day itself."""
     wanted: dict
     equity: float
     share: float
     min_trade_pct: float
+    day: str | None = None
 
 
 def paper_targets(trader) -> PaperTargets:
@@ -137,7 +227,7 @@ def paper_targets(trader) -> PaperTargets:
     last = history[-1]
     return PaperTargets(wanted=trader.wanted_units(), equity=float(last["equity"]),
                         share=float(last.get("capital_per_strategy") or last["equity"]),
-                        min_trade_pct=float(trader.min_trade_pct))
+                        min_trade_pct=float(trader.min_trade_pct), day=trader.state.get("last_day"))
 
 
 def _check_paper(p) -> PaperTargets:
@@ -200,6 +290,52 @@ def strategy_holdings(orders) -> dict[str, dict[str, float]]:
         for strategy, units in shares.items():
             out.setdefault(strategy, {}).setdefault(o["symbol"], []).append(float(units))
     return {s: {sym: math.fsum(us) for sym, us in book.items()} for s, book in out.items()}
+
+
+def order_parts(netted_parts, units: float) -> list[dict]:
+    """The strategies' parts of an order of `units`, sorted by strategy (orders.allocate), with the rounding absorbed
+    so that the parts' exact sum is `units` (then sum, math.fsum and a plain running total all give `units`).
+
+    First the last part absorbs it: every other part is put on a power-of-two grid just fine enough that each
+    running total is exact (moving it by at most half a unit in the last place of the largest running total) and
+    the last part is `units` less their sum; failing that, the last part alone is `units` less the others' exact
+    sum. That covers every whole-share order and every fractional order whose parts stay within the order's own
+    power of two. When the last part cannot, the smallest part absorbs it. No parts can sum exactly when `units`
+    is not a multiple of the finest unit in the last place among the parts (a fractional order with crossing parts
+    far larger than itself); those parts are left as allocate gives them, their sum within a few units in the last
+    place of the largest part."""
+    shares = sorted(allocate(netted_parts, units).items())
+    if not shares:
+        return []
+    units = float(units)
+    vals = [float(u) for _, u in shares]
+
+    def exact(vs):
+        return math.fsum([*vs, -units]) == 0.0        # fsum is correctly rounded: 0.0 only when the sum is exact
+
+    def done(vs):
+        return [{"strategy": s, "units": u} for (s, _), u in zip(shares, vs)]
+    reach, running = [abs(units)], 0.0
+    for v in vals[:-1]:
+        running += v
+        reach += [abs(v), abs(running), abs(units - running)]
+    top = math.frexp(max(reach))[1]                      # every value reached is below 2**top
+    for widen in range(3):
+        g = math.ldexp(1.0, top + widen - 53)
+        if not (units / g).is_integer():
+            break
+        head = [round(v / g) * g for v in vals[:-1]]
+        total = 0.0
+        for v in head:
+            total += v
+        if exact([*head, units - total]):
+            return done([*head, units - total])
+    for j in [len(vals) - 1] + sorted(range(len(vals) - 1), key=lambda i: (abs(vals[i]), i)):
+        others = vals[:j] + vals[j + 1:]
+        trial = vals[:j] + [math.fsum([units, *(-v for v in others)])] + vals[j + 1:]
+        if exact(trial):
+            return done(trial)
+    return done(vals)
 
 
 def round_units(units: float, fractional: bool = False) -> float:
@@ -266,26 +402,35 @@ def _quote_time(t) -> float | None:
     return None
 
 
+def _read_quote(raw, now: float) -> tuple[float | None, float | None, str | None]:
+    """(price, time, None) for a usable quote, else (None, None, why), in the order step's own words."""
+    if raw is None:
+        return None, None, "no quote"
+    try:
+        price, when = (raw["price"], raw["time"]) if isinstance(raw, dict) else (raw[0], raw[1])
+    except Exception:
+        return None, None, "the quote is not a price and a time"
+    if not _finite(price) or price <= 0:
+        return None, None, "the quote's price is not a positive finite number"
+    try:
+        t = _quote_time(when)
+    except Exception:
+        t = None
+    if t is None:
+        return None, None, "the quote's time is not usable"
+    age = now - t
+    if age > QUOTE_MAX_AGE_SECONDS:
+        return None, None, f"the quote is {age / 60:.1f} minutes old, more than {QUOTE_MAX_AGE_SECONDS // 60}"
+    if age < -QUOTE_MAX_AHEAD_SECONDS:
+        return None, None, f"the quote is stamped {-age:.0f} s after now"
+    return float(price), t, None
+
+
 def usable_quote(raw, now: float) -> tuple[float | None, str | None]:
     """(price, None) for a usable quote, else (None, why). A quote is (price, time) or {"price", "time"}; the time
     is seconds or a datetime with a zone."""
-    if raw is None:
-        return None, "no quote"
-    try:
-        price, when = (raw["price"], raw["time"]) if isinstance(raw, dict) else (raw[0], raw[1])
-    except (KeyError, IndexError, TypeError):
-        return None, "the quote is not a price and a time"
-    if not _finite(price) or price <= 0:
-        return None, f"the quote {price!r} is not a positive finite number"
-    t = _quote_time(when)
-    if t is None:
-        return None, "the quote's time is not usable"
-    age = now - t
-    if age > QUOTE_MAX_AGE_SECONDS:
-        return None, f"the quote is {age / 60:.1f} minutes old, more than {QUOTE_MAX_AGE_SECONDS // 60}"
-    if age < -QUOTE_MAX_AHEAD_SECONDS:
-        return None, f"the quote is stamped {-age:.0f} s after now"
-    return float(price), None
+    price, _, why = _read_quote(raw, now)
+    return price, why
 
 
 def minute_quotes(symbols) -> dict:
@@ -398,8 +543,8 @@ class OrderStepState:
     def record_baseline(self, positions: dict) -> dict[str, float]:
         clean = {}
         for sym, units in positions.items():
-            if not isinstance(sym, str) or not sym or not _finite(units) or units < 0:
-                raise OrderStepError(f"the venue holds {units!r} of {sym!r}: not a symbol and a finite number at least 0")
+            if not _plain(_SYMBOL, sym) or not _finite(units) or units < 0:
+                raise OrderStepError("the baseline must be plain symbols with finite numbers at least 0")
             if units > 0:
                 clean[sym] = float(units)
         with self._write():
@@ -492,6 +637,30 @@ class _Stop(Exception):
         self.stage, self.reason = stage, reason
 
 
+class _SubmitWatch:
+    """The venue as handed to ledger.submit_once: it remembers the call's exception or answer, so that what the run
+    writes about the outcome comes from the order step's own words, not from the venue's text in the ledger's note."""
+
+    def __init__(self, venue) -> None:
+        self._venue = venue
+        self.called, self.error, self.answer = False, None, None
+
+    def submit(self, *args, **kwargs):
+        self.called = True
+        try:
+            self.answer = self._venue.submit(*args, **kwargs)
+        except BaseException as exc:
+            self.error = exc
+            raise
+        return self.answer
+
+    def __getattr__(self, name):
+        return getattr(self._venue, name)
+
+
+_ABSENT = object()
+
+
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False) -> dict:
@@ -524,10 +693,32 @@ class _Run:
         self.paper_equity = None
         self.window_end = None
         self._seen_fill_ids: set | None = None
+        self.quote_times: dict[str, float] = {}
+        self.torn_lines: list[dict] = []
+        self.paper_read: PaperTargets | None = None
+        self._line_ended = False
 
     # -- helpers
     def _write(self, entry: dict) -> None:
+        if not self._line_ended:                         # a torn last line from a crash must not swallow this entry
+            self._line_ended = True
+            path = self._journal_file(self.day)
+            try:
+                if path is not None and path.exists() and path.stat().st_size:
+                    with path.open("rb") as fh:
+                        fh.seek(-1, os.SEEK_END)
+                        ended = fh.read(1) == b"\n"
+                    if not ended:
+                        with path.open("ab") as fh:
+                            fh.write(b"\n")
+            except OSError:
+                pass                                     # the write below then reports the journal's trouble
         self.journal.write(self.day, {"type": "order_step", "venue": self.name, "batch": self.batch, **entry})
+
+    def _sync_journal(self) -> None:
+        path = self._journal_file(self.day)
+        if path is not None:
+            _sync_file(path)
 
     def _now(self) -> float:
         now = self.clock()
@@ -546,7 +737,10 @@ class _Run:
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
         try:
             self._environment()                          # 1
+            self._scan_journal()                         # before anything is asked of the venue
             self._session(now)                           # 2
+            self.paper_read = self._paper()              # 5, read now: a stale book stops before any venue call
+            self._paper_day(self.paper_read)
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         path = self.state_arg.path if isinstance(self.state_arg, OrderStepState) else str(self.state_arg)
@@ -570,7 +764,7 @@ class _Run:
         try:
             baseline = self._baseline()                  # 3
             self._reconcile_and_cancel(baseline)         # 4
-            paper = self._paper()                        # 5
+            paper = self.paper_read                      # 5
             book = broker_book(self.ledger.fills())
             capital = paper.equity if self.capital is None else self.capital
             if not _finite(capital) or capital <= 0:
@@ -583,20 +777,107 @@ class _Run:
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         except (OrderError, OrderStepError, sqlite3.Error, OSError) as exc:
-            return self._finish("stopped", "reconcile", f"the ledger, the state file or the journal failed: {_describe(exc)}")
+            return self._finish("stopped", "reconcile", f"the ledger, the state file or the journal failed: {_local_error(exc)}")
         try:
             candidates = self._differences(book, per_strategy, prices, why_not, min_value)   # 7
             self._send(candidates, baseline, book, prices, cash)                            # 8, 9, 10
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         except (OrderError, OrderStepError, sqlite3.Error, OSError) as exc:   # nothing more is sent
-            return self._finish("stopped", "send", f"the ledger, the state file or the journal failed: {_describe(exc)}; "
+            return self._finish("stopped", "send", f"the ledger, the state file or the journal failed: {_local_error(exc)}; "
                                                    "nothing more is sent and the next run's reconcile settles what was")
         try:
             self._reconcile(baseline, "after")          # 11
+        except _Stop as stop:
+            return self._finish("stopped", "after", stop.reason)
         except (OrderError, sqlite3.Error, OSError) as exc:
-            return self._finish("stopped", "after", f"the last reconcile could not be completed: {_describe(exc)}")
+            return self._finish("stopped", "after", f"the last reconcile could not be completed: {_local_error(exc)}")
         return self._finish("done", None, None)
+
+    # -- the journal as it is on disk
+    def _journal_file(self, day: str) -> Path | None:
+        d = getattr(self.journal, "dir", None)
+        return Path(d) / f"{day}.jsonl" if d is not None else None
+
+    def _scan_journal(self) -> None:
+        """Read every journal file line by line. A line that is not a JSON object is torn (a crash mid-write). The
+        last line of the newest file may be torn: it is skipped, recorded once with a `torn_line` entry and reported
+        in the summary, and stays skipped in later runs. A torn line anywhere else stops the run."""
+        d = getattr(self.journal, "dir", None)
+        if d is None:
+            return                                       # a journal without files: its read() is used instead
+        try:
+            files = sorted(Path(d).glob("????-??-??.jsonl"))
+            today = self._journal_file(self.day)
+            entries, torn = [], []
+            for i, path in enumerate(files):
+                data = path.read_bytes()
+                if data and not data.endswith(b"\n") and (i == len(files) - 1 or path == today):
+                    with path.open("ab") as fh:          # what is written next starts on its own line
+                        fh.write(b"\n")
+                lines = data.split(b"\n")
+                numbered = [(n, raw) for n, raw in enumerate(lines, 1) if raw.strip()]
+                for n, raw in numbered:
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        obj = None
+                    if isinstance(obj, dict):
+                        entries.append(obj)
+                    else:
+                        torn.append((path.name, n, i == len(files) - 1 and n == numbered[-1][0]))
+        except OSError as exc:
+            raise _Stop("journal", f"the journal could not be read: {_describe(exc)}") from None
+        known = {(e.get("file"), e.get("line")) for e in entries
+                 if e.get("type") == "order_step" and e.get("event") == "torn_line"}
+        new = [(name, n) for name, n, last in torn if (name, n) not in known]
+        bad = [(name, n) for name, n, last in torn if (name, n) not in known and not last]
+        if bad:
+            raise _Stop("journal", "the journal has a damaged line that is not the last line of the newest file ("
+                                   + ", ".join(f"{name} line {n}" for name, n in bad[:5])
+                                   + "); a person must look before the order step runs again")
+        self._seen_fill_ids = {e.get("fill_id") for e in entries
+                               if e.get("type") == "order_step" and e.get("event") == "fill" and e.get("venue") == self.name}
+        self.torn_lines = [{"file": name, "line": n} for name, n, _ in torn]
+        for name, n in new:
+            self._write({"event": "torn_line", "file": name, "line": n,
+                         "reason": "a damaged last line, from a crash mid-write; skipped by the order step"})
+
+    # -- 1, read again before every order
+    def _check_environment(self) -> None:
+        try:
+            env = self.venue.environment
+        except Exception:
+            env = None
+        if type(env) is not str or env != TEST_ENVIRONMENT:
+            raise _Stop("environment", f"the order step runs against the test environment ({TEST_ENVIRONMENT}, a plain "
+                                       "str) only; this venue's environment is not that. Live trading is not built")
+        try:
+            present = inspect.getattr_static(self.venue, "host", _ABSENT) is not _ABSENT
+        except Exception:
+            present = True
+        if present:
+            try:
+                host = self.venue.host
+            except Exception:
+                raise _Stop("environment", "the venue's host could not be read") from None
+            if type(host) is not str or "sandbox" not in host:
+                raise _Stop("environment", "the venue's host is not a plain str naming the sandbox")
+
+    # -- the paper book's day
+    def _paper_day(self, p: PaperTargets) -> None:
+        day = p.day
+        if not _plain(_DATE, day):
+            raise _Stop("targets", "the paper book does not say which day it is from; the order step follows only a "
+                                   "paper book from the session before the run's day or from that day")
+        try:
+            prev = str(pd.Timestamp(self.calendar.previous_session(self.day)).date())
+        except Exception as exc:
+            raise _Stop("targets", f"the exchange calendar could not name the session before {self.day}: "
+                                   f"{_describe(exc)}") from None
+        if day not in (prev, self.day):
+            raise _Stop("targets", f"the paper book is from {day}; the order step follows only a paper book from {prev} "
+                                   f"(the session before {self.day}) or from {self.day}. Run the paper step first")
 
     # -- 1
     def _environment(self) -> None:
@@ -604,16 +885,10 @@ class _Run:
             name = self.venue.name
         except Exception:
             name = None
-        if not isinstance(name, str) or not name:
-            raise _Stop("environment", "the venue has no name")
+        if not _plain(_NAME, name):
+            raise _Stop("environment", "the venue has no plain name (letters, digits, '_', '.', '-', up to 64)")
         self.name = name
-        try:
-            env = self.venue.environment
-        except Exception:
-            env = None
-        if env != TEST_ENVIRONMENT:
-            raise _Stop("environment", f"the order step runs against the test environment ({TEST_ENVIRONMENT}) only; "
-                                       f"this venue is {env!r}. Live trading is not built")
+        self._check_environment()
         not_sent = tuple(getattr(self.ledger, "not_sent", ()) or ())
         missing = [c.__name__ for c in NOT_SENT if c not in not_sent]
         broader = [getattr(t, "__name__", repr(t)) for t in not_sent if not (isinstance(t, type) and issubclass(t, NOT_SENT))]
@@ -646,8 +921,12 @@ class _Run:
                                     "positions can no longer tell the owner's holdings from this program's. A person must look")
         try:
             held = dict(self.venue.positions())
+            bad = sum(1 for sym, units in held.items() if not (_plain(_SYMBOL, sym) and _finite(units) and units >= 0))
         except Exception as exc:
-            raise _Stop("baseline", f"the venue's positions could not be read: {_describe(exc)}") from None
+            raise _Stop("baseline", f"the venue's positions could not be read: {_venue_error(exc)}") from None
+        if bad:
+            raise _Stop("baseline", f"the venue's positions hold {bad} entr{'y' if bad == 1 else 'ies'} that {'is' if bad == 1 else 'are'} "
+                                    "not a plain symbol with a finite number at least 0; no baseline is recorded")
         try:
             base = self.state.record_baseline(held)
         except OrderStepError as exc:
@@ -677,8 +956,11 @@ class _Run:
                 raise _Stop("reconcile", f"the journal could not be read to find the fills already written: {_describe(exc)}") from None
         for f in self.ledger.unapplied_fills():
             if f["id"] not in self._seen_fill_ids:
-                self._write({"event": "fill", "fill_id": f["id"], "tag": f["tag"], "symbol": f["symbol"], "units": f["units"],
-                             "price": f["price"], "price_covers_units": f["price_covers_units"], "fee": f["fee"]})
+                self._write({"event": "fill", "fill_id": f["id"], "tag": f["tag"] if _plain(_TAG, f["tag"]) else None,
+                             "symbol": f["symbol"] if _plain(_SYMBOL, f["symbol"]) else None,
+                             "units": _number_or_none(f["units"]), "price": _number_or_none(f["price"]),
+                             "price_covers_units": _number_or_none(f["price_covers_units"]), "fee": _number_or_none(f["fee"])})
+                self._sync_journal()                     # on disk before the fill counts as applied
                 self._seen_fill_ids.add(f["id"])
                 self.fills_journaled += 1
             self.ledger.mark_applied([f["id"]])
@@ -687,27 +969,57 @@ class _Run:
         self.state.settle_sends(self.ledger)
         self._reconcile(baseline, "first")
         for o in self.ledger.orders(OPEN_STATES):
+            tag = o["tag"] if _plain(_TAG, o["tag"]) else "an order"
+            symbol = o["symbol"] if _plain(_SYMBOL, o["symbol"]) else None
             try:
                 answer = self.venue.cancel(o["tag"])
                 word = answer.get("status") if isinstance(answer, dict) else None
-                word = word if isinstance(word, str) else "an answer that is not a cancel word"
+                word = word if type(word) is str and word in CANCEL_WORDS else "an answer that is not a cancel word"
             except Exception as exc:
-                word = f"error: {_describe(exc)}"
-            self.cancels.append({"tag": o["tag"], "symbol": o["symbol"], "answer": word[:MAX_TEXT]})
-            self._write({"event": "cancel", "tag": o["tag"], "symbol": o["symbol"], "answer": word[:MAX_TEXT]})
+                word = f"error: {_venue_error(exc)}"
+            self.cancels.append({"tag": tag, "symbol": symbol, "answer": word})
+            self._write({"event": "cancel", "tag": tag, "symbol": symbol, "answer": word})
         second = self._reconcile(baseline, "second")
         still = self.ledger.orders(OPEN_STATES)
         blocked = self.ledger.blocked()
         if still or blocked:
-            reasons = []
-            if still:
-                reasons.append(f"{len(still)} order{'' if len(still) == 1 else 's'} of this ledger "
-                               f"{'is' if len(still) == 1 else 'are'} still open at the broker after the cancel requests "
-                               f"({', '.join(o['tag'] + ' ' + o['state'] for o in still)}); the next run asks again")
-            reasons += [r for r in blocked if not any(r.startswith(f"order {o['tag']} ") for o in still)]
-            if second.get("position_differences"):
-                reasons.append(f"positions differ from baseline plus broker book: {json.dumps(second['position_differences'], default=str)}")
-            raise _Stop("reconcile", "; ".join(reasons)[:2000])
+            raise _Stop("reconcile", "; ".join(self._ledger_words(still, second))[:2000])
+
+    def _ledger_words(self, still: list[dict], result: dict) -> list[str]:
+        """Why the ledger stands in the way, from its records (tags, states, counts), never from its text, which can
+        hold the venue's words."""
+        def tag(o):
+            return o["tag"] if _plain(_TAG, o.get("tag")) else "an order"
+
+        def state(o):
+            return o["state"] if o.get("state") in STATES else "a state the order step does not know"
+        reasons = []
+        if still:
+            reasons.append(f"{len(still)} order{'' if len(still) == 1 else 's'} of this ledger "
+                           f"{'is' if len(still) == 1 else 'are'} still open at the broker after the cancel requests "
+                           f"({', '.join(tag(o) + ' ' + state(o) for o in still)}); the next run asks again")
+        waiting = len(self.ledger.unapplied_fills())
+        if waiting:
+            reasons.append(f"{waiting} fill{'' if waiting == 1 else 's'} not yet applied to the book")
+        items = self.ledger.attention()
+        if items:
+            reasons.append(f"{len(items)} attention item{'' if len(items) == 1 else 's'} open "
+                           f"({', '.join(str(int(i['id'])) + ' for ' + tag(i) for i in items)}); close each with "
+                           "close_attention once a person has looked")
+        last = self.ledger.last_reconcile()
+        if last is None or not last.get("clean"):
+            counts = [f"{len(result.get(k) or [])} {k}" for k in ("unresolved", "anomalies") if result.get(k)]
+            if result.get("positions_error"):
+                counts.append("the venue's positions could not be read")
+            reasons.append("the latest reconcile was not clean" + (f" ({', '.join(counts)})" if counts else ""))
+        diffs = result.get("position_differences") or {}
+        if diffs:
+            plain = {sym: {k: _number_or_none(v) for k, v in d.items() if k in ("book", "venue", "unapplied")}
+                     for sym, d in diffs.items() if _plain(_SYMBOL, sym) and isinstance(d, dict)}
+            odd = len(diffs) - len(plain)
+            reasons.append(f"positions differ from baseline plus broker book: {json.dumps(plain, sort_keys=True)}"
+                           + (f" and {odd} more that are not plain symbols" if odd else ""))
+        return reasons or ["the order ledger is blocked"]
 
     # -- 5
     def _paper(self) -> PaperTargets:
@@ -725,22 +1037,40 @@ class _Run:
             raw = self.quotes(symbols)
             raw = dict(raw or {})
         except Exception as exc:
-            raise _Stop("prices", f"the quotes could not be read: {_describe(exc)}") from None
+            raise _Stop("prices", f"the quotes could not be read: {_venue_error(exc)}") from None
         prices, why_not = {}, {}
         now = self._now()
         for sym in symbols:
-            price, why = usable_quote(raw.get(sym), now)
+            price, t, why = _read_quote(raw.get(sym), now)
             if price is None:
                 why_not[sym] = why
             else:
                 prices[sym] = price
+                self.quote_times[sym] = t
         return prices, why_not
+
+    def _fresh_quote(self, sym: str, quote: float) -> tuple[float | None, str | None]:
+        """The quote in hand when it is still within QUOTE_MAX_AGE_SECONDS on the clock; else one more ask of the
+        quote function for this symbol. (price, None), or (None, why) when the new quote is not usable."""
+        t, now = self.quote_times.get(sym), self._now()
+        if t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= QUOTE_MAX_AGE_SECONDS:
+            return quote, None
+        old = f"the quote is older than {QUOTE_MAX_AGE_SECONDS // 60} minutes"
+        try:
+            raw = dict(self.quotes([sym]) or {}).get(sym)
+        except Exception as exc:
+            return None, f"{old} and asking for it again failed: {_venue_error(exc)}"
+        price, t, why = _read_quote(raw, self._now())
+        if price is None:
+            return None, f"{old} and the quote asked for again is not usable: {why}"
+        self.quote_times[sym] = t
+        return price, None
 
     def _cash(self) -> float | None:
         try:
             answer = self.venue.cash()
         except Exception as exc:
-            raise _Stop("prices", f"the venue's cash could not be read: {_describe(exc)}") from None
+            raise _Stop("prices", f"the venue's cash could not be read: {_venue_error(exc)}") from None
         cash = answer.get("cash") if isinstance(answer, dict) else None
         if isinstance(cash, str):
             try:
@@ -785,7 +1115,7 @@ class _Run:
             try:
                 if not netted:
                     raise OrderError("no strategy has a part in this order")
-                parts = [{"strategy": s, "units": u} for s, u in sorted(allocate(netted[0]["parts"], units).items())]
+                parts = order_parts(netted[0]["parts"], units)
             except OrderError as exc:
                 self.refused.append({"symbol": sym, "units": units, "by": "order step",
                                      "reason": f"the strategies' parts could not be worked out: {_describe(exc)}"})
@@ -827,10 +1157,9 @@ class _Run:
         sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
         buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
         for c in sales + buys:
-            sym, units, quote = c["symbol"], c["units"], c["quote"]
+            sym, units = c["symbol"], c["units"]
             owned_here = held.get(sym, 0.0)
             reduces = units < 0 and owned_here > 0 and abs(owned_here + units) < abs(owned_here)
-            limit = limit_price(units, quote, reduces)
             if self._now() > self.window_end:
                 self._leave(c, "the session window closed during the run")
                 continue
@@ -840,6 +1169,11 @@ class _Run:
             if units > 0 and purchases_stopped:
                 self._leave(c, purchases_stopped)
                 continue
+            quote, stale = self._fresh_quote(sym, c["quote"])
+            if quote is None:
+                self._leave(c, stale)
+                continue
+            limit = limit_price(units, quote, reduces)   # from the quote in hand now
             order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote, "reduces_risk": bool(reduces),
                      "adds_to_existing": owned_here > UNITS_EPS, "position_value_after": abs(owned_here + units) * quote}
             ok, why = risk_gate.check_order(order, dict(account), limits, limits_file=None if limits else self.limits_file,
@@ -857,26 +1191,35 @@ class _Run:
                 self._leave(c, purchases_stopped)
                 continue
             tag = f"{self.batch}-{sym}"
+            watch = _SubmitWatch(self.venue)
+            self._check_environment()                    # read again before every order ...
             try:
                 self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
-                rec = self.ledger.submit_once(self.venue, tag)
-            except OrdersBlocked as exc:
-                raise _Stop("send", f"the ledger refused to send {tag}: {'; '.join(exc.reasons)[:1000]}") from None
+                self._check_environment()                # ... and immediately before it is sent
+                rec = self.ledger.submit_once(watch, tag)
+            except OrdersBlocked:
+                words = "; ".join(self._ledger_words(self.ledger.orders(OPEN_STATES), {}))
+                raise _Stop("send", f"the ledger refused to send {tag}: {words}"[:1000]) from None
             except (OrderError, sqlite3.Error) as exc:
-                raise _Stop("send", f"order {tag} could not be recorded or sent: {_describe(exc)}; the next run's "
+                raise _Stop("send", f"order {tag} could not be recorded or sent: {_local_error(exc)}; the next run's "
                                     "reconcile settles it") from None
-            outcome = rec["state"]
+            outcome = rec["state"] if rec.get("state") in STATES else "unknown"
             self.state.note_outcome(tag, outcome)
             if outcome == "refused":
-                self._refuse(c, "venue", rec.get("note") or "refused", tag=tag)
+                why = f"the venue did not take it: {_venue_error(watch.error)}" if watch.error is not None else "the venue did not take it"
+                self._refuse(c, "venue", why, tag=tag)
                 continue
             if outcome != "accepted":
-                self._write({"event": "unknown", "tag": tag, "symbol": sym, "units": units, "state": outcome,
-                             "note": rec.get("note")})
-                raise _Stop("send", f"the outcome of order {tag} ({sym} {units:+g}) is {outcome}: "
-                                    f"{(rec.get('note') or 'no answer')[:MAX_TEXT]}; nothing more is sent until a reconcile "
-                                    "settles it")
+                if watch.error is not None:
+                    why = f"the venue's call raised {_venue_error(watch.error)}"
+                elif watch.called:
+                    why = f"the venue answered {_status_word(watch.answer)}, not 'accepted'"
+                else:
+                    why = "the venue was not called"
+                self._write({"event": "unknown", "tag": tag, "symbol": sym, "units": units, "state": outcome, "reason": why})
+                raise _Stop("send", f"the outcome of order {tag} ({sym} {units:+g}) is {outcome}: {why}; nothing more is "
+                                    "sent until a reconcile settles it")
             sent_today += 1
             spent += cost
             if units > 0 and owned_here <= UNITS_EPS:
@@ -911,7 +1254,7 @@ class _Run:
                    "orders_sent": len(self.sent), "sent": self.sent, "refused": self.refused, "left_over": self.left_over,
                    "skipped": self.skipped, "cancels": self.cancels, "filled_so_far": mine, "fills_journaled": self.fills_journaled,
                    "broker_equity": self.broker_equity if _finite(self.broker_equity) else None,
-                   "paper_equity": self.paper_equity, "gaps": gaps}
+                   "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines}
         try:
             if status == "stopped":
                 self._write({"event": "stopped", "stage": stage, "reason": reason})
