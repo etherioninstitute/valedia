@@ -38,7 +38,9 @@ Any failure in steps 1 to 6 means no order is sent in this run; the reason is jo
    time, from the exchange calendar; half-days end earlier).
 3. **Baseline.** If no baseline is recorded and the ledger has no orders, record the account's positions as
    the baseline. If no baseline is recorded and the ledger has orders, stop.
-4. **Reconcile.** `ledger.reconcile(venue, baseline + broker book)`. Then cancel every order of this ledger
+4. **Reconcile.** `ledger.reconcile(venue, baseline + fills already applied)`: the positions expected at the
+   broker are the baseline plus the fills this step has journaled and marked applied, not the whole broker
+   book. Then cancel every order of this ledger
    that is still open at the broker, and reconcile again. Journal every new fill once (by fill id) and mark it
    applied. If `ledger.blocked()` still gives a reason, stop.
 5. **Targets.** For each symbol: paper units wanted (each strategy's holding plus its pending orders, summed)
@@ -55,8 +57,8 @@ Any failure in steps 1 to 6 means no order is sent in this run; the reason is jo
 9. **Order of sending and caps.** Sales first, then purchases, largest value first. Purchases stop when cash
    (as the venue reports it, less 1%) would be exceeded. No more than `max_orders_per_day` orders are sent in
    one day across runs (from the risk file if present, else 40); what is left over is journaled, not queued.
-10. **Send.** Each order is a day limit order: purchases at the quote plus 1%, sales at the quote less 1%
-    (less 2% when the sale reduces risk), rounded to the cent on the cautious side. `ledger.intend` with the
+10. **Send.** Each order is a day limit order: purchases at the quote plus 1% (rounded
+    down to the cent), every sale at the quote less 2% (rounded up to the cent). `ledger.intend` with the
     strategies' parts, then `ledger.submit_once` with `not_sent=(NotTransmitted, OrderRejected)`. A refusal is
     journaled and the run goes on; an unknown outcome stops the run (the ledger blocks).
 11. **After.** Reconcile once more, journal fills, write a summary: orders sent, refused, filled so far,
