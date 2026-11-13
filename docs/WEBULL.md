@@ -130,16 +130,34 @@ cancelled; the account ended with no open order and no holding):
   the order then reads as cancelled. A tag never sent cancels as `no such order` and, with the option on, reads as
   no order at all.
 - The same order sent twice is one order at Webull.
-- Not seen yet: the answer `not yet` to a cancel, a fill, fees.
+- Not seen yet: the answer `not yet` to a cancel.
+
+## Fills, fees and the first order-step run (paper account, the open of 2026-11-13)
+
+- **Fills.** A market order for 1 SPY read as pending or submitted for up to a second and as filled within 0.5 to
+  4 seconds, with an average price. The holding showed in the positions answer within seconds.
+- **Fees.** A purchase carries no fee (an empty list; the adapter reports none). A sale carries a list of three
+  fee entries as soon as it is filled; the adapter reported 0.03 dollars on a sale of 1 SPY at 754.18, unchanged
+  a minute later.
+- **Quantities.** Up to 5 decimals (a sixth is refused, `OPENAPI_FRACT_QTY_SCALE_LESS_5`). A limit order for less
+  than one share is refused unless it is marketable (`OPENAPI_FRACT_NO_MKT_LMT_QTY_GREAT_1`); 1.5 and 1.12345
+  shares were accepted as limit orders; a market order for 0.5 filled.
+- **One holding, one row:** two fills of the same fund read as one row with the summed quantity.
+- **Selling more than held** is refused by the adapter before anything is sent.
+- **Cash after a sale.** Webull adds the proceeds to `cash` and `buying_power` at once; `settled_cash` does not
+  rise the same day (and a purchase lowers it at once). The order step spends against `cash`. In a cash account
+  that allows buying with unsettled proceeds; before live trading it must spend against settled cash (roadmap 4.8).
+- **The order step, end to end.** At 09:55 New York it read the paper book (one strategy), took minute quotes
+  from the price source (not from Webull), passed the risk gate, and sent two day limit orders through the order
+  ledger: 146 XLE (quote 64.54, limit 65.18) and 43 XLK (quote 170.97, limit 172.67). A second run three minutes
+  later found both filled (64.55 and 170.89), journaled each fill once, saw no gap left and sent nothing.
 
 ## Still to observe there, because Webull does not document them
 
-- a fill: how soon it shows, how fees arrive, what a holding row looks like (a one-share buy and sell is set to run at the next open);
-- fractional quantities in the regular session;
 - the same checks on the live side before any real order (the paper side may not behave identically);
-- the quantity step for stocks and the price steps;
-- whether one holding is ever split over several rows, and whether every row carries its instrument type;
-- how far its open-order and position answers lag behind fills, and how late fees arrive;
+- the price steps;
+- whether every holding row carries its instrument type;
+- a sale and a partial fill through the order step, a cancel answered `not yet`, a day order left unfilled at the close;
 - whether any answer repeats a key.
 
 ## Real money
