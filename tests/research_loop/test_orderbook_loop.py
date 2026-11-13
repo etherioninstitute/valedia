@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from email.utils import formatdate
 import inspect
+import math
 
 import pytest
 
@@ -1929,7 +1930,7 @@ def test_a_date_header_more_than_30_seconds_off_stops_the_storing_until_it_agree
         per.append(len(world.urls) - before)
     assert not col.synced and per == [1] * 7     # the read that disagreed, then one cheap request a minute
     assert store.conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == snaps   # that read thrown away
-    world.date_offset = -29.0
+    world.date_offset = -19.0                                   # rev 8: back in sync only within 20 s
     true.t = T0 + 12 * 60 + 0.5
     col.cycle()
     kinds = [k for (k,) in store.conn.execute("SELECT kind FROM events ORDER BY id")]
@@ -2109,8 +2110,11 @@ def test_with_the_clock_within_the_threshold_no_trade_is_lost_over_a_day(tmp_pat
     col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2)
     minutes = 1440
 
-    def offset(i):
-        return -a + 2 * a * i / minutes if off == "drift" else off * a
+    def offset(i):                                              # rev 8: it starts right (entry needs 20 s) and
+        b = a - 1                                               # moves 1 s a minute to its place; 29 s, as the
+        if off == "drift":                                      # middle of a Date's second is what is judged
+            return -min(i, b) if i <= b else -b + 2 * b * (i - b) / (minutes - b)
+        return math.copysign(min(abs(off * b), i), off)
     n = 0
     for i in range(0, minutes + 1):
         for m in world.markets:
@@ -2266,3 +2270,181 @@ def test_clock_off_and_on_carry_both_times_and_clock_on_waits_for_a_writable_sto
     assert kinds.count("clock_on") == 1 and kinds.index("clock_on") < kinds.index("gap", kinds.index("clock_off"))
     on = json.loads(store.conn.execute("SELECT detail_json FROM events WHERE kind = 'clock_on'").fetchone()[0])
     assert abs(on["clock_ts"] - on["date_ts"]) <= 1.5 and on["clock_ts"] < T0 + 7 * 60
+
+
+
+# ================================================================= rev 8: trades after any outage; agreement edges
+
+def outage_run(tmp_path, kind, minutes, in_pause):
+    """Two watched markets trading all along (tape lag up to a minute). At 06:40 either an outage begins, or
+    failed book reads make the five-failure pause and the outage begins in it at 06:43. `kind`: "network" (every
+    request fails), "sleep" (the machine sleeps: both clocks stop), "step" (the clock steps an hour back until it
+    is set right) or "restart" (the process stops and a new one starts on the same record)."""
+    import random
+    rnd = random.Random(19)
+    mono = {}
+
+    def make(true):
+        mono["m"] = Mono(true)
+        return mono["m"]
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=2, mono=make)
+    begin = 43 if in_pause else 40
+    stop = begin + minutes
+    last = stop + 40
+    n = 0
+    for i in range(0, last + 1):
+        for m in world.markets:
+            for _ in range(2):
+                n += 1
+                world.trade(m["ticker"], n, T0 + 60 * (i - 1) + rnd.uniform(0, 60), lag=rnd.uniform(0, ol.TAPE_LAG_S))
+    col.start()
+    i = 0
+    while i <= last:
+        if in_pause and i == 40:
+            world.fail_paths = {"/markets/%s/orderbook" % m["ticker"] for m in world.markets}
+        if i == begin:
+            assert col.paused() or not in_pause                 # the outage begins in the pause
+            world.fail_paths = set()
+            if kind == "network":
+                world.fail = True
+            elif kind == "step":
+                skew.offset = -3600.0
+        if i == stop:
+            world.fail, skew.offset = False, 0.0
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        col.cycle()
+        if i == begin and kind == "sleep":
+            true.t += minutes * 60
+            mono["m"].slept += minutes * 60
+            i = stop
+        elif i == begin and kind == "restart":
+            true.t += minutes * 60
+            kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono["m"], tries=1)
+            col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+                                 monotonic=mono["m"])
+            i = stop
+            true.t = max(true.t, T0 + 60 * i + 0.5)
+            col.start()
+        i += 1
+    return col, world, store, true
+
+
+def trades_missing(world, store, true):
+    stored = {r[0] for r in store.conn.execute("SELECT trade_id FROM trades")}
+    return {r["trade_id"]: kd.iso_to_ts(r["created_time"]) for v in world.tape.values() for r in v
+            if kd.iso_to_ts(r["created_time"]) >= T0 + 2 and r["_on_tape"] <= true.t - 61 and r["trade_id"] not in stored}
+
+
+OUTAGES = [("network", 65, True), ("network", 120, True), ("network", 780, True),
+           ("network", 65, False), ("network", 120, False), ("network", 780, False),
+           ("sleep", 120, True), ("step", 120, True), ("restart", 180, False)]
+
+
+@pytest.mark.parametrize("kind,minutes,in_pause", OUTAGES,
+                         ids=["%s-%dm-%s" % (k, m, "in_pause" if p else "outside") for k, m, p in OUTAGES])
+def test_after_any_outage_the_trades_are_caught_up(tmp_path, kind, minutes, in_pause):
+    col, world, store, true = outage_run(tmp_path, kind, minutes, in_pause)
+    assert col.synced and len(col.watched()) == 2
+    assert trades_missing(world, store, true) == {}
+    assert "trades_lost" not in event_kinds(store)
+
+
+@pytest.mark.parametrize("minutes,lost", [(23 * 60 + 30, False), (24 * 60 + 30, True)])
+def test_a_trades_lost_event_exactly_when_the_hole_is_over_24_hours(tmp_path, minutes, lost):
+    col, world, store, true = outage_run(tmp_path, "network", minutes, True)
+    events = [json.loads(d) for (d,) in store.conn.execute("SELECT detail_json FROM events WHERE kind = 'trades_lost'")]
+    missing = trades_missing(world, store, true)
+    if not lost:
+        assert events == [] and missing == {}
+    else:
+        assert len(events) == 2 and missing
+        to = min(e["to_ts"] for e in events)
+        assert all(ts < to for ts in missing.values())          # only what lies beyond the 24 hours
+
+
+# ---------------------------------------------------------------- outcome 2: agreement does not grow with the request
+
+@pytest.mark.parametrize("took", [0.0, 1.0, 2.5, 4.9, 5.5, 7.5, 10.0])
+def test_no_row_is_stored_with_the_clock_more_than_33_seconds_off_whatever_the_request_time(tmp_path, took):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=1)
+    world.request_delay = took
+    path = list(range(0, 46)) + list(range(44, -46, -1)) + list(range(-44, 1))   # 1 s a minute, no step
+    col.start()
+    for i, off in enumerate(path):
+        skew.offset = float(off)
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        col.cycle()
+    kept = ("snapshots", "trades", "decisions", "heartbeats")
+    offs = [abs(off) for table, _, off in rec.writes if table in kept]
+    assert all(o <= 33 for o in offs)
+    if took <= ol.DATE_MAX_TOOK_S:
+        assert max(offs) >= 28 and col.synced                   # it does work up to near the edge, and returns
+    else:
+        assert offs == []                                       # no answer that slow confirms the clock
+
+
+def test_a_clock_31_seconds_off_leaves_once_and_returns_only_within_20_seconds(tmp_path):
+    col, world, model, store, rec, true, skew = sync_rig(tmp_path, n=1)
+    path = list(range(0, 32)) + [31] * 10 + list(range(30, 20, -1)) + [21] * 10 + [19] * 3
+    col.start()
+    for i, off in enumerate(path):
+        skew.offset = float(off)
+        true.t = max(true.t, T0 + 60 * i + 0.5)
+        col.cycle()
+        if off > 20 and i > 31:
+            assert "clock_on" not in event_kinds(store)
+    kinds = event_kinds(store)
+    assert kinds.count("clock_off") == 1 and kinds.count("clock_on") == 1 and col.synced
+    on = store.conn.execute("SELECT ts FROM events WHERE kind = 'clock_on'").fetchone()[0]
+    assert on - skew.log[on] == pytest.approx(19.0)
+
+
+# ---------------------------------------------------------------- outcome 3: three small things
+
+def test_a_minute_a_cycle_runs_right_through_still_gets_its_heartbeat(tmp_path):
+    col, world, model, store, clock = started(tmp_path, n=5)
+    run_minutes(col, clock, 1, 40)
+    for m in world.markets:                                     # Kalshi slow: the cycle takes over a minute
+        world.book_delay[m["ticker"]] = 14.0
+    clock.t = T0 + 41 * 60 + 50
+    col.cycle()
+    assert clock.t > T0 + 43 * 60
+    beats = {int((ts - T0) // 60) for (ts,) in store.conn.execute("SELECT ts FROM heartbeats")}
+    assert 42 in beats and 43 in beats
+    row = ol.day_status(store, clock.t)[0]
+    _, _, watched = independent_status(store, clock.t)
+    assert row["watched_minutes"] == pytest.approx(watched["2026-11-13"])
+
+
+def test_a_clock_off_the_store_could_not_take_is_written_when_it_can_and_before_clock_on(tmp_path):
+    for later in (True, False):                                 # writable while still off, or only once it agrees
+        col, world, model, store, rec, true, skew = sync_rig(tmp_path / str(later), n=2)
+        col.start()
+        for i in range(0, 5):
+            true.t = T0 + 60 * i + 0.5
+            col.cycle()
+        store.conn.execute("PRAGMA query_only = 1")
+        world.date_offset = -100.0
+        true.t = T0 + 5 * 60 + 0.5
+        col.cycle()
+        assert not col.synced and "clock_off" not in event_kinds(store)
+        true.t = T0 + 6 * 60 + 0.5
+        col.cycle()
+        if later:
+            store.conn.execute("PRAGMA query_only = 0")
+            true.t = T0 + 7 * 60 + 0.5
+            col.cycle()
+            assert event_kinds(store)[-1] == "clock_off" and not col.synced
+        store.conn.execute("PRAGMA query_only = 0")
+        world.date_offset = 0.0
+        true.t = T0 + 8 * 60 + 0.5
+        col.cycle()
+        kinds = event_kinds(store)
+        assert col.synced and kinds.count("clock_off") == 1 and kinds.index("clock_off") < kinds.index("clock_on")
+        off = json.loads(store.conn.execute("SELECT detail_json FROM events WHERE kind = 'clock_off'").fetchone()[0])
+        assert int((off["clock_ts"] - T0) // 60) == 5           # placed where it happened
+
+
+def test_the_docstring_no_longer_says_a_pause_makes_no_request_or_most_slots_are_late_at_0_9_s():
+    doc = " ".join(ol.__doc__.split())
+    assert "makes no request for five minutes" not in doc and "0.9 s a request and more" not in doc
