@@ -369,3 +369,24 @@ def test_the_ranking_range_does_not_depend_on_the_order_the_rows_were_stored():
     a, b = tm.scores(forward, min_settled=30)[0], tm.scores(backward, min_settled=30)[0]
     assert (a["ranking"], a["ranking_low"], a["ranking_high"]) == (b["ranking"], b["ranking_low"], b["ranking_high"])
     forward.close(), backward.close()
+
+
+def test_a_timid_but_informative_forecaster_is_rescaled_as_far_as_it_needs():
+    from scipy.optimize import minimize
+    from scipy.special import expit, logit
+    n = 240
+    outcomes = _mixed(n, seed=6)
+    rng = np.random.default_rng(9)
+    wrong = rng.random(n) < 0.2                                      # one forecast in five on the wrong side: not separable
+    led = _filled({"timid": lambda y, k: 0.52 if (y == 1) != bool(wrong[k]) else 0.48}, outcomes)
+    s = tm.scores(led, min_settled=30)[0]
+    p, y = np.array([0.52 if (o == 1) != bool(w) else 0.48 for o, w in zip(outcomes, wrong)]), np.array(outcomes, dtype=float)
+    early, late = slice(0, n // 2), slice(n // 2, n)                 # one question a week: the median date splits in half
+    x = logit(np.clip(p[early], 0.01, 0.99))
+    loss = lambda ab: float(np.mean(np.logaddexp(0.0, ab[0] + ab[1] * x) - y[early] * (ab[0] + ab[1] * x)))
+    a, b = minimize(loss, x0=np.array([0.0, 1.0]), method="BFGS", options={"gtol": 1e-10}).x
+    q = expit(a + b * logit(np.clip(p[late], 0.01, 0.99)))
+    assert b > 10                                                    # a slope the old cap of 10 would have refused
+    assert s["rescaled_skill"] == pytest.approx(1.0 - np.mean((q - y[late]) ** 2) / np.mean((0.5 - y[late]) ** 2), abs=5e-4)
+    assert s["rescaled_skill"] > 0 and s["rescaled_settled"] == n // 2
+    led.close()

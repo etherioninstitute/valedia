@@ -282,8 +282,9 @@ def _log_odds(p: np.ndarray) -> np.ndarray:
 def _rescaled(rows: list[dict], min_settled: int) -> dict:
     """Fit q = sigmoid(a + b * logit(p)) by log loss on the earlier half of the questions (split at the median
     distinct ask date, a date never straddling the split), then score the later half with it. The slope b is held
-    between 0 and 10 and the shift a between -10 and 10: a forecaster that is reliably wrong-way is rescaled to a
-    constant, not credited, and a perfectly separable earlier half still has a finite fit. Empty (None) when
+    between 0 and 100 and the shift a between -500 and 500: a forecaster that is reliably wrong-way is rescaled to
+    a constant, not credited, a timid one (forecasts within 0.02 of one half) gets the large slope it needs, and a
+    perfectly separable earlier half still has a finite fit. Empty (None) when
     either half has fewer than `min_settled` rows or the earlier half has only one outcome."""
     empty = {"rescaled_brier": None, "rescaled_baseline_brier": None, "rescaled_skill": None, "rescaled_t_by_week": None,
              "rescaled_settled": None}
@@ -300,7 +301,8 @@ def _rescaled(rows: list[dict], min_settled: int) -> dict:
     def log_loss(ab):
         z = ab[0] + ab[1] * xe
         return float(np.mean(np.logaddexp(0.0, z) - ye * z))          # -[y log q + (1-y) log(1-q)], q = sigmoid(z)
-    a, b = minimize(log_loss, x0=np.array([0.0, 1.0]), method="L-BFGS-B", bounds=[(-10.0, 10.0), (0.0, 10.0)]).x
+    a, b = minimize(log_loss, x0=np.array([0.0, 1.0]), method="L-BFGS-B", bounds=[(-500.0, 500.0), (0.0, 100.0)],
+                  options={"ftol": 1e-12, "gtol": 1e-10, "maxiter": 1000}).x
     pl, yl, bl = (np.array([r[k] for r in late], dtype=float) for k in ("probability", "outcome", "baseline"))
     mine, base = (expit(a + b * _log_odds(pl)) - yl) ** 2, (bl - yl) ** 2
     t, _ = _t_by_week(late, mine - base)
