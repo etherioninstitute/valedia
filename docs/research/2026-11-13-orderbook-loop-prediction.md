@@ -115,3 +115,8 @@ Nothing has been collected into the research record and no answer has been compa
 5. A shakedown run of the previous revision against the live feed (about an hour, into a scratch file that is
    not part of the record: 20 markets, every decision slot collected, no failed request) was made first.
    Nothing from it is used.
+6. **Collector replaced on 2026-11-13 at 16:32 UTC, before the first development day.** Commit 9332c6c took
+   over the same record at a restart (a stop and a start in the same second, both in the store). It closes the
+   two gaps of note 2: a blind check found no trade neither stored nor marked as lost in 200 generated
+   sequences, and decisions identical to the previous revision's wherever there was no gap (4,658 compared).
+   The rule of note 3 stays in force all the same.
