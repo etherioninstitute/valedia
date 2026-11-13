@@ -16,7 +16,7 @@ from valedia_trader.core import secrets as s
 
 LAUNCHERS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
 ASYNC_LAUNCHERS = {"create_subprocess_exec", "create_subprocess_shell"}
-REAL_LAUNCHES = 11                                  # launches in the package today, every one with env=child_env(...)
+REAL_LAUNCHES = 13                                  # launches in the package today, every one with env=child_env(...)
 PACKAGE = Path(valedia_trader.__file__).resolve().parent
 
 
