@@ -159,3 +159,7 @@ strict side: every one can only remove picks, never add them.
     written wholly in capitals no word counts as a code" applies only when the selection holds at least one
     word besides team codes and the bet's own markers (ML, a line, over or under, numbers). "LAL ML" and
     "BOS -4.5" are codes; "IND STRONG ML" is not.
+21. **When the test is scored (same day, before any result).** If the test ends by date, threads dated up to
+    2027-03-31 count and the scoring is made on or after 2027-04-04, when their games have results. If it ends
+    by the counts, the scoring is made three days or more after the last counted thread's date. A league's
+    table of team codes is complete only if every listed game gave two readable codes.
