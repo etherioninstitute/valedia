@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -185,10 +186,8 @@ def latch_on(w): (w.root / "journal" / "kill_switch.json").write_text("{}")
 def latch_off(w): (w.root / "journal" / "kill_switch.json").unlink()
 def order_on(w): w.unknown_order()
 def order_off(w): w.settle_order()
-def step_on(w):
-    w.step_n = getattr(w, "step_n", 0) + 1
-    w.write_step("stopped", "reconcile", "the ledger, the state file or the journal failed", day=f"2026-11-{10 + 2 * w.step_n}")
-def step_off(w): w.write_step("ok", day=f"2026-11-{11 + 2 * w.step_n}")
+def step_on(w): w.write_step("stopped", "reconcile", "the ledger, the state file or the journal failed")    # today, in New York
+def step_off(w): w.write_step("done")                                     # a later run of the same day that ended done
 def job_gone_on(w): w.jobs = [j for j in w.jobs if j[2] != LABELS[2]]
 def job_gone_off(w): w.jobs = list(HEALTHY_JOBS)
 def job_exit_on(w): w.jobs = [("-", "78", LABELS[3]) if j[2] == LABELS[3] else j for j in w.jobs]
@@ -308,17 +307,16 @@ def test_every_other_stop_still_raises(world, stage, reason):
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
 
 
-def test_an_ordinary_stop_after_a_real_one_clears_the_alert(world):
-    world.write_step("stopped", "send", "the venue refused the session", day="2026-11-12")
+def test_an_ordinary_stop_after_a_real_one_does_not_clear_the_alert(world):
+    world.write_step("stopped", "send", "the venue refused the session")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
-    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)",
-                     day="2026-11-13")
-    assert [c.key for c in watch(world).cleared] == ["step-stopped:webull-sandbox"]
+    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)")
+    assert watch(world).cleared == []
 
 
 def test_only_the_last_summary_of_the_day_decides(world):
     world.write_step("stopped", "environment", "the clock is wrong")
-    world.write_step("ok")                                         # a later run the same day went through
+    world.write_step("done")                                       # a later run the same day went through
     assert watch(world).raised == []
     world.write_step("stopped", "send", "the venue refused the session")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
@@ -326,7 +324,7 @@ def test_only_the_last_summary_of_the_day_decides(world):
 
 def test_two_venues_are_watched_apart(world):
     world.write_step("stopped", "send", "busy", venue="webull-sandbox")
-    world.write_step("ok", venue="other-venue")
+    world.write_step("done", venue="other-venue")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
 
 
@@ -1380,13 +1378,13 @@ def write_practice(w, mode, status, stage=None, reason=None, day="2026-11-13", v
 
 
 def test_a_propose_that_ended_done_never_clears_a_stop_of_the_unattended_run(world):
-    world.write_step("stopped", "send", "the venue refused", day="2026-11-12")
+    world.write_step("stopped", "send", "the venue refused", day="2026-11-13")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
     write_practice(world, "propose", "done", day="2026-11-13")
     write_practice(world, "approve", "done", day="2026-11-13")
     r = watch(world)
     assert r.cleared == [] and [a["key"] for a in r.open] == ["step-stopped:webull-sandbox"]
-    world.write_step("ok", day="2026-11-14")                           # only an unattended run can clear it
+    world.write_step("done", day="2026-11-13")                         # only an unattended run can clear it
     assert [c.key for c in watch(world).cleared] == ["step-stopped:webull-sandbox"]
 
 
@@ -1543,7 +1541,7 @@ def test_only_the_two_exact_words_are_practice_runs_and_no_key_is_the_unattended
 
 @pytest.mark.parametrize("odd", ODD_MODES, ids=repr)
 def test_a_summary_with_an_unknown_mode_is_neither_never_clears_never_counts_and_raises_one_warning_a_day(world, odd):
-    world.write_step("stopped", "send", "the venue refused", day="2026-11-12")
+    world.write_step("stopped", "send", "the venue refused", day="2026-11-13")
     assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
     write_mode(world, odd)                                                                      # a summary that is neither
     r = watch(world)
@@ -1666,3 +1664,553 @@ def test_an_id_after_the_end_of_a_clause_does_not_borrow_the_keyword_of_the_one_
     for text, want in ((f"the order was refused, then {id_} came", "the order was refused, then …7a8b came"),
                        (f"order x; order {id_}", "order x; order …7a8b"), (f"order. order {id_}", "order. order …7a8b")):
         assert al.clean(text) == want, text
+
+
+# =====================================================================================================================
+# rev 5: the cleaning, done once and in the right order; a stop of the unattended run is never hidden
+# =====================================================================================================================
+
+# The cleaning of revisions 2 (8d166e5) and 3 (6f02ec1), their own code as it was committed (`git show <rev>:valedia_trader/
+# core/alerts.py`, the digit rules and the text section, copied unchanged), run over this process's guard: what they masked is
+# what the candidate may never show.
+REV2_RULES = r'''
+_LONG_DIGITS = re.compile(r"(?<!\d)\d{9,}(?!\d)")
+_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{3,}(?:[ -]\d{3,}){2,}(?!\d)")
+
+_LEDGER_TAG = re.compile(r"(?<![A-Za-z0-9])os-\d{8}-\d{6}-([A-Za-z0-9]{4,})-([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)")
+_ID_TOKEN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.\-]*[A-Za-z0-9])?")
+_CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")                # clientOrderId reads as client Order Id
+_ID_WORDS = r"(?:orders?|ids?|tags?|client)"
+_ID_CONTEXT = re.compile(rf"(?i)(?<![a-z]){_ID_WORDS}(?![a-z])[^A-Za-z0-9]*(?:(?:orders?|ids?|tags?|number|no)(?![a-z])[^A-Za-z0-9]*)*$")
+
+
+def hide_order_ids(text: str) -> str:
+    """An order id is shown by its last 4 characters only. A ledger tag (`os-20261113-143501-a1b2c3-XLE`) becomes `…b2c3-XLE`
+    (the last 4 characters of its random part, then its fund). Any other id, a run of 8 or more letters, digits, `_`, `-`
+    and `.` (with a digit in it, or 16 or more plain letters) that follows the word order, id, tag or client, becomes `…`
+    and its last 4 characters."""
+    t = _LEDGER_TAG.sub(lambda m: f"…{m.group(1)[-4:]}-{m.group(2)}", text)
+    out, last = [], 0
+    for m in _ID_TOKEN.finditer(t):
+        tok = m.group(0)
+        if (len(tok) >= 8 and not tok.isdigit() and (any(c.isdigit() for c in tok) or (len(tok) >= 16 and tok.isalpha()))
+                and not t[max(0, m.start() - 1):m.start()] == "…" and _ID_CONTEXT.search(_CAMEL.sub(" ", t[max(0, m.start() - 40):m.start()]))):
+            out += [t[last:m.start()], "…" + tok[-4:]]
+            last = m.end()
+    return "".join(out) + t[last:]
+
+
+def _unseen_out(text: str) -> str:
+    """Format characters (Cf: direction overrides and marks, zero-width characters) and control characters (Cc) are dropped,
+    and a line break, tab or separator is a space: nothing in a text can reorder or hide what is around it."""
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if ch in "\n\r\t" or cat in ("Zl", "Zp"):
+            out.append(" ")
+        elif cat not in ("Cf", "Cc", "Cs"):
+            out.append(ch)
+    return "".join(out)
+
+
+def clean(text, limit: int = 300) -> str:
+    """One line of text that is safe to show or write: format and control characters dropped, a remembered secret replaced by
+    the package's own guard, an order id cut to its last 4 characters, any run of 9 or more digits (an account number) or
+    digit groups written together replaced, and no more than `limit` characters."""
+    t, _ = redact(_unseen_out(str(text)))
+    t = hide_order_ids(t)
+    t = _GROUPED_DIGITS.sub("<number>", t)
+    t = _LONG_DIGITS.sub("<number>", t)
+    t = " ".join(t.split())
+    return t if len(t) <= limit else t[:limit - 1] + "…"
+'''
+REV3_RULES = r'''
+_LONG_DIGITS = re.compile(r"(?<!\d)(?<!\d\.)\d{9,}(?!\d)(?!\.\d)")          # a number with a decimal point is a price, not an account
+_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{4}(?:[ -]\d{4}){2,}(?!\d)")          # card-style: 3 or more groups of exactly four
+
+_RANDOM = r"[0-9A-Fa-f]{6}"
+_FUND = r"[A-Z0-9]+(?:[.\-][A-Z0-9]+)*"
+_OUR_TAG = re.compile(rf"(?<![A-Za-z0-9])os-\d{{8}}-\d{{6}}-({_RANDOM})(?:-({_FUND}))?(?![A-Za-z0-9])")
+_ID_TOKEN = re.compile(r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]+(?![A-Za-z0-9_\-])")
+_CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")                # clientOrderId reads as client Order Id
+_ID_KEYWORD = re.compile(r"(?i)(?<![a-z])(?:orders?|ids?|refs?|tags?|client)(?![a-z])")
+_CLAUSE_END = re.compile(r"(?:;|\.\s)")
+_DATEISH = re.compile(r"\d{4}-\d\d-\d\d(?:T\d\d)?|\d{8}(?:T\d{0,6}Z?)?|\d{8}-\d{6}")
+ID_MIN = 12
+
+
+def _is_id(tok: str) -> bool:
+    """A run of 12 or more letters and digits (`_` and `-` may join them) holding a digit: not a date or time, not a Kalshi ticker."""
+    return (len(tok) >= ID_MIN and any(c.isdigit() for c in tok) and not tok.isdigit() and not _DATEISH.fullmatch(tok)
+            and not (tok.startswith("KX") and tok == tok.upper()))
+
+
+def hide_order_ids(text: str) -> str:
+    """An order id is shown by its last 4 characters only. Our own ledger tag (`os-20261113-143501-a1b2c3-XLE`) and batch id
+    (`os-20261113-143501-a1b2c3`) are shortened wherever they stand (`…b2c3-XLE`, `…b2c3`: the last 4 of the random part, then
+    the fund). Any other id, a run of 12 or more letters and digits with a digit in it and no dot (`_` and `-` may join its
+    parts), that follows one of the words order, orders, id, ids, ref, tag or client anywhere in the same clause (lists and
+    `id is X` included) becomes `…` and its last 4 characters. Dates and times, numbers with a decimal point, file names, version
+    strings, Kalshi tickers (upper case, beginning KX), funds, prices and counts are never shortened."""
+    t = _OUR_TAG.sub(lambda m: "…" + m.group(1)[-4:] + (f"-{m.group(2)}" if m.group(2) else ""), text)
+    out, last = [], 0
+    for m in _ID_TOKEN.finditer(t):
+        tok = m.group(0)
+        if not _is_id(tok) or t[max(0, m.start() - 1):m.start()] == "…":
+            continue
+        if m.end() < len(t) and t[m.end()] == "." and m.end() + 1 < len(t) and t[m.end() + 1].isalnum():
+            continue                                                     # inside a dotted name: a file, a version, a host
+        starts = [c.end() for c in _CLAUSE_END.finditer(t, 0, m.start())]
+        clause = _CAMEL.sub(" ", t[(starts[-1] if starts else 0):m.start()])
+        if _ID_KEYWORD.search(clause):
+            out += [t[last:m.start()], "…" + tok[-4:]]
+            last = m.end()
+    return "".join(out) + t[last:]
+
+
+def _unseen_out(text: str) -> str:
+    """Format characters (Cf: direction overrides and marks, zero-width characters) and control characters (Cc) are dropped,
+    and a line break, tab or separator is a space: nothing in a text can reorder or hide what is around it."""
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if ch in "\n\r\t" or cat in ("Zl", "Zp"):
+            out.append(" ")
+        elif cat not in ("Cf", "Cc", "Cs"):
+            out.append(ch)
+    return "".join(out)
+
+
+def clean(text, limit: int = 300) -> str:
+    """One line of text that is safe to show or write: format and control characters dropped, a remembered secret replaced by
+    the package's own guard, an order id cut to its last 4 characters, any run of 9 or more digits (an account number) or
+    digit groups written together replaced, and no more than `limit` characters."""
+    t, _ = redact(_unseen_out(str(text)))
+    t = hide_order_ids(t)
+    t = _GROUPED_DIGITS.sub("<number>", t)
+    t = _LONG_DIGITS.sub("<number>", t)
+    t = " ".join(t.split())
+    return t if len(t) <= limit else t[:limit - 1] + "…"
+'''
+
+
+def earlier_clean(source, name):
+    ns = {"re": re, "unicodedata": unicodedata, "redact": s.redact, "__name__": name}
+    exec(compile(source, name, "exec"), ns)
+    return ns["clean"]
+
+
+REV2_CLEAN, REV3_CLEAN = earlier_clean(REV2_RULES, "rev2"), earlier_clean(REV3_RULES, "rev3")
+UNLIMITED = 10 ** 7
+LIMITS = (40, 80, 120, 300)
+FILLER = "ee eee e eeee ee e eee eeeee "                       # only the letter e: any other character shown came from a value
+PLANT = {   # what is put in a text, and what may show of it: the placeholder of its mask, or what the earlier revisions showed
+    "account": ("987654321098", []),
+    "account in fours": ("9876 5432 1098", []),
+    "account in threes": ("987-654-321-098", []),
+    "long digit run": ("98765432109876543", []),
+    "ledger tag": ("os-20261113-143501-a1b2c3-XLE", ["…b2c3-XLE"]),
+    "batch id": ("os-20261113-143501-a1b2c3", ["…b2c3"]),
+    "id after a word": ("order QZ7XK9VW3JQ8RT", ["order", "…Q8RT"]),
+    "short id after a word": ("order QZ7XK9VW", ["order", "…K9VW"]),
+    "key": (TRADING["BROKER_API_KEY"], []),
+    "secret in capitals": (TRADING["BROKER_API_SECRET"].upper(), []),
+    "recovery phrase": (PHRASE, []),
+    "phrase on lines": ("\n  ".join(PHRASE.split()), []),
+}
+MASKS = ["<secret>", "<number>"]
+
+
+def beyond_masks(out, allowed):
+    """What `out` shows besides the filler, the masks and the allowed placeholders (and, at a cut, the start of one of them)."""
+    body = out[:-1] if out.endswith("…") else out
+    places = sorted(allowed + MASKS, key=len, reverse=True)
+    for p in places:
+        body = body.replace(p, " ")
+    if out.endswith("…"):
+        for p in places:
+            cut = next((k for k in range(len(p) - 1, 0, -1) if body.endswith(p[:k])), 0)
+            if cut:
+                body = body[:-cut]
+                break
+    return body.replace("e", "").replace(" ", "")
+
+
+@pytest.fixture
+def registered(world, trading_file):
+    al.register_trading_file(world.env())
+    return world
+
+
+@pytest.mark.parametrize("name", sorted(PLANT))
+def test_a_value_slid_across_the_length_limit_never_shows_a_part_at_any_limit(registered, name):
+    value, allowed = PLANT[name]
+    for limit in LIMITS:
+        for start in range(limit - 60, limit + 61):
+            lead = (FILLER * (start // len(FILLER) + 2))[:max(0, start - 1)] + " "
+            text = lead + value + " " + FILLER * 4
+            out = al.clean(text, limit)
+            assert len(out) <= limit and beyond_masks(out, allowed) == "", (name, limit, start, out[-60:])
+
+
+@pytest.mark.parametrize("name", sorted(PLANT))
+def test_a_value_slid_across_the_raw_bound_never_shows_a_part(registered, name):
+    """Padding that cleaning removes (spaces, line breaks, zero-width characters) puts the value at the front of what is shown;
+    every offset from TAIL + 50 before the raw bound to 50 after it."""
+    value, allowed = PLANT[name]
+    for limit in (120, 300):
+        raw_max = max(20 * limit, 4096)
+        for d in range(-(al.TAIL + 50), 51):
+            pad = ("\u200b" if d % 25 == 0 else "\n" if d % 2 else " ") * (raw_max + d)
+            text = pad + value + " " + FILLER * 300
+            out = al.clean(text, limit)
+            assert len(out) <= limit and beyond_masks(out, allowed) == "", (name, limit, d, out)
+            assert al.clean(out, limit) == out
+
+
+READABLE = ["2026-11-13", "2026-11-13T17:30:00Z", "17:30:00", "60.25", "1234.5", "450.00", "5 shares", "XLE", "BRK.B", "BTC-USD",
+            "report_2026.csv", "orders-20261113-143501.json", "1.2.3-rc1", "python3.12.11", "KXNBAGAME-26NOV13LALBOS-LAL",
+            "KXHIGHNY-26NOV13-T60"]
+
+
+def test_readable_things_stay_readable_wherever_the_cut_does_not_reach_them():
+    rng = random.Random(55)
+    for i in range(3000):
+        items = [rng.choice(READABLE) for _ in range(rng.randint(3, 30))]
+        words = [rng.choice(["order", "id", "tag", "client", "ref", "the", "fund", "at", "on"]) + " " + x for x in items]
+        text = rng.choice([" ", ", ", "; "]).join(words)
+        for limit in LIMITS + (UNLIMITED,):
+            out = al.clean(text, limit)
+            reach = limit - 1 - max(map(len, words)) - 2
+            pos = 0
+            for w in words:
+                end = text.index(w, pos) + len(w)
+                if end <= reach:
+                    assert w in out, (text, limit, w, out)
+                pos = end
+        assert al.clean(text, UNLIMITED) == text
+
+
+ALNUM_UP = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
+
+
+def generated(rng):
+    """A text made of words, readable things, id words, joints and planted values (each new), and the values with what of each
+    may be shown: (kind, value, what may show)."""
+    parts, planted = [], []
+    for _ in range(rng.randint(2, 16)):
+        k = rng.random()
+        if k < 0.25:
+            parts.append(rng.choice(["the venue said", "for", "and", "was refused", "is open", "filled 5 at", "fund", "shares"]))
+        elif k < 0.37:
+            parts.append(rng.choice(READABLE))
+        elif k < 0.52:
+            parts.append(rng.choice(["order", "orders", "id", "ids", "ref", "tag", "client", "Order ID:", "clientOrderId:",
+                                     "order number", "id=", "the id is", "venue_order_id=", "tag no", ";", ",", "number", "is"]))
+        elif k < 0.64:
+            while True:
+                v = "".join(rng.choice(ALNUM_UP) for _ in range(rng.randint(8, 30)))
+                if any(c.isdigit() for c in v) and not v.isdigit() and not v.startswith("KX"):
+                    break
+            parts.append(v)
+            planted.append(("id", v, v[-4:]))
+        elif k < 0.70:
+            rand = "".join(rng.choice("0123456789abcdef") for _ in range(6)) if rng.random() < 0.6 else \
+                "".join(rng.choice(ALNUM_UP) for _ in range(rng.randint(4, 9)))
+            fund = rng.choice(["", "-XLE", "-BRK.B", "-BTC-USD"])
+            v = f"os-2026{rng.randint(1, 12):02d}{rng.randint(1, 28):02d}-{rng.randint(10, 23):02d}{rng.randint(10, 59):02d}" \
+                f"{rng.randint(10, 59):02d}-{rand}{fund}"
+            parts.append(v)
+            planted.append(("tag", v, rand[-4:] + fund))
+        elif k < 0.82:
+            if rng.random() < 0.5:
+                v = "".join(rng.choice("0123456789") for _ in range(rng.randint(9, 16)))
+            else:
+                v = rng.choice([" ", "-"]).join("".join(rng.choice("0123456789") for _ in range(rng.randint(3, 4)))
+                                                for _ in range(rng.randint(3, 5)))
+            parts.append(v)
+            planted.append(("digits", v, ""))
+        else:
+            name = rng.choice(["BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID", "WALLET_MNEMONIC"])
+            if name == "WALLET_MNEMONIC":
+                words = PHRASE.split()
+                a = rng.randint(0, len(words) - 4)
+                v = spaced(rng, words[a:a + rng.randint(4, len(words) - a)])
+            else:
+                v = rng.choice([str.upper, str.lower, str])(TRADING[name])
+            parts.append(v)
+            planted.append(("secret", v, ""))
+    text, before = "", None
+    for p in parts:
+        near_readable = any(q is not None and (q in READABLE or "." in q) for q in (p, before))   # a dotted name (a fund
+        joints = [" ", " ", " ", "  ", "\n", "\t", "\u3000", ", ", "; ", ". ", "=", ": "] + ([] if near_readable else ["", "-"])
+        text += (rng.choice(joints) if text else "") + p             # like BRK.B too), a date or a ticker glued to an id is a
+                                                                      # readable name (see hide_order_ids): not compared here
+        before = p
+    return text, planted
+
+
+def hidden_core(kind, value, shown):
+    """What of a planted value an earlier revision did not show when it masked it: all of it but its last 4 for an id, all of a
+    tag but the last 4 of its random part and its fund, all of anything else."""
+    norm = " ".join(value.split())
+    if kind == "id":
+        return norm[:-4]
+    if kind == "tag":
+        return norm[:len(norm) - len(shown)]
+    return norm
+
+
+def windows(text, n=4):
+    return {text[i:i + n].lower() for i in range(len(text) - n + 1)}
+
+
+def shown_of(x, out, old, kind, value, shown):
+    """The pieces of a planted value's hidden part found in `out` that the earlier revision's output `old` does not show and the
+    text does not hold anywhere else, and at a cut, the start of it ending the text (two characters or more)."""
+    core = hidden_core(kind, value, shown).lower()
+    elsewhere = " ".join(x.replace(value, " ").split()).lower() + " " + old
+    low = out.lower()
+    found = [w for w in windows(core) if w in low and w not in elsewhere]
+    if out.endswith("…"):
+        body = low[:-1]
+        found += [core[:k] for k in range(2, len(core) + 1) if body.endswith(core[:k]) and core[:k] not in elsewhere]
+    return found
+
+
+def test_generated_texts_never_show_what_revision_2_or_3_masked_at_any_limit_and_cleaning_is_a_fixed_point(registered):
+    rng = random.Random(5005)
+    compared = hidden = 0
+    for i in range(20000):
+        x, planted = generated(rng)
+        old = {"rev 2": REV2_CLEAN(x, UNLIMITED).lower(), "rev 3": REV3_CLEAN(x, UNLIMITED).lower()}
+        masked = [(p, o) for p in planted for o in old.values() if " ".join(p[1].split()).lower() not in o]
+        compared += len(planted)
+        hidden += len(masked)
+        for limit in LIMITS + (UNLIMITED,):
+            out = al.clean(x, limit)
+            assert len(out) <= limit
+            for p, o in masked:
+                assert shown_of(x, out, o, *p) == [], (x, limit, p, out)
+            if limit != UNLIMITED:
+                assert al.clean(out, limit) == out, (x, limit, out)
+    assert compared > 50000 and hidden > 20000                     # the comparison had something to compare
+
+
+def test_a_key_is_its_own_key_form_for_generated_keys(registered):
+    rng = random.Random(77)
+    for i in range(5000):
+        x, _ = generated(rng)
+        key = al._key_part(rng.choice(["job:com.valedia.", "orders:", "step-stopped:", ""]) + x)
+        assert al._key_part(key) == key and al.Alert(key, "warning", "t", "d").key == key, (x, key)
+        assert all(c.isalnum() or c in "_.:-" for c in key) and len(key) <= 80
+
+
+@pytest.mark.parametrize("shape", ["words and ids", "padding then a value", "digits", "letters with accents", "zero-width"])
+def test_a_five_megabyte_text_is_cleaned_in_under_fifty_milliseconds(registered, shape):
+    body = {"words and ids": "the venue said order QZ7XK9VW3JQ8RT for 2026-11-13 " * 100000,
+            "padding then a value": " " * 5_000_000 + TRADING["BROKER_API_KEY"],
+            "digits": "1234567890" * 500000, "letters with accents": "é" * 5_000_000,
+            "zero-width": "\u200b" * 5_000_000 + PHRASE}[shape][:5_000_000]
+    best = None
+    for _ in range(3):                                                  # the best of three: the machine may be busy with others
+        t0 = time.perf_counter()
+        out = al.clean(body)
+        took = time.perf_counter() - t0
+        best = took if best is None else min(best, took)
+    assert best < 0.05, (shape, best)
+    assert al.clean(out) == out
+
+
+# ----------------------------------------------------------------------------------------------- through the real commands
+
+FORMS = {"key": [TRADING["BROKER_API_KEY"], TRADING["BROKER_API_KEY"].lower(), TRADING["BROKER_API_KEY"].upper()],
+         "secret": [TRADING["BROKER_API_SECRET"], TRADING["BROKER_API_SECRET"].upper()],
+         "account": ["987654321098", "9876 5432 1098", "987-654-321-098", "987 654 321 098"],
+         "phrase": [PHRASE, "  ".join(PHRASE.split()), "\n".join(PHRASE.split()), "_".join(PHRASE.split())]}
+ALL_FORMS = [f for forms in FORMS.values() for f in forms]
+PHRASE_WORD = re.compile(r"(?i)(?<![a-z])(?:" + "|".join(PHRASE.split()) + r")(?![a-z])")
+
+
+def any_part(text):
+    """Any piece (4 characters, in any letter case) of the key, the secret or the account number, or any word of the phrase."""
+    low = text.lower()
+    found = [w for name in ("BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID") for w in windows(TRADING[name]) if w in low]
+    return found + PHRASE_WORD.findall(text)
+
+
+def across(value, at, size=None):
+    """A long text with the value starting at `at`: words before it and after it, or (`size`) padding that cleaning removes,
+    so the value stands across the raw bound of a text cut to `size`."""
+    if size is not None:
+        return " " * at + value + " " + FILLER * ((size - at) // len(FILLER) + 30)
+    return (FILLER * (at // len(FILLER) + 1))[:max(0, at - 1)] + " " + value + " " + FILLER * 20
+
+
+def placements(prefix_len, limit):
+    """Where to put a value in a text that is shown cut to `limit` behind `prefix_len` characters: at the head, in the middle,
+    at offsets across the length cut and across the raw bound."""
+    raw = max(20 * limit, 4096)
+    out = [(0, None), (limit // 2, None)]
+    out += [(limit - 1 - prefix_len - j, None) for j in (1, 3, 6, 10)]
+    out += [(raw - prefix_len - j, raw) for j in (1, 4, 8, 12)]
+    return out
+
+
+def test_no_part_of_any_value_reaches_any_output_of_the_real_commands_at_the_head_middle_or_across_either_cut(world, trading_file, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    n = 0
+    for form in ALL_FORMS:
+        for at, size in placements(len("2026-11-13 v000: "), 300):            # the detail: day, venue, reason; cut to 300
+            world.write_step("stopped", "send", across(form, max(0, at), size), venue=f"v{n:03d}")
+            n += 1
+        for at, size in placements(len("The order step stopped at stage "), 120):   # the title: the stage; cut to 120
+            world.write_step("stopped", across(form, max(0, at), size), "r", venue=f"v{n:03d}")
+            n += 1
+    world.jobs = world.jobs + [("-", "9", "com.valedia." + across(f, 60).replace(" ", "")) for f in ALL_FORMS[:6]]
+    world.write_picks_log(end_ago=600, extra=["schedule failed " + across(ALL_FORMS[0], 250)])
+    assert al.main(["watch", "--notify"], env=world.env()) == 1
+    assert al.main(["list"], env=world.env()) == 1
+    seen = capsys.readouterr()
+    assert len([x for x in world.lines() if x["key"].startswith("step-stopped")]) == n
+    texts = [seen.out, seen.err, world.alerts_file.read_text(), " ".join(" ".join(c) for c in spy.calls),
+             (world.alerts_file.parent / "notifications.jsonl").read_text()]
+    for i, text in enumerate(texts):
+        assert any_part(text) == [], (i, any_part(text)[:10])
+
+
+def test_no_part_of_a_value_in_any_stored_field_gets_out_through_the_real_commands(world, trading_file, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    rows, notes = [], []
+    for i, form in enumerate(ALL_FORMS):
+        for field, limit in (("title", 120), ("detail", 300), ("time", 40), ("level", 20), ("key", 80)):
+            for k, (at, size) in enumerate(placements(len(f"job:com.valedia.x{i}-{field}-0 ") if field == "key" else 0, limit)):
+                row = {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": f"job:com.valedia.x{i}-{field}-{k}", "title": "t",
+                       "detail": "d"}
+                row[field] = (row["key"] + " " if field == "key" else "") + across(form, max(0, at), size)
+                rows.append(row)
+                notes.append({"time": "x", "sender": across(form, max(0, at), size), "key": row["key"], "since": row["time"],
+                              "result": "failed"})
+    folder = world.alerts_file.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (folder / "notifications.jsonl").write_text("".join(json.dumps(r) + "\n" for r in notes))
+    old = (world.alerts_file.read_text(), (folder / "notifications.jsonl").read_text())
+    outputs = []
+    for argv in (["list"], ["watch", "--notify"], ["list"]):
+        al.main(argv, env=world.env())
+        seen = capsys.readouterr()
+        outputs += [seen.out, seen.err]
+    texts = outputs + [world.alerts_file.read_text()[len(old[0]):], (folder / "notifications.jsonl").read_text()[len(old[1]):],
+                       " ".join(" ".join(c) for c in spy.calls)]
+    assert any("<secret>" in t or "<number>" in t for t in texts[:2])
+    for i, text in enumerate(texts):
+        assert any_part(text) == [], (i, any_part(text)[:10])
+
+
+# ----------------------------------------------------------------------------------------------- withheld: the guard on the whole key
+
+def test_a_stored_line_is_withheld_when_the_guard_masks_any_part_of_its_whole_key(world, trading_file):
+    al.register_trading_file(world.env())
+    key = TRADING["BROKER_API_KEY"]
+    rows = [{"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:com.valedia." + "x" * 70 + " " + key, "title": "t", "detail": "d"},
+            {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:com.valedia." + "y" * 300 + key, "title": "t", "detail": "d"},
+            {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:" + "z" * 75 + "_" + "_".join(PHRASE.split()[:5]), "title": "t", "detail": "d"},
+            {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:com.valedia.55512345678901", "title": "t", "detail": "d"}]
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    open_rows, withheld = al.read_alert_file(world.alerts_file)
+    assert withheld == 3 and [r["key"] for r in open_rows] == ["job:com.valedia._number_"]      # digits alone: not the guard
+    for _ in range(2):
+        al.watch(world.env())
+    assert [x["key"] for x in world.lines()[len(rows):]] == ["job:com.valedia._number_"]        # cleared once; the withheld never
+
+
+# ----------------------------------------------------------------------------------------------- a stop of the unattended run
+
+def write_raw_summary(w, day_file, entry):
+    """A summary written straight into a journal file, so a test can give it any day and any keys."""
+    with (w.root / "journal" / f"{day_file}.jsonl").open("a") as fh:
+        fh.write(json.dumps({"type": "order_step", "venue": "webull-sandbox", "event": "summary", "orders_sent": 0, "sent": [],
+                             "refused": [], "left_over": [], **entry}) + "\n")
+
+
+def test_a_later_stop_at_stage_session_never_clears_a_stop(world):
+    world.write_step("stopped", "send", "the venue refused the session")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 16:10)")
+    world.write_step("stopped", "session", "2026-11-13 (Friday) is not a trading day")
+    r = watch(world)
+    assert r.cleared == [] and [a["key"] for a in r.open] == ["step-stopped:webull-sandbox"]
+
+
+@pytest.mark.parametrize("status", [None, 1, True, ["done"], {"done": 1}, "Done", "DONE", " done", "done ", "done\n", "ok", "", "finished"],
+                         ids=repr)
+def test_a_later_summary_whose_status_is_not_exactly_done_never_clears_and_is_a_warning_once_a_day(world, status):
+    world.write_step("stopped", "send", "the venue refused the session")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    world.write_step(status)
+    r = watch(world)
+    assert r.cleared == [] and "step-stopped:webull-sandbox" in [a["key"] for a in r.open]
+    (a,) = [x for x in r.raised if x.key.startswith("step-unreadable")]
+    assert a.key == "step-unreadable:2026-11-13" and a.level == "warning" and "could not be read" in a.title
+    world.write_step(status)
+    assert not [x for x in watch(world).raised if x.key.startswith("step-unreadable")]          # once a day
+    later = world.env()
+    later.now = NOW + 86400
+    assert [c.key for c in al.watch(later).cleared if c.key.startswith("step-unreadable")]
+
+
+def test_a_summary_with_no_status_at_all_never_clears_and_is_a_warning(world):
+    world.write_step("stopped", "send", "the venue refused the session")
+    watch(world)
+    write_raw_summary(world, "2026-11-13", {"day": "2026-11-13", "stage": None, "reason": None})
+    r = watch(world)
+    assert r.cleared == [] and "step-unreadable:2026-11-13" in keys(r)
+
+
+@pytest.mark.parametrize("mode_key", ["Mode", "MODE", " mode", "mode ", "mOdE"])
+def test_a_done_summary_with_a_key_like_mode_in_another_case_never_clears_a_stop(world, mode_key):
+    world.write_step("stopped", "send", "the venue refused the session")
+    watch(world)
+    write_raw_summary(world, "2026-11-13", {"day": "2026-11-13", "status": "done", "stage": None, "reason": None, mode_key: "propose"})
+    r = watch(world)
+    assert r.cleared == [] and [a["key"] for a in r.open] == ["step-stopped:webull-sandbox"]
+
+
+def test_a_done_summary_in_a_journal_file_dated_after_today_never_clears_a_stop(world):
+    world.write_step("stopped", "send", "the venue refused the session")
+    watch(world)
+    write_raw_summary(world, "2026-11-14", {"day": "2026-11-13", "status": "done", "stage": None, "reason": None})
+    world.write_step("done", day="2026-11-14")
+    r = watch(world)
+    assert r.cleared == [] and [a["key"] for a in r.open] == ["step-stopped:webull-sandbox"]
+
+
+def test_a_later_done_of_the_same_day_and_venue_clears_it_and_a_later_stop_opens_it_again(world):
+    world.write_step("stopped", "reconcile", "the ledger failed")
+    world.write_step("done", venue="other-venue")                                  # another venue's run clears nothing here
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    world.write_step("done")
+    assert [c.key for c in watch(world).cleared] == ["step-stopped:webull-sandbox"]
+    world.write_step("stopped", "after", "the last reconcile could not be completed")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+
+
+def test_any_stop_of_the_day_counts_not_only_the_last_summary(world):
+    world.write_step("stopped", "send", "the venue refused the session")
+    world.write_step("stopped", "session", "outside the regular session window 09:35 to 15:45 New York time (it is 16:10)")
+    (a,) = watch(world).raised
+    assert a.key == "step-stopped:webull-sandbox" and "send" in a.title and "refused the session" in a.detail
+
+
+def test_a_stop_of_an_earlier_day_is_over_when_the_day_passes(world):
+    world.write_step("stopped", "send", "the venue refused", day="2026-11-12")
+    assert not [a for a in watch(world).raised if a.key.startswith("step-stopped")]
+    world.write_step("stopped", "send", "the venue refused")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    tomorrow = world.env()
+    tomorrow.now = NOW + 86400
+    assert [c.key for c in al.watch(tomorrow).cleared if c.key.startswith("step-stopped")] == ["step-stopped:webull-sandbox"]

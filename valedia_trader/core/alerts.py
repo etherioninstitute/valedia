@@ -11,8 +11,12 @@ with `level` "cleared" and the same key is written. An alert is open while the l
 
     switch:halt, switch:latch   the operator halt file, or the drawdown latch, is set (the risk gate's own rule)
     orders:<ledger>             an order ledger is blocked, or holds an order whose fate is unknown (its own `blocked`)
-    step-stopped:<venue>        the last order-step summary of the last day says stopped, with its stage and reason
-                                (a stop at stage "session" for a closed market or a holiday is ordinary: no alert)
+    step-stopped:<venue>        an unattended order step of today (New York; a summary with no `mode` key, read from today's
+                                journal file only) stopped at a stage other than "session" (a closed market or a holiday is
+                                ordinary: no alert); it clears only when a later unattended summary of the same day and venue
+                                has the status exactly "done", or when the day passes
+    step-unreadable:<day>       an order-step summary today whose status is not one of the words the step writes ("done",
+                                "stopped"): a warning of its own, once a day
     approval:refused:<day>      an approval was refused today (a summary with mode approve, stopped at stage ticket): a warning
                                 of its own, once a New York day. Summaries with a `mode` (propose, approve) are practice
                                 runs of the approval flow: the conditions about the unattended run look only at those without
@@ -31,16 +35,17 @@ A check that cannot be asked (a file busy or unreadable, `launchctl` missing) is
 checks still run, nothing is raised or cleared for what the failed check owns, the failure is told on stderr, and
 the exit code is 2. Exit code: 0 when nothing is open, 1 when an alert is open, 2 when the watch itself failed.
 
-Everything shown or written passes `clean`: format and control characters are dropped, the package's output guard
-replaces a remembered secret by `<secret>`, an order id is cut to its last 4 characters (a ledger tag `os-20261113-143501-
-a1b2c3-XLE` becomes `…b2c3-XLE`), and any run of 9 or more digits (an account number) becomes `<number>`. Before it reads
+Everything shown or written passes `clean` (its steps, in order, are in its own description): format and control characters
+are dropped and whitespace collapsed, the package's output guard replaces a remembered secret by `<secret>`, an order id is
+cut to its last 4 characters (a ledger tag `os-20261113-143501-a1b2c3-XLE` becomes `…b2c3-XLE`), digit groups and any run of
+9 or more digits (an account number) become `<number>`, the guard runs again, and only then is the text cut to its length:
+nothing that rev 2 or rev 3 of this module hid is shown, in part or whole, at any length. Before it reads
 or prints anything the command registers every value of the trading file with that guard (`register_trading_file`), into a
 private dictionary: nothing is put into the process environment. A trading file that exists and cannot be read is exit 2
 with nothing written; a missing one is no reason to stop; so is one over 64 KB or 200 settings, or not UTF-8 text, which is
 refused at once. Nothing read back from `alerts.jsonl` or `notifications.jsonl` is trusted either: every field of every line
 passes the same cleaning before it is written, printed, shown or sent, and a key that changes under cleaning is its cleaned
-form from then on. The output guard is put on the streams before the command binds them to print, and it has the last word in `clean`: every
-change of the text (whitespace, format characters, ids, digits, truncation) is made first. An old line whose key held a secret
+form from then on. The output guard is put on the streams before the command binds them to print. An old line whose key held a secret
 cleans to the mask, can match no check, and so could never be cleared: it is withheld (not an alert, open or cleared), counted
 once in the output of `list` and `watch`, and ignored by the exit code.
 
@@ -62,6 +67,7 @@ are absent, an empty `-wal` file and a `-shm` file of 32,768 bytes; that is the 
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import json
 import os
@@ -114,21 +120,179 @@ _GROUPED_DIGITS = re.compile(r"(?<!\d)\d{3,}(?:[ -]\d{3,}){2,}(?!\d)")          
 
 # ---------------------------------------------------------------------------------------------- text and files
 
-_RANDOM = r"[0-9A-Fa-f]{6}"
-_FUND = r"[A-Z0-9]+(?:[.\-][A-Z0-9]+)*"
-_OUR_TAG = re.compile(rf"(?<![A-Za-z0-9])os-\d{{8}}-\d{{6}}-({_RANDOM})(?:-({_FUND}))?(?![A-Za-z0-9])")
+# Our ledger tag `os-20261113-143501-a1b2c3-XLE` and batch id `os-20261113-143501-a1b2c3`, as rev 3 and 4 knew them (6 hex,
+# the fund upper case, the fund left out for a batch id), and as rev 2 knew them (4 or more letters and digits, a fund always).
+_OUR_TAG = re.compile(r"(?<![A-Za-z0-9])os-\d{8}-\d{6}-([0-9A-Fa-f]{6})(?:-([A-Z0-9]+(?:[.\-][A-Z0-9]+)*))?(?![A-Za-z0-9])")
+_WIDE_TAG = re.compile(r"(?<![A-Za-z0-9])os-\d{8}-\d{6}-([A-Za-z0-9]{4,})-([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)")
 _ID_TOKEN = re.compile(r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]+(?![A-Za-z0-9_\-])")
 _CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")                # clientOrderId reads as client Order Id
 _ID_KEYWORD = re.compile(r"(?i)(?<![a-z])(?:orders?|ids?|refs?|tags?|client)(?![a-z])")
 _CLAUSE_END = re.compile(r"(?:;|\.\s)")
 _DATEISH = re.compile(r"\d{4}-\d\d-\d\d(?:T\d\d)?|\d{8}(?:T\d{0,6}Z?)?|\d{8}-\d{6}")
 ID_MIN = 12
+_NEAR_TOKEN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.\-]*[A-Za-z0-9])?")
+_NEAR_WORDS = r"(?:orders?|ids?|tags?|client)"
+_NEAR_KEYWORD = re.compile(rf"(?i)(?<![a-z]){_NEAR_WORDS}(?![a-z])[^A-Za-z0-9]*(?:(?:orders?|ids?|tags?|number|no)(?![a-z])[^A-Za-z0-9]*)*$")
+NEAR_MIN, NEAR_LETTERS, NEAR_WINDOW = 8, 16, 40
+
+RAW_MIN, RAW_TIMES = 4096, 20                # step 1: at most RAW_MAX = max(20 x limit, 4096) characters are looked at
+TAIL = 600                                   # step 6: what is dropped at the end of a text step 1 cut (see `clean`)
+ELLIPSIS = "…"
+HELD = "<held>"                              # shown instead of a text that does not clean to a stable form (see `clean`)
+_KEY_CHARS = re.compile(r"[^A-Za-z0-9_.:-]+")
+_KEY_HELD = "_held_"
+_registered = {"longest": 0}                 # the longest value registered from the trading file (for step 6)
+
+
+def _is_readable(tok: str) -> bool:
+    """A date or time in an ISO form, a Kalshi ticker (upper case, beginning KX): never an id."""
+    return bool(_DATEISH.fullmatch(tok)) or (tok.startswith("KX") and tok == tok.upper())
 
 
 def _is_id(tok: str) -> bool:
     """A run of 12 or more letters and digits (`_` and `-` may join them) holding a digit: not a date or time, not a Kalshi ticker."""
-    return (len(tok) >= ID_MIN and any(c.isdigit() for c in tok) and not tok.isdigit() and not _DATEISH.fullmatch(tok)
-            and not (tok.startswith("KX") and tok == tok.upper()))
+    return len(tok) >= ID_MIN and any(c.isdigit() for c in tok) and not tok.isdigit() and not _is_readable(tok)
+
+
+def _is_near_id(tok: str) -> bool:
+    """What may follow an id word directly: 8 or more letters and digits (`_`, `-` inside) with a digit and not only digits, or
+    16 or more letters; never a dotted name (a file, a version, a decimal, a host), a date or time, or a Kalshi ticker."""
+    return (len(tok) >= NEAR_MIN and not tok.isdigit() and "." not in tok and not _is_readable(tok)
+            and (any(c.isdigit() for c in tok) or (len(tok) >= NEAR_LETTERS and tok.isalpha())))
+
+
+def _keyword_spans(t: str) -> list[tuple[int, int]]:
+    """Where the id words stand in `t` (start, end), read with camelCase split (clientOrderId: client, Order, Id)."""
+    marks = [m.start() for m in _CAMEL.finditer(t)]
+    if not marks:
+        return [m.span() for m in _ID_KEYWORD.finditer(t)]
+    return [(_unsplit(m.start(), marks), _unsplit(m.end(), marks)) for m in _ID_KEYWORD.finditer(_CAMEL.sub(" ", t))]
+
+
+def _unsplit(i: int, marks: list[int]) -> int:
+    """A position in the camel-split text as a position in the text: each inserted space before it is taken off."""
+    lo, hi = 0, len(marks)                                  # marks are positions in the text; the k-th lands at marks[k] + k
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if marks[mid] + mid < i:
+            lo = mid + 1
+        else:
+            hi = mid
+    return i - lo
+
+
+def _tag_spans(rx, t: str) -> list[tuple[int, int, int]]:
+    """Our ledger tags and batch ids: (start, where the shown part begins, end); the shown part is the last 4 of the random part
+    and the fund."""
+    return [(m.start(), m.end(1) - 4, m.end()) for m in rx.finditer(t)]
+
+
+def _clause_id_spans(t: str, extra=frozenset(), found=None) -> list[tuple[int, int, int]]:
+    """Ids of 12 or more after an id word anywhere in the same clause (rev 3's rule): (start, end - 4, end). A token in `extra`
+    counts whatever stands before it; each one found is added to `found`."""
+    clause_starts = [0] + [c.end() for c in _CLAUSE_END.finditer(t)]
+    kw = _keyword_spans(t)
+    kw_ends = [b for _, b in kw]
+    spans = []
+    for m in _ID_TOKEN.finditer(t):
+        tok = m.group(0)
+        if not _is_id(tok) or t[max(0, m.start() - 1):m.start()] == "…":
+            continue
+        if m.end() < len(t) and t[m.end()] == "." and m.end() + 1 < len(t) and t[m.end() + 1].isalnum():
+            continue                                                     # inside a dotted name: a file, a version, a host
+        if tok not in extra:
+            start = clause_starts[bisect.bisect_right(clause_starts, m.start()) - 1]
+            k = bisect.bisect_right(kw_ends, m.start()) - 1               # the last id word that ends before the token
+            if k < 0 or kw[k][0] < start:
+                continue
+        if found is not None:
+            found.add(tok)
+        spans.append((m.start(), m.end() - 4, m.end()))
+    return spans
+
+
+def _near_id_spans(t: str, extra=frozenset(), found=None) -> list[tuple[int, int, int]]:
+    """Ids of 8 or more right after an id word (rev 2's rule, the readable names left out): (start, end - 4, end)."""
+    spans = []
+    for m in _NEAR_TOKEN.finditer(t):
+        tok = m.group(0)
+        if not _is_near_id(tok) or t[max(0, m.start() - 1):m.start()] == "…":
+            continue
+        if tok not in extra and not _NEAR_KEYWORD.search(_CAMEL.sub(" ", t[max(0, m.start() - NEAR_WINDOW):m.start()])):
+            continue
+        if found is not None:
+            found.add(tok)
+        spans.append((m.start(), m.end() - 4, m.end()))
+    return spans
+
+
+def _digit_spans(rx, t: str) -> list[tuple[int, int, int]]:
+    return [(m.start(), m.end(), m.end()) for m in rx.finditer(t) if rx is not _GROUPED_BY_SECRET or "<secret>" in m.group()]
+
+
+# Digit groups of which the guard has taken one or more (it masks a whole token, so `9503-delta` with `delta` a word of a
+# phrase goes, and `6236 0220` alone would no longer be 3 groups): a `<secret>` counts as a group.
+_GROUPED_BY_SECRET = re.compile(r"(?<!\d)(?=(?:<secret>[ -])*\d)(?:\d{3,}|<secret>)(?:[ -](?:\d{3,}|<secret>)){2,}(?!\d)")
+
+
+_BY_ID, _BY_DIGITS = 1, 2
+
+
+def _replace(text: str, origin: list[int], spans, hidden: bytearray, flag: int, placeholder: str):
+    """`text` with each span's hidden part replaced by `placeholder` (its shown part kept), and where each character came from
+    in the text the chain began with (-1 for a placeholder). Every character hidden is marked in `hidden` with `flag`."""
+    parts, where, last = [], [], 0
+    for a, k, b in spans:
+        parts += [text[last:a], placeholder, text[k:b]]
+        where += origin[last:a]
+        for o in origin[a:k]:
+            if o >= 0:
+                hidden[o] |= flag
+        where += [-1] * len(placeholder)
+        where += origin[k:b]
+        last = b
+    parts.append(text[last:])
+    where += origin[last:]
+    return "".join(parts), where
+
+
+def _chain(t: str, tag_rx, id_spans, hidden: bytearray, digits: bool = True) -> None:
+    """One earlier revision's way of masking, over `t`, marking what it hides: its tags, then its ids, then the digit groups
+    and long digit runs, then its ids once more (a `<number>` can stand between an id word and an id)."""
+    cur, origin = _replace(t, list(range(len(t))), _tag_spans(tag_rx, t), hidden, _BY_ID, ELLIPSIS)
+    cur, origin = _replace(cur, origin, id_spans(cur), hidden, _BY_ID, ELLIPSIS)
+    if digits:
+        for rx in (_GROUPED_BY_SECRET, _GROUPED_DIGITS, _LONG_DIGITS):
+            cur, origin = _replace(cur, origin, _digit_spans(rx, cur), hidden, _BY_DIGITS, "<number>")
+        _replace(cur, origin, id_spans(cur), hidden, _BY_ID, ELLIPSIS)
+
+
+_CHAINS = ((_WIDE_TAG, _near_id_spans), (_OUR_TAG, _clause_id_spans))       # rev 2's rules; rev 3's (and 4's)
+_HIDDEN_RUN = re.compile(rb"[\x01-\x03]+")
+
+
+def _mask(t: str, extra=frozenset(), digits: bool = True) -> str:
+    """Step 4: every character that rev 2's rules or rev 3's rules would hide is hidden (both are run over the same text, each
+    in its own order, and what either hides is hidden; an id in `extra`, found before the guard, is hidden too, all but its
+    last 4, wherever it stands). A hidden run that holds a digit mask becomes `<number>`, any other `…`
+    (so an id keeps its last 4 characters, and a tag the last 4 of its random part and its fund)."""
+    hidden = bytearray(len(t))
+    for tag_rx, id_spans in _CHAINS:
+        _chain(t, tag_rx, id_spans, hidden, digits)
+    if extra:                                                            # ids found before the guard, wherever they stand now
+        spans = sorted({(m.start(), m.end() - 4, m.end()) for rx in (_ID_TOKEN, _NEAR_TOKEN) for m in rx.finditer(t)
+                        if m.group(0) in extra})
+        last = -1
+        for a, k, b in spans:
+            if a >= last:
+                for i in range(a, k):
+                    hidden[i] |= _BY_ID
+                last = b
+    out, last = [], 0
+    for m in _HIDDEN_RUN.finditer(bytes(hidden)):
+        out += [t[last:m.start()], "<number>" if any(f & _BY_DIGITS for f in m.group()) else ELLIPSIS]
+        last = m.end()
+    return "".join(out) + t[last:]
 
 
 def hide_order_ids(text: str) -> str:
@@ -136,27 +300,21 @@ def hide_order_ids(text: str) -> str:
     (`os-20261113-143501-a1b2c3`) are shortened wherever they stand (`…b2c3-XLE`, `…b2c3`: the last 4 of the random part, then
     the fund). Any other id, a run of 12 or more letters and digits with a digit in it and no dot (`_` and `-` may join its
     parts), that follows one of the words order, orders, id, ids, ref, tag or client anywhere in the same clause (lists and
-    `id is X` included) becomes `…` and its last 4 characters. Dates and times, numbers with a decimal point, file names, version
-    strings, Kalshi tickers (upper case, beginning KX), funds, prices and counts are never shortened."""
-    t = _OUR_TAG.sub(lambda m: "…" + m.group(1)[-4:] + (f"-{m.group(2)}" if m.group(2) else ""), text)
-    out, last = [], 0
-    for m in _ID_TOKEN.finditer(t):
-        tok = m.group(0)
-        if not _is_id(tok) or t[max(0, m.start() - 1):m.start()] == "…":
-            continue
-        if m.end() < len(t) and t[m.end()] == "." and m.end() + 1 < len(t) and t[m.end() + 1].isalnum():
-            continue                                                     # inside a dotted name: a file, a version, a host
-        starts = [c.end() for c in _CLAUSE_END.finditer(t, 0, m.start())]
-        clause = _CAMEL.sub(" ", t[(starts[-1] if starts else 0):m.start()])
-        if _ID_KEYWORD.search(clause):
-            out += [t[last:m.start()], "…" + tok[-4:]]
-            last = m.end()
-    return "".join(out) + t[last:]
+    `id is X` included) becomes `…` and its last 4 characters; so does a shorter one, of 8 or more with a digit (or of 16 or
+    more letters), that follows order, id, tag or client directly (only other id words, `number` or `no` between). Dates and
+    times, numbers with a decimal point, file names, version strings, Kalshi tickers (upper case, beginning KX), funds, prices
+    and counts are never shortened."""
+    return _mask(str(text), digits=False)
 
 
-def _unseen_out(text: str) -> str:
-    """Format characters (Cf: direction overrides and marks, zero-width characters) and control characters (Cc) are dropped,
-    and a line break, tab or separator is a space: nothing in a text can reorder or hide what is around it."""
+def _normalise(text: str, collapse: bool = True) -> str:
+    """Step 2: format characters (Cf: direction overrides and marks, zero-width characters), control characters (Cc) and lone
+    surrogates are dropped; a line break, tab or separator is a space; then every run of whitespace is one space (unless
+    `collapse` is false: the text as rev 2 and rev 3 gave it to the guard)."""
+    if text.isascii():
+        if _ASCII_CONTROL.search(text):
+            text = _ASCII_CONTROL.sub(lambda m: " " if m.group() in "\n\r\t" else "", text)
+        return " ".join(text.split()) if collapse else text
     out = []
     for ch in text:
         cat = unicodedata.category(ch)
@@ -164,49 +322,122 @@ def _unseen_out(text: str) -> str:
             out.append(" ")
         elif cat not in ("Cf", "Cc", "Cs"):
             out.append(ch)
-    return "".join(out)
+    return " ".join("".join(out).split()) if collapse else "".join(out)
 
 
-def _clean_once(text: str, limit: int) -> str:
-    """One pass, in this order: drop format and control characters, collapse every kind of whitespace, run the guard, cut to
-    `limit`, shorten order ids, mask account-style digits, and run the guard LAST, so nothing that comes after it can put a
-    covered form back together."""
-    t = " ".join(_unseen_out(text).split())
+_ASCII_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _steps(text: str) -> str:
+    """Steps 2 to 5 on a text already bounded: normalise, guard, mask, guard again. The ids are first looked for twice: in the
+    normalised text before the guard runs (a mask the guard puts over the words before an id never makes that id plain), and
+    as rev 2 and rev 3 looked for them, after the guard over the text with its spaces still as they were (the guard masks a
+    whole token, a `.` or `;` that ends a clause included). An id found either way is shortened wherever it stands."""
+    t = _normalise(text)
+    seen: set = set()
+    for source in (t, redact(_normalise(text, collapse=False))[0]):
+        for tag_rx, id_spans in _CHAINS:
+            id_spans(_replace(source, list(range(len(source))), _tag_spans(tag_rx, source), bytearray(len(source)), _BY_ID,
+                              ELLIPSIS)[0], found=seen)
     t, _ = redact(t)
-    if len(t) > limit:
-        t = t[:limit - 1] + "…"
-    t = hide_order_ids(t)
-    t = _GROUPED_DIGITS.sub("<number>", t)
-    t = _LONG_DIGITS.sub("<number>", t)
+    t = _mask(t, frozenset(seen))
     t, _ = redact(t)
     return t
+
+
+def _back_to_token(t: str, k: int) -> str:
+    """`t[:k]`, never ending inside a token: when the cut falls inside one, that whole token goes."""
+    head = t[:k]
+    if 0 < k < len(t) and t[k] != " " and head[-1:] != " ":
+        head = head[:head.rfind(" ") + 1]
+    return head.rstrip()
+
+
+def _tail_size() -> int:
+    return max(TAIL, _registered["longest"] + 1)
+
+
+def _fit(t: str, limit: int, raw_cut: bool) -> str:
+    """Steps 6 and 7: drop the tail of a text step 1 cut, then cut to `limit` with the ellipsis. A cut inside a token keeps the
+    part only when cleaning it again changes nothing; otherwise the whole token goes."""
+    if raw_cut:
+        t = _back_to_token(t, max(0, len(t) - _tail_size()))
+    if not raw_cut and len(t) <= limit:
+        return t
+    room = max(0, limit - 1)
+    if len(t) <= room:
+        return t + ELLIPSIS
+    head = t[:room]
+    if t[room] != " " and head[-1:] not in ("", " "):
+        kept = head.rstrip() + ELLIPSIS
+        if _steps(kept) == kept:
+            return kept
+        head = _back_to_token(t, room)
+    return head.rstrip() + ELLIPSIS
+
+
+def _pipeline(text, limit: int) -> str:
+    s = text if isinstance(text, str) else str(text)
+    raw_max = max(RAW_TIMES * limit, RAW_MIN)
+    raw_cut = len(s) > raw_max
+    if raw_cut:
+        s = s[:raw_max]
+    return _fit(_steps(s), limit, raw_cut)
 
 
 def clean(text, limit: int = 300) -> str:
-    """One line of text that is safe to show or write: format and control characters dropped, whitespace collapsed, a remembered
-    secret replaced by the package's own guard, an order id cut to its last 4 characters, any run of 9 or more digits (an
-    account number) or three or more groups of three or more digits joined by single spaces or dashes replaced (a list of
-    years or of clock times in groups of three digits or more, such as `2024 2025 2026`, is masked too: a known cost), and no
-    more than `limit` characters. The guard has the last word, and cleaning is a fixed point: cleaning a cleaned text changes
-    nothing."""
-    t = str(text)[:max(limit * 20, 4096)]
-    for _ in range(6):
-        n = _clean_once(t, limit)
-        if n == t:
-            return n
-        t = n
-    return t
+    """One line of text that is safe to show or write, made in this order:
+
+    1. at most RAW_MAX characters are looked at (20 times `limit`, at least 4,096), and whether the text was longer is kept;
+    2. format and control characters are dropped and every run of whitespace becomes one space;
+    3. the package's guard replaces any remembered secret by `<secret>`, over the whole normalised text;
+    4. order tags, batch ids and other ids are cut to their last 4 characters (`hide_order_ids`), and any run of 9 or more digits
+       (an account number) or three or more groups of three or more digits joined by single spaces or dashes (a group the
+       guard took counts as one) becomes `<number>` (a list of years in groups of three digits or more, such as
+       `2024 2025 2026`, is masked too: a known cost); a number with a decimal point is a price and stays. Rev 2's rules and
+       rev 3's are both run over the same text, each in its own order (tags, ids, digits, ids again), and a character either
+       hides is hidden; an id either would have found before the guard, or with the text spaced as they gave it to the guard,
+       is shortened wherever it stands;
+    5. the guard again, over the result;
+    6. if step 1 cut the text, its tail is dropped: at least the last TAIL (600) characters, and never less than the longest
+       value registered from the trading file, back to the start of a token; every step before is one that never lengthens a
+       text, so whatever came from the part near the cut is in that tail, and nothing that lay across the cut shows a part;
+    7. only now the text is cut to `limit` with `…`; a cut inside a token keeps its part only when cleaning it again changes
+       nothing, otherwise the whole token goes; a mask's own placeholder may be cut, a value never;
+    8. cleaning is a fixed point: the result is cleaned once more (it is at most `limit` long, so this is cheap); when that
+       changes it, the changed form is checked the same way, and a text that changes a third time is shown as `<held>`. No
+       loop runs longer than that, and each step makes one pass over the text."""
+    limit = max(1, int(limit))
+    once = _pipeline(text, limit)
+    twice = _pipeline(once, limit)
+    if twice == once:
+        return once
+    thrice = _pipeline(twice, limit)
+    if thrice == twice:
+        return twice
+    return HELD if limit >= len(HELD) else ELLIPSIS
+
+
+def _key_once(text) -> str:
+    return _KEY_CHARS.sub("_", clean(text, 80))
 
 
 def _key_part(text) -> str:
-    """A key: cleaned, then only letters, digits and `_.:-`; repeated until it no longer changes, so a key is its own cleaned form."""
-    cur = str(text)
-    for _ in range(6):
-        nxt = re.sub(r"[^A-Za-z0-9_.:-]+", "_", clean(cur, 80))
-        if nxt == cur:
-            return nxt
-        cur = nxt
-    return cur
+    """A key: cleaned to 80 characters, then only letters, digits and `_.:-`. A key is its own key form: the form is made again
+    from itself, and when that changes it, once more; a key that changes a third time is `_held_`."""
+    once = _key_once(text)
+    twice = _key_once(once)
+    if twice == once:
+        return once
+    thrice = _key_once(twice)
+    return twice if thrice == twice else _KEY_HELD
+
+
+def _guard_masks(text) -> bool:
+    """Whether the package's guard, on the whole text (not cut, and with format characters dropped and whitespace collapsed as
+    well), masks any part of it."""
+    s = str(text)
+    return redact(s)[1] > 0 or redact(_normalise(s))[1] > 0
 
 
 class SourceMissing(RuntimeError):
@@ -433,6 +664,7 @@ def register_trading_file(env: Env | None = None) -> dict[str, str]:
             if sum(1 for ln in text.splitlines() if "=" in ln and not ln.lstrip().startswith("#")) > TRADING_FILE_MAX_SETTINGS:
                 raise TradingFileError(f"the trading file holds more than 200 settings, so it is not a trading file; {done}")
             load_env(path, environ=values)
+            _registered["longest"] = max([_registered["longest"]] + [len(v) for v in values.values() if isinstance(v, str)])
     except TradingFileError:
         raise
     except Exception as exc:
@@ -586,14 +818,61 @@ def is_outside_market_hours(summary: dict) -> bool:
             and any(p.fullmatch(reason) for p in _ORDINARY_SESSION_STOPS))
 
 
+STEP_STATUSES = ("done", "stopped")          # the words the order step writes as the status of a summary
+DONE = "done"
+
+
+def todays_step_summaries(env: Env) -> list[dict]:
+    """The order-step summaries of today in New York, in the order written: from today's journal file only (a file dated after
+    today is not read) and dated today themselves. Read once; nothing is created."""
+    if "step_today" not in env._cache:
+        from valedia_trader.research_loop.paper import Journal
+        today = str(datetime.fromtimestamp(env.now, NEW_YORK).date())
+        folder = env.paths.journal
+        entries = Journal(folder).read(since=today, until=today) if folder.is_dir() else []
+        env._cache["step_today"] = [e for e in entries if e.get("type") == "order_step" and e.get("event") == "summary"
+                                    and str(e.get("day"))[:10] == today]
+    return env._cache["step_today"]
+
+
+def _has_mode_like_key(entry: dict) -> bool:
+    """A key that reads as `mode` in another letter case or with blanks around it (`Mode`, `MODE`, ` mode`)."""
+    return any(isinstance(k, str) and k != "mode" and k.strip().casefold() == "mode" for k in entry)
+
+
+def clears_a_stop(entry: dict) -> bool:
+    """A summary that clears a stop of the unattended run: no `mode` key in any letter case, and a status that is exactly `done`."""
+    return is_unattended(entry) and not _has_mode_like_key(entry) and isinstance(entry.get("status"), str) and entry["status"] == DONE
+
+
 def check_order_step(env: Env) -> CheckResult:
+    """For today in New York, per venue: the unattended run (a summary with no `mode` key) stopped, at a stage other than session or
+    at stage session for a reason that is not one of the two ordinary ones, and no LATER unattended summary of today said `done`.
+    A later stop at stage session, a status that is missing, of another type, in another letter case or padded, a summary
+    with a key like `Mode`, and a summary in a journal file dated after today never clear it; the next day starts afresh. A
+    summary of today whose status is not one of the order step's own words is a warning of its own, once a day."""
     out = CheckResult()
-    entries, _ = env.journal()
-    for venue, e in sorted(last_step_summaries(entries).items()):
+    today = str(datetime.fromtimestamp(env.now, NEW_YORK).date())
+    todays = todays_step_summaries(env)
+    stops: dict[str, dict] = {}
+    for e in todays:
+        if not is_unattended(e):
+            continue
+        venue = str(e.get("venue"))
         if e.get("status") == "stopped" and not is_outside_market_hours(e):
-            out.alerts.append(Alert(f"step-stopped:{_key_part(venue)}", "critical",
-                                    f"The order step stopped at stage {e.get('stage')}",
-                                    f"{e.get('day')} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}"))
+            stops[venue] = e
+        elif clears_a_stop(e):
+            stops.pop(venue, None)
+    for venue, e in sorted(stops.items()):
+        out.alerts.append(Alert(f"step-stopped:{_key_part(venue)}", "critical",
+                                f"The order step stopped at stage {e.get('stage')}",
+                                f"{e.get('day')} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}"))
+    unread = [e for e in todays if not (isinstance(e.get("status"), str) and e["status"] in STEP_STATUSES)]
+    if unread:
+        e = unread[-1]
+        out.alerts.append(Alert(f"step-unreadable:{today}", "warning", "An order-step summary could not be read",
+                                f"{today} {clean(e.get('venue'), 60)}: status {clean(repr(e.get('status')), 40)}, which is not "
+                                f"one of the order step's own words ({', '.join(STEP_STATUSES)})"))
     return out
 
 
@@ -796,7 +1075,7 @@ def check_disk(env: Env) -> CheckResult:
 CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
     ("switches", ("switch:",), check_switches),
     ("order ledgers", ("orders:",), check_orders),
-    ("order step", ("step-stopped:",), check_order_step),
+    ("order step", ("step-stopped:", "step-unreadable:"), check_order_step),
     ("approval", ("approval:",), check_approval_refused),
     ("order-step modes", ("mode:", "practice-stopped:"), check_modes),
     ("scheduled jobs", ("job:",), check_jobs),
@@ -837,7 +1116,7 @@ def _cleaned_line(e: dict) -> dict:
     that changes under cleaning is its cleaned form from here on and is never written back as it was."""
     out = {k: clean(v, 400) for k, v in e.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
     out["key"] = _key_part(e.get("key"))
-    out["withheld"] = "<secret>" in clean(e.get("key"), 80)       # the key held a secret: the cleaned key is the mask, not a key
+    out["withheld"] = _guard_masks(e.get("key"))                  # the key held a secret: the guard, on the whole key, masks a part
     out["level"] = clean(e.get("level"), 20)
     out["title"], out["detail"], out["time"] = clean(e.get("title", ""), 120), clean(e.get("detail", ""), 300), clean(e.get("time", ""), 40)
     return out

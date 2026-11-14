@@ -7,6 +7,7 @@ hostile markup, a made-up secret and a made-up account number, and the page is c
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -357,7 +358,7 @@ def test_paper_account_has_a_chart_cash_positions_pending_and_realised(world):
 def test_broker_section_has_open_orders_recent_fills_with_fees_and_the_step_summaries(world):
     text = world.page().sections["Broker (paper)"]
     assert "webull-sandbox" in text
-    assert "accepted" in text and "XLE" in text and "…0007" in text                         # an id only by its last 4 characters
+    assert "accepted" in text and "XLE" in text and "<secret>" in text and "0007" not in text   # a tag that holds a value: its mask
     assert "SPY" in text and "0.05" in text and "450.00" in text                            # the fill of the last 7 days, with its fee
     assert "QQQ" not in text and "9.99" not in text                                         # ten days ago: not shown
     assert "sent 2" in text and "refused 1" in text and "left over 2" in text               # an ok step
@@ -919,3 +920,97 @@ def test_the_alert_lines_withheld_are_counted_on_the_page_not_listed_as_open(bar
     op.build(env, out=out)
     health = Page(out.read_text()).sections["Health"]
     assert "No open alerts" in health and health.count("withheld") == 1 and "4 old lines" in health and leaked(health) == []
+
+
+# =====================================================================================================================
+# rev 5: a value across either cut of a long text, and an order tag that is a value
+# =====================================================================================================================
+
+FORMS = [TRADING["BROKER_API_KEY"], TRADING["BROKER_API_KEY"].lower(), TRADING["BROKER_API_SECRET"], TRADING["BROKER_API_SECRET"].upper(),
+         "987654321098", "9876 5432 1098", "987-654-321-098", "987 654 321 098",
+         PHRASE, "  ".join(PHRASE.split()), "\n".join(PHRASE.split()), "_".join(PHRASE.split())]
+FILLER = "ee eee e eeee ee e eee eeeee "                       # only the letter e
+PHRASE_WORD = re.compile(r"(?i)(?<![a-z])(?:" + "|".join(PHRASE.split()) + r")(?![a-z])")
+
+
+def any_part(text):
+    """Any 4 characters in a row (in any letter case) of the key, the secret or the account number, or any word of the phrase."""
+    low = text.lower()
+    found = [v[i:i + 4] for n in ("BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID") for v in [TRADING[n].lower()]
+             for i in range(len(v) - 3) if v[i:i + 4] in low]
+    return found + PHRASE_WORD.findall(text)
+
+
+def across(value, at, size=None):
+    """The value starting at `at` of a long text; with `size`, behind padding that cleaning removes, so that it stands across
+    the raw bound of a text shown cut to a limit whose bound is `size`."""
+    if size is not None:
+        return " " * at + value + " " + FILLER * ((size - at) // len(FILLER) + 30)
+    return (FILLER * (at // len(FILLER) + 1))[:max(0, at - 1)] + " " + value + " " + FILLER * 20
+
+
+def placements(limit, prefix_len=0):
+    """At the head, in the middle, just across the length cut and just across the raw bound."""
+    raw = max(20 * limit, 4096)
+    return ([(0, None), (limit // 2, None)] + [(max(0, limit - 1 - prefix_len - j), None) for j in (1, 3, 6, 10)]
+            + [(raw - prefix_len - j, raw) for j in (1, 4, 8, 12)])
+
+
+def build_real(w, capsys):
+    env = w.env()
+    env.environ = None                                                                     # the real command reads the file itself
+    out = w.tmp / "out" / "index.html"
+    assert op.main(["build", "--out", str(out)], env=env) == 0
+    seen = capsys.readouterr()
+    return out.read_text(), seen.out + seen.err
+
+
+def test_the_leak_check_finds_nothing_on_a_page_without_planted_values(bare_world, trading_file, capsys):
+    html, said = build_real(bare_world, capsys)
+    assert any_part(html) == [] and any_part(said) == []
+
+
+def test_no_part_of_a_value_reaches_the_page_at_the_head_middle_or_across_either_cut_of_any_long_text(bare_world, trading_file, capsys):
+    w = bare_world
+    for n, form in enumerate(FORMS):
+        flat = " ".join(form.split("\n"))
+        logs = sorted(w.logs.glob("valedia-*.log"))
+        for p in logs:
+            p.unlink()
+        for k, (at, size) in enumerate(placements(200)):                                   # the last line of a log: cut to 200
+            (w.logs / f"valedia-x{k}.log").write_text("first line\n" + across(flat, at, size) + "\n")   # (one line holds no break)
+        w.jobs = [("-", "9", "com.valedia." + across(flat, at, size)) for at, size in placements(120, len("com.valedia."))]
+        rows = []
+        for field, limit in (("title", 200), ("time", 40), ("level", 20), ("key", 80)):
+            for k, (at, size) in enumerate(placements(limit, len("job:x-0 ") if field == "key" else 0)):
+                row = {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": f"job:x{n}-{field}-{k}", "title": "t", "detail": "d"}
+                row[field] = (row["key"] + " " if field == "key" else "") + across(form, at, size)
+                rows.append(row)
+        (w.root / "artifacts" / "owner" / "alerts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        unverified = [across(form, at, size) for at, size in placements(80)]
+        for k, ((at, size), (at4, size4)) in enumerate(zip(placements(240), placements(400))):
+            for d in range(5):                                                             # the step reason: cut to 240
+                write_step_entry(w, None, "stopped", "send", across(form, *placements(240)[(k + d) % 10]), day=f"2026-11-{9 + d}")
+            tax = ({"unavailable": across(form, at4, size4)} if k % 2 else
+                   {"year": 2026, "note": across(form, at4, size4), "unverified": unverified})
+            w.journal.write("2026-11-13", {"type": "summary", "equity": 1.0, "strategy_values": {}, "benchmark_values": {}, "tax": tax})
+            html, said = build_real(w, capsys)
+            assert any_part(html) == [] and any_part(said) == [], (n, k, any_part(html)[:6], any_part(said)[:6])
+    assert "&lt;secret&gt;" in html and "&lt;number&gt;" in html
+
+
+def test_an_order_tag_that_is_or_holds_a_value_shows_no_part_of_it(bare_world, trading_file, capsys):
+    w = bare_world
+    db = sqlite3.connect(w.ledger_path)
+    tags = [TRADING["WEBULL_ACCOUNT_ID"], "9876-5432-1098", TRADING["BROKER_API_KEY"], "paper-" + TRADING["BROKER_API_KEY"],
+            TRADING["BROKER_API_SECRET"].lower(), "_".join(PHRASE.split())]
+    for i, tag in enumerate(tags):
+        db.execute("INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES (?, 'XLE', 5, 60.0, 'accepted', ?, ?)",
+                   (tag, NOW - 100 - i, NOW - 90 - i))
+        db.execute("INSERT INTO fills (tag, symbol, units, price, fee, time, applied) VALUES (?, 'XLE', 5, 60.0, 0.01, ?, 1)", (tag, NOW - 80 - i))
+    db.commit()
+    db.close()
+    html, said = build_real(w, capsys)
+    broker = Page(html).sections["Broker (paper)"]
+    assert any_part(html) == [] and any_part(said) == [], any_part(html)
+    assert broker.count("<number>") + broker.count("<secret>") >= 2 * len(tags)               # each tag, in both tables, by its mask

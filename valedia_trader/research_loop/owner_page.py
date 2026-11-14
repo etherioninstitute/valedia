@@ -22,9 +22,11 @@ Nothing read back from the tool's own files (the alert file, the notification re
 text. Known limits of the output guard this rests on (the package's own): a value split by other separators, halves shorter
 than 8 characters, a base64 form of a recovery phrase, words of the phrase glued to other letters, and values under ordinary
 setting names are not caught. The order-step section shows the unattended run's last results, and apart from them the last
-propose run and the last approve run (summaries that carry a `mode`). Every text that comes from a file or from a program's output is passed through `alerts.clean` (the
-package's output guard, then any long run of digits becomes `<number>`) and then HTML-escaped. An order is shown only by
-the last 4 characters of its tag, the pick lists only by counts, and no result of any research test is shown.
+propose run and the last approve run (summaries that carry a `mode`). Every text that comes from a file or from a program's
+output is passed through `alerts.clean` (normalised, the package's output guard, ids shortened and digit runs and groups
+masked, the guard again, and only then cut to its length) and then HTML-escaped. An order is shown only by the last 4
+characters of its tag (a tag the cleaning masks only as `<secret>` or `<number>`), the pick lists only by counts, and no
+result of any research test is shown.
 """
 from __future__ import annotations
 
@@ -130,8 +132,13 @@ def newest_text(candidates) -> str:
 
 def short_id(tag) -> str:
     """An order is shown by the last 4 characters of its id only: `…0007`. A ledger tag (`os-20261113-143501-a1b2c3-XLE`) by the
-    last 4 of its random part and its fund: `…b2c3-XLE`."""
+    last 4 of its random part and its fund: `…b2c3-XLE`. A tag that is, or holds, something the cleaning masks (a value of the
+    trading file, a long run or groups of digits) is shown only as the cleaning shows it (`<secret>`, `<number>`): its last 4
+    characters may be the last 4 of that value."""
     text = str(tag)
+    cleaned = al.clean(text, 400)
+    if any(mark in cleaned for mark in ("<secret>", "<number>", al.HELD)):
+        return cleaned
     shaped = al.hide_order_ids(text)
     return shaped if shaped != text else "…" + text[-4:]
 
