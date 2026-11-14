@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 import types
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3316,14 +3317,27 @@ def _refused_venue(tmp_path, detail, code="OPENAPI_TRADE_PLACE_ORDER_REPEAT", ta
 @pytest.mark.parametrize("code", ["OPENAPI_TRADE_PLACE_ORDER_REPEAT", "OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED"])
 @pytest.mark.parametrize("fields", [
     {"symbol": "QQQ", "side": "SELL", "status": "CANCELLED"},            # the verifier's reproduction
-    {"symbol": "QQQ"}, {"side": "SELL"}, {"total_quantity": "2"}, {"total_quantity": "0.5"}, {"symbol": "SPYX", "status": "FILLED"}])
+    {"symbol": "QQQ", "status": "CANCELLED"}, {"side": "SELL", "status": "FAILED"}, {"total_quantity": "2", "status": "EXPIRED"},
+    {"total_quantity": "0.5", "status": "CANCELLED", "filled_quantity": "0.5"}, {"symbol": "SPYX", "status": "REJECTED"}])
 def test_after_a_refusal_a_row_of_another_order_is_never_reported_accepted(tmp_path, code, fields):
+    # addendum 2: dead AND another order is the refusal it was (whatever it filled: that fill is another order's)
     v, client, cid = _refused_venue(tmp_path, Response(observed_detail(wb.client_order_id("t"), observed_order(wb.client_order_id("t"), **fields))), code)
     with pytest.raises(wb.OrderRejected) as exc:
         v.submit("SPY", 1.0, "t", limit_price=100.0)
     assert "not the order sent" in str(exc.value) and "outcome unknown" not in str(exc.value)
     assert not isinstance(exc.value, wb.NotTransmitted) and KEY not in str(exc.value) and "QQQ" not in str(exc.value)
     assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+@pytest.mark.parametrize("code", ["OPENAPI_TRADE_PLACE_ORDER_REPEAT", "OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED"])
+@pytest.mark.parametrize("fields", [{"symbol": "QQQ"}, {"side": "SELL"}, {"total_quantity": "2"}, {"total_quantity": "0.5"},
+                                    {"symbol": "SPYX", "status": "FILLED"}, {"side": "SELL", "status": "PARTIAL_FILLED"}])
+def test_after_a_refusal_a_live_row_under_our_tag_that_differs_is_an_unknown_outcome(tmp_path, code, fields):
+    # addendum 2: something of ours is live at the broker under this tag: never booked as refused
+    v, client, cid = _refused_venue(tmp_path, Response(observed_detail(wb.client_order_id("t"), observed_order(wb.client_order_id("t"), **fields))), code)
+    with pytest.raises(wb.WebullError) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert type(exc.value) is wb.WebullError and "outcome unknown" in str(exc.value) and "QQQ" not in str(exc.value)
 
 
 @pytest.mark.parametrize("status", ["CANCELLED", "FAILED", "EXPIRED", "REJECTED", "CANCELED"])
@@ -3366,8 +3380,13 @@ def test_after_a_refusal_a_crypto_row_is_matched_under_either_spelling_and_the_s
     cid = wb.client_order_id("c")
     row = observed_order(cid, symbol="BTCUSD", instrument_type="CRYPTO", total_quantity="0.003", side="SELL")
     v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, row)), tag="c", account_class="CRYPTO")
+    with pytest.raises(wb.WebullError, match="outcome unknown") as exc:
+        v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)               # a BUY sent, a live SELL there: not this order
+    assert type(exc.value) is wb.WebullError
+    row = observed_order(cid, symbol="BTCUSD", instrument_type="CRYPTO", total_quantity="0.003", side="SELL", status="CANCELLED")
+    v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, row)), tag="c", account_class="CRYPTO")
     with pytest.raises(wb.OrderRejected):
-        v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)               # a BUY sent, a SELL there: not this order
+        v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)               # dead and not this order: the refusal it was
 
 
 def _events_venue(tmp_path, details=None, positions=None):
@@ -3382,16 +3401,188 @@ def _event_detail(cid, **fields):
     return Response({"client_order_id": cid, "orders": [row]})
 
 
-@pytest.mark.parametrize("fields, accepted", [({}, True), ({"status": "CANCELLED"}, False), ({"total_quantity": "2"}, False)])
+@pytest.mark.parametrize("fields, accepted", [({}, "accepted"), ({"status": "CANCELLED"}, "rejected"), ({"total_quantity": "2"}, "unknown"),
+                                              ({"total_quantity": "2", "status": "CANCELLED"}, "rejected")])
 def test_after_a_refusal_an_event_row_must_also_be_the_order_sent_and_live(tmp_path, fields, accepted):
     cid = wb.client_order_id("e")
     v, client = _events_venue(tmp_path, details={cid: _event_detail(cid, **fields)})
     client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused(wb.REPEAT_CODE)(a, orders))
-    if accepted:
+    if accepted == "accepted":
         assert v.submit("KXTEST:yes", 1, "e", limit_price=0.5)["status"] == "accepted"
-    else:
+    elif accepted == "rejected":
         with pytest.raises(wb.OrderRejected):
             v.submit("KXTEST:yes", 1, "e", limit_price=0.5)
+    else:
+        with pytest.raises(wb.WebullError, match="outcome unknown") as exc:
+            v.submit("KXTEST:yes", 1, "e", limit_price=0.5)
+        assert type(exc.value) is wb.WebullError
+
+
+# ---- T22d-2 addendum 2: a dead row of THIS order that filled something, or whose fill cannot be read, and a live row
+# under our tag that differs, are unknown outcomes (the ledger keeps them unsettled and reads the fill); the full table
+
+def _case(tmp_path, kind, code=wb.REPEAT_CODE, **fields):
+    """A venue of `kind` (stock, crypto, event) whose placement is refused with `code` and whose detail row is the order
+    the call below sends, changed by `fields` (a value None drops the field); and that call."""
+    if kind == "event":
+        cid = wb.client_order_id("e")
+        row = {"client_order_id": cid, "order_id": "ORD-1", "symbol": "KXTEST", "side": "BUY", "status": "SUBMITTED", "fees": [],
+               "commission": {}, "instrument_type": "EVENT", "total_quantity": "1", "filled_quantity": "0", "filled_price": "0",
+               "event_outcome": "yes"}
+        client = FakeClient(account_class="EVENTS_CASH")
+        v = wb.WebullVenue(KEY, SECRET, client=client, account_class="EVENTS_CASH", confirmation_file=tmp_path / "x.json")
+        call = lambda: v.submit("KXTEST:yes", 1, "e", limit_price=0.5)                     # noqa: E731
+    else:
+        cid = wb.client_order_id("c" if kind == "crypto" else "t")
+        crypto = kind == "crypto"
+        row = observed_order(cid, **({"symbol": "BTCUSD", "instrument_type": "CRYPTO", "total_quantity": "0.003"} if crypto else {}))
+        client = FakeClient(account_class="CRYPTO" if crypto else "INDIVIDUAL_CASH")
+        v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+        call = (lambda: v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)) if crypto else (lambda: v.submit("SPY", 1.0, "t", limit_price=100.0))
+    for k, value in fields.items():
+        if value is None:
+            row.pop(k, None)
+        else:
+            row[k] = value
+    client._details[cid] = Response({"client_order_id": cid, "orders": [row]})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused(code)(a, orders))
+    call.venue = v
+    return call, client
+
+
+def _verdict(call):
+    try:
+        out = call()
+    except wb.OrderRejected:
+        return "rejected"
+    except wb.WebullError as exc:
+        return "unknown" if type(exc) is wb.WebullError and "outcome unknown" in str(exc) else f"other: {type(exc).__name__}"
+    return "accepted" if out.get("status") == "accepted" else "other"
+
+
+KINDS = ("stock", "crypto", "event")
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("status", ["CANCELLED", "FAILED", "EXPIRED", "REJECTED"])
+@pytest.mark.parametrize("filled", ["1", "0.5", "0.001", "1e-8"])
+def test_a_dead_row_of_this_order_that_filled_something_is_an_unknown_outcome(tmp_path, kind, status, filled):
+    call, client = _case(tmp_path, kind, status=status, filled_quantity=filled)
+    assert _verdict(call) == "unknown" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("filled", [None, "x", "", "-1", "nan", "inf", 7, True, {"q": 1}])
+def test_a_dead_row_of_this_order_whose_fill_cannot_be_read_is_an_unknown_outcome(tmp_path, kind, filled):
+    call, _ = _case(tmp_path, kind, status="CANCELLED", filled_quantity=filled)
+    assert _verdict(call) == "unknown", filled
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("filled", ["0", "0.0", "0.00000"])
+def test_a_dead_row_of_this_order_that_filled_nothing_is_still_the_refusal_it_was(tmp_path, kind, filled):
+    call, _ = _case(tmp_path, kind, status="CANCELLED", filled_quantity=filled)
+    assert _verdict(call) == "rejected"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("status", ["SUBMITTED", "PENDING", "PARTIAL_FILLED", "FILLED"])
+def test_a_live_row_under_our_tag_of_another_quantity_is_an_unknown_outcome(tmp_path, kind, status):
+    call, _ = _case(tmp_path, kind, status=status, total_quantity="2")
+    assert _verdict(call) == "unknown"
+
+
+@pytest.mark.parametrize("kind", ["stock", "crypto"])
+@pytest.mark.parametrize("fields", [{"symbol": "QQQ"}, {"side": "SELL"}])
+def test_a_live_row_under_our_tag_of_another_symbol_or_side_is_an_unknown_outcome(tmp_path, kind, fields):
+    call, _ = _case(tmp_path, kind, **fields)
+    assert _verdict(call) == "unknown"
+
+
+def _model(kind, row, sent_qty, sent_side):
+    """This test's own table (addendum 2) for a refused placement whose detail row under our tag is `row`."""
+    alive, dead = {"PENDING", "SUBMITTED", "PARTIAL_FILLED", "PARTIAL FILLED", "FILLED"}, {"CANCELLED", "CANCELED", "FAILED", "REJECTED", "EXPIRED"}
+    sym, side, qty, status, filled = (row.get(k) for k in ("symbol", "side", "total_quantity", "status", "filled_quantity"))
+
+    def number(x):
+        if isinstance(x, bool) or not isinstance(x, (str, int, float)):
+            return None
+        try:
+            d = Decimal(str(x))
+        except ArithmeticError:
+            return None
+        return d if d.is_finite() and d >= 0 else None
+    if kind == "event" and not (sym == "KXTEST" and isinstance(side, str) and side == sent_side):
+        return "unknown"                                                  # the events reading refuses the row itself
+    names = {"stock": {"SPY"}, "crypto": {"BTCUSD", "BTC-USD"}, "event": {"KXTEST"}}[kind]
+    q = number(qty) if isinstance(qty, str) else None
+    readable = isinstance(sym, str) and isinstance(side, str) and q is not None
+    same = readable and sym.upper() in names and side == sent_side and q == Decimal(sent_qty)
+    if same and status in alive:
+        return "accepted"
+    if status in dead and readable and not same:
+        return "rejected"
+    if status in dead and same and number(filled) == 0 and not isinstance(filled, (int, float)):
+        return "rejected"
+    return "unknown"
+
+
+def test_generated_refused_placements_follow_the_table(tmp_path):
+    import random
+    rng = random.Random(20261114)
+    seen, disagree = {}, []
+    for n in range(900):
+        kind = rng.choice(KINDS)
+        sent_qty = {"stock": "1", "crypto": "0.003", "event": "1"}[kind]
+        fields = {}
+        if rng.random() < 0.3:
+            fields["symbol"] = rng.choice(["QQQ", "spy" if kind == "stock" else "btcusd" if kind == "crypto" else "KXOTHER", None, 7])
+        if rng.random() < 0.3:
+            fields["side"] = rng.choice(["SELL", "buy", None, "SHORT"])
+        if rng.random() < 0.3:
+            fields["total_quantity"] = rng.choice(["2", "0.5", sent_qty + ".000", "x", None, "-1"])
+        fields["status"] = rng.choice(["SUBMITTED", "FILLED", "PARTIAL_FILLED", "PENDING", "CANCELLED", "FAILED", "EXPIRED",
+                                       "REJECTED", "CANCELED", "ODD", None])
+        fields["filled_quantity"] = rng.choice(["0", "0.0", "1", "0.5", "x", None, "-1", "nan", ""])
+        code = rng.choice([wb.REPEAT_CODE, "OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED"])
+        call, _ = _case(tmp_path, kind, code, **fields)
+        row = {"symbol": {"stock": "SPY", "crypto": "BTCUSD", "event": "KXTEST"}[kind], "side": "BUY", "total_quantity": sent_qty,
+               "status": "SUBMITTED", "filled_quantity": "0"}
+        row.update(fields)
+        row = {k: v for k, v in row.items() if v is not None}
+        want, got = _model(kind, row, sent_qty, "BUY"), _verdict(call)
+        seen[want] = seen.get(want, 0) + 1
+        if want != got:
+            disagree.append((kind, fields, want, got))
+    assert disagree == [], disagree[:5]
+    assert all(seen.get(k, 0) >= 50 for k in ("accepted", "rejected", "unknown")), seen
+
+
+def test_end_to_end_a_cancelled_row_with_a_fill_reaches_the_ledger_as_a_fill(tmp_path):
+    """The real OrderLedger and a fake venue: a refused placement whose row is this order, cancelled with 1 filled.
+    After submit_once the order is unknown (not refused, a state the ledger never asks about again); one reconcile
+    reads the fill, and the order, cancelled with something filled, is still asked about for late fees."""
+    from valedia_trader.execution_and_risk.orders import OrderLedger
+    now = [1_000_000.0]
+    ledger = OrderLedger(":memory:", not_sent=(wb.NotTransmitted, wb.OrderRejected), clock=lambda: now[0])
+    call, client = _case(tmp_path, "stock", wb.REPEAT_CODE, status="CANCELLED", filled_quantity="1", filled_price="100.25")
+    v = call.venue
+    assert ledger.reconcile(v, {})["clean"]                                  # the gate needs one clean reconcile first
+    ledger.intend("t", "SPY", 1.0, 100.0, limit_price=100.0)
+    states = [ledger.order("t")["state"]]
+    states.append(ledger.submit_once(v, "t")["state"])
+    assert states == ["intended", "unknown"], states
+    client._positions = [{"symbol": "SPY", "quantity": "1", "instrument_type": "EQUITY"}]     # the fill shows at the broker
+    now[0] += 60
+    out = ledger.reconcile(v, {})
+    rec = ledger.order("t")
+    fills = ledger.fills("t")
+    assert rec["state"] == "cancelled" and rec["filled_units"] == 1.0, rec
+    assert [f["units"] for f in fills] == [1.0] and fills[0]["price"] == 100.25, fills
+    assert out["clean"] and out["position_differences"] == {}, out
+    now[0] += 60
+    again = ledger.reconcile(v, {"SPY": 0.0})
+    assert again["orders_checked"] == 1                                      # still asked about (late fees, averages)
 
 
 # ---- B2: production refuses an order without a limit, before any request is built

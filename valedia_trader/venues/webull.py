@@ -292,9 +292,10 @@ class RateLimitHit(WebullError):
 
 class OrderRejected(WebullError):
     """Webull answered the order call and refused it, and a read of the order's detail then showed that no order
-    exists under its client order id, or (T22d-2 B1) that the order there is not the one just sent (another symbol,
-    side or quantity) or is dead (cancelled, rejected, expired, failed). Not a NotTransmitted (the order did reach
-    Webull), but its outcome is known: this request placed nothing live. `code` is Webull's error code in the code
+    exists under its client order id, or (T22d-2 B1) that the order there is dead (cancelled, rejected, expired,
+    failed) and either not the one just sent (another symbol, side or quantity) or that one with a filled_quantity of
+    exactly 0 (see the table in WebullVenue.submit). Not a NotTransmitted (the order did reach Webull), but its
+    outcome is known: this request placed nothing live and filled nothing. `code` is Webull's error code in the code
     shape, else None."""
 
     def __init__(self, message: str, code: str | None = None):
@@ -1437,6 +1438,8 @@ def _row_against_sent(item: dict, sent: dict) -> str:
 
 
 def _filled_units(item: dict) -> float | None:
+    """The row's filled quantity: its `filled_quantity` field (the name in the order-detail docs, and the one seen on
+    event rows in the test environment) and no other; absent, unreadable, not finite or negative is None, never 0."""
     n = _number(item.get("filled_quantity"))
     return None if n is None or n < 0 else n + 0.0                      # a negative fill is unreadable; -0.0 becomes 0.0
 
@@ -2248,11 +2251,24 @@ class WebullVenue:
 
         After the place_order call: when it fails with the SDK's ServerException and a 4xx status (Webull answered and
         refused; a 429 included: place is never retried), the order's detail is read once under the same client order
-        id. If the order is there, and its row is the order just sent (symbol, side and quantity, see _row_against_sent)
-        and live (not cancelled, rejected, expired or failed), submit returns it as accepted (this covers
-        OPENAPI_TRADE_PLACE_ORDER_REPEAT: the same client order id was sent before and that order exists); a row that
-        is another order or dead raises OrderRejected, and a row whose symbol, side, quantity or status cannot be read
-        is an unknown outcome (T22d-2 B1). If the detail gives the "no such order" answer
+        id. If the order is there, its row decides (T22d-2 B1; the same for stocks, crypto and event contracts). "This
+        order" means the row's symbol, side and quantity are those sent (see _row_against_sent); "alive" means the
+        status is PENDING, SUBMITTED, PARTIAL_FILLED or FILLED, "dead" that it is CANCELLED, CANCELED, FAILED, REJECTED
+        or EXPIRED (see _row_life); the filled quantity is the row's `filled_quantity` (see _filled_units):
+
+            this order, alive                                    -> accepted (this covers OPENAPI_TRADE_PLACE_ORDER_REPEAT:
+                                                                    the same client order id was sent before and exists)
+            this order, dead, filled exactly 0                   -> OrderRejected
+            this order, dead, filled above 0, or the filled      -> UNKNOWN OUTCOME, never OrderRejected: something
+              quantity absent or unreadable                         may have filled; order_status reads the fill
+            alive but not the order sent                         -> UNKNOWN OUTCOME, never OrderRejected: something
+                                                                    under our client order id is live at Webull
+            dead and not the order sent                          -> OrderRejected
+            a symbol, side, quantity or status that cannot be    -> UNKNOWN OUTCOME
+              read, or a status that is not a known one
+
+        A row that gives the filled quantity under another name than `filled_quantity` has no readable fill, so a dead
+        row of this order then is an unknown outcome, never OrderRejected. If the detail gives the "no such order" answer
         (see order_status; recognised here whatever confirmed_not_found says, because it follows a refusal), submit
         raises OrderRejected: Webull refused and no order exists. The exception is OPENAPI_TRADE_PLACE_ORDER_REPEAT:
         there Webull says an order with this client order id exists, so "no such order" on the detail read leaves the
@@ -2398,19 +2414,27 @@ class WebullVenue:
         if refused is not None:                                           # Webull answered 4xx: one detail read decides
             found, reason = self._after_refusal(cid, secrets, expected, sent=order)
             if found is not None:
-                # T22d-2 B1: accepted only when the row is the order just sent (symbol, side, quantity) and not dead
+                # T22d-2 B1 (the table in submit's docstring): accepted only when the row is the order just sent and live;
+                # OrderRejected only when the row is dead and either another order or this one with exactly 0 filled
                 match, life = found.get("sent_row", ("unreadable", "unknown"))
                 if match == "match" and life == "live":
                     return {"status": "accepted", "client_order_id": cid, "venue_order_id": found["venue_order_id"],
                             "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
-                if match == "differs" or (match == "match" and life == "dead"):
+                if life == "dead" and (match == "differs" or (match == "match" and found.get("filled_units") == 0.0)):
                     self._in_flight_sells.pop(cid, None)
                     what = ("the order its detail shows under this client order id is not the order sent (another symbol, side or "
-                            "quantity)" if match == "differs" else
-                            "its detail shows the order sent but no live order (cancelled, rejected, expired or failed)")
+                            "quantity) and is dead" if match == "differs" else
+                            "its detail shows the order sent but no live order (cancelled, rejected, expired or failed), and nothing filled")
                     raise OrderRejected(f"Webull refused the order, and {what}: " + self._final(detail), self._refusal_code(refused, secrets))
-                reason = ("the order's detail after the refusal cannot be read as the order sent (its symbol, side, quantity or "
-                          "status is unreadable or not a known one)")
+                if match == "match" and life == "dead":
+                    reason = ("the order's detail after the refusal shows the order sent, dead, but with something filled or a "
+                              "filled quantity (filled_quantity) that is absent or unreadable")
+                elif match == "differs" and life == "live":
+                    reason = ("the order's detail after the refusal shows a live order under this client order id that is not the "
+                              "order sent (another symbol, side or quantity)")
+                else:
+                    reason = ("the order's detail after the refusal cannot be read as the order sent (its symbol, side, quantity or "
+                              "status is unreadable or not a known one)")
             elif reason is None and type(refused[0]) is str and refused[0] == REPEAT_CODE:
                 reason = ("Webull says an order with this client order id already exists (OPENAPI_TRADE_PLACE_ORDER_REPEAT), "
                           "but its detail reads as no such order")

@@ -487,17 +487,23 @@ def _sent_names(sent):
     return names
 
 
+def _quantity(x):
+    """This test's own reading of a quantity Webull wrote as a string: a finite, non-negative Decimal, else None."""
+    try:
+        number = Decimal(x) if isinstance(x, str) else None
+    except ArithmeticError:
+        return None
+    return number if number is not None and number.is_finite() and number >= 0 else None
+
+
 def _row_reading(row, sent):
     """This test's own reading of a detail row against the order sent: "readable" is False when the symbol, side or
-    total quantity cannot be read; "same" whether it is that order; "status" the raw status."""
-    sym, side, qty = row.get("symbol"), row.get("side"), row.get("total_quantity")
-    try:
-        number = Decimal(qty) if isinstance(qty, str) else None
-    except ArithmeticError:
-        number = None
-    readable = isinstance(sym, str) and isinstance(side, str) and number is not None and number.is_finite() and number >= 0
+    total quantity cannot be read; "same" whether it is that order; "status" the raw status; "filled" the row's
+    filled_quantity as a Decimal (None when absent or unreadable)."""
+    sym, side, number = row.get("symbol"), row.get("side"), _quantity(row.get("total_quantity"))
+    readable = isinstance(sym, str) and isinstance(side, str) and number is not None
     same = readable and sym.upper() in _sent_names(sent) and side == sent["side"] and number == Decimal(sent["quantity"])
-    return {"readable": readable, "same": same, "status": row.get("status")}
+    return {"readable": readable, "same": same, "status": row.get("status"), "filled": _quantity(row.get("filled_quantity"))}
 
 
 def _the_row(s):
@@ -515,8 +521,10 @@ def _places(calls):
 def _is_b1(s, head_step, cand_step):
     """B1, recognised by what it is: the older adapter returned "accepted" after Webull refused the placement (a 4xx),
     the SDK saw exactly the same calls (one place, one detail read), and the detail row is NOT the order just sent,
-    alive. The candidate then raises OrderRejected when the row is readable and another order or dead, and a plain
-    WebullError of unknown outcome when the row or its status cannot be read; anything else is not B1."""
+    alive. The candidate then raises OrderRejected only when the row is readable and dead, and either another order
+    or this one with a filled_quantity of exactly 0 (this test's own reading); in every other case (this order dead
+    with something filled or no readable fill, a live row of another order, an unreadable row or status) a plain
+    WebullError of unknown outcome. Anything else is not B1."""
     (_, h_out, h_calls), (_, c_out, c_calls) = head_step, cand_step
     if h_calls != c_calls or s["place"] not in ("417", "repeat") or h_out[0] != "ok" or h_out[1].get("status") != "accepted":
         return False
@@ -527,7 +535,7 @@ def _is_b1(s, head_step, cand_step):
     reading = _row_reading(row, places[0][2][0])
     if reading["same"] and reading["status"] in ALIVE_STATUSES:
         return False                                              # this order, alive: "accepted" was right
-    rejected = reading["readable"] and (not reading["same"] or reading["status"] in DEAD_STATUSES)
+    rejected = reading["readable"] and reading["status"] in DEAD_STATUSES and (not reading["same"] or reading["filled"] == 0)
     if rejected:
         return "OrderRejected" in c_out[1] and "NotTransmitted" not in c_out[1]
     return c_out[1][0] == "WebullError" and "outcome unknown" in c_out[2]
@@ -555,12 +563,37 @@ def _floor(x, crypto):
     return x.quantize(Decimal(1).scaleb(-(8 if crypto else 5)), rounding="ROUND_FLOOR")
 
 
+def _own_open_sells(s, symbol):
+    """This test's own sum of the unfilled remainder of the scripted open sells of `symbol` and its instrument type
+    (EQUITY, or CRYPTO for a -USD pair): rows of exactly that instrument_type whose symbol, upper-cased and for crypto
+    BTCUSD read as BTC-USD, is the symbol; side SELL or SHORT (trimmed, any case); total minus filled, or the total when
+    the filled quantity is unreadable or above it. None when such a row has no readable total."""
+    crypto = symbol.upper().endswith("-USD")
+    kind, sym, total = ("CRYPTO" if crypto else "EQUITY"), symbol.upper(), Decimal(0)
+    for r in s["open_rows"]:
+        name, side = r.get("symbol"), r.get("side")
+        if r.get("instrument_type") != kind or not isinstance(name, str):
+            continue
+        name = name.upper()
+        if crypto and name.endswith("USD") and "-" not in name:
+            name = name[:-3] + "-USD"
+        if name != sym or not (isinstance(side, str) and side.strip().upper() in ("SELL", "SHORT")):
+            continue
+        q, f = _quantity(r.get("total_quantity")), _quantity(r.get("filled_quantity"))
+        if q is None:
+            return None
+        total += q - f if f is not None and f <= q else q
+    return total
+
+
 def _is_b3(s, head_step, cand_step, reserved):
     """B3, recognised by what it is, at the second submit (a sale of the same symbol right after the first): either
     the older adapter sent the sale and the candidate refused it as long-only after the same reads and before any order
     call, with figures such that the sale fits once the reservation is taken out of the "in open sells" figure and does
     not fit with it; or both refused it as long-only with the same calls and the same text except the "in open sells"
-    figure, which is larger in the candidate by exactly the reservation."""
+    figure, which is larger in the candidate by exactly the reservation. Where the older adapter sent the sale, the
+    candidate's "in open sells" figure must also be, as printed, this test's own sum of the open sells
+    (_own_open_sells) plus the reservation."""
     (_, h_out, h_calls), (_, c_out, c_calls) = head_step, cand_step
     if reserved <= 0 or c_out[0] != "raised" or "NotTransmitted" not in c_out[1]:
         return False
@@ -573,7 +606,8 @@ def _is_b3(s, head_step, cand_step, reserved):
     if without < 0 or symbol != s["symbol"]:                      # the message names the symbol as asked
         return False
     if _places(h_calls):                                          # the older adapter sent it (whatever Webull answered)
-        return (not _places(c_calls) and c_calls == h_calls[:len(c_calls)]
+        own = _own_open_sells(s, symbol)
+        return (own is not None and m[4] == f"{float(own + reserved):g}" and not _places(c_calls) and c_calls == h_calls[:len(c_calls)]
                 and amount <= _floor(held - without, crypto) and amount > _floor(held - open_sells, crypto))
     h = LONG_ONLY.fullmatch(h_out[2]) if h_out[0] == "raised" else None
     return (h is not None and h_calls == c_calls and h_out[1] == c_out[1] and (h[1], h[2], h[3]) == (m[1], m[2], m[3])
@@ -640,6 +674,24 @@ def test_generated_stock_and_crypto_inputs_behave_as_before_except_b1_and_b3(tmp
     assert compared == 600 and placed > 150 and accepted_before > 100 and accepted == accepted_before - kinds["B1_first"]
     assert kinds["B1"] > 0, f"no B1 difference was ever seen, so the test never reached the case it exists for: {kinds}"
     assert identical + kinds["B1"] + kinds["B3"] >= compared
+
+
+def test_the_b3_recogniser_checks_the_in_open_sells_figure_where_the_older_adapter_sent_the_sale():
+    """In every B3 case the generator above reaches, the figures leave no slack (nothing else in open sells, the sale
+    equal to the holding), so the amount checks alone pin the figure. With slack they do not: 2 of 5 held, an open sell
+    of 1 and a reservation of 3 fit any printed figure above 3 up to 4 under those checks; only 4 is the sum."""
+    s = {"symbol": "SPY", "open_rows": [{"symbol": "SPY", "side": "SELL", "instrument_type": "EQUITY", "total_quantity": "1",
+                                         "filled_quantity": "0"}, {"symbol": "SPY", "side": "BUY", "instrument_type": "EQUITY",
+                                                                   "total_quantity": "9", "filled_quantity": "0"}]}
+    reads = [("open", "A", None), ("positions", "A")]
+    head_step = ("second submit", ("ok", {"status": "accepted"}), reads + [("place", "A", [{"side": "SELL"}])])
+
+    def cand(figure):
+        text = f"selling 2 SPY with 5 held and {figure} in open sells would open a short; this venue is long-only"
+        return ("second submit", ("raised", ["NotTransmitted", "WebullError", "Exception", "BaseException", "object"], text), reads)
+    assert _is_b3(s, head_step, cand("4"), Decimal(3))
+    for wrong in ("3", "3.5", "3.999"):
+        assert not _is_b3(s, head_step, cand(wrong), Decimal(3)), wrong
 
 
 def test_the_order_payload_function_is_unchanged(head):
