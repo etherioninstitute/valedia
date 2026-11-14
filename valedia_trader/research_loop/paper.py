@@ -180,6 +180,22 @@ def market_conditions(prices: pd.DataFrame, market: tuple[str, ...] | list[str],
             "return_20d": float(np.expm1(recent.sum())) if len(recent) else float("nan")}
 
 
+def _is_price(px: float) -> bool:
+    """A price is a finite number above zero; anything else (missing, not a number, infinite, zero, negative) is none."""
+    return bool(np.isfinite(px) and px > 0)
+
+
+def _valid_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    """`prices` with every value that is not a finite number above zero made missing (NaN). The same object, untouched,
+    when there is no such value other than a missing one."""
+    values = prices.to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        good = np.isfinite(values) & (values > 0)
+    if (good | np.isnan(values)).all():
+        return prices
+    return prices.where(good)
+
+
 class Venue(Protocol):
     name: str
 
@@ -273,37 +289,49 @@ class PaperTrader:
 
     @staticmethod
     def _mark(sym: str, lot: dict, row: pd.Series, carried: dict[str, float] | None) -> float:
-        """The price a held lot is valued at: today's when it is finite, else the last finite price before today
-        (`carried`), else the lot's cost. A held position is never valued at nothing."""
+        """The price a held lot is valued at: today's when it is a price (a finite number above zero), else the last price
+        before today (`carried`), else the lot's cost. A held position is never valued at nothing."""
         px = float(row.get(sym, np.nan))
-        if np.isfinite(px):
+        if _is_price(px):
             return px
         if carried and sym in carried:
             return carried[sym]
         return float(lot["cost"])
 
     def _carried_prices(self, prices: pd.DataFrame) -> dict[str, float]:
-        """For each fund the book holds that has no finite price today: the last finite price before today in `prices`
-        (left out when there is none: the lot is then valued at its cost)."""
+        """For each fund the book holds that has no price today: the last price before today in `prices` (left out when
+        there is none: the lot is then valued at its cost)."""
         row, out = prices.iloc[-1], {}
         for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
-            if np.isfinite(float(row.get(sym, np.nan))):
+            if _is_price(float(row.get(sym, np.nan))):
                 continue
             if sym in prices.columns:
                 earlier = prices[sym].iloc[:-1].to_numpy(dtype=float)
-                earlier = earlier[np.isfinite(earlier)]
+                with np.errstate(invalid="ignore"):
+                    earlier = earlier[np.isfinite(earlier) & (earlier > 0)]
                 if earlier.size:
                     out[sym] = float(earlier[-1])
         return out
 
-    def _stale_funds(self, prices_row: pd.Series) -> list[str]:
-        """The funds the book holds that have no finite price in `prices_row`, sorted."""
-        return sorted({sym for book in self.state["positions"].values() for sym, lot in book.items()
-                       if lot["units"] and not np.isfinite(float(prices_row.get(sym, np.nan)))})
+    def _stale_funds(self, prices: pd.DataFrame) -> dict[str, int]:
+        """The funds the book holds that have no price on the last row of `prices`, by name, each with the number of
+        consecutive rows, the last included, on which it has had none (every row, for a fund without a column)."""
+        row, out = prices.iloc[-1], {}
+        for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
+            if _is_price(float(row.get(sym, np.nan))):
+                continue
+            if sym not in prices.columns:
+                out[sym] = len(prices)
+                continue
+            values = prices[sym].to_numpy(dtype=float)
+            with np.errstate(invalid="ignore"):
+                good = np.flatnonzero(np.isfinite(values) & (values > 0))
+            out[sym] = int(len(values) - (good[-1] + 1 if good.size else 0))
+        return out
 
     def equity(self, prices_row: pd.Series, carried: dict[str, float] | None = None) -> float:
-        """Cash plus every held lot at `_mark`: a fund with no finite price in `prices_row` is valued at its `carried`
-        price, or at the lot's cost."""
+        """Cash plus every held lot at `_mark`: a fund with no price in `prices_row` (none that is a finite number above
+        zero) is valued at its `carried` price, or at the lot's cost."""
         value = sum(lot["units"] * self._mark(sym, lot, prices_row, carried) for book in self.state["positions"].values()
                     for sym, lot in book.items() if lot["units"])
         return float(self.state["cash"] + value)
@@ -341,8 +369,8 @@ class PaperTrader:
         still = []
         for o in self.state["pending"]:
             px = float(row.get(o["symbol"], np.nan))
-            if not np.isfinite(px):
-                still.append(o)                           # no price today: the order waits
+            if not _is_price(px):
+                still.append(o)                           # no price today (none, or not above zero): the order waits
                 continue
             fill = px * (1.0 + np.sign(o["units"]) * self.slippage_bps * 1e-4)
             fee = abs(o["units"]) * fill * self.fee_bps * 1e-4
@@ -425,7 +453,7 @@ class PaperTrader:
         for case in self.state.get("panel_cases", []):
             later = prices.index[prices.index > pd.Timestamp(case["decided_on"])]
             px = float(prices[case["symbol"]].iloc[-1]) if case["symbol"] in prices.columns else float("nan")
-            if len(later) < case["horizon_days"] or not np.isfinite(px):
+            if len(later) < case["horizon_days"] or not _is_price(px):
                 still.append(case)
                 continue
             outcome = int((px > case["price"]) if case["side"] == "buy" else (px < case["price"]))
@@ -466,10 +494,18 @@ class PaperTrader:
         """Run one day using `prices` up to and including today (its last row). `strategies` maps
         the ledger's hypothesis id to the strategy. Returns the day's summary.
 
-        A fund with no finite price today is not traded: its pending orders wait and no new order is decided for it.
-        If the book holds it, it is valued at the last finite price before today in `prices` (at the lot's cost when
-        there is none) in the equity, the strategy values, the capital per strategy and the benchmarks alike, and the
-        summary names it in `stale_prices` (present only on such a day)."""
+        A price is a finite number above zero; any other value in `prices` (missing, not a number, infinite, zero or
+        negative) is no price, and is read as missing everywhere the day reads prices: valuation, the benchmark, fills,
+        decisions, the strategies' rules and the panel. A fund with no price today is not traded: its pending orders
+        wait and no new order is decided for it. If the book holds it, it is valued at the last price before today in
+        `prices` in the equity, the strategy values, the capital per strategy and the benchmarks alike, and the summary's
+        `stale_prices` maps it to the number of consecutive days, today included, it has had no price in `prices`
+        (present only on such a day; nothing about it is kept in the state file).
+
+        Not handled: a run given a price history that starts after a fund was bought, or that lacks the fund's column,
+        values the position at its cost (and counts every row of the history given as carried); a strategy whose every
+        fund is missing from `prices` makes the rules raise, as before."""
+        prices = _valid_prices(prices)
         day = prices.index[-1]
         if self.state["last_day"] is not None and str(day.date()) <= self.state["last_day"]:
             raise ValueError(f"{day.date()} was already processed; paper trading only moves forward")
@@ -478,7 +514,7 @@ class PaperTrader:
         before = self.state["history"][-1]["strategy_values"] if self.state["history"] else {}
         self._fill_pending(day, row)
         self._settle_panel(prices)
-        stale = self._stale_funds(row)
+        stale = self._stale_funds(prices)
         carried = self._carried_prices(prices) if stale else None
         equity = self.equity(row, carried)
         self.state["peak_equity"] = max(self.state["peak_equity"], equity)
@@ -590,7 +626,7 @@ class PaperTrader:
         daily, no costs), started with the capital the strategy had on its first paper day. It is a yardstick, not a book:
         it places no orders, meets no risk check and pays no costs. Only the start day and capital are stored; the value
         is recomputed from prices each day. A book saved before this existed takes both from its own history. A day on
-        which a fund has no finite price carries its last finite price, as the book does."""
+        which a fund has no price (none that is a finite number above zero) carries its last price, as the book does."""
         books, out = self.state.setdefault("benchmarks", {}), {}
         for s in strategies.values():
             if s.name not in books:
@@ -602,9 +638,9 @@ class PaperTrader:
             if len(since) < 2 or not funds:
                 out[s.name] = 0.0
                 continue
-            frame = prices[funds]
-            if not np.isfinite(frame.to_numpy(dtype=float)).all():          # a gap: carry the last finite price
-                frame = frame.where(np.isfinite(frame)).ffill()
+            frame = _valid_prices(prices[funds])
+            if frame.isna().to_numpy().any():                              # a gap: carry the last price
+                frame = frame.ffill()
             held = buy_and_hold(frame.loc[since[0]:])
             out[s.name] = float(books[s.name]["capital"] * (np.prod(1.0 + held.iloc[1:]) - 1.0))
         return out

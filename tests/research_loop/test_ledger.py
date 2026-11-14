@@ -243,3 +243,23 @@ def test_a_ledger_file_written_before_is_continued_with_the_same_layout(tmp_path
     assert sorted(tuple(r) for r in led._db.execute("SELECT type, name, sql FROM sqlite_master")) == schema
     assert [f["finding"] for f in led.findings(a)] == ["status -> paused: first reason", "status -> passed paper: second reason"]
     _consistent(path)
+
+
+def test_a_caller_that_catches_the_error_and_commits_later_saves_neither_the_status_nor_the_reason(tmp_path):
+    path = tmp_path / "ledger.db"
+    led = lg.HypothesisLedger(path)
+    a = led.propose("Idea A", "price-analyst", "us-etf")
+    led.set_status(a, "passed paper", "held up for 20 days", "critic")
+    real, led._db = led._db, _FailingFindings(led._db)
+    try:
+        led.set_status(a, "paused", "drawdown deeper than the backtest", "critic")
+    except sqlite3.OperationalError:
+        pass                                                       # the caller carries on
+    led._db = real
+    led.add_lesson(None, "a later finding, committed", "critic")   # a later write commits whatever is open
+    led._db.commit()
+    led.close()
+    again = lg.HypothesisLedger(path)
+    assert again.get(a)["status"] == "passed paper" and "status -> paused" not in again.get(a)["lessons_learned"]
+    assert [f["finding"] for f in again.findings()] == ["status -> passed paper: held up for 20 days", "a later finding, committed"]
+    _consistent(path)

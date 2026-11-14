@@ -216,3 +216,74 @@ def test_with_one_capital_throughout_the_returns_are_as_before(desk):
     days = summaries(journal, "2026-11-02", [0.01, -0.02, 0.005])
     out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
     assert out["strategies"]["mom"]["result"]["total_return"] == pytest.approx(1.01 * 0.98 * 1.005 - 1)
+
+
+# ---- T29 rev 2: a day with a carried price is not evidence toward passing paper; the first day on its own capital
+
+def _carried_summaries(journal, start, daily_returns, carried_on, fund="SPY", holder="mom"):
+    """Summaries as `summaries`, the days at positions `carried_on` naming `fund` as carried; `holder` bought it on day 0."""
+    days = pd.bdate_range(start, periods=len(daily_returns))
+    journal.write(days[0], {"type": "fill", "strategy": holder, "version": "1.0.0", "symbol": fund, "units": 10.0, "price": 100.0,
+                            "fee": 0.0, "realized_pnl": None})
+    for k, (d, r) in enumerate(zip(days, daily_returns)):
+        entry = {"type": "summary", "strategy_value_change": {"mom": r * 50_000.0}, "capital_per_strategy": 50_000.0}
+        if k in carried_on:
+            entry["stale_prices"] = {fund: 1}
+        journal.write(d, entry)
+    return days
+
+
+def _rising(n, seed=1):
+    return (0.0006 + 0.003 * np.random.default_rng(seed).standard_normal(n)).tolist()
+
+
+def test_days_with_a_carried_price_do_not_count_toward_passing_paper_and_the_review_says_so(desk):
+    ledger, journal, limits, hid = desk
+    days = _carried_summaries(journal, "2026-09-01", _rising(22), carried_on={4, 9, 15})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed backtest only"            # 19 days that count: below the bar of 20
+    result = out["strategies"]["mom"]["result"]
+    assert result["days"] == 22 and result["carried_price_days"] == 3 and result["carried_price_funds"] == ["SPY"]
+    assert any("3 paper days with a carried price (SPY)" in f and "left out" in f for f in out["findings"])
+    assert "3 paper days with a carried price (SPY)" in (journal.dir / f"review-{days[-1].date()}.md").read_text()
+
+
+def test_the_same_days_with_every_price_pass_paper(desk):
+    ledger, journal, limits, hid = desk
+    days = _carried_summaries(journal, "2026-09-01", _rising(22), carried_on=set())
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed paper" and "carried_price_days" not in out["strategies"]["mom"]["result"]
+    assert not any("carried price" in f for f in out["findings"])
+
+
+def test_a_carried_price_of_a_fund_another_strategy_holds_does_not_count_against_this_one(desk):
+    ledger, journal, limits, hid = desk
+    days = _carried_summaries(journal, "2026-09-01", _rising(22), carried_on={4, 9, 15}, holder="other")
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed paper"
+
+
+def test_a_fund_sold_before_the_carried_day_does_not_count_against_the_strategy(desk):
+    ledger, journal, limits, hid = desk
+    days = _carried_summaries(journal, "2026-09-01", _rising(22), carried_on={4, 9, 15})
+    journal.write(days[2], {"type": "fill", "strategy": "mom", "version": "1.0.0", "symbol": "SPY", "units": -10.0, "price": 101.0,
+                            "fee": 0.0, "realized_pnl": 10.0})
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed paper"
+
+
+def test_carried_days_still_count_for_a_pause(desk):
+    ledger, journal, limits, hid = desk
+    days = _carried_summaries(journal, "2026-11-02", [-0.03, -0.03, -0.02], carried_on={0, 1, 2})
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "paused" and "deeper than the worst drawdown" in ledger.get(hid)["lessons_learned"]
+
+
+def test_a_first_day_is_measured_on_its_own_capital_when_the_next_days_capital_differs(desk):
+    ledger, journal, limits, hid = desk
+    days = pd.bdate_range("2026-11-02", periods=3)
+    for d, cap, change in zip(days, [40_000.0, 60_000.0, 50_000.0], [-400.0, -400.0, -600.0]):
+        journal.write(d, {"type": "summary", "strategy_value_change": {"mom": change}, "capital_per_strategy": cap})
+    r = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)["strategies"]["mom"]["result"]
+    # -400 on its first capital 40,000; -400 on 40,000 (the day before); -600 on 60,000: 1% each day
+    assert r["total_return"] == pytest.approx(0.99 ** 3 - 1) and r["max_drawdown"] == pytest.approx(1 - 0.99 ** 3)

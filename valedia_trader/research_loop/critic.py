@@ -76,6 +76,23 @@ def benchmark_comparison(entries: list[dict]) -> list[dict]:
     return rows
 
 
+def carried_days(entries: list[dict], name: str) -> tuple[list[bool], list[str]]:
+    """For each of the strategy's day summaries in `entries` (those whose `strategy_value_change` names it, in order):
+    whether the strategy held a fund that day whose price was carried (the summary's `stale_prices`), and the funds that
+    made any day carried. What the strategy held comes from its fills in the same entries, up to and including the day."""
+    held: dict[str, float] = {}
+    marks, funds = [], set()
+    for e in entries:
+        if e.get("type") == "fill" and e.get("strategy") == name:
+            held[e["symbol"]] = held.get(e["symbol"], 0.0) + float(e.get("units") or 0.0)
+        elif e.get("type") == "summary" and name in e.get("strategy_value_change", {}):
+            stale = e.get("stale_prices") or {}
+            hit = {sym for sym in stale if abs(held.get(sym, 0.0)) > 1e-12}
+            marks.append(bool(hit))
+            funds |= hit
+    return marks, sorted(funds)
+
+
 def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies: dict[int, str], limits_file: str | Path,
                   days: int = 7, rules: CriticRules | None = None, apply: bool = True,
                   narrator: Callable[[str], str] | None = None) -> dict:
@@ -155,6 +172,10 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         returns = np.array([e["strategy_value_change"][name] / cap for e, cap in zip(summaries, started)], dtype=float)
         in_week = np.array([e["strategy_value_change"][name] / cap for e, cap in zip(summaries, started)
                             if e["day"] >= str(since.date())], dtype=float)
+        # a day on which the strategy held a fund whose price was carried is no evidence of holding up: it is left out of
+        # the days that count toward passing paper (and nothing else; the pause rules use every day)
+        carried, carried_funds = carried_days(everything, name)
+        kept = returns[~np.array(carried, dtype=bool)] if len(carried) == len(returns) else returns
         closed = [e for e in everything if e["type"] == "fill" and e["strategy"] == name and e.get("realized_pnl") is not None]
         losers = [e for e in closed if e["realized_pnl"] < 0 and e["day"] >= str(since.date())]
         bt = ((h["backtest_result"] or {}).get("result") or {})
@@ -174,7 +195,17 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                   "closed_trades": len(closed), "trade_win_rate": win, "z_vs_backtest": z,
                   "backtest_annual_return": bt_mu, "backtest_max_drawdown": bt.get("max_drawdown"),
                   "predicted_annual_return": prediction.get("annual_return"), "predicted_win_rate": prediction.get("win_rate")}
+        left_out = n - len(kept)
+        n_kept, total_kept, z_kept = len(kept), float(np.prod(1.0 + kept) - 1.0) if len(kept) else float("nan"), float("nan")
+        if n_kept >= 2 and bt_mu is not None and bt_sd:
+            z_kept = (float(np.mean(kept)) - bt_mu / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n_kept))
+        if left_out:
+            result.update({"carried_price_days": left_out, "carried_price_funds": carried_funds})
         notes = []
+        if left_out:
+            notes.append(f"{name}: {left_out} paper day{'s' if left_out != 1 else ''} with a carried price ({', '.join(carried_funds)}) "
+                         f"{'are' if left_out != 1 else 'is'} left out of the days that count toward passing paper; "
+                         f"{n_kept} of its {n} days count.")
         if n and bt_mu is not None and math.isfinite(live_annual) and live_annual < bt_mu:
             notes.append(f"{name} is running at {_fmt(live_annual)} a year on paper against {_fmt(bt_mu)} in its backtest, "
                          f"{_fmt(bt_mu - live_annual)} worse ({n} days, z {_fmt(z, False)}).")
@@ -204,11 +235,12 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
             if apply and status not in ("paused", "failed", "retired"):
                 ledger.set_status(hid, "paused", pause, "critic")
                 status = "paused"
-        elif (not incomplete and status == "passed backtest only" and n >= rules.promote_days and math.isfinite(z) and z >= rules.promote_min_z
-              and live_total > 0):
-            notes.append(f"{name} has held up for {n} paper days (z {_fmt(z, False)} against its backtest).")
+        elif (not incomplete and status == "passed backtest only" and n_kept >= rules.promote_days and math.isfinite(z_kept)
+              and z_kept >= rules.promote_min_z and total_kept > 0):
+            notes.append(f"{name} has held up for {n_kept} paper days (z {_fmt(z_kept, False)} against its backtest).")
             if apply:
-                ledger.set_status(hid, "passed paper", f"{n} paper days, return {_fmt(live_total)}, z {z:.2f} against the backtest", "critic")
+                ledger.set_status(hid, "passed paper", f"{n_kept} paper days, return {_fmt(total_kept)}, z {z_kept:.2f} against the backtest",
+                                  "critic")
                 status = "passed paper"
         elif n < rules.min_days_to_judge:
             notes.append(f"{name} has {n} paper days. That is too few to judge; the bar is {rules.min_days_to_judge}.")

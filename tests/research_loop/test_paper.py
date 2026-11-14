@@ -1,4 +1,5 @@
 import json
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -935,7 +936,7 @@ LEVELS = (-0.4, 0.0, 0.4)                     # weight steps of 0.4 against a 15
                                               # schedule changes, never from drift
 
 
-def _gap_history(seed):
+def _gap_history(seed, values=None):
     """A seeded history: 2 to 4 funds, 1 to 3 scripted strategies joining on decision days, and gaps of the seed's kind
     (and maybe a second kind) placed where neither history would trade the fund: never on a decision day or the day its
     orders fill. Returns prices with gaps, the same prices gap-filled with the last known price, the schedules, the join
@@ -992,8 +993,12 @@ def _gap_history(seed):
     gapped = px.copy()
     for i, fs in gaps.items():
         for f in fs:
-            gapped.iloc[i, gapped.columns.get_loc(f)] = np.inf if rng.random() < 0.2 else np.nan
-    filled = gapped.where(np.isfinite(gapped)).ffill()
+            if values is None:
+                bad = np.inf if rng.random() < 0.2 else np.nan
+            else:                                                  # zero, negative, not a number, infinite: all no price
+                bad = (0.0, -float(px.iloc[i][f]), np.nan, np.inf)[int(rng.integers(4))]
+            gapped.iloc[i, gapped.columns.get_loc(f)] = bad
+    filled = gapped.where(np.isfinite(gapped) & (gapped > 0)).ffill()
     strategies = {nm: long_only(nm, market=tuple(markets[nm])) for nm in names}
     return gapped, filled, schedules, joins, strategies, gaps, used
 
@@ -1007,6 +1012,12 @@ def _run(directory, limits, frame, strategies, joins, after_step=None):
         if after_step is not None:
             after_step(t, i, out[-1])
     return t, out
+
+
+def _drop(*traders):
+    """Remove the checked histories' journals: hundreds of them would otherwise fill the temporary folder."""
+    for t in traders:
+        shutil.rmtree(t.dir)
 
 
 SAME = ("equity", "strategy_values", "strategy_value_change", "capital_per_strategy", "benchmark_values", "daily_loss_pct",
@@ -1047,10 +1058,19 @@ def test_a_history_with_price_gaps_values_the_book_exactly_as_the_same_history_g
                     assert e["type"] not in ("fill", "decision"), (seed, e)
         assert tg.state["positions"] == tf.state["positions"] and tg.state["cash"] == tf.state["cash"]
         for i, (want, named) in stale_seen.items():                 # named when not empty, and only then
-            assert named == (want or None), (seed, i)
+            assert named == ({f: _carried_run(gapped, f, i) for f in want} or None), (seed, i)
         carried += sum(bool(want) for want, _ in stale_seen.values())
+        _drop(tg, tf)
     assert all(kinds.get(kind, 0) >= 8 for kind in GAP_KINDS), kinds
     assert carried >= 40, carried                                  # the gaps did fall on held funds, many times
+
+
+def _carried_run(frame, fund, i):
+    """Bars up to and including bar i on which `fund` has no price that is a finite number above zero, counted back."""
+    n = 0
+    while i - n >= 0 and not (np.isfinite(frame[fund].iloc[i - n]) and frame[fund].iloc[i - n] > 0):
+        n += 1
+    return n
 
 
 def _two_funds_one_day_gap(setup, monkeypatch, fill_gap=False, **kw):
@@ -1078,7 +1098,7 @@ def test_a_held_fund_with_no_price_keeps_its_last_price_in_equity_strategy_value
                                                           + lots["BBB"]["units"] * (carried - lots["BBB"]["cost"]))
     assert gap["capital_per_strategy"] == gap["equity"]
     _adds_up(out)
-    assert gap["stale_prices"] == ["BBB"] and all("stale_prices" not in o for i, o in enumerate(out) if i != 3)
+    assert gap["stale_prices"] == {"BBB": 1} and all("stale_prices" not in o for i, o in enumerate(out) if i != 3)
     twin, filled, _ = _two_funds_one_day_gap(setup, monkeypatch, fill_gap=True, directory=tmp_path / "filled")
     assert [o["equity"] for o in out] == [o["equity"] for o in filled]
     assert [o["benchmark_values"] for o in out] == [o["benchmark_values"] for o in filled]
@@ -1116,7 +1136,7 @@ def test_a_held_fund_with_no_earlier_price_in_the_data_is_valued_at_its_cost(set
     aaa = t.state["positions"]["two"]["AAA"]
     assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * lot["cost"])
     _adds_up(out + [later])
-    assert later["stale_prices"] == ["BBB"]
+    assert later["stale_prices"] == {"BBB": DAY0 + 6}                # every bar of the frame given lacks it
 
 
 class _Clock(pp.datetime):
@@ -1165,8 +1185,94 @@ def test_where_no_price_is_missing_every_journal_entry_state_file_and_summary_is
     digest = hashlib.sha256()
     for seed in range(200):
         files, summaries = _plain_history(seed, tmp_path / f"h{seed}", setup[1])
+        shutil.rmtree(tmp_path / f"h{seed}")                          # checked: keep the disk free
         for name, body in files:
             digest.update(name.encode() + b"\0" + body + b"\0")
         digest.update(summaries + b"\1")
         assert b"stale_prices" not in summaries
     assert digest.hexdigest() == PLAIN_DIGEST
+
+
+# ---- T29 rev 2: a price is a finite number above zero; `stale_prices` says for how many days
+
+@pytest.mark.parametrize("block", range(6))
+def test_zero_negative_and_missing_prices_mixed_value_the_book_as_the_same_history_gap_filled(setup, tmp_path, monkeypatch, block):
+    """Outcomes 1 and 2 on 300 seeded histories (50 a block): every gap kind, each bad cell a zero, a negative number, not
+    a number or infinite, against the same history with each bad cell filled by the last price above zero."""
+    limits = tmp_path / "loose.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 90.0, "max_drawdown_pct": 90.0, "max_position_pct": 1.0, "max_open_positions": 20}))
+    carried, kinds, values = 0, {}, set()
+    for seed in range(block * 50, block * 50 + 50):
+        gapped, filled, schedules, joins, strategies, gaps, used = _gap_history(seed, values="mixed")
+        for kind in used:
+            kinds[kind] = kinds.get(kind, 0) + 1
+        for i, fs in gaps.items():
+            values |= {"zero" if v == 0 else "negative" if v < 0 else "infinite" if np.isinf(v) else "nan"
+                       for v in (float(gapped[f].iloc[i]) for f in fs)}
+        monkeypatch.setattr(pp, "run_rules", _schedule_rules(schedules))
+        seen = {}
+        tg, a = _run(tmp_path / f"gap{seed}", limits, gapped, strategies, joins,
+                     after_step=lambda t, i, summary: seen.__setitem__(i, (sorted(_held_now(t) & gaps.get(i, set())), summary.get("stale_prices"))))
+        tf, b = _run(tmp_path / f"filled{seed}", limits, filled, strategies, joins)
+        for x, y in zip(a, b):
+            assert {key: x[key] for key in SAME} == {key: y[key] for key in SAME}, (seed, x["day"], used)
+            assert x["orders_blocked"] == 0 and "stale_prices" not in y
+            assert all(np.isfinite(v) for v in x["benchmark_values"].values())
+        _adds_up(a)
+        _adds_up(b)
+        for e in tg.journal.read():                                 # nothing traded a fund on a day it had no price
+            i = gapped.index.get_loc(pd.Timestamp(e["day"]))
+            if e.get("symbol") in gaps.get(i, set()):
+                assert e["type"] not in ("fill", "decision"), (seed, e)
+            if e["type"] == "fill":
+                assert e["price"] > 0, (seed, e)
+        assert tg.state["positions"] == tf.state["positions"] and tg.state["cash"] == tf.state["cash"]
+        assert tg.state["realized"] == tf.state["realized"]
+        for i, (want, named) in seen.items():
+            assert named == ({f: _carried_run(gapped, f, i) for f in want} or None), (seed, i)
+        carried += sum(bool(want) for want, _ in seen.values())
+        _drop(tg, tf)
+    assert all(kinds.get(kind, 0) >= 8 for kind in GAP_KINDS), kinds
+    assert values == {"zero", "negative", "infinite", "nan"} and carried >= 40, (values, carried)
+
+
+def _exit_onto(close, setup, monkeypatch, tmp_path):
+    """AAA bought on bar 30 (fills on 31 at 100), sold on bar 32 at 80; the fill day, bar 33, closes at `close`."""
+    px = scripted_market()
+    px.iloc[DAY0 + 3, 0] = close
+    weights = [{"AAA": 0.5}] * (DAY0 + 2) + [{"AAA": 0.0}] * (len(px) - DAY0 - 2)
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"tax_paper": weights}))
+    t, s = no_costs(setup, tax_rules=RULES), long_only()
+    return t, [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(6)], px
+
+
+@pytest.mark.parametrize("close", [0.0, -3.0])
+def test_a_close_of_zero_or_below_is_no_price_the_sell_waits_and_the_book_is_carried(setup, monkeypatch, tmp_path, close):
+    t, out, px = _exit_onto(close, setup, monkeypatch, tmp_path)
+    fills = [e for e in t.journal.read() if e["type"] == "fill"]
+    sell = [f for f in fills if f["units"] < 0]
+    assert len(sell) == 1 and sell[0]["day"] == str(px.index[DAY0 + 4].date()) and sell[0]["price"] == pytest.approx(80.0)
+    day = out[3]                                                    # bar 33: the close was no price
+    assert day["equity"] == pytest.approx(out[2]["equity"]) and day["daily_loss_pct"] == 0.0 and day["drawdown_pct"] == out[2]["drawdown_pct"]
+    assert day["stale_prices"] == {"AAA": 1} and "stale_prices" not in out[4]
+    assert all(np.isfinite(o["benchmark_values"]["tax_paper"]) for o in out)
+    assert not t.latch_file.exists() and not any(e["type"] == "kill_switch" for e in t.journal.read())
+    assert t.state["realized"]["tax_paper"] == pytest.approx(500 * (80.0 - 100.0))       # the real loss, once the price is back
+    assert t.tax_ledger.open_lots("AAA") == [] and len([f for f in fills if f["day"] == str(px.index[DAY0 + 3].date())]) == 0
+    _adds_up(out)
+
+
+def test_stale_prices_counts_the_consecutive_days_each_held_fund_has_been_carried(setup, monkeypatch, tmp_path):
+    px = scripted_market()
+    px["BBB"] = 50.0 + np.arange(len(px)) * 0.25
+    px.iloc[DAY0 + 3, px.columns.get_loc("BBB")] = np.nan
+    px.iloc[DAY0 + 4, px.columns.get_loc("BBB")] = 0.0
+    px.iloc[DAY0 + 4, px.columns.get_loc("AAA")] = -1.0
+    px.iloc[DAY0 + 5, px.columns.get_loc("BBB")] = np.inf
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.15), long_only("two", market=("AAA", "BBB"))
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(7)]
+    assert [o.get("stale_prices") for o in out] == [None, None, None, {"BBB": 1}, {"AAA": 1, "BBB": 2}, {"BBB": 3}, None]
+    assert list(out[4]["stale_prices"]) == ["AAA", "BBB"]                       # by fund name
+    assert "stale_prices" not in json.dumps({k: v for k, v in t.state.items() if k != "history"})   # nothing new kept
+    _adds_up(out)
