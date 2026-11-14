@@ -62,7 +62,7 @@ def benchmark_comparison(entries: list[dict]) -> list[dict]:
     """Each paper strategy against simply holding its own funds, from the journal's day summaries. `days` is the number
     of days both were recorded, so the reader can see how little or how much the difference rests on."""
     seen: dict[str, list[dict]] = {}
-    for e in entries:
+    for e in last_summary_of_each_day(entries):
         if e.get("type") == "summary" and isinstance(e.get("benchmark_values"), dict):
             for name in e["benchmark_values"]:
                 if name in e.get("strategy_values", {}):
@@ -76,6 +76,35 @@ def benchmark_comparison(entries: list[dict]) -> list[dict]:
     return rows
 
 
+def last_summary_of_each_day(entries: list[dict]) -> list[dict]:
+    """`entries` with every day summary but the last of its day left out (a day run again writes its summary again; the
+    last one is the day's truth). Everything else is kept, in order."""
+    last = {e.get("day"): k for k, e in enumerate(entries) if e.get("type") == "summary"}
+    keep = set(last.values())
+    return [e for k, e in enumerate(entries) if e.get("type") != "summary" or k in keep]
+
+
+def _price_field(e: dict, key: str) -> set | None:
+    """The funds a summary names under `key` (`stale_prices` or `suspect_prices`): a mapping's keys, or a list of fund
+    names; an empty set when the field is absent; None when it is there but cannot be read (a number, a string, null, a
+    list of anything but names)."""
+    if key not in e:
+        return set()
+    v = e[key]
+    if isinstance(v, dict):
+        return set(v)
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return set(v)
+    return None
+
+
+def unreadable_days(entries: list[dict], name: str) -> list[bool]:
+    """For each of the strategy's day summaries in `entries`, in order (as `carried_days`): whether its `stale_prices` or
+    `suspect_prices` field is there but cannot be read."""
+    return [_price_field(e, "stale_prices") is None or _price_field(e, "suspect_prices") is None
+            for e in entries if e.get("type") == "summary" and name in e.get("strategy_value_change", {})]
+
+
 def carried_days(entries: list[dict], name: str) -> tuple[list[bool], list[str]]:
     """For each of the strategy's day summaries in `entries` (those whose `strategy_value_change` names it, in order):
     whether the strategy held a fund that day whose price was carried (the summary's `stale_prices`), and the funds that
@@ -86,7 +115,7 @@ def carried_days(entries: list[dict], name: str) -> tuple[list[bool], list[str]]
         if e.get("type") == "fill" and e.get("strategy") == name:
             held[e["symbol"]] = held.get(e["symbol"], 0.0) + float(e.get("units") or 0.0)
         elif e.get("type") == "summary" and name in e.get("strategy_value_change", {}):
-            stale = e.get("stale_prices") or {}
+            stale = _price_field(e, "stale_prices") or set()           # an unreadable field: see `unreadable_days`
             hit = {sym for sym in stale if abs(held.get(sym, 0.0)) > 1e-12}
             marks.append(bool(hit))
             funds |= hit
@@ -102,7 +131,7 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     rules = rules or CriticRules()
     as_of = pd.Timestamp(as_of)
     since = as_of - pd.Timedelta(days=days - 1)
-    everything = journal.read(until=as_of)
+    everything = last_summary_of_each_day(journal.read(until=as_of))
     skipped = [dict(s) for s in getattr(journal, "skipped_lines", [])]
     incomplete = bool(skipped)
     week = [e for e in everything if e["day"] >= str(since.date())]
@@ -174,8 +203,12 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                             if e["day"] >= str(since.date())], dtype=float)
         # a day on which the strategy held a fund whose price was carried is no evidence of holding up: it is left out of
         # the days that count toward passing paper (and nothing else; the pause rules use every day)
+        # so is a day whose carried- or suspect-price field cannot be read: it cannot say what the day's prices were
         carried, carried_funds = carried_days(everything, name)
-        kept = returns[~np.array(carried, dtype=bool)] if len(carried) == len(returns) else returns
+        unreadable = unreadable_days(everything, name)
+        n_carried, n_unreadable = sum(carried), sum(unreadable)
+        out_of_count = np.array(carried, dtype=bool) | np.array(unreadable, dtype=bool)
+        kept = returns[~out_of_count] if len(carried) == len(returns) else returns
         closed = [e for e in everything if e["type"] == "fill" and e["strategy"] == name and e.get("realized_pnl") is not None]
         losers = [e for e in closed if e["realized_pnl"] < 0 and e["day"] >= str(since.date())]
         bt = ((h["backtest_result"] or {}).get("result") or {})
@@ -195,16 +228,21 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                   "closed_trades": len(closed), "trade_win_rate": win, "z_vs_backtest": z,
                   "backtest_annual_return": bt_mu, "backtest_max_drawdown": bt.get("max_drawdown"),
                   "predicted_annual_return": prediction.get("annual_return"), "predicted_win_rate": prediction.get("win_rate")}
-        left_out = n - len(kept)
         n_kept, total_kept, z_kept = len(kept), float(np.prod(1.0 + kept) - 1.0) if len(kept) else float("nan"), float("nan")
         if n_kept >= 2 and bt_mu is not None and bt_sd:
             z_kept = (float(np.mean(kept)) - bt_mu / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n_kept))
-        if left_out:
-            result.update({"carried_price_days": left_out, "carried_price_funds": carried_funds})
+        if n_carried:
+            result.update({"carried_price_days": n_carried, "carried_price_funds": carried_funds})
+        if n_unreadable:
+            result["unreadable_price_days"] = n_unreadable
         notes = []
-        if left_out:
-            notes.append(f"{name}: {left_out} paper day{'s' if left_out != 1 else ''} with a carried price ({', '.join(carried_funds)}) "
-                         f"{'are' if left_out != 1 else 'is'} left out of the days that count toward passing paper; "
+        if n_carried:
+            notes.append(f"{name}: {n_carried} paper day{'s' if n_carried != 1 else ''} with a carried price ({', '.join(carried_funds)}) "
+                         f"{'are' if n_carried != 1 else 'is'} left out of the days that count toward passing paper; "
+                         f"{n_kept} of its {n} days count.")
+        if n_unreadable:
+            notes.append(f"{name}: {n_unreadable} paper day{'s' if n_unreadable != 1 else ''} whose carried-price field could not be read "
+                         f"{'are' if n_unreadable != 1 else 'is'} left out of the days that count toward passing paper; "
                          f"{n_kept} of its {n} days count.")
         if n and bt_mu is not None and math.isfinite(live_annual) and live_annual < bt_mu:
             notes.append(f"{name} is running at {_fmt(live_annual)} a year on paper against {_fmt(bt_mu)} in its backtest, "

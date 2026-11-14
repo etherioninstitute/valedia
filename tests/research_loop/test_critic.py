@@ -287,3 +287,78 @@ def test_a_first_day_is_measured_on_its_own_capital_when_the_next_days_capital_d
     r = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)["strategies"]["mom"]["result"]
     # -400 on its first capital 40,000; -400 on 40,000 (the day before); -600 on 60,000: 1% each day
     assert r["total_return"] == pytest.approx(0.99 ** 3 - 1) and r["max_drawdown"] == pytest.approx(1 - 0.99 ** 3)
+
+
+# ---- T29 rev 3: a damaged field never stops the review; the pause and promotion rules each use the right days;
+# a day run twice counts once
+
+def _damaged_summaries(journal, daily_returns, field, on=(3, 4, 5)):
+    """As `_carried_summaries` (mom holds SPY from day 0), with `field` on the summaries of the days at `on`."""
+    days = pd.bdate_range("2026-09-01", periods=len(daily_returns))
+    journal.write(days[0], {"type": "fill", "strategy": "mom", "version": "1.0.0", "symbol": "SPY", "units": 10.0, "price": 100.0,
+                            "fee": 0.0, "realized_pnl": None})
+    for k, (d, r) in enumerate(zip(days, daily_returns)):
+        journal.write(d, {"type": "summary", "strategy_value_change": {"mom": r * 50_000.0}, "capital_per_strategy": 50_000.0,
+                          **(field if k in on else {})})
+    return days
+
+
+@pytest.mark.parametrize("damaged", [5, "SPY", None, [1, 2], {"SPY": 1, "QQQ": "x"}])
+def test_a_damaged_carried_price_field_is_counted_as_unreadable_and_never_raises(desk, damaged):
+    ledger, journal, limits, hid = desk
+    days = _damaged_summaries(journal, _rising(22), {"stale_prices": damaged})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    if isinstance(damaged, dict):                                    # a mapping is readable: SPY is held, so the day is carried
+        assert out["strategies"]["mom"]["result"]["carried_price_days"] == 3
+    else:
+        assert out["strategies"]["mom"]["result"]["unreadable_price_days"] == 3
+        assert any("3 paper days whose carried-price field could not be read" in f for f in out["findings"])
+    assert ledger.get(hid)["status"] == "passed backtest only"      # 19 days count: below the bar of 20
+
+
+def test_a_damaged_suspect_price_field_is_counted_as_unreadable(desk):
+    ledger, journal, limits, hid = desk
+    days = _damaged_summaries(journal, _rising(22), {"suspect_prices": 7})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert out["strategies"]["mom"]["result"]["unreadable_price_days"] == 3 and ledger.get(hid)["status"] == "passed backtest only"
+
+
+def test_carried_days_still_count_for_a_pause_on_returns_far_below_the_backtest(desk):
+    ledger, journal, limits, hid = desk
+    returns = [0.0004] * 25
+    for k in (3, 11, 19):
+        returns[k] = -0.018                                          # three losing days, each with a carried price
+    days = _carried_summaries(journal, "2026-09-01", returns, carried_on={3, 11, 19})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "paused" and "standard errors below the backtest" in ledger.get(hid)["lessons_learned"]
+    assert out["strategies"]["mom"]["result"]["z_vs_backtest"] <= -2.0
+
+
+def test_promotion_needs_a_gain_on_the_days_that_count(desk):
+    ledger, journal, limits, hid = desk
+    returns = [-0.0002] * 23
+    for k in (5, 12, 18):
+        returns[k] = 0.01                                            # the gains all fell on days with a carried price
+    days = _carried_summaries(journal, "2026-09-01", returns, carried_on={5, 12, 18})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert out["strategies"]["mom"]["result"]["total_return"] > 0
+    assert ledger.get(hid)["status"] == "passed backtest only"
+
+
+def test_a_day_summarised_twice_counts_once_with_its_last_summary(desk):
+    ledger, journal, limits, hid = desk
+    days = summaries(journal, "2026-11-02", [0.01, -0.02, 0.005])
+    journal.write(days[1], {"type": "summary", "strategy_value_change": {"mom": -0.02 * 50_000.0}, "capital_per_strategy": 50_000.0})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    r = out["strategies"]["mom"]["result"]
+    assert r["days"] == 3 and r["total_return"] == pytest.approx(1.01 * 0.98 * 1.005 - 1)
+    journal.write(days[2], {"type": "summary", "strategy_value_change": {"mom": 0.03 * 50_000.0}, "capital_per_strategy": 50_000.0})
+    r = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)["strategies"]["mom"]["result"]
+    assert r["days"] == 3 and r["total_return"] == pytest.approx(1.01 * 0.98 * 1.03 - 1)    # the last summary of the day
+
+
+def test_benchmark_comparison_counts_a_day_summarised_twice_once():
+    def day(d, value, bench):
+        return {"type": "summary", "day": d, "strategy_values": {"mom": value}, "benchmark_values": {"mom": bench}, "capital_per_strategy": 100_000.0}
+    rows = cr.benchmark_comparison([day("2026-11-10", 0.0, 0.0), day("2026-11-11", -5.0, 0.0), day("2026-11-11", -6.0, 1.0)])
+    assert rows[0]["days"] == 2 and rows[0]["strategy_value"] == -6.0

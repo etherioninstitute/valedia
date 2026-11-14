@@ -1276,3 +1276,347 @@ def test_stale_prices_counts_the_consecutive_days_each_held_fund_has_been_carrie
     assert list(out[4]["stale_prices"]) == ["AAA", "BBB"]                       # by fund name
     assert "stale_prices" not in json.dumps({k: v for k, v in t.state.items() if k != "history"})   # nothing new kept
     _adds_up(out)
+
+
+# ---- T29 rev 3: a price must be believable: in range, and not a jump the next day does not confirm
+
+def _judged(col):
+    """The ticket's rule, written out independently: each close of one fund is 'valid', 'suspect' or 'invalid'."""
+    def in_range(x):
+        return isinstance(x, float) and np.isfinite(x) and 0.0001 <= x <= 10_000_000
+    out, last = [], None
+    for t, v in enumerate(col):
+        if not in_range(v):
+            out.append("invalid")
+            continue
+        prev = col[t - 1] if t else None
+        if (last is None or (v <= 5 * last and 5 * v >= last)
+                or (in_range(prev) and v <= 5 * prev and 5 * v >= prev)):
+            out.append("valid")
+            last = v
+        else:
+            out.append("suspect")
+    return out
+
+
+BELIEVABLE = ("tiny", "huge", "jump and return", "jump and stay", "zero", "negative", "missing")
+
+
+def _believable_history(seed):
+    """`_gap_history`'s funds, strategies and gap days, each bad cell now one of BELIEVABLE. Returns the history, its twin
+    (every invalid or suspect close replaced by the last valid one), the cells judged not valid by day, the suspect
+    cells by day with the value seen, and the kinds used."""
+    _, filled, schedules, joins, strategies, gaps, _ = _gap_history(seed)
+    rng = np.random.default_rng(10_000 + seed)
+    frame, used, jumped = filled.copy(), set(), set()
+    for i in sorted(gaps):
+        for f in sorted(gaps[i]):
+            kind = BELIEVABLE[int(rng.integers(len(BELIEVABLE)))]
+            if kind.startswith("jump") and ((i - 1, f) in jumped or (kind == "jump and stay" and (gaps.get(i + 1) or gaps.get(i + 2)))):
+                kind = "missing"     # a move that stays makes the next day a trading day: no other bad close may fall on it
+            j, last = frame.columns.get_loc(f), float(frame[f].iloc[i])
+            if kind == "jump and stay":
+                frame.iloc[i:, j] = frame.iloc[i:, j] / 7.0
+            else:
+                frame.iloc[i, j] = {"tiny": float(rng.choice([1e-300, 5e-5])), "huge": float(rng.choice([2e7, 1e300])),
+                                    "jump and return": last * float(rng.choice([7.0, 1 / 7.0])), "zero": 0.0,
+                                    "negative": -last, "missing": np.nan}[kind]
+            if kind.startswith("jump"):
+                jumped.add((i, f))
+            used.add(kind)
+    bad, suspect = {}, {}
+    twin = frame.copy()
+    for f in frame.columns:
+        marks = _judged([float(v) for v in frame[f]])
+        for i, m in enumerate(marks):
+            if m != "valid":
+                bad.setdefault(i, set()).add(f)
+                twin.iloc[i, twin.columns.get_loc(f)] = np.nan
+            if m == "suspect":
+                suspect.setdefault(i, {})[f] = float(frame[f].iloc[i])
+    twin = twin.ffill()
+    assert all(f in gaps.get(i, ()) for i, fs in bad.items() for f in fs), (seed, bad, gaps)    # bad only where nothing trades
+    return frame, twin, schedules, joins, strategies, bad, suspect, used
+
+
+def _bad_run(frame, i):
+    """Rows up to and including row i on which `fund` has no valid close, counted back, per the ticket's rule."""
+    marks = {f: _judged([float(v) for v in frame[f]]) for f in frame.columns}
+    def run(f):
+        n = 0
+        while i - n >= 0 and marks[f][i - n] != "valid":
+            n += 1
+        return n
+    return run
+
+
+def _no_nonfinite_written(t):
+    for p in t.dir.iterdir():
+        if p.is_file():
+            body = p.read_bytes()
+            assert b"NaN" not in body and b"Infinity" not in body, p.name
+
+
+@pytest.mark.parametrize("block", range(6))
+def test_tiny_huge_jumping_zero_negative_and_missing_closes_value_the_book_as_the_twin(setup, tmp_path, monkeypatch, block):
+    """Outcome 1 on 300 seeded histories (50 a block), against the twin in which every invalid or suspect close is the last
+    valid one. The twin is run with the jump test off: a move that stays is a move in the twin, taken a day late here."""
+    from valedia_trader.execution_and_risk.order_step import paper_targets
+    limits = tmp_path / "loose.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 90.0, "max_drawdown_pct": 90.0, "max_position_pct": 1.0, "max_open_positions": 20}))
+    kinds, carried, named = set(), 0, 0
+    for seed in range(block * 50, block * 50 + 50):
+        frame, twin, schedules, joins, strategies, bad, suspect, used = _believable_history(seed)
+        kinds |= used
+        monkeypatch.setattr(pp, "run_rules", _schedule_rules(schedules))
+        seen, targets = {}, {}
+
+        def check(t, i, summary):
+            seen[i] = (sorted(_held_now(t) & bad.get(i, set())), summary.get("stale_prices"), summary.get("suspect_prices"))
+            targets[i] = paper_targets(t)
+
+        tg, a = _run(tmp_path / f"gap{seed}", limits, frame, strategies, joins, after_step=check)
+        monkeypatch.setattr(pp, "JUMP_FACTOR", float("inf"), raising=False)
+        twin_targets = {}
+        tf, b = _run(tmp_path / f"twin{seed}", limits, twin, strategies, joins,
+                     after_step=lambda t, i, s: twin_targets.__setitem__(i, paper_targets(t)))
+        monkeypatch.setattr(pp, "JUMP_FACTOR", 5.0, raising=False)
+        for x, y in zip(a, b):
+            assert {key: x[key] for key in SAME} == {key: y[key] for key in SAME}, (seed, x["day"], used)
+            assert x["orders_blocked"] == 0 and "stale_prices" not in y and "suspect_prices" not in y
+        assert targets == twin_targets, seed                            # what the order step is handed, day by day
+        _adds_up(a)
+        _adds_up(b)
+        for e in tg.journal.read():
+            i = frame.index.get_loc(pd.Timestamp(e["day"]))
+            if e.get("symbol") in bad.get(i, set()):
+                assert e["type"] not in ("fill", "decision"), (seed, e)
+        _no_nonfinite_written(tg)
+        run = None
+        for i, (want, stale, sus) in seen.items():
+            run = _bad_run(frame, i)
+            assert stale == ({f: run(f) for f in want} or None), (seed, i)
+            assert sus == (dict(sorted(suspect.get(i, {}).items())) or None), (seed, i)
+            carried += bool(want)
+            named += bool(sus)
+        _drop(tg, tf)
+    assert kinds == set(BELIEVABLE) and carried >= 30 and named >= 10, (kinds, carried, named)
+
+
+def _one_fund(closes):
+    px = scripted_market()
+    px.iloc[DAY0:DAY0 + len(closes), 0] = closes
+    return px
+
+
+def test_a_close_of_1e_300_is_no_price_and_nothing_infinite_is_written(setup, monkeypatch):
+    from valedia_trader.execution_and_risk.order_step import paper_targets
+    px = _one_fund([100.0, 100.0, 1e-300, 1e-300, 100.0])
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"tax_paper": [{"AAA": 0.5}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.002), long_only()
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(5)]
+    assert [o.get("stale_prices") for o in out] == [None, None, {"AAA": 1}, {"AAA": 2}, None]
+    assert all(abs(u) < 1e6 for book in t.wanted_units().values() for u in book.values())
+    assert out[2]["equity"] == pytest.approx(out[1]["equity"]) and out[3]["equity"] == pytest.approx(out[1]["equity"])
+    assert all(abs(o["units"]) < 1e6 for o in t.state["pending"])
+    assert paper_targets(t).equity == pytest.approx(out[4]["equity"])
+    _no_nonfinite_written(t)
+    _adds_up(out)
+
+
+def test_a_one_day_jump_is_never_taken_and_a_jump_that_stays_is_taken_a_day_late(setup, monkeypatch):
+    px = _one_fund([100.0, 100.0, 100.0, 900.0, 100.0, 15.0, 15.0, 15.0])
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"tax_paper": [{"AAA": 0.5}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.45), long_only()         # a 45% band: the book buys once, then only holds
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(8)]
+    units = t.state["positions"]["tax_paper"]["AAA"]["units"]
+    assert units == pytest.approx(500.0)
+    assert [o.get("suspect_prices") for o in out] == [None, None, None, {"AAA": 900.0}, None, {"AAA": 15.0}, None, None]
+    assert [o.get("stale_prices") for o in out] == [None, None, None, {"AAA": 1}, None, {"AAA": 1}, None, None]
+    assert out[3]["equity"] == pytest.approx(out[2]["equity"])              # the glitch: never taken
+    assert out[5]["equity"] == pytest.approx(out[4]["equity"])              # the move: carried one day ...
+    assert out[6]["equity"] == pytest.approx(out[4]["equity"] - 500 * 85.0)  # ... and taken the next
+    _adds_up(out)
+
+
+def test_a_text_column_does_not_stop_the_night_and_is_named(setup, monkeypatch):
+    px = scripted_market()
+    px["BBB"] = 50.0 + np.arange(len(px)) * 0.25
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.15), long_only("two", market=("AAA", "BBB"))
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(3)]
+    noted = px.iloc[: DAY0 + 4].copy()
+    noted["NOTE"] = "closed early"                                     # a text column outside every market
+    out.append(t.step(noted, {7: s}))
+    assert out[-1]["unreadable_prices"] == ["NOTE"] and "stale_prices" not in out[-1]
+    texty = px.iloc[: DAY0 + 5].astype(object)
+    texty["BBB"] = "n/a"                                               # a held fund's column is text: no price on any day
+    out.append(t.step(texty, {7: s}))
+    lot = t.state["positions"]["two"]["BBB"]
+    assert out[-1]["unreadable_prices"] == ["BBB"] and out[-1]["stale_prices"] == {"BBB": DAY0 + 5}
+    aaa = t.state["positions"]["two"]["AAA"]
+    assert out[-1]["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * 80.0 + lot["units"] * lot["cost"])
+    assert "unreadable_prices" not in out[2]
+    _adds_up(out)
+
+
+def test_a_fund_with_no_column_is_counted_as_carried_on_every_row(setup, monkeypatch):
+    t, out, px = _two_funds_one_day_gap(setup, monkeypatch)
+    without = px.iloc[: DAY0 + 6].drop(columns=["BBB"])
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3}] * len(px)}))
+    later = t.step(without, {7: long_only("two", market=("AAA",))})
+    assert later["stale_prices"] == {"BBB": DAY0 + 6}
+    lot = t.state["positions"]["two"]["BBB"]
+    aaa = t.state["positions"]["two"]["AAA"]
+    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * lot["cost"])
+    _adds_up(out + [later])
+
+
+class _Recording(FakePanel):
+    def evaluate(self, case_id, case):
+        return super().evaluate(case_id, json.loads(json.dumps(case, default=str)))
+
+
+def _real_rules_history(seed, directory, limits, frame, panel):
+    rng = np.random.default_rng(seed)
+    strategies = {j + 1: st.RuleStrategy.from_spec({
+        "name": f"mom_{j}", "version": "1.0.0", "hypothesis": "Assets that rose over ten days keep rising",
+        "market": list(frame.columns),
+        "entry": {"rule": "momentum", "lookback": int(rng.integers(5, 8)), "enter": 0.01, "exit": 0.0, "direction": "both"},
+        "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.4, "max_open_positions": 3, "stop_loss_pct": 0.05}})
+        for j in range(2)}
+    t = pp.PaperTrader(directory, limits, halt_file=None, min_trade_pct=0.002, panel=panel, panel_mode="shadow",
+                       facts=lambda p, sym: {"recent": p[sym].dropna().round(6).tolist()[-6:], "missing": int(p[sym].isna().sum())})
+    for i in range(8, len(frame)):
+        t.step(frame.iloc[: i + 1], strategies)
+    entries = [{k: v for k, v in e.items() if k not in ("timestamp", "suspect_prices")} for e in t.journal.read()]
+    return entries, [c for c in panel.cases]
+
+
+def test_real_rule_strategies_their_market_conditions_and_the_panel_read_a_bad_close_as_missing(setup, tmp_path):
+    """Outcome 4: with real rule strategies, a history whose bad closes are zero, negative, tiny, huge or a one-day jump
+    writes exactly what the same history with those closes missing writes: the rules, the market conditions and the
+    panel's facts are all given the cleaned prices."""
+    differs = 0
+    for seed in range(30):
+        rng = np.random.default_rng(500 + seed)
+        n = 34
+        px = pd.DataFrame({f: 60 * np.exp(np.cumsum(0.02 * rng.standard_normal(n))) for f in ("R1", "R2", "R3")},
+                          index=pd.bdate_range("2026-04-01", periods=n))
+        bad, missing = px.copy(), px.copy()
+        for _ in range(3):
+            i, f = int(rng.integers(9, n)), str(rng.choice(px.columns))
+            if bad[f].iloc[i - 1] != px[f].iloc[i - 1] or bad[f].iloc[min(i + 1, n - 1)] != px[f].iloc[min(i + 1, n - 1)]:
+                continue                                               # one bad close at a time, between good ones
+            bad.loc[px.index[i], f] = float(rng.choice([0.0, -1.0, 1e-300, 1e300, float(px[f].iloc[i - 1]) * 8.0]))
+            missing.loc[px.index[i], f] = np.nan
+        a = _real_rules_history(seed, tmp_path / f"bad{seed}", setup[1], bad, _Recording())
+        b = _real_rules_history(seed, tmp_path / f"missing{seed}", setup[1], missing, _Recording())
+        assert a == b, seed
+        differs += int(not bad.equals(missing))
+        shutil.rmtree(tmp_path / f"bad{seed}")
+        shutil.rmtree(tmp_path / f"missing{seed}")
+    assert differs >= 25
+
+
+def test_an_early_history_volatility_is_written_as_null_never_as_nan(setup):
+    t = trader(setup)
+    t.step(prices().iloc[:2], {7: strat()})                            # two bars: no 20-day volatility can be measured
+    decision = [e for e in t.journal.read() if e["type"] == "decision"][0]
+    assert decision["market_conditions"]["volatility_20d"] is None
+    _no_nonfinite_written(t)
+
+
+# ---- T29 rev 3, outcome 6: a day cut short by a kill and run again leaves one truth
+
+RERUN_CHILD = r'''
+import json, sys, time
+import numpy as np, pandas as pd
+from valedia_trader.research_loop import paper as pp
+from valedia_trader.research_loop import strategy as st
+from valedia_trader.execution_and_risk import tax as tx
+directory, limits, upto, stop_after = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+armed, count = [False], [0]
+def marked(fn):
+    def run(*a, **k):
+        out = fn(*a, **k)
+        if armed[0]:
+            count[0] += 1
+            print("wrote", count[0], flush=True)
+            if stop_after and count[0] >= stop_after:
+                time.sleep(60)                                     # the parent kills it here, between two writes
+        return out
+    return run
+name = "append" if hasattr(pp.Journal, "append") else "write"      # every journal line, whichever writes it
+setattr(pp.Journal, name, marked(getattr(pp.Journal, name)))
+pp.PaperTrader._save = marked(pp.PaperTrader._save)
+rng = np.random.default_rng(29)
+n = 46
+px = pd.DataFrame({f: 70 * np.exp(np.cumsum(0.0015 + 0.02 * rng.standard_normal(n))) for f in ("K1", "K2", "K3")},
+                  index=pd.bdate_range("2026-03-02", periods=n))
+s = st.RuleStrategy.from_spec({"name": "rerun_paper", "version": "1.0.0", "hypothesis": "Assets that rose keep rising",
+    "market": ["K1", "K2", "K3"], "entry": {"rule": "momentum", "lookback": 5, "enter": 0.0, "exit": -0.01, "direction": "long"},
+    "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.3, "max_open_positions": 3, "stop_loss_pct": None}})
+t = pp.PaperTrader(directory, limits, halt_file=None, min_trade_pct=0.001, tax_rules=tx.TaxRules.load())
+for i in range(10, upto + 1):
+    if t.state["last_day"] is None or str(px.index[i].date()) > t.state["last_day"]:
+        armed[0], count[0] = (i == upto or not stop_after), 0      # writes are counted day by day
+        print("day", i, flush=True)
+        t.step(px.iloc[: i + 1], {7: s})
+print("done", flush=True)
+'''
+
+
+def _child(script, directory, limits, upto, stop_after, env):
+    import subprocess
+    import sys
+    return subprocess.Popen([sys.executable, "-B", "-c", script, str(directory), str(limits), str(upto), str(stop_after)],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _comparable_journal(directory):
+    return [{k: v for k, v in e.items() if k != "timestamp"} for e in pp.Journal(directory).read_complete()]
+
+
+def test_a_day_killed_between_its_writes_and_run_again_books_nothing_twice(setup, tmp_path):
+    """Outcome 6 (a): 30 real kills, each between two of a day's writes (journal lines and state saves; among them the
+    one after the day's summary and before its state is saved), each followed by a rerun of the day. The journal, the state,
+    the tax ledger and the summaries end exactly as one run without kills leaves them."""
+    import os
+    from pathlib import Path
+    root = str(Path(pp.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""), PYTHONHASHSEED="0")
+    reference = tmp_path / "reference"
+    ref = _child(RERUN_CHILD, reference, setup[1], 45, 0, env)
+    out, err = ref.communicate(timeout=240)
+    assert ref.returncode == 0, err[-2000:]
+    writes, day = {}, None                                          # how many writes each day makes, from the run without kills
+    for line in out.splitlines():
+        if line.startswith("day "):
+            day = int(line.split()[1])
+        elif line.startswith("wrote "):
+            writes[day] = int(line.split()[1])
+    killed_dir, rng, kills = tmp_path / "killed", np.random.default_rng(6), 0
+    for i in range(16, 46):
+        stop = writes[i] - 1 if i % 3 == 0 else int(rng.integers(1, writes[i]))     # every third: after the last line
+        child = _child(RERUN_CHILD, killed_dir, setup[1], i, stop, env)
+        for line in child.stdout:
+            if line.strip() == f"wrote {stop}":
+                child.kill()                                       # SIGKILL to the child this test started, by its pid
+                kills += 1
+                break
+        child.wait()
+        child.stdout.close()
+        child.stderr.close()
+        again = _child(RERUN_CHILD, killed_dir, setup[1], i, 0, env)
+        _, err = again.communicate(timeout=240)
+        assert again.returncode == 0, err[-2000:]
+        days = [e["day"] for e in pp.Journal(killed_dir).read() if e["type"] == "summary"]
+        assert len(days) == len(set(days)), (i, stop)                  # one summary a day
+    assert kills == 30
+    assert _comparable_journal(killed_dir) == _comparable_journal(reference)
+    a, b = (json.loads((d / "paper_state.json").read_text()) for d in (killed_dir, reference))
+    assert a == b and "journal_outbox" not in a
+    from valedia_trader.execution_and_risk.tax import TaxLedger
+    lots = [TaxLedger.from_fills(pp.Journal(d).read_complete(), RULES).summary("2026", as_of="2026-12-31") for d in (killed_dir, reference)]
+    assert lots[0] == lots[1]

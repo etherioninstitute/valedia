@@ -122,19 +122,35 @@ class Journal:
     def write(self, day, entry: dict) -> dict:
         """Append one record. Any piece of a remembered secret is replaced first, and the record
         then says how many replacements were made (`secret_redacted`)."""
+        record = self.record(day, entry)
+        self.append(self.line(record))
+        return record
+
+    @staticmethod
+    def record(day, entry: dict) -> dict:
+        """The record `write` would append for `entry` today, without appending it: stamped, dated and redacted."""
         from valedia_trader.core.secrets import redact_json
         record = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "day": str(pd.Timestamp(day).date()), **entry}
         record, replaced = redact_json(record)
         if replaced:
             record["secret_redacted"] = replaced
-        line = (json.dumps(record, default=str) + "\n").encode("utf-8")
-        with (self.dir / f"{record['day']}.jsonl").open("a+b") as fh:
+        return record
+
+    @staticmethod
+    def line(record: dict) -> str:
+        """The journal line of a record, as `write` appends it (without its newline)."""
+        return json.dumps(record, default=str)
+
+    def append(self, line: str) -> None:
+        """Append one journal line (from `line`) to the file of the day it names."""
+        day = json.loads(line)["day"]
+        data = (line + "\n").encode("utf-8")
+        with (self.dir / f"{day}.jsonl").open("a+b") as fh:
             if fh.seek(0, os.SEEK_END):                  # a file whose last line has no newline ends in a torn line (a kill
                 fh.seek(-1, os.SEEK_END)                 # in the middle of a write): the new entry starts on its own line
                 if fh.read(1) != b"\n":
-                    line = b"\n" + line
-            fh.write(line)                               # one write, so a kill leaves at most one torn line
-        return record
+                    data = b"\n" + data
+            fh.write(data)                               # one write, so a kill leaves at most one torn line
 
     def read(self, since=None, until=None) -> list[dict]:
         """The entries in date order, each file in the order written. A line that is not a complete JSON object (one cut
@@ -180,20 +196,86 @@ def market_conditions(prices: pd.DataFrame, market: tuple[str, ...] | list[str],
             "return_20d": float(np.expm1(recent.sum())) if len(recent) else float("nan")}
 
 
+PRICE_MIN, PRICE_MAX = 0.0001, 10_000_000.0          # a close outside this range is no price
+JUMP_FACTOR = 5.0                                     # a close this many times above or below the last valid one is suspect
+
+
 def _is_price(px: float) -> bool:
-    """A price is a finite number above zero; anything else (missing, not a number, infinite, zero, negative) is none."""
-    return bool(np.isfinite(px) and px > 0)
+    """A price is a finite number from PRICE_MIN to PRICE_MAX; anything else (missing, not a number, infinite, zero,
+    negative, too small or too large) is none. (Whether a close is a believable move is `_clean_prices`'s question.)"""
+    return bool(np.isfinite(px) and PRICE_MIN <= px <= PRICE_MAX)
 
 
-def _valid_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    """`prices` with every value that is not a finite number above zero made missing (NaN). The same object, untouched,
-    when there is no such value other than a missing one."""
-    values = prices.to_numpy(dtype=float)
+def _close_enough(a: float, b: float) -> bool:
+    return bool(a <= JUMP_FACTOR * b and JUMP_FACTOR * a >= b)
+
+
+def _judge(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(valid, suspect) for each close of one fund, in order. A close is valid when it is in range and either the fund
+    has no valid close before it, or it is within JUMP_FACTOR of the last valid close, or the close of the row before it
+    is in range and within JUMP_FACTOR of it (a move confirmed the next day). An in-range close that is none of these is
+    suspect: it is treated as missing."""
     with np.errstate(invalid="ignore"):
-        good = np.isfinite(values) & (values > 0)
-    if (good | np.isnan(values)).all():
-        return prices
-    return prices.where(good)
+        ok = np.isfinite(values) & (values >= PRICE_MIN) & (values <= PRICE_MAX)
+    valid, suspect, last = np.zeros(len(values), bool), np.zeros(len(values), bool), None
+    for t in np.flatnonzero(ok):
+        v = float(values[t])
+        if last is None or _close_enough(v, last) or (t > 0 and ok[t - 1] and _close_enough(v, float(values[t - 1]))):
+            valid[t], last = True, v
+        else:
+            suspect[t] = True
+    return valid, suspect
+
+
+def _clean_prices(prices: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], list[str]]:
+    """(prices with every close that is no valid price made missing, today's suspect closes by fund, the columns that
+    are not numbers). A column that cannot be read as numbers has no valid price on any day. When every close is valid
+    or missing, `prices` itself comes back, untouched."""
+    unreadable, columns = [], {}
+    for name, dtype in prices.dtypes.items():
+        if pd.api.types.is_numeric_dtype(dtype) and not pd.api.types.is_bool_dtype(dtype):
+            continue
+        try:
+            columns[name] = pd.to_numeric(prices[name], errors="raise").astype(float)
+        except (ValueError, TypeError):
+            columns[name] = pd.Series(np.nan, index=prices.index)
+            unreadable.append(str(name))
+    frame = prices
+    if columns:
+        frame = prices.copy()
+        for name, col in columns.items():
+            frame[name] = col
+    values = frame.to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(values) & (values >= PRICE_MIN) & (values <= PRICE_MAX)
+    suspect_today: dict[str, float] = {}
+    clean = values.copy() if not (ok | np.isnan(values)).all() else None
+    for j, name in enumerate(frame.columns):
+        col = values[:, j]
+        kept = col[ok[:, j]]
+        if (ok[:, j] | np.isnan(col)).all() and (kept.size < 2 or (np.all(kept[1:] <= JUMP_FACTOR * kept[:-1])
+                                                                   and np.all(JUMP_FACTOR * kept[1:] >= kept[:-1]))):
+            continue                                                       # every close valid or missing: nothing to judge
+        valid, suspect = _judge(col)
+        if clean is None:
+            clean = values.copy()
+        clean[~valid, j] = np.nan
+        if suspect[-1]:
+            suspect_today[str(name)] = float(col[-1])
+    if clean is None:
+        return frame, {}, sorted(unreadable)
+    return pd.DataFrame(clean, index=frame.index, columns=frame.columns), dict(sorted(suspect_today.items())), sorted(unreadable)
+
+
+def _finite_only(x):
+    """`x` with every number that is not finite replaced by None (null in JSON); everything else as it was."""
+    if isinstance(x, float):
+        return x if np.isfinite(x) else None
+    if isinstance(x, dict):
+        return {k: _finite_only(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_finite_only(v) for v in x]
+    return x
 
 
 class Venue(Protocol):
@@ -273,6 +355,9 @@ class PaperTrader:
         else:
             self.state = {"starting_cash": starting_cash, "cash": starting_cash, "positions": {}, "pending": [],
                           "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}, "panel_cases": []}
+        self._outbox: list[str] = []                         # the journal lines of the day being run, written with the day
+        if "journal_outbox" in self.state:                   # a day saved by a run killed while appending its entries
+            self._flush_outbox()
         # the account's tax ledger: built once from the journal's fills, then fed each new fill. Notes only.
         self.tax_rules, self.tax_ledger, self.tax_unavailable = tax_rules, None, None
         self._tax_today, self._tax_fill_day = [], None        # in memory only: the orders placed so far this step
@@ -289,8 +374,9 @@ class PaperTrader:
 
     @staticmethod
     def _mark(sym: str, lot: dict, row: pd.Series, carried: dict[str, float] | None) -> float:
-        """The price a held lot is valued at: today's when it is a price (a finite number above zero), else the last price
-        before today (`carried`), else the lot's cost. A held position is never valued at nothing."""
+        """The price a held lot is valued at: today's when it is a price (finite, PRICE_MIN to PRICE_MAX; `step` has already
+        removed a suspect jump), else the last price before today (`carried`), else the lot's cost. A held position is
+        never valued at nothing."""
         px = float(row.get(sym, np.nan))
         if _is_price(px):
             return px
@@ -308,7 +394,7 @@ class PaperTrader:
             if sym in prices.columns:
                 earlier = prices[sym].iloc[:-1].to_numpy(dtype=float)
                 with np.errstate(invalid="ignore"):
-                    earlier = earlier[np.isfinite(earlier) & (earlier > 0)]
+                    earlier = earlier[np.isfinite(earlier) & (earlier >= PRICE_MIN) & (earlier <= PRICE_MAX)]
                 if earlier.size:
                     out[sym] = float(earlier[-1])
         return out
@@ -325,13 +411,13 @@ class PaperTrader:
                 continue
             values = prices[sym].to_numpy(dtype=float)
             with np.errstate(invalid="ignore"):
-                good = np.flatnonzero(np.isfinite(values) & (values > 0))
+                good = np.flatnonzero(np.isfinite(values) & (values >= PRICE_MIN) & (values <= PRICE_MAX))
             out[sym] = int(len(values) - (good[-1] + 1 if good.size else 0))
         return out
 
     def equity(self, prices_row: pd.Series, carried: dict[str, float] | None = None) -> float:
-        """Cash plus every held lot at `_mark`: a fund with no price in `prices_row` (none that is a finite number above
-        zero) is valued at its `carried` price, or at the lot's cost."""
+        """Cash plus every held lot at `_mark`: a fund with no valid price in `prices_row` (see `_mark`) is valued at its
+        `carried` price, or at the lot's cost."""
         value = sum(lot["units"] * self._mark(sym, lot, prices_row, carried) for book in self.state["positions"].values()
                     for sym, lot in book.items() if lot["units"])
         return float(self.state["cash"] + value)
@@ -370,7 +456,7 @@ class PaperTrader:
         for o in self.state["pending"]:
             px = float(row.get(o["symbol"], np.nan))
             if not _is_price(px):
-                still.append(o)                           # no price today (none, or not above zero): the order waits
+                still.append(o)                           # no valid price today: the order waits
                 continue
             fill = px * (1.0 + np.sign(o["units"]) * self.slippage_bps * 1e-4)
             fee = abs(o["units"]) * fill * self.fee_bps * 1e-4
@@ -393,7 +479,7 @@ class PaperTrader:
             else:
                 lot["units"] = after
             self.state["cash"] -= o["units"] * fill + fee
-            self.journal.write(day, {"type": "fill", "strategy": o["strategy"], "version": o["version"], "symbol": o["symbol"],
+            self._note(day, {"type": "fill", "strategy": o["strategy"], "version": o["version"], "symbol": o["symbol"],
                                      "units": o["units"], "price": fill, "fee": fee, "decided_on": o["decided_on"],
                                      "realized_pnl": realized, "entry_conditions": o.get("conditions"), "reason": o["reasoning"]})
             self._tax_take(day, o["symbol"], o["units"], fill, fee)
@@ -459,10 +545,10 @@ class PaperTrader:
             outcome = int((px > case["price"]) if case["side"] == "buy" else (px < case["price"]))
             try:
                 self.panel.settle(case["case_id"], outcome)
-                self.journal.write(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "symbol": case["symbol"],
+                self._note(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "symbol": case["symbol"],
                                                       "thesis_right": bool(outcome), "price_then": case["price"], "price_now": px})
             except Exception as exc:
-                self.journal.write(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "error": f"{type(exc).__name__}: {exc}"})
+                self._note(prices.index[-1], {"type": "panel_settled", "case_id": case["case_id"], "error": f"{type(exc).__name__}: {exc}"})
         self.state["panel_cases"] = still
 
     def _consult_panel(self, day, strategy: Strategy, symbol: str, prices: pd.DataFrame, order: dict, account: dict, px: float) -> dict:
@@ -494,18 +580,31 @@ class PaperTrader:
         """Run one day using `prices` up to and including today (its last row). `strategies` maps
         the ledger's hypothesis id to the strategy. Returns the day's summary.
 
-        A price is a finite number above zero; any other value in `prices` (missing, not a number, infinite, zero or
-        negative) is no price, and is read as missing everywhere the day reads prices: valuation, the benchmark, fills,
-        decisions, the strategies' rules and the panel. A fund with no price today is not traded: its pending orders
-        wait and no new order is decided for it. If the book holds it, it is valued at the last price before today in
-        `prices` in the equity, the strategy values, the capital per strategy and the benchmarks alike, and the summary's
-        `stale_prices` maps it to the number of consecutive days, today included, it has had no price in `prices`
-        (present only on such a day; nothing about it is kept in the state file).
+        A price is valid when it is a finite number from PRICE_MIN to PRICE_MAX and is no wild jump: a close more than
+        JUMP_FACTOR times above or below the fund's last valid close is suspect, unless the close of the row before it was
+        in range and within JUMP_FACTOR of it (so a real move is taken one day late and a one-day glitch never; a fund's
+        first close is judged on the range alone). A column that cannot be read as numbers has no valid price on any day.
+        Every close that is not valid is read as missing everywhere the day reads prices: valuation, the benchmark,
+        fills, decisions, the strategies' rules, the market conditions and the panel. A fund with no price today is not
+        traded: its pending orders wait and no new order is decided for it. If the book holds it, it is valued at its
+        last valid price before today in `prices` in the equity, the strategy values, the capital per strategy and the
+        benchmarks alike. The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
+        included, it has had no valid price in `prices`; `suspect_prices` maps each fund whose close today is suspect to
+        the close seen; `unreadable_prices` names the columns that are not numbers. Each is present only when not empty,
+        and all are derived from `prices`: nothing about them is kept in the state file. No number that is not finite is
+        written to the journal or the summary (it is written as null).
+
+        The day's journal entries are written once the day is decided: the state is saved first with those entries in it
+        (`journal_outbox`), then they are appended, then the state is saved without them. A run killed anywhere in a day
+        leaves either nothing of the day (the day is run again from the start) or a saved day whose entries the next
+        start appends where they are missing: a day run again never books a fill, a tax lot or a result twice, and never
+        writes a second summary. An ordinary day writes the same journal lines and the same final state as before.
 
         Not handled: a run given a price history that starts after a fund was bought, or that lacks the fund's column,
         values the position at its cost (and counts every row of the history given as carried); a strategy whose every
-        fund is missing from `prices` makes the rules raise, as before."""
-        prices = _valid_prices(prices)
+        fund is missing from `prices` makes the rules raise, as before; a kill before the day's state is saved does not
+        undo what reached the outside (the venue mirror's orders, the panel's settlements), which a rerun repeats."""
+        prices, suspect, unreadable = _clean_prices(prices)
         day = prices.index[-1]
         if self.state["last_day"] is not None and str(day.date()) <= self.state["last_day"]:
             raise ValueError(f"{day.date()} was already processed; paper trading only moves forward")
@@ -525,9 +624,11 @@ class PaperTrader:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
             limits = None                                  # check_order will then block every order
-        if (limits and account["drawdown_pct"] >= limits["max_drawdown_pct"] and not risk_gate.file_is_there(self.latch_file)
-                and self._trip_latch({"tripped_on": str(day.date()), "drawdown_pct": account["drawdown_pct"]})):
-            self.journal.write(day, {"type": "kill_switch", "decision": "latched",
+        if limits and account["drawdown_pct"] >= limits["max_drawdown_pct"] and (
+                (not risk_gate.file_is_there(self.latch_file)
+                 and self._trip_latch({"tripped_on": str(day.date()), "drawdown_pct": account["drawdown_pct"]}))
+                or self._latched_on(day)):                 # tripped today by a run of this day that was killed before saving
+            self._note(day, {"type": "kill_switch", "decision": "latched",
                                      "reasoning": f"drawdown {account['drawdown_pct']:.2f}% reached the limit; new risk is blocked until the latch is reset"})
 
         placed = blocked = 0
@@ -537,11 +638,11 @@ class PaperTrader:
         for hid, s in strategies.items():
             weights, events = run_rules(s, prices)
             latest = {e["symbol"]: e for e in events}          # events are in time order: the last one per symbol wins
-            cond = market_conditions(prices, s.market)
+            cond = _finite_only(market_conditions(prices, s.market))
             acted = False
             for sym in s.market:
                 px = float(row.get(sym, np.nan))
-                if not np.isfinite(px) or px <= 0:
+                if not _is_price(px):
                     continue
                 lot = self._lot(s.name, sym)
                 target = float(weights[sym].iloc[-1]) * share / px
@@ -594,9 +695,9 @@ class PaperTrader:
                             entry["venue"] = {"name": self.venue.name, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
                 else:
                     blocked += 1
-                self.journal.write(day, entry)
+                self._note(day, entry)
             if not acted:
-                self.journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": s.name, "version": s.version,
+                self._note(day, {"type": "decision", "hypothesis_id": hid, "strategy": s.name, "version": s.version,
                                          "market_conditions": cond, "decision": "no trade",
                                          "reasoning": "positions already match the strategy's targets"})
         by_strategy = {s: self._strategy_value(s, row, carried) - before.get(s, 0.0) for s in self.state["positions"]}
@@ -608,16 +709,58 @@ class PaperTrader:
                    "benchmark_values": self._benchmark_values(prices, strategies, share)}
         if stale:
             summary["stale_prices"] = stale
+        if suspect:
+            summary["suspect_prices"] = suspect
+        if unreadable:
+            summary["unreadable_prices"] = unreadable
         if self.tax_rules is not None:
             summary["tax"] = self._tax_block(day)
         self.journal.read(since=day - pd.Timedelta(days=DAMAGE_WINDOW_DAYS))      # only to learn what it cannot read
         if self.journal.skipped_lines:                    # visible to the owner: lines the journal could not read
             summary["skipped_journal_lines"] = len(self.journal.skipped_lines)
+        summary = _finite_only(summary)
         self.state["history"].append(summary)
         self.state["last_day"] = str(day.date())
-        self.journal.write(day, {"type": "summary", **summary})
+        self._note(day, {"type": "summary", **summary})
+        lines, self._outbox = self._outbox, []
+        self.state["journal_outbox"] = lines              # the day and its entries are saved as one step ...
         self._save()
+        self._flush_outbox()                              # ... then the entries are appended, and the state saved without them
         return summary
+
+    def _note(self, day, entry: dict) -> None:
+        """Keep one journal entry of the day being run, to be written with the day (`step`)."""
+        self._outbox.append(Journal.line(Journal.record(day, _finite_only(entry))))
+
+    def _flush_outbox(self) -> None:
+        """Append the saved day's journal entries that are not in the journal yet (all of them, unless a kill came while
+        they were being appended), then save the state without them."""
+        lines = self.state.get("journal_outbox")
+        if lines is None:
+            return
+        present: dict[str, int] = {}
+        for day in sorted({json.loads(line)["day"] for line in lines}):
+            path = self.journal.dir / f"{day}.jsonl"
+            if path.exists():
+                for raw in path.read_bytes().decode("utf-8", errors="replace").split("\n"):
+                    present[raw] = present.get(raw, 0) + 1
+        for line in lines:
+            if present.get(line, 0) > 0:
+                present[line] -= 1                        # appended before the kill
+            else:
+                self.journal.append(line)
+        del self.state["journal_outbox"]
+        self._save()
+
+    def _latched_on(self, day) -> bool:
+        """Whether the latch file says it was tripped on `day` (read without following a link; False if unreadable)."""
+        try:
+            fd = os.open(self.latch_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd) as fh:
+                body = json.loads(fh.read(10_000))
+            return isinstance(body, dict) and body.get("tripped_on") == str(pd.Timestamp(day).date())
+        except (OSError, ValueError):
+            return False
 
     def _benchmark_values(self, prices: pd.DataFrame, strategies: dict[int, Strategy], share: float) -> dict[str, float]:
         """What simply holding each strategy's funds would have made, in dollars, since its first orders filled.
@@ -626,7 +769,7 @@ class PaperTrader:
         daily, no costs), started with the capital the strategy had on its first paper day. It is a yardstick, not a book:
         it places no orders, meets no risk check and pays no costs. Only the start day and capital are stored; the value
         is recomputed from prices each day. A book saved before this existed takes both from its own history. A day on
-        which a fund has no price (none that is a finite number above zero) carries its last price, as the book does."""
+        which a fund has no valid price carries its last valid price, as the book does."""
         books, out = self.state.setdefault("benchmarks", {}), {}
         for s in strategies.values():
             if s.name not in books:
@@ -638,7 +781,7 @@ class PaperTrader:
             if len(since) < 2 or not funds:
                 out[s.name] = 0.0
                 continue
-            frame = _valid_prices(prices[funds])
+            frame = prices[funds]                                          # cleaned by `step`: only valid prices
             if frame.isna().to_numpy().any():                              # a gap: carry the last price
                 frame = frame.ffill()
             held = buy_and_hold(frame.loc[since[0]:])
