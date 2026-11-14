@@ -15,21 +15,28 @@ Which test covers which numbered outcome of ticket T33 (the section names below 
   8 docstring rules and no use on the order path               -> "8. rules" section
 """
 import base64
+import fcntl
 import hashlib
 import io
 import json
 import logging
 import os
 import random
+import re
+import select
 import shutil
+import signal
 import socket
 import sqlite3
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.response
 from datetime import datetime, timezone
 from email.message import Message
+from email.utils import format_datetime
 from pathlib import Path
 
 import pytest
@@ -111,9 +118,10 @@ class Call:
 
 class Finnhub:
     """A fake fetch. `script` maps (path, symbol) or (path, None) to a list of answers used in turn (the last one
-    stays): bytes, an exception (raised), a callable of the Call, or any other object (sent as JSON)."""
-    def __init__(self, clock, script=None):
-        self.clock, self.script, self.calls = clock, dict(script or {}), []
+    stays): bytes, an exception (raised), a callable of the Call, or any other object (sent as JSON). It answers
+    (body, headers) as the transport does; `date(call)`, if given, is the answer's Date header (None: no Date)."""
+    def __init__(self, clock, script=None, date=None):
+        self.clock, self.script, self.calls, self.date = clock, dict(script or {}), [], date
 
     def __call__(self, url, headers):
         call = Call(url, headers, self.clock())
@@ -129,7 +137,8 @@ class Finnhub:
             raise a
         if callable(a):
             a = a(call)
-        return a if isinstance(a, bytes) else json.dumps(a).encode()
+        dated = self.date(call) if self.date else None
+        return (a if isinstance(a, bytes) else json.dumps(a).encode()), ({} if dated is None else {"date": dated})
 
     def paths(self, symbol=None):
         return [c.path for c in self.calls if symbol is None or c.symbol == symbol]
@@ -406,7 +415,9 @@ def test_as_of_reads_the_store_without_making_or_locking_anything(tmp_path):
     cf.as_of(tmp_path / "cf.sqlite", "AAA", "profile", T0 + 1)
     cf.news_as_of(tmp_path / "cf.sqlite", "AAA", T0 + 1)
     cf.status(tmp_path / "cf.sqlite")
-    assert snap(tmp_path) == before                                              # no side file, no changed byte or time
+    after = snap(tmp_path)                                  # rev 3 (D1): SQLite's own side files may appear in a writable folder
+    assert {k: v for k, v in after.items() if k not in ("cf.sqlite-wal", "cf.sqlite-shm")} == before
+    assert set(after) - set(before) <= {"cf.sqlite-wal", "cf.sqlite-shm"}        # no other file, no changed byte or time
     assert rows(tmp_path, "SELECT count(*) FROM runs") == [(1,)]
     with pytest.raises(cf.Refused):
         cf.as_of(tmp_path / "missing.sqlite", "AAA", "profile", T0)
@@ -422,30 +433,33 @@ def test_as_of_refuses_a_bad_symbol_kind_or_time(tmp_path):
             cf.as_of(db, *args)
 
 
+B = T0          # rev 3 (D4): a stored fetch time before 2000 is impossible, so hand-made rows are stamped from here
+
+
 def test_news_as_of_needs_both_published_and_fetched_not_after_when(tmp_path):
     conn = sqlite3.connect(":memory:")
     make_store(conn)
-    put_news(conn, "AAA", 1, published=10, fetched=20)      # published before, fetched after `when`
-    put_news(conn, "AAA", 2, published=30, fetched=15)      # fetched before, "published" after `when` (a bad date)
-    put_news(conn, "AAA", 3, published=10, fetched=12)
-    put_news(conn, "AAA", 4, published=25, fetched=25)
-    put_news(conn, "BBB", 5, published=1, fetched=1)
-    got = cf.news_as_of(conn, "AAA", 16)
+    put_news(conn, "AAA", 1, published=B + 10, fetched=B + 20)      # published before, fetched after `when`
+    put_news(conn, "AAA", 2, published=B + 30, fetched=B + 15)      # fetched before, "published" after `when` (a bad date)
+    put_news(conn, "AAA", 3, published=B + 10, fetched=B + 12)
+    put_news(conn, "AAA", 4, published=B + 25, fetched=B + 25)
+    put_news(conn, "BBB", 5, published=B + 1, fetched=B + 1)
+    got = cf.news_as_of(conn, "AAA", B + 16)
     assert [a["article_id"] for a in got] == ["3"]
-    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", 25)] == ["3", "1", "4"]        # ordered by published_at
-    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", 25, since=11)] == ["4"]
-    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", 25, since=10)] == ["3", "1", "4"]
-    assert cf.news_as_of(conn, "AAA", 25, since=26) == []
+    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", B + 25)] == ["3", "1", "4"]        # ordered by published_at
+    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", B + 25, since=B + 11)] == ["4"]
+    assert [a["article_id"] for a in cf.news_as_of(conn, "AAA", B + 25, since=B + 10)] == ["3", "1", "4"]
+    assert cf.news_as_of(conn, "AAA", B + 25, since=B + 26) == []
     assert set(got[0]) == {"symbol", "article_id", "published_at", "fetched_at", "headline", "source", "url", "summary"}
 
 
 def test_a_damaged_row_is_refused_not_returned(tmp_path):
     conn = sqlite3.connect(":memory:")
     make_store(conn)
-    put_obs(conn, "AAA", "profile", 5, "ok")
+    put_obs(conn, "AAA", "profile", B + 5, "ok")
     conn.execute("UPDATE observations SET body='{\"tag\":\"changed\"}'")
     with pytest.raises(cf.Refused):
-        cf.as_of(conn, "AAA", "profile", 10)
+        cf.as_of(conn, "AAA", "profile", B + 10)
 
 
 def test_nothing_fetched_after_when_ever_comes_back_over_250_random_stores():
@@ -461,16 +475,16 @@ def test_nothing_fetched_after_when_ever_comes_back_over_250_random_stores():
             sym, kind = rnd.choice(syms), rnd.choice(kinds)
             if sym == "*":
                 kind = "earnings_calendar"
-            at = float(rnd.randint(0, 40))                                    # many ties on purpose
+            at = B + float(rnd.randint(0, 40))                                # many ties on purpose
             put_obs(conn, sym, kind, at, "r%d" % i)
             obs.append((sym, kind, at, i))
         for i in range(rnd.randint(0, 14)):
             sym = rnd.choice([s for s in syms if s != "*"])
-            pub, fet = float(rnd.randint(0, 40)), float(rnd.randint(0, 40))
+            pub, fet = B + float(rnd.randint(0, 40)), B + float(rnd.randint(0, 40))
             put_news(conn, sym, i, pub, fet)
             news.append((sym, str(i), pub, fet))
         for _ in range(8):
-            when = rnd.choice([float(rnd.randint(-3, 44)), rnd.randint(0, 40) + 0.5, rnd.choice([a[2] for a in obs] or [1.0])])
+            when = rnd.choice([B + float(rnd.randint(-3, 44)), B + rnd.randint(0, 40) + 0.5, rnd.choice([a[2] for a in obs] or [B + 1.0])])
             for sym in syms:
                 for kind in kinds + ("earnings_calendar",):
                     if (sym == "*") != (kind == "earnings_calendar"):
@@ -547,11 +561,12 @@ def test_a_clock_that_steps_back_does_not_let_requests_through_faster(tmp_path):
         state["n"] += 1
         if state["n"] == 30:
             clock.now -= 600
-        return b"{}"
+            clock.mono -= 600                     # rev 3: the PACING clock steps back too, so the pacer's clamp is exercised
+        return b"{}", {}
     cf.collect(["S%d" % i for i in range(12)], tmp_path / "cf.sqlite", fetch=fetch, clock=clock, sleep=clock.sleep,
                credentials=lambda n: KEY, monotonic=clock.monotonic)
     assert state["n"] == 73                       # the run completed
-    assert max(clock.sleeps) <= 61                # and no wait of ten minutes to "catch up" with the earlier readings
+    assert clock.sleeps and max(clock.sleeps) <= 61   # and no wait of ten minutes to "catch up" with the earlier readings
 
 
 def test_a_429_waits_the_retry_after_and_tries_again(tmp_path):
@@ -773,7 +788,7 @@ def test_the_real_fetch_returns_the_body_and_reads_no_more_than_the_cap():
         cf.http_fetch(U, HDR, opener=cf._build_opener(handler))
     assert Counting.total <= cf.MAX_BODY_BYTES + 65536
     handler = FakeHTTPS({U: (200, {}, b'{"ok":1}')})
-    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler)) == b'{"ok":1}'
+    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler))[0] == b'{"ok":1}'          # rev 3 (D4): (body, headers)
 
 
 def test_the_real_fetch_turns_statuses_into_http_errors_with_retry_after():
@@ -1214,6 +1229,49 @@ def _mk_symlink(p, t):
     os.symlink(t / "side" / "real.sqlite", p)
 
 
+def _live_copy(src, dest, *statements):
+    """Run `statements` on `src` in WAL mode with checkpoints off and copy it WITH its live -wal and -shm to `dest` while
+    the connection is still open: `dest` then has a write-ahead file whose changes are not in its main file."""
+    conn = sqlite3.connect(src)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    for st in statements:
+        conn.execute(st)
+    conn.commit()
+    for suffix in ("", "-wal", "-shm"):
+        shutil.copy2(str(src) + suffix, str(dest) + suffix)
+    conn.close()
+
+
+def _mk_mark_other_tables_live(p, t):
+    src = t / "side" / "marked_other.sqlite"
+    src.parent.mkdir(exist_ok=True)
+    _sql(src, "PRAGMA application_id=%d" % cf.APPLICATION_ID, "PRAGMA user_version=%d" % cf.USER_VERSION)
+    _live_copy(src, p, "CREATE TABLE prices(day TEXT, close REAL)", "INSERT INTO prices VALUES('2026-11-13', 1.0)")
+
+
+def _mk_extra_table_only_in_the_live_wal(p, t):
+    src = t / "side" / "good_live.sqlite"
+    _good_store(src, t)
+    _live_copy(src, p, "CREATE TABLE extra(x)", "INSERT INTO extra VALUES(1)")
+
+
+def _mk_cut(n):
+    def make(p, t):
+        side = t / "side"
+        side.mkdir(exist_ok=True)
+        run(side, ["AAA", "BBB", "CCC"], name="cut.sqlite")
+        p.write_bytes((side / "cut.sqlite").read_bytes()[:-n])
+    return make
+
+
+def _mk_shm_symlink(p, t):
+    _good_store(p, t)
+    victim = t / "side" / "victim.bin"
+    victim.write_bytes(b"not a shared-memory file")
+    os.symlink(victim, str(p) + "-shm")
+
+
 FOREIGN = {
     "another_programs_database": _mk_prices,
     "empty_sqlite_file": _mk_empty_sqlite,
@@ -1234,6 +1292,15 @@ FOREIGN = {
     "binary_garbage": lambda p, t: p.write_bytes(bytes(range(256)) * 20),
     "a_directory": lambda p, t: p.mkdir(),
     "a_symlink_to_a_good_store": _mk_symlink,
+    # rev 3 (D3, D6, D7): refused, and left exactly as found, side files included
+    "our_mark_other_tables_with_live_side_files": _mk_mark_other_tables_live,
+    "our_store_with_an_extra_table_only_in_its_live_wal": _mk_extra_table_only_in_the_live_wal,
+    "our_store_with_an_extra_table": _mk_good_then("CREATE TABLE extra(x)"),
+    "our_store_with_a_view": _mk_good_then("CREATE VIEW v AS SELECT 1 AS one"),
+    "our_store_cut_by_1_byte": _mk_cut(1),
+    "our_store_cut_by_100_bytes": _mk_cut(100),
+    "our_store_cut_by_4096_bytes": _mk_cut(4096),
+    "our_store_whose_shm_is_a_symlink": _mk_shm_symlink,
 }
 
 
@@ -1484,7 +1551,11 @@ def test_a_store_in_a_read_only_folder_and_a_read_only_store_file_can_be_read_an
             assert cf.main(["show", "AAA", "--kind", "profile", "--db", str(target), "--as-of", "2026-11-14T13:00:00Z"]) == 0
             assert cf.main(["status", "--db", str(target)]) == 0
             capsys.readouterr()
-            assert snap(d) == before
+            after = snap(d)
+            if variant == "folder":
+                assert after == before
+            else:                       # rev 3 (D1): a writable folder may gain SQLite's side files; the store itself is unchanged
+                assert {k: v for k, v in after.items() if k not in ("cf.sqlite-wal", "cf.sqlite-shm")} == before
         finally:
             os.chmod(d, 0o755)
             os.chmod(target, 0o644)
@@ -1584,9 +1655,9 @@ def test_a_body_shorter_than_its_declared_length_is_a_failure_not_an_answer():
     with pytest.raises(ValueError):
         cf.http_fetch(U, HDR, opener=cf._build_opener(handler))
     handler = FakeHTTPS({U: (200, {"Content-Length": "7"}, b'{"a":1}')})
-    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler)) == b'{"a":1}'
+    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler))[0] == b'{"a":1}'       # rev 3 (D4): (body, headers)
     handler = FakeHTTPS({U: (200, {"Content-Length": "7x"}, b'{"a":1}')})
-    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler)) == b'{"a":1}'          # an unreadable length is not a claim
+    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler))[0] == b'{"a":1}'       # an unreadable length is not a claim
 
 
 SHAPES = {"profile": dict, "metrics": dict, "earnings": list, "recommendations": list, "insiders": dict, "news": list, "earnings_calendar": dict}
@@ -1619,18 +1690,18 @@ def test_an_answer_of_another_top_level_type_is_refused_and_counted_failed(tmp_p
 def test_a_stored_body_that_is_not_strict_json_is_refused_even_with_a_matching_hash(body):
     conn = sqlite3.connect(":memory:")
     make_store(conn)
-    conn.execute("INSERT INTO observations VALUES ('AAA','profile',5,?,?)", (cf.body_sha256(body), body))
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile',?,?,?)", (B + 5, cf.body_sha256(body), body))
     with pytest.raises(cf.Refused):
-        cf.as_of(conn, "AAA", "profile", 10)
+        cf.as_of(conn, "AAA", "profile", B + 10)
 
 
 @pytest.mark.parametrize("body", [sqlite3.Binary(b'{"a":1}'), 5, 2.5])
 def test_a_stored_body_that_is_not_text_is_refused_not_crashed_on(body):
     conn = sqlite3.connect(":memory:")
     make_store(conn)
-    conn.execute("INSERT INTO observations VALUES ('AAA','profile',5,'x',?)", (body,))
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile',?,'x',?)", (B + 5, body))
     with pytest.raises(cf.Refused):
-        cf.as_of(conn, "AAA", "profile", 10)
+        cf.as_of(conn, "AAA", "profile", B + 10)
 
 
 def test_rows_with_a_time_that_is_not_a_number_are_never_returned():
@@ -1667,3 +1738,789 @@ def test_a_killed_runs_row_is_closed_as_interrupted_at_the_next_run_and_status_c
     assert cf.status(tmp_path / "cf.sqlite")["interrupted"] == 1                  # once, not again
     assert cf.main(["status", "--db", str(tmp_path / "cf.sqlite")]) == 0
     assert "interrupted runs: 1" in capsys.readouterr().out
+
+
+# ======================================================================================================================
+# rev 3: the reader and the creation path, with the design decided (D1 to D8)
+# ======================================================================================================================
+
+@pytest.fixture
+def uris(monkeypatch):
+    """Every SQLite URI opened while the test runs (the readers open the store by URI)."""
+    seen = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        target = a[0] if a else k.get("database")
+        if isinstance(target, str) and target.startswith("file:"):
+            seen.append(target)
+        return real(*a, **k)
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return seen
+
+
+def _read_everything(db, capsys=None):
+    """Every reader once: as_of, news_as_of, status, and the command line's status and show."""
+    out = {"profile": cf.as_of(db, "AAA", "profile", T0 + 1), "news": cf.news_as_of(db, "AAA", T0 + 1), "status": cf.status(db)}
+    assert cf.main(["status", "--db", str(db)]) == 0
+    assert cf.main(["show", "AAA", "--db", str(db), "--as-of", "2026-11-14T13:00:00Z"]) == 0
+    if capsys is not None:
+        capsys.readouterr()
+    return out
+
+
+# ---- outcome 1 (D1): no torn or stale read beside a real collector, no lock probe, no immutable mode in a writable folder
+
+def test_a_reader_never_opens_or_locks_the_collectors_lock_file(tmp_path, monkeypatch, capsys):
+    run(tmp_path, ["AAA"])
+    lock = tmp_path / "cf.sqlite.lock"
+    before = lock.stat()
+    opened, locked = [], []
+    real_open, real_flock = os.open, fcntl.flock
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: (opened.append(os.fspath(p)), real_open(p, *a, **k))[1])
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: (locked.append(op), real_flock(fd, op))[1])
+    _read_everything(tmp_path / "cf.sqlite", capsys)
+    assert not [p for p in opened if p.endswith(".lock")] and locked == []
+    after = lock.stat()
+    assert (after.st_mtime_ns, after.st_size, after.st_ino) == (before.st_mtime_ns, before.st_size, before.st_ino)
+
+
+def test_a_reader_in_a_writable_folder_reads_in_ordinary_read_only_mode_never_immutable(tmp_path, uris, capsys):
+    run(tmp_path, ["AAA"])
+    got = _read_everything(tmp_path / "cf.sqlite", capsys)                     # no side file beside the store yet
+    assert got["profile"]["body"]["ticker"] == "AAA" and len(got["news"]) == 2
+    _read_everything(tmp_path / "cf.sqlite", capsys)                           # and with the side files a reader leaves
+    assert uris and all("mode=ro" in u and "immutable" not in u for u in uris), uris
+
+
+COLLECTOR_CHILD = r'''
+import json, random, sqlite3, sys
+from valedia_trader.data_and_fees import company_facts as cf
+db, t0, key = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+state = {"next": int(sys.argv[4]), "run": 0, "now": t0, "mono": 0.0}
+rnd = random.Random(31)
+
+def clock():
+    state["now"] += 0.5
+    return state["now"]
+
+def monotonic():
+    state["mono"] += 0.001
+    return state["mono"]
+
+def fetch(url, headers):
+    if "company-news" in url:
+        ids = range(state["next"], state["next"] + state["per"])
+        state["next"] += state["per"]
+        body = [{"id": "a%07d" % i, "datetime": t0 - rnd.uniform(60, 20 * 86400), "headline": "h%d" % i, "source": "w",
+                 "url": "u", "summary": "s" * 40} for i in ids]
+    elif "profile2" in url:
+        body = {"v": state["run"]}
+    elif "calendar" in url:
+        body = {"earningsCalendar": [{"run": state["run"]}]}
+    elif "stock/earnings" in url or "recommendation" in url:
+        body = [{"run": state["run"]}]
+    else:
+        body = {"run": state["run"]}
+    return json.dumps(body).encode(), {}
+
+print("ready", flush=True)
+for line in sys.stdin:
+    words = line.split()
+    if not words or words[0] != "run":
+        break
+    state["run"] += 1
+    state["per"] = int(words[1])
+    result = cf.collect(["AAA"], db, fetch=fetch, clock=clock, sleep=lambda s: None, credentials=lambda n: key,
+                        monotonic=monotonic)
+    conn = sqlite3.connect(db)                       # a checkpoint, as a collector's close makes when it is the last one
+    ckpt = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    conn.close()
+    print("done", state["run"], state["next"] - 1, result.failed, result.stopped, *ckpt, flush=True)
+'''
+
+
+def _consecutive_ids(articles):
+    ids = [int(a["article_id"][1:]) for a in articles]
+    return len(ids) if ids and len(set(ids)) == len(ids) and min(ids) == 1 and max(ids) == len(ids) else None
+
+
+def test_300_reads_beside_a_real_collector_are_each_a_committed_state_never_torn_or_stale(tmp_path, monkeypatch, capsys):
+    """A second process collects (starting, committing, checkpointing and finishing) while this one reads through as_of,
+    news_as_of, status and show. Each read must be one state the collector committed, and not older than the newest one
+    committed before the read began. Some reads are held in the middle (inside SQLite) while the collector starts and
+    makes whole runs that end in a checkpoint; such a read must still answer the state of its own beginning."""
+    live = tmp_path / "live"
+    live.mkdir()
+    db = live / "cf.sqlite"
+    n0 = 20000
+    first = [{"id": "a%07d" % i, "datetime": T0 - 86400 - (i * 37) % (20 * 86400), "headline": "h%d" % i, "source": "w",
+              "url": "u", "summary": "s" * 40} for i in range(1, n0 + 1)]
+    clock = Clock()
+    run(live, ["AAA"], clock=clock, fetch=Finnhub(clock, {("/company-news", "AAA"): [first], ("/stock/profile2", "AAA"): [{"v": 0}]}))
+    root = Path(cf.__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1")
+    child = subprocess.Popen([sys.executable, "-c", COLLECTOR_CHILD, str(db), repr(T0 + 100), KEY, str(n0 + 1)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env, cwd=str(root))
+    committed = [n0]                     # the news count after each committed run, in order (run 0 is the parent's)
+    hold = {"action": None, "at": 10 ** 9, "max": 0}
+    real_connect = sqlite3.connect
+
+    def connect(*a, **k):                # holds a reader inside SQLite (a progress handler) when asked to
+        conn = real_connect(*a, **k)
+        target = a[0] if a else k.get("database")
+        if isinstance(target, str) and target.startswith("file:") and hold["action"] is not None:
+            calls = [0]
+
+            def handler():
+                calls[0] += 1
+                hold["max"] = max(hold["max"], calls[0])
+                if calls[0] == hold["at"] and hold["action"] is not None:
+                    action, hold["action"] = hold["action"], None
+                    action()
+                return 0
+            conn.set_progress_handler(handler, 1000)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+    def send(per):
+        child.stdin.write("run %d\n" % per)
+        child.stdin.flush()
+
+    def done():
+        words = child.stdout.readline().split()
+        assert words[:1] == ["done"] and words[3:5] == ["0", "None"], words      # the run ended, nothing failed
+        committed.append(int(words[2]))
+        return words
+
+    def check_news(articles, allowed):
+        m = _consecutive_ids(articles)
+        assert m is not None and m in allowed, ("TORN or STALE", len(articles), m, sorted(allowed))
+        return m
+
+    tally = {"news": 0, "as_of": 0, "status": 0, "show": 0, "held": 0, "refused": 0}
+    try:
+        assert child.stdout.readline().startswith("ready")
+        # how long one news read takes, in progress-handler calls, so a held read is held in its middle
+        hold.update(action=lambda: None, at=10 ** 9, max=0)
+        cf.news_as_of(db, "AAA", T0 + 10 ** 6)
+        middle = max(2, hold["max"] // 3)
+        # 1. a read that starts BEFORE the collector does and lasts past two of its runs and their checkpoints
+        hold.update(action=lambda: (send(3000), done(), send(3000), done()), at=middle)
+        assert check_news(cf.news_as_of(db, "AAA", T0 + 10 ** 6), {n0}) == n0
+        assert len(committed) == 3 and hold["action"] is None
+        tally["held"] += 1
+        # 2. reads beside runs in flight; now and then a read held while the run in flight ends and a whole run follows
+        inflight, per, reads, kinds = False, 0, 0, ("news", "as_of", "status", "show")
+        while reads < 300:
+            if not inflight:
+                per = 100
+                send(per)
+                inflight = True
+            runs_done = len(committed) - 1
+            allowed_news = {committed[-1], committed[-1] + per} if inflight else {committed[-1]}
+            allowed_v = {runs_done, runs_done + 1} if inflight else {runs_done}
+            kind = kinds[reads % 4]
+            try:
+                if kind == "news" and reads % 20 == 0 and inflight:
+                    hold.update(action=lambda: (done(), send(3000), done()), at=middle)
+                    check_news(cf.news_as_of(db, "AAA", T0 + 10 ** 6), allowed_news)
+                    assert hold["action"] is None
+                    tally["held"] += 1
+                    inflight = False
+                elif kind == "news":
+                    check_news(cf.news_as_of(db, "AAA", T0 + 10 ** 6), allowed_news)
+                elif kind == "as_of":
+                    assert cf.as_of(db, "AAA", "profile", T0 + 10 ** 6)["body"]["v"] in allowed_v
+                elif kind == "status":
+                    st = cf.status(db)
+                    assert st["rows"]["news"] in allowed_news and st["rows"]["profile"] - 1 in allowed_v
+                    if inflight and st["rows"]["news"] == committed[-1] + per:          # news commits after the profile
+                        assert st["rows"]["profile"] - 1 == runs_done + 1
+                else:
+                    assert cf.main(["show", "AAA", "--kind", "profile", "--db", str(db), "--as-of", "2026-12-01T00:00:00Z"]) == 0
+                    assert json.loads(capsys.readouterr().out)["body"]["v"] in allowed_v
+                tally[kind] += 1
+            except cf.Refused as e:
+                assert "\n" not in str(e)
+                tally["refused"] += 1
+            reads += 1
+            if inflight and select.select([child.stdout], [], [], 0)[0]:
+                done()
+                inflight = False
+        if inflight:
+            done()
+    finally:
+        monkeypatch.undo()
+        if child.poll() is None:
+            child.stdin.close()
+            try:
+                child.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        size = sum(p.stat().st_size for p in live.iterdir())
+        shutil.rmtree(live)                                                       # the store is deleted here
+    assert child.returncode == 0 and reads == 300
+    assert size < 200 * 1024 * 1024 and tally["refused"] <= 3, (size, tally)
+    assert tally["held"] >= 5 and min(tally[k] for k in ("news", "as_of", "status", "show")) >= 60, tally
+
+
+# ---- outcome 2 (D1): read-only places
+
+def test_a_store_in_a_read_only_folder_without_wal_content_is_read_immutably_and_nothing_changes(tmp_path, uris, capsys):
+    d = tmp_path / "ro"
+    d.mkdir()
+    run(d, ["AAA"])
+    for left_by_a_reader in (False, True):
+        if left_by_a_reader:                       # an earlier reader in the writable folder left an empty -wal and a -shm
+            cf.as_of(d / "cf.sqlite", "AAA", "profile", T0 + 1)
+            assert (d / "cf.sqlite-shm").exists() and (d / "cf.sqlite-wal").stat().st_size == 0
+        os.chmod(d, 0o555)
+        try:
+            del uris[:]
+            before = snap(d)
+            got = _read_everything(d / "cf.sqlite", capsys)
+            assert got["profile"]["body"]["ticker"] == "AAA" and len(got["news"]) == 2 and got["status"]["rows"]["profile"] == 1
+            assert snap(d) == before and uris and all("immutable=1" in u for u in uris if "cf.sqlite" in u)
+        finally:
+            os.chmod(d, 0o755)
+
+
+def test_a_store_in_a_read_only_folder_with_wal_content_is_refused_in_one_line_and_nothing_changes(tmp_path, capsys):
+    side = tmp_path / "side"
+    side.mkdir()
+    run(side, ["AAA"])
+    body = cf.canonical_json({"ticker": "AAA", "v": "only in the wal"})
+    row = "INSERT INTO observations VALUES ('AAA','profile',%r,'%s','%s')" % (T0 + 50, cf.body_sha256(body), body)
+    for with_shm in (True, False):
+        d = tmp_path / ("ro_shm" if with_shm else "ro_no_shm")
+        d.mkdir()
+        _live_copy(side / "cf.sqlite", d / "cf.sqlite", row)
+        if not with_shm:
+            os.unlink(d / "cf.sqlite-shm")
+        assert (d / "cf.sqlite-wal").stat().st_size > 32
+        os.chmod(d, 0o555)
+        try:
+            before = snap(d)
+            for call in (lambda: cf.as_of(d / "cf.sqlite", "AAA", "profile", T0 + 100), lambda: cf.news_as_of(d / "cf.sqlite", "AAA", T0 + 100),
+                         lambda: cf.status(d / "cf.sqlite")):
+                with pytest.raises(cf.Refused) as e:
+                    call()
+                text = str(e.value)
+                assert "\n" not in text and "read-only" in text and "-wal" in text and "copy" in text, text
+            for argv in (["status"], ["show", "AAA"]):
+                assert cf.main(argv + ["--db", str(d / "cf.sqlite")]) == 2
+                assert len(capsys.readouterr().err.strip().splitlines()) == 1
+            assert snap(d) == before
+        finally:
+            os.chmod(d, 0o755)
+        copy = tmp_path / ("copy_" + d.name)                       # and the advice works: copied to a writable place, it reads
+        copy.mkdir()
+        for p in d.iterdir():
+            shutil.copy2(p, copy / p.name)
+        assert cf.as_of(copy / "cf.sqlite", "AAA", "profile", T0 + 100)["body"]["v"] == "only in the wal"
+
+
+def test_a_read_only_store_file_in_a_writable_folder_reads_correctly_and_its_bytes_do_not_change(tmp_path, capsys):
+    run(tmp_path, ["AAA"])
+    p = tmp_path / "cf.sqlite"
+    os.chmod(p, 0o444)
+    try:
+        before = snap(tmp_path)["cf.sqlite"]
+        got = _read_everything(p, capsys)
+        assert got["profile"]["body"]["ticker"] == "AAA" and len(got["news"]) == 2
+        assert snap(tmp_path)["cf.sqlite"] == before
+    finally:
+        os.chmod(p, 0o644)
+
+
+# ---- outcome 3 (D2): creation cannot be steered
+
+def _forced_temp_name(monkeypatch, tmp_path, name=None):
+    """Make the module use a known temporary name (rev 2's predictable `<store>.new-<pid>` by default)."""
+    name = name or "cf.sqlite.new-%d" % os.getpid()
+    monkeypatch.setattr(cf, "_temp_name", lambda path: path.with_name(name), raising=False)
+    return tmp_path / name
+
+
+def test_the_temporary_file_is_made_by_the_module_exclusively_without_following_links_under_an_unpredictable_name(tmp_path, monkeypatch):
+    made = []
+    real_open = os.open
+
+    def spy(p, flags, mode=0o777, *a, **k):
+        if ".new-" in os.fspath(p) and flags & os.O_CREAT:
+            made.append((os.fspath(p), flags, mode))
+        return real_open(p, flags, mode, *a, **k)
+    monkeypatch.setattr(os, "open", spy)
+    for name in ("a", "b"):
+        run(tmp_path / name, ["AAA"])
+    assert len(made) == 2
+    for p, flags, mode in made:
+        assert flags & os.O_CREAT and flags & os.O_EXCL and flags & os.O_NOFOLLOW and mode == 0o600
+        assert re.fullmatch(r"cf\.sqlite\.new-[0-9a-f]{32}", Path(p).name) and str(os.getpid()) not in Path(p).name[14:]
+    assert Path(made[0][0]).name != Path(made[1][0]).name
+    assert sorted(x.name for x in (tmp_path / "a").iterdir()) == ["cf.sqlite", "cf.sqlite.lock"]
+
+
+def _victims(t):
+    v = t / "victims"
+    v.mkdir(exist_ok=True)
+    (v / "notes.txt").write_bytes(b"somebody's notes\n" * 50)
+    _sql(v / "prices.db", "CREATE TABLE prices(day TEXT, close REAL)", "INSERT INTO prices VALUES('2026-11-13', 1.0)")
+    if not (v / "store.sqlite").exists():
+        _good_store(v / "store.sqlite", t)
+    (v / "dir").mkdir(exist_ok=True)
+    return v
+
+
+PLANTS = {
+    "an_empty_file": lambda p, v: p.write_bytes(b""),
+    "a_file_with_bytes": lambda p, v: p.write_bytes(b"leftover bytes " * 100),
+    "another_programs_database": lambda p, v: shutil.copy2(v / "prices.db", p),
+    "a_good_store": lambda p, v: shutil.copy2(v / "store.sqlite", p),
+    "a_symlink_to_a_file": lambda p, v: os.symlink(v / "notes.txt", p),
+    "a_symlink_to_a_database": lambda p, v: os.symlink(v / "prices.db", p),
+    "a_symlink_to_a_good_store": lambda p, v: os.symlink(v / "store.sqlite", p),
+    "a_dangling_symlink": lambda p, v: os.symlink(v / "made_by_nobody.db", p),
+    "a_symlink_to_a_directory": lambda p, v: os.symlink(v / "dir", p),
+    "a_fifo": lambda p, v: os.mkfifo(p),
+    "a_directory": lambda p, v: p.mkdir(),
+    "a_hard_link_to_a_file": lambda p, v: os.link(v / "notes.txt", p),
+    "a_hard_link_to_a_database": lambda p, v: os.link(v / "prices.db", p),
+    "a_hard_link_to_a_good_store": lambda p, v: os.link(v / "store.sqlite", p),
+    "a_symlink_to_a_symlink_to_a_database": lambda p, v: (os.symlink(v / "prices.db", v / "chain.db"), os.symlink(v / "chain.db", p)),
+    "a_read_only_file": lambda p, v: (p.write_bytes(b"read only " * 400), os.chmod(p, 0o444)),
+}
+
+
+def _whole(folder):
+    """snap(), and for each symbolic link its target text."""
+    out = snap(folder)
+    for p in Path(folder).iterdir():
+        if p.is_symlink():
+            out[p.name] = out[p.name] + (os.readlink(p),)
+    return out
+
+
+@pytest.mark.parametrize("kind", list(PLANTS))
+def test_a_thing_at_the_temporary_name_before_creation_is_never_written_and_never_becomes_the_store(tmp_path, monkeypatch, kind):
+    v = _victims(tmp_path)
+    d = tmp_path / "d"
+    d.mkdir()
+    tmp = _forced_temp_name(monkeypatch, d)
+    PLANTS[kind](tmp, v)
+    before, victims = _whole(d), _whole(v)
+    fetch = Finnhub(Clock())
+    try:
+        result, _, _ = run(d, ["AAA"], fetch=fetch)
+    except cf.Refused as e:
+        result = e
+    assert isinstance(result, cf.Refused) and "\n" not in str(result) and fetch.calls == [], result
+    assert _whole(v) == victims and _whole(d) == before            # not a byte, a time or a name changed (no store either)
+    assert not (v / "made_by_nobody.db").exists()
+
+
+def _swap(tmp, kind, v):
+    """Put `kind` at `tmp` in place of what is there (another program, racing the module)."""
+    if kind == "a_symlink_to_a_database":
+        os.unlink(tmp)
+        os.symlink(v / "prices.db", tmp)
+    elif kind == "another_programs_database":
+        shutil.copy2(v / "prices.db", str(tmp) + ".x")
+        os.replace(str(tmp) + ".x", tmp)
+    elif kind == "a_directory":
+        os.unlink(tmp)
+        os.mkdir(tmp)
+    elif kind == "a_fifo":
+        os.unlink(tmp)
+        os.mkfifo(tmp)
+    elif kind == "a_hard_link_to_a_database":
+        os.unlink(tmp)
+        os.link(v / "prices.db", tmp)
+
+
+SWAPS = [("made", k) for k in ("a_symlink_to_a_database", "another_programs_database", "a_directory", "a_fifo", "a_hard_link_to_a_database")] + \
+        [("opened", k) for k in ("a_symlink_to_a_database", "another_programs_database", "a_hard_link_to_a_database")] + \
+        [("linked", k) for k in ("a_symlink_to_a_database", "another_programs_database", "a_fifo", "a_hard_link_to_a_database")]
+
+
+@pytest.mark.parametrize("moment, kind", SWAPS)
+def test_a_thing_swapped_in_at_the_temporary_name_during_creation_is_never_written_and_never_becomes_the_store(tmp_path, monkeypatch, moment, kind):
+    """`made`: just after the module created its temporary file; `opened`: as SQLite opens it; `linked`: just before it is
+    linked into place."""
+    v = _victims(tmp_path)
+    d = tmp_path / "d"
+    d.mkdir()
+    victims = _whole(v)
+    swapped = []
+    real_open, real_connect, real_link = os.open, sqlite3.connect, os.link
+
+    def is_tmp(p):
+        return ".new-" in os.fspath(p) and os.fspath(p).startswith(str(d))
+
+    def spy_open(p, flags, *a, **k):
+        fd = real_open(p, flags, *a, **k)
+        if moment == "made" and is_tmp(p) and flags & os.O_CREAT and not swapped:
+            swapped.append(os.fspath(p))
+            _swap(p, kind, v)
+        return fd
+
+    def spy_connect(target, *a, **k):
+        if moment == "opened" and isinstance(target, (str, os.PathLike)) and is_tmp(target) and not swapped:
+            swapped.append(os.fspath(target))
+            _swap(target, kind, v)
+        return real_connect(target, *a, **k)
+
+    def spy_link(src, dst, *a, **k):
+        if moment == "linked" and is_tmp(src) and not swapped:
+            swapped.append(os.fspath(src))
+            _swap(src, kind, v)
+        return real_link(src, dst, *a, **k)
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+    monkeypatch.setattr(os, "link", spy_link)
+    fetch = Finnhub(Clock())
+    with pytest.raises(cf.Refused) as e:
+        run(d, ["AAA"], fetch=fetch)
+    monkeypatch.undo()
+    assert swapped and "\n" not in str(e.value) and fetch.calls == []
+    assert _whole(v) == victims                                       # the victims: not a byte, a time or a name changed
+    assert not (d / "cf.sqlite").exists() and not (d / "cf.sqlite").is_symlink()
+    planted = Path(swapped[0])
+    assert planted.exists() or planted.is_symlink()                   # what the other program put there is left there
+
+
+CREATION_CHILD = r'''
+import os, signal, sys
+from valedia_trader.data_and_fees import company_facts as cf
+db, k, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+create, module = cf._create_store.__code__, cf.__file__
+count, inside = [0], [0]
+
+def local(frame, event, arg):
+    if event == "line":
+        count[0] += 1
+        if count[0] == k:
+            os.kill(os.getpid(), signal.SIGKILL)
+    elif event == "return" and frame.f_code is create:
+        inside[0] -= 1
+    return local
+
+def tracer(frame, event, arg):                       # every line of the creation and of what it calls in the module
+    if frame.f_code is create:
+        inside[0] += 1
+        return local
+    return local if inside[0] and frame.f_code.co_filename == module else None
+
+sys.settrace(tracer)
+cf.collect(["AAA"], db, fetch=lambda u, h: (b"{}" if "profile2" in u or "metric" in u or "insider" in u or "calendar" in u else b"[]", {}),
+           clock=lambda: 1763121600.0, sleep=lambda s: None, credentials=lambda n: key)
+sys.settrace(None)
+print("finished", count[0], flush=True)
+'''
+
+
+def _whole_store_or_nothing(path):
+    """'absent', or 'store' when the file at `path` is a complete company-facts store (mark, tables, integrity)."""
+    if not path.exists():
+        return "absent"
+    head = path.read_bytes()[:100]
+    assert head[:16] == b"SQLite format 3\x00" and int.from_bytes(head[68:72], "big") == cf.APPLICATION_ID
+    copy = path.with_name("check.sqlite")
+    shutil.copy2(path, copy)
+    conn = sqlite3.connect(copy)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {"observations", "news", "runs"}
+    finally:
+        conn.close()
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            with __import__("contextlib").suppress(FileNotFoundError):
+                os.unlink(str(copy) + suffix)
+    return "store"
+
+
+def test_kills_during_creation_never_leave_a_half_made_store_and_the_next_run_removes_only_its_own_hard_link(tmp_path):
+    root = Path(cf.__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1")
+
+    def child(db, k):
+        p = subprocess.run([sys.executable, "-c", CREATION_CHILD, str(db), str(k), KEY], capture_output=True, text=True, env=env,
+                           cwd=str(root), timeout=60)
+        return p.returncode, p.stdout
+    rc, out = child(tmp_path / "whole" / "cf.sqlite", 10 ** 9)
+    assert rc == 0 and out.startswith("finished"), out
+    lines = int(out.split()[1])
+    assert lines >= 30                                               # a kill at each line of the creation
+    outcomes = {}
+    for k in range(1, lines + 1):
+        d = tmp_path / ("k%03d" % k)
+        d.mkdir()
+        rc, out = child(d / "cf.sqlite", k)
+        assert rc == -signal.SIGKILL, (k, rc, out)
+        state = _whole_store_or_nothing(d / "cf.sqlite")
+        left = {p.name: p.lstat() for p in d.iterdir() if ".new-" in p.name}
+        live = (d / "cf.sqlite").lstat() if state == "store" else None
+        own = {n for n, st in left.items() if live and (st.st_dev, st.st_ino) == (live.st_dev, live.st_ino)}
+        others = {n: _whole(d)[n] for n in left if n not in own}
+        listed = cf.status(d / "cf.sqlite")["leftovers"] if state == "store" else None
+        if state == "store":
+            assert sorted(listed) == sorted(left)                        # status lists every leftover by name
+        result, _, _ = run(d, ["AAA"], clock=Clock(T0 + 100))           # the next run
+        assert result.stopped is None and _whole_store_or_nothing(d / "cf.sqlite") == "store"
+        after = _whole(d)
+        assert not any(n in after for n in own)                          # a hard link to the live store is removed
+        assert {n: after.get(n) for n in others} == others               # any other leftover is untouched
+        assert sorted(cf.status(d / "cf.sqlite")["leftovers"]) == sorted(others)
+        outcomes[(state, bool(own), bool(others))] = outcomes.get((state, bool(own), bool(others)), 0) + 1
+        shutil.rmtree(d)
+    assert sum(outcomes.values()) >= 30
+    assert any(o[0] == "absent" for o in outcomes) and any(o[0] == "store" for o in outcomes), outcomes
+
+
+def test_a_leftover_hard_link_to_the_live_store_is_removed_and_every_other_leftover_is_listed_and_untouched(tmp_path, capsys):
+    run(tmp_path, ["AAA"])
+    store = tmp_path / "cf.sqlite"
+    v = _victims(tmp_path)
+    own = ["cf.sqlite.new-" + "a" * 32, "cf.sqlite.new-%d" % 4242]
+    for n in own:
+        os.link(store, tmp_path / n)
+    others = {"cf.sqlite.new-" + "b" * 32: lambda p: p.write_bytes(b"half made"),
+              "cf.sqlite.new-" + "c" * 32: lambda p: os.symlink(store, p),
+              "cf.sqlite.new-" + "d" * 32: lambda p: os.link(v / "notes.txt", p),
+              "cf.sqlite.new-" + "e" * 32 + "-wal": lambda p: p.write_bytes(b"w" * 100),
+              "cf.sqlite.new-" + "f" * 32: lambda p: os.mkfifo(p),
+              "cf.sqlite.new-" + "0" * 32: lambda p: p.mkdir(),
+              "cf.sqlite.new-77": lambda p: shutil.copy2(store, p)}
+    for n, make in others.items():
+        make(tmp_path / n)
+    assert sorted(cf.status(store)["leftovers"]) == sorted(own + list(others))
+    before = {n: v_ for n, v_ in _whole(tmp_path).items() if n in others}
+    victims = _whole(v)
+    run(tmp_path, ["AAA"], clock=Clock(T0 + 10))
+    after = _whole(tmp_path)
+    assert not any(n in after for n in own)
+    assert {n: after.get(n) for n in others} == before and _whole(v) == victims
+    assert sorted(cf.status(store)["leftovers"]) == sorted(others)
+    assert cf.main(["status", "--db", str(store)]) == 0
+    out = capsys.readouterr().out
+    assert all(n in out for n in others) and "leftover" in out
+
+
+# ---- outcome 4 (D3, D6, D7): see FOREIGN above (18 kinds of rev 2 and 8 more); and a short main file that the -wal explains
+
+def test_a_short_main_file_with_a_write_ahead_file_that_holds_the_missing_pages_is_not_cut(tmp_path):
+    """A kill in the middle of a checkpoint leaves the main file shorter than its header says while the -wal still holds
+    every frame; SQLite completes it. Such a store is not 'cut' (D6 as built: see the report)."""
+    side = tmp_path / "side"
+    side.mkdir()
+    run(side, ["AAA"])
+    rows_ = ["INSERT INTO news VALUES ('AAA','w%d',%r,%r,'%s','s','u','m')" % (i, T0 - 60, T0 + 1, "x" * 900) for i in range(40)]
+    _live_copy(side / "cf.sqlite", tmp_path / "cf.sqlite", *rows_)
+    p = tmp_path / "cf.sqlite"
+    head = bytearray(p.read_bytes()[:100])
+    pages = int.from_bytes(head[28:32], "big")
+    page = int.from_bytes(head[16:18], "big")
+    with open(p, "r+b") as f:                       # the header of a half-done checkpoint: it already counts 8 more pages
+        f.seek(28)
+        f.write((pages + 8).to_bytes(4, "big"))
+    assert p.stat().st_size < (pages + 8) * page
+    assert cf._store_problem(p) is None
+    os.unlink(str(p) + "-wal")
+    assert "cut short" in cf._store_problem(p)
+
+
+# ---- outcome 5 (D4): the clock guard
+
+def _http_date(ts):
+    return format_datetime(datetime.fromtimestamp(ts, timezone.utc), usegmt=True)
+
+
+@pytest.mark.parametrize("offset, words", [(25 * 3600, "25.0 hours"), (365 * 86400, "365.0 days"), (-365 * 86400, "365.0 days")])
+def test_an_answer_dated_more_than_24_hours_from_the_wall_clock_stops_the_run_and_nothing_of_it_is_stored(tmp_path, capsys, offset, words):
+    clock = Clock()
+    dated = lambda call: _http_date(call.t + offset) if call.path == "/stock/profile2" else _http_date(call.t)   # noqa: E731
+    fetch = Finnhub(clock, date=dated)
+    result, _, _ = run(tmp_path, ["AAA", "BBB"], fetch=fetch, clock=clock)
+    assert result.stopped and "\n" not in result.stopped and words in result.stopped
+    assert cf._iso(T0) in result.stopped and cf._iso(T0 + offset) in result.stopped
+    assert [c.path for c in fetch.calls] == ["/calendar/earnings", "/stock/profile2"]             # nothing after it is asked
+    assert rows(tmp_path, "SELECT kind FROM observations") == [("earnings_calendar",)]           # nothing of it is stored
+    assert rows(tmp_path, "SELECT ended_at IS NOT NULL FROM runs") == [(1,)]
+    rc, _, _ = cli(tmp_path, "collect", "--symbols", "AAA", "--db", str(tmp_path / "cli.sqlite"), clock=clock, fetch=Finnhub(clock, date=dated))
+    out = capsys.readouterr()
+    assert rc == 2 and len(out.out.strip().splitlines()) == 1 and words in out.out
+
+
+@pytest.mark.parametrize("date", [_http_date(T0 - 23 * 3600 - 59 * 60), _http_date(T0), _http_date(T0 + 24 * 3600), None, "yesterday", "",
+                                  "Mon, 99 Foo 2026 12:00:00 GMT", b"Sat, 14 Nov 2026 12:00:00 GMT", 12345, "Sat, 14 Nov 99999 12:00:00 GMT"])
+def test_an_answer_dated_within_24_hours_or_with_no_readable_date_is_stored(tmp_path, date):
+    clock = Clock()
+    fetch = Finnhub(clock, date=(lambda call: date) if date is not None else None)
+    result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+    assert result.stopped is None and result.failed == 0 and result.stored == 8
+    readable = isinstance(date, str) and date.endswith("GMT") and "Foo" not in date and "99999" not in date
+    assert result.undated == (0 if readable else 7) and ("without a readable Date: %d" % result.undated) in result.summary()
+
+
+def test_the_real_fetch_returns_the_answers_headers_with_lower_cased_names():
+    handler = FakeHTTPS({U: (200, {"Date": "Sat, 14 Nov 2026 12:00:00 GMT", "X-Ratelimit-Remaining": "59"}, b'{"ok":1}')})
+    body, headers = cf.http_fetch(U, HDR, opener=cf._build_opener(handler))
+    assert body == b'{"ok":1}' and headers["date"] == "Sat, 14 Nov 2026 12:00:00 GMT" and headers["x-ratelimit-remaining"] == "59"
+    assert all(k == k.lower() for k in headers)
+
+
+IMPOSSIBLE_TIMES = {"1e300": "1e300", "infinity": "9e999", "minus infinity": "-9e999", "text": "'later'", "after the year 9999": "253402300800.0",
+                    "negative": "-5.0", "1999": "946684799.0", "2100-01-02": "4102531200.0", "a blob": "x'00'"}
+
+
+def test_stored_impossible_fetch_times_neither_refuse_a_run_nor_ever_come_back_from_a_reader(tmp_path):
+    run(tmp_path, ["AAA"])
+    db = tmp_path / "cf.sqlite"
+    body = cf.canonical_json({"impossible": True})
+    for i, (name, t) in enumerate(IMPOSSIBLE_TIMES.items()):
+        _sql(db, "INSERT INTO observations VALUES ('AAA','profile',%s,'%s','%s')" % (t, cf.body_sha256(body), body),
+             "INSERT INTO news VALUES ('AAA','imp%d',%r,%s,'h','s','u','m')" % (i, T0 - 60, t))
+    later_clock = Clock(T0 + 3600)
+    later, _, _ = run(tmp_path, ["AAA"], clock=later_clock, fetch=Finnhub(later_clock, {("/stock/profile2", "AAA"): [{"v": 2}]}))
+    assert later.stopped is None and later.failed == 0 and later.unchanged == 6     # compared with the newest PLAUSIBLE rows
+    for when in (T0 + 7200, 4102444800.0, 1e300, 1e308):
+        got = cf.as_of(db, "AAA", "profile", when)
+        assert got["body"] == {"v": 2} and got["fetched_at"] == T0 + 3600
+        assert cf.as_of(db, "AAA", "metrics", when)["fetched_at"] == T0
+        assert not [a for a in cf.news_as_of(db, "AAA", when) if a["article_id"].startswith("imp")]
+    st = cf.status(db)
+    assert st["newest"] == T0 + 3600 and st["oldest"] == T0 and st["impossible"] == 2 * len(IMPOSSIBLE_TIMES)
+
+
+def test_the_collector_never_stamps_an_impossible_time_itself(tmp_path):
+    for start in (4102444800.0 + 10, 946684800.0 - 10):
+        fetch = Finnhub(Clock(start))
+        with pytest.raises(cf.Refused) as e:
+            run(tmp_path, ["AAA"], fetch=fetch, clock=Clock(start), name="c%d.sqlite" % start)
+        assert fetch.calls == [] and "2000" in str(e.value) and "2100" in str(e.value)
+
+
+@pytest.mark.parametrize("ahead, words", [(2 * 3600, "2.0 hours"), (200 * 86400, "200.0 days")])
+def test_a_store_whose_newest_plausible_fetch_is_ahead_of_the_clock_is_refused_naming_the_times(tmp_path, ahead, words):
+    run(tmp_path, ["AAA"], clock=Clock(T0 + ahead))
+    fetch = Finnhub(Clock())
+    with pytest.raises(cf.Refused) as e:
+        run(tmp_path, ["AAA"], fetch=fetch)
+    text = str(e.value)
+    assert fetch.calls == [] and "\n" not in text and cf._iso(T0 + ahead) in text and cf._iso(T0) in text and words in text
+
+
+# ---- outcome 6 (D5): no traceback from status or show over hand-made bad rows
+
+def _bad_rows():
+    """At least 40 hand-made bad rows for each table, as SQL value lists."""
+    times = ["1e300", "9e999", "-9e999", "-1e15", "'soon'", "x'00ff'", "CAST(x'ff41' AS TEXT)", "253402300800.0", "0", "%r" % (T0 + 10)]
+    texts = ["x'00ff'", "CAST(x'fffe' AS TEXT)", "12", "1.5", "'%s'" % ("y" * 5000), "''", "'*'", "'profile'"]
+    sha = cf.body_sha256('{"a":1}')
+    obs = []
+    for i, (t, x) in enumerate((t, x) for t in times for x in texts):
+        obs.append("('AAA', %s, %s, %s, %s)" % (x if i % 3 else "'profile'", t, ("'%s'" % sha) if i % 2 else "'x'", x))
+    obs += ["(%s, 'profile', %r, '%s', '{\"a\":1}')" % (s, T0 + 5, sha) for s in ("x'41'", "CAST(x'ff' AS TEXT)", "'AAA'", "12")]
+    news = ["('AAA', %s, %s, %s, %s, %s, %s, %s)" % ("'n%d'" % i if i % 4 else ("x'%04x'" % i), times[i % len(times)], times[(i * 3) % len(times)],
+                                                    texts[i % len(texts)], texts[(i + 1) % len(texts)], texts[(i + 2) % len(texts)],
+                                                    "NULL" if i % 5 == 0 else texts[(i + 3) % len(texts)]) for i in range(60)]
+    news += ["('AAA', %d, %r, %r, 'h', 's', 'u', 'm')" % (10 ** 18 + i, T0 - 60, T0 + 1) for i in range(3)]
+    counts = ["'many'", "1.5", "-1", "x'00'", "9223372036854775807", "1e300", "CAST(x'ff' AS TEXT)", "0"]
+    runs_ = ["(%s, %s, %s, %s, 0, 0, %s)" % (times[i % len(times)], "NULL" if i % 3 == 0 else times[(i + 4) % len(times)],
+                                            counts[i % len(counts)], counts[(i * 5) % len(counts)],
+                                            ["x'00'", "CAST(x'ff' AS TEXT)", "12", "'%s'" % cf.INTERRUPTED, "''", "'news,profile'"][i % 6])
+             for i in range(48)]
+    return {"observations": obs, "news": news, "runs": runs_}
+
+
+@pytest.mark.parametrize("table", ["observations", "news", "runs", "all"])
+def test_status_and_show_never_end_in_a_traceback_over_hand_made_bad_rows(tmp_path, capsys, table):
+    run(tmp_path, ["AAA"])
+    db = tmp_path / "cf.sqlite"
+    bad = _bad_rows()
+    assert all(len(v) >= 40 for v in bad.values())
+    conn = sqlite3.connect(db)
+    for name, values in bad.items():
+        if table in (name, "all"):
+            for vals in values:
+                conn.execute("INSERT INTO %s VALUES %s" % (name, vals))
+    conn.commit()
+    if table in ("runs", "all"):                     # each bad runs row in turn as the newest one, the row `status` shows
+        for vals in bad["runs"]:
+            rowid = conn.execute("INSERT INTO runs VALUES %s" % vals).lastrowid
+            conn.commit()
+            assert cf.main(["status", "--db", str(db)]) == 0, vals
+            out = capsys.readouterr()
+            assert out.err == "" and "Traceback" not in out.out, vals
+            conn.execute("DELETE FROM runs WHERE rowid=?", (rowid,))
+            conn.commit()
+    conn.close()
+    st = cf.status(db)                                                   # the function itself: no exception
+    if table in ("runs", "all"):
+        assert st["unreadable_runs"] >= 30 and st["last_run"] is not None
+    if table in ("observations", "news", "all"):
+        assert st["impossible"] >= 20
+    assert cf.main(["status", "--db", str(db)]) == 0                       # every row it cannot show is skipped and counted
+    out = capsys.readouterr()
+    assert out.err == "" and "Traceback" not in out.out
+    for argv in (["show", "AAA"], ["show", "AAA", "--kind", "news"], ["show", "AAA", "--kind", "profile"], ["show", "*"],
+                 ["show", "AAA", "--as-of", "9999-12-31T23:59:59Z"], ["show", "AAA", "--kind", "news", "--as-of", "2000-01-01T00:00:00Z"]):
+        rc = cf.main(argv + ["--db", str(db)])
+        out = capsys.readouterr()
+        assert rc in (0, 2) and "Traceback" not in out.err + out.out
+        if rc == 2:
+            assert out.out == "" and len(out.err.strip().splitlines()) == 1
+        else:
+            json.loads(out.out)
+            assert len(out.err.strip().splitlines()) <= 1
+
+
+# ---- outcome 7 (D8 and three breaks no test caught)
+
+def test_a_refusal_after_the_lock_was_taken_leaves_no_lock_file_behind(tmp_path, monkeypatch):
+    run(tmp_path, ["AAA"])
+    os.unlink(tmp_path / "cf.sqlite.lock")
+    real = cf._take_lock
+
+    def take_then_swap(path):
+        got = real(path)                       # the store turns foreign between the first check and the second
+        _sql(tmp_path / "foreign.db", "CREATE TABLE prices(day TEXT)")
+        os.replace(tmp_path / "foreign.db", path)
+        return got
+    monkeypatch.setattr(cf, "_take_lock", take_then_swap)
+    with pytest.raises(cf.Refused):
+        run(tmp_path, ["AAA"])
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cf.sqlite"]
+
+
+@pytest.mark.parametrize("aid, usable", [("", False), ("x", True), ("x" * 128, True), ("x" * 129, False), (0, True), (2 ** 63 - 1, True),
+                                         (2 ** 63, False), (-(2 ** 63 - 1), True), (-(2 ** 63), False), (10 ** 40, False), (1.0, False)])
+def test_an_article_id_is_usable_only_as_1_to_128_characters_or_an_integer_below_2_to_the_63(tmp_path, aid, usable):
+    clock = Clock()
+    result, _, _ = run(tmp_path, ["AAA"], fetch=Finnhub(clock, {("/company-news", "AAA"): [[dict(article(1, T0 - 5), id=aid)]]}), clock=clock)
+    assert rows(tmp_path, "SELECT count(*) FROM news") == [(1 if usable else 0,)] and result.skipped == (0 if usable else 1)
+
+
+def test_the_pacer_gives_up_cleanly_when_its_clock_has_not_advanced_across_1000_waits(tmp_path):
+    clock = Clock()
+    waits = []
+    result = cf.collect(["S%02d" % i for i in range(20)], tmp_path / "cf.sqlite", fetch=Finnhub(clock), clock=clock,
+                        sleep=waits.append, credentials=lambda n: KEY, monotonic=lambda: 1000.0)
+    assert result.calls == 55 and len(waits) == 1000 and result.stopped and "does not advance" in result.stopped
+    assert rows(tmp_path, "SELECT calls, ended_at IS NOT NULL FROM runs") == [(55, 1)]
+
+
+def test_the_pacer_goes_on_when_its_clock_advances_after_999_waits(tmp_path):
+    clock = Clock()
+    mono = [1000.0]
+    waits = []
+
+    def sleep(s):
+        waits.append(s)
+        if len(waits) % 999 == 0:
+            mono[0] += 61.0
+    result = cf.collect(["S%02d" % i for i in range(12)], tmp_path / "cf.sqlite", fetch=Finnhub(clock), clock=clock,
+                        sleep=sleep, credentials=lambda n: KEY, monotonic=lambda: mono[0])
+    assert result.stopped is None and result.calls == 73 and len(waits) == 999

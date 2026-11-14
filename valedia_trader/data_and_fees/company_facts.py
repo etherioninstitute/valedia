@@ -23,26 +23,50 @@ The store (SQLite, WAL, one writer at a time):
   news(symbol, article_id, published_at, fetched_at, ...)    one row per article, written when first seen, never changed
   runs(started_at, ended_at, calls, stored, unchanged, failed, kinds_refused)
 
-A store is created only where no file exists, and opened only when it carries this store's own mark (SQLite application_id
-APPLICATION_ID, user_version USER_VERSION, and exactly the tables and columns above). Anything else (another program's
-database, an empty SQLite file, a zero-byte file, a file that is not SQLite, a store of another version, a symbolic link) is
-refused before any write of any kind: not a byte, a modification time, a `-wal`, `-shm` or lock file changes. The readers check
-the same mark. A reader opens a store that no collector is writing with SQLite's `immutable` mode, which writes and creates
-nothing and so also works in a read-only folder or on a read-only file. While a collector is writing, it reads the store the
-normal way (read only); where that cannot work (a read-only place) it refuses with a message that says so, and never answers
-from a stale copy.
+A store is created only where no file exists, and opened only when it is this version's store: this store's own mark (SQLite
+application_id APPLICATION_ID, user_version USER_VERSION), exactly the three tables above with exactly their columns, indexes
+and nothing else (no other table, view or trigger), and a file as long as its own header says (page size times page count; a
+store cut short is refused). Anything else (another program's database, an empty SQLite file, a zero-byte file, a file that
+is not SQLite, a store of another version, a symbolic link, a store with an extra table, a cut store) is refused before any
+write of any kind and is left exactly as found, side files included: the checks read the file's bytes and those of its
+`-wal` (where a write-ahead file could change the tables) without SQLite, so not a byte, a modification time, a `-wal`, `-shm`
+or lock file changes. One exception to "cut": a main file shorter than its header says while its `-wal` holds at least as many
+pages as are missing is what a kill in the middle of a checkpoint leaves, and SQLite completes it; it is opened.
+
+A new store is built in a file this module creates itself, beside the store, with O_CREAT | O_EXCL | O_NOFOLLOW under a name
+no one can predict (`<store>.new-<32 random hex digits>`); SQLite then opens that file (its device and inode are compared
+before and after, and the finished file is checked to hold the store), and it is linked into place with a hard link, which
+fails if anything is at the final path (where hard links are impossible it is renamed, only if nothing is there). A name left
+by a run that was killed while it made a store is removed at a later run's start only when it is a hard link to the live
+store; any other leftover is never opened and never deleted, and `status` lists every leftover by name.
+
+Readers read in SQLite's ordinary read-only mode (`mode=ro`) and touch no lock file. In a writable folder SQLite may create
+its own `-wal` and `-shm` side files beside the store as it reads; that is accepted. A store in a place that cannot hold side
+files (a read-only folder or volume) is read in SQLite's `immutable` mode, which writes and creates nothing, and only when no
+`-wal` with content is beside it (the answer is checked not to have changed while it was read); a read-only place with a
+`-wal` that has content is refused in one line that says so and to copy the store with its side files to a writable place.
 
 No look-ahead: `as_of(db, symbol, kind, when)` returns the newest observation fetched at or before `when`;
 `news_as_of(db, symbol, when, since=None)` returns only articles published AND fetched at or before `when`. The reader never
 looks at anything fetched later, whatever the store holds, and a stored row whose text no longer matches its hash is refused.
+A stored fetch time that is not a finite number from 2000-01-01 to 2100-01-01 is impossible: it is never returned by a
+reader and is ignored by every rule about the newest fetch (the clock-behind rule, the unchanged rule, the newest and oldest
+fetch of `status`). `status` and `show` never end in a traceback: a row they cannot show is skipped and counted.
+
+The service's clock guards the stamps: the transport returns the answer's headers with its body, and an answer whose `Date`
+differs from this computer's clock by more than 24 hours when it arrives stops the run before anything of it is stored (the
+one line gives both times and the difference). An answer with no readable `Date` is stored as before and counted. A run
+whose clock reads earlier than the newest plausible fetch in the store, or outside 2000 to 2100, is refused.
 
 Politeness and safety: at most 55 requests in any 60 seconds (the plan allows 60); a 429 waits the Retry-After (30 seconds if
 none, at most 120) and tries again up to 3 times; a 403 marks that kind "not on this plan" for the rest of the run; a 5xx or a
 timeout gets two tries; `max_calls` ends a run cleanly. Only https://finnhub.io/api/v1/ is requested, no redirect is followed,
 an answer over 5 MB, shorter than its declared length, not JSON, of the wrong top-level type, or with a repeated key is refused.
 Pacing is measured on a monotonic clock, so a correction of the wall clock cannot let a burst through; the wall clock is used
-only for the time stamps and the clock-behind rule. An article is stored only if its time is a finite number from 2000-01-01
-to two days after the fetch; any other article is skipped and counted. Nothing in an answer or in the store can stop a run:
+only for the time stamps and the clock-behind rule. The pacer gives up, ending the run cleanly, when its clock has not
+advanced across 1,000 consecutive waits. An article is stored only if its time is a finite number from 2000-01-01 to two days
+after the fetch and its id is a string of 1 to 128 characters or an integer of magnitude below 2**63; any other article is
+skipped and counted. Nothing in an answer or in the store can stop a run:
 an error while handling one symbol and kind is counted failed (with a short fixed reason) and the run goes on. The key is read through `credentials("FINNHUB_API_KEY")`
 (`valedia_trader.core.secrets.secret` by default) and travels only in the `X-Finnhub-Token` header: it is never in a URL, an
 error text, a message, a result or the database, and the client name is the generic constant `USER_AGENT`. An answer that
@@ -65,6 +89,8 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import email.utils
+import errno
 import fcntl
 import hashlib
 import json
@@ -72,12 +98,14 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -110,7 +138,11 @@ NEWS_OVERLAP_DAYS = 2
 
 MIN_ARTICLE_TIME = 946684800.0                   # 2000-01-01
 ARTICLE_FUTURE_SLACK = 2 * 86400.0               # an article may be dated at most this long after the fetch
+MIN_FETCH_TIME, MAX_FETCH_TIME = 946684800.0, 4102444800.0      # 2000-01-01 and 2100-01-01: a fetch time outside is impossible
+DATE_TOLERANCE = 24 * 3600.0                     # the service's Date may differ from this computer's clock by this much
+CLOCK_STOP = "the service dates its answer"      # how a run stopped by the Date guard says why (exit status 2)
 MAX_ARTICLE_ID_CHARS = 128
+ARTICLE_ID_INT_LIMIT = 2 ** 63                   # an integer id must be of magnitude below this
 HALF_KEY_MIN_CHARS = 12
 APPLICATION_ID = 1128549169                      # 0x43464B31, "CFK1": this store's mark in the SQLite header
 USER_VERSION = 1
@@ -119,7 +151,7 @@ INTERRUPTED = "(interrupted)"                    # in runs.kinds_refused: a run 
 MAX_REQUESTS_PER_WINDOW = 55
 WINDOW_SECONDS = 60.0
 WINDOW_MARGIN = 0.1                              # a request counts against the window slightly longer than 60 seconds
-MAX_PACE_SLEEPS = 5
+MAX_STALLED_WAITS = 1000                         # the pacer gives up after this many waits in a row with no clock advance
 RETRY_AFTER_DEFAULT = 30.0
 RETRY_AFTER_MAX = 120.0
 MAX_429_RETRIES = 3
@@ -134,7 +166,12 @@ _SYMBOL = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "memory" / "company_facts.sqlite"
 UNIVERSES_PATH = Path(__file__).resolve().parents[1] / "research_loop" / "universes.json"
 LOCK_SUFFIX = ".lock"
+TEMP_INFIX = ".new-"                             # a new store is built at `<store>.new-<32 random hex digits>`
+_LEFTOVER = re.compile(r"\.new-(?:[0-9a-f]{32}|[0-9]+)(?:-wal|-shm|-journal)?")   # after the store's name (rev 2 used the pid)
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_WAL_MAGIC = (0x377F0682, 0x377F0683)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _COLUMNS = {
     "observations": ["symbol", "kind", "fetched_at", "body_sha256", "body"],
     "news": ["symbol", "article_id", "published_at", "fetched_at", "headline", "source", "url", "summary"],
@@ -152,6 +189,27 @@ CREATE TABLE IF NOT EXISTS runs(
     started_at REAL NOT NULL, ended_at REAL, calls INTEGER NOT NULL, stored INTEGER NOT NULL,
     unchanged INTEGER NOT NULL, failed INTEGER NOT NULL, kinds_refused TEXT NOT NULL);
 """
+
+
+def _plausible_sql(column: str) -> str:
+    """SQL that is true when `column` holds a possible fetch time: a number from MIN_FETCH_TIME to MAX_FETCH_TIME."""
+    return "(typeof({0}) IN ('integer','real') AND {0} BETWEEN {1!r} AND {2!r})".format(column, MIN_FETCH_TIME, MAX_FETCH_TIME)
+
+
+def _schema_rows_of(conn: sqlite3.Connection) -> set:
+    return set(conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+
+
+def _expected_schema() -> frozenset:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return frozenset(_schema_rows_of(conn))
+    finally:
+        conn.close()
+
+
+_EXPECTED_SCHEMA = _expected_schema()             # version 1 holds exactly these tables, indexes and nothing else
 
 
 class HttpError(Exception):
@@ -184,11 +242,13 @@ class Result:
     stopped: str | None = None
     skipped: int = 0
     failures: list = field(default_factory=list)
+    undated: int = 0                                  # answers that carried no readable Date header
 
     def summary(self) -> str:
-        return ("company_facts: %d calls, %d stored, %d unchanged, %d failed; refused kinds: %s; skipped articles: %d; stopped: %s"
+        return ("company_facts: %d calls, %d stored, %d unchanged, %d failed; refused kinds: %s; skipped articles: %d; "
+                "answers without a readable Date: %d; stopped: %s"
                 % (self.calls, self.stored, self.unchanged, self.failed, ",".join(self.kinds_refused) or "none",
-                   self.skipped, self.stopped or "no"))
+                   self.skipped, self.undated, _one_line(self.stopped) if self.stopped else "no"))
 
 
 # ---- small helpers
@@ -221,6 +281,30 @@ def _number(x: Any) -> float | None:
 def _iso(ts: float) -> str:
     dt = datetime.fromtimestamp(ts, timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S" + (".%f" if dt.microsecond else "") + "Z")
+
+
+def _iso_or_none(ts: Any) -> str | None:
+    """`ts` as an ISO time, or None when it is not a number a calendar can show."""
+    if _number(ts) is None:
+        return None
+    try:
+        return _iso(ts)
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+def _when_text(ts: Any) -> str:
+    return _iso_or_none(ts) or "%r seconds since 1970" % (ts,)
+
+
+def _span(seconds: float) -> str:
+    seconds = abs(seconds)
+    return "%.1f hours" % (seconds / 3600) if seconds < 72 * 3600 else "%.1f days" % (seconds / 86400)
+
+
+def _plausible(ts: Any) -> bool:
+    f = _number(ts)
+    return f is not None and MIN_FETCH_TIME <= f <= MAX_FETCH_TIME
 
 
 def _day(ts: float) -> str:
@@ -290,10 +374,21 @@ def _read_capped(resp, limit: int, deadline_at: float, clock: Callable[[], float
             raise ValueError("too long")
 
 
+def _answer_headers(resp) -> dict:
+    """The answer's headers with lower-cased names; a name sent twice with different values maps to None (unreadable)."""
+    got: dict = {}
+    items = resp.headers.items() if getattr(resp, "headers", None) is not None else []
+    for name, value in items:
+        k = str(name).lower()
+        got[k] = value if k not in got or got[k] == value else None
+    return got
+
+
 def http_fetch(url: str, headers: dict, *, opener: urllib.request.OpenerDirector | None = None,
                timeout: float = TIMEOUT_SECONDS, deadline: float = DEADLINE_SECONDS,
-               clock: Callable[[], float] = time.monotonic) -> bytes:
-    """GET `url` (under BASE_URL, else ValueError before any request) and return the body, at most MAX_BODY_BYTES.
+               clock: Callable[[], float] = time.monotonic) -> tuple[bytes, dict]:
+    """GET `url` (under BASE_URL, else ValueError before any request) and return (the body, at most MAX_BODY_BYTES, and the
+    answer's headers with lower-cased names).
     `headers` may hold only X-Finnhub-Token (the key, required), User-Agent and Accept; the key travels as an unredirected
     header and the client name is always USER_AGENT. A status other than 200 raises HttpError (status and Retry-After only);
     a timeout raises TimeoutError, a body over the cap or a changed address ValueError, anything else OSError, each with a
@@ -321,7 +416,7 @@ def http_fetch(url: str, headers: dict, *, opener: urllib.request.OpenerDirector
                 if declared is not None and declared.strip().isdigit() and int(declared) != len(body):
                     failure = ("refused",)                      # cut short (or longer than it said): not an answer
                 else:
-                    return body
+                    return body, _answer_headers(resp)
     except urllib.error.HTTPError as e:
         failure = ("http", e.code, _retry_after_header(e.headers.get("Retry-After") if e.headers else None))
         with contextlib.suppress(Exception):
@@ -350,75 +445,205 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
 
 
-def _columns_ok(conn: sqlite3.Connection) -> bool:
-    return all([r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)] == cols for table, cols in _COLUMNS.items())
+def _schema_ok(conn: sqlite3.Connection) -> bool:
+    return _schema_rows_of(conn) == _EXPECTED_SCHEMA
 
 
 def _check_columns(conn: sqlite3.Connection) -> None:
-    if not _columns_ok(conn):
+    if not _schema_ok(conn):
         raise Refused("the file is not a company-facts store (its tables are not the expected ones); nothing was done")
 
 
-def _side_files(path: Path) -> bool:
-    """True if SQLite's -wal / -shm files exist beside the store: a collector is, or was, writing it."""
-    wal, shm = Path(str(path) + "-wal"), Path(str(path) + "-shm")
-    try:
-        return shm.exists() or (wal.exists() and wal.stat().st_size > 0)
-    except OSError:
-        return True
+def _varint(b: bytes, i: int) -> tuple[int, int]:
+    v = 0
+    for k in range(9):
+        if i >= len(b):
+            raise ValueError("short")
+        c = b[i]
+        i += 1
+        if k == 8:
+            return (v << 8) | c, i
+        v = (v << 7) | (c & 0x7F)
+        if c < 0x80:
+            return v, i
+    raise ValueError("varint")
 
 
-def _header_reason(path: Path) -> str | None:
-    """Why the file at `path` (which exists) is not this store, from its first 100 bytes alone (nothing is opened by SQLite
-    and nothing is written); None when it carries this store's mark."""
-    if path.is_symlink():
-        return "a symbolic link"
-    if not path.is_file():
-        return "not a regular file"
-    try:
-        with open(path, "rb") as f:
-            head = f.read(100)
-    except OSError as e:
-        return "unreadable (%s)" % type(e).__name__
-    if len(head) < 100 or head[:16] != _SQLITE_HEADER:
-        return "not a SQLite database"
-    if int.from_bytes(head[68:72], "big") != APPLICATION_ID:
-        return "another program's database or an empty SQLite file"
-    version = int.from_bytes(head[60:64], "big")
-    if version != USER_VERSION:
-        return "a store of version %d (this program reads version %d)" % (version, USER_VERSION)
-    return None
+def _schema_of_page1(page: bytes, usable: int) -> set:
+    """The rows (type, name, tbl_name, sql) of sqlite_master, read from the bytes of page 1 alone: ValueError unless page 1 is
+    one table leaf whose records all fit on it in UTF-8 (true of this store: its schema is a few hundred bytes)."""
+    h = 100
+    if len(page) < usable or page[h] != 0x0D:
+        raise ValueError("not one leaf")
+    rows = set()
+    for c in range(int.from_bytes(page[h + 3:h + 5], "big")):
+        ptr = int.from_bytes(page[h + 8 + 2 * c:h + 10 + 2 * c], "big")
+        size, i = _varint(page, ptr)
+        _, i = _varint(page, i)                                          # the rowid
+        if size > usable - 35 or i + size > usable:
+            raise ValueError("overflow")
+        rec = page[i:i + size]
+        head, j = _varint(rec, 0)
+        types = []
+        while j < head:
+            t, j = _varint(rec, j)
+            types.append(t)
+        if len(types) != 5:
+            raise ValueError("not a schema row")
+        values, p = [], head
+        for t in types:
+            if t == 0:
+                values.append(None)
+            elif 1 <= t <= 6:
+                n = (1, 2, 3, 4, 6, 8)[t - 1]
+                values.append(int.from_bytes(rec[p:p + n], "big", signed=True))
+                p += n
+            elif t in (8, 9):
+                values.append(t - 8)
+            elif t >= 13 and t % 2:
+                n = (t - 13) // 2
+                values.append(rec[p:p + n].decode("utf-8"))
+                p += n
+            elif t >= 12:
+                n = (t - 12) // 2
+                values.append(bytes(rec[p:p + n]))
+                p += n
+            else:
+                raise ValueError("serial type")
+        if p > len(rec):
+            raise ValueError("short record")
+        rows.add((values[0], values[1], values[2], values[4]))
+    return rows
 
 
-def _foreign_reason(path: Path) -> str | None:
-    """None if nothing exists at `path` or this store does; else why the file there is refused. Before any write."""
-    if not path.exists() and not path.is_symlink():
-        return None
-    why = _header_reason(path)
-    if why is None and not _side_files(path):               # the tables, read through SQLite's immutable mode (writes nothing)
+def _wal_scan(path: Path, page_size: int) -> tuple[int, set | None, str | None]:
+    """(frames, pages of page 1, problem) of the store's write-ahead file, read as plain bytes (SQLite does not open it):
+    the number of frames SQLite could take from it (frames whose salts match its header), the bytes of each such frame of
+    page 1, and why the side files themselves are refused. (0, set(), None) when there is no -wal or SQLite would
+    ignore it."""
+    for suffix in ("-wal", "-shm"):
         try:
-            conn = sqlite3.connect("file:%s?immutable=1" % urllib.parse.quote(str(path.resolve())), uri=True)
-            try:
-                if not _columns_ok(conn):
-                    why = "its tables are not the expected ones"
-            finally:
-                conn.close()
-        except sqlite3.Error:
-            why = "damaged"
-    return why
+            st = os.lstat(str(path) + suffix)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return 0, None, "its %s file cannot be examined (%s)" % (suffix, type(e).__name__)
+        if not stat.S_ISREG(st.st_mode):
+            return 0, None, "its %s file is not a regular file" % suffix
+    try:
+        fd = os.open(str(path) + "-wal", os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK | _CLOEXEC)
+    except FileNotFoundError:
+        return 0, set(), None
+    except OSError as e:
+        return 0, None, "its -wal file cannot be read (%s)" % type(e).__name__
+    try:
+        size = os.fstat(fd).st_size
+        head = os.pread(fd, 32, 0)
+        if len(head) < 32:
+            return 0, set(), None
+        magic, _, wal_page, _, salt1, salt2 = (int.from_bytes(head[k:k + 4], "big") for k in range(0, 24, 4))
+        if magic not in _WAL_MAGIC or wal_page != page_size:
+            return 0, set(), None                                       # SQLite ignores such a file and starts it again
+        frames, pages, offset = 0, set(), 32
+        while offset + 24 + page_size <= size:
+            fh = os.pread(fd, 24, offset)
+            if len(fh) < 24 or (int.from_bytes(fh[8:12], "big"), int.from_bytes(fh[12:16], "big")) != (salt1, salt2):
+                break                                                   # SQLite reads no frame after this one
+            frames += 1
+            if int.from_bytes(fh[0:4], "big") == 1:
+                pages.add(os.pread(fd, page_size, offset + 24))
+            offset += 24 + page_size
+        return frames, pages, None
+    except OSError as e:
+        return 0, None, "its -wal file cannot be read (%s)" % type(e).__name__
+    finally:
+        os.close(fd)
+
+
+@dataclass
+class _Seen:
+    """What the checks saw of a store that passed them."""
+    st: os.stat_result
+    wal_frames: int
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _inspect(path: Path) -> tuple[str | None, _Seen | None]:
+    """(None, None) when nothing is at `path`; (None, seen) when this version's store is; else (why it is refused, None).
+    Read from the file's own bytes and those of its -wal, with plain reads: SQLite opens nothing and nothing is written."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return "is not a company-facts store (unreadable: %s)" % type(e).__name__, None
+    if stat.S_ISLNK(st.st_mode):
+        return "is not a company-facts store (a symbolic link)", None
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a company-facts store (not a regular file)", None
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK | _CLOEXEC)
+    except OSError as e:
+        return "is not a company-facts store (unreadable: %s)" % type(e).__name__, None
+    try:
+        if not _same_file(os.fstat(fd), st):
+            return "changed while it was being checked", None
+        head = os.pread(fd, 100, 0)
+        if len(head) < 100 or head[:16] != _SQLITE_HEADER:
+            return "is not a company-facts store (not a SQLite database)", None
+        if int.from_bytes(head[68:72], "big") != APPLICATION_ID:
+            return "is not a company-facts store (another program's database or an empty SQLite file)", None
+        version = int.from_bytes(head[60:64], "big")
+        if version != USER_VERSION:
+            return "is not a company-facts store (a store of version %d; this program reads version %d)" % (version, USER_VERSION), None
+        page_size = int.from_bytes(head[16:18], "big")
+        page_size = 65536 if page_size == 1 else page_size
+        pages = int.from_bytes(head[28:32], "big")
+        usable = page_size - head[20]
+        if (page_size < 512 or page_size & (page_size - 1) or usable < 480 or pages < 1 or head[24:28] != head[92:96]
+                or int.from_bytes(head[56:60], "big") != 1):
+            return "is damaged (its header is not consistent)", None
+        page1 = os.pread(fd, page_size, 0)
+        size = os.fstat(fd).st_size
+    except OSError as e:
+        return "is not a company-facts store (unreadable: %s)" % type(e).__name__, None
+    finally:
+        os.close(fd)
+    frames, wal_schemas, problem = _wal_scan(path, page_size)
+    if problem:
+        return "is not usable (%s)" % problem, None
+    if size < page_size * pages and size + frames * page_size < page_size * pages:
+        return "is damaged (cut short: %d bytes where its header says %d)" % (size, page_size * pages), None
+    try:
+        tables_ok = _schema_of_page1(page1, usable) == _EXPECTED_SCHEMA
+        wal_ok = all(_schema_of_page1(p, usable) == _EXPECTED_SCHEMA for p in wal_schemas)
+    except (ValueError, IndexError):
+        tables_ok = wal_ok = False
+    if not tables_ok:
+        return "is not a company-facts store (its tables are not the expected ones)", None
+    if not wal_ok:
+        return "is not a company-facts store (its -wal file changes its tables)", None
+    return None, _Seen(st, frames)
+
+
+def _store_problem(path: Any) -> str | None:
+    """Why the file at `path` is not this version's store (None when it is, or when nothing is there)."""
+    return _inspect(Path(path))[0]
 
 
 def _take_lock(path: Path) -> tuple[int, bool]:
     """The exclusive writer lock of the store: a file beside it (`<store>.lock`, never a link) held until closed."""
     lp = Path(str(path) + LOCK_SUFFIX)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
     made = False
     try:
         try:
-            fd = os.open(lp, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+            fd = os.open(lp, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
             made = True
         except FileExistsError:
-            fd = os.open(lp, os.O_RDWR | nofollow, 0o600)
+            fd = os.open(lp, os.O_RDWR | _NOFOLLOW, 0o600)
     except OSError as e:
         raise Refused("%s: the lock file cannot be used (%s); nothing was done" % (lp, type(e).__name__)) from None
     try:
@@ -429,35 +654,110 @@ def _take_lock(path: Path) -> tuple[int, bool]:
     return fd, made
 
 
-def _create_store(path: Path) -> None:
-    """Make a new store at `path`, where nothing exists: built under another name, then linked into place, so that a file
-    which appears meanwhile is never replaced and a half-made store is never visible."""
-    tmp = path.with_name(path.name + ".new-%d" % os.getpid())
+def _temp_name(path: Path) -> Path:
+    """Where a new store is built: beside it, under a name no one can predict."""
+    return path.with_name(path.name + TEMP_INFIX + os.urandom(16).hex())
+
+
+def _is_ours(p: Path, ours: os.stat_result) -> bool:
     try:
-        conn = sqlite3.connect(tmp, isolation_level=None)
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and _same_file(st, ours)
+
+
+def _built(fd: int) -> bool:
+    """True when the file open at `fd` (the one this module created) holds a whole store with this store's mark."""
+    head = os.pread(fd, 100, 0)
+    if len(head) < 100 or head[:16] != _SQLITE_HEADER or int.from_bytes(head[68:72], "big") != APPLICATION_ID:
+        return False
+    page_size = int.from_bytes(head[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    return int.from_bytes(head[60:64], "big") == USER_VERSION and os.fstat(fd).st_size == page_size * int.from_bytes(head[28:32], "big")
+
+
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.EXDEV, errno.ENOSYS}
+
+
+def _create_store(path: Path) -> None:
+    """Make a new store at `path`, where nothing exists. It is built in a file this module creates itself (O_EXCL, no link
+    followed, a name no one can predict) and SQLite is checked to have opened that very file; the finished file is linked into
+    place, which fails if anything is at `path`, so a file that appears meanwhile is never replaced and a half-made store is
+    never visible. Whatever another program puts at the temporary name is left alone."""
+    tmp = _temp_name(path)
+    try:
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o600)
+    except OSError as e:
+        raise Refused("%s cannot be made: its temporary file cannot be created (%s); nothing was done" % (path, type(e).__name__)) from None
+    ours = os.fstat(fd)
+    replaced = Refused("%s cannot be made: its temporary file was replaced by another program and was left alone; nothing was done" % path)
+    renamed = False
+    try:
+        if not _is_ours(tmp, ours):
+            raise replaced
+        conn = sqlite3.connect(str(tmp), isolation_level=None)
         try:
+            if not _is_ours(tmp, ours):                         # SQLite opened by name: it must be the file made above
+                raise replaced
+            conn.execute("PRAGMA journal_mode=MEMORY")           # no side file is made for the temporary file
             conn.execute("PRAGMA application_id=%d" % APPLICATION_ID)
             conn.execute("PRAGMA user_version=%d" % USER_VERSION)
-            conn.execute("PRAGMA journal_mode=WAL")
             create_schema(conn)
         finally:
             conn.close()
+        if not _is_ours(tmp, ours) or not _built(fd):
+            raise replaced
+        os.fsync(fd)
         try:
-            os.link(tmp, path)
+            os.link(tmp, path, follow_symlinks=False)
         except FileExistsError:
             raise Refused("%s appeared while the store was being made; it was left alone, nothing was done" % path) from None
-        except OSError:                                         # a volume without hard links
-            if path.exists() or path.is_symlink():
-                raise Refused("%s appeared while the store was being made; it was left alone, nothing was done" % path) from None
-            os.rename(tmp, path)
+        except OSError as e:
+            if e.errno not in _NO_LINKS or os.path.lexists(path) or not _is_ours(tmp, ours):
+                raise
+            os.rename(tmp, path)                                # a volume without hard links, and nothing at `path`
+            renamed = True
+        if not _is_ours(path, ours):                           # the temporary name was swapped just before the link
+            if not renamed:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)                            # the name this module just made, not what it points to
+            raise replaced
     except sqlite3.Error as e:
         raise Refused("%s cannot be made (%s); nothing was done" % (path, type(e).__name__)) from None
     except OSError as e:
         raise Refused("%s cannot be made (%s); nothing was done" % (path, type(e).__name__)) from None
     finally:
-        for suffix in ("", "-wal", "-shm", "-journal"):
+        if not renamed and _is_ours(tmp, ours):
             with contextlib.suppress(OSError):
-                os.unlink(str(tmp) + suffix)
+                os.unlink(tmp)
+        os.close(fd)
+
+
+def _leftovers(path: Path) -> list[str]:
+    """The names beside the store that a run killed while making a store may have left (never opened here)."""
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return []
+    return sorted(n for n in names if n.startswith(path.name) and _LEFTOVER.fullmatch(n[len(path.name):]))
+
+
+def _remove_own_leftovers(path: Path) -> None:
+    """Unlink each leftover name that is a hard link to the live store (the store stays); any other leftover is left alone."""
+    try:
+        live = os.lstat(path)
+    except OSError:
+        return
+    for name in _leftovers(path):
+        p = path.parent / name
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and _same_file(st, live):
+            with contextlib.suppress(OSError):
+                os.unlink(p)
 
 
 class _Writer:
@@ -468,22 +768,30 @@ class _Writer:
         self.path = Path(path)
         self.fd: int | None = None
         self.conn: sqlite3.Connection | None = None
-        why = _foreign_reason(self.path)
+        why, _ = _inspect(self.path)
         if why:
-            raise Refused("%s is not a company-facts store (%s); nothing was done" % (self.path, why))
+            raise Refused("%s %s; nothing was done" % (self.path, why))
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             raise Refused("%s cannot be used (%s); nothing was done" % (self.path, type(e).__name__)) from None
         self.fd, made = _take_lock(self.path)
         try:
-            why = _foreign_reason(self.path)                    # again, now that no other collector can change it
+            why, seen = _inspect(self.path)                     # again, now that no other collector can change it
             if why:
-                raise Refused("%s is not a company-facts store (%s); nothing was done" % (self.path, why))
-            if not self.path.exists():
+                raise Refused("%s %s; nothing was done" % (self.path, why))
+            if seen is None:
                 _create_store(self.path)
-            self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
+                why, seen = _inspect(self.path)
+                if why or seen is None:
+                    raise Refused("%s %s; nothing was done" % (self.path, why or "vanished as it was made"))
+            _remove_own_leftovers(self.path)
+            self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=5.0)
+            if not _is_ours(self.path, seen.st):
+                raise Refused("%s changed while it was being opened; nothing was done" % self.path)
             _check_columns(self.conn)
+            if self.conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                self.conn.execute("PRAGMA journal_mode=WAL")    # a store is built without a journal and turned to WAL here
             self.conn.execute("PRAGMA synchronous=NORMAL")
         except (Refused, sqlite3.Error) as e:
             self.close()
@@ -504,62 +812,68 @@ class _Writer:
             self.fd = None
 
     def highwater(self) -> float:
-        """The latest fetch time anywhere in the store (0 when it is empty); a row whose time is not a number is ignored."""
+        """The latest possible fetch time anywhere in the store (0 when there is none); an impossible time is ignored."""
         row = self.conn.execute(
-            "SELECT max(a, b) FROM (SELECT coalesce(max(fetched_at), 0) a FROM observations WHERE typeof(fetched_at) IN ('integer','real')),"
-            " (SELECT coalesce(max(fetched_at), 0) b FROM news WHERE typeof(fetched_at) IN ('integer','real'))").fetchone()
+            "SELECT max(a, b) FROM (SELECT coalesce(max(fetched_at), 0) a FROM observations WHERE %s),"
+            " (SELECT coalesce(max(fetched_at), 0) b FROM news WHERE %s)" % (_plausible_sql("fetched_at"), _plausible_sql("fetched_at"))).fetchone()
         return float(row[0])
 
 
-def _collector_active(path: Path) -> bool:
-    """True if a collector may be writing the store now: SQLite's side files exist, or the writer lock is held."""
-    if _side_files(path):
-        return True
-    lp = Path(str(path) + LOCK_SUFFIX)
+def _writable_place(path: Path) -> bool:
+    """True when SQLite could make its side files beside the store: the folder is writable and not on a read-only volume."""
+    folder = path.parent
     try:
-        fd = os.open(lp, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return False
+        if os.statvfs(folder).f_flag & getattr(os, "ST_RDONLY", 1):
+            return False
     except OSError:
-        return True
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
         return False
-    except OSError:
-        return True
-    finally:
-        os.close(fd)
+    return os.access(folder, os.W_OK | os.X_OK)
+
+
+def _fingerprint(path: Path) -> tuple:
+    out = []
+    for p in (str(path), str(path) + "-wal"):
+        try:
+            st = os.lstat(p)
+            out.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append(None)
+    return tuple(out)
 
 
 @contextlib.contextmanager
 def _reader(db: Any):
-    """A read-only view of the store. A connection is used as given. A path must be a file carrying this store's mark; it is
-    opened with SQLite's `immutable` mode when no collector is writing (nothing is written or created, so a read-only folder
-    or file works) and normally, read only, when one is."""
+    """A read-only view of the store. A connection is used as given. A path must be this version's store; it is read in
+    SQLite's ordinary read-only mode, which may make SQLite's own side files in a writable folder. Only where the place cannot
+    hold side files is it read in `immutable` mode, and only when no -wal with content is beside it. No lock file is touched."""
     if isinstance(db, sqlite3.Connection):
         yield db
         return
     if not isinstance(db, (str, os.PathLike)):
         raise Refused("the database must be a path")
     path = Path(db)
-    if not path.exists() and not path.is_symlink():
+    if not os.path.lexists(path):
         raise Refused("no store at %s; run collect first" % path)
-    why = _header_reason(path)
-    if why:
-        raise Refused("%s is not a company-facts store (%s); nothing was done" % (path, why))
-    active = _collector_active(path)
-    uri = "file:%s?%s" % (urllib.parse.quote(str(path.resolve())), "mode=ro" if active else "immutable=1")
-    conn = None
+    why, seen = _inspect(path)
+    if why or seen is None:
+        raise Refused("%s %s; nothing was done" % (path, why or "vanished as it was read"))
+    full = Path(os.path.abspath(path))
+    immutable = not _writable_place(full)
+    if immutable and seen.wal_frames:
+        raise Refused("%s is in a read-only place and its -wal file holds changes that are not in the store yet, which cannot be "
+                      "read here without writing; copy the store with its -wal and -shm files to a writable folder and read "
+                      "it there" % path)
+    before = _fingerprint(full) if immutable else None
+    uri = "file:%s?%s" % (urllib.parse.quote(str(full)), "immutable=1" if immutable else "mode=ro")
 
     def refusal(e: sqlite3.Error) -> Refused:
-        if active and ("unable to open" in str(e) or "readonly" in str(e) or "locked" in str(e)):
-            return Refused("%s is being written by a collector and cannot be read from a read-only place right now; "
-                           "try again when the run ends" % path)
         return Refused("%s cannot be read (%s)" % (path, _one_line(e)))
+    conn = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         _check_columns(conn)
+        if not _is_ours(full, seen.st):
+            raise Refused("%s changed while it was being opened; read it again" % path)
     except sqlite3.Error as e:
         if conn is not None:
             conn.close()
@@ -573,6 +887,8 @@ def _reader(db: Any):
         raise refusal(e) from None
     finally:
         conn.close()
+    if immutable and _fingerprint(full) != before:
+        raise Refused("%s changed while it was being read in a read-only place; read it again" % path)
 
 
 # ---- the readers: no look-ahead
@@ -612,7 +928,8 @@ def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
     when = _check_when(when)
     with _reader(db) as conn:
         row = conn.execute("SELECT fetched_at, body_sha256, body FROM observations WHERE symbol=? AND kind=? AND fetched_at<=?"
-                           " AND typeof(fetched_at) IN ('integer','real') ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (symbol, kind, when)).fetchone()
+                           " AND %s ORDER BY fetched_at DESC, rowid DESC LIMIT 1" % _plausible_sql("fetched_at"),
+                           (symbol, kind, when)).fetchone()
     if row is None:
         return None
     fetched_at, sha, text = row
@@ -633,7 +950,7 @@ def news_as_of(db: Any, symbol: str, when: float, since: float | None = None) ->
     when = _check_when(when)
     sql = ("SELECT symbol, article_id, published_at, fetched_at, headline, source, url, summary FROM news"
            " WHERE symbol=? AND published_at<=? AND fetched_at<=?"
-           " AND typeof(published_at) IN ('integer','real') AND typeof(fetched_at) IN ('integer','real')")
+           " AND typeof(published_at) IN ('integer','real') AND " + _plausible_sql("fetched_at"))
     args: list = [symbol, when, when]
     if since is not None:
         sql += " AND published_at>=?"
@@ -644,23 +961,59 @@ def news_as_of(db: Any, symbol: str, when: float, since: float | None = None) ->
         return [dict(zip(keys, r)) for r in conn.execute(sql, args)]
 
 
+def _count(x: Any) -> bool:
+    return type(x) is int and x >= 0
+
+
+def _run_row(row: tuple) -> dict | None:
+    """A runs row as status shows it, or None when it cannot be shown (a time that is impossible, a count that is not a
+    whole number, refused kinds that are not text)."""
+    started, ended, calls, stored, unchanged, failed, kinds = row
+    if not _plausible(started) or (ended is not None and not _plausible(ended)):
+        return None
+    if not all(_count(x) for x in (calls, stored, unchanged, failed)) or type(kinds) is not bytes:
+        return None
+    try:
+        text = kinds.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return dict(zip(_COLUMNS["runs"], (started, ended, calls, stored, unchanged, failed, text)))
+
+
 def status(db: Any) -> dict:
-    """Rows per kind, symbols covered, the last run's counts, the oldest and newest fetch, the runs that were interrupted."""
+    """Rows per kind, symbols covered, the last run's counts, the oldest and newest possible fetch, the runs that were
+    interrupted, and what it could not show: rows with an impossible fetch time, rows of no known kind, runs rows that
+    cannot be shown (skipped and counted), and the leftover names a killed run may have left beside the store."""
+    plausible = _plausible_sql("fetched_at")
     with _reader(db) as conn:
         rows = {k: 0 for k in STORED_KINDS + ("news",)}
-        for kind, n in conn.execute("SELECT kind, count(*) FROM observations GROUP BY kind"):
+        for kind, n in conn.execute("SELECT kind, count(*) FROM observations WHERE kind IN (%s) GROUP BY kind"
+                                    % ",".join("?" * len(STORED_KINDS)), STORED_KINDS):
             rows[kind] = n
+        other_kinds = conn.execute("SELECT count(*) FROM observations").fetchone()[0] - sum(rows.values())
         rows["news"] = conn.execute("SELECT count(*) FROM news").fetchone()[0]
         symbols = conn.execute("SELECT count(*) FROM (SELECT symbol FROM observations WHERE symbol<>'*'"
                                " UNION SELECT symbol FROM news)").fetchone()[0]
-        last = conn.execute("SELECT started_at, ended_at, calls, stored, unchanged, failed, kinds_refused FROM runs"
-                            " ORDER BY rowid DESC LIMIT 1").fetchone()
+        last, unreadable = None, 0
+        number = "CASE WHEN typeof(%s) IN ('integer','real') THEN %s WHEN typeof(%s)='null' THEN NULL ELSE -1 END"
+        for row in conn.execute("SELECT %s, CASE WHEN typeof(kinds_refused)='text' THEN CAST(kinds_refused AS BLOB) END"
+                                " FROM runs ORDER BY rowid DESC"     # text where a number belongs comes back as -1, never decoded
+                                % ", ".join(number % (c, c, c) for c in _COLUMNS["runs"][:6])):
+            shown = _run_row(row)
+            if shown is None:
+                unreadable += 1
+            elif last is None:
+                last = shown
         span = conn.execute("SELECT min(lo), max(hi) FROM (SELECT min(fetched_at) lo, max(fetched_at) hi FROM observations"
-                            " WHERE typeof(fetched_at) IN ('integer','real')"
-                            " UNION ALL SELECT min(fetched_at), max(fetched_at) FROM news WHERE typeof(fetched_at) IN ('integer','real'))").fetchone()
+                            " WHERE %s UNION ALL SELECT min(fetched_at), max(fetched_at) FROM news WHERE %s)"
+                            % (plausible, plausible)).fetchone()
+        impossible = conn.execute("SELECT (SELECT count(*) FROM observations WHERE NOT %s) + (SELECT count(*) FROM news WHERE NOT %s)"
+                                  % (plausible, plausible)).fetchone()[0]
         interrupted = conn.execute("SELECT count(*) FROM runs WHERE kinds_refused=?", (INTERRUPTED,)).fetchone()[0]
+    leftovers = _leftovers(Path(db)) if isinstance(db, (str, os.PathLike)) else []
     return {"rows": rows, "symbols": symbols, "oldest": span[0], "newest": span[1], "interrupted": interrupted,
-            "last_run": dict(zip(_COLUMNS["runs"], last)) if last else None}
+            "last_run": last, "impossible": impossible, "other_kinds": other_kinds, "unreadable_runs": unreadable,
+            "leftovers": leftovers}
 
 
 # ---- the collector
@@ -670,9 +1023,10 @@ class _Pacer:
     the wall clock (a correction of that cannot let a burst through)."""
     def __init__(self, clock: Callable[[], float], sleep: Callable[[float], Any]):
         self.clock, self.sleep, self.sent = clock, sleep, deque()
+        self.stalled = 0                                                  # waits in a row across which the clock did not advance
 
     def wait(self) -> None:
-        for _ in range(MAX_PACE_SLEEPS):
+        while True:
             now = self.clock()
             self.sent = deque(min(t, now) for t in self.sent)            # (a monotonic clock does not step back; if one does, be safe)
             while self.sent and now - self.sent[0] >= WINDOW_SECONDS + WINDOW_MARGIN / 2:     # (the wait below overshoots it)
@@ -680,8 +1034,26 @@ class _Pacer:
             if len(self.sent) < MAX_REQUESTS_PER_WINDOW:
                 self.sent.append(now)
                 return
+            if self.stalled >= MAX_STALLED_WAITS:
+                raise _Stop("pacing clock does not advance (%d waits)" % self.stalled)
             self.sleep(max(0.0, self.sent[0] + WINDOW_SECONDS + WINDOW_MARGIN - now))
-        raise _Stop("clock does not advance")
+            self.stalled = 0 if self.clock() > now else self.stalled + 1
+
+
+def _served_at(headers: Mapping) -> float | None:
+    """The time in the answer's Date header, or None when there is none or it cannot be read (a name sent twice with
+    different values, not text, not an HTTP date, or a time no calendar holds)."""
+    values = [v for k, v in headers.items() if isinstance(k, str) and k.lower() == "date"]
+    if len(values) != 1 or type(values[0]) is not str or len(values[0]) > 100:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(values[0])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)             # "-0000": a time in UTC whose zone is not known
+        ts = dt.timestamp()
+    except (TypeError, ValueError, IndexError, OverflowError, OSError):
+        return None
+    return ts if math.isfinite(ts) else None
 
 
 def _retry_after(value: Any) -> float:
@@ -847,6 +1219,9 @@ class _Run:
 
     def _store(self, kind: str, symbol: str, value: Any, canon: str) -> None:
         at = self.clock()                                       # after the answer arrived: never earlier than the fact
+        if not _plausible(at):
+            self._fail(kind, "clock impossible")                 # never stamp a time the store would call impossible
+            return
         if at < self.highwater:
             self._fail(kind, "clock behind the store")
             return
@@ -864,8 +1239,8 @@ class _Run:
                 unchanged = 0 if stored else 1
             else:
                 sha = body_sha256(canon)
-                row = conn.execute("SELECT body_sha256 FROM observations WHERE symbol=? AND kind=?"
-                                   " ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (symbol, kind)).fetchone()
+                row = conn.execute("SELECT body_sha256 FROM observations WHERE symbol=? AND kind=? AND %s"
+                                   " ORDER BY fetched_at DESC, rowid DESC LIMIT 1" % _plausible_sql("fetched_at"), (symbol, kind)).fetchone()
                 if row is not None and row[0] == sha:
                     unchanged = 1
                 else:
@@ -883,12 +1258,15 @@ class _Run:
 
     @staticmethod
     def _insert_article(conn, symbol: str, a: Any, at: float) -> int | None:
-        """1 if the article was new, 0 if it was already stored, None if it is skipped: no usable id, no usable time (a finite
-        number from 2000-01-01 to two days after the fetch), or text that cannot be stored. Nothing is filled in."""
+        """1 if the article was new, 0 if it was already stored, None if it is skipped: no usable id (a string of 1 to 128
+        characters or an integer of magnitude below 2**63), no usable time (a finite number from 2000-01-01 to two days after
+        the fetch), or text that cannot be stored. Nothing is filled in."""
         if not isinstance(a, dict):
             return None
         aid, published = a.get("id"), _number(a.get("datetime"))
-        if isinstance(aid, bool) or not isinstance(aid, (int, str)) or aid == "":
+        if isinstance(aid, bool) or not isinstance(aid, (int, str)):
+            return None
+        if (len(aid) < 1 or len(aid) > MAX_ARTICLE_ID_CHARS) if isinstance(aid, str) else not abs(aid) < ARTICLE_ID_INT_LIMIT:
             return None
         if published is None or not MIN_ARTICLE_TIME <= published <= at + ARTICLE_FUTURE_SLACK:
             return None
@@ -898,8 +1276,6 @@ class _Run:
             texts.append(v if isinstance(v, str) else None)
         try:
             ident = str(aid)
-            if isinstance(aid, str) and len(aid) > MAX_ARTICLE_ID_CHARS:
-                return None
             for t in [ident] + texts:
                 if t is not None:
                     t.encode("utf-8")
@@ -909,9 +1285,24 @@ class _Run:
         return cur.rowcount
 
     def _one(self, kind: str, symbol: str, url: str) -> None:
-        body = self._ask(kind, url)
-        if body is None:
+        answer = self._ask(kind, url)
+        if answer is None:
             return
+        arrived = self.clock()
+        if type(answer) is not tuple or len(answer) != 2:
+            self._fail(kind, "not an answer")                    # the transport answers (body, headers)
+            return
+        body, headers = answer
+        if not isinstance(headers, Mapping):
+            self._fail(kind, "no headers")
+            return
+        served = _served_at(headers)
+        if served is None:
+            self.result.undated += 1
+        elif _number(arrived) is not None and abs(arrived - served) > DATE_TOLERANCE:
+            raise _Stop("%s %s but this computer's clock reads %s: they differ by %s (more than 24 hours), so nothing of that "
+                        "answer was stored; set the clock right and run again"
+                        % (CLOCK_STOP, _when_text(served), _when_text(arrived), _span(arrived - served)))
         try:
             value, canon = self._decode(body)
         except _Bad as e:
@@ -964,7 +1355,9 @@ class _Run:
     def go(self, symbols: list[str]) -> Result:
         conn = self.store.conn
         if self.result.started_at < self.highwater:
-            raise Refused("the clock reads earlier than the newest fetch already in the store; nothing was asked")
+            raise Refused("the clock reads %s, earlier than the newest fetch already in the store (%s) by %s; set the clock right "
+                          "and run again; nothing was asked" % (_when_text(self.result.started_at), _when_text(self.highwater),
+                                                                 _span(self.highwater - self.result.started_at)))
         # a row still open here belongs to a run that died (this collector holds the lock): mark it, keep its start time
         conn.execute("UPDATE runs SET kinds_refused=? WHERE ended_at IS NULL AND kinds_refused=''", (INTERRUPTED,))
         conn.execute("INSERT INTO runs VALUES (?, NULL, 0, 0, 0, 0, '')", (self.result.started_at,))
@@ -994,12 +1387,17 @@ def collect(symbols: Any, db: Any, *, fetch: Callable[[str, dict], Any] = http_f
             max_calls: int = DEFAULT_MAX_CALLS, monotonic: Callable[[], float] = time.monotonic) -> Result:
     """Ask Finnhub for each symbol's profile, metrics, earnings, recommendations, insiders and news, and once for the
     earnings calendar, and store what is new. Refused (Refused, before any request) for a bad symbol, a bad `max_calls`, a
-    missing key, a store that is not ours, one that another run holds, or a clock earlier than the store's newest fetch.
-    `fetch(url, headers)` returns the body bytes or raises HttpError (or another error); `credentials(name)` returns the key.
-    `clock` stamps what is fetched; `monotonic` (never the wall clock) paces the requests."""
+    missing key, a store that is not ours, one that another run holds, a clock outside 2000 to 2100, or a clock earlier than
+    the store's newest fetch. `fetch(url, headers)` returns (the body bytes, the answer's headers with lower-cased names) or
+    raises HttpError (or another error); `credentials(name)` returns the key. `clock` stamps what is fetched and is compared
+    with each answer's Date; `monotonic` (never the wall clock) paces the requests."""
     symbols = _check_symbols(symbols)
     max_calls = _check_max_calls(max_calls)
     key = _read_key(credentials)
+    now = clock()
+    if not _plausible(now):
+        raise Refused("the clock reads %s, which is not between 2000-01-01 and 2100-01-01; set it right and run again; "
+                      "nothing was asked" % _when_text(now))
     store = _Writer(db)
     try:
         return _Run(store, key, fetch, clock, sleep, monotonic, max_calls).go(symbols)
@@ -1035,8 +1433,18 @@ def _show_fact(fact: dict | None) -> dict | None:
     return None if fact is None else dict(fact, fetched_at=_iso(fact["fetched_at"]))
 
 
-def _show_news(articles: list[dict]) -> list[dict]:
-    return [dict(a, published_at=_iso(a["published_at"]), fetched_at=_iso(a["fetched_at"])) for a in articles]
+def _show_news(articles: list[dict], skipped: list) -> list[dict]:
+    """The articles as `show` prints them; one it cannot show (a time no calendar holds, a field that is not text) is
+    skipped and counted in `skipped`."""
+    out = []
+    for a in articles:
+        published, fetched = _iso_or_none(a["published_at"]), _iso_or_none(a["fetched_at"])
+        fields_ok = all(a[k] is None or type(a[k]) is str for k in ("headline", "source", "url", "summary"))
+        if published is None or fetched is None or not fields_ok or type(a["article_id"]) not in (str, int):
+            skipped.append(a)
+            continue
+        out.append(dict(a, published_at=published, fetched_at=fetched))
+    return out
 
 
 def _status_text(db: Any) -> str:
@@ -1048,31 +1456,35 @@ def _status_text(db: Any) -> str:
              "last run: none" if last is None else
              "last run: started %s, ended %s, %d calls, %d stored, %d unchanged, %d failed, refused kinds: %s" % (
                  _iso(last["started_at"]), _iso(last["ended_at"]) if last["ended_at"] is not None else "never",
-                 last["calls"], last["stored"], last["unchanged"], last["failed"], last["kinds_refused"] or "none"),
+                 last["calls"], last["stored"], last["unchanged"], last["failed"], _one_line(last["kinds_refused"]) or "none"),
              "interrupted runs: %d" % st["interrupted"],
              "oldest fetch: " + (_iso(st["oldest"]) if st["oldest"] is not None else "none"),
-             "newest fetch: " + (_iso(st["newest"]) if st["newest"] is not None else "none")]
+             "newest fetch: " + (_iso(st["newest"]) if st["newest"] is not None else "none"),
+             "skipped and counted: %d rows with an impossible fetch time, %d rows of no known kind, %d runs rows that cannot be "
+             "shown" % (st["impossible"], st["other_kinds"], st["unreadable_runs"]),
+             "leftover temporary files: " + (", ".join(st["leftovers"]) or "none")]
     return "\n".join(lines)
 
 
-def _show(args, clock) -> str:
+def _show(args, clock) -> tuple[str, int]:
     symbol, kind = args.symbol, args.kind
     if kind is not None and kind not in KINDS + (EARNINGS_CALENDAR,):
         raise Refused("--kind must be one of %s" % ", ".join(KINDS + (EARNINGS_CALENDAR,)))
     when = _parse_when(args.as_of) if args.as_of is not None else clock()
+    skipped: list = []
     try:
         if kind == "news":
-            out: Any = _show_news(news_as_of(args.db, symbol, when))
+            out: Any = _show_news(news_as_of(args.db, symbol, when), skipped)
         elif kind is not None:
             out = _show_fact(as_of(args.db, symbol, kind, when))
         elif symbol == "*":
             out = {EARNINGS_CALENDAR: _show_fact(as_of(args.db, symbol, EARNINGS_CALENDAR, when))}
         else:
             out = {k: _show_fact(as_of(args.db, symbol, k, when)) for k in KINDS if k != "news"}
-            out["news"] = _show_news(news_as_of(args.db, symbol, when))
+            out["news"] = _show_news(news_as_of(args.db, symbol, when), skipped)
     except ValueError as e:
         raise Refused(_one_line(e)) from None
-    return json.dumps(out, indent=2)
+    return json.dumps(out, indent=2), len(skipped)
 
 
 def _load_secrets_file() -> None:
@@ -1124,11 +1536,19 @@ def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep
             result = collect(symbols, args.db, fetch=fetch or http_fetch, clock=clock, sleep=sleep, credentials=credentials,
                              max_calls=max_calls, monotonic=monotonic)
             print(result.summary())
-            return 2 if result.stopped == "key rejected" else 0
-        if args.command == "status":
-            print(_status_text(args.db))
-            return 0
-        print(_show(args, clock))
+            return 2 if result.stopped == "key rejected" or (result.stopped or "").startswith(CLOCK_STOP) else 0
+        try:
+            if args.command == "status":
+                print(_status_text(args.db))
+                return 0
+            text, skipped = _show(args, clock)
+        except (Refused, ValueError):
+            raise
+        except Exception as e:                           # never a traceback from status or show: one line, exit status 2
+            raise Refused("%s cannot be shown (%s)" % (args.db, type(e).__name__)) from None
+        print(text)
+        if skipped:
+            print("company_facts: %d stored articles cannot be shown and were skipped" % skipped, file=sys.stderr)
         return 0
     except Refused as e:
         print("company_facts: refused: %s" % _one_line(e), file=sys.stderr)
