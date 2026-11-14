@@ -243,7 +243,7 @@ already does; neither was chosen with data in sight.
     the battery in force. A late or forced row for the same market and slot, before or after it, is not scored
     and does not take its place.
 
-## Collector replaced during the development period (2026-11-14, written at 10:55 UTC before the restart; no answer has been scored)
+## Collector replaced during the development period (2026-11-14, written at 10:54 UTC, before the restart at 10:54:39 UTC; no answer has been scored)
 
 Under note 4 above. The collector's requests to Kalshi named the owner's project in their `User-Agent` header
 (`valedia-trader-research/1.0`). On the owner's instruction of 2026-11-14 the header becomes
