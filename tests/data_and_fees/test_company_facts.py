@@ -14,10 +14,14 @@ Which test covers which numbered outcome of ticket T33 (the section names below 
   7 command line                                               -> "7. command line" section
   8 docstring rules and no use on the order path               -> "8. rules" section
 """
+import base64
+import hashlib
 import io
 import json
 import logging
+import os
 import random
+import shutil
 import socket
 import sqlite3
 import urllib.error
@@ -52,14 +56,18 @@ def _no_network(monkeypatch):
 class Clock:
     """One fake time: the clock reads it, sleep moves it."""
     def __init__(self, start=T0):
-        self.now, self.sleeps = float(start), []
+        self.now, self.mono, self.sleeps = float(start), 1000.0, []
 
     def __call__(self):
         return self.now
 
+    def monotonic(self):
+        return self.mono
+
     def sleep(self, seconds):
         self.sleeps.append(seconds)
         self.now += seconds
+        self.mono += seconds
 
 
 def day(ts):
@@ -131,8 +139,19 @@ def run(tmp_path, symbols, fetch=None, clock=None, name="cf.sqlite", **kw):
     clock = clock or Clock()
     fetch = fetch or Finnhub(clock)
     kw.setdefault("credentials", lambda n: KEY)
+    kw.setdefault("monotonic", clock.monotonic)
     result = cf.collect(symbols, tmp_path / name, fetch=fetch, clock=clock, sleep=clock.sleep, **kw)
     return result, fetch, clock
+
+
+def snap(folder):
+    """Everything observable about a folder: names, modes, sizes, modification times and content hashes."""
+    out = {}
+    for p in sorted(Path(folder).iterdir()):
+        st = p.lstat()
+        digest = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() and not p.is_symlink() else None
+        out[p.name] = (st.st_mode, st.st_size, st.st_mtime_ns, digest)
+    return out
 
 
 def rows(tmp_path, sql, args=(), name="cf.sqlite"):
@@ -196,12 +215,13 @@ def test_news_window_starts_two_days_before_the_newest_stored_article_day(tmp_pa
 
 def test_news_window_never_starts_after_today(tmp_path):
     clock = Clock()
-    future = T0 + 10 * 86400                                                     # a bad article date in the future
-    fetch = Finnhub(clock, {("/company-news", "AAA"): [[article(1, future)]]})
+    future = T0 + 2 * 86400                                                      # the latest article time that is accepted
+    fetch = Finnhub(clock, {("/company-news", "AAA"): [[article(1, future), article(2, future + 1)]]})
     run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
     run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
     second = [c for c in fetch.calls if c.path == "/company-news"][1]
     assert second.query["from"] <= second.query["to"]
+    assert rows(tmp_path, "SELECT article_id FROM news") == [("1",)]             # one second further is not accepted
 
 
 def test_the_calendar_is_stored_under_the_symbol_star(tmp_path):
@@ -306,11 +326,13 @@ def test_a_second_collector_is_refused_and_names_the_lock(tmp_path):
             seen["nested"] = True
             inner = Finnhub(clock)
             with pytest.raises(cf.Refused) as e:
-                cf.collect(["BBB"], db, fetch=inner, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY)
+                cf.collect(["BBB"], db, fetch=inner, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY,
+                           monotonic=clock.monotonic)
             seen["text"], seen["inner_calls"] = str(e.value), len(inner.calls)
-        return b"[]" if "company-news" in url else b"{}"
+        return Finnhub(clock)(url, headers)
 
-    result = cf.collect(["AAA"], db, fetch=fetch, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY)
+    result = cf.collect(["AAA"], db, fetch=fetch, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY,
+                        monotonic=clock.monotonic)
     assert seen["inner_calls"] == 0 and str(db) + ".lock" in seen["text"] and "\n" not in seen["text"]
     assert result.failed == 0
     run(tmp_path, ["CCC"])                                                         # the lock is free once the run ended
@@ -380,12 +402,11 @@ def test_as_of_returns_the_newest_row_fetched_at_or_before_when(tmp_path):
 
 def test_as_of_reads_the_store_without_making_or_locking_anything(tmp_path):
     run(tmp_path, ["AAA"])
-    def names():                                  # SQLite's own -wal / -shm side files may come and go with a reader
-        return sorted(p.name for p in tmp_path.iterdir() if not p.name.endswith(("-wal", "-shm")))
-    before, size = names(), (tmp_path / "cf.sqlite").stat().st_size
+    before = snap(tmp_path)
     cf.as_of(tmp_path / "cf.sqlite", "AAA", "profile", T0 + 1)
     cf.news_as_of(tmp_path / "cf.sqlite", "AAA", T0 + 1)
-    assert names() == before and (tmp_path / "cf.sqlite").stat().st_size == size
+    cf.status(tmp_path / "cf.sqlite")
+    assert snap(tmp_path) == before                                              # no side file, no changed byte or time
     assert rows(tmp_path, "SELECT count(*) FROM runs") == [(1,)]
     with pytest.raises(cf.Refused):
         cf.as_of(tmp_path / "missing.sqlite", "AAA", "profile", T0)
@@ -528,7 +549,7 @@ def test_a_clock_that_steps_back_does_not_let_requests_through_faster(tmp_path):
             clock.now -= 600
         return b"{}"
     cf.collect(["S%d" % i for i in range(12)], tmp_path / "cf.sqlite", fetch=fetch, clock=clock, sleep=clock.sleep,
-               credentials=lambda n: KEY)
+               credentials=lambda n: KEY, monotonic=clock.monotonic)
     assert state["n"] == 73                       # the run completed
     assert max(clock.sleeps) <= 61                # and no wait of ten minutes to "catch up" with the earlier readings
 
@@ -651,8 +672,8 @@ def test_a_body_over_5_mb_is_refused_and_counted_failed(tmp_path):
     clock = Clock()
     limit = cf.MAX_BODY_BYTES
     assert limit == 5 * 1024 * 1024
-    exact = b'"' + b"x" * (limit - 2) + b'"'
-    over = b'"' + b"x" * (limit - 1) + b'"'
+    exact = b'{"x":"' + b"x" * (limit - 8) + b'"}'
+    over = b'{"x":"' + b"x" * (limit - 7) + b'"}'
     assert len(exact) == limit and len(over) == limit + 1
     fetch = Finnhub(clock, {("/stock/profile2", "AAA"): [over], ("/stock/metric", "AAA"): [exact]})
     result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
@@ -857,7 +878,7 @@ def test_the_key_is_nowhere_in_output_logs_exceptions_results_or_the_database(tm
     leaky = {("/stock/profile2", None): [RuntimeError("failed with header " + KEY)],
              ("/stock/metric", None): [OSError("connection to https://finnhub.io/?token=" + KEY)],
              ("/stock/earnings", None): [http_error(500)],
-             ("/stock/recommendation", None): [b'{"echo":"' + KEY.encode() + b'"}'],
+             ("/stock/recommendation", None): [b'[{"echo":"' + KEY.encode() + b'"}]'],
              ("/stock/insider-transactions", None): [b'{"half":"' + HALVES[0].encode() + b'-tail"}'],
              ("/company-news", None): [lambda call: [article(1, T0 - 5, headline="seen with " + call.headers["X-Finnhub-Token"])]]}
     fetch = Finnhub(clock, leaky)
@@ -938,6 +959,7 @@ def cli(tmp_path, *argv, clock=None, fetch=None, **kw):
     clock = clock or Clock()
     fetch = fetch or Finnhub(clock)
     kw.setdefault("credentials", lambda n: KEY)
+    kw.setdefault("monotonic", clock.monotonic)
     rc = cf.main(list(argv), fetch=fetch, clock=clock, sleep=clock.sleep, **kw)
     return rc, fetch, clock
 
@@ -1012,12 +1034,10 @@ def test_the_universe_flag_reads_the_stocks_entry_of_the_universes_file(tmp_path
     assert rc == 0 and sorted({c.symbol for c in fetch.calls if c.symbol}) == ["AAA", "BRK-B"]
     rc, fetch, _ = cli(tmp_path, "collect", "--db", str(tmp_path / "cf2.sqlite"))                 # the default universe is stocks
     assert rc == 0 and sorted({c.symbol for c in fetch.calls if c.symbol}) == ["AAA", "BRK-B"]
-    with pytest.raises(SystemExit) as e:
-        cli(tmp_path, "collect", "--universe", "crypto", "--db", str(tmp_path / "cf3.sqlite"))
-    assert e.value.code == 2
-    with pytest.raises(SystemExit) as e:
-        cli(tmp_path, "collect", "--universe", "stocks", "--symbols", "AAA", "--db", str(tmp_path / "cf3.sqlite"))
-    assert e.value.code == 2
+    for argv in (["--universe", "crypto"], ["--universe", "stocks", "--symbols", "AAA"]):
+        rc, _, _ = cli(tmp_path, "collect", *argv, "--db", str(tmp_path / "cf3.sqlite"))
+        err = capsys.readouterr().err
+        assert rc == 2 and len(err.strip().splitlines()) == 1
     capsys.readouterr()
 
 
@@ -1127,3 +1147,523 @@ def test_the_module_has_no_dependency_beyond_the_standard_library_and_the_packag
             names.add((node.module or "").split(".")[0])
     import sys
     assert names <= set(sys.stdlib_module_names) | {"valedia_trader"}, names
+
+
+# ======================================================================================================================
+# rev 2: repairs after the blind check
+# ======================================================================================================================
+
+# ---- R1. a store is created only where nothing is, and opened only when it is this store
+
+def _good_store(dest, tmp_path):
+    side = tmp_path / "side"
+    side.mkdir(exist_ok=True)
+    run(side, ["AAA"], name="good.sqlite")
+    shutil.copy(side / "good.sqlite", dest)
+
+
+def _sql(path, *statements):
+    conn = sqlite3.connect(path)
+    for st in statements:
+        conn.execute(st)
+    conn.commit()
+    conn.close()
+
+
+def _mk_prices(p, t):
+    _sql(p, "CREATE TABLE prices(day TEXT, close REAL)", "INSERT INTO prices VALUES('2026-11-13', 1.0)")
+
+
+def _mk_empty_sqlite(p, t):
+    _sql(p, "CREATE TABLE x(a)", "DROP TABLE x")
+
+
+def _mk_conflicting(p, t):
+    _sql(p, "CREATE TABLE observations(a, b)", "INSERT INTO observations VALUES(1, 2)")
+
+
+def _mk_unmarked_with_our_tables(p, t):
+    conn = sqlite3.connect(p)
+    cf.create_schema(conn)
+    conn.commit()
+    conn.close()
+
+
+def _mk_good_then(*statements):
+    def make(p, t):
+        _good_store(p, t)
+        _sql(p, *statements)
+    return make
+
+
+def _mk_wal_foreign(p, t):
+    conn = sqlite3.connect(p)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE prices(day TEXT)")
+    conn.commit()
+    conn.close()
+
+
+def _mk_truncated(p, t):
+    _good_store(p, t)
+    p.write_bytes(p.read_bytes()[:60])
+
+
+def _mk_symlink(p, t):
+    _good_store(t / "side" / "real.sqlite", t)
+    os.symlink(t / "side" / "real.sqlite", p)
+
+
+FOREIGN = {
+    "another_programs_database": _mk_prices,
+    "empty_sqlite_file": _mk_empty_sqlite,
+    "zero_byte_file": lambda p, t: p.write_bytes(b""),
+    "text_file": lambda p, t: p.write_text("not a database, just words\n" * 20),
+    "conflicting_observations_table": _mk_conflicting,
+    "our_tables_but_no_mark": _mk_unmarked_with_our_tables,
+    "other_programs_application_id": lambda p, t: (_mk_unmarked_with_our_tables(p, t), _sql(p, "PRAGMA application_id=305419896")),
+    "other_application_id_with_our_version_and_tables": lambda p, t: (_mk_unmarked_with_our_tables(p, t), _sql(
+        p, "PRAGMA application_id=305419896", "PRAGMA user_version=%d" % cf.USER_VERSION)),
+    "store_of_a_later_version": _mk_good_then("PRAGMA user_version=2"),
+    "our_application_id_version_zero": _mk_good_then("PRAGMA user_version=0"),
+    "our_mark_but_an_extra_column": _mk_good_then("ALTER TABLE news ADD COLUMN extra TEXT"),
+    "our_mark_but_a_table_missing": _mk_good_then("DROP TABLE runs"),
+    "foreign_database_already_in_wal_mode": _mk_wal_foreign,
+    "sixteen_byte_header_only": lambda p, t: p.write_bytes(b"SQLite format 3\x00"),
+    "truncated_below_a_header": _mk_truncated,
+    "binary_garbage": lambda p, t: p.write_bytes(bytes(range(256)) * 20),
+    "a_directory": lambda p, t: p.mkdir(),
+    "a_symlink_to_a_good_store": _mk_symlink,
+}
+
+
+@pytest.mark.parametrize("name", list(FOREIGN))
+def test_a_foreign_file_is_refused_before_any_write_of_any_kind(tmp_path, name, capsys):
+    fo = tmp_path / "fo"
+    fo.mkdir()
+    path = fo / "cf.sqlite"
+    FOREIGN[name](path, tmp_path)
+    before = snap(fo)
+    fetch = Finnhub(Clock())
+    with pytest.raises(cf.Refused) as e:
+        run(fo, ["AAA"], fetch=fetch)
+    assert fetch.calls == [] and "\n" not in str(e.value)
+    for call in (lambda: cf.as_of(path, "AAA", "profile", T0 + 1), lambda: cf.news_as_of(path, "AAA", T0 + 1), lambda: cf.status(path)):
+        with pytest.raises(cf.Refused):
+            call()
+    assert cf.main(["collect", "--symbols", "AAA", "--db", str(path)], fetch=fetch, credentials=lambda n: KEY) == 2
+    assert cf.main(["status", "--db", str(path)]) == 2
+    assert cf.main(["show", "AAA", "--db", str(path)]) == 2
+    capsys.readouterr()
+    assert fetch.calls == [] and snap(fo) == before          # bytes, modification times, and no -wal, -shm or lock file
+
+
+def test_a_store_is_created_where_nothing_is_with_its_own_mark_and_no_stray_file(tmp_path):
+    sub = tmp_path / "new" / "deeper"
+    result, _, _ = run(sub, ["AAA"])
+    assert result.failed == 0
+    assert rows(sub, "PRAGMA application_id") == [(cf.APPLICATION_ID,)]
+    assert rows(sub, "PRAGMA user_version") == [(cf.USER_VERSION,)]
+    assert rows(sub, "PRAGMA journal_mode") == [("wal",)]
+    assert sorted(p.name for p in sub.iterdir()) == ["cf.sqlite", "cf.sqlite.lock"]
+    again, _, _ = run(sub, ["AAA"], clock=Clock(T0 + 10))                         # and a store with the mark opens again
+    assert again.failed == 0 and again.unchanged >= 6
+
+
+def test_a_store_that_appears_while_a_new_one_is_being_made_is_not_replaced(tmp_path, monkeypatch):
+    path = tmp_path / "cf.sqlite"
+    real_link = os.link
+
+    def racing_link(src, dst, *a, **k):                    # another program makes the file in the moment between
+        Path(dst).write_bytes(b"someone else's file")
+        return real_link(src, dst, *a, **k)
+    monkeypatch.setattr(os, "link", racing_link)
+    with pytest.raises(cf.Refused):
+        run(tmp_path, ["AAA"])
+    assert path.read_bytes() == b"someone else's file"
+    assert sorted(p.name for p in tmp_path.iterdir() if ".new" in p.name) == []
+
+
+# ---- R2. no answer can stop a later run
+
+def _article_with(time_value, i=1):
+    a = article(i, 0)
+    if time_value == "missing":
+        del a["datetime"]
+    else:
+        a["datetime"] = time_value
+    return a
+
+
+@pytest.mark.parametrize("value, usable", [
+    (T0 - 60, True), (946684800, True), (946684799, False), (T0 + 2 * 86400, True), (T0 + 2 * 86400 + 1, False),
+    (1763121600000, False), (1.7e12, False), (1e300, False), (10 ** 30, False), (-5, False), (0, False), (1e-300, False),
+    ("2026-11-12", False), (True, False), (None, False), ([], False), ({}, False), ("missing", False)])
+def test_an_article_time_is_usable_only_between_2000_and_two_days_after_the_fetch(tmp_path, value, usable):
+    clock = Clock()
+    fetch = Finnhub(clock, {("/company-news", "AAA"): [[_article_with(value)]]})
+    result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+    assert rows(tmp_path, "SELECT count(*) FROM news") == [(1 if usable else 0,)]
+    assert result.skipped == (0 if usable else 1) and result.failed == 0
+    later, _, _ = run(tmp_path, ["AAA", "BBB"], fetch=fetch, clock=Clock(T0 + 5))     # and the next run is not stopped by it
+    assert later.stopped is None and later.failed == 0
+
+
+def test_an_article_without_a_usable_id_is_skipped_and_counted(tmp_path):
+    clock = Clock()
+    bad = [{"datetime": T0 - 1}, {"id": True, "datetime": T0 - 1}, {"id": [], "datetime": T0 - 1}, {"id": "", "datetime": T0 - 1},
+           "text", None, 5, {"id": "\ud800", "datetime": T0 - 1}, article(2, T0 - 1, headline="\ud800bad")]
+    result, _, _ = run(tmp_path, ["AAA"], fetch=Finnhub(clock, {("/company-news", "AAA"): [bad]}), clock=clock)
+    assert rows(tmp_path, "SELECT count(*) FROM news") == [(0,)] and result.skipped == 9 and result.failed == 0
+
+
+def test_a_store_already_holding_a_row_with_an_impossible_time_does_not_stop_a_run(tmp_path):
+    run(tmp_path, ["AAA"])
+    _sql(tmp_path / "cf.sqlite",
+         "INSERT INTO news VALUES('AAA','h1',1763121600000.0,1.0,'h','s','u','m')",
+         "INSERT INTO news VALUES('AAA','h2',1e300,1.0,'h','s','u','m')",
+         "INSERT INTO news VALUES('AAA','h3',-5.0,1.0,'h','s','u','m')",
+         "INSERT INTO news VALUES('AAA','h4','soon',1.0,'h','s','u','m')",
+         "INSERT INTO news VALUES('BBB','h5',1e300,1.0,'h','s','u','m')",
+         "INSERT INTO news VALUES('BBB','h6',5.0,'soon','h','s','u','m')",
+         "INSERT INTO observations VALUES('AAA','metrics','later','x','{}')")
+    clock = Clock(T0 + 100)
+    result, fetch, _ = run(tmp_path, ["AAA", "BBB", "CCC"], clock=clock)
+    assert result.stopped is None and result.failed == 0
+    assert fetch.paths("CCC") == [PATHS[k] for k in SIX]
+    news = {c.symbol: c for c in fetch.calls if c.path == "/company-news"}
+    assert news["AAA"].query["from"] <= news["AAA"].query["to"] and news["BBB"].query["from"] == "2026-10-15"
+    again, _, _ = run(tmp_path, ["AAA", "BBB", "CCC"], clock=Clock(T0 + 200))
+    assert again.stopped is None
+
+
+def test_an_exception_while_handling_one_symbol_and_kind_is_counted_failed_and_the_run_goes_on(tmp_path, monkeypatch):
+    original = cf._Run._store
+
+    def bad_store(self, kind, symbol, value, canon):
+        if symbol == "BBB" and kind == "profile":
+            raise RuntimeError("boom " + KEY)
+        return original(self, kind, symbol, value, canon)
+
+    def bad_url(self, symbol):
+        if symbol == "BBB":
+            raise OverflowError("year 57841 is out of range " + KEY)
+        return "https://finnhub.io/api/v1/company-news?symbol=%s&from=2026-10-15&to=2026-11-14" % symbol
+    monkeypatch.setattr(cf._Run, "_store", bad_store)
+    monkeypatch.setattr(cf._Run, "_news_url", bad_url)
+    result, fetch, _ = run(tmp_path, ["AAA", "BBB", "CCC"])
+    assert result.failed == 2 and result.stopped is None
+    assert sorted(result.failures) == [("news", "error OverflowError"), ("profile", "error RuntimeError")]
+    assert fetch.paths("CCC") == [PATHS[k] for k in SIX] and KEY not in repr(result)
+    assert rows(tmp_path, "SELECT count(*) FROM observations WHERE symbol='CCC'") == [(5,)]
+
+
+def _hostile(rnd, kind):
+    times = [1763121600000, 1.7e12, 1e300, -5, 0, "2026-01-01", True, None, [], {}, 10 ** 30, 946684799, 1e-300, T0 + 2 * 86400 + 1]
+    ids = [None, True, 1.5, 10 ** 40, "", "x" * 10000, [], {"a": 1}, -1, 0, "∑", "\ud800", "i" * 300]
+    texts = [None, 5, "\ud800", "x" * 100000, "\u0000", [], {"k": "v"}, "\U0001F600", ""]
+    r = rnd.random()
+    if r < 0.3:
+        deep = lambda n: ("[" * n + "]" * n).encode()                            # noqa: E731
+        return rnd.choice([b"null", b"12", b'"s"', b"true", b"[]", b"{}", b'[1,2,{"a":[null]}]', b'{"a":{"b":{"c":[1,2,3]}}}',
+                           deep(10), deep(500), deep(5000), deep(100000), b'{"a":' + deep(900) + b"}", b'[' + b'{"id":1},' * 20000 + b'{}]'])
+    if kind == "news":
+        items = []
+        for _ in range(rnd.randint(1, 6)):
+            items.append({"id": rnd.choice(ids + [rnd.randint(1, 10 ** 6)]), "datetime": rnd.choice(times + [T0 - 5]),
+                          "headline": rnd.choice(texts), "source": rnd.choice(texts), "url": rnd.choice(texts), "summary": rnd.choice(texts)})
+        return json.dumps(items).encode()
+    body = {rnd.choice(["a", "\ud800", "k" * 1000, "\u0000"]): rnd.choice(texts + times + [[[[]]], {"x": {"y": {}}}, 10 ** 400 % 7])}
+    return json.dumps(body if kind not in ("earnings", "recommendations") else [body]).encode()
+
+
+def test_300_hostile_answers_mixed_with_ordinary_ones_never_stop_a_run_or_a_later_run(tmp_path):
+    rnd = random.Random(2026)
+    hostile_count = 0
+    for r in range(60):
+        clock = Clock(T0 + r * 1000)
+        script, hostile, ordinary = {}, [], []
+        for i in range(10):
+            sym = "H%d" % i if i < 5 else "O%d" % i
+            if i < 5:
+                kind = rnd.choice(SIX)
+                script[(PATHS[kind], sym)] = [_hostile(rnd, kind)]
+                hostile.append(sym)
+                hostile_count += 1
+            else:
+                ordinary.append(sym)
+        fetch = Finnhub(clock, script)
+        db = "fuzz%d.sqlite" % r
+        for again in range(2):                                                  # the run, and a later run on the same store
+            before = len(fetch.calls)
+            result, _, _ = run(tmp_path, hostile + ordinary, fetch=fetch, clock=Clock(T0 + r * 1000 + again * 100), name=db)
+            assert result.stopped is None and result.ended_at is not None, (r, result)
+            asked = fetch.calls[before:]
+            for sym in ordinary:
+                assert [c.path for c in asked if c.symbol == sym] == [PATHS[k] for k in SIX]
+            assert not any(KEY in repr(f) for f in result.failures)
+        assert rows(tmp_path, "SELECT count(*) FROM news WHERE published_at < 946684800 OR published_at > ?", (T0 + r * 1000 + 100 + 2 * 86400,), name=db) == [(0,)]
+        assert rows(tmp_path, "SELECT count(*) FROM runs WHERE ended_at IS NULL", name=db) == [(0,)]
+    assert hostile_count == 300
+
+
+# ---- R3. the rate rule holds in true time (a monotonic clock)
+
+def _no_more_than_55_in_60(ts):
+    j = 0
+    for i in range(len(ts)):
+        while ts[i] - ts[j] > 60:
+            j += 1
+        if i - j + 1 > 55:
+            return False
+    return True
+
+
+class Stepping(Finnhub):
+    """A fetch that takes time on the fake clock (both clocks) and sometimes steps the WALL clock; it records true time."""
+    def __init__(self, world, rnd, spacing=(0, 0, 0, 0.2, 1.08, 3)):
+        super().__init__(world.monotonic)
+        self.world, self.rnd, self.spacing = world, rnd, spacing
+
+    def __call__(self, url, headers):
+        out = super().__call__(url, headers)
+        dt = self.rnd.choice(self.spacing)
+        self.world.now += dt
+        self.world.mono += dt
+        if self.rnd.random() < 0.15:
+            self.world.now += self.rnd.choice([-7200, -30, 45, 3600, 86400])      # the wall clock only
+        return out
+
+
+def test_requests_1_08_seconds_apart_are_never_56_in_60_seconds(tmp_path):
+    world = Clock()
+    fetch = Stepping(world, random.Random(1), spacing=(1.08,))
+    run(tmp_path, ["S%02d" % i for i in range(30)], fetch=fetch, clock=world)
+    ts = [c.t for c in fetch.calls]
+    assert len(ts) == 181 and _no_more_than_55_in_60(ts)
+    assert max(b - a for a, b in zip(ts, ts[1:])) > 1.08                           # it did have to wait
+
+
+def test_100_schedules_with_forward_and_backward_wall_clock_steps_never_exceed_55_in_60_seconds(tmp_path):
+    for seed in range(100):
+        world = Clock()
+        fetch = Stepping(world, random.Random(seed))
+        run(tmp_path, ["S%02d" % i for i in range(25)], fetch=fetch, clock=world, name="sched%d.sqlite" % seed)
+        ts = [c.t for c in fetch.calls]
+        assert len(ts) > 100 and _no_more_than_55_in_60(ts), seed
+
+
+def test_a_wall_clock_jump_forward_does_not_let_a_burst_through(tmp_path):
+    world = Clock()
+    seen = []
+
+    def fetch(url, headers):
+        seen.append(world.monotonic())
+        if len(seen) == 55:
+            world.now += 3600                                                     # a clock correction, or a wake from sleep
+        return Finnhub(world)(url, headers)
+    cf.collect(["S%d" % i for i in range(12)], tmp_path / "cf.sqlite", fetch=fetch, clock=world, sleep=world.sleep,
+               credentials=lambda n: KEY, monotonic=world.monotonic)
+    assert _no_more_than_55_in_60(seen) and seen[55] - seen[0] >= 60
+
+
+# ---- R4. readers work on read-only places and write nothing
+
+def test_a_store_in_a_read_only_folder_and_a_read_only_store_file_can_be_read_and_nothing_changes(tmp_path, capsys):
+    for variant in ("folder", "file"):
+        d = tmp_path / variant
+        d.mkdir()
+        run(d, ["AAA"])
+        target = d / "cf.sqlite"
+        os.chmod(d, 0o555) if variant == "folder" else os.chmod(target, 0o444)
+        try:
+            before = snap(d)
+            assert cf.as_of(target, "AAA", "profile", T0 + 1)["body"]["ticker"] == "AAA"
+            assert len(cf.news_as_of(target, "AAA", T0 + 1)) == 2
+            assert cf.status(target)["rows"]["profile"] == 1
+            assert cf.main(["show", "AAA", "--kind", "profile", "--db", str(target), "--as-of", "2026-11-14T13:00:00Z"]) == 0
+            assert cf.main(["status", "--db", str(target)]) == 0
+            capsys.readouterr()
+            assert snap(d) == before
+        finally:
+            os.chmod(d, 0o755)
+            os.chmod(target, 0o644)
+
+
+def test_a_store_that_cannot_be_read_is_refused_and_the_message_says_why(tmp_path):
+    run(tmp_path, ["AAA"])
+    p = tmp_path / "cf.sqlite"
+    p.write_bytes(p.read_bytes()[:4096])                                          # the header page only: the rest is gone
+    before = snap(tmp_path)
+    with pytest.raises(cf.Refused) as e:
+        cf.as_of(p, "AAA", "profile", T0 + 1)
+    assert "malformed" in str(e.value) or "damaged" in str(e.value)
+    assert snap(tmp_path) == before
+
+
+def test_a_reader_never_returns_a_wrong_answer_while_a_collector_writes_in_a_read_only_folder(tmp_path):
+    seen = {}
+    db = tmp_path / "cf.sqlite"
+    clock = Clock()
+    inner = Finnhub(clock)
+
+    def fetch(url, headers):
+        out = inner(url, headers)
+        if len(inner.calls) == 4 and "outcome" not in seen:                       # calendar and profile/metrics/earnings are committed
+            os.chmod(tmp_path, 0o555)
+            try:
+                seen["outcome"] = cf.as_of(db, "AAA", "profile", T0 + 1)
+            except cf.Refused as e:
+                seen["outcome"] = e
+            finally:
+                os.chmod(tmp_path, 0o755)
+        return out
+    cf.collect(["AAA"], db, fetch=fetch, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY, monotonic=clock.monotonic)
+    out = seen["outcome"]
+    assert isinstance(out, cf.Refused) or (out is not None and out["body"]["ticker"] == "AAA")      # refused, or the committed truth
+    if isinstance(out, cf.Refused):
+        assert "read-only" in str(out) and "\n" not in str(out)
+
+
+# ---- R5. the key in any form
+
+def _key_bodies(key):
+    b = key.encode()
+    b64, b64u, hx = base64.b64encode(b).decode(), base64.urlsafe_b64encode(b).decode().rstrip("="), b.hex()
+    return {
+        "plain": json.dumps({"note": key}).encode(),
+        "embedded": json.dumps({"note": "see " + key + " here"}).encode(),
+        "unicode_escapes": ('{"note":"' + "".join("\\u%04x" % ord(c) for c in key) + '"}').encode(),
+        "as_a_member_name": json.dumps({key: 1}).encode(),
+        "base64": json.dumps({"note": b64}).encode(),
+        "base64_url_safe": json.dumps({"note": b64u}).encode(),
+        "base64_at_offset_1": json.dumps({"note": base64.b64encode(b"x" + b).decode()[2:]}).encode(),
+        "base64_at_offset_2": json.dumps({"note": base64.b64encode(b"xy" + b).decode()[3:]}).encode(),
+        "hex": json.dumps({"note": hx}).encode(),
+        "hex_upper": json.dumps({"note": hx.upper()}).encode(),
+    }
+
+
+QUOTED_KEY = 'Ab"Cd\\Ef-1234567890xyzABCDEFGH'
+
+
+@pytest.mark.parametrize("form", list(_key_bodies(QUOTED_KEY)))
+def test_a_key_echoed_in_any_form_is_refused_counted_failed_and_not_stored(tmp_path, form):
+    clock = Clock()
+    fetch = Finnhub(clock, {("/stock/profile2", "AAA"): [_key_bodies(QUOTED_KEY)[form]]})
+    result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock, credentials=lambda n: QUOTED_KEY)
+    assert result.failed == 1 and result.failures == [("profile", "key in answer")]
+    assert rows(tmp_path, "SELECT count(*) FROM observations WHERE kind='profile'") == [(0,)]
+    blob = everything_in(tmp_path)
+    for text in (QUOTED_KEY, json.dumps(QUOTED_KEY)[1:-1], base64.b64encode(QUOTED_KEY.encode()).decode()[:24]):
+        assert text.encode() not in blob
+
+
+def test_a_word_like_key_does_not_refuse_honest_answers_but_its_full_text_is_still_refused(tmp_path):
+    clock = Clock()
+    result, _, _ = run(tmp_path, ["AAA"], clock=clock, credentials=lambda n: "headlinesummary")
+    assert result.failed == 0 and rows(tmp_path, "SELECT count(*) FROM news") == [(2,)]
+    fetch = Finnhub(clock, {("/stock/profile2", "BBB"): [{"note": "xx headlinesummary xx"}]})
+    result, _, _ = run(tmp_path, ["BBB"], fetch=fetch, clock=Clock(T0 + 10), credentials=lambda n: "headlinesummary")
+    assert result.failures == [("profile", "key in answer")]
+
+
+def test_the_half_key_rule_applies_only_to_halves_of_at_least_12_characters(tmp_path):
+    long_key, short_key = "L" * 3 + "0123456789abcdefghijklmnopqrstu", "S0123456789abcdefghi"             # 34 and 20 characters
+    for key, half_len, refused in ((long_key, 17, True), (short_key, 10, False)):
+        clock = Clock()
+        fetch = Finnhub(clock, {("/stock/profile2", "AAA"): [{"note": "x " + key[:half_len] + " y"}]})
+        result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock, credentials=lambda n, key=key: key, name="k%d.sqlite" % len(key))
+        assert (result.failed == 1) is refused
+
+
+# ---- R6. only whole, well-shaped answers are stored
+
+def test_a_body_shorter_than_its_declared_length_is_a_failure_not_an_answer():
+    handler = FakeHTTPS({U: (200, {"Content-Length": "100"}, b'{"a":1}')})
+    with pytest.raises(ValueError):
+        cf.http_fetch(U, HDR, opener=cf._build_opener(handler))
+    handler = FakeHTTPS({U: (200, {"Content-Length": "7"}, b'{"a":1}')})
+    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler)) == b'{"a":1}'
+    handler = FakeHTTPS({U: (200, {"Content-Length": "7x"}, b'{"a":1}')})
+    assert cf.http_fetch(U, HDR, opener=cf._build_opener(handler)) == b'{"a":1}'          # an unreadable length is not a claim
+
+
+SHAPES = {"profile": dict, "metrics": dict, "earnings": list, "recommendations": list, "insiders": dict, "news": list, "earnings_calendar": dict}
+
+
+def test_the_module_states_one_expected_top_level_type_per_kind():
+    assert dict(cf.EXPECTED_TYPES) == {k: v for k, v in SHAPES.items()}
+    for kind in SHAPES:
+        assert kind in " ".join((cf.__doc__ or "").split())
+
+
+WRONG_TYPES = [(kind, wrong) for kind, expected in SHAPES.items()
+               for wrong in (b'"text"', b"12", b"null", b"true", b'{"a":1}' if expected is list else b"[1]")]
+
+
+@pytest.mark.parametrize("kind, wrong", WRONG_TYPES)
+def test_an_answer_of_another_top_level_type_is_refused_and_counted_failed(tmp_path, kind, wrong):
+    path = {"earnings_calendar": "/calendar/earnings"}.get(kind) or PATHS[kind]
+    clock = Clock()
+    fetch = Finnhub(clock, {(path, None): [wrong]})
+    result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+    assert result.failed == 1 and result.failures == [(kind, "wrong type")]
+    table = "news" if kind == "news" else "observations WHERE kind='%s'" % kind
+    assert rows(tmp_path, "SELECT count(*) FROM " + table) == [(0,)]
+
+
+# ---- R7. hand-made rows are refused, never crashed on
+
+@pytest.mark.parametrize("body", ['{"a":NaN}', '{"a":1,"a":2}', "not json", "", '{"a":Infinity}', '{"a":1}extra'])
+def test_a_stored_body_that_is_not_strict_json_is_refused_even_with_a_matching_hash(body):
+    conn = sqlite3.connect(":memory:")
+    make_store(conn)
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile',5,?,?)", (cf.body_sha256(body), body))
+    with pytest.raises(cf.Refused):
+        cf.as_of(conn, "AAA", "profile", 10)
+
+
+@pytest.mark.parametrize("body", [sqlite3.Binary(b'{"a":1}'), 5, 2.5])
+def test_a_stored_body_that_is_not_text_is_refused_not_crashed_on(body):
+    conn = sqlite3.connect(":memory:")
+    make_store(conn)
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile',5,'x',?)", (body,))
+    with pytest.raises(cf.Refused):
+        cf.as_of(conn, "AAA", "profile", 10)
+
+
+def test_rows_with_a_time_that_is_not_a_number_are_never_returned():
+    conn = sqlite3.connect(":memory:")
+    make_store(conn)
+    body = cf.canonical_json({"v": 1})
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile','soon',?,?)", (cf.body_sha256(body), body))
+    conn.execute("INSERT INTO news VALUES ('AAA','1','soon',5,'h','s','u','m')")
+    conn.execute("INSERT INTO news VALUES ('AAA','2',5,'soon','h','s','u','m')")
+    assert cf.as_of(conn, "AAA", "profile", 10) is None and cf.news_as_of(conn, "AAA", 10) == []
+
+
+# ---- R8. one line, always
+
+@pytest.mark.parametrize("argv", [["collect", "--symbols", "AAA", "--universe", "stocks"], ["frobnicate"], [], ["collect", "--symbols", "-A"],
+                                  ["show"], ["collect", "--universe", "bonds"], ["status", "--nope"], ["collect", "--max-calls"],
+                                  ["collect", "--db"], ["show", "AAA", "BBB"]])
+def test_every_refusal_of_the_command_line_including_the_parsers_is_one_line_and_exit_2(capsys, argv):
+    rc = cf.main(argv)
+    out = capsys.readouterr()
+    assert rc == 2 and out.out == "" and len(out.err.strip().splitlines()) == 1 and out.err.startswith("company_facts: refused:")
+
+
+# ---- R9. a killed run is visible
+
+def test_a_killed_runs_row_is_closed_as_interrupted_at_the_next_run_and_status_counts_it(tmp_path, capsys):
+    run(tmp_path, ["AAA"])
+    _sql(tmp_path / "cf.sqlite", "INSERT INTO runs VALUES (%r, NULL, 0, 0, 0, 0, '')" % (T0 - 500))
+    assert cf.status(tmp_path / "cf.sqlite")["interrupted"] == 0                  # still open: not yet known to be dead
+    run(tmp_path, ["AAA"], clock=Clock(T0 + 3600))
+    got = rows(tmp_path, "SELECT started_at, ended_at, calls, stored, unchanged, failed, kinds_refused FROM runs ORDER BY rowid")
+    assert got[1] == (T0 - 500, None, 0, 0, 0, 0, cf.INTERRUPTED) and got[0][1] is not None and got[2][1] is not None
+    run(tmp_path, ["AAA"], clock=Clock(T0 + 7200))
+    assert cf.status(tmp_path / "cf.sqlite")["interrupted"] == 1                  # once, not again
+    assert cf.main(["status", "--db", str(tmp_path / "cf.sqlite")]) == 0
+    assert "interrupted runs: 1" in capsys.readouterr().out

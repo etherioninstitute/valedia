@@ -12,12 +12,25 @@ nothing, and daily candles, dividends, splits, fund profiles and fund holdings a
 for. Prices come from elsewhere; this module is about facts. The answers are today's snapshot, so history exists only from
 the first run on, and every row says when it was fetched.
 
+What each kind must answer (one top-level JSON type each; anything else is refused and counted failed):
+  profile: object    metrics: object    earnings: array    recommendations: array    insiders: object
+  news: array        earnings_calendar: object
+
 The store (SQLite, WAL, one writer at a time):
   observations(symbol, kind, fetched_at, body_sha256, body)  a row only when the answer, as canonical JSON (sorted keys, no
                                                              spaces), differs from the newest stored one for that symbol and
                                                              kind; the market calendar is under the symbol `*`
   news(symbol, article_id, published_at, fetched_at, ...)    one row per article, written when first seen, never changed
   runs(started_at, ended_at, calls, stored, unchanged, failed, kinds_refused)
+
+A store is created only where no file exists, and opened only when it carries this store's own mark (SQLite application_id
+APPLICATION_ID, user_version USER_VERSION, and exactly the tables and columns above). Anything else (another program's
+database, an empty SQLite file, a zero-byte file, a file that is not SQLite, a store of another version, a symbolic link) is
+refused before any write of any kind: not a byte, a modification time, a `-wal`, `-shm` or lock file changes. The readers check
+the same mark. A reader opens a store that no collector is writing with SQLite's `immutable` mode, which writes and creates
+nothing and so also works in a read-only folder or on a read-only file. While a collector is writing, it reads the store the
+normal way (read only); where that cannot work (a read-only place) it refuses with a message that says so, and never answers
+from a stale copy.
 
 No look-ahead: `as_of(db, symbol, kind, when)` returns the newest observation fetched at or before `when`;
 `news_as_of(db, symbol, when, since=None)` returns only articles published AND fetched at or before `when`. The reader never
@@ -26,9 +39,17 @@ looks at anything fetched later, whatever the store holds, and a stored row whos
 Politeness and safety: at most 55 requests in any 60 seconds (the plan allows 60); a 429 waits the Retry-After (30 seconds if
 none, at most 120) and tries again up to 3 times; a 403 marks that kind "not on this plan" for the rest of the run; a 5xx or a
 timeout gets two tries; `max_calls` ends a run cleanly. Only https://finnhub.io/api/v1/ is requested, no redirect is followed,
-an answer over 5 MB, not JSON, or with a repeated key is refused. The key is read through `credentials("FINNHUB_API_KEY")`
+an answer over 5 MB, shorter than its declared length, not JSON, of the wrong top-level type, or with a repeated key is refused.
+Pacing is measured on a monotonic clock, so a correction of the wall clock cannot let a burst through; the wall clock is used
+only for the time stamps and the clock-behind rule. An article is stored only if its time is a finite number from 2000-01-01
+to two days after the fetch; any other article is skipped and counted. Nothing in an answer or in the store can stop a run:
+an error while handling one symbol and kind is counted failed (with a short fixed reason) and the run goes on. The key is read through `credentials("FINNHUB_API_KEY")`
 (`valedia_trader.core.secrets.secret` by default) and travels only in the `X-Finnhub-Token` header: it is never in a URL, an
-error text, a message, a result or the database, and the client name is the generic constant `USER_AGENT`.
+error text, a message, a result or the database, and the client name is the generic constant `USER_AGENT`. An answer that
+contains the key (plain, as JSON-escaped text, as \\u escapes, as a member name, or base64 or hex encoded, at any alignment) or,
+for a key of at least 24 characters, a half of it, is refused. What remains unguarded: a short key's partial echo, the key
+split over several strings, and other transformations (reversed, percent-encoded, base32, hashed); a key shorter than about
+10 characters has no base64 guard.
 
 This module is not on the order path and nothing on the order path may import it.
 
@@ -42,6 +63,7 @@ says what to do.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -61,7 +83,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-__all__ = ["BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
+__all__ = ["APPLICATION_ID", "USER_VERSION", "INTERRUPTED", "EXPECTED_TYPES", "BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
            "news_as_of", "status", "universe_symbols", "valid_symbol", "http_fetch", "canonical_json", "body_sha256",
            "create_schema", "main", "DEFAULT_DB", "UNIVERSES_PATH", "DEFAULT_MAX_CALLS", "MAX_BODY_BYTES"]
 
@@ -79,10 +101,20 @@ _REQUESTS = {                                   # kind -> path and fixed query (
     "recommendations": ("stock/recommendation", {}),
     "insiders": ("stock/insider-transactions", {}),
 }
+EXPECTED_TYPES = {"profile": dict, "metrics": dict, "earnings": list, "recommendations": list, "insiders": dict,
+                  "news": list, EARNINGS_CALENDAR: dict}
 CALENDAR_PATH = "calendar/earnings"
 CALENDAR_DAYS = 90
 NEWS_FIRST_DAYS = 30
 NEWS_OVERLAP_DAYS = 2
+
+MIN_ARTICLE_TIME = 946684800.0                   # 2000-01-01
+ARTICLE_FUTURE_SLACK = 2 * 86400.0               # an article may be dated at most this long after the fetch
+MAX_ARTICLE_ID_CHARS = 128
+HALF_KEY_MIN_CHARS = 12
+APPLICATION_ID = 1128549169                      # 0x43464B31, "CFK1": this store's mark in the SQLite header
+USER_VERSION = 1
+INTERRUPTED = "(interrupted)"                    # in runs.kinds_refused: a run that died without closing its row
 
 MAX_REQUESTS_PER_WINDOW = 55
 WINDOW_SECONDS = 60.0
@@ -150,12 +182,13 @@ class Result:
     failed: int = 0
     kinds_refused: tuple = ()
     stopped: str | None = None
+    skipped: int = 0
     failures: list = field(default_factory=list)
 
     def summary(self) -> str:
-        return ("company_facts: %d calls, %d stored, %d unchanged, %d failed; refused kinds: %s; stopped: %s"
+        return ("company_facts: %d calls, %d stored, %d unchanged, %d failed; refused kinds: %s; skipped articles: %d; stopped: %s"
                 % (self.calls, self.stored, self.unchanged, self.failed, ",".join(self.kinds_refused) or "none",
-                   self.stopped or "no"))
+                   self.skipped, self.stopped or "no"))
 
 
 # ---- small helpers
@@ -283,7 +316,12 @@ def http_fetch(url: str, headers: dict, *, opener: urllib.request.OpenerDirector
             elif resp.geturl() != url:
                 failure = ("refused",)
             else:
-                return _read_capped(resp, MAX_BODY_BYTES, deadline_at, clock)
+                body = _read_capped(resp, MAX_BODY_BYTES, deadline_at, clock)
+                declared = resp.headers.get("Content-Length") if getattr(resp, "headers", None) is not None else None
+                if declared is not None and declared.strip().isdigit() and int(declared) != len(body):
+                    failure = ("refused",)                      # cut short (or longer than it said): not an answer
+                else:
+                    return body
     except urllib.error.HTTPError as e:
         failure = ("http", e.code, _retry_after_header(e.headers.get("Retry-After") if e.headers else None))
         with contextlib.suppress(Exception):
@@ -312,10 +350,62 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
 
 
+def _columns_ok(conn: sqlite3.Connection) -> bool:
+    return all([r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)] == cols for table, cols in _COLUMNS.items())
+
+
 def _check_columns(conn: sqlite3.Connection) -> None:
-    for table, cols in _COLUMNS.items():
-        if [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)] != cols:
-            raise Refused("the file is not a company-facts store (table %s has other columns); nothing was done" % table)
+    if not _columns_ok(conn):
+        raise Refused("the file is not a company-facts store (its tables are not the expected ones); nothing was done")
+
+
+def _side_files(path: Path) -> bool:
+    """True if SQLite's -wal / -shm files exist beside the store: a collector is, or was, writing it."""
+    wal, shm = Path(str(path) + "-wal"), Path(str(path) + "-shm")
+    try:
+        return shm.exists() or (wal.exists() and wal.stat().st_size > 0)
+    except OSError:
+        return True
+
+
+def _header_reason(path: Path) -> str | None:
+    """Why the file at `path` (which exists) is not this store, from its first 100 bytes alone (nothing is opened by SQLite
+    and nothing is written); None when it carries this store's mark."""
+    if path.is_symlink():
+        return "a symbolic link"
+    if not path.is_file():
+        return "not a regular file"
+    try:
+        with open(path, "rb") as f:
+            head = f.read(100)
+    except OSError as e:
+        return "unreadable (%s)" % type(e).__name__
+    if len(head) < 100 or head[:16] != _SQLITE_HEADER:
+        return "not a SQLite database"
+    if int.from_bytes(head[68:72], "big") != APPLICATION_ID:
+        return "another program's database or an empty SQLite file"
+    version = int.from_bytes(head[60:64], "big")
+    if version != USER_VERSION:
+        return "a store of version %d (this program reads version %d)" % (version, USER_VERSION)
+    return None
+
+
+def _foreign_reason(path: Path) -> str | None:
+    """None if nothing exists at `path` or this store does; else why the file there is refused. Before any write."""
+    if not path.exists() and not path.is_symlink():
+        return None
+    why = _header_reason(path)
+    if why is None and not _side_files(path):               # the tables, read through SQLite's immutable mode (writes nothing)
+        try:
+            conn = sqlite3.connect("file:%s?immutable=1" % urllib.parse.quote(str(path.resolve())), uri=True)
+            try:
+                if not _columns_ok(conn):
+                    why = "its tables are not the expected ones"
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            why = "damaged"
+    return why
 
 
 def _take_lock(path: Path) -> tuple[int, bool]:
@@ -339,38 +429,70 @@ def _take_lock(path: Path) -> tuple[int, bool]:
     return fd, made
 
 
+def _create_store(path: Path) -> None:
+    """Make a new store at `path`, where nothing exists: built under another name, then linked into place, so that a file
+    which appears meanwhile is never replaced and a half-made store is never visible."""
+    tmp = path.with_name(path.name + ".new-%d" % os.getpid())
+    try:
+        conn = sqlite3.connect(tmp, isolation_level=None)
+        try:
+            conn.execute("PRAGMA application_id=%d" % APPLICATION_ID)
+            conn.execute("PRAGMA user_version=%d" % USER_VERSION)
+            conn.execute("PRAGMA journal_mode=WAL")
+            create_schema(conn)
+        finally:
+            conn.close()
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise Refused("%s appeared while the store was being made; it was left alone, nothing was done" % path) from None
+        except OSError:                                         # a volume without hard links
+            if path.exists() or path.is_symlink():
+                raise Refused("%s appeared while the store was being made; it was left alone, nothing was done" % path) from None
+            os.rename(tmp, path)
+    except sqlite3.Error as e:
+        raise Refused("%s cannot be made (%s); nothing was done" % (path, type(e).__name__)) from None
+    except OSError as e:
+        raise Refused("%s cannot be made (%s); nothing was done" % (path, type(e).__name__)) from None
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            with contextlib.suppress(OSError):
+                os.unlink(str(tmp) + suffix)
+
+
 class _Writer:
     """The store opened for writing by the one collector that holds its lock."""
     def __init__(self, path: Any):
         if not isinstance(path, (str, os.PathLike)):
             raise Refused("the database must be a path")
         self.path = Path(path)
+        self.fd: int | None = None
+        self.conn: sqlite3.Connection | None = None
+        why = _foreign_reason(self.path)
+        if why:
+            raise Refused("%s is not a company-facts store (%s); nothing was done" % (self.path, why))
         try:
-            if self.path.exists() and self.path.stat().st_size:
-                with open(self.path, "rb") as f:
-                    foreign = f.read(16) != _SQLITE_HEADER
-                if foreign:
-                    raise Refused("%s is not a company-facts store; nothing was done" % self.path)
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             raise Refused("%s cannot be used (%s); nothing was done" % (self.path, type(e).__name__)) from None
         self.fd, made = _take_lock(self.path)
-        self.conn: sqlite3.Connection | None = None
         try:
+            why = _foreign_reason(self.path)                    # again, now that no other collector can change it
+            if why:
+                raise Refused("%s is not a company-facts store (%s); nothing was done" % (self.path, why))
+            if not self.path.exists():
+                _create_store(self.path)
             self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            create_schema(self.conn)
             _check_columns(self.conn)
-        except sqlite3.Error:
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except (Refused, sqlite3.Error) as e:
             self.close()
             if made:
                 with contextlib.suppress(OSError):
                     os.unlink(str(self.path) + LOCK_SUFFIX)
-            raise Refused("%s is not a company-facts store; nothing was done" % self.path) from None
-        except Refused:
-            self.close()
-            raise
+            if isinstance(e, Refused):
+                raise
+            raise Refused("%s is not a usable company-facts store (%s); nothing was done" % (self.path, _one_line(e))) from None
 
     def close(self) -> None:
         if self.conn is not None:
@@ -382,36 +504,96 @@ class _Writer:
             self.fd = None
 
     def highwater(self) -> float:
-        """The latest fetch time anywhere in the store (0 when it is empty)."""
-        row = self.conn.execute("SELECT max(a, b) FROM (SELECT coalesce(max(fetched_at), 0) a FROM observations),"
-                                " (SELECT coalesce(max(fetched_at), 0) b FROM news)").fetchone()
+        """The latest fetch time anywhere in the store (0 when it is empty); a row whose time is not a number is ignored."""
+        row = self.conn.execute(
+            "SELECT max(a, b) FROM (SELECT coalesce(max(fetched_at), 0) a FROM observations WHERE typeof(fetched_at) IN ('integer','real')),"
+            " (SELECT coalesce(max(fetched_at), 0) b FROM news WHERE typeof(fetched_at) IN ('integer','real'))").fetchone()
         return float(row[0])
+
+
+def _collector_active(path: Path) -> bool:
+    """True if a collector may be writing the store now: SQLite's side files exist, or the writer lock is held."""
+    if _side_files(path):
+        return True
+    lp = Path(str(path) + LOCK_SUFFIX)
+    try:
+        fd = os.open(lp, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager
 def _reader(db: Any):
-    """A read-only view of the store: a connection is used as given, a path is opened read only (and never made)."""
+    """A read-only view of the store. A connection is used as given. A path must be a file carrying this store's mark; it is
+    opened with SQLite's `immutable` mode when no collector is writing (nothing is written or created, so a read-only folder
+    or file works) and normally, read only, when one is."""
     if isinstance(db, sqlite3.Connection):
         yield db
         return
     if not isinstance(db, (str, os.PathLike)):
         raise Refused("the database must be a path")
     path = Path(db)
-    if not path.is_file():
+    if not path.exists() and not path.is_symlink():
         raise Refused("no store at %s; run collect first" % path)
+    why = _header_reason(path)
+    if why:
+        raise Refused("%s is not a company-facts store (%s); nothing was done" % (path, why))
+    active = _collector_active(path)
+    uri = "file:%s?%s" % (urllib.parse.quote(str(path.resolve())), "mode=ro" if active else "immutable=1")
+    conn = None
+
+    def refusal(e: sqlite3.Error) -> Refused:
+        if active and ("unable to open" in str(e) or "readonly" in str(e) or "locked" in str(e)):
+            return Refused("%s is being written by a collector and cannot be read from a read-only place right now; "
+                           "try again when the run ends" % path)
+        return Refused("%s cannot be read (%s)" % (path, _one_line(e)))
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(path.resolve())), uri=True, timeout=5.0)
-    except sqlite3.Error:
-        raise Refused("%s cannot be opened as a company-facts store" % path) from None
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        _check_columns(conn)
+    except sqlite3.Error as e:
+        if conn is not None:
+            conn.close()
+        raise refusal(e) from None
+    except Refused:
+        conn.close()
+        raise
     try:
         yield conn
-    except sqlite3.Error:
-        raise Refused("%s is not a readable company-facts store" % path) from None
+    except sqlite3.Error as e:
+        raise refusal(e) from None
     finally:
         conn.close()
 
 
 # ---- the readers: no look-ahead
+
+def _no_repeated_keys(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError("repeated key")
+        out[k] = v
+    return out
+
+
+def _no_constant(name):
+    raise ValueError("not JSON")
+
+
+def _loads_strict(text: str) -> Any:
+    """Strict JSON: no NaN or Infinity, no repeated key (ValueError or RecursionError otherwise)."""
+    return json.loads(text, object_pairs_hook=_no_repeated_keys, parse_constant=_no_constant)
+
 
 def _check_when(when: Any) -> float:
     w = _number(when)
@@ -430,15 +612,15 @@ def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
     when = _check_when(when)
     with _reader(db) as conn:
         row = conn.execute("SELECT fetched_at, body_sha256, body FROM observations WHERE symbol=? AND kind=? AND fetched_at<=?"
-                           " ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (symbol, kind, when)).fetchone()
+                           " AND typeof(fetched_at) IN ('integer','real') ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (symbol, kind, when)).fetchone()
     if row is None:
         return None
     fetched_at, sha, text = row
     try:
-        if body_sha256(text) != sha:
+        if type(text) is not str or body_sha256(text) != sha:
             raise ValueError("hash")
-        parsed = json.loads(text)
-    except ValueError:
+        parsed = _loads_strict(text)
+    except (ValueError, RecursionError):
         raise Refused("a stored %s row for %s does not match its hash; the store is damaged" % (kind, symbol)) from None
     return {"symbol": symbol, "kind": kind, "fetched_at": fetched_at, "body_sha256": sha, "body": parsed}
 
@@ -450,7 +632,8 @@ def news_as_of(db: Any, symbol: str, when: float, since: float | None = None) ->
         raise ValueError("bad symbol")
     when = _check_when(when)
     sql = ("SELECT symbol, article_id, published_at, fetched_at, headline, source, url, summary FROM news"
-           " WHERE symbol=? AND published_at<=? AND fetched_at<=?")
+           " WHERE symbol=? AND published_at<=? AND fetched_at<=?"
+           " AND typeof(published_at) IN ('integer','real') AND typeof(fetched_at) IN ('integer','real')")
     args: list = [symbol, when, when]
     if since is not None:
         sql += " AND published_at>=?"
@@ -462,7 +645,7 @@ def news_as_of(db: Any, symbol: str, when: float, since: float | None = None) ->
 
 
 def status(db: Any) -> dict:
-    """Rows per kind, symbols covered, the last run's counts, the oldest and newest fetch."""
+    """Rows per kind, symbols covered, the last run's counts, the oldest and newest fetch, the runs that were interrupted."""
     with _reader(db) as conn:
         rows = {k: 0 for k in STORED_KINDS + ("news",)}
         for kind, n in conn.execute("SELECT kind, count(*) FROM observations GROUP BY kind"):
@@ -473,22 +656,25 @@ def status(db: Any) -> dict:
         last = conn.execute("SELECT started_at, ended_at, calls, stored, unchanged, failed, kinds_refused FROM runs"
                             " ORDER BY rowid DESC LIMIT 1").fetchone()
         span = conn.execute("SELECT min(lo), max(hi) FROM (SELECT min(fetched_at) lo, max(fetched_at) hi FROM observations"
-                            " UNION ALL SELECT min(fetched_at), max(fetched_at) FROM news)").fetchone()
-    return {"rows": rows, "symbols": symbols, "oldest": span[0], "newest": span[1],
+                            " WHERE typeof(fetched_at) IN ('integer','real')"
+                            " UNION ALL SELECT min(fetched_at), max(fetched_at) FROM news WHERE typeof(fetched_at) IN ('integer','real'))").fetchone()
+        interrupted = conn.execute("SELECT count(*) FROM runs WHERE kinds_refused=?", (INTERRUPTED,)).fetchone()[0]
+    return {"rows": rows, "symbols": symbols, "oldest": span[0], "newest": span[1], "interrupted": interrupted,
             "last_run": dict(zip(_COLUMNS["runs"], last)) if last else None}
 
 
 # ---- the collector
 
 class _Pacer:
-    """At most MAX_REQUESTS_PER_WINDOW request starts in any WINDOW_SECONDS, read off the injected clock."""
+    """At most MAX_REQUESTS_PER_WINDOW request starts in any WINDOW_SECONDS of true time: it reads a monotonic clock, never
+    the wall clock (a correction of that cannot let a burst through)."""
     def __init__(self, clock: Callable[[], float], sleep: Callable[[float], Any]):
         self.clock, self.sleep, self.sent = clock, sleep, deque()
 
     def wait(self) -> None:
         for _ in range(MAX_PACE_SLEEPS):
             now = self.clock()
-            self.sent = deque(min(t, now) for t in self.sent)            # a clock that stepped back: those were "just now"
+            self.sent = deque(min(t, now) for t in self.sent)            # (a monotonic clock does not step back; if one does, be safe)
             while self.sent and now - self.sent[0] >= WINDOW_SECONDS + WINDOW_MARGIN / 2:     # (the wait below overshoots it)
                 self.sent.popleft()
             if len(self.sent) < MAX_REQUESTS_PER_WINDOW:
@@ -517,19 +703,6 @@ class _Bad(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
-
-
-def _no_repeated_keys(pairs):
-    out = {}
-    for k, v in pairs:
-        if k in out:
-            raise ValueError("repeated key")
-        out[k] = v
-    return out
-
-
-def _no_constant(name):
-    raise ValueError("not JSON")
 
 
 def _check_symbols(symbols: Any) -> list[str]:
@@ -569,12 +742,51 @@ def _read_key(credentials: Callable[[str], Any] | None) -> str:
     return key
 
 
+def _key_forms(key: str) -> tuple[list[bytes], list[str]]:
+    """What an echo of the key can look like: (byte strings to look for in the raw body, strings to look for in every parsed
+    string and member name). Plain, JSON-escaped, base64 (both alphabets, at all three alignments, without the characters a
+    neighbour could change) and hex; and each half when a half is at least HALF_KEY_MIN_CHARS long."""
+    kb = key.encode("ascii")
+    plain = [key]
+    for half in (key[:len(key) // 2], key[len(key) // 2:]):
+        if len(half) >= HALF_KEY_MIN_CHARS:
+            plain.append(half)
+    encoded = set()
+    for alphabet in (base64.b64encode, base64.urlsafe_b64encode):
+        for offset, skip in ((0, 0), (1, 2), (2, 3)):
+            data = bytes(offset) + kb
+            text = alphabet(data).decode().rstrip("=")
+            piece = text[skip:len(text) - (1 if len(data) % 3 else 0)]
+            if len(piece) >= 8:
+                encoded.add(piece)
+    hexed = kb.hex()
+    raw = {p.encode() for p in plain + list(encoded)} | {json.dumps(key)[1:-1].encode(), json.dumps(key, ensure_ascii=False)[1:-1].encode(),
+                                                           hexed.encode(), hexed.upper().encode()}
+    texts = plain + sorted(encoded) + [hexed]                    # the hex form is compared in lower case
+    return sorted(raw), texts
+
+
+def _strings_of(value: Any):
+    """Every string and member name in a parsed JSON value (iteratively: nesting cannot exhaust the stack)."""
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                yield k
+                stack.append(x)
+        elif isinstance(v, list):
+            stack.extend(v)
+
+
 class _Run:
-    def __init__(self, store: _Writer, key: str, fetch, clock, sleep, max_calls: int):
+    def __init__(self, store: _Writer, key: str, fetch, clock, sleep, monotonic, max_calls: int):
         self.store, self.fetch, self.clock, self.sleep, self.max_calls = store, fetch, clock, sleep, max_calls
         self.headers = {KEY_HEADER: key, "User-Agent": USER_AGENT, "Accept": "application/json"}
-        self.key_bytes = [key.encode(), key[:len(key) // 2].encode(), key[len(key) // 2:].encode()]
-        self.pacer = _Pacer(clock, sleep)
+        self.raw_forms, self.text_forms = _key_forms(key)
+        self.pacer = _Pacer(monotonic, sleep)
         self.refused: set[str] = set()
         self.result = Result(started_at=clock())
         self.highwater = store.highwater()
@@ -621,61 +833,79 @@ class _Run:
             raise _Bad("not bytes")
         if len(body) > MAX_BODY_BYTES:
             raise _Bad("over 5 MB")
-        if any(k in body for k in self.key_bytes):
+        if any(k in body for k in self.raw_forms):
             raise _Bad("key in answer")
         try:
-            value = json.loads(body.decode("utf-8"), object_pairs_hook=_no_repeated_keys, parse_constant=_no_constant)
+            value = _loads_strict(body.decode("utf-8"))
             canon = canonical_json(value)
         except (ValueError, RecursionError):
             raise _Bad("not JSON or a repeated key") from None
-        if any(k in canon.encode("utf-8") for k in self.key_bytes):
-            raise _Bad("key in answer")
+        for text in _strings_of(value):
+            if any(f in text for f in self.text_forms) or self.text_forms[-1] in text.lower():
+                raise _Bad("key in answer")
         return value, canon
 
     def _store(self, kind: str, symbol: str, value: Any, canon: str) -> None:
-        if kind == "news" and not isinstance(value, list):
-            self._fail(kind, "not a list")
-            return
         at = self.clock()                                       # after the answer arrived: never earlier than the fact
         if at < self.highwater:
             self._fail(kind, "clock behind the store")
             return
         conn = self.store.conn
+        stored = unchanged = skipped = 0
         conn.execute("BEGIN IMMEDIATE")
         try:
             if kind == "news":
-                new = sum(self._insert_article(conn, symbol, a, at) for a in value)
-                self.result.stored += new
-                self.result.unchanged += 0 if new else 1
+                for a in value:
+                    got = self._insert_article(conn, symbol, a, at)
+                    if got is None:
+                        skipped += 1
+                    else:
+                        stored += got
+                unchanged = 0 if stored else 1
             else:
                 sha = body_sha256(canon)
                 row = conn.execute("SELECT body_sha256 FROM observations WHERE symbol=? AND kind=?"
                                    " ORDER BY fetched_at DESC, rowid DESC LIMIT 1", (symbol, kind)).fetchone()
                 if row is not None and row[0] == sha:
-                    self.result.unchanged += 1
+                    unchanged = 1
                 else:
                     conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", (symbol, kind, at, sha, canon))
-                    self.result.stored += 1
+                    stored = 1
             conn.execute("COMMIT")
         except BaseException:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute("ROLLBACK")
             raise
+        self.result.stored += stored
+        self.result.unchanged += unchanged
+        self.result.skipped += skipped
         self.highwater = max(self.highwater, at)
 
     @staticmethod
-    def _insert_article(conn, symbol: str, a: Any, at: float) -> int:
-        """1 if the article was new. An article without a usable id or time is skipped, never filled in."""
+    def _insert_article(conn, symbol: str, a: Any, at: float) -> int | None:
+        """1 if the article was new, 0 if it was already stored, None if it is skipped: no usable id, no usable time (a finite
+        number from 2000-01-01 to two days after the fetch), or text that cannot be stored. Nothing is filled in."""
         if not isinstance(a, dict):
-            return 0
+            return None
         aid, published = a.get("id"), _number(a.get("datetime"))
-        if isinstance(aid, bool) or not isinstance(aid, (int, str)) or aid == "" or published is None or published <= 0:
-            return 0
-
-        def text(k):
-            return a[k] if isinstance(a.get(k), str) else None
-        cur = conn.execute("INSERT OR IGNORE INTO news VALUES (?,?,?,?,?,?,?,?)",
-                           (symbol, str(aid), published, at, text("headline"), text("source"), text("url"), text("summary")))
+        if isinstance(aid, bool) or not isinstance(aid, (int, str)) or aid == "":
+            return None
+        if published is None or not MIN_ARTICLE_TIME <= published <= at + ARTICLE_FUTURE_SLACK:
+            return None
+        texts = []
+        for k in ("headline", "source", "url", "summary"):
+            v = a.get(k)
+            texts.append(v if isinstance(v, str) else None)
+        try:
+            ident = str(aid)
+            if isinstance(aid, str) and len(aid) > MAX_ARTICLE_ID_CHARS:
+                return None
+            for t in [ident] + texts:
+                if t is not None:
+                    t.encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            return None
+        cur = conn.execute("INSERT OR IGNORE INTO news VALUES (?,?,?,?,?,?,?,?)", (symbol, ident, published, at, *texts))
         return cur.rowcount
 
     def _one(self, kind: str, symbol: str, url: str) -> None:
@@ -687,6 +917,9 @@ class _Run:
         except _Bad as e:
             self._fail(kind, e.reason)
             return
+        if type(value) is not EXPECTED_TYPES[kind]:
+            self._fail(kind, "wrong type")
+            return
         self._store(kind, symbol, value, canon)
 
     @staticmethod
@@ -694,33 +927,56 @@ class _Run:
         return BASE_URL + path + "?" + "&".join("%s=%s" % (k, v) for k, v in query.items())
 
     def _news_url(self, symbol: str) -> str:
+        """The news request: from two days before the newest usable stored article of the symbol (30 days back when there is
+        none); a stored row with an impossible time is ignored."""
         now = self.clock()
-        newest = self.store.conn.execute("SELECT max(published_at) FROM news WHERE symbol=?", (symbol,)).fetchone()[0]
         today = _day(now)
-        start = _day(now - NEWS_FIRST_DAYS * 86400) if newest is None else min(_day(newest - NEWS_OVERLAP_DAYS * 86400), today)
+        newest = self.store.conn.execute(
+            "SELECT max(published_at) FROM news WHERE symbol=? AND typeof(published_at) IN ('integer','real')"
+            " AND published_at BETWEEN ? AND ?", (symbol, MIN_ARTICLE_TIME, now + ARTICLE_FUTURE_SLACK)).fetchone()[0]
+        try:
+            start = _day(now - NEWS_FIRST_DAYS * 86400) if newest is None else min(_day(newest - NEWS_OVERLAP_DAYS * 86400), today)
+        except (OverflowError, ValueError, OSError):
+            start = _day(now - NEWS_FIRST_DAYS * 86400)
         return self._url("company-news", {"symbol": symbol, "from": start, "to": today})
+
+    def _guarded(self, kind: str, work: Callable[[], Any]) -> None:
+        """Nothing in an answer or in the store can end a run: any error while handling one symbol and kind is counted failed
+        with a short fixed reason (the error's type, never its text), and the run goes on."""
+        try:
+            work()
+        except _Stop:
+            raise
+        except Exception as e:
+            self._fail(kind, "error %s" % type(e).__name__)
+
+    def _plan(self, kind: str, symbol: str) -> None:
+        if kind == EARNINGS_CALENDAR:
+            now = self.clock()
+            url = self._url(CALENDAR_PATH, {"from": _day(now), "to": _day(now + CALENDAR_DAYS * 86400)})
+        elif kind == "news":
+            url = self._news_url(symbol)
+        else:
+            path, fixed = _REQUESTS[kind]
+            url = self._url(path, dict({"symbol": symbol}, **fixed))
+        self._one(kind, symbol, url)
 
     def go(self, symbols: list[str]) -> Result:
         conn = self.store.conn
         if self.result.started_at < self.highwater:
             raise Refused("the clock reads earlier than the newest fetch already in the store; nothing was asked")
+        # a row still open here belongs to a run that died (this collector holds the lock): mark it, keep its start time
+        conn.execute("UPDATE runs SET kinds_refused=? WHERE ended_at IS NULL AND kinds_refused=''", (INTERRUPTED,))
         conn.execute("INSERT INTO runs VALUES (?, NULL, 0, 0, 0, 0, '')", (self.result.started_at,))
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         try:
             try:
-                now = self.clock()
                 if EARNINGS_CALENDAR not in self.refused:
-                    self._one(EARNINGS_CALENDAR, "*", self._url(CALENDAR_PATH, {"from": _day(now), "to": _day(now + CALENDAR_DAYS * 86400)}))
+                    self._guarded(EARNINGS_CALENDAR, lambda: self._plan(EARNINGS_CALENDAR, "*"))
                 for symbol in symbols:
                     for kind in KINDS:
-                        if kind in self.refused:
-                            continue
-                        if kind == "news":
-                            url = self._news_url(symbol)
-                        else:
-                            path, fixed = _REQUESTS[kind]
-                            url = self._url(path, dict({"symbol": symbol}, **fixed))
-                        self._one(kind, symbol, url)
+                        if kind not in self.refused:
+                            self._guarded(kind, lambda kind=kind, symbol=symbol: self._plan(kind, symbol))
             except _Stop as stop:
                 self.result.stopped = stop.reason
         finally:
@@ -735,17 +991,18 @@ class _Run:
 
 def collect(symbols: Any, db: Any, *, fetch: Callable[[str, dict], Any] = http_fetch, clock: Callable[[], float] = time.time,
             sleep: Callable[[float], Any] = time.sleep, credentials: Callable[[str], Any] | None = None,
-            max_calls: int = DEFAULT_MAX_CALLS) -> Result:
+            max_calls: int = DEFAULT_MAX_CALLS, monotonic: Callable[[], float] = time.monotonic) -> Result:
     """Ask Finnhub for each symbol's profile, metrics, earnings, recommendations, insiders and news, and once for the
     earnings calendar, and store what is new. Refused (Refused, before any request) for a bad symbol, a bad `max_calls`, a
     missing key, a store that is not ours, one that another run holds, or a clock earlier than the store's newest fetch.
-    `fetch(url, headers)` returns the body bytes or raises HttpError (or another error); `credentials(name)` returns the key."""
+    `fetch(url, headers)` returns the body bytes or raises HttpError (or another error); `credentials(name)` returns the key.
+    `clock` stamps what is fetched; `monotonic` (never the wall clock) paces the requests."""
     symbols = _check_symbols(symbols)
     max_calls = _check_max_calls(max_calls)
     key = _read_key(credentials)
     store = _Writer(db)
     try:
-        return _Run(store, key, fetch, clock, sleep, max_calls).go(symbols)
+        return _Run(store, key, fetch, clock, sleep, monotonic, max_calls).go(symbols)
     finally:
         store.close()
 
@@ -792,6 +1049,7 @@ def _status_text(db: Any) -> str:
              "last run: started %s, ended %s, %d calls, %d stored, %d unchanged, %d failed, refused kinds: %s" % (
                  _iso(last["started_at"]), _iso(last["ended_at"]) if last["ended_at"] is not None else "never",
                  last["calls"], last["stored"], last["unchanged"], last["failed"], last["kinds_refused"] or "none"),
+             "interrupted runs: %d" % st["interrupted"],
              "oldest fetch: " + (_iso(st["oldest"]) if st["oldest"] is not None else "none"),
              "newest fetch: " + (_iso(st["newest"]) if st["newest"] is not None else "none")]
     return "\n".join(lines)
@@ -826,9 +1084,15 @@ def _load_secrets_file() -> None:
         raise Refused(_one_line(e)) from None
 
 
+class _Parser(argparse.ArgumentParser):
+    """An argument error is a refusal like any other: one line, exit status 2."""
+    def error(self, message):
+        raise Refused("%s (see --help)" % _one_line(message))
+
+
 def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep: Callable[[float], Any] = time.sleep,
-         credentials: Callable[[str], Any] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m valedia_trader.data_and_fees.company_facts",
+         credentials: Callable[[str], Any] | None = None, monotonic: Callable[[], float] = time.monotonic) -> int:
+    parser = _Parser(prog="python -m valedia_trader.data_and_fees.company_facts",
                                      description="Collect and read company facts from Finnhub's free plan, point-in-time.")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("collect", help="ask Finnhub and store what is new")
@@ -845,8 +1109,8 @@ def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep
     p.add_argument("--kind")
     p.add_argument("--as-of", dest="as_of", help="ISO time in UTC (default: now)")
     p.add_argument("--db", default=str(DEFAULT_DB))
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         if args.command == "collect":
             try:
                 max_calls = int(args.max_calls)
@@ -858,7 +1122,7 @@ def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep
             if credentials is None:
                 _load_secrets_file()
             result = collect(symbols, args.db, fetch=fetch or http_fetch, clock=clock, sleep=sleep, credentials=credentials,
-                             max_calls=max_calls)
+                             max_calls=max_calls, monotonic=monotonic)
             print(result.summary())
             return 2 if result.stopped == "key rejected" else 0
         if args.command == "status":
