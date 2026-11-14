@@ -677,7 +677,8 @@ def four_words(phrase=PHRASE):
 def leaked(text):
     low = text.lower()
     return [name for name in ("BROKER_API_KEY", "BROKER_API_SECRET", "WEBULL_ACCOUNT_ID")
-            if TRADING[name].lower() in low or TRADING[name][:12].lower() in low] + [g for g in four_words() if g in low]
+            if TRADING[name].lower() in low or TRADING[name][:12].lower() in low] + \
+        [g for g in four_words() for g in (g, g.replace(" ", "_"), g.replace(" ", "-")) if g in low]
 
 
 def plant_everywhere(w):
@@ -754,7 +755,7 @@ def test_a_ledger_tag_is_shown_as_the_last_four_of_its_random_part_and_its_fund(
 def test_other_order_ids_are_shown_as_their_last_four_characters():
     cases = {"order V-1234567890 is open": "order …7890 is open", "Order ID: 7f3a9c2e51b84d60 failed": "Order ID: …4d60 failed",
              "venue_order_id=ABCD1234efgh5678": "venue_order_id=…5678", "client order id paper-XLE-batch-0007": "client order id …0007",
-             "tag abcdefghijklmnopqrst was sent": "tag …qrst was sent", "clientOrderId: Z9y8X7w6V5u4": "clientOrderId: …V5u4"}
+             "tag abcdefghijklmnopqrs7 was sent": "tag …qrs7 was sent", "clientOrderId: Z9y8X7w6V5u4": "clientOrderId: …V5u4"}
     for text, want in cases.items():
         assert al.clean(text) == want, text
 
@@ -779,7 +780,7 @@ def test_generated_texts_with_tags_and_ids_never_keep_one_whole():
             out = al.clean(text)
             assert tag not in out and f"…{rand[-4:]}-{sym}" in out, (text, out)
         else:
-            ident = "".join(rng.choice(alnum + "-_") for _ in range(rng.randint(8, 36))).strip("-_") + str(rng.randint(0, 9))
+            ident = "".join(rng.choice(alnum + "-_") for _ in range(rng.randint(12, 36))).strip("-_") + str(rng.randint(0, 9))
             text = f"{rng.choice(lead)} {ident} {rng.choice(tail)}".replace("= ", "=").replace(": ", ": ").strip()
             out = al.clean(text)
             assert ident not in out and f"…{ident[-4:]}" in out, (text, out)
@@ -1112,3 +1113,321 @@ def test_a_run_killed_before_the_sender_answered_leaves_the_alert_not_shown_and_
     assert not any(st["shown"] for st in states.values())
     phone = Flaky()
     assert [a.key for a in watch(world, senders=[phone]).shown] == ["switch:halt"]
+
+
+# =====================================================================================================================
+# rev 3: what is read back from the tool's own files is cleaned too
+# =====================================================================================================================
+
+def raw_pair(value):
+    return {"v": value}
+
+
+def plant_old_files(w):
+    """An alerts.jsonl and a notifications.jsonl that already hold values of the trading file in every field (as an earlier
+    version, a hand or another program could have left them). The values in a key are all in the characters a key may hold."""
+    key, sec, acct = TRADING["BROKER_API_KEY"], TRADING["BROKER_API_SECRET"], TRADING["WEBULL_ACCOUNT_ID"]
+    phrase_key = "_".join(PHRASE.split()[:6])
+    rows = [
+        {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": f"job:com.valedia.{key}", "title": f"Job {sec} failed", "detail": f"words {PHRASE}"},
+        {"time": "2026-11-13T19:01:00Z", "level": "critical", "key": f"job:com.valedia.{phrase_key}", "title": "t", "detail": f"account {acct}"},
+        {"time": f"2026-11-13T{sec}", "level": "warning", "key": f"picks:{sec}", "title": "title", "detail": "d"},
+        {"time": "2026-11-13T19:03:00Z", "level": f"warning{key}", "key": f"job:com.valedia.{acct}", "title": "t", "detail": "d"},
+        {"time": "2026-11-13T19:04:00Z", "level": "warning", "key": f"orders:{key}", "title": f"order {sec}", "detail": "d"},
+        {"time": "2026-11-13T19:05:00Z", "level": "warning", "key": "job:com.valedia.55512345678901", "title": "an account-like key", "detail": "d"},
+    ]
+    folder = w.alerts_file.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    w.alerts_file.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    notes = [{"time": "2026-11-13T19:05:00Z", "sender": f"phone-{key}", "key": f"job:com.valedia.{key}", "since": "2026-11-13T19:00:00Z",
+              "result": "failed"},
+             {"time": "2026-11-13T19:05:00Z", "sender": "mac", "key": f"picks:{sec}", "since": f"2026-11-13T{sec}", "result": "failed"},
+             {"time": "2026-11-13T19:05:00Z", "sender": "mac", "key": f"orders:{key}", "since": "2026-11-13T19:04:00Z", "result": "shown"}]
+    (folder / "notifications.jsonl").write_text("".join(json.dumps(r) + "\n" for r in notes))
+
+
+def test_values_already_in_the_alert_and_notification_files_never_get_out_through_the_real_commands(world, trading_file, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    plant_old_files(world)
+    halt_on(world)                                                # one real alert beside the old ones
+    folder = world.alerts_file.parent
+    old = (world.alerts_file.read_text(), (folder / "notifications.jsonl").read_text())     # what was planted: it is there to stay
+    outputs = []
+    for argv in (["list"], ["watch", "--notify"], ["list"], ["watch", "--notify"], ["list"]):
+        al.main(argv, env=world.env())
+        seen = capsys.readouterr()
+        outputs += [seen.out, seen.err]
+    new_alerts, new_notes = world.alerts_file.read_text(), (folder / "notifications.jsonl").read_text()
+    assert new_alerts.startswith(old[0]) and new_notes.startswith(old[1])                    # append-only: the old lines are untouched
+    texts = outputs + [new_alerts[len(old[0]):], new_notes[len(old[1]):], " ".join(" ".join(c) for c in spy.calls)]
+    for i, text in enumerate(texts):
+        assert leaked(text) == [], (i, text[:600])
+    lines = world.lines()
+    assert [x["key"] for x in lines[6:] if x["level"] == "cleared"] == ["job:com.valedia._number_"]    # cleared under its cleaned key
+    assert spy.calls                                                    # and the open ones were sent, cleaned
+
+
+def test_the_commands_register_the_trading_file_before_they_bind_the_stream_they_print_to(world, trading_file, monkeypatch, capsys):
+    def raw_print(rows, out, states=None):
+        print("raw " + TRADING["BROKER_API_KEY"], file=out)         # a line that nothing cleaned: only the stream guard can stop it
+    monkeypatch.setattr(al, "_show", raw_print)
+    al.main(["list"], env=world.env())
+    assert TRADING["BROKER_API_KEY"] not in capsys.readouterr().out
+
+
+def test_a_stored_line_is_read_back_as_its_cleaned_form_everywhere(world, trading_file):
+    plant_old_files(world)
+    al.register_trading_file(world.env())
+    rows = al.open_alerts(world.alerts_file)
+    assert len(rows) >= 1                                              # keys that clean to the same form are one key
+    for r in rows:
+        assert leaked(json.dumps(r)) == [] and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-" for c in r["key"])
+    states = al.read_notifications(al.notifications_file(world.root))
+    assert leaked(json.dumps([list(k) for k in states])) == []
+
+
+# ----------------------------------------------------------------------------------------------- account-style digit groups
+
+def test_three_or_more_groups_of_four_digits_are_masked_and_dates_stay_readable():
+    for text, want in (("card 1234 5678 9012 3456 ok", "card <number> ok"), ("1234-5678-9012", "<number>"),
+                       ("acct 1234 5678-9012 3456 7890", "acct <number>"), ("x 1234 5678 y", "x 1234 5678 y"),
+                       ("1234  5678  9012", "1234 5678 9012"),                         # double spaces are one gap after cleaning, not groups
+                       ("1234 5678 90123", "1234 5678 90123")):
+        assert al.clean(text) == want, text
+    for ok in ("2026-11-13", "2026-11-13 17:30:00", "20261113", "2026-11-13T17:30:00Z", "on 2026-11-13 at 2026-11-14 09:30", "1 2 4 8 16"):
+        assert al.clean(ok) == ok, ok
+
+
+def test_an_account_style_number_in_a_source_does_not_reach_the_alert_file(world):
+    world.write_step("stopped", "send", "the venue said account 4111 1111 1111 1111 and 5500-0000-0000-0004 on 2026-11-13 17:30:00")
+    (a,) = [x for x in watch(world).raised if x.key.startswith("step-stopped")]
+    assert "4111" not in a.detail and "5500" not in a.detail and "2026-11-13 17:30:00" in a.detail
+
+
+# ----------------------------------------------------------------------------------------------- tries are counted before the send
+
+def test_a_try_is_written_before_the_send_and_counts_toward_the_five(world):
+    halt_on(world)
+    seen = []
+
+    class Watches:
+        name = "phone"
+
+        def send(self, alert):
+            record = (world.alerts_file.parent / "notifications.jsonl").read_text()
+            seen.append([json.loads(x)["result"] for x in record.splitlines()])
+
+    watch(world, senders=[Watches()])
+    assert seen == [["trying"]]                                          # on disk before the send began
+    assert [json.loads(x)["result"] for x in (world.alerts_file.parent / "notifications.jsonl").read_text().splitlines()] == ["trying", "shown"]
+    states = al.read_notifications(al.notifications_file(world.root))
+    assert list(states.values()) == [{"shown": True, "tries": 1}]
+
+
+CHILD = """
+import sys, time, json
+from pathlib import Path
+import pandas as pd
+from valedia_trader.core import alerts as al
+a = json.loads(sys.argv[1])
+env = al.Env(root=Path(a["root"]), now=a["now"], halt_file=Path(a["halt"]), logs_dir=Path(a["logs"]), launch_agents_dir=Path(a["agents"]),
+             launchctl=lambda: a["launchctl"], free_bytes=lambda p: 50 * 10 ** 9,
+             sessions=lambda: pd.bdate_range("2026-01-01", "2027-12-31"), environ={})
+class Hang:
+    name = "phone"
+    def send(self, alert):
+        print("sending", flush=True)
+        time.sleep(300)
+al.watch(env, senders=[Hang()])
+"""
+
+
+def kill_during_send(world, tmp_path):
+    root = Path(al.__file__).resolve().parents[2]
+    arg = json.dumps({"root": str(world.root), "now": NOW, "halt": str(world.halt), "logs": str(world.logs), "agents": str(world.agents),
+                      "launchctl": launchctl_text(world.jobs)})
+    child_env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "PYTHONPATH": str(root), "VALEDIA_ENV_FILE": str(tmp_path / "none.env"),
+                 "PYTHONDONTWRITEBYTECODE": "1"}
+    p = subprocess.Popen([sys.executable, "-c", CHILD, arg], env=child_env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "sending"
+    finally:
+        p.kill()                                                         # our own child, by its handle
+        p.wait()
+
+
+def test_a_run_killed_during_the_send_can_never_show_one_alert_more_than_five_times_in_all(world, tmp_path):
+    halt_on(world)
+    for _ in range(5):
+        kill_during_send(world, tmp_path)
+    states = al.read_notifications(al.notifications_file(world.root))
+    assert [st["tries"] for st in states.values()] == [5] and not any(st["shown"] for st in states.values())
+    phone = Flaky()
+    r = watch(world, senders=[phone])
+    assert phone.calls == [] and r.shown == []                           # five tries were used up by the killed ones
+
+
+def test_two_killed_sends_then_a_good_one_shows_it_once(world, tmp_path):
+    halt_on(world)
+    kill_during_send(world, tmp_path)
+    kill_during_send(world, tmp_path)
+    phone = Flaky()
+    assert [a.key for a in watch(world, senders=[phone]).shown] == ["switch:halt"]
+    assert watch(world, senders=[phone]).shown == [] and len(phone.calls) == 1
+
+
+# ----------------------------------------------------------------------------------------------- a file that is not a trading file
+
+def test_a_trading_file_too_large_or_with_too_many_settings_is_refused_quickly_with_nothing_written(world, trading_file, capsys):
+    cases = {"larger than 64 KB": "# " + "x" * 70000 + "\n",
+             "a few MB": "".join(f"SETTING_{i}=v\n" for i in range(400000)),
+             "more than 200 settings": "".join(f"SETTING_{i}=value{i}\n" for i in range(201))}
+    for name, body in cases.items():
+        trading_file.write_text(body)
+        os.chmod(trading_file, 0o600)
+        for argv in (["watch"], ["list"]):
+            t0 = time.monotonic()
+            code = al.main(argv, env=world.env())
+            took = time.monotonic() - t0
+            err = capsys.readouterr().err
+            assert code == 2 and took < 1.0, (name, took)
+            assert "trading file" in err and "nothing was done" in err and ("64 KB" in err or "200" in err)
+            assert not world.alerts_file.exists()
+    trading_file.write_text("".join(f"SETTING_{i}=value{i}\n" for i in range(200)))
+    os.chmod(trading_file, 0o600)
+    assert al.main(["list"], env=world.env()) == 0                       # 200 settings is still a trading file
+
+
+def test_a_trading_file_that_is_not_utf8_says_so_and_not_chmod(world, trading_file, capsys):
+    trading_file.write_bytes(b"BROKER_KEY=\xff\xfe\xfa not text\n")
+    os.chmod(trading_file, 0o600)
+    assert al.main(["watch"], env=world.env()) == 2
+    err = capsys.readouterr().err
+    assert "UTF-8" in err and "chmod" not in err and "nothing was done" in err
+    os.chmod(trading_file, 0o644)
+    assert al.main(["watch"], env=world.env()) == 2
+    assert "chmod 600" in capsys.readouterr().err                          # a file others can read still says why
+
+
+# ----------------------------------------------------------------------------------------------- order ids, both ways
+
+def test_our_own_tags_and_batch_ids_are_shortened_wherever_they_stand():
+    batch, tag = "os-20261113-143501-a1b2c3", "os-20261113-143501-a1b2c3-XLE"
+    for text, want in ((tag, "…b2c3-XLE"), (batch, "…b2c3"), (f"the {batch} run", "the …b2c3 run"),
+                       (f"sent: {tag}, {tag.replace('XLE', 'SPY')}", "sent: …b2c3-XLE, …b2c3-SPY"),
+                       (f"refused {tag}!", "refused …b2c3-XLE!"), (f"batch={batch}.", "batch=…b2c3."),
+                       (f"{batch}-BRK.B and {batch}-BTC-USD", "…b2c3-BRK.B and …b2c3-BTC-USD"), (f"paper-{tag}", "paper-…b2c3-XLE")):
+        assert al.clean(text) == want, text
+
+
+def test_other_ids_after_the_words_in_lists_and_after_is_and_ref():
+    cases = {"orders A1B2C3D4E5F6 and G7H8I9J0K1L2 were refused": "orders …E5F6 and …K1L2 were refused",
+             "orders X9Y8Z7W6V5U4T3, Q1W2E3R4T5Y6, M0N9B8V7C6X5": "orders …U4T3, …T5Y6, …C6X5",
+             "the id is 4f9a7c1e0b2d3a5f6e": "the id is …5f6e",
+             "ref 20261113ABCDEF and tag 9z8y7x6w5v4u3t": "ref …CDEF and tag …4u3t",
+             "the client sent a request for order number q1w2e3r4t5y6u7": "the client sent a request for order number …y6u7",
+             "tag: AAAABBBBCCCC1234": "tag: …1234", "IDs 5f3c8a1e9b7d2046, 0b9e8d7c6a5f4e31": "IDs …2046, …4e31"}
+    for text, want in cases.items():
+        assert al.clean(text) == want, (text, al.clean(text))
+
+
+def test_dates_decimals_file_names_versions_tickers_funds_prices_and_counts_are_never_shortened():
+    for text in ("order placed 2026-11-13T17:30:00Z", "order filled at 2026-11-13T17:30:00+00:00 for 60.25", "order 20261113T173000Z done",
+                 "order 20261113-173000 done", "order price 123456789.55 and 60.2575", "orders file orders-20261113-143501.json written",
+                 "client version 1.2.3-rc1 and python3.12.11 build", "order KXNBAGAME-26NOV13LALBOS-LAL filled", "id KXHIGHNY-26NOV13-T60 open",
+                 "order BTC-USD and BRK.B and XLE", "order 5 units at 450.00", "ref 2026-11-13 17:30:00", "tag 20261113", "orders sent 2, refused 1",
+                 "the order ledger orders-webull-sandbox-events is blocked", "order sandbox.example.com:8443 down",
+                 "client 127.0.0.1 id 192.168.100.200", "order 1.0.0-beta.2+build.5 shipped"):
+        assert al.clean(text) == text, (text, al.clean(text))
+
+
+def test_generated_ids_in_clauses_and_lists_never_survive_and_generated_non_ids_always_do():
+    rng = random.Random(2027)
+    alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    words = ["order", "orders", "id", "ids", "ref", "tag", "client", "Order", "ID"]
+    for i in range(2000):
+        ids = []
+        for _ in range(rng.randint(1, 3)):
+            n = rng.randint(12, 30)
+            core = "".join(rng.choice(alnum) for _ in range(n))
+            ids.append(core[:n - 1] + str(rng.randint(0, 9)))
+        word = rng.choice(words)
+        joiner = rng.choice([", ", " and ", " ", " / "])
+        glue = rng.choice(["", "is ", "= ", ": ", "number ", "sent "])
+        text = f"The venue said {word} {glue}{joiner.join(ids)} {rng.choice(['was refused', 'is open', '(XLE +5)', ''])}".strip()
+        out = al.clean(text)
+        assert all(x not in out for x in ids), (text, out)
+        assert all(f"…{x[-4:]}" in out for x in ids), (text, out)
+    for i in range(2000):
+        date = f"2026-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"
+        pick = rng.choice([f"{date}T{rng.randint(0, 23):02d}:00:00Z", f"{date}", f"{rng.randint(1, 99999)}.{rng.randint(10, 99999)}",
+                           f"orders-{date.replace('-', '')}-1435{rng.randint(10, 99)}.json", f"{rng.randint(1, 9)}.{rng.randint(0, 20)}.{rng.randint(0, 20)}-rc{rng.randint(1, 9)}",
+                           f"KX{''.join(rng.choice('ABCDEFGHIJ') for _ in range(10))}-{date[2:4]}NOV13-T{rng.randint(10, 99)}"])
+        text = f"{rng.choice(['order', 'id', 'ref', 'tag', 'client'])} {pick} ok"
+        assert al.clean(text) == text, (text, al.clean(text))
+
+
+# ----------------------------------------------------------------------------------------------- practice runs are not the unattended run
+
+def write_practice(w, mode, status, stage=None, reason=None, day="2026-11-13", venue="webull-sandbox"):
+    w.journal.write(day, {"type": "order_step", "venue": venue, "event": "summary", "mode": mode, "status": status, "stage": stage,
+                          "reason": reason, "orders_sent": 0, "sent": [], "refused": [], "left_over": []})
+
+
+def test_a_propose_that_ended_done_never_clears_a_stop_of_the_unattended_run(world):
+    world.write_step("stopped", "send", "the venue refused", day="2026-11-12")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    write_practice(world, "propose", "done", day="2026-11-13")
+    write_practice(world, "approve", "done", day="2026-11-13")
+    r = watch(world)
+    assert r.cleared == [] and [a["key"] for a in r.open] == ["step-stopped:webull-sandbox"]
+    world.write_step("ok", day="2026-11-14")                           # only an unattended run can clear it
+    assert [c.key for c in watch(world).cleared] == ["step-stopped:webull-sandbox"]
+
+
+def test_a_stopped_propose_or_approve_is_not_a_stop_of_the_unattended_run(world):
+    write_practice(world, "propose", "stopped", "send", "the venue refused")
+    write_practice(world, "approve", "stopped", "ticket", "ticket 7 is not the latest")
+    assert not [a for a in watch(world).raised if a.key.startswith("step-stopped")]
+
+
+def test_the_order_step_not_run_today_looks_only_at_the_unattended_run(world):
+    orderstep_on(world)
+    write_practice(world, "propose", "done", day="2026-11-13")
+    assert "orderstep:no-run" in keys(watch(world))                      # a propose is not the unattended run
+    world.write_step("ok", day="2026-11-13")
+    assert [c.key for c in watch(world).cleared] == ["orderstep:no-run"]
+
+
+def test_a_refused_approval_is_its_own_warning_once_per_new_york_day(world):
+    write_practice(world, "approve", "stopped", "ticket", "the ticket is not the latest one")
+    r1 = watch(world)
+    (a,) = [x for x in r1.raised if x.key.startswith("approval")]
+    assert a.level == "warning" and "approval was refused" in a.title and "ticket" in a.detail
+    assert not [x for x in r1.raised if x.key.startswith("step-stopped")]
+    r2 = watch(world)
+    assert not [x for x in r2.raised if x.key.startswith("approval")]
+    write_practice(world, "approve", "stopped", "ticket", "again", day="2026-11-13")
+    assert not [x for x in watch(world).raised if x.key.startswith("approval")]          # the same day: still the one alert
+    tomorrow = world.env()
+    tomorrow.now = NOW + 86400
+    r3 = al.watch(tomorrow)
+    assert [c.key for c in r3.cleared if c.key.startswith("approval")]                  # the day is over: cleared
+    write_practice(world, "approve", "stopped", "ticket", "next day", day="2026-11-14")
+    nextday = world.env()
+    nextday.now = NOW + 86400 + 60
+    assert [a.key for a in al.watch(nextday).raised if a.key.startswith("approval")]    # a new day, a new alert
+
+
+def test_an_approve_stopped_at_another_stage_is_a_stop_of_a_practice_run_only(world):
+    write_practice(world, "approve", "stopped", "send", "the venue refused")
+    assert not [a for a in watch(world).raised if a.key.startswith(("approval", "step-stopped"))]
+
+
+def test_an_alert_key_is_cleaned_when_it_is_made(world, trading_file):
+    al.register_trading_file(world.env())
+    a = al.Alert(f"job:com.valedia.{TRADING['BROKER_API_KEY']}", "warning", "t", "d")
+    assert leaked(a.key) == [] and all(c.isalnum() or c in "_.:-" for c in a.key)
+    assert al.Alert("job:com.valedia.55512345678901", "warning", "t", "d").key == "job:com.valedia._number_"
+    assert al.Alert("orders:orders-webull-sandbox", "warning", "t", "d").key == "orders:orders-webull-sandbox"

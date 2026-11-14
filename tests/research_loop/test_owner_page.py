@@ -828,3 +828,65 @@ def test_a_ledger_tag_in_the_order_tables_is_shown_as_the_random_tail_and_its_fu
     db.close()
     html = world.html()
     assert tag not in html and "a1b2c3" not in html and html.count("…b2c3-XLE") >= 2
+
+
+# =====================================================================================================================
+# rev 3
+# =====================================================================================================================
+
+def test_values_already_in_the_alert_and_notification_files_do_not_reach_the_page_through_the_real_command(bare_world, trading_file, capsys):
+    w = bare_world
+    key, sec, acct = TRADING["BROKER_API_KEY"], TRADING["BROKER_API_SECRET"], TRADING["WEBULL_ACCOUNT_ID"]
+    folder = w.root / "artifacts" / "owner"
+    rows = [{"time": f"2026-11-13T{sec}", "level": f"warning{key}", "key": f"job:com.valedia.{key}", "title": f"Job {sec}", "detail": f"words {PHRASE}"},
+            {"time": "2026-11-13T19:01:00Z", "level": "critical", "key": "job:alpha_bravo_candle_delta_eagle_frost", "title": "t", "detail": f"acct {acct}"}]
+    (folder / "alerts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (folder / "notifications.jsonl").write_text("".join(json.dumps(
+        {"time": "x", "sender": f"phone-{key}", "key": r["key"], "since": r["time"], "result": "failed"}) + "\n" for r in rows))
+    env = w.env()
+    env.environ = None
+    out = w.tmp / "out" / "index.html"
+    assert op.main(["build", "--out", str(out)], env=env) == 0
+    seen = capsys.readouterr()
+    assert leaked(out.read_text()) == [] and leaked(seen.out + seen.err) == []
+    assert "Notification" in out.read_text() and "job:com.valedia._number_" not in out.read_text()
+
+
+@pytest.mark.parametrize("body, words", [("# " + "x" * 70000 + "\n", "64 KB"), ("".join(f"S_{i}=v{i}\n" for i in range(201)), "200"),
+                                         ("K=\xff\n".encode("latin-1"), "UTF-8")])
+def test_a_file_that_is_not_a_trading_file_stops_the_build_at_once_with_nothing_written(bare_world, trading_file, capsys, body, words):
+    if isinstance(body, bytes):
+        trading_file.write_bytes(body)
+    else:
+        trading_file.write_text(body)
+    os.chmod(trading_file, 0o600)
+    out = bare_world.tmp / "out" / "index.html"
+    t0 = time.monotonic()
+    assert op.main(["build", "--out", str(out)], env=bare_world.env()) == 2
+    err = capsys.readouterr().err
+    assert time.monotonic() - t0 < 1.0 and words in err and "chmod" not in err and "nothing was done" in err and not out.exists()
+
+
+def write_step_entry(w, mode, status, stage=None, reason=None, day="2026-11-13", sent=0):
+    entry = {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": status, "stage": stage, "reason": reason,
+             "orders_sent": sent, "sent": [{"symbol": "XLE"}] * sent, "refused": [], "left_over": []}
+    if mode:
+        entry["mode"] = mode
+    w.journal.write(day, entry)
+
+
+def test_the_order_step_section_keeps_the_unattended_run_apart_from_the_practice_runs(world):
+    write_step_entry(world, "propose", "done", day="2026-11-14", sent=4)
+    write_step_entry(world, "approve", "stopped", "ticket", "the ticket is not the latest one", day="2026-11-15")
+    text = world.page().sections["Broker (paper)"]
+    unattended, practice = text.split("Practice runs of the approval flow")
+    assert "Last order steps of the unattended run" in unattended
+    assert "2026-11-14" not in unattended and "2026-11-15" not in unattended and "the ticket is not the latest" not in unattended
+    assert "stopped at stage send" in unattended                                      # the unattended run's own last result
+    assert "Last propose 2026-11-14 done sent 4" in practice
+    assert "Last approve 2026-11-15 stopped at stage ticket: the ticket is not the latest one" in practice
+
+
+def test_the_practice_rows_say_none_yet_when_there_is_no_practice_run(world):
+    practice = world.page().sections["Broker (paper)"].split("Practice runs of the approval flow")[1]
+    assert "Last propose none yet" in practice and "Last approve none yet" in practice

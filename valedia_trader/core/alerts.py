@@ -13,6 +13,9 @@ with `level` "cleared" and the same key is written. An alert is open while the l
     orders:<ledger>             an order ledger is blocked, or holds an order whose fate is unknown (its own `blocked`)
     step-stopped:<venue>        the last order-step summary of the last day says stopped, with its stage and reason
                                 (a stop at stage "session" for a closed market or a holiday is ordinary: no alert)
+    approval:refused:<day>      an approval was refused today (a summary with mode approve, stopped at stage ticket): a warning
+                                of its own, once a New York day. Summaries with a `mode` (propose, approve) are practice
+                                runs of the approval flow: the conditions about the unattended run look only at those without
     job:<label>                 a scheduled com.valedia.* job is not loaded, or its last exit code is not 0
     collector:heartbeat         the order-book collector's newest heartbeat is older than 10 minutes
     picks:no-end                the hourly pick-list log has no "end" line in the last 3 hours
@@ -30,11 +33,19 @@ replaces a remembered secret by `<secret>`, an order id is cut to its last 4 cha
 a1b2c3-XLE` becomes `…b2c3-XLE`), and any run of 9 or more digits (an account number) becomes `<number>`. Before it reads
 or prints anything the command registers every value of the trading file with that guard (`register_trading_file`), into a
 private dictionary: nothing is put into the process environment. A trading file that exists and cannot be read is exit 2
-with nothing written; a missing one is no reason to stop.
+with nothing written; a missing one is no reason to stop; so is one over 64 KB or 200 settings, or not UTF-8 text, which is
+refused at once. Nothing read back from `alerts.jsonl` or `notifications.jsonl` is trusted either: every field of every line
+passes the same cleaning before it is written, printed, shown or sent, and a key that changes under cleaning is its cleaned
+form from then on. The output guard is put on the streams before the command binds them to print.
+
+Known limits of the guard that this rests on (the package's own, recorded here): a value split by other separators, halves
+shorter than 8 characters, a base64 form of a recovery phrase, words of the phrase glued to other letters, and values under
+ordinary setting names are not caught.
 
 A phone sender is anything with a `send(alert)` method (and a `name`): give it to `watch` beside the Mac notifier. An
-alert counts as shown to a sender only after its `send` returned; `notifications.jsonl`, beside the alert file, keeps one
-line per try. An open alert that was not shown is tried again on each later `watch --notify`, 5 tries in all; after that
+alert counts as shown to a sender only after its `send` returned; `notifications.jsonl`, beside the alert file, keeps a "trying"
+line written before each send (it counts toward the 5, so a run killed during a send can never show an alert more than 5 times)
+and a "shown" or "failed" line after it. An open alert that was not shown is tried again on each later `watch --notify`, 5 tries in all; after that
 `list` and the page say it was not shown.
 
 Every sqlite file is opened read-only (`mode=ro`) by this module, never through a class that can write, recover or
@@ -90,30 +101,47 @@ _END_LINE = re.compile(rf"^({_STAMP}) end$")
 _START_LINE = re.compile(rf"^{_STAMP} start$")
 _WEEKLY_RUN = re.compile(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) weekly research loop")
 _FAILED = re.compile(r"\bfailed\b(?!:?\s*\d)", re.I)           # "failed: 0" and "failed 3 times" are counts, not a failed run
-_LONG_DIGITS = re.compile(r"(?<!\d)\d{9,}(?!\d)")
-_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{3,}(?:[ -]\d{3,}){2,}(?!\d)")
+_LONG_DIGITS = re.compile(r"(?<!\d)(?<!\d\.)\d{9,}(?!\d)(?!\.\d)")          # a number with a decimal point is a price, not an account
+_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{4}(?:[ -]\d{4}){2,}(?!\d)")          # card-style: 3 or more groups of exactly four
 
 
 # ---------------------------------------------------------------------------------------------- text and files
 
-_LEDGER_TAG = re.compile(r"(?<![A-Za-z0-9])os-\d{8}-\d{6}-([A-Za-z0-9]{4,})-([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)")
-_ID_TOKEN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.\-]*[A-Za-z0-9])?")
+_RANDOM = r"[0-9A-Fa-f]{6}"
+_FUND = r"[A-Z0-9]+(?:[.\-][A-Z0-9]+)*"
+_OUR_TAG = re.compile(rf"(?<![A-Za-z0-9])os-\d{{8}}-\d{{6}}-({_RANDOM})(?:-({_FUND}))?(?![A-Za-z0-9])")
+_ID_TOKEN = re.compile(r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]+(?![A-Za-z0-9_\-])")
 _CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")                # clientOrderId reads as client Order Id
-_ID_WORDS = r"(?:orders?|ids?|tags?|client)"
-_ID_CONTEXT = re.compile(rf"(?i)(?<![a-z]){_ID_WORDS}(?![a-z])[^A-Za-z0-9]*(?:(?:orders?|ids?|tags?|number|no)(?![a-z])[^A-Za-z0-9]*)*$")
+_ID_KEYWORD = re.compile(r"(?i)(?<![a-z])(?:orders?|ids?|refs?|tags?|client)(?![a-z])")
+_CLAUSE_END = re.compile(r"(?:;|\.\s)")
+_DATEISH = re.compile(r"\d{4}-\d\d-\d\d(?:T\d\d)?|\d{8}(?:T\d{0,6}Z?)?|\d{8}-\d{6}")
+ID_MIN = 12
+
+
+def _is_id(tok: str) -> bool:
+    """A run of 12 or more letters and digits (`_` and `-` may join them) holding a digit: not a date or time, not a Kalshi ticker."""
+    return (len(tok) >= ID_MIN and any(c.isdigit() for c in tok) and not tok.isdigit() and not _DATEISH.fullmatch(tok)
+            and not (tok.startswith("KX") and tok == tok.upper()))
 
 
 def hide_order_ids(text: str) -> str:
-    """An order id is shown by its last 4 characters only. A ledger tag (`os-20261113-143501-a1b2c3-XLE`) becomes `…b2c3-XLE`
-    (the last 4 characters of its random part, then its fund). Any other id, a run of 8 or more letters, digits, `_`, `-`
-    and `.` (with a digit in it, or 16 or more plain letters) that follows the word order, id, tag or client, becomes `…`
-    and its last 4 characters."""
-    t = _LEDGER_TAG.sub(lambda m: f"…{m.group(1)[-4:]}-{m.group(2)}", text)
+    """An order id is shown by its last 4 characters only. Our own ledger tag (`os-20261113-143501-a1b2c3-XLE`) and batch id
+    (`os-20261113-143501-a1b2c3`) are shortened wherever they stand (`…b2c3-XLE`, `…b2c3`: the last 4 of the random part, then
+    the fund). Any other id, a run of 12 or more letters and digits with a digit in it and no dot (`_` and `-` may join its
+    parts), that follows one of the words order, orders, id, ids, ref, tag or client anywhere in the same clause (lists and
+    `id is X` included) becomes `…` and its last 4 characters. Dates and times, numbers with a decimal point, file names, version
+    strings, Kalshi tickers (upper case, beginning KX), funds, prices and counts are never shortened."""
+    t = _OUR_TAG.sub(lambda m: "…" + m.group(1)[-4:] + (f"-{m.group(2)}" if m.group(2) else ""), text)
     out, last = [], 0
     for m in _ID_TOKEN.finditer(t):
         tok = m.group(0)
-        if (len(tok) >= 8 and not tok.isdigit() and (any(c.isdigit() for c in tok) or (len(tok) >= 16 and tok.isalpha()))
-                and not t[max(0, m.start() - 1):m.start()] == "…" and _ID_CONTEXT.search(_CAMEL.sub(" ", t[max(0, m.start() - 40):m.start()]))):
+        if not _is_id(tok) or t[max(0, m.start() - 1):m.start()] == "…":
+            continue
+        if m.end() < len(t) and t[m.end()] == "." and m.end() + 1 < len(t) and t[m.end() + 1].isalnum():
+            continue                                                     # inside a dotted name: a file, a version, a host
+        starts = [c.end() for c in _CLAUSE_END.finditer(t, 0, m.start())]
+        clause = _CAMEL.sub(" ", t[(starts[-1] if starts else 0):m.start()])
+        if _ID_KEYWORD.search(clause):
             out += [t[last:m.start()], "…" + tok[-4:]]
             last = m.end()
     return "".join(out) + t[last:]
@@ -331,7 +359,7 @@ class Alert:
     detail: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "key", _key_part(self.key) if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", self.key) else self.key)
+        object.__setattr__(self, "key", _key_part(self.key))                   # a key is cleaned when it is made, always
         object.__setattr__(self, "title", clean(self.title, 120))
         object.__setattr__(self, "detail", clean(self.detail, 300))
 
@@ -340,21 +368,42 @@ class TradingFileError(RuntimeError):
     """The trading file exists and cannot be read. The message says so in plain words and holds nothing from the file."""
 
 
+TRADING_FILE_MAX_BYTES, TRADING_FILE_MAX_SETTINGS = 64 * 1024, 200
+
+
 def register_trading_file(env: Env | None = None) -> dict[str, str]:
     """Hand every value of the trading file to the package's output guard (the guard's own rule: `load_env` remembers what it
     finds worth remembering: keys, secrets, account numbers, recovery phrases), before anything is read or printed. The
     values are loaded into a private dictionary and returned (so a caller can read one setting); NOTHING is put into the
-    process environment. A missing file is no reason to stop (an empty dictionary). A file that exists and cannot be read, or
-    that others can read, raises TradingFileError. Done once per Env."""
+    process environment. A missing file is no reason to stop (an empty dictionary). A file that exists and cannot be read,
+    that others can read, that is larger than 64 KB or holds more than 200 settings (it is not a trading file) or that is
+    not UTF-8 text raises TradingFileError, in plain words and at once. Done once per Env."""
     if env is not None and "trading_values" in env._cache:
         return env._cache["trading_values"]
-    path = (env.trading_file if env is not None and env.trading_file else None) or env_file_path()
+    path = Path((env.trading_file if env is not None and env.trading_file else None) or env_file_path()).expanduser()
+    done = "nothing was done"
     values: dict[str, str] = {}
     try:
-        load_env(path, environ=values)
+        if path.is_file():
+            if path.stat().st_mode & 0o077:
+                raise TradingFileError(f"the trading file is readable by others; it must be readable by its owner only (chmod 600); {done}")
+            if path.stat().st_size > TRADING_FILE_MAX_BYTES:
+                raise TradingFileError(f"the trading file is larger than 64 KB, so it is not a trading file; {done}")
+            with path.open("rb") as fh:
+                raw = fh.read(TRADING_FILE_MAX_BYTES + 1)
+            if len(raw) > TRADING_FILE_MAX_BYTES:
+                raise TradingFileError(f"the trading file is larger than 64 KB, so it is not a trading file; {done}")
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise TradingFileError(f"the trading file is not valid UTF-8 text; {done}") from None
+            if sum(1 for ln in text.splitlines() if "=" in ln and not ln.lstrip().startswith("#")) > TRADING_FILE_MAX_SETTINGS:
+                raise TradingFileError(f"the trading file holds more than 200 settings, so it is not a trading file; {done}")
+            load_env(path, environ=values)
+    except TradingFileError:
+        raise
     except Exception as exc:
-        raise TradingFileError(f"the trading file exists but cannot be read ({type(exc).__name__}: it must be readable by its "
-                               "owner only, chmod 600); nothing was done") from None
+        raise TradingFileError(f"the trading file exists but cannot be read ({type(exc).__name__}); {done}") from None
     if env is not None:
         env._cache["trading_values"] = values
     return values
@@ -459,11 +508,18 @@ def check_orders(env: Env) -> CheckResult:
     return out
 
 
-def last_step_summaries(entries: list[dict]) -> dict[str, dict]:
-    """The last order-step summary of each venue (entries are in date order, each file in the order written)."""
+def is_practice(entry: dict) -> bool:
+    """An order-step entry with a `mode` (propose or approve) is a practice run of the approval flow, not the unattended run."""
+    return entry.get("mode") not in (None, "")
+
+
+def last_step_summaries(entries: list[dict], practice: str | None = None) -> dict[str, dict]:
+    """The last order-step summary of each venue (entries are in date order, each file in the order written): of the unattended
+    run, that is of the summaries WITHOUT a `mode`; or, given `practice` ("propose" or "approve"), of that mode."""
     last: dict[str, dict] = {}
     for e in entries:
-        if e.get("type") == "order_step" and e.get("event") == "summary":
+        if e.get("type") == "order_step" and e.get("event") == "summary" and \
+                ((e.get("mode") == practice) if practice else not is_practice(e)):
             last[str(e.get("venue"))] = e
     return last
 
@@ -491,6 +547,20 @@ def check_order_step(env: Env) -> CheckResult:
             out.alerts.append(Alert(f"step-stopped:{_key_part(venue)}", "critical",
                                     f"The order step stopped at stage {e.get('stage')}",
                                     f"{e.get('day')} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}"))
+    return out
+
+
+def check_approval_refused(env: Env) -> CheckResult:
+    """An approval that was refused (mode approve, stopped at stage ticket) today in New York: a warning of its own, once a day."""
+    out = CheckResult()
+    today = str(datetime.fromtimestamp(env.now, NEW_YORK).date())
+    entries, _ = env.journal()
+    refused = [e for e in entries if e.get("type") == "order_step" and e.get("event") == "summary" and e.get("mode") == "approve"
+               and e.get("status") == "stopped" and e.get("stage") == "ticket" and str(e.get("day"))[:10] == today]
+    if refused:
+        e = refused[-1]
+        out.alerts.append(Alert(f"approval:refused:{today}", "warning", "An approval was refused",
+                                f"{today} {clean(e.get('venue'), 60)}: {e.get('reason') or 'no reason given'}"))
     return out
 
 
@@ -587,7 +657,7 @@ def check_orderstep_ran(env: Env) -> CheckResult:
         return out
     today = str(ny.date())
     entries, _ = env.journal()
-    if not any(e.get("type") == "order_step" and str(e.get("day"))[:10] == today for e in entries):
+    if not any(e.get("type") == "order_step" and not is_practice(e) and str(e.get("day"))[:10] == today for e in entries):
         out.alerts.append(Alert("orderstep:no-run", "warning", f"The order step has not run today ({today})",
                                 f"{ORDERSTEP_JOB} is loaded and the journal holds no order-step entry for {today}."))
     return out
@@ -659,6 +729,7 @@ CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
     ("switches", ("switch:",), check_switches),
     ("order ledgers", ("orders:",), check_orders),
     ("order step", ("step-stopped:",), check_order_step),
+    ("approval", ("approval:",), check_approval_refused),
     ("scheduled jobs", ("job:",), check_jobs),
     ("order-book collector", ("collector:",), check_collector),
     ("pick-list log", ("picks:",), check_picks),
@@ -692,8 +763,18 @@ def alerts_file(root) -> Path:
     return Path(root) / "artifacts" / "owner" / "alerts.jsonl"
 
 
+def _cleaned_line(e: dict) -> dict:
+    """A line read back from the tool's own files, every field cleaned like a new text: nothing read back is trusted. A key
+    that changes under cleaning is its cleaned form from here on and is never written back as it was."""
+    out = {k: clean(v, 400) for k, v in e.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+    out["key"] = _key_part(e.get("key"))
+    out["level"] = clean(e.get("level"), 20)
+    out["title"], out["detail"], out["time"] = clean(e.get("title", ""), 120), clean(e.get("detail", ""), 300), clean(e.get("time", ""), 40)
+    return out
+
+
 def _replay(data: bytes) -> tuple[dict[str, dict], int]:
-    """({key: its last line} for the keys whose last line is not a cleared line, the number of lines that are not
+    """({key: its last line, cleaned} for the keys whose last line is not a cleared line, the number of lines that are not
     alert lines)."""
     open_map: dict[str, dict] = {}
     damaged = 0
@@ -707,6 +788,7 @@ def _replay(data: bytes) -> tuple[dict[str, dict], int]:
         if not isinstance(e, dict) or not isinstance(e.get("key"), str) or not isinstance(e.get("level"), str):
             damaged += 1
             continue
+        e = _cleaned_line(e)
         if e["level"] == CLEARED:
             open_map.pop(e["key"], None)
         else:
@@ -729,20 +811,30 @@ def notifications_file(root) -> Path:
 
 
 def read_notifications(path) -> dict[tuple, dict]:
-    """{(sender, alert key, alert time): {"shown": bool, "tries": n}} from the notification record (a line per try); a
-    missing file is an empty record and a line that is not a record is skipped."""
+    """{(sender, alert key, alert time): {"shown": bool, "tries": n}} from the notification record, every field cleaned like a
+    new text. A try is a "trying" line written before the send; a "shown" or "failed" line is its answer (an answer with no
+    "trying" line before it, from an earlier version, is a try of its own). A missing file is an empty record and a line that
+    is not a record is skipped."""
     out: dict[tuple, dict] = {}
     p = Path(path)
     if not p.is_file():
         return out
+    waiting: set = set()
     for raw in p.read_bytes().split(b"\n"):
         try:
             e = json.loads(raw)
         except ValueError:
             continue
         if isinstance(e, dict) and all(isinstance(e.get(k), str) for k in ("sender", "key", "since", "result")):
-            st = out.setdefault((e["sender"], e["key"], e["since"]), {"shown": False, "tries": 0})
-            st["tries"] += 1
+            ident = (clean(e["sender"], 40), _key_part(e["key"]), clean(e["since"], 40))
+            st = out.setdefault(ident, {"shown": False, "tries": 0})
+            if e["result"] == "trying":
+                st["tries"] += 1
+                waiting.add(ident)
+                continue
+            if ident not in waiting:
+                st["tries"] += 1
+            waiting.discard(ident)
             st["shown"] = st["shown"] or e["result"] == "shown"
     return out
 
@@ -755,8 +847,8 @@ def notification_note(states: dict, row: dict) -> str:
     tries = max((st["tries"] for st in mine), default=0)
     if not tries:
         return "not shown yet"
-    return (f"not shown: it failed {tries} times and is not tried again" if tries >= NOTIFY_MAX_TRIES
-            else f"not shown yet ({tries} failed {'try' if tries == 1 else 'tries'})")
+    return (f"not shown: tried {tries} times and is not tried again" if tries >= NOTIFY_MAX_TRIES
+            else f"not shown yet ({tries} {'try' if tries == 1 else 'tries'} so far)")
 
 
 @dataclass
@@ -803,6 +895,13 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
     return WatchResult(raised, cleared, list(open_map.values()), failures, shown)
 
 
+def _record(path: Path, row: dict) -> None:
+    with path.open("ab") as fh:
+        fh.write((json.dumps(row) + "\n").encode("utf-8"))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _notify(open_map: dict, senders, record: Path, now: str, failures: list[str]) -> list[Alert]:
     """Give each open alert that a sender has not yet acknowledged to that sender (new ones and old ones alike), at most
     NOTIFY_MAX_TRIES tries in all. A try is written to the record after the sender answered: an alert is shown only once its
@@ -816,20 +915,18 @@ def _notify(open_map: dict, senders, record: Path, now: str, failures: list[str]
         alert = Alert(e["key"], e["level"], e.get("title", ""), e.get("detail", ""))
         for sender in senders:
             name = str(getattr(sender, "name", type(sender).__name__))
-            st = states.get((name, e["key"], e["time"]), {"shown": False, "tries": 0})
+            st = states.get((clean(name, 40), alert.key, clean(e["time"], 40)), {"shown": False, "tries": 0})
             if st["shown"] or st["tries"] >= NOTIFY_MAX_TRIES:
                 continue
+            ident = {"sender": clean(name, 40), "key": alert.key, "since": clean(e["time"], 40)}
+            _record(record, {"time": now, **ident, "result": "trying"})        # on disk before the send: a kill cannot un-count it
             try:
                 sender.send(alert)
                 result = "shown"
             except Exception as exc:
                 failures.append(f"notification for {alert.key}: {describe(exc)}")
                 result = "failed"
-            line = json.dumps({"time": now, "sender": name, "key": e["key"], "since": e["time"], "result": result}) + "\n"
-            with record.open("ab") as fh:
-                fh.write(line.encode("utf-8"))
-                fh.flush()
-                os.fsync(fh.fileno())
+            _record(record, {"time": now, **ident, "result": result})
             if result == "shown":
                 shown.append(alert)
     return shown
@@ -850,7 +947,6 @@ def _show(rows: list[dict], out, states: dict | None = None) -> None:
 
 
 def main(argv=None, env: Env | None = None, out=None) -> int:
-    out = out or sys.stdout
     ap = argparse.ArgumentParser(prog="python -m valedia_trader.core.alerts", description=__doc__.split("\n")[0])
     ap.add_argument("--root", default=None, help="the repository (default: this one)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -864,6 +960,7 @@ def main(argv=None, env: Env | None = None, out=None) -> int:
     except TradingFileError as exc:
         print(f"the watch could not start: {exc}", file=sys.stderr)
         return 2
+    out = out or sys.stdout                                # bound only now: registering puts the output guard on the streams
     try:
         if args.cmd == "list":
             rows = open_alerts(alerts_file(env.root))

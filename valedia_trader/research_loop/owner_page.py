@@ -16,7 +16,13 @@ one section, or that one part of it, say so in plain words ("Unavailable: busy",
 recover it"); its bytes, modification time and side files stay as they were. The one change a read can make: reading a
 WAL store (the order-book collector's) creates, when they are absent, an empty `-wal` file and a `-shm` file of 32,768
 bytes. Before it reads anything the command registers every value of the trading file with the output guard (into a
-private dictionary: nothing goes into the process environment), and reads the Webull environment word from it. Every text that comes from a file or from a program's output is passed through `alerts.clean` (the
+private dictionary: nothing goes into the process environment), and reads the Webull environment word from it. A trading file
+that is unreadable, shared, over 64 KB or 200 settings, or not UTF-8 text stops the build with exit 2 and nothing written.
+Nothing read back from the tool's own files (the alert file, the notification record) is trusted: it is cleaned like a new
+text. Known limits of the output guard this rests on (the package's own): a value split by other separators, halves shorter
+than 8 characters, a base64 form of a recovery phrase, words of the phrase glued to other letters, and values under ordinary
+setting names are not caught. The order-step section shows the unattended run's last results, and apart from them the last
+propose run and the last approve run (summaries that carry a `mode`). Every text that comes from a file or from a program's output is passed through `alerts.clean` (the
 package's output guard, then any long run of digits becomes `<number>`) and then HTML-escaped. An order is shown only by
 the last 4 characters of its tag, the pick lists only by counts, and no result of any research test is shown.
 """
@@ -319,6 +325,19 @@ def step_summaries(entries: list[dict]) -> list[dict]:
     return [e for e in entries if e.get("type") == "order_step" and e.get("event") == "summary"]
 
 
+def step_result(e: dict) -> str:
+    """What an order-step summary says, in words: a closed market is ordinary, any other stop names its stage and reason."""
+    if al.is_outside_market_hours(e):
+        return "outside market hours"
+    if e.get("status") == "stopped":
+        return f"stopped at stage {E(e.get('stage'))}: {E(e.get('reason'), 240)}"
+    return E(e.get("status"))
+
+
+def step_orders(e: dict) -> str:
+    return f"sent {len(e.get('sent') or [])}, refused {len(e.get('refused') or [])}, left over {len(e.get('left_over') or [])}"
+
+
 def broker_part(path: Path, env: al.Env, ctx: Context) -> tuple[list, str]:
     from valedia_trader.execution_and_risk.order_step import ledger_path_for
     from valedia_trader.execution_and_risk.orders import TERMINAL
@@ -348,19 +367,20 @@ def broker_part(path: Path, env: al.Env, ctx: Context) -> tuple[list, str]:
                      else "No reconcile has been recorded.", "muted"))
     try:
         entries, _ = ctx.journal()
-        mine = [e for e in step_summaries(entries) if ledger_path_for(Path("."), e.get("venue")).name == path.name][-SUMMARIES_SHOWN:]
-        body.append("<h3>Last order steps (from the journal)</h3>")
+        ours = [e for e in step_summaries(entries) if ledger_path_for(Path("."), e.get("venue")).name == path.name]
+        mine = [e for e in ours if not al.is_practice(e)][-SUMMARIES_SHOWN:]
+        body.append("<h3>Last order steps of the unattended run (from the journal)</h3>")
         if mine:
-            rows = []
-            for e in reversed(mine):
-                what = ("outside market hours" if al.is_outside_market_hours(e)
-                        else f"stopped at stage {E(e.get('stage'))}: {E(e.get('reason'), 240)}" if e.get("status") == "stopped"
-                        else E(e.get("status")))
-                rows.append([E(day_of(e)), what, f"sent {len(e.get('sent') or [])}, refused {len(e.get('refused') or [])}, "
-                                                  f"left over {len(e.get('left_over') or [])}"])
-            body.append(table(["Day", "Result", "Orders"], rows))
+            body.append(table(["Day", "Result", "Orders"], [[E(day_of(e)), step_result(e), step_orders(e)] for e in reversed(mine)]))
         else:
-            body.append(para("No order step is in the journal for this ledger."))
+            body.append(para("No unattended order step is in the journal for this ledger."))
+        body.append("<h3>Practice runs of the approval flow</h3>")
+        practice = []
+        for mode in ("propose", "approve"):
+            last_of_mode = [e for e in ours if e.get("mode") == mode][-1:]
+            practice.append([f"Last {mode}", E(day_of(last_of_mode[0])) if last_of_mode else "none yet",
+                             step_result(last_of_mode[0]) if last_of_mode else "", step_orders(last_of_mode[0]) if last_of_mode else ""])
+        body.append(table(["Run", "Day", "Result", "Orders"], practice))
     except Exception as exc:
         body.append(problem(exc, "order-step summaries"))
     times = [last["time"]] if last else []
