@@ -513,6 +513,38 @@ class _LiveVenue(_Venue):
     account_id = LIVE_ACCOUNT
 
 
+def _strategy_file(root, hid, name, market=("SPY", "QQQ")):
+    spec = {**strat().to_spec(), "name": name, "market": list(market)}
+    (root / "strategies").mkdir(exist_ok=True)
+    path = root / "strategies" / f"{name}_h{hid}.json"
+    path.write_text(json.dumps(spec))
+    return path
+
+
+def _owner_file(path, value, mode=0o644):
+    path.write_text(value if isinstance(value, str) else json.dumps(value))
+    path.chmod(mode)
+    return path
+
+
+def _followed_book(root):
+    """T32: the order step project's paper book under a real strategy's name (hypothesis 1, mom_paper, in the ledger
+    and the strategy files; its latest day lists it), and config/broker_book.json following it."""
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    state["positions"] = {"mom_paper": state["positions"]["a"]}
+    state["pending"] = [{**o, "strategy": "mom_paper"} for o in state["pending"]]
+    state["history"][-1]["strategy_values"] = {"mom_paper": 2_000.0}
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        hid = led.propose("Assets that rose over ten days keep rising", "test", cli.MARKET)
+    finally:
+        led.close()
+    _strategy_file(root, hid, "mom_paper")
+    _owner_file(root / "config" / "broker_book.json", {"follow": [hid]})
+    return hid
+
+
 @pytest.fixture
 def live_project(order_step_project, monkeypatch):
     from datetime import date
@@ -537,6 +569,7 @@ def live_project(order_step_project, monkeypatch):
         for e in ({"event": "fill", "fill_id": "f1"}, {"event": "summary", "status": "done", "stage": None}):
             fh.write(json.dumps({"timestamp": "2026-11-12T15:00:00+00:00", "day": "2026-11-12", "type": "order_step",
                                  "venue": "webull-sandbox", "batch": "paper-1", **e}) + "\n")
+    _followed_book(root)                                    # T32: live mode follows only what broker_book.json names
     venue = _LiveVenue()
     built, asked = [], []
     monkeypatch.setattr(cli, "_live_environ", lambda: dict(LIVE_KEYS))             # never the secrets file
@@ -876,3 +909,225 @@ def test_a_live_root_is_compared_with_links_resolved_on_both_sides(live_project,
     args = argparse.Namespace(live=True, check=True, propose=False, approve=None, capital=None, fractional=False)
     assert cli.live_order_step_command(args, cli.LoopPaths(links / "repo"), environ=dict(LIVE_KEYS)) == 0
     assert cli.live_order_step_command(args, cli.LoopPaths(links / "other"), environ=dict(LIVE_KEYS)) == 2
+
+
+# ---- T32: the broker book follows the strategies config/broker_book.json names (hypothesis ids, named through the
+# ledger and the strategy files as the paper command names them, and found in the paper book's latest day)
+
+H23, H26 = "trend_blend_etf_1999_2011", "hold_rebalance_etf_2006_2026"
+
+
+@pytest.fixture
+def follow_project(order_step_project):
+    """The order step project with the paper book of today: hypotheses 23 and 26 in the ledger with their strategy
+    files, each stepped on half the paper equity; 24 in the ledger without a strategy file; 25 with a strategy that
+    is not in the paper book's latest day."""
+    root, venue = order_step_project
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    state["positions"] = {H23: {"SPY": {"units": 4.0, "cost": 500.0}}, H26: {"QQQ": {"units": 6.0, "cost": 400.0}}}
+    state["pending"] = []
+    state["history"] = [{"day": "2026-11-12", "equity": 100_000.0, "capital_per_strategy": 50_000.0,
+                         "strategy_values": {H23: 2_000.0, H26: 2_400.0}}]
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        ids = [led.propose(f"Idea number {i} about a different market effect entirely", "test", cli.MARKET)
+               for i in range(26)]
+    finally:
+        led.close()
+    assert ids[22] == 23 and ids[25] == 26
+    _strategy_file(root, 23, H23, ("SPY",))
+    _strategy_file(root, 26, H26, ("QQQ",))
+    _strategy_file(root, 25, "elsewhere_strategy", ("SPY",))
+    return root, venue
+
+
+def _book_file(root, value, mode=0o644):
+    return _owner_file(root / "config" / "broker_book.json", value, mode)
+
+
+def test_t32_without_the_file_the_order_step_follows_the_whole_book_as_before(follow_project, capsys):
+    root, venue = follow_project
+    assert cli.main(["--root", str(root), "order-step"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert sorted((s["symbol"], s["units"]) for s in out["sent"]) == [("QQQ", 6.0), ("SPY", 4.0)] and "follow" not in out
+    assert not (root / "config" / "broker_book.json").exists()
+
+
+@pytest.mark.parametrize("capital, units", [(None, 12.0), (50_000.0, 6.0), (20_000.0, 2.0)])
+def test_t32_following_26_sends_only_its_units_on_its_own_share(follow_project, capsys, capital, units):
+    root, venue = follow_project
+    _book_file(root, {"follow": [26], "note": "the owner's choice of 2026-11-14"})       # other keys are ignored
+    argv = ["--root", str(root), "order-step"] + ([] if capital is None else ["--capital", str(capital)])
+    assert cli.main(argv) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [(s["symbol"], s["units"]) for s in out["sent"]] == [("QQQ", units)]          # nothing of 23's SPY
+    assert out["gaps"]["QQQ"]["target"] == 6.0 * ((100_000.0 if capital is None else capital) / 50_000.0)
+    assert out["follow"] == {"ids": [26], "names": [H26]}
+    journal = [json.loads(ln) for ln in (root / "journal" / "2026-11-13.jsonl").read_text().splitlines()]
+    (summary,) = [e for e in journal if e.get("event") == "summary"]
+    assert summary["follow"] == {"ids": [26], "names": [H26]}
+
+
+def test_t32_following_both_ids_sends_what_the_whole_book_sends(follow_project, capsys):
+    root, venue = follow_project
+    _book_file(root, {"follow": [26, 23]})
+    assert cli.main(["--root", str(root), "order-step"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert sorted((s["symbol"], s["units"]) for s in out["sent"]) == [("QQQ", 6.0), ("SPY", 4.0)]
+    assert out["follow"] == {"ids": [26, 23], "names": [H26, H23]}
+
+
+BAD_BOOK_FILES = {
+    "not an object": ([26], "must be a JSON object"),
+    "follow missing": ({"strategies": [26]}, 'has no "follow" list'),
+    "empty": ({"follow": []}, "at least one id is needed"),
+    "not a list": ({"follow": 26}, 'must be a list of hypothesis ids'),
+    "a bool": ({"follow": [True]}, "true or false"),
+    "text": ({"follow": ["26"]}, 'the text "26"'),
+    "a float": ({"follow": [26.0]}, "the number 26.0"),
+    "a negative": ({"follow": [-26]}, "holds -26; a hypothesis id is a whole number from 1"),
+    "zero": ({"follow": [0]}, "holds 0;"),
+    "huge": ({"follow": [10**30]}, "a whole number from 1"),
+    "a repeat": ({"follow": [26, 26]}, "names hypothesis 26 more than once"),
+    "null": ({"follow": None}, "not null"),
+    "an id unknown to the ledger": ({"follow": [26, 999]}, "hypothesis 999, which the research ledger does not hold"),
+    "an id whose strategy file is missing": ({"follow": [24]}, "hypothesis 24, whose strategy cannot be loaded"),
+    "an id not in the paper book's latest day": ({"follow": [26, 25]}, "not among the strategies of the paper book's "
+                                                                       "latest day (2026-11-12"),
+    "a repeated key": ('{"follow": [26], "follow": [23]}', "repeats a key"),
+    "NaN": ('{"follow": [NaN]}', "NaN"),
+    "not JSON": ("follow: [26]", "is not plain JSON"),
+    "not UTF-8": (b"\xff\xfe{}", "not UTF-8"),
+}
+
+
+@pytest.mark.parametrize("how", sorted(BAD_BOOK_FILES) + ["a link", "a link above it", "a second name",
+                                                         "writable by others", "writable by its group", "a folder"])
+def test_t32_a_bad_broker_book_file_or_id_stops_the_order_step_with_nothing_sent_changed_or_cancelled(
+        follow_project, capsys, tmp_path_factory, how):
+    import os
+    root, venue = follow_project
+    assert cli.main(["--root", str(root), "order-step"]) == 0                             # open orders, as before
+    capsys.readouterr()
+    book_before = json.dumps(venue.book, sort_keys=True)
+    venue.calls.clear()
+    path = root / "config" / "broker_book.json"
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    words = {"a link": "symbolic link", "a link above it": "symbolic link", "a second name": "more than one name",
+             "writable by others": "writable by its group or by others",
+             "writable by its group": "writable by its group or by others", "a folder": "not a regular file"}
+    if how in BAD_BOOK_FILES:
+        value, words = BAD_BOOK_FILES[how]
+        if isinstance(value, bytes):
+            path.write_bytes(value)
+            path.chmod(0o644)
+        else:
+            _book_file(root, value)
+    else:
+        words = words[how]
+        real = _owner_file(elsewhere / "broker_book.json", {"follow": [26]})
+        if how == "a link":
+            path.symlink_to(real)
+        elif how == "a link above it":                               # config/ itself a link to a folder elsewhere
+            (root / "config").rename(elsewhere / "config")
+            (root / "config").symlink_to(elsewhere / "config", target_is_directory=True)
+            _owner_file(elsewhere / "config" / "broker_book.json", {"follow": [26]})
+        elif how == "a second name":
+            os.link(real, path)
+        elif how == "a folder":
+            path.mkdir()
+        else:
+            _book_file(root, {"follow": [26]}, 0o646 if how == "writable by others" else 0o664)
+    code = cli.main(["--root", str(root), "order-step"])
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert code == 2 and out["status"] == "stopped" and out["stage"] == "follow", out
+    assert "config/broker_book.json" in out["reason"] and words in out["reason"], out["reason"]
+    assert "nothing is sent" in out["reason"] and "follow" not in out
+    assert [c for c in venue.calls if c in ("submit", "cancel", "positions", "cash", "order_status")] == []
+    assert json.dumps(venue.book, sort_keys=True) == book_before                         # nothing sent, changed or cancelled
+    journal = [json.loads(ln) for ln in (root / "journal" / "2026-11-13.jsonl").read_text().splitlines()]
+    assert journal[-1]["event"] == "summary" and journal[-1]["stage"] == "follow"
+
+
+def test_t32_the_reading_function_names_ids_through_the_ledger_and_the_strategy_files(follow_project):
+    from valedia_trader.execution_and_risk import order_step
+    root, venue = follow_project
+    paths = cli.LoopPaths(root)
+    assert cli.broker_book_follow(paths) is None                                           # no file: the whole book
+    _book_file(root, {"follow": [26]})
+    f = cli.broker_book_follow(paths)
+    assert type(f) is order_step.Follow and f.ids == (26,) and f.names == (H26,) and f.refused is None
+    assert len(f.digest) == 64
+    _book_file(root, {"follow": [26], "note": "changed"})
+    assert cli.broker_book_follow(paths).digest != f.digest                                # the file is in the digest
+    (root / "config" / "broker_book.json").unlink()
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        assert cli.broker_book_follow(paths, led) is None
+        _book_file(root, {"follow": [23]})
+        assert cli.broker_book_follow(paths, led).names == (H23,)
+    finally:
+        led.close()
+
+
+# ---- T32 in live mode: no file, or a refused one, stops before any venue, quote or second source; the proposal
+# shows what is followed; a change of the file between propose and approve stops the approve
+
+@pytest.mark.parametrize("how", ["missing", "empty list", "unknown id", "a link"])
+def test_t32_a_live_run_without_a_usable_broker_book_file_is_refused_before_any_venue(live_project, capsys,
+                                                                                       tmp_path_factory, how):
+    root, venue, built, asked = live_project
+    path = root / "config" / "broker_book.json"
+    path.unlink()
+    if how == "empty list":
+        _book_file(root, {"follow": []})
+    elif how == "unknown id":
+        _book_file(root, {"follow": [7]})
+    elif how == "a link":
+        path.symlink_to(_owner_file(tmp_path_factory.mktemp("elsewhere") / "b.json", {"follow": [1]}))
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("refused: config/broker_book.json ") and len(captured.err.strip().splitlines()) == 1
+    assert {"missing": "never follows the whole book", "empty list": "at least one id", "unknown id": "hypothesis 7",
+            "a link": "symbolic link"}[how] in captured.err
+    assert "nothing was read from the account" in captured.err and captured.out == ""
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+
+
+def test_t32_a_live_proposal_shows_what_it_follows(live_project, capsys):
+    root, venue, built, asked = live_project
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    out, _ = _ticket_out(capsys.readouterr().out)
+    assert out["follow"] == {"ids": [1], "names": ["mom_paper"]} and out["ticket"]["follow"] == out["follow"]
+    journal = [json.loads(ln) for ln in (root / "journal" / "2026-11-13.jsonl").read_text().splitlines()]
+    (ticket,) = [e for e in journal if e.get("event") == "ticket"]
+    assert ticket["follow"] == {"ids": [1], "names": ["mom_paper"]}
+
+
+@pytest.mark.parametrize("change", ["removed", "another key", "refused"])
+def test_t32_a_live_approve_after_the_broker_book_file_changed_is_refused_and_marked(live_project, capsys, change):
+    root, venue, built, asked = live_project
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    _, (line,) = _ticket_out(capsys.readouterr().out)
+    number = line.split()[2]
+    path = root / "config" / "broker_book.json"
+    if change == "removed":
+        path.unlink()
+    elif change == "another key":
+        _book_file(root, {"follow": [1], "note": "the same list, another file"})
+    else:
+        _book_file(root, {"follow": [1, 1]})
+    calls_before = list(venue.calls)
+    built.clear()
+    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    if change == "another key":                                    # still a usable file: the ticket's check refuses it
+        assert out["stage"] == "ticket" and "broker book" in out["reason"] and "changed since" in out["reason"]
+    else:                                                          # no usable file: refused before any venue is built
+        assert captured.err.startswith("refused: config/broker_book.json ") and built == []
+        assert out["stage"] == "lock" and venue.calls == calls_before
+    assert "submit" not in venue.calls and _verdicts(root) == ["refused"]

@@ -4768,9 +4768,19 @@ def live_world(tmp, venue=None, conf=None, checklist=None, limits=None, environ=
     return w
 
 
+def _follow_the_book(w):
+    """T32: live mode follows only the strategies config/broker_book.json names (the command line reads it into a
+    Follow). A live world follows every strategy of its paper book (one, "a", in these tests: the same targets)."""
+    book = w.paper if isinstance(w.paper, osx.PaperTargets) else None
+    names = tuple(sorted(book.wanted)) if book is not None and book.wanted else ("a",)
+    return osx.Follow(ids=tuple(range(1, len(names) + 1)), names=names, digest=hashlib.sha256(repr(names).encode()).hexdigest())
+
+
 def lrun(w, **kw):
     kw.setdefault("live", w.live)
     kw.setdefault("second_opinion", w.second)
+    if "follow" not in kw:                                         # T32: decided when the run is made, from the book
+        kw["follow"] = _follow_the_book(w)
     return w.run(**kw)
 
 
@@ -5657,3 +5667,323 @@ def test_a_live_run_given_an_object_whose_paths_point_elsewhere_reads_only_the_r
     out = lpropose(w, live=Pointing())
     assert out["stage"] == "lock" and "lock 1 (" in out["reason"] and "lock 2 (" in out["reason"], out
     assert w.venue.calls == [] and w.quote_calls == []
+
+
+# ==== T32: the broker book follows the strategies the owner chose (config/broker_book.json, read by the command line
+# into a Follow: the hypothesis ids, their strategies' names, a digest of the file). Without one the step follows the
+# whole book as before; with one, only those strategies, each an equal part of the capital: capital / (share x n).
+
+H23, H26 = "trend_blend_etf_1999_2011", "hold_rebalance_etf_2006_2026"
+TWO = {H23: {"SPY": 40.0, "QQQ": 10.0}, H26: {"SPY": 24.0, "TLT": 60.0}}
+
+
+def _follow(*pairs, digest=None):
+    return osx.Follow(ids=tuple(i for i, _ in pairs), names=tuple(n for _, n in pairs),
+                      digest=digest or hashlib.sha256(repr(pairs).encode()).hexdigest())
+
+
+def two_book(equity=100_000.0, min_trade_pct=0.0, wanted=None):
+    """The paper book as it is: two strategies, each stepped on half the equity."""
+    return paper(TWO if wanted is None else wanted, equity=equity, share=equity / 2, min_trade_pct=min_trade_pct)
+
+
+# ---- outcome 1: following 26 alone, on its own share
+
+@pytest.mark.parametrize("capital", [None, 30_000.0])
+def test_t32_following_26_alone_targets_its_wanted_units_times_capital_over_its_share(world, capital):
+    world.paper = two_book()
+    out = world.run(follow=_follow((26, H26)), **({} if capital is None else {"capital": capital}))
+    scale = (100_000.0 if capital is None else capital) / 50_000.0          # the default capital is the paper equity
+    assert out["status"] == "done", out
+    assert {s: g["target"] for s, g in out["gaps"].items()} == {"SPY": 24.0 * scale, "TLT": 60.0 * scale}
+    assert units_sent(world) == {"SPY": float(math.floor(24.0 * scale)), "TLT": float(math.floor(60.0 * scale))}
+    assert {p["strategy"] for o in world.orders() for p in o["parts"]} == {H26}       # nothing of 23 is bought
+    assert out["follow"] == {"ids": [26], "names": [H26]}
+    (summary,) = world.entries("summary")
+    assert summary["follow"] == {"ids": [26], "names": [H26]}
+
+
+def test_t32_the_targets_function_follows_only_the_names_given_on_their_own_share():
+    book = two_book()
+    per_symbol, per_strategy = osx.targets(book, 30_000.0, follow=(H26,))
+    assert per_strategy == {H26: {"SPY": 24.0 * (30_000.0 / 50_000.0), "TLT": 60.0 * (30_000.0 / 50_000.0)}}
+    assert per_symbol == {"SPY": 24.0 * 0.6, "TLT": 60.0 * 0.6}
+    assert osx.targets(book, 30_000.0)[1] == {H23: {"SPY": 40.0 * 0.3, "QQQ": 10.0 * 0.3},       # no list: the whole
+                                              H26: {"SPY": 24.0 * 0.3, "TLT": 60.0 * 0.3}}       # book, on the equity
+
+
+def test_t32_what_an_unfollowed_strategy_holds_at_the_broker_is_sold_to_zero_and_attributed_to_it(world):
+    world.venue.fill_at_once = 1.0
+    world.paper = two_book()
+    out = world.run(capital=100_000.0)                                       # the whole book, as before: both bought
+    assert out["status"] == "done" and world.book() == {"SPY": 64.0, "QQQ": 10.0, "TLT": 60.0}
+    world.later()
+    out = world.run(capital=50_000.0, follow=_follow((26, H26)))             # 26 alone on its share: a scale of 1
+    assert out["status"] == "done", out
+    sales = [o for o in world.orders() if o["tag"].startswith(out["batch"] + "-")]
+    assert sorted((o["symbol"], o["units"], [p["strategy"] for p in o["parts"]]) for o in sales) == [
+        ("QQQ", -10.0, [H23]), ("SPY", -40.0, [H23])]
+    held = osx.strategy_holdings(world.orders())
+    assert held[H26] == {"SPY": 24.0, "TLT": 60.0} and held[H23] == {"SPY": 0.0, "QQQ": 0.0}
+    assert world.book() == {"SPY": 24.0, "QQQ": 0.0, "TLT": 60.0}
+
+
+def test_t32_the_smallest_trade_follows_the_same_scale(world):
+    # share 50,000, min_trade_pct 1%, capital 30,000, 26 alone: scale 0.6, smallest trade 0.01 x 50,000 x 0.6 = 300.
+    # At capital / paper equity it would be 150, and the 2 TLT (200) would go.
+    world.paper = two_book(min_trade_pct=0.01, wanted={H23: {"QQQ": 10.0}, H26: {"TLT": 4.0, "IWM": 5.0}})
+    out = world.run(capital=30_000.0, follow=_follow((26, H26)))
+    assert out["status"] == "done", out
+    assert units_sent(world) == {"IWM": 3.0}                                 # 600 sent; QQQ is 23's, never bought
+    (skip,) = [s for s in out["skipped"] if s["symbol"] == "TLT"]
+    assert skip["reason"] == "worth 200.00, less than the smallest trade of 300.00"
+
+
+# ---- outcome 2: following both ids is following the whole book, to the last float digit
+
+def _random_two_book(rng):
+    equity = rng.choice([10_000.0, 100_000.0, 123_456.78, 1_000_003.0, 7.5e6])
+    wanted = {s: {sym: float(rng.choice([0, 0, 2, 5, 9, 12.5, -3, 0.37, 1e-7, 333.3333]))
+                  for sym in rng.sample(["SPY", "QQQ", "IWM", "TLT"], rng.randint(1, 4))} for s in ("a", "b")}
+    return paper(wanted, equity=equity, share=equity / 2, min_trade_pct=rng.choice([0.0, 0.002, 0.02, 0.05]))
+
+
+def test_t32_the_targets_of_both_strategies_followed_are_the_whole_books_over_generated_books():
+    rng = random.Random(3232)
+    for _ in range(400):
+        book = _random_two_book(rng)
+        capital = rng.choice([1.0, 7_500.0, 50_000.0, 250_000.0, 99_999.99, book.equity])
+        whole = osx.targets(book, capital)
+        assert osx.targets(book, capital, follow=("a", "b")) == whole
+        assert osx.targets(book, capital, follow=("b", "a")) == whole
+
+
+def _strip_follow(entry):
+    entry = dict(entry)
+    entry.pop("follow", None)
+    if isinstance(entry.get("ticket"), dict):
+        entry["ticket"] = {k: v for k, v in entry["ticket"].items() if k != "follow"}
+    return entry
+
+
+def _both_scenario(tmp, seed, monkeypatch, follow):
+    """One generated scenario of the scheduled run and the paper ticket flow on a two-strategy book, with both
+    strategies followed or with no follow list: what the venue saw, the summaries and journal lines (the follow field
+    taken out), the ledger, the state file and the ticket file, run by run."""
+    rng = random.Random(seed)
+    urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
+    monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
+    monkeypatch.setattr("secrets.randbelow", lambda n: numbers.randrange(n))
+    held = {"OWN": float(rng.randint(0, 5)), "SPY": float(rng.choice([0, 0, 3]))}
+    venue = Booked({s: u for s, u in held.items() if u}, cash=rng.choice([5_000.0, 50_000.0, 1e7]))
+    venue.fill_at_once = rng.choice([0.0, 0.5, 1.0])
+    w = ticket_world(tmp, venue)
+    w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": rng.choice([1, 2, 3, 40])}))
+    kw = {}
+    if rng.random() < 0.3:
+        kw["fractional"] = True
+    if rng.random() < 0.6:
+        kw["capital"] = rng.choice([7_500.0, 50_000.0, 250_000.0])
+    if follow:
+        kw["follow"] = _follow((23, "a"), (26, "b"))
+    seen, number = [], None
+    for day in range(2):
+        w.paper = _random_two_book(rng)
+        for sym in ("SPY", "QQQ", "IWM", "TLT"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 0.37])
+            w.quote_age[sym] = rng.choice([60.0, 60.0, 1500.0])
+        for run in range(rng.randint(1, 3)):
+            if run:
+                w.later(rng.choice([1, 5, 30]))
+            mode = rng.choice(["scheduled", "scheduled", "propose", "approve"])
+            if seen and seen[-1]["mode"] == "propose" and number and rng.random() < 0.7:
+                mode = "approve"                                    # most tickets are approved in the next run
+            run_kw = dict(kw)
+            if mode == "propose":
+                run_kw["propose"] = True
+            elif mode == "approve":
+                run_kw["approve"] = number or "000000"
+            w.venue.calls.clear()
+            out = w.run(**run_kw)
+            if out.get("ticket_number"):
+                number = out["ticket_number"]
+            journal = {f.name: [_strip_follow(json.loads(line)) for line in
+                                _STAMP.sub(b'"timestamp": "T"', f.read_bytes()).decode().splitlines()]
+                       for f in sorted((w.tmp / "journal").glob("*"))}
+            seen.append({"mode": mode, "calls": list(w.venue.calls),
+                         "summary": _strip_follow(json.loads(json.dumps(out, default=str))),
+                         "followed": out.get("follow"), "journal": journal, "state": _dump(w.state_path),
+                         "ledger": _dump(w.ledger_path), "tickets": _dump(osx.ticket_path_for(w.state_path))})
+        w.next_day()
+    monkeypatch.undo()
+    return seen
+
+
+@pytest.mark.parametrize("seed_block", range(4))
+def test_t32_following_both_ids_is_the_whole_book_over_generated_books(tmp_path, monkeypatch, seed_block):
+    """50 scenarios per block, 200 in all: orders sent, smallest-trade decisions, journal lines and every file equal,
+    apart from the new field, which names both strategies in every summary of the follow run."""
+    counts = {"submit": 0, "smallest": 0, "runs": 0}
+    for k in range(50):
+        seed = 320_000 + seed_block * 50 + k
+        whole = _both_scenario(tmp_path / f"whole{k}", seed, monkeypatch, follow=False)
+        both = _both_scenario(tmp_path / f"both{k}", seed, monkeypatch, follow=True)
+        assert len(whole) == len(both)
+        for i, (a, b) in enumerate(zip(whole, both)):
+            assert a["followed"] is None and b["followed"] == {"ids": [23, 26], "names": ["a", "b"]}, (seed, i)
+            for key in a:
+                if key != "followed":
+                    assert a[key] == b[key], (seed, i, key)
+        counts["submit"] += sum(1 for r in both for c in r["calls"] if c[0] == "submit")
+        counts["smallest"] += sum(1 for r in both for s in r["summary"]["skipped"] if "smallest trade" in s["reason"])
+        counts["runs"] += len(both)
+        _shutil.rmtree(tmp_path / f"whole{k}")
+        _shutil.rmtree(tmp_path / f"both{k}")
+    assert counts["submit"] > 30 and counts["smallest"] > 10, counts
+
+
+# ---- outcome 3, at the step: a refused or malformed follow list stops the run with nothing sent, changed or cancelled
+
+BAD_FOLLOWS = {
+    "refused": osx.Follow(refused="config/broker_book.json names hypothesis 99, which the research ledger does not hold"),
+    "not a Follow": {"ids": (26,), "names": (H26,)},
+    "no id": osx.Follow(ids=(), names=(), digest="0" * 64),
+    "a bool id": osx.Follow(ids=(True,), names=(H26,), digest="0" * 64),
+    "a text id": osx.Follow(ids=("26",), names=(H26,), digest="0" * 64),
+    "a float id": osx.Follow(ids=(26.0,), names=(H26,), digest="0" * 64),
+    "a negative id": osx.Follow(ids=(-26,), names=(H26,), digest="0" * 64),
+    "a repeated id": osx.Follow(ids=(26, 26), names=(H26, H23), digest="0" * 64),
+    "a repeated name": osx.Follow(ids=(23, 26), names=(H26, H26), digest="0" * 64),
+    "fewer names": osx.Follow(ids=(23, 26), names=(H26,), digest="0" * 64),
+    "an empty name": osx.Follow(ids=(26,), names=("",), digest="0" * 64),
+    "no digest": osx.Follow(ids=(26,), names=(H26,)),
+    "names as a list": osx.Follow(ids=[26], names=[H26], digest="0" * 64),
+}
+
+
+@pytest.mark.parametrize("how", sorted(BAD_FOLLOWS))
+def test_t32_a_refused_or_malformed_follow_list_stops_the_run_with_nothing_sent_changed_or_cancelled(world, how):
+    world.paper = two_book()
+    out = world.run(capital=10_000.0)                                       # an open order of an earlier run
+    assert out["status"] == "done" and world.venue.submits()
+    open_before = [(o["tag"], o["state"]) for o in world.orders()]
+    world.later()
+    world.venue.calls.clear()
+    world.quote_calls.clear()
+    out = world.run(capital=10_000.0, follow=BAD_FOLLOWS[how])
+    assert out["status"] == "stopped" and out["stage"] == "follow", out
+    assert "broker book" in out["reason"] and "nothing is sent" in out["reason"], out
+    if how == "refused":
+        assert "hypothesis 99" in out["reason"]
+    assert [c for c in world.venue.calls if c[0] in ("submit", "cancel", "positions", "cash", "order_status")] == []
+    assert world.quote_calls == [] and [(o["tag"], o["state"]) for o in world.orders()] == open_before
+    assert "follow" not in out
+
+
+# ---- outcome 4, at the step: live mode never follows the whole book; the proposal says what it follows; a change
+# of the follow list between propose and approve stops the approve
+
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+@pytest.mark.parametrize("how", ["no follow list", "refused"])
+def test_t32_live_mode_without_a_follow_list_stops_before_anything_is_read(lw, mode, how):
+    number = "123456"
+    if mode == "approve":
+        _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+        lw.later(1)
+    lw.venue.calls.clear()
+    lw.quote_calls.clear()
+    lw.second.calls.clear()
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    follow = None if how == "no follow list" else osx.Follow(refused="config/broker_book.json is missing")
+    out = lpropose(lw, follow=follow) if mode == "propose" else lapprove(lw, number, follow=follow)
+    assert out["status"] == "stopped" and out["stage"] == "lock" and "broker_book.json" in out["reason"], out
+    assert "never follows the whole book" in out["reason"] or "is missing" in out["reason"]
+    assert _account_reads(lw) == [] and lw.quote_calls == [] and lw.second.calls == [] and lw.venue.submits() == []
+    if mode == "approve":
+        assert ticket_rows(lw, "verdicts")[-1]["verdict"] == "refused"
+
+
+def test_t32_a_live_proposal_says_what_it_follows_and_binds_the_ticket_to_it(lw):
+    follow = _follow((26, "a"))
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}}, equity=5000.0)
+    out = lpropose(lw, follow=follow)
+    assert out["status"] == "done" and out["ticket"]["orders"], out
+    assert out["follow"] == {"ids": [26], "names": ["a"]} and out["ticket"]["follow"] == {"ids": [26], "names": ["a"]}
+    (entry,) = lw.entries("ticket")
+    assert entry["follow"] == {"ids": [26], "names": ["a"]}
+    (summary,) = [e for e in lw.entries("summary") if e["venue"] == "webull-production"]
+    assert summary["follow"] == {"ids": [26], "names": ["a"]}
+    meta = {r["key"]: json.loads(r["value"]) for r in _rows(lw, "SELECT key, value FROM meta") if ":" in r["key"]}
+    number = out["ticket_number"]
+    assert meta[f"broker_book:2026-11-13:{number}"] == {"digest": follow.digest, "ids": [26], "names": ["a"]}
+    lw.later(1)
+    out = lapprove(lw, number, follow=follow)                              # the same follow list: sent
+    assert out["status"] == "done" and out["orders_sent"] == 2 and out["follow"] == {"ids": [26], "names": ["a"]}
+
+
+@pytest.mark.parametrize("change", ["the file", "the ids", "the names"])
+def test_t32_a_live_approve_after_the_follow_list_changed_is_refused_and_marked(lw, change):
+    follow = _follow((26, "a"))
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(lw, follow=follow)
+    number = out["ticket_number"]
+    later = {"the file": dataclasses.replace(follow, digest="f" * 64),
+             "the ids": _follow((27, "a")), "the names": _follow((26, "a"), (27, "b"))}[change]
+    lw.later(1)
+    lw.venue.calls.clear()
+    out = lapprove(lw, number, follow=later)
+    assert out["status"] == "stopped" and out["stage"] == "ticket", out
+    assert "broker book" in out["reason"] and "changed since that ticket was made" in out["reason"]
+    assert lw.venue.submits() == [] and ticket_rows(lw, "verdicts")[-1]["verdict"] == "refused"
+
+
+def test_t32_a_live_ticket_made_without_a_follow_mark_is_never_approved(lw, monkeypatch):
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    real = osx.TicketBook.create
+    monkeypatch.setattr(osx.TicketBook, "create", lambda self, t, lines, live=None, **k: real(self, t, lines, live=live))
+    out = lpropose(lw)
+    number = out["ticket_number"]
+    monkeypatch.setattr(osx.TicketBook, "create", real)
+    lw.later(1)
+    out = lapprove(lw, number)
+    assert out["stage"] == "ticket" and "changed since that ticket was made" in out["reason"] and lw.venue.submits() == []
+
+
+# ---- outcome 5: without a follow list the step is 76295f7's, byte for byte (the lead runs this one: it needs git)
+
+T32_BASE = "76295f7"
+
+
+@pytest.fixture(scope="module")
+def t32_base(tmp_path_factory):
+    """The order step of T32's base commit, from git, loaded under its own name."""
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{T32_BASE}:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True, check=True).stdout
+    folder = tmp_path_factory.mktemp("t32_base_order_step")
+    path = folder / "order_step_t32_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t32_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t32_base"] = mod
+    spec.loader.exec_module(mod)
+    assert hasattr(mod.TicketBook, "live_mark") and not hasattr(mod, "Follow")
+    return mod
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path, monkeypatch, t32_base, seed_block):
+    """50 scenarios per block, 300 in all, of the scheduled run and the paper ticket flow, through 76295f7 and here."""
+    sends = 0
+    for k in range(50):
+        seed = 532_000 + seed_block * 50 + k
+        base = _flow_scenario(t32_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            for key in b:
+                assert b[key] == m[key], (seed, i, key)
+        sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    assert sends > 30

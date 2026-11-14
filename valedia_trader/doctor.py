@@ -26,6 +26,7 @@ from valedia_trader.research_loop import LoopPaths, risk_gate
 
 REPO = Path(__file__).resolve().parents[1]
 OK, ATTENTION, FAIL = "ok", "attention", "fail"
+SHOWN_MAX = 4                   # T32 A1: the longest figure from an owner's file the doctor shows (no piece of 5)
 
 
 def _get(url: str, timeout: float = 3.0) -> dict:
@@ -67,8 +68,13 @@ def check_risk_limits(paths: LoopPaths) -> tuple[str, str]:
         limits = risk_gate.load_limits(paths.risk_limits)
     except risk_gate.RiskConfigError as exc:
         return FAIL, f"{exc}; every order is blocked until this is fixed"
-    text = (f"daily loss {limits['max_daily_loss_pct']}%, drawdown {limits['max_drawdown_pct']}%, position {limits['max_position_pct']:.0%}, "
-            f"{limits['max_open_positions']} positions")
+    # T32 A1: a figure is shown only when it is at most 4 characters; a longer one may be something typed there by
+    # mistake (an account number), so only that it is set is said
+    figures = [(f"{limits['max_daily_loss_pct']}", "daily loss {}%"), (f"{limits['max_drawdown_pct']}", "drawdown {}%"),
+               (f"{limits['max_position_pct'] * 100:.0f}", "position {}%"), (f"{limits['max_open_positions']}", "{} positions")]
+    text = ", ".join(form.format(v) if len(v) <= SHOWN_MAX else
+                     form.replace("{}%", "").replace("{} ", "").strip() + " not shown (more than 4 characters)"
+                     for v, form in figures)
     if all(limits.get(k) == v for k, v in risk_gate.DEFAULT_LIMITS.items()):
         return ATTENTION, text + "; these are still the guide's example limits, not yours"
     return OK, text
@@ -175,8 +181,90 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
 
 
 LIVE_ONLY_AT_A_PROPOSAL = ("judged only when a batch is proposed and again when it is approved: lock 4 (the ticket), the "
-                           "account the venue will trade against the confirmation's class and last 4 characters, each "
-                           "order's value against max_order_value, and both second price sources agreeing on each price")
+                           "capital given with --capital against the confirmation's max_capital, the money at work (what "
+                           "the account holds plus the batch's buys) against max_capital, the account the venue will "
+                           "trade against the confirmation's class and last 4 characters, each order's value against "
+                           "max_order_value, and both second price sources agreeing on each price; WEBULL_ENV and "
+                           "WEBULL_ACCOUNT_CLASS are read when the venue is built, not here")
+
+# T32 A1: the lock judges' reasons the doctor prints as they are, because they are made of the code's own words and
+# nothing from inside the file (after "config/<file> "); any other reason is said in the doctor's own words, or not
+# shown. The order step still gets the judges' reasons whole.
+_READ_WHYS = ("is missing", "is a symbolic link", "has a symbolic link", "cannot be opened", "is not a regular file",
+              "has more than one name", "is writable by", "is larger than", "is not UTF-8", "is not plain JSON",
+              "cannot be read")
+_PLAIN_REASONS = {
+    1: ("config/webull_live.json", _READ_WHYS + ("is not a JSON object", "is in the old form", "lacks ",
+                                                 "account_class must be", "account_ends must be", "confirmed_by must be",
+                                                 "max_order_value must be", "max_capital must be",
+                                                 "max_order_value is above", "valid_until must be",
+                                                 "valid_until is more than", "i_understand_this_trades_real_money must")),
+    2: ("config/go_live.json", _READ_WHYS + ("is not a JSON object", "lacks ", "confirmed_by must be", "min_paper_broker_days must",
+                                             "min_reconciled_fills must", "min_days_since_a_stopped_run must",
+                                             "fills_checked_by_hand must", "min_fills_checked_by_hand must")),
+    3: ("config/risk.json", _READ_WHYS + ("is not a JSON object", "must hold max_orders_per_day",
+                                          "is not a limits file the risk gate accepts")),
+}
+_RECORD_WHYS = ("there is no paper record", "the journal is damaged", "the journal cannot be read",
+                "the paper record cannot be", "a stopped paper run in the journal carries no date")
+_SHORT = (("paper trading days on which the order step ended done", "paper_broker_days"),
+          ("fills journaled in paper runs with a clean reconcile", "reconciled_fills"),
+          ("min_days_since_a_stopped_run", None), ("fills checked by hand", None))
+
+
+def _unknown_keys(n: int) -> int | None:
+    """How many keys of lock n's file are not part of it, read again through the locks' own reading function; None
+    when that cannot be told."""
+    try:
+        from valedia_trader.execution_and_risk import go_live
+        from valedia_trader.venues import webull
+        files = go_live.LiveFiles()
+        path, known = (files.confirmation, webull.LIVE_KEYS) if n == 1 else (files.checklist, go_live.CHECKLIST_KEYS)
+        data, why = webull.read_owner_file(path, files.root)
+        return sum(1 for k in data if k not in known) if why is None and isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def plain_lock_reason(lock: dict) -> str:
+    """A lock's reason with nothing taken from inside the owner's file (T32 A1): an unknown key is counted, not
+    named; a lapsed confirmation's date and the checklist's own figures are not shown; a reason not known to be the
+    code's own words is not shown."""
+    n, reason, figures = lock.get("lock"), lock.get("reason"), lock.get("figures") or {}
+    if lock.get("met") is True:
+        return "met"
+    shown, known = _PLAIN_REASONS.get(n, ("its file", ()))
+    if not isinstance(reason, str):
+        return "not met"
+    rest = reason[len(shown) + 1:] if reason.startswith(shown + " ") else None
+    if rest is not None and rest.startswith("has keys that are not part of"):
+        count = _unknown_keys(n)
+        what = "a confirmation" if n == 1 else "the checklist"
+        said = "one or more unknown keys" if not count else f"{count} unknown key{'s' if count != 1 else ''}"
+        return f"{shown} holds {said} (not part of {what}; which is not shown here)"
+    if n == 1 and rest is not None and rest.startswith("lapsed on "):
+        return f"{shown} has lapsed (its valid_until is before today, New York date): the owner renews it"
+    if n == 2 and isinstance(figures.get("owner"), dict) and isinstance(figures.get("record"), dict):
+        record, short = figures["record"], []
+        for words, figure in _SHORT:                    # the record's figures are the journal's, not the file's
+            if words not in reason:
+                continue
+            if figure is not None:
+                short.append(f"{words} ({record.get(figure)} so far)")
+            elif words == "min_days_since_a_stopped_run":
+                short.append(f"days since a stopped paper run (the last was {record.get('days_since_a_stopped_run')} "
+                             f"days ago, {record.get('last_stopped_run')})")
+            else:
+                short.append(words)
+        if short:
+            return f"the paper record is short of {shown} on: {'; '.join(short)} (the file's own figures are not shown here)"
+    if n == 2 and "owner" in figures and reason.startswith(_RECORD_WHYS):
+        return reason
+    if rest is not None and rest.startswith(known):
+        return reason
+    if n == 3 and reason.startswith("the second price sources are not configured: "):
+        return reason
+    return f"{shown} is not as live mode needs it (the reason is not shown here: it may quote the file; the order step gives it)"
 
 
 def live_mode_note(paths: LoopPaths) -> str:
@@ -186,7 +274,10 @@ def live_mode_note(paths: LoopPaths) -> str:
     record from the journal), on today's New York date. Each of locks 1 to 3 is met or not met with its reason; what
     is judged only when a batch is proposed is named as such. "real-money orders off" unless every lock judged here
     is met, and even then every batch still needs a proposal and the owner's approval. Never raises; prints no
-    account id (not even its last 4), key or token: the locks' reasons hold none."""
+    account id (not even its last 4), key or token, and nothing taken from inside an owner's file (T32 A1: the
+    reasons go through plain_lock_reason). Also which strategies the broker book follows (config/broker_book.json,
+    T32), through the reading function the order step is given (research_loop.cli.broker_book_follow), or why it
+    would not be followed and that live mode would stop for that."""
     try:
         import os
 
@@ -198,7 +289,8 @@ def live_mode_note(paths: LoopPaths) -> str:
             return f"real-money orders off: {why}; the locks were not read"
         state = go_live.judge_locks(go_live.LiveFiles(environ=os.environ), webull.ny_date())
         locks = state.locks[:3]
-        told = [f"lock {lock['lock']} ({lock['name']}) " + ("met" if lock["met"] is True else f"not met: {lock['reason']}")
+        told = [f"lock {lock['lock']} ({lock['name']}) " + ("met" if lock["met"] is True else
+                                                            f"not met: {plain_lock_reason(lock)}")
                 for lock in locks]
     except Exception as exc:
         return f"real-money orders off: the locks could not be judged ({type(exc).__name__})"
@@ -207,7 +299,63 @@ def live_mode_note(paths: LoopPaths) -> str:
                 "the owner's approval of its ticket number (order-step --live --propose, then --approve)")
     else:
         head = "real-money orders off"
-    return "; ".join([head, *told, LIVE_ONLY_AT_A_PROPOSAL])
+    return "; ".join([head, *told, broker_book_note(paths), LIVE_ONLY_AT_A_PROPOSAL])
+
+
+def broker_book_note(paths: LoopPaths) -> str:
+    """Which strategies the broker book follows in live mode, read as live mode reads it
+    (research_loop.cli.broker_book_follow: the repository's config/broker_book.json, the ledger, the strategy files);
+    whether each is in the paper book's latest day is judged at each run. Nothing taken from inside the file is
+    shown (T32 A1): the strategies are named by their names (from the strategy files), not by the file's ids, and a
+    refusal is said in the doctor's own words (plain_follow_refusal). Never raises."""
+    try:
+        from valedia_trader.research_loop import cli
+        follow = cli.broker_book_follow(paths, live=True)
+    except Exception as exc:
+        return f"broker book: could not be judged ({type(exc).__name__}); live mode would stop for that"
+    if follow.refused is not None:
+        shown = cli.BROKER_BOOK_SHOWN
+        if follow.refused.startswith(f"{shown} is missing: "):
+            return (f"broker book: {shown} is missing: live mode follows only the strategies that file names and never "
+                    "follows the whole book by default; live mode would stop for that")
+        return f"broker book: not followed: {plain_follow_refusal(follow.refused, shown)}; live mode would stop for that"
+    n = len(follow.names)
+    return (f"broker book: follows {n} strateg{'y' if n == 1 else 'ies'}: {', '.join(follow.names)} (each must be in "
+            "the paper book's latest day; that is judged at each run)")
+
+
+_FOLLOW_WORDS = (('must be a JSON object such as ', 'is not a JSON object such as {"follow": [26]}'),
+                 ('has no "follow" list', 'has no "follow" list of hypothesis ids (such as {"follow": [26]})'),
+                 ('"follow" must be a list', '"follow" is not a list of hypothesis ids (such as {"follow": [26]})'),
+                 ('"follow" names no hypothesis', '"follow" names no hypothesis: at least one id is needed'),
+                 ('"follow" holds true or false', '"follow" holds true or false where a hypothesis id is needed'),
+                 ('"follow" holds ', '"follow" holds something that is not a hypothesis id (a whole number from 1)'))
+
+
+def plain_follow_refusal(refused: str, shown: str) -> str:
+    """Why the broker book file is not followed, with nothing taken from inside it (T32 A1): no id, no value."""
+    if refused.startswith("the research ledger (memory/ledger.db) is missing"):
+        return f"the research ledger (memory/ledger.db) is missing, so the hypotheses {shown} names cannot be found"
+    if not refused.startswith(shown + " "):
+        return f"{shown} cannot be followed (the reason is not shown here: it may quote the file)"
+    rest = refused[len(shown) + 1:]
+    if rest.startswith(_READ_WHYS) or rest.startswith("could not be judged ("):
+        return refused                                  # the reading function's own words, or an error's type
+    if rest.startswith("names hypothes"):
+        for end, words in ((", which the research ledger does not hold", "names a hypothesis the research ledger does not hold"),
+                           ("whose strategy has no plain name", "names a hypothesis whose strategy has no plain name"),
+                           ("; follow it once", "names two hypotheses whose strategies share one name")):
+            if rest.endswith(end):
+                return f"{shown} {words}"
+        if ", whose strategy cannot be loaded (" in rest:
+            return f"{shown} names a hypothesis whose strategy cannot be loaded"
+        return f"{shown} names a hypothesis that cannot be followed"
+    if rest.endswith("more than once"):
+        return f'{shown} "follow" names a hypothesis more than once'
+    for start, words in _FOLLOW_WORDS:
+        if rest.startswith(start):
+            return f"{shown} {words}"
+    return f"{shown} cannot be followed (the reason is not shown here: it may quote the file)"
 
 
 def check_schedule(paths: LoopPaths) -> tuple[str, str]:

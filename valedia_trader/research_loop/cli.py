@@ -300,13 +300,93 @@ def _order_step_events(venue) -> bool:
     return False
 
 
-def order_step_command(args, paths: LoopPaths, venue=None) -> int:
+BROKER_BOOK_SHOWN = "config/broker_book.json"
+
+
+def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None, *, live: bool = False, trader=None):
+    """config/broker_book.json (T32): which strategies of the paper book the broker book follows, as the order step
+    is given it. None when the file is missing outside live mode (the whole book, as before). Otherwise an
+    order_step.Follow: the hypothesis ids, their strategies' names (through the ledger and the strategy files, as
+    the paper command names them: _strategy_for(...)[0].name) and a digest of the file's value and the names; or
+    `refused`, why the file or an id cannot be followed, in words a person can act on. Read through
+    webull.read_owner_file (a link, a second name, a file writable by others, a repeated key, NaN and the rest are
+    refused). In live mode the file is the repository's own (webull.LIVE_REPO) and a missing file is refused: live
+    mode never follows the whole book by default. With `trader` (a PaperTrader) each name must also be among the
+    strategies of the paper book's latest day. `ledger` None: the research ledger is opened only when its file is
+    there (a missing one is never made). Never raises; writes, creates or repairs nothing."""
+    import hashlib
+    import os
+
+    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.venues import webull
+    shown = BROKER_BOOK_SHOWN
+    Follow = order_step.Follow
+    try:
+        if live:
+            paths = LoopPaths(Path(os.path.abspath(os.fspath(webull.LIVE_REPO))))
+        raw, why = webull.read_owner_file(paths.config / order_step.BROKER_BOOK_FILE, paths.root)
+        if why == "is missing" and not live:
+            return None
+        if why == "is missing":
+            return Follow(refused=f"{shown} is missing: live mode follows only the strategies that file names (such as "
+                                  '{"follow": [26]}) and never follows the whole book by default')
+        if why is not None:
+            return Follow(refused=f"{shown} {why}")
+        ids, why = order_step.judge_follow(raw)
+        if why is not None:
+            return Follow(refused=f"{shown} {why}")
+        own = None
+        if ledger is None:
+            if not paths.ledger.is_file():
+                return Follow(refused=f"the research ledger (memory/ledger.db) is missing, so the hypotheses {shown} "
+                                      "names cannot be found")
+            ledger = own = HypothesisLedger(paths.ledger)
+        try:
+            names: list[str] = []
+            for hid in ids:
+                try:
+                    ledger.get(hid)
+                except LedgerError:
+                    return Follow(refused=f"{shown} names hypothesis {hid}, which the research ledger does not hold")
+                try:
+                    name = _strategy_for(paths, ledger, hid, None)[0].name
+                except Exception as exc:
+                    return Follow(refused=f"{shown} names hypothesis {hid}, whose strategy cannot be loaded "
+                                          f"({order_step._describe(exc)})")
+                if type(name) is not str or not order_step._plain(order_step._NAME, name):
+                    return Follow(refused=f"{shown} names hypothesis {hid}, whose strategy has no plain name")
+                if name in names:
+                    return Follow(refused=f"{shown} names hypotheses {ids[names.index(name)]} and {hid}, whose strategies "
+                                          f"share the name {name}; follow it once")
+                names.append(name)
+        finally:
+            if own is not None:
+                own.close()
+        if trader is not None:
+            day, latest = order_step.paper_strategies(trader)
+            if latest is None:
+                return Follow(refused=f"the paper book's latest day ({day}) does not list its strategies, so what {shown} "
+                                      "names cannot be found in it")
+            for hid, name in zip(ids, names):
+                if name not in latest:
+                    return Follow(refused=f"{shown} names hypothesis {hid} ({name}), which is not among the strategies of "
+                                          f"the paper book's latest day ({day}: {', '.join(sorted(latest)) or 'none'})")
+        digest = hashlib.sha256(json.dumps({"file": raw, "ids": list(ids), "names": names}, sort_keys=True,
+                                           ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+        return Follow(ids=tuple(ids), names=tuple(names), digest=digest)
+    except Exception as exc:                             # nothing about the broker book file may raise
+        return Follow(refused=f"{shown} could not be judged ({type(exc).__name__})")
+
+
+def order_step_command(args, paths: LoopPaths, venue=None, ledger: HypothesisLedger | None = None) -> int:
     """One order step against the venue `_order_step_venue` gives (built here when not given); prints the summary.
     0 when the run went through, 2 when it stopped. The command line builds the venue before any folder or file is
     made, and refuses a configured environment other than the test environment before building it. With --propose
     the run writes a ticket and sends nothing; its number is printed once, on a line of its own after the summary
     (it is never journaled). With --approve NUMBER the run sends only that ticket's orders, each after fresh checks.
-    Without either flag the run is called exactly as before."""
+    Without either flag the run is called exactly as before. With config/broker_book.json (T32) the run follows only
+    the strategies it names (broker_book_follow; `ledger` is the research ledger, opened when not given); without
+    it, the whole book, called exactly as before."""
     from valedia_trader.execution_and_risk import order_step
     if venue is None:
         venue = _order_step_build()
@@ -320,6 +400,8 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
     elif getattr(args, "approve", None) is not None:
         ticket["approve"] = args.approve
     trader = PaperTrader(paths.journal, paths.risk_limits)
+    follow = broker_book_follow(paths, ledger, trader=trader)
+    followed = {} if follow is None else {"follow": follow}   # nothing new is passed without the file
     ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
     orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
     try:
@@ -327,7 +409,7 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
             clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
-            fractional=args.fractional, **ticket)
+            fractional=args.fractional, **ticket, **followed)
     finally:
         orders.close()
     number = out.pop("ticket_number", None) if ticket else None
@@ -456,6 +538,7 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
     from valedia_trader.execution_and_risk import order_step
     ticket = {"propose": True} if args.propose else {"approve": args.approve}
     trader = PaperTrader(paths.journal, paths.risk_limits)
+    follow = broker_book_follow(paths, live=True, trader=trader)   # T32: read again for this run, with its paper book
     ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
     orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
     try:
@@ -463,7 +546,7 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
             clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
-            fractional=False, live=files, second_opinion=second_opinion, **ticket)
+            fractional=False, live=files, second_opinion=second_opinion, follow=follow, **ticket)
     finally:
         orders.close()
     number = out.pop("ticket_number", None)
@@ -481,7 +564,8 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     to 3 are met, the account the venue will trade (its class and last 4); it sends nothing. --propose and --approve
     run the order step in live mode once every lock is met; with a lock unmet they say which and by how much and
     exit 2 (an approve is still marked refused on the ticket file, when there is one, without any account read).
-    `environ` (default: the secrets file loaded into the process environment), `build_venue`, `second_opinion` and
+    Then config/broker_book.json (T32, broker_book_follow): missing or refused, the run is refused the same way,
+    before any venue is built; live mode never follows the whole book. `environ` (default: the secrets file loaded into the process environment), `build_venue`, `second_opinion` and
     `today` are for tests. Nothing here writes, creates or repairs an owner's file."""
     from valedia_trader.execution_and_risk import go_live, order_step
     from valedia_trader.venues.webull import ny_date
@@ -517,6 +601,14 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     if not state.met:
         print(f"refused: {state.unmet()}; nothing was read from the account and no quote was asked", file=sys.stderr)
         if args.approve is not None:                    # the refused approve is marked, as step 1 marks one
+            ledger_path = order_step.ledger_path_for(paths.memory, go_live.LIVE_VENUE)
+            if Path(order_step.ticket_path_for(order_step.state_path_for(ledger_path, go_live.LIVE_VENUE))).exists():
+                _run_live(args, paths, _LockStub(), files, second_opinion)
+        return 2
+    follow = broker_book_follow(paths, live=True)        # T32: before any venue is built; never the whole book
+    if follow.refused is not None:
+        print(f"refused: {follow.refused}; nothing was read from the account and no quote was asked", file=sys.stderr)
+        if args.approve is not None:                    # the refused approve is marked, as for a lock unmet
             ledger_path = order_step.ledger_path_for(paths.memory, go_live.LIVE_VENUE)
             if Path(order_step.ticket_path_for(order_step.state_path_for(ledger_path, go_live.LIVE_VENUE))).exists():
                 _run_live(args, paths, _LockStub(), files, second_opinion)
@@ -693,7 +785,7 @@ def main(argv=None) -> int:
             print(f"stopped: {out['stopped']}; best v{out['best_version']} (Sharpe {out['best_sharpe']:.2f}); "
                   f"{out['variations_counted']} variations counted, {out['revisions_used']} revisions used; passed: {out['passed']}")
         elif args.cmd == "order-step":
-            return order_step_command(args, paths, venue=venue)
+            return order_step_command(args, paths, venue=venue, ledger=ledger)
         elif args.cmd == "paper-step":
             if args.webull:                                    # the paper step runs after the close; Webull refuses those orders
                 print("refused: paper-step no longer sends anything to Webull. Orders reach Webull's test environment only "

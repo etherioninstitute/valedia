@@ -45,6 +45,13 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  journaled once (keyed by its fill id), the journal file fsynced, and only then marked applied. A
                  blocked ledger, or an order still open at the broker, stops the run.
  5. targets      per symbol, each strategy's paper units held plus pending, summed, times capital / paper equity.
+                 With a follow list (`follow`, a Follow: config/broker_book.json as the command line reads it, T32)
+                 only the strategies it names, each an equal part of the capital: times capital / (paper share x
+                 number followed), and the smallest trade at the same scale. What a strategy no longer followed
+                 holds at the broker has a target of zero and is sold down by the ordinary steps below. A follow list
+                 that is refused, or not a well-formed Follow, stops the run after the paper book is read, before
+                 any venue call that sends, changes or cancels an order; in live mode a follow list is required
+                 and is judged with the locks, before anything is read from the account.
  6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, a time whose
                  timestamp() is not finite or raises, or a price not above 0 or above MAX_QUOTE_PRICE: no order for
                  that symbol. The venue's cash, and the broker equity (cash
@@ -178,7 +185,8 @@ from valedia_trader.venues.webull import EVENTS_CLASS, NotTransmitted, OrderReje
 __all__ = ["TEST_ENVIRONMENT", "NOT_SENT", "PaperTargets", "OrderStepState", "OrderStepError", "run_order_step",
            "paper_targets", "open_ledger", "ledger_path_for", "state_path_for", "broker_book", "targets", "strategy_holdings",
            "round_units", "limit_price", "market_window", "max_orders_per_day", "minute_quotes", "wall_clock",
-           "TicketBook", "ticket_path_for", "ticket_number", "TICKET_LIFE_SECONDS", "TICKET_QUOTE_MOVE"]
+           "TicketBook", "ticket_path_for", "ticket_number", "TICKET_LIFE_SECONDS", "TICKET_QUOTE_MOVE", "Follow",
+           "judge_follow", "paper_strategies", "BROKER_BOOK_FILE"]
 
 TEST_ENVIRONMENT = "sandbox"                      # the only environment a run accepts (WebullVenue.environment)
 LIVE_ENVIRONMENT = "production"                   # live mode only (--live): Webull's production environment ...
@@ -421,11 +429,104 @@ def _check_paper(p) -> PaperTargets:
     return p
 
 
-def targets(paper: PaperTargets, capital: float) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+def paper_strategies(trader) -> tuple[str | None, tuple[str, ...] | None]:
+    """The paper book's latest day and the strategies of its last summary (its `strategy_values`), or (that day,
+    None) when there is no summary or it does not list them. Read only."""
+    history = trader.state.get("history") or []
+    last = history[-1] if history else {}
+    day = last.get("day") if isinstance(last, dict) and last.get("day") else trader.state.get("last_day")
+    values = last.get("strategy_values") if isinstance(last, dict) else None
+    if not isinstance(values, dict):
+        return (None if day is None else str(day)), None
+    return (None if day is None else str(day)), tuple(str(s) for s in values)
+
+
+BROKER_BOOK_FILE = "broker_book.json"           # config/broker_book.json: the strategies the broker book follows (T32)
+FOLLOW_ID_MAX = 10**9                           # a hypothesis id is a whole number from 1 to this
+_EXAMPLE = '{"follow": [26]}'
+
+
+@dataclass(frozen=True)
+class Follow:
+    """Which strategies of the paper book the broker book follows (config/broker_book.json, T32), as the command
+    line reads it: the hypothesis ids the owner named, their strategies' names in the same order, and a digest of
+    the file's value and the names (a live ticket is bound to it); or `refused`, why the file or one of its ids
+    cannot be followed, in words a person can act on (the run stops)."""
+    ids: tuple = ()
+    names: tuple = ()
+    digest: str | None = None
+    refused: str | None = None
+
+
+def _json_kind(x) -> str:
+    if isinstance(x, str):
+        return f"the text {json.dumps(x[:40])}"
+    if isinstance(x, float):
+        return f"the number {x!r}"
+    return {dict: "an object", list: "a list", type(None): "null"}.get(type(x), f"a {type(x).__name__}")
+
+
+def judge_follow(raw) -> tuple[tuple[int, ...] | None, str | None]:
+    """The hypothesis ids of a broker book file's value: (ids, None), or (None, why) in words that say what to fix.
+    The value must be an object whose `follow` is a list of at least one whole number from 1, none repeated; its
+    other keys are allowed and ignored."""
+    if not isinstance(raw, dict):
+        return None, f"must be a JSON object such as {_EXAMPLE}, not {_json_kind(raw)}"
+    if "follow" not in raw:
+        return None, f'has no "follow" list of hypothesis ids (it should look like {_EXAMPLE})'
+    ids = raw["follow"]
+    if not isinstance(ids, list):
+        return None, f'"follow" must be a list of hypothesis ids such as {_EXAMPLE}, not {_json_kind(ids)}'
+    if not ids:
+        return None, '"follow" names no hypothesis: at least one id is needed'
+    seen: list[int] = []
+    for x in ids:
+        if type(x) is bool:
+            return None, '"follow" holds true or false; a hypothesis id is a whole number such as 26'
+        if type(x) is not int:
+            return None, f'"follow" holds {_json_kind(x)}; a hypothesis id is a whole number such as 26 (not 26.0 or "26")'
+        if not 1 <= x <= FOLLOW_ID_MAX:
+            return None, f'"follow" holds {x}; a hypothesis id is a whole number from 1'
+        if x in seen:
+            return None, f'"follow" names hypothesis {x} more than once'
+        seen.append(x)
+    return tuple(seen), None
+
+
+def _follow_problem(f) -> str | None:
+    """Why the step cannot follow `f` (refused, or not a well-formed Follow), or None."""
+    if type(f) is not Follow:
+        return f"the follow list given is not a Follow but {type(f).__name__}"
+    if f.refused is not None:
+        return str(f.refused)[:MAX_TEXT * 3] or "it is refused"
+    if type(f.ids) is not tuple or type(f.names) is not tuple:
+        return "its ids and names are not tuples"
+    if not f.ids:
+        return "it names no strategy"
+    if len(f.names) != len(f.ids):
+        return "its ids and names do not pair up"
+    if any(type(i) is not int or not 1 <= i <= FOLLOW_ID_MAX for i in f.ids) or len(set(f.ids)) != len(f.ids):
+        return "its ids are not distinct whole numbers from 1"
+    if not all(_plain(_NAME, n) for n in f.names) or len(set(f.names)) != len(f.names):
+        return "its names are not distinct plain strategy names"
+    if type(f.digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", f.digest):
+        return "it carries no digest of the file it was read from"
+    return None
+
+
+def _book_capital(paper: PaperTargets, follow) -> float:
+    """What the broker capital is spread over: the paper equity (the whole book), or the paper share of each
+    strategy followed."""
+    return float(paper.equity) if follow is None else float(paper.share) * len(follow)
+
+
+def targets(paper: PaperTargets, capital: float, follow=None) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """(per symbol, per strategy and symbol) target units at the broker: the paper's wanted units times
-    capital / paper equity."""
-    scale = float(capital) / float(paper.equity)
-    per_strategy = {s: {sym: float(u) * scale for sym, u in book.items()} for s, book in paper.wanted.items()}
+    capital / paper equity. With `follow` (strategy names), only those strategies, each on an equal part of the
+    capital: their wanted units times capital / (paper share x number followed)."""
+    scale = float(capital) / _book_capital(paper, follow)
+    per_strategy = {s: {sym: float(u) * scale for sym, u in book.items()} for s, book in paper.wanted.items()
+                    if follow is None or s in follow}
     per_symbol: dict[str, list[float]] = {}
     for book in per_strategy.values():
         for sym, u in book.items():
@@ -1033,10 +1134,22 @@ class TicketBook:
             return {"mode": "unreadable"}
         return mark if isinstance(mark, dict) else {"mode": "unreadable"}
 
-    def create(self, ticket: dict, lines: list[dict], live: dict | None = None) -> None:
+    def follow_mark(self, day: str, number: str) -> dict | None:
+        """A live ticket's broker book ({"digest": the follow list's digest, "ids": ..., "names": ...}, T32), or None
+        when the ticket has none ({} when it cannot be read)."""
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (f"broker_book:{day}:{number}",)).fetchone()
+        if row is None:
+            return None
+        try:
+            mark = json.loads(row[0])
+        except ValueError:
+            return {}
+        return mark if isinstance(mark, dict) else {}
+
+    def create(self, ticket: dict, lines: list[dict], live: dict | None = None, follow: dict | None = None) -> None:
         """Write a ticket and its lines, and mark every earlier unused ticket of the same venue and account superseded,
-        in one transaction: only the latest ticket is live. A live ticket also gets its mark (`live`) in the meta
-        table, in the same transaction."""
+        in one transaction: only the latest ticket is live. A live ticket also gets its mark (`live`) and the broker
+        book it follows (`follow`, T32) in the meta table, in the same transaction."""
         cols = ("day", "number", "created", "expires", "venue", "environment", "account", "capital", "fractional", "equity",
                 "cash", "settled_cash", "batch")
         with self._write():
@@ -1054,6 +1167,9 @@ class TicketBook:
             if live is not None:
                 self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
                                  (f"live:{ticket['day']}:{ticket['number']}", json.dumps(live, sort_keys=True)))
+            if follow is not None:
+                self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                 (f"broker_book:{ticket['day']}:{ticket['number']}", json.dumps(follow, sort_keys=True)))
 
     def mark_used(self, day: str, number: str, batch: str) -> None:
         """Mark the ticket used by `batch`; refused (OrderStepError) when it already has a fate."""
@@ -1244,7 +1360,7 @@ _ABSENT = object()
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
-                   approve: str | None = None, live=None, second_opinion=None) -> dict:
+                   approve: str | None = None, live=None, second_opinion=None, follow=None) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
@@ -1252,10 +1368,16 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     `propose` writes a ticket instead of sending; `approve` (the ticket's number) sends only what that ticket holds.
     `live` (a go_live.LiveFiles, with propose or approve and a capital) is live mode: Webull's production environment
     under the four locks of the go-live gate; `second_opinion` is the second price source's verdict function
-    (default: second_quote.second_opinion), asked only in live mode."""
+    (default: second_quote.second_opinion), asked only in live mode. `follow` (a Follow: config/broker_book.json as
+    the command line reads it, T32) makes the broker book follow only the strategies it names; None follows the
+    whole book, except in live mode, which stops without one."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
+    if follow is not None:
+        run.follow, run.follow_problem = follow, _follow_problem(follow)
+        if run.follow_problem is None:
+            run.follow_names = follow.names
     if live is not None:
         run.live = live
         run.expected_env = LIVE_ENVIRONMENT
@@ -1322,8 +1444,23 @@ class _Run:
         self.account = None
         self.dropped: list[dict] = []
         self.capital_used = None
+        self.follow = None                               # T32: the Follow given (None: the whole book)
+        self.follow_problem = None                       # why it cannot be followed, or None
+        self.follow_names: tuple | None = None           # the strategies followed, once the Follow is well formed
 
     # -- helpers
+    def _follow_view(self) -> dict:
+        return {"ids": list(self.follow.ids), "names": list(self.follow.names)}
+
+    def _live_follow(self) -> str | None:
+        """Live mode: why the run cannot follow what it was given (it never follows the whole book), or None."""
+        if self.follow is None:
+            return ("the broker book (config/broker_book.json) was not read: live mode follows only the strategies "
+                    f"that file names (such as {_EXAMPLE}) and never follows the whole book by default")
+        if self.follow_problem is not None:
+            return f"the broker book's follow list: {self.follow_problem}"
+        return None
+
     def _write(self, entry: dict) -> None:
         if not self._locked:                             # a run without the lock writes nothing anywhere
             raise RuntimeError("the order step wrote to the journal without holding the lock")
@@ -1411,6 +1548,8 @@ class _Run:
                 self._check_events_class()               # ... an account class only a property gives, read now
                 self.paper_read = self._paper()          # 5, read now: a stale book stops before any venue call
                 self._paper_day(self.paper_read)
+                if self.follow_problem is not None:      # T32: a follow list that cannot be followed stops here
+                    raise _Stop("follow", f"the broker book's follow list: {self.follow_problem}; nothing is sent")
             except _Stop as stop:
                 return self._finish("stopped", stop.stage, stop.reason)
             try:
@@ -1457,8 +1596,11 @@ class _Run:
                 raise _Stop("targets", f"the capital must be a positive finite number, not {capital!r}")
             self.capital_used = float(capital)
             self.paper_equity = paper.equity
-            self.target_units, per_strategy = targets(paper, float(capital))
-            min_value = paper.min_trade_pct * paper.share * float(capital) / paper.equity
+            self.target_units, per_strategy = targets(paper, float(capital), self.follow_names)
+            if self.follow_names is None:
+                min_value = paper.min_trade_pct * paper.share * float(capital) / paper.equity
+            else:                                        # T32: the smallest trade at the followed strategies' scale
+                min_value = paper.min_trade_pct * paper.share * float(capital) / _book_capital(paper, self.follow_names)
             prices, why_not = self._prices(sorted(set(self.target_units) | set(book) | set(baseline)), now)   # 6
             cash = self._cash()
         except _Stop as stop:
@@ -1496,6 +1638,8 @@ class _Run:
         try:
             self.locks = go_live.judge_locks(self.live, date.fromisoformat(self.day), self.capital)
             why = self.locks.unmet()
+            if why is None:                              # T32: the broker book file, judged with the locks
+                why = self._live_follow()
         except Exception as exc:
             why = f"the locks could not be judged: {_describe(exc)}"
         if why is None or self.mode != "approve":
@@ -1643,6 +1787,10 @@ class _Run:
             if mark.get("files") != self.locks.digest:
                 self._refuse_ticket("the owner's files (the confirmation, the checklist or the limits) changed since that "
                                     "ticket was made")
+            follow = book.follow_mark(t["day"], t["number"])     # T32: the broker book it was made to follow
+            if not isinstance(follow, dict) or follow.get("digest") != self.follow.digest:
+                self._refuse_ticket("the broker book's follow list (config/broker_book.json, or the strategies it names) "
+                                    "changed since that ticket was made")
         if self._ticket_expired(now, t):
             try:
                 book.mark_expired(t["day"], t["number"], self.batch)
@@ -1679,15 +1827,22 @@ class _Run:
                   "fractional": int(self.fractional), "equity": self.broker_equity, "cash": self.cash_read,
                   "settled_cash": self.settled_cash, "batch": self.batch}
         mark = None if self.live is None else {"mode": "live", "files": self.locks.digest}
-        self.tickets.create(ticket, self.ticket_lines, live=mark)
+        if self.live is None:
+            self.tickets.create(ticket, self.ticket_lines, live=mark)
+        else:                                            # T32: a live ticket is bound to the broker book it follows
+            self.tickets.create(ticket, self.ticket_lines, live=mark,
+                                follow={"digest": self.follow.digest, **self._follow_view()})
         self.ticket, self.ticket_number_made = ticket, number
         self._write({"event": "ticket", **self._ticket_view()})
 
     def _ticket_view(self) -> dict:
         t = self.ticket
-        return {"number_ends": t["number"][-2:], "orders": [dict(ln) for ln in self.ticket_lines], "equity": t["equity"],
+        view = {"number_ends": t["number"][-2:], "orders": [dict(ln) for ln in self.ticket_lines], "equity": t["equity"],
                 "cash": t["cash"], "settled_cash": t["settled_cash"], "created": _iso(t["created"]),
                 "expires": _iso(t["expires"])}
+        if self.follow_names is not None:                # T32: what the proposal follows
+            view["follow"] = self._follow_view()
+        return view
 
     def _line(self, c: dict) -> dict:
         return next(ln for ln in self.ticket_lines if ln["line"] == c["line"])
@@ -2492,6 +2647,8 @@ class _Run:
                    "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines,
                    "cash": self.cash_read, "settled_cash": self.settled_cash,
                    "purchases_left_unsettled": self.purchases_left_unsettled}
+        if self.follow_names is not None:                # T32: which strategies the broker book followed
+            summary["follow"] = self._follow_view()
         corrections = []
         if self._locked:                                 # every used ticket mirrors the order ledger as it now is
             try:

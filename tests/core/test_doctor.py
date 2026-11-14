@@ -256,7 +256,8 @@ def test_the_doctor_judges_through_the_locks_own_functions(live_repo, monkeypatc
     monkeypatch.setattr(go_live, "read_owner_file", webull.read_owner_file)
     _owner(live_repo, "webull_live.json", _confirmation())
     _venues(live_repo)
-    assert len(seen) == 1 and sorted(p.name for p in reads) == ["go_live.json", "risk.json", "webull_live.json"]
+    assert len(seen) == 1 and sorted(p.name for p in reads) == ["broker_book.json", "go_live.json", "risk.json",
+                                                                "webull_live.json"]   # T32: and the broker book file
 
 
 @pytest.mark.parametrize("how", ["missing", "not json", "duplicate key", "group-writable", "symlink", "hard link",
@@ -310,3 +311,187 @@ def test_the_doctor_says_off_when_the_locks_cannot_be_judged(live_repo, monkeypa
     monkeypatch.setattr(go_live, "judge_locks", lambda *a, **k: (_ for _ in ()).throw(RuntimeError(APP_KEY)))
     status, detail = _venues(live_repo)
     assert "real-money orders off" in detail and "could not be judged" in detail
+
+
+# ---- T32: the live-mode note says which strategies the broker book follows, or that config/broker_book.json is
+# missing or refused and that live mode would stop for that, through the reading function the order step is given
+
+def _ledger_with(repo, name="hold_rebalance_etf_2006_2026"):
+    from valedia_trader.research_loop import ledger as lg
+    led = lg.HypothesisLedger(repo / "memory" / "ledger.db")
+    try:
+        hid = led.propose("Hold a fixed basket and rebalance it", "test", "us-etf+crypto")
+    finally:
+        led.close()
+    (repo / "strategies").mkdir(exist_ok=True)
+    (repo / "strategies" / f"{name}_h{hid}.json").write_text(json.dumps({
+        "name": name, "version": "1.0.0", "hypothesis": "Hold a fixed basket and rebalance it", "market": ["SPY", "TLT"],
+        "entry": {"rule": "momentum", "lookback": 10, "enter": 0.03, "exit": 0.0, "direction": "both"},
+        "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.5, "max_open_positions": 2, "stop_loss_pct": None}}))
+    return hid
+
+
+def test_the_doctor_says_the_broker_book_file_is_missing_and_that_live_mode_would_stop(live_repo):
+    before = _tree(live_repo)
+    status, detail = _venues(live_repo)
+    assert "broker book: config/broker_book.json is missing" in detail and "live mode would stop for that" in detail
+    assert "never follows the whole book" in detail
+    assert _tree(live_repo) == before
+
+
+def test_the_doctor_says_which_strategies_the_broker_book_follows(live_repo):
+    hid = _ledger_with(live_repo)
+    _owner(live_repo, "broker_book.json", {"follow": [hid]})
+    before = _tree(live_repo)
+    status, detail = _venues(live_repo)
+    assert "broker book: follows 1 strategy: hold_rebalance_etf_2006_2026 (" in detail
+    assert f"hypothesis {hid}" not in detail                  # A1: the ids are the file's values; the names are not
+    assert "live mode would stop" not in detail
+    assert _tree(live_repo) == before
+
+
+@pytest.mark.parametrize("value, words", [({"follow": [True]}, "true or false"), ({"follow": []}, "at least one"),
+                                          ({"follow": [42]}, "names a hypothesis the research ledger does not hold"),
+                                          ('{"follow": [1], "follow": [2]}', "repeats a key")])
+def test_the_doctor_says_a_refused_broker_book_file_would_stop_live_mode(live_repo, value, words):
+    _ledger_with(live_repo)
+    _owner(live_repo, "broker_book.json", value)
+    status, detail = _venues(live_repo)
+    assert "broker book: not followed: config/broker_book.json " in detail and words in detail
+    assert "live mode would stop for that" in detail
+    assert "42" not in detail.split("broker book: ")[1]       # A1: no id from the file
+
+
+def test_the_doctor_reads_the_broker_book_through_the_order_steps_reading_function(live_repo, monkeypatch):
+    from valedia_trader.research_loop import cli
+    seen = []
+    real = cli.broker_book_follow
+    monkeypatch.setattr(cli, "broker_book_follow", lambda *a, **k: seen.append(k) or real(*a, **k))
+    _venues(live_repo)
+    assert seen == [{"live": True}]
+
+
+def test_the_doctor_never_makes_the_research_ledger_to_read_the_broker_book(live_repo):
+    _owner(live_repo, "broker_book.json", {"follow": [26]})
+    status, detail = _venues(live_repo)
+    assert "the research ledger (memory/ledger.db) is missing" in detail and "live mode would stop" in detail
+    assert not (live_repo / "memory").exists()
+
+
+# ---- T32 addendum A1: the doctor prints nothing taken from inside an owner file (no key name, no value, no piece of
+# 5 characters or more of either); an unknown key is counted, not named. A2: what is judged only at a proposal.
+
+PLANTED = {"account": "U83719464851", "key": "AKIAQ7XLMNBVZ9TT4P", "token": "tok_9fQLxm7Rk4Wb8ZpHs6"}
+NUMBER = 83719464851                                    # an account number typed as a number
+SMALL = 83719                                           # a piece of it that a checklist number can hold (<= 100,000)
+
+
+def _pieces(text):
+    return {text[i:i + 5] for i in range(len(text) - 4)}
+
+
+def _plants():
+    """(file, value) pairs: each planted text as a key name and as a value, and the account number as a number, in
+    each of the four owner files."""
+    out = []
+    for what, s in PLANTED.items():
+        out += [("webull_live.json", _confirmation(**{s: 1})), ("webull_live.json", _confirmation(note=s)),
+                ("webull_live.json", _confirmation(confirmed_by=s)), ("webull_live.json", _confirmation(account_class=s)),
+                ("webull_live.json", _confirmation(valid_until=s)), ("webull_live.json", {"account_id": s}),
+                ("go_live.json", {**CHECKLIST, s: 1}), ("go_live.json", {**CHECKLIST, "confirmed_by": s}),
+                ("go_live.json", {**CHECKLIST, "note": s}), ("go_live.json", {s: CHECKLIST}),
+                ("risk.json", {**LIMITS, s: 1}), ("risk.json", {**LIMITS, "max_drawdown_pct": s}),
+                ("broker_book.json", {"follow": [1], s: 1}), ("broker_book.json", {"follow": [1], "note": s}),
+                ("broker_book.json", {"follow": [s]}), ("broker_book.json", {"follow": s}), ("broker_book.json", {s: [1]}),
+                ("broker_book.json", {"follow": {s: 1}})]
+    out += [("webull_live.json", _confirmation(max_capital=NUMBER)), ("webull_live.json", _confirmation(max_order_value=NUMBER)),
+            ("webull_live.json", _confirmation(valid_until="2026-11-02")),
+            ("go_live.json", {**CHECKLIST, "min_paper_broker_days": SMALL}),
+            ("go_live.json", {**CHECKLIST, "min_reconciled_fills": SMALL, "min_fills_checked_by_hand": SMALL,
+                              "min_days_since_a_stopped_run": SMALL}),
+            ("risk.json", {**LIMITS, "max_open_positions": NUMBER}), ("risk.json", {**LIMITS, "max_drawdown_pct": 8.37194}),
+            ("risk.json", {**LIMITS, "max_orders_per_day": NUMBER}),
+            ("broker_book.json", {"follow": [837194648]}), ("broker_book.json", {"follow": [1, 837194648]}),
+            ("broker_book.json", {"follow": [837194648, 837194648]}), ("broker_book.json", {"follow": [8.37194]}),
+            ("broker_book.json", {"follow": [-837194648]})]
+    return out
+
+
+@pytest.mark.parametrize("name, value", _plants(), ids=lambda x: x if isinstance(x, str) else None)
+def test_t32_a1_nothing_from_inside_an_owner_file_reaches_the_doctors_output(live_repo, monkeypatch, name, value):
+    for n, v in SECOND.items():
+        monkeypatch.setenv(n, v)
+    _ledger_with(live_repo)
+    _paper_record(live_repo)
+    files = {"webull_live.json": _confirmation(), "go_live.json": CHECKLIST, "risk.json": LIMITS,
+             "broker_book.json": {"follow": [1]}}
+    files[name] = value
+    for n, v in files.items():
+        _owner(live_repo, n, v)
+    rows = D.run(live_repo, only=("risk limits", "venues"))
+    out = json.dumps(rows) + "\n".join(f"{r['status']} {r['check']} {r['detail']}" for r in rows)
+    assert len(rows) == 2 and "broker book: " in out
+    candidates = [*PLANTED.values(), str(NUMBER), str(SMALL), "837194648", "8.37194", "2026-11-02"]
+    planted = [s for s in candidates if s in json.dumps(value)]
+    assert planted
+    for s in planted:
+        hits = sorted(p for p in _pieces(s) if p in out)
+        assert not hits, (s, hits)
+
+
+@pytest.mark.parametrize("name, base, n", [("webull_live.json", _confirmation(), 1), ("webull_live.json", _confirmation(), 3),
+                                           ("webull_live.json", _confirmation(), 12), ("go_live.json", CHECKLIST, 1),
+                                           ("go_live.json", CHECKLIST, 3), ("go_live.json", CHECKLIST, 12)])
+def test_t32_a1_an_unknown_key_is_counted_not_named(live_repo, name, base, n):
+    keys = [f"{PLANTED['token']}{i}" for i in range(n)]
+    _owner(live_repo, "webull_live.json", _confirmation())
+    _owner(live_repo, name, {**base, **{k: 1 for k in keys}})
+    status, detail = _venues(live_repo)
+    lock = "lock 1 (the confirmation)" if name == "webull_live.json" else "lock 2 (the checklist)"
+    assert f"{lock} not met: config/{name} holds {n} unknown key{'s' if n != 1 else ''} " in detail
+    assert not [p for p in _pieces(PLANTED["token"]) if p in detail]
+
+
+def test_t32_a1_the_lock_judges_reasons_to_the_order_step_are_unchanged(live_repo):
+    from valedia_trader.execution_and_risk import go_live
+    from valedia_trader.venues import webull
+    s = PLANTED["token"]
+    _owner(live_repo, "webull_live.json", _confirmation(**{s: 1}))
+    _owner(live_repo, "go_live.json", {**CHECKLIST, s: 1})
+    state = go_live.judge_locks(go_live.LiveFiles(environ={}), webull.ny_date())
+    assert s in state.locks[0]["reason"] and s in state.locks[1]["reason"]     # the order step still names the key
+
+
+def test_t32_a1_a_short_paper_record_names_what_is_short_not_the_owners_figures(live_repo):
+    _owner(live_repo, "go_live.json", {**CHECKLIST, "min_paper_broker_days": SMALL, "min_reconciled_fills": 4,
+                                       "fills_checked_by_hand": 0})
+    _paper_record(live_repo)
+    status, detail = _venues(live_repo)
+    assert "lock 2 (the checklist) not met: the paper record is short of config/go_live.json on: " in detail
+    assert "paper trading days on which the order step ended done (1 so far)" in detail
+    assert "fills journaled in paper runs with a clean reconcile (1 so far)" in detail
+    assert "fills checked by hand" in detail and "stopped paper run" not in detail
+    assert str(SMALL) not in detail and "needed" not in detail
+
+
+def test_t32_a1_the_risk_limits_are_shown_only_when_short(tmp_path):
+    p = _paths(tmp_path)
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_drawdown_pct": 6.0}))
+    status, detail = D.check_risk_limits(p)
+    assert status == D.OK and "drawdown 6.0%" in detail
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_open_positions": NUMBER,
+                                         "max_daily_loss_pct": 1.23456}))
+    status, detail = D.check_risk_limits(p)
+    assert status == D.OK and str(NUMBER)[:5] not in detail and "1.234" not in detail
+    assert "positions not shown" in detail and "daily loss not shown" in detail
+
+
+def test_t32_a2_the_proposal_only_list_names_the_capital_the_money_at_work_and_the_environment_names(live_repo):
+    status, detail = _venues(live_repo)
+    proposal = detail.split("judged only when a batch is proposed and again when it is approved: ")[1]
+    assert "the capital given with --capital against the confirmation's max_capital" in proposal
+    assert "the money at work (what the account holds plus the batch's buys) against max_capital" in proposal
+    assert "WEBULL_ENV and WEBULL_ACCOUNT_CLASS are read when the venue is built" in proposal
+    for old in ("lock 4 (the ticket)", "the account the venue will trade against the confirmation's class and last 4",
+                "each order's value against max_order_value", "both second price sources agreeing on each price"):
+        assert old in proposal

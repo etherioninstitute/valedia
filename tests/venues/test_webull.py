@@ -3272,3 +3272,31 @@ def test_in_the_test_environment_a_malformed_price_behaves_as_before(tmp_path, p
     v, client = venue(tmp_path)
     out = v.submit("SPY", 1.0, "t", price=price)
     assert out["environment"] == "sandbox" and len(client.placed()) == 1
+
+
+# ==== T32 addendum 1, A3 (V105 N1): with no confirmation the refusal says so, whatever the price; a value that
+# overflows is refused as too large
+
+@pytest.mark.parametrize("bad", [True, "100", b"100", None, float("nan"), 0.0, -5.0, 10 ** 400, _FloatSub(1.0)])
+@pytest.mark.parametrize("field", ["price", "limit_price"])
+def test_in_production_with_no_confirmation_a_bad_price_is_refused_as_unconfirmed_not_for_its_price(tmp_path, bad, field):
+    v, client = venue(tmp_path, env="production")                       # no config/webull_live.json written
+    assert not (tmp_path / "config" / "webull_live.json").exists()
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="the owner has not written config/webull_live.json") as exc:
+        v.submit("SPY", 1.0, "t", **{field: bad})
+    assert "price" not in str(exc.value) and "dollar value" not in str(exc.value)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("field", ["price", "limit_price"])
+@pytest.mark.parametrize("units, price", [(10.0, 1.7e308), (-3.0, 1e308), (2.0, 9e307)])
+def test_in_production_a_quantity_times_price_that_overflows_is_refused_as_too_large(tmp_path, field, units, price):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())                                        # a valid confirmation, cap 1000
+    assert price < float("inf") and abs(units) * price == float("inf")
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="known dollar value") as exc:
+        v.submit("SPY", units, "t", **{field: price})
+    assert "the order's value (quantity times price) is too large" in str(exc.value)
+    assert client.calls == []
+    value, why = wb._live_order_value(units, price)
+    assert value is None and "too large" in why
