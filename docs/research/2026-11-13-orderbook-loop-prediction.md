@@ -242,3 +242,14 @@ already does; neither was chosen with data in sight.
 37. **"The first for its market and slot"** (clarifications 1 and 29) is the first ORDINARY row with answers under
     the battery in force. A late or forced row for the same market and slot, before or after it, is not scored
     and does not take its place.
+
+## Collector replaced during the development period (2026-11-14, written at 10:55 UTC before the restart; no answer has been scored)
+
+Under note 4 above. The collector's requests to Kalshi named the owner's project in their `User-Agent` header
+(`valedia-trader-research/1.0`). On the owner's instruction of 2026-11-14 the header becomes
+`market-data-reader/1.0`. The pinned copy goes from commit 9332c6c to 9332c6c plus that one commit (d4f4713 on
+its branch, b92a9f0 on main): one constant in `valedia_trader/venues/kalshi_data.py`. A blind check (V106)
+confirmed the commit changes that constant and nothing else, and that every request of the reader carries
+exactly the new header. What is asked, how often, the questions put to the model and what is stored do not
+change. The replacement is one restart of the collector, the stop and the start both in the store; any decision
+slot lost in that minute is counted as lost like any other. The test period still runs on one revision.
