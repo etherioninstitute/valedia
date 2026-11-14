@@ -76,6 +76,12 @@ checks the test environment gets today, and the host must be exactly Webull's pr
 are checked before anything is read from the account. Whole shares only. The account must be of the class the
 confirmation names (stocks and funds: Individual Cash; event contracts have no live mode).
 
+Live mode runs only from the repository the program itself lives in: the three owner files are read from that
+repository's `config/` folder and the paper record from its `journal/`, and no argument or environment setting
+moves them (settled 2026-11-13 after the blind check of live mode: the `--root` argument could point all of them
+at another folder). A paper run that was killed before it wrote its summary leaves no entry, so the checklist does
+not count it as a stopped run (a known limit).
+
 The paper mode is unchanged byte for byte: the scheduled paper job keeps running without tickets. The ticket
 flow can also be switched on in the test environment (`--propose` / `--approve` without `--live`), so the owner
 can practise it on paper before any real order.
