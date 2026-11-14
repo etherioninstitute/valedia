@@ -30,8 +30,16 @@ The limits hold across any kill. Before any request leaves, a row saying it is a
 official burst, page counts, Kalshi's minutes, back-offs) is rebuilt from those rows and from the answers stored,
 and a request whose answer never came gets an outcome row "unknown", appended. Every request has a whole-answer
 deadline (connection, headers and body together) after which its socket is shut: no request thread outlives it.
+TLS trusts one certificate bundle, a path fixed here (the system's /etc/ssl/cert.pem, else certifi's; with neither
+the run does not start), certificate and host name always verified; no environment variable changes it. A body
+shorter than its Content-Length, or a Content-Length that is not one plain number, is a bad answer.
 
-Text written by Reddit users is untrusted data. It is stored exactly as received (the raw answer by hash, zlib-compressed, the text
+Coverage is Clarification 3 for whole UTC days: from the day of the first run on, every day's slots are expected
+(7,200 price slots; 624 public or 1,440 official comment slots), time nobody was recording uncovered, and a day
+not yet ended never counts. The body of a bad answer (unreadable, refused, over the limit, failed) is not stored,
+only its hash, size, status and reason, so bad answers cannot grow the store faster than good ones.
+
+Text written by Reddit users is untrusted data. It is stored exactly as received (a good raw answer by hash, zlib-compressed, the text
 per version) and is never executed, passed to a shell, a template, a format string or a model, and never printed:
 `run`, `status` and `check` print counts, ids and times only, and no failure text carries any of it. Nothing from
 the trading secrets file is loaded, read or sent (this module has no code that loads any secrets file), and it starts no child process.
@@ -41,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import email.utils
 import fcntl
 import hashlib
@@ -101,7 +110,11 @@ MAX_ABANDONED = 4                 # with this many timed-out requests of one ser
 KALSHI_MAX_PAGES = 10             # cursor pages of one series in one minute, at most
 KALSHI_SPACING_S = 1.0 / 3.0 + 0.01   # never more than three Kalshi requests in a second
 INTENT_MARGIN_S = 1.0             # a request known only by its row is taken as sent this much after the row's time
+KALSHI_INTENT_MARGIN_S = 0.05     # a Kalshi request known only by its row is taken as sent this much after the row's time
 CURSOR = re.compile(r"[A-Za-z0-9_]{1,64}")    # the only official-interface cursor accepted
+TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")    # the only token accepted: visible ASCII, no space, at most 4,096 long
+CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")    # a Content-Length is a plain number ...
+SYSTEM_BUNDLE = "/etc/ssl/cert.pem"   # the one trust store (else certifi's bundle): never one the environment names
 SKIP_AFTER_FRACTION = 0.5         # a slot more than half over is skipped
 TOKEN_REFRESH_EARLY_S = 300.0
 MAX_SKIP_ROWS = 20                # skipped slots of one stall are recorded as at most this many rows (the rest as a count)
@@ -112,7 +125,8 @@ HEARTBEAT_S = 3600.0              # a line of counts on standard output this oft
 # ------------------------------------------------------------------------------------------------ the store
 TABLES = ("runs", "payloads", "comments", "comment_versions", "comment_fetches", "comment_events", "price_fetches",
           "prices", "price_events", "requests")
-LAYOUT = 3                        # PRAGMA user_version (2: raw answers kept zlib-compressed; 3: a row before every request)
+LAYOUT = 4                        # PRAGMA user_version (2: raw answers kept zlib-compressed; 3: a row before every request;
+                                  # 4: a bad answer's hash and size in place of its body)
 APP_ID = 0x43484154               # PRAGMA application_id: "CHAT"
 LOCK_SUFFIX = ".lock"
 
@@ -131,12 +145,14 @@ CREATE TABLE comment_fetches (id INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL, 
     backend TEXT NOT NULL, purpose TEXT NOT NULL CHECK (purpose IN ('feed', 'token')), page INTEGER NOT NULL,
     status INTEGER, ok INTEGER NOT NULL, failure TEXT, payload_id INTEGER, comments_in_feed INTEGER,
     new_comments INTEGER NOT NULL DEFAULT 0, new_versions INTEGER NOT NULL DEFAULT 0, bad_entries INTEGER NOT NULL DEFAULT 0,
-    duplicates INTEGER NOT NULL DEFAULT 0, rate_remaining REAL, rate_reset REAL, request_id INTEGER);
+    duplicates INTEGER NOT NULL DEFAULT 0, rate_remaining REAL, rate_reset REAL, request_id INTEGER, body_sha256 TEXT,
+    body_size INTEGER);   -- body_sha256 and body_size: of the answer received, kept or not (a bad answer's body is not kept)
 CREATE TABLE comment_events (id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, slot_ts INTEGER, until TEXT,
     count INTEGER, detail TEXT);
 CREATE TABLE price_fetches (id INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL, slot_ts INTEGER NOT NULL, series TEXT NOT NULL,
     ok INTEGER NOT NULL, failure TEXT, markets_seen INTEGER NOT NULL DEFAULT 0, rows_stored INTEGER NOT NULL DEFAULT 0,
-    bad_rows INTEGER NOT NULL DEFAULT 0, payload_id INTEGER, request_id INTEGER);
+    bad_rows INTEGER NOT NULL DEFAULT 0, payload_id INTEGER, request_id INTEGER, status INTEGER, body_sha256 TEXT,
+    body_size INTEGER);
 CREATE TABLE prices (id INTEGER PRIMARY KEY, fetch_id INTEGER NOT NULL, seen_at TEXT NOT NULL, series TEXT NOT NULL,
     ticker TEXT NOT NULL, event_ticker TEXT, yes_bid REAL, yes_ask REAL, last_price REAL, volume REAL, open_interest REAL,
     yes_bid_size REAL, yes_ask_size REAL, status TEXT, note TEXT);
@@ -384,6 +400,8 @@ class Fetch:
     rate_remaining: float | None = None
     rate_reset: float | None = None
     request_id: int | None = None      # the row committed before the request left (None when nothing was sent)
+    body_sha256: str | None = None     # of the answer received, when its body is not kept (a bad answer's is not)
+    body_size: int | None = None
 
 
 @dataclass
@@ -760,7 +778,8 @@ class Store:
         # in, and the tables' own triggers keep each table's times in order
         with self.writing(iso(max(times))):
             good = [f for f in fetches if f.purpose == "feed" and f.failure is None and f.entries is not None]
-            miss_event = self._possible_miss(good, max(f.at for f in fetches) if fetches else None)
+            marked = any(e.kind == "possible_miss" for e in events)        # the slot's caller marked it already
+            miss_event = None if marked else self._possible_miss(good, max(f.at for f in fetches) if fetches else None)
             for f in fetches:
                 fid, nc, nv = self._save_fetch(f)
                 out["fetch_ids"].append(fid)
@@ -801,6 +820,7 @@ class Store:
         now = iso(f.at)
         kind = "reddit_" + f.backend if f.purpose == "feed" else "reddit_token_" + f.backend
         pid = self._payload(kind, f.body, now) if f.body is not None else None
+        digest, size = (sha256_bytes(f.body), len(f.body)) if f.body is not None else (f.body_sha256, f.body_size)
         fid = self.conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM comment_fetches").fetchone()[0]
         new_comments = new_versions = dups = 0
         if f.failure is None and f.entries is not None:
@@ -814,11 +834,11 @@ class Store:
                 new_versions += nv
         self.conn.execute(
             "INSERT INTO comment_fetches (id, fetched_at, slot_ts, backend, purpose, page, status, ok, failure, payload_id, "
-            "comments_in_feed, new_comments, new_versions, bad_entries, duplicates, rate_remaining, rate_reset, request_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "comments_in_feed, new_comments, new_versions, bad_entries, duplicates, rate_remaining, rate_reset, request_id, "
+            "body_sha256, body_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (fid, now, f.slot, f.backend, f.purpose, f.page, f.status, 1 if f.failure is None else 0, f.failure, pid,
              len(f.entries) if f.entries is not None else None, new_comments, new_versions, f.bad_entries, dups,
-             f.rate_remaining, f.rate_reset, f.request_id))
+             f.rate_remaining, f.rate_reset, f.request_id, digest, size))
         return fid, new_comments, new_versions
 
     def _save_entry(self, e: Entry, fetch_id: int, now: str) -> tuple[int, int]:
@@ -854,7 +874,8 @@ class Store:
         return out
 
     def save_price_fetch(self, *, series: str, slot: int, at: float, failure: str | None, markets: list, seen: int,
-                         bad_rows: int, body: bytes | None, request_id: int | None = None) -> int:
+                         bad_rows: int, body: bytes | None, request_id: int | None = None, status: int | None = None,
+                         body_sha256: str | None = None, body_size: int | None = None) -> int:
         """One Kalshi read of one series: a row for the fetch, and one row per market whose bid, ask or last price
         differs from its latest stored row (or that has none). Returns the number of market rows stored. `body` is
         the raw answer, kept only when it could not be read; `request_id` the row of its first request (None when
@@ -864,6 +885,8 @@ class Store:
             self._last_quote = self._load_last_quotes()
         with self.writing(now):
             pid = self._payload("kalshi_unread", body, now) if body is not None else None
+            if body is not None:
+                body_sha256, body_size = sha256_bytes(body), len(body)
             fid = self.conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM price_fetches").fetchone()[0]
             stored, fresh = 0, {}
             if failure is None:
@@ -885,9 +908,9 @@ class Store:
                     stored += 1
             self.conn.execute(
                 "INSERT INTO price_fetches (id, fetched_at, slot_ts, series, ok, failure, markets_seen, rows_stored, bad_rows, payload_id, "
-                "request_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "request_id, status, body_sha256, body_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (fid, now, slot, series, 1 if failure is None else 0, failure, seen if failure is None else 0, stored, bad_rows, pid,
-                 request_id))
+                 request_id, status, body_sha256, body_size))
         self._last_quote.update(fresh)                        # only after the commit
         return stored
 
@@ -936,11 +959,11 @@ class Response:
 
 
 class TooLarge(Exception):
-    """A Kalshi answer longer than MAX_BODY. `body` is what was read (MAX_BODY bytes), kept as its raw answer."""
+    """A Kalshi answer longer than MAX_BODY. `body` is what was read (MAX_BODY bytes): its hash and size are recorded."""
 
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, status: int | None = None):
         super().__init__("an answer longer than %d bytes" % MAX_BODY)
-        self.body = body
+        self.body, self.status = body, status
 
 
 _ABANDONED: dict[str, list] = {}         # per service: requests given up on whose thread has not ended yet
@@ -1000,15 +1023,55 @@ class _Abort:
                 pass
 
 
-_SSL_CONTEXT: ssl.SSLContext | None = None     # None: the system's default context, verifying certificate and host
+class NoTrustStore(Exception):
+    """Neither the system's certificate bundle nor certifi's is there: nothing can be verified, nothing is asked."""
+
+
+class BadLength(ValueError):
+    """An answer whose body is not what its Content-Length states (shorter, or a length that is not a plain number)."""
+
+
+_SSL_CONTEXT: ssl.SSLContext | None = None     # None: the module's own context (_make_context over _trust_bundle)
 _SSL_DEFAULT: list = []
+
+
+def _certifi_bundle() -> str | None:
+    try:
+        import certifi
+        p = certifi.where()
+    except Exception:
+        return None
+    return p if isinstance(p, str) and os.path.isfile(p) else None
+
+
+def _trust_bundle() -> str:
+    """The one certificate bundle the transport trusts: the system's SYSTEM_BUNDLE, else certifi's. A path fixed in
+    the code: SSL_CERT_FILE, SSL_CERT_DIR and every other variable change nothing. Raises NoTrustStore."""
+    if os.path.isfile(SYSTEM_BUNDLE):
+        return SYSTEM_BUNDLE
+    p = _certifi_bundle()
+    if p:
+        return p
+    raise NoTrustStore("no certificate bundle to verify servers with (neither %s nor certifi's): nothing is asked"
+                       % SYSTEM_BUNDLE)
+
+
+def _make_context(cafile: str) -> ssl.SSLContext:
+    """A client context trusting `cafile` alone: the certificate and the host name are always verified, TLS 1.2 at
+    least. Nothing here loads the default paths, so nothing reads the environment."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    ctx.load_verify_locations(cafile=cafile)
+    return ctx
 
 
 def _ssl_context() -> ssl.SSLContext:
     if _SSL_CONTEXT is not None:
         return _SSL_CONTEXT
     if not _SSL_DEFAULT:
-        _SSL_DEFAULT.append(ssl.create_default_context())
+        _SSL_DEFAULT.append(_make_context(_trust_bundle()))
     return _SSL_DEFAULT[0]
 
 
@@ -1017,7 +1080,8 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
     reads the environment), no redirect followed (a 3xx comes back as it is), no cookie, no header but those given,
     Host, and Content-Length when there is a body. The whole answer, connection, TLS, headers and body together, is
     bounded by `timeout`: then the socket is shut and TimeoutError raised. At most MAX_BODY bytes of the body are
-    kept; a longer answer comes back `truncated`."""
+    kept; a longer answer, or one whose Content-Length states more, comes back `truncated`. A body shorter than its
+    Content-Length, or a Content-Length that is not one plain number, raises BadLength. TLS trusts one bundle only."""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("not an http address")
@@ -1054,13 +1118,24 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
             conn.endheaders(data)
             r = conn.getresponse()
             status, hd = r.status, {k.lower(): v for k, v in r.getheaders()}
+            stated = r.msg.get_all("content-length") or []
+            if len(stated) > 1 or (stated and not CONTENT_LENGTH.fullmatch(stated[0])):
+                raise BadLength("not one plain Content-Length")
+            length = int(stated[0]) if stated else None
+            if length is not None and length > MAX_BODY:
+                return Response(status, hd, b"", True)      # more than the limit stated: not read at all
             body = bytearray()
-            while len(body) <= MAX_BODY:
-                sock.settimeout(left())
-                chunk = r.read(min(65536, MAX_BODY + 1 - len(body)))
-                if not chunk:
-                    break
-                body += chunk
+            try:
+                while len(body) <= MAX_BODY:
+                    sock.settimeout(left())
+                    chunk = r.read(min(65536, MAX_BODY + 1 - len(body)))
+                    if not chunk:
+                        break
+                    body += chunk
+            except http.client.IncompleteRead:
+                raise BadLength("the body ended early") from None
+            if length is not None and len(body) < length:
+                raise BadLength("shorter than its Content-Length")
             return Response(status, hd, bytes(body[:MAX_BODY]), len(body) > MAX_BODY)
         finally:
             try:
@@ -1092,9 +1167,11 @@ def kalshi_get(url: str, timeout: float) -> bytes:
         raise ValueError("not Kalshi's public address")
     r = _http("GET", url, {"User-Agent": USER_AGENT, "Accept": "application/json"}, None, timeout, "kalshi")
     if r.truncated:
-        raise TooLarge(r.body)
+        raise TooLarge(r.body, r.status)
     if r.status != 200:
-        raise kd.HttpError(r.status, url)
+        e = kd.HttpError(r.status, url)
+        e.body = r.body                                   # its hash and size are recorded, never the body itself
+        raise e
     return r.body
 
 
@@ -1198,6 +1275,7 @@ class Collector:
         self._k_last: float | None = None                 # the start of the latest Kalshi request (three a second at most)
         self._open: tuple | None = None                   # the request out now: (request id, purpose, page), or None
         self._k_rid: int | None = None                    # the first request row of the series pass under way
+        self._k_seen: tuple = (None, None, None)          # the latest Kalshi answer of the pass: its hash, size and status
         self.counts = {"comment_slots": 0, "comment_failed": 0, "price_slots": 0, "price_failed": 0, "versions": 0,
                        "rows": 0, "misses": 0, "backoffs": 0, "skipped": 0}
         self._beat = 0.0
@@ -1209,7 +1287,8 @@ class Collector:
         counts as a request sent INTENT_MARGIN_S after its time (whether its answer came or not); an answer stored
         counts at its own time, which is never earlier than its request; back-offs and the answer's own reset times
         are taken as still in force; and the pages of the latest official slots and the Kalshi minutes already asked
-        are counted, so that no slot is asked for more than its share whatever was killed when."""
+        are counted, so that no slot is asked for more than its share whatever was killed when. Kalshi's pacer starts
+        from its latest request row (KALSHI_INTENT_MARGIN_S after it)."""
         c = self.store.conn
         r = c.execute("SELECT MAX(until) FROM comment_events WHERE kind IN ('backoff', 'ratelimit')").fetchone()
         if r and r[0]:
@@ -1228,8 +1307,12 @@ class Collector:
             self._burst.append(_iso_ts(at) + INTENT_MARGIN_S)
         if times:
             self._last_req = max(times + ([self._last_req] if self._last_req is not None else []))
-        if rows and rows[0][1] is not None and 0 < rows[0][1] <= BACKOFF_NAMED_MAX_S:
-            self.not_before = max(self.not_before, _iso_ts(rows[0][0]) + rows[0][1])
+        if rows and rows[0][1] is not None and rows[0][1] > 0:          # a named wait above an hour is an hour
+            self.not_before = max(self.not_before, _iso_ts(rows[0][0]) + min(rows[0][1], BACKOFF_NAMED_MAX_S))
+        r = c.execute("SELECT MAX(at) FROM requests WHERE service = 'kalshi'").fetchone()
+        if r and r[0]:                                     # Kalshi's pace: its latest request, a restart included
+            t = _iso_ts(r[0]) + KALSHI_INTENT_MARGIN_S
+            self._k_last = t if self._k_last is None else max(self._k_last, t)
         for slot, n in c.execute("SELECT slot_ts, COUNT(*) FROM requests WHERE service = 'reddit' AND purpose = 'feed' "
                                  "AND slot_ts >= ? GROUP BY slot_ts", (int(now) - 3 * OAUTH_INTERVAL_S,)):
             self._pages[slot] = n
@@ -1295,6 +1378,7 @@ class Collector:
         I = self.c_interval
         top = int(now // I) * I                            # the latest slot on the grid
         first, self.c_next = self.c_next, top + I
+        self._pages = {g: n for g, n in self._pages.items() if g >= top - I}     # the current and the previous slot only
         # slots passed over while we were busy or the clock jumped: each is more than half over. In the public feed's
         # silence a passed slot is no loss.
         lost = sum(1 for g in range(first, top, I) if not (self.backend == "public" and is_silent(g)))
@@ -1331,7 +1415,7 @@ class Collector:
         except _STORE_ERRORS:
             raise
         except Exception as e:                             # a slot that broke is a failed slot, never a stopped run
-            self._broken(slot, fetches, "error_" + type(e).__name__)
+            self._broken(slot, fetches, events, "error_" + type(e).__name__)
         self._open = None
         if not fetches and not events:
             return
@@ -1341,11 +1425,17 @@ class Collector:
         if not any(f.purpose == "feed" and f.page == 1 and f.failure is None for f in fetches):
             self.counts["comment_failed"] += 1
 
-    def _broken(self, slot: int, fetches: list, failure: str) -> None:
-        """An exception while handling the slot: every request of it is recorded as failed with the exception's class
-        name only (never its text); the raw answers already in hand are kept. The request out when it broke gets its
-        outcome row here, and a slot that sent nothing gets a row of its own, so the failure is counted."""
+    def _broken(self, slot: int, fetches: list, events: list, failure: str) -> None:
+        """An exception while handling the slot, recorded with the exception's class name only (never its text). The
+        feed pages already read well are kept as they are, their comments and versions stored with their own times;
+        the slot then carries a possible-miss mark (so it is not covered) and the page being handled a failed row.
+        Any other request of the slot is recorded as failed. The request out when it broke gets its outcome row here,
+        and a slot that sent nothing gets a row of its own, so the failure is counted."""
+        good = [f for f in fetches if f.purpose == "feed" and f.failure is None and f.entries is not None]
+        kept = {id(f) for f in good}
         for f in fetches:
+            if id(f) in kept:
+                continue
             f.entries, f.bad_entries = None, 0
             if f.failure is None:
                 f.failure = failure
@@ -1353,14 +1443,29 @@ class Collector:
             rid, purpose, page = self._open
             fetches.append(Fetch(at=self.clock(), slot=slot, backend=self.backend, purpose=purpose, page=page, status=None,
                                  failure=failure, body=None, entries=None, request_id=rid))
+        elif good:
+            fetches.append(Fetch(at=self.clock(), slot=slot, backend=self.backend, purpose="feed", page=max(f.page for f in good) + 1,
+                                 status=None, failure=failure, body=None, entries=None))
         elif not fetches:
             fetches.append(Fetch(at=self.clock(), slot=slot, backend=self.backend, purpose="feed", page=1, status=None,
                                  failure=failure, body=None, entries=None))
+        if good:
+            events.append(Event(at=self.clock(), kind="possible_miss", slot=slot, until=None,
+                                count=sum(len(f.entries) for f in good), detail="a later page of the slot was rejected"))
         self._open = None
+
+    @staticmethod
+    def _shed(fetches: list) -> None:
+        """The body of a bad answer (unreadable, refused, over the limit, or any other failure) is not stored: its
+        hash and size are, beside its status and reason. Only the answers read well keep their bodies."""
+        for f in fetches:
+            if f.body is not None and f.failure is not None:
+                f.body_sha256, f.body_size, f.body = sha256_bytes(f.body), len(f.body), None
 
     def _save_slot(self, fetches: list, events: list) -> dict:
         """The slot's one transaction. Should what it brought fail to be stored for any reason but the store's own, it
-        is stored again as failed fetches (the raw answers kept, then, at the last, without them): never a stopped run."""
+        is stored again as failed fetches (their bodies not kept): never a stopped run."""
+        self._shed(fetches)
         try:
             return self.store.save_comment_slot(fetches, events)
         except _STORE_ERRORS:
@@ -1371,13 +1476,14 @@ class Collector:
             f.entries, f.bad_entries = None, 0
             if f.failure is None:
                 f.failure = failure
+        self._shed(fetches)
         try:
             return self.store.save_comment_slot(fetches, events)
         except _STORE_ERRORS:
             raise
         except Exception:
             for f in fetches:
-                f.body = None
+                f.body = f.body_sha256 = f.body_size = None
             return self.store.save_comment_slot(fetches, events)
 
     def _commit_event(self, e: Event) -> None:
@@ -1427,6 +1533,8 @@ class Collector:
                     resp = self.reddit_fetch(method, url, headers, data, min(budget, STEP_DEADLINE_S))
                 except TimeoutError:
                     failure = "timeout"
+                except BadLength:
+                    failure = "bad_length"
                 except (OSError, urllib.error.URLError):
                     failure = "network"
                 except Exception:                          # a transport that broke: a failed fetch, not a stopped run
@@ -1437,14 +1545,14 @@ class Collector:
         reset = _float(resp.headers.get("x-ratelimit-reset")) if resp is not None else None
         body = resp.body if (resp is not None and keep_body) else None
         if resp is not None:
-            if resp.truncated:
-                failure = "too_large"
-            elif status in (429, 403):
+            if status in (429, 403):                       # a back-off, the answer truncated or not
                 failure = "http_%d" % status
                 secs, why = _backoff_seconds(resp.headers, at)
                 self.backoff_until = max(self.backoff_until, at + secs)
                 self._commit_event(Event(at=at, kind="backoff", slot=slot, until=at + secs, count=None,
                                          detail="http_%d %s %g s" % (status, why, secs)))
+            elif resp.truncated:
+                failure = "too_large"
             elif status in (301, 302, 303, 307, 308):
                 failure = "redirect"
             elif status == 401:
@@ -1458,7 +1566,7 @@ class Collector:
         return f, resp
 
     def _parse_into(self, f: Fetch, resp: Response, oauth: bool) -> str | None:
-        """Read a good answer into `f.entries`; an answer that cannot be read is a failed fetch, stored raw."""
+        """Read a good answer into `f.entries`; an answer that cannot be read is a failed fetch (its body not kept)."""
         try:
             if oauth:
                 f.entries, f.bad_entries, after = parse_listing(resp.body)
@@ -1476,8 +1584,8 @@ class Collector:
         if resp is not None and f.failure is None:
             self._parse_into(f, resp, False)
             reset = f.rate_reset
-            if reset is not None and 0 < reset <= BACKOFF_NAMED_MAX_S:
-                self.not_before = max(self.not_before, f.at + reset)   # never ahead of what the answer says
+            if reset is not None and reset > 0:            # never ahead of what the answer says; above an hour, an hour
+                self.not_before = max(self.not_before, f.at + min(reset, BACKOFF_NAMED_MAX_S))
 
     def _token_for(self, slot: int, deadline: float, fetches: list, events: list) -> str | None:
         now = self.clock()
@@ -1495,10 +1603,13 @@ class Collector:
         try:
             doc = json.loads(resp.body.decode("utf-8"))
             tok, ttl = doc["access_token"], float(doc.get("expires_in", 3600))
-            if not isinstance(tok, str) or not tok or not math.isfinite(ttl):
+            if not math.isfinite(ttl):
                 raise ValueError
         except Exception:
             f.failure = "unparseable"
+            return None
+        if not isinstance(tok, str) or not TOKEN.fullmatch(tok):
+            f.failure = "bad_token"                        # visible ASCII, no space, at most 4,096 long: else never sent
             return None
         self._token, self._token_until = tok, f.at + max(ttl - TOKEN_REFRESH_EARLY_S, 60.0)
         return tok
@@ -1562,6 +1673,7 @@ class Collector:
         I = self.p_interval
         top = int(now // I) * I
         first, self.p_next = self.p_next, top + I
+        self._asked = {(sr, g) for sr, g in self._asked if g >= top - I}           # this minute and the one before only
         self._skip_event("price_events", now, top - I, (top - first) // I, "late")
         if now - top > SKIP_AFTER_FRACTION * I:
             self._skip_event("price_events", now, top, 1, "more than half over")
@@ -1593,24 +1705,27 @@ class Collector:
         if remaining <= 0:
             raise TimeoutError("the pass is out of time")
         out = self.kalshi_get(url, min(remaining, STEP_DEADLINE_S))
-        return out[0] if isinstance(out, tuple) else out
+        out = out[0] if isinstance(out, tuple) else out
+        if isinstance(out, (bytes, bytearray)):
+            self._k_seen = (sha256_bytes(bytes(out)), len(out), 200)
+        return out
 
     def _read_series(self, series: str, slot: int) -> tuple:
         """The open markets of one series, following Kalshi's cursor (at most KALSHI_MAX_PAGES pages, all within the
-        pass's deadline). Returns (failure, quotes, markets seen, bad rows, raw answer kept)."""
+        pass's deadline). Returns (failure, quotes, markets seen, bad rows). No body is kept: the hash, size and status
+        of the latest answer are in `_k_seen`."""
         rows, cursor, cursors = [], None, set()
         for page in range(1, KALSHI_MAX_PAGES + 1):
             params = {"series_ticker": series, "status": "open", "limit": 1000}
             if cursor:
                 params["cursor"] = cursor
             raw = self._kalshi_request(series, slot, page, kd.BASE_URL + "/markets?" + urllib.parse.urlencode(params))
-            keep = bytes(raw) if isinstance(raw, (bytes, bytearray)) else None
             try:
                 doc = json.loads(raw)
             except (ValueError, TypeError, RecursionError):
-                return "not_json", [], 0, 0, keep
+                return "not_json", [], 0, 0
             if not isinstance(doc, dict) or "markets" not in doc or not isinstance(doc["markets"] or [], list):
-                return "bad_shape", [], 0, 0, keep
+                return "bad_shape", [], 0, 0
             got = doc["markets"] or []
             rows += got
             cursor = doc.get("cursor")
@@ -1624,23 +1739,32 @@ class Collector:
                 bad += 1
             else:
                 markets.append(q)
-        return None, markets, len(markets), bad, None
+        return None, markets, len(markets), bad
+
+    @staticmethod
+    def _answer_seen(body, status) -> tuple:
+        if isinstance(body, (bytes, bytearray)):
+            return sha256_bytes(bytes(body)), len(body), status
+        return None, None, status
 
     def _price_series(self, series: str, slot: int) -> None:
-        failure, markets, seen, bad, body = None, [], 0, 0, None
-        self._k_rid = None
+        failure, markets, seen, bad = None, [], 0, 0
+        self._k_rid, self._k_seen = None, (None, None, None)
         try:
             if self._price_deadline - self.clock() <= 0:
                 raise TimeoutError("the pass is out of time")
-            failure, markets, seen, bad, body = self._read_series(series, slot)
+            failure, markets, seen, bad = self._read_series(series, slot)
         except _STORE_ERRORS:
             raise
         except TimeoutError:
             failure = "timeout"
         except TooLarge as e:
-            failure, body = "too_large", e.body
+            failure, self._k_seen = "too_large", self._answer_seen(e.body, getattr(e, "status", None))
         except kd.HttpError as e:
             failure = "redirect" if 300 <= e.status < 400 else "http_%d" % e.status
+            self._k_seen = self._answer_seen(getattr(e, "body", None), e.status)
+        except BadLength:
+            failure = "bad_length"
         except (OSError, urllib.error.URLError):
             failure = "network"
         except Exception as e:                             # whatever broke: this series' minute failed, the run goes on
@@ -1648,15 +1772,18 @@ class Collector:
         if failure is not None:
             markets, seen, bad = [], 0, 0
         at = self.clock()
+        digest, size, status = self._k_seen                 # of the answer, read or not: its body is never kept
         try:
             stored = self.store.save_price_fetch(series=series, slot=slot, at=at, failure=failure, markets=markets, seen=seen,
-                                                 bad_rows=bad, body=body, request_id=self._k_rid)
+                                                 bad_rows=bad, body=None, request_id=self._k_rid, status=status,
+                                                 body_sha256=digest, body_size=size)
         except _STORE_ERRORS:
             raise
         except Exception as e:
             failure = "error_" + type(e).__name__
             stored = self.store.save_price_fetch(series=series, slot=slot, at=at, failure=failure, markets=[], seen=0,
-                                                 bad_rows=0, body=None, request_id=self._k_rid)
+                                                 bad_rows=0, body=None, request_id=self._k_rid, status=status,
+                                                 body_sha256=digest, body_size=size)
         self.counts["price_slots"] += 1
         self.counts["rows"] += stored
         if failure:
@@ -1801,17 +1928,25 @@ def _day(ts: float) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d")
 
 
-def _expected_slots(runs: list, now: float, which: str) -> list[int]:
-    """Every slot a recorder was supposed to take: for each run, from its first slot to the first slot of the next
-    run (the last run, to now). The days a run did not cover count as the blind time they were."""
+def _expected_slots(runs: list, now: float, which: str) -> list[tuple[int, str]]:
+    """Every slot of every whole UTC day from the day of the first run to the day of `now` (its unfinished day
+    whole too): Clarification 3, time during which the collector was not running is expected and uncovered. Each
+    slot is on the grid of the run in force at its time (the latest run started at or before it; before the first
+    run, the first run's), with that run's backend."""
+    if not runs:
+        return []
+    starts = [r[0] for r in runs]
+    g = int(runs[0][0] // 86400) * 86400
+    end = max(g + 86400, -(-int(math.ceil(now)) // 86400) * 86400)
     out = []
-    for i, (start, backend, ci, pi) in enumerate(runs):
+    while g < end:
+        start, backend, ci, pi = runs[max(bisect.bisect_right(starts, g) - 1, 0)]
         interval = ci if which == "comments" else pi
-        g = first_slot(start, interval)
-        limit = first_slot(runs[i + 1][0], interval) if i + 1 < len(runs) else now
-        while g < limit:
-            out.append((g, backend))
-            g += interval
+        if g % interval:
+            g = (g // interval + 1) * interval
+            continue
+        out.append((g, backend))
+        g += interval
     return out
 
 
@@ -1821,8 +1956,11 @@ def status(store: Store, now: float) -> dict:
     (made, and that read carries no possible-miss mark), failed (asked, never read), how many a possible-miss mark
     uncovered, back-off minutes, possible misses, comments and versions stored. Prices, in all and per series: slots
     expected (the five series, one a minute), covered (distinct series and minute with at least one successful read),
-    failed, markets seen and rows stored. Only slots of the plan count, each once, so covered never exceeds expected.
-    `share` is covered over expected, and `covered` whether it is at least 80% (`counts`: both recorders were)."""
+    failed, markets seen and rows stored. Every UTC day from the first run's on is expected whole (7,200 price slots;
+    624 public or 1,440 official comment slots, by the backend in force at each slot); only slots of the plan already
+    begun count, each once, so covered never exceeds expected. `share` is covered over expected, `covered` whether it
+    is at least 80%. A day not yet ended is `in_progress`: its counts so far are shown, and it never `counts`; an
+    ended day counts when both recorders covered it."""
     runs = [(_utc_ts(r["started_at"]), r["backend"], r["comment_interval_s"], r["price_interval_s"])
             for r in store.rows("SELECT started_at, backend, comment_interval_s, price_interval_s FROM runs ORDER BY id")]
     days: dict[str, dict] = {}
@@ -1837,7 +1975,7 @@ def status(store: Store, now: float) -> dict:
                                     "backoff_minutes": 0.0, "misses": 0, "comments": 0, "versions": 0, "share": None,
                                     "covered": False},
                        "prices": dict(blank(), covered=False, series={s: blank() for s in SERIES}),
-                       "counts": False}
+                       "in_progress": _utc_ts(d + "T00:00:00") + 86400 > now, "counts": False}
         return days[d]
     c_expected: set[int] = set()
     for g, backend in _expected_slots(runs, now, "comments"):
@@ -1864,7 +2002,7 @@ def status(store: Store, now: float) -> dict:
             c["failed"] += 1
             continue
         c["made"] += 1
-        if r["s"] not in c_expected:
+        if r["s"] not in c_expected or r["s"] >= now:
             continue                                        # not a slot of the plan: shown as made, never as covered
         if r["s"] in marked:
             c["miss_uncovered"] += 1
@@ -1884,7 +2022,7 @@ def status(store: Store, now: float) -> dict:
         d[key] += 1
         d["rows"] += r["rows"] or 0
         d["markets_seen"] = max(d["markets_seen"], r["seen"] or 0)
-        if r["ok"] and r["slot_ts"] in p_expected:
+        if r["ok"] and r["slot_ts"] in p_expected and r["slot_ts"] < now:
             ps["covered_slots"] += 1
             d["covered_slots"] += 1
     for r in store.rows("SELECT at, until FROM comment_events WHERE kind IN ('backoff', 'ratelimit') AND until IS NOT NULL"):
@@ -1908,7 +2046,7 @@ def status(store: Store, now: float) -> dict:
         p["covered"] = p["share"] is not None and p["share"] >= COVERAGE_MIN
         for ps in p["series"].values():
             ps["share"] = ps["covered_slots"] / ps["expected"] if ps["expected"] else None
-        d["counts"] = c["covered"] and p["covered"]
+        d["counts"] = c["covered"] and p["covered"] and not d["in_progress"]      # an unfinished day never counts
     return {"days": [days[k] for k in sorted(days)]}
 
 
@@ -1921,7 +2059,8 @@ def format_status(st: dict) -> str:
     lines = []
     for d in st["days"]:
         c, p = d["comments"], d["prices"]
-        lines.append("%s  counts toward the test: %s" % (d["day"], "yes" if d["counts"] else "no"))
+        lines.append("%s  counts toward the test: %s" % (d["day"], "no, the day is in progress (counts so far, of the whole day)"
+                                                         if d.get("in_progress") else "yes" if d["counts"] else "no"))
         lines.append("  comments  expected %4d  (silent %3d, not counted)  covered %4d  made %4d  failed %4d  "
                      "uncovered by a possible miss %d  coverage %6s %s  back-off %.1f min  possible misses %d  comments %d  versions %d"
                      % (c["expected"], c["silent"], c["covered_slots"], c["made"], c["failed"], c["miss_uncovered"], _pct(c["share"]),
@@ -1982,6 +2121,11 @@ def main(argv=None, *, clock=None, sleep=None, reddit_fetch=None, kalshi_get=Non
             return 1
         finally:
             store.close()
+    try:
+        _trust_bundle()                                    # nothing can be verified without it: the run never starts
+    except NoTrustStore as e:
+        out("chatter_loop: not started: " + str(e))
+        return 1
     try:
         store = Store(a.db, lock=True)
     except StoreError as e:

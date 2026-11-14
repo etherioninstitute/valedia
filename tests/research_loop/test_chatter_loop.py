@@ -655,7 +655,8 @@ def test_a_429_or_403_is_a_back_off_for_the_time_named_else_5_minutes_at_most_10
     assert len(ev) == 1 and ev[0]["detail"].startswith("http_%d" % status)
     f = store.rows("SELECT ok, failure, status FROM comment_fetches ORDER BY id")[0]
     assert (f["ok"], f["failure"], f["status"]) == (0, "http_%d" % status, status)
-    assert raw_bodies(store)[0] == b"slow down"                                                    # the raw answer is kept
+    f0 = store.rows("SELECT payload_id, body_sha256, body_size FROM comment_fetches ORDER BY id")[0]     # rev 3 (outcome 7): a bad
+    assert f0 == {"payload_id": None, "body_sha256": hashlib.sha256(b"slow down").hexdigest(), "body_size": 9}  # answer's hash and size, not its body
 
 
 def test_a_redirect_is_not_followed_and_is_a_failed_fetch(tmp_path):
@@ -986,8 +987,11 @@ def test_an_answer_that_cannot_be_read_is_stored_raw_and_counted(tmp_path):
     run_for(col, clock, 60)
     got = {r["series"]: r["failure"] for r in store.rows("SELECT series, failure FROM price_fetches")}
     assert got["KXNBAGAME"] == "not_json" and got["KXNFLGAME"] == "bad_shape"
-    raw = set(raw_bodies(store, "kind = 'kalshi_unread'"))
-    assert raw == {b"<html>not json</html>", json.dumps({"nothing": 1}).encode()}
+    # rev 3 (outcome 7): an unreadable answer's hash, size and status are kept, never its body
+    kept = {r["series"]: (r["status"], r["body_sha256"], r["body_size"]) for r in store.rows("SELECT * FROM price_fetches")}
+    for series, body in (("KXNBAGAME", b"<html>not json</html>"), ("KXNFLGAME", json.dumps({"nothing": 1}).encode())):
+        assert kept[series] == (200, hashlib.sha256(body).hexdigest(), len(body))
+    assert raw_bodies(store, "kind = 'kalshi_unread'") == []
 
 
 def test_odd_market_rows_are_counted_not_dropped_quietly(tmp_path):
@@ -1279,17 +1283,20 @@ def test_status_counts_slots_per_utc_day_with_the_silence_shown_and_excluded(tmp
     assert [d["day"] for d in st["days"]] == ["2026-11-13"]
     d = st["days"][0]
     c = d["comments"]
-    assert (c["expected"], c["silent"], c["made"], c["failed"]) == (78, 12, 78, 0)
+    # rev 3 (outcome 1, Clarification 3): the whole UTC day is expected, so three hours from 06:00 are 78 of 624
+    # comment slots and 900 of 7,200 price slots, and a day not yet ended never counts
+    assert (c["expected"], c["silent"], c["made"], c["failed"], c["covered_slots"]) == (624, 96, 78, 0, 78)
     assert c["comments"] == store.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0] > 0
     assert c["versions"] == store.conn.execute("SELECT COUNT(*) FROM comment_versions").fetchone()[0]
-    assert c["backoff_minutes"] == 0 and c["misses"] == 0 and c["share"] == 1.0 and c["covered"] is True
+    assert c["backoff_minutes"] == 0 and c["misses"] == 0 and c["share"] == 78 / 624 and c["covered"] is False
     p = d["prices"]
-    assert p["expected"] == 5 * 180 and p["made"] == 900 and p["failed"] == 0 and p["share"] == 1.0 and p["covered"] is True
+    assert p["expected"] == 7200 and p["made"] == 900 and p["covered_slots"] == 900 and p["failed"] == 0
+    assert p["share"] == 900 / 7200 and p["covered"] is False
     for s in cl.SERIES:
         ps = p["series"][s]
-        assert (ps["expected"], ps["made"], ps["failed"]) == (180, 180, 0)
+        assert (ps["expected"], ps["made"], ps["covered_slots"], ps["failed"]) == (1440, 180, 180, 0)
         assert ps["markets_seen"] == 2 and ps["rows"] == 2
-    assert d["counts"] is True
+    assert d["in_progress"] is True and d["counts"] is False
 
 
 def test_status_splits_days_at_midnight_utc(tmp_path):
@@ -1297,8 +1304,12 @@ def test_status_splits_days_at_midnight_utc(tmp_path):
     col, store, *_ = run_store(tmp_path, 2 * 3600, start=midnight - 3600)
     st = cl.status(store, midnight + 3600)
     assert [d["day"] for d in st["days"]] == ["2026-11-13", "2026-11-14"]
-    assert st["days"][0]["prices"]["expected"] == 5 * 60 and st["days"][1]["prices"]["expected"] == 5 * 60
-    assert st["days"][0]["comments"]["expected"] == 26 and st["days"][1]["comments"]["expected"] == 26
+    # rev 3 (outcome 1): each day is expected whole; the hour each side of midnight is what was covered
+    assert st["days"][0]["prices"]["expected"] == 7200 and st["days"][1]["prices"]["expected"] == 7200
+    assert st["days"][0]["prices"]["covered_slots"] == 5 * 60 and st["days"][1]["prices"]["covered_slots"] == 5 * 60
+    assert st["days"][0]["comments"]["expected"] == 624 and st["days"][1]["comments"]["expected"] == 624
+    assert st["days"][0]["comments"]["covered_slots"] == 26 and st["days"][1]["comments"]["covered_slots"] == 26
+    assert [d["in_progress"] for d in st["days"]] == [False, True]
 
 
 def test_status_counts_failures_backoffs_and_possible_misses(tmp_path):
@@ -1324,7 +1335,8 @@ def test_status_counts_failures_backoffs_and_possible_misses(tmp_path):
 def test_status_calls_a_blind_stretch_a_gap_not_a_quiet_one(tmp_path):
     col, store, reddit, kalshi, clock = run_store(tmp_path, 3600, answer=lambda n, t, m, u: resp(200, atom_with()))
     quiet = cl.status(store, T0 + 3600)["days"][0]
-    assert quiet["comments"]["share"] == 1.0 and quiet["comments"]["comments"] == 0       # an empty feed is a quiet hour, covered
+    c = quiet["comments"]                                          # an empty feed is a quiet hour, covered (rev 3: of the whole day)
+    assert c["covered_slots"] == c["made"] == 26 and c["share"] == 26 / 624 and c["comments"] == 0
     st = cl.status(store, T0 + 4 * 3600)["days"][0]                # then nobody records for three hours
     assert st["comments"]["share"] < 0.3 and st["comments"]["covered"] is False and st["counts"] is False
     assert st["prices"]["share"] < 0.3 and st["prices"]["covered"] is False
@@ -1336,8 +1348,21 @@ def test_status_a_failing_price_series_is_shown_and_80_percent_is_the_line(tmp_p
     col, store, *_ = run_store(tmp_path, 3600, kanswer=kanswer)
     d = cl.status(store, T0 + 3600)["days"][0]
     assert d["prices"]["series"]["KXNHLGAME"]["failed"] == 60 and d["prices"]["series"]["KXNHLGAME"]["share"] == 0.0
+    # rev 3 (outcome 1): an hour is not a day; the line is shown on a whole day in which one series failed throughout
+    assert d["prices"]["covered_slots"] == 4 * 60 and d["prices"]["covered"] is False and d["in_progress"] is True
+    s = cl.Store(tmp_path / "day.sqlite", synchronous="OFF")
+    s.save_run(started=DAY, backend="public", comment_interval=120, price_interval=60)
+    for g in range(DAY, DAY + 86400, 60):
+        for i, sr in enumerate(SERIES):
+            s.save_price_fetch(series=sr, slot=g, at=g + 1 + 0.01 * i, failure="http_500" if sr == "KXNHLGAME" else None,
+                               markets=[], seen=0, bad_rows=0, body=None)
+        if g % 120 == 0 and not cl.is_silent(g):
+            feed(s, [entry("c%d" % g)], g + 2, slot=g)
+    d = cl.status(s, DAY + 86400)["days"][0]
+    assert d["prices"]["series"]["KXNHLGAME"]["failed"] == 1440 and d["prices"]["series"]["KXNHLGAME"]["share"] == 0.0
     assert d["prices"]["share"] == 0.8 and d["prices"]["covered"] is True                 # four of five series: exactly the line
-    assert min(v["share"] for v in d["prices"]["series"].values()) == 0.0
+    assert min(v["share"] for v in d["prices"]["series"].values()) == 0.0 and d["counts"] is True
+    s.close()
 
 
 def test_status_text_has_counts_only(tmp_path):
@@ -1725,7 +1750,7 @@ def test_status_for_the_official_interface_has_no_silence(tmp_path):
         return listing([("t1_n%03d" % n, T0 + n * 60 - 3)])
     col, store, *_ = run_store(tmp_path, 3600, answer=oauth_answer(pages), env=CREDS)
     c = cl.status(store, T0 + 3600)["days"][0]["comments"]
-    assert (c["expected"], c["silent"], c["made"]) == (60, 0, 60)
+    assert (c["expected"], c["silent"], c["made"]) == (1440, 0, 60)                     # rev 3 (outcome 1): the whole day
 
 
 # ---------------------------------------------------------------------------- edges found by breaking the code on purpose
@@ -1774,9 +1799,11 @@ def test_a_store_with_another_application_id_or_layout_number_in_its_header_is_r
 def test_a_public_answer_that_is_not_a_feed_is_a_failed_fetch_stored_raw_and_counted(tmp_path):
     col, store, reddit, *_ = make(tmp_path, answer=lambda n, t, m, u: resp(200, b"<html><body>Reddit is down</body></html>"))
     run_for(col, col.clock, 300)
-    rows = store.rows("SELECT ok, failure, payload_id, comments_in_feed FROM comment_fetches")
-    assert rows and all(r["ok"] == 0 and r["failure"] == "unparseable" and r["payload_id"] for r in rows)
-    assert raw_bodies(store)[0] == b"<html><body>Reddit is down</body></html>"
+    rows = store.rows("SELECT ok, failure, payload_id, comments_in_feed, body_sha256, body_size FROM comment_fetches")
+    page = b"<html><body>Reddit is down</body></html>"                 # rev 3 (outcome 7): its hash and size, not its body
+    assert rows and all(r["ok"] == 0 and r["failure"] == "unparseable" and r["payload_id"] is None and
+                        (r["body_sha256"], r["body_size"]) == (hashlib.sha256(page).hexdigest(), len(page)) for r in rows)
+    assert raw_bodies(store) == []
     c = cl.status(store, T0 + 300)["days"][0]["comments"]
     assert c["failed"] == len(rows) and c["made"] == 0
 
@@ -1797,7 +1824,10 @@ def test_the_oversized_answer_is_a_failed_fetch_and_what_was_read_is_kept(tmp_pa
     col, store, *_ = make(tmp_path, answer=lambda n, t, m, u: resp(200, b"x" * 100, truncated=True))
     run_for(col, col.clock, 200)
     assert {r["failure"] for r in store.rows("SELECT failure FROM comment_fetches")} == {"too_large"}
-    assert store.rows("SELECT size FROM payloads")[0]["size"] == 100
+    # rev 3 (outcome 7): of what was read, its hash and size are kept, not its body
+    assert store.rows("SELECT body_sha256, body_size FROM comment_fetches")[0] == {"body_sha256": hashlib.sha256(b"x" * 100).hexdigest(),
+                                                                                "body_size": 100}
+    assert store.rows("SELECT COUNT(*) AS n FROM payloads")[0]["n"] == 0
 
 
 # ------------------------------------------------------- raw answers are kept compressed, hash over the exact bytes (6)
@@ -2338,7 +2368,7 @@ def test_a_comment_slot_with_a_possible_miss_mark_is_not_covered(tmp_path):
     marks = store.rows("SELECT COUNT(DISTINCT slot_ts) AS n FROM comment_events WHERE kind = 'possible_miss'")[0]["n"]
     assert marks >= 2
     assert marks == 2 and c["made"] == 26 and c["failed"] == 0 and c["miss_uncovered"] == marks and c["covered_slots"] == 26 - marks
-    assert c["share"] == pytest.approx((26 - marks) / 26)
+    assert c["share"] == pytest.approx((26 - marks) / 624)                          # rev 3 (outcome 1): of the whole day
 
 
 def test_covered_never_exceeds_expected_whatever_the_rows_say(tmp_path):
@@ -2358,7 +2388,7 @@ def test_covered_never_exceeds_expected_whatever_the_rows_say(tmp_path):
             assert v["covered_slots"] <= v["expected"]
     d = st["days"][0]
     assert d["prices"]["covered_slots"] == 1 and d["prices"]["series"]["KXNBAGAME"]["covered_slots"] == 1
-    assert d["comments"]["expected"] == 1 and d["comments"]["covered_slots"] == 1
+    assert d["comments"]["expected"] == 624 and d["comments"]["covered_slots"] == 1        # rev 3 (outcome 1): the whole day
     s.close()
 
 
@@ -2861,3 +2891,571 @@ def test_check_finds_requests_and_outcomes_that_do_not_belong_together(tmp_path)
         store.conn.execute(sql)
         assert any("request" in p for p in cl.verify(store)), name
         store.close()
+
+
+# ============================================================================================ rev 3
+# ------------------------------------------------------- outcome 1: whole UTC days, an unfinished day never counts
+
+def day_rows(s, start, end, n_prices=None, n_comments=None, interval=120, silent=True):
+    """Every slot from `start` to `end` read successfully, in time order: price minutes (the five series, at most
+    `n_prices` reads) and comment slots on `interval` (the public feed's silence left out; at most `n_comments`)."""
+    writes = []
+    k = 0
+    for g in range(start, end, 60):
+        for i, sr in enumerate(SERIES):
+            if n_prices is None or k < n_prices:
+                writes.append((g + 1 + 0.01 * i, "p", g, sr))
+            k += 1
+    k = 0
+    for g in range(start, end, interval):
+        if silent and interval == 120 and cl.is_silent(g):
+            continue
+        if n_comments is None or k < n_comments:
+            writes.append((g + 2, "c", g, None))
+        k += 1
+    for at, kind, g, sr in sorted(writes):
+        if kind == "p":
+            s.save_price_fetch(series=sr, slot=g, at=at, failure=None, markets=[], seen=0, bad_rows=0, body=None)
+        else:
+            backend = "public" if interval == 120 else "oauth"
+            feed(s, [entry("c%d" % g)], at, slot=g, backend=backend)
+
+
+def test_a_first_run_at_18_utc_covers_a_quarter_of_its_day(tmp_path):
+    """The check's finding 1: a first run at 18:00 UTC with every slot read is 25% of its day, never 100%."""
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.save_run(started=DAY + 18 * 3600, backend="public", comment_interval=120, price_interval=60)
+    day_rows(s, DAY + 18 * 3600, DAY + 86400)
+    d = cl.status(s, DAY + 86400)["days"][0]
+    p, c = d["prices"], d["comments"]
+    assert d["day"] == "2026-11-14" and d["in_progress"] is False
+    assert (p["expected"], p["covered_slots"], p["share"], p["covered"]) == (7200, 1800, 0.25, False)
+    assert (c["expected"], c["silent"], c["covered_slots"], c["share"], c["covered"]) == (624, 96, 156, 0.25, False)
+    assert all(v["expected"] == 1440 and v["covered_slots"] == 360 for v in p["series"].values())
+    assert d["counts"] is False
+    s.close()
+
+
+def test_a_day_not_yet_ended_is_in_progress_and_never_counts(tmp_path):
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.save_run(started=DAY, backend="public", comment_interval=120, price_interval=60)
+    day_rows(s, DAY, DAY + 86400)
+    noon = cl.status(s, DAY + 12 * 3600)["days"]
+    assert [d["day"] for d in noon] == ["2026-11-14"]
+    d = noon[0]
+    assert d["in_progress"] is True and d["counts"] is False                     # the day has not ended
+    assert d["prices"]["expected"] == 7200 and d["prices"]["covered_slots"] == 3600       # the counts so far, of the whole day
+    assert d["comments"]["expected"] == 624 and d["comments"]["covered_slots"] == 312
+    assert "in progress" in cl.format_status({"days": noon})
+    late = cl.status(s, DAY + 86400 - 1)["days"][0]                              # every slot read, a second before midnight
+    assert late["prices"]["covered_slots"] == 7200 and late["in_progress"] is True and late["counts"] is False
+    done = cl.status(s, DAY + 86400)["days"][0]
+    assert done["in_progress"] is False and done["counts"] is True and done["prices"]["share"] == 1.0
+    assert "in progress" not in cl.format_status({"days": [done]})
+    s.close()
+
+
+def test_time_between_runs_and_after_the_last_is_expected_and_uncovered_by_the_backend_in_force(tmp_path):
+    """The first run (official, 06:00) sets the backend before it; the second (public, 12:00) from then on, through the
+    next day in which nothing ran at all."""
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.save_run(started=DAY + 6 * 3600, backend="oauth", comment_interval=60, price_interval=60)
+    day_rows(s, DAY + 6 * 3600, DAY + 7 * 3600, interval=60)
+    s.save_run(started=DAY + 12 * 3600, backend="public", comment_interval=120, price_interval=60)
+    day_rows(s, DAY + 12 * 3600, DAY + 13 * 3600)
+    days = cl.status(s, DAY + 2 * 86400)["days"]
+    assert [d["day"] for d in days] == ["2026-11-14", "2026-11-15"]
+    one, two = days
+    assert one["comments"]["expected"] == 720 + 312 and one["comments"]["silent"] == 48        # 00-12 official, 12-24 public
+    assert one["comments"]["covered_slots"] == 60 + 26
+    assert one["prices"]["expected"] == 7200 and one["prices"]["covered_slots"] == 2 * 60 * 5
+    assert (two["comments"]["expected"], two["comments"]["covered_slots"]) == (624, 0)   # nobody ran: expected, uncovered
+    assert (two["prices"]["expected"], two["prices"]["covered_slots"], two["counts"]) == (7200, 0, False)
+    s.close()
+
+
+@pytest.mark.parametrize("n_prices,n_comments,interval,counts", [(5760, None, 60, True), (5759, None, 60, False),
+                                                                 (None, 1152, 60, True), (None, 1151, 60, False)])
+def test_the_80_percent_edges_of_a_whole_day_stay_exact(tmp_path, n_prices, n_comments, interval, counts):
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.save_run(started=DAY, backend="oauth", comment_interval=60, price_interval=60)
+    day_rows(s, DAY, DAY + 86400, n_prices=n_prices, n_comments=n_comments, interval=interval)
+    d = cl.status(s, DAY + 86400)["days"][0]
+    assert d["prices"]["expected"] == 7200 and d["comments"]["expected"] == 1440
+    assert d["counts"] is counts
+    s.close()
+
+
+# ------------------------------------------------------------ outcomes 2 and 3: one fixed trust store, real context
+
+class Authority:
+    """A throwaway certificate authority of this test only, and the server certificates it signs."""
+
+    def __init__(self, where):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        import datetime as dtm
+        self.x509, self.hashes, self.ser, self.ec, self.NameOID, self.dtm = x509, hashes, serialization, ec, NameOID, dtm
+        where.mkdir(parents=True, exist_ok=True)
+        self.where = where
+        self.key = ec.generate_private_key(ec.SECP256R1())
+        self.name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "throwaway test authority")])
+        now = dtm.datetime.now(dtm.timezone.utc)
+        self.cert = (x509.CertificateBuilder().subject_name(self.name).issuer_name(self.name).public_key(self.key.public_key())
+                     .serial_number(x509.random_serial_number()).not_valid_before(now - dtm.timedelta(days=1))
+                     .not_valid_after(now + dtm.timedelta(days=2))
+                     .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                     .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=True, crl_sign=True, content_commitment=False,
+                                                  key_encipherment=False, data_encipherment=False, key_agreement=False,
+                                                  encipher_only=False, decipher_only=False), critical=True)
+                     .add_extension(x509.SubjectKeyIdentifier.from_public_key(self.key.public_key()), critical=False)
+                     .sign(self.key, hashes.SHA256()))
+        self.path = where / "authority.pem"
+        self.path.write_bytes(self.cert.public_bytes(serialization.Encoding.PEM))
+
+    def leaf(self, *names):
+        import ipaddress
+        x509 = self.x509
+        key = self.ec.generate_private_key(self.ec.SECP256R1())
+        now = self.dtm.datetime.now(self.dtm.timezone.utc)
+        alt = []
+        for n in names:
+            try:
+                alt.append(x509.IPAddress(ipaddress.ip_address(n)))
+            except ValueError:
+                alt.append(x509.DNSName(n))
+        cert = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(self.NameOID.COMMON_NAME, names[0])]))
+                .issuer_name(self.name).public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - self.dtm.timedelta(days=1)).not_valid_after(now + self.dtm.timedelta(days=1))
+                .add_extension(x509.SubjectAlternativeName(alt), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()), critical=False)
+                .sign(self.key, self.hashes.SHA256()))
+        tag = "-".join(names).replace(".", "_")
+        cf, kf = self.where / ("%s.pem" % tag), self.where / ("%s.key" % tag)
+        cf.write_bytes(cert.public_bytes(self.ser.Encoding.PEM))
+        kf.write_bytes(key.private_bytes(self.ser.Encoding.PEM, self.ser.PrivateFormat.PKCS8, self.ser.NoEncryption()))
+        return cf, kf
+
+
+def tls_server(cf, kf, body=b"hello"):
+    """A local TLS server answering 200 with `body`; `requests` holds only what arrived after a completed handshake."""
+    import ssl
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cf, kf)
+    srv = LocalServer("ok", body=body)
+    plain = srv._handle
+
+    def handle(c):
+        try:
+            c.settimeout(2.0)
+            c = server_ctx.wrap_socket(c, server_side=True)
+        except OSError:
+            c.close()
+            return
+        plain(c)
+    srv._handle = handle
+    return srv
+
+
+def fresh_real_context(monkeypatch):
+    """The module's own context, built anew (nothing cached from another test, no override installed)."""
+    monkeypatch.setattr(cl, "_SSL_CONTEXT", None, raising=False)
+    monkeypatch.setattr(cl, "_SSL_DEFAULT", [], raising=False)
+
+
+def test_the_trust_store_is_one_fixed_bundle_and_the_environment_changes_nothing(tmp_path, monkeypatch):
+    ca = Authority(tmp_path / "ca")
+    cf, kf = ca.leaf("127.0.0.1")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca.path))                  # the throwaway authority, offered by the environment
+    monkeypatch.setenv("SSL_CERT_DIR", str(ca.where))
+    fresh_real_context(monkeypatch)
+    srv = tls_server(cf, kf)
+    try:
+        with pytest.raises(OSError):                                    # ssl.SSLCertVerificationError is an OSError
+            cl._http("GET", srv.url(path="/x", scheme="https"), {}, None, 3, "reddit")
+        assert srv.requests == []                                       # not one request byte reached the server
+    finally:
+        srv.close()
+    want = cl.SYSTEM_BUNDLE if os.path.isfile(cl.SYSTEM_BUNDLE) else cl._certifi_bundle()
+    assert cl.SYSTEM_BUNDLE == "/etc/ssl/cert.pem" and cl._trust_bundle() == want
+    monkeypatch.setattr(cl, "SYSTEM_BUNDLE", str(tmp_path / "absent.pem"))
+    import certifi
+    assert cl._trust_bundle() == certifi.where()                       # the system's bundle absent: certifi's
+
+
+def test_with_no_bundle_the_collector_refuses_to_start_and_says_why(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "SYSTEM_BUNDLE", str(tmp_path / "absent.pem"), raising=False)
+    monkeypatch.setattr(cl, "_certifi_bundle", lambda: None, raising=False)
+    clock = Clock()
+    out, db = [], tmp_path / "c.sqlite"
+    rc = cl.main(["run", "--db", str(db), "--for-minutes", "1"], clock=clock, sleep=clock.sleep,
+                 reddit_fetch=FakeReddit(clock, feed_answer()), kalshi_get=FakeKalshi(clock), env={}, out=out.append)
+    assert rc == 1 and not db.exists()
+    assert any("certificate" in line for line in out), out
+
+
+def test_the_real_context_refuses_an_unknown_authority_and_its_settings_refuse_a_name_they_do_not_match(tmp_path, monkeypatch):
+    """Against the module's real context and transport: an authority it does not trust is refused (no request byte
+    sent); a copy of the real settings that adds the throwaway authority accepts a certificate for 127.0.0.1 and
+    refuses one for another name."""
+    import ssl
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    fresh_real_context(monkeypatch)
+    ca = Authority(tmp_path / "ca")
+    good, wrong = ca.leaf("127.0.0.1"), ca.leaf("other.test")
+    real = cl._ssl_context()
+    assert real.verify_mode == ssl.CERT_REQUIRED and real.check_hostname is True
+    srv = tls_server(*good)
+    try:
+        with pytest.raises(OSError):
+            cl._http("GET", srv.url(path="/x", scheme="https"), {}, None, 3, "reddit")
+        assert srv.requests == []
+        monkeypatch.setattr(cl, "_SSL_CONTEXT", cl._make_context(str(ca.path)))    # the same settings, this authority added
+        r = cl._http("GET", srv.url(path="/x", scheme="https"), {}, None, 3, "reddit")
+        assert (r.status, r.body) == (200, b"hello") and srv.requests[0].startswith(b"GET /x HTTP/1.1")
+    finally:
+        srv.close()
+    srv = tls_server(*wrong)
+    try:
+        with pytest.raises(OSError):
+            cl._http("GET", srv.url(path="/x", scheme="https"), {}, None, 3, "reddit")
+        assert srv.requests == []                                       # the name did not match: nothing was sent
+    finally:
+        srv.close()
+
+
+@pytest.mark.parametrize("feed_text", [
+    b'<?xml version="1.0" encoding="UTF-8"?><!-- <!DOCTYPE x [<!ENTITY a "b">]> --><feed xmlns="http://www.w3.org/2005/Atom"></feed>',
+    b'<feed xmlns="http://www.w3.org/2005/Atom"><title><![CDATA[<!ENTITY a "b">]]></title></feed>',
+], ids=["in-a-comment", "in-cdata"])
+def test_the_text_checks_alone_refuse_a_declaration_the_parser_never_sees(feed_text):
+    """The parser accepts these (the declaration is only text in a comment or a CDATA section), so only the checks on
+    the bytes and the decoded text stand between them and the store."""
+    assert cl._xml_tree(feed_text) is not None
+    with pytest.raises(cl.Unparseable):
+        cl.parse_atom(feed_text)
+
+
+def test_a_stated_size_or_a_blob_beyond_the_limit_is_refused_before_anything_is_inflated(tmp_path, monkeypatch):
+    made, real = [], zlib.decompressobj
+    monkeypatch.setattr(cl.zlib, "decompressobj", lambda *a: made.append(1) or real(*a))
+    small = zlib.compress(b"abc")
+    for blob, size in ((small, cl.MAX_BODY + 1), (small, -1), (b"\x00" * (cl.MAX_STORED_BLOB + 1), 3)):
+        with pytest.raises(cl.StoreError):
+            cl._inflate(blob, size)
+    assert made == []
+    assert cl._inflate(small, 3) == b"abc" and made == [1]
+
+
+# ------------------------------------------------------------------- outcome 4: Kalshi's pace across a restart
+
+def test_kalshis_pace_holds_across_restarts(tmp_path):
+    """Every run is killed while one of its Kalshi requests is out and restarted at once: never more than three
+    Kalshi requests in any one second."""
+    path, clock, sent = tmp_path / "c.sqlite", Clock(), []
+
+    def kget(url, timeout):
+        sent.append(clock())
+        raise Killed
+    reddit = FakeReddit(clock, feed_answer())
+    for _ in range(12):
+        s = cl.Store(path, synchronous="OFF")
+        try:
+            col = collector(s, clock, reddit, kget)
+            col.start()
+            col.step()
+        except Killed:
+            pass
+        finally:
+            s.close()
+    assert len(sent) == 5                                               # each series asked once in the minute
+    for t in sent:
+        assert sum(1 for u in sent if t - 1.0 < u <= t) <= 3, sent
+
+
+# ------------------------------------------------------------------- outcome 5: a token is checked before it is used
+
+@pytest.mark.parametrize("tok,ok", [("abc\r\n\tdef", False), ("abc\x00def", False), ("abc def", False), ("t" * 4097, False),
+                                    ("t\xf6k\xe9n", False), ("abc\x7f", False), ("t" * 4096, True), ("a-Z_0.9~+/=", True)],
+                         ids=["crlf-tab", "nul", "space", "4097", "non-ascii", "del", "4096", "visible"])
+def test_a_token_that_is_not_visible_ascii_is_a_bad_token_answer_and_never_sent(tmp_path, tok, ok):
+    def answer(n, t, method, url):
+        if url == cl.TOKEN_URL:
+            return token_answer(tok=tok)
+        return listing([("t1_n%03d" % n, T0 + n * 60 - 3)])
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=answer, env=CREDS)
+    run_for(col, clock, 150)
+    feeds = [r for r in reddit.log if r["url"] != cl.TOKEN_URL]
+    tokens = store.rows("SELECT ok, failure FROM comment_fetches WHERE purpose = 'token'")
+    if ok:
+        assert feeds and all(r["headers"]["Authorization"] == "Bearer " + tok for r in feeds)
+        assert tokens[0] == {"ok": 1, "failure": None}
+    else:
+        assert feeds == []                                              # no request carried it
+        assert tokens and all(r == {"ok": 0, "failure": "bad_token"} for r in tokens)
+
+
+# ---------------------------------------------------------- outcome 6: a body that is not what its length states
+
+def raw_server(answer):
+    """A local server that sends `answer` (the whole HTTP answer, as bytes) and closes."""
+    srv = LocalServer("ok")
+
+    def handle(c):
+        try:
+            c.settimeout(1.0)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                head += chunk
+            srv.requests.append(head)
+            c.sendall(answer)
+        except OSError:
+            pass
+        finally:
+            c.close()
+    srv._handle = handle
+    return srv
+
+
+@pytest.mark.parametrize("answer", [
+    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + b"x" * 10,
+    b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nhello",
+    b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\nhello" % (4 * 1024 * 1024 + 1),
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+    b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\nContent-Length:\r\n\r\nhello",
+], ids=["short", "letters", "absurd", "over-the-limit", "twice", "signed", "empty-second"])
+def test_a_body_unlike_its_content_length_is_a_bad_answer_never_a_200(monkeypatch, answer):
+    local_hosts_allowed(monkeypatch)
+    for service in ("reddit", "kalshi"):
+        srv = raw_server(answer)
+        try:
+            try:
+                r = through(service, srv.url(path="/x"), 3)
+            except Exception:
+                continue                                                # refused: a bad answer
+            assert service == "reddit" and r.truncated, (service, r.status, r.body[:20])
+        finally:
+            srv.close()
+
+
+def test_a_body_exactly_its_content_length_is_a_good_answer(monkeypatch):
+    local_hosts_allowed(monkeypatch)
+    srv = raw_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    try:
+        r = through("reddit", srv.url(path="/x"), 3)
+        assert (r.status, r.body, r.truncated) == (200, b"hello", False)
+    finally:
+        srv.close()
+
+
+def test_a_transport_that_says_the_length_was_wrong_is_a_failed_fetch_of_its_own_kind(tmp_path):
+    def answer(n, t, m, u):
+        return cl.BadLength("shorter than stated") if n == 1 else resp(200, atom_with(atom_entry("t1_ok%d" % n)))
+    col, store, *_ = make(tmp_path, answer=answer)
+    run_for(col, col.clock, 300)
+    assert [r["failure"] for r in store.rows("SELECT failure FROM comment_fetches ORDER BY id")][:2] == ["bad_length", None]
+
+    def kanswer(url, timeout):
+        raise cl.BadLength("shorter than stated")
+    clock = Clock()
+    s = cl.Store(tmp_path / "k.sqlite", synchronous="OFF")
+    col = collector(s, clock, FakeReddit(clock, feed_answer()), kanswer)
+    run_for(col, clock, 30)
+    assert {r["failure"] for r in s.rows("SELECT failure FROM price_fetches")} == {"bad_length"}
+    s.close()
+
+
+# ------------------------------------------------------------------------------ outcome 7: bounded growth over months
+
+def test_what_was_asked_is_pruned_and_memory_stays_flat_over_60_days(tmp_path):
+    """Half an hour of collection on each of 60 days, official interface and one series: the records of what was
+    asked hold the current and the previous slot only, and the module's own memory does not grow."""
+    clock, n = Clock(DAY), {"r": 0}
+    kbody = json.dumps({"markets": [market("KXNBAGAME-26NOV20AAABBB-AAA")], "cursor": ""}).encode()
+
+    def reddit(method, url, headers, data, timeout):                   # stand-ins that keep no log of their own
+        clock.sleep(0.2)
+        if url == cl.TOKEN_URL:
+            return token_answer()
+        n["r"] += 1
+        return listing([("t1_n%06d" % n["r"], clock() - 3)])
+
+    def kalshi(url, timeout):
+        clock.sleep(0.3)
+        return kbody
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    col = cl.Collector(s, clock=clock, sleep=clock.sleep, reddit_fetch=reddit, kalshi_get=kalshi, env=CREDS,
+                       log=lambda line: None, series=("KXNBAGAME",))
+    here = [tracemalloc.Filter(True, cl.__file__)]
+    tracemalloc.start()
+    try:
+        col.start()
+        mine = {}
+        for d in range(60):
+            clock.t = max(clock.t, DAY + 86400 * d)
+            end = clock.t + 1800
+            while clock() < end:
+                col.step()
+                clock.sleep(min(max(col.next_due() - clock(), 0.0), 1.0))
+                assert len(col._asked) <= 2 and len(col._pages) <= 2 and len(col._burst) <= cl.OAUTH_BURST
+            if d in (9, 59):
+                mine[d] = sum(t.size for t in tracemalloc.take_snapshot().filter_traces(here).traces)
+    finally:
+        tracemalloc.stop()
+    assert s.rows("SELECT COUNT(*) AS n FROM price_fetches WHERE ok = 1")[0]["n"] >= 60 * 29
+    assert mine[59] - mine[9] < 64 * 1024, mine                                         # flat: no growth with the days
+    s.close()
+
+
+def store_bytes(s):
+    s.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return s.conn.execute("PRAGMA page_count").fetchone()[0] * s.conn.execute("PRAGMA page_size").fetchone()[0]
+
+
+def test_bad_answers_never_grow_the_store_more_than_a_healthy_hour_does(tmp_path):
+    """An hour of healthy answers against an hour in which both services answer 4 MB of garbage every time (an
+    unreadable feed, unreadable and over-the-limit Kalshi answers): the garbage hour adds no more to the store, and
+    of each bad answer only its hash, size, status and reason are kept."""
+    col, healthy, *_ = make(tmp_path, name="healthy.sqlite")
+    base = store_bytes(healthy)
+    run_for(col, col.clock, 3600)
+    grew_healthy = store_bytes(healthy) - base
+    filler = b"\x00garbage" * (cl.MAX_BODY // 8)
+    assert len(filler) == cl.MAX_BODY
+    n = {"r": 0, "k": 0}
+
+    def answer(i, t, m, u):
+        n["r"] += 1
+        return resp(200, b"%08d" % i + filler[8:], truncated=(i % 2 == 0))
+
+    clock = Clock()
+    s = cl.Store(tmp_path / "garbage.sqlite", lock=False, synchronous="OFF")
+
+    def kget(url, timeout):
+        n["k"] += 1
+        clock.sleep(0.1)
+        body = b"%08d" % n["k"] + filler[8:]
+        if n["k"] % 2:
+            raise cl.TooLarge(body)
+        return body
+    col = cl.Collector(s, clock=clock, sleep=clock.sleep, reddit_fetch=FakeReddit(clock, answer), kalshi_get=kget, env={},
+                       log=lambda line: None)
+    base = store_bytes(s)
+    run_for(col, clock, 3600)
+    grew_garbage = store_bytes(s) - base
+    assert n["r"] >= 20 and n["k"] >= 290
+    assert s.rows("SELECT COUNT(*) AS n FROM payloads")[0]["n"] == 0                   # no bad body kept
+    rows = s.rows("SELECT failure, body_sha256, body_size FROM price_fetches")
+    assert {r["failure"] for r in rows} == {"not_json", "too_large"}
+    assert all(r["body_size"] == cl.MAX_BODY and len(r["body_sha256"]) == 64 for r in rows)
+    first = s.rows("SELECT failure, status, body_sha256, body_size FROM comment_fetches WHERE status IS NOT NULL ORDER BY id")[0]
+    assert first == {"failure": "unparseable", "status": 200, "body_sha256": hashlib.sha256(b"%08d" % 1 + filler[8:]).hexdigest(),
+                     "body_size": cl.MAX_BODY}
+    assert grew_garbage <= grew_healthy, (grew_garbage, grew_healthy)
+    s.close()
+    healthy.close()
+
+
+# ------------------------------------------------------------------------------------ outcome 8: three small rules
+
+def test_a_public_reset_above_an_hour_is_honoured_as_an_hour_not_ignored(tmp_path):
+    def answer(n, t, m, u):
+        return resp(200, atom_with(atom_entry("t1_r%d" % n)), {"x-ratelimit-remaining": "50", "x-ratelimit-reset": "7200"})
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=answer)
+    run_for(col, clock, 2 * 3600)
+    ts = [r["t"] for r in reddit.log]
+    assert len(ts) >= 2, ts                                             # not taken as forever
+    assert all(b - a >= 3600 for a, b in zip(ts, ts[1:])), ts           # nor as nothing
+
+
+@pytest.mark.parametrize("headers,wait", [({"Retry-After": "240"}, 240), ({}, 300)])
+def test_a_truncated_429_still_backs_off(tmp_path, headers, wait):
+    def answer(n, t, m, u):
+        return resp(429, b"x" * 100, headers, truncated=True) if n == 1 else resp(200, atom_with(atom_entry("t1_ok%d" % n)))
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=answer)
+    run_for(col, clock, 900)
+    first, second = reddit.log[0]["t"], reddit.log[1]["t"]
+    assert second >= first + 0.2 + wait
+    ev = store.rows("SELECT detail FROM comment_events WHERE kind = 'backoff'")
+    assert len(ev) == 1 and ev[0]["detail"].startswith("http_429")
+    assert store.rows("SELECT failure FROM comment_fetches ORDER BY id")[0]["failure"] == "http_429"
+
+
+@pytest.mark.parametrize("how", ["exception", "unreadable"])
+def test_good_entries_of_a_slot_are_kept_when_a_later_page_is_rejected(tmp_path, monkeypatch, how):
+    """Slot 1 stores an old comment; slot 2's first page brings two newer ones and a cursor, and its second page is
+    rejected (an exception while handling it, or an unreadable answer). The two are stored with the first page's
+    time, the slot carries a possible-miss mark, and it is not covered."""
+    def pages(n, url):
+        if n == 1:
+            return listing([("t1_old", T0 - 100)])
+        if n == 2:
+            return listing([("t1_new1", T0 + 50), ("t1_new2", T0 + 40)], after="t1_new2")
+        return resp(200, b"not json at all") if how == "unreadable" else listing([("t1_new3", T0 + 30)])
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=oauth_answer(pages), env=CREDS)
+    if how == "exception":
+        real, calls = col._headers, {"n": 0}
+
+        def headers(extra=None):
+            calls["n"] += 1
+            if calls["n"] == 4:                                         # token, slot 1, slot 2 page 1, then page 2
+                raise RuntimeError("broken while handling page 2")
+            return real(extra)
+        monkeypatch.setattr(col, "_headers", headers)
+    run_for(col, clock, 110)
+    page1 = store.rows("SELECT id, fetched_at FROM comment_fetches WHERE slot_ts = ? AND page = 1 AND ok = 1", (T0 + 60,))
+    assert len(page1) == 1
+    kept = store.rows("SELECT comment_id, first_seen FROM comments WHERE comment_id IN ('t1_new1', 't1_new2') ORDER BY comment_id")
+    assert [r["comment_id"] for r in kept] == ["t1_new1", "t1_new2"]
+    assert all(r["first_seen"] == page1[0]["fetched_at"] for r in kept)
+    marks = store.rows("SELECT slot_ts FROM comment_events WHERE kind = 'possible_miss'")
+    assert [m["slot_ts"] for m in marks] == [T0 + 60]
+    later = store.rows("SELECT ok, failure FROM comment_fetches WHERE slot_ts = ? AND page = 2", (T0 + 60,))
+    assert later and later[0]["ok"] == 0
+    assert cl.verify(store) == []
+    c = cl.status(store, T0 + 120)["days"][0]["comments"]
+    assert c["covered_slots"] == 1 and c["miss_uncovered"] == 1
+
+
+def test_nothing_of_a_body_whose_content_length_is_over_the_limit_is_read(monkeypatch):
+    local_hosts_allowed(monkeypatch)
+    srv = raw_server(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % (cl.MAX_BODY + 1) + b"x" * (cl.MAX_BODY + 1))
+    try:
+        r = through("reddit", srv.url(path="/x"), 5)
+        assert r.truncated and r.body == b""                            # refused by its stated length alone
+    finally:
+        srv.close()
+
+
+def test_an_exception_after_a_page_was_read_well_keeps_its_entries_and_marks_the_slot(tmp_path, monkeypatch):
+    """Slot 2's page shares a comment with the store (so it would carry no possible-miss mark by itself), then the
+    handling of the slot raises: its comments are kept, the slot is marked, and it is not covered."""
+    def answer(n, t, m, u):
+        return resp(200, atom_with(atom_entry("t1_c%d" % n), atom_entry("t1_c%d" % (n - 1))))
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=answer)
+    real, calls = col._parse_into, {"n": 0}
+
+    def parse_into(f, r, oauth):
+        out = real(f, r, oauth)
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("broken after the page was read")
+        return out
+    monkeypatch.setattr(col, "_parse_into", parse_into)
+    run_for(col, clock, 150)
+    kept = store.rows("SELECT comment_id FROM comments ORDER BY comment_id")
+    assert [r["comment_id"] for r in kept] == ["t1_c0", "t1_c1", "t1_c2"]
+    assert [m["slot_ts"] for m in store.rows("SELECT slot_ts FROM comment_events WHERE kind = 'possible_miss'")] == [T0 + 120]
+    assert cl.verify(store) == []
+    c = cl.status(store, T0 + 240)["days"][0]["comments"]
+    assert c["covered_slots"] == 1 and c["miss_uncovered"] == 1
