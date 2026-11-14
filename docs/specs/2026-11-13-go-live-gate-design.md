@@ -28,12 +28,15 @@ owner renews it. The old form (the whole account id) is no longer accepted.
 
 **2. The checklist** `config/go_live.json`, written by hand, with the owner's own numbers (roadmap 4.9):
 
-    {"min_paper_broker_days": <n>, "min_reconciled_fills": <n>, "max_days_since_a_stopped_run": <n>,
+    {"min_paper_broker_days": <n>, "min_reconciled_fills": <n>, "min_days_since_a_stopped_run": <n>,
      "fills_checked_by_hand": <n>, "min_fills_checked_by_hand": <n>, "confirmed_by": "<your name>"}
 
 The order step computes the first three from its own paper record (days on which the paper order step ended
 "done", fills journaled with a clean reconcile, days since the last stopped run) and refuses live mode while
-any is unmet, saying which and by how much. The hand-check count is the owner's statement. There is no default:
+any is unmet, saying which and by how much. A stopped run is any paper run of the order step, unattended or
+practice, that stopped, except a stop outside market hours (stage `session`) and a refused approval (stage
+`ticket`); `min_days_since_a_stopped_run` is met when no stopped run lies within that many days. The
+hand-check count is the owner's statement. There is no default:
 without the file there is no live mode.
 
 **3. The limits** `config/risk.json`: in live mode `max_orders_per_day` must be present (the test environment's
