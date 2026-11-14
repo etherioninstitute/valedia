@@ -17,8 +17,10 @@ import random
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -245,12 +247,71 @@ def test_triggers_application_id_and_user_version_come_out_unchanged(repo):
             c.execute("UPDATE ledger SET payload = x'00' WHERE seq = 1")
 
 
+# A writer that records, for every commit, a time before it began and a time after it returned (wall clock, so the
+# test process can compare them with its own readings): a commit lies inside a window only when both are inside.
+WRITER_LOGGED = r'''
+import os, sqlite3, sys, time
+path, stop, cap, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+conn = sqlite3.connect(path, timeout=60, isolation_level=None)
+n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
+stop_at = n + cap
+out = open(log, "a")
+while not os.path.exists(stop) and n < stop_at:
+    began = time.time_ns()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        n += 1
+        conn.execute("INSERT INTO ledger VALUES (?, ?)", (n, b"z" * 300))
+        conn.execute("INSERT INTO mirror VALUES (?)", (n,))
+        conn.execute("UPDATE meta SET last = ?", (n,))
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
+        continue
+    out.write(f"{began} {time.time_ns()}\n")
+    out.flush()
+    time.sleep(0.002)                      # about 500 commits a second at most: it need not load the machine
+out.close()
+'''
+
+
+def _commits_inside(log, start_ns, end_ns):
+    """How many logged commits began and ended inside [start_ns, end_ns]."""
+    inside = 0
+    for line in Path(log).read_text().splitlines():
+        try:
+            began, ended = (int(x) for x in line.split())
+        except ValueError:
+            continue                                               # a line cut short by the end of the writer
+        inside += began >= start_ns and ended <= end_ns
+    return inside
+
+
 @pytest.mark.parametrize("mode", ["wal", "delete"])
-def test_database_written_during_the_backup_comes_out_consistent(small_repo, mode, capsys):
+def test_database_written_during_the_backup_comes_out_consistent(small_repo, mode, monkeypatch, capsys):
     live = small_repo.root / "memory" / "orderbook_loop.sqlite"
     make_db(live, mode=mode, rows=12000, pad=4000)                  # about 50 MB: the copy takes a while
     stop = small_repo.base / "stop_writer"
-    writer = subprocess.Popen([sys.executable, "-c", WRITER, str(live), str(stop), "6000"])   # capped: 6000 rows
+    log = small_repo.base / "commit_times.log"
+    window = {}
+    real_copy_sqlite = backup.copy_sqlite
+
+    def timed_copy_sqlite(src, *args, **kwargs):
+        mine = str(src).endswith("orderbook_loop.sqlite")
+        if mine:
+            window["start"] = time.time_ns()                        # the copy of this database begins
+        try:
+            return real_copy_sqlite(src, *args, **kwargs)
+        finally:
+            if mine:
+                window["end"] = time.time_ns()                      # and is finished (copy checked, hashed)
+
+    monkeypatch.setattr(backup, "copy_sqlite", timed_copy_sqlite)
+    writer = subprocess.Popen([sys.executable, "-c", WRITER_LOGGED, str(live), str(stop), "20000", str(log)])
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -259,13 +320,16 @@ def test_database_written_during_the_backup_comes_out_consistent(small_repo, mod
                     if c.execute("SELECT last FROM meta").fetchone()[0] > 12000 + 20:
                         break
             time.sleep(0.01)
+        run_began = time.time_ns()
         code = run(small_repo)
+        run_ended = time.time_ns()
     finally:
         stop.write_text("stop")
         try:
             writer.wait(timeout=60)
         except subprocess.TimeoutExpired:
             writer.kill()                                      # the process this test started, by its handle
+            writer.wait()
     assert code == 0, capsys.readouterr().err
     folder = newest(small_repo.dest)
     cpy = folder / "memory" / "orderbook_loop.sqlite"
@@ -278,6 +342,11 @@ def test_database_written_during_the_backup_comes_out_consistent(small_repo, mod
         assert c.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
     assert n_ledger == n_mirror == top == last        # one snapshot: the three agree
     assert n_ledger >= 12000 + 20
+    assert "start" in window and "end" in window and run_began <= window["start"] <= window["end"] <= run_ended
+    if mode == "wal":
+        # the writer really did commit while the copy ran (in rollback mode its writers are held out: a stated limit)
+        during = _commits_inside(log, window["start"], window["end"])
+        assert during >= 1, (during, _commits_inside(log, run_began, run_ended))
 
 
 # --------------------------------------------------------------------------------------- outcome: sources untouched
@@ -1888,3 +1957,178 @@ def test_a_database_that_is_another_file_only_at_the_check_before_is_refused(sma
     assert m["changed_into_a_link"] == ["memory/a.sqlite"]
     assert "memory/a.sqlite" not in {e["path"] for e in m["files"]}
     assert "memory/a.sqlite" in capsys.readouterr().err
+
+
+# =========================================================================================== rev 5
+# The checks of verify_connection_files and the lock wait of first_read, each reached by the tool's own hook
+# (open_fds is called once just before SQLite opens a database by its path and once after its first read,
+# just before the files of its connection are checked) with a link swapped in at that moment and out again.
+def _swapping_fds(monkeypatch, put_in, take_out):
+    """Make open_fds swap something in at its 1st call and out at its 2nd; returns the list of its calls."""
+    real = backup.open_fds
+    calls = []
+
+    def hooked():
+        calls.append(1)
+        if len(calls) == 1:
+            put_in()                                   # SQLite is about to open the database by its path
+        elif len(calls) == 2:
+            take_out()                                 # SQLite has read; its files are about to be checked
+        return real()
+
+    monkeypatch.setattr(backup, "open_fds", hooked)
+    return calls
+
+
+def test_a_link_to_an_outside_database_swapped_in_when_sqlite_opens_it_is_refused(small_repo, tmp_path,
+                                                                                    monkeypatch, capsys):
+    """The main file of the connection is not the scanned one (device and inode). Another thread is alive, so
+    the check of unknown files beside the database (which would also see the outside file) is off: only the
+    check of the main file's identity can refuse it. The original is back before the check after the copy."""
+    outside = tmp_path / "outside"
+    _secret_db(outside / "d.sqlite")
+    db = small_repo.root / "memory" / "a.sqlite"
+    aside = small_repo.root / "memory" / "a.aside"
+
+    def put_link_in():
+        os.rename(db, aside)
+        os.symlink(outside / "d.sqlite", db)
+
+    def put_original_back():
+        os.unlink(db)
+        os.rename(aside, db)
+
+    calls = _swapping_fds(monkeypatch, put_link_in, put_original_back)
+    gate = threading.Event()
+    noise = threading.Thread(target=gate.wait, daemon=True)
+    noise.start()
+    try:
+        assert threading.active_count() > 1
+        capsys.readouterr()
+        code = run(small_repo)
+    finally:
+        gate.set()
+        noise.join()
+    err = capsys.readouterr().err
+    assert len(calls) >= 2 and db.is_file() and not db.is_symlink()
+    assert code == 1, err
+    folder = newest(small_repo.dest)
+    m = manifest_of(folder)
+    assert m["changed_into_a_link"] == ["memory/a.sqlite"], m
+    assert "memory/a.sqlite" not in {e["path"] for e in m["files"]} and not (folder / "memory" / "a.sqlite").exists()
+    assert not _bytes_of_backup_contain(folder, SECRET)
+    assert "memory/a.sqlite" in err
+
+
+def _wal_repo(base):
+    """A repository whose only database is in WAL mode with a live writer (this process): -wal and -shm exist,
+    the un-checkpointed rows are in the -wal. Returns (repo, writer connection, path of the database)."""
+    r = Repo(base)
+    db = r.root / "memory" / "live.sqlite"
+    make_db(db, mode="wal", rows=40)
+    write_file(r.root / "journal" / "anchor.txt", "an anchor so that the run publishes")
+    r.writer = sqlite3.connect(db)
+    r.writer.execute("PRAGMA wal_autocheckpoint=0")
+    r.writer.executemany("INSERT INTO ledger VALUES (?, ?)", [(i, b"w" * 100) for i in range(41, 61)])
+    r.writer.executemany("INSERT INTO mirror VALUES (?)", [(i,) for i in range(41, 61)])
+    r.writer.execute("UPDATE meta SET last = 60")
+    r.writer.commit()
+    assert os.path.exists(str(db) + "-wal") and os.path.exists(str(db) + "-shm")
+    return r, db
+
+
+def test_an_outside_wal_swapped_in_when_sqlite_opens_it_is_refused(tmp_path, monkeypatch, capsys):
+    """A link to an outside -wal (the secret in its frames) stands at the -wal's name while SQLite makes its
+    first read, which is when it opens the -wal; the real -wal is back before the files are checked. Only the
+    check of every file the connection opened (and the first read that makes SQLite open them) can refuse it."""
+    r, db = _wal_repo(tmp_path)
+    try:
+        wal = Path(str(db) + "-wal")
+        aside = Path(str(wal) + ".aside")
+        outside_wal = tmp_path / "outside" / "outside-wal"
+        write_file(outside_wal, wal.read_bytes().replace(b"w" * 25, SECRET))      # same frames, the secret inside
+        assert SECRET in outside_wal.read_bytes()
+
+        def put_link_in():
+            os.rename(wal, aside)
+            os.link(outside_wal, wal)             # SQLite refuses a -wal that is a symbolic link: a hard link it opens
+
+        def put_original_back():
+            os.unlink(wal)
+            os.rename(aside, wal)
+
+        calls = _swapping_fds(monkeypatch, put_link_in, put_original_back)
+        assert threading.active_count() == 1               # the check of unknown files is only made in a plain process
+        capsys.readouterr()
+        code = run(r)
+        err = capsys.readouterr().err
+        assert len(calls) >= 2, (calls, err)
+        assert wal.is_file() and not wal.is_symlink() and not aside.exists()
+        assert code == 1, err
+        folder = newest(r.dest)
+        m = manifest_of(folder)
+        assert m["changed_into_a_link"] == ["memory/live.sqlite"], m
+        assert "memory/live.sqlite" not in {e["path"] for e in m["files"]}
+        assert not _bytes_of_backup_contain(folder, SECRET)
+        assert "memory/live.sqlite" in err
+    finally:
+        r.close()
+
+
+def test_sqlite_has_opened_the_wal_by_the_time_the_files_of_the_connection_are_checked(tmp_path, monkeypatch,
+                                                                                        capsys):
+    """first_read is what makes SQLite open the -wal: without it the check would see only the main file and
+    pass, and the -wal would be opened later, unchecked, by the copy itself."""
+    r, db = _wal_repo(tmp_path)
+    try:
+        seen = []
+        real = backup.verify_connection_files
+
+        def recording(root, rel, identity, before, after):
+            opened = set()
+            for fd in after - before:
+                with contextlib.suppress(OSError):
+                    st = os.fstat(fd)
+                    if stat.S_ISREG(st.st_mode):
+                        opened.add((st.st_dev, st.st_ino))
+            seen.append(opened)
+            return real(root, rel, identity, before, after)
+
+        monkeypatch.setattr(backup, "verify_connection_files", recording)
+        wal_st = os.stat(str(db) + "-wal")
+        main_st = os.stat(db)
+        assert run(r) == 0, capsys.readouterr().err
+        assert len(seen) == 1
+        assert (wal_st.st_dev, wal_st.st_ino) in seen[0]          # opened by the first read, before the check
+        assert (main_st.st_dev, main_st.st_ino) in seen[0]
+        assert entry(manifest_of(newest(r.dest)), "memory/live.sqlite")["tables"]["ledger"] == 60
+    finally:
+        r.close()
+
+
+def test_a_database_that_is_locked_for_a_while_is_waited_for_and_then_copied(small_repo):
+    """The tool waits through the lock itself (first_read retries in slices) and does not give the database
+    up when SQLite's own 1 s wait ends: it is locked for 2.5 s, longer than that, and is copied afterwards."""
+    stuck = small_repo.root / "memory" / "aaa_stuck.sqlite"
+    make_db(stuck, rows=20)
+    holder = sqlite3.connect(stuck, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--root", str(small_repo.root), "--dest",
+                             str(small_repo.dest), "--db-timeout", "120"], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for_work_folder(small_repo.dest, proc)
+        time.sleep(2.5)                                                   # well past SQLite's own wait of 1 s
+        still_waiting = proc.poll() is None
+        holder.execute("ROLLBACK")                                        # the lock is let go
+        out, err = proc.communicate(timeout=120)
+    finally:
+        holder.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert still_waiting, (proc.returncode, err)
+    assert proc.returncode == 0, (proc.returncode, err)
+    m = manifest_of(newest(small_repo.dest))
+    assert m["failures"] == [] and entry(m, "memory/aaa_stuck.sqlite")["tables"]["ledger"] == 20
+    assert entry(m, "memory/a.sqlite")["integrity"] == "ok"

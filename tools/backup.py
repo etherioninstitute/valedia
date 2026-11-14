@@ -30,12 +30,18 @@ device and inode are the scan's; otherwise it is not copied and the exit code is
 a database by path, so after it has opened it (and read it once, which opens a -wal and -shm) the files its
 connection is on are established from this process's own file descriptors, before any page is copied: one of
 them must be the scanned file, and every other regular file it opened must be the file a link-free walk to
-that name finds; otherwise the copy is not made (this closes a link swapped in and out within microseconds).
-A plain file that changes while it is copied is copied again (3 tries at most);
-if it still changed the last copy is kept, flagged `changed_during_copy` and named on stderr. A file with a
-database name that is not a database (the old state/ folder holds some) is kept as a plain file, flagged
+that name finds; otherwise the copy is not made (this narrows the window for a link swapped in and out
+within microseconds; it does not close it, see KNOWN LIMIT below). A plain file that changes while it is
+copied is copied again (3 tries at most); if it still changed the last copy is kept, flagged
+`changed_during_copy` and named on stderr. A file with a database name that is not a database (the old
+state/ folder holds some) is kept as a plain file, flagged
 `not_a_database` in its manifest entry and named on stderr as a NOTE; it does not make the backup partial,
 and verify re-checks its hash like any plain file.
+
+KNOWN LIMIT. A process that can write inside the repository's own folders during a backup is outside what
+this tool defends against. In particular, a folder in a rollback-mode database's path swapped for a link
+DURING the copy can make SQLite replay an outside -wal into a backup that is still called complete. The
+checks above narrow that window; they do not close it.
 
 What a source is spared, and what it is not. Nothing is created or removed beside a source and no source
 file is written by us, with one exception that SQLite itself makes, which we cannot prevent: reading a
