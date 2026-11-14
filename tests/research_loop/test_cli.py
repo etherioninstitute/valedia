@@ -520,6 +520,7 @@ def live_project(order_step_project, monkeypatch):
     from valedia_trader.data_and_fees import second_quote
     from valedia_trader.venues import webull
     root, _ = order_step_project
+    monkeypatch.setattr(webull, "LIVE_REPO", root, raising=False)       # T22b rev 2: this project is the repository
     cfg = root / "config"
     (cfg / "risk.json").write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.6,
                                                "max_open_positions": 5, "max_orders_per_day": 10}))
@@ -658,6 +659,7 @@ def test_a_live_approve_after_a_lock_stops_being_met_is_refused_and_marked_witho
 
 def test_the_live_venue_is_built_only_for_production_and_the_cash_account_with_the_owners_file(monkeypatch, tmp_path):
     from valedia_trader.venues import webull
+    monkeypatch.setattr(webull, "LIVE_REPO", tmp_path, raising=False)   # T22b rev 2: the repository, in-process
     files = cli._live_files(cli.LoopPaths(tmp_path), {})
     seen = []
     monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: seen.append(kw) or "v"))
@@ -675,3 +677,145 @@ def test_a_paper_order_step_never_enters_live_mode(order_step_project, monkeypat
     root, venue = order_step_project
     monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
     assert cli.main(["--root", str(root), "order-step"]) == 0
+
+
+
+# ---- T22b rev 2, outcomes 1, 2 and 4: live mode exists only for the repository (webull.LIVE_REPO); a --root, an
+# environment variable, a working folder or an argument naming another folder opens nothing
+
+def _no_reads(monkeypatch):
+    from valedia_trader.execution_and_risk import go_live
+    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    monkeypatch.setattr(go_live, "judge_locks", lambda *a, **k: pytest.fail("an owner's file or the journal was read"))
+    monkeypatch.setattr(cli, "_order_step_live_venue", lambda *a, **k: pytest.fail("a venue was built"))
+
+
+@pytest.mark.parametrize("argv", [["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456",
+                                  "--capital", "100000"], ["--live", "--check"], ["--live", "--check", "--capital", "5"]])
+def test_a_live_run_whose_root_is_another_folder_is_refused_at_the_flags_step(live_project, monkeypatch, capsys, argv,
+                                                                                 tmp_path_factory):
+    from valedia_trader.venues import webull
+    root, venue, built, asked = live_project                     # every lock met under root
+    repo = tmp_path_factory.mktemp("repo")
+    monkeypatch.setattr(webull, "LIVE_REPO", repo, raising=False)                # the repository is another (empty) folder
+    _no_reads(monkeypatch)
+    before = _tree(root), _tree(repo)
+    assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == "refused: live mode runs only from the repository itself (--root names another folder)\n"
+    assert captured.out == "" and built == [] and venue.calls == [] and asked == [] and (_tree(root), _tree(repo)) == before
+
+
+def test_a_live_root_that_is_the_repository_through_a_link_or_no_root_at_all_runs_as_before(live_project, capsys, tmp_path_factory):
+    root, venue, built, asked = live_project
+    link = tmp_path_factory.mktemp("links") / "repo"
+    link.symlink_to(root, target_is_directory=True)
+    for argv in (["--root", str(link)], ["--root", str(root) + "/."], []):
+        built.clear()
+        assert cli.main([*argv, "order-step", "--live", "--check"]) == 0, argv
+        report = json.loads(capsys.readouterr().out)
+        assert report["all_met"] is True and len(built) == 1 and built[0].confirmation == root / "config" / "webull_live.json"
+
+
+def test_without_live_a_root_elsewhere_is_untouched(order_step_project, monkeypatch, capsys, tmp_path_factory):
+    from valedia_trader.venues import webull
+    root, venue = order_step_project
+    monkeypatch.setattr(webull, "LIVE_REPO", tmp_path_factory.mktemp("repo"), raising=False)
+    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
+    assert cli.main(["--root", str(root), "order-step"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "done" and venue.book
+
+
+_REAL_LIVE_VENUE = cli._order_step_live_venue                          # before live_project replaces it
+
+EVERY_NAME = ["VALEDIA_ROOT", "VALEDIA_REPO", "VALEDIA_TRADER_ROOT", "VALEDIA_HOME", "REPO", "REPO_ROOT", "ROOT", "HOME",
+              "PWD", "WEBULL_LIVE", "WEBULL_LIVE_FILE", "WEBULL_LIVE_CONFIRMATION", "WEBULL_CONFIRMATION",
+              "WEBULL_CONFIRMATION_FILE", "LIVE_CONFIRMATION", "CONFIRMATION_FILE", "GO_LIVE", "GO_LIVE_FILE",
+              "GO_LIVE_CHECKLIST", "CHECKLIST", "RISK", "RISK_FILE", "RISK_LIMITS", "LIMITS_FILE", "JOURNAL",
+              "JOURNAL_DIR", "PAPER_JOURNAL", "CONFIG", "CONFIG_DIR", "LIVE_REPO", "VALEDIA_LIVE", "LIVE"]
+
+
+def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_another_folder(live_project, monkeypatch,
+                                                                                               capsys, tmp_path_factory):
+    import argparse as ap
+    from types import SimpleNamespace
+
+    from valedia_trader.execution_and_risk import go_live
+    from valedia_trader.execution_and_risk import order_step as osx
+    from valedia_trader.research_loop.paper import Journal
+    from valedia_trader.venues import webull
+    other, venue, built, asked = live_project                    # every lock met in this folder: the made-up one
+    repo = tmp_path_factory.mktemp("repo")                        # the repository: no owner's file at all
+    (repo / "config").mkdir()
+    monkeypatch.setattr(webull, "LIVE_REPO", repo, raising=False)
+    cfg = other / "config"
+    every = {name: str(other) for name in EVERY_NAME}
+    every.update({n: str(cfg / "webull_live.json") for n in EVERY_NAME if "CONFIRM" in n or n.startswith("WEBULL_LIVE")})
+    every.update({n: str(cfg / "go_live.json") for n in EVERY_NAME if "GO_LIVE" in n or n == "CHECKLIST"})
+    every.update({n: str(cfg / "risk.json") for n in EVERY_NAME if "RISK" in n or "LIMITS" in n})
+    every.update({n: str(other / "journal") for n in EVERY_NAME if "JOURNAL" in n})
+    for name, value in every.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(other)
+    env = {**LIVE_KEYS, **every}
+    monkeypatch.setattr(cli, "_live_environ", lambda: env)
+    before = _tree(other), _tree(repo)
+    sent = []
+
+    class Recorder:                                               # a client that records any use of itself
+        def __getattr__(self, name):
+            sent.append(name)
+            raise AssertionError(f"the client was used: {name}")
+
+    # the command line: --root the other folder, every flag, every environment variable
+    for argv in (["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456", "--capital", "100000"],
+                 ["--live", "--check"]):
+        assert cli.main(["--root", str(other), "order-step", *argv]) == 2
+        assert "runs only from the repository itself" in capsys.readouterr().err
+    # the command line without --root: the repository's files, none written, so nothing opens
+    assert cli.main(["order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    err = capsys.readouterr().err
+    assert "lock 1 (the confirmation): config/webull_live.json is missing" in err and "lock 2 (" in err
+    assert cli.main(["order-step", "--live", "--check"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert [lock["met"] for lock in report["locks"]][:2] == [False, False] and report["all_met"] is False
+    assert "is missing" in report["locks"][0]["reason"] and "is missing" in report["locks"][1]["reason"]
+    # the command function given the other folder's paths, the environment and a venue builder
+    args = ap.Namespace(live=True, check=False, propose=True, approve=None, capital=100000.0, fractional=False)
+    assert cli.live_order_step_command(args, cli.LoopPaths(other), environ=env,
+                                       build_venue=lambda *a: pytest.fail("a venue was built"),
+                                       second_opinion=lambda *a, **k: pytest.fail("a second source was asked")) == 2
+    assert "runs only from the repository itself" in capsys.readouterr().err
+    # the step itself, given the other folder's limits and journal and an object naming its files
+    pointing = SimpleNamespace(confirmation=cfg / "webull_live.json", checklist=cfg / "go_live.json",
+                               limits=cfg / "risk.json", journal=other / "journal", root=other,
+                               paper_venue=go_live.PAPER_VENUE, environ=env, calendar=None)
+    led = osx.open_ledger(tmp_path_factory.mktemp("led") / "orders.sqlite", clock=lambda: 0.0)
+    try:
+        for live in (pointing, go_live.LiveFiles(environ=env)):
+            out = osx.run_order_step(ledger=led, venue=venue, paper=lambda: pytest.fail("the paper book was read"),
+                                     quotes=lambda s: pytest.fail("a quote was asked"), journal=Journal(other / "journal"),
+                                     limits_file=cfg / "risk.json", state=tmp_path_factory.mktemp("st") / "s.sqlite",
+                                     clock=lambda: 0.0, halt_file=None, latch_file=None, capital=100000.0,
+                                     fractional=False, live=live, second_opinion=lambda *a, **k: pytest.fail("asked"),
+                                     propose=True)
+            assert out["status"] == "stopped" and out["stage"] == "lock", out
+    finally:
+        led.close()
+    # the locks module given that object
+    state = go_live.judge_locks(pointing, webull.ny_date(), 100000.0)
+    assert [lock["met"] for lock in state.locks[:2]] == [False, False] and state.confirmation is None
+    # the function that builds the real production venue, given that object: only the repository's own path
+    seen = []
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: seen.append(kw) or "v"))
+    assert _REAL_LIVE_VENUE(pointing, env) == "v"
+    assert seen == [{"confirmation_file": repo / "config" / "webull_live.json"}]
+    # the adapter given the other folder's confirmation
+    v = webull.WebullVenue("k", "s", environment="production", client=Recorder(), confirmation_file=cfg / "webull_live.json")
+    with pytest.raises(webull.LiveTradingNotConfirmed):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert webull.live_confirmation(cfg / "webull_live.json") == (None, webull.NOT_OWN_CONFIRMATION)
+    assert webull.load_live_confirmation(cfg / "webull_live.json") is None
+    assert built == [] and venue.calls == [] and asked == [] and sent == []
+    assert (_tree(other), _tree(repo)) == before
+    assert not list(repo.rglob("webull_live.json")) and not list(repo.rglob("go_live.json"))

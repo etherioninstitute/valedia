@@ -81,11 +81,36 @@ def paper_journal(folder: Path, done_days=("2026-11-09", "2026-11-10", "2026-11-
     return folder
 
 
+class World:
+    """One test's repository in a temporary folder: the owner's three files and the journal at the places live mode
+    reads them (LIVE_REPO/config/..., LIVE_REPO/journal), and `live`, the LiveFiles a run is given (no paths)."""
+
+    def __init__(self, root, environ):
+        self.root = root
+        cfg = root / "config"
+        self.confirmation, self.checklist, self.limits = cfg / "webull_live.json", cfg / "go_live.json", cfg / "risk.json"
+        self.journal = root / "journal"
+        self.live = gl.LiveFiles(environ=environ, calendar=CAL)
+
+    def with_environ(self, environ):
+        other = World(self.root, environ)
+        return other
+
+
+def judge(w, today, capital=None):
+    """judge_locks with this world's folder as the repository (webull.LIVE_REPO, replaced in-process)."""
+    wb.LIVE_REPO = w.root
+    return gl.judge_locks(w.live, today, capital)
+
+
+@pytest.fixture(autouse=True)
+def _live_repo_restored(monkeypatch):
+    monkeypatch.setattr(wb, "LIVE_REPO", getattr(wb, "LIVE_REPO", wb.REPO), raising=False)
+
+
 def world(tmp_path, conf=None, checklist=None, limits=None, environ=None, **journal):
-    cfg = tmp_path / "repo" / "config"
-    files = gl.LiveFiles(confirmation=cfg / "webull_live.json", checklist=cfg / "go_live.json", limits=cfg / "risk.json",
-                         journal=paper_journal(tmp_path / "repo" / "journal", **journal), root=tmp_path / "repo",
-                         environ=ENV if environ is None else environ, calendar=CAL)
+    files = World(tmp_path / "repo", ENV if environ is None else environ)
+    paper_journal(files.journal, **journal)
     for path, value in ((files.confirmation, conf_dict() if conf is None else conf),
                         (files.checklist, checklist_dict() if checklist is None else checklist),
                         (files.limits, LIMITS if limits is None else limits)):
@@ -109,7 +134,7 @@ def snapshot(folder: Path):
 
 def test_all_four_locks_met_on_a_good_world(tmp_path):
     files = world(tmp_path)
-    state = gl.judge_locks(files, TODAY, capital=1500)
+    state = judge(files, TODAY, capital=1500)
     assert state.met and state.unmet() is None and state.digest
     assert [lock["lock"] for lock in state.locks] == [1, 2, 3, 4]
     assert state.confirmation["max_capital"] == 2000.0 and state.max_orders_per_day == 10
@@ -161,7 +186,7 @@ def test_any_unsafe_owner_file_is_an_unmet_lock_and_nothing_is_touched(tmp_path,
     else:
         _write(path, "")
     before = snapshot(tmp_path)
-    state = gl.judge_locks(files, TODAY, capital=1000)
+    state = judge(files, TODAY, capital=1000)
     after = snapshot(tmp_path)
     if how == "unreadable":
         path.chmod(0o644)
@@ -179,7 +204,7 @@ def test_no_environment_variable_stands_in_for_a_file(tmp_path, monkeypatch):
     files = world(tmp_path, conf=DROP, checklist=DROP)
     for name in ("WEBULL_LIVE", "WEBULL_LIVE_CONFIRMATION", "GO_LIVE", "VALEDIA_GO_LIVE", "LIVE_CONFIRMED"):
         monkeypatch.setenv(name, json.dumps(conf_dict()))
-    state = gl.judge_locks(gl.LiveFiles(**{**files.__dict__, "environ": {**ENV, **os.environ}}), TODAY)
+    state = judge(files.with_environ({**ENV, **os.environ}), TODAY)
     assert [lock["met"] for lock in state.locks] == [False, False, True, True]
     assert "is missing" in state.locks[0]["reason"] and "there is no live mode without it" in state.locks[1]["reason"]
     assert not files.confirmation.exists() and not files.checklist.exists()
@@ -220,14 +245,14 @@ def test_the_defaults_are_the_repositorys_own_files_which_no_test_here_writes():
     ({"confirmed_by": DROP}, "lacks confirmed_by"),
     ({"account_id": "ACC-0001-1234"}, "old form")])
 def test_lock_one_refuses_each_rule_broken(tmp_path, change, words):
-    state = gl.judge_locks(world(tmp_path, conf=conf_dict(**change)), TODAY)
+    state = judge(world(tmp_path, conf=conf_dict(**change)), TODAY)
     assert not state.locks[0]["met"] and words in state.locks[0]["reason"] and state.confirmation is None
     assert [lock["met"] for lock in state.locks[1:]] == [True, True, True]
 
 
 def test_lock_one_accepts_today_and_31_days_ahead_and_a_decimal_cap(tmp_path):
     for until in (TODAY, TODAY + timedelta(days=31)):
-        state = gl.judge_locks(world(tmp_path / until.isoformat(), conf=conf_dict(valid_until=until.isoformat(),
+        state = judge(world(tmp_path / until.isoformat(), conf=conf_dict(valid_until=until.isoformat(),
                                                                                      max_order_value=249.5)), TODAY)
         assert state.locks[0]["met"], state.locks[0]["reason"]
 
@@ -235,18 +260,18 @@ def test_lock_one_accepts_today_and_31_days_ahead_and_a_decimal_cap(tmp_path):
 def test_the_old_form_is_refused_by_the_order_steps_lock(tmp_path):
     old = {"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000,
            "i_understand_this_trades_real_money": True}
-    state = gl.judge_locks(world(tmp_path, conf=old), TODAY)
+    state = judge(world(tmp_path, conf=old), TODAY)
     assert not state.locks[0]["met"] and "old form" in state.locks[0]["reason"]
     assert "ACC-0001" not in json.dumps(state.locks)                  # invariant 10: no account id in what is said
 
 
 def test_capital_above_max_capital_says_by_how_much(tmp_path):
     files = world(tmp_path)
-    state = gl.judge_locks(files, TODAY, capital=2500)
+    state = judge(files, TODAY, capital=2500)
     assert not state.locks[0]["met"] and "above max_capital 2,000.00 (by 500.00)" in state.locks[0]["reason"]
     for bad in (0, -5, float("nan"), float("inf"), True, "100"):
-        assert not gl.judge_locks(files, TODAY, capital=bad).locks[0]["met"]
-    assert gl.judge_locks(files, TODAY, capital=2000).locks[0]["met"]
+        assert not judge(files, TODAY, capital=bad).locks[0]["met"]
+    assert judge(files, TODAY, capital=2000).locks[0]["met"]
 
 
 _NOT_A_VALUE = [True, False, None, [], {}, [1], {"a": 1}, "", " ", "x" * 5000, "\u0000", "NaN", "1e3"]
@@ -336,12 +361,12 @@ def _many_malformed(rng, good: dict, n: int):
 def test_two_hundred_and_fifty_malformed_confirmation_files_none_opens_lock_one(tmp_path):
     files = world(tmp_path)
     good = conf_dict()
-    assert gl.judge_locks(files, TODAY).locks[0]["met"]
+    assert judge(files, TODAY).locks[0]["met"]
     opened = []
     for text, mode in _many_malformed(random.Random(20261113), good, 250):
         files.confirmation.write_text(text, errors="surrogatepass")
         files.confirmation.chmod(mode)
-        state = gl.judge_locks(files, TODAY, capital=100)          # never raises
+        state = judge(files, TODAY, capital=100)          # never raises
         data, why = wb.live_confirmation(files.confirmation, today=TODAY, root=files.root)
         if state.locks[0]["met"] or data is not None or state.digest is not None or not why:
             opened.append((text, oct(mode)))
@@ -353,12 +378,12 @@ def test_two_hundred_and_fifty_malformed_checklist_files_none_opens_lock_two(tmp
     good = checklist_dict(min_paper_broker_days=1, min_reconciled_fills=1, min_days_since_a_stopped_run=0,
                           fills_checked_by_hand=0, min_fills_checked_by_hand=0)
     _write(files.checklist, good)
-    assert gl.judge_locks(files, TODAY).locks[1]["met"]       # the easiest checklist opens it: no mangled one may
+    assert judge(files, TODAY).locks[1]["met"]       # the easiest checklist opens it: no mangled one may
     opened = []
     for text, mode in _many_malformed(random.Random(4242), good, 250):
         files.checklist.write_text(text, errors="surrogatepass")
         files.checklist.chmod(mode)
-        state = gl.judge_locks(files, TODAY)
+        state = judge(files, TODAY)
         if state.locks[1]["met"] or state.digest is not None:
             opened.append((text, oct(mode)))
     assert opened == []
@@ -379,14 +404,14 @@ def test_two_hundred_and_fifty_malformed_checklist_files_none_opens_lock_two(tmp
     ({"min_reconciled_fills": DROP}, "there is no default"),
     ({"note": "hi"}, "not part of the checklist")])
 def test_lock_two_refuses_a_checklist_that_breaks_a_rule(tmp_path, change, words):
-    state = gl.judge_locks(world(tmp_path, checklist=checklist_dict(**change)), TODAY)
+    state = judge(world(tmp_path, checklist=checklist_dict(**change)), TODAY)
     assert not state.locks[1]["met"] and words in state.locks[1]["reason"]
 
 
 def test_lock_two_says_how_far_short_each_figure_is(tmp_path):
     files = world(tmp_path, checklist=checklist_dict(min_paper_broker_days=5, min_reconciled_fills=7,
                                                      fills_checked_by_hand=1, min_fills_checked_by_hand=4))
-    reason = gl.judge_locks(files, TODAY).locks[1]["reason"]
+    reason = judge(files, TODAY).locks[1]["reason"]
     assert "3 paper trading days on which the order step ended done, 5 needed (2 short)" in reason
     assert "3 fills journaled in paper runs with a clean reconcile, 7 needed (4 short)" in reason
     assert "1 fills checked by hand, 4 needed (3 short)" in reason
@@ -417,7 +442,7 @@ def test_a_stopped_paper_run_counts_by_its_days(tmp_path):
         stop_day = (TODAY - timedelta(days=since)).isoformat()
         files = world(tmp_path / f"{since}-{needed}", checklist=checklist_dict(min_days_since_a_stopped_run=needed),
                       stops=((stop_day, "reconcile"),))
-        lock = gl.judge_locks(files, TODAY).locks[1]
+        lock = judge(files, TODAY).locks[1]
         assert lock["met"] is met, lock["reason"]
         assert lock["figures"]["record"]["days_since_a_stopped_run"] == since
         if not met:
@@ -429,7 +454,7 @@ def test_a_damaged_journal_is_an_unmet_lock_two(tmp_path):
     day_file = sorted(files.journal.glob("*.jsonl"))[0]
     with day_file.open("ab") as fh:
         fh.write(b'{"type": "order_step", "venue": "webull-sandbox", "ev')
-    state = gl.judge_locks(files, TODAY)
+    state = judge(files, TODAY)
     assert not state.locks[1]["met"] and "the journal is damaged (1 line cannot be read)" in state.locks[1]["reason"]
 
 
@@ -438,7 +463,7 @@ def test_a_missing_journal_folder_is_no_record_and_is_not_created(tmp_path):
     for p in files.journal.iterdir():
         p.unlink()
     files.journal.rmdir()
-    state = gl.judge_locks(files, TODAY)
+    state = judge(files, TODAY)
     assert not state.locks[1]["met"] and "no paper record" in state.locks[1]["reason"]
     assert not files.journal.exists()
 
@@ -450,7 +475,7 @@ def test_an_undated_stopped_run_is_not_guessed(tmp_path):
     with path.open("a") as fh:
         fh.write(json.dumps({"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "z", "event": "summary",
                              "status": "stopped", "stage": "send", "day": "someday"}) + "\n")
-    assert "carries no date" in gl.judge_locks(files, TODAY).locks[1]["reason"]
+    assert "carries no date" in judge(files, TODAY).locks[1]["reason"]
 
 
 # ---- invariant 5 (the file side): lock 3, the limits
@@ -461,57 +486,57 @@ def test_lock_three_needs_max_orders_per_day_from_1_to_200(tmp_path, cap, met):
     limits = {k: v for k, v in LIMITS.items() if k != "max_orders_per_day"}
     if cap is not None:
         limits["max_orders_per_day"] = cap
-    state = gl.judge_locks(world(tmp_path, limits=limits), TODAY)
+    state = judge(world(tmp_path, limits=limits), TODAY)
     assert state.locks[2]["met"] is met
     if not met:
         assert "max_orders_per_day" in state.locks[2]["reason"] and state.max_orders_per_day is None
 
 
 def test_lock_three_needs_the_risk_gate_to_accept_the_limits(tmp_path):
-    state = gl.judge_locks(world(tmp_path, limits={**LIMITS, "max_position_pct": 2.0}), TODAY)
+    state = judge(world(tmp_path, limits={**LIMITS, "max_position_pct": 2.0}), TODAY)
     assert not state.locks[2]["met"] and "risk gate accepts" in state.locks[2]["reason"]
 
 
 @pytest.mark.parametrize("absent", gl.SECOND_SOURCE_KEYS)
 def test_lock_three_needs_both_second_sources_keys(tmp_path, absent):
     for env in ({k: v for k, v in ENV.items() if k != absent}, {**ENV, absent: ""}, {**ENV, absent: "  "}):
-        state = gl.judge_locks(world(tmp_path / str(len(env)) / repr(env[absent] if absent in env else None).strip("'"),
+        state = judge(world(tmp_path / str(len(env)) / repr(env[absent] if absent in env else None).strip("'"),
                                      environ=env), TODAY)
         assert not state.locks[2]["met"] and absent in state.locks[2]["reason"]
 
 
 def test_the_digest_follows_each_file_and_is_kept_only_when_locks_one_to_three_are_met(tmp_path):
     files = world(tmp_path)
-    first = gl.judge_locks(files, TODAY).digest
-    assert first == gl.judge_locks(files, TODAY).digest
+    first = judge(files, TODAY).digest
+    assert first == judge(files, TODAY).digest
     seen = {first}
     for path, value in ((files.confirmation, conf_dict(max_capital=1999)), (files.checklist, checklist_dict(confirmed_by="B")),
                         (files.limits, {**LIMITS, "max_orders_per_day": 9})):
         _write(path, value)
-        d = gl.judge_locks(files, TODAY).digest
+        d = judge(files, TODAY).digest
         assert d and d not in seen
         seen.add(d)
     _write(files.limits, {**LIMITS, "max_orders_per_day": 0})
-    assert gl.judge_locks(files, TODAY).digest is None
+    assert judge(files, TODAY).digest is None
 
 
 # ---- T22b rulings: the key is min_days_since_a_stopped_run; a stop at stage session or ticket is not a stopped run
 
 def test_the_checklist_key_is_min_days_since_a_stopped_run_and_the_old_name_is_refused(tmp_path):
-    good = gl.judge_locks(world(tmp_path / "new"), TODAY).locks[1]
+    good = judge(world(tmp_path / "new"), TODAY).locks[1]
     assert good["met"] and "min_days_since_a_stopped_run" in good["figures"]["owner"]
     assert "max_days_since_a_stopped_run" not in json.dumps(good)
     old = {**{k: v for k, v in checklist_dict().items() if k != "min_days_since_a_stopped_run"},
            "max_days_since_a_stopped_run": 2}
-    lock = gl.judge_locks(world(tmp_path / "old", checklist=old), TODAY).locks[1]
+    lock = judge(world(tmp_path / "old", checklist=old), TODAY).locks[1]
     assert not lock["met"] and "not part of the checklist" in lock["reason"] and "max_days_since_a_stopped_run" in lock["reason"]
     both = {**checklist_dict(), "max_days_since_a_stopped_run": 2}
-    assert not gl.judge_locks(world(tmp_path / "both", checklist=both), TODAY).locks[1]["met"]
+    assert not judge(world(tmp_path / "both", checklist=both), TODAY).locks[1]["met"]
 
 
 def test_the_shortfall_text_names_min_days_since_a_stopped_run(tmp_path):
     files = world(tmp_path, checklist=checklist_dict(min_days_since_a_stopped_run=3), stops=(("2026-11-12", "send"),))
-    reason = gl.judge_locks(files, TODAY).locks[1]["reason"]
+    reason = judge(files, TODAY).locks[1]["reason"]
     assert "min_days_since_a_stopped_run 3" in reason and "(2 short)" in reason
 
 
@@ -542,3 +567,40 @@ def test_a_refused_approval_is_not_a_stopped_run_but_a_practice_run_stopped_else
                            "status": "stopped", "stage": "send", "mode": "approve"})
     record, _ = gl.paper_record(folder, gl.PAPER_VENUE, TODAY, CAL)
     assert record["days_since_a_stopped_run"] == 1 and record["last_stopped_run"] == "2026-11-12"
+
+
+# ==== T22b rev 2: the owner's files are LIVE_REPO's; nothing a caller passes moves them
+
+def test_live_files_carry_no_paths_and_follow_live_repo(tmp_path):
+    for name in ("confirmation", "checklist", "limits", "journal", "root", "paper_venue"):
+        with pytest.raises(TypeError):
+            gl.LiveFiles(**{name: tmp_path / "x"})
+    wb.LIVE_REPO = tmp_path / "r1"
+    files = gl.LiveFiles(environ=ENV)
+    assert (files.confirmation, files.checklist, files.limits, files.journal, files.root) == (
+        tmp_path / "r1" / "config" / "webull_live.json", tmp_path / "r1" / "config" / "go_live.json",
+        tmp_path / "r1" / "config" / "risk.json", tmp_path / "r1" / "journal", tmp_path / "r1")
+    wb.LIVE_REPO = tmp_path / "r2"
+    assert files.confirmation == tmp_path / "r2" / "config" / "webull_live.json"
+
+
+class _Pointing:
+    """An object shaped like the old LiveFiles, every path at another folder where every lock is met."""
+
+    def __init__(self, w):
+        self.confirmation, self.checklist, self.limits, self.journal, self.root = (w.confirmation, w.checklist, w.limits,
+                                                                                    w.journal, w.root)
+        self.paper_venue, self.environ, self.calendar = gl.PAPER_VENUE, ENV, CAL
+
+
+def test_the_locks_are_read_only_from_live_repo_whatever_the_object_given_says(tmp_path):
+    met = world(tmp_path / "other")
+    assert judge(met, TODAY).met                                              # met where it is
+    empty = tmp_path / "repo"
+    empty.mkdir()
+    wb.LIVE_REPO = empty                                                      # the repository holds no owner file
+    for given in (_Pointing(met), met.live, gl.LiveFiles(environ=ENV, calendar=CAL)):
+        state = gl.judge_locks(given, TODAY, 1000)
+        assert [lock["met"] for lock in state.locks[:3]] == [False, False, False], state.locks
+        assert all("is missing" in lock["reason"] for lock in state.locks[:3]) and state.digest is None
+    assert sorted(p.name for p in empty.iterdir()) == []                      # nothing created there either

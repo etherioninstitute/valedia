@@ -4693,6 +4693,14 @@ def test_the_ticket_file_refuses_a_late_tag_and_any_second_row_that_is_not_a_cor
 import shutil as _shutil
 
 from valedia_trader.execution_and_risk import go_live as gl
+from valedia_trader.venues import webull as _wb
+
+
+@pytest.fixture(autouse=True)
+def _live_repo_restored(monkeypatch):
+    """T22b rev 2: live mode reads the owner's files only from webull.LIVE_REPO; a live world replaces it in-process
+    (live_world) and this puts it back after every test."""
+    monkeypatch.setattr(_wb, "LIVE_REPO", getattr(_wb, "LIVE_REPO", _wb.REPO), raising=False)
 
 LIVE_ENDS = ACCOUNT[-4:]
 LIVE_ENV = {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s", "FINNHUB_API_KEY": "f"}
@@ -4754,9 +4762,8 @@ def live_world(tmp, venue=None, conf=None, checklist=None, limits=None, environ=
             (cfg / name).chmod(0o644)
     w.limits = cfg / "risk.json"
     _paper_record(w.journal)
-    w.live = gl.LiveFiles(confirmation=cfg / "webull_live.json", checklist=cfg / "go_live.json", limits=cfg / "risk.json",
-                          journal=tmp / "journal", root=tmp, environ=dict(LIVE_ENV if environ is None else environ),
-                          calendar=CAL)
+    _wb.LIVE_REPO = tmp                                            # this world's folder is the repository, in-process
+    w.live = gl.LiveFiles(environ=dict(LIVE_ENV if environ is None else environ), calendar=CAL)
     w.second = Second()
     return w
 
@@ -5598,3 +5605,55 @@ def test_a_paper_stop_today_opens_or_closes_lock_two_by_its_stage(tmp_path, stag
     else:
         assert out["stage"] == "lock" and "lock 2 (" in out["reason"] and "min_days_since_a_stopped_run 1" in out["reason"]
         assert w.venue.calls == []
+
+
+
+# ---- T22b rev 2, outcome 2: inside the step, live mode reads the owner's files and the paper record only from
+# LIVE_REPO; a limits file or a journal anywhere else is refused before anything is read or written
+
+def _snapshot(folder, skip=()):
+    """Every file under the folder and its bytes, without the order ledger the harness itself opens around a run."""
+    return {str(p.relative_to(folder)): (p.read_bytes() if p.is_file() else None) for p in sorted(folder.rglob("*"))
+            if not any(str(p).startswith(str(s)) for s in skip)}
+
+
+@pytest.mark.parametrize("moved", ["limits", "journal", "both"])
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+def test_a_live_run_whose_limits_file_or_journal_is_not_the_repositorys_is_refused_before_anything(tmp_path, moved, mode):
+    other = live_world(tmp_path / "other")                         # every lock met there
+    w = live_world(tmp_path / "w")                                 # the repository: every lock met here too
+    number = "123456"
+    if mode == "approve":
+        _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+        w.later(1)
+    w.venue.calls.clear()
+    w.quote_calls.clear()
+    w.second.calls.clear()
+    if moved in ("limits", "both"):
+        w.limits = other.limits
+    if moved in ("journal", "both"):
+        w.journal = other.journal
+    w.ledger().close()                                             # the harness's own ledger (and its folder), made first
+    skip = (w.ledger_path, other.ledger_path)
+    before = (_snapshot(w.tmp, skip), _snapshot(other.tmp, skip))
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w) if mode == "propose" else lapprove(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "lock" and "only from the repository" in out["reason"], out
+    assert w.venue.calls == [] and w.quote_calls == [] and w.second.calls == []
+    assert (_snapshot(w.tmp, skip), _snapshot(other.tmp, skip)) == before   # nothing written by the step
+
+
+def test_a_live_run_given_an_object_whose_paths_point_elsewhere_reads_only_the_repository(tmp_path):
+    other = live_world(tmp_path / "other")                         # every lock met there
+    w = live_world(tmp_path / "w")
+    for name in ("webull_live.json", "go_live.json"):
+        (w.cfg / name).unlink()                                    # the repository has no confirmation, no checklist
+
+    class Pointing:
+        confirmation, checklist = other.cfg / "webull_live.json", other.cfg / "go_live.json"
+        limits, journal, root, paper_venue = other.cfg / "risk.json", other.tmp / "journal", other.tmp, gl.PAPER_VENUE
+        environ, calendar = dict(LIVE_ENV), CAL
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w, live=Pointing())
+    assert out["stage"] == "lock" and "lock 1 (" in out["reason"] and "lock 2 (" in out["reason"], out
+    assert w.venue.calls == [] and w.quote_calls == []

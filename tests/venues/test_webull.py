@@ -20,6 +20,19 @@ def _home_is_temporary(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
+@pytest.fixture(autouse=True)
+def _live_repo_is_temporary(tmp_path, monkeypatch):
+    """T22b rev 2: the repository whose config/webull_live.json the adapter's own lock reads is the test's temporary
+    folder, replaced in-process (webull.LIVE_REPO), never by an argument; nothing is made there by this fixture."""
+    monkeypatch.setattr(wb, "LIVE_REPO", tmp_path, raising=False)
+
+
+def CONF(tmp_path):
+    """The one place the adapter accepts a production confirmation: LIVE_REPO/config/webull_live.json."""
+    (tmp_path / "config").mkdir(exist_ok=True)
+    return tmp_path / "config" / "webull_live.json"
+
+
 REAL_RATE_LIMITS = {env: dict(table) for env, table in getattr(wb, "RATE_LIMITS", {}).items()}
 HIGH_LIMITS = {kind: (10 ** 9, 1) for kind in getattr(wb, "CALL_KINDS", ())}
 
@@ -118,7 +131,7 @@ def _class_for(symbol):
 
 def venue(tmp_path, env="sandbox", **kw):
     client = kw.pop("client", None) or FakeClient(**{k: kw.pop(k) for k in ("accounts", "positions", "order_status", "account_class") if k in kw})
-    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json", **kw), client
+    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=CONF(tmp_path), **kw), client
 
 
 def test_orders_are_built_in_webulls_format():
@@ -170,7 +183,7 @@ def test_production_orders_need_the_owners_written_confirmation(tmp_path):
     client.calls.clear()
     with pytest.raises(wb.LiveTradingNotConfirmed, match="has not written"):
         v.submit("SPY", 1.0, "t", price=500.0)
-    conf = tmp_path / "webull_live.json"
+    conf = CONF(tmp_path)
     for bad in ("not json", json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000,
                                         "i_understand_this_trades_real_money": True}),                 # the old form
                 _live(i_understand_this_trades_real_money="yes"), _live(max_order_value=-5), _live(confirmed_by=DROP)):
@@ -257,7 +270,7 @@ def detail(*orders, cid=None):
 
 def status_venue(tmp_path, answer, tag="t", env="sandbox", **kw):
     client = FakeClient(details={wb.client_order_id(tag): answer})
-    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json", **kw), client
+    return wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=CONF(tmp_path), **kw), client
 
 
 def test_refusals_made_here_are_marked_not_transmitted_and_nothing_is_sent(tmp_path):
@@ -719,7 +732,7 @@ def test_the_limit_price_sent_is_exactly_the_price_given(tmp_path, symbol, limit
 
 def test_the_live_cap_still_uses_the_limit_price(tmp_path):
     v, client = venue(tmp_path, env="production")
-    (tmp_path / "webull_live.json").write_text(_live())                   # T22b: the new form
+    (CONF(tmp_path)).write_text(_live())                   # T22b: the new form
     with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
         v.submit("SPY", 2.0, "t", price=100.0, limit_price=600.0)          # valued at the limit: 1,200 > 1,000
     assert client.placed() == []
@@ -2884,7 +2897,7 @@ TIMINGS: dict = {}
 # ==== T22b: the adapter keeps its own lock (the new-form confirmation, judged before any network call)
 
 def _conf_file(tmp_path, text, mode=0o644):
-    path = tmp_path / "webull_live.json"
+    path = CONF(tmp_path)
     path.write_text(text)
     path.chmod(mode)
     return path
@@ -2938,7 +2951,7 @@ def test_an_unsafe_confirmation_file_is_no_confirmation(tmp_path, how):
         path = _conf_file(tmp_path, _live(), 0o646)
     elif how == "symlink":
         (real / "c.json").write_text(_live())
-        path = tmp_path / "webull_live.json"
+        path = CONF(tmp_path)
         path.symlink_to(real / "c.json")
     elif how == "folder symlink":
         (real / "webull_live.json").write_text(_live())
@@ -2960,7 +2973,136 @@ def test_an_unsafe_confirmation_file_is_no_confirmation(tmp_path, how):
 def test_event_contracts_stay_refused_in_production_with_a_valid_new_form_confirmation(tmp_path):
     v, client = venue(tmp_path, env="production", account_class="EVENTS_CASH")
     _conf_file(tmp_path, _live())
-    assert wb.load_live_confirmation(tmp_path / "webull_live.json") is not None
+    assert wb.load_live_confirmation(CONF(tmp_path)) is not None
     with pytest.raises(wb.NotTransmitted):
         v.submit("SPY", 1.0, "t", price=100.0)
     assert client.placed() == []
+
+
+# ==== T22b rev 2: the adapter accepts a production confirmation only at LIVE_REPO/config/webull_live.json
+
+def _valid_elsewhere(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "webull_live.json"
+    path.write_text(_live())
+    path.chmod(0o644)
+    return path
+
+
+@pytest.mark.parametrize("where", ["another repo's config", "another folder", "beside the repository"])
+def test_a_production_confirmation_anywhere_but_the_repositorys_own_path_is_none(tmp_path, where):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    wb.LIVE_REPO = repo
+    other = {"another repo's config": tmp_path / "other" / "config", "another folder": tmp_path / "x" / "y",
+             "beside the repository": tmp_path}[where]
+    path = _valid_elsewhere(other)
+    client = FakeClient()
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=path)
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="only from this repository"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []                                              # zero client calls, whatever the file holds
+    assert v.check()["real_money_orders"].startswith("off")
+    data, why = wb.live_confirmation(path)
+    assert data is None and "this repository" in why
+    assert wb.load_live_confirmation(path) is None
+
+
+def test_the_repositorys_own_path_is_the_one_accepted_and_it_follows_live_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "config").mkdir(parents=True)
+    wb.LIVE_REPO = repo
+    client = FakeClient()
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=repo / "config" / "webull_live.json")
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="has not written"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    _valid_elsewhere(repo / "config")
+    assert v.submit("SPY", 1.0, "t", price=100.0)["environment"] == "production" and len(client.placed()) == 1
+    assert wb.live_confirmation()[0] is not None and wb.load_live_confirmation() is not None   # the default: the repo's
+
+
+def test_a_production_confirmation_reached_through_a_linked_folder_is_none(tmp_path):
+    repo = tmp_path / "repo"
+    _valid_elsewhere(repo / "config")
+    wb.LIVE_REPO = repo
+    (tmp_path / "alias").symlink_to(repo)
+    client = FakeClient()
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client,
+                       confirmation_file=tmp_path / "alias" / "config" / "webull_live.json")
+    with pytest.raises(wb.LiveTradingNotConfirmed):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []
+
+
+def test_the_linked_parent_check_covers_the_whole_path(tmp_path):
+    real = tmp_path / "real"
+    _valid_elsewhere(real / "a" / "b")
+    (tmp_path / "link").symlink_to(real)
+    inner = tmp_path / "link" / "a"
+    for root in (inner, inner / "b", None, tmp_path / "elsewhere"):
+        data, why = wb.read_owner_file(inner / "b" / "webull_live.json", root)
+        assert data is None and "symbolic link" in why, root
+    data, why = wb.read_owner_file(real / "a" / "b" / "webull_live.json", None)
+    assert why is None and data["account_class"] == "INDIVIDUAL_CASH"
+
+
+# ---- T22b rev 2, outcome 5: in the test environment a malformed price meets the base's checks (495c29f)
+
+T22B_BASE = "495c29ff67ec84a7bb5b4c40c1471d67726f2d22"
+
+
+@pytest.fixture(scope="module")
+def base_webull(tmp_path_factory):
+    import importlib.util
+    import subprocess
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{T22B_BASE}:valedia_trader/venues/webull.py"],
+                         capture_output=True, check=True).stdout
+    path = tmp_path_factory.mktemp("base_webull") / "webull_t22b_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("webull_t22b_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["webull_t22b_base"] = mod
+    spec.loader.exec_module(mod)
+    assert not hasattr(mod, "judge_live_confirmation")
+    return mod
+
+
+BAD_PRICES = ["abc", "", None, float("nan"), float("inf"), -float("inf"), "1e3", object(), [], 100.0]
+
+
+def _price_op(mod, tmp_path, monkeypatch, units, price, limit):
+    monkeypatch.setattr(mod, "RATE_LIMITS", {env: dict(HIGH_LIMITS) for env in REAL_RATE_LIMITS}, raising=False)
+    monkeypatch.setattr(mod, "_default_sleep", lambda seconds: None, raising=False)
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "5", "instrument_type": "EQUITY"}])
+    v = mod.WebullVenue(KEY, SECRET, environment="sandbox", client=client, confirmation_file=tmp_path / "x.json")
+    try:
+        out = ("returned", v.submit("SPY", units, "t-1", price=price, limit_price=limit))
+    except Exception as exc:                                               # the class by name: two modules, two classes
+        out = ("raised", type(exc).__name__, str(exc))
+    return out, [c if not (isinstance(c, tuple) and c[0] == "place") else ("place", c[1], json.dumps(c[2], default=str))
+                 for c in client.calls]
+
+
+def test_in_the_test_environment_a_malformed_price_is_judged_as_the_base_judged_it(tmp_path, monkeypatch, base_webull):
+    seen = 0
+    for units in (1.0, -1.0):
+        for price in BAD_PRICES:
+            for limit in (None, "abc", "", float("nan"), float("inf"), 101.0, 99.0):
+                base = _price_op(base_webull, tmp_path, monkeypatch, units, price, limit)
+                mine = _price_op(wb, tmp_path, monkeypatch, units, price, limit)
+                assert base == mine, (units, price, limit, base, mine)
+                seen += 1
+    assert seen == 140
+
+
+@pytest.mark.parametrize("price", ["abc", "", None, float("nan"), float("inf"), -float("inf"), object(), [], 0.0, -5.0])
+def test_in_production_a_malformed_price_is_still_refused_before_any_call(tmp_path, price):
+    _valid_elsewhere(tmp_path / "config")
+    client = FakeClient()
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=CONF(tmp_path))
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", 1.0, "t", price=price)
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", 1.0, "t", limit_price=price)
+    assert client.calls == []

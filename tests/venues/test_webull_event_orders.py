@@ -145,9 +145,20 @@ class Client:
         return [c for c in self.calls if c[0] == "place"]
 
 
+@pytest.fixture(autouse=True)
+def _live_repo_is_temporary(tmp_path, monkeypatch):
+    """T22b rev 2: the repository whose config/webull_live.json the adapter reads is the test's temporary folder."""
+    monkeypatch.setattr(wb, "LIVE_REPO", tmp_path, raising=False)
+
+
+def CONF(tmp_path):
+    (tmp_path / "config").mkdir(exist_ok=True)
+    return tmp_path / "config" / "webull_live.json"
+
+
 def ev(tmp_path, client=None, cls="EVENTS_CASH", env="sandbox", clock=None, **kw):
     client = client if client is not None else Client()
-    v = wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=tmp_path / "webull_live.json",
+    v = wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=CONF(tmp_path),
                        account_class=cls, limits=HIGH, sleep=lambda s: None, clock=clock or (lambda: 0.0), **kw)
     return v, client
 
@@ -640,7 +651,7 @@ def test_an_events_venue_on_an_account_of_another_class_sends_nothing(tmp_path):
 # ---- invariant 6: event orders in the test environment only, in the adapter itself
 
 def test_production_refuses_event_orders_whatever_the_confirmation_file_says(tmp_path):
-    conf = tmp_path / "webull_live.json"
+    conf = CONF(tmp_path)
     conf.write_text('{"account_class": "INDIVIDUAL_CASH", "account_ends": "%s", "confirmed_by": "Burton", '   # T22b: the new form
                     '"max_order_value": 100000, "max_capital": 100000, "valid_until": "%s", '
                     '"i_understand_this_trades_real_money": true}' % (EV_ID[-4:], wb.ny_date().isoformat()))

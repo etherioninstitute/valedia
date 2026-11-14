@@ -379,10 +379,21 @@ def _live_environ():
 
 
 def _live_files(paths: LoopPaths, environ):
-    """Where live mode reads its locks: the owner's files in config/, the journal (the paper record), the environment."""
+    """What live mode's locks are judged with: the environment. Where they are read is the repository's own config/
+    and journal/ (go_live.LiveFiles' properties, under webull.LIVE_REPO), never `paths`: the caller has already
+    refused any other root (_live_root_refusal)."""
     from valedia_trader.execution_and_risk import go_live
-    return go_live.LiveFiles(confirmation=paths.config / "webull_live.json", checklist=paths.config / "go_live.json",
-                             limits=paths.risk_limits, journal=paths.journal, root=paths.root, environ=environ)
+    return go_live.LiveFiles(environ=environ)
+
+
+def _live_root_refusal(paths: LoopPaths) -> str | None:
+    """Live mode exists only for the repository the package lives in (webull.LIVE_REPO): a root that resolves (links
+    resolved on both sides) to any other folder is refused before anything is read. Why, or None."""
+    import os
+    from valedia_trader.venues import webull
+    if os.path.realpath(os.fspath(paths.root)) != os.path.realpath(os.fspath(webull.LIVE_REPO)):
+        return "live mode runs only from the repository itself (--root names another folder)"
+    return None
 
 
 def _order_step_live_venue(files, environ):
@@ -393,8 +404,8 @@ def _order_step_live_venue(files, environ):
         raise _LiveRefused(f"live mode needs WEBULL_ENV={LIVE_ENVIRONMENT} in the trading secrets file")
     if (environ.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() != LIVE_CLASS:
         raise _LiveRefused(f"live mode needs WEBULL_ACCOUNT_CLASS={LIVE_CLASS} in the trading secrets file")
-    from valedia_trader.venues.webull import WebullVenue
-    return WebullVenue.from_secrets(environ=environ, confirmation_file=files.confirmation)
+    from valedia_trader.venues import webull
+    return webull.WebullVenue.from_secrets(environ=environ, confirmation_file=webull.own_confirmation())
 
 
 class _LockStub:
@@ -474,10 +485,13 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     `today` are for tests. Nothing here writes, creates or repairs an owner's file."""
     from valedia_trader.execution_and_risk import go_live, order_step
     from valedia_trader.venues.webull import ny_date
-    why = _live_args_refusal(args)
+    why = _live_args_refusal(args) or _live_root_refusal(paths)
     if why is not None:
         print(f"refused: {why}", file=sys.stderr)
         return 2
+    import os
+    from valedia_trader.venues import webull
+    paths = LoopPaths(Path(os.path.abspath(os.fspath(webull.LIVE_REPO))))   # the repository's folders, nothing else
     if environ is None:
         try:
             environ = _live_environ()
@@ -622,7 +636,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     venue = None
     if args.cmd == "order-step" and (args.live or args.check):  # live mode: its flags and locks before anything else
-        return live_order_step_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths())
+        from valedia_trader.venues import webull
+        return live_order_step_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths(webull.LIVE_REPO))
     if args.cmd == "order-step":                                # before any folder or file is made
         venue = _order_step_build()
         if venue is None:

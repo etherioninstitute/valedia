@@ -1361,6 +1361,23 @@ class _Run:
             raise _Stop("clock", f"the clock gave {now!r}, not a finite number of seconds")
         return float(now)
 
+    def _live_place(self) -> str | None:
+        """Live mode reads the owner's files and the paper record only from the repository (go_live.live_repo()): the
+        limits file this run was given must be its config/risk.json and the journal its journal/ folder. Why not, or
+        None. Compared as given (links are refused by the owner-file reader); nothing is opened."""
+        from valedia_trader.execution_and_risk import go_live
+        repo = go_live.live_repo()
+        try:
+            limits = Path(os.path.abspath(os.fspath(self.limits_file)))
+            folder = getattr(self.journal, "dir", None)
+            journal = None if folder is None else Path(os.path.abspath(os.fspath(folder)))
+        except (TypeError, ValueError):
+            limits = journal = None
+        if limits != repo / "config" / "risk.json" or journal != repo / "journal":
+            return ("live mode reads the owner's files and the paper record only from the repository itself "
+                    "(its config/ and journal/); this run was given another folder's")
+        return None
+
     def go(self) -> dict:
         try:
             now = self._now()
@@ -1378,6 +1395,9 @@ class _Run:
                    "live mode trades whole shares only" if self.fractional else None)
             if why is not None:
                 return self._finish("stopped", "live", why)
+            why = self._live_place()                     # before the lock: nothing read, nothing written
+            if why is not None:
+                return self._finish("stopped", "lock", why)
         try:
             self._environment()                          # 1: the venue's name, environment and host only
         except _Stop as stop:

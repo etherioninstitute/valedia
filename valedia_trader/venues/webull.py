@@ -222,6 +222,11 @@ PRODUCTION_HOST = "api.webull.com"
 HOSTS = {"sandbox": SANDBOX_HOST, "production": PRODUCTION_HOST}
 REPO = Path(__file__).resolve().parents[2]
 LIVE_CONFIRMATION = REPO / "config" / "webull_live.json"
+# The one repository live mode exists for (T22b rev 2): the owner's files are read only from its config/ and the paper
+# record only from its journal/, by the command line, the order step, the locks module and this adapter, each reading
+# this name at call time. It is the package's own folder; nothing a caller passes (an argument, an environment
+# variable, a file) moves it. Tests replace it in-process, and only that way.
+LIVE_REPO = REPO
 # The owner's confirmation, new form only (2026-11-13, the go-live gate): the account named by its class and the last
 # four characters `check` prints for it, a cap per order and a cap on all the money put to work, a date it lapses.
 LIVE_ACCOUNT_CLASS = "INDIVIDUAL_CASH"
@@ -512,15 +517,13 @@ def _inside(path: Path, root: Path) -> bool:
 
 def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[Any, str | None]:
     """An owner's hand-written JSON file, read without trusting it: (its value, None), or (None, why) when it is
-    missing, unreadable, a symbolic link (at the file, or at any folder above it inside `root`), not a regular file,
-    writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8, not JSON, or holding a repeated
-    key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs anything."""
+    missing, unreadable, a symbolic link (at the file, or at any folder above it, up to the top of the file system),
+    not a regular file, writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8, not JSON, or
+    holding a repeated key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs anything.
+    `root` is accepted as before and no longer limits the link check (T22b rev 2: the whole path is checked)."""
     try:
         p = Path(os.path.abspath(os.fspath(path)))
-        r = None if root is None else Path(os.path.abspath(os.fspath(root)))
         for q in [p, *p.parents]:
-            if q != p and (r is None or not _inside(q, r)):
-                break
             if os.path.islink(q):
                 return None, "is a symbolic link, or a folder above it is" if q == p else "has a symbolic link in a folder above it"
         try:
@@ -631,17 +634,29 @@ def judge_live_confirmation(data: Any, today: date) -> tuple[dict | None, str | 
             "i_understand_this_trades_real_money": True}, None
 
 
-def live_confirmation(path: str | Path = LIVE_CONFIRMATION, today: date | None = None,
-                      root: str | Path | None = REPO) -> tuple[dict | None, str | None]:
+def own_confirmation() -> Path:
+    """The only path a confirmation is read from: LIVE_REPO's config/webull_live.json (read at each call)."""
+    return Path(os.path.abspath(os.fspath(LIVE_REPO))) / "config" / "webull_live.json"
+
+
+NOT_OWN_CONFIRMATION = "is not this repository's own config/webull_live.json (a confirmation is read only from there)"
+
+
+def live_confirmation(path: str | Path | None = None, today: date | None = None,
+                      root: str | Path | None = None) -> tuple[dict | None, str | None]:
     """The owner's confirmation file read (read_owner_file) and judged (judge_live_confirmation) on `today` (the New
-    York date now when None): (confirmation, None) or (None, why)."""
-    data, why = read_owner_file(path, root)
+    York date now when None): (confirmation, None) or (None, why). Only the repository's own file counts
+    (own_confirmation(), the default): any other `path` is (None, NOT_OWN_CONFIRMATION), unread."""
+    p = own_confirmation() if path is None else Path(os.path.abspath(os.fspath(path)))
+    if p != own_confirmation():
+        return None, NOT_OWN_CONFIRMATION
+    data, why = read_owner_file(p, root)
     if why is not None:
         return None, why
     return judge_live_confirmation(data, ny_date() if today is None else today)
 
 
-def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION, today: date | None = None) -> dict | None:
+def load_live_confirmation(path: str | Path | None = None, today: date | None = None) -> dict | None:
     """The owner's hand-written permission to trade real money (new form only), or None. Anything wrong means no
     permission."""
     return live_confirmation(path, today)[0]
@@ -2017,6 +2032,9 @@ class WebullVenue:
         if self.environment != "production":
             return None
         confirmation, why = live_confirmation(self._confirmation_file)
+        if why == NOT_OWN_CONFIRMATION:
+            raise LiveTradingNotConfirmed("real-money orders are off: the confirmation is read only from this repository's "
+                                          "config/webull_live.json")
         if confirmation is None:
             if why == "is missing":
                 raise LiveTradingNotConfirmed("real-money orders are off: the owner has not written config/webull_live.json")
@@ -2087,12 +2105,16 @@ class WebullVenue:
             amount, _ = _quantity(units, crypto)                          # a malformed quantity is refused first
             _session(session, crypto, limit_price)
             reference = limit_price if limit_price is not None else price
-            confirmation = self._guard_live(abs(amount) * float(reference) if reference else None)   # before any call
+            live = self.environment == "production"
+            # in production the price is judged before any call; in the test environment where the base judged it
+            confirmation = self._guard_live(abs(amount) * float(reference) if reference else None) if live else None
             account = self.account_id
             self._fits(crypto)
             self._guard_live_account(confirmation)
             secrets = self._secrets()
             read_at = self._check_sale(symbol, amount, crypto) if amount < 0 else None    # the holding must be established
+            if not live:
+                self._guard_live(abs(amount) * float(reference) if reference else None)   # None here, as at 495c29f
             order = order_payload(symbol, units, tag, limit_price, session)
             placed_at = self._pacer.wait("place")                         # the place slot, taken before the call
             if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:

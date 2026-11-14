@@ -38,8 +38,8 @@ from typing import Any, Mapping
 
 from valedia_trader.research_loop import risk_gate
 from valedia_trader.research_loop.paper import Journal, JournalDamaged
-from valedia_trader.venues.webull import (LIVE_CONFIRMATION, OWNER_TEXT_MAX, PRODUCTION_HOST, REPO, judge_live_confirmation,
-                                          read_owner_file)
+from valedia_trader.venues import webull as _webull
+from valedia_trader.venues.webull import OWNER_TEXT_MAX, PRODUCTION_HOST, REPO, judge_live_confirmation, read_owner_file
 
 CHECKLIST = REPO / "config" / "go_live.json"
 LIMITS = REPO / "config" / "risk.json"
@@ -60,19 +60,43 @@ ORDINARY_STOP_STAGES = frozenset({"session", "ticket"})   # not stopped runs: ou
 LOCK_NAMES = {1: "the confirmation", 2: "the checklist", 3: "the limits", 4: "the ticket"}
 
 
+def live_repo() -> Path:
+    """The repository live mode exists for: webull.LIVE_REPO, read at each call (the package's own folder; a test
+    replaces that one constant in-process, and nothing a caller passes moves it)."""
+    return Path(os.path.abspath(os.fspath(_webull.LIVE_REPO)))
+
+
 @dataclass(frozen=True)
 class LiveFiles:
-    """Where live mode reads its locks: the owner's three files, the journal folder holding the paper record, the
-    folder inside which no symbolic link is accepted, the paper venue's name, the environment the command loaded
-    (None: os.environ) and an exchange calendar (None: XNYS)."""
-    confirmation: Path = LIVE_CONFIRMATION
-    checklist: Path = CHECKLIST
-    limits: Path = LIMITS
-    journal: Path = JOURNAL
-    root: Path | None = REPO
-    paper_venue: str = PAPER_VENUE
+    """What live mode is run with: the environment the command loaded (None: os.environ) and an exchange calendar
+    (None: XNYS). Where its locks are read is not an argument: the owner's three files in the repository's config/
+    and its journal/ (the paper record), all under live_repo(), shown here as read-only properties."""
     environ: Mapping[str, str] | None = None
     calendar: Any = None
+
+    @property
+    def root(self) -> Path:
+        return live_repo()
+
+    @property
+    def confirmation(self) -> Path:
+        return live_repo() / "config" / "webull_live.json"
+
+    @property
+    def checklist(self) -> Path:
+        return live_repo() / "config" / "go_live.json"
+
+    @property
+    def limits(self) -> Path:
+        return live_repo() / "config" / "risk.json"
+
+    @property
+    def journal(self) -> Path:
+        return live_repo() / "journal"
+
+    @property
+    def paper_venue(self) -> str:
+        return PAPER_VENUE
 
 
 @dataclass
@@ -220,8 +244,12 @@ def judge_limits(data: Any, path: Path, environ: Mapping[str, str]) -> tuple[dic
 
 def judge_locks(files: LiveFiles, today: date, capital: Any = None) -> LockState:
     """All four locks on the New York date `today`, from the owner's files and the journal alone (no venue, no
-    quote). `capital`, when given, is judged against max_capital as part of lock 1."""
-    environ = os.environ if files.environ is None else files.environ
+    quote). `capital`, when given, is judged against max_capital as part of lock 1. The files are always the
+    repository's own (LiveFiles' properties, under live_repo()): only the environment and the calendar are taken
+    from `files`, whatever else the object given says."""
+    given_environ, calendar = getattr(files, "environ", None), getattr(files, "calendar", None)
+    environ = os.environ if given_environ is None else given_environ
+    files = LiveFiles(environ=environ, calendar=calendar)
     raw_conf, why = read_owner_file(files.confirmation, files.root)
     confirmation = None
     if why is not None:
