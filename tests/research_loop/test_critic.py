@@ -382,8 +382,9 @@ def test_a_damaged_suspect_price_field_is_named_as_the_suspect_price_field(desk)
 def test_the_review_names_every_bad_data_day_of_the_week_by_fund(desk):
     ledger, journal, limits, hid = desk
     days = pd.bdate_range("2026-11-02", periods=6)
-    marks = {1: {"stale_prices": {"SPY": 2}}, 2: {"suspect_prices": {"QQQ": 612.5}, "stale_prices": {"QQQ": 1}},
-             4: {"unreadable_prices": ["XLE", "XLF"], "stale_prices": {"XLE": 31}}}
+    marks = {1: {"stale_prices": {"SPY": 2}, "carried_close_days": {"SPY": "2026-10-30"}},
+             2: {"suspect_prices": {"QQQ": 612.5}, "stale_prices": {"QQQ": 1}, "carried_close_days": {"QQQ": None}},
+             4: {"unreadable_prices": ["XLE", "XLF"], "stale_prices": {"XLE": 31}, "carried_close_days": {"XLE": "2026-11-05"}}}
     for k, d in enumerate(days):
         journal.write(d, {"type": "summary", "strategy_value_change": {"mom": 50.0}, "capital_per_strategy": 50_000.0, **marks.get(k, {})})
     journal.write(days[0] - pd.Timedelta(days=7), {"type": "summary", "strategy_value_change": {"mom": 50.0},
@@ -394,6 +395,24 @@ def test_the_review_names_every_bad_data_day_of_the_week_by_fund(desk):
     assert "SPY" in named[0] and "carried" in named[0]
     assert "QQQ" in named[1] and "suspect" in named[1] and "612.5" in named[1]
     assert "XLE" in named[2] and "XLF" in named[2] and "unreadable" in named[2]
+    # rev 6 (outcome 5): the close a carried fund was valued at, never a count that is the frame's length
+    assert "SPY carried, valued at its close of 2026-10-30" in named[0] and "QQQ" in named[1] and "valued at its cost" in named[1]
+    assert "XLE unreadable, carried, valued at its close of 2026-11-05" in named[2] and not any("31 day" in f or "2 day" in f for f in named)
     assert not any("OLD" in f for f in out["findings"])                  # a day before the week is not listed
     body = open(out["path"]).read()
     assert all(f in body for f in named)                                 # in the review a person reads
+
+
+def test_the_reviews_bad_data_lines_are_findings_only_never_lessons_in_the_ledger(desk):
+    """Rev 6, outcome 6: the review's bad-data lines are in its findings and its file, and never written to the
+    hypothesis ledger as lessons, however often the review runs, with `apply` or without."""
+    ledger, journal, limits, hid = desk
+    days = pd.bdate_range("2026-11-02", periods=6)
+    for k, d in enumerate(days):
+        extra = {"stale_prices": {"SPY": 1}, "carried_close_days": {"SPY": str(days[k - 1].date())}} if k in (2, 3) else {}
+        journal.write(d, {"type": "summary", "strategy_value_change": {"mom": 50.0}, "capital_per_strategy": 50_000.0, **extra})
+    for apply in (False, True, False):
+        out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=apply)
+        assert len([f for f in out["findings"] if f.startswith("Price data on ")]) == 2
+    assert not [r for r in ledger.findings() if "Price data" in r["finding"]]
+    assert ledger.findings()                                            # the other findings are written as before

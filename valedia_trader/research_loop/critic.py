@@ -124,8 +124,10 @@ def carried_days(entries: list[dict], name: str) -> tuple[list[bool], list[str]]
 
 def bad_price_days(entries: list[dict]) -> list[str]:
     """One line for each day summary in `entries` (in order) that names a fund whose price could not be read, was set
-    aside as suspect or was carried, by fund: "Price data on DAY: FUND unreadable, suspect (close 612.50), carried (2
-    days); ...". A field that cannot be read is left out here (the strategy notes count those days)."""
+    aside as suspect or was carried, by fund: "Price data on DAY: FUND unreadable, suspect (close 612.50), carried,
+    valued at its close of DAY; ...". A carried fund is "valued at its close of DAY" or "valued at its cost" as the
+    summary's `carried_close_days` says, and just "carried" in a summary without it (an earlier revision's). A field
+    that cannot be read is left out here (the strategy notes count those days)."""
     out = []
     for e in entries:
         if e.get("type") != "summary":
@@ -135,15 +137,15 @@ def bad_price_days(entries: list[dict]) -> list[str]:
         if isinstance(names, list) and all(isinstance(x, str) for x in names):
             for sym in names:
                 what.setdefault(sym, []).append("unreadable")
-        suspect, stale = e.get("suspect_prices"), e.get("stale_prices")
+        suspect, used = e.get("suspect_prices"), e.get("carried_close_days")
         for sym in sorted(_price_field(e, "suspect_prices") or set()):
             v = suspect.get(sym) if isinstance(suspect, dict) else None
             ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
             what.setdefault(sym, []).append(f"suspect (close {float(v):.2f})" if ok else "suspect")
         for sym in sorted(_price_field(e, "stale_prices") or set()):
-            v = stale.get(sym) if isinstance(stale, dict) else None
-            ok = isinstance(v, int) and not isinstance(v, bool) and v > 0
-            what.setdefault(sym, []).append(f"carried ({v} day{'s' if v != 1 else ''})" if ok else "carried")
+            on = used.get(sym, "") if isinstance(used, dict) else ""
+            what.setdefault(sym, []).append("carried, valued at its cost" if on is None else
+                                            f"carried, valued at its close of {on}" if isinstance(on, str) and on else "carried")
         if what:
             out.append(f"Price data on {e.get('day')}: " + "; ".join(f"{sym} {', '.join(what[sym])}" for sym in sorted(what))
                        + ". None of these funds was traded that day.")
@@ -194,8 +196,9 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         if e["type"] == "kill_switch":
             findings.append((None, f"Kill switch {e['decision']} on {e['day']}: {e['reasoning']}"))
 
-    # ---- the days whose price data was bad, by fund
-    for text in bad_price_days(week):
+    # ---- the days whose price data was bad, by fund: findings of this review only, never lessons in the ledger
+    review_only = bad_price_days(week)
+    for text in review_only:
         findings.append((None, text))
 
     # ---- the decision panel against what happened
@@ -328,7 +331,8 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         per_strategy[name] = {"result": result, "notes": notes}
 
     for hid, text in findings:
-        ledger.add_lesson(hid, text, "critic")
+        if not any(text is t for t in review_only):              # the same string object, not merely equal text
+            ledger.add_lesson(hid, text, "critic")
 
     lines = ([f"**{incomplete_text}**", ""] if incomplete else []) + [f"# Critic's review, {since.date()} to {as_of.date()}", ""]
     urgent = [t for _, t in findings if t.startswith("KILL SWITCH FAILURE")]
