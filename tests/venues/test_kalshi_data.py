@@ -283,3 +283,8 @@ def test_the_date_header_is_handed_back_and_existing_callers_see_no_difference(m
                           sleep=FakeClock().sleep, clock=FakeClock())
     assert plain.series("KXA") == dated.series("KXA")
     assert plain.last_date is None and dated.last_date == "Fri, 13 Nov 2026 06:00:01 GMT"
+
+
+def test_the_request_name_is_generic_and_names_no_project_owner_or_business():
+    assert kd.USER_AGENT == "market-data-reader/1.0"
+    assert not any(word in kd.USER_AGENT.lower() for word in ("valedia", "trader", "burton", "chatelain", "etherion", "@", "python", "urllib"))
