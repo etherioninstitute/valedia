@@ -1189,13 +1189,17 @@ def test_a_stored_line_is_read_back_as_its_cleaned_form_everywhere(world, tradin
 
 # ----------------------------------------------------------------------------------------------- account-style digit groups
 
-def test_three_or_more_groups_of_four_digits_are_masked_and_dates_stay_readable():
+def test_three_or_more_groups_of_three_or_more_digits_are_masked_and_dates_stay_readable():
     for text, want in (("card 1234 5678 9012 3456 ok", "card <number> ok"), ("1234-5678-9012", "<number>"),
                        ("acct 1234 5678-9012 3456 7890", "acct <number>"), ("x 1234 5678 y", "x 1234 5678 y"),
-                       ("1234  5678  9012", "1234 5678 9012"),                         # double spaces are one gap after cleaning, not groups
-                       ("1234 5678 90123", "1234 5678 90123")):
+                       ("987-654-321-098", "<number>"), ("987 654 321 098", "<number>"), ("acct 987 654 321 098.", "acct <number>."),
+                       ("123 456 789", "<number>"), ("x 123 456 y", "x 123 456 y"),
+                       ("1234  5678  9012", "<number>"),                         # spaces are collapsed first, then the groups are seen
+                       ("1234 5678 90123", "<number>"), ("12 3456 7890 1234", "12 <number>"),
+                       ("2024 2025 2026", "<number>")):                          # a list of years in fours is masked too: a known cost
         assert al.clean(text) == want, text
-    for ok in ("2026-11-13", "2026-11-13 17:30:00", "20261113", "2026-11-13T17:30:00Z", "on 2026-11-13 at 2026-11-14 09:30", "1 2 4 8 16"):
+    for ok in ("2026-11-13", "2026-11-13 17:30:00", "20261113", "2026-11-13T17:30:00Z", "on 2026-11-13 at 2026-11-14 09:30", "1 2 4 8 16",
+               "2026-11-13 17:30", "17:30:00 17:31:00 17:32:00"):
         assert al.clean(ok) == ok, ok
 
 
@@ -1431,3 +1435,234 @@ def test_an_alert_key_is_cleaned_when_it_is_made(world, trading_file):
     assert leaked(a.key) == [] and all(c.isalnum() or c in "_.:-" for c in a.key)
     assert al.Alert("job:com.valedia.55512345678901", "warning", "t", "d").key == "job:com.valedia._number_"
     assert al.Alert("orders:orders-webull-sandbox", "warning", "t", "d").key == "orders:orders-webull-sandbox"
+
+
+# =====================================================================================================================
+# rev 4
+# =====================================================================================================================
+
+def test_an_account_number_written_in_groups_of_three_never_reaches_the_alert_file_or_the_screen(world, capsys):
+    world.write_step("stopped", "send", "the venue said account 987-654-321-098 and 987 654 321 098 and 123 456 789")
+    assert al.main(["watch"], env=world.env()) == 1
+    al.main(["list"], env=world.env())
+    seen = capsys.readouterr()
+    for text in (seen.out, seen.err, world.alerts_file.read_text()):
+        assert "987" not in text and "321" not in text and "654" not in text and "098" not in text and "123 456" not in text
+
+
+# ----------------------------------------------------------------------------------------------- the guard runs last; a fixed point
+
+WHITESPACE = ["  ", "   ", "         ", "　", " ", "  ", "\n", "\n\n", "\t", " \n ", "\r\n", " ", "  ", " 　 "]
+
+
+def spaced(rng, words):
+    out = words[0]
+    for w in words[1:]:
+        out += rng.choice(WHITESPACE) + w
+    return out
+
+
+def test_phrase_words_apart_by_wide_or_many_spaces_or_lines_are_masked_and_cleaning_is_a_fixed_point(world, trading_file):
+    al.register_trading_file(world.env())
+    rng = random.Random(404)
+    words = PHRASE.split()
+    for i in range(2000):
+        start = rng.randint(0, len(words) - 4)
+        chunk = words[start:start + rng.randint(4, 8)]
+        text = f"the venue said {spaced(rng, chunk)} for {rng.choice(['XLE', 'account 5', 'order'])}"
+        out = al.clean(text)
+        assert leaked(out) == [], (text, out)
+        assert al.clean(out) == out, (text, out)
+        key = al.Alert("job:" + spaced(rng, chunk), "warning", "t", "d").key
+        assert leaked(key) == [] and al.Alert(key, "warning", "t", "d").key == key and al._key_part(key) == key, key
+    for i in range(2000):                                                                   # fixed point on texts of every sort
+        pieces = [rng.choice(["order", "id", "tag", "client", "1a2b3c4d5e6f7a8b", "os-20261113-143501-a1b2c3-XLE", "987 654 321 098",
+                              "2026-11-13", "17:30:00", "x" * rng.randint(1, 120), "​", "\x07", "alpha", "bravo", "candle", "delta",
+                              "<secret>", "…", ";", ".", "KXNBA-26NOV13-T60", "12345678901234"]) for _ in range(rng.randint(1, 14))]
+        text = rng.choice([" ", "  ", "\n", ""]).join(pieces)
+        for limit in (40, 120, 300):
+            once = al.clean(text, limit)
+            assert al.clean(once, limit) == once, (text, limit, once)
+
+
+def test_spaced_out_phrase_words_in_every_source_do_not_reach_the_alert_file_the_screen_or_a_notification(world, trading_file, monkeypatch, capsys):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    gap = "          \u3000    "                                   # 15 characters that are not letters: past what the guard bridges
+    words = PHRASE.split()
+    world.write_step("stopped", "send", f"the venue said {gap.join(words)} and {chr(10).join(words)}")
+    world.jobs = world.jobs + [("-", "9", "com.valedia." + gap.join(words[:5]))]
+    world.write_picks_log(end_ago=600, extra=["match failed " + "  ".join(words)])
+    old = {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:" + gap.join(words[:5]), "title": gap.join(words), "detail": "\n".join(words)}
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.write_text(json.dumps(old) + "\n")
+    outputs = []
+    for argv in (["watch", "--notify"], ["list"], ["watch", "--notify"], ["list"]):
+        al.main(argv, env=world.env())
+        seen = capsys.readouterr()
+        outputs += [seen.out, seen.err]
+    new = world.alerts_file.read_text()[len(json.dumps(old)) + 1:]
+    for text in outputs + [new, " ".join(" ".join(c) for c in spy.calls)]:
+        assert leaked(text) == [], text[:300]
+
+
+def test_a_key_that_cleans_twice_differently_does_not_write_a_cleared_line_on_every_watch(world, trading_file):
+    gap = "         "
+    old = {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:com.valedia." + gap.join(PHRASE.split()[:5]), "title": "t", "detail": "d"}
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.write_text(json.dumps(old) + "\n")
+    sizes = []
+    for _ in range(4):
+        al.main(["watch"], env=world.env())
+        sizes.append(world.alerts_file.stat().st_size)
+    assert sizes[1] == sizes[2] == sizes[3]                                                   # settled after the first watch
+
+
+# ----------------------------------------------------------------------------------------------- only propose and approve are practice runs
+
+def write_mode(w, mode, status="done", stage=None, reason=None, day="2026-11-13", event="summary", venue="webull-sandbox"):
+    e = {"type": "order_step", "venue": venue, "event": event, "status": status, "stage": stage, "reason": reason,
+         "orders_sent": 0, "sent": [], "refused": [], "left_over": []}
+    if mode is not NO_MODE:
+        e["mode"] = mode
+    w.journal.write(day, e)
+
+
+NO_MODE = object()
+ODD_MODES = ["", None, 1, 0, True, False, ["propose"], {"a": 1}, "Propose", "APPROVE", " propose", "approve ", "propose\n", "practice", "approvex"]
+
+
+def test_only_the_two_exact_words_are_practice_runs_and_no_key_is_the_unattended_run():
+    assert al.is_practice({"mode": "propose"}) and al.is_practice({"mode": "approve"})
+    assert not al.is_practice({}) and not al.is_practice({"status": "ok"})
+    for odd in ODD_MODES:
+        assert not al.is_practice({"mode": odd}), odd
+        assert al.has_unknown_mode({"mode": odd}), odd
+    assert not al.has_unknown_mode({}) and not al.has_unknown_mode({"mode": "propose"}) and not al.has_unknown_mode({"mode": "approve"})
+
+
+@pytest.mark.parametrize("odd", ODD_MODES, ids=repr)
+def test_a_summary_with_an_unknown_mode_is_neither_never_clears_never_counts_and_raises_one_warning_a_day(world, odd):
+    world.write_step("stopped", "send", "the venue refused", day="2026-11-12")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+    write_mode(world, odd)                                                                      # a summary that is neither
+    r = watch(world)
+    assert r.cleared == [] and ["step-stopped:webull-sandbox"] == [a["key"] for a in r.open if a["key"].startswith("step")]
+    unknown = [a for a in r.raised if a.key.startswith("mode:")]
+    assert len(unknown) == 1 and unknown[0].level == "warning" and "unknown mode" in unknown[0].title
+    assert not [a for a in watch(world).raised if a.key.startswith("mode:")]                    # once
+    write_mode(world, odd, day="2026-11-13")                                                    # the same day again: still the one alert
+    assert not [a for a in watch(world).raised if a.key.startswith("mode:")]
+    later = world.env()
+    later.now = NOW + 86400
+    assert [c.key for c in al.watch(later).cleared if c.key.startswith("mode:")]                # the day is over: cleared
+
+
+@pytest.mark.parametrize("odd", ODD_MODES, ids=repr)
+def test_a_summary_with_an_unknown_mode_does_not_count_as_ran_today(world, odd):
+    orderstep_on(world)
+    write_mode(world, odd)
+    assert "orderstep:no-run" in keys(watch(world))
+    write_mode(world, NO_MODE)                                                                  # no mode key at all: the unattended run
+    assert [c.key for c in watch(world).cleared] == ["orderstep:no-run"]
+
+
+def test_an_unattended_stop_is_a_stop_with_no_mode_key_and_nothing_else(world):
+    write_mode(world, NO_MODE, "stopped", "send", "the venue refused")
+    assert keys(watch(world)) == ["step-stopped:webull-sandbox"]
+
+
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+@pytest.mark.parametrize("stage", ["send", "reconcile", "environment", "baseline", "after", "unexpected", "journal"])
+def test_a_practice_run_stopped_at_any_other_stage_raises_its_own_warning_once_a_day(world, mode, stage):
+    write_mode(world, mode, "stopped", stage, "the venue refused")
+    r = watch(world)
+    (a,) = [x for x in r.raised if x.key.startswith("practice-stopped")]
+    assert a.level == "warning" and mode in a.title and f"stage {stage}" in a.title
+    assert not [x for x in r.raised if x.key.startswith("step-stopped")]
+    assert not [x for x in watch(world).raised if x.key.startswith("practice-stopped")]
+    later = world.env()
+    later.now = NOW + 86400
+    assert [c.key for c in al.watch(later).cleared if c.key.startswith("practice-stopped")]
+
+
+@pytest.mark.parametrize("mode, stage", [("approve", "ticket"), ("propose", "ticket"), ("approve", "session"), ("propose", "session")])
+def test_a_practice_run_stopped_at_ticket_or_session_raises_no_stopped_warning(world, mode, stage):
+    write_mode(world, mode, "stopped", stage, "outside the regular session window 09:35 to 15:45 New York time (it is 06:10)")
+    assert not [x for x in watch(world).raised if x.key.startswith(("practice-stopped", "step-stopped"))]
+
+
+# ----------------------------------------------------------------------------------------------- a withheld old alert is not open
+
+def plant_withheld(w, n=2):
+    key = TRADING["BROKER_API_KEY"]
+    rows = [{"time": f"2026-11-13T19:0{i}:00Z", "level": "warning", "key": f"job:com.valedia.{key}{i}", "title": "t", "detail": "d"} for i in range(n)]
+    rows.append({"time": "2026-11-13T19:09:00Z", "level": "cleared", "key": f"job:com.valedia.{key}9", "title": "t", "detail": "d"})
+    w.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    w.alerts_file.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return len(rows)
+
+
+def test_old_lines_whose_key_holds_a_secret_are_withheld_not_open_and_never_cleared(world, trading_file, capsys):
+    n = plant_withheld(world)
+    size = world.alerts_file.stat().st_size
+    assert al.main(["list"], env=world.env()) == 0                                               # nothing open: exit 0
+    out = capsys.readouterr().out
+    assert out.count("withheld") == 1 and f"{n} old lines" in out and "no open alerts" in out
+    for _ in range(3):
+        assert al.main(["watch"], env=world.env()) == 0
+    assert world.alerts_file.stat().st_size == size                                              # no cleared line, ever
+    seen = capsys.readouterr().out
+    assert seen.count("withheld") == 3 and leaked(seen) == []                                     # once per command output
+
+
+def test_withheld_lines_do_not_hide_a_real_open_alert_and_are_not_counted_with_it(world, trading_file, capsys):
+    plant_withheld(world)
+    halt_on(world)
+    assert al.main(["watch"], env=world.env()) == 1
+    out = capsys.readouterr().out
+    assert "switch:halt" in out and out.count("withheld") == 1
+    assert [a["key"] for a in al.open_alerts(world.alerts_file)] == ["switch:halt"]
+    rows, withheld = al.read_alert_file(world.alerts_file)
+    assert [r["key"] for r in rows] == ["switch:halt"] and withheld == 3
+
+
+def test_the_page_counts_no_withheld_line_as_open_and_says_how_many_were_withheld_once(world, trading_file):
+    import valedia_trader.research_loop.owner_page as op
+    plant_withheld(world)
+    out = world.root.parent / "page.html"
+    env = world.env()
+    env.environ = None
+    op.build(env, out=out)
+    html = out.read_text()
+    assert html.count("withheld") == 1 and "3 old lines" in html and "No open alerts" in html and leaked(html) == []
+
+
+def test_a_line_whose_key_merely_changes_under_cleaning_is_still_an_open_alert(world):
+    row = {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": "job:com.valedia.55512345678901", "title": "t", "detail": "d"}
+    world.alerts_file.parent.mkdir(parents=True, exist_ok=True)
+    world.alerts_file.write_text(json.dumps(row) + "\n")
+    rows, withheld = al.read_alert_file(world.alerts_file)
+    assert [r["key"] for r in rows] == ["job:com.valedia._number_"] and withheld == 0
+
+
+# ----------------------------------------------------------------------------------------------- raised once; the clause end
+
+def test_two_labels_that_clean_to_the_same_key_raise_one_alert_in_one_run(world):
+    world.jobs = world.jobs + [("-", "9", f"com.valedia.5551234567{i:04d}") for i in range(5)]
+    r = watch(world)
+    mine = [a for a in r.raised if a.key == "job:com.valedia._number_"]
+    assert len(mine) == 1
+    assert sum(x["key"] == "job:com.valedia._number_" for x in world.lines()) == 1
+    r2 = watch(world)
+    assert r2.raised == [] and sum(x["key"] == "job:com.valedia._number_" for x in world.lines()) == 1
+
+
+def test_an_id_after_the_end_of_a_clause_does_not_borrow_the_keyword_of_the_one_before():
+    id_ = "1a2b3c4d5e6f7a8b"
+    for text in (f"the order was refused; then {id_} came", f"the order was refused. Build {id_} came", f"tag ok; build {id_} done",
+                 f"order refused. version {id_}"):
+        assert al.clean(text) == text, text
+    for text, want in ((f"the order was refused, then {id_} came", "the order was refused, then …7a8b came"),
+                       (f"order x; order {id_}", "order x; order …7a8b"), (f"order. order {id_}", "order. order …7a8b")):
+        assert al.clean(text) == want, text

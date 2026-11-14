@@ -16,6 +16,9 @@ with `level` "cleared" and the same key is written. An alert is open while the l
     approval:refused:<day>      an approval was refused today (a summary with mode approve, stopped at stage ticket): a warning
                                 of its own, once a New York day. Summaries with a `mode` (propose, approve) are practice
                                 runs of the approval flow: the conditions about the unattended run look only at those without
+    mode:unknown:<day>          a summary today whose `mode` is neither absent (the unattended run) nor exactly `propose` or
+                                `approve`: neither kind of run, never counted as one, one warning a day
+    practice-stopped:<m>:<day>  a propose or approve run today stopped at a stage other than ticket or session: a warning of its own
     job:<label>                 a scheduled com.valedia.* job is not loaded, or its last exit code is not 0
     collector:heartbeat         the order-book collector's newest heartbeat is older than 10 minutes
     picks:no-end                the hourly pick-list log has no "end" line in the last 3 hours
@@ -36,7 +39,10 @@ private dictionary: nothing is put into the process environment. A trading file 
 with nothing written; a missing one is no reason to stop; so is one over 64 KB or 200 settings, or not UTF-8 text, which is
 refused at once. Nothing read back from `alerts.jsonl` or `notifications.jsonl` is trusted either: every field of every line
 passes the same cleaning before it is written, printed, shown or sent, and a key that changes under cleaning is its cleaned
-form from then on. The output guard is put on the streams before the command binds them to print.
+form from then on. The output guard is put on the streams before the command binds them to print, and it has the last word in `clean`: every
+change of the text (whitespace, format characters, ids, digits, truncation) is made first. An old line whose key held a secret
+cleans to the mask, can match no check, and so could never be cleared: it is withheld (not an alert, open or cleared), counted
+once in the output of `list` and `watch`, and ignored by the exit code.
 
 Known limits of the guard that this rests on (the package's own, recorded here): a value split by other separators, halves
 shorter than 8 characters, a base64 form of a recovery phrase, words of the phrase glued to other letters, and values under
@@ -78,7 +84,8 @@ from valedia_trader.core.secrets import child_env, env_file_path, load_env, reda
 __all__ = ["Alert", "Env", "Sender", "MacNotifier", "WatchResult", "watch", "open_alerts", "alerts_file", "main", "clean",
            "open_readonly", "describe", "SourceMissing", "CHECKS", "last_trading_day", "exchange_sessions", "launchctl_text",
            "parse_jobs", "read_tail", "PICKS_LOG", "is_outside_market_hours", "register_trading_file", "TradingFileError",
-           "hide_order_ids", "notifications_file", "read_notifications", "notification_note"]
+           "hide_order_ids", "notifications_file", "read_notifications", "notification_note", "is_practice", "is_unattended",
+           "has_unknown_mode", "read_alert_file", "withheld_note"]
 
 HEARTBEAT_MAX_AGE_S = 600.0                  # the collector writes one a minute; ten minutes without one is a stop
 PICKS_END_MAX_AGE_S = 3 * 3600.0             # the pick-list job runs every hour
@@ -102,7 +109,7 @@ _START_LINE = re.compile(rf"^{_STAMP} start$")
 _WEEKLY_RUN = re.compile(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) weekly research loop")
 _FAILED = re.compile(r"\bfailed\b(?!:?\s*\d)", re.I)           # "failed: 0" and "failed 3 times" are counts, not a failed run
 _LONG_DIGITS = re.compile(r"(?<!\d)(?<!\d\.)\d{9,}(?!\d)(?!\.\d)")          # a number with a decimal point is a price, not an account
-_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{4}(?:[ -]\d{4}){2,}(?!\d)")          # card-style: 3 or more groups of exactly four
+_GROUPED_DIGITS = re.compile(r"(?<!\d)\d{3,}(?:[ -]\d{3,}){2,}(?!\d)")          # 3 or more groups of 3 or more digits
 
 
 # ---------------------------------------------------------------------------------------------- text and files
@@ -160,20 +167,46 @@ def _unseen_out(text: str) -> str:
     return "".join(out)
 
 
-def clean(text, limit: int = 300) -> str:
-    """One line of text that is safe to show or write: format and control characters dropped, a remembered secret replaced by
-    the package's own guard, an order id cut to its last 4 characters, any run of 9 or more digits (an account number) or
-    digit groups written together replaced, and no more than `limit` characters."""
-    t, _ = redact(_unseen_out(str(text)))
+def _clean_once(text: str, limit: int) -> str:
+    """One pass, in this order: drop format and control characters, collapse every kind of whitespace, run the guard, cut to
+    `limit`, shorten order ids, mask account-style digits, and run the guard LAST, so nothing that comes after it can put a
+    covered form back together."""
+    t = " ".join(_unseen_out(text).split())
+    t, _ = redact(t)
+    if len(t) > limit:
+        t = t[:limit - 1] + "…"
     t = hide_order_ids(t)
     t = _GROUPED_DIGITS.sub("<number>", t)
     t = _LONG_DIGITS.sub("<number>", t)
-    t = " ".join(t.split())
-    return t if len(t) <= limit else t[:limit - 1] + "…"
+    t, _ = redact(t)
+    return t
+
+
+def clean(text, limit: int = 300) -> str:
+    """One line of text that is safe to show or write: format and control characters dropped, whitespace collapsed, a remembered
+    secret replaced by the package's own guard, an order id cut to its last 4 characters, any run of 9 or more digits (an
+    account number) or three or more groups of three or more digits joined by single spaces or dashes replaced (a list of
+    years or of clock times in groups of three digits or more, such as `2024 2025 2026`, is masked too: a known cost), and no
+    more than `limit` characters. The guard has the last word, and cleaning is a fixed point: cleaning a cleaned text changes
+    nothing."""
+    t = str(text)[:max(limit * 20, 4096)]
+    for _ in range(6):
+        n = _clean_once(t, limit)
+        if n == t:
+            return n
+        t = n
+    return t
 
 
 def _key_part(text) -> str:
-    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", clean(text, 80))
+    """A key: cleaned, then only letters, digits and `_.:-`; repeated until it no longer changes, so a key is its own cleaned form."""
+    cur = str(text)
+    for _ in range(6):
+        nxt = re.sub(r"[^A-Za-z0-9_.:-]+", "_", clean(cur, 80))
+        if nxt == cur:
+            return nxt
+        cur = nxt
+    return cur
 
 
 class SourceMissing(RuntimeError):
@@ -508,9 +541,23 @@ def check_orders(env: Env) -> CheckResult:
     return out
 
 
+PRACTICE_MODES = ("propose", "approve")
+
+
 def is_practice(entry: dict) -> bool:
-    """An order-step entry with a `mode` (propose or approve) is a practice run of the approval flow, not the unattended run."""
-    return entry.get("mode") not in (None, "")
+    """An order-step entry whose `mode` is exactly `propose` or `approve` is a practice run of the approval flow."""
+    return "mode" in entry and isinstance(entry["mode"], str) and entry["mode"] in PRACTICE_MODES
+
+
+def is_unattended(entry: dict) -> bool:
+    """An order-step entry with no `mode` key at all is the unattended run."""
+    return "mode" not in entry
+
+
+def has_unknown_mode(entry: dict) -> bool:
+    """A `mode` key that holds anything else (empty, null, a number, a boolean, a list, another letter case, blanks around a
+    word, another word) is neither the unattended run nor a practice run."""
+    return "mode" in entry and not is_practice(entry)
 
 
 def last_step_summaries(entries: list[dict], practice: str | None = None) -> dict[str, dict]:
@@ -519,7 +566,7 @@ def last_step_summaries(entries: list[dict], practice: str | None = None) -> dic
     last: dict[str, dict] = {}
     for e in entries:
         if e.get("type") == "order_step" and e.get("event") == "summary" and \
-                ((e.get("mode") == practice) if practice else not is_practice(e)):
+                ((e.get("mode") == practice and is_practice(e)) if practice else is_unattended(e)):
             last[str(e.get("venue"))] = e
     return last
 
@@ -561,6 +608,27 @@ def check_approval_refused(env: Env) -> CheckResult:
         e = refused[-1]
         out.alerts.append(Alert(f"approval:refused:{today}", "warning", "An approval was refused",
                                 f"{today} {clean(e.get('venue'), 60)}: {e.get('reason') or 'no reason given'}"))
+    return out
+
+
+def check_modes(env: Env) -> CheckResult:
+    """Today in New York: a summary with an unknown mode (one warning), and a propose or approve run that stopped at a stage other
+    than ticket (a refused approval has its own warning) or session (a closed market): one warning for each mode."""
+    out = CheckResult()
+    today = str(datetime.fromtimestamp(env.now, NEW_YORK).date())
+    entries, _ = env.journal()
+    todays = [e for e in entries if e.get("type") == "order_step" and e.get("event") == "summary" and str(e.get("day"))[:10] == today]
+    unknown = [e for e in todays if has_unknown_mode(e)]
+    if unknown:
+        out.alerts.append(Alert(f"mode:unknown:{today}", "warning", "An order-step summary with an unknown mode",
+                                f"{today} {clean(unknown[-1].get('venue'), 60)}: mode {clean(repr(unknown[-1].get('mode')), 40)}"))
+    for mode in PRACTICE_MODES:
+        stops = [e for e in todays if e.get("mode") == mode and is_practice(e) and e.get("status") == "stopped"
+                 and e.get("stage") not in ("ticket", "session")]
+        if stops:
+            e = stops[-1]
+            out.alerts.append(Alert(f"practice-stopped:{mode}:{today}", "warning", f"A {mode} run stopped at stage {e.get('stage')}",
+                                    f"{today} {clean(e.get('venue'), 60)}: {e.get('reason') or 'no reason given'}"))
     return out
 
 
@@ -657,7 +725,7 @@ def check_orderstep_ran(env: Env) -> CheckResult:
         return out
     today = str(ny.date())
     entries, _ = env.journal()
-    if not any(e.get("type") == "order_step" and not is_practice(e) and str(e.get("day"))[:10] == today for e in entries):
+    if not any(e.get("type") == "order_step" and is_unattended(e) and str(e.get("day"))[:10] == today for e in entries):
         out.alerts.append(Alert("orderstep:no-run", "warning", f"The order step has not run today ({today})",
                                 f"{ORDERSTEP_JOB} is loaded and the journal holds no order-step entry for {today}."))
     return out
@@ -730,6 +798,7 @@ CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
     ("order ledgers", ("orders:",), check_orders),
     ("order step", ("step-stopped:",), check_order_step),
     ("approval", ("approval:",), check_approval_refused),
+    ("order-step modes", ("mode:", "practice-stopped:"), check_modes),
     ("scheduled jobs", ("job:",), check_jobs),
     ("order-book collector", ("collector:",), check_collector),
     ("pick-list log", ("picks:",), check_picks),
@@ -768,16 +837,18 @@ def _cleaned_line(e: dict) -> dict:
     that changes under cleaning is its cleaned form from here on and is never written back as it was."""
     out = {k: clean(v, 400) for k, v in e.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
     out["key"] = _key_part(e.get("key"))
+    out["withheld"] = "<secret>" in clean(e.get("key"), 80)       # the key held a secret: the cleaned key is the mask, not a key
     out["level"] = clean(e.get("level"), 20)
     out["title"], out["detail"], out["time"] = clean(e.get("title", ""), 120), clean(e.get("detail", ""), 300), clean(e.get("time", ""), 40)
     return out
 
 
-def _replay(data: bytes) -> tuple[dict[str, dict], int]:
+def _replay(data: bytes) -> tuple[dict[str, dict], int, int]:
     """({key: its last line, cleaned} for the keys whose last line is not a cleared line, the number of lines that are not
-    alert lines)."""
+    alert lines, the number of old lines withheld: those whose key held a secret clean to the guard's mask, can match no check
+    and so could never be cleared; they are not alerts, open or cleared)."""
     open_map: dict[str, dict] = {}
-    damaged = 0
+    damaged = withheld = 0
     for raw in data.split(b"\n"):
         if not raw.strip():
             continue
@@ -789,21 +860,36 @@ def _replay(data: bytes) -> tuple[dict[str, dict], int]:
             damaged += 1
             continue
         e = _cleaned_line(e)
+        if e.pop("withheld"):
+            withheld += 1
+            continue
         if e["level"] == CLEARED:
             open_map.pop(e["key"], None)
         else:
             open_map[e["key"]] = e
-    return open_map, damaged
+    return open_map, damaged, withheld
+
+
+def read_alert_file(path) -> tuple[list[dict], int]:
+    """(the alerts open now, oldest first; the number of old lines withheld) from the file; nothing when there is no file.
+    Raises OSError if it cannot be read."""
+    p = Path(path)
+    if not p.exists():
+        return [], 0
+    if not p.is_file():
+        raise IsADirectoryError(f"{p.name} is not a file")
+    open_map, _, withheld = _replay(p.read_bytes())
+    return list(open_map.values()), withheld
 
 
 def open_alerts(path) -> list[dict]:
     """The alerts open now, oldest first, from the file; none when there is no file. Raises OSError if it cannot be read."""
-    p = Path(path)
-    if not p.exists():
-        return []
-    if not p.is_file():
-        raise IsADirectoryError(f"{p.name} is not a file")
-    return list(_replay(p.read_bytes())[0].values())
+    return read_alert_file(path)[0]
+
+
+def withheld_note(n: int) -> str:
+    return (f"{n} old line{'s' if n != 1 else ''} in the alert file {'were' if n != 1 else 'was'} withheld: the key held a secret, "
+            "so the line can match no check; it is not an open alert") if n else ""
 
 
 def notifications_file(root) -> Path:
@@ -858,6 +944,7 @@ class WatchResult:
     open: list[dict]                   # open after this run
     failures: list[str]
     shown: list[Alert] = field(default_factory=list)       # given to a sender and acknowledged, this run
+    withheld: int = 0                                      # old lines of the alert file that are not alerts (see `_replay`)
 
 
 def watch(env: Env, senders=(), path=None) -> WatchResult:
@@ -866,14 +953,17 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
     register_trading_file(env)
     produced, held, held_prefixes, failures = run_checks(env)
     now = iso(env.now)
-    by_key = {a.key: a for a in produced}
+    by_key = {}
+    for a in produced:                                     # two checks, or two labels, that clean to one key are one alert
+        by_key.setdefault(a.key, a)
+    produced = list(by_key.values())
     path.parent.mkdir(parents=True, exist_ok=True)
     raised, cleared = [], []
     with path.open("a+b") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)                     # two watches at once cannot both raise the same alert
         fh.seek(0)
         data = fh.read()
-        open_map, _ = _replay(data)
+        open_map, _, withheld = _replay(data)
         raised = [a for a in produced if a.key not in open_map]
         gone = [e for k, e in open_map.items()
                 if k not in by_key and k not in held and not any(k.startswith(p) for p in held_prefixes)
@@ -892,7 +982,7 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
             open_map[a.key] = {"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail}
         shown = _notify(open_map, senders, notifications_file(env.root) if path == alerts_file(env.root) else path.with_name("notifications.jsonl"),
                         now, failures)
-    return WatchResult(raised, cleared, list(open_map.values()), failures, shown)
+    return WatchResult(raised, cleared, list(open_map.values()), failures, shown, withheld)
 
 
 def _record(path: Path, row: dict) -> None:
@@ -934,9 +1024,11 @@ def _notify(open_map: dict, senders, record: Path, now: str, failures: list[str]
 
 # ---------------------------------------------------------------------------------------------- the command line
 
-def _show(rows: list[dict], out, states: dict | None = None) -> None:
+def _show(rows: list[dict], out, states: dict | None = None, withheld: int = 0) -> None:
     if not rows:
         print("no open alerts", file=out)
+    if withheld:
+        print(withheld_note(withheld), file=out)
     for e in rows:
         note = ""
         if states:
@@ -963,8 +1055,8 @@ def main(argv=None, env: Env | None = None, out=None) -> int:
     out = out or sys.stdout                                # bound only now: registering puts the output guard on the streams
     try:
         if args.cmd == "list":
-            rows = open_alerts(alerts_file(env.root))
-            _show(rows, out, read_notifications(notifications_file(env.root)))
+            rows, withheld = read_alert_file(alerts_file(env.root))
+            _show(rows, out, read_notifications(notifications_file(env.root)), withheld)
             return 1 if rows else 0
         result = watch(env, senders=[MacNotifier()] if args.notify else [])
     except Exception as exc:
@@ -974,7 +1066,7 @@ def main(argv=None, env: Env | None = None, out=None) -> int:
         print(f"raised   {a.level:<8} {a.key}  {a.title} - {a.detail}", file=out)
     for a in result.cleared:
         print(f"cleared  {a.key}", file=out)
-    _show(result.open, out, read_notifications(notifications_file(env.root)))
+    _show(result.open, out, read_notifications(notifications_file(env.root)), result.withheld)
     for failure in result.failures:
         print(f"the watch could not check: {failure}", file=sys.stderr)
     return 2 if result.failures else (1 if result.open else 0)

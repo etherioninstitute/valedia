@@ -849,7 +849,7 @@ def test_values_already_in_the_alert_and_notification_files_do_not_reach_the_pag
     assert op.main(["build", "--out", str(out)], env=env) == 0
     seen = capsys.readouterr()
     assert leaked(out.read_text()) == [] and leaked(seen.out + seen.err) == []
-    assert "Notification" in out.read_text() and "job:com.valedia._number_" not in out.read_text()
+    assert "withheld" in out.read_text() and "job:com.valedia._number_" not in out.read_text()          # both old lines held a secret in the key
 
 
 @pytest.mark.parametrize("body, words", [("# " + "x" * 70000 + "\n", "64 KB"), ("".join(f"S_{i}=v{i}\n" for i in range(201)), "200"),
@@ -890,3 +890,32 @@ def test_the_order_step_section_keeps_the_unattended_run_apart_from_the_practice
 def test_the_practice_rows_say_none_yet_when_there_is_no_practice_run(world):
     practice = world.page().sections["Broker (paper)"].split("Practice runs of the approval flow")[1]
     assert "Last propose none yet" in practice and "Last approve none yet" in practice
+
+
+# =====================================================================================================================
+# rev 4
+# =====================================================================================================================
+
+def test_the_page_treats_only_the_two_exact_modes_as_practice_and_no_key_as_the_unattended_run(world):
+    for odd in ("", None, "Propose", " approve", 3):
+        write_step_entry(world, None, "done", day="2026-11-16", sent=1)
+        entry = {"type": "order_step", "venue": "webull-sandbox", "event": "summary", "status": "stopped", "stage": "send",
+                 "reason": "unknown-mode-reason", "orders_sent": 0, "sent": [], "refused": [], "left_over": [], "mode": odd}
+        world.journal.write("2026-11-17", entry)
+    text = world.page().sections["Broker (paper)"]
+    unattended, practice = text.split("Practice runs of the approval flow")
+    assert "unknown-mode-reason" not in unattended and "unknown-mode-reason" not in practice       # neither run: not shown as either
+    assert "2026-11-16" in unattended                                                              # the real unattended run is
+
+
+def test_the_alert_lines_withheld_are_counted_on_the_page_not_listed_as_open(bare_world, trading_file):
+    key = TRADING["BROKER_API_KEY"]
+    folder = bare_world.root / "artifacts" / "owner"
+    (folder / "alerts.jsonl").write_text("".join(json.dumps(
+        {"time": "2026-11-13T19:00:00Z", "level": "warning", "key": f"job:com.valedia.{key}{i}", "title": "t", "detail": "d"}) + "\n" for i in range(4)))
+    env = bare_world.env()
+    env.environ = None
+    out = bare_world.tmp / "o.html"
+    op.build(env, out=out)
+    health = Page(out.read_text()).sections["Health"]
+    assert "No open alerts" in health and health.count("withheld") == 1 and "4 old lines" in health and leaked(health) == []

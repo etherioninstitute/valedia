@@ -368,7 +368,7 @@ def broker_part(path: Path, env: al.Env, ctx: Context) -> tuple[list, str]:
     try:
         entries, _ = ctx.journal()
         ours = [e for e in step_summaries(entries) if ledger_path_for(Path("."), e.get("venue")).name == path.name]
-        mine = [e for e in ours if not al.is_practice(e)][-SUMMARIES_SHOWN:]
+        mine = [e for e in ours if al.is_unattended(e)][-SUMMARIES_SHOWN:]
         body.append("<h3>Last order steps of the unattended run (from the journal)</h3>")
         if mine:
             body.append(table(["Day", "Result", "Orders"], [[E(day_of(e)), step_result(e), step_orders(e)] for e in reversed(mine)]))
@@ -377,7 +377,7 @@ def broker_part(path: Path, env: al.Env, ctx: Context) -> tuple[list, str]:
         body.append("<h3>Practice runs of the approval flow</h3>")
         practice = []
         for mode in ("propose", "approve"):
-            last_of_mode = [e for e in ours if e.get("mode") == mode][-1:]
+            last_of_mode = [e for e in ours if e.get("mode") == mode and al.is_practice(e)][-1:]
             practice.append([f"Last {mode}", E(day_of(last_of_mode[0])) if last_of_mode else "none yet",
                              step_result(last_of_mode[0]) if last_of_mode else "", step_orders(last_of_mode[0]) if last_of_mode else ""])
         body.append(table(["Run", "Day", "Result", "Orders"], practice))
@@ -589,11 +589,13 @@ def health_section(env: al.Env, ctx: Context) -> tuple[list, str]:
         body.append(problem(exc, "journal"))
     body.append("<h3>Open alerts of the watchdog</h3>")
     try:
-        rows = al.open_alerts(al.alerts_file(env.root))
+        rows, withheld = al.read_alert_file(al.alerts_file(env.root))
         states = al.read_notifications(al.notifications_file(env.root))
         body.append(table(["Level", "Key", "What", "Since", "Notification"],
                           [[E(r.get("level"), 20), E(r.get("key"), 80), E(r.get("title"), 200), E(r.get("time"), 40),
                             E(al.notification_note(states, r), 120)] for r in rows]) if rows else para("No open alerts."))
+        if withheld:
+            body.append(para(E(al.withheld_note(withheld), 300) + ".", "muted"))
     except Exception as exc:
         body.append(problem(exc, "alerts"))
     return times, "".join(body)
