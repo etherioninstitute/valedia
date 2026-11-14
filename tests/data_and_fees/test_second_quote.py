@@ -7,12 +7,14 @@ import io
 import json
 import math
 import functools
+import itertools
 import random
 import socket
 import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import urllib.response
 from datetime import datetime, timezone
@@ -1198,6 +1200,1025 @@ def test_four_thousand_generated_cases_of_the_age_rule_including_the_daylight_sa
     assert seen["agree"] > 300 and seen["no second quote"] > 300 and seen["ambiguous"] > 10 and seen["missing"] > 10, seen
 
 
+# ======================================================================================================================
+# T28b: licensed, real-time second sources (Alpaca, Finnhub) and the consensus
+# ======================================================================================================================
+
+AID, ASEC, FTOK = "PKFAKEID0123456789ABCD", "fakeAlpacaSecret0123456789abcdefXYZ", "fakeFinnhubToken0123456789qrstuv"
+KEYS = {"ALPACA_API_KEY": AID, "ALPACA_SECRET_KEY": ASEC, "FINNHUB_API_KEY": FTOK}
+FAKE_KEYS = (AID, ASEC, FTOK)
+ALPACA_URL = "https://data.alpaca.markets/v2/stocks/snapshots?symbols=%s&feed=iex"
+FINNHUB_URL = "https://finnhub.io/api/v1/quote?symbol=%s"
+
+
+def creds(name):
+    return KEYS[name]
+
+
+def zt(offset, frac="", base=None):
+    """An RFC 3339 UTC time `offset` seconds from NOW (or from `base`), with an optional fraction of a second."""
+    t = (NOW if base is None else base) + offset
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + ("." + frac if frac else "") + "Z"
+
+
+def alp_block(bid=752.5, ask=752.55, band_t=-30, last=752.54, last_t=-20, frac="092799711"):
+    return {"latestQuote": {"ap": ask, "as": 3, "ax": "V", "bp": bid, "bs": 4, "bx": "V", "c": ["R"], "t": zt(band_t, frac), "z": "B"},
+            "latestTrade": {"c": ["@"], "i": 12345, "p": last, "s": 100, "t": zt(last_t, frac), "x": "V", "z": "B"},
+            "minuteBar": {"c": 752.5, "h": 752.6, "l": 752.4, "n": 10, "o": 752.45, "t": zt(-60), "v": 1000, "vw": 752.5},
+            "dailyBar": {"c": 754.37, "h": 760.12, "l": 747.88, "n": 100, "o": 760.05, "t": zt(-3600), "v": 29900315, "vw": 752.0},
+            "prevDailyBar": {"c": 757.12, "h": 758.0, "l": 750.0, "n": 100, "o": 751.0, "t": zt(-90000), "v": 30000000, "vw": 754.0}}
+
+
+def alp(symbol="SPY", **kw):
+    return json.dumps({symbol: alp_block(**kw)}).encode()
+
+
+def fin(c=754.37, t=-20, **over):
+    doc = {"c": c, "d": -2.75, "dp": -0.3632, "h": 760.12, "l": 747.88, "o": 760.05, "pc": 757.12, "t": int(NOW + t)}
+    doc.update(over)
+    return json.dumps(doc).encode()
+
+
+# the answers as the lead saw them on 2026-11-13 at 21:04 New York time (market closed): kept whole, nothing but market data
+REAL_ALPACA_XLE = json.dumps({"XLE": {
+    "latestQuote": {"ap": 66.86, "as": 1, "ax": "V", "bp": 62.81, "bs": 1, "bx": "V", "c": ["R"], "t": "2026-11-13T21:00:00.092799711Z", "z": "B"},
+    "latestTrade": {"c": ["@", "T"], "i": 4321, "p": 64.93, "s": 100, "t": "2026-11-13T21:55:04.282408928Z", "x": "V", "z": "B"},
+    "minuteBar": {"c": 64.9, "h": 64.95, "l": 64.9, "n": 3, "o": 64.9, "t": "2026-11-13T20:59:00Z", "v": 300, "vw": 64.92},
+    "dailyBar": {"c": 64.96, "h": 64.965, "l": 64.155, "n": 900, "o": 64.91, "t": "2026-11-13T05:00:00Z", "v": 17648505, "vw": 64.7},
+    "prevDailyBar": {"c": 64.33, "h": 64.5, "l": 63.9, "n": 800, "o": 64.0, "t": "2026-11-12T05:00:00Z", "v": 15000000, "vw": 64.2}}}).encode()
+REAL_FINNHUB_SPY = b'{"c": 754.37, "d": -2.75, "dp": -0.3632, "h": 760.12, "l": 747.88, "o": 760.05, "pc": 757.12, "t": 1794603600}'
+
+
+class KFake:
+    """A fetch function for all three services: records (url, timeout, headers) and answers by host (a list is a queue whose
+    last item repeats; an exception is raised; a callable is called with (url, timeout, headers))."""
+    def __init__(self, alpaca=None, finnhub=None, cboe=None):
+        self.by_host = {"data.alpaca.markets": alpaca, "finnhub.io": finnhub, "cdn.cboe.com": cboe}
+        self.calls = []
+
+    def __call__(self, url, timeout, headers=None):
+        self.calls.append((url, timeout, None if headers is None else dict(headers)))
+        a = self.by_host[urllib.parse.urlsplit(url).hostname]
+        if isinstance(a, list):
+            a = a.pop(0) if len(a) > 1 else a[0]
+        if callable(a):
+            a = a(url, timeout, headers)
+        if isinstance(a, BaseException):
+            raise a
+        return a
+
+    def hosts(self):
+        return [urllib.parse.urlsplit(c[0]).hostname for c in self.calls]
+
+
+def aq(raw=None, symbol="SPY", fake=None, **kw):
+    fake = fake or KFake(alpaca=raw if raw is not None else alp(symbol))
+    return sq.alpaca_quote(symbol, fetch=fake, clock=CLOCK, credentials=kw.pop("credentials", creds), sleep=kw.pop("sleep", lambda s: None), **kw)
+
+
+def fq(raw=None, symbol="SPY", fake=None, **kw):
+    fake = fake or KFake(finnhub=raw if raw is not None else fin())
+    return sq.finnhub_quote(symbol, fetch=fake, clock=CLOCK, credentials=kw.pop("credentials", creds), sleep=kw.pop("sleep", lambda s: None), **kw)
+
+
+# ---- the readers: the real shapes, and what is sent
+
+def test_the_real_alpaca_answer_is_read_into_the_normal_form():
+    fake = KFake(alpaca=REAL_ALPACA_XLE)
+    out = sq.alpaca_quote("XLE", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None)
+    assert set(out) == {"symbol", "bid", "ask", "band_time", "last", "last_time", "fetched_at", "source"}
+    assert (out["symbol"], out["bid"], out["ask"], out["last"], out["fetched_at"], out["source"]) == ("XLE", 62.81, 66.86, 64.93, NOW, "alpaca-iex")
+    assert out["band_time"] == pytest.approx(datetime(2026, 11, 13, 21, 0, 0, tzinfo=timezone.utc).timestamp() + 0.092799711, abs=1e-6)
+    assert out["last_time"] == pytest.approx(datetime(2026, 11, 13, 21, 55, 4, tzinfo=timezone.utc).timestamp() + 0.282408928, abs=1e-6)
+    assert fake.calls == [(ALPACA_URL % "XLE", 5.0, {"APCA-API-KEY-ID": AID, "APCA-API-SECRET-KEY": ASEC})]
+
+
+def test_the_real_finnhub_answer_is_read_into_the_normal_form():
+    fake = KFake(finnhub=REAL_FINNHUB_SPY)
+    out = sq.finnhub_quote("SPY", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None)
+    assert out == {"symbol": "SPY", "bid": None, "ask": None, "band_time": None, "last": 754.37, "last_time": 1794603600.0,
+                   "fetched_at": NOW, "source": "finnhub"}
+    assert fake.calls == [(FINNHUB_URL % "SPY", 5.0, {"X-Finnhub-Token": FTOK})]
+
+
+def test_the_credentials_are_asked_for_by_the_three_names_and_nothing_else():
+    asked = []
+
+    def record(name):
+        asked.append(name)
+        return KEYS[name]
+    aq(credentials=record)
+    fq(credentials=record)
+    assert asked == ["ALPACA_API_KEY", "ALPACA_SECRET_KEY", "FINNHUB_API_KEY"]
+
+
+def test_the_default_credentials_are_the_secrets_module_by_those_names(monkeypatch):
+    for name, value in KEYS.items():
+        monkeypatch.setenv(name, value)
+    fake = KFake(alpaca=alp(), finnhub=fin())
+    assert sq.alpaca_quote("SPY", fetch=fake, clock=CLOCK, sleep=lambda s: None)["last"] == 752.54
+    assert sq.finnhub_quote("SPY", fetch=fake, clock=CLOCK, sleep=lambda s: None)["last"] == 754.37
+    assert fake.calls[0][2] == {"APCA-API-KEY-ID": AID, "APCA-API-SECRET-KEY": ASEC} and fake.calls[1][2] == {"X-Finnhub-Token": FTOK}
+    for name in KEYS:
+        monkeypatch.delenv(name)
+    silent = KFake(alpaca=alp(), finnhub=fin())
+    assert sq.alpaca_quote("SPY", fetch=silent, clock=CLOCK, sleep=lambda s: None) is None
+    assert sq.finnhub_quote("SPY", fetch=silent, clock=CLOCK, sleep=lambda s: None) is None
+    assert silent.calls == []                                                   # a missing key: no request at all
+
+
+BAD_KEYS = [None, "", " ", "  \t ", 5, b"abc", ["x"], "has space", "line\nbreak", "tab\there", "nul\x00byte", "cafékey", "x" * 300,
+            "bell\x07", "cr\rkey", " key"]
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS, ids=[repr(b)[:20] for b in BAD_KEYS])
+def test_a_missing_or_unusable_key_is_no_quote_and_no_request_to_that_service(bad):
+    for broken in KEYS:
+        fake = KFake(alpaca=alp(), finnhub=fin())
+        keys = {**KEYS, broken: bad}
+        a = sq.alpaca_quote("SPY", fetch=fake, clock=CLOCK, credentials=keys.__getitem__, sleep=lambda s: None)
+        f = sq.finnhub_quote("SPY", fetch=fake, clock=CLOCK, credentials=keys.__getitem__, sleep=lambda s: None)
+        if broken == "FINNHUB_API_KEY":
+            assert f is None and a is not None and fake.hosts() == ["data.alpaca.markets"]
+        else:
+            assert a is None and f is not None and fake.hosts() == ["finnhub.io"]
+
+
+def test_a_credentials_function_that_raises_is_no_quote_and_never_an_exception():
+    for exc in (KeyError("ALPACA_API_KEY"), RuntimeError("boom " + AID), ValueError(ASEC), OSError(FTOK), SystemError("x")):
+        def broken(name, exc=exc):
+            raise exc
+        fake = KFake(alpaca=alp(), finnhub=fin())
+        assert aq(fake=fake, credentials=broken) is None and fq(fake=fake, credentials=broken) is None
+        assert fake.calls == []
+
+
+def test_a_secrets_error_for_a_missing_key_is_no_quote(monkeypatch):
+    from valedia_trader.core import secrets
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    fake = KFake(alpaca=alp())
+    assert sq.alpaca_quote("SPY", fetch=fake, clock=CLOCK, credentials=secrets.secret, sleep=lambda s: None) is None
+    assert fake.calls == []
+
+
+def test_the_symbol_rule_is_applied_before_any_request():
+    for reader in (sq.alpaca_quote, sq.finnhub_quote):
+        for bad in ("spy", "SPY,QQQ", "SPY&feed=sip", "SPY\n", "", None, 5, "TOOLONGX", "A B", "SPY/../x", "SPY%2c"):
+            fake = KFake(alpaca=alp(), finnhub=fin())
+            with pytest.raises(ValueError):
+                reader(bad, fetch=fake, clock=CLOCK, credentials=creds)
+            assert fake.calls == []
+
+
+def test_only_the_symbol_is_sent_in_the_query_and_the_url_is_exact():
+    for sym in ("SPY", "BRK.B", "BRK-B", "XLE"):
+        a, f = KFake(alpaca=alp(sym)), KFake(finnhub=fin())
+        aq(symbol=sym, fake=a)
+        fq(symbol=sym, fake=f)
+        assert a.calls[0][0] == ALPACA_URL % sym and f.calls[0][0] == FINNHUB_URL % sym
+        for url in (a.calls[0][0], f.calls[0][0]):
+            assert "key" not in url.lower() and "secret" not in url.lower() and "token" not in url.lower()
+
+
+def test_each_key_goes_only_to_its_own_host_in_the_header_named():
+    fake = KFake(alpaca=alp(), finnhub=fin())
+    aq(fake=fake)
+    fq(fake=fake)
+    (a_url, _, a_headers), (f_url, _, f_headers) = fake.calls
+    assert urllib.parse.urlsplit(a_url).hostname == "data.alpaca.markets" and a_headers == {"APCA-API-KEY-ID": AID, "APCA-API-SECRET-KEY": ASEC}
+    assert urllib.parse.urlsplit(f_url).hostname == "finnhub.io" and f_headers == {"X-Finnhub-Token": FTOK}
+    assert FTOK not in str(a_headers) + a_url and AID not in str(f_headers) + f_url and ASEC not in str(f_headers) + f_url
+
+
+# ---- the readers: times, partial answers, hostile answers
+
+def test_alpaca_times_are_read_with_any_number_of_decimals_in_utc():
+    base = datetime(2026, 11, 13, 21, 10, 0, tzinfo=timezone.utc).timestamp()
+    for frac, extra in (("", 0.0), ("5", 0.5), ("123", 0.123), ("092799711", 0.092799711), ("000000001", 1e-9), ("999999999", 0.999999999)):
+        text = "2026-11-13T21:10:00" + ("." + frac if frac else "") + "Z"
+        block = alp_block()
+        block["latestQuote"]["t"] = text
+        out = aq(json.dumps({"SPY": block}).encode())
+        assert abs(out["band_time"] - (base + extra)) < 1e-6, text
+
+
+@pytest.mark.parametrize("bad", ["2026-11-13T21:10:00", "2026-11-13T21:10:00+00:00", "2026-11-13 21:10:00Z", "2026-11-13T21:10:00.Z",
+                                 "2026-11-13T21:10:00.1234567890Z", "2026-13-13T21:10:00Z", "2026-11-31T21:10:00Z", "2026-11-13T25:10:00Z",
+                                 "2026-11-13T21:10:60Z", "2026-11-13T21:10:00z", "yesterday", "", None, 5, True, ["2026-11-13T21:10:00Z"], " 2026-11-13T21:10:00Z"])
+def test_an_unreadable_alpaca_time_is_none_and_the_numbers_stay(bad):
+    block = alp_block()
+    block["latestQuote"]["t"] = bad
+    block["latestTrade"]["t"] = bad
+    out = aq(json.dumps({"SPY": block}).encode())
+    assert out is not None and out["band_time"] is None and out["last_time"] is None and out["bid"] == 752.5 and out["last"] == 752.54
+
+
+def test_alpaca_numbers_are_strict_one_by_one():
+    for bad in ("752.5", True, None, -1.0, 0, 0.0, float("inf"), 1e7 + 1, [1], {}):
+        block = alp_block()
+        block["latestQuote"]["bp"] = bad
+        out = aq(json.dumps({"SPY": block}, allow_nan=True).encode())
+        assert out is not None and out["bid"] is None and out["ask"] == 752.55 and out["last"] == 752.54
+        block = alp_block()
+        block["latestTrade"]["p"] = bad
+        out = aq(json.dumps({"SPY": block}, allow_nan=True).encode())
+        assert out is not None and out["last"] is None and out["bid"] == 752.5
+
+
+def test_alpaca_without_a_last_and_without_a_band_pair_is_none():
+    block = alp_block()
+    block["latestTrade"]["p"] = 0
+    block["latestQuote"]["bp"] = 0
+    assert aq(json.dumps({"SPY": block}).encode()) is None
+    block = alp_block()
+    del block["latestTrade"]
+    out = aq(json.dumps({"SPY": block}).encode())
+    assert out["last"] is None and out["last_time"] is None and out["bid"] == 752.5
+    block = alp_block()
+    del block["latestQuote"]
+    out = aq(json.dumps({"SPY": block}).encode())
+    assert out["bid"] is None and out["band_time"] is None and out["last"] == 752.54
+    assert aq(json.dumps({"SPY": {"latestQuote": 5, "latestTrade": "x"}}).encode()) is None
+
+
+def alpaca_hostile():
+    out = {}
+
+    def put(name, raw):
+        out[name] = raw if isinstance(raw, bytes) else json.dumps(raw).encode()
+    good = json.loads(alp())
+    put("another-symbols-block", {"QQQ": good["SPY"]})
+    put("lowercase-symbol-key", {"spy": good["SPY"]})
+    put("empty-object", {})
+    put("symbol-block-null", {"SPY": None})
+    put("symbol-block-string", {"SPY": "752.5"})
+    put("symbol-block-list", {"SPY": [good["SPY"]]})
+    put("data-wrapped", {"data": {"SPY": good["SPY"]}})
+    put("list-of-blocks", [good])
+    put("string", "SPY")
+    put("null", None)
+    put("number", 752.5)
+    put("html-error-page", b"<html><body><h1>403 Forbidden</h1></body></html>")
+    put("message-body", {"code": 40110000, "message": "request is not authorized"})
+    put("empty", b"")
+    put("truncated", alp()[:-30])
+    put("invalid-utf8", b'{"SPY": {"latestTrade": {"p": 1.0, "x": "\xff\xfe"}}}')
+    put("utf16", alp().decode().encode("utf-16"))
+    put("duplicate-symbol-key", b'{"SPY": ' + json.dumps(good["SPY"]).encode() + b', "SPY": ' + json.dumps(good["SPY"]).encode() + b"}")
+    put("duplicate-inside-block", b'{"SPY": {"latestTrade": {"p": 1.0, "p": 2.0, "t": "2026-11-13T21:19:00Z"}}}')
+    put("duplicate-escaped", b'{"SPY": {"latestTrade": {"p": 1.0, "\\u0070": 2.0, "t": "2026-11-13T21:19:00Z"}}}')
+    put("ten-megabytes-of-valid-data", json.dumps({"SPY": good["SPY"], "pad": "x" * (10 * 1024 * 1024)}).encode())
+    put("ten-megabytes-of-junk", b"x" * (10 * 1024 * 1024))
+    put("deep-nesting", b"[" * 30000 + b"]" * 30000)
+    put("every-number-nan", alp().replace(b"752.5,", b"NaN,").replace(b"752.55", b"NaN").replace(b"752.54", b"NaN"))
+    put("every-number-infinity", alp().replace(b"752.5,", b"Infinity,").replace(b"752.55", b"-Infinity").replace(b"752.54", b"Infinity"))
+    put("every-number-1e999", alp().replace(b"752.5,", b"1e999,").replace(b"752.55", b"-1e999").replace(b"752.54", b"1e999"))
+    put("every-number-giant-integer", alp().replace(b"752.5,", b"1" + b"0" * 400 + b",").replace(b"752.55", b"-" + b"1" + b"0" * 400).replace(b"752.54", b"1" + b"0" * 400))
+    for name, bad in {"string": "752.5", "list": [1], "dict": {"a": 1}, "bool": True, "null": None, "negative": -5.0, "zero": 0, "huge": 1.0000001e7}.items():
+        block = alp_block()
+        block["latestQuote"].update(bp=bad, ap=bad)
+        block["latestTrade"].update(p=bad)
+        put("every-number-" + name, {"SPY": block})
+    return out
+
+
+ALPACA_HOSTILE = alpaca_hostile()
+
+
+@pytest.mark.parametrize("name", sorted(ALPACA_HOSTILE))
+def test_a_hostile_alpaca_answer_is_no_quote_never_an_exception(name):
+    fake = KFake(alpaca=ALPACA_HOSTILE[name])
+    assert sq.alpaca_quote("SPY", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None) is None
+    assert len(fake.calls) == 1                                                  # an unusable answer is not retried
+
+
+def finnhub_hostile():
+    out = {}
+
+    def put(name, raw):
+        out[name] = raw if isinstance(raw, bytes) else json.dumps(raw).encode()
+    t = int(NOW - 20)
+    put("unknown-symbol-zeros", {"c": 0, "d": None, "dp": None, "h": 0, "l": 0, "o": 0, "pc": 0, "t": 0})
+    put("c-zero", {"c": 0, "t": t})
+    put("t-zero", {"c": 754.37, "t": 0})
+    put("t-missing", {"c": 754.37})
+    put("c-missing", {"t": t})
+    put("t-string", {"c": 754.37, "t": str(t)})
+    put("t-bool", {"c": 754.37, "t": True})
+    put("t-negative", {"c": 754.37, "t": -t})
+    put("t-huge", {"c": 754.37, "t": 10 ** 15})
+    put("t-year-10000", {"c": 754.37, "t": 253402300800})
+    put("t-nan", b'{"c": 754.37, "t": NaN}')
+    put("t-infinity", b'{"c": 754.37, "t": Infinity}')
+    put("t-giant", b'{"c": 754.37, "t": 1' + b"0" * 400 + b"}")
+    put("c-string", {"c": "754.37", "t": t})
+    put("c-bool", {"c": True, "t": t})
+    put("c-negative", {"c": -754.37, "t": t})
+    put("c-huge", {"c": 1.0000001e7, "t": t})
+    put("c-nan", b'{"c": NaN, "t": %d}' % t)
+    put("c-infinity", b'{"c": -Infinity, "t": %d}' % t)
+    put("c-1e999", b'{"c": 1e999, "t": %d}' % t)
+    put("c-list", {"c": [754.37], "t": t})
+    put("c-dict", {"c": {"v": 754.37}, "t": t})
+    put("list", [{"c": 754.37, "t": t}])
+    put("string", "754.37")
+    put("null", None)
+    put("number", 754.37)
+    put("wrapped", {"quote": {"c": 754.37, "t": t}})
+    put("error-json", {"error": "Invalid API key"})
+    put("html", b"<!DOCTYPE html><html><title>429 Too Many Requests</title></html>")
+    put("empty", b"")
+    put("truncated", fin()[:-10])
+    put("invalid-utf8", b'{"c": 754.37, "t": %d, "x": "\xff"}' % t)
+    put("duplicate-c", b'{"c": 754.37, "c": 1.0, "t": %d}' % t)
+    put("duplicate-t", b'{"c": 754.37, "t": %d, "t": %d}' % (t, t))
+    put("ten-megabytes", json.dumps({"c": 754.37, "t": t, "pad": "x" * (10 * 1024 * 1024)}).encode())
+    put("deep-nesting", b"[" * 30000 + b"]" * 30000)
+    return out
+
+
+FINNHUB_HOSTILE = finnhub_hostile()
+
+
+@pytest.mark.parametrize("name", sorted(FINNHUB_HOSTILE))
+def test_a_hostile_finnhub_answer_is_no_quote_never_an_exception(name):
+    fake = KFake(finnhub=FINNHUB_HOSTILE[name])
+    assert sq.finnhub_quote("SPY", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None) is None
+    assert len(fake.calls) == 1
+
+
+def test_finnhub_reads_the_price_and_its_own_time_and_nothing_more():
+    out = fq(fin(c=100, t=-5))
+    assert out["last"] == 100.0 and type(out["last"]) is float and out["last_time"] == float(int(NOW - 5)) and out["bid"] is None
+    assert fq(json.dumps({"c": 100.5, "t": NOW - 5.5, "h": None, "l": "x"}).encode())["last_time"] == NOW - 5.5     # a float time is fine
+
+
+def test_a_403_or_429_or_any_error_status_is_no_quote_and_client_errors_are_not_retried():
+    for code in (400, 401, 403, 404, 429):
+        err = urllib.error.HTTPError("https://x/", code, "no", None, None)
+        for reader, host in ((aq, "alpaca"), (fq, "finnhub")):
+            fake = KFake(**{host: err})
+            sleeps = []
+            assert reader(fake=fake, sleep=sleeps.append) is None
+            assert len(fake.calls) == 1 and sleeps == []
+    for code in (500, 502, 503):
+        err = urllib.error.HTTPError("https://x/", code, "no", None, None)
+        fake, sleeps = KFake(alpaca=err), []
+        assert aq(fake=fake, sleep=sleeps.append) is None
+        assert len(fake.calls) == 2 and sleeps == [2.0]
+
+
+def test_two_tries_two_seconds_apart_for_both_readers():
+    for reader, host in ((aq, "alpaca"), (fq, "finnhub")):
+        fake, sleeps = KFake(**{host: OSError("boom")}), []
+        assert reader(fake=fake, sleep=sleeps.append) is None
+        assert len(fake.calls) == 2 and sleeps == [2.0] and all(c[1] == 5.0 for c in fake.calls)
+        fake = KFake(**{host: [TimeoutError("slow"), alp() if host == "alpaca" else fin()]})
+        assert reader(fake=fake, sleep=lambda s: None) is not None and len(fake.calls) == 2
+        fake = KFake(**{host: [OSError("a"), ValueError("b"), alp() if host == "alpaca" else fin()]})
+        assert reader(fake=fake, sleep=lambda s: None) is None and len(fake.calls) == 2
+
+
+def test_a_try_longer_than_ten_seconds_fails_for_both_readers():
+    for reader, host, body in ((sq.alpaca_quote, "alpaca", alp()), (sq.finnhub_quote, "finnhub", fin())):
+        fc = FakeClock(NOW)
+        calls = []
+
+        def slow(url, timeout, headers=None):
+            calls.append(url)
+            fc.t += 2100.0
+            return body
+        assert reader("SPY", fetch=slow, clock=fc, credentials=creds, sleep=lambda s: None) is None and len(calls) == 2
+
+        def ten(url, timeout, headers=None):
+            fc.t += 10.0
+            return body
+        assert reader("SPY", fetch=ten, clock=fc, credentials=creds, sleep=lambda s: None) is not None
+
+        def over(url, timeout, headers=None):
+            fc.t += 10.5
+            return body
+        assert reader("SPY", fetch=over, clock=fc, credentials=creds, sleep=lambda s: None) is None
+
+
+# ---- the real keyed fetch (a fake HTTPS handler stands in; nothing leaves the machine)
+
+class Recorder(FakeHTTPS):
+    def __init__(self, routes):
+        super().__init__(routes)
+        self.requests = []
+
+    def https_open(self, req):
+        self.requests.append({"url": req.full_url, "method": req.get_method(), "headers": dict(req.header_items()),
+                              "unredirected": dict(req.unredirected_hdrs), "data": req.data, "regular": dict(req.headers)})
+        return super().https_open(req)
+
+
+AL = ALPACA_URL % "SPY"
+FH = FINNHUB_URL % "SPY"
+A_HEAD = {"APCA-API-KEY-ID": AID, "APCA-API-SECRET-KEY": ASEC}
+F_HEAD = {"X-Finnhub-Token": FTOK}
+
+
+def kf(routes, url, headers, **kw):
+    handler = Recorder(routes)
+    return handler, lambda: sq.keyed_fetch(url, 5.0, headers, opener=sq._build_opener(handler), **kw)
+
+
+def test_the_keyed_fetch_sends_the_keys_as_headers_to_their_own_host_only():
+    handler, go = kf({AL: (200, None, io.BytesIO(alp()))}, AL, A_HEAD)
+    assert go() == alp()
+    (req,) = handler.requests
+    assert req["url"] == AL and req["method"] == "GET" and req["data"] is None
+    sent = {k.lower(): v for k, v in req["headers"].items()}
+    assert sent["apca-api-key-id"] == AID and sent["apca-api-secret-key"] == ASEC
+    assert set(sent) <= {"apca-api-key-id", "apca-api-secret-key", "user-agent", "accept", "host"}
+    handler, go = kf({FH: (200, None, io.BytesIO(fin()))}, FH, F_HEAD)
+    assert go() == fin()
+    sent = {k.lower(): v for k, v in handler.requests[0]["headers"].items()}
+    assert sent["x-finnhub-token"] == FTOK and set(sent) <= {"x-finnhub-token", "user-agent", "accept", "host"}
+
+
+def test_the_keys_are_unredirected_headers_so_nothing_can_copy_them_to_another_place():
+    handler, go = kf({AL: (200, None, io.BytesIO(alp()))}, AL, A_HEAD)
+    go()
+    req = handler.requests[0]
+    assert {k.lower() for k in req["unredirected"]} - {"host"} == {"apca-api-key-id", "apca-api-secret-key"}
+    assert not any(k.lower().startswith(("apca", "x-finnhub")) for k in req["regular"])
+
+
+@pytest.mark.parametrize("url,headers", [
+    (AL, F_HEAD), (FH, A_HEAD), (AL, {}), (FH, {}), (AL, {"APCA-API-KEY-ID": AID}), (AL, {**A_HEAD, "X-Finnhub-Token": FTOK}),
+    (FH, {**F_HEAD, "Authorization": "Bearer " + FTOK}), (AL, {**A_HEAD, "Cookie": "a=b"}), (AL, None), (AL, "key"), (AL, [("APCA-API-KEY-ID", AID)]),
+    (AL, {"APCA-API-KEY-ID": "has space", "APCA-API-SECRET-KEY": ASEC}), (AL, {"APCA-API-KEY-ID": AID + "\r\nX-Evil: 1", "APCA-API-SECRET-KEY": ASEC}),
+    (FH, {"X-Finnhub-Token": 5}), (FH, {"x-finnhub-token": FTOK}),
+    ("http://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=iex", A_HEAD), ("http://finnhub.io/api/v1/quote?symbol=SPY", F_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=sip", A_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=iex&apca=" + AID, A_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY,QQQ&feed=iex", A_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=spy&feed=iex", A_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/SPY/quotes/latest?feed=iex", A_HEAD), ("https://data.alpaca.markets:443/v2/stocks/snapshots?symbols=SPY&feed=iex", A_HEAD),
+    ("https://user@data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=iex", A_HEAD), ("https://data.alpaca.markets.evil.example/v2/stocks/snapshots?symbols=SPY&feed=iex", A_HEAD),
+    ("https://finnhub.io/api/v1/quote?symbol=SPY&token=" + FTOK, F_HEAD), ("https://finnhub.io/api/v1/quote?symbol=SPY#x", F_HEAD),
+    ("https://finnhub.io/api/v1/quote?symbol=SPY%0d", F_HEAD), ("https://finnhub.io/api/v1/quote?symbol=SPY&a=BC", F_HEAD),
+    ("https://finnhub.io/api/v1/quote?symbol=SPY&symbol=QQQ", F_HEAD), ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=iex&x=Y", A_HEAD),
+    ("https://data.alpaca.markets/v2/stocks/snapshots?symbols=SPY&feed=iex&feed=sip", A_HEAD), ("https://data.alpaca.markets/v2/stocks/snapshots?feed=iex&symbols=SPY", A_HEAD),
+    ("https://finnhub.io/api/v1/quote?symbol=SPY\n", F_HEAD), ("https://finnhub.io/api/v1//quote?symbol=SPY", F_HEAD), ("https://FINNHUB.IO/api/v1/quote?symbol=SPY", F_HEAD), ("https://finnhub.io/api/v1/search?q=SPY", F_HEAD), ("https://finnhub.io@evil.example/api/v1/quote?symbol=SPY", F_HEAD),
+    ("https://cdn.cboe.com/api/global/delayed_quotes/quotes/SPY.json", A_HEAD), ("https://cdn.cboe.com/api/global/delayed_quotes/quotes/SPY.json", F_HEAD),
+    ("https://evil.example/v2/stocks/snapshots?symbols=SPY&feed=iex", A_HEAD), (None, A_HEAD), (5, F_HEAD), ("", F_HEAD),
+])
+def test_the_keyed_fetch_refuses_before_any_request_a_wrong_host_url_or_header_set(url, headers):
+    handler = Recorder({})
+    with pytest.raises(ValueError) as e:
+        sq.keyed_fetch(url, 5.0, headers, opener=sq._build_opener(handler))
+    assert handler.requests == []
+    for key in FAKE_KEYS:
+        assert key not in str(e.value)
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_is_a_failed_try_for_the_keyed_sources_and_nothing_is_sent_on(code):
+    for url, head, targets in ((AL, A_HEAD, ["https://data.alpaca.markets/other", FH, "https://evil.example/x", B, "http://data.alpaca.markets/x"]),
+                               (FH, F_HEAD, ["https://finnhub.io/other", AL, "https://evil.example/x", A, "https://finnhub.io/api/v1/quote?symbol=QQQ"])):
+        for target in targets:
+            routes = {url: (code, target, io.BytesIO(b"")), target: (200, None, io.BytesIO(alp()))}
+            handler, go = kf(routes, url, head)
+            with pytest.raises(urllib.error.HTTPError) as e:
+                go()
+            assert e.value.code == code
+            assert [r["url"] for r in handler.requests] == [url]                    # the target is never requested
+            for key in FAKE_KEYS:
+                assert key not in str(e.value)
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404, 429, 500, 503])
+def test_an_error_status_raises_an_http_error_whose_text_holds_no_key_and_the_body_is_not_read(code):
+    body = Counting(("<html>" + AID + ASEC + FTOK + "</html>").encode() * 3)
+    handler, go = kf({AL: (code, None, body)}, AL, A_HEAD)
+    with pytest.raises(urllib.error.HTTPError) as e:
+        go()
+    assert e.value.code == code
+    for key in FAKE_KEYS:
+        assert key not in str(e.value) and key not in repr(e.value)
+    assert body.total == 0
+
+
+def test_an_answer_that_comes_from_another_place_is_refused():
+    class Elsewhere(Recorder):
+        def https_open(self, req):
+            resp = super().https_open(req)
+            resp.url = "https://evil.example/answer"
+            return resp
+    handler = Elsewhere({AL: (200, None, io.BytesIO(alp()))})
+    with pytest.raises(ValueError):
+        sq.keyed_fetch(AL, 5.0, A_HEAD, opener=sq._build_opener(handler))
+
+
+def test_the_keyed_fetch_has_the_same_deadline_cap_and_tls_as_the_cboe_fetch():
+    fc = FakeClock()
+    body = Trickle(fc)
+    handler = Recorder({AL: (200, None, body)})
+    with pytest.raises(TimeoutError):
+        sq.keyed_fetch(AL, 5.0, A_HEAD, opener=sq._build_opener(handler), clock=fc)
+    assert body.reads == 3 and fc.t == 12.0
+    big = Counting(b"x" * BIG)
+    handler, go = kf({AL: (200, None, big)}, AL, A_HEAD)
+    with pytest.raises(ValueError):
+        go()
+    assert big.total <= sq.MAX_BODY_BYTES + 1
+    real = sq._build_opener()
+    assert [h for h in real.handlers if type(h).__name__ == "_BudgetHTTPS"]
+
+
+# ---- judging a quote by its own times (alpaca and finnhub)
+
+def nq(bid=None, ask=None, band_t=-30, last=None, last_t=-20, fetched_t=0, symbol="SPY", base=NOW):
+    """A normalised quote; times as offsets in seconds from `base` (None: unknown)."""
+    return {"symbol": symbol, "bid": bid, "ask": ask, "band_time": None if band_t is None else base + band_t, "last": last,
+            "last_time": None if last_t is None else base + last_t, "fetched_at": None if fetched_t is None else base + fetched_t,
+            "source": "alpaca-iex"}
+
+
+def jq(first, q, tol=0.01, now=NOW_DT, symbol="SPY", **kw):
+    return sq.judge_quote(first, q, symbol=symbol, now=now, tolerance=tol, **kw)
+
+
+def test_the_named_constants_of_the_rules():
+    assert sq.BAND_MAX_AGE_SECONDS == 120 and sq.BAND_FUTURE_SLACK_SECONDS == 5 and sq.BAND_MAX_WIDTH == 0.005
+    assert sq.MAX_FETCH_AGE_SECONDS == 120 and sq.DEFAULT_MAX_AGE_SECONDS == 1800 and sq.FUTURE_SLACK_SECONDS == 300
+    assert sq.OVERALL_DEADLINE_SECONDS == 25.0
+
+
+def test_a_fresh_narrow_band_decides_and_the_difference_is_from_its_mid():
+    q = nq(752.5, 752.55, last=752.54)
+    out = jq(752.6, q)
+    assert out["verdict"] == "agree" and out["basis"] == "bid/ask band" and math.isclose(out["difference"], (752.6 - 752.525) / 752.525)
+    assert jq(760.07525, q)["verdict"] == "agree" and jq(760.07526, q)["verdict"] == "disagree"      # ask + 1 % of the mid
+    assert jq(744.97475, q)["verdict"] == "agree" and jq(744.97474, q)["verdict"] == "disagree"      # bid - 1 % of the mid
+    assert jq(752.6, q, 0.0)["verdict"] == "disagree" and jq(752.55, q, 0.0)["verdict"] == "agree" and jq(752.5, q, 0.0)["verdict"] == "agree"
+
+
+@pytest.mark.parametrize("age,ok", [(-5, True), (-6, False), (0, True), (1, True), (119, True), (120, True), (121, False), (3600, False)])
+def test_the_band_must_be_at_most_120_seconds_old_and_5_ahead(age, ok):
+    out = jq(100.0, nq(99.99, 100.01, band_t=-age))
+    assert out["verdict"] == ("agree" if ok else "no second quote")
+
+
+@pytest.mark.parametrize("bid,ask,ok", [
+    (399, 401, True),            # width 2 on a mid of 400: exactly 0.5 %
+    (399, 402, False),           # a bit over
+    (3990, 4010, True), (3990, 4011, False), (3991, 4010, True),
+    (100, 100, True), (99.5, 100.5, False),                      # 1 on 100: 1 %
+])
+def test_the_band_may_be_no_wider_than_half_a_percent_of_its_mid(bid, ask, ok):
+    mid = (bid + ask) / 2
+    out = jq(mid, nq(float(bid), float(ask), last=None))
+    assert out["verdict"] == ("agree" if ok else "no second quote"), (bid, ask)
+
+
+def test_a_band_too_wide_or_too_old_gives_way_to_a_usable_last_price():
+    wide = nq(62.81, 66.86, band_t=-5, last=64.93, last_t=-10)                # the closing quote the lead saw
+    out = jq(64.93, wide)
+    assert out["verdict"] == "agree" and out["basis"] == "last price" and out["difference"] == 0.0
+    assert jq(70.0, wide)["verdict"] == "disagree"
+    stale = nq(99.99, 100.01, band_t=-500, last=100.0, last_t=-10)
+    assert jq(100.0, stale)["basis"] == "last price" and jq(101.01, stale)["verdict"] == "disagree" and jq(101.0, stale)["verdict"] == "agree"
+    assert jq(100.0, nq(99.99, 100.01, band_t=-500, last=None))["verdict"] == "no second quote"
+    assert jq(100.0, nq(62.81, 66.86, band_t=-5, last=None))["verdict"] == "no second quote"
+
+
+@pytest.mark.parametrize("age,ok", [(-300, True), (-301, False), (0, True), (1800, True), (1801, False), (7200, False)])
+def test_the_last_trade_must_be_within_the_age_limit_and_300_ahead(age, ok):
+    out = jq(100.0, nq(last=100.0, last_t=-age))
+    assert out["verdict"] == ("agree" if ok else "no second quote")
+    assert jq(100.0, nq(last=100.0, last_t=-60), max_age_seconds=60)["verdict"] == "agree"
+    assert jq(100.0, nq(last=100.0, last_t=-61), max_age_seconds=60)["verdict"] == "no second quote"
+
+
+@pytest.mark.parametrize("fetched_before,ok", [(120, True), (121, False), (0, True), (-1, True), (-30, True), (-31, False), (3600, False)])
+def test_the_fetch_must_be_at_most_120_seconds_before_now_and_not_far_after(fetched_before, ok):
+    out = jq(100.0, nq(99.99, 100.01, band_t=-10, fetched_t=-fetched_before))
+    assert out["verdict"] == ("agree" if ok else "no second quote"), fetched_before
+
+
+def test_a_crossed_band_is_no_quote_whatever_the_last_price_for_the_licensed_sources_too():
+    for q in (nq(102.0, 100.0, last=500.0, last_t=-5), nq(100.01, 100.0, last=100.0), nq(102.0, 100.0, last=100.0, band_t=-500)):
+        for first in (500.0, 100.0, 101.0):
+            assert jq(first, q) == {"verdict": "no second quote", "difference": None, "basis": jq(first, q)["basis"]}
+    assert jq(500.0, nq(102.0, None, last=500.0, last_t=-5))["verdict"] == "agree"          # one side only: the last price
+
+
+def test_a_last_price_that_contradicts_its_own_usable_band_is_no_quote_but_a_stale_one_does_not():
+    q = nq(99.99, 100.01, last=105.0, last_t=-5)
+    assert jq(100.0, q)["verdict"] == "no second quote" and jq(105.0, q)["verdict"] == "no second quote"
+    assert jq(100.0, nq(99.99, 100.01, last=105.0, last_t=-5000))["verdict"] == "agree"     # that last trade is hours old: not used
+    assert jq(100.0, nq(99.99, 100.01, last=101.0, last_t=-5))["verdict"] == "agree"         # inside the band widened by 1 %
+    assert jq(100.0, nq(99.99, 100.01, last=101.0101, last_t=-5))["verdict"] == "no second quote"
+    assert jq(100.0, nq(99.99, 100.01, last=101.01, last_t=-5))["verdict"] == "agree"
+
+
+def test_nothing_usable_is_no_second_quote_and_a_bad_first_price_never_agrees():
+    assert jq(100.0, nq())["verdict"] == "no second quote"
+    assert jq(100.0, nq(99.99, 100.01, band_t=None, last=None))["verdict"] == "no second quote"
+    assert jq(100.0, nq(99.99, 100.01, band_t=None, last=100.0, last_t=None))["verdict"] == "no second quote"
+    for bad in (None, float("nan"), float("inf"), -1.0, 0.0, True, "100", 1e8):
+        out = jq(bad, nq(99.99, 100.01))
+        assert out["verdict"] == "disagree" and out["difference"] is None
+    assert jq(None, None)["verdict"] == "no second quote"
+
+
+def test_a_quote_for_another_symbol_or_with_garbage_fields_is_no_second_quote():
+    assert jq(100.0, nq(99.99, 100.01, symbol="QQQ"))["verdict"] == "no second quote"
+    assert jq(100.0, nq(99.99, 100.01), symbol="QQQ")["verdict"] == "no second quote"
+    for bad in (None, "x", 5, [], {}, nq(99.99, 100.01, fetched_t=None)):
+        assert jq(100.0, bad)["verdict"] == "no second quote"
+    for key, value in (("fetched_at", True), ("fetched_at", float("nan")), ("fetched_at", "now"), ("band_time", True), ("band_time", float("inf")),
+                       ("bid", "99.99"), ("bid", True), ("ask", float("nan")), ("last", -1.0), ("last_time", "x")):
+        q = nq(99.99, 100.01, last=100.0)
+        q[key] = value
+        out = jq(100.0, q)
+        assert out["verdict"] == ("no second quote" if key == "fetched_at" else "agree"), (key, value)    # the rest falls back to what is usable
+    q = nq(99.99, 100.01)
+    del q["symbol"]
+    assert jq(100.0, q)["verdict"] == "no second quote"
+
+
+def test_judge_quote_validates_its_arguments_like_compare_and_reads_no_clock(monkeypatch):
+    import inspect
+    q = nq(99.99, 100.01)
+    for bad in (float("nan"), -0.01, True, "0.01", 1.5):
+        with pytest.raises(ValueError):
+            jq(100.0, q, bad)
+    for bad in (datetime(2026, 11, 13, 21, 20, 3), NOW, None):
+        with pytest.raises(ValueError):
+            sq.judge_quote(100.0, q, symbol="SPY", now=bad)
+    for bad in (0, -1, float("nan"), True, "1800"):
+        with pytest.raises(ValueError):
+            sq.judge_quote(100.0, q, symbol="SPY", now=NOW_DT, max_age_seconds=bad)
+    with pytest.raises(TypeError):
+        sq.judge_quote(100.0, q, "SPY", NOW_DT)
+
+    def boom(*a, **k):
+        raise AssertionError("a clock was read")
+    monkeypatch.setattr(sq.time, "time", boom)
+    monkeypatch.setattr(sq.time, "monotonic", boom)
+    assert jq(100.0, q)["verdict"] == "agree"
+    src = inspect.getsource(sq.judge_quote)
+    assert "time.time" not in src and "monotonic" not in src and ".now(" not in src
+
+
+def _ref_judge(first_c, bid_c, ask_c, band_off, last_c, last_off, fetch_before, tol_t, max_age):
+    """The rules written again in whole numbers: prices in cents, times in seconds, `now` at 0, the fetch `fetch_before`
+    seconds before it. The quote is judged at the later of `now` and the fetch time."""
+    if fetch_before > 120 or fetch_before < -30:
+        return "no second quote", None
+    eff = max(0, -fetch_before)
+    if bid_c is not None and ask_c is not None and bid_c > ask_c:
+        return "no second quote", None
+    band_ok = (bid_c is not None and ask_c is not None and band_off is not None and -5 <= eff - band_off <= 120
+               and 400 * (ask_c - bid_c) <= (ask_c + bid_c))
+    last_ok = last_c is not None and last_off is not None and -300 <= eff - last_off <= max_age
+    if not band_ok and not last_ok:
+        return "no second quote", None
+    T = Fraction(tol_t, 10000)
+    if band_ok:
+        mid = Fraction(bid_c + ask_c, 2)
+        lo, hi = bid_c - T * mid, ask_c + T * mid
+        if last_ok and not lo <= last_c <= hi:
+            return "no second quote", None
+        return ("agree" if lo <= first_c <= hi else "disagree"), float((first_c - mid) / mid)
+    ok = abs(Fraction(first_c) - last_c) <= T * last_c
+    return ("agree" if ok else "disagree"), float(Fraction(first_c - last_c, last_c))
+
+
+def test_five_thousand_generated_cases_of_the_licensed_judgement_agree_with_the_independent_calculation():
+    rng = random.Random(20261114)
+    seen = {"agree": 0, "disagree": 0, "no second quote": 0, "band": 0, "last": 0, "crossed": 0, "exactly 0.5%": 0, "over 0.5%": 0}
+    for i in range(6000):
+        max_age = rng.choice([1800, 1800, 60, 3600, rng.randint(1, 5000)])
+        tol_t = rng.choice([0, 1, 50, 100, 100, 100, 250, 1000, rng.randint(0, 10000)])
+        kind = rng.random()
+        k = rng.randint(1, 5000)
+        if kind < 0.25:
+            bid_c, ask_c = 399 * k, 401 * k                                    # exactly 0.5 % wide
+        elif kind < 0.40:
+            bid_c, ask_c = 399 * k, 401 * k + rng.choice([1, 2, 5])            # just over
+        elif kind < 0.48:
+            bid_c, ask_c = 399 * k + rng.choice([1, 2]), 401 * k              # just under
+        else:
+            bid_c = rng.randint(100, 2_000_000)
+            ask_c = bid_c + rng.choice([0, 1, 5, rng.randint(0, 3000), rng.randint(0, max(1, bid_c // 100))])
+        if rng.random() < 0.08:
+            bid_c, ask_c = ask_c, bid_c                                        # crossed (or equal)
+        if rng.random() < 0.10:
+            bid_c = None
+        elif rng.random() < 0.05:
+            ask_c = None
+        band_off = rng.choice([-120 - 1, -120, -119, 5, 6, 0, -5, -1, rng.randint(-200, 20)]) if rng.random() < 0.9 else None
+        if bid_c is not None and ask_c is not None and bid_c <= ask_c and rng.random() < 0.7:
+            last_c = rng.choice([bid_c, ask_c, (bid_c + ask_c) // 2, bid_c - 1, ask_c + 1, rng.randint(bid_c, ask_c)])
+            last_c = max(last_c, 1)
+        else:
+            last_c = rng.randint(100, 2_000_000) if rng.random() < 0.8 else None
+        last_off = rng.choice([-max_age - 1, -max_age, -max_age + 1, 300, 301, 299, 0, rng.randint(-max_age - 100, 400)]) if rng.random() < 0.9 else None
+        fetch_before = rng.choice([121, 120, 119, 0, -1, -30, -31, rng.randint(-40, 130)])
+        if bid_c is not None and ask_c is not None and bid_c <= ask_c and rng.random() < 0.6:
+            T = Fraction(tol_t, 10000)
+            mid = Fraction(bid_c + ask_c, 2)
+            edge = rng.choice([bid_c - T * mid, ask_c + T * mid, mid])
+            first_c = max(int(edge) + rng.choice([-1, 0, 1]), 1)
+        elif last_c is not None and rng.random() < 0.6:
+            first_c = max(int(last_c * (10000 + rng.choice([-1, 1]) * tol_t) / 10000) + rng.choice([-1, 0, 1]), 1)
+        else:
+            first_c = rng.randint(100, 2_000_000)
+        now_abs = NOW
+        q = {"symbol": "SPY", "bid": None if bid_c is None else bid_c / 100, "ask": None if ask_c is None else ask_c / 100,
+             "band_time": None if band_off is None else now_abs + band_off, "last": None if last_c is None else last_c / 100,
+             "last_time": None if last_off is None else now_abs + last_off, "fetched_at": now_abs - fetch_before, "source": "alpaca-iex"}
+        want, want_diff = _ref_judge(first_c, bid_c, ask_c, band_off, last_c, last_off, fetch_before, tol_t, max_age)
+        got = sq.judge_quote(first_c / 100, q, symbol="SPY", now=NOW_DT, tolerance=tol_t / 10000, max_age_seconds=max_age)
+        assert got["verdict"] == want, (i, first_c, bid_c, ask_c, band_off, last_c, last_off, fetch_before, tol_t, max_age, got)
+        if want_diff is None:
+            assert got["difference"] is None
+        else:
+            assert math.isclose(got["difference"], want_diff, rel_tol=1e-9, abs_tol=1e-12), (i, got, want_diff)
+        seen[want] += 1
+        if want != "no second quote":
+            seen["band" if got["basis"] == "bid/ask band" else "last"] += 1
+        if bid_c is not None and ask_c is not None:
+            if bid_c > ask_c:
+                seen["crossed"] += 1
+            elif 400 * (ask_c - bid_c) == ask_c + bid_c:
+                seen["exactly 0.5%"] += 1
+            elif 400 * (ask_c - bid_c) > ask_c + bid_c:
+                seen["over 0.5%"] += 1
+    assert min(seen.values()) > 100, seen
+
+
+# ---- second_opinion: one answer from several sources
+
+def cboe_bytes(price=752.54, bid=752.5, ask=752.55, ltt_age=60, snapshot_age=30, symbol="SPY"):
+    data = {"symbol": symbol, "current_price": price, "bid": bid, "ask": ask, "last_trade_time": at(ltt_age)}
+    return json.dumps({"timestamp": datetime.fromtimestamp(NOW - snapshot_age, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                       "data": data, "symbol": symbol}).encode()
+
+
+def opinion(first=752.54, fake=None, sources=("alpaca", "finnhub"), **kw):
+    kw.setdefault("credentials", creds)
+    return sq.second_opinion(first, "SPY", now=NOW_DT, sources=sources, fetch=fake, clock=CLOCK, sleep=lambda s: None, **kw)
+
+
+def test_the_consensus_rule_over_every_combination_of_verdicts():
+    names = ("alpaca", "finnhub", "cboe")
+    bodies = {
+        "agree": {"alpaca": alp(bid=752.5, ask=752.55, last=752.54), "finnhub": fin(c=752.54), "cboe": cboe_bytes()},
+        "disagree": {"alpaca": alp(bid=900.0, ask=900.1, last=900.05), "finnhub": fin(c=900.0), "cboe": cboe_bytes(900.05, 900.0, 900.1)},
+        "no second quote": {"alpaca": b"{}", "finnhub": fin(c=0, t=0), "cboe": b"garbage"},
+    }
+    verdicts = ("agree", "disagree", "no second quote")
+    count = 0
+    for size in (1, 2, 3):
+        for chosen in itertools.permutations(names, size):
+            for combo in itertools.product(verdicts, repeat=size):
+                fake = KFake(**{n: bodies[v][n] for n, v in zip(chosen, combo)})
+                out = opinion(fake=fake, sources=chosen)
+                want = "agree" if ("agree" in combo and "disagree" not in combo) else "disagree" if "disagree" in combo else "no second quote"
+                assert out["verdict"] == want, (chosen, combo, out)
+                assert [s["name"] for s in out["sources"]] == list(chosen) and [s["verdict"] for s in out["sources"]] == list(combo)
+                assert len(fake.calls) == size                                      # each source asked once
+                count += 1
+    assert count == 3 * 3 + 6 * 9 + 6 * 27
+
+
+def test_two_thousand_generated_consensus_cases_agree_with_the_rule():
+    rng = random.Random(77)
+    seen = {"agree": 0, "disagree": 0, "no second quote": 0, 2: 0, 3: 0}
+    for i in range(2400):
+        first = round(rng.uniform(10, 900), 2)
+        sources = rng.sample(["alpaca", "finnhub", "cboe"], rng.choice([2, 3]))
+        wants, routes = [], {}
+        for name in sources:
+            v = rng.choice(["agree", "disagree", "none"])
+            far = round(first * rng.choice([0.9, 1.1, 1.5]), 2)
+            px = first if v == "agree" else far
+            if name == "alpaca":
+                routes[name] = alp(bid=round(px - 0.01, 2), ask=round(px + 0.01, 2), last=px) if v != "none" else rng.choice(
+                    [b"{}", b"<html>", alp(band_t=-500, last_t=-5000), alp("QQQ"), alp(bid=0, ask=0, last=0)])
+            elif name == "finnhub":
+                routes[name] = fin(c=px) if v != "none" else rng.choice([fin(c=0, t=0), b"x", fin(t=-5000), fin(c=-1)])
+            else:
+                routes[name] = cboe_bytes(px, round(px - 0.01, 2), round(px + 0.01, 2)) if v != "none" else rng.choice(
+                    [b"nope", cboe_bytes(ltt_age=9000), cboe_bytes(symbol="QQQ"), cboe_bytes(snapshot_age=-900)])
+            wants.append("no second quote" if v == "none" else v)
+        out = opinion(first, KFake(**routes), tuple(sources))
+        want = "agree" if ("agree" in wants and "disagree" not in wants) else "disagree" if "disagree" in wants else "no second quote"
+        assert out["verdict"] == want and [s["verdict"] for s in out["sources"]] == wants, (i, sources, wants, out)
+        seen[want] += 1
+        seen[len(sources)] += 1
+    assert min(seen.values()) > 100, seen
+
+
+def test_second_opinion_returns_one_entry_per_source_with_the_times():
+    fake = KFake(alpaca=alp(bid=752.5, ask=752.55, band_t=-30, last=752.54, last_t=-20), finnhub=fin(c=752.54, t=-10), cboe=cboe_bytes(ltt_age=60))
+    out = opinion(fake=fake, sources=("alpaca", "finnhub", "cboe"))
+    assert set(out) >= {"verdict", "sources", "symbol"} and out["verdict"] == "agree" and out["symbol"] == "SPY"
+    a, f, c = out["sources"]
+    assert (a["name"], f["name"], c["name"]) == ("alpaca", "finnhub", "cboe")
+    assert a["basis"] == "bid/ask band" and a["band_time"] == pytest.approx(NOW - 30 + 0.092799711, abs=1e-6)
+    assert a["last_time"] == pytest.approx(NOW - 20 + 0.092799711, abs=1e-6) and a["fetched_at"] == NOW
+    assert a["bid"] == 752.5 and a["ask"] == 752.55 and a["last"] == 752.54 and a["age"] == pytest.approx(30 - 0.092799711, abs=1e-6)
+    assert f["basis"] == "last price" and f["band_time"] is None and f["last_time"] == NOW - 10 and f["age"] == pytest.approx(10)
+    assert c["basis"] == "bid/ask band" and c["last_time"] == NOW - 60 and c["age"] == pytest.approx(60)
+    for entry in out["sources"]:
+        assert set(entry) >= {"name", "verdict", "basis", "difference", "band_time", "last_time", "fetched_at", "bid", "ask", "last", "age"}
+
+
+def test_the_default_sources_are_alpaca_and_finnhub_and_cboe_is_asked_only_when_named():
+    fake = KFake(alpaca=alp(), finnhub=fin(), cboe=cboe_bytes())
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, fetch=fake, clock=CLOCK, sleep=lambda s: None, credentials=creds)
+    assert [s["name"] for s in out["sources"]] == ["alpaca", "finnhub"] and sorted(fake.hosts()) == ["data.alpaca.markets", "finnhub.io"]
+    fake = KFake(alpaca=alp(), finnhub=fin(), cboe=cboe_bytes())
+    opinion(fake=fake, sources=("cboe",))
+    assert fake.hosts() == ["cdn.cboe.com"]
+
+
+def test_a_source_that_fails_times_out_or_has_no_key_counts_as_no_second_quote_for_that_source():
+    keys = dict(KEYS)
+    del keys["FINNHUB_API_KEY"]
+    fake = KFake(alpaca=alp(), finnhub=fin(), cboe=OSError("down"))
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=fake, clock=CLOCK, sleep=lambda s: None,
+                            credentials=keys.__getitem__)
+    assert [s["verdict"] for s in out["sources"]] == ["agree", "no second quote", "no second quote"] and out["verdict"] == "agree"
+    assert "finnhub.io" not in fake.hosts()
+    out = opinion(fake=KFake(alpaca=TimeoutError("slow"), finnhub=OSError("x")))
+    assert out["verdict"] == "no second quote" and all(s["verdict"] == "no second quote" for s in out["sources"])
+    out = opinion(fake=KFake(alpaca=alp(bid=900.0, ask=900.1, last=900.0), finnhub=OSError("x")))
+    assert out["verdict"] == "disagree"
+
+
+def test_a_source_that_disagrees_outvotes_any_number_that_agree():
+    out = opinion(fake=KFake(alpaca=alp(), finnhub=fin(c=900.0), cboe=cboe_bytes()), sources=("alpaca", "finnhub", "cboe"))
+    assert [s["verdict"] for s in out["sources"]] == ["agree", "disagree", "agree"] and out["verdict"] == "disagree"
+
+
+def test_second_opinion_refuses_a_bad_symbol_source_or_argument_before_any_request():
+    for kw in ({"sources": ("alpaca", "nope")}, {"sources": ("SIP",)}, {"sources": "alpaca"}, {"sources": (5,)}, {"tolerance": -1}, {"max_age_seconds": 0},
+               {"now": NOW}, {"now": datetime(2026, 11, 13, 21, 20, 3)}, {"deadline_seconds": 0}, {"deadline_seconds": float("nan")}):
+        fake = KFake(alpaca=alp(), finnhub=fin())
+        args = {"first_price": 752.54, "symbol": "SPY", "now": NOW_DT, "fetch": fake, "clock": CLOCK, "credentials": creds, "sleep": lambda s: None}
+        args.update(kw)
+        with pytest.raises(ValueError):
+            sq.second_opinion(args.pop("first_price"), args.pop("symbol"), **args)
+        assert fake.calls == [], kw
+    for bad in ("spy", "SPY,QQQ", "", None):
+        fake = KFake(alpaca=alp())
+        with pytest.raises(ValueError):
+            sq.second_opinion(752.54, bad, now=NOW_DT, fetch=fake, clock=CLOCK, credentials=creds)
+        assert fake.calls == []
+
+
+def test_second_opinion_with_no_sources_and_with_repeated_sources():
+    out = opinion(fake=KFake(), sources=())
+    assert out["verdict"] == "no second quote" and out["sources"] == []
+    fake = KFake(alpaca=alp(), finnhub=fin())
+    out = opinion(fake=fake, sources=("alpaca", "alpaca", "finnhub"))
+    assert [s["name"] for s in out["sources"]] == ["alpaca", "finnhub"] and len(fake.calls) == 2
+
+
+def test_second_opinion_judges_each_quote_at_the_later_of_now_and_its_fetch():
+    # `now` was taken before the requests: a quote that arrives 20 s later and was made 3 s after `now` is still current
+    ticking = FakeClock(NOW)
+    ticks = []
+
+    def fetch(url, timeout, headers=None):
+        ticking.t += 10.0
+        ticks.append(ticking.t)
+        return alp(bid=752.5, ask=752.55, band_t=ticking.t - NOW - 2, last=752.54, last_t=ticking.t - NOW - 2) if "alpaca" in url else fin(c=752.54, t=ticking.t - NOW - 1)
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, fetch=fetch, clock=ticking, sleep=lambda s: None, credentials=creds)
+    assert out["verdict"] == "agree" and [s["verdict"] for s in out["sources"]] == ["agree", "agree"]
+
+
+def test_one_overall_deadline_of_25_seconds_on_the_injected_clock():
+    fc = FakeClock(NOW)
+    timeouts = []
+
+    def slow(per_call):
+        def fetch(url, timeout, headers=None):
+            timeouts.append(timeout)
+            fc.t += per_call
+            if "alpaca" in url:
+                return alp()
+            return fin() if "finnhub" in url else cboe_bytes()
+        return fetch
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=slow(9.0), clock=fc, sleep=lambda s: fc.__setattr__("t", fc.t + s),
+                            credentials=creds)
+    # 9 s, 9 s, then the third starts at 18 s with 7 s left: its answer arrives at 27 s, past the deadline, and is refused
+    assert [s["verdict"] for s in out["sources"]] == ["agree", "agree", "no second quote"] and out["verdict"] == "agree"
+    assert timeouts == [5.0, 5.0, 5.0] and fc.t == NOW + 27.0
+    fc.t, timeouts[:] = NOW, []
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=slow(30.0), clock=fc, sleep=lambda s: fc.__setattr__("t", fc.t + s),
+                            credentials=creds)
+    assert len(timeouts) == 1 and out["verdict"] == "no second quote"                   # the first took 30 s: nothing else is started
+    fc.t, timeouts[:] = NOW, []
+
+    def stall(url, timeout, headers=None):
+        timeouts.append(timeout)
+        fc.t += timeout
+        raise TimeoutError("stalled")
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=stall, clock=fc,
+                            sleep=lambda s: fc.__setattr__("t", fc.t + s), credentials=creds)
+    assert fc.t - NOW <= 25.0 + 1e-9 and all(t <= 5.0 for t in timeouts) and out["verdict"] == "no second quote"
+    assert min(timeouts) > 0
+
+
+def test_second_opinion_never_raises_on_hostile_answers():
+    finnhub_names = sorted(FINNHUB_HOSTILE)
+    for k, name in enumerate(sorted(ALPACA_HOSTILE)):
+        out = opinion(fake=KFake(alpaca=ALPACA_HOSTILE[name], finnhub=FINNHUB_HOSTILE[finnhub_names[k % len(finnhub_names)]]))
+        assert out["verdict"] == "no second quote" and all(s["verdict"] == "no second quote" for s in out["sources"])
+    for first in (None, float("nan"), -1, 0, True, "x", [], 1e9):
+        out = opinion(first, KFake(alpaca=alp(), finnhub=fin()))
+        assert out["verdict"] == "disagree" and all(s["verdict"] == "disagree" and s["difference"] is None for s in out["sources"])
+
+
+def test_the_defaults_of_the_new_readers_are_the_keyed_fetch_and_the_wall_clock():
+    import inspect
+    for reader in (sq.alpaca_quote, sq.finnhub_quote):
+        params = inspect.signature(reader).parameters
+        assert params["fetch"].default is sq.keyed_fetch and params["credentials"].default is None
+        assert all(params[n].kind is inspect.Parameter.KEYWORD_ONLY for n in ("fetch", "clock", "credentials"))
+    assert inspect.signature(sq.second_opinion).parameters["sources"].default == ("alpaca", "finnhub")
+
+
+def test_second_opinion_hands_its_own_fetches_what_is_left_of_the_overall_deadline(monkeypatch):
+    fc = FakeClock(NOW)
+    seen = []
+
+    def record(kind, body):
+        def fetch(url, timeout, *args, deadline=None, **kw):
+            seen.append((kind, timeout, deadline, args))
+            fc.t += 10.0
+            return body
+        return fetch
+    monkeypatch.setattr(sq, "keyed_fetch", record("keyed", alp()))
+    monkeypatch.setattr(sq, "urllib_fetch", record("cboe", cboe_bytes()))
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), clock=fc, sleep=lambda s: None, credentials=creds)
+    assert [k for k, *_ in seen] == ["keyed", "keyed", "cboe"]
+    assert [round(d, 6) for _, _, d, _ in seen] == [10.0, 10.0, 5.0]               # 25, 15 and 5 s left: a try is at most 10
+    assert [a for *_, a in seen] == [(A_HEAD,), (F_HEAD,), ()] and [t for _, t, _, _ in seen] == [5.0, 5.0, 5.0]
+    assert out["sources"][0]["name"] == "alpaca"
+
+
+def test_no_key_appears_anywhere_but_the_two_header_values_sent_to_the_right_host(capsys, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    outputs = []
+
+    def hostile_echo(url, timeout, headers=None):
+        raise RuntimeError("failed with headers %r for %s" % (headers, url))
+
+    def echo_body(url, timeout, headers=None):
+        return json.dumps({"SPY": {"latestQuote": {"ap": AID, "bp": ASEC}, "latestTrade": {"p": FTOK, "t": ASEC}}, "c": FTOK, "t": AID}).encode()
+    scenarios = [KFake(alpaca=alp(), finnhub=fin(), cboe=cboe_bytes()), KFake(alpaca=hostile_echo, finnhub=hostile_echo, cboe=hostile_echo),
+                 KFake(alpaca=echo_body, finnhub=echo_body, cboe=echo_body), KFake(alpaca=urllib.error.HTTPError("https://data.alpaca.markets/x", 403, "Forbidden", None, None),
+                                                                                  finnhub=urllib.error.HTTPError("https://finnhub.io/x", 429, "Slow down", None, None), cboe=None)]
+    recorded = []
+    for fake in scenarios:
+        out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=fake, clock=CLOCK, sleep=lambda s: None, credentials=creds)
+        outputs += [repr(out), json.dumps(out, default=str)]
+        outputs += [repr(sq.alpaca_quote("SPY", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None)), repr(sq.finnhub_quote("SPY", fetch=fake, clock=CLOCK, credentials=creds, sleep=lambda s: None))]
+        recorded += fake.calls
+        buf = Out()
+        sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.54, FIRST_T)}), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=buf, credentials=creds)
+        outputs += buf.lines
+    captured = capsys.readouterr()
+    outputs += [captured.out, captured.err, caplog.text]
+    for text in outputs:
+        for key in FAKE_KEYS:
+            assert key not in text, text[:200]
+    right = {"data.alpaca.markets": {AID, ASEC}, "finnhub.io": {FTOK}}
+    for url, timeout, headers in recorded:
+        host = urllib.parse.urlsplit(url).hostname
+        for key in FAKE_KEYS:
+            assert key not in url
+        sent = set((headers or {}).values())
+        assert sent <= right.get(host, set()), (host, sent)
+        if host == "cdn.cboe.com":
+            assert headers is None
+
+
+def test_exception_texts_from_the_keyed_fetch_hold_no_key():
+    texts = []
+    for url, head, route in ((AL, A_HEAD, (403, None, io.BytesIO(AID.encode()))), (FH, F_HEAD, (429, None, io.BytesIO(FTOK.encode()))),
+                             (AL, A_HEAD, (307, "https://evil.example/", io.BytesIO(b""))), (AL, F_HEAD, None)):
+        handler = Recorder({url: route} if route else {})
+        try:
+            sq.keyed_fetch(url, 5.0, head, opener=sq._build_opener(handler))
+        except Exception as e:
+            texts += [str(e), repr(e)]
+    assert texts and not any(k in t for t in texts for k in FAKE_KEYS)
+
+
 # ---- the probe
 
 class Out:
@@ -1221,64 +2242,92 @@ def first_source(mapping, calls=None):
 FIRST_T = datetime(2026, 11, 13, 20, 59, tzinfo=timezone.utc).timestamp()
 
 
+def no_keys(name):
+    raise KeyError(name)
+
+
+def block(lines, sym):
+    """The lines of one symbol's block: its first line (which starts with the symbol) and the indented lines under it."""
+    out, inside = [], False
+    for line in lines:
+        if line.startswith(sym + "  "):
+            inside = True
+            out = [line]
+        elif inside and line.startswith("  "):
+            out.append(line)
+        elif inside:
+            break
+    return out
+
+
+def source_line(lines, sym, name):
+    found = [l for l in block(lines, sym) if l.split() and l.split()[0] == name]
+    assert len(found) == 1, (sym, name, lines)
+    return found[0]
+
+
+def cboe_probe(symbols, first, fetch, out, **kw):
+    kw.setdefault("clock", PCLOCK)
+    return sq.probe(symbols, first_quotes=first, fetch=fetch, sleep=lambda s: None, out=out, credentials=no_keys, sources=("cboe",), **kw)
+
+
 def test_the_probe_prints_both_prices_both_times_the_difference_and_the_verdict():
     calls, out = [], Out()
     fake = Fake(REAL_SPY)
-    code = sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}, calls), fetch=fake, clock=PCLOCK,
-                    sleep=lambda s: None, out=out)
+    code = cboe_probe(["SPY"], first_source({"SPY": (752.6, FIRST_T)}, calls), fake, out)
     text = "\n".join(out.lines)
     assert code == 0 and calls == [["SPY"]] and len(fake.calls) == 1
     for part in ("SPY", "752.6", "752.54", "752.5", "752.55", "2026-11-13T20:59:00Z", "2026-11-13T16:00:00", "+0.01%", "agree"):
         assert part in text, (part, text)
+    line = source_line(out.lines, "SPY", "cboe")
+    assert "age 1740 s" in line and "+0.01%" in line and "agree [bid/ask band]" in line
 
 
 def test_the_probe_reports_a_disagreement_and_a_missing_second_quote():
     out = Out()
-    sq.probe(["SPY", "XLE"], first_quotes=first_source({"SPY": (800.0, FIRST_T), "XLE": (64.8, FIRST_T)}),
-             fetch=Fake(REAL_SPY, b"garbage"), clock=PCLOCK, sleep=lambda s: None, out=out)
-    spy = [l for l in out.lines if l.startswith("SPY")]
-    assert len(spy) == 1 and "disagree" in spy[0] and "+6.3" in spy[0]
-    xle = [l for l in out.lines if l.startswith("XLE")]
-    assert len(xle) == 1 and "no second quote" in xle[0]
+    cboe_probe(["SPY", "XLE"], first_source({"SPY": (800.0, FIRST_T), "XLE": (64.8, FIRST_T)}), Fake(REAL_SPY, b"garbage"), out)
+    spy = source_line(out.lines, "SPY", "cboe")
+    assert "disagree" in spy and "+6.3" in spy
+    assert "no second quote" in source_line(out.lines, "XLE", "cboe")
 
 
 def test_the_probe_survives_the_first_source_failing_or_missing_a_symbol():
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source(RuntimeError("down")), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
-    line = [l for l in out.lines if l.startswith("SPY")][0]
-    assert "first source failed" in line and "752.54" in line and "agree" not in line.replace("disagree", "")
+    cboe_probe(["SPY"], first_source(RuntimeError("down")), Fake(REAL_SPY), out)
+    assert "first source failed" in block(out.lines, "SPY")[0]
+    line = source_line(out.lines, "SPY", "cboe")
+    assert "752.54" in line and "agree" not in line.replace("disagree", "")
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({}), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
-    assert "no first quote" in [l for l in out.lines if l.startswith("SPY")][0]
+    cboe_probe(["SPY"], first_source({}), Fake(REAL_SPY), out)
+    assert "no first quote" in block(out.lines, "SPY")[0]
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({"SPY": (float("nan"), FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
-             sleep=lambda s: None, out=out)
-    assert "no first quote" in [l for l in out.lines if l.startswith("SPY")][0]
+    cboe_probe(["SPY"], first_source({"SPY": (float("nan"), FIRST_T)}), Fake(REAL_SPY), out)
+    assert "no first quote" in block(out.lines, "SPY")[0]
 
 
 def test_the_probe_takes_at_most_ten_symbols_and_refuses_before_any_request():
     syms = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    sq.probe(syms, first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out)
+    cboe_probe(syms, first_source({}, calls), fake, out)
     assert calls == [syms] and len(fake.calls) == 10                      # ten is fine, one request each
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    assert sq.probe(syms + ["K"], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
+    assert cboe_probe(syms + ["K"], first_source({}, calls), fake, out) == 2
     assert calls == [] and fake.calls == [] and any("at most 10" in l for l in out.lines)
 
 
 def test_the_probe_refuses_a_bad_symbol_before_any_request():
     for bad in ("spy", "SPY?x=1", "TOOLONGX", "", "SPY/../x"):
         calls, fake, out = [], Fake(REAL_SPY), Out()
-        assert sq.probe(["SPY", bad], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
+        assert cboe_probe(["SPY", bad], first_source({}, calls), fake, out) == 2
         assert calls == [] and fake.calls == []
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    assert sq.probe([], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out) == 2
+    assert cboe_probe([], first_source({}, calls), fake, out) == 2
     assert calls == [] and fake.calls == []
 
 
 def test_a_repeated_symbol_is_fetched_once():
     calls, fake, out = [], Fake(REAL_SPY), Out()
-    sq.probe(["SPY", "SPY"], first_quotes=first_source({}, calls), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=out)
+    cboe_probe(["SPY", "SPY"], first_source({}, calls), fake, out)
     assert calls == [["SPY"]] and len(fake.calls) == 1
 
 
@@ -1287,16 +2336,16 @@ def test_the_default_first_source_is_the_order_steps_own_function_by_import(monk
     seen = []
     monkeypatch.setattr(order_step, "minute_quotes", lambda symbols: seen.append(list(symbols)) or {"SPY": (752.6, FIRST_T)})
     out = Out()
-    sq.probe(["SPY"], fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
+    sq.probe(["SPY"], fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out, credentials=no_keys, sources=("cboe",))
     assert seen == [["SPY"]] and "752.6" in "\n".join(out.lines)
 
 
 def test_main_runs_the_probe_subcommand_and_refuses_bad_arguments():
     out = Out()
-    assert sq.main(["probe", "SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
-                   sleep=lambda s: None, out=out) == 0
+    kw = dict(credentials=no_keys, sources=("cboe",), clock=PCLOCK, sleep=lambda s: None)
+    assert sq.main(["probe", "SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), out=out, **kw) == 0
     fake = Fake(REAL_SPY)
-    assert sq.main(["probe", "spy"], first_quotes=first_source({}), fetch=fake, clock=PCLOCK, sleep=lambda s: None, out=Out()) == 2
+    assert sq.main(["probe", "spy"], first_quotes=first_source({}), fetch=fake, out=Out(), **kw) == 2
     assert fake.calls == []
     with pytest.raises(SystemExit) as e:
         sq.main([], fetch=fake, out=Out())
@@ -1311,13 +2360,12 @@ def test_main_runs_the_probe_subcommand_and_refuses_bad_arguments():
 def test_the_probe_prints_zero_as_0_00_percent_never_minus_zero():
     for first in (752.525, 752.524, 752.526):
         out = Out()
-        sq.probe(["SPY"], first_quotes=first_source({"SPY": (first, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK,
-                 sleep=lambda s: None, out=out)
-        line = [l for l in out.lines if l.startswith("SPY")][0]
+        cboe_probe(["SPY"], first_source({"SPY": (first, FIRST_T)}), Fake(REAL_SPY), out)
+        line = source_line(out.lines, "SPY", "cboe")
         assert "| 0.00% |" in line and "-0.00%" not in line and "+0.00%" not in line, line
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.4, FIRST_T)}), fetch=Fake(REAL_SPY), clock=PCLOCK, sleep=lambda s: None, out=out)
-    assert "| -0.02% |" in [l for l in out.lines if l.startswith("SPY")][0]
+    cboe_probe(["SPY"], first_source({"SPY": (752.4, FIRST_T)}), Fake(REAL_SPY), out)
+    assert "| -0.02% |" in source_line(out.lines, "SPY", "cboe")
 
 
 def test_the_probe_gives_compare_the_symbol_and_the_callers_clock(monkeypatch):
@@ -1328,15 +2376,118 @@ def test_the_probe_gives_compare_the_symbol_and_the_callers_clock(monkeypatch):
         seen.append(kw)
         return real(first, second, **kw)
     monkeypatch.setattr(sq, "compare", spy)
-    sq.probe(["SPY", "XLE"], first_quotes=first_source({"SPY": (752.6, FIRST_T), "XLE": (64.8, FIRST_T)}),
-             fetch=Fake(REAL_SPY, REAL_XLE), clock=PCLOCK, sleep=lambda s: None, out=Out())
+    cboe_probe(["SPY", "XLE"], first_source({"SPY": (752.6, FIRST_T), "XLE": (64.8, FIRST_T)}), Fake(REAL_SPY, REAL_XLE), Out())
     assert [k["symbol"] for k in seen] == ["SPY", "XLE"]
     assert all(k["now"] == datetime.fromtimestamp(PNOW, timezone.utc) and k["now"].tzinfo is not None for k in seen)
 
 
 def test_the_probe_judges_age_by_its_clock():
     out = Out()
-    sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.6, FIRST_T)}), fetch=Fake(REAL_SPY), clock=lambda: PNOW + 3600,
-             sleep=lambda s: None, out=out)
-    line = [l for l in out.lines if l.startswith("SPY")][0]
+    cboe_probe(["SPY"], first_source({"SPY": (752.6, FIRST_T)}), Fake(REAL_SPY), out, clock=lambda: PNOW + 3600)
+    line = source_line(out.lines, "SPY", "cboe")
     assert "no second quote" in line and "agree" not in line
+
+
+# ---- T28b: the probe over every source
+
+def all_probe(symbols=("SPY",), fake=None, first=752.54, out=None, **kw):
+    out = out if out is not None else Out()
+    kw.setdefault("credentials", creds)
+    kw.setdefault("clock", CLOCK)
+    fake = fake or KFake(alpaca=alp(), finnhub=fin(c=752.60), cboe=cboe_bytes())
+    code = sq.probe(list(symbols), first_quotes=first_source({s: (first, FIRST_T) for s in symbols}), fetch=fake, sleep=lambda s: None, out=out, **kw)
+    return code, out, fake
+
+
+def test_the_probe_prints_the_first_price_then_one_line_per_source_then_the_consensus():
+    code, out, fake = all_probe()
+    assert code == 0
+    lines = block(out.lines, "SPY")
+    assert [l.split()[0] for l in lines[1:]] == ["alpaca", "finnhub", "cboe", "consensus"]
+    assert "752.54" in lines[0] and "2026-11-13T20:59:00Z" in lines[0]
+    alpaca, finnhub, cboe, consensus = lines[1:]
+    assert "bid 752.5" in alpaca and "ask 752.55" in alpaca and "last 752.54" in alpaca and "age 30 s" in alpaca and "agree [bid/ask band]" in alpaca
+    assert zt(-30)[:19] in alpaca and zt(-20)[:19] in alpaca
+    assert "last 752.6" in finnhub and "age 20 s" in finnhub and "-0.01%" in finnhub and "agree [last price]" in finnhub and zt(-20)[:19] in finnhub
+    assert "752.54" in cboe and "age 60 s" in cboe and "agree" in cboe and "2026-11-13T" in cboe
+    assert consensus.split() == ["consensus", "agree"]
+    assert sorted(fake.hosts()) == ["cdn.cboe.com", "data.alpaca.markets", "finnhub.io"]      # each source asked once
+
+
+def test_the_probe_consensus_line_follows_the_rule():
+    code, out, _ = all_probe(fake=KFake(alpaca=alp(), finnhub=fin(c=900.0), cboe=cboe_bytes()))
+    assert block(out.lines, "SPY")[-1].split() == ["consensus", "disagree"] and "disagree" in source_line(out.lines, "SPY", "finnhub")
+    code, out, _ = all_probe(fake=KFake(alpaca=b"{}", finnhub=OSError("x"), cboe=b"nope"))
+    assert block(out.lines, "SPY")[-1].split() == ["consensus", "no", "second", "quote"]
+    assert all("none" in source_line(out.lines, "SPY", n) for n in ("alpaca", "finnhub", "cboe"))
+
+
+def test_the_probe_asks_each_source_once_per_symbol_and_at_most_ten_symbols():
+    syms = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    code, out, fake = all_probe(syms)
+    assert code == 0 and len(fake.calls) == 30 and sorted(fake.hosts()) == sorted(["cdn.cboe.com", "data.alpaca.markets", "finnhub.io"] * 10)
+    code, out, fake = all_probe(syms + ["K"])
+    assert code == 2 and fake.calls == []
+    code, out, fake = all_probe(["SPY", "spy"])
+    assert code == 2 and fake.calls == []
+
+
+def test_the_probe_loads_the_secrets_file_once_through_load_env_and_reads_the_keys_by_name(monkeypatch):
+    from valedia_trader.core import secrets
+    loaded = []
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: loaded.append((a, k)) or [])
+    for name, value in KEYS.items():
+        monkeypatch.setenv(name, value)
+    out = Out()
+    fake = KFake(alpaca=alp(), finnhub=fin(), cboe=cboe_bytes())
+    code = sq.probe(["SPY", "XLE"], first_quotes=first_source({"SPY": (752.54, FIRST_T), "XLE": (752.54, FIRST_T)}), fetch=fake, clock=CLOCK,
+                    sleep=lambda s: None, out=out)
+    assert code == 0 and loaded == [((), {})]
+    assert [c[2] for c in fake.calls if c[2]][:2] == [A_HEAD, F_HEAD]
+
+
+def test_the_probe_does_not_touch_the_secrets_file_when_credentials_are_given_or_when_refusing(monkeypatch):
+    from valedia_trader.core import secrets
+    loaded = []
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: loaded.append(1) or [])
+    all_probe()
+    all_probe(["spy"])
+    sq.probe([], out=Out())
+    assert loaded == []
+
+
+def test_a_secrets_file_that_cannot_be_loaded_is_a_note_with_the_error_class_only_and_the_sources_have_no_key(monkeypatch):
+    from valedia_trader.core import secrets
+
+    def broken(*a, **k):
+        raise secrets.SecretError("/home/someone/.hermes/secrets/trading.env is readable by group or others " + AID)
+    monkeypatch.setattr(secrets, "load_env", broken)
+    for name in KEYS:
+        monkeypatch.delenv(name, raising=False)
+    out = Out()
+    fake = KFake(alpaca=alp(), finnhub=fin(), cboe=cboe_bytes())
+    code = sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.54, FIRST_T)}), fetch=fake, clock=CLOCK, sleep=lambda s: None, out=out)
+    text = "\n".join(out.lines)
+    assert code == 0 and "SecretError" in text and AID not in text and "/home/someone" not in text
+    assert fake.hosts() == ["cdn.cboe.com"]                                   # no keys: only the keyless source was asked
+
+
+def test_every_probe_line_passes_the_output_guard_and_control_characters_are_dropped(monkeypatch):
+    from valedia_trader.core import secrets
+    seen = []
+    real = secrets.redact
+    monkeypatch.setattr(secrets, "redact", lambda text: seen.append(text) or real(text))
+    code, out, _ = all_probe()
+    assert out.lines and sorted(seen) == sorted(out.lines)
+    for line in out.lines:
+        assert all(ch.isprintable() for ch in line)
+
+
+def test_a_remembered_key_is_masked_even_if_it_were_to_reach_a_line(monkeypatch):
+    from valedia_trader.core import secrets
+    secrets.remember(ASEC)
+    out = Out()
+    shown = sq._shown("price " + ASEC + " seen")
+    assert ASEC not in shown and "<secret>" in shown
+    code, out, _ = all_probe()
+    assert all(ASEC not in l for l in out.lines)
