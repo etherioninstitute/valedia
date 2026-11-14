@@ -47,19 +47,23 @@ def _book(journal, plan, start="2026-06-01", capital=CAPITAL, days=None):
     last = _last_summary(journal)
     if last is None:
         journal.write(pd.Timestamp(days[0]) - pd.offsets.BDay(1),
-                      {"type": "summary", "equity": START_EQUITY, "strategy_value_change": {}, "capital_per_strategy": capital})
-        equity = START_EQUITY
+                      {"type": "summary", "equity": START_EQUITY, "strategy_values": {}, "strategy_value_change": {},
+                       "capital_per_strategy": capital})
+        equity, values = START_EQUITY, {}
     else:
-        equity = float(last["equity"])
+        equity, values = float(last["equity"]), dict(last.get("strategy_values", {}))
     for k, d in enumerate(days):
         change = {}
         for hid, (name, changes, off) in plan.items():
             if off <= k < off + len(changes):
                 journal.write(d, {"type": "decision", "hypothesis_id": hid, "strategy": name, "version": "1.0.0",
                                   "decision": "no trade", "reasoning": "positions already match the strategy's targets"})
-                change[name] = changes[k - off]
+                before = values.get(name, 0.0)
+                values[name] = before + changes[k - off]
+                change[name] = values[name] - before                   # as the paper trader: value now less value before
         equity += sum(change.values())
-        journal.write(d, {"type": "summary", "equity": equity, "strategy_value_change": change, "capital_per_strategy": capital})
+        journal.write(d, {"type": "summary", "equity": equity, "strategy_values": dict(values), "strategy_value_change": change,
+                          "capital_per_strategy": capital})
     return [pd.Timestamp(d) for d in days]
 
 
@@ -299,18 +303,21 @@ def test_the_decay_entry_itself_is_not_mistaken_for_a_paper_day(desk):
 
 
 # ---------------------------------------------------------------- what cannot be judged
-def test_a_damaged_journal_line_in_the_stretch_means_cannot_judge_named_by_file_and_line(desk):
+def test_a_damaged_journal_line_in_the_stretch_is_bridged_and_named_by_file_and_line(desk):
+    # rev 4 (the design forces it): the day whose last line is damaged is bridged, the strategy is judged across it
     ledger, journal, root = desk
     hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05})
-    days = _returns_record(journal, hid, "mom", [0.0, -0.3, 0.01, 0.01])        # deep enough to pause, if it could be judged
+    days = _returns_record(journal, hid, "mom", [0.0, -0.3, 0.01, 0.01])        # deep enough to pause
     path = journal.dir / f"{days[1].date()}.jsonl"
     with path.open("ab") as fh:
         fh.write(b'{"type": "summary", "strategy_value_change": {"mom": SECRET-TEXT')
     out = dc.check(_lp(root), journal, apply=True)
     row = _row(out, hid)
-    assert row["decision"] == "cannot judge" and f"{days[1].date()}.jsonl line 3" in row["reason"]
+    assert row["decision"] == "paused" and row["days"] == 3 and row["days_bridged"] == 1
+    assert row["summaries_skipped"] == {"damaged line after it": 1}
+    assert out["unreadable_lines"] == [{"file": f"{days[1].date()}.jsonl", "line": 3}]
     assert "SECRET-TEXT" not in json.dumps(out) and "SECRET-TEXT" not in json.dumps(_decay_entries(journal))
-    assert ledger.get(hid)["status"] == "passed backtest only" and ledger.findings(hid) == [] and out["exit_code"] == 0
+    assert ledger.get(hid)["status"] == "paused" and out["exit_code"] == 1
 
 
 def test_damage_before_a_strategys_first_paper_day_does_not_stop_it_being_judged(desk):
@@ -330,9 +337,9 @@ def test_a_strategy_with_no_backtest_figures_cannot_be_judged(desk):
     out = dc.check(_lp(root), journal, apply=True)
     for hid in (none, empty):
         row = _row(out, hid)
-        assert row["decision"] == "cannot judge" and "backtest" in row["reason"]
+        assert row["decision"] == "cannot judge" and "backtest" in row["reason"] and not row["fault"]
         assert ledger.get(hid)["status"] == "passed backtest only" and ledger.findings(hid) == []
-    assert out["exit_code"] == 0
+    assert out["exit_code"] == 2                    # rev 4 (the design forces it): nothing at all was judged
 
 
 def test_fewer_than_two_paper_days_cannot_be_judged(desk):
@@ -593,18 +600,22 @@ def _run_trader(root, px, plan):
 def _append_day(journal, day, hid_names, changes, equity_change=None, **extra):
     """One more paper day by hand: a decision line per strategy and the summary; the equity moves by `equity_change`
     (by default the sum of the changes, so the book adds up)."""
-    eq = float(_last_summary(journal)["equity"])
+    last = _last_summary(journal)
+    eq, values = float(last["equity"]), dict(last.get("strategy_values", {}))
     for hid, name in hid_names.items():
         journal.write(day, {"type": "decision", "hypothesis_id": hid, "strategy": name, "decision": "no trade"})
+    for name, c in changes.items():
+        values[name] = values.get(name, 0.0) + c
     move = sum(changes.values()) if equity_change is None else equity_change
-    journal.write(day, {"type": "summary", "equity": eq + move, "strategy_value_change": changes, "capital_per_strategy": CAPITAL,
-                        **extra})
+    journal.write(day, {"type": "summary", "equity": eq + move, "strategy_values": values, "strategy_value_change": changes,
+                        "capital_per_strategy": CAPITAL, **extra})
 
 
 def test_a_missing_close_in_a_real_paper_history_is_never_judged(tmp_path, capsys):
     """The history as the paper book wrote it before the repair (6ae5ca3): on the day UP had no close the held position
     was left out of the equity (-110,000) while the strategy lost only its open gain (-25,000); the next day both came back.
-    That day does not add up, so the strategy, which rose 1% every other day, is never judged on it."""
+    That day does not add up, so it is never used: rev 4 (the design forces it) bridges it, and the strategy, which rose
+    1% a day, is judged from the next day's values, which add up against the day before the gap."""
     paths = _paths(tmp_path)
     ledger = lg.HypothesisLedger(paths.ledger)
     hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05})
@@ -617,8 +628,12 @@ def test_a_missing_close_in_a_real_paper_history_is_never_judged(tmp_path, capsy
     _append_day(journal, after, {hid: "riser"}, {"riser": 26_000.0}, equity_change=111_000.0)
     assert dc.main(["check", "--apply"], paths=paths) == 0
     out = capsys.readouterr().out
-    assert _decision(out, hid) == "CANNOT JUDGE" and f"the book could not be valued on {gap.date()}" in out
+    line = next(ln for ln in out.splitlines() if ln.startswith(f"h{hid} "))
+    assert _decision(out, hid) == "KEEP" and "21 paper days" in line and "days bridged: 1" in line
+    assert "summaries skipped: 1 (does not add up: 1)" in line
     assert _status(paths, hid) == ("passed backtest only", [])
+    row = _row(dc.check(paths.ledger, journal), hid)
+    assert row["live_max_drawdown"] == 0.0 and row["live_sharpe"] == pytest.approx(my_sharpe([0.01] * 20 + [0.01]), rel=1e-12)
 
 
 def test_a_real_history_with_a_missing_close_is_judged_like_the_same_history_gap_filled(tmp_path, capsys):
@@ -738,7 +753,8 @@ def test_the_sharpe_compared_against_is_the_lower_of_development_and_sealed(tmp_
 @pytest.mark.parametrize("bad", ["0.1", True, -0.1, float("nan"), [0.1]])
 def test_a_backtest_worst_fall_that_is_not_a_real_number_cannot_be_judged(tmp_path, capsys, bad):
     code, decision, _, paths, hid = _one(tmp_path, {"sharpe": 1.0, "max_drawdown": bad}, None, [0.0, -0.5, 0.001], capsys)
-    assert (code, decision) == (0, "CANNOT JUDGE") and _status(paths, hid) == ("passed backtest only", [])
+    # rev 4 (the design forces it): a stored figure that is not a real number is a malformed result, a fault: exit 2
+    assert (code, decision) == (2, "CANNOT JUDGE") and _status(paths, hid) == ("passed backtest only", [])
 
 
 @pytest.mark.parametrize("bad", ["2.0", True, float("inf")])
@@ -746,7 +762,7 @@ def test_a_backtest_sharpe_that_is_not_a_real_number_cannot_be_judged(tmp_path, 
     rng = np.random.default_rng(12)
     returns = (-0.002 + 0.01 * rng.standard_normal(70)).tolist()
     code, decision, _, paths, hid = _one(tmp_path, {"sharpe": bad, "max_drawdown": 0.9}, None, returns, capsys)
-    assert (code, decision) == (0, "CANNOT JUDGE") and _status(paths, hid) == ("passed backtest only", [])
+    assert (code, decision) == (2, "CANNOT JUDGE") and _status(paths, hid) == ("passed backtest only", [])   # rev 4: a fault
 
 
 def test_a_backtest_sharpe_not_above_zero_never_pauses_on_sharpe(tmp_path, capsys):
@@ -783,7 +799,7 @@ def test_one_malformed_idea_or_decision_line_does_not_stop_the_check(tmp_path, c
         journal.write(last, {"type": "decision", "hypothesis_id": bad, "strategy": "JOURNAL-NAME", "decision": "no trade"})
     code = dc.main(["check", "--apply"], paths=paths)
     captured = capsys.readouterr()
-    assert code == 1 and _status(paths, fine)[0] == "paused"
+    assert code == 2 and _status(paths, fine)[0] == "paused"       # rev 4 (forced): two malformed ideas are faults; the pause is still written
     assert _decision(captured.out, broken) == "CANNOT JUDGE" and _decision(captured.out, listed) == "CANNOT JUDGE"
     assert _status(paths, broken)[0] == _status(paths, listed)[0] == "passed backtest only"
     assert f"decision lines skipped (idea number not a whole number): 4 ({last.date()}.jsonl)" in captured.out
@@ -851,11 +867,15 @@ def test_a_torn_line_in_the_as_of_file_stops_the_check_naming_file_and_line(tmp_
     with (paths.journal / f"{as_of}.jsonl").open("ab") as fh:
         fh.write(b'{"type": "decay_check", "as_of": "JOURNAL-TEXT')
     lines = (paths.journal / f"{as_of}.jsonl").read_bytes()
-    for argv in (["check"], ["check", "--apply"]):
-        assert dc.main(argv, paths=paths) == 2
-        err = capsys.readouterr().err
-        assert f"{as_of}.jsonl line 3" in err and "JOURNAL-TEXT" not in err
+    assert dc.main(["check"], paths=paths) == 2
+    err = capsys.readouterr().err
+    assert f"{as_of}.jsonl line 3" in err and "JOURNAL-TEXT" not in err
     assert (paths.journal / f"{as_of}.jsonl").read_bytes() == lines and _status(paths, hid) == ("passed backtest only", [])
+    # rev 4 (the design forces it): a fault never hides a pause; the fall to the day before is enough to pause
+    assert dc.main(["check", "--apply"], paths=paths) == 2
+    captured = capsys.readouterr()
+    assert f"{as_of}.jsonl line 3" in captured.err and "JOURNAL-TEXT" not in captured.err + captured.out
+    assert f"paused: h{hid}" in captured.out and _status(paths, hid)[0] == "paused"
 
 
 def test_trading_days_with_no_journal_file_are_counted_and_printed(tmp_path, capsys):
@@ -883,3 +903,555 @@ def test_a_strategy_paused_with_no_reason_row_is_reported_as_such(tmp_path, caps
     assert dc.main(["check", "--apply"], paths=paths) == 0
     out = capsys.readouterr().out
     assert _decision(out, silent) == "PAUSED, REASON NOT RECORDED" and _decision(out, said) == "LEFT ALONE"
+
+
+# ================================================================ rev 4: no single event may blind the monitor for good
+def my_value_returns(summaries, name):
+    """My own calculation from the values: from one summary to the next that holds the strategy, its value now less its
+    value then, over the earlier summary's capital per strategy; its first summary, from nothing, over its own capital.
+    In the journal's first summary a strategy worth something has a history the journal does not hold: it starts there."""
+    out, prev = [], None
+    for i, h in enumerate(summaries):
+        if name not in h["strategy_values"]:
+            continue
+        v = h["strategy_values"][name]
+        if prev is not None:
+            out.append((v - prev["strategy_values"][name]) / prev["capital_per_strategy"])
+        elif i > 0 or v == 0:
+            out.append(v / h["capital_per_strategy"])
+        prev = h
+    return out
+
+
+def _moving_prices(n=50, seed=7):
+    rng = np.random.default_rng(seed)
+    steps = 0.005 + 0.012 * rng.standard_normal((n, 2))
+    return pd.DataFrame(100 * np.exp(np.cumsum(steps, axis=0)), columns=["UP", "ALT"],
+                        index=pd.bdate_range("2026-01-05", periods=n))
+
+
+def _real_book(root, rerun_at=None, n=50, seed=7):
+    """A real paper book of two strategies (one fund, and two funds) written by the PaperTrader. With `rerun_at`, that
+    step is run, its saved state put back as a kill after the summary and before the save leaves it, and run again."""
+    paths = _paths(root)
+    ledger = lg.HypothesisLedger(paths.ledger)
+    a = _idea(ledger, "Funds that rose keep rising", {"sharpe": 0.5, "max_drawdown": 0.3})
+    b = _idea(ledger, "Two funds that rose keep rising", {"sharpe": 0.5, "max_drawdown": 0.3})
+    ledger.close()
+    plan = {a: _long("solo", 0.6), b: _long("pair", 0.3, market=("UP", "ALT"))}
+    px, limits = _moving_prices(n, seed), _limits(root)
+    trader = pp.PaperTrader(paths.journal, limits, starting_cash=CAPITAL, halt_file=None)
+    for i in range(12, n + 1):
+        if i == rerun_at:
+            saved = trader.state_file.read_bytes()
+            trader.step(px.iloc[:i], plan)
+            trader.state_file.write_bytes(saved)                          # killed before its state was saved
+            trader = pp.PaperTrader(paths.journal, limits, starting_cash=CAPITAL, halt_file=None)
+        trader.step(px.iloc[:i], plan)
+    return paths, {a: "solo", b: "pair"}, trader
+
+
+def _summary_index(path):
+    lines = path.read_bytes().split(b"\n")
+    k = max(i for i, raw in enumerate(lines) if raw.strip() and json.loads(raw).get("type") == "summary")
+    return lines, k
+
+
+def _rewrite_summary(path, change):
+    """Replace the last summary line of a journal file: `change` takes the entry and returns the new line (bytes)."""
+    lines, k = _summary_index(path)
+    lines[k] = change(json.loads(lines[k]))
+    path.write_bytes(b"\n".join(lines))
+
+
+ONE_EVENT = ["a lost file", "two summaries for one day", "one malformed line", "a text value", "a missing field",
+             "a summary that does not add up", "a journal that starts mid-history"]
+
+
+@pytest.mark.parametrize("event", ONE_EVENT)
+def test_after_one_event_every_strategy_is_judged_again_with_figures_from_the_values(tmp_path, capsys, event):
+    paths, names, trader = _real_book(tmp_path, rerun_at=30 if event == "two summaries for one day" else None)
+    history = trader.state["history"]
+    k = 18                                                                 # a day in the middle, on which the book moved
+    hit = history[k]["day"]
+    assert history[k]["equity"] != history[k - 1]["equity"]
+    assert all(history[k]["strategy_values"][n] != history[k - 1]["strategy_values"][n] for n in names.values())
+    path = paths.journal / f"{hit}.jsonl"
+    used = [h for h in history if h["day"] != hit]
+    if event == "a lost file":
+        path.unlink()
+    elif event == "two summaries for one day":
+        used = history
+        rerun = paths.journal / f"{history[30 - 12]['day']}.jsonl"
+        assert sum(1 for ln in rerun.read_bytes().splitlines() if b'"type": "summary"' in ln) == 2
+    elif event == "one malformed line":
+        _rewrite_summary(path, lambda e: b'{"type": "summary", "equity": 10')
+    elif event == "a text value":
+        _rewrite_summary(path, lambda e: json.dumps({**e, "equity": "JOURNAL-TEXT"}).encode())
+    elif event == "a missing field":
+        _rewrite_summary(path, lambda e: json.dumps({k2: v for k2, v in e.items() if k2 != "strategy_values"}).encode())
+    elif event == "a summary that does not add up":
+        _rewrite_summary(path, lambda e: json.dumps({**e, "equity": e["equity"] + 5_000.0}).encode())
+    else:
+        m = next(i for i in range(5, k) if all(history[i]["strategy_values"][n] != 0 for n in names.values()))
+        for h in history[:m]:
+            (paths.journal / f"{h['day']}.jsonl").unlink()
+        used = history[m:]
+        assert all(used[0]["strategy_values"][n] != 0 for n in names.values())   # each has a history before the journal
+    code = dc.main(["check"], paths=paths)
+    printed = capsys.readouterr()
+    report = dc.check(paths.ledger, pp.Journal(paths.journal))
+    for hid, name in names.items():
+        mine, row = my_value_returns(used, name), _row(report, hid)
+        assert len(mine) >= 20 and row["decision"] in ("keep", "pause"), (event, row["reason"])
+        assert row["days"] == len(mine)
+        assert row["live_sharpe"] == pytest.approx(my_sharpe(mine), rel=1e-12)
+        assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(mine), rel=1e-12, abs=1e-15)
+        if event not in ("two summaries for one day", "a journal that starts mid-history"):
+            assert row["days_bridged"] == 1
+    assert code in (0, 1) and report["exit_code"] == code and "JOURNAL-TEXT" not in printed.out + printed.err
+
+
+def test_a_lost_file_in_a_real_book_names_the_bridge_on_each_line(tmp_path, capsys):
+    paths, names, trader = _real_book(tmp_path)
+    hit = trader.state["history"][18]["day"]
+    (paths.journal / f"{hit}.jsonl").unlink()
+    assert dc.main(["check"], paths=paths) in (0, 1)
+    out = capsys.readouterr().out
+    for hid in names:
+        line = next(ln for ln in out.splitlines() if ln.startswith(f"h{hid} "))
+        assert "days missing: 1" in line and "days bridged: 1" in line and "summaries skipped: 0" in line
+
+
+def test_a_rerun_day_counts_its_last_summary_and_sets_the_earlier_one_aside(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05}, None)],
+                                {0: ("mom", [0.0, 1000.0, 1000.0, 1000.0])})
+    day = "2026-06-02"
+    path = paths.journal / f"{day}.jsonl"
+    lines, k = _summary_index(path)
+    first = json.loads(lines[k])                                          # the killed run wrote a deep fall, then was rerun
+    killed = {**first, "equity": first["equity"] - 40_000.0, "strategy_values": {"mom": first["strategy_values"]["mom"] - 40_000.0}}
+    lines.insert(k, json.dumps(killed).encode())
+    path.write_bytes(b"\n".join(lines))
+    assert dc.main(["check", "--apply"], paths=paths) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.startswith(f"h{hid} "))
+    assert _decision(out, hid) == "KEEP" and "duplicate summaries set aside: 1" in line and "4 paper days" in line
+
+
+# ---------------------------------------------------------------- 2. the exit code tells all is well from nothing checked
+def test_ordinary_reasons_are_listed_and_do_not_change_the_code(tmp_path, capsys):
+    paths, (calm, young, bare, flat) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None),
+                   ("Funds that fell keep falling", {"sharpe": 1.0, "max_drawdown": 0.5}, None),
+                   ("Bonds lead stocks by a week", None, None),
+                   ("Gold rises when the dollar falls", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+        {0: ("calm", [0.0, 1000.0, -500.0, 800.0]), 1: ("young", [0.0], 3), 2: ("bare", [0.0, -0.4 * CAPITAL, 0.0, 0.0]),
+         3: ("flat", [0.0] * 4)})
+    assert dc.main(["check"], paths=paths) == 0
+    out = capsys.readouterr()
+    assert _decision(out.out, calm) == "KEEP" and _decision(out.out, flat) == "KEEP"
+    assert _decision(out.out, young) == "CANNOT JUDGE" and _decision(out.out, bare) == "CANNOT JUDGE"
+    assert "1 paper day" in out.out and "no backtest" in out.out and "has not traded" in out.out and out.err == ""
+
+
+def test_a_malformed_stored_result_is_a_fault_and_exits_2_while_the_rest_is_judged(tmp_path, capsys):
+    paths, (broken, calm) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None),
+                   ("Funds that fell keep falling", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+        {0: ("broken", [0.0, 1000.0, 1000.0]), 1: ("calm", [0.0, 1000.0, 1000.0])})
+    db = sqlite3.connect(paths.ledger)
+    db.execute("UPDATE hypotheses SET backtest_result = ? WHERE id = ?", ('{"result": LEDGER-TEXT', broken))
+    db.commit()
+    db.close()
+    assert dc.main(["check"], paths=paths) == 2
+    out = capsys.readouterr()
+    assert _decision(out.out, calm) == "KEEP" and _decision(out.out, broken) == "CANNOT JUDGE"
+    assert f"h{broken}" in out.err and "stored development result could not be read" in out.err
+    assert "LEDGER-TEXT" not in out.out + out.err
+
+
+def test_a_latest_summary_that_is_not_good_exits_2_every_run_until_a_good_one_follows(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("calm", [0.0, 1000.0, 1000.0])})
+    journal = pp.Journal(paths.journal)
+    _append_day(journal, "2026-06-04", {hid: "calm"}, {"calm": 1000.0}, equity_change=9000.0)
+    for _ in range(2):
+        assert dc.main(["check"], paths=paths) == 2
+        out = capsys.readouterr()
+        assert "2026-06-04" in out.err and "does not add up" in out.err and _decision(out.out, hid) == "CANNOT JUDGE"
+    _append_day(journal, "2026-06-05", {hid: "calm"}, {"calm": 1000.0}, equity_change=-7000.0)   # adds up against 06-03
+    assert dc.main(["check"], paths=paths) == 0
+    out = capsys.readouterr().out
+    assert _decision(out, hid) == "KEEP" and "summaries skipped: 1 (does not add up: 1)" in out
+
+
+def test_a_stretch_with_fewer_than_two_good_summaries_is_a_fault(tmp_path, capsys):
+    paths, (calm, young) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None),
+                   ("Funds that fell keep falling", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+        {0: ("calm", [0.0, 1000.0, 1000.0, 1000.0]), 1: ("young", [0.0, 0.0], 2)})
+    _rewrite_summary(paths.journal / "2026-06-03.jsonl", lambda e: json.dumps({**e, "equity": "lots"}).encode())
+    assert dc.main(["check"], paths=paths) == 2
+    out = capsys.readouterr()
+    assert _decision(out.out, calm) == "KEEP" and _decision(out.out, young) == "CANNOT JUDGE"
+    assert f"h{young}" in out.err
+
+
+def test_nothing_judged_at_all_exits_2(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("young", [0.0])})
+    assert dc.main(["check"], paths=paths) == 2
+    out = capsys.readouterr()
+    assert _decision(out.out, hid) == "CANNOT JUDGE" and "nothing was judged" in out.err
+
+
+def test_a_fault_never_hides_a_pause(tmp_path, capsys):
+    paths, (broken, deep) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05}, None),
+                   ("Funds that fell keep falling", {"sharpe": 1.0, "max_drawdown": 0.05}, None)],
+        {0: ("broken", [0.0, 1000.0, 1000.0]), 1: ("deep", [0.0, -0.2 * CAPITAL, 0.0])})
+    db = sqlite3.connect(paths.ledger)
+    db.execute("UPDATE hypotheses SET sealed_test_result = ? WHERE id = ?", ("[1]", broken))
+    db.commit()
+    db.close()
+    assert dc.main(["check"], paths=paths) == 2
+    out = capsys.readouterr()
+    assert f"to pause (run with --apply): h{deep}" in out.out and f"h{broken}" in out.err
+    assert dc.main(["check", "--apply"], paths=paths) == 2
+    out = capsys.readouterr()
+    assert f"paused: h{deep}" in out.out and f"h{broken}" in out.err and _status(paths, deep)[0] == "paused"
+
+
+# ---------------------------------------------------------------- 3. damage to the module's own as-of file
+def test_a_torn_check_line_is_named_on_every_run_and_the_next_day_is_judged_across_it(tmp_path, capsys):
+    """My choice: a damaged line after a day's last readable summary means that summary may not be the day's last, so it
+    is not good. On that day the check exits 2 naming the file and line; from the next good summary the day is bridged,
+    judged exactly from the values, and the line is named on every run until a person repairs it."""
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("calm", [0.0, 1000.0, -2000.0])})
+    journal = pp.Journal(paths.journal)
+    as_of = _last_summary(journal)["day"]
+    with (paths.journal / f"{as_of}.jsonl").open("ab") as fh:
+        fh.write(b'{"type": "decay_check", "as_of": "JOURNAL-TEXT')
+    for argv in (["check"], ["check", "--apply"]):
+        assert dc.main(argv, paths=paths) == 2
+        assert f"{as_of}.jsonl line 3" in capsys.readouterr().err
+    _append_day(journal, "2026-06-04", {hid: "calm"}, {"calm": 3000.0})
+    for _ in range(2):
+        assert dc.main(["check", "--apply"], paths=paths) == 0
+        out = capsys.readouterr()
+        assert f"journal lines that could not be read (ignored): 1 ({as_of}.jsonl line 3)" in out.out
+        assert _decision(out.out, hid) == "KEEP" and "JOURNAL-TEXT" not in out.out + out.err
+    row = _row(dc.check(paths.ledger, journal), hid)
+    mine = [0.0, 0.01, (2000.0 - 1000.0) / CAPITAL]                       # 06-03 bridged: 06-02 to 06-04 in one observation
+    assert row["days"] == 3 and row["days_bridged"] == 1
+    assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(mine), abs=1e-15)
+    assert row["live_sharpe"] == pytest.approx(my_sharpe(mine), rel=1e-12)
+
+
+def test_a_damaged_line_before_the_as_of_summary_is_named_and_the_day_is_judged(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("calm", [0.0, 1000.0])})
+    journal = pp.Journal(paths.journal)
+    with (paths.journal / "2026-06-03.jsonl").open("ab") as fh:
+        fh.write(b'{"type": "decision", "strategy": "JOURNAL-TEXT')         # torn, then the day is written after it
+    _append_day(journal, "2026-06-03", {hid: "calm"}, {"calm": 500.0})
+    for _ in range(2):
+        assert dc.main(["check", "--apply"], paths=paths) == 0
+        out = capsys.readouterr().out
+        assert "journal lines that could not be read (ignored): 1 (2026-06-03.jsonl line 1)" in out
+        assert _decision(out, hid) == "KEEP" and "3 paper days" in out
+
+
+# ---------------------------------------------------------------- 4. nothing silent, nothing wrong across a bridge
+def test_each_line_prints_days_bridged_summaries_skipped_by_kind_and_duplicates(tmp_path, capsys):
+    changes = [0.0, 1000.0, -500.0, 700.0, 300.0, -200.0, 400.0, 100.0]
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", changes)}, start="2026-06-01")
+    j = paths.journal
+    (j / "2026-06-02.jsonl").unlink()                                      # lost
+    _rewrite_summary(j / "2026-06-03.jsonl", lambda e: json.dumps({**e, "equity": e["equity"] + 1.0}).encode())
+    _rewrite_summary(j / "2026-06-04.jsonl", lambda e: json.dumps({**e, "capital_per_strategy": None}).encode())
+    lines, k = _summary_index(j / "2026-06-08.jsonl")
+    lines.insert(k, lines[k])                                             # the same summary twice: the last one counts
+    (j / "2026-06-08.jsonl").write_bytes(b"\n".join(lines))
+    assert dc.main(["check"], paths=paths) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.startswith(f"h{hid} "))
+    assert "5 paper days" in line and "days bridged: 3" in line and "duplicate summaries set aside: 1" in line
+    assert "summaries skipped: 2 (does not add up: 1, not readable: 1)" in line
+    values = np.cumsum(changes)                                           # 06-01 then 06-05, 06-08, 06-09, 06-10
+    mine = [0.0, (values[4] - values[0]) / CAPITAL] + [c / CAPITAL for c in changes[5:]]
+    row = _row(dc.check(paths.ledger, pp.Journal(j)), hid)
+    assert row["live_sharpe"] == pytest.approx(my_sharpe(mine), rel=1e-12)
+    assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(mine), abs=1e-15)
+
+
+def test_a_bridge_counts_once_toward_the_60_observations(tmp_path):
+    rng = np.random.default_rng(21)
+    returns = (-0.001 + 0.01 * rng.standard_normal(61)).tolist()           # a Sharpe well below half of 1.0
+    out = {}
+    for n in (61, 60):
+        root = tmp_path / str(n)
+        paths, (hid,) = _setup_book(root, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.9}, None)],
+                                    {0: ("mom", [r * CAPITAL for r in returns[:n]])})
+        (paths.journal / f"{pd.bdate_range('2026-06-01', periods=n)[30].date()}.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+        out[n] = (row["days"], row["sharpe_decides"], row["decision"])
+    assert out[61] == (60, True, "pause") and out[60] == (59, False, "keep")
+
+
+def _spread(returns, lost):
+    """The returns with day `lost` and the day after joined into one observation; and the same spread evenly over its two
+    days (what the monitor also asks of a pause)."""
+    joined = returns[:lost] + [returns[lost] + returns[lost + 1]] + returns[lost + 2:]
+    even = returns[:lost] + [(returns[lost] + returns[lost + 1]) / 2] * 2 + returns[lost + 2:]
+    return joined, even
+
+
+def _my_rule(returns, bt, joined=None, even=None):
+    """My own reading of the rule, with my stated bridge rule when the history has a bridge: both readings must clear the
+    limit by 1% of it, and by at least 0.1 of a percentage point of worst fall or 0.05 of Sharpe."""
+    dd_limit, s_limit = 1.5 * bt["max_drawdown"], 0.5 * bt["sharpe"]
+    if joined is None:
+        series, n = [returns], len(returns)
+    else:
+        series, n = [joined, even], len(joined)
+        dd_limit, s_limit = dd_limit + max(0.01 * dd_limit, 0.001), s_limit - max(0.01 * s_limit, 0.05)
+    dd = all(my_worst_fall(s) > dd_limit for s in series)
+    sharpe = n >= 60 and all(my_sharpe(s) < s_limit for s in series)
+    return "pause" if (dd or sharpe) else "keep"
+
+
+def test_a_lost_day_never_makes_a_pause_more_likely_than_the_same_history_with_it(tmp_path):
+    rng = np.random.default_rng(424242)
+    seen, case = {"pause": 0, "keep": 0}, 0
+    for book in range(40):
+        n = int(rng.integers(30, 80))
+        returns = (rng.uniform(-0.002, 0.003) + rng.uniform(0.004, 0.02) * rng.standard_normal(n)).tolist()
+        returns[0] = 0.0
+        lost = int(rng.integers(2, n - 2))
+        full_dd, full_s = my_worst_fall(returns), my_sharpe(returns)
+        for bt in ({"sharpe": 0.01, "max_drawdown": full_dd / 1.5 * (1 + 1e-12)},      # the full history kept at the edge
+                   {"sharpe": 2 * full_s * (1 - 1e-12) if full_s > 0 else 0.01, "max_drawdown": 0.9},
+                   {"sharpe": 0.01, "max_drawdown": full_dd / 1.5 * 0.9},              # the full history paused
+                   {"sharpe": 2 * full_s + 1.0 if full_s > 0 else 1.0, "max_drawdown": 0.9}):
+            decided, case = {}, case + 1
+            for label in ("full", "gap"):
+                root = tmp_path / f"{case}-{label}"
+                paths, (hid,) = _setup_book(root, [("Funds that rose keep rising", bt, None)],
+                                            {0: ("mom", [r * CAPITAL for r in returns])})
+                if label == "gap":
+                    (paths.journal / f"{pd.bdate_range('2026-06-01', periods=n)[lost].date()}.jsonl").unlink()
+                decided[label] = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)["decision"]
+            joined, even = _spread(returns, lost)                          # day `lost` and the next, in one observation
+            assert decided["full"] == _my_rule(returns, bt)
+            assert decided["gap"] == _my_rule(returns, bt, joined, even), (book, bt)
+            assert not (decided["gap"] == "pause" and decided["full"] == "keep"), (book, bt)
+            seen[decided["gap"]] += 1
+    assert seen["pause"] > 30 and seen["keep"] > 30
+
+
+def test_a_bridge_is_not_read_as_one_day_when_that_alone_would_pause(tmp_path):
+    returns = [0.0] + [0.004, -0.002] * 34 + [0.03, 0.03]                  # two strong days at the end, joined by the gap
+    joined, even = _spread(returns, len(returns) - 2)
+    assert my_sharpe(joined) < my_sharpe(returns) and my_sharpe(even) >= my_sharpe(returns) - 1e-12
+    bt = {"sharpe": my_sharpe(joined) + my_sharpe(returns), "max_drawdown": 0.9}  # limit between the two readings
+    decided = {}
+    for label in ("full", "gap"):
+        paths, (hid,) = _setup_book(tmp_path / label, [("Funds that rose keep rising", bt, None)],
+                                    {0: ("mom", [r * CAPITAL for r in returns])})
+        if label == "gap":
+            (paths.journal / f"{pd.bdate_range('2026-06-01', periods=len(returns))[-2].date()}.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+        decided[label] = (row["decision"], row["days"])
+    assert decided == {"full": ("keep", 71), "gap": ("keep", 70)}
+
+
+# ---------------------------------------------------------------- 5. --apply recovers the ledger it is about to write to
+_CHILD_KILLED_WRITER = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA cache_size = 1")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE hypotheses SET status = 'retired'")
+db.execute("CREATE TABLE filler(x)")
+db.execute("INSERT INTO filler SELECT randomblob(4000) FROM (WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 60) SELECT i FROM c)")
+os._exit(0)
+"""
+
+
+def test_apply_recovers_a_hot_rollback_journal_and_report_only_says_what_is_needed(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05}, None)],
+                                {0: ("mom", [0.0, -0.2 * CAPITAL, 0.001 * CAPITAL])})
+    subprocess.run([sys.executable, "-c", _CHILD_KILLED_WRITER, str(paths.ledger)], check=True, timeout=60)
+    hot = Path(str(paths.ledger) + "-journal")
+    assert hot.exists() and hot.stat().st_size > 0
+    before, journal_before = (paths.ledger.read_bytes(), hot.read_bytes()), pp.Journal(paths.journal).read()
+    assert dc.main(["check"], paths=paths) == 2
+    err = capsys.readouterr().err
+    assert "unfinished write" in err and "--apply" in err
+    assert (paths.ledger.read_bytes(), hot.read_bytes()) == before and pp.Journal(paths.journal).read() == journal_before
+    assert dc.main(["check", "--apply"], paths=paths) == 1
+    assert not hot.exists() and _status(paths, hid)[0] == "paused"         # the killed write rolled back, then the pause
+
+
+# ---------------------------------------------------------------- 6. the low ones
+def test_a_malformed_idea_still_shows_its_paper_figures(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05}, None)],
+                                {0: ("mom", [0.0, -0.2 * CAPITAL, 0.1 * CAPITAL])})
+    db = sqlite3.connect(paths.ledger)
+    db.execute("UPDATE hypotheses SET backtest_result = ? WHERE id = ?", ('{"result": LEDGER-TEXT', hid))
+    db.commit()
+    db.close()
+    row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+    mine = [0.0, -0.2, 0.1]
+    assert row["decision"] == "cannot judge" and row["fault"] and row["days"] == 3
+    assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(mine)) and row["live_sharpe"] == pytest.approx(my_sharpe(mine))
+    assert dc.main(["check"], paths=paths) == 2
+    out = capsys.readouterr().out
+    assert "3 paper days" in out and "worst fall 20.00%" in out and "LEDGER-TEXT" not in out
+
+
+@pytest.mark.parametrize("off, good", [(5_000.0, False), (1_000.0, False), (0.02, False), (0.009, True)])
+def test_a_summary_adds_up_only_to_a_cent_or_a_billionth_of_the_equity(tmp_path, off, good):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", [0.0, 1000.0, 1000.0, 1000.0])})
+    _rewrite_summary(paths.journal / "2026-06-02.jsonl", lambda e: json.dumps({**e, "equity": e["equity"] + off}).encode())
+    row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+    assert row["summaries_skipped"] == ({} if good else {"does not add up": 1})
+    assert row["days"] == (4 if good else 3) and row["decision"] == "keep"
+
+
+def test_the_journals_first_summary_is_the_baseline_and_is_never_an_observation(tmp_path):
+    paths = _paths(tmp_path)
+    ledger = lg.HypothesisLedger(paths.ledger)
+    hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05})
+    ledger.close()
+    journal = pp.Journal(paths.journal)
+    journal.write("2026-06-01", {"type": "summary", "equity": 1_050_000.0, "strategy_values": {"mom": 50_000.0},
+                                 "strategy_value_change": {"mom": 900.0}, "capital_per_strategy": CAPITAL})
+    _append_day(journal, "2026-06-02", {hid: "mom"}, {"mom": -3000.0})
+    _append_day(journal, "2026-06-03", {hid: "mom"}, {"mom": 1000.0})
+    row = _row(dc.check(paths.ledger, journal), hid)
+    mine = [-0.03, 0.01]
+    assert row["days"] == 2 and row["decision"] == "keep"
+    assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(mine), abs=1e-15)
+    assert row["live_sharpe"] == pytest.approx(my_sharpe(mine), rel=1e-12)
+
+
+def test_the_catch_all_error_never_prints_the_exceptions_own_text(tmp_path, capsys, monkeypatch):
+    paths, _ = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                           {0: ("mom", [0.0, 1000.0])})
+
+    def boom(*args, **kw):
+        raise ValueError("JOURNAL-TEXT from a line of the journal")
+    monkeypatch.setattr(dc, "check", boom)
+    assert dc.main(["check"], paths=paths) == 2
+    captured = capsys.readouterr()
+    assert "ValueError" in captured.err and "JOURNAL-TEXT" not in captured.out + captured.err
+
+
+def _set_backtest(paths, hid, sharpe, drawdown):
+    db = sqlite3.connect(paths.ledger)
+    db.execute("UPDATE hypotheses SET backtest_result = ?, sealed_test_result = ? WHERE id = ?",
+               (json.dumps({"result": {"sharpe": sharpe, "max_drawdown": drawdown}}), json.dumps({"verdict": "pass"}), hid))
+    db.commit()
+    db.close()
+
+
+def test_a_lost_day_in_real_books_never_pauses_where_the_whole_history_is_kept_at_its_edge(tmp_path):
+    import shutil
+    checked = 0
+    for seed in range(6):
+        root = tmp_path / f"s{seed}"
+        paths, names, trader = _real_book(root, seed=seed)
+        gap = root / "gap"
+        shutil.copytree(paths.journal, gap)
+        (gap / f"{trader.state['history'][15]['day']}.jsonl").unlink()
+        full = {r["hypothesis_id"]: r for r in dc.check(paths.ledger, pp.Journal(paths.journal))["strategies"]}
+        for hid in names:
+            if not full[hid]["live_max_drawdown"]:
+                continue
+            _set_backtest(paths, hid, -1.0, full[hid]["live_max_drawdown"] / 1.5 * (1 + 1e-12))   # the full one kept by a hair
+            whole = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+            lost = _row(dc.check(paths.ledger, pp.Journal(gap)), hid)
+            assert whole["decision"] == "keep" and lost["decision"] == "keep" and lost["days_bridged"] == 1, (seed, hid)
+            checked += 1
+    assert checked >= 10
+
+
+def test_a_strategy_joining_inside_a_bridge_reads_the_bridge_over_either_end_capital(tmp_path):
+    # 06-04 is lost; on it a second strategy joined and the capital per strategy halved. The rebound inside the bridge
+    # over the earlier capital looks half its size; read over the later capital it is at least the whole history's
+    full = [0.0, 0.02, -0.10, 0.0, 0.10, -0.10, 0.0]
+    edge = my_worst_fall(full) / 1.5 * (1 + 1e-12)                         # the whole history kept by a hair
+    decided = {}
+    for label in ("full", "gap"):
+        paths = _paths(tmp_path / label)
+        ledger = lg.HypothesisLedger(paths.ledger)
+        alpha = _idea(ledger, "Funds that rose keep rising", {"sharpe": -1.0, "max_drawdown": edge})
+        beta = _idea(ledger, "Funds that fell keep falling", {"sharpe": -1.0, "max_drawdown": 0.5})
+        ledger.close()
+        journal = pp.Journal(paths.journal)
+        _book(journal, {alpha: ("alpha", [0.0, 2000.0, -10_000.0])})
+        _book(journal, {alpha: ("alpha", [0.0, 5000.0, -5000.0, 0.0]), beta: ("beta", [0.0] * 4)}, start="2026-06-04",
+              capital=CAPITAL / 2)
+        if label == "gap":
+            (paths.journal / "2026-06-04.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), alpha)
+        decided[label] = (row["decision"], row["days"], row["days_bridged"])
+        if label == "full":
+            assert row["live_max_drawdown"] == pytest.approx(my_worst_fall(full), rel=1e-12)
+        else:
+            assert row["live_max_drawdown"] == pytest.approx(my_worst_fall([0.0, 0.02, -0.10, 0.05, -0.10, 0.0]), rel=1e-12)
+            assert row["live_max_drawdown"] > 1.3 * 1.5 * edge                 # read over the earlier capital: far over
+    assert decided == {"full": ("keep", 7, 0), "gap": ("keep", 6, 1)}
+
+
+def test_a_lost_holiday_the_book_traded_is_bridged_from_the_next_days_own_change(tmp_path, capsys):
+    # 2026-07-03 is an exchange holiday the book traded on (and the only one in its stretch); its file is lost
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", [0.0, 1000.0, -500.0, 700.0, 2000.0, 300.0])}, start="2026-06-29")
+    (paths.journal / "2026-07-03.jsonl").unlink()
+    row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+    assert row["days"] == 5 and row["days_bridged"] == 1 and row["live_sharpe_bridges_spread"] is not None
+
+
+def test_a_book_that_trades_holidays_counts_a_lost_one_on_weekdays(tmp_path):
+    # the book opened on 2026-06-19 and traded 2026-07-03, both exchange holidays; 07-03 is lost and the next day's
+    # summary has no change field to show it: the book's own weekday calendar does
+    changes = [0.0, 1000.0, -500.0, 700.0, 300.0, 200.0, -100.0, 400.0, 100.0, 2000.0, 300.0]   # 06-22 to 07-06
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", changes)}, start="2026-06-22")
+    assert (paths.journal / "2026-06-19.jsonl").exists()
+    (paths.journal / "2026-07-03.jsonl").unlink()
+    _rewrite_summary(paths.journal / "2026-07-06.jsonl",
+                     lambda e: json.dumps({k: v for k, v in e.items() if k != "strategy_value_change"}).encode())
+    row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+    assert row["days"] == 10 and row["days_bridged"] == 1
+
+
+def test_across_a_bridge_a_pause_must_clear_the_limit_by_the_margin(tmp_path):
+    # the capital per strategy drifted 1% on the lost day 06-03: read evenly over the known capital the fall looks a
+    # little deeper (14.26%) than the whole history's (14.22%); within the margin that is no pause
+    full = [0.0, -0.05, -0.05, -5000.0 / 101_000.0, 0.0]
+    edge = my_worst_fall(full) / 1.5 * (1 + 1e-9)                          # the whole history kept by a hair
+    decided = {}
+    for label in ("full", "gap"):
+        paths = _paths(tmp_path / label)
+        ledger = lg.HypothesisLedger(paths.ledger)
+        hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": -1.0, "max_drawdown": edge})
+        ledger.close()
+        journal = pp.Journal(paths.journal)
+        _book(journal, {hid: ("mom", [0.0, -5000.0])})
+        _book(journal, {hid: ("mom", [-5000.0])}, start="2026-06-03", capital=101_000.0)
+        _book(journal, {hid: ("mom", [-5000.0, 0.0])}, start="2026-06-04")
+        if label == "gap":
+            (paths.journal / "2026-06-03.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+        decided[label] = row["decision"]
+        if label == "gap":
+            assert 1.5 * edge < row["live_max_drawdown_bridges_spread"] < 1.5 * edge * 1.01
+    assert decided == {"full": "keep", "gap": "keep"}

@@ -3,49 +3,71 @@
     python -m valedia_trader.research_loop.decay check            report only
     python -m valedia_trader.research_loop.decay check --apply    pause what should be paused, journal the check
 
-A daily check that can only make the trader more careful. For every strategy in the paper book it computes,
-from the paper record alone, the strategy's own daily returns, their annualised Sharpe and their worst fall from
-a peak, and sets them against what its tests showed in the idea ledger.
+A daily check that can only make the trader more careful. For every strategy in the paper book it computes, from the
+paper record alone, the strategy's own returns, their annualised Sharpe and their worst fall from a peak, and sets them
+against what its tests showed in the idea ledger.
 
     Rule 1, from the first paper day:   worst fall > 1.5 x the backtest's worst drawdown      -> pause
     Rule 2, from MIN_DAYS_FOR_SHARPE:   Sharpe < half the backtest Sharpe                      -> pause
 
-A day's return is the strategy's change in value that day over the capital per strategy of the day before (the
-capital its positions were sized on); a strategy's first day uses its own first capital. This differs from the
-weekly critic, which divides by the same day's capital (overstating a day's move when strategies join the book);
-the critic's convention is being repaired separately.
+The record is read from the strategies' VALUES in the paper book's day summaries (`strategy_values`: open value plus
+realised result), never from the day's changes, so that no single event can blind it for good:
+
+  - A summary is GOOD when it parses with finite numbers where numbers belong (equity, every strategy value, a capital
+    per strategy above zero), is the last summary of its day (no damaged line follows it in the day's file, which could
+    be a later one), and adds up against the last good summary before it: the sum over strategies of (value now less
+    value then) equals the equity now less the equity then, to the larger of a cent and 1e-9 of the equity. The
+    journal's first summary is the baseline: there is nothing before it to add up against. A summary that is not good
+    is skipped and counted by kind; it is never the reference for a later one. Earlier summaries of a day (a paper
+    trader killed after its summary and run again) are set aside and counted; the last one counts.
+  - A return observation runs from one good summary holding the strategy to the next: its value now less its value
+    then, over the capital per strategy of the earlier one. Days lost or skipped between them make that one
+    observation, a bridge; the days it spans are counted. A strategy's first observation is from nothing (it is absent
+    from the summary before) over its own first capital. In the baseline a strategy worth exactly nothing has held
+    nothing, so it starts there from nothing too; one worth something has a history the journal does not hold: it
+    starts there, and its first observation ends on the next good summary.
+  - A bridge never makes a pause more likely. The figures shown take a bridge as one observation (the Sharpe rule's
+    60 are 60 observations, a bridge counted once). The days a bridge spans are the trading sessions between its ends
+    (weekdays too, when the book has traded on a weekday the exchange did not), the skipped days, and at least one
+    when the end summary's own `strategy_value_change` shows a value before it that the journal no longer holds. A
+    rule pauses a strategy whose record holds a bridge only if it also fires with every bridge spread evenly over its
+    days (k equal parts of its change in value, over the capital at either end of it, the most favourable reading:
+    for the same change, evenly spread days are the most favourable path for both the worst fall and the Sharpe),
+    and only when both readings clear the limit by BRIDGE_MARGIN of it, and by at least BRIDGE_FLOOR_DRAWDOWN of worst
+    fall or BRIDGE_FLOOR_SHARPE of Sharpe (the capital inside a bridge, and so the day's split, is not known). A
+    bridge can hide a pause (its low point is unseen, it counts once, the margin), never make one.
 
 The backtest is both stored results of the idea, development and sealed: the worst fall compared against is the
-larger of the two, the Sharpe the lower, so a strategy is paused only when its paper record is worse than everything
-its tests showed. An idea with only one of the two uses that one. Each figure must be a real finite number (the worst
-fall not negative), otherwise that rule cannot judge. With a backtest Sharpe not above zero, or paper returns with no
-spread (a strategy that has not traded), the Sharpe rule is not judged and never pauses.
+larger of the two, the Sharpe the lower; an idea with only one uses that one. Each figure must be a real finite number
+(the worst fall not negative). With a backtest Sharpe not above zero, or paper returns with no spread (a strategy that
+has not traded), the Sharpe rule is not judged and never pauses. The Sharpe is computed exactly as the gauntlet's
+headline figure (`performance_report`): mean over sample standard deviation (ddof 1), times the square root of 252.
+The worst fall uses the same `max_drawdown`, from the starting capital.
 
-The Sharpe is computed exactly as the gauntlet's headline figure (`performance_report`): mean over sample standard
-deviation (ddof 1) of the daily returns, times the square root of 252, no risk-free rate. The worst fall uses the
-same `max_drawdown`, from the starting capital.
-
-A strategy is `cannot judge` and never paused when its figures cannot be trusted: no usable backtest figure, a damaged
-journal line in the stretch it needs, fewer than 2 paper days, or a day the book could not be valued: the strategies'
-value changes do not add up to the book's equity change (to a cent or 1e-9 of the equity, whichever is larger). That
-is the only test of a day. A day on which the paper book carried a fund's last price (`stale_prices`, a list of funds
-or a mapping from fund to days carried) and which adds up is judged like any other; the days in a strategy's stretch
-on which a fund it held had a carried price are counted and shown ("days with a carried price"). Trading days with no
-journal file in a strategy's stretch are counted and shown ("days missing"). Neither is a refusal. A damaged line is named by file and line, never by its text, and no
-text from the journal or the ledger appears in an error.
+Days on which a fund a strategy held had a carried price (`stale_prices`, a list or a mapping) are judged like any
+other and counted. Trading days with no journal file are counted ("days missing"). A damaged journal line is ignored
+and named, by file and line, on every run until a person repairs it; no text from the journal or the ledger appears in
+any message.
 
 It never un-pauses, promotes or changes anything else: the only write to the ledger is
 `set_status(id, "paused", reason, "decay")`, for a strategy still trading, and the only write to the journal is one
 `decay_check` entry a day. Report-only opens the ledger read-only. `--apply` runs one at a time: it holds an
 operating-system lock on `journal/decay.lock`, released with the process however it ends; a second run that finds it
-held stops and writes nothing. A torn line in the as-of day's journal file stops the check (it cannot tell whether
-it already ran that day).
+held stops and writes nothing. Holding that lock, `--apply` opens the ledger read-write once first, which lets SQLite
+roll back a write that a killed program left unfinished; report-only never does, and says so.
 
-Exit codes: 0 nothing to pause, 1 at least one strategy paused or to pause, 2 the check could not run.
+Exit codes:
+  0  every strategy that can be judged was judged and none is to be paused (one not yet judgeable for an ordinary
+     reason is listed: fewer than two observations, no backtest figure; a flat record is judged on its worst fall);
+  1  at least one strategy is paused or would be;
+  2  a fault (the latest summary is not good; a strategy's stretch holds fewer than two good summaries; its idea's
+     stored result is malformed, or it is not in the ledger), the check could not run, or strategies are trading and
+     not one could be judged. A fault never hides a pause: under --apply the pause is written and the code is 2.
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import json
 import math
@@ -63,21 +85,25 @@ import pandas as pd
 from valedia_trader.quant_engine import level8_portfolio_risk as risk
 from valedia_trader.research_loop import LoopPaths
 from valedia_trader.research_loop.ledger import HypothesisLedger
-from valedia_trader.research_loop.paper import Journal, JournalDamaged, describe_skipped
+from valedia_trader.research_loop.paper import Journal, describe_skipped
 
 __all__ = ["MIN_DAYS_FOR_SHARPE", "DRAWDOWN_MULTIPLE", "SHARPE_FRACTION", "CheckCannotRun", "CheckBusy", "run_lock",
            "annualised_sharpe", "worst_fall", "has_traded", "judge", "check", "main"]
 
-MIN_DAYS_FOR_SHARPE = 60          # paper trading days before the Sharpe rule decides anything
+MIN_DAYS_FOR_SHARPE = 60          # return observations before the Sharpe rule decides anything (a bridge counts once)
 DRAWDOWN_MULTIPLE = 1.5           # pause when the paper fall is more than this times the backtest's worst
 SHARPE_FRACTION = 0.5             # pause when the paper Sharpe is below this fraction of the backtest's
-MIN_DAYS = 2                      # fewer paper days than this: nothing can be said
+MIN_DAYS = 2                      # fewer observations than this: nothing can be said
 TRADING = ("passed backtest only", "passed paper")       # the statuses the paper trader trades (cli.PAPER_STATUSES)
 SOURCE = "decay"
 PERIODS_PER_YEAR = 252.0
 ZERO = 1e-15                      # the Sharpe convention's zero (performance_report's threshold on the sd)
 CENT, RELATIVE = 0.01, 1e-9       # how closely the strategies' value changes must add up to the book's equity change
+BRIDGE_MARGIN = 0.01              # across a bridge a rule fires only when it clears its limit by this share of the limit,
+BRIDGE_FLOOR_DRAWDOWN = 0.001     # and by at least a tenth of a percentage point of worst fall
+BRIDGE_FLOOR_SHARPE = 0.05        # or 0.05 of Sharpe (what is not known inside a bridge: the capital and the day's split)
 LOCK_NAME = "decay.lock"
+KINDS = ("does not add up", "not readable", "damaged line after it")    # why a summary is skipped, in printing order
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -90,7 +116,9 @@ class CheckBusy(CheckCannotRun):
 
 
 class _CannotJudge(Exception):
-    pass
+    def __init__(self, text: str, fault: bool = False) -> None:
+        super().__init__(text)
+        self.fault = fault
 
 
 # ---------------------------------------------------------------- figures
@@ -108,7 +136,7 @@ def worst_fall(returns) -> float:
 
 
 def has_traded(returns) -> bool:
-    """False when every daily return is zero (within ZERO): the strategy has never held anything."""
+    """False when every return is zero (within ZERO): the strategy has never held anything."""
     r = np.asarray(returns, dtype=float).ravel()
     return bool(np.any(np.abs(r) > ZERO))
 
@@ -149,15 +177,19 @@ def _date(x) -> str | None:
 
 
 def judge(live_sharpe: float, live_drawdown: float, days: int, backtest_sharpe, backtest_drawdown,
-          traded: bool = True, spread: bool | None = None) -> dict:
+          traded: bool = True, spread: bool | None = None, spread_sharpe: float | None = None,
+          spread_drawdown: float | None = None) -> dict:
     """Both rules on figures already computed. `decision` is pause, keep or cannot judge.
 
     A backtest figure that is None is missing; one that is not a real finite number (or a negative worst fall) is
     unusable: either makes its rule `cannot judge`, and the strategy `cannot judge` unless the other rule fires (that
     only makes the trader more careful). A backtest Sharpe not above zero, or paper returns with no spread (`traded`
     False: every return zero; `spread` False: no variation), leave the Sharpe rule not judged: it never pauses, and the
-    strategy is judged on its worst fall."""
+    strategy is judged on its worst fall. `spread_sharpe` and `spread_drawdown`, given for a record that holds a
+    bridge, are the most favourable figures with every bridge spread evenly over its days: a rule then fires only if
+    both readings clear its limit by BRIDGE_MARGIN of the limit (the capital inside a bridge is not known)."""
     spread = traded if spread is None else (spread and traded)
+    bridged = spread_sharpe is not None or spread_drawdown is not None
     reasons: list[str] = []
     problems: list[str] = []
     notes: list[str] = []
@@ -169,7 +201,13 @@ def judge(live_sharpe: float, live_drawdown: float, days: int, backtest_sharpe, 
         problems.append("the stored backtest worst drawdown is not a real finite number of at least zero")
     else:
         limit = DRAWDOWN_MULTIPLE * bd
-        dd_rule.update(limit=limit, decides=True, fires=bool(live_drawdown > limit), state="clear")
+        over = bool(live_drawdown > limit)
+        clear_by = limit + max(BRIDGE_MARGIN * limit, BRIDGE_FLOOR_DRAWDOWN)
+        held = bridged and over and not (live_drawdown > clear_by and spread_drawdown is not None and spread_drawdown > clear_by)
+        dd_rule.update(limit=limit, decides=True, fires=over and not held, state="clear")
+        if held:
+            notes.append(f"worst fall {live_drawdown:.2%} is over the limit, but across a bridge a pause needs more than "
+                         f"{clear_by:.2%} on every reading ({spread_drawdown:.2%} with each bridge spread over its days): not paused")
         if dd_rule["fires"]:
             dd_rule["state"] = "pause"
             reasons.append(f"paper worst fall {live_drawdown:.2%} after {days} paper days is more than {DRAWDOWN_MULTIPLE:g} times "
@@ -192,8 +230,14 @@ def judge(live_sharpe: float, live_drawdown: float, days: int, backtest_sharpe, 
     else:
         limit = SHARPE_FRACTION * bs
         sr_rule.update(limit=limit, decides=bool(days >= MIN_DAYS_FOR_SHARPE))
-        sr_rule["fires"] = bool(sr_rule["decides"] and live_sharpe < limit)
+        below = bool(sr_rule["decides"] and live_sharpe < limit)
+        clear_by = limit - max(BRIDGE_MARGIN * limit, BRIDGE_FLOOR_SHARPE)
+        held = bridged and below and not (live_sharpe < clear_by and spread_sharpe is not None and spread_sharpe < clear_by)
+        sr_rule["fires"] = below and not held
         sr_rule["state"] = "pause" if sr_rule["fires"] else "clear" if sr_rule["decides"] else "not yet"
+        if held:
+            notes.append(f"Sharpe {live_sharpe:.2f} is under the limit, but across a bridge a pause needs less than "
+                         f"{clear_by:.2f} on every reading ({spread_sharpe:.2f} with each bridge spread over its days): not paused")
         if sr_rule["fires"]:
             reasons.append(f"paper Sharpe {live_sharpe:.2f} over {days} paper days is below half the backtest Sharpe "
                            f"{bs:.2f} (limit {limit:.2f})")
@@ -234,22 +278,56 @@ def run_lock(journal_dir):
         os.close(fd)                                     # closing the file releases the lock
 
 
-# ---------------------------------------------------------------- the ledger, read-only
+# ---------------------------------------------------------------- the ledger
+def _ledger_file(path) -> Path:
+    p = Path(path)
+    if not p.is_file():
+        raise CheckCannotRun(f"there is no idea ledger at {p}")
+    if p.stat().st_size == 0:
+        raise CheckCannotRun(f"the idea ledger at {p} is empty")
+    return p
+
+
+def _unfinished_write(p: Path) -> bool:
+    hot = Path(str(p) + "-journal")
+    try:
+        return hot.is_file() and hot.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _recover(path) -> None:
+    """For `--apply`, holding the monitor's lock and about to write: one ordinary read-write open of the ledger, which
+    lets SQLite roll back a write a killed program left unfinished (a hot rollback journal). It never creates the file."""
+    p = _ledger_file(path)
+    db = None
+    try:
+        db = sqlite3.connect(p.resolve().as_uri() + "?mode=rw", uri=True)
+        db.execute("SELECT count(*) FROM sqlite_master").fetchall()
+    except sqlite3.Error as exc:
+        raise CheckCannotRun(f"the idea ledger at {p} could not be read ({type(exc).__name__})") from None
+    finally:
+        if db is not None:
+            db.close()
+
+
 class _LedgerView:
     """The idea ledger opened read-only, read row by row so that one malformed idea cannot stop the others."""
 
     def __init__(self, path) -> None:
-        p = Path(path)
-        if not p.is_file():
-            raise CheckCannotRun(f"there is no idea ledger at {p}")
-        if p.stat().st_size == 0:
-            raise CheckCannotRun(f"the idea ledger at {p} is empty")
+        p = _ledger_file(path)
         self._db = None
         try:
             self._db = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True)
             tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
         except sqlite3.Error as exc:
             self.close()
+            if _unfinished_write(p):
+                raise CheckCannotRun(
+                    f"the idea ledger at {p} holds an unfinished write, left by a program that stopped in the middle of it "
+                    f"({p.name}-journal beside it); report-only never opens the ledger for writing, so it cannot read it. "
+                    "Run the check with --apply (it holds its lock and lets SQLite roll the unfinished write back), or "
+                    "open the ledger with any program that writes to it") from None
             raise CheckCannotRun(f"the idea ledger at {p} could not be read ({type(exc).__name__})") from None
         if not {"hypotheses", "findings"} <= tables:
             self.close()
@@ -275,10 +353,10 @@ class _LedgerView:
 
 
 def _stored_result(raw, which: str) -> dict | None:
-    """The `result` of a stored test, None when there is none; _CannotJudge when what is stored cannot be read."""
+    """The `result` of a stored test, None when there is none; a fault when what is stored cannot be read."""
     if raw is None:
         return None
-    problem = _CannotJudge(f"the idea ledger's stored {which} result could not be read")
+    problem = _CannotJudge(f"the idea ledger's stored {which} result could not be read", fault=True)
     if not isinstance(raw, str):
         raise problem
     try:
@@ -296,40 +374,59 @@ def _stored_result(raw, which: str) -> dict | None:
 
 
 def _combine(results: list[dict], key: str, pick, at_least: float | None = None):
-    """The larger or lower of the stored figures; None when no result is stored; NaN when one stored figure is unusable."""
-    if not results:
+    """The larger or lower of the stored figures; None when no result stores one (absent or null: no figure, an ordinary
+    reason); NaN when a stored figure is there and unusable (a malformed result, a fault)."""
+    stored = [r.get(key) for r in results if r.get(key) is not None]
+    if not stored:
         return None
-    values = [_real(r.get(key), at_least) for r in results]
+    values = [_real(v, at_least) for v in stored]
     if any(v is None for v in values):
         return float("nan")
     return pick(values)
 
 
 # ---------------------------------------------------------------- the paper record
-def _mentions(e: dict, name: str) -> bool:
-    if e.get("type") == "summary":
-        return isinstance(e.get("strategy_value_change"), dict) and name in e["strategy_value_change"]
-    return e.get("type") in ("decision", "fill") and e.get("strategy") == name
+def _read(directory: Path) -> tuple[list[tuple[str, int, dict]], list[dict]]:
+    """Every entry with its file's day and line number, in date order and each file in the order written; and the lines
+    that are not a complete JSON object, by file and line only (read as `Journal.read` reads them)."""
+    entries: list[tuple[str, int, dict]] = []
+    damaged: list[dict] = []
+    for path in sorted(directory.glob("????-??-??.jsonl")):
+        for number, raw in enumerate(path.read_bytes().split(b"\n"), 1):
+            if not raw.strip():
+                continue
+            try:
+                entry = json.loads(raw)
+            except (ValueError, RecursionError):
+                entry = None
+            if isinstance(entry, dict):
+                entries.append((path.stem, number, entry))
+            else:
+                damaged.append({"file": path.name, "line": number})
+    return entries, damaged
 
 
-def _book_fault(summary: dict, previous: dict | None) -> bool:
-    """True when the book could not be valued on this summary's day: the strategies' value changes do not add up to the
-    book's equity change. This is the only test; a day with a carried price that adds up is judged like any other."""
-    changes = summary.get("strategy_value_change")
-    if not isinstance(changes, dict):
-        return True
-    values = [_real(v) for v in changes.values()]
-    equity = _real(summary.get("equity"))
-    if equity is None or any(v is None for v in values):
-        return True
-    if previous is None:                                  # the book's first day: nothing is held before its orders fill
-        delta, scale = 0.0, abs(equity)
-    else:
-        before = _real(previous.get("equity"))
-        if before is None:
-            return True
-        delta, scale = equity - before, max(abs(equity), abs(before))
-    return abs(sum(values) - delta) > max(CENT, RELATIVE * scale)
+def _valuation(e: dict) -> tuple[float, dict[str, float], float] | None:
+    """The summary's equity, strategy values and capital per strategy, when each is a real finite number (the capital
+    above zero); None otherwise."""
+    equity, capital, values = _real(e.get("equity")), _real(e.get("capital_per_strategy")), e.get("strategy_values")
+    if equity is None or capital is None or capital <= 0 or not isinstance(values, dict):
+        return None
+    out = {}
+    for name, v in values.items():
+        x = _real(v)
+        if x is None:
+            return None
+        out[name] = x
+    return equity, out, capital
+
+
+def _adds_up(now: tuple, then: tuple) -> bool:
+    """The strategies' change in value from `then` to `now` (a strategy absent from one is worth nothing there) equals the
+    book's change in equity, to the larger of a cent and 1e-9 of the equity."""
+    (e1, v1, _), (e0, v0, _) = now, then
+    moved = sum(v1.get(s, 0.0) - v0.get(s, 0.0) for s in sorted(set(v1) | set(v0)))
+    return abs(moved - (e1 - e0)) <= max(CENT, RELATIVE * max(abs(e1), abs(e0)))
 
 
 def _carried_funds(summary: dict) -> set | None:
@@ -364,32 +461,105 @@ def _held_by_day(entries: list[dict]) -> dict[str, dict[str, set]]:
     return out
 
 
-def _returns(summaries: list[dict], name: str, held: dict[str, dict[str, set]], book_first: bool) -> tuple[list[float], int]:
-    """The strategy's daily returns: each day's change over the capital per strategy of the day before (its first day
-    over its own capital), and the number of those days on which a fund it held had a carried price (an unreadable
-    `stale_prices` counts when it held anything). `summaries` starts with the book's summary before the strategy's
-    first day, unless `book_first` (the strategy began on the book's first day). Raises _CannotJudge on a day that
-    cannot be used."""
-    out: list[float] = []
-    carried_days = 0
-    for i, s in enumerate(summaries):
-        if not _mentions(s, name):
-            continue
-        previous = summaries[i - 1] if i > 0 else None
-        if previous is None and not book_first:
-            raise _CannotJudge(f"the book could not be valued on {s['day']}")
-        if _book_fault(s, previous):
-            raise _CannotJudge(f"the book could not be valued on {s['day']}")
-        mine, carried = held.get(s["day"], {}).get(name, set()), _carried_funds(s)
-        carried_days += bool(mine) and (carried is None or bool(carried & mine))
-        capital = _real((previous if out else s).get("capital_per_strategy"))
-        if capital is None or capital <= 0:
-            raise _CannotJudge(f"the day summary of {(previous if out else s)['day']} has no usable capital per strategy")
-        r = float(s["strategy_value_change"][name]) / capital
-        if r <= -1.0:
-            raise _CannotJudge(f"the day summary of {s['day']} shows its whole capital lost")
-        out.append(r)
-    return out, carried_days
+def _mentions(e: dict, name: str) -> bool:
+    if e.get("type") == "summary":
+        return any(isinstance(e.get(k), dict) and name in e[k] for k in ("strategy_values", "strategy_value_change"))
+    return e.get("type") in ("decision", "fill") and e.get("strategy") == name
+
+
+class _Record:
+    """The paper book up to `as_of`, read once: the good summaries in order, the skipped ones by kind, the duplicates
+    set aside, the days whose last readable summary may not be their last, and what is wrong with the latest one."""
+
+    def __init__(self, entries: list[tuple[str, int, dict]], damaged: list[dict], as_of: str, sessions) -> None:
+        by_day: dict[str, list[tuple[int, dict]]] = {}
+        for day, line, e in entries:
+            if e.get("type") == "summary" and day <= as_of:
+                by_day.setdefault(day, []).append((line, e))
+        last_damaged: dict[str, list[int]] = {}
+        for d in damaged:
+            last_damaged.setdefault(d["file"][:-len(".jsonl")], []).append(d["line"])
+        self.uncertain = {day: [n for n in lines if n > max((ln for ln, _ in by_day.get(day, [])), default=0)]
+                          for day, lines in last_damaged.items() if day <= as_of}
+        self.uncertain = {day: lines for day, lines in self.uncertain.items() if lines}
+        self.duplicates = {day: len(items) - 1 for day, items in by_day.items() if len(items) > 1}
+        self.good: list[dict] = []                         # {"day", "equity", "values", "capital", "entry"}
+        self.skipped: list[tuple[str, str]] = []            # (day, kind)
+        for day in sorted(by_day):
+            _, e = max(by_day[day], key=lambda item: item[0])
+            val = _valuation(e) if e.get("day") == day else None
+            if day in self.uncertain:
+                self.skipped.append((day, "damaged line after it"))
+            elif val is None:
+                self.skipped.append((day, "not readable"))
+            elif self.good and not _adds_up(val, (self.good[-1]["equity"], self.good[-1]["values"], self.good[-1]["capital"])):
+                self.skipped.append((day, "does not add up"))
+            else:
+                self.good.append({"day": day, "equity": val[0], "values": val[1], "capital": val[2], "entry": e})
+        self.latest = max(set(by_day) | set(self.uncertain), default=None)
+        self.latest_problem = None
+        if self.latest is not None and not (self.good and self.good[-1]["day"] == self.latest):
+            day = self.latest
+            if day in self.uncertain:
+                lines = ", ".join(f"line {n}" for n in self.uncertain[day])
+                self.latest_problem = (f"the latest day, {day}, may hold a summary that cannot be read: {day}.jsonl {lines} "
+                                       f"could not be read and comes after its last readable summary")
+            else:
+                kind = next(k for d, k in self.skipped if d == day)
+                self.latest_problem = f"the latest day summary, {day}, is not good ({kind})"
+        marks = set(sessions) | set(by_day) | set(self.uncertain)
+        weekdays = {str(d.date()) for d in pd.bdate_range(min(marks), as_of)} if marks else set()
+        if any(day in weekdays and day not in sessions for day in by_day):   # the book trades weekdays the exchange does not
+            marks |= weekdays
+        self._marks = sorted(marks)
+
+    def days_between(self, lo: str, hi: str) -> int:
+        """Days strictly between two summary days that are trading sessions, or have a summary or a damaged line."""
+        return max(0, bisect.bisect_left(self._marks, hi) - bisect.bisect_right(self._marks, lo))
+
+    def path(self, name: str) -> tuple[list[float], list[tuple[int, float, float, float]], list[dict]]:
+        """The strategy's return observations from the values; for each, the days it spans (1, or more for a bridge),
+        its change in value and the capital per strategy at its two ends; and the good summary each ends on."""
+        returns: list[float] = []
+        spans: list[tuple[int, float, float, float]] = []
+        ends: list[dict] = []
+        prev = None
+        for i, g in enumerate(self.good):
+            if name not in g["values"]:
+                continue
+            v = g["values"][name]
+            if prev is not None:
+                moved = v - prev["values"][name]
+                days = 1 + self.days_between(prev["day"], g["day"])
+                own = _real((g["entry"].get("strategy_value_change") or {}).get(name)) if isinstance(
+                    g["entry"].get("strategy_value_change"), dict) else None
+                if days == 1 and own is not None and abs(moved - own) > CENT:   # its own day's change shows a day unseen
+                    days = 2
+                r, span = moved / prev["capital"], (days, moved, prev["capital"], g["capital"])
+            elif i > 0 or v == 0:                           # from nothing: absent before, or the baseline worth nothing
+                r, span = v / g["capital"], (1, v, g["capital"], g["capital"])
+            else:                                           # the baseline holds a history the journal does not: start here
+                prev = g
+                continue
+            if r <= -1.0:
+                raise _CannotJudge(f"the book shows its whole capital lost by {g['day']}", fault=True)
+            returns.append(r)
+            spans.append(span)
+            ends.append(g)
+            prev = g
+        return returns, spans, ends
+
+
+def _bridge_readings(returns: list[float], spans: list[tuple[int, float, float, float]]) -> list[list[float]]:
+    """The record with each bridge of k days spread evenly into k equal parts of its change in value, over the capital
+    per strategy at either end of the bridge (the capital inside it is not known): two readings."""
+    out = []
+    for end in (2, 3):
+        series: list[float] = []
+        for r, (k, moved, *capital) in zip(returns, spans):
+            series.extend([r] if k == 1 else [moved / capital[end - 2] / k] * k)
+        out.append(series)
+    return out
 
 
 _CALENDAR: list = []
@@ -418,36 +588,40 @@ def _clean(x):
 
 # ---------------------------------------------------------------- the check
 def check(ledger_path, journal: Journal, as_of=None, apply: bool = False, strategies: dict[int, str] | None = None) -> dict:
-    """Judge every strategy in the paper book as of `as_of` (default: the last day summary in the journal).
-    `strategies` maps hypothesis id to strategy name; by default it is read from the journal's decisions, together
-    with every idea the ledger says is trading. Report-only reads the ledger read-only and writes nothing. With
-    `apply`, holds the monitor's lock, pauses what should be paused and journals the check once a day. Raises
-    CheckCannotRun (CheckBusy when another run holds the lock) when the check itself cannot run."""
-    view = _LedgerView(ledger_path)                       # a bad ledger stops the check before anything is created
-    try:
-        if not apply:
+    """Judge every strategy in the paper book as of `as_of` (default: the last day in the journal with a summary, or
+    with a damaged line after its last summary). `strategies` maps hypothesis id to strategy name; by default it is
+    read from the journal's decisions, together with every idea the ledger says is trading. Report-only reads the
+    ledger read-only and writes nothing. With `apply`, holds the monitor's lock, lets SQLite recover a write left
+    unfinished in the ledger, pauses what should be paused and journals the check once a day. Raises CheckCannotRun
+    (CheckBusy when another run holds the lock) when the check itself cannot run."""
+    _ledger_file(ledger_path)                             # a missing ledger stops the check before anything is created
+    if not apply:
+        view = _LedgerView(ledger_path)
+        try:
             return _check(view, ledger_path, journal, as_of, False, strategies)
-        with run_lock(journal.dir):
+        finally:
+            view.close()
+    with run_lock(journal.dir):
+        _recover(ledger_path)
+        view = _LedgerView(ledger_path)
+        try:
             return _check(view, ledger_path, journal, as_of, True, strategies)
-    finally:
-        view.close()
+        finally:
+            view.close()
 
 
 def _check(view: _LedgerView, ledger_path, journal: Journal, as_of, apply: bool, strategies) -> dict:
-    everything = journal.read()                           # skips damage: used only to find who traded, from when, and holdings
-    undated = sum(1 for e in everything if _date(e.get("day")) is None)
-    dated = [e for e in everything if _date(e.get("day")) is not None]
+    entries, damaged = _read(journal.dir)
+    undated = sum(1 for _, _, e in entries if _date(e.get("day")) is None)
     if as_of is None:
-        found = [e["day"] for e in dated if e.get("type") == "summary"]
+        summary_days = {day for day, _, e in entries if e.get("type") == "summary"}
+        found = summary_days | {d["file"][:-len(".jsonl")] for d in damaged}
+        latest = max(summary_days, default=None)
+        found = {d for d in found if latest is None or d >= latest}      # a damaged day after the last summary counts
         as_of = max(found) if found else str(pd.Timestamp.today().date())
     as_of = str(pd.Timestamp(as_of).date())
-    try:                                                  # the as-of file holds this check's own entry: it must be whole
-        today = journal.read_complete(since=as_of, until=as_of)
-    except JournalDamaged as exc:
-        raise CheckCannotRun(f"the journal file for {as_of} has a line that is not a complete entry ({describe_skipped(exc.skipped)}); "
-                             "the check cannot tell whether it already ran that day") from None
-    already = any(e.get("type") == "decay_check" for e in today)
-    readable = [e for e in dated if e["day"] <= as_of]
+    readable = [e for day, _, e in entries if day <= as_of and _date(e.get("day")) is not None]
+    already = any(e.get("type") == "decay_check" for day, _, e in entries if day == as_of)
     ideas = view.ideas()
 
     skipped_files: list[str] = []
@@ -467,25 +641,58 @@ def _check(view: _LedgerView, ledger_path, journal: Journal, as_of, apply: bool,
     else:
         names = {int(k): v for k, v in strategies.items()}
 
-    summary_days = [e["day"] for e in readable if e.get("type") == "summary"]
+    lo = min((e["day"] for e in readable), default=as_of)
+    sessions, calendar_note = _sessions(min(lo, as_of), as_of)
+    record = _Record(entries, damaged, as_of, sessions)
     held = _held_by_day(readable)
     files = {p.stem for p in journal.dir.glob("????-??-??.jsonl")}
-    calendar_note = None
 
     rows = []
     for hid in sorted(names):
         name = names[hid]
-        row = {"hypothesis_id": hid, "strategy": name, "status": None, "days": 0, "days_missing": None, "days_with_carried_price": None, "first_day": None,
-               "live_sharpe": None, "live_max_drawdown": None, "backtest_sharpe": None, "backtest_max_drawdown": None,
-               "backtest_sources": [], "drawdown_limit": None, "sharpe_limit": None, "sharpe_decides": False, "traded": None,
-               "decision": None, "reason": ""}
+        row = {"hypothesis_id": hid, "strategy": name, "status": None, "days": 0, "days_missing": None,
+               "days_with_carried_price": None, "days_bridged": 0, "summaries_skipped": {}, "duplicates_set_aside": 0,
+               "first_day": None, "live_sharpe": None, "live_max_drawdown": None, "live_sharpe_bridges_spread": None,
+               "live_max_drawdown_bridges_spread": None, "backtest_sharpe": None, "backtest_max_drawdown": None,
+               "backtest_sources": [], "drawdown_limit": None, "sharpe_limit": None, "sharpe_decides": False,
+               "traded": None, "decision": None, "reason": "", "fault": False}
         rows.append(row)
         idea = ideas.get(hid)
         if idea is None:
-            row.update(decision="cannot judge", reason=f"hypothesis {hid} is not in the idea ledger")
+            row.update(decision="cannot judge", reason=f"hypothesis {hid} is not in the idea ledger", fault=True)
             continue
         row["status"] = idea["status"]
-        problem = None
+        problem = None                                    # (text, fault)
+        returns: list[float] = []
+        spans: list[tuple[int, float, float, float]] = []
+        try:                                              # the paper figures first: shown even when the idea cannot be read
+            first = min((e["day"] for e in readable if name and _mentions(e, name)), default=None)
+            if first is None:
+                raise _CannotJudge(f"0 paper days; at least {MIN_DAYS} are needed")
+            row["first_day"] = first
+            row["days_missing"] = sum(1 for d in sessions if first <= d and d not in files)
+            skipped = [kind for day, kind in record.skipped if day >= first]
+            row["summaries_skipped"] = {k: skipped.count(k) for k in KINDS if k in skipped}
+            row["duplicates_set_aside"] = sum(n for day, n in record.duplicates.items() if day >= first)
+            returns, spans, ends = record.path(name)
+            row["days"], row["days_bridged"] = len(returns), sum(s[0] - 1 for s in spans)
+            row["days_with_carried_price"] = 0
+            for g in ends:
+                mine, carried = held.get(g["day"], {}).get(name, set()), _carried_funds(g["entry"])
+                row["days_with_carried_price"] += bool(mine) and (carried is None or bool(carried & mine))
+            if len(returns) < MIN_DAYS:
+                lost = len(skipped)
+                text = f"{len(returns)} paper day{'s' if len(returns) != 1 else ''}; at least {MIN_DAYS} are needed"
+                raise _CannotJudge(text + (f", and its stretch holds fewer than two good summaries ({lost} skipped)" if lost else ""),
+                                   fault=bool(lost))
+            row["live_sharpe"], row["live_max_drawdown"] = annualised_sharpe(returns), worst_fall(returns)
+            row["traded"] = has_traded(returns)
+            if any(s[0] > 1 for s in spans):              # each bridge also read spread evenly over its days: the most
+                readings = _bridge_readings(returns, spans)   # favourable of those readings is what a pause must also clear
+                row["live_sharpe_bridges_spread"] = max(annualised_sharpe(s) for s in readings)
+                row["live_max_drawdown_bridges_spread"] = min(worst_fall(s) for s in readings)
+        except _CannotJudge as exc:
+            problem = (str(exc), exc.fault)
         bt_sharpe = bt_drawdown = None
         try:
             stored = [(label, _stored_result(idea[col], label)) for label, col in
@@ -495,41 +702,32 @@ def _check(view: _LedgerView, ledger_path, journal: Journal, as_of, apply: bool,
             bt_drawdown = _combine(results, "max_drawdown", max, at_least=0.0)
             bt_sharpe = _combine(results, "sharpe", min)
             row["backtest_max_drawdown"], row["backtest_sharpe"] = _real(bt_drawdown), _real(bt_sharpe)
-            first = min((e["day"] for e in readable if name and _mentions(e, name)), default=None)
-            if first is None:
-                raise _CannotJudge(f"0 paper days; at least {MIN_DAYS} are needed")
-            row["first_day"] = first
-            sessions, calendar_note = _sessions(first, as_of)
-            row["days_missing"] = sum(1 for d in sessions if d not in files)
-            before = [d for d in summary_days if d < first]
-            try:
-                stretch = journal.read_complete(since=before[-1] if before else first, until=as_of)
-            except JournalDamaged as exc:
-                raise _CannotJudge(f"the journal is damaged in the stretch it needs ({describe_skipped(exc.skipped)})") from None
-            summaries = [e for e in stretch if e.get("type") == "summary" and _date(e.get("day")) is not None]
-            returns, row["days_with_carried_price"] = _returns(summaries, name, held, book_first=not before)
-            row["days"] = len(returns)
-            if len(returns) < MIN_DAYS:
-                raise _CannotJudge(f"{len(returns)} paper day{'s' if len(returns) != 1 else ''}; at least {MIN_DAYS} are needed")
-            row["live_sharpe"], row["live_max_drawdown"] = annualised_sharpe(returns), worst_fall(returns)
-            row["traded"] = has_traded(returns)
-            spread = _has_spread(returns)
         except _CannotJudge as exc:
-            problem = str(exc)
+            problem = (str(exc) + (f"; {problem[0]}" if problem else ""), exc.fault or bool(problem and problem[1]))
         if idea["status"] not in TRADING:
             unrecorded = idea["status"] == "paused" and not view.pause_reason_recorded(hid)
             row.update(decision="paused, reason not recorded" if unrecorded else "left alone",
-                       reason=f"its status is {idea['status']}; this monitor never changes it" + (f" ({problem})" if problem else ""))
+                       reason=f"its status is {idea['status']}; this monitor never changes it" + (f" ({problem[0]})" if problem else ""))
             continue
         if problem:
-            row.update(decision="cannot judge", reason=problem)
+            row.update(decision="cannot judge", reason=problem[0], fault=problem[1])
             continue
         verdict = judge(row["live_sharpe"], row["live_max_drawdown"], row["days"], bt_sharpe, bt_drawdown,
-                        traded=row["traded"], spread=spread)
+                        traded=row["traded"], spread=_has_spread(returns), spread_sharpe=row["live_sharpe_bridges_spread"],
+                        spread_drawdown=row["live_max_drawdown_bridges_spread"])
+        unusable = any(v is not None and _real(v, low) is None for v, low in ((bt_drawdown, 0.0), (bt_sharpe, None)))
         row.update(decision=verdict["decision"], reason="; ".join(verdict["reasons"]),
                    drawdown_limit=verdict["rules"]["drawdown"]["limit"], sharpe_limit=verdict["rules"]["sharpe"]["limit"],
-                   sharpe_decides=verdict["rules"]["sharpe"]["decides"])
+                   sharpe_decides=verdict["rules"]["sharpe"]["decides"], fault=verdict["decision"] == "cannot judge" and unusable)
+        if record.latest_problem and row["decision"] == "keep":   # judged only to the last good summary: that is no keep
+            upto = record.good[-1]["day"] if record.good else "no good summary"
+            row.update(decision="cannot judge", fault=True, reason=f"{record.latest_problem}; up to {upto}: {row['reason']}")
 
+    responsible = [r for r in rows if r["status"] in TRADING or r["status"] is None]
+    faults = [f"h{r['hypothesis_id']}: {r['reason']}" for r in rows if r["fault"]]
+    if record.latest_problem:
+        faults.insert(0, record.latest_problem)
+    nothing = bool(responsible) and not any(r["decision"] in ("keep", "pause") for r in responsible)
     to_pause = [r["hypothesis_id"] for r in rows if r["decision"] == "pause"]
     paused: list[int] = []
     written = False
@@ -549,12 +747,14 @@ def _check(view: _LedgerView, ledger_path, journal: Journal, as_of, apply: bool,
             journal.write(as_of, _clean({"type": "decay_check", "as_of": as_of,
                                          "rules": {"drawdown_multiple": DRAWDOWN_MULTIPLE, "sharpe_fraction": SHARPE_FRACTION,
                                                    "min_days_for_sharpe": MIN_DAYS_FOR_SHARPE},
-                                         "strategies": rows, "paused": paused}))
+                                         "strategies": rows, "paused": paused, "faults": faults}))
             written = True
+    code = 2 if (faults or nothing) else 1 if (to_pause or paused) else 0
     return _clean({"as_of": as_of, "strategies": rows, "to_pause": to_pause, "paused": paused, "journal_entry_written": written,
                    "skipped_decision_lines": {"count": len(skipped_files), "files": sorted(set(skipped_files))},
-                   "entries_without_a_date": undated, "calendar_note": calendar_note,
-                   "exit_code": 1 if (to_pause or paused) else 0})
+                   "entries_without_a_date": undated, "calendar_note": calendar_note, "unreadable_lines": damaged,
+                   "latest_summary": {"day": record.latest, "good": record.latest_problem is None},
+                   "faults": faults, "nothing_judged": nothing, "exit_code": code})
 
 
 # ---------------------------------------------------------------- the command
@@ -566,9 +766,14 @@ def _line(r: dict) -> str:
         return "n/a" if x is None else f"{x:.2f}"
     missing = "n/a" if r["days_missing"] is None else r["days_missing"]
     carried = "n/a" if r["days_with_carried_price"] is None else r["days_with_carried_price"]
+    kinds = r["summaries_skipped"]
+    skipped = f"{sum(kinds.values())}" + (f" ({', '.join(f'{k}: {kinds[k]}' for k in KINDS if k in kinds)})" if kinds else "")
     return (f"h{r['hypothesis_id']} {r['strategy'] or '(no paper record)'} [{r['status']}]: {r['decision'].upper()}; "
-            f"{r['days']} paper days, days missing: {missing}, days with a carried price: {carried}, Sharpe {num(r['live_sharpe'])} (backtest {num(r['backtest_sharpe'])}), "
-            f"worst fall {pct(r['live_max_drawdown'])} (backtest {pct(r['backtest_max_drawdown'])}); {r['reason']}")
+            f"{r['days']} paper days, days missing: {missing}, days with a carried price: {carried}, "
+            f"days bridged: {r['days_bridged']}, summaries skipped: {skipped}, "
+            f"duplicate summaries set aside: {r['duplicates_set_aside']}, Sharpe {num(r['live_sharpe'])} "
+            f"(backtest {num(r['backtest_sharpe'])}), worst fall {pct(r['live_max_drawdown'])} "
+            f"(backtest {pct(r['backtest_max_drawdown'])}); {r['reason']}")
 
 
 def main(argv=None, paths: LoopPaths | None = None) -> int:
@@ -593,6 +798,9 @@ def main(argv=None, paths: LoopPaths | None = None) -> int:
         print(f"the check could not run: {type(exc).__name__}{where}", file=sys.stderr)
         return 2
     print(f"decay check as of {out['as_of']}" + (" (applied)" if args.apply else " (report only)"))
+    if out["unreadable_lines"]:
+        lines = out["unreadable_lines"]
+        print(f"journal lines that could not be read (ignored): {len(lines)} ({describe_skipped(lines, limit=len(lines))})")
     skipped = out["skipped_decision_lines"]
     if skipped["count"]:
         print(f"decision lines skipped (idea number not a whole number): {skipped['count']} ({', '.join(skipped['files'])})")
@@ -608,6 +816,10 @@ def main(argv=None, paths: LoopPaths | None = None) -> int:
         print("paused: " + ", ".join(f"h{h}" for h in out["paused"]))
     elif out["to_pause"]:
         print("to pause (run with --apply): " + ", ".join(f"h{h}" for h in out["to_pause"]))
+    for f in out["faults"]:
+        print(f"fault: {f}", file=sys.stderr)
+    if out["nothing_judged"]:
+        print("nothing was judged: strategies are trading and not one of them could be judged", file=sys.stderr)
     return int(out["exit_code"])
 
 
