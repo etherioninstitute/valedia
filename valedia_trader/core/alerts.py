@@ -398,7 +398,8 @@ def clean(text, limit: int = 300) -> str:
        rev 3's are both run over the same text, each in its own order (tags, ids, digits, ids again), and a character either
        hides is hidden; an id either would have found before the guard, or with the text spaced as they gave it to the guard,
        is shortened wherever it stands;
-    5. the guard again, over the result;
+    5. the guard again, over the result (a second line of defence that no known input needs: none is known on which it
+       changes the output);
     6. if step 1 cut the text, its tail is dropped: at least the last TAIL (600) characters, and never less than the longest
        value registered from the trading file, back to the start of a token; every step before is one that never lengthens a
        text, so whatever came from the part near the cut is in that tail, and nothing that lay across the cut shows a part;

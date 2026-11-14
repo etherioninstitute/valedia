@@ -7,6 +7,7 @@ hostile markup, a made-up secret and a made-up account number, and the page is c
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -819,7 +820,7 @@ def test_the_open_alerts_say_whether_each_was_shown(world):
     assert "Notification" in world.page().sections["Health"] and "shown" in world.page().sections["Health"]
 
 
-def test_a_ledger_tag_in_the_order_tables_is_shown_as_the_random_tail_and_its_fund(world):
+def test_a_ledger_tag_in_the_order_tables_is_shown_by_its_last_four_characters_only(world):
     tag = "os-20261113-143501-a1b2c3-XLE"
     db = sqlite3.connect(world.ledger_path)
     db.execute("INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES (?, 'XLE', 5, 60.0, 'accepted', ?, ?)",
@@ -828,7 +829,7 @@ def test_a_ledger_tag_in_the_order_tables_is_shown_as_the_random_tail_and_its_fu
     db.commit()
     db.close()
     html = world.html()
-    assert tag not in html and "a1b2c3" not in html and html.count("…b2c3-XLE") >= 2
+    assert tag not in html and "a1b2c3" not in html and "b2c3" not in html and html.count("…-XLE") >= 2   # fund: own column
 
 
 # =====================================================================================================================
@@ -1014,3 +1015,91 @@ def test_an_order_tag_that_is_or_holds_a_value_shows_no_part_of_it(bare_world, t
     broker = Page(html).sections["Broker (paper)"]
     assert any_part(html) == [] and any_part(said) == [], any_part(html)
     assert broker.count("<number>") + broker.count("<secret>") >= 2 * len(tags)               # each tag, in both tables, by its mask
+
+
+# =====================================================================================================================
+# rev 6: an order is shown by its mask alone or by its last 4 characters, never by anything else of its tag
+# =====================================================================================================================
+
+MASKS = ("<secret>", "<number>", "<held>")
+HEXD = "0123456789abcdef"
+FUNDS = ["XLE", "SPY", "BRK.B", "BTC-USD", "QQQ", "IWM"]
+EXAMPLES = ["client-ABCDEF-7f3a9c2e-123456789012", "webull-ord-9f8e7d6c5b4a-555666777888", "valedia-20261113-123456789-XLE"]
+
+
+def generated_tags(rng, n):
+    """Order tags of every shape the trader, its brokers and its clients write, with long digit runs, hex runs, dates, fund
+    symbols and the trading file's values, whole and inside."""
+    def digits(a, b):
+        return "".join(rng.choice("0123456789") for _ in range(rng.randint(a, b)))
+
+    def hexes(a, b):
+        return "".join(rng.choice(HEXD) for _ in range(rng.randint(a, b)))
+
+    def alnum(a, b):
+        return "".join(rng.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz0123456789") for _ in range(rng.randint(a, b)))
+
+    values = [TRADING["BROKER_API_KEY"], TRADING["BROKER_API_SECRET"], TRADING["WEBULL_ACCOUNT_ID"], "_".join(PHRASE.split()),
+              "-".join(PHRASE.split()), TRADING["BROKER_API_KEY"].lower(), TRADING["BROKER_API_SECRET"].upper()]
+    day = lambda: f"2026{rng.randint(1, 12):02d}{rng.randint(1, 28):02d}"                 # noqa: E731
+    shapes = [
+        lambda: f"os-{day()}-{rng.randint(100000, 235959)}-{hexes(6, 6)}" + rng.choice(["", "-" + rng.choice(FUNDS)]),
+        lambda: f"os-{day()}-{rng.randint(100000, 235959)}-{alnum(4, 9)}-{rng.choice(FUNDS)}",
+        lambda: f"client-{alnum(4, 8)}-{hexes(6, 10)}-{digits(9, 16)}",
+        lambda: f"webull-ord-{hexes(8, 16)}-{digits(9, 14)}",
+        lambda: f"valedia-{day()}-{digits(6, 12)}-{rng.choice(FUNDS)}",
+        lambda: digits(9, 20),
+        lambda: "-".join(digits(3, 4) for _ in range(rng.randint(3, 5))),
+        lambda: hexes(8, 32),
+        lambda: f"{rng.choice(['paper', 'live', 'ord', 'client'])}-{alnum(4, 12)}-{digits(1, 8)}",
+        lambda: f"{day()[:4]}-{day()[4:6]}-{day()[6:]}-{rng.choice(FUNDS)}",
+        lambda: rng.choice(FUNDS) + "-" + alnum(1, 6),
+        lambda: rng.choice(values),
+        lambda: rng.choice(["paper-", "ord-", "x", ""]) + rng.choice(values) + rng.choice(["-0007", "-XLE", "", "_9"]),
+        lambda: f"{alnum(2, 6)}-{digits(9, 12)}-{alnum(2, 6)}",
+        lambda: alnum(1, 4),
+    ]
+    return [rng.choice(shapes)() for _ in range(n)] + EXAMPLES
+
+
+def test_short_id_is_the_mask_alone_or_the_ellipsis_and_the_last_four_characters_for_generated_tags(bare_world, trading_file):
+    al.register_trading_file(bare_world.env())
+    tags = generated_tags(random.Random(66), 10000)
+    masked = 0
+    for tag in tags:
+        out = op.short_id(tag)
+        found = re.search("|".join(map(re.escape, MASKS)), al.clean(tag, 400))
+        if found:
+            masked += 1
+            assert out == found.group(), (tag, out)                                         # the mask alone
+        else:
+            assert out == "…" + tag[-4:], (tag, out)                                        # the last 4 characters only
+    assert [op.short_id(t) for t in EXAMPLES] == ["<number>"] * 3
+    assert masked > 2000 and len(tags) - masked > 2000                                       # both kinds were met
+    assert op.short_id("os-20261113-143501-a1b2c3-XLE") == "…-XLE"
+    assert [op.short_id(t) for t in ("abcd", "ab", "", None, 12345)] == ["…abcd", "…ab", "…", "…None", "…2345"]  # as in rev 4
+
+
+def grams(text, n=5):
+    low = text.lower()
+    return {low[i:i + n] for i in range(len(low) - n + 1)}
+
+
+def test_no_five_characters_of_any_order_tag_reach_the_page(bare_world, trading_file, capsys):
+    w = bare_world
+    base, _ = build_real(w, capsys)
+    tags = sorted(set(generated_tags(random.Random(67), 10000)))
+    db = sqlite3.connect(w.ledger_path)
+    for i, tag in enumerate(tags):
+        db.execute("INSERT INTO orders (tag, symbol, units, reference_price, state, created, updated) VALUES (?, 'XLE', 1, 1.0, 'accepted', ?, ?)",
+                   (tag, NOW - 100, NOW - 90))
+        db.execute("INSERT INTO fills (tag, symbol, units, price, fee, time, applied) VALUES (?, 'XLE', 1, 1.0, 0.0, ?, 1)", (tag, NOW - 80))
+    db.commit()
+    db.close()
+    html, said = build_real(w, capsys)
+    assert html.count("<tr>") >= 2 * len(tags)                                               # every planted tag is in both tables
+    page = grams(html) | grams(said)
+    known = grams(base)                                                                      # the page's own words and numbers
+    shown = sorted({(t, t.lower()[i:i + 5]) for t in tags for i in range(len(t) - 4)
+                    if t.lower()[i:i + 5] in page and t.lower()[i:i + 5] not in known})
+    assert shown == [], shown[:10]

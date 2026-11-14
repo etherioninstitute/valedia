@@ -131,16 +131,13 @@ def newest_text(candidates) -> str:
 
 
 def short_id(tag) -> str:
-    """An order is shown by the last 4 characters of its id only: `…0007`. A ledger tag (`os-20261113-143501-a1b2c3-XLE`) by the
-    last 4 of its random part and its fund: `…b2c3-XLE`. A tag that is, or holds, something the cleaning masks (a value of the
-    trading file, a long run or groups of digits) is shown only as the cleaning shows it (`<secret>`, `<number>`): its last 4
-    characters may be the last 4 of that value."""
+    """An order is shown by one of two things only, never by anything else of its tag: the mask alone (`<secret>`, `<number>`
+    or `<held>`, the first one in it) when cleaning the tag puts any mask in it, or else `…` and the tag's last 4 characters
+    (`…0007`; a ledger tag `os-20261113-143501-a1b2c3-XLE` is `…-XLE`, its fund shown in its own column)."""
     text = str(tag)
     cleaned = al.clean(text, 400)
-    if any(mark in cleaned for mark in ("<secret>", "<number>", al.HELD)):
-        return cleaned
-    shaped = al.hide_order_ids(text)
-    return shaped if shaped != text else "…" + text[-4:]
+    found = [(cleaned.find(mark), mark) for mark in ("<secret>", "<number>", al.HELD) if mark in cleaned]
+    return min(found)[1] if found else "…" + text[-4:]
 
 
 def table(headers: list[str], rows: list[list[str]]) -> str:

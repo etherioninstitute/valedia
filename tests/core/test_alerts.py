@@ -2214,3 +2214,53 @@ def test_a_stop_of_an_earlier_day_is_over_when_the_day_passes(world):
     tomorrow = world.env()
     tomorrow.now = NOW + 86400
     assert [c.key for c in al.watch(tomorrow).cleared if c.key.startswith("step-stopped")] == ["step-stopped:webull-sandbox"]
+
+
+# =====================================================================================================================
+# rev 6: the tail dropped at the raw bound, pinned by what it must hide (not by the module's own constant)
+# =====================================================================================================================
+
+LONG_PHRASE = ("counterrevolutionaries incomprehensibilities electroencephalographs uncharacteristically internationalizations "
+               "disproportionateness interdenominational institutionalization overintellectualizing compartmentalization "
+               "misinterpretations antiestablishmentarian")                    # 12 words of 18 to 22 letters
+KNOWN_PHRASE = ("photosynthesizingly thermoluminescences crystallographically spectrophotometrical ultramicroscopically "
+                "hypercholesterolemia immunohistochemistry neuropharmacologists otorhinolaryngology psychophysiologically "
+                "radiotelegraphically superconductivities")                    # 12 more, known to the guard by remember()
+RAW_OFFSETS = range(-300, 51)                                                  # fixed: never read from the module
+
+
+def slide_across_the_raw_bound(value):
+    """Every offset from 300 characters before the raw bound to 50 after it, behind padding that cleaning removes: what is
+    shown beyond the masks and the filler (nothing, when the tail dropped at the raw bound is long enough)."""
+    shown = []
+    for limit in (120, 300):
+        raw_max = max(20 * limit, 4096)
+        for d in RAW_OFFSETS:
+            out = al.clean(" " * (raw_max + d) + value + " " + FILLER * 300, limit)
+            if beyond_masks(out, []):
+                shown.append((limit, d, out[:60]))
+    return shown
+
+
+def test_a_long_registered_phrase_and_the_longest_registered_value_slid_across_the_raw_bound_show_nothing(world, tmp_path, monkeypatch):
+    """The guard matches a phrase only from 4 words on: up to 3 words and a part of the 4th (here up to 88 characters) of a
+    phrase cut by the raw bound pass it, and only the tail dropped at the raw bound hides them."""
+    f = tmp_path / "long-trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in {**TRADING, "WALLET_MNEMONIC": LONG_PHRASE}.items()))
+    os.chmod(f, 0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    al.register_trading_file(world.env())
+    longest = max((v for k, v in TRADING.items() if k != "WALLET_MNEMONIC"), key=len)
+    assert len(LONG_PHRASE) > len(longest)                                     # the long phrase is the longest registered value
+    assert s.redact(" ".join(LONG_PHRASE.split()[:3]))[1] == 0                 # three words alone pass the guard
+    assert slide_across_the_raw_bound(LONG_PHRASE) == []
+    assert slide_across_the_raw_bound("  ".join(LONG_PHRASE.split())) == []
+
+
+def test_a_long_phrase_the_guard_knows_from_elsewhere_slid_across_the_raw_bound_shows_nothing(monkeypatch):
+    """A phrase the guard was given by another way (`remember`, as `load_env` does for any command), in a run that registered
+    no trading file: the tail must hide its part that lay across the raw bound by its own size."""
+    monkeypatch.setitem(al._registered, "longest", 0)                          # no trading file registered in this run
+    s.remember(KNOWN_PHRASE)
+    assert s.redact(" ".join(KNOWN_PHRASE.split()[:4]))[1] == 1 and s.redact(" ".join(KNOWN_PHRASE.split()[:3]))[1] == 0
+    assert slide_across_the_raw_bound(KNOWN_PHRASE) == []
