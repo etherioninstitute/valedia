@@ -317,9 +317,10 @@ def test_a_done_run_carrying_a_fault_is_a_fault(faults):
     assert kinds(sl.session_facts([summ(TODAY, faults=faults)], LIVE, CAL)) == [(TODAY, "fault")]
 
 
-def test_an_empty_or_absent_faults_list_is_clean():
+def test_an_empty_faults_list_or_no_faults_key_is_clean_and_a_null_one_is_a_fault():          # F4
     assert kinds(sl.session_facts([summ(TODAY, faults=[])], LIVE, CAL)) == [(TODAY, "clean")]
-    assert kinds(sl.session_facts([summ(TODAY, faults=None)], LIVE, CAL)) == [(TODAY, "clean")]
+    assert kinds(sl.session_facts([summ(TODAY)], LIVE, CAL)) == [(TODAY, "clean")]
+    assert kinds(sl.session_facts([summ(TODAY, faults=None)], LIVE, CAL)) == [(TODAY, "fault")]
 
 
 def test_drift_does_not_act_while_the_constant_is_false(monkeypatch):
@@ -587,11 +588,12 @@ def test_a_skipped_session_neither_counts_nor_resets():
     assert shape(pos(facts)) == ("ticket", 500.0, 19, 20, False)
 
 
-def test_a_pause_with_no_reset_is_paused_and_nothing_counts():
+def test_a_pause_with_no_reset_is_paused_no_clean_session_counts_and_faults_still_halve():
     days = Days()
-    facts = run(days, ["clean"] * 5) + [F("pause", days())] + run(days, ["clean"] * 100 + ["fault"] * 3)
-    p = pos(facts)
-    assert shape(p) == ("ticket", 500.0, 5, 20, True)
+    facts = run(days, ["clean"] * 5) + [F("pause", days())] + run(days, ["clean"] * 100)
+    assert shape(pos(facts)) == ("ticket", 500.0, 5, 20, True)
+    facts += run(days, ["fault"] * 3)                                     # F1: a fault halves on any day
+    assert shape(pos(facts)) == ("ticket", 62.5, 0, 20, True)
 
 
 def test_the_session_of_the_pause_day_and_of_the_reset_day_do_not_count():
@@ -1074,7 +1076,8 @@ def test_property_e3_the_stake_never_exceeds_the_days_ceiling_and_no_ceiling_nev
 
 
 def reference_a1(facts, first, cap):
-    """Addendum-1's walk, kept as the reference for (e4): one ceiling for the whole history, clamped at every step."""
+    """Addendum-1's walk, kept as the reference for (e4): one ceiling for the whole history, clamped at every step;
+    since addendum 3 (F1) with its fault rule: a fault halves on any day, and a day's sessions come before its events."""
     mode, stake, clean, needed, paused = "ticket", min(first, cap), 0, sl.TICKET_SESSIONS, False
     groups = {}
     for f in facts:
@@ -1082,6 +1085,7 @@ def reference_a1(facts, first, cap):
     for day in sorted(groups):
         group = groups[day]
         counts = not paused and not any(f.kind == "pause" for f in group)
+        group = [f for f in group if f.kind in sl.SESSION_KINDS] + [f for f in group if f.kind in sl.EVENT_KINDS]
         for f in group:
             if f.kind == "pause":
                 paused = True
@@ -1094,10 +1098,10 @@ def reference_a1(facts, first, cap):
                     needed = sl.DOUBLING_SESSIONS if stake > first else sl.UNATTENDED_SESSIONS
                 elif mode == "unattended":
                     mode, needed = "ticket", sl.TICKET_SESSIONS
-            elif not counts or f.kind == "skipped":
-                continue
             elif f.kind == "fault":
                 stake, clean = stake / 2, 0
+            elif not counts or f.kind == "skipped":
+                continue
             else:
                 clean += 1
                 if clean < needed:
@@ -1333,10 +1337,16 @@ def test_describe_when_the_file_says_no_fractions_or_no_unattended():
 
 def test_describe_when_paused_and_after_a_change():
     days = Days()
-    p = pos(run(days, ["clean"] * 20 + ["fault"]) + [F("pause", days())])
-    text = lines_ok(sl.describe(p, sl.working_stop_pct([], 2.0), LADDER, 1))
-    assert "paused" in text and "reset" in text and "--who" in text
-    assert "a fault session" in text or "pause" in text
+    facts = run(days, ["clean"] * 20 + ["fault"])
+    d = days()
+    p = pos(facts + [F("pause", d)])
+    lines = sl.describe(p, sl.working_stop_pct([], 2.0), LADDER, 1)
+    text = lines_ok(lines)
+    assert "paused since " + d.isoformat() in text and sl.RESET_COMMAND in text                 # paused
+    assert f"last change: {d.isoformat()}: the 25% drawdown pause" in text                     # after a change
+    q = pos(facts)
+    assert any(line.startswith(f"last change: {facts[-1].day.isoformat()}: a fault session")
+               for line in sl.describe(q, None, LADDER, 1))
 
 
 def test_a3_describe_says_paused_since_when_and_that_only_the_owners_reset_clears_it():
@@ -1361,3 +1371,182 @@ def test_describe_refuses_a_count_that_is_not_a_whole_number():
     for bad in (True, -1, 1.0, None):
         with pytest.raises(ValueError):
             sl.describe(None, None, None, bad)
+
+
+# ------------------------------------------------------------------ addendum 3: the blind check's findings
+def test_f1_a_fault_then_a_pause_the_same_day_halves_then_the_reset_steps_down():
+    days = Days()
+    facts = run(days, ["clean"] * 120, ceiling=1e6)                            # unattended at 400
+    assert pos(facts, 100, 1e6).earned == 400.0
+    d = days()
+    same_day = facts + [F("fault", d), F("pause", d), F("reset", days())]
+    assert shape(pos(same_day, 100, 1e6)) == ("unattended", 100.0, 0, 40, False)     # 400, 200, then 100
+    earlier = facts + [F("fault", d), F("pause", days()), F("reset", days())]
+    assert shape(pos(earlier, 100, 1e6)) == shape(pos(same_day, 100, 1e6))
+    journal = [summ(x) for x in sessions_from(FIRST, 120)]                     # the same through session_facts
+    fd = sessions_from(FIRST, 122)[120]
+    journal += [stop(fd, "reconcile", timestamp=f"{fd}T14:00:00+00:00"), pause(fd, ts="15:00:00"),
+                reset(sessions_from(FIRST, 122)[121])]
+    assert shape(sl.position(sl.session_facts(journal, LIVE, CAL), 100, 1e6)) == ("unattended", 100.0, 0, 40, False)
+
+
+def test_f1_a_reset_in_the_morning_and_a_fault_in_the_afternoon_of_one_day():
+    days = Days()
+    facts = run(days, ["clean"] * 120) + [F("pause", days())]                  # paused at 400
+    d = days()
+    p = pos(facts + [F("reset", d), F("fault", d)], 100, 1e6)                  # the fault first, then the reset
+    assert shape(p) == ("unattended", 100.0, 0, 40, False)
+
+
+def test_f1_a_fault_wholly_inside_a_pause_and_two_fault_days_inside_one_pause():
+    days = Days()
+    facts = run(days, ["clean"] * 120) + [F("pause", days())] + run(days, ["clean"] * 5)
+    one = facts + run(days, ["fault"])
+    assert shape(pos(one, 100, 1e6)) == ("unattended", 200.0, 0, 60, True)
+    two = one + run(days, ["clean", "fault"])
+    assert shape(pos(two, 100, 1e6)) == ("unattended", 100.0, 0, 60, True)
+    assert shape(pos(two + [F("reset", days())], 100, 1e6)) == ("ticket", 100.0, 0, 20, False)
+
+
+def reference_f1(facts, first, cap):
+    """An independent walk of the rules as they now stand (A1, A4, F1), position after each day: per day, every
+    session clamps the earned stake to its ceiling, a fault halves it and zeroes the count on any day, a clean one
+    counts only on a day that neither starts paused nor holds a pause; then the day's pauses and resets in order."""
+    mode, e, clean, needed, paused, out = "ticket", float(first), 0, 20, False, []
+    days_ = sorted({f.day for f in facts})
+    for day in days_:
+        group = [f for f in facts if f.day == day]
+        sessions = [f for f in group if f.kind in ("clean", "fault", "skipped")]
+        counting = not paused and all(f.kind != "pause" for f in group)
+        for s in sessions:
+            if s.ceiling is not None:
+                e = min(e, s.ceiling)
+            if s.kind == "fault":
+                e, clean = e / 2, 0
+            elif s.kind == "clean" and counting:
+                clean += 1
+                if clean == needed:
+                    clean = 0
+                    if mode == "ticket":
+                        mode, needed = "unattended", 40
+                    else:
+                        e, needed = (e if s.ceiling is None else min(2 * e, s.ceiling)), 60
+        for ev in (f for f in group if f.kind in ("pause", "reset")):
+            if ev.kind == "pause":
+                paused = True
+            elif paused:
+                paused, clean = False, 0
+                if mode == "unattended" and e > first:
+                    e = max(first, e / 2)
+                    needed = 60 if e > first else 40
+                elif mode == "unattended":
+                    mode, needed = "ticket", 20
+        out.append((day, (mode, min(e, cap), clean, needed, paused)))
+    return out
+
+
+def test_property_f1_every_fault_halves_and_a_fault_inside_a_pause_never_gives_more_than_one_moved_before_it():
+    prefixes = moved = 0
+    for _, first, cap, blocks, _ in histories(2000, moving=True, seed=SEED + 7, pause_rate=0.03, fault_rate=0.03):
+        facts = list(sl.session_facts(flat(blocks), LIVE, CAL))
+        walk = sl._walk(facts, first, cap)
+        assert [(d, (p.mode, p.stake, p.clean, p.needed, p.paused)) for d, p in walk] == reference_f1(facts, first, cap)
+        prefixes += len(walk)
+        # a fault on a day inside a pause (or holding one), moved to a free day just before that pause began
+        paused, start = False, None
+        for i, f in enumerate(facts):
+            if f.kind == "pause" and not paused:
+                paused, start = True, f.day
+            if f.kind == "reset" and paused:
+                paused = False
+            pause_today = any(g.kind == "pause" and g.day == f.day for g in facts)
+            if f.kind == "fault" and (paused or pause_today):
+                begun = f.day if pause_today and not paused else start          # when the pause in force began
+                before_start = [g.day for g in facts if g.day < begun]
+                free = begun - timedelta(days=1)
+                if before_start and free <= max(before_start):
+                    break
+                other = facts[:i] + facts[i + 1:]
+                shifted = sorted(other + [sl.SessionFact(free, "fault", f.reasons, False, f.ceiling)],
+                                 key=lambda g: g.day)
+                a = sl._walk(facts, first, cap)
+                b = sl._walk(shifted, first, cap)
+                for d, pa in a:
+                    if d >= f.day:
+                        pb = [q for e_, q in b if e_ <= d][-1]               # the moved history as of that day
+                        assert pa.stake <= pb.stake
+                moved += 1
+                break
+    print(f"property (F1): 2000 histories, {prefixes} prefixes against the reference, {moved} faults moved")
+    assert prefixes > 200_000 and moved > 100
+
+
+def test_f2_day_stopped_reads_a_stop_on_a_stopped_run_too():
+    entries = [summ(TODAY), stop(TODAY, "prices", batch="b2", day_stop={"pct": 2.1, "limit": 2.0, "wall": True})]
+    why = sl.day_stopped(entries, LIVE, TODAY)
+    assert why and "2.10%" in why and "daily halt" in why
+
+
+def test_f3_a_fractional_fill_counts_only_from_a_clean_done_batch(monkeypatch):
+    def proven(**extra):
+        return sl.fractional_proven([summ(TODAY, venue=PAPER, batch="b1", **extra), fill(0.5)], PAPER)
+    assert proven() == 1
+    assert proven(faults=["reconcile"]) == 0
+    assert proven(faults=["drift"]) == 1
+    assert proven(faults="reconcile") == 0 and proven(faults=None) == 0 and proven(faults={"cap": 1}) == 0
+    monkeypatch.setattr(sl, "DRIFT_ACTS", True)
+    assert proven(faults=["drift"]) == 0
+
+
+def test_f5_a_pause_that_names_no_venue_pauses_and_is_counted():
+    for venue in (OMIT, None, "", 7, ["webull-production"]):
+        e = pause(TODAY)
+        if venue is OMIT:
+            del e["venue"]
+        else:
+            e["venue"] = venue
+        facts = sl.session_facts([summ(TODAY), e], LIVE, CAL)
+        assert kinds(facts) == [(TODAY, "clean"), (TODAY, "pause")] and facts.unreadable == 1
+        r = reset(TODAY)
+        if venue is OMIT:
+            del r["venue"]
+        else:
+            r["venue"] = venue
+        facts = sl.session_facts([pause(TODAY), r], LIVE, CAL)
+        assert kinds(facts) == [(TODAY, "pause")] and facts.unreadable == 1
+    assert sl.session_facts([pause(TODAY, venue=PAPER)], LIVE, CAL).unreadable == 0       # another venue's: not ours
+
+
+WEEK_DATE = "2026-W47-1"                         # Monday 2026-11-16 as a week date; also 10 characters
+
+
+@pytest.mark.parametrize("day", [WEEK_DATE, "2026-11-16T09", "20261116", "2026-11-16 ", " 2026-11-16", "2026-1-16",
+                                 "\uff12026-11-16"])
+def test_f6_a_day_is_usable_only_as_strict_yyyy_mm_dd(day):
+    assert date.fromisoformat("2026-W47-1") == TODAY                      # what Python's own parser would accept
+    for e in (summ(day), pause(day), reset(day)):
+        e["day"] = day
+        facts = sl.session_facts([e], LIVE, CAL)
+        assert list(facts) == [] and facts.unreadable == 1
+    stopped = summ(TODAY, day_stop={"pct": 3, "limit": 2, "wall": True})
+    stopped["day"] = day
+    assert sl.day_stopped([stopped], LIVE, TODAY) is None
+    good = summ(TODAY, venue=PAPER)
+    bad_fill = {**fill(0.5), "day": day}
+    bad_summary = {**summ(TODAY, venue=PAPER), "day": day}
+    assert sl.fractional_proven([good, bad_fill], PAPER) == 0
+    assert sl.fractional_proven([bad_summary, fill(0.5)], PAPER) == 0
+    assert sl.fractional_proven([good, fill(0.5)], PAPER) == 1
+
+
+def test_f7_describe_says_no_rise_under_todays_ceiling_and_prints_small_amounts_fully():
+    p = pos(run(Days(), ["clean"] * 61), 500, 800)                          # earned 1000, held at 800
+    text = lines_ok(sl.describe(p, None, LADDER, 0))
+    assert "doubles from" not in text
+    assert "no rise is possible under today's ceiling" in text and "1,000.00" in text
+    q = pos(run(Days(), ["clean"] * 61), 500, 1e6)
+    assert "doubles from 1,000.00" in lines_ok(sl.describe(q, None, LADDER, 0))
+    assert sl._amount(0.075) == "0.075" and sl._amount(2.675) == "2.68" and sl._amount(0.125) == "0.125"
+    assert sl._amount(1234.565) == "1,234.57" and sl._amount(1 / 3) == "0.333333" and sl._amount(0.0) == "0.00"
+    tiny = pos(run(Days(), ["fault"] * 3), 0.6, 1e6)                       # 0.075
+    assert "stake at work: 0.075" in lines_ok(sl.describe(tiny, None, LADDER, 0))
