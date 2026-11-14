@@ -304,7 +304,8 @@ def test_the_decay_entry_itself_is_not_mistaken_for_a_paper_day(desk):
 
 # ---------------------------------------------------------------- what cannot be judged
 def test_a_damaged_journal_line_in_the_stretch_is_bridged_and_named_by_file_and_line(desk):
-    # rev 4 (the design forces it): the day whose last line is damaged is bridged, the strategy is judged across it
+    # rev 4 (the design forces it): the day whose last line is damaged is bridged, the strategy is judged across it.
+    # rev 5 (the design forces it): the fall lies only inside the bridge, which proves nothing: held, exit 2, not paused
     ledger, journal, root = desk
     hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05})
     days = _returns_record(journal, hid, "mom", [0.0, -0.3, 0.01, 0.01])        # deep enough to pause
@@ -313,11 +314,11 @@ def test_a_damaged_journal_line_in_the_stretch_is_bridged_and_named_by_file_and_
         fh.write(b'{"type": "summary", "strategy_value_change": {"mom": SECRET-TEXT')
     out = dc.check(_lp(root), journal, apply=True)
     row = _row(out, hid)
-    assert row["decision"] == "paused" and row["days"] == 3 and row["days_bridged"] == 1
+    assert row["decision"] == "held" and row["days"] == 3 and row["days_bridged"] == 1
     assert row["summaries_skipped"] == {"damaged line after it": 1}
     assert out["unreadable_lines"] == [{"file": f"{days[1].date()}.jsonl", "line": 3}]
     assert "SECRET-TEXT" not in json.dumps(out) and "SECRET-TEXT" not in json.dumps(_decay_entries(journal))
-    assert ledger.get(hid)["status"] == "paused" and out["exit_code"] == 1
+    assert ledger.get(hid)["status"] == "passed backtest only" and out["exit_code"] == 2
 
 
 def test_damage_before_a_strategys_first_paper_day_does_not_stop_it_being_judged(desk):
@@ -1191,42 +1192,52 @@ def test_each_line_prints_days_bridged_summaries_skipped_by_kind_and_duplicates(
 def test_a_bridge_counts_once_toward_the_60_observations(tmp_path):
     rng = np.random.default_rng(21)
     returns = (-0.001 + 0.01 * rng.standard_normal(61)).tolist()           # a Sharpe well below half of 1.0
+    returns.append(-0.002)
     out = {}
-    for n in (61, 60):
+    for n in (62, 61, 60):
         root = tmp_path / str(n)
         paths, (hid,) = _setup_book(root, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.9}, None)],
                                     {0: ("mom", [r * CAPITAL for r in returns[:n]])})
         (paths.journal / f"{pd.bdate_range('2026-06-01', periods=n)[30].date()}.jsonl").unlink()
         row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
-        out[n] = (row["days"], row["sharpe_decides"], row["decision"])
-    assert out[61] == (60, True, "pause") and out[60] == (59, False, "keep")
+        out[n] = (row["days"], row["proven_days"], row["sharpe_decides"], row["decision"])
+    # rev 5 (the design forces it): the plain reading counts the bridge once; the proven reading needs 60 exact ones
+    assert out[62] == (61, 60, True, "pause") and out[61] == (60, 59, True, "held") and out[60] == (59, 58, False, "keep")
 
 
 def _spread(returns, lost):
-    """The returns with day `lost` and the day after joined into one observation; and the same spread evenly over its two
-    days (what the monitor also asks of a pause)."""
+    """The returns with day `lost` and the day after joined into one observation (the PLAIN reading); and the stretches
+    of exact observations on either side of that bridge (the PROVEN reading)."""
     joined = returns[:lost] + [returns[lost] + returns[lost + 1]] + returns[lost + 2:]
-    even = returns[:lost] + [(returns[lost] + returns[lost + 1]) / 2] * 2 + returns[lost + 2:]
-    return joined, even
+    stretches = [s for s in (returns[:lost], returns[lost + 2:]) if s]
+    return joined, stretches
 
 
-def _my_rule(returns, bt, joined=None, even=None):
-    """My own reading of the rule, with my stated bridge rule when the history has a bridge: both readings must clear the
-    limit by 1% of it, and by at least 0.1 of a percentage point of worst fall or 0.05 of Sharpe."""
-    dd_limit, s_limit = 1.5 * bt["max_drawdown"], 0.5 * bt["sharpe"]
+def _my_rules(series_dd, series_sharpe, n, bt):
+    dd = series_dd > 1.5 * bt["max_drawdown"]
+    sharpe = bt["sharpe"] > 0 and n >= 60 and series_sharpe < 0.5 * bt["sharpe"]
+    return dd, sharpe
+
+
+def _my_rule(returns, bt, joined=None, stretches=None):
+    """My own reading of the rev 5 design: without a bridge, the rules on the record. With one, each rule on the plain
+    reading (the bridge as one observation) and on the proven reading (worst fall: the largest inside a stretch; Sharpe:
+    the stretches' exact observations pooled, 60 of them needed): a rule that fires on both pauses, on one holds."""
     if joined is None:
-        series, n = [returns], len(returns)
-    else:
-        series, n = [joined, even], len(joined)
-        dd_limit, s_limit = dd_limit + max(0.01 * dd_limit, 0.001), s_limit - max(0.01 * s_limit, 0.05)
-    dd = all(my_worst_fall(s) > dd_limit for s in series)
-    sharpe = n >= 60 and all(my_sharpe(s) < s_limit for s in series)
-    return "pause" if (dd or sharpe) else "keep"
+        return "pause" if any(_my_rules(my_worst_fall(returns), my_sharpe(returns), len(returns), bt)) else "keep"
+    plain = _my_rules(my_worst_fall(joined), my_sharpe(joined), len(joined), bt)
+    pooled = [r for s in stretches for r in s]
+    proven = _my_rules(max(my_worst_fall(s) for s in stretches), my_sharpe(pooled), len(pooled), bt)
+    if any(p and q for p, q in zip(plain, proven)):
+        return "pause"
+    return "held" if any(p != q for p, q in zip(plain, proven)) else "keep"
 
 
 def test_a_lost_day_never_makes_a_pause_more_likely_than_the_same_history_with_it(tmp_path):
+    # rev 5 (the design forces it): the rule is now the two readings; the guarantee is on the worst fall, and the Sharpe
+    # rule may differ from the whole history's by what the lost days returned (stated in the module's docstring)
     rng = np.random.default_rng(424242)
-    seen, case = {"pause": 0, "keep": 0}, 0
+    seen, case = {"pause": 0, "keep": 0, "held": 0}, 0
     for book in range(40):
         n = int(rng.integers(30, 80))
         returns = (rng.uniform(-0.002, 0.003) + rng.uniform(0.004, 0.02) * rng.standard_normal(n)).tolist()
@@ -1245,18 +1256,21 @@ def test_a_lost_day_never_makes_a_pause_more_likely_than_the_same_history_with_i
                 if label == "gap":
                     (paths.journal / f"{pd.bdate_range('2026-06-01', periods=n)[lost].date()}.jsonl").unlink()
                 decided[label] = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)["decision"]
-            joined, even = _spread(returns, lost)                          # day `lost` and the next, in one observation
+            joined, stretches = _spread(returns, lost)                     # day `lost` and the next, in one observation
             assert decided["full"] == _my_rule(returns, bt)
-            assert decided["gap"] == _my_rule(returns, bt, joined, even), (book, bt)
-            assert not (decided["gap"] == "pause" and decided["full"] == "keep"), (book, bt)
+            assert decided["gap"] == _my_rule(returns, bt, joined, stretches), (book, bt)
+            full_dd = _my_rules(my_worst_fall(returns), 0.0, 0, bt)[0]
+            gap_dd = all(_my_rules(f, 0.0, 0, bt)[0] for f in (my_worst_fall(joined), max(map(my_worst_fall, stretches))))
+            assert not (gap_dd and not full_dd), (book, bt)                # never a worst-fall pause the whole would not make
             seen[decided["gap"]] += 1
-    assert seen["pause"] > 30 and seen["keep"] > 30
+    assert seen["pause"] > 30 and seen["keep"] > 30 and seen["held"] > 0
 
 
 def test_a_bridge_is_not_read_as_one_day_when_that_alone_would_pause(tmp_path):
+    # rev 5 (the design forces it): the plain reading fires, the proven one (the bridge left out) does not: held
     returns = [0.0] + [0.004, -0.002] * 34 + [0.03, 0.03]                  # two strong days at the end, joined by the gap
-    joined, even = _spread(returns, len(returns) - 2)
-    assert my_sharpe(joined) < my_sharpe(returns) and my_sharpe(even) >= my_sharpe(returns) - 1e-12
+    joined, stretches = _spread(returns, len(returns) - 2)
+    assert my_sharpe(joined) < my_sharpe(returns) < my_sharpe(stretches[0])
     bt = {"sharpe": my_sharpe(joined) + my_sharpe(returns), "max_drawdown": 0.9}  # limit between the two readings
     decided = {}
     for label in ("full", "gap"):
@@ -1266,7 +1280,7 @@ def test_a_bridge_is_not_read_as_one_day_when_that_alone_would_pause(tmp_path):
             (paths.journal / f"{pd.bdate_range('2026-06-01', periods=len(returns))[-2].date()}.jsonl").unlink()
         row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
         decided[label] = (row["decision"], row["days"])
-    assert decided == {"full": ("keep", 71), "gap": ("keep", 70)}
+    assert decided == {"full": ("keep", 71), "gap": ("held", 70)}
 
 
 # ---------------------------------------------------------------- 5. --apply recovers the ledger it is about to write to
@@ -1377,14 +1391,17 @@ def test_a_lost_day_in_real_books_never_pauses_where_the_whole_history_is_kept_a
             _set_backtest(paths, hid, -1.0, full[hid]["live_max_drawdown"] / 1.5 * (1 + 1e-12))   # the full one kept by a hair
             whole = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
             lost = _row(dc.check(paths.ledger, pp.Journal(gap)), hid)
-            assert whole["decision"] == "keep" and lost["decision"] == "keep" and lost["days_bridged"] == 1, (seed, hid)
+            # rev 5 (the design forces it): never a pause; held when only the plain reading is over the limit
+            assert whole["decision"] == "keep" and lost["decision"] in ("keep", "held") and lost["days_bridged"] == 1, (seed, hid)
+            assert lost["proven_max_drawdown"] <= whole["live_max_drawdown"] * (1 + 1e-12)
             checked += 1
     assert checked >= 10
 
 
 def test_a_strategy_joining_inside_a_bridge_reads_the_bridge_over_either_end_capital(tmp_path):
     # 06-04 is lost; on it a second strategy joined and the capital per strategy halved. The rebound inside the bridge
-    # over the earlier capital looks half its size; read over the later capital it is at least the whole history's
+    # over the earlier capital looks half its size, so the plain reading is far over the limit; rev 5 (the design forces
+    # it): the proven reading (each side of the bridge) is not, so the strategy is held, not paused and not kept
     full = [0.0, 0.02, -0.10, 0.0, 0.10, -0.10, 0.0]
     edge = my_worst_fall(full) / 1.5 * (1 + 1e-12)                         # the whole history kept by a hair
     decided = {}
@@ -1407,7 +1424,8 @@ def test_a_strategy_joining_inside_a_bridge_reads_the_bridge_over_either_end_cap
         else:
             assert row["live_max_drawdown"] == pytest.approx(my_worst_fall([0.0, 0.02, -0.10, 0.05, -0.10, 0.0]), rel=1e-12)
             assert row["live_max_drawdown"] > 1.3 * 1.5 * edge                 # read over the earlier capital: far over
-    assert decided == {"full": ("keep", 7, 0), "gap": ("keep", 6, 1)}
+            assert row["proven_max_drawdown"] == pytest.approx(0.10, rel=1e-12) and row["stretches"] == 2
+    assert decided == {"full": ("keep", 7, 0), "gap": ("held", 6, 1)}
 
 
 def test_a_lost_holiday_the_book_traded_is_bridged_from_the_next_days_own_change(tmp_path, capsys):
@@ -1416,7 +1434,7 @@ def test_a_lost_holiday_the_book_traded_is_bridged_from_the_next_days_own_change
                                 {0: ("mom", [0.0, 1000.0, -500.0, 700.0, 2000.0, 300.0])}, start="2026-06-29")
     (paths.journal / "2026-07-03.jsonl").unlink()
     row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
-    assert row["days"] == 5 and row["days_bridged"] == 1 and row["live_sharpe_bridges_spread"] is not None
+    assert row["days"] == 5 and row["days_bridged"] == 1 and (row["stretches"], row["proven_days"]) == (1, 4)  # rev 5 fields
 
 
 def test_a_book_that_trades_holidays_counts_a_lost_one_on_weekdays(tmp_path):
@@ -1433,9 +1451,10 @@ def test_a_book_that_trades_holidays_counts_a_lost_one_on_weekdays(tmp_path):
     assert row["days"] == 10 and row["days_bridged"] == 1
 
 
-def test_across_a_bridge_a_pause_must_clear_the_limit_by_the_margin(tmp_path):
-    # the capital per strategy drifted 1% on the lost day 06-03: read evenly over the known capital the fall looks a
-    # little deeper (14.26%) than the whole history's (14.22%); within the margin that is no pause
+def test_a_capital_drift_inside_a_bridge_is_held_not_paused(tmp_path):
+    # the capital per strategy drifted 1% on the lost day 06-03: over the earlier capital the plain reading's fall looks a
+    # little deeper (14.50%) than the whole history's (14.22%). Rev 4 asked a margin of it; rev 5 (the design forces it,
+    # and renames this test): the proven reading (5% before the bridge, nothing after) is under the limit: held
     full = [0.0, -0.05, -0.05, -5000.0 / 101_000.0, 0.0]
     edge = my_worst_fall(full) / 1.5 * (1 + 1e-9)                          # the whole history kept by a hair
     decided = {}
@@ -1453,5 +1472,252 @@ def test_across_a_bridge_a_pause_must_clear_the_limit_by_the_margin(tmp_path):
         row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
         decided[label] = row["decision"]
         if label == "gap":
-            assert 1.5 * edge < row["live_max_drawdown_bridges_spread"] < 1.5 * edge * 1.01
-    assert decided == {"full": "keep", "gap": "keep"}
+            assert row["live_max_drawdown"] == pytest.approx(my_worst_fall([0.0, -0.05, -0.10, 0.0]), rel=1e-12)
+            assert row["proven_max_drawdown"] == pytest.approx(0.05, rel=1e-12)
+            assert row["proven_max_drawdown"] < 1.5 * edge < row["live_max_drawdown"]
+    assert decided == {"full": "keep", "gap": "held"}
+
+
+# ================================================================ rev 5: what a lost day proves
+def _line_of(text, hid):
+    return next(ln for ln in text.splitlines() if ln.startswith(f"h{hid} "))
+
+
+def test_a_fall_that_exists_only_across_a_bridge_is_held_with_exit_2_on_every_run(tmp_path, capsys):
+    # three falls of 3%, the middle one on a lost day: 8.8% on the plain reading, at most 3% inside either stretch.
+    # Beside it a fall of 20% inside one stretch: that pause is still written, and the code is 2
+    returns = [0.0, 0.01, -0.03, -0.03, -0.03, 0.01]
+    paths, (held, deep) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": -1.0, "max_drawdown": 0.04}, None),          # limit 6%
+                   ("Funds that fell keep falling", {"sharpe": -1.0, "max_drawdown": 0.05}, None)],
+        {0: ("mom", [r * CAPITAL for r in returns]), 1: ("deep", [0.0, -0.2 * CAPITAL, 0.0, 0.0, 0.0, 0.0])})
+    (paths.journal / "2026-06-04.jsonl").unlink()
+    plain = my_worst_fall([0.0, 0.01, -0.03, -0.06, 0.01])
+    for _ in range(2):
+        assert dc.main(["check"], paths=paths) == 2
+        out = capsys.readouterr()
+        line = _line_of(out.out, held)
+        assert _decision(out.out, held) == "HELD" and f"to pause (run with --apply): h{deep}" in out.out
+        assert f"worst fall {plain:.2%} (proven 3.00%)" in line and "stretches: 2" in line and "days bridged: 1" in line
+        assert "2026-06-04" in line and "restore the journal for those days from a backup, or decide by hand" in line
+        assert f"held: h{held}" in out.err
+    for _ in range(2):
+        assert dc.main(["check", "--apply"], paths=paths) == 2
+        out = capsys.readouterr()
+        assert _decision(out.out, held) == "HELD"
+    assert _status(paths, held) == ("passed backtest only", []) and _status(paths, deep)[0] == "paused"
+    entry = _decay_entries(pp.Journal(paths.journal))
+    assert len(entry) == 1 and entry[0]["paused"] == [deep] and entry[0]["held"] == [held]
+
+
+def test_a_record_with_no_bridge_prints_one_stretch_and_one_figure_per_rule(tmp_path, capsys):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", [0.0, 1000.0, -500.0, 800.0])})
+    assert dc.main(["check"], paths=paths) == 0
+    line = _line_of(capsys.readouterr().out, hid)
+    assert "stretches: 1" in line and "days bridged: 0" in line and "proven" not in line
+
+
+@pytest.mark.parametrize("times", [1.003, 2.0])
+def test_a_fall_past_the_limit_inside_one_stretch_pauses_on_its_day_with_or_without_a_bridge_elsewhere(tmp_path, times):
+    returns = [0.0] + [0.001] * 61 + [-0.05, 0.0]                           # day 62: 5% down from the peak
+    bt = {"sharpe": -1.0, "max_drawdown": my_worst_fall(returns) / times / 1.5}
+    days = [str(d.date()) for d in pd.bdate_range("2026-06-01", periods=len(returns))]
+    decided = {}
+    for label in ("full", "gap"):
+        paths, (hid,) = _setup_book(tmp_path / label, [("Funds that rose keep rising", bt, None)],
+                                    {0: ("mom", [r * CAPITAL for r in returns])})
+        if label == "gap":
+            (paths.journal / f"{days[5]}.jsonl").unlink()                  # a day lost early, far from the fall
+        rows = [_row(dc.check(paths.ledger, pp.Journal(paths.journal), as_of=days[k]), hid) for k in (61, 62, 63)]
+        decided[label] = [r["decision"] for r in rows]
+        assert rows[-1]["days_bridged"] == (1 if label == "gap" else 0)
+    assert decided == {"full": ["keep", "pause", "pause"], "gap": ["keep", "pause", "pause"]}
+
+
+def test_a_strategy_whose_first_day_is_lost_starts_with_a_bridge_and_is_never_paused_by_it(tmp_path):
+    # beta joins on 06-03 (worth nothing, capital 100,000 a strategy) and loses 10,000 on 06-04, the day a third
+    # strategy joined and the capital per strategy halved: the whole history's fall is 10%. 06-03 is lost: over the
+    # later capital its first observation would read 20%; it is a bridge, and the proven reading has no fall
+    edge = 0.10 / 1.5 * (1 + 1e-9)
+    decided = {}
+    for label in ("full", "gap"):
+        paths = _paths(tmp_path / label)
+        ledger = lg.HypothesisLedger(paths.ledger)
+        alpha = _idea(ledger, "Funds that rose keep rising", {"sharpe": -1.0, "max_drawdown": 0.5})
+        beta = _idea(ledger, "Funds that fell keep falling", {"sharpe": -1.0, "max_drawdown": edge})
+        gamma = _idea(ledger, "Bonds lead stocks by a week", {"sharpe": -1.0, "max_drawdown": 0.5})
+        ledger.close()
+        journal = pp.Journal(paths.journal)
+        _book(journal, {alpha: ("alpha", [0.0, 0.0, 0.0]), beta: ("beta", [0.0], 2)})
+        _book(journal, {alpha: ("alpha", [0.0] * 3), beta: ("beta", [-10_000.0, 0.0, 0.0]), gamma: ("gamma", [0.0] * 3)},
+              start="2026-06-04", capital=CAPITAL / 2)
+        if label == "gap":
+            (paths.journal / "2026-06-03.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), beta)
+        decided[label] = (row["decision"], row["days_bridged"])
+        if label == "full":
+            assert row["live_max_drawdown"] == pytest.approx(0.10, rel=1e-12)
+        else:
+            assert row["live_max_drawdown"] == pytest.approx(0.20, rel=1e-12) and row["proven_max_drawdown"] == 0.0
+    assert decided == {"full": ("keep", 0), "gap": ("held", 1)}
+
+
+def test_a_lost_day_with_one_strategy_fewer_than_both_neighbours_is_never_a_pause(tmp_path):
+    # beta sits out 06-04 (N, N-1, N): the capital per strategy doubles that day. Alpha loses 10,000 on 06-05, 5% of the
+    # doubled capital it started the day with; 06-04 is lost, and over the capital before it the loss reads 10%
+    edge = 0.05 / 1.5 * (1 + 1e-9)
+    decided = {}
+    for label in ("full", "gap"):
+        paths = _paths(tmp_path / label)
+        ledger = lg.HypothesisLedger(paths.ledger)
+        alpha = _idea(ledger, "Funds that rose keep rising", {"sharpe": -1.0, "max_drawdown": edge})
+        beta = _idea(ledger, "Funds that fell keep falling", {"sharpe": -1.0, "max_drawdown": 0.5})
+        ledger.close()
+        journal = pp.Journal(paths.journal)
+        _book(journal, {alpha: ("alpha", [0.0] * 3), beta: ("beta", [0.0] * 3)})
+        _book(journal, {alpha: ("alpha", [0.0])}, start="2026-06-04", capital=2 * CAPITAL)
+        _book(journal, {alpha: ("alpha", [-10_000.0, 0.0]), beta: ("beta", [0.0, 0.0])}, start="2026-06-05")
+        if label == "gap":
+            (paths.journal / "2026-06-04.jsonl").unlink()
+        row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), alpha)
+        decided[label] = (row["decision"], row["days_bridged"], row["stretches"])
+        assert row["live_max_drawdown"] == pytest.approx(0.05 if label == "full" else 0.10, rel=1e-12)
+    assert decided == {"full": ("keep", 0, 1), "gap": ("held", 1, 2)}
+
+
+def _turning_book(root, seed, n=56):
+    """A real paper book whose strategy count moves, so the capital per strategy does: alpha throughout; beta joins and
+    later leaves; gamma joins and sits out one day (N, N-1, N). Returns the paths, {hid: name}, the summary days and the
+    days of those events."""
+    rng = np.random.default_rng(seed)
+    paths = _paths(root)
+    ledger = lg.HypothesisLedger(paths.ledger)
+    hids = [_idea(ledger, text, {"sharpe": -1.0, "max_drawdown": 0.9}) for text in
+            ("Funds that rose keep rising", "Two funds that rose keep rising", "Bonds lead stocks by a week")]
+    ledger.close()
+    plan = dict(zip(hids, (_long("alpha", 0.6), _long("beta", 0.5, market=("ALT",)), _long("gamma", 0.4, market=("UP", "ALT")))))
+    beta_in = int(rng.integers(16, 22))
+    gamma_in = beta_in + int(rng.integers(3, 7))
+    beta_out = gamma_in + int(rng.integers(6, 10))
+    sat = beta_out + int(rng.integers(3, 6))
+    px = _moving_prices(n, seed)
+    trader = pp.PaperTrader(paths.journal, _limits(root), starting_cash=CAPITAL, halt_file=None)
+    for i in range(12, n + 1):
+        active = [hids[0]] + ([hids[1]] if beta_in <= i < beta_out else []) + ([hids[2]] if i >= gamma_in and i != sat else [])
+        trader.step(px.iloc[:i], {h: plan[h] for h in active})
+    days = [h["day"] for h in trader.state["history"]]
+    return paths, dict(zip(hids, ("alpha", "beta", "gamma"))), days, {
+        "beta first": days[beta_in - 12], "gamma first": days[gamma_in - 12], "sat out": days[sat - 12]}
+
+
+def test_lost_days_in_real_books_whose_capital_moves_never_make_a_worst_fall_pause(tmp_path):
+    import shutil
+    checked = 0
+    for seed in range(3):
+        root = tmp_path / f"s{seed}"
+        paths, names, days, events = _turning_book(root, seed)
+        full = {r["hypothesis_id"]: r for r in dc.check(paths.ledger, pp.Journal(paths.journal))["strategies"]}
+        for hid in names:                                                  # each kept by a hair on the whole history
+            _set_backtest(paths, hid, -1.0, full[hid]["live_max_drawdown"] / 1.5 * (1 + 1e-12))
+        assert all(r["decision"] == "keep" for r in dc.check(paths.ledger, pp.Journal(paths.journal))["strategies"])
+        g = days.index(events["gamma first"])
+        variants = {"one day": [days[10]], "three days": days[g - 1:g + 2], "beta's first day": [events["beta first"]],
+                    "gamma's first day": [events["gamma first"]], "N, N-1, N": [events["sat out"]]}
+        for label, lost in variants.items():
+            gap = root / label.replace(" ", "_").replace(",", "").replace("'", "")
+            shutil.copytree(paths.journal, gap)
+            for d in lost:
+                (gap / f"{d}.jsonl").unlink()
+            rows = {r["hypothesis_id"]: r for r in dc.check(paths.ledger, pp.Journal(gap))["strategies"]}
+            for hid, name in names.items():
+                row = rows[hid]
+                assert row["decision"] != "pause", (seed, label, name)
+                assert row["proven_max_drawdown"] <= full[hid]["live_max_drawdown"] * (1 + 1e-12) + 1e-15
+                if label.startswith(name):
+                    assert row["days_bridged"] >= 1, (seed, label)            # its first day lost: a bridge
+                checked += 1
+    assert checked == 45
+
+
+@pytest.mark.parametrize("case", ["two later summaries", "three later summaries", "three that disagree", "in the middle"])
+def test_a_wrong_reference_is_set_aside_after_three_later_summaries_reject_it(tmp_path, capsys, case):
+    changes = [1000.0, -500.0, 800.0, 300.0, -200.0, 400.0]
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", changes[:2] if case == "two later summaries" else changes[:3]
+                                     if case != "in the middle" else changes)})
+    j = paths.journal
+    if case == "in the middle":                                           # from 06-04 on the equity holds 5,000 the values do not
+        for d in ("2026-06-04", "2026-06-05", "2026-06-08"):
+            _rewrite_summary(j / f"{d}.jsonl", lambda e: json.dumps({**e, "equity": e["equity"] + 5000.0}).encode())
+    else:
+        _rewrite_summary(j / "2026-05-29.jsonl", lambda e: json.dumps({**e, "equity": e["equity"] + 5000.0}).encode())
+        if case == "three that disagree":
+            _rewrite_summary(j / "2026-06-02.jsonl", lambda e: json.dumps({**e, "equity": e["equity"] + 700.0}).encode())
+    code = dc.main(["check"], paths=paths)
+    out = capsys.readouterr()
+    if case in ("two later summaries", "three that disagree"):
+        assert code == 2 and "does not add up" in out.err                  # today's behaviour, loud
+        return
+    assert code == 0 and _decision(out.out, hid) == "KEEP"
+    set_aside = "2026-05-29" if case == "three later summaries" else "2026-06-03"
+    assert f"a summary set aside as a wrong reference (does not add up against the next three): {set_aside}" in out.out
+    row = _row(dc.check(paths.ledger, pp.Journal(j)), hid)
+    if case == "in the middle":                                           # 06-02 to 06-04 is a bridge over the set-aside day
+        mine = [1000.0 / CAPITAL, -500.0 / CAPITAL, (800.0 + 300.0) / CAPITAL, -200.0 / CAPITAL, 400.0 / CAPITAL]
+        assert row["days"] == 5 and row["days_bridged"] == 1 and row["summaries_skipped"] == {"does not add up": 1}
+    else:                                                                 # 06-01 is the reference now: it starts there
+        mine = [-500.0 / CAPITAL, 800.0 / CAPITAL]
+        assert row["days"] == 2 and row["days_bridged"] == 0
+    assert row["live_sharpe"] == pytest.approx(my_sharpe(mine), rel=1e-12)
+
+
+@pytest.mark.parametrize("field", ["equity", "strategy_values", "capital_per_strategy"])
+def test_a_number_too_large_for_a_float_makes_its_summary_not_readable(tmp_path, capsys, field):
+    paths, (hid,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                {0: ("mom", [0.0, 1000.0, -500.0, 800.0])})
+    huge = 10 ** 400                                                      # 401 digits
+    value = {"mom": huge} if field == "strategy_values" else huge
+    _rewrite_summary(paths.journal / "2026-06-02.jsonl", lambda e: json.dumps({**e, field: value}).encode())
+    row = _row(dc.check(paths.ledger, pp.Journal(paths.journal)), hid)
+    assert row["summaries_skipped"] == {"not readable": 1} and row["days_bridged"] == 1 and row["decision"] == "keep"
+    assert dc.main(["check"], paths=paths) == 0
+    assert "OverflowError" not in capsys.readouterr().err
+
+
+def test_an_unknown_idea_is_a_fault_only_while_the_book_still_values_it(tmp_path, capsys):
+    paths, (calm,) = _setup_book(tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+                                 {0: ("calm", [0.0, 1000.0, 1000.0])})
+    journal = pp.Journal(paths.journal)
+    journal.write("2026-06-01", {"type": "decision", "hypothesis_id": 990, "strategy": "gone", "decision": "no trade"})
+    assert dc.main(["check"], paths=paths) == 0
+    out = capsys.readouterr()
+    assert "h990 gone" in out.out and "not in the idea ledger" in _line_of(out.out, 990) and out.err == ""
+    _append_day(journal, "2026-06-04", {calm: "calm", 991: "ghost"}, {"calm": 1000.0, "ghost": 0.0})
+    assert dc.main(["check"], paths=paths) == 2
+    err = capsys.readouterr().err
+    assert "h991" in err and "h990" not in err
+
+
+def test_the_days_check_entry_lists_a_pause_an_earlier_killed_run_made(tmp_path, monkeypatch):
+    paths, (deep, calm) = _setup_book(
+        tmp_path, [("Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.05}, None),
+                   ("Funds that fell keep falling", {"sharpe": 1.0, "max_drawdown": 0.5}, None)],
+        {0: ("deep", [0.0, -0.2 * CAPITAL, 0.0]), 1: ("calm", [0.0, 1000.0, 1000.0])})
+    real_write = pp.Journal.write
+
+    def killed(self, day, entry):
+        if entry.get("type") == "decay_check":
+            raise KeyboardInterrupt                                       # killed after its pause, before its entry
+        return real_write(self, day, entry)
+    monkeypatch.setattr(pp.Journal, "write", killed)
+    with pytest.raises(KeyboardInterrupt):
+        dc.check(paths.ledger, pp.Journal(paths.journal), apply=True)
+    monkeypatch.setattr(pp.Journal, "write", real_write)
+    assert _status(paths, deep)[0] == "paused" and _decay_entries(pp.Journal(paths.journal)) == []
+    out = dc.check(paths.ledger, pp.Journal(paths.journal), apply=True)
+    entries = _decay_entries(pp.Journal(paths.journal))
+    assert out["paused"] == [] and _row(out, deep)["decision"] == "left alone" and out["exit_code"] == 0
+    assert len(entries) == 1 and entries[0]["paused"] == [deep]
+    again = dc.check(paths.ledger, pp.Journal(paths.journal), apply=True)
+    assert not again["journal_entry_written"] and len(_decay_entries(pp.Journal(paths.journal))) == 1
