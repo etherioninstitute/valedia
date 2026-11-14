@@ -44,9 +44,10 @@ realised result), never from the day's changes, so that no single event can blin
     one, the strategy is HELD: its line names both figures and the days whose record is missing (restore the journal
     for those days from a backup, or decide by hand), and every run exits 2 while that stands. On neither: keep. A
     record with no bridge has one reading. There is no margin and no floor.
-  - What this guarantees and what it does not. On the worst-fall rule a lost day can never make a pause the whole
-    history would not make, whatever happened to the capital inside it: a stretch is a run of the true history's own
-    observations, and a fall inside it is a fall of the whole. On the Sharpe rule a lost day is a missing observation:
+  - What this guarantees and what it does not. On the worst-fall rule a lost day that the journal can see never makes
+    a pause the whole history would not make, whatever happened to the capital inside it: a stretch is a run of the
+    true history's own observations. (A day lost on a date that is no exchange session, and a readable summary whose
+    wrong figures agree with one another, cannot be seen.) On the Sharpe rule a lost day is a missing observation:
     either reading can differ from the whole history's Sharpe by what the lost days returned, in either direction, so
     a lost day can make or hide a Sharpe pause. A strategy that fell past its limit only when its falls on both sides of
     a lost day are added together is HELD, loudly, never quietly kept or paused.
