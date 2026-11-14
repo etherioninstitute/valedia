@@ -4712,19 +4712,29 @@ class LiveVenue(Booked):
     environment = "production"
     host = "api.webull.com"
     account_class = "INDIVIDUAL_CASH"
+    settled = "same"              # T22d-1: the settled cash cash() reports: "same" (the cash), None, or "missing" (no key)
 
     def __init__(self, held=None, cash=1_000_000.0, name="webull-production"):
         super().__init__(held, cash, name)
 
+    def cash(self):
+        answer = super().cash()
+        if self.settled == "missing":
+            del answer["settled_cash"]
+        else:
+            answer["settled_cash"] = answer["cash"] if self.settled == "same" else self.settled
+        return answer
+
 
 class Second:
-    """The second price source: a verdict per symbol (an exception is raised), every call kept."""
+    """The second price source: a verdict per symbol, or per (symbol, price) in `by_price` (an exception is raised),
+    every call kept."""
 
     def __init__(self):
-        self.verdicts, self.calls = {}, []
+        self.verdicts, self.by_price, self.calls = {}, {}, []
 
     def __call__(self, first_price, symbol, *, now, sources, **kw):
-        v = self.verdicts.get(symbol, "agree")
+        v = self.by_price.get((symbol, first_price), self.verdicts.get(symbol, "agree"))
         self.calls.append({"symbol": symbol, "price": first_price, "now": now, "sources": sources, "kw": sorted(kw),
                            "verdict": v if isinstance(v, str) else "raised"})
         if isinstance(v, BaseException):
@@ -5273,6 +5283,10 @@ def _live_caps_scenario(tmp, seed):
         w.second.calls.clear()
         book_before = w.book()
         out = lpropose(w, capital=capital)
+        if _mark_refused(w, out, book_before, stats):              # T22d-1: a held mark not agreed on stops the run
+            w.later(20)
+            w.venue.calls.clear()
+            continue
         assert out["status"] == "done", out
         kept = _check_live_run(w, out, "propose", live_conf(max_order_value=mov, max_capital=cap), book_before, w.prices)
         stats["kept"] += len(kept)
@@ -5289,22 +5303,38 @@ def _live_caps_scenario(tmp, seed):
             w.later(1)
             book_before = w.book()
             out = lapprove(w, number, capital=capital)
-            sent = _check_live_run(w, out, "approve", live_conf(max_order_value=mov, max_capital=cap), book_before, w.prices)
-            stats["sent"] += len(sent)
+            if not _mark_refused(w, out, book_before, stats):
+                sent = _check_live_run(w, out, "approve", live_conf(max_order_value=mov, max_capital=cap), book_before,
+                                       w.prices)
+                stats["sent"] += len(sent)
             w.venue.calls.clear()
         w.later(20)
         w.venue.calls.clear()
     return stats
 
 
+def _mark_refused(w, out, book_before, stats):
+    """T22d-1 (A1): a symbol this ledger holds whose mark the second source does not agree on stops the live run at
+    stage "marks", before any ticket line or send, naming the first such symbol; True when that is what happened."""
+    held = sorted(s for s, u in book_before.items() if u > 1e-9)
+    bad = [s for s in held if w.second.by_price.get((s, w.prices[s]), w.second.verdicts.get(s, "agree")) != "agree"]
+    if not bad:
+        return False
+    assert out["status"] == "stopped" and out["stage"] == "marks" and bad[0] in out["reason"], out
+    assert w.venue.submits() == [] and not out.get("ticket_number"), out
+    assert [c["symbol"] for c in w.second.calls][-1] == bad[0]
+    stats["marks"] = stats.get("marks", 0) + 1
+    return True
+
+
 @pytest.mark.parametrize("seed_block", range(6))
 def test_live_orders_stay_within_the_caps_and_the_second_sources_verdict_over_generated_scenarios(tmp_path, seed_block):
     """50 scenarios per block, 300 in all, each two rounds of a live propose and approve."""
-    total = {"kept": 0, "dropped": 0, "sent": 0}
+    total = {"kept": 0, "dropped": 0, "sent": 0, "marks": 0}
     for k in range(50):
         stats = _live_caps_scenario(tmp_path / f"s{k}", 220_000 + seed_block * 50 + k)
         for key in total:
-            total[key] += stats[key]
+            total[key] += stats.get(key, 0)
         _shutil.rmtree(tmp_path / f"s{k}")
     assert total["kept"] > 30 and total["dropped"] > 30 and total["sent"] > 10, total
 
@@ -6144,3 +6174,434 @@ def test_t32_rev2_every_strategy_followed_keeps_the_whole_books_smallest_trade_a
         assert out["status"] == "done", out
         decided.append(("SPY" in units_sent(w), [s["reason"] for s in out["skipped"] if s["symbol"] == "SPY"]))
     assert decided[0] == decided[1], decided
+
+
+# ==== T22d-1: the order step before real money (findings A1, A2, A3, A4, A6 of the off-family review)
+
+import fcntl as _fcntl
+from collections import Counter as _Counter
+
+
+def _later_submit(w, minutes, then=None):
+    """The venue's submit, after which the clock moves on `minutes` and `then(w)` runs (a price that moves, a lock
+    file that goes): what a slow broker call and the world outside do between two orders of one run."""
+    real = w.venue.submit
+
+    def submit(*a, **k):
+        out = real(*a, **k)
+        w.clock.t += minutes * 60
+        if then is not None:
+            then(w)
+        return out
+    w.venue.submit = submit
+
+
+def _t22d1_equity(w):
+    if not Path(w.state_path).exists():
+        return []
+    con = sqlite3.connect(w.state_path)
+    try:
+        return [r[0] for r in con.execute("SELECT equity FROM equity ORDER BY id")]
+    finally:
+        con.close()
+
+
+# ---- outcome 1 (A1): in live mode no mark is believed on one source
+
+@pytest.mark.parametrize("verdict, words", [("disagree", "does not agree with"),
+                                            ("no second quote", "cannot answer for"),
+                                            (ValueError("boom"), "cannot answer for"),
+                                            ("nonsense", "cannot answer for")])
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+def test_t22d1_a_baseline_mark_the_second_source_does_not_back_stops_the_live_run_before_any_order(tmp_path, mode,
+                                                                                                 verdict, words):
+    w = live_world(tmp_path / "w", venue=LiveVenue(held={"OWN": 3.0}))           # the owner's holding: the baseline
+    number = None
+    if mode == "approve":
+        _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+        w.later(1)
+    rows = _t22d1_equity(w)
+    w.second.calls.clear()
+    w.second.verdicts = {"OWN": verdict}
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w) if mode == "propose" else lapprove(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "marks", out
+    assert "OWN" in out["reason"] and words in out["reason"] and "nothing is sent" in out["reason"], out["reason"]
+    assert w.venue.submits() == [] and w.orders() == [] and "ticket_number" not in out
+    assert [(c["symbol"], c["price"]) for c in w.second.calls] == [("OWN", 50.0)]   # the order's own is never reached
+    assert _t22d1_equity(w) == rows                                                   # no equity, no peak recorded
+    assert any(e["stage"] == "marks" for e in w.entries("stopped"))
+    if mode == "propose":
+        assert [t for t in ticket_rows(w, "tickets")] == []
+    else:                                                          # the ticket is not consumed: a later approve sends it
+        assert [f["fate"] for f in ticket_rows(w, "fates")] == []
+        w.second.verdicts = {}
+        out = lapprove(w, number)
+        assert out["status"] == "done" and out["orders_sent"] == 1, out
+
+
+def test_t22d1_a_mark_of_this_ledgers_own_holding_is_judged_though_that_symbol_is_not_ordered(tmp_path):
+    w = live_world(tmp_path / "w")
+    w.venue.fill_at_once = 1.0
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+    w.later(1)
+    assert lapprove(w, number)["orders_sent"] == 1 and w.book() == {"IWM": 3.0}
+    w.later(20)
+    w.second.calls.clear()
+    w.second.verdicts = {"IWM": "disagree"}
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}}, equity=5000.0)                 # IWM held, only TLT wanted
+    out = lpropose(w)
+    assert out["status"] == "stopped" and out["stage"] == "marks" and "IWM" in out["reason"], out
+    assert [c["symbol"] for c in w.second.calls] == ["IWM"] and "ticket_number" not in out
+    w.second.verdicts = {}
+    w.second.calls.clear()
+    out = lpropose(w)                                              # agreed: the mark and then the order's own quote
+    assert out["status"] == "done" and [c["symbol"] for c in w.second.calls] == ["IWM", "TLT"], out
+
+
+def test_t22d1_a_held_mark_a_refresh_replaces_is_judged_again_before_the_gate_or_a_limit_uses_it(tmp_path):
+    w = live_world(tmp_path / "w", venue=LiveVenue(held={"OWN": 3.0}))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.later(1)
+    w.quote_age["OWN"] = 19.5 * 60                                 # fresh at the start, too old two minutes on
+    w.second.calls.clear()
+    w.second.by_price = {("OWN", 51.0): "disagree"}
+    _later_submit(w, 2, then=lambda w: w.prices.__setitem__("OWN", 51.0))
+    out = lapprove(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "marks" and "OWN" in out["reason"], out
+    assert "51" in out["reason"] and "does not agree with" in out["reason"]
+    assert [w.venue.book[t]["symbol"] for t in w.venue.submits()] == ["IWM"]       # TLT never intended, never sent
+    assert [o["symbol"] for o in w.orders()] == ["IWM"]
+    assert [(c["symbol"], c["price"]) for c in w.second.calls] == [("OWN", 50.0), ("IWM", 200.0), ("OWN", 51.0)]
+    gate = [e for e in w.entries("refused") if e.get("by") == "risk gate"]
+    assert gate == []
+
+
+def test_t22d1_a_refreshed_mark_that_agrees_lets_the_run_go_on_and_each_quote_is_asked_once(tmp_path):
+    w = live_world(tmp_path / "w", venue=LiveVenue(held={"OWN": 3.0, "IWM": 1.0}))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.later(1)
+    w.quote_age["OWN"] = 19.5 * 60
+    w.second.calls.clear()
+    _later_submit(w, 2, then=lambda w: w.prices.__setitem__("OWN", 51.0))
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 2, out
+    asked = [(c["symbol"], c["price"]) for c in w.second.calls]
+    assert asked == [("IWM", 200.0), ("OWN", 50.0), ("OWN", 51.0), ("TLT", 100.0)]   # IWM's held mark is its order's
+    assert len(asked) == len(set(asked))
+
+
+# ---- outcome 2 (A3): exposure is never older than the marks
+
+def test_t22d1_max_capital_sees_a_held_symbols_new_price_after_a_refresh(tmp_path):
+    w = live_world(tmp_path / "w", conf=live_conf(max_capital=1600, max_order_value=1000))
+    w.venue.fill_at_once = 1.0
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0}}, capital=1600.0)
+    w.later(1)
+    assert lapprove(w, number, capital=1600.0)["orders_sent"] == 1 and w.book() == {"IWM": 3.0}
+    w.later(20)
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "GLD": 2.0, "TLT": 4.0}}, capital=1600.0)
+    lines = [ln["symbol"] for ln in ticket_rows(w, "lines") if ln["number"] == number]
+    assert sorted(lines) == ["GLD", "TLT"]                         # 600 + 505 + 404 = 1,509 at the start's marks
+    w.later(1)
+    w.quote_age["IWM"] = 19.5 * 60
+    _later_submit(w, 2, then=lambda w: w.prices.__setitem__("IWM", 240.0))
+    out = lapprove(w, number, capital=1600.0)
+    assert [w.venue.book[t]["symbol"] for t in w.venue.submits()] == ["IWM", "GLD"], out
+    (d,) = out["dropped"]                                          # 3 x 240 + 505 + 404 = 1,629: TLT is over
+    assert d["symbol"] == "TLT" and "1,629.00, above max_capital 1,600.00" in d["reason"], d
+
+
+# ---- outcome 3 (A2): the run lock follows the file
+
+def test_t22d1_a_live_run_whose_lock_file_went_after_it_took_it_stops_at_the_start(tmp_path, monkeypatch):
+    real = osx._RunLock.acquire
+
+    def acquire(self):
+        ok = real(self)
+        if ok and self.path is not None:
+            Path(self.path).unlink()
+        return ok
+    w = live_world(tmp_path / "w")
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    monkeypatch.setattr(osx._RunLock, "acquire", acquire)
+    out = lpropose(w)
+    assert out["status"] == "stopped" and out["stage"] == "lock" and "run lock" in out["reason"], out
+    assert "order_step-webull-production.sqlite.lock" in out["reason"], out["reason"]
+    assert _account_reads(w) == [] and w.quote_calls == [] and w.second.calls == []
+    p = ticket_world(tmp_path / "p")                               # a practice run is as on the base: it goes on
+    p.paper = paper({"a": {"SPY": 2.0}})
+    assert p.run()["status"] == "done" and len(p.venue.submits()) == 1
+
+
+@pytest.mark.parametrize("how", ["unlinked", "replaced by a second run's"])
+def test_t22d1_a_lock_file_removed_or_replaced_during_a_live_run_stops_it_before_its_next_send(lw, how):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    lw.later(1)
+    path, kept = Path(str(lw.state_path) + ".lock"), []
+
+    def lose_the_lock(w):
+        if kept:
+            return
+        path.unlink()
+        fh = None
+        if how != "unlinked":                                      # a second run starts on a new lock file
+            fh = open(path, "a+")
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        kept.append(fh)
+    _later_submit(lw, 0, then=lose_the_lock)
+    try:
+        out = lapprove(lw, number)
+    finally:
+        for fh in kept:
+            if fh is not None:
+                fh.close()
+    assert out["status"] == "stopped" and out["stage"] == "lock" and "run lock" in out["reason"], out
+    assert [lw.venue.book[t]["symbol"] for t in lw.venue.submits()] == ["IWM"]
+    assert {o["symbol"]: o["state"] for o in lw.orders()}["TLT"] == "intended"     # never sent
+    assert any(x["symbol"] == "TLT" and "run lock" in x["reason"] for x in out["left_over"])
+
+
+# ---- outcome 4 (A4): an older state file cannot reopen the day
+
+def test_t22d1_a_state_file_that_counts_fewer_orders_today_than_the_ledger_stops_the_live_run(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    older = lw.tmp / "older-state.sqlite"
+    _shutil.copy(lw.state_path, older)                             # the state file before the approve
+    lw.later(1)
+    assert lapprove(lw, number)["orders_sent"] == 2
+    _shutil.copy(older, lw.state_path)                             # ... put back by a person
+    lw.later(20)
+    lw.venue.calls.clear()
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "0 orders" in out["reason"] and "2" in out["reason"] and "2026-11-13" in out["reason"], out["reason"]
+    assert [c for c in lw.venue.calls if c[0] in ("cancel", "submit", "positions", "cash")] == []
+    assert "ticket_number" not in out
+
+
+def test_t22d1_a_state_file_whose_peak_is_below_an_equity_the_journal_recorded_stops_the_live_run(lw):
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    assert lpropose(lw)["status"] == "done"
+    older = lw.tmp / "older-state.sqlite"
+    _shutil.copy(lw.state_path, older)                             # its peak: 1,000,000.00
+    lw.later(20)
+    lw.venue.cash_value += 2500.0
+    assert lpropose(lw)["broker_equity"] == 1_002_500.0            # journaled, and the state's peak
+    _shutil.copy(older, lw.state_path)
+    lw.later(20)
+    out = lpropose(lw)
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "1,000,000.00" in out["reason"] and "1,002,500.00" in out["reason"], out["reason"]
+    assert "ticket_number" not in out and lw.venue.submits() == []
+
+
+def test_t22d1_a_state_file_that_knows_as_much_as_the_ledger_and_the_journal_lets_the_live_run_go_on(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    lw.later(1)
+    assert lapprove(lw, number)["orders_sent"] == 2
+    lw.later(20)
+    lw.venue.cash_value -= 2500.0                                  # a lower equity than the journal's: a real loss
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["status"] == "done" and out["ticket"]["orders"], out
+
+
+def test_t22d1_orders_sent_on_an_earlier_new_york_day_do_not_count_against_today(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    lw.later(1)
+    assert lapprove(lw, number)["orders_sent"] == 2
+    lw.next_day()                                                  # the state counts 0 today; the ledger's 2 are older
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["status"] == "done" and out["ticket"]["orders"], out
+
+
+# ---- outcome 5 (A6): live mode needs the settled-cash figure
+
+@pytest.mark.parametrize("settled", [None, "missing"])
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+def test_t22d1_a_live_run_stops_when_the_account_read_gives_no_settled_cash(tmp_path, mode, settled):
+    w = live_world(tmp_path / "w")
+    number = None
+    if mode == "approve":
+        _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+        w.later(1)
+    w.venue.settled = settled
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w) if mode == "propose" else lapprove(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "prices" and "settled cash" in out["reason"], out
+    assert "never spends on the cash figure" in out["reason"]
+    assert w.venue.submits() == [] and w.orders() == [] and "ticket_number" not in out
+    if mode == "approve":
+        assert [f["fate"] for f in ticket_rows(w, "fates")] == []  # not consumed
+
+
+# ---- outcome 7: what the marks cost, for a fifteen-symbol book
+
+FIFTEEN = tuple(f"S{k:02d}" for k in range(15))
+
+
+def _fifteen_world(tmp):
+    w = live_world(tmp, venue=LiveVenue(held={s: 1.0 for s in FIFTEEN}))
+    for k, s in enumerate(FIFTEEN):
+        w.prices[s] = 100.0 + 10 * k
+    w.paper = paper({"a": {s: 1.0 for s in FIFTEEN}}, equity=5000.0)
+    return w
+
+
+def test_t22d1_a_fifteen_symbol_book_asks_once_per_symbol_in_the_usual_run(tmp_path):
+    w = _fifteen_world(tmp_path / "w")
+    out = lpropose(w)
+    assert out["status"] == "done" and len(out["ticket"]["orders"]) == 15, out
+    assert sorted(c["symbol"] for c in w.second.calls) == list(FIFTEEN)            # 15: each held mark, once
+    w.second.calls.clear()
+    w.later(1)
+    out = lapprove(w, out["ticket_number"])
+    assert out["status"] == "done" and out["orders_sent"] == 15, out
+    assert sorted(c["symbol"] for c in w.second.calls) == list(FIFTEEN)
+
+
+def test_t22d1_a_slow_fifteen_symbol_run_asks_once_per_symbol_per_quote_and_no_more(tmp_path):
+    w = _fifteen_world(tmp_path / "w")
+    number = lpropose(w)["ticket_number"]
+    w.later(0.1)
+    for s in FIFTEEN:
+        w.quote_age[s] = 19.5 * 60                                 # every quote goes stale after each slow submit
+    real, answered = w.quotes, []
+
+    def quotes(symbols):                                           # every answer a new quote, a cent higher
+        out = real(symbols)
+        for s in symbols:
+            w.prices[s] = round(w.prices[s] + 0.01, 2)
+        answered.extend((s, q[0]) for s, q in out.items())
+        return out
+    w.quotes = quotes
+    w.second.calls.clear()
+    _later_submit(w, 1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 15, out
+    asked = [(c["symbol"], c["price"]) for c in w.second.calls]
+    assert len(asked) == len(set(asked))                           # never the same quote twice
+    assert _Counter(asked) == _Counter(answered)                   # every quote answered, once
+    assert len(asked) == 15 + 14 * 15                              # 225: every holding again before each later order
+
+
+# ---- outcome 6: nothing else moves (practice runs byte for byte; live runs apart from the marks asked)
+
+T22D1_BASE = "7c2ec4a"
+
+
+@pytest.fixture(scope="module")
+def t22d1_base(tmp_path_factory):
+    """The order step of T22d-1's base commit, from git (or, in a copy of the tree without git, the file named by
+    T22D1_BASE_FILE), loaded under its own name."""
+    root = Path(__file__).resolve().parents[2]
+    got = subprocess.run(["git", "-C", str(root), "show", f"{T22D1_BASE}:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True)
+    if got.returncode == 0:
+        src = got.stdout
+    elif _os.environ.get("T22D1_BASE_FILE"):
+        src = Path(_os.environ["T22D1_BASE_FILE"]).read_bytes()
+    else:
+        raise AssertionError(f"the base {T22D1_BASE} cannot be read: {got.stderr.decode(errors='replace')}")
+    folder = tmp_path_factory.mktemp("t22d1_base_order_step")
+    path = folder / "order_step_t22d1_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t22d1_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t22d1_base"] = mod
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "Follow") and not hasattr(mod._Run, "_judge_marks")
+    return mod
+
+
+@pytest.mark.parametrize("seed_block", range(2))
+def test_t22d1_practice_runs_are_the_bases_byte_for_byte(tmp_path, monkeypatch, t22d1_base, seed_block):
+    """25 scenarios per block, 50 in all (each 4 to 8 runs: scheduled, propose, approve, wrong numbers, kills, partial
+    fills, refusals), through 7c2ec4a and here: venue calls, summaries, journal lines, ledger, state and tickets."""
+    runs = sends = 0
+    for k in range(25):
+        seed = 770_000 + seed_block * 25 + k
+        base = _flow_scenario(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            for key in b:
+                assert b[key] == m[key], (seed, i, key)
+        runs += len(mine)
+        sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    assert runs >= 100 and sends > 10, (runs, sends)
+
+
+def _live_flow(mod, tmp, seed, monkeypatch):
+    """One generated live scenario that meets none of T22d-1's five conditions (every held mark agreed on, settled
+    cash given, prices still within a run, the lock and the state file left alone), driven through `mod`."""
+    rng = random.Random(seed)
+    urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
+    monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
+    monkeypatch.setattr("secrets.randbelow", lambda n: numbers.randrange(n))
+    cap = rng.choice([800, 2500, 6000])
+    mov = rng.choice([m for m in (150, 400, 900, 2500) if m <= cap])
+    held = rng.choice([None, {"OWN": float(rng.randint(1, 4))}, {"OWN": 2.0, "QQQ": 1.0}])
+    w = live_world(tmp, venue=LiveVenue(held=held), conf=live_conf(max_order_value=mov, max_capital=cap))
+    capital = float(rng.choice([cap, round(cap * rng.uniform(0.3, 1.0), 2)]))
+    verdicts = ["agree", "agree", "agree", "disagree", "no second quote", "nonsense"]
+    seen = []
+
+    def one(**kw):
+        f = _follow_the_book(w)
+        before = set(w.book()) | set(held or {})
+        w.second.verdicts = {s: ("agree" if s in before else rng.choice(verdicts)) for s in ("SPY", "QQQ", "IWM", "TLT", "GLD")}
+        w.second.calls.clear()
+        w.venue.calls.clear()
+        out = _run_with(mod, w, live=w.live, second_opinion=w.second, capital=capital,
+                        follow=mod.Follow(**dataclasses.asdict(f)), **kw)
+        seen.append({"calls": list(w.venue.calls), "summary": json.dumps(out, sort_keys=True, default=str),
+                     "journal": {f.name: _STAMP.sub(b'"timestamp": "T"', f.read_bytes())
+                                 for f in sorted((w.tmp / "journal").glob("*"))},
+                     "state": _dump(w.state_path), "ledger": _dump(w.ledger_path),
+                     "tickets": _dump(osx.ticket_path_for(w.state_path)),
+                     "second": [(c["symbol"], c["price"]) for c in w.second.calls], "held": sorted(before)})
+        return out
+    for _ in range(3):
+        for sym in ("SPY", "QQQ", "IWM", "TLT", "GLD"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 230.0, 480.0])
+        wanted = {s: float(rng.randint(0, 6)) for s in rng.sample(["SPY", "QQQ", "IWM", "TLT", "GLD"], rng.randint(1, 5))}
+        w.paper = paper({"a": wanted}, equity=capital)
+        number = one(propose=True).get("ticket_number")
+        if number:
+            w.venue.fill_at_once = rng.choice([0.0, 0.5, 1.0])
+            w.later(1)
+            one(approve=number)
+        w.later(20)
+    monkeypatch.undo()
+    return seen
+
+
+@pytest.mark.parametrize("seed_block", range(2))
+def test_t22d1_live_runs_that_meet_none_of_the_five_are_the_bases_apart_from_the_marks_asked(tmp_path, monkeypatch,
+                                                                                            t22d1_base, seed_block):
+    """25 scenarios per block, 50 in all, of up to six live runs each, through 7c2ec4a and here."""
+    added = sent = 0
+    for k in range(25):
+        seed = 880_000 + seed_block * 25 + k
+        base = _live_flow(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _live_flow(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            for key in b:
+                if key != "second":
+                    assert b[key] == m[key], (seed, i, key)
+            more = _Counter(m["second"]) - _Counter(b["second"])     # what this revision asks beyond the base:
+            assert not (_Counter(b["second"]) - _Counter(m["second"])), (seed, i)
+            assert all(sym in m["held"] for sym, _ in more), (seed, i, more)   # only held marks
+            assert len(m["second"]) == len(set(m["second"])), (seed, i)        # each quote once
+            added += sum(more.values())
+        sent += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    assert added > 10 and sent > 10, (added, sent)

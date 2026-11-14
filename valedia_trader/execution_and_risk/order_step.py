@@ -156,6 +156,20 @@ environment only). Without `propose` or `approve` a run is exactly the one above
             of an ordinary run passes; otherwise it is dropped with the reason. Orders not on the ticket are not sent.
 Tickets live in their own file beside the state file (ticket_path_for, TicketBook): append-only tables, natural keys,
 no update, no delete, no replacement; the state file's layout is unchanged.
+
+Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run never makes them:
+ - the run lock must still be the file the run locked (not unlinked, not replaced): judged at the start, before the
+   ticket's checks, and in the last look before every submit_once; otherwise the run stops at stage "lock";
+ - before the baseline and the reconcile, the state file must count at least the orders the order ledger holds as
+   sent on the New York day (any state but intended and refused) and hold an equity peak at least the highest
+   equity the journal recorded for the venue (summaries and tickets); otherwise the run stops at stage "state";
+ - the account read must give a settled cash; otherwise the run stops at stage "prices" (never the cash figure);
+ - every symbol held (the baseline and this ledger's book) has its mark judged by the second price source, as an
+   order's own quote is, before the equity is recorded and the ticket used, and again whenever a refresh replaces
+   it, before the gate prices the account; a verdict other than "agree" stops the run at stage "marks". Each quote
+   (symbol, price, time) is asked about once in a run; an order's own quote already judged as a mark is not asked
+   again;
+ - the max_capital check works out this ledger's exposure afresh at each order, at the marks the gate has just used.
 """
 from __future__ import annotations
 
@@ -788,6 +802,16 @@ STATE_SCHEMA = [
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
 NOT_COUNTED = ("refused", "not sent")             # outcomes that are not an order sent
+LEDGER_NOT_SENT = ("intended", "refused")         # T22d-1: the ledger's states of an order never sent (NOT_COUNTED there)
+
+
+def _ny_day(t) -> str | None:
+    """The New York day of a time in seconds, or None when it cannot be read."""
+    try:
+        v = _as_float(t)
+        return None if v is None else str(pd.Timestamp(v, unit="s", tz="UTC").tz_convert(NEW_YORK).date())
+    except Exception:
+        return None
 
 
 class OrderStepState:
@@ -1316,6 +1340,19 @@ class _RunLock:
         self.fh = fh
         return True
 
+    def follows(self) -> bool:
+        """Whether the file this run locked is still the one at the lock's path (T22d-1, A2): not unlinked, not
+        replaced by another file (which a second run could lock as well). A lock with no file (":memory:") follows."""
+        if self.path is None:
+            return True
+        if self.fh is None:
+            return False
+        try:
+            held, there = os.fstat(self.fh.fileno()), os.stat(self.path)
+        except OSError:
+            return False
+        return held.st_nlink > 0 and (held.st_dev, held.st_ino) == (there.st_dev, there.st_ino)
+
     def release(self) -> None:
         if self.fh is not None:
             import fcntl
@@ -1452,6 +1489,12 @@ class _Run:
         self.second_opinion = None
         self.locks = None                                # live mode: the go_live.LockState judged at the start
         self.live_exposure = 0.0                         # live mode: what this ledger holds plus the buys passed so far
+        self.run_lock: _RunLock | None = None            # T22d-1 (A2): the lock this run holds, checked to follow its file
+        self.marks_judged: dict[tuple, str] = {}         # T22d-1 (A1): the second source's verdict per (symbol, price, time)
+        self.live_book: dict[str, float] = {}            # T22d-1 (A3): this ledger's book and the marks in hand, from which
+        self.live_marks: dict[str, float] = {}           # ... the exposure is worked out again at each order
+        self.live_buys: list[float] = []                 # ... with the buys passed so far, in order
+        self.journal_peak: float | None = None           # T22d-1 (A4): the highest equity the journal holds for this venue
         self._ticket_expired_seen = False                # once a reading is past the ticket's expiry, it stays expired
         self.disagreements: list[dict] = []
         self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
@@ -1552,7 +1595,7 @@ class _Run:
             return self._finish("stopped", stop.stage, stop.reason)
         path = self.state_arg.path if isinstance(self.state_arg, OrderStepState) else str(self.state_arg)
         self.run_path = path
-        lock = _RunLock(path)
+        lock = self.run_lock = _RunLock(path)
         if not lock.acquire():                           # everything below runs under the lock
             return self._finish("stopped", "session", "another order step is running on this venue's state file")
         self._locked = True                              # from here on the journal may be written
@@ -1596,6 +1639,10 @@ class _Run:
             lock.release()
 
     def _rest(self, now: float) -> dict:
+        if self.live is not None:                        # T22d-1 (A2): the lock still the file this run took, at the start
+            why = self._lock_lost("nothing is sent")
+            if why is not None:
+                return self._finish("stopped", "lock", why)
         if self.mode is not None:                        # the ticket's checks and the account, before any other venue call
             try:
                 self._ticket_first(now)
@@ -1604,6 +1651,8 @@ class _Run:
             except (OrderStepError, sqlite3.Error, OSError) as exc:
                 return self._finish("stopped", "ticket", f"the ticket file failed: {_local_error(exc)}; nothing is sent")
         try:
+            if self.live is not None:                    # T22d-1 (A4): the state file knows what the ledger and journal do
+                self._live_counters()
             baseline = self._baseline()                  # 3
             self._reconcile_and_cancel(baseline)         # 4
             paper = self.paper_read                      # 5
@@ -1701,15 +1750,77 @@ class _Run:
         if not value <= conf["max_order_value"]:
             return (f"lock 1 (the confirmation): the order's value {value:,.2f} at its limit is above max_order_value "
                     f"{conf['max_order_value']:,.2f}")
+        self.live_exposure = self._exposure_now()       # T22d-1 (A3): at the marks the gate has just judged
         if units > 0 and not self.live_exposure + value <= conf["max_capital"]:
             return (f"lock 1 (the confirmation): with this order the money at work would be "
                     f"{self.live_exposure + value:,.2f}, above max_capital {conf['max_capital']:,.2f}")
-        verdict = self._second_verdict(c["symbol"], quote)
+        verdict = self._judged(c["symbol"], quote)       # a held symbol's quote: already judged as its mark
         if verdict != "agree":
             return f"lock 3 (the limits): the second price source says {verdict} for the quote {quote:g}"
         if units > 0:
+            self.live_buys.append(value)
             self.live_exposure += value
         return None
+
+    def _exposure_now(self) -> float:
+        """Live mode (T22d-1, A3): what this ledger holds at the marks in hand now, plus the buys passed so far in
+        this run (added one by one, in order); infinite when a holding has no usable mark (no buy can be judged)."""
+        mine = [(u, self.live_marks.get(sym)) for sym, u in self.live_book.items() if u > UNITS_EPS]
+        exposure = math.inf if any(not _finite(q) for _, q in mine) else math.fsum(u * float(q) for u, q in mine)
+        for value in self.live_buys:
+            exposure += value
+        return exposure
+
+    def _judged(self, symbol: str, price: float) -> str:
+        """The second source's verdict on one quote in hand (its symbol, price and time), asked once per quote in a
+        run (T22d-1, A1): the same quote is never asked about twice; a new quote is."""
+        key = (symbol, float(price), self.quote_times.get(symbol))
+        if key not in self.marks_judged:
+            self.marks_judged[key] = self._second_verdict(symbol, price)
+        return self.marks_judged[key]
+
+    def _judge_marks(self, held: dict, marks: dict, after: str) -> None:
+        """Live mode (T22d-1, A1): every symbol held (the baseline and this ledger's book) has its mark in hand judged
+        by the second source with the rule an order's own quote gets; the first one it does not agree with, or
+        cannot answer for, stops the run at stage "marks", naming the symbol."""
+        for sym in sorted(s for s, u in held.items() if u > UNITS_EPS):
+            price = marks[sym]
+            verdict = self._judged(sym, price)
+            if verdict == "agree":
+                continue
+            how = "does not agree with" if verdict == "disagree" else f"cannot answer for ({verdict})"
+            raise _Stop("marks", f"live mode: the second price source {how} the mark {price:g} of {sym}, a symbol held, "
+                                 "which prices the equity, the drawdown, the daily loss and the exposure; a mark is "
+                                 f"never believed on one source, so {after}")
+
+    def _lock_lost(self, after: str) -> str | None:
+        """Live mode (T22d-1, A2): why the run lock is no longer this run's (its file unlinked or replaced since the
+        run took it, so a second run may hold a lock of its own), or None."""
+        lock = self.run_lock
+        if lock is None or lock.follows():
+            return None
+        name = os.path.basename(lock.path or "") or "the lock file"
+        return (f"the run lock ({name}) is no longer the file this run locked: it was removed or replaced, so another "
+                f"run may hold a lock of its own; {after}")
+
+    def _live_counters(self) -> None:
+        """Live mode (T22d-1, A4): the state file must know at least what the order ledger holds of the orders sent
+        on this New York day, and an equity peak at least the highest equity the journal recorded for this venue. An
+        older state file put back would reopen the day's cap or lower the peak: the run stops; a person must look."""
+        counted = self.state.sent_on(self.day)
+        on_ledger = sum(1 for o in self.ledger.orders()
+                        if o.get("state") not in LEDGER_NOT_SENT and _ny_day(o.get("created")) in (self.day, None))
+        if counted < on_ledger:
+            raise _Stop("state", f"the order step's state file counts {counted} order{'' if counted == 1 else 's'} sent on "
+                                 f"{self.day} and the order ledger holds {on_ledger} sent that day: the state file knows "
+                                 "less than the ledger (an older copy put back?), so the day's cap cannot be judged; "
+                                 "a person must look; nothing is sent")
+        peak, seen = self.state.peak(), self.journal_peak
+        if seen is not None and (peak is None or peak < seen):
+            held = "no equity" if peak is None else f"an equity peak of {peak:,.2f}"
+            raise _Stop("state", f"the order step's state file holds {held} and the journal recorded an equity of "
+                                 f"{seen:,.2f} for {self.name}: the state file knows less than the journal (an older copy "
+                                 "put back?), so the drawdown cannot be judged; a person must look; nothing is sent")
 
     def _second_verdict(self, symbol: str, quote: float) -> str:
         from valedia_trader.execution_and_risk import go_live
@@ -2035,6 +2146,12 @@ class _Run:
         self._seen_fill_ids = {e.get("fill_id") for e in entries
                                if e.get("type") == "order_step" and e.get("event") == "fill" and e.get("venue") == self.name}
         self.torn_lines = [{"file": name, "line": n} for name, n, _ in torn]
+        if self.live is not None:                        # T22d-1 (A4): the highest equity journaled for this venue
+            keys = {"summary": "broker_equity", "ticket": "equity"}
+            seen = [_as_float(e.get(keys[e.get("event")])) for e in entries if e.get("type") == "order_step"
+                    and e.get("venue") == self.name and type(e.get("event")) is str and e.get("event") in keys]
+            seen = [v for v in seen if v is not None]
+            self.journal_peak = max(seen) if seen else None
         for name, n in new:
             self._write({"event": "torn_line", "file": name, "line": n,
                          "reason": "a damaged last line, from a crash mid-write; skipped by the order step"})
@@ -2413,9 +2530,14 @@ class _Run:
         if self._settled_unusable:
             raise _Stop("prices", f"the venue's settled cash is not a usable number ({_EQUITY_BOUNDS}, at most the cash "
                                   f"plus {SETTLED_ABOVE_CASH:.2f}); nothing is sent")
+        if self.live is not None and self.settled_cash is None:   # T22d-1 (A6): never spends on the cash figure
+            raise _Stop("prices", "live mode needs the venue's settled cash and the account read gave none; it never "
+                                  "spends on the cash figure; nothing is sent")
         if unpriced:
             raise _Stop("prices", f"the broker equity cannot be worked out: no usable quote for {', '.join(sorted(unpriced))}; "
                                   "nothing is sent")
+        if self.live is not None:                        # T22d-1 (A1): every held mark judged, before any equity, ticket
+            self._judge_marks(held, prices, "nothing is sent")   # ... use or order
         in_hand = dict(prices)                           # every holding at its latest usable quote
         equity = self._equity(cash, held, in_hand)
         previous, prior_peak = self.state.previous_equity(self.day), self.state.peak()
@@ -2477,9 +2599,8 @@ class _Run:
             self._write({"event": "ticket_used", "number_ends": self.ticket["number"][-2:]})
             candidates = self._ticket_candidates(candidates)
         if self.live is not None:                        # live: the money this ledger has at work, at the quotes in hand
-            mine = [(u, in_hand.get(sym)) for sym, u in book.items() if u > UNITS_EPS]
-            self.live_exposure = (math.inf if any(not _finite(q) for _, q in mine)    # unpriced: no buy can be judged
-                                  else math.fsum(u * float(q) for u, q in mine))
+            self.live_book, self.live_marks, self.live_buys = book, in_hand, []   # worked out again at each order
+            self.live_exposure = self._exposure_now()
         sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
         buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
         for c in sales + buys:
@@ -2506,6 +2627,8 @@ class _Run:
                 if quote is None:
                     self._leave(c, stale)
                     break
+                if self.live is not None:                # T22d-1 (A1): a mark the refresh replaced, judged before use
+                    self._judge_marks(held, in_hand, "nothing more is sent")
                 account = account_now()                  # ... the account priced at them
                 if unpriced and not reduces:
                     self._leave(c, f"the account cannot be priced: no fresh quote for {', '.join(unpriced)}")
@@ -2575,6 +2698,9 @@ class _Run:
                 late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
                 if late is None and self.mode == "approve":
                     late = self._ticket_held()           # ... the ticket still this run's ...
+                lost = None
+                if late is None and self.live is not None:   # ... T22d-1 (A2): the run lock still the file it took ...
+                    late = lost = self._lock_lost("nothing more is sent")
                 if late is None:                         # ... then one reading: the window (and the ticket's life)
                     now = self._now()                    # ... nothing between it and submit_once
                     if now > self.window_end:
@@ -2584,6 +2710,8 @@ class _Run:
                 if late is not None:
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
                     self._leave(c, late)
+                    if lost is not None:                 # the lock gone: the run stops here
+                        raise _Stop("lock", lost)
                     continue
                 rec = self.ledger.submit_once(watch, tag)
             except OrdersBlocked:
