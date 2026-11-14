@@ -600,9 +600,11 @@ def test_public_feed_is_asked_every_120_seconds_from_a_fixed_address_with_a_fixe
     assert not re.search(r"burton|chatelain|@|/u/|valedia\.ai|\d{3}-\d{4}", cl.USER_AGENT, re.I)
     # rev 5 (outcome 1): nothing of the owner's project or business either: not "valedia", not one word of the
     # repository's folder name (valedia-trader, and the folder this copy lives in), no system or Python version, and
-    # not a library's default agent
-    words = {"valedia", "trader"} | {w for w in re.split(r"[^a-z0-9]+", cl.REPO.name.lower()) if len(w) >= 2}
-    assert not re.search("|".join(sorted(words)), cl.USER_AGENT, re.I), words
+    # not a library's default agent. "valedia" and "trader" are refused anywhere in it; the words of the folder this
+    # copy lives in are refused as whole words (so a folder named "co" or "pr" does not trip on "collector" or "price")
+    assert not re.search(r"valedia|trader", cl.USER_AGENT, re.I)
+    words = {w for w in re.split(r"[^a-z0-9]+", cl.REPO.name.lower()) if len(w) >= 2}     # (a "1" is the version)
+    assert not any(re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(w), cl.USER_AGENT, re.I) for w in words), words
     assert not re.search(r"python|urllib|requests|darwin|macos|mac os|linux|windows|cpython|\(", cl.USER_AGENT, re.I)
     assert cl.USER_AGENT.strip() and re.fullmatch(r"[a-z-]+/1\.0", cl.USER_AGENT)
 
@@ -4195,4 +4197,143 @@ def test_a_content_length_beside_a_chunked_body_is_a_bad_answer(tmp_path, monkey
     rows = store.rows("SELECT ok, status, failure FROM comment_fetches")
     assert len(rows) >= 2 and all((r["ok"], r["status"], r["failure"]) == (0, 200, "bad_length") for r in rows), rows
     assert store.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0] == 0
+    store.close()
+
+
+# ============================================================================== rev 5, the blind check's test gaps
+# ------------------- V106 F1 and F5: a 200 whose body did not finish is never a good read, under the transport's name
+
+def stalling_server(body, how, ctx=None):
+    """A local server answering 200 with `body` whole and readable (a good feed, listing or token answer) but stating
+    1,000 bytes more, so that the body does not finish: `trickle` (then a space every 50 ms), `reset` (then a reset)
+    or, over TLS (`ctx`), `tls-short` (then nothing more until the client gives up)."""
+    srv = LocalServer("ok")
+
+    def handle(c):
+        try:
+            c.settimeout(2.0)
+            if ctx is not None:
+                c = ctx.wrap_socket(c, server_side=True)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                head += chunk
+            m = re.search(rb"(?i)\r\ncontent-length: *([0-9]+)", head)
+            if m:
+                need = head.index(b"\r\n\r\n") + 4 + int(m.group(1))
+                while len(head) < need:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    head += chunk
+            srv.requests.append(head)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % (len(body) + 1000) + body)
+            if how == "trickle":
+                srv._slowly(c, b" " * 1000, 0.05)
+            elif how == "reset":
+                srv.stop.wait(0.2)                                      # the client is reading the body by now
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                socket.socket.close(c)
+            else:
+                srv.stop.wait(3.0)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    srv._handle = handle
+    return srv
+
+
+CUT_200 = [("http", "trickle", "timeout"), ("http", "reset", "network"), ("https", "tls-short", "timeout")]
+
+
+def cut_200_run(tmp_path, monkeypatch, target, scheme, how):
+    """The collector with one 200 whose body did not finish, over the real transport from a stalling server: the
+    public feed's first page, the official interface's token answer, or its first feed page (after a good token).
+    Returns the store, the transport and every request's headers."""
+    import ssl
+    local_hosts_allowed(monkeypatch)
+    ctx = None
+    if scheme == "https":
+        ca = Authority(tmp_path / "ca")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(*ca.leaf("127.0.0.1"))
+        monkeypatch.setattr(cl, "_SSL_CONTEXT", cl._make_context(str(ca.path)))
+    oauth = target != "public-feed"
+    body = {"public-feed": atom_with(atom_entry("t1_cut1")), "oauth-feed": listing([("t1_cut1", T0 + 1205)]).body,
+            "oauth-token": json.dumps({"access_token": "madeUpTokenFromACutAnswer", "token_type": "bearer",
+                                       "expires_in": 3600}).encode()}[target]
+    srv = stalling_server(body, how, ctx)
+    clock = Clock(T0 + 1200)
+    reddit = OneRealAnswer(clock, oauth, srv, 2 if target == "oauth-feed" else 1, cap=1.0, scheme=scheme)
+    sent = []
+
+    def transport(method, url, headers, data, timeout):
+        sent.append(dict(headers))
+        return reddit(method, url, headers, data, timeout)
+    store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    try:
+        run_for(collector(store, clock, transport, kalshi_ok(clock), CREDS if oauth else None), clock, 300)
+    finally:
+        srv.close()
+    return store, reddit, sent
+
+
+@pytest.mark.parametrize("scheme,how,name", CUT_200, ids=[c[1] for c in CUT_200])
+@pytest.mark.parametrize("target", ["public-feed", "oauth-token", "oauth-feed"])
+def test_a_200_whose_body_did_not_finish_is_never_a_good_read(tmp_path, monkeypatch, target, scheme, how, name):
+    """V106 F1: the bytes read are a whole good answer, but the body did not finish (trickled past the deadline, reset,
+    short under TLS). Nothing is parsed or stored from it (no comment, no version, no token), its slot is failed for
+    coverage, and of its body only the hash and size are kept, never the body."""
+    store, reddit, sent = cut_200_run(tmp_path, monkeypatch, target, scheme, how)
+    rows = store.rows("SELECT slot_ts, purpose, ok, status, failure, payload_id FROM comment_fetches WHERE fetched_at = ?",
+                      (stamp(reddit.came),))
+    assert len(rows) == 1, rows
+    cut = rows[0]
+    assert (cut["purpose"], cut["ok"], cut["status"], cut["payload_id"]) == ("token" if target == "oauth-token" else "feed",
+                                                                            0, 200, None), cut
+    assert cut["failure"] in ("timeout", "network"), cut
+    assert store.rows("SELECT COUNT(*) AS n FROM comments WHERE comment_id = 't1_cut1'")[0]["n"] == 0
+    assert store.rows("SELECT COUNT(*) AS n FROM comment_versions WHERE comment_id = 't1_cut1'")[0]["n"] == 0
+    assert not any("madeUpTokenFromACutAnswer" in v for h in sent for v in h.values())          # no token from it
+    good = store.rows("SELECT COUNT(*) AS n FROM comment_fetches WHERE slot_ts = ? AND purpose = 'feed' AND page = 1 AND ok = 1",
+                      (cut["slot_ts"],))[0]["n"]
+    assert good == 0                                                    # the slot is failed for coverage
+    c = cl.status(store, T0 + 1800)["days"][0]["comments"]
+    assert c["failed"] >= 1 and c["covered_slots"] >= 1, c              # later slots read well: requests went on
+    assert cl.verify(store) == []
+    store.close()
+
+
+@pytest.mark.parametrize("scheme,how,name", CUT_200, ids=[c[1] for c in CUT_200])
+def test_a_200_whose_body_did_not_finish_keeps_the_transports_failure_name(tmp_path, monkeypatch, scheme, how, name):
+    """V106 F5, a rev-5 decision pinned: a 200 whose body did not finish is recorded under the transport's own failure
+    (a deadline: `timeout`; a reset: `network`), never renamed (not `bad_length`), with its status kept."""
+    store, reddit, _ = cut_200_run(tmp_path, monkeypatch, "public-feed", scheme, how)
+    row = store.rows("SELECT status, failure FROM comment_fetches WHERE fetched_at = ?", (stamp(reddit.came),))
+    assert row == [{"status": 200, "failure": name}], row
+    store.close()
+
+
+# --------------------------------- V106 F4: the token request does not apply the rate-limit rules (a decision)
+
+def test_a_token_answers_rate_limit_headers_start_no_wait(tmp_path):
+    # DECISION TO REVISIT before the official backend is switched on: rev 5 applies the rate-limit rules to feed
+    # answers only, so a token answer saying remaining 0 / reset 600 starts no wait (see _rate_waits).
+    def answer(n, t, method, url):
+        if url == cl.TOKEN_URL:
+            return resp(200, token_answer().body, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "600"})
+        return listing([("t1_tk%03d" % n, T0 + 1200 + n)])
+    col, store, reddit, _, clock, _ = make(tmp_path, clock=Clock(T0 + 1200), answer=answer, env=CREDS)
+    run_for(col, clock, 300)
+    tok = [r["t"] for r in reddit.log if r["url"] == cl.TOKEN_URL]
+    feeds = [r["t"] for r in reddit.log if r["url"] != cl.TOKEN_URL]
+    assert len(tok) == 1 and feeds and feeds[0] - tok[0] < 1.0, (tok, feeds[:3])   # the feed asked at once after it
+    assert len(feeds) >= 5                                              # and every minute after
+    assert store.rows("SELECT kind FROM comment_events WHERE kind IN ('ratelimit', 'backoff')") == []
     store.close()
