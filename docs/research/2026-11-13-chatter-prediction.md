@@ -87,3 +87,9 @@ public feed must stay silent, and after a mark that comments may have been misse
 test: an event's time is still the time Valedia first saw that version of the comment on its own clock, whatever
 brought it; a comment already seen through one way is not a new version when it arrives through another; the
 posting time the service gives is stored as information and is not used to move an event earlier.
+
+## Clarification 2 (2026-11-14, 03:17 UTC: before the collector has run; nothing has been collected, read or scored)
+
+**The paid reader service will not be used.** The owner decided to keep the plan as first written: comments are
+read from the public feed, or from Reddit's official interface if he later supplies an app. Clarification 1
+therefore has no effect; nothing else changes.
