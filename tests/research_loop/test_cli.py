@@ -513,6 +513,9 @@ class _LiveVenue(_Venue):
     account_id = LIVE_ACCOUNT
 
 
+REAL_LIVE_VENUE = cli._order_step_live_venue                    # before any fixture replaces it (T32 rev 2)
+
+
 def _strategy_file(root, hid, name, market=("SPY", "QQQ")):
     spec = {**strat().to_spec(), "name": name, "market": list(market)}
     (root / "strategies").mkdir(exist_ok=True)
@@ -538,6 +541,7 @@ def _followed_book(root):
     led = lg.HypothesisLedger(root / "memory" / "ledger.db")
     try:
         hid = led.propose("Assets that rose over ten days keep rising", "test", cli.MARKET)
+        led.set_status(hid, "passed paper")                 # rev 2: a hypothesis the paper command steps
     finally:
         led.close()
     _strategy_file(root, hid, "mom_paper")
@@ -933,6 +937,8 @@ def follow_project(order_step_project):
     try:
         ids = [led.propose(f"Idea number {i} about a different market effect entirely", "test", cli.MARKET)
                for i in range(26)]
+        for hid in (23, 24, 25, 26):                        # rev 2: hypotheses the paper command steps
+            led.set_status(hid, "passed backtest only" if hid == 23 else "passed paper")
     finally:
         led.close()
     assert ids[22] == 23 and ids[25] == 26
@@ -1131,3 +1137,171 @@ def test_t32_a_live_approve_after_the_broker_book_file_changed_is_refused_and_ma
         assert captured.err.startswith("refused: config/broker_book.json ") and built == []
         assert out["stage"] == "lock" and venue.calls == calls_before
     assert "submit" not in venue.calls and _verdicts(root) == ["refused"]
+
+
+# ==== T32 rev 2
+
+def _set_status(root, hid, status):
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        led.set_status(hid, status)
+    finally:
+        led.close()
+
+
+# ---- outcome 2: a followed id must be a hypothesis the paper command steps (cli.PAPER_STATUSES)
+
+@pytest.mark.parametrize("status", ["paused", "failed", "untested", "retired"])
+def test_t32_rev2_a_followed_hypothesis_the_paper_command_does_not_step_stops_the_order_step(follow_project, capsys,
+                                                                                               status):
+    root, venue = follow_project
+    assert cli.main(["--root", str(root), "order-step"]) == 0                             # open orders, as before
+    capsys.readouterr()
+    book_before = json.dumps(venue.book, sort_keys=True)
+    venue.calls.clear()
+    _set_status(root, 23, status)
+    _book_file(root, {"follow": [26, 23]})
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "stopped" and out["stage"] == "follow", out
+    assert f"hypothesis 23, whose status in the research ledger is {status}" in out["reason"], out
+    assert [c for c in venue.calls if c[0] in ("submit", "cancel")] == [] and json.dumps(venue.book, sort_keys=True) == book_before
+    f = cli.broker_book_follow(cli.LoopPaths(root))                                        # without the paper book too
+    assert f.refused is not None and f"whose status in the research ledger is {status}" in f.refused
+
+
+def test_t32_rev2_each_status_the_paper_command_trades_is_followed(follow_project):
+    root, venue = follow_project
+    _book_file(root, {"follow": [23, 26]})
+    for status in cli.PAPER_STATUSES:
+        _set_status(root, 23, status)
+        f = cli.broker_book_follow(cli.LoopPaths(root))
+        assert f.refused is None and f.names == (H23, H26), (status, f)
+
+
+# ---- outcome 1: in live mode every refusal of the follow list comes before the production venue is built
+
+def _secrets_watch(monkeypatch):
+    from valedia_trader.core import secrets
+    from valedia_trader.venues import webull
+    seen = {"secret": [], "load_env": [], "from_secrets": [], "client": []}
+    monkeypatch.setattr(cli, "_order_step_live_venue", REAL_LIVE_VENUE)               # the command's own builder
+    monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: seen["secret"].append(name) or "x" * 16)
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: seen["load_env"].append(1) or [])
+    real = webull.WebullVenue.from_secrets
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets",
+                        classmethod(lambda cls, *a, **k: seen["from_secrets"].append(1) or real.__func__(cls, *a, **k)))
+    monkeypatch.setattr(webull.WebullVenue, "__init__", lambda self, *a, **k: seen["client"].append(1)
+                        or (_ for _ in ()).throw(RuntimeError("no client in this test")))
+    return seen
+
+
+def _second_book(root, name="mom_two", status="passed paper", in_latest=True):
+    """A second hypothesis (2) with its strategy file; its strategy in the paper book's latest day, or not."""
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    if in_latest:
+        state["positions"][name] = {"QQQ": {"units": 2.0, "cost": 100.0}}
+        state["history"][-1]["strategy_values"][name] = 200.0
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        hid = led.propose("Funds that fell for a week bounce back the next one", "test", cli.MARKET)
+        led.set_status(hid, status)
+    finally:
+        led.close()
+    _strategy_file(root, hid, name, ("QQQ",))
+    return hid
+
+
+@pytest.mark.parametrize("how", ["not in the latest day", "renamed out of it", "paused", "retired", "unknown id"])
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+def test_t32_rev2_a_live_follow_refusal_comes_before_the_venue_is_built(live_project, capsys, monkeypatch, how, mode):
+    root, venue, built, asked = live_project
+    number = None
+    if mode == "approve":
+        assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+        _, (line,) = _ticket_out(capsys.readouterr().out)
+        number = line.split()[2]
+    seen = _secrets_watch(monkeypatch)
+    built.clear()
+    calls, quotes = len(venue.calls), len(asked)
+    if how == "not in the latest day":
+        _book_file(root, {"follow": [1, _second_book(root, in_latest=False)]})
+    elif how == "renamed out of it":
+        spec_path = root / "strategies" / "mom_paper_h1.json"
+        spec = json.loads(spec_path.read_text())
+        spec_path.write_text(json.dumps({**spec, "name": "renamed_away"}))
+    elif how in ("paused", "retired"):
+        _set_status(root, 1, how)
+    else:
+        _book_file(root, {"follow": [1, 99]})
+    argv = ["--live", "--propose"] if mode == "propose" else ["--live", "--approve", number]
+    assert cli.main(["--root", str(root), "order-step", *argv, "--capital", "100000"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused: ") and "nothing was read from the account" in err, err
+    words = {"not in the latest day": "not among the strategies of the paper book's latest day",
+             "renamed out of it": "(renamed_away), which is not among the strategies",
+             "paused": "whose status in the research ledger is paused",
+             "retired": "whose status in the research ledger is retired",
+             "unknown id": "hypothesis 99, which the research ledger does not hold"}[how]
+    assert words in err, err
+    assert seen == {"secret": [], "load_env": [], "from_secrets": [], "client": []}    # no secret, no client object
+    assert built == [] and len(venue.calls) == calls and len(asked) == quotes        # nothing asked of any venue
+
+
+# ---- outcome 5a: the ticket's digest holds the names (a strategy file renamed to another strategy of the book)
+
+def test_t32_rev2_a_live_approve_after_a_followed_strategy_was_renamed_to_another_of_the_book_is_refused(live_project,
+                                                                                                     capsys):
+    root, venue, built, asked = live_project
+    _second_book(root)                                             # mom_two is in the latest day, not followed
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    out, (line,) = _ticket_out(capsys.readouterr().out)
+    assert out["follow"] == {"ids": [1], "names": ["mom_paper"]}
+    number = line.split()[2]
+    spec_path = root / "strategies" / "mom_paper_h1.json"
+    spec = json.loads(spec_path.read_text())
+    spec_path.write_text(json.dumps({**spec, "name": "mom_two", "market": ["QQQ"]}))   # the same file, the same ids
+    calls_before = len([c for c in venue.calls if c[0] == "submit"])
+    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "stopped" and "broker book's follow list" in out["reason"] and "changed" in out["reason"], out
+    assert len([c for c in venue.calls if c[0] == "submit"]) == calls_before
+
+
+# ---- outcome 5b: the reading function refuses a strategy with no plain name
+
+@pytest.mark.parametrize("name", ["two words", "semi;colon", "x" * 65, "dollar$", "", 26, None])
+def test_t32_rev2_the_reading_function_refuses_a_strategy_without_a_plain_name(follow_project, monkeypatch, name):
+    # a strategy file's spec allows only lower_snake_case names, so the stand-in is a strategy loaded otherwise (as a
+    # strategy module can be: _strategy_for returns what it loads)
+    root, venue = follow_project
+    real = cli._strategy_for
+
+    class Odd:
+        pass
+
+    def loaded(paths, ledger, hid, override):
+        s, f = real(paths, ledger, hid, override)
+        if hid != 26:
+            return s, f
+        odd = Odd()
+        odd.name = name
+        return odd, f
+    monkeypatch.setattr(cli, "_strategy_for", loaded)
+    _book_file(root, {"follow": [26]})
+    f = cli.broker_book_follow(cli.LoopPaths(root))
+    assert f.refused == "config/broker_book.json names hypothesis 26, whose strategy has no plain name", f
+    assert f.names == () and f.digest is None
+
+
+# ---- outcome 3, at the command line: `every` is set when the list names the whole latest day, and only then
+
+def test_t32_rev2_the_reading_function_says_when_every_strategy_of_the_latest_day_is_followed(follow_project):
+    root, venue = follow_project
+    paths = cli.LoopPaths(root)
+    trader = cli.PaperTrader(paths.journal, paths.risk_limits)
+    for ids, every in (([26, 23], True), ([23, 26], True), ([26], False), ([23], False)):
+        _book_file(root, {"follow": ids})
+        assert cli.broker_book_follow(paths, trader=trader).every is every, ids
+        assert cli.broker_book_follow(paths).every is False                       # without the paper book: never

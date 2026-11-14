@@ -5677,9 +5677,10 @@ H23, H26 = "trend_blend_etf_1999_2011", "hold_rebalance_etf_2006_2026"
 TWO = {H23: {"SPY": 40.0, "QQQ": 10.0}, H26: {"SPY": 24.0, "TLT": 60.0}}
 
 
-def _follow(*pairs, digest=None):
+def _follow(*pairs, digest=None, every=None):
+    kw = {} if every is None else {"every": every}            # rev 2: `every`, the list names the whole latest day
     return osx.Follow(ids=tuple(i for i, _ in pairs), names=tuple(n for _, n in pairs),
-                      digest=digest or hashlib.sha256(repr(pairs).encode()).hexdigest())
+                      digest=digest or hashlib.sha256(repr(pairs).encode()).hexdigest(), **kw)
 
 
 def two_book(equity=100_000.0, min_trade_pct=0.0, wanted=None):
@@ -5987,3 +5988,159 @@ def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path,
         _shutil.rmtree(tmp_path / f"base{k}")
         _shutil.rmtree(tmp_path / f"mine{k}")
     assert sends > 30
+
+
+# ==== T32 rev 2
+
+# ---- outcome 3: a list that names every strategy of the paper book's latest day is the whole book, to the last
+# digit, for any number of strategies (the paper book steps each on equity / n, paper.py)
+
+NAMES7 = ("s1", "s2", "s3", "s4", "s5", "s6", "s7")
+
+
+def _random_book(rng, n):
+    equity = rng.choice([10_000.0, 100_000.0, 123_456.78, 1_000_003.0, 7.5e6, 99_999.99,
+                         6_519_413.8, 8_359_293.39, 3_753_283.17, 7_889_346.28])   # (equity / n) x n != equity
+    wanted = {s: {sym: float(rng.choice([0, 0, 2, 5, 9, 12.5, -3, 0.37, 1e-7, 333.3333, 17.0, 1.0 / 3]))
+                  for sym in rng.sample(["SPY", "QQQ", "IWM", "TLT"], rng.randint(1, 4))} for s in NAMES7[:n]}
+    return paper(wanted, equity=equity, share=equity / max(n, 1), min_trade_pct=rng.choice([0.0, 0.002, 0.02, 0.05]))
+
+
+def _every(n):
+    return _follow(*[(k + 1, s) for k, s in enumerate(NAMES7[:n])], every=True)
+
+
+@pytest.mark.parametrize("n", [2, 3, 5, 7])
+def test_t32_rev2_every_strategy_followed_targets_on_the_paper_equity_over_generated_books(n):
+    rng = random.Random(4_000 + n)
+    differs = 0
+    for _ in range(60):                                               # 240 books in all
+        book = _random_book(rng, n)
+        capital = rng.choice([1.0, 7_500.0, 50_000.0, 250_000.0, 99_999.99, book.equity])
+        whole = osx.targets(book, capital)
+        names = list(NAMES7[:n])
+        rng.shuffle(names)
+        assert osx.targets(book, capital, follow=tuple(names), every=True) == whole
+        part = osx.targets(book, capital, follow=tuple(names))           # not every: capital / (share x n), as rev 1
+        scale = capital / (book.share * n)
+        assert part[1] == {s: {sym: u * scale for sym, u in b.items()} for s, b in book.wanted.items()}
+        differs += book.share * n != book.equity
+    assert n == 2 or differs > 0                                      # share x n is not the equity in some books
+
+
+def _every_scenario(tmp, seed, monkeypatch, n, follow):
+    """_both_scenario on an n-strategy book: every strategy followed (every=True), or no follow list."""
+    rng = random.Random(seed)
+    urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
+    monkeypatch.setattr("os.urandom", lambda k: bytes(urandom.getrandbits(8) for _ in range(k)))
+    monkeypatch.setattr("secrets.randbelow", lambda k: numbers.randrange(k))
+    held = {"OWN": float(rng.randint(0, 5)), "SPY": float(rng.choice([0, 0, 3]))}
+    venue = Booked({s: u for s, u in held.items() if u}, cash=rng.choice([5_000.0, 50_000.0, 1e7]))
+    venue.fill_at_once = rng.choice([0.0, 0.5, 1.0])
+    w = ticket_world(tmp, venue)
+    w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": rng.choice([1, 2, 3, 40])}))
+    kw = {}
+    if rng.random() < 0.3:
+        kw["fractional"] = True
+    if rng.random() < 0.6:
+        kw["capital"] = rng.choice([7_500.0, 50_000.0, 250_000.0, 333_333.0])
+    if follow:
+        kw["follow"] = _every(n)
+    seen, number = [], None
+    for day in range(2):
+        w.paper = _random_book(rng, n)
+        for sym in ("SPY", "QQQ", "IWM", "TLT"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 0.37, 7.77])
+            w.quote_age[sym] = rng.choice([60.0, 60.0, 1500.0])
+        for run in range(rng.randint(1, 3)):
+            if run:
+                w.later(rng.choice([1, 5, 30]))
+            mode = rng.choice(["scheduled", "scheduled", "propose", "approve"])
+            if seen and seen[-1]["mode"] == "propose" and number and rng.random() < 0.7:
+                mode = "approve"
+            run_kw = dict(kw)
+            if mode == "propose":
+                run_kw["propose"] = True
+            elif mode == "approve":
+                run_kw["approve"] = number or "000000"
+            w.venue.calls.clear()
+            out = w.run(**run_kw)
+            if out.get("ticket_number"):
+                number = out["ticket_number"]
+            journal = {f.name: [_strip_follow(json.loads(line)) for line in
+                                _STAMP.sub(b'"timestamp": "T"', f.read_bytes()).decode().splitlines()]
+                       for f in sorted((w.tmp / "journal").glob("*"))}
+            seen.append({"mode": mode, "calls": list(w.venue.calls),
+                         "summary": _strip_follow(json.loads(json.dumps(out, default=str))),
+                         "followed": out.get("follow"), "journal": journal, "state": _dump(w.state_path),
+                         "ledger": _dump(w.ledger_path), "tickets": _dump(osx.ticket_path_for(w.state_path))})
+        w.next_day()
+    monkeypatch.undo()
+    return seen
+
+
+@pytest.mark.parametrize("n", [2, 3, 5, 7])
+def test_t32_rev2_following_every_strategy_is_the_whole_book_over_generated_books(tmp_path, monkeypatch, n):
+    """50 scenarios per n, 200 in all: orders sent, smallest-trade decisions, journal lines and every file equal,
+    apart from the follow field."""
+    counts = {"submit": 0, "smallest": 0}
+    for k in range(50):
+        seed = 640_000 + n * 1_000 + k
+        whole = _every_scenario(tmp_path / f"whole{k}", seed, monkeypatch, n, follow=False)
+        every = _every_scenario(tmp_path / f"every{k}", seed, monkeypatch, n, follow=True)
+        assert len(whole) == len(every)
+        for i, (a, b) in enumerate(zip(whole, every)):
+            assert a["followed"] is None and b["followed"] == {"ids": list(range(1, n + 1)), "names": list(NAMES7[:n])}
+            for key in a:
+                if key != "followed":
+                    assert a[key] == b[key], (seed, i, key)
+        counts["submit"] += sum(1 for r in every for c in r["calls"] if c[0] == "submit")
+        counts["smallest"] += sum(1 for r in every for s in r["summary"]["skipped"] if "smallest trade" in s["reason"])
+        _shutil.rmtree(tmp_path / f"whole{k}")
+        _shutil.rmtree(tmp_path / f"every{k}")
+    assert counts["submit"] > 30 and counts["smallest"] > 5, counts
+
+
+def test_t32_rev2_every_must_be_true_or_false(world):
+    world.paper = two_book()
+    out = world.run(capital=10_000.0, follow=_follow((26, H26), every="yes"))
+    assert out["status"] == "stopped" and out["stage"] == "follow" and world.venue.submits() == [], out
+
+
+# ---- outcome 6: the kinds judge_follow names read as English
+
+@pytest.mark.parametrize("raw", [26, 10**30, 2.5, "26", True, False, None, [26], {"a": 1}])
+def test_t32_rev2_every_kind_the_follow_judge_names_reads_as_english(raw):
+    import re
+    whys = [osx.judge_follow(raw)[1], osx.judge_follow({"follow": raw})[1], osx.judge_follow({"follow": [raw]})[1]]
+    for why in whys:
+        if why is None:
+            continue
+        assert not re.search(r"\ba [aeiouAEIOU]", why), why
+        for bad in (" a int", " a bool", " a str", " a float", " a NoneType", " a dict", "a bytes"):
+            assert bad not in why, why
+        assert len(why) < 300
+    assert "not the number 26" in osx.judge_follow(26)[1]
+    assert "not true or false" in osx.judge_follow(True)[1]
+
+
+@pytest.mark.parametrize("equity, n", [(3_972_837.94, 3), (3_663_232.28, 3), (6_392_745.55, 5), (2_903_196.77, 5),
+                                      (3_698_843.19, 7), (7_801_895.21, 7)])
+def test_t32_rev2_every_strategy_followed_keeps_the_whole_books_smallest_trade_at_its_edge(tmp_path, equity, n):
+    """A difference worth exactly the smaller of the two smallest trades (capital / equity, and capital / (share x n),
+    which differ in the last digit for these books): followed whole, it is decided as the whole book decides it."""
+    capital, pct = 50_000.0, 0.02
+    book = paper({**{s: {"TLT": 5.0} for s in NAMES7[1:n]}, "s1": {"SPY": 1.2 * equity / capital}},
+                 equity=equity, share=equity / n, min_trade_pct=pct)
+    whole_min = book.min_trade_pct * book.share * capital / book.equity
+    part_min = book.min_trade_pct * book.share * capital / (float(book.share) * n)
+    assert whole_min != part_min
+    decided = []
+    for k, follow in enumerate((None, _every(n))):
+        w = World(tmp_path / f"w{k}")
+        w.paper = book
+        w.prices["SPY"] = min(whole_min, part_min)                    # 1 share, worth exactly the smaller of the two
+        out = w.run(capital=capital, **({} if follow is None else {"follow": follow}))
+        assert out["status"] == "done", out
+        decided.append(("SPY" in units_sent(w), [s["reason"] for s in out["skipped"] if s["symbol"] == "SPY"]))
+    assert decided[0] == decided[1], decided

@@ -321,6 +321,7 @@ def _ledger_with(repo, name="hold_rebalance_etf_2006_2026"):
     led = lg.HypothesisLedger(repo / "memory" / "ledger.db")
     try:
         hid = led.propose("Hold a fixed basket and rebalance it", "test", "us-etf+crypto")
+        led.set_status(hid, "passed paper")                 # T32 rev 2: a hypothesis the paper command steps
     finally:
         led.close()
     (repo / "strategies").mkdir(exist_ok=True)
@@ -409,7 +410,8 @@ def _plants():
             ("go_live.json", {**CHECKLIST, "min_paper_broker_days": SMALL}),
             ("go_live.json", {**CHECKLIST, "min_reconciled_fills": SMALL, "min_fills_checked_by_hand": SMALL,
                               "min_days_since_a_stopped_run": SMALL}),
-            ("risk.json", {**LIMITS, "max_open_positions": NUMBER}), ("risk.json", {**LIMITS, "max_drawdown_pct": 8.37194}),
+            ("risk.json", {**LIMITS, "max_open_positions": NUMBER}), ("risk.json", {**LIMITS, "max_open_positions": SMALL}),
+            ("risk.json", {**LIMITS, "max_daily_loss_pct": NUMBER}), ("risk.json", {**LIMITS, "max_position_pct": SMALL}),
             ("risk.json", {**LIMITS, "max_orders_per_day": NUMBER}),
             ("broker_book.json", {"follow": [837194648]}), ("broker_book.json", {"follow": [1, 837194648]}),
             ("broker_book.json", {"follow": [837194648, 837194648]}), ("broker_book.json", {"follow": [8.37194]}),
@@ -474,16 +476,109 @@ def test_t32_a1_a_short_paper_record_names_what_is_short_not_the_owners_figures(
     assert str(SMALL) not in detail and "needed" not in detail
 
 
-def test_t32_a1_the_risk_limits_are_shown_only_when_short(tmp_path):
+def _b8fcd2d_row(limits):
+    """The risk-limits row as b8fcd2d writes it for a file it accepts (valedia_trader/doctor.py there)."""
+    text = (f"daily loss {limits['max_daily_loss_pct']}%, drawdown {limits['max_drawdown_pct']}%, position {limits['max_position_pct']:.0%}, "
+            f"{limits['max_open_positions']} positions")
+    if all(limits.get(k) == v for k, v in risk_gate.DEFAULT_LIMITS.items()):
+        return D.ATTENTION, text + "; these are still the guide's example limits, not yours"
+    return D.OK, text
+
+
+IN_RANGE = [{"max_drawdown_pct": 17.75}, {"max_daily_loss_pct": 0.125}, {"max_open_positions": 2},
+            {"max_open_positions": 25}, {"max_position_pct": 0.5}, {"max_daily_loss_pct": 2}, {"max_drawdown_pct": 25},
+            {"max_daily_loss_pct": 0.5}, {"max_position_pct": 0.125}, {"max_drawdown_pct": 0.125},
+            {"max_drawdown_pct": 17.75, "max_daily_loss_pct": 0.125, "max_position_pct": 0.5, "max_open_positions": 25},
+            {"max_orders_per_day": 25}, {"max_open_positions": 1}, {"max_open_positions": 1000}, {}]
+
+
+@pytest.mark.parametrize("over", IN_RANGE)
+def test_t32_rev2_the_risk_limits_row_shows_in_range_limits_as_b8fcd2d_did(tmp_path, over):
     p = _paths(tmp_path)
-    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_drawdown_pct": 6.0}))
+    limits = {**risk_gate.DEFAULT_LIMITS, **over}
+    p.risk_limits.write_text(json.dumps(limits))
+    assert D.check_risk_limits(p) == _b8fcd2d_row(limits)
+    assert "not shown" not in D.check_risk_limits(p)[1] and "out of range" not in D.check_risk_limits(p)[1]
+
+
+def test_t32_rev2_the_risk_limits_row_on_the_tracked_file_is_b8fcd2d_s():
+    tracked = D.REPO / "config" / "risk.json"
+    assert D.check_risk_limits(LoopPaths(D.REPO)) == _b8fcd2d_row(json.loads(tracked.read_text()))
+
+
+@pytest.fixture(scope="module")
+def b8fcd2d_doctor(tmp_path_factory):
+    """valedia_trader/doctor.py at b8fcd2d (needs git: the lead runs this one)."""
+    import importlib.util
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", "b8fcd2d:valedia_trader/doctor.py"], capture_output=True,
+                         check=True).stdout
+    path = tmp_path_factory.mktemp("b8fcd2d_doctor") / "doctor_b8fcd2d.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("doctor_b8fcd2d", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["doctor_b8fcd2d"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("over", IN_RANGE)
+def test_t32_rev2_the_risk_limits_row_is_b8fcd2d_s_byte_for_byte(tmp_path, b8fcd2d_doctor, over):
+    p = _paths(tmp_path)
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, **over}))
+    assert D.check_risk_limits(p) == b8fcd2d_doctor.check_risk_limits(p)
+    tracked = LoopPaths(D.REPO)
+    assert D.check_risk_limits(tracked) == b8fcd2d_doctor.check_risk_limits(tracked)
+
+
+@pytest.mark.parametrize("over, words", [({"max_open_positions": NUMBER}, "positions out of range"),
+                                         ({"max_open_positions": 1001}, "positions out of range"),
+                                         ({"max_open_positions": SMALL}, "positions out of range")])
+def test_t32_rev2_a_limit_out_of_its_range_is_described_not_quoted(tmp_path, over, words):
+    p = _paths(tmp_path)
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, **over}))
     status, detail = D.check_risk_limits(p)
-    assert status == D.OK and "drawdown 6.0%" in detail
-    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_open_positions": NUMBER,
-                                         "max_daily_loss_pct": 1.23456}))
+    assert words in detail and str(over["max_open_positions"]) not in detail
+    assert "daily loss 2.0%, drawdown 8.0%, position 10%" in detail                    # the others as before
+
+
+@pytest.mark.parametrize("value", ["U83719464851", None, [1], True])
+def test_t32_rev2_a_limit_that_is_not_a_number_is_described_not_quoted(tmp_path, value):
+    p = _paths(tmp_path)
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, "max_drawdown_pct": value}))
     status, detail = D.check_risk_limits(p)
-    assert status == D.OK and str(NUMBER)[:5] not in detail and "1.234" not in detail
-    assert "positions not shown" in detail and "daily loss not shown" in detail
+    assert status == D.FAIL and "max_drawdown_pct is not a number" in detail and "every order is blocked" in detail
+    assert not [x for x in _pieces(json.dumps(value)) if x in detail]
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_t32_rev2_an_unknown_key_of_the_limits_file_is_counted_not_named(tmp_path, n):
+    p = _paths(tmp_path)
+    p.risk_limits.write_text(json.dumps({**risk_gate.DEFAULT_LIMITS, **{f"{PLANTED['token']}{i}": 1 for i in range(n)}}))
+    status, detail = D.check_risk_limits(p)
+    assert status == D.FAIL and f"holds {n} key{'s' if n != 1 else ''} that {'is' if n == 1 else 'are'} not a known limit" in detail
+    assert not [x for x in _pieces(PLANTED["token"]) if x in detail]
+
+
+# ---- T32 rev 2 outcome 2, at the doctor: a followed hypothesis the paper command does not step
+
+@pytest.mark.parametrize("status", ["paused", "retired", "untested", "failed"])
+def test_t32_rev2_the_doctor_says_a_followed_hypothesis_is_not_stepped_and_live_mode_would_stop(live_repo, status):
+    from valedia_trader.research_loop import ledger as lg
+    hid = _ledger_with(live_repo)
+    led = lg.HypothesisLedger(live_repo / "memory" / "ledger.db")
+    try:
+        led.set_status(hid, status)
+    finally:
+        led.close()
+    _owner(live_repo, "broker_book.json", {"follow": [hid]})
+    status_, detail = _venues(live_repo)
+    assert (f"broker book: not followed: config/broker_book.json names a hypothesis whose status in the research ledger "
+            f"is {status}") in detail and "live mode would stop for that" in detail
+    assert f"hypothesis {hid}" not in detail
 
 
 def test_t32_a2_the_proposal_only_list_names_the_capital_the_money_at_work_and_the_environment_names(live_repo):

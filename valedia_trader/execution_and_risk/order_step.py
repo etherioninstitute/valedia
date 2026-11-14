@@ -451,19 +451,33 @@ class Follow:
     """Which strategies of the paper book the broker book follows (config/broker_book.json, T32), as the command
     line reads it: the hypothesis ids the owner named, their strategies' names in the same order, and a digest of
     the file's value and the names (a live ticket is bound to it); or `refused`, why the file or one of its ids
-    cannot be followed, in words a person can act on (the run stops)."""
+    cannot be followed, in words a person can act on (the run stops). `every` (rev 2): the names are every strategy
+    of the paper book's latest day, so the broker book is the whole book, sized on the paper equity."""
     ids: tuple = ()
     names: tuple = ()
     digest: str | None = None
     refused: str | None = None
+    every: bool = False
 
 
 def _json_kind(x) -> str:
+    """What a JSON value is, in words (rev 2: every kind reads as English)."""
+    if type(x) is bool:
+        return "true or false"
     if isinstance(x, str):
         return f"the text {json.dumps(x[:40])}"
     if isinstance(x, float):
         return f"the number {x!r}"
-    return {dict: "an object", list: "a list", type(None): "null"}.get(type(x), f"a {type(x).__name__}")
+    if isinstance(x, int):
+        shown = str(x)
+        return f"the number {shown}" if len(shown) <= 40 else f"a number of {len(shown)} digits"
+    if isinstance(x, dict):
+        return "an object"
+    if isinstance(x, list):
+        return "a list"
+    if x is None:
+        return "null"
+    return "a value that is not JSON"
 
 
 def judge_follow(raw) -> tuple[tuple[int, ...] | None, str | None]:
@@ -511,20 +525,24 @@ def _follow_problem(f) -> str | None:
         return "its names are not distinct plain strategy names"
     if type(f.digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", f.digest):
         return "it carries no digest of the file it was read from"
+    if type(f.every) is not bool:
+        return "it does not say (true or false) whether it names every strategy of the paper book"
     return None
 
 
-def _book_capital(paper: PaperTargets, follow) -> float:
-    """What the broker capital is spread over: the paper equity (the whole book), or the paper share of each
-    strategy followed."""
-    return float(paper.equity) if follow is None else float(paper.share) * len(follow)
+def _book_capital(paper: PaperTargets, follow, every: bool = False) -> float:
+    """What the broker capital is spread over: the paper equity (the whole book, or a list that names every
+    strategy of the paper book's latest day: rev 2), or the paper share of each strategy followed."""
+    return float(paper.equity) if follow is None or every is True else float(paper.share) * len(follow)
 
 
-def targets(paper: PaperTargets, capital: float, follow=None) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+def targets(paper: PaperTargets, capital: float, follow=None,
+            every: bool = False) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """(per symbol, per strategy and symbol) target units at the broker: the paper's wanted units times
     capital / paper equity. With `follow` (strategy names), only those strategies, each on an equal part of the
-    capital: their wanted units times capital / (paper share x number followed)."""
-    scale = float(capital) / _book_capital(paper, follow)
+    capital: their wanted units times capital / (paper share x number followed); with `every` (they are every
+    strategy of the paper book's latest day), capital / paper equity, the whole book's scale."""
+    scale = float(capital) / _book_capital(paper, follow, every)
     per_strategy = {s: {sym: float(u) * scale for sym, u in book.items()} for s, book in paper.wanted.items()
                     if follow is None or s in follow}
     per_symbol: dict[str, list[float]] = {}
@@ -1377,7 +1395,7 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     if follow is not None:
         run.follow, run.follow_problem = follow, _follow_problem(follow)
         if run.follow_problem is None:
-            run.follow_names = follow.names
+            run.follow_names, run.follow_every = follow.names, follow.every
     if live is not None:
         run.live = live
         run.expected_env = LIVE_ENVIRONMENT
@@ -1447,6 +1465,7 @@ class _Run:
         self.follow = None                               # T32: the Follow given (None: the whole book)
         self.follow_problem = None                       # why it cannot be followed, or None
         self.follow_names: tuple | None = None           # the strategies followed, once the Follow is well formed
+        self.follow_every = False                        # rev 2: they are every strategy of the latest day
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -1596,8 +1615,8 @@ class _Run:
                 raise _Stop("targets", f"the capital must be a positive finite number, not {capital!r}")
             self.capital_used = float(capital)
             self.paper_equity = paper.equity
-            self.target_units, per_strategy = targets(paper, float(capital), self.follow_names)
-            if self.follow_names is None:
+            self.target_units, per_strategy = targets(paper, float(capital), self.follow_names, self.follow_every)
+            if self.follow_names is None or self.follow_every:
                 min_value = paper.min_trade_pct * paper.share * float(capital) / paper.equity
             else:                                        # T32: the smallest trade at the followed strategies' scale
                 min_value = paper.min_trade_pct * paper.share * float(capital) / _book_capital(paper, self.follow_names)

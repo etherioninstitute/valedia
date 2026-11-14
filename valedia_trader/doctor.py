@@ -26,7 +26,6 @@ from valedia_trader.research_loop import LoopPaths, risk_gate
 
 REPO = Path(__file__).resolve().parents[1]
 OK, ATTENTION, FAIL = "ok", "attention", "fail"
-SHOWN_MAX = 4                   # T32 A1: the longest figure from an owner's file the doctor shows (no piece of 5)
 
 
 def _get(url: str, timeout: float = 3.0) -> dict:
@@ -63,18 +62,59 @@ def check_ledger(paths: LoopPaths) -> tuple[str, str]:
     return (OK if live else ATTENTION), text + ("" if live else "; nothing has passed the gate, so nothing trades")
 
 
+# T32 rev 2: the range in which each limit the row shows is a limit (the risk gate's own ranges; the gate sets no top
+# to the count of positions, the row does: a longer figure there is more likely an account number typed by mistake)
+LIMIT_RANGES = {"max_daily_loss_pct": (0.0, 100.0), "max_drawdown_pct": (0.0, 100.0), "max_position_pct": (0.0, 1.0),
+                "max_open_positions": (0, 1000)}         # a whole number from 1 (checked below) to 1,000
+_LIMIT_LABELS = {"max_daily_loss_pct": "daily loss", "max_drawdown_pct": "drawdown", "max_position_pct": "position",
+                 "max_open_positions": "positions"}
+
+
+def _limit_in_range(key: str, value) -> bool:
+    low, high = LIMIT_RANGES[key]
+    if type(value) not in (int, float) or not low < value <= high or value != value:
+        return False
+    return key != "max_open_positions" or value >= 1 and int(value) == value
+
+
+def _limits_described(path) -> str:
+    """What is wrong with the limits file, in the doctor's words, with nothing from inside it (T32 A1, rev 2):
+    unknown keys counted, a known limit that is not a number or out of its range named as such; "" when none of
+    that can be said."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    said = []
+    unknown = sum(1 for k in data if k not in risk_gate.DEFAULT_LIMITS and k not in risk_gate.OPTIONAL_LIMITS)
+    if unknown:
+        said.append(f"it holds {unknown} key{'s' if unknown != 1 else ''} that {'is' if unknown == 1 else 'are'} "
+                    "not a known limit")
+    for key in LIMIT_RANGES:
+        if key in data:
+            v = data[key]
+            if type(v) not in (int, float) or v != v or v in (float("inf"), float("-inf")):
+                said.append(f"{key} is not a number")
+            elif not _limit_in_range(key, v):
+                said.append(f"{key} is out of range")
+    return "; ".join(said)
+
+
 def check_risk_limits(paths: LoopPaths) -> tuple[str, str]:
     try:
         limits = risk_gate.load_limits(paths.risk_limits)
     except risk_gate.RiskConfigError as exc:
-        return FAIL, f"{exc}; every order is blocked until this is fixed"
-    # T32 A1: a figure is shown only when it is at most 4 characters; a longer one may be something typed there by
-    # mistake (an account number), so only that it is set is said
-    figures = [(f"{limits['max_daily_loss_pct']}", "daily loss {}%"), (f"{limits['max_drawdown_pct']}", "drawdown {}%"),
-               (f"{limits['max_position_pct'] * 100:.0f}", "position {}%"), (f"{limits['max_open_positions']}", "{} positions")]
-    text = ", ".join(form.format(v) if len(v) <= SHOWN_MAX else
-                     form.replace("{}%", "").replace("{} ", "").strip() + " not shown (more than 4 characters)"
-                     for v, form in figures)
+        said = _limits_described(paths.risk_limits)
+        return FAIL, f"{exc}{f' ({said})' if said else ''}; every order is blocked until this is fixed"
+    # T32 rev 2: every limit inside its range is shown as b8fcd2d showed it; one outside is said to be out of range
+    # and not quoted (A1: no figure from inside the file that is not a limit)
+    parts = {"max_daily_loss_pct": f"daily loss {limits['max_daily_loss_pct']}%",
+             "max_drawdown_pct": f"drawdown {limits['max_drawdown_pct']}%",
+             "max_position_pct": f"position {limits['max_position_pct']:.0%}",
+             "max_open_positions": f"{limits['max_open_positions']} positions"}
+    text = ", ".join(parts[k] if _limit_in_range(k, limits[k]) else f"{_LIMIT_LABELS[k]} out of range" for k in parts)
     if all(limits.get(k) == v for k, v in risk_gate.DEFAULT_LIMITS.items()):
         return ATTENTION, text + "; these are still the guide's example limits, not yours"
     return OK, text
@@ -342,6 +382,12 @@ def plain_follow_refusal(refused: str, shown: str) -> str:
     if rest.startswith(_READ_WHYS) or rest.startswith("could not be judged ("):
         return refused                                  # the reading function's own words, or an error's type
     if rest.startswith("names hypothes"):
+        marker = ", whose status in the research ledger is "
+        if marker in rest:                              # rev 2: a hypothesis the paper command does not step
+            from valedia_trader.research_loop.ledger import STATUSES
+            status = rest.split(marker, 1)[1].split(";", 1)[0]
+            said = status if status in STATUSES else "one the paper command does not step"
+            return f"{shown} names a hypothesis whose status in the research ledger is {said}"
         for end, words in ((", which the research ledger does not hold", "names a hypothesis the research ledger does not hold"),
                            ("whose strategy has no plain name", "names a hypothesis whose strategy has no plain name"),
                            ("; follow it once", "names two hypotheses whose strategies share one name")):

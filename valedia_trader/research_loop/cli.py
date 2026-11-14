@@ -311,8 +311,10 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
     `refused`, why the file or an id cannot be followed, in words a person can act on. Read through
     webull.read_owner_file (a link, a second name, a file writable by others, a repeated key, NaN and the rest are
     refused). In live mode the file is the repository's own (webull.LIVE_REPO) and a missing file is refused: live
-    mode never follows the whole book by default. With `trader` (a PaperTrader) each name must also be among the
-    strategies of the paper book's latest day. `ledger` None: the research ledger is opened only when its file is
+    mode never follows the whole book by default. Each id must be a hypothesis the paper command steps (its ledger
+    status one of PAPER_STATUSES, T32 rev 2). With `trader` (a PaperTrader) each name must also be among the
+    strategies of the paper book's latest day, and `every` says whether the names are all of them (the broker book
+    is then the whole book, on the paper equity). `ledger` None: the research ledger is opened only when its file is
     there (a missing one is never made). Never raises; writes, creates or repairs nothing."""
     import hashlib
     import os
@@ -345,9 +347,14 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
             names: list[str] = []
             for hid in ids:
                 try:
-                    ledger.get(hid)
+                    status = ledger.get(hid).get("status")
                 except LedgerError:
                     return Follow(refused=f"{shown} names hypothesis {hid}, which the research ledger does not hold")
+                if status not in PAPER_STATUSES:            # rev 2: only a hypothesis the paper command steps today
+                    from valedia_trader.research_loop.ledger import STATUSES
+                    said = status if status in STATUSES else "not one it knows"
+                    return Follow(refused=f"{shown} names hypothesis {hid}, whose status in the research ledger is "
+                                          f"{said}; the paper command steps only {' and '.join(PAPER_STATUSES)}")
                 try:
                     name = _strategy_for(paths, ledger, hid, None)[0].name
                 except Exception as exc:
@@ -373,7 +380,8 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
                                           f"the paper book's latest day ({day}: {', '.join(sorted(latest)) or 'none'})")
         digest = hashlib.sha256(json.dumps({"file": raw, "ids": list(ids), "names": names}, sort_keys=True,
                                            ensure_ascii=True, allow_nan=False).encode()).hexdigest()
-        return Follow(ids=tuple(ids), names=tuple(names), digest=digest)
+        every = trader is not None and set(names) == set(latest)     # rev 2: the whole latest day is followed
+        return Follow(ids=tuple(ids), names=tuple(names), digest=digest, every=every)
     except Exception as exc:                             # nothing about the broker book file may raise
         return Follow(refused=f"{shown} could not be judged ({type(exc).__name__})")
 
@@ -605,7 +613,8 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
             if Path(order_step.ticket_path_for(order_step.state_path_for(ledger_path, go_live.LIVE_VENUE))).exists():
                 _run_live(args, paths, _LockStub(), files, second_opinion)
         return 2
-    follow = broker_book_follow(paths, live=True)        # T32: before any venue is built; never the whole book
+    trader = PaperTrader(paths.journal, paths.risk_limits)   # rev 2: judged in full (latest day too) before any venue
+    follow = broker_book_follow(paths, live=True, trader=trader)   # T32: before any venue is built; never the whole book
     if follow.refused is not None:
         print(f"refused: {follow.refused}; nothing was read from the account and no quote was asked", file=sys.stderr)
         if args.approve is not None:                    # the refused approve is marked, as for a lock unmet
