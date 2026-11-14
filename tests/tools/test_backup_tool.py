@@ -19,7 +19,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -246,50 +245,28 @@ def test_triggers_application_id_and_user_version_come_out_unchanged(repo):
             c.execute("UPDATE ledger SET payload = x'00' WHERE seq = 1")
 
 
-def _start_writer(path, stop, log, pad=2000):
-    def work():
-        conn = sqlite3.connect(path, timeout=60, isolation_level=None)
-        n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
-        try:
-            while not stop.is_set():
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    n += 1
-                    conn.execute("INSERT INTO ledger VALUES (?, ?)", (n, b"y" * pad))
-                    conn.execute("INSERT INTO mirror VALUES (?)", (n,))
-                    conn.execute("UPDATE meta SET last = ?", (n,))
-                    conn.execute("COMMIT")
-                    log.append(n)
-                except sqlite3.Error as exc:                  # a busy moment is not a failure of the writer
-                    log.append(f"error: {exc}")
-                    with contextlib.suppress(sqlite3.Error):
-                        conn.execute("ROLLBACK")
-                    n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
-        finally:
-            conn.close()
-    t = threading.Thread(target=work, daemon=True)
-    t.start()
-    return t
-
-
 @pytest.mark.parametrize("mode", ["wal", "delete"])
 def test_database_written_during_the_backup_comes_out_consistent(small_repo, mode, capsys):
     live = small_repo.root / "memory" / "orderbook_loop.sqlite"
     make_db(live, mode=mode, rows=12000, pad=4000)                  # about 50 MB: the copy takes a while
-    stop, log = threading.Event(), []
-    t = _start_writer(live, stop, log)
+    stop = small_repo.base / "stop_writer"
+    writer = subprocess.Popen([sys.executable, "-c", WRITER, str(live), str(stop), "6000"])   # capped: 6000 rows
     try:
         deadline = time.monotonic() + 30
-        while len([x for x in log if isinstance(x, int)]) < 20 and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            with contextlib.suppress(sqlite3.Error):
+                with contextlib.closing(sqlite3.connect(f"{live.as_uri()}?mode=ro", uri=True)) as c:
+                    if c.execute("SELECT last FROM meta").fetchone()[0] > 12000 + 20:
+                        break
             time.sleep(0.01)
-        before = len(log)
         code = run(small_repo)
-        during = len(log) - before
     finally:
-        stop.set()
-        t.join(timeout=60)
+        stop.write_text("stop")
+        try:
+            writer.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            writer.kill()                                      # the process this test started, by its handle
     assert code == 0, capsys.readouterr().err
-    assert not [x for x in log if isinstance(x, str) and "locked" not in x and "busy" not in x]
     folder = newest(small_repo.dest)
     cpy = folder / "memory" / "orderbook_loop.sqlite"
     e = entry(manifest_of(folder), "memory/orderbook_loop.sqlite")
@@ -301,8 +278,6 @@ def test_database_written_during_the_backup_comes_out_consistent(small_repo, mod
         assert c.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
     assert n_ledger == n_mirror == top == last        # one snapshot: the three agree
     assert n_ledger >= 12000 + 20
-    if mode == "wal":
-        assert during >= 1                            # the writer really did commit while the copy ran
 
 
 # --------------------------------------------------------------------------------------- outcome: sources untouched
@@ -528,7 +503,7 @@ def test_retention_does_not_let_partial_backups_push_out_the_last_complete_one(s
     monkeypatch.setattr(backup, "utcnow", clock)
     assert run(small_repo) == 0
     good = newest(small_repo.dest).name
-    write_file(small_repo.root / "memory" / "broken.sqlite", b"this is not a database at all")
+    _make_corrupt_db(small_repo.root / "memory" / "broken.sqlite")
     for _ in range(16):
         clock.advance()
         assert run(small_repo) == 1
@@ -536,6 +511,11 @@ def test_retention_does_not_let_partial_backups_push_out_the_last_complete_one(s
 
 
 # --------------------------------------------------------------------------------------- outcome: failures are named
+def _make_corrupt_db(path):
+    make_db(path, rows=800, pad=300)
+    _break_pages(path)
+
+
 def _break_pages(path):
     data = bytearray(path.read_bytes())
     for page in (2, 3, 4):                           # smash table pages, keep the 100-byte header intact
@@ -560,14 +540,14 @@ def test_corrupt_sources_are_reported_with_exit_1_and_the_rest_is_backed_up(repo
     folder = newest(repo.dest)
     m = manifest_of(folder)
     assert m["status"] == "partial"
-    assert failed_paths(m) == {"memory/garbage.sqlite", "memory/broken.sqlite"}
+    assert failed_paths(m) == {"memory/broken.sqlite"}                        # a non-database name is not a failure
     assert "memory/garbage.sqlite" in captured.err and "memory/broken.sqlite" in captured.err
     assert not (folder / "memory" / "broken.sqlite").exists()                 # a corrupt database: left out
     assert (folder / "memory" / "garbage.sqlite").read_bytes() == b"this is not a database at all, just text"
     assert entry(m, "memory/garbage.sqlite")["not_a_database"] is True       # not a database: a flagged plain copy
     assert {e["path"] for e in m["files"]} >= {"memory/rollback.sqlite", "memory/wal_open.sqlite",
                                                 "journal/2026-11-12.jsonl", "config/risk.json"}
-    assert all(e["path"] not in failed_paths(m) for e in m["files"] if e["path"] != "memory/garbage.sqlite")
+    assert all(e["path"] not in failed_paths(m) for e in m["files"])
 
 
 @pytest.mark.skipif(IS_ROOT, reason="root can read anything")
@@ -631,7 +611,7 @@ def test_no_backup_possible_exits_2(tmp_path, capsys):
     assert backup.main(["run", "--root", str(tmp_path / "missing"), "--dest", str(tmp_path / "dest")]) == 2
     only_bad = tmp_path / "only_bad"
     write_file(only_bad / "memory" / "bad.sqlite", b"not a database")
-    assert backup.main(["run", "--root", str(only_bad), "--dest", str(tmp_path / "dest2")]) == 1   # kept as a plain file
+    assert backup.main(["run", "--root", str(only_bad), "--dest", str(tmp_path / "dest2")]) == 0   # kept as a plain file
     corrupt_only = tmp_path / "corrupt_only"
     make_db(corrupt_only / "memory" / "broken.sqlite", rows=800, pad=300)
     _break_pages(corrupt_only / "memory" / "broken.sqlite")
@@ -754,7 +734,7 @@ def test_verify_names_missing_and_unlisted_files(repo):
 
 
 def test_verify_of_a_partial_backup_says_so_and_exits_1(small_repo):
-    write_file(small_repo.root / "memory" / "broken.sqlite", b"not a database")
+    _make_corrupt_db(small_repo.root / "memory" / "broken.sqlite")
     assert run(small_repo) == 1
     code, lines = backup.verify_backup(newest(small_repo.dest))
     assert code == 1 and "PARTIAL" in "\n".join(lines) and "memory/broken.sqlite" in "\n".join(lines)
@@ -772,7 +752,7 @@ def test_list_shows_the_backups_with_sizes(small_repo, monkeypatch, capsys):
     monkeypatch.setattr(backup, "utcnow", clock)
     assert run(small_repo) == 0
     clock.advance()
-    write_file(small_repo.root / "memory" / "broken.sqlite", b"not a database")
+    _make_corrupt_db(small_repo.root / "memory" / "broken.sqlite")
     assert run(small_repo) == 1
     write_file(small_repo.dest / "20190101T000000Z" / "foreign.txt", "x")        # not ours: not listed
     capsys.readouterr()
@@ -869,9 +849,11 @@ def test_restore_of_a_backup_with_pruned_large_files_says_what_is_missing(tmp_pa
 WRITER = r'''
 import os, sqlite3, sys
 path, stop = sys.argv[1:3]
+cap = int(sys.argv[3]) if len(sys.argv) > 3 else 20000          # every writer is capped
 conn = sqlite3.connect(path, timeout=60, isolation_level=None)
 n = conn.execute("SELECT MAX(seq) FROM ledger").fetchone()[0]
-while not os.path.exists(stop):
+stop_at = n + cap
+while not os.path.exists(stop) and n < stop_at:
     try:
         conn.execute("BEGIN IMMEDIATE")
         n += 1
@@ -1224,15 +1206,23 @@ def test_a_file_that_changed_while_copied_is_copied_again_up_to_three_times(smal
 
 
 def test_a_file_with_a_database_name_that_is_not_one_is_kept_as_a_plain_file_and_flagged(small_repo, capsys):
+    """The lead's rule after the first real run: such a file (the old state/ holds six) no longer makes the
+    backup partial."""
     write_file(small_repo.root / "memory" / "notes.db", b"just some notes, not sqlite")
-    assert run(small_repo) == 1
+    capsys.readouterr()
+    assert run(small_repo) == 0
     folder = newest(small_repo.dest)
     m = manifest_of(folder)
     e = entry(m, "memory/notes.db")
     assert e["kind"] == "file" and e["not_a_database"] is True
     assert (folder / "memory" / "notes.db").read_bytes() == b"just some notes, not sqlite"
-    assert "memory/notes.db" in failed_paths(m) and "memory/notes.db" in capsys.readouterr().err
-    assert backup.verify_backup(folder)[0] == 1                       # partial, but its hashes match
+    assert m["status"] == "complete" and m["failures"] == []
+    err = capsys.readouterr().err
+    assert "NOTE" in err and "memory/notes.db" in err and "FAILED" not in err
+    code, lines = backup.verify_backup(folder)
+    assert code == 0 and "PARTIAL" not in "\n".join(lines), lines
+    (folder / "memory" / "notes.db").write_bytes(b"just some notes, not sqlitE")      # its hash is re-checked
+    assert backup.verify_backup(folder)[0] == 1
 
 
 def test_the_message_after_a_termination_signal_says_whether_a_backup_was_published(small_repo, monkeypatch, capsys):
@@ -1632,3 +1622,269 @@ def test_a_top_level_folder_that_is_a_link_is_not_descended_into(small_repo, tmp
     assert not _bytes_of_backup_contain(folder, SECRET)
     assert {e["path"] for e in m["files"]} == {"memory/a.sqlite", "config/c.json"}
     assert m["absent_folders"] == []
+
+
+# =========================================================================================== rev 4
+SWAPPER = r'''
+import ctypes, os, random, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+a, b, stop, cap = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+rng = random.Random(4)
+def wait(seconds):
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        pass
+n = 0
+while not os.path.exists(stop) and n < cap:          # capped: it also ends by itself
+    libc.renamex_np(a.encode(), b.encode(), 2)       # RENAME_SWAP: the link takes the path, atomically
+    wait(rng.uniform(20e-6, 150e-6))                 # a flicker of about 0.1 ms
+    libc.renamex_np(a.encode(), b.encode(), 2)       # and the real file is back
+    wait(rng.uniform(0, 1.5e-3))
+    n += 1
+'''
+
+
+def _secret_db(path, mode="delete", rows=6):
+    """An outside database whose every payload is the secret marker."""
+    make_db(path, mode=mode, rows=rows, pad=len(SECRET))
+    with contextlib.closing(sqlite3.connect(path)) as c:
+        c.execute("UPDATE ledger SET payload = ?", (SECRET,))
+        c.commit()
+
+
+SWAP_VARIANTS = ["rollback_db", "wal_db_with_a_live_writer", "middle_folder", "wal_file_of_a_live_database"]
+
+
+@pytest.mark.timeout(280)
+def test_a_database_path_swapped_to_a_link_and_back_as_fast_as_possible_is_never_copied_from_outside(tmp_path):
+    """300 backups (75 per route) while a helper process swaps, atomically and as fast as it can, the database
+    path, a folder in its path, or its -wal with a link to a file outside the repository."""
+    outside = tmp_path / "outside"
+    swapdir = tmp_path / "swapdir"
+    swapdir.mkdir()
+    write_file(outside / "anchor", b"x")
+    _secret_db(outside / "d.sqlite")
+    _secret_db(outside / "live.sqlite", mode="wal")
+    _secret_db(outside / "sub" / "d.sqlite")
+    keeper = sqlite3.connect(outside / "live.sqlite")                       # outside WAL with frames in it
+    keeper.execute("PRAGMA wal_autocheckpoint=0")
+    keeper.executemany("INSERT INTO ledger VALUES (?, ?)", [(100 + i, SECRET) for i in range(5)])
+    keeper.commit()
+    shutil.copyfile(str(outside / "live.sqlite") + "-wal", outside / "outside-wal-copy")
+    keeper.close()
+    stats = {v: {"attempts": 0, "kept": 0, "named": 0} for v in SWAP_VARIANTS}
+    for variant in SWAP_VARIANTS:
+        base = tmp_path / variant
+        root, dest = base / "repo", base / "dest"
+        write_file(root / "journal" / "anchor.txt", "an anchor so that every run publishes")
+        writer = None
+        stop = base / "stop_swapper"
+        stop_writer = base / "stop_writer"
+        if variant == "rollback_db":
+            make_db(root / "memory" / "d.sqlite", rows=30)
+            a, b, rel = root / "memory" / "d.sqlite", swapdir / f"{variant}-partner", "memory/d.sqlite"
+            os.symlink(outside / "d.sqlite", b)
+        elif variant == "wal_db_with_a_live_writer":
+            make_db(root / "memory" / "d.sqlite", mode="wal", rows=30)
+            writer = subprocess.Popen([sys.executable, "-c", WRITER, str(root / "memory" / "d.sqlite"),
+                                       str(stop_writer), "30000"])
+            a, b, rel = root / "memory" / "d.sqlite", swapdir / f"{variant}-partner", "memory/d.sqlite"
+            os.symlink(outside / "live.sqlite", b)
+        elif variant == "middle_folder":
+            make_db(root / "memory" / "sub" / "d.sqlite", rows=30)
+            a, b, rel = root / "memory" / "sub", swapdir / f"{variant}-partner", "memory/sub/d.sqlite"
+            os.symlink(outside / "sub", b, target_is_directory=True)
+        else:
+            make_db(root / "memory" / "d.sqlite", mode="wal", rows=30)
+            writer = subprocess.Popen([sys.executable, "-c", WRITER, str(root / "memory" / "d.sqlite"),
+                                       str(stop_writer), "30000"])
+            a, b, rel = Path(str(root / "memory" / "d.sqlite") + "-wal"), swapdir / f"{variant}-partner", "memory/d.sqlite"
+            os.symlink(outside / "outside-wal-copy", b)
+        try:
+            if writer is not None:
+                deadline = time.monotonic() + 20
+                while not Path(str(root / "memory" / "d.sqlite") + "-wal").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            swapper = subprocess.Popen([sys.executable, "-c", SWAPPER, str(a), str(b), str(stop), "1000000"])
+            try:
+                time.sleep(0.2)
+                for _ in range(75):
+                    backup.main(["run", "--root", str(root), "--dest", str(dest), "--keep", "2"])
+                    folder = newest(dest)
+                    assert not _bytes_of_backup_contain(folder, SECRET), (variant, folder.name)
+                    m = manifest_of(folder)
+                    stats[variant]["attempts"] += 1
+                    stats[variant]["kept"] += any(e["path"] == rel for e in m["files"])
+                    stats[variant]["named"] += bool(set(m.get("changed_into_a_link", [])) | failed_paths(m))
+            finally:
+                stop.write_text("stop")
+                try:
+                    swapper.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    swapper.kill()                                           # the process this test started
+        finally:
+            stop_writer.write_text("stop")
+            if writer is not None:
+                try:
+                    writer.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    writer.kill()
+    print({v: stats[v] for v in SWAP_VARIANTS})
+    assert sum(s["attempts"] for s in stats.values()) == 300
+    assert sum(s["kept"] for s in stats.values()) >= 1, stats                # the legitimate file does get backed up
+
+
+@pytest.mark.parametrize("variant", ["before", "after"])
+def test_a_database_renamed_over_another_during_a_lock_wait_is_refused(small_repo, variant, capsys):
+    root = small_repo.root
+    stuck, nxt = root / "memory" / "aaa_stuck.sqlite", root / "memory" / "zzz_next.sqlite"
+    make_db(stuck, rows=20)
+    make_db(nxt, rows=7)
+    replacement = small_repo.base / "replacement.sqlite"
+    make_db(replacement, rows=99)
+    holder = sqlite3.connect(stuck, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--root", str(root), "--dest", str(small_repo.dest),
+                             "--db-timeout", "60"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for_work_folder(small_repo.dest, proc)
+        time.sleep(0.6)                                                     # the tool is inside the lock wait
+        victim = nxt if variant == "before" else stuck                      # not yet reached / being waited on
+        os.replace(replacement, victim)
+        holder.execute("ROLLBACK")
+        out, err = proc.communicate(timeout=120)
+    finally:
+        holder.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    rel = "memory/zzz_next.sqlite" if variant == "before" else "memory/aaa_stuck.sqlite"
+    assert proc.returncode == 1, (proc.returncode, err)
+    folder = newest(small_repo.dest)
+    m = manifest_of(folder)
+    assert m["changed_into_a_link"] == [rel]
+    assert rel not in {e["path"] for e in m["files"]} and not (folder / rel).exists()
+    assert rel in err
+
+
+# --------------------------------------------------------------------------------------- outcome 4
+def test_a_wal_that_vanishes_between_the_look_and_the_open_is_looked_at_again(small_repo, monkeypatch, capsys):
+    src_dir = small_repo.base / "image_src"
+    make_db(src_dir / "img.sqlite", mode="wal", rows=10)
+    live = sqlite3.connect(src_dir / "img.sqlite")
+    live.execute("PRAGMA wal_autocheckpoint=0")
+    live.executemany("INSERT INTO ledger VALUES (?, ?)", [(i, b"w") for i in range(11, 16)])
+    live.executemany("INSERT INTO mirror VALUES (?)", [(i,) for i in range(11, 16)])
+    live.execute("UPDATE meta SET last = 15")
+    live.commit()
+    target = small_repo.root / "memory" / "img.sqlite"                      # a crash image: db and -wal, no -shm
+    shutil.copyfile(src_dir / "img.sqlite", target)
+    shutil.copyfile(str(src_dir / "img.sqlite") + "-wal", str(target) + "-wal")
+    live.close()
+    real = backup._copy_nofollow
+    calls = []
+
+    def vanishing(root, rel, dst, expect=None):
+        if rel.endswith("-wal") and not calls:
+            calls.append(rel)
+            os.remove(Path(root) / rel)                                       # gone between the look and the open
+        return real(root, rel, dst, expect)
+
+    monkeypatch.setattr(backup, "_copy_nofollow", vanishing)
+    capsys.readouterr()
+    assert run(small_repo) == 0, capsys.readouterr().err
+    assert calls == ["memory/img.sqlite-wal"]
+    m = manifest_of(newest(small_repo.dest))
+    assert m["failures"] == [] and entry(m, "memory/img.sqlite")["integrity"] == "ok"
+
+
+# --------------------------------------------------------------------------------------- outcome 5
+def test_verify_and_restore_do_not_follow_links_at_their_own_edges(small_repo, capsys):
+    assert run(small_repo) == 0
+    folder = newest(small_repo.dest)
+    link_to_backup = small_repo.base / "link_to_backup"
+    link_to_backup.symlink_to(folder, target_is_directory=True)
+    capsys.readouterr()
+    assert backup.main(["verify", str(link_to_backup)]) == 2
+    assert "link" in capsys.readouterr().err.lower()
+    assert backup.main(["verify", str(link_to_backup) + "/"]) == 2
+    assert backup.main(["restore", str(link_to_backup), "--to", str(small_repo.base / "never1"), "--root",
+                        str(small_repo.root)]) == 2
+    assert not (small_repo.base / "never1").exists()
+    # a MANIFEST.json that is a link
+    copy_dir = small_repo.base / "copy_of_backup"
+    shutil.copytree(folder, copy_dir)
+    real_manifest = small_repo.base / "manifest_elsewhere.json"
+    os.replace(copy_dir / "MANIFEST.json", real_manifest)
+    (copy_dir / "MANIFEST.json").symlink_to(real_manifest)
+    capsys.readouterr()
+    assert backup.main(["verify", str(copy_dir)]) == 2
+    assert "link" in capsys.readouterr().err.lower()
+    assert backup.main(["restore", str(copy_dir), "--to", str(small_repo.base / "never2"), "--root",
+                        str(small_repo.root)]) == 2
+    assert not (small_repo.base / "never2").exists()
+    # restore --to a link (even one to an empty folder)
+    empty = small_repo.base / "empty_elsewhere"
+    empty.mkdir()
+    link_to = small_repo.base / "link_to_empty"
+    link_to.symlink_to(empty, target_is_directory=True)
+    capsys.readouterr()
+    assert backup.main(["restore", str(folder), "--to", str(link_to), "--root", str(small_repo.root)]) == 2
+    assert "link" in capsys.readouterr().err.lower()
+    assert backup.main(["restore", str(folder), "--to", str(link_to) + "/", "--root", str(small_repo.root)]) == 2
+    assert list(empty.iterdir()) == []
+    dangling = small_repo.base / "dangling"
+    dangling.symlink_to(small_repo.base / "not_there")
+    assert backup.main(["restore", str(folder), "--to", str(dangling), "--root", str(small_repo.root)]) == 2
+    assert not (small_repo.base / "not_there").exists()
+    # and a manifest that is a link is unreadable for list and retention too (never followed)
+    bad = small_repo.dest / "20190101T000000Z"
+    bad.mkdir()
+    (bad / "MANIFEST.json").symlink_to(folder / "MANIFEST.json")
+    assert backup.main(["list", "--dest", str(small_repo.dest)]) == 0
+    out = capsys.readouterr().out
+    assert "20190101T000000Z" in out and "unreadable" in out.lower()
+
+
+# --------------------------------------------------------------------------------------- outcome 6
+@pytest.mark.parametrize("stray", [b"", bytes([0xAB]) * 100, b"WAL junk"])
+def test_reading_a_rollback_database_with_a_stray_wal_creates_nothing_beside_it(small_repo, stray):
+    db = small_repo.root / "memory" / "stray.sqlite"
+    make_db(db, mode="delete", rows=10)
+    write_file(str(db) + "-wal", stray)
+    before = tree_state(small_repo.root)
+    assert not any(k.endswith("stray.sqlite-shm") for k in before)
+    assert run(small_repo) == 0
+    after = tree_state(small_repo.root)
+    assert after == before, set(after) ^ set(before)                          # no -shm, no change at all
+    e = entry(manifest_of(newest(small_repo.dest)), "memory/stray.sqlite")
+    assert e["integrity"] == "ok" and e["tables"]["ledger"] == 10
+
+
+def test_a_database_that_is_another_file_only_at_the_check_before_is_refused(small_repo, monkeypatch, capsys):
+    """Another file stands at the path when the check before looks, and the original is back before SQLite
+    opens it and before the check after: only the check before can refuse it."""
+    db = small_repo.root / "memory" / "a.sqlite"
+    aside = small_repo.root / "memory" / "a.aside"
+    real_scan, real_fds = backup.scan, backup.open_fds
+    fired = []
+
+    def scan_then_stand_in(root):
+        result = real_scan(root)
+        os.rename(db, aside)
+        make_db(db, rows=3)                                       # another file (another inode) at the path
+        return result
+
+    def fds_then_put_the_original_back():
+        if aside.exists() and not fired:
+            fired.append(1)
+            os.replace(aside, db)                                  # the original is back (its own inode)
+        return real_fds()
+
+    monkeypatch.setattr(backup, "scan", scan_then_stand_in)
+    monkeypatch.setattr(backup, "open_fds", fds_then_put_the_original_back)
+    assert run(small_repo) == 1
+    m = manifest_of(newest(small_repo.dest))
+    assert m["changed_into_a_link"] == ["memory/a.sqlite"]
+    assert "memory/a.sqlite" not in {e["path"] for e in m["files"]}
+    assert "memory/a.sqlite" in capsys.readouterr().err
