@@ -1340,6 +1340,10 @@ def test_status_calls_a_blind_stretch_a_gap_not_a_quiet_one(tmp_path):
     st = cl.status(store, T0 + 4 * 3600)["days"][0]                # then nobody records for three hours
     assert st["comments"]["share"] < 0.3 and st["comments"]["covered"] is False and st["counts"] is False
     assert st["prices"]["share"] < 0.3 and st["prices"]["covered"] is False
+    # rev 4 (outcome 5): the three blind hours add nothing to covered, and the same whole day with and without a
+    # blind stretch differs by exactly the blind slots (the quiet day counts, the blind one does not)
+    assert st["comments"]["covered_slots"] == c["covered_slots"] and st["prices"]["covered_slots"] == quiet["prices"]["covered_slots"]
+    quiet_and_blind_days(tmp_path)
 
 
 def test_status_a_failing_price_series_is_shown_and_80_percent_is_the_line(tmp_path):
@@ -3233,7 +3237,8 @@ def raw_server(answer):
     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
     b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello",
     b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\nContent-Length:\r\n\r\nhello",
-], ids=["short", "letters", "absurd", "over-the-limit", "twice", "signed", "empty-second"])
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n" + b"y" * 20,
+], ids=["short", "letters", "absurd", "over-the-limit", "twice", "signed", "empty-second", "longer"])
 def test_a_body_unlike_its_content_length_is_a_bad_answer_never_a_200(monkeypatch, answer):
     local_hosts_allowed(monkeypatch)
     for service in ("reddit", "kalshi"):
@@ -3243,7 +3248,10 @@ def test_a_body_unlike_its_content_length_is_a_bad_answer_never_a_200(monkeypatc
                 r = through(service, srv.url(path="/x"), 3)
             except Exception:
                 continue                                                # refused: a bad answer
-            assert service == "reddit" and r.truncated, (service, r.status, r.body[:20])
+            # rev 4 (outcome 1): Reddit's transport keeps the status and headers and marks the body as not as stated
+            # (`bad`) or over the limit; the collector then makes it a failed fetch (never a good 200: see
+            # test_a_200_with_any_body_fault_is_never_a_good_read)
+            assert service == "reddit" and (r.truncated or getattr(r, "bad", None)), (service, r.status, r.body[:20])
         finally:
             srv.close()
 
@@ -3459,3 +3467,339 @@ def test_an_exception_after_a_page_was_read_well_keeps_its_entries_and_marks_the
     assert cl.verify(store) == []
     c = cl.status(store, T0 + 240)["days"][0]["comments"]
     assert c["covered_slots"] == 1 and c["miss_uncovered"] == 1
+
+
+# ============================================================================================ rev 4
+# ------------------------------------------- outcome 1: a status and its headers are never lost to a bad body
+
+BODY_FAULTS = {
+    "short": b"Content-Length: 500\r\n\r\n" + b"x" * 10,
+    "longer": b"Content-Length: 5\r\n\r\n" + b"y" * 20,
+    "letters": b"Content-Length: abc\r\n\r\nhello",
+    "twice": b"Content-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+    "absurd": b"Content-Length: 99999999999\r\n\r\nhello",
+    "over-the-limit": b"Content-Length: %d\r\n\r\nhello" % (4 * 1024 * 1024 + 1),
+    "cut-off": b"Transfer-Encoding: chunked\r\n\r\n5\r\nhel",
+    "empty": b"Content-Length: 0\r\n\r\n",
+    "missing": b"\r\nslow down, read until the end",
+}
+
+
+def answering_server(answer):
+    """raw_server that reads the whole request (its body too) before sending `answer`, then ends its side and reads
+    what is left before closing, so that the client is never reset in the middle of reading the answer."""
+    srv = LocalServer("ok")
+
+    def handle(c):
+        try:
+            c.settimeout(1.0)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                head += chunk
+            m = re.search(rb"(?i)\r\ncontent-length: *([0-9]+)", head)
+            if m:
+                need = head.index(b"\r\n\r\n") + 4 + int(m.group(1))
+                while len(head) < need:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    head += chunk
+            srv.requests.append(head)
+            c.sendall(answer)
+            c.shutdown(socket.SHUT_WR)
+            while c.recv(65536):
+                pass
+        except OSError:
+            pass
+        finally:
+            c.close()
+    srv._handle = handle
+    return srv
+
+
+def faulty(status, fault, wait_header=b"Retry-After: 600"):
+    """A whole HTTP answer: `status`, a named wait, and the body fault `fault`."""
+    return b"HTTP/1.1 %d X\r\n" % status + (wait_header + b"\r\n" if wait_header else b"") + BODY_FAULTS[fault]
+
+
+def good_answer(n, method, url, oauth):
+    if url == cl.TOKEN_URL:
+        return token_answer()
+    if oauth:
+        return listing([("t1_g%05d" % n, T0 + n)])
+    return resp(200, atom_with(atom_entry("t1_g%05d" % n)))
+
+
+class RealThenFake:
+    """The collector's Reddit transport: the answers `real(n)` names come from a local server over the module's real
+    transport (cl.reddit_get), the others are good stand-in answers. Logs when each request left."""
+
+    def __init__(self, clock, oauth, real):
+        self.clock, self.oauth, self.real, self.log = clock, oauth, real, []
+
+    def __call__(self, method, url, headers, data, timeout):
+        self.log.append(self.clock())
+        n = len(self.log)
+        srv = self.real(n)
+        if srv is not None:
+            r = cl.reddit_get(method, srv.url(path=urllib.parse.urlsplit(url).path), headers, data, timeout)
+            self.clock.sleep(0.2)
+            return r
+        self.clock.sleep(0.2)
+        return good_answer(n, method, url, self.oauth)
+
+
+@pytest.mark.parametrize("backend", ["public", "oauth"])
+@pytest.mark.parametrize("status", [429, 403])
+@pytest.mark.parametrize("fault", sorted(BODY_FAULTS) + ["date-form"])
+def test_a_429_or_403_backs_off_whatever_its_body_over_the_real_transport(tmp_path, monkeypatch, backend, status, fault):
+    """The check's finding 1: the first answer (the token's, on the official interface) is a 429 or a 403 naming
+    600 s, with a body not as stated. Its status is recorded, its back-off committed when it came, and nothing is
+    asked inside the wait."""
+    local_hosts_allowed(monkeypatch)
+    clock = Clock()
+    header = (b"Retry-After: " + email.utils.formatdate(T0 + 600, usegmt=True).encode()) if fault == "date-form" else b"Retry-After: 600"
+    srv = answering_server(faulty(status, "short" if fault == "date-form" else fault, header))
+    try:
+        reddit = RealThenFake(clock, backend == "oauth", lambda n: srv if n == 1 else None)
+        store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+        col = collector(store, clock, reddit, kalshi_ok(clock), env=CREDS if backend == "oauth" else None)
+        assert col.backend == backend
+        run_for(col, clock, 900)
+    finally:
+        srv.close()
+    first = store.rows("SELECT purpose, status, failure, fetched_at FROM comment_fetches ORDER BY id")[0]
+    assert (first["purpose"], first["status"], first["failure"]) == ("token" if backend == "oauth" else "feed", status,
+                                                                     "http_%d" % status), first
+    ev = store.rows("SELECT at, until, detail FROM comment_events WHERE kind = 'backoff'")
+    assert len(ev) == 1 and ev[0]["detail"].startswith("http_%d" % status), ev
+    at, until = cl._iso_ts(ev[0]["at"]), cl._iso_ts(ev[0]["until"])
+    assert abs(at - (T0 + 0.2)) < 0.01 and abs(until - (T0 + 600 if fault == "date-form" else at + 600)) < 1.01, (at, until)
+    assert len(reddit.log) >= 2 and reddit.log[1] >= until, reddit.log[:3]  # not one request inside the named wait
+    assert cl.verify(store) == []
+    store.close()
+
+
+@pytest.mark.parametrize("backend", ["public", "oauth"])
+def test_a_day_in_which_every_tenth_answer_is_a_faulty_429_never_asks_inside_a_named_wait(tmp_path, monkeypatch, backend):
+    local_hosts_allowed(monkeypatch)
+    faults = sorted(BODY_FAULTS)
+    waits = [b"Retry-After: 90", b"Retry-After: 600", b"x-ratelimit-reset: 1800", b"Retry-After: 99999", b"", b"Retry-After: 300"]
+    servers = [answering_server(faulty(429, f, w)) for f, w in zip(faults, waits * 2)]
+    sent = []
+    try:
+        clock = Clock(DAY)
+
+        def real(n):
+            if n % 10:
+                return None
+            srv = servers[(n // 10) % len(servers)]
+            sent.append(n)
+            return srv
+        reddit = RealThenFake(clock, backend == "oauth", real)
+        store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+        col = collector(store, clock, reddit, kalshi_ok(clock), env=CREDS if backend == "oauth" else None)
+        run_for(col, clock, 86400)
+    finally:
+        for srv in servers:
+            srv.close()
+    ev = [(cl._iso_ts(r["at"]), cl._iso_ts(r["until"])) for r in store.rows("SELECT at, until FROM comment_events WHERE kind = 'backoff'")]
+    assert len(sent) >= 10 and len(ev) == len(sent), (len(sent), len(ev))      # each faulty 429 backed off
+    assert all(u - a >= 90 - 0.01 for a, u in ev)
+    inside = [t for t in reddit.log for a, u in ev if a < t < u]
+    assert inside == [], inside[:5]
+    rows = store.rows("SELECT status, failure FROM comment_fetches WHERE failure = 'http_429'")
+    assert len(rows) == len(sent) and all(r["status"] == 429 for r in rows)
+    store.close()
+
+
+@pytest.mark.parametrize("fault", ["short", "longer", "letters", "cut-off"])
+def test_a_kalshi_answer_with_a_bad_body_keeps_its_real_status(tmp_path, monkeypatch, fault):
+    """Over the real transport: a 429 with a bad body is recorded as the 429 it is; a 200 with a bad body is a bad
+    answer recorded with its status 200, never a good read."""
+    local_hosts_allowed(monkeypatch)
+    for status, failure in ((429, "http_429"), (200, "bad_length")):
+        srv = answering_server(b"HTTP/1.1 %d X\r\n" % status + BODY_FAULTS[fault])
+        try:
+            clock = Clock()
+            s = cl.Store(tmp_path / ("k%d.sqlite" % status), synchronous="OFF")
+
+            def kget(url, timeout):
+                return cl.kalshi_get(srv.url(path="/trade-api/v2/markets"), timeout)
+            col = cl.Collector(s, clock=clock, sleep=clock.sleep, reddit_fetch=FakeReddit(clock, feed_answer()), kalshi_get=kget,
+                               env={}, log=lambda line: None, series=("KXNBAGAME",))
+            run_for(col, clock, 30)
+        finally:
+            srv.close()
+        rows = s.rows("SELECT ok, status, failure FROM price_fetches")
+        assert rows and all((r["ok"], r["status"], r["failure"]) == (0, status, failure) for r in rows), (status, rows)
+        s.close()
+
+
+# ------------------------------------------------------------------ outcome 2: expected slots at a backend switch
+
+def brute_expected(runs, day):
+    """The stated rule, slot by slot: the backend in force at a time is the latest run started at or before it (before
+    the first run, the first run's); a time is a slot when it is on that run's grid."""
+    out = []
+    for t in range(day, day + 86400, 60):
+        live = [r for r in runs if r[0] <= t] or runs[:1]
+        start, backend, ci, pi = live[-1]
+        if t % ci == 0:
+            out.append((t, backend))
+    return out
+
+
+@pytest.mark.parametrize("first,second", [("public", "oauth"), ("oauth", "public")])
+def test_expected_slots_at_a_switch_follow_the_rule_for_every_second_of_a_public_slot(tmp_path, first, second):
+    """The check's finding 2: a switch 1 to 59 s into a public slot lost the official slot in between."""
+    ival = {"public": 120, "oauth": 60}
+    switch = DAY + 10 * 3600                                            # a public slot (10:00 UTC)
+    for offset in range(120):
+        runs = [(float(DAY), first, ival[first], 60), (switch + offset + 0.25, second, ival[second], 60)]
+        got = cl._expected_slots(runs, DAY + 86400, "comments")
+        assert got == brute_expected(runs, DAY), (offset, [g for g in got if switch - 240 <= g[0] <= switch + 240])
+        assert len({g for g, _ in got}) == len(got)                     # none counted twice
+    for offset in (0, 1, 30, 59, 60, 61, 119):                          # and through status(), from a real store
+        s = cl.Store(tmp_path / ("s%s%d.sqlite" % (first, offset)), synchronous="OFF")
+        s.save_run(started=DAY, backend=first, comment_interval=ival[first], price_interval=60)
+        s.save_run(started=switch + offset, backend=second, comment_interval=ival[second], price_interval=60)
+        c = cl.status(s, DAY + 86400)["days"][0]["comments"]
+        want = brute_expected([(float(DAY), first, ival[first], 60), (float(switch + offset), second, ival[second], 60)], DAY)
+        assert c["expected"] + c["silent"] == len(want), (offset, c)
+        assert c["silent"] == sum(1 for t, b in want if b == "public" and cl.is_silent(t))
+        s.close()
+
+
+# ------------------------------------------------------------ outcome 3: a body longer than its Content-Length
+
+def tls_raw_server(cf, kf, answer):
+    """answering_server over TLS: the whole `answer` in one write after the handshake."""
+    import ssl
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cf, kf)
+    srv = answering_server(answer)
+    plain = srv._handle
+
+    def handle(c):
+        try:
+            c.settimeout(2.0)
+            c = server_ctx.wrap_socket(c, server_side=True)
+        except OSError:
+            c.close()
+            return
+        plain(c)
+    srv._handle = handle
+    return srv
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_a_body_longer_than_its_content_length_is_a_bad_answer(tmp_path, monkeypatch, scheme):
+    local_hosts_allowed(monkeypatch)
+    answer = b"HTTP/1.1 200 OK\r\n" + BODY_FAULTS["longer"]
+    if scheme == "https":
+        ca = Authority(tmp_path / "ca")
+        srv = tls_raw_server(*ca.leaf("127.0.0.1"), answer)
+        monkeypatch.setattr(cl, "_SSL_CONTEXT", cl._make_context(str(ca.path)))
+    else:
+        srv = answering_server(answer)
+    try:
+        r = through("reddit", srv.url(path="/x", scheme=scheme), 3)
+        assert r.status == 200 and r.bad, (r.status, r.body)
+        with pytest.raises(cl.BadLength):
+            through("kalshi", srv.url(path="/x", scheme=scheme), 3)
+        clock = Clock()
+        store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+        reddit = lambda m, u, h, d, t: cl.reddit_get(m, srv.url(path="/x", scheme=scheme), h, d, t)   # noqa: E731
+        col = collector(store, clock, reddit, kalshi_ok(clock))
+        run_for(col, clock, 100)
+        rows = store.rows("SELECT ok, status, failure FROM comment_fetches")
+        assert rows and all((r["ok"], r["status"], r["failure"]) == (0, 200, "bad_length") for r in rows), rows
+        assert store.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0] == 0
+        store.close()
+    finally:
+        srv.close()
+
+
+@pytest.mark.parametrize("fault", ["short", "longer", "letters", "twice", "absurd", "cut-off"])
+def test_a_200_with_any_body_fault_is_never_a_good_read(tmp_path, monkeypatch, fault):
+    local_hosts_allowed(monkeypatch)
+    srv = answering_server(b"HTTP/1.1 200 OK\r\n" + BODY_FAULTS[fault])
+    try:
+        clock = Clock()
+        store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+        reddit = RealThenFake(clock, False, lambda n: srv)
+        col = collector(store, clock, reddit, kalshi_ok(clock))
+        run_for(col, clock, 300)
+    finally:
+        srv.close()
+    rows = store.rows("SELECT ok, status, failure FROM comment_fetches")
+    assert rows and all((r["ok"], r["status"], r["failure"]) == (0, 200, "bad_length") for r in rows), rows
+    store.close()
+
+
+# --------------------------------------------- outcome 4: a failed later Kalshi page records its own failure
+
+@pytest.mark.parametrize("how", ["timeout", "http_500", "bad_length"])
+def test_a_failed_later_kalshi_page_records_its_own_failure_not_the_earlier_pages(tmp_path, how):
+    clock = Clock()
+    page1 = json.dumps({"markets": [market("KXNBAGAME-26NOV20AAABBB-AAA")], "cursor": "c2"}).encode()
+    calls = {"n": 0}
+
+    def kget(url, timeout):
+        calls["n"] += 1
+        clock.sleep(0.1)
+        if "cursor=" not in url:
+            return page1
+        if how == "timeout":
+            raise TimeoutError
+        if how == "http_500":
+            raise kd.HttpError(500, url)
+        raise cl.BadLength("shorter than stated")
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    col = cl.Collector(s, clock=clock, sleep=clock.sleep, reddit_fetch=FakeReddit(clock, feed_answer()), kalshi_get=kget,
+                       env={}, log=lambda line: None, series=("KXNBAGAME",))
+    run_for(col, clock, 30)
+    row = s.rows("SELECT failure, status, body_sha256, body_size FROM price_fetches")[0]
+    want_status = 500 if how == "http_500" else None
+    assert row == {"failure": how, "status": want_status, "body_sha256": None, "body_size": None}, row
+    assert calls["n"] == 2
+    s.close()
+
+
+# ------------------------------------------------- outcome 5: a blind stretch is told apart from a quiet one
+
+def quiet_and_blind_days(tmp_path):
+    """Rev 4 (outcome 5), used by test_status_calls_a_blind_stretch_a_gap_not_a_quiet_one: a whole quiet day (every
+    slot read, no comment in any) against the same day in which nothing was read from 10:00 to 16:00: covered differs
+    by exactly the blind slots, and only the quiet day counts."""
+    def day(name, blind):
+        s = cl.Store(tmp_path / name, synchronous="OFF")
+        s.save_run(started=DAY, backend="public", comment_interval=120, price_interval=60)
+        writes = []
+        for g in range(DAY, DAY + 86400, 60):
+            if blind and DAY + 10 * 3600 <= g < DAY + 16 * 3600:
+                continue
+            writes += [(g + 1 + 0.01 * i, "p", g, sr) for i, sr in enumerate(SERIES)]
+            if g % 120 == 0 and not cl.is_silent(g):
+                writes.append((g + 2, "c", g, None))
+        for at, kind, g, sr in sorted(writes):
+            if kind == "p":
+                s.save_price_fetch(series=sr, slot=g, at=at, failure=None, markets=[], seen=0, bad_rows=0, body=None)
+            else:
+                feed(s, [], at, slot=g)
+        d = cl.status(s, DAY + 86400)["days"][0]
+        s.close()
+        return d
+    quiet, blind = day("quiet.sqlite", False), day("blind.sqlite", True)
+    blind_comment_slots = sum(1 for g in range(DAY + 10 * 3600, DAY + 16 * 3600, 120) if not cl.is_silent(g))
+    assert blind_comment_slots == 6 * 26
+    assert quiet["comments"]["expected"] == blind["comments"]["expected"] == 624
+    assert quiet["comments"]["covered_slots"] - blind["comments"]["covered_slots"] == blind_comment_slots
+    assert quiet["prices"]["covered_slots"] - blind["prices"]["covered_slots"] == 6 * 60 * 5
+    assert quiet["comments"]["comments"] == blind["comments"]["comments"] == 0
+    assert (quiet["comments"]["covered"], quiet["prices"]["covered"], quiet["counts"]) == (True, True, True)
+    assert (blind["comments"]["covered"], blind["prices"]["covered"], blind["counts"]) == (False, False, False)
