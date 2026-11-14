@@ -4,6 +4,7 @@ Every test uses a stand-in for the SDK's TradeClient; nothing here builds a Webu
 The stand-in serves the shapes observed in Webull's test environment on 2026-11-13 (the ticket's CONTEXT)."""
 import importlib.util
 import random
+import re
 import string
 import subprocess
 import sys
@@ -468,32 +469,177 @@ def _outcome(fn):
         return ("raised", [c.__name__ for c in type(exc).__mro__], str(exc))
 
 
-def test_generated_stock_and_crypto_inputs_behave_exactly_as_before(tmp_path, head):
-    """600 seeded accounts and requests on venues that are not Events venues: every public method gives the same value
-    or raises the same kind of error with the same text as the adapter before T19, and the SDK sees the same calls
-    with the same payloads."""
+# T22d-2 changed two things on this path on purpose; every other difference from the adapter before T19 is an error.
+# B1: after a refused placement, "accepted" only when the detail row is the order just sent (symbol, side, quantity)
+# and alive; B3: a sale this venue object sent and has not seen settled is subtracted in the long-only check.
+ALIVE_STATUSES = frozenset({"PENDING", "SUBMITTED", "PARTIAL_FILLED", "PARTIAL FILLED", "FILLED"})
+DEAD_STATUSES = frozenset({"CANCELLED", "CANCELED", "FAILED", "REJECTED", "EXPIRED"})
+SETTLED_STATUSES = DEAD_STATUSES | {"FILLED"}
+LONG_ONLY = re.compile(r"selling (\S+) (\S+) with (\S+) held and (\S+) in open sells would open a short; this venue is long-only")
+SECOND_TAG = "h-tag-2"
+
+
+def _sent_names(sent):
+    """The names a detail row may give the order `sent` under: Webull's symbol, and for crypto the trader's BTC-USD."""
+    names = {sent["symbol"]}
+    if sent["instrument_type"] == "CRYPTO" and sent["symbol"].endswith("USD"):
+        names.add(sent["symbol"][:-3] + "-USD")
+    return names
+
+
+def _row_reading(row, sent):
+    """This test's own reading of a detail row against the order sent: "readable" is False when the symbol, side or
+    total quantity cannot be read; "same" whether it is that order; "status" the raw status."""
+    sym, side, qty = row.get("symbol"), row.get("side"), row.get("total_quantity")
+    try:
+        number = Decimal(qty) if isinstance(qty, str) else None
+    except ArithmeticError:
+        number = None
+    readable = isinstance(sym, str) and isinstance(side, str) and number is not None and number.is_finite() and number >= 0
+    same = readable and sym.upper() in _sent_names(sent) and side == sent["side"] and number == Decimal(sent["quantity"])
+    return {"readable": readable, "same": same, "status": row.get("status")}
+
+
+def _the_row(s):
+    """The one order row the scripted detail answer holds, else None (not present, empty, junk)."""
+    d = s["detail"]
+    if isinstance(d, dict) and isinstance(d.get("orders"), list) and len(d["orders"]) == 1 and isinstance(d["orders"][0], dict):
+        return d["orders"][0]
+    return None
+
+
+def _places(calls):
+    return [c for c in calls if c[0] == "place"]
+
+
+def _is_b1(s, head_step, cand_step):
+    """B1, recognised by what it is: the older adapter returned "accepted" after Webull refused the placement (a 4xx),
+    the SDK saw exactly the same calls (one place, one detail read), and the detail row is NOT the order just sent,
+    alive. The candidate then raises OrderRejected when the row is readable and another order or dead, and a plain
+    WebullError of unknown outcome when the row or its status cannot be read; anything else is not B1."""
+    (_, h_out, h_calls), (_, c_out, c_calls) = head_step, cand_step
+    if h_calls != c_calls or s["place"] not in ("417", "repeat") or h_out[0] != "ok" or h_out[1].get("status") != "accepted":
+        return False
+    places, details = _places(h_calls), [c for c in h_calls if c[0] == "detail"]
+    row = _the_row(s)
+    if len(places) != 1 or len(details) != 1 or row is None or c_out[0] != "raised":
+        return False
+    reading = _row_reading(row, places[0][2][0])
+    if reading["same"] and reading["status"] in ALIVE_STATUSES:
+        return False                                              # this order, alive: "accepted" was right
+    rejected = reading["readable"] and (not reading["same"] or reading["status"] in DEAD_STATUSES)
+    if rejected:
+        return "OrderRejected" in c_out[1] and "NotTransmitted" not in c_out[1]
+    return c_out[1][0] == "WebullError" and "outcome unknown" in c_out[2]
+
+
+def _in_flight(s, record):
+    """This test's own count of the candidate's reservation when the second submit runs: the quantity of the first
+    submit when it was a sale that reached the order call, did not end in OrderRejected, and was not shown settled
+    (that very sale, filled or dead) by the order_status read in between. Decimal(0) otherwise."""
+    _, first_out, first_calls = record[2]                          # [0] construction, [1] name, [2] submit
+    places = _places(first_calls)
+    if not places or places[0][2][0]["side"] != "SELL" or (first_out[0] == "raised" and "OrderRejected" in first_out[1]):
+        return Decimal(0)
+    sent, row = places[0][2][0], _the_row(s)
+    status_calls = record[6][2]                                     # the order_status step
+    if row is not None and any(c[0] == "detail" and c[2] == sent["client_order_id"] for c in status_calls):
+        if row.get("client_order_id") in (sent["client_order_id"], None):
+            reading = _row_reading(row, sent)
+            if reading["same"] and reading["status"] in SETTLED_STATUSES:
+                return Decimal(0)
+    return Decimal(sent["quantity"])
+
+
+def _floor(x, crypto):
+    return x.quantize(Decimal(1).scaleb(-(8 if crypto else 5)), rounding="ROUND_FLOOR")
+
+
+def _is_b3(s, head_step, cand_step, reserved):
+    """B3, recognised by what it is, at the second submit (a sale of the same symbol right after the first): either
+    the older adapter sent the sale and the candidate refused it as long-only after the same reads and before any order
+    call, with figures such that the sale fits once the reservation is taken out of the "in open sells" figure and does
+    not fit with it; or both refused it as long-only with the same calls and the same text except the "in open sells"
+    figure, which is larger in the candidate by exactly the reservation."""
+    (_, h_out, h_calls), (_, c_out, c_calls) = head_step, cand_step
+    if reserved <= 0 or c_out[0] != "raised" or "NotTransmitted" not in c_out[1]:
+        return False
+    m = LONG_ONLY.fullmatch(c_out[2])
+    if m is None:
+        return False
+    amount, symbol, held, open_sells = Decimal(m[1]), m[2], Decimal(m[3]), Decimal(m[4])
+    crypto = symbol.upper().endswith("-USD")
+    without = open_sells - reserved
+    if without < 0 or symbol != s["symbol"]:                      # the message names the symbol as asked
+        return False
+    if _places(h_calls):                                          # the older adapter sent it (whatever Webull answered)
+        return (not _places(c_calls) and c_calls == h_calls[:len(c_calls)]
+                and amount <= _floor(held - without, crypto) and amount > _floor(held - open_sells, crypto))
+    h = LONG_ONLY.fullmatch(h_out[2]) if h_out[0] == "raised" else None
+    return (h is not None and h_calls == c_calls and h_out[1] == c_out[1] and (h[1], h[2], h[3]) == (m[1], m[2], m[3])
+            and Decimal(h[4]) == without)
+
+
+def _record(module, s, tmp_path):
+    """Every step of one sequence on a fresh venue: (step name, outcome, the SDK calls that step made)."""
+    client = SpecClient(s)
+    venue = module.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "none.json", account_class=s["wanted"],
+                               limits=HIGH, sleep=lambda x: None, clock=lambda: 0.0)
+    steps = [("name", lambda: venue.name),
+             ("submit", lambda: venue.submit(s["symbol"], s["units"], "h-tag", price=s["price"], limit_price=s["limit"],
+                                             session=s["session"])),
+             ("positions", venue.positions), ("other_positions", venue.other_positions), ("open_orders", venue.open_orders),
+             ("order_status", lambda: venue.order_status("h-tag")), ("cash", venue.cash), ("balance", venue.balance),
+             ("cancel", lambda: venue.cancel("h-tag")), ("cancel_all_open", venue.cancel_all_open), ("check", venue.check),
+             ("account_class", lambda: venue.account_class),
+             ("second submit", lambda: venue.submit(s["symbol"], s["units"], SECOND_TAG, price=s["price"], limit_price=s["limit"],
+                                                    session=s["session"]))]
+    out = [("construction", None, list(client.calls))]
+    for name, fn in steps:
+        before = len(client.calls)
+        out.append((name, _outcome(fn), client.calls[before:]))
+    return out
+
+
+def test_generated_stock_and_crypto_inputs_behave_as_before_except_b1_and_b3(tmp_path, head):
+    """600 seeded accounts and requests on venues that are not Events venues, each run on a fresh venue of the adapter
+    before T19 and of this one: at every step every public method gives the same value or raises the same kind of
+    error with the same text, and the SDK sees the same calls with the same payloads, except a step that is one of
+    the two differences T22d-2 made on purpose (see _is_b1, _is_b3), recognised by what it is wherever it falls.
+
+    After such a difference the comparison goes on: the only state it leaves behind is the candidate's reservation of
+    an unsettled sale, which no read, cancel or check uses, so every later step must still be equal, except the last
+    one, a second sale of the same symbol, which is judged by _is_b3 with this test's own count of that reservation."""
     rng = random.Random(4242)
-    compared = placed = accepted = 0
+    compared = placed = accepted = accepted_before = identical = 0
+    kinds = {"B1": 0, "B3": 0, "B1_first": 0}
     for _ in range(600):
         s = _spec(rng)
-        pair = []
-        for module in (head, wb):
-            client = SpecClient(s)
-            venue = module.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "none.json", account_class=s["wanted"],
-                                       limits=HIGH, sleep=lambda x: None, clock=lambda: 0.0)
-            results = [venue.name,
-                       _outcome(lambda: venue.submit(s["symbol"], s["units"], "h-tag", price=s["price"], limit_price=s["limit"],
-                                                     session=s["session"])),
-                       _outcome(venue.positions), _outcome(venue.other_positions), _outcome(venue.open_orders),
-                       _outcome(lambda: venue.order_status("h-tag")), _outcome(venue.cash), _outcome(venue.balance),
-                       _outcome(lambda: venue.cancel("h-tag")), _outcome(venue.cancel_all_open), _outcome(venue.check),
-                       _outcome(lambda: venue.account_class)]
-            pair.append((results, client.calls))
-        assert pair[0] == pair[1], s
+        h, c = _record(head, s, tmp_path), _record(wb, s, tmp_path)
+        assert [step[0] for step in h] == [step[0] for step in c]
+        reserved = _in_flight(s, c)
+        differed = False
+        for i, (hs, cs) in enumerate(zip(h, c)):
+            if hs == cs:
+                continue
+            differed = True
+            if hs[0] in ("submit", "second submit") and _is_b1(s, hs, cs):
+                kinds["B1"] += 1
+                kinds["B1_first"] += hs[0] == "submit"
+            elif hs[0] == "second submit" and _is_b3(s, hs, cs, reserved):
+                kinds["B3"] += 1
+            else:
+                pytest.fail(f"a difference that is neither B1 nor B3 at step {hs[0]!r}: before {hs[1:]!r}, now {cs[1:]!r}; spec {s!r}")
+        identical += not differed
         compared += 1
-        placed += any(c[0] == "place" for c in pair[1][1])
-        accepted += pair[1][0][1][0] == "ok"
-    assert compared == 600 and placed > 150 and accepted > 100
+        placed += any(c_[0] == "place" for c_ in c[2][2])
+        accepted += c[2][1][0] == "ok"
+        accepted_before += h[2][1][0] == "ok"                    # the generator still reaches acceptance
+    print(f"T22d-2 comparison: {compared} sequences, {identical} identical, {kinds['B1']} B1 differences, "
+          f"{kinds['B3']} B3 differences; first submit accepted {accepted_before} times before, {accepted} now")
+    assert compared == 600 and placed > 150 and accepted_before > 100 and accepted == accepted_before - kinds["B1_first"]
+    assert kinds["B1"] > 0, f"no B1 difference was ever seen, so the test never reached the case it exists for: {kinds}"
+    assert identical + kinds["B1"] + kinds["B3"] >= compared
 
 
 def test_the_order_payload_function_is_unchanged(head):
