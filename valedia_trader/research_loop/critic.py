@@ -4,7 +4,8 @@ Every number is computed here from the journal and the ledger: how each strategy
 compare with its backtest and its written prediction, what the losing trades had in common, which
 mistake keeps repeating, and whether a strategy should be paused. A model may be asked to put the
 findings into words (`narrator`), but it is given the numbers and cannot change them. The review is
-saved to `journal/review-<date>.md` and every finding is written to the ledger.
+saved to `journal/review-<date>.md`, and every finding but the lines naming the days of bad price data is written to
+the ledger as a lesson, on every run, with `apply` or without (those lines are in the review and its findings only).
 
 The critic also audits the kill switch: it re-runs `check_order` on every order the journal says
 was placed. An order that should have been refused and was not is the first thing reported.

@@ -2127,17 +2127,19 @@ def test_a_book_saved_without_remembered_prices_takes_them_from_the_frame_on_its
     assert not rg.file_is_there(again.latch_file)
 
 
-def test_cost_only_for_a_fund_the_book_has_no_valid_close_of(tmp_path, monkeypatch):
-    """Outcome 1: a book saved without remembered prices and a frame with no valid close of a held fund: only then its
-    cost, and nothing is remembered for it."""
+def test_a_held_fund_the_book_has_no_close_of_refuses_the_night(tmp_path, monkeypatch):
+    """Outcome 1 (rev 7: the book does not estimate): a book saved without remembered prices and a frame with no valid
+    close of a held fund: the night is refused whole, naming the fund, and the folder is left as it was; with the data
+    back it runs, and nothing is remembered for a fund it holds no more."""
     t, s, out, px, limits = _rising_book(tmp_path / "old", monkeypatch, limit=50.0)
     _without_remembered_prices(t)
     again = pp.PaperTrader(t.dir, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
-    day = again.step(_bad_column(px.iloc[: DAY0 + 5], "all NaN"), {7: s})
-    bbb = again.state["positions"]["two"]["BBB"]
-    assert day["equity"] == pytest.approx(again.state["cash"] + again.state["positions"]["two"]["AAA"]["units"] * 100.0 + bbb["units"] * 50.0)
-    assert "BBB" not in again.state["last_valid_prices"] and again.state["last_valid_prices"]["AAA"]["price"] == 100.0
-    assert day["carried_close_days"] == {"BBB": None}                   # rev 6: valued at its cost
+    before = _folder(t.dir)
+    with pytest.raises(pp.PaperBookNoPrice, match="restore the price data for BBB and run it again") as err:
+        again.step(_bad_column(px.iloc[: DAY0 + 5], "all NaN"), {7: s})
+    assert err.value.funds == ["BBB"] and err.value.day == str(px.index[DAY0 + 4].date()) and _folder(t.dir) == before
+    day = again.step(px.iloc[: DAY0 + 5], {7: s})
+    assert "carried_close_days" not in day and again.state["last_valid_prices"]["BBB"]["price"] == 80.0
 
 
 def test_a_latch_file_that_cannot_be_opened_counts_as_tripped_and_is_journaled(setup):
@@ -2216,7 +2218,7 @@ def test_a_start_that_finishes_an_outbox_rebuilds_the_tax_ledger_before_the_nigh
 _KEYS = ("last_valid_prices", "last_valid_prices_as_of")
 
 
-def _book(directory, monkeypatch, bbb, schedule=None, limit=50.0, aaa=100.0):
+def _book(directory, monkeypatch, bbb, schedule=None, limit=50.0, aaa=100.0, **kw):
     """AAA at `aaa` (flat at 100 unless given) and BBB at the closes `bbb`; `two` holds 30% of each unless `schedule`
     (targets by bar) says otherwise; orders of bar 30 fill on bar 31."""
     px = pd.DataFrame({"AAA": np.broadcast_to(np.asarray(aaa, dtype=float), (len(bbb),)).copy(), "BBB": np.asarray(bbb, dtype=float)},
@@ -2224,7 +2226,7 @@ def _book(directory, monkeypatch, bbb, schedule=None, limit=50.0, aaa=100.0):
     limits = directory.parent / f"{directory.name}-limits.json"
     limits.write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": limit, "max_position_pct": 0.6, "max_open_positions": 5}))
     monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": schedule or [{"AAA": 0.3, "BBB": 0.3}] * len(bbb)}))
-    t = pp.PaperTrader(directory, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    t = pp.PaperTrader(directory, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15, **kw)
     return t, long_only("two", market=("AAA", "BBB")), px
 
 
@@ -2251,8 +2253,9 @@ def test_after_a_roll_back_the_closes_kept_before_it_are_never_used(tmp_path, mo
     """Outcome 1, the check's first case: BBB is bought at 50 and rises to 80 (kept as of bar 33); another revision then
     runs two nights in which it falls to 56. The first night back the closes kept before the roll back are dropped and
     filled again from the history: with only today's close missing the night equals this revision run throughout (56);
-    with the column unreadable the history has nothing and the fund is valued at its cost, as for a state saved without
-    the closes; never at the 80 from before, so no false gain and no false peak."""
+    with the column unreadable the history has nothing (rev 7: the night is refused whole, as for a state saved without
+    the closes, and this revision run throughout carries its own 56); never at the 80 from before, so no false gain and
+    no false peak."""
     bbb = [50.0] * 32 + [80.0] * 2 + [56.0] * 4
     t, s, px = _book(tmp_path / "rolled", monkeypatch, bbb)
     u, _, _ = _book(tmp_path / "throughout", monkeypatch, bbb)
@@ -2274,22 +2277,27 @@ def test_after_a_roll_back_the_closes_kept_before_it_are_never_used(tmp_path, mo
     else:
         frame.iloc[-1, frame.columns.get_loc("BBB")] = np.nan
     peak = t.state["peak_equity"]
+    if back == "column as text":                                        # rev 7: BBB has no close anywhere tonight
+        for book in (t, w):
+            before = _folder(book.dir)
+            with pytest.raises(pp.PaperBookNoPrice, match="restore the price data for BBB"):
+                book.step(frame, {7: s})
+            assert _folder(book.dir) == before and book.state["peak_equity"] == peak
+        same = u.step(frame, {7: s})                                     # run throughout: its own kept 56
+        assert same["equity"] == pytest.approx(_value(u, {"AAA": 100.0, "BBB": 56.0}))
+        return
     night, same, forgot = t.step(frame, {7: s}), u.step(frame, {7: s}), w.step(frame, {7: s})
     assert night["equity"] == pytest.approx(forgot["equity"], rel=1e-12) and t.state["peak_equity"] == peak
-    lot = t.state["positions"]["two"]["BBB"]
-    if back == "column as text":
-        assert night["equity"] == pytest.approx(_value(t, {"AAA": 100.0, "BBB": lot["cost"]})) and lot["cost"] == pytest.approx(50.0)
-        assert night["carried_close_days"] == {"BBB": None}
-    else:
+    if back != "column as text":
         assert night["equity"] == pytest.approx(same["equity"], rel=1e-12) == _value(t, {"AAA": 100.0, "BBB": 56.0})
         assert night["carried_close_days"] == {"BBB": str(px.index[35].date())}
     assert night["equity"] < _value(t, {"AAA": 100.0, "BBB": 80.0}) - 1.0 and not rg.file_is_there(t.latch_file)
 
 
-def test_after_a_roll_back_a_fund_sold_and_bought_again_is_valued_at_its_new_cost(tmp_path, monkeypatch):
+def test_after_a_roll_back_a_fund_sold_and_bought_again_is_never_valued_at_the_old_close(tmp_path, monkeypatch):
     """Outcome 1, the check's second case: BBB held at 100 (kept as of bar 33); another revision sells it and buys it
-    again at 60. The first night back, its column unreadable, it is valued at its cost of 60, as rev 4 values it, never
-    at the 100 kept from the earlier holding."""
+    again at 60. The first night back, its column unreadable, it is never valued at the 100 kept from the earlier
+    holding: rev 7 refuses the night (no close of BBB anywhere), and with the data back it runs at the true 60."""
     both, aaa = {"AAA": 0.3, "BBB": 0.3}, {"AAA": 0.3}
     schedule = [both] * 34 + [aaa] + [both] * 3
     t, s, px = _book(tmp_path / "rolled", monkeypatch, [100.0] * 34 + [60.0] * 4, schedule=schedule)
@@ -2299,9 +2307,13 @@ def test_after_a_roll_back_a_fund_sold_and_bought_again_is_valued_at_its_new_cos
     _nights_of_another_revision(t, px, s, (34, 35, 36))                 # sold on bar 35, bought again on bar 36 at 60
     lot = t.state["positions"]["two"]["BBB"]
     assert lot["cost"] == pytest.approx(60.0) and t.state["last_valid_prices"]["BBB"]["price"] == 100.0
-    night = t.step(_bad_column(px.iloc[:38], "text"), {7: s})
+    before = _folder(t.dir)
+    with pytest.raises(pp.PaperBookNoPrice, match="BBB"):
+        t.step(_bad_column(px.iloc[:38], "text"), {7: s})
+    assert _folder(t.dir) == before
+    night = t.step(px.iloc[:38], {7: s})
     assert night["equity"] == pytest.approx(_value(t, {"AAA": 100.0, "BBB": 60.0}))
-    assert night["carried_close_days"] == {"BBB": None} and not rg.file_is_there(t.latch_file)
+    assert "carried_close_days" not in night and not rg.file_is_there(t.latch_file)
 
 
 def _damage(kind, state, last):
@@ -2323,7 +2335,7 @@ def _damage(kind, state, last):
     elif kind == "a price that is no price":
         entry["price"] = -77.0
     else:
-        entry["day"] = {"a day far ahead": "2099-01-01", "a day that is text": "garbage", "a day that is no date": "2026-02-30",
+        entry["day"] = {"a day without dashes": last.replace("-", ""), "a day far ahead": "2099-01-01", "a day that is text": "garbage", "a day that is no date": "2026-02-30",
                         "a day with a time": f"{last}T23:59", "the day after the last night": later,
                         "a day that is a number": 20990101}[kind]
 
@@ -2331,13 +2343,14 @@ def _damage(kind, state, last):
 @pytest.mark.parametrize("kind", ["a day far ahead", "a day that is text", "a day that is no date", "a day with a time",
                                   "the day after the last night", "a day that is a number", "a price too large for a float",
                                   "a price that is text", "a price that is true", "a price that is no price", "an entry that is a list",
-                                  "the key as a list", "the key as text"])
+                                  "the key as a list", "the key as text", "a day without dashes"])
 def test_a_damaged_remembered_close_is_dropped_and_never_raises(tmp_path, monkeypatch, kind):
     """Outcome 2: an entry is read strictly (a calendar date written YYYY-MM-DD no later than the book's last day, a valid
     price), days are compared as dates, a key that is not a mapping is absent; a damaged entry is dropped, never wins
     over a real close and never raises: the night equals the same night with the entry removed. A damaged day comes
-    with a remembered 77 against the frame's 80 of the last day; a damaged price with the day right and no BBB column
-    tonight, so that only the price decides."""
+    with a remembered 77 against the frame's 80 of the last day; a damaged price (and a day written without dashes) with
+    no BBB column tonight, so that only the entry could price BBB: dropped, the night is refused (rev 7), as it is with
+    the entry removed."""
     t, s, out, px, _ = _rising_book(tmp_path / "damaged", monkeypatch)
     u, _, _, _, _ = _rising_book(tmp_path / "removed", monkeypatch)
     last = t.state["last_day"]
@@ -2350,10 +2363,16 @@ def test_a_damaged_remembered_close_is_dropped_and_never_raises(tmp_path, monkey
     u._save()
     frame = px.iloc[: DAY0 + 5].copy()
     frame.iloc[-1, frame.columns.get_loc("BBB")] = np.nan               # carried tonight: the frame has 80 on bar 33
-    price = kind.startswith("a price")
-    if price:
+    if kind.startswith("a price") or kind == "a day without dashes":
         frame = frame.drop(columns=["BBB"])
         monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3}] * len(px)}))
+        for book in (t, u):
+            before = _folder(book.dir)
+            with pytest.raises(pp.PaperBookNoPrice, match="BBB"):
+                book.step(frame, {7: s})
+            assert _folder(book.dir) == before
+        return
+    price = False
     bad, good = t.step(frame, {7: s}), u.step(frame, {7: s})
     assert bad["equity"] == pytest.approx(good["equity"], rel=1e-12) and bad["drawdown_pct"] == pytest.approx(good["drawdown_pct"])
     assert bad["carried_close_days"] == good["carried_close_days"] == {"BBB": None if price else last}
@@ -2431,7 +2450,7 @@ def test_a_reader_on_a_read_only_folder_with_the_lock_there_raises_nothing_and_w
     assert after == before
 
 
-@pytest.mark.parametrize("what", ["folder", "state file", "journal file", "latch reset"])
+@pytest.mark.parametrize("what", ["folder", "state file", "journal file", "latch reset", "leftover state temp file"])
 def test_a_writer_that_cannot_write_refuses_before_it_decides_or_calls_a_venue(setup, monkeypatch, what):
     """Outcome 3: a night (or a latch reset) on a book whose folder, state file or journal file it cannot write raises at
     once, naming what cannot be written: no rule is run, no venue is called, nothing changes."""
@@ -2448,8 +2467,9 @@ def test_a_writer_that_cannot_write_refuses_before_it_decides_or_calls_a_venue(s
     real = pp.run_rules
     monkeypatch.setattr(pp, "run_rules", lambda *a, **k: rules.append(1) or real(*a, **k))
     target = {"folder": setup[0], "latch reset": setup[0], "state file": setup[0] / "paper_state.json",
-              "journal file": setup[0] / f"{px.index[14].date()}.jsonl"}[what]
-    if what == "journal file":
+              "journal file": setup[0] / f"{px.index[14].date()}.jsonl",
+              "leftover state temp file": setup[0] / "paper_state.json.tmp"}[what]      # rev 7: outcome 5
+    if what in ("journal file", "leftover state temp file"):
         target.write_bytes(b"")
     before = _folder(setup[0])
     target.chmod(0o500 if target.is_dir() else 0o444)
@@ -2502,41 +2522,39 @@ def _rolled_back(tmp_path, monkeypatch, name, bbb, aaa, limit):
     return t, s, px
 
 
-def test_a_night_valued_at_cost_for_lack_of_any_close_never_raises_the_peak(tmp_path, monkeypatch):
-    """Outcome 9, the check's case: BBB bought at 120 falls to 100 and then, while another revision runs, to 70; AAA
-    rises to 110. The first night back BBB's whole column is text: it is valued at its cost of 120, above the true 70,
-    and that estimate is above the peak. It is journaled as computed and names BBB as valued at cost, but the peak stays;
-    the next true night shows the true drawdown (9.5% from the peak of 100,000) and trips no 10% latch, as the true
-    figures do not."""
+def test_a_night_with_no_close_of_a_held_fund_never_reaches_the_peak(tmp_path, monkeypatch):
+    """Rev 7 (in place of the addendum's peak rule): BBB bought at 120 falls to 100 and then, while another revision
+    runs, to 70; AAA rises to 110. The first night back BBB's whole column is text, so it has no close anywhere: the
+    night is refused, the peak and the folder stay as they were; with the data back the night is the true one (9.5% from
+    the peak of 100,000) and trips no 10% latch."""
     bbb, aaa = [120.0] * 32 + [100.0] * 2 + [70.0] * 4, [100.0] * 32 + [110.0] * 6
     t, s, px = _rolled_back(tmp_path, monkeypatch, "rolled", bbb, aaa, 10.0)
     u, _, _ = _rolled_back(tmp_path, monkeypatch, "true", bbb, aaa, 10.0)
-    peak = t.state["peak_equity"]
+    peak, before = t.state["peak_equity"], _folder(t.dir)
     assert peak == pytest.approx(100_000.0) and t.state["positions"]["two"]["BBB"]["cost"] == pytest.approx(120.0)
-    night = t.step(_bad_column(px.iloc[:37], "text"), {7: s})
-    true = u.step(px.iloc[:37], {7: s})
-    assert night["equity"] == pytest.approx(_value(t, {"AAA": 110.0, "BBB": 120.0})) and night["equity"] > peak
-    assert night["carried_close_days"] == {"BBB": None} and night["unreadable_prices"] == ["BBB"]
-    assert t.state["peak_equity"] == peak and night["drawdown_pct"] == 0.0
+    with pytest.raises(pp.PaperBookNoPrice, match="BBB"):
+        t.step(_bad_column(px.iloc[:37], "text"), {7: s})
+    assert t.state["peak_equity"] == peak and _folder(t.dir) == before
+    night, true = t.step(px.iloc[:37], {7: s}), u.step(px.iloc[:37], {7: s})
     after, true_after = t.step(px.iloc[:38], {7: s}), u.step(px.iloc[:38], {7: s})
-    assert after["equity"] == pytest.approx(true_after["equity"]) and after["drawdown_pct"] == pytest.approx(true_after["drawdown_pct"])
+    assert [night, after] == [true, true_after]
     assert after["drawdown_pct"] == pytest.approx(100.0 * (1 - _value(t, {"AAA": 110.0, "BBB": 70.0}) / peak)) and after["drawdown_pct"] < 10.0
-    assert true["drawdown_pct"] < 10.0 and not rg.file_is_there(t.latch_file) and not _latched(t.dir)
+    assert not rg.file_is_there(t.latch_file) and not _latched(t.dir)
 
 
-def test_a_night_valued_at_cost_below_the_true_close_is_judged_against_the_old_peak(tmp_path, monkeypatch):
-    """Outcome 9, the other direction: BBB bought at 50 rises to 90 while another revision runs; the first night back its
-    column is text and it is valued at its cost of 50, far below the true 90. The night is judged against the peak as
-    it was: the estimate is a 19% fall, past the 10% limit, so the latch trips that night (the careful direction), and
-    the summary names BBB as valued at its cost."""
+def test_a_night_whose_estimate_would_trip_the_latch_is_refused_and_trips_nothing(tmp_path, monkeypatch):
+    """Rev 7 (in place of the addendum's other direction): BBB bought at 50 rises to 90 while another revision runs;
+    the first night back its column is text. Rev 6 valued it at its cost of 50 and the 19% fall it made tripped the 10%
+    latch; rev 7 refuses the night, and with the data back the true night (BBB at 90) trips nothing."""
     bbb = [50.0] * 32 + [80.0] * 2 + [90.0] * 4
     t, s, px = _rolled_back(tmp_path, monkeypatch, "rolled", bbb, 100.0, 10.0)
-    peak = t.state["peak_equity"]
-    night = t.step(_bad_column(px.iloc[:37], "text"), {7: s})
-    assert night["carried_close_days"] == {"BBB": None} and night["stale_prices"] == {"BBB": 37}
-    assert night["equity"] == pytest.approx(_value(t, {"AAA": 100.0, "BBB": 50.0})) and t.state["peak_equity"] == peak
-    assert night["drawdown_pct"] == pytest.approx(100.0 * (1 - night["equity"] / peak)) and night["drawdown_pct"] > 10.0
-    assert rg.file_is_there(t.latch_file) and _latched(t.dir) == [str(px.index[36].date())]
+    peak, before = t.state["peak_equity"], _folder(t.dir)
+    with pytest.raises(pp.PaperBookNoPrice, match="BBB"):
+        t.step(_bad_column(px.iloc[:37], "text"), {7: s})
+    assert _folder(t.dir) == before and not rg.file_is_there(t.latch_file)
+    night = t.step(px.iloc[:37], {7: s})
+    assert night["equity"] == pytest.approx(_value(t, {"AAA": 100.0, "BBB": 90.0})) and t.state["peak_equity"] == peak
+    assert night["drawdown_pct"] == 0.0 and not rg.file_is_there(t.latch_file) and not _latched(t.dir)
 
 
 def test_a_night_whose_carried_funds_all_have_a_real_close_raises_the_peak_as_before(tmp_path, monkeypatch):
@@ -2550,3 +2568,141 @@ def test_a_night_whose_carried_funds_all_have_a_real_close_raises_the_peak_as_be
     night = t.step(frame, {7: s})
     assert night["carried_close_days"] == {"BBB": str(px.index[DAY0 + 3].date())} and night["equity"] > peak
     assert t.state["peak_equity"] == night["equity"] and night["drawdown_pct"] == 0.0
+
+
+# ---- rev 7: a night the book cannot price is a night it does not run
+
+def _spied(monkeypatch):
+    """Record every strategy rule run and every venue call from here on."""
+    rules, calls, real = [], [], pp.run_rules
+    monkeypatch.setattr(pp, "run_rules", lambda *a, **k: rules.append(1) or real(*a, **k))
+    venue = SimpleNamespace(name="stub", submit=lambda *a: calls.append(a) or {"status": "accepted"})
+    return rules, calls, venue
+
+
+@pytest.mark.parametrize("case", ["roll back, column text, 100 to 70", "bought at 50, true price 90",
+                                  "a state without kept closes", "an outbox waiting"])
+def test_a_night_it_cannot_price_is_refused_whole_and_runs_later_as_if_never_seen(tmp_path, monkeypatch, case):
+    """Rev 7, outcome 1: a held fund with no close at all (its whole column unreadable and no current kept close): `step`
+    raises PaperBookNoPrice naming it and saying what to do, before any rule, venue call, journal line, state, latch or
+    outbox write: the folder is identical, bytes and times. Run again with the data back, the night is an ordinary one
+    and the book equals one that never saw the bad night."""
+    bbb = {"roll back, column text, 100 to 70": [100.0] * 34 + [70.0] * 4,
+           "bought at 50, true price 90": [50.0] * 32 + [80.0] * 2 + [90.0] * 4}.get(case, [50.0] * 32 + [80.0] * 6)
+    books = []
+    for name in ("bad", "never"):
+        t, s, px = _book(tmp_path / name, monkeypatch, bbb, limit=10.0)
+        for i in range(30, 34):
+            t.step(px.iloc[: i + 1], {7: s})
+        if case.startswith("roll back") or case.startswith("bought"):
+            _nights_of_another_revision(t, px, s, (34, 35))
+        else:
+            for i in (34, 35):
+                if i == 35 and case == "an outbox waiting":
+                    monkeypatch.setattr(t, "_flush_outbox", lambda: None)   # the kill: after the save, before the appends
+                t.step(px.iloc[: i + 1], {7: s})
+            for k in _KEYS:
+                t.state.pop(k, None)                                    # a state without current kept closes
+            t._save()
+        books.append(t)
+    bad, never = books
+    if case == "an outbox waiting":
+        assert "journal_outbox" in json.loads(bad.state_file.read_text())
+    wants = [{"AAA": 0.3, "BBB": 0.3}] * 36 + [{"AAA": 0.5, "BBB": 0.3}] * 2   # tonight an AAA order for the venue
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": wants}))
+    rules, calls, venue = _spied(monkeypatch)
+    with monkeypatch.context() as m:
+        if case == "an outbox waiting":   # built while the book could not be written: the outbox still waits at `step`
+            m.setattr(pp.PaperTrader, "_unwritable", lambda self, days=(): "the book could not be written")
+        writer = pp.PaperTrader(bad.dir, bad.limits_file, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15,
+                                venue=venue)
+    if case == "an outbox waiting":
+        assert "journal_outbox" in writer.state and "journal_outbox" in json.loads(bad.state_file.read_text())
+    before = _folder(bad.dir)
+    with pytest.raises(pp.PaperBookNoPrice) as err:
+        writer.step(_bad_column(px.iloc[:37], "text"), {7: s})
+    assert err.value.funds == ["BBB"] and err.value.day == str(px.index[36].date())
+    assert str(err.value).startswith(f"the paper book was not run for {px.index[36].date()}:")
+    assert str(err.value).endswith("restore the price data for BBB and run it again") and "\n" not in str(err.value)
+    assert rules == [] and calls == [] and _folder(bad.dir) == before
+    again = pp.PaperTrader(bad.dir, bad.limits_file, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    other = pp.PaperTrader(never.dir, never.limits_file, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    for i in (36, 37):
+        assert again.step(px.iloc[: i + 1], {7: s}) == other.step(px.iloc[: i + 1], {7: s})
+    assert [e for e in again.journal.read(since=px.index[36]) if e["type"] == "decision" and e.get("symbol") == "AAA"]
+    files = lambda d: {p.name: p.read_bytes() for p in d.iterdir()                  # journal lines carry the wall clock:
+                       if p.name != "paper_state.lock" and p.suffix != ".jsonl"}   # compared below without it
+    assert files(bad.dir) == files(never.dir) and not rg.file_is_there(again.latch_file)
+    assert sorted(p.name for p in bad.dir.iterdir()) == sorted(p.name for p in never.dir.iterdir())
+    assert _comparable_journal(bad.dir) == _comparable_journal(never.dir)
+
+
+def test_a_latch_reset_after_a_refused_night_takes_the_peak_of_the_last_night_that_ran(tmp_path, monkeypatch):
+    """Rev 7, outcome 1, the check's third case: a real fall trips the latch; the next night BBB has no close anywhere and
+    is refused; the reset then sets the peak to the equity of the last night that ran (a real one), and the next true
+    night shows no drawdown and trips nothing."""
+    t, s, px = _book(tmp_path / "book", monkeypatch, [100.0] * 34 + [70.0] * 4, limit=5.0)
+    for i in range(30, 35):
+        t.step(px.iloc[: i + 1], {7: s})
+    assert _latched(t.dir) == [str(px.index[34].date())]               # the real fall to 70
+    for k in _KEYS:
+        t.state.pop(k, None)
+    t._save()
+    with pytest.raises(pp.PaperBookNoPrice):
+        t.step(_bad_column(px.iloc[:36], "text"), {7: s})
+    assert t.reset_latch("owner", px.index[35]) is True
+    assert t.state["peak_equity"] == t.state["history"][-1]["equity"] == pytest.approx(_value(t, {"AAA": 100.0, "BBB": 70.0}))
+    night = t.step(px.iloc[:36], {7: s})
+    assert night["drawdown_pct"] == 0.0 and not rg.file_is_there(t.latch_file)
+
+
+def test_a_reader_still_values_a_book_in_any_state_and_never_raises(tmp_path, monkeypatch):
+    """Rev 7, outcome 2: `step` never values a night at cost, but a reader's `equity` and `_mark` still answer for any row,
+    cost fallback included, and never raise (a row of text, a fund missing, nothing carried)."""
+    t, s, out, px, _ = _rising_book(tmp_path / "book", monkeypatch)
+    aaa, bbb = t.state["positions"]["two"]["AAA"], t.state["positions"]["two"]["BBB"]
+    row = pd.Series({"AAA": "n/a", "BBB": None})
+    assert t.equity(row) == pytest.approx(t.state["cash"] + aaa["units"] * aaa["cost"] + bbb["units"] * bbb["cost"])
+    assert t.equity(pd.Series({"AAA": 100.0}), {"BBB": 80.0}) == pytest.approx(out[-1]["equity"])
+    assert pp.PaperTrader._mark("BBB", bbb, pd.Series({"BBB": "n/a"}), None) == bbb["cost"]
+
+
+def test_a_writer_refuses_when_a_waiting_outboxs_journal_file_cannot_be_written(setup, monkeypatch):
+    """Rev 7, outcome 5: the journal file a waiting outbox appends to is checked by a writer: read-only, the night is
+    refused naming it, before any rule, and nothing changes."""
+    import os
+    import re
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the permissions this test sets")
+    px, s, state = _with_outbox(setup, monkeypatch)
+    pp.Journal(setup[0]).append(state["journal_outbox"][0])             # a kill after the first append: the file is there
+    target = setup[0] / f"{state['last_day']}.jsonl"
+    rules, calls, venue = _spied(monkeypatch)
+    before = _folder(setup[0])
+    target.chmod(0o444)
+    try:
+        with pytest.raises(pp.PaperBookUnwritable, match=re.escape(str(target))):
+            trader(setup, venue=venue).step(px.iloc[:16], {7: s})
+        after = _folder(setup[0])
+    finally:
+        target.chmod(0o644)
+    assert rules == [] and calls == [] and after == before
+
+
+def test_a_reader_whose_finishing_of_an_outbox_fails_raises_nothing_and_keeps_the_state_on_disk(setup, monkeypatch):
+    """Rev 7, outcome 5: a reader that can write starts finishing an outbox and fails (a full disk at the save): building
+    it raises nothing and its state is the state on disk (the outbox still waiting), never the half-done one in memory;
+    a later run finishes it with every entry exactly once."""
+    px, s, state = _with_outbox(setup, monkeypatch)
+    real = pp.PaperTrader._save
+
+    def full(self):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(pp.PaperTrader, "_save", full)
+    reader = pp.PaperTrader(setup[0], setup[1], halt_file=None)
+    assert reader.state == json.loads((setup[0] / "paper_state.json").read_text()) == state
+    assert "journal_outbox" in reader.state
+    monkeypatch.setattr(pp.PaperTrader, "_save", real)
+    trader(setup)
+    lines = [ln for p in sorted(setup[0].glob("*.jsonl")) for ln in p.read_text().splitlines()]
+    assert all(lines.count(ln) == 1 for ln in state["journal_outbox"])

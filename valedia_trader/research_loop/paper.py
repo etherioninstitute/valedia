@@ -123,6 +123,18 @@ class PaperBookUnwritable(PermissionError):
     a journal file): refused before it reads prices, decides or calls a venue; nothing was done to the book."""
 
 
+class PaperBookNoPrice(RuntimeError):
+    """A night on which a fund the book holds has no close at all (none today, none in the price history, none the book
+    kept from its previous night): the book does not estimate, so the night is not run. Nothing was done to the book.
+    `day` is the night, `funds` the funds without a close."""
+
+    def __init__(self, day: str, funds: list[str]) -> None:
+        self.day, self.funds = day, list(funds)
+        names = ", ".join(self.funds)
+        super().__init__(f"the paper book was not run for {day}: no close of {names} today, in the price history or kept by "
+                         f"the book; restore the price data for {names} and run it again")
+
+
 class LatchResetError(RuntimeError):
     """The drawdown latch is there and cannot be removed (a directory, no permission, ...)."""
 
@@ -509,10 +521,10 @@ class PaperTrader:
             return None
         return fd
 
-    def _locked(self, days=()):
+    def _locked(self, days=(), check=None):
         """Take the book's lock for one write (a day, a latch reset), or refuse at once; then make sure the state in
-        memory is the state on disk: when another run changed the file since this trader read it, read it again (and
-        finish an outbox it left)."""
+        memory is the state on disk: when another run changed the file since this trader read it, read it again, call
+        `check` (which may refuse the run before anything is written), and finish an outbox it left."""
         self.dir.mkdir(parents=True, exist_ok=True)
         fd = self._try_lock()
         if fd is None:
@@ -522,17 +534,19 @@ class PaperTrader:
             cannot = self._unwritable(sorted(set(days) | set(self._outbox_days())))
             if cannot is not None:
                 raise PaperBookUnwritable(f"{cannot} cannot be written: this run did nothing to the book")
-            self._catch_up()
+            self._catch_up(check)
         except BaseException:
             os.close(fd)
             raise
         return fd
 
-    def _catch_up(self) -> None:
-        """Under the lock: read the state again if another run changed it since this trader read it, and finish an outbox
-        a killed run left (then rebuild the tax ledger from the journal it completed)."""
+    def _catch_up(self, check=None) -> None:
+        """Under the lock: read the state again if another run changed it since this trader read it, call `check`, and
+        finish an outbox a killed run left (then rebuild the tax ledger from the journal it completed)."""
         if self._state_bytes() != self._seen:
             self._load()
+        if check is not None:
+            check()
         if "journal_outbox" in self.state:
             self._flush_outbox()
             self._load_tax()
@@ -544,9 +558,13 @@ class PaperTrader:
     @staticmethod
     def _mark(sym: str, lot: dict, row: pd.Series, carried: dict[str, float] | None) -> float:
         """The price a held lot is valued at: today's when it is a price (finite, PRICE_MIN to PRICE_MAX; `step` has already
-        removed a suspect jump), else the last valid close the book has seen (`carried`, from `_carried_marks`), else the lot's cost. A held position is
-        never valued at nothing."""
-        px = float(row.get(sym, np.nan))
+        removed a suspect jump), else the last valid close the book has seen (`carried`, from `_carried_marks`), else the lot's cost (only in a
+        reader's view: `step` never runs a night with a held fund without a close). A held position is never valued at
+        nothing and this never raises."""
+        try:
+            px = float(row.get(sym, np.nan))
+        except (TypeError, ValueError):                   # a reader's row may hold anything: no price
+            px = float("nan")
         if _is_price(px):
             return px
         if carried and sym in carried:
@@ -584,7 +602,8 @@ class PaperTrader:
         previous night valued it at (`_remembered`); on the same day, the one in `prices`. In a book run every night the
         two are the same close; the frame's is later only when the book did not run on that day, the book's own is the
         only one when the frame holds no valid price of the fund (its column unreadable, all missing or absent). Left out
-        when there is neither: the lot is then valued at its cost."""
+        when there is neither: `step` then refuses the night (`_refuse_unpriced`); only a reader's `equity` values such a
+        lot at its cost."""
         row, out = prices.iloc[-1], {}
         seen = self._remembered()
         for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
@@ -603,9 +622,22 @@ class PaperTrader:
                 out[sym] = (best[0], best[1].isoformat())
         return out
 
+    def _refuse_unpriced(self, prices: pd.DataFrame) -> None:
+        """Refuse the night (`PaperBookNoPrice`) when a fund the book holds has no close at all: no valid close today,
+        none before today in `prices` and none kept from the book's previous night (`_carried_marks`). Called under the
+        lock before anything of the night happens; a day already processed is left to `_step` to refuse."""
+        clean, _, _ = _clean_prices(prices)
+        day = str(clean.index[-1].date())
+        if self.state["last_day"] is not None and day <= self.state["last_day"]:
+            return
+        stale = self._stale_funds(clean)
+        missing = [sym for sym in stale if sym not in self._carried_marks(clean)] if stale else []
+        if missing:
+            raise PaperBookNoPrice(day, missing)
+
     def _remember_prices(self, row: pd.Series, day, marks: dict[str, tuple[float, str]]) -> None:
         """Keep, for every fund the book holds, the last valid close it was valued at and that close's day: today's when
-        it is valid, else the carried one (`_carried_marks`); a fund valued at its cost, or no longer held, has none. The
+        it is valid, else the carried one (`_carried_marks`); a fund no longer held has none. The
         closes are kept as of today (`last_valid_prices_as_of`, the book's last day once the night is saved); when there
         is none, neither key is kept."""
         memo, today = {}, str(pd.Timestamp(day).date())
@@ -818,8 +850,14 @@ class PaperTrader:
         the valid close it was last valued at and that close's day, as of the night that wrote it; on any other night
         (another revision ran in between, the state was edited) it is dropped and filled again from `prices`, as for a
         state saved without it. The summary's `carried_close_days` maps each fund of `stale_prices` to the day of the
-        close it was valued at (null: its cost). A night with a fund valued at its cost for lack of any close never
-        raises the peak: its equity is journaled as computed and the latch judged against the peak as it was. Cost is used only for a fund with no valid close the book has seen. The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
+        close it was valued at (a summary of rev 6 may hold a null there: its cost).
+
+        The book does not estimate: a night on which a held fund has no close at all (none valid today, none before today
+        in `prices`, none kept from the book's previous night) is not run. `step` raises `PaperBookNoPrice`, naming the
+        funds, under the lock and before any rule, fill, venue call, journal line, state, latch or outbox is written (it
+        leaves even a waiting outbox to the next run); run again once the price data is back, it is an ordinary night.
+
+        The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
         included, it has had no valid price in `prices`; `suspect_prices` maps each fund whose close today is suspect to
         the close seen; `unreadable_prices` names the columns no price can be read from: those that are not numbers, and
         those with no value at all (missing on every row given). Each is present only when not empty, and all are derived from `prices`: nothing about them is kept in the state file. No number that is not finite is
@@ -834,8 +872,7 @@ class PaperTrader:
         start appends where they are missing: a day run again never books a fill, a tax lot or a result twice, and never
         writes a second summary. An ordinary day writes the same journal lines and the same final state as before.
 
-        Not handled: a held fund with no valid close in `prices` and none kept by the book's previous night (the first
-        night after another revision ran, for one) is valued at its cost; a run given a price history that lacks the fund's column counts every row of the history given as
+        Not handled: a run given a price history that lacks the fund's column counts every row of the history given as
         carried; a strategy whose every
         fund is missing from `prices` makes the rules raise, as before; a kill before the day's state is saved does not
         undo what reached the outside (the venue mirror's orders, the panel's settlements), which a rerun repeats."""
@@ -843,7 +880,7 @@ class PaperTrader:
             today = [str(pd.Timestamp(prices.index[-1]).date())]
         except Exception:                                  # no usable last day: `_step` says what is wrong with it
             today = []
-        fd = self._locked(today)
+        fd = self._locked(today, lambda: self._refuse_unpriced(prices))
         try:
             return self._step(prices, strategies)
         finally:
@@ -863,8 +900,7 @@ class PaperTrader:
         marks = self._carried_marks(prices) if stale else {}
         carried = {sym: px for sym, (px, _) in marks.items()} if stale else None
         equity = self.equity(row, carried)
-        if not any(sym not in marks for sym in stale):    # a held fund valued at its cost for lack of any close makes the
-            self.state["peak_equity"] = max(self.state["peak_equity"], equity)   # equity an estimate: never a new peak
+        self.state["peak_equity"] = max(self.state["peak_equity"], equity)
         account = {"equity": equity, "daily_loss_pct": max(0.0, (previous - equity) / previous * 100.0),
                    "drawdown_pct": max(0.0, (self.state["peak_equity"] - equity) / self.state["peak_equity"] * 100.0),
                    "open_positions": self.open_positions()}
@@ -959,7 +995,7 @@ class PaperTrader:
                    "benchmark_values": self._benchmark_values(prices, strategies, share)}
         if stale:
             summary["stale_prices"] = stale
-            summary["carried_close_days"] = {sym: marks[sym][1] if sym in marks else None for sym in stale}
+            summary["carried_close_days"] = {sym: marks[sym][1] for sym in stale}     # every one priced (`_refuse_unpriced`)
         if suspect:
             summary["suspect_prices"] = suspect
         if unreadable:
