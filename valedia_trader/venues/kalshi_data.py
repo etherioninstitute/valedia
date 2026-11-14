@@ -29,7 +29,7 @@ __all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "urllib_get", "n
            "KalshiData", "normalize_levels", "best_quote", "normalize_trade", "iso_to_ts"]
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-USER_AGENT = "valedia-trader-research/1.0"
+USER_AGENT = "market-data-reader/1.0"
 PRICE_KEYS = ("open", "high", "low", "close", "mean", "previous")
 BOOK_KEYS = ("open", "high", "low", "close")
 MARKET_KEYS = ("ticker", "event_ticker", "title", "subtitle", "yes_sub_title", "strike_type", "floor_strike", "cap_strike",
