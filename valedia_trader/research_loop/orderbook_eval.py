@@ -552,11 +552,6 @@ class Tape:
         k = bisect.bisect_right(self.ends, t + AFTER_S)
         return [s for s in self.valid[j:k] if s["book_start_ts"] > t]
 
-    def before(self, i: int, t: float) -> list:
-        a = self.valid[i]["book_end_ts"]
-        lo = bisect.bisect_left(self.ends, a - HORIZON_S - REF_S)
-        return [s for s in self.valid[lo:i + 1] if s["end_ts"] < t]
-
     def not_after(self, i: int, t: float) -> list:
         """The valid snapshots from 15 min 30 s before the now snapshot's book time that did not begin after t: those
         finished before it and those that began before it and finished after (clarification 26)."""
@@ -1122,8 +1117,8 @@ def main(argv=None, *, clock: Callable[[], float] | None = None) -> int:
         print("refused: %s" % e, file=sys.stderr)
         return 2
     except sqlite3.Error as e:
-        print("refused: a database error stopped the command (%s: %s). Each write of this program is one transaction, "
-              "so the one that failed left nothing; `status` shows what the evaluation's store holds"
+        print("refused: a database error stopped the command (%s: %s). A fit or a result and its log lines are "
+              "stored together or not at all; `status` shows what the evaluation's store holds"
               % (type(e).__name__, e), file=sys.stderr)
         return 2
     print(json.dumps(out, indent=1, sort_keys=True, allow_nan=False))

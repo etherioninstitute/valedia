@@ -1269,6 +1269,45 @@ def test_the_result_and_its_log_line_are_one_write(generated, tmp_path, capsys):
     assert code == 0 and json.loads(out)["period"] == "test"
 
 
+def test_the_fit_and_its_log_line_are_one_write(generated, tmp_path, capsys):
+    # the log insert fails after the fit's: neither is stored, and the message says only what is true
+    path, _, _ = generated
+    per, _, _ = per_and_days()
+    ev = tmp_path / "e"
+    oe.EvalStore(ev).close()
+    c = sqlite3.connect(str(ev / oe.EVAL_DB))
+    c.execute("CREATE TRIGGER fail_fit BEFORE INSERT ON log WHEN NEW.command = 'fit' BEGIN "
+              "SELECT RAISE(ABORT, 'injected'); END")
+    c.commit()
+    c.close()
+    code, _, err = run(capsys, "fit", "--db", str(path), "--eval-dir", str(ev), now=oe.day_end(per["test_last"]))
+    es = oe.EvalStore(ev)
+    assert es.fit() is None and es.log_entries() == []
+    es.close()
+    assert code == 2 and "injected" in err and "stored together or not at all" in err and "Traceback" not in err
+
+
+def test_a_code_changed_line_is_written_with_the_result_never_alone(generated, tmp_path, capsys, monkeypatch):
+    # the result insert fails: the code_changed line that would go with it is not left behind on its own
+    path, _, _ = generated
+    per, _, _ = per_and_days()
+    ev = tmp_path / "e"
+    due = oe.day_end(per["test_last"]) + oe.OUTCOME_WAIT_S
+    assert run(capsys, "fit", "--db", str(path), "--eval-dir", str(ev), now=due)[0] == 0
+    c = sqlite3.connect(str(ev / oe.EVAL_DB))
+    c.execute("CREATE TRIGGER fail_result BEFORE INSERT ON result BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    c.commit()
+    c.close()
+    real = oe.code_hashes()
+    monkeypatch.setattr(oe, "code_hashes", lambda: dict(real, orderbook_eval="0" * 64))
+    code, _, err = run(capsys, "score", "--db", str(path), "--eval-dir", str(ev), "--code-changed", "a test",
+                       now=due)
+    es = oe.EvalStore(ev)
+    assert es.result() is None and [e["command"] for e in es.log_entries()] == ["fit"]
+    es.close()
+    assert code == 2 and "injected" in err and "stored together or not at all" in err
+
+
 def test_score_once_is_a_rule_of_this_program_a_removed_store_is_scored_again(generated, tmp_path, capsys):
     # clarification 35: the evaluation store's file removed by other means: the next score runs again
     path, _, _ = generated
