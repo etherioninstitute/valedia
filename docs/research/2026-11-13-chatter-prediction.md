@@ -93,3 +93,21 @@ posting time the service gives is stored as information and is not used to move 
 **The paid reader service will not be used.** The owner decided to keep the plan as first written: comments are
 read from the public feed, or from Reddit's official interface if he later supplies an app. Clarification 1
 therefore has no effect; nothing else changes.
+
+## Clarification 3 (2026-11-14, 03:29 UTC: before the collector has run; no store exists; nothing has been collected, read or scored)
+
+**What "covered at least 80% of it" means.** The blind check of the collector showed that its count could call a
+day covered when it was not (a restart inside a minute counted the same minute twice). The rule, fixed now:
+
+- **Prices.** A UTC day has 5 series x 1,440 minutes = 7,200 slots. A slot is covered when at least one
+  successful read of that series was stored for that minute (a read that finds no open game market is a
+  successful read; a second read of the same series and minute adds nothing). Coverage is covered slots over
+  7,200. A series with no successful read all day therefore costs 20 points, and four complete series alone
+  reach exactly 80%.
+- **Comments.** The day's slots are the reads the plan allows: every 120 seconds on the public feed outside
+  minutes 5 to 12 of each hour (624 a day), every 60 seconds on Reddit's official interface (1,440 a day). The
+  silent minutes are not slots: they delay first sight, which the test already charges to itself, and are a known
+  limit. A slot is covered when a successful first-page read was stored for it AND that read carries no mark that
+  comments may have been missed since the read before it. Coverage is covered slots over the day's slots.
+- Time during which the collector was not running is uncovered on both counts. A day counts if both coverages
+  are at least 80%. Nothing else in the test changes.
