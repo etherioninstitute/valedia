@@ -1087,7 +1087,7 @@ def grams(text, n=5):
 
 def test_no_five_characters_of_any_order_tag_reach_the_page(bare_world, trading_file, capsys):
     w = bare_world
-    base, _ = build_real(w, capsys)
+    base, base_said = build_real(w, capsys)
     tags = sorted(set(generated_tags(random.Random(67), 10000)))
     db = sqlite3.connect(w.ledger_path)
     for i, tag in enumerate(tags):
@@ -1099,7 +1099,7 @@ def test_no_five_characters_of_any_order_tag_reach_the_page(bare_world, trading_
     html, said = build_real(w, capsys)
     assert html.count("<tr>") >= 2 * len(tags)                                               # every planted tag is in both tables
     page = grams(html) | grams(said)
-    known = grams(base)                                                                      # the page's own words and numbers
+    known = grams(base) | grams(base_said)                           # the page's own words and numbers, and the path the command prints
     shown = sorted({(t, t.lower()[i:i + 5]) for t in tags for i in range(len(t) - 4)
                     if t.lower()[i:i + 5] in page and t.lower()[i:i + 5] not in known})
     assert shown == [], shown[:10]

@@ -984,6 +984,7 @@ def test_after_one_event_every_strategy_is_judged_again_with_figures_from_the_va
     elif event == "two summaries for one day":
         used = history
         rerun = paths.journal / f"{history[30 - 12]['day']}.jsonl"
+        rerun.write_bytes(rerun.read_bytes() * 2)                          # the day written twice, as a book before the exactly-once write left it
         assert sum(1 for ln in rerun.read_bytes().splitlines() if b'"type": "summary"' in ln) == 2
     elif event == "one malformed line":
         _rewrite_summary(path, lambda e: b'{"type": "summary", "equity": 10')
