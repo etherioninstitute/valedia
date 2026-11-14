@@ -1,7 +1,7 @@
 """The evaluation of the order-book loop, exactly as its locked prediction says.
 
 The prediction is docs/research/2026-11-13-orderbook-loop-prediction.md (with its notes 1 to 6 and its
-clarifications 1 to 25); every rule and threshold below comes from it, and nothing is tuned on data. The collector's
+clarifications 1 to 35); every rule and threshold below comes from it, and nothing is tuned on data. The collector's
 record (`orderbook_loop.py`) is opened read-only (`mode=ro`) always. Reading it can create its two side files (the
 `-wal` and `-shm` beside it, as SQLite does for any reader of a WAL-mode store) and never changes the store's own
 bytes; a record that cannot be read so (a read-only folder without its `-shm` file) is refused plainly. This module
@@ -38,16 +38,16 @@ or the more literal one and is listed for a dated clarification):
     different taker sides: not known); its direction is up when its taker bought yes. "The mid just before it"
     (clarification 7) is the latest two-sided valid snapshot whose book read ended before the trade (clarification
     22: by its book end time), at most 90 s (the collector's STALE_S) before it; one-sided books are passed over.
-    The candidates are the snapshots before the decision (the now snapshot with the state's mid, and those before
-    it) and those that began after it; reading: one that began before the decision and finished after it is in
-    neither, as for every outcome. The outcome is true
+    The candidates are all valid snapshots whatever they began (clarification 26): the now snapshot with the
+    state's mid, those before it, one that began before the decision and ended after it, and those begun after. The outcome is true
     when the mid at the trade + 15 min is beyond that mid on the taker's side. Note 3: counted only where the trade
     reads cover the whole 15 minutes (below); a slot without cover is left out and counted.
   - `regime` (not part of the pass line; reported as the share of answers that named it): quiet when the mid at
-    a + 30 min is within one cent of the mid now and no minute of the 30 is more than two cents from it (reading: the
-    two-cent band is two cents either side); else trending when the mid at a + 30 min moved a cent or more in the
+    a + 30 min is within one cent of the mid now and no minute of the 30 is more than two cents from it (the
+    two-cent band is two cents either side), judged first and needing no earlier move (clarification 27); else
+    trending when the mid at a + 30 min moved a cent or more in the
     direction of the state's `mid_change_30m_cents` (two cents or more either way when that was zero); else
-    mean-reverting. A null `mid_change_30m_cents` leaves it unknown.
+    mean-reverting. A null `mid_change_30m_cents` leaves a window that is not quiet unknown.
 * Tape cover (note 3): judged only from the spans of the successful trade reads stored with the snapshots, never from
   the event rows. A read covers the trades created from its `trades_min_ts` to its start (the collector's span, as in
   `_covered`) less 90 s (clarification 19: COVER_SHORTEN_S, the tape's lag TAPE_LAG_S of 60 s and the 30 s,
@@ -98,14 +98,18 @@ or the more literal one and is listed for a dated clarification):
   is above 0.5.
 * Policy, on the same slots for the three rules: mean profit per slot (cents) over all included slots; the model rule
   passes when that mean is above zero and above the always and plain rules' means, each difference (by day: each
-  day's mean of the model rule less that day's mean of the other) with a t of 2 or more. Judged on the `series` fee
+  day's mean of the model rule less that day's mean of the other) with a t of 2 or more, and the model rule's own
+  day means with a t of 2 or more (clarification 28, `model_above_zero`). Judged on the `series` fee
   variant; the other two are reported.
 * The idea passes when the test reached 10 counted days, at least two questions pass and the policy passes.
 
 `fit` stores the yardsticks once, with the SHA-256 of their canonical JSON and of this module's and the collector's
 source; `score` refuses without a stored fit, before the test period is complete, and when the code differs from the
 fit's unless `--code-changed "<reason>"` is given (logged); it scores once, and a later run prints the stored result
-without reading the record. Every command except `status` writes a line to the store's log.
+without reading the record. Every command except `status` writes a line to the store's log. The fit and its log
+line, and the result with its log lines, are each one transaction (clarification 34): a failure leaves neither.
+Score-once is this program's rule (clarification 35): a store whose result was removed by other means is scored
+again.
 """
 from __future__ import annotations
 
@@ -371,10 +375,12 @@ def mid_outcomes(mid0, spread0, prev30, a, after: list) -> dict:
             out["move_15m"] = max(abs(m - mid0) for m in p15) >= spread0 / 2 - EPS
     m30 = _mid_at(after, a + REGIME_S)
     p30 = forward_mids(after, a, REGIME_S // 60)
-    if m30 is not None and p30 is not None and prev30 is not None:
+    if m30 is not None and p30 is not None:
         d = m30 - mid0
         if abs(d) <= QUIET_END_C + EPS and all(abs(m - mid0) <= QUIET_BAND_C + EPS for m in p30):
-            out["regime"] = "quiet"
+            out["regime"] = "quiet"                      # judged first; needs no earlier move (clarification 27)
+        elif prev30 is None:
+            pass
         elif ((prev30 > 0 and d >= TREND_C - EPS) or (prev30 < 0 and d <= -TREND_C + EPS)
               or (prev30 == 0 and abs(d) >= TREND_FLAT_C - EPS)):
             out["regime"] = "trending"
@@ -387,8 +393,9 @@ def toxic_outcome(mid0, a, decision_ts: float, after: list, trades: list, prior:
     """(`toxic_15m`, the first trade's taker side): (None, None) without a trade in (decision, decision + 15 min] or
     when its first moment has trades of both sides; (None, side) when the mids around it are not known. The mid just
     before the trade (clarification 7) is the latest two-sided snapshot whose book ended before it, at most 90 s
-    old: among `prior` (the valid snapshots finished before the decision; the now snapshot, whose book ended at `a`,
-    with the state's mid `mid0`) and `after` (those begun after it)."""
+    old, whenever it began (clarification 26): among `prior` (the valid snapshots that did not begin after the
+    decision, those that straddle it included; the now snapshot, whose book ended at `a`, with the state's mid
+    `mid0`) and `after` (those begun after it)."""
     win = [x for x in trades if decision_ts < x["created_ts"] <= decision_ts + HORIZON_S]
     if not win:
         return None, None
@@ -550,6 +557,14 @@ class Tape:
         lo = bisect.bisect_left(self.ends, a - HORIZON_S - REF_S)
         return [s for s in self.valid[lo:i + 1] if s["end_ts"] < t]
 
+    def not_after(self, i: int, t: float) -> list:
+        """The valid snapshots from 15 min 30 s before the now snapshot's book time that did not begin after t: those
+        finished before it and those that began before it and finished after (clarification 26)."""
+        a = self.valid[i]["book_end_ts"]
+        lo = bisect.bisect_left(self.ends, a - HORIZON_S - REF_S)
+        k = bisect.bisect_right(self.ends, t + AFTER_S)
+        return [s for s in self.valid[lo:k] if s["book_start_ts"] <= t]
+
     def trades_in(self, t0: float, t1: float) -> list:
         return self.trades[bisect.bisect_right(self.created, t0):bisect.bisect_right(self.created, t1)]
 
@@ -578,7 +593,7 @@ class Tape:
         side = None
         if o["toxic_cover"]:
             o["outcomes"]["toxic_15m"], side = toxic_outcome(mid0, a, dts, after, self.trades_in(dts, dts + HORIZON_S),
-                                                             prior=self.before(i, dts))
+                                                             prior=self.not_after(i, dts))
         g15 = sign_group(state.get("mid_change_15m_cents"))
         o["groups"].update(up_15m=g15, down_15m=g15,
                            move_15m=move_group(state.get("mid_change_15m_cents"), state.get("spread_cents")),
@@ -789,11 +804,13 @@ def policy(obs: list) -> dict:
             ds = [statistics.mean(daily[d]["model"]) - statistics.mean(daily[d][other]) for d in sorted(daily)]
             res["model_minus_" + other] = {"mean_daily": statistics.mean(ds) if ds else None, "t": _t(ds),
                                            "days": len(ds)}
+        own = [statistics.mean(daily[d]["model"]) for d in sorted(daily)]          # clarification 28
+        res["model_above_zero"] = {"mean_daily": statistics.mean(own) if own else None, "t": _t(own), "days": len(own)}
         m = {r: res["rules"][r]["mean"] for r in RULES}
         res["pass"] = bool(m["model"] is not None and m["model"] > 0 and m["model"] > m["always"]
                            and m["model"] > m["plain"]
-                           and all(res["model_minus_" + o]["t"] is not None and res["model_minus_" + o]["t"] >= T_LINE
-                                   for o in ("always", "plain")))
+                           and all(res[k]["t"] is not None and res[k]["t"] >= T_LINE
+                                   for k in ("model_minus_always", "model_minus_plain", "model_above_zero")))
         out["variants"][v] = res
     return out
 
@@ -880,19 +897,28 @@ class EvalStore:
         return [{"at": a, "command": c, "detail": json.loads(d)} for a, c, d in
                 self.conn.execute("SELECT at, command, detail_json FROM log ORDER BY id")]
 
-    def put_fit(self, at: str, record: str, start: float, fitted: dict, code: dict) -> dict:
+    def _log_in(self, logs) -> None:
+        for at, command, detail in logs:
+            self.conn.execute("INSERT INTO log (at, command, detail_json) VALUES (?, ?, ?)",
+                              (at, command, canon(detail)))
+
+    def put_fit(self, at: str, record: str, start: float, fitted: dict, code: dict, logs=()) -> dict:
+        """The fit and its log lines, one transaction."""
         fj = canon(fitted)
         with self.conn:
             self.conn.execute("INSERT INTO fit (id, at, record, collection_start_ts, fitted_json, fitted_sha256, "
                               "code_json, code_sha256) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
                               (at, record, start, fj, _sha(fj), canon(code), _sha(canon(code))))
+            self._log_in(logs)
         return self.fit()
 
-    def put_result(self, at: str, fitted_sha: str, code_sha: str, result: dict) -> None:
+    def put_result(self, at: str, fitted_sha: str, code_sha: str, result: dict, logs=()) -> None:
+        """The result and its log lines, one transaction (clarification 34): a failure leaves neither."""
         rj = canon(result)
         with self.conn:
             self.conn.execute("INSERT INTO result (id, at, fitted_sha256, code_sha256, result_json, result_sha256) "
                               "VALUES (1, ?, ?, ?, ?, ?)", (at, fitted_sha, code_sha, rj, _sha(rj)))
+            self._log_in(logs)
 
 
 def _peek_eval(folder) -> dict:
@@ -989,10 +1015,9 @@ def cmd_fit(db, eval_dir, now: float) -> dict:
         ob = observe(rec, dev)
         fitted = {"questions": fit_yardsticks(ob["obs"]),
                   "development_days": [d.isoformat() for d in per["development"]], "counted_days": [d.isoformat() for d in dev], "counts": ob["counts"], "battery": BATTERY_IN_FORCE}
-        held = es.put_fit(_iso(now), str(rec.path), start, fitted, code_hashes())
-        es.log(_iso(now), "fit", {"fitted_sha256": held["fitted_sha256"], "code_sha256": held["code_sha256"],
-                                  "record": str(rec.path)})
-        return held
+        code, fj = code_hashes(), canon(fitted)
+        return es.put_fit(_iso(now), str(rec.path), start, fitted, code, logs=[(_iso(now), "fit", {
+            "fitted_sha256": _sha(fj), "code_sha256": _sha(canon(code)), "record": str(rec.path)})])
     finally:
         es.close()
 
@@ -1029,8 +1054,6 @@ def cmd_score(db, eval_dir, now: float, code_changed: str | None = None, *, resa
             raise Refused("the test period is not complete (it ends no earlier than %s, extended until 10 days count, "
                           "and is scored %d s after its last day); nothing was scored"
                           % (per["test_last"], OUTCOME_WAIT_S))
-        if changed is not None:
-            es.log(_iso(now), "code_changed", changed)
         days = [d for d in span if d <= end]
         counted = counted_days(table, days)
         res = {"period": "test", "test_first": per["test_first"].isoformat(), "test_end": end.isoformat(),
@@ -1041,8 +1064,9 @@ def cmd_score(db, eval_dir, now: float, code_changed: str | None = None, *, resa
         res.update(compute(rec, counted, held["fitted"]["questions"], resamples=resamples))
         res["pass_line"] = pass_line(res["judgment"], res["policy"], reached)
         res = json.loads(canon(res))
-        es.put_result(_iso(now), held["fitted_sha256"], _sha(canon(code)), res)
-        es.log(_iso(now), "score", {"result_sha256": _sha(canon(res)), "passes": res["pass_line"]["passes"]})
+        logs = [] if changed is None else [(_iso(now), "code_changed", changed)]
+        logs.append((_iso(now), "score", {"result_sha256": _sha(canon(res)), "passes": res["pass_line"]["passes"]}))
+        es.put_result(_iso(now), held["fitted_sha256"], _sha(canon(code)), res, logs=logs)
         return res
     finally:
         es.close()
@@ -1098,8 +1122,9 @@ def main(argv=None, *, clock: Callable[[], float] | None = None) -> int:
         print("refused: %s" % e, file=sys.stderr)
         return 2
     except sqlite3.Error as e:
-        print("refused: the record or the evaluation's store could not be read or written (%s: %s); nothing was "
-              "changed" % (type(e).__name__, e), file=sys.stderr)
+        print("refused: a database error stopped the command (%s: %s). Each write of this program is one transaction, "
+              "so the one that failed left nothing; `status` shows what the evaluation's store holds"
+              % (type(e).__name__, e), file=sys.stderr)
         return 2
     print(json.dumps(out, indent=1, sort_keys=True, allow_nan=False))
     return 0
