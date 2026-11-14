@@ -231,3 +231,14 @@ being changed to it.
 34. **The stored result and its log line are one write;** a failure leaves neither.
 35. **Score-once is a rule of this program:** a record whose result table has been removed by other means would
     be scored again. The lead uses one evaluation folder, the default, and nothing else touches it.
+
+## Clarifications 36 and 37 for the scoring (2026-11-14, 01:45 UTC: the first development day is being collected; no answer has been compared with an outcome, and the evaluation code has never opened the real record)
+
+Raised by the third blind check of the evaluation code, on generated records only. Both state what the code
+already does; neither was chosen with data in sight.
+
+36. **"A t statistic of 2 or more"** is judged on the value as computed in double precision, with no tolerance: a
+    value that falls short of 2 only by rounding in its last places fails. This is the stricter reading.
+37. **"The first for its market and slot"** (clarifications 1 and 29) is the first ORDINARY row with answers under
+    the battery in force. A late or forced row for the same market and slot, before or after it, is not scored
+    and does not take its place.
