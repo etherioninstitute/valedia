@@ -1305,3 +1305,107 @@ def test_t32_rev2_the_reading_function_says_when_every_strategy_of_the_latest_da
         _book_file(root, {"follow": ids})
         assert cli.broker_book_follow(paths, trader=trader).every is every, ids
         assert cli.broker_book_follow(paths).every is False                       # without the paper book: never
+
+
+# ---- T29 rev 7, outcome 3: a night the paper book cannot price stops every command that steps it, in one plain line
+
+def _no_price_project(tmp_path, monkeypatch):
+    """A project whose paper book (hypothesis 1, mom_paper, passed paper) was caught up by `paper-step` to bar 22 of
+    `prices()` and holds both funds, its state written by a revision that keeps no closes (as a book from before rev 6
+    is). `run(argv, frame)` runs the command line on that price frame and returns (status, out, err)."""
+    import io
+    import contextlib
+    root = tmp_path / "project"
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "risk.json").write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0,
+                                                           "max_position_pct": 0.6, "max_open_positions": 5}))
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        hid = led.propose("Assets that rose over ten days keep rising", "test", cli.MARKET)
+        led.set_status(hid, "passed paper")
+    finally:
+        led.close()
+    _strategy_file(root, hid, "mom_paper", ("UP", "DOWN"))
+    frame = {}
+    monkeypatch.setattr(cli, "_market", lambda args: (frame["prices"], None, None))
+
+    def run(argv, prices):
+        frame["prices"] = prices
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = cli.main(["--root", str(root), *argv])
+        return status, out.getvalue(), err.getvalue()
+
+    px = prices()
+    assert run(["paper-step"], px.iloc[:20])[0] == 0                       # a first run: bar 19 only
+    assert run(["paper-step"], px.iloc[:23])[0] == 0                       # bars 20 to 22, the fills on bar 20
+    state_file = root / "journal" / "paper_state.json"
+    state = json.loads(state_file.read_text())
+    assert state["last_day"] == str(px.index[22].date())
+    assert {sym for book in state["positions"].values() for sym, lot in book.items() if lot["units"]} == {"UP", "DOWN"}
+    for key in ("last_valid_prices", "last_valid_prices_as_of"):
+        state.pop(key)
+    state_file.write_text(json.dumps(state))
+    bad = px.iloc[:26].astype(object)
+    bad["DOWN"] = "n/a"                                                    # the held fund has no close at all
+    return root, run, px, bad
+
+
+def _book_files(root):
+    journal = root / "journal"
+    return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(journal.iterdir()) if p.name != "paper_state.lock"}
+
+
+def _refused_plainly(status, out, err, day):
+    assert status == 2 and out == "" and "Traceback" not in err
+    assert err.endswith("\n") and err.count("\n") == 1, err                # one line
+    assert err.startswith(f"refused: the paper book was not run for {day}:")
+    assert "DOWN" in err and err.rstrip("\n").endswith("restore the price data for DOWN and run it again")
+
+
+def test_paper_step_on_a_night_it_cannot_price_says_so_in_one_line_exits_2_and_keeps_the_nights_before(tmp_path, monkeypatch):
+    """The paper command's catch-up (no venue): the refused night and those after it are not run, the book keeps the
+    nights caught up before (every file as it was, bytes and times); with the data back it runs them all."""
+    root, run, px, bad = _no_price_project(tmp_path, monkeypatch)
+    before = _book_files(root)
+    _refused_plainly(*run(["paper-step"], bad), px.index[23].date())
+    assert _book_files(root) == before
+    assert PaperTrader(root / "journal", root / "config" / "risk.json").state["last_day"] == str(px.index[22].date())
+    status, out, _ = run(["paper-step"], px.iloc[:26])
+    assert status == 0 and json.loads(out)["days_processed"] == 3 and json.loads(out)["last"]["day"] == str(px.index[25].date())
+
+
+def test_paper_step_with_the_alpaca_mirror_on_a_night_it_cannot_price_says_so_and_sends_nothing(tmp_path, monkeypatch):
+    """The paper command with a broker mirror steps the latest day only: refused in one line, status 2, nothing sent
+    to the mirror, the book as it was."""
+    from valedia_trader.core import secrets
+    root, run, px, bad = _no_price_project(tmp_path, monkeypatch)
+
+    class Mirror:
+        name, sent = "alpaca-standin", []
+
+        def submit(self, *a, **k):
+            self.sent.append(a)
+            return {"status": "accepted"}
+
+    mirror = Mirror()
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: "PKTEST")
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: mirror)
+    before = _book_files(root)
+    _refused_plainly(*run(["paper-step", "--alpaca"], bad), px.index[25].date())
+    assert mirror.sent == [] and _book_files(root) == before
+
+
+def test_the_cycle_on_a_night_it_cannot_price_says_so_in_one_line_and_runs_no_review_after_it(tmp_path, monkeypatch):
+    """The cycle's paper step is refused: one line, status 2, the earlier nights kept, and nothing after the paper
+    step runs on the book that stopped short: no weekly review (asked for with --critic), no review file."""
+    root, run, px, bad = _no_price_project(tmp_path, monkeypatch)
+    reviews = []
+    monkeypatch.setattr(cli, "Gauntlet", lambda *a, **k: object())         # nothing untested: the tests never run
+    monkeypatch.setattr(cli.critic_mod, "weekly_review", lambda *a, **k: reviews.append(a) or {"path": "review"})
+    before = _book_files(root)
+    _refused_plainly(*run(["cycle", "--no-research", "--critic"], bad), px.index[23].date())
+    assert reviews == [] and _book_files(root) == before and not list((root / "journal").glob("review-*"))
+    status, out, _ = run(["cycle", "--no-research", "--critic"], px.iloc[:26])   # the data back: the whole cycle runs
+    assert status == 0 and json.loads(out)["paper"]["days_processed"] == 3 and len(reviews) == 1

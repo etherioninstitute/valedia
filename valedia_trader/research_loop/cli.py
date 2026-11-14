@@ -35,7 +35,7 @@ from valedia_trader.research_loop import critic as critic_mod
 from valedia_trader.research_loop import research as research_mod
 from valedia_trader.research_loop.gauntlet import Criteria, Gauntlet, GauntletError
 from valedia_trader.research_loop.ledger import HypothesisLedger, LedgerError
-from valedia_trader.research_loop.paper import AlpacaPaperVenue, LatchResetError, PaperTrader
+from valedia_trader.research_loop.paper import AlpacaPaperVenue, LatchResetError, PaperBookNoPrice, PaperTrader
 from valedia_trader.research_loop.strategy import SpecError, Strategy, load_strategy
 
 MARKET = "us-etf+crypto"
@@ -167,7 +167,9 @@ def paper_catch_up(trader: PaperTrader, prices: pd.DataFrame, active: dict[int, 
     with prices up to that day only. A first run starts at the latest day: nothing is backfilled.
     This makes a weekly run produce the same book a daily run would, because a decision at one
     close is filled at the next close either way. It is for the simulated book only; orders cannot
-    be mirrored to a broker in the past."""
+    be mirrored to a broker in the past. A night the book cannot price (`PaperBookNoPrice`) stops it
+    there: every night before it is saved, that night and the ones after it are not run, and the
+    error goes to the caller (`main` prints it in one line and exits 2)."""
     last = trader.state["last_day"]
     days = [prices.index[-1]] if last is None else [d for d in prices.index if str(d.date()) > last]
     return [trader.step(prices.loc[:day], active) for day in days]
@@ -634,7 +636,9 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     """One pass of the loop. Each stage is the same code the single commands run, in the order the
     rules require: research sees the development period only; every untested idea gets its
     development test; failures are revised within the cap; an idea that passes gets its one sealed
-    test; whatever has passed that is paper traded for the day; the critic reports on Sundays."""
+    test; whatever has passed that is paper traded for the day; the critic reports on Sundays. A
+    paper night the book cannot price (`PaperBookNoPrice`) ends the pass there: the critic does not
+    review a book that stopped short, and `main` prints the refusal in one line and exits 2."""
     from valedia_trader.research_loop.paper import Journal
     from valedia_trader.research_loop.revision import RevisionEngine
     out: dict = {"date": str(pd.Timestamp.today().date())}
@@ -834,7 +838,7 @@ def main(argv=None) -> int:
         elif args.cmd == "reset-kill-switch":
             trader = PaperTrader(paths.journal, paths.risk_limits)
             print("latch cleared" if trader.reset_latch(args.who, pd.Timestamp.today()) else "the latch was not set")
-    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError) as exc:
+    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError, PaperBookNoPrice) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     finally:
