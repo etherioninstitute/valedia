@@ -5,6 +5,7 @@ fake HTTPS handler. The two real answers kept below were read on 2026-11-13 (one
 volatility fields."""
 import io
 import json
+import re
 import math
 import functools
 import itertools
@@ -17,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.response
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from fractions import Fraction
 from zoneinfo import ZoneInfo
@@ -2491,3 +2492,310 @@ def test_a_remembered_key_is_masked_even_if_it_were_to_reach_a_line(monkeypatch)
     assert ASEC not in shown and "<secret>" in shown
     code, out, _ = all_probe()
     assert all(ASEC not in l for l in out.lines)
+
+
+# ======================================================================================================================
+# T28b rev 2: four closures
+# ======================================================================================================================
+
+REASON_PATTERN = re.compile(r"no key|timed out|request failed|request failed \(HTTP [1-5][0-9]{2}\)|answer could not be used|quote not recent|"
+                            r"band too wide and no recent last price|suspect data")
+
+
+def test_the_fixed_set_of_reasons():
+    assert set(sq.NO_QUOTE_REASONS) == {"no key", "timed out", "request failed", "answer could not be used", "quote not recent",
+                                        "band too wide and no recent last price", "suspect data"}
+    assert sq.HTTP_REASON % 403 == "request failed (HTTP 403)"
+
+
+# ---- 1. the Cboe quote inside second_opinion is judged at a time never before its own fetch
+
+def test_the_cboe_quote_inside_second_opinion_is_never_refused_for_the_rounding_of_its_fetch_time(monkeypatch):
+    rng = random.Random(4040)
+    judged = []
+    real = sq.compare
+
+    def spy(first, second, **kw):
+        judged.append((second["fetched_at"], kw["now"]))
+        return real(first, second, **kw)
+    monkeypatch.setattr(sq, "compare", spy)
+    rounds_down = 0
+    for i in range(10000):
+        d = rng.choice([rng.uniform(0.0, 3.0), round(rng.uniform(0.0, 3.0), 6) + rng.choice([-4e-7, -2e-7, -1e-8, 1e-8, 2e-7, 4e-7]),
+                        rng.uniform(0.0, 1e-5), float(rng.randint(1, 3)), rng.randint(1, 3000000) / 1e6 + 4.9e-7])
+        fc = FakeClock(NOW)
+
+        def fetch(url, timeout, headers=None, d=d, fc=fc):
+            fc.t += d
+            return cboe_bytes()
+        out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("cboe",), fetch=fetch, clock=fc, sleep=lambda s: None)
+        fetched = fc.t
+        if datetime.fromtimestamp(fetched, timezone.utc).timestamp() < fetched:
+            rounds_down += 1
+        entry = out["sources"][0]
+        assert entry["verdict"] == "agree" and entry["basis"] == "bid/ask band", (i, repr(d), entry)
+        assert judged[-1][0] == fetched and judged[-1][1].timestamp() >= fetched and judged[-1][1].tzinfo is not None
+    assert rounds_down > 1000                                         # the generator did reach fetch times that round down
+
+
+def test_the_judging_time_is_the_fetch_when_it_is_up_to_30_seconds_after_now_and_now_beyond_that(monkeypatch):
+    judged = []
+    real = sq.compare
+
+    def spy(first, second, **kw):
+        judged.append(kw["now"].timestamp())
+        return real(first, second, **kw)
+    monkeypatch.setattr(sq, "compare", spy)
+    for d, verdict in ((5.0, "agree"), (9.5, "agree"), (10.0, "agree")):
+        fc = FakeClock(NOW)
+
+        def fetch(url, timeout, headers=None, d=d, fc=fc):
+            fc.t += d
+            return cboe_bytes(snapshot_age=-d + 30)
+        out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("cboe",), fetch=fetch, clock=fc, sleep=lambda s: None)
+        assert out["sources"][0]["verdict"] == verdict and judged[-1] >= NOW + d
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT - timedelta(seconds=31.0), sources=("cboe",), fetch=lambda u, t: cboe_bytes(), clock=CLOCK,
+                            sleep=lambda s: None)
+    assert out["sources"][0]["verdict"] == "no second quote" and judged[-1] == NOW - 31.0           # 31 s after `now`: not the fetch
+
+
+# ---- 2. no text chosen by a server reaches an error of keyed_fetch
+
+class Echo(Recorder):
+    """A server that echoes the keys in its reason phrase, in a header and in the body."""
+    def https_open(self, req):
+        resp = super().https_open(req)
+        resp.msg = "Unauthorized " + AID + " " + ASEC + " " + FTOK
+        resp.headers["X-Echo"] = AID + ASEC + FTOK
+        resp.headers["WWW-Authenticate"] = "Key realm=" + ASEC
+        return resp
+
+
+def _error_texts(e):
+    import traceback
+    return [str(e), repr(e), getattr(e, "reason", "") or "", "".join(traceback.format_exception(type(e), e, e.__traceback__)), str(e.args)]
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308, 400, 401, 403, 404, 429, 500, 502, 503])
+def test_an_http_error_of_the_keyed_fetch_carries_the_status_code_and_the_service_name_only(code):
+    for url, head, service in ((AL, A_HEAD, "alpaca"), (FH, F_HEAD, "finnhub")):
+        body = Counting((AID + ASEC + FTOK).encode() * 4)
+        handler = Echo({url: (code, "https://evil.example/" + AID, body)})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            sq.keyed_fetch(url, 5.0, head, opener=sq._build_opener(handler))
+        e = caught.value
+        assert e.code == code and e.reason == service and str(e) == "HTTP Error %d: %s" % (code, service)
+        assert e.headers is None and (e.fp is None or e.fp.read() == b"") and e.__cause__ is None and e.__context__ is None and body.total == 0
+        for text in _error_texts(e):
+            assert not any(k in text for k in FAKE_KEYS), text[:120]
+            assert "Unauthorized" not in text and "evil.example" not in text and "Key realm" not in text
+
+
+def test_a_status_other_than_200_that_is_not_an_error_is_the_same_sanitised_error():
+    for code in (201, 204, 206):
+        handler = Echo({AL: (code, None, io.BytesIO(alp()))})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            sq.keyed_fetch(AL, 5.0, A_HEAD, opener=sq._build_opener(handler))
+        assert caught.value.code == code and caught.value.reason == "alpaca" and caught.value.headers is None
+
+
+def test_every_other_error_of_the_keyed_fetch_has_a_fixed_text_and_no_chained_error():
+    import http.client
+
+    class Raises(Recorder):
+        def __init__(self, exc):
+            super().__init__({})
+            self.exc = exc
+
+        def https_open(self, req):
+            raise self.exc
+    echo = AID + ASEC + FTOK
+    cases = [(OSError("echo " + echo), OSError, "alpaca request failed"), (urllib.error.URLError("echo " + echo), OSError, "alpaca request failed"),
+             (ConnectionResetError(echo), OSError, "alpaca request failed"), (http.client.BadStatusLine(echo), OSError, "alpaca request failed"),
+             (RuntimeError(echo), OSError, "alpaca request failed"), (ValueError(echo), ValueError, "alpaca answer refused"),
+             (TimeoutError(echo), TimeoutError, "alpaca request timed out"), (urllib.error.URLError(TimeoutError(echo)), TimeoutError, "alpaca request timed out")]
+    for exc, kind, text in cases:
+        with pytest.raises(kind) as caught:
+            sq.keyed_fetch(AL, 5.0, A_HEAD, opener=sq._build_opener(Raises(exc)))
+        e = caught.value
+        assert type(e) is kind and str(e) == text and e.__cause__ is None and e.__context__ is None, (exc, e)
+        assert not any(k in t for t in _error_texts(e) for k in FAKE_KEYS)
+    handler = Recorder({FH: (200, None, io.BytesIO(b"x" * (sq.MAX_BODY_BYTES + 5)))})
+    with pytest.raises(ValueError) as caught:
+        sq.keyed_fetch(FH, 5.0, F_HEAD, opener=sq._build_opener(handler))
+    assert str(caught.value) == "finnhub answer refused" and caught.value.__context__ is None
+
+
+# ---- 3. a redirect to a keyed source ends the call: one request
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_answered_to_a_keyed_source_is_one_request_and_no_retry(code):
+    for reader, url, head, host in ((sq.alpaca_quote, AL, A_HEAD, "alpaca"), (sq.finnhub_quote, FH, F_HEAD, "finnhub")):
+        handler = Recorder({url: (code, "https://data.alpaca.markets/x", io.BytesIO(b""))})
+        sleeps = []
+        out = reader("SPY", fetch=functools.partial(sq.keyed_fetch, opener=sq._build_opener(handler)), clock=CLOCK, credentials=creds, sleep=sleeps.append)
+        assert out is None and [r["url"] for r in handler.requests] == [url] and sleeps == []
+
+
+def test_a_redirect_error_from_any_fetch_is_final_and_an_error_status_from_the_server_still_retries():
+    for code in (301, 307, 308, 400, 429):
+        err = urllib.error.HTTPError("https://x/", code, "no", None, None)
+        fake, sleeps = KFake(alpaca=err), []
+        assert aq(fake=fake, sleep=sleeps.append) is None and len(fake.calls) == 1 and sleeps == []
+    for code in (500, 503):
+        fake, sleeps = KFake(alpaca=urllib.error.HTTPError("https://x/", code, "no", None, None)), []
+        assert aq(fake=fake, sleep=sleeps.append) is None and len(fake.calls) == 2 and sleeps == [2.0]
+    cb = KFake(cboe=urllib.error.HTTPError("https://x/", 307, "no", None, None))
+    assert sq.cboe_quote("SPY", fetch=cb, clock=CLOCK, sleep=lambda s: None) is None and len(cb.calls) == 1
+
+
+# ---- 4. each source says why it has nothing
+
+def entry_of(name, fake, first=752.54, **kw):
+    kw.setdefault("credentials", creds)
+    out = sq.second_opinion(first, "SPY", now=NOW_DT, sources=(name,), fetch=fake, clock=CLOCK, sleep=lambda s: None, **kw)
+    return out["sources"][0]
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://x/", code, "reason", None, None)
+
+
+def test_a_missing_key_is_no_key_for_the_keyed_sources():
+    for name in ("alpaca", "finnhub"):
+        for creds_fn in (no_keys, lambda n: "", lambda n: None, lambda n: "has space", lambda n: 5):
+            fake = KFake(alpaca=alp(), finnhub=fin())
+            e = entry_of(name, fake, credentials=creds_fn)
+            assert e["verdict"] == "no second quote" and e["reason"] == "no key" and e["basis"] == "no key" and fake.calls == []
+    keys = {k: v for k, v in KEYS.items() if k != "ALPACA_SECRET_KEY"}
+    e = entry_of("alpaca", KFake(alpaca=alp()), credentials=keys.__getitem__)
+    assert e["reason"] == "no key"
+    assert entry_of("finnhub", KFake(finnhub=fin()), credentials=keys.__getitem__)["reason"] is None                # its own key is there
+
+
+def test_a_failed_request_gives_the_status_code_or_timed_out():
+    for name, key in (("alpaca", "alpaca"), ("finnhub", "finnhub"), ("cboe", "cboe")):
+        for code in (301, 307, 400, 401, 403, 404, 429, 500, 503):
+            e = entry_of(name, KFake(**{key: http_error(code)}))
+            assert e["verdict"] == "no second quote" and e["reason"] == e["basis"] == "request failed (HTTP %d)" % code, (name, code, e)
+        for exc in (TimeoutError("slow"), socket.timeout("slow"), urllib.error.URLError(TimeoutError("x"))):
+            e = entry_of(name, KFake(**{key: exc}))
+            assert e["reason"] == "timed out" or isinstance(exc, urllib.error.URLError), (name, exc, e)
+        for exc in (OSError("down"), ConnectionResetError("x"), RuntimeError("y"), ValueError("z"), urllib.error.URLError("w")):
+            e = entry_of(name, KFake(**{key: exc}))
+            assert e["reason"] == "request failed", (name, exc, e)
+        e = entry_of(name, KFake(**{key: http_error(999)}))
+        assert e["reason"] == "request failed"                                  # not a status code: no code is printed
+
+
+def test_a_try_that_overruns_its_deadline_is_timed_out():
+    fc = FakeClock(NOW)
+
+    def slow(url, timeout, headers=None):
+        fc.t += 2100.0
+        return alp()
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca",), fetch=slow, clock=fc, sleep=lambda s: None, credentials=creds)
+    assert out["sources"][0]["reason"] == "timed out"
+    fc = FakeClock(NOW)
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=lambda *a, **k: (setattr(fc, "t", fc.t + 30), alp())[1], clock=fc,
+                            sleep=lambda s: None, credentials=creds)
+    assert [s["reason"] for s in out["sources"]] == ["timed out"] * 3                     # the first took 30 s: the others never started
+
+
+def test_an_answer_that_could_not_be_used():
+    for name, bodies in (("alpaca", [b"{}", b"<html>", b"", alp("QQQ"), alp(bid=0, ask=0, last=0), ALPACA_HOSTILE["duplicate-symbol-key"], None]),
+                         ("finnhub", [fin(c=0, t=0), b"x", b"", FINNHUB_HOSTILE["duplicate-c"], None]),
+                         ("cboe", [b"nope", b"", cboe_bytes(symbol="QQQ"), None])):
+        for body in bodies:
+            e = entry_of(name, KFake(**{name: body}))
+            assert e["verdict"] == "no second quote" and e["reason"] == "answer could not be used", (name, body, e)
+
+
+def test_a_quote_that_is_not_recent():
+    for name, body in (("alpaca", alp(band_t=-500, last_t=-5000)), ("alpaca", alp(bid=None, ask=None, last_t=-5000)), ("finnhub", fin(t=-5000)),
+                       ("cboe", cboe_bytes(ltt_age=9000)), ("cboe", cboe_bytes(snapshot_age=-900)), ("alpaca", alp(band_t=-500, last=None))):
+        e = entry_of(name, KFake(**{name: body}))
+        assert e["verdict"] == "no second quote" and e["reason"] == "quote not recent", (name, e)
+    e = sq.second_opinion(752.54, "SPY", now=NOW_DT + timedelta(seconds=500), sources=("finnhub",), fetch=KFake(finnhub=fin()), clock=CLOCK, sleep=lambda s: None,
+                          credentials=creds)["sources"][0]
+    assert e["reason"] == "quote not recent"                                          # fetched 500 s before `now`
+
+
+def test_a_band_too_wide_with_no_recent_last_price():
+    wide = dict(bid=62.81, ask=66.86, band_t=-5)
+    for kw in ({"last": None}, {"last": 64.93, "last_t": -5000}, {"last": 64.93, "last_t": 3600}):
+        e = entry_of("alpaca", KFake(alpaca=alp(**wide, **kw)))
+        assert e["verdict"] == "no second quote" and e["reason"] == "band too wide and no recent last price", (kw, e)
+    e = entry_of("alpaca", KFake(alpaca=alp(**wide, last=64.93, last_t=-5)), first=64.93)
+    assert e["verdict"] == "agree" and e["reason"] is None and e["basis"] == "last price"      # a recent last price decides
+
+
+def test_suspect_data_a_crossed_band_or_a_last_trade_that_contradicts_its_band():
+    for body in (alp(bid=102.0, ask=100.0, last=500.0), alp(bid=752.5, ask=752.55, last=900.0), alp(bid=100.01, ask=100.0, last=100.0)):
+        e = entry_of("alpaca", KFake(alpaca=body), first=500.0)
+        assert e["reason"] == "suspect data" and e["basis"] == "suspect data" and e["verdict"] == "no second quote"
+    for body in (cboe_bytes(500.0, 102.0, 100.0), cboe_bytes(900.0, 752.5, 752.55)):
+        e = entry_of("cboe", KFake(cboe=body), first=500.0)
+        assert e["reason"] == "suspect data", e
+
+
+def test_a_source_that_gives_a_verdict_has_no_reason_and_every_reason_is_from_the_fixed_set():
+    out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=("alpaca", "finnhub", "cboe"), fetch=KFake(alpaca=alp(), finnhub=fin(c=900.0), cboe=cboe_bytes()),
+                            clock=CLOCK, sleep=lambda s: None, credentials=creds)
+    assert [(s["verdict"], s["reason"]) for s in out["sources"]] == [("agree", None), ("disagree", None), ("agree", None)]
+    rng = random.Random(5)
+    seen = set()
+    bodies = {"alpaca": [b"{}", alp(band_t=-500, last_t=-5000), alp(bid=62.81, ask=66.86, last=None), alp(bid=102.0, ask=100.0), http_error(403), OSError("x"), TimeoutError("t")],
+              "finnhub": [fin(c=0, t=0), fin(t=-5000), http_error(429), http_error(500), OSError("x")],
+              "cboe": [b"nope", cboe_bytes(ltt_age=9000), http_error(404), TimeoutError("t")]}
+    for i in range(600):
+        names = rng.sample(["alpaca", "finnhub", "cboe"], rng.choice([1, 2, 3]))
+        fake = KFake(**{n: rng.choice(bodies[n]) for n in names})
+        creds_fn = creds if rng.random() < 0.8 else no_keys
+        out = sq.second_opinion(752.54, "SPY", now=NOW_DT, sources=tuple(names), fetch=fake, clock=CLOCK, sleep=lambda s: None, credentials=creds_fn)
+        for s in out["sources"]:
+            assert s["verdict"] != "no second quote" or (REASON_PATTERN.fullmatch(s["reason"]) and s["basis"] == s["reason"]), s
+            assert s["verdict"] == "no second quote" or s["reason"] is None
+            seen.add(s["reason"])
+    assert {"no key", "timed out", "request failed", "answer could not be used", "quote not recent", "suspect data",
+            "band too wide and no recent last price", "request failed (HTTP 403)"} <= seen
+
+
+def test_the_probe_prints_no_key_plainly_for_a_source_whose_key_is_absent():
+    keys = {k: v for k, v in KEYS.items() if k != "FINNHUB_API_KEY"}
+    code, out, fake = all_probe(credentials=keys.__getitem__)
+    line = source_line(out.lines, "SPY", "finnhub")
+    assert "no key" in line and "no second quote [no key]" in line and "finnhub.io" not in fake.hosts()
+    assert "agree" in source_line(out.lines, "SPY", "alpaca")
+    assert block(out.lines, "SPY")[-1].split()[:2] == ["consensus", "agree"]
+    code, out, _ = all_probe(credentials=no_keys, fake=KFake(cboe=cboe_bytes()))
+    assert "no key" in source_line(out.lines, "SPY", "alpaca") and "no key" in source_line(out.lines, "SPY", "finnhub")
+
+
+def test_the_probe_prints_the_reason_even_when_there_is_no_first_price():
+    out = Out()
+    sq.probe(["SPY"], first_quotes=first_source({}), fetch=KFake(alpaca=http_error(403), finnhub=OSError("x"), cboe=b"nope"), clock=CLOCK,
+             sleep=lambda s: None, out=out, credentials=creds)
+    assert "no second quote [request failed (HTTP 403)]" in source_line(out.lines, "SPY", "alpaca")
+    assert "no second quote [request failed]" in source_line(out.lines, "SPY", "finnhub")
+    assert "no second quote [answer could not be used]" in source_line(out.lines, "SPY", "cboe")
+
+
+def test_the_probe_prints_every_reason_without_a_key_or_anything_a_server_chose():
+    echo = (AID + ASEC + FTOK)
+    out = Out()
+    sq.probe(["SPY"], first_quotes=first_source({"SPY": (752.54, FIRST_T)}), clock=CLOCK, sleep=lambda s: None, out=out, credentials=creds,
+             fetch=KFake(alpaca=urllib.error.HTTPError("https://x/", 401, "Unauthorized " + echo, None, None), finnhub=RuntimeError(echo), cboe=OSError(echo)))
+    assert not any(k in "\n".join(out.lines) for k in FAKE_KEYS) and "Unauthorized" not in "\n".join(out.lines)
+
+
+# ---- 5. the docstring says what the code does
+
+def test_the_docstring_states_the_finnhub_symbol_rule_and_the_reach_of_judging_at_the_later_time():
+    doc = " ".join(sq.__doc__.split())
+    assert "a Finnhub answer carries no symbol" in doc and "only because the request, with that symbol, went to its verified host" in doc
+    assert "band time up to 35 seconds" in doc and "last time up to 330 seconds ahead of the caller's `now`" in doc
+    assert "a redirect" in doc and "one request" in doc and "no key" in doc and "request failed (HTTP" in doc
+    assert "status code and the service's name only" in doc
+
+

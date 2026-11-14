@@ -88,21 +88,27 @@ lookup, never an exception out, never a wrong number), and one function that giv
   (market closed): the IEX band of a fund can be far wider than the fund's price moves (62.81 / 66.86 on 64.93), so a band
   is trusted only when it is narrow (below).
 - `finnhub_quote`: `GET https://finnhub.io/api/v1/quote?symbol=SYM` with header `X-Finnhub-Token`; `c` is the last price and
-  `t` its time in epoch seconds. An unknown symbol answers 200 with zeros: a `c` or `t` of 0 is no quote.
+  `t` its time in epoch seconds. An unknown symbol answers 200 with zeros: a `c` or `t` of 0 is no quote. Since a Finnhub answer
+  carries no symbol, it is taken to be for the symbol asked only because the request, with that symbol, went to its
+  verified host.
 - Documented limits, not measured: Alpaca 200 requests a minute, Finnhub 60. Each source is asked once per symbol.
 - Both give the normal form `{symbol, bid, ask, band_time, last, last_time, fetched_at, source}`; times are UTC seconds.
 - KEYS: each key goes only in the request headers named above, only to its own host, only over the verified TLS of this
   module. `keyed_fetch` (the default fetch of these two) refuses, before any request, a URL that is not exactly one of the two
-  requests above and a header set that is not exactly the keys of that service. It follows no redirect at all (a redirect is a
-  failed try), sets the keys as unredirected headers, and its errors never carry a key. The keys come from the injected
+  requests above and a header set that is not exactly the keys of that service. It follows no redirect at all (a redirect
+  answered to a keyed source ends the call: one request, no retry), sets the keys as unredirected headers, and no text chosen
+  by a server reaches an error it raises: an HTTP error carries the status code and the service's name only, never the reason
+  phrase, a header or any part of the body, and every other error is a fixed text of the service's name. The keys come from the injected
   `credentials` callable, by the names `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`; the default is
   `valedia_trader.core.secrets.secret`. A key that is missing, raises, or is not 1-256 printable ASCII characters without spaces
   makes that source "no second quote" and no request is made. A key is never in a URL, a log line, an exception text, the probe's
-  output or a returned dict. A 4xx answer is not retried (a 403 or 429 will not change in two seconds).
+  output or a returned dict. A 3xx or 4xx answer is not retried (a redirect, a 403 or a 429 will not change in two seconds).
 - `judge_quote` judges a normal-form quote by its OWN clocks, at the later of `now` and its fetch time (the fetch happens after
   the caller took `now`), provided the fetch is no more than 30 s after `now` and no more than 120 s before it. A BAND is usable
   only if bid and ask are valid numbers, `band_time` is at most 120 s before and 5 s after that moment, and the band is no wider
-  than `BAND_MAX_WIDTH` (0.5 %) of its mid: IEX sees one exchange, and a wide band confirms nothing. A LAST price is usable only if
+  than `BAND_MAX_WIDTH` (0.5 %) of its mid: IEX sees one exchange, and a wide band confirms nothing. Judging at the later of
+  `now` and the fetch time lets a band time up to 35 seconds and a last time up to 330 seconds ahead of the caller's `now`
+  count (5 + the 30 seconds allowed after `now`, and 300 + 30). A LAST price is usable only if
   `last_time` is at most `max_age_seconds` (1800) before and 300 s after it. With a usable band the first price must lie inside it
   widened by the tolerance, and a usable last price outside that widened band makes the quote "no second quote" (a stale last
   price is not used for this). Without a usable band the usable last price decides. A crossed pair (bid above ask) is "no second
@@ -115,6 +121,12 @@ lookup, never an exception out, never a wrong number), and one function that giv
   call has one deadline of 25 s on the injected clock: no try is started after it, a try gets at most the time left, and an
   answer that arrives after it is refused. `fetch` is one callable for every source (called `fetch(url, timeout)` for Cboe and
   `fetch(url, timeout, headers)` for the keyed ones) or a dict by source name.
+- Each entry of `second_opinion` says why a source has nothing, as `reason` (None when it gave a verdict; the entry's `basis`
+  is the same text), always one of: "no key", "request failed (HTTP <status code>)", "request failed", "timed out", "answer
+  could not be used", "quote not recent", "band too wide and no recent last price", "suspect data" (a crossed band, or a last
+  trade that contradicts its band). The probe prints it, so a source whose key is absent shows "no key" plainly.
+- The Cboe quote inside `second_opinion` is judged at a datetime that is never before its own fetch time (a float rounded to
+  the microsecond can land below it, and `compare` then refuses a fresh quote as "not fetched within the last 120 seconds").
 - Live probe (needs the owner's secrets file): `python -m valedia_trader.data_and_fees.second_quote probe SPY XLE`.
 """
 from __future__ import annotations
@@ -132,7 +144,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -165,6 +177,15 @@ OVERALL_DEADLINE_SECONDS = 25.0         # one deadline for a whole `second_opini
 MAX_KEY_CHARS = 256
 SOURCE_NAMES = ("alpaca", "finnhub", "cboe")
 MAX_TIME = 253402300799                 # 9999-12-31, the latest time taken from a licensed answer
+REASON_NO_KEY = "no key"
+REASON_TIMED_OUT = "timed out"
+REASON_FAILED = "request failed"
+REASON_UNUSABLE = "answer could not be used"
+REASON_NOT_RECENT = "quote not recent"
+REASON_WIDE = "band too wide and no recent last price"
+REASON_SUSPECT = "suspect data"
+HTTP_REASON = "request failed (HTTP %d)"
+NO_QUOTE_REASONS = (REASON_NO_KEY, REASON_TIMED_OUT, REASON_FAILED, REASON_UNUSABLE, REASON_NOT_RECENT, REASON_WIDE, REASON_SUSPECT)
 NEW_YORK = ZoneInfo("America/New_York")
 
 _SYMBOL = re.compile(r"[A-Z]{1,6}(?:[.-][A-Z])?")
@@ -458,11 +479,14 @@ def keyed_fetch(url: str, timeout: float, headers: dict, opener: urllib.request.
     """GET one of the two keyed requests and return the body, at most MAX_BODY_BYTES, within one `deadline` (TimeoutError
     when it passes). The URL must be exactly the Alpaca or the Finnhub request and `headers` exactly that service's keys
     (ValueError before any request otherwise); the keys travel only as unredirected request headers, only to their own host.
-    No redirect is followed (it raises the HTTPError), a status other than 200 raises, and no text of a raised error holds
-    a key."""
-    _keyed_service(url, headers)
+    No redirect is followed and a status other than 200 raises an HTTPError that carries the status code and the service's
+    name only (never the reason phrase, a header or any part of the body); every other failure is a TimeoutError, a ValueError
+    (an answer refused) or an OSError with a fixed text of the service's name. Nothing a server sent is in an error text, and no
+    other error is chained to it."""
+    service = _keyed_service(url, headers)
     opener = opener or _build_opener()
     budget = _Budget(clock, deadline)
+    failure: Any = None
     try:
         budget.check()
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, method="GET")
@@ -476,17 +500,29 @@ def keyed_fetch(url: str, timeout: float, headers: dict, opener: urllib.request.
             if resp.geturl() != url:
                 raise ValueError("answered from another place")
             return _read_capped(resp, MAX_BODY_BYTES, budget)
+    except urllib.error.HTTPError as e:
+        failure = ("http", _http_code(e) or 0)
+        try:
+            e.close()                                                    # its body is not read
+        except Exception:
+            pass
     except Exception as e:
-        if isinstance(e, urllib.error.HTTPError):
-            try:
-                e.close()                                                # its body is not read
-            except Exception:
-                pass
-        if budget.fired.is_set() or budget.remaining() <= 0 or isinstance(getattr(e, "reason", None), TimeoutError):
-            raise TimeoutError("the request passed its deadline") from None
-        raise
+        if budget.fired.is_set() or budget.remaining() <= 0 or isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+            failure = ("timeout",)
+        elif isinstance(e, ValueError):
+            failure = ("refused",)
+        else:
+            failure = ("failed",)
     finally:
         budget.cancel()
+    # raised here, outside the handlers: nothing the server chose is in the text and no other error is chained to it
+    if failure[0] == "timeout":
+        raise TimeoutError("%s request timed out" % service)
+    if failure[0] == "refused":
+        raise ValueError("%s answer refused" % service)
+    if failure[0] == "failed":
+        raise OSError("%s request failed" % service)
+    raise urllib.error.HTTPError(url, failure[1], service, None, None)
 
 
 # ---- the reader
@@ -555,12 +591,29 @@ def _parse(raw: Any, symbol: str, fetched_at: float) -> dict | None:
         return None
 
 
+def _http_code(e: BaseException) -> int | None:
+    code = getattr(e, "code", None)
+    return code if type(code) is int else None
+
+
+def _failure_reason(e: BaseException) -> str:
+    """The fixed reason a failed fetch is reported as: the status code, "timed out", or "request failed"."""
+    if isinstance(e, urllib.error.HTTPError):
+        code = _http_code(e)
+        return HTTP_REASON % code if code is not None and 100 <= code <= 599 else REASON_FAILED
+    if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+        return REASON_TIMED_OUT
+    return REASON_FAILED
+
+
 def _fetch_tries(url: str, fetch: Callable, clock: Callable[[], float], sleep: Callable[[float], Any],
-                 headers: dict | None = None, deadline_at: float | None = None) -> tuple[Any, float | None]:
-    """(raw, fetched_at) of at most MAX_TRIES tries of `fetch(url, timeout)` (`fetch(url, timeout, headers)` when there are
-    headers), RETRY_WAIT_SECONDS apart, TIMEOUT_SECONDS each, retried only when the fetch itself fails or takes more than
-    DEADLINE_SECONDS on `clock`; a 4xx answer is final. With `deadline_at` (seconds on `clock`) no try starts after it, a
-    try gets at most the time left, and an answer that arrives after it is refused. (None, None) when nothing came."""
+                 headers: dict | None = None, deadline_at: float | None = None) -> tuple[Any, float | None, str | None]:
+    """(raw, fetched_at, why) of at most MAX_TRIES tries of `fetch(url, timeout)` (`fetch(url, timeout, headers)` when there
+    are headers), RETRY_WAIT_SECONDS apart, TIMEOUT_SECONDS each, retried only when the fetch itself fails or takes more than
+    DEADLINE_SECONDS on `clock`; an HTTP error below 500 (a redirect, a 403, a 429) is final. With `deadline_at` (seconds on
+    `clock`) no try starts after it, a try gets at most the time left, and an answer that arrives after it is refused. When
+    nothing came, (None, None, why) with `why` one of the fixed reasons; when something came, why is None."""
+    why = REASON_FAILED
     for attempt in range(MAX_TRIES):
         try:
             started = _epoch(clock())
@@ -570,7 +623,7 @@ def _fetch_tries(url: str, fetch: Callable, clock: Callable[[], float], sleep: C
             if deadline_at is not None:
                 left = deadline_at - started
                 if left <= 0:
-                    return None, None
+                    return None, None, REASON_TIMED_OUT
                 timeout = min(TIMEOUT_SECONDS, left)
             raw = fetch(url, timeout) if headers is None else fetch(url, timeout, dict(headers))
             fetched_at = _epoch(clock())
@@ -578,16 +631,28 @@ def _fetch_tries(url: str, fetch: Callable, clock: Callable[[], float], sleep: C
                 raise ValueError("the clock gave no time")
             if fetched_at - started > DEADLINE_SECONDS or (deadline_at is not None and fetched_at > deadline_at):
                 raise TimeoutError("the try took longer than its deadline")
-            return raw, fetched_at
+            return raw, fetched_at, None
         except Exception as e:
-            if (isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500) or attempt + 1 >= MAX_TRIES:
-                return None, None
+            why = _failure_reason(e)
+            code = _http_code(e) if isinstance(e, urllib.error.HTTPError) else None
+            if (code is not None and 300 <= code < 500) or attempt + 1 >= MAX_TRIES:
+                return None, None, why
             if deadline_at is not None:
                 after = _epoch(clock())
                 if after is None or after + RETRY_WAIT_SECONDS >= deadline_at:
-                    return None, None
+                    return None, None, why
             sleep(RETRY_WAIT_SECONDS)
-    return None, None
+    return None, None, why
+
+
+def _cboe_attempt(symbol: str, fetch: Callable, clock: Callable[[], float], sleep: Callable[[float], Any],
+                  deadline_at: float | None) -> tuple[dict | None, str | None]:
+    """(quote, None) or (None, the fixed reason there is none)."""
+    raw, fetched_at, why = _fetch_tries(BASE_URL % symbol, fetch, clock, sleep, None, deadline_at)
+    if why is not None:
+        return None, why
+    quote = _parse(raw, symbol, fetched_at) if raw is not None and fetched_at is not None else None
+    return (quote, None) if quote is not None else (None, REASON_UNUSABLE)
 
 
 def cboe_quote(symbol: str, fetch: Callable[[str, float], Any] = urllib_fetch, clock: Callable[[], float] = time.time,
@@ -601,10 +666,7 @@ def cboe_quote(symbol: str, fetch: Callable[[str, float], Any] = urllib_fetch, c
     is the overall deadline of a `second_opinion`."""
     if not valid_symbol(symbol):
         raise ValueError("not a symbol this module asks for: %r" % (symbol,))
-    raw, fetched_at = _fetch_tries(BASE_URL % symbol, fetch, clock, sleep, None, deadline_at)
-    if raw is None or fetched_at is None:
-        return None
-    return _parse(raw, symbol, fetched_at)
+    return _cboe_attempt(symbol, fetch, clock, sleep, deadline_at)[0]
 
 
 # ---- the licensed readers: Alpaca and Finnhub
@@ -680,17 +742,24 @@ def _parse_finnhub(raw: Any, symbol: str, fetched_at: float) -> dict | None:
 _PARSERS = {"alpaca": _parse_alpaca, "finnhub": _parse_finnhub}
 
 
-def _keyed_quote(service: str, symbol: str, fetch: Callable, clock: Callable[[], float], sleep: Callable[[float], Any],
-                 credentials: Callable[[str], Any] | None, deadline_at: float | None) -> dict | None:
+def _keyed_attempt(service: str, symbol: str, fetch: Callable, clock: Callable[[], float], sleep: Callable[[float], Any],
+                   credentials: Callable[[str], Any] | None, deadline_at: float | None) -> tuple[dict | None, str | None]:
+    """(quote, None) or (None, the fixed reason there is none)."""
     if not valid_symbol(symbol):
         raise ValueError("not a symbol this module asks for: %r" % (symbol,))
     headers = _key_headers(service, credentials)
     if headers is None:
-        return None
-    raw, fetched_at = _fetch_tries(_SERVICES[service]["url"] % urllib.parse.quote(symbol, safe=""), fetch, clock, sleep, headers, deadline_at)
-    if raw is None or fetched_at is None:
-        return None
-    return _PARSERS[service](raw, symbol, fetched_at)
+        return None, REASON_NO_KEY
+    raw, fetched_at, why = _fetch_tries(_SERVICES[service]["url"] % urllib.parse.quote(symbol, safe=""), fetch, clock, sleep, headers, deadline_at)
+    if why is not None:
+        return None, why
+    quote = _PARSERS[service](raw, symbol, fetched_at) if raw is not None and fetched_at is not None else None
+    return (quote, None) if quote is not None else (None, REASON_UNUSABLE)
+
+
+def _keyed_quote(service: str, symbol: str, fetch: Callable, clock: Callable[[], float], sleep: Callable[[float], Any],
+                 credentials: Callable[[str], Any] | None, deadline_at: float | None) -> dict | None:
+    return _keyed_attempt(service, symbol, fetch, clock, sleep, credentials, deadline_at)[0]
 
 
 def alpaca_quote(symbol: str, *, fetch: Callable = keyed_fetch, clock: Callable[[], float] = time.time,
@@ -816,53 +885,65 @@ def compare(first_price: Any, second: Any, *, symbol: Any, now: datetime, tolera
     return _verdict("agree" if abs(f - ref) <= tol * ref else "disagree", float((f - ref) / ref), "last price")
 
 
+def _judge_quote(first_price: Any, quote: Any, symbol: Any, now: datetime, tolerance: float, max_age_seconds: float) -> tuple[dict, str | None]:
+    """`judge_quote` and, when the verdict is "no second quote", the fixed reason (else None)."""
+    now_ts = _validated(tolerance, max_age_seconds, now)
+
+    def none(reason: str, basis: str) -> tuple[dict, str]:
+        return _verdict("no second quote", None, basis), reason
+    if type(quote) is not dict:
+        return none(REASON_UNUSABLE, "no second quote")
+    if type(symbol) is not str or quote.get("symbol") != symbol:
+        return none(REASON_UNUSABLE, "the quote is for another symbol")
+    fetched = _epoch(quote.get("fetched_at"))
+    if fetched is None:
+        return none(REASON_UNUSABLE, "no fetch time")
+    if not -FETCH_AHEAD_SLACK_SECONDS <= now_ts - fetched <= MAX_FETCH_AGE_SECONDS:
+        return none(REASON_NOT_RECENT, "not fetched within the last %d seconds" % MAX_FETCH_AGE_SECONDS)
+    at = max(now_ts, fetched)
+    bid, ask, last = _number(quote.get("bid")), _number(quote.get("ask")), _number(quote.get("last"))
+    if bid is not None and ask is not None and bid > ask:
+        return none(REASON_SUSPECT, "bid above ask: crossed, suspect data")
+    band_time, last_time = _epoch(quote.get("band_time")), _epoch(quote.get("last_time"))
+    tol = _exact(tolerance)
+    band, why_not = "absent", "no bid and ask"                           # absent, stale, wide or ok
+    if bid is not None and ask is not None:
+        b, a = _exact(bid), _exact(ask)
+        mid = (b + a) / 2
+        if band_time is None:
+            why_not = "the bid and ask have no time"
+        elif not -BAND_FUTURE_SLACK_SECONDS <= at - band_time <= BAND_MAX_AGE_SECONDS:
+            band, why_not = "stale", "the bid and ask are not from the last %d seconds" % BAND_MAX_AGE_SECONDS
+        elif a - b > _exact(BAND_MAX_WIDTH) * mid:
+            band, why_not = "wide", "the bid and ask are wider than %g of their mid" % BAND_MAX_WIDTH
+        else:
+            band = "ok"
+    last_state = "absent" if last is None or last_time is None else (
+        "ok" if -FUTURE_SLACK_SECONDS <= at - last_time <= float(max_age_seconds) else "stale")
+    if band != "ok" and last_state != "ok":
+        reason = REASON_WIDE if band == "wide" else REASON_NOT_RECENT if "stale" in (band, last_state) else REASON_UNUSABLE
+        return none(reason, "nothing usable: " + why_not + ", and no recent last price")
+    if band == "ok":
+        lo, hi = b - tol * mid, a + tol * mid
+        if last_state == "ok" and not lo <= _exact(last) <= hi:
+            return none(REASON_SUSPECT, "the last trade contradicts the bid and ask")
+    first = _number(first_price)
+    if first is None:
+        return _verdict("disagree", None, "the first price is not usable"), None
+    f = _exact(first)
+    if band == "ok":
+        return _verdict("agree" if lo <= f <= hi else "disagree", float((f - mid) / mid), "bid/ask band"), None
+    ref = _exact(last)
+    return _verdict("agree" if abs(f - ref) <= tol * ref else "disagree", float((f - ref) / ref), "last price"), None
+
+
 def judge_quote(first_price: Any, quote: Any, *, symbol: Any, now: datetime, tolerance: float = 0.01,
                 max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS) -> dict:
     """Judge the first source's price against a licensed quote in the normal form (`alpaca_quote`, `finnhub_quote`), by the
     quote's own times: {verdict: "agree" | "disagree" | "no second quote", difference, basis}. See the module docstring for the
     rules. The quote is judged at the later of `now` and its fetch time; `now` is an aware datetime and no clock is read.
     ValueError for a tolerance not in 0..1, an age limit that is not a positive number, or a `now` that is not aware."""
-    now_ts = _validated(tolerance, max_age_seconds, now)
-    if type(quote) is not dict:
-        return _verdict("no second quote", None, "no second quote")
-    if type(symbol) is not str or quote.get("symbol") != symbol:
-        return _verdict("no second quote", None, "the quote is for another symbol")
-    fetched = _epoch(quote.get("fetched_at"))
-    if fetched is None:
-        return _verdict("no second quote", None, "no fetch time")
-    if not -FETCH_AHEAD_SLACK_SECONDS <= now_ts - fetched <= MAX_FETCH_AGE_SECONDS:
-        return _verdict("no second quote", None, "not fetched within the last %d seconds" % MAX_FETCH_AGE_SECONDS)
-    at = max(now_ts, fetched)
-    bid, ask, last = _number(quote.get("bid")), _number(quote.get("ask")), _number(quote.get("last"))
-    if bid is not None and ask is not None and bid > ask:
-        return _verdict("no second quote", None, "bid above ask: crossed, suspect data")
-    band_time, last_time = _epoch(quote.get("band_time")), _epoch(quote.get("last_time"))
-    tol = _exact(tolerance)
-    band_ok, why_not = False, "no bid and ask"
-    if bid is not None and ask is not None:
-        b, a = _exact(bid), _exact(ask)
-        mid = (b + a) / 2
-        if band_time is None or not -BAND_FUTURE_SLACK_SECONDS <= at - band_time <= BAND_MAX_AGE_SECONDS:
-            why_not = "the bid and ask are not from the last %d seconds" % BAND_MAX_AGE_SECONDS
-        elif a - b > _exact(BAND_MAX_WIDTH) * mid:
-            why_not = "the bid and ask are wider than %g of their mid" % BAND_MAX_WIDTH
-        else:
-            band_ok = True
-    last_ok = last is not None and last_time is not None and -FUTURE_SLACK_SECONDS <= at - last_time <= float(max_age_seconds)
-    if not band_ok and not last_ok:
-        return _verdict("no second quote", None, "nothing usable: " + why_not + ", and no recent last price")
-    if band_ok:
-        lo, hi = b - tol * mid, a + tol * mid
-        if last_ok and not lo <= _exact(last) <= hi:
-            return _verdict("no second quote", None, "the last trade contradicts the bid and ask")
-    first = _number(first_price)
-    if first is None:
-        return _verdict("disagree", None, "the first price is not usable")
-    f = _exact(first)
-    if band_ok:
-        return _verdict("agree" if lo <= f <= hi else "disagree", float((f - mid) / mid), "bid/ask band")
-    ref = _exact(last)
-    return _verdict("agree" if abs(f - ref) <= tol * ref else "disagree", float((f - ref) / ref), "last price")
+    return _judge_quote(first_price, quote, symbol, now, tolerance, max_age_seconds)[0]
 
 
 def _consensus(verdicts: list) -> str:
@@ -892,10 +973,30 @@ def _fetch_for(fetch: Any, name: str, clock: Callable[[], float], deadline_at: f
     return run
 
 
+def _datetime_not_before(seconds: float) -> datetime:
+    """An aware UTC datetime whose timestamp is not below `seconds`: a float rounded to the microsecond can land below it."""
+    when = datetime.fromtimestamp(seconds, timezone.utc)
+    for _ in range(4):
+        if when.timestamp() >= seconds:
+            break
+        when += timedelta(microseconds=1)
+    return when
+
+
+def _cboe_reason(basis: str) -> str:
+    """The fixed reason for a Cboe quote that `compare` called "no second quote", read from its basis."""
+    if basis.startswith(("not fetched within", "the snapshot time is not within", "the last trade is more than")):
+        return REASON_NOT_RECENT
+    if basis.startswith(("bid above ask", "the last trade contradicts")):
+        return REASON_SUSPECT
+    return REASON_UNUSABLE
+
+
 def _entry(name: str, verdict: str, basis: str, difference: float | None, quote: dict | None, at: float | None,
-           band_time: float | None, last_time: float | None) -> dict:
+           band_time: float | None, last_time: float | None, reason: str | None = None) -> dict:
+    """One source's entry. When there is no second quote the `basis` is the `reason`, one of the fixed set."""
     used = band_time if basis == "bid/ask band" and band_time is not None else last_time
-    return {"name": name, "verdict": verdict, "basis": basis, "difference": difference,
+    return {"name": name, "verdict": verdict, "basis": basis, "reason": reason, "difference": difference,
             "bid": quote.get("bid") if quote else None, "ask": quote.get("ask") if quote else None,
             "last": quote.get("last") if quote else None, "band_time": band_time, "last_time": last_time,
             "fetched_at": quote.get("fetched_at") if quote else None,
@@ -905,30 +1006,35 @@ def _entry(name: str, verdict: str, basis: str, difference: float | None, quote:
 
 def _ask_source(name: str, first_price: Any, symbol: str, now: datetime, now_ts: float, tolerance: float, max_age_seconds: float,
                 fetch: Any, clock: Callable[[], float], sleep: Callable[[float], Any], credentials: Any, deadline_at: float | None) -> dict:
-    nothing = _entry(name, "no second quote", "no usable quote (no key, a failed request or an unusable answer)", None, None, None, None, None)
+    def nothing(reason: str, quote: dict | None = None, at: float | None = None, band_time: float | None = None,
+                last_time: float | None = None) -> dict:
+        return _entry(name, "no second quote", reason, None, quote, at, band_time, last_time, reason)
     try:
         use = _fetch_for(fetch, name, clock, deadline_at)
         if name == "cboe":
-            quote = cboe_quote(symbol, fetch=use, clock=clock, sleep=sleep, deadline_at=deadline_at)
+            quote, why = _cboe_attempt(symbol, use, clock, sleep, deadline_at)
             if quote is None:
-                return nothing
+                return nothing(why or REASON_UNUSABLE)
             fetched = _epoch(quote.get("fetched_at"))
             at = fetched if fetched is not None and 0 < fetched - now_ts <= FETCH_AHEAD_SLACK_SECONDS else now_ts
-            res = compare(first_price, quote, symbol=symbol, now=datetime.fromtimestamp(at, timezone.utc), tolerance=tolerance,
+            res = compare(first_price, quote, symbol=symbol, now=_datetime_not_before(at), tolerance=tolerance,
                           max_age_seconds=max_age_seconds)
             instants = _trade_instants(quote.get("last_trade_time"))
             when = instants[0] if instants and len(set(instants)) == 1 else None
+            if res["verdict"] == "no second quote":
+                return nothing(_cboe_reason(res["basis"]), quote, at, None, when)
             return _entry(name, res["verdict"], res["basis"], res["difference"], quote, at, None, when)
-        reader = alpaca_quote if name == "alpaca" else finnhub_quote
-        quote = reader(symbol, fetch=use, clock=clock, credentials=credentials, sleep=sleep, deadline_at=deadline_at)
+        quote, why = (_keyed_attempt("alpaca" if name == "alpaca" else "finnhub", symbol, use, clock, sleep, credentials, deadline_at))
         if quote is None:
-            return nothing
-        res = judge_quote(first_price, quote, symbol=symbol, now=now, tolerance=tolerance, max_age_seconds=max_age_seconds)
+            return nothing(why or REASON_UNUSABLE)
+        res, reason = _judge_quote(first_price, quote, symbol, now, tolerance, max_age_seconds)
         fetched = _epoch(quote.get("fetched_at"))
-        return _entry(name, res["verdict"], res["basis"], res["difference"], quote, max(now_ts, fetched) if fetched is not None else now_ts,
-                      quote.get("band_time"), quote.get("last_time"))
+        at = max(now_ts, fetched) if fetched is not None else now_ts
+        if res["verdict"] == "no second quote":
+            return nothing(reason or REASON_UNUSABLE, quote, at, quote.get("band_time"), quote.get("last_time"))
+        return _entry(name, res["verdict"], res["basis"], res["difference"], quote, at, quote.get("band_time"), quote.get("last_time"))
     except Exception:                                                  # a source never takes the call down
-        return _entry(name, "no second quote", "the source failed", None, None, None, None, None)
+        return nothing(REASON_FAILED)
 
 
 def second_opinion(first_price: Any, symbol: str, *, now: datetime, sources: Any = ("alpaca", "finnhub"), tolerance: float = 0.01,
@@ -1028,7 +1134,10 @@ def _source_line(e: dict, show_verdict: bool) -> str:
             parts.append("last %s @ %s" % (_g(e["last"]), _iso(e["last_time"]) if e["last_time"] is not None else "unknown time"))
     quote = "; ".join(parts) or "none"
     age = "age %d s" % round(e["age"]) if e["age"] is not None else "age n/a"
-    verdict = "%s [%s]" % (e["verdict"], e["basis"]) if show_verdict else "n/a"
+    if e["verdict"] == "no second quote":                       # the reason does not depend on the first price: always shown
+        verdict = "no second quote [%s]" % e["basis"]
+    else:
+        verdict = "%s [%s]" % (e["verdict"], e["basis"]) if show_verdict else "n/a"
     return "  %-8s %s | %s | %s | %s" % (e["name"], quote, age, _percent(e["difference"]) if show_verdict else "n/a", verdict)
 
 
