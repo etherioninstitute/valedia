@@ -193,14 +193,14 @@ def test_production_orders_need_the_owners_written_confirmation(tmp_path):
     assert client.calls == []                                             # each refused before any call
     conf.write_text(_live(account_ends="9999"))
     with pytest.raises(wb.LiveTradingNotConfirmed, match="different account"):
-        v.submit("SPY", 1.0, "t", price=500.0)
+        v.submit("SPY", 1.0, "t", price=500.0, limit_price=500.0)
     conf.write_text(_live())
     with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
         v.submit("SPY", 3.0, "t", price=500.0)
     with pytest.raises(wb.LiveTradingNotConfirmed, match="known dollar value"):
         v.submit("SPY", 1.0, "t")                                         # the paper mirror passes no price: it can never trade live
     assert client.placed() == []                                          # nothing reached Webull through any refusal
-    assert v.submit("SPY", 1.0, "t", price=500.0)["environment"] == "production" and len(client.placed()) == 1
+    assert v.submit("SPY", 1.0, "t", price=500.0, limit_price=500.0)["environment"] == "production" and len(client.placed()) == 1
     assert "on for the INDIVIDUAL_CASH account ending 1234" in v.check()["real_money_orders"]
 
 
@@ -2926,9 +2926,9 @@ def test_a_valid_until_more_than_31_days_ahead_is_refused_and_31_is_accepted(tmp
     with pytest.raises(wb.LiveTradingNotConfirmed, match="31 days"):
         v.submit("SPY", 1.0, "t", price=100.0)
     _conf_file(tmp_path, _live(valid_until=(today + wb.timedelta(days=31)).isoformat()))
-    v.submit("SPY", 1.0, "t", price=100.0)
+    v.submit("SPY", 1.0, "t", price=100.0, limit_price=100.0)
     _conf_file(tmp_path, _live(valid_until=today.isoformat()))            # today is still valid
-    v.submit("SPY", 1.0, "t2", price=100.0)
+    v.submit("SPY", 1.0, "t2", price=100.0, limit_price=100.0)
     assert len(client.placed()) == 2
 
 
@@ -2936,7 +2936,7 @@ def test_the_account_class_must_be_the_one_the_confirmation_names(tmp_path):
     v, client = venue(tmp_path, env="production", account_class="INDIVIDUAL_MARGIN")
     _conf_file(tmp_path, _live())
     with pytest.raises(wb.LiveTradingNotConfirmed, match="INDIVIDUAL_CASH"):
-        v.submit("SPY", 1.0, "t", price=100.0)
+        v.submit("SPY", 1.0, "t", price=100.0, limit_price=100.0)
     assert client.placed() == []
 
 
@@ -3017,7 +3017,7 @@ def test_the_repositorys_own_path_is_the_one_accepted_and_it_follows_live_repo(t
     with pytest.raises(wb.LiveTradingNotConfirmed, match="has not written"):
         v.submit("SPY", 1.0, "t", price=100.0)
     _valid_elsewhere(repo / "config")
-    assert v.submit("SPY", 1.0, "t", price=100.0)["environment"] == "production" and len(client.placed()) == 1
+    assert v.submit("SPY", 1.0, "t", price=100.0, limit_price=100.0)["environment"] == "production" and len(client.placed()) == 1
     assert wb.live_confirmation()[0] is not None and wb.load_live_confirmation() is not None   # the default: the repo's
 
 
@@ -3157,7 +3157,7 @@ def test_an_owner_file_with_more_than_one_name_is_refused_with_a_reason_a_person
     assert client.calls == []
     other.unlink()                                                        # one name again: accepted
     assert conf.stat().st_nlink == 1 and wb.read_owner_file(conf)[1] is None
-    assert v.submit("SPY", 1.0, "t", price=100.0)["environment"] == "production"
+    assert v.submit("SPY", 1.0, "t", price=100.0, limit_price=100.0)["environment"] == "production"
 
 
 class _SneakyEnv(str):
@@ -3259,7 +3259,7 @@ def test_in_production_an_amount_that_is_not_a_real_number_is_refused_before_any
 def test_in_production_a_valid_price_still_trades_within_the_cap(tmp_path):
     v, client = venue(tmp_path, env="production")
     _conf_file(tmp_path, _live())
-    assert v.submit("SPY", 2.0, "t", price=500)["environment"] == "production"         # an int price is a real number
+    assert v.submit("SPY", 2.0, "t", price=500, limit_price=500)["environment"] == "production"         # an int price is a real number
     assert v.submit("SPY", 1.0, "t2", limit_price=999.99)["environment"] == "production"
     with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
         v.submit("SPY", 3.0, "t3", price=500.0)
@@ -3300,3 +3300,340 @@ def test_in_production_a_quantity_times_price_that_overflows_is_refused_as_too_l
     assert client.calls == []
     value, why = wb._live_order_value(units, price)
     assert value is None and "too large" in why
+
+
+# ==== T22d-2 (group 2 of the off-family review): B1, B2, B3, B5, B6
+
+def _refused_venue(tmp_path, detail, code="OPENAPI_TRADE_PLACE_ORDER_REPEAT", tag="t", **client_kw):
+    cid = wb.client_order_id(tag)
+    client = FakeClient(details={cid: detail}, **client_kw)
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused(code)(a, orders))
+    return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json"), client, cid
+
+
+# ---- B1: after a refusal, "accepted" only for the order that was sent
+
+@pytest.mark.parametrize("code", ["OPENAPI_TRADE_PLACE_ORDER_REPEAT", "OPENAPI_STOCK_ORDER_PRICE_PRECISION_EXCEED"])
+@pytest.mark.parametrize("fields", [
+    {"symbol": "QQQ", "side": "SELL", "status": "CANCELLED"},            # the verifier's reproduction
+    {"symbol": "QQQ"}, {"side": "SELL"}, {"total_quantity": "2"}, {"total_quantity": "0.5"}, {"symbol": "SPYX", "status": "FILLED"}])
+def test_after_a_refusal_a_row_of_another_order_is_never_reported_accepted(tmp_path, code, fields):
+    v, client, cid = _refused_venue(tmp_path, Response(observed_detail(wb.client_order_id("t"), observed_order(wb.client_order_id("t"), **fields))), code)
+    with pytest.raises(wb.OrderRejected) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert "not the order sent" in str(exc.value) and "outcome unknown" not in str(exc.value)
+    assert not isinstance(exc.value, wb.NotTransmitted) and KEY not in str(exc.value) and "QQQ" not in str(exc.value)
+    assert len(client.placed()) == 1 and len(_calls(client, "detail")) == 1
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "FAILED", "EXPIRED", "REJECTED", "CANCELED"])
+def test_after_a_refusal_a_dead_row_of_the_same_order_is_never_reported_accepted(tmp_path, status):
+    cid = wb.client_order_id("t")
+    v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, observed_order(cid, status=status))))
+    with pytest.raises(wb.OrderRejected) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert "no live order" in str(exc.value) and exc.value.code == "OPENAPI_TRADE_PLACE_ORDER_REPEAT"
+    assert len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("fields", [{"side": None}, {"side": 7}, {"symbol": None}, {"total_quantity": None},
+                                    {"total_quantity": "many"}, {"status": "ODD"}, {"status": None}])
+def test_after_a_refusal_a_row_that_cannot_be_read_is_an_unknown_outcome(tmp_path, fields):
+    cid = wb.client_order_id("t")
+    item = observed_order(cid, **fields)
+    item = {k: v for k, v in item.items() if v is not None or k == "status"}
+    v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, item)))
+    with pytest.raises(wb.WebullError) as exc:
+        v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert type(exc.value) is wb.WebullError and "outcome unknown" in str(exc.value)
+
+
+@pytest.mark.parametrize("status", ["PENDING", "SUBMITTED", "PARTIAL_FILLED", "PARTIAL FILLED", "FILLED"])
+@pytest.mark.parametrize("quantity", ["1", "1.00000", "1.0"])
+def test_after_a_refusal_the_live_row_of_the_order_sent_is_still_accepted(tmp_path, status, quantity):
+    cid = wb.client_order_id("t")
+    v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, observed_order(cid, status=status, total_quantity=quantity))))
+    out = v.submit("SPY", 1.0, "t", limit_price=100.0)
+    assert out == {"status": "accepted", "client_order_id": cid, "venue_order_id": "ORD-777", "environment": "sandbox", "side": "BUY", "quantity": "1"}
+
+
+def test_after_a_refusal_a_crypto_row_is_matched_under_either_spelling_and_the_side_is_never_copied(tmp_path):
+    for symbol in ("BTCUSD", "BTC-USD"):
+        cid = wb.client_order_id("c")
+        row = observed_order(cid, symbol=symbol, instrument_type="CRYPTO", total_quantity="0.003")
+        v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, row)), tag="c", account_class="CRYPTO")
+        assert v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)["status"] == "accepted"
+    cid = wb.client_order_id("c")
+    row = observed_order(cid, symbol="BTCUSD", instrument_type="CRYPTO", total_quantity="0.003", side="SELL")
+    v, client, _ = _refused_venue(tmp_path, Response(observed_detail(cid, row)), tag="c", account_class="CRYPTO")
+    with pytest.raises(wb.OrderRejected):
+        v.submit("BTC-USD", 0.003, "c", limit_price=80000.0)               # a BUY sent, a SELL there: not this order
+
+
+def _events_venue(tmp_path, details=None, positions=None):
+    client = FakeClient(account_class="EVENTS_CASH", details=details or {}, positions=positions)
+    return wb.WebullVenue(KEY, SECRET, client=client, account_class="EVENTS_CASH", confirmation_file=tmp_path / "x.json"), client
+
+
+def _event_detail(cid, **fields):
+    row = {"client_order_id": cid, "order_id": "ORD-1", "symbol": "KXTEST", "side": "BUY", "status": "SUBMITTED", "fees": [],
+           "commission": {}, "instrument_type": "EVENT", "total_quantity": "1", "filled_quantity": "0", "filled_price": "0",
+           "event_outcome": "yes", **fields}
+    return Response({"client_order_id": cid, "orders": [row]})
+
+
+@pytest.mark.parametrize("fields, accepted", [({}, True), ({"status": "CANCELLED"}, False), ({"total_quantity": "2"}, False)])
+def test_after_a_refusal_an_event_row_must_also_be_the_order_sent_and_live(tmp_path, fields, accepted):
+    cid = wb.client_order_id("e")
+    v, client = _events_venue(tmp_path, details={cid: _event_detail(cid, **fields)})
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), refused(wb.REPEAT_CODE)(a, orders))
+    if accepted:
+        assert v.submit("KXTEST:yes", 1, "e", limit_price=0.5)["status"] == "accepted"
+    else:
+        with pytest.raises(wb.OrderRejected):
+            v.submit("KXTEST:yes", 1, "e", limit_price=0.5)
+
+
+# ---- B2: production refuses an order without a limit, before any request is built
+
+@pytest.mark.parametrize("limit", [None, 0, 0.0, -1.0, float("nan"), float("inf"), True, "100"])
+def test_production_refuses_an_order_without_a_positive_finite_limit_before_any_request(tmp_path, monkeypatch, limit):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())
+    built = []
+    monkeypatch.setattr(wb, "order_payload", lambda *a, **k: built.append(a) or {})
+    with pytest.raises(wb.NotTransmitted) as exc:
+        v.submit("SPY", 1.0, "t", price=100.0, limit_price=limit)
+    assert client.calls == [] and built == []
+    if limit is None:
+        assert "limit price" in str(exc.value)
+
+
+@pytest.mark.parametrize("limit", [None, 0, 0.0, -0.01, float("nan"), float("inf"), -float("inf"), True, False, "100", b"1",
+                                   10 ** 400, _FloatSub(5.0)])
+def test_the_production_limit_rule_on_its_own(limit):
+    with pytest.raises(wb.NotTransmitted, match="limit price"):
+        wb._require_live_limit(limit)
+
+
+@pytest.mark.parametrize("limit", [0.01, 5, 100.0, 999.99])
+def test_the_production_limit_rule_lets_a_positive_finite_limit_through(limit):
+    assert wb._require_live_limit(limit) is None
+
+
+def test_production_with_a_good_limit_and_the_test_environment_without_one_both_send(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())
+    out = v.submit("SPY", 1.0, "t", price=100.0, limit_price=100.0)
+    assert out["environment"] == "production" and client.placed()[0][2][0]["order_type"] == "LIMIT"
+    v, client = venue(tmp_path)
+    assert v.submit("SPY", 1.0, "t", price=100.0)["environment"] == "sandbox"
+    assert client.placed()[0][2][0]["order_type"] == "MARKET"           # the test environment is unchanged
+
+
+# ---- B3: sells this venue object sent and has not seen settled are counted
+
+def _b3_seller(tmp_path, held="3", place=None, details=None, open_pages=None):
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": held, "instrument_type": "EQUITY"}], details=details or {},
+                        open_pages=open_pages)
+    if place is not None:
+        client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), place(a, orders))
+    return wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json"), client
+
+
+def test_two_sells_of_one_holding_with_a_lagging_open_order_list_cannot_together_exceed_it(tmp_path):
+    v, client = _b3_seller(tmp_path)                                         # the open-order list never shows the first sell
+    assert v.submit("SPY", -2.0, "s1")["status"] == "accepted"
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -2.0, "s2")
+    assert v.submit("SPY", -1.0, "s3")["status"] == "accepted"            # what is left of the holding may still be sold
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -0.00001, "s4")
+    assert len(client.placed()) == 2
+
+
+@pytest.mark.parametrize("status", ["FILLED", "CANCELLED", "FAILED"])
+def test_a_reservation_is_cleared_by_a_detail_read_that_shows_the_sale_settled(tmp_path, status):
+    cid = wb.client_order_id("s1")
+    v, client = _b3_seller(tmp_path, details={cid: Response(observed_detail(cid, observed_order(cid, status=status, side="SELL", total_quantity="2")))})
+    v.submit("SPY", -2.0, "s1")
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -2.0, "s2")
+    v.order_status("s1")
+    assert v.submit("SPY", -2.0, "s2")["status"] == "accepted"            # settled: the base's own check alone
+
+
+@pytest.mark.parametrize("fields", [{"status": "SUBMITTED"}, {"status": "PARTIAL_FILLED"}, {"status": "ODD"},
+                                    {"status": "CANCELLED", "symbol": "QQQ"}, {"status": "FILLED", "total_quantity": "1"},
+                                    {"status": "CANCELLED", "side": "BUY"}])
+def test_a_reservation_is_kept_while_the_sale_is_open_or_the_row_is_not_that_sale(tmp_path, fields):
+    cid = wb.client_order_id("s1")
+    item = observed_order(cid, **{"side": "SELL", "total_quantity": "2", **fields})
+    v, client = _b3_seller(tmp_path, details={cid: Response(observed_detail(cid, item))})
+    v.submit("SPY", -2.0, "s1")
+    v.order_status("s1")
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -2.0, "s2")
+
+
+def test_a_sale_refused_by_webull_frees_its_reservation_and_an_unknown_outcome_keeps_it(tmp_path):
+    cid = wb.client_order_id("s1")
+    v, client = _b3_seller(tmp_path, place=refused("OPENAPI_CAN_NOT_TRADING_FOR_FIXGW_NOT_READY_NIGHT"), details={cid: ServerException(*NOT_PRESENT)})
+    with pytest.raises(wb.OrderRejected):
+        v.submit("SPY", -2.0, "s1")
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), Response({"order_id": "o-2"}))[1]
+    assert v.submit("SPY", -3.0, "s2")["status"] == "accepted"            # the refused sale holds nothing back
+    v, client = _b3_seller(tmp_path, place=refused("SYSTEM_BUSY", 500))
+    with pytest.raises(wb.WebullError, match="outcome unknown"):
+        v.submit("SPY", -2.0, "s1")
+    client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), Response({"order_id": "o-2"}))[1]
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -2.0, "s2")                                       # it may have reached Webull: still counted
+
+
+def test_a_sale_the_open_order_list_already_shows_is_counted_once(tmp_path):
+    cid = wb.client_order_id("s1")
+    row = {"client_order_id": cid, "orders": [observed_order(cid, side="SELL", total_quantity="2", filled_quantity="0")]}
+    v, client = _b3_seller(tmp_path, open_pages={None: {"data": []}})
+    v.submit("SPY", -2.0, "s1")
+    client._open_pages = {None: {"data": [row]}}                          # the list has caught up
+    assert v.submit("SPY", -1.0, "s2")["status"] == "accepted"            # 3 held - 2 open: 1 free, not -1
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -0.5, "s3")                                       # s2 is now in flight and not listed
+
+
+def test_a_reservation_is_per_symbol_and_buys_reserve_nothing(tmp_path):
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": "3", "instrument_type": "EQUITY"},
+                                   {"symbol": "QQQ", "quantity": "1", "instrument_type": "EQUITY"}])
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    v.submit("SPY", 5.0, "b1")
+    v.submit("SPY", -3.0, "s1")
+    assert v.submit("QQQ", -1.0, "s2")["status"] == "accepted"
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -1.0, "s3")
+
+
+def test_two_event_sales_with_a_lagging_open_order_list_cannot_together_exceed_the_holding(tmp_path):
+    v, client = _events_venue(tmp_path, positions=[{"symbol": "KXTEST", "instrument_type": "EVENT", "event_outcome": "yes", "quantity": "3"}])
+    assert v.submit("KXTEST:yes", -2, "e1", limit_price=0.5)["status"] == "accepted"
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("KXTEST:yes", -2, "e2", limit_price=0.5)
+    assert v.submit("KXTEST:yes", -1, "e3", limit_price=0.5)["status"] == "accepted"
+
+
+# ---- B5: the owner's files belong to the owner alone, and so does every folder up to the repository root
+
+def test_another_users_file_is_never_read(tmp_path, monkeypatch):
+    import os
+    conf = _conf_file(tmp_path, _live())
+    assert wb.read_owner_file(conf)[1] is None
+    real_fstat = os.fstat
+
+    def theirs(fd):                                                       # the file (opened by descriptor) is another user's
+        fields = list(real_fstat(fd))
+        fields[4] += 1
+        return os.stat_result(fields)
+    monkeypatch.setattr(os, "fstat", theirs)
+    data, why = wb.read_owner_file(conf)
+    assert data is None and why.startswith("belongs to another user"), why
+    assert wb.live_confirmation()[0] is None
+    monkeypatch.setattr(os, "fstat", real_fstat)
+    me = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: me + 1)                   # or this process runs as someone else
+    data, why = wb.read_owner_file(conf)
+    assert data is None and "belongs to another user" in why
+
+
+def test_a_folder_of_another_user_above_the_file_is_refused_naming_it(tmp_path, monkeypatch):
+    import os
+    conf = _conf_file(tmp_path, _live())
+    real_lstat = os.lstat
+    target = str(tmp_path / "config")
+
+    def faked(path):
+        st = real_lstat(path)
+        if os.fspath(path) == target:                                     # the folder, seen as another user's
+            fields = list(st)
+            fields[4] = st.st_uid + 1
+            return os.stat_result(fields)
+        return st
+    monkeypatch.setattr(os, "lstat", faked)
+    data, why = wb.read_owner_file(conf)
+    assert data is None and "config" in why and "another user" in why, why
+
+
+@pytest.mark.parametrize("which", ["config", "root"])
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o730])
+def test_a_folder_writable_by_its_group_or_others_up_to_the_root_is_refused_naming_it(tmp_path, which, mode):
+    conf = _conf_file(tmp_path, _live())
+    folder = tmp_path / "config" if which == "config" else tmp_path
+    old = folder.stat().st_mode & 0o777
+    folder.chmod(mode)
+    try:
+        data, why = wb.read_owner_file(conf)
+        assert data is None and "writable by its group or by others" in why, why
+        assert ("'config'" in why) if which == "config" else ("repository folder" in why), why
+        assert wb.live_confirmation()[0] is None
+    finally:
+        folder.chmod(old)
+    assert wb.read_owner_file(conf)[1] is None
+
+
+def test_folders_above_the_repository_root_are_not_judged_and_a_file_outside_it_is_refused(tmp_path):
+    repo = tmp_path / "repo"
+    path = _valid_elsewhere(repo / "config")
+    tmp_path.chmod(0o777)                                                 # above the root: not the owner's to answer for
+    try:
+        assert wb.read_owner_file(path, repo)[1] is None
+        data, why = wb.read_owner_file(path, tmp_path / "elsewhere")
+        assert data is None and "not inside the repository folder" in why
+    finally:
+        tmp_path.chmod(0o700)
+
+
+@pytest.mark.parametrize("folder_mode, file_mode", [(0o700, 0o600), (0o755, 0o644), (0o750, 0o640), (0o711, 0o400)])
+def test_a_correct_owner_file_is_read_as_before(tmp_path, folder_mode, file_mode):
+    conf = _conf_file(tmp_path, _live(), mode=file_mode)
+    (tmp_path / "config").chmod(folder_mode)
+    data, why = wb.read_owner_file(conf)
+    assert why is None and data["account_class"] == "INDIVIDUAL_CASH"
+    assert wb.live_confirmation()[0] is not None
+
+
+# ---- B6: the confirmation's last day cannot come back
+
+def _conf_data(**over):
+    return json.loads(_live(**over))
+
+
+def test_a_confirmation_that_lapsed_on_a_day_already_seen_stays_lapsed(tmp_path):
+    today = wb.ny_date()
+    data = _conf_data(valid_until=today.isoformat())
+    assert wb.judge_live_confirmation(data, today)[1] is None                       # valid on its last day
+    got, why = wb.judge_live_confirmation(data, today, today + wb.timedelta(days=1))  # a later day was already seen
+    assert got is None and "lapsed" in why and (today + wb.timedelta(days=1)).isoformat() in why
+    got, why = wb.judge_live_confirmation(data, today - wb.timedelta(days=5), floor=today + wb.timedelta(days=2))
+    assert got is None and "lapsed" in why                               # the wall clock going back changes nothing
+
+
+def test_a_floor_not_later_than_today_or_none_changes_nothing():
+    today = wb.ny_date()
+    for until in (today, today + wb.timedelta(days=10), today - wb.timedelta(days=1), today + wb.timedelta(days=40)):
+        data = _conf_data(valid_until=until.isoformat())
+        base = wb.judge_live_confirmation(data, today)
+        assert wb.judge_live_confirmation(data, today, None) == base
+        assert wb.judge_live_confirmation(data, today, today) == base
+        assert wb.judge_live_confirmation(data, today, today - wb.timedelta(days=3)) == base
+
+
+def test_a_floor_never_loosens_the_days_ahead_limit_and_a_floor_that_is_not_a_date_is_refused():
+    from datetime import datetime as _dt
+    today = wb.ny_date()
+    data = _conf_data(valid_until=(today + wb.timedelta(days=33)).isoformat())
+    assert wb.judge_live_confirmation(data, today)[0] is None
+    assert wb.judge_live_confirmation(data, today, today + wb.timedelta(days=5))[0] is None   # still judged against today too
+    ok = _conf_data(valid_until=(today + wb.timedelta(days=20)).isoformat())
+    assert wb.judge_live_confirmation(ok, today, today + wb.timedelta(days=5))[0] is not None
+    for bad in (today.isoformat(), _dt.now(), 20261114, True):
+        got, why = wb.judge_live_confirmation(ok, today, bad)
+        assert got is None and "floor" in why

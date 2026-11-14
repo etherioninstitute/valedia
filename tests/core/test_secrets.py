@@ -1207,3 +1207,67 @@ def test_load_env_leaves_spaced_lists_of_short_numbers_alone(tmp_path):
     caught = sorted(k for k, v in values.items() if s.redact(f"retry after {v} seconds")[1])
     plain = s.redact("retry after 1, 2, 4, 8 seconds")[1]
     assert caught == ["BACKUP_TOKEN", "CARD_KEY"] and plain == 0
+
+
+# ---- T22d-2, B4: one WEBULL_ENV, said once (a repeated key is refused; a file that disagrees with the process is refused)
+
+@pytest.mark.parametrize("text, key, lines", [
+    ("WEBULL_ENV=sandbox\nWEBULL_ENV=production\n", "WEBULL_ENV", (1, 2)),                  # the verifier's reproduction
+    ("# c\nA_KEY=one-value-here\n\nexport A_KEY=another-value-here\n", "A_KEY", (2, 4)),    # `export` names the same key
+    ("X=1\nWEBULL_ENV = sandbox\nY=2\nWEBULL_ENV= production \n", "WEBULL_ENV", (2, 4)),
+    ("A_SECRET=s3cr3t-value-0001\nB=2\nA_SECRET=s3cr3t-value-0001\n", "A_SECRET", (1, 3)),  # even with the same value
+])
+def test_a_key_repeated_in_the_file_is_refused_naming_the_key_and_both_lines_never_a_value(text, key, lines):
+    with pytest.raises(s.SecretError) as err:
+        s.parse_env(text)
+    message = str(err.value)
+    assert key in message and f"lines {lines[0]} and {lines[1]}" in message, message
+    for value in ("sandbox", "production", "one-value-here", "another-value-here", "s3cr3t-value-0001"):
+        assert value not in message
+
+
+def test_a_key_repeated_in_the_file_is_refused_by_load_env_before_anything_is_loaded(tmp_path):
+    f = tmp_path / "trading.env"
+    f.write_text("A_KEY=first-value-abcdef\nWEBULL_ENV=sandbox\nWEBULL_ENV=production\n")
+    os.chmod(f, 0o600)
+    env = {}
+    with pytest.raises(s.SecretError, match="WEBULL_ENV") as err:
+        s.load_env(f, environ=env)
+    assert env == {} and "production" not in str(err.value) and "first-value-abcdef" not in str(err.value)
+
+
+def test_lines_that_are_not_settings_are_still_skipped_and_a_single_key_is_read_as_before():
+    assert s.parse_env("# WEBULL_ENV=x\n# WEBULL_ENV=y\nbad line\n9BAD=1\n9BAD=2\nWEBULL_ENV='sandbox'\n") == {"WEBULL_ENV": "sandbox"}
+    assert s.parse_env("") == {} and s.parse_env("A=1\nB=2") == {"A": "1", "B": "2"}
+
+
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("in_file, in_process", [("production", "sandbox"), ("sandbox", "production"), ("sandbox", " sandbox"),
+                                                 ("sandbox", "")])
+def test_a_webull_env_in_the_file_that_disagrees_with_the_process_is_refused(tmp_path, override, in_file, in_process):
+    f = tmp_path / "trading.env"
+    f.write_text(f"A_KEY=key-value-0123456789\nWEBULL_ENV={in_file}\n")
+    os.chmod(f, 0o600)
+    env = {"WEBULL_ENV": in_process}
+    with pytest.raises(s.SecretError) as err:
+        s.load_env(f, environ=env, override=override)
+    message = str(err.value)
+    assert "WEBULL_ENV" in message and "disagree" in message, message
+    assert in_file not in message.replace("WEBULL_ENV", "") and "key-value-0123456789" not in message
+    assert in_process.strip() == "" or in_process.strip() not in message.replace("WEBULL_ENV", "")
+    assert env == {"WEBULL_ENV": in_process}                                     # nothing loaded
+
+
+def test_a_webull_env_that_agrees_or_is_absent_on_one_side_loads_as_before(tmp_path):
+    f = tmp_path / "trading.env"
+    f.write_text("A_KEY=key-value-0123456789\nWEBULL_ENV=sandbox\n")
+    os.chmod(f, 0o600)
+    env = {"WEBULL_ENV": "sandbox"}
+    assert s.load_env(f, environ=env) == ["A_KEY"] and env["WEBULL_ENV"] == "sandbox"
+    env = {}
+    assert s.load_env(f, environ=env) == ["A_KEY", "WEBULL_ENV"] and env["WEBULL_ENV"] == "sandbox"
+    g = tmp_path / "other.env"
+    g.write_text("A_KEY=key-value-0123456789\n")
+    os.chmod(g, 0o600)
+    env = {"WEBULL_ENV": "production"}
+    assert s.load_env(g, environ=env) == ["A_KEY"] and env["WEBULL_ENV"] == "production"

@@ -115,22 +115,37 @@ def env_file_path(environ=None) -> Path:
 
 
 def parse_env(text: str) -> dict[str, str]:
+    """KEY=VALUE pairs of a trading file. A key that appears on more than one line (`export KEY` and `KEY` are the
+    same key) is refused with SecretError naming the key and the first two line numbers, never a value (T22d-2 B4:
+    a second line must not quietly change a setting such as WEBULL_ENV)."""
     out: dict[str, str] = {}
-    for raw in text.splitlines():
+    first_line: dict[str, int] = {}
+    for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.replace("export ", "", 1).strip()
         if key.replace("_", "").isalnum() and not key[0].isdigit():
+            if key in first_line:
+                raise SecretError(f"the trading file sets {key} more than once (lines {first_line[key]} and {number}); "
+                                  "keep exactly one line for it")
+            first_line[key] = number
             out[key] = value.strip().strip('"').strip("'")
     return out
+
+
+# Settings that must have one value only: the file's may not differ from one already in the process environment.
+_SINGLE_SOURCE = ("WEBULL_ENV",)
 
 
 def load_env(path: str | Path | None = None, environ=None, override: bool = False) -> list[str]:
     """Load KEY=VALUE pairs into the environment and return the names loaded. A file readable by
     group or others is refused. A missing file loads nothing (and returns an empty list). A name
-    already set is left alone (unless `override`), but its value is remembered all the same."""
+    already set is left alone (unless `override`), but its value is remembered all the same. A key repeated in the
+    file is refused (parse_env), and so is a WEBULL_ENV in the file that is not exactly the one already in the
+    environment, `override` or not: SecretError names the key and says the two disagree, never a value, and nothing
+    is loaded."""
     ensure_output_guard()
     env = os.environ if environ is None else environ
     p = Path(path).expanduser() if path else env_file_path(env)
@@ -138,8 +153,13 @@ def load_env(path: str | Path | None = None, environ=None, override: bool = Fals
         return []
     if stat.S_IMODE(p.stat().st_mode) & 0o077:
         raise SecretError(f"{p} is readable by group or others; run chmod 600 on it")
+    pairs = parse_env(p.read_text())
+    for key in _SINGLE_SOURCE:
+        if key in pairs and key in env and env[key] != pairs[key]:
+            raise SecretError(f"the trading file's {key} and the {key} already in the environment disagree; set it in one "
+                              "place only")
     loaded = []
-    for key, value in parse_env(p.read_text()).items():
+    for key, value in pairs.items():
         _hidden_names.add(key)
         if override or key not in env:
             env[key] = value

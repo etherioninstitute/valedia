@@ -108,7 +108,11 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   instrument_type is exactly EQUITY or CRYPTO is a holding (positions()); every other row, one with no, an
   empty or an unrecognised instrument_type included, is reported apart (other_positions()) and licenses no sale.
 * Selling: what may be sold is the holding minus the unfilled remainder of every open sell for the same symbol
-  and instrument type, read with open_orders() in the same submit, before the order call.
+  and instrument type, read with open_orders() in the same submit, before the order call, minus (T22d-2 B3) the whole
+  quantity of every sale this venue object sent and has not yet seen settled that the list does not show (the list
+  may lag): see _in_flight_reserved for what clears such a reservation.
+* Production (T22d-2 B2): an order is sent only with a limit price, a finite number above zero, checked before any
+  call; the test environment still takes market orders.
 * Numbers: every number Webull sends is read with one rule: absent, unreadable, too large for a float (a huge
   JSON integer) or not finite means None (positions() skips such a row, and a holding above 1e12), a negative
   filled quantity or filled price is None, and a status is matched exactly as documented (else unknown_status).
@@ -288,8 +292,10 @@ class RateLimitHit(WebullError):
 
 class OrderRejected(WebullError):
     """Webull answered the order call and refused it, and a read of the order's detail then showed that no order
-    exists under its client order id. Not a NotTransmitted (the order did reach Webull), but its outcome is known:
-    nothing was placed. `code` is Webull's error code in the code shape, else None."""
+    exists under its client order id, or (T22d-2 B1) that the order there is not the one just sent (another symbol,
+    side or quantity) or is dead (cancelled, rejected, expired, failed). Not a NotTransmitted (the order did reach
+    Webull), but its outcome is known: this request placed nothing live. `code` is Webull's error code in the code
+    shape, else None."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -511,14 +517,40 @@ def _no_constant(name: str):
     raise ValueError("NaN and Infinity are not numbers here")
 
 
-def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[Any, str | None]:
+def _owner_folders(p: Path, root: str | Path | None) -> tuple[list[Path] | None, Path]:
+    """The folders above `p` up to and including the repository root (`root`, else LIVE_REPO read now), nearest first;
+    None when `p` is not inside that root."""
+    top = Path(os.path.abspath(os.fspath(LIVE_REPO if root is None else root)))
+    if top not in p.parents:
+        return None, top
+    folders = []
+    for q in p.parents:
+        folders.append(q)
+        if q == top:
+            break
+    return folders, top
+
+
+def _not_owners_alone(st: os.stat_result) -> str | None:
+    """What is wrong with a file or folder that must be the running user's alone, or None."""
+    if st.st_uid != os.geteuid():
+        return "belongs to another user"
+    if st.st_mode & 0o022:
+        return "is writable by its group or by others"
+    return None
+
+
+def read_owner_file(path: str | Path, root: str | Path | None = None) -> tuple[Any, str | None]:
     """An owner's hand-written JSON file, read without trusting it: (its value, None), or (None, why) when it is
     missing, unreadable, a symbolic link (at the file, or at any folder above it, up to the top of the file system),
     not a regular file, a file with more than one name (a hard link: a second name, anywhere on the disk, through
-    which it can be rewritten; T22c), writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8,
-    not JSON, or holding a repeated key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs
-    anything. `root` is accepted as before and no longer limits the link check (T22b rev 2: the whole path is
-    checked)."""
+    which it can be rewritten; T22c), writable by its group or by others, owned by another user than the one running
+    this, not inside the repository folder, below a folder (up to and including the repository folder) that belongs to
+    another user or is writable by its group or by others (T22d-2 B5; the reason names that folder, relative to the
+    repository folder), larger than OWNER_FILE_MAX_BYTES, not UTF-8, not JSON, or holding a repeated key, NaN or
+    Infinity anywhere. Never raises, never writes, creates or repairs anything. `root` is the repository folder
+    (LIVE_REPO, read at the call, when None); folders above it are not judged. It no longer limits the link check
+    (T22b rev 2: the whole path is checked)."""
     try:
         p = Path(os.path.abspath(os.fspath(path)))
         for q in [p, *p.parents]:
@@ -539,6 +571,16 @@ def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[A
                               "name; give it a name of its own: copy it to a new file, then move the copy over it")
             if st.st_mode & 0o022:
                 return None, "is writable by its group or by others (it must be the owner's alone: chmod 600 or 644)"
+            if st.st_uid != os.geteuid():
+                return None, "belongs to another user (it must be the owner's alone: the user running this trader)"
+            folders, top = _owner_folders(p, root)
+            if folders is None:
+                return None, "is not inside the repository folder, so the folders above it cannot be checked"
+            for q in folders:
+                wrong = _not_owners_alone(os.lstat(q))
+                if wrong is not None:
+                    name = "the repository folder" if q == top else f"the folder {str(q.relative_to(top))!r} above it"
+                    return None, f"is below a folder that is not the owner's alone: {name} {wrong} (chmod 700 or 755)"
             if st.st_size > OWNER_FILE_MAX_BYTES:
                 return None, f"is larger than {OWNER_FILE_MAX_BYTES} bytes"
             chunks, size = [], 0
@@ -594,6 +636,18 @@ def _live_order_value(amount: Any, reference: Any) -> tuple[float | None, str | 
     return value, None
 
 
+def _require_live_limit(limit_price: Any) -> None:
+    """A production order is a limit order (T22d-2 B2): NotTransmitted unless the limit price is an int or a float (not
+    a bool, not a subclass), finite and above zero. The test environment never calls this."""
+    try:
+        good = type(limit_price) in (int, float) and math.isfinite(limit_price) and limit_price > 0
+    except (OverflowError, ValueError):                                   # an int too large for a float
+        good = False
+    if not good:
+        raise NotTransmitted("a real-money order needs a limit price (a finite number above zero); production takes no "
+                             "market orders from this adapter")
+
+
 def _money(value: Any) -> float | None:
     """A finite number above 0 and at most LIVE_MONEY_MAX (an int or a float, never a bool), or None."""
     if type(value) not in (int, float):
@@ -618,9 +672,17 @@ def _key_list(keys) -> str:
     return ", ".join(repr(k) for k in shown[:10]) + (" ..." if len(shown) > 10 else "")
 
 
-def judge_live_confirmation(data: Any, today: date) -> tuple[dict | None, str | None]:
+def judge_live_confirmation(data: Any, today: date, floor: date | None = None) -> tuple[dict | None, str | None]:
     """The owner's confirmation in its new form, judged on the New York date `today`: (the confirmation with its two
-    caps as floats, None), or (None, why). The old form (a whole account id) and any unknown key are refused."""
+    caps as floats, None), or (None, why). The old form (a whole account id) and any unknown key are refused.
+
+    `floor` (T22d-2 B6): a New York date the caller has already seen (by the ledger or the journal), or None. When it is
+    later than `today`, the lapse is judged on the floor, so a confirmation that had lapsed on a day already seen stays
+    lapsed whatever the clock says now. A floor only ever makes the judgement stricter: the days-ahead limit is still
+    judged against `today`. A floor that is not exactly a date (a datetime, text, a number) is refused. With no floor
+    the judgement is as before."""
+    if floor is not None and type(floor) is not date:
+        return None, "cannot be judged: the floor date given is not a date"
     if not isinstance(data, dict):
         return None, "is not a JSON object"
     if "account_id" in data:
@@ -656,6 +718,9 @@ def judge_live_confirmation(data: Any, today: date) -> tuple[dict | None, str | 
         return None, "valid_until must be a date written YYYY-MM-DD"
     if day < today:
         return None, f"lapsed on {day.isoformat()} (today is {today.isoformat()}, New York date): the owner renews it"
+    if floor is not None and day < floor:
+        return None, (f"lapsed on {day.isoformat()} (a later New York date, {floor.isoformat()}, has already been seen; the "
+                      f"clock says {today.isoformat()}): the owner renews it")
     if day > today + timedelta(days=LIVE_DAYS_AHEAD_MAX):
         return None, f"valid_until is more than {LIVE_DAYS_AHEAD_MAX} days ahead of today ({today.isoformat()})"
     if data["i_understand_this_trades_real_money"] is not True:
@@ -1341,6 +1406,36 @@ def _state(raw: Any) -> str:
     return ORDER_STATES.get(raw, "unknown_status") if type(raw) is str else "unknown_status"      # exact, as documented
 
 
+# T22d-2 B1/B3: which detail rows are dead (nothing more can happen to the order) and which are live. CANCELLED and
+# FAILED are documented (order-detail); EXPIRED, REJECTED and CANCELED are not, and are read as dead too, never as live.
+DEAD_STATES = frozenset({"cancelled", "rejected"})
+DEAD_RAW_STATUSES = frozenset({"CANCELLED", "CANCELED", "FAILED", "REJECTED", "EXPIRED"})
+LIVE_STATES = frozenset({"open", "partly_filled", "filled"})
+
+
+def _row_life(raw: Any, state: str) -> str:
+    """"dead", "live" or "unknown" for a detail row's raw status and its mapped state (an unknown status is unknown)."""
+    if (type(raw) is str and raw in DEAD_RAW_STATUSES) or state in DEAD_STATES:
+        return "dead"
+    return "live" if state in LIVE_STATES else "unknown"
+
+
+def _row_against_sent(item: dict, sent: dict) -> str:
+    """Whether a detail row is the order `sent` (a payload this module built): "match" when its symbol (in any letter
+    case; for crypto also under the trader's BTC-USD spelling), its side (exactly) and its total_quantity (as a number)
+    are those sent; "differs" when all three are readable and one is not; "unreadable" when one is absent or cannot
+    be read. Raw values are only compared, never shown."""
+    sym, side, qty = item.get("symbol"), item.get("side"), _number(item.get("total_quantity"))
+    if type(sym) is not str or type(side) is not str or qty is None or qty < 0:
+        return "unreadable"
+    names = {sent["symbol"]}
+    if sent.get("instrument_type") == "CRYPTO":
+        names.add(_trader_symbol(sent["symbol"], "CRYPTO"))
+    if str.upper(sym) not in names or side != sent["side"] or _decimal(qty) != Decimal(sent["quantity"]):
+        return "differs"
+    return "match"
+
+
 def _filled_units(item: dict) -> float | None:
     n = _number(item.get("filled_quantity"))
     return None if n is None or n < 0 else n + 0.0                      # a negative fill is unreadable; -0.0 becomes 0.0
@@ -1538,6 +1633,8 @@ class WebullVenue:
         self._sent_sides: dict[str, str] = {}             # client order id -> BUY or SELL, as this object sent it
         self._named_events: dict[str, str] = {}           # client order id -> the event name a caller gave (expected=)
         self._named_sides: dict[str, str] = {}            # client order id -> the side a caller gave (expected_side=)
+        # T22d-2 B3: client order id -> a sale this object sent and has not seen settled ({kind, name, units, order})
+        self._in_flight_sells: dict[str, dict] = {}
         suffix = "-events" if self._events else ""
         # The host the requests go to, fixed here and given to the SDK: the live guard decides from it (_to_production),
         # so assigning `environment` or `host` later never makes the guard read the test environment (T22c).
@@ -1875,10 +1972,12 @@ class WebullVenue:
         the total when the filled quantity is unreadable (or above the total). Raises WebullError, so the sale is
         not sent, when the open orders cannot be read (an open order without a clean symbol included), or when an
         open order for this symbol has an unreadable total or side (units None), or carries no recognised
-        instrument_type (it could be this very holding)."""
+        instrument_type (it could be this very holding). Plus (T22d-2 B3) every sale of this symbol this object sent
+        and has not seen settled that the list does not show (see _in_flight_reserved)."""
         kind, sym = ("CRYPTO" if _is_crypto(symbol) else "EQUITY"), symbol.upper()
         names = {sym, sym.replace("-", "")}
         reserved = Decimal(0)
+        counted: set[str] = set()
         for o in self.open_orders():
             given = o["instrument_type"]
             if type(given) is not str or given not in ORDER_INSTRUMENT_TYPES:
@@ -1894,7 +1993,19 @@ class WebullVenue:
             total, filled = _decimal(abs(o["units"])), o["filled_units"]
             filled = _decimal(filled) if filled is not None else None
             reserved += total - filled if filled is not None and filled <= total else total
-        return reserved
+            if o["client_order_id"] is not None:
+                counted.add(o["client_order_id"])
+        return reserved + self._in_flight_reserved(kind, sym, counted)
+
+    def _in_flight_reserved(self, kind: str, name: str, counted: set) -> Decimal:
+        """T22d-2 B3: the whole quantity of every sale of `name` (and `kind`) this object sent and has not seen settled
+        whose client order id is not among `counted` (the open sells of the list already added). A reservation is made
+        just before the order call (_place) and cleared only by Webull's refusal of that call (OrderRejected) or by a
+        detail read showing that very sale filled or dead (_row_read); an unknown outcome, an open or partly filled
+        state, "no such order" from order_status and a row that is not that sale all keep it. It only ever adds, so the
+        check can never be more permissive than the open-order list alone."""
+        return sum((r["units"] for c, r in self._in_flight_sells.items() if r["kind"] == kind and r["name"] == name and c not in counted),
+                   Decimal(0))
 
     # ---- event contracts: reading
     def _event_row_name(self, row: dict, where: str) -> str:
@@ -1983,6 +2094,7 @@ class WebullVenue:
         ticker carries no recognised instrument type, or an open order that counts has an unreadable quantity or side."""
         ticker = name.partition(":")[0]
         reserved = Decimal(0)
+        counted: set[str] = set()
         for o in self.open_orders():
             given, sym = o["instrument_type"], o["symbol"]
             of_ticker = type(sym) is str and sym.partition(":")[0] == ticker
@@ -2002,7 +2114,9 @@ class WebullVenue:
             total, filled = _decimal(abs(o["units"])), o["filled_units"]
             filled = _decimal(filled) if filled is not None else None
             reserved += total - filled if filled is not None and filled <= total else total
-        return reserved
+            if cid is not None and sym == name:
+                counted.add(cid)
+        return reserved + self._in_flight_reserved(EVENT_INSTRUMENT, name, counted)     # T22d-2 B3, as for stocks
 
     def _event_fee(self, item: dict, filled: float | None, secrets: _Secrets) -> tuple[float | None, str | None]:
         """(fee, fee type) of an event order row. The fee is the actual_value of the one fees entry (plus
@@ -2134,8 +2248,11 @@ class WebullVenue:
 
         After the place_order call: when it fails with the SDK's ServerException and a 4xx status (Webull answered and
         refused; a 429 included: place is never retried), the order's detail is read once under the same client order
-        id. If the order is there, submit returns it as accepted (this covers OPENAPI_TRADE_PLACE_ORDER_REPEAT: the
-        same client order id was sent before and that order exists); if the detail gives the "no such order" answer
+        id. If the order is there, and its row is the order just sent (symbol, side and quantity, see _row_against_sent)
+        and live (not cancelled, rejected, expired or failed), submit returns it as accepted (this covers
+        OPENAPI_TRADE_PLACE_ORDER_REPEAT: the same client order id was sent before and that order exists); a row that
+        is another order or dead raises OrderRejected, and a row whose symbol, side, quantity or status cannot be read
+        is an unknown outcome (T22d-2 B1). If the detail gives the "no such order" answer
         (see order_status; recognised here whatever confirmed_not_found says, because it follows a refusal), submit
         raises OrderRejected: Webull refused and no order exists. The exception is OPENAPI_TRADE_PLACE_ORDER_REPEAT:
         there Webull says an order with this client order id exists, so "no such order" on the detail read leaves the
@@ -2163,6 +2280,8 @@ class WebullVenue:
             # in production the price is judged before any call (a real number only: _live_order_value); in the test
             # environment where the base judged it
             confirmation = self._guard_live(*_live_order_value(amount, reference)) if live else None
+            if live:
+                _require_live_limit(limit_price)                          # T22d-2 B2: before any call or request is built
             account = self.account_id
             self._fits(crypto)
             self._guard_live_account(confirmation)
@@ -2262,6 +2381,11 @@ class WebullVenue:
         """The single place_order call and what follows it (see submit). `expected`: the event name sent, for the
         detail read after a refusal (None for stocks and crypto)."""
         detail, refused = None, None
+        cid = order["client_order_id"]
+        if order["side"] == "SELL":                                       # T22d-2 B3: counted until seen settled
+            kind = order["instrument_type"]
+            self._in_flight_sells[cid] = {"kind": kind, "name": expected if kind == EVENT_INSTRUMENT else _trader_symbol(order["symbol"], kind),
+                                          "units": Decimal(order["quantity"]), "order": dict(order)}
         try:
             res = self._client.order_v3.place_order(account, [order])   # the only order call; its slot is already taken
         except NotTransmitted as exc:                                     # raised from inside the call: still unknown
@@ -2272,17 +2396,28 @@ class WebullVenue:
             detail = "Webull call failed: " + _safe(exc, secrets)
             refused = _refusal(exc)
         if refused is not None:                                           # Webull answered 4xx: one detail read decides
-            found, reason = self._after_refusal(order["client_order_id"], secrets, expected)
+            found, reason = self._after_refusal(cid, secrets, expected, sent=order)
             if found is not None:
-                return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": found["venue_order_id"],
-                        "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
-            if reason is None and type(refused[0]) is str and refused[0] == REPEAT_CODE:
+                # T22d-2 B1: accepted only when the row is the order just sent (symbol, side, quantity) and not dead
+                match, life = found.get("sent_row", ("unreadable", "unknown"))
+                if match == "match" and life == "live":
+                    return {"status": "accepted", "client_order_id": cid, "venue_order_id": found["venue_order_id"],
+                            "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
+                if match == "differs" or (match == "match" and life == "dead"):
+                    self._in_flight_sells.pop(cid, None)
+                    what = ("the order its detail shows under this client order id is not the order sent (another symbol, side or "
+                            "quantity)" if match == "differs" else
+                            "its detail shows the order sent but no live order (cancelled, rejected, expired or failed)")
+                    raise OrderRejected(f"Webull refused the order, and {what}: " + self._final(detail), self._refusal_code(refused, secrets))
+                reason = ("the order's detail after the refusal cannot be read as the order sent (its symbol, side, quantity or "
+                          "status is unreadable or not a known one)")
+            elif reason is None and type(refused[0]) is str and refused[0] == REPEAT_CODE:
                 reason = ("Webull says an order with this client order id already exists (OPENAPI_TRADE_PLACE_ORDER_REPEAT), "
                           "but its detail reads as no such order")
             if reason is None:
-                code = _code(refused[0], secrets)
-                code = code if code != CODE_WITHHELD and self._final(code) == code else None
-                raise OrderRejected("Webull refused the order and no order exists under its client order id: " + self._final(detail), code)
+                self._in_flight_sells.pop(cid, None)
+                raise OrderRejected("Webull refused the order and no order exists under its client order id: " + self._final(detail),
+                                    self._refusal_code(refused, secrets))
             detail += "; " + reason
         if detail is None:
             try:                                                          # everything after the call, in one guarded block
@@ -2307,6 +2442,11 @@ class WebullVenue:
         return {"status": "accepted", "client_order_id": order["client_order_id"], "venue_order_id": venue_order_id,
                 "environment": self.environment, "side": order["side"], "quantity": order["quantity"]}
 
+    def _refusal_code(self, refused: tuple, secrets: _Secrets) -> str | None:
+        """Webull's error code of a refusal in the code shape, else None (OrderRejected.code)."""
+        code = _code(refused[0], secrets)
+        return code if code != CODE_WITHHELD and self._final(code) == code else None
+
     def _check_sale(self, symbol: str, amount: float, crypto: bool) -> float:
         """The long-only check for a sale, read fresh: wait until open orders, holdings and the order call could all be
         made at once, read open orders then holdings, check, and wait for the place slot. If more than
@@ -2327,13 +2467,15 @@ class WebullVenue:
         raise NotTransmitted(f"the holdings could not be read within {SALE_READ_MAX_AGE:g} seconds of the order call after "
                              f"{SALE_REREADS} re-reads; not sent")
 
-    def _after_refusal(self, cid: str, secrets: _Secrets, expected: str | None = None) -> tuple[dict | None, str | None]:
+    def _after_refusal(self, cid: str, secrets: _Secrets, expected: str | None = None,
+                       sent: dict | None = None) -> tuple[dict | None, str | None]:
         """One read of the order's detail after Webull refused the order call: (the order as order_status reads it,
         None) when it exists; (None, None) on the "no such order" answer; (None, why) when the read fails or answers
-        anything else (the outcome stays unknown). `expected`: the event name sent, in an Events venue."""
+        anything else (the outcome stays unknown). `expected`: the event name sent, in an Events venue. `sent`: the
+        order just sent; the answer then also carries `sent_row`, (match, life): see _row_against_sent and _row_life."""
         reason = None
         try:
-            found = self._read_order(cid, recognise_not_found=True, expected=expected)
+            found = self._read_order(cid, recognise_not_found=True, expected=expected, sent=sent)
         except WebullError as exc:
             found, reason = None, "reading the order's detail after the refusal failed: " + _plain(exc)
         except Exception as exc:
@@ -2460,7 +2602,7 @@ class WebullVenue:
         self._name_order(cid, name, expected_side)
         return self._read_order(cid, self._confirmed_not_found, expected=name)
 
-    def _read_order(self, cid: str, recognise_not_found: bool, expected: str | None = None) -> dict | None:
+    def _read_order(self, cid: str, recognise_not_found: bool, expected: str | None = None, sent: dict | None = None) -> dict | None:
         if self._events and parse_event_name(expected) is None:
             raise WebullError("an event order is read only against the event name it was sent under")
         account = self.account_id
@@ -2501,7 +2643,7 @@ class WebullVenue:
                "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
                "raw_status": _status_word(item.get("status"), secrets, self._final)}
         if not self._events:
-            return out
+            return self._row_read(cid, item, out, sent)
         kind = item.get("instrument_type")
         if not (type(kind) is str and kind == EVENT_INSTRUMENT):
             raise WebullError("Webull's order detail for an event order is not of the type EVENT; it is not read as a fill")
@@ -2514,6 +2656,19 @@ class WebullVenue:
                               "exactly BUY or SELL); it is not read as a fill")
         out["fee"], out["fee_type"] = self._event_fee(item, out["filled_units"], secrets)
         out["symbol"] = expected
+        return self._row_read(cid, item, out, sent)
+
+    def _row_read(self, cid: str, item: dict, out: dict, sent: dict | None) -> dict:
+        """What every detail read does last (T22d-2). B3: a sale this object sent stops being counted once a read shows
+        that very sale (symbol, side and quantity as sent) settled: filled, or dead (cancelled, rejected, expired,
+        failed). B1: with `sent` (only after a refusal) the answer also carries `sent_row` = (match, life) for _place."""
+        life = _row_life(item.get("status"), out["state"])
+        reservation = self._in_flight_sells.get(cid)
+        if (reservation is not None and (life == "dead" or out["state"] == "filled")
+                and _row_against_sent(item, reservation["order"]) == "match"):
+            del self._in_flight_sells[cid]
+        if sent is not None:
+            out["sent_row"] = (_row_against_sent(item, sent), life)
         return out
 
     @staticmethod

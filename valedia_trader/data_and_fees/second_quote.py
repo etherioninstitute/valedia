@@ -62,8 +62,9 @@ verdict is "no second quote", whatever the last price (rev 2 fell back to the la
 
 Environment (rev 3): the opener ignores the proxy variables, and its TLS context is built by hand so that it does not honour
 SSLKEYLOGFILE (the standard `ssl.create_default_context` opens the named file and logs the session keys to it). Server and
-host name are still verified, TLS 1.2 at least. The system's trusted-certificate locations are still read, and OpenSSL
-itself reads SSL_CERT_FILE and SSL_CERT_DIR for them: those two are not neutralised here.
+host name are still verified, TLS 1.2 at least. Trust (T22d-2 C2): the context trusts only the authorities of the certifi
+bundle (`ca_bundle`, loaded by its path); the system's default locations are never loaded, so SSL_CERT_FILE, SSL_CERT_DIR
+and every other environment variable leave the trust store as it is.
 
 Name lookup (rev 3): `getaddrinfo` cannot be interrupted, so the lookup runs in one daemon thread (named
 "second-quote-lookup") and the try waits for it only as long as the deadline allows; then the try fails with TimeoutError and
@@ -279,15 +280,27 @@ class _Budget:
         self._timer.cancel()
 
 
+CA_BUNDLE_SOURCE = "certifi"                      # the one certificate set the second quote trusts (T22d-2 C2)
+
+
+def ca_bundle() -> str:
+    """The path of the certificate bundle the second quote trusts: the `certifi` package's (a declared dependency). No
+    environment variable is read to choose it."""
+    import certifi
+    return certifi.where()
+
+
 def _tls_context() -> ssl.SSLContext:
     """The TLS context of the real opener, built by hand: server and host name verified, TLS 1.2 at least, the ALPN and
     post-handshake settings `http.client` would add, and, unlike `ssl.create_default_context`, no SSLKEYLOGFILE (that
-    function opens the file the variable names and logs session keys to it)."""
+    function opens the file the variable names and logs session keys to it). It trusts the authorities of one bundle
+    only, ca_bundle() (T22d-2 C2): the system's default locations are never loaded, so neither SSL_CERT_FILE,
+    SSL_CERT_DIR nor any other variable changes the trust store. A bundle that cannot be loaded raises: no context."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.verify_mode = ssl.CERT_REQUIRED
     context.check_hostname = True
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    context.load_verify_locations(cafile=ca_bundle())
     context.set_alpn_protocols(["http/1.1"])
     if context.post_handshake_auth is not None:
         context.post_handshake_auth = True

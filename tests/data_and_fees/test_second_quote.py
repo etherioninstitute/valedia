@@ -2799,3 +2799,93 @@ def test_the_docstring_states_the_finnhub_symbol_rule_and_the_reach_of_judging_a
     assert "status code and the service's name only" in doc
 
 
+
+
+# ---- T22d-2, C2: the second quote trusts only the certificate bundle the program names (certifi's), whatever the
+# environment says
+
+_CA_VARIABLES = ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT", "OPENSSL_CONF")
+
+
+def _store(ctx):
+    return sorted(json.dumps(c, sort_keys=True) for c in ctx.get_ca_certs())
+
+
+def _programs_store():
+    import certifi
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile=certifi.where())
+    return _store(ctx)
+
+
+def _one_certificate(tmp_path):
+    import certifi
+    text = open(certifi.where(), encoding="ascii").read()
+    end = "-----END CERTIFICATE-----"
+    first = text[text.index("-----BEGIN CERTIFICATE-----"):text.index(end) + len(end)] + "\n"
+    one = tmp_path / "one.pem"
+    one.write_text(first)
+    folder = tmp_path / "certs"
+    folder.mkdir()
+    (folder / "one.pem").write_text(first)
+    return one, folder
+
+
+def _contexts():
+    opener = sq._build_opener()
+    handler = [h for h in opener.handlers if type(h).__name__ == "_BudgetHTTPS"][0]
+    return [sq._tls_context(), sq._BudgetHTTPS()._context, handler._context]
+
+
+def test_the_trust_store_is_the_programs_bundle_and_ssl_cert_file_does_not_change_it(monkeypatch, tmp_path):
+    for name in _CA_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    want = _programs_store()
+    assert len(want) > 50                                                # the certifi bundle, a full set of authorities
+    assert [_store(c) for c in _contexts()] == [want] * 3
+    one, folder = _one_certificate(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(one))                        # the verifier's reproduction: one certificate
+    assert [_store(c) for c in _contexts()] == [want] * 3
+    monkeypatch.setenv("SSL_CERT_DIR", str(folder))
+    for name in _CA_VARIABLES[2:4]:
+        monkeypatch.setenv(name, str(one))
+    assert [_store(c) for c in _contexts()] == [want] * 3
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))  # a file that is not there changes nothing either
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "missing"))
+    assert [_store(c) for c in _contexts()] == [want] * 3
+
+
+def test_the_bundle_is_named_by_the_program_not_found_by_openssl():
+    import certifi
+    assert sq.ca_bundle() == certifi.where() and sq.CA_BUNDLE_SOURCE == "certifi"
+    source = open(sq.__file__, encoding="utf-8").read()
+    for forbidden in ("load_default_certs", "set_default_verify_paths", "create_default_context", "capath="):
+        assert forbidden + ("" if forbidden.endswith("=") else "(") not in source, forbidden
+
+
+def test_no_function_of_the_module_gives_a_context_that_would_accept_an_untrusted_certificate(monkeypatch, tmp_path):
+    import inspect
+    one, folder = _one_certificate(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(one))
+    monkeypatch.setenv("SSL_CERT_DIR", str(folder))
+    contexts = _contexts()
+    assert len({id(c) for c in contexts}) == 3                           # each a fresh object: changing one changes no other
+    for ctx in contexts:
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
+        assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2 and ctx.get_ca_certs()
+    assert list(inspect.signature(sq._tls_context).parameters) == []     # nothing a caller passes loosens it
+    assert list(inspect.signature(sq._BudgetHTTPS).parameters) == []
+    source = open(sq.__file__, encoding="utf-8").read()
+    for loosening in ("CERT_NONE", "CERT_OPTIONAL", "_create_unverified_context", "check_hostname = False", "check_hostname=False",
+                      "verify_mode = ssl.CERT_N"):
+        assert loosening not in source, loosening
+    contexts[0].check_hostname = False                                   # a caller loosening its own copy ...
+    contexts[0].verify_mode = ssl.CERT_NONE
+    fresh = sq._tls_context()                                            # ... never reaches the next one built
+    assert fresh.verify_mode == ssl.CERT_REQUIRED and fresh.check_hostname is True
+
+
+def test_without_its_bundle_the_module_builds_no_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(sq, "ca_bundle", lambda: str(tmp_path / "gone.pem"))
+    with pytest.raises((OSError, ssl.SSLError)):
+        sq._tls_context()
