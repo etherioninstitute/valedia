@@ -203,3 +203,31 @@ are readings the text left open; each is fixed here before any real slot can be 
     linear interpolation.
 25. **A day's count** (clarification 2) is reduced by every answered slot under another battery, including one
     the collector itself did not count.
+
+## Clarifications 26 to 35 for the scoring (2026-11-14, 00:19 UTC: the first development day is being collected; no answer has been compared with an outcome, and the evaluation code has never opened the real record)
+
+Raised by the second blind check of the evaluation code, again on generated records only. Each fixes a reading the
+text left open. Where two readings were possible the stricter one is taken; where the text was plain, the code is
+being changed to it.
+
+26. **A snapshot that began before a decision and ended after it** is an ordinary snapshot for "the mid just
+    before the trade": clarifications 7 and 22 mean what they say (the latest two-sided snapshot whose book ended
+    before the trade, at most 90 seconds old), whenever it began. The collector finishes its snapshots before it
+    decides, so none is expected in the record.
+27. **`regime`, quiet** is judged first and needs no earlier move: an end within one cent and a path within two
+    cents is quiet even when the state carries no 30-minute change. Only when the window is not quiet and that
+    change is missing is the outcome unknown.
+28. **The model rule above zero** (clarification 15) also needs a by-day t statistic of 2 or more on its own
+    mean profit per slot, like the two differences.
+29. **"The first for its market and slot"** (clarification 1) is the first row with answers under the battery in
+    force, not the first row of any kind.
+30. **"Nearest"** is measured by a snapshot's book end time, and one snapshot serves at most one minute of a path.
+31. **A slot whose state does not match its own snapshot** (the mid of the state differs from the mid of the
+    snapshot it names) is left out of every question and of the policy, and counted.
+32. **A late row with answers** under another battery counts as an answered slot for clarification 25.
+33. **Resampling:** whole counted days are drawn with replacement, as many as there are; a draw in which a
+    question has only one outcome is left out of that question's range and counted. The position of a question
+    in the battery, for the seed, is counted from 0.
+34. **The stored result and its log line are one write;** a failure leaves neither.
+35. **Score-once is a rule of this program:** a record whose result table has been removed by other means would
+    be scored again. The lead uses one evaluation folder, the default, and nothing else touches it.
