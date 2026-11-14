@@ -42,8 +42,9 @@ them). Over any sequence the units add up to the stored total, the fees to the l
 last report with an average left nothing unpriced, the priced rows to that average times that total. A fee
 total that falls, or an average that implies a negative or non-finite price, is an anomaly for that piece of
 information only: the stored fee total (or priced point) is kept, and a rise in units in the same report is
-still taken, its row carrying fee (or price) None. A reconcile reports a fill or an update only once the write
-that made it true is committed; an order whose write failed is listed as unresolved. The book must apply every row (`unapplied_fills`, then `mark_applied`)
+still taken, its row carrying fee (or price) None. A fee total recorded below zero is kept as reported and opens
+one notice per order (an attention item of a kind in NOTICE_KINDS, which does not block). A reconcile reports
+a fill or an update only once the write that made it true is committed; an order whose write failed is listed as unresolved. The book must apply every row (`unapplied_fills`, then `mark_applied`)
 before another order may be submitted, because orders are sized from the book.
 
 Strategies that share one account trade through one netted order per symbol: `net_orders` builds it and
@@ -55,7 +56,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -87,6 +90,7 @@ MIN_UNITS = 1e-8                                          # the smallest order `
 REL_TOL = 1e-9                                            # filled amounts compare within REL_TOL x max(1, |units|)
 MAX_TEXT = 200
 BUSY_SECONDS = 30.0                                       # how long a connection waits for another's write to end
+NOTICE_KINDS = frozenset({"negative_fee"})                # attention kinds that tell a person and do not block
 
 
 class OrderError(RuntimeError):
@@ -145,6 +149,11 @@ def _safe_repr(x) -> str:
 def _storable(text: str) -> str:
     """Text from outside made safe to store: anything UTF-8 cannot encode (a lone surrogate) becomes '?'."""
     return str(text).encode("utf-8", "replace").decode("utf-8")
+
+
+def _one_line(text) -> str:
+    """A path or name made safe to show on one line of a message."""
+    return _storable(str(text)).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _finite(x) -> bool:
@@ -224,9 +233,18 @@ class OrderLedger:
     The file carries a layout version (`PRAGMA user_version` = LAYOUT_VERSION). A new file is created at it; a
     file written with any other layout is refused, never repaired. `not_sent` lists exception classes that
     guarantee nothing was transmitted; any other failure of a submit leaves the order `unknown`. `clock` gives
-    the time in seconds."""
+    the time in seconds.
 
-    def __init__(self, path: str | Path = ":memory:", not_sent: tuple = (), clock: Callable[[], float] = time.time) -> None:
+    Where a ledger is opened: a path that is a symbolic link, and a ledger file group or others may write, are
+    refused in every mode, before anything is created or written (a link in a folder above the file is followed, as
+    the system's own folders are often links). With `must_exist` (default False: a missing file, and its folder, are
+    created) a path with no ledger file is refused the same way. The path is checked again once the write lock is
+    held, so a file replaced while it was being opened is refused too."""
+
+    def __init__(self, path: str | Path = ":memory:", not_sent: tuple = (), clock: Callable[[], float] = time.time,
+                 *, must_exist: bool = False) -> None:
+        if type(must_exist) is not bool:
+            raise OrderError(f"must_exist must be True or False, not {_safe_repr(must_exist)}")
         try:
             not_sent = tuple(not_sent)
         except TypeError:
@@ -237,6 +255,10 @@ class OrderLedger:
         self.not_sent = not_sent
         self.clock = clock
         self._path = str(path)
+        private = self._path in (":memory:", "")              # sqlite's own databases, never a file at a path
+        if private and must_exist:
+            raise OrderError(f"must_exist asks for a ledger file, and {_one_line(self._path)!r} names none; it is not opened")
+        seen = None if private else self._check_file(must_exist)   # raises before anything is created
         try:
             if self._path != ":memory:":
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +267,11 @@ class OrderLedger:
             raise OrderError(f"the order ledger {path} could not be opened: {_describe(exc)}") from exc
         try:
             with self._write():
+                if not private:                               # the write lock is held: nothing can be written yet
+                    now_seen = self._check_file(True)
+                    if seen is not None and now_seen != seen:
+                        raise OrderError(f"the order ledger {_one_line(self._path)} was replaced while it was being "
+                                         "opened; it is not opened")
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
                 ours = self._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
                 anything = self._db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
@@ -261,6 +288,28 @@ class OrderLedger:
         except BaseException:
             self._close_quietly()
             raise
+
+    def _check_file(self, must_exist: bool) -> tuple | None:
+        """Refuse the ledger's path, in one line naming it, when it is a symbolic link or a regular file group or
+        others may write, and with `must_exist` when no regular file is there. Returns the file's (device, inode),
+        or None when nothing is there yet. Reads only: it never creates, opens or changes anything."""
+        where = _one_line(self._path)
+        try:
+            st = os.lstat(self._path)
+        except (FileNotFoundError, NotADirectoryError):
+            st = None
+        except OSError as exc:
+            raise OrderError(f"the order ledger {where} could not be checked: {_describe(exc)}") from exc
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            raise OrderError(f"the order ledger {where} is a symbolic link; it is not opened")
+        if st is None or not stat.S_ISREG(st.st_mode):
+            if must_exist:
+                raise OrderError(f"no order ledger file is at {where}, and one was expected there; nothing was created")
+            return None
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise OrderError(f"the order ledger {where} is writable by group or others (mode "
+                             f"{stat.S_IMODE(st.st_mode):o}); it is not opened")
+        return (st.st_dev, st.st_ino)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self._path, timeout=BUSY_SECONDS, isolation_level=None)   # transactions are explicit
@@ -405,8 +454,10 @@ class OrderLedger:
         return {"time": rows[0]["time"], "clean": bool(rows[0]["clean"]), "summary": json.loads(rows[0]["summary"])}
 
     def attention(self, open_only: bool = True) -> list[dict]:
-        """Items a person must look at (an order found at the venue after it was declared never arrived), oldest
-        first; only the open ones unless `open_only` is False. Every open item blocks further orders."""
+        """Items a person must look at (an order found at the venue after it was declared never arrived, a submit
+        outcome that came back after that, a fee total below zero), oldest first; only the open ones unless
+        `open_only` is False. Every open item blocks further orders, except a notice (its kind is in NOTICE_KINDS),
+        which only tells a person."""
         sql = "SELECT * FROM attention" + (" WHERE closed_time IS NULL" if open_only else "") + " ORDER BY id"
         return [dict(r) for r in self._read(sql)]
 
@@ -528,6 +579,8 @@ class OrderLedger:
         if waiting:
             reasons.append(f"{waiting} fill{'' if waiting == 1 else 's'} not yet applied to the book")
         for item in self.attention():
+            if item["kind"] in NOTICE_KINDS:                  # tells a person; does not stand in the way
+                continue
             reasons.append(f"attention item {item['id']} for order {item['tag']} is open: {item['reason']} "
                            "(close it with close_attention once a person has looked)")
         last = self.last_reconcile()
@@ -550,7 +603,9 @@ class OrderLedger:
         OrderError is raised.
 
         An acceptance always wins: if another ledger moved the order to unknown or never_arrived while the venue
-        call was in flight, the acceptance moves it on to accepted, with a note that it arrived late.
+        call was in flight, the acceptance moves it on to accepted, with a note that it arrived late. Any outcome
+        that finds the order declared never arrived meanwhile (an acceptance, an error, a refusal, an answer that is
+        not an acceptance) opens an attention item, which blocks every further order until a person closes it.
 
         The check of `blocked(max_age_seconds)` and the change `intended -> sent` are one write transaction: the
         caller that makes the change is the only one that calls the venue. Another caller gets OrdersBlocked while
@@ -576,7 +631,8 @@ class OrderLedger:
             note = _describe(exc)
             new = "refused" if self.not_sent and isinstance(exc, self.not_sent) else "unknown"
             with self._write():
-                self._cas(tag, "sent", new, note, note=note)
+                if not self._cas(tag, "sent", new, note, note=note):
+                    self._late_outcome(tag, "a refusal" if new == "refused" else "an error")
             return self.order(tag)
         accepted = False
         try:
@@ -596,8 +652,18 @@ class OrderLedger:
                                    "been declared never arrived; check that no replacement was sent")
             elif not accepted:
                 note = f"the venue did not say accepted: {_safe_repr(result)}"
-                self._cas(tag, "sent", "unknown", note, note=note)
+                if not self._cas(tag, "sent", "unknown", note, note=note):
+                    self._late_outcome(tag, "an answer that was not an acceptance")
         return self.order(tag)
+
+    def _late_outcome(self, tag: str, what: str) -> None:
+        """Inside the caller's write: a submit's outcome found its order no longer sent. If it was declared never
+        arrived meanwhile, open an attention item (it blocks, as a late acceptance does). The reason is in this
+        module's own words only, never the venue's text, as blocked() shows it."""
+        rec = self.order(tag)
+        if rec is not None and rec["state"] == "never_arrived":
+            self._flag(tag, "late_outcome", f"the submit came back with {what} after the order had been declared "
+                       "never arrived; check at the venue that it is not there and that no replacement was sent")
 
     # ---- reconcile
 
@@ -736,6 +802,14 @@ class OrderLedger:
         for k, items in local.items():                    # committed: now it may be reported
             out[k].extend(items)
 
+    def _notice_negative_fee(self, tag: str, fee: float) -> None:
+        """Inside the caller's write: the fee total recorded for the order is below zero. It is kept as reported (it
+        may be a rebate) and a notice is opened for a person: once per order, open or closed, and it does not block."""
+        if self._db.execute("SELECT COUNT(*) FROM attention WHERE tag = ? AND kind = 'negative_fee'", (tag,)).fetchone()[0]:
+            return
+        self._flag(tag, "negative_fee", f"the venue reports a fee total of {fee!r} for order {tag}, below zero; it is "
+                   "kept as reported: check whether it is a rebate")
+
     def _apply_missing(self, rec: dict, now: float, settle_seconds: float, out: dict) -> None:
         tag, state = rec["tag"], rec["state"]
         if state in UNSETTLED:
@@ -835,6 +909,8 @@ class OrderLedger:
         why = f"venue says {vstate}" + ("; it had been declared never arrived" if mode == "turned_up" else "")
         if not self._cas(tag, state, new, why, **fields):
             return
+        if fields.get("fee") is not None and fields["fee"] < 0:
+            self._notice_negative_fee(tag, fields["fee"])
         if wanted:
             cur = self._db.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) "
                                    "VALUES (?,?,?,?,?,?,?,0)", (tag, rec["symbol"], row["units"], row["price"],

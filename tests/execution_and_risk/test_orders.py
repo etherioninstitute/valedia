@@ -3,6 +3,9 @@ import multiprocessing
 import os
 import random
 import sqlite3
+import stat
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -797,6 +800,7 @@ def test_two_processes_racing_submit_once_make_one_venue_call_in_every_trial(tmp
         led = OrderLedger(p)
         assert led.order("race")["state"] == "accepted"
         assert [(e["from"], e["to"]) for e in led.events("race")] == [(None, "intended"), ("intended", "sent"), ("sent", "accepted")]
+        assert led.attention(open_only=False) == []                      # the loser left nothing for a person to settle
         led.close()
 
 
@@ -1885,3 +1889,672 @@ def test_intend_refuses_a_batch_that_is_not_a_string():
 def test_mark_applied_refuses_an_argument_that_is_not_an_iterable_of_ids(ids):
     with pytest.raises(OrderError):
         ledger().mark_applied(ids)
+
+
+# ---- rev 7: an outcome that finds its order declared never arrived, where a ledger is opened, a negative fee total
+
+
+LATE_OUTCOME, NEGATIVE_FEE = "late_outcome", "negative_fee"
+OUTCOMES = ["raise", "raise_after_taking", "not_sent", "odd_result"]   # a timeout, an error, a refusal, an unknown answer
+
+
+def _raced(tmp_path, mode, by_hand=False):
+    """Ledgers a and b on one file. While a's submit is in flight, b declares the order never arrived (a reconcile with
+    the clock 200 s ahead, or a person's ruling); then the venue gives a its outcome, `mode`."""
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(mode=mode)
+    ready(a, venue)
+    intend(a)
+
+    def b_declares_it_never_arrived(tag):
+        if by_hand:
+            b.settle_by_hand(tag, "Burton", "not in the app")
+        else:
+            clock.t += 200
+            assert b.reconcile(venue, {})["clean"] and b.order(tag)["state"] == "never_arrived"
+
+    venue.on_submit = b_declares_it_never_arrived
+    return a, b, venue, clock
+
+
+@pytest.mark.parametrize("by_hand", [False, True])
+@pytest.mark.parametrize("mode", OUTCOMES)
+def test_an_outcome_that_finds_its_order_declared_never_arrived_blocks_every_further_order(tmp_path, mode, by_hand):
+    a, b, venue, clock = _raced(tmp_path, mode, by_hand)
+    rec = a.submit_once(venue, TAG)
+    assert rec["state"] == "never_arrived" and len(venue.calls) == 1
+    (item,) = a.attention()
+    assert item["tag"] == TAG and item["kind"] == LATE_OUTCOME and "never arrived" in item["reason"]
+    reasons = a.blocked()
+    assert len(reasons) == 1 and TAG in reasons[0] and "never arrived" in reasons[0]
+    assert b.blocked() == reasons                                         # every connection on the file sees it
+    intend(a, tag="next")
+    with pytest.raises(OrdersBlocked) as err:
+        a.submit_once(venue, "next")
+    assert err.value.reasons == reasons and a.order("next")["state"] == "intended" and len(venue.calls) == 1
+
+
+def test_a_late_outcome_is_lifted_only_when_a_person_closes_it(tmp_path):
+    a, b, venue, clock = _raced(tmp_path, "raise")
+    a.submit_once(venue, TAG)
+    (item,) = a.attention()
+    for _ in range(2):                                                    # a reconcile does not lift it
+        clock.t += 60
+        assert a.reconcile(venue, {})["clean"] and len(a.blocked()) == 1
+    a.close_attention(item["id"], "Burton", "not in the app; no replacement was sent")
+    assert a.blocked() == [] and a.order(TAG)["state"] == "never_arrived"
+    venue.mode, venue.on_submit = "accept", None
+    intend(a, tag="next")
+    assert a.submit_once(venue, "next")["state"] == "accepted" and len(venue.calls) == 2
+
+
+def test_an_order_that_arrived_after_a_late_outcome_is_also_turned_up(tmp_path):
+    a, b, venue, clock = _raced(tmp_path, "raise_after_taking")         # it did reach the venue
+    a.submit_once(venue, TAG)
+    clock.t += 60
+    found = a.reconcile(venue, {})
+    assert a.order(TAG)["state"] == "accepted" and [x["tag"] for x in found["anomalies"]] == [TAG]
+    assert sorted(i["kind"] for i in a.attention()) == [LATE_OUTCOME, "turned_up"]
+    assert sum(r.startswith("attention item") for r in a.blocked()) == 2
+
+
+def test_an_acceptance_that_finds_its_order_declared_never_arrived_by_a_reconcile_blocks(tmp_path):
+    a, b, venue, clock = _raced(tmp_path, "accept")
+    assert a.submit_once(venue, TAG)["state"] == "accepted"
+    (item,) = a.attention()
+    assert item["kind"] == "late_acceptance" and len(a.blocked()) == 1 and TAG in a.blocked()[0]
+
+
+@pytest.mark.parametrize("mode", ["raise", "odd_result"])
+def test_an_order_that_never_arrived_without_a_race_blocks_nothing(tmp_path, mode):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, venue = ledger(path, clock), FakeVenue(mode=mode)
+    ready(a, venue)
+    intend(a)
+    assert a.submit_once(venue, TAG)["state"] == "unknown"
+    clock.t += 200
+    assert a.reconcile(venue, {})["clean"] and a.order(TAG)["state"] == "never_arrived"
+    assert a.attention(open_only=False) == [] and a.blocked() == []
+    venue.mode = "accept"
+    intend(a, tag="next")
+    assert a.submit_once(venue, "next")["state"] == "accepted"
+
+
+def test_an_unknown_order_settled_by_hand_after_its_submit_blocks_nothing():
+    led, venue = ledger(), FakeVenue(mode="raise")
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, TAG)
+    led.settle_by_hand(TAG, "Burton", "not in the app")
+    assert led.attention(open_only=False) == [] and led.blocked() == []
+
+
+def test_a_reconcile_during_the_submit_that_does_not_declare_never_arrived_opens_nothing(tmp_path):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(mode="raise")
+    ready(a, venue)
+    intend(a)
+
+    def too_early(tag):
+        clock.t += 5
+        b.reconcile(venue, {})
+
+    venue.on_submit = too_early
+    assert a.submit_once(venue, TAG)["state"] == "unknown" and a.attention(open_only=False) == []
+
+
+@pytest.mark.parametrize("mode", OUTCOMES)
+def test_an_outcome_that_finds_its_order_settled_by_the_venue_opens_nothing(tmp_path, mode):
+    path, clock = tmp_path / "orders.sqlite", Clock()
+    a, b = ledger(path, clock), ledger(path, clock)
+    venue = FakeVenue(mode=mode)
+    ready(a, venue)
+    intend(a)
+
+    def b_sees_it_filled(tag):
+        venue._take("XLE", 10.0, tag)
+        venue.set(tag, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+        b.reconcile(venue, {})
+
+    venue.on_submit = b_sees_it_filled
+    assert a.submit_once(venue, TAG)["state"] == "filled" and a.attention(open_only=False) == []
+
+
+def _listing(directory):
+    """Every name in the folder with its kind, mode, size, change time and (for a file) its bytes."""
+    out = []
+    for p in sorted(Path(directory).iterdir()):
+        st = os.lstat(p)
+        body = p.read_bytes() if stat.S_ISREG(st.st_mode) else None
+        out.append((p.name, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino, body))
+    return out
+
+
+def _filled_ledger(path):
+    led, venue = ledger(path), FakeVenue()
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, TAG)
+    led.close()
+
+
+def test_must_exist_refuses_a_missing_ledger_and_creates_nothing(tmp_path):
+    (tmp_path / "keep").write_text("x")
+    before = _listing(tmp_path)
+    for path in (tmp_path / "orders.sqlite", tmp_path / "new" / "orders.sqlite"):
+        with pytest.raises(OrderError) as err:
+            OrderLedger(path, must_exist=True)
+        assert str(path) in str(err.value) and "\n" not in str(err.value) and "no order ledger" in str(err.value)
+        assert _listing(tmp_path) == before                               # no file, no folder, no journal
+    with pytest.raises(OrderError, match="file"):
+        OrderLedger(":memory:", must_exist=True)
+
+
+def test_must_exist_opens_an_existing_ledger_and_the_default_still_creates_one(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    _filled_ledger(path)
+    led = OrderLedger(path, must_exist=True)
+    assert led.order(TAG)["state"] == "accepted"
+    led.close()
+    fresh = OrderLedger(tmp_path / "sub" / "fresh.sqlite")              # the default: today's behaviour
+    assert fresh.orders() == [] and (tmp_path / "sub" / "fresh.sqlite").exists()
+    assert stat.S_IMODE(os.stat(tmp_path / "sub" / "fresh.sqlite").st_mode) & 0o022 == 0
+    fresh.close()
+    assert OrderLedger(tmp_path / "sub" / "fresh.sqlite", must_exist=True).orders() == []
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_must_exist_must_be_true_or_false_and_is_a_keyword(tmp_path, value):
+    with pytest.raises(OrderError, match="must_exist"):
+        OrderLedger(tmp_path / "orders.sqlite", must_exist=value)
+    with pytest.raises(TypeError):
+        OrderLedger(tmp_path / "orders.sqlite", (), time.time, True)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("must_exist", [False, True])
+def test_a_ledger_path_that_is_a_symbolic_link_is_refused_in_every_mode(tmp_path, must_exist):
+    real, link, dangling = tmp_path / "real.sqlite", tmp_path / "orders.sqlite", tmp_path / "gone.sqlite"
+    _filled_ledger(real)
+    link.symlink_to(real)
+    dangling.symlink_to(tmp_path / "missing.sqlite")
+    before = _listing(tmp_path)
+    for path in (link, dangling):
+        with pytest.raises(OrderError) as err:
+            OrderLedger(path, must_exist=must_exist)
+        assert str(path) in str(err.value) and "symbolic link" in str(err.value) and "\n" not in str(err.value)
+        assert _listing(tmp_path) == before                               # the target and the folder are untouched
+
+
+@pytest.mark.parametrize("must_exist", [False, True])
+@pytest.mark.parametrize("mode", [0o664, 0o646, 0o666, 0o622])
+def test_a_ledger_file_writable_by_group_or_others_is_refused_in_every_mode(tmp_path, must_exist, mode):
+    path = tmp_path / "orders.sqlite"
+    _filled_ledger(path)
+    os.chmod(path, mode)
+    before = _listing(tmp_path)
+    with pytest.raises(OrderError) as err:
+        OrderLedger(path, must_exist=must_exist)
+    assert str(path) in str(err.value) and "writable by group or others" in str(err.value) and "\n" not in str(err.value)
+    assert _listing(tmp_path) == before
+    os.chmod(path, 0o644)
+    assert OrderLedger(path, must_exist=must_exist).order(TAG)["state"] == "accepted"
+
+
+def test_a_ledger_replaced_by_a_link_while_it_is_opened_is_refused_and_nothing_is_written(tmp_path, monkeypatch):
+    real, path = tmp_path / "real.sqlite", tmp_path / "orders.sqlite"
+    sqlite3.connect(str(real)).close()                                   # an empty database: it would become a ledger
+    _filled_ledger(path)
+    connect = OrderLedger._connect
+
+    def swap_then_connect(self):
+        os.replace(path, tmp_path / "moved.sqlite")
+        os.symlink(real, path)
+        return connect(self)
+
+    monkeypatch.setattr(OrderLedger, "_connect", swap_then_connect)
+    before = real.read_bytes()
+    with pytest.raises(OrderError, match="symbolic link"):
+        OrderLedger(path)
+    assert real.read_bytes() == before and not (tmp_path / "real.sqlite-journal").exists()
+
+
+def test_a_ledger_file_swapped_for_another_file_while_it_is_opened_is_refused(tmp_path, monkeypatch):
+    path, other = tmp_path / "orders.sqlite", tmp_path / "other.sqlite"
+    _filled_ledger(path)
+    _filled_ledger(other)
+    connect = OrderLedger._connect
+
+    def swap_then_connect(self):
+        os.replace(other, path)
+        return connect(self)
+
+    monkeypatch.setattr(OrderLedger, "_connect", swap_then_connect)
+    with pytest.raises(OrderError, match="replaced"):
+        OrderLedger(path, must_exist=True)
+
+
+def test_a_link_in_a_folder_above_the_ledger_is_followed(tmp_path):
+    (tmp_path / "real").mkdir()
+    _filled_ledger(tmp_path / "real" / "orders.sqlite")
+    (tmp_path / "linked").symlink_to(tmp_path / "real", target_is_directory=True)
+    assert OrderLedger(tmp_path / "linked" / "orders.sqlite", must_exist=True).order(TAG)["state"] == "accepted"
+
+
+def _negative_items(led):
+    return [i for i in led.attention(open_only=False) if i["kind"] == NEGATIVE_FEE]
+
+
+def test_a_negative_fee_total_is_kept_and_raises_one_notice_that_does_not_block():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=-0.35)
+    venue.held = {"XLE": 10.0}
+    clock.t += 5
+    found = led.reconcile(venue, {})
+    assert found["clean"] and [f["fee"] for f in found["fills"]] == [-0.35] and led.order(TAG)["fee"] == -0.35
+    led.mark_applied([f["id"] for f in found["fills"]])
+    (item,) = led.attention()
+    assert item["tag"] == TAG and item["kind"] == NEGATIVE_FEE and TAG in item["reason"] and "-0.35" in item["reason"]
+    assert led.blocked() == []
+    for fee in (-0.35, -0.1, -0.1):                                     # asked again (late fees): still one notice
+        venue.set(TAG, fee=fee)
+        clock.t += 60
+        assert led.reconcile(venue, {"XLE": 10.0})["clean"]
+        led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    assert led.order(TAG)["fee"] == -0.1 and len(_negative_items(led)) == 1 and led.blocked() == []
+    intend(led, tag="next")
+    assert led.submit_once(venue, "next")["state"] == "accepted"
+
+
+def test_a_negative_fee_notice_is_raised_once_per_order_even_after_a_person_closes_it():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=-0.2)
+    venue.held = {"XLE": 4.0}
+    clock.t += 5
+    led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    (item,) = led.attention()
+    led.close_attention(item["id"], "Burton", "a rebate, as the statement says")
+    venue.set(TAG, state="filled", filled_units=10.0, fee=-0.1)
+    venue.held = {"XLE": 10.0}
+    clock.t += 5
+    assert led.reconcile(venue, {"XLE": 4.0})["clean"] and led.order(TAG)["fee"] == -0.1
+    assert len(_negative_items(led)) == 1 and led.attention() == []
+    venue.mode = "accept"
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    intend(led, tag="second", units=5.0)
+    led.submit_once(venue, "second")
+    venue.set("second", state="filled", filled_units=5.0, avg_price=90.0, fee=-0.05)
+    venue.held = {"XLE": 15.0}
+    clock.t += 5
+    assert led.reconcile(venue, {"XLE": 10.0})["clean"]
+    assert sorted(i["tag"] for i in _negative_items(led)) == sorted(["second", TAG]) and led.blocked() != [] \
+        and all("attention" not in r for r in led.blocked())               # only the unapplied fill stands in the way
+
+
+@pytest.mark.parametrize("fee", [0.0, 0.35, None])
+def test_a_fee_total_of_zero_or_more_raises_no_notice(fee):
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=fee)
+    clock.t += 5
+    led.reconcile(venue, {"XLE": 0.0})
+    assert led.attention(open_only=False) == []
+
+
+def test_a_fee_total_that_falls_below_zero_is_an_anomaly_and_the_stored_total_is_kept():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.5)
+    venue.held = {"XLE": 10.0}
+    clock.t += 5
+    led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    venue.set(TAG, fee=-0.5)
+    clock.t += 5
+    found = led.reconcile(venue, {"XLE": 10.0})
+    assert not found["clean"] and "fell" in found["anomalies"][0]["reason"] and led.order(TAG)["fee"] == 0.5
+    assert led.attention(open_only=False) == []                           # nothing negative was recorded
+
+
+# ---- generated sequences: one ledger object, and the two families where the change is meant to show
+
+
+SYMBOLS = ("XLE", "XLK")
+SUBMIT_MODES = ("accept",) * 4 + ("raise", "raise_after_taking", "not_sent", "odd_result")
+ACTIONS = (("intend",) * 3 + ("submit",) * 4 + ("reconcile",) * 5 + ("venue",) * 5
+           + ("late_arrival", "status_raises", "settle_by_hand", "close_attention", "restart", "clock"))
+
+
+def _snapshot(led):
+    return {"orders": led.orders(), "events": led.events(), "fills": led.fills(),
+            "attention": led.attention(open_only=False), "blocked": led.blocked(), "last": led.last_reconcile()}
+
+
+def _sequence_trace(mod, seed, family="single", path=None):
+    """One generated sequence. `family` is single (one ledger object, fee totals never below zero), race (a second
+    object on the same file declares a submitted order never arrived while the venue call is in flight, at random) or
+    negfee (one object; fee totals may go below zero). Restarts (close and reopen) happen only on a file. Returns the
+    steps, each (action, what it returned, a snapshot of the ledger after it), and the venue's calls per tag."""
+    rng = random.Random(seed)
+    clock = Clock()
+
+    def open_ledger():
+        return mod.OrderLedger(path if path is not None else ":memory:", not_sent=(LocalRefusal,), clock=clock)
+
+    led = open_ledger()
+    other = open_ledger() if family == "race" else None
+    venue, sizes, book, steps, actual = FakeVenue(), {}, {}, [], {}   # actual: what the venue has filled, said or not
+    fee_steps = (-0.3, -0.05, 0.0, 0.02, 0.1) if family == "negfee" else (0.0, 0.01, 0.05, -0.02)
+
+    def held():
+        out = {}
+        for tag in venue.book:
+            symbol, units = sizes[tag]
+            out[symbol] = out.get(symbol, 0.0) + math.copysign(actual.get(tag, 0.0), units)
+        return out
+
+    def next_fee(st):
+        if rng.random() < 0.15:
+            return None
+        base = st["fee"] if st["fee"] is not None else 0.0
+        fee = round(base + rng.choice(fee_steps), 4)
+        return fee if family == "negfee" else max(fee, 0.0)
+
+    def apply_fills():
+        rows = led.unapplied_fills()
+        for f in rows:
+            book[f["symbol"]] = book.get(f["symbol"], 0.0) + f["units"]
+        led.mark_applied([f["id"] for f in rows])
+
+    def act(action):
+        nonlocal led
+        if action == "intend":
+            tag = f"t{len(sizes)}"
+            sizes[tag] = (rng.choice(SYMBOLS), rng.choice((-5.0, 3.0, 10.0)))
+            return led.intend(tag, sizes[tag][0], sizes[tag][1], 90.0, limit_price=rng.choice((None, 91.0)))["state"]
+        if action == "submit":
+            if not sizes:
+                return None
+            waiting = [o["tag"] for o in led.orders(("intended",))]
+            tag = rng.choice(waiting if waiting and rng.random() < 0.8 else sorted(sizes))
+            venue.mode = rng.choice(SUBMIT_MODES)
+            raced = other is not None and rng.random() < 0.5
+
+            def declare(_tag):
+                clock.t += 200
+                venue.held = held()
+                other.reconcile(venue, book)
+
+            venue.on_submit = declare if raced else None
+            before = led.order(tag)["state"]
+            try:
+                return (tag, before, raced, venue.mode, led.submit_once(venue, tag)["state"])
+            finally:
+                venue.on_submit = None
+        if action == "reconcile":
+            clock.t += rng.choice((0, 1, 30, 130, 400))
+            venue.held = held()
+            r = led.reconcile(venue, book)
+            if rng.random() < 0.8:
+                apply_fills()
+            return (r["clean"], [(u["tag"], u["to"]) for u in r["updated"]], len(r["fills"]), len(r["anomalies"]),
+                    len(r["unresolved"]))
+        if action == "venue":
+            if not venue.book:
+                return None
+            tag = rng.choice(sorted(venue.book))
+            st, size = venue.book[tag], abs(sizes[tag][1])
+            now = actual.get(tag, 0.0)
+            change = rng.choice(("partial", "fill", "cancel", "expire", "reject", "fee", "avg", "no_amount", "odd"))
+            if change == "partial":
+                got = actual[tag] = min(size, now + rng.choice((1.0, 2.0)))
+                venue.set(tag, filled_units=got, state="filled" if got >= size else "partly_filled",
+                          avg_price=rng.choice((90.0, 90.5, None)), fee=next_fee(st))
+            elif change == "fill":
+                actual[tag] = size
+                venue.set(tag, filled_units=size, state="filled", avg_price=90.0, fee=next_fee(st))
+            elif change in ("cancel", "expire"):
+                venue.set(tag, state="cancelled" if change == "cancel" else "expired", filled_units=now)
+            elif change == "reject":
+                venue.set(tag, state="rejected" if now == 0 else "cancelled", filled_units=now)
+            elif change == "fee":
+                venue.set(tag, fee=next_fee(st), filled_units=now)
+            elif change == "avg":
+                venue.set(tag, avg_price=rng.choice((89.0, 90.0, 91.0)), filled_units=now)
+            elif change == "no_amount":
+                venue.set(tag, filled_units=None)
+            else:
+                venue.set(tag, state="unknown_status", filled_units=now)
+            return (tag, change)
+        if action == "late_arrival":
+            gone = [o["tag"] for o in led.orders(("sent", "unknown", "never_arrived")) if o["tag"] not in venue.book]
+            if not gone:
+                return None
+            tag = rng.choice(gone)
+            venue._take(*sizes[tag], tag)
+            return tag
+        if action == "status_raises":
+            if not sizes:
+                return None
+            tag = rng.choice(sorted(sizes))
+            venue.status_raises ^= {tag}
+            return tag
+        if action == "settle_by_hand":
+            open_ = led.orders(("sent", "unknown"))
+            if not open_:
+                return None
+            return led.settle_by_hand(open_[0]["tag"], "tester", "checked in the app")["state"]
+        if action == "close_attention":
+            items = [i for i in led.attention() if i["kind"] in ("late_acceptance", "turned_up")]
+            if not items:
+                return None
+            return led.close_attention(items[0]["id"], "tester", "looked")["tag"]
+        if action == "restart":
+            if path is None:
+                return None
+            led.close()
+            led = open_ledger()
+            return "reopened"
+        clock.t += rng.choice((5, 200, 30000))
+        return clock.t
+
+    def possible(action):
+        states = {o["state"] for o in led.orders()}
+        return {"intend": len(sizes) < 6, "submit": "intended" in states, "venue": bool(venue.book),
+                "late_arrival": bool(states & {"sent", "unknown", "never_arrived"}), "status_raises": bool(sizes),
+                "settle_by_hand": bool(states & {"sent", "unknown"}), "restart": path is not None,
+                "close_attention": any(i["kind"] in ("late_acceptance", "turned_up") for i in led.attention()),
+                }.get(action, True)
+
+    for i in range(rng.randint(10, 30)):
+        action = "reconcile" if i == 0 else rng.choice([a for a in ACTIONS if possible(a)])   # the first lets submits go
+        try:
+            got = act(action)
+        except mod.OrdersBlocked as exc:
+            got = ("blocked", len(exc.reasons))
+        except mod.OrderError as exc:
+            got = ("error", str(exc))
+        steps.append((action, got, _snapshot(led)))
+        if family == "race":                                              # a person looks at once, so later steps compare
+            for item in led.attention():
+                if item["kind"] == LATE_OUTCOME:
+                    led.close_attention(item["id"], "tester", "looked")
+    calls = {}
+    for c in venue.calls:
+        calls[c["tag"]] = calls.get(c["tag"], 0) + 1
+    led.close()
+    if other is not None:
+        other.close()
+    return steps, calls
+
+
+def test_generated_sequences_on_one_ledger_open_no_new_kind_of_item_and_send_at_most_once(tmp_path):
+    for seed in range(300):
+        path = tmp_path / f"s{seed}.sqlite" if seed % 6 == 0 else None
+        steps, calls = _sequence_trace(orders, seed, "single", path)
+        assert all(n == 1 for n in calls.values()), (seed, calls)
+        for action, got, snap in steps:
+            assert not [i for i in snap["attention"] if i["kind"] in (LATE_OUTCOME, NEGATIVE_FEE)], (seed, action)
+            assert all(o["fee"] is None or o["fee"] >= 0 for o in snap["orders"]), (seed, action)
+
+
+def test_generated_races_open_a_late_outcome_item_exactly_when_an_outcome_finds_never_arrived(tmp_path):
+    opened = 0
+    for seed in range(100):
+        steps, calls = _sequence_trace(orders, seed, "race", tmp_path / f"r{seed}.sqlite")
+        assert all(n == 1 for n in calls.values()), (seed, calls)
+        seen = set()
+        for action, got, snap in steps:
+            items = {i["id"]: i for i in snap["attention"] if i["kind"] == LATE_OUTCOME}
+            new = [items[i] for i in sorted(set(items) - seen)]
+            seen |= set(items)
+            lost = (action == "submit" and isinstance(got, tuple) and len(got) == 5 and got[2]
+                    and got[1] == "intended" and got[3] != "accept" and got[4] == "never_arrived")
+            assert [i["tag"] for i in new] == ([got[0]] if lost else []), (seed, action, got)
+            if lost:
+                assert any(got[0] in r and "never arrived" in r for r in snap["blocked"]), (seed, snap["blocked"])
+            opened += len(new)
+    assert opened >= 10
+
+
+def test_generated_negative_fees_raise_one_notice_per_order_and_block_nothing():
+    noticed = 0
+    for seed in range(100):
+        steps, _ = _sequence_trace(orders, seed, "negfee")
+        went_negative = set()
+        for action, got, snap in steps:
+            went_negative |= {o["tag"] for o in snap["orders"] if o["fee"] is not None and o["fee"] < 0}
+            items = [i for i in snap["attention"] if i["kind"] == NEGATIVE_FEE]
+            assert sorted(i["tag"] for i in items) == sorted(went_negative), (seed, action)
+            assert all(f"attention item {i['id']} " not in r for i in items for r in snap["blocked"]), (seed, action)
+        noticed += len(went_negative)
+    assert noticed >= 5
+
+
+# ---- sent at most once, with real processes killed at generated moments
+
+
+KILL_CHILD = r'''
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("orders_under_test", sys.argv[1])
+orders = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(orders)
+path, hold = sys.argv[2], sys.argv[3]
+calls = os.path.join(os.path.dirname(path), "calls")
+
+
+def say(word):
+    sys.stdout.write(word + "\n")
+    sys.stdout.flush()
+
+
+def wait():
+    sys.stdin.readline()                     # the parent never writes: the process waits here until it is killed
+
+
+class Venue:
+    name = "file"
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        say("venue")
+        if hold == "venue":
+            wait()
+        fd = os.open(calls, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        os.write(fd, (tag + "\n").encode())
+        os.close(fd)
+        say("called")
+        if hold == "called":
+            wait()
+        return {"status": "accepted", "venue_order_id": "V"}
+
+    def order_status(self, tag):
+        return None
+
+    def positions(self):
+        return {}
+
+
+led = orders.OrderLedger(path)
+say("ready")
+if hold == "ready":
+    wait()
+led.submit_once(Venue(), "kill")
+say("done")
+wait()
+'''
+
+
+class CallsVenue:
+    """The venue after a kill: it knows an order when the child's call reached it, and records any new call."""
+    name = "file"
+
+    def __init__(self, directory):
+        self.calls = Path(directory) / "calls"
+
+    def lines(self):
+        return self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        with open(self.calls, "a") as f:
+            f.write(tag + "\n")
+        return {"status": "accepted", "venue_order_id": "V"}
+
+    def order_status(self, tag):
+        if tag not in self.lines():
+            return None
+        return {"state": "open", "filled_units": 0.0, "avg_price": None, "fee": None, "venue_order_id": "V",
+                "raw_status": "NEW"}
+
+    def positions(self):
+        return {}
+
+
+def test_a_submitting_process_killed_at_generated_moments_sends_at_most_once_and_recovers(tmp_path):
+    rng = random.Random(7)
+    holds = ["ready", "venue", "called"] * 6 + ["free"] * 24               # 42 kills
+    rng.shuffle(holds)
+    seen = {}
+    for i, hold in enumerate(holds):
+        d = tmp_path / f"k{i}"
+        path = d / "orders.sqlite"
+        led = OrderLedger(path)
+        led.reconcile(CallsVenue(d), {})
+        led.intend("kill", "XLE", 10.0, 90.0)
+        led.close()
+        child = subprocess.Popen([sys.executable, "-I", "-B", "-c", KILL_CHILD, orders.__file__, str(path), hold],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=d, text=True)
+        try:
+            assert child.stdout.readline() == "ready\n"
+            if hold in ("venue", "called"):
+                for word in ("venue", "called")[:("venue", "called").index(hold) + 1]:
+                    assert child.stdout.readline() == word + "\n"
+            elif hold == "free":
+                try:
+                    child.wait(timeout=rng.uniform(0.0, 0.03))             # a generated moment after it starts
+                except subprocess.TimeoutExpired:
+                    pass
+            child.kill()
+            child.wait(timeout=30)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=30)
+            child.stdin.close()
+            child.stdout.close()
+        venue = CallsVenue(d)
+        arrived = len(venue.lines())
+        assert arrived <= 1, (i, hold)
+        led = OrderLedger(path, clock=Clock(time.time() + 200))           # recovery: a new process, 200 s later
+        assert led.reconcile(venue, {})["clean"], (i, hold)
+        state = led.order("kill")["state"]
+        assert state == ("accepted" if arrived else state) and state in ("accepted", "intended", "never_arrived"), (i, hold)
+        chain = [(e["from"], e["to"]) for e in led.events("kill")]
+        assert all(a[1] == b[0] for a, b in zip(chain, chain[1:])) and chain[0] == (None, "intended")
+        assert led.submit_once(venue, "kill")["state"] in ("accepted", "never_arrived")
+        assert len(venue.lines()) == (1 if state in ("intended", "accepted") else 0), (i, hold, state)
+        assert led.blocked() == [] and led.attention(open_only=False) == [], (i, hold)
+        led.close()
+        seen[(hold, state)] = seen.get((hold, state), 0) + 1
+    assert seen[("ready", "intended")] == 6 and seen[("venue", "never_arrived")] == 6
+    assert seen[("called", "accepted")] == 6 and sum(n for (h, _), n in seen.items() if h == "free") == 24
