@@ -4,9 +4,10 @@
 # environment, anything outside 09:35 to 15:45 New York, and holidays. The second run of a day journals the
 # first run's fills and sends only what is still missing.
 #
-# It runs from the main tree, and only when every existing file of the package is byte-for-byte the accepted
-# revision named in accepted-orderpath-commit (the pick-grading module aside, which is not on the order path);
-# otherwise the day's run is skipped and says so. Prints a short summary, never an id or a key.
+# It runs from the main tree, and only when every file the order step uses (the list in accepted-orderpath-files:
+# what the command imports, at import time and inside its functions; made by the lead, 2026-11-13) is
+# byte-for-byte the accepted revision named in accepted-orderpath-commit; otherwise the day's run is skipped and
+# says so. Work on modules outside that list no longer stops it. Prints a short summary, never an id or a key.
 set -u
 R=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader
 DD=/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-deploy
@@ -15,8 +16,12 @@ stamp() { date -u "+%Y-%m-%dT%H:%M:%SZ"; }
 
 if [ ! -x "$PY" ]; then echo "$(stamp) not ready (the SSD is not mounted): nothing was run"; exit 0; fi
 ACC=$(cat "$DD/accepted-orderpath-commit" 2>/dev/null)
-if [ -z "$ACC" ] || ! git -C "$R" diff --quiet --diff-filter=MDRT "$ACC" -- valedia_trader ':(exclude)valedia_trader/research_loop/pick_grading.py' 2>/dev/null; then
-  echo "$(stamp) skipped: the tree's order path is not the accepted revision (${ACC:-none named})"; exit 0
+FILES=(${(f)"$(cat "$DD/accepted-orderpath-files" 2>/dev/null)"})
+if [ -z "$ACC" ] || [ ${#FILES} -lt 10 ]; then
+  echo "$(stamp) skipped: no accepted revision or no list of the order path's files"; exit 0
+fi
+if ! git -C "$R" diff --quiet "$ACC" -- $FILES 2>/dev/null; then
+  echo "$(stamp) skipped: the tree's order path is not the accepted revision (${ACC})"; exit 0
 fi
 cd "$R" || exit 0
 export PYTHONDONTWRITEBYTECODE=1
