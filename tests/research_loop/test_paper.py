@@ -1137,7 +1137,9 @@ def test_a_held_fund_with_no_earlier_price_in_the_data_is_valued_at_its_cost(set
     blank["BBB"] = np.nan                                           # a frame that has no price for BBB at all
     later = t.step(blank, {7: long_only("two", market=("AAA", "BBB"))})
     aaa = t.state["positions"]["two"]["AAA"]
-    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * lot["cost"])
+    # rev 5 (outcome 1): not its cost but the last valid close the book itself valued it at (bar 34)
+    seen = float(px["BBB"].iloc[DAY0 + 4])
+    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * seen)
     _adds_up(out + [later])
     assert later["stale_prices"] == {"BBB": DAY0 + 6}                # every bar of the frame given lacks it
 
@@ -1174,7 +1176,15 @@ def _plain_history(seed, directory, limits):
         summaries.append(t.step(px.iloc[: i + 1], {h: s for h, (join, s) in strategies.items() if join <= i}))
     files = sorted(p for p in directory.iterdir() if p.is_file() and p.name != "paper_state.lock")   # rev 4: the lock, empty
     assert not (directory / "paper_state.lock").exists() or (directory / "paper_state.lock").read_bytes() == b""
-    return [(p.name, p.read_bytes()) for p in files], json.dumps(summaries).encode()
+    out = [(p.name, p.read_bytes()) for p in files]
+    for k, (name, body) in enumerate(out):                         # rev 5: the remembered closes, today's for every fund
+        if name == "paper_state.json":                             # held, are the one key the base does not write
+            state = json.loads(body)
+            held = sorted({sym for book in state["positions"].values() for sym, lot in book.items() if lot["units"]})
+            assert state.pop("last_valid_prices", {}) == {sym: {"price": float(px[sym].iloc[-1]), "day": str(px.index[-1].date())}
+                                                          for sym in held}
+            out[k] = (name, json.dumps(state, indent=1, default=str).encode())
+    return out, json.dumps(summaries).encode()
 
 
 # sha-256 of 200 gap-free histories as the base (7837ac4) writes them: every journal file and state file byte for byte,
@@ -1459,7 +1469,8 @@ def test_a_text_column_does_not_stop_the_night_and_is_named(setup, monkeypatch):
     lot = t.state["positions"]["two"]["BBB"]
     assert out[-1]["unreadable_prices"] == ["BBB"] and out[-1]["stale_prices"] == {"BBB": DAY0 + 5}
     aaa = t.state["positions"]["two"]["AAA"]
-    assert out[-1]["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * 80.0 + lot["units"] * lot["cost"])
+    seen = float(px["BBB"].iloc[DAY0 + 3])                             # rev 5 (outcome 1): the close the book last valued it at
+    assert out[-1]["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * 80.0 + lot["units"] * seen)
     assert "unreadable_prices" not in out[2]
     _adds_up(out)
 
@@ -1472,7 +1483,8 @@ def test_a_fund_with_no_column_is_counted_as_carried_on_every_row(setup, monkeyp
     assert later["stale_prices"] == {"BBB": DAY0 + 6}
     lot = t.state["positions"]["two"]["BBB"]
     aaa = t.state["positions"]["two"]["AAA"]
-    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * lot["cost"])
+    seen = float(px["BBB"].iloc[DAY0 + 4])                             # rev 5 (outcome 1): the close the book last valued it at
+    assert later["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 5]) + lot["units"] * seen)
     _adds_up(out + [later])
 
 
@@ -1659,7 +1671,8 @@ def _not_numbers(kind, n):
                                   "categories", "all NaN", "all missing"])
 def test_a_column_that_is_not_numbers_is_never_a_price_and_is_named(setup, monkeypatch, kind):
     """Outcome 1: a held fund whose column is booleans, dates, text, other objects, or holds no value at all: no price on
-    any day, named in `unreadable_prices`, valued at its cost (this frame has no valid price of it), never traded."""
+    any day, named in `unreadable_prices`, valued at the last close the book valued it at (rev 5; rev 4 said its cost, as
+    this frame has no valid price of it), never traded."""
     t, s, out, px = _held_two(setup[0], setup[1], monkeypatch)
     frame = px.iloc[: DAY0 + 5].copy()
     frame["BBB"] = _not_numbers(kind, len(frame))
@@ -1667,7 +1680,8 @@ def test_a_column_that_is_not_numbers_is_never_a_price_and_is_named(setup, monke
     day = t.step(frame, {7: s})
     assert day["unreadable_prices"] == ["BBB"] and day["stale_prices"] == {"BBB": DAY0 + 5}
     aaa = t.state["positions"]["two"]["AAA"]
-    assert day["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 4]) + lot["units"] * lot["cost"])
+    seen = float(px["BBB"].iloc[DAY0 + 2])                             # rev 5 (outcome 1): the close the book last valued it at
+    assert day["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 4]) + lot["units"] * seen)
     assert t.state["positions"]["two"]["BBB"] == lot
     assert not [e for e in t.journal.read(since=frame.index[-1]) if e.get("symbol") == "BBB"]          # no decision, no fill
     assert not [o for o in t.state["pending"] if o["symbol"] == "BBB"]
@@ -2006,3 +2020,188 @@ def test_a_trader_built_before_another_run_saved_a_day_reads_the_book_again_unde
     assert early.step(px.iloc[:16], {7: s})["day"] == str(px.index[15].date())     # and carries on from the saved book
     days = [e["day"] for e in pp.Journal(setup[0]).read() if e["type"] == "summary"]
     assert len(days) == len(set(days)) == 5
+
+
+# ---- T29 rev 5: a held fund is valued at the last valid close the BOOK has seen; an unopenable latch counts as set;
+# a reader never crashes on a lock it cannot make; the tax ledger is rebuilt after an outbox is finished
+
+def _rising_book(directory, monkeypatch, limit=10.0):
+    """The check's case: AAA flat at 100; BBB 50 until bar 31, 80 from bar 32. `two` buys 30% of each on bar 30 (filled
+    on bar 31 at 50) and holds; four nights run (bars 30 to 33). BBB is then worth far more than its cost, and valuing it
+    at its cost would be a drawdown past the 10% limit."""
+    px = scripted_market()
+    px["AAA"] = 100.0
+    px["BBB"] = np.where(np.arange(len(px)) < DAY0 + 2, 50.0, 80.0)
+    limits = directory.parent / f"{directory.name}-limits.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": limit, "max_position_pct": 0.6, "max_open_positions": 5}))
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t = pp.PaperTrader(directory, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    s = long_only("two", market=("AAA", "BBB"))
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(4)]
+    assert t.state["positions"]["two"]["BBB"]["cost"] == pytest.approx(50.0) and out[-1]["equity"] > 117_000.0
+    return t, s, out, px, limits
+
+
+def _bad_column(frame, kind):
+    frame = frame.copy()
+    if kind == "booleans":
+        frame["BBB"] = np.array([True, False] * len(frame))[: len(frame)]
+    elif kind == "one stray True":
+        col = frame["BBB"].astype(object)
+        col.iloc[5] = True
+        frame["BBB"] = col
+    elif kind == "all NaN":
+        frame["BBB"] = np.nan
+    elif kind == "column absent":
+        frame = frame.drop(columns=["BBB"])
+    else:
+        frame["BBB"] = "n/a"
+    return frame
+
+
+@pytest.mark.parametrize("kind", ["booleans", "one stray True", "all NaN", "column absent", "text"])
+def test_a_bad_data_night_values_a_held_fund_at_the_last_close_the_book_saw_and_trips_nothing(tmp_path, monkeypatch, kind):
+    """Outcome 1, the check's case: the held fund's column cannot be read, so the frame holds no valid price of it. It
+    is valued at the last valid close the book valued it at: the equity is that of the same night with yesterday's close
+    repeated, there is no false drawdown and no latch, the fund is named and not traded."""
+    t, s, out, px, _ = _rising_book(tmp_path / "bad", monkeypatch)
+    u, _, _, _, _ = _rising_book(tmp_path / "twin", monkeypatch)
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3}] * len(px)}))   # BBB is wanted out
+    frame = px.iloc[: DAY0 + 5].copy()
+    twin = frame.copy()
+    twin.iloc[-1, twin.columns.get_loc("BBB")] = twin["BBB"].iloc[-2]                          # yesterday's close repeated
+    lot = dict(t.state["positions"]["two"]["BBB"])
+    bad, good = t.step(_bad_column(frame, kind), {7: s}), u.step(twin, {7: s})
+    assert bad["equity"] == pytest.approx(good["equity"], rel=1e-12) and bad["drawdown_pct"] == pytest.approx(good["drawdown_pct"])
+    assert bad["strategy_values"] == pytest.approx(good["strategy_values"]) and bad["drawdown_pct"] < 1.0
+    assert not rg.file_is_there(t.latch_file) and not [e for e in t.journal.read() if e["type"] == "kill_switch"]
+    assert bad["stale_prices"] == {"BBB": DAY0 + 5} and bad.get("unreadable_prices") == (None if kind == "column absent" else ["BBB"])
+    assert t.state["positions"]["two"]["BBB"] == lot and not [o for o in t.state["pending"] if o["symbol"] == "BBB"]
+    assert not [e for e in t.journal.read(since=frame.index[-1]) if e.get("symbol") == "BBB"]
+    assert t.state["last_valid_prices"]["BBB"] == {"price": 80.0, "day": str(px.index[DAY0 + 3].date())}
+    _adds_up(out + [bad])
+
+
+def test_the_remembered_price_follows_every_good_night_and_never_replaces_a_valid_close(tmp_path, monkeypatch):
+    """Outcome 1: each night with a valid close moves the remembered price to it; a valid close today is the mark; the
+    next bad night uses the latest good close."""
+    t, s, out, px, _ = _rising_book(tmp_path / "book", monkeypatch)
+    px.iloc[DAY0 + 4, px.columns.get_loc("BBB")] = 81.0
+    px.iloc[DAY0 + 5, px.columns.get_loc("BBB")] = 82.0
+    for i in (4, 5):
+        day = t.step(px.iloc[: DAY0 + i + 1], {7: s})
+        aaa, bbb = t.state["positions"]["two"]["AAA"], t.state["positions"]["two"]["BBB"]
+        assert day["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * 100.0 + bbb["units"] * float(px["BBB"].iloc[DAY0 + i]))
+        assert t.state["last_valid_prices"]["BBB"] == {"price": float(px["BBB"].iloc[DAY0 + i]), "day": str(px.index[DAY0 + i].date())}
+        out.append(day)
+    px.iloc[DAY0 + 6, px.columns.get_loc("AAA")] = 101.0                # AAA's close today is valid: it is AAA's mark
+    bad = t.step(_bad_column(px.iloc[: DAY0 + 7], "text"), {7: s})
+    assert bad["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * 101.0 + bbb["units"] * 82.0)
+    assert t.state["last_valid_prices"]["AAA"] == {"price": 101.0, "day": str(px.index[DAY0 + 6].date())}
+    assert set(t.state["last_valid_prices"]) == {"AAA", "BBB"}                         # the funds held, nothing else
+    _adds_up(out + [bad])
+
+
+def _without_remembered_prices(t):
+    state = json.loads(t.state_file.read_text())
+    state.pop("last_valid_prices", None)                                # as the accepted revision and rev 4 save it
+    t.state_file.write_text(json.dumps(state, indent=1))
+
+
+def test_a_book_saved_without_remembered_prices_takes_them_from_the_frame_on_its_first_night(tmp_path, monkeypatch):
+    """Outcome 1: a state from rev 4 or the accepted revision has no remembered prices; the first night takes each held
+    fund's from the frame's last valid close (what rev 4 values it at), and the nights after use them."""
+    t, s, out, px, limits = _rising_book(tmp_path / "old", monkeypatch)
+    _without_remembered_prices(t)
+    again = pp.PaperTrader(t.dir, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    gap = px.iloc[: DAY0 + 5].copy()
+    gap.iloc[-1, gap.columns.get_loc("BBB")] = np.nan                    # today's close missing: rev 4 carries bar 33's
+    first = again.step(gap, {7: s})
+    bbb = again.state["positions"]["two"]["BBB"]
+    assert first["equity"] == pytest.approx(out[-1]["equity"]) and first["stale_prices"] == {"BBB": 1}
+    assert again.state["last_valid_prices"]["BBB"] == {"price": 80.0, "day": str(px.index[DAY0 + 3].date())}
+    bad = again.step(_bad_column(px.iloc[: DAY0 + 6], "booleans"), {7: s})
+    assert bad["equity"] == pytest.approx(again.state["cash"] + again.state["positions"]["two"]["AAA"]["units"] * 100.0 + bbb["units"] * 80.0)
+    assert not rg.file_is_there(again.latch_file)
+
+
+def test_cost_only_for_a_fund_the_book_has_no_valid_close_of(tmp_path, monkeypatch):
+    """Outcome 1: a book saved without remembered prices and a frame with no valid close of a held fund: only then its
+    cost, and nothing is remembered for it."""
+    t, s, out, px, limits = _rising_book(tmp_path / "old", monkeypatch, limit=50.0)
+    _without_remembered_prices(t)
+    again = pp.PaperTrader(t.dir, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    day = again.step(_bad_column(px.iloc[: DAY0 + 5], "all NaN"), {7: s})
+    bbb = again.state["positions"]["two"]["BBB"]
+    assert day["equity"] == pytest.approx(again.state["cash"] + again.state["positions"]["two"]["AAA"]["units"] * 100.0 + bbb["units"] * 50.0)
+    assert "BBB" not in again.state["last_valid_prices"] and again.state["last_valid_prices"]["AAA"]["price"] == 100.0
+
+
+def test_a_latch_file_that_cannot_be_opened_counts_as_tripped_and_is_journaled(setup):
+    """Outcome 2: a latch file that cannot even be opened (mode 000) is journaled as the latch, like one that opens but
+    cannot be read; it is never replaced."""
+    import os
+    if os.geteuid() == 0:
+        pytest.skip("root opens a file of mode 000")
+    crash, t, s = _latch_setup(setup)
+    t.latch_file.write_text('{"tripped_on": "2026-01-02"}')
+    t.latch_file.chmod(0)
+    try:
+        t.step(crash.iloc[:15], {7: s})
+    finally:
+        t.latch_file.chmod(0o600)
+    assert _latched(setup[0]) == [str(crash.index[14].date())]
+    assert t.latch_file.read_text() == '{"tripped_on": "2026-01-02"}'
+    after = [e for e in t.journal.read(since=crash.index[14]) if e["type"] == "decision" and "order" in e]
+    assert all(e["decision"] == "blocked" for e in after if not e["order"]["reduces_risk"])
+
+
+@pytest.mark.parametrize("how", ["read-only folder, no lock file", "lock file of mode 000"])
+def test_a_reader_reads_a_book_whose_lock_cannot_be_made_and_a_writer_still_refuses(setup, monkeypatch, how):
+    """Outcome 3: with an outbox waiting and a lock file that cannot be created or opened, building a PaperTrader (as the
+    order step does) reads the state, leaves the outbox and writes nothing; a day run on it refuses, naming the lock."""
+    import os
+    from valedia_trader.execution_and_risk.order_step import paper_targets
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the permissions this test sets")
+    px, s, state = _with_outbox(setup, monkeypatch)
+    lock = setup[0] / "paper_state.lock"
+    files = lambda: {p.name: p.read_bytes() for p in setup[0].iterdir() if p.is_file() and p.name != "paper_state.lock"}
+    before = files()
+    if how.startswith("read-only"):
+        lock.unlink()
+        setup[0].chmod(0o500)
+    else:
+        lock.chmod(0)
+    try:
+        reader = pp.PaperTrader(setup[0], setup[1], halt_file=None)
+        assert paper_targets(reader).day == state["last_day"] and "journal_outbox" in reader.state
+        with pytest.raises(pp.PaperBookBusy, match="paper_state.lock"):
+            reader.step(px.iloc[:16], {7: s})
+    finally:
+        setup[0].chmod(0o700)
+        if lock.exists():
+            lock.chmod(0o644)
+    assert files() == before and (how.startswith("lock") or not lock.exists())
+
+
+def test_a_start_that_finishes_an_outbox_rebuilds_the_tax_ledger_before_the_nights_sale(setup, tmp_path, scripted, monkeypatch):
+    """Outcome 4: a kill after the state save leaves the buy's fill in the outbox; the next start appends it and must
+    rebuild the tax ledger from it: the trim it decides that night carries the same tax note as a run without the kill."""
+    px, s = scripted, long_only()
+    ref = no_costs(setup, tmp_path / "reference", tax_rules=RULES)
+    for k in range(3):
+        ref.step(px.iloc[: DAY0 + k + 1], {7: s})
+    t = no_costs(setup, tax_rules=RULES)
+    t.step(px.iloc[: DAY0 + 1], {7: s})
+    monkeypatch.setattr(t, "_flush_outbox", lambda: None)              # the kill: after the save, before the appends
+    t.step(px.iloc[: DAY0 + 2], {7: s})
+    assert not [e for e in pp.Journal(setup[0]).read() if e["type"] == "fill"]
+    again = no_costs(setup, tax_rules=RULES)                          # this start finishes the outbox
+    again.step(px.iloc[: DAY0 + 3], {7: s})                           # and trims at a loss the same night
+    trim = str(px.index[DAY0 + 2].date())
+
+    def notes(directory):
+        return [e["tax"] for e in pp.Journal(directory).read() if e["type"] == "decision" and "order" in e and e["day"] == trim]
+    assert notes(setup[0]) == notes(tmp_path / "reference") and notes(setup[0])[0]["side"] == "sell"
+    assert notes(setup[0])[0]["gain_loss"] == {"short_term": pytest.approx(-4375.0), "long_term": pytest.approx(0.0)}

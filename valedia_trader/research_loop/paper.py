@@ -19,13 +19,17 @@ every note says it is unavailable and why; trading carries on exactly as with ta
 One night at a time on one book: a run that writes the book (`step`, `reset_latch`) first takes an operating-system
 lock on `paper_state.lock` beside the state file (`fcntl.flock`, released with the process however it ends). A second
 run that finds it held writes nothing and raises `PaperBookBusy`, naming the lock. A program that only reads the book
-(the order step, the owner page, the decay monitor) never takes it and never waits for it.
+(the order step, the owner page, the decay monitor) never takes it and never waits for it; one on a folder where the
+lock cannot be made or opened reads the book, leaves any outbox for a run that can take the lock and writes nothing,
+while a run that writes the book there still raises.
 
 Rolling the code back: a day's journal entries are saved in the state (`journal_outbox`) before they are appended, and
 a revision without the outbox does not know to append them. Before rolling the code back to such a revision, start this
 revision once on the book (building a `PaperTrader` on it is enough, when no other run holds the lock): its start
 appends any entries a killed run left in the outbox and removes it. Otherwise the older code runs on with that day's
 fills, decisions and summary missing from the journal, and its tax notes, read from the journal's fills, are wrong.
+The state's `last_valid_prices` (the last valid close the book valued each held fund at) is ignored by an older
+revision, and filled from the price history on the first night of this one when it is missing.
 """
 from __future__ import annotations
 
@@ -409,7 +413,10 @@ class PaperTrader:
         self._tax_today, self._tax_fill_day = [], None        # in memory only: the orders placed so far this step
         self._load()
         if "journal_outbox" in self.state:                   # a day saved by a run killed while appending its entries:
-            fd = self._try_lock()                            # finished only under the lock, and never waited for
+            try:                                             # finished only under the lock, and never waited for
+                fd = self._try_lock()
+            except _LockCannotOpen:                          # a reader on a folder it cannot write: it reads, and leaves
+                fd = None                                    # the outbox to a run that can take the lock
             if fd is not None:
                 try:
                     self._catch_up()
@@ -492,7 +499,7 @@ class PaperTrader:
     @staticmethod
     def _mark(sym: str, lot: dict, row: pd.Series, carried: dict[str, float] | None) -> float:
         """The price a held lot is valued at: today's when it is a price (finite, PRICE_MIN to PRICE_MAX; `step` has already
-        removed a suspect jump), else the last price before today (`carried`), else the lot's cost. A held position is
+        removed a suspect jump), else the last valid close the book has seen (`carried`, from `_carried_marks`), else the lot's cost. A held position is
         never valued at nothing."""
         px = float(row.get(sym, np.nan))
         if _is_price(px):
@@ -501,20 +508,47 @@ class PaperTrader:
             return carried[sym]
         return float(lot["cost"])
 
-    def _carried_prices(self, prices: pd.DataFrame) -> dict[str, float]:
-        """For each fund the book holds that has no price today: the last price before today in `prices` (left out when
-        there is none: the lot is then valued at its cost)."""
+    def _carried_marks(self, prices: pd.DataFrame) -> dict[str, tuple[float, str]]:
+        """For each fund the book holds that has no valid price today: the price it is valued at and that close's day.
+        That is the later of two closes: the fund's last valid close before today in `prices`, and the last valid close
+        the book itself valued it at (`last_valid_prices` in the state). In a book run every night the two are the same
+        close; the frame's is later only when the book did not run on that day, the book's own is the only one when the
+        frame holds no valid price of the fund (its column unreadable, all missing or absent). Left out when there is
+        neither: the lot is then valued at its cost."""
         row, out = prices.iloc[-1], {}
+        seen = self.state.get("last_valid_prices") or {}
         for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
             if _is_price(float(row.get(sym, np.nan))):
                 continue
+            best = None
+            mark = seen.get(sym)
+            if (isinstance(mark, dict) and isinstance(mark.get("day"), str) and isinstance(mark.get("price"), (int, float))
+                    and not isinstance(mark.get("price"), bool) and _is_price(float(mark["price"]))):
+                best = (float(mark["price"]), mark["day"])
             if sym in prices.columns:
                 earlier = prices[sym].iloc[:-1].to_numpy(dtype=float)
                 with np.errstate(invalid="ignore"):
-                    earlier = earlier[np.isfinite(earlier) & (earlier >= PRICE_MIN) & (earlier <= PRICE_MAX)]
-                if earlier.size:
-                    out[sym] = float(earlier[-1])
+                    good = np.flatnonzero(np.isfinite(earlier) & (earlier >= PRICE_MIN) & (earlier <= PRICE_MAX))
+                if good.size:
+                    on = str(prices.index[good[-1]].date())
+                    if best is None or on >= best[1]:
+                        best = (float(earlier[good[-1]]), on)
+            if best is not None:
+                out[sym] = best
         return out
+
+    def _remember_prices(self, row: pd.Series, day, marks: dict[str, tuple[float, str]]) -> None:
+        """Keep, for every fund the book holds, the last valid close it was valued at and that close's day: today's when
+        it is valid, else the carried one (`_carried_marks`); a fund valued at its cost has none."""
+        memo = {}
+        for sym in sorted({sym for book in self.state["positions"].values() for sym, lot in book.items() if lot["units"]}):
+            px = float(row.get(sym, np.nan))
+            if _is_price(px):
+                memo[sym] = {"price": px, "day": str(pd.Timestamp(day).date())}
+            elif sym in marks:
+                memo[sym] = {"price": marks[sym][0], "day": marks[sym][1]}
+        if memo or "last_valid_prices" in self.state:
+            self.state["last_valid_prices"] = memo
 
     def _stale_funds(self, prices: pd.DataFrame) -> dict[str, int]:
         """The funds the book holds that have no price on the last row of `prices`, by name, each with the number of
@@ -705,9 +739,13 @@ class PaperTrader:
         missing prices. "The close of the row before" is the fund's last priced close: its last in-range close before
         this one, however many rows without one lie between. Every close that is not valid is read as missing
         everywhere the day reads prices: valuation, the benchmark, fills, decisions, the strategies' rules, the market conditions and the panel. A fund with no price today is not
-        traded: its pending orders wait and no new order is decided for it. If the book holds it, it is valued at its
-        last valid price before today in `prices` in the equity, the strategy values, the capital per strategy and the
-        benchmarks alike. The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
+        traded: its pending orders wait and no new order is decided for it. If the book holds it, it is valued at the
+        last valid close the book has seen of it (`_carried_marks`: the later of its last valid close before today in
+        `prices` and the one kept in the state's `last_valid_prices`) in the equity, the strategy values and the capital
+        per strategy alike, so a night whose data for a held fund is bad cannot by itself move the equity or trip the
+        latch; the benchmarks read `prices` alone. The state's `last_valid_prices` keeps, for every fund the book holds,
+        the valid close it was last valued at and that close's day; a state saved without it (an earlier revision) is
+        filled on its first night from `prices`. Cost is used only for a fund with no valid close the book has seen. The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
         included, it has had no valid price in `prices`; `suspect_prices` maps each fund whose close today is suspect to
         the close seen; `unreadable_prices` names the columns no price can be read from: those that are not numbers, and
         those with no value at all (missing on every row given). Each is present only when not empty, and all are derived from `prices`: nothing about them is kept in the state file. No number that is not finite is
@@ -722,8 +760,9 @@ class PaperTrader:
         start appends where they are missing: a day run again never books a fill, a tax lot or a result twice, and never
         writes a second summary. An ordinary day writes the same journal lines and the same final state as before.
 
-        Not handled: a run given a price history that starts after a fund was bought, or that lacks the fund's column,
-        values the position at its cost (and counts every row of the history given as carried); a strategy whose every
+        Not handled: a fund bought by a book with no valid close of it since (in the state or in `prices`) is valued
+        at its cost; a run given a price history that lacks the fund's column counts every row of the history given as
+        carried; a strategy whose every
         fund is missing from `prices` makes the rules raise, as before; a kill before the day's state is saved does not
         undo what reached the outside (the venue mirror's orders, the panel's settlements), which a rerun repeats."""
         fd = self._locked()
@@ -743,7 +782,8 @@ class PaperTrader:
         self._fill_pending(day, row)
         self._settle_panel(prices)
         stale = self._stale_funds(prices)
-        carried = self._carried_prices(prices) if stale else None
+        marks = self._carried_marks(prices) if stale else {}
+        carried = {sym: px for sym, (px, _) in marks.items()} if stale else None
         equity = self.equity(row, carried)
         self.state["peak_equity"] = max(self.state["peak_equity"], equity)
         account = {"equity": equity, "daily_loss_pct": max(0.0, (previous - equity) / previous * 100.0),
@@ -851,6 +891,7 @@ class PaperTrader:
             summary["skipped_journal_lines"] = len(self.journal.skipped_lines)
         summary = _finite_only(summary)
         self.state["history"].append(summary)
+        self._remember_prices(row, day, marks)
         self.state["last_day"] = str(day.date())
         self._note(day, {"type": "summary", **summary})
         lines, self._outbox = self._outbox, []
@@ -884,12 +925,17 @@ class PaperTrader:
         self._save()
 
     def _latch_day(self) -> str | None:
-        """The day the latch file says it was tripped on; "" for a file that cannot be read or holds no day; None when
-        there is no file (nothing, a link, which is never followed, or a directory)."""
+        """The day the latch file says it was tripped on; "" for a file that cannot be opened, cannot be read or holds no
+        day; None when there is no file (nothing, a link, which is never followed, or a directory)."""
         try:
             fd = os.open(self.latch_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError:                                           # a link (never followed), or a file it cannot open
+            try:
+                return "" if stat.S_ISREG(os.lstat(self.latch_file).st_mode) else None
+            except OSError:
+                return None
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None

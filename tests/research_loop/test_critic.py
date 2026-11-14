@@ -375,3 +375,25 @@ def test_a_damaged_suspect_price_field_is_named_as_the_suspect_price_field(desk)
     out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
     assert any("2 paper days whose suspect-price field could not be read" in f for f in out["findings"])
     assert any("2 paper days whose carried-price field could not be read" in f for f in out["findings"])
+
+
+# ---- T29 rev 5: the weekly review names bad-data days by fund
+
+def test_the_review_names_every_bad_data_day_of_the_week_by_fund(desk):
+    ledger, journal, limits, hid = desk
+    days = pd.bdate_range("2026-11-02", periods=6)
+    marks = {1: {"stale_prices": {"SPY": 2}}, 2: {"suspect_prices": {"QQQ": 612.5}, "stale_prices": {"QQQ": 1}},
+             4: {"unreadable_prices": ["XLE", "XLF"], "stale_prices": {"XLE": 31}}}
+    for k, d in enumerate(days):
+        journal.write(d, {"type": "summary", "strategy_value_change": {"mom": 50.0}, "capital_per_strategy": 50_000.0, **marks.get(k, {})})
+    journal.write(days[0] - pd.Timedelta(days=7), {"type": "summary", "strategy_value_change": {"mom": 50.0},
+                                                   "capital_per_strategy": 50_000.0, "unreadable_prices": ["OLD"]})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    named = [f for f in out["findings"] if f.startswith("Price data")]
+    assert [f.split(":")[0] for f in named] == [f"Price data on {days[k].date()}" for k in (1, 2, 4)]
+    assert "SPY" in named[0] and "carried" in named[0]
+    assert "QQQ" in named[1] and "suspect" in named[1] and "612.5" in named[1]
+    assert "XLE" in named[2] and "XLF" in named[2] and "unreadable" in named[2]
+    assert not any("OLD" in f for f in out["findings"])                  # a day before the week is not listed
+    body = open(out["path"]).read()
+    assert all(f in body for f in named)                                 # in the review a person reads

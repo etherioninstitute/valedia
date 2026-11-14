@@ -122,6 +122,34 @@ def carried_days(entries: list[dict], name: str) -> tuple[list[bool], list[str]]
     return marks, sorted(funds)
 
 
+def bad_price_days(entries: list[dict]) -> list[str]:
+    """One line for each day summary in `entries` (in order) that names a fund whose price could not be read, was set
+    aside as suspect or was carried, by fund: "Price data on DAY: FUND unreadable, suspect (close 612.50), carried (2
+    days); ...". A field that cannot be read is left out here (the strategy notes count those days)."""
+    out = []
+    for e in entries:
+        if e.get("type") != "summary":
+            continue
+        what: dict[str, list[str]] = {}
+        names = e.get("unreadable_prices")
+        if isinstance(names, list) and all(isinstance(x, str) for x in names):
+            for sym in names:
+                what.setdefault(sym, []).append("unreadable")
+        suspect, stale = e.get("suspect_prices"), e.get("stale_prices")
+        for sym in sorted(_price_field(e, "suspect_prices") or set()):
+            v = suspect.get(sym) if isinstance(suspect, dict) else None
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            what.setdefault(sym, []).append(f"suspect (close {float(v):.2f})" if ok else "suspect")
+        for sym in sorted(_price_field(e, "stale_prices") or set()):
+            v = stale.get(sym) if isinstance(stale, dict) else None
+            ok = isinstance(v, int) and not isinstance(v, bool) and v > 0
+            what.setdefault(sym, []).append(f"carried ({v} day{'s' if v != 1 else ''})" if ok else "carried")
+        if what:
+            out.append(f"Price data on {e.get('day')}: " + "; ".join(f"{sym} {', '.join(what[sym])}" for sym in sorted(what))
+                       + ". None of these funds was traded that day.")
+    return out
+
+
 def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies: dict[int, str], limits_file: str | Path,
                   days: int = 7, rules: CriticRules | None = None, apply: bool = True,
                   narrator: Callable[[str], str] | None = None) -> dict:
@@ -165,6 +193,10 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
     for e in week:
         if e["type"] == "kill_switch":
             findings.append((None, f"Kill switch {e['decision']} on {e['day']}: {e['reasoning']}"))
+
+    # ---- the days whose price data was bad, by fund
+    for text in bad_price_days(week):
+        findings.append((None, text))
 
     # ---- the decision panel against what happened
     card = panel_scorecard(everything)
