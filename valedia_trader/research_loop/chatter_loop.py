@@ -83,7 +83,8 @@ DEFAULT_DB = REPO / "memory" / "chatter.sqlite"
 
 # ------------------------------------------------------------------------------------------------ what it asks
 SUBREDDIT = "sportsbook"
-USER_AGENT = "valedia-trader-chatter-collector/1.0"      # a plain fixed string naming the program: nothing personal
+USER_AGENT = "comment-and-price-collector/1.0"   # what the program does, nothing else: no name of a person, project,
+#                                                  business, site, account or address, no system or Python version
 PUBLIC_HOST = "www.reddit.com"
 OAUTH_HOST = "oauth.reddit.com"
 PUBLIC_URL = "https://%s/r/%s/comments/.rss?limit=100" % (PUBLIC_HOST, SUBREDDIT)
@@ -1092,11 +1093,10 @@ def _more_waiting(fp, sock) -> bool:
         return False
 
 
-def _read_stated(fp, sock, status: int, hd: dict, length: int, left: Callable[[], float]) -> Response:
-    """The body of an answer that states its length (at most MAX_BODY): exactly `length` bytes from the connection,
-    then a look, without waiting, at whether more came. Shorter (the connection ended first) or longer is `bad`; the
-    status and headers are kept either way."""
-    body = bytearray()
+def _read_stated(fp, sock, status: int, hd: dict, length: int, left: Callable[[], float], body: bytearray) -> Response:
+    """The body of an answer that states its length (at most MAX_BODY): exactly `length` bytes from the connection
+    (into `body`), then a look, without waiting, at whether more came. Shorter (the connection ended first) or longer
+    is `bad`; the status and headers are kept either way."""
     while len(body) < length:
         sock.settimeout(left())
         chunk = fp.read1(min(65536, length - len(body)))
@@ -1116,7 +1116,10 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
     kept; a longer answer, or one whose Content-Length states more, comes back `truncated`. Once the status line and
     headers are read they are never lost: a body shorter or longer than its Content-Length, one cut off, or a
     Content-Length that is not one plain number comes back with its status and headers and `bad` saying so (the
-    caller acts on the status first). TLS trusts one bundle only."""
+    caller acts on the status first). A body that does not finish (the deadline passing while it is read, a reset or
+    any other error) still raises, as before, and the error then carries `answer`: a Response with the status, the
+    headers, the bytes read and `bad` saying so, for the caller to act on. An error before the status line and headers
+    were read carries none. TLS trusts one bundle only."""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("not an http address")
@@ -1125,6 +1128,7 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
     target = (u.path or "/") + ("?" + u.query if u.query else "")
     end = time.monotonic() + max(0.0, timeout)
     abort = _Abort()
+    read: dict = {}                                       # the status and headers once read, and the body so far
 
     def left() -> float:
         r = end - time.monotonic()
@@ -1153,6 +1157,8 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
             conn.endheaders(data)
             r = conn.getresponse()
             status, hd = r.status, {k.lower(): v for k, v in r.getheaders()}
+            body = bytearray()
+            read.update(status=status, headers=hd, body=body)   # from here on the status and headers are kept
             stated = r.msg.get_all("content-length") or []
             if len(stated) > 1 or (stated and not CONTENT_LENGTH.fullmatch(stated[0])):
                 return Response(status, hd, b"", False, "not one plain Content-Length")    # the body is not read
@@ -1160,8 +1166,7 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
             if length is not None and length > MAX_BODY:
                 return Response(status, hd, b"", True)      # more than the limit stated: not read at all
             if length is not None and not r.chunked:
-                return _read_stated(r.fp, sock, status, hd, length, left)
-            body = bytearray()
+                return _read_stated(r.fp, sock, status, hd, length, left, body)
             try:
                 while len(body) <= MAX_BODY:
                     sock.settimeout(left())
@@ -1169,9 +1174,9 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
                     if not chunk:
                         break
                     body += chunk
-            except http.client.HTTPException as e:          # chunks cut off or not readable: the status is kept
-                part = getattr(e, "partial", b"")
-                body += part if isinstance(part, (bytes, bytearray)) else b""
+            except http.client.HTTPException as e:          # chunks cut off or not readable: the answer comes back
+                part = getattr(e, "partial", b"")           # with its status and headers, `bad` saying so (any other
+                body += part if isinstance(part, (bytes, bytearray)) else b""   # error raises carrying them: below)
                 return Response(status, hd, bytes(body[:MAX_BODY]), False, "the body ended early")
             if length is not None:                          # a length stated beside a chunked body: not as stated
                 return Response(status, hd, bytes(body[:MAX_BODY]), len(body) > MAX_BODY, "a length and chunks both")
@@ -1181,7 +1186,13 @@ def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: flo
                 sock.close()
             except OSError:
                 pass
-    return bounded_call(go, timeout, service, abort)
+    try:
+        return bounded_call(go, timeout, service, abort)
+    except Exception as e:
+        if "status" in read:                              # the body did not finish: the deadline, a reset, any error
+            e.answer = Response(read["status"], read["headers"], bytes(read["body"][:MAX_BODY]), False,
+                                "the body did not finish")
+        raise
 
 
 _ALLOWED = {("https", PUBLIC_HOST), ("https", OAUTH_HOST)}
@@ -1201,11 +1212,20 @@ def kalshi_get(url: str, timeout: float) -> bytes:
     """One keyless GET to Kalshi's public interface by this module's own bounded transport (no proxy, no redirect,
     at most MAX_BODY bytes, the whole answer within `timeout`). A non-200 answer raises kd.HttpError with its status
     (a redirect included), whatever its body; a longer one raises TooLarge; a 200 whose body is not what its headers
-    state raises BadLength carrying the status."""
+    state raises BadLength carrying the status. A non-200 answer whose body did not finish raises kd.HttpError with
+    its status too; a 200 whose body did not finish raises what the transport raised (a timeout, a network error)."""
     u = urllib.parse.urlsplit(url)
     if (u.scheme, u.hostname) not in _KALSHI_ALLOWED or u.username or u.password:
         raise ValueError("not Kalshi's public address")
-    r = _http("GET", url, {"User-Agent": USER_AGENT, "Accept": "application/json"}, None, timeout, "kalshi")
+    try:
+        r = _http("GET", url, {"User-Agent": USER_AGENT, "Accept": "application/json"}, None, timeout, "kalshi")
+    except Exception as cut:
+        a = getattr(cut, "answer", None)
+        if not isinstance(a, Response) or a.status == 200:
+            raise
+        e = kd.HttpError(a.status, url)                   # the status first, whatever the body
+        e.body = a.body
+        raise e from None
     if r.truncated:
         raise TooLarge(r.body, r.status)
     if r.status != 200:                                   # the status first, whatever the body
@@ -1544,9 +1564,10 @@ class Collector:
                  events: list, keep_body: bool = True) -> tuple[Fetch, Response | None]:
         """One request within the step's deadline, turned into a Fetch: failures are constants, never text from the
         answer. Every limit is checked first (nothing is sent when one would break: "held_back"); then the request's
-        row is committed, and only then does the request leave. A 429 or 403 commits its back-off at once."""
+        row is committed, and only then does the request leave. A 429 or 403 commits its back-off at once, and a feed
+        answer's rate-limit waits are honoured at once (_rate_waits), whenever its status line and headers were read."""
         t0 = self.clock()
-        resp, failure, rid, said = None, None, None, None
+        resp, failure, rid, said, cut = None, None, None, None, None
         if deadline - t0 <= 0:
             failure = "deadline"
         elif t0 < self.backoff_until:
@@ -1573,29 +1594,33 @@ class Collector:
             else:
                 try:
                     resp = self.reddit_fetch(method, url, headers, data, min(budget, STEP_DEADLINE_S))
-                except TimeoutError:
-                    failure = "timeout"
+                except TimeoutError as e:
+                    failure, cut = "timeout", getattr(e, "answer", None)
                 except BadLength as e:
                     failure, said = "bad_length", e.status
-                except (OSError, urllib.error.URLError):
-                    failure = "network"
-                except Exception:                          # a transport that broke: a failed fetch, not a stopped run
-                    failure = "error"
+                except (OSError, urllib.error.URLError) as e:
+                    failure, cut = "network", getattr(e, "answer", None)
+                except Exception as e:                     # a transport that broke: a failed fetch, not a stopped run
+                    failure, cut = "error", getattr(e, "answer", None)
         at = self.clock()                                  # read once: when the answer (or the failure) came
-        status = resp.status if resp is not None else said
-        remaining = _float(resp.headers.get("x-ratelimit-remaining")) if resp is not None else None
-        reset = _float(resp.headers.get("x-ratelimit-reset")) if resp is not None else None
-        body = resp.body if (resp is not None and keep_body) else None
-        if resp is not None:
-            bad = getattr(resp, "bad", None)
-            if status in (429, 403):                       # a back-off, whatever the body: truncated, not as stated, none
-                failure = "http_%d" % status
-                secs, why = _backoff_seconds(resp.headers, at)
+        # the answer whose status line and headers were read: whole, or one whose body did not finish (`cut`: the
+        # transport raised, carrying them). Either way its status is recorded and acted on, and its rate-limit waits
+        # are honoured; when no status line was read, the failure above stands alone.
+        head = resp if resp is not None else (cut if isinstance(cut, Response) else None)
+        status = head.status if head is not None else said
+        remaining = _float(head.headers.get("x-ratelimit-remaining")) if head is not None else None
+        reset = _float(head.headers.get("x-ratelimit-reset")) if head is not None else None
+        body = head.body if (head is not None and keep_body) else None
+        if head is not None:
+            bad = getattr(head, "bad", None)
+            if status in (429, 403):                       # a back-off, whatever the body: truncated, not as stated, none,
+                failure = "http_%d" % status               # or one that did not finish
+                secs, why = _backoff_seconds(head.headers, at)
                 self.backoff_until = max(self.backoff_until, at + secs)
                 self._commit_event(Event(at=at, kind="backoff", slot=slot, until=at + secs, count=None,
                                          detail="http_%d %s %g s%s" % (status, why, secs,
                                                                        ", the body not as stated" if bad else "")))
-            elif resp.truncated:
+            elif head.truncated:
                 failure = "too_large"
             elif status in (301, 302, 303, 307, 308):
                 failure = "redirect"
@@ -1604,12 +1629,30 @@ class Collector:
                 self._token = None
             elif status != 200:
                 failure = "http_%d" % status
-            elif bad:
+            elif bad and failure is None:
                 failure = "bad_length"                     # a 200 whose body is not what its headers state
         f = Fetch(at=at, slot=slot, backend=self.backend, purpose=purpose, page=page, status=status, failure=failure, body=body,
                   entries=None, rate_remaining=remaining, rate_reset=reset, request_id=rid)
+        if head is not None and purpose == "feed":
+            self._rate_waits(f, slot)
         self._open = None
         return f, resp
+
+    def _rate_waits(self, f: Fetch, slot: int) -> None:
+        """The waits a feed answer's rate-limit headers name, honoured whenever its status line and headers were read,
+        whatever its status and its body, the moment it came (rev 2's rules, unchanged): on the public feed its reset
+        time, never ahead of it, above an hour an hour (the next run reads it back from the answer's row); on the
+        official interface, under one request left, a back-off for its reset (from one second to an hour), else five
+        minutes, committed at once."""
+        if self.backend == "public":
+            if f.rate_reset is not None and f.rate_reset > 0:
+                self.not_before = max(self.not_before, f.at + min(f.rate_reset, BACKOFF_NAMED_MAX_S))
+        elif f.rate_remaining is not None and f.rate_remaining < 1:
+            named = _named_wait(f.rate_reset)
+            secs = named if named is not None else BACKOFF_DEFAULT_S
+            self.backoff_until = max(self.backoff_until, f.at + secs)
+            self._commit_event(Event(at=f.at, kind="ratelimit", slot=slot, until=f.at + secs, count=None,
+                                     detail="remaining below 1, reset %g s" % secs))
 
     def _parse_into(self, f: Fetch, resp: Response, oauth: bool) -> str | None:
         """Read a good answer into `f.entries`; an answer that cannot be read is a failed fetch (its body not kept)."""
@@ -1627,11 +1670,8 @@ class Collector:
     def _public_slot(self, slot: int, deadline: float, fetches: list, events: list) -> None:
         f, resp = self._request(slot, "feed", 1, "GET", PUBLIC_URL, self._headers(), None, deadline, events)
         fetches.append(f)
-        if resp is not None and f.failure is None:
+        if resp is not None and f.failure is None:         # (its reset time is honoured already, whatever the answer)
             self._parse_into(f, resp, False)
-            reset = f.rate_reset
-            if reset is not None and reset > 0:            # never ahead of what the answer says; above an hour, an hour
-                self.not_before = max(self.not_before, f.at + min(reset, BACKOFF_NAMED_MAX_S))
 
     def _token_for(self, slot: int, deadline: float, fetches: list, events: list) -> str | None:
         now = self.clock()
@@ -1678,12 +1718,7 @@ class Collector:
                 return
             after = self._parse_into(f, resp, True)
             if f.rate_remaining is not None and f.rate_remaining < 1:
-                named = _named_wait(f.rate_reset)
-                secs = named if named is not None else BACKOFF_DEFAULT_S
-                self.backoff_until = max(self.backoff_until, f.at + secs)
-                self._commit_event(Event(at=f.at, kind="ratelimit", slot=slot, until=f.at + secs, count=None,
-                                         detail="remaining below 1, reset %g s" % secs))
-                return
+                return                                     # its back-off is committed already (_rate_waits)
             if f.entries is None or not f.entries or after is None or newest_id is None:
                 return
             if any(e.comment_id == newest_id for e in f.entries):
@@ -2015,7 +2050,9 @@ def status(store: Store, now: float) -> dict:
     begun count, each once, so covered never exceeds expected. `share` is covered over expected, `covered` whether it
     is at least 80%. A day not yet ended is `in_progress`: its counts so far are shown, and it never `counts`; an
     ended day counts when both recorders covered it."""
-    runs = [(_utc_ts(r["started_at"]), r["backend"], r["comment_interval_s"], r["price_interval_s"])
+    # a run's start to the millisecond it is stored with (every run row this module writes has its milliseconds; a
+    # start written without them is read as whole seconds): a run begun at 06:06:00.5 does not own the 06:06:00 slot
+    runs = [(_iso_ts(r["started_at"]), r["backend"], r["comment_interval_s"], r["price_interval_s"])
             for r in store.rows("SELECT started_at, backend, comment_interval_s, price_interval_s FROM runs ORDER BY id")]
     days: dict[str, dict] = {}
 

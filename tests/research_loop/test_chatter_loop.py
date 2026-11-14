@@ -15,6 +15,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -594,9 +595,16 @@ def test_public_feed_is_asked_every_120_seconds_from_a_fixed_address_with_a_fixe
     assert {r["method"] for r in reddit.log} == {"GET"}
     for r in reddit.log:
         assert set(k.lower() for k in r["headers"]) <= {"user-agent", "accept"}
-        assert r["headers"]["User-Agent"] == cl.USER_AGENT == "valedia-trader-chatter-collector/1.0"
+        assert r["headers"]["User-Agent"] == cl.USER_AGENT == "comment-and-price-collector/1.0"      # rev 5 (outcome 1)
         assert r["data"] is None
     assert not re.search(r"burton|chatelain|@|/u/|valedia\.ai|\d{3}-\d{4}", cl.USER_AGENT, re.I)
+    # rev 5 (outcome 1): nothing of the owner's project or business either: not "valedia", not one word of the
+    # repository's folder name (valedia-trader, and the folder this copy lives in), no system or Python version, and
+    # not a library's default agent
+    words = {"valedia", "trader"} | {w for w in re.split(r"[^a-z0-9]+", cl.REPO.name.lower()) if len(w) >= 2}
+    assert not re.search("|".join(sorted(words)), cl.USER_AGENT, re.I), words
+    assert not re.search(r"python|urllib|requests|darwin|macos|mac os|linux|windows|cpython|\(", cl.USER_AGENT, re.I)
+    assert cl.USER_AGENT.strip() and re.fullmatch(r"[a-z-]+/1\.0", cl.USER_AGENT)
 
 
 def test_no_public_request_from_minute_5_to_minute_12_of_any_hour_and_silence_is_a_row(tmp_path):
@@ -3803,3 +3811,388 @@ def quiet_and_blind_days(tmp_path):
     assert quiet["comments"]["comments"] == blind["comments"]["comments"] == 0
     assert (quiet["comments"]["covered"], quiet["prices"]["covered"], quiet["counts"]) == (True, True, True)
     assert (blind["comments"]["covered"], blind["prices"]["covered"], blind["counts"]) == (False, False, False)
+
+
+# ============================================================================================ rev 5
+# ------------------------------------- outcome 1: no request names the owner, his project or his business
+
+def test_every_request_and_every_run_row_carry_the_one_generic_agent(tmp_path, monkeypatch):
+    """Over the real transports to local stand-ins: the public feed, the token request, the official interface and
+    Kalshi each send exactly one User-Agent, `comment-and-price-collector/1.0`, and no request names the owner's
+    project; every run row holds the same string."""
+    local_hosts_allowed(monkeypatch)
+    rsrv = answering_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    ksrv = answering_server(b'HTTP/1.1 200 OK\r\nContent-Length: 29\r\n\r\n{"markets": [], "cursor": ""}')
+    paths = [tmp_path / "public.sqlite", tmp_path / "oauth.sqlite"]
+    try:
+        for env, path in zip(({}, CREDS), paths):
+            clock, n = Clock(T0 + 1200), {"r": 0}
+
+            def reddit(method, url, headers, data, timeout):
+                cl.reddit_get(method, rsrv.url(path=urllib.parse.urlsplit(url).path), headers, data, timeout)   # the real request
+                n["r"] += 1
+                clock.sleep(0.2)
+                return good_answer(n["r"], method, url, bool(env))                                    # a good answer
+
+            def kalshi(url, timeout):
+                u = urllib.parse.urlsplit(url)
+                clock.sleep(0.1)
+                return cl.kalshi_get(ksrv.url(path=u.path + "?" + u.query), timeout)
+            store = cl.Store(path, synchronous="OFF")
+            col = collector(store, clock, reddit, kalshi, env)
+            run_for(col, clock, 130)
+            store.close()
+    finally:
+        rsrv.close()
+        ksrv.close()
+    heads = rsrv.requests + ksrv.requests
+    kinds = {h.split(b" ", 2)[0] + b" " + h.split(b" ", 2)[1].split(b"?")[0] for h in heads}
+    assert kinds == {b"GET /r/sportsbook/comments/.rss", b"POST /api/v1/access_token", b"GET /r/sportsbook/comments",
+                     b"GET /trade-api/v2/markets"}, kinds
+    for h in heads:
+        agents = [line.split(b":", 1)[1].strip() for line in h.split(b"\r\n") if line.lower().startswith(b"user-agent:")]
+        assert agents == [b"comment-and-price-collector/1.0"], (h[:60], agents)
+        assert not re.search(rb"valedia|trader|burton|chatelain|python|urllib", h, re.I), h[:200]
+    for path in paths:
+        s = cl.Store(path, readonly=True)
+        assert {r["program"] for r in s.rows("SELECT program FROM runs")} == {"comment-and-price-collector/1.0"}
+        s.close()
+
+
+# --------------------- outcome 2: a wait the rate-limit headers name is honoured whatever the status and the body
+
+RATE_200_FAULTS = ["short", "longer", "letters", "twice", "cut-off", "empty"]
+
+
+def kill_after_the_next_commit(monkeypatch, armed):
+    """A kill right after the first commit that follows the moment `armed["on"]` is set: what that commit holds is
+    kept, nothing after it runs (as a SIGKILL there)."""
+    real = cl._Writing.__exit__
+
+    def exit_(self, et, ev, tb):
+        out = real(self, et, ev, tb)
+        if et is None and armed.get("on"):
+            armed["on"] = False
+            raise Killed
+        return out
+    monkeypatch.setattr(cl._Writing, "__exit__", exit_)
+
+
+class OneRealAnswer:
+    """The collector's Reddit transport: request number `which` goes over the module's real transport to `srv` (its
+    deadline at most `cap` real seconds when given); the others get good stand-in answers. Logs when each request
+    left (`log`) and when the real answer, or its failure, came (`came`), and arms `armed` at that moment."""
+
+    def __init__(self, clock, oauth, srv, which, armed=None, cap=None, scheme="http"):
+        self.clock, self.oauth, self.srv, self.which, self.armed, self.cap = clock, oauth, srv, which, armed, cap
+        self.scheme = scheme
+        self.log, self.came = [], None
+
+    def __call__(self, method, url, headers, data, timeout):
+        self.log.append(self.clock())
+        n = len(self.log)
+        if n != self.which:
+            self.clock.sleep(0.2)
+            return good_answer(n, method, url, self.oauth)
+        try:
+            return cl.reddit_get(method, self.srv.url(path=urllib.parse.urlsplit(url).path, scheme=self.scheme), headers,
+                                 data, timeout if self.cap is None else min(timeout, self.cap))
+        finally:
+            self.clock.sleep(0.2 if self.cap is None else self.cap)
+            self.came = self.clock()
+            if self.armed is not None:
+                self.armed["on"] = True
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["running", "killed-and-restarted"])
+@pytest.mark.parametrize("backend", ["public", "oauth"])
+@pytest.mark.parametrize("fault", RATE_200_FAULTS)
+def test_a_rate_limit_wait_on_a_bad_bodied_200_is_honoured_running_or_restarted(tmp_path, monkeypatch, fault, backend, killed):
+    """The check's F1: the first feed page (the public feed's, or the official interface's after a good token) is a
+    200 whose body is not as stated, carrying x-ratelimit-remaining: 0 and x-ratelimit-reset: 600, over the real
+    transport. No request inside those 600 s, whether the run goes on or is killed right after the commit that
+    follows the answer and restarted at once; the row keeps the status and the numbers the headers gave."""
+    local_hosts_allowed(monkeypatch)
+    oauth = backend == "oauth"
+    armed = {"on": False}
+    if killed:
+        kill_after_the_next_commit(monkeypatch, armed)
+    srv = answering_server(b"HTTP/1.1 200 OK\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 600\r\n" + BODY_FAULTS[fault])
+    path = tmp_path / "c.sqlite"
+    clock = Clock(T0 + 1200)                                            # 06:20: the hourly silence is not in the way
+    reddit = OneRealAnswer(clock, oauth, srv, 2 if oauth else 1, armed if killed else None)
+    end, kills = clock() + 1500, 0
+    try:
+        while clock() < end:
+            store = cl.Store(path, synchronous="OFF")
+            try:
+                col = collector(store, clock, reddit, kalshi_ok(clock), CREDS if oauth else None)
+                col.start()
+                while clock() < end:
+                    col.step()
+                    clock.sleep(min(max(col.next_due() - clock(), 0.0), 1.0))
+            except Killed:
+                kills += 1                                              # restarted at once, on the same clock
+            finally:
+                store.close()
+    finally:
+        srv.close()
+    assert kills == (1 if killed else 0)
+    came = reddit.came
+    assert came is not None
+    inside = [t for t in reddit.log if came < t < came + 600 - 0.01]
+    assert inside == [], (came, inside[:5])
+    assert any(t >= came + 600 - 0.01 for t in reddit.log), reddit.log  # the wait ended: requests went on
+    s = cl.Store(path, readonly=True)
+    rows = s.rows("SELECT status, ok, failure, rate_remaining, rate_reset FROM comment_fetches WHERE purpose = 'feed' "
+                  "AND status IS NOT NULL ORDER BY id")
+    if not (killed and oauth):                                          # (the official run killed at its rate-limit
+        r = rows[0]                                                     # commit never stored the page's row)
+        assert (r["status"], r["ok"], r["rate_remaining"], r["rate_reset"]) == (200, 0, 0.0, 600.0), r
+        assert r["failure"] in ("bad_length", "unparseable"), r
+    if oauth:
+        ev = s.rows("SELECT at, until FROM comment_events WHERE kind = 'ratelimit'")
+        assert len(ev) == 1 and abs(cl._iso_ts(ev[0]["until"]) - (came + 600)) < 0.01, ev
+    assert cl.verify(s) == []
+    s.close()
+
+
+# ---------- outcome 3: a 429 or a 403 whose headers were read keeps its status and its wait when the body does not finish
+
+def cutting_server(status, how, ctx=None):
+    """A local server whose answer's status line and headers (Retry-After: 600) arrive whole, and whose body then does
+    not finish: `trickle` (a stated length, one byte every 50 ms), `endless` (no length, 1 KB every 20 ms), `flood`
+    (no length, 6 MB at once), `reset` (a stated length, ten bytes, then a reset), `chunk-reset` (chunked, part of a
+    chunk, then a reset) or `garbage` (over TLS: ten bytes, then a record that does not decrypt). `ctx`: TLS."""
+    srv = LocalServer("ok")
+
+    def handle(c):
+        try:
+            c.settimeout(2.0)
+            if ctx is not None:
+                c = ctx.wrap_socket(c, server_side=True)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                head += chunk
+            m = re.search(rb"(?i)\r\ncontent-length: *([0-9]+)", head)
+            if m:
+                need = head.index(b"\r\n\r\n") + 4 + int(m.group(1))
+                while len(head) < need:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    head += chunk
+            srv.requests.append(head)
+            first = b"HTTP/1.1 %d X\r\nRetry-After: 600\r\n" % status
+            if how == "trickle":
+                c.sendall(first + b"Content-Length: 100000\r\n\r\n")
+                srv._slowly(c, b"x" * 100000, 0.05)
+            elif how == "endless":
+                c.sendall(first + b"Content-Type: application/json\r\n\r\n")
+                while not srv.stop.wait(0.02):
+                    c.sendall(b"y" * 1024)
+            elif how == "flood":
+                c.sendall(first + b"Content-Type: application/json\r\n\r\n")
+                for _ in range(96):
+                    c.sendall(b"z" * 65536)
+                srv._hold(c)
+            elif how in ("reset", "chunk-reset"):
+                c.sendall(first + (b"Content-Length: 1000\r\n\r\n" + b"r" * 10 if how == "reset" else
+                                   b"Transfer-Encoding: chunked\r\n\r\n64\r\n" + b"r" * 10))
+                srv.stop.wait(0.2)                                      # the client is reading the body by now
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                socket.socket.close(c)                                  # a reset (no TLS close either)
+            elif how == "garbage":
+                c.sendall(first + b"Content-Length: 1000\r\n\r\n" + b"g" * 10)
+                srv.stop.wait(0.2)
+                socket.socket.sendall(c, b"\x17\x03\x03\x00\x20" + bytes(range(32)))   # under the TLS layer
+                srv.stop.wait(1.5)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    srv._handle = handle
+    return srv
+
+
+@pytest.mark.parametrize("scheme,how,status", [
+    ("http", "trickle", 429), ("http", "endless", 429), ("http", "flood", 429), ("http", "reset", 429),
+    ("http", "chunk-reset", 429), ("https", "trickle", 429), ("https", "endless", 429), ("https", "reset", 429),
+    ("https", "garbage", 429), ("http", "trickle", 403), ("https", "reset", 403)])
+def test_a_429_or_403_whose_body_does_not_finish_keeps_its_status_and_its_wait(tmp_path, monkeypatch, scheme, how, status):
+    """The check's F2 and F4: the deadline passing while the body trickles, an endless body, a reset or another error
+    while the body is read, over TLS and over plain HTTP. The transport still ends by the deadline (its thread by the
+    deadline plus 2 s) but keeps the status and headers it read; the collector records the real status and commits
+    the back-off rev 2 would have used (600 s from when the answer, or its failure, came); nothing is asked inside."""
+    import ssl
+    local_hosts_allowed(monkeypatch)
+    ctx = None
+    if scheme == "https":
+        ca = Authority(tmp_path / "ca")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(*ca.leaf("127.0.0.1"))
+        monkeypatch.setattr(cl, "_SSL_CONTEXT", cl._make_context(str(ca.path)))
+    srv = cutting_server(status, how, ctx)
+    try:
+        before = request_threads()
+        for service in ("reddit", "kalshi"):
+            t = time.monotonic()
+            try:
+                r, err = through(service, srv.url(path="/x", scheme=scheme), 1.0), None
+            except Exception as e:
+                r, err = None, e
+            assert time.monotonic() - t <= 1.3, (service, how)
+            if service == "kalshi":                                     # Kalshi: the status it is, whatever the body
+                assert isinstance(err, (kd.HttpError, cl.TooLarge)) and err.status == status, (how, repr(err))
+            elif how == "flood":
+                assert r is not None and (r.status, r.truncated) == (status, True)
+            else:                       # an error that carries what was read, or (a reset under TLS can read as the
+                a = r if r is not None else getattr(err, "answer", None)       # end of the body) a short answer
+                assert a is not None, (how, repr(err))
+                assert (a.status, a.headers.get("retry-after"), bool(a.bad)) == (status, "600", True), (how, a)
+        t = time.monotonic()
+        while request_threads() - before and time.monotonic() - t < 3.0:
+            time.sleep(0.02)
+        assert not request_threads() - before, "a request thread outlived its deadline by 2 s"
+        for backend in ("public", "oauth"):
+            oauth = backend == "oauth"
+            clock = Clock(T0 + 1200)
+            reddit = OneRealAnswer(clock, oauth, srv, 1, cap=1.0, scheme=scheme)    # the first: the token's, officially
+            store = cl.Store(tmp_path / ("%s.sqlite" % backend), synchronous="OFF")
+            col = collector(store, clock, reddit, kalshi_ok(clock), CREDS if oauth else None)
+            run_for(col, clock, 1500)
+            first = store.rows("SELECT purpose, status, failure, fetched_at FROM comment_fetches ORDER BY id")[0]
+            assert (first["purpose"], first["status"], first["failure"]) == ("token" if oauth else "feed", status,
+                                                                             "http_%d" % status), (backend, how, first)
+            ev = store.rows("SELECT at, until, detail FROM comment_events WHERE kind = 'backoff'")
+            assert len(ev) == 1 and ev[0]["detail"].startswith("http_%d retry-after 600" % status), ev
+            at, until = cl._iso_ts(ev[0]["at"]), cl._iso_ts(ev[0]["until"])
+            assert abs(at - reddit.came) < 0.01 and abs(until - (at + 600)) < 0.01, (at, until, reddit.came)
+            assert [t for t in reddit.log if at < t < until] == [], reddit.log[:4]
+            assert any(t >= until for t in reddit.log), reddit.log
+            assert cl.verify(store) == []
+            store.close()
+    finally:
+        srv.close()
+
+
+def test_with_no_status_line_read_the_old_error_paths_stay(monkeypatch):
+    """A server that never answers, and one that trickles its headers: a timeout as before, carrying no answer."""
+    local_hosts_allowed(monkeypatch)
+    for kind in ("silent", "trickle_headers"):
+        srv = LocalServer(kind)
+        try:
+            with pytest.raises(TimeoutError) as e:
+                through("reddit", srv.url(), 0.5)
+            assert getattr(e.value, "answer", None) is None, kind
+            with pytest.raises(TimeoutError):
+                through("kalshi", srv.url(), 0.5)
+        finally:
+            srv.close()
+
+
+# ------------------------------------------------- outcome 5: expected slots to the fraction of a run's start
+
+@pytest.mark.parametrize("first,second", [("public", "oauth"), ("oauth", "public")])
+def test_expected_slots_follow_a_runs_start_to_the_fraction_of_a_second(tmp_path, first, second):
+    """The check's F5: a run started at 06:06:00.5 does not make the 06:06:00 slot its own (the backend in force at a
+    slot is the latest run started at or before it). Through status(), from a real store."""
+    ival = {"public": 120, "oauth": 60}
+    starts = (DAY + 6 * 3600 + 360.5, DAY + 6 * 3600 + 360.001, DAY + 6 * 3600 + 420.999, DAY + 10 * 3600 + 0.5,
+              DAY + 10 * 3600 + 60.5, DAY + 10 * 3600 + 119.75)
+    for k, start in enumerate(starts):
+        s = cl.Store(tmp_path / ("f%s%d.sqlite" % (first, k)), synchronous="OFF")
+        s.save_run(started=DAY, backend=first, comment_interval=ival[first], price_interval=60)
+        s.save_run(started=start, backend=second, comment_interval=ival[second], price_interval=60)
+        assert s.rows("SELECT started_at FROM runs ORDER BY id")[1]["started_at"] == stamp(start)    # to the millisecond
+        d = cl.status(s, DAY + 86400)["days"][0]
+        want = brute_expected([(float(DAY), first, ival[first], 60), (start, second, ival[second], 60)], DAY)
+        silent = sum(1 for t, b in want if b == "public" and cl.is_silent(t))
+        assert (d["comments"]["expected"], d["comments"]["silent"]) == (len(want) - silent, silent), (start - DAY, d["comments"])
+        if (first, start) == ("public", DAY + 6 * 3600 + 360.5):
+            assert d["comments"]["expected"] == 1232                    # the check's case (1,233 before)
+        assert d["prices"]["expected"] == 7200
+        s.close()
+
+
+def test_a_run_row_without_a_fraction_is_still_read(tmp_path):
+    """Every run row this module writes has its milliseconds; a start written without them is read as whole seconds."""
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.conn.execute("INSERT INTO runs (started_at, backend, comment_interval_s, price_interval_s, program) VALUES (?,?,?,?,?)",
+                   ("2026-11-14T00:00:00Z", "public", 120, 60, cl.USER_AGENT))
+    assert cl._iso_ts("2026-11-14T06:06:00Z") == DAY + 6 * 3600 + 360
+    assert cl._iso_ts("2026-11-14T06:06:00.500Z") == DAY + 6 * 3600 + 360.5
+    d = cl.status(s, DAY + 86400)["days"][0]
+    assert (d["comments"]["expected"], d["prices"]["expected"]) == (624, 7200)
+    s.close()
+
+
+# --------------------------------------------------------- outcome 6: the three breaks no test caught (V102 F3)
+
+def faulted(body, how):
+    """A whole 200 answer whose bytes read are exactly `body` but which is not as stated: `longer` (more after the
+    stated length) or `length-and-chunks` (a Content-Length beside a chunked body)."""
+    if how == "longer":
+        return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body + b"MORE BYTES"
+    return (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: %d\r\n\r\n" % len(body)
+            + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+
+
+@pytest.mark.parametrize("how", ["longer", "length-and-chunks"])
+@pytest.mark.parametrize("which", ["feed", "token"])
+def test_the_official_feed_and_the_token_never_take_a_bad_bodied_200_for_a_good_one(tmp_path, monkeypatch, which, how):
+    """The bytes read are a good listing (or a good token answer), but the answer is not as stated: a bad answer of
+    its own kind, nothing parsed from it, nothing stored from it, and a token from it is never sent."""
+    local_hosts_allowed(monkeypatch)
+    good = (json.dumps({"access_token": "madeUpTokenFromABadAnswer", "token_type": "bearer", "expires_in": 3600}).encode()
+            if which == "token" else listing([("t1_bad%d" % i, T0 + i) for i in range(3)]).body)
+    srv = answering_server(faulted(good, how))
+    log = []
+    clock = Clock(T0 + 1200)
+
+    def reddit(method, url, headers, data, timeout):
+        log.append((url, dict(headers)))
+        if (url == cl.TOKEN_URL) == (which == "token"):
+            r = cl.reddit_get(method, srv.url(path=urllib.parse.urlsplit(url).path), headers, data, timeout)
+        else:
+            r = good_answer(len(log), method, url, True)
+        clock.sleep(0.2)
+        return r
+    store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    try:
+        run_for(collector(store, clock, reddit, kalshi_ok(clock), CREDS), clock, 300)
+    finally:
+        srv.close()
+    rows = store.rows("SELECT ok, status, failure FROM comment_fetches WHERE purpose = ?", (which,))
+    assert len(rows) >= 4 and all((r["ok"], r["status"], r["failure"]) == (0, 200, "bad_length") for r in rows), rows
+    assert store.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0] == 0
+    if which == "token":
+        assert [u for u, _ in log if u != cl.TOKEN_URL] == []           # no request carried it
+        assert not any("madeUpTokenFromABadAnswer" in v for _, h in log for v in h.values())
+    store.close()
+
+
+def test_a_content_length_beside_a_chunked_body_is_a_bad_answer(tmp_path, monkeypatch):
+    local_hosts_allowed(monkeypatch)
+    body = atom_with(atom_entry("t1_lc1"))
+    srv = answering_server(faulted(body, "length-and-chunks"))
+    try:
+        r = through("reddit", srv.url(path="/x"), 3)
+        assert (r.status, r.body) == (200, body) and r.bad, (r.status, r.bad)
+        with pytest.raises(cl.BadLength):
+            through("kalshi", srv.url(path="/x"), 3)
+        clock = Clock(T0 + 1200)
+        store = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+        run_for(collector(store, clock, RealThenFake(clock, False, lambda n: srv), kalshi_ok(clock)), clock, 300)
+    finally:
+        srv.close()
+    rows = store.rows("SELECT ok, status, failure FROM comment_fetches")
+    assert len(rows) >= 2 and all((r["ok"], r["status"], r["failure"]) == (0, 200, "bad_length") for r in rows), rows
+    assert store.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0] == 0
+    store.close()
