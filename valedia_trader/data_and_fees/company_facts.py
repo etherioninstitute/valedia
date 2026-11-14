@@ -25,13 +25,35 @@ The store (SQLite, WAL, one writer at a time):
 
 A store is created only where no file exists, and opened only when it is this version's store: this store's own mark (SQLite
 application_id APPLICATION_ID, user_version USER_VERSION), exactly the three tables above with exactly their columns, indexes
-and nothing else (no other table, view or trigger), and a file as long as its own header says (page size times page count; a
-store cut short is refused). Anything else (another program's database, an empty SQLite file, a zero-byte file, a file that
-is not SQLite, a store of another version, a symbolic link, a store with an extra table, a cut store) is refused before any
-write of any kind and is left exactly as found, side files included: the checks read the file's bytes and those of its
-`-wal` (where a write-ahead file could change the tables) without SQLite, so not a byte, a modification time, a `-wal`, `-shm`
-or lock file changes. One exception to "cut": a main file shorter than its header says while its `-wal` holds at least as many
-pages as are missing is what a kill in the middle of a checkpoint leaves, and SQLite completes it; it is opened.
+and nothing else (no other table, view or trigger), and a store that is whole (below). Anything else (another program's
+database, an empty SQLite file, a zero-byte file, a file that is not SQLite, a store of another version, a symbolic link, a
+store with an extra table, a cut store) is refused before SQLite is ever asked to open it, by the collector, a reader,
+`status` or `show`, and is left exactly as found, side files included: the checks read the file's bytes and those of its
+`-wal` without SQLite, so not a byte, a modification time, a `-wal`, `-shm` or lock file changes. Such a refusal says
+"nothing was done"; a refusal that comes after SQLite opened the store says instead that SQLite could not use it and that
+SQLite's own recovery may have changed its side files (`_refusal` is the one place that chooses those words).
+
+Whole, decided from bytes alone the way SQLite's own recovery reads a write-ahead file: the `-wal` counts only when its magic
+is one of the two WAL magics, its format is 3007000, its page size is the store's and its header checksum holds; a frame is
+valid only when its salts are the header's, its page number is not zero and the running checksum (from the header's, over
+the frame header's first 8 bytes and its page, word order given by the magic) equals its own; the first invalid frame ends
+the walk, and only frames up to the last valid commit frame are counted (none when there is no valid commit frame: the
+`-wal` then proves nothing). With F the whole pages of the main file, H the page count in its own header and M the database
+size of the last counted commit, the store is whole when every page p with F < p <= max(H, M) is in a counted frame (with a
+`-wal` that proves nothing: when F >= H). So a main file left short by a kill in the middle of a checkpoint, whose missing
+pages are all in counted frames, is opened, and SQLite completes it; a cut main file beside a `-wal` of another database, a
+stale one, one that does not hold every missing page, or one whose checksums fail is refused. The table check reads page 1
+and every counted copy of page 1 in the `-wal`. The cost: a read beside a large `-wal` checksums it (about 0.09 s for 1,200
+frames), and a `-wal` exists only while a collector runs or after one was killed. A store file, `-wal` or `-shm` that cannot
+be written is refused before SQLite opens it; should SQLite still find it cannot write, that is refused in one line too.
+
+Limits, stated and not guarded: a name another program places at `<temporary name>-journal` or `-wal` while a store is
+being made is removed by SQLite (the name only; no byte of another file changes). A program that swaps the temporary name
+away and back between two of the creation checks can have its own database take this store's tables (it must win a race a
+watcher lost 160 times of 160). A foreign `-wal` beside a WHOLE store is SQLite's to interpret: the module refuses it only
+when its counted frames copy page 1 with other tables, or when its last commit says the store is longer than the main
+file and its frames lack a missing page; a foreign `-wal` whose counted frames fit inside the main file is not detected,
+and SQLite applies it.
 
 A new store is built in a file this module creates itself, beside the store, with O_CREAT | O_EXCL | O_NOFOLLOW under a name
 no one can predict (`<store>.new-<32 random hex digits>`); SQLite then opens that file (its device and inode are compared
@@ -43,20 +65,24 @@ store; any other leftover is never opened and never deleted, and `status` lists 
 Readers read in SQLite's ordinary read-only mode (`mode=ro`) and touch no lock file. In a writable folder SQLite may create
 its own `-wal` and `-shm` side files beside the store as it reads; that is accepted. A store in a place that cannot hold side
 files (a read-only folder or volume) is read in SQLite's `immutable` mode, which writes and creates nothing, and only when no
-`-wal` with content is beside it (the answer is checked not to have changed while it was read); a read-only place with a
-`-wal` that has content is refused in one line that says so and to copy the store with its side files to a writable place.
+`-wal` with content is beside it (the answer is checked not to have changed while it was read: a read that overlapped a
+write is refused as that, "ask again"); a read-only place with a `-wal` that has content is refused in one line that says so
+and to copy the store with its side files to a writable place. Each call of `status` and of `show` (one kind or all) reads on
+one connection inside one read transaction, so every count, the newest fetch and every row shown belong to one commit.
 
 No look-ahead: `as_of(db, symbol, kind, when)` returns the newest observation fetched at or before `when`;
 `news_as_of(db, symbol, when, since=None)` returns only articles published AND fetched at or before `when`. The reader never
 looks at anything fetched later, whatever the store holds, and a stored row whose text no longer matches its hash is refused.
 A stored fetch time that is not a finite number from 2000-01-01 to 2100-01-01 is impossible: it is never returned by a
 reader and is ignored by every rule about the newest fetch (the clock-behind rule, the unchanged rule, the newest and oldest
-fetch of `status`). `status` and `show` never end in a traceback: a row they cannot show is skipped and counted.
+fetch of `status`). `status` and `show` never end in a traceback: a row they cannot show is skipped and counted (`show`
+prints what it can and says on stderr how many stored articles it skipped).
 
 The service's clock guards the stamps: the transport returns the answer's headers with its body, and an answer whose `Date`
 differs from this computer's clock by more than 24 hours when it arrives stops the run before anything of it is stored (the
 one line gives both times and the difference). An answer with no readable `Date` is stored as before and counted. A run
-whose clock reads earlier than the newest plausible fetch in the store, or outside 2000 to 2100, is refused.
+whose clock reads earlier than the newest plausible fetch in the store, or outside 2000 to 2100, is refused (for the first:
+runs resume by themselves once the clock passes that fetch, and the one line says so and what can be done sooner).
 
 Politeness and safety: at most 55 requests in any 60 seconds (the plan allows 60); a 429 waits the Retry-After (30 seconds if
 none, at most 120) and tries again up to 3 times; a 403 marks that kind "not on this plan" for the rest of the run; a 5xx or a
@@ -99,6 +125,7 @@ import os
 import re
 import sqlite3
 import stat
+import struct
 import sys
 import time
 import urllib.error
@@ -298,8 +325,15 @@ def _when_text(ts: Any) -> str:
 
 
 def _span(seconds: float) -> str:
-    seconds = abs(seconds)
-    return "%.1f hours" % (seconds / 3600) if seconds < 72 * 3600 else "%.1f days" % (seconds / 86400)
+    """A gap in hours and minutes (days too from 72 hours), the minutes rounded up: a gap above a limit never reads as
+    the limit itself."""
+    minutes = math.ceil(abs(seconds) / 60)
+    days, minutes = divmod(minutes, 1440) if minutes >= 72 * 60 else (0, minutes)
+    hours, minutes = divmod(minutes, 60)
+
+    def n(k, word):
+        return "%d %s%s" % (k, word, "" if k == 1 else "s")
+    return " ".join(([n(days, "day")] if days else []) + [n(hours, "hour"), n(minutes, "minute")])
 
 
 def _plausible(ts: Any) -> bool:
@@ -449,9 +483,29 @@ def _schema_ok(conn: sqlite3.Connection) -> bool:
     return _schema_rows_of(conn) == _EXPECTED_SCHEMA
 
 
-def _check_columns(conn: sqlite3.Connection) -> None:
+_OPENED_RW, _OPENED_RO, _OPENED_IMMUTABLE = "rw", "ro", "immutable"     # how SQLite had opened the store (see _refusal)
+WRITTEN_WHILE_READ = "%s: the store was being written while it was read; ask again"
+
+
+def _refusal(path: Any, why: str, opened: str | None = None) -> Refused:
+    """The one place a store's refusal chooses its last words. Before SQLite was asked to open the store (`opened` None)
+    nothing was done. After, the words say SQLite had opened it: in an ordinary mode (`rw`, `ro`) SQLite's own recovery
+    may have changed its side files; in immutable mode SQLite writes nothing."""
+    if opened is None:
+        return Refused("%s %s; nothing was done" % (path, why))
+    if opened == _OPENED_IMMUTABLE:
+        return Refused("%s %s; SQLite had opened it in immutable mode, which writes nothing" % (path, why))
+    return Refused("%s %s; SQLite had opened it, so SQLite's own recovery may have changed its -wal and -shm side files"
+                   % (path, why))
+
+
+def _sqlite_failed(path: Any, e: sqlite3.Error, opened: str) -> Refused:
+    return _refusal(path, "is not usable: SQLite could not use it (%s)" % _one_line(e), opened)
+
+
+def _check_columns(conn: sqlite3.Connection, path: Any, opened: str) -> None:
     if not _schema_ok(conn):
-        raise Refused("the file is not a company-facts store (its tables are not the expected ones); nothing was done")
+        raise _refusal(path, "is not a company-facts store (its tables are not the expected ones)", opened)
 
 
 def _varint(b: bytes, i: int) -> tuple[int, int]:
@@ -516,55 +570,116 @@ def _schema_of_page1(page: bytes, usable: int) -> set:
     return rows
 
 
-def _wal_scan(path: Path, page_size: int) -> tuple[int, set | None, str | None]:
-    """(frames, pages of page 1, problem) of the store's write-ahead file, read as plain bytes (SQLite does not open it):
-    the number of frames SQLite could take from it (frames whose salts match its header), the bytes of each such frame of
-    page 1, and why the side files themselves are refused. (0, set(), None) when there is no -wal or SQLite would
-    ignore it."""
+WAL_VERSION = 3007000
+
+
+def _wal_sum(data: bytes, s1: int, s2: int, order: str) -> tuple[int, int]:
+    """SQLite's write-ahead checksum over `data` (a multiple of 8 bytes) continuing from (s1, s2); `order` is the word
+    order the file's magic names (">" big-endian, "<" little-endian)."""
+    words = iter(struct.unpack(order + "%dI" % (len(data) // 4), data))
+    for a, b in zip(words, words):
+        s1 = (s1 + a + s2) & 0xFFFFFFFF
+        s2 = (s2 + b + s1) & 0xFFFFFFFF
+    return s1, s2
+
+
+@dataclass
+class _Wal:
+    """What the store's write-ahead file proves, read as plain bytes (SQLite does not open it).
+    `salted`: frames from the start whose salts match the header (the "content" the read-only rule asks about).
+    `counted`: frames SQLite's recovery would take, up to and including the last valid commit frame; `commit_pages` that
+    frame's database size in pages (None: the -wal proves nothing); `pages` the page numbers and `page1` the copies of page 1
+    in counted frames; `problem` why the side files themselves are refused."""
+    problem: str | None = None
+    salted: int = 0
+    counted: int = 0
+    commit_pages: int | None = None
+    pages: set = field(default_factory=set)
+    page1: list = field(default_factory=list)
+
+
+def _wal_scan(path: Path, page_size: int) -> _Wal:
+    """The store's -wal as SQLite's own recovery would read it: usable only with a WAL magic, format 3007000, this store's
+    page size and a header checksum that holds; a frame is valid only with the header's salts, a page number that is not
+    zero and the running checksum (from the header's, over the frame header's first 8 bytes and then its page) equal to its
+    own; the first invalid frame ends the walk; frames after the last valid commit frame are not counted."""
     for suffix in ("-wal", "-shm"):
         try:
             st = os.lstat(str(path) + suffix)
         except FileNotFoundError:
             continue
         except OSError as e:
-            return 0, None, "its %s file cannot be examined (%s)" % (suffix, type(e).__name__)
+            return _Wal(problem="its %s file cannot be examined (%s)" % (suffix, type(e).__name__))
         if not stat.S_ISREG(st.st_mode):
-            return 0, None, "its %s file is not a regular file" % suffix
+            return _Wal(problem="its %s file is not a regular file" % suffix)
     try:
         fd = os.open(str(path) + "-wal", os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK | _CLOEXEC)
     except FileNotFoundError:
-        return 0, set(), None
+        return _Wal()
     except OSError as e:
-        return 0, None, "its -wal file cannot be read (%s)" % type(e).__name__
+        return _Wal(problem="its -wal file cannot be read (%s)" % type(e).__name__)
+    wal = _Wal()
     try:
         size = os.fstat(fd).st_size
         head = os.pread(fd, 32, 0)
         if len(head) < 32:
-            return 0, set(), None
-        magic, _, wal_page, _, salt1, salt2 = (int.from_bytes(head[k:k + 4], "big") for k in range(0, 24, 4))
+            return wal
+        magic, version, wal_page, _, salt1, salt2, sum1, sum2 = struct.unpack(">8I", head)
         if magic not in _WAL_MAGIC or wal_page != page_size:
-            return 0, set(), None                                       # SQLite ignores such a file and starts it again
-        frames, pages, offset = 0, set(), 32
+            return wal                                                  # SQLite ignores such a file and starts it again
+        order = ">" if magic & 1 else "<"
+        chain = (version == WAL_VERSION and _wal_sum(head[:24], 0, 0, order) == (sum1, sum2)) or None
+        s1, s2 = sum1, sum2
+        pending_pages: set = set()
+        pending_page1: list = []
+        offset = 32
         while offset + 24 + page_size <= size:
             fh = os.pread(fd, 24, offset)
-            if len(fh) < 24 or (int.from_bytes(fh[8:12], "big"), int.from_bytes(fh[12:16], "big")) != (salt1, salt2):
+            if len(fh) < 24 or struct.unpack(">2I", fh[8:16]) != (salt1, salt2):
                 break                                                   # SQLite reads no frame after this one
-            frames += 1
-            if int.from_bytes(fh[0:4], "big") == 1:
-                pages.add(os.pread(fd, page_size, offset + 24))
+            wal.salted += 1
+            if chain:
+                pgno, commit, f1, f2 = struct.unpack(">2I8x2I", fh)
+                page = os.pread(fd, page_size, offset + 24)
+                s1, s2 = _wal_sum(page, *_wal_sum(fh[:8], s1, s2, order), order) if len(page) == page_size else (None, None)
+                if pgno == 0 or (s1, s2) != (f1, f2):
+                    chain = None                                        # the first invalid frame ends the walk
+                else:
+                    pending_pages.add(pgno)
+                    if pgno == 1:
+                        pending_page1.append(page)
+                    if commit:                                          # a commit frame: everything up to it counts
+                        wal.counted, wal.commit_pages = wal.salted, commit
+                        wal.pages |= pending_pages
+                        wal.page1 += pending_page1
+                        pending_pages, pending_page1 = set(), []
             offset += 24 + page_size
-        return frames, pages, None
+        return wal
     except OSError as e:
-        return 0, None, "its -wal file cannot be read (%s)" % type(e).__name__
+        return _Wal(problem="its -wal file cannot be read (%s)" % type(e).__name__)
     finally:
         os.close(fd)
+
+
+def _cut_short(size: int, page_size: int, header_pages: int, wal: _Wal) -> str | None:
+    """Why the store is not whole (None when it is). F, the whole pages of the main file, must reach max(H, M): H the page
+    count of its own header, M the database size of the -wal's last counted commit; every page beyond F up to there must be
+    in a counted frame (with a -wal that proves nothing, none is)."""
+    whole = size // page_size
+    need = max(header_pages, wal.commit_pages or 0)
+    if whole >= need:
+        return None
+    if need - whole <= len(wal.pages) and all(p in wal.pages for p in range(whole + 1, need + 1)):
+        return None
+    return ("is damaged (cut short: its main file holds %d whole pages where %d are needed, and its -wal does not hold "
+            "every missing one)" % (whole, need))
 
 
 @dataclass
 class _Seen:
     """What the checks saw of a store that passed them."""
     st: os.stat_result
-    wal_frames: int
+    wal_frames: int                                     # frames whose salts match: the -wal has content (D1)
 
 
 def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
@@ -612,21 +727,22 @@ def _inspect(path: Path) -> tuple[str | None, _Seen | None]:
         return "is not a company-facts store (unreadable: %s)" % type(e).__name__, None
     finally:
         os.close(fd)
-    frames, wal_schemas, problem = _wal_scan(path, page_size)
-    if problem:
-        return "is not usable (%s)" % problem, None
-    if size < page_size * pages and size + frames * page_size < page_size * pages:
-        return "is damaged (cut short: %d bytes where its header says %d)" % (size, page_size * pages), None
+    wal = _wal_scan(path, page_size)
+    if wal.problem:
+        return "is not usable (%s)" % wal.problem, None
+    cut = _cut_short(size, page_size, pages, wal)
+    if cut:
+        return cut, None
     try:
         tables_ok = _schema_of_page1(page1, usable) == _EXPECTED_SCHEMA
-        wal_ok = all(_schema_of_page1(p, usable) == _EXPECTED_SCHEMA for p in wal_schemas)
+        wal_ok = all(_schema_of_page1(p, usable) == _EXPECTED_SCHEMA for p in wal.page1)
     except (ValueError, IndexError):
         tables_ok = wal_ok = False
     if not tables_ok:
         return "is not a company-facts store (its tables are not the expected ones)", None
     if not wal_ok:
         return "is not a company-facts store (its -wal file changes its tables)", None
-    return None, _Seen(st, frames)
+    return None, _Seen(st, wal.salted)
 
 
 def _store_problem(path: Any) -> str | None:
@@ -770,29 +886,38 @@ class _Writer:
         self.conn: sqlite3.Connection | None = None
         why, _ = _inspect(self.path)
         if why:
-            raise Refused("%s %s; nothing was done" % (self.path, why))
+            raise _refusal(self.path, why)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            raise Refused("%s cannot be used (%s); nothing was done" % (self.path, type(e).__name__)) from None
+            raise _refusal(self.path, "cannot be used (%s)" % type(e).__name__) from None
         self.fd, made = _take_lock(self.path)
+        opened = None                                           # how SQLite has opened the store, once it has been asked to
         try:
             why, seen = _inspect(self.path)                     # again, now that no other collector can change it
             if why:
-                raise Refused("%s %s; nothing was done" % (self.path, why))
+                raise _refusal(self.path, why)
             if seen is None:
                 _create_store(self.path)
                 why, seen = _inspect(self.path)
                 if why or seen is None:
-                    raise Refused("%s %s; nothing was done" % (self.path, why or "vanished as it was made"))
+                    raise _refusal(self.path, why or "vanished as it was made")
             _remove_own_leftovers(self.path)
+            locked = [n for n in ("", "-wal", "-shm") if os.path.lexists(str(self.path) + n) and not os.access(str(self.path) + n, os.W_OK)]
+            if locked:                                          # before SQLite is asked to open it: nothing changes
+                raise _refusal(self.path, "cannot be written here (%s is read-only; collect into a writable copy)"
+                               % ", ".join("its %s file" % n if n else "the store file" for n in locked))
+            opened = _OPENED_RW
             self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=5.0)
             if not _is_ours(self.path, seen.st):
-                raise Refused("%s changed while it was being opened; nothing was done" % self.path)
-            _check_columns(self.conn)
+                raise _refusal(self.path, "changed while it was being opened", opened)
+            _check_columns(self.conn, self.path, opened)
             if self.conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
                 self.conn.execute("PRAGMA journal_mode=WAL")    # a store is built without a journal and turned to WAL here
             self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("BEGIN IMMEDIATE")                # SQLite can write here, or it is a one-line refusal now,
+            self.conn.execute("DELETE FROM runs WHERE 0")       # before any run begins (a write that touches no row)
+            self.conn.execute("ROLLBACK")
         except (Refused, sqlite3.Error) as e:
             self.close()
             if made:
@@ -800,7 +925,7 @@ class _Writer:
                     os.unlink(str(self.path) + LOCK_SUFFIX)
             if isinstance(e, Refused):
                 raise
-            raise Refused("%s is not a usable company-facts store (%s); nothing was done" % (self.path, _one_line(e))) from None
+            raise _sqlite_failed(self.path, e, opened or _OPENED_RW) from None
 
     def close(self) -> None:
         if self.conn is not None:
@@ -856,7 +981,7 @@ def _reader(db: Any):
         raise Refused("no store at %s; run collect first" % path)
     why, seen = _inspect(path)
     if why or seen is None:
-        raise Refused("%s %s; nothing was done" % (path, why or "vanished as it was read"))
+        raise _refusal(path, why or "vanished as it was read")
     full = Path(os.path.abspath(path))
     immutable = not _writable_place(full)
     if immutable and seen.wal_frames:
@@ -864,31 +989,53 @@ def _reader(db: Any):
                       "read here without writing; copy the store with its -wal and -shm files to a writable folder and read "
                       "it there" % path)
     before = _fingerprint(full) if immutable else None
+    opened = _OPENED_IMMUTABLE if immutable else _OPENED_RO
     uri = "file:%s?%s" % (urllib.parse.quote(str(full)), "immutable=1" if immutable else "mode=ro")
 
-    def refusal(e: sqlite3.Error) -> Refused:
-        return Refused("%s cannot be read (%s)" % (path, _one_line(e)))
+    def overlapped() -> bool:
+        """In immutable mode SQLite takes no lock: a changed fingerprint means the read overlapped a write."""
+        return immutable and _fingerprint(full) != before
+
+    def failed(e: sqlite3.Error) -> Refused:
+        return Refused(WRITTEN_WHILE_READ % path) if overlapped() else _sqlite_failed(path, e, opened)
     conn = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-        _check_columns(conn)
+        _check_columns(conn, path, opened)
         if not _is_ours(full, seen.st):
-            raise Refused("%s changed while it was being opened; read it again" % path)
+            raise _refusal(path, "changed while it was being opened (read it again)", opened)
     except sqlite3.Error as e:
         if conn is not None:
             conn.close()
-        raise refusal(e) from None
+        raise failed(e) from None
     except Refused:
         conn.close()
+        if overlapped():
+            raise Refused(WRITTEN_WHILE_READ % path) from None
         raise
     try:
         yield conn
     except sqlite3.Error as e:
-        raise refusal(e) from None
+        raise failed(e) from None
     finally:
         conn.close()
-    if immutable and _fingerprint(full) != before:
-        raise Refused("%s changed while it was being read in a read-only place; read it again" % path)
+    if overlapped():
+        raise Refused(WRITTEN_WHILE_READ % path)
+
+
+@contextlib.contextmanager
+def _snapshot(db: Any):
+    """`_reader` inside one read transaction: every statement run on it reads the same commit."""
+    with _reader(db) as conn:
+        began = not conn.in_transaction
+        if began:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            if began:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
 
 
 # ---- the readers: no look-ahead
@@ -918,13 +1065,17 @@ def _check_when(when: Any) -> float:
     return w
 
 
-def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
-    """The newest observation of (symbol, kind) with fetched_at <= `when`, as {symbol, kind, fetched_at, body_sha256, body}
-    (body parsed), or None. Nothing fetched after `when` is ever looked at. `db` is a path or an open connection."""
+def _check_fact(symbol: Any, kind: Any) -> None:
     if kind not in STORED_KINDS:
         raise ValueError("kind must be one of %s (news is read with news_as_of)" % ", ".join(STORED_KINDS))
     if (symbol != "*") if kind == EARNINGS_CALENDAR else not valid_symbol(symbol):
         raise ValueError("bad symbol for this kind")
+
+
+def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
+    """The newest observation of (symbol, kind) with fetched_at <= `when`, as {symbol, kind, fetched_at, body_sha256, body}
+    (body parsed), or None. Nothing fetched after `when` is ever looked at. `db` is a path or an open connection."""
+    _check_fact(symbol, kind)
     when = _check_when(when)
     with _reader(db) as conn:
         row = conn.execute("SELECT fetched_at, body_sha256, body FROM observations WHERE symbol=? AND kind=? AND fetched_at<=?"
@@ -983,9 +1134,10 @@ def _run_row(row: tuple) -> dict | None:
 def status(db: Any) -> dict:
     """Rows per kind, symbols covered, the last run's counts, the oldest and newest possible fetch, the runs that were
     interrupted, and what it could not show: rows with an impossible fetch time, rows of no known kind, runs rows that
-    cannot be shown (skipped and counted), and the leftover names a killed run may have left beside the store."""
+    cannot be shown (skipped and counted), and the leftover names a killed run may have left beside the store. Every
+    statement runs on one connection inside one read transaction: all of it belongs to one commit."""
     plausible = _plausible_sql("fetched_at")
-    with _reader(db) as conn:
+    with _snapshot(db) as conn:
         rows = {k: 0 for k in STORED_KINDS + ("news",)}
         for kind, n in conn.execute("SELECT kind, count(*) FROM observations WHERE kind IN (%s) GROUP BY kind"
                                     % ",".join("?" * len(STORED_KINDS)), STORED_KINDS):
@@ -1355,9 +1507,11 @@ class _Run:
     def go(self, symbols: list[str]) -> Result:
         conn = self.store.conn
         if self.result.started_at < self.highwater:
-            raise Refused("the clock reads %s, earlier than the newest fetch already in the store (%s) by %s; set the clock right "
-                          "and run again; nothing was asked" % (_when_text(self.result.started_at), _when_text(self.highwater),
-                                                                 _span(self.highwater - self.result.started_at)))
+            newest = _when_text(self.highwater)
+            raise Refused("the clock reads %s, earlier than the newest fetch already in the store (%s) by %s; runs resume by "
+                          "themselves once the clock passes %s; to collect sooner, collect into another store (--db PATH), or "
+                          "correct this computer's clock if it is wrong; nothing was asked"
+                          % (_when_text(self.result.started_at), newest, _span(self.highwater - self.result.started_at), newest))
         # a row still open here belongs to a run that died (this collector holds the lock): mark it, keep its start time
         conn.execute("UPDATE runs SET kinds_refused=? WHERE ended_at IS NULL AND kinds_refused=''", (INTERRUPTED,))
         conn.execute("INSERT INTO runs VALUES (?, NULL, 0, 0, 0, 0, '')", (self.result.started_at,))
@@ -1473,15 +1627,23 @@ def _show(args, clock) -> tuple[str, int]:
     when = _parse_when(args.as_of) if args.as_of is not None else clock()
     skipped: list = []
     try:
+        _check_when(when)                                # the input is checked before the store is opened
         if kind == "news":
-            out: Any = _show_news(news_as_of(args.db, symbol, when), skipped)
-        elif kind is not None:
-            out = _show_fact(as_of(args.db, symbol, kind, when))
-        elif symbol == "*":
-            out = {EARNINGS_CALENDAR: _show_fact(as_of(args.db, symbol, EARNINGS_CALENDAR, when))}
+            if not valid_symbol(symbol):
+                raise ValueError("bad symbol")
         else:
-            out = {k: _show_fact(as_of(args.db, symbol, k, when)) for k in KINDS if k != "news"}
-            out["news"] = _show_news(news_as_of(args.db, symbol, when), skipped)
+            for k in [kind] if kind is not None else [EARNINGS_CALENDAR] if symbol == "*" else [k for k in KINDS if k != "news"]:
+                _check_fact(symbol, k)
+        with _snapshot(args.db) as conn:                 # one connection, one read transaction: every answer from one commit
+            if kind == "news":
+                out: Any = _show_news(news_as_of(conn, symbol, when), skipped)
+            elif kind is not None:
+                out = _show_fact(as_of(conn, symbol, kind, when))
+            elif symbol == "*":
+                out = {EARNINGS_CALENDAR: _show_fact(as_of(conn, symbol, EARNINGS_CALENDAR, when))}
+            else:
+                out = {k: _show_fact(as_of(conn, symbol, k, when)) for k in KINDS if k != "news"}
+                out["news"] = _show_news(news_as_of(conn, symbol, when), skipped)
     except ValueError as e:
         raise Refused(_one_line(e)) from None
     return json.dumps(out, indent=2), len(skipped)

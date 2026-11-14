@@ -15,6 +15,7 @@ Which test covers which numbered outcome of ticket T33 (the section names below 
   8 docstring rules and no use on the order path               -> "8. rules" section
 """
 import base64
+import contextlib
 import fcntl
 import hashlib
 import io
@@ -28,6 +29,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -2337,7 +2339,8 @@ def _http_date(ts):
     return format_datetime(datetime.fromtimestamp(ts, timezone.utc), usegmt=True)
 
 
-@pytest.mark.parametrize("offset, words", [(25 * 3600, "25.0 hours"), (365 * 86400, "365.0 days"), (-365 * 86400, "365.0 days")])
+@pytest.mark.parametrize("offset, words", [(25 * 3600, "25 hours 0 minutes"), (365 * 86400, "365 days 0 hours 0 minutes"),
+                                           (-365 * 86400, "365 days 0 hours 0 minutes")])      # rev 4 (R4b): hours and minutes
 def test_an_answer_dated_more_than_24_hours_from_the_wall_clock_stops_the_run_and_nothing_of_it_is_stored(tmp_path, capsys, offset, words):
     clock = Clock()
     dated = lambda call: _http_date(call.t + offset) if call.path == "/stock/profile2" else _http_date(call.t)   # noqa: E731
@@ -2402,7 +2405,7 @@ def test_the_collector_never_stamps_an_impossible_time_itself(tmp_path):
         assert fetch.calls == [] and "2000" in str(e.value) and "2100" in str(e.value)
 
 
-@pytest.mark.parametrize("ahead, words", [(2 * 3600, "2.0 hours"), (200 * 86400, "200.0 days")])
+@pytest.mark.parametrize("ahead, words", [(2 * 3600, "2 hours 0 minutes"), (200 * 86400, "200 days 0 hours 0 minutes")])     # rev 4 (R4b)
 def test_a_store_whose_newest_plausible_fetch_is_ahead_of_the_clock_is_refused_naming_the_times(tmp_path, ahead, words):
     run(tmp_path, ["AAA"], clock=Clock(T0 + ahead))
     fetch = Finnhub(Clock())
@@ -2506,8 +2509,13 @@ def test_an_article_id_is_usable_only_as_1_to_128_characters_or_an_integer_below
 def test_the_pacer_gives_up_cleanly_when_its_clock_has_not_advanced_across_1000_waits(tmp_path):
     clock = Clock()
     waits = []
+
+    def sleep(s):                                    # rev 4 (R3): bounded, so a broken rule fails at once instead of hanging
+        waits.append(s)
+        if len(waits) > 2000:
+            raise _Hung("the pacer waited 2000 times on a clock that never advanced")
     result = cf.collect(["S%02d" % i for i in range(20)], tmp_path / "cf.sqlite", fetch=Finnhub(clock), clock=clock,
-                        sleep=waits.append, credentials=lambda n: KEY, monotonic=lambda: 1000.0)
+                        sleep=sleep, credentials=lambda n: KEY, monotonic=lambda: 1000.0)
     assert result.calls == 55 and len(waits) == 1000 and result.stopped and "does not advance" in result.stopped
     assert rows(tmp_path, "SELECT calls, ended_at IS NOT NULL FROM runs") == [(55, 1)]
 
@@ -2524,3 +2532,674 @@ def test_the_pacer_goes_on_when_its_clock_advances_after_999_waits(tmp_path):
     result = cf.collect(["S%02d" % i for i in range(12)], tmp_path / "cf.sqlite", fetch=Finnhub(clock), clock=clock,
                         sleep=sleep, credentials=lambda n: KEY, monotonic=lambda: mono[0])
     assert result.stopped is None and result.calls == 73 and len(waits) == 999
+
+
+# ======================================================================================================================
+# rev 4 (ticket T33 rev 4): R1 the cut-store rule decided from bytes before SQLite opens anything; R2 status and show read
+# one committed state; R3 tests for four breaks no test caught; R4 the words a person reads.
+# ======================================================================================================================
+
+def _wal_sum(data, s, big):
+    """SQLite's WAL checksum over `data` (a multiple of 8 bytes), continuing from `s` (written here from the file format,
+    independently of the module)."""
+    s1, s2 = s
+    w = struct.unpack((">" if big else "<") + "%dI" % (len(data) // 4), data)
+    for i in range(0, len(w), 2):
+        s1 = (s1 + w[i] + s2) & 0xFFFFFFFF
+        s2 = (s2 + w[i + 1] + s1) & 0xFFFFFFFF
+    return s1, s2
+
+
+def _read_wal(path):
+    """(page size, frames) of a -wal SQLite wrote, every frame as (page number, commit size, page bytes), unvalidated."""
+    b = Path(path).read_bytes()
+    ps = struct.unpack(">I", b[8:12])[0]
+    frames, off = [], 32
+    while off + 24 + ps <= len(b):
+        pg, commit = struct.unpack(">2I", b[off:off + 8])
+        frames.append((pg, commit, b[off + 24:off + 24 + ps]))
+        off += 24 + ps
+    return ps, frames
+
+
+def _write_wal(path, ps, frames, big=False, salts=(0x1A2B3C4D, 0x5E6F7081)):
+    """A valid -wal holding `frames` in the word order `big` (magic 0x377F0683) or little (0x377F0682)."""
+    head = struct.pack(">6I", 0x377F0682 | int(big), 3007000, ps, 0, *salts)
+    s = _wal_sum(head, (0, 0), big)
+    out = [head, struct.pack(">2I", *s)]
+    for pg, commit, page in frames:
+        fh = struct.pack(">4I", pg, commit, *salts)
+        s = _wal_sum(page, _wal_sum(fh[:8], s, big), big)
+        out.append(fh + struct.pack(">2I", *s) + page)
+    Path(path).write_bytes(b"".join(out))
+
+
+def _sqlite_frames(path):
+    """How many frames of the -wal beside `path` SQLite itself trusts: open a copy (no -shm, so SQLite recovers from the
+    -wal alone) and ask for its log size."""
+    work = Path(str(path) + ".sq")
+    work.mkdir()
+    try:
+        for suffix in ("", "-wal"):
+            shutil.copy(str(path) + suffix, str(work / "x.db") + suffix)
+        conn = sqlite3.connect(work / "x.db")
+        try:
+            return conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()[1]
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(work)
+
+
+def _header(p):
+    b = Path(p).read_bytes()[:100]
+    return int.from_bytes(b[16:18], "big"), int.from_bytes(b[28:32], "big")
+
+
+NEWS_ROWS = 60
+
+
+def _news_rows(n=NEWS_ROWS):
+    return ["INSERT INTO news VALUES ('AAA','w%03d',%r,%r,'%s','s','u','m')" % (i, T0 - 60, T0 + 1, "x" * 900) for i in range(n)]
+
+
+def _model(n=NEWS_ROWS):
+    """The AAA articles a reader must see at T0 + 100 in a store made by `_live_store`."""
+    return sorted(["%d" % (sum(map(ord, "AAA")) * 10 + k) for k in (1, 2)] + ["w%03d" % i for i in range(n)])
+
+
+def _live_store(d):
+    """d/cf.sqlite: a store of one run with NEWS_ROWS more articles committed in its -wal and not checkpointed."""
+    side = d.parent / (d.name + "_side")
+    side.mkdir()
+    run(side, ["AAA"])
+    _live_copy(side / "cf.sqlite", d / "cf.sqlite", *_news_rows())
+    shutil.rmtree(side)
+    return d / "cf.sqlite"
+
+
+def _newest(frames):
+    out = {}
+    for pg, _, page in frames:
+        out[pg] = page
+    return out
+
+
+def _kill_in_checkpoint(d, extra=3):
+    """d/cf.sqlite as a kill in the middle of a checkpoint leaves it, byte for byte: the checkpoint has written page 1 and
+    the pages up to K (the old size + `extra`) from the -wal, in page order, and died; the main file is K pages long, its
+    header says M (the -wal's last commit), and every page from K + 1 to M is in a committed frame. Returns (path, K, M)."""
+    p = _live_store(d)
+    ps, frames = _read_wal(str(p) + "-wal")
+    old = p.stat().st_size // ps
+    commit = [c for _, c, _ in frames if c][-1]
+    k = old + extra
+    with open(p, "r+b") as f:
+        for pg, page in sorted(_newest(frames).items()):
+            if pg == 1 or pg <= k:
+                f.seek((pg - 1) * ps)
+                f.write(page)
+    assert p.stat().st_size == k * ps and _header(p) == (ps, commit) and commit > k + 2
+    return p, k, commit
+
+
+def _cut_main(d, pages=5):
+    """d/cf.sqlite: a whole store with NEWS_ROWS more articles, checkpointed (no -wal), then cut by `pages` pages."""
+    side = d.parent / (d.name + "_cut")
+    side.mkdir()
+    run(side, ["AAA"])
+    _sql(side / "cf.sqlite", *_news_rows())
+    b = (side / "cf.sqlite").read_bytes()
+    ps = _header(side / "cf.sqlite")[0]
+    (d / "cf.sqlite").write_bytes(b[:len(b) - pages * ps])
+    shutil.rmtree(side)
+    return d / "cf.sqlite"
+
+
+def _wal_from(d, name, statements, base_store=True):
+    """The -wal of a database (a fresh one-run store, or another program's database) after `statements`, each committed."""
+    src = d.parent / (d.name + "_" + name)
+    src.mkdir()
+    db = src / "x.db"
+    if base_store:
+        run(src, ["AAA"], name="x.db")
+    else:
+        _sql(db, "CREATE TABLE t(x)", *["INSERT INTO t VALUES ('%s')" % ("y" * 300)] * 200)
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    for st in statements:
+        conn.execute(st)
+        conn.commit()
+    wal = Path(str(db) + "-wal").read_bytes()
+    conn.close()
+    shutil.rmtree(src)
+    return wal
+
+
+def _k_one_page_wal(d):                      # a -wal of 12 frames, all of one page of this store
+    p = _cut_main(d)
+    Path(str(p) + "-wal").write_bytes(_wal_from(d, "w", ["UPDATE runs SET calls=%d" % i for i in range(12)]))
+    ps, frames = _read_wal(str(p) + "-wal")
+    assert len(frames) == 12 and len({pg for pg, _, _ in frames}) == 1
+    return p
+
+
+def _k_foreign_wal(d):                       # another database's -wal
+    p = _cut_main(d)
+    Path(str(p) + "-wal").write_bytes(_wal_from(d, "f", ["UPDATE t SET x='%s' WHERE rowid=%d" % ("z" * 300, i + 1) for i in range(10)],
+                                                base_store=False))
+    return p
+
+
+def _k_stale_wal(d):                         # a -wal of this same store from before later writes
+    p = _cut_main(d, pages=4)
+    Path(str(p) + "-wal").write_bytes(_wal_from(d, "s", ["INSERT INTO runs VALUES (%r, %r, 0, 0, 0, 0, '')" % (T0 + i, T0 + i) for i in range(8)]))
+    return p
+
+
+def _k_frame1_checksum_broken(d):            # the right -wal with frame 1's checksum broken
+    p, _, _ = _kill_in_checkpoint(d)
+    with open(str(p) + "-wal", "r+b") as f:
+        f.seek(32 + 16)
+        x = f.read(1)
+        f.seek(32 + 16)
+        f.write(bytes([x[0] ^ 0xFF]))
+    return p
+
+
+def _rewal(p, edit, big=False):
+    """Rewrite the -wal beside `p` as a valid -wal of the frames `edit(frames, k, m)` returns (the -shm is removed)."""
+    ps, frames = _read_wal(str(p) + "-wal")
+    k = p.stat().st_size // ps
+    m = [c for _, c, _ in frames if c][-1]
+    _write_wal(str(p) + "-wal", ps, edit(frames, k, m), big=big)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(str(p) + "-shm")
+    return p
+
+
+def _drop(page_of):
+    """The frames without those of one page; a dropped commit frame hands its commit size to the frame before it, so the
+    last commit still says M."""
+    def edit(frames, k, m):
+        out = []
+        for pg, commit, page in frames:
+            if pg == page_of(k, m):
+                if commit and out:
+                    out[-1] = (out[-1][0], commit, out[-1][2])
+                continue
+            out.append((pg, commit, page))
+        return out
+    return edit
+
+
+def _s_no_commit(d):                         # every frame valid, none a commit
+    p, _, _ = _kill_in_checkpoint(d)
+    return _rewal(p, lambda frames, k, m: [(pg, 0, page) for pg, _, page in frames])
+
+
+def _s_all_missing_pages_but_one(d):         # a counted frame for every missing page but one
+    p, _, _ = _kill_in_checkpoint(d)
+    return _rewal(p, _drop(lambda k, m: k + 2))
+
+
+def _s_missing_page_only_after_the_last_commit(d):      # a valid frame AFTER the last commit holds the missing page
+    p, _, _ = _kill_in_checkpoint(d)
+
+    def edit(frames, k, m):
+        return _drop(lambda k_, m_: k + 2)(frames, k, m) + [(k + 2, 0, _newest(frames)[k + 2])]
+    return _rewal(p, edit)
+
+
+def _s_header_checksum_broken(d):
+    p, _, _ = _kill_in_checkpoint(d)
+    _rewal(p, lambda frames, k, m: frames)
+    with open(str(p) + "-wal", "r+b") as f:  # the checkpoint sequence number changes; the stored checksum does not
+        f.seek(15)
+        f.write(b"\x07")
+    return p
+
+
+def _s_frame_checksum_broken(d):             # one byte of a page in the frame of a missing page
+    p, k, _ = _kill_in_checkpoint(d)
+    ps, frames = _read_wal(str(p) + "-wal")
+    i = max(n for n, f in enumerate(frames) if f[0] == k + 1)
+    with open(str(p) + "-wal", "r+b") as f:
+        f.seek(32 + i * (24 + ps) + 24 + 777)
+        x = f.read(1)
+        f.seek(32 + i * (24 + ps) + 24 + 777)
+        f.write(bytes([x[0] ^ 0x01]))
+    return p
+
+
+def _s_partial_last_page(d):                 # page K + 1 is only partly in the main file and in no frame
+    p, k, _ = _kill_in_checkpoint(d)
+    ps, frames = _read_wal(str(p) + "-wal")
+    part = _newest(frames)[k + 1][:100]
+    _rewal(p, _drop(lambda k_, m: k + 1))
+    with open(p, "ab") as f:
+        f.write(part)
+    return p
+
+
+def _s_commit_size_beyond_every_frame(d):    # a whole main file; the -wal's commit says M pages but page M is in no frame
+    p = _live_store(d)
+    return _rewal(p, _drop(lambda k, m: m))
+
+
+def _s_page_number_0_frame_in_the_chain(d):  # addendum B1: the chain passes through a frame of page number 0
+    p, _, _ = _kill_in_checkpoint(d)
+    _rewal(p, lambda frames, k, m: [(0, 0, frames[0][2])] + frames)      # right salts and checksums, page number 0
+    ps, frames = _read_wal(str(p) + "-wal")
+    wal = cf._wal_scan(p, ps)
+    assert wal.salted == len(frames) and wal.counted == 0             # every salt right; the walk ends at that frame
+    return p
+
+
+R1_REFUSED = {
+    "cut_main_and_a_page_number_0_frame_before_the_missing_pages": _s_page_number_0_frame_in_the_chain,
+    "cut_main_and_a_wal_of_12_frames_of_one_page": _k_one_page_wal,
+    "cut_main_and_another_databases_wal": _k_foreign_wal,
+    "cut_main_and_a_stale_wal_of_this_store": _k_stale_wal,
+    "cut_main_and_the_right_wal_with_frame_1s_checksum_broken": _k_frame1_checksum_broken,
+    "cut_main_and_valid_frames_but_no_commit_frame": _s_no_commit,
+    "cut_main_and_a_frame_for_every_missing_page_but_one": _s_all_missing_pages_but_one,
+    "cut_main_and_the_missing_page_only_after_the_last_commit": _s_missing_page_only_after_the_last_commit,
+    "cut_main_and_the_wal_header_checksum_broken": _s_header_checksum_broken,
+    "cut_main_and_a_frame_checksum_broken": _s_frame_checksum_broken,
+    "cut_main_whose_last_page_is_partial_and_in_no_frame": _s_partial_last_page,
+    "a_commit_size_beyond_every_frame": _s_commit_size_beyond_every_frame,
+}
+
+
+@pytest.fixture
+def opened_by_sqlite(monkeypatch):
+    """Every database name SQLite is asked to open while the test runs."""
+    seen = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        seen.append(str(a[0] if a else k.get("database")))
+        return real(*a, **k)
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return seen
+
+
+@pytest.mark.parametrize("name", list(R1_REFUSED))
+def test_r1_a_store_that_is_not_whole_is_refused_before_sqlite_opens_it_and_nothing_changes(tmp_path, name, capsys, opened_by_sqlite):
+    d = tmp_path / "s"
+    d.mkdir()
+    path = R1_REFUSED[name](d)
+    before = snap(d)
+    del opened_by_sqlite[:]
+    fetch = Finnhub(Clock(T0 + 100))
+    with pytest.raises(cf.Refused) as e:
+        run(d, ["AAA"], fetch=fetch, clock=Clock(T0 + 100))
+    text = str(e.value)
+    assert "\n" not in text and "nothing was done" in text and ("cut short" in text or "not whole" in text), text
+    for call in (lambda: cf.as_of(path, "AAA", "profile", T0 + 100), lambda: cf.news_as_of(path, "AAA", T0 + 100), lambda: cf.status(path)):
+        with pytest.raises(cf.Refused) as e:
+            call()
+        assert "nothing was done" in str(e.value)
+    assert cf.main(["collect", "--symbols", "AAA", "--db", str(path)], fetch=fetch, credentials=lambda n: KEY, clock=Clock(T0 + 100)) == 2
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    for argv in (["status"], ["show", "AAA"], ["show", "AAA", "--kind", "news"]):
+        assert cf.main(argv + ["--db", str(path)]) == 2
+        assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert fetch.calls == [] and snap(d) == before                     # bytes, modification times and directory entries
+    assert not [n for n in opened_by_sqlite if str(d) in n], opened_by_sqlite      # SQLite was never asked to open it
+
+
+def _opened_everywhere(path, capsys):
+    """Every reader reads the model, the collector runs on it, and SQLite finds it whole."""
+    assert sorted(a["article_id"] for a in cf.news_as_of(path, "AAA", T0 + 100) if a["fetched_at"] <= T0 + 1) == _model()
+    assert cf.as_of(path, "AAA", "profile", T0 + 100)["body"]["ticker"] == "AAA"
+    assert cf.status(path)["rows"]["news"] == len(_model())
+    assert cf.main(["status", "--db", str(path)]) == 0
+    assert cf.main(["show", "AAA", "--db", str(path), "--as-of", "2026-11-14T12:05:00Z"]) == 0
+    capsys.readouterr()
+    clock = Clock(T0 + 200)
+    result, _, _ = run(path.parent, ["AAA"], clock=clock)
+    assert result.stopped is None and result.failed == 0
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        got = sorted(r[0] for r in conn.execute("SELECT article_id FROM news WHERE fetched_at<=?", (T0 + 1,)))
+    finally:
+        conn.close()
+    assert got == _model()
+
+
+@pytest.mark.parametrize("big", [None, False, True])
+def test_r1_a_main_file_left_short_by_a_kill_during_a_checkpoint_is_opened_whole(tmp_path, capsys, big):
+    """None: the -wal exactly as SQLite wrote it; False/True: rewritten in each word order of the magic."""
+    d = tmp_path / "k"
+    d.mkdir()
+    p, k, m = _kill_in_checkpoint(d)
+    if big is not None:
+        _rewal(p, lambda frames, k_, m_: frames, big=big)
+        assert Path(str(p) + "-wal").read_bytes()[3] == (0x83 if big else 0x82)
+    assert p.stat().st_size // _header(p)[0] == k < m == _header(p)[1]
+    assert cf._store_problem(p) is None
+    assert cf._wal_scan(p, _header(p)[0]).counted == _sqlite_frames(p) > 0
+    _opened_everywhere(p, capsys)
+
+
+def _random_db(d, rnd, big):
+    """A database SQLite wrote with a random history, copied with its live -wal (checkpoints off); sometimes in the middle
+    of a transaction whose pages spilled into the -wal before its commit. Returns the copy's path and its page size."""
+    src = d / "src.db"
+    ps = rnd.choice([512, 1024, 4096, 8192])
+    conn = sqlite3.connect(src, isolation_level=None)
+    conn.execute("PRAGMA page_size=%d" % ps)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+    for _ in range(rnd.randint(1, 12)):
+        conn.execute("BEGIN")
+        for _ in range(rnd.randint(1, 30)):
+            op = rnd.random()
+            if op < 0.6:
+                conn.execute("INSERT INTO t(b) VALUES (?)", ("v" * rnd.randint(1, 3000),))
+            elif op < 0.85:
+                conn.execute("UPDATE t SET b=? WHERE a % 7 = ?", ("u" * rnd.randint(1, 900), rnd.randint(0, 6)))
+            else:
+                conn.execute("DELETE FROM t WHERE a % 11 = ?", (rnd.randint(0, 10),))
+        conn.execute("COMMIT")
+    spilled = rnd.random() < 0.3
+    if spilled:                                  # an open transaction whose pages spill into the -wal before any commit
+        conn.execute("PRAGMA cache_size=2")
+        conn.execute("BEGIN")
+        for _ in range(60):
+            conn.execute("INSERT INTO t(b) VALUES (?)", ("s" * 2000,))
+    dest = d / "copy.db"
+    for suffix in ("", "-wal"):
+        shutil.copy(str(src) + suffix, str(dest) + suffix)
+    if spilled:
+        conn.execute("ROLLBACK")
+    conn.close()
+    if big:
+        _rewal(dest, lambda frames, k, m: frames, big=True)
+    return dest, ps
+
+
+def test_r1_the_walk_counts_exactly_the_frames_sqlite_trusts_on_60_generated_stores_and_none_from_a_flipped_byte_on(tmp_path):
+    rnd = random.Random(404)
+    flips = 0
+    for i in range(60):
+        d = tmp_path / ("g%02d" % i)
+        d.mkdir()
+        db, ps = _random_db(d, rnd, big=(i % 4 == 3))
+        want = _sqlite_frames(db)
+        assert cf._wal_scan(db, ps).counted == want, i
+        ps_, frames = _read_wal(str(db) + "-wal")
+        commits = [n + 1 for n, f in enumerate(frames) if f[1]]
+        if frames:
+            k = rnd.randint(1, len(frames))                       # flip one byte of frame k (its header or its page)
+            off = 32 + (k - 1) * (24 + ps) + rnd.choice([rnd.randint(0, 7), rnd.randint(16, 23), 24 + rnd.randint(0, ps - 1)])
+            with open(str(db) + "-wal", "r+b") as f:
+                f.seek(off)
+                x = f.read(1)
+                f.seek(off)
+                f.write(bytes([x[0] ^ (1 << rnd.randint(0, 7))]))
+            before_k = max([c for c in commits if c < k], default=0)
+            got = cf._wal_scan(db, ps).counted
+            assert got == _sqlite_frames(db) == before_k, (i, k, got, before_k)
+            flips += 1
+        shutil.rmtree(d)
+    assert flips >= 50
+
+
+# ---- R1: "nothing was done" only before SQLite opened the store
+
+def test_r1_a_refusal_after_sqlite_opened_the_store_says_so_and_never_says_nothing_was_done(tmp_path, monkeypatch):
+    run(tmp_path, ["AAA"])
+    real = cf._remove_own_leftovers
+
+    def swap(path):                                  # the store is replaced just before SQLite opens it
+        real(path)
+        _sql(tmp_path / "other.db", "PRAGMA application_id=%d" % cf.APPLICATION_ID, "PRAGMA user_version=1")
+        os.replace(tmp_path / "other.db", path)
+    monkeypatch.setattr(cf, "_remove_own_leftovers", swap)
+    with pytest.raises(cf.Refused) as e:
+        run(tmp_path, ["AAA"], clock=Clock(T0 + 10))
+    text = str(e.value)
+    assert "nothing was done" not in text and "SQLite" in text and "side files" in text and "\n" not in text, text
+    monkeypatch.undo()
+    (tmp_path / "x").mkdir()
+    run(tmp_path / "x", ["AAA"])
+    good = tmp_path / "x" / "cf.sqlite"
+    ps, n = _header(good)
+    with open(good, "r+b") as f:                     # whole by its bytes, but its pages after page 1 are garbage
+        f.seek(ps)
+        f.write(b"\xa5" * (ps * (n - 1)))
+    with pytest.raises(cf.Refused) as e:
+        cf.as_of(good, "AAA", "profile", T0 + 1)
+    text = str(e.value)
+    assert "nothing was done" not in text and "SQLite could not use it" in text and "side files" in text, text
+
+
+# ---- R2: status and show read one committed state
+
+def _commit_between_statements(monkeypatch, db):
+    """Make a second connection commit new rows of every kind between the first statement a reader runs on the store's
+    data and the next one (a trace callback on the reader's connection: deterministic, no timing)."""
+    real = sqlite3.connect
+    state = {"selects": 0, "committed": False, "error": None}
+    body = cf.canonical_json({"ticker": "AAA", "v": "new"})
+    statements = ["INSERT INTO observations VALUES ('%s','%s',%r,'%s','%s')" % (s, k, T0 + 30, cf.body_sha256(body), body)
+                  for s, k in [("AAA", k) for k in cf.STORED_KINDS if k != "earnings_calendar"] + [("*", "earnings_calendar"), ("NEWSYM", "profile")]]
+    statements += ["INSERT INTO observations VALUES ('AAA','unknown',%r,'%s','%s')" % (T0 + 30, cf.body_sha256(body), body),
+                   "INSERT INTO observations VALUES ('AAA','profile',1e300,'%s','%s')" % (cf.body_sha256(body), body),
+                   "INSERT INTO observations VALUES ('AAA','metrics',%r,'%s','%s')" % (cf.MIN_FETCH_TIME + 5, cf.body_sha256(body), body),
+                   "INSERT INTO news VALUES ('AAA','late',%r,%r,'h','s','u','m')" % (T0 + 20, T0 + 40),
+                   "INSERT INTO runs VALUES (%r, %r, 9, 9, 9, 9, '')" % (T0 + 30, T0 + 31),
+                   "INSERT INTO runs VALUES (%r, NULL, 1, 0, 0, 0, '%s')" % (T0 + 29, cf.INTERRUPTED),
+                   "INSERT INTO runs VALUES ('bad', NULL, 1, 0, 0, 0, '')"]
+
+    def commit_now():
+        try:
+            w = real(db)
+            for st in statements:
+                w.execute(st)
+            w.commit()
+            w.close()
+            state["committed"] = True
+        except Exception as e:                       # (a callback's error would be swallowed: keep it for the test)
+            state["error"] = e
+
+    def trace(sql):
+        if sql.lstrip().upper().startswith("SELECT") and "sqlite_master" not in sql:
+            state["selects"] += 1
+            if state["selects"] == 2 and not state["committed"]:
+                commit_now()
+
+    def spy(*a, **k):
+        conn = real(*a, **k)
+        target = a[0] if a else k.get("database")
+        if isinstance(target, str) and target.startswith("file:"):
+            conn.set_trace_callback(trace)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return state
+
+
+def test_r2_one_status_call_reads_one_committed_state_in_every_field(tmp_path, monkeypatch):
+    run(tmp_path, ["AAA", "BBB"])
+    db = tmp_path / "cf.sqlite"
+    before = cf.status(db)
+    state = _commit_between_statements(monkeypatch, db)
+    got = cf.status(db)
+    assert state["error"] is None and state["committed"] and state["selects"] >= 2
+    monkeypatch.undo()
+    after = cf.status(db)
+    assert got == before
+    assert all(after[k] != before[k] for k in before if k != "leftovers"), {k: (before[k], after[k]) for k in before}
+
+
+@pytest.mark.parametrize("argv", [["show", "AAA"], ["show", "AAA", "--kind", "news"], ["show", "AAA", "--kind", "metrics"]])
+def test_r2_one_show_call_reads_one_committed_state(tmp_path, monkeypatch, capsys, argv):
+    run(tmp_path, ["AAA", "BBB"])
+    db = tmp_path / "cf.sqlite"
+    argv = argv + ["--db", str(db), "--as-of", "2026-11-14T13:00:00Z"]
+    assert cf.main(argv) == 0
+    before = capsys.readouterr().out
+    state = _commit_between_statements(monkeypatch, db)
+    assert cf.main(argv) == 0
+    got = capsys.readouterr().out
+    monkeypatch.undo()
+    assert state["error"] is None and got == before
+    if "--kind" in argv:                     # one kind is one statement on the data: one commit by construction
+        assert state["selects"] == 1 and not state["committed"]
+    else:
+        assert state["committed"] and cf.main(argv) == 0 and capsys.readouterr().out != before   # the commit did land
+
+
+# ---- R3: breaks no test caught
+
+def _immutable_hook(monkeypatch, db, act):
+    """Run `act()` once, when an immutable reader of `db` starts its first statement on the store's data."""
+    real = sqlite3.connect
+    done = []
+
+    def spy(*a, **k):
+        conn = real(*a, **k)
+        target = a[0] if a else k.get("database")
+        if isinstance(target, str) and "immutable=1" in target:
+            def trace(sql):
+                if not done and sql.lstrip().upper().startswith("SELECT") and "sqlite_master" not in sql:
+                    done.append(sql)
+                    act()
+            conn.set_trace_callback(trace)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return done
+
+
+def _touch(db):
+    st = db.stat()
+    os.utime(db, ns=(st.st_atime_ns, st.st_mtime_ns + 7 * 10 ** 9))
+
+
+def _scribble(db):
+    ps, n = _header(db)
+    with open(db, "r+b") as f:
+        f.seek(ps)
+        f.write(b"\xa5" * (ps * (n - 1)))
+
+
+@pytest.mark.parametrize("act", [_touch, _scribble])
+@pytest.mark.parametrize("reader", ["as_of", "news_as_of", "status"])
+def test_r3_r4_a_read_in_a_read_only_place_that_overlaps_a_write_is_refused_as_that_never_returned(tmp_path, monkeypatch, act, reader):
+    d = tmp_path / "ro"
+    d.mkdir()
+    run(d, ["AAA"])
+    db = d / "cf.sqlite"
+    done = _immutable_hook(monkeypatch, db, lambda: act(db))
+    call = {"as_of": lambda: cf.as_of(db, "AAA", "profile", T0 + 1), "news_as_of": lambda: cf.news_as_of(db, "AAA", T0 + 1),
+            "status": lambda: cf.status(db)}[reader]
+    os.chmod(d, 0o555)
+    try:
+        with pytest.raises(cf.Refused) as e:
+            call()
+    finally:
+        os.chmod(d, 0o755)
+    text = str(e.value)
+    assert done and "\n" not in text and "being written while it was read" in text and "ask again" in text, text
+    assert "malformed" not in text
+
+
+def test_r3_a_bare_bytes_answer_from_the_transport_is_counted_failed_and_stores_nothing(tmp_path):
+    clock = Clock()
+    inner = Finnhub(clock)
+    result = cf.collect(["AAA"], tmp_path / "cf.sqlite", fetch=lambda u, h: inner(u, h)[0], clock=clock, sleep=clock.sleep,
+                        credentials=lambda n: KEY, monotonic=clock.monotonic)
+    assert result.calls == 7 and result.failed == 7 and result.stored == 0
+    assert {r for _, r in result.failures} == {"not an answer"}
+    assert rows(tmp_path, "SELECT count(*) FROM observations") == [(0,)] and rows(tmp_path, "SELECT count(*) FROM news") == [(0,)]
+
+
+@pytest.mark.parametrize("kind", [None, "news"])
+def test_r3_show_skips_and_counts_a_stored_article_it_cannot_show(tmp_path, capsys, kind):
+    run(tmp_path, ["AAA"])
+    db = tmp_path / "cf.sqlite"
+    _sql(db, "INSERT INTO news VALUES ('AAA','far',-1e300,%r,'h','s','u','m')" % (T0 + 1),
+         "INSERT INTO news VALUES ('AAA','blob',%r,%r,x'00ff','s','u','m')" % (T0 - 60, T0 + 1))
+    argv = ["show", "AAA", "--db", str(db), "--as-of", "2026-11-14T13:00:00Z"] + (["--kind", kind] if kind else [])
+    assert cf.main(argv) == 0
+    out = capsys.readouterr()
+    shown = json.loads(out.out)
+    articles = shown if kind else shown["news"]
+    assert sorted(a["article_id"] for a in articles) == sorted(_model(0)) and len(out.err.strip().splitlines()) == 1
+    assert "2 stored articles cannot be shown and were skipped" in out.err
+
+
+class _Hung(BaseException):
+    """Raised by a fake clock or sleep that has been read far more often than the rule allows: a broken rule fails fast."""
+
+
+# ---- R4: the words a person reads
+
+@pytest.mark.parametrize("seconds, words", [(24 * 3600 + 30, "24 hours 1 minute"), (24 * 3600 + 0.001, "24 hours 1 minute"),
+                                            (25 * 3600, "25 hours 0 minutes"), (2 * 3600, "2 hours 0 minutes"), (90, "0 hours 2 minutes"),
+                                            (365 * 86400, "365 days 0 hours 0 minutes"), (-(3 * 86400 + 61), "3 days 0 hours 2 minutes")])
+def test_r4_a_gap_is_printed_in_hours_and_minutes_rounded_up(seconds, words):
+    assert cf._span(seconds) == words
+
+
+def test_r4_an_answer_dated_just_over_24_hours_away_never_reads_24_point_0_hours(tmp_path):
+    clock = Clock()
+    fetch = Finnhub(clock, date=lambda call: _http_date(call.t - 24 * 3600 - 30))
+    result, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+    assert "more than 24 hours" in result.stopped and "24 hours 1 minute" in result.stopped and "24.0 hours" not in result.stopped
+
+
+def test_r4_rows_ahead_of_the_clock_name_both_times_say_runs_resume_by_themselves_and_what_to_do_sooner(tmp_path):
+    run(tmp_path, ["AAA"], clock=Clock(T0 + 3 * 3600))
+    with pytest.raises(cf.Refused) as e:
+        run(tmp_path, ["AAA"])
+    text = str(e.value)
+    assert cf._iso(T0) in text and cf._iso(T0 + 3 * 3600) in text and "3 hours 0 minutes" in text and "\n" not in text
+    assert "resume by themselves" in text and "--db" in text and "set the clock right" not in text, text
+
+
+# ---- addendum 1, B2: a store file (or its -wal) that cannot be written is a one-line refusal, never a raw SQLite error
+
+@pytest.mark.parametrize("which", ["store_file", "wal_file"])
+@pytest.mark.parametrize("seen", ["before_sqlite_opens", "after_sqlite_opened"])
+def test_b2_collecting_into_a_store_that_cannot_be_written_is_a_one_line_refusal(tmp_path, capsys, monkeypatch, which, seen):
+    """The volume enforces the modes, so the module sees them before SQLite opens anything: refused, nothing changes. Where
+    it could not see them (os.access made to say yes), SQLite's own error after it opened the store is the refusal, in
+    words that say SQLite had opened it."""
+    d = tmp_path / "d"
+    d.mkdir()
+    if which == "store_file":
+        run(d, ["AAA"])
+        target = d / "cf.sqlite"
+    else:                                            # a writable store and folder beside a -wal (with content) that is not
+        target = Path(str(_live_store(d)) + "-wal")
+    os.chmod(target, 0o444)
+    try:
+        if seen == "after_sqlite_opened":
+            monkeypatch.setattr(os, "access", lambda *a, **k: True)
+        before = snap(d)
+        fetch = Finnhub(Clock(T0 + 100))
+        with pytest.raises(cf.Refused) as e:
+            run(d, ["AAA"], fetch=fetch, clock=Clock(T0 + 100))
+        text = str(e.value)
+        rc = cf.main(["collect", "--symbols", "AAA", "--db", str(d / "cf.sqlite")], fetch=fetch, credentials=lambda n: KEY,
+                     clock=Clock(T0 + 100))
+        out = capsys.readouterr()
+        monkeypatch.undo()
+        assert "\n" not in text and rc == 2 and out.out == "" and len(out.err.strip().splitlines()) == 1 and "Traceback" not in out.err
+        assert fetch.calls == []
+        after = snap(d)
+        if seen == "before_sqlite_opens":
+            assert "nothing was done" in text and "read-only" in text and after == before, text
+        else:
+            assert "nothing was done" not in text and "SQLite" in text and "side files" in text, text
+            assert after["cf.sqlite"] == before["cf.sqlite"] and after.get(target.name) == before[target.name]   # the file
+            assert set(after) - set(before) <= {"cf.sqlite-wal", "cf.sqlite-shm"}, sorted(after)        # SQLite's own side files
+    finally:
+        os.chmod(target, 0o644)
