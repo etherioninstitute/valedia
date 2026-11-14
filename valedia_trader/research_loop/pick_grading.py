@@ -64,7 +64,9 @@ Commands:
   `BOUNDARY` (2026-12-13 00:00 US-Eastern, clarification 22), is dropped from the scores list before it is stored (the
   count dropped is shown), and so from the copy of the answer the credit ledger keeps (`calls.body`, written by
   `sports_lines.CreditLedger.attempt`: it holds the kept entries only, while the credits spent and the call are
-  recorded as for any call; after a choice it holds the whole answer); no Kalshi settlement of the day of a game a test-period pick is matched to is fetched, and
+  recorded as for any call; after a choice it holds the whole answer). Before a choice an entry that is not an object
+  is dropped the same way, and of an answer that is not a list nothing is kept (the ledger's body is `null`; the
+  answer is reported unusable); no Kalshi settlement of the day of a game a test-period pick is matched to is fetched, and
   of a market Kalshi dates `KALSHI_BOUNDARY_DAY` or later only those of games the schedule starts before the boundary
   are stored (Kalshi dates a game starting between 00:00 and 05:59 US-Eastern the day before).
   Question B: a pick on a game Kalshi lists (a stored code table's event or a stored market's event dated the game's
@@ -1828,7 +1830,8 @@ def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     pick is matched to), nor for any game on a league-day `_held` holds; and a date from
     `KALSHI_BOUNDARY_DAY` on is stored only for the games before the boundary (`_settled_before_choice`). The callers
     pass rows of a current `match` run (`need_current`) with held games left out, and a row's start is the schedule's
-    start, so no separate clock condition is needed here. Errors of one league are recorded and the others go on."""
+    start; a row of a day of the test period or starting at or after `BOUNDARY` is still left out here, a second wall
+    for a call made another way. Errors of one league are recorded and the others go on."""
     out: dict[str, Any] = {}
     games = schedule_games(gr.store.lists())
     by_league: dict[str, set] = {}
@@ -1836,8 +1839,12 @@ def _kalshi_sync(gr: Grader, rows: Sequence[dict], now: datetime) -> dict:
     held_ids, held = _held(gr.store)
     for r in rows:
         d = sl.eastern_date(r["start"])
-        if _ts(r["start"]) < now.timestamp() and not (no_choice and ((r["league"], d) in held
-                                                                      or r["game_id"] in held_ids)):
+        # The clock conditions are a second wall: every caller already leaves out held rows of a current `match` run,
+        # whose starts are the schedule's, so they change nothing for them; they keep this function safe on its own.
+        if _ts(r["start"]) < now.timestamp() and not (no_choice and (d >= PERIODS["test"][0]
+                                                                      or (r["league"], d) in held
+                                                                      or r["game_id"] in held_ids
+                                                                      or _ts(r["start"]) >= BOUNDARY_TS)):
             by_league.setdefault(r["league"], set()).add(d)
     if not by_league:
         return out
@@ -1939,9 +1946,10 @@ def cmd_prices(gr: Grader) -> dict:
 def _dropped_before_storing(e, held: set[str], starts: dict[str, int], no_choice: bool) -> bool:
     """Whether a scores answer's entry is dropped before the answer is stored: a game held for the test (`_held`),
     and, before a choice, any game the schedule does not start before `BOUNDARY`: one the schedule lacks by its own
-    `commence_time`, and one with no readable time at all (clarification 22)."""
+    `commence_time`, and one with no readable time at all (clarification 22). An entry that is not an object is dropped
+    before a choice (whatever it holds, nothing reads it) and kept after it, as it came."""
     if not isinstance(e, dict):
-        return False
+        return no_choice
     gid = str(e.get("id"))
     if gid in held:
         return True
@@ -1958,10 +1966,11 @@ def _dropped_before_storing(e, held: set[str], starts: dict[str, int], no_choice
 def _scores_kept(answer, held: set[str], starts: dict[str, int], no_choice: bool, seen: dict) -> Any:
     """What of a scores answer is kept anywhere, the credit ledger's copy included (`sports_lines.CreditLedger`
     keeps what the send it is given returns): the entries `_dropped_before_storing` does not drop. `seen["listed"]`
-    receives how many entries the answer had. An answer that is not a list is returned as it is (it has no entries,
-    and the caller refuses it)."""
+    receives how many entries the answer had. Before a choice an answer that is not a list keeps nothing (`None`: the
+    ledger's body is `null`, the call and its credits recorded as for any answer) and the caller refuses it as
+    unusable; after the choice it is returned as it is (and refused the same way)."""
     if not isinstance(answer, list):
-        return answer
+        return None if no_choice else answer
     seen["listed"] = len(answer)
     return [e for e in answer if not _dropped_before_storing(e, held, starts, no_choice)]
 

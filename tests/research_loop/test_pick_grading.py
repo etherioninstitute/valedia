@@ -2951,3 +2951,109 @@ def test_a_market_of_a_game_from_the_boundary_on_is_not_stored_before_the_choice
     assert stored == {"p%02d" % i for i in range(10)}
     out = env.out(capsys, "prices")
     assert out["pairing"]["NBA"]["markets_held_before_choice"] == 20                     # e's 10 events, 2 markets each
+
+
+# ---------------------------------------------------------------- rev 8, outcome 1: an answer of the wrong shape
+
+def _shape_env(tmp_path, capsys, monkeypatch, shape):
+    """The boundary-edge world of rev 7 with the scores answer replaced by `shape(answer)` before `results` runs."""
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, "TWIN_KINDS", EDGE_KINDS)
+    monkeypatch.setattr(mod, "TWIN_LATE", ())
+    env, _ = _twin_env(tmp_path, False)
+    env.odds.scores["basketball_nba"] = shape(env.odds.scores["basketball_nba"])
+    out = None
+    for step, at in (("schedule", "2026-12-12T19:00:00Z"), ("match", "2026-12-12T23:00:00Z"),
+                     ("audit", "2026-12-12T23:05:00Z"), ("results", "2026-12-13T10:40:00Z")):
+        env.clock.set(at)
+        if step == "audit":
+            env.audit(capsys)
+        else:
+            out = env.out(capsys, step)
+    return env, out
+
+
+def _scores_calls(root):
+    c = sqlite3.connect(root / "credits.sqlite")
+    try:
+        return [dict(zip(("status", "ok", "charged", "last", "error"), r)) for r in
+                c.execute("SELECT status, ok, charged, last, error FROM calls WHERE path LIKE '%/scores%' ORDER BY id")]
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("shape", ["object_wrapping_the_list", "json_string"])
+def test_before_the_choice_a_scores_answer_that_is_not_a_list_keeps_no_body(tmp_path, capsys, monkeypatch, shape):
+    """An answer that is not a list (an object wrapping the list, the list as a JSON string): before the choice the
+    credit ledger keeps no body of it (`null`), nothing reaches the scores table, the call is recorded as any answered
+    call (done, its credits and headers) and the command reports the answer as unusable, as before."""
+    wrap = {"object_wrapping_the_list": lambda a: {"data": a}, "json_string": lambda a: json.dumps(a)}[shape]
+    env, out = _shape_env(tmp_path, capsys, monkeypatch, wrap)
+    assert out["scores"]["NBA"] == "error: OddsApiError"
+    assert _ledger_bodies(env.root, "/scores") == [None]
+    assert _scores_calls(env.root) == [{"status": "done", "ok": 1, "charged": 2, "last": 2, "error": None}]
+    assert _stored_finals(env) == set()
+
+
+def test_before_the_choice_entries_that_are_not_objects_are_dropped_before_anything_is_stored(tmp_path, capsys,
+                                                                                             monkeypatch):
+    """A list holding entries that are not objects (here a held final inside a list, and one as a JSON string): before
+    the choice they are dropped from what the ledger keeps and from the scores table; after the choice the whole
+    answer is kept, as before (no reader parses those shapes)."""
+    def with_odd_entries(answer):
+        by = {e["id"]: e for e in answer}
+        return answer + [[by["e00"]], json.dumps(by["e01"]), 7, None]
+
+    env, out = _shape_env(tmp_path, capsys, monkeypatch, with_odd_entries)
+    want = {"p%02d" % i for i in range(10)} | {"x98"}
+    assert out["scores"]["NBA"]["games_listed"] == len(want)
+    for kept in (_ledger_bodies(env.root, "/scores")[-1], *(json.loads(r["raw"]) for r in env.store().rows(
+            "SELECT raw FROM scores"))):
+        assert all(isinstance(e, dict) for e in kept) and {e["id"] for e in kept} == want, kept
+    env.clock.set("2026-12-14T12:30:00Z")
+    env.out(capsys, "choose", "--version", "1")
+    env.out(capsys, "results")
+    assert sum(not isinstance(e, dict) for e in _ledger_bodies(env.root, "/scores")[-1]) == 4
+
+
+# ---------------------------------------------------------------- rev 8, outcome 2: the Kalshi sync on its own
+
+@pytest.mark.parametrize("start, periods", [
+    ("2026-12-15T01:00:00Z", None),                       # 20:00 US-Eastern 12/14: a day of the test period
+    ("2026-12-13T06:00:00Z", None),                       # 01:00 US-Eastern 12/13: from the boundary on (the clock)
+    ("2026-12-11T01:00:00Z", {"development": (date(2026, 11, 13), date(2026, 12, 9)),   # the period's day alone
+                              "test": (date(2026, 12, 10), date(2027, 3, 31))}),
+])
+def test_the_kalshi_sync_called_directly_requests_nothing_for_a_held_row(tmp_path, monkeypatch, start, periods):
+    """`_kalshi_sync` is safe on its own (the second wall): called directly before the choice with a row of a game
+    from the boundary on, or of a day of the test period, it makes no request. A row before both does (the control)."""
+    kt, clock = KalshiTransport(), Clock("2026-12-20T12:00:00Z")
+    (tmp_path / "grading").mkdir()
+    gr = pg.Grader(tmp_path / "grading", tmp_path / "picks.sqlite", clock, odds_client(OddsTransport()),
+                   kalshi_client(kt))
+    try:
+        if periods is not None:
+            monkeypatch.setattr(pg, "PERIODS", periods)
+        row = {"game_id": "g1", "league": "NBA", "start": start}
+        assert pg._kalshi_sync(gr, [row], clock()) == {} and kt.urls == []
+        control = {"game_id": "g0", "league": "NBA", "start": "2026-12-08T01:00:00Z"}   # 20:00 US-Eastern 12/7
+        assert "NBA" in pg._kalshi_sync(gr, [control], clock()) and kt.urls
+    finally:
+        gr.close()
+
+
+# ---------------------------------------------------------------- rev 8, outcome 3: the comparison at the boundary
+
+def test_the_boundary_comparison_of_what_is_dropped_before_storing():
+    """`_dropped_before_storing` directly: a game the schedule starts exactly at the boundary, or one second after, is
+    dropped before the choice; one second before is kept; the same by an unscheduled entry's own time; after the choice
+    nothing is dropped but a held game."""
+    b = pg.BOUNDARY_TS
+    for delta, dropped in ((-1, False), (0, True), (1, True)):
+        assert pg._dropped_before_storing({"id": "g"}, set(), {"g": b + delta}, True) is dropped, delta
+        assert pg._dropped_before_storing({"id": "g", "commence_time": "2026-12-13T05:00:00Z"}, set(),
+                                          {"g": b + delta}, True) is dropped, delta          # the schedule decides
+        when = datetime.fromtimestamp(b + delta, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert pg._dropped_before_storing({"id": "u", "commence_time": when}, set(), {}, True) is dropped, delta
+        assert pg._dropped_before_storing({"id": "g"}, set(), {"g": b + delta}, False) is False
+    assert pg._dropped_before_storing({"id": "g"}, {"g"}, {}, False) is True
