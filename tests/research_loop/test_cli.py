@@ -512,6 +512,9 @@ class _LiveVenue(_Venue):
     account_class = "INDIVIDUAL_CASH"
     account_id = LIVE_ACCOUNT
 
+    def cash(self):                                              # T22d-1 (A6): live mode needs the settled-cash figure
+        return {**super().cash(), "settled_cash": super().cash()["cash"]}
+
 
 REAL_LIVE_VENUE = cli._order_step_live_venue                    # before any fixture replaces it (T32 rev 2)
 
