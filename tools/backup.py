@@ -10,12 +10,24 @@ What `run` takes: every SQLite database under memory/, artifacts/ and state/ (fo
 by name), and the whole of journal/ and config/. In every one of these folders a file is classified by its
 content: a SQLite database is copied with SQLite's own online backup from a read-only connection, so a
 database that is being written at that moment comes out as one consistent snapshot, with its triggers,
-application_id and user_version carried unchanged. The -wal, -shm and -journal files that belong to a
-database are never copied (the snapshot already holds what was in them); a restored database therefore
-opens read-write to exactly the rows its manifest entry counts. Links are never followed: a symbolic link
+application_id and user_version carried unchanged. A file whose name ends in -wal, -shm or -journal is a
+side file only when the file it would belong to (the same name without that ending) exists beside it and
+is a SQLite database by content; a side file is never copied (the snapshot already holds what was in it)
+and every one skipped is listed in the manifest (`side_files_skipped`). Any other file with such a name is
+classified by its own content like any other (a database named `trade-journal` is backed up as one). A
+restored database therefore opens read-write to exactly the rows its manifest entry counts. Links are never followed: a symbolic link
 inside a source folder is not copied and not descended into, it is named in the manifest
 (`link_not_followed`, the link's own path only) and on stderr, and does not change the exit code. A hard
-link is an ordinary file. A plain file that changes while it is copied is copied again (3 tries at most);
+link is an ordinary file. A link that appears AFTER the scan is not followed either: every plain file is
+opened one folder at a time with O_DIRECTORY|O_NOFOLLOW (and the file with O_NOFOLLOW) relative to the
+descriptor of its parent. A file that now has a link in any component of its path, or is no longer a
+regular file, is not copied (a copy already made is discarded), is listed as `changed_into_a_link` and
+makes the exit code 1. A plain file that was replaced by another regular file between the scan and the
+copy (rewritten by rename) is an ordinary file: its current content is copied through the same opens,
+flagged `replaced_during_run` and named on stderr, and the exit code is unchanged. A database is copied
+only if, immediately before and after the online backup, its path has no link in any component and its
+device and inode are the scan's (SQLite opens it by path); otherwise it is not copied and the exit code is 1.
+A plain file that changes while it is copied is copied again (3 tries at most);
 if it still changed the last copy is kept, flagged `changed_during_copy` and named on stderr. A file with a
 database name that is not a database is kept as a plain file, flagged `not_a_database`, and the run exits 1.
 
@@ -32,7 +44,8 @@ One limit to know. A rollback-mode (non-WAL) database holds its writers out for 
 (measured: 0.36 s at 40 MB and 0.47 s at 195 MB on this disk); in WAL mode writers are never held out. A
 rollback-mode store that grows past about 1 GB while a process writes to it continuously needs another
 plan (convert it to WAL, or back it up from the writer's side). The order-book collector is in WAL mode.
-A second limit: one database is waited for at most --db-timeout seconds (default 3600) for its lock.
+A second limit: one database is waited for at most --db-timeout seconds (default 3600) for its lock,
+in slices of one second, so a termination signal is acted on within about two seconds.
 
 The copy goes into a working folder `<dest>/.valedia-backup-tmp-<stamp>-<pid>/`, marked by a file named
 `.valedia-backup-work` written as the first thing in it, and is renamed to `<dest>/<stamp>/` (UTC,
@@ -42,7 +55,9 @@ name is exactly `.valedia-backup-(tmp|scratch|trash)-<stamp>-<pid>` and which ca
 MANIFEST.json, or is empty is ever removed as ours: a user's file or folder that merely starts with `.tmp-`
 (or any other name) is left alone. A source that cannot be read or whose copy fails its integrity check is
 named in the manifest (and on stderr), left out of the copy, and makes the exit code 1; everything else is
-still backed up.
+still backed up. A folder in the destination that cannot be read (a user's, or a stamp-named one) is left
+alone, named on stderr, shown by `list` as unreadable and never counted; it does not change what `run`
+exits with.
 
 Exit codes of `run`: 0 everything copied and checked; 1 backup made but something was named as failed;
 2 no backup could be made (refused destination, too little free space, another run holds the lock, a
@@ -56,7 +71,8 @@ ancestors, are compared with the repository root by device and inode after links
 spelling of a place inside the repository (letter case, trailing slash, `.` and `..`, a link, a Unicode
 form) is refused, and nothing is created before the refusal. A manifest is not trusted about paths: an
 absolute path, a `..` part or a path that would land outside the target makes verify fail and restore
-refuse before it writes anything. restore works inside its target folder only.
+refuse before it writes anything. restore works inside its target folder only, and refuses when the
+parent of the target does not exist (it creates the target itself and nothing above it).
 
 Retention (after a successful rename): the newest 14 backups are kept (the newest complete one is never
 dropped, so a run of partial backups cannot push out the last whole one); of a file larger than 200 MB
@@ -85,7 +101,7 @@ import stat
 import time
 from pathlib import Path
 
-VERSION = "VALEDIA-BACKUP-2.0"
+VERSION = "VALEDIA-BACKUP-3.0"
 FORMAT = "valedia-trader-backup-1"
 MANIFEST = "MANIFEST.json"
 MANIFEST_PART = MANIFEST + ".part"
@@ -118,6 +134,10 @@ class Refused(Exception):
 
 class SourceError(Exception):
     """One source could not be read or copied; it is named in the manifest. Exit 1."""
+
+
+class ChangedIntoLink(SourceError):
+    """A source that was a plain file at the scan is now reached through a link, or is another file."""
 
 
 class NotADatabase(SourceError):
@@ -242,19 +262,22 @@ def sidecar_suffix(name):
     return next((s for s in SIDECAR_SUFFIXES if lower.endswith(s)), None)
 
 
-def belongs_to_database(base_entry):
-    """Is this folder entry a database (so that its -wal/-shm/-journal are not files of their own)?"""
-    if base_entry.name.lower().endswith(DB_SUFFIXES):
-        return True
+def is_database_by_content(entry):
+    """True when this folder entry is a plain file that starts with the SQLite header, False when it is
+    not (a link, a folder, anything else), None when it cannot be read to tell."""
     try:
-        return read_header(base_entry.path)[:16] == SQLITE_MAGIC
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            return False
+        return read_header(entry.path)[:16] == SQLITE_MAGIC
     except OSError:
-        return True                                    # cannot tell: it is named as failed elsewhere
+        return None
 
 
 def scan(root):
-    """What will be copied: items [(kind, rel, abs, size)], failures, absent folders, ignored files, links."""
-    items, failures, absent, links = [], [], [], []
+    """What will be copied: items [(kind, rel, abs, size, dev, ino)], failures, absent folders, ignored files,
+    links, and the side files skipped (a side file is one only when the database it belongs to exists beside it
+    and is a database by content)."""
+    items, failures, absent, links, sides = [], [], [], [], []
     ignored = {"count": 0, "examples": []}
 
     def fail(rel, kind, why):
@@ -279,8 +302,9 @@ def scan(root):
                     continue
                 if suffix:
                     base = by_name.get(e.name[:-len(suffix)])
-                    if in_db_folder or (base is not None and belongs_to_database(base)):
-                        continue                       # a database's own side file: the snapshot holds it
+                    if base is not None and is_database_by_content(base) is not False:
+                        sides.append(erel)             # a database's own side file: the snapshot holds it
+                        continue
                 st = e.stat(follow_symlinks=False)
             except FileNotFoundError:
                 if not suffix:
@@ -306,7 +330,7 @@ def scan(root):
             if kind == "sqlite":                       # the -wal beside it ends up merged into the copy
                 with contextlib.suppress(OSError):
                     size += os.stat(e.path + "-wal").st_size
-            items.append((kind, erel, e.path, size))
+            items.append((kind, erel, e.path, size, st.st_dev, st.st_ino))
 
     for top in DB_FOLDERS + TREE_FOLDERS:
         base = os.path.join(root, top)
@@ -318,16 +342,63 @@ def scan(root):
             fail(top, "folder", "not a folder")
         else:
             walk(base, top, top in DB_FOLDERS)
-    return items, failures, absent, ignored, links
+    return items, failures, absent, ignored, links, sorted(sides)
 
 
 # ------------------------------------------------------------------------------------------ copying
-def copy_file(src, dst):
-    """Chunked copy; returns (size, sha256 of the copy, changed_during_copy). A read problem is a
-    SourceError (named, the run goes on); a write problem is an OSError (the run stops)."""
+LINK_ERRNOS = (errno.ELOOP, errno.ENOTDIR, getattr(errno, "EMLINK", errno.ELOOP))
+
+
+def open_nofollow(root, rel, expect=None, replaced=None):
+    """A read-only descriptor for root/rel, opened without following a link in ANY component below root:
+    each folder with O_DIRECTORY|O_NOFOLLOW relative to its parent's descriptor, the file with O_NOFOLLOW.
+    It must be a regular file and, when `expect` (device, inode) is given, the file the scan saw; if it is
+    another regular file and `replaced` (a list) is given, that is recorded in it instead of refused (a file
+    rewritten by rename is an ordinary file; a link in the path or a non-regular file is always refused)."""
+    parts = rel.split("/")
+    dirfd = None
     try:
-        before = os.stat(src)
-        fin = open(src, "rb")
+        try:
+            dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            for part in parts[:-1]:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+                os.close(dirfd)
+                dirfd = nxt
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dirfd)
+        except OSError as exc:
+            if exc.errno in LINK_ERRNOS:
+                raise ChangedIntoLink("a link (or a non-folder) now sits in its path; not followed") from exc
+            raise SourceError(f"cannot read: {exc.strerror or exc}") from exc
+    finally:
+        if dirfd is not None:
+            os.close(dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ChangedIntoLink("is no longer a regular file")
+        if expect is not None and (st.st_dev, st.st_ino) != tuple(expect):
+            if replaced is None:
+                raise ChangedIntoLink("is another file than the scan saw (device/inode differ); not copied")
+            replaced.append(True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def copy_file(src, dst, identity=None, root=None, replaced=None):
+    """Chunked copy; returns (size, sha256 of the copy, changed_during_copy). A read problem is a
+    SourceError (named, the run goes on); a write problem is an OSError (the run stops). With `identity`
+    and `root` the source is opened without following any link; if it is another regular file than the scan
+    saw (rewritten by rename) that is recorded in the `replaced` list and its current content is copied."""
+    try:
+        if identity is not None:
+            fd = open_nofollow(root, os.path.relpath(src, root).replace(os.sep, "/"), identity, replaced)
+        else:
+            fd = os.open(src, os.O_RDONLY)
+        before = os.fstat(fd)
+        before_path = os.lstat(src)
+        fin = os.fdopen(fd, "rb")
     except OSError as exc:
         raise SourceError(f"cannot read: {exc.strerror or exc}") from exc
     with fin:
@@ -342,19 +413,27 @@ def copy_file(src, dst):
                 fout.write(chunk)
             fout.flush()
             os.fsync(fout.fileno())
+        try:
+            after = os.fstat(fin.fileno())
+        except OSError:
+            after = None
     os.chmod(dst, stat.S_IMODE(before.st_mode) | 0o600)
     try:
-        after = os.stat(src)
-        changed = (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns)
+        after_path = os.lstat(src)
+        if after is None:
+            raise OSError("no fstat")
+        changed = ((after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns)
+                   or (after_path.st_size, after_path.st_mtime_ns, after_path.st_ino)
+                   != (before_path.st_size, before_path.st_mtime_ns, before_path.st_ino))
     except OSError:
         changed = True
     return os.stat(dst).st_size, sha256_file(dst), changed
 
 
-def copy_plain(src, dst):
+def copy_plain(src, dst, identity=None, root=None, replaced=None):
     """copy_file, again while the source changed under it (COPY_TRIES at most); the last copy is kept."""
     for _try in range(COPY_TRIES):
-        size, digest, changed = copy_file(src, dst)
+        size, digest, changed = copy_file(src, dst, identity, root, replaced)
         if not changed:
             break
     return size, digest, changed
@@ -379,12 +458,31 @@ def _signature(real):
     return tuple(out)
 
 
-def open_source(src, scratch, timeout):
-    """Read-only connection to a source database that creates nothing beside it.
-    Returns (connection, how)."""
-    real = os.path.realpath(src)
+BUSY_SLICE = 1.0       # a lock is waited for in slices this long, so a termination signal is acted on within ~2 s
+
+
+def _copy_nofollow(root, rel, target, expect=None):
+    fd = open_nofollow(root, rel, expect)
     try:
-        header = read_header(real)
+        with os.fdopen(fd, "rb") as fin, open(target, "wb") as fout:
+            shutil.copyfileobj(fin, fout, CHUNK)
+    except OSError as exc:
+        raise SourceError(f"cannot read: {exc.strerror or exc}") from exc
+
+
+def open_source(src, scratch, timeout, root=None, identity=None):
+    """Read-only connection to a source database that creates nothing beside it.
+    Returns (connection, how). With `root` and `identity` every read of the source goes through
+    open_nofollow, so a link swapped in after the scan is never followed."""
+    rel = os.path.relpath(src, root).replace(os.sep, "/") if root is not None else None
+    real = src if root is not None else os.path.realpath(src)
+    try:
+        if root is not None:
+            fd = open_nofollow(root, rel, identity)
+            with os.fdopen(fd, "rb") as f:
+                header = f.read(100)
+        else:
+            header = read_header(real)
     except OSError as exc:
         raise SourceError(f"cannot read: {exc.strerror or exc}") from exc
     if header and header[:16] != SQLITE_MAGIC:
@@ -402,21 +500,28 @@ def open_source(src, scratch, timeout):
             os.makedirs(snap)
             target = os.path.join(snap, "db.sqlite")
             try:
-                shutil.copyfile(real, target)
-                if before[1] is not None:
-                    shutil.copyfile(real + "-wal", target + "-wal")
+                if root is not None:
+                    _copy_nofollow(root, rel, target, identity)
+                    if before[1] is not None:
+                        _copy_nofollow(root, rel + "-wal", target + "-wal")
+                else:
+                    shutil.copyfile(real, target)
+                    if before[1] is not None:
+                        shutil.copyfile(real + "-wal", target + "-wal")
+            except FileNotFoundError:
+                continue                                # a side file went away meanwhile: look again
             except OSError as exc:
                 raise SourceError(f"cannot read: {exc.strerror or exc}") from exc
             if _signature(real) == before:
                 try:
-                    return sqlite3.connect(target, timeout=min(timeout, 30)), "online backup of a quiet private copy"
+                    return sqlite3.connect(target, timeout=BUSY_SLICE), "online backup of a quiet private copy"
                 except sqlite3.Error as exc:
                     raise SourceError(f"cannot open: {exc}") from exc
             time.sleep(0.2)
         else:
             raise SourceError("kept changing while a quiet copy was made")
     try:
-        return sqlite3.connect(ro_uri(real), uri=True, timeout=min(timeout, 30)), "online backup, read-only"
+        return sqlite3.connect(ro_uri(real), uri=True, timeout=BUSY_SLICE), "online backup, read-only"
     except sqlite3.Error as exc:
         raise SourceError(f"cannot open read-only: {exc}") from exc
 
@@ -447,10 +552,12 @@ def inspect_copy(path):
         conn.close()
 
 
-def copy_sqlite(src, dst, scratch, db_timeout):
+def copy_sqlite(src, dst, scratch, db_timeout, root=None, identity=None):
     """Online backup of one database into dst; returns the manifest fields. SourceError when the source
-    cannot be read or its copy fails the integrity check; NotADatabase when it is not a database."""
-    conn, how = open_source(src, scratch, db_timeout)
+    cannot be read or its copy fails the integrity check; NotADatabase when it is not a database.
+    With `root` and `identity` the path must have no link in any component and be the file the scan saw,
+    immediately before and immediately after the online backup (else ChangedIntoLink, copy discarded)."""
+    conn, how = open_source(src, scratch, db_timeout, root, identity)
     deadline = time.monotonic() + db_timeout
     out = sqlite3.connect(dst)
     failed = False
@@ -485,6 +592,12 @@ def copy_sqlite(src, dst, scratch, db_timeout):
                 Path(str(dst) + suffix).unlink(missing_ok=True)
     for suffix in ("-journal", "-wal", "-shm"):
         Path(str(dst) + suffix).unlink(missing_ok=True)      # only ever our own copy's leftovers
+    if root is not None:
+        try:
+            os.close(open_nofollow(root, os.path.relpath(src, root).replace(os.sep, "/"), identity))
+        except SourceError:
+            Path(dst).unlink(missing_ok=True)
+            raise
     try:
         ok, info = inspect_copy(dst)
     except sqlite3.Error as exc:
@@ -583,11 +696,18 @@ def our_backups(dest):
     [(folder, manifest)]; `unreadable` is [(folder, reason)] and is never deleted or counted."""
     valid, unreadable = [], []
     for p in sorted(Path(dest).iterdir()):
-        if STAMP_RE.match(p.name) and not p.is_symlink() and p.is_dir() and (p / MANIFEST).is_file():
-            try:
-                valid.append((p, read_manifest(p)))
-            except ManifestError as exc:
-                unreadable.append((p, str(exc)))
+        if not STAMP_RE.match(p.name):
+            continue
+        try:
+            if p.is_symlink() or not p.is_dir() or not (p / MANIFEST).is_file():
+                continue
+            valid.append((p, read_manifest(p)))
+        except ManifestError as exc:
+            unreadable.append((p, str(exc)))
+        except OSError as exc:
+            unreadable.append((p, f"the folder cannot be read: {exc.strerror or exc}"))
+    for p, why in unreadable:
+        warn(f"left alone: {p.name} in the destination: {why}")
     return valid, unreadable
 
 
@@ -605,7 +725,7 @@ def is_our_work_folder(p):
     """A working folder of this tool: the exact name, a real folder, and the mark, a manifest or nothing in it."""
     if not WORK_RE.match(p.name) or p.is_symlink() or not p.is_dir():
         return False
-    return (p / WORK_MARK).exists() or (p / MANIFEST).exists() or not any(p.iterdir())
+    return (p / WORK_MARK).exists() or (p / MANIFEST).exists() or not any(p.iterdir())   # may raise OSError
 
 
 def remove_work_folder(p):
@@ -625,8 +745,11 @@ def remove_work_folder(p):
 def clear_leftovers(dest):
     """What a killed run left: our own working folders, and nothing else."""
     for p in sorted(dest.iterdir()):
-        if is_our_work_folder(p):
-            remove_work_folder(p)
+        try:
+            if is_our_work_folder(p):
+                remove_work_folder(p)
+        except OSError as exc:                         # a folder we cannot read is not ours to touch
+            warn(f"left alone: {p.name} in the destination cannot be read or removed ({exc.strerror or exc})")
 
 
 def mark_work_folder(p):
@@ -686,16 +809,38 @@ def apply_retention(dest, keep, large_bytes, large_keep):
     return problems
 
 
+@contextlib.contextmanager
+def termination_as_exception():
+    """SIGTERM raises Terminated for as long as the block runs (set before anything slow starts)."""
+    def on_term(_signum, _frame):
+        raise Terminated()
+
+    old = {}
+    with contextlib.suppress(ValueError):              # only the main thread may set handlers
+        old[signal.SIGTERM] = signal.signal(signal.SIGTERM, on_term)
+    try:
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
 def run_backup(root, dest, *, keep=DEFAULT_KEEP, large_bytes=DEFAULT_LARGE_BYTES, large_keep=DEFAULT_LARGE_KEEP,
                db_timeout=DEFAULT_DB_TIMEOUT):
+    with termination_as_exception():
+        return _run_backup(root, dest, keep=keep, large_bytes=large_bytes, large_keep=large_keep,
+                           db_timeout=db_timeout)
+
+
+def _run_backup(root, dest, *, keep, large_bytes, large_keep, db_timeout):
     root = Path(os.path.realpath(_absolute(root)))
     if not root.is_dir():
         raise Refused(f"repository {root} is not a folder")
     dest = check_destination(root, dest)
-    items, failures, absent, ignored, links = scan(root)
+    items, failures, absent, ignored, links, sides = scan(root)
     if not items and not failures:
         raise Refused(f"nothing to back up: no database, journal or config file found under {root}")
-    total = sum(size for _k, _r, _a, size in items)
+    total = sum(item[3] for item in items)
     free = free_bytes(nearest_existing(dest))
     if free < 2 * total:
         raise Refused(f"not enough free space at {dest}: {human(free)} free, but a backup needs twice what is "
@@ -708,60 +853,69 @@ def run_backup(root, dest, *, keep=DEFAULT_KEEP, large_bytes=DEFAULT_LARGE_BYTES
         except OSError:
             raise Refused(f"another backup run holds the lock {dest / LOCK_NAME}; try again when it is done") from None
         clear_leftovers(dest)
-        return _locked_run(root, dest, items, failures, absent, ignored, links, keep, large_bytes, large_keep,
-                           db_timeout)
+        return _locked_run(root, dest, items, failures, absent, ignored, links, sides, keep, large_bytes,
+                           large_keep, db_timeout)
     finally:
         lock.close()
 
 
-def _locked_run(root, dest, items, failures, absent, ignored, links, keep, large_bytes, large_keep, db_timeout):
+def _locked_run(root, dest, items, failures, absent, ignored, links, sides, keep, large_bytes, large_keep,
+                db_timeout):
     stamp, created = make_stamp(dest, utcnow())
     final = dest / stamp
     tmp = dest / f"{WORK_PREFIX}tmp-{stamp}-{os.getpid()}"
     scratch = dest / f"{WORK_PREFIX}scratch-{stamp}-{os.getpid()}"
     renamed = False
 
-    def on_term(_signum, _frame):
-        raise Terminated()
-
-    old = {}
-    with contextlib.suppress(ValueError):              # only the main thread may set handlers
-        old[signal.SIGTERM] = signal.signal(signal.SIGTERM, on_term)
     try:
         try:
             mark_work_folder(tmp)
             mark_work_folder(scratch)
-            files, notes = [], []
+            files, notes, changed_links = [], [], []
+            replaced = []
             failures = list(failures)
-            for kind, rel, src, _size in items:
+            for kind, rel, src, _size, dev, ino in items:
                 target = tmp / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     try:
                         if kind == "sqlite":
                             try:
-                                info = copy_sqlite(src, target, str(scratch), db_timeout)
+                                info = copy_sqlite(src, target, str(scratch), db_timeout, root, (dev, ino))
                             finally:
                                 for child in scratch.iterdir():     # a quiet private copy is needed for its turn only
                                     if child.name != WORK_MARK:
                                         remove_tree(child)
                             entry = {"path": rel, "kind": "sqlite", **info}
                         else:
-                            size, digest, changed = copy_plain(src, target)
+                            replaced.clear()
+                            size, digest, changed = copy_plain(src, target, (dev, ino), root, replaced)
                             entry = {"path": rel, "kind": "file", "size": size, "sha256": digest}
+                            if replaced:
+                                entry["replaced_during_run"] = True
+                                notes.append(f"{rel}: was replaced by another file (rewritten by rename) after "
+                                             "the scan; its current content was copied (flagged in the manifest)")
                             if changed:
                                 entry["changed_during_copy"] = True
                                 notes.append(f"{rel}: changed while it was copied, even on the last of "
                                              f"{COPY_TRIES} tries; the last copy is kept (flagged in the manifest)")
                     except NotADatabase as exc:
-                        size, digest, changed = copy_plain(src, target)
+                        replaced.clear()
+                        size, digest, changed = copy_plain(src, target, (dev, ino), root, replaced)
                         entry = {"path": rel, "kind": "file", "size": size, "sha256": digest,
                                  "not_a_database": True}
+                        if replaced:
+                            entry["replaced_during_run"] = True
                         if changed:
                             entry["changed_during_copy"] = True
                         failures.append({"path": rel, "kind": "not_a_database",
                                          "error": f"{exc}; kept as a plain file"})
                     files.append(entry)
+                except ChangedIntoLink as exc:
+                    changed_links.append(rel)
+                    failures.append({"path": rel, "kind": "changed_into_a_link", "error": str(exc)})
+                    with contextlib.suppress(OSError):
+                        target.unlink()               # a copy already made is discarded
                 except SourceError as exc:
                     failures.append({"path": rel, "kind": kind, "error": str(exc)})
                     with contextlib.suppress(OSError):
@@ -780,6 +934,7 @@ def _locked_run(root, dest, items, failures, absent, ignored, links, keep, large
                 "stamp": stamp, "root": str(root), "sqlite_version": sqlite3.sqlite_version,
                 "status": "complete" if not failures else "partial",
                 "absent_folders": absent, "link_not_followed": sorted(links),
+                "changed_into_a_link": sorted(changed_links), "side_files_skipped": sides,
                 "not_backed_up": {"non_database_files_in_memory_artifacts_state": ignored["count"],
                                   "examples": ignored["examples"]},
                 "files": files, "failures": failures,
@@ -815,9 +970,6 @@ def _locked_run(root, dest, items, failures, absent, ignored, links, keep, large
         exc.published = final.is_dir()                 # looked at on disk, not remembered in a flag
         exc.final = final
         raise
-    finally:
-        for sig, handler in old.items():
-            signal.signal(sig, handler)
 
 
 # ------------------------------------------------------------------------------------------ verify
@@ -949,6 +1101,9 @@ def restore_backup(folder, to, root):
     if same_place_as_or_inside(to, folder):
         raise Refused("will not restore into the backup folder itself")
     target = Path(os.path.realpath(_absolute(to)))
+    if not target.parent.is_dir():
+        raise Refused(f"{target.parent} does not exist; restore creates only the target folder itself, "
+                      "nothing above it")
     if target.exists():
         if not target.is_dir():
             raise Refused(f"{target} is not a folder")
@@ -959,7 +1114,7 @@ def restore_backup(folder, to, root):
         raise Refused(f"{folder} does not pass verify, nothing restored:\n  " + "\n  ".join(lines[:10]))
     m = read_manifest(folder)
     created_target = not target.exists()
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(exist_ok=True)
     work = target / RESTORE_WORK                       # inside the target: nothing is created outside it
     work.mkdir()
     try:
