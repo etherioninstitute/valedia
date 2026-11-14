@@ -77,3 +77,13 @@ and can miss comments on the busiest days; gaps are recorded and days under 80% 
 runs behind posting time by the polling interval, so this tests what Valedia could trade, not whether the forum
 was first. Word lists miss sarcasm, questions and quotes of old news; the audit of 40 measures that. One
 contract says nothing about size.
+
+## Clarification 1 (2026-11-14, 03:14 UTC: before the collector has run; nothing has been collected, read or scored)
+
+**A third way of reading the same comments.** The owner has taken an account with a paid reader service
+(ScrapeBadger), which returns the newest comments of one thread at a time, with each comment's own posting time
+and edit mark. It may be used beside the public feed: to read the day's busy threads during the minutes the
+public feed must stay silent, and after a mark that comments may have been missed. It changes nothing in the
+test: an event's time is still the time Valedia first saw that version of the comment on its own clock, whatever
+brought it; a comment already seen through one way is not a new version when it arrives through another; the
+posting time the service gives is stored as information and is not used to move an event earlier.
