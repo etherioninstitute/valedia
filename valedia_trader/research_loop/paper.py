@@ -15,11 +15,24 @@ and writes beside every order what it would do for tax, estimated at the decisio
 summary the year's realised result so far. These are notes only: they never block, delay, resize or
 reorder an order. A ledger that cannot take a fill (a short position, for one) stops, and from then on
 every note says it is unavailable and why; trading carries on exactly as with tax off.
+
+One night at a time on one book: a run that writes the book (`step`, `reset_latch`) first takes an operating-system
+lock on `paper_state.lock` beside the state file (`fcntl.flock`, released with the process however it ends). A second
+run that finds it held writes nothing and raises `PaperBookBusy`, naming the lock. A program that only reads the book
+(the order step, the owner page, the decay monitor) never takes it and never waits for it.
+
+Rolling the code back: a day's journal entries are saved in the state (`journal_outbox`) before they are appended, and
+a revision without the outbox does not know to append them. Before rolling the code back to such a revision, start this
+revision once on the book (building a `PaperTrader` on it is enough, when no other run holds the lock): its start
+appends any entries a killed run left in the outbox and removes it. Otherwise the older code runs on with that day's
+fills, decisions and summary missing from the journal, and its tax notes, read from the journal's fills, are wrong.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -89,6 +102,14 @@ DAMAGE_WINDOW_DAYS = 30                               # how far back the owner i
 
 class VenueError(RuntimeError):
     pass
+
+
+class PaperBookBusy(RuntimeError):
+    """Another run holds the paper book's lock: this run did nothing to the book."""
+
+
+class _LockCannotOpen(PaperBookBusy):
+    """The book's lock file cannot be opened (a folder that cannot be written, a link at its path): nothing was done."""
 
 
 class LatchResetError(RuntimeError):
@@ -212,40 +233,72 @@ def _close_enough(a: float, b: float) -> bool:
 
 def _judge(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """(valid, suspect) for each close of one fund, in order. A close is valid when it is in range and either the fund
-    has no valid close before it, or it is within JUMP_FACTOR of the last valid close, or the close of the row before it
-    is in range and within JUMP_FACTOR of it (a move confirmed the next day). An in-range close that is none of these is
-    suspect: it is treated as missing."""
+    has no valid close before it, or it is within JUMP_FACTOR of the last valid close, or it is within JUMP_FACTOR of the
+    fund's last priced close (the last in-range close before it, valid or suspect, however many rows without one lie
+    between: a move confirmed by the fund's next priced close). An in-range close that is none of these is suspect: it is
+    treated as missing."""
     with np.errstate(invalid="ignore"):
         ok = np.isfinite(values) & (values >= PRICE_MIN) & (values <= PRICE_MAX)
-    valid, suspect, last = np.zeros(len(values), bool), np.zeros(len(values), bool), None
+    valid, suspect, last, priced = np.zeros(len(values), bool), np.zeros(len(values), bool), None, None
     for t in np.flatnonzero(ok):
         v = float(values[t])
-        if last is None or _close_enough(v, last) or (t > 0 and ok[t - 1] and _close_enough(v, float(values[t - 1]))):
+        if last is None or _close_enough(v, last) or (priced is not None and _close_enough(v, priced)):
             valid[t], last = True, v
         else:
             suspect[t] = True
+        priced = v
     return valid, suspect
 
 
+def _as_numbers(col: pd.Series) -> pd.Series | None:
+    """`col` as floats (a missing value, pd.NA included, as NaN), or None when it is not a column of numbers: booleans,
+    dates, times, categories, or objects other than numbers and text that reads as a number."""
+    types = pd.api.types
+    if types.is_bool_dtype(col.dtype) or types.is_complex_dtype(col.dtype):
+        return None
+    if types.is_integer_dtype(col.dtype) or types.is_float_dtype(col.dtype):
+        return pd.Series(col.to_numpy(dtype=float, na_value=np.nan), index=col.index)
+    if not (types.is_object_dtype(col.dtype) or types.is_string_dtype(col.dtype)):
+        return None                                                   # dates, times, periods, intervals, categories
+    values = []
+    for v in col.to_numpy(dtype=object):
+        if isinstance(v, (bool, np.bool_)):
+            return None
+        if v is None or v is pd.NA or (isinstance(v, float) and np.isnan(v)):
+            values.append(np.nan)
+        elif isinstance(v, (int, float, np.integer, np.floating, str)):
+            values.append(v)
+        else:
+            return None
+    try:
+        return pd.to_numeric(pd.Series(values, index=col.index, dtype=object), errors="raise").astype(float)
+    except (ValueError, TypeError):
+        return None
+
+
 def _clean_prices(prices: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], list[str]]:
-    """(prices with every close that is no valid price made missing, today's suspect closes by fund, the columns that
-    are not numbers). A column that cannot be read as numbers has no valid price on any day. When every close is valid
-    or missing, `prices` itself comes back, untouched."""
+    """(prices with every close that is no valid price made missing, today's suspect closes by fund, the columns no
+    price can be read from). A column that is not numbers (`_as_numbers`) has no valid price on any day; a column with
+    no value at all is missing on every day; both are named. A column of ordinary floats or integers is not converted,
+    and when every close is valid or missing, `prices` itself comes back, untouched."""
     unreadable, columns = [], {}
     for name, dtype in prices.dtypes.items():
-        if pd.api.types.is_numeric_dtype(dtype) and not pd.api.types.is_bool_dtype(dtype):
-            continue
-        try:
-            columns[name] = pd.to_numeric(prices[name], errors="raise").astype(float)
-        except (ValueError, TypeError):
-            columns[name] = pd.Series(np.nan, index=prices.index)
+        if isinstance(dtype, np.dtype) and dtype.kind in "iuf":
+            continue                                                       # ordinary floats or integers: as they are
+        col = _as_numbers(prices[name])
+        if col is None:
+            col = pd.Series(np.nan, index=prices.index)
             unreadable.append(str(name))
+        columns[name] = col
     frame = prices
     if columns:
         frame = prices.copy()
         for name, col in columns.items():
             frame[name] = col
     values = frame.to_numpy(dtype=float)
+    for j, name in enumerate(frame.columns):
+        if len(values) and np.isnan(values[:, j]).all() and str(name) not in unreadable:
+            unreadable.append(str(name))                                   # no value at all: no price can be read
     with np.errstate(invalid="ignore"):
         ok = np.isfinite(values) & (values >= PRICE_MIN) & (values <= PRICE_MAX)
     suspect_today: dict[str, float] = {}
@@ -349,24 +402,88 @@ class PaperTrader:
         self.limits_file, self.halt_file, self.venue = Path(limits_file), halt_file, venue
         self.fee_bps, self.slippage_bps, self.min_trade_pct = fee_bps, slippage_bps, min_trade_pct
         self.state_file, self.latch_file = self.dir / "paper_state.json", self.dir / "kill_switch.json"
-        if self.state_file.exists():
-            self.state = json.loads(self.state_file.read_text())
+        self.lock_file = self.dir / "paper_state.lock"
+        self._starting_cash = starting_cash
+        self._outbox: list[str] = []                         # the journal lines of the day being run, written with the day
+        self.tax_rules = tax_rules
+        self._tax_today, self._tax_fill_day = [], None        # in memory only: the orders placed so far this step
+        self._load()
+        if "journal_outbox" in self.state:                   # a day saved by a run killed while appending its entries:
+            fd = self._try_lock()                            # finished only under the lock, and never waited for
+            if fd is not None:
+                try:
+                    self._catch_up()
+                finally:
+                    os.close(fd)
+
+    def _load(self) -> None:
+        """Read the state file (or start a book) and build the tax ledger from the journal."""
+        self._seen = self._state_bytes()
+        if self._seen is not None:
+            self.state = json.loads(self._seen)
             self.state.setdefault("panel_cases", [])
         else:
-            self.state = {"starting_cash": starting_cash, "cash": starting_cash, "positions": {}, "pending": [],
-                          "history": [], "peak_equity": starting_cash, "last_day": None, "realized": {}, "panel_cases": []}
-        self._outbox: list[str] = []                         # the journal lines of the day being run, written with the day
-        if "journal_outbox" in self.state:                   # a day saved by a run killed while appending its entries
-            self._flush_outbox()
+            c = self._starting_cash
+            self.state = {"starting_cash": c, "cash": c, "positions": {}, "pending": [],
+                          "history": [], "peak_equity": c, "last_day": None, "realized": {}, "panel_cases": []}
+        self._load_tax()
+
+    def _load_tax(self) -> None:
         # the account's tax ledger: built once from the journal's fills, then fed each new fill. Notes only.
-        self.tax_rules, self.tax_ledger, self.tax_unavailable = tax_rules, None, None
-        self._tax_today, self._tax_fill_day = [], None        # in memory only: the orders placed so far this step
-        if tax_rules is not None:
+        self.tax_ledger, self.tax_unavailable = None, None
+        if self.tax_rules is not None:
             try:
                 from valedia_trader.execution_and_risk.tax import TaxLedger
-                self.tax_ledger = TaxLedger.from_fills(self.journal.read_complete(), tax_rules)
+                self.tax_ledger = TaxLedger.from_fills(self.journal.read_complete(), self.tax_rules)
             except Exception as exc:
                 self.tax_unavailable = f"the tax ledger could not take a fill: {exc}"
+
+    def _state_bytes(self) -> bytes | None:
+        try:
+            return self.state_file.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def _try_lock(self) -> int | None:
+        """The book's lock, taken without waiting: its descriptor, or None when another holds it."""
+        try:
+            fd = os.open(self.lock_file, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        except FileNotFoundError:
+            return None                                       # no book folder yet: nothing to finish
+        except OSError as exc:
+            raise _LockCannotOpen(f"the paper book's lock {self.lock_file} cannot be opened ({type(exc).__name__}); "
+                                "this run did nothing to the book") from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def _locked(self):
+        """Take the book's lock for one write (a day, a latch reset), or refuse at once; then make sure the state in
+        memory is the state on disk: when another run changed the file since this trader read it, read it again (and
+        finish an outbox it left)."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        fd = self._try_lock()
+        if fd is None:
+            raise PaperBookBusy(f"another run holds the paper book's lock {self.lock_file}: this run did nothing to the "
+                                "book (one night at a time on one book)")
+        try:
+            self._catch_up()
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _catch_up(self) -> None:
+        """Under the lock: read the state again if another run changed it since this trader read it, and finish an outbox
+        a killed run left (then rebuild the tax ledger from the journal it completed)."""
+        if self._state_bytes() != self._seen:
+            self._load()
+        if "journal_outbox" in self.state:
+            self._flush_outbox()
+            self._load_tax()
 
     # ---- book
     def _lot(self, strategy: str, symbol: str) -> dict:
@@ -582,17 +699,22 @@ class PaperTrader:
 
         A price is valid when it is a finite number from PRICE_MIN to PRICE_MAX and is no wild jump: a close more than
         JUMP_FACTOR times above or below the fund's last valid close is suspect, unless the close of the row before it was
-        in range and within JUMP_FACTOR of it (so a real move is taken one day late and a one-day glitch never; a fund's
-        first close is judged on the range alone). A column that cannot be read as numbers has no valid price on any day.
-        Every close that is not valid is read as missing everywhere the day reads prices: valuation, the benchmark,
-        fills, decisions, the strategies' rules, the market conditions and the panel. A fund with no price today is not
+        in range and within JUMP_FACTOR of it (so a real move is taken one priced row late and a one-day glitch never; a
+        fund's first close is judged on the range alone). A column that is not numbers (booleans, dates, text that does
+        not read as a number, other objects) has no valid price on any day; a nullable column's missing values are
+        missing prices. "The close of the row before" is the fund's last priced close: its last in-range close before
+        this one, however many rows without one lie between. Every close that is not valid is read as missing
+        everywhere the day reads prices: valuation, the benchmark, fills, decisions, the strategies' rules, the market conditions and the panel. A fund with no price today is not
         traded: its pending orders wait and no new order is decided for it. If the book holds it, it is valued at its
         last valid price before today in `prices` in the equity, the strategy values, the capital per strategy and the
         benchmarks alike. The summary's `stale_prices` maps each such held fund to the number of consecutive days, today
         included, it has had no valid price in `prices`; `suspect_prices` maps each fund whose close today is suspect to
-        the close seen; `unreadable_prices` names the columns that are not numbers. Each is present only when not empty,
-        and all are derived from `prices`: nothing about them is kept in the state file. No number that is not finite is
+        the close seen; `unreadable_prices` names the columns no price can be read from: those that are not numbers, and
+        those with no value at all (missing on every row given). Each is present only when not empty, and all are derived from `prices`: nothing about them is kept in the state file. No number that is not finite is
         written to the journal or the summary (it is written as null).
+
+        A day is run under the book's lock (see the module docstring): a run that finds it held raises `PaperBookBusy`
+        before it reads or writes anything of the book.
 
         The day's journal entries are written once the day is decided: the state is saved first with those entries in it
         (`journal_outbox`), then they are appended, then the state is saved without them. A run killed anywhere in a day
@@ -604,6 +726,13 @@ class PaperTrader:
         values the position at its cost (and counts every row of the history given as carried); a strategy whose every
         fund is missing from `prices` makes the rules raise, as before; a kill before the day's state is saved does not
         undo what reached the outside (the venue mirror's orders, the panel's settlements), which a rerun repeats."""
+        fd = self._locked()
+        try:
+            return self._step(prices, strategies)
+        finally:
+            os.close(fd)
+
+    def _step(self, prices: pd.DataFrame, strategies: dict[int, Strategy]) -> dict:
         prices, suspect, unreadable = _clean_prices(prices)
         day = prices.index[-1]
         if self.state["last_day"] is not None and str(day.date()) <= self.state["last_day"]:
@@ -628,8 +757,10 @@ class PaperTrader:
                 (not risk_gate.file_is_there(self.latch_file)
                  and self._trip_latch({"tripped_on": str(day.date()), "drawdown_pct": account["drawdown_pct"]}))
                 or self._latched_on(day)):                 # tripped today by a run of this day that was killed before saving
-            self._note(day, {"type": "kill_switch", "decision": "latched",
-                                     "reasoning": f"drawdown {account['drawdown_pct']:.2f}% reached the limit; new risk is blocked until the latch is reset"})
+            reasoning = f"drawdown {account['drawdown_pct']:.2f}% reached the limit; new risk is blocked until the latch is reset"
+            if self._latch_day() == "":
+                reasoning += " (the latch file cannot be read or holds no day: it counts as set)"
+            self._note(day, {"type": "kill_switch", "decision": "latched", "reasoning": reasoning})
 
         placed = blocked = 0
         if self.tax_rules is not None:
@@ -752,15 +883,28 @@ class PaperTrader:
         del self.state["journal_outbox"]
         self._save()
 
-    def _latched_on(self, day) -> bool:
-        """Whether the latch file says it was tripped on `day` (read without following a link; False if unreadable)."""
+    def _latch_day(self) -> str | None:
+        """The day the latch file says it was tripped on; "" for a file that cannot be read or holds no day; None when
+        there is no file (nothing, a link, which is never followed, or a directory)."""
         try:
             fd = os.open(self.latch_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd) as fh:
-                body = json.loads(fh.read(10_000))
-            return isinstance(body, dict) and body.get("tripped_on") == str(pd.Timestamp(day).date())
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            body = json.loads(os.read(fd, 10_000).decode("utf-8"))
         except (OSError, ValueError):
-            return False
+            return ""
+        finally:
+            os.close(fd)
+        return body["tripped_on"] if isinstance(body, dict) and isinstance(body.get("tripped_on"), str) and body["tripped_on"] else ""
+
+    def _latched_on(self, day) -> bool:
+        """Whether the latch file counts as tripped on `day`: it says so, or it is a file that cannot be read or holds no
+        day (the careful direction: such a file is journaled as the latch on every day the drawdown is at the limit)."""
+        tripped = self._latch_day()
+        return tripped is not None and tripped in ("", str(pd.Timestamp(day).date()))
 
     def _benchmark_values(self, prices: pd.DataFrame, strategies: dict[int, Strategy], share: float) -> dict[str, float]:
         """What simply holding each strategy's funds would have made, in dollars, since its first orders filled.
@@ -796,19 +940,43 @@ class PaperTrader:
         return float(open_value + self.state["realized"].get(strategy, 0.0))
 
     def _trip_latch(self, body: dict) -> bool:
-        """Create the latch file, only when nothing is at its path: never through a link, never over what is there. False
-        when something (a file, a link of any kind, a directory) turned up first: the latch then counts as set."""
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        """Create the latch file in one step, only when nothing is at its path: written whole to a temporary file beside
+        it, then renamed into place (a kill leaves no latch or a whole one, never an empty one). Never through a link,
+        never over what is there: False when something (a file, a link of any kind, a directory) turned up first, and the
+        latch then counts as set. Called under the book's lock, which every writer of the latch holds."""
+        tmp = self.latch_file.with_name(self.latch_file.name + ".tmp")
         try:
-            fd = os.open(self.latch_file, flags, 0o644)
-        except FileExistsError:
-            return False
+            tmp.unlink()                                          # a temporary file a killed run left (a link: as a link)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(body))
+            fh.flush()
+            os.fsync(fh.fileno())
+        if risk_gate.file_is_there(self.latch_file):
+            tmp.unlink()
+            return False
+        try:
+            os.rename(tmp, self.latch_file)
+        except OSError:                                           # a directory turned up at the path
+            tmp.unlink()
+            return False
         return True
 
     def reset_latch(self, who: str, day) -> bool:
-        """A person clears the drawdown latch. The reset is journaled; the high-water mark restarts."""
+        """A person clears the drawdown latch. The reset is journaled; the high-water mark restarts. Under the book's
+        lock: refused (`PaperBookBusy`) while another run holds it."""
+        try:
+            fd = self._locked()
+        except _LockCannotOpen as exc:
+            raise LatchResetError(f"the drawdown latch {self.latch_file} cannot be cleared: {exc}") from exc
+        try:
+            return self._reset_latch(who, day)
+        finally:
+            os.close(fd)
+
+    def _reset_latch(self, who: str, day) -> bool:
         if not risk_gate.file_is_there(self.latch_file):         # as the risk gate sees it: a link of any kind is there
             return False
         try:
@@ -828,5 +996,7 @@ class PaperTrader:
 
     def _save(self) -> None:
         tmp = self.state_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.state, indent=1, default=str))
+        body = json.dumps(self.state, indent=1, default=str)
+        tmp.write_text(body)
         tmp.replace(self.state_file)
+        self._seen = body.encode()

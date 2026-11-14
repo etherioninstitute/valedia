@@ -362,3 +362,16 @@ def test_benchmark_comparison_counts_a_day_summarised_twice_once():
         return {"type": "summary", "day": d, "strategy_values": {"mom": value}, "benchmark_values": {"mom": bench}, "capital_per_strategy": 100_000.0}
     rows = cr.benchmark_comparison([day("2026-11-10", 0.0, 0.0), day("2026-11-11", -5.0, 0.0), day("2026-11-11", -6.0, 1.0)])
     assert rows[0]["days"] == 2 and rows[0]["strategy_value"] == -6.0
+
+
+# ---- T29 rev 4: the review names the field that could not be read
+
+def test_a_damaged_suspect_price_field_is_named_as_the_suspect_price_field(desk):
+    ledger, journal, limits, hid = desk
+    days = _damaged_summaries(journal, _rising(22), {"suspect_prices": "x"}, on=(3, 4))
+    for d in days[6:8]:
+        journal.write(d, {"type": "summary", "strategy_value_change": {"mom": 0.001 * 50_000.0}, "capital_per_strategy": 50_000.0,
+                          "stale_prices": 7})
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert any("2 paper days whose suspect-price field could not be read" in f for f in out["findings"])
+    assert any("2 paper days whose carried-price field could not be read" in f for f in out["findings"])

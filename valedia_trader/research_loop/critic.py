@@ -240,10 +240,13 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
             notes.append(f"{name}: {n_carried} paper day{'s' if n_carried != 1 else ''} with a carried price ({', '.join(carried_funds)}) "
                          f"{'are' if n_carried != 1 else 'is'} left out of the days that count toward passing paper; "
                          f"{n_kept} of its {n} days count.")
-        if n_unreadable:
-            notes.append(f"{name}: {n_unreadable} paper day{'s' if n_unreadable != 1 else ''} whose carried-price field could not be read "
-                         f"{'are' if n_unreadable != 1 else 'is'} left out of the days that count toward passing paper; "
-                         f"{n_kept} of its {n} days count.")
+        for key, field in (("stale_prices", "carried-price"), ("suspect_prices", "suspect-price")):
+            k = sum(1 for e in everything if e.get("type") == "summary" and name in e.get("strategy_value_change", {})
+                    and _price_field(e, key) is None)
+            if k:
+                notes.append(f"{name}: {k} paper day{'s' if k != 1 else ''} whose {field} field could not be read "
+                             f"{'are' if k != 1 else 'is'} left out of the days that count toward passing paper; "
+                             f"{n_kept} of its {n} days count. The field is {key} in the day summaries.")
         if n and bt_mu is not None and math.isfinite(live_annual) and live_annual < bt_mu:
             notes.append(f"{name} is running at {_fmt(live_annual)} a year on paper against {_fmt(bt_mu)} in its backtest, "
                          f"{_fmt(bt_mu - live_annual)} worse ({n} days, z {_fmt(z, False)}).")

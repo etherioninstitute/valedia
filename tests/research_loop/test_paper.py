@@ -834,7 +834,10 @@ def test_tripping_the_latch_never_follows_or_replaces_what_is_already_there(setu
     assert t.latch_file.is_symlink() == (how in ("dangling link", "link loop"))
     if how == "plain file":
         assert t.latch_file.read_text() == "earlier"
-    assert [e for e in t.journal.read() if e["type"] == "kill_switch"] == []            # it was already set: no new trip
+        # rev 4 (outcome 4): a latch file that cannot be read counts as tripped and the day journals it; never replaced
+        assert [(e["day"], e["decision"]) for e in t.journal.read() if e["type"] == "kill_switch"] == [(str(crash.index[14].date()), "latched")]
+    else:
+        assert [e for e in t.journal.read() if e["type"] == "kill_switch"] == []        # it was already set: no new trip
     for k in range(15, 20):
         t.step(crash.iloc[: k + 1], {7: s})
     after = [e for e in t.journal.read(since=crash.index[14]) if e["type"] == "decision" and "order" in e]
@@ -1169,7 +1172,8 @@ def _plain_history(seed, directory, limits):
         if i == restart:
             t = pp.PaperTrader(directory, limits, **kw)            # the nightly job continues a state file
         summaries.append(t.step(px.iloc[: i + 1], {h: s for h, (join, s) in strategies.items() if join <= i}))
-    files = sorted(p for p in directory.iterdir() if p.is_file())
+    files = sorted(p for p in directory.iterdir() if p.is_file() and p.name != "paper_state.lock")   # rev 4: the lock, empty
+    assert not (directory / "paper_state.lock").exists() or (directory / "paper_state.lock").read_bytes() == b""
     return [(p.name, p.read_bytes()) for p in files], json.dumps(summaries).encode()
 
 
@@ -1289,9 +1293,9 @@ def _judged(col):
         if not in_range(v):
             out.append("invalid")
             continue
-        prev = col[t - 1] if t else None
+        prev = next((p for p in reversed(col[:t]) if in_range(p)), None)      # rev 4: the fund's last priced row
         if (last is None or (v <= 5 * last and 5 * v >= last)
-                or (in_range(prev) and v <= 5 * prev and 5 * v >= prev)):
+                or (prev is not None and v <= 5 * prev and 5 * v >= prev)):
             out.append("valid")
             last = v
         else:
@@ -1620,3 +1624,385 @@ def test_a_day_killed_between_its_writes_and_run_again_books_nothing_twice(setup
     from valedia_trader.execution_and_risk.tax import TaxLedger
     lots = [TaxLedger.from_fills(pp.Journal(d).read_complete(), RULES).summary("2026", as_of="2026-12-31") for d in (killed_dir, reference)]
     assert lots[0] == lots[1]
+
+
+# ---- T29 rev 4: a column that is not numbers is never a price; one night at a time on one book; the confirmation
+# looks at the fund's last priced row; the latch file appears whole; the two decisions rev 3 left untested
+
+def _held_two(directory, limits, monkeypatch, bbb=None):
+    """`two` (AAA and BBB) bought on the scripted market's first day and held for three days. Returns the trader, the
+    strategy, the summaries and the full price frame. From then on the strategy wants twice as much BBB, so a fund with
+    a price would trade."""
+    px = scripted_market()
+    px["BBB"] = 50.0 + np.arange(len(px)) * 0.25 if bbb is None else bbb
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.3}] * len(px)}))
+    t = pp.PaperTrader(directory, limits, fee_bps=0.0, slippage_bps=0.0, halt_file=None, min_trade_pct=0.15)
+    s = long_only("two", market=("AAA", "BBB"))
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(3)]
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"two": [{"AAA": 0.3, "BBB": 0.6}] * len(px)}))
+    return t, s, out, px
+
+
+def _not_numbers(kind, n):
+    return {"booleans": np.array([True, False] * n)[:n],
+            "nullable booleans": pd.array([True] * n, dtype="boolean"),
+            "booleans among numbers": np.array([50.0] * (n - 1) + [True], dtype=object),
+            "dates": pd.date_range("2026-01-01", periods=n).to_numpy(),
+            "text": np.array(["n/a"] * n, dtype=object),
+            "mixed objects": np.array([50.0] * (n - 1) + [{"close": 51.0}], dtype=object),
+            "categories": pd.Categorical([50.0] * n),
+            "all NaN": np.full(n, np.nan),
+            "all missing": np.array([None] * n, dtype=object)}[kind]
+
+
+@pytest.mark.parametrize("kind", ["booleans", "nullable booleans", "booleans among numbers", "dates", "text", "mixed objects",
+                                  "categories", "all NaN", "all missing"])
+def test_a_column_that_is_not_numbers_is_never_a_price_and_is_named(setup, monkeypatch, kind):
+    """Outcome 1: a held fund whose column is booleans, dates, text, other objects, or holds no value at all: no price on
+    any day, named in `unreadable_prices`, valued at its cost (this frame has no valid price of it), never traded."""
+    t, s, out, px = _held_two(setup[0], setup[1], monkeypatch)
+    frame = px.iloc[: DAY0 + 5].copy()
+    frame["BBB"] = _not_numbers(kind, len(frame))
+    lot = dict(t.state["positions"]["two"]["BBB"])
+    day = t.step(frame, {7: s})
+    assert day["unreadable_prices"] == ["BBB"] and day["stale_prices"] == {"BBB": DAY0 + 5}
+    aaa = t.state["positions"]["two"]["AAA"]
+    assert day["equity"] == pytest.approx(t.state["cash"] + aaa["units"] * float(px["AAA"].iloc[DAY0 + 4]) + lot["units"] * lot["cost"])
+    assert t.state["positions"]["two"]["BBB"] == lot
+    assert not [e for e in t.journal.read(since=frame.index[-1]) if e.get("symbol") == "BBB"]          # no decision, no fill
+    assert not [o for o in t.state["pending"] if o["symbol"] == "BBB"]
+    _adds_up(out + [day])
+
+
+def test_a_nullable_column_holding_pd_na_reads_those_rows_as_missing(setup, tmp_path, monkeypatch):
+    """Outcome 1: a nullable Float64 frame with pd.NA in it runs, and writes what the same frame with NaN there writes."""
+    t, s, _, px = _held_two(setup[0], setup[1], monkeypatch)
+    u, _, _, _ = _held_two(tmp_path / "twin", setup[1], monkeypatch)
+    frame = px.iloc[: DAY0 + 5].copy()
+    nullable = frame.astype("Float64")
+    nullable.iloc[-1, nullable.columns.get_loc("BBB")] = pd.NA
+    twin = frame.copy()
+    twin.iloc[-1, twin.columns.get_loc("BBB")] = np.nan
+    a, b = t.step(nullable, {7: s}), u.step(twin, {7: s})
+    assert a == b and a["stale_prices"] == {"BBB": 1} and "unreadable_prices" not in a
+
+
+@pytest.mark.parametrize("dtype", ["int64", "Int64", "Float64"])
+def test_a_column_of_integers_or_nullable_numbers_is_read_as_the_same_floats(setup, tmp_path, monkeypatch, dtype):
+    """Outcome 1, unchanged: whole-number closes as integers (numpy or nullable) or as nullable floats write what the
+    same closes as ordinary floats write."""
+    whole = 50.0 + np.arange(DAY0 + 8)
+    t, s, a, px = _held_two(setup[0], setup[1], monkeypatch, bbb=whole)
+    u, _, b, _ = _held_two(tmp_path / "twin", setup[1], monkeypatch, bbb=pd.array(whole.astype(int) if dtype != "Float64" else whole, dtype=dtype))
+    assert a == b
+    frame = px.iloc[: DAY0 + 5].copy()
+    other = frame.copy()
+    other["BBB"] = pd.array(frame["BBB"].astype(int) if dtype != "Float64" else frame["BBB"], dtype=dtype)
+    assert t.step(frame, {7: s}) == u.step(other, {7: s})
+
+
+def _hold_lock(path):
+    import fcntl
+    import os
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)                  # as another run of the book would hold it
+    return fd
+
+
+def _files(directory):
+    return {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+
+
+def test_a_start_that_finds_the_book_locked_does_nothing_and_names_the_lock(setup):
+    """Outcome 2: while another process holds the book's lock, a start writes nothing (no state, no journal line, no
+    latch, no temporary file), calls neither the venue nor the panel, and refuses naming the lock; once it is free the
+    same trader runs the day."""
+    import os
+    px, t, s = prices(), trader(setup), strat()
+    for k in range(11, 14):
+        t.step(px.iloc[: k + 1], {7: s})
+    calls = []
+
+    class Venue:
+        name = "spy"
+
+        def submit(self, symbol, units, tag):
+            calls.append(("venue", symbol))
+            return {"status": "accepted"}
+
+    class Panel(FakePanel):
+        def evaluate(self, case_id, case):
+            calls.append(("panel", case_id))
+            return super().evaluate(case_id, case)
+
+    t.latch_file.write_text(json.dumps({"tripped_on": "2026-01-02"}))
+    lock = setup[0] / "paper_state.lock"
+    fd = _hold_lock(lock)
+    try:
+        before = _files(setup[0])
+        other = pp.PaperTrader(setup[0], setup[1], halt_file=None, venue=Venue(), panel=Panel(), panel_mode="shadow")
+        for run in (lambda: other.step(px.iloc[:15], {7: s}), lambda: t.step(px.iloc[:15], {7: s}),
+                    lambda: other.reset_latch("burton", "2026-01-26")):
+            with pytest.raises(pp.PaperBookBusy) as err:
+                run()
+            assert str(lock) in str(err.value)
+        assert _files(setup[0]) == before and calls == []
+    finally:
+        os.close(fd)
+    assert other.step(px.iloc[:15], {7: s})["day"] == str(px.index[14].date())
+
+
+LOCK_CHILD = r'''
+import pathlib, sys, time
+import numpy as np, pandas as pd
+from valedia_trader.research_loop import paper as pp
+from valedia_trader.research_loop import strategy as st
+directory, limits, first, last, who, hold = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+log = pathlib.Path(directory).parent / "venue.log"
+class Venue:
+    name = "spy"
+    def submit(self, symbol, units, tag):
+        with log.open("a") as fh:
+            fh.write(f"{who} {tag}\n")
+        return {"status": "accepted"}
+save, armed = pp.PaperTrader._save, [False]
+def held(self):
+    if armed[0] and hold != "-":
+        armed[0] = False
+        print("inside", flush=True)                                  # the day is decided and not saved yet
+        while not pathlib.Path(hold).exists():
+            time.sleep(0.05)
+    return save(self)
+pp.PaperTrader._save = held
+rng = np.random.default_rng(29)
+n = 46
+px = pd.DataFrame({f: 70 * np.exp(np.cumsum(0.0015 + 0.02 * rng.standard_normal(n))) for f in ("K1", "K2", "K3")},
+                  index=pd.bdate_range("2026-03-02", periods=n))
+s = st.RuleStrategy.from_spec({"name": "lock_paper", "version": "1.0.0", "hypothesis": "Assets that rose keep rising",
+    "market": ["K1", "K2", "K3"], "entry": {"rule": "momentum", "lookback": 5, "enter": 0.0, "exit": -0.01, "direction": "long"},
+    "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.3, "max_open_positions": 3, "stop_loss_pct": None}})
+t = pp.PaperTrader(directory, limits, halt_file=None, min_trade_pct=0.0001)
+for i in range(first, last + 1):
+    if i == last and who != "prep":
+        t.venue, armed[0] = Venue(), True
+    t.step(px.iloc[: i + 1], {7: s})
+print("done", flush=True)
+'''
+
+
+def test_two_starts_at_once_in_two_processes_run_the_day_once(setup, tmp_path):
+    """Outcome 2 with real processes: a second start while the first is inside the day exits non-zero naming the lock,
+    and the day is written once, its venue orders sent once (by the first)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = str(Path(pp.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    book, hold = tmp_path / "book" / "journal", tmp_path / "release"
+
+    def start(first, last, who, held):
+        return subprocess.Popen([sys.executable, "-B", "-c", LOCK_CHILD, str(book), str(setup[1]), str(first), str(last), who, held],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    prep = start(10, 15, "prep", "-")
+    _, err = prep.communicate(timeout=240)
+    assert prep.returncode == 0, err[-2000:]
+    a = start(16, 16, "A", str(hold))
+    try:
+        assert a.stdout.readline().strip() == "inside"
+        before = _files(book)
+        b = start(16, 16, "B", "-")
+        _, err_b = b.communicate(timeout=240)
+        assert b.returncode != 0 and "PaperBookBusy" in err_b and str(book / "paper_state.lock") in err_b
+        assert _files(book) == before                                    # the second start wrote nothing
+    finally:
+        hold.touch()
+        out_a, err_a = a.communicate(timeout=240)
+    assert a.returncode == 0 and out_a.strip() == "done", err_a[-2000:]
+    days = [e["day"] for e in pp.Journal(book).read() if e["type"] == "summary"]
+    assert days.count(str(pd.bdate_range("2026-03-02", periods=17)[16].date())) == 1 and len(days) == len(set(days)) == 7
+    sent = (tmp_path / "book" / "venue.log").read_text().split("\n") if (tmp_path / "book" / "venue.log").exists() else []
+    assert [line for line in sent if line] and all(line.startswith("A ") for line in sent if line)
+
+
+def _with_outbox(setup, monkeypatch):
+    """A book whose last day was saved with its journal entries and killed before it appended them."""
+    px, t, s = prices(), trader(setup), strat()
+    for k in range(11, 14):
+        t.step(px.iloc[: k + 1], {7: s})
+    monkeypatch.setattr(t, "_flush_outbox", lambda: None)              # the kill: after the save, before the appends
+    t.step(px.iloc[:15], {7: s})
+    state = json.loads((setup[0] / "paper_state.json").read_text())
+    assert state["journal_outbox"] and state["last_day"] == str(px.index[14].date())
+    assert not [e for e in pp.Journal(setup[0]).read() if e["day"] == state["last_day"]]
+    return px, s, state
+
+
+def test_a_reader_is_never_made_to_wait_and_never_finishes_an_outbox_without_the_lock(setup, monkeypatch):
+    """Outcome 2: while the lock is held, a program that only reads the book (the order step builds a PaperTrader and
+    reads its targets) gets its answer at once and appends nothing; the next start that holds the lock finishes it."""
+    import os
+    import threading
+    from valedia_trader.execution_and_risk.order_step import paper_targets
+    px, s, state = _with_outbox(setup, monkeypatch)
+    fd, got = _hold_lock(setup[0] / "paper_state.lock"), {}
+    try:
+        before = _files(setup[0])
+        reader = threading.Thread(target=lambda: got.update(targets=paper_targets(pp.PaperTrader(setup[0], setup[1], halt_file=None))))
+        reader.start()
+        reader.join(timeout=10)
+        alive = reader.is_alive()
+    finally:
+        os.close(fd)
+    reader.join(timeout=30)
+    assert not alive and got["targets"].day == state["last_day"]                # it did not wait for the lock
+    assert _files(setup[0]) == before                                            # and appended nothing
+    t = trader(setup)                                                            # the lock is free: this start finishes it
+    days = [e["day"] for e in t.journal.read() if e["type"] == "summary"]
+    assert days.count(state["last_day"]) == 1 and "journal_outbox" not in json.loads((setup[0] / "paper_state.json").read_text())
+
+
+def test_a_start_that_finds_an_outbox_and_the_lock_held_finishes_it_when_it_runs_its_day(setup, monkeypatch):
+    """Outcome 2: an outbox read while another holds the lock is finished by this trader's own next day, under the lock."""
+    import os
+    px, s, state = _with_outbox(setup, monkeypatch)
+    fd = _hold_lock(setup[0] / "paper_state.lock")
+    try:
+        t = trader(setup)
+    finally:
+        os.close(fd)
+    assert "journal_outbox" in t.state and not [e for e in t.journal.read() if e["day"] == state["last_day"]]
+    t.step(px.iloc[:16], {7: s})
+    days = [e["day"] for e in t.journal.read() if e["type"] == "summary"]
+    assert days == sorted(set(days)) and state["last_day"] in days and str(px.index[15].date()) in days
+
+
+@pytest.mark.parametrize("closes, suspect_on", [
+    ([100.0, np.nan, 100.0, np.nan, 600.0, np.nan, 600.0, 600.0], {4}),                # priced every other row
+    ([100.0, 100.0, 600.0, np.nan, np.nan, np.nan, 600.0, 600.0], {2}),                # three rows without a close between
+    ([100.0, 100.0, 600.0, 0.0, -1.0, 600.0, 600.0, 600.0], {2}),                      # rows with no valid close between
+    ([100.0, 100.0, 15.0, np.nan, 15.0, np.nan, 15.0, 15.0], {2})])                    # the same downward
+def test_the_confirmation_is_the_funds_last_priced_row_however_far_back(setup, monkeypatch, closes, suspect_on):
+    """Outcome 3: after a real move of more than five times, the first priced row is suspect and the next priced row
+    confirms it: never locked out because the calendar row before had no close."""
+    px = _one_fund(closes)
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"tax_paper": [{"AAA": 0.5}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.45), long_only()
+    out, book = [], []
+    for i in range(len(closes)):
+        out.append(t.step(px.iloc[: DAY0 + i + 1], {7: s}))
+        book.append((t.state["cash"], t.state["positions"]["tax_paper"]["AAA"]["units"]))
+    assert {i for i, o in enumerate(out) if o.get("suspect_prices")} == suspect_on
+    confirmed = min(i for i in range(len(closes)) if i > max(suspect_on) and np.isfinite(closes[i]) and closes[i] > 0)
+    cash, units = book[confirmed]
+    assert units and out[confirmed]["equity"] == pytest.approx(cash + units * closes[confirmed])          # taken
+    assert not any(o.get("suspect_prices") for o in out[confirmed:])                                      # and kept
+    _adds_up(out)
+
+
+class _Killed(BaseException):
+    """A kill, raised where a test stops a run."""
+
+
+def _latch_setup(setup):
+    setup[1].write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 3.0, "max_position_pct": 0.6, "max_open_positions": 5}))
+    px, t, s = prices(), trader(setup), strat()
+    crash = px.copy()
+    crash.iloc[14:, 0] = crash.iloc[13, 0] * 0.80
+    crash.iloc[14:, 1] = crash.iloc[13, 1] * 1.20
+    for k in range(11, 14):
+        t.step(crash.iloc[: k + 1], {7: s})
+    return crash, t, s
+
+
+def _latched(directory):
+    return [e["day"] for e in pp.Journal(directory).read() if e["type"] == "kill_switch" and e["decision"] == "latched"]
+
+
+def test_a_rerun_of_the_day_the_latch_tripped_journals_it_once(setup, monkeypatch):
+    """Untested in rev 3 (`_latched_on`): a run killed after tripping the latch and before saving its day leaves the latch
+    and nothing else; the rerun of that day journals the trip, once."""
+    crash, t, s = _latch_setup(setup)
+
+    def killed(self):
+        raise _Killed()
+    monkeypatch.setattr(pp.PaperTrader, "_save", killed)
+    with pytest.raises(_Killed):
+        t.step(crash.iloc[:15], {7: s})
+    monkeypatch.undo()
+    day = str(crash.index[14].date())
+    assert json.loads(t.latch_file.read_text())["tripped_on"] == day and _latched(setup[0]) == []
+    again = trader(setup)
+    again.step(crash.iloc[:15], {7: s})
+    again.step(crash.iloc[:16], {7: s})
+    assert _latched(setup[0]) == [day]
+
+
+def test_the_latch_file_never_exists_half_written(setup, monkeypatch):
+    """Outcome 4: a kill while the latch is being written leaves no latch file (or a whole one), never an empty one; the
+    rerun trips it and journals it."""
+    crash, t, s = _latch_setup(setup)
+    real = pp.os.fdopen
+
+    def fdopen(fd, mode="r", *a, **k):
+        fh = real(fd, mode, *a, **k)
+        if "w" in mode:
+            def write(text):
+                raise _Killed()                                        # killed before a byte of the latch is written
+            fh.write = write
+        return fh
+    monkeypatch.setattr(pp.os, "fdopen", fdopen)
+    with pytest.raises(_Killed):
+        t.step(crash.iloc[:15], {7: s})
+    monkeypatch.undo()
+    assert not rg.file_is_there(t.latch_file) or "tripped_on" in json.loads(t.latch_file.read_text() or "{}")
+    again = trader(setup)
+    again.step(crash.iloc[:15], {7: s})
+    assert json.loads(again.latch_file.read_text())["tripped_on"] == str(crash.index[14].date())
+    assert _latched(setup[0]) == [str(crash.index[14].date())]
+    assert not [p for p in setup[0].iterdir() if p.name.endswith(".tmp")]
+
+
+@pytest.mark.parametrize("body", ["", "{}", '{"tripped_on": 5}', "[1, 2]"])
+def test_a_latch_file_that_cannot_be_read_or_holds_no_day_counts_as_tripped_and_is_journaled(setup, body):
+    """Outcome 4: a latch file left empty (by a kill of an earlier revision) or holding no day counts as tripped today:
+    new risk is blocked and the day journals the latch."""
+    crash, t, s = _latch_setup(setup)
+    t.latch_file.write_text(body)
+    t.step(crash.iloc[:15], {7: s})
+    assert _latched(setup[0]) == [str(crash.index[14].date())]
+    assert t.latch_file.read_text() == body                              # what was there is kept, never replaced
+    t.step(crash.iloc[:16], {7: s})
+    after = [e for e in t.journal.read(since=crash.index[14]) if e["type"] == "decision" and "order" in e]
+    assert all(e["decision"] == "blocked" for e in after if not e["order"]["reduces_risk"])
+
+
+@pytest.mark.parametrize("close, suspect", [(500.0, False), (499.99, False), (500.01, True),
+                                            (20.0, False), (20.01, False), (19.99, True)])
+def test_a_close_at_exactly_five_times_is_taken_and_just_beyond_is_suspect(setup, monkeypatch, close, suspect):
+    """Untested in rev 3 (`JUMP_FACTOR`): five times the last valid close, up or down, is a price; just beyond is suspect."""
+    px = _one_fund([100.0, 100.0, 100.0, close])
+    monkeypatch.setattr(pp, "run_rules", _schedule_rules({"tax_paper": [{"AAA": 0.5}] * len(px)}))
+    t, s = no_costs(setup, min_trade_pct=0.002), long_only()
+    out = [t.step(px.iloc[: DAY0 + i + 1], {7: s}) for i in range(4)]
+    assert out[-1].get("suspect_prices") == ({"AAA": close} if suspect else None)
+    assert out[-1].get("stale_prices") == ({"AAA": 1} if suspect else None)
+
+
+def test_a_trader_built_before_another_run_saved_a_day_reads_the_book_again_under_the_lock(setup):
+    """Outcome 2: the state a day is decided on is the one read under the lock. A trader built before another run saved
+    that day refuses to run it again (it reads the saved day under the lock) and writes nothing."""
+    px, s = prices(), strat()
+    early = trader(setup)
+    for k in range(11, 14):
+        early.step(px.iloc[: k + 1], {7: s})
+    late = trader(setup)
+    late.step(px.iloc[:15], {7: s})                                     # another run saves the day first
+    before = _files(setup[0])
+    with pytest.raises(ValueError, match="already processed"):
+        early.step(px.iloc[:15], {7: s})
+    assert _files(setup[0]) == before
+    assert early.step(px.iloc[:16], {7: s})["day"] == str(px.index[15].date())     # and carries on from the saved book
+    days = [e["day"] for e in pp.Journal(setup[0]).read() if e["type"] == "summary"]
+    assert len(days) == len(set(days)) == 5
