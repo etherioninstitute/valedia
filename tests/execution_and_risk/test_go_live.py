@@ -604,3 +604,38 @@ def test_the_locks_are_read_only_from_live_repo_whatever_the_object_given_says(t
         assert [lock["met"] for lock in state.locks[:3]] == [False, False, False], state.locks
         assert all("is missing" in lock["reason"] for lock in state.locks[:3]) and state.digest is None
     assert sorted(p.name for p in empty.iterdir()) == []                      # nothing created there either
+
+
+# ---- T22c item 1: an owner's file with more than one name (a hard link) is an unmet lock, for each of the three
+
+@pytest.mark.parametrize("which, lock", [("confirmation", 1), ("checklist", 2), ("limits", 3)])
+@pytest.mark.parametrize("side", ["the owner's file is the second name", "a second name made elsewhere"])
+def test_an_owner_file_with_more_than_one_name_is_an_unmet_lock_and_nothing_is_changed(tmp_path, which, lock, side):
+    files = world(tmp_path)
+    assert judge(files, TODAY).met
+    path = getattr(files, which)
+    other = tmp_path / "outside" / f"{which}.json"
+    other.parent.mkdir()
+    if side == "the owner's file is the second name":
+        os.replace(path, other)
+        os.link(other, path)
+    else:
+        os.link(path, other)
+    before = snapshot(files.root), other.read_bytes()
+    state = judge(files, TODAY)
+    assert not state.met and state.digest is None
+    assert [n for n in (1, 2, 3) if not state.locks[n - 1]["met"]] == [lock]
+    reason = state.locks[lock - 1]["reason"]
+    assert "more than one name" in reason and "copy" in reason, reason
+    assert (snapshot(files.root), other.read_bytes()) == before and path.stat().st_nlink == 2   # nothing repaired
+    other.unlink()
+    assert judge(files, TODAY).met                                            # one name again: met
+
+
+def test_read_owner_file_refuses_a_second_name_whatever_root_is_given(tmp_path):
+    real = _write(tmp_path / "a" / "f.json", {"x": 1})
+    os.link(real, tmp_path / "f2.json")
+    for root in (None, tmp_path, tmp_path / "a", wb.REPO):
+        for p in (real, tmp_path / "f2.json"):
+            data, why = wb.read_owner_file(p, root)
+            assert data is None and "more than one name" in why

@@ -3106,3 +3106,169 @@ def test_in_production_a_malformed_price_is_still_refused_before_any_call(tmp_pa
     with pytest.raises(wb.NotTransmitted):
         v.submit("SPY", 1.0, "t", limit_price=price)
     assert client.calls == []
+
+
+# ==== T22c: hardening before any real money (item 1 hard links, item 2 the shape of `environment`, item 3 prices)
+
+def _sdk_recorder(monkeypatch):
+    """A stand-in SDK that records any object built from it (nothing of it may exist after a refused construction)."""
+    built = []
+
+    class ApiClient:
+        def __init__(self, *a):
+            built.append("ApiClient")
+
+        def add_endpoint(self, region, host):
+            built.append(("endpoint", host))
+
+        def set_token_dir(self, token_dir):
+            pass
+
+    class TradeClient:
+        def __init__(self, api):
+            built.append("TradeClient")
+            self.account_v2 = self.order_v3 = None
+
+    monkeypatch.setitem(sys.modules, "webull.core.client", types.SimpleNamespace(ApiClient=ApiClient))
+    monkeypatch.setitem(sys.modules, "webull.trade.trade_client", types.SimpleNamespace(TradeClient=TradeClient))
+    return built
+
+
+@pytest.mark.parametrize("which", ["the confirmation is the second name", "the confirmation is the first name"])
+def test_an_owner_file_with_more_than_one_name_is_refused_with_a_reason_a_person_can_act_on(tmp_path, which):
+    import os
+    v, client = venue(tmp_path, env="production")
+    conf = CONF(tmp_path)
+    other = tmp_path / "elsewhere" / "copy.json"
+    other.parent.mkdir()
+    if which == "the confirmation is the second name":
+        other.write_text(_live())
+        other.chmod(0o644)
+        os.link(other, conf)
+    else:
+        _conf_file(tmp_path, _live())
+        os.link(conf, other)
+    assert conf.stat().st_nlink == 2 and not conf.is_symlink()
+    data, why = wb.read_owner_file(conf)
+    assert data is None and "more than one name" in why and "copy" in why       # what to do: give it a name of its own
+    assert wb.live_confirmation()[0] is None and wb.load_live_confirmation() is None
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="more than one name"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []
+    other.unlink()                                                        # one name again: accepted
+    assert conf.stat().st_nlink == 1 and wb.read_owner_file(conf)[1] is None
+    assert v.submit("SPY", 1.0, "t", price=100.0)["environment"] == "production"
+
+
+class _SneakyEnv(str):
+    """Finds the production host (inherited hash and equality) while saying it is not "production"."""
+    def __ne__(self, other):
+        return True
+
+    def __eq__(self, other):
+        return str.__eq__(self, other)
+
+    __hash__ = str.__hash__
+
+
+class _PlainSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize("env", [_SneakyEnv("production"), _PlainSubclass("production"), _PlainSubclass("sandbox")])
+@pytest.mark.parametrize("with_client", [True, False])
+def test_an_environment_that_is_not_exactly_a_str_is_refused_at_construction(tmp_path, monkeypatch, env, with_client):
+    built = _sdk_recorder(monkeypatch)
+    _conf_file(tmp_path, _live(max_order_value=1, max_capital=1))       # a cap no order here can meet
+    client = FakeClient() if with_client else None
+    with pytest.raises(wb.WebullError, match="plain text"):
+        wb.WebullVenue(KEY, SECRET, environment=env, client=client, confirmation_file=CONF(tmp_path))
+    assert built == [] and (client is None or client.calls == [])        # no client, no session, no network object
+
+
+def test_a_production_venue_relabelled_after_construction_still_keeps_its_lock(tmp_path):
+    # T22c item 2, the question asked: at ce3ba99 `environment` (and `host`) could be assigned after construction, the
+    # requests still going to the production host while the guard read the test environment. Now the guard decides
+    # from the host the venue was built for, which cannot be assigned.
+    v, client = venue(tmp_path, env="production")                       # no confirmation written
+    v.environment, v.host = "sandbox", wb.SANDBOX_HOST
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="has not written"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    v.environment = _SneakyEnv("production")
+    with pytest.raises(wb.LiveTradingNotConfirmed):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []
+    with pytest.raises(AttributeError):
+        v._endpoint = wb.SANDBOX_HOST
+    with pytest.raises(AttributeError):
+        del v._endpoint
+    with pytest.raises(wb.LiveTradingNotConfirmed):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []
+
+
+def test_a_production_events_venue_relabelled_after_construction_stays_refused(tmp_path):
+    client = FakeClient(account_class="EVENTS_CASH")
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, account_class="EVENTS_CASH",
+                       confirmation_file=CONF(tmp_path))
+    v.environment, v.host = "sandbox", wb.SANDBOX_HOST
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="test environment"):
+        v.submit("KXT:yes", 1, "t", limit_price=0.5)
+    assert client.calls == []
+
+
+def test_the_sdk_is_given_the_host_the_guard_decides_from(tmp_path, monkeypatch):
+    built = _sdk_recorder(monkeypatch)
+    for env, host in (("sandbox", wb.SANDBOX_HOST), ("production", wb.PRODUCTION_HOST)):
+        built.clear()
+        v = wb.WebullVenue(KEY, SECRET, environment=env, confirmation_file=CONF(tmp_path))
+        assert ("endpoint", host) in built and v.host == host and v._endpoint == host and v.environment == env
+
+
+class _FloatSub(float):
+    pass
+
+
+@pytest.mark.parametrize("bad, words", [
+    (True, "true or false"), (False, "true or false"), ("100", "not a number"), (b"100", "not a number"),
+    (None, "no price"), (float("nan"), "finite"), (float("inf"), "finite"), (-float("inf"), "finite"),
+    (0, "above zero"), (0.0, "above zero"), (-5.0, "above zero"), (10 ** 400, "too large"), (_FloatSub(1.0), "not a number")])
+@pytest.mark.parametrize("field", ["price", "limit_price"])
+def test_in_production_a_reference_price_that_is_not_a_real_number_is_refused_before_any_call(tmp_path, bad, words, field):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())                                        # a valid confirmation, cap 1000
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="known dollar value") as exc:
+        v.submit("SPY", 1.0, "t", **{field: bad})
+    assert words in str(exc.value) and "price" in str(exc.value)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("bad, words", [(True, "bool"), ("1", "str"), (float("nan"), "finite"), (float("inf"), "finite")])
+def test_in_production_an_amount_that_is_not_a_real_number_is_refused_before_any_call(tmp_path, bad, words):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())
+    with pytest.raises(wb.NotTransmitted, match="quantity") as exc:
+        v.submit("SPY", bad, "t", price=100.0)
+    assert words in str(exc.value)
+    assert client.calls == []
+    for amount in (True, "1", float("nan"), float("inf")):               # the valuation's own rule, apart from _quantity
+        value, why = wb._live_order_value(amount, 100.0)
+        assert value is None and "quantity" in why
+
+
+def test_in_production_a_valid_price_still_trades_within_the_cap(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live())
+    assert v.submit("SPY", 2.0, "t", price=500)["environment"] == "production"         # an int price is a real number
+    assert v.submit("SPY", 1.0, "t2", limit_price=999.99)["environment"] == "production"
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
+        v.submit("SPY", 3.0, "t3", price=500.0)
+    assert len(client.placed()) == 2
+
+
+@pytest.mark.parametrize("price", [True, "100", b"100", 0, None])
+def test_in_the_test_environment_a_malformed_price_behaves_as_before(tmp_path, price):
+    # T22c outcome 3: the test environment is unchanged (ce3ba99): the price plays no part unless it cannot be converted
+    v, client = venue(tmp_path)
+    out = v.submit("SPY", 1.0, "t", price=price)
+    assert out["environment"] == "sandbox" and len(client.placed()) == 1

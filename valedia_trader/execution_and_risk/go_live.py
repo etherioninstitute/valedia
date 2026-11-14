@@ -32,7 +32,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -44,7 +44,6 @@ from valedia_trader.venues.webull import OWNER_TEXT_MAX, PRODUCTION_HOST, REPO, 
 CHECKLIST = REPO / "config" / "go_live.json"
 LIMITS = REPO / "config" / "risk.json"
 JOURNAL = REPO / "journal"
-PRODUCTION_ENVIRONMENT = "production"
 LIVE_HOST = PRODUCTION_HOST
 PAPER_VENUE = "webull-sandbox"                    # the test-environment venue whose record lock 2 reads
 LIVE_VENUE = "webull-production"
@@ -290,8 +289,3 @@ def judge_locks(files: LiveFiles, today: date, capital: Any = None) -> LockState
         digest = hashlib.sha256(json.dumps([raw_conf, raw_list, raw_limits], sort_keys=True, ensure_ascii=True,
                                            allow_nan=False).encode()).hexdigest()
     return LockState([lock1, lock2, lock3, lock4], confirmation if lock1["met"] else None, cap, digest)
-
-
-def days_ahead(today: date, n: int) -> str:
-    """A date `n` days after `today`, as the owner writes it (for messages and examples)."""
-    return (today + timedelta(days=n)).isoformat()

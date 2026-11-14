@@ -819,3 +819,60 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
     assert built == [] and venue.calls == [] and asked == [] and sent == []
     assert (_tree(other), _tree(repo)) == before
     assert not list(repo.rglob("webull_live.json")) and not list(repo.rglob("go_live.json"))
+
+
+# ---- T22c item 5: live mode runs with the repository's own folders (cli.py's LoopPaths(webull.LIVE_REPO)), and the
+# root is compared with links resolved on both sides (os.path.realpath)
+
+def _capture_run_live(monkeypatch):
+    seen = []
+    real = cli._run_live
+
+    def capture(args, paths, venue, files, second_opinion):
+        seen.append(paths)
+        return real(args, paths, venue, files, second_opinion)
+
+    monkeypatch.setattr(cli, "_run_live", capture)
+    return seen
+
+
+def test_live_mode_runs_with_the_repositorys_own_folders_whatever_paths_it_is_given(live_project, monkeypatch, capsys,
+                                                                                   tmp_path_factory):
+    import os
+    from pathlib import Path
+    root, venue, built, asked = live_project
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+
+    class Pointing(cli.LoopPaths):                               # the repository's root, every folder somewhere else
+        journal = property(lambda self: elsewhere / "journal")
+        memory = property(lambda self: elsewhere / "memory")
+        config = property(lambda self: elsewhere / "config")
+
+    link = tmp_path_factory.mktemp("links") / "repo"
+    link.symlink_to(root, target_is_directory=True)
+    seen = _capture_run_live(monkeypatch)
+    args = argparse.Namespace(live=True, check=False, propose=True, approve=None, capital=100000.0, fractional=False)
+    for given in (Pointing(root), cli.LoopPaths(link), cli.LoopPaths(Path(str(root) + "/."))):
+        assert cli.live_order_step_command(args, given, environ=dict(LIVE_KEYS)) == 0, given
+        capsys.readouterr()
+        paths = seen[-1]
+        assert type(paths) is cli.LoopPaths and paths.root == Path(os.path.abspath(root)), paths
+    assert list(elsewhere.rglob("*")) == []                      # nothing written through the given object's folders
+    assert (root / "memory" / "order_step-webull-production.tickets.sqlite").is_file()
+
+
+def test_a_live_root_is_compared_with_links_resolved_on_both_sides(live_project, monkeypatch, tmp_path_factory):
+    from valedia_trader.venues import webull
+    root, venue, built, asked = live_project
+    links = tmp_path_factory.mktemp("links")
+    (links / "repo").symlink_to(root, target_is_directory=True)
+    (links / "other").symlink_to(tmp_path_factory.mktemp("other"), target_is_directory=True)
+    assert cli._live_root_refusal(cli.LoopPaths(links / "repo")) is None           # the root given through a link
+    monkeypatch.setattr(webull, "LIVE_REPO", links / "repo", raising=False)
+    assert cli._live_root_refusal(cli.LoopPaths(root)) is None                      # the repository's name is the link
+    assert cli._live_root_refusal(cli.LoopPaths(links / "repo")) is None
+    assert cli._live_root_refusal(cli.LoopPaths(links / "other")) is not None       # a link to another folder
+    monkeypatch.setattr(webull, "LIVE_REPO", root, raising=False)
+    args = argparse.Namespace(live=True, check=True, propose=False, approve=None, capital=None, fractional=False)
+    assert cli.live_order_step_command(args, cli.LoopPaths(links / "repo"), environ=dict(LIVE_KEYS)) == 0
+    assert cli.live_order_step_command(args, cli.LoopPaths(links / "other"), environ=dict(LIVE_KEYS)) == 2

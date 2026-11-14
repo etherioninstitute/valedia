@@ -613,13 +613,6 @@ def _read_quote_unguarded(raw, now: float) -> tuple[float | None, float | None, 
     return price, t, None
 
 
-def usable_quote(raw, now: float) -> tuple[float | None, str | None]:
-    """(price, None) for a usable quote, else (None, why). A quote is (price, time) or {"price", "time"}; the time
-    is seconds or a datetime with a zone."""
-    price, _, why = _read_quote(raw, now)
-    return price, why
-
-
 def minute_quotes(symbols) -> dict:
     """The default quote function: the last one-minute bar of today from the price source the repository already
     uses (yfinance), as {symbol: (close, time of the bar in seconds)}. A symbol without a bar is left out. No test
@@ -800,7 +793,6 @@ FINAL_OUTCOMES = ("sent", "not sent", "left over")   # a line's first row; "unkn
 ROW_OUTCOMES = FINAL_OUTCOMES + ("unknown",)          # a correcting row may also say unknown, as the ledger then does
 LEDGER_RECHECK_SECONDS = float(inspect.signature(OrderLedger.reconcile).parameters["recheck_seconds"].default)
 REACHED_VENUE = ("accepted", "partly_filled", "filled", "cancelled", "rejected", "expired")   # ledger states: at the venue
-NEVER_SENT = ("intended", "refused", "never_arrived")    # ledger states: never transmitted, or the venue never had it
 _TICKET_TABLES = {
     "meta": ("key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL", ("key",)),
     "tickets": ("day TEXT NOT NULL, number TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, venue TEXT NOT NULL, "

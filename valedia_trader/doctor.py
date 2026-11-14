@@ -164,16 +164,50 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
         else:
             notes.append(f"{label}: a key is on file but it is not a paper key; the paper venue refuses it")
     try:
-        from valedia_trader.venues.webull import LIVE_CONFIRMATION, load_live_confirmation
         import os
         if os.environ.get("WEBULL_APP_KEY"):
-            env = (os.environ.get("WEBULL_ENV") or "sandbox").lower()
-            live = load_live_confirmation(LIVE_CONFIRMATION) is not None
-            notes.append(f"Webull environment {env}; real-money orders " + ("CONFIRMED in config/webull_live.json" if live and env == "production" else "off"))
+            notes.append(f"Webull environment {(os.environ.get('WEBULL_ENV') or 'sandbox').lower()}")
     except Exception:
         pass
+    notes.append(live_mode_note(paths))
     notes.append("the built-in paper book needs no key")
     return (OK if ready else ATTENTION), "; ".join(notes)
+
+
+LIVE_ONLY_AT_A_PROPOSAL = ("judged only when a batch is proposed and again when it is approved: lock 4 (the ticket), the "
+                           "account the venue will trade against the confirmation's class and last 4 characters, each "
+                           "order's value against max_order_value, and both second price sources agreeing on each price")
+
+
+def live_mode_note(paths: LoopPaths) -> str:
+    """What can be said of live mode (real money) without the venue, a quote or any network call, through the
+    functions live mode itself uses: the command line's root rule (research_loop.cli._live_root_refusal) and the
+    locks as go_live.judge_locks reads and judges them (the owner's files through webull.read_owner_file, the paper
+    record from the journal), on today's New York date. Each of locks 1 to 3 is met or not met with its reason; what
+    is judged only when a batch is proposed is named as such. "real-money orders off" unless every lock judged here
+    is met, and even then every batch still needs a proposal and the owner's approval. Never raises; prints no
+    account id (not even its last 4), key or token: the locks' reasons hold none."""
+    try:
+        import os
+
+        from valedia_trader.execution_and_risk import go_live
+        from valedia_trader.research_loop.cli import _live_root_refusal
+        from valedia_trader.venues import webull
+        why = _live_root_refusal(paths)
+        if why is not None:
+            return f"real-money orders off: {why}; the locks were not read"
+        state = go_live.judge_locks(go_live.LiveFiles(environ=os.environ), webull.ny_date())
+        locks = state.locks[:3]
+        told = [f"lock {lock['lock']} ({lock['name']}) " + ("met" if lock["met"] is True else f"not met: {lock['reason']}")
+                for lock in locks]
+    except Exception as exc:
+        return f"real-money orders off: the locks could not be judged ({type(exc).__name__})"
+    if all(lock["met"] is True for lock in locks):
+        head = ("live mode: locks 1 to 3 met as far as they can be judged here; every batch still needs a proposal and "
+                "the owner's approval of its ticket number (order-step --live --propose, then --approve)")
+    else:
+        head = "real-money orders off"
+    return "; ".join([head, *told, LIVE_ONLY_AT_A_PROPOSAL])
 
 
 def check_schedule(paths: LoopPaths) -> tuple[str, str]:

@@ -511,16 +511,14 @@ def _no_constant(name: str):
     raise ValueError("NaN and Infinity are not numbers here")
 
 
-def _inside(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
 def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[Any, str | None]:
     """An owner's hand-written JSON file, read without trusting it: (its value, None), or (None, why) when it is
     missing, unreadable, a symbolic link (at the file, or at any folder above it, up to the top of the file system),
-    not a regular file, writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8, not JSON, or
-    holding a repeated key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs anything.
-    `root` is accepted as before and no longer limits the link check (T22b rev 2: the whole path is checked)."""
+    not a regular file, a file with more than one name (a hard link: a second name, anywhere on the disk, through
+    which it can be rewritten; T22c), writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8,
+    not JSON, or holding a repeated key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs
+    anything. `root` is accepted as before and no longer limits the link check (T22b rev 2: the whole path is
+    checked)."""
     try:
         p = Path(os.path.abspath(os.fspath(path)))
         for q in [p, *p.parents]:
@@ -536,6 +534,9 @@ def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[A
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 return None, "is not a regular file"
+            if st.st_nlink > 1:
+                return None, ("has more than one name on disk (a hard link), so it can be rewritten through its other "
+                              "name; give it a name of its own: copy it to a new file, then move the copy over it")
             if st.st_mode & 0o022:
                 return None, "is writable by its group or by others (it must be the owner's alone: chmod 600 or 644)"
             if st.st_size > OWNER_FILE_MAX_BYTES:
@@ -561,6 +562,36 @@ def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[A
         return None, "cannot be read"
     except Exception:                                     # nothing about an owner's file may raise
         return None, "cannot be read"
+
+
+def _live_order_value(amount: Any, reference: Any) -> tuple[float | None, str | None]:
+    """A production order's dollar value for the per-order cap: (abs(amount) times the reference price, None), or
+    (None, why). Both must be real numbers: an int or a float exactly (not a bool, not text or bytes, not a subclass),
+    finite, and the price above zero. The test environment never calls this (T22c: it behaves as before)."""
+    if type(amount) not in (int, float):
+        shown = "true or false" if type(amount) is bool else f"a {type(amount).__name__}"
+        return None, f"a real-money order's quantity must be a number, not {shown}"
+    if not math.isfinite(amount):
+        return None, "a real-money order's quantity is not a finite number"
+    need = "a real-money order needs a known dollar value to check against the cap"
+    if reference is None:
+        return None, f"{need}: no price or limit price was given"
+    if type(reference) is bool:
+        return None, f"{need}: the price given is true or false, not a number"
+    if type(reference) not in (int, float):
+        return None, f"{need}: the price given is a {type(reference).__name__}, not a number (an int or a float)"
+    try:
+        price = float(reference)
+    except OverflowError:
+        return None, f"{need}: the price given is too large"
+    if not math.isfinite(price):
+        return None, f"{need}: the price given is not a finite number"
+    if price <= 0:
+        return None, f"{need}: the price given must be above zero"
+    value = abs(float(amount)) * price
+    if not math.isfinite(value):
+        return None, f"{need}: the order's value (quantity times price) is too large"
+    return value, None
 
 
 def _money(value: Any) -> float | None:
@@ -1435,6 +1466,7 @@ def _too_many(exc_or_res: Any, raised: bool) -> bool:
 
 
 _UNSET = object()                                                       # the account's class, not looked up yet
+_FIXED_ATTRIBUTES = frozenset({"_endpoint"})                            # set once in _setup, never assigned again
 
 
 class WebullVenue:
@@ -1483,8 +1515,9 @@ class WebullVenue:
 
     def _setup(self, app_key, app_secret, environment, account_id, client, confirmation_file, region, confirmed_not_found, token_dir,
                account_class=None, limits=None, clock=None, sleep=None) -> None:
-        if environment not in HOSTS:
-            raise WebullError(f"environment must be one of {sorted(HOSTS)}")
+        # T22c: exactly a built-in str (a subclass could find one host and compare as another), before anything is built
+        if type(environment) is not str or environment not in HOSTS:
+            raise WebullError(f"environment must be one of {sorted(HOSTS)}, as plain text")
         if not str(app_key).strip() or not str(app_secret).strip():
             raise WebullError("a Webull App Key and App Secret are required")
         if account_class is not None and not (type(account_class) is str and _ACCOUNT_CLASS.fullmatch(account_class)):
@@ -1506,7 +1539,10 @@ class WebullVenue:
         self._named_events: dict[str, str] = {}           # client order id -> the event name a caller gave (expected=)
         self._named_sides: dict[str, str] = {}            # client order id -> the side a caller gave (expected_side=)
         suffix = "-events" if self._events else ""
-        self.environment, self.host, self.name = environment, HOSTS[environment], f"webull-{environment}{suffix}"
+        # The host the requests go to, fixed here and given to the SDK: the live guard decides from it (_to_production),
+        # so assigning `environment` or `host` later never makes the guard read the test environment (T22c).
+        self._endpoint = HOSTS[environment]
+        self.environment, self.host, self.name = environment, self._endpoint, f"webull-{environment}{suffix}"
         self._confirmation_file = Path(confirmation_file)
         self._app_key, self._app_secret = app_key, app_secret    # kept only to be withheld from every text
         self._account_id = None
@@ -1525,7 +1561,7 @@ class WebullVenue:
             _quiet_sdk_logging()
             try:                                             # the SDK opens a session here: this is a network call
                 api = ApiClient(app_key, app_secret, region)
-                api.add_endpoint(region, self.host)
+                api.add_endpoint(region, self._endpoint)
                 # The SDK writes its access token to <dir>/token.txt; without this it uses $WEBULL_OPENAPI_TOKEN_DIR or
                 # conf/ under the working directory (SDK core/client.py:171, token_storage.py:48-86, token_manager.py:96-104).
                 api.set_token_dir(str(private_tokens))
@@ -1543,6 +1579,21 @@ class WebullVenue:
             self._learn(account_id)
         self._account_id = account_id
         self._confirmed_not_found = confirmed_not_found is True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _FIXED_ATTRIBUTES and name in self.__dict__:
+            raise AttributeError(f"{name} is fixed when the venue is built (the host its requests go to)")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in _FIXED_ATTRIBUTES:
+            raise AttributeError(f"{name} is fixed when the venue is built (the host its requests go to)")
+        object.__delattr__(self, name)
+
+    def _to_production(self) -> bool:
+        """Whether this venue's orders are judged as production orders: always when the host it was built for (and
+        handed to the SDK) is not the test environment's, and, as before, when `environment` says production."""
+        return self.__dict__.get("_endpoint") != SANDBOX_HOST or self.environment == "production"
 
     def __repr__(self) -> str:
         return f"WebullVenue({self.name})"
@@ -2025,11 +2076,12 @@ class WebullVenue:
             self._named_sides[cid] = side
 
     # ---- orders
-    def _guard_live(self, value: float | None) -> dict | None:
-        """In production, before any network call: the owner's confirmation valid today (new form, not lapsed), the
-        order's value known and at most its max_order_value. Returns the confirmation (None in the test environment);
+    def _guard_live(self, value: float | None, why_no_value: str | None = None) -> dict | None:
+        """In production (_to_production: the host the venue was built for), before any network call: the owner's
+        confirmation valid today (new form, not lapsed), the order's value known (`why_no_value` None: see
+        _live_order_value) and at most its max_order_value. Returns the confirmation (None in the test environment);
         LiveTradingNotConfirmed otherwise."""
-        if self.environment != "production":
+        if not self._to_production():
             return None
         confirmation, why = live_confirmation(self._confirmation_file)
         if why == NOT_OWN_CONFIRMATION:
@@ -2039,6 +2091,8 @@ class WebullVenue:
             if why == "is missing":
                 raise LiveTradingNotConfirmed("real-money orders are off: the owner has not written config/webull_live.json")
             raise LiveTradingNotConfirmed(f"real-money orders are off: config/webull_live.json {why}")
+        if why_no_value is not None:
+            raise LiveTradingNotConfirmed(why_no_value)
         if value is None or not value > 0 or not math.isfinite(value):
             raise LiveTradingNotConfirmed("a real-money order needs a known dollar value to check against the cap")
         if value > confirmation["max_order_value"]:
@@ -2105,9 +2159,10 @@ class WebullVenue:
             amount, _ = _quantity(units, crypto)                          # a malformed quantity is refused first
             _session(session, crypto, limit_price)
             reference = limit_price if limit_price is not None else price
-            live = self.environment == "production"
-            # in production the price is judged before any call; in the test environment where the base judged it
-            confirmation = self._guard_live(abs(amount) * float(reference) if reference else None) if live else None
+            live = self._to_production()
+            # in production the price is judged before any call (a real number only: _live_order_value); in the test
+            # environment where the base judged it
+            confirmation = self._guard_live(*_live_order_value(amount, reference)) if live else None
             account = self.account_id
             self._fits(crypto)
             self._guard_live_account(confirmation)
@@ -2162,8 +2217,9 @@ class WebullVenue:
     def _event_environment(self) -> None:
         """LiveTradingNotConfirmed unless this venue is plainly the test environment: `environment` a plain str equal to
         "sandbox" by a static lookup (inspect.getattr_static: a property or a class-level answer is refused) and by an
-        ordinary one, and `host` by both lookups a plain str with "sandbox" as a whole dot-separated label. Reads no
-        file and calls nothing: no confirmation file changes it."""
+        ordinary one, `host` by both lookups a plain str with "sandbox" as a whole dot-separated label, and the host
+        the venue was built for (and handed to the SDK) the test environment's (T22c). Reads no file and calls nothing:
+        no confirmation file changes it."""
         found = []
         for name in ("environment", "host"):
             try:
@@ -2176,7 +2232,7 @@ class WebullVenue:
                 ordinary = None
             found.append((static, ordinary))
         env_ok = all(type(e) is str and e == TEST_ENVIRONMENT for e in found[0])
-        host_ok = all(_plain_sandbox_host(h) for h in found[1])
+        host_ok = all(_plain_sandbox_host(h) for h in found[1]) and self.__dict__.get("_endpoint") == SANDBOX_HOST
         if not (env_ok and host_ok):
             raise LiveTradingNotConfirmed("event orders are sent only in Webull's test environment (sandbox), and this venue is "
                                           "not plainly that; no confirmation file changes this")
