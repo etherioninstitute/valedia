@@ -196,16 +196,24 @@ def settle_directions(ledger: TournamentLedger, prices: pd.DataFrame) -> int:
 
 
 def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=None, max_age_days: int = 3,
-        limit: int | None = None, progress=None) -> dict[str, dict[str, int]]:
+        limit: int | None = None, progress=None, kinds: Sequence[str] | None = None) -> dict[str, dict[str, int]]:
     """Put every question a forecaster has not answered to it. A forecaster sees the thesis and the
     facts, as the decision panel does, and nothing else. Failures are recorded and asked again next time.
 
     With `today` given, a forward question is only put while it is at most `max_age_days` old and still
-    open: a forecaster that arrives later must not answer it with hindsight."""
+    open: a forecaster that arrives later must not answer it with hindsight.
+
+    With `kinds` given (values from KINDS), only questions of those kinds are considered, before the freshness
+    rule and before `limit`; an unknown kind is a ValueError, raised before any forecaster is asked."""
+    if kinds is not None:
+        kinds = (kinds,) if isinstance(kinds, str) else tuple(kinds)
+        unknown = [k for k in kinds if k not in KINDS]
+        if unknown:
+            raise ValueError(f"unknown question kind {unknown[0]!r}; the kinds are {', '.join(KINDS)}")
     out = {}
     for m in members:
         have = ledger.answered(m.name)
-        todo = [q for q in ledger.questions() if q["id"] not in have]
+        todo = [q for q in ledger.questions() if q["id"] not in have and (kinds is None or q["kind"] in kinds)]
         if today is not None:
             open_ids = {q["id"] for q in ledger.questions(unsettled_only=True)}
             fresh = lambda q: q["id"] in open_ids and (pd.Timestamp(today) - pd.Timestamp(q["asked_on"])).days <= max_age_days
@@ -421,6 +429,8 @@ def main(argv=None) -> int:
             p.add_argument("--forecasters", default="", help="comma-separated panel deciders (default: every enabled one)")
             p.add_argument("--with-rules", action="store_true", help="also ask the two rule forecasters (momentum, above the 200-day average)")
             p.add_argument("--limit", type=int, default=None, help="at most this many questions per forecaster in this run")
+        if name == "ask-forward":
+            p.add_argument("--only-forward", action="store_true", help="put only forward questions, never the blind-history backlog")
         if name == "ask-blind":
             p.add_argument("--count", type=int, default=300, help="how many questions to draw")
             p.add_argument("--seed", type=int, default=0)
@@ -457,8 +467,11 @@ def main(argv=None) -> int:
             qs = direction_questions(prices, list(prices.columns), prices.index[-1], args.horizon, args.market)
             added, settled, today = ledger.add(qs), 0, pd.Timestamp.now().normalize()
         members = forecasters([n for n in args.forecasters.split(",") if n] or None) + (reference_forecasters() if args.with_rules else [])
-        asked = ask(ledger, members, today=today, limit=args.limit, progress=lambda s: print(s, file=sys.stderr, flush=True))
-        print(json.dumps({"questions_added": added, "settled_now": settled, "asked": asked, "counts": ledger.counts()}, indent=1))
+        only_forward = args.cmd == "ask-forward" and args.only_forward
+        asked = ask(ledger, members, today=today, limit=args.limit, progress=lambda s: print(s, file=sys.stderr, flush=True),
+                    kinds=("forward",) if only_forward else None)
+        result = {"questions_added": added, "settled_now": settled, "asked": asked, "counts": ledger.counts()}
+        print(json.dumps({**result, "only_forward": True} if only_forward else result, indent=1))
         return 0
     finally:
         ledger.close()

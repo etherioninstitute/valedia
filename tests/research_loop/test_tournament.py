@@ -390,3 +390,193 @@ def test_a_timid_but_informative_forecaster_is_rescaled_as_far_as_it_needs():
     assert s["rescaled_skill"] == pytest.approx(1.0 - np.mean((q - y[late]) ** 2) / np.mean((0.5 - y[late]) ** 2), abs=5e-4)
     assert s["rescaled_skill"] > 0 and s["rescaled_settled"] == n // 2
     led.close()
+
+
+# ---- asking only the day's forward questions ----------------------------------------------------------------------
+
+TODAY = pd.Timestamp("2026-11-13")
+
+
+def _backlog_ledger(blind=30, forward=3, extra=()):
+    """`blind` old blind-history questions (oldest first by day) and `forward` questions asked today."""
+    led = tm.TournamentLedger()
+    day0 = pd.Timestamp("2024-01-01")
+    led.add([tm.Question(f"b{k:03d}", "funds", "blind history", str((day0 + pd.Timedelta(days=k)).date()), 5, "AAA",
+                         f"blind {k}", {"n": k}, 0.5) for k in range(blind)])
+    led.add([tm.Question(f"f{k}", "funds", "forward", str(TODAY.date()), 5, f"S{k}", f"forward {k}", {"n": k}, 0.5)
+             for k in range(forward)])
+    led.add(list(extra))
+    return led
+
+
+def _recorder(fail=False):
+    calls = []
+
+    def fn(case):
+        calls.append(case["thesis"])
+        if fail:
+            raise RuntimeError("model fell over")
+        return 0.6, None, "ok"
+    return calls, fn
+
+
+def test_with_only_forward_a_forecaster_with_a_blind_backlog_is_asked_exactly_the_days_forward_questions():
+    led = _backlog_ledger()
+    calls, fn = _recorder()
+    out = tm.ask(led, [CallableMember("m", "decider", fn)], today=TODAY, kinds=("forward",))
+    assert out == {"m": {"asked": 3, "answered": 3}} and sorted(calls) == ["forward 0", "forward 1", "forward 2"]
+    calls2, fn2 = _recorder()                                                   # without it: the backlog goes first, oldest first
+    out2 = tm.ask(_backlog_ledger(), [CallableMember("m", "decider", fn2)], today=TODAY)
+    assert out2 == {"m": {"asked": 33, "answered": 33}}
+    assert calls2[:30] == [f"blind {k}" for k in range(30)] and calls2[30:] == ["forward 0", "forward 1", "forward 2"]
+    calls3, fn3 = _recorder()                                                   # and a limit then never reaches the forward ones
+    tm.ask(_backlog_ledger(), [CallableMember("m", "decider", fn3)], today=TODAY, limit=5)
+    assert calls3 == [f"blind {k}" for k in range(5)]
+    led.close()
+
+
+def test_the_limit_counts_forward_questions_only_when_the_flag_is_given():
+    led = _backlog_ledger(forward=5)
+    calls, fn = _recorder()
+    out = tm.ask(led, [CallableMember("m", "decider", fn)], today=TODAY, limit=2, kinds=("forward",))
+    assert out == {"m": {"asked": 2, "answered": 2}} and calls == ["forward 0", "forward 1"]
+    calls2, fn2 = _recorder()                                                   # a second run takes the next two
+    tm.ask(led, [CallableMember("m", "decider", fn2)], today=TODAY, limit=2, kinds=("forward",))
+    assert calls2 == ["forward 2", "forward 3"]
+    led.close()
+
+
+def test_a_stale_or_settled_forward_question_is_still_not_asked_with_the_flag():
+    old = tm.Question("fold", "funds", "forward", "2026-11-05", 5, "OLD", "forward stale", {}, 0.5)
+    done = tm.Question("fdone", "funds", "forward", str(TODAY.date()), 5, "DON", "forward settled", {}, 0.5)
+    edge = tm.Question("fedge", "funds", "forward", "2026-11-10", 5, "EDG", "forward three days old", {}, 0.5)
+    led = _backlog_ledger(extra=(old, done, edge))
+    led.settle("fdone", 1)
+    calls, fn = _recorder()
+    out = tm.ask(led, [CallableMember("m", "decider", fn)], today=TODAY, max_age_days=3, kinds=("forward",))
+    assert out == {"m": {"asked": 4, "answered": 4}}
+    assert sorted(calls) == ["forward 0", "forward 1", "forward 2", "forward three days old"]
+    led.close()
+
+
+def test_a_failed_call_with_the_flag_is_recorded_and_asked_again_next_run():
+    led = _backlog_ledger()
+    calls, fn = _recorder(fail=True)
+    out = tm.ask(led, [CallableMember("m", "decider", fn)], today=TODAY, kinds=("forward",))
+    assert out == {"m": {"asked": 3, "answered": 0}} and led.counts()["failed_calls"] == {"m": 3}
+    calls2, fn2 = _recorder()
+    out2 = tm.ask(led, [CallableMember("m", "decider", fn2)], today=TODAY, kinds=("forward",))
+    assert out2 == {"m": {"asked": 3, "answered": 3}} and led.counts()["answers"] == {"m": 3}
+    assert tm.ask(led, [CallableMember("m", "decider", fn2)], today=TODAY, kinds=("forward",)) == {"m": {"asked": 0, "answered": 0}}
+    led.close()
+
+
+@pytest.mark.parametrize("kinds", [("nonsense",), ("forward", "blind histroy"), "forward,blind"])
+def test_an_unknown_kind_raises_before_any_forecaster_is_asked(kinds):
+    led = _backlog_ledger()
+    calls, fn = _recorder()
+    with pytest.raises(ValueError, match="blind histroy|nonsense|forward,blind"):
+        tm.ask(led, [CallableMember("m", "decider", fn), CallableMember("n", "decider", fn)], today=TODAY, kinds=kinds)
+    assert calls == [] and led.counts()["answers"] == {} and led.counts()["failed_calls"] == {}
+    led.close()
+
+
+def test_every_known_kind_and_both_together_are_accepted():
+    for kinds, n in ((tm.KINDS, 33), (("blind history",), 30), ((), 0)):
+        led = _backlog_ledger()
+        calls, fn = _recorder()
+        assert tm.ask(led, [CallableMember("m", "decider", fn)], today=TODAY, kinds=kinds) == {"m": {"asked": n, "answered": n}}
+        led.close()
+
+
+def _ask_as_it_was(ledger, members, today=None, max_age_days=3, limit=None):
+    """The behaviour before `kinds` was added, kept here as the reference the unchanged path is held to."""
+    out = {}
+    for m in members:
+        have = ledger.answered(m.name)
+        todo = [q for q in ledger.questions() if q["id"] not in have]
+        if today is not None:
+            open_ids = {q["id"] for q in ledger.questions(unsettled_only=True)}
+            fresh = lambda q: q["id"] in open_ids and (pd.Timestamp(today) - pd.Timestamp(q["asked_on"])).days <= max_age_days
+            todo = [q for q in todo if q["kind"] != "forward" or fresh(q)]
+        todo = todo[:limit] if limit else todo
+        answered = 0
+        for q in todo:
+            v = m.ask({"thesis": q["thesis"], "facts": q["facts"]})
+            ok = v.error is None and v.probability is not None
+            ledger.record(q["id"], m.name, v.probability if ok else None, None if ok else (v.error or "no probability in the reply"), v.latency_ms)
+            answered += int(ok)
+        out[m.name] = {"asked": len(todo), "answered": answered}
+    return out
+
+
+def _random_ledger(seed):
+    rng = np.random.default_rng(seed)
+    led = tm.TournamentLedger()
+    qs = []
+    for k in range(int(rng.integers(0, 25))):
+        kind = KINDS_FOR_TESTS[int(rng.integers(0, 2))]
+        day = str((TODAY - pd.Timedelta(days=int(rng.integers(0, 12)) if kind == "forward" else int(rng.integers(0, 900)))).date())
+        qs.append(tm.Question(f"q{k:03d}", "funds", kind, day, 5, "AAA", f"t{k}", {"k": k}, 0.5))
+    led.add(qs)
+    for q in qs:
+        if rng.random() < 0.2:
+            led.settle(q.id, int(rng.integers(0, 2)))
+        for name in ("a", "b"):
+            if rng.random() < 0.3:
+                led.record(q.id, name, 0.5 if rng.random() < 0.8 else None, None if rng.random() < 0.8 else "failed", 1.0)
+    return led
+
+
+KINDS_FOR_TESTS = ("forward", "blind history")
+
+
+def test_without_the_flag_the_asking_is_what_it_was_on_200_generated_ledgers():
+    def run(fn, seed, **kw):
+        led = _random_ledger(seed)
+        calls = []
+
+        def member(name):
+            return CallableMember(name, "decider", lambda case, n=name: (calls.append((n, case["thesis"])) or (0.55, None, "ok")))
+        out = fn(led, [member("a"), member("b"), member("c")], **kw)
+        rows = led._db.execute("SELECT question_id, forecaster, probability, error FROM forecasts ORDER BY question_id, forecaster").fetchall()
+        led.close()
+        return json.dumps([out, calls, [tuple(r) for r in rows]], sort_keys=True)
+    rng = np.random.default_rng(20261114)
+    for seed in range(200):
+        kw = {"today": [None, TODAY][int(rng.integers(0, 2))], "max_age_days": int(rng.integers(0, 6)),
+              "limit": [None, 0, 1, 3, 7][int(rng.integers(0, 5))]}
+        assert run(tm.ask, seed, **kw) == run(_ask_as_it_was, seed, **kw), (seed, kw)
+        assert run(lambda *a, **k: tm.ask(*a, **k, kinds=None), seed, **kw) == run(_ask_as_it_was, seed, **kw)
+
+
+def _forward_cli(tmp_path, monkeypatch, capsys, *flags):
+    folder = _price_folder(tmp_path, end=pd.Timestamp.now().normalize())
+    ledger_path = tmp_path / "t.sqlite"
+    led = tm.TournamentLedger(ledger_path)                                      # a blind backlog already on file
+    led.add([tm.Question(f"b{k:03d}", "funds", "blind history", f"2024-02-{k + 1:02d}", 5, "AAA", f"blind {k}", {"n": k}, 0.5)
+             for k in range(20)])
+    led.close()
+    calls, fn = _recorder()
+    monkeypatch.setattr(tm, "forecasters", lambda names=None, roster=None: [CallableMember("m", "decider", fn)])
+    args = ["--root", str(tmp_path), "--ledger", str(ledger_path), "ask-forward", "--data", str(folder), "--market", "funds", *flags]
+    assert tm.main(args) == 0
+    return calls, json.loads(capsys.readouterr().out)
+
+
+def test_ask_forward_with_only_forward_asks_just_the_forward_questions_and_adds_one_key(tmp_path, monkeypatch, capsys):
+    calls, out = _forward_cli(tmp_path, monkeypatch, capsys, "--only-forward", "--limit", "2")
+    assert out["only_forward"] is True and out["asked"] == {"m": {"asked": 2, "answered": 2}}
+    assert len(calls) == 2 and not any(t.startswith("blind") for t in calls)
+    assert list(out) == ["questions_added", "settled_now", "asked", "counts", "only_forward"]
+
+
+def test_ask_forward_without_the_flag_prints_what_it_printed_and_asks_the_backlog_first(tmp_path, monkeypatch, capsys):
+    calls, out = _forward_cli(tmp_path, monkeypatch, capsys, "--limit", "2")
+    assert list(out) == ["questions_added", "settled_now", "asked", "counts"] and "only_forward" not in out
+    assert calls == ["blind 0", "blind 1"]
+
+
+def test_only_forward_is_not_an_option_of_ask_blind(tmp_path):
+    with pytest.raises(SystemExit):
+        tm.main(["--root", str(tmp_path), "ask-blind", "--data", "x", "--market", "funds", "--only-forward"])
