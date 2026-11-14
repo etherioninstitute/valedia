@@ -164,7 +164,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timezone
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Callable
@@ -181,6 +181,9 @@ __all__ = ["TEST_ENVIRONMENT", "NOT_SENT", "PaperTargets", "OrderStepState", "Or
            "TicketBook", "ticket_path_for", "ticket_number", "TICKET_LIFE_SECONDS", "TICKET_QUOTE_MOVE"]
 
 TEST_ENVIRONMENT = "sandbox"                      # the only environment a run accepts (WebullVenue.environment)
+LIVE_ENVIRONMENT = "production"                   # live mode only (--live): Webull's production environment ...
+LIVE_HOST = "api.webull.com"                      # ... at exactly this host
+SECOND_VERDICTS = ("agree", "disagree", "no second quote")
 NOT_SENT = (NotTransmitted, OrderRejected)        # the adapter's answers that mean no order exists
 NEW_YORK = "America/New_York"
 SESSION_AFTER_OPEN = pd.Timedelta(minutes=5)      # 09:35 on a 09:30 open
@@ -1026,9 +1029,22 @@ class TicketBook:
             self._db.execute("INSERT INTO outcomes (day, number, line, seq, outcome, tag, reason, time, batch) "
                              "VALUES (?, ?, ?, 0, 'not sent', NULL, ?, ?, ?)", (day, number, line, reason, now, batch))
 
-    def create(self, ticket: dict, lines: list[dict]) -> None:
+    def live_mark(self, day: str, number: str) -> dict | None:
+        """A live ticket's mark ({"mode": "live", "files": the digest of the owner's files it was made under}), or None
+        for a ticket of the test environment's paper mode."""
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (f"live:{day}:{number}",)).fetchone()
+        if row is None:
+            return None
+        try:
+            mark = json.loads(row[0])
+        except ValueError:
+            return {"mode": "unreadable"}
+        return mark if isinstance(mark, dict) else {"mode": "unreadable"}
+
+    def create(self, ticket: dict, lines: list[dict], live: dict | None = None) -> None:
         """Write a ticket and its lines, and mark every earlier unused ticket of the same venue and account superseded,
-        in one transaction: only the latest ticket is live."""
+        in one transaction: only the latest ticket is live. A live ticket also gets its mark (`live`) in the meta
+        table, in the same transaction."""
         cols = ("day", "number", "created", "expires", "venue", "environment", "account", "capital", "fractional", "equity",
                 "cash", "settled_cash", "batch")
         with self._write():
@@ -1043,6 +1059,9 @@ class TicketBook:
                                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                  [(ticket["day"], ticket["number"], ln["line"], ln["fund"], ln["side"], ln["units"],
                                    ln["quote"], ln["limit"], ln["value"]) for ln in lines])
+            if live is not None:
+                self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                 (f"live:{ticket['day']}:{ticket['number']}", json.dumps(live, sort_keys=True)))
 
     def mark_used(self, day: str, number: str, batch: str) -> None:
         """Mark the ticket used by `batch`; refused (OrderStepError) when it already has a fate."""
@@ -1097,6 +1116,7 @@ class TicketBook:
             used = [(r["day"], r["number"]) for r in self._db.execute("SELECT day, number FROM fates WHERE fate = 'used' "
                                                                       "ORDER BY rowid")]
         corrections = []
+        self.disagreements = []
         for day, number in used:
             latest, tags = self.outcomes(day, number), self.tags(day, number)
             for ln in self.lines(day, number):
@@ -1115,6 +1135,10 @@ class TicketBook:
                     continue
                 now = outcome if outcome is not None else "unknown"
                 if now == row["outcome"]:
+                    continue
+                if row["outcome"] == "sent":             # never turned back: the order reached the venue once
+                    self.disagreements.append({"number_ends": number[-2:], "line": line, "fund": ln["symbol"], "tag": tag,
+                                               "record": "sent", "ledger": rec.get("state") if rec else "nothing"})
                     continue
                 if now == "sent" and rec is not None and rec.get("never_arrived_at") is not None:
                     why = f"sent: found at the venue on recheck (the ledger now says {rec.get('state')})"
@@ -1228,15 +1252,24 @@ _ABSENT = object()
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
-                   approve: str | None = None) -> dict:
+                   approve: str | None = None, live=None, second_opinion=None) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
     Never raises because of the venue, the quotes or the paper book; a crash of the process mid-run is safe.
-    `propose` writes a ticket instead of sending; `approve` (the ticket's number) sends only what that ticket holds."""
+    `propose` writes a ticket instead of sending; `approve` (the ticket's number) sends only what that ticket holds.
+    `live` (a go_live.LiveFiles, with propose or approve and a capital) is live mode: Webull's production environment
+    under the four locks of the go-live gate; `second_opinion` is the second price source's verdict function
+    (default: second_quote.second_opinion), asked only in live mode."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
+    if live is not None:
+        run.live = live
+        run.expected_env = LIVE_ENVIRONMENT
+        if second_opinion is None:
+            from valedia_trader.data_and_fees.second_quote import second_opinion
+        run.second_opinion = second_opinion
     if mode is not None:
         run.mode, run.approve_number = mode, approve
         if propose and approve is not None:
@@ -1282,6 +1315,13 @@ class _Run:
         self.approve_number = None
         self.tickets: TicketBook | None = None
         self.run_path: str | None = None                 # the state file this run is locked on
+        self.live = None                                 # live mode: the go_live.LiveFiles its locks are read from
+        self.expected_env = TEST_ENVIRONMENT             # the environment the venue and the tickets must name
+        self.second_opinion = None
+        self.locks = None                                # live mode: the go_live.LockState judged at the start
+        self.live_exposure = 0.0                         # live mode: what this ledger holds plus the buys passed so far
+        self._ticket_expired_seen = False                # once a reading is past the ticket's expiry, it stays expired
+        self.disagreements: list[dict] = []
         self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
         self.ticket_lines: list[dict] = []
         self.ticket_out: dict[int, dict] = {}            # approve: what became of each line in this run
@@ -1332,6 +1372,12 @@ class _Run:
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
         if self.mode == "both":                          # before the lock: writes nothing anywhere
             return self._finish("stopped", "ticket", "propose and approve cannot be asked for in one run")
+        if self.live is not None:                        # live mode: only as a ticket run, a capital, whole shares
+            why = ("live mode runs only with propose or approve" if self.mode is None else
+                   "live mode needs the capital given (at most the confirmation's max_capital)" if self.capital is None else
+                   "live mode trades whole shares only" if self.fractional else None)
+            if why is not None:
+                return self._finish("stopped", "live", why)
         try:
             self._environment()                          # 1: the venue's name, environment and host only
         except _Stop as stop:
@@ -1343,6 +1389,10 @@ class _Run:
             return self._finish("stopped", "session", "another order step is running on this venue's state file")
         self._locked = True                              # from here on the journal may be written
         try:
+            if self.live is not None:                    # the four locks, before anything is read from the account
+                why = self._live_locks(path)
+                if why is not None:
+                    return self._finish("stopped", "lock", why)
             try:
                 self._scan_journal()                     # before anything is asked of the venue
                 self._session(now)                       # 2
@@ -1426,6 +1476,84 @@ class _Run:
                 return self._finish("stopped", "ticket", f"the ticket could not be written: {_local_error(exc)}")
         return self._finish("done", None, None)
 
+    # -- live mode (go_live): the locks, the account, each order's caps and second price
+    def _live_locks(self, path: str) -> str | None:
+        """Judge the four locks on the run's New York day; None when all are met. An unmet lock in an approve run is
+        recorded as a refused approval of this batch (step 1's mark), in the ticket file when there is one."""
+        from valedia_trader.execution_and_risk import go_live
+        try:
+            self.locks = go_live.judge_locks(self.live, date.fromisoformat(self.day), self.capital)
+            why = self.locks.unmet()
+        except Exception as exc:
+            why = f"the locks could not be judged: {_describe(exc)}"
+        if why is None or self.mode != "approve":
+            return why
+        try:
+            book = TicketBook(ticket_path_for(path), self.clock, create=False)
+        except (OrderStepError, sqlite3.Error, OSError):
+            return why                                   # no ticket file: nothing to mark
+        try:
+            book.note_attempt(self.batch, self.day)
+            book.note_verdict(self.batch, "refused", why[:1000])
+        except (sqlite3.Error, OSError):
+            pass
+        finally:
+            book.close()
+        return why
+
+    def _live_account(self, account: str) -> str | None:
+        """Live mode, at the first account read: the account the venue will trade is the confirmation's (its class,
+        its last 4). Why not, or None; no more than the last 4 of an id ever appears."""
+        conf = self.locks.confirmation
+        try:
+            cls = self.venue.account_class
+        except Exception as exc:
+            return f"lock 1 (the confirmation): the venue's account class could not be read: {_venue_error(exc)}"
+        if not (type(cls) is str and cls == conf["account_class"]):
+            return (f"lock 1 (the confirmation): it names an {conf['account_class']} account; the venue's account is of "
+                    "another class")
+        if account[-4:] != conf["account_ends"]:
+            return (f"lock 1 (the confirmation): it names the account ending {conf['account_ends']}; the venue's account "
+                    f"ends {account[-4:]}")
+        return None
+
+    def _live_order(self, c: dict, units: float, limit: float, quote: float) -> str | None:
+        """Live mode, for one order before its ticket line (propose) or its intend (approve): its value at its limit
+        at most max_order_value; what this ledger holds plus this ticket's buys at most max_capital; the second
+        price source agreeing on the fresh quote. Why not, or None (a buy is then counted against max_capital)."""
+        conf = self.locks.confirmation
+        value = abs(units) * limit
+        if not value <= conf["max_order_value"]:
+            return (f"lock 1 (the confirmation): the order's value {value:,.2f} at its limit is above max_order_value "
+                    f"{conf['max_order_value']:,.2f}")
+        if units > 0 and not self.live_exposure + value <= conf["max_capital"]:
+            return (f"lock 1 (the confirmation): with this order the money at work would be "
+                    f"{self.live_exposure + value:,.2f}, above max_capital {conf['max_capital']:,.2f}")
+        verdict = self._second_verdict(c["symbol"], quote)
+        if verdict != "agree":
+            return f"lock 3 (the limits): the second price source says {verdict} for the quote {quote:g}"
+        if units > 0:
+            self.live_exposure += value
+        return None
+
+    def _second_verdict(self, symbol: str, quote: float) -> str:
+        from valedia_trader.execution_and_risk import go_live
+        try:
+            now = datetime.fromtimestamp(self._now(), tz=timezone.utc)
+            answer = self.second_opinion(quote, symbol, now=now, sources=go_live.SECOND_SOURCES, clock=self.clock)
+            verdict = answer.get("verdict") if isinstance(answer, dict) else None
+        except _Stop:
+            return "no second quote (the clock gave no usable time)"
+        except Exception as exc:
+            return f"no second quote (the check failed: {type(exc).__name__})"
+        return verdict if type(verdict) is str and verdict in SECOND_VERDICTS else "an answer that is not a verdict"
+
+    def _ticket_expired(self, now: float, ticket: dict | None = None) -> bool:
+        """Whether the ticket is past its expiry on this reading or was on any earlier reading of this run."""
+        if now > ticket_expiry(self.ticket if ticket is None else ticket):
+            self._ticket_expired_seen = True
+        return self._ticket_expired_seen
+
     # -- tickets (propose and approve runs only)
     def _verdict(self, verdict: str, why: str | None = None) -> None:
         try:
@@ -1456,6 +1584,12 @@ class _Run:
             if self.mode == "approve":
                 self._verdict("refused", "the venue's account is not a plain id")
             raise _Stop("ticket", "the venue's account is not a plain id; nothing is sent")
+        if self.live is not None:                        # live: the account is the one the confirmation names
+            why = self._live_account(account)
+            if why is not None:
+                if self.mode == "approve":
+                    self._verdict("refused", why)
+                raise _Stop("lock", f"{why}; nothing is sent")
         self.account = self.tickets.account_hash(account)
         if self.mode == "approve":
             if not hmac.compare_digest(self.account, str(self.ticket["account"])):
@@ -1481,14 +1615,23 @@ class _Run:
             env = self.venue.environment
         except Exception:
             env = None
-        if t["environment"] != TEST_ENVIRONMENT or type(env) is not str or env != t["environment"]:
+        if t["environment"] != self.expected_env or type(env) is not str or env != t["environment"]:
             self._refuse_ticket("that ticket was made for another environment")
         fate = book.fate(t["day"], t["number"])
         if fate is not None:
             self._refuse_ticket({"used": "that ticket has been used", "expired": "that ticket has expired",
                                  "superseded": "that ticket was superseded by a later one"}.get(fate["fate"],
                                                                                                 "that ticket is closed"))
-        if now > ticket_expiry(t):
+        mark = book.live_mark(t["day"], t["number"])     # the ticket's mode: live tickets carry their locks' files
+        if self.live is None and mark is not None:
+            self._refuse_ticket("that ticket was made in live mode")
+        if self.live is not None:
+            if mark is None or mark.get("mode") != "live":
+                self._refuse_ticket("that ticket was not made in live mode")
+            if mark.get("files") != self.locks.digest:
+                self._refuse_ticket("the owner's files (the confirmation, the checklist or the limits) changed since that "
+                                    "ticket was made")
+        if self._ticket_expired(now, t):
             try:
                 book.mark_expired(t["day"], t["number"], self.batch)
             except (sqlite3.Error, OSError):
@@ -1520,10 +1663,11 @@ class _Run:
         else:
             raise _Stop("ticket", "no free ticket number could be drawn")
         ticket = {"day": self.day, "number": number, "created": now, "expires": now + life, "venue": self.name,
-                  "environment": TEST_ENVIRONMENT, "account": self.account, "capital": self.capital_used,
+                  "environment": self.expected_env, "account": self.account, "capital": self.capital_used,
                   "fractional": int(self.fractional), "equity": self.broker_equity, "cash": self.cash_read,
                   "settled_cash": self.settled_cash, "batch": self.batch}
-        self.tickets.create(ticket, self.ticket_lines)
+        mark = None if self.live is None else {"mode": "live", "files": self.locks.digest}
+        self.tickets.create(ticket, self.ticket_lines, live=mark)
         self.ticket, self.ticket_number_made = ticket, number
         self._write({"event": "ticket", **self._ticket_view()})
 
@@ -1609,6 +1753,7 @@ class _Run:
         is read). A ticket file that cannot be used or written is journaled, never a reason to stop. Returns the
         corrections written."""
         book, own = self.tickets, True
+        self.disagreements = []
         if book is None:
             path = ticket_path_for(self.run_path) if self.run_path is not None else ":memory:"
             if str(path) == ":memory:" or not os.path.exists(path):
@@ -1619,7 +1764,9 @@ class _Run:
                 self._write({"event": "tickets_not_settled", "reason": _local_error(exc)})
                 return []
         try:
-            return book.settle(self.ledger, self.batch)
+            out = book.settle(self.ledger, self.batch)
+            self.disagreements = list(getattr(book, "disagreements", []))
+            return out
         except (OrderStepError, sqlite3.Error, OSError) as exc:
             self._write({"event": "tickets_not_settled", "reason": _local_error(exc)})
             return []
@@ -1737,6 +1884,9 @@ class _Run:
             env = self.venue.environment
         except Exception:
             env = None
+        if self.live is not None:                        # live mode: production, at exactly Webull's production host
+            self._check_live_environment(static_env, env)
+            return
         if not all(type(e) is str and e == TEST_ENVIRONMENT for e in (static_env, env)):
             raise _Stop("environment", f"the order step runs against the test environment ({TEST_ENVIRONMENT}, a plain "
                                        "str) only; this venue's environment is not that. Live trading is not built")
@@ -1751,6 +1901,24 @@ class _Run:
         if static is not _ABSENT or dynamic is not _ABSENT:
             if not all(_sandbox_host(h) for h in (static, dynamic)):
                 raise _Stop("environment", "the venue's host is not a plain str attribute naming the sandbox")
+
+    def _check_live_environment(self, static_env, env) -> None:
+        """Live mode: `environment` exactly "production" and `host` exactly LIVE_HOST, each a plain str (not a
+        subclass) by a static lookup (a property or a class-level descriptor is refused) and by an ordinary one (also
+        through __getattr__)."""
+        if not all(type(e) is str and e == LIVE_ENVIRONMENT for e in (static_env, env)):
+            raise _Stop("environment", f"live mode runs against Webull's production environment ({LIVE_ENVIRONMENT}, a "
+                                       "plain str attribute) only; this venue's environment is not that")
+        try:
+            static = inspect.getattr_static(self.venue, "host", _ABSENT)
+        except Exception:
+            static = None
+        try:
+            dynamic = getattr(self.venue, "host", _ABSENT)
+        except Exception:
+            dynamic = None
+        if not all(type(h) is str and h == LIVE_HOST for h in (static, dynamic)):
+            raise _Stop("environment", f"live mode needs the venue's host to be exactly {LIVE_HOST} (a plain str attribute)")
 
     # -- the paper book's day
     def _paper_day(self, p: PaperTargets) -> None:
@@ -2122,6 +2290,10 @@ class _Run:
             self.ticket_used = True
             self._write({"event": "ticket_used", "number_ends": self.ticket["number"][-2:]})
             candidates = self._ticket_candidates(candidates)
+        if self.live is not None:                        # live: the money this ledger has at work, at the quotes in hand
+            mine = [(u, in_hand.get(sym)) for sym, u in book.items() if u > UNITS_EPS]
+            self.live_exposure = (math.inf if any(not _finite(q) for _, q in mine)    # unpriced: no buy can be judged
+                                  else math.fsum(u * float(q) for u, q in mine))
         sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
         buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
         for c in sales + buys:
@@ -2185,6 +2357,11 @@ class _Run:
                 if why is not None:
                     self._drop(c, why)
                     continue
+            if self.live is not None:                    # live: the caps and the second price, at propose and approve
+                why = self._live_order(c, units, limit, quote)
+                if why is not None:
+                    self._drop(c, why)
+                    continue
             tag = f"{self.batch}-{sym}"
             watch = _SubmitWatch(self.venue)
             if self.mode == "approve":                   # the line's tag, on file before its intend
@@ -2194,7 +2371,7 @@ class _Run:
             if now > self.window_end:                    # 5. the window, on the clock, immediately before intend
                 self._leave(c, "the session window closed during the run")
                 continue
-            if self.mode == "approve" and now > ticket_expiry(self.ticket):   # ... the ticket's life on that reading
+            if self.mode == "approve" and self._ticket_expired(now):         # ... the ticket's life on that reading
                 self._drop(c, "the ticket expired before the order was intended")
                 continue
             if self.mode == "propose":                   # a line of the ticket instead of intend: nothing is intended
@@ -2216,7 +2393,7 @@ class _Run:
                     now = self._now()                    # ... nothing between it and submit_once
                     if now > self.window_end:
                         late = "the session window closed during the run"
-                    elif self.mode == "approve" and now > ticket_expiry(self.ticket):
+                    elif self.mode == "approve" and self._ticket_expired(now):
                         late = "the ticket expired before the order was sent"
                 if late is not None:
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
@@ -2314,8 +2491,14 @@ class _Run:
                     pass
         if self.mode is not None:
             summary.update(mode=self.mode, dropped=self.dropped, ticket=self._ticket_summary())
+        if self.live is not None:                        # live mode: said so, with each lock as judged
+            summary["live"] = True
+            summary["locks"] = None if self.locks is None else [dict(lock) for lock in self.locks.locks]
         if corrections:                                  # named in the summary of the run that wrote them
             summary["ticket_corrections"] = corrections
+        if self.disagreements:                           # a sent line the order ledger no longer knows as sent: kept
+            summary["ticket_disagreements"] = [{**d, "reason": "the record says sent and the order ledger does not; the "
+                                                "record is left as it is and a person must look"} for d in self.disagreements]
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only
                 return summary

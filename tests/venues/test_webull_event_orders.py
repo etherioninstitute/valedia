@@ -641,8 +641,9 @@ def test_an_events_venue_on_an_account_of_another_class_sends_nothing(tmp_path):
 
 def test_production_refuses_event_orders_whatever_the_confirmation_file_says(tmp_path):
     conf = tmp_path / "webull_live.json"
-    conf.write_text('{"account_id": "%s", "confirmed_by": "Burton", "max_order_value": 100000, '
-                    '"i_understand_this_trades_real_money": true}' % EV_ID)
+    conf.write_text('{"account_class": "INDIVIDUAL_CASH", "account_ends": "%s", "confirmed_by": "Burton", '   # T22b: the new form
+                    '"max_order_value": 100000, "max_capital": 100000, "valid_until": "%s", '
+                    '"i_understand_this_trades_real_money": true}' % (EV_ID[-4:], wb.ny_date().isoformat()))
     assert wb.load_live_confirmation(conf) is not None
     v, client = ev(tmp_path, env="production")
     for units in (1, -1):

@@ -495,3 +495,183 @@ def test_order_step_without_the_new_flags_calls_the_step_exactly_as_before(order
     assert capsys.readouterr().out == json.dumps({"status": "done"}, indent=2) + "\n"
     assert cli.order_step_command(argparse.Namespace(capital=None, fractional=False), cli.LoopPaths(root), venue=venue) == 0
     assert "propose" not in seen[-1] and "approve" not in seen[-1]
+
+
+# ---- T22b: live mode on the command line (order-step --live), every venue a stand-in, every owner's file in tmp
+
+LIVE_ACCOUNT = "ZqLIVEACCOUNT0077"                                     # made up; only its last 4 may ever be printed
+LIVE_KEYS = {"ALPACA_API_KEY": "a", "ALPACA_SECRET_KEY": "b", "FINNHUB_API_KEY": "c", "WEBULL_ENV": "production",
+             "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_CASH"}
+
+
+class _LiveVenue(_Venue):
+    """A stand-in for Webull's production environment: no network."""
+    environment = "production"
+    host = "api.webull.com"
+    name = "webull-production"
+    account_class = "INDIVIDUAL_CASH"
+    account_id = LIVE_ACCOUNT
+
+
+@pytest.fixture
+def live_project(order_step_project, monkeypatch):
+    from datetime import date
+
+    from valedia_trader.data_and_fees import second_quote
+    from valedia_trader.venues import webull
+    root, _ = order_step_project
+    cfg = root / "config"
+    (cfg / "risk.json").write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.6,
+                                               "max_open_positions": 5, "max_orders_per_day": 10}))
+    (cfg / "webull_live.json").write_text(json.dumps({
+        "account_class": "INDIVIDUAL_CASH", "account_ends": LIVE_ACCOUNT[-4:], "confirmed_by": "Burton",
+        "max_order_value": 3000, "max_capital": 100000, "valid_until": "2026-11-20",
+        "i_understand_this_trades_real_money": True}))
+    (cfg / "go_live.json").write_text(json.dumps({
+        "min_paper_broker_days": 1, "min_reconciled_fills": 1, "min_days_since_a_stopped_run": 1,
+        "fills_checked_by_hand": 1, "min_fills_checked_by_hand": 1, "confirmed_by": "Burton"}))
+    for p in cfg.iterdir():
+        p.chmod(0o644)
+    with (root / "journal" / "2026-11-12.jsonl").open("a") as fh:
+        for e in ({"event": "fill", "fill_id": "f1"}, {"event": "summary", "status": "done", "stage": None}):
+            fh.write(json.dumps({"timestamp": "2026-11-12T15:00:00+00:00", "day": "2026-11-12", "type": "order_step",
+                                 "venue": "webull-sandbox", "batch": "paper-1", **e}) + "\n")
+    venue = _LiveVenue()
+    built, asked = [], []
+    monkeypatch.setattr(cli, "_live_environ", lambda: dict(LIVE_KEYS))             # never the secrets file
+    monkeypatch.setattr(cli, "_order_step_live_venue", lambda files, environ: built.append(files) or venue)
+    monkeypatch.setattr(second_quote, "second_opinion",
+                        lambda price, symbol, **kw: asked.append(symbol) or {"verdict": "agree"})
+    monkeypatch.setattr(webull, "ny_date", lambda t=None: date(2026, 11, 13))
+    return root, venue, built, asked
+
+
+def _tree(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+@pytest.mark.parametrize("argv", [["--live"], ["--live", "--propose"], ["--live", "--approve", "123456"],
+                                  ["--live", "--propose", "--capital", "100000", "--fractional"],
+                                  ["--live", "--approve", "123456", "--capital", "100000", "--fractional"],
+                                  ["--live", "--propose", "--capital", "nan"], ["--live", "--propose", "--capital", "-5"],
+                                  ["--check"], ["--check", "--capital", "5"]])
+def test_live_flags_that_cannot_run_are_refused_before_anything_is_read(live_project, monkeypatch, capsys, argv):
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused: ") and len(err.strip().splitlines()) == 1
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+
+
+def test_live_propose_and_approve_on_the_command_line(live_project, capsys):
+    root, venue, built, asked = live_project
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    captured = capsys.readouterr()
+    out, number_lines = _ticket_out(captured.out)
+    assert out["status"] == "done" and out["live"] is True and out["mode"] == "propose" and "submit" not in venue.calls
+    assert [(o["fund"], o["side"], o["units"]) for o in out["ticket"]["orders"]] == [("SPY", "buy", 5.0)]
+    (line,) = number_lines
+    number = line.split()[2]
+    assert "order-step --live --approve NUMBER --capital 100000.0" in line and asked == ["SPY"]
+    assert len(built) == 1 and built[0].confirmation == root / "config" / "webull_live.json"
+    assert built[0].checklist == root / "config" / "go_live.json" and built[0].limits == root / "config" / "risk.json"
+    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 0
+    out, number_lines = _ticket_out(capsys.readouterr().out)
+    assert number_lines == [] and out["orders_sent"] == 1 and venue.calls.count("submit") == 1 and asked == ["SPY", "SPY"]
+    text = captured.out + captured.err + "".join(p.read_text() for p in (root / "journal").glob("*.jsonl"))
+    assert LIVE_ACCOUNT[:-4] not in text
+
+
+def test_live_check_prints_each_lock_and_the_account_only_when_locks_one_to_three_are_met(live_project, capsys):
+    root, venue, built, asked = live_project
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert [lock["lock"] for lock in report["locks"]] == [1, 2, 3, 4] and all(lock["met"] for lock in report["locks"])
+    assert report["locks"][1]["figures"]["record"]["paper_broker_days"] == 1
+    assert report["locks"][1]["figures"]["owner"]["min_paper_broker_days"] == 1
+    assert report["locks"][1]["figures"]["owner"]["min_days_since_a_stopped_run"] == 1
+    assert report["account"] == {"account_class": "INDIVIDUAL_CASH", "account_ends": LIVE_ACCOUNT[-4:],
+                                 "matches_the_confirmation": True} and report["all_met"] is True
+    assert "submit" not in venue.calls and asked == [] and _tree(root) == before          # read-only
+    (root / "config" / "go_live.json").unlink()
+    built.clear()
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check", "--capital", "200000"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert [lock["met"] for lock in report["locks"]] == [False, False, True, True]
+    assert "(by 100,000.00)" in report["locks"][0]["reason"] and "is missing" in report["locks"][1]["reason"]
+    assert report["account"] == "not read: locks 1 to 3 are not all met" and built == [] and report["all_met"] is False
+
+
+def test_live_check_says_when_the_account_is_not_the_confirmations(live_project, capsys):
+    root, venue, built, asked = live_project
+    venue.account_id = "ZqLIVEACCOUNT9999"
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["account"]["matches_the_confirmation"] is False and report["account"]["account_ends"] == "9999"
+    assert "ZqLIVEACCOUNT" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("missing", ["webull_live.json", "go_live.json"])
+def test_a_live_propose_with_a_lock_unmet_says_which_builds_nothing_and_creates_nothing(live_project, capsys, missing):
+    root, venue, built, asked = live_project
+    (root / "config" / missing).unlink()
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused: lock ") and "is missing" in err and "nothing was read from the account" in err
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+    assert not (root / "config" / missing).exists()
+
+
+def _verdicts(root):
+    con = sqlite3.connect(root / "memory" / "order_step-webull-production.tickets.sqlite")
+    try:
+        return [r[0] for r in con.execute("SELECT verdict FROM verdicts ORDER BY rowid")]
+    finally:
+        con.close()
+
+
+def test_a_live_approve_after_a_lock_stops_being_met_is_refused_and_marked_without_any_account_read(live_project, capsys):
+    root, venue, built, asked = live_project
+    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    _, (line,) = _ticket_out(capsys.readouterr().out)
+    number = line.split()[2]
+    conf = (root / "config" / "webull_live.json").read_text()
+    (root / "config" / "webull_live.json").unlink()                 # the confirmation removed: lock 1 unmet
+    calls_before = list(venue.calls)
+    built.clear()
+    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("refused: lock 1 (the confirmation)") and venue.calls == calls_before and built == []
+    out = json.loads(captured.out)
+    assert out["stage"] == "lock" and out["live"] is True and _verdicts(root) == ["refused"]
+    (root / "config" / "webull_live.json").write_text(json.dumps({**json.loads(conf), "max_order_value": 2900}))
+    (root / "config" / "webull_live.json").chmod(0o644)             # back, with a smaller cap: every lock met again
+    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["stage"] == "ticket" and "changed since that ticket was made" in out["reason"]
+    assert "submit" not in venue.calls and _verdicts(root) == ["refused", "refused"]
+
+
+def test_the_live_venue_is_built_only_for_production_and_the_cash_account_with_the_owners_file(monkeypatch, tmp_path):
+    from valedia_trader.venues import webull
+    files = cli._live_files(cli.LoopPaths(tmp_path), {})
+    seen = []
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: seen.append(kw) or "v"))
+    for env in ({**LIVE_KEYS, "WEBULL_ENV": "sandbox"}, {**LIVE_KEYS, "WEBULL_ENV": ""},
+                {**LIVE_KEYS, "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_MARGIN"}, {**LIVE_KEYS, "WEBULL_ACCOUNT_CLASS": "EVENTS_CASH"},
+                {k: v for k, v in LIVE_KEYS.items() if k != "WEBULL_ACCOUNT_CLASS"}):
+        with pytest.raises(cli._LiveRefused):
+            cli._order_step_live_venue(files, env)
+    assert seen == []
+    assert cli._order_step_live_venue(files, {**LIVE_KEYS, "WEBULL_ENV": " Production "}) == "v"
+    assert seen == [{"confirmation_file": tmp_path / "config" / "webull_live.json"}]
+
+
+def test_a_paper_order_step_never_enters_live_mode(order_step_project, monkeypatch):
+    root, venue = order_step_project
+    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
+    assert cli.main(["--root", str(root), "order-step"]) == 0

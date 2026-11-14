@@ -150,31 +150,45 @@ def test_the_test_environment_accepts_orders_and_stays_long_only(tmp_path):
     assert v.cancel("tag-1")["status"] == "cancel requested"
 
 
+def _live(**over):
+    """A confirmation in the new form, valid today, for the fake client's account (INDIVIDUAL_CASH, ending 1234)."""
+    today = wb.ny_date()
+    good = {"account_class": "INDIVIDUAL_CASH", "account_ends": "1234", "confirmed_by": "Burton", "max_order_value": 1000,
+            "max_capital": 2000, "valid_until": (today + wb.timedelta(days=10)).isoformat(),
+            "i_understand_this_trades_real_money": True}
+    return json.dumps({k: v for k, v in {**good, **over}.items() if v is not DROP})
+
+
+DROP = object()
+
+
 def test_production_orders_need_the_owners_written_confirmation(tmp_path):
+    # T22b: the new form only (the account by its class and last 4, two caps, a date it lapses); the old form refused
     v, client = venue(tmp_path, env="production")
     assert v.name == "webull-production" and v.host == "api.webull.com"
     assert v.accounts() and v.balance() == {"account_currency_assets": []}   # reading is allowed (only documented fields come back)
+    client.calls.clear()
     with pytest.raises(wb.LiveTradingNotConfirmed, match="has not written"):
         v.submit("SPY", 1.0, "t", price=500.0)
     conf = tmp_path / "webull_live.json"
-    for bad in ("not json", json.dumps({"account_id": "ACC-0001-1234", "max_order_value": 1000}),            # no name, no acknowledgement
-                json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000, "i_understand_this_trades_real_money": "yes"}),
-                json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": -5, "i_understand_this_trades_real_money": True})):
+    for bad in ("not json", json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000,
+                                        "i_understand_this_trades_real_money": True}),                 # the old form
+                _live(i_understand_this_trades_real_money="yes"), _live(max_order_value=-5), _live(confirmed_by=DROP)):
         conf.write_text(bad)
         with pytest.raises(wb.LiveTradingNotConfirmed):
             v.submit("SPY", 1.0, "t", price=500.0)
-    good = {"account_id": "OTHER-ACCOUNT", "confirmed_by": "Burton", "max_order_value": 1000, "i_understand_this_trades_real_money": True}
-    conf.write_text(json.dumps(good))
+    assert client.calls == []                                             # each refused before any call
+    conf.write_text(_live(account_ends="9999"))
     with pytest.raises(wb.LiveTradingNotConfirmed, match="different account"):
         v.submit("SPY", 1.0, "t", price=500.0)
-    conf.write_text(json.dumps({**good, "account_id": "ACC-0001-1234"}))
+    conf.write_text(_live())
     with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
         v.submit("SPY", 3.0, "t", price=500.0)
     with pytest.raises(wb.LiveTradingNotConfirmed, match="known dollar value"):
         v.submit("SPY", 1.0, "t")                                         # the paper mirror passes no price: it can never trade live
     assert client.placed() == []                                          # nothing reached Webull through any refusal
     assert v.submit("SPY", 1.0, "t", price=500.0)["environment"] == "production" and len(client.placed()) == 1
-    assert "on for the account ending 1234" in v.check()["real_money_orders"]
+    assert "on for the INDIVIDUAL_CASH account ending 1234" in v.check()["real_money_orders"]
 
 
 def test_errors_never_carry_the_credentials_and_accounts_must_be_unambiguous(tmp_path):
@@ -705,8 +719,7 @@ def test_the_limit_price_sent_is_exactly_the_price_given(tmp_path, symbol, limit
 
 def test_the_live_cap_still_uses_the_limit_price(tmp_path):
     v, client = venue(tmp_path, env="production")
-    (tmp_path / "webull_live.json").write_text(json.dumps({"account_id": "ACC-0001-1234", "confirmed_by": "Burton", "max_order_value": 1000,
-                                                           "i_understand_this_trades_real_money": True}))
+    (tmp_path / "webull_live.json").write_text(_live())                   # T22b: the new form
     with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
         v.submit("SPY", 2.0, "t", price=100.0, limit_price=600.0)          # valued at the limit: 1,200 > 1,000
     assert client.placed() == []
@@ -2866,3 +2879,88 @@ def test_two_full_bursts_one_window_apart_never_crowd_a_closed_window(tmp_path):
 
 
 TIMINGS: dict = {}
+
+
+# ==== T22b: the adapter keeps its own lock (the new-form confirmation, judged before any network call)
+
+def _conf_file(tmp_path, text, mode=0o644):
+    path = tmp_path / "webull_live.json"
+    path.write_text(text)
+    path.chmod(mode)
+    return path
+
+
+@pytest.mark.parametrize("change, words", [
+    ({"valid_until": "2020-01-01"}, "lapsed"),
+    ({"valid_until": "far"}, "YYYY-MM-DD"),
+    ({"extra": 1}, "not part of a confirmation"),
+    ({"account_class": "INDIVIDUAL_MARGIN"}, "INDIVIDUAL_CASH"),
+    ({"max_order_value": 3000}, "above max_capital"),
+    ({"max_capital": True}, "max_capital"),
+    ({"account_ends": "12345"}, "account_ends")])
+def test_a_production_order_is_refused_before_any_call_for_each_failing_condition(tmp_path, change, words):
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live(**change))
+    with pytest.raises(wb.LiveTradingNotConfirmed, match=words):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.calls == []
+
+
+def test_a_valid_until_more_than_31_days_ahead_is_refused_and_31_is_accepted(tmp_path):
+    today = wb.ny_date()
+    v, client = venue(tmp_path, env="production")
+    _conf_file(tmp_path, _live(valid_until=(today + wb.timedelta(days=32)).isoformat()))
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="31 days"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    _conf_file(tmp_path, _live(valid_until=(today + wb.timedelta(days=31)).isoformat()))
+    v.submit("SPY", 1.0, "t", price=100.0)
+    _conf_file(tmp_path, _live(valid_until=today.isoformat()))            # today is still valid
+    v.submit("SPY", 1.0, "t2", price=100.0)
+    assert len(client.placed()) == 2
+
+
+def test_the_account_class_must_be_the_one_the_confirmation_names(tmp_path):
+    v, client = venue(tmp_path, env="production", account_class="INDIVIDUAL_MARGIN")
+    _conf_file(tmp_path, _live())
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="INDIVIDUAL_CASH"):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.placed() == []
+
+
+@pytest.mark.parametrize("how", ["group-writable", "world-writable", "symlink", "folder symlink", "duplicate key", "nan"])
+def test_an_unsafe_confirmation_file_is_no_confirmation(tmp_path, how):
+    v, client = venue(tmp_path, env="production")
+    real = tmp_path / "real"
+    real.mkdir()
+    if how == "group-writable":
+        path = _conf_file(tmp_path, _live(), 0o664)
+    elif how == "world-writable":
+        path = _conf_file(tmp_path, _live(), 0o646)
+    elif how == "symlink":
+        (real / "c.json").write_text(_live())
+        path = tmp_path / "webull_live.json"
+        path.symlink_to(real / "c.json")
+    elif how == "folder symlink":
+        (real / "webull_live.json").write_text(_live())
+        (tmp_path / "linked").symlink_to(real)
+        path = tmp_path / "linked" / "webull_live.json"
+    elif how == "duplicate key":
+        path = _conf_file(tmp_path, _live()[:-1] + ', "max_order_value": 999999}')
+    else:
+        path = _conf_file(tmp_path, _live().replace('"max_order_value": 1000', '"max_order_value": NaN'))
+    data, why = wb.live_confirmation(path, root=tmp_path)
+    assert data is None and why
+    if how != "folder symlink":                                          # the adapter's own file: no link, no group write
+        v._confirmation_file = path
+        with pytest.raises(wb.LiveTradingNotConfirmed):
+            v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.placed() == []
+
+
+def test_event_contracts_stay_refused_in_production_with_a_valid_new_form_confirmation(tmp_path):
+    v, client = venue(tmp_path, env="production", account_class="EVENTS_CASH")
+    _conf_file(tmp_path, _live())
+    assert wb.load_live_confirmation(tmp_path / "webull_live.json") is not None
+    with pytest.raises(wb.NotTransmitted):
+        v.submit("SPY", 1.0, "t", price=100.0)
+    assert client.placed() == []

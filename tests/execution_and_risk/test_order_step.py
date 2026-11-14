@@ -4682,3 +4682,919 @@ def test_the_ticket_file_refuses_a_late_tag_and_any_second_row_that_is_not_a_cor
                         "('2026-11-13', '515152', 0, 0, 'unknown', 'os-q', 'x', 0, 'x')")
     finally:
         con.close()
+
+
+# ==== T22b: live mode and its four locks (docs/specs/2026-11-13-go-live-gate-design.md, step 2)
+#
+# Every live run here uses a stand-in production venue, owner's files written by the test in its temporary folder
+# (never under the repository's config/), a fake second price source, and the run's fake clock. Nothing is sent
+# anywhere.
+
+import shutil as _shutil
+
+from valedia_trader.execution_and_risk import go_live as gl
+
+LIVE_ENDS = ACCOUNT[-4:]
+LIVE_ENV = {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s", "FINNHUB_API_KEY": "f"}
+LIVE_LIMITS = {**GENEROUS, "max_orders_per_day": 40}
+
+
+class LiveVenue(Booked):
+    """The stand-in in Webull's production environment, at its production host, of the confirmation's class."""
+    environment = "production"
+    host = "api.webull.com"
+    account_class = "INDIVIDUAL_CASH"
+
+    def __init__(self, held=None, cash=1_000_000.0, name="webull-production"):
+        super().__init__(held, cash, name)
+
+
+class Second:
+    """The second price source: a verdict per symbol (an exception is raised), every call kept."""
+
+    def __init__(self):
+        self.verdicts, self.calls = {}, []
+
+    def __call__(self, first_price, symbol, *, now, sources, **kw):
+        v = self.verdicts.get(symbol, "agree")
+        self.calls.append({"symbol": symbol, "price": first_price, "now": now, "sources": sources, "kw": sorted(kw),
+                           "verdict": v if isinstance(v, str) else "raised"})
+        if isinstance(v, BaseException):
+            raise v
+        return {"verdict": v, "symbol": symbol, "sources": []}
+
+
+def live_conf(**over):
+    good = {"account_class": "INDIVIDUAL_CASH", "account_ends": LIVE_ENDS, "confirmed_by": "Burton", "max_order_value": 1000,
+            "max_capital": 5000, "valid_until": "2026-11-20", "i_understand_this_trades_real_money": True}
+    good.update(over)
+    return good
+
+
+LIVE_CHECKLIST = {"min_paper_broker_days": 1, "min_reconciled_fills": 1, "min_days_since_a_stopped_run": 1,
+                  "fills_checked_by_hand": 1, "min_fills_checked_by_hand": 1, "confirmed_by": "Burton"}
+
+
+def _paper_record(journal, day="2026-11-12"):
+    journal.write(day, {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "paper-1", "event": "fill", "fill_id": "pf1"})
+    journal.write(day, {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "paper-1", "event": "summary",
+                        "status": "done", "stage": None})
+
+
+def live_world(tmp, venue=None, conf=None, checklist=None, limits=None, environ=None):
+    w = ticket_world(tmp, venue if venue is not None else LiveVenue())
+    cfg = tmp / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    w.cfg = cfg
+    for name, value in (("webull_live.json", live_conf() if conf is None else conf),
+                        ("go_live.json", LIVE_CHECKLIST if checklist is None else checklist),
+                        ("risk.json", LIVE_LIMITS if limits is None else limits)):
+        if value is not None:
+            (cfg / name).write_text(json.dumps(value))
+            (cfg / name).chmod(0o644)
+    w.limits = cfg / "risk.json"
+    _paper_record(w.journal)
+    w.live = gl.LiveFiles(confirmation=cfg / "webull_live.json", checklist=cfg / "go_live.json", limits=cfg / "risk.json",
+                          journal=tmp / "journal", root=tmp, environ=dict(LIVE_ENV if environ is None else environ),
+                          calendar=CAL)
+    w.second = Second()
+    return w
+
+
+def lrun(w, **kw):
+    kw.setdefault("live", w.live)
+    kw.setdefault("second_opinion", w.second)
+    return w.run(**kw)
+
+
+def lpropose(w, capital=5000.0, **kw):
+    return lrun(w, propose=True, capital=capital, **kw)
+
+
+def lapprove(w, number, capital=5000.0, **kw):
+    return lrun(w, approve=number, capital=capital, **kw)
+
+
+def _live_proposed(w, wanted, capital=5000.0, **kw):
+    w.paper = paper(wanted, equity=capital)
+    out = lpropose(w, capital=capital, **kw)
+    assert out["status"] == "done" and out["ticket"]["orders"], out
+    return out, out["ticket_number"]
+
+
+@pytest.fixture
+def lw(tmp_path):
+    return live_world(tmp_path / "w")
+
+
+def _account_reads(w):
+    return [c for c in w.venue.calls if c[0] in ("account_id", "positions", "cash", "order_status", "submit", "cancel")]
+
+
+# ---- expected outcome: a live propose writes a ticket and sends nothing; a live approve sends it
+
+def test_a_live_propose_writes_a_live_ticket_and_sends_nothing(lw):
+    out, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    assert lw.venue.submits() == [] and lw.orders() == []
+    assert out["live"] is True and [lock["lock"] for lock in out["locks"]] == [1, 2, 3, 4]
+    assert all(lock["met"] for lock in out["locks"])
+    (ticket,) = ticket_rows(lw, "tickets")
+    assert ticket["environment"] == "production" and ticket["venue"] == "webull-production"
+    assert sorted(ln["symbol"] for ln in ticket_rows(lw, "lines")) == ["IWM", "TLT"]
+    assert sorted(c["symbol"] for c in lw.second.calls) == ["IWM", "TLT"]
+    assert all(c["sources"] == ("alpaca", "finnhub") and c["now"].tzinfo is not None and "clock" in c["kw"]
+               for c in lw.second.calls)
+    assert {c["now"].timestamp() for c in lw.second.calls} <= {lw.clock.t}
+    meta = {r["key"]: r["value"] for r in _rows(lw, "SELECT key, value FROM meta")}
+    assert json.loads(meta[f"live:2026-11-13:{number}"]) == {"mode": "live", "files": gl.judge_locks(
+        lw.live, datetime(2026, 11, 13).date(), 5000.0).digest}
+
+
+def test_a_live_approve_sends_the_tickets_orders_and_asks_the_second_source_again(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    lw.second.calls.clear()
+    lw.later(1)
+    out = lapprove(lw, number)
+    assert out["status"] == "done" and out["live"] is True and out["orders_sent"] == 2, out
+    assert sorted(lw.venue.book[t]["symbol"] for t in lw.venue.submits()) == ["IWM", "TLT"]
+    assert sorted(c["symbol"] for c in lw.second.calls) == ["IWM", "TLT"]
+    assert [r["outcome"] for r in ticket_rows(lw, "outcomes")] == ["sent", "sent"]
+
+
+@pytest.mark.parametrize("kw, words", [({}, "only with propose or approve"),
+                                       ({"propose": True}, "needs the capital"),
+                                       ({"approve": "123456"}, "needs the capital"),
+                                       ({"propose": True, "capital": 1000.0, "fractional": True}, "whole shares only"),
+                                       ({"approve": "123456", "capital": 1000.0, "fractional": True}, "whole shares only")])
+def test_live_without_a_ticket_mode_a_capital_or_in_fractions_reads_nothing_and_writes_nothing(tmp_path, kw, words):
+    w = live_world(tmp_path / "w")
+    w.ledger().close()                                             # the ledger file is the harness's, made before
+    before = sorted(str(p) for p in w.tmp.rglob("*"))
+    out = lrun(w, **kw)
+    assert out["status"] == "stopped" and out["stage"] == "live" and words in out["reason"]
+    assert w.venue.calls == [] and w.quote_calls == [] and w.second.calls == []
+    assert sorted(str(p) for p in w.tmp.rglob("*")) == before
+
+
+# ---- invariants 3, 4, 5 at the order step: any lock unmet stops before the account is read or a quote asked
+
+def _unmet(w, how):
+    cfg = w.cfg
+    if how == "no confirmation":
+        (cfg / "webull_live.json").unlink()
+    elif how == "old form":
+        (cfg / "webull_live.json").write_text(json.dumps({"account_id": ACCOUNT, "confirmed_by": "Burton",
+                                                          "max_order_value": 1000, "i_understand_this_trades_real_money": True}))
+    elif how == "lapsed":
+        (cfg / "webull_live.json").write_text(json.dumps(live_conf(valid_until="2026-11-12")))
+    elif how == "too far ahead":
+        (cfg / "webull_live.json").write_text(json.dumps(live_conf(valid_until="2026-12-15")))
+    elif how == "group-writable":
+        (cfg / "webull_live.json").chmod(0o664)
+    elif how == "linked":
+        real = w.tmp / "elsewhere.json"
+        real.write_text((cfg / "webull_live.json").read_text())
+        (cfg / "webull_live.json").unlink()
+        (cfg / "webull_live.json").symlink_to(real)
+    elif how == "no checklist":
+        (cfg / "go_live.json").unlink()
+    elif how == "too few days":
+        (cfg / "go_live.json").write_text(json.dumps({**LIVE_CHECKLIST, "min_paper_broker_days": 5}))
+    elif how == "too few hand checks":
+        (cfg / "go_live.json").write_text(json.dumps({**LIVE_CHECKLIST, "fills_checked_by_hand": 0}))
+    elif how == "a recent stopped run":
+        (cfg / "go_live.json").write_text(json.dumps({**LIVE_CHECKLIST, "min_days_since_a_stopped_run": 3}))
+        w.journal.write("2026-11-12", {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "paper-2", "event": "summary",
+                                       "status": "stopped", "stage": "reconcile"})
+    elif how == "a damaged journal":
+        with (w.tmp / "journal" / "2026-11-12.jsonl").open("ab") as fh:
+            fh.write(b'{"torn": \n')
+    elif how == "no max_orders_per_day":
+        (cfg / "risk.json").write_text(json.dumps(GENEROUS))
+    elif how == "max_orders_per_day 300":
+        (cfg / "risk.json").write_text(json.dumps({**GENEROUS, "max_orders_per_day": 300}))
+    elif how == "no second source key":
+        w.live = dataclasses.replace(w.live, environ={k: v for k, v in LIVE_ENV.items() if k != "FINNHUB_API_KEY"})
+    elif how == "capital above max_capital":
+        w.live_capital = 6000.0
+    else:
+        raise AssertionError(how)
+
+
+UNMET = {"no confirmation": (1, "is missing"), "old form": (1, "old form"), "lapsed": (1, "lapsed"),
+         "too far ahead": (1, "31 days"), "group-writable": (1, "writable by its group"), "linked": (1, "symbolic link"),
+         "capital above max_capital": (1, "(by 1,000.00)"),
+         "no checklist": (2, "is missing"), "too few days": (2, "(4 short)"), "too few hand checks": (2, "(1 short)"),
+         "a recent stopped run": (2, "(2 short)"), "a damaged journal": (2, "damaged"),
+         "no max_orders_per_day": (3, "max_orders_per_day"), "max_orders_per_day 300": (3, "from 1 to 200"),
+         "no second source key": (3, "FINNHUB_API_KEY")}
+
+
+@pytest.mark.parametrize("how", sorted(UNMET))
+@pytest.mark.parametrize("mode", ["propose", "approve", "check"])
+def test_an_unmet_lock_stops_before_any_account_read_or_quote_and_says_which_and_by_how_much(tmp_path, how, mode):
+    w = live_world(tmp_path / "w")
+    number = None
+    if mode == "approve":
+        _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+        w.venue.calls.clear()
+        w.quote_calls.clear()
+        w.second.calls.clear()
+        w.later(1)
+    w.live_capital = 5000.0
+    _unmet(w, how)
+    cfg_before = {p.name: (p.is_symlink(), p.read_bytes() if not p.is_symlink() and p.exists() else None)
+                  for p in w.cfg.iterdir()}
+    n, words = UNMET[how]
+    if mode == "check":
+        state = gl.judge_locks(w.live, datetime(2026, 11, 13).date(), w.live_capital)
+        assert not state.met and f"lock {n} (" in state.unmet() and words in state.unmet()
+        return
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = (lpropose(w, capital=w.live_capital) if mode == "propose" else lapprove(w, number, capital=w.live_capital))
+    assert out["status"] == "stopped" and out["stage"] == "lock", out
+    assert f"lock {n} (" in out["reason"] and words in out["reason"], out["reason"]
+    assert w.venue.calls == [] and w.quote_calls == [] and w.second.calls == []
+    assert w.venue.submits() == [] and out["live"] is True
+    assert {p.name: (p.is_symlink(), p.read_bytes() if not p.is_symlink() and p.exists() else None)
+            for p in w.cfg.iterdir()} == cfg_before                # invariant 2: nothing written, created or repaired
+    if mode == "propose":
+        assert not Path(osx.ticket_path_for(w.state_path)).exists() or ticket_rows(w, "tickets") == []
+    else:                                                          # invariant 11: the approve is marked refused
+        (verdict,) = [v for v in ticket_rows(w, "verdicts") if v["batch"] == out["batch"]]
+        assert verdict["verdict"] == "refused" and f"lock {n}" in verdict["reason"]
+        assert [f["fate"] for f in ticket_rows(w, "fates")] == []  # not used: a later approve may still send it
+    assert ACCOUNT[:-4] not in _all_text(w, [out])
+
+
+def test_no_environment_variable_or_argument_stands_in_for_an_owners_file(lw, monkeypatch):
+    for p in lw.cfg.iterdir():
+        p.unlink()
+    for name in ("WEBULL_LIVE", "VALEDIA_GO_LIVE", "GO_LIVE", "WEBULL_LIVE_CONFIRMATION", "MAX_ORDERS_PER_DAY"):
+        monkeypatch.setenv(name, "1")
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["stage"] == "lock" and all(f"lock {n} (" in out["reason"] for n in (1, 2, 3))
+    assert list(lw.cfg.iterdir()) == []                            # never created, defaulted or repaired
+
+
+# ---- invariant 6: lock 4, the ticket in live mode
+
+def test_a_live_run_never_sends_in_the_run_that_decides(lw, monkeypatch):
+    calls = []
+    monkeypatch.setattr(osx.OrderLedger, "intend", lambda *a, **k: calls.append("intend"))
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["status"] == "done" and calls == [] and lw.venue.submits() == []
+
+
+def _switch(venue, live):
+    venue.environment = "production" if live else "sandbox"
+    venue.host = "api.webull.com" if live else "api.sandbox.webull.com"
+
+
+def test_a_ticket_made_in_the_test_environment_is_never_accepted_in_live_mode(lw):
+    _switch(lw.venue, live=False)
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lw.run(propose=True, capital=5000.0)                     # a paper ticket, the same venue name and state file
+    number = out["ticket_number"]
+    assert ticket_rows(lw, "tickets")[0]["environment"] == "sandbox"
+    _switch(lw.venue, live=True)
+    lw.later(1)
+    out = lapprove(lw, number)
+    assert out["stage"] == "ticket" and "another environment" in out["reason"] and lw.venue.submits() == []
+    assert ticket_rows(lw, "verdicts")[-1]["verdict"] == "refused"
+
+
+def test_a_live_ticket_is_never_accepted_in_the_test_environment(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+    _switch(lw.venue, live=False)
+    lw.later(1)
+    out = lw.run(approve=number, capital=5000.0)
+    assert out["stage"] == "ticket" and "another environment" in out["reason"] and lw.venue.submits() == []
+
+
+def _crafted_live(w, environment, live_mark, number="616161"):
+    book = osx.TicketBook(osx.ticket_path_for(w.state_path))
+    try:
+        now = w.clock.t
+        ticket = {"day": "2026-11-13", "number": number, "created": now, "expires": now + 900, "venue": w.venue.name,
+                  "environment": environment, "account": book.account_hash(ACCOUNT), "capital": 5000.0, "fractional": 0,
+                  "equity": 1e6, "cash": 1e6, "settled_cash": None, "batch": "os-crafted"}
+        book.create(ticket, [{"line": 0, "fund": "IWM", "side": "buy", "units": 3.0, "quote": 200.0, "limit": 202.0,
+                              "value": 600.0}], live=live_mark)
+    finally:
+        book.close()
+    return number
+
+
+def test_the_ticket_records_its_mode_and_each_mode_refuses_the_other(lw):
+    digest = gl.judge_locks(lw.live, datetime(2026, 11, 13).date(), 5000.0).digest
+    lw.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    number = _crafted_live(lw, "production", None)                 # production, but not made in live mode
+    out = lapprove(lw, number)
+    assert out["stage"] == "ticket" and "not made in live mode" in out["reason"] and lw.venue.submits() == []
+    _switch(lw.venue, live=False)
+    number = _crafted_live(lw, "sandbox", {"mode": "live", "files": digest}, number="626262")
+    out = lw.run(approve=number, capital=5000.0)
+    assert out["stage"] == "ticket" and "made in live mode" in out["reason"] and lw.venue.submits() == []
+
+
+def test_every_step_one_rule_holds_in_live_mode(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+    lw.later(1)
+    out = lapprove(lw, wrong_other_number(number))
+    assert out["stage"] == "ticket" and "no ticket has that number" in out["reason"]
+    out = lapprove(lw, number, capital=4000.0)
+    assert out["stage"] == "ticket" and "another capital" in out["reason"]
+    lw.later(20)
+    out = lapprove(lw, number)
+    assert out["stage"] == "ticket" and "expired" in out["reason"] and lw.venue.submits() == []
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+    lw.later(1)
+    assert lapprove(lw, number)["orders_sent"] == 1
+    out = lapprove(lw, number)
+    assert out["stage"] == "ticket" and "has been used" in out["reason"] and len(lw.venue.submits()) == 1
+
+
+# ---- invariant 7: the venue in live mode
+
+class _Env(str):
+    pass
+
+
+class _PropEnv(LiveVenue):
+    @property
+    def environment(self):
+        return "production"
+
+
+class _PropHost(LiveVenue):
+    @property
+    def host(self):
+        return "api.webull.com"
+
+
+class _GetattrHost(LiveVenue):
+    host = None
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        del self.__class__.host
+
+    def __getattr__(self, name):
+        if name == "host":
+            return "api.webull.com"
+        raise AttributeError(name)
+
+
+class _NoHost(Booked):
+    environment = "production"
+    account_class = "INDIVIDUAL_CASH"
+
+    def __init__(self):
+        super().__init__(name="webull-production")
+
+
+def _live_venue(how):
+    v = LiveVenue()
+    if how == "sandbox":
+        v.environment = "sandbox"
+    elif how == "Production":
+        v.environment = "Production"
+    elif how == "str subclass env":
+        v.environment = _Env("production")
+    elif how == "property env":
+        v = _PropEnv()
+    elif how == "property host":
+        v = _PropHost()
+    elif how == "no host":
+        v = _NoHost()
+    elif how in ("api.webull.com.", "API.webull.com", "us-api.webull.com", "api.webull.com.example", "api.sandbox.webull.com",
+                 " api.webull.com"):
+        v.host = how
+    elif how == "str subclass host":
+        v.host = _Env("api.webull.com")
+    elif how == "events class":
+        v.account_class = "EVENTS_CASH"
+    elif how == "events name":
+        v.name = "webull-production-events"
+    else:
+        raise AssertionError(how)
+    return v
+
+
+@pytest.mark.parametrize("how", ["sandbox", "Production", "str subclass env", "property env", "property host", "no host",
+                                 "api.webull.com.", "API.webull.com", "us-api.webull.com", "api.webull.com.example",
+                                 "api.sandbox.webull.com", " api.webull.com", "str subclass host", "events class",
+                                 "events name"])
+@pytest.mark.parametrize("mode", ["propose", "approve"])
+def test_live_mode_needs_exactly_the_production_environment_and_host_by_plain_attributes(tmp_path, how, mode):
+    w = live_world(tmp_path / "w")
+    number = "123456"
+    if mode == "approve":
+        _, number = _live_proposed(w, {"a": {"IWM": 3.0}})
+        w.later(1)
+        w.quote_calls.clear()
+    w.venue = _live_venue(how)
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w) if mode == "propose" else lapprove(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "environment", out
+    assert _account_reads(w) == [] and w.quote_calls == [] and w.venue.submits() == []
+
+
+def test_a_paper_run_still_refuses_the_production_venue(tmp_path):
+    w = live_world(tmp_path / "w")
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = w.run(propose=True, capital=5000.0)
+    assert out["stage"] == "environment" and w.venue.calls == []
+    out = w.run()
+    assert out["stage"] == "environment" and w.venue.calls == []
+
+
+@pytest.mark.parametrize("cls", ["INDIVIDUAL_MARGIN", "IRA", None, 7])
+def test_an_account_of_another_class_than_the_confirmation_names_is_refused_at_the_first_account_read(tmp_path, cls):
+    w = live_world(tmp_path / "w")
+    w.venue.account_class = cls
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["stage"] == "lock" and "another class" in out["reason"]
+    assert [c[0] for c in _account_reads(w)] == ["account_id"] and w.quote_calls == []
+
+
+def test_an_account_whose_last_4_differ_is_refused_and_no_more_than_its_last_4_is_said(tmp_path):
+    w = live_world(tmp_path / "w", conf=live_conf(account_ends="9Z9Z"))
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["stage"] == "lock" and "ending 9Z9Z" in out["reason"] and f"ends {LIVE_ENDS}" in out["reason"]
+    assert [c[0] for c in _account_reads(w)] == ["account_id"] and w.quote_calls == []
+    assert ACCOUNT[:-4] not in _all_text(w, [out]) and ACCOUNT[-5:] not in _all_text(w, [out])
+
+
+def test_an_approve_on_an_account_that_no_longer_matches_is_refused_and_marked(lw):
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+    lw.later(1)
+    lw.venue.account = "Zq9ACCT77310055QQ"
+    out = lapprove(lw, number)
+    assert out["stage"] == "lock" and lw.venue.submits() == []
+    assert ticket_rows(lw, "verdicts")[-1]["verdict"] == "refused"
+
+
+def test_live_mode_trades_whole_shares_only_and_never_crypto(lw):
+    lw.prices["BTC-USD"] = 100.0
+    lw.paper = paper({"a": {"IWM": 3.6, "BTC-USD": 2.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert out["status"] == "done"
+    assert [(ln["symbol"], ln["units"]) for ln in ticket_rows(lw, "lines")] == [("IWM", 3.0)]
+    assert any(s["symbol"] == "BTC-USD" and "crypto" in s["reason"] for s in out["skipped"])
+
+
+# ---- invariants 5 and 8: each order's second price and its caps, at propose and again at approve
+
+def test_an_order_the_second_source_does_not_agree_on_is_dropped_and_the_rest_go_on(lw):
+    lw.second.verdicts = {"IWM": "disagree", "TLT": "no second quote", "GLD": ValueError("boom")}
+    lw.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0, "QQQ": 1.0}}, equity=5000.0)
+    out = lpropose(lw)
+    assert [ln["symbol"] for ln in ticket_rows(lw, "lines")] == ["QQQ"]
+    reasons = {d["symbol"]: d["reason"] for d in out["dropped"]}
+    assert "says disagree" in reasons["IWM"] and "says no second quote" in reasons["TLT"]
+    assert "no second quote (the check failed: ValueError)" in reasons["GLD"]
+    number = out["ticket_number"]
+    lw.second.verdicts = {"QQQ": "disagree"}
+    lw.later(1)
+    out = lapprove(lw, number)
+    assert lw.venue.submits() == [] and "says disagree" in out["dropped"][0]["reason"]
+    assert [r["outcome"] for r in ticket_rows(lw, "outcomes")] == ["not sent"]
+
+
+def test_an_order_above_max_order_value_is_dropped(tmp_path):
+    w = live_world(tmp_path / "w", conf=live_conf(max_order_value=500))
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert [ln["symbol"] for ln in ticket_rows(w, "lines")] == ["TLT"]
+    assert "above max_order_value 500.00" in out["dropped"][0]["reason"] and out["dropped"][0]["symbol"] == "IWM"
+
+
+def test_what_this_ledger_holds_plus_the_tickets_buys_stays_within_max_capital(tmp_path):
+    w = live_world(tmp_path / "w", conf=live_conf(max_capital=1500, max_order_value=1000))
+    w.venue.fill_at_once = 1.0
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0}}, capital=1500.0)       # 606.00 at its limit
+    w.later(1)
+    assert lapprove(w, number, capital=1500.0)["orders_sent"] == 1
+    w.later(20)
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}}, equity=1500.0)
+    out = lpropose(w, capital=1500.0)
+    held = 3 * 200.0                                                         # this ledger's holding at the quote
+    lines = ticket_rows(w, "lines")
+    kept = [ln for ln in lines if ln["number"] == out["ticket_number"]]
+    assert held + sum(ln["units"] * ln["limit_price"] for ln in kept if ln["side"] == "buy") <= 1500.0
+    assert [ln["symbol"] for ln in kept] == ["GLD"]                          # 505.00; TLT's 404.00 then exceeds 1,500
+    assert any(d["symbol"] == "TLT" and "above max_capital 1,500.00" in d["reason"] for d in out["dropped"])
+
+
+def test_an_approve_judges_the_caps_again_on_fresh_quotes(tmp_path):
+    w = live_world(tmp_path / "w", conf=live_conf(max_order_value=607))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0}})                        # 3 x 202.00 = 606.00
+    w.prices["IWM"] = 200.6                                                   # within 0.5%; 3 x 202.60 = 607.80
+    w.later(1)
+    out = lapprove(w, number)
+    assert w.venue.submits() == [] and "above max_order_value" in out["dropped"][0]["reason"]
+
+
+def _held_value(book, prices):
+    return math.fsum(u * prices[s] for s, u in book.items() if u > 1e-9)
+
+
+def _check_live_run(w, out, stage, conf, book_before, prices, number=None):
+    """What may happen in one live run, by the model: every order kept (a ticket line at propose, a send at approve)
+    is at most max_order_value at its limit, had the second source's `agree` in this run, and with what this ledger
+    held keeps the money at work within max_capital; every order dropped for a lock has a true reason."""
+    mov, cap = conf["max_order_value"], conf["max_capital"]
+    answers = {}
+    for c in w.second.calls:
+        answers.setdefault(c["symbol"], []).append(c["verdict"])
+    if stage == "propose":
+        kept = [(ln["symbol"], ln["units"], ln["limit_price"]) for ln in ticket_rows(w, "lines")
+                if out.get("ticket_number") and ln["number"] == out["ticket_number"]]
+    else:
+        kept = [(w.venue.book[t]["symbol"], w.venue.book[t]["units"], w.venue.book[t]["limit"]) for t in w.venue.submits()]
+    held = _held_value(book_before, prices)
+    for sym, units, limit in kept:
+        assert abs(units) * limit <= mov + 1e-9, (stage, sym, units, limit, mov)
+        assert answers.get(sym, [None])[-1] == "agree", (stage, sym, answers)
+        assert float(units).is_integer()
+    kept_buys = math.fsum(u * lp for _, u, lp in kept if u > 0)
+    if kept_buys:                                    # a holding that grew above the cap on prices: sales only
+        assert held + kept_buys <= cap + 1e-6, (stage, held, kept, cap)
+    for d in out.get("dropped", []):
+        sym, units, why = d["symbol"], d["units"], d["reason"]
+        if "max_order_value" in why:
+            assert abs(units) * osx.limit_price(units, prices[sym], units < 0) > mov - 1e-9 or \
+                abs(units) * osx.limit_price(units, prices[sym]) > mov - 1e-9
+        elif "max_capital" in why:
+            assert units > 0 and held + kept_buys + units * osx.limit_price(units, prices[sym]) > cap - 1e-6
+        elif "second price source" in why:
+            assert answers.get(sym, ["agree"])[-1] != "agree"
+    return kept
+
+
+def _live_caps_scenario(tmp, seed):
+    rng = random.Random(seed)
+    cap = rng.choice([800, 2500, 6000])
+    mov = rng.choice([m for m in (150, 400, 900, 2500) if m <= cap])
+    w = live_world(tmp, conf=live_conf(max_order_value=mov, max_capital=cap))
+    capital = float(rng.choice([cap, round(cap * rng.uniform(0.3, 1.0), 2)]))
+    stats = {"kept": 0, "dropped": 0, "sent": 0}
+    verdicts = ["agree", "agree", "agree", "disagree", "no second quote", "raise", "nonsense"]
+    for round_ in range(2):
+        for sym in ("SPY", "QQQ", "IWM", "TLT", "GLD"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 230.0, 480.0])
+        wanted = {s: float(rng.randint(0, 6)) for s in rng.sample(["SPY", "QQQ", "IWM", "TLT", "GLD"], rng.randint(1, 5))}
+        w.paper = paper({"a": wanted}, equity=capital)
+        pick = {s: rng.choice(verdicts) for s in wanted}
+        w.second.verdicts = {s: (RuntimeError("x") if v == "raise" else v) for s, v in pick.items()}
+        w.second.calls.clear()
+        book_before = w.book()
+        out = lpropose(w, capital=capital)
+        assert out["status"] == "done", out
+        kept = _check_live_run(w, out, "propose", live_conf(max_order_value=mov, max_capital=cap), book_before, w.prices)
+        stats["kept"] += len(kept)
+        stats["dropped"] += len(out.get("dropped", []))
+        number = out.get("ticket_number")
+        if number:
+            for sym in w.prices:
+                if rng.random() < 0.6:
+                    w.prices[sym] = round(w.prices[sym] * rng.uniform(0.997, 1.003), 2)
+            w.second.verdicts = {s: (RuntimeError("x") if v == "raise" else v)
+                                 for s, v in ((s, rng.choice(verdicts)) for s in wanted)}
+            w.second.calls.clear()
+            w.venue.fill_at_once = rng.choice([0.0, 1.0])
+            w.later(1)
+            book_before = w.book()
+            out = lapprove(w, number, capital=capital)
+            sent = _check_live_run(w, out, "approve", live_conf(max_order_value=mov, max_capital=cap), book_before, w.prices)
+            stats["sent"] += len(sent)
+            w.venue.calls.clear()
+        w.later(20)
+        w.venue.calls.clear()
+    return stats
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_live_orders_stay_within_the_caps_and_the_second_sources_verdict_over_generated_scenarios(tmp_path, seed_block):
+    """50 scenarios per block, 300 in all, each two rounds of a live propose and approve."""
+    total = {"kept": 0, "dropped": 0, "sent": 0}
+    for k in range(50):
+        stats = _live_caps_scenario(tmp_path / f"s{k}", 220_000 + seed_block * 50 + k)
+        for key in total:
+            total[key] += stats[key]
+        _shutil.rmtree(tmp_path / f"s{k}")
+    assert total["kept"] > 30 and total["dropped"] > 30 and total["sent"] > 10, total
+
+
+# ---- invariant 11: a lock that stops being met between propose and approve stops the approve
+
+CHANGES = ["none", "conf removed", "conf lapsed", "conf smaller cap", "conf renamed", "conf group-writable", "conf linked",
+           "checklist removed", "checklist raised", "checklist edited", "a stopped paper run", "a damaged journal",
+           "limits changed", "limits without the cap", "second key removed", "conf too far ahead"]
+
+
+def _change(w, how, rng):
+    cfg = w.cfg
+    conf = json.loads((cfg / "webull_live.json").read_text())
+    if how == "conf removed":
+        (cfg / "webull_live.json").unlink()
+    elif how == "conf lapsed":
+        (cfg / "webull_live.json").write_text(json.dumps({**conf, "valid_until": "2026-11-12"}))
+    elif how == "conf too far ahead":
+        (cfg / "webull_live.json").write_text(json.dumps({**conf, "valid_until": "2026-12-31"}))
+    elif how == "conf smaller cap":
+        key = rng.choice(["max_capital", "max_order_value"])
+        (cfg / "webull_live.json").write_text(json.dumps({**conf, key: conf[key] - rng.choice([1, 0.01, 100])}))
+    elif how == "conf renamed":
+        (cfg / "webull_live.json").write_text(json.dumps({**conf, "confirmed_by": "Someone else"}))
+    elif how == "conf group-writable":
+        (cfg / "webull_live.json").chmod(rng.choice([0o664, 0o646]))
+    elif how == "conf linked":
+        real = w.tmp / "real.json"
+        real.write_text((cfg / "webull_live.json").read_text())
+        (cfg / "webull_live.json").unlink()
+        (cfg / "webull_live.json").symlink_to(real)
+    elif how == "checklist removed":
+        (cfg / "go_live.json").unlink()
+    elif how == "checklist raised":
+        (cfg / "go_live.json").write_text(json.dumps({**LIVE_CHECKLIST, "min_reconciled_fills": rng.randint(2, 9)}))
+    elif how == "checklist edited":
+        (cfg / "go_live.json").write_text(json.dumps({**LIVE_CHECKLIST, "confirmed_by": "B."}))
+    elif how == "a stopped paper run":                             # the journal only: the files are unchanged
+        w.journal.write("2026-11-13", {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "paper-x", "event": "summary",
+                                       "status": "stopped", "stage": rng.choice(["reconcile", "send", "baseline"])})
+    elif how == "a damaged journal":
+        with (w.tmp / "journal" / "2026-11-12.jsonl").open("ab") as fh:
+            fh.write(b'{"cut": ')
+        w.journal.write("2026-11-13", {"type": "note"})
+    elif how == "limits changed":
+        (cfg / "risk.json").write_text(json.dumps({**LIVE_LIMITS, "max_orders_per_day": rng.choice([1, 39, 41, 200])}))
+    elif how == "limits without the cap":
+        (cfg / "risk.json").write_text(json.dumps(GENEROUS))
+    elif how == "second key removed":
+        gone = rng.choice(gl.SECOND_SOURCE_KEYS)
+        w.live = dataclasses.replace(w.live, environ={k: v for k, v in LIVE_ENV.items() if k != gone})
+    elif how != "none":
+        raise AssertionError(how)
+
+
+def _lock_change_scenario(tmp, seed):
+    rng = random.Random(seed)
+    w = live_world(tmp)
+    how = CHANGES[seed % len(CHANGES)] if rng.random() < 0.5 else rng.choice(CHANGES)
+    wanted = {s: float(rng.randint(1, 2)) for s in rng.sample(["IWM", "TLT", "GLD"], rng.randint(1, 3))}
+    _, number = _live_proposed(w, {"a": wanted})
+    lines = ticket_rows(w, "lines")
+    w.later(rng.choice([0.5, 1, 5]))
+    _change(w, how, rng)
+    w.venue.calls.clear()
+    w.quote_calls.clear()
+    out = lapprove(w, number)
+    if how == "none":                                              # the model: sent only when nothing changed
+        assert out["status"] == "done" and len(w.venue.submits()) == len(lines), (seed, how, out)
+        return how, True
+    assert w.venue.submits() == [] and w.orders() == [], (seed, how, out)
+    assert out["status"] == "stopped" and out["stage"] in ("lock", "ticket") and out["reason"], (seed, how, out)
+    (verdict,) = [v for v in ticket_rows(w, "verdicts") if v["batch"] == out["batch"]]
+    assert verdict["verdict"] == "refused" and verdict["reason"], (seed, how)
+    if out["stage"] == "lock":
+        assert _account_reads(w) == [] and w.quote_calls == [], (seed, how)
+    else:
+        assert "changed since that ticket was made" in out["reason"], (seed, how, out)
+    return how, False
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_a_lock_that_stops_being_met_before_the_approve_stops_it_over_generated_scenarios(tmp_path, seed_block):
+    """50 scenarios per block, 300 in all."""
+    seen = {}
+    for k in range(50):
+        how, sent = _lock_change_scenario(tmp_path / f"s{k}", 330_000 + seed_block * 50 + k)
+        seen[how] = seen.get(how, 0) + 1
+        _shutil.rmtree(tmp_path / f"s{k}")
+    assert len(seen) >= 12 and seen.get("none", 0) >= 1, seen
+
+
+# ---- invariant 10: no account id beyond its last 4 anywhere
+
+def test_no_live_ticket_summary_journal_or_error_holds_more_than_the_accounts_last_4(lw, capsys):
+    outs = []
+    _, number = _live_proposed(lw, {"a": {"IWM": 3.0}})
+    lw.later(1)
+    outs.append(lapprove(lw, number))
+    lw.venue.account = "Zq9ACCT77310055QQ"
+    lw.later(20)
+    lw.paper = paper({"a": {"TLT": 3.0}}, equity=5000.0)
+    outs.append(lpropose(lw))
+    text = _all_text(lw, outs) + capsys.readouterr().out
+    assert ACCOUNT[:-4] not in text and "Zq9ACCT77310055" not in text
+
+
+# ---- closure (a): a correction never turns a sent line into not sent
+
+def test_a_sent_line_the_ledger_no_longer_knows_stays_sent_and_the_summary_says_they_disagree(tw):
+    out, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    older = tw.tmp / "older.sqlite"
+    _shutil.copy(tw.ledger_path, older)                            # the order ledger before the approve
+    tw.later(1)
+    assert approve(tw, number)["orders_sent"] == 1
+    assert [r["outcome"] for r in ticket_rows(tw, "outcomes")] == ["sent"]
+    for suffix in ("-wal", "-shm"):
+        p = Path(str(tw.ledger_path) + suffix)
+        if p.exists():
+            p.unlink()
+    _shutil.copy(older, tw.ledger_path)                            # an older ledger file put back
+    tw.later(20)
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    out = propose(tw)
+    assert [r["outcome"] for r in ticket_rows(tw, "outcomes")] == ["sent"]      # never corrected to not sent
+    (d,) = out["ticket_disagreements"]
+    assert d["record"] == "sent" and d["ledger"] == "nothing" and d["number_ends"] == number[-2:]
+    assert "a person must look" in d["reason"]
+    assert any(e.get("ticket_disagreements") for e in tw.entries("summary"))
+
+
+# ---- closure (b): a ticket's expiry is sticky within a run
+
+class BackClock(Clock):
+    """A clock that, once `past` is set, reads `past` until the order step has judged the ticket on such a reading,
+    then reads `back` (set back before the expiry) for the rest of the run."""
+
+    def __init__(self, t):
+        super().__init__(t)
+        self.past = self.back = None
+        self.judged_past = False
+
+    def __call__(self):
+        if self.past is not None:
+            return self.back if self.judged_past else self.past
+        return self.t
+
+
+@pytest.mark.parametrize("where", ["after the first send", "at the first quote"])
+def test_once_a_reading_is_past_the_expiry_no_later_reading_makes_the_ticket_live_again(tw, monkeypatch, where):
+    tw.clock = BackClock(tw.clock.t)
+    _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 5.0, "IWM": 4.0}})
+    (ticket,) = ticket_rows(tw, "tickets")
+    tw.clock.t = ticket["expires"] - 300
+    log = []
+    real = osx._Run._ticket_expired
+
+    def judged(self, now, t=None):
+        answer = real(self, now, t)
+        log.append((now, answer))
+        if now > ticket["expires"]:
+            tw.clock.judged_past = True
+        return answer
+    monkeypatch.setattr(osx._Run, "_ticket_expired", judged)
+
+    def go_past():
+        tw.clock.past, tw.clock.back = ticket["expires"] + 1, ticket["expires"] - 200
+    if where == "after the first send":
+        real_submit = tw.venue.submit
+
+        def submit(*a, **k):
+            answer = real_submit(*a, **k)
+            go_past()
+            return answer
+        tw.venue.submit = submit
+    else:
+        real_quotes = tw.quotes
+
+        def quotes(symbols):
+            go_past()
+            return real_quotes(symbols)
+        tw.quotes = quotes
+    out = approve(tw, number)
+    first_past = next(i for i, (now, _) in enumerate(log) if now > ticket["expires"])
+    later = log[first_past:]
+    assert any(now < ticket["expires"] for now, _ in later), log           # the clock was set back afterwards ...
+    assert all(answer for _, answer in later), log                          # ... and the ticket stayed expired
+    assert len(tw.venue.submits()) == (1 if where == "after the first send" else 0), out
+
+
+# ---- T22b invariant 1: without --live nothing changes, byte for byte, against T22b's base (T22a rev 3, 495c29f)
+
+T22B_BASE = "495c29ff67ec84a7bb5b4c40c1471d67726f2d22"
+
+
+@pytest.fixture(scope="module")
+def t22b_base(tmp_path_factory):
+    """The order step of T22b's base commit (the accepted ticket flow), from git, loaded under its own name."""
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{T22B_BASE}:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True, check=True).stdout
+    folder = tmp_path_factory.mktemp("t22b_base_order_step")
+    path = folder / "order_step_t22b_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t22b_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t22b_base"] = mod
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "TicketBook") and not hasattr(mod.TicketBook, "live_mark")
+    return mod
+
+
+def _flow_scenario(mod, tmp, seed, monkeypatch):
+    """One generated scenario of the scheduled run and the paper ticket flow driven through `mod`: what the venue, the
+    quote source, the journal, the ledger, the state file and the ticket file saw, run by run."""
+    rng = random.Random(seed)
+    urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
+    monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
+    monkeypatch.setattr("secrets.randbelow", lambda n: numbers.randrange(n))
+    held = {"OWN": float(rng.randint(0, 5)), "SPY": float(rng.choice([0, 0, 3]))}
+    venue = KillVenue(rng, {s: u for s, u in held.items() if u}, cash=rng.choice([5_000.0, 50_000.0, 1e7]))
+    w = ticket_world(tmp, venue)
+    w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": rng.choice([1, 2, 3, 40])}))
+    kw = {}
+    if rng.random() < 0.3:
+        kw["fractional"] = True
+    if rng.random() < 0.4:
+        kw["capital"] = rng.choice([50_000.0, 250_000.0])
+    seen, last_number = [], None
+    for day in range(2):
+        w.venue.nice = day == 1
+        w.paper = _random_paper(rng)
+        for sym in ("SPY", "QQQ", "IWM"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25])
+            w.quote_age[sym] = rng.choice([60.0, 60.0, 1500.0])
+        for run in range(rng.randint(2, 4)):
+            if run:
+                w.later(rng.choice([1, 1, 5, 20]))
+            if rng.random() < 0.3:
+                w.prices["SPY"] = round(w.prices["SPY"] * rng.choice([1.0, 1.003, 1.02]), 2)
+            mode = rng.choice(["scheduled", "propose", "propose", "approve", "approve", "wrong"])
+            if seen and seen[-1]["mode"] == "propose" and last_number and rng.random() < 0.6:
+                mode = "approve"                                    # most tickets are approved in the next run
+            run_kw = dict(kw)
+            if mode == "propose":
+                run_kw["propose"] = True
+            elif mode == "approve":
+                run_kw["approve"] = last_number or "000000"
+            elif mode == "wrong":
+                run_kw["approve"] = f"{numbers.randrange(1_000_000):06d}"
+            w.venue.calls.clear()
+            w.venue.killer = Killer(rng.choice([None, None, None, rng.randint(1, 25)]))
+            try:
+                out = _run_with(mod, w, **run_kw)
+            except Crash as crash:
+                out = {"crashed": str(crash)}
+            w.venue.killer = None
+            if out.get("ticket_number"):
+                last_number = out["ticket_number"]
+            seen.append({"mode": mode, "calls": list(w.venue.calls), "summary": json.dumps(out, sort_keys=True, default=str),
+                         "journal": {f.name: _STAMP.sub(b'"timestamp": "T"', f.read_bytes())
+                                     for f in sorted((w.tmp / "journal").glob("*"))},
+                         "state": _dump(w.state_path), "ledger": _dump(w.ledger_path),
+                         "tickets": _dump(osx.ticket_path_for(w.state_path)),
+                         "files": sorted(str(p.relative_to(w.tmp)) for p in w.tmp.rglob("*") if p.is_file())})
+            w.venue.market()
+        w.next_day()
+    monkeypatch.undo()
+    return seen
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_without_live_the_scheduled_run_and_the_paper_ticket_flow_are_t22bs_base_byte_for_byte(tmp_path, monkeypatch,
+                                                                                               t22b_base, seed_block):
+    """50 scenarios per block, 300 in all, each driven through T22b's base and through this revision."""
+    counts = {"submit": 0, "tickets": 0, "approved": 0, "crashed": 0}
+    for k in range(50):
+        seed = 440_000 + seed_block * 50 + k
+        base = _flow_scenario(t22b_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            for key in b:
+                assert b[key] == m[key], (seed, i, key)
+        counts["submit"] += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        counts["tickets"] += sum(1 for r in mine if '"ticket_number"' in r["summary"])
+        counts["approved"] += sum(1 for r in mine if r["mode"] == "approve" and '"orders_sent": 0' not in r["summary"]
+                                  and '"status": "done"' in r["summary"])
+        counts["crashed"] += sum(1 for r in mine if "crashed" in r["summary"])
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    assert counts["submit"] > 30 and counts["tickets"] > 30 and counts["approved"] > 5 and counts["crashed"] > 5, counts
+
+
+# ---- T22b rulings at the order step: a refused paper approval today is no stopped run; a practice run stopped
+# at another stage is
+
+@pytest.mark.parametrize("stage, met", [("ticket", True), ("session", True), ("send", False), ("reconcile", False)])
+def test_a_paper_stop_today_opens_or_closes_lock_two_by_its_stage(tmp_path, stage, met):
+    w = live_world(tmp_path / "w")
+    w.journal.write("2026-11-13", {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "practice", "event": "summary",
+                                   "status": "stopped", "stage": stage, "mode": "approve"})
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    if met:
+        assert out["status"] == "done" and out["ticket"]["orders"], out
+    else:
+        assert out["stage"] == "lock" and "lock 2 (" in out["reason"] and "min_days_since_a_stopped_run 1" in out["reason"]
+        assert w.venue.calls == []

@@ -11,6 +11,10 @@
                                                                 (once a day, inside the regular session; never production)
     python -m valedia_trader.research_loop order-step --propose the same up to the moment before sending: a ticket, nothing sent
     python -m valedia_trader.research_loop order-step --approve NUMBER   send only that ticket's orders, each checked afresh
+    python -m valedia_trader.research_loop order-step --live --check     the go-live gate's four locks (reads the account
+                                                                only when locks 1 to 3 are met); sends nothing
+    python -m valedia_trader.research_loop order-step --live --propose --capital C   live mode: a ticket, nothing sent
+    python -m valedia_trader.research_loop order-step --live --approve NUMBER --capital C   send that ticket's orders
     python -m valedia_trader.research_loop critic               the weekly post-mortem
     python -m valedia_trader.research_loop reset-kill-switch --who NAME
     python -m valedia_trader.research_loop cycle                the whole loop once: research, test, revise, seal, paper, critic
@@ -336,6 +340,181 @@ def order_step_command(args, paths: LoopPaths, venue=None) -> int:
     return 0 if out["status"] == "done" else 2
 
 
+LIVE_CLASS = "INDIVIDUAL_CASH"                          # live mode's only account class (stocks and funds)
+
+
+class _LiveRefused(Exception):
+    """Live mode cannot go on; the message is the command's own words, nothing from the secrets file."""
+
+
+def _live_args_refusal(args) -> str | None:
+    """Why the flags given cannot run (checked before anything is read), or None."""
+    import math
+    live, check = getattr(args, "live", False), getattr(args, "check", False)
+    if check and not live:
+        return "--check is part of live mode: order-step --live --check"
+    if not live:
+        return None
+    if getattr(args, "fractional", False):
+        return "live mode trades whole shares only (no --fractional)"
+    capital = getattr(args, "capital", None)
+    if check:
+        return None if capital is None or (math.isfinite(capital) and capital > 0) else "--capital must be a number above 0"
+    if not getattr(args, "propose", False) and getattr(args, "approve", None) is None:
+        return ("live mode runs only as a ticket: order-step --live --propose --capital C, then order-step --live --approve "
+                "NUMBER --capital C (or order-step --live --check)")
+    if capital is None:
+        return "live mode needs --capital (at most the confirmation's max_capital)"
+    if not (math.isfinite(capital) and capital > 0):
+        return "--capital must be a number above 0"
+    return None
+
+
+def _live_environ():
+    """The environment the command runs with: the trading secrets file loaded into it."""
+    import os
+    from valedia_trader.core.secrets import load_env
+    load_env()
+    return os.environ
+
+
+def _live_files(paths: LoopPaths, environ):
+    """Where live mode reads its locks: the owner's files in config/, the journal (the paper record), the environment."""
+    from valedia_trader.execution_and_risk import go_live
+    return go_live.LiveFiles(confirmation=paths.config / "webull_live.json", checklist=paths.config / "go_live.json",
+                             limits=paths.risk_limits, journal=paths.journal, root=paths.root, environ=environ)
+
+
+def _order_step_live_venue(files, environ):
+    """Webull's production venue from the secrets: WEBULL_ENV production and WEBULL_ACCOUNT_CLASS the live class, and
+    the confirmation file the locks read. Raises _LiveRefused when the secrets name anything else."""
+    from valedia_trader.execution_and_risk.order_step import LIVE_ENVIRONMENT
+    if (environ.get("WEBULL_ENV") or "sandbox").strip().lower() != LIVE_ENVIRONMENT:
+        raise _LiveRefused(f"live mode needs WEBULL_ENV={LIVE_ENVIRONMENT} in the trading secrets file")
+    if (environ.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() != LIVE_CLASS:
+        raise _LiveRefused(f"live mode needs WEBULL_ACCOUNT_CLASS={LIVE_CLASS} in the trading secrets file")
+    from valedia_trader.venues.webull import WebullVenue
+    return WebullVenue.from_secrets(environ=environ, confirmation_file=files.confirmation)
+
+
+class _LockStub:
+    """What an approve whose locks are unmet is run against, so that the order step marks the refusal on the ticket
+    file: the production venue's name, environment and host as plain attributes and nothing else (any other use
+    raises; nothing is read from any account)."""
+    environment = "production"
+    host = "api.webull.com"
+    account_class = LIVE_CLASS
+
+    def __init__(self) -> None:
+        self.name = "webull-production"
+
+    def __getattr__(self, name):
+        raise AttributeError(f"{name}: nothing is read while a lock is unmet")
+
+
+def _build_live_venue(build_venue, files, environ):
+    """The live venue, or (None, why) in the command's own words."""
+    from valedia_trader.core.secrets import SecretError
+    from valedia_trader.execution_and_risk.order_step import _venue_error
+    from valedia_trader.venues.webull import WebullError
+    try:
+        return (build_venue or _order_step_live_venue)(files, environ), None
+    except _LiveRefused as exc:
+        return None, str(exc)
+    except (WebullError, SecretError, OSError) as exc:
+        return None, (f"the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file and "
+                      "its WEBULL_ settings")
+
+
+def _live_account_report(venue, confirmation) -> tuple[dict | str, bool]:
+    """The account the venue will trade, as `check` prints it: its class and the last 4 characters of its id only."""
+    import re
+    from valedia_trader.execution_and_risk.order_step import _venue_error
+    try:
+        cls = venue.account_class
+        account = venue.account_id
+    except Exception as exc:
+        return f"could not be read: {_venue_error(exc)}", False
+    ends = account[-4:] if type(account) is str and len(account) >= 4 else None
+    shown = cls if type(cls) is str and re.fullmatch(r"[A-Z_]{1,40}", cls) else None
+    matches = shown == confirmation["account_class"] and ends == confirmation["account_ends"]
+    return {"account_class": shown, "account_ends": ends, "matches_the_confirmation": matches}, matches
+
+
+def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
+    from valedia_trader.execution_and_risk import order_step
+    ticket = {"propose": True} if args.propose else {"approve": args.approve}
+    trader = PaperTrader(paths.journal, paths.risk_limits)
+    ledger_path = order_step.ledger_path_for(paths.memory, venue.name)
+    orders = order_step.open_ledger(ledger_path, clock=order_step.wall_clock)
+    try:
+        out = order_step.run_order_step(
+            ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
+            journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
+            clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
+            fractional=False, live=files, second_opinion=second_opinion, **ticket)
+    finally:
+        orders.close()
+    number = out.pop("ticket_number", None)
+    print(json.dumps(out, indent=2, default=str))
+    if number is not None:
+        print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
+              f"order-step --live --approve NUMBER --capital {args.capital!r})")
+    return 0 if out["status"] == "done" else 2
+
+
+def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=None, second_opinion=None, today=None) -> int:
+    """`order-step --live`: the go-live gate (docs/specs/2026-11-13-go-live-gate-design.md). The flags are checked
+    first, before anything is read; then the four locks from the owner's files and the paper record, before any
+    venue is built. --check prints each lock (met or not, the figures and the owner's numbers) and, only when locks 1
+    to 3 are met, the account the venue will trade (its class and last 4); it sends nothing. --propose and --approve
+    run the order step in live mode once every lock is met; with a lock unmet they say which and by how much and
+    exit 2 (an approve is still marked refused on the ticket file, when there is one, without any account read).
+    `environ` (default: the secrets file loaded into the process environment), `build_venue`, `second_opinion` and
+    `today` are for tests. Nothing here writes, creates or repairs an owner's file."""
+    from valedia_trader.execution_and_risk import go_live, order_step
+    from valedia_trader.venues.webull import ny_date
+    why = _live_args_refusal(args)
+    if why is not None:
+        print(f"refused: {why}", file=sys.stderr)
+        return 2
+    if environ is None:
+        try:
+            environ = _live_environ()
+        except Exception as exc:
+            print(f"refused: the trading secrets file could not be loaded ({order_step._venue_error(exc)}); it must be "
+                  "readable by its owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
+            return 2
+    files = _live_files(paths, environ)
+    state = go_live.judge_locks(files, ny_date() if today is None else today, args.capital)
+    first_three = all(lock["met"] for lock in state.locks[:3])
+    if args.check:
+        report: dict = {"locks": state.locks, "account": "not read: locks 1 to 3 are not all met"}
+        ok = first_three
+        if first_three:
+            venue, why = _build_live_venue(build_venue, files, environ)
+            if venue is None:
+                report["account"], ok = f"not read: {why}", False
+            else:
+                report["account"], ok = _live_account_report(venue, state.confirmation)
+        report["all_met"] = bool(ok and state.met)
+        print(json.dumps(report, indent=2, default=str))
+        return 0 if report["all_met"] else 2
+    if not state.met:
+        print(f"refused: {state.unmet()}; nothing was read from the account and no quote was asked", file=sys.stderr)
+        if args.approve is not None:                    # the refused approve is marked, as step 1 marks one
+            ledger_path = order_step.ledger_path_for(paths.memory, go_live.LIVE_VENUE)
+            if Path(order_step.ticket_path_for(order_step.state_path_for(ledger_path, go_live.LIVE_VENUE))).exists():
+                _run_live(args, paths, _LockStub(), files, second_opinion)
+        return 2
+    venue, why = _build_live_venue(build_venue, files, environ)
+    if venue is None:
+        print(f"refused: {why}", file=sys.stderr)
+        return 2
+    paths.ensure()
+    return _run_live(args, paths, venue, files, second_opinion)
+
+
 def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     """One pass of the loop. Each stage is the same code the single commands run, in the order the
     rules require: research sees the development period only; every untested idea gets its
@@ -424,6 +603,10 @@ def main(argv=None) -> int:
                         help="write a ticket of the orders instead of sending them; nothing is sent, the number is printed")
     ticket.add_argument("--approve", metavar="NUMBER", default=None,
                         help="send only the orders of this ticket (six digits, within 15 minutes), each after fresh checks")
+    ticket.add_argument("--check", action="store_true",
+                        help="with --live: print each lock of the go-live gate and, when locks 1 to 3 are met, the account")
+    p.add_argument("--live", action="store_true",
+                   help="real money: only with --propose or --approve and --capital, under the go-live gate's four locks")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -438,6 +621,8 @@ def main(argv=None) -> int:
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
     venue = None
+    if args.cmd == "order-step" and (args.live or args.check):  # live mode: its flags and locks before anything else
+        return live_order_step_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths())
     if args.cmd == "order-step":                                # before any folder or file is made
         venue = _order_step_build()
         if venue is None:

@@ -208,9 +208,11 @@ import math
 import numbers
 import os
 import re
+import stat
 import sys
 import time
 import urllib.parse
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
@@ -220,9 +222,19 @@ PRODUCTION_HOST = "api.webull.com"
 HOSTS = {"sandbox": SANDBOX_HOST, "production": PRODUCTION_HOST}
 REPO = Path(__file__).resolve().parents[2]
 LIVE_CONFIRMATION = REPO / "config" / "webull_live.json"
+# The owner's confirmation, new form only (2026-11-13, the go-live gate): the account named by its class and the last
+# four characters `check` prints for it, a cap per order and a cap on all the money put to work, a date it lapses.
+LIVE_ACCOUNT_CLASS = "INDIVIDUAL_CASH"
+LIVE_KEYS = ("account_class", "account_ends", "confirmed_by", "max_order_value", "max_capital", "valid_until",
+             "i_understand_this_trades_real_money")
+LIVE_DAYS_AHEAD_MAX = 31                          # valid_until at most this many days after today (New York date)
+LIVE_MONEY_MAX = 1e9                              # a cap above this is not a number this trader would ever be given
+OWNER_FILE_MAX_BYTES = 65536
+OWNER_TEXT_MAX = 200
 
 __all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfirmed", "OrderRejected", "RateLimitHit", "order_payload",
-           "client_order_id", "load_live_confirmation", "ORDER_STATES", "EVENTS_CLASS", "parse_event_name", "event_order_payload"]
+           "client_order_id", "load_live_confirmation", "live_confirmation", "judge_live_confirmation", "read_owner_file",
+           "ORDER_STATES", "EVENTS_CLASS", "parse_event_name", "event_order_payload"]
 
 # Webull's order status -> the trader's order state. Source: developer.webull.com/apis/docs/reference/order-detail
 # (read 2026-11-12), field orders[].status; "PARTIAL FILLED" is the SDK's spelling (webull/trade/common/order_status.py:25).
@@ -475,20 +487,164 @@ def _plain_sandbox_host(host: Any) -> bool:
     return type(host) is str and _HOST_TEXT.fullmatch(host) is not None and TEST_ENVIRONMENT in str.split(host, ".")
 
 
-def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION) -> dict | None:
-    """The owner's hand-written permission to trade real money, or None. Malformed means no permission."""
-    p = Path(path)
-    if not p.is_file():
+def ny_date(t: float | None = None) -> date:
+    """The New York date at epoch seconds `t` (now when None)."""
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(time.time() if t is None else float(t), tz=timezone.utc).astimezone(ZoneInfo("America/New_York")).date()
+
+
+def _no_repeated_keys(pairs: list) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("a key appears twice")
+        out[key] = value
+    return out
+
+
+def _no_constant(name: str):
+    raise ValueError("NaN and Infinity are not numbers here")
+
+
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def read_owner_file(path: str | Path, root: str | Path | None = REPO) -> tuple[Any, str | None]:
+    """An owner's hand-written JSON file, read without trusting it: (its value, None), or (None, why) when it is
+    missing, unreadable, a symbolic link (at the file, or at any folder above it inside `root`), not a regular file,
+    writable by its group or by others, larger than OWNER_FILE_MAX_BYTES, not UTF-8, not JSON, or holding a repeated
+    key, NaN or Infinity anywhere. Never raises, never writes, creates or repairs anything."""
+    try:
+        p = Path(os.path.abspath(os.fspath(path)))
+        r = None if root is None else Path(os.path.abspath(os.fspath(root)))
+        for q in [p, *p.parents]:
+            if q != p and (r is None or not _inside(q, r)):
+                break
+            if os.path.islink(q):
+                return None, "is a symbolic link, or a folder above it is" if q == p else "has a symbolic link in a folder above it"
+        try:
+            fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return None, "is missing"
+        except OSError:
+            return None, "cannot be opened"
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None, "is not a regular file"
+            if st.st_mode & 0o022:
+                return None, "is writable by its group or by others (it must be the owner's alone: chmod 600 or 644)"
+            if st.st_size > OWNER_FILE_MAX_BYTES:
+                return None, f"is larger than {OWNER_FILE_MAX_BYTES} bytes"
+            chunks, size = [], 0
+            while True:
+                chunk = os.read(fd, 8192)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > OWNER_FILE_MAX_BYTES:
+                    return None, f"is larger than {OWNER_FILE_MAX_BYTES} bytes"
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        text = b"".join(chunks).decode("utf-8")
+        return json.loads(text, object_pairs_hook=_no_repeated_keys, parse_constant=_no_constant), None
+    except UnicodeDecodeError:
+        return None, "is not UTF-8 text"
+    except (ValueError, RecursionError):
+        return None, "is not plain JSON (or repeats a key, or holds NaN or Infinity)"
+    except OSError:
+        return None, "cannot be read"
+    except Exception:                                     # nothing about an owner's file may raise
+        return None, "cannot be read"
+
+
+def _money(value: Any) -> float | None:
+    """A finite number above 0 and at most LIVE_MONEY_MAX (an int or a float, never a bool), or None."""
+    if type(value) not in (int, float):
         return None
     try:
-        data = json.loads(p.read_text())
-    except ValueError:
+        v = float(value)
+    except (OverflowError, ValueError):
         return None
-    ok = (isinstance(data, dict) and isinstance(data.get("account_id"), str) and data["account_id"]
-          and isinstance(data.get("confirmed_by"), str) and data["confirmed_by"].strip()
-          and isinstance(data.get("max_order_value"), (int, float)) and not isinstance(data.get("max_order_value"), bool)
-          and data["max_order_value"] > 0 and data.get("i_understand_this_trades_real_money") is True)
-    return data if ok else None
+    return v if math.isfinite(v) and 0 < v <= LIVE_MONEY_MAX else None
+
+
+def _owner_text(value: Any) -> bool:
+    return type(value) is str and bool(str.strip(value)) and len(value) <= OWNER_TEXT_MAX and value.isprintable()
+
+
+_ACCOUNT_ENDS = re.compile(r"[A-Za-z0-9]{4}")
+_ISO_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _key_list(keys) -> str:
+    shown = [k if len(k) <= 40 and k.isprintable() else (k[:40].encode("ascii", "replace").decode() + "...") for k in sorted(keys)]
+    return ", ".join(repr(k) for k in shown[:10]) + (" ..." if len(shown) > 10 else "")
+
+
+def judge_live_confirmation(data: Any, today: date) -> tuple[dict | None, str | None]:
+    """The owner's confirmation in its new form, judged on the New York date `today`: (the confirmation with its two
+    caps as floats, None), or (None, why). The old form (a whole account id) and any unknown key are refused."""
+    if not isinstance(data, dict):
+        return None, "is not a JSON object"
+    if "account_id" in data:
+        return None, ("is in the old form (a whole account id), which is no longer accepted: name the account by "
+                      "account_class and account_ends")
+    unknown = [k for k in data if k not in LIVE_KEYS]
+    if unknown:
+        return None, f"has keys that are not part of a confirmation: {_key_list(unknown)}"
+    missing = [k for k in LIVE_KEYS if k not in data]
+    if missing:
+        return None, f"lacks {', '.join(missing)}"
+    if not (type(data["account_class"]) is str and data["account_class"] == LIVE_ACCOUNT_CLASS):
+        return None, f"account_class must be exactly {LIVE_ACCOUNT_CLASS} (stocks and funds; event contracts have no live mode)"
+    if not (type(data["account_ends"]) is str and _ACCOUNT_ENDS.fullmatch(data["account_ends"])):
+        return None, "account_ends must be the last 4 characters (letters or digits) of the account, as `check` prints them"
+    if not _owner_text(data["confirmed_by"]):
+        return None, f"confirmed_by must be a name (plain text, at most {OWNER_TEXT_MAX} characters)"
+    per_order, capital = _money(data["max_order_value"]), _money(data["max_capital"])
+    if per_order is None:
+        return None, f"max_order_value must be a number above 0 and at most {LIVE_MONEY_MAX:,.0f} (not text, not true or false)"
+    if capital is None:
+        return None, f"max_capital must be a number above 0 and at most {LIVE_MONEY_MAX:,.0f} (not text, not true or false)"
+    if per_order > capital:
+        return None, "max_order_value is above max_capital"
+    until = data["valid_until"]
+    day = None
+    if type(until) is str and _ISO_DAY.fullmatch(until):
+        try:
+            day = date.fromisoformat(until)
+        except ValueError:
+            day = None
+    if day is None:
+        return None, "valid_until must be a date written YYYY-MM-DD"
+    if day < today:
+        return None, f"lapsed on {day.isoformat()} (today is {today.isoformat()}, New York date): the owner renews it"
+    if day > today + timedelta(days=LIVE_DAYS_AHEAD_MAX):
+        return None, f"valid_until is more than {LIVE_DAYS_AHEAD_MAX} days ahead of today ({today.isoformat()})"
+    if data["i_understand_this_trades_real_money"] is not True:
+        return None, "i_understand_this_trades_real_money must be true"
+    return {"account_class": LIVE_ACCOUNT_CLASS, "account_ends": data["account_ends"], "confirmed_by": data["confirmed_by"],
+            "max_order_value": per_order, "max_capital": capital, "valid_until": day.isoformat(),
+            "i_understand_this_trades_real_money": True}, None
+
+
+def live_confirmation(path: str | Path = LIVE_CONFIRMATION, today: date | None = None,
+                      root: str | Path | None = REPO) -> tuple[dict | None, str | None]:
+    """The owner's confirmation file read (read_owner_file) and judged (judge_live_confirmation) on `today` (the New
+    York date now when None): (confirmation, None) or (None, why)."""
+    data, why = read_owner_file(path, root)
+    if why is not None:
+        return None, why
+    return judge_live_confirmation(data, ny_date() if today is None else today)
+
+
+def load_live_confirmation(path: str | Path = LIVE_CONFIRMATION, today: date | None = None) -> dict | None:
+    """The owner's hand-written permission to trade real money (new form only), or None. Anything wrong means no
+    permission."""
+    return live_confirmation(path, today)[0]
 
 
 # TradeClient._init_logger (SDK trade/trade_client.py:41-47) points logger "webull.core" at INFO and adds a StreamHandler
@@ -1854,18 +2010,34 @@ class WebullVenue:
             self._named_sides[cid] = side
 
     # ---- orders
-    def _guard_live(self, value: float | None) -> None:
+    def _guard_live(self, value: float | None) -> dict | None:
+        """In production, before any network call: the owner's confirmation valid today (new form, not lapsed), the
+        order's value known and at most its max_order_value. Returns the confirmation (None in the test environment);
+        LiveTradingNotConfirmed otherwise."""
         if self.environment != "production":
-            return
-        confirmation = load_live_confirmation(self._confirmation_file)
+            return None
+        confirmation, why = live_confirmation(self._confirmation_file)
         if confirmation is None:
-            raise LiveTradingNotConfirmed("real-money orders are off: the owner has not written config/webull_live.json")
-        if confirmation["account_id"] != self.account_id:
-            raise LiveTradingNotConfirmed("the written confirmation names a different account")
-        if value is None or not value > 0:
+            if why == "is missing":
+                raise LiveTradingNotConfirmed("real-money orders are off: the owner has not written config/webull_live.json")
+            raise LiveTradingNotConfirmed(f"real-money orders are off: config/webull_live.json {why}")
+        if value is None or not value > 0 or not math.isfinite(value):
             raise LiveTradingNotConfirmed("a real-money order needs a known dollar value to check against the cap")
-        if value > float(confirmation["max_order_value"]):
+        if value > confirmation["max_order_value"]:
             raise LiveTradingNotConfirmed(f"order value {value:,.2f} is above the confirmed cap of {confirmation['max_order_value']:,.2f}")
+        return confirmation
+
+    def _guard_live_account(self, confirmation: dict | None) -> None:
+        """In production: the account about to be used is the one the confirmation names (its class, its last 4)."""
+        if confirmation is None:
+            return
+        cls = self.account_class
+        if not (type(cls) is str and cls == confirmation["account_class"]):
+            raise LiveTradingNotConfirmed(f"the written confirmation names an {confirmation['account_class']} account; this one "
+                                          f"is of class {cls if type(cls) is str and _ACCOUNT_CLASS.fullmatch(cls) else 'unknown'}")
+        account = self.account_id
+        if not (type(account) is str and account[-4:] == confirmation["account_ends"]):
+            raise LiveTradingNotConfirmed("the written confirmation names a different account")
 
     @_public
     def submit(self, symbol: str, units: float, tag: str, price: float | None = None, limit_price: float | None = None,
@@ -1914,12 +2086,13 @@ class WebullVenue:
             crypto = _is_crypto(symbol)
             amount, _ = _quantity(units, crypto)                          # a malformed quantity is refused first
             _session(session, crypto, limit_price)
+            reference = limit_price if limit_price is not None else price
+            confirmation = self._guard_live(abs(amount) * float(reference) if reference else None)   # before any call
             account = self.account_id
             self._fits(crypto)
+            self._guard_live_account(confirmation)
             secrets = self._secrets()
             read_at = self._check_sale(symbol, amount, crypto) if amount < 0 else None    # the holding must be established
-            reference = limit_price if limit_price is not None else price
-            self._guard_live(abs(amount) * float(reference) if reference else None)
             order = order_payload(symbol, units, tag, limit_price, session)
             placed_at = self._pacer.wait("place")                         # the place slot, taken before the call
             if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:
@@ -2409,11 +2582,14 @@ class WebullVenue:
             report["open_orders"] = len(self.open_orders())
         except WebullError as exc:
             report["open_orders_error"] = self._final(_plain(exc, 10 ** 6))
-        confirmation = load_live_confirmation(self._confirmation_file)
+        confirmation, why = live_confirmation(self._confirmation_file)
         report["real_money_orders"] = ("off: event orders are sent in the test environment only" if self._events else
                                        "off: test environment" if self.environment != "production" else
-                                       "off: no written confirmation" if confirmation is None else
-                                       f"on for the account ending {confirmation['account_id'][-4:]}, up to {confirmation['max_order_value']:,.0f} per order")
+                                       "off: no written confirmation" if why == "is missing" else
+                                       f"off: config/webull_live.json {why}" if confirmation is None else
+                                       f"on for the {confirmation['account_class']} account ending {confirmation['account_ends']}, "
+                                       f"up to {confirmation['max_order_value']:,.0f} per order and "
+                                       f"{confirmation['max_capital']:,.0f} in all, until {confirmation['valid_until']}")
         return report
 
 
