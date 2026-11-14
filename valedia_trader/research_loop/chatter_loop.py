@@ -16,12 +16,20 @@ other more than that:
   the environment: the official interface on oauth.reddit.com with an application-only token (a read-only grant
   that needs no login of any person), every 60 seconds, at most 30 requests in any 60, paging back with the
   documented cursor while the newest stored comment is not on the page (at most 5 pages), the rate-limit headers
-  obeyed. A 429 or a 403 is a back-off for the time the answer names (else 5 minutes, at most 10), recorded, never
-  retried inside. No redirect is followed. No cookie is sent or kept; no proxy is used.
-* Prices. Kalshi's public interface through the package's own reader (`kalshi_data.KalshiData`): for each of the
-  five game series once every 60 seconds, the open markets with their best yes bid and ask, last price, volume and
-  open interest (they come on the market objects themselves, so the reader needed no new function). One row per
-  market whenever bid, ask or last changed, one row per fetch.
+  obeyed. A 429 or a 403 is a back-off for the time the answer names (seconds or an HTTP date, honoured up to an
+  hour), else 5 minutes, recorded, never retried inside. No redirect is followed. No cookie is sent or kept; no
+  proxy is used.
+* Prices. Kalshi's public interface, keyless, through this module's own bounded transport (the package reader in
+  `kalshi_data` follows proxies and redirects and reads answers without a limit, so only its constants and its
+  error class are used): for each of the five game series once every 60 seconds, the open markets with their best
+  yes bid and ask, last price, volume and open interest. One row per market whenever bid, ask or last changed, one
+  row per fetch. The same series is never asked twice for the same minute, a restart included.
+
+The limits hold across any kill. Before any request leaves, a row saying it is about to be sent is committed
+(`requests`: service, purpose, slot, time); on start the request history the limits use (the public floor, the
+official burst, page counts, Kalshi's minutes, back-offs) is rebuilt from those rows and from the answers stored,
+and a request whose answer never came gets an outcome row "unknown", appended. Every request has a whole-answer
+deadline (connection, headers and body together) after which its socket is shut: no request thread outlives it.
 
 Text written by Reddit users is untrusted data. It is stored exactly as received (the raw answer by hash, zlib-compressed, the text
 per version) and is never executed, passed to a shell, a template, a format string or a model, and never printed:
@@ -33,20 +41,24 @@ from __future__ import annotations
 
 import argparse
 import base64
+import email.utils
 import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
 import re
 import signal
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -78,12 +90,18 @@ SILENT_FROM_MINUTE = 5            # the hourly pick reader's window: minute 5 ..
 SILENT_TO_MINUTE = 12             # ... to minute 12 inclusive of every hour, no public request
 OAUTH_BURST = 30                  # never more than this many official requests in any 60 seconds
 OAUTH_MAX_PAGES = 5               # paging back, at most this many pages for one slot
-BACKOFF_DEFAULT_S = 300.0         # a 429 or 403 that names no time: five minutes
-BACKOFF_MAX_S = 600.0             # at most ten minutes
+BACKOFF_DEFAULT_S = 300.0         # a 429 or 403 that names no time: five minutes (the module's own choice) ...
+BACKOFF_MAX_S = 600.0             # ... and a wait of the module's own choosing is at most ten minutes
+BACKOFF_NAMED_MAX_S = 3600.0      # a wait the service names (Retry-After, a reset header) is honoured up to an hour
 BACKOFF_MIN_S = 1.0
 STEP_DEADLINE_S = 10.0            # every step (a Reddit slot, a price pass) and every request within it ends by then
 MAX_BODY = 4 * 1024 * 1024        # an answer is read up to this many bytes
-MAX_ABANDONED = 4                 # with this many timed-out requests still running no new one is started
+MAX_STORED_BLOB = MAX_BODY + MAX_BODY // 100 + 4096   # no stored compressed answer can be longer (zlib's worst case)
+MAX_ABANDONED = 4                 # with this many timed-out requests of one service still running, none of it is started
+KALSHI_MAX_PAGES = 10             # cursor pages of one series in one minute, at most
+KALSHI_SPACING_S = 1.0 / 3.0 + 0.01   # never more than three Kalshi requests in a second
+INTENT_MARGIN_S = 1.0             # a request known only by its row is taken as sent this much after the row's time
+CURSOR = re.compile(r"[A-Za-z0-9_]{1,64}")    # the only official-interface cursor accepted
 SKIP_AFTER_FRACTION = 0.5         # a slot more than half over is skipped
 TOKEN_REFRESH_EARLY_S = 300.0
 MAX_SKIP_ROWS = 20                # skipped slots of one stall are recorded as at most this many rows (the rest as a count)
@@ -93,8 +111,8 @@ HEARTBEAT_S = 3600.0              # a line of counts on standard output this oft
 
 # ------------------------------------------------------------------------------------------------ the store
 TABLES = ("runs", "payloads", "comments", "comment_versions", "comment_fetches", "comment_events", "price_fetches",
-          "prices", "price_events")
-LAYOUT = 2                        # PRAGMA user_version (2: raw answers kept zlib-compressed)
+          "prices", "price_events", "requests")
+LAYOUT = 3                        # PRAGMA user_version (2: raw answers kept zlib-compressed; 3: a row before every request)
 APP_ID = 0x43484154               # PRAGMA application_id: "CHAT"
 LOCK_SUFFIX = ".lock"
 
@@ -113,18 +131,24 @@ CREATE TABLE comment_fetches (id INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL, 
     backend TEXT NOT NULL, purpose TEXT NOT NULL CHECK (purpose IN ('feed', 'token')), page INTEGER NOT NULL,
     status INTEGER, ok INTEGER NOT NULL, failure TEXT, payload_id INTEGER, comments_in_feed INTEGER,
     new_comments INTEGER NOT NULL DEFAULT 0, new_versions INTEGER NOT NULL DEFAULT 0, bad_entries INTEGER NOT NULL DEFAULT 0,
-    duplicates INTEGER NOT NULL DEFAULT 0, rate_remaining REAL, rate_reset REAL);
+    duplicates INTEGER NOT NULL DEFAULT 0, rate_remaining REAL, rate_reset REAL, request_id INTEGER);
 CREATE TABLE comment_events (id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, slot_ts INTEGER, until TEXT,
     count INTEGER, detail TEXT);
 CREATE TABLE price_fetches (id INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL, slot_ts INTEGER NOT NULL, series TEXT NOT NULL,
     ok INTEGER NOT NULL, failure TEXT, markets_seen INTEGER NOT NULL DEFAULT 0, rows_stored INTEGER NOT NULL DEFAULT 0,
-    bad_rows INTEGER NOT NULL DEFAULT 0, payload_id INTEGER);
+    bad_rows INTEGER NOT NULL DEFAULT 0, payload_id INTEGER, request_id INTEGER);
 CREATE TABLE prices (id INTEGER PRIMARY KEY, fetch_id INTEGER NOT NULL, seen_at TEXT NOT NULL, series TEXT NOT NULL,
     ticker TEXT NOT NULL, event_ticker TEXT, yes_bid REAL, yes_ask REAL, last_price REAL, volume REAL, open_interest REAL,
     yes_bid_size REAL, yes_ask_size REAL, status TEXT, note TEXT);
 CREATE TABLE price_events (id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, series TEXT, slot_ts INTEGER,
     until TEXT, count INTEGER, detail TEXT);
+CREATE TABLE requests (id INTEGER PRIMARY KEY, at TEXT NOT NULL, service TEXT NOT NULL CHECK (service IN ('reddit', 'kalshi')),
+    backend TEXT NOT NULL, purpose TEXT NOT NULL CHECK (purpose IN ('feed', 'token', 'prices')), slot_ts INTEGER NOT NULL,
+    page INTEGER NOT NULL, series TEXT);   -- committed before the request leaves; its outcome is the fetch row naming it
 CREATE INDEX comments_by_time ON comments (source_time);
+CREATE INDEX requests_by_kind ON requests (service, backend, purpose, at);
+CREATE INDEX requests_by_slot ON requests (service, slot_ts);
+CREATE INDEX comment_fetches_by_request ON comment_fetches (request_id);
 CREATE INDEX versions_by_seen ON comment_versions (seen_at);
 CREATE INDEX comment_fetches_by_slot ON comment_fetches (slot_ts);
 CREATE INDEX price_fetches_by_slot ON price_fetches (series, slot_ts);
@@ -138,12 +162,12 @@ CREATE INDEX prices_by_fetch ON prices (fetch_id);
 _KEYS = {
     "runs": [("id",)], "payloads": [("id",), ("kind", "sha256")], "comments": [("comment_id",)],
     "comment_versions": [("id",), ("comment_id", "version")], "comment_fetches": [("id",)], "comment_events": [("id",)],
-    "price_fetches": [("id",)], "prices": [("id",)], "price_events": [("id",)],
+    "price_fetches": [("id",)], "prices": [("id",)], "price_events": [("id",)], "requests": [("id",)],
 }
 # every time this program writes from its own clock: no row may carry a time earlier than the last row of its table
 _TIMES = (("runs", "started_at"), ("payloads", "first_seen_at"), ("comments", "first_seen"), ("comment_versions", "seen_at"),
           ("comment_fetches", "fetched_at"), ("comment_events", "at"), ("price_fetches", "fetched_at"),
-          ("prices", "seen_at"), ("price_events", "at"))
+          ("prices", "seen_at"), ("price_events", "at"), ("requests", "at"))
 
 
 def _layout_sql() -> str:
@@ -189,6 +213,9 @@ class ClockBehind(ValueError):
     """The clock reads earlier than the latest time the store already holds: nothing is written."""
 
 
+_STORE_ERRORS = (sqlite3.Error, StoreError, ClockBehind)    # errors of the store itself: these still stop the run
+
+
 def iso(ts: float) -> str:
     """A fixed-width UTC time to the nearest millisecond, so that text order is time order."""
     ms = round(ts * 1000)
@@ -229,11 +256,16 @@ def _deflate(data: bytes) -> bytes:
 
 
 def _inflate(blob, size: int) -> bytes:
-    """A stored blob back to the bytes received. It must decompress, to exactly `size` bytes, and end cleanly; a blob
-    that would be bigger is stopped at size + 1 bytes, so a decompression bomb cannot fill memory. Raises StoreError."""
+    """A stored blob back to the bytes received. It must decompress, to exactly `size` bytes, and end cleanly. No
+    answer is ever kept longer than MAX_BODY, so a row that states more is damage, and inflation always stops at
+    MAX_BODY + 1 bytes whatever the row states: a decompression bomb cannot fill memory. Raises StoreError."""
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= MAX_BODY:
+        raise StoreError("a stored raw answer does not decompress to its stated size")
+    if not isinstance(blob, (bytes, bytearray, memoryview)) or len(blob) > MAX_STORED_BLOB:
+        raise StoreError("a stored raw answer does not decompress to its stated size")
     d = zlib.decompressobj()
     try:
-        out = d.decompress(bytes(blob), size + 1)
+        out = d.decompress(bytes(blob), min(size, MAX_BODY) + 1)
     except zlib.error:
         raise StoreError("a stored raw answer does not decompress") from None
     if len(out) != size or not d.eof or d.unused_data or d.unconsumed_tail:
@@ -295,12 +327,19 @@ def _create(path: Path) -> None:
             p.unlink()
 
 
-def _take_lock(path: Path) -> int:
+def _take_lock(path: Path) -> tuple[int, bool]:
     """The exclusive lock of the store at `path`: a file beside it (`<store>.lock`, never a link), held until the
-    program ends (a kill releases it). Another writer holding it raises StoreError."""
+    program ends (a kill releases it). Another writer holding it raises StoreError. Returns the descriptor and
+    whether this call made the file."""
     lp = Path(str(path) + LOCK_SUFFIX)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    made = False
     try:
-        fd = os.open(lp, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fd = os.open(lp, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+            made = True
+        except FileExistsError:
+            fd = os.open(lp, os.O_RDWR | nofollow, 0o600)
     except OSError as e:
         raise StoreError("%s: the lock file cannot be used (%s)" % (lp, type(e).__name__)) from None
     try:
@@ -308,7 +347,7 @@ def _take_lock(path: Path) -> int:
     except OSError:
         os.close(fd)
         raise StoreError("%s: another collector is using the store; nothing was done" % path) from None
-    return fd
+    return fd, made
 
 
 @dataclass
@@ -344,6 +383,7 @@ class Fetch:
     bad_entries: int = 0
     rate_remaining: float | None = None
     rate_reset: float | None = None
+    request_id: int | None = None      # the row committed before the request left (None when nothing was sent)
 
 
 @dataclass
@@ -379,7 +419,48 @@ class Unparseable(Exception):
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _DOCTYPE = re.compile(rb"<!\s*(DOCTYPE|ENTITY)", re.I)
+_DOCTYPE_TEXT = re.compile(r"<!\s*(DOCTYPE|ENTITY)", re.I)       # the same, after the bytes are decoded
+_DECLARED = re.compile(r"\A<\?xml[^>]*?\bencoding\s*=\s*([\"'])(.*?)\1")
 _THREAD_IN_LINK = re.compile(r"/comments/([A-Za-z0-9]+)/")
+
+
+def _refuse(*_a):
+    raise Unparseable("a declaration the feed may not hold")
+
+
+def _xml_tree(data: bytes):
+    """The document as an ElementTree element, parsed by expat with every declaration refused by the parser itself
+    (a DOCTYPE, an entity of any kind, a notation, a reference to an external entity), so nothing can be expanded
+    whatever got past the text checks. Raises Unparseable."""
+    p = xml.parsers.expat.ParserCreate("UTF-8", "}")
+    tb = ET.TreeBuilder()
+
+    def name(n):
+        return "{" + n if "}" in n else n
+
+    def start(tag, attrs):
+        tb.start(name(tag), {name(k): v for k, v in attrs.items()})
+
+    def decl(version, encoding, standalone):
+        if encoding is not None and encoding.lower().replace("_", "-") not in ("utf-8", "utf8"):
+            raise Unparseable("not UTF-8")
+    p.buffer_text = True
+    p.ordered_attributes = False
+    p.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    p.StartElementHandler = start
+    p.EndElementHandler = lambda tag: tb.end(name(tag))
+    p.CharacterDataHandler = tb.data
+    p.XmlDeclHandler = decl
+    for h in ("StartDoctypeDeclHandler", "EntityDeclHandler", "UnparsedEntityDeclHandler", "NotationDeclHandler",
+              "ExternalEntityRefHandler", "ElementDeclHandler", "AttlistDeclHandler", "SkippedEntityHandler"):
+        setattr(p, h, _refuse)
+    try:
+        p.Parse(data, True)
+        return tb.close()
+    except Unparseable:
+        raise
+    except (xml.parsers.expat.ExpatError, ValueError, RecursionError, MemoryError, AssertionError, TypeError):
+        raise Unparseable("not XML") from None
 
 
 def normalize_time(v) -> str | None:
@@ -406,14 +487,23 @@ def normalize_time(v) -> str | None:
 
 def parse_atom(data: bytes) -> tuple[list, int]:
     """The entries of the public feed (Atom, newest first) and the number of entries that had no id or no text.
-    Entities, DOCTYPE declarations and anything else XML can expand are refused before parsing; the text of each
-    comment is kept exactly as the XML gave it. Raises Unparseable."""
+    The feed must be UTF-8 (a strict decode; any other encoding, declared or not, and any byte-order mark is a bad
+    answer). Entities, DOCTYPE declarations and anything else XML can expand are refused before parsing, on the bytes
+    and again on the decoded text, and by the parser itself; the text of each comment is kept exactly as the XML gave
+    it. Raises Unparseable."""
     if not isinstance(data, (bytes, bytearray)) or _DOCTYPE.search(data):
         raise Unparseable("not a plain Atom feed")
+    data = bytes(data)
+    if data.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+        raise Unparseable("a byte-order mark")
     try:
-        root = ET.fromstring(bytes(data))
-    except (ET.ParseError, ValueError, RecursionError, MemoryError):
-        raise Unparseable("not XML") from None
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Unparseable("not UTF-8") from None
+    m = _DECLARED.match(text)
+    if _DOCTYPE_TEXT.search(text) or "\x00" in text or (m and m.group(2).strip().lower() not in ("utf-8", "utf8")):
+        raise Unparseable("not a plain UTF-8 Atom feed")
+    root = _xml_tree(data)
     if root.tag != _ATOM + "feed":
         raise Unparseable("not an Atom feed")
     entries, bad = [], 0
@@ -468,7 +558,11 @@ def parse_listing(data: bytes) -> tuple[list, int, str | None]:
             source_raw=None if created is None else repr(created),
             edited=None if edited is None else ("false" if edited is False else ("true" if edited is True else repr(edited)))))
     after = body.get("after")
-    return entries, bad, after if isinstance(after, str) and after else None
+    if after is None or after == "":
+        return entries, bad, None
+    if not isinstance(after, str) or not CURSOR.fullmatch(after):
+        raise Unparseable("a cursor that is not a plain name")      # ASCII letters, digits, underscore, 1 to 64 of them
+    return entries, bad, after
 
 
 class Store:
@@ -490,10 +584,11 @@ class Store:
             _check_header(self.path)                 # before anything is made beside it: a foreign file gets no lock file
         elif readonly or not create:
             raise StoreError("no store at %s" % path)
+        made_lock = False
         try:
             if lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._lock_fd = _take_lock(self.path)
+                self._lock_fd, made_lock = _take_lock(self.path)
             if not self.path.exists():
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -502,6 +597,14 @@ class Store:
                     raise StoreError("%s: the store could not be created (%s)" % (path, type(e).__name__)) from None
                 _check_header(self.path)
             self._open(readonly, synchronous)
+        except StoreError:
+            if made_lock:                            # a file refused keeps nothing of ours beside it (the lock is still held)
+                try:
+                    os.unlink(str(self.path) + LOCK_SUFFIX)
+                except OSError:
+                    pass
+            self._unlock()
+            raise
         except BaseException:
             self._unlock()
             raise
@@ -571,6 +674,8 @@ class Store:
                               "and the run stops" % (now, latest))
 
     def _payload(self, kind: str, data: bytes, now: str) -> int:
+        if len(data) > MAX_BODY:                          # never read back (inflation stops at MAX_BODY + 1): never stored
+            raise ValueError("an answer longer than %d bytes is not stored" % MAX_BODY)
         digest = sha256_bytes(data)
         r = self.conn.execute("SELECT id FROM payloads WHERE kind = ? AND sha256 = ?", (kind, digest)).fetchone()
         if r:
@@ -597,12 +702,22 @@ class Store:
             self.conn.execute("INSERT INTO price_events (at, kind, series, slot_ts, until, count, detail) VALUES (?,?,?,?,?,?,?)",
                               (iso(e.at), e.kind, series, e.slot, until, e.count, _s(e.detail)))
 
+    def save_request(self, *, at: float, service: str, backend: str, purpose: str, slot: int, page: int,
+                     series: str | None = None) -> int:
+        """The row that says a request is about to be sent, committed (durably, at the store's synchronous level)
+        before it leaves. Returns its id, which the request's outcome row names."""
+        with self.writing(iso(at)):
+            return self.conn.execute("INSERT INTO requests (at, service, backend, purpose, slot_ts, page, series) VALUES (?,?,?,?,?,?,?)",
+                                     (iso(at), service, backend, purpose, int(slot), int(page), series)).lastrowid
+
     def save_run(self, started: float, backend: str, comment_interval: int, price_interval: int) -> None:
-        """A run begins: one row, and a `down` event on each side when the store already holds something older (the
-        time nobody was recording)."""
+        """A run begins: one row, a `down` event on each side when the store already holds something older (the time
+        nobody was recording), and an outcome "unknown" for every request of the runs before whose answer was never
+        stored (a kill while it was out), appended in the same transaction."""
         now = iso(started)
         with self.writing(now):
             before = self.latest_time()
+            last_run = self.conn.execute("SELECT started_at FROM runs ORDER BY id DESC LIMIT 1").fetchone()
             self.conn.execute("INSERT INTO runs (started_at, backend, comment_interval_s, price_interval_s, program) VALUES (?,?,?,?,?)",
                               (now, backend, comment_interval, price_interval, USER_AGENT))
             if before:
@@ -610,6 +725,24 @@ class Store:
                                   (now, "down", now, "from " + before))
                 self.conn.execute("INSERT INTO price_events (at, kind, until, detail) VALUES (?,?,?,?)",
                                   (now, "down", now, "from " + before))
+            self._unknown_outcomes(now, last_run[0] if last_run else "")
+
+    def _unknown_outcomes(self, now: str, since: str) -> None:
+        """Every request sent since the last run began (the starts before it settled the older ones, in their own
+        transaction) that has no outcome row gets one: failed, "unknown", naming it."""
+        for rid, backend, purpose, slot, page in self.conn.execute(
+                "SELECT id, backend, purpose, slot_ts, page FROM requests r WHERE service = 'reddit' AND at >= ? AND NOT EXISTS "
+                "(SELECT 1 FROM comment_fetches f WHERE f.request_id = r.id) ORDER BY id", (since,)).fetchall():
+            fid = self.conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM comment_fetches").fetchone()[0]
+            self.conn.execute("INSERT INTO comment_fetches (id, fetched_at, slot_ts, backend, purpose, page, ok, failure, request_id) "
+                              "VALUES (?,?,?,?,?,?,0,'unknown',?)", (fid, now, slot, backend, purpose, page, rid))
+        for rid, series, slot in self.conn.execute(
+                "SELECT MIN(id), series, slot_ts FROM requests r WHERE service = 'kalshi' AND at >= ? GROUP BY series, slot_ts "
+                "HAVING NOT EXISTS (SELECT 1 FROM price_fetches f WHERE f.series = r.series AND f.slot_ts = r.slot_ts AND "
+                "f.request_id IS NOT NULL) ORDER BY 1", (since,)).fetchall():
+            fid = self.conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM price_fetches").fetchone()[0]
+            self.conn.execute("INSERT INTO price_fetches (id, fetched_at, slot_ts, series, ok, failure, request_id) "
+                              "VALUES (?,?,?,?,0,'unknown',?)", (fid, now, slot, series, rid))
 
     def _newest_stored_time(self) -> str | None:
         r = self.conn.execute("SELECT MAX(source_time) FROM comments").fetchone()
@@ -623,9 +756,11 @@ class Store:
         out = {"new_comments": 0, "new_versions": 0, "miss": False, "fetch_ids": []}
         if not times:
             return out
-        with self.writing(iso(min(times))):
+        # the clock is checked at the slot's latest time: the rows of the requests sent during the slot are already
+        # in, and the tables' own triggers keep each table's times in order
+        with self.writing(iso(max(times))):
             good = [f for f in fetches if f.purpose == "feed" and f.failure is None and f.entries is not None]
-            miss_event = self._possible_miss(good)
+            miss_event = self._possible_miss(good, max(f.at for f in fetches) if fetches else None)
             for f in fetches:
                 fid, nc, nv = self._save_fetch(f)
                 out["fetch_ids"].append(fid)
@@ -639,7 +774,7 @@ class Store:
                 self._event("comment_events", e)
         return out
 
-    def _possible_miss(self, good: list) -> Event | None:
+    def _possible_miss(self, good: list, at: float | None = None) -> Event | None:
         """The oldest comment of the slot's feeds is newer than the newest comment stored before it: comments may
         have been missed. With no time to compare, a feed that shares no comment with the store says the same."""
         entries = [e for f in good for e in f.entries]
@@ -656,7 +791,8 @@ class Store:
             why = "no comment in common with the store"
         if not miss:
             return None
-        return Event(at=max(f.at for f in good), kind="possible_miss", slot=good[0].slot, until=None, count=len(entries),
+        when = max(f.at for f in good) if at is None else max(at, max(f.at for f in good))
+        return Event(at=when, kind="possible_miss", slot=good[0].slot, until=None, count=len(entries),
                      detail=why)
 
     def _save_fetch(self, f: Fetch) -> tuple[int, int, int]:
@@ -678,11 +814,11 @@ class Store:
                 new_versions += nv
         self.conn.execute(
             "INSERT INTO comment_fetches (id, fetched_at, slot_ts, backend, purpose, page, status, ok, failure, payload_id, "
-            "comments_in_feed, new_comments, new_versions, bad_entries, duplicates, rate_remaining, rate_reset) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "comments_in_feed, new_comments, new_versions, bad_entries, duplicates, rate_remaining, rate_reset, request_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (fid, now, f.slot, f.backend, f.purpose, f.page, f.status, 1 if f.failure is None else 0, f.failure, pid,
              len(f.entries) if f.entries is not None else None, new_comments, new_versions, f.bad_entries, dups,
-             f.rate_remaining, f.rate_reset))
+             f.rate_remaining, f.rate_reset, f.request_id))
         return fid, new_comments, new_versions
 
     def _save_entry(self, e: Entry, fetch_id: int, now: str) -> tuple[int, int]:
@@ -718,10 +854,11 @@ class Store:
         return out
 
     def save_price_fetch(self, *, series: str, slot: int, at: float, failure: str | None, markets: list, seen: int,
-                         bad_rows: int, body: bytes | None) -> int:
-        """One Kalshi request for one series: a row for the fetch, and one row per market whose bid, ask or last price
+                         bad_rows: int, body: bytes | None, request_id: int | None = None) -> int:
+        """One Kalshi read of one series: a row for the fetch, and one row per market whose bid, ask or last price
         differs from its latest stored row (or that has none). Returns the number of market rows stored. `body` is
-        the raw answer, kept only when it could not be read."""
+        the raw answer, kept only when it could not be read; `request_id` the row of its first request (None when
+        nothing was sent)."""
         now = iso(at)
         if self._last_quote is None:
             self._last_quote = self._load_last_quotes()
@@ -747,9 +884,10 @@ class Store:
                     fresh[q.ticker] = key
                     stored += 1
             self.conn.execute(
-                "INSERT INTO price_fetches (id, fetched_at, slot_ts, series, ok, failure, markets_seen, rows_stored, bad_rows, payload_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (fid, now, slot, series, 1 if failure is None else 0, failure, seen if failure is None else 0, stored, bad_rows, pid))
+                "INSERT INTO price_fetches (id, fetched_at, slot_ts, series, ok, failure, markets_seen, rows_stored, bad_rows, payload_id, "
+                "request_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (fid, now, slot, series, 1 if failure is None else 0, failure, seen if failure is None else 0, stored, bad_rows, pid,
+                 request_id))
         self._last_quote.update(fresh)                        # only after the commit
         return stored
 
@@ -797,16 +935,26 @@ class Response:
     truncated: bool = False
 
 
-_ABANDONED: list = []
+class TooLarge(Exception):
+    """A Kalshi answer longer than MAX_BODY. `body` is what was read (MAX_BODY bytes), kept as its raw answer."""
+
+    def __init__(self, body: bytes):
+        super().__init__("an answer longer than %d bytes" % MAX_BODY)
+        self.body = body
 
 
-def bounded_call(fn: Callable[[], Any], limit: float) -> Any:
-    """`fn()` with a hard limit: an answer not in after `limit` seconds raises TimeoutError and is abandoned (the
-    request runs in a short-lived daemon thread whose own socket timeout ends it soon after). While MAX_ABANDONED
-    abandoned requests are still running, no new one is started: that too raises TimeoutError."""
-    _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
-    if len(_ABANDONED) >= MAX_ABANDONED:
-        raise TimeoutError("%d abandoned requests still running; none started" % MAX_ABANDONED)
+_ABANDONED: dict[str, list] = {}         # per service: requests given up on whose thread has not ended yet
+
+
+def bounded_call(fn: Callable[[], Any], limit: float, service: str = "reddit", abort: Callable[[], Any] | None = None) -> Any:
+    """`fn()` with a hard limit, in a short-lived daemon thread: an answer not in after `limit` seconds raises
+    TimeoutError, and `abort()` is called first, which shuts the request's socket so that its thread ends at once.
+    While MAX_ABANDONED requests of `service` that were given up on are still running, no new one of that service is
+    started (that too raises TimeoutError); those of the other service are never held back by them."""
+    stuck = _ABANDONED.setdefault(service, [])
+    stuck[:] = [t for t in stuck if t.is_alive()]
+    if len(stuck) >= MAX_ABANDONED:
+        raise TimeoutError("%d abandoned %s requests still running; none started" % (MAX_ABANDONED, service))
     box: dict = {}
 
     def work():
@@ -814,48 +962,140 @@ def bounded_call(fn: Callable[[], Any], limit: float) -> Any:
             box["value"] = fn()
         except BaseException as e:                    # handed to the caller below
             box["exc"] = e
-    th = threading.Thread(target=work, name="chatter-get", daemon=True)
+    th = threading.Thread(target=work, name="chatter-get-" + service, daemon=True)
     th.start()
     th.join(max(0.0, limit))
     if th.is_alive():
-        _ABANDONED.append(th)
+        if abort is not None:
+            abort()
+        stuck.append(th)
         raise TimeoutError("no answer within %g s" % limit)
     if "exc" in box:
         raise box["exc"]
     return box["value"]
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):              # no redirect is followed, to any host
-        return None
+class _Abort:
+    """The socket of one request, shut from the caller's thread when the request's deadline passes: whatever the
+    server does, the request's thread then wakes, fails and ends."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sock = None
+        self.fired = False
+
+    def hold(self, sock) -> None:
+        with self._lock:
+            if self.fired:
+                raise TimeoutError("the deadline passed")
+            self._sock = sock
+
+    def __call__(self) -> None:
+        with self._lock:
+            self.fired, s = True, self._sock
+        if s is not None:
+            try:
+                socket.socket.shutdown(s, socket.SHUT_RDWR)      # the plain socket's own shutdown, TLS or not
+            except OSError:
+                pass
 
 
-# no proxy, no cookie jar (neither is in this list), no redirect: a request is what we build and nothing else
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, urllib.request.HTTPSHandler)
+_SSL_CONTEXT: ssl.SSLContext | None = None     # None: the system's default context, verifying certificate and host
+_SSL_DEFAULT: list = []
+
+
+def _ssl_context() -> ssl.SSLContext:
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    if not _SSL_DEFAULT:
+        _SSL_DEFAULT.append(ssl.create_default_context())
+    return _SSL_DEFAULT[0]
+
+
+def _http(method: str, url: str, headers: dict, data: bytes | None, timeout: float, service: str) -> Response:
+    """One HTTP request by this module's own transport: http.client over a socket of its own. No proxy (nothing here
+    reads the environment), no redirect followed (a 3xx comes back as it is), no cookie, no header but those given,
+    Host, and Content-Length when there is a body. The whole answer, connection, TLS, headers and body together, is
+    bounded by `timeout`: then the socket is shut and TimeoutError raised. At most MAX_BODY bytes of the body are
+    kept; a longer answer comes back `truncated`."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("not an http address")
+    https = u.scheme == "https"
+    host, port = u.hostname, u.port or (443 if https else 80)
+    target = (u.path or "/") + ("?" + u.query if u.query else "")
+    end = time.monotonic() + max(0.0, timeout)
+    abort = _Abort()
+
+    def left() -> float:
+        r = end - time.monotonic()
+        if r <= 0:
+            raise TimeoutError("the deadline passed")
+        return r
+
+    def go() -> Response:
+        sock = socket.create_connection((host, port), timeout=left())
+        try:
+            abort.hold(sock)
+            if https:
+                sock = _ssl_context().wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+                abort.hold(sock)
+                sock.settimeout(left())
+                sock.do_handshake()
+            conn = http.client.HTTPConnection(host, port)
+            conn.sock = sock
+            conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", host if port == (443 if https else 80) else "%s:%d" % (host, port))
+            for k, v in headers.items():
+                conn.putheader(k, v)
+            if data is not None:
+                conn.putheader("Content-Length", str(len(data)))
+            sock.settimeout(left())
+            conn.endheaders(data)
+            r = conn.getresponse()
+            status, hd = r.status, {k.lower(): v for k, v in r.getheaders()}
+            body = bytearray()
+            while len(body) <= MAX_BODY:
+                sock.settimeout(left())
+                chunk = r.read(min(65536, MAX_BODY + 1 - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+            return Response(status, hd, bytes(body[:MAX_BODY]), len(body) > MAX_BODY)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return bounded_call(go, timeout, service, abort)
+
+
 _ALLOWED = {("https", PUBLIC_HOST), ("https", OAUTH_HOST)}
+_KALSHI_ALLOWED = {("https", urllib.parse.urlsplit(kd.BASE_URL).hostname)}
 
 
 def reddit_get(method: str, url: str, headers: dict, data: bytes | None, timeout: float) -> Response:
     """One request to Reddit, nothing followed: the real transport. Only https to the two Reddit hosts; at most
-    MAX_BODY bytes of the answer are read; the whole request is bounded by `timeout`."""
+    MAX_BODY bytes of the answer are read; the whole answer is bounded by `timeout`."""
     u = urllib.parse.urlsplit(url)
     if (u.scheme, u.hostname) not in _ALLOWED or u.username or u.password:
         raise ValueError("not a Reddit address")
-
-    def go() -> Response:
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with _OPENER.open(req, timeout=timeout) as r:
-                status, hd, raw = r.status, r.headers, r.read(MAX_BODY + 1)
-        except urllib.error.HTTPError as e:
-            status, hd, raw = e.code, e.headers, e.read(MAX_BODY + 1)
-        return Response(status, {k.lower(): v for k, v in hd.items()}, raw[:MAX_BODY], len(raw) > MAX_BODY)
-    return bounded_call(go, timeout)
+    return _http(method, url, headers, data, timeout, "reddit")
 
 
-def kalshi_get(url: str, timeout: float):
-    """One keyless GET to Kalshi's public interface through the package's own transport, bounded by `timeout`."""
-    return bounded_call(lambda: kd.urllib_get_dated(url, timeout=timeout), timeout)
+def kalshi_get(url: str, timeout: float) -> bytes:
+    """One keyless GET to Kalshi's public interface by this module's own bounded transport (no proxy, no redirect,
+    at most MAX_BODY bytes, the whole answer within `timeout`). A non-200 answer raises kd.HttpError with its status
+    (a redirect included); a longer one raises TooLarge."""
+    u = urllib.parse.urlsplit(url)
+    if (u.scheme, u.hostname) not in _KALSHI_ALLOWED or u.username or u.password:
+        raise ValueError("not Kalshi's public address")
+    r = _http("GET", url, {"User-Agent": USER_AGENT, "Accept": "application/json"}, None, timeout, "kalshi")
+    if r.truncated:
+        raise TooLarge(r.body)
+    if r.status != 200:
+        raise kd.HttpError(r.status, url)
+    return r.body
 
 
 def _float(v) -> float | None:
@@ -881,14 +1121,46 @@ def first_slot(now: float, interval: int) -> int:
     return g if now - g <= SKIP_AFTER_FRACTION * interval else g + interval
 
 
-def _backoff_seconds(headers: dict) -> tuple[float, str]:
-    """How long the answer names (Retry-After, else the rate-limit reset header), else five minutes; one second to
-    ten minutes."""
-    for name, why in (("retry-after", "retry-after"), ("x-ratelimit-reset", "reset")):
-        v = _float(headers.get(name))
-        if v is not None:
-            return min(max(v, BACKOFF_MIN_S), BACKOFF_MAX_S), why
-    return BACKOFF_DEFAULT_S, "default"
+def _named_wait(v) -> float | None:
+    """A number of seconds a service named, from one second to an hour (BACKOFF_NAMED_MAX_S), or None."""
+    x = _float(v)
+    return None if x is None else min(max(x, BACKOFF_MIN_S), BACKOFF_NAMED_MAX_S)
+
+
+def _http_date_wait(v, now: float) -> float | None:
+    """Retry-After as an HTTP date: the seconds from `now` to it, or None when it cannot be read or is not ahead."""
+    if not isinstance(v, str) or not v.strip() or len(v) > 100:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(v.strip())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    try:
+        secs = dt.timestamp() - now
+    except (OverflowError, OSError, ValueError):
+        return None
+    return secs if math.isfinite(secs) and secs > 0 else None
+
+
+def _backoff_seconds(headers: dict, now: float | None = None) -> tuple[float, str]:
+    """How long a 429 or 403 binds: the time the answer names (Retry-After as seconds or as an HTTP date, else the
+    rate-limit reset header), from one second to an hour; else five minutes, the module's own choice. A date in the
+    past or one that cannot be read gives the five minutes."""
+    v = _named_wait(headers.get("retry-after"))
+    if v is not None:
+        return v, "retry-after"
+    if now is not None:
+        d = _http_date_wait(headers.get("retry-after"), now)
+        if d is not None:
+            return min(max(d, BACKOFF_MIN_S), BACKOFF_NAMED_MAX_S), "retry-after-date"
+    v = _named_wait(headers.get("x-ratelimit-reset"))
+    if v is not None:
+        return v, "reset"
+    return min(BACKOFF_DEFAULT_S, BACKOFF_MAX_S), "default"
 
 
 class Collector:
@@ -921,35 +1193,53 @@ class Collector:
         self._token_until = 0.0
         self._silence_window: int | None = None
         self._price_deadline = 0.0
-        self._k_status: int | None = None
-        self._k_body: bytes | None = None
-        self.kalshi = kd.KalshiData(fetch=self._kalshi_fetch, tries=1, sleep=lambda s: self.sleep(s), clock=lambda: self.clock())
+        self._pages: dict[int, int] = {}                  # official-interface feed requests sent, per slot
+        self._asked: set[tuple[str, int]] = set()         # (series, slot) of every Kalshi minute already asked
+        self._k_last: float | None = None                 # the start of the latest Kalshi request (three a second at most)
+        self._open: tuple | None = None                   # the request out now: (request id, purpose, page), or None
+        self._k_rid: int | None = None                    # the first request row of the series pass under way
         self.counts = {"comment_slots": 0, "comment_failed": 0, "price_slots": 0, "price_failed": 0, "versions": 0,
                        "rows": 0, "misses": 0, "backoffs": 0, "skipped": 0}
         self._beat = 0.0
         self._seen: float | None = None                      # the latest reading of the clock
 
     # ------------------------------------------------------------------------------------------ the loop
-    def _remember(self) -> None:
-        """The limits hold across a restart: what the store knows of the last requests, back-offs and reset times is
-        taken as still in force (a request is taken to have been made at the time its answer was stored, which is
-        never earlier than the request, so this errs on the side of waiting)."""
+    def _remember(self, now: float) -> None:
+        """The limits hold across any kill: the request history they use is rebuilt from the store. Every request row
+        counts as a request sent INTENT_MARGIN_S after its time (whether its answer came or not); an answer stored
+        counts at its own time, which is never earlier than its request; back-offs and the answer's own reset times
+        are taken as still in force; and the pages of the latest official slots and the Kalshi minutes already asked
+        are counted, so that no slot is asked for more than its share whatever was killed when."""
         c = self.store.conn
         r = c.execute("SELECT MAX(until) FROM comment_events WHERE kind IN ('backoff', 'ratelimit')").fetchone()
         if r and r[0]:
             self.backoff_until = max(self.backoff_until, _iso_ts(r[0]))
-        rows = c.execute("SELECT fetched_at, backend, rate_reset FROM comment_fetches ORDER BY id DESC LIMIT %d" % (OAUTH_BURST + 5)).fetchall()
-        for fetched_at, backend, reset in rows:
-            t = _iso_ts(fetched_at)
-            self._burst.append(t)
-            if self._last_req is None or t > self._last_req:
-                self._last_req = t
-        if rows and rows[0][2] is not None and 0 < rows[0][2] <= BACKOFF_MAX_S:
-            self.not_before = max(self.not_before, _iso_ts(rows[0][0]) + rows[0][2])
+        times = []
+        r = c.execute("SELECT MAX(at) FROM requests WHERE service = 'reddit' AND backend = 'public' AND purpose = 'feed'").fetchone()
+        if r and r[0]:
+            times.append(_iso_ts(r[0]) + INTENT_MARGIN_S)
+        rows = c.execute("SELECT fetched_at, rate_reset FROM comment_fetches WHERE request_id IS NOT NULL AND backend = 'public' "
+                         "AND status IS NOT NULL ORDER BY id DESC LIMIT 1").fetchall()
+        if rows:
+            times.append(_iso_ts(rows[0][0]))              # an answer is never earlier than its request
+        # every official request has its row: the burst is counted from those alone (an answer row would count twice)
+        for (at,) in c.execute("SELECT at FROM requests WHERE service = 'reddit' AND backend = 'oauth' AND at > ?",
+                               (iso(now - 60.0 - 2 * INTENT_MARGIN_S),)):
+            self._burst.append(_iso_ts(at) + INTENT_MARGIN_S)
+        if times:
+            self._last_req = max(times + ([self._last_req] if self._last_req is not None else []))
+        if rows and rows[0][1] is not None and 0 < rows[0][1] <= BACKOFF_NAMED_MAX_S:
+            self.not_before = max(self.not_before, _iso_ts(rows[0][0]) + rows[0][1])
+        for slot, n in c.execute("SELECT slot_ts, COUNT(*) FROM requests WHERE service = 'reddit' AND purpose = 'feed' "
+                                 "AND slot_ts >= ? GROUP BY slot_ts", (int(now) - 3 * OAUTH_INTERVAL_S,)):
+            self._pages[slot] = n
+        for series, slot in c.execute("SELECT DISTINCT series, slot_ts FROM requests WHERE service = 'kalshi' AND slot_ts >= ?",
+                                      (int(now) - 3 * PRICE_INTERVAL_S,)):
+            self._asked.add((series, slot))
 
     def start(self) -> None:
         now = self.clock()
-        self._remember()
+        self._remember(now)
         self.store.save_run(now, self.backend, self.c_interval, self.p_interval)
         self.c_next, self.p_next = first_slot(now, self.c_interval), first_slot(now, self.p_interval)
         self._beat = now
@@ -1032,18 +1322,69 @@ class Collector:
         deadline = now + STEP_DEADLINE_S
         fetches: list = []
         events: list = []
-        if self.backend == "oauth":
-            self._oauth_slot(slot, deadline, fetches, events)
-        else:
-            self._public_slot(slot, deadline, fetches, events)
+        self._open = None
+        try:
+            if self.backend == "oauth":
+                self._oauth_slot(slot, deadline, fetches, events)
+            else:
+                self._public_slot(slot, deadline, fetches, events)
+        except _STORE_ERRORS:
+            raise
+        except Exception as e:                             # a slot that broke is a failed slot, never a stopped run
+            self._broken(slot, fetches, "error_" + type(e).__name__)
+        self._open = None
         if not fetches and not events:
             return
-        r = self.store.save_comment_slot(fetches, events)
+        r = self._save_slot(fetches, events)
         self.counts["versions"] += r["new_versions"]
         self.counts["misses"] += 1 if r["miss"] else 0
-        self.counts["backoffs"] += sum(1 for e in events if e.kind in ("backoff", "ratelimit"))
         if not any(f.purpose == "feed" and f.page == 1 and f.failure is None for f in fetches):
             self.counts["comment_failed"] += 1
+
+    def _broken(self, slot: int, fetches: list, failure: str) -> None:
+        """An exception while handling the slot: every request of it is recorded as failed with the exception's class
+        name only (never its text); the raw answers already in hand are kept. The request out when it broke gets its
+        outcome row here, and a slot that sent nothing gets a row of its own, so the failure is counted."""
+        for f in fetches:
+            f.entries, f.bad_entries = None, 0
+            if f.failure is None:
+                f.failure = failure
+        if self._open is not None:
+            rid, purpose, page = self._open
+            fetches.append(Fetch(at=self.clock(), slot=slot, backend=self.backend, purpose=purpose, page=page, status=None,
+                                 failure=failure, body=None, entries=None, request_id=rid))
+        elif not fetches:
+            fetches.append(Fetch(at=self.clock(), slot=slot, backend=self.backend, purpose="feed", page=1, status=None,
+                                 failure=failure, body=None, entries=None))
+        self._open = None
+
+    def _save_slot(self, fetches: list, events: list) -> dict:
+        """The slot's one transaction. Should what it brought fail to be stored for any reason but the store's own, it
+        is stored again as failed fetches (the raw answers kept, then, at the last, without them): never a stopped run."""
+        try:
+            return self.store.save_comment_slot(fetches, events)
+        except _STORE_ERRORS:
+            raise
+        except Exception as e:
+            failure = "error_" + type(e).__name__
+        for f in fetches:
+            f.entries, f.bad_entries = None, 0
+            if f.failure is None:
+                f.failure = failure
+        try:
+            return self.store.save_comment_slot(fetches, events)
+        except _STORE_ERRORS:
+            raise
+        except Exception:
+            for f in fetches:
+                f.body = None
+            return self.store.save_comment_slot(fetches, events)
+
+    def _commit_event(self, e: Event) -> None:
+        """A back-off or a rate limit, committed the moment it is known, before anything else happens: a kill right
+        after it cannot make the next run forget it."""
+        self.store.save_comment_slot([], [e])
+        self.counts["backoffs"] += 1
 
     # ------------------------------------------------------------------------------------------ requests
     def _headers(self, extra: dict | None = None) -> dict:
@@ -1054,28 +1395,42 @@ class Collector:
     def _request(self, slot: int, purpose: str, page: int, method: str, url: str, headers: dict, data, deadline: float,
                  events: list, keep_body: bool = True) -> tuple[Fetch, Response | None]:
         """One request within the step's deadline, turned into a Fetch: failures are constants, never text from the
-        answer. A 429 or 403 adds a back-off event."""
+        answer. Every limit is checked first (nothing is sent when one would break: "held_back"); then the request's
+        row is committed, and only then does the request leave. A 429 or 403 commits its back-off at once."""
         t0 = self.clock()
-        budget = deadline - t0
-        resp, failure = None, None
-        if budget <= 0:
+        resp, failure, rid = None, None, None
+        if deadline - t0 <= 0:
             failure = "deadline"
+        elif t0 < self.backoff_until:
+            failure = "held_back"                          # inside a back-off: nothing is sent
         elif self.backend == "public" and purpose == "feed" and (is_silent(t0) or t0 < self.not_before or
                                                                   (self._last_req is not None and t0 - self._last_req < PUBLIC_MIN_GAP_S)):
             failure = "held_back"                          # a rule would have been broken: nothing is sent
         elif self.backend == "oauth" and sum(1 for t in self._burst if t > t0 - 60.0) >= OAUTH_BURST:
             failure = "held_back"
+        elif self.backend == "oauth" and purpose == "feed" and self._pages.get(slot, 0) >= OAUTH_MAX_PAGES:
+            failure = "held_back"
         if failure is None:
-            self._last_req = t0
-            self._burst = [t for t in self._burst if t > t0 - 60.0] + [t0]
-            try:
-                resp = self.reddit_fetch(method, url, headers, data, min(budget, STEP_DEADLINE_S))
-            except TimeoutError:
-                failure = "timeout"
-            except (OSError, urllib.error.URLError):
-                failure = "network"
-            except Exception:                              # a transport that broke: a failed fetch, not a stopped run
-                failure = "error"
+            rid = self.store.save_request(at=t0, service="reddit", backend=self.backend, purpose=purpose, slot=slot, page=page)
+            self._open = (rid, purpose, page)
+            if purpose == "feed":
+                self._pages[slot] = self._pages.get(slot, 0) + 1
+            sent = self.clock()                            # the request leaves now, its row already in
+            if self.backend == "public" and purpose == "feed":
+                self._last_req = sent
+            self._burst = [t for t in self._burst if t > sent - 60.0] + [sent]
+            budget = deadline - sent
+            if budget <= 0:
+                failure = "deadline"
+            else:
+                try:
+                    resp = self.reddit_fetch(method, url, headers, data, min(budget, STEP_DEADLINE_S))
+                except TimeoutError:
+                    failure = "timeout"
+                except (OSError, urllib.error.URLError):
+                    failure = "network"
+                except Exception:                          # a transport that broke: a failed fetch, not a stopped run
+                    failure = "error"
         at = self.clock()                                  # read once: when the answer (or the failure) came
         status = resp.status if resp is not None else None
         remaining = _float(resp.headers.get("x-ratelimit-remaining")) if resp is not None else None
@@ -1086,10 +1441,10 @@ class Collector:
                 failure = "too_large"
             elif status in (429, 403):
                 failure = "http_%d" % status
-                secs, why = _backoff_seconds(resp.headers)
+                secs, why = _backoff_seconds(resp.headers, at)
                 self.backoff_until = max(self.backoff_until, at + secs)
-                events.append(Event(at=at, kind="backoff", slot=slot, until=at + secs, count=None,
-                                    detail="http_%d %s %g s" % (status, why, secs)))
+                self._commit_event(Event(at=at, kind="backoff", slot=slot, until=at + secs, count=None,
+                                         detail="http_%d %s %g s" % (status, why, secs)))
             elif status in (301, 302, 303, 307, 308):
                 failure = "redirect"
             elif status == 401:
@@ -1098,7 +1453,8 @@ class Collector:
             elif status != 200:
                 failure = "http_%d" % status
         f = Fetch(at=at, slot=slot, backend=self.backend, purpose=purpose, page=page, status=status, failure=failure, body=body,
-                  entries=None, rate_remaining=remaining, rate_reset=reset)
+                  entries=None, rate_remaining=remaining, rate_reset=reset, request_id=rid)
+        self._open = None
         return f, resp
 
     def _parse_into(self, f: Fetch, resp: Response, oauth: bool) -> str | None:
@@ -1120,7 +1476,7 @@ class Collector:
         if resp is not None and f.failure is None:
             self._parse_into(f, resp, False)
             reset = f.rate_reset
-            if reset is not None and 0 < reset <= BACKOFF_MAX_S:
+            if reset is not None and 0 < reset <= BACKOFF_NAMED_MAX_S:
                 self.not_before = max(self.not_before, f.at + reset)   # never ahead of what the answer says
 
     def _token_for(self, slot: int, deadline: float, fetches: list, events: list) -> str | None:
@@ -1139,7 +1495,7 @@ class Collector:
         try:
             doc = json.loads(resp.body.decode("utf-8"))
             tok, ttl = doc["access_token"], float(doc.get("expires_in", 3600))
-            if not isinstance(tok, str) or not tok:
+            if not isinstance(tok, str) or not tok or not math.isfinite(ttl):
                 raise ValueError
         except Exception:
             f.failure = "unparseable"
@@ -1155,7 +1511,9 @@ class Collector:
         newest_id, newest_time = (row[0], row[1]) if row else (None, None)
         after = None
         for page in range(1, OAUTH_MAX_PAGES + 1):
-            url = OAUTH_URL + ("&after=" + urllib.parse.quote(after, safe="") if after else "")
+            if page > 1 and self._pages.get(slot, 0) >= OAUTH_MAX_PAGES:
+                return                                     # the slot's pages are spent (a run before was killed in it)
+            url = OAUTH_URL + ("&after=" + after if after else "")       # `after` matched CURSOR: nothing to quote
             f, resp = self._request(slot, "feed", page, "GET", url, self._headers({"Authorization": "Bearer " + tok}), None,
                                     deadline, events)
             fetches.append(f)
@@ -1163,10 +1521,11 @@ class Collector:
                 return
             after = self._parse_into(f, resp, True)
             if f.rate_remaining is not None and f.rate_remaining < 1:
-                secs = min(max(f.rate_reset if f.rate_reset is not None else BACKOFF_DEFAULT_S, BACKOFF_MIN_S), BACKOFF_MAX_S)
+                named = _named_wait(f.rate_reset)
+                secs = named if named is not None else BACKOFF_DEFAULT_S
                 self.backoff_until = max(self.backoff_until, f.at + secs)
-                events.append(Event(at=f.at, kind="ratelimit", slot=slot, until=f.at + secs, count=None,
-                                    detail="remaining below 1, reset %g s" % secs))
+                self._commit_event(Event(at=f.at, kind="ratelimit", slot=slot, until=f.at + secs, count=None,
+                                         detail="remaining below 1, reset %g s" % secs))
                 return
             if f.entries is None or not f.entries or after is None or newest_id is None:
                 return
@@ -1177,18 +1536,6 @@ class Collector:
                 return
 
     # ------------------------------------------------------------------------------------------ prices
-    def _kalshi_fetch(self, url: str):
-        remaining = self._price_deadline - self.clock()
-        if remaining <= 0:
-            raise TimeoutError("the pass is out of time")
-        try:
-            out = self.kalshi_get(url, min(remaining, STEP_DEADLINE_S))
-        except kd.HttpError as e:
-            self._k_status = e.status
-            raise
-        self._k_body = out[0] if isinstance(out, tuple) else out
-        return out
-
     def _quote(self, m) -> Quote | None:
         if not isinstance(m, dict) or not isinstance(m.get("ticker"), str) or not m["ticker"]:
             return None
@@ -1221,41 +1568,95 @@ class Collector:
             return
         self._price_deadline = now + STEP_DEADLINE_S
         for series in self.series:
+            if (series, top) in self._asked:
+                continue                                   # asked already in this minute (by a run since killed): never twice
             self._price_series(series, top)
+
+    def _kalshi_request(self, series: str, slot: int, page: int, url: str) -> bytes:
+        """One Kalshi request within the pass's deadline and at most three a second: its row is committed first."""
+        if self._price_deadline - self.clock() <= 0:
+            raise TimeoutError("the pass is out of time")
+        if self._k_last is not None:
+            wait = KALSHI_SPACING_S - (self.clock() - self._k_last)
+            if wait > 0:
+                self.sleep(wait)
+        t0 = self.clock()
+        if self._price_deadline - t0 <= 0:
+            raise TimeoutError("the pass is out of time")
+        rid = self.store.save_request(at=t0, service="kalshi", backend="kalshi", purpose="prices", slot=slot, page=page,
+                                      series=series)
+        self._asked.add((series, slot))
+        if self._k_rid is None:
+            self._k_rid = rid
+        self._k_last = self.clock()
+        remaining = self._price_deadline - self._k_last
+        if remaining <= 0:
+            raise TimeoutError("the pass is out of time")
+        out = self.kalshi_get(url, min(remaining, STEP_DEADLINE_S))
+        return out[0] if isinstance(out, tuple) else out
+
+    def _read_series(self, series: str, slot: int) -> tuple:
+        """The open markets of one series, following Kalshi's cursor (at most KALSHI_MAX_PAGES pages, all within the
+        pass's deadline). Returns (failure, quotes, markets seen, bad rows, raw answer kept)."""
+        rows, cursor, cursors = [], None, set()
+        for page in range(1, KALSHI_MAX_PAGES + 1):
+            params = {"series_ticker": series, "status": "open", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            raw = self._kalshi_request(series, slot, page, kd.BASE_URL + "/markets?" + urllib.parse.urlencode(params))
+            keep = bytes(raw) if isinstance(raw, (bytes, bytearray)) else None
+            try:
+                doc = json.loads(raw)
+            except (ValueError, TypeError, RecursionError):
+                return "not_json", [], 0, 0, keep
+            if not isinstance(doc, dict) or "markets" not in doc or not isinstance(doc["markets"] or [], list):
+                return "bad_shape", [], 0, 0, keep
+            got = doc["markets"] or []
+            rows += got
+            cursor = doc.get("cursor")
+            if not cursor or not got or cursor in cursors:
+                break
+            cursors.add(cursor)
+        markets, bad = [], 0
+        for m in rows:
+            q = self._quote(m)
+            if q is None:
+                bad += 1
+            else:
+                markets.append(q)
+        return None, markets, len(markets), bad, None
 
     def _price_series(self, series: str, slot: int) -> None:
         failure, markets, seen, bad, body = None, [], 0, 0, None
-        self._k_status, self._k_body = None, None
+        self._k_rid = None
         try:
             if self._price_deadline - self.clock() <= 0:
                 raise TimeoutError("the pass is out of time")
-            rows = self.kalshi.pages("/markets", {"series_ticker": series, "status": "open", "limit": 1000}, "markets")
-            for m in rows:
-                q = self._quote(m)
-                if q is None:
-                    bad += 1
-                else:
-                    markets.append(q)
-            seen = len(markets)
+            failure, markets, seen, bad, body = self._read_series(series, slot)
+        except _STORE_ERRORS:
+            raise
         except TimeoutError:
             failure = "timeout"
-        except kd.KalshiDataError as e:
-            msg = str(e)
-            if msg.startswith("not JSON") or msg.startswith("no "):
-                failure, body = ("not_json" if msg.startswith("not JSON") else "bad_shape"), self._k_body
-            elif self._k_status is not None:
-                failure = "http_%d" % self._k_status
-            else:
-                failure = "gave_up"
+        except TooLarge as e:
+            failure, body = "too_large", e.body
         except kd.HttpError as e:
-            failure = "http_%d" % e.status
+            failure = "redirect" if 300 <= e.status < 400 else "http_%d" % e.status
         except (OSError, urllib.error.URLError):
             failure = "network"
-        except Exception:
-            failure = "error"
+        except Exception as e:                             # whatever broke: this series' minute failed, the run goes on
+            failure = "error_" + type(e).__name__
+        if failure is not None:
+            markets, seen, bad = [], 0, 0
         at = self.clock()
-        stored = self.store.save_price_fetch(series=series, slot=slot, at=at, failure=failure, markets=markets, seen=seen,
-                                             bad_rows=bad, body=body)
+        try:
+            stored = self.store.save_price_fetch(series=series, slot=slot, at=at, failure=failure, markets=markets, seen=seen,
+                                                 bad_rows=bad, body=body, request_id=self._k_rid)
+        except _STORE_ERRORS:
+            raise
+        except Exception as e:
+            failure = "error_" + type(e).__name__
+            stored = self.store.save_price_fetch(series=series, slot=slot, at=at, failure=failure, markets=[], seen=0,
+                                                 bad_rows=0, body=None, request_id=self._k_rid)
         self.counts["price_slots"] += 1
         self.counts["rows"] += stored
         if failure:
@@ -1336,12 +1737,19 @@ def verify(store: Store) -> list[str]:
     if k:
         bad.append("payload: %d price fetches point at no raw answer" % k)
     broken = wrong = 0
-    for pid, digest, size, body in c.execute("SELECT id, sha256, size, body FROM payloads"):
+    # one raw answer at a time, its stored length read before the blob itself: a row that states a size beyond
+    # MAX_BODY, or holds more than a MAX_BODY answer can compress to, is damage and is never read in
+    for pid, digest, size, length in q("SELECT id, sha256, size, length(body) FROM payloads"):
+        if not isinstance(size, int) or not 0 <= size <= MAX_BODY or not isinstance(length, int) or length > MAX_STORED_BLOB:
+            broken += 1
+            continue
         try:
+            body = c.execute("SELECT body FROM payloads WHERE id = ?", (pid,)).fetchone()[0]
             if sha256_bytes(_inflate(body, size)) != digest:
                 wrong += 1
         except StoreError:
             broken += 1
+        body = None
     if broken:
         bad.append("payload: %d raw answers do not decompress to their stated size" % broken)
     if wrong:
@@ -1357,6 +1765,25 @@ def verify(store: Store) -> list[str]:
           "WHERE pid IS NOT NULL AND b IS pb AND a IS pa AND l IS pl")
     if k:
         bad.append("price: %d price rows repeat the row before them" % k)
+    # each request row and its outcome belong together: an outcome names a request that exists and is the same
+    # request (service, slot, purpose, page or series, never later than its outcome); a request has at most one
+    # outcome, and a Kalshi minute one
+    k = n("SELECT COUNT(*) FROM comment_fetches f LEFT JOIN requests r ON r.id = f.request_id WHERE f.request_id IS NOT NULL AND "
+          "(r.id IS NULL OR r.service != 'reddit' OR r.slot_ts != f.slot_ts OR r.purpose != f.purpose OR r.page != f.page "
+          "OR r.backend != f.backend OR r.at > f.fetched_at)")
+    if k:
+        bad.append("request: %d comment fetch rows name no request, or one that is not theirs" % k)
+    k = n("SELECT COUNT(*) FROM price_fetches f LEFT JOIN requests r ON r.id = f.request_id WHERE f.request_id IS NOT NULL AND "
+          "(r.id IS NULL OR r.service != 'kalshi' OR r.slot_ts != f.slot_ts OR r.series IS NOT f.series OR r.at > f.fetched_at)")
+    if k:
+        bad.append("request: %d price fetch rows name no request, or one that is not theirs" % k)
+    k = n("SELECT COUNT(*) FROM (SELECT request_id FROM comment_fetches WHERE request_id IS NOT NULL GROUP BY request_id HAVING COUNT(*) > 1)")
+    if k:
+        bad.append("request: %d requests have more than one outcome" % k)
+    k = n("SELECT COUNT(*) FROM (SELECT series, slot_ts FROM price_fetches WHERE request_id IS NOT NULL GROUP BY series, slot_ts "
+          "HAVING COUNT(*) > 1)")
+    if k:
+        bad.append("request: %d Kalshi minutes have more than one outcome" % k)
     return bad
 
 
@@ -1389,48 +1816,77 @@ def _expected_slots(runs: list, now: float, which: str) -> list[int]:
 
 
 def status(store: Store, now: float) -> dict:
-    """What the prediction needs counted, per UTC day: comment slots expected (the hourly silence of the public feed
-    excluded, and shown), made, failed, back-off minutes, possible misses, comments and versions stored; per series,
-    price slots expected, made, failed, markets seen and rows stored; and whether each recorder covered at least
-    80% of the day (`covered`), and so whether the day counts (`counts`)."""
+    """What the prediction needs counted, per UTC day, as Clarification 3 counts it. Comments: slots expected (the
+    hourly silence of the public feed excluded, and shown), made (a successful first-page read is stored), covered
+    (made, and that read carries no possible-miss mark), failed (asked, never read), how many a possible-miss mark
+    uncovered, back-off minutes, possible misses, comments and versions stored. Prices, in all and per series: slots
+    expected (the five series, one a minute), covered (distinct series and minute with at least one successful read),
+    failed, markets seen and rows stored. Only slots of the plan count, each once, so covered never exceeds expected.
+    `share` is covered over expected, and `covered` whether it is at least 80% (`counts`: both recorders were)."""
     runs = [(_utc_ts(r["started_at"]), r["backend"], r["comment_interval_s"], r["price_interval_s"])
             for r in store.rows("SELECT started_at, backend, comment_interval_s, price_interval_s FROM runs ORDER BY id")]
     days: dict[str, dict] = {}
 
+    def blank():
+        return {"expected": 0, "made": 0, "covered_slots": 0, "failed": 0, "markets_seen": 0, "rows": 0, "share": None}
+
     def day(d):
         if d not in days:
             days[d] = {"day": d,
-                       "comments": {"expected": 0, "silent": 0, "made": 0, "failed": 0, "backoff_minutes": 0.0, "misses": 0,
-                                    "comments": 0, "versions": 0, "share": None, "covered": False},
-                       "prices": {"expected": 0, "made": 0, "failed": 0, "markets_seen": 0, "rows": 0, "share": None,
-                                  "covered": False, "series": {s: {"expected": 0, "made": 0, "failed": 0, "markets_seen": 0,
-                                                                   "rows": 0, "share": None} for s in SERIES}},
+                       "comments": {"expected": 0, "silent": 0, "made": 0, "covered_slots": 0, "failed": 0, "miss_uncovered": 0,
+                                    "backoff_minutes": 0.0, "misses": 0, "comments": 0, "versions": 0, "share": None,
+                                    "covered": False},
+                       "prices": dict(blank(), covered=False, series={s: blank() for s in SERIES}),
                        "counts": False}
         return days[d]
+    c_expected: set[int] = set()
     for g, backend in _expected_slots(runs, now, "comments"):
         c = day(_day(g))["comments"]
         if backend == "public" and is_silent(g):
             c["silent"] += 1
-        else:
+        elif g not in c_expected:
+            c_expected.add(g)
             c["expected"] += 1
+    p_expected: set[int] = set()
     for g, _ in _expected_slots(runs, now, "prices"):
+        if g in p_expected:
+            continue
+        p_expected.add(g)
         p = day(_day(g))["prices"]
         for s in SERIES:
             p["series"][s]["expected"] += 1
         p["expected"] += len(SERIES)
+    marked = {r["s"] for r in store.rows("SELECT DISTINCT slot_ts AS s FROM comment_events WHERE kind = 'possible_miss'")}
     for r in store.rows("SELECT slot_ts AS s, MAX(CASE WHEN purpose = 'feed' AND page = 1 AND ok = 1 THEN 1 ELSE 0 END) AS o "
                         "FROM comment_fetches GROUP BY slot_ts"):
-        day(_day(r["s"]))["comments"]["made" if r["o"] else "failed"] += 1
-    for r in store.rows("SELECT slot_ts, series, ok, markets_seen, rows_stored FROM price_fetches"):
+        c = day(_day(r["s"]))["comments"]
+        if not r["o"]:
+            c["failed"] += 1
+            continue
+        c["made"] += 1
+        if r["s"] not in c_expected:
+            continue                                        # not a slot of the plan: shown as made, never as covered
+        if r["s"] in marked:
+            c["miss_uncovered"] += 1
+        else:
+            c["covered_slots"] += 1
+    for r in store.rows("SELECT slot_ts, series, MAX(ok) AS ok, MAX(markets_seen) AS seen, SUM(rows_stored) AS rows "
+                        "FROM price_fetches WHERE series IS NOT NULL GROUP BY slot_ts, series"):
         d = day(_day(r["slot_ts"]))["prices"]
-        ps = d["series"].setdefault(r["series"], {"expected": 0, "made": 0, "failed": 0, "markets_seen": 0, "rows": 0, "share": None})
+        mine = r["series"] in SERIES
+        ps = d["series"].setdefault(r["series"], blank())
         key = "made" if r["ok"] else "failed"
         ps[key] += 1
+        ps["rows"] += r["rows"] or 0
+        ps["markets_seen"] = max(ps["markets_seen"], r["seen"] or 0)
+        if not mine:
+            continue                                        # not one of the five: shown, never counted
         d[key] += 1
-        ps["rows"] += r["rows_stored"]
-        d["rows"] += r["rows_stored"]
-        ps["markets_seen"] = max(ps["markets_seen"], r["markets_seen"])
-        d["markets_seen"] = max(d["markets_seen"], r["markets_seen"])
+        d["rows"] += r["rows"] or 0
+        d["markets_seen"] = max(d["markets_seen"], r["seen"] or 0)
+        if r["ok"] and r["slot_ts"] in p_expected:
+            ps["covered_slots"] += 1
+            d["covered_slots"] += 1
     for r in store.rows("SELECT at, until FROM comment_events WHERE kind IN ('backoff', 'ratelimit') AND until IS NOT NULL"):
         t, end = _iso_ts(r["at"]), _iso_ts(r["until"])
         while t < end:                                      # a back-off across midnight counts on both days
@@ -1446,12 +1902,12 @@ def status(store: Store, now: float) -> dict:
     for d in days.values():
         c, p = d["comments"], d["prices"]
         c["backoff_minutes"] = round(c["backoff_minutes"], 3)
-        c["share"] = min(1.0, c["made"] / c["expected"]) if c["expected"] else None
+        c["share"] = c["covered_slots"] / c["expected"] if c["expected"] else None
         c["covered"] = c["share"] is not None and c["share"] >= COVERAGE_MIN
-        p["share"] = min(1.0, p["made"] / p["expected"]) if p["expected"] else None
+        p["share"] = p["covered_slots"] / p["expected"] if p["expected"] else None
         p["covered"] = p["share"] is not None and p["share"] >= COVERAGE_MIN
         for ps in p["series"].values():
-            ps["share"] = min(1.0, ps["made"] / ps["expected"]) if ps["expected"] else None
+            ps["share"] = ps["covered_slots"] / ps["expected"] if ps["expected"] else None
         d["counts"] = c["covered"] and p["covered"]
     return {"days": [days[k] for k in sorted(days)]}
 
@@ -1466,16 +1922,16 @@ def format_status(st: dict) -> str:
     for d in st["days"]:
         c, p = d["comments"], d["prices"]
         lines.append("%s  counts toward the test: %s" % (d["day"], "yes" if d["counts"] else "no"))
-        lines.append("  comments  expected %4d  (silent %3d, not counted)  made %4d  failed %4d  coverage %6s %s  back-off %.1f min  "
-                     "possible misses %d  comments %d  versions %d"
-                     % (c["expected"], c["silent"], c["made"], c["failed"], _pct(c["share"]), "ok" if c["covered"] else "UNDER 80%",
-                        c["backoff_minutes"], c["misses"], c["comments"], c["versions"]))
-        lines.append("  prices    expected %4d  made %4d  failed %4d  coverage %6s %s  markets seen %d  rows %d"
-                     % (p["expected"], p["made"], p["failed"], _pct(p["share"]), "ok" if p["covered"] else "UNDER 80%",
+        lines.append("  comments  expected %4d  (silent %3d, not counted)  covered %4d  made %4d  failed %4d  "
+                     "uncovered by a possible miss %d  coverage %6s %s  back-off %.1f min  possible misses %d  comments %d  versions %d"
+                     % (c["expected"], c["silent"], c["covered_slots"], c["made"], c["failed"], c["miss_uncovered"], _pct(c["share"]),
+                        "ok" if c["covered"] else "UNDER 80%", c["backoff_minutes"], c["misses"], c["comments"], c["versions"]))
+        lines.append("  prices    expected %4d  covered %4d  failed %4d  coverage %6s %s  markets seen %d  rows %d"
+                     % (p["expected"], p["covered_slots"], p["failed"], _pct(p["share"]), "ok" if p["covered"] else "UNDER 80%",
                         p["markets_seen"], p["rows"]))
         for s, v in p["series"].items():
-            lines.append("    %-13s expected %4d  made %4d  failed %4d  coverage %6s  markets seen %3d  rows %d"
-                         % (s, v["expected"], v["made"], v["failed"], _pct(v["share"]), v["markets_seen"], v["rows"]))
+            lines.append("    %-13s expected %4d  covered %4d  failed %4d  coverage %6s  markets seen %3d  rows %d"
+                         % (s, v["expected"], v["covered_slots"], v["failed"], _pct(v["share"]), v["markets_seen"], v["rows"]))
     return "\n".join(lines) if lines else "nothing recorded yet"
 
 
@@ -1543,6 +1999,9 @@ def main(argv=None, *, clock=None, sleep=None, reddit_fetch=None, kalshi_get=Non
         return 1
     except sqlite3.Error as e:
         out("chatter_loop: stopped: the store could not be written (%s)" % type(e).__name__)
+        return 1
+    except StoreError as e:
+        out("chatter_loop: stopped: " + str(e))
         return 1
     finally:
         for sig, h in old.items():

@@ -4,20 +4,25 @@ its own. Everything runs on stand-in answers and a clock that moves only when to
 Comment text in these tests is made up and is never printed by the program: the tests also check that.
 """
 import base64
+import email.utils
 import hashlib
 import json
+import math
 import os
 import random
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 import urllib.parse
 import zlib
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,6 +155,7 @@ def test_every_table_refuses_update_delete_and_replace(tmp_path, table):
         cl.Quote(ticker="A-1", event_ticker="A", bid=0.4, ask=0.5, last=0.45, volume=1.0, open_interest=2.0, bid_size=1.0,
                  ask_size=1.0, status="active", note=None)], seen=1, bad_rows=0, body=None)
     s.save_price_event(cl.Event(at=T0, kind="skipped", slot=T0, until=None, count=1, detail="x"), series="KXNBAGAME")
+    s.save_request(at=T0, service="reddit", backend="public", purpose="feed", slot=T0, page=1)     # (rev 2: the new table)
     s.save_run(started=T0, backend="public", comment_interval=120, price_interval=60)
     c = s.conn
     n = c.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
@@ -627,7 +633,7 @@ def test_the_answers_own_reset_time_holds_the_next_request_back(tmp_path):
 
 
 @pytest.mark.parametrize("status", [429, 403])
-@pytest.mark.parametrize("headers,expected", [({"Retry-After": "90"}, 90), ({}, 300), ({"Retry-After": "99999"}, 600),
+@pytest.mark.parametrize("headers,expected", [({"Retry-After": "90"}, 90), ({}, 300), ({"Retry-After": "99999"}, 3600),
                                               ({"Retry-After": "soon"}, 300), ({"x-ratelimit-reset": "150"}, 150),
                                               ({"Retry-After": "0"}, 1), ({"Retry-After": "-5"}, 1),
                                               ({"Retry-After": "nan"}, 300)])
@@ -638,9 +644,10 @@ def test_a_429_or_403_is_a_back_off_for_the_time_named_else_5_minutes_at_most_10
         count["n"] += 1
         return resp(status, b"slow down", headers) if count["n"] == 1 else resp(200, atom_with(atom_entry("t1_ok%d" % n)))
     col, store, reddit, _, clock, _ = make(tmp_path, answer=answer)
-    run_for(col, clock, 1500)
+    run_for(col, clock, 4000)                                           # rev 2: long enough for a named hour
     first, second = reddit.log[0]["t"], reddit.log[1]["t"]
-    g = -(-(first + expected) // 120) * 120                             # the first slot at or after the back-off's end ...
+    g = -(-(first + 0.2 + expected) // 120) * 120                       # the first slot at or after the back-off's end
+    #                                                                     (rev 2: it starts when the answer came, 0.2 s in) ...
     while 5 <= minute_of_hour(g) <= 12:                                  # ... that is not in the hourly silence
         g += 120
     assert second == g
@@ -686,13 +693,11 @@ def test_the_real_transport_never_follows_a_redirect_and_refuses_other_hosts():
             cl.reddit_get("GET", "https://www.reddit.com.evil.example/x", {}, None, 2)
         with pytest.raises(ValueError):
             cl.reddit_get("GET", "https://user:pw@www.reddit.com/x", {}, None, 2)
-        import urllib.error
-        import urllib.request
-        with pytest.raises(urllib.error.HTTPError) as e:
-            cl._OPENER.open(urllib.request.Request("http://127.0.0.1:%d/x" % srv.server_port), timeout=2)
-        assert e.value.code == 302 and hits == ["/x"]
-        assert not any(isinstance(h, urllib.request.HTTPCookieProcessor) for h in cl._OPENER.handlers)
-        assert not any(isinstance(h, urllib.request.ProxyHandler) and h.proxies for h in cl._OPENER.handlers)
+        # the module's own transport (the one reddit_get and kalshi_get use) hands the 302 back and never follows it;
+        # it has no cookie jar and no proxy at all (outcome 3 replaced the urllib opener this test used to inspect)
+        r = cl._http("GET", "http://127.0.0.1:%d/x" % srv.server_port, {}, None, 2, "reddit")
+        assert r.status == 302 and hits == ["/x"]
+        assert not hasattr(cl, "_OPENER")
     finally:
         srv.shutdown()
 
@@ -894,11 +899,27 @@ def test_each_series_is_asked_once_a_minute_by_the_package_reader_with_nothing_b
     assert len(kalshi.log) == 50
 
 
-def test_the_real_price_transport_is_the_packages_keyless_reader():
+def test_the_real_price_transport_is_this_modules_own_bounded_one(monkeypatch):
+    """rev 2 (outcome 3 changes invariant 2): Kalshi is read through this module's own transport, keyless, GET only,
+    to Kalshi's public host only; the package reader is no longer used."""
     import inspect
     src = inspect.getsource(cl.kalshi_get)
-    assert "urllib_get_dated" in src and "kd." in src
-    assert "KalshiData(" in inspect.getsource(cl.Collector.__init__)
+    assert "urllib_get" not in src and "urlopen" not in src
+    assert "KalshiData(" not in inspect.getsource(cl.Collector.__init__)
+    seen = []
+
+    def fake_http(method, url, headers, data, timeout, service, **kw):
+        seen.append((method, url, dict(headers), data, timeout, service))
+        return cl.Response(200, {}, b'{"markets": [], "cursor": ""}')
+    monkeypatch.setattr(cl, "_http", fake_http)
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXNBAGAME&status=open&limit=1000"
+    assert cl.kalshi_get(url, 7.5) == b'{"markets": [], "cursor": ""}'
+    assert seen == [("GET", url, {"User-Agent": cl.USER_AGENT, "Accept": "application/json"}, None, 7.5, "kalshi")]
+    for bad in ("http://api.elections.kalshi.com/trade-api/v2/markets", "https://evil.example/trade-api/v2/markets",
+                "https://api.elections.kalshi.com.evil.example/x", "https://u:p@api.elections.kalshi.com/trade-api/v2/markets"):
+        with pytest.raises(ValueError):
+            cl.kalshi_get(bad, 5)
+    assert len(seen) == 1
 
 
 def test_a_price_row_is_stored_only_when_bid_ask_or_last_changed_and_each_fetch_is_a_row(tmp_path):
@@ -1153,7 +1174,7 @@ def test_48_hours_of_slow_failing_and_limited_answers_keep_every_limit(tmp_path,
     for e in store.rows("SELECT at, until FROM comment_events WHERE kind IN ('backoff', 'ratelimit')"):
         a, b = datetime.strptime(e["at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp(), \
             datetime.strptime(e["until"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp()
-        assert 1 <= b - a <= 600 + 1e-6
+        assert 1 <= b - a <= 3600 + 1e-6                                   # rev 2: a wait the service names, up to an hour
         assert not [t for t in ts if a < t < b], (e, )
     if not oauth:
         assert all(m["method"] == "GET" and m["url"] == cl.PUBLIC_URL for m in log)
@@ -1781,11 +1802,11 @@ def test_the_oversized_answer_is_a_failed_fetch_and_what_was_read_is_kept(tmp_pa
 
 # ------------------------------------------------------- raw answers are kept compressed, hash over the exact bytes (6)
 
-HOSTILE = [b"", b"\xff\xfe\x00 not utf-8 \xc3\x28", bytes(range(256)) * 40, b"<feed>" + b"a" * 5_000_000 + b"</feed>",
+HOSTILE = [b"", b"\xff\xfe\x00 not utf-8 \xc3\x28", bytes(range(256)) * 40, b"<feed>" + b"a" * (cl.MAX_BODY - 13) + b"</feed>",
            os.urandom(70_000), b"\x00" * 100_000]
 
 
-@pytest.mark.parametrize("raw", HOSTILE, ids=["empty", "bad-utf8", "all-bytes", "5MB", "random", "zeros"])
+@pytest.mark.parametrize("raw", HOSTILE, ids=["empty", "bad-utf8", "all-bytes", "MAX_BODY", "random", "zeros"])
 def test_a_raw_answer_round_trips_exactly_whatever_its_bytes_and_the_hash_is_over_what_was_received(store, raw):
     f = cl.Fetch(at=T0, slot=T0, backend="public", purpose="feed", page=1, status=200, failure="unparseable", body=raw, entries=None)
     store.save_comment_slot([f], [])
@@ -1835,3 +1856,1008 @@ def test_a_decompression_bomb_in_the_store_is_caught_without_filling_memory(tmp_
     tracemalloc.stop()
     assert time.time() - t < 5 and peak < 50_000_000
     s.close()
+
+
+# ==================================================================== rev 2: the repairs after the blind check (V90)
+
+class Killed(BaseException):
+    """A kill at this point: nothing after it runs and nothing uncommitted is kept. A BaseException, so that no handler
+    in the program can catch it, as none can catch SIGKILL."""
+
+
+def iso_ts(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp()
+
+
+def collector(store, clock, reddit, kalshi, env=None):
+    return cl.Collector(store, clock=clock, sleep=clock.sleep, reddit_fetch=reddit, kalshi_get=kalshi, env=env or {},
+                        log=lambda s: None)
+
+
+def kalshi_ok(clock, took=0.1):
+    def get(url, timeout):
+        clock.sleep(took)
+        return b'{"markets": [], "cursor": ""}'
+    return get
+
+
+# ------------------------------------------------------- outcome 1: a durable row before any request leaves
+
+def test_a_durable_row_is_committed_before_each_request_leaves(tmp_path):
+    """Public feed, token, official interface and Kalshi: while the request is out, another connection to the file
+    already sees the row that says it was about to be sent, with its service, purpose, slot and time."""
+    path = tmp_path / "c.sqlite"
+    problems, seen = [], []
+
+    def look(service, purpose, t, series=None):
+        try:
+            r = cl.Store(path, readonly=True)
+            try:
+                row = r.rows("SELECT at, service, backend, purpose, slot_ts, page, series FROM requests ORDER BY id DESC LIMIT 1")
+            finally:
+                r.close()
+            if not row or (row[0]["service"], row[0]["purpose"], row[0]["at"], row[0]["series"]) != (service, purpose, stamp(t), series):
+                problems.append((service, purpose, row))
+            else:
+                seen.append((service, purpose))
+        except Exception as e:                                          # an assertion here would be swallowed as a failed fetch
+            problems.append((service, purpose, type(e).__name__))
+
+    for env in ({}, CREDS):
+        for p in tmp_path.glob("c.sqlite*"):
+            p.unlink()
+        clock = Clock()
+        answer = oauth_answer(lambda n, url: listing([("t1_n%03d" % n, T0 + n)])) if env else feed_answer()
+
+        def reddit(method, url, headers, data, timeout):
+            look("reddit", "token" if url == cl.TOKEN_URL else "feed", clock())
+            clock.sleep(0.2)
+            return answer(0, clock(), method, url)
+
+        def kalshi(url, timeout):
+            look("kalshi", "prices", clock(), dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["series_ticker"])
+            clock.sleep(0.1)
+            return b'{"markets": [], "cursor": ""}'
+        store = cl.Store(path, synchronous="OFF")
+        run_for(collector(store, clock, reddit, kalshi, env), clock, 300)
+        store.close()
+    assert problems == []
+    n = Counter(seen)
+    assert n[("reddit", "feed")] >= 3 + 5 and n[("reddit", "token")] == 1 and n[("kalshi", "prices")] == 2 * 25
+
+
+def test_a_request_whose_answer_never_came_is_recorded_as_unknown_by_appending_and_kalshi_is_not_asked_twice(tmp_path):
+    path = tmp_path / "c.sqlite"
+    clock = Clock()
+
+    def reddit_killed(method, url, headers, data, timeout):
+        raise Killed                                                    # killed while the request is out
+    store = cl.Store(path, synchronous="OFF")
+    col = collector(store, clock, reddit_killed, kalshi_ok(clock))
+    col.start()
+    with pytest.raises(Killed):
+        col.step()
+    store.close()
+    s = cl.Store(path, synchronous="OFF")
+    before = s.rows("SELECT * FROM requests ORDER BY id")
+    assert [(r["service"], r["purpose"], r["slot_ts"], r["at"]) for r in before] == [("reddit", "feed", T0, stamp(T0))]
+    assert s.rows("SELECT id FROM comment_fetches") == []
+    clock.sleep(1)
+    col = collector(s, clock, FakeReddit(clock, feed_answer()), kalshi_ok(clock))
+    col.start()
+    assert s.rows("SELECT * FROM requests ORDER BY id")[:1] == before                       # never rewritten
+    assert s.rows("SELECT fetched_at, slot_ts, purpose, page, ok, failure, request_id FROM comment_fetches") == [
+        {"fetched_at": stamp(T0 + 1), "slot_ts": T0, "purpose": "feed", "page": 1, "ok": 0, "failure": "unknown",
+         "request_id": before[0]["id"]}]
+    s.close()
+    # Kalshi: killed while the third series is out; the restart in the same minute asks only the two never asked
+    path2 = tmp_path / "k.sqlite"
+    clock = Clock()
+    asked = []
+
+    def kalshi(url, timeout):
+        series = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["series_ticker"]
+        asked.append((clock(), series))
+        if len(asked) == 3:
+            raise Killed
+        clock.sleep(0.1)
+        return b'{"markets": [], "cursor": ""}'
+    reddit = FakeReddit(clock, feed_answer())
+    store = cl.Store(path2, synchronous="OFF")
+    col = collector(store, clock, reddit, kalshi)
+    col.start()
+    with pytest.raises(Killed):
+        col.step()
+    store.close()
+    clock.sleep(0.5)
+    s = cl.Store(path2, synchronous="OFF")
+    run_for(collector(s, clock, reddit, kalshi), clock, 20)
+    assert [x[1] for x in asked] == list(cl.SERIES)                   # each series once in the 06:00 minute
+    rows = {r["series"]: (r["ok"], r["failure"]) for r in s.rows("SELECT series, ok, failure FROM price_fetches WHERE slot_ts = ?", (T0,))}
+    assert rows == {"KXNFLGAME": (1, None), "KXNBAGAME": (1, None), "KXNHLGAME": (0, "unknown"), "KXNCAAFGAME": (1, None),
+                    "KXNCAAMBGAME": (1, None)}
+    assert cl.verify(s) == []
+    s.close()
+
+
+@pytest.mark.parametrize("restart_after", [0.0, 1.0, 40.0, 59.0])
+def test_a_kill_during_a_public_request_and_a_restart_sends_nothing_inside_the_60_seconds(tmp_path, restart_after):
+    """The check's break: the floor cut from 60 s to 30 s was caught by no test. This one catches it (the 40 s and
+    59 s restarts are inside the half of the 06:00 slot, so the slot is still taken, and only the floor holds it)."""
+    path = tmp_path / "c.sqlite"
+    clock = Clock()
+    sent = []
+
+    def killed(method, url, headers, data, timeout):
+        sent.append(clock())
+        raise Killed
+    store = cl.Store(path, synchronous="OFF")
+    col = collector(store, clock, killed, kalshi_ok(clock))
+    col.start()
+    with pytest.raises(Killed):
+        col.step()
+    store.close()
+    clock.t = T0 + restart_after
+    reddit = FakeReddit(clock, feed_answer())
+    s = cl.Store(path, synchronous="OFF")
+    run_for(collector(s, clock, reddit, kalshi_ok(clock)), clock, 400)
+    ts = sent + [r["t"] for r in reddit.log]
+    assert ts[0] == T0 and ts[1] >= T0 + 60, ts
+    assert all(b - a >= 60 for a, b in zip(ts, ts[1:]))
+    s.close()
+
+
+def test_a_storm_of_restarts_never_sends_more_than_30_official_requests_in_any_60_seconds(tmp_path):
+    """The check's other uncaught break: the official burst raised from 30 to 45. Every run is killed while its
+    token request is out and restarted 0.5 s later, 41 times in 20 s (and the runs held back each read prices,
+    three Kalshi requests a second, all inside the slot's first half)."""
+    path = tmp_path / "c.sqlite"
+    clock = Clock()
+    sent = []
+
+    def killed(method, url, headers, data, timeout):
+        sent.append(clock())
+        raise Killed
+    for _ in range(41):
+        store = cl.Store(path, synchronous="OFF")
+        try:
+            col = collector(store, clock, killed, kalshi_ok(clock, 0.0), CREDS)
+            col.start()
+            col.step()
+        except Killed:
+            pass
+        finally:
+            store.close()
+        clock.sleep(0.5)
+    assert 25 <= len(sent) <= cl.OAUTH_BURST == 30
+    for t in sent:
+        assert sum(1 for u in sent if t - 60 < u <= t) <= 30
+    s = cl.Store(path, readonly=True)
+    held = s.rows("SELECT COUNT(*) AS n FROM comment_fetches WHERE failure = 'held_back'")[0]["n"]
+    assert held == 41 - len(sent)                                       # each held-back slot is a row
+    s.close()
+
+
+def test_the_page_count_of_a_slot_holds_across_a_kill(tmp_path):
+    path = tmp_path / "c.sqlite"
+    clock = Clock()
+    feeds = []
+
+    def reddit(method, url, headers, data, timeout):
+        clock.sleep(0.2)
+        if url == cl.TOKEN_URL:
+            return token_answer()
+        feeds.append(clock())
+        n = len(feeds)
+        if n == 4:
+            raise Killed                                                # killed while the fourth page is out
+        return listing([("t1_p%d_%d" % (n, i), T0 + 1000 - 10 * n - i) for i in range(3)], after="t1_p%d_2" % n)
+    store = cl.Store(path, synchronous="OFF")
+    feed(store, [entry("t1_stored", time_=datetime.fromtimestamp(T0 - 3000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))], T0 - 500)
+    col = collector(store, clock, reddit, kalshi_ok(clock), CREDS)
+    col.start()
+    with pytest.raises(Killed):
+        col.step()
+    store.close()
+    s = cl.Store(path, synchronous="OFF")
+    run_for(collector(s, clock, reddit, kalshi_ok(clock), CREDS), clock, 30)    # restarted at once, the same slot
+    assert len([t for t in feeds if t < T0 + 60]) == cl.OAUTH_MAX_PAGES == 5
+    n = s.rows("SELECT COUNT(*) AS n FROM requests WHERE service = 'reddit' AND purpose = 'feed' AND slot_ts = ?", (T0,))[0]["n"]
+    assert n == 5
+    s.close()
+
+
+# a kill at generated points, an immediate restart, and an independent model of the limits
+
+class KillPlan:
+    """Where a run is killed: just before or just after a commit, or while a request is out (its answer then never
+    comes). An answer the program received stays `pending` until a commit has followed it; a kill before that loses
+    it, as a real kill would, and the model then does not hold the program to it."""
+
+    def __init__(self, rng, p_commit=0.004, p_reddit=0.12, p_kalshi=0.02):
+        self.rng, self.p_commit, self.p_reddit, self.p_kalshi = rng, p_commit, p_reddit, p_kalshi
+        self.pending = []
+        self.kills = Counter()
+
+    def commit_point(self):
+        if self.rng.random() < self.p_commit:
+            self.kills["commit"] += 1
+            raise Killed
+
+
+def install_kill_points(monkeypatch, holder):
+    real = cl._Writing.__exit__
+
+    def exit_(self, et, ev, tb):
+        plan = holder.get("plan")
+        if et is None and plan is not None:
+            try:
+                plan.commit_point()                                     # just before the commit: the transaction is lost
+            except Killed:
+                self.store.conn.execute("ROLLBACK")
+                raise
+        out = real(self, et, ev, tb)
+        if et is None and plan is not None:
+            plan.pending.clear()
+            plan.commit_point()                                         # just after it
+        return out
+    monkeypatch.setattr(cl._Writing, "__exit__", exit_)
+
+
+class KillReddit:
+    """Reddit as the model sees it: every request it received (`log`) and every answer that reached the program."""
+
+    def __init__(self, clock, plan, rng, oauth):
+        self.clock, self.plan, self.rng, self.oauth = clock, plan, rng, oauth
+        self.log, self.answers, self.window, self.i = [], [], [], 0
+
+    def __call__(self, method, url, headers, data, timeout):
+        t, rng = self.clock(), self.rng
+        self.log.append(t)
+        if rng.random() < self.plan.p_reddit:
+            self.plan.kills["reddit"] += 1
+            raise Killed
+        if url == cl.TOKEN_URL:
+            a = token_answer(rng.choice([600, 3600]))
+        else:
+            r = rng.random()
+            if r < 0.06:
+                a = resp(429, b"", {"Retry-After": str(rng.choice([5, 40, 90, 400, 2000]))} if rng.random() < 0.7 else {})
+            elif r < 0.08:
+                a = resp(403, b"", {})
+            elif r < 0.11:
+                a = resp(500, b"", {})
+            elif r < 0.14:
+                self.clock.sleep(timeout)
+                raise TimeoutError
+            elif self.oauth:
+                self.i += 1
+                a = listing([("t1_k%06d" % self.i, t - 3)], after=("t1_k%06d" % self.i) if rng.random() < 0.3 else None,
+                            remaining=rng.choice([90, 90, 90, 0.0]), reset=rng.choice([20, 60, 300]))
+            else:
+                self.i += 1
+                when = datetime.fromtimestamp(t - 3, UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                self.window.insert(0, atom_entry("t1_k%06d" % self.i, updated=when))
+                del self.window[30:]
+                a = resp(200, atom_with(*self.window), {"x-ratelimit-reset": "56"})
+        took = rng.uniform(0.1, 3.0)
+        if took > timeout:
+            self.clock.sleep(timeout)
+            raise TimeoutError
+        self.clock.sleep(took)
+        rec = {"at": self.clock(), "status": a.status, "headers": dict(a.headers), "feed": url != cl.TOKEN_URL, "lost": False}
+        self.answers.append(rec)
+        self.plan.pending.append(rec)
+        return a
+
+
+class KillKalshi:
+    def __init__(self, clock, plan, rng):
+        self.clock, self.plan, self.rng, self.log = clock, plan, rng, []
+
+    def __call__(self, url, timeout):
+        series = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["series_ticker"]
+        self.log.append((self.clock(), series))
+        if self.rng.random() < self.plan.p_kalshi:
+            self.plan.kills["kalshi"] += 1
+            raise Killed
+        self.clock.sleep(self.rng.uniform(0.05, 0.6))
+        return json.dumps({"markets": [market(series + "-26NOV20AAABBB-AAA", bid="%.4f" % (self.rng.randint(1, 98) / 100))],
+                           "cursor": ""}).encode()
+
+
+def model_wait(a, oauth):
+    """How long an answer the program received binds it, by the rules alone: a 429 or 403, the time it names (Retry-After,
+    else the reset header) from one second to an hour, else five minutes; an official page with under one request
+    left, its reset, else five minutes."""
+    h = {k.lower(): v for k, v in a["headers"].items()}
+
+    def num(name):
+        try:
+            v = float(h[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    def named(name):
+        v = num(name)
+        return None if v is None else min(max(v, 1.0), 3600.0)
+    if a["status"] in (429, 403):
+        return named("retry-after") or named("x-ratelimit-reset") or 300.0
+    if oauth and a["feed"] and a["status"] == 200 and num("x-ratelimit-remaining") is not None and num("x-ratelimit-remaining") < 1:
+        return named("x-ratelimit-reset") or 300.0
+    return 0.0
+
+
+def limit_breaks(reddit, kalshi, oauth):
+    """Every break of a limit, judged only from what the stand-in servers received and answered, never from the store."""
+    out = []
+    ts = sorted(reddit.log)
+    if not oauth:
+        out += ["floor: %.3f then %.3f" % (a, b) for a, b in zip(ts, ts[1:]) if b - a < 60]
+        out += ["silence: %.3f" % t for t in ts if 5 <= minute_of_hour(t) <= 12]
+    else:
+        out += ["burst: %.3f" % t for t in ts if sum(1 for u in ts if t - 60 < u <= t) > 30]
+    for a in reddit.answers:
+        w = 0.0 if a["lost"] else model_wait(a, oauth)
+        out += ["inside a back-off from %.3f for %g s: %.3f" % (a["at"], w, t) for t in ts if a["at"] < t < a["at"] + w]
+    seen = set()
+    for t, series in kalshi.log:
+        k = (series, int(t // 60))
+        if k in seen:
+            out.append("kalshi twice: %s %d" % k)
+        seen.add(k)
+    return out
+
+
+def run_with_kills(path, holder, seed, oauth, hours):
+    rng = random.Random(1000 * seed + (1 if oauth else 0))
+    plan = holder["plan"] = KillPlan(rng)
+    clock = Clock(T0 + rng.randint(0, 3599) + rng.random())
+    reddit, kalshi = KillReddit(clock, plan, rng, oauth), KillKalshi(clock, plan, rng)
+    end = clock() + hours * 3600
+    quick = 0
+    while clock() < end:
+        store = cl.Store(path, synchronous="OFF")
+        try:
+            col = collector(store, clock, reddit, kalshi, CREDS if oauth else {})
+            col.start()
+            while clock() < end:
+                col.step()
+                clock.sleep(min(max(col.next_due() - clock(), 0.0), 1.0))
+        except Killed:
+            for a in plan.pending:
+                a["lost"] = True
+            plan.pending.clear()
+            gap = rng.choice([0.0, 0.0, 0.0, 0.4, 1.5, 4.0, rng.uniform(30.0, 59.9), rng.uniform(30.0, 59.9), 61.0, 150.0])
+            quick += gap < 60
+            clock.sleep(gap)
+        finally:
+            store.close()
+    holder["plan"] = None                                               # one clean start: every open request gets its outcome
+    store = cl.Store(path, synchronous="OFF")
+    collector(store, clock, reddit, kalshi, CREDS if oauth else {}).start()
+    store.close()
+    return plan, reddit, kalshi, quick
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+def test_kills_at_generated_points_with_immediate_restarts_keep_every_limit(tmp_path, monkeypatch, oauth):
+    holder = {"plan": None}
+    install_kill_points(monkeypatch, holder)
+    kills, quick, bound = Counter(), 0, 0
+    for seed in range(8):
+        path = tmp_path / ("k%d.sqlite" % seed)
+        plan, reddit, kalshi, q = run_with_kills(path, holder, seed, oauth, hours=2)
+        kills.update(plan.kills)
+        quick += q
+        bound += sum(1 for a in reddit.answers if not a["lost"] and model_wait(a, oauth))
+        assert limit_breaks(reddit, kalshi, oauth) == [], seed
+        s = cl.Store(path, readonly=True)
+        assert cl.verify(s) == [], seed
+        # every request that reached a server had its row, at its time, before it left
+        rows = Counter(round(iso_ts(r["at"]) * 1000) for r in s.rows("SELECT at FROM requests WHERE service = 'reddit'"))
+        assert not Counter(round(t * 1000) for t in reddit.log) - rows, seed
+        rows = Counter((round(iso_ts(r["at"]) * 1000), r["series"]) for r in s.rows("SELECT at, series FROM requests WHERE service = 'kalshi'"))
+        assert not Counter((round(t * 1000), x) for t, x in kalshi.log) - rows, seed
+        # every request has exactly one outcome, appended
+        assert s.rows("SELECT COUNT(*) AS n FROM requests r WHERE service = 'reddit' AND "
+                      "(SELECT COUNT(*) FROM comment_fetches f WHERE f.request_id = r.id) != 1")[0]["n"] == 0, seed
+        assert s.rows("SELECT COUNT(*) AS n FROM (SELECT DISTINCT series, slot_ts FROM requests WHERE service = 'kalshi') r WHERE "
+                      "(SELECT COUNT(*) FROM price_fetches f WHERE f.series = r.series AND f.slot_ts = r.slot_ts "
+                      "AND f.request_id IS NOT NULL) != 1")[0]["n"] == 0, seed
+        pages = s.rows("SELECT MAX(n) AS m FROM (SELECT COUNT(*) AS n FROM requests WHERE service = 'reddit' AND purpose = 'feed' "
+                       "GROUP BY slot_ts)")[0]["m"]
+        assert pages <= (cl.OAUTH_MAX_PAGES if oauth else 2), seed
+        s.close()
+    assert sum(kills.values()) >= 150 and kills["reddit"] >= 20 and kills["commit"] >= 20 and kills["kalshi"] >= 20, kills
+    assert quick >= 100 and bound >= 10, (quick, bound)
+
+
+# ------------------------------------------------------------------------- outcome 2: coverage is Clarification 3
+
+DAY = 1794614400                     # 2026-11-14 00:00 UTC
+
+
+def test_a_full_utc_day_has_7200_price_slots_and_624_public_or_1440_official_comment_slots(tmp_path):
+    for backend, interval, want in (("public", 120, 624), ("oauth", 60, 1440)):
+        s = cl.Store(tmp_path / ("%s.sqlite" % backend), synchronous="OFF")
+        s.save_run(started=DAY, backend=backend, comment_interval=interval, price_interval=60)
+        d = cl.status(s, DAY + 86400)["days"][0]
+        assert d["day"] == "2026-11-14"
+        assert (d["comments"]["expected"], d["comments"]["covered_slots"], d["prices"]["expected"], d["prices"]["covered_slots"]) == (want, 0, 7200, 0)
+        assert all(v["expected"] == 1440 for v in d["prices"]["series"].values())
+        assert d["counts"] is False
+        s.close()
+
+
+def test_coverage_of_a_day_with_two_restarts_inside_every_other_minute(tmp_path):
+    """Every two minutes a run starts 26 s into the even minute, takes it and dies; a second starts at once in the
+    same minute and dies; nothing runs in the odd minute. Half the price minutes were read, each once."""
+    path = tmp_path / "c.sqlite"
+    clock = Clock(DAY + 26)
+    reddit, kalshi = FakeReddit(clock, feed_answer()), FakeKalshi(clock)
+    for k in range(720):
+        clock.t = max(clock.t, DAY + 120 * k + 26)
+        for _ in range(2):
+            s = cl.Store(path, synchronous="OFF")
+            col = collector(s, clock, reddit, kalshi)
+            col.start()
+            col.step()
+            s.close()
+            clock.sleep(1)
+    asked = Counter((r["series"], int(r["t"] // 60)) for r in kalshi.log)
+    assert len(asked) == 5 * 720 and max(asked.values()) == 1                         # never the same series twice in a minute
+    s = cl.Store(path, readonly=True)
+    st = cl.status(s, DAY + 86400)
+    d = st["days"][0]
+    assert d["day"] == "2026-11-14"
+    p, c = d["prices"], d["comments"]
+    assert (p["expected"], p["covered_slots"], p["failed"]) == (7200, 3600, 0)
+    assert p["share"] == 0.5 and p["covered"] is False and d["counts"] is False      # covered: at least 80% of the day
+    for v in p["series"].values():
+        assert (v["expected"], v["covered_slots"]) == (1440, 720)
+    distinct = s.rows("SELECT COUNT(*) AS n FROM (SELECT DISTINCT series, slot_ts FROM price_fetches WHERE ok = 1)")[0]["n"]
+    assert distinct == p["covered_slots"]
+    assert (c["expected"], c["covered_slots"]) == (624, 624) and c["covered"] is True
+    text = cl.format_status(st)
+    assert "covered" in text
+    s.close()
+
+
+def test_a_comment_slot_with_a_possible_miss_mark_is_not_covered(tmp_path):
+    def when(n):
+        return datetime.fromtimestamp(T0 + 60 * n, UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    def answer(n, t, m, u):
+        if n in (3, 7):                                                  # a feed that starts after the newest stored
+            return resp(200, atom_with(atom_entry("t1_jump%d" % n, updated=when(n))))
+        return resp(200, atom_with(atom_entry("t1_c%d" % n, updated=when(n)), atom_entry("t1_c%d" % (n - 1), updated=when(n - 1))))
+    col, store, *_ = run_store(tmp_path, 3600, answer=answer)
+    c = cl.status(store, T0 + 3600)["days"][0]["comments"]
+    marks = store.rows("SELECT COUNT(DISTINCT slot_ts) AS n FROM comment_events WHERE kind = 'possible_miss'")[0]["n"]
+    assert marks >= 2
+    assert marks == 2 and c["made"] == 26 and c["failed"] == 0 and c["miss_uncovered"] == marks and c["covered_slots"] == 26 - marks
+    assert c["share"] == pytest.approx((26 - marks) / 26)
+
+
+def test_covered_never_exceeds_expected_whatever_the_rows_say(tmp_path):
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    s.save_run(started=T0, backend="public", comment_interval=120, price_interval=60)
+    for i in range(3):                                                  # the same minute read three times
+        s.save_price_fetch(series="KXNBAGAME", slot=T0, at=T0 + i, failure=None, markets=[], seen=0, bad_rows=0, body=None)
+    s.save_price_fetch(series="KXNBAGAME", slot=T0 + 3600 * 5, at=T0 + 5, failure=None, markets=[], seen=0, bad_rows=0, body=None)  # a slot after now
+    s.save_price_fetch(series="KXOTHER", slot=T0, at=T0 + 6, failure=None, markets=[], seen=0, bad_rows=0, body=None)        # not one of the five
+    feed(s, [entry("c1")], T0 + 7, slot=T0)
+    feed(s, [entry("c2")], T0 + 8, slot=T0)
+    feed(s, [entry("c3")], T0 + 9, slot=T0 + 360)                      # minute 6: in the silence, not a slot of the plan
+    st = cl.status(s, T0 + 120)
+    for d in st["days"]:
+        assert d["prices"]["covered_slots"] <= d["prices"]["expected"] and d["comments"]["covered_slots"] <= d["comments"]["expected"]
+        for v in d["prices"]["series"].values():
+            assert v["covered_slots"] <= v["expected"]
+    d = st["days"][0]
+    assert d["prices"]["covered_slots"] == 1 and d["prices"]["series"]["KXNBAGAME"]["covered_slots"] == 1
+    assert d["comments"]["expected"] == 1 and d["comments"]["covered_slots"] == 1
+    s.close()
+
+
+# ------------------------------------------- outcome 3: one slow or hostile answer costs nothing but its own slot
+
+class LocalServer:
+    """A stand-in server on 127.0.0.1 that behaves one way. "ok" answers at once with `status`, `extra` headers and
+    `body`; the others misbehave. Nothing here is reachable from outside the machine."""
+
+    def __init__(self, behaviour, body=b'{"markets": [], "cursor": ""}', status=200, extra=b""):
+        self.behaviour, self.body, self.status, self.extra = behaviour, body, status, extra
+        self.requests, self.hits, self.stop = [], 0, threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.05)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, name="test-server", daemon=True).start()
+
+    def url(self, path="/trade-api/v2/markets", scheme="http"):
+        return "%s://127.0.0.1:%d%s" % (scheme, self.port, path)
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                c, _ = self.sock.accept()
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            self.hits += 1
+            threading.Thread(target=self._handle, args=(c,), name="test-server-conn", daemon=True).start()
+
+    def _hold(self, c):
+        while not self.stop.is_set():
+            try:
+                if c.recv(65536) == b"":
+                    return
+            except (socket.timeout, TimeoutError):
+                continue
+
+    def _slowly(self, c, data, every):
+        for i in range(len(data)):
+            if self.stop.wait(every):
+                return
+            c.sendall(data[i:i + 1])
+
+    def _handle(self, c):
+        try:
+            c.settimeout(0.05)
+            head, t = b"", time.monotonic()
+            while b"\r\n\r\n" not in head and time.monotonic() - t < 1.0 and not self.stop.is_set():
+                try:
+                    chunk = c.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    continue
+                if not chunk:
+                    break
+                head += chunk
+            self.requests.append(head)
+            b = self.behaviour
+            if b == "ok":
+                c.sendall(b"HTTP/1.1 %d X\r\nContent-Length: %d\r\n%s\r\n" % (self.status, len(self.body), self.extra) + self.body)
+            elif b == "silent":
+                self._hold(c)
+            elif b == "trickle_headers":
+                c.sendall(b"HTTP/1.1 200 OK\r\n")
+                self._slowly(c, b"X-Slow: " + b"a" * 2000 + b"\r\n\r\n", 0.05)
+            elif b == "trickle_body":
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+                self._slowly(c, b"x" * 100000, 0.05)
+            elif b == "endless":
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+                c.settimeout(2.0)
+                sent = 0
+                while sent < 6 * 1024 * 1024 and not self.stop.is_set():
+                    c.sendall(b"x" * 65536)
+                    sent += 65536
+                c.settimeout(0.05)
+                self._hold(c)
+            elif b == "endless_slow":
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+                while not self.stop.wait(0.02):
+                    c.sendall(b"y" * 1024)
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+
+
+def local_hosts_allowed(monkeypatch):
+    """Let the real transports reach the stand-in servers on 127.0.0.1 (they refuse any host but their own otherwise)."""
+    local = {("http", "127.0.0.1"), ("https", "127.0.0.1")}
+    monkeypatch.setattr(cl, "_ALLOWED", set(cl._ALLOWED) | local)
+    monkeypatch.setattr(cl, "_KALSHI_ALLOWED", local, raising=False)
+
+
+def through(service, url, timeout):
+    if service == "reddit":
+        return cl.reddit_get("GET", url, {"User-Agent": cl.USER_AGENT, "Accept": "application/atom+xml"}, None, timeout)
+    return cl.kalshi_get(url, timeout)
+
+
+def request_threads():
+    return {t for t in threading.enumerate() if t.name.startswith("chatter-get") and t.is_alive()}
+
+
+@pytest.mark.parametrize("service", ["reddit", "kalshi"])
+@pytest.mark.parametrize("kind", ["silent", "tls_silent", "trickle_headers", "trickle_body", "endless", "endless_slow"])
+def test_a_hostile_server_cannot_keep_a_request_past_its_whole_deadline(monkeypatch, service, kind):
+    local_hosts_allowed(monkeypatch)
+    srv = LocalServer("silent" if kind == "tls_silent" else kind)
+    before = request_threads()
+    limit = 1.0
+    try:
+        t = time.monotonic()
+        try:
+            r = through(service, srv.url(scheme="https" if kind == "tls_silent" else "http"), limit)
+            outcome = "answer"
+        except Exception as e:
+            r, outcome = None, type(e).__name__
+        elapsed = time.monotonic() - t
+        assert elapsed <= limit + 0.3, (kind, outcome, elapsed)
+        if kind == "endless":
+            assert (outcome == "answer" and r.truncated and len(r.body) == cl.MAX_BODY) if service == "reddit" else outcome != "answer"
+        else:
+            assert outcome != "answer", kind
+        while request_threads() - before and time.monotonic() - t < limit + 2.0:
+            time.sleep(0.02)
+        assert not request_threads() - before, "a request thread outlived its deadline by 2 s"
+    finally:
+        srv.close()
+
+
+def _self_signed(tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime as dtm
+    import ipaddress
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = dtm.datetime.now(dtm.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - dtm.timedelta(days=1))
+            .not_valid_after(now + dtm.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .sign(key, hashes.SHA256()))
+    cf, kf = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cf.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    kf.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    return cf, kf
+
+
+@pytest.mark.parametrize("kind", ["trickle_headers", "trickle_body"])
+def test_a_trickling_answer_over_tls_is_cut_at_the_deadline_too(tmp_path, monkeypatch, kind):
+    import ssl
+    local_hosts_allowed(monkeypatch)
+    cf, kf = _self_signed(tmp_path)
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cf, kf)
+    client_ctx = ssl.create_default_context(cafile=str(cf))
+    monkeypatch.setattr(cl, "_SSL_CONTEXT", client_ctx, raising=False)
+    srv = LocalServer(kind)
+    plain_handle = srv._handle
+
+    def tls_handle(c):
+        try:
+            c.settimeout(2.0)
+            c = server_ctx.wrap_socket(c, server_side=True)
+        except OSError:
+            c.close()
+            return
+        plain_handle(c)
+    srv._handle = tls_handle
+    before = request_threads()
+    try:
+        t = time.monotonic()
+        with pytest.raises(Exception):
+            through("reddit", srv.url(path="/x", scheme="https"), 1.0)
+        assert time.monotonic() - t <= 1.3
+        while request_threads() - before and time.monotonic() - t < 3.0:
+            time.sleep(0.02)
+        assert not request_threads() - before
+        assert srv.requests and srv.requests[0].startswith(b"GET /x HTTP/1.1")       # it was TLS all the way through
+    finally:
+        srv.close()
+
+
+def test_abandoned_requests_of_one_service_never_stop_the_other():
+    stuck = threading.Event()
+    try:
+        for service, other in (("reddit", "kalshi"), ("kalshi", "reddit")):
+            for _ in range(cl.MAX_ABANDONED):
+                with pytest.raises(TimeoutError):
+                    cl.bounded_call(lambda: stuck.wait(10), 0.05, service)
+            with pytest.raises(TimeoutError):
+                cl.bounded_call(lambda: 1, 1, service)                  # this one is full: none started
+            assert cl.bounded_call(lambda: 7, 1, other) == 7            # the other is not
+            if service == "reddit":
+                stuck.set()
+                time.sleep(0.2)
+                stuck.clear()
+    finally:
+        stuck.set()
+        time.sleep(0.2)
+
+
+def test_trickling_answers_of_one_service_never_cost_a_request_of_the_other(monkeypatch):
+    """The check's finding: four trickling Reddit answers left every later price minute failing as a timeout."""
+    local_hosts_allowed(monkeypatch)
+    slow, good = LocalServer("trickle_body"), LocalServer("ok")
+    try:
+        for service, other in (("reddit", "kalshi"), ("kalshi", "reddit")):
+            for _ in range(cl.MAX_ABANDONED + 2):
+                with pytest.raises(Exception):
+                    through(service, slow.url(), 0.3)
+            r = through(other, good.url(), 2.0)
+            assert (r if other == "kalshi" else r.body) == good.body
+            assert (through(service, good.url(), 2.0) if service == "kalshi" else through(service, good.url(), 2.0).body) == good.body
+    finally:
+        slow.close()
+        good.close()
+
+
+def test_no_request_uses_a_proxy_from_the_environment_follows_a_redirect_or_sends_more_than_the_fixed_headers(monkeypatch):
+    local_hosts_allowed(monkeypatch)
+    proxy, target, elsewhere = LocalServer("ok"), LocalServer("ok"), LocalServer("ok")
+    redirecting = LocalServer("ok", status=302, body=b"", extra=b"Location: %s\r\n" % elsewhere.url().encode())
+    for k in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(k, proxy.url("/"))
+    for k in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(k, raising=False)
+    try:
+        assert through("reddit", target.url(), 2.0).status == 200
+        assert through("kalshi", target.url(), 2.0) == target.body
+        assert target.hits == 2 and proxy.hits == 0
+        assert through("reddit", redirecting.url(), 2.0).status == 302
+        with pytest.raises(kd.HttpError) as e:
+            through("kalshi", redirecting.url(), 2.0)
+        assert e.value.status == 302 and elsewhere.hits == 0 and proxy.hits == 0
+        for head in target.requests:
+            names = {line.split(b":", 1)[0].strip().lower() for line in head.split(b"\r\n")[1:] if b":" in line}
+            assert names <= {b"host", b"user-agent", b"accept"}, names
+    finally:
+        for s in (proxy, target, elsewhere, redirecting):
+            s.close()
+
+
+def test_a_kalshi_answer_larger_than_the_limit_is_a_failed_fetch(tmp_path):
+    def kanswer(url, timeout):
+        raise cl.TooLarge(b"x" * 100)
+    clock = Clock()
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    run_for(collector(s, clock, FakeReddit(clock, feed_answer()), kanswer), clock, 60)
+    assert {r["failure"] for r in s.rows("SELECT failure FROM price_fetches")} == {"too_large"}
+    s.close()
+
+
+# --------------------------------------------- outcome 4: memory stays bounded wherever a stored blob is read back
+
+def stream_bomb(n_bytes):
+    """A small blob that inflates to `n_bytes` zeros, made a megabyte at a time (the whole is never held)."""
+    co, chunk = zlib.compressobj(9), b"\x00" * (1 << 20)
+    parts = [co.compress(chunk) for _ in range(n_bytes >> 20)]
+    return b"".join(parts) + co.flush()
+
+
+def test_check_never_inflates_past_max_body_whatever_a_row_states_and_goes_on(tmp_path, monkeypatch):
+    s = cl.Store(tmp_path / "c.sqlite", synchronous="OFF")
+    for i in range(3):
+        feed(s, [entry("c%d" % i)], T0 + 120 * i, body=b"<feed>real %d</feed>" % i)
+    bomb = stream_bomb(256 << 20)                                      # a quarter of a megabyte that would be 256 MB
+    assert len(bomb) < 1 << 20
+    trig = dict(s.conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'").fetchall())
+    s.conn.execute("DROP TRIGGER no_update_payloads")
+    s.conn.execute("UPDATE payloads SET body = ?, size = ? WHERE id = 1", (bomb, 1 << 30))          # states a gigabyte
+    s.conn.execute("UPDATE payloads SET body = ?, size = ? WHERE id = 2", (bomb, cl.MAX_BODY))       # states the most an answer can be
+    s.conn.execute("DROP TRIGGER no_update_comment_fetches")
+    s.conn.execute("UPDATE comment_fetches SET new_versions = new_versions + 1 WHERE id = 3")       # damage of another kind after them
+    for name in ("no_update_payloads", "no_update_comment_fetches"):                               # the layout itself put back
+        s.conn.execute(trig[name])
+    asked, real = [], zlib.decompressobj
+
+    class Watched:
+        """zlib's decompressor, refusing to be asked for more than MAX_BODY + 1 bytes (or for no limit at all)."""
+        def __init__(self, *a):
+            self._d = real(*a)
+
+        def decompress(self, data, max_length=0):
+            asked.append(max_length)
+            if max_length <= 0 or max_length > cl.MAX_BODY + 1:
+                raise AssertionError("asked to inflate up to %d bytes" % max_length)
+            return self._d.decompress(data, max_length)
+
+        def __getattr__(self, name):
+            return getattr(self._d, name)
+    monkeypatch.setattr(cl.zlib, "decompressobj", Watched)
+    tracemalloc.start()
+    try:
+        problems = cl.verify(s)
+        with pytest.raises(cl.StoreError):
+            s.payload_bytes(1)
+        with pytest.raises(cl.StoreError):
+            s.payload_bytes(2)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 300_000_000 and peak < 3 * cl.MAX_BODY + 20_000_000
+    assert any("payload: 2 raw answers" in p for p in problems), problems
+    assert any("new_versions" in p for p in problems), problems
+    assert all(0 < n <= cl.MAX_BODY + 1 for n in asked)
+    s.close()
+    out = []
+    assert cl.main(["check", "--db", str(tmp_path / "c.sqlite")], out=out.append) == 1
+    assert any("payload: 2 raw answers" in line for line in out) and any("new_versions" in line for line in out), out
+    s = cl.Store(tmp_path / "big.sqlite", synchronous="OFF")                                        # nor is one ever stored
+    big = cl.Fetch(at=T0, slot=T0, backend="public", purpose="feed", page=1, status=200, failure="too_large",
+                   body=b"x" * (cl.MAX_BODY + 1), entries=None)
+    with pytest.raises(ValueError):
+        s.save_comment_slot([big], [])
+    assert s.rows("SELECT COUNT(*) AS n FROM payloads")[0]["n"] == 0
+    s.close()
+
+
+# ------------------------------------------------------------------- outcome 5: Retry-After as an HTTP date
+
+@pytest.mark.parametrize("value,expected", [("future", 200), ("past", 300), ("Someday, 99 Foo 2026 25:61:61 GMT", 300),
+                                            ("3000", 3000), ("7200", 3600)])
+def test_retry_after_as_an_http_date_is_honoured_and_a_named_wait_up_to_an_hour(tmp_path, value, expected):
+    count = {"n": 0}
+
+    def answer(n, t, m, u):
+        count["n"] += 1
+        if count["n"] == 1:
+            v = {"future": email.utils.formatdate(t + 0.2 + 200, usegmt=True),
+                 "past": email.utils.formatdate(t - 3600, usegmt=True)}.get(value, value)
+            return resp(429, b"", {"Retry-After": v})
+        return resp(200, atom_with(atom_entry("t1_ok%d" % n)))
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=answer)
+    run_for(col, clock, 4000)
+    first, second = reddit.log[0]["t"], reddit.log[1]["t"]
+    ev = store.rows("SELECT at, until FROM comment_events WHERE kind = 'backoff'")
+    assert len(ev) == 1 and abs(iso_ts(ev[0]["until"]) - (first + 0.2 + expected)) <= 1.0, ev
+    g = -(-iso_ts(ev[0]["until"]) // 120) * 120
+    while 5 <= minute_of_hour(g) <= 12:
+        g += 120
+    assert second == g
+
+
+def test_an_official_reset_the_service_names_is_honoured_up_to_an_hour(tmp_path):
+    def pages(n, url):
+        return listing([("t1_n%03d" % n, T0 + n * 60 - 3)], remaining=0.0, reset=2000) if n == 2 else \
+            listing([("t1_n%03d" % n, T0 + n * 60 - 3)], remaining=90, reset=60)
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=oauth_answer(pages), env=CREDS)
+    run_for(col, clock, 2400)
+    feeds = [r["t"] for r in reddit.log if r["url"] != cl.TOKEN_URL]
+    assert feeds[2] - feeds[1] >= 2000
+
+
+# ------------------------------------------------------------------------------------- outcome 6: the smaller ones
+
+@pytest.mark.parametrize("name", ["utf16-bom", "utf16-no-bom", "utf8-bom", "latin1-declared", "latin1-bytes", "utf16-entity-bomb",
+                                  "utf16-doctype"])
+def test_a_feed_must_be_utf8_without_a_byte_order_mark(name):
+    bomb = ('<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+            '<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]><feed xmlns="http://www.w3.org/2005/Atom">'
+            + atom_entry(body="&c;") + '</feed>')
+    data = {"utf16-bom": ATOM_FIXTURE.replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16"),
+            "utf16-no-bom": ATOM_FIXTURE.replace('encoding="UTF-8"', 'encoding="UTF-16LE"').encode("utf-16-le"),
+            "utf8-bom": b"\xef\xbb\xbf" + ATOM_FIXTURE.encode(),
+            "latin1-declared": ATOM_FIXTURE.replace('encoding="UTF-8"', 'encoding="ISO-8859-1"').encode(),
+            "latin1-bytes": atom_with(atom_entry(body="caf\xe9")).decode().encode("latin-1"),
+            "utf16-entity-bomb": bomb.encode("utf-16"),
+            "utf16-doctype": ('<!DOCTYPE feed SYSTEM "file:///etc/passwd">' + ATOM_FIXTURE[38:]).encode("utf-16")}[name]
+    t = time.time()
+    with pytest.raises(cl.Unparseable):
+        cl.parse_atom(data)
+    assert time.time() - t < 1
+
+
+def test_the_parser_itself_refuses_entity_and_doctype_declarations(monkeypatch):
+    never = re.compile(r"(?!)")
+    monkeypatch.setattr(cl, "_DOCTYPE", re.compile(rb"(?!)"))           # with the text check gone, the parser still refuses
+    monkeypatch.setattr(cl, "_DOCTYPE_TEXT", never, raising=False)
+    for doc in ('<!DOCTYPE feed [<!ENTITY a "x">]><feed xmlns="http://www.w3.org/2005/Atom">' + atom_entry(body="&a;") + "</feed>",
+                '<!DOCTYPE feed><feed xmlns="http://www.w3.org/2005/Atom">' + atom_entry() + "</feed>",
+                '<!DOCTYPE feed [<!ENTITY % p "x">]><feed xmlns="http://www.w3.org/2005/Atom"/>'):
+        with pytest.raises(cl.Unparseable):
+            cl.parse_atom(doc.encode())
+    entries, bad = cl.parse_atom(ATOM_FIXTURE.encode())                 # the real layout still parses, exactly as before
+    assert len(entries) == 3 and entries[0].body == '<!-- SC_OFF --><div class="md"><p>xx-x xxx xxx xxx</p> </div><!-- SC_ON -->'
+
+
+@pytest.mark.parametrize("after,ok", [("t1_abc123", True), ("t1_" + "a" * 61, True), ("t1_" + "a" * 62, False), ("t1_\ud800", False),
+                                      ("t1 abc", False), ("t1_é", False), ("t1_a&b=c", False), ("t1_a/../b", False), (7, False), (None, None), ("", None)])
+def test_an_official_cursor_must_match_a_strict_pattern(after, ok):
+    doc = json.loads(LISTING_FIXTURE)
+    doc["data"]["after"] = after
+    data = json.dumps(doc).encode()
+    if ok is False:
+        with pytest.raises(cl.Unparseable):
+            cl.parse_listing(data)
+    else:
+        assert cl.parse_listing(data)[2] == (after if ok else None)
+
+
+def test_a_lone_surrogate_cursor_is_a_bad_answer_and_the_run_goes_on(tmp_path):
+    def pages(n, url):
+        body = listing([("t1_n%03d" % n, T0 + 3000 + n)], after="PLACEHOLDER").body.replace(b'"PLACEHOLDER"', b'"t1_\\ud800"')
+        return resp(200, body)
+    col, store, reddit, _, clock, _ = make(tmp_path, answer=oauth_answer(pages), env=CREDS)
+    feed(store, [entry("t1_stored", time_="2026-11-13T05:00:00Z")], T0 - 500)
+    run_for(col, clock, 300)                                             # does not raise
+    rows = store.rows("SELECT failure FROM comment_fetches WHERE purpose = 'feed' AND id > 1")
+    assert len(rows) == 5 and {r["failure"] for r in rows} == {"unparseable"}
+
+
+class GetRaises(dict):
+    def get(self, *a, **k):
+        raise RuntimeError("SECRET-TEXT-OF-THE-ERROR")
+
+
+def test_an_exception_while_handling_a_slot_is_a_failed_slot_with_its_class_name_and_the_run_goes_on(tmp_path, monkeypatch):
+    def answer(n, t, m, u):
+        r = resp(200, atom_with(atom_entry("t1_c%d" % n)))
+        if n == 2:
+            r.headers = GetRaises()
+        return r
+    calls = {"n": 0}
+    real_quote = cl.Collector._quote
+
+    def quote(self, m):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("SECRET-TEXT-OF-THE-ERROR")
+        return real_quote(self, m)
+    monkeypatch.setattr(cl.Collector, "_quote", quote)
+    col, store, reddit, kalshi, clock, _ = make(tmp_path, answer=answer)
+    run_for(col, clock, 1200)
+    f = store.rows("SELECT slot_ts, failure, request_id FROM comment_fetches ORDER BY id")
+    assert [r["failure"] for r in f][:3] == [None, "error_RuntimeError", None] and f[1]["request_id"] is not None
+    assert len(reddit.log) == 6                                          # 06:00 to 06:18, less the silence: the run went on
+    p = store.rows("SELECT series, failure FROM price_fetches ORDER BY id")
+    assert p[0]["failure"] == "error_RuntimeError" and all(r["failure"] is None for r in p[1:]) and len(p) == 100
+    store.close()
+    blob = b"".join(x.read_bytes() for x in tmp_path.glob("c.sqlite*"))
+    assert b"SECRET" not in blob
+
+
+def test_an_error_of_the_store_itself_still_stops_the_run_loudly(tmp_path, monkeypatch):
+    def broken(self, **kw):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(cl.Store, "save_price_fetch", broken)
+    code, out, _ = cli(tmp_path, ["run", "--db", str(tmp_path / "c.sqlite"), "--for-minutes", "5"])
+    assert code == 1 and "could not be written" in out
+
+
+def test_run_leaves_no_lock_file_beside_a_file_it_refused_and_keeps_one_it_did_not_make(tmp_path):
+    p = tmp_path / "c.sqlite"
+    cl.Store(p).close()
+    c = sqlite3.connect(str(p))
+    c.execute("DROP TRIGGER no_update_comment_versions")                # a valid header, the wrong layout
+    c.commit()
+    c.close()
+    code, out, _ = cli(tmp_path, ["run", "--db", str(p), "--for-minutes", "1"])
+    assert code == 1 and "not a chatter store" in out
+    assert not Path(str(p) + cl.LOCK_SUFFIX).exists()
+    with pytest.raises(cl.StoreError):
+        cl.Store(p, lock=True)
+    assert not Path(str(p) + cl.LOCK_SUFFIX).exists()
+    Path(str(p) + cl.LOCK_SUFFIX).write_bytes(b"")                      # one that was there before is not ours to remove
+    with pytest.raises(cl.StoreError):
+        cl.Store(p, lock=True)
+    assert Path(str(p) + cl.LOCK_SUFFIX).exists()
+
+
+def test_check_finds_requests_and_outcomes_that_do_not_belong_together(tmp_path):
+    for name, sql in (("an outcome of nothing", "INSERT INTO comment_fetches (fetched_at, slot_ts, backend, purpose, page, ok, failure, "
+                                                 "request_id) VALUES ('2099-01-01T00:00:00.000Z', 0, 'public', 'feed', 1, 0, 'unknown', 999)"),
+                      ("two outcomes of one", "INSERT INTO comment_fetches (fetched_at, slot_ts, backend, purpose, page, ok, failure, "
+                                              "request_id) SELECT '2099-01-01T00:00:00.000Z', slot_ts, backend, purpose, page, 0, 'unknown', "
+                                              "request_id FROM comment_fetches WHERE request_id IS NOT NULL LIMIT 1"),
+                      ("an outcome of another slot's request", "INSERT INTO comment_fetches (fetched_at, slot_ts, backend, purpose, page, "
+                                                               "ok, failure, request_id) SELECT '2099-01-01T00:00:00.000Z', slot_ts + 120, "
+                                                               "backend, purpose, page, 0, 'unknown', MAX(id) FROM requests "
+                                                               "WHERE service = 'reddit'"),
+                      ("a price outcome of nothing", "INSERT INTO price_fetches (fetched_at, slot_ts, series, ok, failure, request_id) "
+                                                     "VALUES ('2099-01-01T00:00:00.000Z', 0, 'KXNBAGAME', 0, 'unknown', 999)")):
+        sub = tmp_path / name.replace(" ", "_")
+        sub.mkdir()
+        col, store, *_ = make(sub)
+        run_for(col, col.clock, 600)
+        assert cl.verify(store) == []
+        store.conn.execute(sql)
+        assert any("request" in p for p in cl.verify(store)), name
+        store.close()
