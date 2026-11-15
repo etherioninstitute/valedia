@@ -327,3 +327,12 @@ store. The proving run was stopped by its own guard seven minutes in, when a mod
 appeared in this Mac's list of loaded models; nothing was wrong with the collector or with this Mac's memory. The four
 stops of 15 November total 2 hours 43 minutes 23 seconds, 11.3% of the day's slots before the overruns already noted.
 A further attempt at the same run, if the owner asks for one, is declared here before it happens.
+
+## A fifth stop on 15 November, for a second attempt at the proving run (written at 20:30 UTC, 12:30 PST, before the stop; no answer has been scored)
+
+The owner has switched off the link to the other computer whose model stopped the first attempt, and has asked for
+the same 8-participant run again. The collector will be stopped for it once more, and is to be running again no later
+than 1 hour 55 minutes after that stop, whatever the run does; the run is expected to take about 75 minutes. With the
+four earlier stops that is 4 hours 38 minutes of 15 November at the most, 19.3% of the day's slots, and about 4 hours
+3 minutes (16.9%) at the expected length; the day's own count decides whether it counts. No third attempt will be made
+on 15 November (UTC). The exact times are added below afterwards.
