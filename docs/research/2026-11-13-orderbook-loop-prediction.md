@@ -364,3 +364,12 @@ The owner cancelled the 48-participant run before it began, and the collector wa
 break since 21:22:34 UTC. The stops of 15 November remain the five recorded above, 3 hours 33 minutes 29 seconds in
 all, 14.8% of the day's slots before the overruns already noted. A later run of this kind is declared here before it
 happens.
+
+## Seven late decisions at 22:17 to 22:21 UTC on 15 November (written at 22:23 UTC; no answer has been scored)
+
+Between 22:15 and 22:22 UTC the lead ran a comparison of two builds of the model on invented market states, and sent
+thirty of its requests to the collector's own model in Ollama, one after another. The collector's calls waited behind
+them, memory was short at the same time (20 to 28% free), and seven decisions (slots 22:17 to 22:21) missed the
+ten-second limit and are marked late. Nothing was read from the store for that comparison beyond counts, times and
+status. They are lost slots like any other. The fault was the lead's: no test sends requests to the collector's own
+model again while it is collecting.
