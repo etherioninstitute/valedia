@@ -253,3 +253,15 @@ confirmed the commit changes that constant and nothing else, and that every requ
 exactly the new header. What is asked, how often, the questions put to the model and what is stored do not
 change. The replacement is one restart of the collector, the stop and the start both in the store; any decision
 slot lost in that minute is counted as lost like any other. The test period still runs on one revision.
+
+## Collector stopped on purpose during the development period (2026-11-15 UTC; written at 06:35 UTC, 22:35 PST on 14 November, before the stop; no answer has been scored)
+
+On the owner's instruction of 2026-11-14 one small MiroFish run is made tonight. That run needs the machine's
+local model memory to itself: it refuses to start with less than 65% of memory free and stops if another language
+model is loaded while it runs, and the collector's model alone holds 17.6 GB of this Mac's 64. So the collector is
+stopped on purpose for the length of that run: about 25 minutes are expected, and it is to be running again within
+45 minutes of the stop whatever the run does. Nothing about the collector changes: the same pinned revision
+(4133f56) is started again by the same job, and the stop and the start are both in the store. Every decision slot
+in between is lost and is counted as lost like any other; whether 15 November counts as a day is decided by its own
+count of slots under clarification 2, as written. The exact times of the stop and the start are added below when
+they are known. A longer stop for a larger run, if the owner wants one, is declared here before it happens.
