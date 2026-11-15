@@ -3234,14 +3234,59 @@ def _damaged_text(kind="profile", symbol="AAA"):
     return "a stored %s row for %s does not match its hash; the store is damaged" % (kind, symbol)
 
 
+REFERENCE_COMMIT = "530ccce"                     # the commit that last changed the module before T36a (rev 4)
+REFERENCE_FILE = "valedia_trader/data_and_fees/company_facts.py"
+_SESSION = {}
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _session_tmp(tmp_path_factory):
+    """Where the reference module read from git is written, once per session: a pytest temporary directory, never the
+    repository."""
+    _SESSION["tmp"] = tmp_path_factory
+    yield
+
+
+def _reference_from_git() -> str:
+    """The reference module's text from `git show REFERENCE_COMMIT:REFERENCE_FILE` in $CF_REFERENCE_REPO (default: the
+    repository this file is in), written once per session to a pytest temporary file; skips, saying why, when git, the
+    repository or the commit is not available. Only `git show` is run, and it only reads."""
+    if "git_path" in _SESSION:
+        return _SESSION["git_path"]
+    repo = os.environ.get("CF_REFERENCE_REPO") or str(Path(__file__).resolve().parents[2])
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("the reference module (rev 4): git is not available, and no $CF_REFERENCE_MODULE or side file")
+    if not os.path.isdir(repo):
+        pytest.skip("the reference module (rev 4): the repository %s is not there" % repo)
+    try:
+        p = subprocess.run([git, "--no-pager", "-C", repo, "show", "%s:%s" % (REFERENCE_COMMIT, REFERENCE_FILE)],
+                           capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0"))
+    except (OSError, subprocess.SubprocessError) as e:
+        pytest.skip("the reference module (rev 4): git could not be run: %s" % e)
+    if p.returncode != 0:
+        why = (p.stderr.decode("utf-8", "replace").strip().splitlines() or ["no message"])[0]
+        what = "is not a git repository" if "not a git repository" in why else "has not got commit %s (or its %s)" % (
+            REFERENCE_COMMIT, REFERENCE_FILE)
+        pytest.skip("the reference module (rev 4): %s %s: git said: %s" % (repo, what, why))
+    path = _SESSION["tmp"].mktemp("cf_reference") / "rev4_company_facts.py"
+    path.write_bytes(p.stdout)
+    _SESSION["git_path"] = str(path)
+    return str(path)
+
+
 def _reference_module():
     """The module exactly as it was before T36a (rev 4), loaded under another name: the measure of "exactly as today".
-    Found at $CF_REFERENCE_MODULE, or beside the repository as rev4_company_facts.py; a test that needs it skips without it."""
-    path = os.environ.get("CF_REFERENCE_MODULE") or str(Path(__file__).resolve().parents[3] / "rev4_company_facts.py")
-    if not os.path.isfile(path):
-        pytest.skip("the reference module (rev 4) is not here: %s" % path)
+    Found at $CF_REFERENCE_MODULE, else beside the repository as rev4_company_facts.py, else read from git (commit
+    REFERENCE_COMMIT of $CF_REFERENCE_REPO or of this repository); a test that needs it skips, saying why, without all three."""
     name = "cf_rev4_reference"
     if name not in sys.modules:
+        path = os.environ.get("CF_REFERENCE_MODULE") or str(Path(__file__).resolve().parents[3] / "rev4_company_facts.py")
+        if not os.environ.get("CF_REFERENCE_MODULE") and not os.path.isfile(path):
+            path = _reference_from_git()
+        if not os.path.isfile(path):
+            pytest.skip("the reference module (rev 4) is not here: %s" % path)
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
