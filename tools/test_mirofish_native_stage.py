@@ -200,7 +200,11 @@ class NativeStaging(unittest.TestCase):
         # The -a folders were staged by the tool before addendum 2 and are left as they are; the -b twins are the repaired tool's proof.
         for name,folder in [('swarm48',s.CREW/'valedia-native-20261115-swarm48-b'),('swarm8',s.CREW/'valedia-native-20261115-swarm8-b')]:
             if not (folder/'builder/candidate-manifest.json').exists():self.skipTest('staged folders follow tests')
-            manifest=json.loads((folder/'builder/candidate-manifest.json').read_text());n=s.swarm_numbers(name);p=manifest['swarm_profile']
+            # TMF3: swarm48-b was staged at the ratio 1.25; the 1.30 ruling moves its wall, so it is checked against 1.25 and must be restaged before any launch.
+            original=s.LIMITS.RATIO_ASSUMED;s.LIMITS.RATIO_ASSUMED=1.25 if name=='swarm48' else original
+            try:n=s.swarm_numbers(name)
+            finally:s.LIMITS.RATIO_ASSUMED=original
+            manifest=json.loads((folder/'builder/candidate-manifest.json').read_text());p=manifest['swarm_profile']
             self.assertEqual((p['name'],p['memory_budget'],p['caller_output'],p['wall'],p['chats']),(name,n['memory_budget'],4096,n['wall'],n['chats']));self.assertFalse(manifest['launch_authorized'])
             self.assertEqual(p['memory_replacement']['canonical_sha256'],s.MEMORY_CANONICAL_SHA);self.assertEqual(p['memory_replacement']['replacement_sha256'],s.MEMORY_REPLACEMENT_SHA)
             self.assertEqual((folder/s.MEMORY_REL).read_bytes(),s.swarm_memory_bytes((s.W16/s.MEMORY_REL).read_bytes(),name))

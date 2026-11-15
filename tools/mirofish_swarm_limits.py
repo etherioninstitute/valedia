@@ -14,7 +14,8 @@ READ_TOKENS_PER_S = 188.0     # prompt tokens read a second: fit over 288 comple
 WRITE_TOKENS_PER_S = 23.6     # reply tokens written a second: same fit
 OVERSHOOT_S = 27.0            # the largest amount any of those 288 calls took beyond the fitted line
 RATIO_MEASURED = 1.131        # real prompt tokens per agent-library token: 217 completed agent turns of the stopped run
-RATIO_ASSUMED = 1.25          # the same ratio assumed for safety (a feed is JSON-heavy and may tokenise worse)
+RATIO_ASSUMED = 1.30          # the same ratio assumed for safety (TMF3 addendum 1: raised from 1.25, since one platform of the
+                              # 8B proving run measured 1.241 on the 27B's tokenizer, which left 1.25 no margin)
 OVERHEAD_LARGE = 1750         # tools + template tokens on the platform with the larger tool list (stopped run)
 OVERHEAD_SMALL = 830          # the same on the platform with the smaller tool list (stopped run)
 BYTES_PER_TOKEN_MAX = 5.28    # request bytes per real prompt token, largest over the 225 agent requests of the stopped run
@@ -24,6 +25,40 @@ BYTES_PER_TOKEN_MAX = 5.28    # request bytes per real prompt token, largest ove
 # a 4-byte one 12). Computed from the vocabulary itself (test_mirofish_swarm_limits.py), so it bounds every text the model
 # writes, whatever its language: a reply of N tokens is at most 144 N bytes in the worker's event line.
 ESCAPED_BYTES_PER_TOKEN = 144
+
+# ---- Per model (TMF3, 2026-11-15) -----------------------------------------------------------------------------------------
+# A LIMIT (call slot, arrival-to-done, queue, client timeouts, request and event bytes, model calls, output) is an upper bound
+# and stays derived from the 27B's constants above for every model: a faster model only finishes sooner. EXPECTED durations
+# and the wall clock use the chosen model's own speeds. The memory window inequality stays the 27B's: the 8B needs fewer real
+# tokens for the same request (token_ratio_to_27b below), so a budget that fits the 27B fits the 8B.
+DEFAULT_MODEL = 'qwen3.8-27b'
+PLAIN_READ_27B = 260.0        # the 27B's prompt tokens a second through plain LM Studio, against 188 inside the pipeline
+PIPELINE_DISCOUNT = READ_TOKENS_PER_S / PLAIN_READ_27B   # 0.723: what the pipeline (admission, the C++ runtime) cost the 27B
+MODELS = {
+    'qwen3.8-27b': {'read_tps': READ_TOKENS_PER_S, 'write_tps': WRITE_TOKENS_PER_S, 'token_ratio_to_27b': 1.0,
+                    'speed_source': 'measured inside the pipeline: fit over 288 completed calls of the stopped run (R2 0.97)'},
+    # Plain LM Studio beside the live collector, 44 real agent turns of the 2026-11-15 proving run: 1,208 read, 46.3 written a
+    # second. Both are discounted by the 27B's plain-to-pipeline read ratio (no write ratio was measured for the 27B, so the
+    # read ratio is used for both; it is the larger discount and so the longer estimate). An ESTIMATE until a run.
+    'qwen3-8b': {'read_tps': 1208.0 * PIPELINE_DISCOUNT, 'write_tps': 46.3 * PIPELINE_DISCOUNT, 'token_ratio_to_27b': 0.950,
+                 'speed_source': 'ESTIMATE until a run: plain-server 1,208 read and 46.3 written a second (44 agent turns, '
+                                 '2026-11-15) x 188/260, the 27B\'s plain-to-pipeline read ratio'},
+}
+# The 8B's real prompt tokens per 27B real token for the same 44 request bodies (its reported usage.prompt_tokens against the
+# 27B admission's count): reddit median 0.939, largest 0.950; twitter median 0.918, largest 0.931. The largest is used.
+INSTALLED_MEMORY_BYTES = 68719476736   # this Mac (sysctl hw.memsize, 64 GiB)
+MODEL_HEADROOM_BYTES = 6 * 2**30       # what the run needs besides the weights at its start (TMF3 ticket, outcome 5)
+REVIEWED_START_THRESHOLD = 65          # the reviewed start rule for the 27B (mirofish_native_run.py:380); it stays for the 27B
+
+
+def start_threshold(model, weight_bytes):
+    """Free memory, percent, the run needs before it starts: 30 + ceil(100 x (weights + 6 GiB) / installed memory). The 27B
+    keeps its reviewed 65 (the formula gives 67 for it), so its staged bytes do not change. The 30% stop floor and the 40 GiB
+    resident-memory bound are not derived here and do not change."""
+    if model == DEFAULT_MODEL:
+        return REVIEWED_START_THRESHOLD
+    return 30 + math.ceil(100 * (weight_bytes + MODEL_HEADROOM_BYTES) / INSTALLED_MEMORY_BYTES - 1e-12)
+
 
 # ---- Fixed by the reviewed code (not tunable here) ----------------------------------------------------------------------
 PLATFORMS = 2                 # twitter and reddit run side by side (run_parallel_simulation.py, platform 'parallel')
@@ -99,21 +134,29 @@ def largest_budget(reply_cap=AGENT_REPLY_CAP):
     return math.floor((WINDOW - OVERHEAD_LARGE - reply_cap) / RATIO_ASSUMED)
 
 
-def call_seconds(prompt_real, reply):
-    return prompt_real / READ_TOKENS_PER_S + reply / WRITE_TOKENS_PER_S
+def call_seconds(prompt_real, reply, model=DEFAULT_MODEL):
+    speed = MODELS[model]
+    return prompt_real / speed['read_tps'] + reply / speed['write_tps']
 
 
-def expected_round_seconds(budget, round_number):
+def phase_scale(model=DEFAULT_MODEL):
+    """Setup and report phase times were measured on the 27B and are mostly writing (personas, ontology, config, report
+    text), so another model's are scaled by the ratio of written tokens a second."""
+    return MODELS[DEFAULT_MODEL]['write_tps'] / MODELS[model]['write_tps']
+
+
+def expected_round_seconds(budget, round_number, model=DEFAULT_MODEL):
     """Expected time of one agent call in round 1, 2, 3...: persona plus every feed so far, capped by the memory budget."""
     record = AGENT_REPLY_MEAN + TOOL_RESULT_LIBRARY
     library = min(budget, PERSONA_LIBRARY_MEDIAN + round_number * (FEED_LIBRARY_MEDIAN + record))
     prompt = RATIO_MEASURED * library + (OVERHEAD_LARGE + OVERHEAD_SMALL) / 2
-    return call_seconds(prompt, AGENT_REPLY_MEAN)
+    return call_seconds(prompt, AGENT_REPLY_MEAN, model)
 
 
-def ceiling_call_seconds(budget):
-    """One agent call with its memory full at the assumed ratio on the larger platform, at the mean reply."""
-    return call_seconds(RATIO_ASSUMED * budget + OVERHEAD_LARGE, AGENT_REPLY_MEAN)
+def ceiling_call_seconds(budget, model=DEFAULT_MODEL):
+    """One agent call with its memory full at the assumed ratio on the larger platform, at the mean reply. The prompt is
+    counted in the 27B's tokens, which a smaller model of this family does not exceed."""
+    return call_seconds(RATIO_ASSUMED * budget + OVERHEAD_LARGE, AGENT_REPLY_MEAN, model)
 
 
 def action_text_tokens():
@@ -133,13 +176,18 @@ def worker_event_bytes():
     return ceil_to(MARGIN * (max(wait_event_bound(), FIXED_EVENT_BYTES) + 1), EVENT_STEP)
 
 
-def derive(profile):
+def derive(profile, model=DEFAULT_MODEL):
     """All numbers for one swarm profile from its closed inputs: actors, agents_bound, rounds, memory_budget. Expected
     figures use the named actors times the measured growth; ceilings, the wall and every budget use the participant bound,
-    so they hold for anything the bound admits."""
+    so they hold for anything the bound admits. Limits use the 27B's constants; expected durations and the wall use the
+    chosen model's speeds (TMF3)."""
+    require_model(model)
     actors, rounds, budget, bound = profile['actors'], profile['rounds'], profile['memory_budget'], profile['agents_bound']
     agents = math.ceil(actors * GROWTH - 1e-9)
-    out = {'expected_agents': agents}
+    scale = phase_scale(model)
+    out = {'expected_agents': agents, 'model': model, 'read_tps': round(MODELS[model]['read_tps'], 1),
+           'write_tps': round(MODELS[model]['write_tps'], 1), 'phase_scale': round(scale, 3),
+           'token_ratio_to_27b': MODELS[model]['token_ratio_to_27b']}
     # Memory and window.
     out['window_need'] = window_need(budget)
     out['largest_budget'] = largest_budget()
@@ -169,12 +217,12 @@ def derive(profile):
                bound_turns=bound_turns, bound_sim_chats=bound_sim_chats, bound_chats=bound_chats,
                chats=chats, reserve_need=reserve, output=ceil_to(reserve, OUTPUT_STEP))
     # Durations by phase, and the wall clock.
-    setup_s = SETUP_GRAPH_S + (agents + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S
-    ceiling_setup = SETUP_GRAPH_S + (bound + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S
+    setup_s = (SETUP_GRAPH_S + (agents + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S) * scale
+    ceiling_setup = (SETUP_GRAPH_S + (bound + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S) * scale
     per_round = turns / rounds * CALLS_PER_TURN
-    expected_rounds = [per_round * expected_round_seconds(budget, r) for r in range(1, rounds + 1)]
-    ceiling_sim = bound_sim_chats * ceiling_call_seconds(budget)
-    report_s = REPORT_MEASURED_S * REPORT_SCALE_ASSUMED
+    expected_rounds = [per_round * expected_round_seconds(budget, r, model) for r in range(1, rounds + 1)]
+    ceiling_sim = bound_sim_chats * ceiling_call_seconds(budget, model)
+    report_s = REPORT_MEASURED_S * REPORT_SCALE_ASSUMED * scale
     expected_total = START_S + setup_s + sum(expected_rounds) + report_s + CLEANUP_S
     ceiling_total = START_S + ceiling_setup + ceiling_sim + report_s + CLEANUP_S
     wall = ceil_to(DURATION_MARGIN * ceiling_total, WALL_STEP_S)
@@ -186,11 +234,17 @@ def derive(profile):
     return out
 
 
-def violations(profile, d=None):
+def require_model(model):
+    if model not in MODELS:
+        raise ValueError('no measured limits for model %r; known: %s' % (model, sorted(MODELS)))
+
+
+def violations(profile, d=None, model=DEFAULT_MODEL):
     """Every coupling inequality; an empty list means the profile is consistent. Each entry names the broken inequality."""
-    d = d or derive(profile)
+    d = d or derive(profile, model)
     checks = [
-        ('memory budget fits the window at the assumed ratio: 1.25 B + 1750 + 1024 <= 32768', d['window_need'] <= WINDOW),
+        ('memory budget fits the window at the assumed ratio: %.2f B + 1750 + 1024 <= 32768' % RATIO_ASSUMED, d['window_need'] <= WINDOW),
+        ('the chosen model needs no more real tokens than the 27B the window was measured on', MODELS[d['model']]['token_ratio_to_27b'] <= 1.0),
         ('largest persona fits the memory budget with room for a feed', PERSONA_LIBRARY_MAX < profile['memory_budget']),
         ('a call slot is the worst single call plus 10%', d['agent_slot_s'] >= MARGIN * d['agent_worst_s'] and d['caller_slot_s'] >= MARGIN * d['caller_worst_s']),
         ('gateway arrival-to-done covers every agent call in flight', d['gateway_arrival_s'] >= d['agents_in_flight'] * d['agent_slot_s']),
