@@ -336,3 +336,12 @@ than 1 hour 55 minutes after that stop, whatever the run does; the run is expect
 four earlier stops that is 4 hours 38 minutes of 15 November at the most, 19.3% of the day's slots, and about 4 hours
 3 minutes (16.9%) at the expected length; the day's own count decides whether it counts. No third attempt will be made
 on 15 November (UTC). The exact times are added below afterwards.
+
+## The fifth stop's times (written at 21:27 UTC on 15 November, after the stop; no answer has been scored)
+
+The fifth stop lasted 50 minutes 6 seconds: the collector was stopped at 20:32:28 UTC and started again at 21:22:34
+UTC on 15 November, its last heartbeat before the stop at 20:32:21 and its first new one at 21:23:19; both are in the
+store. The proving run made every one of its model calls and ended by itself, 65 minutes inside the limit. The five
+stops of 15 November total 3 hours 33 minutes 29 seconds, 14.8% of the day's slots before the overruns already noted,
+and the day's own count decides whether it counts. No further stop is planned for 15 November (UTC); a later run of
+this kind is declared here before it happens.
