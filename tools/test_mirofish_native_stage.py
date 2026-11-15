@@ -151,6 +151,18 @@ class NativeStaging(unittest.TestCase):
         with self.assertRaises(RuntimeError):s.sdk_port_policy(policy+policy,59671)                    # ambiguous
         pathy=policy+'(allow file-read* (subpath "/work/run-p59671"))\n';self.assertIn('"localhost:59671"',s.sdk_port_policy(pathy,59671))  # the digits in a folder name are not a rule
         with self.assertRaises(RuntimeError):s.sdk_port_policy(moved+'(allow network-outbound (remote ip "localhost:62298"))\n',59671)  # the new rule is already there
+    def test_ssd_device_is_one_integer_in_the_startup_source_and_only_follows_the_mounted_ssd(self):
+        raw=(s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes();changed=s.ssd_device_bytes(raw,16777245);before,after=s.integer_literals(raw),s.integer_literals(changed)
+        self.assertEqual(sum(a!=b for a,b in zip(before,after)),1);self.assertIn(b'CACHE_DEVICE=16777245',changed);self.assertNotIn(b'16777246',changed)
+        for bad in (s.ORIGINAL_CACHE_DEVICE,0,-1,True,'16777245',16777245.0):
+            with self.assertRaises(RuntimeError):s.ssd_device_bytes(raw,bad)
+        with self.assertRaisesRegex(RuntimeError,'original source drift'):s.ssd_device_bytes(raw+b'\n',16777245)
+        swarm=s.swarm_startup_bytes(raw,'swarm48');both=s.ssd_device_bytes(swarm,16777245,hashlib.sha256(swarm).hexdigest())  # a swarm copy takes both deltas
+        for text in [b'CACHE_DEVICE=16777245',b'MAX_RECORDS=36001',b'(30 if preflight else 14400)']:self.assertIn(text,both)
+        self.assertEqual(s.live_ssd_device(),s.CACHE_TARGET.stat().st_dev);self.assertEqual(s.live_ssd_device(),s.SSD_MOUNT.stat().st_dev)  # read as the launcher reads it
+        with self.assertRaisesRegex(RuntimeError,'not on the SSD'):s.live_ssd_device(target=Path.home())  # a folder on another volume is never patched in
+        with self.assertRaisesRegex(RuntimeError,'missing'):s.live_ssd_device(target=s.BASE/'cache/bionic/no-such-prompt-cache')
+        with self.assertRaisesRegex(RuntimeError,'not mounted'):s.live_ssd_device(mount=s.BASE)  # a plain folder is not the SSD's mount
     def test_compact_prompt_changes_one_ast_constant_and_refuses_source_drift(self):
         source=s.W16/s.ONTOLOGY_REL;raw=source.read_bytes();changed=s.compact_ontology_bytes(raw);self.assertNotEqual(raw,changed)
         old=ast.parse(raw);new=ast.parse(changed)
