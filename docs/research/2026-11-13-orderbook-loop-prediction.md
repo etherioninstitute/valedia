@@ -265,3 +265,13 @@ stopped on purpose for the length of that run: about 25 minutes are expected, an
 in between is lost and is counted as lost like any other; whether 15 November counts as a day is decided by its own
 count of slots under clarification 2, as written. The exact times of the stop and the start are added below when
 they are known. A longer stop for a larger run, if the owner wants one, is declared here before it happens.
+
+## The same stop extended for the 48-agent run (written at 06:41 UTC, 22:41 PST on 14 November, before the extension; no answer has been scored)
+
+Asked whether the 48-agent run should follow tonight or wait for Sunday afternoon, and told that a long stop inside
+one UTC day could cost that day under clarification 2, the owner answered "Tonight". So the stop declared above is
+extended: when the small run has completed, the 48-agent run (one attempt, its own limit four hours) follows at once
+with the collector still stopped. The collector is to be running again no later than 4 hours 35 minutes after its
+stop, whatever the run does: that is 19.1% of a day's slots, so 15 November can still reach 80% if little else is
+lost, and its own count decides. If the small run does not complete, the larger one is not started and the first
+declaration's 45 minutes stand. Nothing about the collector changes; the stop and the start are in the store.
