@@ -96,7 +96,7 @@ def test_apply_env_file_changes_only_model_keys(tmp_path):
         mm.apply_env_file(tmp_path / "missing.env", mm.PROFILES["qwen3-8b"])
 
 
-@pytest.mark.parametrize("name", ["qwen3.8-27b", "qwen3-8b"])
+@pytest.mark.parametrize("name", ["qwen3.8-27b", "qwen3-8b", "ternary-bonsai-2-27b"])
 def test_profiles_are_ready_on_this_machine(name):
     p = mm.PROFILES[name]
     if not p.weight_file.exists():
@@ -132,14 +132,77 @@ def assets(tmp_path, size=2048):
     return weights, tok
 
 
-def test_add_registers_a_native_model_with_pins_and_use_selects_it(tmp_path):
+@pytest.fixture
+def root(tmp_path, monkeypatch):
+    """Registered native files must lie under the models root; tests that register files make tmp_path that root."""
+    monkeypatch.setattr(mm, "MODEL_ROOT", tmp_path)
+    return tmp_path
+
+
+def test_builtins_are_the_native_modules_builtins_and_bonsai_matches_its_pins(tmp_path):
+    code = ("import json, mirofish_native_model as m; p=m.MODEL_PROFILES['ternary-bonsai-2-27b']; print(json.dumps({'builtins': "
+            "list(m.BUILTIN_PROFILES), 'weight_file': str(p['weight_file']), 'weight_bytes': p['weight_bytes'], 'sha': p['weight_sha256'], "
+            "'tokenizer_root': str(p['tokenizer_root']), 'key': p['gguf_selection']['modelKey'], 'context': p['gguf_selection']['maxContextLength']}))")
+    for name in ("mirofish_native_model.py", "mirofish_native_gateway.py"):
+        shutil.copy2(SRC / name, tmp_path / name)
+    out = subprocess.run([sys.executable, "-B", "-c", code], cwd=tmp_path, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[-400:]
+    seen, p = json.loads(out.stdout), mm.PROFILES["ternary-bonsai-2-27b"]
+    assert seen["builtins"] == list(mm.PROFILES) == ["qwen3.8-27b", "qwen3-8b", "ternary-bonsai-2-27b"]
+    assert (seen["weight_file"], seen["weight_bytes"], seen["sha"]) == (str(p.weight_file), p.weight_bytes, p.weight_sha256)
+    assert (seen["tokenizer_root"], seen["key"], seen["context"]) == (str(p.tokenizer_root), p.lmstudio_key, p.max_context)
+    assert not p.native_reference and p.native and p.builtin and p.ollama_tag is None
+
+
+def test_add_refuses_files_outside_the_models_root(tmp_path):
+    weights, tok = assets(tmp_path)
+    with pytest.raises(mm.ProfileError, match="models root"):
+        mm.add("my-model", "my-gguf", weights, tok, listing=LISTING, registry_file=tmp_path / "registry.json")
+    assert not (tmp_path / "registry.json").exists()
+
+
+def native_row(**changes):
+    row = {"native": True, "description": "test", "lmstudio_key": "my-gguf", "ollama_tag": None, "max_context": 40960,
+           "weight_file": str(mm.MODEL_ROOT / "tmf4-test-only/model.gguf"), "weight_bytes": 2048, "weight_sha256": "1" * 64,
+           "tokenizer_root": str(mm.MODEL_ROOT / "tmf4-test-only/tokenizer"), "tokenizer_model_type": "qwen3",
+           "tokenizer_quant_bits": None, "gguf_selection": {k: LISTING["my-gguf"][k] for k in mm._SELECTION_KEYS}}
+    row["gguf_selection"]["deviceIdentifier"] = None
+    row.update(changes)
+    return row
+
+
+@pytest.mark.parametrize("text", [
+    "{", "[]", '{"profiles": {"x1": 1}}',
+    json.dumps({"profiles": {"qwen3-8b": {"native": False}}}), json.dumps({"profiles": {"small": {"native": False}}}),
+    json.dumps({"profiles": {"Bad Name": {"native": False}}}), json.dumps({"profiles": {"m1": native_row(native="yes")}}),
+    json.dumps({"profiles": {"m1": native_row(weight_sha256="Z" * 64)}}), json.dumps({"profiles": {"m1": native_row(weight_bytes="2048")}}),
+    json.dumps({"profiles": {"m1": native_row(weight_bytes=True)}}),
+    json.dumps({"profiles": {"m1": native_row(weight_file="/tmp/model.gguf")}}),
+    json.dumps({"profiles": {"m1": native_row(tokenizer_root=str(mm.MODEL_ROOT / "../valedia-trader"))}}),
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={"modelKey": "my-gguf"})}}),
+])
+def test_a_malformed_registry_refuses_with_the_tool_refusal(tmp_path, text):
+    reg = tmp_path / "registry.json"
+    reg.write_text(text)
+    with pytest.raises(mm.ProfileError):
+        mm.profiles(reg)
+
+
+def test_a_wellformed_registered_native_row_reads(tmp_path):
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps({"profiles": {"m1": native_row()}}))
+    p = mm.profiles(reg)["m1"]
+    assert p.native and not p.builtin and p.weight_file == mm.MODEL_ROOT / "tmf4-test-only/model.gguf" and p.weight_bytes == 2048
+
+
+def test_add_registers_a_native_model_with_pins_and_use_selects_it(tmp_path, root):
     reg, switch = tmp_path / "registry.json", tmp_path / "profile.json"
     weights, tok = assets(tmp_path)
     p = mm.add("My-Model", "my-gguf", weights, tok, description="a test checkpoint", listing=LISTING, registry_file=reg)
     assert p.name == "my-model" and p.native and not p.builtin and p.weight_bytes == 2048 and len(p.weight_sha256) == 64
     assert p.extra["gguf_selection"]["modelKey"] == "my-gguf" and p.extra["gguf_selection"]["deviceIdentifier"] is None
     assert p.extra["tokenizer_model_type"] == "qwen3" and p.max_context == 40960
-    assert set(mm.profiles(reg)) == {"qwen3-8b", "qwen3.8-27b", "my-model"}
+    assert set(mm.profiles(reg)) == {"qwen3-8b", "qwen3.8-27b", "ternary-bonsai-2-27b", "my-model"}
     assert mm.use("my-model", switch, reg).name == "my-model" and mm.active(switch, {}, reg).name == "my-model"
     assert mm.active(switch, {mm.ENV_VAR: "8b"}, reg).name == "qwen3-8b"            # per-process override still wins
     assert mm.verify(p, check_hash=True, probe_servers=False)["ready"]
@@ -175,7 +238,7 @@ def test_http_only_models_can_be_selected_but_are_not_native(tmp_path):
     ({"name": "wrongkey", "lmstudio_key": "org/mlx-model", "weights": "W", "tokenizer": "TOK"}, "lists as a GGUF"),
     ({"name": "notok", "lmstudio_key": "my-gguf", "weights": "W", "tokenizer": "EMPTY"}, "tokenizer directory lacks"),
 ])
-def test_add_refuses_incomplete_or_mismatched_models(tmp_path, kwargs, message):
+def test_add_refuses_incomplete_or_mismatched_models(tmp_path, root, kwargs, message):
     weights, tok = assets(tmp_path)
     (tmp_path / "empty").mkdir()
     swap = {"W": weights, "TOK": tok, "EMPTY": tmp_path / "empty"}
@@ -185,7 +248,7 @@ def test_add_refuses_incomplete_or_mismatched_models(tmp_path, kwargs, message):
     assert not (tmp_path / "registry.json").exists()
 
 
-def test_add_checks_the_file_is_the_one_the_server_lists_and_fits_the_native_context(tmp_path):
+def test_add_checks_the_file_is_the_one_the_server_lists_and_fits_the_native_context(tmp_path, root):
     weights, tok = assets(tmp_path, size=999)
     with pytest.raises(mm.ProfileError, match="sizes differ"):
         mm.add("other-file", "my-gguf", weights, tok, listing=LISTING, registry_file=tmp_path / "r.json")
@@ -200,20 +263,25 @@ def test_add_checks_the_file_is_the_one_the_server_lists_and_fits_the_native_con
 
 def test_native_pipeline_runs_a_registered_checkpoint_and_refuses_http_only_ones(tmp_path):
     reg = tmp_path / "mirofish_model_registry.json"                                # the name the native module reads
-    weights, tok = assets(tmp_path)
-    p = mm.add("my-model", "my-gguf", weights, tok, listing=LISTING, registry_file=reg)
-    mm.add("mlx-27b", "org/mlx-model", listing=LISTING, registry_file=reg)
-    mm.add("qwen3-8b-copy", "my-gguf", weights, tok, listing=LISTING, registry_file=reg)
+    rows = {"my-model": native_row(), "mlx-27b": {"native": False, "lmstudio_key": "org/mlx-model", "max_context": 262144},
+            "qwen3-8b-copy": native_row()}
+    reg.write_text(json.dumps({"profiles": rows}))
     out = native_view(tmp_path, "my-model")
     assert out.returncode == 0, out.stderr[-400:]
     seen = json.loads(out.stdout)
-    assert seen["profile"] == "my-model" and seen["key"] == "my-gguf" and seen["weight_file"] == str(p.weight_file)
-    assert seen["weight_bytes"] == seen["sel_bytes"] == 2048 and seen["weight_sha256"] == seen["sel_sha"] == p.weight_sha256
+    assert seen["profile"] == "my-model" and seen["key"] == "my-gguf" and seen["weight_file"] == rows["my-model"]["weight_file"]
+    assert seen["weight_bytes"] == seen["sel_bytes"] == 2048 and seen["weight_sha256"] == seen["sel_sha"] == "1" * 64
     assert seen["script_has_pin"] and not seen["placeholders_left"]
     refused = native_view(tmp_path, "mlx-27b")
     assert refused.returncode != 0 and "HTTP backends only" in refused.stderr
     builtin = native_view(tmp_path, "qwen3-8b")                                    # a registry cannot shadow a built-in
     assert json.loads(builtin.stdout)["weight_sha256"] == mm.PROFILES["qwen3-8b"].weight_sha256
+    reg.write_text(json.dumps({"profiles": {"qwen3-8b": native_row()}}))         # and naming one refuses the registry
+    shadow = native_view(tmp_path, "qwen3-8b")
+    assert shadow.returncode != 0 and "NativeRefused" in shadow.stderr and "built-in" in shadow.stderr
+    reg.write_text(json.dumps({"profiles": {"far-away": native_row(weight_file=str(tmp_path / "model.gguf"))}}))
+    outside = native_view(tmp_path, "qwen3-8b")                                    # registered files lie under the models root
+    assert outside.returncode != 0 and "NativeRefused" in outside.stderr and "models root" in outside.stderr
 
 
 def test_cli_add_use_status_remove(tmp_path, monkeypatch, capsys):
