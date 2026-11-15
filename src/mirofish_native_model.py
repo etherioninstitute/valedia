@@ -1,25 +1,31 @@
 """Trusted, fixed-local SDK ownership and full-template context admission.
 
 No SDK client, model, tokenizer, or service is created at import. The helper is
-outside the producer sandbox and supports only the frozen local checkpoint,
-already-loaded embedding instance and metadata/tokenization/embedding operations.
+outside the producer sandbox and supports only the frozen local checkpoints of the
+selected profile or plan, the already-loaded embedding instance and
+metadata/tokenization/embedding operations.
 """
 from __future__ import annotations
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import subprocess
 import time
 import uuid
 from mirofish_native_gateway import NativeRefused, atomic, decode, encoded
 
-# Checkpoint profiles. The active profile is named in mirofish_model_profile.json beside this file
-# (written by `python -m valedia_trader.agents.mirofish_models use <name>`); without that file the
-# checkpoint this pipeline was qualified on is used. A prepared candidate carries its own copy of the
-# file, so a candidate can never change checkpoint after preparation. Each profile is pinned by byte
-# size and SHA-256 and names the tokenizer origin its template admission is built from.
+# Checkpoint profiles. The selector mirofish_model_profile.json beside this file names either one
+# profile for the whole run, {"profile": "<name>"} (written by `python -m
+# valedia_trader.agents.mirofish_models use <name>`), or a plan of two built-in profiles,
+# {"plan": {"setup": "<name>", "turns": "<name>"}}: the setup model serves everything before the
+# simulation starts and the report after it ends, the turns model serves the simulation's agent
+# turns, one loaded at a time under the run's one identifier (TMF4). Without the file the checkpoint
+# this pipeline was qualified on is used. A prepared candidate carries its own copy of the file, so a
+# candidate can never change checkpoint after preparation. Each profile is pinned by byte size and
+# SHA-256 and names the tokenizer origin its template admission is built from.
 _MODEL_ROOT = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models')
 MODEL_PROFILES = {
     'qwen3.8-27b': {
@@ -38,42 +44,173 @@ MODEL_PROFILES = {
         'tokenizer_model_type': 'qwen3', 'tokenizer_quant_bits': None,
         'gguf_selection': {'modelKey': 'qwen3-8b', 'path': 'Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf', 'indexedModelIdentifier': 'Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf', 'format': 'gguf', 'publisher': 'Qwen', 'architecture': 'qwen3', 'quantization': {'name': 'Q4_K_M', 'bits': 4}, 'sizeBytes': 5225374496, 'deviceIdentifier': None, 'vision': False, 'trainedForToolUse': True, 'maxContextLength': 40960, 'sourceSha256': 'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f'},
     },
+    # Ternary Bonsai 2 27B (prism-ml, GGUF Q2_0). LM Studio loads a second file with the weights, the
+    # vision projector, and reports the two files together as the selection's sizeBytes, pinned here as
+    # selection_bytes (TMF4 addendum 1, ruling a). The projector is loaded and unused: every native
+    # message is text. The tokenizer origin is the 27B's: the GGUF header's tokens, token types, merges,
+    # pre-tokenizer, special token ids and chat template match it byte for byte (addendum 1, Step 0.2).
+    'ternary-bonsai-2-27b': {
+        'tokenizer_root': _MODEL_ROOT/'Qwen3.8-27B-MLX-4bit',
+        'weight_file': _MODEL_ROOT/'lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-Q2_0.gguf',
+        'weight_bytes': 7626008928,
+        'weight_sha256': '4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e',
+        'second_file': _MODEL_ROOT/'lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf',
+        'second_bytes': 629246976,
+        'second_sha256': '6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903',
+        'selection_bytes': 8255255904,
+        'tokenizer_model_type': 'qwen3_5', 'tokenizer_quant_bits': 4,
+        'gguf_selection': {'modelKey': 'ternary-bonsai-2-27b', 'path': 'prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-Q2_0.gguf', 'indexedModelIdentifier': 'prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-Q2_0.gguf', 'format': 'gguf', 'publisher': 'prism-ml', 'architecture': 'qwen35', 'quantization': {'name': 'Q2_0', 'bits': 2}, 'sizeBytes': 8255255904, 'deviceIdentifier': None, 'vision': True, 'trainedForToolUse': True, 'maxContextLength': 262144, 'sourceSha256': '4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e'},
+    },
 }
+BUILTIN_PROFILES = tuple(MODEL_PROFILES)
 DEFAULT_MODEL_PROFILE = 'qwen3.8-27b'
 MODEL_PROFILE_FILE = Path(__file__).with_name('mirofish_model_profile.json')
 # Further checkpoints are registered with `python -m valedia_trader.agents.mirofish_models add`. A
-# registered checkpoint is pinned exactly like the built-in ones; the two built-in profiles cannot be
-# overridden. Profiles registered for HTTP backends only (no pinned GGUF) are not native checkpoints.
+# registered checkpoint is pinned exactly like the built-in ones; a built-in profile cannot be
+# overridden, and a registry that names one is refused. Profiles registered for HTTP backends only (no
+# pinned GGUF) are not native checkpoints. A registered profile may be the single profile of a run,
+# never a member of a plan. Model-staged candidates carry no registry.
 MODEL_REGISTRY_FILE = Path(__file__).with_name('mirofish_model_registry.json')
 HTTP_ONLY_PROFILES = set()
+_PROFILE_NAME = re.compile(r'[a-z0-9][a-z0-9._-]{1,40}')
+_SHA256 = re.compile(r'[0-9a-f]{64}')
+_TOKENIZER_TYPE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+_SELECTION_TYPES = {'modelKey': str, 'path': str, 'indexedModelIdentifier': str, 'format': str, 'publisher': str,
+                    'architecture': str, 'quantization': dict, 'sizeBytes': int, 'deviceIdentifier': type(None),
+                    'vision': bool, 'trainedForToolUse': bool, 'maxContextLength': int, 'sourceSha256': str}
+_REGISTERED_SELECTION_KEYS = set(_SELECTION_TYPES) - {'sizeBytes', 'sourceSha256'}  # those two come from the pins
 
 
-def _registered_profiles():
-    if not MODEL_REGISTRY_FILE.exists():
-        return {}
-    out = {}
-    for name, row in json.loads(MODEL_REGISTRY_FILE.read_text()).get('profiles', {}).items():
-        if name in MODEL_PROFILES:
+def require(ok, reason):
+    if not ok:
+        raise NativeRefused(reason)
+
+
+def _positive_int(value, reason):
+    require(type(value) is int and value > 0, reason)  # type(), not isinstance(): a bool is not a size
+    return value
+
+
+def _sha256(value, reason):
+    require(type(value) is str and _SHA256.fullmatch(value) is not None, reason)
+    return value
+
+
+def _checked_selection(selection, size, sha):
+    require(type(selection) is dict and set(selection) == set(_SELECTION_TYPES), 'model profile selection must have exactly the LM Studio selection fields')
+    for key, kind in _SELECTION_TYPES.items():
+        require(type(selection[key]) is kind, 'model profile selection field has the wrong type: ' + key)
+    quantization = selection['quantization']
+    require(set(quantization) == {'name', 'bits'} and type(quantization['name']) is str and type(quantization['bits']) is int, 'model profile selection quantization shape')
+    require(selection['format'] == 'gguf' and selection['maxContextLength'] >= 32768, 'model profile selection must be a GGUF that supports the 32,768 context')
+    require(selection['sizeBytes'] == size and selection['sourceSha256'] == sha, 'model profile selection disagrees with its pinned size or hash')
+    return selection
+
+
+def helper_constants(profile):
+    """R6: the three values one profile puts in the SDK helper, each validated before it enters the script. The size is
+    LM Studio's sizeBytes for the selection: the weights, plus a pinned second file LM Studio loads with them."""
+    require(type(profile) is dict, 'model profile shape')
+    weight = _positive_int(profile.get('weight_bytes'), 'model profile weight size must be a positive integer')
+    sha = _sha256(profile.get('weight_sha256'), 'model profile weight hash must be 64 lowercase hexadecimal characters')
+    extra = 0
+    if any(key in profile for key in ('second_file', 'second_bytes', 'second_sha256')):
+        require(isinstance(profile.get('second_file'), Path) and profile['second_file'].is_absolute(), 'model profile second file must be an absolute path')
+        extra = _positive_int(profile.get('second_bytes'), 'model profile second file size must be a positive integer')
+        _sha256(profile.get('second_sha256'), 'model profile second file hash must be 64 lowercase hexadecimal characters')
+        require('selection_bytes' in profile, 'a profile with a second file pins the selection size')
+    total = profile.get('selection_bytes', weight + extra)
+    require(type(total) is int and total == weight + extra, 'model profile selection size must be its pinned files together')
+    return {'selection': _checked_selection(profile.get('gguf_selection'), total, sha), 'weightSize': total, 'weightSha': sha}
+
+
+def profile_files(name):
+    """The pinned serving files of one profile: the GGUF weights and, when it has one, the second file loaded with them."""
+    profile = MODEL_PROFILES[name]
+    rows = [{'path': profile['weight_file'], 'bytes': profile['weight_bytes'], 'sha256': profile['weight_sha256'],
+             'role': 'sole serving GGUF %s weight' % profile['gguf_selection']['quantization']['name']}]
+    if profile.get('second_file') is not None:
+        rows.append({'path': profile['second_file'], 'bytes': profile['second_bytes'], 'sha256': profile['second_sha256'],
+                     'role': 'second file LM Studio loads with the weights (vision projector); loaded and unused'})
+    return rows
+
+
+def registered_profiles(path=None, builtins=None):
+    """R9: the registry's native profiles and HTTP-only names. A malformed registry refuses with NativeRefused: invalid
+    JSON, a wrongly shaped name, a built-in name, a size or hash of the wrong shape, a selection that fails R6, or a file
+    or tokenizer origin that does not lie under the pinned models root after resolving links (resolved paths are kept)."""
+    path = Path(MODEL_REGISTRY_FILE if path is None else path)
+    builtins = BUILTIN_PROFILES if builtins is None else builtins
+    if not path.exists():
+        return {}, set()
+    try:
+        data = decode(path.read_bytes())
+    except NativeRefused as exc:
+        raise NativeRefused('malformed MiroFish model registry %s: %s' % (path.name, exc)) from None
+    require(type(data) is dict and type(data.get('profiles')) is dict, 'malformed MiroFish model registry %s: no profiles mapping' % path.name)
+    root = _MODEL_ROOT.resolve()
+    native, http = {}, set()
+    for name, row in data['profiles'].items():
+        require(_PROFILE_NAME.fullmatch(name) is not None, 'malformed MiroFish model registry: profile name %r has the wrong shape' % name[:64])
+        require(name not in builtins, 'malformed MiroFish model registry: %r is a built-in profile, which a registry cannot override' % name)
+        require(type(row) is dict and type(row.get('native')) is bool, 'malformed MiroFish model registry: profile %r needs native true or false' % name)
+        if not row['native']:
+            http.add(name)
             continue
-        if not row.get('native'):
-            HTTP_ONLY_PROFILES.add(name)
-            continue
-        out[name] = {
-            'tokenizer_root': Path(row['tokenizer_root']), 'weight_file': Path(row['weight_file']),
-            'weight_bytes': int(row['weight_bytes']), 'weight_sha256': str(row['weight_sha256']),
-            'tokenizer_model_type': row['tokenizer_model_type'], 'tokenizer_quant_bits': row.get('tokenizer_quant_bits'),
-            'gguf_selection': dict(row['gguf_selection'], sizeBytes=int(row['weight_bytes']), sourceSha256=str(row['weight_sha256'])),
-        }
-    return out
+        def under_root(key):
+            value = row.get(key)
+            require(type(value) is str and Path(value).is_absolute(), 'malformed MiroFish model registry: profile %r %s must be an absolute path' % (name, key))
+            resolved = Path(value).resolve()
+            require(resolved != root and resolved.is_relative_to(root), 'malformed MiroFish model registry: profile %r %s lies outside the pinned models root %s after resolving links' % (name, key, root))
+            return resolved
+        weight_file, tokenizer_root = under_root('weight_file'), under_root('tokenizer_root')
+        size = _positive_int(row.get('weight_bytes'), 'malformed MiroFish model registry: profile %r weight size' % name)
+        sha = _sha256(row.get('weight_sha256'), 'malformed MiroFish model registry: profile %r weight hash' % name)
+        kind, bits = row.get('tokenizer_model_type'), row.get('tokenizer_quant_bits')
+        require(type(kind) is str and _TOKENIZER_TYPE.fullmatch(kind) is not None and (bits is None or type(bits) is int), 'malformed MiroFish model registry: profile %r tokenizer type' % name)
+        selection = row.get('gguf_selection')
+        require(type(selection) is dict and set(selection) == _REGISTERED_SELECTION_KEYS, 'malformed MiroFish model registry: profile %r gguf_selection fields' % name)
+        profile = {'tokenizer_root': tokenizer_root, 'weight_file': weight_file, 'weight_bytes': size, 'weight_sha256': sha,
+                   'tokenizer_model_type': kind, 'tokenizer_quant_bits': bits,
+                   'gguf_selection': dict(selection, sizeBytes=size, sourceSha256=sha)}
+        helper_constants(profile)  # R6 holds for a registered profile before anything else reads it
+        native[name] = profile
+    return native, http
 
 
-MODEL_PROFILES.update(_registered_profiles())
+_REGISTERED, _HTTP_ONLY = registered_profiles()
+MODEL_PROFILES.update(_REGISTERED)
+HTTP_ONLY_PROFILES.update(_HTTP_ONLY)
 
 
-def active_model_profile():
-    name = DEFAULT_MODEL_PROFILE
-    if MODEL_PROFILE_FILE.exists():
-        name = json.loads(MODEL_PROFILE_FILE.read_text()).get('profile')
+def parse_selector(value):
+    """R2: the selector's two forms. Returns (the profile loaded first, the plan or None)."""
+    require(type(value) is dict, 'MiroFish model selector must be a JSON object')
+    require(type(value.get('set_at', '')) is str, 'MiroFish model selector set_at must be text')
+    keys = set(value) - {'set_at'}
+    if keys == {'profile'}:
+        require(type(value['profile']) is str, 'MiroFish model selector profile must be a name')
+        return value['profile'], None
+    require(keys == {'plan'}, 'MiroFish model selector must be {"profile": <name>} or {"plan": {"setup": <name>, "turns": <name>}}')
+    plan = value['plan']
+    require(type(plan) is dict and set(plan) == {'setup', 'turns'} and all(type(plan[key]) is str for key in plan), 'MiroFish model plan must name exactly a setup and a turns profile')
+    require(plan['setup'] in BUILTIN_PROFILES and plan['turns'] in BUILTIN_PROFILES, 'MiroFish model plan members must be built-in profiles: %s' % (BUILTIN_PROFILES,))
+    require(plan['setup'] != plan['turns'], 'a plan of one model is written as {"profile": <name>}')
+    return plan['setup'], {'setup': plan['setup'], 'turns': plan['turns']}
+
+
+def read_selector(path=None):
+    path = Path(MODEL_PROFILE_FILE if path is None else path)
+    if not path.exists():
+        return DEFAULT_MODEL_PROFILE, None
+    try:
+        value = decode(path.read_bytes())
+    except NativeRefused:
+        raise NativeRefused('MiroFish model selector %s is not valid JSON' % path.name) from None
+    return parse_selector(value)
+
+
+def _native_profile(name):
     if name in HTTP_ONLY_PROFILES:
         raise NativeRefused('MiroFish model profile %r is registered for HTTP backends only; the native pipeline needs a pinned GGUF checkpoint' % name)
     if name not in MODEL_PROFILES:
@@ -81,7 +218,20 @@ def active_model_profile():
     return name
 
 
-ACTIVE_MODEL_PROFILE = active_model_profile()
+def active_model_profile():
+    """The profile loaded first: the single profile, or the plan's setup profile."""
+    name, plan = read_selector()
+    for each in ((plan['setup'], plan['turns']) if plan else (name,)):
+        _native_profile(each)
+    return name
+
+
+ACTIVE_MODEL_PROFILE, MODEL_PLAN = read_selector()  # one read: the profile and the plan come from the same bytes
+# The profiles in load order: the single profile, or setup then turns (setup is loaded again at the second boundary).
+PLAN_PROFILES = (MODEL_PLAN['setup'], MODEL_PLAN['turns']) if MODEL_PLAN else (ACTIVE_MODEL_PROFILE,)
+for _name in PLAN_PROFILES:
+    _native_profile(_name)
+# The module constants below name the profile loaded first; plan-aware callers use PLAN_PROFILES and profile_files().
 _PROFILE = MODEL_PROFILES[ACTIVE_MODEL_PROFILE]
 TOKENIZER_ROOT = _PROFILE['tokenizer_root']
 WEIGHT_FILE = _PROFILE['weight_file']
@@ -96,7 +246,8 @@ SDK_FILE = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/runtime/flint-lmstudio-sd
 SDK_TOOL_SCHEMA_SOURCE_SHA256 = 'd44c6732b8d7abe4061cf42887dd95c537e2b85ad8000b83d25e7ed706a37b66'
 SDK_TOOL_SCHEMA_JS = 'const jsonSerializableSchema = z.any().transform((val, ctx) => {\n    try {\n        // Needs a more performant way to do this.\n        return JSON.parse(JSON.stringify(val));\n    }\n    catch (e) {\n        ctx.addIssue({\n            code: z.ZodIssueCode.custom,\n            message: "Not JSON serializable: " + e.message,\n        });\n        return val;\n    }\n});\n\nconst llmToolParametersSchema = z.discriminatedUnion("type", [\n    z.object({\n        type: z.literal("object"),\n        properties: z.record(jsonSerializableSchema),\n        required: z.array(z.string()).optional(),\n        additionalProperties: z.any().optional(),\n        $defs: z.record(jsonSerializableSchema).optional(),\n    }),\n    // add more parameter types here\n    // ...\n]);\nconst llmToolSchema = z.discriminatedUnion("type", [\n    z.object({\n        type: z.literal("function"),\n        function: z.object({\n            name: z.string(),\n            description: z.string().optional(),\n            parameters: llmToolParametersSchema.optional(),\n        }),\n    }),\n    // add more tool types here\n    // ...\n]);\n/**\n * For convenience\n */\nz.array(llmToolSchema);\n'
 
-SDK_SCRIPT = r"""import {LMStudioClient} from '/Volumes/NIMROD_SSD/Qwen-Weight-Space/runtime/flint-lmstudio-sdk-2.1.0/node_modules/@lmstudio/sdk/dist/index.mjs';
+# The helper template. Its placeholders are filled once, in one pass, by sdk_script() from validated values (R6).
+_SDK_TEMPLATE = r"""import {LMStudioClient} from '/Volumes/NIMROD_SSD/Qwen-Weight-Space/runtime/flint-lmstudio-sdk-2.1.0/node_modules/@lmstudio/sdk/dist/index.mjs';
 import {randomUUID,createHash} from 'node:crypto';
 import readline from 'node:readline';
 import {createRequire} from 'node:module';
@@ -199,12 +350,62 @@ try{for await(const line of lines){
  try{const x=JSON.parse(line);id=x.id;const data=await action(x);const out=JSON.stringify({id,ok:true,data});require(Buffer.byteLength(out)<=524288,'SDK reply cap');process.stdout.write(out+'\n');}
  catch(e){process.stdout.write(JSON.stringify({id,ok:false,error:String(e).slice(0,1024)})+'\n');}
 }}finally{await client[Symbol.asyncDispose]();}
-""".replace("__GGUF_SELECTION__",json.dumps(GGUF_SELECTION,sort_keys=True)).replace("__SDK_PORT__",str(SDK_PORT)).replace("__SDK_TOOL_SCHEMA_JS__",SDK_TOOL_SCHEMA_JS).replace("__WEIGHT_BYTES__",str(WEIGHT_BYTES)).replace("__WEIGHT_SHA256__",WEIGHT_SHA256)
+"""
+# A plan's helper (TMF4): the same template with three closed fragments replaced. It carries each plan profile's
+# validated constants in one table and switches the selection only when it loads a profile and when it unloads one,
+# and only to a profile of the table; everything else in the helper is the single-model text.
+_PLAN_FRAGMENTS = (
+    ("const selection=__GGUF_SELECTION__;\nconst key=selection?.modelKey??null, embeddingId='ym-research-embedding';\nconst weightSize=__WEIGHT_BYTES__,weightSha='__WEIGHT_SHA256__';\n",
+     "const profiles=__PLAN_PROFILES__;\nlet selection=null,key=null,weightSize=null,weightSha=null,chosen=null;const embeddingId='ym-research-embedding';\n"
+     "function use(name){require(typeof name==='string' && Object.prototype.hasOwnProperty.call(profiles,name),'closed plan profile');({selection,weightSize,weightSha}=profiles[name]);key=selection.modelKey;chosen=name;}\n"),
+    (" if(x.action==='load'){\n  require(!owned && /^mf-native-[0-9a-f]{32}$/.test(x.identifier),'fresh exact owned identifier');\n",
+     " if(x.action==='load'){\n  require(!owned && /^mf-native-[0-9a-f]{32}$/.test(x.identifier),'fresh exact owned identifier');\n  use(x.profile);ownInfo=null;\n"),
+    (" if(x.action==='unload'){\n",
+     " if(x.action==='unload'){\n  require(!owned || chosen===x.profile,'unload names a profile other than the owned one');use(x.profile);\n"),
+)
 
 
-def require(ok, reason):
-    if not ok:
-        raise NativeRefused(reason)
+def _fill(template, values):
+    """Each placeholder exactly once, all replaced in one pass: no value is ever searched for another placeholder."""
+    for key in values:
+        require(template.count(key) == 1, 'SDK helper placeholder missing or repeated: ' + key)
+    pattern = re.compile('|'.join(re.escape(key) for key in values))
+    return pattern.sub(lambda match: values[match.group(0)], template)
+
+
+def sdk_script(names, profiles=None):
+    """The SDK helper for one profile (a name) or a plan (setup and turns names). Every profile value reaches the text
+    through helper_constants() (R6); selections and the plan table are serialised with json.dumps, never pasted."""
+    profiles = MODEL_PROFILES if profiles is None else profiles
+    names = (names,) if isinstance(names, str) else tuple(names)
+    require(len(names) in (1, 2) and len(set(names)) == len(names) and all(name in profiles for name in names), 'closed SDK helper profile set')
+    values = {'__SDK_PORT__': str(SDK_PORT), '__SDK_TOOL_SCHEMA_JS__': SDK_TOOL_SCHEMA_JS}
+    template = _SDK_TEMPLATE
+    if len(names) == 1:
+        constants = helper_constants(profiles[names[0]])
+        values.update({'__GGUF_SELECTION__': json.dumps(constants['selection'], sort_keys=True),
+                       '__WEIGHT_BYTES__': str(constants['weightSize']), '__WEIGHT_SHA256__': constants['weightSha']})
+    else:
+        for old, new in _PLAN_FRAGMENTS:
+            require(template.count(old) == 1, 'plan helper fragment missing or repeated')
+            template = template.replace(old, new)
+        values['__PLAN_PROFILES__'] = json.dumps({name: helper_constants(profiles[name]) for name in names}, sort_keys=True)
+    return _fill(template, values)
+
+
+def observer_reads(names=None):
+    """R7: the tokenizer origins and the pinned serving files of the given profiles (the plan's by default), in order."""
+    roots, files = [], []
+    for name in (PLAN_PROFILES if names is None else names):
+        if MODEL_PROFILES[name]['tokenizer_root'] not in roots:
+            roots.append(MODEL_PROFILES[name]['tokenizer_root'])
+        for row in profile_files(name):
+            if row['path'] not in files:
+                files.append(row['path'])
+    return roots, files
+
+
+SDK_SCRIPT = sdk_script(PLAN_PROFILES)
 
 
 class SDKBridge:
@@ -258,24 +459,29 @@ class SDKBridge:
 
 
 class TemplateAdmission:
-    def __init__(self, sdk, identifier, manifest, *, embedding_native_semantics=False):
+    def __init__(self, sdk, identifier, manifest, *, embedding_native_semantics=False, profile=None):
+        # profile: the checkpoint behind the identifier now (the profile loaded first by default); after a swap the
+        # observer builds a new admission for the next profile from that profile's own tokenizer origin and pins.
         from jinja2 import Environment, StrictUndefined
         from tokenizers import Tokenizer
         self.sdk,self.identifier=sdk,identifier
         self.embedding_native_semantics=embedding_native_semantics
+        self.profile=ACTIVE_MODEL_PROFILE if profile is None else profile
+        require(self.profile in MODEL_PROFILES,'unknown MiroFish model profile for admission: %r'%(self.profile,))
+        entry=MODEL_PROFILES[self.profile];root=self.tokenizer_root=entry['tokenizer_root']
         for name in ['config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json']:
-            require(hashlib.sha256((TOKENIZER_ROOT/name).read_bytes()).hexdigest()==manifest[name], 'frozen native model/tokenizer file changed')
-        config=decode((TOKENIZER_ROOT/'config.json').read_bytes())
-        require(config.get('model_type')==_PROFILE['tokenizer_model_type'] and (_PROFILE['tokenizer_quant_bits'] is None or config.get('quantization',{}).get('bits')==_PROFILE['tokenizer_quant_bits']),'frozen same-base tokenizer origin architecture/quantization drift')
-        tokenizer_config=decode((TOKENIZER_ROOT/'tokenizer_config.json').read_bytes())
-        self.tokenizer=Tokenizer.from_file(str(TOKENIZER_ROOT/'tokenizer.json'))
+            require(hashlib.sha256((root/name).read_bytes()).hexdigest()==manifest[name], 'frozen native model/tokenizer file changed')
+        config=decode((root/'config.json').read_bytes())
+        require(config.get('model_type')==entry['tokenizer_model_type'] and (entry['tokenizer_quant_bits'] is None or config.get('quantization',{}).get('bits')==entry['tokenizer_quant_bits']),'frozen same-base tokenizer origin architecture/quantization drift')
+        tokenizer_config=decode((root/'tokenizer_config.json').read_bytes())
+        self.tokenizer=Tokenizer.from_file(str(root/'tokenizer.json'))
         self.tokens={key: tokenizer_config.get(key,'') for key in ['bos_token','eos_token','unk_token','pad_token']}
         self.env=Environment(undefined=StrictUndefined,trim_blocks=True,lstrip_blocks=True)
         def raise_exception(message): raise NativeRefused('native template refused: '+str(message))
         self.env.globals['raise_exception']=raise_exception
         self.env.globals['strftime_now']=lambda fmt: (_ for _ in ()).throw(NativeRefused('clock-dependent native template unavailable'))
         self.env.filters['tojson']=lambda obj,**kw: json.dumps(obj,ensure_ascii=False,**kw)
-        self.template=self.env.from_string((TOKENIZER_ROOT/'chat_template.jinja').read_text())
+        self.template=self.env.from_string((root/'chat_template.jinja').read_text())
         self.template_sha=manifest['chat_template.jinja']
 
     def __call__(self, kind, body, deadline):
@@ -296,7 +502,7 @@ class TemplateAdmission:
         maximum=max(count for text,count in candidates)
         require(time.monotonic()<deadline,'context admission deadline')
         return {'verified':True,'model':body['model'],'tokens':maximum,'template_sha256':self.template_sha,
-                'instance_reference':observation['instanceReference'],'sdk_tool_schema_source_sha256':SDK_TOOL_SCHEMA_SOURCE_SHA256,'candidate_count':len(candidates),'proof':'maximum raw unchanged and exact SDK-parsed tool views, all thinking and valid typed-argument renderings; actual SDK template/tokenizer equality retained'}
+                'instance_reference':observation['instanceReference'],'profile':self.profile,'sdk_tool_schema_source_sha256':SDK_TOOL_SCHEMA_SOURCE_SHA256,'candidate_count':len(candidates),'proof':'maximum raw unchanged and exact SDK-parsed tool views, all thinking and valid typed-argument renderings; actual SDK template/tokenizer equality retained'}
 
     def render_candidates(self,body,sdk_tool_view):
         candidates=[]

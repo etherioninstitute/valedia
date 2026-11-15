@@ -141,10 +141,9 @@ class SingleModelIdentityTests(unittest.TestCase):
 
 def entry(**changes):
     value = copy.deepcopy(m.MODEL_PROFILES['qwen3-8b'])
-    selection = changes.pop('selection', None)
+    if 'selection' in changes:
+        value['gguf_selection'] = changes.pop('selection')
     value.update(changes)
-    if selection is not None:
-        value['gguf_selection'] = selection
     return value
 
 
@@ -211,7 +210,7 @@ class PlanHelperTests(unittest.TestCase):
         # Everything outside the three closed fragments is the single-model helper's text.
         single = m.sdk_script('qwen3-8b')
         self.assertEqual(text.splitlines()[:6], single.splitlines()[:6])
-        self.assertEqual(text.splitlines()[-30:], single.splitlines()[-30:])
+        self.assertEqual(text.splitlines()[-17:], single.splitlines()[-17:])  # from the line after the unload fragment
 
     @unittest.skipUnless(NODE.is_file(), 'node unavailable')
     def test_plan_helper_parses_in_node(self):
@@ -444,7 +443,7 @@ class SwapTests(unittest.TestCase):
     """R4: the swap at a boundary, with the gateway provably idle, against a fake helper."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.gateway = Gateway(Limits(ID), 's'*32, Path(self.tmp.name)/'ledger.json', lambda *a: None, deadline=time.monotonic()+2400)
+        self.gateway = Gateway(Limits(ID), 's'*32, Path(self.tmp.name).resolve()/'ledger.json', lambda *a: None, deadline=time.monotonic()+2400)
         self.state = {'profile': BONSAI, 'loaded': loaded_readback(BONSAI, 'ref-1')}
         self.built = []
 
@@ -568,7 +567,7 @@ class BoundaryPlacementTests(unittest.TestCase):
                                      "save('native_terminal'", "boundary('B2',", "worker.request('report'"]]
         self.assertEqual(order, sorted(order))
         boundary = text[text.index('def boundary('):text.index("save('pre_resource'")]
-        self.assertIn('if plan is None:return', boundary.replace(' ', '').replace('return\n', 'return'))
+        self.assertIn('ifplanisNone:return', boundary.replace(' ', ''))
         self.assertLess(boundary.index('swap_model('), boundary.index('compatibility_probes('))
         self.assertIn("save('model_swap'", boundary); self.assertIn("save('post_swap_compatibility_probes_passed'", boundary)
 

@@ -439,11 +439,12 @@ def graph_environment(graph, original_home):
     return env
 
 def observer_policy(work,proxy_port=62471,graph_port=62472):
-    from mirofish_native_model import WEIGHT_FILE,SDK_PORT,TOKENIZER_ROOT
+    from mirofish_native_model import SDK_PORT,observer_reads
+    tokenizer_roots,model_files=observer_reads()  # R7: exactly the plan's tokenizer origins and pinned serving files
     work=Path(work)
     text=worker_policy(work,work/'owned-source/observer-entry',proxy_port,graph_port)
     extra=['(allow dynamic-code-generation)']
-    for path in [JAVA,TOKENIZER_ROOT,QWS/'runtime/flint-lmstudio-sdk-2.1.0']:
+    for path in [JAVA,*tokenizer_roots,QWS/'runtime/flint-lmstudio-sdk-2.1.0']:
         extra.append('(allow file-read* file-map-executable (subpath '+_quote(path)+'))')
     extra += ['(allow file-read* file-write* (subpath '+_quote(work)+'))',
               '(allow file-read* file-write* (subpath '+_quote(RUNTIME/'tmp')+'))',
@@ -452,7 +453,7 @@ def observer_policy(work,proxy_port=62471,graph_port=62472):
         extra += ['(allow process-exec (literal '+_quote(path)+'))','(allow file-read* (literal '+_quote(path)+'))']
     for port in [1235,SDK_PORT]:extra.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
     for port in [proxy_port,graph_port]:extra.append(f'(allow network-inbound (local ip "localhost:{port}"))')
-    extra.append('(allow file-read* (literal '+_quote(WEIGHT_FILE)+'))')
+    for path in model_files:extra.append('(allow file-read* (literal '+_quote(path)+'))')
     extra.append('(allow file-map-executable (literal "/bin/bash"))')
     extra.append('(deny file-write* (subpath '+_quote(work/'host-resource')+'))')
     return text+'\n'.join(extra)+'\n'
@@ -479,7 +480,7 @@ def graph_policy(work,graph_port=62472):
     return '\n'.join(lines)+'\n'
 
 def prepare_candidate(work):
-    from mirofish_native_model import SDK_SCRIPT, TOKENIZER_ROOT, TOKENIZER_FILES, WEIGHT_FILE, WEIGHT_BYTES, WEIGHT_SHA256, GGUF_SELECTION, SDK_FILE
+    from mirofish_native_model import SDK_SCRIPT, TOKENIZER_FILES, GGUF_SELECTION, SDK_FILE, MODEL_PROFILES, MODEL_PLAN, PLAN_PROFILES, DEFAULT_MODEL_PROFILE, profile_files
     work=owned(Path(work),Path(work));builder=work/'builder';builder.mkdir(exist_ok=True)
     producer,control,source=copy_sources(work);paper=copy_paper(work)
     auth=[]
@@ -507,17 +508,34 @@ def prepare_candidate(work):
     (builder/'graph.sb').write_text(graph_policy(work))
     (builder/'worker.sb').write_text(worker_policy(producer,control,62471,62472))
     # The five same-base tokenizer-origin metadata files are distinct from the
-    # sole loaded GGUF serving weight. No MLX weight shard is a GGUF input.
-    model={};model_files=[]
-    for name in TOKENIZER_FILES:
-        path=TOKENIZER_ROOT/name
-        require(path.is_file() and not path.is_symlink(),'frozen tokenizer origin missing')
-        sha=digest(path);model[name]=sha
-        model_files.append({'path':str(path),'bytes':path.stat().st_size,'sha256':sha,'role':'same-base tokenizer/template origin metadata; not serving weights'})
-    require(WEIGHT_FILE.is_file() and not WEIGHT_FILE.is_symlink() and WEIGHT_FILE.stat().st_size==WEIGHT_BYTES,'single verified GGUF source missing/size drift')
-    weight_sha=digest(WEIGHT_FILE);require(weight_sha==WEIGHT_SHA256,'single GGUF source hash drift')
-    model_files.append({'path':str(WEIGHT_FILE),'bytes':WEIGHT_BYTES,'sha256':weight_sha,'role':'sole serving GGUF Q4_K_M weight'})
-    atomic(builder/'model-source-manifest.json',{'required_tokenizer_files':model,'tokenizer_origin_root':str(TOKENIZER_ROOT),'files':model_files,'sdk_source_sha256':digest(SDK_FILE),'GGUF_selection':GGUF_SELECTION,'same_base_revision':'1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0','GGUF_source_revision':'a316ea527fde32c12487be7574e2db5ac2ad2a7e'})
+    # loaded GGUF serving files. No MLX weight shard is a GGUF input. A plan
+    # pins each of its profiles' files; a tokenizer origin two profiles share is
+    # listed once.
+    model_files=[];by_profile={};records={}
+    for profile in PLAN_PROFILES:
+        entry=MODEL_PROFILES[profile];root=entry['tokenizer_root'];pins={};rows=[]
+        for name in TOKENIZER_FILES:
+            path=root/name
+            require(path.is_file() and not path.is_symlink(),'frozen tokenizer origin missing')
+            sha=digest(path);pins[name]=sha
+            rows.append({'path':str(path),'bytes':path.stat().st_size,'sha256':sha,'role':'same-base tokenizer/template origin metadata; not serving weights'})
+        for item in profile_files(profile):
+            path=item['path']
+            require(path.is_file() and not path.is_symlink() and path.stat().st_size==item['bytes'],'single verified GGUF source missing/size drift')
+            sha=digest(path);require(sha==item['sha256'],'single GGUF source hash drift')
+            phase='' if MODEL_PLAN is None else ('turns model ' if profile==MODEL_PLAN['turns'] else 'setup and report model ')+profile+': '
+            rows.append({'path':str(path),'bytes':item['bytes'],'sha256':sha,'role':phase+item['role']})
+        model_files+=[row for row in rows if row not in model_files];by_profile[profile]=pins
+        records[profile]={'required_tokenizer_files':pins,'tokenizer_origin_root':str(root),'files':rows,'GGUF_selection':entry['gguf_selection']}
+        if profile==DEFAULT_MODEL_PROFILE:  # R10: the 27B's revision identifiers describe the 27B's files only
+            records[profile].update(same_base_revision='1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0',GGUF_source_revision='a316ea527fde32c12487be7574e2db5ac2ad2a7e')
+    model=by_profile[PLAN_PROFILES[0]]
+    if MODEL_PLAN is None:
+        source_record=dict(records[PLAN_PROFILES[0]],sdk_source_sha256=digest(SDK_FILE))
+        if PLAN_PROFILES[0]!=DEFAULT_MODEL_PROFILE:source_record['profile']=PLAN_PROFILES[0]
+    else:
+        source_record={'plan':dict(MODEL_PLAN),'profiles':records,'files':model_files,'sdk_source_sha256':digest(SDK_FILE)}
+    atomic(builder/'model-source-manifest.json',source_record)
     # Runtime source files are frozen through complete per-file hashes, not only
     # distribution names. Mutable cache and rejected environments are excluded.
     inputs=[]
@@ -534,6 +552,9 @@ def prepare_candidate(work):
               'launch_available':True,'launch_authorized':False,
               'known_blockers':(['UNRESOLVED_EXACT_GGUF_SDK_SELECTOR'] if GGUF_SELECTION is None else [])+([] if decode((builder/'jdk-repair/validation-result.json').read_bytes()).get('exit')==0 else ['BLOCKED_JDK_POLICY']),
               'source_status':'FROZEN_UNLAUNCHED_COHERENT_CANDIDATE'}
+    if MODEL_PLAN is not None:
+        manifest.update(model_plan=dict(MODEL_PLAN),model_tokenizer_by_profile=by_profile)
+        manifest['runtime_predicates'].append('two pinned models by phase: setup model for preparation and report, turns model for the simulation, swapped at the two boundaries with the gateway idle, the same two probes after each swap')
     atomic(builder/'candidate-manifest.json',manifest)
     return {'candidate_sha256':digest(builder/'candidate-manifest.json'),'manifest':str(builder/'candidate-manifest.json'),'frozen_file_count':len(inputs),'model_files':len(model_files)}
 
@@ -580,17 +601,77 @@ def qualify_native_chat_calls(calls):
     return completed
 
 
+def compatibility_probes(gateway,identifier,secret):
+    """Two fixed nonmarket compatibility requests. Both count in all budgets. Run at the start and, in a plan, again
+    on the newly loaded model after each swap (TMF4 addendum 1, ruling d)."""
+    text_probe={'model':identifier,'messages':[{'role':'user','content':'Non-market transport check. Reply exactly with JSON {"ok":true}.'}],'max_tokens':512,'temperature':0}
+    raw=gateway.handle('/v1/chat/completions',text_probe,'Bearer '+secret);reply=decode(raw)['choices'][0]
+    require(reply.get('finish_reason')=='stop' and strict_probe_success(decode(reply['message'].get('content',''))) and not reply['message'].get('reasoning_content'),'no-thinking JSON probe failed')
+    tool_probe={'model':identifier,'messages':[{'role':'user','content':'Non-market transport check. Call no_effect once with ok=true. This function has no effects.'}],'max_tokens':512,'temperature':0,'parallel_tool_calls':False,'tools':[{'type':'function','function':{'name':'no_effect','description':'Transport probe only; no implementation and no effects.','parameters':{'type':'object','properties':{'ok':{'type':'boolean'}},'required':['ok'],'additionalProperties':False}}}],'tool_choice':'required'}
+    raw=gateway.handle('/v1/chat/completions',tool_probe,'Bearer '+secret);reply=decode(raw)['choices'][0];calls=reply['message'].get('tool_calls',[])
+    require(reply.get('finish_reason')=='tool_calls' and len(calls)==1 and calls[0]['function']['name']=='no_effect' and strict_probe_success(decode(calls[0]['function']['arguments'])) and not reply['message'].get('reasoning_content'),'no-thinking function-tool probe failed')
+
+
+def check_load_readback(loaded,identifier,profile):
+    """A plan load is read back as the run's identifier carrying the plan profile's checkpoint (the helper has already
+    checked the selection, size, hash, load configuration and instance reference)."""
+    from mirofish_native_model import MODEL_PROFILES
+    key=MODEL_PROFILES[profile]['gguf_selection']['modelKey']
+    info=loaded.get('info') if type(loaded) is dict else None;requested=loaded.get('requested') if type(loaded) is dict else None
+    require(type(info) is dict and type(requested) is dict and info.get('identifier')==identifier and info.get('modelKey')==key and requested.get('identifier')==identifier and requested.get('key')==key and type(info.get('instanceReference')) is str and bool(info['instanceReference']),'model load readback does not name the plan profile under the run identifier: '+profile)
+    return loaded
+
+
+def swap_model(sdk,gateway,identifier,profile,state,embedding_reference,admission_for,deadline):
+    """R4, at a plan boundary only: with the gateway provably idle (its serial lock held, no call reserved or in flight)
+    unload the owned instance and confirm no language model is listed, load the next profile under the same identifier
+    with the same load settings, read it back, rebuild the admission for that profile, and require that no call arrived
+    meanwhile. state carries the profile behind the identifier and its readback for cleanup. Any failure freezes the
+    gateway before the serial lock is released, so nothing queued can reach either model, and refuses the run."""
+    from mirofish_native_model import MODEL_PROFILES
+    locked=gateway.serial.acquire(blocking=False)
+    try:
+        require(locked,'gateway not idle at the model boundary: a call holds the serial lock')
+        require(profile in MODEL_PROFILES and profile!=state.get('profile'),'closed model swap target')
+        with gateway.lock:
+            require(not gateway.cancelled.is_set(),'gateway cancelled at the model boundary')
+            busy=[row.get('id') for row in gateway.state['calls'] if row.get('state') in ('reserved','inflight')]
+            require(not busy,'gateway not idle at the model boundary: calls reserved or in flight: '+str(busy[:4]))
+            count=len(gateway.state['calls'])
+        previous=state['profile'];reference=((state.get('loaded') or {}).get('info') or {}).get('instanceReference')
+        require(deadline-time.monotonic()>0,'model swap deadline')
+        unloaded=sdk.call('unload',min(45,max(.1,deadline-time.monotonic())),identifier=identifier,instanceReference=reference,embeddingReference=embedding_reference,profile=previous)
+        require(type(unloaded) is dict and unloaded.get('unloaded')==identifier and not unloaded.get('alreadyAbsent') and type(unloaded.get('snapshot')) is dict and unloaded['snapshot'].get('llm')==[],'model swap unload not confirmed: the owned instance was absent or a language model is still listed')
+        state['loaded']=None;state['profile']=profile  # cleanup now targets the next profile under the same identifier
+        require(deadline-time.monotonic()>0,'model swap deadline')
+        loaded=check_load_readback(sdk.call('load',min(180,deadline-time.monotonic()),identifier=identifier,profile=profile),identifier,profile)
+        state['loaded']=loaded
+        admission=admission_for(profile)
+        with gateway.lock:
+            require(not gateway.cancelled.is_set() and len(gateway.state['calls'])==count,'gateway call arrived during the model swap')
+            gateway.admit_context=admission
+        return {'from_profile':previous,'to_profile':profile,'gateway_calls':count,'unload':unloaded,'load':loaded}
+    except BaseException:
+        gateway.cancel()
+        raise
+    finally:
+        if locked:gateway.serial.release()
+
+
 def execute(work,gate):
     import threading
     import sqlite3
     from mirofish_native_gateway import Gateway,Limits,make_server
-    from mirofish_native_model import SDKBridge,TemplateAdmission
+    from mirofish_native_model import SDKBridge,TemplateAdmission,MODEL_PLAN
+    plan=MODEL_PLAN  # None: one model for the whole run, exactly as before TMF4
     work=Path(work);start=time.monotonic();deadline=start+2400;active=deadline-120
     original_jvm_home=os.environ.get('HOME')
     deadline=min(deadline,float(os.environ.get('MIROFISH_HOST_DEADLINE',deadline)));active=deadline-120
     allowed={key:os.environ[key] for key in ['PATH','TMPDIR','PYTHONDONTWRITEBYTECODE','XDG_CACHE_HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','MIROFISH_RESOURCE_CAPSULE','MIROFISH_RESOURCE_KEY','MIROFISH_RESOURCE_NONCE','MIROFISH_RESOURCE_HOST','MIROFISH_HOST_DEADLINE','MIROFISH_IDENTITY_PS','MIROFISH_HOST_CONTROL_FD','MIROFISH_WORKER_COMMAND_FD','MIROFISH_WORKER_EVENT_FD'] if key in os.environ}
     os.environ.clear();os.environ.update(allowed)
     candidate,candidate_digest=verify_candidate(work)
+    if plan is not None:
+        require(candidate.get('model_plan')==plan and type(candidate.get('model_tokenizer_by_profile')) is dict and set(candidate['model_tokenizer_by_profile'])==set(plan.values()),'candidate manifest does not bind this model plan and its tokenizer pins')
     run_id=uuid.uuid4().hex;identifier='mf-native-'+run_id
     verify_launch(work,gate,candidate_digest,run_id)
     # A valid receipt does not itself provide filesystem confinement. Prove the
@@ -605,7 +686,9 @@ def execute(work,gate):
     client().call('bind',run_id=run_id,candidate_sha256=candidate_digest)
     producer=work/'owned-source/producer';control=work/'owned-source/worker-entry'
     receipt={'outcome':OUTCOME,'candidate_sha256':candidate_digest,'run_id':run_id,'requested_checkpoint':'exact pinned GGUF SDK variant; see frozen model-source-manifest','api_owned_instance':identifier,'complete':False,'model_usage':'unknown until reported','events':[]}
-    sdk=worker=graph_group=server=gateway=None;server_thread=None;model_intent=False;loaded=baseline=None
+    if plan is not None:receipt['model_plan']=dict(plan)
+    sdk=worker=graph_group=server=gateway=None;server_thread=None;model_intent=False;loaded=baseline=None;secret=None
+    model_state={'profile':plan['setup'] if plan is not None else None,'loaded':None}  # a plan's checkpoint behind the identifier
     aborted=threading.Event();stop_monitor=threading.Event();errors=[]
     def save(event,**data):
         receipt['events'].append({'event':event,'utc':datetime.now(timezone.utc).isoformat(),**data});atomic(work/'builder/native-run-receipt.json',receipt)
@@ -622,14 +705,26 @@ def execute(work,gate):
         aborted.set()
         if gateway is not None:gateway.cancel()
         raise NativeRefused('supervisor interrupted')
+    def admission_for(profile):
+        return TemplateAdmission(sdk,identifier,candidate['model_tokenizer_by_profile'][profile],embedding_native_semantics=True,profile=profile)
+    def boundary(name,phase):
+        # B1 (setup -> turns) and B2 (turns -> setup); nothing happens here with one model.
+        if plan is None:return
+        event=swap_model(sdk,gateway,identifier,plan[phase],model_state,(baseline or {}).get('embedding',{}).get('instanceReference'),admission_for,remaining())
+        save('model_swap',boundary=name,**event)
+        compatibility_probes(gateway,identifier,secret)
+        save('post_swap_compatibility_probes_passed',boundary=name,profile=plan[phase],attempts=gateway.state['chat_attempts'],reserved_output=gateway.state['reserved_output'])
     old_handlers={sig:signal.signal(sig,interrupted) for sig in (signal.SIGINT,signal.SIGTERM)}
     try:
         save('pre_resource',sample=resource(True))
         sdk=SDKBridge(work,active);baseline=sdk.call('baseline',15);save('baseline',observation=baseline)
         require(baseline.get('embeddingContext')==2048,'baseline embedding context changed')
         resource_thread=threading.Thread(target=monitor,daemon=True);resource_thread.start()
-        model_intent=True;loaded=sdk.call('load',min(180,active-time.monotonic()),identifier=identifier);save('owned_model_readback',observation=loaded)
-        admission=TemplateAdmission(sdk,identifier,candidate['model_tokenizer'],embedding_native_semantics=True)
+        model_intent=True
+        if plan is None:loaded=sdk.call('load',min(180,active-time.monotonic()),identifier=identifier)
+        else:loaded=model_state['loaded']=check_load_readback(sdk.call('load',min(180,active-time.monotonic()),identifier=identifier,profile=plan['setup']),identifier,plan['setup'])
+        save('owned_model_readback',observation=loaded)
+        admission=TemplateAdmission(sdk,identifier,candidate['model_tokenizer'],embedding_native_semantics=True) if plan is None else admission_for(plan['setup'])
         secret=uuid.uuid4().hex+uuid.uuid4().hex
         gateway=Gateway(Limits(identifier),secret,work/'builder/gateway-ledger.json',admission,resource_check=lambda:resource(False),deadline=deadline,calls_path=work/"run1/calls")
         def dispatch(route,body,deadline):
@@ -638,13 +733,7 @@ def execute(work,gate):
             return gateway._http(route,body,deadline)
         gateway.dispatch=dispatch
         server=make_server(gateway,candidate['proxy_port']);server_thread=threading.Thread(target=server.serve_forever,daemon=True);server_thread.start()
-        # Two fixed nonmarket compatibility requests. Both count in all budgets.
-        text_probe={'model':identifier,'messages':[{'role':'user','content':'Non-market transport check. Reply exactly with JSON {"ok":true}.'}],'max_tokens':512,'temperature':0}
-        raw=gateway.handle('/v1/chat/completions',text_probe,'Bearer '+secret);reply=decode(raw)['choices'][0]
-        require(reply.get('finish_reason')=='stop' and strict_probe_success(decode(reply['message'].get('content',''))) and not reply['message'].get('reasoning_content'),'no-thinking JSON probe failed')
-        tool_probe={'model':identifier,'messages':[{'role':'user','content':'Non-market transport check. Call no_effect once with ok=true. This function has no effects.'}],'max_tokens':512,'temperature':0,'parallel_tool_calls':False,'tools':[{'type':'function','function':{'name':'no_effect','description':'Transport probe only; no implementation and no effects.','parameters':{'type':'object','properties':{'ok':{'type':'boolean'}},'required':['ok'],'additionalProperties':False}}}],'tool_choice':'required'}
-        raw=gateway.handle('/v1/chat/completions',tool_probe,'Bearer '+secret);reply=decode(raw)['choices'][0];calls=reply['message'].get('tool_calls',[])
-        require(reply.get('finish_reason')=='tool_calls' and len(calls)==1 and calls[0]['function']['name']=='no_effect' and strict_probe_success(decode(calls[0]['function']['arguments'])) and not reply['message'].get('reasoning_content'),'no-thinking function-tool probe failed')
+        compatibility_probes(gateway,identifier,secret)
         save('two_compatibility_probes_passed',attempts=gateway.state['chat_attempts'],reserved_output=gateway.state['reserved_output'])
         graph_path=work/'builder/graph';neo=RUNTIME/'neo4j-community-2026.10.1'
         from mirofish_native_children import start_graph
@@ -671,12 +760,14 @@ def execute(work,gate):
         require(graph_proof.get('qualified') is True and graph_proof.get('producer_root')==str(producer) and graph_proof.get('owned_instance')==identifier,'native graph prerequisite identity mismatch')
         save('graph_prerequisite_qualified',schema=graph_proof,embedding={'model':'ym-research-embedding','dimension':768,'cardinality':1,'call_id':embedding_call['id'],'response_sha256':hashlib.sha256(embedding_raw).hexdigest(),'context':embedding_call.get('context'),'budget_charged':True},producer_root=str(producer),run_id=run_id)
         prepared=worker.request('prepare',remaining());save('native_prepared',data=prepared)
+        boundary('B1','turns')  # the worker waits for its start command; the simulation's turns go to the turns model
         before=gateway.state['chat_attempts'];native_call_start=len(gateway.state['calls'])
         started=worker.request('start',remaining());require(started['child_pgid']==worker.group.owner['pgid'],'native child escaped worker group')
         session=store.begin(prepared['simulation_id']);save('prospective_running_begin',session=session,native=started)
         terminal=worker.request('wait',remaining());require(terminal['child_exit']==0 and terminal['monitor_joined'] is True,'native terminal order failed')
         native_completed=qualify_native_chat_calls(gateway.state['calls'][native_call_start:])
         save('native_terminal',data=terminal,native_chat_attempts=gateway.state['chat_attempts']-before,completed_native_forward_calls=[row['id'] for row in native_completed])
+        boundary('B2','setup')  # the worker waits for its report command; the report goes to the setup model
         report=worker.request('report',remaining());rid=store.finish(session,report['report_id']);receipt_body,features,now=store.validate(rid)
         save('fresh_report_validated',receipt_ref=rid,report=report,features=features,manifest=receipt_body['manifest'])
         proposal={'receipt_ref':rid,'instrument':'NVDA','action':'buy','reason':'Fixed reviewed local-paper qualification from exact captured native report.'}
@@ -710,9 +801,10 @@ def execute(work,gate):
                     cleanup.append({'poisoned_sdk':sdk.group.stop(deadline)})
                     sdk=SDKBridge(work,deadline)
                 sdk.deadline=deadline
-                reference=(loaded or {}).get('info',{}).get('instanceReference')
+                reference=((loaded if plan is None else model_state['loaded']) or {}).get('info',{}).get('instanceReference')
                 embedding_reference=(baseline or {}).get('embedding',{}).get('instanceReference')
-                cleanup.append({'model':sdk.call('unload',min(45,max(.1,deadline-time.monotonic())),identifier=identifier,instanceReference=reference,embeddingReference=embedding_reference)})
+                owned_values={} if plan is None else {'profile':model_state['profile']}  # a plan's checkpoint behind the identifier now
+                cleanup.append({'model':sdk.call('unload',min(45,max(.1,deadline-time.monotonic())),identifier=identifier,instanceReference=reference,embeddingReference=embedding_reference,**owned_values)})
             except BaseException as exc:cleanup.append({'model_cleanup_failure':str(exc)})
         stop_monitor.set()
         if sdk is not None:

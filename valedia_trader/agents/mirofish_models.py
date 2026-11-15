@@ -18,8 +18,10 @@ Two kinds of profile:
 * HTTP only: any model a local OpenAI-compatible server offers (an MLX build in LM Studio, an Ollama
   tag). The HTTP backend path can use it; the native pipeline refuses it by name.
 
-The two built-in profiles are fixed here and in src/mirofish_native_model.py (a test keeps them in
+The built-in profiles are fixed here and in src/mirofish_native_model.py (a test keeps them in
 step). Registered profiles live in src/mirofish_model_registry.json, which that module also reads.
+A registered native profile's files lie under MODEL_ROOT after resolving links, and a registry that
+names a built-in profile or alias, or has a row of the wrong shape, is refused as a whole.
 """
 from __future__ import annotations
 
@@ -56,6 +58,7 @@ NATIVE_CONTEXT = 32768          # the native pipeline loads every checkpoint at 
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{1,40}")
 _SELECTION_KEYS = ("modelKey", "path", "indexedModelIdentifier", "format", "publisher", "architecture", "quantization",
                    "deviceIdentifier", "vision", "trainedForToolUse", "maxContextLength")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class ProfileError(ValueError):
@@ -90,6 +93,12 @@ PROFILES: dict[str, ModelProfile] = {
         MODEL_ROOT / "ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf", 18973870528,
         "c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747",
         MODEL_ROOT / "Qwen3.8-27B-MLX-4bit", "qwen3.8-27b", None, 262144, native_reference=True),
+    "ternary-bonsai-2-27b": ModelProfile(
+        "ternary-bonsai-2-27b", "Ternary Bonsai 2 27B Q2_0: the 27B's structure at half its memory; LM Studio also loads its "
+        "vision projector (loaded and unused); the native pipeline's setup and report model in a two-model plan",
+        MODEL_ROOT / "lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-Q2_0.gguf", 7626008928,
+        "4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e",
+        MODEL_ROOT / "Qwen3.8-27B-MLX-4bit", "ternary-bonsai-2-27b", None, 262144),
 }
 DEFAULT_PROFILE = "qwen3.8-27b"
 ALIASES = {
@@ -101,13 +110,47 @@ ALIASES = {
 
 # ---- the registry of further models
 
+def _under_root(value, what: str) -> Path:
+    """A registered native file or folder: an absolute path that lies under MODEL_ROOT after resolving links."""
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ProfileError(f"{what} must be an absolute path")
+    resolved, root = Path(value).resolve(), MODEL_ROOT.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ProfileError(f"{what} lies outside the models root {root} after resolving links")
+    return resolved
+
+
+def _check_row(file: str, name, row) -> None:
+    if not isinstance(name, str) or not _NAME.fullmatch(name):
+        raise ProfileError(f"{file}: profile name {str(name)[:64]!r} has the wrong shape")
+    if name in PROFILES or name in ALIASES:
+        raise ProfileError(f"{file}: '{name}' is a built-in profile or alias, which a registry cannot override")
+    if not isinstance(row, dict) or type(row.get("native")) is not bool:
+        raise ProfileError(f"{file}: profile '{name}' needs native true or false")
+    if not row["native"]:
+        return
+    _under_root(row.get("weight_file"), f"{file}: profile '{name}' weight_file")
+    _under_root(row.get("tokenizer_root"), f"{file}: profile '{name}' tokenizer_root")
+    if type(row.get("weight_bytes")) is not int or row["weight_bytes"] <= 0:
+        raise ProfileError(f"{file}: profile '{name}' weight_bytes must be a positive integer")
+    if not isinstance(row.get("weight_sha256"), str) or not _SHA256.fullmatch(row["weight_sha256"]):
+        raise ProfileError(f"{file}: profile '{name}' weight_sha256 must be 64 lowercase hexadecimal characters")
+    if not isinstance(row.get("gguf_selection"), dict) or set(row["gguf_selection"]) != set(_SELECTION_KEYS):
+        raise ProfileError(f"{file}: profile '{name}' gguf_selection must have exactly the fields {list(_SELECTION_KEYS)}")
+
+
 def _read_registry(registry_file: Path | None) -> dict:
     path = Path(registry_file or REGISTRY_FILE)
     if not path.exists():
         return {"profiles": {}}
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, UnicodeError):
+        raise ProfileError(f"{path.name} is not a model registry (invalid JSON)") from None
     if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
         raise ProfileError(f"{path.name} is not a model registry")
+    for name, row in data["profiles"].items():
+        _check_row(path.name, name, row)
     return data
 
 
@@ -127,12 +170,11 @@ def _from_row(name: str, row: dict) -> ModelProfile:
 
 
 def profiles(registry_file: Path | None = None) -> dict[str, ModelProfile]:
-    """Every selectable profile: the two built-in ones, then the registered ones (which cannot
-    replace a built-in)."""
+    """Every selectable profile: the built-in ones, then the registered ones (a registry that names a
+    built-in is refused)."""
     out = dict(PROFILES)
     for name, row in _read_registry(registry_file)["profiles"].items():
-        if name not in out:
-            out[name] = _from_row(name, row)
+        out[name] = _from_row(name, row)
     return out
 
 
@@ -210,6 +252,9 @@ def add(name: str, lmstudio_key: str | None = None, weights: str | Path | None =
                  "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     if weights:
         weight_file, tokenizer_root = Path(weights).expanduser().resolve(), Path(tokenizer).expanduser().resolve()
+        for path in (weight_file, tokenizer_root):
+            if path == MODEL_ROOT.resolve() or not path.is_relative_to(MODEL_ROOT.resolve()):
+                raise ProfileError(f"native files must lie under the models root {MODEL_ROOT.resolve()}: {path}")
         if weight_file.suffix != ".gguf" or not weight_file.is_file():
             raise ProfileError("the native pipeline runs a single GGUF file; --weights must be an existing .gguf")
         missing = [f for f in TOKENIZER_FILES if not (tokenizer_root / f).is_file()]

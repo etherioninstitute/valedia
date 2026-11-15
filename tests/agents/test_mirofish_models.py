@@ -148,7 +148,7 @@ def test_builtins_are_the_native_modules_builtins_and_bonsai_matches_its_pins(tm
     out = subprocess.run([sys.executable, "-B", "-c", code], cwd=tmp_path, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr[-400:]
     seen, p = json.loads(out.stdout), mm.PROFILES["ternary-bonsai-2-27b"]
-    assert seen["builtins"] == list(mm.PROFILES) == ["qwen3.8-27b", "qwen3-8b", "ternary-bonsai-2-27b"]
+    assert set(seen["builtins"]) == set(mm.PROFILES) == {"qwen3.8-27b", "qwen3-8b", "ternary-bonsai-2-27b"}
     assert (seen["weight_file"], seen["weight_bytes"], seen["sha"]) == (str(p.weight_file), p.weight_bytes, p.weight_sha256)
     assert (seen["tokenizer_root"], seen["key"], seen["context"]) == (str(p.tokenizer_root), p.lmstudio_key, p.max_context)
     assert not p.native_reference and p.native and p.builtin and p.ollama_tag is None
