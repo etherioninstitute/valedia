@@ -105,7 +105,7 @@ from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.paper import Journal, describe_skipped
 
 __all__ = ["MIN_DAYS_FOR_SHARPE", "DRAWDOWN_MULTIPLE", "SHARPE_FRACTION", "CheckCannotRun", "CheckBusy", "run_lock",
-           "annualised_sharpe", "worst_fall", "has_traded", "judge", "two_readings", "check", "main"]
+           "annualised_sharpe", "worst_fall", "has_traded", "judge", "two_readings", "check", "paper_record", "main"]
 
 MIN_DAYS_FOR_SHARPE = 60          # return observations before the Sharpe rule decides (proven reading: exact ones)
 DRAWDOWN_MULTIPLE = 1.5           # pause when the paper fall is more than this times the backtest's worst
@@ -645,6 +645,18 @@ def _sessions(lo: str, hi: str) -> tuple[list[str], str | None]:
         return [str(d.date()) for d in _CALENDAR[0].sessions_in_range(lo, hi)], None
     except Exception:
         return [str(d.date()) for d in pd.bdate_range(lo, hi)], "weekdays (the exchange calendar could not be read)"
+
+
+def paper_record(journal_dir, as_of):
+    """The paper record up to the day `as_of` (a date or YYYY-MM-DD) from the journal files in `journal_dir`, built
+    exactly as the check builds it (`_read`, the exchange sessions from the first dated entry to `as_of`, `_Record`):
+    for a reader outside the monitor (the order step's working stop, T34b-2). Reads only; raises what they raise."""
+    entries, damaged = _read(Path(journal_dir))
+    as_of = str(pd.Timestamp(as_of).date())
+    readable = [e for day, _, e in entries if day <= as_of and _date(e.get("day")) is not None]
+    lo = min((e["day"] for e in readable), default=as_of)
+    sessions, _ = _sessions(min(lo, as_of), as_of)
+    return _Record(entries, damaged, as_of, sessions)
 
 
 def _clean(x):

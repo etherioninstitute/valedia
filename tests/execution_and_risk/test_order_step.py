@@ -3781,9 +3781,10 @@ def test_a_run_without_the_new_flags_is_the_base_byte_for_byte_over_generated_sc
         base = _scenario(base_osx, tmp_path / f"base{k}", seed, monkeypatch)
         mine = _scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
         assert len(base) == len(mine)
-        for i, (b, m) in enumerate(zip(base, mine)):
-            for key in b:
-                assert b[key] == m[key], (seed, i, key)
+        for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
+            added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
+            if _t34_practice_marks(added, (seed, i)):
+                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         crashes += sum(1 for r in mine if "crashed" in r["summary"])
     assert sends > 50 and crashes > 5
@@ -5617,9 +5618,10 @@ def test_without_live_the_scheduled_run_and_the_paper_ticket_flow_are_t22bs_base
         base = _flow_scenario(t22b_base, tmp_path / f"base{k}", seed, monkeypatch)
         mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
         assert len(base) == len(mine)
-        for i, (b, m) in enumerate(zip(base, mine)):
-            for key in b:
-                assert b[key] == m[key], (seed, i, key)
+        for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
+            added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
+            if _t34_practice_marks(added, (seed, i)):
+                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
         counts["submit"] += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         counts["tickets"] += sum(1 for r in mine if '"ticket_number"' in r["summary"])
         counts["approved"] += sum(1 for r in mine if r["mode"] == "approve" and '"orders_sent": 0' not in r["summary"]
@@ -6011,9 +6013,10 @@ def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path,
         base = _flow_scenario(t32_base, tmp_path / f"base{k}", seed, monkeypatch)
         mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
         assert len(base) == len(mine)
-        for i, (b, m) in enumerate(zip(base, mine)):
-            for key in b:
-                assert b[key] == m[key], (seed, i, key)
+        for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
+            added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
+            if _t34_practice_marks(added, (seed, i)):
+                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         _shutil.rmtree(tmp_path / f"base{k}")
         _shutil.rmtree(tmp_path / f"mine{k}")
@@ -6527,9 +6530,10 @@ def test_t22d1_practice_runs_are_the_bases_byte_for_byte(tmp_path, monkeypatch, 
         base = _flow_scenario(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch)
         mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
         assert len(base) == len(mine)
-        for i, (b, m) in enumerate(zip(base, mine)):
-            for key in b:
-                assert b[key] == m[key], (seed, i, key)
+        for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
+            added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
+            if _t34_practice_marks(added, (seed, i)):
+                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
         runs += len(mine)
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         _shutil.rmtree(tmp_path / f"base{k}")
@@ -6592,10 +6596,9 @@ def test_t22d1_live_runs_that_meet_none_of_the_five_are_the_bases_apart_from_the
         base = _live_flow(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch)
         mine = _live_flow(osx, tmp_path / f"mine{k}", seed, monkeypatch)
         assert len(base) == len(mine)
-        for i, (b, m) in enumerate(zip(base, mine)):
-            for key in b:
-                if key != "second":
-                    assert b[key] == m[key], (seed, i, key)
+        for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: but for the live summary keys
+            keys = _t34_same_but(b, m, T34B2_LIVE_KEYS, (seed, i), skip=("second",))
+            assert "ceiling" in keys and "day_stop" not in keys, (seed, i, keys)             # no earlier day: no stop
             more = _Counter(m["second"]) - _Counter(b["second"])     # what this revision asks beyond the base:
             assert not (_Counter(b["second"]) - _Counter(m["second"])), (seed, i)
             assert all(sym in m["held"] for sym, _ in more), (seed, i, more)   # only held marks
@@ -6605,3 +6608,997 @@ def test_t22d1_live_runs_that_meet_none_of_the_five_are_the_bases_apart_from_the
         _shutil.rmtree(tmp_path / f"base{k}")
         _shutil.rmtree(tmp_path / f"mine{k}")
     assert added > 10 and sent > 10, (added, sent)
+
+
+# ==== T34b-2: the order step writes its faults and its ceiling, and obeys a stop that lasts the day
+#
+# docs/specs/2026-11-14-caps-ladder-design.md, D4 (the ceiling), D5, D6, D8. The summary gains `faults` (F1 the final
+# reconcile not clean, F2 a blocking attention item opened in the run, F3 on live runs a breached cap) and, on live
+# runs, `ceiling`, `working_stop` and `day_stop` (and `cap_unjudged`). A practice run is otherwise untouched.
+
+import copy as _copy
+import statistics as _statistics
+
+from valedia_trader.execution_and_risk import stake_ladder as _sl
+from valedia_trader.research_loop import decay as _dc
+
+T34B2_PRACTICE_KEYS = ("faults",)
+T34B2_LIVE_KEYS = ("faults", "cap_unjudged", "ceiling", "over_ceiling", "working_stop", "day_stop")
+T34B2_BASE = "f88593e"
+
+
+def _t34_positions_fail(w, at):
+    """The venue's positions read fails at the calls numbered in `at` (1 = the next call), and only there."""
+    real, count = w.venue.positions, [0]
+
+    def positions():
+        count[0] += 1
+        if count[0] in at:
+            w.venue.calls.append(("positions", None))
+            raise ConnectionError("positions is down")
+        return real()
+    w.venue.positions = positions
+
+
+def _t34_flag(w, kinds, prefix="x"):
+    """Open one attention item per kind in the order ledger's file, through the ledger's own write, as the ledger opens
+    them (a separate connection, the way another reconcile would)."""
+    led = w.ledger()
+    try:
+        with led._write():
+            for k, kind in enumerate(kinds):
+                led._flag(f"{prefix}-{k}", kind, f"made by the test ({k})")
+        return [i["id"] for i in led.attention(open_only=False)]
+    finally:
+        led.close()
+
+
+# ---- F1: the final reconcile
+
+def test_t34b2_a_practice_run_whose_last_reconcile_is_not_clean_ends_done_and_says_so(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    first = world.run()
+    assert first["status"] == "done" and first["orders_sent"] == 1 and "faults" not in first, first
+    world.later(30)
+    world.paper = paper({"a": {"SPY": 4.0}})
+    _later_submit(world, 0, then=lambda w: w.venue.raise_on.add("positions"))   # the final reconcile cannot read them
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["faults"] == ["reconcile"], out
+    assert world.entries("summary")[-1]["faults"] == ["reconcile"]
+    assert not any(k in out for k in T34B2_LIVE_KEYS[1:])
+
+
+def test_t34b2_an_unclean_first_reconcile_then_clean_ones_is_no_fault(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.run()
+    world.later(30)
+    _t34_positions_fail(world, {1})                                    # the run's first reconcile only
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out, out
+    led = world.ledger()
+    try:
+        assert [tuple(r) for r in led._read("SELECT clean FROM reconciles ORDER BY id")][-3:] == [(0,), (1,), (1,)]
+    finally:
+        led.close()
+
+
+def test_t34b2_a_run_stopped_at_the_reconcile_never_judges_a_final_one(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.run()
+    world.later(30)
+    _t34_positions_fail(world, {1, 2})                                 # both reconciles before sending: blocked
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and "faults" not in out, out
+
+
+# ---- F2: a blocking attention item opened in the run
+
+def test_t34b2_an_item_that_turns_up_in_the_run_is_a_fault_and_one_open_before_it_is_not(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.venue.submit_mode = ["raise"]                                # sent, never arrived: the outcome unknown
+    out = world.run()
+    assert out["stage"] == "send" and "faults" not in out, out
+    (lost,) = world.venue.submits()
+    world.later(30)
+    world.paper = paper({})
+    out = world.run()                                                  # declared never arrived
+    assert out["status"] == "done" and "faults" not in out and world.orders()[0]["state"] == "never_arrived", out
+    world.venue.book[lost] = {"symbol": "SPY", "units": 2.0, "limit": 505.0, "filled": 0.0, "state": "open"}
+    world.later(30)
+    out = world.run()                                                  # ... and then it turns up
+    assert out["status"] == "stopped" and out["stage"] == "reconcile", out
+    assert out["faults"] == ["attention:turned_up"] and world.entries("summary")[-1]["faults"] == ["attention:turned_up"]
+    world.later(30)
+    out = world.run()                                                  # the same item, opened before this run
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and "faults" not in out, out
+
+
+def test_t34b2_items_opened_in_a_done_run_are_one_entry_per_kind_sorted_and_notices_and_older_ones_are_not(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.run()
+    led = world.ledger()
+    try:
+        with led._write():
+            led._flag("old", "aaa_old", "opened before the run")
+        led.close_attention(1, "Burton", "looked")                    # closed: its id still counts as existing
+    finally:
+        led.close()
+    world.later(30)
+    world.paper = paper({"a": {"SPY": 4.0}})
+    _later_submit(world, 0, then=lambda w: _t34_flag(w, ["zeta", "alpha", "alpha", "Bad Kind!", "x" * 41, "negative_fee",
+                                                         "aaa_old"]))
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 1, out
+    assert out["faults"] == ["attention:aaa_old", "attention:alpha", "attention:unknown", "attention:zeta"], out
+
+
+def test_t34b2_a_notice_opened_in_the_run_is_no_fault(world):
+    class NegativeFee(StandIn):
+        def order_status(self, tag):
+            out = super().order_status(tag)
+            if out is not None and out["filled_units"]:
+                out["fee"] = -0.25
+            return out
+    world.venue = NegativeFee()
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.venue.fill_at_once = 1.0
+    world.paper = paper({"a": {"SPY": 2.0}})
+    out = world.run()
+    kinds = [i["kind"] for i in world.ledger().attention()]
+    assert kinds == ["negative_fee"] and out["status"] == "done" and "faults" not in out, (kinds, out)
+
+
+def _t34_faults_fail(monkeypatch):
+    """The ledger's every-item attention read fails from its second call in a run on: the faults' own read."""
+    calls, real = [], _Ledger.attention
+
+    def attention(self, open_only=True):
+        if not open_only:                                              # every item, closed ones too: the faults' read
+            calls.append(open_only)
+            if len(calls) > 1:
+                raise RuntimeError("the attention table cannot be read")
+        return real(self, open_only)
+    monkeypatch.setattr(_Ledger, "attention", attention)
+
+
+def test_t34b2_a_failure_while_the_faults_are_worked_out_ends_the_run_as_any_unexpected_failure(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.run()
+    world.later(30)
+    _t34_faults_fail(monkeypatch)
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "unexpected", out
+    assert out["reason"] == "the run failed unexpectedly: RuntimeError; the run had ended done" and "faults" not in out
+    assert [e["event"] for e in world.entries()][-2:] == ["stopped", "summary"]
+    assert world.entries("stopped")[-1]["reason"] == out["reason"]
+
+
+def test_t34b2_a_failure_while_the_faults_are_worked_out_keeps_the_stop_the_run_had_already_made(tmp_path, monkeypatch):
+    outs = []
+    for name in ("plain", "failing"):                                  # the same world twice; the second one's read fails
+        w = World(tmp_path / name)
+        w.paper = paper({"a": {"SPY": 2.0}})
+        w.venue.submit_mode = ["raise"]                                # sent, never arrived: the run stops at send
+        if name == "failing":
+            _t34_faults_fail(monkeypatch)
+        outs.append(w.run())
+    plain, failing = outs
+    assert plain["status"] == "stopped" and plain["stage"] == "send" and plain["reason"], plain
+    assert "\n" not in plain["reason"]
+    assert failing["status"] == "stopped" and failing["stage"] == "unexpected", failing
+    assert failing["reason"] == ("the run failed unexpectedly: RuntimeError; the run had ended stopped at send: "
+                                 + plain["reason"].replace(plain["batch"], failing["batch"])), failing
+    assert failing["orders_sent"] == plain["orders_sent"] and failing["refused"] == plain["refused"], (plain, failing)
+
+
+# ---- the live world of these tests: a baseline OWN 10 at 50, cash 9,500, so day 1's equity is 10,000
+
+def _t34_paper_book(journal, returns, end="2026-11-12", capital=100_000.0, name="a"):
+    """The paper trader's day summaries for `name` on the exchange sessions ending `end`: one that does not hold it,
+    then one per return (its value change over the capital), each adding up."""
+    days = [str(d.date()) for d in CAL.sessions_in_range("2025-06-02", end)[-(len(returns) + 1):]]
+    equity, value = 1_000_000.0, 0.0
+    journal.write(days[0], {"type": "summary", "equity": equity, "strategy_values": {}, "strategy_value_change": {},
+                            "capital_per_strategy": capital})
+    for d, r in zip(days[1:], returns):
+        change = r * capital
+        value, equity = value + change, equity + change
+        journal.write(d, {"type": "summary", "equity": equity, "strategy_values": {name: value},
+                          "strategy_value_change": {name: change}, "capital_per_strategy": capital})
+
+
+def _t34_world(tmp, wall=None, returns=None, conf=None, venue=None):
+    limits = None if wall is None else {**LIVE_LIMITS, "max_daily_loss_pct": wall}
+    w = live_world(tmp, venue=venue if venue is not None else LiveVenue(held={"OWN": 10.0}, cash=9_500.0), limits=limits,
+                   conf=conf)
+    if returns is not None:
+        _t34_paper_book(w.journal, returns)
+    return w
+
+
+def _t34_day_one(w):
+    """2026-11-13: a ticket for IWM 3 and TLT 4, approved and filled at once (cash 9,500 less 606 and 404)."""
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 2 and "day_stop" not in out, out
+    w.venue.fill_at_once = 0.0
+    assert w.book() == {"IWM": 3.0, "TLT": 4.0} and w.venue.cash_value == 8_490.0
+    return out
+
+
+def _t34_day_two(w, cash):
+    """The next session, 10:00: held IWM 3 at 200, TLT 4 at 100, OWN 10 at 50, so the equity is cash + 1,500."""
+    w.next_day()
+    w.venue.cash_value = cash
+    st = osx.OrderStepState(w.state_path)
+    try:
+        assert st.previous_equity(str(ny_day(w.clock.t).date())) == 10_000.0
+    finally:
+        st.close()
+
+
+def _refused_by(out, by):
+    return [r["symbol"] for r in out["refused"] if r["by"] == by]
+
+
+FLOOR_STOP = {"pct": 1.0, "basis": "fewer than 25 returns: the floor", "n": 0}
+
+
+# ---- C: the ceiling, on every live summary once the confirmation is in force
+
+def test_t34b2_every_live_summary_with_a_confirmation_carries_its_max_capital_as_the_ceiling(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    out = _t34_day_one(w)
+    assert out["ceiling"] == 5000.0 and type(out["ceiling"]) is float
+    assert all(e["ceiling"] == 5000.0 for e in w.entries("summary") if e["venue"] == "webull-production")
+    assert out["working_stop"] == FLOOR_STOP and "faults" not in out and "cap_unjudged" not in out
+    _unmet(w, "too few days")                                        # lock 2 unmet; the confirmation still in force
+    w.later(1)
+    out = lpropose(w)
+    assert out["stage"] == "lock" and out["ceiling"] == 5000.0 and "working_stop" not in out, out
+    _unmet(w, "lapsed")                                              # no confirmation in force: no ceiling
+    out = lpropose(w)
+    assert out["stage"] == "lock" and "ceiling" not in out, out
+
+
+def test_t34b2_no_ceiling_and_no_live_key_on_a_practice_summary(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 2.0}})
+    tw.later(1)
+    for out in (approve(tw, number), tw.run()):
+        assert out["status"] == "done" and not any(k in out for k in T34B2_LIVE_KEYS), out
+    assert not any(k in e for e in tw.entries("summary") for k in T34B2_LIVE_KEYS)
+
+
+# ---- F3: a breached cap, live runs only
+
+class _Overpriced(LiveVenue):
+    """Reports each fill at twice its limit."""
+
+    def order_status(self, tag):
+        out = super().order_status(tag)
+        if out is not None and out["avg_price"] is not None:
+            out["avg_price"] = out["avg_price"] * 2
+        return out
+
+
+class _Unpriced(LiveVenue):
+    """Reports each fill without an average price."""
+
+    def order_status(self, tag):
+        out = super().order_status(tag)
+        if out is not None:
+            out["avg_price"] = None
+        return out
+
+
+def test_t34b2_a_fill_of_this_batch_above_max_order_value_is_a_cap_fault(tmp_path):
+    w = _t34_world(tmp_path / "w", venue=_Overpriced(held={"OWN": 10.0}, cash=9_500.0))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)                                         # IWM 3 at 404: 1,212 > 1,000; TLT 4 at 202: 808
+    assert out["status"] == "done" and out["orders_sent"] == 2 and out["faults"] == ["cap"], out
+    assert "cap_unjudged" not in out and w.entries("summary")[-1]["faults"] == ["cap"]
+    w.later(1)
+    out = lpropose(w)                                                 # a later batch: those fills are not its own
+    assert out["status"] == "done" and "faults" not in out, out
+
+
+def test_t34b2_a_book_above_the_ceiling_through_a_mark_that_rose_is_no_fault_and_is_said_as_over_ceiling(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    w.next_day()
+    w.prices["IWM"] = 1_500.0                                        # 4,500 + 400 = 4,900: not above 5,000
+    out = lpropose(w)
+    assert out["status"] == "done" and "faults" not in out and "over_ceiling" not in out, out
+    w.later(1)
+    w.prices["IWM"] = 1_534.0                                        # 4,602 + 400 = 5,002 > 5,000: information only
+    out = lpropose(w)
+    assert out["status"] == "done" and out["stage"] is None and "faults" not in out and out["ceiling"] == 5000.0, out
+    assert out["over_ceiling"] == {"at_work": 5002.0, "ceiling": 5000.0}, out
+    assert w.entries("summary")[-1]["over_ceiling"] == {"at_work": 5002.0, "ceiling": 5000.0}
+    p = ticket_world(tmp_path / "p")                                  # the same book in practice: nothing is judged
+    p.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}})
+    p.venue.fill_at_once = 1.0
+    p.run()
+    p.next_day()
+    p.prices["IWM"] = 1_534.0
+    out = p.run()
+    assert out["status"] == "done" and not any(k in out for k in T34B2_LIVE_KEYS), out
+
+
+def test_t34b2_a_ceiling_the_owner_lowered_between_two_runs_is_no_fault_and_is_said_as_over_ceiling(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    w.next_day()                                                     # 3 x 200 + 4 x 100 = 1,000 at work
+    out = lpropose(w)
+    assert out["status"] == "done" and "over_ceiling" not in out and "faults" not in out, out
+    (w.cfg / "webull_live.json").write_text(json.dumps(live_conf(max_capital=900, max_order_value=900)))
+    w.later(1)
+    out = lpropose(w, capital=900.0)                                 # the capital follows the lowered ceiling
+    assert out["status"] == "done" and out["ceiling"] == 900.0 and "faults" not in out, out
+    assert out["over_ceiling"] == {"at_work": 1000.0, "ceiling": 900.0}, out
+
+
+def test_t34b2_holdings_an_earlier_run_bought_above_the_ceiling_are_no_fault_while_this_run_sells(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    w.next_day()
+    w.prices["IWM"] = 1_700.0                                        # 5,100 + 400 = 5,500 > 5,000, bought by day one
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 2.0}})  # this run's batch: a sale of TLT 2
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["sent"][0]["units"] == -2.0, out
+    assert "faults" not in out and out["over_ceiling"] == {"at_work": 5300.0, "ceiling": 5000.0}, out
+
+
+def test_t34b2_a_fill_without_a_price_is_not_judged_and_is_named(tmp_path):
+    w = _t34_world(tmp_path / "w", venue=_Unpriced(held={"OWN": 10.0}, cash=9_500.0))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 2, out
+    assert out["cap_unjudged"] == ["IWM", "TLT"] and "faults" not in out, out
+
+
+# ---- F3 (ii) and (iii), addendum 1: a fill that broke what the run had checked, from this batch's own orders
+
+class _ThroughLimit(LiveVenue):
+    """Reports each fill at its limit times `buy` (a purchase) or `sell` (a sale)."""
+    buy, sell = 1.0, 1.0
+
+    def order_status(self, tag):
+        out = super().order_status(tag)
+        if out is not None and out["avg_price"] is not None:
+            out["avg_price"] = out["avg_price"] * (self.buy if self.book[tag]["units"] > 0 else self.sell)
+        return out
+
+
+@pytest.mark.parametrize("factor, fault", [(1.01, True), (1 + 5e-7, False), (1.0, False)])
+def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
+    venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
+    venue.buy = factor                                                # IWM 3 at 202 x 1.01: 612, under max_order_value
+    w = _t34_world(tmp_path / "w", venue=venue)
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 2, out
+    assert out.get("faults") == (["cap"] if fault else None) and "cap_unjudged" not in out, out
+
+
+@pytest.mark.parametrize("factor, fault", [(0.99, True), (1 - 5e-7, False), (1.0, False)])
+def test_t34b2_a_sale_filled_below_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
+    venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
+    w = _t34_world(tmp_path / "w", venue=venue)
+    _t34_day_one(w)
+    w.next_day()
+    venue.sell = factor
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 2.0}})  # a sale of TLT 2, limit 98
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 1 and out["sent"][0]["units"] == -2.0, out
+    assert out.get("faults") == (["cap"] if fault else None), out
+
+
+def _t34_extra_fill(w, units):
+    """After the run's second (last) submit: one more fill row for that order, written into the ledger file the way
+    a fill row is stored, and the same units at the venue (so the positions still agree)."""
+    done = []
+
+    def then(w):
+        if done or len(w.venue.submits()) < 2:
+            return
+        tag = w.venue.submits()[-1]
+        o = w.venue.book[tag]
+        sign = 1.0 if o["units"] > 0 else -1.0
+        con = sqlite3.connect(w.ledger_path)
+        try:
+            with con:
+                con.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) "
+                            "VALUES (?,?,?,?,?,?,?,0)", (tag, o["symbol"], sign * units, o["limit"], units, 0.0, w.clock.t))
+        finally:
+            con.close()
+        w.venue.held[o["symbol"]] = w.venue.held.get(o["symbol"], 0.0) + sign * units
+        done.append(tag)
+    _later_submit(w, 0, then=then)
+    return done
+
+
+@pytest.mark.parametrize("extra, fault", [(1.0, True), (1e-10, False)])
+def test_t34b2_one_orders_fills_summing_to_more_units_than_it_asked_for_are_a_cap_fault(tmp_path, extra, fault):
+    w = _t34_world(tmp_path / "w")
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    done = _t34_extra_fill(w, extra)
+    out = lapprove(w, number)
+    assert done and out["orders_sent"] == 2, out
+    assert ("cap" in out.get("faults", [])) is fault, out
+
+
+class _Overfilling(LiveVenue):
+    """Reports half as many units again as each order asked for once it fills."""
+
+    def order_status(self, tag):
+        out = super().order_status(tag)
+        if out is not None and out["filled_units"]:
+            out["filled_units"] = out["filled_units"] * 1.5
+        return out
+
+
+def test_t34b2_a_broker_that_reports_an_overfill_is_refused_by_the_ledger_and_is_a_reconcile_fault(tmp_path):
+    w = _t34_world(tmp_path / "w", venue=_Overfilling(held={"OWN": 10.0}, cash=9_500.0))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    out = lapprove(w, number)
+    assert w.fills() == [], w.fills()                                 # the ledger stores no fill above an order's size
+    assert "reconcile" in out.get("faults", []) and "cap" not in out.get("faults", []), out
+
+
+# ---- S1: the working stop
+
+def _alternating(n, size=0.006):
+    return [size if k % 2 == 0 else -size for k in range(n)]
+
+
+@pytest.mark.parametrize("returns, wall, pct, basis, n", [
+    (_alternating(25), None, "formula", "25 returns ending 2026-11-12", 25),
+    (_alternating(31), None, "formula", "25 returns ending 2026-11-12", 25),
+    (_alternating(24), None, 1.0, "fewer than 25 returns: the floor", 24),
+    (_alternating(25, 0.02), 2.0, 2.0, "25 returns ending 2026-11-12; held at the owner's daily halt", 25),
+    (_alternating(24), 0.5, 0.5, "fewer than 25 returns: the floor; held at the owner's daily halt", 24),
+    ([0.001, -1.0], 2.0, 1.0, "the paper record could not be read: the floor", 0),
+    ([0.001, -1.0], 0.5, 0.5, "the paper record could not be read: the floor; held at the owner's daily halt", 0)])
+def test_t34b2_the_working_stop_comes_from_the_paper_books_last_25_exact_returns(tmp_path, returns, wall, pct, basis, n):
+    w = _t34_world(tmp_path / "w", wall=wall, returns=returns)
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done", out
+    if pct == "formula":
+        pct = _sl.STOP_MULTIPLE * _statistics.stdev(r * 100 for r in returns[-25:])
+        assert 1.0 < pct < 99.0
+        assert out["working_stop"]["pct"] == pytest.approx(pct, rel=1e-9, abs=0)
+        assert out["working_stop"]["pct"] == _sl.working_stop_pct(
+            _sl.paper_returns(_dc.paper_record(w.journal.dir, "2026-11-13"), ["a"]), 99.0).pct
+        out["working_stop"]["pct"] = pct
+    assert out["working_stop"] == {"pct": pct, "basis": basis, "n": n}, out
+    assert w.entries("summary")[-1]["working_stop"] == out["working_stop"]
+
+
+def test_t34b2_a_paper_record_that_cannot_be_read_sets_the_floor_and_says_so(tmp_path, monkeypatch):
+    w = _t34_world(tmp_path / "w", wall=2.0, returns=_alternating(25, 0.02))
+
+    def unreadable(directory, as_of):
+        raise OSError("the journal folder cannot be read")
+    monkeypatch.setattr(_dc, "paper_record", unreadable)
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and out["working_stop"] == {
+        "pct": 1.0, "basis": "the paper record could not be read: the floor", "n": 0}, out
+
+
+def test_t34b2_the_working_stop_is_worked_out_once_after_the_paper_book_and_before_any_order(tmp_path, monkeypatch):
+    w = _t34_world(tmp_path / "w")
+    seen = []
+    real = _dc.paper_record
+
+    def spy(directory, as_of):
+        seen.append((Path(directory), as_of, len(w.venue.submits()), len(w.quote_calls)))
+        return real(directory, as_of)
+    monkeypatch.setattr(_dc, "paper_record", spy)
+    _t34_day_one(w)
+    assert seen == [(w.tmp / "journal", "2026-11-13", 0, 1), (w.tmp / "journal", "2026-11-13", 0, 2)]   # one ask each
+
+
+# ---- S2, S3, S5: the trip, and what is refused in the day stop
+
+@pytest.mark.parametrize("own_after, trips", [(41.0, True), (41.001, False)])
+def test_t34b2_the_day_stop_trips_at_the_look_where_the_loss_first_reaches_the_working_stop(tmp_path, own_after, trips):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_490.0)                                        # 9,990: a loss of 0.1%
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 0.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and len(out["ticket"]["orders"]) == 3 and "day_stop" not in out, out
+    w.later(1)
+    for s in ("OWN", "IWM", "TLT", "GLD"):
+        w.quote_age[s] = 19.5 * 60                                    # stale after the first send: asked again
+
+    def own_falls(w):
+        w.prices["OWN"] = own_after
+    _later_submit(w, 2, then=own_falls)
+    out = lapprove(w, out["ticket_number"])
+    assert out["status"] == "done" and "faults" not in out, out
+    assert [s["symbol"] for s in out["sent"]] == (["IWM", "TLT"] if trips else ["IWM", "TLT", "GLD"]), out
+    if trips:                                                          # the second look: 8,490 + 600 + 400 + 410 = 9,900
+        assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False}
+        assert _refused_by(out, "day stop") == ["GLD"] and len(out["refused"]) == 1
+        (line,) = [r for r in ticket_rows(w, "outcomes") if r["outcome"] == "not sent"]
+        assert line["reason"].startswith("refused by the day stop: ") and "GLD" not in {o["symbol"] for o in w.orders()}
+    else:                                                              # 9,900.01: a loss of 0.9999%
+        assert "day_stop" not in out and out["refused"] == []
+    assert w.entries("summary")[-1].get("day_stop") == out.get("day_stop")
+
+
+@pytest.mark.parametrize("cash, loss, wall_flag", [(8_350.0, 1.5, False), (8_300.0, 2.0, True), (8_250.0, 2.5, True)])
+def test_t34b2_the_wall_flag_says_whether_the_loss_also_reached_the_owners_daily_halt(tmp_path, cash, loss, wall_flag):
+    w = _t34_world(tmp_path / "w", wall=2.0)
+    _t34_day_one(w)
+    _t34_day_two(w, cash)
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and "faults" not in out, out
+    assert out["day_stop"] == {"pct": pytest.approx(loss, abs=1e-9), "limit": 1.0, "wall": wall_flag}, out
+    assert [o["fund"] for o in out["ticket"]["orders"]] == ["IWM"] and _refused_by(out, "day stop") == ["GLD"]
+
+
+def test_t34b2_in_the_day_stop_a_buy_is_refused_once_before_the_gate_and_nothing_is_reserved(tmp_path, monkeypatch):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_400.0)                                        # 9,900: exactly the floor
+    gate = []
+    real = osx.risk_gate.check_order
+    monkeypatch.setattr(osx.risk_gate, "check_order", lambda order, *a, **k: gate.append(order["symbol"]) or real(order, *a, **k))
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0, "QQQ": 1.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False}, out
+    assert gate == ["IWM"] and _refused_by(out, "day stop") == ["GLD", "QQQ"]
+    refused = w.entries("refused")
+    assert [(e["symbol"], e["by"]) for e in refused] == [("GLD", "day stop"), ("QQQ", "day stop")]
+    assert all("working stop of 1.00%" in e["reason"] and "reducing orders still pass" in e["reason"] for e in refused)
+    assert [o["fund"] for o in out["ticket"]["orders"]] == ["IWM"] and not {"GLD", "QQQ"} & {o["symbol"] for o in w.orders()}
+    w.later(1)
+    out = lapprove(w, out["ticket_number"])                          # the sale goes through every check
+    assert out["status"] == "done" and [s["symbol"] for s in out["sent"]] == ["IWM"], out
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False, "carried": True}
+    assert {o["symbol"] for o in w.orders() if o["created"] > ny("2026-11-16 00:00")} == {"IWM"}
+
+
+# ---- S4: later runs the same New York day, and the next day
+
+def test_t34b2_a_later_run_the_same_day_starts_in_the_day_stop_and_the_next_new_york_day_does_not(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_400.0)
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False} and _refused_by(out, "day stop") == ["GLD"], out
+    w.venue.cash_value = 8_490.0                                    # the loss is back to 0.1%: the day is still stopped
+    w.later(1)
+    out = lpropose(w)
+    assert out["status"] == "done" and _refused_by(out, "day stop") == ["GLD"], out
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False, "carried": True}
+    assert "carried" not in w.entries("summary")[-2]["day_stop"] and w.entries("summary")[-1]["day_stop"]["carried"] is True
+    w.later(1)
+    out = lapprove(w, out["ticket_number"])
+    assert out["status"] == "done" and [s["symbol"] for s in out["sent"]] == ["IWM"] and out["day_stop"]["carried"], out
+    w.next_day()                                                    # 2026-11-17: nothing carries
+    out = lpropose(w)
+    assert out["status"] == "done" and "day_stop" not in out and out["refused"] == [], out
+    assert [o["fund"] for o in out["ticket"]["orders"]] == ["IWM", "GLD"]
+
+
+def test_t34b2_a_run_stopped_after_the_trip_still_records_it_and_a_later_run_reads_it_back(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_490.0)
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)                                                # no stop yet: the ticket holds the sale and the buy
+    assert "day_stop" not in out and [o["fund"] for o in out["ticket"]["orders"]] == ["IWM", "GLD"], out
+    w.later(1)
+    w.venue.cash_value = 8_400.0                                    # 9,900 at the approve's first look
+    w.venue.submit_mode = ["raise"]                                  # the sale's outcome unknown: the run stops at send
+    out = lapprove(w, out["ticket_number"])
+    assert out["stage"] == "send" and out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False}, out
+    assert w.entries("summary")[-1]["day_stop"] == out["day_stop"]
+    w.later(30)
+    w.venue.cash_value = 8_490.0
+    out = lpropose(w)
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False, "carried": True}, out
+
+
+# ---- addendum 2 (C1): the trip journaled when it happens, so the stop survives a run that dies
+
+def test_t34b2_the_trip_is_journaled_once_at_the_look_synced_before_the_refusal_and_a_carried_stop_writes_none(
+        tmp_path, monkeypatch):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_400.0)
+    synced, real = [], osx._sync_file
+    monkeypatch.setattr(osx, "_sync_file", lambda path: synced.append(len(w.entries())) or real(path))
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0, "QQQ": 1.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False}, out
+    events = [e["event"] for e in w.entries() if e["batch"] == out["batch"]]
+    assert events.count("day_stop") == 1 and events.index("day_stop") < events.index("refused"), events
+    (line,) = w.entries("day_stop")
+    assert {k: line[k] for k in ("pct", "limit", "wall")} == {"pct": 1.0, "limit": 1.0, "wall": False}
+    assert line["venue"] == "webull-production" and line["day"] == "2026-11-16" and set(line) == {
+        "timestamp", "day", "type", "venue", "batch", "event", "pct", "limit", "wall"}
+    at = [e for e in w.entries()].index(line) + 1
+    assert at in synced, (at, synced)                                # synced with the line as the journal's last
+    w.later(1)
+    out = lapprove(w, out["ticket_number"])                          # carried: it did not trip, it writes no line
+    assert out["day_stop"]["carried"] is True and len(w.entries("day_stop")) == 1, out
+
+
+class _Killed(BaseException):
+    """What a kill looks like from inside: no handler of the order step's own runs, so no summary is written."""
+
+
+def _t34_cut_off_after_the_trip(w, how):
+    """Run a live propose that trips the day stop and is cut off at the first refusal by the day stop: raised from
+    inside the run, or by a real SIGKILL of a forked child that runs it. The run writes no summary either way."""
+    batches = {e["batch"] for e in w.entries("summary")}
+    if how == "raise":
+        def refuse(self, c, by, *a, **k):
+            if by == "day stop":
+                raise _Killed()
+            return real(self, c, by, *a, **k)
+        real = osx._Run._refuse
+        osx._Run._refuse = refuse
+        try:
+            with pytest.raises(_Killed):
+                lpropose(w)
+        finally:
+            osx._Run._refuse = real
+    else:
+        r, wfd = _os.pipe()
+        pid = _os.fork()
+        if pid == 0:                                                   # the child
+            _os.close(r)
+            try:
+                def stop(self, c, by, *a, **k):
+                    if by == "day stop":
+                        _os.write(wfd, b"K")
+                        _time.sleep(240)
+                    return real(self, c, by, *a, **k)
+                real = osx._Run._refuse
+                osx._Run._refuse = stop
+                lpropose(w)
+                _os.write(wfd, b"D")
+            except BaseException:
+                _os.write(wfd, b"E" + _traceback.format_exc().encode()[-2000:])
+            finally:
+                _os._exit(0)
+        _os.close(wfd)
+        try:
+            ready, _, _ = _select.select([r], [], [], 120.0)
+            data = _os.read(r, 4096) if ready else b""
+            if not ready or data[:1] == b"K":
+                _os.kill(pid, _signal.SIGKILL)                         # our own child, by its process id
+        finally:
+            _os.waitpid(pid, 0)
+            _os.close(r)
+        assert data[:1] == b"K", data
+    assert {e["batch"] for e in w.entries("summary")} == batches       # no summary of the run that was cut off
+
+
+@pytest.mark.parametrize("how", ["raise", "sigkill"])
+def test_t34b2_a_run_cut_off_after_the_trip_still_stops_the_rest_of_the_new_york_day(tmp_path, how):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_400.0)                                        # 9,900: the floor's 1% at the first look
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    _t34_cut_off_after_the_trip(w, how)
+    (line,) = w.entries("day_stop")
+    assert {k: line[k] for k in ("pct", "limit", "wall")} == {"pct": 1.0, "limit": 1.0, "wall": False}, line
+    assert not any("day_stop" in e for e in w.entries("summary"))   # only the line records it
+    w.venue.cash_value = 8_490.0                                    # the loss is back to 0.1%: the day is still stopped
+    w.later(1)
+    out = lpropose(w)
+    assert out["status"] == "done" and _refused_by(out, "day stop") == ["GLD"], out
+    assert out["day_stop"] == {"pct": 1.0, "limit": 1.0, "wall": False, "carried": True}, out
+    assert [o["fund"] for o in out["ticket"]["orders"]] == ["IWM"] and len(w.entries("day_stop")) == 1
+    w.later(1)
+    out = lapprove(w, out["ticket_number"])                          # the sale is sent
+    assert out["status"] == "done" and [s["symbol"] for s in out["sent"]] == ["IWM"] and out["day_stop"]["carried"], out
+    w.next_day()                                                    # the next New York day: nothing carries
+    out = lpropose(w)
+    assert out["status"] == "done" and "day_stop" not in out and out["refused"] == [], out
+    assert [o["fund"] for o in out["ticket"]["orders"]] == ["IWM", "GLD"], out      # the sale was sent, not filled
+
+
+def test_t34b2_a_trip_line_that_cannot_be_written_stops_the_run_and_nothing_is_sent(tmp_path, monkeypatch):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_490.0)
+    w.paper = paper({"a": {"IWM": 0.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)                                                # no stop yet: the sale and the buy
+    assert "day_stop" not in out and [o["fund"] for o in out["ticket"]["orders"]] == ["IWM", "GLD"], out
+    real = Journal.write
+
+    def write(self, day, entry):
+        if entry.get("event") == "day_stop":
+            raise OSError("the disk is full")
+        return real(self, day, entry)
+    monkeypatch.setattr(Journal, "write", write)
+    sent_before = len(w.venue.submits())
+    w.later(1)
+    w.venue.cash_value = 8_400.0                                    # the approve's first look trips
+    out = lapprove(w, out["ticket_number"])
+    assert out["status"] == "stopped" and out["stage"] == "send" and out["orders_sent"] == 0, out   # as any journal failure
+    assert out["reason"].startswith("the ledger, the state file or the journal failed: OSError"), out
+    assert len(w.venue.submits()) == sent_before and w.entries("day_stop") == []
+
+
+def test_t34b2_a_day_stop_line_of_another_venue_or_day_or_kind_does_not_carry_and_unreadable_values_carry_as_null(
+        tmp_path):
+    w = _t34_world(tmp_path / "w")
+    _t34_day_one(w)
+    _t34_day_two(w, 8_490.0)
+    day = str(ny_day(w.clock.t).date())
+    for e in ({"type": "order_step", "venue": gl.PAPER_VENUE, "event": "day_stop", "pct": 3.0, "limit": 1.0, "wall": False},
+              {"type": "paper", "venue": "webull-production", "event": "day_stop", "pct": 3.0, "limit": 1.0, "wall": False}):
+        w.journal.write(day, {"batch": "x", **e})
+    w.journal.write("2026-11-13", {"type": "order_step", "venue": "webull-production", "batch": "y", "event": "day_stop",
+                                   "pct": 3.0, "limit": 1.0, "wall": False})
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and "day_stop" not in out and out["refused"] == [], out
+    w.journal.write(day, {"type": "order_step", "venue": "webull-production", "batch": "z", "event": "day_stop",
+                          "pct": "x", "limit": None, "wall": "no"})
+    w.later(1)
+    out = lpropose(w)
+    assert out["day_stop"] == {"pct": None, "limit": None, "wall": None, "carried": True}, out
+    assert _refused_by(out, "day stop") == ["GLD"], out
+
+
+def test_t34b2_a_day_stop_on_another_venue_or_an_earlier_day_does_not_carry(tmp_path):
+    w = _t34_world(tmp_path / "w")
+    w.journal.write("2026-11-13", {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "x", "event": "summary",
+                                   "status": "done", "stage": None, "day_stop": {"pct": 3.0, "limit": 1.0, "wall": False}})
+    w.journal.write("2026-11-12", {"type": "order_step", "venue": "webull-production", "batch": "y", "event": "summary",
+                                   "status": "done", "stage": None, "day_stop": {"pct": 3.0, "limit": 1.0, "wall": False}})
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    out = lpropose(w)
+    assert out["status"] == "done" and "day_stop" not in out and out["ticket"]["orders"], out
+    w.journal.write("2026-11-13", {"type": "order_step", "venue": "webull-production", "batch": "z", "event": "summary",
+                                   "status": "stopped", "stage": "prices", "day_stop": "not a mapping"})
+    w.later(1)
+    out = lpropose(w)                                                # an unreadable stop still counts as a stop
+    assert out["day_stop"] == {"pct": None, "limit": None, "wall": None, "carried": True}, out
+    assert _refused_by(out, "day stop") == ["IWM"] and out["ticket"]["orders"] == []
+
+
+# ---- P: the day stop and the working stop never act on a practice run
+
+def test_t34b2_a_practice_run_past_any_working_stop_refuses_nothing_and_writes_no_live_key(tmp_path):
+    w = ticket_world(tmp_path / "w", Booked(held={"OWN": 10.0}, cash=9_500.0))
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.venue.fill_at_once = 1.0
+    assert w.run()["orders_sent"] == 2
+    w.next_day()
+    w.venue.cash_value = 5_000.0                                    # a loss of 45%
+    w.paper = paper({"a": {"IWM": 3.0, "TLT": 4.0, "GLD": 2.0}})
+    w.journal.write(str(ny_day(w.clock.t).date()), {"type": "order_step", "venue": w.venue.name, "batch": "x",
+                                                    "event": "day_stop", "pct": 3.0, "limit": 1.0, "wall": False})
+    out = w.run()                                                    # ... and a day_stop line it never reads
+    assert out["status"] == "done" and [s["symbol"] for s in out["sent"]] == ["GLD"] and out["refused"] == [], out
+    assert not any(k in e for e in [out, *w.entries("summary")] for k in T34B2_LIVE_KEYS)
+    assert [e["batch"] for e in w.entries("day_stop")] == ["x"]      # addendum 2: practice never writes the line
+
+
+# ---- P and the comparisons with earlier revisions: equal but for the added keys
+
+def _t34_same_but(b, m, keys, where, skip=()):
+    """One run's record through an earlier revision (`b`) and through this one (`m`): every part equal, except that
+    this revision's summaries, returned and journaled, may carry the keys `keys` that the earlier one's do not; a
+    journal line that differs is a summary line, the earlier line with only such keys added at its end (the journal
+    holds the summaries of earlier runs too). Returns the keys added to the returned summary, with their values."""
+    added = {}
+    for key in b:
+        if key in skip:
+            continue
+        if key == "summary":
+            bs, ms = json.loads(b[key]), json.loads(m[key])
+            added = {k: ms.pop(k) for k in keys if k in ms and k not in bs}
+            assert json.dumps(ms, sort_keys=True, default=str) == b[key], (where, key)
+        elif key == "journal":
+            assert sorted(b[key]) == sorted(m[key]), (where, key)
+            for name in b[key]:
+                bl, ml = b[key][name].split(b"\n"), m[key][name].split(b"\n")
+                assert len(bl) == len(ml), (where, name)
+                for x, y in zip(bl, ml):
+                    if x == y:
+                        continue
+                    e = json.loads(y)
+                    extra = [k for k in e if k in keys]
+                    assert extra and e.get("event") == "summary" and list(e)[-len(extra):] == extra, (where, name)
+                    assert json.dumps({k: v for k, v in e.items() if k not in keys}, default=str).encode() == x, (where, name)
+        else:
+            assert b[key] == m[key], (where, key)
+    return added
+
+
+def _t34_practice_marks(added, where):
+    """A practice run may carry `faults` only, and only reconcile and attention entries."""
+    assert set(added) <= {"faults"}, where
+    if added:
+        f = added["faults"]
+        assert f and len(f) == len(set(f)) and all(x == "reconcile" or x.startswith("attention:") for x in f), (where, f)
+        assert f == (["reconcile"] if "reconcile" in f else []) + sorted(x for x in f if x != "reconcile"), (where, f)
+    return bool(added)
+
+
+@pytest.fixture(scope="module")
+def t34b2_base(tmp_path_factory):
+    """The order step of this ticket's base revision, from git, loaded under its own name."""
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{T34B2_BASE}:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True, check=True).stdout
+    folder = tmp_path_factory.mktemp("t34b2_base_order_step")
+    path = folder / "order_step_t34b2_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t34b2_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t34b2_base"] = mod
+    spec.loader.exec_module(mod)
+    assert hasattr(mod._Run, "_judge_marks") and "working_stop" not in src.decode()
+    return mod
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_them(tmp_path, monkeypatch, t34b2_base,
+                                                                                   seed_block):
+    """50 scenarios per block, 300 in all, of the scheduled run and the paper ticket flow (kills, partial fills,
+    refusals, wrong numbers), through f88593e and here: venue calls, journal lines, ledger, state and tickets equal; the
+    summaries equal but for `faults`, carried only where F1 or F2 marks the run."""
+    runs = marked = sends = 0
+    for k in range(50):
+        seed = 990_000 + seed_block * 50 + k
+        base = _flow_scenario(t34b2_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
+            if _t34_practice_marks(added, (seed, i)):
+                marked += 1
+                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+        runs += len(mine)
+        sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    print(f"T34B2-PRACTICE block {seed_block}: runs {runs}, marked {marked}, sends {sends}")
+    assert runs >= 200 and sends > 30 and marked > 0, (runs, marked, sends)
+
+
+def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch):
+    """One generated live scenario, run by run through `mod` (this revision); before each run the whole world (files,
+    venue, second source, clock, prices) is copied and the same run is made through `base_mod` from the copy, so that
+    each comparison has the same inputs. Returns per run: the orders each sent, whether a day stop was in force, the
+    summary keys added."""
+    rng = random.Random(seed)
+    cap = rng.choice([2500, 6000, 20_000])
+    mov = rng.choice([m for m in (400, 900, 2500, 5000) if m <= cap])
+    held = rng.choice([{"OWN": 10.0}, {"OWN": 10.0, "QQQ": 2.0}])
+    wall = rng.choice([0.5, 1.0, 2.0, 5.0, 99.0])
+    w = live_world(tmp / "w", venue=LiveVenue(held=held, cash=rng.choice([2_000.0, 9_500.0, 40_000.0])),
+                   conf=live_conf(max_order_value=mov, max_capital=cap), limits={**LIVE_LIMITS, "max_daily_loss_pct": wall})
+    n = rng.choice([0, 10, 24, 25, 30])
+    if n:
+        size = rng.choice([0.001, 0.004, 0.01])
+        _t34_paper_book(w.journal, [rng.choice([size, -size, size / 2, 0.0]) for _ in range(n)])
+    capital = float(rng.choice([cap, round(cap * rng.uniform(0.3, 1.0), 2)]))
+    out_runs = []
+    counter = [0]
+
+    def one(**kw):
+        counter[0] += 1
+        f = _follow_the_book(w)
+        before = set(w.book()) | set(held)
+        w.second.verdicts = {s: ("agree" if s in before else rng.choice(["agree", "agree", "agree", "disagree"]))
+                             for s in ("SPY", "QQQ", "IWM", "TLT", "GLD")}
+        results = {}
+        for name, which in (("base", base_mod), ("mine", mod)):
+            if name == "base":
+                copy_dir = tmp / f"copy{counter[0]}"
+                _shutil.copytree(w.tmp, copy_dir, symlinks=True)
+                wb = _copy.copy(w)
+                wb.tmp, wb.journal = copy_dir, Journal(copy_dir / "journal")
+                wb.ledger_path = copy_dir / w.ledger_path.relative_to(w.tmp)
+                wb.state_path = copy_dir / Path(w.state_path).relative_to(w.tmp)
+                wb.limits, wb.latch = copy_dir / "config" / "risk.json", copy_dir / w.latch.relative_to(w.tmp)
+                wb.venue, wb.second = _copy.deepcopy(w.venue), _copy.deepcopy(w.second)
+                wb.clock, wb.prices, wb.quote_age = Clock(w.clock.t), dict(w.prices), dict(w.quote_age)
+                wb.quote_calls, target, repo = [], wb, copy_dir
+            else:
+                target, repo = w, w.tmp
+                lines_before = len(w.entries("day_stop"))                # addendum 2: the trip's own journal line
+            _wb.LIVE_REPO = repo
+            urandom = random.Random(seed * 1000 + counter[0])
+            monkeypatch.setattr("os.urandom", lambda k: bytes(urandom.getrandbits(8) for _ in range(k)))
+            target.second.calls.clear()
+            target.venue.calls.clear()
+            out = _run_with(which, target, live=target.live, second_opinion=target.second, capital=capital,
+                            follow=which.Follow(**dataclasses.asdict(f)), **kw)
+            results[name] = out
+            if name == "base":
+                _shutil.rmtree(copy_dir)
+        _wb.LIVE_REPO = w.tmp
+        b, m = results["base"], results["mine"]
+        sent = {k: _Counter((s["symbol"], s["side"], s["units"]) for s in r["sent"]) for k, r in results.items()}
+        lines = {k: _Counter((o["fund"], o["side"], o["units"]) for o in (r.get("ticket") or {}).get("orders") or [])
+                 for k, r in results.items() if r.get("mode") == "propose"}
+        out_runs.append({"base": sent["base"], "mine": sent["mine"], "lines": lines, "stop": "day_stop" in m,
+                         "added": sorted(set(m) - set(b)), "status": (b["status"], m["status"], b["stage"], m["stage"]),
+                         "mine_out": m, "trip_lines": len(w.entries("day_stop")) - lines_before})
+        return m
+    for day in range(rng.randint(2, 3)):
+        if day:
+            w.next_day()
+            w.venue.cash_value = round(w.venue.cash_value * rng.choice([1.0, 0.998, 0.99, 0.98, 0.95]), 2)
+        for sym in ("SPY", "QQQ", "IWM", "TLT", "GLD", "OWN"):
+            w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 230.0])
+        for _ in range(rng.randint(1, 2)):
+            wanted = {s: float(rng.randint(0, 6)) for s in rng.sample(["SPY", "QQQ", "IWM", "TLT", "GLD"], rng.randint(1, 5))}
+            w.paper = paper({"a": wanted}, equity=capital)
+            number = one(propose=True).get("ticket_number")
+            if number:
+                w.venue.fill_at_once = rng.choice([0.0, 0.5, 1.0])
+                if rng.random() < 0.3:                                 # a loss between the ticket and its approval
+                    w.venue.cash_value = round(w.venue.cash_value * rng.choice([0.99, 0.97, 0.9]), 2)
+                w.later(1)
+                one(approve=number)
+            w.later(20)
+    monkeypatch.undo()
+    return out_runs
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_a_day_stop(tmp_path, monkeypatch,
+                                                                                         t34b2_base, seed_block):
+    """50 scenarios per block, 300 in all, each of two or three New York days with losses, walls and paper records
+    drawn at random; every run made from the same inputs through f88593e and here."""
+    stats = _Counter()
+    for k in range(50):
+        seed = 660_000 + seed_block * 50 + k
+        for i, r in enumerate(_t34_live_scenario(osx, t34b2_base, tmp_path / f"s{k}", seed, monkeypatch)):
+            where = (seed, i)
+            mine_lines, base_lines = r["lines"].get("mine", _Counter()), r["lines"].get("base", _Counter())
+            assert not (r["mine"] - r["base"]) and not (mine_lines - base_lines), where   # never more than the base
+            if not r["stop"]:                                                           # and without a day stop, the same
+                assert r["mine"] == r["base"] and mine_lines == base_lines, where
+                assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
+            assert set(r["added"]) <= set(T34B2_LIVE_KEYS) and "ceiling" in r["added"], (where, r["added"])
+            stats["runs"] += 1
+            stats["stopped days"] += r["stop"]
+            stats["fewer sent"] += r["mine"] != r["base"]
+            stats["fewer ticket lines"] += mine_lines != base_lines
+            stats["sent"] += sum(r["mine"].values())
+            assert "cap" not in r["mine_out"].get("faults", []), (where, r["mine_out"].get("faults"))   # an honest broker
+            stats["over ceiling"] += "over_ceiling" in r["mine_out"]
+            tripped = r["stop"] and not r["mine_out"]["day_stop"].get("carried")   # one line exactly when it tripped
+            assert r["trip_lines"] == (1 if tripped else 0), (where, r["trip_lines"], r["mine_out"].get("day_stop"))
+            stats["trip lines"] += r["trip_lines"]
+        _shutil.rmtree(tmp_path / f"s{k}")
+    print(f"T34B2-LIVE block {seed_block}: {dict(stats)}")
+    assert stats["runs"] >= 150 and stats["stopped days"] > 5 and stats["sent"] > 20, stats
+    assert stats["fewer sent"] + stats["fewer ticket lines"] > 0, stats

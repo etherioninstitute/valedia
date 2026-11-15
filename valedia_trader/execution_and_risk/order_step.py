@@ -170,6 +170,24 @@ Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run neve
    (symbol, price, time) is asked about once in a run; an order's own quote already judged as a mark is not asked
    again;
  - the max_capital check works out this ledger's exposure afresh at each order, at the marks the gate has just used.
+
+What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-ladder-design.md D4, D5, D6, D8):
+ - `faults`, a list, only when not empty, on practice and live runs, done or stopped: `reconcile` when the final
+   reconcile's own result is not clean (the run still ends as it would); `attention:<kind>` per distinct kind, sorted,
+   of a blocking attention item (a kind not in orders.NOTICE_KINDS) whose id is above the largest id the ledger held
+   when the run took it, read once before settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); in live mode `cap`
+   when, after the final reconcile, a fill of this batch broke what the run had checked: worth more than
+   max_order_value at its fill price, one order's fills above the units it asked for, or a fill price on the wrong
+   side of its own order's limit (what cannot be judged is named in `cap_unjudged` instead). A failure while they are
+   worked out is the run's own: it stops at stage "unexpected", its reason keeping how the run had ended before.
+ - live mode only: `ceiling` (the confirmation's max_capital) once a confirmation is in force; `over_ceiling`
+   ({"at_work", "ceiling"}), information and never a fault, when the book at the marks in hand is above it; `working_stop`
+   ({"pct", "basis", "n"}, stake_ladder.working_stop_pct from decay.paper_record's exact returns of the strategies
+   followed, under max_daily_loss_pct; the floor when the record cannot be read), worked out once before any order;
+   `day_stop` ({"pct", "limit", "wall"}) from the look at which the day's loss first reaches the working stop, or
+   with "carried": true when an earlier run recorded one for this venue and New York day. In the day stop every order
+   that does not reduce a position is refused ("day stop") before the risk gate is asked; a reducing order goes on as
+   before. A practice run computes no working stop and refuses nothing more.
 """
 from __future__ import annotations
 
@@ -192,7 +210,8 @@ from typing import Callable
 
 import pandas as pd
 
-from valedia_trader.execution_and_risk.orders import STATES, OrderError, OrderLedger, OrdersBlocked, allocate, net_orders
+from valedia_trader.execution_and_risk.orders import (NOTICE_KINDS, REL_TOL, STATES, OrderError, OrderLedger, OrdersBlocked,
+                                                      allocate, net_orders)
 from valedia_trader.research_loop import risk_gate
 from valedia_trader.venues.webull import EVENTS_CLASS, NotTransmitted, OrderRejected
 
@@ -232,6 +251,7 @@ TICKET_LIFE_MAX_SECONDS = 60 * 60                 # a ticket never lives longer 
 TICKET_LIFE_SECONDS = 15 * 60                     # a ticket can be approved for this long after it was made
 TICKET_QUOTE_MOVE = 0.005                         # an approved order's fresh quote within 0.5% of the ticket's
 TICKET_UNITS_SAME = 1e-9                          # fractional units: the same within this
+LIMIT_SAME = 1e-6                                 # T34b-2 F3 (iii): a fill price at its limit within this part of it
 WRONG_NUMBERS_MAX = 3                             # refused approvals in a New York day that lock approval
 TICKET_UNWRITABLE = ("the ticket file cannot be written, so no approval can be judged or recorded; nothing is sent")
 
@@ -260,6 +280,7 @@ _SYMBOL = re.compile(r"[A-Za-z0-9./-]{1,24}")
 _TAG = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_ATTENTION_KIND = re.compile(r"[a-z0-9_-]{1,40}")  # T34b-2 (F2): an attention kind written as itself; else "unknown"
 CANCEL_WORDS = ("cancel requested", "not yet", "already finished", "no such order")   # WebullVenue.cancel's words
 STATUS_WORDS = ("accepted", "pending", "open", "rejected", "refused", "unknown")      # a submit answer's status words
 
@@ -1509,6 +1530,14 @@ class _Run:
         self.follow_problem = None                       # why it cannot be followed, or None
         self.follow_names: tuple | None = None           # the strategies followed, once the Follow is well formed
         self.follow_every = False                        # rev 2: they are every strategy of the latest day
+        self.attention_before: int | None = None         # T34b-2 (F2): the largest attention id when the run took the ledger
+        self.final_unclean = False                       # T34b-2 (F1): the final reconcile was not clean
+        self.cap_breach = False                          # T34b-2 (F3, live): a cap found breached after the final reconcile
+        self.cap_unjudged: set[str] = set()              # ... and the symbols it could not be judged for
+        self.over_ceiling: dict | None = None            # T34b-2 addendum 1 (live): the book above max_capital, information only
+        self.working_stop: dict | None = None            # T34b-2 (S1, live): {"pct", "basis", "n"}, set once before any order
+        self.wall: float | None = None                   # ... the limits' max_daily_loss_pct as this run loaded them
+        self.day_stop: dict | None = None                # T34b-2 (S2, S4, live): set, the run is in the day stop
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -1684,11 +1713,12 @@ class _Run:
             return self._finish("stopped", "send", f"the ledger, the state file or the journal failed: {_local_error(exc)}; "
                                                    "nothing more is sent and the next run's reconcile settles what was")
         try:
-            self._reconcile(baseline, "after")          # 11
+            final = self._reconcile(baseline, "after")  # 11
         except _Stop as stop:
             return self._finish("stopped", "after", stop.reason)
         except (OrderError, sqlite3.Error, OSError) as exc:
             return self._finish("stopped", "after", f"the last reconcile could not be completed: {_local_error(exc)}")
+        self._judge_final(final)                         # T34b-2 (F1, F3): a failure here is the run's own (unexpected)
         if self.mode == "propose":
             try:
                 self._make_ticket()
@@ -1821,6 +1851,150 @@ class _Run:
             raise _Stop("state", f"the order step's state file holds {held} and the journal recorded an equity of "
                                  f"{seen:,.2f} for {self.name}: the state file knows less than the journal (an older copy "
                                  "put back?), so the drawdown cannot be judged; a person must look; nothing is sent")
+
+    # -- T34b-2: the faults the summary carries, and (live mode) the working stop and the day stop
+    def _judge_final(self, final) -> None:
+        """After the final reconcile: F1, that reconcile's own result not clean by the order ledger's judgement; F3
+        (live mode, the confirmation in force), the caps judged on this batch's fills and the book as it now is."""
+        if not (isinstance(final, dict) and final.get("clean") is True):
+            self.final_unclean = True
+        if self.live is not None and self.locks is not None and self.locks.confirmation is not None:
+            self._judge_caps(self.locks.confirmation)
+
+    def _judge_caps(self, conf: dict) -> None:
+        """F3 (addendum 1): a fill of this batch that broke what the run had checked, judged from this batch's own
+        orders and fills with no mark: (i) its units times its fill price above max_order_value; (ii) one order's
+        fills summing to more units than the order asked for (beyond the order ledger's own tolerance,
+        REL_TOL x max(1, |units|)); (iii) its fill price on the wrong side of its own order's limit (above it for a
+        purchase, below it for a sale) by more than one part in a million of the limit. A fill without a usable price,
+        or whose order or limit cannot be read back, is no breach: its symbol is named in `cap_unjudged`. The money at
+        work in the broker book (this ledger's holdings at the marks in hand, as `_exposure_now` measures it) above
+        max_capital is information only (`over_ceiling`), never a fault: a market gain or a lowered ceiling takes
+        it there as well."""
+        fills = self.ledger.fills()
+        mine = self.batch + "-"
+        by_tag: dict[str, list] = {}
+        for f in fills:
+            if type(f.get("tag")) is str and f["tag"].startswith(mine):
+                by_tag.setdefault(f["tag"], []).append(f)
+        for tag, rows in by_tag.items():
+            order = self.ledger.order(tag)
+            asked = _as_float(order.get("units")) if isinstance(order, dict) else None
+            limit = _as_float(order.get("limit_price")) if isinstance(order, dict) else None
+            if asked is None or asked == 0:
+                self.cap_unjudged.update(self._cap_symbol(f.get("symbol")) for f in rows)
+            else:
+                filled = [_as_float(f.get("units")) for f in rows]
+                if None in filled:
+                    self.cap_unjudged.update(self._cap_symbol(f.get("symbol")) for f in rows)
+                elif math.fsum(filled) * (1.0 if asked > 0 else -1.0) > abs(asked) + REL_TOL * max(1.0, abs(asked)):
+                    self.cap_breach = True                           # (ii)
+            for f in rows:
+                units, price = _as_float(f.get("units")), _as_float(f.get("price"))
+                if units is None or price is None:
+                    self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
+                    continue
+                if not abs(units) * price <= conf["max_order_value"]:
+                    self.cap_breach = True                           # (i)
+                if asked is None or asked == 0 or limit is None or not limit > 0:
+                    self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
+                elif (price > limit + LIMIT_SAME * limit) if asked > 0 else (price < limit - LIMIT_SAME * limit):
+                    self.cap_breach = True                           # (iii)
+        at_work = []
+        for sym, u in broker_book(fills).items():
+            if not u > UNITS_EPS:
+                continue
+            q = self.live_marks.get(sym)
+            if not _finite(q):
+                self.cap_unjudged.add(self._cap_symbol(sym))
+            else:
+                at_work.append(u * float(q))
+        total = math.fsum(at_work)
+        if not total <= conf["max_capital"]:                       # information only: the part that could be measured
+            self.over_ceiling = {"at_work": total, "ceiling": float(conf["max_capital"])}
+
+    @staticmethod
+    def _cap_symbol(sym) -> str:
+        return sym if _plain(_SYMBOL, sym) else "(a symbol that is not plain)"
+
+    def _faults(self) -> list[str]:
+        """The summary's `faults` (D8), in order, each at most once: `reconcile` (F1); `attention:<kind>` for each
+        distinct kind of a blocking attention item opened in this run, an id above the largest that existed when the
+        run took the ledger, closed ones counted (F2); `cap` (F3, live mode only). Raises what the ledger raises."""
+        out = ["reconcile"] if self.final_unclean else []
+        if self.attention_before is not None:
+            kinds = set()
+            for item in self.ledger.attention(open_only=False):
+                kind = item.get("kind")
+                if int(item["id"]) > self.attention_before and kind not in NOTICE_KINDS:
+                    kinds.add(kind if type(kind) is str and _ATTENTION_KIND.fullmatch(kind) else "unknown")
+            out += [f"attention:{kind}" for kind in sorted(kinds)]
+        if self.live is not None and self.cap_breach:
+            out.append("cap")
+        return out
+
+    def _set_working_stop(self, limits) -> None:
+        """S1, live mode, once, after the paper book is read and before any order: the working stop (D5) from the
+        paper record's exact daily returns of the strategies followed, under the limits' max_daily_loss_pct (the
+        wall); when the record cannot be built or read, the floor (or the wall, when lower), and the basis says so."""
+        from valedia_trader.execution_and_risk import stake_ladder
+        from valedia_trader.research_loop import decay
+        self.wall = _as_float(limits.get("max_daily_loss_pct")) if isinstance(limits, dict) else None
+        if self.wall is None:                            # the gate then refuses every order with the file's own error
+            self.working_stop = {"pct": None, "n": 0, "basis": "the risk limits could not be loaded, so no working stop "
+                                                               "is set; the risk gate refuses every order"}
+            return
+        try:
+            record = decay.paper_record(self.journal.dir, self.day)
+            stop = stake_ladder.working_stop_pct(stake_ladder.paper_returns(record, self.follow_names), self.wall)
+            pct, basis, n = float(stop.pct), str(stop.basis), int(stop.n)
+        except Exception:
+            pct, n = min(self.wall, stake_ladder.STOP_FLOOR_PCT), 0
+            basis = "the paper record could not be read: the floor" + (
+                "; held at the owner's daily halt" if pct < stake_ladder.STOP_FLOOR_PCT else "")
+        self.working_stop = {"pct": pct, "basis": basis, "n": n}
+
+    def _look(self, loss: float) -> None:
+        """S2, live mode, at every look at the account: the day's loss at or above the working stop puts the run in the
+        day stop from this look on. Addendum 2 (C1): the trip is journaled at once, one `day_stop` line with the same
+        three values, synced, so the stop lasts the day even when the run dies before its summary; a failure to write
+        it is the journal's failure and propagates (nothing more is sent)."""
+        stop = None if self.working_stop is None else self.working_stop["pct"]
+        if self.day_stop is None and stop is not None and loss >= stop:
+            self.day_stop = {"pct": float(loss), "limit": float(stop), "wall": bool(loss >= self.wall)}
+            self._write({"event": "day_stop", **self.day_stop})
+            self._sync_journal()
+
+    def _carry_day_stop(self, entries: list[dict]) -> None:
+        """S4, live mode, from the journal scanned: a day stop an earlier run recorded for this venue and New York day
+        (stake_ladder.day_stopped; the first such summary, its three values copied where they can be read). Addendum 2
+        (C1): equally an `order_step` `day_stop` event line of this venue and day, the line a tripping run writes at the
+        look; the earliest of the two kinds, in file order, gives the values."""
+        from valedia_trader.execution_and_risk import stake_ladder
+        day = date.fromisoformat(self.day)
+
+        def tripped(e) -> bool:
+            return (isinstance(e, dict) and e.get("type") == "order_step" and e.get("event") == "day_stop"
+                    and e.get("venue") == self.name and type(e.get("day")) is str and e["day"] == self.day)
+        first = next((e for e in entries if tripped(e) or stake_ladder.day_stopped([e], self.name, day) is not None), None)
+        if first is None:
+            return
+        if tripped(first):
+            raw = first
+        else:
+            raw = first.get("day_stop") if isinstance(first.get("day_stop"), dict) else {}
+        wall = raw.get("wall")
+        self.day_stop = {"pct": _as_float(raw.get("pct")), "limit": _as_float(raw.get("limit")),
+                         "wall": wall if type(wall) is bool else None, "carried": True}
+
+    def _day_stop_reason(self) -> str:
+        s = self.day_stop
+        if s.get("carried"):
+            return (f"an earlier run on {self.day} recorded the day stop: no order that adds to a position is sent for the "
+                    "rest of the New York day; reducing orders still pass")
+        halt = " and the owner's daily halt" if s["wall"] else ""
+        return (f"the day's loss of {s['pct']:.2f}% reached the working stop of {s['limit']:.2f}%{halt}: no order that "
+                f"adds to a position is sent for the rest of the New York day {self.day}; reducing orders still pass")
 
     def _second_verdict(self, symbol: str, quote: float) -> str:
         from valedia_trader.execution_and_risk import go_live
@@ -2152,6 +2326,7 @@ class _Run:
                     and e.get("venue") == self.name and type(e.get("event")) is str and e.get("event") in keys]
             seen = [v for v in seen if v is not None]
             self.journal_peak = max(seen) if seen else None
+            self._carry_day_stop(entries)                # T34b-2 (S4): a day stop recorded earlier this New York day
         for name, n in new:
             self._write({"event": "torn_line", "file": name, "line": n,
                          "reason": "a damaged last line, from a crash mid-write; skipped by the order step"})
@@ -2327,6 +2502,8 @@ class _Run:
             self.ledger.mark_applied([f["id"]])
 
     def _reconcile_and_cancel(self, baseline: dict) -> None:
+        if self.attention_before is None:                # T34b-2 (F2): read once, before anything settles or reconciles
+            self.attention_before = max((int(i["id"]) for i in self.ledger.attention(open_only=False)), default=0)
         self.state.settle_sends(self.ledger)
         self._reconcile(baseline, "first")
         for o in self.ledger.orders(OPEN_STATES):
@@ -2553,14 +2730,19 @@ class _Run:
                 self.state.reprice_equity(row, now_equity)
                 self.broker_equity = now_equity
             peak = now_equity if prior_peak is None else max(prior_peak, now_equity)
-            return {"equity": now_equity,
-                    "daily_loss_pct": max(0.0, (previous - now_equity) / previous * 100.0) if previous else 0.0,
-                    "drawdown_pct": max(0.0, (peak - now_equity) / peak * 100.0) if peak else 0.0,
-                    "open_positions": opened}
+            figures = {"equity": now_equity,
+                       "daily_loss_pct": max(0.0, (previous - now_equity) / previous * 100.0) if previous else 0.0,
+                       "drawdown_pct": max(0.0, (peak - now_equity) / peak * 100.0) if peak else 0.0,
+                       "open_positions": opened}
+            if self.live is not None:                    # T34b-2 (S2): every look may trip the day stop
+                self._look(figures["daily_loss_pct"])
+            return figures
         try:
             limits = risk_gate.load_limits(self.limits_file)
         except risk_gate.RiskConfigError:
             limits = None                                # check_order then refuses with the file's own error
+        if self.live is not None:                        # T34b-2 (S1): once, before any order
+            self._set_working_stop(limits)
         cap = max_orders_per_day(limits)
         sent_today = self.state.sent_on(self.day)
         settled = self.settled_cash
@@ -2632,6 +2814,9 @@ class _Run:
                 account = account_now()                  # ... the account priced at them
                 if unpriced and not reduces:
                     self._leave(c, f"the account cannot be priced: no fresh quote for {', '.join(unpriced)}")
+                    break
+                if self.live is not None and self.day_stop is not None and not reduces:   # T34b-2 (S3)
+                    self._refuse(c, "day stop", self._day_stop_reason())
                     break
                 order = {"symbol": sym, "side": "buy" if units > 0 else "sell", "value": abs(units) * quote,
                          "reduces_risk": bool(reduces), "adds_to_existing": owned_here > UNITS_EPS,
@@ -2778,6 +2963,19 @@ class _Run:
 
     # -- 11
     def _finish(self, status: str, stage: str | None, reason: str | None) -> dict:
+        faults: list[str] = []
+        if self._locked:                                 # T34b-2 (D8): worked out first; a failure is the run's own
+            try:
+                faults = self._faults()
+            except Exception as exc:
+                if stage != "unexpected":                # addendum 1 (B2): how the run had ended is kept, in one line
+                    if status == "stopped":
+                        before = f"stopped at {stage}" + ("" if reason is None else f": {reason}")
+                    else:
+                        before = str(status) + ("" if reason is None else f": {reason}")
+                    before = " ".join(before.splitlines())
+                    return self._finish("stopped", "unexpected", f"the run failed unexpectedly: {_venue_error(exc)}; "
+                                                                 f"the run had ended {before}")
         try:
             book = broker_book(self.ledger.fills())
             mine = broker_book(f for f in self.ledger.fills() if self.batch and f["tag"].startswith(self.batch + "-"))
@@ -2815,6 +3013,19 @@ class _Run:
         if self.disagreements:                           # a sent line the order ledger no longer knows as sent: kept
             summary["ticket_disagreements"] = [{**d, "reason": "the record says sent and the order ledger does not; the "
                                                 "record is left as it is and a person must look"} for d in self.disagreements]
+        if faults:                                       # T34b-2: only when there is one, practice and live alike
+            summary["faults"] = faults
+        if self.live is not None:                        # T34b-2: live mode only
+            if self.cap_unjudged:
+                summary["cap_unjudged"] = sorted(self.cap_unjudged)
+            if self.locks is not None and self.locks.confirmation is not None:
+                summary["ceiling"] = float(self.locks.confirmation["max_capital"])
+            if self.over_ceiling is not None:            # addendum 1: information, never a fault
+                summary["over_ceiling"] = dict(self.over_ceiling)
+            if self.working_stop is not None:
+                summary["working_stop"] = dict(self.working_stop)
+            if self.day_stop is not None:
+                summary["day_stop"] = dict(self.day_stop)
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only
                 return summary

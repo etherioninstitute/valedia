@@ -1723,3 +1723,56 @@ def test_the_days_check_entry_lists_a_pause_an_earlier_killed_run_made(tmp_path,
     assert len(entries) == 1 and entries[0]["paused"] == [deep]
     again = dc.check(paths.ledger, pp.Journal(paths.journal), apply=True)
     assert not again["journal_entry_written"] and len(_decay_entries(pp.Journal(paths.journal))) == 1
+
+
+# ---------------------------------------------------------------- T34b-2: the paper record, read in public
+def _records_seen(monkeypatch):
+    """Every _Record the module builds, as it builds it."""
+    seen = []
+    real = dc._Record
+
+    class Spy(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            seen.append(self)
+    monkeypatch.setattr(dc, "_Record", Spy)
+    return seen
+
+
+def _same_record(a, b):
+    for name in ("good", "skipped", "set_aside", "duplicates", "uncertain", "latest", "latest_problem", "_marks"):
+        assert getattr(a, name) == getattr(b, name), name
+
+
+@pytest.mark.parametrize("as_of", [None, "2026-06-05", "2026-06-12"])
+def test_t34b2_paper_record_is_exactly_the_record_the_check_builds(desk, monkeypatch, as_of):
+    ledger, journal, root = desk
+    hid = _idea(ledger, "Funds that rose keep rising", {"sharpe": 1.0, "max_drawdown": 0.2})
+    _book(journal, {hid: ("calm", [1000.0, -500.0, 250.0, 0.0, 800.0, -100.0, 50.0, 0.0, 20.0])})
+    with (journal.dir / "2026-06-08.jsonl").open("ab") as fh:                     # a damaged line: one more thing to read
+        fh.write(b'{"torn\n')
+    _book(journal, {hid: ("calm", [10.0, 20.0])})
+    seen = _records_seen(monkeypatch)
+    report = dc.check(_lp(root), journal, as_of=as_of)
+    (built,) = seen
+    day = as_of if as_of is not None else built.latest
+    mine = dc.paper_record(journal.dir, day)
+    assert type(mine) is dc._Record and len(seen) == 2                          # the module's own record, built afresh
+    _same_record(mine, built)
+    assert [o for o in mine.path("calm")] == [o for o in built.path("calm")]
+    _same_record(dc.paper_record(str(journal.dir), pd.Timestamp(day).date()), built)   # a path as text, a date
+    monkeypatch.undo()
+    assert dc.check(_lp(root), journal, as_of=as_of) == report                     # the monitor itself is unchanged
+
+
+def test_t34b2_paper_record_of_a_folder_without_summaries_is_empty_and_raises_nothing(tmp_path):
+    rec = dc.paper_record(tmp_path / "nothing here", "2026-11-13")
+    assert rec.good == [] and rec.latest is None and rec.path("a") == []
+
+
+def test_t34b2_paper_record_raises_what_the_record_raises_for_a_book_it_cannot_judge(desk):
+    ledger, journal, root = desk
+    _book(journal, {1: ("gone", [-CAPITAL])})                                   # the whole capital lost
+    rec = dc.paper_record(journal.dir, "2026-06-30")
+    with pytest.raises(dc._CannotJudge):
+        rec.path("gone")
