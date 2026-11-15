@@ -357,3 +357,10 @@ stop is placed across midnight UTC on purpose, so that neither day carries all o
 limit, in which case 16 November would fall under the 80% its count needs). Each day's own count decides. The exact
 times are added below afterwards. If the run's preparation fails before the collector is touched, this stop does not
 take place, and that is said here.
+
+## The sixth stop did not take place (written at 22:04 UTC on 15 November; no answer has been scored)
+
+The owner cancelled the 48-participant run before it began, and the collector was not touched: it has run without a
+break since 21:22:34 UTC. The stops of 15 November remain the five recorded above, 3 hours 33 minutes 29 seconds in
+all, 14.8% of the day's slots before the overruns already noted. A later run of this kind is declared here before it
+happens.
