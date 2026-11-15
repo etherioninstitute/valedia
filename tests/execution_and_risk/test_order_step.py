@@ -3784,7 +3784,7 @@ def test_a_run_without_the_new_flags_is_the_base_byte_for_byte_over_generated_sc
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
             if _t34_practice_marks(added, (seed, i)):
-                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+                print(f"T34B2-MARKED {seed} run {i}: {added.get('faults')} pending {added.get('reconcile_pending')}")
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         crashes += sum(1 for r in mine if "crashed" in r["summary"])
     assert sends > 50 and crashes > 5
@@ -5621,7 +5621,7 @@ def test_without_live_the_scheduled_run_and_the_paper_ticket_flow_are_t22bs_base
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
             if _t34_practice_marks(added, (seed, i)):
-                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+                print(f"T34B2-MARKED {seed} run {i}: {added.get('faults')} pending {added.get('reconcile_pending')}")
         counts["submit"] += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         counts["tickets"] += sum(1 for r in mine if '"ticket_number"' in r["summary"])
         counts["approved"] += sum(1 for r in mine if r["mode"] == "approve" and '"orders_sent": 0' not in r["summary"]
@@ -6016,7 +6016,7 @@ def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path,
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
             if _t34_practice_marks(added, (seed, i)):
-                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+                print(f"T34B2-MARKED {seed} run {i}: {added.get('faults')} pending {added.get('reconcile_pending')}")
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         _shutil.rmtree(tmp_path / f"base{k}")
         _shutil.rmtree(tmp_path / f"mine{k}")
@@ -6533,7 +6533,7 @@ def test_t22d1_practice_runs_are_the_bases_byte_for_byte(tmp_path, monkeypatch, 
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
             if _t34_practice_marks(added, (seed, i)):
-                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+                print(f"T34B2-MARKED {seed} run {i}: {added.get('faults')} pending {added.get('reconcile_pending')}")
         runs += len(mine)
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         _shutil.rmtree(tmp_path / f"base{k}")
@@ -6622,8 +6622,8 @@ import statistics as _statistics
 from valedia_trader.execution_and_risk import stake_ladder as _sl
 from valedia_trader.research_loop import decay as _dc
 
-T34B2_PRACTICE_KEYS = ("faults",)
-T34B2_LIVE_KEYS = ("faults", "cap_unjudged", "ceiling", "over_ceiling", "working_stop", "day_stop")
+T34B2_PRACTICE_KEYS = ("faults", "reconcile_pending")
+T34B2_LIVE_KEYS = ("faults", "reconcile_pending", "cap_unjudged", "ceiling", "over_ceiling", "working_stop", "day_stop")
 T34B2_BASE = "f88593e"
 
 
@@ -6662,10 +6662,11 @@ def test_t34b2_a_practice_run_whose_last_reconcile_is_not_clean_ends_done_and_sa
     world.later(30)
     world.paper = paper({"a": {"SPY": 4.0}})
     _later_submit(world, 0, then=lambda w: w.venue.raise_on.add("positions"))   # the final reconcile cannot read them
-    out = world.run()
-    assert out["status"] == "done" and out["orders_sent"] == 1 and out["faults"] == ["reconcile"], out
-    assert world.entries("summary")[-1]["faults"] == ["reconcile"]
-    assert not any(k in out for k in T34B2_LIVE_KEYS[1:])
+    out = world.run()                                                  # addendum 3 (E2): set aside, said, no fault
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out, out
+    assert out["reconcile_pending"] == {"symbols": [], "positions_unread": True, "status_unread": 0}, out
+    assert world.entries("summary")[-1]["reconcile_pending"] == out["reconcile_pending"]
+    assert not any(k in out for k in T34B2_LIVE_KEYS[2:])
 
 
 def test_t34b2_an_unclean_first_reconcile_then_clean_ones_is_no_fault(world):
@@ -6978,7 +6979,8 @@ class _ThroughLimit(LiveVenue):
         return out
 
 
-@pytest.mark.parametrize("factor, fault", [(1.01, True), (1 + 5e-7, False), (1.0, False)])
+@pytest.mark.parametrize("factor, fault", [(1.01, True), (1 + 1.1e-6, True), (1 + 1e-6, False), (1 + 9e-7, False),
+                                           (1 + 5e-7, False), (1.0, False)])                  # E3: the edge is no breach
 def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
     venue.buy = factor                                                # IWM 3 at 202 x 1.01: 612, under max_order_value
@@ -6991,7 +6993,8 @@ def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, fa
     assert out.get("faults") == (["cap"] if fault else None) and "cap_unjudged" not in out, out
 
 
-@pytest.mark.parametrize("factor, fault", [(0.99, True), (1 - 5e-7, False), (1.0, False)])
+@pytest.mark.parametrize("factor, fault", [(0.99, True), (1 - 1.1e-6, True), (1 - 1e-6, False), (1 - 9e-7, False),
+                                           (1 - 5e-7, False), (1.0, False)])                  # E3: the edge is no breach
 def test_t34b2_a_sale_filled_below_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
     w = _t34_world(tmp_path / "w", venue=venue)
@@ -7060,6 +7063,259 @@ def test_t34b2_a_broker_that_reports_an_overfill_is_refused_by_the_ledger_and_is
     out = lapprove(w, number)
     assert w.fills() == [], w.fills()                                 # the ledger stores no fill above an order's size
     assert "reconcile" in out.get("faults", []) and "cap" not in out.get("faults", []), out
+
+
+# ---- addendum 3: E1 a sale above its limit is no breach; E2 a final reconcile that cannot tell a race from a mismatch
+
+@pytest.mark.parametrize("fill_at", [252.0 / 246.96, 1.0])
+def test_t34b2_a_sale_filled_above_its_limit_is_a_better_price_and_no_cap_fault(tmp_path, fill_at):
+    v = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
+    w = _t34_world(tmp_path / "w", venue=v, conf=live_conf(max_order_value=1000, max_capital=5000))
+    w.prices["IWM"] = 240.0
+    _, number = _live_proposed(w, {"a": {"IWM": 4.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    assert lapprove(w, number)["orders_sent"] == 1
+    w.next_day()
+    w.prices["IWM"] = 252.0
+    v.sell = fill_at                                                  # limit 246.96 (4 x 246.96 = 987.84 <= 1,000)
+    _, number = _live_proposed(w, {"a": {"IWM": 0.0}})
+    w.later(1)
+    out = lapprove(w, number)
+    fills = [(f["units"], f["price"]) for f in w.fills() if f["tag"].startswith(out["batch"])]
+    assert out["status"] == "done" and out["sent"][0]["limit_price"] == 246.96 and len(fills) == 1, (out, fills)
+    assert abs(fills[0][1] - 246.96 * fill_at) < 1e-9 and "faults" not in out, (fills, out)
+
+
+def _t34_at_final_positions(w, action, sends):
+    """`action(w)` at the first positions read after the run's `sends`-th submit (the final reconcile's), before the
+    positions are read: what a resting order that fills, or a venue that fails, does between status and positions."""
+    real, start, done = w.venue.positions, len(w.venue.calls), []
+
+    def positions():
+        if not done and sum(1 for c in w.venue.calls[start:] if c[0] == "submit") >= sends:
+            done.append(1)
+            action(w)
+        return real()
+    w.venue.positions = positions
+    return done
+
+
+def _t34_fill_open(*symbols):
+    def action(w):
+        for tag, o in w.venue.book.items():
+            if o["state"] == "open" and (not symbols or o["symbol"] in symbols):
+                w.venue.fill(tag)
+    return action
+
+
+def _t34_positions_down(w):
+    w.venue.raise_on.add("positions")
+
+
+def _t34_held_elsewhere(w):
+    w.venue.held["GLD"] = w.venue.held.get("GLD", 0.0) + 1.0
+
+
+def _with_odd(base):
+    class Odd(base):
+        """Reports filled_units -1 for the orders of the symbols in `odd` (an anomaly to the order ledger)."""
+        odd = ()
+
+        def order_status(self, tag):
+            out = super().order_status(tag)
+            if out is not None and self.book[tag]["symbol"] in self.odd:
+                out["filled_units"] = -1.0
+            return out
+    return Odd
+
+
+@pytest.mark.parametrize("what, faults, pending", [
+    ("race", None, {"symbols": ["IWM"], "positions_unread": False, "status_unread": 0}),
+    ("elsewhere", ["reconcile"], None),
+    ("positions down", None, {"symbols": [], "positions_unread": True, "status_unread": 0}),
+    ("race and an anomaly", ["reconcile"], {"symbols": ["IWM"], "positions_unread": False, "status_unread": 0})])
+def test_t34b2_a_live_final_reconcile_sets_aside_only_a_race_with_an_open_order_or_unread_positions(
+        tmp_path, what, faults, pending):
+    w = _t34_world(tmp_path / "w", venue=_with_odd(LiveVenue)(held={"OWN": 10.0}, cash=9_500.0))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.later(1)                                                        # fill_at_once 0: both orders rest at the venue
+    action = {"race": _t34_fill_open("IWM"), "elsewhere": _t34_held_elsewhere, "positions down": _t34_positions_down,
+              "race and an anomaly": _t34_fill_open("IWM")}[what]
+    if what == "race and an anomaly":
+        real = w.venue.submit
+
+        def submit(*a, **k):                                          # TLT's status reads odd from its submit on
+            out = real(*a, **k)
+            w.venue.odd = ("TLT",)
+            return out
+        w.venue.submit = submit
+    done = _t34_at_final_positions(w, action, 2)
+    out = lapprove(w, number)
+    assert done and out["status"] == "done" and out["orders_sent"] == 2, out
+    assert out.get("faults") == faults and out.get("reconcile_pending") == pending, out
+    summary = w.entries("summary")[-1]
+    assert summary.get("faults") == faults and summary.get("reconcile_pending") == pending
+    assert {o["symbol"] for o in w.orders() if o["state"] in ("accepted", "partly_filled")} >= (
+        {"TLT"} if what != "positions down" else {"IWM", "TLT"})
+
+
+def test_t34b2_a_practice_order_that_fills_between_status_and_positions_is_set_aside_and_said(world):
+    world.paper = paper({"a": {"SPY": 3.0}})
+    done = _t34_at_final_positions(world, _t34_fill_open(), 1)
+    out = world.run()
+    assert done and out["status"] == "done" and "faults" not in out, out
+    assert out["reconcile_pending"] == {"symbols": ["SPY"], "positions_unread": False, "status_unread": 0}, out
+    world.later(30)
+    out = world.run()                                                 # the next run settles it: nothing pending
+    assert out["status"] == "done" and "faults" not in out and "reconcile_pending" not in out, out
+
+
+def test_t34b2_a_practice_anomaly_at_the_final_reconcile_is_still_a_fault(world):
+    world.venue = _with_odd(StandIn)()
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.paper = paper({"a": {"SPY": 2.0}})
+    _later_submit(world, 0, then=lambda w: setattr(w.venue, "odd", ("SPY",)))
+    out = world.run()
+    assert out["status"] == "done" and out["faults"] == ["reconcile"] and "reconcile_pending" not in out, out
+
+
+# ---- addendum 4 (G1): an order the ledger knows to be working, whose status could not be read, is pending
+
+def _with_status_down(base):
+    class StatusDown(base):
+        """Its order_status raises for the orders of the symbols in `down`."""
+        down = ()
+
+        def order_status(self, tag):
+            if self.book.get(tag, {}).get("symbol") in self.down:
+                self.calls.append(("order_status", tag))
+                raise ConnectionError("order_status timed out")
+            return super().order_status(tag)
+    return StatusDown
+
+
+def _t34_after_last_submit(w, sends, then):
+    """`then(w, tag)` right after the run's `sends`-th submit, with that submit's tag."""
+    real, count = w.venue.submit, [0]
+
+    def submit(*a, **k):
+        out = real(*a, **k)
+        count[0] += 1
+        if count[0] == sends:
+            then(w, w.venue.submits()[-1])
+        return out
+    w.venue.submit = submit
+
+
+def _t34_ledger_state(w, tag, state):
+    con = sqlite3.connect(w.ledger_path)
+    try:
+        with con:
+            con.execute("UPDATE orders SET state = ? WHERE tag = ?", (state, tag))
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("what, faults, pending", [
+    ("status unread", None, {"symbols": ["IWM"], "positions_unread": False, "status_unread": 1}),
+    ("status unread and an anomaly", ["reconcile"], {"symbols": ["IWM"], "positions_unread": False, "status_unread": 1}),
+    ("status unread, the order unsettled", ["reconcile"], None)])
+def test_t34b2_a_live_final_reconcile_sets_aside_an_unread_status_only_for_an_order_the_ledger_knows_is_working(
+        tmp_path, what, faults, pending):
+    w = _t34_world(tmp_path / "w", venue=_with_status_down(_with_odd(LiveVenue))(held={"OWN": 10.0}, cash=9_500.0))
+    _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
+    w.later(1)                                                        # both orders rest at the venue
+
+    def then(w, tag):
+        w.venue.down = ("IWM",)
+        if what == "status unread and an anomaly":
+            w.venue.odd = ("TLT",)
+        if what == "status unread, the order unsettled":
+            (iwm,) = [t for t, o in w.venue.book.items() if o["symbol"] == "IWM"]
+            _t34_ledger_state(w, iwm, "sent")
+    _t34_after_last_submit(w, 2, then)
+    out = lapprove(w, number)
+    assert out["status"] == "done" and out["orders_sent"] == 2, out
+    assert out.get("faults") == faults and out.get("reconcile_pending") == pending, out
+
+
+def test_t34b2_a_practice_order_whose_status_could_not_be_read_is_pending_and_the_next_run_settles_it(world):
+    world.venue = _with_status_down(StandIn)()
+    world.state_path = osx.state_path_for(world.ledger_path, world.venue.name)
+    world.paper = paper({"a": {"SPY": 2.0}})
+    _t34_after_last_submit(world, 1, lambda w, tag: setattr(w.venue, "down", ("SPY",)))
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out, out
+    assert out["reconcile_pending"] == {"symbols": ["SPY"], "positions_unread": False, "status_unread": 1}, out
+    world.venue.down = ()
+    world.later(30)
+    out = world.run()
+    assert out["status"] == "done" and "faults" not in out and "reconcile_pending" not in out, out
+
+
+@pytest.mark.parametrize("tag", ["no-such-order", None, ""])
+def test_t34b2_an_unresolved_entry_whose_order_cannot_be_read_back_stays_a_reconcile_fault(world, monkeypatch, tag):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    real, armed = _Ledger.reconcile, []
+
+    def reconcile(self, *a, **k):
+        out = real(self, *a, **k)
+        if armed:                                                     # the final reconcile: one entry the ledger
+            out["unresolved"].append({"tag": tag, "reason": "made by the test"})   # cannot read back
+            out["clean"] = False
+        return out
+    monkeypatch.setattr(_Ledger, "reconcile", reconcile)
+    _later_submit(world, 0, then=lambda w: armed.append(1))
+    out = world.run()
+    assert out["status"] == "done" and out["faults"] == ["reconcile"] and "reconcile_pending" not in out, out
+
+
+# ---- addendum 3 (E4): a run that turns out stopped leaves no usable ticket and loses no reason
+
+def _t34_faults_raise(monkeypatch):
+    """The faults cannot be worked out while the returned switch holds True."""
+    on, real = [True], osx._Run._faults
+
+    def faults(self):
+        if on[0]:
+            raise RuntimeError("the faults cannot be worked out")
+        return real(self)
+    monkeypatch.setattr(osx._Run, "_faults", faults)
+    return on
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_t34b2_a_propose_turned_stopped_by_its_faults_voids_its_ticket_and_returns_no_number(tmp_path, monkeypatch,
+                                                                                             live):
+    w = _t34_world(tmp_path / "w") if live else ticket_world(tmp_path / "w")
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0) if live else paper({"a": {"SPY": 2.0}})
+    on = _t34_faults_raise(monkeypatch)
+    out = lpropose(w) if live else propose(w)
+    on[0] = False
+    assert out["status"] == "stopped" and out["stage"] == "unexpected" and "ticket_number" not in out, out
+    assert out["reason"] == "the run failed unexpectedly: RuntimeError; the run had ended done", out
+    (number,) = [r["number"] for r in ticket_rows(w, "tickets")]      # made, never returned: and never usable
+    w.later(1)
+    out = lapprove(w, number) if live else approve(w, number)
+    assert out["status"] == "stopped" and out["stage"] == "ticket" and out["orders_sent"] == 0, out
+    assert out["reason"].startswith("the run that made that ticket ended stopped: the run failed unexpectedly: "
+                                    "RuntimeError; the run had ended done"), out
+    assert w.venue.submits() == []
+
+
+def test_t34b2_a_run_already_stopped_unexpectedly_keeps_its_reason_and_appends_the_faults_failure(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 2.0}})
+
+    def judge(self, final):
+        raise ValueError("the final judgement failed")
+    monkeypatch.setattr(osx._Run, "_judge_final", judge)
+    _t34_faults_raise(monkeypatch)
+    out = world.run()
+    assert out["status"] == "stopped" and out["stage"] == "unexpected", out
+    assert out["reason"] == ("the run failed unexpectedly: ValueError; working out the faults also failed: "
+                             "RuntimeError"), out
+    assert world.entries("stopped")[-1]["reason"] == out["reason"] and "faults" not in out
 
 
 # ---- S1: the working stop
@@ -7439,9 +7695,14 @@ def _t34_same_but(b, m, keys, where, skip=()):
 
 
 def _t34_practice_marks(added, where):
-    """A practice run may carry `faults` only, and only reconcile and attention entries."""
-    assert set(added) <= {"faults"}, where
-    if added:
+    """A practice run may carry `faults` and `reconcile_pending` only, and `faults` only reconcile and attention entries."""
+    assert set(added) <= {"faults", "reconcile_pending"}, where
+    if "reconcile_pending" in added:
+        p = added["reconcile_pending"]
+        assert set(p) == {"symbols", "positions_unread", "status_unread"} and type(p["positions_unread"]) is bool, (where, p)
+        assert type(p["status_unread"]) is int and p["status_unread"] >= 0, (where, p)
+        assert p["symbols"] == sorted(set(p["symbols"])) and (p["symbols"] or p["positions_unread"]), (where, p)
+    if "faults" in added:
         f = added["faults"]
         assert f and len(f) == len(set(f)) and all(x == "reconcile" or x.startswith("attention:") for x in f), (where, f)
         assert f == (["reconcile"] if "reconcile" in f else []) + sorted(x for x in f if x != "reconcile"), (where, f)
@@ -7471,7 +7732,7 @@ def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_th
     """50 scenarios per block, 300 in all, of the scheduled run and the paper ticket flow (kills, partial fills,
     refusals, wrong numbers), through f88593e and here: venue calls, journal lines, ledger, state and tickets equal; the
     summaries equal but for `faults`, carried only where F1 or F2 marks the run."""
-    runs = marked = sends = 0
+    runs = marked = pending = sends = 0
     for k in range(50):
         seed = 990_000 + seed_block * 50 + k
         base = _flow_scenario(t34b2_base, tmp_path / f"base{k}", seed, monkeypatch)
@@ -7480,14 +7741,15 @@ def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_th
         for i, (b, m) in enumerate(zip(base, mine)):
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
             if _t34_practice_marks(added, (seed, i)):
-                marked += 1
-                print(f"T34B2-MARKED {seed} run {i}: {added['faults']}")
+                marked += "faults" in added
+                pending += "reconcile_pending" in added
+                print(f"T34B2-MARKED {seed} run {i}: {added.get('faults')} pending {added.get('reconcile_pending')}")
         runs += len(mine)
         sends += sum(1 for r in mine for c in r["calls"] if c[0] == "submit")
         _shutil.rmtree(tmp_path / f"base{k}")
         _shutil.rmtree(tmp_path / f"mine{k}")
-    print(f"T34B2-PRACTICE block {seed_block}: runs {runs}, marked {marked}, sends {sends}")
-    assert runs >= 200 and sends > 30 and marked > 0, (runs, marked, sends)
+    print(f"T34B2-PRACTICE block {seed_block}: runs {runs}, marked {marked}, pending {pending}, sends {sends}")
+    assert runs >= 200 and sends > 30 and marked + pending > 0, (runs, marked, pending, sends)
 
 
 def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch):

@@ -173,13 +173,23 @@ Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run neve
 
 What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-ladder-design.md D4, D5, D6, D8):
  - `faults`, a list, only when not empty, on practice and live runs, done or stopped: `reconcile` when the final
-   reconcile's own result is not clean (the run still ends as it would); `attention:<kind>` per distinct kind, sorted,
-   of a blocking attention item (a kind not in orders.NOTICE_KINDS) whose id is above the largest id the ledger held
-   when the run took it, read once before settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); in live mode `cap`
-   when, after the final reconcile, a fill of this batch broke what the run had checked: worth more than
-   max_order_value at its fill price, one order's fills above the units it asked for, or a fill price on the wrong
-   side of its own order's limit (what cannot be judged is named in `cap_unjudged` instead). A failure while they are
-   worked out is the run's own: it stops at stage "unexpected", its reason keeping how the run had ended before.
+   reconcile's own result is not clean for any reason but three (the run still ends as it would): a position
+   difference in a symbol where this ledger still holds an order open at the venue after that reconcile's status reads
+   (a fill racing the positions read), positions the venue did not give (`positions_error`), and an unresolved order
+   that the ledger, read back after that reconcile, holds in an open state (`accepted`, `partly_filled`: judged by its
+   state, never by the words of a reason); those are set aside and said in `reconcile_pending` ({"symbols",
+   "positions_unread", "status_unread": the count of such orders}, information, never a fault), and the next run's
+   first reconcile judges again; `attention:<kind>` per distinct kind, sorted, of a blocking attention item (a kind not in
+   orders.NOTICE_KINDS) whose id is above the largest id the ledger held when the run took it, read once before
+   settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); in live mode `cap` when, after the final reconcile, a fill
+   of this batch broke what the run had checked: a purchase worth more than max_order_value at its fill price (a sale
+   that fills above its limit is a better price, not a breach), one order's fills above the units it asked for, or a
+   fill price beyond one part in a million on the wrong side of its own order's limit, the edge itself no breach (what
+   cannot be judged is named in `cap_unjudged` instead). A failure while they are worked out is the run's own: it
+   stops at stage "unexpected", its reason keeping how the run had ended before (or, when it had already stopped
+   there, its first reason with the second failure's words appended); a propose run so stopped leaves its ticket
+   refused in the ticket book and returns no ticket number. The attempt row that refusal writes counts once toward the
+   day's wrong-number lock on that ticket, which is void anyway, until the next propose lifts the lock.
  - live mode only: `ceiling` (the confirmation's max_capital) once a confirmation is in force; `over_ceiling`
    ({"at_work", "ceiling"}), information and never a fault, when the book at the marks in hand is above it; `working_stop`
    ({"pct", "basis", "n"}, stake_ladder.working_stop_pct from decay.paper_record's exact returns of the strategies
@@ -188,6 +198,10 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
    with "carried": true when an earlier run recorded one for this venue and New York day. In the day stop every order
    that does not reduce a position is refused ("day stop") before the risk gate is asked; a reducing order goes on as
    before. A practice run computes no working stop and refuses nothing more.
+ - the limit that stays: the journal is the only record of a trip (its `day_stop` line, written and synced at the
+   look, and the summary). If the journal cannot be written from the trip on, the run stops and sends nothing more;
+   but a later run the same day, should the journal work again, does not know of the stop, and only the owner's own
+   daily limit in the risk gate (max_daily_loss_pct) still judges each of its orders.
 """
 from __future__ import annotations
 
@@ -252,6 +266,8 @@ TICKET_LIFE_SECONDS = 15 * 60                     # a ticket can be approved for
 TICKET_QUOTE_MOVE = 0.005                         # an approved order's fresh quote within 0.5% of the ticket's
 TICKET_UNITS_SAME = 1e-9                          # fractional units: the same within this
 LIMIT_SAME = 1e-6                                 # T34b-2 F3 (iii): a fill price at its limit within this part of it
+LIMIT_EDGE = 1.0 + 1e-9                           # ... the edge itself included on both sides, whatever the rounding
+OPEN_AT_VENUE = ("accepted", "partly_filled")     # T34b-2 E2: an order of the ledger still working at the venue
 WRONG_NUMBERS_MAX = 3                             # refused approvals in a New York day that lock approval
 TICKET_UNWRITABLE = ("the ticket file cannot be written, so no approval can be judged or recorded; nothing is sent")
 
@@ -1331,6 +1347,11 @@ class TicketBook:
             self._db.execute("INSERT INTO verdicts (batch, verdict, reason, time) VALUES (?, ?, ?, ?)",
                              (batch, verdict, reason, float(self.clock())))
 
+    def verdict(self, batch: str) -> dict | None:
+        """The verdict recorded for `batch` ({"verdict", "reason"}), or None."""
+        row = self._db.execute("SELECT verdict, reason FROM verdicts WHERE batch = ?", (batch,)).fetchone()
+        return None if row is None else {"verdict": row[0], "reason": row[1]}
+
     def wrong_count(self, day: str, batch: str) -> int:
         """Approvals tried on `day` since the latest ticket was written that were not accepted (refused, or never
         judged because the run died), other than `batch`'s own. A propose that writes a ticket lifts the lock."""
@@ -1534,6 +1555,8 @@ class _Run:
         self.final_unclean = False                       # T34b-2 (F1): the final reconcile was not clean
         self.cap_breach = False                          # T34b-2 (F3, live): a cap found breached after the final reconcile
         self.cap_unjudged: set[str] = set()              # ... and the symbols it could not be judged for
+        self.reconcile_pending: dict | None = None       # T34b-2 E2: what the final reconcile set aside, information only
+        self.faults_failed = False                       # T34b-2 E4: the faults could not be worked out (once)
         self.over_ceiling: dict | None = None            # T34b-2 addendum 1 (live): the book above max_capital, information only
         self.working_stop: dict | None = None            # T34b-2 (S1, live): {"pct", "basis", "n"}, set once before any order
         self.wall: float | None = None                   # ... the limits' max_daily_loss_pct as this run loaded them
@@ -1854,19 +1877,54 @@ class _Run:
 
     # -- T34b-2: the faults the summary carries, and (live mode) the working stop and the day stop
     def _judge_final(self, final) -> None:
-        """After the final reconcile: F1, that reconcile's own result not clean by the order ledger's judgement; F3
-        (live mode, the confirmation in force), the caps judged on this batch's fills and the book as it now is."""
+        """After the final reconcile: F1 (addendum 3, E2), that reconcile's own result not clean by the order ledger's
+        judgement for any reason but two, which are set aside and said in `reconcile_pending`: (a) a position
+        difference in a symbol where this ledger still holds an order open at the venue after that reconcile's own
+        status reads (a fill racing the positions read), (b) the venue's positions not read (`positions_error`). An
+        unresolved order, an unsettled send, an anomaly or a difference in a symbol with no open order is F1. The next
+        run's first reconcile judges again. F3 (live mode, the confirmation in force), the caps judged on this batch's
+        fills and the book as it now is."""
         if not (isinstance(final, dict) and final.get("clean") is True):
-            self.final_unclean = True
+            self._judge_unclean(final)
         if self.live is not None and self.locks is not None and self.locks.confirmation is not None:
             self._judge_caps(self.locks.confirmation)
 
+    def _judge_unclean(self, final) -> None:
+        if not isinstance(final, dict):
+            self.final_unclean = True
+            return
+        unread = final.get("positions_error") is not None
+        diffs = final.get("position_differences")
+        diffs = diffs if isinstance(diffs, dict) else {}
+        working = {o["symbol"] for o in self.ledger.orders(OPEN_AT_VENUE)} if diffs else set()
+        aside = {sym for sym in diffs if sym in working}
+        unresolved = final.get("unresolved")
+        unresolved = unresolved if isinstance(unresolved, list) else ([] if not unresolved else [None])
+        status_aside: dict[str, str] = {}               # G1 (addendum 4): judged by the order's state, never a reason
+        stuck = False
+        for item in unresolved:
+            tag = item.get("tag") if isinstance(item, dict) else None
+            order = self.ledger.order(tag) if type(tag) is str and tag else None
+            if isinstance(order, dict) and order.get("state") in OPEN_AT_VENUE:
+                status_aside[tag] = order.get("symbol")
+            else:
+                stuck = True
+        other = (stuck or bool(final.get("anomalies")) or bool(set(diffs) - aside)
+                 or bool(self.ledger.orders(("sent", "unknown"))) or not (aside or unread or status_aside))
+        if other:
+            self.final_unclean = True
+        if aside or unread or status_aside:
+            self.reconcile_pending = {"symbols": sorted({self._cap_symbol(sym) for sym in (*aside, *status_aside.values())}),
+                                      "positions_unread": unread, "status_unread": len(status_aside)}
+
     def _judge_caps(self, conf: dict) -> None:
         """F3 (addendum 1): a fill of this batch that broke what the run had checked, judged from this batch's own
-        orders and fills with no mark: (i) its units times its fill price above max_order_value; (ii) one order's
+        orders and fills with no mark: (i) a purchase's units times its fill price above max_order_value (a sale
+        that fills above its limit is a better price, judged by (ii) and (iii) alone, addendum 3 E1); (ii) one order's
         fills summing to more units than the order asked for (beyond the order ledger's own tolerance,
         REL_TOL x max(1, |units|)); (iii) its fill price on the wrong side of its own order's limit (above it for a
-        purchase, below it for a sale) by more than one part in a million of the limit. A fill without a usable price,
+        purchase, below it for a sale) by more than one part in a million of the limit, the edge itself no breach on
+        either side (E3). A fill without a usable price,
         or whose order or limit cannot be read back, is no breach: its symbol is named in `cap_unjudged`. The money at
         work in the broker book (this ledger's holdings at the marks in hand, as `_exposure_now` measures it) above
         max_capital is information only (`over_ceiling`), never a fault: a market gain or a lowered ceiling takes
@@ -1894,11 +1952,11 @@ class _Run:
                 if units is None or price is None:
                     self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
                     continue
-                if not abs(units) * price <= conf["max_order_value"]:
-                    self.cap_breach = True                           # (i)
+                if units > 0 and not units * price <= conf["max_order_value"]:
+                    self.cap_breach = True                           # (i), purchases only
                 if asked is None or asked == 0 or limit is None or not limit > 0:
                     self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
-                elif (price > limit + LIMIT_SAME * limit) if asked > 0 else (price < limit - LIMIT_SAME * limit):
+                elif ((price - limit) if asked > 0 else (limit - price)) > LIMIT_SAME * limit * LIMIT_EDGE:
                     self.cap_breach = True                           # (iii)
         at_work = []
         for sym, u in broker_book(fills).items():
@@ -2082,6 +2140,9 @@ class _Run:
             self._refuse_ticket({"used": "that ticket has been used", "expired": "that ticket has expired",
                                  "superseded": "that ticket was superseded by a later one"}.get(fate["fate"],
                                                                                                 "that ticket is closed"))
+        made = book.verdict(t["batch"])                 # T34b-2 E4: the run that made it was refused after it made it
+        if made is not None and made["verdict"] == "refused":
+            self._refuse_ticket(str(made["reason"] or "the run that made that ticket was refused"))
         mark = book.live_mark(t["day"], t["number"])     # the ticket's mode: live tickets carry their locks' files
         if self.live is None and mark is not None:
             self._refuse_ticket("that ticket was made in live mode")
@@ -2955,6 +3016,18 @@ class _Run:
         self._write({"event": "left_over", **item})
         self._ticket_note(c, "not sent", reason=reason)
 
+    def _void_ticket(self, why: str) -> str:
+        """E4: a propose run that made its ticket and then ended stopped: the ticket's batch is refused in the ticket
+        book (an attempt and a refused verdict, the book's way of refusing a batch, with the reason), which every
+        approval of that ticket then reads; no number is returned. The reason, with any failure to record it."""
+        self.ticket_number_made = None
+        try:
+            self.tickets.note_attempt(self.batch, self.day)
+            self.tickets.note_verdict(self.batch, "refused", f"the run that made that ticket ended stopped: {why}"[:1000])
+        except Exception as exc:
+            return f"{why}; its ticket could not be refused ({_local_error(exc)}), and its number is not given"
+        return why
+
     def _refuse(self, c: dict, by: str, reason: str, **extra) -> None:
         item = {"symbol": c["symbol"], "units": c["units"], "by": by, "reason": str(reason)[:MAX_TEXT * 2]}
         self.refused.append(item)
@@ -2966,16 +3039,21 @@ class _Run:
         faults: list[str] = []
         if self._locked:                                 # T34b-2 (D8): worked out first; a failure is the run's own
             try:
-                faults = self._faults()
+                faults = [] if self.faults_failed else self._faults()
             except Exception as exc:
+                self.faults_failed = True                # worked out once: the stopped summary does not try again
                 if stage != "unexpected":                # addendum 1 (B2): how the run had ended is kept, in one line
                     if status == "stopped":
                         before = f"stopped at {stage}" + ("" if reason is None else f": {reason}")
                     else:
                         before = str(status) + ("" if reason is None else f": {reason}")
                     before = " ".join(before.splitlines())
-                    return self._finish("stopped", "unexpected", f"the run failed unexpectedly: {_venue_error(exc)}; "
-                                                                 f"the run had ended {before}")
+                    why = f"the run failed unexpectedly: {_venue_error(exc)}; the run had ended {before}"
+                    if self.ticket_number_made is not None:   # addendum 3 (E4): the ticket it made is never usable
+                        why = self._void_ticket(why)
+                    return self._finish("stopped", "unexpected", why)
+                reason = (f"{reason or 'the run failed unexpectedly'}; working out the faults also failed: "   # E4
+                          f"{_venue_error(exc)}")
         try:
             book = broker_book(self.ledger.fills())
             mine = broker_book(f for f in self.ledger.fills() if self.batch and f["tag"].startswith(self.batch + "-"))
@@ -3015,6 +3093,10 @@ class _Run:
                                                 "record is left as it is and a person must look"} for d in self.disagreements]
         if faults:                                       # T34b-2: only when there is one, practice and live alike
             summary["faults"] = faults
+        if self.reconcile_pending is not None:           # addendum 3 (E2): what the final reconcile set aside
+            summary["reconcile_pending"] = {"symbols": list(self.reconcile_pending["symbols"]),
+                                            "positions_unread": bool(self.reconcile_pending["positions_unread"]),
+                                            "status_unread": int(self.reconcile_pending["status_unread"])}
         if self.live is not None:                        # T34b-2: live mode only
             if self.cap_unjudged:
                 summary["cap_unjudged"] = sorted(self.cap_unjudged)
