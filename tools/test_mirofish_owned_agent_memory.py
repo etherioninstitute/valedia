@@ -127,7 +127,7 @@ class OwnedAgentMemory(unittest.TestCase):
         module=staged_module('swarm8');model=make_model(module.OUTPUT_COMPLETION_TOKENS)
         agent=ChatAgent(system_message=BaseMessage.make_assistant_message(role_name='system',content='persona'),model=model)
         with self.assertRaisesRegex(RuntimeError,'Unreviewed platform'):module.admit_owned_agent_context(Graph([agent]),model,'mastodon')
-        with self.assertRaisesRegex(RuntimeError,'Owned agent count outside bound'):module.admit_owned_agent_context(Graph([agent]*17),model,'reddit')
+        with self.assertRaisesRegex(RuntimeError,'Owned agent count outside bound'):module.admit_owned_agent_context(Graph([agent]*13),model,'reddit')   # swarm8's bound is 12
         wrong=make_model(512)
         with self.assertRaisesRegex(RuntimeError,'Provider completion cap or model shape drift'):module.admit_owned_agent_context(Graph([agent]),wrong,'reddit')
         other=ChatAgent(system_message=BaseMessage.make_assistant_message(role_name='system',content='persona'),model=model);other.memory=ChatHistoryMemory(ScoreBasedContextCreator(model.token_counter,4096),agent_id=other.agent_id)
@@ -138,4 +138,44 @@ class OwnedAgentMemory(unittest.TestCase):
         finally:os.environ['MIROFISH_TEST_ISOLATED']='1'
         module.admit_owned_agent_context(Graph([agent]),model,'reddit');creator=agent.memory.get_context_creator()
         self.assertEqual((type(creator).__name__,creator.budget,creator.token_limit),('WholeUnitContextCreator',4096,sys.maxsize))
+    # ---- TMF2 addendum 2 -------------------------------------------------------------------------------------------------
+    def call_message(self,counter,words,call_id):
+        args=json.dumps({'content':' '.join(WORDS[i%len(WORDS)] for i in range(words))})
+        return {'role':'assistant','content':'','tool_calls':[{'id':call_id,'type':'function','function':{'name':'create_post','arguments':args}}]},args
+    def test_R2_tool_call_arguments_are_counted_by_the_memory_itself(self):
+        module=staged_module('swarm8');agent=admitted_agent(module);creator=agent.memory.get_context_creator();counter=creator.token_counter
+        library=[];own=[]
+        for words in (10,1000,5000):
+            message,args=self.call_message(counter,words,'c%d'%words)
+            library.append(counter.count_tokens_from_messages([message]));own.append(creator._count(message))
+            self.assertGreaterEqual(own[-1],library[-1]+len(counter.encode(args)),words)
+        self.assertEqual(len(set(library)),1)                                                            # the library sees the same few tokens whatever the length
+        self.assertGreater(own[1]-own[0],900);self.assertGreater(own[2]-own[1],3500)
+    def test_R2_a_context_with_long_tool_calls_stays_within_the_budget_in_real_content(self):
+        module=staged_module('swarm8');agent=admitted_agent(module,1300);creator=agent.memory.get_context_creator();counter=creator.token_counter
+        long_args={'content':' '.join(WORDS[i%len(WORDS)] for i in range(2000))}
+        for r in (1,2,3):
+            agent.update_memory(feed(text_of(counter,300,r)),OpenAIBackendRole.USER);call='call_%d'%r
+            agent.update_memory(FunctionCallingMessage(role_name='assistant',role_type=BaseMessage.make_assistant_message('a','').role_type,meta_dict=None,content='',func_name='create_post',args=long_args,tool_call_id=call),OpenAIBackendRole.ASSISTANT)
+            agent.update_memory(FunctionCallingMessage(role_name='assistant',role_type=BaseMessage.make_assistant_message('a','').role_type,meta_dict=None,content='',func_name='create_post',result={'success':True,'post_id':r},tool_call_id=call),OpenAIBackendRole.FUNCTION)
+            agent.update_memory(BaseMessage.make_assistant_message(role_name='assistant',content=''),OpenAIBackendRole.ASSISTANT)
+        context,total=agent.memory.get_context()
+        real=sum(counter.count_tokens_from_messages([m])+sum(len(counter.encode(c['function']['arguments'])) for c in m.get('tool_calls') or []) for m in context)
+        self.assertLessEqual(real,creator.budget);self.assertLessEqual(real,total)
+        self.assertEqual(len([m for m in context if m['role']=='user']),1)                               # two units of ~2,350 real tokens do not fit 4,096
+    def test_R6_every_refusal_logs_one_fixed_phrase_with_the_newest_role(self):
+        module=staged_module('swarm8');agent=admitted_agent(module);counter=agent.memory.get_context_creator().token_counter
+        one_turn(agent,counter,300,1);agent.update_memory(BaseMessage.make_assistant_message('assistant','a second closing text'),OpenAIBackendRole.ASSISTANT)
+        with self.assertRaises(module.OwnedMemoryShapeError):agent.memory.get_context()
+        lines=[(lvl,m) for lvl,name,m in self.capture.lines if module.REFUSED_PHRASE in m]
+        self.assertEqual(len(lines),1);self.assertEqual(lines[0][0],'WARNING');self.assertIn('newest record role=assistant',lines[0][1])
+        with self.assertRaises(module.OwnedMemoryShapeError):agent.memory.get_context()
+        self.assertEqual(len(self.warnings(module.REFUSED_PHRASE)),2)                                   # every raise is a line, so they can be counted
+        lone=admitted_agent(module);lone.update_memory(feed('hello'),OpenAIBackendRole.USER)
+        lone.update_memory(FunctionCallingMessage(role_name='assistant',role_type=BaseMessage.make_assistant_message('a','').role_type,meta_dict=None,content='',func_name='x',result='orphan',tool_call_id='never-called'),OpenAIBackendRole.FUNCTION)
+        with self.assertRaises(module.OwnedMemoryShapeError):lone.memory.get_context()
+        self.assertIn('newest record role=tool',self.warnings(module.REFUSED_PHRASE)[-1])
+        full=admitted_agent(module,4080);full.update_memory(feed(text_of(counter,200,2)),OpenAIBackendRole.USER)   # persona leaves no room for any feed
+        with self.assertRaises(module.OwnedMemoryBudgetError):full.memory.get_context()
+        self.assertIn('newest record role=user',self.warnings(module.REFUSED_PHRASE)[-1])
 if __name__=='__main__':unittest.main()

@@ -93,29 +93,33 @@ class NativeStaging(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_integer_delta(raw+b'#',digest,[('limit = 40','limit = 640',1,1)])
     # TMF2 (2026-11-15): every swarm number comes from tools/mirofish_swarm_limits.py; the expected literals below are that
     # derivation's results, written out so a change in the derivation shows up here as well.
-    EXPECTED={'swarm48':{'chats':672,'output':2800000,'wall':45000,'worker':44880,'records':112501,'mib':224,'bound':64,'rounds':3,'budget':12288},
-              'swarm8':{'chats':192,'output':800000,'wall':7200,'worker':7080,'records':18001,'mib':32,'bound':16,'rounds':3,'budget':4096}}
+    # Addendum 2: walls and ceilings follow the participant bound (swarm8's bound is 12), and the worker event limit is derived.
+    EXPECTED={'swarm48':{'chats':672,'output':2800000,'wall':55800,'worker':55680,'records':139501,'mib':256,'bound':64,'rounds':3,'budget':12288,'events':114294784},
+              'swarm8':{'chats':192,'output':800000,'wall':7200,'worker':7080,'records':18001,'mib':32,'bound':12,'rounds':3,'budget':4096,'events':114294784}}
     def test_swarm_numbers_are_the_derivation_and_every_admitted_call_can_reserve_its_cap(self):
         self.assertEqual(set(s.SWARM),set(self.EXPECTED))
         for name,e in self.EXPECTED.items():
             n=s.swarm_numbers(name);self.assertEqual(s.PROFILES[name],(n['chats'],n['output']))
             self.assertEqual((n['chats'],n['output'],n['wall'],n['worker_deadline_s'],n['history_records'],n['history_mib'],n['agents_bound'],n['rounds'],n['memory_budget']),
                              (e['chats'],e['output'],e['wall'],e['worker'],e['records'],e['mib'],e['bound'],e['rounds'],e['budget']),name)
-            self.assertEqual((n['caller_output'],n['native_output'],n['semaphore'],n['gateway_arrival_s'],n['gateway_queue_s'],n['agent_client_s'],n['caller_client_s'],n['embedding_client_s'],n['request_bytes']),(4096,1024,1,540,270,570,570,570,262144),name)
+            self.assertEqual((n['caller_output'],n['native_output'],n['semaphore'],n['gateway_arrival_s'],n['gateway_queue_s'],n['agent_client_s'],n['caller_client_s'],n['embedding_client_s'],n['request_bytes']),(4096,1024,1,540,270,570,570,570,258048),name)
+            self.assertEqual(n['worker_event_bytes'],e['events'],name)
             self.assertGreaterEqual(n['output'],2*512+(n['chats']-2)*max(n['caller_output'],n['native_output']))
             self.assertNotEqual(n['memory_budget'],2048)
     def test_swarm_gateway_run_and_startup_change_exactly_the_closed_numbers(self):
         for name,e in self.EXPECTED.items():
-            for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,17),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,10),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
+            for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,17),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,11),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
                 raw=(s.W16/relative).read_bytes();changed=build(raw,name);before,after=s.integer_literals(raw),s.integer_literals(changed)
                 self.assertEqual(sum(a!=b for a,b in zip(before,after)),count,relative)
                 with self.assertRaisesRegex(RuntimeError,'original source drift'):build(raw+b'\n',name)
             gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),name).decode()
             for text in [f'chat_attempts: int = {e["chats"]}',f'"chat_attempts": {e["chats"]},',f'output_total: int = {e["output"]}',f'"output_total": {e["output"]},',f'"wall_seconds": {e["wall"]},',
-                         'request_bytes: int = 262144','client_seconds: int = 540','"client_seconds": 540,','queue_seconds: int = 270','"queue_seconds": 270}','output_per_call: int = 4096','context: int = 32768','cleanup_seconds: int = 120','<= 128','+10.0']:self.assertIn(text,gateway)
+                         'request_bytes: int = 258048','client_seconds: int = 540','"client_seconds": 540,','queue_seconds: int = 270','"queue_seconds": 270}','output_per_call: int = 4096','context: int = 32768','cleanup_seconds: int = 120','<= 128','+10.0']:self.assertIn(text,gateway)
             run=s.swarm_run_bytes((s.W16/sorted(s.RUN_COPIES)[0]).read_bytes(),name).decode()
             for text in [f'time.monotonic() + {e["worker"]}',f'<= {e["bound"]}, "actual generated participant count outside bound"',f'"max_rounds": {e["rounds"]},',f'deadline=start+{e["wall"]};active=deadline-120',f'research_only=False,max_age_seconds={e["wall"]})',f"receipt['wall_seconds']<={e['wall']}",
-                         '"MIROFISH_PREP_LLM_TIMEOUT": "570"','"MIROFISH_REPORT_LLM_TIMEOUT": "570"',"'caller_timeout':570,'gateway_arrival_seconds':540,'queue_seconds':270",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)"]:self.assertIn(text,run)
+                         '"MIROFISH_PREP_LLM_TIMEOUT": "570"','"MIROFISH_REPORT_LLM_TIMEOUT": "570"',"'caller_timeout':570,'gateway_arrival_seconds':540,'queue_seconds':270",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)",
+                         f'self.buffer += data; require(len(self.buffer) <= {e["events"]}, "worker event byte limit")']:self.assertIn(text,run)
+            self.assertNotIn('<= 131072, "worker event byte limit"',run)
             self.assertNotIn('"180"',run)
             startup=s.swarm_startup_bytes((s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),name).decode()
             for text in [f'(30 if preflight else {e["wall"]})',f'MAX_RECORDS={e["records"]}',f'MAX_BYTES={e["mib"]}*1024*1024']:self.assertIn(text,startup)
@@ -134,6 +138,15 @@ class NativeStaging(unittest.TestCase):
             with self.assertRaises(RuntimeError):s.closed_digit_delta(raw,digest,edits)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_digit_delta(raw+b'#',digest,[("'caller_timeout':180","'caller_timeout':570",1,1)])
         self.assertEqual(s.closed_integer_delta(raw,digest,[("'caller_timeout':180","'caller_timeout':570",1,1)]).count(b"'caller_timeout':570"),1)
+        # Addendum 2, R4: exact to the byte. A comment-only edit beside an approved change is refused, by both proofs.
+        comment=('# Remain a live group ownership anchor; the supervisor owns termination.','# Remain a live group ownership anchor; the supervisor owns termination!',1,0)
+        self.assertEqual(raw.count(comment[0].encode()),1)
+        with self.assertRaisesRegex(RuntimeError,'outside the approved constants'):s.closed_digit_delta(raw,digest,[("'caller_timeout':180","'caller_timeout':570",1,1),comment])
+        with self.assertRaisesRegex(RuntimeError,'outside the approved constants'):s.closed_integer_delta(raw,digest,[("'caller_timeout':180","'caller_timeout':570",1,1),comment])
+        spaced=("'caller_timeout':180,","'caller_timeout': 570,",1,1)                                     # whitespace inside an approved fragment
+        with self.assertRaisesRegex(RuntimeError,'outside the approved constants'):s.closed_digit_delta(raw,digest,[spaced])
+        quoted=('"MIROFISH_PREP_LLM_TIMEOUT": "180"',"\"MIROFISH_PREP_LLM_TIMEOUT\": '570'",1,1)          # the same value with other quotes
+        with self.assertRaisesRegex(RuntimeError,'outside the approved constants'):s.closed_digit_delta(raw,digest,[quoted])
         with self.assertRaises(RuntimeError):s.closed_integer_delta(raw,digest,[('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',1,1)])  # the integer-only rule is unchanged elsewhere
     def test_swarm_selector_is_full_participation_with_one_request_in_flight_per_platform(self):
         raw=(s.W16/s.SELECTOR_REL).read_bytes()
@@ -183,12 +196,15 @@ class NativeStaging(unittest.TestCase):
         for required in ['HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS.','none is a real person or firm','not participants','do not force a BUY','No real prices','three rounds']:self.assertIn(required,text)
         self.assertEqual(json.loads(s.swarm_scenario('swarm48')[1])['recorded_at_utc'],'2026-11-11T00:00:00+00:00')  # the earlier seal is unchanged
     def test_staged_swarm_folders_carry_the_memory_replacement_and_derived_numbers(self):
-        for name,folder in [('swarm48',s.CREW/'valedia-native-20261115-swarm48-a'),('swarm8',s.CREW/'valedia-native-20261115-swarm8-a')]:
+        # The -a folders were staged by the tool before addendum 2 and are left as they are; the -b twins are the repaired tool's proof.
+        for name,folder in [('swarm48',s.CREW/'valedia-native-20261115-swarm48-b'),('swarm8',s.CREW/'valedia-native-20261115-swarm8-b')]:
             if not (folder/'builder/candidate-manifest.json').exists():self.skipTest('staged folders follow tests')
             manifest=json.loads((folder/'builder/candidate-manifest.json').read_text());n=s.swarm_numbers(name);p=manifest['swarm_profile']
             self.assertEqual((p['name'],p['memory_budget'],p['caller_output'],p['wall'],p['chats']),(name,n['memory_budget'],4096,n['wall'],n['chats']));self.assertFalse(manifest['launch_authorized'])
             self.assertEqual(p['memory_replacement']['canonical_sha256'],s.MEMORY_CANONICAL_SHA);self.assertEqual(p['memory_replacement']['replacement_sha256'],s.MEMORY_REPLACEMENT_SHA)
             self.assertEqual((folder/s.MEMORY_REL).read_bytes(),s.swarm_memory_bytes((s.W16/s.MEMORY_REL).read_bytes(),name))
+            self.assertEqual(p['worker_event_bytes'],n['worker_event_bytes']);self.assertEqual(p['agents_bound'],n['agents_bound'])
+            for relative in s.RUN_COPIES:self.assertIn(f'require(len(self.buffer) <= {n["worker_event_bytes"]}, "worker event byte limit")'.encode(),(folder/relative).read_bytes())
             self.assertFalse((folder/'root-one-native-attempt.json').exists());self.assertFalse((folder/'builder/startup-preflight.json').exists());self.assertFalse((folder/'run1').exists())
     def test_swarm_scenario_is_labelled_hypothetical_and_sealed_with_its_exact_bytes(self):
         raw,seal=s.swarm_scenario('swarm48');value=json.loads(seal);text=raw.decode()
