@@ -194,9 +194,9 @@ Either line means the memory is not the one staged.
 
 How to read `Owned memory refused the context`:
 
-- `newest record role=tool`: harmless; the next round starts a new unit.
-- `newest record role=user`: an agent's turn was lost (its feed could not be given to the model). Count these lines and report
-  the count with the run.
+- `newest record role=tool` or `role=assistant`: harmless; a tool call or its result was too large and the next round starts a new unit.
+- `newest record role=user`: an agent's turn was lost (its feed could not be given to the model). Report the number of these lines
+  as an UPPER BOUND on lost turns: a refusal that lasts is logged again when the next round's feed is written, and the line names no agent.
 - The library's own `Token calculation failed before chunking` warnings come with these refusals and are expected. They are
   not the count to read; count the owned-memory line instead.
 
