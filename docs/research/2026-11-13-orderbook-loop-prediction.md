@@ -308,3 +308,13 @@ to fail; the collector was started again at once. The three stops of 15 November
 (45 seconds, 15 minutes 29 seconds, 2 hours 19 minutes 19 seconds), 10.8% of the day's slots before the overruns
 already noted, and the day's own count decides whether it counts. No further stop is declared. A later run of this
 kind is declared here before it happens.
+
+## A fourth stop on 15 November, for an 8-participant proving run (written at 20:11 UTC, 12:11 PST, before the stop; no answer has been scored)
+
+The owner has asked for one more run today: a small one of 8 participants and three rounds, to prove a repair to the
+swarm before a long run is spent on it. Like the others it needs the local model memory to itself. The collector will
+be stopped for it once, and is to be running again no later than 2 hours 10 minutes after that stop, whatever the run
+does; the run is expected to take about 75 minutes. With the three earlier stops that is 4 hours 46 minutes of
+15 November at the most, 19.8% of the day's slots, and about 3 hours 55 minutes (16.4%) if the run takes its expected
+time; the day's own count decides whether it counts. The exact times are added below afterwards. If the run's
+preparation fails before the collector is touched, this stop does not take place, and that is said here.
