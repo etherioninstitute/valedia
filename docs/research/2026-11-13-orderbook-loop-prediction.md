@@ -275,3 +275,13 @@ with the collector still stopped. The collector is to be running again no later 
 stop, whatever the run does: that is 19.1% of a day's slots, so 15 November can still reach 80% if little else is
 lost, and its own count decides. If the small run does not complete, the larger one is not started and the first
 declaration's 45 minutes stand. Nothing about the collector changes; the stop and the start are in the store.
+
+## What the first stop was, and the second stop (written at 08:17 UTC on 15 November, 00:17 PST, before the second stop; no answer has been scored)
+
+The first attempt never ran: the run's launcher refused in its first second (a fixed drive number in its own source,
+changed at a reboot), so the collector was off for 45 seconds only, from 06:38:36 to 06:39:21 UTC on 15 November, its
+first new heartbeat at 06:40:34; both are in the store. The launcher's fault is repaired. The second stop follows now,
+for the small run and then, only if that completes, the 48-agent run, under the limits already declared: the collector
+is to be running again no later than 4 hours 35 minutes after this second stop, whatever the runs do. Its exact times
+are added below afterwards. Between the two stops, at 06:55 UTC, the store shows two overruns while another program
+on this Mac held 16 to 19 GB of memory; they are lost slots like any other.
