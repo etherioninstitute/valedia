@@ -23,11 +23,12 @@ import json
 import math
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from valedia_trader.execution_and_risk import go_live as _go_live
 from valedia_trader.execution_and_risk.go_live import LIVE_VENUE, PAPER_VENUE
@@ -35,7 +36,7 @@ from valedia_trader.venues import webull as _webull
 from valedia_trader.venues.webull import LIVE_DAYS_AHEAD_MAX, OWNER_TEXT_MAX, read_owner_file
 
 __all__ = ["TICKET_SESSIONS", "UNATTENDED_SESSIONS", "DOUBLING_SESSIONS", "STOP_MULTIPLE", "STOP_WINDOW",
-           "STOP_FLOOR_PCT", "FAULT_STAGES", "SKIP_STAGES", "DRIFT_ACTS", "LADDER_KEYS", "LIVE_VENUE", "PAPER_VENUE",
+           "STOP_FLOOR_PCT", "MAX_DAY_ORDERS", "MAX_POSITIONS", "FAULT_STAGES", "SKIP_STAGES", "DRIFT_ACTS", "LADDER_KEYS", "LIVE_VENUE", "PAPER_VENUE",
            "LadderRefused", "LadderAbsent", "LadderFile", "read_ladder_file", "SessionFact", "SessionFacts", "session_facts",
            "Position", "position", "WorkingStop", "working_stop_pct", "paper_returns", "day_stopped", "fractional_proven",
            "describe"]
@@ -51,6 +52,9 @@ SKIP_STAGES = frozenset({"session", "ticket", "lock", "live", "clock", "environm
                          "marks"})    # D3's ordinary and data stops: a skipped session
 DRIFT_ACTS = False                   # D10: a `drift` entry in a summary's faults does not make a fault while False
 DRIFT = "drift"
+MAX_DAY_ORDERS = 720                 # T34b-1 addendum 2, D-A: more possible orders on one day and a person must look
+MAX_POSITIONS = 64                   # D-B: more positions the record allows and a person must look
+_NY = ZoneInfo("America/New_York")   # D-F: a usable time falls on its entry's own New York date
 LADDER_FILE = "config/ladder.json"
 LADDER_KEYS = ("confirmed_by", "first_stake", "unattended", "fractional", "valid_until")
 _MISSING = "is missing"              # read_owner_file's own words for a file that is not there
@@ -173,7 +177,8 @@ class SessionFact:
     summaries (the owner's max_capital in force when each run read his file), or None; always None for an event.
     `at` (T34b-1 R1): for a pause or a reset its usable time, else None; None on every session fact. `fault_times`
     (T34b-1 addendum 1, A2): for a fault session one entry per faulty summary of the day, its usable time or None
-    (instants ascending, None last); empty on every other fact. A usable time is an aware datetime (`_instant`)."""
+    (instants ascending, None last); empty on every other fact. A usable time is an aware datetime on the fact's own
+    New York date (`_instant`)."""
     day: date
     kind: str
     reasons: tuple[str, ...]
@@ -227,17 +232,20 @@ def _aware(x: Any) -> bool:
         return False
 
 
-def _instant(ts: Any) -> datetime | None:
+def _instant(ts: Any, day: date) -> datetime | None:
     """A journal entry's `timestamp` as an instant (T34b-1 R1): a `str` that `datetime.fromisoformat` reads as a
-    datetime WITH a UTC offset (as `Journal.record` stamps every record); anything else is an unknown time (None).
-    Instants are compared as instants (aware datetimes), never as text."""
+    datetime WITH a UTC offset (as `Journal.record` stamps every record) and that falls on the entry's own `day` read
+    in New York (addendum 2, D-F); anything else is an unknown time (None). Instants are compared as instants (aware
+    datetimes), never as text."""
     if type(ts) is not str:
         return None
     try:
         dt = datetime.fromisoformat(ts)
+        if not _aware(dt) or dt.astimezone(_NY).date() != day:
+            return None
     except (ValueError, TypeError, OverflowError):
         return None
-    return dt if _aware(dt) else None
+    return dt
 
 
 def _is_session(cal, d: date) -> bool | None:
@@ -258,9 +266,10 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
     boolean, never text), finite and above 0; None when no summary of the day has a usable one. An unusable ceiling
     makes no entry unreadable: it is simply not a ceiling, and a day without one can never raise the stake.
     Entries of type `drawdown_pause` and `latch_reset` (with a `who` that is a name) for `venue` are their own facts
-    (kind pause and reset), after the session of their day, in the order of their `timestamp` read as an instant
-    (`_instant`; T34b-1 R1), a reset before a pause at the same instant; a reset of unknown time comes before every
-    other event of its day and a pause of unknown time after every other. `at` and `fault_times` are described on
+    (kind pause and reset), after the session of their day, listed in the order of their `timestamp` read as an
+    instant (`_instant`; T34b-1 R1), a reset before a pause at the same instant, a reset of unknown time first and a
+    pause of unknown time last. That listing claims no order: where the instants do not tell it (equal, or either
+    unknown) the walk takes every order (addendum 2, D-A). `at` and `fault_times` are described on
     SessionFact: a fault session carries one time per faulty summary (addendum 1, A2). A pause or a reset is
     an event, not a session (addendum 1, A2): it counts on any calendar day it carries (a weekend, a holiday, a day
     outside the calendar's window; the calendar is not asked) and so takes effect before the next session after it.
@@ -274,9 +283,8 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
     not ours: ignored.
 
     Readings (the careful side): a stop at a stage in neither D3 list, a status other than done or stopped, and a
-    `faults` field that is not a list are faults. Within a day, a reset and a pause at the same instant, or one without
-    a usable time, are put so that the day ends paused (a reset first, a pause last). D4's "between the pause and
-    the reset no session counts" is applied in `position`."""
+    `faults` field that is not a list are faults. A time on another New York date than the entry's `day` is unknown
+    (D-F). D4's "between the pause and the reset no session counts" is applied in `position`."""
     cal = _go_live._calendar(calendar)
     days: dict[date, list[dict]] = {}
     events: dict[date, list[tuple[tuple, SessionFact]]] = {}
@@ -312,7 +320,7 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
                 continue
             days.setdefault(d, []).append(e)
             continue
-        ts = _instant(e.get("timestamp"))
+        ts = _instant(e.get("timestamp"), d)
         if kind == "drawdown_pause":
             fact = SessionFact(d, "pause", ("the 25% drawdown pause began: no clean session counts until the owner's "
                                             "reset",), at=ts)
@@ -335,7 +343,7 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
             times: tuple[datetime | None, ...] = ()
             if faulty:
                 kind, reasons = "fault", faulty
-                runs = [_instant(e.get("timestamp")) for e, (_, rs, _) in zip(days[d], judged) if rs]
+                runs = [_instant(e.get("timestamp"), d) for e, (_, rs, _) in zip(days[d], judged) if rs]
                 times = tuple(sorted(t for t in runs if t is not None)) + tuple(t for t in runs if t is None)
             elif any(done for done, _, _ in judged):
                 kind, reasons = "clean", {"a run ended done"} | notes
@@ -424,13 +432,22 @@ class Position:
     changes: tuple[tuple[date | None, str], ...]
     earned: float                                    # A4: the stake the history earned; `stake` is min(earned, max_capital)
     ceiling: float                                   # T34b-1 R5: max_capital, the owner's ceiling at this read
+    possible: int = 1                                # addendum 2, D-C: how many positions the record allows
 
 
 _PAUSE_WORDS = "the 25% drawdown pause: no clean session counts until the owner's reset (a fault still halves)"
-_ORDER_UNKNOWN_WORDS = "the journal's times do not tell the order of this day's fault and its pause or reset"
-_LOWER_KEPT_WORDS = "the lower stake was kept"
-_TICKET_KEPT_WORDS = "ticket mode was kept"
-_MORE_CAREFUL_WORDS = "the state kept is the end of no single possible order and is more careful than each of them"
+_UNTOLD_START = "the times do not tell the order of the events on "
+_UNTOLD_WORDS = (_UNTOLD_START + "{days}: {count} possible; what is shown is the lowest stake, ticket mode where any "
+                 "of them has it and the pause where any of them has it")
+_DAYS_NAMED = 5
+
+
+def _untold_line(days: list[date], n: int) -> str:
+    """D-D's one undated line, in fixed words: the days (up to five named, then "and N more") and the positions."""
+    named = ", ".join(d.isoformat() for d in days[:_DAYS_NAMED])
+    if len(days) > _DAYS_NAMED:
+        named += f" and {len(days) - _DAYS_NAMED} more"
+    return _UNTOLD_WORDS.format(days=named, count=f"{n} position{' is' if n == 1 else 's are'}")
 
 
 def _amount(x: float) -> str:
@@ -488,30 +505,50 @@ def position(facts, first_stake: Any, max_capital: Any) -> Position:
     The pause rule is applied here (addendum 3, F1): between a pause and its reset no CLEAN session counts (none on a
     day that starts paused or holds a pause: the pause stands from the start of its day, and a reset applies after
     its day's session), but a FAULT session halves the earned stake and zeroes the count on any day, paused or not.
-    Within one day (T34b-1 R1): (1) the day's ceiling clamp; (2) a clean or skipped session, before the day's pauses
-    and resets; (3) a fault session on a day with no pause or reset halves; (4) on a day with k of them the fault
-    takes its place in real time: after the first p of them (0 <= p <= k), where a place is possible for one faulty
-    run's time when no event before it has a known instant (`at`) later than that time and none after it one earlier
-    (an event at that very instant, or of unknown time, may be on either side; an unknown time allows every place).
-    The fault halves ONCE; its possible places are the union over the day's faulty runs (`fault_times`, addendum 1,
-    A2; none recorded: every place). With several possible places the day is walked once for each from the same start
-    and the end kept is built part by part (A1): the smallest earned stake; ticket mode when any place ends in ticket
-    (then TICKET_SESSIONS needed), else unattended with the largest `needed`; the smallest count; paused when any place
-    ends paused. So it is never above any possible order in stake and never less approved than any. The day's lines
-    are those of the earliest place with the smallest stake, then, when the places did not all end alike, one line
-    in fixed words: the times do not tell the order, the lower stake was kept, ticket mode was kept (when some place
-    ended unattended), and the state kept is the end of no single possible order (when so). Stakes are halved
-    and doubled exactly in binary floating point (dividing or multiplying by 2 loses nothing away from underflow), so
-    n halvings and n doublings return exactly to the start.
+    One day for ONE given order (T34b-1 R1): (1) the day's ceiling clamp; (2) a clean or skipped session, before the
+    day's pauses and resets; (3) a fault session after the first p of them (0 <= p <= k); then the events in the order
+    given. The fault halves ONCE.
+
+    The day's POSSIBLE ORDERS (addendum 2, D-A): every arrangement of its pauses and resets that their known
+    DIFFERENT instants allow (equal instants, or an unknown one, may go either way; `at` on another New York date than
+    the fact's day is unknown, D-F), each with every place of the fault that A2 allows in that arrangement (a place is
+    possible for one faulty run's time when no event before it has a known instant later than that time and none
+    after it one earlier; an unknown time allows every place; the union over the day's faulty runs, `fault_times`).
+    More than MAX_DAY_ORDERS: ValueError. The walk (D-B) carries the SET of distinct states (mode, earned stake, clean,
+    needed, paused) the record allows, from one: each day every member is walked through every possible order of the
+    day and the new set is the distinct ends; more than MAX_POSITIONS: ValueError. Where every day has one possible
+    order the set has one member and the walk is today's for that order.
+
+    The position reported (D-C), at the end of each day and at the read, part by part over the set: the SMALLEST
+    earned stake (`stake` is min of it and max_capital); ticket mode when ANY member is in ticket mode; paused when ANY
+    member is; `clean` and `needed` of the member, among those in the reported mode, with the most sessions still to
+    go (`needed - clean`), among equals the larger `needed`, then the smaller `clean`; `possible`, how many members.
+    So for any concrete order of the record's events (D-E) the concrete position is a member on every day, and the
+    reported stake is never above it, the report is ticket whenever it is, and paused whenever it is.
+
+    The lines (D-D): a day "whose order could not be told" is one on which, for some member, the possible orders do
+    not all give the same end and the same lines. Up to the first such day the set has one member and its lines are
+    the changes, as today. From that day on no dated line is listed: the changes are the dated lines up to the day
+    before it, then one undated line in fixed words naming every such day (up to five, then "and N more"), how many
+    positions are possible and what is shown. Reading: that line is written from the first such day even if the set
+    has one member again (or never had more: orders that end alike but tell their lines in another order), since
+    the dated lines after it would claim an order the record does not tell.
+
+    Stakes are halved and doubled exactly in binary floating point (dividing or multiplying by 2 loses nothing away
+    from underflow), so n halvings and n doublings return exactly to the start.
 
     Refusals (ValueError, one line): `first_stake` or `max_capital` not a finite number above 0 or above
     `webull.LIVE_MONEY_MAX` (T34b-1 R3); a fact that is not a SessionFact, out of day order, with an unusable ceiling,
-    or with an `at` that is neither None nor an aware datetime, or a `fault_times` that is not a tuple of None or aware
-    datetimes, or is not empty on a fact that is not a fault; a day whose pauses and resets with known instants are
-    not in non-decreasing order as given; a day with more than one session fact (session_facts gives one a day).
+    or with an `at` that is neither None nor an aware datetime, or with an `at` on a session fact (clean, fault or
+    skipped; D-F), or a `fault_times` that is not a tuple of None or aware datetimes, or is not empty on a fact that is
+    not a fault; a day whose pauses and resets with known instants are not in non-decreasing order as given; a day
+    with more than one session fact (session_facts gives one a day); a day with more than MAX_DAY_ORDERS possible
+    orders; more than MAX_POSITIONS positions.
 
     Readings (the careful side): a reset with no pause before it changes nothing; a second pause before the reset
-    changes nothing (one reset, one step down); the step down compares with the owner's `first_stake` as written."""
+    changes nothing (one reset, one step down); the step down compares with the owner's `first_stake` as written.
+    Two pauses (or two resets) with the same time, or both unknown, are interchangeable: their orders are counted
+    once towards MAX_DAY_ORDERS (an order is an arrangement of distinct (kind, time) events, with a place)."""
     final, _ = _walk_all(facts, first_stake, max_capital)
     return final
 
@@ -538,23 +575,47 @@ def _places(events: list, fault_times: tuple) -> list[int]:
     return [p for p in every if any(_possible(events, t, p) for t in fault_times)]
 
 
-def _kept(tried: list, day: date) -> tuple[tuple, list]:
-    """Addendum 1, A1: the end of a day kept from the ends of its possible places (in place order), part by part,
-    and the day's lines (those of the earliest place with the smallest stake, then the tie line when they differ)."""
-    ends = [end for _, end, _ in tried]
-    low = min(e[1] for e in ends)
-    ticket = any(e[0] == "ticket" for e in ends)
-    kept = ("ticket" if ticket else "unattended", low, min(e[2] for e in ends),
-            TICKET_SESSIONS if ticket else max(e[3] for e in ends), any(e[4] for e in ends))
-    lines = list(next(ls for _, e, ls in tried if e[1] == low))
-    if len(set(ends)) > 1:
-        words = f"{_ORDER_UNKNOWN_WORDS}: {_LOWER_KEPT_WORDS}"
-        if ticket and any(e[0] != "ticket" for e in ends):
-            words += f"; {_TICKET_KEPT_WORDS}"
-        if kept not in ends:
-            words += f"; {_MORE_CAREFUL_WORDS}"
-        lines.append((day, words))
-    return kept, lines
+def _arrangements(events: list) -> list[list]:
+    """D-A: every order of the day's pauses and resets that their known different instants allow, each listed once
+    (events of the same kind and the same time, or both of unknown time, are interchangeable). Stops as soon as there
+    are more than MAX_DAY_ORDERS (the caller refuses). Worked without recursion, so a long day cannot overflow."""
+    out: list[list] = []
+    stack: list[tuple[tuple, tuple]] = [((), tuple(events))]
+    while stack and len(out) <= MAX_DAY_ORDERS:
+        seq, rest = stack.pop()
+        if not rest:
+            out.append(list(seq))
+            continue
+        low = min((f.at for f in rest if f.at is not None), default=None)
+        seen: set = set()
+        grown = []
+        for i, f in enumerate(rest):
+            if (f.at is not None and f.at != low) or (f.kind, f.at) in seen:
+                continue                     # an event with a later known instant waits for the earlier ones
+            seen.add((f.kind, f.at))
+            grown.append((seq + (f,), rest[:i] + rest[i + 1:]))
+        stack.extend(reversed(grown))
+    return out
+
+
+def _orders(day: date, session: SessionFact | None, events: list) -> list[tuple[list, int]]:
+    """D-A: the day's possible orders, (arrangement, place of the fault); a ValueError past MAX_DAY_ORDERS."""
+    out: list[tuple[list, int]] = []
+    for seq in _arrangements(events):
+        places = _places(seq, session.fault_times) if session is not None and session.kind == "fault" and seq else [0]
+        out.extend((seq, p) for p in places)
+        if len(out) > MAX_DAY_ORDERS:
+            raise ValueError(f"{day.isoformat()} has more than {MAX_DAY_ORDERS} possible orders of its fault, pauses and "
+                             "resets; a person must look at that day")
+    return out
+
+
+def _report(members: list[tuple]) -> tuple:
+    """D-C: the position reported, part by part over the set: (mode, the smallest earned stake, clean, needed of the
+    slowest member in that mode, paused when any is)."""
+    mode = "ticket" if any(m[0] == "ticket" for m in members) else "unattended"
+    slow = max((m for m in members if m[0] == mode), key=lambda m: (m[3] - m[2], m[3], -m[2]))
+    return mode, min(m[1] for m in members), slow[2], slow[3], any(m[4] for m in members)
 
 
 def _one_day(state: tuple, day: date, first: float, session: SessionFact | None, events: list,
@@ -626,6 +687,21 @@ def _one_day(state: tuple, day: date, first: float, session: SessionFact | None,
 
 
 def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list[tuple[date, Position]]]:
+    final, walk, _ = _walk_sets(facts, first_stake, max_capital)
+    return final, walk
+
+
+def _on_day(t: datetime | None, day: date) -> datetime | None:
+    """D-F: a time that is not on `day` in New York orders nothing (an unknown time)."""
+    try:
+        return t if t is not None and t.astimezone(_NY).date() == day else None
+    except (OverflowError, ValueError):
+        return None
+
+
+def _walk_sets(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list[tuple[date, Position]],
+                                                                    list[tuple[date, tuple]]]:
+    """The walk (D-B): the reported position at the read, at the end of each day, and the set of each day."""
     first = _bounded(first_stake, "first_stake")
     cap = _bounded(max_capital, "max_capital")
     facts = list(facts)
@@ -636,24 +712,33 @@ def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list
             raise ValueError("a session fact's ceiling must be a finite number above 0, or None")
         if f.at is not None and not _aware(f.at):
             raise ValueError("a session fact's time (at) must be a datetime with a UTC offset, or None")
+        if f.at is not None and f.kind in SESSION_KINDS:
+            raise ValueError("a session fact (clean, fault or skipped) carries no time (at); only a pause or a reset does")
         if type(f.fault_times) is not tuple or any(t is not None and not _aware(t) for t in f.fault_times):
             raise ValueError("a session fact's fault_times must be a tuple of datetimes with a UTC offset or None")
         if f.fault_times and f.kind != "fault":
             raise ValueError("only a fault session carries fault_times")
         if i and f.day < facts[i - 1].day:
             raise ValueError("the session facts are not in day order")
-    state = ("ticket", first, 0, TICKET_SESSIONS, False)               # the stake in it: the earned E
-    changes: list[tuple[date | None, str]] = []
+    members: list[tuple] = [("ticket", first, 0, TICKET_SESSIONS, False)]    # the stake in each: the earned E
+    changes: list[tuple[date | None, str]] = []                             # the dated lines, while told
+    untold: list[date] = []                                                 # the days whose order was not told
 
-    def at(changes_now: list) -> Position:
-        mode, stake, clean, needed, paused = state
+    def at() -> Position:
+        mode, stake, clean, needed, paused = _report(members)
         held = min(stake, cap)
+        now = list(changes)
+        if untold:
+            now.append((None, _untold_line(untold, len(members))))
         if held < stake:
-            changes_now = changes_now + [(None, f"the owner's ceiling at this read (max_capital {_amount(cap)}) holds the "
-                                                f"stake at {_amount(held)}, below the {_amount(stake)} the record earned")]
-        return Position(mode, held, clean, needed, paused, tuple(changes_now), stake, cap)
+            earned = (f"the {_amount(stake)} the record earned" if len(members) == 1 else
+                      f"{_amount(stake)}, the lowest stake of the positions the record allows")
+            now.append((None, f"the owner's ceiling at this read (max_capital {_amount(cap)}) holds the stake at "
+                              f"{_amount(held)}, below {earned}"))
+        return Position(mode, held, clean, needed, paused, tuple(now), stake, cap, len(members))
 
     walk: list[tuple[date, Position]] = []
+    sets: list[tuple[date, tuple]] = []
     i = 0
     while i < len(facts):
         day = facts[i].day
@@ -661,7 +746,7 @@ def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list
         while j < len(facts) and facts[j].day == day:
             j += 1
         sessions = [f for f in facts[i:j] if f.kind in SESSION_KINDS]
-        events = [f for f in facts[i:j] if f.kind in EVENT_KINDS]
+        events = [f if _on_day(f.at, day) == f.at else replace(f, at=None) for f in facts[i:j] if f.kind in EVENT_KINDS]
         if len(sessions) > 1:
             raise ValueError(f"the session facts hold more than one session for {day.isoformat()} (session_facts gives "
                              "one a day)")
@@ -669,15 +754,33 @@ def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list
         if any(later < earlier for earlier, later in zip(known, known[1:])):
             raise ValueError(f"the pauses and resets of {day.isoformat()} are not in the order of their times")
         session = sessions[0] if sessions else None
-        places = [0]
-        if session is not None and session.kind == "fault" and events:
-            places = _places(events, session.fault_times)
-        tried = [(p, *_one_day(state, day, first, session, events, p)) for p in places]
-        state, lines = _kept(tried, day)
-        changes.extend(lines)
-        walk.append((day, at(changes)))
+        if session is not None and session.fault_times:
+            session = replace(session, fault_times=tuple(_on_day(t, day) for t in session.fault_times))
+        orders = _orders(day, session, events)
+        ends: dict[tuple, None] = {}
+        told: list | None = None
+        for m in members:
+            results = {}
+            for seq, p in orders:
+                end, lines = _one_day(m, day, first, session, seq, p)
+                results.setdefault((end, tuple(lines)), None)
+            if len(results) > 1:                      # this day's order is not told: no dated line from here on
+                if not untold or untold[-1] != day:
+                    untold.append(day)
+            elif not untold:                          # one member (D-D): its lines, as today
+                told = list(next(iter(results))[1])
+            for end, _ in results:
+                ends.setdefault(end, None)
+            if len(ends) > MAX_POSITIONS:
+                raise ValueError(f"the record allows more than {MAX_POSITIONS} positions by {day.isoformat()} (the times "
+                                 "do not tell the order of too many events); a person must look")
+        if not untold and told is not None:
+            changes.extend(told)
+        members = list(ends)
+        sets.append((day, tuple(members)))
+        walk.append((day, at()))
         i = j
-    return at(changes), walk
+    return at(), walk, sets
 
 
 # ------------------------------------------------------------------ 4. the working stop (D5)
@@ -773,7 +876,10 @@ def describe(position: Position | None, working_stop: WorkingStop | None, ladder
              proven: int) -> list[str]:
     """The lines `order-step --live --check` prints for the owner: the mode, the stake, the clean sessions of how
     many, what changes next and when at the earliest, the working stop and its basis, and whether fractional units
-    are allowed and why. No secret, no account, no path outside the repository, no digest.
+    are allowed and why. No secret, no account, no path outside the repository, no digest. With more than one
+    position (addendum 2, D-D) every sentence is of the reported position: the counts are "at the earliest, for the
+    slowest of the positions the record allows", no stake is named that the reported position does not hold, and the
+    last change shown is the last one the record tells, with the order that is not told in its own line.
 
     Refuses (ValueError, one line, T34b-1 R3) a ladder file's `first_stake` or a position's `ceiling` (the
     max_capital it was read under) that is not a number above 0 and at most `webull.LIVE_MONEY_MAX`, the cap the
@@ -802,38 +908,62 @@ def describe(position: Position | None, working_stop: WorkingStop | None, ladder
         else:
             lines.append(f"mode: unattended by the ladder, but {LADDER_FILE} says unattended: false (or is not there), "
                          "so every send still needs a ticket")
+        many = position.possible > 1                                 # addendum 2, D-D: several positions
+        untold = next((w for d, w in position.changes if d is None and w.startswith(_UNTOLD_START)), None)
+        if many:
+            lines.append(f"positions: the record allows {position.possible} (the times do not tell the order of some "
+                         "events); shown: the lowest stake, ticket mode where any of them has it, the pause where any "
+                         "of them has it, and the count of the slowest")
         lines.append(f"stake at work: {_amount(position.stake)}")
         if position.stake < position.earned:
-            lines.append(f"held by the owner's ceiling: the record earned {_amount(position.earned)}, and the owner's "
-                         f"ceiling (max_capital {_amount(position.stake)}) holds the stake at work to "
-                         f"{_amount(position.stake)}")
-        lines.append(f"clean sessions: {position.clean} of {position.needed}")
+            earned = (f"the lowest stake of the positions the record allows is {_amount(position.earned)}" if many else
+                      f"the record earned {_amount(position.earned)}")
+            lines.append(f"held by the owner's ceiling: {earned}, and the owner's ceiling (max_capital "
+                         f"{_amount(position.stake)}) holds the stake at work to {_amount(position.stake)}")
+        lines.append(f"clean sessions: {position.clean} of {position.needed}"
+                     + (" (the slowest of the positions the record allows)" if many else ""))
         left = position.needed - position.clean
         sessions = f"{left} more clean session{'s' if left != 1 else ''}"
+        soonest = (f"at the earliest, for the slowest of the positions the record allows, after {sessions}" if many else
+                   f"after {sessions} (at the earliest {left} session{'s' if left != 1 else ''} from now)")
         if position.paused:
             since = next((d for d, words in reversed(position.changes) if words == _PAUSE_WORDS), None)
-            lines.insert(1, f"paused: the 25% drawdown pause, paused since "
-                         f"{'a day the record does not show' if since is None else since.isoformat()}; only the "
-                         f"owner's reset clears it ({RESET_COMMAND}); no clean session counts until then, and a fault still "
-                         "halves the stake")
-            lines.append(f"next: paused by the 25% drawdown pause: no clean session counts until the owner resets it "
-                         f"({RESET_COMMAND}); the reset steps one step down")
+            if untold is not None or many:
+                since = None                         # the dated lines stop at a day whose order was not told
+            lines.insert(1, f"paused: the 25% drawdown pause{' (in at least one of the positions the record allows)' if many else ''}, "
+                         f"paused since {'a day the record does not show' if since is None else since.isoformat()}; "
+                         f"only the owner's reset clears it ({RESET_COMMAND}); no clean session counts until then, and "
+                         "a fault still halves the stake")
+            lines.append(f"next: paused by the 25% drawdown pause{' (in at least one of the positions)' if many else ''}: "
+                         f"no clean session counts until the owner resets it ({RESET_COMMAND}); the reset steps one "
+                         "step down")
         elif position.mode == "ticket":
-            lines.append(f"next: after {sessions} (at the earliest {left} session{'s' if left != 1 else ''} from now), "
-                         "unattended at the same stake; a fault session halves the stake and restarts the count")
+            lines.append(f"next: {soonest}, " + ("its ticket mode ends and it is unattended at its own stake" if many
+                                                  else "unattended at the same stake")
+                         + "; a fault session halves the stake and restarts the count")
         elif position.stake < position.earned:
             lines.append(f"next: no rise is possible under today's ceiling (the owner's max_capital "
-                         f"{_amount(position.stake)}); the record has earned {_amount(position.earned)}, and after "
-                         f"{sessions} the earned stake doubles; a fault session halves it and restarts the count")
+                         f"{_amount(position.stake)}); "
+                         + (f"{soonest}, its earned stake doubles" if many else
+                            f"the record has earned {_amount(position.earned)}, and after {sessions} the earned stake "
+                            "doubles")
+                         + "; a fault session halves it and restarts the count")
         elif position.stake >= position.ceiling:                     # T34b-1 R5: the ceiling is already reached
             lines.append(f"next: no rise is possible at today's ceiling (the owner's max_capital "
                          f"{_amount(position.ceiling)}), which the stake has reached; a fault session halves it and "
                          "restarts the count")
+        elif many:
+            lines.append(f"next: {soonest}, its stake doubles, up to the ceiling; a fault session halves it and restarts "
+                         "the count")
         else:
-            lines.append(f"next: after {sessions} (at the earliest {left} session{'s' if left != 1 else ''} from now), "
-                         f"the stake doubles from {_amount(position.stake)}, up to the ceiling; a fault session halves "
-                         "it and restarts the count")
-        if position.changes:
+            lines.append(f"next: {soonest}, the stake doubles from {_amount(position.stake)}, up to the ceiling; a fault "
+                         "session halves it and restarts the count")
+        if untold is not None:
+            lines.append(f"order not told: {untold}")
+            dated = [(d, w) for d, w in position.changes if d is not None]
+            if dated:
+                lines.append(f"last change the record tells: {dated[-1][0].isoformat()}: {dated[-1][1]}")
+        elif position.changes:
             day, words = position.changes[-1]
             lines.append(f"last change: {'at the read' if day is None else day.isoformat()}: {words}")
     if working_stop is not None:

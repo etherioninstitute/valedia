@@ -5,6 +5,7 @@ edges, and the properties over hundreds of generated journals with a fixed seed.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -23,6 +25,7 @@ from valedia_trader.execution_and_risk import go_live as gl
 from valedia_trader.execution_and_risk import stake_ladder as sl
 from valedia_trader.venues import webull as wb
 
+NY = ZoneInfo("America/New_York")
 TODAY = date(2026, 11, 16)                       # a Monday, a session
 LIVE, PAPER = gl.LIVE_VENUE, gl.PAPER_VENUE
 EM_DASH = "—"
@@ -666,12 +669,18 @@ def test_a_reset_with_no_pause_changes_nothing():                        # the r
     assert shape(pos(facts)) == ("unattended", 1000.0, 0, 60, False)
 
 
-def test_a_pause_and_a_reset_on_one_day_step_down_once_in_the_order_given():
+def test_a_pause_and_a_reset_on_one_day_step_down_once_in_the_order_their_times_tell():
     days = Days()
     facts = run(days, ["clean"] * 60)
     d = days()
-    assert shape(pos(facts + [F("pause", d), F("reset", d)])) == ("unattended", 500.0, 0, 40, False)
-    assert shape(pos(facts + [F("reset", d), F("pause", d)])) == ("unattended", 1000.0, 0, 60, True)
+    t1, t2 = datetime.fromisoformat(_utc(d, 15)), datetime.fromisoformat(_utc(d, 16))
+    p = pos(facts + [replace(F("pause", d), at=t1), replace(F("reset", d), at=t2)])
+    assert (shape(p), p.possible) == (("unattended", 500.0, 0, 40, False), 1)
+    p = pos(facts + [replace(F("reset", d), at=t1), replace(F("pause", d), at=t2)])
+    assert (shape(p), p.possible) == (("unattended", 1000.0, 0, 60, True), 1)
+    # addendum 2: with no times both orders are possible; the lowest stake, the pause where any has it, the slowest
+    p = pos(facts + [F("pause", d), F("reset", d)])
+    assert (shape(p), p.possible, p.earned) == (("unattended", 500.0, 0, 60, True), 2, 500.0)
 
 
 def test_twenty_halvings_and_doublings_return_exactly_the_start():
@@ -813,7 +822,9 @@ FAULTS = sorted(sl.FAULT_STAGES)
 
 
 def _ts(rng, d):
-    return f"{d.isoformat()}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}+00:00"
+    """A time on `d`'s own New York date (addendum 2, D-F: a time on another New York date is unknown)."""
+    return datetime(d.year, d.month, d.day, rng.randint(0, 22), rng.randint(0, 59), rng.randint(0, 59),
+                    tzinfo=NY).isoformat(timespec="seconds")
 
 
 UNUSABLE_CEILINGS = [True, False, math.nan, math.inf, 0, -100.0, "500", None, OMIT]
@@ -870,9 +881,9 @@ def generate(rng, n_days, fault_rate=None, pause_rate=None, drift_rate=0.05, ski
         if rng.random() < 0.15:
             block.append(summ(d, venue=PAPER))                           # another venue: ignored
         if rng.random() < pause_rate and not (apart and m["fault"]):
-            block.append(pause(d, ts=_ts(rng, d)[11:19]))
+            block.append({**pause(d), "timestamp": _ts(rng, d)})
         if rng.random() < pause_rate * 1.5 and not (apart and m["fault"]):
-            block.append(reset(d, ts=_ts(rng, d)[11:19]))
+            block.append({**reset(d), "timestamp": _ts(rng, d)})
         if rng.random() < 0.02:
             block.append(rng.choice([None, 7, "torn line", summ("2025-02-30")]))
         rng.shuffle(block)
@@ -930,7 +941,7 @@ def test_property_session_kinds_match_what_was_written():
 
 def test_property_a_and_c_stake_capped_rises_only_on_the_needed_clean_session_and_a_fault_halves():
     checked_rises = checked_faults = 0
-    for _, first, cap, blocks, _ in histories(300):
+    for _, first, cap, blocks, _ in histories(400):
         facts = sl.session_facts(flat(blocks), LIVE, CAL)
         by_day = {}
         for f in facts:
@@ -941,12 +952,14 @@ def test_property_a_and_c_stake_capped_rises_only_on_the_needed_clean_session_an
             events = [f for f in today if f.kind in sl.EVENT_KINDS]
             session = [f for f in today if f.kind in sl.SESSION_KINDS]
             assert p.stake <= cap
+            one = prev.possible == 1 and p.possible == 1                                   # addendum 2: one position
             if p.stake > prev.stake:                                                       # (a)
+                assert session and session[0].kind == "clean" and not any(f.kind == "pause" for f in events)
+            if p.stake > prev.stake and one:
                 checked_rises += 1
-                assert session and session[0].kind == "clean" and not prev.paused
-                assert not any(f.kind == "pause" for f in events)
+                assert not prev.paused
                 assert prev.mode == "unattended" and prev.clean == prev.needed - 1 and p.clean == 0
-            if session and session[0].kind == "fault" and not events and not prev.paused:  # (c)
+            if session and session[0].kind == "fault" and not events and not prev.paused and one:  # (c)
                 checked_faults += 1
                 assert p.stake == prev.stake / 2 and p.clean == 0
                 assert (p.mode, p.needed) == (prev.mode, prev.needed)
@@ -1257,6 +1270,7 @@ def test_property_e4_one_constant_ceiling_gives_what_addendum_1_gave():
             differing += 1
         mine, theirs = sl._walk(facts, first, cap), base_walk_all(facts, first, cap)[1]
         assert [(d, as_base(q)) for d, q in mine] == [(d, as_base(q)) for d, q in theirs]
+        assert all(q.possible == 1 for _, q in mine)                    # addendum 2: one position throughout
         days += len(mine)
     assert differing == 0 and days > 50_000
 
@@ -1270,6 +1284,7 @@ def test_property_e4_the_literal_earlier_walk_equals_the_new_one_where_no_day_ho
                        for f in facts)
         mine, theirs = sl._walk(facts, first, cap), base_walk_all(facts, first, cap)[1]
         assert [(d, as_base(q)) for d, q in mine] == [(d, as_base(q)) for d, q in theirs]
+        assert all(q.possible == 1 for _, q in mine)                    # addendum 2: one position throughout
         days += len(mine)
     assert days > 50_000
 
@@ -1565,12 +1580,13 @@ def test_f1_a_fault_wholly_inside_a_pause_and_two_fault_days_inside_one_pause():
 
 
 # ------------------------------------------------------------------ T34b-1 R1 and R6 (a): the fault in real time
-# The reference below was written from the ticket (T34b-1 R1, R6) and the design note (D4) BEFORE `_walk_all` was read
-# again, and does not use the module; extended from addendum 1 (A1, A2) BEFORE `_walk_all` was changed for it. A day
-# is (ceilings, session, fault_times, events): `ceilings` the usable ceilings of the day's summaries, `session` None,
-# "clean", "skipped" or "fault", `fault_times` one entry per faulty run (seconds into the day, UTC; None when unknown),
-# `events` [(instant or None, "pause" or "reset")]. Within a day: the ceiling clamp; a clean or skipped session before
-# the events; a fault halving once, at every place any of its runs' times allows, the day's end built part by part.
+# The single-order reference below was written from the ticket (T34b-1 R1, R6) and the design note (D4) BEFORE
+# `_walk_all` was read again, and does not use the module. A day is (ceilings, session, fault_times, events):
+# `ceilings` the usable ceilings of the day's summaries, `session` None, "clean", "skipped" or "fault", `fault_times`
+# one entry per faulty run (seconds after New York midnight; None when unknown), `events` [(instant or None, "pause"
+# or "reset")]. Within a day, for one given order: the ceiling clamp; a clean or skipped session before the events; a
+# fault halving once, after the first `place` events. (Addendum 1's part-by-part kept end, `ref_compose`, and the
+# helpers built on it were removed with addendum 2.)
 def ref_day(state, first, ceilings, session, kinds_, place):
     """One day from `state` = (mode, earned, clean, needed, paused); `kinds_` the day's events in the order applied,
     and for a fault day `place` how many of them come before the fault."""
@@ -1616,48 +1632,6 @@ def ref_day(state, first, ceilings, session, kinds_, place):
     return mode, earned, clean, needed, paused
 
 
-def ref_compose(outs):
-    """A1: the kept end of a day from the ends of its possible places, part by part: the smallest earned stake; ticket
-    when any place ends in ticket (then 20 needed), else the largest needed; the smallest count; paused (equal in
-    every place, since the events keep their order)."""
-    ticket = any(o[0] == "ticket" for o in outs)
-    paused = {o[4] for o in outs}
-    assert len(paused) == 1, outs
-    return ("ticket" if ticket else "unattended", min(o[1] for o in outs), min(o[2] for o in outs),
-            20 if ticket else max(o[3] for o in outs), paused.pop())
-
-
-def ref_full_day(state, first, day):
-    """(kept end, the possible places, their ends) of one day from `state`."""
-    ceilings, session, fault_times, events = day
-    ordered = ticket_order(events)
-    kinds_ = [k for _, k in ordered]
-    places = possible_places(fault_times, ordered) if session == "fault" and events else [0]
-    outs = [ref_day(state, first, ceilings, session, kinds_, q) for q in places]
-    return ref_compose(outs), places, outs
-
-
-def ref_walk(days, first):
-    """End-of-day states, day after day (for days whose times are known and distinct, the events strictly in instant
-    order; a fault with runs on both sides of an event has several possible places, A2)."""
-    state, out = ("ticket", first, 0, 20, False), []
-    for day in days:
-        state = ref_full_day(state, first, day)[0]
-        out.append(state)
-    return out
-
-
-def ticket_order(events):
-    """The ticket's order of one day's events: known instants in order, a reset before a pause at the same instant; a
-    reset of unknown time first, a pause of unknown time last."""
-    def key(ev):
-        t, kind = ev
-        if t is None:
-            return (0,) if kind == "reset" else (2,)
-        return (1, t, 0 if kind == "reset" else 1)
-    return sorted(events, key=key)
-
-
 def possible_places(fault_times, ordered):
     """The places of the fault among `ordered` that the times allow: for one instant (R1 (4)) no event before it known
     later, none after it known earlier, an equal or unknown time on either side; A2: the union over the day's faulty
@@ -1671,13 +1645,84 @@ def possible_places(fault_times, ordered):
     return sorted(set().union(*(one(t) for t in fault_times)))
 
 
+# ------------------------------------------------------------------ T34b-1 addendum 2: the oracle
+# Written from addendum 2 (D-A to D-D) BEFORE `_walk_all` was changed for it, and independent of the module. The
+# single-order walk is `ref_day` (today's rules for one given order of a day); the brute force below lists every
+# possible order of every day and walks every combination of them, giving the set of states at the end of each day.
+def oracle_day_orders(session, fault_times, events):
+    """D-A: the distinct possible orders of one day, as (kinds of the events in order, place of the fault): every
+    arrangement of `events` [(instant or None, kind)] in which each pair with known DIFFERENT instants keeps its real
+    order, on a fault day combined with every place A2 allows in that arrangement (the union over the faulty runs)."""
+    out = set()
+    for perm in itertools.permutations(range(len(events))):
+        seq = [events[i] for i in perm]
+        if any(a[0] is not None and b[0] is not None and a[0] > b[0] for i, a in enumerate(seq) for b in seq[i + 1:]):
+            continue
+        kinds_ = tuple(k for _, k in seq)
+        if session == "fault" and seq:
+            out.update((kinds_, p) for p in possible_places(fault_times, seq))
+        else:
+            out.add((kinds_, 0))
+    return sorted(out)
+
+
+def oracle_combinations(truth):
+    days = sorted(truth)
+    n = 1
+    for d in days:
+        n *= len(oracle_day_orders(truth[d][1], truth[d][2], truth[d][3]))
+    return n
+
+
+def oracle_sets(truth, first):
+    """Brute force: every combination of every day's possible orders, each walked from the start with `ref_day`; the
+    set of states at the end of each day over all combinations. Days in day order; [(day, set of states)]."""
+    days = sorted(truth)
+    orders = [oracle_day_orders(truth[d][1], truth[d][2], truth[d][3]) for d in days]
+    sets = [set() for _ in days]
+
+    def go(i, state):                                    # one combination per path; a prefix is shared, not merged
+        if i == len(days):
+            return
+        ceilings, session, _, _ = truth[days[i]]
+        for kinds_, place in orders[i]:
+            end = ref_day(state, first, ceilings, session, list(kinds_), place)
+            sets[i].add(end)
+            go(i + 1, end)
+    go(0, ("ticket", first, 0, 20, False))
+    return list(zip(days, sets))
+
+
+def oracle_report(states):
+    """D-C, part by part over a set of states: (mode, smallest earned, clean, needed, paused, how many)."""
+    mode = "ticket" if any(s[0] == "ticket" for s in states) else "unattended"
+    slow = max((s for s in states if s[0] == mode), key=lambda s: (s[3] - s[2], s[3], -s[2]))
+    return mode, min(s[1] for s in states), slow[2], slow[3], any(s[4] for s in states), len(states)
+
+
+def oracle_set_walk(truth, first):
+    """The same sets by propagation: each day, every state of the set walked through every possible order of the day
+    with `ref_day`, the distinct ends kept (sound because a day's end depends only on its start and its order; checked
+    against the brute force `oracle_sets` in the oracle property). For histories too long to brute-force."""
+    states, out = {("ticket", first, 0, 20, False)}, []
+    for d in sorted(truth):
+        ceilings, session, fault_times, events = truth[d]
+        orders = oracle_day_orders(session, fault_times, events)
+        states = {ref_day(s, first, ceilings, session, list(k), q) for s in states for k, q in orders}
+        out.append((d, states))
+    return out
+
+
 T_FIRSTS = [100.0, 500.0, 0.1, 333.33, 77.7]
 OFFSETS = [0, 0, -300, -240, 60, 330]                # minutes: one instant written in other offsets
-UNKNOWN_STAMPS = [OMIT, None, 12345, "", "2025-01-06T09:00:00", "09:00:00", "not a time", "2025-01-06"]
+OTHER_DATE = object()                               # a usable instant, but on the New York date before the entry's day
+UNKNOWN_STAMPS = [OMIT, None, 12345, "", "2025-01-06T09:00:00", "09:00:00", "not a time", "2025-01-06", OTHER_DATE]
 
 
 def _stamp(d, sec, offset):
-    t = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(seconds=sec)
+    """`sec` seconds after New York midnight of `d` (kept under 23 hours, so on `d` in New York), written in UTC
+    offset `offset` (minutes)."""
+    t = datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(seconds=sec)
     return t.astimezone(timezone(timedelta(minutes=offset))).isoformat(timespec="seconds")
 
 
@@ -1685,7 +1730,9 @@ def _with_time(rng, e, d, sec, mode):
     e.pop("timestamp", None)
     if sec is None:
         bad = rng.choice(UNKNOWN_STAMPS)
-        if bad is not OMIT:
+        if bad is OTHER_DATE:
+            e["timestamp"] = _stamp(d - timedelta(days=1), rng.randrange(60, 82800), 0)
+        elif bad is not OMIT:
             e["timestamp"] = bad
     else:
         e["timestamp"] = _stamp(d, sec, rng.choice(OFFSETS) if mode == "distinct" else 0)
@@ -1700,41 +1747,49 @@ def timed_journal(rng, n_days, mode):
     time UTC and well formed (the earlier walk's domain). truth[day] = (ceilings, session, fault_times, events). A
     history may open with a run of clean sessions (none, 25, 65 or 130; "ties": 65, 130 or 250, with fewer faults between
     the event days), so that many of its fault days fall while unattended above the first stake, where the order of a
-    fault and a reset matters."""
+    fault and a reset matters. Every usable time falls on its entry's own New York date (addendum 2, D-F); an unknown
+    time may also be a usable instant on another New York date. mode "mixed" (addendum 2): "distinct", but for one to
+    four days after the opening run, which hold one to three events and often a fault of one to three runs, with times
+    as in "ties" (the days whose order the times cannot tell, few enough to walk every combination)."""
     first = rng.choice(T_FIRSTS)
     ties = mode == "ties"
-    warm = rng.choice([65, 130, 250] if ties else [0, 25, 65, 130])
+    mixed = mode == "mixed"
+    warm = rng.choice([65, 130, 250] if ties else [0, 25, 65] if mixed else [0, 25, 65, 130])
     cap = first * rng.choice([1, 2, 8, 1000])
     fault_rate = rng.choice([0.0, 0.005, 0.04] if ties else [0.0, 0.005, 0.04, 0.1, 0.2])
     ev_rate = rng.choice([0.04, 0.1, 0.25, 0.4])
-    if ties:
+    if ties or mixed:
         n_days += warm * 7 // 5                          # the opening run comes on top of the `n_days` asked for
+    lo = warm * 7 // 5 + 2
+    undecided = set(rng.sample(range(lo, n_days), rng.randint(1, 4))) if mixed else set()
     moving = rng.random() < 0.5
     c = first * rng.choice([1, 2, 4, 64])
     blocks, truth, batch, open_ = [], {}, 0, False
     d = FIRST
-    for _ in range(n_days):
+    for index in range(n_days):
+        day_mode = "ties" if index in undecided else "distinct" if mixed else mode
         if moving and rng.random() < 0.04:
             c = max(first / 8, min(first * 256, c * rng.choice([0.5, 0.9, 2, 4])))
         day_cap = c if moving else BIG
-        secs = rng.sample(range(86400), 12)
+        secs = rng.sample(range(60, 82800), 12)
 
         def when():
-            if mode == "distinct":
+            if day_mode == "distinct":
                 return secs.pop()
-            if mode == "ties":
+            if day_mode == "ties":
                 return None if rng.random() < 0.25 else rng.choice([9, 15]) * 3600
-            return rng.randrange(86400)
+            return rng.randrange(60, 82800)
 
         block, runs, events, warming = [], [], [], bool(warm)
-        with_events = not warming and rng.random() < ev_rate
-        rate = 0.35 if with_events and mode != "apart" else fault_rate      # many days hold a fault and an event
+        with_events = not warming and (index in undecided or (not mixed and rng.random() < ev_rate)
+                                       or (mixed and rng.random() < ev_rate / 4))
+        rate = 0.5 if index in undecided else 0.35 if with_events and mode != "apart" else fault_rate
         if warming and d.weekday() < 5:
             warm -= 1
             batch += 1
             sec = when()
             runs.append(("clean", sec))
-            block.append(_with_time(rng, summ(d, batch=f"b{batch}", ceiling=day_cap), d, sec, mode))
+            block.append(_with_time(rng, summ(d, batch=f"b{batch}", ceiling=day_cap), d, sec, day_mode))
         elif d.weekday() < 5 and rng.random() < 0.88:
             for _ in range(rng.randint(1, 3)):
                 batch += 1
@@ -1749,10 +1804,10 @@ def timed_journal(rng, n_days, mode):
                     e = summ(d, batch=f"b{batch}", ceiling=day_cap)
                 sec = when()
                 runs.append((kind, sec))
-                block.append(_with_time(rng, e, d, sec, mode))
+                block.append(_with_time(rng, e, d, sec, day_mode))
         has_fault = any(k == "fault" for k, _ in runs)
         if with_events and not (mode == "apart" and has_fault):
-            for _ in range(rng.choice([1, 1, 2, 3])):
+            for _ in range(rng.choice([1, 2, 2, 3] if index in undecided else [1, 1, 2, 3])):
                 if open_:
                     kind = "reset" if rng.random() < 0.7 else "pause"
                 else:
@@ -1762,7 +1817,7 @@ def timed_journal(rng, n_days, mode):
                      {"type": "latch_reset", "venue": LIVE, "day": d.isoformat(), "who": "Owner Name"})
                 sec = when()
                 events.append((sec, kind))
-                block.append(_with_time(rng, e, d, sec, mode))
+                block.append(_with_time(rng, e, d, sec, day_mode))
         if runs or events:
             session = None if not runs else "fault" if has_fault else \
                 "clean" if any(k == "clean" for k, _ in runs) else "skipped"
@@ -1780,8 +1835,9 @@ F1_HISTORIES = 2000
 
 def test_property_f1_every_fault_halves_and_a_fault_inside_a_pause_never_gives_more_than_one_moved_before_it():
     """R6 (a): histories with several faults placed before, on and inside pauses and on reset days on both sides of
-    the reset by time; every time known and distinct: the walk equals the independent reference at every day (one
-    faulty run: the real order; runs on both sides of an event: A2's union of places, then A1)."""
+    the reset by time; every time known and distinct: the walk's set equals the independent reference's at every day
+    (one faulty run: the real order; runs on both sides of an event: A2's union of places, so several positions), and
+    the report is its part-by-part reading (addendum 2)."""
     rng = random.Random(SEED + 7)
     days_checked = moved = several = single = spread = 0
     seen = dict.fromkeys(("day before a pause", "pause's day", "inside a pause", "reset's day, before it",
@@ -1791,33 +1847,34 @@ def test_property_f1_every_fault_halves_and_a_fault_inside_a_pause_never_gives_m
         facts = sl.session_facts(flat(blocks), LIVE, CAL)
         assert facts.unreadable == 0
         facts = list(facts)
-        walk = sl._walk(facts, first, cap)
+        _, walk, sets = sl._walk_sets(facts, first, cap)
         days = sorted(truth)
-        want = ref_walk([truth[d] for d in days], first)
-        assert [(d, (p.mode, p.earned, p.clean, p.needed, p.paused)) for d, p in walk] == list(zip(days, want))
+        want = oracle_set_walk(truth, first)
+        assert [(d, set(x)) for d, x in sets] == want
+        assert [(d, report(p)) for d, p in walk] == [(d, oracle_report(x)) for d, x in want]
         assert all(p.stake == min(p.earned, cap) for _, p in walk)
         days_checked += len(walk)
         several += sum(1 for d in days if truth[d][1] == "fault") >= 2
-        prev = ("ticket", first, 0, 20, False)
+        prev = {("ticket", first, 0, 20, False)}
         for i, (d, p) in enumerate(walk):
             ceilings, session, fault_times, events = truth[d]
-            _, places, outs = ref_full_day(prev, first, truth[d])
-            assert told(p, d) == (1 if len(set(outs)) > 1 else 0)
+            ordered = sorted(events, key=lambda ev: ev[0])
+            places = possible_places(fault_times, ordered) if session == "fault" and events else [0]
             if session == "fault" and events:
                 single += len(fault_times) == 1
                 spread += len(places) > 1
                 if len(fault_times) == 1:
-                    assert len(places) == 1 and told(p, d) == 0                 # one known instant: the real order
+                    assert len(places) == 1                                    # one known instant: the real order
+                    assert p.possible == len(prev)
             if session == "fault":                       # every fault halves and zeroes the count, on any day
                 assert p.clean == 0
-                without = ref_day(prev, first, ceilings, "skipped",
-                                  [k for _, k in sorted(events)], 0)
                 if not events:
-                    assert p.earned == without[1] / 2
+                    without = [ref_day(x, first, ceilings, "skipped", [], 0) for x in prev]
+                    assert p.earned == min(w[1] for w in without) / 2
                 kinds_here = {k for _, k in events}
                 if "pause" in kinds_here:
                     seen["pause's day"] += 1
-                if prev[4] and not events:
+                if any(x[4] for x in prev) and not events:
                     seen["inside a pause"] += 1
                 for t, k in events:
                     if k == "reset":
@@ -1828,9 +1885,12 @@ def test_property_f1_every_fault_halves_and_a_fault_inside_a_pause_never_gives_m
                     seen["day before a pause"] += 1
                 if i and any(k == "reset" for _, k in truth[walk[i - 1][0]][3]) and not events:
                     seen["day after a reset"] += 1
-            if prev[4] or any(k == "pause" for _, k in events):  # paused: no clean session counts
-                assert p.clean <= prev[2] and p.earned <= prev[1]
-            prev = (p.mode, p.earned, p.clean, p.needed, p.paused)
+            if all(x[4] for x in prev) or any(k == "pause" for _, k in events):  # paused: no clean session counts
+                before = oracle_report(prev)
+                assert p.earned <= before[1]
+                if len(prev) == 1 and p.possible == 1:
+                    assert p.clean <= before[2]
+            prev = set(sets[i][1])
         # a fault on a day inside a pause (or holding one), moved to a free day just before that pause began
         paused, start = False, None
         for i, f in enumerate(facts):
@@ -1954,80 +2014,205 @@ def the_case(reset_ts=OMIT, fault_ts=OMIT, more=()):
     return facts, sl.position(facts, 100, 1e6)
 
 
-def told(p, day):
-    return sum(1 for d, words in p.changes if d == day and words.startswith(sl._ORDER_UNKNOWN_WORDS))
-
-
-def tie_line(p, day):
-    lines = [words for d, words in p.changes if d == day and words.startswith(sl._ORDER_UNKNOWN_WORDS)]
+def untold(p):
+    """Addendum 2, D-D: the one undated line naming the days whose order the times do not tell, or None."""
+    lines = [words for d, words in p.changes if d is None and words.startswith(sl._UNTOLD_START)]
+    assert len(lines) <= 1
     return lines[0] if lines else None
 
 
-def tie_words(kept, outs):
-    """A1's fixed words for a day whose possible places ended differently."""
-    words = f"{sl._ORDER_UNKNOWN_WORDS}: {sl._LOWER_KEPT_WORDS}"
-    if kept[0] == "ticket" and any(o[0] != "ticket" for o in outs):
-        words += f"; {sl._TICKET_KEPT_WORDS}"
-    if kept not in outs:
-        words += f"; {sl._MORE_CAREFUL_WORDS}"
-    return words
+def untold_words(days, n):
+    """D-D's fixed words, written here from the addendum (not from the module's template)."""
+    named = ", ".join(d.isoformat() for d in days[:5]) + (f" and {len(days) - 5} more" if len(days) > 5 else "")
+    return (f"the times do not tell the order of the events on {named}: {n} position{' is' if n == 1 else 's are'} "
+            "possible; what is shown is the lowest stake, ticket mode where any of them has it and the pause where any "
+            "of them has it")
 
 
-def test_r1_the_case_that_must_hold():
+def report(p):
+    return (p.mode, p.earned, p.clean, p.needed, p.paused, p.possible)
+
+
+CASE_TWO = {("unattended", 50.0, 0, 40, False), ("ticket", 100.0, 0, 20, False)}
+
+
+def test_d_the_case_that_must_hold():
+    """Addendum 2, THE CASE, lines 1 to 3: first stake 100, unattended at an earned 200, paused; one day with the
+    owner's reset and a faulty run."""
     d = CASE_DAYS[61]
-    _, before = the_case()
     head = sl.position(sl.session_facts([summ(x, ceiling=BIG) for x in CASE_DAYS[:60]] + [pause(CASE_DAYS[60])],
                                         LIVE, CAL), 100, 1e6)
     assert shape(head) == ("unattended", 200.0, 0, 60, True) and head.earned == 200.0
-    _, p = the_case(_utc(d, 9), _utc(d, 15))                         # the reset at 09:00, the fault at 15:00
-    assert shape(p) == ("unattended", 50.0, 0, 40, False) and told(p, d) == 0
-    _, p = the_case(_utc(d, 15), _utc(d, 9))                         # the fault at 09:00, the reset at 15:00
-    assert shape(p) == ("ticket", 100.0, 0, 20, False) and told(p, d) == 0
-    # addendum 1, A1: ticket at 100 and unattended at 50 are both possible: ticket mode at the lower 50, needs 20
-    ends = [("ticket", 100.0, 0, 20, False), ("unattended", 50.0, 0, 40, False)]
-    for reset_ts, fault_ts in ((_utc(d, 12), _utc(d, 12)),           # equal instants
+    facts, p = the_case(_utc(d, 9), _utc(d, 15))                     # 1. the reset at 09:00, the fault at 15:00
+    assert report(p) == ("unattended", 50.0, 0, 40, False, 1) and untold(p) is None
+    assert sl._walk_sets(facts, 100, 1e6)[2][-1] == (d, (("unattended", 50.0, 0, 40, False),))
+    _, p = the_case(_utc(d, 15), _utc(d, 9))                         # 2. the fault at 09:00, the reset at 15:00
+    assert report(p) == ("ticket", 100.0, 0, 20, False, 1) and untold(p) is None
+    later = [summ(x, ceiling=BIG) for x in sessions_from(d + timedelta(days=1), 40)]
+    for reset_ts, fault_ts in ((_utc(d, 12), _utc(d, 12)),           # 3. equal instants
                                (_utc(d, 9), OMIT), (_utc(d, 15), OMIT),       # the fault's time unknown
-                               (OMIT, _utc(d, 9)), (OMIT, _utc(d, 15))):      # the reset's time unknown
-        _, p = the_case(reset_ts, fault_ts)
-        assert shape(p) == ("ticket", 50.0, 0, 20, False) and p.earned == 50.0, (reset_ts, fault_ts)
-        assert told(p, d) == 1 and p.changes[-1] == (d, tie_words(shape(p), ends))
-        assert sl._TICKET_KEPT_WORDS in p.changes[-1][1] and sl._MORE_CAREFUL_WORDS in p.changes[-1][1]
-    assert shape(before) == ("ticket", 50.0, 0, 20, False)           # no times at all
-    # A2: faulty runs at 09:00 and 15:00 around a reset at 12:00: both places possible, ticket at 50 with 20 needed
+                               (OMIT, _utc(d, 9)), (OMIT, _utc(d, 15)),       # the reset's time unknown
+                               (OMIT, OMIT)):
+        facts, p = the_case(reset_ts, fault_ts)
+        assert report(p) == ("ticket", 50.0, 0, 20, False, 2) and p.stake == 50.0, (reset_ts, fault_ts)
+        assert set(sl._walk_sets(facts, 100, 1e6)[2][-1][1]) == CASE_TWO
+        assert untold(p) == untold_words([d], 2) and not any(x == d for x, _ in p.changes)    # no dated line on d
+        facts, _ = the_case(reset_ts, fault_ts, more=later)
+        walk = dict(sl._walk(facts, 100, 1e6))
+        xs = sessions_from(d + timedelta(days=1), 40)
+        assert report(walk[xs[19]]) == ("unattended", 50.0, 0, 40, False, 2)     # twenty later: no member in ticket
+        assert report(walk[xs[39]]) == ("unattended", 100.0, 0, 60, False, 2)    # twenty more
+        assert set(sl._walk_sets(facts, 100, 1e6)[2][-1][1]) == {("unattended", 100.0, 20, 40, False),
+                                                                 ("unattended", 100.0, 0, 60, False)}
+    # A2: faulty runs at 09:00 and 15:00 around a reset at 12:00: both places possible
     _, p = the_case(_utc(d, 12), _utc(d, 9), more=[stop(d, "send", ceiling=BIG, batch="b9", timestamp=_utc(d, 15))])
-    assert shape(p) == ("ticket", 50.0, 0, 20, False) and told(p, d) == 1
+    assert report(p) == ("ticket", 50.0, 0, 20, False, 2) and untold(p) is not None
     _, p = the_case(_utc(d, 12), _utc(d, 13), more=[stop(d, "send", ceiling=BIG, batch="b9", timestamp=_utc(d, 15))])
-    assert shape(p) == ("unattended", 50.0, 0, 40, False) and told(p, d) == 0     # both after the reset: one place
+    assert report(p) == ("unattended", 50.0, 0, 40, False, 1) and untold(p) is None  # both after the reset: one place
+
+
+def test_d_v1_a_pause_and_a_reset_at_the_same_second_report_the_stepped_down_stake_and_the_pause():
+    """Addendum 2, THE CASE, line 4 (the check's V1): 120 clean sessions from 100 (unattended at 400), then a pause
+    and a reset at the same second. Pause then reset: 200, not paused; reset then pause: 400, paused. The report: the
+    stepped-down 200, paused."""
+    xs = sessions_from(FIRST, 121)
+    journal = [summ(x, ceiling=BIG) for x in xs[:120]]
+    same = [pause(xs[120], ts="16:00:00"), reset(xs[120], ts="16:00:00")]
+    facts = sl.session_facts(journal + same, LIVE, CAL)
+    p = sl.position(facts, 100, 1e6)
+    assert report(p) == ("unattended", 200.0, 0, 60, True, 2) and p.stake == 200.0
+    assert set(sl._walk_sets(facts, 100, 1e6)[2][-1][1]) == {("unattended", 200.0, 0, 60, False),
+                                                             ("unattended", 400.0, 0, 60, True)}
+    for ts_p, ts_r, want in (("15:59:59", "16:00:00", ("unattended", 200.0, 0, 60, False, 1)),
+                             ("16:00:00", "15:59:59", ("unattended", 400.0, 0, 60, True, 1))):
+        q = sl.position(sl.session_facts(journal + [pause(xs[120], ts=ts_p), reset(xs[120], ts=ts_r)], LIVE, CAL),
+                        100, 1e6)
+        assert report(q) == want
+        assert q.earned >= p.earned and (not q.paused or p.paused) and (q.mode != "ticket" or p.mode == "ticket")
+    lines = sl.describe(p, None, LADDER, 0)
+    assert "paused: the 25% drawdown pause (in at least one of the positions the record allows)" in lines_ok(lines)
+    [nxt] = [line for line in lines if line.startswith("next: ")]
+    assert "400" not in nxt and "200" not in nxt                         # no stake the reported position does not hold
+    assert "stake at work: 200.00" in lines
+
+
+def test_d_v2_the_check_p3_min2_the_report_stays_at_or_below_both_concrete_orders_on_every_later_day():
+    """Addendum 2, THE CASE, line 5: the check's `p3_min2.py`, rebuilt. 120 clean sessions from 100, a pause, then a
+    day with a faulty run and the owner's reset (equal, or one second apart either way), then 69 clean sessions, the
+    40th of them under a ceiling of 60 (or no ceiling). On every day from the fault day on, the reported earned stake
+    is at or below both concrete orders', ticket whenever one is, and paused whenever one is."""
+    def nxt(x):
+        x += timedelta(days=1)
+        while x.weekday() >= 5:
+            x += timedelta(days=1)
+        return x
+
+    def clean(x, ceiling=1e4):
+        e = {"type": "order_step", "event": "summary", "venue": LIVE, "status": "done", "day": x.isoformat(),
+             "timestamp": x.isoformat() + "T15:00:00+00:00"}
+        if ceiling is not None:
+            e["ceiling"] = ceiling
+        return e
+
+    checked = 0
+    for variant in (None, 60.0):
+        x, pre = date(2026, 1, 4), []
+        for _ in range(120):
+            x = nxt(x)
+            pre.append(clean(x))
+        x = nxt(x)
+        pre.append({"type": "drawdown_pause", "venue": LIVE, "day": x.isoformat(),
+                    "timestamp": x.isoformat() + "T16:00:00+00:00"})
+        fd = nxt(x)
+
+        def fault_day(ft, rt):
+            return [{"type": "order_step", "event": "summary", "venue": LIVE, "status": "stopped", "stage": "send",
+                     "day": fd.isoformat(), "ceiling": 1e4, "timestamp": fd.isoformat() + ft},
+                    {"type": "latch_reset", "venue": LIVE, "who": "Owner", "day": fd.isoformat(),
+                     "timestamp": fd.isoformat() + rt}]
+        post, y = [], fd
+        for k in range(1, 70):
+            y = nxt(y)
+            post.append(clean(y, variant if k == 40 else 1e4))
+        both = sl._walk(sl.session_facts(pre + fault_day("T10:00:00+00:00", "T10:00:00+00:00") + post, LIVE, CAL),
+                        100.0, 1e9)
+        a = sl._walk(sl.session_facts(pre + fault_day("T10:00:01+00:00", "T10:00:00+00:00") + post, LIVE, CAL),
+                     100.0, 1e9)
+        b = sl._walk(sl.session_facts(pre + fault_day("T09:59:59+00:00", "T10:00:00+00:00") + post, LIVE, CAL),
+                     100.0, 1e9)
+        assert [d for d, _ in both] == [d for d, _ in a] == [d for d, _ in b]
+        later = [(d, p, q, r) for (d, p), (_, q), (_, r) in zip(both, a, b) if d >= fd]
+        assert len(later) == 70
+        for d, p, q, r in later:
+            for c in (q, r):
+                assert c.possible == 1
+                assert p.earned <= c.earned and p.stake <= c.stake
+                assert (c.mode != "ticket" or p.mode == "ticket") and (not c.paused or p.paused)
+            checked += 1
+        assert any(q.earned != r.earned for _, _, q, r in later)          # the two orders do part
+    assert checked == 140
 
 
 def test_r1_times_are_instants_not_text_and_a_time_needs_its_offset():
     d = CASE_DAYS[61]
     # 10:00 at -05:00 is 15:00 UTC, after a fault at 14:00 UTC (as text it would come first)
     _, p = the_case(f"{d}T10:00:00-05:00", _utc(d, 14))
-    assert shape(p) == ("ticket", 100.0, 0, 20, False) and told(p, d) == 0
+    assert report(p) == ("ticket", 100.0, 0, 20, False, 1) and untold(p) is None
     _, p = the_case(_utc(d, 14), f"{d}T10:00:00-05:00")
-    assert shape(p) == ("unattended", 50.0, 0, 40, False) and told(p, d) == 0
-    # a fault time with no offset (or not a datetime) is unknown: both places are possible (A1: ticket at the lower 50)
+    assert report(p) == ("unattended", 50.0, 0, 40, False, 1) and untold(p) is None
+    # a fault time with no offset (or not a datetime) is unknown: both orders are possible (addendum 2: two positions)
     for bad in (f"{d}T08:00:00", f"{d}", "08:00:00", "", 20250101, None, f"{d}T08:00:00+25:00", f"{d}T08:00:00 UTC"):
         facts, p = the_case(_utc(d, 9), bad)
         assert facts[-2].kind == "fault" and facts[-2].at is None and facts[-2].fault_times == (None,)
-        assert shape(p) == ("ticket", 50.0, 0, 20, False) and told(p, d) == 1, bad
+        assert report(p) == ("ticket", 50.0, 0, 20, False, 2) and untold(p) is not None, bad
     # "Z" is an offset: read
     facts, p = the_case(f"{d}T09:00:00Z", f"{d}T08:00:00Z")
     assert facts[-1].at == datetime(d.year, d.month, d.day, 9, tzinfo=timezone.utc)
-    assert shape(p) == ("ticket", 100.0, 0, 20, False)
+    assert report(p) == ("ticket", 100.0, 0, 20, False, 1)
 
 
-def test_r1_events_go_by_their_instants_and_a_reset_comes_first_at_the_same_instant():
+def test_d_f_a_time_on_another_new_york_date_is_an_unknown_time():
+    d = CASE_DAYS[61]                                                 # in March 2025: New York is UTC-4 or UTC-5
+    prev_ny = f"{d}T03:00:00+00:00"                                   # the evening before, in New York
+    next_ny = f"{d + timedelta(days=1)}T08:00:00+00:00"               # the next New York day
+    for reset_ts, fault_ts in ((prev_ny, _utc(d, 15)), (_utc(d, 9), next_ny), (f"{d}T23:30:00-05:00", _utc(d, 15)),
+                               (_utc(d, 9), f"{d - timedelta(days=1)}T22:00:00-05:00")):
+        facts, p = the_case(reset_ts, fault_ts)
+        reset_fact = [f for f in facts if f.kind == "reset"][0]
+        fault_fact = [f for f in facts if f.kind == "fault"][0]
+        assert reset_fact.at is None or fault_fact.fault_times == (None,)
+        assert report(p) == ("ticket", 50.0, 0, 20, False, 2), (reset_ts, fault_ts)
+    # the same instants, on the right New York date, order the day
+    _, p = the_case(f"{d}T09:00:00-04:00", f"{d}T15:00:00-04:00")
+    assert report(p) == ("unattended", 50.0, 0, 40, False, 1)
+    # and the walk reads a hand-built fact the same way: an `at` on another New York date orders nothing
+    days = Days()
+    facts = run(days, ["clean"] * 120, ceiling=1e6) + [F("pause", days())]
+    e = days()
+    nine = datetime(e.year, e.month, e.day, 9, tzinfo=NY)
+    fault = sl.SessionFact(e, "fault", ("r",), False, BIG, fault_times=(nine.replace(hour=15),))
+    on_day = pos(facts + [sl.SessionFact(e, "reset", ("r",), at=nine), fault], 100, 1e6)
+    off_day = pos(facts + [sl.SessionFact(e, "reset", ("r",), at=nine - timedelta(days=1)), fault], 100, 1e6)
+    assert on_day.possible == 1 and off_day.possible == 2 and off_day.earned <= on_day.earned
+    assert sl._instant(f"{e}T09:00:00-05:00", e) is not None and sl._instant(f"{e}T09:00:00-05:00",
+                                                                                e + timedelta(days=1)) is None
+
+
+def test_r1_events_are_listed_by_their_instants_and_a_reset_first_at_the_same_instant():
     entries = [pause(TODAY, ts="14:00:00"), {**reset(TODAY), "timestamp": f"{TODAY}T10:00:00-05:00"}]
     assert [f.kind for f in sl.session_facts(entries, LIVE, CAL)] == ["pause", "reset"]      # 14:00 then 15:00 UTC
     entries = [pause(TODAY, ts="15:00:00"), {**reset(TODAY), "timestamp": f"{TODAY}T10:00:00-05:00"}]
     assert [f.kind for f in sl.session_facts(entries, LIVE, CAL)] == ["reset", "pause"]      # the same instant
     for bad in (f"{TODAY}T01:00:00", "zz", 5):                       # unknown: a reset first, a pause last
-        entries = [{**reset(TODAY), "timestamp": bad}, pause(TODAY, ts="00:00:01"), reset(TODAY, ts="00:00:02")]
+        entries = [{**reset(TODAY), "timestamp": bad}, pause(TODAY, ts="05:00:01"), reset(TODAY, ts="05:00:02")]
         assert [f.kind for f in sl.session_facts(entries, LIVE, CAL)] == ["reset", "pause", "reset"]
         entries = [{**pause(TODAY), "timestamp": bad}, reset(TODAY, ts="23:59:59")]
         assert [f.kind for f in sl.session_facts(entries, LIVE, CAL)] == ["reset", "pause"]
+    # addendum 2: the listing claims no order; the walk takes both (not "a reset first, a pause last")
+    facts = sl.session_facts([pause(TODAY, ts="15:00:00"), {**reset(TODAY), "timestamp": f"{TODAY}T10:00:00-05:00"}],
+                             LIVE, CAL)
+    p = sl.position(facts, 500, 1e6)                                  # pause-reset: not paused; reset-pause: paused
+    assert report(p) == ("ticket", 500.0, 0, 20, True, 2)
 
 
 def test_r1_the_fact_carries_its_instant():
@@ -2049,9 +2234,9 @@ def test_r1_the_fact_carries_its_instant():
     # one faulty run without a time, one at 08:00 and a reset at 09:00: the untimed run widens the places (A2)
     d = CASE_DAYS[61]
     _, p = the_case(_utc(d, 9), _utc(d, 8), more=[stop(d, "send", ceiling=BIG, batch="b9")])
-    assert shape(p) == ("ticket", 50.0, 0, 20, False) and told(p, d) == 1
+    assert report(p) == ("ticket", 50.0, 0, 20, False, 2) and untold(p) is not None
     _, p = the_case(_utc(d, 9), _utc(d, 8))                                         # 08:00 alone: the real order
-    assert shape(p) == ("ticket", 100.0, 0, 20, False) and told(p, d) == 0
+    assert report(p) == ("ticket", 100.0, 0, 20, False, 1) and untold(p) is None
 
 
 def test_r1_the_walk_refuses_a_time_it_cannot_judge_and_events_out_of_their_order():
@@ -2087,6 +2272,68 @@ def test_r1_the_walk_refuses_a_time_it_cannot_judge_and_events_out_of_their_orde
     assert sl.position([ok, late[1]], 500, 1e6).stake == 250.0
 
 
+def test_d_f_a_hand_set_time_on_a_session_fact_is_refused():
+    nine = datetime(TODAY.year, TODAY.month, TODAY.day, 9, tzinfo=NY)
+    for kind in sl.SESSION_KINDS:
+        for fn in (sl.position, sl._walk):
+            with pytest.raises(ValueError) as why:
+                fn([sl.SessionFact(TODAY, kind, ("r",), ceiling=BIG, at=nine)], 500, 1e6)
+            assert "carries no time" in str(why.value) and "\n" not in str(why.value)
+    for kind in sl.EVENT_KINDS:
+        assert sl.position([sl.SessionFact(TODAY, kind, ("r",), at=nine)], 500, 1e6).possible == 1
+
+
+def test_d_a_more_than_720_possible_orders_on_one_day_is_refused():
+    assert sl.MAX_DAY_ORDERS == 720 and sl.MAX_POSITIONS == 64
+    d = TODAY
+    six = [sl.SessionFact(d, k, ("r",)) for k in ["pause"] * 6 + ["reset"] * 6]      # 924 orders of unknown time
+    with pytest.raises(ValueError) as why:
+        sl.position(six, 500, 1e6)
+    assert "720" in str(why.value) and d.isoformat() in str(why.value) and "\n" not in str(why.value)
+    assert len(sl._orders(d, None, six[:5] + six[6:11])) == 252                     # C(10, 5): walked
+    sl.position(six[:5] + six[6:11], 500, 1e6)
+    # 6 unknown pauses and 5 unknown resets (462 arrangements) with a fault of unknown time: 462 x 12 places
+    fault = sl.SessionFact(d, "fault", ("r",), ceiling=BIG, fault_times=(None,))
+    with pytest.raises(ValueError) as why:
+        sl.position([fault] + six[:11], 500, 1e6)
+    assert "720" in str(why.value) and "\n" not in str(why.value)
+    # interchangeable events (one kind, one time) are one order, however many there are
+    many = [sl.SessionFact(d, "pause", ("r",)) for _ in range(2000)]
+    assert len(sl._orders(d, None, many)) == 1 and sl.position(many, 500, 1e6).paused is True
+    timed = [sl.SessionFact(d, k, ("r",), at=datetime(d.year, d.month, d.day, 9, 0, s, tzinfo=NY))
+             for s in range(50) for k in ("pause", "reset")]                        # 2^50 orders: refused at once
+    with pytest.raises(ValueError):
+        sl.position(timed, 500, 1e6)
+
+
+def _many_positions(rounds, seed=19):
+    """A record whose possible positions grow: from a first stake of 100, a climb, then `rounds` days drawn with a
+    fixed seed, each with a fault or a clean session or none, under ceilings that move near the first stake, and
+    pauses and resets of unknown time, then a run of clean sessions. With seed 19 the set first passes 64 on the
+    38th such day (found by search; 60 at most before it)."""
+    rng = random.Random(seed)
+    days = Days(date(2025, 1, 6))
+    facts = [sl.SessionFact(days(), "clean", ("r",), ceiling=1e6) for _ in range(rng.choice([60, 120, 180]))]
+    for _ in range(rounds):
+        x = days()
+        kinds_ = rng.choice([["pause", "reset"], ["reset", "pause", "reset"], ["pause"], ["reset"], []])
+        s = rng.choice(["fault", "fault", "clean", None])
+        if s:
+            facts.append(sl.SessionFact(x, s, ("r",), ceiling=rng.choice([1e6, 1e6, 77.0, 130.0, 260.0, 333.0])))
+        facts += [sl.SessionFact(x, k, ("r",)) for k in kinds_]
+        for _ in range(rng.choice([0, 1, 5, 19, 20, 39, 40, 59, 60])):
+            facts.append(sl.SessionFact(days(), "clean", ("r",), ceiling=rng.choice([1e6, 1e6, 1e6, 150.0, 400.0])))
+    return facts
+
+
+def test_d_b_more_than_64_positions_is_refused():
+    sizes = [len(s) for _, s in sl._walk_sets(_many_positions(37), 100, 1e6)[2]]
+    assert 32 < max(sizes) <= 64
+    with pytest.raises(ValueError) as why:
+        sl.position(_many_positions(38), 100, 1e6)
+    assert "64" in str(why.value) and "\n" not in str(why.value)
+
+
 def test_r1_a_fault_between_two_events_and_a_fault_before_a_reset_with_a_pause_of_unknown_time():
     d = CASE_DAYS[61]
     entries = [summ(x, ceiling=BIG) for x in CASE_DAYS[:60]]         # unattended at 200, not paused
@@ -2098,50 +2345,196 @@ def test_r1_a_fault_between_two_events_and_a_fault_before_a_reset_with_a_pause_o
     assert shape(p) == ("unattended", 50.0, 0, 40, False)            # pause, reset to 100, then the fault: 50
 
 
-def test_property_r1_unknown_or_equal_times_keep_the_most_careful_possible_order():
-    """R1 (4) with addendum 1, by brute force over every possible place of the fault (A2: the union over the day's
-    faulty runs), checked part by part (A1): the earned stake is the smallest any possible place gives; the mode is
-    ticket exactly when any place ends in ticket; `needed` is 20 then, else the largest; the count the smallest;
-    paused as in every place. The day's line, with its words, is written exactly when the places disagree.
-    Reordering a day's lines never changes the position, and nothing after a day changes that day's position."""
-    rng = random.Random(SEED + 21)
-    ambiguous = differing = days_checked = composite = 0
-    by_runs = {1: 0, 2: 0, 3: 0}
-    for _ in range(1500):
-        blocks, truth, first, cap = timed_journal(rng, rng.randint(40, 160), "ties")
+def test_d_d_the_lines_stop_at_the_first_day_whose_order_is_not_told():
+    """D-D: one member: its lines as today; from the first day whose order is not told: the shared dated lines up to
+    the day before, then the one undated line (days named up to five, then "and N more"), and no dated line after."""
+    d = CASE_DAYS[61]
+    facts, p = the_case(_utc(d, 12), _utc(d, 12))
+    one, _ = the_case(_utc(d, 9), _utc(d, 15))
+    q = sl.position(one, 100, 1e6)
+    shared = [c for c in q.changes if c[0] is not None and c[0] < d]
+    assert list(p.changes) == shared + [(None, untold_words([d], 2))]
+    later = sessions_from(d + timedelta(days=1), 70)
+    facts, _ = the_case(_utc(d, 12), _utc(d, 12), more=[summ(x, ceiling=BIG) for x in later])
+    p = sl.position(facts, 100, 1e6)
+    assert all(x is None or x < d for x, _ in p.changes) and untold(p) == untold_words([d], 2)
+    # seven days whose order is not told, then a ceiling at the read: five named, "and 2 more", the read line last
+    days = Days()
+    facts = run(days, ["clean"] * 600, ceiling=1e12)                         # 500 doubled nine times
+    named = []
+    for _ in range(7):
+        x = days()
+        named.append(x)
+        facts += [F("fault", x), sl.SessionFact(x, "pause", ("r",)), sl.SessionFact(x, "reset", ("r",))]
+        facts += run(days, ["clean"] * 3, ceiling=1e12)
+    p = sl.position(facts, 500, 1.0)
+    n = p.possible
+    assert n > 1 and p.changes[-2] == (None, untold_words(named, n)) and " and 2 more: " in p.changes[-2][1]
+    assert p.changes[-1][0] is None and "lowest stake of the positions the record allows" in p.changes[-1][1]
+    assert all(x is None or x < named[0] for x, _ in p.changes)
+    # the words are one line each, and the template is the addendum's
+    assert untold_words(named[:1], 1).endswith("1 position is possible; what is shown is the lowest stake, ticket "
+                                               "mode where any of them has it and the pause where any of them has it")
+    assert sl._untold_line(named, 3) == untold_words(named, 3)
+    # describe: every sentence of the reported position, no stake it does not hold
+    text = lines_ok(sl.describe(sl.position(the_case(_utc(d, 12), _utc(d, 12))[0], 100, 1e6), None, LADDER, 0))
+    assert "at the earliest, for the slowest of the positions the record allows" in text
+    assert "order not told: " + untold_words([d], 2) in text and "100.00" not in text   # 50 is held; 100 is not
+    assert "last change: at the read" not in text
+
+
+ORACLE_JOURNALS = 3000
+ORACLE_MAX_COMBINATIONS = 5000
+
+
+def test_property_d_the_set_equals_the_brute_force_on_every_day():
+    """Addendum 2, by the oracle written FIRST: journals with one to four days whose order the times do not tell
+    (faults of one to three faulty runs, pauses and resets of equal and unknown instants, moving ceilings), small
+    enough to walk every combination of every day's possible orders. The module's set equals the brute force's on
+    every day, its report is the part-by-part reading of it, and the propagated set (`oracle_set_walk`) is the brute
+    force's too. Reordering a day's entries changes nothing; nothing after a day changes that day's position."""
+    rng = random.Random(SEED + 41)
+    journals = skipped = days_checked = several = 0
+    largest, by_runs = 0, {1: 0, 2: 0, 3: 0}
+    while journals < ORACLE_JOURNALS:
+        blocks, truth, first, cap = timed_journal(rng, rng.randint(15, 60), "mixed")
+        orders = {d: oracle_day_orders(truth[d][1], truth[d][2], truth[d][3]) for d in truth}
+        undecidable = [d for d in truth if len(orders[d]) > 1]
+        if not 1 <= len(undecidable) <= 4 or oracle_combinations(truth) > ORACLE_MAX_COMBINATIONS:
+            skipped += 1
+            continue
+        journals += 1
         facts = sl.session_facts(flat(blocks), LIVE, CAL)
-        walk = sl._walk(facts, first, cap)
-        assert [d for d, _ in walk] == sorted(truth)
-        prev = ("ticket", first, 0, 20, False)
-        for d, p in walk:
-            kept, places, outs = ref_full_day(prev, first, truth[d])
-            got = (p.mode, p.earned, p.clean, p.needed, p.paused)
-            assert p.earned == min(o[1] for o in outs)
-            assert (p.mode == "ticket") == any(o[0] == "ticket" for o in outs)
-            assert p.needed == (20 if p.mode == "ticket" else max(o[3] for o in outs))
-            assert p.clean == min(o[2] for o in outs) and all(o[4] == p.paused for o in outs)
-            assert got == kept
-            if truth[d][1] == "fault":
-                assert all(o[2] == 0 for o in outs)
-            if len(set(outs)) > 1:
-                assert told(p, d) == 1 and tie_line(p, d) == tie_words(kept, outs)
-            else:
-                assert told(p, d) == 0
-            if len(places) > 1:
-                ambiguous += 1
-                by_runs[len(truth[d][2])] += 1
-            differing += len(set(outs)) > 1
-            composite += kept not in outs
+        final, walk, sets = sl._walk_sets(facts, first, cap)
+        want = oracle_sets(truth, first)
+        assert [(d, set(s)) for d, s in sets] == want
+        assert [(d, set(s)) for d, s in oracle_set_walk(truth, first)] == want
+        for (d, p), (_, states) in zip(walk, want):
+            assert report(p) == oracle_report(states) and p.stake == min(p.earned, cap)
+            several += len(states) > 1
+            largest = max(largest, len(states))
             days_checked += 1
-            prev = got
+        for d in undecidable:
+            if truth[d][1] == "fault":
+                by_runs[min(3, len(truth[d][2]))] += 1
+        assert final == walk[-1][1]
         again = sl.session_facts(flat([rng.sample(b, len(b)) for b in blocks]), LIVE, CAL)
-        assert list(again) == list(facts) and sl.position(again, first, cap) == sl.position(facts, first, cap)
+        assert list(again) == list(facts) and sl.position(again, first, cap) == final
         k = rng.randint(0, len(blocks))
         head = sl._walk(sl.session_facts(flat(blocks[:k]), LIVE, CAL), first, cap)
         assert head == walk[:len(head)]
-    print(f"property (R1 ties): {days_checked} days, {ambiguous} with several possible places (by faulty runs "
-          f"{by_runs}), {differing} of them giving different ends, {composite} kept ends that no single order gives")
-    assert ambiguous > 5000 and differing > 200 and composite > 50 and min(by_runs.values()) > 200
+    print(f"property (D oracle): {journals} journals ({skipped} generated ones skipped), {days_checked} days, "
+          f"{several} with more than one position, largest set {largest}, undecidable fault days by runs {by_runs}")
+    assert several > 10_000 and largest >= 4 and min(by_runs.values()) > 200
+
+
+def _faulty(e):
+    return (e.get("type") == "order_step" and e.get("event") == "summary" and e.get("venue") == LIVE
+            and ((e.get("status") == "stopped" and e.get("stage") in sl.FAULT_STAGES) or bool(e.get("faults"))))
+
+
+def _usable(e, d):
+    """The entry's time as an instant on its own New York date, read here (not by the module), or None."""
+    ts = e.get("timestamp")
+    if type(ts) is not str:
+        return None
+    try:
+        t = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if t.utcoffset() is None or t.astimezone(NY).date() != d:
+        return None
+    return t
+
+
+def _ny_or_none(t, d):
+    """D-F, read here: an instant orders nothing unless it falls on `d` in New York."""
+    return t if t is not None and t.astimezone(NY).date() == d else None
+
+
+def concrete_versions(rng, blocks, limit=50):
+    """D-E: concrete versions of a journal: on every day, the faulty runs and the pauses and resets put in one order
+    the known different instants allow, and given times that are all known and different (a known time moves by at
+    most milliseconds, so it keeps its place among the other known instants). All of them when there are at most
+    `limit`, else `limit` drawn at random. Returns (how many exist, [blocks])."""
+    days = []
+    for i, block in enumerate(blocks):
+        d = FIRST + timedelta(days=i)
+        items = [j for j, e in enumerate(block) if isinstance(e, dict) and (_faulty(e) or (
+            e.get("type") in ("drawdown_pause", "latch_reset") and e.get("venue") == LIVE))]
+        times = {j: _usable(block[j], d) for j in items}
+        perms = [p for p in itertools.permutations(items)
+                 if all(times[a] is None or times[b] is None or times[a] <= times[b]
+                        for x, a in enumerate(p) for b in p[x + 1:])]
+        # equal known instants are one order whichever runs first, unless they are of different kinds or runs
+        days.append((i, d, perms, times))
+    total = 1
+    for _, _, perms, _ in days:
+        total *= len(perms)
+    if total <= limit:
+        choices = list(itertools.product(*[range(len(p)) for _, _, p, _ in days]))
+    else:
+        seen, choices = set(), []
+        while len(choices) < limit:
+            c = tuple(rng.randrange(len(p)) for _, _, p, _ in days)
+            if c not in seen:
+                seen.add(c)
+                choices.append(c)
+    out = []
+    for choice in choices:
+        version = [list(b) for b in blocks]
+        for (i, d, perms, times), k in zip(days, choice):
+            anchor = datetime(d.year, d.month, d.day, 0, 1, tzinfo=NY)
+            for n, j in enumerate(perms[k]):
+                if times[j] is not None:
+                    anchor = times[j]
+                t = anchor + timedelta(milliseconds=n + 1)
+                version[i][j] = {**version[i][j], "timestamp": t.isoformat(timespec="microseconds")}
+        out.append(version)
+    return total, out
+
+
+DE_JOURNALS = 2000
+DE_VERSIONS = 50
+
+
+def test_property_d_e_every_concrete_version_is_in_the_set_and_never_reported_more_careless():
+    """D-E: for journals with days whose order the times do not tell, and at least 50 concrete versions of each (all
+    of them when fewer exist): on every day the concrete walk's members are in the original's set, the reported
+    earned stake is never above the concrete one's, the report is ticket whenever the concrete one is, and paused
+    whenever the concrete one is."""
+    rng = random.Random(SEED + 43)
+    journals = versions = days_checked = all_of_them = 0
+    lower = ticket_only = paused_only = 0
+    while journals < DE_JOURNALS:
+        blocks, truth, first, cap = timed_journal(rng, rng.randint(10, 40), "mixed")
+        if not any(len(oracle_day_orders(truth[d][1], truth[d][2], truth[d][3])) > 1 for d in truth):
+            continue
+        journals += 1
+        _, walk, sets = sl._walk_sets(sl.session_facts(flat(blocks), LIVE, CAL), first, cap)
+        total, made = concrete_versions(rng, blocks, DE_VERSIONS)
+        assert len(made) == min(total, DE_VERSIONS)
+        all_of_them += total <= DE_VERSIONS
+        for version in made:
+            facts = sl.session_facts(flat(version), LIVE, CAL)
+            assert all(f.at is not None for f in facts if f.kind in sl.EVENT_KINDS)
+            assert all(None not in f.fault_times for f in facts if f.kind == "fault")
+            _, cwalk, csets = sl._walk_sets(facts, first, cap)
+            assert [d for d, _ in csets] == [d for d, _ in sets]
+            for (d, s), (_, cs), (_, p), (_, c) in zip(sets, csets, walk, cwalk):
+                assert set(cs) <= set(s)
+                assert p.earned <= c.earned and p.stake <= c.stake
+                assert c.mode != "ticket" or p.mode == "ticket"
+                assert not c.paused or p.paused
+                lower += p.earned < c.earned
+                ticket_only += p.mode == "ticket" and c.mode != "ticket"
+                paused_only += p.paused and not c.paused
+                days_checked += 1
+            versions += 1
+    print(f"property (D-E): {journals} journals, {versions} concrete versions ({all_of_them} journals with every "
+          f"version), {days_checked} days; the report strictly lower {lower}, ticket where the concrete is not "
+          f"{ticket_only}, paused where it is not {paused_only}")
+    assert versions >= DE_JOURNALS * 10 and lower > 1000 and ticket_only > 100 and paused_only > 100
 
 
 def test_r2_a_batch_proves_a_fraction_only_when_every_summary_of_it_is_clean_and_dated():
@@ -2243,34 +2636,3 @@ def test_r5_describe_at_the_ceiling_says_no_rise_is_possible():
     assert (p.mode, p.stake, p.earned, p.ceiling) == ("unattended", 1000.0, 1000.0, 1000.0)
     q = pos(run(Days(), ["clean"] * 61), 500, 1500)                            # below the ceiling: it may double
     assert "the stake doubles from 1,000.00, up to the ceiling" in lines_ok(sl.describe(q, None, LADDER, 0))
-
-
-def test_r1_the_tie_rule_part_by_part_on_the_reachable_case():
-    """Addendum 1, A1, on the case that must hold with equal instants: one place ends in ticket at 100 (20 needed),
-    the other unattended at 50 (40 needed). The kept end is ticket at 50 with 20 needed: no single order gives it, and
-    it is below every one in stake and above none in approval. The day's lines are those of the earliest place with the
-    smallest stake (the reset, then the fault), then the tie line naming the lower stake, ticket mode and the more
-    careful state. And where both places are unattended at one stake, the larger `needed` is kept."""
-    d = CASE_DAYS[61]
-    _, p = the_case(_utc(d, 12), _utc(d, 12))
-    assert (p.mode, p.earned, p.clean, p.needed, p.paused) == ("ticket", 50.0, 0, 20, False)
-    day = [words for e, words in p.changes if e == d]
-    assert len(day) == 3
-    assert day[0].startswith("the owner's reset after the pause: one step down, the stake goes from 200.00 to 100.00")
-    assert day[1].startswith("a fault session") and "from 100.00 to 50.00" in day[1]
-    assert day[2] == (f"{sl._ORDER_UNKNOWN_WORDS}: {sl._LOWER_KEPT_WORDS}; {sl._TICKET_KEPT_WORDS}; "
-                      f"{sl._MORE_CAREFUL_WORDS}")
-    assert all(type(w) is str and w and "\n" not in w for w in (sl._ORDER_UNKNOWN_WORDS, sl._LOWER_KEPT_WORDS,
-                                                                 sl._TICKET_KEPT_WORDS, sl._MORE_CAREFUL_WORDS))
-    # 20 clean sessions later: unattended at 50, never at 100 (the ticket-mode order's stake)
-    later = [summ(x, ceiling=BIG) for x in sessions_from(d + timedelta(days=1), 20)]
-    facts, _ = the_case(_utc(d, 12), _utc(d, 12), more=later)
-    q = sl.position(facts, 100, 1e6)
-    assert (q.mode, q.earned, q.needed) == ("unattended", 50.0, 40)
-    # both places unattended at 100 (40 or 60 needed): unattended at 100, the larger needed, no ticket words
-    days = Days()
-    facts = run(days, ["clean"] * 120) + [F("pause", days())]
-    e = days()
-    p = pos(facts + [F("reset", e), F("fault", e)], 100, 1e6)
-    assert shape(p) == ("unattended", 100.0, 0, 60, False)
-    assert tie_line(p, e) == f"{sl._ORDER_UNKNOWN_WORDS}: {sl._LOWER_KEPT_WORDS}"     # the 60-needed end is one order's
