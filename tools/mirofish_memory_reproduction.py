@@ -61,7 +61,8 @@ def run(label,module):
         count=lambda phrase:sum(phrase in line for line in capture.lines)
         return {'case':label,'budget':getattr(module,'INPUT_CONTEXT_TOKENS',None),'rounds':rounds,
                 'log':{'Slicing into smaller chunks':count('Slicing into smaller chunks'),'Context truncation performed':count('Context truncation performed'),
-                       'Owned memory dropped whole units':count('Owned memory dropped whole units'),'Owned memory trimmed the newest user message':count('Owned memory trimmed the newest user message')}}
+                       'Owned memory dropped whole units':count('Owned memory dropped whole units'),'Owned memory trimmed the newest user message':count('Owned memory trimmed the newest user message'),
+                       'Owned memory refused the context':count('Owned memory refused the context')}}
     finally:root.removeHandler(capture)
 def main():
     canonical=(s.W16/s.MEMORY_REL).read_bytes()

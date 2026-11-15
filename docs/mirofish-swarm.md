@@ -17,8 +17,8 @@ the commits, and the tool pins that list by its own hash.
 | Profile | Agents | Rounds | Model calls allowed | Wall clock | Purpose |
 |---|---|---|---|---|---|
 | `report64_coverage` | at most 4 (2 act per platform) | 1 | 64 | 40 min | The profile that completed on 2026-11-08 |
-| `swarm8` | 8 named, up to 16 | 3, every agent each round | 192 | 2 hours | The proving run: whole-unit memory at a deliberately tight 4,096 tokens |
-| `swarm48` | 48 named (53 in the graph), up to 64 | 3, every agent each round | 672 | 12.5 hours | A real swarm. **PROVISIONAL: not to be launched before the `swarm8` run's memory readings have been read** |
+| `swarm8` | 8 named, up to 12 | 3, every agent each round | 192 | 2 hours | The proving run: whole-unit memory at a deliberately tight 4,096 tokens |
+| `swarm48` | 48 named (52 agents configured in the last attempt), up to 64 | 3, every agent each round | 672 | 15.5 hours | A real swarm. **PROVISIONAL: not to be launched before the `swarm8` run's memory readings have been read** |
 
 The swarm profiles change closed numbers (gateway budgets and time limits, deadlines, the participant bound, the round count),
 three selector expressions, the concurrency integers, the agent memory (below) and the scenario with its seal. Every number
@@ -38,7 +38,7 @@ The run shows the pipeline at scale. It is not a forecast and says nothing about
 - The embedding model `google/embedding-gemma-300m` loaded under the name `ym-research-embedding`, context 2048.
 - Memory headroom throughout; the run samples memory every 0.4 s and stops itself if the machine gets tight.
 - About 15 minutes for `report64_coverage`. For the swarms see "Duration by phase" below: about 75 minutes for `swarm8`
-  (2-hour wall clock) and about 5 hours for `swarm48` (12.5-hour wall clock).
+  (2-hour wall clock) and about 5 hours for `swarm48` (15.5-hour wall clock).
 
 ## What the 2026-11-11 runs showed
 
@@ -92,7 +92,11 @@ integers on it (budget, reply cap, participant bound). The manifest's `swarm_pro
 - Never two assistant messages in a row, never a tool result without its call: such records raise and end the turn instead.
 - Only if the system message and the newest unit alone exceed the budget is the newest user message trimmed from its end,
   with a plain last line saying how much was kept. Log line, WARNING: `Owned memory trimmed the newest user message`.
-- The total stays at or under the budget, and the same records always give the same context.
+- The total stays at or under the budget, and the same records always give the same context. The total counts tool-call
+  arguments: the library itself counts an assistant's tool calls as a few tokens whatever their length, so the memory adds
+  their own text. On the old count a context the budget called 2,356 tokens held 7,411.
+- Every refusal (a shape that cannot be sent, or a newest unit that cannot fit) writes one WARNING line,
+  `Owned memory refused the context`, with the role of the newest record; see "Watching a run".
 
 Reproduction, offline (`tools/mirofish_memory_reproduction.py`, the stopped run's largest persona and three largest feeds):
 
@@ -113,40 +117,61 @@ tools and template add 1,750 tokens; a request is at most 5.28 bytes per token; 
 
 | Limit | Old | New | Rule |
 |---|---|---|---|
-| Agent memory budget | 2,048 | 4,096 (`swarm8`), 12,288 (`swarm48`) | 1.25 B + 1,750 + 1,024 <= 32,768 (largest allowed 23,995) |
+| Agent memory budget | 2,048 | 4,096 (`swarm8`), 12,288 (`swarm48`) | 1.25 B + 1,750 + 1,024 <= 32,768 (largest allowed 23,995). Still holds now that the budget counts tool-call arguments: the measured 1.131 was taken when they went uncounted, so the true ratio is lower |
 | Worst single call | | agent 239 s, caller 353 s | (32,768 - reply cap) / 188 + reply cap / 23.6 + 27 |
 | Gateway arrival-to-done | 175 s | 540 s | two agent calls in flight (one per platform), each worst + 10%, rounded up to 30 s |
 | Gateway queue | 170 s | 270 s | one agent call ahead, worst + 10%, rounded up to 30 s |
 | Agent, caller and embedding client timeouts | 180 s | 570 s | at least 30 s longer than the gateway limit in front of them |
 | Requests in flight per platform (semaphore) | 30 (2 in the first `swarm48`) | 1 | dispatch is serial; more in flight only waits |
-| Gateway request bytes | 131,072 | 262,144 | >= 5.28 x 32,768 = 173,016 |
+| Gateway request bytes | 131,072 | 258,048 | >= 5.28 x 32,768 = 173,016, and at least 4,096 below the SDK helper's 262,144 request-line cap (the helper re-wraps the body, about 120 bytes, and its check sits outside its `try`) |
+| Worker event line (observer buffer) | 131,072 | 114,294,784 (109 MiB) | the largest `wait` event: 8,192 + 50 recent actions x (14,336 text tokens x 144 bytes + 512), plus 10%, in whole MiB. See below |
 | Caller reply cap | 2,560 | 4,096 | 2,560 was 96% used (2,467) |
-| Model calls allowed | 640 | 192 / 672 | expected calls + 50%, rounded up to a multiple of 32 |
+| Model calls allowed | 640 | 192 / 672 | the larger of expected calls + 50% and every call the participant bound admits, rounded up to a multiple of 32 |
 | Output total | 1,700,000 | 800,000 / 2,800,000 | every admitted call can reserve its reply cap |
-| Wall clock | 14,400 s | 7,200 s / 45,000 s | ceiling duration + 20%, rounded up to a half hour |
-| Worker deadline | | 7,080 s / 44,880 s | wall clock - 120 s cleanup |
-| Resource history | 36,001 records, 64 MiB | 18,001, 32 MiB / 112,501, 224 MiB | one record per 0.4 s for the wall clock, 1,219 bytes each |
+| Participant bound | 4 | 12 / 64 | covers the named actors x 52/48 (9 / 52); `swarm8`'s 12 keeps its ceiling inside 2 hours |
+| Wall clock | 14,400 s | 7,200 s / 55,800 s | ceiling at the participant bound + 20%, rounded up to a half hour |
+| Worker deadline | | 7,080 s / 55,680 s | wall clock - 120 s cleanup |
+| Resource history | 36,001 records, 64 MiB | 18,001, 32 MiB / 139,501, 256 MiB | one record per 0.4 s for the wall clock, 1,219 bytes each |
+
+**The worker event line.** The worker reports each stage to the observer as one JSON line on a pipe, and the observer refuses
+a line longer than its buffer limit (`mirofish_native_run.py:261`, 131,072 in the reviewed code). The `wait` event carries the
+whole run state, including up to 50 recent actions with their full text. Nothing else on that path limits its size: the
+observer stores it as `builder/worker-events/wait.json` and again in `builder/native-run-receipt.json`, neither with a cap.
+
+- What one action can carry: a quote holds its own text twice (each at most one 1,024-token agent reply), the quoted post (a
+  seed post can be as long as a 4,096-token caller reply) and two names (each at most a caller reply): 14,336 tokens.
+- Bytes per token: 144, the largest any single token of the frozen vocabulary takes once the worker writes it with escaping
+  (a non-ASCII character becomes 6 or 12 bytes). Computed from the vocabulary itself, so it holds for any language.
+- Measured: every recorded event of earlier runs fits the bound. The largest `wait` was 11,539 bytes; the stopped run's run
+  state would have made a 51,794-byte `wait`. Fifty actions near the reply cap pass 131,072, so a long swarm would have been
+  refused at this event, after its whole simulation and before its report.
+- The other events (graph check, prepare, start, report, any failure) carry no agent text; the largest seen is 4,582 bytes.
 
 The offline part of context admission (template renders for all eight candidates plus the tokenizer) takes 0.32 s at the
 largest admitted size, 31,744 tokens (`tools/mirofish_admission_timing.py`); its 10 s limit stays.
 
 ## Duration by phase
 
-Expected figures use the measured speeds and the median persona and feed; the ceiling assumes every agent call is at full
-memory. The report phase has been measured only in the 4-agent run (393 s) and is assumed to take three times that.
+Expected figures use the named actors times the measured growth (the graph built 52 agents from 48 names: 9 for `swarm8`,
+52 for `swarm48`), the measured speeds and the median persona and feed. The ceiling takes the participant bound (12 and 64)
+with every agent call at full memory, so the wall holds for anything the bound admits. The report phase has been measured
+only in the 4-agent run (393 s) and is assumed to take three times that.
 
 | Phase | `swarm8` | `swarm48` |
 |---|---|---|
-| Start, graph, personas, settings | 21 min (1,256 s) | 59 min (3,536 s) |
-| Simulation, rounds 1 / 2 / 3 | 9 / 12 / 12 min | 55 / 74 / 93 min |
+| Start, graph, personas, settings | 18 min (1,085 s) | 59 min (3,536 s) |
+| Simulation, rounds 1 / 2 / 3 | 10 / 12 / 12 min | 55 / 74 / 93 min |
 | Report (assumed) | 20 min | 20 min |
-| Expected total | about 75 min (4,514 s) | about 5.0 h (18,166 s) |
-| Ceiling | 82 min (4,934 s) | 10.3 h (37,009 s) |
-| Wall clock (the run stops itself here) | 2 h | 12.5 h |
+| Expected total | about 74 min (4,418 s) | about 5.0 h (18,166 s) |
+| Ceiling, at the participant bound | 98 min (5,880 s) | 12.6 h (45,197 s) |
+| Wall clock (the run stops itself here) | 2 h | 15.5 h |
+
+If the graph builds more participants than the bound (more than 12 for `swarm8`), the run stops at its own participant check
+in its first minutes, before the simulation, and cleans up.
 
 ## What must be switched off, and for how long
 
-For the whole wall clock (up to 2 hours for `swarm8`, up to 12.5 hours for `swarm48`):
+For the whole wall clock (up to 2 hours for `swarm8`, up to 15.5 hours for `swarm48`):
 
 - every other language model on the local model server: the run stops if another one is loaded;
 - the local Hermes bots (Scout, Valedia, CTO, local delegation workers) and anything else that uses the local model server,
@@ -165,6 +190,15 @@ Either line means the memory is not the one staged.
 | `Context truncation performed` | library WARNING | the library dropped context itself: stop the attempt |
 | `Owned memory dropped whole units` | INFO | older whole units were left out to fit the budget: expected |
 | `Owned memory trimmed the newest user message` | WARNING | one feed did not fit alone and was trimmed: expected at 4,096; count them |
+| `Owned memory refused the context` | WARNING | the memory refused to build a context; read the `newest record role=` at the end of the line |
+
+How to read `Owned memory refused the context`:
+
+- `newest record role=tool`: harmless; the next round starts a new unit.
+- `newest record role=user`: an agent's turn was lost (its feed could not be given to the model). Count these lines and report
+  the count with the run.
+- The library's own `Token calculation failed before chunking` warnings come with these refusals and are expected. They are
+  not the count to read; count the owned-memory line instead.
 
 ## Stage, gate, launch
 
@@ -178,10 +212,12 @@ cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp $PY -B miro
 $PY -B mirofish_native_startup.py --work <work> --gate <work>/root-one-native-attempt.json
 ```
 
-Staged on 2026-11-15, not launched, no gate written: `valedia-native-20261115-swarm8-a` (candidate
-`ed62b796cf47f28fa1966f509ac0d1c04394f2b39d762312902c3e8d6aa4e6a4`) and `valedia-native-20261115-swarm48-a` (candidate
-`49135ce8e3ba7609ea538eff0f021e1ab75ac7f5c2c90e9c07ac0d4fe1af605a`, PROVISIONAL). Both carry the model server's port as of
-staging; stage again if the server app restarts.
+Staged on 2026-11-15 as proof of the repaired tool, not launched, no gate written: `valedia-native-20261115-swarm8-b`
+(candidate `f1ec87023ece47b0f2d31952d97f0b392402ce7e04f799a5ac7370c81a5802f1`) and `valedia-native-20261115-swarm48-b`
+(candidate `01313bba42916d809a90ae9aa5ef3bb5f34c72f45469fecae02e6366fadd4d45`, PROVISIONAL). The `-a` folders were staged by
+the tool before these repairs; leave them unlaunched. The folder that is actually launched is staged from `main` after the
+merge, so that its manifest names the repository's own files. A staged folder carries the model server's port as of staging;
+stage again if the server app restarts.
 
 The result is `<work>/builder/native-run-receipt.json` (events, model-call count, whether the report validated, what the
 paper step did) and `<work>/builder/gateway-ledger.json` (every model call).
