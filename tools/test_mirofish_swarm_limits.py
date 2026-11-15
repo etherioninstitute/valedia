@@ -25,8 +25,8 @@ class SwarmLimits(unittest.TestCase):
         self.assertEqual((S.SWARM['swarm48']['memory_budget'],S.SWARM['swarm8']['memory_budget']),(12288,4096))
         self.assertEqual((S.SWARM['swarm8']['actors'],S.SWARM['swarm8']['rounds']),(8,3))
         for profile in S.SWARM.values():
-            self.assertLessEqual(math.ceil(1.25*profile['memory_budget'])+1750+1024,32768);self.assertNotEqual(profile['memory_budget'],2048)
-        self.assertEqual(L.largest_budget(),23995)
+            self.assertLessEqual(math.ceil(1.30*profile['memory_budget'])+1750+1024,32768);self.assertNotEqual(profile['memory_budget'],2048)
+        self.assertEqual(L.largest_budget(),23072)                                                       # floor(29,994 / 1.30); was 23,995 at 1.25
     def test_output_budget_lets_every_admitted_call_reserve_its_cap(self):
         for profile in S.SWARM.values():
             d=L.derive(profile);self.assertGreaterEqual(d['output'],2*512+(d['chats']-2)*4096);self.assertGreaterEqual(d['chats'],d['expected_chats'])
@@ -36,7 +36,7 @@ class SwarmLimits(unittest.TestCase):
             self.assertGreaterEqual(d['history_records'],int(d['wall']/0.4)+1);self.assertEqual(d['worker_deadline_s'],d['wall']-120)
     def test_a_broken_profile_is_named_by_the_inequality_it_breaks(self):
         good=dict(S.SWARM['swarm8'])
-        self.assertIn('memory budget fits the window at the assumed ratio: 1.25 B + 1750 + 1024 <= 32768',L.violations(dict(good,memory_budget=24000)))
+        self.assertIn('memory budget fits the window at the assumed ratio: 1.30 B + 1750 + 1024 <= 32768',L.violations(dict(good,memory_budget=24000)))
         self.assertIn('largest persona fits the memory budget with room for a feed',L.violations(dict(good,memory_budget=1600)))
         self.assertIn('participant bound covers the named participants and the measured growth',L.violations(dict(good,agents_bound=8)))
         d=L.derive(good);d['agent_client_s']=d['gateway_arrival_s']+29
@@ -110,4 +110,31 @@ class SwarmLimits(unittest.TestCase):
             self.assertGreaterEqual(d['request_bytes'],math.ceil(32768*5.28));self.assertLessEqual(d['request_bytes'],262144-4096)
             self.assertIn('request bytes sit at least 4096 below the SDK helper cap',L.violations(profile,dict(d,request_bytes=262144)))
             self.assertIn('request bytes cover a full-window prompt',L.violations(profile,dict(d,request_bytes=173015)))
+    # ---- TMF3 (2026-11-15): per model; addendum 1 numbers ------------------------------------------------------------------
+    def test_TMF3_ratio_is_1_30_and_every_budget_fits_the_window(self):
+        self.assertEqual(L.RATIO_ASSUMED,1.30)
+        self.assertEqual({n:L.derive(p)['window_need'] for n,p in S.SWARM.items()},{'swarm8':8099,'swarm48':18749})         # ceil(1.3 B) + 2,774
+        self.assertEqual(L.violations(dict(S.SWARM['swarm8'],memory_budget=23072)),[]);self.assertIn('memory budget fits the window at the assumed ratio: 1.30 B + 1750 + 1024 <= 32768',L.violations(dict(S.SWARM['swarm8'],memory_budget=23073)))
+    def test_TMF3_models_and_their_speeds(self):
+        self.assertEqual(set(L.MODELS),{'qwen3.8-27b','qwen3-8b'});self.assertEqual(L.DEFAULT_MODEL,'qwen3.8-27b')
+        self.assertEqual((L.MODELS['qwen3.8-27b']['read_tps'],L.MODELS['qwen3.8-27b']['write_tps']),(188.0,23.6))
+        self.assertAlmostEqual(L.MODELS['qwen3-8b']['read_tps'],1208*188/260,9);self.assertAlmostEqual(L.MODELS['qwen3-8b']['write_tps'],46.3*188/260,9)
+        self.assertIn('ESTIMATE',L.MODELS['qwen3-8b']['speed_source']);self.assertLessEqual(L.MODELS['qwen3-8b']['token_ratio_to_27b'],1.0)
+        with self.assertRaises(ValueError):L.derive(S.SWARM['swarm8'],'qwen9-1b')
+    def test_TMF3_limits_stay_the_27b_and_expected_and_wall_follow_the_model(self):
+        expected={('swarm8','qwen3.8-27b'):(4418,7200),('swarm48','qwen3.8-27b'):(18166,57600),('swarm8','qwen3-8b'):(2346,3600),('swarm48','qwen3-8b'):(7365,18000)}
+        for (name,model),(total,wall) in expected.items():
+            profile=S.SWARM[name];d=L.derive(profile,model);self.assertEqual((d['expected_total_s'],d['wall']),(total,wall),(name,model));self.assertEqual(L.violations(profile,d,model),[],(name,model))
+            big=L.derive(profile)
+            for key in ['agent_worst_s','caller_worst_s','agent_slot_s','caller_slot_s','gateway_arrival_s','gateway_queue_s','agent_client_s','caller_client_s','embedding_client_s','request_bytes','worker_event_bytes','chats','output','bound_chats','window_need','largest_budget']:self.assertEqual(d[key],big[key],(name,model,key))
+            self.assertEqual(d['worker_deadline_s'],wall-120);self.assertGreaterEqual(d['history_records'],int(wall/0.4)+1);self.assertGreaterEqual(wall,1.2*d['ceiling_total_s'])
+        self.assertEqual(L.derive(S.SWARM['swarm8']),L.derive(S.SWARM['swarm8'],'qwen3.8-27b'))                # the default is the 27B
+        broken=dict(L.MODELS['qwen3-8b'],token_ratio_to_27b=1.01);original=L.MODELS['qwen3-8b'];L.MODELS['qwen3-8b']=broken
+        try:self.assertIn('the chosen model needs no more real tokens than the 27B the window was measured on',L.violations(S.SWARM['swarm8'],model='qwen3-8b'))
+        finally:L.MODELS['qwen3-8b']=original
+    def test_TMF3_start_threshold_per_model(self):
+        self.assertEqual(L.INSTALLED_MEMORY_BYTES,68719476736)
+        self.assertEqual(L.start_threshold('qwen3-8b',5225374496),47)                                       # 30 + ceil(100 x (5,225,374,496 + 6 GiB) / 64 GiB)
+        self.assertEqual(L.start_threshold('qwen3.8-27b',18973870528),65)                                   # the reviewed value stays
+        self.assertEqual(L.start_threshold('another',18973870528),67)                                       # what the rule alone gives for the 27B's weights
 if __name__=='__main__':unittest.main()

@@ -94,7 +94,8 @@ class NativeStaging(unittest.TestCase):
     # TMF2 (2026-11-15): every swarm number comes from tools/mirofish_swarm_limits.py; the expected literals below are that
     # derivation's results, written out so a change in the derivation shows up here as well.
     # Addendum 2: walls and ceilings follow the participant bound (swarm8's bound is 12), and the worker event limit is derived.
-    EXPECTED={'swarm48':{'chats':672,'output':2800000,'wall':55800,'worker':55680,'records':139501,'mib':256,'bound':64,'rounds':3,'budget':12288,'events':114294784},
+    # TMF3 addendum 1: the assumed ratio is 1.30, which raises swarm48's ceiling and so its wall (was 55,800 s at 1.25).
+    EXPECTED={'swarm48':{'chats':672,'output':2800000,'wall':57600,'worker':57480,'records':144001,'mib':256,'bound':64,'rounds':3,'budget':12288,'events':114294784},
               'swarm8':{'chats':192,'output':800000,'wall':7200,'worker':7080,'records':18001,'mib':32,'bound':12,'rounds':3,'budget':4096,'events':114294784}}
     def test_swarm_numbers_are_the_derivation_and_every_admitted_call_can_reserve_its_cap(self):
         self.assertEqual(set(s.SWARM),set(self.EXPECTED))
@@ -327,6 +328,176 @@ class NativeStaging(unittest.TestCase):
     def test_full_profile_staged_stimulus_and_native_criterion_unchanged(self):
         if not (s.COVERAGE_WORK/'builder/candidate-manifest.json').exists():self.skipTest('actual full profile follows tests')
         self.assertEqual((s.COVERAGE_WORK/s.SELECTOR_REL).read_bytes(),s.coverage_selector_bytes((s.W16/s.SELECTOR_REL).read_bytes()));manifest=json.loads((s.COVERAGE_WORK/'builder/candidate-manifest.json').read_text());self.assertTrue(manifest['qualification_stimulus']['enabled']);self.assertIn('QUALIFICATION_ONLY',manifest['staging_profile']['participation_stimulus']);self.assertEqual(manifest['staging_profile']['chat_attempts'],64);self.assertFalse(manifest['launch_authorized']);lineage=json.loads((s.COVERAGE_WORK/'builder/staging-ancestry.json').read_text());self.assertEqual((lineage['exact_owned_source_files'],lineage['gateway_budget_deltas_owned'],lineage['reviewed_prompt_only_deltas'],lineage['qualification_selector_deltas']),(68,2,1,1));self.assertEqual(s.sha(s.COVERAGE_WORK/'owned-source/observer-entry/mirofish_native_run.py'),s.sha(s.W16/'owned-source/observer-entry/mirofish_native_run.py'))
+# ---- TMF3 (2026-11-15): a swarm staged on a chosen model; addenda 1 and 2 ------------------------------------------------
+# The transformed bytes of every default (no --model) path, hashed from the merged tool (main abf88d5) before TMF3 changed it.
+BASELINE_ABF88D5={'coverage_selector':'7c242db3f1d32417eebdcbf5f71e7b80704fdd7d7cfd88e2f0d98a8634ce63ea','device_startup':'4852d68bbb69e08eefdc879156da18fb12ce2fb968d5a9d7547c1eb49b8926b9','ontology':'cb5f076d379945281a47b9ac3e4226738e236d7bc4fd356c700fed44ebc0a554',
+ 'port_helper':'7897590a47e75cafe87f9bc4512132a0e7e4be2a9f70878538230642dfee986c','port_model':'71d1811cc5453bb8bbbc0677d93fe5acbc811700d6a1a1d6f50e7b7809f9d848','report64_gateway':'c77653a4ade3a8e48165b1d737c9bcb3cdb595a2e44b1746bb941ff3de0540a5',
+ 'swarm48':{'embedding_service.py':'83c717318c9e6e3a792f114b2a23f331cf571965551ac7299ae9dd4f3f1895ef','gateway':'a050e47daa947e7cd03be3ddda6cc8e88dba8bda4a00bc3e00610cd528cbe76b','memory':'e505e8c3be37dce9417fc5dd7b1bbaeaa67cb13676e38d4f6bdfda0c40cf6b75','mirofish_provenance.py':'8b39ea8f2f6d9fd30a08f94d02b81c1f39830ebbee38c89be158e3ffa18b0dd6','owned_caller_budget.py':'12a708bb08a6cd1f015befc98b673abee132d8259f64b0519f317951521c59c6','run':'0d8af4917c3cd93daeb67f00deb5f791d37908a43c6c7fcd8b89cc9398910387','scenario':'999e56774f34df31ceef8fa344f061a22e704e9c2ee607faf0087f8446121357','seal':'9b46c98f08bd71fd772f4cefbc76900a3d4e8a90092d0afee423c1410015cc75','selector':'6c8b8b7bbf1e57c68d1bbf11b8347191f84c8ffa1946287b2f531a9cbf8a6081','simulation_config_generator.py':'b724bc4e264652f3fee5ad66ac5263fcfbe94bfd4660ad144f983d09dcc63ac5','simulation_manager.py':'2a8e471c8260fceeb0e6018a7a871585f0d54c682acd62ab554edffb61382265','simulation_runner.py':'277fbf85c689bc62e2151a6746cec8fec03a784670b4e1c87f61329e0fa12eb7','startup':'08e65db86facc60a94639f5de680f325a177e1a9995c543a741713dca7f850cb','startup_device':'93dbac21fb081d3024060981331dca65f83b31352854bca9fa00d993d7c984bf'},
+ 'swarm8':{'embedding_service.py':'83c717318c9e6e3a792f114b2a23f331cf571965551ac7299ae9dd4f3f1895ef','gateway':'530708fb80d43f4c17c4b25dd1be27def598dc56283338c51c8100e5ea084ab6','memory':'ea20ae5ab911717fca16e6d7ca51909902cef8e83b04cf308df7474533e20fd9','mirofish_provenance.py':'e952a6204c2b67464ce840bea13b1a41146497f545a72aa45ac9091b2a3725a2','owned_caller_budget.py':'12a708bb08a6cd1f015befc98b673abee132d8259f64b0519f317951521c59c6','run':'2db95d25909488f24347044d6074338b90d2c3cb68af12bb235f97a245ad2328','scenario':'641690f62eb67dd2175a45041b19278a22d07d892693b761da6a067de4f1a15e','seal':'b67ce38de930385e8cc1ab361113fa054738665a00b1b343dd74efdd89a4e839','selector':'93aca4976d1161eaecf24780869528e55bb3a18ef5f3a4d0609434538e15c655','simulation_config_generator.py':'7e41e789fdacaf14c12b19afa408da3fcbcbfc5de732df0e7cb1bc45d2f4166c','simulation_manager.py':'25f87e43ba97d329f4ede1451116e0ad5fd50e93d7fe120840e3e52232e376e2','simulation_runner.py':'9fb056d762384c7930f5b04a67abcdf8ea5f37fbb247097bb343e136248da4b5','startup':'b45fee03a1b49b5f87a7c804f6aff290fd05cf31c4c5483f0f378e26b3fa19d8','startup_device':'7150d372b4fd30935f1e1b2ad629fdc1e9fd72531228a0bc52041b017f74507b'}}
+Q8_WORK=s.CREW/'valedia-native-20261115-swarm8-q8-a'
+def default_hashes():
+    """Every default-path transformed file, hashed the way BASELINE_ABF88D5 was."""
+    h=lambda b:hashlib.sha256(b).hexdigest();raw=lambda rel:(s.W16/rel).read_bytes();out={}
+    out['ontology']=h(s.compact_ontology_bytes(raw(s.ONTOLOGY_REL)));out['report64_gateway']=h(s.gateway_profile_bytes(raw(sorted(s.GATEWAY_COPIES)[0]),'report64'))
+    out['coverage_selector']=h(s.coverage_selector_bytes(raw(s.SELECTOR_REL)));out['port_model']=h(s.sdk_port_bytes(raw(sorted(s.MODEL_COPIES)[0]),59671))
+    out['port_helper']=h(s.sdk_port_helper(raw(s.SDK_HELPER_REL).decode(),59671).encode());out['device_startup']=h(s.ssd_device_bytes(raw(sorted(s.STARTUP_COPIES)[0]),16777245))
+    for name in s.SWARM:
+        row={'gateway':h(s.swarm_gateway_bytes(raw(sorted(s.GATEWAY_COPIES)[0]),name)),'run':h(s.swarm_run_bytes(raw(sorted(s.RUN_COPIES)[0]),name))}
+        st=s.swarm_startup_bytes(raw(sorted(s.STARTUP_COPIES)[0]),name);row['startup']=h(st);row['startup_device']=h(s.ssd_device_bytes(st,16777245,h(st)))
+        for rel in s.SWARM_PRODUCER:row[Path(rel).name]=h(s.swarm_producer_bytes(rel,raw(rel),name))
+        row['memory']=h(s.swarm_memory_bytes(raw(s.MEMORY_REL),name));row['selector']=h(s.swarm_selector_bytes(raw(s.SELECTOR_REL),name))
+        sc,seal=s.swarm_scenario(name);row['scenario']=h(sc);row['seal']=h(seal);out[name]=row
+    return out
+def base_manifest():return json.loads((s.W16/'builder/candidate-manifest.json').read_text())
+def load_module_copy(folder,name):
+    """Import a module copy from a scratch folder under its own name (never the W16 names this process may hold)."""
+    sys.path.insert(0,str(folder))
+    try:
+        spec=importlib.util.spec_from_file_location(name,Path(folder)/'mirofish_native_model.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+    finally:sys.path.remove(str(folder))
+class ModelStaging(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        s.storage_guard();cls.temp_root=s.RESUME/'build/staging-test-tmp';cls.temp_root.mkdir(exist_ok=True);cls.base=base_manifest()
+    def test_outcome1_default_staging_is_byte_identical_per_transformed_file(self):
+        # Every default path reproduces the merged tool's bytes. The lead's ratio of 1.30 (addendum 1) also raises swarm48's
+        # ceiling and so its wall (55,800 -> 57,600 s): with the ratio set back to 1.25 swarm48 is byte-identical too, and at
+        # 1.30 exactly its five wall-derived files differ; nothing else does.
+        original=s.LIMITS.RATIO_ASSUMED;self.assertEqual(original,1.30)
+        try:s.LIMITS.RATIO_ASSUMED=1.25;self.assertEqual(default_hashes(),BASELINE_ABF88D5)
+        finally:s.LIMITS.RATIO_ASSUMED=original
+        now=default_hashes();differ={(k,kk) for k,v in BASELINE_ABF88D5.items() if isinstance(v,dict) for kk in v if now[k][kk]!=v[kk]}|{(k,None) for k,v in BASELINE_ABF88D5.items() if not isinstance(v,dict) and now[k]!=v}
+        self.assertEqual(differ,{('swarm48',k) for k in ['gateway','mirofish_provenance.py','run','startup','startup_device']})
+        self.assertEqual(s.swarm_numbers('swarm48')['wall'],57600);self.assertEqual(s.swarm_numbers('swarm8')['wall'],7200)
+    def test_outcome1_model_option_exists_and_a_default_stage_has_no_selector_or_registry(self):
+        work=s.CREW/'valedia-native-20261115-swarm8-b'
+        if not (work/'builder/candidate-manifest.json').exists():self.skipTest('default-staged folder absent')
+        self.assertFalse(list(work.rglob(s.MODEL_SELECTOR)));self.assertFalse(list(work.rglob(s.REGISTRY_NAME)))
+        port=json.loads((work/'builder/candidate-manifest.json').read_text())['sdk_port_revision']['staged'];w16=(s.W16/sorted(s.MODEL_COPIES)[0]).read_bytes()
+        for relative in s.MODEL_COPIES:self.assertEqual((work/relative).read_bytes(),w16 if port==s.ORIGINAL_SDK_PORT else s.sdk_port_bytes(w16,port))   # the W16 bytes, never the src revision
+    def test_addendum1_src_revisions_are_pinned_by_hash_and_a_changed_byte_refuses(self):
+        self.assertEqual(s.sha(s.SRC/'mirofish_native_model.py'),s.MODEL_SRC_SHA);self.assertEqual(s.sha(s.SRC/'mirofish_native_run.py'),s.RUN_SRC_SHA)
+        self.assertEqual(s.src_revision('mirofish_native_run.py',s.RUN_SRC_SHA),(s.SRC/'mirofish_native_run.py').read_bytes())
+        with self.assertRaisesRegex(RuntimeError,'src revision changed since it was pinned'):s.src_revision('mirofish_native_run.py','0'*64)
+        self.assertIn('ab08400',s.SRC_REVISION_NOTE);self.assertIn('b5a1797',s.SRC_REVISION_NOTE);self.assertIn('V134',s.SRC_REVISION_NOTE);self.assertIn('not the W16 bytes',s.SRC_REVISION_NOTE)
+    def test_outcome2_model_pins_are_derived_from_the_pinned_module_text(self):
+        profiles,files,default=s.model_profiles();self.assertEqual(tuple(profiles),s.BUILTIN_MODELS);self.assertEqual(default,'qwen3.8-27b')
+        self.assertEqual(files,('config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json'))
+        big=s.model_choice('qwen3.8-27b',self.base);self.assertEqual([dict(r,bytes=b['bytes']) for r,b in zip(big['model_files'],self.base['model_files'])],self.base['model_files']);self.assertEqual(big['model_tokenizer'],self.base['model_tokenizer'])
+        small=s.model_choice('qwen3-8b',self.base);root=s.BASE/'models/Qwen3-8B-tokenizer';gguf=s.BASE/'models/lmstudio-library/Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf'
+        self.assertEqual([r['path'] for r in small['model_files']],[str(root/f) for f in files]+[str(gguf)]);self.assertEqual(small['paths'],{root/f for f in files}|{gguf})
+        self.assertEqual((small['model_files'][-1]['bytes'],small['model_files'][-1]['sha256']),(5225374496,'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f'))
+        self.assertEqual(small['model_tokenizer'],s.TOKENIZER_PINS['qwen3-8b']);self.assertEqual([r['role'] for r in small['model_files']],[r['role'] for r in self.base['model_files']])
+        # A profile edited into the module text is not trusted: the profiles must be exactly the two built-ins.
+        raw=(s.SRC/'mirofish_native_model.py').read_bytes();edited=raw.replace(b"    'qwen3-8b': {",b"    'qwen3-4b': {",1);self.assertEqual(tuple(s.model_profiles(edited)[0]),('qwen3.8-27b','qwen3-4b'))
+        with self.assertRaisesRegex(RuntimeError,'unexpected expression'):s.model_profiles(raw.replace(b"_MODEL_ROOT/'Qwen3-8B-tokenizer'",b"Path.home()/'x'",1))
+    def test_outcome2_pin_scope_admits_only_the_chosen_models_files(self):
+        small=s.model_choice('qwen3-8b',self.base);big=s.model_choice('qwen3.8-27b',self.base);rows=[dict(r,bytes=1) for r in small['model_files']]
+        self.assertEqual(len(s.pin_scope(rows,model_paths=small['paths'])),6)
+        with self.assertRaisesRegex(RuntimeError,'unknown pin scope'):s.pin_scope(rows)                                 # the default scope is the 27B's
+        with self.assertRaisesRegex(RuntimeError,'unknown pin scope'):s.pin_scope([dict(r,bytes=1) for r in big['model_files']],model_paths=small['paths'])
+        with self.assertRaisesRegex(RuntimeError,'unknown pin scope'):s.pin_scope([{'path':str(s.BASE/'models/other.gguf'),'sha256':'a'*64}],model_paths=small['paths'])
+    def test_outcome2_C2_model_files_are_verified_against_their_pins(self):
+        small=s.model_choice('qwen3-8b',self.base);gguf=small['model_files'][-1]
+        verified=s.verify_model_files(copy.deepcopy(small),[gguf])                       # the five tokenizer files hashed here; the GGUF hash is the staging run's
+        self.assertEqual([r['bytes'] for r in verified['model_files']],[(Path(r['path'])).stat().st_size for r in verified['model_files']])
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            root=Path(folder);(root/'config.json').write_text(json.dumps({'model_type':'qwen3','max_position_embeddings':40960}));(root/'w.gguf').write_bytes(b'weights')
+            fake={'name':'qwen3-8b','entry':{'tokenizer_root':root,'tokenizer_model_type':'qwen3'},'model_files':[{'path':str(root/'config.json'),'bytes':None,'sha256':s.sha(root/'config.json')},{'path':str(root/'w.gguf'),'bytes':7,'sha256':s.sha(root/'w.gguf')}]}
+            s.verify_model_files(copy.deepcopy(fake))
+            for row,field,value,why in [(0,'sha256','0'*64,'does not match its pin'),(1,'sha256','0'*64,'does not match its pin'),(1,'bytes',8,'pinned size')]:
+                bad=copy.deepcopy(fake);bad['model_files'][row][field]=value
+                with self.assertRaisesRegex(RuntimeError,why):s.verify_model_files(bad)
+            (root/'config.json').write_text(json.dumps({'model_type':'qwen3','max_position_embeddings':16384}));fake['model_files'][0]['sha256']=s.sha(root/'config.json')
+            with self.assertRaisesRegex(RuntimeError,'32,768 window'):s.verify_model_files(copy.deepcopy(fake))
+    def test_outcome2_C1_refusals_unknown_registry_only_and_http_only_in_one_line(self):
+        with self.assertRaisesRegex(RuntimeError,'unknown model profile'):s.model_choice('qwen9-1b',self.base)
+        with self.assertRaisesRegex(RuntimeError,'HTTP backends only'):s.model_choice('qwen3.8-27b-mlx',self.base)                 # the real src/ registry entry
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            registry=Path(folder)/s.REGISTRY_NAME;registry.write_text(json.dumps({'profiles':{'evil':{'native':True,'tokenizer_root':'/','weight_file':'/etc/hosts','weight_bytes':1,'weight_sha256':"x'+1+'",'tokenizer_model_type':'qwen3','gguf_selection':{}}}}))
+            with self.assertRaisesRegex(RuntimeError,'registry-only'):s.model_choice('evil',self.base,registry)
+        import contextlib,io
+        for argv in (['--profile','swarm8','--model','qwen9-1b'],['--profile','report64','--model','qwen3-8b'],['--profile','swarm8','--model','qwen3.8-27b-mlx']):
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err):self.assertEqual(s.main(argv),2)
+            self.assertEqual(len(err.getvalue().strip().splitlines()),1,argv);self.assertTrue(err.getvalue().startswith('refused: '))
+    def test_C1_selector_is_exact_bytes_and_no_registry_reaches_a_staged_copy(self):
+        self.assertEqual(s.selector_bytes('qwen3-8b'),b'{"profile": "qwen3-8b"}\n');self.assertEqual(s.selector_bytes('qwen3.8-27b'),b'{"profile": "qwen3.8-27b"}\n')
+        with self.assertRaises(RuntimeError):s.selector_bytes('evil')
+        self.assertEqual(s.SELECTOR_COPIES,{'builder/review-source/mirofish_model_profile.json','owned-source/observer-entry/mirofish_model_profile.json'})
+        self.assertEqual({str(Path(r).parent) for r in s.SELECTOR_COPIES},{str(Path(r).parent) for r in s.MODEL_COPIES})   # beside every staged model copy
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            src=Path(folder)/'src';src.mkdir()                                           # a scratch copy of the module folder, never src/ itself
+            for name in ('mirofish_native_model.py','mirofish_native_gateway.py'):(src/name).write_bytes((s.SRC/name).read_bytes())
+            # With a registry holding a native entry beside it, the revised code would take the entry's own paths and pins.
+            (src/s.REGISTRY_NAME).write_text(json.dumps({'profiles':{'evil':{'native':True,'tokenizer_root':'/','weight_file':'/etc/hosts','weight_bytes':1,'weight_sha256':'a'*64,'tokenizer_model_type':'qwen3','gguf_selection':{}}}}))
+            (src/s.MODEL_SELECTOR).write_text('{"profile": "evil"}\n');self.assertEqual(str(load_module_copy(src,'tmf3_registry_channel').WEIGHT_FILE),'/etc/hosts')
+            # A staged copy has no registry: the same selector is refused, and the built-in 8B selector takes the built-in pins.
+            (src/s.REGISTRY_NAME).unlink()
+            with self.assertRaisesRegex(Exception,'unknown MiroFish model profile'):load_module_copy(src,'tmf3_registry_closed')
+            (src/s.MODEL_SELECTOR).write_bytes(s.selector_bytes('qwen3-8b'));module=load_module_copy(src,'tmf3_selector_8b')
+            self.assertEqual((module.ACTIVE_MODEL_PROFILE,module.TOKENIZER_ROOT,module.WEIGHT_SHA256),('qwen3-8b',s.BASE/'models/Qwen3-8B-tokenizer','a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f'))
+            # And the helper it generates is the reviewed helper with exactly the checkpoint selection, size and hash changed.
+            reviewed=(s.W16/s.SDK_HELPER_REL).read_text();big=s.model_choice('qwen3.8-27b',self.base);small=s.model_choice('qwen3-8b',self.base)
+            self.assertEqual(s.model_helper_text(reviewed,small,big),module.SDK_SCRIPT);self.assertEqual(s.model_helper_text(reviewed,big,big),reviewed)
+            self.assertEqual(s.model_helper_text(s.sdk_port_helper(reviewed,59671),small,big).count('ws://127.0.0.1:59671'),1)
+            with self.assertRaisesRegex(RuntimeError,'helper checkpoint text'):s.model_helper_text(reviewed+reviewed,small,big)
+    def test_addendum1_observer_policy_names_only_the_chosen_checkpoint(self):
+        policy=(s.W16/'builder/observer.sb').read_text();big=s.model_choice('qwen3.8-27b',self.base);small=s.model_choice('qwen3-8b',self.base)
+        self.assertEqual(s.model_policy(policy,big,big),policy);moved=s.model_policy(policy,small,big)
+        self.assertNotIn('Qwen3.8-27B',moved);self.assertIn('(subpath "'+str(s.BASE/'models/Qwen3-8B-tokenizer')+'")',moved);self.assertIn('(literal "'+str(small['entry']['weight_file'])+'")',moved)
+        self.assertEqual(len(moved.splitlines()),len(policy.splitlines()));self.assertEqual(sum(a!=b for a,b in zip(moved.splitlines(),policy.splitlines())),2)
+        with self.assertRaisesRegex(RuntimeError,'checkpoint rule missing or ambiguous'):s.model_policy(moved,small,big)
+    def test_addendum1_every_run_delta_is_reproved_against_the_src_revision(self):
+        w16=(s.W16/sorted(s.RUN_COPIES)[0]).read_bytes();src=(s.SRC/'mirofish_native_run.py').read_bytes()
+        import difflib
+        src_lines={l for l in difflib.ndiff(w16.decode().splitlines(),src.decode().splitlines()) if l[:2] in ('- ','+ ')}
+        for name in s.SWARM:
+            for model,threshold in (('qwen3.8-27b',65),('qwen3-8b',47)):
+                n=s.swarm_numbers(name,model);changed=s.swarm_run_bytes(src,name,model,s.RUN_SRC_SHA,threshold).decode()
+                self.assertEqual(changed.count(f'({threshold} if pre else 30)'),1);self.assertEqual(changed.count('if pre else 30)'),1)
+                for text in [f'time.monotonic() + {n["worker_deadline_s"]}',f'deadline=start+{n["wall"]};active=deadline-120',f"receipt['wall_seconds']<={n['wall']}",f'research_only=False,max_age_seconds={n["wall"]})',f'"max_rounds": {n["rounds"]},',
+                             f'<= {n["agents_bound"]}, "actual generated participant count outside bound"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',f'require(len(self.buffer) <= {n["worker_event_bytes"]}, "worker event byte limit")','40*1024**3']:self.assertIn(text,changed,(name,model))
+                if model=='qwen3.8-27b':                                                   # the same deltas as on W16: only the src revision's own lines differ
+                    old=s.swarm_run_bytes(w16,name).decode();self.assertEqual({l for l in difflib.ndiff(old.splitlines(),changed.splitlines()) if l[:2] in ('- ','+ ')},src_lines)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src+b'\n',name,'qwen3-8b',s.RUN_SRC_SHA,47)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src,name,'qwen3-8b',s.RUN_ORIGINAL_SHA,47)   # src bytes are not the W16 original
+        moved=s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671,s.MODEL_SRC_SHA);self.assertIn(b'SDK_PORT = 59671',moved);self.assertNotIn(b'SDK_PORT = 62298',moved)
+        with self.assertRaisesRegex(RuntimeError,'original source drift'):s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671)   # against the W16 pin
+    def test_outcome5_start_threshold_per_model_and_the_unchanged_fragment_is_a_presence_check(self):
+        self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],47);self.assertEqual(s.model_choice('qwen3.8-27b',self.base)['start_threshold'],65)
+        raw=b"x = (65 if pre else 30)\nwall = 3600\n";digest=hashlib.sha256(raw).hexdigest()
+        self.assertEqual(s.closed_integer_delta(raw,digest,s.closed([('(65 if pre else 30)','(65 if pre else 30)',1,1),('wall = 3600','wall = 3600',1,1)])),raw)
+        with self.assertRaisesRegex(RuntimeError,'fragment missing'):s.closed_integer_delta(raw,digest,s.closed([('(66 if pre else 30)','(66 if pre else 30)',1,1)]))   # still must be present
+        with self.assertRaisesRegex(RuntimeError,'fragment missing'):s.closed_integer_delta(raw,digest,[('wall = 3600','wall = 3600',1,1)])                        # an unchanged edit claiming a change
+        n=s.swarm_numbers('swarm8','qwen3-8b');self.assertEqual(n['wall'],3600)                              # a one-hour wall: the freshness cap stays as reviewed
+        self.assertIn(b'<= self.max_age_seconds <= 3600:',s.swarm_producer_bytes('owned-source/paper_app/src/mirofish_provenance.py',(s.W16/'owned-source/paper_app/src/mirofish_provenance.py').read_bytes(),'swarm8','qwen3-8b'))
+    def test_limits_per_model_only_the_wall_and_expected_durations_follow_the_model(self):
+        for name in s.SWARM:
+            big,small=s.swarm_numbers(name,'qwen3.8-27b'),s.swarm_numbers(name,'qwen3-8b');self.assertEqual(big,s.swarm_numbers(name)|{})
+            for key in ['agent_slot_s','caller_slot_s','gateway_arrival_s','gateway_queue_s','agent_client_s','caller_client_s','embedding_client_s','request_bytes','worker_event_bytes','chats','output','window_need','memory_budget','agents_bound']:self.assertEqual(big[key],small[key],(name,key))
+            self.assertLess(small['wall'],big['wall']);self.assertLess(small['expected_total_s'],big['expected_total_s'])
+        self.assertEqual((s.swarm_numbers('swarm8','qwen3-8b')['wall'],s.swarm_numbers('swarm48','qwen3-8b')['wall']),(3600,18000))
+        gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm8','qwen3-8b').decode();self.assertIn('"wall_seconds": 3600,',gateway);self.assertIn('client_seconds: int = 540',gateway)
+    def test_outcome7_staged_q8_folder_is_the_8b_candidate_unlaunched(self):
+        work=Q8_WORK
+        if not (work/'builder/candidate-manifest.json').exists():self.skipTest('the proof folder is staged after the tests')
+        manifest=json.loads((work/'builder/candidate-manifest.json').read_text());pins={row['path']:row['sha256'] for row in manifest['files']};small=s.model_choice('qwen3-8b',self.base)
+        self.assertFalse(manifest['launch_authorized']);self.assertFalse((work/'root-one-native-attempt.json').exists());self.assertFalse((work/'builder/startup-preflight.json').exists());self.assertFalse((work/'run1').exists())
+        for relative in s.SELECTOR_COPIES:self.assertEqual((work/relative).read_bytes(),b'{"profile": "qwen3-8b"}\n');self.assertEqual(pins[str(work/relative)],s.sha(work/relative))
+        self.assertFalse(list(work.rglob(s.REGISTRY_NAME)))
+        port=manifest['sdk_port_revision']['staged'];src_model=(s.SRC/'mirofish_native_model.py').read_bytes();expected=src_model if port==s.ORIGINAL_SDK_PORT else s.sdk_port_bytes(src_model,port,s.MODEL_SRC_SHA)
+        for relative in s.MODEL_COPIES:self.assertEqual((work/relative).read_bytes(),expected)
+        run=s.swarm_run_bytes((s.SRC/'mirofish_native_run.py').read_bytes(),'swarm8','qwen3-8b',s.RUN_SRC_SHA,47)
+        for relative in s.RUN_COPIES:self.assertEqual((work/relative).read_bytes(),run);self.assertIn(b'(47 if pre else 30)',run)
+        self.assertEqual([dict(r) for r in manifest['model_files']],[dict(r,bytes=Path(r['path']).stat().st_size) for r in small['model_files']]);self.assertEqual(manifest['model_tokenizer'],small['model_tokenizer'])
+        p=manifest['model_profile'];self.assertEqual(p['name'],'qwen3-8b');self.assertEqual(p['start_threshold']['percent_free'],47);self.assertIn('decided by the lead',p['start_threshold']['why']);self.assertIn('ab08400',p['source_files']);self.assertIn('V134',p['source_files'])
+        self.assertIn('known to be wrong',p['provenance']['known_wrong']);self.assertEqual(p['provenance']['correct_source']['gguf_sha256'],'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f')
+        self.assertIn('NOT been shown',manifest['metadata_reuse_impact']['scope']);self.assertNotIn('same roles, tools, schemas, LLMClient, SDK/model/tokenizer',manifest['metadata_reuse_impact']['scope']);self.assertTrue(manifest['derived_from']['removed_metadata_prerequisite'].startswith('NOT_SHOWN_FOR_QWEN3-8B'))
+        self.assertEqual(manifest['swarm_profile']['wall'],3600);self.assertEqual(manifest['swarm_profile']['model'],'qwen3-8b')
+        policy=(work/'builder/observer.sb').read_text();self.assertNotIn('Qwen3.8-27B',policy);self.assertIn(str(s.BASE/'models/Qwen3-8B-tokenizer'),policy)
+        module=s.staged_helper_matches_model(work,port,'qwen3-8b');self.assertEqual(module.WEIGHT_FILE,small['entry']['weight_file'])
+        s.assert_staged(work,manifest)
 if __name__=='__main__':unittest.main()
 
 
