@@ -285,3 +285,15 @@ for the small run and then, only if that completes, the 48-agent run, under the 
 is to be running again no later than 4 hours 35 minutes after this second stop, whatever the runs do. Its exact times
 are added below afterwards. Between the two stops, at 06:55 UTC, the store shows two overruns while another program
 on this Mac held 16 to 19 GB of memory; they are lost slots like any other.
+
+## The second stop's times, and a third stop for the 48-agent run (written at 08:41 UTC on 15 November, 00:41 PST, before the third stop; no answer has been scored)
+
+The second stop lasted 15 minutes 29 seconds: the collector was stopped at 08:23:29 UTC and started again at 08:38:58
+UTC on 15 November, its first new heartbeat at 08:39:16; both are in the store. The small run made every one of its
+model calls and cleaned up after itself; its last step refused its report as too close to neutral to count, which is
+an outcome of its invented scenario and not a fault of the run, so the collector was started again at once. The
+owner's instruction for the 48-agent run tonight stands, and the small run has shown what it was there to show, so
+a third stop follows now for that run alone: one attempt, its own limit four hours. The collector is to be running
+again no later than 4 hours 15 minutes after this third stop, whatever the run does; with the two earlier stops that
+is 4 hours 31 minutes of 15 November at the most, 18.8% of the day's slots, and the day's own count decides whether it
+counts. The exact times are added below afterwards.
