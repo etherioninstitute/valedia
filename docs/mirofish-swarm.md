@@ -1,4 +1,4 @@
-# MiroFish: the guard decision and the swarm profiles (2026-11-11, revised 2026-11-15)
+# MiroFish: the guard decision and the swarm profiles (2026-11-11, revised 2026-11-15, models added 2026-11-15)
 
 ## The staging guard
 
@@ -18,7 +18,7 @@ the commits, and the tool pins that list by its own hash.
 |---|---|---|---|---|---|
 | `report64_coverage` | at most 4 (2 act per platform) | 1 | 64 | 40 min | The profile that completed on 2026-11-08 |
 | `swarm8` | 8 named, up to 12 | 3, every agent each round | 192 | 2 hours | The proving run: whole-unit memory at a deliberately tight 4,096 tokens |
-| `swarm48` | 48 named (52 agents configured in the last attempt), up to 64 | 3, every agent each round | 672 | 15.5 hours | A real swarm. **PROVISIONAL: not to be launched before the `swarm8` run's memory readings have been read** |
+| `swarm48` | 48 named (52 agents configured in the last attempt), up to 64 | 3, every agent each round | 672 | 16 hours | A real swarm. **PROVISIONAL: not to be launched before the `swarm8` run's memory readings have been read** |
 
 The swarm profiles change closed numbers (gateway budgets and time limits, deadlines, the participant bound, the round count),
 three selector expressions, the concurrency integers, the agent memory (below) and the scenario with its seal. Every number
@@ -32,13 +32,13 @@ The run shows the pipeline at scale. It is not a forecast and says nothing about
 
 ## What a run needs from the machine
 
-- **The local model server to itself.** The run loads its own pinned 27B and stops if any other language model is
+- **The local model server to itself.** The run loads its own pinned checkpoint (the 27B unless staged with `--model`) and stops if any other language model is
   loaded or gets loaded while it runs. No local Hermes bot (Scout, Valedia, CTO, local delegation workers) may be used
   until it ends. Cloud bots (Decider, Auditor, the default profile) are fine.
 - The embedding model `google/embedding-gemma-300m` loaded under the name `ym-research-embedding`, context 2048.
 - Memory headroom throughout; the run samples memory every 0.4 s and stops itself if the machine gets tight.
 - About 15 minutes for `report64_coverage`. For the swarms see "Duration by phase" below: about 75 minutes for `swarm8`
-  (2-hour wall clock) and about 5 hours for `swarm48` (15.5-hour wall clock).
+  (2-hour wall clock) and about 5 hours for `swarm48` (16-hour wall clock) on the 27B. On the 8B see "Staging on a chosen model".
 
 ## What the 2026-11-11 runs showed
 
@@ -112,12 +112,14 @@ Reproduction, offline (`tools/mirofish_memory_reproduction.py`, the stopped run'
 ## Where each number comes from
 
 Measured constants (stopped run `valedia-native-20261114-swarm48-b` unless noted): the model reads 188 prompt tokens a second
-and writes 23.6 (fit over 288 calls), plus at most 27 s; a real prompt is 1.131 agent-library tokens per token (1.25 assumed);
+and writes 23.6 (fit over 288 calls), plus at most 27 s; a real prompt is 1.131 agent-library tokens per token (1.30 assumed
+since 2026-11-15: one platform of the 8B proving run's requests measured 1.241 on the 27B's tokenizer, which left the earlier
+1.25 no margin);
 tools and template add 1,750 tokens; a request is at most 5.28 bytes per token; window 32,768.
 
 | Limit | Old | New | Rule |
 |---|---|---|---|
-| Agent memory budget | 2,048 | 4,096 (`swarm8`), 12,288 (`swarm48`) | 1.25 B + 1,750 + 1,024 <= 32,768 (largest allowed 23,995). Still holds now that the budget counts tool-call arguments: the measured 1.131 was taken when they went uncounted, so the true ratio is lower |
+| Agent memory budget | 2,048 | 4,096 (`swarm8`), 12,288 (`swarm48`) | 1.30 B + 1,750 + 1,024 <= 32,768 (largest allowed 23,072; `swarm8` needs 8,099, `swarm48` 18,749). Still holds now that the budget counts tool-call arguments: the measured 1.131 was taken when they went uncounted, so the true ratio is lower |
 | Worst single call | | agent 239 s, caller 353 s | (32,768 - reply cap) / 188 + reply cap / 23.6 + 27 |
 | Gateway arrival-to-done | 175 s | 540 s | two agent calls in flight (one per platform), each worst + 10%, rounded up to 30 s |
 | Gateway queue | 170 s | 270 s | one agent call ahead, worst + 10%, rounded up to 30 s |
@@ -129,9 +131,9 @@ tools and template add 1,750 tokens; a request is at most 5.28 bytes per token; 
 | Model calls allowed | 640 | 192 / 672 | the larger of expected calls + 50% and every call the participant bound admits, rounded up to a multiple of 32 |
 | Output total | 1,700,000 | 800,000 / 2,800,000 | every admitted call can reserve its reply cap |
 | Participant bound | 4 | 12 / 64 | covers the named actors x 52/48 (9 / 52); `swarm8`'s 12 keeps its ceiling inside 2 hours |
-| Wall clock | 14,400 s | 7,200 s / 55,800 s | ceiling at the participant bound + 20%, rounded up to a half hour |
-| Worker deadline | | 7,080 s / 55,680 s | wall clock - 120 s cleanup |
-| Resource history | 36,001 records, 64 MiB | 18,001, 32 MiB / 139,501, 256 MiB | one record per 0.4 s for the wall clock, 1,219 bytes each |
+| Wall clock | 14,400 s | 7,200 s / 57,600 s (27B; 55,800 s at the old 1.25) | ceiling at the participant bound + 20%, rounded up to a half hour |
+| Worker deadline | | 7,080 s / 57,480 s | wall clock - 120 s cleanup |
+| Resource history | 36,001 records, 64 MiB | 18,001, 32 MiB / 144,001, 256 MiB | one record per 0.4 s for the wall clock, 1,219 bytes each |
 
 **The worker event line.** The worker reports each stage to the observer as one JSON line on a pipe, and the observer refuses
 a line longer than its buffer limit (`mirofish_native_run.py:261`, 131,072 in the reviewed code). The `wait` event carries the
@@ -152,7 +154,7 @@ largest admitted size, 31,744 tokens (`tools/mirofish_admission_timing.py`); its
 
 ## Duration by phase
 
-Expected figures use the named actors times the measured growth (the graph built 52 agents from 48 names: 9 for `swarm8`,
+These are the 27B's figures; the 8B's are under "Staging on a chosen model". Expected figures use the named actors times the measured growth (the graph built 52 agents from 48 names: 9 for `swarm8`,
 52 for `swarm48`), the measured speeds and the median persona and feed. The ceiling takes the participant bound (12 and 64)
 with every agent call at full memory, so the wall holds for anything the bound admits. The report phase has been measured
 only in the 4-agent run (393 s) and is assumed to take three times that.
@@ -163,15 +165,15 @@ only in the 4-agent run (393 s) and is assumed to take three times that.
 | Simulation, rounds 1 / 2 / 3 | 10 / 12 / 12 min | 55 / 74 / 93 min |
 | Report (assumed) | 20 min | 20 min |
 | Expected total | about 74 min (4,418 s) | about 5.0 h (18,166 s) |
-| Ceiling, at the participant bound | 98 min (5,880 s) | 12.6 h (45,197 s) |
-| Wall clock (the run stops itself here) | 2 h | 15.5 h |
+| Ceiling, at the participant bound | 99 min (5,964 s) | 12.9 h (46,527 s) |
+| Wall clock (the run stops itself here) | 2 h | 16 h |
 
 If the graph builds more participants than the bound (more than 12 for `swarm8`), the run stops at its own participant check
 in its first minutes, before the simulation, and cleans up.
 
 ## What must be switched off, and for how long
 
-For the whole wall clock (up to 2 hours for `swarm8`, up to 15.5 hours for `swarm48`):
+For the whole wall clock (on the 27B up to 2 hours for `swarm8`, up to 16 hours for `swarm48`; on the 8B see below):
 
 - every other language model on the local model server: the run stops if another one is loaded;
 - the local Hermes bots (Scout, Valedia, CTO, local delegation workers) and anything else that uses the local model server,
@@ -200,6 +202,78 @@ How to read `Owned memory refused the context`:
 - The library's own `Token calculation failed before chunking` warnings come with these refusals and are expected. They are
   not the count to read; count the owned-memory line instead.
 
+## Staging on a chosen model (2026-11-15)
+
+```bash
+cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp nice -n 15 $PY -B mirofish_native_stage.py --stage --profile swarm8 --model qwen3-8b --work <new folder under the crew directory>
+```
+
+- `--model` takes exactly one of the two built-in profiles of `src/mirofish_native_model.py`: `qwen3.8-27b` or `qwen3-8b`.
+  Anything else is refused in one line, starting `refused:`: an unknown name, a profile that exists only in
+  `src/mirofish_model_registry.json` (registered profiles can name their own paths and pins, so none is staged), and
+  `qwen3.8-27b-mlx`, which is registered for HTTP backends only. `--model` works with the swarm profiles only.
+- Without `--model`, staging is unchanged: the reviewed W16 bytes, no selector, the 27B.
+- With `--model`, including `--model qwen3.8-27b` named explicitly, the copies of `mirofish_native_model.py` (two) and
+  `mirofish_native_run.py` (three) are the `src/` revisions of commits `ab08400` and `b5a1797`, reviewed on 2026-11-15
+  (V134), each pinned in the stage tool by its SHA-256. A changed byte in `src/` refuses staging until the pin is moved.
+  Every closed number of the run script, the SDK port and the SSD device number is applied to those revisions with the
+  same exact-fragment proof.
+- The selector `mirofish_model_profile.json`, `{"profile": "<name>"}` and a newline, is written by the tool beside each
+  model copy (`builder/review-source/`, `owned-source/observer-entry/`; the worker entry has no model copy) and pinned in
+  the manifest. No `mirofish_model_registry.json` is in any staged copy, so the staged module knows only its two built-ins.
+- The checkpoint pins (`model_files`, `model_tokenizer`) are derived from the chosen profile in the pinned module text: its
+  five tokenizer files and its GGUF. Staging checks every one against its pin, the GGUF by size and SHA-256 (hashed once).
+- The SDK helper and the observer sandbox policy are the reviewed ones with only the checkpoint changed (selection, weight
+  size and hash; tokenizer folder and GGUF path), and staging requires that the staged `src/` code generates exactly them.
+- The free-memory start rule follows the checkpoint: 30 + ceil(100 x (weight bytes + 6 GiB) / 64 GiB), which is 47% for
+  the 8B. The 27B keeps its reviewed 65%. The 30% stop floor and the 40 GiB resident-memory bound do not change.
+- For the 8B the manifest says plainly that format conformance with LM Studio's own rendering has not been shown (the
+  metadata receipt is the 27B's), and that the run script writes the 27B's revision identifiers into
+  `model-source-manifest.json` for any profile, so that provenance field is wrong for the 8B. The correct sources are the
+  tokenizer folder's `SOURCE.txt` (Qwen/Qwen3-8B, fetched 2026-11-10) and the GGUF's path, size and hash.
+
+Limits (call slots, gateway limits, client timeouts, request and event bytes, model calls, output) stay the 27B's for every
+model: a limit is an upper bound, and a faster model only finishes sooner. The memory window inequality also stays the
+27B's: for the same 44 request bodies the 8B counted 0.92 to 0.95 of the 27B's tokens. Expected durations and the wall
+clock use the chosen model's speeds. For the 8B these are an ESTIMATE until a run: its plain-server speeds (1,208 prompt
+tokens read and 46.3 written a second over 44 agent turns of 2026-11-15) times 188/260, what the pipeline cost the 27B
+against its plain server (873 read, 33.5 written). The 27B-measured setup and report phases are scaled by the ratio of
+written tokens a second (0.705).
+
+| | `swarm8` 27B | `swarm8` 8B (estimate) | `swarm48` 27B | `swarm48` 8B (estimate) |
+|---|---|---|---|---|
+| Start, graph, personas, settings | 18 min | 13 min | 59 min | 42 min |
+| Simulation, rounds 1 / 2 / 3 | 10 / 12 / 12 min | 3 / 4 / 4 min | 55 / 74 / 93 min | 18 / 22 / 26 min |
+| Report (assumed) | 20 min | 14 min | 20 min | 14 min |
+| Expected total | 74 min (4,418 s) | 39 min (2,346 s) | 5.0 h (18,166 s) | 2.0 h (7,365 s) |
+| Ceiling, at the participant bound | 99 min (5,964 s) | 47 min (2,825 s) | 12.9 h (46,527 s) | 3.9 h (14,048 s) |
+| Wall clock | 2 h (7,200 s) | 1 h (3,600 s) | 16 h (57,600 s) | 5 h (18,000 s) |
+| Free memory needed to start | 65% | 47% | 65% | 47% |
+
+**What must be off for a run on the 8B, for its whole wall clock:** the hourly pick reader (it uses LM Studio); every other
+language model on LM Studio; the local Hermes helpers, idle (Scout, Valedia, CTO, local delegation workers) and anything else
+that uses the local model server. The order-book collector may stay ON if free memory is above the start threshold (47%)
+when the run starts; the run still stops itself under 30% free.
+
+**No run on the 8B has been made yet.** Its personas, its agents' turns and its report are unjudged. The first run is a
+pipeline proof; whether the 8B's output is any good is a separate question for after it.
+
+**What the first run on the 8B will show first.** The template admission renders every agent call with the tokenizer
+folder's `chat_template.jinja` and requires LM Studio's own formatted prompt to be one of its candidates. Two things are
+settled at the first calls, and a refusal there is the pipeline working (fail closed, cleanup, model unloaded), not a fault:
+
+- Tool-call arguments. The 8B's template writes a tool call's arguments as given when they are a string and as `tojson`
+  when they are an object; the 27B's iterates them as a mapping. The admission renders only the parsed-object view, with
+  Python's `json.dumps`. Whether that is LM Studio's rendering shows at the first agent turn whose history carries a tool
+  call (round 1, after the first action). If not, the call is refused with
+  `actual SDK template differs from all frozen no-thinking/thinking branches`.
+- The GGUF's built-in template, which LM Studio uses, differs from the tokenizer folder's `chat_template.jinja` in five
+  places. Plain string contents render the same; an assistant turn whose content is null errors under the GGUF's template.
+  Look for `fixed SDK operation refused: chat_context` followed by the template error, or the same
+  `actual SDK template differs ...` line, at the first call that carries such a turn.
+
+Either refusal ends the attempt as designed. Read the call's `request.json` under `run1/calls/` to see which turn caused it.
+
 ## Stage, gate, launch
 
 Each staged folder can be launched once. A gate is a small file naming the staged candidate's hash and an expiry at most
@@ -215,7 +289,11 @@ $PY -B mirofish_native_startup.py --work <work> --gate <work>/root-one-native-at
 Staged on 2026-11-15 as proof of the repaired tool, not launched, no gate written: `valedia-native-20261115-swarm8-b`
 (candidate `f1ec87023ece47b0f2d31952d97f0b392402ce7e04f799a5ac7370c81a5802f1`) and `valedia-native-20261115-swarm48-b`
 (candidate `01313bba42916d809a90ae9aa5ef3bb5f34c72f45469fecae02e6366fadd4d45`, PROVISIONAL). The `-a` folders were staged by
-the tool before these repairs; leave them unlaunched. The folder that is actually launched is staged from `main` after the
+the tool before these repairs; leave them unlaunched. `swarm48-b` was staged at the old ratio 1.25 (wall 55,800 s); stage
+`swarm48` again before any launch.
+
+Staged on 2026-11-15 as proof of model staging, not launched, no gate, no preflight: `valedia-native-20261115-swarm8-q8-a`
+(`swarm8` on `qwen3-8b`, candidate `82025f4a0e13e88c393e16052cdf000fdc2e10719a8f2bb96bbc283a4388d011`, SDK port 54311). The folder that is actually launched is staged from `main` after the
 merge, so that its manifest names the repository's own files. A staged folder carries the model server's port as of staging;
 stage again if the server app restarts.
 
