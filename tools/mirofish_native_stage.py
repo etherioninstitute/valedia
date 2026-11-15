@@ -82,7 +82,11 @@ SRC=BASE/'valedia-trader/src'
 MODEL_SRC_SHA='ea0676a6409a0915cd564bc954790937d8c9fbcb8be2a35d51c77ebda730d103'
 RUN_SRC_SHA='21c4418452a7c19c16ab7164f3c24f60feac097e46bb70219c896c7029be06eb'
 SRC_REVISION_NOTE=('These two files (mirofish_native_model.py, mirofish_native_run.py) are the src/ revisions of commits ab08400 and '
-    'b5a1797, reviewed on 2026-11-15 (V134), not the W16 bytes. Every other file is staged as without a model.')
+    'b5a1797, not the W16 bytes. They were reviewed on 2026-11-15 (V134) and found unsafe for registered profiles: a '
+    'registered profile can set the observer\'s readable directory and its own weight pin, and its hash text reaches the helper '
+    'script unescaped. They were accepted for the two built-in profiles only, under conditions C1 to C3, which this folder '
+    'applies: built-in names only, no registry in any staged copy, weight pin and tokenizer hashes checked at staging, no '
+    'borrowed conformance evidence. Every other file is staged as without a model.')
 MODEL_SELECTOR='mirofish_model_profile.json'
 SELECTOR_COPIES={'builder/review-source/'+MODEL_SELECTOR,'owned-source/observer-entry/'+MODEL_SELECTOR}  # beside each staged model copy
 MODEL_REGISTRY=SRC/'mirofish_model_registry.json'  # read only to name a registry-only profile in its refusal; never staged
