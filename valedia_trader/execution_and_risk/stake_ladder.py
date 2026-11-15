@@ -24,8 +24,8 @@ import math
 import re
 import statistics
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
-from datetime import date, timedelta
+from decimal import ROUND_HALF_UP, Decimal, localcontext
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -164,19 +164,23 @@ def _strict_day(value: Any) -> date | None:
 SESSION_KINDS = ("clean", "fault", "skipped")
 EVENT_KINDS = ("pause", "reset")
 _FAULT_WORDS = re.compile(r"(reconcile|cap|drift|attention:[a-z0-9_-]{1,40})")
-_AFTER_ANY_TIME = "￿"           # sorts after every timestamp: a pause of unknown time ends its day
 
 
 @dataclass(frozen=True)
 class SessionFact:
     """One session day of the live venue (`kind` clean, fault or skipped), or one drawdown pause or owner's reset
     (`kind` pause or reset), with its reasons in words. `ceiling` (A4): the smallest usable ceiling among the day's
-    summaries (the owner's max_capital in force when each run read his file), or None; always None for an event."""
+    summaries (the owner's max_capital in force when each run read his file), or None; always None for an event.
+    `at` (T34b-1 R1): for a pause or a reset its usable time, else None; None on every session fact. `fault_times`
+    (T34b-1 addendum 1, A2): for a fault session one entry per faulty summary of the day, its usable time or None
+    (instants ascending, None last); empty on every other fact. A usable time is an aware datetime (`_instant`)."""
     day: date
     kind: str
     reasons: tuple[str, ...]
     day_stop: bool = False
     ceiling: float | None = None
+    at: datetime | None = None
+    fault_times: tuple[datetime | None, ...] = ()
 
 
 class SessionFacts(list):
@@ -213,6 +217,29 @@ def _judge_summary(e: dict) -> tuple[bool, list[str], list[str]]:
     return done, faulty, notes
 
 
+def _aware(x: Any) -> bool:
+    """A datetime (exactly) that carries a UTC offset."""
+    if type(x) is not datetime:
+        return False
+    try:
+        return x.utcoffset() is not None
+    except Exception:
+        return False
+
+
+def _instant(ts: Any) -> datetime | None:
+    """A journal entry's `timestamp` as an instant (T34b-1 R1): a `str` that `datetime.fromisoformat` reads as a
+    datetime WITH a UTC offset (as `Journal.record` stamps every record); anything else is an unknown time (None).
+    Instants are compared as instants (aware datetimes), never as text."""
+    if type(ts) is not str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return dt if _aware(dt) else None
+
+
 def _is_session(cal, d: date) -> bool | None:
     try:
         return bool(cal.is_session(d.isoformat()))
@@ -231,20 +258,24 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
     boolean, never text), finite and above 0; None when no summary of the day has a usable one. An unusable ceiling
     makes no entry unreadable: it is simply not a ceiling, and a day without one can never raise the stake.
     Entries of type `drawdown_pause` and `latch_reset` (with a `who` that is a name) for `venue` are their own facts
-    (kind pause and reset), after the session of their day, in the order of their `timestamp`. A pause or a reset is
+    (kind pause and reset), after the session of their day, in the order of their `timestamp` read as an instant
+    (`_instant`; T34b-1 R1), a reset before a pause at the same instant; a reset of unknown time comes before every
+    other event of its day and a pause of unknown time after every other. `at` and `fault_times` are described on
+    SessionFact: a fault session carries one time per faulty summary (addendum 1, A2). A pause or a reset is
     an event, not a session (addendum 1, A2): it counts on any calendar day it carries (a weekend, a holiday, a day
     outside the calendar's window; the calendar is not asked) and so takes effect before the next session after it.
 
     An entry that is not a mapping, or is one of the three kinds for `venue` but lacks a usable day (strictly
     YYYY-MM-DD, `_strict_day`), a summary whose day is not a session (or that the calendar cannot answer for), and a
     reset without a name are skipped and counted in `unreadable`; none raises or counts as clean. A pause or a reset
-    whose `venue` is missing or not a name (addendum 3, F5) is counted too: the pause still applies to `venue` (the
-    careful side), the reset lifts nothing. A faults key holding anything but a list, null included, is a fault (F4).
-    Entries of other venues and types are not ours: ignored.
+    whose `venue` is missing or not a name (addendum 3, F5; a string that is empty after stripping whitespace is no
+    name, T34b-1 R4) is counted too: the pause still applies to `venue` (the careful side), the reset lifts nothing.
+    A faults key holding anything but a list, null included, is a fault (F4). Entries of other venues and types are
+    not ours: ignored.
 
     Readings (the careful side): a stop at a stage in neither D3 list, a status other than done or stopped, and a
-    `faults` field that is not a list are faults. Within a day, a reset and a pause at the same time, or one without a
-    usable timestamp, are put so that the day ends paused (a reset first, a pause last). D4's "between the pause and
+    `faults` field that is not a list are faults. Within a day, a reset and a pause at the same instant, or one without
+    a usable time, are put so that the day ends paused (a reset first, a pause last). D4's "between the pause and
     the reset no session counts" is applied in `position`."""
     cal = _go_live._calendar(calendar)
     days: dict[date, list[dict]] = {}
@@ -260,7 +291,7 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
             if e.get("venue") != venue or e.get("event") != "summary":
                 continue
         elif kind in ("drawdown_pause", "latch_reset"):
-            named = type(e.get("venue")) is str and e["venue"] != ""
+            named = type(e.get("venue")) is str and e["venue"].strip() != ""
             if named and e["venue"] != venue:
                 continue
         else:
@@ -281,19 +312,18 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
                 continue
             days.setdefault(d, []).append(e)
             continue
-        ts = e.get("timestamp")
-        ts = ts if type(ts) is str and ts else None
+        ts = _instant(e.get("timestamp"))
         if kind == "drawdown_pause":
             fact = SessionFact(d, "pause", ("the 25% drawdown pause began: no clean session counts until the owner's "
-                                            "reset",))
-            key = (ts if ts is not None else _AFTER_ANY_TIME, 1)
+                                            "reset",), at=ts)
+            key = (2, 0) if ts is None else (1, ts, 1)          # unknown: after every other event of its day
         else:
             who = e.get("who")
             if not _webull._owner_text(who):
                 unreadable += 1
                 continue
-            fact = SessionFact(d, "reset", (f"the owner's reset of the drawdown pause, by {who}",))
-            key = (ts if ts is not None else "", 0)
+            fact = SessionFact(d, "reset", (f"the owner's reset of the drawdown pause, by {who}",), at=ts)
+            key = (0, 0) if ts is None else (1, ts, 0)          # unknown: before every other; first at one instant
         events.setdefault(d, []).append((key + fact.reasons, fact))
     out = []
     for d in sorted(set(days) | set(events)):
@@ -302,14 +332,18 @@ def session_facts(entries, venue: str, calendar=None) -> SessionFacts:
             stopped = any("day_stop" in e for e in days[d])
             faulty = {r for _, rs, _ in judged for r in rs}
             notes = {r for _, _, rs in judged for r in rs}
+            times: tuple[datetime | None, ...] = ()
             if faulty:
                 kind, reasons = "fault", faulty
+                runs = [_instant(e.get("timestamp")) for e, (_, rs, _) in zip(days[d], judged) if rs]
+                times = tuple(sorted(t for t in runs if t is not None)) + tuple(t for t in runs if t is None)
             elif any(done for done, _, _ in judged):
                 kind, reasons = "clean", {"a run ended done"} | notes
             else:
                 kind, reasons = "skipped", notes
             usable = [c for c in (_number(e.get("ceiling")) for e in days[d]) if c is not None and c > 0]
-            out.append(SessionFact(d, kind, tuple(sorted(reasons)), stopped, min(usable) if usable else None))
+            out.append(SessionFact(d, kind, tuple(sorted(reasons)), stopped, min(usable) if usable else None,
+                                   fault_times=times))
         out.extend(fact for _, fact in sorted(events.get(d, []), key=lambda item: item[0]))
     return SessionFacts(out, unreadable)
 
@@ -364,16 +398,18 @@ def fractional_proven(entries, paper_venue: str) -> int:
     same venue with status done). A quantity that is not a finite number (an int or a float, never a boolean) counts
     as nothing. Addendum 3: the batch's summary must be CLEAN by the judgement `session_facts` uses for one summary
     (done, no fault; a `drift` entry alone does not disqualify while DRIFT_ACTS is False) (F3), and the fill and the
-    summary must each carry a usable day, read as `session_facts` reads it (F6)."""
-    mine = [e for e in entries if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == paper_venue
-            and _strict_day(e.get("day")) is not None]
-    done = set()
+    summary must each carry a usable day, read as `session_facts` reads it (F6). T34b-1 R2: a batch counts only when
+    it has at least one summary and EVERY `order_step` summary of that venue carrying that batch is clean and carries
+    a usable day (one faulty, or one whose day cannot be read, and the batch proves nothing)."""
+    mine = [e for e in entries if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == paper_venue]
+    verdict: dict[str, bool] = {}
     for e in mine:
         if e.get("event") == "summary" and type(e.get("batch")) is str:
             finished, faulty, _ = _judge_summary(e)
-            if finished and not faulty:
-                done.add(e["batch"])
-    return sum(1 for e in mine if e.get("event") == "fill" and type(e.get("batch")) is str and e["batch"] in done
+            good = finished and not faulty and _strict_day(e.get("day")) is not None
+            verdict[e["batch"]] = verdict.get(e["batch"], True) and good
+    return sum(1 for e in mine if e.get("event") == "fill" and type(e.get("batch")) is str
+               and verdict.get(e["batch"], False) and _strict_day(e.get("day")) is not None
                and _fractional(e.get("units")))
 
 
@@ -387,20 +423,28 @@ class Position:
     paused: bool                                     # a drawdown pause with no reset yet
     changes: tuple[tuple[date | None, str], ...]
     earned: float                                    # A4: the stake the history earned; `stake` is min(earned, max_capital)
+    ceiling: float                                   # T34b-1 R5: max_capital, the owner's ceiling at this read
 
 
 _PAUSE_WORDS = "the 25% drawdown pause: no clean session counts until the owner's reset (a fault still halves)"
+_ORDER_UNKNOWN_WORDS = "the journal's times do not tell the order of this day's fault and its pause or reset"
+_LOWER_KEPT_WORDS = "the lower stake was kept"
+_TICKET_KEPT_WORDS = "ticket mode was kept"
+_MORE_CAREFUL_WORDS = "the state kept is the end of no single possible order and is more careful than each of them"
 
 
 def _amount(x: float) -> str:
     """An amount in words: cents from 1 up, six significant digits under 1 (0.075 stays 0.075), rounded half up on
-    the number's shortest decimal form (2.675 is 2.68), never half even."""
+    the number's shortest decimal form (2.675 is 2.68), never half even. Total on finite floats (T34b-1 R3): worked
+    with 400 significant digits, more than the 311 the largest float needs written to the cent."""
     d = Decimal(repr(float(x)))
     if d == 0:
         return "0.00"
-    if abs(d) >= 1:
-        return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
-    text = format(d.quantize(Decimal(1).scaleb(d.adjusted() - 5), rounding=ROUND_HALF_UP), "f").rstrip("0")
+    with localcontext() as ctx:
+        ctx.prec = 400
+        if abs(d) >= 1:
+            return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}"
+        text = format(d.quantize(Decimal(1).scaleb(d.adjusted() - 5), rounding=ROUND_HALF_UP), "f").rstrip("0")
     whole, _, cents = text.partition(".")
     return f"{whole}.{cents.ljust(2, '0')}"
 
@@ -409,6 +453,15 @@ def _positive(x: Any, name: str) -> float:
     v = _number(x)
     if v is None or v <= 0:
         raise ValueError(f"{name} must be a finite number above 0 (not true or false, not text)")
+    return v
+
+
+def _bounded(x: Any, name: str) -> float:
+    """`_positive`, and at most `webull.LIVE_MONEY_MAX`, the cap the owner's ladder file already uses for the first
+    stake (T34b-1 R3: an absurd number is a one-line refusal, never a Decimal error further on)."""
+    v = _positive(x, name)
+    if v > _webull.LIVE_MONEY_MAX:
+        raise ValueError(f"{name} is above {_webull.LIVE_MONEY_MAX:,.0f}, the most the owner's ladder file may give")
     return v
 
 
@@ -435,9 +488,27 @@ def position(facts, first_stake: Any, max_capital: Any) -> Position:
     The pause rule is applied here (addendum 3, F1): between a pause and its reset no CLEAN session counts (none on a
     day that starts paused or holds a pause: the pause stands from the start of its day, and a reset applies after
     its day's session), but a FAULT session halves the earned stake and zeroes the count on any day, paused or not.
-    Within one day: the day's ceiling clamp, then the fault's halving, then the day's pauses and resets in order. Stakes are halved and doubled exactly in
-    binary floating point (dividing or multiplying by 2 loses nothing away from underflow), so n halvings and n
-    doublings return exactly to the start.
+    Within one day (T34b-1 R1): (1) the day's ceiling clamp; (2) a clean or skipped session, before the day's pauses
+    and resets; (3) a fault session on a day with no pause or reset halves; (4) on a day with k of them the fault
+    takes its place in real time: after the first p of them (0 <= p <= k), where a place is possible for one faulty
+    run's time when no event before it has a known instant (`at`) later than that time and none after it one earlier
+    (an event at that very instant, or of unknown time, may be on either side; an unknown time allows every place).
+    The fault halves ONCE; its possible places are the union over the day's faulty runs (`fault_times`, addendum 1,
+    A2; none recorded: every place). With several possible places the day is walked once for each from the same start
+    and the end kept is built part by part (A1): the smallest earned stake; ticket mode when any place ends in ticket
+    (then TICKET_SESSIONS needed), else unattended with the largest `needed`; the smallest count; paused when any place
+    ends paused. So it is never above any possible order in stake and never less approved than any. The day's lines
+    are those of the earliest place with the smallest stake, then, when the places did not all end alike, one line
+    in fixed words: the times do not tell the order, the lower stake was kept, ticket mode was kept (when some place
+    ended unattended), and the state kept is the end of no single possible order (when so). Stakes are halved
+    and doubled exactly in binary floating point (dividing or multiplying by 2 loses nothing away from underflow), so
+    n halvings and n doublings return exactly to the start.
+
+    Refusals (ValueError, one line): `first_stake` or `max_capital` not a finite number above 0 or above
+    `webull.LIVE_MONEY_MAX` (T34b-1 R3); a fact that is not a SessionFact, out of day order, with an unusable ceiling,
+    or with an `at` that is neither None nor an aware datetime, or a `fault_times` that is not a tuple of None or aware
+    datetimes, or is not empty on a fact that is not a fault; a day whose pauses and resets with known instants are
+    not in non-decreasing order as given; a day with more than one session fact (session_facts gives one a day).
 
     Readings (the careful side): a reset with no pause before it changes nothing; a second pause before the reset
     changes nothing (one reset, one step down); the step down compares with the owner's `first_stake` as written."""
@@ -450,26 +521,137 @@ def _walk(facts, first_stake: Any, max_capital: Any) -> list[tuple[date, Positio
     return _walk_all(facts, first_stake, max_capital)[1]
 
 
+def _possible(events: list, fault_at: datetime | None, place: int) -> bool:
+    """R1 (4): may a fault run at `fault_at` come after the first `place` of the day's pauses and resets?"""
+    if fault_at is None:
+        return True
+    return (all(f.at is None or f.at <= fault_at for f in events[:place])
+            and all(f.at is None or f.at >= fault_at for f in events[place:]))
+
+
+def _places(events: list, fault_times: tuple) -> list[int]:
+    """Addendum 1, A2: the union over the day's faulty runs of the places each one's time allows; no time recorded
+    allows every place."""
+    every = range(len(events) + 1)
+    if not fault_times:
+        return list(every)
+    return [p for p in every if any(_possible(events, t, p) for t in fault_times)]
+
+
+def _kept(tried: list, day: date) -> tuple[tuple, list]:
+    """Addendum 1, A1: the end of a day kept from the ends of its possible places (in place order), part by part,
+    and the day's lines (those of the earliest place with the smallest stake, then the tie line when they differ)."""
+    ends = [end for _, end, _ in tried]
+    low = min(e[1] for e in ends)
+    ticket = any(e[0] == "ticket" for e in ends)
+    kept = ("ticket" if ticket else "unattended", low, min(e[2] for e in ends),
+            TICKET_SESSIONS if ticket else max(e[3] for e in ends), any(e[4] for e in ends))
+    lines = list(next(ls for _, e, ls in tried if e[1] == low))
+    if len(set(ends)) > 1:
+        words = f"{_ORDER_UNKNOWN_WORDS}: {_LOWER_KEPT_WORDS}"
+        if ticket and any(e[0] != "ticket" for e in ends):
+            words += f"; {_TICKET_KEPT_WORDS}"
+        if kept not in ends:
+            words += f"; {_MORE_CAREFUL_WORDS}"
+        lines.append((day, words))
+    return kept, lines
+
+
+def _one_day(state: tuple, day: date, first: float, session: SessionFact | None, events: list,
+             place: int) -> tuple[tuple, list[tuple[date | None, str]]]:
+    """One day's walk from `state` = (mode, earned stake, clean, needed, paused): the clamp, then a clean or skipped
+    session before the events, or a fault after the first `place` events. Returns the end state and the day's lines."""
+    mode, stake, clean, needed, paused = state
+    lines: list[tuple[date | None, str]] = []
+    counts = not paused and not any(f.kind == "pause" for f in events)
+    if session is not None and session.ceiling is not None and stake > session.ceiling:
+        lines.append((day, f"the owner's ceiling that day ({_amount(session.ceiling)}) lowers the stake from "
+                           f"{_amount(stake)} to {_amount(session.ceiling)}"))
+        stake = session.ceiling
+
+    def event(f: SessionFact) -> None:
+        nonlocal mode, stake, clean, needed, paused
+        if f.kind == "pause":
+            if not paused:
+                paused = True
+                lines.append((day, _PAUSE_WORDS))
+            return
+        if not paused:
+            return
+        paused, clean = False, 0
+        if mode == "unattended" and stake > first:
+            before, stake = stake, max(first, stake / 2)
+            needed = DOUBLING_SESSIONS if stake > first else UNATTENDED_SESSIONS
+            lines.append((day, f"the owner's reset after the pause: one step down, the stake goes from "
+                               f"{_amount(before)} to {_amount(stake)} (half, never below the first stake), "
+                               f"unattended, {needed} clean sessions to the next doubling"))
+        elif mode == "unattended":
+            mode, needed = "ticket", TICKET_SESSIONS
+            lines.append((day, f"the owner's reset after the pause: one step down, back to ticket mode at "
+                               f"{_amount(stake)}"))
+        else:
+            lines.append((day, "the owner's reset after the pause: ticket mode stays, the count restarts"))
+
+    if session is not None and session.kind == "fault":     # addendum 3, F1: on any day, paused or not
+        for f in events[:place]:
+            event(f)
+        before, stake, clean = stake, stake / 2, 0
+        lines.append((day, f"a fault session ({session.reasons[0] if session.reasons else 'a fault'}): the stake "
+                           f"halves from {_amount(before)} to {_amount(stake)} and the count restarts"))
+        for f in events[place:]:
+            event(f)
+        return (mode, stake, clean, needed, paused), lines
+    if session is not None and session.kind == "clean" and counts:
+        clean += 1
+        if clean >= needed:
+            clean = 0
+            if mode == "ticket":
+                mode, needed = "unattended", UNATTENDED_SESSIONS
+                lines.append((day, f"{TICKET_SESSIONS} clean sessions: unattended at the same stake {_amount(stake)}"))
+            elif session.ceiling is None:
+                done, needed = needed, DOUBLING_SESSIONS
+                lines.append((day, f"{done} clean sessions, but no ceiling was recorded that day, so the stake "
+                                   f"stays at {_amount(stake)} (no rise without the owner's ceiling); the count "
+                                   "restarts"))
+            else:
+                done, before = needed, stake
+                stake, needed = min(2 * stake, session.ceiling), DOUBLING_SESSIONS
+                words = (f"the stake doubles from {_amount(before)} to {_amount(stake)}" if stake == 2 * before else
+                         f"the stake rises from {_amount(before)} to that day's ceiling {_amount(stake)}"
+                         if stake > before else f"the stake stays at that day's ceiling {_amount(stake)}")
+                lines.append((day, f"{done} clean sessions: {words}"))
+    for f in events:
+        event(f)
+    return (mode, stake, clean, needed, paused), lines
+
+
 def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list[tuple[date, Position]]]:
-    first = _positive(first_stake, "first_stake")
-    cap = _positive(max_capital, "max_capital")
+    first = _bounded(first_stake, "first_stake")
+    cap = _bounded(max_capital, "max_capital")
     facts = list(facts)
     for i, f in enumerate(facts):
         if not isinstance(f, SessionFact) or type(f.day) is not date or f.kind not in SESSION_KINDS + EVENT_KINDS:
             raise ValueError("the position is worked out from session facts only (session_facts gives them)")
         if f.ceiling is not None and (_number(f.ceiling) is None or f.ceiling <= 0):
             raise ValueError("a session fact's ceiling must be a finite number above 0, or None")
+        if f.at is not None and not _aware(f.at):
+            raise ValueError("a session fact's time (at) must be a datetime with a UTC offset, or None")
+        if type(f.fault_times) is not tuple or any(t is not None and not _aware(t) for t in f.fault_times):
+            raise ValueError("a session fact's fault_times must be a tuple of datetimes with a UTC offset or None")
+        if f.fault_times and f.kind != "fault":
+            raise ValueError("only a fault session carries fault_times")
         if i and f.day < facts[i - 1].day:
             raise ValueError("the session facts are not in day order")
-    mode, stake, clean, needed, paused = "ticket", first, 0, TICKET_SESSIONS, False     # stake: the earned E
+    state = ("ticket", first, 0, TICKET_SESSIONS, False)               # the stake in it: the earned E
     changes: list[tuple[date | None, str]] = []
 
     def at(changes_now: list) -> Position:
+        mode, stake, clean, needed, paused = state
         held = min(stake, cap)
         if held < stake:
             changes_now = changes_now + [(None, f"the owner's ceiling at this read (max_capital {_amount(cap)}) holds the "
                                                 f"stake at {_amount(held)}, below the {_amount(stake)} the record earned")]
-        return Position(mode, held, clean, needed, paused, tuple(changes_now), stake)
+        return Position(mode, held, clean, needed, paused, tuple(changes_now), stake, cap)
 
     walk: list[tuple[date, Position]] = []
     i = 0
@@ -478,61 +660,21 @@ def _walk_all(facts, first_stake: Any, max_capital: Any) -> tuple[Position, list
         j = i
         while j < len(facts) and facts[j].day == day:
             j += 1
-        group = facts[i:j]
-        counts = not paused and not any(f.kind == "pause" for f in group)
-        group = [f for f in group if f.kind in SESSION_KINDS] + [f for f in group if f.kind in EVENT_KINDS]
-        for f in group:
-            if f.kind in SESSION_KINDS and f.ceiling is not None and stake > f.ceiling:
-                changes.append((day, f"the owner's ceiling that day ({_amount(f.ceiling)}) lowers the stake from "
-                                     f"{_amount(stake)} to {_amount(f.ceiling)}"))
-                stake = f.ceiling
-            if f.kind == "pause":
-                if not paused:
-                    paused = True
-                    changes.append((day, _PAUSE_WORDS))
-            elif f.kind == "reset":
-                if not paused:
-                    continue
-                paused, clean = False, 0
-                if mode == "unattended" and stake > first:
-                    before, stake = stake, max(first, stake / 2)
-                    needed = DOUBLING_SESSIONS if stake > first else UNATTENDED_SESSIONS
-                    changes.append((day, f"the owner's reset after the pause: one step down, the stake goes from "
-                                         f"{_amount(before)} to {_amount(stake)} (half, never below the first stake), "
-                                         f"unattended, {needed} clean sessions to the next doubling"))
-                elif mode == "unattended":
-                    mode, needed = "ticket", TICKET_SESSIONS
-                    changes.append((day, f"the owner's reset after the pause: one step down, back to ticket mode at "
-                                         f"{_amount(stake)}"))
-                else:
-                    changes.append((day, "the owner's reset after the pause: ticket mode stays, the count restarts"))
-            elif f.kind == "fault":                      # addendum 3, F1: on any day, paused or not
-                before, stake, clean = stake, stake / 2, 0
-                changes.append((day, f"a fault session ({f.reasons[0] if f.reasons else 'a fault'}): the stake halves "
-                                     f"from {_amount(before)} to {_amount(stake)} and the count restarts"))
-            elif not counts or f.kind == "skipped":
-                continue
-            else:
-                clean += 1
-                if clean < needed:
-                    continue
-                clean = 0
-                if mode == "ticket":
-                    mode, needed = "unattended", UNATTENDED_SESSIONS
-                    changes.append((day, f"{TICKET_SESSIONS} clean sessions: unattended at the same stake "
-                                         f"{_amount(stake)}"))
-                elif f.ceiling is None:
-                    done, needed = needed, DOUBLING_SESSIONS
-                    changes.append((day, f"{done} clean sessions, but no ceiling was recorded that day, so the stake "
-                                         f"stays at {_amount(stake)} (no rise without the owner's ceiling); the count "
-                                         "restarts"))
-                else:
-                    done, before = needed, stake
-                    stake, needed = min(2 * stake, f.ceiling), DOUBLING_SESSIONS
-                    words = (f"the stake doubles from {_amount(before)} to {_amount(stake)}" if stake == 2 * before else
-                             f"the stake rises from {_amount(before)} to that day's ceiling {_amount(stake)}"
-                             if stake > before else f"the stake stays at that day's ceiling {_amount(stake)}")
-                    changes.append((day, f"{done} clean sessions: {words}"))
+        sessions = [f for f in facts[i:j] if f.kind in SESSION_KINDS]
+        events = [f for f in facts[i:j] if f.kind in EVENT_KINDS]
+        if len(sessions) > 1:
+            raise ValueError(f"the session facts hold more than one session for {day.isoformat()} (session_facts gives "
+                             "one a day)")
+        known = [f.at for f in events if f.at is not None]
+        if any(later < earlier for earlier, later in zip(known, known[1:])):
+            raise ValueError(f"the pauses and resets of {day.isoformat()} are not in the order of their times")
+        session = sessions[0] if sessions else None
+        places = [0]
+        if session is not None and session.kind == "fault" and events:
+            places = _places(events, session.fault_times)
+        tried = [(p, *_one_day(state, day, first, session, events, p)) for p in places]
+        state, lines = _kept(tried, day)
+        changes.extend(lines)
         walk.append((day, at(changes)))
         i = j
     return at(changes), walk
@@ -631,9 +773,19 @@ def describe(position: Position | None, working_stop: WorkingStop | None, ladder
              proven: int) -> list[str]:
     """The lines `order-step --live --check` prints for the owner: the mode, the stake, the clean sessions of how
     many, what changes next and when at the earliest, the working stop and its basis, and whether fractional units
-    are allowed and why. No secret, no account, no path outside the repository, no digest."""
+    are allowed and why. No secret, no account, no path outside the repository, no digest.
+
+    Refuses (ValueError, one line, T34b-1 R3) a ladder file's `first_stake` or a position's `ceiling` (the
+    max_capital it was read under) that is not a number above 0 and at most `webull.LIVE_MONEY_MAX`, the cap the
+    owner's ladder file already uses for the first stake."""
     if type(proven) is not int or proven < 0:
         raise ValueError("the count of proven fractional fills must be a whole number, 0 or more")
+    if ladder_file is not None and _webull._money(ladder_file.first_stake) is None:
+        raise ValueError(f"the ladder file's first_stake must be a number above 0 and at most "
+                         f"{_webull.LIVE_MONEY_MAX:,.0f}")
+    if position is not None and _webull._money(position.ceiling) is None:
+        raise ValueError(f"the position's max_capital must be a number above 0 and at most "
+                         f"{_webull.LIVE_MONEY_MAX:,.0f}")
     lines = []
     if ladder_file is None:
         lines.append(f"ladder: no {LADDER_FILE}: live mode works as it does today (every send by ticket, --capital by "
@@ -673,6 +825,10 @@ def describe(position: Position | None, working_stop: WorkingStop | None, ladder
             lines.append(f"next: no rise is possible under today's ceiling (the owner's max_capital "
                          f"{_amount(position.stake)}); the record has earned {_amount(position.earned)}, and after "
                          f"{sessions} the earned stake doubles; a fault session halves it and restarts the count")
+        elif position.stake >= position.ceiling:                     # T34b-1 R5: the ceiling is already reached
+            lines.append(f"next: no rise is possible at today's ceiling (the owner's max_capital "
+                         f"{_amount(position.ceiling)}), which the stake has reached; a fault session halves it and "
+                         "restarts the count")
         else:
             lines.append(f"next: after {sessions} (at the earliest {left} session{'s' if left != 1 else ''} from now), "
                          f"the stake doubles from {_amount(position.stake)}, up to the ceiling; a fault session halves "
