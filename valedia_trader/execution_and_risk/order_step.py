@@ -175,21 +175,27 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
  - `faults`, a list, only when not empty, on practice and live runs, done or stopped: `reconcile` when the final
    reconcile's own result is not clean for any reason but three (the run still ends as it would): a position
    difference in a symbol where this ledger still holds an order open at the venue after that reconcile's status reads
-   (a fill racing the positions read), positions the venue did not give (`positions_error`), and an unresolved order
-   that the ledger, read back after that reconcile, holds in an open state (`accepted`, `partly_filled`: judged by its
-   state, never by the words of a reason); those are set aside and said in `reconcile_pending` ({"symbols",
-   "positions_unread", "status_unread": the count of such orders}, information, never a fault), and the next run's
-   first reconcile judges again; `attention:<kind>` per distinct kind, sorted, of a blocking attention item (a kind not in
-   orders.NOTICE_KINDS) whose id is above the largest id the ledger held when the run took it, read once before
-   settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); in live mode `cap` when, after the final reconcile, a fill
-   of this batch broke what the run had checked: a purchase worth more than max_order_value at its fill price (a sale
-   that fills above its limit is a better price, not a breach), one order's fills above the units it asked for, or a
-   fill price beyond one part in a million on the wrong side of its own order's limit, the edge itself no breach (what
-   cannot be judged is named in `cap_unjudged` instead). A failure while they are worked out is the run's own: it
+   (a fill racing the positions read), or one this run's batch ordered in any state, or one of a fill this run
+   journaled (the venue's positions may lag its order status); positions the venue did not give (`positions_error`);
+   and an unresolved order that the ledger, read back after that reconcile, holds in an open state (`accepted`,
+   `partly_filled`: judged by its state, never by the words of a reason); those are set aside and said in
+   `reconcile_pending` ({"symbols", "positions_unread", "status_unread": the count of such orders}, information, never
+   a fault), and the next run's first reconcile judges every symbol again; `attention:<kind>` per distinct kind,
+   sorted, of a blocking attention item (a kind not in orders.NOTICE_KINDS) whose id is above the largest id the ledger held when the run took it, read once before
+   settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); `cap` when a fill broke what was checked: on practice and
+   live runs, for every fill at the moment a run first journals it, whichever run sent its order, one order's fills
+   above the units it asked for, or that order's own average fill price as the ledger then holds it (the broker's
+   figure, not a piece worked out from running averages) on the wrong side of its limit by more than one part in a
+   million of it or half a cent, whichever is larger, the edge itself no breach (so a breach of under half a cent on the
+   average is not seen, nor one piece through its limit diluted below that by honest pieces); in live mode also, after the final reconcile, a purchase of this batch worth more
+   than max_order_value at its fill price (a sale that fills above its limit is a better price, not a breach). What
+   cannot be judged is named in `cap_unjudged` instead, on practice and live summaries. A failure while they are worked out is the run's own: it
    stops at stage "unexpected", its reason keeping how the run had ended before (or, when it had already stopped
-   there, its first reason with the second failure's words appended); a propose run so stopped leaves its ticket
+   there, its first reason with the second failure's words appended); a propose run so stopped records its ticket
    refused in the ticket book and returns no ticket number. The attempt row that refusal writes counts once toward the
-   day's wrong-number lock on that ticket, which is void anyway, until the next propose lifts the lock.
+   day's wrong-number lock on that ticket, which is void anyway, until the next propose lifts the lock. When that
+   refusal itself cannot be written, the ticket is NOT void: no number is returned, and the run's reason says that its
+   ticket could not be refused.
  - live mode only: `ceiling` (the confirmation's max_capital) once a confirmation is in force; `over_ceiling`
    ({"at_work", "ceiling"}), information and never a fault, when the book at the marks in hand is above it; `working_stop`
    ({"pct", "basis", "n"}, stake_ladder.working_stop_pct from decay.paper_record's exact returns of the strategies
@@ -202,6 +208,10 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
    look, and the summary). If the journal cannot be written from the trip on, the run stops and sends nothing more;
    but a later run the same day, should the journal work again, does not know of the stop, and only the owner's own
    daily limit in the risk gate (max_daily_loss_pct) still judges each of its orders.
+ - the limit that stays for `cap` (K2): a fill is judged once, by the run that first journals it, and that judgement
+   lives only in the run's summary. A run that journals a fill, judges it, and dies before writing its summary leaves
+   that judgement nowhere, and no later run sees the fill as new. It needs a broker's breach and such a death in the
+   same narrow window.
 """
 from __future__ import annotations
 
@@ -265,7 +275,8 @@ TICKET_LIFE_MAX_SECONDS = 60 * 60                 # a ticket never lives longer 
 TICKET_LIFE_SECONDS = 15 * 60                     # a ticket can be approved for this long after it was made
 TICKET_QUOTE_MOVE = 0.005                         # an approved order's fresh quote within 0.5% of the ticket's
 TICKET_UNITS_SAME = 1e-9                          # fractional units: the same within this
-LIMIT_SAME = 1e-6                                 # T34b-2 F3 (iii): a fill price at its limit within this part of it
+LIMIT_SAME = 1e-6                                 # T34b-2 F3 (iii): an order's average at its limit within this part of it
+HALF_A_CENT = 0.005                               # K1: ... or within this (an average rounded to the cent is this near)
 LIMIT_EDGE = 1.0 + 1e-9                           # ... the edge itself included on both sides, whatever the rounding
 OPEN_AT_VENUE = ("accepted", "partly_filled")     # T34b-2 E2: an order of the ledger still working at the venue
 WRONG_NUMBERS_MAX = 3                             # refused approvals in a New York day that lock approval
@@ -1515,6 +1526,7 @@ class _Run:
         self.purchases_left_unsettled = 0.0
         self.window_end = None
         self._seen_fill_ids: set | None = None
+        self.journaled_symbols: set = set()              # T34b-2 J2: the symbols of the fills this run journaled
         self.quote_times: dict[str, float] = {}
         self.asked: dict[str, float] = {}               # when each symbol was last asked of the quote function
         self.torn_lines: list[dict] = []
@@ -1877,13 +1889,15 @@ class _Run:
 
     # -- T34b-2: the faults the summary carries, and (live mode) the working stop and the day stop
     def _judge_final(self, final) -> None:
-        """After the final reconcile: F1 (addendum 3, E2), that reconcile's own result not clean by the order ledger's
-        judgement for any reason but two, which are set aside and said in `reconcile_pending`: (a) a position
-        difference in a symbol where this ledger still holds an order open at the venue after that reconcile's own
-        status reads (a fill racing the positions read), (b) the venue's positions not read (`positions_error`). An
-        unresolved order, an unsettled send, an anomaly or a difference in a symbol with no open order is F1. The next
-        run's first reconcile judges again. F3 (live mode, the confirmation in force), the caps judged on this batch's
-        fills and the book as it now is."""
+        """After the final reconcile: F1, that reconcile's own result not clean by the order ledger's judgement, except
+        what is set aside and said in `reconcile_pending` (information, never a fault): a position difference in a
+        symbol where this ledger still holds an order open at the venue, or one of this run's batch in any state, or a
+        fill this run journaled (J2: the venue's positions may lag its order status); the venue's positions not read
+        (`positions_error`); an unresolved order that the ledger, read back, holds in an open state (G1: by its state,
+        never by a reason's words). Anything else is F1: an unresolved order in any other state or that cannot be read
+        back, an unsettled send, an anomaly, a difference in a symbol this run did not touch, or an unclean result that
+        nothing here explains. The next run's first reconcile judges every symbol again, with nothing set aside. F3
+        (live mode, the confirmation in force): (i) and the book, by `_judge_caps`."""
         if not (isinstance(final, dict) and final.get("clean") is True):
             self._judge_unclean(final)
         if self.live is not None and self.locks is not None and self.locks.confirmation is not None:
@@ -1896,7 +1910,12 @@ class _Run:
         unread = final.get("positions_error") is not None
         diffs = final.get("position_differences")
         diffs = diffs if isinstance(diffs, dict) else {}
-        working = {o["symbol"] for o in self.ledger.orders(OPEN_AT_VENUE)} if diffs else set()
+        if diffs:                                       # J2 (addendum 5): a symbol this run touched is set aside too
+            touched = {o["symbol"] for o in self.ledger.orders()
+                       if o.get("state") in OPEN_AT_VENUE or (self.batch and o.get("batch") == self.batch)}
+            working = touched | self.journaled_symbols
+        else:
+            working = set()
         aside = {sym for sym in diffs if sym in working}
         unresolved = final.get("unresolved")
         unresolved = unresolved if isinstance(unresolved, list) else ([] if not unresolved else [None])
@@ -1917,47 +1936,51 @@ class _Run:
             self.reconcile_pending = {"symbols": sorted({self._cap_symbol(sym) for sym in (*aside, *status_aside.values())}),
                                       "positions_unread": unread, "status_unread": len(status_aside)}
 
+    def _judge_fill(self, f: dict) -> None:
+        """J1 (addendum 5): one fill, the moment this run first journals it, whichever run or batch sent its order,
+        practice and live alike, against its own order read back from the ledger: (ii) the order's fills in the ledger
+        now summing to more units than it asked for (beyond REL_TOL x max(1, |units|)); (iii), K1 (addendum 6), the
+        ORDER'S average fill price as the ledger then holds it (the broker's own figure, never the piece price worked
+        out from two running averages, which a broker's rounding can throw far off) beyond max(LIMIT_SAME x limit,
+        HALF_A_CENT) on the wrong side of its limit, the edge itself no breach. A fill without a price (the ledger's
+        average then does not cover it), or whose order, limit or average cannot be read back as a usable number, is
+        no breach: its symbol is named in `cap_unjudged`. What this cannot see: a breach of under half a cent on the
+        average, including one piece through its limit diluted by honest pieces of the same order."""
+        sym = self._cap_symbol(f.get("symbol"))
+        tag = f.get("tag")
+        order = self.ledger.order(tag) if type(tag) is str and tag else None
+        asked = _as_float(order.get("units")) if isinstance(order, dict) else None
+        if asked is None or asked == 0:
+            self.cap_unjudged.add(sym)
+            return
+        filled = [_as_float(r.get("units")) for r in self.ledger.fills(tag)]
+        if None in filled:
+            self.cap_unjudged.add(sym)
+        elif math.fsum(filled) * (1.0 if asked > 0 else -1.0) > abs(asked) + REL_TOL * max(1.0, abs(asked)):
+            self.cap_breach = True                               # (ii)
+        avg, limit = _as_float(order.get("avg_price")), _as_float(order.get("limit_price"))
+        if _as_float(f.get("price")) is None or avg is None or not avg > 0 or limit is None or not limit > 0:
+            self.cap_unjudged.add(sym)
+        elif ((avg - limit) if asked > 0 else (limit - avg)) > max(LIMIT_SAME * limit, HALF_A_CENT) * LIMIT_EDGE:
+            self.cap_breach = True                               # (iii), K1: on the order's own average
+
     def _judge_caps(self, conf: dict) -> None:
-        """F3 (addendum 1): a fill of this batch that broke what the run had checked, judged from this batch's own
-        orders and fills with no mark: (i) a purchase's units times its fill price above max_order_value (a sale
-        that fills above its limit is a better price, judged by (ii) and (iii) alone, addendum 3 E1); (ii) one order's
-        fills summing to more units than the order asked for (beyond the order ledger's own tolerance,
-        REL_TOL x max(1, |units|)); (iii) its fill price on the wrong side of its own order's limit (above it for a
-        purchase, below it for a sale) by more than one part in a million of the limit, the edge itself no breach on
-        either side (E3). A fill without a usable price,
-        or whose order or limit cannot be read back, is no breach: its symbol is named in `cap_unjudged`. The money at
-        work in the broker book (this ledger's holdings at the marks in hand, as `_exposure_now` measures it) above
-        max_capital is information only (`over_ceiling`), never a fault: a market gain or a lowered ceiling takes
-        it there as well."""
+        """F3, live mode, after the final reconcile: (i) a purchase fill of this batch whose units times its fill price
+        is above the confirmation's max_order_value (a sale that fills above its limit is a better price, not a
+        breach); a fill of this batch without a usable price is named in `cap_unjudged`. (ii) and (iii) are judged per
+        fill by `_judge_fill`, on practice runs too. The money at work in the broker book (this ledger's holdings at the
+        marks in hand, as `_exposure_now` measures it) above max_capital is information only (`over_ceiling`), never a
+        fault: a market gain or a lowered ceiling takes it there as well."""
         fills = self.ledger.fills()
         mine = self.batch + "-"
-        by_tag: dict[str, list] = {}
-        for f in fills:
-            if type(f.get("tag")) is str and f["tag"].startswith(mine):
-                by_tag.setdefault(f["tag"], []).append(f)
-        for tag, rows in by_tag.items():
-            order = self.ledger.order(tag)
-            asked = _as_float(order.get("units")) if isinstance(order, dict) else None
-            limit = _as_float(order.get("limit_price")) if isinstance(order, dict) else None
-            if asked is None or asked == 0:
-                self.cap_unjudged.update(self._cap_symbol(f.get("symbol")) for f in rows)
-            else:
-                filled = [_as_float(f.get("units")) for f in rows]
-                if None in filled:
-                    self.cap_unjudged.update(self._cap_symbol(f.get("symbol")) for f in rows)
-                elif math.fsum(filled) * (1.0 if asked > 0 else -1.0) > abs(asked) + REL_TOL * max(1.0, abs(asked)):
-                    self.cap_breach = True                           # (ii)
-            for f in rows:
-                units, price = _as_float(f.get("units")), _as_float(f.get("price"))
-                if units is None or price is None:
-                    self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
-                    continue
-                if units > 0 and not units * price <= conf["max_order_value"]:
-                    self.cap_breach = True                           # (i), purchases only
-                if asked is None or asked == 0 or limit is None or not limit > 0:
-                    self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
-                elif ((price - limit) if asked > 0 else (limit - price)) > LIMIT_SAME * limit * LIMIT_EDGE:
-                    self.cap_breach = True                           # (iii)
+        for f in fills:                                  # (i): this batch's purchase fills ((ii), (iii): _judge_fill)
+            if not (type(f.get("tag")) is str and f["tag"].startswith(mine)):
+                continue
+            units, price = _as_float(f.get("units")), _as_float(f.get("price"))
+            if units is None or price is None:
+                self.cap_unjudged.add(self._cap_symbol(f.get("symbol")))
+            elif units > 0 and not units * price <= conf["max_order_value"]:
+                self.cap_breach = True                           # (i), purchases only
         at_work = []
         for sym, u in broker_book(fills).items():
             if not u > UNITS_EPS:
@@ -1987,7 +2010,7 @@ class _Run:
                 if int(item["id"]) > self.attention_before and kind not in NOTICE_KINDS:
                     kinds.add(kind if type(kind) is str and _ATTENTION_KIND.fullmatch(kind) else "unknown")
             out += [f"attention:{kind}" for kind in sorted(kinds)]
-        if self.live is not None and self.cap_breach:
+        if self.cap_breach:                              # J1: (ii) and (iii) on practice runs too
             out.append("cap")
         return out
 
@@ -2560,6 +2583,8 @@ class _Run:
                 self._sync_journal()                     # on disk before the fill counts as applied
                 self._seen_fill_ids.add(f["id"])
                 self.fills_journaled += 1
+                self.journaled_symbols.add(f["symbol"])
+                self._judge_fill(f)                      # T34b-2 J1: judged once, by the run that journals it
             self.ledger.mark_applied([f["id"]])
 
     def _reconcile_and_cancel(self, baseline: dict) -> None:
@@ -3097,9 +3122,9 @@ class _Run:
             summary["reconcile_pending"] = {"symbols": list(self.reconcile_pending["symbols"]),
                                             "positions_unread": bool(self.reconcile_pending["positions_unread"]),
                                             "status_unread": int(self.reconcile_pending["status_unread"])}
+        if self.cap_unjudged:                            # addendum 5 (J1): practice and live alike
+            summary["cap_unjudged"] = sorted(self.cap_unjudged)
         if self.live is not None:                        # T34b-2: live mode only
-            if self.cap_unjudged:
-                summary["cap_unjudged"] = sorted(self.cap_unjudged)
             if self.locks is not None and self.locks.confirmation is not None:
                 summary["ceiling"] = float(self.locks.confirmation["max_capital"])
             if self.over_ceiling is not None:            # addendum 1: information, never a fault

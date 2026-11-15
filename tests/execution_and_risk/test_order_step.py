@@ -6622,7 +6622,7 @@ import statistics as _statistics
 from valedia_trader.execution_and_risk import stake_ladder as _sl
 from valedia_trader.research_loop import decay as _dc
 
-T34B2_PRACTICE_KEYS = ("faults", "reconcile_pending")
+T34B2_PRACTICE_KEYS = ("faults", "reconcile_pending", "cap_unjudged")
 T34B2_LIVE_KEYS = ("faults", "reconcile_pending", "cap_unjudged", "ceiling", "over_ceiling", "working_stop", "day_stop")
 T34B2_BASE = "f88593e"
 
@@ -6969,21 +6969,24 @@ def test_t34b2_a_fill_without_a_price_is_not_judged_and_is_named(tmp_path):
 # ---- F3 (ii) and (iii), addendum 1: a fill that broke what the run had checked, from this batch's own orders
 
 class _ThroughLimit(LiveVenue):
-    """Reports each fill at its limit times `buy` (a purchase) or `sell` (a sale)."""
-    buy, sell = 1.0, 1.0
+    """Reports each fill at its limit times `buy` (a purchase) or `sell` (a sale), plus `buy_add` or `sell_add` (K1)."""
+    buy, sell, buy_add, sell_add = 1.0, 1.0, 0.0, 0.0
 
     def order_status(self, tag):
         out = super().order_status(tag)
         if out is not None and out["avg_price"] is not None:
-            out["avg_price"] = out["avg_price"] * (self.buy if self.book[tag]["units"] > 0 else self.sell)
+            bought = self.book[tag]["units"] > 0
+            out["avg_price"] = out["avg_price"] * (self.buy if bought else self.sell) + (
+                self.buy_add if bought else self.sell_add)
         return out
 
 
-@pytest.mark.parametrize("factor, fault", [(1.01, True), (1 + 1.1e-6, True), (1 + 1e-6, False), (1 + 9e-7, False),
-                                           (1 + 5e-7, False), (1.0, False)])                  # E3: the edge is no breach
-def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
+@pytest.mark.parametrize("factor, add, fault", [(1.01, 0.0, True), (1.0, 0.006, True), (1.0, 0.005, False),
+                                                (1.0, 0.004, False), (1 + 1.1e-6, 0.0, False), (1.0, 0.0, False)])
+def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, factor, add, fault):
+    # K1: the order's average beyond its limit by more than max(1e-6 of it, half a cent); the edge is no breach
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
-    venue.buy = factor                                                # IWM 3 at 202 x 1.01: 612, under max_order_value
+    venue.buy, venue.buy_add = factor, add                            # IWM 3 at 202 x 1.01: 612, under max_order_value
     w = _t34_world(tmp_path / "w", venue=venue)
     _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 4.0}})
     w.venue.fill_at_once = 1.0
@@ -6993,14 +6996,14 @@ def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, fa
     assert out.get("faults") == (["cap"] if fault else None) and "cap_unjudged" not in out, out
 
 
-@pytest.mark.parametrize("factor, fault", [(0.99, True), (1 - 1.1e-6, True), (1 - 1e-6, False), (1 - 9e-7, False),
-                                           (1 - 5e-7, False), (1.0, False)])                  # E3: the edge is no breach
-def test_t34b2_a_sale_filled_below_its_own_limit_is_a_cap_fault(tmp_path, factor, fault):
+@pytest.mark.parametrize("factor, add, fault", [(0.99, 0.0, True), (1.0, -0.006, True), (1.0, -0.005, False),
+                                                (1.0, -0.004, False), (1 - 1.1e-6, 0.0, False), (1.0, 0.0, False)])
+def test_t34b2_a_sale_filled_below_its_own_limit_is_a_cap_fault(tmp_path, factor, add, fault):
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
     w = _t34_world(tmp_path / "w", venue=venue)
     _t34_day_one(w)
     w.next_day()
-    venue.sell = factor
+    venue.sell, venue.sell_add = factor, add
     _, number = _live_proposed(w, {"a": {"IWM": 3.0, "TLT": 2.0}})  # a sale of TLT 2, limit 98
     w.venue.fill_at_once = 1.0
     w.later(1)
@@ -7269,6 +7272,239 @@ def test_t34b2_an_unresolved_entry_whose_order_cannot_be_read_back_stays_a_recon
     _later_submit(world, 0, then=lambda w: armed.append(1))
     out = world.run()
     assert out["status"] == "done" and out["faults"] == ["reconcile"] and "reconcile_pending" not in out, out
+
+
+# ---- addendum 5 (J1): a fill is judged when a run first journals it, whichever run sent its order
+
+def _through(base):
+    class Through(_with_status_down(base)):
+        """Reports each fill at its limit times `buy` or `sell`; `over` reports that share more units than filled."""
+        buy, sell, over = 1.0, 1.0, 0.0
+
+        def order_status(self, tag):
+            out = super().order_status(tag)
+            if out is not None and out["avg_price"] is not None:
+                out["avg_price"] = out["avg_price"] * (self.buy if self.book[tag]["units"] > 0 else self.sell)
+            if out is not None and out["filled_units"] and self.over:
+                out["filled_units"] = out["filled_units"] * (1 + self.over)
+            return out
+    return Through
+
+
+def _t34_late_world(tmp, live, buy=1.0, over=0.0):
+    venue = _through(LiveVenue if live else Booked)(held={"OWN": 10.0}, cash=9_500.0 if live else 1_000_000.0)
+    venue.buy, venue.over = buy, over
+    w = _t34_world(tmp, venue=venue) if live else ticket_world(tmp, venue)
+    return w
+
+
+def _t34_send(w, live, wanted):
+    """One run that sends: live, a propose and its approve; practice, a scheduled run."""
+    if live:
+        _, number = _live_proposed(w, wanted)
+        w.later(1)
+        return lapprove(w, number)
+    w.paper = paper(wanted)
+    return w.run()
+
+
+def _t34_next(w, live):
+    """The next run, which reconciles first: live a propose, practice a scheduled run (the same targets)."""
+    w.later(30)
+    return lpropose(w) if live else w.run()
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("how", ["race", "status timeout", "quiet between runs"])
+@pytest.mark.parametrize("buy, fault", [(1.05, True), (1.0, False)])
+def test_t34b2_a_fill_through_its_limit_that_reaches_the_ledger_late_is_a_cap_fault_of_the_run_that_journals_it(
+        tmp_path, live, how, buy, fault):
+    w = _t34_late_world(tmp_path / "w", live, buy=buy)
+    w.venue.fill_at_once = 0.0                                       # the IWM order rests at the venue
+    if how == "race":
+        _t34_at_final_positions(w, _t34_fill_open("IWM"), 1)
+    elif how == "status timeout":
+        def then(w, tag):
+            w.venue.fill(tag)                                         # it fills, and its status read times out
+            w.venue.down = ("IWM",)
+        _t34_after_last_submit(w, 1, then)
+    first = _t34_send(w, live, {"a": {"IWM": 3.0}})
+    assert first["status"] == "done" and first["orders_sent"] == 1 and "faults" not in first, first
+    assert w.fills() == [], w.fills()                                 # the fill is not in the ledger yet
+    w.venue.down = ()
+    if how == "quiet between runs":
+        (tag,) = w.venue.submits()
+        w.venue.fill(tag)
+    out = _t34_next(w, live)
+    (f,) = w.fills()
+    assert f["units"] == 3.0 and abs(f["price"] - 202.0 * buy) < 1e-9, f
+    assert out.get("faults") == (["cap"] if fault else None), out
+    assert w.entries("summary")[-1].get("faults") == (["cap"] if fault else None)
+    w.later(30)
+    assert "faults" not in (lpropose(w) if live else w.run())         # judged once, by the run that journaled it
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_t34b2_an_overfill_reported_late_is_refused_by_the_ledger_and_is_no_cap(tmp_path, live):
+    w = _t34_late_world(tmp_path / "w", live, over=0.5)
+    w.venue.fill_at_once = 0.0
+    first = _t34_send(w, live, {"a": {"IWM": 3.0}})
+    assert first["status"] == "done" and "faults" not in first, first
+    (tag,) = w.venue.submits()
+    w.venue.fill(tag)                                                 # filled quietly; reported as 4.5 of 3
+    out = _t34_next(w, live)
+    assert w.fills() == [] and "cap" not in out.get("faults", []), (w.fills(), out)
+    assert out["status"] == "stopped" and out["stage"] == "reconcile", out   # the ledger refuses it: a reconcile fault
+
+
+def test_t34b2_a_late_fill_of_another_runs_order_over_its_asked_units_is_a_cap_fault(tmp_path):
+    w = _t34_late_world(tmp_path / "w", False)
+    w.venue.fill_at_once = 0.0
+    first = _t34_send(w, False, {"a": {"IWM": 3.0}})
+    assert first["status"] == "done" and "faults" not in first, first
+    (tag,) = w.venue.submits()
+    w.venue.fill(tag)
+    con = sqlite3.connect(w.ledger_path)                              # one more fill row of that order, as stored
+    try:
+        with con:
+            con.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) "
+                        "VALUES (?,?,?,?,?,?,?,0)", (tag, "IWM", 1.0, 202.0, 1.0, 0.0, w.clock.t))
+    finally:
+        con.close()
+    w.venue.held["IWM"] = w.venue.held.get("IWM", 0.0) + 1.0
+    out = _t34_next(w, False)
+    assert out.get("faults") == ["cap"], out
+
+
+# ---- addendum 6 (K1): the limit is judged on the order's own average, as the broker gives it
+
+def _rounded(base):
+    class Rounded(base):
+        """Reports an order's average rounded to the cent, worked out from true piece prices: its first `first` units
+        at its limit less `off` (a purchase; plus `off` for a sale), the rest at its limit. With `shown` set, its
+        status gives only that many units filled (partly filled). An order in `skip` is reported as it is."""
+        first, off, shown, skip = 0.0, 0.0, None, frozenset()
+
+        def order_status(self, tag):
+            out = super().order_status(tag)
+            o = self.book.get(tag)
+            if out is None or not o["filled"] or not self.first or tag in self.skip:
+                return out
+            p1 = o["limit"] - (1.0 if o["units"] > 0 else -1.0) * self.off
+            n = o["filled"] if self.shown is None else min(self.shown, o["filled"])
+            a = min(n, self.first)
+            out["filled_units"], out["avg_price"] = n, round((a * p1 + (n - a) * o["limit"]) / n, 2)
+            if n < abs(o["units"]):
+                out["state"] = "partly_filled"
+            return out
+    return Rounded
+
+
+@pytest.mark.parametrize("case", ["live purchase", "live sale", "practice purchase"])
+def test_t34b2_an_average_rounded_to_the_cent_within_its_limit_is_no_cap_whatever_the_worked_out_piece(tmp_path, case):
+    live = case.startswith("live")
+    venue = _rounded(LiveVenue if live else Booked)(held={"OWN": 10.0}, cash=9_500.0 if live else 1_000_000.0)
+    w = _t34_world(tmp_path / "w", venue=venue) if live else ticket_world(tmp_path / "w", venue)
+    if case == "live sale":                                           # TLT 2 of 4 sold, limit 98: 98.01, then 98.00
+        _t34_day_one(w)
+        w.next_day()
+        venue.skip = frozenset(venue.book)                            # day one's orders stay as they were
+        wanted, venue.first, venue.off = {"a": {"IWM": 3.0, "TLT": 2.0}}, 1.0, 0.0051
+    elif live:                                                        # IWM 3 at limit 202: 201.98 on 2, then 201.99
+        wanted, venue.first, venue.off = {"a": {"IWM": 3.0}}, 2.0, 0.0151
+    else:                                                             # IWM 100: 99 at 201.98, then 201.99 on 100
+        wanted, venue.first, venue.off = {"a": {"IWM": 100.0}}, 99.0, 0.0151
+    venue.fill_at_once, venue.shown = 1.0, venue.first                # filled at once; its status shows one piece
+    first = _t34_send(w, live, wanted)
+    assert first["status"] == "done" and first["orders_sent"] == 1 and "faults" not in first, first
+    venue.shown = None                                                # then the whole of it, at the rounded average
+    out = _t34_next(w, live)
+    tag = w.venue.submits()[-1]
+    rows, limit = [f for f in w.fills() if f["tag"] == tag], w.venue.book[tag]["limit"]
+    beyond = (1.0 if rows[-1]["units"] > 0 else -1.0) * (rows[-1]["price"] - limit)
+    assert len(rows) == 2 and beyond > 0.009, (rows, limit)           # the worked-out piece lies beyond the limit
+    assert "faults" not in out and "cap_unjudged" not in out, out
+
+
+# ---- addendum 5 (J2): the final reconcile does not fault a symbol the run has just traded
+
+def _with_lag(base):
+    class Lag(base):
+        """Its positions read gives, for the symbols in `lag`, the stated units instead of what it holds."""
+        lag = {}
+
+        def positions(self):
+            out = super().positions()
+            for sym, units in self.lag.items():
+                out[sym] = units
+            return {s: u for s, u in out.items() if abs(u) > 1e-12}
+    return Lag
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("untouched", [False, True])
+def test_t34b2_a_positions_read_that_lags_the_order_status_is_pending_and_an_untouched_symbol_is_not(
+        tmp_path, live, untouched):
+    venue = _with_lag(LiveVenue if live else Booked)(held={"OWN": 10.0}, cash=9_500.0 if live else 1_000_000.0)
+    w = _t34_world(tmp_path / "w", venue=venue) if live else ticket_world(tmp_path / "w", venue)
+    w.venue.fill_at_once = 1.0                                       # filled at once; the positions read has not caught up
+
+    def then(w, tag):
+        w.venue.lag = {"IWM": 0.0}
+        if untouched:
+            w.venue.held["GLD"] = 1.0
+    _t34_after_last_submit(w, 1, then)
+    out = _t34_send(w, live, {"a": {"IWM": 3.0}})
+    assert out["status"] == "done" and out["orders_sent"] == 1, out
+    assert w.orders()[-1]["state"] == "filled"                       # no longer open: set aside as this run's symbol
+    assert out["reconcile_pending"] == {"symbols": ["IWM"], "positions_unread": False, "status_unread": 0}, out
+    assert out.get("faults") == (["reconcile"] if untouched else None), out
+    w.venue.lag = {}
+    if untouched:
+        w.venue.held.pop("GLD")
+    out = _t34_next(w, live)                                          # caught up: the next run is clean
+    assert "faults" not in out and out["stage"] is None, out
+
+
+def test_t34b2_a_batch_order_the_venue_calls_cancelled_while_its_positions_show_a_fill_is_pending_then_a_fault(
+        tmp_path):
+    class Cancelled(Booked):
+        """Fills at once, but reports the order cancelled with nothing filled."""
+
+        def order_status(self, tag):
+            out = super().order_status(tag)
+            if out is not None:
+                out.update(state="cancelled", filled_units=0.0, avg_price=None)
+            return out
+    w = ticket_world(tmp_path / "w", Cancelled(held={"OWN": 10.0}))
+    w.venue.fill_at_once = 1.0
+    out = _t34_send(w, False, {"a": {"IWM": 3.0}})
+    assert w.orders()[-1]["state"] == "cancelled" and w.fills() == [], w.orders()
+    assert out["status"] == "done" and "faults" not in out, out                     # this run's batch: set aside
+    assert out["reconcile_pending"] == {"symbols": ["IWM"], "positions_unread": False, "status_unread": 0}, out
+    out = _t34_next(w, False)                                         # not hidden for good: the next run stops
+    assert out["status"] == "stopped" and out["stage"] == "reconcile", out
+
+
+# ---- addendum 5 (J3): the unsettled-send guard
+
+def test_t34b2_an_unsettled_order_not_in_the_unresolved_list_is_still_a_reconcile_fault(world, monkeypatch):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    real, armed = _Ledger.reconcile, []
+
+    def reconcile(self, *a, **k):
+        out = real(self, *a, **k)
+        if armed:                                                     # the final reconcile: positions unread (set
+            tag = self.orders()[-1]["tag"]                            # aside), and an order unsettled that is not in
+            self._db.execute("UPDATE orders SET state = 'sent' WHERE tag = ?", (tag,))   # its unresolved list
+            self._db.commit()
+            out["positions_error"], out["clean"] = "made by the test", False
+        return out
+    monkeypatch.setattr(_Ledger, "reconcile", reconcile)
+    _later_submit(world, 0, then=lambda w: armed.append(1))
+    out = world.run()
+    assert out["status"] == "done" and out["faults"] == ["reconcile"], out
+    assert out["reconcile_pending"] == {"symbols": [], "positions_unread": True, "status_unread": 0}, out
 
 
 # ---- addendum 3 (E4): a run that turns out stopped leaves no usable ticket and loses no reason
@@ -7696,7 +7932,7 @@ def _t34_same_but(b, m, keys, where, skip=()):
 
 def _t34_practice_marks(added, where):
     """A practice run may carry `faults` and `reconcile_pending` only, and `faults` only reconcile and attention entries."""
-    assert set(added) <= {"faults", "reconcile_pending"}, where
+    assert set(added) <= {"faults", "reconcile_pending", "cap_unjudged"}, where
     if "reconcile_pending" in added:
         p = added["reconcile_pending"]
         assert set(p) == {"symbols", "positions_unread", "status_unread"} and type(p["positions_unread"]) is bool, (where, p)
@@ -7704,8 +7940,10 @@ def _t34_practice_marks(added, where):
         assert p["symbols"] == sorted(set(p["symbols"])) and (p["symbols"] or p["positions_unread"]), (where, p)
     if "faults" in added:
         f = added["faults"]
-        assert f and len(f) == len(set(f)) and all(x == "reconcile" or x.startswith("attention:") for x in f), (where, f)
-        assert f == (["reconcile"] if "reconcile" in f else []) + sorted(x for x in f if x != "reconcile"), (where, f)
+        assert f and len(f) == len(set(f)) and all(x in ("reconcile", "cap") or x.startswith("attention:") for x in f), (
+            where, f)
+        assert f == ((["reconcile"] if "reconcile" in f else []) + sorted(x for x in f if x.startswith("attention:"))
+                     + (["cap"] if "cap" in f else [])), (where, f)
     return bool(added)
 
 
