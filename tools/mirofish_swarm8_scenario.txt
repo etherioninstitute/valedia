@@ -1,0 +1,15 @@
+HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS. Every participant below is invented for this test; none is a real person or firm. Use exactly these 8 named participants as graph actors, no more and no fewer. The tickers SPY, TLT and GLD are discussion topics (a broad stock fund, a long government bond fund and a gold fund), not participants. The invented central bank is a topic, not a participant.
+
+Invented catalyst: the fictional Bank of Aldoria unexpectedly announces that it will pause shrinking its balance sheet. Imagine this drawing attention to SPY, TLT and GLD while inflation risk, crowded positioning and thin liquidity remain unresolved.
+
+The eight participants, one of each kind:
+- Harrowgate Pension Trust, a pension fund (organization; slow, liability-driven, wary of drawdowns).
+- Vantor Macro Partners, a macro hedge fund (organization; discretionary, opinionated about policy, fast to change view).
+- Quillon Systematic Trend, a trend-following fund (organization; rule-based, follows price trends, ignores narratives).
+- Dara Okonkwo-Reyes, a bond strategist (person; argues about term premium and duration risk).
+- Auric Lane Bullion, a gold dealer (organization; reports physical demand and distrusts paper promises).
+- Mira Tanaka-Bell, a retail trader (person; posts often, chases momentum).
+- Esme Radcliffe-Moyo, a financial journalist (person; asks for evidence, quotes both sides, publishes summaries).
+- Casimir Dunmore, a risk officer (person; skeptical, focuses on concentration, leverage and liquidity).
+
+Simulate three rounds of balanced discussion in which every participant takes part. Separate the invented scenario assumptions from the actual simulated outputs. No real prices, returns, observed market sentiment or execution clearance may be invented. Produce an evidence-grounded research report with uncertainty; do not force a BUY and do not fabricate missing data.

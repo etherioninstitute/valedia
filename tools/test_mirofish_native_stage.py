@@ -91,41 +91,105 @@ class NativeStaging(unittest.TestCase):
                       [('limit = 40','limit = 640',1,2)]):                                      # fewer integers changed than claimed
             with self.assertRaises(RuntimeError):s.closed_integer_delta(raw,digest,edits)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_integer_delta(raw+b'#',digest,[('limit = 40','limit = 640',1,1)])
-    def test_swarm_gateway_run_and_startup_change_exactly_the_closed_integers(self):
-        p=s.SWARM['swarm48'];self.assertEqual(s.PROFILES['swarm48'],(p['chats'],p['output']));self.assertGreaterEqual(p['output'],2*512+(p['chats']-2)*max(p['caller_output'],p['native_output']))  # every admitted call can reserve its cap
-        self.assertLess(p['caller_output'],4096);self.assertLess(p['caller_output']/20,175)  # under the gateway's per-call ceiling, and writable inside the 175 s limit even at 20 tokens a second
-        self.assertGreaterEqual(p['agents_bound'],p['actors']);self.assertGreaterEqual(p['history_records'],int(p['wall']/0.4)+1)                       # the host samples every 0.4 s
-        for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,12),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,7),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
-            raw=(s.W16/relative).read_bytes();changed=build(raw,'swarm48');before,after=s.integer_literals(raw),s.integer_literals(changed)
-            self.assertEqual(sum(a!=b for a,b in zip(before,after)),count,relative)
-            with self.assertRaisesRegex(RuntimeError,'original source drift'):build(raw+b'\n','swarm48')
-        gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm48').decode()
-        for text in ['chat_attempts: int = 640','"chat_attempts": 640,','output_total: int = 1700000','"output_total": 1700000,','"wall_seconds": 14400,','request_bytes: int = 131072','client_seconds: int = 175','queue_seconds: int = 170','output_per_call: int = 4096','context: int = 32768']:self.assertIn(text,gateway)
-        run=s.swarm_run_bytes((s.W16/sorted(s.RUN_COPIES)[0]).read_bytes(),'swarm48').decode()
-        for text in ['time.monotonic() + 14280','<= 64, "actual generated participant count outside bound"','"max_rounds": 3,','deadline=start+14400;active=deadline-120','research_only=False,max_age_seconds=14400)',"receipt['wall_seconds']<=14400",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)"]:self.assertIn(text,run)
-        startup=s.swarm_startup_bytes((s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),'swarm48').decode()
-        for text in ['(30 if preflight else 14400)','MAX_RECORDS=36001','MAX_BYTES=64*1024*1024']:self.assertIn(text,startup)
+    # TMF2 (2026-11-15): every swarm number comes from tools/mirofish_swarm_limits.py; the expected literals below are that
+    # derivation's results, written out so a change in the derivation shows up here as well.
+    EXPECTED={'swarm48':{'chats':672,'output':2800000,'wall':45000,'worker':44880,'records':112501,'mib':224,'bound':64,'rounds':3,'budget':12288},
+              'swarm8':{'chats':192,'output':800000,'wall':7200,'worker':7080,'records':18001,'mib':32,'bound':16,'rounds':3,'budget':4096}}
+    def test_swarm_numbers_are_the_derivation_and_every_admitted_call_can_reserve_its_cap(self):
+        self.assertEqual(set(s.SWARM),set(self.EXPECTED))
+        for name,e in self.EXPECTED.items():
+            n=s.swarm_numbers(name);self.assertEqual(s.PROFILES[name],(n['chats'],n['output']))
+            self.assertEqual((n['chats'],n['output'],n['wall'],n['worker_deadline_s'],n['history_records'],n['history_mib'],n['agents_bound'],n['rounds'],n['memory_budget']),
+                             (e['chats'],e['output'],e['wall'],e['worker'],e['records'],e['mib'],e['bound'],e['rounds'],e['budget']),name)
+            self.assertEqual((n['caller_output'],n['native_output'],n['semaphore'],n['gateway_arrival_s'],n['gateway_queue_s'],n['agent_client_s'],n['caller_client_s'],n['embedding_client_s'],n['request_bytes']),(4096,1024,1,540,270,570,570,570,262144),name)
+            self.assertGreaterEqual(n['output'],2*512+(n['chats']-2)*max(n['caller_output'],n['native_output']))
+            self.assertNotEqual(n['memory_budget'],2048)
+    def test_swarm_gateway_run_and_startup_change_exactly_the_closed_numbers(self):
+        for name,e in self.EXPECTED.items():
+            for relative,build,count in [(sorted(s.GATEWAY_COPIES)[0],s.swarm_gateway_bytes,17),(sorted(s.RUN_COPIES)[0],s.swarm_run_bytes,10),(sorted(s.STARTUP_COPIES)[0],s.swarm_startup_bytes,3)]:
+                raw=(s.W16/relative).read_bytes();changed=build(raw,name);before,after=s.integer_literals(raw),s.integer_literals(changed)
+                self.assertEqual(sum(a!=b for a,b in zip(before,after)),count,relative)
+                with self.assertRaisesRegex(RuntimeError,'original source drift'):build(raw+b'\n',name)
+            gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),name).decode()
+            for text in [f'chat_attempts: int = {e["chats"]}',f'"chat_attempts": {e["chats"]},',f'output_total: int = {e["output"]}',f'"output_total": {e["output"]},',f'"wall_seconds": {e["wall"]},',
+                         'request_bytes: int = 262144','client_seconds: int = 540','"client_seconds": 540,','queue_seconds: int = 270','"queue_seconds": 270}','output_per_call: int = 4096','context: int = 32768','cleanup_seconds: int = 120','<= 128','+10.0']:self.assertIn(text,gateway)
+            run=s.swarm_run_bytes((s.W16/sorted(s.RUN_COPIES)[0]).read_bytes(),name).decode()
+            for text in [f'time.monotonic() + {e["worker"]}',f'<= {e["bound"]}, "actual generated participant count outside bound"',f'"max_rounds": {e["rounds"]},',f'deadline=start+{e["wall"]};active=deadline-120',f'research_only=False,max_age_seconds={e["wall"]})',f"receipt['wall_seconds']<={e['wall']}",
+                         '"MIROFISH_PREP_LLM_TIMEOUT": "570"','"MIROFISH_REPORT_LLM_TIMEOUT": "570"',"'caller_timeout':570,'gateway_arrival_seconds':540,'queue_seconds':270",'(expires-now).total_seconds() <= 3600',"len(native)>=2 and len(completed)==len(native)"]:self.assertIn(text,run)
+            self.assertNotIn('"180"',run)
+            startup=s.swarm_startup_bytes((s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),name).decode()
+            for text in [f'(30 if preflight else {e["wall"]})',f'MAX_RECORDS={e["records"]}',f'MAX_BYTES={e["mib"]}*1024*1024']:self.assertIn(text,startup)
         self.assertEqual(len({s.sha(s.W16/r) for r in s.RUN_COPIES}),1);self.assertEqual(len({s.sha(s.W16/r) for r in s.STARTUP_COPIES}),1)
-    def test_swarm_selector_is_full_participation_with_two_requests_in_flight(self):
-        raw=(s.W16/s.SELECTOR_REL).read_bytes();changed=s.swarm_selector_bytes(raw,'swarm48')
-        self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(changed))],['len(agent_configs)','list(range(24))','1.0'])
-        self.assertEqual(changed.count(b'semaphore=2,'),2);self.assertEqual(changed.count(b'semaphore=30,'),0)
-        self.assertIn(b"or args.max_rounds != 3 or args.twitter_only",changed);self.assertIn(b"len(config['agent_configs']) <= 64):",changed)
-        self.assertIn(b"'Owned child agent, round, platform or path cap violated'",changed)  # the refusal itself stays
-        self.assertIn(b"'max_tokens': 1024,",changed);self.assertNotIn(b"'max_tokens': 512,",changed)
-        coverage=s.coverage_selector_bytes(raw);self.assertEqual(coverage.count(b'semaphore=30,'),2)  # the earlier profile is untouched by the new code path
+    def test_closed_digit_delta_changes_only_the_two_caller_timeout_strings_and_integers(self):
+        raw=(s.W16/sorted(s.RUN_COPIES)[0]).read_bytes();digest=hashlib.sha256(raw).hexdigest()
+        changed=s.closed_digit_delta(raw,digest,[('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',1,1),("'caller_timeout':180","'caller_timeout':570",1,1)])
+        self.assertIn(b'"MIROFISH_PREP_LLM_TIMEOUT": "570"',changed);self.assertIn(b'"MIROFISH_REPORT_LLM_TIMEOUT": "180"',changed)
+        for edits in ([('"FLASK_DEBUG": "false"','"FLASK_DEBUG": "true"',1,1)],                           # any other string
+                      [('"HF_HUB_OFFLINE": "1"','"HF_HUB_OFFLINE": "2"',1,1)],                             # a digit string outside the two caller timeouts
+                      [('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "18O"',1,1)],   # a non-digit value
+                      [('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "570.0"',1,1)], # not decimal digits only
+                      [('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": 570',1,1)],     # a string turned into an integer
+                      [('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',1,2)],   # fewer changes than claimed
+                      [("'caller_timeout':180","'caller_timeout':-570",1,1)]):                            # an operator
+            with self.assertRaises(RuntimeError):s.closed_digit_delta(raw,digest,edits)
+        with self.assertRaisesRegex(RuntimeError,'original source drift'):s.closed_digit_delta(raw+b'#',digest,[("'caller_timeout':180","'caller_timeout':570",1,1)])
+        self.assertEqual(s.closed_integer_delta(raw,digest,[("'caller_timeout':180","'caller_timeout':570",1,1)]).count(b"'caller_timeout':570"),1)
+        with self.assertRaises(RuntimeError):s.closed_integer_delta(raw,digest,[('"MIROFISH_PREP_LLM_TIMEOUT": "180"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',1,1)])  # the integer-only rule is unchanged elsewhere
+    def test_swarm_selector_is_full_participation_with_one_request_in_flight_per_platform(self):
+        raw=(s.W16/s.SELECTOR_REL).read_bytes()
+        for name,e in self.EXPECTED.items():
+            changed=s.swarm_selector_bytes(raw,name)
+            self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(changed))],['len(agent_configs)','list(range(24))','1.0'])
+            self.assertEqual(changed.count(b'semaphore=1,'),2);self.assertEqual(changed.count(b'semaphore=30,'),0)
+            self.assertIn(f"or args.max_rounds != {e['rounds']} or args.twitter_only".encode(),changed);self.assertIn(f"len(config['agent_configs']) <= {e['bound']}):".encode(),changed)
+            self.assertIn(b"'Owned child agent, round, platform or path cap violated'",changed)  # the refusal itself stays
+            self.assertIn(b"'max_tokens': 1024,",changed);self.assertNotIn(b"'max_tokens': 512,",changed)
+            self.assertIn(b'timeout=570,',changed);self.assertNotIn(b'timeout=180,',changed);self.assertIn(b'max_retries=0,',changed)
+            before,after=s.integer_literals(s.coverage_selector_bytes(raw,['len(agent_configs)','list(range(24))','1.0'])),s.integer_literals(changed);self.assertEqual(sum(a!=b for a,b in zip(before,after)),6)
+        coverage=s.coverage_selector_bytes(raw);self.assertEqual(coverage.count(b'semaphore=30,'),2);self.assertIn(b'timeout=180,',coverage)  # the earlier profile is untouched by the new code path
         self.assertEqual([ast.unparse(n.value) for n in s.selector_assignments(ast.parse(coverage))],['min(2, len(agent_configs))','list(range(24))','1.0'])
         with self.assertRaisesRegex(RuntimeError,'source drift'):s.swarm_selector_bytes(raw+b'\n','swarm48')
     def test_swarm_lifts_every_producer_cap_by_one_integer_each_and_keeps_the_refusals(self):
-        expected={'simulation_manager.py':[b'len(filtered.entities) <= 64:'],'simulation_config_generator.py':[b'len(entities) <= 64:'],
-                  'simulation_runner.py':[b'or max_rounds != 3 or enable_graph_memory_update',b"len(config['agent_configs']) <= 64):"],'owned_context_budget.py':[b'len(agents) <= 64:',b'OUTPUT_COMPLETION_TOKENS = 1024'],'owned_caller_budget.py':[b'CALLER_OUTPUT_LIMIT = 2560'],'mirofish_provenance.py':[b'<= self.max_age_seconds <= 14400:']}
-        self.assertEqual({Path(k).name for k in s.SWARM_PRODUCER},set(expected))
-        for relative,(original,edits) in s.SWARM_PRODUCER.items():
-            raw=(s.W16/relative).read_bytes();self.assertEqual(hashlib.sha256(raw).hexdigest(),original);changed=s.swarm_producer_bytes(relative,raw,'swarm48')
-            before,after=s.integer_literals(raw),s.integer_literals(changed);self.assertEqual(sum(a!=b for a,b in zip(before,after)),len(edits),relative)
-            for text in expected[Path(relative).name]:self.assertIn(text,changed)
-            self.assertEqual(raw.count(b'raise '),changed.count(b'raise '));self.assertEqual(raw.count(b"MIROFISH_TEST_ISOLATED"),changed.count(b"MIROFISH_TEST_ISOLATED"))
-            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_producer_bytes(relative,raw+b'\n','swarm48')
+        for name,e in self.EXPECTED.items():
+            expected={'simulation_manager.py':[f'len(filtered.entities) <= {e["bound"]}:'],'simulation_config_generator.py':[f'len(entities) <= {e["bound"]}:'],
+                      'simulation_runner.py':[f'or max_rounds != {e["rounds"]} or enable_graph_memory_update',f"len(config['agent_configs']) <= {e['bound']}):"],'owned_caller_budget.py':['CALLER_OUTPUT_LIMIT = 4096'],
+                      'mirofish_provenance.py':[f'<= self.max_age_seconds <= {e["wall"]}:'],'embedding_service.py':['        timeout: int = 570,']}
+            self.assertEqual({Path(k).name for k in s.SWARM_PRODUCER},set(expected))   # the memory file is a reviewed replacement, not a list entry
+            for relative,(original,edits) in s.SWARM_PRODUCER.items():
+                raw=(s.W16/relative).read_bytes();self.assertEqual(hashlib.sha256(raw).hexdigest(),original);changed=s.swarm_producer_bytes(relative,raw,name)
+                before,after=s.integer_literals(raw),s.integer_literals(changed);self.assertEqual(sum(a!=b for a,b in zip(before,after)),len(edits),relative)
+                for text in expected[Path(relative).name]:self.assertIn(text.encode(),changed)
+                self.assertEqual(raw.count(b'raise '),changed.count(b'raise '));self.assertEqual(raw.count(b"MIROFISH_TEST_ISOLATED"),changed.count(b"MIROFISH_TEST_ISOLATED"))
+                with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_producer_bytes(relative,raw+b'\n',name)
+    def test_swarm_memory_is_the_reviewed_replacement_with_the_profile_budget_and_reply_cap(self):
+        raw=(s.W16/s.MEMORY_REL).read_bytes();self.assertEqual(hashlib.sha256(raw).hexdigest(),s.MEMORY_CANONICAL_SHA);self.assertIn(b'INPUT_CONTEXT_TOKENS = 2048',raw)
+        reviewed=s.MEMORY_FILE.read_bytes();self.assertEqual(hashlib.sha256(reviewed).hexdigest(),s.MEMORY_REPLACEMENT_SHA)
+        self.assertNotIn(s.MEMORY_REL,s.SWARM_PRODUCER)
+        for name,e in self.EXPECTED.items():
+            staged=s.swarm_memory_bytes(raw,name)
+            for text in [f'INPUT_CONTEXT_TOKENS = {e["budget"]}','OUTPUT_COMPLETION_TOKENS = 1024',f'len(agents) <= {e["bound"]}:','class WholeUnitContextCreator','NO_SLICING_LIMIT = sys.maxsize',
+                         "version('camel-ai') != '0.2.78'","platform not in ('twitter', 'reddit')",'Provider completion cap or model shape drift','Unreviewed agent memory',"os.environ.get('MIROFISH_TEST_ISOLATED') != '1'"]:self.assertIn(text.encode(),staged,name)
+            self.assertNotIn(b'INPUT_CONTEXT_TOKENS = 2048',staged);self.assertNotIn(b'ScoreBasedContextCreator(model.token_counter, INPUT_CONTEXT_TOKENS)',staged)
+            before,after=s.integer_literals(reviewed),s.integer_literals(staged);self.assertEqual(sum(a!=b for a,b in zip(before,after)),3)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_memory_bytes(raw+b'\n',name)
+        original=s.MEMORY_REPLACEMENT_SHA;s.MEMORY_REPLACEMENT_SHA='0'*64
+        try:
+            with self.assertRaisesRegex(RuntimeError,'reviewed memory replacement changed'):s.swarm_memory_bytes(raw,'swarm8')
+        finally:s.MEMORY_REPLACEMENT_SHA=original
+    def test_swarm8_scenario_names_eight_invented_participants_and_is_sealed(self):
+        raw,seal=s.swarm_scenario('swarm8');value=json.loads(seal);text=raw.decode()
+        self.assertEqual((value['sha256'],value['bytes'],value['actor_count'],value['actual_model_calls_so_far'],value['recorded_at_utc']),(hashlib.sha256(raw).hexdigest(),len(raw),8,0,'2026-11-15T00:00:00+00:00'))
+        names=[line[2:].split(',')[0] for line in text.splitlines() if line.startswith('- ')];self.assertEqual((len(names),len(set(names))),(8,8))
+        for required in ['HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS.','none is a real person or firm','not participants','do not force a BUY','No real prices','three rounds']:self.assertIn(required,text)
+        self.assertEqual(json.loads(s.swarm_scenario('swarm48')[1])['recorded_at_utc'],'2026-11-11T00:00:00+00:00')  # the earlier seal is unchanged
+    def test_staged_swarm_folders_carry_the_memory_replacement_and_derived_numbers(self):
+        for name,folder in [('swarm48',s.CREW/'valedia-native-20261115-swarm48-a'),('swarm8',s.CREW/'valedia-native-20261115-swarm8-a')]:
+            if not (folder/'builder/candidate-manifest.json').exists():self.skipTest('staged folders follow tests')
+            manifest=json.loads((folder/'builder/candidate-manifest.json').read_text());n=s.swarm_numbers(name);p=manifest['swarm_profile']
+            self.assertEqual((p['name'],p['memory_budget'],p['caller_output'],p['wall'],p['chats']),(name,n['memory_budget'],4096,n['wall'],n['chats']));self.assertFalse(manifest['launch_authorized'])
+            self.assertEqual(p['memory_replacement']['canonical_sha256'],s.MEMORY_CANONICAL_SHA);self.assertEqual(p['memory_replacement']['replacement_sha256'],s.MEMORY_REPLACEMENT_SHA)
+            self.assertEqual((folder/s.MEMORY_REL).read_bytes(),s.swarm_memory_bytes((s.W16/s.MEMORY_REL).read_bytes(),name))
+            self.assertFalse((folder/'root-one-native-attempt.json').exists());self.assertFalse((folder/'builder/startup-preflight.json').exists());self.assertFalse((folder/'run1').exists())
     def test_swarm_scenario_is_labelled_hypothetical_and_sealed_with_its_exact_bytes(self):
         raw,seal=s.swarm_scenario('swarm48');value=json.loads(seal);text=raw.decode()
         self.assertEqual((value['sha256'],value['bytes'],value['actor_count'],value['actual_model_calls_so_far']),(hashlib.sha256(raw).hexdigest(),len(raw),48,0))
@@ -158,7 +222,8 @@ class NativeStaging(unittest.TestCase):
             with self.assertRaises(RuntimeError):s.ssd_device_bytes(raw,bad)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.ssd_device_bytes(raw+b'\n',16777245)
         swarm=s.swarm_startup_bytes(raw,'swarm48');both=s.ssd_device_bytes(swarm,16777245,hashlib.sha256(swarm).hexdigest())  # a swarm copy takes both deltas
-        for text in [b'CACHE_DEVICE=16777245',b'MAX_RECORDS=36001',b'(30 if preflight else 14400)']:self.assertIn(text,both)
+        n=s.swarm_numbers('swarm48')
+        for text in [b'CACHE_DEVICE=16777245',f'MAX_RECORDS={n["history_records"]}'.encode(),f'(30 if preflight else {n["wall"]})'.encode()]:self.assertIn(text,both)
         self.assertEqual(s.live_ssd_device(),s.CACHE_TARGET.stat().st_dev);self.assertEqual(s.live_ssd_device(),s.SSD_MOUNT.stat().st_dev)  # read as the launcher reads it
         with self.assertRaisesRegex(RuntimeError,'not on the SSD'):s.live_ssd_device(target=Path.home())  # a folder on another volume is never patched in
         with self.assertRaisesRegex(RuntimeError,'missing'):s.live_ssd_device(target=s.BASE/'cache/bionic/no-such-prompt-cache')

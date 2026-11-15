@@ -7,18 +7,26 @@ W16=CREW/'valedia-mirofish-fresh-20261106-caller-budget';RESUME=CREW/'valedia-re
 WORK=CREW/'valedia-native-20261108-compact-ontology'
 REPORT64_WORK=CREW/'valedia-native-20261108-report64'
 COVERAGE_WORK=CREW/'valedia-native-20261108-report64-coverage'
-PROFILES={'compact40':(40,60000),'report64':(64,100000),'report64_coverage':(64,100000),'swarm48':(640,1700000)}
-# The swarm profile (owner go-ahead 2026-11-11): a real many-agent run. Every number is closed here; none is a command-line option.
-# 48 named invented participants, every one acting in each of 3 rounds on both platforms, at most 2 requests in flight per platform so
-# nothing waits past the gateway's unchanged 170-second queue limit. One model call at a time, so the wall clock is hours, not minutes.
-# Reply caps: the gateway treats a reply cut off at its cap as fatal for the whole attempt. At the reviewed caps (1536 for
-# personas, ontology and report text; 512 for an agent's turn) a 4-agent run rarely gets near them; the second swarm attempt lost
-# its 28th persona to the 1536 cap after half an hour, and two small runs already saw a 423-token turn. So both caps are raised
-# (2560 and 1024), and the output budget with them so every admitted call can still reserve its cap.
-SWARM={'swarm48':{'actors':48,'agents_bound':64,'rounds':3,'chats':640,'output':1700000,'caller_output':2560,'native_output':1024,'embedding_attempts':1024,'embedding_texts':4096,
-                  'embedding_bytes':2097152,'wall':14400,'semaphore':2,'history_records':36001,'history_mib':64,
-                  'scenario':'mirofish_swarm48_scenario.txt','scenario_sha256':'999e56774f34df31ceef8fa344f061a22e704e9c2ee607faf0087f8446121357'}}
-SWARM_WORK=CREW/'valedia-native-20261111-swarm48'
+def _tools_module(name):
+    spec=importlib.util.spec_from_file_location('stage_'+name,Path(__file__).with_name(name+'.py'));module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+LIMITS=_tools_module('mirofish_swarm_limits')  # TMF2: every swarm cap and time limit is derived there, from measured constants
+# Swarm profiles (owner go-ahead 2026-11-11; the 2,048-token agent cap removed at the owner's instruction of 2026-11-15). Only the
+# inputs are closed here; none is a command-line option. Every derived number (model calls, output budget, time limits, wall clock,
+# host history) comes from mirofish_swarm_limits.derive(), and staging refuses a profile that breaks a coupling inequality. Every
+# configured agent acts in every round on both platforms, one request in flight per platform (dispatch is serial; more in flight
+# only adds waiting). Reply caps: a reply cut off at its cap is fatal for the whole attempt, so the caller cap is 4,096 (2,560 was 96%
+# used) and an agent turn's 1,024 (longest seen 738). The agent memory is the reviewed whole-unit memory (MEMORY_* below).
+# swarm8 is the proving profile: its 4,096-token memory is deliberately tight so whole units drop in a real run.
+# swarm48's 12,288 is PROVISIONAL until the proving run's memory readings have been read.
+SWARM={'swarm48':{'actors':48,'agents_bound':64,'rounds':3,'memory_budget':12288,'personas':52,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
+                  'scenario':'mirofish_swarm48_scenario.txt','scenario_sha256':'999e56774f34df31ceef8fa344f061a22e704e9c2ee607faf0087f8446121357','scenario_recorded_utc':'2026-11-11T00:00:00+00:00'},
+       'swarm8':{'actors':8,'agents_bound':16,'rounds':3,'memory_budget':4096,'personas':12,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
+                 'scenario':'mirofish_swarm8_scenario.txt','scenario_sha256':'641690f62eb67dd2175a45041b19278a22d07d892693b761da6a067de4f1a15e','scenario_recorded_utc':'2026-11-15T00:00:00+00:00'}}
+def swarm_numbers(profile):
+    """The profile's closed inputs and every number derived from them; refuses a profile that breaks any coupling inequality."""
+    inputs=SWARM[profile];derived=LIMITS.derive(inputs);broken=LIMITS.violations(inputs,derived);require(not broken,'swarm profile breaks: '+'; '.join(broken))
+    return dict(inputs,**derived,caller_output=LIMITS.CALLER_REPLY_CAP,native_output=LIMITS.AGENT_REPLY_CAP)
+SWARM_WORK=CREW/'valedia-native-20261111-swarm48';SWARM8_WORK=CREW/'valedia-native-20261115-swarm8'
 RUN_ORIGINAL_SHA='5fd72f92b52330c689f62ae35ee90c36ec4f0608d925c66f77d6b10548883650'
 STARTUP_ORIGINAL_SHA='45ad8faf47457f6d851fcfadc207cb24ee71d90c4602ab1723a3fe01782154fd'
 RUN_COPIES={'builder/review-source/mirofish_native_run.py','owned-source/observer-entry/mirofish_native_run.py','owned-source/worker-entry/mirofish_native_run.py'}
@@ -30,13 +38,32 @@ SWARM_PRODUCER={
  'owned-source/producer/backend/app/services/simulation_manager.py':('ab0ec6a1b7fd9de72f048d77e09512a730184a43db0fcfa0aaf0670f0df0af53',[('len(filtered.entities) <= 4:','len(filtered.entities) <= {agents}:')]),
  'owned-source/producer/backend/app/services/simulation_config_generator.py':('6faccfe744022e2ea996118f5111b2adf80cf0de17928792ee6d52b8fdc0034b',[('len(entities) <= 4:','len(entities) <= {agents}:')]),
  'owned-source/producer/backend/app/services/simulation_runner.py':('d08c5b346db26ce6ba88e8db2376d3c965ce747e1c507079ddd5f455bf659938',[('or max_rounds != 1 or enable_graph_memory_update','or max_rounds != {rounds} or enable_graph_memory_update'),("len(config['agent_configs']) <= 4):","len(config['agent_configs']) <= {agents}):")]),
- 'owned-source/producer/backend/scripts/owned_context_budget.py':('e68444293006bf759c71f78884e07630120ee9dbb4c2d4d38fcdc0cb6a50ddb3',[('len(agents) <= 4:','len(agents) <= {agents}:'),('OUTPUT_COMPLETION_TOKENS = 512','OUTPUT_COMPLETION_TOKENS = {native}')]),
  'owned-source/producer/backend/app/owned_caller_budget.py':('1ac9addd7cca1c3d32dbd3f21f47cc0aece7c90fb19bb5621d88d68116cb5e07',[('CALLER_OUTPUT_LIMIT = 1536','CALLER_OUTPUT_LIMIT = {caller}')]),
+ # The embedding client sits behind the same gateway arrival-to-done limit, so it outlasts that limit by 30 s like every other client.
+ 'owned-source/producer/backend/app/storage/embedding_service.py':('04612aee8b2a5b86981793e25ea07cdac1f149bd9fb464284223bd3930ebc460',[('        timeout: int = 180,','        timeout: int = {embedding_client},')]),
  # The final report check accepts a run only if its simulation began less than max_age_seconds earlier, and refuses a policy above
  # one hour. A swarm's simulation alone runs longer than that, so the ceiling follows the profile's wall clock. The paper step stays
  # bound to NVDA only, which this scenario never mentions: no paper action can follow from it.
  'owned-source/paper_app/src/mirofish_provenance.py':('e9b2da75bb59662a18c3a0e808801a1cc326bdd826919eaa7738550da1b34bf4',[('<= self.max_age_seconds <= 3600:','<= self.max_age_seconds <= {wall}:')]),
 }
+# The agent memory (TMF2 addendum 1; a change of logic in a pinned producer file, decided by the lead under the owner's instruction
+# of 2026-11-15 that the cap is to go). For a swarm profile the canonical owned_context_budget.py is checked against its pinned hash,
+# replaced by the reviewed whole-unit memory in tools/ (pinned by its own hash), and only then are the profile's integers set on it by
+# closed integer replacement. report64_coverage and the other profiles keep the canonical bytes.
+MEMORY_REL='owned-source/producer/backend/scripts/owned_context_budget.py'
+MEMORY_CANONICAL_SHA='e68444293006bf759c71f78884e07630120ee9dbb4c2d4d38fcdc0cb6a50ddb3'
+MEMORY_FILE=Path(__file__).with_name('mirofish_owned_agent_memory.py')
+MEMORY_REPLACEMENT_SHA='770f3c62d3ae6c2ce8f2ef822b349471a9caae7b222d553dc1a51dd3f9e5de73'
+MEMORY_EDITS=[('len(agents) <= 4:','len(agents) <= {agents}:'),('OUTPUT_COMPLETION_TOKENS = 512','OUTPUT_COMPLETION_TOKENS = {native}'),('INPUT_CONTEXT_TOKENS = 2048','INPUT_CONTEXT_TOKENS = {budget}')]
+MEMORY_WHAT_CHANGES=('The canonical file gave every agent the library\'s score-based context at 2,048 tokens; with a 1,100 to 1,700-token '
+    'persona inside it the library cut each feed into one-token chunks and kept only the last few dozen, so agents no longer read '
+    'their input, and a cut that left two assistant messages in a row was refused by the template admission. The replacement keeps '
+    'every guard of the canonical file (library versions, isolated runner, platform, agent count, model shape, memory type, the '
+    'provider reply cap) and gives each agent a whole-unit memory: no message is ever sliced; the model is given the system message '
+    'and the newest whole units (a unit is one user message and everything after it up to the next), older units dropped whole, '
+    'oldest first, with one INFO line; never two assistant messages in a row and never a tool result without its call; only if the '
+    'newest unit alone cannot fit is the newest user message trimmed from its end, with a marker line and one WARNING line; the '
+    'total never exceeds the profile\'s budget.')
 SCENARIO_SEAL_REL='scenario-input-seal.json'
 # The model server's internal SDK port. The reviewed sources fix the value seen on 2026-11-08; the server picks a new one each time
 # its app restarts, so a candidate staged later must carry the live port or it cannot connect at all. One integer, same closed check.
@@ -70,6 +97,8 @@ ACKNOWLEDGED_WITNESSES=[]  # filled by inputs(); written into the staged candida
 EXPECTED_CASES=['hash_matched_native_strict_tools','source_based_report_history_user_final','source_based_tool_cycle_tool_final']
 def require(value,why):
     if not value:raise RuntimeError(why)
+PROFILES={'compact40':(40,60000),'report64':(64,100000),'report64_coverage':(64,100000)}
+PROFILES.update({name:(swarm_numbers(name)['chats'],swarm_numbers(name)['output']) for name in SWARM})  # derived, never typed in
 def sha(path):
     with Path(path).open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
 def snapshot(path,limit=4*1024*1024):
@@ -242,27 +271,71 @@ def closed_integer_delta(raw,original_sha,edits):
     before,after=integer_literals(raw),integer_literals(changed);require(len(before)==len(after) and sum(a!=b for a,b in zip(before,after))==expected,'number of changed integer literals differs from the closed delta')
     return changed
 def swarm_gateway_bytes(raw,profile):
-    p=SWARM[profile];pairs=[('chat_attempts',40,p['chats']),('output_total',60000,p['output']),('embedding_attempts',64,p['embedding_attempts']),('embedding_texts',256,p['embedding_texts']),('embedding_total_bytes',131072,p['embedding_bytes']),('wall_seconds',2400,p['wall'])]
+    p=swarm_numbers(profile);pairs=[('chat_attempts',40,p['chats']),('output_total',60000,p['output']),('embedding_attempts',64,p['embedding_attempts']),('embedding_texts',256,p['embedding_texts']),('embedding_total_bytes',131072,p['embedding_bytes']),('wall_seconds',2400,p['wall'])]
     edits=[(f'{name}: int = {old}',f'{name}: int = {new}',1,1) for name,old,new in pairs]+[(f'"{name}": {old},',f'"{name}": {new},',1,1) for name,old,new in pairs]
+    # TMF2: the arrival-to-done and queue limits (default and reviewed maximum each) and the request byte limit follow the derivation.
+    arrival,queue=p['gateway_arrival_s'],p['gateway_queue_s']
+    edits+=[('client_seconds: int = 175',f'client_seconds: int = {arrival}',1,1),('"client_seconds": 175,',f'"client_seconds": {arrival},',1,1),
+            ('queue_seconds: int = 170',f'queue_seconds: int = {queue}',1,1),('"queue_seconds": 170}',f'"queue_seconds": {queue}}}',1,1),
+            ('request_bytes: int = 131072',f'request_bytes: int = {p["request_bytes"]}',1,1)]
     changed=closed_integer_delta(raw,GATEWAY_ORIGINAL_SHA,edits);nodes=gateway_budget_nodes(ast.parse(changed));require([n.value for n in nodes]==[p['chats'],p['output'],p['chats'],p['output']],'swarm gateway budget mismatch');return changed
 def swarm_run_bytes(raw,profile):
-    p=SWARM[profile];wall=p['wall']
-    return closed_integer_delta(raw,RUN_ORIGINAL_SHA,[('time.monotonic() + 2280',f'time.monotonic() + {wall-120}',1,1),
+    p=swarm_numbers(profile);wall=p['wall'];caller=p['caller_client_s']
+    # TMF2 addendum 1, ruling 1: the two caller timeouts are digit strings in the worker environment; closed_digit_delta proves that
+    # only those two strings and the stated integers differ.
+    return closed_digit_delta(raw,RUN_ORIGINAL_SHA,[('time.monotonic() + 2280',f'time.monotonic() + {p["worker_deadline_s"]}',1,1),
+        ('"MIROFISH_PREP_LLM_TIMEOUT": "180"',f'"MIROFISH_PREP_LLM_TIMEOUT": "{caller}"',1,1),('"MIROFISH_REPORT_LLM_TIMEOUT": "180"',f'"MIROFISH_REPORT_LLM_TIMEOUT": "{caller}"',1,1),
+        ("'caller_timeout':180,'gateway_arrival_seconds':175,'queue_seconds':170",f"'caller_timeout':{caller},'gateway_arrival_seconds':{p['gateway_arrival_s']},'queue_seconds':{p['gateway_queue_s']}",1,3),
         ('<= 4, "actual generated participant count outside bound"',f'<= {p["agents_bound"]}, "actual generated participant count outside bound"',1,1),
         ('"max_rounds": 1,',f'"max_rounds": {p["rounds"]},',1,1),("'wall_seconds':2400}",f"'wall_seconds':{wall}}}",1,1),
         ('deadline=start+2400',f'deadline=start+{wall}',1,1),("receipt['wall_seconds']<=2400",f"receipt['wall_seconds']<={wall}",1,1),
         ('research_only=False,max_age_seconds=3600)',f'research_only=False,max_age_seconds={wall})',1,1)])
 def swarm_startup_bytes(raw,profile):
-    p=SWARM[profile]
+    p=swarm_numbers(profile)
     return closed_integer_delta(raw,STARTUP_ORIGINAL_SHA,[('(30 if preflight else 2400)',f'(30 if preflight else {p["wall"]})',1,1),
         ('MAX_RECORDS=6001',f'MAX_RECORDS={p["history_records"]}',1,1),('MAX_BYTES=16*1024*1024',f'MAX_BYTES={p["history_mib"]}*1024*1024',1,1)])
 def swarm_producer_bytes(relative,raw,profile):
-    p=SWARM[profile];original,edits=SWARM_PRODUCER[relative]
-    return closed_integer_delta(raw,original,[(old,new.format(agents=p['agents_bound'],rounds=p['rounds'],wall=p['wall'],caller=p['caller_output'],native=p['native_output']),1,1) for old,new in edits])
+    p=swarm_numbers(profile);original,edits=SWARM_PRODUCER[relative]
+    return closed_integer_delta(raw,original,[(old,new.format(agents=p['agents_bound'],rounds=p['rounds'],wall=p['wall'],caller=p['caller_output'],native=p['native_output'],embedding_client=p['embedding_client_s']),1,1) for old,new in edits])
+def swarm_memory_bytes(raw,profile):
+    """The reviewed whole-unit memory in place of the canonical owned_context_budget.py, with the profile's three integers."""
+    p=swarm_numbers(profile);require(hashlib.sha256(raw).hexdigest()==MEMORY_CANONICAL_SHA,'original source drift: canonical owned_context_budget.py')
+    reviewed=snapshot(MEMORY_FILE);require(hashlib.sha256(reviewed).hexdigest()==MEMORY_REPLACEMENT_SHA,'reviewed memory replacement changed')
+    return closed_integer_delta(reviewed,MEMORY_REPLACEMENT_SHA,[(old,new.format(agents=p['agents_bound'],native=p['native_output'],budget=p['memory_budget']),1,1) for old,new in MEMORY_EDITS])
+DIGIT_STRING_KEYS=('MIROFISH_PREP_LLM_TIMEOUT','MIROFISH_REPORT_LLM_TIMEOUT')
+def closed_digit_delta(raw,original_sha,edits,string_keys=DIGIT_STRING_KEYS):
+    """closed_integer_delta, plus the two caller timeout values, which the worker environment holds as digit strings (TMF2
+    addendum 1). Same exact-fragment rule; then the two syntax trees must be identical except for constants, every changed constant
+    must be decimal digits before and after (an integer stays an integer, a string stays a string), a changed string must be the
+    value of one of `string_keys` in a dict literal, and exactly as many constants may change as the edits say."""
+    require(hashlib.sha256(raw).hexdigest()==original_sha,'original source drift before a closed digit delta');changed=raw;expected=0
+    for old,new,count,literals in edits:
+        old,new=old.encode(),new.encode();require(old!=new and changed.count(old)==count,'closed delta fragment missing or repeated: '+old.decode());changed=changed.replace(old,new);expected+=count*literals
+    before,after=ast.parse(raw),ast.parse(changed)
+    def masked(tree):
+        tree=copy.deepcopy(tree)
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Constant):node.value='<'+type(node.value).__name__+'>'
+        return ast.dump(tree,include_attributes=False)
+    require(masked(before)==masked(after),'source changed outside constants, or a constant changed type')
+    keys={}
+    for node in ast.walk(after):
+        if isinstance(node,ast.Dict):
+            for key,value in zip(node.keys,node.values):
+                if isinstance(key,ast.Constant) and isinstance(value,ast.Constant):keys[id(value)]=key.value
+    digits=lambda value:type(value) is int or (type(value) is str and value.isascii() and value.isdigit())
+    differing=0
+    for old,new in zip([n for n in ast.walk(before) if isinstance(n,ast.Constant)],[n for n in ast.walk(after) if isinstance(n,ast.Constant)]):
+        if old.value==new.value:continue
+        require(digits(old.value) and digits(new.value),'a changed constant is not decimal digits before and after')
+        require(type(new.value) is int or keys.get(id(new)) in string_keys,'a changed digit string is not one of the two caller timeouts')
+        differing+=1
+    require(differing==expected,'number of changed constants differs from the closed delta')
+    return changed
 def swarm_scenario(profile):
     p=SWARM[profile];raw=snapshot(Path(__file__).with_name(p['scenario']));require(hashlib.sha256(raw).hexdigest()==p['scenario_sha256'],'swarm scenario changed')
     text=raw.decode();require(text.startswith('HYPOTHETICAL RESEARCH SCENARIO, NOT CURRENT MARKET NEWS.') and sum(line.startswith('- ') for line in text.splitlines())==p['actors'],'swarm scenario must be labelled hypothetical and name exactly the closed number of participants')
-    seal={'recorded_at_utc':'2026-11-11T00:00:00+00:00','sha256':p['scenario_sha256'],'bytes':len(raw),'kind':'Pre-generation hypothetical public qualification input, not market observations','actor_count':p['actors'],'actual_model_calls_so_far':0}
+    seal={'recorded_at_utc':p['scenario_recorded_utc'],'sha256':p['scenario_sha256'],'bytes':len(raw),'kind':'Pre-generation hypothetical public qualification input, not market observations','actor_count':p['actors'],'actual_model_calls_so_far':0}
     return raw,(json.dumps(seal,indent=2)+'\n').encode()
 
 SELECTOR_REL='owned-source/producer/backend/scripts/run_parallel_simulation.py'
@@ -278,8 +351,9 @@ def swarm_selector_bytes(raw,profile):
     flight per platform (two integers); the child's own round and participant caps follow the profile (two integers). Agents'
     profiles, prompts and what they say stay the model's own."""
     step=coverage_selector_bytes(raw,['len(agent_configs)','list(range(24))','1.0'])
-    p=SWARM[profile]
+    p=swarm_numbers(profile)
     return closed_integer_delta(step,hashlib.sha256(step).hexdigest(),[('semaphore=30,',f'semaphore={p["semaphore"]},',2,1),
+        ('timeout=180,',f'timeout={p["agent_client_s"]},',1,1),  # the agent client outlasts the gateway arrival-to-done limit by 30 s
         ('or args.max_rounds != 1 or args.twitter_only',f'or args.max_rounds != {p["rounds"]} or args.twitter_only',1,1),
         ("len(config['agent_configs']) <= 4):",f"len(config['agent_configs']) <= {p['agents_bound']}):",1,1),
         ("'max_tokens': 512,",f"'max_tokens': {p['native_output']},",1,1)])
@@ -325,8 +399,10 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
                     elif str(relative) in SWARM_PRODUCER:closed=('producer:'+Path(str(relative)).name,lambda raw,name,key=str(relative):swarm_producer_bytes(key,raw,name))
                     if closed:
                         target=work/relative;changed=closed[1](target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='REVIEWED_CLOSED_SWARM_INTEGER_DELTA',file=closed[0],source_sha256=row['sha256'],sha256=sha(target))
+                    if str(relative)==MEMORY_REL:
+                        target=work/relative;changed=swarm_memory_bytes(target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='REVIEWED_MEMORY_REPLACEMENT_THEN_CLOSED_INTEGERS',canonical_sha256=MEMORY_CANONICAL_SHA,replacement_path=str(MEMORY_FILE),replacement_sha256=MEMORY_REPLACEMENT_SHA,source_sha256=row['sha256'],sha256=sha(target))
                     if str(relative)==SELECTOR_REL:
-                        target=work/relative;changed=swarm_selector_bytes(target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='SWARM_FULL_PARTICIPATION_THREE_RHS_AND_FIVE_CLOSED_INTEGERS',source_sha256=row['sha256'],sha256=sha(target))
+                        target=work/relative;changed=swarm_selector_bytes(target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='SWARM_FULL_PARTICIPATION_THREE_RHS_AND_SIX_CLOSED_INTEGERS',source_sha256=row['sha256'],sha256=sha(target))
                     if str(relative) in SCENARIO_COPIES or str(relative)==SCENARIO_SEAL_REL:
                         scenario,seal=swarm_scenario(profile);target=work/relative;mode=target.stat().st_mode&0o777;target.chmod(0o644);target.write_bytes(seal if str(relative)==SCENARIO_SEAL_REL else scenario);target.chmod(mode);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='SWARM_INVENTED_SCENARIO_REPLACES_QUALIFICATION_INPUT',source_sha256=row['sha256'],sha256=sha(target))
                 if profile=='report64_coverage' and str(relative)==SELECTOR_REL:
@@ -351,19 +427,37 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
     for name,raw in evidence_files.items():target=evidence/name;target.write_bytes(raw);pins.append({'path':str(target),'sha256':sha(target)})
     # Preserve copied proof manifests as historical ancestry; never rewrite their embedded old paths.
     staging_source=work/'builder/staging-source';staging_source.mkdir()
-    for name in ['mirofish_native_stage.py','test_mirofish_native_stage.py','test_mirofish_event_boundary.py','mirofish_acknowledged_revisions.json']:
+    for name in ['mirofish_native_stage.py','test_mirofish_native_stage.py','test_mirofish_event_boundary.py','mirofish_acknowledged_revisions.json']+(['mirofish_swarm_limits.py','test_mirofish_swarm_limits.py','mirofish_owned_agent_memory.py','test_mirofish_owned_agent_memory.py'] if profile in SWARM else []):
         target=staging_source/name;target.write_bytes(Path(__file__).with_name(name).read_bytes());pins.append({'path':str(target),'sha256':sha(target)})
-    owned_count=sum(1 for row in ancestry if Path(row['source']).is_relative_to(W16/'owned-source'));exact_owned=sum(1 for row in ancestry if row['kind']=='EXACT_ACCEPTED_W16_BYTES' and Path(row['source']).is_relative_to(W16/'owned-source'));owned_gateway=sum(1 for row in ancestry if row['kind']=='REVIEWED_FIXED_REPORT64_FOUR_INTEGER_DELTA' and Path(row['source']).is_relative_to(W16/'owned-source'));gateway_deltas=sum(row['kind']=='REVIEWED_FIXED_REPORT64_FOUR_INTEGER_DELTA' for row in ancestry);swarm_closed=[row for row in ancestry if row['kind']=='REVIEWED_CLOSED_SWARM_INTEGER_DELTA'];swarm_scenario_rows=sum(row['kind']=='SWARM_INVENTED_SCENARIO_REPLACES_QUALIFICATION_INPUT' for row in ancestry);swarm_selector=sum(row['kind']=='SWARM_FULL_PARTICIPATION_THREE_RHS_AND_FIVE_CLOSED_INTEGERS' for row in ancestry)
+    owned_count=sum(1 for row in ancestry if Path(row['source']).is_relative_to(W16/'owned-source'));exact_owned=sum(1 for row in ancestry if row['kind']=='EXACT_ACCEPTED_W16_BYTES' and Path(row['source']).is_relative_to(W16/'owned-source'));owned_gateway=sum(1 for row in ancestry if row['kind']=='REVIEWED_FIXED_REPORT64_FOUR_INTEGER_DELTA' and Path(row['source']).is_relative_to(W16/'owned-source'));gateway_deltas=sum(row['kind']=='REVIEWED_FIXED_REPORT64_FOUR_INTEGER_DELTA' for row in ancestry);swarm_closed=[row for row in ancestry if row['kind']=='REVIEWED_CLOSED_SWARM_INTEGER_DELTA'];swarm_scenario_rows=sum(row['kind']=='SWARM_INVENTED_SCENARIO_REPLACES_QUALIFICATION_INPUT' for row in ancestry);swarm_selector=sum(row['kind']=='SWARM_FULL_PARTICIPATION_THREE_RHS_AND_SIX_CLOSED_INTEGERS' for row in ancestry);memory_rows=sum(row['kind']=='REVIEWED_MEMORY_REPLACEMENT_THEN_CLOSED_INTEGERS' for row in ancestry)
     port_rows=[row for row in ancestry if row['kind']=='CLOSED_LIVE_SDK_PORT_ONE_INTEGER'];require(len(port_rows)==(2 if moved else 0),'SDK port delta must touch exactly the two model copies');port_owned=sum(Path(row['source']).is_relative_to(W16/'owned-source') for row in port_rows)
     device_rows=[row for row in ancestry if 'ssd_device_change' in row];require(len(device_rows)==(len(STARTUP_COPIES) if remounted else 0),'SSD device delta must touch exactly the three startup copies');device_owned=sum(row['kind']=='CLOSED_LIVE_SSD_DEVICE_ONE_INTEGER' and Path(row['source']).is_relative_to(W16/'owned-source') for row in device_rows)
-    if profile in SWARM:require(owned_count==72 and exact_owned+port_owned+device_owned==56 and sorted(row['file'] for row in swarm_closed)==sorted(['gateway']*3+['run']*3+['startup']*3+['producer:'+Path(k).name for k in SWARM_PRODUCER]) and swarm_selector==1 and swarm_scenario_rows==3 and gateway_deltas==0,'swarm source ancestry changed')
-    else:require(owned_count==72 and exact_owned+port_owned+device_owned==({'compact40':70,'report64':68,'report64_coverage':67}[profile]) and owned_gateway==(0 if profile=='compact40' else 2) and gateway_deltas==(0 if profile=='compact40' else 3) and not swarm_closed and not swarm_scenario_rows and not swarm_selector,'profile source ancestry changed');require(len({sha(work/relative) for relative in GATEWAY_COPIES})==1,'gateway copies inconsistent')
+    if profile in SWARM:require(owned_count==72 and exact_owned+port_owned+device_owned==55 and sorted(row['file'] for row in swarm_closed)==sorted(['gateway']*3+['run']*3+['startup']*3+['producer:'+Path(k).name for k in SWARM_PRODUCER]) and swarm_selector==1 and memory_rows==1 and swarm_scenario_rows==3 and gateway_deltas==0,'swarm source ancestry changed')
+    else:require(owned_count==72 and exact_owned+port_owned+device_owned==({'compact40':70,'report64':68,'report64_coverage':67}[profile]) and owned_gateway==(0 if profile=='compact40' else 2) and gateway_deltas==(0 if profile=='compact40' else 3) and not swarm_closed and not swarm_scenario_rows and not swarm_selector and not memory_rows,'profile source ancestry changed');require(len({sha(work/relative) for relative in GATEWAY_COPIES})==1,'gateway copies inconsistent')
     lineage={'manifest_pinned_owned_source_files':owned_count,'exact_owned_source_files':exact_owned,'reviewed_prompt_only_deltas':1,'profile':profile,'gateway_budget_deltas_total':gateway_deltas,'gateway_budget_deltas_owned':owned_gateway,'qualification_selector_deltas':sum(row['kind']=='EXPLICIT_BOUNDED_NATIVE_COVERAGE_QUALIFICATION_STIMULUS_THREE_RHS' for row in ancestry),'swarm_integer_delta_files':len(swarm_closed),'sdk_port':{'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port,'model_copies_changed':len(port_rows),'helper_script_changed':moved,'policy_rule_changed':moved,'why':'the local model server chooses a new internal SDK port each time its app restarts; a candidate is usable only while the server that was running at staging keeps running'},'ssd_device':{'reviewed':ORIGINAL_CACHE_DEVICE,'staged':ssd_device,'startup_copies_changed':len(device_rows),'route_record_changed':False,'why':'macOS numbers a volume when it mounts it, so a reboot or remount can change the SSD device number the launcher checks the prompt-cache target against; staging read the live number of the mounted SSD itself. builder/shared-cache-storage-route.json is the dated record of the 2026-11-07 routing and nothing reads it, so it keeps its 2026-11-07 number'},'swarm_selector_deltas':swarm_selector,'swarm_scenario_files_replaced':swarm_scenario_rows,'runtime_scaffolds':EMPTY_SCAFFOLDS,'historical_runtime_log_excluded':'owned-source/producer/backend/logs/2026-11-07.log (not manifest-pinned source)','base_manifest_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'source_copies':ancestry,'canonical_revision_witness':canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA),'historical_proof_policy':'Copied old manifests remain exact historical proof, not new target claims. Operational file paths in this derived manifest and all four generated policies/configs point at new work.','original713_and318':'713 selected pins unchanged; the one canonical extractor row in318 uses the exact closed witness; '+str(len(ACKNOWLEDGED_WITNESSES))+' other original files carry an owner-acknowledged later revision that is NOT copied into this candidate (the reviewed W16 bytes are); the remaining original pins are unchanged','owner_acknowledged_canonical_revisions':{'list_sha256':ACKNOWLEDGED_SHA,'count':len(ACKNOWLEDGED_WITNESSES),'copied_into_candidate':False,'witnesses':list(ACKNOWLEDGED_WITNESSES)},'no_model_graph_worker_paper_or_broker_actions':True};lineage_path=work/'builder/staging-ancestry.json';write(lineage_path,lineage);pins.append({'path':str(lineage_path),'sha256':sha(lineage_path)})
     derived=copy.deepcopy(manifest);derived['staging_profile']={'name':profile,'chat_attempts':PROFILES[profile][0],'requested_output_total':PROFILES[profile][1],'caller_output':1536,'native_probe_output':512,'global_output_per_call':4096,'context':32768,'coverage':'expected finite report coverage, not guaranteed; full report semantics unchanged','participation_stimulus':'EXPLICIT_BOUNDED_CARDINALITY_COVERAGE_QUALIFICATION_ONLY_NOT_NATURALISTIC_FORECAST' if profile=='report64_coverage' else 'FULL_PARTICIPATION_EVERY_ROUND_SWARM_LOAD_NOT_NATURALISTIC_FORECAST' if profile in SWARM else 'UNCHANGED_STOCHASTIC_SCHEDULE'};derived['files']=pins;derived['task_caller_budget']['global_gateway']=[PROFILES[profile][0],PROFILES[profile][1],4096];derived['task_caller_budget']['maximum_reserved']=2*512+(PROFILES[profile][0]-2)*1536;derived['known_blockers']=[];derived['launch_available']=True;
     if profile in SWARM:
-        p=SWARM[profile];derived['uniform_policy']=dict(derived.get('uniform_policy') or {},wall_seconds=p['wall'])
-        derived['staging_profile'].update(caller_output=p['caller_output'],native_output=p['native_output']);derived['task_caller_budget']['limit']=p['caller_output'];derived['task_caller_budget']['maximum_reserved']=2*512+(p['chats']-2)*p['caller_output']
-        derived['swarm_profile']=dict(p,name=profile,owner_decision='2026-11-11 go-ahead for a larger swarm profile',what_changed='Closed integers only in the gateway limits, the supervisor and host deadlines, and the participant bound and round count wherever the worker and the producer check them (five participant caps, three round caps), and the freshness window of the final report check, which now spans the run because a swarm cannot finish inside one hour; three selector right-hand sides so every configured agent takes part in every round; two concurrency integers; the scenario input and its seal. Reply caps are raised from 1536 to 2560 (personas, ontology, report text) and from 512 to 1024 (an agent turn), because a reply cut off at its cap is fatal to the whole attempt and a swarm makes hundreds of calls. The 175 s arrival-to-completion and 170 s queue limits, the 32768 context, the one dispatch slot, the poison-on-unknown rule, confinement and the paper-only handoff are unchanged.',what_it_is_not='The scenario and its 48 participants are invented, and every agent is made to take part in every round: this shows the pipeline at scale. It is not a forecast, not a naturalistic schedule and not evidence about any market.')
+        p=swarm_numbers(profile);derived['uniform_policy']=dict(derived.get('uniform_policy') or {},wall_seconds=p['wall'],caller_timeout=p['caller_client_s'],gateway_arrival_seconds=p['gateway_arrival_s'],queue_seconds=p['gateway_queue_s'])
+        derived['staging_profile'].update(caller_output=p['caller_output'],native_output=p['native_output'],agent_memory_tokens=p['memory_budget']);derived['task_caller_budget']['limit']=p['caller_output'];derived['task_caller_budget']['maximum_reserved']=2*512+(p['chats']-2)*p['caller_output']
+        derived['swarm_profile']=dict(p,name=profile,
+            owner_decision='2026-11-11 go-ahead for a larger swarm profile; on 2026-11-15 the owner asked for the 2,048-token agent cap to go. The numbers are the lead\'s, derived from the measurements of the stopped run valedia-native-20261114-swarm48-b. Launching remains the owner\'s decision.',
+            memory_replacement={'path':MEMORY_REL,'canonical_sha256':MEMORY_CANONICAL_SHA,'replacement':str(MEMORY_FILE),'replacement_sha256':MEMORY_REPLACEMENT_SHA,'staged_sha256':sha(work/MEMORY_REL),
+                                'what_changes':MEMORY_WHAT_CHANGES,'decision':'Owner\'s instruction of 2026-11-15 that the cap is to go; the design and the numbers are the lead\'s (TMF2 addendum 1).',
+                                'log_phrases':{'dropped_whole_units_info':'Owned memory dropped whole units','trimmed_newest_user_message_warning':'Owned memory trimmed the newest user message','must_stay_zero':['Slicing into smaller chunks','Context truncation performed']}},
+            budget_note=('PROVISIONAL: memory use at large prompts has never been measured on this Mac; this budget is to be set from the proving run (swarm8) readings, and swarm48 is not to be launched before they have been read.' if profile=='swarm48' else
+                         'The tight 4,096-token budget is the point: it makes whole units drop in a real run and shows that such prompts pass the template admission, before a multi-hour run is spent.'),
+            derivation={'source':'tools/mirofish_swarm_limits.py','window':'1.25 x memory budget + 1750 + 1024 <= 32768 ('+str(p['window_need'])+')',
+                        'worst_single_call':'(32768 - reply cap)/188 + reply cap/23.6 + 27: agent '+str(p['agent_worst_s'])+' s, caller '+str(p['caller_worst_s'])+' s',
+                        'call_slot':'worst single call x 1.10, rounded up to 30 s: agent '+str(p['agent_slot_s'])+' s, caller '+str(p['caller_slot_s'])+' s',
+                        'gateway_arrival':'max(2 agent calls in flight x agent slot, 1 caller call x caller slot) = '+str(p['gateway_arrival_s'])+' s',
+                        'gateway_queue':'(calls in flight - 1) x agent slot = '+str(p['gateway_queue_s'])+' s',
+                        'clients':'gateway arrival + 30 s = '+str(p['agent_client_s'])+' s (agent, persona/config, report and embedding clients)',
+                        'request_bytes':'32768 tokens x 5.28 bytes per token (largest measured) = '+str(p['request_bytes_need'])+' <= '+str(p['request_bytes']),
+                        'chats':'(setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+') x 1.5, rounded up to 32 = '+str(p['chats']),
+                        'output':'2 x 512 + (chats - 2) x 4096 = '+str(p['reserve_need'])+', rounded up to 100,000',
+                        'wall':'1.2 x (start 15 s + setup '+str(p['setup_s'])+' s + simulation at full memory '+str(p['ceiling_sim_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s'},
+            what_changed='Closed integers in the gateway limits (model calls, output, embeddings, wall clock, arrival-to-done '+str(p['gateway_arrival_s'])+' s, queue '+str(p['gateway_queue_s'])+' s, request bytes '+str(p['request_bytes'])+'), the supervisor and host deadlines and the host history, the participant bound and round count wherever the worker and the producer check them, the report check\'s freshness window (it spans the run), the agent client timeout and concurrency (one request in flight per platform), the embedding client timeout; two digit strings, the persona/config and report client timeouts ('+str(p['caller_client_s'])+' s, proven by closed_digit_delta); three selector right-hand sides so every configured agent acts in every round; the scenario input and its seal. Reply caps: 4,096 for personas, ontology, config and report text, 1,024 for an agent turn. The agent memory is the reviewed whole-unit memory with a budget of '+str(p['memory_budget'])+' library tokens (see memory_replacement). Why: every simulation agent\'s whole context had been 2,048 tokens, so the library shredded each feed into one-token chunks and the run of 2026-11-15 was stopped after five template refusals; every limit that had been sized for 3,000-token prompts is now derived from one block of measured constants. Unchanged: the 32,768 context, the 4,096 per-call output ceiling, the one dispatch slot, the 10 s context admission, the template admission, the poison-on-unknown rule, confinement and the paper-only handoff.',
+            what_it_is_not='The scenario and its participants are invented, and every agent is made to take part in every round: this shows the pipeline at scale. It is not a forecast, not a naturalistic schedule and not evidence about any market.')
     derived['launch_authorized']=False;derived['source_status']='W16_COMPACT_ONTOLOGY_PLUS_CLOSED_'+profile.upper()+'_FOR_ROOT_GATED_QUALIFICATION';derived['intentional_canonical_source_revision']=canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA);derived['old_authority_policy']='Old v1 receipts/stores/hash3c053002 remain unchanged. New source extraction/replays are versioned derived artifacts, not new live proof or rewritten authority.';derived['qualification_stimulus']={'enabled':profile=='report64_coverage','scope':'Only three selector RHS: min(2,N) configured valid agents per platform, all24 hours, probability1.0; random.sample identities/order unchanged. Generated configs/prompts/agent content unchanged. No forced action, answer, direction, trade or weakening of >=2 actual completed200 native forwards. Naturalistic forecasting is not claimed.','selector_original_sha256':SELECTOR_ORIGINAL_SHA,'selector_staged_sha256':sha(work/SELECTOR_REL)};derived['metadata_reuse_impact']={'evidence':METADATA_SHA,'scope':'Format conformance reused only: same roles, tools, schemas, LLMClient, SDK/model/tokenizer; only declared ontology prompt content, opt-in four gateway budget integers and optional explicit qualification participation schedule differ; gateway format/guards unchanged, and every actual request still requires actual SDK/frozen comparison. No new model quality or prep success claimed.','ontology_change':{'source_sha256':ONTOLOGY_ORIGINAL_SHA,'staged_sha256':sha(work/ONTOLOGY_REL),'constant':'ONTOLOGY_SYSTEM_PROMPT','functions_and_other_constants':'AST_IDENTICAL'}};derived['derived_from']={'base_candidate_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'removed_metadata_prerequisite':'ACTUAL_SUPPORTED_THREE_CASE_METADATA_ACCEPTED','moved_from_runtime_blockers_to_post_run':'NO_COMPLETED_GENUINE_NATIVE_AGENT_FORWARD_EVIDENCE_FOR_REPAIRED_CODE'};derived['qualification_status']={'native_forward':'PENDING_POST_RUN_ALL_NATIVE_CHATS_COMPLETED_DISPATCHED_200','fresh_report':'PENDING_POST_RUN_EXACT_CAPTURE_AND_VALIDATE','local_paper':'PENDING_GENUINE_EXTRACTED_SIGNAL_MAY_REFUSE_FIXED_BUY','assistant_final_continuation':'UNSUPPORTED','launch_available_means':'eligible for qualification only; separate expiring one-use root receipt required','model_selected_execution_or_profit':'NOT_CLAIMED'}
     derived['sdk_port_revision']={'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port}
     derived['ssd_device_revision']={'reviewed':ORIGINAL_CACHE_DEVICE,'staged':ssd_device}
@@ -382,5 +476,5 @@ def assert_staged(work,manifest):
     require(manifest['launch_authorized'] is False and manifest['qualification_status']['native_forward'].startswith('PENDING'),'fabricated launch/native qualification')
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--stage',action='store_true');parser.add_argument('--profile',choices=tuple(PROFILES),default='compact40');parser.add_argument('--work',type=Path);args=parser.parse_args(argv);storage_guard();os.environ['TMPDIR']=str(BASE/'project/tmp');data=inputs()
-    selected_work=args.work or {'compact40':WORK,'report64':REPORT64_WORK,'report64_coverage':COVERAGE_WORK,'swarm48':SWARM_WORK}[args.profile];result=stage(selected_work,data,args.profile,live_sdk_port(),live_ssd_device()) if args.stage else {'status':'INPUTS_VERIFIED_NO_STAGE_NO_LOAD','base_sha256':BASE_SHA,'metadata_sha256':METADATA_SHA};print(json.dumps(result));return 0
+    selected_work=args.work or {'compact40':WORK,'report64':REPORT64_WORK,'report64_coverage':COVERAGE_WORK,'swarm48':SWARM_WORK,'swarm8':SWARM8_WORK}[args.profile];result=stage(selected_work,data,args.profile,live_sdk_port(),live_ssd_device()) if args.stage else {'status':'INPUTS_VERIFIED_NO_STAGE_NO_LOAD','base_sha256':BASE_SHA,'metadata_sha256':METADATA_SHA};print(json.dumps(result));return 0
 if __name__=='__main__':raise SystemExit(main())
