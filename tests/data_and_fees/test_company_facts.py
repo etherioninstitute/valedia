@@ -4562,3 +4562,371 @@ def test_t36a_on_equal_fetch_times_the_larger_rowid_is_the_later_row(tmp_path, f
             assert fc.decode(body) == ("D", cf.canonical_json(fc.diff(_value36(i - 1), _value36(i))))
         _check_known(db, known)
     assert cf.as_of(db, "AAA", "profile", T0 + 100)["body"] == _value36(2)
+
+
+# ---- T36a addendum 3. H1: no reading depends on nesting or on the caller's stack; H2: the body is the parse of the proved
+# text; H3: every body read as bytes, one sentence for damage; H5: no encoded row while the main file says version 1
+
+DEPTHS3 = [1, 10, 64, 65, 100, 500, 800, 900, 985, 995, 1500]
+CALLERS3 = [0, 100, 300, 900]
+BULK3 = "".join(map(str, random.Random(3).choices(range(10), k=3000)))      # 3,000 random digits: a full copy is large
+
+
+def _deep_text3(n, kind, day):
+    """An answer object nesting exactly `n` levels (the object itself is one): a long string that never changes, and a
+    value under "deep" inside n - 1 levels of objects ("o"), arrays ("a") or both in turn ("m"), ending in `day`."""
+    opens, closes = [], []
+    for i in range(n - 1):
+        k = "oa"[i % 2] if kind == "m" else kind
+        opens.append('{"k":' if k == "o" else "[")
+        closes.append("}" if k == "o" else "]")
+    return ('{"bulk":"%s","deep":%s%d%s}' % (BULK3, "".join(opens), day, "".join(reversed(closes)))).encode()
+
+
+def _tokens3(v):
+    """The value as a flat list of (type, key order, scalar repr), made without recursion: equal lists mean equal values
+    with equal key order and equal number types."""
+    out, todo = [], [v]
+    while todo:
+        x = todo.pop()
+        t = type(x)
+        if t is dict:
+            out.append(("dict", tuple(x)))
+            todo.extend(reversed(list(x.values())))
+        elif t is list:
+            out.append(("list", len(x)))
+            todo.extend(reversed(x))
+        else:
+            out.append((t.__name__, float.__repr__(x) if t is float else x))
+    return out
+
+
+def _at_depth3(n, fn):
+    return fn() if n == 0 else _at_depth3(n - 1, fn)
+
+
+def _outcome3(mod, db, when, frames):
+    try:
+        got = _at_depth3(frames, lambda: mod.as_of(db, "AAA", "profile", when))
+    except mod.Refused as e:
+        return ("damaged",) if str(e) == _damaged_text() else ("refused", str(e)[:60])
+    except RecursionError:
+        return ("RecursionError",)
+    except Exception as e:                                      # noqa: BLE001 - every outcome is recorded, none hidden
+        return (type(e).__name__,)
+    if got is None:
+        return ("none",)
+    return ("ok", got["body_sha256"], got["fetched_at"], _tokens3(got["body"]))
+
+
+def _collect3(mod, db, answer, day):
+    clock = Clock(T0 + day * 86400)
+    fetch = Finnhub(clock, {("/stock/profile2", "AAA"): [answer]})
+    return mod.collect(["AAA"], db, fetch=fetch, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY,
+                       monotonic=clock.monotonic)
+
+
+SCENARIOS3 = {"first": lambda n, k: [_deep_text3(n, k, 0)],
+              "from_shallow": lambda n, k: [_deep_text3(1, k, 0), _deep_text3(n, k, 1)],
+              "from_deep": lambda n, k: [_deep_text3(n, k, 0), _deep_text3(n, k, 1), _deep_text3(n, k, 2)]}
+
+
+def _short3(o):
+    return "ok" if o[0] == "ok" else o[0]
+
+
+@pytest.mark.parametrize("n", DEPTHS3)
+def test_t36a_a_deep_answer_reads_as_the_reference_reads_it_from_every_caller_stack(tmp_path, n):
+    ref = _reference_module()
+    table = []
+    for kind in ("o", "a", "m"):
+        for scen, make in SCENARIOS3.items():
+            answers = make(n, kind)
+            dbs = {}
+            for writer, mod in (("ref", ref), ("this", cf)):
+                d = tmp_path / ("%s_%s_%s" % (writer, kind, scen))
+                d.mkdir()
+                dbs[writer] = d / "cf.sqlite"
+                for day, a in enumerate(answers):
+                    _collect3(mod, dbs[writer], a, day)
+            forms = _forms(dbs["this"], "AAA", "profile")
+            deep_d = n > 64 and "D" in forms                                    # a changed-fields row for a deep value
+            for day in range(len(answers)):
+                when = T0 + day * 86400 + 5
+                r = [_outcome3(ref, dbs["ref"], when, f) for f in CALLERS3]
+                a = [_outcome3(cf, dbs["ref"], when, f) for f in CALLERS3]
+                b = [_outcome3(cf, dbs["this"], when, f) for f in CALLERS3]
+                for i in range(len(CALLERS3)):
+                    if r[i][0] == "ok":
+                        assert a[i] == r[i] and b[i] == r[i], (kind, scen, day, CALLERS3[i])
+                for x in (a, b):
+                    pattern = [o[0] == "ok" for o in x]
+                    if len(set(pattern)) > 1:                                    # reads at one caller depth, not another:
+                        assert pattern == [o[0] == "ok" for o in r], (kind, scen, day, x)   # only as the reference does
+                table.append("%s %s d%d forms=%s ref=%s this(ref store)=%s this(own store)=%s" % (
+                    kind, scen, day, forms, "/".join(map(_short3, r)), "/".join(map(_short3, a)), "/".join(map(_short3, b))))
+            for p_ in dbs.values():
+                shutil.rmtree(p_.parent)
+            assert not deep_d, (kind, scen, forms)                              # (MAX_PATCH_DEPTH is 64)
+    assert cf.MAX_PATCH_DEPTH == 64
+    print("T36a H1 depth %d (callers %s):\n  %s" % (n, CALLERS3, "\n  ".join(table)), file=sys.stderr)
+
+
+@pytest.mark.parametrize("kind", ["o", "a", "m"])
+def test_t36a_a_value_nesting_64_levels_may_be_changed_fields_and_one_of_65_never(tmp_path, kind):
+    for n, want in ((64, "FD"), (65, "FF")):
+        d = tmp_path / str(n)
+        d.mkdir()
+        _collect3(cf, d / "cf.sqlite", _deep_text3(n, kind, 0), 0)
+        _collect3(cf, d / "cf.sqlite", _deep_text3(n, kind, 1), 1)
+        assert _forms(d / "cf.sqlite", "AAA", "profile") == want, n
+    d = tmp_path / "into"                                                     # shallow base, deep new value: full
+    d.mkdir()
+    _collect3(cf, d / "cf.sqlite", _deep_text3(3, kind, 0), 0)
+    _collect3(cf, d / "cf.sqlite", _deep_text3(65, kind, 1), 1)
+    _collect3(cf, d / "cf.sqlite", _deep_text3(3, kind, 2), 2)                 # and deep base, shallow new value: full
+    assert _forms(d / "cf.sqlite", "AAA", "profile") == "FFF"
+
+
+def test_t36a_compact_stores_a_deep_value_full(tmp_path):
+    vals = [json.loads(_deep_text3(n, "m", i)) for i, n in enumerate((3, 70, 70, 3, 64, 64))]
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, v) for i, v in enumerate(vals)])
+    before = _every_answer(db, [("AAA", "profile")])
+    cf.compact(db)
+    assert _forms(db, "AAA", "profile") == "FFFFDD"                            # 3, 70, 70, 3: full; 64 on 3, 64 on 64: changed
+    assert _every_answer(db, [("AAA", "profile")]) == before
+
+
+def test_t36a_the_body_returned_is_the_parse_of_the_proved_text_whatever_the_base_looks_like(tmp_path):
+    """H2: a plain base reformatted (keys in another order, value and hash kept), then a changed-fields row: the body's
+    key order and number types are those of the canonical text, as the earlier revision would give them."""
+    v0 = {"z": 1, "a": {"y": 2.0, "b": [1, 1.0]}, "m": 0, "bulk": BULK3}
+    v1 = dict(v0, m=1)                                                       # no key added: nothing re-sorts the keys
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0, v0)])
+    reordered = json.dumps({"z": 1, "m": 0, "bulk": BULK3, "a": {"y": 2.0, "b": [1, 1.0]}}, separators=(",", ":"))
+    assert reordered != cf.canonical_json(v0) and json.loads(reordered) == v0
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE observations SET body=? WHERE fetched_at=?", (reordered, T0))
+    conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", ("AAA", "profile", T0 + 100, cf.body_sha256(cf.canonical_json(v1)),
+                                                                 fc.encode_changed(cf.canonical_json(fc.diff(v0, v1)))))
+    conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    conn.close()
+    with pytest.raises(cf.Refused) as e:                                      # the base itself: its text is not its hash's
+        cf.as_of(db, "AAA", "profile", T0)
+    assert str(e.value) == _damaged_text()
+    got = cf.as_of(db, "AAA", "profile", T0 + 100)
+    canonical = json.loads(cf.canonical_json(v1))
+    assert got["body"] == v1 and _tokens3(got["body"]) == _tokens3(canonical)
+    assert json.dumps(got["body"]) == json.dumps(canonical)
+
+
+MARK3 = b"SECRET-BODY-BYTES"
+
+
+def _bad_utf8_store(tmp_path, where):
+    """A store whose plain row is not UTF-8 (`where`: "asked" the row asked for, "passed" the base of a changed-fields
+    row asked for). Its bytes carry MARK3, so any message quoting the body shows it."""
+    v0, v1 = {"a": 1, "bulk": BULK3}, {"a": 2, "bulk": BULK3}
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0, v0)])
+    conn = sqlite3.connect(db)
+    bad = b'{"a":1,"x":"' + MARK3 + b'\xff\xfe"}'
+    conn.execute("UPDATE observations SET body=CAST(? AS TEXT) WHERE fetched_at=?", (bad, T0))
+    if where == "passed":
+        conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", ("AAA", "profile", T0 + 100, cf.body_sha256(cf.canonical_json(v1)),
+                                                                     fc.encode_changed(cf.canonical_json(fc.diff(v0, v1)))))
+        conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    assert conn.execute("SELECT typeof(body) FROM observations WHERE fetched_at=?", (T0,)).fetchone() == ("text",)
+    conn.close()
+    return db, (T0 if where == "asked" else T0 + 100)
+
+
+@pytest.mark.parametrize("where", ["asked", "passed"])
+def test_t36a_a_text_body_that_is_not_utf8_is_the_damaged_refusal_in_one_sentence_with_no_byte_of_it(tmp_path, where, capsys):
+    db, when = _bad_utf8_store(tmp_path, where)
+    with pytest.raises(cf.Refused) as e:
+        cf.as_of(db, "AAA", "profile", when)
+    assert str(e.value) == _damaged_text()
+    conn = sqlite3.connect(db)                                                 # a caller's own connection: the same refusal
+    try:
+        with pytest.raises(cf.Refused) as e:
+            cf.as_of(conn, "AAA", "profile", when)
+        assert str(e.value) == _damaged_text()
+    finally:
+        conn.close()
+    iso = datetime.fromtimestamp(when, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for argv in (["show", "AAA", "--kind", "profile", "--as-of", iso], ["show", "AAA"], ["status"]):
+        cf.main(argv + ["--db", str(db)])
+        out = capsys.readouterr()
+        for text in (out.out, out.err):
+            assert MARK3.decode() not in text and "�" not in text and "Traceback" not in text
+    got = cf.compact(db)                                                       # left as found, counted
+    assert got["damaged"] == 1
+
+
+def _snapshot_holder(db):
+    """A second process holding a read snapshot of `db` until its stdin closes."""
+    code = ("import sqlite3, sys\n"
+            "c = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+            "c.execute('BEGIN')\n"
+            "c.execute('SELECT count(*) FROM observations').fetchone()\n"
+            "print('holding', flush=True)\n"
+            "sys.stdin.read()\n"
+            "c.execute('COMMIT')\n")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=_child_env(), text=True)
+    assert proc.stdout.readline().strip() == "holding"
+    return proc
+
+
+def _release(proc):
+    proc.stdin.close()
+    proc.wait(timeout=30)
+
+
+@pytest.mark.parametrize("writer", ["collect", "compact"])
+def test_t36a_a_raise_a_reader_holds_back_is_a_one_line_refusal_with_no_row_written(tmp_path, writer, capsys):
+    v = [{"a": i, "bulk": BULK3} for i in range(3)]
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, v[i]) for i in range(2)])
+    before = _all_rows(db)
+    known = _every_answer(db, [("AAA", "profile")])
+    ref = _reference_module()
+    proc = _snapshot_holder(db)
+    try:
+        argv = (["compact"] if writer == "compact" else ["collect", "--symbols", "AAA"]) + ["--db", str(db)]
+        if writer == "collect":
+            with pytest.raises(cf.Refused) as e:
+                _collect3(cf, db, json.dumps(v[2]).encode(), 1)
+            msg = str(e.value)
+        else:
+            assert cf.main(argv) == 2
+            msg = capsys.readouterr().err.strip()
+        assert "\n" not in msg and "still says version 1 in its main file" in msg and "no row was written" in msg
+        assert _header_version(db) == 1 and _all_rows(db) == before                   # nothing else written
+        assert rows(tmp_path, "SELECT count(*) FROM runs") == [(0,)]
+        assert _every_answer(db, [("AAA", "profile")]) == known                       # read correctly by this revision
+        for at in (T0, T0 + 1, T0 + 5):                                               # and by the earlier one
+            assert ref.as_of(db, "AAA", "profile", at)["body"] == cf.as_of(db, "AAA", "profile", at)["body"]
+    finally:
+        _release(proc)
+    if writer == "collect":                                                           # the next run tries again
+        r = _collect3(cf, db, json.dumps(v[2]).encode(), 1)
+        assert r.stored >= 1 and _forms(db, "AAA", "profile") == "PPD"
+    else:
+        assert cf.compact(db)["changed"] == 1 and _forms(db, "AAA", "profile") == "FD"
+    assert _header_version(db) == 2
+    after = _every_answer(db, [("AAA", "profile")])
+    assert {k: after[k] for k in known} == known
+
+
+@pytest.mark.parametrize("writer", ["collect", "compact"])
+def test_t36a_unhindered_the_main_files_header_says_2_before_the_first_row_is_written(tmp_path, monkeypatch, writer):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, {"a": i, "bulk": BULK3}) for i in range(2)])
+    assert _header_version(db) == 1
+    seen = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        conn = real(*a, **k)
+        if (a[0] if a else k.get("database")) == str(db):
+            conn.set_trace_callback(lambda s: seen.append((s, _header_version(db))))
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    if writer == "collect":
+        _collect3(cf, db, json.dumps({"a": 9, "bulk": BULK3}).encode(), 1)
+    else:
+        cf.compact(db)
+    monkeypatch.undo()
+    writes = [i for i, (s, _) in enumerate(seen) if s.split()[0].upper() in ("INSERT", "UPDATE")]
+    up = [i for i, (s, _) in enumerate(seen) if s == "PRAGMA user_version=2"]
+    assert writes and up and up[0] < writes[0]
+    assert all(h == 2 for _, h in seen[writes[0]:]), seen[writes[0]]
+    assert any("wal_checkpoint" in s for s, _ in seen[up[0]:writes[0]])
+    assert "D" in _forms(db, "AAA", "profile") or writer == "collect"
+
+
+KILL_RAISE3 = r'''
+import json, os, signal, sqlite3, sys
+from valedia_trader.data_and_fees import company_facts as cf
+db, n, writer, t0, bulk = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4]), sys.argv[5]
+count = [0]
+real = sqlite3.connect
+def cb(s):
+    count[0] += 1
+    if count[0] == n:
+        os.kill(os.getpid(), signal.SIGKILL)
+def spy(*a, **k):
+    c = real(*a, **k)
+    if (a[0] if a else k.get("database")) == db:
+        c.set_trace_callback(cb)
+    return c
+sqlite3.connect = spy
+now = [t0]
+def fetch(url, headers):
+    if "profile2" in url:
+        return json.dumps({"a": 9, "bulk": bulk}).encode(), {}
+    if "calendar" in url:
+        return b'{"earningsCalendar":[]}', {}
+    if "metric" in url or "insider" in url:
+        return b'{"x":1}', {}
+    return b"[]", {}
+def sleep(s):
+    now[0] += s
+if writer == "collect":
+    cf.collect(["AAA"], db, fetch=fetch, clock=lambda: now[0], sleep=sleep, credentials=lambda n: "fhk-9Q7xT2mLpW4vB8nZc3RsD6aYe1UjHg0K",
+               monotonic=lambda: now[0])
+else:
+    cf.compact(db)
+print("finished", count[0], flush=True)
+'''
+
+
+@pytest.mark.parametrize("writer", ["collect", "compact"])
+def test_t36a_a_kill_at_every_statement_of_the_raise_leaves_version_1_with_no_encoded_row_or_version_2(tmp_path, writer):
+    (tmp_path / "t").mkdir()
+    template = _plain_store(tmp_path / "t" / "cf.sqlite", [("AAA", "profile", T0 + i, {"a": i, "bulk": BULK3}) for i in range(3)])
+    known = _every_answer(template, [("AAA", "profile")])
+    ref = _reference_module()
+    kills, n, outcomes = 0, 1, set()
+    while True:
+        d = tmp_path / ("k%d" % n)
+        shutil.copytree(template.parent, d)
+        db = d / "cf.sqlite"
+        p = subprocess.run([sys.executable, "-c", KILL_RAISE3, str(db), str(n), writer, repr(T0 + 86400), BULK3],
+                           capture_output=True, text=True, env=_child_env(), timeout=120)
+        finished = p.returncode == 0 and p.stdout.startswith("finished")
+        assert finished or p.returncode == -signal.SIGKILL, p.stderr[-300:]
+        if not finished:
+            kills += 1
+        header = _header_version(db)                       # before any connection of the test's own (a last close checkpoints)
+        assert header in (1, 2)
+        if header == 1:                                                              # the earlier revision reads it as before
+            for at in (T0, T0 + 1, T0 + 2):
+                assert ref.as_of(db, "AAA", "profile", at)["body"] == {"a": at - T0, "bulk": BULK3}
+        cf.status(db)                                                                # the store opens whole
+        ro = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        try:
+            forms = "".join("P" if t == "text" else "E" for (t,) in ro.execute(
+                "SELECT typeof(body) FROM observations WHERE kind='profile' ORDER BY fetched_at, rowid"))
+        finally:
+            ro.close()
+        if header == 1:
+            assert set(forms) <= {"P"}, (n, forms)                                   # never an encoded row under a 1
+        got = _every_answer(db, [("AAA", "profile")])
+        assert {k: w for k, w in got.items() if k[2] < T0 + 3} == known, n
+        outcomes.add((header, "E" in forms))
+        if writer == "collect":                                                      # a rerun finishes
+            r = _collect3(cf, db, json.dumps({"a": 9, "bulk": BULK3}).encode(), 2)
+            assert r.stopped is None and _header_version(db) == 2
+        else:
+            cf.compact(db)
+            assert _header_version(db) == 2 and _forms(db, "AAA", "profile") == "FDD"
+        assert {k: w for k, w in _every_answer(db, [("AAA", "profile")]).items() if k[2] < T0 + 3} == known
+        shutil.rmtree(d)
+        if finished:
+            break
+        n += 1
+    assert kills >= 10 and (1, False) in outcomes and any(h == 2 for h, _ in outcomes), (kills, outcomes)
+    print("T36a H5 %s: %d kills, one at each statement, outcomes (header, encoded rows) %s" % (writer, kills, sorted(outcomes)),
+          file=sys.stderr)

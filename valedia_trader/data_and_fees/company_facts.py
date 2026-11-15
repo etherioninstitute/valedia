@@ -30,12 +30,17 @@ since the row before it (one zlib stream of a patch, marked \x01D). A changed-fi
 just before it among the rows of that symbol and kind with a possible fetch time, in (fetched_at, rowid) order, the order
 `as_of` reads. A row is read by walking back from it to the nearest plain or full row, in one SELECT of at most
 MAX_DELTAS + 2 rows of which none was fetched after `when`, parsing that row once, applying the patches forward and proving
-the result's canonical text against the hash of the row asked for. More than MAX_DELTAS changed-fields rows in a row, the
-start of the rows reached with no plain or full row, a body or patch that does not read, or a result whose hash differs:
-the row is refused as damaged, never returned. A new answer is stored changed-fields only when the row before it reads
-back whole, both are objects, the run stays within MAX_DELTAS rows, the patch applied to the base gives exactly the
+the result's canonical text against the hash of the row asked for; the body returned is the strict parse of that proved
+text, whatever the form of the row. Every body is read as its stored bytes and decoded here. More than MAX_DELTAS
+changed-fields rows in a row, the start of the rows reached with no plain or full row, a body or patch that does not read
+(a text body that is not UTF-8 included), or a result whose hash differs: the row is refused as damaged, in one sentence
+that carries no byte of any body, never returned. (A deliberate difference from the earlier revision, for a plain row that
+is not UTF-8: it refused too, but in SQLite's words, which quoted the stored bytes.) A new answer is stored changed-fields
+only when the row before it reads back whole, both are objects, neither nests deeper than MAX_PATCH_DEPTH levels (each
+object and each array a level), the run stays within MAX_DELTAS rows, the patch applied to the base gives exactly the
 answer's text, and the patch is at most half the size of the full copy; otherwise it is stored full, never plain (and full
-when SQLite could give the new row a rowid that sorts before its base: a row already at the largest rowid). `compact`
+when SQLite could give the new row a rowid that sorts before its base: a row already at the largest rowid). So a deep
+answer is read exactly as the earlier revision reads it, and no reading depends on the caller's stack. `compact`
 rewrites the plain rows of an existing store in place by the same rule (a plain row followed by a changed-fields row is
 made full), one symbol and kind per transaction, every row that read whole before read back by that rule before it
 commits; it never deletes or vacuums, so the file does not shrink and later rows reuse its free pages.
@@ -122,8 +127,11 @@ split over several strings, and other transformations (reversed, percent-encoded
 Versions: a reader (`as_of`, `news_as_of`, `status`, `show`) reads a version-1 store as found and never writes. A writer
 (`collect`, `compact`) that opens a version-1 store raises it to 2 in one committed transaction of its own, after its write
 probe and before any row is written, so that the earlier revision refuses the store in one line from then on instead of
-calling its encoded rows damage. A limit, stated and not guarded: until SQLite checkpoints, the main file's header can still
-say 1 while the `-wal` holds 2 (the earlier revision reads the header only, and would open such a store).
+calling its encoded rows damage. The earlier revision reads the version from the main file's header only, so the writer
+then checkpoints and reads that header itself, and writes nothing more until it says 2: when a checkpoint cannot bring it
+there (another program holds a read snapshot of the store), the command is a one-line refusal with nothing else written,
+and the next writer tries again. So a store whose main file says 1 never holds an encoded row (its `-wal` may already say
+2), and the earlier revision can never meet one.
 
 This module is not on the order path and nothing on the order path may import it.
 
@@ -165,7 +173,7 @@ from typing import Any, Callable
 
 from valedia_trader.data_and_fees import facts_codec
 
-__all__ = ["APPLICATION_ID", "USER_VERSION", "READABLE_VERSIONS", "MAX_DELTAS", "MAX_TEXT_BYTES", "compact", "INTERRUPTED", "EXPECTED_TYPES", "BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
+__all__ = ["APPLICATION_ID", "USER_VERSION", "READABLE_VERSIONS", "MAX_DELTAS", "MAX_PATCH_DEPTH", "MAX_TEXT_BYTES", "compact", "INTERRUPTED", "EXPECTED_TYPES", "BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
            "news_as_of", "status", "universe_symbols", "valid_symbol", "http_fetch", "canonical_json", "body_sha256",
            "create_schema", "main", "DEFAULT_DB", "UNIVERSES_PATH", "DEFAULT_MAX_CALLS", "MAX_BODY_BYTES"]
 
@@ -215,6 +223,7 @@ DEFAULT_MAX_CALLS = 1000
 MAX_BODY_BYTES = 5 * 1024 * 1024
 MAX_TEXT_BYTES = 8 * MAX_BODY_BYTES              # a stored stream may inflate to at most this much text
 MAX_DELTAS = 30                                  # at most this many changed-fields rows in a row
+MAX_PATCH_DEPTH = 64                             # a value nesting deeper than this is never stored as changed fields
 _MAX_ROWID = 2 ** 63 - 1
 TIMEOUT_SECONDS = 20.0
 DEADLINE_SECONDS = 60.0
@@ -907,6 +916,21 @@ def _remove_own_leftovers(path: Path) -> None:
                 os.unlink(p)
 
 
+def _header_version(path: Path) -> int | None:
+    """The version in the main file's own header (what the earlier revision reads), with a plain read; None if unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK | _CLOEXEC)
+    except OSError:
+        return None
+    try:
+        head = os.pread(fd, 100, 0)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return int.from_bytes(head[60:64], "big") if len(head) == 100 else None
+
+
 class _Writer:
     """The store opened for writing by the one collector that holds its lock."""
     def __init__(self, path: Any):
@@ -953,6 +977,11 @@ class _Writer:
                 self.conn.execute("BEGIN IMMEDIATE")            # version 1 becomes 2 before any row is written, in a
                 self.conn.execute("PRAGMA user_version=%d" % USER_VERSION)     # transaction of its own: the earlier
                 self.conn.execute("COMMIT")                     # revision then refuses the store instead of reading it
+            if _header_version(self.path) != USER_VERSION:      # the main file's own header, which the earlier revision reads
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
+                if _header_version(self.path) != USER_VERSION:
+                    raise _refusal(self.path, "still says version 1 in its main file (a reader's snapshot kept the raise to 2 in"
+                                   " its -wal); no row was written; run again once that reader is done", opened)
         except (Refused, sqlite3.Error) as e:
             self.close()
             if made:
@@ -1124,19 +1153,16 @@ def _chain_sql(body: str, upto: str) -> str:
             " ORDER BY fetched_at DESC, rowid DESC LIMIT %d" % (body, upto, _plausible_sql("fetched_at"), MAX_DELTAS + 2))
 
 
-def _form_of(storage: Any, body: Any, raw: bool) -> tuple[str, str]:
-    """("P", text), ("F", text) or ("D", patch text) of one stored body; `raw`: a text body comes as its UTF-8 bytes."""
+def _form_of(storage: Any, body: Any) -> tuple[str, str]:
+    """("P", text), ("F", text) or ("D", patch text) of one stored body, read as its bytes (`CAST(body AS BLOB)`) with its
+    storage class: a text body is decoded here, so one that is not UTF-8 is unreadable and no byte of it is in any error."""
     if storage == "text":
-        if raw:
-            if type(body) is not bytes:
-                raise _Unreadable()
-            try:
-                return "P", body.decode("utf-8")
-            except UnicodeDecodeError:
-                raise _Unreadable() from None
-        if type(body) is not str:
+        if type(body) is not bytes:
             raise _Unreadable()
-        return "P", body
+        try:
+            return "P", body.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _Unreadable() from None
     if storage == "blob":
         try:
             return facts_codec.decode(body, MAX_TEXT_BYTES)
@@ -1145,16 +1171,17 @@ def _form_of(storage: Any, body: Any, raw: bool) -> tuple[str, str]:
     raise _Unreadable()
 
 
-def _walk(rows, raw: bool = False) -> tuple | None:
+def _walk(rows) -> tuple | None:
     """Read the first row of `rows` (newest first, from `_chain_sql`) whole: back over changed-fields rows to the nearest
     plain or full row, its text parsed once, the patches applied forward, and the result's canonical text written once and
-    proved against the hash of the row asked for (a plain or full row: its own text against its hash). Returns None when
-    there is no row, else ((rowid, fetched_at, body_sha256), value, changed-fields rows passed); _Unreadable otherwise."""
+    proved against the hash of the row asked for (a plain or full row: its own text against its hash); the value given is
+    the strict parse of that proved text. Every body comes as its bytes. Returns None when there is no row, else
+    ((rowid, fetched_at, body_sha256), value, changed-fields rows passed); _Unreadable otherwise."""
     top, patches, text = None, [], ""
     for rowid, fetched_at, sha, storage, body in rows:
         if top is None:
             top = (rowid, fetched_at, sha)
-        form, text = _form_of(storage, body, raw)
+        form, text = _form_of(storage, body)
         if form != "D":
             break
         patches.append(text)
@@ -1172,9 +1199,10 @@ def _walk(rows, raw: bool = False) -> tuple | None:
         value = _loads_strict(text)
         for patch in reversed(patches):
             value = facts_codec.apply(value, _loads_strict(patch))
-        if body_sha256(canonical_json(value)) != top[2]:
+        text = canonical_json(value)
+        if body_sha256(text) != top[2]:
             raise _Unreadable()
-        return top, value, len(patches)
+        return top, _loads_strict(text), len(patches)          # the parse of the proved text, never the patched value
     except (ValueError, TypeError, RecursionError):            # facts_codec.Damaged is a ValueError
         raise _Unreadable() from None
 
@@ -1187,7 +1215,7 @@ def _read_row(conn: sqlite3.Connection, symbol: Any, kind: Any, row: tuple | Non
     else:
         cur = conn.execute(_chain_sql("CAST(body AS BLOB)", _UPTO_ROW), (symbol, kind, row[0], row[0], row[1]))
     try:
-        return _walk(cur, raw=True)
+        return _walk(cur)
     finally:
         cur.close()
 
@@ -1195,7 +1223,7 @@ def _read_row(conn: sqlite3.Connection, symbol: Any, kind: Any, row: tuple | Non
 def _encoded(base: tuple | None, value: Any, text: str) -> bytes:
     """The body to store for an answer `value` whose canonical text is `text`, given `base`, what `_read_row` gave for the
     row just before it (None when there is none, or when it does not read whole or must not be used). Changed-fields only
-    when the base is there, both are objects, the run behind the base is shorter than MAX_DELTAS, the patch read back from
+    when the base is there, both are objects nesting at most MAX_PATCH_DEPTH levels, the run behind the base is shorter than MAX_DELTAS, the patch read back from
     its own encoded bytes and applied to the base gives exactly `text`, and its body is at most half the full body's size;
     otherwise full. Any error while making or proving the patch means full."""
     full = facts_codec.encode_full(text)
@@ -1204,6 +1232,8 @@ def _encoded(base: tuple | None, value: Any, text: str) -> bytes:
             return full
         _, old, run = base
         if type(old) is not dict or run >= MAX_DELTAS:
+            return full
+        if facts_codec.deeper_than(old, MAX_PATCH_DEPTH) or facts_codec.deeper_than(value, MAX_PATCH_DEPTH):
             return full
         changed = facts_codec.encode_changed(canonical_json(facts_codec.diff(old, value)))
         if 2 * len(changed) > len(full):
@@ -1223,7 +1253,7 @@ def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
     _check_fact(symbol, kind)
     when = _check_when(when)
     with _reader(db) as conn:
-        cur = conn.execute(_chain_sql("body", _UPTO_WHEN), (symbol, kind, when))
+        cur = conn.execute(_chain_sql("CAST(body AS BLOB)", _UPTO_WHEN), (symbol, kind, when))
         try:
             got = _walk(cur)
         except _Unreadable:

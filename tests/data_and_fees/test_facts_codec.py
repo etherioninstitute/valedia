@@ -6,6 +6,7 @@ JSON of its own; these tests use the store's own canonical JSON writer as the re
 """
 import ast
 import random
+import sys
 import tracemalloc
 import zlib
 from pathlib import Path
@@ -140,9 +141,9 @@ def test_a_stream_that_inflates_past_the_cap_is_refused_without_holding_more_tha
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    # the decompressor's output is cut at the cap + 1 byte (D2); CPython's output buffer copies its blocks into the final
-    # bytes once, so the peak is twice that, never the 160 MB the stream would inflate to
-    assert peak < 2 * (fc.MAX_TEXT_BYTES + 1) + 4 * 1024 * 1024 < 4 * fc.MAX_TEXT_BYTES, peak
+    # inflated in steps of at most 1 MB with a running total (addendum 3, H4): refusing holds about the cap plus one step,
+    # never twice the cap and never the 160 MB the stream would inflate to
+    assert peak < fc.MAX_TEXT_BYTES + 8 * 1024 * 1024, peak
     exact = b"\x01F" + zlib.compress(b" " * fc.MAX_TEXT_BYTES, 9)                 # exactly the cap: read
     assert fc.decode(exact) == ("F", " " * fc.MAX_TEXT_BYTES)
     over = b"\x01D" + zlib.compress(b" " * (fc.MAX_TEXT_BYTES + 1), 9)            # one byte past it: damaged
@@ -285,3 +286,96 @@ def test_the_codec_is_pure_no_sqlite_no_file_no_clock_no_json_and_no_import_of_t
     assert not called & {"open", "__import__", "exec", "eval", "compile"}, called
     assert "company_facts" not in src                       # (the package rule: nothing else in it names the store module)
     assert {"encode_full", "encode_changed", "decode", "same", "diff", "apply", "Damaged", "MAX_TEXT_BYTES"} <= set(dir(fc))
+
+
+# ---- addendum 3, H1: no recursion at any depth or caller stack; H4: inflate in steps of at most 1 MB
+
+def nest(n, leaf, kind="o"):
+    """`leaf` under `n` levels: of objects ("o"), arrays ("a") or both in turn ("m")."""
+    v = leaf
+    for i in range(n):
+        k = "oa"[i % 2] if kind == "m" else kind
+        v = {"k": v} if k == "o" else [v]
+    return v
+
+
+def at_depth(n, fn):
+    return fn() if n == 0 else at_depth(n - 1, fn)
+
+
+def stack_depth():
+    f, n = sys._getframe(), 0
+    while f is not None:
+        f, n = f.f_back, n + 1
+    return n
+
+
+def caller_depths():
+    room = sys.getrecursionlimit() - stack_depth() - 40
+    return [0, 100, 300, room]
+
+
+@pytest.mark.parametrize("kind", ["o", "a", "m"])
+@pytest.mark.parametrize("n", [1, 64, 65, 500, 990, 1500, 5000])
+def test_same_diff_and_apply_give_the_same_result_at_any_nesting_and_any_caller_stack(n, kind):
+    a, b = {"x": nest(n, 1, kind), "y": 0}, {"x": nest(n, 1.0, kind), "y": 0}
+    for frames in caller_depths():
+        assert at_depth(frames, lambda: fc.same(a, dict(a))) is True
+        assert at_depth(frames, lambda: fc.same(a, b)) is False
+        p = at_depth(frames, lambda: fc.diff(a, b))
+        if kind == "o":                                           # objects all the way: a "~" per level above the change
+            assert list(p) == ["x"] and p["x"][0] == "~"
+        else:                                                     # an array is set whole where it starts
+            assert p == {"x": ["=", b["x"]]} or p["x"][0] == "~"
+        got = at_depth(frames, lambda: fc.apply(a, p))
+        assert at_depth(frames, lambda: fc.same(got, b)) is True
+        assert at_depth(frames, lambda: fc.apply(a, {})) == a
+
+
+def test_the_codec_calls_none_of_its_own_functions_from_inside_themselves():
+    tree = ast.parse(Path(fc.__file__).read_text())
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        inner = {c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+        assert fn.name not in inner, fn.name                     # an explicit stack, never Python recursion
+
+
+def test_deeper_than_counts_objects_and_arrays_as_levels_without_recursion():
+    assert [fc.deeper_than(v, 0) for v in (None, 1, "x", {}, [], {"a": 1}, [1])] == [False] * 3 + [True] * 4
+    assert fc.deeper_than({"a": [{}]}, 2) is True and fc.deeper_than({"a": [{}]}, 3) is False
+    assert fc.deeper_than({"a": [1, {"b": []}]}, 3) is True and fc.deeper_than({"a": [1, {"b": []}]}, 4) is False
+    for kind in ("o", "a", "m"):
+        assert fc.deeper_than(nest(64, 1, kind), 64) is False and fc.deeper_than(nest(65, 1, kind), 64) is True
+        deep = nest(100_000, 1, kind)
+        assert at_depth(caller_depths()[-1], lambda: fc.deeper_than(deep, 64)) is True
+        assert fc.deeper_than(deep, 100_000) is False and fc.deeper_than(deep, 99_999) is True
+
+
+def test_a_stream_is_inflated_in_steps_of_at_most_one_mb(monkeypatch):
+    seen = []
+    real = zlib.decompressobj
+
+    class Spy:
+        def __init__(self):
+            self.d = real()
+
+        def decompress(self, data, max_length=0):
+            seen.append(max_length)
+            return self.d.decompress(data, max_length)
+
+        def __getattr__(self, name):
+            return getattr(self.d, name)
+    monkeypatch.setattr(fc.zlib, "decompressobj", Spy)
+    for size in (0, 1, 1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 2 * 1024 * 1024, 3 * 1024 * 1024 + 17):
+        text = "".join(chr(97 + i % 26) for i in range(min(size, 4096))) * (size // 4096) + "q" * (size % 4096)
+        assert len(text) == size
+        del seen[:]
+        assert fc.decode(fc.encode_full(text)) == ("F", text)
+        assert seen and all(0 < m <= 1024 * 1024 for m in seen), seen[:5]
+        assert fc.decode(fc.encode_full(text), size) == ("F", text)
+        if size:
+            with pytest.raises(fc.Damaged):
+                fc.decode(fc.encode_full(text), size - 1)
+    del seen[:]
+    with pytest.raises(fc.Damaged):
+        fc.decode(b"\x01F" + zlib.compress(b" " * (fc.MAX_TEXT_BYTES * 2), 9))
+    assert 40 <= len(seen) <= 42 and all(0 < m <= 1024 * 1024 for m in seen)     # it stops at the cap
