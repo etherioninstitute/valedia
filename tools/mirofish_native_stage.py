@@ -16,11 +16,13 @@ LIMITS=_tools_module('mirofish_swarm_limits')  # TMF2: every swarm cap and time 
 # configured agent acts in every round on both platforms, one request in flight per platform (dispatch is serial; more in flight
 # only adds waiting). Reply caps: a reply cut off at its cap is fatal for the whole attempt, so the caller cap is 4,096 (2,560 was 96%
 # used) and an agent turn's 1,024 (longest seen 738). The agent memory is the reviewed whole-unit memory (MEMORY_* below).
-# swarm8 is the proving profile: its 4,096-token memory is deliberately tight so whole units drop in a real run.
+# swarm8 is the proving profile: its 4,096-token memory is deliberately tight so whole units drop in a real run. Its participant
+# bound is 12 (addendum 2, R3): ceilings and the wall are taken at the bound, and at 12 the ceiling with its margin stays inside
+# the 2-hour wall; a graph that builds more than 12 participants is refused by the run's own participant check in its first minutes.
 # swarm48's 12,288 is PROVISIONAL until the proving run's memory readings have been read.
-SWARM={'swarm48':{'actors':48,'agents_bound':64,'rounds':3,'memory_budget':12288,'personas':52,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
+SWARM={'swarm48':{'actors':48,'agents_bound':64,'rounds':3,'memory_budget':12288,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
                   'scenario':'mirofish_swarm48_scenario.txt','scenario_sha256':'999e56774f34df31ceef8fa344f061a22e704e9c2ee607faf0087f8446121357','scenario_recorded_utc':'2026-11-11T00:00:00+00:00'},
-       'swarm8':{'actors':8,'agents_bound':16,'rounds':3,'memory_budget':4096,'personas':12,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
+       'swarm8':{'actors':8,'agents_bound':12,'rounds':3,'memory_budget':4096,'embedding_attempts':1024,'embedding_texts':4096,'embedding_bytes':2097152,
                  'scenario':'mirofish_swarm8_scenario.txt','scenario_sha256':'641690f62eb67dd2175a45041b19278a22d07d892693b761da6a067de4f1a15e','scenario_recorded_utc':'2026-11-15T00:00:00+00:00'}}
 def swarm_numbers(profile):
     """The profile's closed inputs and every number derived from them; refuses a profile that breaks any coupling inequality."""
@@ -53,7 +55,7 @@ SWARM_PRODUCER={
 MEMORY_REL='owned-source/producer/backend/scripts/owned_context_budget.py'
 MEMORY_CANONICAL_SHA='e68444293006bf759c71f78884e07630120ee9dbb4c2d4d38fcdc0cb6a50ddb3'
 MEMORY_FILE=Path(__file__).with_name('mirofish_owned_agent_memory.py')
-MEMORY_REPLACEMENT_SHA='770f3c62d3ae6c2ce8f2ef822b349471a9caae7b222d553dc1a51dd3f9e5de73'
+MEMORY_REPLACEMENT_SHA='276add7e12d83b50948afd1f061b747fe156189c6488e17d7ddfa1a1d0c7d589'  # addendum 2: R2 tool-call text counted, R6 refusal line
 MEMORY_EDITS=[('len(agents) <= 4:','len(agents) <= {agents}:'),('OUTPUT_COMPLETION_TOKENS = 512','OUTPUT_COMPLETION_TOKENS = {native}'),('INPUT_CONTEXT_TOKENS = 2048','INPUT_CONTEXT_TOKENS = {budget}')]
 MEMORY_WHAT_CHANGES=('The canonical file gave every agent the library\'s score-based context at 2,048 tokens; with a 1,100 to 1,700-token '
     'persona inside it the library cut each feed into one-token chunks and kept only the last few dozen, so agents no longer read '
@@ -63,7 +65,8 @@ MEMORY_WHAT_CHANGES=('The canonical file gave every agent the library\'s score-b
     'and the newest whole units (a unit is one user message and everything after it up to the next), older units dropped whole, '
     'oldest first, with one INFO line; never two assistant messages in a row and never a tool result without its call; only if the '
     'newest unit alone cannot fit is the newest user message trimmed from its end, with a marker line and one WARNING line; the '
-    'total never exceeds the profile\'s budget.')
+    'total never exceeds the profile\'s budget, counting tool-call arguments, which the library itself counts as nothing; every '
+    'refusal writes one WARNING line with a fixed phrase and the newest record\'s role.')
 SCENARIO_SEAL_REL='scenario-input-seal.json'
 # The model server's internal SDK port. The reviewed sources fix the value seen on 2026-11-08; the server picks a new one each time
 # its app restarts, so a candidate staged later must carry the live port or it cannot connect at all. One integer, same closed check.
@@ -256,6 +259,24 @@ def ssd_device_bytes(raw,device,original_sha=STARTUP_ORIGINAL_SHA):
     require(type(device) is int and device>0 and device!=ORIGINAL_CACHE_DEVICE,'SSD device delta needs a different valid device number')
     return closed_integer_delta(raw,original_sha,[(f'CACHE_DEVICE={ORIGINAL_CACHE_DEVICE}',f'CACHE_DEVICE={device}',1,1)])
 def integer_literals(source):return [n.value for n in ast.walk(ast.parse(source)) if isinstance(n,ast.Constant) and type(n.value) is int]
+def exact_constant_spans(raw,changed):
+    """Exact to the byte (TMF2 addendum 2, R4): `changed` must be `raw` with only the changed constants' own source spans
+    replaced, each by the same text with its digits replaced, so no comment, space, quote or other byte can change beside them."""
+    def starts(source):
+        offsets=[0]
+        for line in source.splitlines(keepends=True):offsets.append(offsets[-1]+len(line))
+        return offsets
+    def constants(source):return [n for n in ast.walk(ast.parse(source)) if isinstance(n,ast.Constant)]
+    before,after,lines_before,lines_after=constants(raw),constants(changed),starts(raw),starts(changed)
+    require(len(before)==len(after),'source changed outside the approved constants')
+    span=lambda node,lines:(lines[node.lineno-1]+node.col_offset,lines[node.end_lineno-1]+node.end_col_offset)
+    pieces=[];cursor=0
+    for old,new in sorted(((o,n) for o,n in zip(before,after) if o.value!=n.value or type(o.value) is not type(n.value)),key=lambda pair:span(pair[0],lines_before)):
+        (start,end),(new_start,new_end)=span(old,lines_before),span(new,lines_after)
+        old_text,new_text,old_digits,new_digits=raw[start:end],changed[new_start:new_end],str(old.value).encode(),str(new.value).encode()
+        require(start>=cursor and old_text.count(old_digits)==1 and new_text==old_text.replace(old_digits,new_digits),'source changed outside the approved constants')
+        pieces+=[raw[cursor:start],new_text];cursor=end
+    require(b''.join(pieces+[raw[cursor:]])==changed,'source changed outside the approved constants')
 def closed_integer_delta(raw,original_sha,edits):
     """Replace exact source fragments, each of which must occur exactly the stated number of times, and prove by the syntax tree
     that the result differs from the original in integer literals only and in exactly as many of them as the edits say."""
@@ -269,6 +290,7 @@ def closed_integer_delta(raw,original_sha,edits):
         return ast.dump(tree,include_attributes=False)
     require(masked(raw)==masked(changed),'source changed outside integer literals')
     before,after=integer_literals(raw),integer_literals(changed);require(len(before)==len(after) and sum(a!=b for a,b in zip(before,after))==expected,'number of changed integer literals differs from the closed delta')
+    exact_constant_spans(raw,changed)
     return changed
 def swarm_gateway_bytes(raw,profile):
     p=swarm_numbers(profile);pairs=[('chat_attempts',40,p['chats']),('output_total',60000,p['output']),('embedding_attempts',64,p['embedding_attempts']),('embedding_texts',256,p['embedding_texts']),('embedding_total_bytes',131072,p['embedding_bytes']),('wall_seconds',2400,p['wall'])]
@@ -283,7 +305,9 @@ def swarm_run_bytes(raw,profile):
     p=swarm_numbers(profile);wall=p['wall'];caller=p['caller_client_s']
     # TMF2 addendum 1, ruling 1: the two caller timeouts are digit strings in the worker environment; closed_digit_delta proves that
     # only those two strings and the stated integers differ.
+    # Addendum 2, R1: the observer's worker event buffer limit, derived from the largest wait event the profile can produce.
     return closed_digit_delta(raw,RUN_ORIGINAL_SHA,[('time.monotonic() + 2280',f'time.monotonic() + {p["worker_deadline_s"]}',1,1),
+        ('self.buffer += data; require(len(self.buffer) <= 131072, "worker event byte limit")',f'self.buffer += data; require(len(self.buffer) <= {p["worker_event_bytes"]}, "worker event byte limit")',1,1),
         ('"MIROFISH_PREP_LLM_TIMEOUT": "180"',f'"MIROFISH_PREP_LLM_TIMEOUT": "{caller}"',1,1),('"MIROFISH_REPORT_LLM_TIMEOUT": "180"',f'"MIROFISH_REPORT_LLM_TIMEOUT": "{caller}"',1,1),
         ("'caller_timeout':180,'gateway_arrival_seconds':175,'queue_seconds':170",f"'caller_timeout':{caller},'gateway_arrival_seconds':{p['gateway_arrival_s']},'queue_seconds':{p['gateway_queue_s']}",1,3),
         ('<= 4, "actual generated participant count outside bound"',f'<= {p["agents_bound"]}, "actual generated participant count outside bound"',1,1),
@@ -331,6 +355,7 @@ def closed_digit_delta(raw,original_sha,edits,string_keys=DIGIT_STRING_KEYS):
         require(type(new.value) is int or keys.get(id(new)) in string_keys,'a changed digit string is not one of the two caller timeouts')
         differing+=1
     require(differing==expected,'number of changed constants differs from the closed delta')
+    exact_constant_spans(raw,changed)
     return changed
 def swarm_scenario(profile):
     p=SWARM[profile];raw=snapshot(Path(__file__).with_name(p['scenario']));require(hashlib.sha256(raw).hexdigest()==p['scenario_sha256'],'swarm scenario changed')
@@ -443,7 +468,7 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
             owner_decision='2026-11-11 go-ahead for a larger swarm profile; on 2026-11-15 the owner asked for the 2,048-token agent cap to go. The numbers are the lead\'s, derived from the measurements of the stopped run valedia-native-20261114-swarm48-b. Launching remains the owner\'s decision.',
             memory_replacement={'path':MEMORY_REL,'canonical_sha256':MEMORY_CANONICAL_SHA,'replacement':str(MEMORY_FILE),'replacement_sha256':MEMORY_REPLACEMENT_SHA,'staged_sha256':sha(work/MEMORY_REL),
                                 'what_changes':MEMORY_WHAT_CHANGES,'decision':'Owner\'s instruction of 2026-11-15 that the cap is to go; the design and the numbers are the lead\'s (TMF2 addendum 1).',
-                                'log_phrases':{'dropped_whole_units_info':'Owned memory dropped whole units','trimmed_newest_user_message_warning':'Owned memory trimmed the newest user message','must_stay_zero':['Slicing into smaller chunks','Context truncation performed']}},
+                                'log_phrases':{'dropped_whole_units_info':'Owned memory dropped whole units','trimmed_newest_user_message_warning':'Owned memory trimmed the newest user message','refused_context_warning':'Owned memory refused the context','must_stay_zero':['Slicing into smaller chunks','Context truncation performed']}},
             budget_note=('PROVISIONAL: memory use at large prompts has never been measured on this Mac; this budget is to be set from the proving run (swarm8) readings, and swarm48 is not to be launched before they have been read.' if profile=='swarm48' else
                          'The tight 4,096-token budget is the point: it makes whole units drop in a real run and shows that such prompts pass the template admission, before a multi-hour run is spent.'),
             derivation={'source':'tools/mirofish_swarm_limits.py','window':'1.25 x memory budget + 1750 + 1024 <= 32768 ('+str(p['window_need'])+')',
@@ -452,11 +477,12 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
                         'gateway_arrival':'max(2 agent calls in flight x agent slot, 1 caller call x caller slot) = '+str(p['gateway_arrival_s'])+' s',
                         'gateway_queue':'(calls in flight - 1) x agent slot = '+str(p['gateway_queue_s'])+' s',
                         'clients':'gateway arrival + 30 s = '+str(p['agent_client_s'])+' s (agent, persona/config, report and embedding clients)',
-                        'request_bytes':'32768 tokens x 5.28 bytes per token (largest measured) = '+str(p['request_bytes_need'])+' <= '+str(p['request_bytes']),
-                        'chats':'(setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+') x 1.5, rounded up to 32 = '+str(p['chats']),
+                        'request_bytes':'32768 tokens x 5.28 bytes per token (largest measured) = '+str(p['request_bytes_need'])+' <= '+str(p['request_bytes'])+' <= SDK helper cap '+str(p['helper_request_cap'])+' - 4096',
+                        'worker_events':'largest wait event = 8192 + 50 recent actions x (14336 text tokens x 144 bytes per token + 512) = '+str(p['wait_event_bound'])+'; limit = 1.1 x (that + 1), rounded up to a MiB = '+str(p['worker_event_bytes']),
+                        'chats':'max((setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+') x 1.5, every call at the participant bound '+str(p['bound_chats'])+'), rounded up to 32 = '+str(p['chats']),
                         'output':'2 x 512 + (chats - 2) x 4096 = '+str(p['reserve_need'])+', rounded up to 100,000',
-                        'wall':'1.2 x (start 15 s + setup '+str(p['setup_s'])+' s + simulation at full memory '+str(p['ceiling_sim_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s'},
-            what_changed='Closed integers in the gateway limits (model calls, output, embeddings, wall clock, arrival-to-done '+str(p['gateway_arrival_s'])+' s, queue '+str(p['gateway_queue_s'])+' s, request bytes '+str(p['request_bytes'])+'), the supervisor and host deadlines and the host history, the participant bound and round count wherever the worker and the producer check them, the report check\'s freshness window (it spans the run), the agent client timeout and concurrency (one request in flight per platform), the embedding client timeout; two digit strings, the persona/config and report client timeouts ('+str(p['caller_client_s'])+' s, proven by closed_digit_delta); three selector right-hand sides so every configured agent acts in every round; the scenario input and its seal. Reply caps: 4,096 for personas, ontology, config and report text, 1,024 for an agent turn. The agent memory is the reviewed whole-unit memory with a budget of '+str(p['memory_budget'])+' library tokens (see memory_replacement). Why: every simulation agent\'s whole context had been 2,048 tokens, so the library shredded each feed into one-token chunks and the run of 2026-11-15 was stopped after five template refusals; every limit that had been sized for 3,000-token prompts is now derived from one block of measured constants. Unchanged: the 32,768 context, the 4,096 per-call output ceiling, the one dispatch slot, the 10 s context admission, the template admission, the poison-on-unknown rule, confinement and the paper-only handoff.',
+                        'wall':'1.2 x (start 15 s + setup at the participant bound '+str(p['ceiling_setup_s'])+' s + simulation at the bound and full memory '+str(p['ceiling_sim_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s for '+str(p['expected_agents'])+' agents (named actors x 52/48)'},
+            what_changed='Closed integers in the gateway limits (model calls, output, embeddings, wall clock, arrival-to-done '+str(p['gateway_arrival_s'])+' s, queue '+str(p['gateway_queue_s'])+' s, request bytes '+str(p['request_bytes'])+'), the observer\'s worker event limit ('+str(p['worker_event_bytes'])+' bytes), the supervisor and host deadlines and the host history, the participant bound and round count wherever the worker and the producer check them, the report check\'s freshness window (it spans the run), the agent client timeout and concurrency (one request in flight per platform), the embedding client timeout; two digit strings, the persona/config and report client timeouts ('+str(p['caller_client_s'])+' s, proven by closed_digit_delta); three selector right-hand sides so every configured agent acts in every round; the scenario input and its seal. Reply caps: 4,096 for personas, ontology, config and report text, 1,024 for an agent turn. The agent memory is the reviewed whole-unit memory with a budget of '+str(p['memory_budget'])+' library tokens (see memory_replacement). Why: every simulation agent\'s whole context had been 2,048 tokens, so the library shredded each feed into one-token chunks and the run of 2026-11-15 was stopped after five template refusals; every limit that had been sized for 3,000-token prompts is now derived from one block of measured constants. Unchanged: the 32,768 context, the 4,096 per-call output ceiling, the one dispatch slot, the 10 s context admission, the template admission, the poison-on-unknown rule, confinement and the paper-only handoff.',
             what_it_is_not='The scenario and its participants are invented, and every agent is made to take part in every round: this shows the pipeline at scale. It is not a forecast, not a naturalistic schedule and not evidence about any market.')
     derived['launch_authorized']=False;derived['source_status']='W16_COMPACT_ONTOLOGY_PLUS_CLOSED_'+profile.upper()+'_FOR_ROOT_GATED_QUALIFICATION';derived['intentional_canonical_source_revision']=canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA);derived['old_authority_policy']='Old v1 receipts/stores/hash3c053002 remain unchanged. New source extraction/replays are versioned derived artifacts, not new live proof or rewritten authority.';derived['qualification_stimulus']={'enabled':profile=='report64_coverage','scope':'Only three selector RHS: min(2,N) configured valid agents per platform, all24 hours, probability1.0; random.sample identities/order unchanged. Generated configs/prompts/agent content unchanged. No forced action, answer, direction, trade or weakening of >=2 actual completed200 native forwards. Naturalistic forecasting is not claimed.','selector_original_sha256':SELECTOR_ORIGINAL_SHA,'selector_staged_sha256':sha(work/SELECTOR_REL)};derived['metadata_reuse_impact']={'evidence':METADATA_SHA,'scope':'Format conformance reused only: same roles, tools, schemas, LLMClient, SDK/model/tokenizer; only declared ontology prompt content, opt-in four gateway budget integers and optional explicit qualification participation schedule differ; gateway format/guards unchanged, and every actual request still requires actual SDK/frozen comparison. No new model quality or prep success claimed.','ontology_change':{'source_sha256':ONTOLOGY_ORIGINAL_SHA,'staged_sha256':sha(work/ONTOLOGY_REL),'constant':'ONTOLOGY_SYSTEM_PROMPT','functions_and_other_constants':'AST_IDENTICAL'}};derived['derived_from']={'base_candidate_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'removed_metadata_prerequisite':'ACTUAL_SUPPORTED_THREE_CASE_METADATA_ACCEPTED','moved_from_runtime_blockers_to_post_run':'NO_COMPLETED_GENUINE_NATIVE_AGENT_FORWARD_EVIDENCE_FOR_REPAIRED_CODE'};derived['qualification_status']={'native_forward':'PENDING_POST_RUN_ALL_NATIVE_CHATS_COMPLETED_DISPATCHED_200','fresh_report':'PENDING_POST_RUN_EXACT_CAPTURE_AND_VALIDATE','local_paper':'PENDING_GENUINE_EXTRACTED_SIGNAL_MAY_REFUSE_FIXED_BUY','assistant_final_continuation':'UNSUPPORTED','launch_available_means':'eligible for qualification only; separate expiring one-use root receipt required','model_selected_execution_or_profit':'NOT_CLAIMED'}
     derived['sdk_port_revision']={'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port}

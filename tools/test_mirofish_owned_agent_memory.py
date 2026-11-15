@@ -79,7 +79,8 @@ class OwnedAgentMemory(unittest.TestCase):
         module=staged_module('swarm48');agent=admitted_agent(module,1684);counter=agent.memory.get_context_creator().token_counter
         for r,size in enumerate((2418,6477,6690),1):one_turn(agent,counter,size,r)
         context,total=agent.memory.get_context();creator=agent.memory.get_context_creator()
-        self.assertLessEqual(total,creator.budget);self.assertEqual(total,sum(counter.count_tokens_from_messages([m]) for m in context))   # P5
+        self.assertLessEqual(total,creator.budget)   # P5, counted as real content: the library's count plus the tool calls' own text (addendum 2, R2)
+        self.assertEqual(total,sum(counter.count_tokens_from_messages([m])+(len(counter.encode(json.dumps(m['tool_calls'],ensure_ascii=False,sort_keys=True))) if m.get('tool_calls') else 0) for m in context))
         self.assertEqual(context[0]['role'],'system');self.assertEqual(context[1]['role'],'user')
         users=[m for m in context if m['role']=='user'];self.assertTrue(users[-1]['content'].startswith('Here is your social media environment: '+text_of(counter,6690,3)[:200]))
         self.assertEqual(len(context),1+4*len(users))                                    # whole units only: user, call, result, closing text
@@ -153,7 +154,7 @@ class OwnedAgentMemory(unittest.TestCase):
         self.assertGreater(own[1]-own[0],900);self.assertGreater(own[2]-own[1],3500)
     def test_R2_a_context_with_long_tool_calls_stays_within_the_budget_in_real_content(self):
         module=staged_module('swarm8');agent=admitted_agent(module,1300);creator=agent.memory.get_context_creator();counter=creator.token_counter
-        long_args={'content':' '.join(WORDS[i%len(WORDS)] for i in range(2000))}
+        long_args={'content':' '.join(WORDS[i%len(WORDS)] for i in range(1200))}
         for r in (1,2,3):
             agent.update_memory(feed(text_of(counter,300,r)),OpenAIBackendRole.USER);call='call_%d'%r
             agent.update_memory(FunctionCallingMessage(role_name='assistant',role_type=BaseMessage.make_assistant_message('a','').role_type,meta_dict=None,content='',func_name='create_post',args=long_args,tool_call_id=call),OpenAIBackendRole.ASSISTANT)
@@ -162,7 +163,7 @@ class OwnedAgentMemory(unittest.TestCase):
         context,total=agent.memory.get_context()
         real=sum(counter.count_tokens_from_messages([m])+sum(len(counter.encode(c['function']['arguments'])) for c in m.get('tool_calls') or []) for m in context)
         self.assertLessEqual(real,creator.budget);self.assertLessEqual(real,total)
-        self.assertEqual(len([m for m in context if m['role']=='user']),1)                               # two units of ~2,350 real tokens do not fit 4,096
+        self.assertEqual(len([m for m in context if m['role']=='user']),1)                               # one unit is ~2,100 real tokens; two do not fit 4,096 beside the persona
     def test_R6_every_refusal_logs_one_fixed_phrase_with_the_newest_role(self):
         module=staged_module('swarm8');agent=admitted_agent(module);counter=agent.memory.get_context_creator().token_counter
         one_turn(agent,counter,300,1);agent.update_memory(BaseMessage.make_assistant_message('assistant','a second closing text'),OpenAIBackendRole.ASSISTANT)

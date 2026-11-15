@@ -16,13 +16,19 @@ This file keeps the canonical guards and replaces only the context creator:
   raise OwnedMemoryShapeError instead.
 - P4 if the system message and the newest unit alone exceed the budget, the newest user message is trimmed from its end,
   with one plain last line saying how much was kept, and one WARNING line. Nothing else is ever trimmed.
-- P5 the library-token total given to the model never exceeds the budget.
+- P5 the library-token total given to the model never exceeds the budget. The library counts an assistant message's tool
+  calls as nothing (a few tokens whatever the arguments' length), so this file adds the tool calls' own text, encoded by the
+  same counter (its UTF-8 byte length, an upper bound for a byte-level tokenizer, if the counter cannot encode it): the
+  budget is a bound on real content, tool-call arguments included.
 - P6 the same records always give the same context.
+Every refusal (OwnedMemoryShapeError or OwnedMemoryBudgetError) also writes one WARNING line with a fixed phrase and the role of
+the newest record, because the agent library ends such a turn without a line of its own.
 
 Only the copied owned runner calls this, before starting either platform environment. Version and shape guards
 intentionally fail closed if CAMEL/OASIS changes.
 """
 from importlib.metadata import version
+import json
 import logging
 import os
 import sys
@@ -42,6 +48,7 @@ NO_SLICING_LIMIT = sys.maxsize
 
 DROPPED_PHRASE = 'Owned memory dropped whole units'
 TRIMMED_PHRASE = 'Owned memory trimmed the newest user message'
+REFUSED_PHRASE = 'Owned memory refused the context'
 
 # The simulation's camel lines reach simulation.log through the root handler; camel's own level is WARNING, so the INFO
 # line for dropped units needs this logger's level set explicitly.
@@ -79,7 +86,16 @@ class WholeUnitContextCreator(BaseContextCreator):
         return NO_SLICING_LIMIT
 
     def _count(self, message):
-        return self._token_counter.count_tokens_from_messages([message])
+        tokens = self._token_counter.count_tokens_from_messages([message])
+        calls = message.get('tool_calls')
+        if calls:
+            # The library's count ignores this list; count the calls' own text (ids, names and arguments) here.
+            text = json.dumps(calls, ensure_ascii=False, sort_keys=True)
+            try:
+                tokens += len(self._token_counter.encode(text))
+            except Exception:
+                tokens += len(text.encode('utf-8'))
+        return tokens
 
     def _log_once(self, kind, key, level, text, *args):
         # get_context runs several times a turn while the turn's records are written; log once per newest unit, with the
@@ -89,6 +105,21 @@ class WholeUnitContextCreator(BaseContextCreator):
             logger.log(level, text, *args)
 
     def create_context(self, records):
+        try:
+            return self._create_context(records)
+        except (OwnedMemoryShapeError, OwnedMemoryBudgetError) as exc:
+            logger.warning(REFUSED_PHRASE + ': %s; newest record role=%s', exc.args[0], self._newest_role(records))
+            raise
+
+    @staticmethod
+    def _newest_role(records):
+        try:
+            newest = max(enumerate(records), key=lambda item: (item[1].timestamp, item[0]))[1]
+            return newest.memory_record.to_openai_message().get('role')
+        except Exception:
+            return 'unknown'
+
+    def _create_context(self, records):
         if not records:
             return [], 0
         system = None
