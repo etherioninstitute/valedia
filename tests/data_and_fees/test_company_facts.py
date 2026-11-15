@@ -18,6 +18,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import logging
@@ -32,10 +33,12 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.response
+import zlib
 from datetime import datetime, timezone
 from email.message import Message
 from email.utils import format_datetime
@@ -44,6 +47,7 @@ from pathlib import Path
 import pytest
 
 from valedia_trader.data_and_fees import company_facts as cf
+from valedia_trader.data_and_fees import facts_codec as fc
 
 T0 = datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 KEY = "fhk-9Q7xT2mLpW4vB8nZc3RsD6aYe1UjHg0K"                     # a recognisable fake, 36 characters
@@ -177,6 +181,15 @@ def http_error(status, retry_after=None):
     return cf.HttpError(status, retry_after)
 
 
+def stored_text(body):
+    """The canonical text a plain or full body holds (T36a D2: a new row is written full or changed-fields, never plain)."""
+    if type(body) is str:
+        return body
+    form, text = fc.decode(body)
+    assert form == "F", "a changed-fields row: read it with as_of"
+    return text
+
+
 # ---- 1. collect: the kinds, paths, the news window, the calendar once
 
 def test_each_symbol_is_asked_for_the_six_kinds_at_the_named_paths_and_the_calendar_once(tmp_path):
@@ -254,8 +267,9 @@ def test_the_store_is_wal_and_has_the_three_tables_with_the_named_columns(tmp_pa
 def test_observation_body_is_canonical_json_and_carries_its_sha256(tmp_path):
     import hashlib
     run(tmp_path, ["AAA"], fetch=Finnhub(Clock(), {("/stock/profile2", "AAA"): [b'{ "b": 2,\n "a": [1, 2], "c": {"z":1,"y":2} }']}))
-    (sha, body, at), = rows(tmp_path, "SELECT body_sha256, body, fetched_at FROM observations WHERE kind='profile'")
-    assert body == '{"a":[1,2],"b":2,"c":{"y":2,"z":1}}'
+    (sha, stored, at), = rows(tmp_path, "SELECT body_sha256, body, fetched_at FROM observations WHERE kind='profile'")
+    body = stored_text(stored)                           # T36a D2: stored as a full body; the hash is the canonical text's
+    assert type(stored) is bytes and body == '{"a":[1,2],"b":2,"c":{"y":2,"z":1}}'
     assert sha == hashlib.sha256(body.encode()).hexdigest() == cf.body_sha256(body)
     assert at == T0
 
@@ -287,6 +301,7 @@ def test_a_changed_answer_is_a_new_row_and_a_return_to_an_old_value_is_a_change(
         run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
         clock.now += 100
     got = rows(tmp_path, "SELECT fetched_at, body FROM observations WHERE kind='profile' ORDER BY fetched_at")
+    got = [(at, stored_text(b)) for at, b in got]         # T36a D2: small answers are stored full (rule e)
     assert got == [(T0, '{"v":1}'), (T0 + 100, '{"v":2}'), (T0 + 200, '{"v":1}')]
 
 
@@ -578,7 +593,7 @@ def test_a_429_waits_the_retry_after_and_tries_again(tmp_path):
     assert clock.sleeps == [7] and result.failed == 0
     first, second = [c for c in fetch.calls if c.path == "/stock/profile2"]
     assert second.t - first.t == 7 and result.calls == 8
-    assert rows(tmp_path, "SELECT body FROM observations WHERE kind='profile'") == [('{"v":1}',)]
+    assert [stored_text(b) for b, in rows(tmp_path, "SELECT body FROM observations WHERE kind='profile'")] == ['{"v":1}']   # T36a D2
 
 
 @pytest.mark.parametrize("sent, waited", [(None, 30), (0, 0), (500, 120), (120, 120), (float("nan"), 30), (-3, 30), ("abc", 30), (2.5, 2.5)])
@@ -697,7 +712,7 @@ def test_a_body_over_5_mb_is_refused_and_counted_failed(tmp_path):
     assert result.failed == 1
     assert fetch.paths("AAA").count("/stock/profile2") == 1                       # not retried
     assert rows(tmp_path, "SELECT count(*) FROM observations WHERE kind='profile'") == [(0,)]
-    assert rows(tmp_path, "SELECT length(body) FROM observations WHERE kind='metrics'") == [(limit,)]
+    assert [len(stored_text(b)) for b, in rows(tmp_path, "SELECT body FROM observations WHERE kind='metrics'")] == [limit]   # T36a D2
 
 
 @pytest.mark.parametrize("body", [b"not json", b"", b"<html>", b'{"a":1,"a":2}', b'{"x":[{"k":1,"k":1}]}', b"NaN", b'{"a":Infinity}', b'{"a":1e999}',
@@ -1284,7 +1299,7 @@ FOREIGN = {
     "other_programs_application_id": lambda p, t: (_mk_unmarked_with_our_tables(p, t), _sql(p, "PRAGMA application_id=305419896")),
     "other_application_id_with_our_version_and_tables": lambda p, t: (_mk_unmarked_with_our_tables(p, t), _sql(
         p, "PRAGMA application_id=305419896", "PRAGMA user_version=%d" % cf.USER_VERSION)),
-    "store_of_a_later_version": _mk_good_then("PRAGMA user_version=2"),
+    "store_of_a_later_version": _mk_good_then("PRAGMA user_version=3"),          # T36a D6: this revision reads 1 and 2
     "our_application_id_version_zero": _mk_good_then("PRAGMA user_version=0"),
     "our_mark_but_an_extra_column": _mk_good_then("ALTER TABLE news ADD COLUMN extra TEXT"),
     "our_mark_but_a_table_missing": _mk_good_then("DROP TABLE runs"),
@@ -3203,3 +3218,1302 @@ def test_b2_collecting_into_a_store_that_cannot_be_written_is_a_one_line_refusal
             assert set(after) - set(before) <= {"cf.sqlite-wal", "cf.sqlite-shm"}, sorted(after)        # SQLite's own side files
     finally:
         os.chmod(target, 0o644)
+
+
+# ======================================================================================================================
+# T36a: the store keeps only the fields that changed (D1 to D11; D12 is measured outside the suite)
+# ======================================================================================================================
+
+DAMAGED = "does not match its hash; the store is damaged"
+OBJ_KINDS = ("profile", "metrics", "insiders")
+ARR_KINDS = ("earnings", "recommendations")
+FIVE = OBJ_KINDS + ARR_KINDS
+
+
+def _damaged_text(kind="profile", symbol="AAA"):
+    return "a stored %s row for %s does not match its hash; the store is damaged" % (kind, symbol)
+
+
+def _reference_module():
+    """The module exactly as it was before T36a (rev 4), loaded under another name: the measure of "exactly as today".
+    Found at $CF_REFERENCE_MODULE, or beside the repository as rev4_company_facts.py; a test that needs it skips without it."""
+    path = os.environ.get("CF_REFERENCE_MODULE") or str(Path(__file__).resolve().parents[3] / "rev4_company_facts.py")
+    if not os.path.isfile(path):
+        pytest.skip("the reference module (rev 4) is not here: %s" % path)
+    name = "cf_rev4_reference"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    mod = sys.modules[name]
+    assert mod.USER_VERSION == 1 and not hasattr(mod, "compact") and mod is not cf
+    return mod
+
+
+class Days:
+    """A fetch that answers each (path, symbol) with that day's value of its history (`day` is set before each run).
+    News is always empty: this ticket does not touch news."""
+    def __init__(self, answers):
+        self.answers, self.day = answers, 0
+
+    def __call__(self, url, headers):
+        call = Call(url, headers, 0)
+        if call.path == "/company-news":
+            return b"[]", {}
+        seq = self.answers[(call.path, call.symbol)]
+        return json.dumps(seq[min(self.day, len(seq) - 1)]).encode(), {}
+
+
+def collect_day(mod, db, symbols, days, day):
+    days.day = day
+    clock = Clock(T0 + day * 86400)
+    r = mod.collect(symbols, db, fetch=days, clock=clock, sleep=clock.sleep, credentials=lambda n: KEY, monotonic=clock.monotonic)
+    assert r.failed == 0 and r.stopped is None, r.failures
+    return r
+
+
+SPECIAL36 = [None, True, False, 0, 0.0, -0.0, 1, 1.0, 2 ** 70, -(2 ** 65), 1e-320, 1e308, -1e308, "", "é😀", "/", [], {}]
+KEYS36 = ["", "-", "=", "~", "/", "ключ", "😀", "k" * 300, "a", "b", "c", "d", "e"]
+
+
+def _v36(rnd, depth=0):
+    r = rnd.random()
+    if depth >= 3 or r < 0.5:
+        return rnd.choice(SPECIAL36 + [rnd.randint(-9, 9), round(rnd.random() * 100, 3), "s%d" % rnd.randint(0, 9)])
+    if r < 0.8:
+        return {rnd.choice(KEYS36): _v36(rnd, depth + 1) for _ in range(rnd.randint(0, 4))}
+    return [_v36(rnd, depth + 1) for _ in range(rnd.randint(0, 3))]
+
+
+def _change36(rnd, v, depth=0):
+    """A value near `v`, never changed in place: keys changed, added and removed; objects, arrays and scalars swapped."""
+    if type(v) is dict:
+        out = dict(v)
+        for k in list(out):
+            r = rnd.random()
+            if r < 0.12:
+                del out[k]
+            elif r < 0.35:
+                out[k] = _change36(rnd, out[k], depth + 1) if rnd.random() < 0.6 else _v36(rnd, depth + 1)
+        if rnd.random() < 0.5:
+            out[rnd.choice(KEYS36)] = _v36(rnd, depth + 1)
+        return out
+    if type(v) is list:
+        out = [_change36(rnd, x, depth + 1) if rnd.random() < 0.3 else x for x in v]
+        if rnd.random() < 0.3:
+            out.append(_v36(rnd, depth + 1))
+        if out and rnd.random() < 0.2:
+            out.pop(rnd.randrange(len(out)))
+        return out
+    return _v36(rnd, depth)
+
+
+def _history36(rnd, top, days):
+    first = ({k: _v36(rnd, 1) for k in rnd.sample(KEYS36, rnd.randint(1, 7))} if top is dict
+             else [_v36(rnd, 1) for _ in range(rnd.randint(0, 3))])
+    seq = [first]
+    while len(seq) < days:
+        r = rnd.random()
+        seq.append(rnd.choice(seq) if r < 0.1 else seq[-1] if r < 0.2 else _change36(rnd, seq[-1]))
+    return seq
+
+
+def _deep36(n, leaf):
+    v = leaf
+    for i in range(n):
+        v = {"d": v, "i": i}
+    return v
+
+
+def _set36(d, **kv):
+    out = dict(d)
+    for k, v in kv.items():
+        k = {"EMPTY": "", "SLASH": "/", "LONG": "k" * 300}.get(k, k)
+        if v is _DROP:
+            out.pop(k, None)
+        else:
+            out[k] = v
+    return out
+
+
+_DROP = object()
+
+
+def _corners(top, days, rnd):
+    """A history that holds every corner the ticket names, in a fixed order, then random changes."""
+    if top is dict:
+        s0 = {"a": None, "x": 1, "z": 0, "deep": _deep36(200, 1), "": {"-": [1, {"=": "~"}]}, "/": "é😀", "k" * 300: 2 ** 70,
+              "f": 1e-320, "g": 1e308, "t": True, "e": {}, "l": [], "~": "=", "-": "-", "=": ["~"]}
+        s1 = _set36(s0, x=1.0, z=0.0, deep=_deep36(200, 1.0), a=_DROP)              # 1 -> 1.0, 0 -> 0.0, a change 200 deep, a removal
+        s2 = _set36(s1, x=True, z=-0.0, a=None, EMPTY={"-": [1, {"=": "~"}], "~": {}})  # 1.0 -> true, 0.0 -> -0.0, null added back
+        s3 = _set36(s2, z=False, EMPTY=[], SLASH={"o": 1}, t=1, a=_DROP)          # object -> array, scalar -> object, true -> 1
+        s4 = s0                                                                    # back to the first value
+        s5 = _set36(s4, SLASH=[1, 2], e={"n": None}, l={"o": []}, f=0.0, g=-0.0, LONG=-(2 ** 70))
+        s6 = _set36(s5, e=None, l=[], a={"x": {}})                                 # object -> null, null -> object
+        seq = [s0, s1, s2, s3, s4, s5, s6, s5]
+    else:
+        seq = [[], [1], [1.0], [True], [{"a": 1}], [], [{"": None}, [], {}], [1]]
+    while len(seq) < days:
+        seq.append(_change36(rnd, seq[-1]))
+    return seq[:days]
+
+
+N_STORES, SYMS, N_DAYS, LONG_DAYS = 20, 10, 12, 75            # 20 stores x 10 symbols = 200 histories of five kinds each
+
+
+def _plan36(s):
+    """Store `s`'s symbols and answers: 9 random histories and one of every corner; store N_STORES is the long run."""
+    rnd = random.Random(3600 + s)
+    if s == N_STORES:
+        symbols = ["LONG"]
+        big = [rnd.randint(0, 10 ** 9) for _ in range(120)]
+        answers = {(PATHS[k], "LONG"): [default_body(PATHS[k], "LONG")] for k in FIVE}
+        answers[(PATHS["profile"], "LONG")] = [{"n": d, "big": big, "c": {"k": d % 3}} for d in range(LONG_DAYS)]
+        answers[(PATHS["earnings_calendar"], None)] = [default_body(PATHS["earnings_calendar"], None)]
+        return symbols, answers, LONG_DAYS
+    symbols = ["Q%02d" % i for i in range(SYMS - 1)] + ["CRN"]
+    answers = {}
+    for sym in symbols:
+        for kind in FIVE:
+            top = dict if kind in OBJ_KINDS else list
+            answers[(PATHS[kind], sym)] = _corners(top, N_DAYS, rnd) if sym == "CRN" else _history36(rnd, top, N_DAYS)
+    answers[(PATHS["earnings_calendar"], None)] = _history36(rnd, dict, N_DAYS)
+    return symbols, answers, N_DAYS
+
+
+def _keys36(symbols):
+    return [(s, k) for s in symbols for k in FIVE] + [("*", "earnings_calendar")]
+
+
+def _times36(conn, keys):
+    out = {}
+    for sym, kind in keys:
+        ts = sorted({r[0] for r in conn.execute("SELECT fetched_at FROM observations WHERE symbol=? AND kind=?", (sym, kind))})
+        if not ts:
+            out[(sym, kind)] = [T0 - 1.0, T0 + 10.0 ** 7]
+            continue
+        out[(sym, kind)] = ([ts[0] - 1.0, ts[0] - 0.001] + ts + [(a + b) / 2 for a, b in zip(ts, ts[1:])]
+                            + [ts[-1] + 0.5, ts[-1] + 10.0 ** 7])
+    return out
+
+
+def _answer(mod, conn, sym, kind, when):
+    try:
+        got = mod.as_of(conn, sym, kind, when)
+    except mod.Refused as e:
+        return ("refused", str(e))
+    if got is None:
+        return None
+    return (got, cf.canonical_json(got["body"]), json.dumps(got["body"]), type(got["fetched_at"]).__name__)   # (key order too)
+
+
+def _answers36(mod, db, times, upto=None):
+    conn = sqlite3.connect(db)
+    try:
+        return {(sym, kind, w): _answer(mod, conn, sym, kind, w) for (sym, kind), ws in times.items() for w in ws
+                if upto is None or w < upto}
+    finally:
+        conn.close()
+
+
+def _forms(db, symbol=None, kind=None):
+    """The stored form of each row ('P' plain, 'F' full, 'D' changed-fields, '?' other), in chain order."""
+    sql = ("SELECT CASE WHEN typeof(body)='text' THEN 'P' WHEN substr(body,1,2)=x'0146' THEN 'F' WHEN substr(body,1,2)=x'0144'"
+           " THEN 'D' ELSE '?' END FROM observations")
+    args = ()
+    if symbol is not None:
+        sql += " WHERE symbol=? AND kind=?"
+        args = (symbol, kind)
+    conn = sqlite3.connect(db)
+    try:
+        return "".join(r[0] for r in conn.execute(sql + " ORDER BY symbol, kind, fetched_at, rowid", args))
+    finally:
+        conn.close()
+
+
+@pytest.fixture(scope="module")
+def histories(tmp_path_factory):
+    """The reference stores: every planned history collected day by day by the reference module (plain rows only), and
+    the reference answers for every symbol and kind at every fetch time, between them, before the first and after the
+    last."""
+    ref = _reference_module()
+    base = tmp_path_factory.mktemp("t36a")
+    out = []
+    for s in range(N_STORES + 1):
+        symbols, answers, ndays = _plan36(s)
+        db = base / ("ref%02d.sqlite" % s)
+        days = Days(answers)
+        for d in range(ndays):
+            collect_day(ref, db, symbols, days, d)
+        conn = sqlite3.connect(db)
+        times = _times36(conn, _keys36(symbols))
+        conn.close()
+        out.append({"s": s, "symbols": symbols, "answers": answers, "days": ndays, "ref_db": db, "times": times,
+                    "want": _answers36(ref, db, times)})
+    return out
+
+
+def _model_ok(h, db):
+    """Independent of the reference: every answer this module gives holds the very answer fetched on its row's day, and no
+    row of that symbol and kind lies between its fetch and `when`."""
+    conn = sqlite3.connect(db)
+    try:
+        checked = 0
+        for (sym, kind), ws in h["times"].items():
+            stamps = sorted(r[0] for r in conn.execute("SELECT fetched_at FROM observations WHERE symbol=? AND kind=?", (sym, kind)))
+            path = PATHS[kind]
+            seq = h["answers"][(path, None if sym == "*" else sym)]
+            for w in ws:
+                got = cf.as_of(conn, sym, kind, w)
+                before = [t for t in stamps if t <= w]
+                if not before:
+                    assert got is None
+                    continue
+                assert got["fetched_at"] == before[-1]
+                day = int((got["fetched_at"] - T0) // 86400)
+                assert cf.canonical_json(got["body"]) == cf.canonical_json(seq[min(day, len(seq) - 1)]), (sym, kind, w)
+                checked += 1
+        return checked
+    finally:
+        conn.close()
+
+
+def test_t36a_1_this_collector_gives_exactly_the_reference_answers_over_200_histories(histories, tmp_path, capsys):
+    ref = _reference_module()
+    compared = histories_n = 0
+    forms = ""
+    for h in histories:
+        db = tmp_path / ("mine%02d.sqlite" % h["s"])
+        days = Days(h["answers"])
+        for d in range(h["days"]):
+            collect_day(cf, db, h["symbols"], days, d)
+        got = _answers36(cf, db, h["times"])
+        assert got.keys() == h["want"].keys()
+        diffs = [k for k in got if got[k] != h["want"][k]]
+        assert diffs == [], diffs[:3]
+        compared += len(got)
+        histories_n += len(h["symbols"])
+        assert _model_ok(h, db) > 0
+        forms += _forms(db)
+        assert "P" not in _forms(db)                                   # this revision never writes a row plain
+        for argv in (["show", h["symbols"][-1]], ["show", "*", "--kind", "earnings_calendar"]):
+            outs = []
+            for mod, store in ((ref, h["ref_db"]), (cf, db)):
+                assert mod.main(argv + ["--db", str(store), "--as-of", "2026-11-17T12:00:00Z"]) == 0
+                outs.append(capsys.readouterr().out)
+            assert outs[0] == outs[1]
+        if h["s"] == N_STORES:                                         # the long run: cut at 30 changed-fields rows, twice
+            chain = _forms(db, "LONG", "profile")
+            assert len(chain) == LONG_DAYS and chain == "F" + ("D" * 30 + "F") * 2 + "D" * (LONG_DAYS - 63), chain
+        os.unlink(db)
+    assert histories_n >= 200 and compared > 20000 and forms.count("D") >= 100 and forms.count("F") > 500
+    print("T36a comparison 1: %d histories, %d answers compared, 0 differences, forms %d full %d changed"
+          % (histories_n, compared, forms.count("F"), forms.count("D")), file=sys.stderr)
+
+
+def test_t36a_2_compact_of_a_reference_store_changes_no_answer(histories, tmp_path):
+    compared = 0
+    for h in histories:
+        db = tmp_path / "c.sqlite"
+        for suffix in ("", "-wal"):                                    # (an empty -wal a read-only reader left, if any)
+            if os.path.exists(str(h["ref_db"]) + suffix):
+                shutil.copy(str(h["ref_db"]) + suffix, str(db) + suffix)
+        assert _answers36(cf, db, h["times"]) == h["want"]               # a version-1 store read as found
+        got = cf.compact(db)
+        assert got["full"] + got["changed"] == len(_forms(db)) and got["damaged"] == 0
+        assert set(_forms(db)) <= {"F", "D"}
+        assert _answers36(cf, db, h["times"]) == h["want"]
+        compared += 2 * len(h["want"])
+        assert cf.compact(db)["full"] == cf.compact(db)["changed"] == 0     # a second run rewrites nothing
+        for p in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm")):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(p)
+    assert compared > 40000
+    print("T36a comparison 2: %d stores, %d answers compared before and after compact, 0 differences" % (len(histories), compared),
+          file=sys.stderr)
+
+
+def test_t36a_3_a_reference_store_continued_by_this_collector_then_compacted(histories, tmp_path):
+    ref = _reference_module()
+    compared = mixed = 0
+    for h in histories:
+        db = tmp_path / "m.sqlite"
+        days = Days(h["answers"])
+        half = h["days"] // 2
+        for d in range(half):
+            collect_day(ref, db, h["symbols"], days, d)
+        upto = T0 + half * 86400
+        stage = _answers36(cf, db, h["times"], upto)
+        assert stage == {k: v for k, v in h["want"].items() if k[2] < upto}
+        for d in range(half, h["days"]):
+            collect_day(cf, db, h["symbols"], days, d)
+        forms = _forms(db)
+        assert "P" in forms and ("F" in forms or "D" in forms)
+        mixed += sum("PD" in _forms(db, sym, kind) for sym, kind in h["times"])
+        assert _answers36(cf, db, h["times"]) == h["want"]
+        cf.compact(db)
+        assert "P" not in _forms(db)
+        assert _answers36(cf, db, h["times"]) == h["want"]
+        compared += len(stage) + 2 * len(h["want"])
+        for p in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm"), Path(str(db) + ".lock")):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(p)
+    assert compared > 40000 and mixed >= 10                       # changed-fields rows whose base is a plain row
+    print("T36a comparison 3: %d stores, %d answers compared over three stages, 0 differences, %d chains with a changed-fields"
+          " row on a plain base" % (len(histories), compared, mixed), file=sys.stderr)
+
+
+def test_t36a_every_answer_is_the_one_fetched_on_its_day_without_the_reference_module(tmp_path):
+    """The same histories, judged against the generated answers themselves (runs where the reference module is absent)."""
+    for s in (0, 1, 2, N_STORES):
+        symbols, answers, ndays = _plan36(s)
+        db = tmp_path / ("m%d.sqlite" % s)
+        days = Days(answers)
+        for d in range(ndays):
+            collect_day(cf, db, symbols, days, d)
+        conn = sqlite3.connect(db)
+        times = _times36(conn, _keys36(symbols))
+        conn.close()
+        assert _model_ok({"times": times, "answers": answers}, db) > 100
+        cf.compact(db)
+        assert _model_ok({"times": times, "answers": answers}, db) > 100
+
+
+# ---- D6: the version
+
+def _plain_store(path, rows_, version=1):
+    """A store made by this module with hand-made plain rows (text and hash as the earlier revision wrote them), marked
+    `version`. `rows_` holds (symbol, kind, fetched_at, value)."""
+    cf._Writer(path).close()
+    conn = sqlite3.connect(path)
+    for sym, kind, at, value in rows_:
+        text = cf.canonical_json(value)
+        conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", (sym, kind, at, cf.body_sha256(text), text))
+    conn.execute("PRAGMA user_version=%d" % version)
+    conn.commit()
+    conn.close()
+    for suffix in ("-wal", "-shm", ".lock"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(str(path) + suffix)
+    return path
+
+
+def _header_version(p):
+    return int.from_bytes(Path(p).read_bytes()[60:64], "big")
+
+
+def test_t36a_a_new_store_is_made_at_version_2(tmp_path):
+    assert (cf.USER_VERSION, cf.READABLE_VERSIONS, cf.MAX_DELTAS, cf.MAX_TEXT_BYTES) == (2, (1, 2), 30, 8 * cf.MAX_BODY_BYTES)
+    run(tmp_path, ["AAA"])
+    assert _header_version(tmp_path / "cf.sqlite") == 2 and rows(tmp_path, "PRAGMA user_version") == [(2,)]
+
+
+@pytest.mark.parametrize("version", [0, 3, 7, 65536])
+def test_t36a_a_store_of_another_version_is_refused_in_one_line_naming_both_versions_and_left_alone(tmp_path, version, capsys):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0, {"v": 1})], version)
+    before = snap(tmp_path)
+    for call in (lambda: run(tmp_path, ["AAA"]), lambda: cf.as_of(db, "AAA", "profile", T0), lambda: cf.status(db),
+                 lambda: cf.compact(db)):
+        with pytest.raises(cf.Refused) as e:
+            call()
+        assert "a store of version %d; this program reads versions 1 and 2" % version in str(e.value) and "\n" not in str(e.value)
+    assert cf.main(["compact", "--db", str(db)]) == 2 and len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert snap(tmp_path) == before
+
+
+def _statements(monkeypatch, db):
+    """Every statement run on a connection opened by name to `db` (the writer's), in order."""
+    seen = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        conn = real(*a, **k)
+        if (a[0] if a else k.get("database")) == str(db):
+            conn.set_trace_callback(seen.append)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return seen
+
+
+@pytest.mark.parametrize("writer", ["collect", "compact"])
+def test_t36a_a_writer_raises_a_version_1_store_to_2_in_its_own_transaction_after_its_probe_and_before_any_row(tmp_path, monkeypatch, writer):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0, {"v": 1}), ("AAA", "profile", T0 + 1, {"v": 2})])
+    assert _header_version(db) == 1
+    seen = _statements(monkeypatch, db)
+    if writer == "collect":
+        run(tmp_path, ["AAA"], clock=Clock(T0 + 100))
+    else:
+        cf.compact(db)
+    monkeypatch.undo()
+    up = seen.index("PRAGMA user_version=2")
+    assert seen[up - 1] == "BEGIN IMMEDIATE" and seen[up + 1] == "COMMIT"
+    assert seen.index("DELETE FROM runs WHERE 0") < up                                   # after the write probe
+    first_write = min(i for i, s in enumerate(seen) if s.split()[0].upper() in ("INSERT", "UPDATE"))
+    assert up < first_write
+    assert _header_version(db) == 2 and rows(tmp_path, "PRAGMA user_version") == [(2,)]
+    seen = _statements(monkeypatch, db)                                                    # a version-2 store: not again
+    cf.compact(db)
+    assert not [s for s in seen if "user_version=" in s]
+
+
+def test_t36a_a_version_1_store_is_read_by_every_reader_without_a_byte_written(tmp_path, capsys):
+    d = tmp_path / "ro"
+    d.mkdir()
+    db = _plain_store(d / "cf.sqlite", [("AAA", "profile", T0, {"v": 1}), ("AAA", "metrics", T0 + 5, {"m": [1]})])
+    before = snap(d)
+
+    def read_all():
+        assert cf.as_of(db, "AAA", "profile", T0 + 10)["body"] == {"v": 1}
+        assert cf.news_as_of(db, "AAA", T0 + 10) == []
+        assert cf.status(db)["bodies"]["plain"] == 2
+        assert cf.main(["show", "AAA", "--db", str(db), "--as-of", "2026-11-14T13:00:00Z"]) == 0
+        assert cf.main(["status", "--db", str(db)]) == 0
+        capsys.readouterr()
+    os.chmod(d, 0o555)                                    # a place that cannot hold side files: read immutably, nothing at all
+    try:
+        read_all()
+    finally:
+        os.chmod(d, 0o755)
+    assert snap(d) == before
+    read_all()                                            # a writable place: the store's own bytes and time do not change
+    after = snap(d)
+    assert after["cf.sqlite"] == before["cf.sqlite"] and _header_version(db) == 1
+    assert set(after) - set(before) <= {"cf.sqlite-wal", "cf.sqlite-shm"}
+    if "cf.sqlite-wal" in after:
+        assert after["cf.sqlite-wal"][1] == 0                                              # SQLite's own empty side file
+
+
+def test_t36a_the_earlier_revision_refuses_a_checkpointed_version_2_store_in_one_line_and_leaves_it_untouched(tmp_path, capsys):
+    ref = _reference_module()
+    run(tmp_path, ["AAA"])
+    db = tmp_path / "cf.sqlite"
+    assert not os.path.exists(str(db) + "-wal") and _header_version(db) == 2           # checkpointed when the writer closed
+    before = snap(tmp_path)
+    for call in (lambda: ref.as_of(db, "AAA", "profile", T0), lambda: ref.status(db),
+                 lambda: ref.collect(["AAA"], db, fetch=Finnhub(Clock()), clock=Clock(T0 + 10), credentials=lambda n: KEY)):
+        with pytest.raises(ref.Refused) as e:
+            call()
+        assert "a store of version 2; this program reads version 1" in str(e.value) and "nothing was done" in str(e.value)
+    for argv in (["status"], ["show", "AAA"]):
+        assert ref.main(argv + ["--db", str(db)]) == 2
+        assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert snap(tmp_path) == before
+
+
+# ---- D2, D3, D4: reading a chain, and damage
+
+def _value36(n, salt=7):
+    """A value that changes a little each step: `n` is set again each time and one key is added under "c" for good."""
+    rnd = random.Random(salt)
+    return {"blob": [rnd.randint(0, 10 ** 9) for _ in range(150)], "n": n, "c": {"f%d" % i: i for i in range(n)}}
+
+
+def _chain_store(tmp_path, values, name="cf.sqlite", symbol="AAA"):
+    """A store whose `symbol` profile history is `values`, one run per value 100 seconds apart, written by this collector."""
+    clock = Clock()
+    fetch = Finnhub(clock, {("/stock/profile2", symbol): list(values) + [values[-1]]})
+    for _ in values:
+        run(tmp_path, [symbol], fetch=fetch, clock=clock, name=name)
+        clock.now += 100
+    return tmp_path / name
+
+
+def _chain(db, symbol="AAA", kind="profile"):
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("SELECT rowid, fetched_at, body_sha256, body FROM observations WHERE symbol=? AND kind=?"
+                            " ORDER BY fetched_at, rowid", (symbol, kind)).fetchall()
+    finally:
+        conn.close()
+
+
+def _readable(db, chain_rows, symbol="AAA", kind="profile"):
+    """For each row of the chain: its value's canonical text, or 'damaged'."""
+    out = []
+    for _, at, _, _ in chain_rows:
+        try:
+            got = cf.as_of(db, symbol, kind, at)
+            out.append("none" if got is None else cf.canonical_json(got["body"]))
+        except cf.Refused as e:
+            assert str(e) == _damaged_text(kind, symbol), str(e)
+            out.append("damaged")
+    return out
+
+
+def _set_body(db, rowid, body, sha=None):
+    conn = sqlite3.connect(db)
+    if sha is None:
+        conn.execute("UPDATE observations SET body=? WHERE rowid=?", (body, rowid))
+    else:
+        conn.execute("UPDATE observations SET body=?, body_sha256=? WHERE rowid=?", (body, sha, rowid))
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def run12(tmp_path):
+    """AAA profile: a full row and eleven changed-fields rows, with what each must read."""
+    values = [_value36(n) for n in range(12)]
+    db = _chain_store(tmp_path, values)
+    ch = _chain(db)
+    assert _forms(db, "AAA", "profile") == "F" + "D" * 11
+    want = [cf.canonical_json(v) for v in values]
+    assert _readable(db, ch) == want
+    return db, ch, want
+
+
+def test_t36a_a_changed_fields_row_is_one_zlib_stream_of_the_patch_against_the_row_before_it(run12):
+    db, ch, want = run12
+    form, text = fc.decode(ch[0][3])
+    assert form == "F" and text == want[0] and ch[0][2] == cf.body_sha256(want[0])
+    for i in range(1, len(ch)):
+        form, patch = fc.decode(ch[i][3])
+        assert form == "D" and patch == cf.canonical_json(fc.diff(json.loads(want[i - 1]), json.loads(want[i])))
+        assert ch[i][2] == cf.body_sha256(want[i])                     # the hash is the answer's, whatever the form
+
+
+@pytest.mark.parametrize("which", [0, 5])
+def test_t36a_one_byte_flipped_at_every_position_of_a_small_body_is_refused_as_damaged(tmp_path, which):
+    db = _chain_store(tmp_path, [{"v": 1}, {"v": 2, "w": "x" * 40}, {"v": 3, "w": "x" * 40}])
+    if which == 5:                                     # a small changed-fields stream
+        values = [_value36(n) for n in range(3)]
+        db = _chain_store(tmp_path, values, name="d.sqlite")
+        which = 1
+    ch = _chain(db)
+    rid, at, sha, body = ch[which]
+    assert len(body) < 60
+    good = _readable(db, ch)
+    flips = refused = 0
+    for i in range(len(body)):
+        for bit in (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80):
+            b = bytearray(body)
+            b[i] ^= bit
+            _set_body(db, rid, bytes(b))
+            got = _readable(db, ch)
+            assert got[:which] == good[:which] and set(got[which:]) <= {"damaged"} | set(good[which:]), (i, bit)
+            if got[which] == "damaged":
+                refused += 1
+            else:                       # a flip of a padding bit after the last deflate code: the very same text, proved by
+                assert got[which] == good[which] and i == len(body) - 5, (i, bit)    # its hash; never another body
+            flips += 1
+    _set_body(db, rid, body)
+    assert _readable(db, ch) == good and flips == 8 * len(body) and refused >= flips - 7
+
+
+DAMAGE = {
+    # name: (what is done to the chain of twelve, the rows that must then refuse)
+    "full_blob_truncated": (lambda db, ch: _set_body(db, ch[0][0], ch[0][3][:-1]), range(0, 12)),
+    "full_blob_cut_to_its_prefix": (lambda db, ch: _set_body(db, ch[0][0], ch[0][3][:2]), range(0, 12)),
+    "full_blob_with_a_byte_appended": (lambda db, ch: _set_body(db, ch[0][0], ch[0][3] + b"\x00"), range(0, 12)),
+    "changed_blob_truncated": (lambda db, ch: _set_body(db, ch[4][0], ch[4][3][:-1]), range(4, 12)),
+    "changed_blob_with_a_byte_appended": (lambda db, ch: _set_body(db, ch[4][0], ch[4][3] + b"\x00"), range(4, 12)),
+    "changed_blob_with_a_second_stream_appended": (lambda db, ch: _set_body(db, ch[4][0], ch[4][3] + ch[4][3][2:]), range(4, 12)),
+    "a_body_of_no_known_form": (lambda db, ch: _set_body(db, ch[4][0], b"\x01X" + ch[4][3][2:]), range(4, 12)),
+    "a_one_byte_blob": (lambda db, ch: _set_body(db, ch[4][0], b"\x01"), range(4, 12)),
+    "base_replaced_by_another_valid_answer_hash_kept": (
+        lambda db, ch: _set_body(db, ch[0][0], fc.encode_full(cf.canonical_json(_value36(0, salt=8)))), range(0, 12)),
+    "base_replaced_by_another_valid_plain_answer_hash_kept": (
+        lambda db, ch: _set_body(db, ch[0][0], cf.canonical_json(_value36(0, salt=8))), range(0, 12)),
+    "a_row_in_the_middle_replaced_by_another_valid_patch": (
+        lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"extra":["=",1],"n":["=",6]}')), range(6, 12)),
+    "a_patch_removing_a_missing_key": (lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"nokey":["-"]}')), range(6, 12)),
+    "a_tilde_on_a_key_that_holds_no_object": (lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"n":["~",{}]}')), range(6, 12)),
+    "an_unknown_edit": (lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"n":["+",6]}')), range(6, 12)),
+    "a_patch_that_is_not_json": (lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"n":["=",6]')), range(6, 12)),
+    "a_patch_with_a_repeated_key": (lambda db, ch: _set_body(db, ch[6][0], fc.encode_changed('{"n":["=",6],"n":["=",6]}')), range(6, 12)),
+    "a_stream_that_inflates_past_the_cap": (
+        lambda db, ch: _set_body(db, ch[6][0], b"\x01D" + zlib.compress(b" " * (cf.MAX_TEXT_BYTES + 10), 9)), range(6, 12)),
+    "a_plain_row_whose_text_was_changed": (lambda db, ch: _set_body(db, ch[0][0], cf.canonical_json(_value36(0))[:-1] + " }"), [0]),
+    "the_base_row_removed": (lambda db, ch: _sql(db, "DELETE FROM observations WHERE rowid=%d" % ch[0][0]), range(1, 12)),
+    "two_rows_of_a_run_exchanged": (lambda db, ch: (_set_body(db, ch[3][0], ch[4][3]), _set_body(db, ch[4][0], ch[3][3])), [3, 4]),
+    "a_row_of_the_run_removed": (lambda db, ch: _sql(db, "DELETE FROM observations WHERE rowid=%d" % ch[5][0]), range(6, 12)),
+    "a_changed_row_stored_as_text": (lambda db, ch: _set_body(db, ch[4][0], ch[4][3].decode("latin-1")), range(4, 12)),
+}
+
+
+@pytest.mark.parametrize("name", list(DAMAGE))
+def test_t36a_damage_is_refused_in_todays_words_never_a_wrong_body_and_a_chain_that_avoids_it_is_still_read(run12, name):
+    """Rows at the damage refuse; rows before it read as before; a later row reads only when its own hash proves the
+    result (a patch that sets every field the damage touched), so no row ever gives a wrong body."""
+    db, ch, want = run12
+    damage, refused = DAMAGE[name]
+    damage(db, ch)
+    got = _readable(db, ch)
+    removed = {"the_base_row_removed": 0, "a_row_of_the_run_removed": 5}.get(name)
+    for i in range(len(ch)):
+        if i == removed:
+            continue
+        if i in refused:
+            assert got[i] == "damaged", (name, i)
+        elif i < min(refused):
+            assert got[i] == want[i], (name, i)                        # a chain that does not pass through the damage
+        else:
+            assert got[i] in (want[i], "damaged"), (name, i)           # never a wrong body
+    # the collector goes on after a damaged base: the new answer is stored full and reads; the old rows still refuse
+    clock = Clock(T0 + 5000)
+    result, _, _ = run(db.parent, ["AAA"], fetch=Finnhub(clock, {("/stock/profile2", "AAA"): [_value36(50)]}), clock=clock)
+    assert result.failed == 0 and result.stored == 1 and cf.as_of(db, "AAA", "profile", T0 + 5000)["body"] == _value36(50)
+    if got[-1] == "damaged":
+        assert _forms(db, "AAA", "profile")[-1] == "F"
+    after = _readable(db, ch)
+    assert all(after[i] == "damaged" for i in refused if i != removed)
+
+
+def test_t36a_more_than_30_changed_fields_rows_in_a_row_made_by_hand_are_damaged_from_the_31st(tmp_path):
+    db = tmp_path / "cf.sqlite"
+    cf._Writer(db).close()
+    values = [_value36(n) for n in range(33)]
+    conn = sqlite3.connect(db)
+    text = cf.canonical_json(values[0])
+    conn.execute("INSERT INTO observations VALUES ('AAA','profile',?,?,?)", (B, cf.body_sha256(text), fc.encode_full(text)))
+    for i in range(1, 33):
+        text = cf.canonical_json(values[i])
+        patch = cf.canonical_json(fc.diff(values[i - 1], values[i]))
+        conn.execute("INSERT INTO observations VALUES ('AAA','profile',?,?,?)", (B + i, cf.body_sha256(text), fc.encode_changed(patch)))
+    conn.commit()
+    conn.close()
+    got = _readable(db, _chain(db))
+    assert got[:31] == [cf.canonical_json(v) for v in values[:31]] and got[31:] == ["damaged", "damaged"]
+    run(tmp_path, ["AAA"], clock=Clock(B + 100), fetch=Finnhub(Clock(), {("/stock/profile2", "AAA"): [_value36(40)]}))
+    assert _forms(db, "AAA", "profile")[-1] == "F"                    # its base does not read back: stored full
+
+
+def test_t36a_a_chain_that_reaches_its_beginning_with_no_full_row_is_damaged(tmp_path):
+    db = tmp_path / "cf.sqlite"
+    cf._Writer(db).close()
+    text = cf.canonical_json({"n": 1})
+    _sql(db, "INSERT INTO observations VALUES ('AAA','profile',%r,'%s',x'%s')" % (B, cf.body_sha256(text), fc.encode_changed('{}').hex()))
+    with pytest.raises(cf.Refused) as e:
+        cf.as_of(db, "AAA", "profile", B)
+    assert str(e.value) == _damaged_text()
+
+
+def test_t36a_nothing_fetched_after_when_is_looked_at_even_when_every_later_row_is_garbage(histories, tmp_path):
+    """On compacted copies of reference stores, every row after `when` is replaced by garbage (and more garbage rows are
+    added after it), inside a transaction rolled back after each read: the answer at `when` is unchanged."""
+    checked = 0
+    for h in histories[:6] + histories[-1:]:
+        db = tmp_path / ("la%02d.sqlite" % h["s"])
+        shutil.copy(h["ref_db"], db)
+        cf.compact(db)
+        conn = sqlite3.connect(db)
+        try:
+            for (sym, kind), ws in h["times"].items():
+                for w in ws:
+                    want = h["want"][(sym, kind, w)]
+                    conn.execute("BEGIN")
+                    conn.execute("UPDATE observations SET body=randomblob(40), body_sha256='garbage' WHERE fetched_at>?", (w,))
+                    conn.execute("UPDATE observations SET body=CAST(x'0144' || randomblob(9) AS BLOB) WHERE fetched_at>? AND rowid % 2", (w,))
+                    conn.execute("UPDATE observations SET body=CAST(randomblob(9) AS TEXT) WHERE fetched_at>? AND rowid % 3 = 0", (w,))
+                    conn.execute("INSERT INTO observations VALUES (?,?,?,?,x'01447801')", (sym, kind, w + 0.0001, "x"))
+                    conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", (sym, kind, w + 1, "y", "not json"))
+                    assert _answer(cf, conn, sym, kind, w) == want, (sym, kind, w)
+                    conn.execute("ROLLBACK")
+                    checked += 1
+        finally:
+            conn.close()
+    assert checked > 2000
+
+
+def test_t36a_nothing_fetched_after_when_is_looked_at_in_a_chain_of_changed_fields_rows(run12):
+    db, ch, want = run12
+    conn = sqlite3.connect(db)
+    for i, (_, at, _, _) in enumerate(ch):
+        conn.execute("BEGIN")
+        conn.execute("UPDATE observations SET body=CAST(x'0144' || randomblob(30) AS BLOB), body_sha256='z' WHERE fetched_at>?", (at,))
+        assert cf.canonical_json(cf.as_of(conn, "AAA", "profile", at)["body"]) == want[i]
+        assert cf.canonical_json(cf.as_of(conn, "AAA", "profile", at + 99.9)["body"]) == want[i]
+        conn.execute("ROLLBACK")
+    conn.close()
+
+
+def test_t36a_as_of_reads_one_statement_and_never_more_than_32_rows(run12, monkeypatch):
+    db, ch, want = run12
+    seen = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        conn = real(*a, **k)
+        conn.set_trace_callback(seen.append)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    assert cf.as_of(db, "AAA", "profile", T0 + 10 ** 6)["body"] == json.loads(want[-1])
+    data = [s for s in seen if s.lstrip().upper().startswith("SELECT") and "sqlite_master" not in s]
+    assert len(data) == 1 and "LIMIT 32" in data[0] and "fetched_at DESC, rowid DESC" in data[0]
+
+
+# ---- D5: what a new answer is stored as
+
+def test_t36a_a_new_answer_is_changed_fields_only_when_every_condition_holds(tmp_path):
+    clock = Clock()
+    big = [_value36(n) for n in range(3)]
+    script = {("/stock/profile2", "AAA"): [big[0], big[1], {"v": 1}, {"v": 2}, big[2]],               # objects
+              ("/stock/earnings", "AAA"): [[_value36(0)], [_value36(1)], [_value36(2)], [_value36(2)], [_value36(3)]],  # arrays
+              ("/stock/metric", "AAA"): [big[0], [1], big[1], big[2], big[2]]}                         # an array in an object kind
+    fetch = Finnhub(clock, script)
+    for i in range(5):
+        r, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+        assert r.failed == (1 if i == 1 else 0), r.failures                  # [1] is not a metrics answer
+        clock.now += 100
+    db = tmp_path / "cf.sqlite"
+    assert _forms(db, "AAA", "metrics") == "FDD"
+    assert _forms(db, "AAA", "profile") == "FDFFF"          # first: no base; {"v":1}, {"v":2}: rule (e); big[2] after {"v":2}: (e)
+    assert _forms(db, "AAA", "earnings") == "FFFF"           # arrays are never patched
+    assert cf.as_of(db, "AAA", "earnings", T0 + 10 ** 6)["body"] == [_value36(3)]
+
+
+def test_t36a_a_damaged_base_is_neither_repaired_nor_hidden_and_the_new_answer_is_stored_full(run12):
+    db, ch, want = run12
+    _set_body(db, ch[-1][0], ch[-1][3][:-2])
+    clock = Clock(T0 + 9000)
+    r, _, _ = run(db.parent, ["AAA"], fetch=Finnhub(clock, {("/stock/profile2", "AAA"): [_value36(77)]}), clock=clock)
+    assert r.failed == 0 and r.stored == 1 and _forms(db, "AAA", "profile") == "F" + "D" * 11 + "F"
+    assert _readable(db, ch)[-1] == "damaged" and cf.as_of(db, "AAA", "profile", T0 + 9000)["body"] == _value36(77)
+    assert _chain(db)[-2][3] == ch[-1][3][:-2]                    # not repaired
+
+
+@pytest.mark.parametrize("fault", ["diff_recursion", "apply_raises", "dumps_raises", "diff_wrong", "encode_raises"])
+def test_t36a_any_error_while_making_or_proving_the_patch_means_full_and_the_run_goes_on(tmp_path, monkeypatch, fault):
+    values = [_value36(n) for n in range(4)]
+    db = _chain_store(tmp_path, values[:2])
+    real_diff = fc.diff
+
+    def wrong(a, b):                                          # a patch that gets one field wrong
+        p = real_diff(a, b)
+        p["n"] = ["=", -1]
+        return p
+    if fault == "diff_recursion":
+        monkeypatch.setattr(fc, "diff", lambda a, b: (_ for _ in ()).throw(RecursionError()))
+    elif fault == "apply_raises":
+        monkeypatch.setattr(fc, "apply", lambda a, p: (_ for _ in ()).throw(fc.Damaged()))
+    elif fault == "dumps_raises":
+        monkeypatch.setattr(fc, "diff", lambda a, b: {"x": ["=", float("nan")]})
+    elif fault == "diff_wrong":
+        monkeypatch.setattr(fc, "diff", wrong)
+    else:
+        monkeypatch.setattr(fc, "encode_changed", lambda t: (_ for _ in ()).throw(MemoryError()))
+    clock = Clock(T0 + 1000)
+    fetch = Finnhub(clock, {("/stock/profile2", "AAA"): values[2:]})
+    for _ in range(2):
+        r, _, _ = run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+        assert r.failed == 0 and r.stopped is None
+        clock.now += 100
+    monkeypatch.undo()
+    assert _forms(db, "AAA", "profile") == "FDFF"
+    assert _readable(db, _chain(db)) == [cf.canonical_json(v) for v in values]
+
+
+def test_t36a_a_new_answer_that_could_land_before_its_base_in_chain_order_is_stored_full(tmp_path):
+    """With a row at the largest rowid SQLite picks new rowids at random, so a new row stamped at its base's very time could
+    sort before its base: it is stored full."""
+    db = _chain_store(tmp_path, [_value36(0)])
+    text = cf.canonical_json(_value36(1))
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO observations(rowid, symbol, kind, fetched_at, body_sha256, body) VALUES (?, 'AAA','profile',?,?,?)",
+                 (2 ** 63 - 1, T0 + 100, cf.body_sha256(text), text))
+    conn.commit()
+    conn.close()
+    clock = Clock(T0 + 100)
+    run(tmp_path, ["AAA"], fetch=Finnhub(clock, {("/stock/profile2", "AAA"): [_value36(2)]}), clock=clock)
+    ch = _chain(db)
+    assert len(ch) == 3 and all(fc.decode(r[3])[0] == "F" for r in ch if type(r[3]) is bytes)
+    assert _readable(db, ch).count("damaged") == 0
+
+
+# ---- D7: compact
+
+def _all_rows(db):
+    conn = sqlite3.connect(db)
+    try:
+        return {r[0]: r[1:] for r in conn.execute("SELECT rowid, symbol, kind, fetched_at, body_sha256, body FROM observations")}
+    finally:
+        conn.close()
+
+
+def _every_answer(db, keys):
+    conn = sqlite3.connect(db)
+    try:
+        out = {}
+        for sym, kind in keys:
+            for (at,) in conn.execute("SELECT DISTINCT fetched_at FROM observations WHERE symbol=? AND kind=? AND typeof(fetched_at)"
+                                      " IN ('integer','real') AND fetched_at BETWEEN ? AND ?", (sym, kind, cf.MIN_FETCH_TIME, cf.MAX_FETCH_TIME)).fetchall():
+                for w in (at, at + 0.5):
+                    out[(sym, kind, w)] = _answer(cf, conn, sym, kind, w)
+        return out
+    finally:
+        conn.close()
+
+
+def test_t36a_compact_rewrites_plain_rows_in_place_and_counts_what_it_left(tmp_path, capsys):
+    db = tmp_path / "cf.sqlite"
+    rows_ = [("AAA", "profile", T0 + i, _value36(i)) for i in range(6)]
+    rows_ += [("BBB", "metrics", T0 + i, _value36(i, salt=3)) for i in range(4)]
+    rows_ += [("AAA", "earnings", T0 + i, [_value36(i)]) for i in range(3)]
+    rows_ += [("AAA", "unknownkind", T0 + 1, {"u": 1}), ("AAA", "news", T0 + 2, {"u": 2}), ("AAA", "profile", 1e300, {"t": 1}),
+              ("AAA", "profile", 5.0, {"t": 2}), ("CCC", "insiders", T0, {"v": 1})]
+    _plain_store(db, rows_)
+    _sql(db, "UPDATE observations SET body=body || ' ' WHERE symbol='BBB' AND fetched_at=%r" % (T0 + 1))         # damaged plain
+    keys = [("AAA", "profile"), ("BBB", "metrics"), ("AAA", "earnings"), ("CCC", "insiders")]
+    before_rows, before = _all_rows(db), _every_answer(db, keys)
+    assert cf.main(["compact", "--db", str(db)]) == 0
+    out = capsys.readouterr()
+    line = out.out.strip()
+    assert "\n" not in line and out.err == "" and "blob" not in line and "{" not in line
+    after_rows = _all_rows(db)
+    assert after_rows.keys() == before_rows.keys()
+    for rid, (sym, kind, at, sha, body) in before_rows.items():
+        assert after_rows[rid][:4] == (sym, kind, at, sha)                         # rowid, time and hash never change
+        if kind not in cf.STORED_KINDS or not cf._plausible(at) or (sym == "BBB" and at == T0 + 1):
+            assert after_rows[rid][4] == body                                       # never touched
+    assert _forms(db, "AAA", "profile") == "PFDDDDDP"                              # the two impossible times, untouched
+    assert _forms(db, "BBB", "metrics") == "FPFD"                                  # the damaged row left; the row after it full
+    assert _forms(db, "AAA", "earnings") == "FFF" and _forms(db, "CCC", "insiders") == "F"
+    assert _every_answer(db, keys) == before
+    numbers = [int(x) for x in re.findall(r"\d+", line)]
+    assert numbers[:6] == [7, 6, 0, 1, 2, 2], line                                 # full, changed, encoded, damaged, impossible, unknown
+    for words in ("7 rows rewritten as full", "6 as changed-fields", "0 already encoded", "1 damaged",
+                  "2 with an impossible fetch time", "2 of no known kind", "bytes before", "free"):
+        assert words in line, (words, line)
+    got = cf.compact(db)
+    assert got == {"full": 0, "changed": 0, "encoded": 13, "damaged": 1, "impossible": 2, "unknown_kind": 2,
+                   "bytes_before": 0, "bytes_after": 0, "free_bytes": got["free_bytes"]}
+
+
+def test_t36a_compact_returns_its_counts_and_the_bytes_before_and_after(tmp_path):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, _value36(i)) for i in range(5)])
+    before = sum(len(cf.canonical_json(_value36(i)).encode()) for i in range(5))
+    got = cf.compact(db)
+    stored = sum(len(r[4]) for r in _all_rows(db).values())
+    assert (got["full"], got["changed"], got["bytes_before"], got["bytes_after"]) == (1, 4, before, stored)
+    assert got["bytes_after"] * 3 < got["bytes_before"] and got["free_bytes"] >= 0
+
+
+def test_t36a_compact_rewrites_a_plain_row_in_front_of_an_existing_run_full(tmp_path):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0, _value36(0)), ("AAA", "profile", T0 + 1, _value36(1))])
+    clock = Clock(T0 + 100)
+    fetch = Finnhub(clock, {("/stock/profile2", "AAA"): [_value36(n) for n in range(2, 33)]})
+    for _ in range(31):
+        run(tmp_path, ["AAA"], fetch=fetch, clock=clock)
+        clock.now += 100
+    assert _forms(db, "AAA", "profile") == "PP" + "D" * 30 + "F"                    # a run of 30 on the plain row
+    before = _every_answer(db, [("AAA", "profile")])
+    got = cf.compact(db)
+    assert _forms(db, "AAA", "profile") == "FF" + "D" * 30 + "F" and (got["full"], got["changed"]) == (2, 0)
+    assert _every_answer(db, [("AAA", "profile")]) == before
+
+
+def test_t36a_compact_never_rewrites_an_encoded_row(tmp_path):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, _value36(i)) for i in range(4)])
+    texts = [cf.canonical_json(_value36(i)) for i in range(4)]
+    conn = sqlite3.connect(db)                       # rows 1 and 2 encoded by hand, in ways compact itself would not choose
+    conn.execute("UPDATE observations SET body=? WHERE fetched_at=?", (b"\x01F" + zlib.compress(texts[1].encode(), 1), T0 + 1))
+    conn.execute("UPDATE observations SET body=? WHERE fetched_at=?", (b"\x01F" + zlib.compress(texts[2].encode(), 9), T0 + 2))
+    conn.commit()
+    conn.close()
+    before_rows = _all_rows(db)
+    got = cf.compact(db)
+    after_rows = _all_rows(db)
+    assert (got["full"], got["changed"], got["encoded"]) == (1, 1, 2)
+    for rid, r in before_rows.items():
+        if type(r[4]) is bytes:
+            assert after_rows[rid][4] == r[4]
+    assert _forms(db, "AAA", "profile") == "FFFD"
+
+
+def test_t36a_compact_rolls_a_chain_back_when_it_does_not_read_back_and_refuses_with_exit_2(tmp_path, monkeypatch, capsys):
+    db = _plain_store(tmp_path / "cf.sqlite", [(s, "profile", T0 + i, _value36(i, salt=len(s))) for s in ("AAA", "BBB", "CCC")
+                                               for i in range(4)])
+    keys = [(s, "profile") for s in ("AAA", "BBB", "CCC")]
+    before, before_rows = _every_answer(db, keys), _all_rows(db)
+    real = fc.encode_full
+    calls = []
+
+    def wrong_for_bbb(text):                          # a full body of other text: its hash no longer holds
+        calls.append(text)
+        return real(text + " ") if '"n":0' in text and len(calls) > 1 else real(text)
+    monkeypatch.setattr(fc, "encode_full", wrong_for_bbb)
+    rc = cf.main(["compact", "--db", str(db)])
+    out = capsys.readouterr()
+    monkeypatch.undo()
+    assert rc == 2 and out.out == "" and len(out.err.strip().splitlines()) == 1 and "rolled back" in out.err and "Traceback" not in out.err
+    assert _forms(db, "AAA", "profile") == "FDDD"                                   # the chain before it stays compacted
+    assert _forms(db, "BBB", "profile") == "PPPP" and _forms(db, "CCC", "profile") == "PPPP"
+    assert {r: v for r, v in _all_rows(db).items() if v[0] != "AAA"} == {r: v for r, v in before_rows.items() if v[0] != "AAA"}
+    assert _every_answer(db, keys) == before
+    assert cf.compact(db)["full"] == 2 and _every_answer(db, keys) == before          # a rerun finishes
+
+
+def test_t36a_compact_holds_the_collectors_lock_and_needs_an_existing_store(tmp_path, capsys):
+    assert cf.main(["compact", "--db", str(tmp_path / "none.sqlite")]) == 2
+    assert "no store" in capsys.readouterr().err and list(tmp_path.iterdir()) == []
+    run(tmp_path, ["AAA"])
+    fd = os.open(tmp_path / "cf.sqlite.lock", os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(cf.Refused) as e:
+            cf.compact(tmp_path / "cf.sqlite")
+        assert "another collector holds the store lock" in str(e.value)
+    finally:
+        os.close(fd)
+    import inspect
+    assert "compact" not in inspect.getsource(cf.collect) + inspect.getsource(cf._Run)
+
+
+CHILD = ("import sys, json\n"
+         "from valedia_trader.data_and_fees import company_facts as cf\n"
+         "print('ready', flush=True)\n"
+         "print(json.dumps(cf.compact(sys.argv[1])), flush=True)\n")
+
+
+def _child_env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(cf.__file__).resolve().parents[2])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _kill_template(path, nsym=8, ints=400):
+    """A store of plain rows: `nsym` symbols, five kinds, 12 days, each answer holding `ints` random integers."""
+    rnd = random.Random(52)
+    rows_ = []
+    for s in range(nsym):
+        for kind in FIVE:
+            v = {"blob": [rnd.randint(0, 10 ** 9) for _ in range(ints)], "n": 0, "o": {"k": 1}}
+            for d in range(12):
+                v = dict(v, n=d, o={"k": rnd.randint(0, 3)})
+                if rnd.random() < 0.15:
+                    v = dict(v, blob=[rnd.randint(0, 10 ** 9) for _ in range(ints)])
+                rows_.append(("K%d" % s, kind, T0 + d * 86400, v if kind in OBJ_KINDS else [v]))
+    return _plain_store(path, rows_), [("K%d" % s, k) for s in range(nsym) for k in FIVE]
+
+
+def test_t36a_compact_under_50_real_sigkills_leaves_every_answer_as_before(tmp_path):
+    template, keys = _kill_template(tmp_path / "template.sqlite")
+    want = _every_answer(template, keys)
+    assert len(want) == 8 * 5 * 12 * 2
+    db = tmp_path / "k" / "cf.sqlite"
+    db.parent.mkdir()
+    shutil.copy(template, db)
+    began = time.monotonic()
+    cf.compact(db)
+    span = time.monotonic() - began                                  # how long one compact of the template takes here
+    rnd = random.Random(5050)
+    kills = finished = attempts = 0
+    while kills < 50:
+        attempts += 1
+        assert attempts < 200
+        if attempts % 4 == 1:                                        # a fresh plain store now and then; otherwise go on killing
+            for p in db.parent.iterdir():
+                p.unlink()
+            shutil.copy(template, db)
+        proc = subprocess.Popen([sys.executable, "-c", CHILD, str(db)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=_child_env())
+        try:
+            assert proc.stdout.readline().strip() == b"ready"
+            try:
+                proc.wait(timeout=rnd.uniform(0.0, 1.3 * span))                  # a random moment inside compact
+                finished += 1
+            except subprocess.TimeoutExpired:
+                proc.send_signal(signal.SIGKILL)
+                proc.wait()
+                kills += 1
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+        assert cf._store_problem(db) is None                         # the store opens whole
+        assert _every_answer(db, keys) == want, attempts
+    got = cf.compact(db)                                             # a rerun finishes
+    assert _every_answer(db, keys) == want and "P" not in _forms(db)
+    assert cf.compact(db)["full"] == 0
+    print("T36a kills: %d SIGKILLs in %d attempts, %d runs finished first, compact took %.3f s, last rerun %s"
+          % (kills, attempts, finished, span, got), file=sys.stderr)
+
+
+READER = r'''
+import json, os, random, sys, time
+from valedia_trader.data_and_fees import company_facts as cf
+db, want, stop = sys.argv[1], json.load(open(sys.argv[2])), sys.argv[3]
+rnd = random.Random(7)
+done, written, bad, stamps = 0, 0, [], []
+print("ready", flush=True)
+while not os.path.exists(stop) or done < 50:
+    sym, kind, w, sha = rnd.choice(want)
+    t = time.monotonic()
+    try:
+        got = cf.as_of(db, sym, kind, w)
+        ok = got is not None and got["body_sha256"] == sha and cf.body_sha256(cf.canonical_json(got["body"])) == sha
+    except cf.Refused as e:
+        ok = "being written while it was read" in str(e)
+        written += ok
+    if not ok and len(bad) < 5:
+        bad.append([sym, kind, w])
+    stamps.append(t)
+    done += 1
+print(json.dumps({"done": done, "bad": bad, "written": written, "stamps": stamps}), flush=True)
+'''
+
+
+def test_t36a_readers_in_a_second_process_during_compact_and_collection_never_see_damage(tmp_path):
+    db, keys = _kill_template(tmp_path / "cf.sqlite", nsym=16, ints=1500)
+    conn = sqlite3.connect(db)
+    want = []
+    for sym, kind in keys:
+        for (at,) in conn.execute("SELECT fetched_at FROM observations WHERE symbol=? AND kind=?", (sym, kind)).fetchall():
+            for w in (at, at + 3600):
+                got = cf.as_of(conn, sym, kind, w)
+                want.append([sym, kind, w, got["body_sha256"]])
+    plain = conn.execute("SELECT rowid, body FROM observations").fetchall()
+    conn.close()
+    wf, stop = tmp_path / "want.json", tmp_path / "stop"
+    wf.write_text(json.dumps(want))
+    proc = subprocess.Popen([sys.executable, "-c", READER, str(db), str(wf), str(stop)], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=_child_env())
+    windows = []
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        for r in range(14):                      # compact; then the test puts the plain rows back in one transaction; again
+            if r:
+                w = sqlite3.connect(db, isolation_level=None)
+                w.execute("BEGIN IMMEDIATE")
+                w.executemany("UPDATE observations SET body=? WHERE rowid=?", [(b, rid) for rid, b in plain])
+                w.execute("COMMIT")
+                w.close()
+            t = time.monotonic()
+            cf.compact(db)
+            windows.append(("compact", t, time.monotonic()))
+        answers = {}
+        for sym, kind in keys:                                          # later answers, collected while the reader reads
+            answers[(PATHS[kind], sym)] = [{"later": d} if kind in OBJ_KINDS else [d] for d in range(2000)]
+        answers[(PATHS["earnings_calendar"], None)] = [{"c": 1}]
+        days = Days(answers)
+        t = time.monotonic()
+        d = 12
+        while time.monotonic() - t < 5.0 and d < 2000:                   # collect for at least 5 seconds
+            collect_day(cf, db, sorted({s for s, _ in keys}), days, d)
+            d += 1
+        windows.append(("collect", t, time.monotonic()))
+        stop.write_text("")
+        out, err = proc.communicate(timeout=120)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 0, err[-2000:]
+    report = json.loads(out.strip().splitlines()[-1])
+    assert report["bad"] == []
+    during = {name: sum(1 for s in report["stamps"] for n, a, b in windows if n == name and a <= s <= b) for name in ("compact", "collect")}
+    assert during["compact"] + during["collect"] >= 1000 and during["compact"] >= 300 and during["collect"] >= 300, during
+    print("T36a concurrent reads: %d in all, %s during writes, %d written-while-read refusals"
+          % (report["done"], during, report["written"]), file=sys.stderr)
+
+
+# ---- D8: status
+
+def test_t36a_status_counts_the_forms_in_sql_without_decoding_any_body(tmp_path, monkeypatch, capsys):
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, _value36(i)) for i in range(3)])
+    cf.compact(db)
+    _sql(db, "INSERT INTO observations VALUES ('AAA','profile',%r,'x','plain text')" % (T0 + 9),
+         "INSERT INTO observations VALUES ('AAA','profile',%r,'x',x'00ff')" % (T0 + 10),
+         "INSERT INTO observations VALUES ('AAA','profile',%r,'x',x'01')" % (T0 + 11),
+         "INSERT INTO observations VALUES ('AAA','zzz',%r,'x',x'0146')" % (T0 + 12))
+    stored = sum(len(r[4] if type(r[4]) is bytes else r[4].encode()) for r in _all_rows(db).values())
+    monkeypatch.setattr(fc, "decode", lambda *a, **k: (_ for _ in ()).throw(AssertionError("status decoded a body")))
+    st = cf.status(db)
+    assert st["bodies"] == {"plain": 1, "full": 2, "changed": 2, "unknown": 2, "bytes": stored}
+    assert cf.main(["status", "--db", str(db)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith("rows: ")
+    assert lines[2] == "bodies: 1 plain, 2 full, 2 changed-fields, 2 of no known form, %d bytes" % stored
+    assert [x.split(":")[0] for x in lines[3:]] == ["symbols covered", "last run", "interrupted runs", "oldest fetch",
+                                                    "newest fetch", "skipped and counted", "leftover temporary files"]
+
+
+def test_t36a_status_text_is_todays_with_one_line_added(tmp_path, capsys):
+    ref = _reference_module()
+    db = _plain_store(tmp_path / "cf.sqlite", [("AAA", "profile", T0 + i, _value36(i)) for i in range(3)])
+    assert ref.main(["status", "--db", str(db)]) == 0
+    old = capsys.readouterr().out.splitlines()
+    assert cf.main(["status", "--db", str(db)]) == 0
+    new = capsys.readouterr().out.splitlines()
+    assert new[:2] + new[3:] == old and new[2].startswith("bodies: 3 plain, 0 full, 0 changed-fields, 0 of no known form, ")
+
+
+# ---- D11: three -wal cases owed from the last blind check
+
+def _write_wal_d11(path, ps, frames, salts=(0x1A2B3C4D, 0x5E6F7081), other_salts_from=None, version=3007000, head_ps=None):
+    """A -wal of `frames` whose header says `version` and `head_ps`, its header checksum right; frames from index
+    `other_salts_from` on carry other salts, with every running checksum still made right."""
+    head = struct.pack(">6I", 0x377F0682, version, head_ps or ps, 0, *salts)
+    s = _wal_sum(head, (0, 0), False)
+    out = [head, struct.pack(">2I", *s)]
+    for i, (pg, commit, page) in enumerate(frames):
+        fs = salts if other_salts_from is None or i < other_salts_from else (salts[0] ^ 0x5A5A5A5A, salts[1] ^ 0xA5A5A5A5)
+        fh = struct.pack(">4I", pg, commit, *fs)
+        s = _wal_sum(page, _wal_sum(fh[:8], s, False), False)
+        out.append(fh + struct.pack(">2I", *s) + page)
+    Path(path).write_bytes(b"".join(out))
+
+
+def _d11(**kw):
+    def make(d):
+        p, k, _ = _kill_in_checkpoint(d)
+        ps, frames = _read_wal(str(p) + "-wal")
+        if kw.get("other_salts_from") == "first_missing":
+            kw2 = dict(kw, other_salts_from=min(i for i, f in enumerate(frames) if f[0] > k))
+        else:
+            kw2 = kw
+        _write_wal_d11(str(p) + "-wal", ps, frames, **kw2)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(str(p) + "-shm")
+        return p
+    return make
+
+
+D11_REFUSED = {
+    "cut_main_and_a_wal_whose_salts_are_wrong_from_frame_k_on_with_checksums_made_right": _d11(other_salts_from="first_missing"),
+    "cut_main_and_a_wal_of_another_format_version": _d11(version=3007001),
+    "cut_main_and_a_wal_of_another_page_size": _d11(head_ps=8192),
+}
+
+
+def test_t36a_d11_the_same_wal_written_right_opens(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    p = _d11()(d)
+    assert cf._store_problem(p) is None
+
+
+@pytest.mark.parametrize("name", list(D11_REFUSED))
+def test_t36a_d11_a_cut_store_beside_such_a_wal_is_refused_and_every_side_file_is_untouched(tmp_path, name, capsys, opened_by_sqlite):
+    d = tmp_path / "s"
+    d.mkdir()
+    path = D11_REFUSED[name](d)
+    before = snap(d)
+    del opened_by_sqlite[:]
+    fetch = Finnhub(Clock(T0 + 100))
+    with pytest.raises(cf.Refused) as e:
+        run(d, ["AAA"], fetch=fetch, clock=Clock(T0 + 100))
+    assert "cut short" in str(e.value) and "nothing was done" in str(e.value) and "\n" not in str(e.value)
+    for call in (lambda: cf.as_of(path, "AAA", "profile", T0 + 100), lambda: cf.status(path), lambda: cf.compact(path)):
+        with pytest.raises(cf.Refused) as e:
+            call()
+        assert "nothing was done" in str(e.value)
+    for argv in (["status"], ["show", "AAA"], ["compact"]):
+        assert cf.main(argv + ["--db", str(path)]) == 2
+        assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert fetch.calls == [] and snap(d) == before
+    assert not [n for n in opened_by_sqlite if str(d) in n]
+
+
+# ---- T36a addendum 1: the chain's order when rowids run against the fetch times, and a tie decided by the rowid
+
+def _ordered_store(path, rows_, version=2):
+    """A store whose AAA profile chain is made by direct SQL: `rows_` holds (rowid, fetched_at, value, form), form 'P'
+    (plain text), 'F' (full) or 'D' (changed-fields against the value before it in (fetched_at, rowid) order). Bodies are
+    made in chain order; rows are inserted in the order given, with their explicit rowids."""
+    cf._Writer(path).close()
+    bodies, prev = {}, None
+    for rowid, at, value, form in sorted(rows_, key=lambda r: (r[1], r[0])):
+        text = cf.canonical_json(value)
+        bodies[rowid] = {"P": lambda: text, "F": lambda: fc.encode_full(text),
+                         "D": lambda: fc.encode_changed(cf.canonical_json(fc.diff(prev, value)))}[form]()
+        prev = value
+    conn = sqlite3.connect(path)
+    for rowid, at, value, _ in rows_:
+        conn.execute("INSERT INTO observations(rowid, symbol, kind, fetched_at, body_sha256, body) VALUES (?,?,?,?,?,?)",
+                     (rowid, "AAA", "profile", at, cf.body_sha256(cf.canonical_json(value)), bodies[rowid]))
+    conn.execute("PRAGMA user_version=%d" % version)
+    conn.commit()
+    conn.close()
+    for suffix in ("-wal", "-shm", ".lock"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(str(path) + suffix)
+    return path
+
+
+def _known(rows_):
+    """(when, the answer as_of must give) at every fetch time, between them, before the first and after the last; the
+    answer is (value, its hash, its fetch time, its key order) of the newest row at or before `when` in (fetched_at, rowid)
+    order, so on a tie the larger rowid."""
+    chain = sorted(rows_, key=lambda r: (r[1], r[0]))
+    ts = sorted({r[1] for r in chain})
+    whens = [ts[0] - 1.0] + ts + [(a + b) / 2 for a, b in zip(ts, ts[1:])] + [ts[-1] + 0.5, ts[-1] + 10.0 ** 6]
+    out = []
+    for w in whens:
+        at_or_before = [r for r in chain if r[1] <= w]
+        if not at_or_before:
+            out.append((w, None))
+            continue
+        _, at, value, _ = at_or_before[-1]
+        text = cf.canonical_json(value)
+        out.append((w, (value, cf.body_sha256(text), at, json.dumps(json.loads(text)))))
+    return out
+
+
+def _check_known(db, known):
+    for w, want in known:
+        got = cf.as_of(db, "AAA", "profile", w)
+        if want is None:
+            assert got is None, w
+            continue
+        assert got is not None, w
+        assert (got["body"], got["body_sha256"], got["fetched_at"], json.dumps(got["body"])) == want, w
+        assert (got["symbol"], got["kind"]) == ("AAA", "profile")
+
+
+def _against(forms):
+    """Rows whose rowids run against their fetch times: the earliest time has the largest rowid."""
+    n = len(forms)
+    return [(100 * (n - i), T0 + 100 * i, _value36(i), forms[i]) for i in range(n)]
+
+
+@pytest.mark.parametrize("insert", ["by_rowid", "by_time"])
+def test_t36a_as_of_reads_the_chain_in_fetch_time_order_when_the_rowids_run_against_it(tmp_path, insert):
+    rows_ = _against("FDDDFDDDD")
+    rows_ = sorted(rows_, key=lambda r: r[0]) if insert == "by_rowid" else rows_
+    db = _ordered_store(tmp_path / "cf.sqlite", rows_)
+    assert _forms(db, "AAA", "profile") == "FDDDFDDDD"
+    _check_known(db, _known(rows_))
+
+
+def test_t36a_compact_of_plain_rows_whose_rowids_run_against_their_times_writes_the_chain_in_time_order(tmp_path):
+    rows_ = _against("PPPPPPPPP")
+    db = _ordered_store(tmp_path / "cf.sqlite", sorted(rows_, key=lambda r: r[0]), version=1)
+    known = _known(rows_)
+    _check_known(db, known)
+    got = cf.compact(db)
+    assert (got["full"], got["changed"], got["damaged"]) == (1, 8, 0)
+    assert _forms(db, "AAA", "profile") == "F" + "D" * 8
+    chain = _chain(db)                                                  # (fetched_at, rowid) order
+    assert [r[0] for r in chain] == [100 * (9 - i) for i in range(9)]  # the rowids, unchanged, against the times
+    for i, (_, _, _, body) in enumerate(chain[1:], 1):                # each patch is against the row before it IN TIME
+        assert fc.decode(body) == ("D", cf.canonical_json(fc.diff(_value36(i - 1), _value36(i))))
+    _check_known(db, known)
+    again = cf.compact(db)
+    assert (again["full"], again["changed"]) == (0, 0)                  # a second run rewrites nothing
+
+
+@pytest.mark.parametrize("first", ["smaller_rowid_inserted_first", "larger_rowid_inserted_first"])
+@pytest.mark.parametrize("forms", ["FDDD", "PPPP"])
+def test_t36a_on_equal_fetch_times_the_larger_rowid_is_the_later_row(tmp_path, first, forms):
+    """Rows 1 and 2 share a fetch time; the rowid decides which is later, whatever order they were inserted in. As
+    written by hand (full and changed-fields) and as plain rows then compacted."""
+    rows_ = [(50, T0, _value36(0), forms[0]), (70, T0 + 100, _value36(1), forms[1]), (71, T0 + 100, _value36(2), forms[2]),
+             (20, T0 + 200, _value36(3), forms[3])]
+    order = [0, 1, 2, 3] if first == "smaller_rowid_inserted_first" else [0, 2, 1, 3]
+    db = _ordered_store(tmp_path / "cf.sqlite", [rows_[i] for i in order], version=2 if forms == "FDDD" else 1)
+    known = _known(rows_)
+    assert [w for w, want in known if want is not None and want[0] == _value36(1)] == []   # row 70 is never the answer
+    _check_known(db, known)
+    if forms == "PPPP":
+        got = cf.compact(db)
+        assert (got["full"], got["changed"]) == (1, 3) and _forms(db, "AAA", "profile") == "FDDD"
+        chain = _chain(db)
+        assert [r[0] for r in chain] == [50, 70, 71, 20]
+        for i, (_, _, _, body) in enumerate(chain[1:], 1):
+            assert fc.decode(body) == ("D", cf.canonical_json(fc.diff(_value36(i - 1), _value36(i))))
+        _check_known(db, known)
+    assert cf.as_of(db, "AAA", "profile", T0 + 100)["body"] == _value36(2)

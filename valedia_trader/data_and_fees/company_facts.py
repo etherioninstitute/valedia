@@ -23,8 +23,26 @@ The store (SQLite, WAL, one writer at a time):
   news(symbol, article_id, published_at, fetched_at, ...)    one row per article, written when first seen, never changed
   runs(started_at, ended_at, calls, stored, unchanged, failed, kinds_refused)
 
-A store is created only where no file exists, and opened only when it is this version's store: this store's own mark (SQLite
-application_id APPLICATION_ID, user_version USER_VERSION), exactly the three tables above with exactly their columns, indexes
+How a body is kept (store version 2). `body_sha256` is always the SHA-256 of the answer's canonical text, whatever the form
+of `body`, which is one of three, told apart by SQLite's storage class and the first two bytes (see facts_codec): plain text
+(every row a version-1 collector wrote), a full copy (one zlib stream of the text, marked \x01F) or the fields that changed
+since the row before it (one zlib stream of a patch, marked \x01D). A changed-fields row names no base: its base is the row
+just before it among the rows of that symbol and kind with a possible fetch time, in (fetched_at, rowid) order, the order
+`as_of` reads. A row is read by walking back from it to the nearest plain or full row, in one SELECT of at most
+MAX_DELTAS + 2 rows of which none was fetched after `when`, parsing that row once, applying the patches forward and proving
+the result's canonical text against the hash of the row asked for. More than MAX_DELTAS changed-fields rows in a row, the
+start of the rows reached with no plain or full row, a body or patch that does not read, or a result whose hash differs:
+the row is refused as damaged, never returned. A new answer is stored changed-fields only when the row before it reads
+back whole, both are objects, the run stays within MAX_DELTAS rows, the patch applied to the base gives exactly the
+answer's text, and the patch is at most half the size of the full copy; otherwise it is stored full, never plain (and full
+when SQLite could give the new row a rowid that sorts before its base: a row already at the largest rowid). `compact`
+rewrites the plain rows of an existing store in place by the same rule (a plain row followed by a changed-fields row is
+made full), one symbol and kind per transaction, every row that read whole before read back by that rule before it
+commits; it never deletes or vacuums, so the file does not shrink and later rows reuse its free pages.
+
+A store is created only where no file exists, and opened only when it is a store this version reads: this store's own mark
+(SQLite application_id APPLICATION_ID, user_version 1 or 2 (READABLE_VERSIONS); a new store is made at USER_VERSION, 2),
+exactly the three tables above with exactly their columns, indexes
 and nothing else (no other table, view or trigger), and a store that is whole (below). Anything else (another program's
 database, an empty SQLite file, a zero-byte file, a file that is not SQLite, a store of another version, a symbolic link, a
 store with an extra table, a cut store) is refused before SQLite is ever asked to open it, by the collector, a reader,
@@ -101,14 +119,21 @@ for a key of at least 24 characters, a half of it, is refused. What remains ungu
 split over several strings, and other transformations (reversed, percent-encoded, base32, hashed); a key shorter than about
 10 characters has no base64 guard.
 
+Versions: a reader (`as_of`, `news_as_of`, `status`, `show`) reads a version-1 store as found and never writes. A writer
+(`collect`, `compact`) that opens a version-1 store raises it to 2 in one committed transaction of its own, after its write
+probe and before any row is written, so that the earlier revision refuses the store in one line from then on instead of
+calling its encoded rows damage. A limit, stated and not guarded: until SQLite checkpoints, the main file's header can still
+say 1 while the `-wal` holds 2 (the earlier revision reads the header only, and would open such a store).
+
 This module is not on the order path and nothing on the order path may import it.
 
     python -m valedia_trader.data_and_fees.company_facts collect [--symbols A,B,C | --universe stocks] [--db PATH] [--max-calls N]
     python -m valedia_trader.data_and_fees.company_facts status [--db PATH]
     python -m valedia_trader.data_and_fees.company_facts show SYMBOL [--kind K] [--as-of ISO-UTC] [--db PATH]
+    python -m valedia_trader.data_and_fees.company_facts compact [--db PATH]      (prints counts only, never a body)
 
-Exit status 0 when the run ended; 2 when refused (no key, a bad symbol, the store held by another run), with one line that
-says what to do.
+Exit status 0 when the run ended; 2 when refused (no key, a bad symbol, the store held by another run, a chain `compact`
+could not prove), with one line that says what to do.
 """
 from __future__ import annotations
 
@@ -138,7 +163,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-__all__ = ["APPLICATION_ID", "USER_VERSION", "INTERRUPTED", "EXPECTED_TYPES", "BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
+from valedia_trader.data_and_fees import facts_codec
+
+__all__ = ["APPLICATION_ID", "USER_VERSION", "READABLE_VERSIONS", "MAX_DELTAS", "MAX_TEXT_BYTES", "compact", "INTERRUPTED", "EXPECTED_TYPES", "BASE_URL", "USER_AGENT", "KINDS", "EARNINGS_CALENDAR", "HttpError", "Refused", "Result", "collect", "as_of",
            "news_as_of", "status", "universe_symbols", "valid_symbol", "http_fetch", "canonical_json", "body_sha256",
            "create_schema", "main", "DEFAULT_DB", "UNIVERSES_PATH", "DEFAULT_MAX_CALLS", "MAX_BODY_BYTES"]
 
@@ -172,7 +199,8 @@ MAX_ARTICLE_ID_CHARS = 128
 ARTICLE_ID_INT_LIMIT = 2 ** 63                   # an integer id must be of magnitude below this
 HALF_KEY_MIN_CHARS = 12
 APPLICATION_ID = 1128549169                      # 0x43464B31, "CFK1": this store's mark in the SQLite header
-USER_VERSION = 1
+USER_VERSION = 2                                 # a new store is made at this version
+READABLE_VERSIONS = (1, 2)                       # 1: plain rows only (the earlier revision); 2: plain, full and changed-fields
 INTERRUPTED = "(interrupted)"                    # in runs.kinds_refused: a run that died without closing its row
 
 MAX_REQUESTS_PER_WINDOW = 55
@@ -185,6 +213,9 @@ MAX_429_RETRIES = 3
 MAX_TRANSIENT_TRIES = 2
 DEFAULT_MAX_CALLS = 1000
 MAX_BODY_BYTES = 5 * 1024 * 1024
+MAX_TEXT_BYTES = 8 * MAX_BODY_BYTES              # a stored stream may inflate to at most this much text
+MAX_DELTAS = 30                                  # at most this many changed-fields rows in a row
+_MAX_ROWID = 2 ** 63 - 1
 TIMEOUT_SECONDS = 20.0
 DEADLINE_SECONDS = 60.0
 KEY_MIN_CHARS, KEY_MAX_CHARS = 8, 256
@@ -712,8 +743,8 @@ def _inspect(path: Path) -> tuple[str | None, _Seen | None]:
         if int.from_bytes(head[68:72], "big") != APPLICATION_ID:
             return "is not a company-facts store (another program's database or an empty SQLite file)", None
         version = int.from_bytes(head[60:64], "big")
-        if version != USER_VERSION:
-            return "is not a company-facts store (a store of version %d; this program reads version %d)" % (version, USER_VERSION), None
+        if version not in READABLE_VERSIONS:
+            return "is not a company-facts store (a store of version %d; this program reads versions 1 and 2)" % version, None
         page_size = int.from_bytes(head[16:18], "big")
         page_size = 65536 if page_size == 1 else page_size
         pages = int.from_bytes(head[28:32], "big")
@@ -790,7 +821,7 @@ def _built(fd: int) -> bool:
         return False
     page_size = int.from_bytes(head[16:18], "big")
     page_size = 65536 if page_size == 1 else page_size
-    return int.from_bytes(head[60:64], "big") == USER_VERSION and os.fstat(fd).st_size == page_size * int.from_bytes(head[28:32], "big")
+    return int.from_bytes(head[60:64], "big") in READABLE_VERSIONS and os.fstat(fd).st_size == page_size * int.from_bytes(head[28:32], "big")
 
 
 _NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.EXDEV, errno.ENOSYS}
@@ -918,6 +949,10 @@ class _Writer:
             self.conn.execute("BEGIN IMMEDIATE")                # SQLite can write here, or it is a one-line refusal now,
             self.conn.execute("DELETE FROM runs WHERE 0")       # before any run begins (a write that touches no row)
             self.conn.execute("ROLLBACK")
+            if self.conn.execute("PRAGMA user_version").fetchone()[0] == 1:
+                self.conn.execute("BEGIN IMMEDIATE")            # version 1 becomes 2 before any row is written, in a
+                self.conn.execute("PRAGMA user_version=%d" % USER_VERSION)     # transaction of its own: the earlier
+                self.conn.execute("COMMIT")                     # revision then refuses the store instead of reading it
         except (Refused, sqlite3.Error) as e:
             self.close()
             if made:
@@ -1072,24 +1107,134 @@ def _check_fact(symbol: Any, kind: Any) -> None:
         raise ValueError("bad symbol for this kind")
 
 
+class _Unreadable(Exception):
+    """A stored row that does not read whole (a body, a patch or a chain that is damaged): each caller refuses it, or
+    stores around it, in its own words."""
+
+
+_UPTO_WHEN = "fetched_at<=?"                                    # (when)
+_UPTO_ROW = "(fetched_at<? OR (fetched_at=? AND rowid<=?))"     # (fetched_at, fetched_at, rowid) of the row asked for
+
+
+def _chain_sql(body: str, upto: str) -> str:
+    """The one statement that reads a row and the rows behind it: rows of one symbol and kind with a possible fetch time,
+    at or before the row asked for, newest first, at most MAX_DELTAS + 2 of them (the reader stops at the first plain or full
+    row, so it never loads more than one large body)."""
+    return ("SELECT rowid, fetched_at, body_sha256, typeof(body), %s FROM observations WHERE symbol=? AND kind=? AND %s AND %s"
+            " ORDER BY fetched_at DESC, rowid DESC LIMIT %d" % (body, upto, _plausible_sql("fetched_at"), MAX_DELTAS + 2))
+
+
+def _form_of(storage: Any, body: Any, raw: bool) -> tuple[str, str]:
+    """("P", text), ("F", text) or ("D", patch text) of one stored body; `raw`: a text body comes as its UTF-8 bytes."""
+    if storage == "text":
+        if raw:
+            if type(body) is not bytes:
+                raise _Unreadable()
+            try:
+                return "P", body.decode("utf-8")
+            except UnicodeDecodeError:
+                raise _Unreadable() from None
+        if type(body) is not str:
+            raise _Unreadable()
+        return "P", body
+    if storage == "blob":
+        try:
+            return facts_codec.decode(body, MAX_TEXT_BYTES)
+        except facts_codec.Damaged:
+            raise _Unreadable() from None
+    raise _Unreadable()
+
+
+def _walk(rows, raw: bool = False) -> tuple | None:
+    """Read the first row of `rows` (newest first, from `_chain_sql`) whole: back over changed-fields rows to the nearest
+    plain or full row, its text parsed once, the patches applied forward, and the result's canonical text written once and
+    proved against the hash of the row asked for (a plain or full row: its own text against its hash). Returns None when
+    there is no row, else ((rowid, fetched_at, body_sha256), value, changed-fields rows passed); _Unreadable otherwise."""
+    top, patches, text = None, [], ""
+    for rowid, fetched_at, sha, storage, body in rows:
+        if top is None:
+            top = (rowid, fetched_at, sha)
+        form, text = _form_of(storage, body, raw)
+        if form != "D":
+            break
+        patches.append(text)
+        if len(patches) > MAX_DELTAS:
+            raise _Unreadable()
+    else:
+        if top is None:
+            return None
+        raise _Unreadable()                                     # the start of the rows reached with no plain or full row
+    try:
+        if not patches:
+            if body_sha256(text) != top[2]:
+                raise _Unreadable()
+            return top, _loads_strict(text), 0
+        value = _loads_strict(text)
+        for patch in reversed(patches):
+            value = facts_codec.apply(value, _loads_strict(patch))
+        if body_sha256(canonical_json(value)) != top[2]:
+            raise _Unreadable()
+        return top, value, len(patches)
+    except (ValueError, TypeError, RecursionError):            # facts_codec.Damaged is a ValueError
+        raise _Unreadable() from None
+
+
+def _read_row(conn: sqlite3.Connection, symbol: Any, kind: Any, row: tuple | None = None) -> tuple | None:
+    """`_walk` on a writer's connection: the newest row with a possible fetch time (`row` None) or the row (fetched_at,
+    rowid). Text bodies are read as bytes and decoded here, so no text of a body is ever in an error."""
+    if row is None:
+        cur = conn.execute(_chain_sql("CAST(body AS BLOB)", "1"), (symbol, kind))
+    else:
+        cur = conn.execute(_chain_sql("CAST(body AS BLOB)", _UPTO_ROW), (symbol, kind, row[0], row[0], row[1]))
+    try:
+        return _walk(cur, raw=True)
+    finally:
+        cur.close()
+
+
+def _encoded(base: tuple | None, value: Any, text: str) -> bytes:
+    """The body to store for an answer `value` whose canonical text is `text`, given `base`, what `_read_row` gave for the
+    row just before it (None when there is none, or when it does not read whole or must not be used). Changed-fields only
+    when the base is there, both are objects, the run behind the base is shorter than MAX_DELTAS, the patch read back from
+    its own encoded bytes and applied to the base gives exactly `text`, and its body is at most half the full body's size;
+    otherwise full. Any error while making or proving the patch means full."""
+    full = facts_codec.encode_full(text)
+    try:
+        if base is None or type(value) is not dict:
+            return full
+        _, old, run = base
+        if type(old) is not dict or run >= MAX_DELTAS:
+            return full
+        changed = facts_codec.encode_changed(canonical_json(facts_codec.diff(old, value)))
+        if 2 * len(changed) > len(full):
+            return full
+        form, patch = facts_codec.decode(changed, MAX_TEXT_BYTES)
+        if form != "D" or canonical_json(facts_codec.apply(old, _loads_strict(patch))) != text:
+            return full
+        return changed
+    except Exception:
+        return full
+
+
 def as_of(db: Any, symbol: str, kind: str, when: float) -> dict | None:
     """The newest observation of (symbol, kind) with fetched_at <= `when`, as {symbol, kind, fetched_at, body_sha256, body}
-    (body parsed), or None. Nothing fetched after `when` is ever looked at. `db` is a path or an open connection."""
+    (body parsed), or None. Nothing fetched after `when` is ever looked at: one statement reads the row and the chain behind
+    it. `db` is a path or an open connection."""
     _check_fact(symbol, kind)
     when = _check_when(when)
     with _reader(db) as conn:
-        row = conn.execute("SELECT fetched_at, body_sha256, body FROM observations WHERE symbol=? AND kind=? AND fetched_at<=?"
-                           " AND %s ORDER BY fetched_at DESC, rowid DESC LIMIT 1" % _plausible_sql("fetched_at"),
-                           (symbol, kind, when)).fetchone()
-    if row is None:
+        cur = conn.execute(_chain_sql("body", _UPTO_WHEN), (symbol, kind, when))
+        try:
+            got = _walk(cur)
+        except _Unreadable:
+            got = False
+        finally:
+            cur.close()
+    if got is None:
         return None
-    fetched_at, sha, text = row
-    try:
-        if type(text) is not str or body_sha256(text) != sha:
-            raise ValueError("hash")
-        parsed = _loads_strict(text)
-    except (ValueError, RecursionError):
-        raise Refused("a stored %s row for %s does not match its hash; the store is damaged" % (kind, symbol)) from None
+    if got is False:
+        raise Refused("a stored %s row for %s does not match its hash; the store is damaged" % (kind, symbol))
+    (_, fetched_at, sha), parsed, _ = got
     return {"symbol": symbol, "kind": kind, "fetched_at": fetched_at, "body_sha256": sha, "body": parsed}
 
 
@@ -1162,10 +1307,15 @@ def status(db: Any) -> dict:
         impossible = conn.execute("SELECT (SELECT count(*) FROM observations WHERE NOT %s) + (SELECT count(*) FROM news WHERE NOT %s)"
                                   % (plausible, plausible)).fetchone()[0]
         interrupted = conn.execute("SELECT count(*) FROM runs WHERE kinds_refused=?", (INTERRUPTED,)).fetchone()[0]
+        bodies = dict(zip(("plain", "full", "changed", "unknown", "bytes"), conn.execute(   # in SQL: no body is decoded
+            "SELECT coalesce(sum(f='P'),0), coalesce(sum(f='F'),0), coalesce(sum(f='D'),0), coalesce(sum(f='U'),0),"
+            " coalesce(sum(n),0) FROM (SELECT CASE WHEN typeof(body)='text' THEN 'P'"
+            " WHEN typeof(body)='blob' AND substr(body,1,2)=x'0146' THEN 'F' WHEN typeof(body)='blob' AND substr(body,1,2)=x'0144'"
+            " THEN 'D' ELSE 'U' END f, length(CAST(body AS BLOB)) n FROM observations)").fetchone()))
     leftovers = _leftovers(Path(db)) if isinstance(db, (str, os.PathLike)) else []
     return {"rows": rows, "symbols": symbols, "oldest": span[0], "newest": span[1], "interrupted": interrupted,
             "last_run": last, "impossible": impossible, "other_kinds": other_kinds, "unreadable_runs": unreadable,
-            "leftovers": leftovers}
+            "leftovers": leftovers, "bodies": bodies}
 
 
 # ---- the collector
@@ -1396,7 +1546,8 @@ class _Run:
                 if row is not None and row[0] == sha:
                     unchanged = 1
                 else:
-                    conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)", (symbol, kind, at, sha, canon))
+                    conn.execute("INSERT INTO observations VALUES (?,?,?,?,?)",
+                                 (symbol, kind, at, sha, self._body(conn, symbol, kind, at, value, canon)))
                     stored = 1
             conn.execute("COMMIT")
         except BaseException:
@@ -1407,6 +1558,19 @@ class _Run:
         self.result.unchanged += unchanged
         self.result.skipped += skipped
         self.highwater = max(self.highwater, at)
+
+    @staticmethod
+    def _body(conn, symbol: str, kind: str, at: float, value: Any, canon: str) -> bytes:
+        """How a new answer is stored, inside the transaction `_store` holds: its base is the newest row with a possible
+        fetch time, read back whole or not used. Never plain; a base that does not read is neither repaired nor hidden."""
+        try:
+            base = _read_row(conn, symbol, kind)
+            if (base is not None and base[0][1] == at
+                    and conn.execute("SELECT max(rowid) FROM observations").fetchone()[0] >= _MAX_ROWID):
+                base = None                 # past the largest rowid SQLite picks one at random: the row could sort before its base
+        except Exception:
+            base = None
+        return _encoded(base, value, canon)
 
     @staticmethod
     def _insert_article(conn, symbol: str, a: Any, at: float) -> int | None:
@@ -1559,6 +1723,103 @@ def collect(symbols: Any, db: Any, *, fetch: Callable[[str, dict], Any] = http_f
         store.close()
 
 
+# ---- compact: the plain rows of an existing store rewritten in place
+
+class _NotProved(Exception):
+    pass
+
+
+def _reads_whole(conn: sqlite3.Connection, symbol: Any, kind: Any, at: Any, rowid: int) -> bool:
+    try:
+        got = _read_row(conn, symbol, kind, (at, rowid))
+    except _Unreadable:
+        return False
+    return got is not None and got[0][0] == rowid
+
+
+def _compact_chain(conn: sqlite3.Connection, symbol: Any, kind: Any, counts: dict) -> None:
+    """One symbol and kind in one transaction: each plain row, in chain order, becomes full or changed-fields against the
+    row before it as it then stands; a plain row that does not read whole is left and counted; a plain row followed by a
+    changed-fields row is made full (it is the base of a run that already exists). Before the COMMIT every row that read
+    whole before is read back whole (its text proved against its unchanged hash), else everything is rolled back."""
+    got = {"full": 0, "changed": 0, "damaged": 0, "bytes_before": 0, "bytes_after": 0}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        chain = conn.execute("SELECT rowid, fetched_at, typeof(body)='text', typeof(body)='blob' AND substr(body,1,2)=x'0144'"
+                             " FROM observations WHERE symbol=? AND kind=? AND %s ORDER BY fetched_at, rowid"
+                             % _plausible_sql("fetched_at"), (symbol, kind)).fetchall()
+        whole = [_reads_whole(conn, symbol, kind, at, rowid) for rowid, at, _, _ in chain]
+        for i, (rowid, at, plain, _) in enumerate(chain):
+            if not plain:
+                continue                                        # an encoded row is never rewritten
+            if not whole[i]:
+                got["damaged"] += 1                             # left exactly as found
+                continue
+            raw = conn.execute("SELECT CAST(body AS BLOB) FROM observations WHERE rowid=?", (rowid,)).fetchone()[0]
+            text = raw.decode("utf-8")
+            base = None
+            if i > 0 and not (i + 1 < len(chain) and chain[i + 1][3]):
+                try:
+                    base = _read_row(conn, symbol, kind, (chain[i - 1][1], chain[i - 1][0]))
+                except Exception:
+                    base = None
+            body = _encoded(base, _loads_strict(text), text)
+            conn.execute("UPDATE observations SET body=? WHERE rowid=?", (body, rowid))
+            got["full" if body[:2] == facts_codec.FULL else "changed"] += 1
+            got["bytes_before"] += len(raw)
+            got["bytes_after"] += len(body)
+        for i, (rowid, at, _, _) in enumerate(chain):
+            if whole[i] and not _reads_whole(conn, symbol, kind, at, rowid):
+                raise _NotProved()
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
+    for k, n in got.items():
+        counts[k] += n
+
+
+def compact(db: Any) -> dict:
+    """Rewrite the plain rows of the existing store `db` in place, under the collector's lock, one symbol and kind per
+    transaction (see the module's docstring), and return counts only: rows rewritten "full" and "changed"; rows left as
+    found because already "encoded", "damaged" (a plain row that does not read whole), of an "impossible" fetch time or of
+    no known kind ("unknown_kind"); the stored bytes of the rewritten bodies before and after; and the file's free pages
+    ("free_bytes"). Refused when a chain does not read back whole: that chain is rolled back, the ones before it stay."""
+    if not isinstance(db, (str, os.PathLike)):
+        raise Refused("the database must be a path")
+    path = Path(db)
+    if not os.path.lexists(path):
+        raise Refused("no store at %s; nothing to compact, nothing was done" % path)
+    store = _Writer(path)
+    try:
+        conn = store.conn
+        kinds = ",".join("?" * len(STORED_KINDS))
+        plausible = _plausible_sql("fetched_at")
+        counts = {"full": 0, "changed": 0, "encoded": 0, "damaged": 0, "impossible": 0, "unknown_kind": 0,
+                  "bytes_before": 0, "bytes_after": 0, "free_bytes": 0}
+        try:
+            counts["encoded"], counts["impossible"], counts["unknown_kind"] = conn.execute(
+                "SELECT coalesce(sum(kind IN ({0}) AND {1} AND typeof(body)<>'text'),0), coalesce(sum(kind IN ({0}) AND NOT {1}),0),"
+                " coalesce(sum(kind NOT IN ({0})),0) FROM observations".format(kinds, plausible), STORED_KINDS * 3).fetchone()
+            pairs = conn.execute("SELECT DISTINCT kind, symbol FROM observations WHERE kind IN (%s) AND typeof(body)='text' AND %s"
+                                 " ORDER BY kind, symbol" % (kinds, plausible), STORED_KINDS).fetchall()
+            for kind, symbol in pairs:
+                try:
+                    _compact_chain(conn, symbol, kind, counts)
+                except _NotProved:
+                    raise Refused("%s: compact stopped: after rewriting, a %s row of %s did not read back whole; that symbol "
+                                  "and kind were rolled back as they were and the ones before them stay compacted"
+                                  % (path, kind, _one_line(symbol))) from None
+            counts["free_bytes"] = (conn.execute("PRAGMA freelist_count").fetchone()[0]
+                                    * conn.execute("PRAGMA page_size").fetchone()[0])
+        except sqlite3.Error as e:
+            raise _sqlite_failed(path, e, _OPENED_RW) from None
+        return counts
+    finally:
+        store.close()
+
+
 # ---- the command line
 
 def universe_symbols(name: str = "stocks", path: Any = None) -> list[str]:
@@ -1606,6 +1867,8 @@ def _status_text(db: Any) -> str:
     last = st["last_run"]
     lines = ["company_facts store: %s" % db,
              "rows: " + ", ".join("%s %d" % (k, n) for k, n in st["rows"].items()),
+             "bodies: %d plain, %d full, %d changed-fields, %d of no known form, %d bytes" % tuple(
+                 st["bodies"][k] for k in ("plain", "full", "changed", "unknown", "bytes")),
              "symbols covered: %d" % st["symbols"],
              "last run: none" if last is None else
              "last run: started %s, ended %s, %d calls, %d stored, %d unchanged, %d failed, refused kinds: %s" % (
@@ -1618,6 +1881,15 @@ def _status_text(db: Any) -> str:
              "shown" % (st["impossible"], st["other_kinds"], st["unreadable_runs"]),
              "leftover temporary files: " + (", ".join(st["leftovers"]) or "none")]
     return "\n".join(lines)
+
+
+def _compact_text(c: dict) -> str:
+    """What `compact` did, in counts only: never a body or a value from one."""
+    return ("company_facts compact: %d rows rewritten as full, %d as changed-fields; left as found: %d already encoded, "
+            "%d damaged, %d with an impossible fetch time, %d of no known kind; rewritten bodies: %d bytes before, %d bytes "
+            "after; free space in the file: %d bytes (it does not shrink; later rows reuse it)"
+            % (c["full"], c["changed"], c["encoded"], c["damaged"], c["impossible"], c["unknown_kind"], c["bytes_before"],
+               c["bytes_after"], c["free_bytes"]))
 
 
 def _show(args, clock) -> tuple[str, int]:
@@ -1683,6 +1955,8 @@ def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep
     p.add_argument("--kind")
     p.add_argument("--as-of", dest="as_of", help="ISO time in UTC (default: now)")
     p.add_argument("--db", default=str(DEFAULT_DB))
+    p = sub.add_parser("compact", help="rewrite the plain rows of a store in place (counts only)")
+    p.add_argument("--db", default=str(DEFAULT_DB))
     try:
         args = parser.parse_args(argv)
         if args.command == "collect":
@@ -1703,11 +1977,15 @@ def main(argv=None, *, fetch=None, clock: Callable[[], float] = time.time, sleep
             if args.command == "status":
                 print(_status_text(args.db))
                 return 0
+            if args.command == "compact":
+                print(_compact_text(compact(args.db)))
+                return 0
             text, skipped = _show(args, clock)
         except (Refused, ValueError):
             raise
-        except Exception as e:                           # never a traceback from status or show: one line, exit status 2
-            raise Refused("%s cannot be shown (%s)" % (args.db, type(e).__name__)) from None
+        except Exception as e:                           # never a traceback from status, show or compact: one line, exit 2
+            raise Refused("%s cannot be %s (%s)" % (args.db, "compacted" if args.command == "compact" else "shown",
+                                                    type(e).__name__)) from None
         print(text)
         if skipped:
             print("company_facts: %d stored articles cannot be shown and were skipped" % skipped, file=sys.stderr)
