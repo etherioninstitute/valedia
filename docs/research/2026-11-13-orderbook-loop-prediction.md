@@ -318,3 +318,12 @@ does; the run is expected to take about 75 minutes. With the three earlier stops
 15 November at the most, 19.8% of the day's slots, and about 3 hours 55 minutes (16.4%) if the run takes its expected
 time; the day's own count decides whether it counts. The exact times are added below afterwards. If the run's
 preparation fails before the collector is touched, this stop does not take place, and that is said here.
+
+## The fourth stop's times (written at 20:28 UTC on 15 November, after the stop; no answer has been scored)
+
+The fourth stop lasted 7 minutes 50 seconds: the collector was stopped at 20:17:12 UTC and started again at 20:25:02
+UTC on 15 November, its last heartbeat before the stop at 20:16:20 and its first new one at 20:26:23; both are in the
+store. The proving run was stopped by its own guard seven minutes in, when a model on another, linked computer
+appeared in this Mac's list of loaded models; nothing was wrong with the collector or with this Mac's memory. The four
+stops of 15 November total 2 hours 43 minutes 23 seconds, 11.3% of the day's slots before the overruns already noted.
+A further attempt at the same run, if the owner asks for one, is declared here before it happens.
