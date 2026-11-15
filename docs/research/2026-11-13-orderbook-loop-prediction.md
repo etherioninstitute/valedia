@@ -345,3 +345,15 @@ store. The proving run made every one of its model calls and ended by itself, 65
 stops of 15 November total 3 hours 33 minutes 29 seconds, 14.8% of the day's slots before the overruns already noted,
 and the day's own count decides whether it counts. No further stop is planned for 15 November (UTC); a later run of
 this kind is declared here before it happens.
+
+## A sixth stop, across the end of 15 November, for the 48-participant run (written at 21:57 UTC, 13:57 PST, before the stop; no answer has been scored)
+
+The proving run completed, and the owner has asked for the 48-participant run next. It is expected to take about
+five hours and needs the local model memory to itself. The collector will be stopped at about 23:00 UTC on
+15 November and is to be running again no later than 6 hours 15 minutes after that stop, whatever the run does. The
+stop is placed across midnight UTC on purpose, so that neither day carries all of it: about one hour falls on
+15 November (with the five earlier stops about 4 hours 34 minutes, 19.0% of that day's slots) and the rest on
+16 November (about 4 hours 10 minutes, 17.4%, if the run takes its expected time; 5 hours 15 minutes, 21.9%, at the
+limit, in which case 16 November would fall under the 80% its count needs). Each day's own count decides. The exact
+times are added below afterwards. If the run's preparation fails before the collector is touched, this stop does not
+take place, and that is said here.
