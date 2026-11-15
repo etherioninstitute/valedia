@@ -214,8 +214,12 @@ cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp nice -n 15 
   `qwen3.8-27b-mlx`, which is registered for HTTP backends only. `--model` works with the swarm profiles only.
 - Without `--model`, staging is unchanged: the reviewed W16 bytes, no selector, the 27B.
 - With `--model`, including `--model qwen3.8-27b` named explicitly, the copies of `mirofish_native_model.py` (two) and
-  `mirofish_native_run.py` (three) are the `src/` revisions of commits `ab08400` and `b5a1797`, reviewed on 2026-11-15
-  (V134), each pinned in the stage tool by its SHA-256. A changed byte in `src/` refuses staging until the pin is moved.
+  `mirofish_native_run.py` (three) are the `src/` revisions of commits `ab08400` and `b5a1797`, each pinned in the stage
+  tool by its SHA-256. A changed byte in `src/` refuses staging until the pin is moved. They were reviewed on 2026-11-15
+  (V134) and found unsafe for registered profiles: a registered profile can set the observer's readable directory and its
+  own weight pin, and its hash text reaches the helper script unescaped. They were accepted for the two built-in profiles
+  only, under conditions C1 to C3, which model staging applies: built-in names only, no registry in any staged copy,
+  weight pin and tokenizer hashes checked at staging, no borrowed conformance evidence.
   Every closed number of the run script, the SDK port and the SSD device number is applied to those revisions with the
   same exact-fragment proof.
 - The selector `mirofish_model_profile.json`, `{"profile": "<name>"}` and a newline, is written by the tool beside each
@@ -249,6 +253,11 @@ written tokens a second (0.705).
 | Ceiling, at the participant bound | 99 min (5,964 s) | 47 min (2,825 s) | 12.9 h (46,527 s) | 3.9 h (14,048 s) |
 | Wall clock | 2 h (7,200 s) | 1 h (3,600 s) | 16 h (57,600 s) | 5 h (18,000 s) |
 | Free memory needed to start | 65% | 47% | 65% | 47% |
+
+The 8B's walls rest on the estimate above, and the admission's fixed cost per call does not shrink with a faster model. If
+the first 8B run is to keep the 27B's walls instead, `derive()` in `tools/mirofish_swarm_limits.py` takes one line: for a model
+other than the default, set `wall` to `derive(profile)['wall']`, the 27B's (2 h and 16 h); the worker deadline and the host
+history follow the wall.
 
 **What must be off for a run on the 8B, for its whole wall clock:** the hourly pick reader (it uses LM Studio); every other
 language model on LM Studio; the local Hermes helpers, idle (Scout, Valedia, CTO, local delegation workers) and anything else
@@ -292,8 +301,9 @@ Staged on 2026-11-15 as proof of the repaired tool, not launched, no gate writte
 the tool before these repairs; leave them unlaunched. `swarm48-b` was staged at the old ratio 1.25 (wall 55,800 s); stage
 `swarm48` again before any launch.
 
-Staged on 2026-11-15 as proof of model staging, not launched, no gate, no preflight: `valedia-native-20261115-swarm8-q8-a`
-(`swarm8` on `qwen3-8b`, candidate `82025f4a0e13e88c393e16052cdf000fdc2e10719a8f2bb96bbc283a4388d011`, SDK port 54311). The folder that is actually launched is staged from `main` after the
+Staged on 2026-11-15 as proof of model staging, not launched, no gate, no preflight: `valedia-native-20261115-swarm8-q8-b`
+(`swarm8` on `qwen3-8b`, candidate `a42c81cb510dd48fd3542183d0245ea9a976fd7556679d6018b42febca87610e`). It supersedes `valedia-native-20261115-swarm8-q8-a`
+(candidate `82025f4a…`), whose manifest called the `src/` revisions simply reviewed; leave `-q8-a` unlaunched. The folder that is actually launched is staged from `main` after the
 merge, so that its manifest names the repository's own files. A staged folder carries the model server's port as of staging;
 stage again if the server app restarts.
 
