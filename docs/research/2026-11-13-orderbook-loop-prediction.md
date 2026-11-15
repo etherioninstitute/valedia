@@ -297,3 +297,14 @@ a third stop follows now for that run alone: one attempt, its own limit four hou
 again no later than 4 hours 15 minutes after this third stop, whatever the run does; with the two earlier stops that
 is 4 hours 31 minutes of 15 November at the most, 18.8% of the day's slots, and the day's own count decides whether it
 counts. The exact times are added below afterwards.
+
+## The third stop's times (written at 17:25 UTC on 15 November, after the stop; no answer has been scored)
+
+The third stop lasted 2 hours 19 minutes 19 seconds: the collector was stopped at 08:42:55 UTC and started again at
+11:02:14 UTC on 15 November, its last heartbeat before the stop at 08:42:10 and its first new one at 11:03:06; both
+are in the store. The 48-agent run did not complete. It was stopped by hand at 11:01:55 UTC, 1 hour 38 minutes inside
+its limit, once five of its model calls had been refused by a check of the run's own, which made the attempt certain
+to fail; the collector was started again at once. The three stops of 15 November total 2 hours 35 minutes 33 seconds
+(45 seconds, 15 minutes 29 seconds, 2 hours 19 minutes 19 seconds), 10.8% of the day's slots before the overruns
+already noted, and the day's own count decides whether it counts. No further stop is declared. A later run of this
+kind is declared here before it happens.
