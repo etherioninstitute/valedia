@@ -203,7 +203,13 @@ class PairsStrategy(Strategy):
     def _signal(self, a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(z, beta) for one pair, one value per bar; NaN where there is none. Prices that are missing, not finite
         or not positive count as missing. Each bar is computed from its own window only, so a bar's value does not
-        depend on how much history follows it."""
+        depend on how much history follows it.
+
+        The rolling `ols` fit is this module's own windowed arithmetic (the same centred least-squares formula as
+        `quant_engine.level5_timeseries.hedge_ratio_ols`, over every `hedge_window` at once in blocks of rows). It is
+        used instead of calling `hedge_ratio_ols` bar by bar because that fits one window per call and raises on a
+        missing price or a constant ln B, where the walk needs one fit per bar over the whole history and a window
+        like that to give no beta (NaN) and so no z, not an error."""
         n, w = len(a), self.window
         z, beta = np.full(n, np.nan), np.full(n, np.nan)
         if self.hedge == "ols":
@@ -254,7 +260,10 @@ class PairsStrategy(Strategy):
 
     def walk(self, prices: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         """Walk the pairs forward. Returns (weights, events) in `run_rules`' shape: weights has every column of
-        `prices` (zero outside the market) and row t is decided from prices up to and including t.
+        `prices` (zero outside the market) and row t is decided from prices up to and including t. A market column
+        whose dtype is not a real number type (object, string, boolean, datetime, complex), even text that holds
+        numbers, raises `ValueError` naming the column before any arithmetic; integer and float columns are read as
+        float64. A price that is missing, not finite, or zero or below counts as missing.
 
         Each bar, exits first, on the pair's result r_t (each leg at its price, or its last known price when it has
         none today): stop loss, take profit, time limit (sessions held, priced or not), missing leg (a leg unpriced
@@ -270,11 +279,16 @@ class PairsStrategy(Strategy):
         cols = [c for c in self.market if c in prices.columns]
         if not cols:
             raise SpecError(f"none of the strategy's market {self.market} is in the price data")
+        for sym in cols:
+            dt = prices[sym].dtype
+            if (not pd.api.types.is_numeric_dtype(dt) or pd.api.types.is_bool_dtype(dt)
+                    or pd.api.types.is_complex_dtype(dt)):
+                raise ValueError(f"price column {sym!r} is not real numbers (dtype {dt})")
         n, risk = len(prices), self.risk
         price: dict[str, np.ndarray] = {}
         for sym in self.market:
             if sym in prices.columns:
-                p = prices[sym].to_numpy(dtype=float, copy=True)     # text raises, as in run_rules
+                p = prices[sym].to_numpy(dtype=float, na_value=np.nan, copy=True)
                 p[~(np.isfinite(p) & (p > 0))] = np.nan
             else:
                 p = np.full(n, np.nan)
@@ -423,7 +437,7 @@ class PairsStrategy(Strategy):
                         if wl != 0.0:
                             row[col[sym]] += wl
             gross = np.abs(row).sum()
-            out[t] = row * (risk.max_gross / gross) if gross > risk.max_gross else row      # a safety net: the entry limits keep it idle
+            out[t] = row * (risk.max_gross / gross) if gross > risk.max_gross + 1e-12 else row   # a safety net the entry limits keep idle
         weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
         weights[cols] = out
         return weights, events
