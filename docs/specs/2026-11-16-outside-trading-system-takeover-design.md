@@ -227,6 +227,37 @@ the code. What changed:
 - **Two more properties of the gate, recorded and left as they are:** the delayed-fills check turns away an edge that
   lives in a single bar; and the sealed run charges market impact on equity compounded from 1,000,000, so sealed
   costs depend on development-period profit (small for a real idea, large for a cheat).
+- **The controls on the REAL data (main `fbc9eab`, 2026-11-16; 17 symbols, 2012 to 2026, sealed from 2023-02-24; the
+  real ledger's 38 attempts on this market read read-only, its bytes unchanged).** Each cell: seeds of 5 that passed
+  development and the sealed test / of those, seeds whose re-timing p is at most 0.05; then the median development
+  Sharpe after costs.
+
+  | hit rate over 5-bar blocks | as given, fresh ledger | as given, 38 attempts | drift removed, fresh | drift removed, 38 attempts |
+  |---|---|---|---|---|
+  | 0.50 (no skill) | 5 / 0, Sharpe 0.72 | 0 / 0 | 0 / 0, Sharpe -0.19 | 0 / 0 |
+  | 0.52 | 5 / 3, 0.93 | 0 / 0 | 0 / 0, 0.08 | 0 / 0 |
+  | 0.55 | 5 / 5, 1.42 | 3 / 3 | 2 / 2, 0.54 | 0 / 0 |
+  | 0.60 | 5 / 5, 1.91 | 5 / 5 | 5 / 5, 1.10 | 0 / 0 |
+  | 0.70 | 5 / 5, 3.65 | 5 / 5 | 5 / 5, 2.82 | 5 / 5 |
+
+  Read: (1) on a fresh ledger, no skill at all passes 5 of 5 on our real data (the market basket's Sharpe was 0.95),
+  and none of those passes clears the re-timing test. (2) With today's 38 attempts counted, a long-biased idea needs a
+  development Sharpe of about 1.4 to pass about half the time and about 1.9 to pass reliably; with the market's rise
+  taken out, a timing edge worth Sharpe 1.1 fails 5 of 5. Every real idea tested so far had less, which is why 22
+  ideas gave no pass. (3) The re-timing test sees far smaller skill than that: it flags 3 of 5 at a hit rate of 0.52
+  and 5 of 5 at 0.55, because it compares the book with copies of itself on the same history and so removes the
+  market's own noise. (4) The idea's own Sharpe is counted in the variance the bar is built from (variance used
+  0.00060 against 0.00050 for the 38 attempts alone), so a strong idea raises its own bar.
+- **What this changes in the T39-2 decision above.** The split into EDGE and HOLDING claims stands. The exact pass
+  rule for an edge claim is NOT fixed yet: "also count every attempt in the ledger" would make a strict bar stricter
+  still, while the re-timing test, corrected for the number of attempts, may be the better instrument for skill. It
+  is chosen from a measured study first (T39-2a, no gate change): for each candidate rule, the share of no-skill books
+  that pass (several hundred, long-only and long-short, on the data as given and with drift removed) and the share
+  of small real edges that pass. The gate changes (T39-2b) only after that study, with its own blind check.
+- **What no rule can change.** A daily edge worth a Sharpe of about 1 cannot be told from luck with ten years of
+  data after dozens of tries, and a forward paper record needs years to do it. So money at work is sized under
+  that uncertainty by the stake ladder; a holding book is the honest first thing to follow; and ideas with many
+  independent bets (pairs across many names, shorter bars) are where evidence builds fastest.
 
 ## The owner's decisions (none blocks T38-1 to T38-7)
 
