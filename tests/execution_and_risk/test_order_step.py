@@ -9603,6 +9603,27 @@ def test_t34b3_an_outage_beside_a_local_failure_stays_a_reconcile_stop(tmp_path,
     assert out["status"] == "stopped" and out["stage"] == "reconcile" and out["orders_sent"] == 0, (how, out)
 
 
+def test_t34b3_a_fill_line_that_fails_beside_an_outage_stops_at_reconcile_on_the_journals_own_failure(tmp_path,
+                                                                                                       monkeypatch):
+    """The day's journal file already holds a line, so nothing but the fill line's own failure can stop the run:
+    with that failure swallowed the fill would count as applied with no line and the run would go on to venue_read."""
+    w = _resting(tmp_path / "w")
+    (tag,) = w.venue.submits()
+    w.venue.raise_positions = True
+    w.venue.answers[tag] = [{"state": "filled", "filled_units": 3.0}]
+    real = w.journal.write
+
+    def write(day, entry):
+        if entry.get("event") == "fill":
+            real(day, {"type": "other", "event": "an earlier line of the day"})
+            raise OSError("disk full")
+        return real(day, entry)
+    monkeypatch.setattr(w.journal, "write", write)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and out["orders_sent"] == 0, out
+    assert "disk full" in out["reason"] and w.entries("fill") == [], out
+
+
 # -- N2: a notice is never listed among what stands in the way
 
 def test_t34b3_an_open_notice_is_not_listed_as_standing_in_the_way(tmp_path):
