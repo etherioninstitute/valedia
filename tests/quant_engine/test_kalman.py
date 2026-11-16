@@ -46,8 +46,9 @@ def _prefix_errors(y, x, res, intercept):
 def test_1_delta_zero_is_least_squares_on_every_prefix(intercept):
     # (a) the filter at delta 0 solves least squares with a ridge of 1/prior_var exactly: against lstsq on
     #     the system augmented with the prior rows, every prefix from bar 30, 5e-5 of the largest
-    #     coefficient (measured 6.4e-6 with the intercept; what is left is rounding through the 1e8 prior).
-    # (b) against plain lstsq, every prefix from bar 60, 1e-4 (measured 1.7e-5): the ridge itself moves the
+    #     coefficient (measured 1.5e-5 with the covariance carried as a matrix, 3.0e-12 as a square-root
+    #     factor: what was left was rounding through the 1e8 prior).
+    # (b) against plain lstsq, every prefix from bar 60, 1e-4 (measured 2.6e-5): the ridge itself moves the
     #     estimates where X'X is nearly singular, as on short prefixes of log prices (1.2e-4 at bar 30).
     rng = np.random.default_rng(38)
     worst_a = worst_b = 0.0

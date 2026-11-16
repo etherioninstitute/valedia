@@ -3,14 +3,21 @@ theta_t = [beta_t, alpha_t] is a random walk, run in discount form. Every value 
 data at or before t only; nothing looks at a later bar and nothing is normalised on the full sample.
 
 Discount form, with the state covariance carried in units of the observation variance (P*), so the
-estimates do not depend on the noise level and there is no price-scale constant to tune:
+estimates do not depend on the noise level and there is no price-scale constant to tune. P* is never
+stored: the filter carries a square-root factor S with P* = S S', so the forecast scale is a sum of
+squares plus one and cannot fall below 1 however ill-conditioned P* becomes:
 
-    predict   P*_pred = P*_prev / (1 - delta), then its eigenvalues are clipped at prior_var
-    forecast  F_t = [x_t, 1],  e_t = y_t - F_t theta_prev,  S*_t = F_t P*_pred F_t' + 1
-    update    K_t = P*_pred F_t' / S*_t,  theta_t = theta_prev + K_t e_t
-              P*_t = (I - K F) P*_pred (I - K F)' + K K'   (Joseph form, kept symmetric)
+    predict   S_pred = S_prev / sqrt(1 - delta), then its singular values are clipped at sqrt(prior_var)
+    forecast  F_t = [x_t, 1],  e_t = y_t - F_t theta_prev,  phi = S_pred' F_t',  S*_t = 1 + |phi|^2
+    update    K_t = S_pred phi / S*_t,  theta_t = theta_prev + K_t e_t
+              S_t = S_pred - c (S_pred phi) phi',  c = 1 / (S*_t + sqrt(S*_t))   (Potter's update)
     noise     n_t = (1 - delta) n_{t-1} + 1,  d_t = (1 - delta) d_{t-1} + e_t^2 / S*_t
               R_t = d_{t-1} / n_{t-1}  (bars before t only),  z_t = e_t / sqrt(R_t S*_t)
+
+Mathematically this is the discount filter with P*_t = (I - K F) P*_pred (I - K F)' + K K'. Potter's
+form is used because the observation is a scalar: the update is closed form (no decomposition per
+bar), it needs no square root of a matrix, and it is plain arithmetic, so a prefix of the input
+gives bit-for-bit the same outputs.
 """
 from __future__ import annotations
 
@@ -27,7 +34,7 @@ class KalmanRegression:
     beta: np.ndarray            # filtered slope AFTER seeing bar t
     alpha: np.ndarray           # filtered intercept AFTER seeing bar t (zeros when intercept=False)
     forecast_error: np.ndarray  # e_t = y_t - (beta x_t + alpha) with the state held BEFORE bar t's update
-    forecast_scale: np.ndarray  # S*_t = F P*_pred F' + 1, in units of the observation variance
+    forecast_scale: np.ndarray  # S*_t = F P*_pred F' + 1 (always >= 1), in units of the observation variance
     obs_var: np.ndarray         # R_t: the observation variance estimate used at bar t (from bars before t)
     z: np.ndarray               # e_t / sqrt(R_t S*_t); NaN until `warmup` bars have been seen
 
@@ -36,8 +43,8 @@ class KalmanRegression:
 class _Trace:
     """What the private core exposes to tests; not part of the public result."""
     capped: np.ndarray                 # bool per bar: the cap clipped P*_pred on this bar
-    cov_pred: np.ndarray | None        # P*_pred after the discount and the cap, shape (n, p, p)
-    cov: np.ndarray | None             # P* after bar t (P*_pred carried on a missing bar), shape (n, p, p)
+    cov_pred: np.ndarray | None        # P*_pred = S S' after the discount and the cap, shape (n, p, p)
+    cov: np.ndarray | None             # P* = S S' after bar t (P*_pred on a missing bar), shape (n, p, p)
     count: np.ndarray                  # n_t after bar t (the discounted number of counted bars)
     sum_sq: np.ndarray                 # d_t after bar t (the discounted sum of e^2 / S*)
 
@@ -49,10 +56,10 @@ def _is_real(v) -> bool:
 def _inputs(y, x) -> tuple[np.ndarray, np.ndarray]:
     out = []
     for v, name in ((y, "y"), (x, "x")):
-        try:
-            a = np.array(v, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a numeric series") from exc
+        raw = np.asarray(v)
+        if raw.dtype.kind not in "iuf":             # never let numpy parse text or objects into numbers
+            raise ValueError(f"{name} must be a series of numbers, got values of type {raw.dtype}")
+        a = np.array(raw, dtype=float)
         if a.ndim != 1:
             raise ValueError(f"{name} must be one-dimensional, got {a.ndim} dimensions")
         if np.isinf(a).any():
@@ -74,17 +81,19 @@ def _params(delta, warmup, intercept, prior_var) -> None:
         raise ValueError(f"warmup must be an integer of at least 2, got {warmup!r}")
     if not isinstance(intercept, (bool, np.bool_)):
         raise ValueError(f"intercept must be True or False, got {intercept!r}")
-    if not _is_real(prior_var) or not (math.isfinite(float(prior_var)) and float(prior_var) > 0.0):
-        raise ValueError(f"prior_var must be a finite positive number, got {prior_var!r}")
+    if not _is_real(prior_var) or not 1.0 <= float(prior_var) <= 1e12:
+        raise ValueError(f"prior_var must be a finite number in [1, 1e12], got {prior_var!r}")
 
 
 def _run_two(yl, xl, delta, warmup, prior_var, keep_cov, cap):
-    """Slope and intercept: state [beta, alpha], covariance [[p11, p12], [p12, p22]]."""
+    """Slope and intercept: state [beta, alpha], covariance factor S = [[s11, s12], [s21, s22]] with
+    P* = S S'. Measurement update by Potter's square-root form for a scalar observation."""
     nan = math.nan
-    disc, keep = 1.0 / (1.0 - delta), 1.0 - delta
+    grow, keep = 1.0 / math.sqrt(1.0 - delta), 1.0 - delta
+    root = math.sqrt(prior_var)
     b = a = 0.0
-    p11 = p22 = prior_var
-    p12 = 0.0
+    s11 = s22 = root
+    s12 = s21 = 0.0
     nn = dd = 0.0
     absorbed = 0
     beta, alpha, fe, fs, ov, zz, capped, cpred, cpost = [], [], [], [], [], [], [], [], []
@@ -92,30 +101,39 @@ def _run_two(yl, xl, delta, warmup, prior_var, keep_cov, cap):
     for yt, xt in zip(yl, xl):
         hit = False
         if delta > 0.0:
-            p11 *= disc
-            p12 *= disc
-            p22 *= disc
+            s11 *= grow
+            s12 *= grow
+            s21 *= grow
+            s22 *= grow
             if cap:
-                m = 0.5 * (p11 + p22)
-                r = math.hypot(0.5 * (p11 - p22), p12)
-                lam = m + r
+                q11 = s11 * s11 + s12 * s12             # P* = S S', used only to find the clip
+                q22 = s21 * s21 + s22 * s22
+                q12 = s11 * s21 + s12 * s22
+                m = 0.5 * (q11 + q22)
+                lam = m + math.hypot(0.5 * (q11 - q22), q12)    # largest eigenvalue = sigma_1^2
                 if lam > prior_var:
                     hit = True
-                    if m - r >= prior_var:          # no direction informed: back to the prior itself
-                        p11 = p22 = prior_var
-                        p12 = 0.0
-                    else:                           # clip the one uninformed direction (rank one)
-                        u1, u2 = p12, lam - p11
-                        w1, w2 = lam - p22, p12
+                    det = s11 * s22 - s12 * s21         # sigma_1 sigma_2, accurate from S itself
+                    if det * det >= lam * prior_var:    # sigma_2 above too: back to the prior itself
+                        s11 = s22 = root
+                        s12 = s21 = 0.0
+                    else:                               # scale the top singular direction to root
+                        u1, u2 = q12, lam - q11
+                        w1, w2 = lam - q22, q12
                         if w1 * w1 + w2 * w2 > u1 * u1 + u2 * u2:
                             u1, u2 = w1, w2
-                        s = (lam - prior_var) / (u1 * u1 + u2 * u2)
-                        p11 -= s * u1 * u1
-                        p12 -= s * u1 * u2
-                        p22 -= s * u2 * u2
+                        norm = math.hypot(u1, u2)
+                        u1, u2 = u1 / norm, u2 / norm
+                        f = 1.0 - root / math.sqrt(lam)
+                        r1 = u1 * s11 + u2 * s21        # u' S
+                        r2 = u1 * s12 + u2 * s22
+                        s11 -= f * u1 * r1
+                        s12 -= f * u1 * r2
+                        s21 -= f * u2 * r1
+                        s22 -= f * u2 * r2
         capped.append(hit)
         if keep_cov:
-            cpred.append((p11, p12, p22))
+            cpred.append((s11, s12, s21, s22))
         if yt != yt or xt != xt:                    # missing bar: time passes, nothing is learned
             beta.append(b)
             alpha.append(a)
@@ -124,29 +142,25 @@ def _run_two(yl, xl, delta, warmup, prior_var, keep_cov, cap):
             ov.append(nan)
             zz.append(nan)
             if keep_cov:
-                cpost.append((p11, p12, p22))
+                cpost.append((s11, s12, s21, s22))
             cnt.append(nn)
             ssq.append(dd)
             continue
-        g1 = p11 * xt + p12
-        g2 = p12 * xt + p22
-        s_star = xt * g1 + g2 + 1.0
+        phi1 = s11 * xt + s21                       # phi = S' F'
+        phi2 = s12 * xt + s22
+        s_star = 1.0 + phi1 * phi1 + phi2 * phi2    # a sum of squares plus one: never below 1
+        g1 = s11 * phi1 + s12 * phi2                # g = S phi = P* F'
+        g2 = s21 * phi1 + s22 * phi2
         e = yt - (b * xt + a)
         r_t = dd / nn if nn > 0.0 else nan
         z = e / math.sqrt(r_t * s_star) if absorbed >= warmup and r_t > 0.0 else nan
-        k1, k2 = g1 / s_star, g2 / s_star
-        b += k1 * e
-        a += k2 * e
-        a11, a12, a21, a22 = 1.0 - k1 * xt, -k1, -k2 * xt, 1.0 - k2
-        m11 = a11 * p11 + a12 * p12
-        m12 = a11 * p12 + a12 * p22
-        m21 = a21 * p11 + a22 * p12
-        m22 = a21 * p12 + a22 * p22
-        n11 = m11 * a11 + m12 * a12 + k1 * k1
-        n12 = m11 * a21 + m12 * a22 + k1 * k2
-        n21 = m21 * a11 + m22 * a12 + k2 * k1
-        n22 = m21 * a21 + m22 * a22 + k2 * k2
-        p11, p12, p22 = n11, 0.5 * (n12 + n21), n22
+        b += g1 / s_star * e
+        a += g2 / s_star * e
+        c = 1.0 / (s_star + math.sqrt(s_star))      # Potter: S <- S (I - c phi phi')
+        s11 -= c * g1 * phi1
+        s12 -= c * g1 * phi2
+        s21 -= c * g2 * phi1
+        s22 -= c * g2 * phi2
         if absorbed >= 2:                           # the first p bars are fitted exactly: not counted
             nn = keep * nn + 1.0
             dd = keep * dd + e * e / s_star
@@ -158,24 +172,25 @@ def _run_two(yl, xl, delta, warmup, prior_var, keep_cov, cap):
         ov.append(r_t)
         zz.append(z)
         if keep_cov:
-            cpost.append((p11, p12, p22))
+            cpost.append((s11, s12, s21, s22))
         cnt.append(nn)
         ssq.append(dd)
 
-    def mats(rows):
-        c = np.array(rows, dtype=float).reshape(-1, 3)
-        return np.stack([np.stack([c[:, 0], c[:, 1]], -1), np.stack([c[:, 1], c[:, 2]], -1)], -2)
+    def mats(rows):                                 # rebuild P* = S S' for inspection
+        f = np.array(rows, dtype=float).reshape(-1, 2, 2)
+        return f @ np.swapaxes(f, 1, 2)
 
     return (beta, alpha, fe, fs, ov, zz, capped,
             mats(cpred) if keep_cov else None, mats(cpost) if keep_cov else None, cnt, ssq)
 
 
 def _run_one(yl, xl, delta, warmup, prior_var, keep_cov, cap):
-    """Slope only: state [beta], scalar covariance p."""
+    """Slope only: state [beta], scalar factor s with P* = s^2."""
     nan = math.nan
-    disc, keep = 1.0 / (1.0 - delta), 1.0 - delta
+    grow, keep = 1.0 / math.sqrt(1.0 - delta), 1.0 - delta
+    root = math.sqrt(prior_var)
     b = 0.0
-    p = prior_var
+    s = root
     nn = dd = 0.0
     absorbed = 0
     beta, fe, fs, ov, zz, capped, cpred, cpost = [], [], [], [], [], [], [], []
@@ -183,13 +198,13 @@ def _run_one(yl, xl, delta, warmup, prior_var, keep_cov, cap):
     for yt, xt in zip(yl, xl):
         hit = False
         if delta > 0.0:
-            p *= disc
-            if cap and p > prior_var:
-                p = prior_var
+            s *= grow
+            if cap and s > root:
+                s = root
                 hit = True
         capped.append(hit)
         if keep_cov:
-            cpred.append(p)
+            cpred.append(s)
         if yt != yt or xt != xt:
             beta.append(b)
             fe.append(nan)
@@ -197,19 +212,17 @@ def _run_one(yl, xl, delta, warmup, prior_var, keep_cov, cap):
             ov.append(nan)
             zz.append(nan)
             if keep_cov:
-                cpost.append(p)
+                cpost.append(s)
             cnt.append(nn)
             ssq.append(dd)
             continue
-        g = p * xt
-        s_star = xt * g + 1.0
+        phi = s * xt
+        s_star = 1.0 + phi * phi
         e = yt - b * xt
         r_t = dd / nn if nn > 0.0 else nan
         z = e / math.sqrt(r_t * s_star) if absorbed >= warmup and r_t > 0.0 else nan
-        k = g / s_star
-        b += k * e
-        one = 1.0 - k * xt
-        p = one * one * p + k * k
+        b += s * phi / s_star * e
+        s /= math.sqrt(s_star)                      # Potter for one state: P* <- P* / S*
         if absorbed >= 1:
             nn = keep * nn + 1.0
             dd = keep * dd + e * e / s_star
@@ -220,13 +233,17 @@ def _run_one(yl, xl, delta, warmup, prior_var, keep_cov, cap):
         ov.append(r_t)
         zz.append(z)
         if keep_cov:
-            cpost.append(p)
+            cpost.append(s)
         cnt.append(nn)
         ssq.append(dd)
     n = len(beta)
+
+    def mats(rows):
+        f = np.array(rows, dtype=float).reshape(-1, 1, 1)
+        return f * f
+
     return (beta, [0.0] * n, fe, fs, ov, zz, capped,
-            np.array(cpred, dtype=float).reshape(-1, 1, 1) if keep_cov else None,
-            np.array(cpost, dtype=float).reshape(-1, 1, 1) if keep_cov else None, cnt, ssq)
+            mats(cpred) if keep_cov else None, mats(cpost) if keep_cov else None, cnt, ssq)
 
 
 def _filter(y, x, *, delta: float = 0.01, warmup: int = 60, intercept: bool = True,
@@ -256,7 +273,14 @@ def kalman_regression(y, x, *, delta: float = 0.01, warmup: int = 60, intercept:
     1/prior_var on [beta, alpha]. On 20 log-price series in the tests the filter differed from plain
     least squares by at most 2.6e-5 of the largest coefficient from bar 60 on (the ridge matters where
     X'X is nearly singular: up to 1.2e-4 on 30-bar prefixes) and from the ridge problem itself by at
-    most 1.5e-5 from bar 30 on.
+    most 3e-12 from bar 30 on.
+
+    prior_var, in [1, 1e12]. Precision against a 50-digit copy of the same filter (10 series of 600
+    bars, half log prices moving 1% a bar, half near-constant x moving 0.01% a bar; delta 0.01): at
+    prior_var 1e8 at most 1.4e-11 of the largest coefficient in beta and alpha, 1.0e-11 of the typical
+    forecast error, 1.8e-12 relative in forecast_scale, 6.8e-12 in z; at 1e12 at most 3.4e-10, 9.6e-11,
+    9.2e-12 and 7.8e-11. (A covariance carried as a matrix was off by 9e-4 at 1e8 and by order 1 at
+    1e12 on the same data, and its forecast scale could go negative.)
 
     Start and prior: theta = 0 and P* = prior_var times the identity, on the inputs as given. With the
     default 1e8 the prior is nearly diffuse: the first p bars (p = 2 with the intercept, 1 without) are
@@ -267,9 +291,10 @@ def kalman_regression(y, x, *, delta: float = 0.01, warmup: int = 60, intercept:
     1000 at delta 0.01 for c in [0.1, 100]; c = 0.1 needed 757 bars; smaller c needs longer, and the
     fade depends on how much x moves). Rescaling y is exact from the first bar.
 
-    The cap: after the discount step the eigenvalues of P*_pred are clipped at prior_var (with no
-    intercept, min(P*, prior_var)). The filter is never less certain than knowing nothing. Without the
-    cap a direction the data do not inform grows without limit and the forecast scale cancels below 1.
+    The cap: after the discount step the singular values of the factor are clipped at sqrt(prior_var),
+    that is the eigenvalues of P*_pred at prior_var (with no intercept, min(P*, prior_var)). The filter
+    is never less certain than knowing nothing. Without the cap a direction the data do not inform
+    grows without limit, and the forecast scale and the estimates degrade with it.
     What a caller sees: after a long stretch with no information about the slope (a constant x, a long
     gap) the slope is treated as unknown and relearned; the forecast scale is then of the order of
     prior_var and z stays near zero until the slope is learned again. A constant x returns finite
@@ -289,11 +314,12 @@ def kalman_regression(y, x, *, delta: float = 0.01, warmup: int = 60, intercept:
     example the log price relative to a starting value.
 
     Missing bars (NaN in y or x): no update; beta and alpha carried; forecast_error, forecast_scale,
-    obs_var and z NaN on that bar; the discount still applies to P* (time passed); the variance
-    estimate is unchanged. An infinite value is refused.
+    obs_var and z NaN on that bar; the discount still applies to the factor (time passed); the variance
+    estimate is unchanged. An infinite value, None, text (even numeric text such as "1.5"), booleans
+    and objects are refused: the series must hold numbers.
 
     Raises ValueError for inputs that are not one-dimensional numeric series of equal length with at
     least 3 bars where both are present, for delta outside [0, 0.5), warmup below 2, a non-boolean
-    intercept or a prior_var that is not finite and positive.
+    intercept or a prior_var outside [1, 1e12]; each message names the parameter.
     """
     return _filter(y, x, delta=delta, warmup=warmup, intercept=intercept, prior_var=prior_var)[0]
