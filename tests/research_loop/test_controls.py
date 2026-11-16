@@ -109,13 +109,14 @@ def test_the_reference_edge_passes_on_a_fresh_ledger_and_is_measured_at_prior_at
     assert ref["hit_rate"] == 0.60 and ref["horizon"] == 5 and ref["runs"] == 5
     # measured 5 of 5 on the driftless universe, its detrended copy, and universe 1 as given and detrended: every seed
     assert ref["passed_development"] == ref["passed_sealed"] == 5 and ref["failed_checks"] == {}
-    # reference net Sharpe per seed measured 1.35 to 1.63 (driftless, as given); the gate needs about 0.53 for a
-    # Deflated Sharpe of 0.95 at one attempt; mark 0.8 = 0.53 plus a third of the smallest margin seen (0.82)
+    # reference net Sharpe per seed measured 1.35 to 1.63 (driftless, as given) and 1.33 to 1.59 (detrended); the
+    # gate needs about 0.53 for a Deflated Sharpe of 0.95 at one attempt; mark 0.8 = 0.53 plus a third of the
+    # smallest margin seen (0.80)
     assert min(x["net_sharpe"] for x in rung(full, "fresh_ledger", 0.60, name)["seeds"]) >= 0.8
     # the gate's re-timing test: measured p 0.003 (its floor, 1/301) on every reference seed; all 5 also timed
     assert ref["passed_both_and_timing"] == 5 and ref["median_timing_p_value"] <= 0.05
     at_prior = s["reference_edge_at_prior_attempts"]
-    # with 30 priors it is MEASURED, not required: 2 of 5 on the driftless universe, 5 of 5 on its detrended copy
+    # with 30 priors it is MEASURED, not required: 2 of 5 on the driftless universe and on its detrended copy
     assert at_prior["runs"] == 5 and 0 <= at_prior["passed_sealed"] <= 5
     assert at_prior["passed_sealed"] == rung(full, "at_prior_attempts", 0.60, name)["passed_sealed"]
     assert full["prediction"]["fail_if_sharpe_below"] == 0.0 and full["prediction"]["fail_if_drawdown_above"] == 1.0
@@ -126,8 +127,8 @@ def test_the_no_edge_book_fails_development_on_every_seed(full, name):
     ne = suite(full, name)["no_edge"]
     assert ne["runs"] == 5 and ne["passed_development"] == 0 and ne["passed_sealed"] == 0
     assert all("deflated_sharpe" in s["failed"] for s in ne["seeds"])
-    # median Deflated Sharpe measured 0.106 (as given) and 0.111 (detrended); mark 0.35, about three times the
-    # larger. Highest single seed measured 0.424 here and 0.874 on drifting universe 1.
+    # median Deflated Sharpe measured 0.106 (as given) and 0.114 (detrended); mark 0.35, about three times the
+    # larger. Highest single seed measured 0.422 here and 0.876 on drifting universe 1, detrended.
     assert ne["median_dsr"] <= 0.35
     assert all(s["attempts_on_market_before"] == 0 and s["attempts_on_market"] == 1 for s in ne["seeds"])
 
@@ -240,7 +241,7 @@ def test_smallest_passing_hit_rate_reads_back_from_the_table_and_ignores_rungs_a
     for name, ladder in LADDERS:
         lad = suite(full, name)[ladder]
         assert lad["smallest_passing_hit_rate"] == controls.smallest_passing_hit_rate(lad["ladder"])
-    # measured on the driftless universe: 0.55 fresh and 0.70 at priors as given, 0.52 and 0.60 detrended
+    # measured on the driftless universe: 0.55 fresh and 0.70 at priors, as given and detrended alike
     assert full["fresh_ledger"]["smallest_passing_hit_rate"] <= 0.60
     assert full["at_prior_attempts"]["smallest_passing_hit_rate"] >= full["fresh_ledger"]["smallest_passing_hit_rate"]
     table = [{"hit_rate": h, "runs": 5, "passed_sealed": k} for h, k in ((0.5, 5), (0.52, 3), (0.55, 4), (0.6, 4), (0.7, 5))]
@@ -274,7 +275,7 @@ def test_sealed_fields_are_null_when_the_sealed_test_did_not_run(full):
         assert s["passed_sealed"] is False
     nobody = rung(full, "at_prior_attempts", 0.50)                        # measured 0 of 5 developed: no sealed runs
     assert nobody["passed_development"] == 0 and nobody["median_sealed_impact_share_of_gross"] is None
-    # impact share measured 0.20 or so at h = 1.00 against 0.02 at h = 0.60 on every universe: the compounder pays
+    # impact share measured 0.135 to 0.185 at h = 1.00 against 0.019 to 0.023 at h = 0.60: the compounder pays
     assert (rung(full, "fresh_ledger", 1.00)["median_sealed_impact_share_of_gross"]
             > 3 * rung(full, "fresh_ledger", 0.60)["median_sealed_impact_share_of_gross"])
 
@@ -283,8 +284,8 @@ def test_the_single_bar_edge_is_reported_with_its_failing_check(full):
     for name in ("given", "detrended"):
         sb = suite(full, name)["single_bar_edge"]
         assert sb["horizon"] == 1 and sb["hit_rate"] == 1.0 and sb["runs"] == 1
-        # driftless universe measured: development failed on delayed_fills only (delayed-fills Sharpe -0.833 as
-        # given, -0.592 detrended); drifting universe 1 as given passed both
+        # driftless universe measured: development failed on delayed_fills only, as given and detrended; drifting
+        # universe 1 as given passed both
         assert sb["passed_development"] == 0 and sb["seeds"][0]["failed"] == ["delayed_fills"]
         assert sb["statement"] == "this gate turns away an edge that lives in one bar, because of the delayed-fills check"
 
@@ -302,27 +303,41 @@ def test_the_reading_says_it_in_words(full):
     risen = dict(full, market_basket_sharpe=1.0)
     assert warning in controls._reading(risen, full["detrended"])
     assert warning not in controls._reading(dict(full, market_basket_sharpe=0.3), full["detrended"])
-    # the detrended basket keeps simple-return drift (measured 0.34 to 0.37 on every universe): said, not hidden
-    assert full["detrended"]["market_basket_sharpe"] > 0.3
-    assert any(line.startswith("The detrended market basket still has a development Sharpe of") for line in reading)
+    # detrended in simple returns the basket has no drift: Sharpe measured -0.003 here and -0.051 on drifting
+    # universe 1 (0.37 and 0.34 when the drift was removed in log terms); mark 0.15, about three times the larger
+    assert abs(full["detrended"]["market_basket_sharpe"]) <= 0.15
+    assert any(line.startswith("The detrended market basket has a development Sharpe of") for line in reading)
 
 
-def test_the_detrended_frame_keeps_volatility_and_correlation_and_loses_the_drift():
+def _simple(series: pd.Series) -> np.ndarray:
+    v = series.dropna().to_numpy(dtype=float)                             # between consecutive prices the symbol has
+    return v[1:] / v[:-1] - 1.0
+
+
+def test_the_detrended_frame_keeps_volatility_and_correlation_and_loses_the_drift_in_simple_returns():
     prices, _ = universe(1)                                               # the drifting one
     gaps = prices.copy()
     gaps.iloc[100:130, 3] = np.nan                                        # missing values stay missing
     for px in (prices, gaps):
         flat = controls.detrend(px)
-        assert flat.isna().equals(px.isna()) and (flat.iloc[0] == px.iloc[0]).all()
-        a, b = np.log(px).diff(), np.log(flat).diff()
-        if px is prices:
-            assert np.abs(b.mean().to_numpy()).max() <= 1e-12 and np.abs(a.mean().to_numpy()).max() > 1e-5
-            assert np.allclose(b.std().to_numpy(), a.std().to_numpy(), rtol=0, atol=1e-9)
-            assert np.allclose(b.corr().to_numpy(), a.corr().to_numpy(), rtol=0, atol=1e-9)
-        for c in px.columns:                                              # mean over consecutive prices each symbol has
-            lr = np.diff(np.log(flat[c].dropna().to_numpy()))
-            assert abs(lr.mean()) <= 1e-12
+        assert flat.isna().equals(px.isna()) and (flat.iloc[0] == px.iloc[0]).all() and np.nanmin(flat.to_numpy()) > 0
+        for c in px.columns:
+            a, b = _simple(px[c]), _simple(flat[c])
+            assert len(a) == len(b) and abs(b.mean()) <= 1e-12             # every symbol's mean simple return is zero
+            assert abs(np.std(b, ddof=1) - np.std(a, ddof=1)) <= 1e-9
+        assert max(abs(_simple(px[c]).mean()) for c in px.columns) > 1e-4   # two-way: the data as given did drift
+    a, b = prices.pct_change().iloc[1:], controls.detrend(prices).pct_change().iloc[1:]
+    assert np.allclose(b.corr().to_numpy(), a.corr().to_numpy(), rtol=0, atol=1e-9)
+    assert np.abs(b.mean(axis=1).mean()) <= 1e-12                         # the equal-weight basket's mean return per bar
     assert np.allclose(controls.detrend(controls.detrend(prices)), controls.detrend(prices), rtol=1e-12)
+
+
+def test_detrend_refuses_a_return_it_cannot_rebuild_into_a_price():
+    idx = pd.bdate_range("2020-01-01", periods=6)
+    px = pd.DataFrame({"OK": [10.0, 10.1, 10.0, 10.2, 10.1, 10.3], "JUMP": [1.0, 100.0, 0.5, 0.6, 0.55, 0.6]}, index=idx)
+    with pytest.raises(ValueError, match=r"JUMP: the detrended return on 2020-01-03"):
+        controls.detrend(px)                                              # -0.995 minus a mean of about 19.8 is below -1
+    assert (controls.detrend(px[["OK"]]) > 0).all().all()
 
 
 # ---- the ledgers
