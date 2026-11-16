@@ -2706,3 +2706,25 @@ def test_a_reader_whose_finishing_of_an_outbox_fails_raises_nothing_and_keeps_th
     trader(setup)
     lines = [ln for p in sorted(setup[0].glob("*.jsonl")) for ln in p.read_text().splitlines()]
     assert all(lines.count(ln) == 1 for ln in state["journal_outbox"])
+
+
+def test_a_long_leg_pairs_strategy_places_the_long_legs_order_and_journals_why(setup):
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    rng = np.random.default_rng(8)
+    n = 40
+    b = 100 * np.exp(np.cumsum(0.01 * rng.standard_normal(n)))
+    ratio = 1 + 0.002 * rng.standard_normal(n)
+    ratio[-1] = 0.95                                                 # AAA falls away from BBB on the last day
+    px = pd.DataFrame({"AAA": ratio * b, "BBB": b}, index=pd.bdate_range("2026-01-05", periods=n))
+    s = PairsStrategy.from_spec({
+        "kind": "pairs", "name": "pairs_paper", "version": "1.0.0", "hypothesis": "Two related prices drift back together after they part",
+        "pairs": [["AAA", "BBB"]], "signal": {"hedge": "ratio", "window": 20, "enter": 2.0, "exit": 0.5}, "legs": "long",
+        "sizing": {"pair_weight": 0.2}, "risk": {"max_position_pct": 0.1, "stop_loss_pct": None}})
+    _, events = st.run_rules(s, px)
+    assert [(e["action"], e["symbol"], e["date"]) for e in events][-1] == ("enter", "AAA", px.index[-1])
+    t = trader(setup)
+    summary = t.step(px, {9: s})
+    placed = [e for e in t.journal.read() if e.get("decision") == "placed"]
+    assert summary["orders_placed"] == 1 and [e["symbol"] for e in placed] == ["AAA"] and placed[0]["order"]["side"] == "buy"
+    assert placed[0]["reasoning"].startswith("enter: entry rule") and "target weight +0.100" in placed[0]["reasoning"]
+    assert [(p["symbol"], p["units"] > 0) for p in t.state["pending"]] == [("AAA", True)]     # the short leg is not taken

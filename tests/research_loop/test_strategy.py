@@ -327,3 +327,55 @@ def test_resizing_survives_a_round_trip_and_is_offered_to_the_research_agents(tm
     assert st.RuleStrategy.from_spec(hold_spec()).rebalance_days is None
     assert "  hold: " in research.RULE_LIBRARY and "rebalance_days in [1, 252]" in research.RULE_LIBRARY
     assert "Parameters: ." not in research.RULE_LIBRARY
+
+
+# ---- the two hooks for strategies of another kind (T38-1)
+
+
+def test_run_rules_hands_a_strategy_with_its_own_walk_over_to_it():
+    sentinel = (pd.DataFrame(), [{"action": "enter"}])
+
+    class Walked(st.Strategy):
+        name, version, market, risk = "walked_test", "1.0.0", ("A",), st.StrategyRisk()
+        hypothesis = "A strategy that walks itself is handed over whole"
+        calls = []
+
+        def entry(self, prices):
+            raise AssertionError("run_rules must not ask a walked strategy for entries")
+
+        exit = size = entry
+
+        def walk(self, prices):
+            self.calls.append(len(prices))
+            return sentinel
+
+    s = Walked()
+    assert st.run_rules(s, frame(Z=[1, 2, 3])) is sentinel and s.calls == [3]     # handed over, prices as given
+    s.name = "Not A Name"
+    with pytest.raises(st.SpecError, match="lower_snake_case"):
+        st.run_rules(s, frame(A=[1, 2, 3]))                                       # identity is checked first
+    assert s.calls == [3]
+    s.name, s.walk = "walked_test", "not callable"
+    with pytest.raises(AssertionError, match="must not ask"):
+        st.run_rules(s, frame(A=[1, 2, 3]))                                       # only a callable walk is a walk
+
+
+def test_load_strategy_builds_a_pairs_spec_and_refuses_an_unknown_kind(tmp_path):
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    pairs = {"kind": "pairs", "name": "pairs_load", "version": "1.0.0", "hypothesis": "Two related prices drift back together",
+             "pairs": [["A", "B"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}}
+    (tmp_path / "pairs_load.json").write_text(json.dumps(pairs))
+    loaded = st.load_strategy(tmp_path / "pairs_load.json")
+    assert isinstance(loaded, PairsStrategy) and loaded.to_spec()["kind"] == "pairs" and loaded.market == ("A", "B")
+    (tmp_path / "rules.json").write_text(json.dumps(spec()))
+    assert type(st.load_strategy(tmp_path / "rules.json")) is st.RuleStrategy        # no kind: a rule strategy, as before
+    for kind in ("rule", "rules", "Pairs", None, 7):
+        (tmp_path / "odd.json").write_text(json.dumps({**spec(), "kind": kind}))
+        with pytest.raises(st.SpecError, match="pairs"):
+            st.load_strategy(tmp_path / "odd.json")
+    (tmp_path / "bad_pairs.json").write_text(json.dumps({**pairs, "market": ["A", "B"]}))
+    with pytest.raises(st.SpecError, match="unknown keys"):
+        st.load_strategy(tmp_path / "bad_pairs.json")
+    (tmp_path / "list.json").write_text("[1, 2]")
+    with pytest.raises(st.SpecError, match="JSON object"):
+        st.load_strategy(tmp_path / "list.json")

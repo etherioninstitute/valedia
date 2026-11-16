@@ -195,3 +195,26 @@ def test_timing_null_tells_timing_skill_from_plain_exposure():
     assert gt.timing_null(skilled, r, n=50)["p_value"] == gt.timing_null(skilled, r, n=50)["p_value"]      # seeded
     assert "unavailable" in gt.timing_null(skilled.iloc[:30], r.iloc[:30])
     assert "unavailable" in gt.timing_null(skilled * 0.0, r)
+
+
+def test_a_pairs_strategy_runs_the_development_test_and_a_pair_counts_as_one_trade(env):
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    paths, ledger, _, g, hid = env
+    gt.write_prediction(ledger, paths, hid, "pairs_gauntlet", PRED)
+    s = PairsStrategy.from_spec({
+        "kind": "pairs", "name": "pairs_gauntlet", "version": "1.0.0", "hypothesis": "Two related prices drift back together after they part",
+        "pairs": [["A", "B"], ["C", "D"], ["E", "F"]], "signal": {"hedge": "log_ratio", "window": 20, "enter": 1.5, "exit": 0.5},
+        "legs": "both", "sizing": {"pair_weight": 0.3, "max_open_pairs": 3},
+        "risk": {"max_position_pct": 0.15, "stop_loss_pct": 0.05, "max_holding_days": 30}})
+    rep = g.develop(hid, s, "strategies/pairs_gauntlet.json")
+    _, events = st.run_rules(s, g.dev_prices)
+    start = pd.Timestamp(rep["out_of_sample_from"])
+    exits = [e for e in events if e["action"] == "exit" and e["date"] >= start]
+    legs = [e for e in events if e["action"] == "exit_leg" and e["date"] >= start]
+    assert rep["result"]["trades"] == len(exits) > 20 and len(legs) == len(exits)       # one trade per pair, not per leg
+    assert sum(v["count"] for v in rep["exits"].values()) == len(exits)
+    assert set(rep["exits"]) <= {"stop loss", "take profit", "time limit", "z stop", "exit rule"}
+    assert rep["result"]["trade_win_rate"] == pytest.approx(np.mean([e["pnl_pct"] > 0 for e in exits]))
+    assert rep["strategy"]["risk"]["max_open_positions"] == 6 and rep["verdict"] in ("fail", "pass (development); sealed test pending")
+    attempt = ledger.attempts(hid)[0]
+    assert attempt["params"]["spec"] == s.to_spec() and ledger.variations(hid) == 1

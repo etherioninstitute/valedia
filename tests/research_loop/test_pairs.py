@@ -485,3 +485,69 @@ def test_walk_agrees_with_a_slow_walker_written_from_the_rulings(hedge):
         total += len(closed)
         kinds |= {c[1] for c in closed}
     assert total >= 200 and kinds == {"stop loss", "take profit", "time limit", "z stop", "exit rule"}
+
+
+# ---- through the hooks and the real consumers
+
+
+def test_a_pairs_spec_round_trips_through_save_spec_and_load_strategy(tmp_path):
+    for hedge in ("ratio", "log_ratio", "ols"):
+        s = build(name=f"pairs_{hedge}", signal={"hedge": hedge, **({"hedge_window": 60} if hedge == "ols" else {})})
+        path = st.save_spec(s, tmp_path)
+        loaded = st.load_strategy(path)
+        assert isinstance(loaded, pr.PairsStrategy) and loaded == s and loaded.to_spec() == json.loads(path.read_text())
+
+
+def _universe(n=320, seed=5, gaps=0.02):
+    rng = np.random.default_rng(seed)
+    base = np.log(100.0) + np.cumsum(0.015 * rng.standard_normal((n, 3)), axis=0)
+    e = np.zeros((n, 3))
+    for t in range(1, n):
+        e[t] = 0.8 * e[t - 1] + 0.01 * rng.standard_normal(3)
+    cols = {"A": base[:, 0] + e[:, 0], "B": base[:, 0], "C": 1.3 * base[:, 1] + e[:, 1] - 1.0, "D": base[:, 1],
+            "E": base[:, 2] + e[:, 2], "F": base[:, 2]}
+    px = pd.DataFrame({k: np.exp(v) for k, v in cols.items()}, index=pd.bdate_range("2020-01-01", periods=n))
+    return px.mask(rng.random(px.shape) < gaps)
+
+
+def _universe_strategy(hedge):
+    return build(name=f"universe_{hedge}", pairs=[["A", "B"], ["C", "D"], ["E", "F"], ["A", "C"]],
+                 signal={"hedge": hedge, "window": 10, "enter": 1.4, "exit": 0.3, "stop_z": 3.0,
+                         **({"hedge_window": 40} if hedge == "ols" else {})},
+                 sizing={"pair_weight": 0.2, "max_open_pairs": 2},
+                 risk={"max_position_pct": 0.08, "max_gross": 0.25, "stop_loss_pct": 0.03, "take_profit_pct": 0.03,
+                       "max_holding_days": 8})
+
+
+@pytest.mark.parametrize("hedge", ["ratio", "log_ratio", "ols"])
+def test_the_walk_is_causal(hedge):
+    from valedia_trader.quant_engine.level10_ml_research import detect_lookahead
+    px, s = _universe(), _universe_strategy(hedge)
+    assert detect_lookahead(s.target_weights, px) == [] and detect_lookahead(s.target_weights, px, n_checks=40) == []
+    full_w, full_ev = s.walk(px)
+    assert len(trades(full_ev)) >= 10
+    rng = np.random.default_rng(7)
+    cuts = rng.choice(np.arange(20, len(px) - 1), size=50, replace=False)
+    for cut in cuts:
+        part_w = s.target_weights(px.iloc[: cut + 1])
+        pd.testing.assert_frame_equal(part_w, full_w.iloc[: cut + 1], check_exact=True)
+        _, part_ev = s.walk(px.iloc[: cut + 1])
+        assert part_ev == [e for e in full_ev if e["date"] <= px.index[cut]]
+
+
+def test_run_rules_hands_over_to_walk_and_the_backtester_takes_the_weights():
+    from valedia_trader.backtest.engine import CostModel, run_backtest
+    px = _universe(gaps=0.0)
+    px["X"] = 50.0                                                                # a column outside the market
+    for hedge in ("ratio", "log_ratio", "ols"):
+        s = _universe_strategy(hedge)
+        w, events = st.run_rules(s, px)
+        ww, ee = s.walk(px)
+        pd.testing.assert_frame_equal(w, ww, check_exact=True)
+        assert events == ee and list(w.columns) == list(px.columns) and (w["X"] == 0).all()
+        assert (w.abs().sum(axis=1) <= 0.25 + 1e-12).all() and (w.abs().sum(axis=1) > 0).any()
+        assert all(e["weight"] <= 0.08 + 1e-12 for e in events if "weight" in e)      # the leg cap; a netted symbol may sum past it
+        res = run_backtest(px, w, CostModel(fees_bps=1.0, slippage_bps=1.0, borrow_annual=0.02, funding_annual=0.0))
+        assert np.isfinite(res.net.to_numpy()).all() and res.turnover.sum() > 0
+    with pytest.raises(st.SpecError, match="price data"):
+        st.run_rules(_universe_strategy("ratio"), px[["X"]])
