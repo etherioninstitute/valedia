@@ -22,7 +22,11 @@ BOOK FAMILIES (no skill: N1 to N4; real, known skill: E1 to E3)
 * N3: the long-short no-edge book (`controls.NoEdgeBook`).
 * N4: rule strategies on SURROGATE prices: `n_surrogates` joint stationary-bootstrap resamples of the frame
   (`surrogate_prices`), and on each `specs_per_surrogate` long-only rule strategies drawn from the rule library
-  (`draw_rule_spec`, ranges in `DRAW_RANGES`). Books on one surrogate share its path: they are not independent.
+  (`draw_rule_spec`, ranges in `DRAW_RANGES`). Identical books on one surrogate count once (`_surrogate_books`:
+  a repeated spec, or a different spec with the same whole-history book, is dropped and counted). Books on one
+  surrogate share its path and are not independent, so N4 also reports each surrogate's own pass share and a 95%
+  interval from a bootstrap over whole surrogates (`surrogate_bootstrap`, seeded, 2,000 resamples); the reading judges
+  N4 by that interval, not the Wilson one.
 * E1: the long-only oracle at hit rates 0.52, 0.55, 0.60, 5-bar blocks. E2: the same, 20-bar blocks.
 * E3: a market-neutral oracle (`NeutralOracle`) at the same hit rates, 5-bar blocks.
 
@@ -71,7 +75,8 @@ from valedia_trader.research_loop import gauntlet as gt
 from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.strategy import CRYPTO, SCORES, RuleStrategy, Strategy, StrategyRisk, run_rules
 
-__all__ = ["study", "develops", "passes", "deflated_value", "wilson", "surrogate_prices", "stationary_bootstrap_rows",
+__all__ = ["study", "develops", "passes", "deflated_value", "wilson", "surrogate_bootstrap", "surrogate_prices",
+           "stationary_bootstrap_rows",
            "draw_rule_spec", "NeutralOracle", "RULES", "FAMILIES", "DRAW_RANGES", "main"]
 
 RULES = ("R0", "R1", "R2", "R3", "R4")
@@ -85,7 +90,8 @@ EDGE_HIT_RATES = (0.52, 0.55, 0.60)
 _Z95 = 1.959963984540054
 _SEALED_CHECKS = ("made_money", "prediction_failure_terms")
 _VERSIONS = ("given", "detrended")
-_CODES = {"N1": 1, "N2": 2, "N3": 3, "N4": 4, "E1": 5, "E2": 6, "E3": 7, "surrogate": 8, "spec": 9}
+_CODES = {"N1": 1, "N2": 2, "N3": 3, "N4": 4, "E1": 5, "E2": 6, "E3": 7, "surrogate": 8, "spec": 9, "cluster": 10}
+N_BOOT = 2000                         # resamples of whole surrogates for N4's interval
 
 # family: (kind, hit rates, horizon, plain description)
 FAMILIES: dict[str, tuple[str, tuple[float, ...], int | None, str]] = {
@@ -131,6 +137,21 @@ def wilson(passes: int, runs: int, z: float = _Z95) -> list[float] | None:
     mid = (p + z * z / (2 * n)) / (1 + z * z / n)
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
     return [max(0.0, mid - half), min(1.0, mid + half)]
+
+
+def surrogate_bootstrap(passes_per: Sequence[int], books_per: Sequence[int], rng: np.random.Generator,
+                        n_boot: int = N_BOOT) -> list[float] | None:
+    """A 95% interval for a family's pass share when its books cluster by surrogate: `n_boot` resamples of whole
+    surrogates (drawn with replacement, as many as there are), each resample's share being its passes over its books;
+    the 2.5th and 97.5th percentiles. None with fewer than 2 surrogates (no spread between surrogates to resample)."""
+    p, b = np.asarray(passes_per, dtype=float), np.asarray(books_per, dtype=float)
+    if p.shape != b.shape or p.ndim != 1 or (b < 1).any() or (p < 0).any() or (p > b).any():
+        raise ValueError("one pass count and one book count (at least 1) per surrogate, passes between 0 and books")
+    if len(p) < 2:
+        return None
+    idx = rng.integers(0, len(p), size=(int(n_boot), len(p)))
+    shares = p[idx].sum(axis=1) / b[idx].sum(axis=1)
+    return [float(np.quantile(shares, 0.025)), float(np.quantile(shares, 0.975))]
 
 
 def deflated_value(moments: dict | None, own: Sequence[float], others: Sequence[float], *, leave_own_out: bool = False,
@@ -480,9 +501,37 @@ def _rng(seed: int, *parts) -> np.random.Generator:
     return np.random.default_rng([int(seed), *[_CODES[p] if isinstance(p, str) else int(p) for p in parts]])
 
 
+def _surrogate_books(base: pd.DataFrame, flat: bool, seed: int, j: int, specs_per_surrogate: int) -> dict:
+    """Surrogate `j` of `base` (detrended again when `flat`) and its drawn rule strategies, identical books counted
+    once: a spec drawn again (the same rule and numbers; the hold rule has none) is dropped, and so is a different
+    spec whose whole-history book is the same as one kept (`controls._fingerprint_weights`). The first draw is kept."""
+    frame = surrogate_prices(base, _rng(seed, "surrogate", j))
+    if flat:
+        frame = controls.detrend(frame)
+    spec_rng = _rng(seed, "spec", j)
+    specs, prints, books = set(), set(), []
+    out = {"frame": frame, "books": books, "duplicate_specs_dropped": 0, "duplicate_books_dropped": 0}
+    for i in range(specs_per_surrogate):
+        spec = draw_rule_spec(frame.columns, spec_rng, i)
+        key = json.dumps({k: v for k, v in spec.items() if k not in ("name", "hypothesis")}, sort_keys=True)
+        if key in specs:
+            out["duplicate_specs_dropped"] += 1
+            continue
+        specs.add(key)
+        strategy = RuleStrategy.from_spec(spec)
+        fp = controls._fingerprint_weights(run_rules(strategy, frame)[0])
+        if fp in prints:
+            out["duplicate_books_dropped"] += 1
+            continue
+        prints.add(fp)
+        books.append((j * specs_per_surrogate + i, strategy))
+    return out
+
+
 def _books(fam: str, base: pd.DataFrame, version: str, seed: int, n_null: int, n_edge: int, n_surrogates: int,
-           specs_per_surrogate: int):
-    """(cell key, book number, frame, strategy, surrogate number) for every book of a family on one data version."""
+           specs_per_surrogate: int, dropped: dict | None = None):
+    """(cell key, book number, frame, strategy, surrogate number) for every book of a family on one data version.
+    For N4 the duplicates dropped are added up in `dropped`."""
     kind, rates, horizon, _ = FAMILIES[fam]
     flat = version == "detrended"
     if kind == "oracle" or kind == "neutral":
@@ -498,20 +547,26 @@ def _books(fam: str, base: pd.DataFrame, version: str, seed: int, n_null: int, n
             yield None, k, base, controls.NoEdgeBook(base, _rng(seed, fam, k), name="study_no_edge"), None
     else:
         for j in range(n_surrogates):
-            frame = surrogate_prices(base, _rng(seed, "surrogate", j))
-            if flat:
-                frame = controls.detrend(frame)
-            spec_rng = _rng(seed, "spec", j)
-            for i in range(specs_per_surrogate):
-                yield None, j * specs_per_surrogate + i, frame, RuleStrategy.from_spec(
-                    draw_rule_spec(frame.columns, spec_rng, i)), j
+            sur = _surrogate_books(base, flat, seed, j, specs_per_surrogate)
+            if dropped is not None:
+                for key in ("duplicate_specs_dropped", "duplicate_books_dropped"):
+                    dropped[key] = dropped.get(key, 0) + sur[key]
+            for k, strategy in sur["books"]:
+                yield None, k, sur["frame"], strategy, j
 
 
 def _cell_report(fam: str, h, verdicts: list[dict], counts: list[int], sharpes: list, refused: int,
-                 surrogate_of: list) -> dict:
+                 surrogate_of: list, *, dropped: dict | None = None, seed: int = 0, version: str = "given") -> dict:
+    """One cell's counts. For N4 also, per rule and count: the surrogates with a pass, each surrogate's own pass share
+    (minimum, median, maximum), and `surrogate_bootstrap`'s interval (the same seeded resamples for every rule and
+    count of the cell); and the cell's surrogates and dropped duplicates."""
     kind, _, horizon, _ = FAMILIES[fam]
     out: dict = {"hit_rate": h, "horizon": horizon, "runs": len(verdicts), "refused": refused,
                  "median_development_sharpe": _median(sharpes), "by_attempts": {}}
+    clusters = sorted({s for s in surrogate_of if s is not None})
+    if kind == "surrogate_rules":
+        out.update(surrogates=len(clusters), **{k: int((dropped or {}).get(k, 0))
+                                                for k in ("duplicate_specs_dropped", "duplicate_books_dropped")})
     for n in counts:
         row = {}
         for rule in RULES:
@@ -519,7 +574,13 @@ def _cell_report(fam: str, h, verdicts: list[dict], counts: list[int], sharpes: 
             row[rule] = {"passes": k, "runs": len(verdicts), "share": k / len(verdicts) if verdicts else None,
                          "wilson_95": wilson(k, len(verdicts))}
             if kind == "surrogate_rules":
-                row[rule]["surrogates_with_a_pass"] = len({s for v, s in zip(verdicts, surrogate_of) if v[n][rule]})
+                per_p = [sum(v[n][rule] for v, s in zip(verdicts, surrogate_of) if s == j) for j in clusters]
+                per_b = [sum(1 for s in surrogate_of if s == j) for j in clusters]
+                shares = [a / b for a, b in zip(per_p, per_b)]
+                row[rule].update(
+                    surrogates_with_a_pass=sum(a > 0 for a in per_p),
+                    per_surrogate_share={"min": min(shares), "median": float(np.median(shares)), "max": max(shares)},
+                    surrogate_bootstrap_95=surrogate_bootstrap(per_p, per_b, _rng(seed, "cluster", _VERSIONS.index(version))))
         out["by_attempts"][str(n)] = row
     return out
 
@@ -556,8 +617,9 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
             results[version] = {}
             for fam in FAMILIES:
                 cells: dict = {}
+                dropped: dict = {}
                 for h, k, frame, strategy, sur in _books(fam, base, version, seed, n_null, n_edge, n_surrogates,
-                                                         specs_per_surrogate):
+                                                         specs_per_surrogate, dropped):
                     folder = root / f"book{done:06d}"
                     book = _Book(frame, dollar_volume, cost, c, folder, strategy)
                     verdicts = {n: book.judge(others_at[n]) for n in counts}
@@ -577,7 +639,8 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
                     if done % PROGRESS_EVERY == 0:
                         print(f"gate_study: {done} books in {time.time() - t0:.0f} s", file=sys.stderr, flush=True)
                 results[version][fam] = [_cell_report(fam, h, v["verdicts"], counts, v["sharpes"], v["refused"],
-                                                      v["surrogate"]) for h, v in cells.items()]
+                                                      v["surrogate"], dropped=dropped, seed=seed, version=version)
+                                         for h, v in cells.items()]
     elapsed = time.time() - t0
     timed = ", ".join(f"{_median(v):.2f} s at N = {n} ({r3_shifts(n)} shifts, {len(v)} books)"
                       for n, v in sorted(r3_seconds.items()))
@@ -650,6 +713,22 @@ def _fmt_share(r: dict) -> str:
     return f"{r['passes']} of {r['runs']} ({r['share']:.3f}, 95% interval {lo:.3f} to {hi:.3f})"
 
 
+def _fmt_clustered(r: dict, surrogates: int) -> str:
+    """N4: the interval from the bootstrap over whole surrogates, named as such."""
+    head = f"{r['passes']} of {r['runs']} ({r['share']:.3f}, "
+    if r["surrogate_bootstrap_95"] is None:
+        return head + f"no interval: {surrogates} surrogate, and books on one surrogate are not independent)"
+    lo, hi = r["surrogate_bootstrap_95"]
+    return head + (f"95% interval {lo:.3f} to {hi:.3f} from a bootstrap over {surrogates} whole surrogates, "
+                   "not the Wilson interval)")
+
+
+def _lower(r: dict, fam: str) -> float | None:
+    """The lower end of the interval the reading judges a family by: the surrogate bootstrap for N4, else Wilson."""
+    iv = r.get("surrogate_bootstrap_95") if FAMILIES[fam][0] == "surrogate_rules" else r["wilson_95"]
+    return None if iv is None else iv[0]
+
+
 def _reading(report: dict) -> list[str]:
     """Plain sentences generated from the numbers."""
     out, above = [], {}
@@ -659,9 +738,12 @@ def _reading(report: dict) -> list[str]:
             for n in report["attempt_counts"]:
                 att = "1 attempt" if n == 1 else f"{n} attempts"
                 for fam in NO_SKILL:
-                    r = report["results"][version][fam][0]["by_attempts"][str(n)][rule]
-                    out.append(f"{rule} false-pass share on {fam} ({words[version]}, {att}): {_fmt_share(r)}.")
-                    if r["wilson_95"][0] > ALPHA:
+                    cell = report["results"][version][fam][0]
+                    r = cell["by_attempts"][str(n)][rule]
+                    text = _fmt_clustered(r, cell["surrogates"]) if fam == "N4" else _fmt_share(r)
+                    out.append(f"{rule} false-pass share on {fam} ({words[version]}, {att}): {text}.")
+                    lower = _lower(r, fam)
+                    if lower is not None and lower > ALPHA:
                         above.setdefault(rule, []).append(f"{fam} {version} {att}")
                 for fam in EDGE:
                     cells = report["results"][version][fam]
@@ -672,7 +754,8 @@ def _reading(report: dict) -> list[str]:
                                "books: " + (f"{min(ok):.2f}." if ok else "none of " + ", ".join(
                                    "{:.2f}".format(c["hit_rate"]) for c in cells) + "."))
     if above:
-        out.append("Rules whose false-pass interval lies wholly above 0.05 on at least one no-skill family: "
+        out.append("Rules whose false-pass interval (for N4 the bootstrap over whole surrogates) lies wholly above 0.05 "
+                   "on at least one no-skill family: "
                    + "; ".join(f"{rule} ({', '.join(v)})" for rule, v in above.items()) + ".")
     else:
         out.append("No rule has a false-pass interval lying wholly above 0.05 on any no-skill family.")
