@@ -1232,7 +1232,8 @@ def test_a_fee_total_that_falls_beside_a_rise_in_units_drops_only_the_fee():
     assert again["fills"] == [] and again["anomalies"] == [] and again["notices"] == []
     venue.set(TAG, state="partly_filled", filled_units=7.0, avg_price=90.0, fee=1.25)
     (row,) = led.reconcile(venue, {})["fills"]
-    assert (row["units"], row["fee"]) == (1.0, 0.75) and led.order(TAG)["fee"] == 1.25
+    # M3 (addendum 3): the row's fee is what the total exceeds the rows' 1.0 by, so the rows sum to 1.25, the highest
+    assert (row["units"], row["fee"]) == (1.0, 0.25) and led.order(TAG)["fee"] == 1.25
 
 
 def test_an_average_that_implies_a_negative_price_beside_a_rise_in_units_drops_only_the_price():
@@ -2157,7 +2158,8 @@ def test_a_negative_fee_total_is_kept_and_raises_one_notice_that_does_not_block(
     venue.held = {"XLE": 10.0}
     clock.t += 5
     found = led.reconcile(venue, {})
-    assert found["clean"] and [f["fee"] for f in found["fills"]] == [-0.35] and led.order(TAG)["fee"] == -0.35
+    # M3 (addendum 3): a row's fee is never negative; the order's own total keeps the venue's -0.35
+    assert found["clean"] and [f["fee"] for f in found["fills"]] == [None] and led.order(TAG)["fee"] == -0.35
     led.mark_applied([f["id"] for f in found["fills"]])
     (item,) = led.attention()
     assert item["tag"] == TAG and item["kind"] == NEGATIVE_FEE and TAG in item["reason"] and "-0.35" in item["reason"]
@@ -3008,12 +3010,13 @@ def test_t34b3_a_replay_that_does_not_reproduce_the_stored_figures_is_not_truste
         db.execute("UPDATE orders SET avg_price = 90.01, priced_avg = 90.01 WHERE tag = ?", (TAG,))
     elif how == "stored priced units":
         db.execute("UPDATE orders SET priced_units = 4.0 WHERE tag = ?", (TAG,))
-    elif how == "after_fill gone":
-        (n,) = led.reconcile_notices()
-        db.execute("UPDATE attention SET reason = ? WHERE id = ?",
-                   (json.dumps({"words": "x", "old": 90.006, "new": 90.002}), n["id"]))
-    else:
-        db.execute("UPDATE fills SET price = NULL WHERE id = (SELECT MAX(id) FROM fills WHERE tag = ?)", (TAG,))
+    elif how == "after_fill gone":                        # a notice as recorded before after_fill was kept
+        db.execute("INSERT INTO attention (tag, kind, time, reason, closed_by, closed_note, closed_time) "
+                   "VALUES (?, 'avg_restated', 0, ?, 'x', 'x', 1)",
+                   (TAG, json.dumps({"words": "x", "old": 90.002, "new": 90.002})))
+    else:                                                 # a priced row without the amount its price covers
+        db.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) "
+                   "VALUES (?, 'XLE', 0.0, 90.002, NULL, NULL, 0, 1)", (TAG,))
     got = led.average_writes(TAG)
     assert got["trusted"] is False and type(got["why"]) is str and got["why"], got
     assert led.average_writes("no-such-tag") is None

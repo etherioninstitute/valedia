@@ -36,12 +36,13 @@ or dropping the triggers, gets past them).
 Fills: each increase of the venue's filled amount is one row (units signed like the order, the increment
 only). Fee and price are taken from every report, so a report that raises the fee total, or gives an average
 for filled units not yet priced, without a rise in units makes an adjustment row with units 0.0. A row's fee
-is the increase of the venue's fee total since the last total it gave (None when there is none); its price is
-the price of all units since the last report that gave an average with an amount (`price_covers_units` of
-them). Over any sequence the units add up to the stored total; the fees add up to the last fee total and, when the
-last report with an average left nothing unpriced, the priced rows to that average times that total, until the venue
-restates one of them (below). A fee total recorded below zero is kept as reported and opens one notice per order (an
-attention item of a kind in NOTICE_KINDS, which does not block).
+is what the venue's fee total exceeds the sum of the order's fee rows by (T34b-3 M3; never negative, None when
+it does not exceed it); its price is the price of all units since the last report that gave an average with an
+amount (`price_covers_units` of them). Over any sequence the units add up to the stored total; the fees never sum
+above the highest fee total the venue reported (and equal the last one while it never fell and never went below
+zero) and, when the last report with an average left nothing unpriced, the priced rows to that average times that
+total, until the venue restates one of them (below). A fee total recorded below zero is kept as the order's total
+and opens one notice per order (an attention item of a kind in NOTICE_KINDS, which does not block).
 
 Every entry a reconcile lists carries a `kind` from a closed set (ANOMALY_KINDS, UNRESOLVED_KINDS, RECHECK_KINDS;
 `positions_error_kind` from POSITIONS_ERROR_KINDS beside `positions_error`). T34b-3: three things honest brokers do
@@ -54,7 +55,8 @@ block, and the stored figure follows the venue's:
   late_amount     a larger amount, within the order's size, on a finished order the venue still reports in that same
                   state: the units are taken as a fill (another state with more units: late_amount_other_state);
   fee_fell        a fee total that fell and is still zero or more: the order's stored total takes it and NO row is
-                  written, so the rows' fee increments then sum to the earlier, higher total. A fall to below zero is
+                  written, so the rows' fees then sum to the earlier, higher total, and a later rise writes a fee only
+                  for what goes beyond that sum (M3). A fall to below zero is
                   the anomaly fee_fell_below_zero, stored total kept: deliberately unlike a first total below zero,
                   which is kept with its negative_fee notice;
   piece_unpriced  an average, finite and above zero, that implies a negative or non-finite price for the units since
@@ -63,10 +65,13 @@ block, and the stored figure follows the venue's:
                   venue's average and total, the piece's row carries price None. Beyond that bound:
                   piece_price_unexplained, the priced point kept and the units still taken with price None.
 After a restatement the rows keep the prices first worked out, and the order's average is the venue's: the rows no
-longer sum to it. A notice is recorded in the attention table, in the same write that follows the figure; an
-earlier open notice of the same order and kind is first closed as superseded (by LEDGER_CLOSER). If the new notice
-did not take, nothing of that venue answer is followed and the entry is the anomaly notice_not_recorded: a figure is
-never followed without its record. A non-finite average or fee stays the anomaly value_not_finite. A reconcile reports
+longer sum to it. A notice is recorded in the attention table, in the same write that follows the figure, with
+`after_fill` (the largest fill-row id of the order once that write's own row is in) and `row` (that row's id, or
+None), so `average_writes` can replay the order's averages from these records alone; an earlier open notice of the
+same order and kind is first closed as superseded (by LEDGER_CLOSER). A figure is never followed without its
+record: a notice whose insert is refused (it did not take) rolls the write back and the entry is the anomaly
+notice_not_recorded; an insert that aborts (a database error) rolls it back too and the order is unresolved,
+not_written. The reconcile is unclean and the stored figure kept either way. A non-finite average or fee stays the anomaly value_not_finite. A reconcile reports
 a fill or an update only once the write that made it true is committed; an order whose write failed is listed as unresolved. The book must apply every row (`unapplied_fills`, then `mark_applied`)
 before another order may be submitted, because orders are sized from the book.
 
@@ -504,8 +509,9 @@ class OrderLedger:
 
     def reconcile_notices(self, after_id: int = 0) -> list[dict]:
         """T34b-3: every notice of RECONCILE_NOTICE_KINDS with an id above `after_id`, open, closed or superseded,
-        oldest first, each with `words`, `old` and `new` read from the JSON its reason holds (None where it cannot be
-        read). A notice never blocks; this read is for whoever journals and judges each one once."""
+        oldest first, each with `words`, `old`, `new`, `after_fill` and `row` read from the JSON its reason holds
+        (None where it cannot be read). A notice never blocks; this read is for whoever journals and judges each one
+        once."""
         marks = ",".join("?" * len(RECONCILE_NOTICE_KINDS))
         out = []
         for r in self._read(f"SELECT * FROM attention WHERE kind IN ({marks}) AND id > ? ORDER BY id",
@@ -516,8 +522,103 @@ class OrderLedger:
             except (TypeError, ValueError):
                 said = None
             said = said if isinstance(said, dict) else {}
-            item.update(words=said.get("words"), old=said.get("old"), new=said.get("new"))
+            item.update(words=said.get("words"), old=said.get("old"), new=said.get("new"),
+                        after_fill=said.get("after_fill"), row=said.get("row"))
             out.append(item)
+        return out
+
+    def average_writes(self, tag: str) -> dict | None:
+        """T34b-3 (addendum 4): the average the order held after each write that touched it, REPLAYED from its
+        immutable records, read in one snapshot: the fill rows in id order and the average-changing notices
+        (`avg_restated`, `piece_unpriced`) placed after the row their `after_fill` names, then by id. The ledger's
+        own arithmetic: a priced row moves the priced point (a, u) to ((a x u + price x covers) / (u + covers),
+        u + covers), or to (price, covers) when there is none; an `avg_restated` notice sets a to its `new`; a
+        `piece_unpriced` notice sets a to its `new` and u to the units filled up to its row; a row without a price
+        moves nothing. None when the ledger has no such order. Else {"fills": {id: {"avg", "sets", "units",
+        "covered_by"}}, "notices": {id: {"kind", "avg"}}, "avg", "units", "trusted", "why"}: `avg` is a after the
+        write (None before any priced point); `sets` is true for a priced row and for the row of its own
+        `piece_unpriced` notice (the figure is the notice's); `covered_by` names, for a row with units that sets
+        nothing, the first later write whose priced point takes in its units (("fill", id), or ("notice", id) for a
+        `piece_unpriced` notice that came without a row of its own). `trusted` is false, with `why`, when a record
+        cannot be read as the replay needs it or the replayed priced point is not the stored one (avg_price and
+        priced_units within REL_TOL x max(1, |x|))."""
+        kinds = ("avg_restated", "piece_unpriced")
+        try:
+            snapshot = not self._db.in_transaction
+            if snapshot:
+                self._db.execute("BEGIN")
+            try:
+                rec = self._db.execute("SELECT * FROM orders WHERE tag = ?", (tag,)).fetchone()
+                rows = self._db.execute("SELECT id, units, price, price_covers_units FROM fills WHERE tag = ? "
+                                        "ORDER BY id", (tag,)).fetchall()
+                notes = self._db.execute("SELECT id, kind, reason FROM attention WHERE tag = ? AND kind IN (?, ?) "
+                                         "ORDER BY id", (tag, *kinds)).fetchall()
+            finally:
+                if snapshot:
+                    self._db.execute("COMMIT")
+        except sqlite3.Error as exc:
+            raise OrderError(f"the order ledger could not be read: {_describe(exc)}") from exc
+        if rec is None:
+            return None
+        out = {"fills": {}, "notices": {}, "avg": None, "units": 0.0, "trusted": True, "why": None}
+
+        def untrusted(why: str) -> dict:
+            out.update(trusted=False, why=why)
+            return out
+        ids = [int(r["id"]) for r in rows]
+        placed: dict[int, list] = {}
+        for n in notes:
+            try:
+                said = json.loads(n["reason"])
+            except (TypeError, ValueError):
+                said = None
+            said = said if isinstance(said, dict) else {}
+            new, after, own = said.get("new"), said.get("after_fill"), said.get("row")
+            if not (_finite(new) and new > 0) or type(after) is not int or after not in ids \
+                    or not (own is None or own == after):
+                return untrusted(f"notice {n['id']} ({n['kind']}) cannot be placed among the rows")
+            placed.setdefault(after, []).append((int(n["id"]), n["kind"], float(new), own))
+        a, u, total, waiting = None, 0.0, 0.0, []        # waiting: rows with units that set nothing, not yet covered
+
+        def cover(ref) -> None:
+            for fid, through in list(waiting):
+                if u >= through - _tol(through):
+                    out["fills"][fid]["covered_by"] = ref
+                    waiting.remove((fid, through))
+        for r in rows:
+            fid, units, price, covers = int(r["id"]), r["units"], r["price"], r["price_covers_units"]
+            if not _finite(units):
+                return untrusted(f"fill row {fid} has no usable units")
+            total += abs(units)
+            sets = price is not None
+            if sets:
+                if not (_finite(price) and price >= 0 and _finite(covers) and covers > 0):
+                    return untrusted(f"fill row {fid} has a price without a usable amount it covers")
+                a = price if not (u > 0 and a is not None) else (a * u + price * covers) / (u + covers)
+                u += covers
+            entry = {"avg": a, "sets": sets, "units": abs(units), "covered_by": None}
+            out["fills"][fid] = entry
+            if not sets and abs(units) > _tol(total):
+                waiting.append((fid, total))
+            if sets:
+                cover(("fill", fid))
+            for nid, kind, new, own in placed.get(fid, []):
+                a = new
+                if kind == "piece_unpriced":
+                    u = total
+                    if own == fid:                        # its own row: the row's figure is the notice's
+                        entry.update(avg=a, sets=True)
+                        waiting[:] = [w for w in waiting if w[0] != fid]
+                        cover(("fill", fid))
+                    else:
+                        cover(("notice", nid))
+                out["notices"][nid] = {"kind": kind, "avg": a}
+        out.update(avg=a, units=u)
+        stored_avg, stored_units = rec["avg_price"], rec["priced_units"] or 0.0
+        if (a is None) != (stored_avg is None) or (a is not None and abs(a - stored_avg) > _tol(stored_avg)):
+            return untrusted(f"the replayed average {a!r} is not the stored {stored_avg!r}")
+        if abs(u - stored_units) > _tol(stored_units):
+            return untrusted(f"the replayed priced units {u!r} are not the stored {stored_units!r}")
         return out
 
     def close_attention(self, id: int, who: str, note: str) -> dict:
@@ -891,16 +992,18 @@ class OrderLedger:
         self._flag(tag, "negative_fee", f"the venue reports a fee total of {fee!r} for order {tag}, below zero; it is "
                    "kept as reported: check whether it is a rebate")
 
-    def _record_notice(self, tag: str, kind: str, words: str, old, new) -> int:
+    def _record_notice(self, tag: str, kind: str, words: str, old, new, after_fill, row) -> int:
         """Inside the caller's write (T34b-3): record one notice of RECONCILE_NOTICE_KINDS as an attention item whose
-        reason is a JSON object {"words", "old", "new"}. An earlier OPEN notice of the same order and kind is first
-        closed as superseded (one open item per tag and kind is the table's rule), so every restatement keeps its own
-        id. Returns the new item's id; raises _NoticeNotRecorded when the insert did not take, which rolls the whole
-        write back."""
+        reason is a JSON object {"words", "old", "new", "after_fill", "row"}: `after_fill` is the largest fill-row id
+        of the order once this write's own row is in, `row` that row's id (None when the write adds none), so a
+        reader can place the notice among the rows (`average_writes`). An earlier OPEN notice of the same order and
+        kind is first closed as superseded (one open item per tag and kind is the table's rule), so every restatement
+        keeps its own id. Returns the new item's id; raises _NoticeNotRecorded when the insert did not take, which
+        rolls the whole write back."""
         self._db.execute("UPDATE attention SET closed_by = ?, closed_note = ?, closed_time = ? "
                          "WHERE tag = ? AND kind = ? AND closed_time IS NULL",
                          (LEDGER_CLOSER, "superseded by a later notice of the same kind", self.clock(), tag, kind))
-        reason = json.dumps({"words": words, "old": old, "new": new})
+        reason = json.dumps({"words": words, "old": old, "new": new, "after_fill": after_fill, "row": row})
         cur = self._db.execute("INSERT INTO attention (tag, kind, time, reason) VALUES (?,?,?,?)",
                                (tag, kind, self.clock(), reason))
         nid = cur.lastrowid if cur.rowcount == 1 else None
@@ -1008,7 +1111,14 @@ class OrderLedger:
             else:
                 up = fee - (base or 0.0)
                 if up > ftol or rise:
-                    fields["fee"], row["fee"], wanted = fee, up, True
+                    fields["fee"] = fee                   # the order's own total follows the venue's
+                    rows_fee = math.fsum(r[0] for r in self._db.execute(
+                        "SELECT fee FROM fills WHERE tag = ? AND fee IS NOT NULL", (tag,)))
+                    extra = fee - rows_fee                # M3: a row's fee is only what the total exceeds the rows by
+                    if extra > ftol:
+                        row["fee"], wanted = extra, True
+                    elif rise and extra >= -ftol:         # the total is the rows' sum: a zero fee, as before
+                        row["fee"] = extra
         avg = status.get("avg_price")                     # an average, used only with the amount it covers
         if avg is not None and said:
             avg, p_units, p_avg = float(avg), rec["priced_units"] or 0.0, rec["priced_avg"]
@@ -1042,16 +1152,20 @@ class OrderLedger:
         why = f"venue says {vstate}" + ("; it had been declared never arrived" if mode == "turned_up" else "")
         if not self._cas(tag, state, new, why, **fields):
             return
-        for kind, words, was, now_is in notices:          # in the same write: a figure never followed without it
-            nid = self._record_notice(tag, kind, words, was, now_is)
-            out["notices"].append({"tag": tag, "kind": kind, "old": was, "new": now_is, "id": nid})
-        if fields.get("fee") is not None and fields["fee"] < 0:
-            self._notice_negative_fee(tag, fields["fee"])
-        if wanted:
+        own = None
+        if wanted:                                        # the row first, so a notice can name it (after_fill, row)
             cur = self._db.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) "
                                    "VALUES (?,?,?,?,?,?,?,0)", (tag, rec["symbol"], row["units"], row["price"],
                                                                 row["price_covers_units"], row["fee"], now))
-            out["fills"].append(dict(self._db.execute("SELECT * FROM fills WHERE id = ?", (cur.lastrowid,)).fetchone()))
+            own = cur.lastrowid
+            out["fills"].append(dict(self._db.execute("SELECT * FROM fills WHERE id = ?", (own,)).fetchone()))
+        if notices:
+            after = self._db.execute("SELECT MAX(id) FROM fills WHERE tag = ?", (tag,)).fetchone()[0]
+            for kind, words, was, now_is in notices:      # in the same write: a figure never followed without it
+                nid = self._record_notice(tag, kind, words, was, now_is, after, own)
+                out["notices"].append({"tag": tag, "kind": kind, "old": was, "new": now_is, "id": nid})
+        if fields.get("fee") is not None and fields["fee"] < 0:
+            self._notice_negative_fee(tag, fields["fee"])
         if new != state or wanted:
             out["updated"].append({"tag": tag, "from": state, "to": new})
 
