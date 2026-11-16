@@ -1003,32 +1003,79 @@ def test_an_entry_exactly_at_the_z_stop_opens_nothing_and_a_hair_inside_opens():
         assert events[0]["action"] == "enter" and w["A"].iloc[8] != 0             # a hair inside: opened
 
 
-def _old_safety_net():
-    """A copy of pairs.py with the safety-net scaling as it was before addendum 4 (`gross > max_gross`)."""
+def _patched(name, old, new):
+    """A copy of pairs.py with one line's text replaced (it must occur exactly once)."""
     import types
     src = Path(pr.__file__).read_text()
-    new = "if gross > risk.max_gross + 1e-12 else row"
-    assert src.count(new) == 1
-    mod = types.ModuleType("pairs_before_addendum_4")
-    exec(compile(src.replace(new, "if gross > risk.max_gross else row"), "pairs_before_addendum_4", "exec"), mod.__dict__)
+    assert src.count(old) == 1
+    mod = types.ModuleType(name)
+    exec(compile(src.replace(old, new), name, "exec"), mod.__dict__)
     return mod
 
 
-def test_the_safety_net_check_is_two_way_the_old_line_rescales_by_a_rounding_step():
-    old = _old_safety_net()
-    found = None
+def _old_safety_net():
+    """pairs.py with the safety-net scaling as it was before addendum 4 (`gross > max_gross`)."""
+    return _patched("pairs_before_addendum_4", "if gross > risk.max_gross + 1e-12 else row",
+                    "if gross > risk.max_gross else row")
+
+
+def _tripwire():
+    """pairs.py whose safety-net scaling raises if it is ever taken."""
+    return _patched("pairs_tripwire", "row * (risk.max_gross / gross) if",
+                    "(_ for _ in ()).throw(AssertionError('safety net taken')) if")
+
+
+def _ruling_1_books():
+    """The generated multi-pair books, each twice: with its random sizes, and with round sizes whose legs fill
+    `max_gross` exactly (where a sum of leg weights lands one rounding step either side of the limit). Yields
+    (label, raw spec, prices)."""
+    pw, mg = [0.1, 0.2, 0.3, 0.06, 0.14], [0.3, 0.6, 0.7, 0.9, 0.42]
     for hedge, seed in (("ratio", 404), ("log_ratio", 505), ("ols", 606)):
         rng = np.random.default_rng(seed)
         for i in range(120):
             px, pairs, sig, legs, sizing, risk = _random_book(rng, hedge)
-            raw = spec(pairs=[list(p) for p in pairs], signal={**{"stop_z": None}, **sig}, legs=legs, sizing=sizing, risk=risk)
-            w_new, ev_new = pr.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(frame(**px))
-            w_old, ev_old = old.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(frame(**px))
-            assert ev_old == ev_new                                               # the same trades either way
-            rows = np.flatnonzero((w_new.to_numpy() != w_old.to_numpy()).any(axis=1))
-            if found is None and len(rows):
-                found = (hedge, i, int(rows[0]), float(np.abs(w_new.to_numpy() - w_old.to_numpy()).max()))
-                s_old = old.PairsStrategy.from_spec(copy.deepcopy(raw))
-                with pytest.raises(AssertionError):
-                    leg_invariant(s_old, w_old, ev_old)                           # the exact check sees it
-    assert found is not None and 0 < found[3] < 1e-15, found
+            for kind, sz, rk in (("random", sizing, risk),
+                                 ("round", {"pair_weight": pw[i % 5], "max_open_pairs": 6},
+                                  {**risk, "max_gross": mg[(i // 5) % 5], "max_position_pct": 1.0})):
+                raw = spec(pairs=[list(p) for p in pairs], signal={**{"stop_z": None}, **sig}, legs=legs, sizing=sz, risk=rk)
+                yield f"{hedge} seed {seed} book {i} {kind} sizes", raw, frame(**px)
+
+
+def test_the_safety_net_branch_is_never_taken_on_the_generated_books():
+    trip, bars = _tripwire(), 0
+    for _, raw, px in _ruling_1_books():
+        w, events = trip.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(px)      # raises if the branch is taken
+        leg_invariant(trip.PairsStrategy.from_spec(copy.deepcopy(raw)), w, events)
+        bars += len(w)
+    px = _universe()
+    for hedge in ("ratio", "log_ratio", "ols"):
+        s = _universe_strategy(hedge)
+        s_trip = trip.PairsStrategy.from_spec(spec(
+            name=s.name, pairs=[list(p) for p in s.pairs],
+            signal={"hedge": hedge, "window": 10, "enter": 1.4, "exit": 0.3, "stop_z": 3.0,
+                    **({"hedge_window": 40} if hedge == "ols" else {})},
+            sizing={"pair_weight": 0.2, "max_open_pairs": 2},
+            risk={"max_position_pct": 0.08, "max_gross": 0.35, "stop_loss_pct": 0.03, "take_profit_pct": 0.03,
+                  "max_holding_days": 12}))
+        w, events = s_trip.walk(px)
+        pd.testing.assert_frame_equal(w, s.walk(px)[0], check_exact=True)       # the same strategy as the universe's
+        leg_invariant(s_trip, w, events)
+        bars += len(w)
+    assert bars > 10_000
+
+
+def test_the_safety_net_check_is_two_way_the_old_line_rescales_by_a_rounding_step():
+    old = _old_safety_net()
+    found = []
+    for label, raw, px in _ruling_1_books():
+        w_new, ev_new = pr.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(px)
+        w_old, ev_old = old.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(px)
+        assert ev_old == ev_new                                                   # the same trades either way
+        rows = np.flatnonzero((w_new.to_numpy() != w_old.to_numpy()).any(axis=1))
+        if len(rows):
+            found.append((label, str(px.index[rows[0]].date()), int(rows[0]),
+                          float(np.abs(w_new.to_numpy() - w_old.to_numpy()).max())))
+            with pytest.raises(AssertionError):
+                leg_invariant(old.PairsStrategy.from_spec(copy.deepcopy(raw)), w_old, ev_old)   # the exact check sees it
+    assert found and all(0 < f[3] < 1e-15 for f in found), found
+    assert found[0][:3] == ("ratio seed 404 book 0 round sizes", found[0][1], 35), found[0]
