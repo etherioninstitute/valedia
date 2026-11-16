@@ -30,17 +30,18 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 from valedia_trader.research_loop.strategy import SpecError, Strategy, StrategyRisk, _check_identity
 
-__all__ = ["PairsStrategy", "HEDGES", "LEGS"]
+__all__ = ["PairsStrategy", "HEDGES", "LEGS", "MISSING_LEG_BARS"]
 
 HEDGES = ("ratio", "log_ratio", "ols")
 LEGS = ("both", "long")
 _TOP = {"kind", "name", "version", "hypothesis", "pairs", "signal", "legs", "sizing", "risk"}
-_REQUIRED = {"kind", "name", "version", "hypothesis", "pairs", "signal"}
+_REQUIRED = {"kind", "name", "version", "hypothesis", "pairs", "signal", "legs"}
 _SIGNAL = {"hedge", "window", "enter", "exit", "stop_z", "hedge_window"}
 _SIGNAL_REQUIRED = {"hedge", "window", "enter", "exit"}
 _SIZING = {"pair_weight": 0.10, "max_open_pairs": 3}
 _RISK = {"max_position_pct", "max_gross", "stop_loss_pct", "take_profit_pct", "max_holding_days"}
 _BETA_RANGE = (0.1, 10.0)        # ols: no entry unless the bar's hedge ratio is in this range
+MISSING_LEG_BARS = 5             # an open pair with a leg unpriced this many sessions in a row is closed
 _ROWS = 512                      # rows per block in the windowed arithmetic (memory, not results)
 _NOT_WALKED = "a pairs strategy is walked as pairs (PairsStrategy.walk); it has no per-symbol entry, exit or size"
 
@@ -78,7 +79,7 @@ class PairsStrategy(Strategy):
         self.name, self.version, self.hypothesis = spec["name"], spec["version"], spec["hypothesis"]
         self.pairs = self._read_pairs(spec["pairs"])
         self.market = tuple(dict.fromkeys(sym for pair in self.pairs for sym in pair))
-        self.legs = spec.get("legs", "both")
+        self.legs = spec["legs"]
         if self.legs not in LEGS:
             raise SpecError(f"legs must be one of {list(LEGS)}")
         if self.legs != "long" and any(sym.endswith("-USD") for sym in self.market):
@@ -181,6 +182,11 @@ class PairsStrategy(Strategy):
     def __repr__(self) -> str:
         return f"PairsStrategy({self.name} v{self.version}, {len(self.pairs)} pairs, {self.hedge})"
 
+    @property
+    def holds_shorts(self) -> bool:
+        """True when the strategy holds both legs, and so a short."""
+        return self.legs == "both"
+
     # ---- no per-symbol rules
 
     def entry(self, prices: pd.DataFrame) -> pd.DataFrame:
@@ -250,14 +256,16 @@ class PairsStrategy(Strategy):
         """Walk the pairs forward. Returns (weights, events) in `run_rules`' shape: weights has every column of
         `prices` (zero outside the market) and row t is decided from prices up to and including t.
 
-        Each bar: exits first (stop loss, take profit, time limit, z stop, exit rule; on the pair's result r_t),
-        then entries into free slots by |z_t| (ties by the pair's order in the spec), skipping a candidate at or
-        beyond the z stop and one whose legs would take a symbol's net weight over the open pairs past
-        `risk.max_position_pct` (its slot goes to the next candidate). A pair closed on a bar opens
-        nothing on that bar; after an exit other than the exit rule it opens nothing until a later bar with
-        |z_t| <= exit. A bar on which either leg has no price opens nothing and carries an open pair unchanged
-        (its day count does not advance). The book is the sum of the open pairs' leg weights per symbol, scaled
-        down to `risk.max_gross`."""
+        Each bar, exits first, on the pair's result r_t (each leg at its price, or its last known price when it has
+        none today): stop loss, take profit, time limit (sessions held, priced or not), missing leg (a leg unpriced
+        `MISSING_LEG_BARS` sessions in a row), z stop, exit rule. An open `ols` pair's z is its held spread,
+        ln A - beta_0 ln B with the entry bar's beta. Then entries into free slots by |z_t| (ties by the pair's
+        order in the spec), never on a bar a leg has no price or at or beyond the z stop; a candidate is skipped,
+        and its slot passed on, when a symbol's absolute leg weights over the open pairs, or the book's, would pass
+        `risk.max_position_pct` or `risk.max_gross` (no credit for netting, so no exit can break either limit).
+        A pair closed on a bar opens nothing on that bar; after an exit other than the exit rule it re-arms on a
+        later bar where the closed trade's exit condition holds, and that bar opens nothing either. The book is the
+        net of the open pairs' leg weights per symbol."""
         _check_identity(self)
         cols = [c for c in self.market if c in prices.columns]
         if not cols:
@@ -266,58 +274,76 @@ class PairsStrategy(Strategy):
         price: dict[str, np.ndarray] = {}
         for sym in self.market:
             if sym in prices.columns:
-                p = pd.to_numeric(prices[sym], errors="coerce").to_numpy(dtype=float, copy=True)
+                p = prices[sym].to_numpy(dtype=float, copy=True)     # text raises, as in run_rules
                 p[~(np.isfinite(p) & (p > 0))] = np.nan
             else:
                 p = np.full(n, np.nan)
             price[sym] = p
-        k = len(self.pairs)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logp = {sym: np.log(p) for sym, p in price.items()}
+        k, w = len(self.pairs), self.window
         sig = [self._signal(price[a], price[b]) for a, b in self.pairs]
         z = np.array([s[0] for s in sig]).reshape(k, n)
         beta = np.array([s[1] for s in sig]).reshape(k, n)
         names = [f"{a}/{b}" for a, b in self.pairs]
         col = {sym: j for j, sym in enumerate(cols)}
-        side = [0] * k
+        side, closed_side = [0] * k, [0] * k
         wgt = [(0.0, 0.0)] * k                  # signed weights of the legs held (0.0 for a leg not taken)
         px0 = [(math.nan, math.nan)] * k
-        held, armed = [0] * k, [True] * k
+        beta0 = [math.nan] * k
+        held, miss, armed = [0] * k, [0] * k, [True] * k
+        last = {sym: math.nan for sym in self.market}
         out = np.zeros((n, len(cols)))
         events: list[dict] = []
         dates = prices.index
         lo, hi = _BETA_RANGE
 
-        def zval(i: int, t: int) -> float | None:
-            return float(z[i, t]) if np.isfinite(z[i, t]) else None
+        def num(v: float) -> float | None:
+            return float(v) if np.isfinite(v) else None
 
-        def hedge_of(i: int, t: int) -> float | None:
-            return float(beta[i, t]) if self.hedge == "ols" and np.isfinite(beta[i, t]) else None
+        def held_z(i: int, t: int) -> float:
+            """An open pair's z: each bar's own for ratio and log_ratio; the held spread for ols."""
+            if self.hedge != "ols":
+                return z[i, t]
+            if t < w - 1:
+                return math.nan
+            a, b = self.pairs[i]
+            s = logp[a][t - w + 1: t + 1] - beta0[i] * logp[b][t - w + 1: t + 1]
+            return float(self._z_rows(s[None, :], 1.0)[0])
 
-        def emit(i: int, t: int, entering: bool, reason: str, pnl: float = 0.0) -> None:
+        def emit(i: int, t: int, entering: bool, reason: str, zv: float, hv: float, pnl: float = 0.0) -> None:
             """One event per held leg: the first held leg in the pair's order carries `enter` / `exit` (the one the
             trade statistics count), the other `enter_leg` / `exit_leg`. `side` is the leg's own side and
-            `spread_side` the pair's (+1 long the spread, -1 short); called while the pair's side is still set."""
+            `spread_side` the pair's (+1 long the spread, -1 short); called while the pair's side is still set. An
+            exit on a leg with no price today carries its last known price and `stale`."""
             held_legs = [(sym, wl) for sym, wl in zip(self.pairs[i], wgt[i]) if wl != 0.0]
             for n_leg, (sym, wl) in enumerate(held_legs):
                 action = ("enter" if entering else "exit") + ("" if n_leg == 0 else "_leg")
+                stale = not np.isfinite(price[sym][t])
                 ev = {"date": dates[t], "symbol": sym, "action": action, "side": 1 if wl > 0 else -1, "spread_side": side[i],
-                      "price": float(price[sym][t]), "reason": reason, "pair": names[i], "z": zval(i, t), "hedge": hedge_of(i, t)}
+                      "price": float(last[sym] if stale else price[sym][t]), "reason": reason, "pair": names[i],
+                      "z": num(zv), "hedge": num(hv) if self.hedge == "ols" else None}
                 ev.update({"weight": abs(wl)} if entering else {"pnl_pct": float(pnl)})
+                if stale:
+                    ev["stale"] = True
                 events.append(ev)
 
         for t in range(n):
+            for sym in self.market:
+                if np.isfinite(price[sym][t]):
+                    last[sym] = float(price[sym][t])
             closed = set()
             for i in range(k):
                 if side[i] == 0:
                     continue
                 a, b = self.pairs[i]
-                pa, pb = price[a][t], price[b][t]
-                if not (np.isfinite(pa) and np.isfinite(pb)):
-                    continue                                         # a leg has no price today: carried unchanged
-                held[i] += 1
+                priced = bool(np.isfinite(price[a][t]) and np.isfinite(price[b][t]))
+                held[i] += 1                                         # the clock runs on every session
+                miss[i] = 0 if priced else miss[i] + 1
                 wa, wb = wgt[i]
-                r = (wa * (pa / px0[i][0] - 1.0) if wa else 0.0) + (wb * (pb / px0[i][1] - 1.0) if wb else 0.0)
+                r = (wa * (last[a] / px0[i][0] - 1.0) if wa else 0.0) + (wb * (last[b] / px0[i][1] - 1.0) if wb else 0.0)
                 r /= abs(wa) + abs(wb)
-                zt, s = z[i, t], side[i]
+                zt, s = (held_z(i, t) if priced else math.nan), side[i]
                 reason = None
                 if risk.stop_loss_pct is not None and r <= -risk.stop_loss_pct:
                     reason = f"stop loss: {r:+.1%} against the pair"
@@ -325,13 +351,16 @@ class PairsStrategy(Strategy):
                     reason = f"take profit: {r:+.1%}"
                 elif risk.max_holding_days is not None and held[i] >= risk.max_holding_days:
                     reason = f"time limit: held {held[i]} days"
+                elif miss[i] >= MISSING_LEG_BARS:
+                    reason = f"missing leg: no price for {miss[i]} sessions"
                 elif self.stop_z is not None and np.isfinite(zt) and ((s > 0 and zt <= -self.stop_z) or (s < 0 and zt >= self.stop_z)):
                     reason = f"z stop: z {zt:+.2f} beyond {self.stop_z:g}"
                 elif np.isfinite(zt) and ((s > 0 and zt >= -self.exit_z) or (s < 0 and zt <= self.exit_z)):
                     reason = f"exit rule: z {zt:+.2f}"
                 if reason:
-                    emit(i, t, False, reason, r)
-                    side[i], wgt[i], px0[i], held[i] = 0, (0.0, 0.0), (math.nan, math.nan), 0
+                    emit(i, t, False, reason, zt, beta0[i], r)
+                    closed_side[i] = s
+                    side[i], wgt[i], px0[i], beta0[i], held[i], miss[i] = 0, (0.0, 0.0), (math.nan, math.nan), math.nan, 0, 0
                     armed[i] = reason.startswith("exit rule")
                     closed.add(i)
             want = []
@@ -341,9 +370,9 @@ class PairsStrategy(Strategy):
                 zt = z[i, t]
                 if not np.isfinite(zt):
                     continue
-                if not armed[i]:
-                    armed[i] = abs(zt) <= self.exit_z                # re-armed: the spread came back inside exit
-                    continue
+                if not armed[i]:                                     # re-armed by the closed trade's own exit condition
+                    armed[i] = bool(zt >= -self.exit_z) if closed_side[i] > 0 else bool(zt <= self.exit_z)
+                    continue                                         # and the re-arm bar opens nothing
                 a, b = self.pairs[i]
                 if not (np.isfinite(price[a][t]) and np.isfinite(price[b][t])) or abs(zt) < self.enter:
                     continue
@@ -353,11 +382,12 @@ class PairsStrategy(Strategy):
                     continue
                 want.append(i)
             free = self.max_open_pairs - sum(1 for s in side if s != 0)
-            net: dict[str, float] = {}
+            legsum: dict[str, float] = {}                            # absolute leg weights per symbol: no netting credit
             for i in range(k):
                 if side[i] != 0:
                     for sym, wl in zip(self.pairs[i], wgt[i]):
-                        net[sym] = net.get(sym, 0.0) + wl
+                        legsum[sym] = legsum.get(sym, 0.0) + abs(wl)
+            book = sum(legsum.values())
             for i in sorted(want, key=lambda j: (-abs(z[j, t]), j)):
                 if free <= 0:
                     break
@@ -374,13 +404,18 @@ class PairsStrategy(Strategy):
                 wa, wb = (ga, -gb) if s > 0 else (-ga, gb)
                 if self.legs == "long":
                     wa, wb = max(wa, 0.0), max(wb, 0.0)
-                if any(abs(net.get(sym, 0.0) + wl) > risk.max_position_pct + 1e-12 for sym, wl in ((a, wa), (b, wb)) if wl != 0.0):
-                    continue                                         # a symbol's net weight would pass the limit: next candidate
-                for sym, wl in ((a, wa), (b, wb)):
-                    net[sym] = net.get(sym, 0.0) + wl
+                if (legsum.get(a, 0.0) + abs(wa) > risk.max_position_pct + 1e-12
+                        or legsum.get(b, 0.0) + abs(wb) > risk.max_position_pct + 1e-12):
+                    continue                                         # a symbol's legs would pass the limit: next candidate
+                if book + abs(wa) + abs(wb) > risk.max_gross + 1e-12:
+                    continue                                         # the book's legs would pass max_gross: next candidate
+                legsum[a] = legsum.get(a, 0.0) + abs(wa)
+                legsum[b] = legsum.get(b, 0.0) + abs(wb)
+                book += abs(wa) + abs(wb)
                 free -= 1
-                side[i], wgt[i], px0[i], held[i] = s, (wa, wb), (float(price[a][t]), float(price[b][t])), 0
-                emit(i, t, True, f"entry rule: z {z[i, t]:+.2f} on {names[i]}")
+                side[i], wgt[i], px0[i], held[i], miss[i] = s, (wa, wb), (float(price[a][t]), float(price[b][t])), 0, 0
+                beta0[i] = float(beta[i, t]) if self.hedge == "ols" else math.nan
+                emit(i, t, True, f"entry rule: z {z[i, t]:+.2f} on {names[i]}", z[i, t], beta[i, t])
             row = np.zeros(len(cols))
             for i in range(k):
                 if side[i] != 0:
@@ -388,7 +423,7 @@ class PairsStrategy(Strategy):
                         if wl != 0.0:
                             row[col[sym]] += wl
             gross = np.abs(row).sum()
-            out[t] = row * (risk.max_gross / gross) if gross > risk.max_gross else row
+            out[t] = row * (risk.max_gross / gross) if gross > risk.max_gross else row      # a safety net: the entry limits keep it idle
         weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
         weights[cols] = out
         return weights, events
