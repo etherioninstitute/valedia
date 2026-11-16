@@ -111,9 +111,13 @@ def run_rules(strategy: Strategy, prices: pd.DataFrame) -> tuple[pd.DataFrame, l
     resizes, then entries into free slots by strength. A position keeps the size it was opened with,
     unless the strategy sets `rebalance_days`: then every that many sessions held it is reset to the size
     the sizing rule gives on that bar (left alone on a bar with no size). Spot crypto is never shorted.
-    Gross exposure is scaled down to `risk.max_gross` if the positions exceed it."""
+    Gross exposure is scaled down to `risk.max_gross` if the positions exceed it.
+
+    A strategy with its own `walk` (a pairs strategy) is walked by it instead, and returns the same shape."""
     _check_identity(strategy)
-    cols = [c for c in strategy.market if c in prices.columns]
+    if callable(getattr(strategy, "walk", None)):
+        return strategy.walk(prices)
+    cols =[c for c in strategy.market if c in prices.columns]
     if not cols:
         raise SpecError(f"none of the strategy's market {strategy.market} is in the price data")
     px = prices[cols]
@@ -398,13 +402,20 @@ def save_spec(strategy: RuleStrategy, directory: str | Path) -> Path:
 
 def load_strategy(path: str | Path) -> Strategy:
     """Load a strategy file. JSON specs are built from the rule library. A Python file must define
-    `STRATEGY` and state the same version and hypothesis in its module docstring."""
+    `STRATEGY` and state the same version and hypothesis in its module docstring. A JSON spec with
+    `"kind": "pairs"` is a pairs strategy (`pairs.PairsStrategy`); one with no `"kind"` is a rule strategy."""
     path = Path(path)
     if path.suffix == ".json":
         try:
-            return RuleStrategy.from_spec(json.loads(path.read_text()))
+            raw = json.loads(path.read_text())
         except json.JSONDecodeError as exc:
             raise SpecError(f"{path.name} is not valid JSON: {exc}") from exc
+        if isinstance(raw, dict) and "kind" in raw:
+            if raw["kind"] != "pairs":
+                raise SpecError(f"{path.name}: kind must be 'pairs', or left out for a rule strategy (got {raw['kind']!r})")
+            from valedia_trader.research_loop.pairs import PairsStrategy
+            return PairsStrategy.from_spec(raw)
+        return RuleStrategy.from_spec(raw)
     if path.suffix != ".py":
         raise SpecError("a strategy file is .json or .py")
     module_spec = importlib.util.spec_from_file_location(f"valedia_strategy_{path.stem}", path)
