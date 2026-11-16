@@ -337,8 +337,8 @@ def test_t38_1b_the_doctor_says_a_follow_file_naming_a_strategy_that_can_hold_a_
     _owner(live_repo, "broker_book.json", {"follow": [hid]})
     before = _tree(live_repo)
     status, detail = _venues(live_repo)
-    assert ("broker book: not followed: config/broker_book.json names a hypothesis that cannot be followed; live mode "
-            "would stop for that") in detail
+    assert ("broker book: not followed: config/broker_book.json names a hypothesis whose strategy can hold a short "
+            "position, so it cannot be followed until shorts are built; live mode would stop for that") in detail
     assert f"hypothesis {hid}" not in detail                  # A1: no id from the file
     assert _tree(live_repo) == before
 

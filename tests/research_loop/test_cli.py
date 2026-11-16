@@ -1718,3 +1718,77 @@ def test_t38_1b_a_long_only_follow_list_is_accepted_exactly_as_on_the_base_commi
             assert cli.broker_book_follow(paths, live=live) == want
             assert cli.broker_book_follow(paths, live=live, trader=trader) == order_step.Follow(
                 ids=want.ids, names=want.names, digest=digest, every=ids == (23, 26))
+
+
+# ---- T38-1b ruling 2 of the lead's check: the cycle refuses a held left-out book before it spends anything
+
+def _spend_watch(monkeypatch):
+    """Counts what a cycle spends before its paper step: price refreshes, prices read, research askers built, research
+    rounds and gauntlets (the tests). The research round, when reached, records one idea in the ledger."""
+    import types
+
+    from valedia_trader.data_and_fees import prices as price_data
+    spent = {"refresh": 0, "market": 0, "asker": 0, "research": 0, "gauntlet": 0}
+    real_market = cli._market
+
+    def count(key, value=None):
+        spent[key] += 1
+        return value
+
+    def research(ledger, *a, **k):
+        count("research")
+        ledger.propose("A research round reached in this cycle proposed this idea", "test", cli.MARKET)
+        return {"roles": {}}
+
+    monkeypatch.setattr(price_data, "refresh", lambda data: count("refresh", {"refreshed": 0}))
+    monkeypatch.setattr(cli, "_market", lambda args: count("market") or real_market(args))
+    monkeypatch.setattr(cli, "_asker", lambda *a, **k: count("asker", lambda prompt: pytest.fail("an agent was asked")))
+    monkeypatch.setattr(cli.research_mod, "run_research", research)
+    monkeypatch.setattr(cli, "_reading", lambda paths: [])
+    monkeypatch.setattr(cli, "Gauntlet", lambda *a, **k: count("gauntlet", types.SimpleNamespace(dev_prices=None,
+                                                                                                  dev_dollar_volume=None)))
+    return spent
+
+
+def _memory_bytes(root):
+    return {p.name: p.read_bytes() for p in sorted((root / "memory").iterdir())}
+
+
+FULL_CYCLE = ["cycle", "--refresh", "--critic", "--backend", "chat:standin@http://127.0.0.1:9", "--skeptic", "chat:x@y"]
+
+
+def test_t38_1b_a_held_left_out_book_stops_the_cycle_before_any_refresh_research_or_test(tmp_path, t38, monkeypatch):
+    run, reviews = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE, BOTH_RULE])
+    with monkeypatch.context() as m:
+        m.setattr(cli, "can_hold_shorts", lambda s: False)                        # a book stepped before the guard
+        assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+        assert run(root, ["paper-step"], px.iloc[:24])[0] == 0
+    spent = _spend_watch(monkeypatch)
+    book, memory = _book_files(root), _memory_bytes(root)
+    reviews.clear()
+    assert run(root, FULL_CYCLE, px.iloc[:30]) == (2, "", HELD_REFUSAL)
+    assert spent == {"refresh": 0, "market": 0, "asker": 0, "research": 0, "gauntlet": 0}, spent
+    assert _memory_bytes(root) == memory and _book_files(root) == book and reviews == []
+
+
+def test_t38_1b_an_unloadable_strategy_file_still_surfaces_where_it_did_after_the_research_round(tmp_path, t38,
+                                                                                                    monkeypatch):
+    """No held book: the early check says nothing, and the missing file is refused after the research round and the
+    tests, as on fb5d2c6 (the idea the round recorded is kept; nothing reaches the paper book)."""
+    run, reviews = t38
+    root = tmp_path / "project"
+    ids = _t38_project(root, [BOTH_RULE, LONG_RULE])
+    (root / "strategies" / f"mom_long_h{ids[1]}.json").unlink()
+    spent = _spend_watch(monkeypatch)
+    assert run(root, FULL_CYCLE, prices().iloc[:20]) == (2, "", f"refused: no strategy file found for hypothesis "
+                                                                f"{ids[1]}; pass --file\n")
+    assert spent == {"refresh": 1, "market": 1, "asker": 4, "research": 1, "gauntlet": 1}, spent
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        rows = sorted((h["id"], h["status"]) for h in led.search())
+    finally:
+        led.close()
+    assert rows == [(1, "passed backtest only"), (2, "passed backtest only"), (3, "untested")]
+    assert not (root / "journal" / "paper_state.json").exists() and reviews == []
