@@ -117,7 +117,7 @@ def run_rules(strategy: Strategy, prices: pd.DataFrame) -> tuple[pd.DataFrame, l
     _check_identity(strategy)
     if callable(getattr(strategy, "walk", None)):
         return strategy.walk(prices)
-    cols =[c for c in strategy.market if c in prices.columns]
+    cols = [c for c in strategy.market if c in prices.columns]
     if not cols:
         raise SpecError(f"none of the strategy's market {strategy.market} is in the price data")
     px = prices[cols]
