@@ -5,6 +5,7 @@ written from the same rulings with plain loops and nothing from `pairs.py`."""
 import copy
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -233,8 +234,9 @@ def oracle(a, b, signal, legs="both", sizing=None, risk=None):
 def leg_invariant(strategy, w, events):
     """Rebuild the held legs bar by bar from the events and check addendum 3's invariant on every bar: per symbol
     the sum of absolute leg weights is within max_position_pct, the book's within max_gross, and the output row is
-    exactly the net of the legs (the final scaling never acted). Returns (bars, largest symbol sum / limit, largest
-    book sum / limit)."""
+    EXACTLY the net of the legs, summed in walk's own order (pairs in the spec's order, then each pair's A and B):
+    the final scaling never acted (addendum 4, ruling 1). Returns (bars, largest symbol sum / limit, largest book
+    sum / limit)."""
     held, by_date = {}, {}
     for e in events:
         by_date.setdefault(e["date"], []).append(e)
@@ -252,7 +254,12 @@ def leg_invariant(strategy, w, events):
             net[sym] = net.get(sym, 0.0) + wl
         book = sum(sums.values())
         assert all(v <= mpp + 1e-12 for v in sums.values()) and book <= mg + 1e-12, d
-        assert all(abs(w.at[d, c] - net.get(c, 0.0)) <= 1e-14 for c in w.columns), d      # never rescaled
+        exact = np.zeros(len(w.columns))
+        for a, b in strategy.pairs:
+            for sym in (a, b):
+                if (f"{a}/{b}", sym) in held:
+                    exact[w.columns.get_loc(sym)] += held[(f"{a}/{b}", sym)]
+        assert np.array_equal(w.loc[d].to_numpy(), exact), d                     # never rescaled, not by one rounding step
         worst_sym = max([worst_sym] + [v / mpp for v in sums.values()])
         worst_book = max(worst_book, book / mg)
     return len(w), worst_sym, worst_book
@@ -955,12 +962,73 @@ def test_the_one_leg_cap_on_the_long_leg_and_at_its_boundary():
     assert w["A"].iloc[-1] == pytest.approx(0.09) and w["B"].iloc[-1] == pytest.approx(-0.09)
 
 
-def test_a_price_column_holding_text_raises_as_run_rules_does():
-    px = frame(A=BASE * 3, B=BASE * 3).astype(object)
-    px.iloc[5, 0] = "halted"
+def test_a_market_column_that_is_not_real_numbers_is_refused_whatever_it_holds():
+    base = frame(A=BASE * 3, B=BASE * 3)
+    halted = base.astype(object)
+    halted.iloc[5, 0] = "halted"
     rule = st.RuleStrategy.from_spec({"name": "hold_text", "version": "1.0.0", "hypothesis": "Holding every fund all the time",
                                       "market": ["A", "B"], "entry": {"rule": "hold", "enter": 1, "exit": 0}})
     with pytest.raises(ValueError, match="could not convert string to float"):
-        st.run_rules(rule, px)
-    with pytest.raises(ValueError, match="could not convert string to float"):
-        build().walk(px)
+        st.run_rules(rule, halted)                                                # as before, for rule strategies
+    numbers_as_text = base.assign(A=[f"{x}" for x in base["A"]])                 # "100.0": text that holds a number
+    for bad in (halted, numbers_as_text, base.assign(B=base["B"] > 100), base.assign(A=pd.Timestamp("2024-01-01")),
+                base.assign(B=base["B"] + 0j), base.assign(A=base["A"].astype("string"))):
+        col = next(c for c in ("A", "B") if not (pd.api.types.is_float_dtype(bad[c]) or pd.api.types.is_integer_dtype(bad[c])))
+        with pytest.raises(ValueError, match=f"'{col}'"):
+            build().walk(bad)
+    s = build(pairs=[["A", "B"]], signal={"exit": 0.0})
+    a = BASE + [94, 95, 97, 99, 100, 101, 100, 99, 101, 100]
+    b = [100 + (k % 3) for k in range(len(a))]
+    f64 = frame(A=a, B=b)
+    ints = pd.DataFrame({"A": np.array(a, dtype=np.int64), "B": np.array(b, dtype=np.int64)}, index=f64.index)
+    pd.testing.assert_frame_equal(s.walk(ints)[0], s.walk(f64)[0], check_exact=True)
+    f32 = pd.DataFrame({"A": np.array(a, dtype=np.float32) * np.float32(1.01), "B": np.array(b, dtype=np.float32)}, index=f64.index)
+    w32, e32 = s.walk(f32)
+    w64, e64 = s.walk(f32.astype(np.float64))
+    pd.testing.assert_frame_equal(w32, w64, check_exact=True)
+    assert e32 == e64 and trades(e32)
+    assert s.walk(f64.assign(NOTE="text outside the market"))[0]["NOTE"].eq(0).all()   # only market columns are read
+
+
+def test_an_entry_exactly_at_the_z_stop_opens_nothing_and_a_hair_inside_opens():
+    b = [100.0] * 9
+    for tail in ([94], [106]):
+        a = BASE + tail
+        _, events = build().walk(frame(A=a, B=b))
+        at = abs(events[0]["z"])                                                  # the walk's own z on bar 8, bit for bit
+        assert 1.5 < at < 20
+        w, events = build(signal={"stop_z": at}).walk(frame(A=a, B=b))
+        assert events == [] and (w == 0).all().all()                              # |z| == stop_z: not opened
+        w, events = build(signal={"stop_z": float(np.nextafter(at, np.inf))}).walk(frame(A=a, B=b))
+        assert events[0]["action"] == "enter" and w["A"].iloc[8] != 0             # a hair inside: opened
+
+
+def _old_safety_net():
+    """A copy of pairs.py with the safety-net scaling as it was before addendum 4 (`gross > max_gross`)."""
+    import types
+    src = Path(pr.__file__).read_text()
+    new = "if gross > risk.max_gross + 1e-12 else row"
+    assert src.count(new) == 1
+    mod = types.ModuleType("pairs_before_addendum_4")
+    exec(compile(src.replace(new, "if gross > risk.max_gross else row"), "pairs_before_addendum_4", "exec"), mod.__dict__)
+    return mod
+
+
+def test_the_safety_net_check_is_two_way_the_old_line_rescales_by_a_rounding_step():
+    old = _old_safety_net()
+    found = None
+    for hedge, seed in (("ratio", 404), ("log_ratio", 505), ("ols", 606)):
+        rng = np.random.default_rng(seed)
+        for i in range(120):
+            px, pairs, sig, legs, sizing, risk = _random_book(rng, hedge)
+            raw = spec(pairs=[list(p) for p in pairs], signal={**{"stop_z": None}, **sig}, legs=legs, sizing=sizing, risk=risk)
+            w_new, ev_new = pr.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(frame(**px))
+            w_old, ev_old = old.PairsStrategy.from_spec(copy.deepcopy(raw)).walk(frame(**px))
+            assert ev_old == ev_new                                               # the same trades either way
+            rows = np.flatnonzero((w_new.to_numpy() != w_old.to_numpy()).any(axis=1))
+            if found is None and len(rows):
+                found = (hedge, i, int(rows[0]), float(np.abs(w_new.to_numpy() - w_old.to_numpy()).max()))
+                s_old = old.PairsStrategy.from_spec(copy.deepcopy(raw))
+                with pytest.raises(AssertionError):
+                    leg_invariant(s_old, w_old, ev_old)                           # the exact check sees it
+    assert found is not None and 0 < found[3] < 1e-15, found
