@@ -59,6 +59,12 @@ _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{1,40}")
 _SELECTION_KEYS = ("modelKey", "path", "indexedModelIdentifier", "format", "publisher", "architecture", "quantization",
                    "deviceIdentifier", "vision", "trainedForToolUse", "maxContextLength")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+# The native module's own shape checks for a registered row (src/mirofish_native_model.py, registered_profiles and
+# helper_constants), applied here when reading and before `add` writes anything (TMF4 addendum 3, S3).
+_SELECTION_TYPES = {"modelKey": str, "path": str, "indexedModelIdentifier": str, "format": str, "publisher": str,
+                    "architecture": str, "quantization": dict, "deviceIdentifier": type(None), "vision": bool,
+                    "trainedForToolUse": bool, "maxContextLength": int}
+_TOKENIZER_TYPE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 class ProfileError(ValueError):
@@ -101,6 +107,8 @@ PROFILES: dict[str, ModelProfile] = {
         MODEL_ROOT / "Qwen3.8-27B-MLX-4bit", "ternary-bonsai-2-27b", None, 262144),
 }
 DEFAULT_PROFILE = "qwen3.8-27b"
+# The second file LM Studio loads with a built-in's weights (Bonsai 2's vision projector), pinned in the native module.
+SECOND_FILES = {"ternary-bonsai-2-27b": MODEL_ROOT / "lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"}
 ALIASES = {
     "8b": "qwen3-8b", "qwen3:8b": "qwen3-8b", "qwen3-9b": "qwen3-8b", "qwen3:9b": "qwen3-8b", "small": "qwen3-8b",
     "fast": "qwen3-8b", "27b": "qwen3.8-27b", "qwen3.8:27b": "qwen3.8-27b", "large": "qwen3.8-27b",
@@ -137,6 +145,44 @@ def _check_row(file: str, name, row) -> None:
         raise ProfileError(f"{file}: profile '{name}' weight_sha256 must be 64 lowercase hexadecimal characters")
     if not isinstance(row.get("gguf_selection"), dict) or set(row["gguf_selection"]) != set(_SELECTION_KEYS):
         raise ProfileError(f"{file}: profile '{name}' gguf_selection must have exactly the fields {list(_SELECTION_KEYS)}")
+    kind, bits = row.get("tokenizer_model_type"), row.get("tokenizer_quant_bits")
+    if not isinstance(kind, str) or not _TOKENIZER_TYPE.fullmatch(kind) or not (bits is None or type(bits) is int):
+        raise ProfileError(f"{file}: profile '{name}' tokenizer type must be a model type name and bits an integer or null")
+    selection = row["gguf_selection"]
+    for key, want in _SELECTION_TYPES.items():
+        if type(selection[key]) is not want:
+            raise ProfileError(f"{file}: profile '{name}' gguf_selection field {key} must be {want.__name__}")
+    quantization = selection["quantization"]
+    if set(quantization) != {"name", "bits"} or type(quantization["name"]) is not str or type(quantization["bits"]) is not int:
+        raise ProfileError(f"{file}: profile '{name}' gguf_selection quantization must be exactly a name (text) and bits (integer)")
+    if selection["format"] != "gguf" or selection["maxContextLength"] < NATIVE_CONTEXT:
+        raise ProfileError(f"{file}: profile '{name}' gguf_selection must be a GGUF that supports the {NATIVE_CONTEXT} context")
+
+
+def _narrow_refusal(folder: Path, pinned) -> str | None:
+    """TMF4 addendum 3, S2, as the native module: a registered tokenizer folder directly holds the five tokenizer files,
+    is not the parent of a pinned model file, and has no .gguf file beneath it."""
+    if not all((folder / f).is_file() for f in TOKENIZER_FILES):
+        return "must directly hold the five tokenizer files"
+    if any(Path(f).is_relative_to(folder) for f in pinned):
+        return "is the parent of a pinned model file"
+    for _, dirs, files in os.walk(folder, followlinks=False):
+        if any(n.lower().endswith(".gguf") for n in dirs + files):
+            return "is not narrow: a .gguf file lies beneath it"
+    return None
+
+
+def _check_profiles(file: str, rows: dict) -> None:
+    """Every row's shape, then each native row's tokenizer folder against every pinned file (built-in and registered)."""
+    for name, row in rows.items():
+        _check_row(file, name, row)
+    native = {name: row for name, row in rows.items() if row["native"]}
+    pinned = ([p.weight_file.resolve() for p in PROFILES.values()] + [f.resolve() for f in SECOND_FILES.values()]
+              + [Path(row["weight_file"]).resolve() for row in native.values()])
+    for name, row in native.items():
+        reason = _narrow_refusal(Path(row["tokenizer_root"]).resolve(), pinned)
+        if reason:
+            raise ProfileError(f"{file}: profile '{name}' tokenizer_root {reason}")
 
 
 def _read_registry(registry_file: Path | None) -> dict:
@@ -149,8 +195,7 @@ def _read_registry(registry_file: Path | None) -> dict:
         raise ProfileError(f"{path.name} is not a model registry (invalid JSON)") from None
     if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
         raise ProfileError(f"{path.name} is not a model registry")
-    for name, row in data["profiles"].items():
-        _check_row(path.name, name, row)
+    _check_profiles(path.name, data["profiles"])
     return data
 
 
@@ -273,6 +318,8 @@ def add(name: str, lmstudio_key: str | None = None, weights: str | Path | None =
                    weight_sha256=_sha256(weight_file), tokenizer_root=str(tokenizer_root),
                    tokenizer_model_type=config.get("model_type"),
                    tokenizer_quant_bits=(config.get("quantization") or {}).get("bits"), gguf_selection=selection)
+    # S3: the reader's own checks on the registry as it would be written; nothing is written if they refuse.
+    _check_profiles(Path(registry_file or REGISTRY_FILE).name, {**registry["profiles"], key: row})
     registry["profiles"][key] = row
     _write_registry(registry_file, registry)
     return _from_row(key, row)

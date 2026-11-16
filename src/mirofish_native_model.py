@@ -72,6 +72,8 @@ MODEL_PROFILE_FILE = Path(__file__).with_name('mirofish_model_profile.json')
 # never a member of a plan. Model-staged candidates carry no registry.
 MODEL_REGISTRY_FILE = Path(__file__).with_name('mirofish_model_registry.json')
 HTTP_ONLY_PROFILES = set()
+# The five files of a tokenizer origin (the registry reader below checks a registered folder holds them, S2).
+TOKENIZER_FILES = ('config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json')
 _PROFILE_NAME = re.compile(r'[a-z0-9][a-z0-9._-]{1,40}')
 _SHA256 = re.compile(r'[0-9a-f]{64}')
 _TOKENIZER_TYPE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
@@ -135,10 +137,26 @@ def profile_files(name):
     return rows
 
 
+def narrow_tokenizer_folder_refusal(folder, pinned):
+    """TMF4 addendum 3, S2: the observer is given a subpath read of a tokenizer folder, so a registered folder must be
+    narrow: it directly holds the five tokenizer files, no .gguf file (or link of that name, in any case) lies anywhere
+    beneath it, and it is not the parent of a pinned model file (pinned: resolved paths of every profile's weights and
+    second file, on disk or not). Returns the reason it is not narrow, or None."""
+    if not all((folder/name).is_file() for name in TOKENIZER_FILES):
+        return 'must directly hold the five tokenizer files'
+    if any(Path(file).is_relative_to(folder) for file in pinned):
+        return 'is the parent of a pinned model file'
+    for _, dirs, files in os.walk(folder, followlinks=False):
+        if any(name.lower().endswith('.gguf') for name in dirs + files):
+            return 'is not narrow: a .gguf file lies beneath it'
+    return None
+
+
 def registered_profiles(path=None, builtins=None):
     """R9: the registry's native profiles and HTTP-only names. A malformed registry refuses with NativeRefused: invalid
-    JSON, a wrongly shaped name, a built-in name, a size or hash of the wrong shape, a selection that fails R6, or a file
-    or tokenizer origin that does not lie under the pinned models root after resolving links (resolved paths are kept)."""
+    JSON, a wrongly shaped name, a built-in name, a size or hash of the wrong shape, a selection that fails R6, a file or
+    tokenizer origin that does not lie under the pinned models root after resolving links (resolved paths are kept), or
+    a tokenizer folder that is not narrow (S2)."""
     path = Path(MODEL_REGISTRY_FILE if path is None else path)
     builtins = BUILTIN_PROFILES if builtins is None else builtins
     if not path.exists():
@@ -175,6 +193,11 @@ def registered_profiles(path=None, builtins=None):
                    'gguf_selection': dict(selection, sizeBytes=size, sourceSha256=sha)}
         helper_constants(profile)  # R6 holds for a registered profile before anything else reads it
         native[name] = profile
+    pinned = [Path(row[key]).resolve() for row in [MODEL_PROFILES[name] for name in builtins if name in MODEL_PROFILES] + list(native.values())
+              for key in ('weight_file', 'second_file') if row.get(key) is not None]
+    for name, profile in native.items():
+        reason = narrow_tokenizer_folder_refusal(profile['tokenizer_root'], pinned)
+        require(reason is None, 'malformed MiroFish model registry: profile %r tokenizer_root %s' % (name, reason))
     return native, http
 
 
@@ -237,7 +260,6 @@ TOKENIZER_ROOT = _PROFILE['tokenizer_root']
 WEIGHT_FILE = _PROFILE['weight_file']
 WEIGHT_BYTES = _PROFILE['weight_bytes']
 WEIGHT_SHA256 = _PROFILE['weight_sha256']
-TOKENIZER_FILES = ('config.json','tokenizer.json','tokenizer_config.json','chat_template.jinja','model.safetensors.index.json')
 # Exact unambiguous public SDK group observed 2026-11-07T14:02:22Z.
 SDK_PORT = 62298
 GGUF_SELECTION = _PROFILE['gguf_selection']

@@ -622,16 +622,18 @@ def check_load_readback(loaded,identifier,profile):
     return loaded
 
 
-def swap_model(sdk,gateway,identifier,profile,state,embedding_reference,admission_for,deadline):
+def swap_model(sdk,gateway,identifier,profile,plan,state,embedding_reference,admission_for,deadline):
     """R4, at a plan boundary only: with the gateway provably idle (its serial lock held, no call reserved or in flight)
     unload the owned instance and confirm no language model is listed, load the next profile under the same identifier
     with the same load settings, read it back, rebuild the admission for that profile, and require that no call arrived
-    meanwhile. state carries the profile behind the identifier and its readback for cleanup. Any failure freezes the
-    gateway before the serial lock is released, so nothing queued can reach either model, and refuses the run."""
+    meanwhile. state carries the profile behind the identifier and its readback for cleanup. The target must be a member
+    of the run's plan, checked before anything is unloaded (addendum 3, S1). Any failure freezes the gateway before the
+    serial lock is released, so nothing queued can reach either model, and refuses the run."""
     from mirofish_native_model import MODEL_PROFILES
     locked=gateway.serial.acquire(blocking=False)
     try:
         require(locked,'gateway not idle at the model boundary: a call holds the serial lock')
+        require(type(plan) is dict and set(plan)=={'setup','turns'} and profile in plan.values(),"model swap target is not a member of the run's model plan: "+str(profile)[:64])
         require(profile in MODEL_PROFILES and profile!=state.get('profile'),'closed model swap target')
         with gateway.lock:
             require(not gateway.cancelled.is_set(),'gateway cancelled at the model boundary')
@@ -656,6 +658,27 @@ def swap_model(sdk,gateway,identifier,profile,state,embedding_reference,admissio
         raise
     finally:
         if locked:gateway.serial.release()
+
+
+def model_boundary(sdk,gateway,identifier,name,profile,plan,state,embedding_reference,admission_for,secret,deadline,save):
+    """A plan boundary (B1 setup -> turns, B2 turns -> setup): the swap, then the two compatibility probes on the newly
+    loaded model (ruling d). Any failure, a failed probe's included, freezes the gateway so it refuses every further call
+    and refuses the run; state then names the profile behind the identifier, which cleanup unloads (addendum 3, S4)."""
+    try:
+        event=swap_model(sdk,gateway,identifier,profile,plan,state,embedding_reference,admission_for,deadline)
+        save('model_swap',boundary=name,**event)
+        compatibility_probes(gateway,identifier,secret)
+        save('post_swap_compatibility_probes_passed',boundary=name,profile=profile,attempts=gateway.state['chat_attempts'],reserved_output=gateway.state['reserved_output'])
+    except BaseException:
+        gateway.cancel()
+        raise
+
+
+def unload_owned(sdk,identifier,plan,loaded,state,embedding_reference,deadline):
+    """Cleanup's model unload: only the exact owned identifier and its instance; in a plan, the profile behind it now."""
+    reference=((loaded if plan is None else state['loaded']) or {}).get('info',{}).get('instanceReference')
+    owned_values={} if plan is None else {'profile':state['profile']}  # a plan's checkpoint behind the identifier now
+    return sdk.call('unload',min(45,max(.1,deadline-time.monotonic())),identifier=identifier,instanceReference=reference,embeddingReference=embedding_reference,**owned_values)
 
 
 def execute(work,gate):
@@ -710,10 +733,7 @@ def execute(work,gate):
     def boundary(name,phase):
         # B1 (setup -> turns) and B2 (turns -> setup); nothing happens here with one model.
         if plan is None:return
-        event=swap_model(sdk,gateway,identifier,plan[phase],model_state,(baseline or {}).get('embedding',{}).get('instanceReference'),admission_for,remaining())
-        save('model_swap',boundary=name,**event)
-        compatibility_probes(gateway,identifier,secret)
-        save('post_swap_compatibility_probes_passed',boundary=name,profile=plan[phase],attempts=gateway.state['chat_attempts'],reserved_output=gateway.state['reserved_output'])
+        model_boundary(sdk,gateway,identifier,name,plan[phase],plan,model_state,(baseline or {}).get('embedding',{}).get('instanceReference'),admission_for,secret,remaining(),save)
     old_handlers={sig:signal.signal(sig,interrupted) for sig in (signal.SIGINT,signal.SIGTERM)}
     try:
         save('pre_resource',sample=resource(True))
@@ -801,10 +821,8 @@ def execute(work,gate):
                     cleanup.append({'poisoned_sdk':sdk.group.stop(deadline)})
                     sdk=SDKBridge(work,deadline)
                 sdk.deadline=deadline
-                reference=((loaded if plan is None else model_state['loaded']) or {}).get('info',{}).get('instanceReference')
                 embedding_reference=(baseline or {}).get('embedding',{}).get('instanceReference')
-                owned_values={} if plan is None else {'profile':model_state['profile']}  # a plan's checkpoint behind the identifier now
-                cleanup.append({'model':sdk.call('unload',min(45,max(.1,deadline-time.monotonic())),identifier=identifier,instanceReference=reference,embeddingReference=embedding_reference,**owned_values)})
+                cleanup.append({'model':unload_owned(sdk,identifier,plan,loaded,model_state,embedding_reference,deadline)})
             except BaseException as exc:cleanup.append({'model_cleanup_failure':str(exc)})
         stop_monitor.set()
         if sdk is not None:

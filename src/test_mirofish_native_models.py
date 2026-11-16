@@ -352,9 +352,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(native, {}); self.assertTrue(http)
 
     def test_links_resolve_before_the_root_check(self):
-        inside = self.dir/'inside.gguf'; inside.symlink_to(m.MODEL_PROFILES['qwen3-8b']['tokenizer_root']/'config.json')
+        # (the target is the 27B's tokenizer config: the row's own tokenizer folder, the 8B's, may not be the parent of its weights)
+        inside = self.dir/'inside.gguf'; inside.symlink_to(m.MODEL_PROFILES['qwen3.8-27b']['tokenizer_root']/'config.json')
         native, _ = self.read({'profiles': {'linked': native_row(weight_file=str(inside))}})
-        self.assertEqual(native['linked']['weight_file'], (m.MODEL_PROFILES['qwen3-8b']['tokenizer_root']/'config.json').resolve())
+        self.assertEqual(native['linked']['weight_file'], (m.MODEL_PROFILES['qwen3.8-27b']['tokenizer_root']/'config.json').resolve())
         target = self.dir/'outside.gguf'; target.write_bytes(b'x'); outside = self.dir/'link.gguf'; outside.symlink_to(target)
         for path in [str(target), str(outside), str(MODELS/'../valedia-trader/model.gguf'), 'relative/model.gguf', str(MODELS)]:
             with self.assertRaisesRegex(NativeRefused, 'models root|absolute', msg=path):
