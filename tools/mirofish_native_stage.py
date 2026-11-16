@@ -742,7 +742,7 @@ def model_manifest(derived,model,p,selector_pins):
         if entry.get('second_file') is not None:row['second_file']={'path':str(entry['second_file']),'bytes':entry['second_bytes'],'sha256':entry['second_sha256'],'note':'the vision projector LM Studio loads with the weights; loaded and unused (every native message is text); counted in the selection size and the start threshold'}
         if name!=default:
             source_txt=entry['tokenizer_root']/'SOURCE.txt'
-            row['provenance']={'known_wrong':'mirofish_native_run.py prepare_candidate writes the 27B\'s revision identifiers (same_base_revision, GGUF_source_revision) into model-source-manifest.json for any profile; for '+name+' that provenance field is known to be wrong. A run on '+name+' is a pipeline proof, not evidence about that field.',
+            row['provenance']={'recorded_by_run':'mirofish_native_run.py prepare_candidate (R10) records '+name+' in model-source-manifest.json with its own tokenizer files, GGUF files and hashes, and writes no 27B revision identifiers for it (same_base_revision and GGUF_source_revision go to the 27B\'s record only). The upstream source of these files is the tokenizer origin\'s SOURCE.txt below; no revision identifier for it is pinned.',
                 'correct_source':{'tokenizer_origin':str(source_txt),'tokenizer_origin_text':source_txt.read_text() if source_txt.is_file() else None,'gguf':str(entry['weight_file']),'gguf_bytes':entry['weight_bytes'],'gguf_sha256':entry['weight_sha256']}}
         member_rows[name]=row
     probes=p.get('probe_chats',2);swaps=p.get('swap_chats',0)
