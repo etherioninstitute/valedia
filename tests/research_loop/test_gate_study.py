@@ -224,11 +224,11 @@ def test_a_wrong_r0_fails_the_anchor(anchor_rows, monkeypatch):
         assert _anchor_disagreements(anchor_rows) > 0                    # measured 14
     with monkeypatch.context() as mp:                                    # the sealed made_money check dropped
         mp.setattr(gs, "_SEALED_CHECKS", ("prediction_failure_terms",))
-        assert _anchor_disagreements(anchor_rows) > 0                    # measured DRAG_COUNT
+        assert _anchor_disagreements(anchor_rows) > 0                    # measured 2 (the volatility-drag book, at both counts)
     with monkeypatch.context() as mp:                                    # the walk_forward check dropped
         mp.setattr(gs, "_gate_checks_ok", lambda m: all(ok for k, ok in m["checks"].items()
                                                          if k not in ("deflated_sharpe", "walk_forward")))
-        assert _anchor_disagreements(anchor_rows) > 0                    # measured WF_COUNT
+        assert _anchor_disagreements(anchor_rows) > 0                    # measured 4
     assert _anchor_disagreements(anchor_rows) == 0
 
 
