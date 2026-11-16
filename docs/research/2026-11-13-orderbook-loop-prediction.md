@@ -383,3 +383,11 @@ that stop, whatever the run does; the run is expected to take about 51 minutes. 
 (UTC): at most 7.3% of that day's slots, and the day's own count decides whether it counts. The exact times are
 added below afterwards. If the run's preparation fails before the collector is touched, this stop does not take
 place, and that is said here.
+
+## The times of the stop of 16 November (written at 03:06 UTC on 16 November, after the stop; no answer has been scored)
+
+The stop lasted 22 minutes 18 seconds: the collector was stopped at 02:40:11 UTC and started again at 03:02:29 UTC on
+16 November, its last heartbeat before the stop at 02:40:03 and its first new one at 03:03:09; both are in the store.
+The run made every one of its model calls and ended by itself, 1 hour 23 minutes inside the limit. It is the only
+stop of 16 November (UTC) so far, 1.5% of that day's slots. A later run of this kind is declared here before it
+happens.
