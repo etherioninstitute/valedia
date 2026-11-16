@@ -99,7 +99,8 @@ def oracle(a, b, signal, legs="both", sizing=None, risk=None):
             s = [a[u] / b[u] if hedge == "ratio" else math.log(a[u]) - math.log(b[u]) for u in idx]
         m = math.fsum(s) / w
         sd = math.sqrt(math.fsum((x - m) ** 2 for x in s) / (w - 1))
-        if not math.isfinite(sd) or sd <= 1e-12 * max(1.0, max(abs(x) for x in s)):
+        floor = 0.0 if hedge == "ratio" else 1.0                  # a ratio may be tiny (addendum 1, ruling 3)
+        if not math.isfinite(sd) or sd <= 1e-12 * max(floor, max(abs(x) for x in s)):
             continue
         z[t] = (s[-1] - m) / sd
     side, wa, wb, pa, pb, held, armed = 0, 0.0, 0.0, None, None, 0, True
@@ -128,16 +129,18 @@ def oracle(a, b, signal, legs="both", sizing=None, risk=None):
         if side == 0 and not closed and not armed and z[t] is not None and abs(z[t]) <= ex:
             armed = True
         if (side == 0 and not closed and armed and both and z[t] is not None and abs(z[t]) >= en
+                and (sz is None or abs(z[t]) < sz)                     # nothing opens beyond the z stop (ruling 2)
                 and (hedge != "ols" or (beta[t] is not None and 0.1 <= beta[t] <= 10.0))):
-            side = 1 if z[t] <= -en else -1
+            new_side = 1 if z[t] <= -en else -1
             ga, gb = (pw / (1.0 + beta[t]), pw * beta[t] / (1.0 + beta[t])) if hedge == "ols" else (pw / 2.0, pw / 2.0)
             big = max(ga, gb)
             if big > mpp:
                 ga, gb = ga * mpp / big, gb * mpp / big
-            wa, wb = (ga, -gb) if side > 0 else (-ga, gb)
+            na, nb = (ga, -gb) if new_side > 0 else (-ga, gb)
             if legs == "long":
-                wa, wb = max(wa, 0.0), max(wb, 0.0)
-            pa, pb, held = a[t], b[t], 0
+                na, nb = max(na, 0.0), max(nb, 0.0)
+            if max(abs(na), abs(nb)) <= mpp + 1e-12:                   # net limit per symbol (ruling 1; one pair: its legs)
+                side, wa, wb, pa, pb, held = new_side, na, nb, a[t], b[t], 0
         gross = abs(wa) + abs(wb)
         k = mg / gross if gross > mg else 1.0
         rows.append((wa * k, wb * k))
@@ -322,7 +325,7 @@ def test_pair_stop_loss_take_profit_time_limit_and_z_stop():
         ([94, 90, 89], {}, {"stop_loss_pct": 0.02}, 9, "stop loss", 0.5 * (90 / 94 - 1)),
         ([94, 99, 99, 100], {"exit": 0.0}, {"take_profit_pct": 0.02}, 9, "take profit", 0.5 * (99 / 94 - 1)),
         ([94, 94.5, 94.2, 94.4, 94.3], {}, {"max_holding_days": 3}, 11, "time limit", 0.5 * (94.4 / 94 - 1)),
-        ([94, 85, 86], {"stop_z": 1.6}, {}, 9, "z stop", 0.5 * (85 / 94 - 1)),
+        ([97, 85, 86], {"stop_z": 1.6}, {}, 9, "z stop", 0.5 * (85 / 97 - 1)),     # entered at |z| 1.58, below the z stop
     ]
     for tail, sig, risk, bar, reason, r in cases:
         a = BASE + tail
@@ -332,7 +335,7 @@ def test_pair_stop_loss_take_profit_time_limit_and_z_stop():
         assert exits[0]["reason"].startswith(reason) and exits[0]["pnl_pct"] == pytest.approx(r)
         assert [e["action"] for e in events if e["date"] == w.index[bar]] == ["exit", "exit_leg"]
         assert (w.iloc[bar:] == 0).all().all() and w["A"].iloc[bar - 1] == 0.05
-    assert z_ratio(BASE + [94, 85, 86], b[:11])[9] == pytest.approx(-1.649, abs=1e-3)   # beyond the z stop, short of the exit
+    assert z_ratio(BASE + [97, 85, 86], b[:11])[9] == pytest.approx(-1.756, abs=1e-3)   # beyond the z stop
 
 
 def test_a_pair_closed_by_a_stop_waits_for_the_spread_to_come_back_before_it_opens_again():
@@ -463,6 +466,8 @@ def _random_case(rng, hedge):
         e[t] = 0.75 * e[t - 1] + 0.01 * rng.standard_normal()
     beta = float(rng.choice([rng.uniform(0.4, 2.5), 0.05, 12.0], p=[0.8, 0.1, 0.1])) if hedge == "ols" else 1.0
     a, b = np.exp(beta * lb + (1 - beta) * np.log(100.0) + e), np.exp(lb)
+    if hedge == "ratio" and rng.random() < 0.25:
+        a, b = a * 1e-11, b * 1e3                                   # a ratio near 1e-14 must still trade (ruling 3)
     for arr in (a, b):
         arr[rng.random(n) < 0.03] = np.nan
         arr[rng.random(n) < 0.004] = 0.0
@@ -565,3 +570,60 @@ def test_a_spread_that_does_not_move_gives_no_z_even_through_rounding():
     assert events == [] and (w == 0).all().all()
     w, events = build().walk(frame(A=[100.0] * 30, B=[50.0] * 30))                  # a ratio that never moves
     assert events == [] and (w == 0).all().all()
+
+
+# ---- addendum 1
+
+
+def test_an_entry_that_would_take_a_symbols_net_weight_past_the_limit_is_skipped_for_the_next_candidate():
+    q = [100.0] * 9
+    cols = {"A": BASE + [90], "B": q, "C": q, "D": BASE + [97], "E": q}
+    s = build(pairs=[["A", "B"], ["A", "C"], ["D", "E"]], sizing={"pair_weight": 0.2, "max_open_pairs": 2},
+              risk={"max_position_pct": 0.10})
+    z = z_ratio(cols["A"], q)[8], z_ratio(cols["D"], q)[8]
+    assert z[0] < z[1] <= -1.5                                                    # A/B and A/C tie at the largest |z|
+    w, events = s.walk(frame(**cols))
+    assert [e["pair"] for e in events if e["action"] == "enter"] == ["A/B", "D/E"]   # A/C would put A at 0.20: skipped
+    assert w["A"].iloc[-1] == pytest.approx(0.10) and w["D"].iloc[-1] == pytest.approx(0.10)
+    assert (w.abs() <= 0.10 + 1e-12).all().all()
+    alone = build(pairs=[["A", "C"]], sizing={"pair_weight": 0.2}, risk={"max_position_pct": 0.10}).walk(frame(A=cols["A"], C=q))[0]
+    assert alone["A"].iloc[-1] == pytest.approx(0.10)                             # it fits on its own
+    _, events = build(pairs=[["A", "B"], ["A", "C"]]).walk(frame(A=BASE + [90], B=q, C=q))
+    assert len([e for e in events if e["action"] == "enter"]) == 2                # 0.05 + 0.05 = 0.10 is at the limit: allowed
+
+
+def test_nothing_opens_beyond_the_z_stop_on_either_side():
+    b = [100.0] * 9
+    for tail, side in (([94], 1), ([106], -1)):                                   # |z| 1.73 on bar 8
+        a = BASE + tail
+        assert abs(z_ratio(a, b)[8]) == pytest.approx(1.73, abs=1e-2)
+        w, events = build(signal={"stop_z": 1.7}).walk(frame(A=a, B=b))
+        assert events == [] and (w == 0).all().all()
+        w, events = build(signal={"stop_z": 1.8}).walk(frame(A=a, B=b))
+        assert events[0]["action"] == "enter" and events[0]["side"] == side and w["A"].iloc[8] == 0.05 * side
+
+
+def test_a_ratio_near_1e_minus_14_trades_as_the_same_series_at_ordinary_prices():
+    a = BASE + [94, 90, 86, 82, 78, 85, 95, 100, 100.5, 100, 99.5, 100, 94, 95, 99, 100]
+    b = [100.0 * (1 + 0.001 * k) for k in range(len(a))]
+    sig, risk = {"enter": 1.2, "exit": 0.3}, {"stop_loss_pct": 0.02}
+    _, ordinary = build(signal=sig, risk=risk).walk(frame(A=a, B=b))
+    tiny_a, big_b = [x * 1e-11 for x in a], [x * 1e3 for x in b]                  # about 1e-9 and 1e5
+    assert max(x / y for x, y in zip(tiny_a, big_b)) < 2e-14
+    _, tiny = build(signal=sig, risk=risk).walk(frame(A=tiny_a, B=big_b))
+    key = [(e["date"], e["action"], e["reason"].split(":")[0], e["side"]) for e in ordinary]
+    assert len(key) >= 6 and key == [(e["date"], e["action"], e["reason"].split(":")[0], e["side"]) for e in tiny]
+    w, events = build().walk(frame(A=[3e-9] * 30, B=[1e5] * 30))                  # a tiny ratio that never moves: no z
+    assert events == [] and (w == 0).all().all()
+
+
+def test_every_event_says_which_way_the_spread_was_traded():
+    b = [100.0] * 18
+    up = BASE + [106, 105, 103, 101, 100, 99, 100, 101, 99, 100]
+    _, events = build(legs="long").walk(frame(A=up, B=b))                           # short the spread: only long B is held
+    assert [(e["action"], e["symbol"], e["side"], e["spread_side"]) for e in events] == [("enter", "B", 1, -1), ("exit", "B", 1, -1)]
+    _, events = build().walk(frame(A=up, B=b))
+    assert [(e["symbol"], e["side"], e["spread_side"]) for e in events] == [("A", -1, -1), ("B", 1, -1)] * 2
+    down = BASE + [94, 95, 97, 99, 100, 101, 100, 99, 101, 100]
+    _, events = build().walk(frame(A=down, B=b))
+    assert all(e["spread_side"] == 1 for e in events) and len(events) == 4
