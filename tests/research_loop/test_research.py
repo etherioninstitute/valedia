@@ -372,3 +372,10 @@ def test_a_refused_frame_is_reported_by_the_run_and_no_prompt_is_sent(env):
     out = rs.run_research(ledger, paths, _frame(365.25, 800), None, "us-etf",
                           {"price-analyst": lambda p: asked.append(p) or "{}"}, today="2026-11-10")
     assert asked == [] and "rows a year" in out["roles"]["price-analyst"]["note"]
+
+
+def test_the_macro_legend_says_what_a_session_is_for_a_pair_and_the_price_legend_does_not():
+    px = dev_prices()
+    sentence = "For a pair, a session is a day on which both funds have a price."
+    assert sentence in _legend_part(rs.macro_table(px))
+    assert sentence not in _legend_part(rs.price_table(px, dollar_volume(px)))

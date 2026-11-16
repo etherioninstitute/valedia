@@ -493,3 +493,30 @@ def test_the_promotion_z_uses_the_simple_average_too(tmp_path):
     cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
     assert ledger.get(hid)["status"] == "passed paper"
     assert f"z {-0.0384:.2f}" in ledger.get(hid)["lessons_learned"]
+
+
+def _review_text(journal, days):
+    return (journal.dir / f"review-{days[-1].date()}.md").read_text()
+
+
+def test_the_review_prints_both_backtest_figures_with_their_basis(tmp_path):
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, dict(VOLATILE_BACKTEST))
+    days = summaries(journal, "2026-09-01", [LIVE_DAILY] * LIVE_DAYS)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    result = out["strategies"]["mom"]["result"]
+    assert result["backtest_simple_annual"] == pytest.approx(0.20) and result["backtest_annual_return"] == 0.11
+    line = next(ln for ln in _review_text(journal, days).splitlines() if ln.startswith("- Backtest:"))
+    assert "+20.00% a year (average daily return times 252" in line and "+11.00% a year (compound)" in line
+    assert line.index("+20.00%") < line.index("+11.00%") and "prediction: +10.00% a year" in line
+
+
+@pytest.mark.parametrize("bt", [{"cagr": 0.11, "annual_vol": 0.40, "max_drawdown": 0.5},
+                                {"cagr": 0.11, "sharpe": 0.5, "max_drawdown": 0.5}])
+def test_without_a_simple_figure_the_review_prints_only_the_compound_one_labelled_compound(tmp_path, bt):
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, bt)
+    days = summaries(journal, "2026-09-01", [LIVE_DAILY] * LIVE_DAYS)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    result = out["strategies"]["mom"]["result"]
+    assert "backtest_simple_annual" in result and result["backtest_simple_annual"] is None
+    line = next(ln for ln in _review_text(journal, days).splitlines() if ln.startswith("- Backtest:"))
+    assert "+11.00% a year (compound)" in line and "average daily return times 252" not in line and "n/a" not in line
