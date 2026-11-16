@@ -9184,3 +9184,383 @@ def test_t34b3_every_fault_is_marked_by_the_run_that_meets_it_or_carried_by_the_
         _shutil.rmtree(tmp_path / f"f{k}")
     print(f"T34B3-FAULT {how}: marked {marked}, carried {carried}")
     assert marked + carried == 11
+
+
+# ---- T34b-3 addenda 3 and 4: every write that sets an average is judged once, by its own line, on its own figure
+
+_JTAG = "s1-IWM-2026-11-16"
+
+
+class _Scripted:
+    """A venue that reports, for each tag, exactly what the test last set; positions empty; cancels taken."""
+    name = "scripted"
+
+    def __init__(self):
+        self.book = {}
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        self.book[tag] = {"state": "open", "filled_units": 0.0, "avg_price": None, "fee": None,
+                          "venue_order_id": f"V-{tag}", "raw_status": None}
+        return {"status": "accepted", "venue_order_id": f"V-{tag}"}
+
+    def order_status(self, tag):
+        got = self.book.get(tag)
+        return dict(got) if got is not None else None
+
+    def positions(self):
+        return {}
+
+    def cancel(self, tag):
+        return {"status": "cancelled"}
+
+
+class _Dying:
+    """A journal whose `write` dies (KeyboardInterrupt) once `after` more lines are written; None: never."""
+
+    def __init__(self, journal, after):
+        self._journal, self._left = journal, after
+
+    def write(self, day, entry):
+        if self._left is not None:
+            if self._left == 0:
+                raise KeyboardInterrupt("killed here by the test")
+            self._left -= 1
+        return self._journal.write(day, entry)
+
+    def __getattr__(self, name):
+        return getattr(self._journal, name)
+
+
+class _Lines:
+    """One order's ledger and the order step's own journaling of it, run by run (`journal_run`): the scan, the fill
+    lines, the notice lines, the settling lines and a summary with the run's cap_refs; nothing else of a run."""
+
+    def __init__(self, tmp, units=10.0, limit=90.0):
+        self.t = [1_000_000.0]
+        self.led = OrderLedger(":memory:", clock=lambda: self.t[0])
+        self.venue = _Scripted()
+        assert self.led.reconcile(self.venue, {})["clean"]
+        self.led.intend(_JTAG, "IWM", units, limit, limit_price=limit)
+        self.led.submit_once(self.venue, _JTAG)
+        self.journal = Journal(tmp / "journal")
+
+    def report(self, **fields):
+        self.venue.book[_JTAG].update(fields)
+        self.t[0] += 60
+        return self.led.reconcile(self.venue, {})
+
+    def journal_run(self, die_after=None):
+        run = osx._Run(self.led, self.venue, None, None, _Dying(self.journal, die_after), None, None,
+                       lambda: self.t[0], None, None, None, None, False)
+        run.name, run.day, run._locked, run.session_day = self.venue.name, "2026-11-16", True, True
+        try:
+            run._journal_fills()
+            run._journal_notices()
+            run._settle_unjudged()
+            run._write({"event": "summary", "cap_refs": run._breach_refs()})
+        except KeyboardInterrupt:
+            return None
+        return run
+
+    def lines(self, event=None):
+        return [e for e in self.journal.read() if e.get("type") == "order_step"
+                and (event is None or e.get("event") == event)]
+
+    def caps(self):
+        return [e["cap_refs"] for e in self.lines("summary") if e["cap_refs"]]
+
+
+def _t34b3_map(lines):
+    """ref -> what its own line says ((verdict, judged_avg, judged_on); None for a line with no limit verdict), and
+    ref -> what settled it ((verdict, covered_by)); each ref once."""
+    said, settled = {}, {}
+    for e in lines:
+        event = e.get("event")
+        if event in ("fill", "notice"):
+            ref = f"{event}-{e['fill_id' if event == 'fill' else 'notice_id']}"
+            assert ref not in said, ref
+            said[ref] = (e["verdict"], e["judged_avg"], e.get("judged_on")) if "verdict" in e else None
+        elif event == "verdict":
+            assert e["ref"] not in settled, e
+            settled[e["ref"]] = (e["verdict"], e.get("covered_by"))
+    return said, settled
+
+
+def _refs(L):
+    fills = [f"fill-{f['id']}" for f in L.led.fills(_JTAG)]
+    notes = [f"notice-{n['id']}" for n in L.led.reconcile_notices()]
+    return fills, notes
+
+
+@pytest.mark.parametrize("death", [False, True])
+def test_t34b3_the_four_step_case_gives_two_cap_refs_fill_1_and_fill_2_with_or_without_the_death(tmp_path, death):
+    L = _Lines(tmp_path)
+    L.report(state="partly_filled", filled_units=1.0, avg_price=90.01, fee=0.0)
+    L.journal_run()
+    L.report(avg_price=90.0)
+    L.journal_run()
+    L.report(filled_units=2.0, avg_price=90.01)                     # piece price 90.02, the average back through
+    L.journal_run(die_after=0 if death else None)                  # dies before fill-2's line
+    L.report(avg_price=90.0)                                       # ... and the broker corrects it before the next run
+    L.journal_run()
+    (f1, f2), (n1, n2) = _refs(L)
+    said, settled = _t34b3_map(L.lines())
+    assert said == {f1: ("breach", pytest.approx(90.01), None), f2: ("breach", pytest.approx(90.01), None),
+                    n1: ("ok", 90.0, None), n2: ("ok", 90.0, None)}, said
+    assert settled == {} and L.caps() == [[f1], [f2]], L.caps()
+
+
+def test_t34b3_a_restatement_through_the_limit_a_death_and_a_restatement_back_leave_the_first_notice_a_breach(
+        tmp_path, monkeypatch):
+    # the outside reviewer's case: buy limit 202, average 202; restated to 202.01 and followed; the run dies before
+    # the notice line; restated back to 202 before the next run
+    w, tag = _restating(tmp_path / "w")
+    w.venue.avg[tag] = 202.01
+    w.later(30)
+    _kill_at(monkeypatch, "_journal_notices")
+    with pytest.raises(KeyboardInterrupt):
+        _prun(w)
+    monkeypatch.undo()
+    w.venue.avg[tag] = 202.0
+    w.later(30)
+    out = _prun(w)
+    n1, n2 = w.entries("notice")
+    assert (n1["new"], n1["verdict"], n1["judged_avg"]) == (202.01, "breach", 202.01), n1
+    assert (n2["new"], n2["verdict"], n2["judged_avg"]) == (202.0, "ok", 202.0), n2
+    assert out["faults"] == ["cap"] and out["cap_refs"] == [f"notice-{n1['notice_id']}"], out
+
+
+@pytest.mark.parametrize("then", ["a correcting restatement", "a diluting later fill"])
+def test_t34b3_a_fill_through_its_limit_journaled_late_is_still_the_breach(tmp_path, then):
+    L = _Lines(tmp_path)
+    L.report(state="partly_filled", filled_units=1.0, avg_price=90.01, fee=0.0)
+    if then == "a correcting restatement":
+        L.report(avg_price=90.0)
+    else:
+        L.report(filled_units=2.0, avg_price=90.0)                 # piece 89.99: the average back at the limit
+    L.journal_run()                                                # the first line written only now
+    fills, notes = _refs(L)
+    said, _ = _t34b3_map(L.lines())
+    assert said[fills[0]] == ("breach", pytest.approx(90.01), None), said
+    later = notes[0] if then == "a correcting restatement" else fills[1]
+    assert said[later] == ("ok", pytest.approx(90.0), None) and L.caps() == [[fills[0]]], (said, L.caps())
+
+
+def test_t34b3_an_unpriced_pieces_fill_line_judges_the_notices_figure_and_the_notice_line_has_no_verdict(tmp_path):
+    L = _Lines(tmp_path, units=10.0001, limit=100.0)
+    L.report(state="partly_filled", filled_units=10.0, avg_price=100.01, fee=0.0)
+    L.journal_run()
+    L.report(state="filled", filled_units=10.0001, avg_price=100.0)
+    L.journal_run()
+    (f1, f2), (n1,) = _refs(L)
+    said, settled = _t34b3_map(L.lines())
+    (notice,) = L.lines("notice")
+    assert notice["kind"] == "piece_unpriced" and "verdict" not in notice and "judged_avg" not in notice, notice
+    assert said == {f1: ("breach", 100.01, None), f2: ("ok", 100.0, None), n1: None} and settled == {}, said
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_t34b3_a_row_with_no_average_is_settled_by_the_write_that_prices_it_and_one_ref_carries_the_breach(tmp_path,
+                                                                                                            late):
+    L = _Lines(tmp_path)
+    L.report(state="partly_filled", filled_units=4.0, avg_price=None, fee=0.0)
+    if not late:
+        L.journal_run()
+        (only,) = L.lines("fill")
+        assert (only["verdict"], only["judged_avg"]) == ("unjudged", None) and not L.lines("verdict")
+    L.report(state="filled", filled_units=10.0, avg_price=90.02)    # prices all ten: through the limit
+    L.journal_run()
+    (f1, f2), _ = _refs(L)
+    said, settled = _t34b3_map(L.lines())
+    assert said == {f1: ("unjudged", None, None), f2: ("breach", pytest.approx(90.02), None)}, said
+    assert settled == {f1: ("ok", f2)} and L.caps() == [[f2]], (settled, L.caps())
+    L.journal_run()
+    assert len(L.lines("verdict")) == 1
+
+
+def test_t34b3_a_replay_that_cannot_be_trusted_falls_back_to_the_stored_average_and_says_so(tmp_path, monkeypatch):
+    L = _Lines(tmp_path)
+    L.report(state="partly_filled", filled_units=1.0, avg_price=90.01, fee=0.0)
+    real = OrderLedger.average_writes
+    monkeypatch.setattr(OrderLedger, "average_writes",
+                        lambda self, tag: {**real(self, tag), "trusted": False, "why": "made untrusted by the test"})
+    L.journal_run()
+    (line,) = L.lines("fill")
+    assert (line["verdict"], line["judged_avg"], line["judged_on"]) == ("breach", 90.01, "stored"), line
+
+
+def _t34b3_history(rng):
+    """One order's history: (units, limit, the venue's reports in turn). Fills in unequal pieces (tiny ones too, so
+    a rounding broker gives unpriced pieces), through the limit or not; a broker that rounds, truncates or does not
+    round its average; reports with no average; restatements within and beyond a cent; a cancel with part filled
+    and late amounts after it; fee totals that rise and fall."""
+    side, size, limit = rng.choice((1.0, -1.0)), rng.choice((10.0, 6.0, 10.0002)), 90.0
+    how = rng.choice(("round", "truncate", "exact"))
+    filled = cash = fee = 0.0
+    state, shown, steps = "open", None, []
+    for _ in range(rng.randint(2, 10)):
+        roll, f = rng.random(), {}
+        if roll < 0.5 and filled < size - 1e-9:
+            piece = min(size - filled, rng.choice((0.0001, 0.5, 1.0, 2.5, 4.0)))
+            filled += piece
+            cash += piece * (limit + side * rng.choice((-0.02, -0.01, 0.0, 0.003, 0.01, 0.02)))
+            exact = cash / filled
+            shown = None if rng.random() < 0.2 else {"round": round(exact, 2), "truncate": math.floor(exact * 100) / 100,
+                                                     "exact": exact}[how]
+            if state != "cancelled":
+                state = "filled" if filled >= size - 1e-9 else "partly_filled"
+            f = {"state": state, "filled_units": filled, "avg_price": shown}
+        elif roll < 0.75 and shown is not None:
+            shown = round(shown + rng.choice((-0.01, -0.005, 0.005, 0.01, 0.02, -0.03)), 4)
+            f = {"avg_price": shown}
+        elif roll < 0.82 and state == "partly_filled":
+            state = "cancelled"
+            f = {"state": state}
+        else:
+            fee = max(0.0, round(fee + rng.choice((-0.1, 0.05, 0.2)), 2))
+            f = {"fee": fee}
+        steps.append(f)
+    return side * size, limit, steps
+
+
+def _t34b3_through(units, limit, avg):
+    return ((avg - limit) if units > 0 else (limit - avg)) > osx.LIMIT_SAME * limit * osx.LIMIT_EDGE
+
+
+def test_t34b3_the_verdicts_are_the_same_journaled_on_time_late_or_across_a_death(tmp_path):
+    rng = random.Random(3404)
+    tally = {"histories": 0, "refs": 0, "breach refs": 0, "settled": 0, "stored lines": 0, "deaths": 0,
+             "notices": {}, "unjudged at the end": 0}
+    for k in range(520):
+        units, limit, steps = _t34b3_history(rng)
+        die_at, die_after = rng.randrange(len(steps)), rng.randrange(3)
+        maps = {}
+        for arm in ("on time", "late", "death"):
+            L = _Lines(tmp_path / f"{k}-{arm}", units=units, limit=limit)
+            for i, step in enumerate(steps):
+                L.report(**step)
+                if arm == "on time" or (arm == "death" and i != die_at):
+                    L.journal_run()
+                elif arm == "death":
+                    tally["deaths"] += L.journal_run(die_after=die_after) is None
+            L.journal_run()                                        # the next run finishes the job
+            L.journal_run()
+            maps[arm] = _t34b3_map(L.lines())
+            records = ([{k2: v for k2, v in f.items() if k2 != "applied"} for f in L.led.fills(_JTAG)],
+                       [{k2: n[k2] for k2 in ("id", "kind", "old", "new", "after_fill", "row")}
+                        for n in L.led.reconcile_notices()])
+            maps[arm] += (records,)
+            if arm == "on time":
+                held = L
+        assert maps["on time"] == maps["late"] == maps["death"], (k, steps, die_at, die_after, maps)
+        said, settled, _ = maps["on time"]
+        replay = held.led.average_writes(_JTAG)                    # one figure, one ref: each write that sets one
+        assert replay["trusted"], (k, replay)
+        for f in held.led.fills(_JTAG):
+            ref, wr = f"fill-{f['id']}", replay["fills"][f["id"]]
+            if wr["sets"]:
+                assert said[ref][1] == pytest.approx(wr["avg"], rel=0, abs=0), (k, ref, said[ref], wr)
+                assert (said[ref][0] == "breach") == _t34b3_through(units, limit, wr["avg"]), (k, ref)
+            elif wr["units"] > 1e-9:
+                assert said[ref][:2] == ("unjudged", None), (k, ref, said[ref])
+                if wr["covered_by"] is not None:
+                    cover = "-".join(map(str, wr["covered_by"]))
+                    assert settled[ref] == ("ok", cover) and said[cover][1] is not None, (k, ref, settled)
+                else:
+                    assert ref not in settled
+                    tally["unjudged at the end"] += 1
+            else:
+                assert said[ref][1] is None, (k, ref, said[ref])
+        for n in held.led.reconcile_notices():
+            ref = f"notice-{n['id']}"
+            tally["notices"][n["kind"]] = tally["notices"].get(n["kind"], 0) + 1
+            if n["kind"] == "avg_restated":
+                assert said[ref][1] == n["new"] and (said[ref][0] == "breach") == _t34b3_through(units, limit, n["new"])
+            elif n["kind"] == "piece_unpriced" and n["row"] is not None:
+                assert said[ref] is None, (k, ref)
+            elif n["kind"] in ("late_amount", "fee_fell"):
+                assert said[ref] is None, (k, ref)
+        tally["histories"] += 1
+        tally["refs"] += len(said)
+        tally["breach refs"] += sum(1 for v in said.values() if v and v[0] == "breach")
+        tally["settled"] += len(settled)
+        tally["stored lines"] += sum(1 for v in said.values() if v and v[2] == "stored")
+    print("T34B3-PROPERTY", tally)
+    assert tally["stored lines"] == 0 and tally["deaths"] > 100 and tally["breach refs"] > 200, tally
+    assert {"avg_restated", "piece_unpriced", "late_amount", "fee_fell"} <= set(tally["notices"]), tally
+    assert tally["settled"] > 50, tally
+
+
+# -- M2: the first reconcile's unread status needs only to be of that kind, for an order the ledger knows
+
+@pytest.mark.parametrize("second, stage", [("a full fill at the limit", "venue_read"),
+                                           ("a full fill a cent through", "venue_read"),
+                                           ("no such order", "reconcile"), ("another state", "reconcile"),
+                                           ("more than the size", "reconcile")])
+def test_t34b3_a_first_read_status_unread_answered_by_the_second_read_is_judged_by_the_second(tmp_path, second, stage):
+    w = _resting(tmp_path / "w")
+    (tag,) = w.venue.submits()
+    limit = w.orders()[0]["limit_price"]
+    w.venue.raise_positions, w.venue.raise_on, n = True, {"cancel"}, [0]
+
+    def status(t):
+        n[0] += 1
+        if n[0] == 1:
+            raise ConnectionError("order_status is down")
+        answer = {"state": "filled", "filled_units": 3.0, "avg_price": limit, "fee": 0.0, "venue_order_id": None,
+                  "raw_status": None}
+        if second == "no such order":
+            return None
+        answer.update({"a full fill a cent through": {"avg_price": round(limit + 0.01, 2)},
+                       "another state": {"state": "mystery"},
+                       "more than the size": {"filled_units": 4.0}}.get(second, {}))
+        return answer
+    w.venue.order_status = status
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    assert out["status"] == "stopped" and out["stage"] == stage and out["orders_sent"] == 0, (second, out)
+    if stage == "venue_read":
+        (line,) = w.entries("fill")
+        through = second == "a full fill a cent through"
+        assert line["verdict"] == ("breach" if through else "ok") and line["units"] == 3.0, line
+        assert out.get("faults") == (["cap"] if through else None), out
+        assert out.get("cap_refs") == ([f"fill-{line['fill_id']}"] if through else None), out
+
+
+# -- N1: each local failure, with the venue's positions down, stays a reconcile stop
+
+@pytest.mark.parametrize("how", ["journal write", "state file", "fill not applied"])
+def test_t34b3_an_outage_beside_a_local_failure_stays_a_reconcile_stop(tmp_path, monkeypatch, how):
+    w = _resting(tmp_path / "w")
+    (tag,) = w.venue.submits()
+    w.venue.raise_positions = True
+    w.venue.answers[tag] = [{"state": "filled", "filled_units": 3.0}]
+    if how == "journal write":
+        real = w.journal.write
+
+        def write(day, entry):
+            if entry.get("event") == "fill":
+                raise OSError("disk full")
+            return real(day, entry)
+        monkeypatch.setattr(w.journal, "write", write)
+    elif how == "state file":
+        def settle(self, ledger):
+            raise osx.OrderStepError("the state file could not be written")
+        monkeypatch.setattr(osx.OrderStepState, "settle_sends", settle)
+    else:
+        monkeypatch.setattr(_orders.OrderLedger, "mark_applied", lambda self, ids: 0)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and out["orders_sent"] == 0, (how, out)
+
+
+# -- N2: a notice is never listed among what stands in the way
+
+def test_t34b3_an_open_notice_is_not_listed_as_standing_in_the_way(tmp_path):
+    w, tag = _restating(tmp_path / "w")
+    w.venue.avg[tag] = 201.995
+    w.later(30)
+    assert _prun(w)["notices"] == ["avg_restated"]
+    _t34_flag(w, ["late_outcome"], prefix="old")
+    w.later(30)
+    out = _prun(w)
+    assert out["stage"] == "reconcile" and "1 attention item open (" in out["reason"], out
+    assert "attention items open" not in out["reason"] and tag not in out["reason"].split("attention item open")[1], out
