@@ -2854,3 +2854,16 @@ def test_t34b3_every_anomaly_unresolved_and_recheck_entry_of_a_generated_run_car
                                        or r["positions_error"] or led.orders(("sent", "unknown"))))
             led.mark_applied([f["id"] for f in led.unapplied_fills()])
     assert {"status_unread", "overfill", "avg_restated_beyond"} <= seen, seen
+
+
+@pytest.mark.parametrize("state", ["filled", "cancelled"])
+def test_t34b3_a_finished_order_reported_beyond_its_size_is_an_overfill_never_a_late_amount(state):
+    led, venue, clock = _accepted(10.0)
+    venue.set(TAG, state=state, filled_units=6.0 if state == "cancelled" else 10.0, avg_price=90.0, fee=0.0)
+    _settled(led, venue, {})
+    before = led.order(TAG)["filled_units"]
+    venue.set(TAG, filled_units=11.0)                     # the order's own finished state, one unit beyond its size
+    clock.t += 60
+    result = led.reconcile(venue, {})
+    assert _kinds(result["anomalies"]) == ["overfill"] and result["notices"] == [] and not result["clean"]
+    assert led.order(TAG)["filled_units"] == before and result["fills"] == []
