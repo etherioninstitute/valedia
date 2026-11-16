@@ -301,25 +301,30 @@ MIRROR_TAIL = "the order step does not mirror such a book"
 def _whole_book_refusal(paths: LoopPaths, ledger: HypothesisLedger | None, trader):
     """For the order step with no broker book file outside live mode (the whole book): None when judge_paper_book
     finds nothing in the book the order step would mirror (`trader`'s state, else the state on disk), the left-out
-    strategies read through the research ledger (none when it has no file); otherwise an order_step.Follow refusal in
-    its words. A strategy that cannot be loaded refuses too: the paper command refuses that book itself."""
+    strategies read idea by idea through the research ledger (none when it has no file; an idea whose strategy cannot
+    be loaded names no strategy, as before, and rule C still covers every name); otherwise an order_step.Follow
+    refusal in its words."""
     from valedia_trader.execution_and_risk import order_step
     state = trader.state if trader is not None else _book_state(paths)
     if state is None:
         return None                                     # unreadable: the order step's own reading refuses it
-    own = None
+    own, left = None, []
     try:
         if ledger is None and paths.ledger.is_file():
             ledger = own = HypothesisLedger(paths.ledger)
-        try:
-            left = [] if ledger is None else strategies_to_step(paths, ledger).left_out
-        except Exception as exc:
-            return order_step.Follow(refused="the paper book cannot be followed whole: the strategy of an idea the paper "
-                                             f"command steps cannot be loaded ({order_step._describe(exc)})")
+        for s in PAPER_STATUSES if ledger is not None else ():
+            for h in ledger.search(status=s):
+                try:
+                    strategy = _strategy_for(paths, ledger, h["id"], None)[0]
+                    name = strategy.name
+                except Exception:
+                    continue
+                if can_hold_shorts(strategy):
+                    left.append(name)
     finally:
         if own is not None:
             own.close()
-    found = judge_paper_book(state, [e["name"] for e in left])
+    found = judge_paper_book(state, left)
     return None if found is None else order_step.Follow(refused=paper_book_words(found, MIRROR_TAIL))
 
 
