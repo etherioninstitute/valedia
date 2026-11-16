@@ -339,6 +339,8 @@ BASELINE_ABF88D5={'coverage_selector':'7c242db3f1d32417eebdcbf5f71e7b80704fdd7d7
  'swarm48':{'embedding_service.py':'83c717318c9e6e3a792f114b2a23f331cf571965551ac7299ae9dd4f3f1895ef','gateway':'a050e47daa947e7cd03be3ddda6cc8e88dba8bda4a00bc3e00610cd528cbe76b','memory':'e505e8c3be37dce9417fc5dd7b1bbaeaa67cb13676e38d4f6bdfda0c40cf6b75','mirofish_provenance.py':'8b39ea8f2f6d9fd30a08f94d02b81c1f39830ebbee38c89be158e3ffa18b0dd6','owned_caller_budget.py':'12a708bb08a6cd1f015befc98b673abee132d8259f64b0519f317951521c59c6','run':'0d8af4917c3cd93daeb67f00deb5f791d37908a43c6c7fcd8b89cc9398910387','scenario':'999e56774f34df31ceef8fa344f061a22e704e9c2ee607faf0087f8446121357','seal':'9b46c98f08bd71fd772f4cefbc76900a3d4e8a90092d0afee423c1410015cc75','selector':'6c8b8b7bbf1e57c68d1bbf11b8347191f84c8ffa1946287b2f531a9cbf8a6081','simulation_config_generator.py':'b724bc4e264652f3fee5ad66ac5263fcfbe94bfd4660ad144f983d09dcc63ac5','simulation_manager.py':'2a8e471c8260fceeb0e6018a7a871585f0d54c682acd62ab554edffb61382265','simulation_runner.py':'277fbf85c689bc62e2151a6746cec8fec03a784670b4e1c87f61329e0fa12eb7','startup':'08e65db86facc60a94639f5de680f325a177e1a9995c543a741713dca7f850cb','startup_device':'93dbac21fb081d3024060981331dca65f83b31352854bca9fa00d993d7c984bf'},
  'swarm8':{'embedding_service.py':'83c717318c9e6e3a792f114b2a23f331cf571965551ac7299ae9dd4f3f1895ef','gateway':'530708fb80d43f4c17c4b25dd1be27def598dc56283338c51c8100e5ea084ab6','memory':'ea20ae5ab911717fca16e6d7ca51909902cef8e83b04cf308df7474533e20fd9','mirofish_provenance.py':'e952a6204c2b67464ce840bea13b1a41146497f545a72aa45ac9091b2a3725a2','owned_caller_budget.py':'12a708bb08a6cd1f015befc98b673abee132d8259f64b0519f317951521c59c6','run':'2db95d25909488f24347044d6074338b90d2c3cb68af12bb235f97a245ad2328','scenario':'641690f62eb67dd2175a45041b19278a22d07d892693b761da6a067de4f1a15e','seal':'b67ce38de930385e8cc1ab361113fa054738665a00b1b343dd74efdd89a4e839','selector':'93aca4976d1161eaecf24780869528e55bb3a18ef5f3a4d0609434538e15c655','simulation_config_generator.py':'7e41e789fdacaf14c12b19afa408da3fcbcbfc5de732df0e7cb1bc45d2f4166c','simulation_manager.py':'25f87e43ba97d329f4ede1451116e0ad5fd50e93d7fe120840e3e52232e376e2','simulation_runner.py':'9fb056d762384c7930f5b04a67abcdf8ea5f37fbb247097bb343e136248da4b5','startup':'b45fee03a1b49b5f87a7c804f6aff290fd05cf31c4c5483f0f378e26b3fa19d8','startup_device':'7150d372b4fd30935f1e1b2ad629fdc1e9fd72531228a0bc52041b017f74507b'}}
 Q8_WORK=s.CREW/'valedia-native-20261115-swarm8-q8-b'  # -q8-a (staged before the V134 wording correction) is superseded and left as it is
+TMF3_MODEL_SRC_SHA='ea0676a6409a0915cd564bc954790937d8c9fbcb8be2a35d51c77ebda730d103'   # the dc14f5e revisions TMF3 pinned (commits ab08400, b5a1797)
+TMF3_RUN_SRC_SHA='21c4418452a7c19c16ab7164f3c24f60feac097e46bb70219c896c7029be06eb'
 def default_hashes():
     """Every default-path transformed file, hashed the way BASELINE_ABF88D5 was."""
     h=lambda b:hashlib.sha256(b).hexdigest();raw=lambda rel:(s.W16/rel).read_bytes();out={}
@@ -395,9 +397,11 @@ class ModelStaging(unittest.TestCase):
         small=s.model_choice('qwen3-8b',self.base);root=s.BASE/'models/Qwen3-8B-tokenizer';gguf=s.BASE/'models/lmstudio-library/Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf'
         self.assertEqual([r['path'] for r in small['model_files']],[str(root/f) for f in files]+[str(gguf)]);self.assertEqual(small['paths'],{root/f for f in files}|{gguf})
         self.assertEqual((small['model_files'][-1]['bytes'],small['model_files'][-1]['sha256']),(5225374496,'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f'))
-        self.assertEqual(small['model_tokenizer'],s.TOKENIZER_PINS['qwen3-8b']);self.assertEqual([r['role'] for r in small['model_files']],[r['role'] for r in self.base['model_files']])
-        # A profile edited into the module text is not trusted: the profiles must be exactly the two built-ins.
-        raw=(s.SRC/'mirofish_native_model.py').read_bytes();edited=raw.replace(b"    'qwen3-8b': {",b"    'qwen3-4b': {",1);self.assertEqual(tuple(s.model_profiles(edited)[0]),('qwen3.8-27b','qwen3-4b'))
+        self.assertEqual(small['model_tokenizer'],s.TOKENIZER_PINS['qwen3-8b']);self.assertEqual([r['role'] for r in small['model_files'][:5]],[r['role'] for r in self.base['model_files'][:5]])
+        # TMF4b (C3): the 8B's weight row no longer borrows the 27B's "verified by authorized preflight" claim.
+        self.assertEqual(small['model_files'][-1]['role'],'sole serving GGUF Q4_K_M weight; size and SHA-256 checked at staging');self.assertNotIn('preflight',small['model_files'][-1]['role'])
+        # A profile edited into the module text is not trusted: the profiles must be exactly the built-ins.
+        raw=(s.SRC/'mirofish_native_model.py').read_bytes();edited=raw.replace(b"    'qwen3-8b': {",b"    'qwen3-4b': {",1);self.assertEqual(tuple(s.model_profiles(edited)[0]),('qwen3.8-27b','qwen3-4b','ternary-bonsai-2-27b'))
         with self.assertRaisesRegex(RuntimeError,'unexpected expression'):s.model_profiles(raw.replace(b"_MODEL_ROOT/'Qwen3-8B-tokenizer'",b"Path.home()/'x'",1))
     def test_outcome2_pin_scope_admits_only_the_chosen_models_files(self):
         small=s.model_choice('qwen3-8b',self.base);big=s.model_choice('qwen3.8-27b',self.base);rows=[dict(r,bytes=1) for r in small['model_files']]
@@ -437,9 +441,11 @@ class ModelStaging(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
             src=Path(folder)/'src';src.mkdir()                                           # a scratch copy of the module folder, never src/ itself
             for name in ('mirofish_native_model.py','mirofish_native_gateway.py'):(src/name).write_bytes((s.SRC/name).read_bytes())
-            # With a registry holding a native entry beside it, the revised code would take the entry's own paths and pins.
+            # With a registry holding a native entry beside it, the dc14f5e code took the entry's own paths and pins; the TMF4a
+            # revision (R9) refuses such a registry at import. Staged copies still carry none.
             (src/s.REGISTRY_NAME).write_text(json.dumps({'profiles':{'evil':{'native':True,'tokenizer_root':'/','weight_file':'/etc/hosts','weight_bytes':1,'weight_sha256':'a'*64,'tokenizer_model_type':'qwen3','gguf_selection':{}}}}))
-            (src/s.MODEL_SELECTOR).write_text('{"profile": "evil"}\n');self.assertEqual(str(load_module_copy(src,'tmf3_registry_channel').WEIGHT_FILE),'/etc/hosts')
+            (src/s.MODEL_SELECTOR).write_text('{"profile": "evil"}\n')
+            with self.assertRaisesRegex(Exception,'malformed MiroFish model registry'):load_module_copy(src,'tmf3_registry_channel')
             # A staged copy has no registry: the same selector is refused, and the built-in 8B selector takes the built-in pins.
             (src/s.REGISTRY_NAME).unlink()
             with self.assertRaisesRegex(Exception,'unknown MiroFish model profile'):load_module_copy(src,'tmf3_registry_closed')
@@ -460,20 +466,26 @@ class ModelStaging(unittest.TestCase):
         w16=(s.W16/sorted(s.RUN_COPIES)[0]).read_bytes();src=(s.SRC/'mirofish_native_run.py').read_bytes()
         import difflib
         src_lines={l for l in difflib.ndiff(w16.decode().splitlines(),src.decode().splitlines()) if l[:2] in ('- ','+ ')}
+        plan={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
         for name in s.SWARM:
-            for model,threshold in (('qwen3.8-27b',65),('qwen3-8b',47)):
+            for model,threshold in (('qwen3.8-27b',72),('qwen3-8b',56),('ternary-bonsai-2-27b',57),(plan,57)):   # TMF4 addendum 1, ruling (c)
                 n=s.swarm_numbers(name,model);changed=s.swarm_run_bytes(src,name,model,s.RUN_SRC_SHA,threshold).decode()
                 self.assertEqual(changed.count(f'({threshold} if pre else 30)'),1);self.assertEqual(changed.count('if pre else 30)'),1)
+                # TMF2's 11 and the threshold; a one-hour wall leaves the reviewed one-hour freshness cap as it is (a presence check)
+                self.assertEqual(sum(a!=b for a,b in zip(s.integer_literals(src),s.integer_literals(changed.encode()))),12-(n['wall']==3600),(name,str(model)))
                 for text in [f'time.monotonic() + {n["worker_deadline_s"]}',f'deadline=start+{n["wall"]};active=deadline-120',f"receipt['wall_seconds']<={n['wall']}",f'research_only=False,max_age_seconds={n["wall"]})',f'"max_rounds": {n["rounds"]},',
-                             f'<= {n["agents_bound"]}, "actual generated participant count outside bound"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',f'require(len(self.buffer) <= {n["worker_event_bytes"]}, "worker event byte limit")','40*1024**3']:self.assertIn(text,changed,(name,model))
-                if model=='qwen3.8-27b':                                                   # the same deltas as on W16: only the src revision's own lines differ
-                    old=s.swarm_run_bytes(w16,name).decode();self.assertEqual({l for l in difflib.ndiff(old.splitlines(),changed.splitlines()) if l[:2] in ('- ','+ ')},src_lines)
-            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src+b'\n',name,'qwen3-8b',s.RUN_SRC_SHA,47)
-            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src,name,'qwen3-8b',s.RUN_ORIGINAL_SHA,47)   # src bytes are not the W16 original
+                             f'<= {n["agents_bound"]}, "actual generated participant count outside bound"','"MIROFISH_PREP_LLM_TIMEOUT": "570"',f'require(len(self.buffer) <= {n["worker_event_bytes"]}, "worker event byte limit")','40*1024**3']:self.assertIn(text,changed,(name,str(model)))
+            # The same deltas as on W16 (the threshold kept at 65 as a presence check): only the src revision's own lines differ.
+            same=s.swarm_run_bytes(src,name,'qwen3.8-27b',s.RUN_SRC_SHA,65).decode();old=s.swarm_run_bytes(w16,name).decode()
+            self.assertEqual({l for l in difflib.ndiff(old.splitlines(),same.splitlines()) if l[:2] in ('- ','+ ')},src_lines)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src+b'\n',name,'qwen3-8b',s.RUN_SRC_SHA,56)
+            with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_run_bytes(src,name,'qwen3-8b',s.RUN_ORIGINAL_SHA,56)   # src bytes are not the W16 original
         moved=s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671,s.MODEL_SRC_SHA);self.assertIn(b'SDK_PORT = 59671',moved);self.assertNotIn(b'SDK_PORT = 62298',moved)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671)   # against the W16 pin
     def test_outcome5_start_threshold_per_model_and_the_unchanged_fragment_is_a_presence_check(self):
-        self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],47);self.assertEqual(s.model_choice('qwen3.8-27b',self.base)['start_threshold'],65)
+        # TMF4 addendum 1, ruling (c): the formula for whatever is staged through the model path, the 27B included.
+        self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],56);self.assertEqual(s.model_choice('qwen3.8-27b',self.base)['start_threshold'],72)
+        self.assertEqual(s.model_choice('ternary-bonsai-2-27b',self.base)['start_threshold'],57)
         raw=b"x = (65 if pre else 30)\nwall = 3600\n";digest=hashlib.sha256(raw).hexdigest()
         self.assertEqual(s.closed_integer_delta(raw,digest,s.closed([('(65 if pre else 30)','(65 if pre else 30)',1,1),('wall = 3600','wall = 3600',1,1)])),raw)
         with self.assertRaisesRegex(RuntimeError,'fragment missing'):s.closed_integer_delta(raw,digest,s.closed([('(66 if pre else 30)','(66 if pre else 30)',1,1)]))   # still must be present
@@ -487,26 +499,169 @@ class ModelStaging(unittest.TestCase):
             self.assertLess(small['wall'],big['wall']);self.assertLess(small['expected_total_s'],big['expected_total_s'])
         self.assertEqual((s.swarm_numbers('swarm8','qwen3-8b')['wall'],s.swarm_numbers('swarm48','qwen3-8b')['wall']),(3600,18000))
         gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm8','qwen3-8b').decode();self.assertIn('"wall_seconds": 3600,',gateway);self.assertIn('client_seconds: int = 540',gateway)
-    def test_outcome7_staged_q8_folder_is_the_8b_candidate_unlaunched(self):
+    def test_outcome7_staged_q8_folder_is_the_tmf3_proof_and_is_superseded(self):
+        # TMF3's proof folder was staged from the dc14f5e revisions with the 47% threshold. TMF4b moved the pins, so it is
+        # checked as what it is (the earlier tool's proof, still internally consistent), never as a current candidate.
         work=Q8_WORK
         if not (work/'builder/candidate-manifest.json').exists():self.skipTest('the proof folder is staged after the tests')
-        manifest=json.loads((work/'builder/candidate-manifest.json').read_text());pins={row['path']:row['sha256'] for row in manifest['files']};small=s.model_choice('qwen3-8b',self.base)
+        manifest=json.loads((work/'builder/candidate-manifest.json').read_text())
         self.assertFalse(manifest['launch_authorized']);self.assertFalse((work/'root-one-native-attempt.json').exists());self.assertFalse((work/'builder/startup-preflight.json').exists());self.assertFalse((work/'run1').exists())
-        for relative in s.SELECTOR_COPIES:self.assertEqual((work/relative).read_bytes(),b'{"profile": "qwen3-8b"}\n');self.assertEqual(pins[str(work/relative)],s.sha(work/relative))
+        revisions=manifest['model_profile']['src_revisions'];self.assertEqual((revisions['mirofish_native_model.py']['sha256'],revisions['mirofish_native_run.py']['sha256']),(TMF3_MODEL_SRC_SHA,TMF3_RUN_SRC_SHA))
+        self.assertNotEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),(TMF3_MODEL_SRC_SHA,TMF3_RUN_SRC_SHA))
+        for relative in s.RUN_COPIES:self.assertIn(b'(47 if pre else 30)',(work/relative).read_bytes())
+        self.assertFalse(list(work.rglob(s.REGISTRY_NAME)));s.assert_staged(work,manifest)
+# ---- TMF4b (2026-11-15): a plan of two models by phase; TMF4 addenda 1 and 2 -----------------------------------------------
+SRC_REVIEW='blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied afterwards and awaiting their own check)'  # TMF4 addendum 3
+PLAN={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
+PLAN_WORK=s.CREW/'valedia-native-20261115-swarm8-b2q8-a'
+BONSAI_DIR=s.BASE/'models/lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf'
+PLAN_PREDICATE='two pinned models by phase: setup model for preparation and report, turns model for the simulation, swapped at the two boundaries with the gateway idle, the same two probes after each swap'
+def scratch_entry(root,selector=None):
+    """A scratch observer entry holding the pinned src/ revisions (and the gateway they import), with an optional selector."""
+    entry=Path(root)/'owned-source/observer-entry';entry.mkdir(parents=True)
+    for name in ('mirofish_native_model.py','mirofish_native_run.py','mirofish_native_gateway.py'):(entry/name).write_bytes((s.SRC/name).read_bytes())
+    if selector is not None:(entry/s.MODEL_SELECTOR).write_bytes(selector)
+    return entry
+class PlanStaging(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        s.storage_guard();cls.temp_root=s.RESUME/'build/staging-test-tmp';cls.temp_root.mkdir(exist_ok=True);cls.base=base_manifest()
+    def test_tmf4b_src_pins_moved_to_the_tmf4a_revisions_of_this_repository(self):
+        self.assertEqual(s.SRC,Path(s.__file__).absolute().parents[1]/'src')                       # the tool's own repository, never another tree
+        self.assertEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),('e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115','0426dd5a52ad363f92d02149258507f80bf5f9d8fe51f4a1fa066733f0816b50'))
+        self.assertEqual((s.sha(s.SRC/'mirofish_native_model.py'),s.sha(s.SRC/'mirofish_native_run.py')),(s.MODEL_SRC_SHA,s.RUN_SRC_SHA))
+        for text in ['fc99603','38bce8a','TMF4a','addendum 3',SRC_REVIEW]:self.assertIn(text,s.SRC_REVISION_NOTE)
+        self.assertEqual(s.SRC_REVIEW_STATUS,SRC_REVIEW)
+        self.assertEqual(s.BUILTIN_MODELS,('qwen3.8-27b','qwen3-8b','ternary-bonsai-2-27b'))
+    def test_tmf4b_bonsai_choice_pins_its_projector_and_its_selection_size(self):
+        b=s.model_choice('ternary-bonsai-2-27b',self.base);root=s.BASE/'models/Qwen3.8-27B-MLX-4bit';files=b['tokenizer_files']
+        gguf,mmproj=BONSAI_DIR/'Ternary-Bonsai-2-27B-Q2_0.gguf',BONSAI_DIR/'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'
+        self.assertEqual([r['path'] for r in b['model_files']],[str(root/f) for f in files]+[str(gguf),str(mmproj)])
+        self.assertEqual([(r['bytes'],r['sha256']) for r in b['model_files'][-2:]],[(7626008928,'4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e'),(629246976,'6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903')])
+        self.assertEqual(b['model_tokenizer'],self.base['model_tokenizer'])                         # the 27B's tokenizer origin, its reviewed pins
+        self.assertEqual((b['serving_bytes'],b['start_threshold'],b['default'],b['plan'],b['active'],b['limits_key']),(8255255904,57,False,None,'ternary-bonsai-2-27b','ternary-bonsai-2-27b'))
+        self.assertEqual(b['model_files'][-2]['role'],'sole serving GGUF Q2_0 weight; size and SHA-256 checked at staging')
+        self.assertEqual(b['model_files'][-1]['role'],'second file LM Studio loads with the weights (vision projector); loaded and unused; size and SHA-256 checked at staging')
+        self.assertEqual(s.selector_bytes('ternary-bonsai-2-27b'),b'{"profile": "ternary-bonsai-2-27b"}\n')
+        # The selection check follows the profile: LM Studio's sizeBytes is the two files together.
+        entry=copy.deepcopy(b['entry']);s.check_selection('ternary-bonsai-2-27b',entry)
+        for change,why in [(lambda e:e['gguf_selection'].update(sizeBytes=7626008928),'selection disagrees'),(lambda e:e.update(selection_bytes=8255255905),'selection disagrees'),
+                           (lambda e:e.update(second_sha256='X'*64),'hash shape'),(lambda e:e['gguf_selection'].update(maxContextLength=16384),'32,768 window'),(lambda e:e.pop('selection_bytes'),'selection disagrees')]:
+            bad=copy.deepcopy(b['entry']);change(bad)
+            with self.assertRaisesRegex(RuntimeError,why):s.check_selection('ternary-bonsai-2-27b',bad)
+        s.check_selection('qwen3-8b',s.model_choice('qwen3-8b',self.base)['entry'])               # a profile without a second file: weights alone
+    def test_tmf4b_plan_choice_pins_both_members_in_load_order(self):
+        p=s.plan_choice('ternary-bonsai-2-27b','qwen3-8b',self.base);b=s.model_choice('ternary-bonsai-2-27b',self.base);q=s.model_choice('qwen3-8b',self.base)
+        self.assertEqual((p['plan'],p['active'],p['name'],p['limits_key'],p['default']),(PLAN,'ternary-bonsai-2-27b',None,PLAN,False))
+        self.assertEqual([r['path'] for r in p['model_files']],[r['path'] for r in b['model_files']]+[r['path'] for r in q['model_files']])
+        roles=[r['role'] for r in p['model_files']];self.assertEqual(roles[:5],[r['role'] for r in self.base['model_files'][:5]])
+        self.assertTrue(roles[5].startswith('setup and report model ternary-bonsai-2-27b: sole serving GGUF Q2_0 weight') and roles[6].startswith('setup and report model ternary-bonsai-2-27b: second file'))
+        self.assertTrue(roles[12].startswith('turns model qwen3-8b: sole serving GGUF Q4_K_M weight'))
+        self.assertEqual(p['model_tokenizer'],self.base['model_tokenizer']);self.assertEqual(p['tokenizer_by_profile'],{'ternary-bonsai-2-27b':self.base['model_tokenizer'],'qwen3-8b':s.TOKENIZER_PINS['qwen3-8b']})
+        self.assertEqual(p['paths'],b['paths']|q['paths']);self.assertEqual(p['start_threshold'],57);self.assertEqual(p['members_threshold'],{'ternary-bonsai-2-27b':57,'qwen3-8b':56})
+        self.assertEqual(p['selector'],b'{"plan": {"setup": "ternary-bonsai-2-27b", "turns": "qwen3-8b"}}\n');self.assertEqual(s.selector_bytes(plan=PLAN),p['selector'])
+        shared=s.plan_choice('qwen3.8-27b','ternary-bonsai-2-27b',self.base)                       # a tokenizer origin two members share is listed once
+        self.assertEqual(len(shared['model_files']),5+1+2);self.assertEqual(shared['start_threshold'],72)
+        for args,why in [(('qwen3-8b','qwen3-8b'),'two different'),(('qwen9-1b','qwen3-8b'),'unknown model profile'),(('qwen3-8b','qwen3.8-27b-mlx'),'HTTP backends only')]:
+            with self.assertRaisesRegex(RuntimeError,why):s.plan_choice(*args,self.base)
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            registry=Path(folder)/s.REGISTRY_NAME;registry.write_text(json.dumps({'profiles':{'evil':{'native':True}}}))
+            with self.assertRaisesRegex(RuntimeError,'registry-only'):s.plan_choice('evil','qwen3-8b',self.base,registry)
+        for bad in [{'setup':'qwen3-8b'},{'setup':'a','turns':'b','extra':'c'},{'setup':'evil','turns':'qwen3-8b'}]:
+            with self.assertRaises(RuntimeError):s.selector_bytes(plan=bad)
+    def test_tmf4b_plan_helper_and_policy_are_what_the_src_revisions_generate(self):
+        reviewed=(s.W16/s.SDK_HELPER_REL).read_text();big=s.model_choice('qwen3.8-27b',self.base);policy_ports=(self.base['proxy_port'],self.base['graph_port'])
+        choices={'plan':s.plan_choice('ternary-bonsai-2-27b','qwen3-8b',self.base),'bonsai':s.model_choice('ternary-bonsai-2-27b',self.base),'8b':s.model_choice('qwen3-8b',self.base),'27b':big}
+        with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
+            default_work=Path(folder)/'default';scratch_entry(default_work)
+            default_policy=s.src_observer_policy(default_work,*policy_ports)
+            for key,choice in choices.items():
+                work=Path(folder)/key;entry=scratch_entry(work,choice['selector']);module=load_module_copy(entry,'tmf4b_helper_'+key.replace('.','_'))
+                self.assertEqual(s.model_helper_text(reviewed,choice,big),module.SDK_SCRIPT,key)
+                self.assertEqual((module.ACTIVE_MODEL_PROFILE,module.MODEL_PLAN),(choice['active'],choice['plan']),key)
+                staged=s.src_observer_policy(work,*policy_ports)
+                self.assertEqual(s.model_policy(default_policy.replace(str(default_work),str(work)),choice,big),staged,key)
+            self.assertEqual(s.model_helper_text(reviewed,big,big),reviewed)
+            plan_text=s.model_helper_text(reviewed,choices['plan'],big)
+            self.assertIn('const profiles=',plan_text);self.assertIn('"weightSize": 8255255904',plan_text);self.assertIn('"weightSize": 5225374496',plan_text);self.assertNotIn('weightSize=18973870528',plan_text)
+            self.assertEqual(s.model_helper_text(s.sdk_port_helper(reviewed,59671),choices['plan'],big).count('ws://127.0.0.1:59671'),1)
+            self.assertIn('weightSize=8255255904,',s.model_helper_text(reviewed,choices['bonsai'],big))   # the selection size, not the weight file alone
+            plan_policy=s.src_observer_policy(Path(folder)/'plan',*policy_ports)
+            for path in [s.BASE/'models/Qwen3.8-27B-MLX-4bit',s.BASE/'models/Qwen3-8B-tokenizer']:self.assertEqual(plan_policy.count('(subpath "'+str(path)+'")'),1)
+            for path in [BONSAI_DIR/'Ternary-Bonsai-2-27B-Q2_0.gguf',BONSAI_DIR/'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf',s.BASE/'models/lmstudio-library/Qwen/Qwen3-8B/Qwen3-8B-Q4_K_M.gguf']:self.assertEqual(plan_policy.count('(literal "'+str(path)+'")'),1)
+            self.assertNotIn('Qwen3.8-27B-Q4_K_M.gguf',plan_policy)
+            with self.assertRaisesRegex(RuntimeError,'checkpoint rule missing or ambiguous'):s.model_policy(plan_policy,choices['plan'],big)
+            with self.assertRaisesRegex(RuntimeError,'helper checkpoint text'):s.model_helper_text(plan_text,choices['plan'],big)
+    def test_tmf4b_plan_numbers_count_the_post_swap_probes_and_time_each_phase_on_its_model(self):
+        for name,(chats,output,wall,expected) in {'swarm8':(192,800000,5400,3044),'swarm48':(672,2800000,19800,8787)}.items():
+            n=s.swarm_numbers(name,PLAN);big=s.swarm_numbers(name)
+            self.assertEqual((n['chats'],n['output'],n['wall'],n['expected_total_s'],n['worker_deadline_s']),(chats,output,wall,expected,wall-120),name)
+            self.assertEqual((n['probe_chats'],n['swap_chats'],n['reserve_need']),(6,4,6*512+(chats-6)*4096),name)
+            for key in ['gateway_arrival_s','gateway_queue_s','agent_client_s','caller_client_s','request_bytes','worker_event_bytes','window_need','memory_budget','agents_bound']:self.assertEqual(n[key],big[key],(name,key))
+            self.assertEqual(n['setup_s'],s.swarm_numbers(name,'ternary-bonsai-2-27b')['setup_s']);self.assertEqual(n['expected_round_s'],s.swarm_numbers(name,'qwen3-8b')['expected_round_s'])
+        gateway=s.swarm_gateway_bytes((s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes(),'swarm8',PLAN).decode()
+        for text in ['chat_attempts: int = 192','output_total: int = 800000','"wall_seconds": 5400,','client_seconds: int = 540']:self.assertIn(text,gateway)
+    def test_tmf4b_main_refuses_bad_model_options_in_one_line(self):
+        import contextlib,io
+        for argv in (['--profile','swarm8','--setup-model','ternary-bonsai-2-27b'],['--profile','swarm8','--turns-model','qwen3-8b'],
+                     ['--profile','swarm8','--model','qwen3-8b','--setup-model','ternary-bonsai-2-27b','--turns-model','qwen3-8b'],
+                     ['--profile','swarm8','--setup-model','qwen3-8b','--turns-model','qwen3-8b'],['--profile','report64','--setup-model','ternary-bonsai-2-27b','--turns-model','qwen3-8b'],
+                     ['--profile','swarm8','--setup-model','qwen9-1b','--turns-model','qwen3-8b'],['--profile','swarm8','--setup-model','ternary-bonsai-2-27b','--turns-model','qwen3.8-27b-mlx']):
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err):self.assertEqual(s.main(argv),2,argv)
+            self.assertEqual(len(err.getvalue().strip().splitlines()),1,argv);self.assertTrue(err.getvalue().startswith('refused: '),argv)
+    def manifest_for(self,choice,profile='swarm8'):
+        """The fields stage() has set before the model fields are written, from the base manifest."""
+        derived=copy.deepcopy(self.base);derived['staging_profile']={'name':profile}
+        derived['metadata_reuse_impact']={'evidence':s.METADATA_SHA,'scope':'Format conformance reused only: same roles, tools, schemas, LLMClient, SDK/model/tokenizer; ...'}
+        derived['derived_from']={'removed_metadata_prerequisite':'ACTUAL_SUPPORTED_THREE_CASE_METADATA_ACCEPTED'}
+        p=s.swarm_numbers(profile,choice['limits_key']);return s.model_manifest(derived,choice,p,[{'path':'/x/selector','sha256':'0'*64}]),p
+    def test_tmf4b_manifest_states_the_plan_its_pins_and_nothing_borrowed(self):
+        plan=s.plan_choice('ternary-bonsai-2-27b','qwen3-8b',self.base);m,p=self.manifest_for(plan)
+        self.assertEqual((m['model_plan'],m['model_tokenizer_by_profile'],m['model_tokenizer']),(PLAN,plan['tokenizer_by_profile'],self.base['model_tokenizer']))
+        self.assertEqual(m['model_files'],plan['model_files'])
+        self.assertIn(PLAN_PREDICATE,(s.SRC/'mirofish_native_run.py').read_text());self.assertIn(PLAN_PREDICATE,m['runtime_predicates'])   # the words prepare_candidate writes
+        self.assertFalse([x for x in m['runtime_predicates'] if '65pre' in x]);self.assertEqual(len([x for x in m['runtime_predicates'] if x.startswith('57pre/30floor/40GiB owned caps')]),1)
+        self.assertEqual(m['startup_recovery']['start_threshold_staged']['percent_free'],57);self.assertIn('65pre',m['startup_recovery']['caps'])   # the W16 record, labelled
+        for block in ['GGUF_qualification','mlx_profile_recovery']:self.assertTrue(m[block]['applies_to'].startswith('qwen3.8-27b only'),block)
+        self.assertIn('NOT REUSED for ternary-bonsai-2-27b and qwen3-8b',m['metadata_reuse_impact']['scope']);self.assertNotIn('same roles, tools, schemas, LLMClient, SDK/model/tokenizer',m['metadata_reuse_impact']['scope'])
+        self.assertTrue(m['derived_from']['removed_metadata_prerequisite'].startswith('NOT_SHOWN_FOR_TERNARY-BONSAI-2-27B_AND_QWEN3-8B'))
+        mp=m['model_profile'];self.assertEqual((mp['plan'],mp['src_revisions_review']),(PLAN,SRC_REVIEW))
+        for member in PLAN.values():
+            self.assertIn('NOT been shown',mp['members'][member]['format_conformance']);self.assertIn('first run',mp['members'][member]['format_conformance'])
+        self.assertIn('loaded and unused',mp['members']['ternary-bonsai-2-27b']['second_file']['note']);self.assertNotIn('second_file',mp['members']['qwen3-8b'])
+        st=mp['start_threshold'];self.assertEqual((st['percent_free'],st['by_member'],st['reviewed'],st['stop_floor'],st['rss_bound_gib']),(57,{'ternary-bonsai-2-27b':57,'qwen3-8b':56},65,30,40))
+        self.assertIn('ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / installed memory 68719476736) + 5',st['rule'])
+        budget=mp['budgets'];self.assertEqual((budget['post_swap_probe_chats'],budget['post_swap_probe_output']),(4,2048));self.assertIn('(2 + 4) x 512 + (192 - 6) x 4096 = 764928',budget['output'])
+        phases=mp['expected_by_phase'];self.assertEqual((phases['setup_s'],phases['simulation_s'],phases['swaps_s'],phases['report_s'],phases['total_s'],phases['wall_s']),(p['setup_s'],sum(p['expected_round_s']),30,p['report_s'],3044,5400))
+        self.assertIn('ternary-bonsai-2-27b',phases['setup_model']);self.assertIn('qwen3-8b',phases['turns_model'])
+        self.assertIn('first swap settles it',mp['open_points']['identifier_reuse'])
+        self.assertEqual(m['staging_profile']['model_plan'],PLAN)
+    def test_tmf4b_manifest_for_one_named_model(self):
+        m,_=self.manifest_for(s.model_choice('qwen3.8-27b',self.base))                               # the 27B named: its own evidence, the formula's 72
+        self.assertNotIn('applies_to',m['GGUF_qualification']);self.assertNotIn('model_plan',m);self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('72pre/30floor/40GiB')])
+        self.assertIn('same roles, tools, schemas',m['metadata_reuse_impact']['scope'])
+        m,_=self.manifest_for(s.model_choice('qwen3-8b',self.base))
+        self.assertTrue(m['GGUF_qualification']['applies_to'].startswith('qwen3.8-27b only'));self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('56pre/30floor/40GiB')])
+        self.assertIn('NOT REUSED for qwen3-8b',m['metadata_reuse_impact']['scope']);self.assertEqual(m['model_profile']['start_threshold']['percent_free'],56)
+    def test_tmf4b_staged_plan_folder_is_the_plan_candidate_unlaunched(self):
+        work=PLAN_WORK
+        if not (work/'builder/candidate-manifest.json').exists():self.skipTest('the proof folder is staged after the tests')
+        manifest=json.loads((work/'builder/candidate-manifest.json').read_text());pins={row['path']:row['sha256'] for row in manifest['files']};plan=s.plan_choice('ternary-bonsai-2-27b','qwen3-8b',self.base)
+        self.assertFalse(manifest['launch_authorized']);self.assertFalse((work/'root-one-native-attempt.json').exists());self.assertFalse((work/'builder/startup-preflight.json').exists());self.assertFalse((work/'run1').exists())
+        for relative in s.SELECTOR_COPIES:self.assertEqual((work/relative).read_bytes(),plan['selector']);self.assertEqual(pins[str(work/relative)],s.sha(work/relative))
         self.assertFalse(list(work.rglob(s.REGISTRY_NAME)))
         port=manifest['sdk_port_revision']['staged'];src_model=(s.SRC/'mirofish_native_model.py').read_bytes();expected=src_model if port==s.ORIGINAL_SDK_PORT else s.sdk_port_bytes(src_model,port,s.MODEL_SRC_SHA)
         for relative in s.MODEL_COPIES:self.assertEqual((work/relative).read_bytes(),expected)
-        run=s.swarm_run_bytes((s.SRC/'mirofish_native_run.py').read_bytes(),'swarm8','qwen3-8b',s.RUN_SRC_SHA,47)
-        for relative in s.RUN_COPIES:self.assertEqual((work/relative).read_bytes(),run);self.assertIn(b'(47 if pre else 30)',run)
-        self.assertEqual([dict(r) for r in manifest['model_files']],[dict(r,bytes=Path(r['path']).stat().st_size) for r in small['model_files']]);self.assertEqual(manifest['model_tokenizer'],small['model_tokenizer'])
-        text=(work/'builder/candidate-manifest.json').read_text();self.assertNotIn('reviewed on 2026-11-15 (V134), not',text);self.assertIn('found unsafe for registered profiles',text);self.assertIn('C1 to C3',text)
-        self.assertEqual(manifest['model_profile']['source_files'],s.SRC_REVISION_NOTE)
-        p=manifest['model_profile'];self.assertEqual(p['name'],'qwen3-8b');self.assertEqual(p['start_threshold']['percent_free'],47);self.assertIn('decided by the lead',p['start_threshold']['why']);self.assertIn('ab08400',p['source_files']);self.assertIn('V134',p['source_files'])
-        self.assertIn('known to be wrong',p['provenance']['known_wrong']);self.assertEqual(p['provenance']['correct_source']['gguf_sha256'],'a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f')
-        self.assertIn('NOT been shown',manifest['metadata_reuse_impact']['scope']);self.assertNotIn('same roles, tools, schemas, LLMClient, SDK/model/tokenizer',manifest['metadata_reuse_impact']['scope']);self.assertTrue(manifest['derived_from']['removed_metadata_prerequisite'].startswith('NOT_SHOWN_FOR_QWEN3-8B'))
-        self.assertEqual(manifest['swarm_profile']['wall'],3600);self.assertEqual(manifest['swarm_profile']['model'],'qwen3-8b')
-        policy=(work/'builder/observer.sb').read_text();self.assertNotIn('Qwen3.8-27B',policy);self.assertIn(str(s.BASE/'models/Qwen3-8B-tokenizer'),policy)
-        module=s.staged_helper_matches_model(work,port,'qwen3-8b');self.assertEqual(module.WEIGHT_FILE,small['entry']['weight_file'])
+        run=s.swarm_run_bytes((s.SRC/'mirofish_native_run.py').read_bytes(),'swarm8',PLAN,s.RUN_SRC_SHA,57)
+        for relative in s.RUN_COPIES:self.assertEqual((work/relative).read_bytes(),run)
+        self.assertIn(b'(57 if pre else 30)',run)
+        self.assertEqual(manifest['model_files'],[dict(r,bytes=Path(r['path']).stat().st_size) for r in plan['model_files']])
+        self.assertEqual((manifest['model_plan'],manifest['model_tokenizer_by_profile'],manifest['model_tokenizer']),(PLAN,plan['tokenizer_by_profile'],plan['model_tokenizer']))
+        self.assertEqual((manifest['swarm_profile']['wall'],manifest['swarm_profile']['chats'],manifest['swarm_profile']['output']),(5400,192,800000))
+        self.assertEqual(manifest['model_profile']['src_revisions_review'],SRC_REVIEW);self.assertIn(PLAN_PREDICATE,manifest['runtime_predicates'])
+        policy=(work/'builder/observer.sb').read_text();self.assertNotIn('Qwen3.8-27B-Q4_K_M.gguf',policy);self.assertIn(str(BONSAI_DIR/'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'),policy)
+        module=s.staged_helper_matches_model(work,port,plan);self.assertEqual(module.MODEL_PLAN,PLAN)
         s.assert_staged(work,manifest)
 if __name__=='__main__':unittest.main()
 

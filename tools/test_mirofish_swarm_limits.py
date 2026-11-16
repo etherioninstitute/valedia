@@ -116,7 +116,9 @@ class SwarmLimits(unittest.TestCase):
         self.assertEqual({n:L.derive(p)['window_need'] for n,p in S.SWARM.items()},{'swarm8':8099,'swarm48':18749})         # ceil(1.3 B) + 2,774
         self.assertEqual(L.violations(dict(S.SWARM['swarm8'],memory_budget=23072)),[]);self.assertIn('memory budget fits the window at the assumed ratio: 1.30 B + 1750 + 1024 <= 32768',L.violations(dict(S.SWARM['swarm8'],memory_budget=23073)))
     def test_TMF3_models_and_their_speeds(self):
-        self.assertEqual(set(L.MODELS),{'qwen3.8-27b','qwen3-8b'});self.assertEqual(L.DEFAULT_MODEL,'qwen3.8-27b')
+        self.assertEqual(set(L.MODELS),{'qwen3.8-27b','qwen3-8b','ternary-bonsai-2-27b'});self.assertEqual(L.DEFAULT_MODEL,'qwen3.8-27b')
+        bonsai=L.MODELS['ternary-bonsai-2-27b']                                                              # TMF4: the 27B's measured speeds, assumed
+        self.assertEqual((bonsai['read_tps'],bonsai['write_tps'],bonsai['token_ratio_to_27b']),(188.0,23.6,1.0));self.assertIn('ASSUMED',bonsai['speed_source'])
         self.assertEqual((L.MODELS['qwen3.8-27b']['read_tps'],L.MODELS['qwen3.8-27b']['write_tps']),(188.0,23.6))
         self.assertAlmostEqual(L.MODELS['qwen3-8b']['read_tps'],1208*188/260,9);self.assertAlmostEqual(L.MODELS['qwen3-8b']['write_tps'],46.3*188/260,9)
         self.assertIn('ESTIMATE',L.MODELS['qwen3-8b']['speed_source']);self.assertLessEqual(L.MODELS['qwen3-8b']['token_ratio_to_27b'],1.0)
@@ -132,9 +134,96 @@ class SwarmLimits(unittest.TestCase):
         broken=dict(L.MODELS['qwen3-8b'],token_ratio_to_27b=1.01);original=L.MODELS['qwen3-8b'];L.MODELS['qwen3-8b']=broken
         try:self.assertIn('the chosen model needs no more real tokens than the 27B the window was measured on',L.violations(S.SWARM['swarm8'],model='qwen3-8b'))
         finally:L.MODELS['qwen3-8b']=original
-    def test_TMF3_start_threshold_per_model(self):
-        self.assertEqual(L.INSTALLED_MEMORY_BYTES,68719476736)
-        self.assertEqual(L.start_threshold('qwen3-8b',5225374496),47)                                       # 30 + ceil(100 x (5,225,374,496 + 6 GiB) / 64 GiB)
-        self.assertEqual(L.start_threshold('qwen3.8-27b',18973870528),65)                                   # the reviewed value stays
-        self.assertEqual(L.start_threshold('another',18973870528),67)                                       # what the rule alone gives for the 27B's weights
+    # ---- TMF4 (2026-11-15): two models by phase; addendum 1 rulings (c) and (d) -----------------------------------------------
+    def test_TMF4_start_threshold_is_ruling_c_for_every_model_named(self):
+        self.assertEqual(L.INSTALLED_MEMORY_BYTES,68719476736);self.assertEqual((L.STOP_FLOOR_PERCENT,L.REVIEWED_START_THRESHOLD),(30,65))
+        self.assertEqual({m:L.kv_cache_bytes(m) for m in L.MODELS},{'qwen3.8-27b':2147483648,'ternary-bonsai-2-27b':2147483648,'qwen3-8b':4831838208})
+        # 30 + ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / 64 GiB) + 5
+        self.assertEqual(L.start_threshold('qwen3-8b',5225374496),56)                                       # (5,225,374,496 + 4,831,838,208 + 4 GiB): 20.9% -> 21
+        self.assertEqual(L.start_threshold('ternary-bonsai-2-27b',8255255904),57)                           # weights + projector 8,255,255,904: 21.4% -> 22
+        self.assertEqual(L.start_threshold('qwen3.8-27b',18973870528),72)                                   # 37.0% -> 37; the default path keeps 65
+        self.assertEqual(L.plan_start_threshold({'ternary-bonsai-2-27b':8255255904,'qwen3-8b':5225374496}),57)   # the larger member's
+        self.assertEqual(L.plan_start_threshold({'qwen3.8-27b':18973870528,'ternary-bonsai-2-27b':8255255904}),72)
+        self.assertFalse(hasattr(L,'MODEL_HEADROOM_BYTES'))                                                  # TMF3's weights + 6 GiB rule is gone
+        with self.assertRaises(ValueError):L.start_threshold('another',18973870528)
+    def test_TMF4_context_cache_counts_are_each_models_own(self):
+        root=Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models')
+        big=json.loads((root/'Qwen3.8-27B-MLX-4bit/config.json').read_text())['text_config']
+        self.assertEqual((big['num_hidden_layers'],big['full_attention_interval'],big['num_key_value_heads'],big['head_dim']),(64,4,4,256))
+        self.assertEqual(sum(x=='full_attention' for x in big['layer_types']),16);self.assertEqual(big['num_hidden_layers']//big['full_attention_interval'],L.MODELS['qwen3.8-27b']['attention_layers'])
+        self.assertEqual((L.MODELS['qwen3.8-27b']['kv_heads'],L.MODELS['qwen3.8-27b']['head_dim']),(4,256))
+        small=json.loads((root/'Qwen3-8B-tokenizer/config.json').read_text())
+        self.assertEqual((small['num_hidden_layers'],small['num_key_value_heads'],small['head_dim'],small.get('use_sliding_window')),(36,8,128,False))
+        self.assertEqual((L.MODELS['qwen3-8b']['attention_layers'],L.MODELS['qwen3-8b']['kv_heads'],L.MODELS['qwen3-8b']['head_dim']),(36,8,128))
+        gguf=root/'lmstudio-library/prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-Q2_0.gguf'
+        if not gguf.is_file():self.skipTest('Bonsai 2 weights are not on this machine')
+        h=gguf_metadata(gguf,{'qwen35.block_count','qwen35.full_attention_interval','qwen35.attention.head_count_kv','qwen35.attention.key_length','qwen35.attention.value_length'})
+        self.assertEqual(h,{'qwen35.block_count':64,'qwen35.full_attention_interval':4,'qwen35.attention.head_count_kv':4,'qwen35.attention.key_length':256,'qwen35.attention.value_length':256})
+        b=L.MODELS['ternary-bonsai-2-27b'];self.assertEqual((b['attention_layers'],b['kv_heads'],b['head_dim']),(64//4,4,256))
+    def test_TMF4_a_plan_names_two_different_models(self):
+        self.assertEqual(L.plan_members('qwen3-8b'),('qwen3-8b','qwen3-8b',0))
+        self.assertEqual(L.plan_members(PLAN),('ternary-bonsai-2-27b','qwen3-8b',2))
+        for bad in [{'setup':'qwen3-8b','turns':'qwen3-8b'},{'setup':'qwen3-8b'},{'setup':'qwen3-8b','turns':'qwen9-1b'},['qwen3-8b'],None,{'setup':'qwen3-8b','turns':'ternary-bonsai-2-27b','x':1}]:
+            with self.assertRaises(ValueError,msg=repr(bad)):L.derive(S.SWARM['swarm8'],bad)
+        self.assertEqual(L.model_label(PLAN),'ternary-bonsai-2-27b (setup and report) + qwen3-8b (turns)')
+    def test_TMF4_single_models_keep_their_numbers_and_bonsai_alone_runs_at_the_27b_speeds(self):
+        for name,profile in S.SWARM.items():
+            big=L.derive(profile);bonsai=L.derive(profile,'ternary-bonsai-2-27b')
+            self.assertEqual({k:v for k,v in bonsai.items() if k!='model'},{k:v for k,v in big.items() if k!='model'},name)
+            for model in L.MODELS:
+                d=L.derive(profile,model);self.assertNotIn('swaps',d);self.assertNotIn('swap_chats',d);self.assertEqual(L.violations(profile,d,model),[],(name,model))
+    def test_TMF4_plan_budgets_add_the_four_post_swap_probes(self):
+        for name,profile in S.SWARM.items():
+            d=L.derive(profile,PLAN);one=L.derive(profile,'qwen3-8b')
+            self.assertEqual((d['swaps'],d['swap_chats'],d['probe_chats']),(2,4,6),name)
+            self.assertEqual(d['expected_chats'],one['expected_chats']+4);self.assertEqual(d['bound_chats'],one['bound_chats']+4)
+            self.assertEqual(d['reserve_need'],(2+4)*512+(d['chats']-6)*4096,name);self.assertGreaterEqual(d['output'],d['reserve_need'])
+            self.assertEqual(L.violations(profile,d,PLAN),[],name)
+        d=L.derive(S.SWARM['swarm8'],PLAN)
+        self.assertEqual((d['chats'],d['expected_chats'],d['bound_chats'],d['reserve_need'],d['output']),(192,121,143,764928,800000))   # (2 + 4) x 512 + (192 - 6) x 4096
+        d=L.derive(S.SWARM['swarm48'],PLAN)
+        self.assertEqual((d['chats'],d['expected_chats'],d['bound_chats'],d['reserve_need'],d['output']),(672,436,525,2731008,2800000))
+    def test_TMF4_plan_durations_follow_each_phase_model_and_limits_stay_the_27b(self):
+        expected={'swarm8':{'setup_s':1085,'ceiling_setup_s':1256,'expected_round_s':[184,216,216],'ceiling_sim_s':973,'report_s':1179,'swap_s':30,'ceiling_swaps_s':639,
+                            'expected_total_s':3044,'ceiling_total_s':4182,'wall':5400,'worker_deadline_s':5280,'history_records':13501,'history_mib':32},
+                  'swarm48':{'setup_s':3536,'ceiling_setup_s':4220,'expected_round_s':[1061,1302,1544],'ceiling_sim_s':10107,'report_s':1179,'swap_s':30,
+                             'expected_total_s':8787,'ceiling_total_s':16279,'wall':19800,'worker_deadline_s':19680,'history_records':49501,'history_mib':96}}
+        for name,want in expected.items():
+            profile=S.SWARM[name];d=L.derive(profile,PLAN);big=L.derive(profile);bonsai=L.derive(profile,'ternary-bonsai-2-27b');small=L.derive(profile,'qwen3-8b')
+            self.assertEqual({k:d[k] for k in want},want,name)
+            self.assertEqual((d['setup_s'],d['report_s']),(bonsai['setup_s'],bonsai['report_s']),name)              # setup and report at the setup model's speed
+            self.assertEqual((d['expected_round_s'],d['ceiling_sim_s']),(small['expected_round_s'],small['ceiling_sim_s']),name)   # the turns at the turns model's
+            self.assertLessEqual(abs(d['expected_total_s']-(15+d['setup_s']+sum(d['expected_round_s'])+d['swap_s']+d['report_s']+120)),3,name)   # start, phases, swaps, cleanup (rounded parts)
+            self.assertGreaterEqual(d['wall'],1.2*d['ceiling_total_s']);self.assertEqual(d['wall']%1800,0)
+            for key in ['agent_worst_s','caller_worst_s','agent_slot_s','caller_slot_s','gateway_arrival_s','gateway_queue_s','agent_client_s','caller_client_s','embedding_client_s','request_bytes','worker_event_bytes','window_need','largest_budget']:
+                self.assertEqual(d[key],big[key],(name,key))
+        self.assertAlmostEqual(L.probe_ceiling_seconds('qwen3-8b'),512/L.MODELS['qwen3-8b']['read_tps']+512/L.MODELS['qwen3-8b']['write_tps']+27,9)
+        self.assertAlmostEqual(L.swap_ceiling_seconds('ternary-bonsai-2-27b'),45+180+2*(512/188+512/23.6+27),9)
+        self.assertEqual(round(L.derive(S.SWARM['swarm8'],PLAN)['ceiling_swaps_s']),round(L.swap_ceiling_seconds('qwen3-8b')+L.swap_ceiling_seconds('ternary-bonsai-2-27b')))
+    def test_TMF4_a_plan_that_drops_its_swap_probes_is_named(self):
+        good=S.SWARM['swarm8'];d=L.derive(good,PLAN)
+        self.assertIn('model calls allowed count the probes after each swap of a plan',L.violations(good,dict(d,swap_chats=0),PLAN))
+        self.assertIn('model calls allowed count the probes after each swap of a plan',L.violations(good,dict(d,probe_chats=2),PLAN))
+        self.assertIn('output budget lets every admitted call reserve its cap',L.violations(good,dict(d,reserve_need=2*512+(d['chats']-2)*4096-1,output=2*512+(d['chats']-2)*4096-1),PLAN))
+PLAN={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
+def gguf_metadata(path,keys):
+    """The named scalar keys of a GGUF file's header (read-only: the header only, arrays skipped by their lengths)."""
+    import struct
+    size={0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8};fmt={0:'<B',1:'<b',2:'<H',3:'<h',4:'<I',5:'<i',6:'<f',7:'<?',10:'<Q',11:'<q',12:'<d'};out={}
+    with open(path,'rb') as f:
+        assert f.read(4)==b'GGUF';f.read(4);_,count=struct.unpack('<QQ',f.read(16))
+        def text():n,=struct.unpack('<Q',f.read(8));return f.read(n).decode()
+        for _ in range(count):
+            key=text();kind,=struct.unpack('<I',f.read(4))
+            if kind==8:value=text()
+            elif kind==9:
+                item,=struct.unpack('<I',f.read(4));n,=struct.unpack('<Q',f.read(8))
+                if item==8:
+                    for _ in range(n):m,=struct.unpack('<Q',f.read(8));f.seek(m,1)
+                else:f.seek(size[item]*n,1)
+                value=None
+            else:value=struct.unpack(fmt[kind],f.read(size[kind]))[0]
+            if key in keys:out[key]=value
+            if set(out)==set(keys):break
+    return out
 if __name__=='__main__':unittest.main()
