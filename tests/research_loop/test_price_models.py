@@ -274,3 +274,17 @@ def test_ask_kronos_settles_only_the_questions_of_its_own_market(tmp_path, monke
     assert {("funds", "BTC-USD"), ("crypto", "BTC-USD")} <= on_day
     assert ("funds", "BTC-USD") in settled and ("crypto", "BTC-USD") not in settled    # five calendar days, not five weekdays
     led.close()
+
+
+def test_kronos_answers_carry_its_own_model_release_date_and_fingerprint(tmp_path):
+    ohlc = market_ohlc()
+    idx = ohlc["close"].index
+    led = ledger_with_questions(tmp_path, ohlc, [idx[500], idx[510]])
+    fc, _ = fake_forecaster(tmp_path)
+    holed = {k: v.drop(index=idx[505:511]) for k, v in ohlc.items()}           # the second day has no window: an error row
+    out = pm.ask_price_model(led, fc, holed, not_before="2020-01-01")
+    fc.close()
+    rows = led._db.execute("SELECT error IS NULL, model, unseen_after, prompt_sha FROM forecasts").fetchall()
+    led.close()
+    assert out["asked"] == 4 and {r[0] for r in rows} == {0, 1}
+    assert {tuple(r[1:]) for r in rows} == {("kronos-small", "2025-06-30", "price-model")}

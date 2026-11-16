@@ -129,6 +129,7 @@ def test_a_forecaster_that_repeats_the_baseline_is_not_distinguishable_from_it(t
     base = {q["thesis"] + q["asked_on"]: q["baseline"] for q in led.questions()}
     tm.ask(led, [CallableMember("echo", "decider", lambda case: (base[case["thesis"] + case["facts"]["as_of"]], None, ""))])
     tm.settle_directions(led, px)
+    answered_on_the_day(led)
     s = tm.scores(led, min_settled=30)[0]
     assert s["skill"] == pytest.approx(0.0, abs=1e-12) and s["verdict"] == "not distinguishable from the baseline"
     led.close()
@@ -168,7 +169,15 @@ def _filled(forecasters, outcomes, baseline=0.5, market_name="funds", kind="forw
         for name, fn in forecasters.items():
             led.record(f"q{k}", name, fn(y, k), None, 1.0)
         led.settle(f"q{k}", y)
+    answered_on_the_day(led)
     return led
+
+
+def answered_on_the_day(led, days_late=0):
+    """Stamp every answer as given `days_late` days after its question's day (a forward answer is live within 3)."""
+    led._db.execute("UPDATE forecasts SET ts = (SELECT CAST(strftime('%s', q.asked_on) AS REAL) + 3600 + ? * 86400 FROM questions q "
+                    "WHERE q.id = forecasts.question_id)", (days_late,))
+    led._db.commit()
 
 
 def _mixed(n=80, seed=3):
@@ -599,6 +608,8 @@ OLD_SCHEMA = (                                     # the tables exactly as the t
     "CREATE TABLE IF NOT EXISTS outcomes (question_id TEXT PRIMARY KEY, outcome INTEGER, settled_ts REAL);")
 PROMPT_SHA = hashlib.sha1(panel_mod.PROMPT.encode()).hexdigest()[:12]
 NOT_EVIDENCE = "not evidence: the model may remember these dates"
+LATE = "not evidence: answered after the question was fresh"
+UNKNOWN_CALLABLE = "unknown:CallableMember"
 SKILL_WORDS = ("beats", "better than")
 
 
@@ -612,7 +623,8 @@ def _old_file(path):
         db.execute("INSERT INTO questions VALUES (?,?,?,?,?,?,?,?,?)",
                    (f"q{k}", "funds", kind, str((day0 + pd.Timedelta(days=7 * k)).date()), 5, "AAA", "t", "{}", 0.5))
         for who, p in (("old-model", 0.7), ("rule-momentum", 0.6)):
-            db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{k}", who, p, None, 1.0, 1700000000.0 + k))
+            db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{k}", who, p, None, 1.0,
+                                                                     pd.Timestamp(day0 + pd.Timedelta(days=7 * k), tz="UTC").timestamp() + 3600))
         db.execute("INSERT INTO outcomes VALUES (?,?,?)", (f"q{k}", k % 2, 1700000000.0 + k))
     db.commit()
     db.close()
@@ -668,33 +680,46 @@ def test_a_read_only_open_of_an_old_file_is_scored_without_a_schema_change(tmp_p
     assert all(r["verdict"] == NOT_EVIDENCE for r in out if r["memory"] == "may be remembered")
 
 
-@pytest.mark.parametrize("kind, model, unseen_after, asked_on, memory", [
-    ("forward", "m", None, "2025-07-01", "asked live"),
-    ("forward", None, None, "2020-01-06", "asked live"),
-    ("blind history", "rule", None, "2020-01-06", "no memory"),
-    ("blind history", "m", "2025-06-30", "2025-07-01", "after release"),
-    ("blind history", "m", "2025-06-30", "2025-06-30", "may be remembered"),     # the release day itself is not after it
-    ("blind history", "m", "2025-06-30", "2025-06-27", "may be remembered"),
-    ("blind history", "m", None, "2025-07-01", "may be remembered"),
-    ("blind history", None, None, "2025-07-01", "may be remembered"),
-    ("blind history", None, "2025-06-30", "2025-07-01", "after release"),
-    ("blind history", "m", "not a date", "2025-07-01", "may be remembered"),
+@pytest.mark.parametrize("kind, model, unseen_after, asked_on, days_late, memory", [
+    ("forward", "m", None, "2025-07-01", 0, "asked live"),
+    ("forward", None, None, "2020-01-06", 0, "asked live"),
+    ("forward", "m", None, "2025-07-01", 3, "asked live"),                       # 3 calendar days late is still live
+    ("forward", "m", None, "2025-07-01", 4, "answered late"),
+    ("forward", "m", None, "2025-07-01", 10, "answered late"),
+    ("forward", "m", None, "2025-07-01", None, "answered late"),                 # no usable time
+    ("blind history", "rule", None, "2020-01-06", 0, "no memory"),
+    ("blind history", "m", "2025-06-30", "2025-07-01", 0, "after release"),
+    ("blind history", "m", "2025-06-30", "2025-06-30", 0, "may be remembered"),  # the release day itself is not after it
+    ("blind history", "m", "2025-06-30", "2025-06-27", 0, "may be remembered"),
+    ("blind history", "m", None, "2025-07-01", 0, "may be remembered"),
+    ("blind history", None, None, "2025-07-01", 0, "may be remembered"),
+    ("blind history", None, "2025-06-30", "2025-07-01", 0, "after release"),
+    ("blind history", "m", "not a date", "2025-07-01", 0, "may be remembered"),
+    ("blind history", "m", "2025-06-30", "2025-07-01", 400, "after release"),    # lateness does not matter to a blind question
 ])
-def test_each_scored_row_has_the_memory_class_the_rules_give(kind, model, unseen_after, asked_on, memory):
+def test_each_scored_row_has_the_memory_class_the_rules_give(kind, model, unseen_after, asked_on, days_late, memory):
     led = tm.TournamentLedger()
     led.add([tm.Question("q", "funds", kind, asked_on, 5, "AAA", "t", {}, 0.5)])
     led.record("q", "who", 0.7, None, 1.0, model=model, unseen_after=unseen_after, prompt_sha=PROMPT_SHA)
     led.settle("q", 1)
+    if days_late is None:
+        led._db.execute("UPDATE forecasts SET ts = NULL")
+    else:
+        answered_on_the_day(led, days_late)
     (row,) = tm.scores(led, min_settled=1)
     led.close()
     assert (row["model"], row["prompt_sha"], row["memory"]) == (model, PROMPT_SHA, memory)
-    assert (row["verdict"] == NOT_EVIDENCE) == (memory == "may be remembered")
+    assert row["verdict"] == {"may be remembered": NOT_EVIDENCE, "answered late": LATE}.get(memory, row["verdict"])
+    assert (row["verdict"] in (NOT_EVIDENCE, LATE)) == (memory in ("may be remembered", "answered late"))
 
 
-def _expected_memory(kind, model, unseen_after, asked_on):
+def _expected_memory(kind, model, unseen_after, asked_on, ts):
     """The memory rules written out again here, independently of the code under test."""
     if kind == "forward":
-        return "asked live"
+        if ts is None:
+            return "answered late"
+        late = (pd.Timestamp(ts, unit="s", tz="UTC").date() - pd.Timestamp(asked_on).date()).days
+        return "asked live" if late <= 3 else "answered late"
     if model == "rule":
         return "no memory"
     if unseen_after is not None and pd.Timestamp(asked_on).date() > pd.Timestamp(unseen_after).date():
@@ -724,6 +749,9 @@ def _pooling_ledger(module, seed):
             failed = rng.random() < 0.1
             led.record(f"q{k:03d}", who, None if failed else float(rng.uniform(0, 1)), "failed" if failed else None, 1.0,
                        model=model, unseen_after=unseen, prompt_sha=sha)
+            late = [0, 1, 3, 4, 10, None][int(rng.integers(0, 6))]
+            led._db.execute("UPDATE forecasts SET ts = ? WHERE question_id = ? AND forecaster = ?",
+                            (None if late is None else pd.Timestamp(day, tz="UTC").timestamp() + 7200 + 86400 * late, f"q{k:03d}", who))
         if rng.random() < 0.85:
             led.settle(f"q{k:03d}", int(rng.integers(0, 2)))
     return led
@@ -735,10 +763,10 @@ def pooling_violations(module, seeds=range(60)) -> list:
     for seed in seeds:
         led = _pooling_ledger(module, seed)
         raw = led._db.execute(
-            "SELECT f.forecaster, f.model, f.unseen_after, f.prompt_sha, q.market, q.kind, q.asked_on FROM forecasts f "
+            "SELECT f.forecaster, f.model, f.unseen_after, f.prompt_sha, q.market, q.kind, q.asked_on, f.ts FROM forecasts f "
             "JOIN questions q ON q.id = f.question_id JOIN outcomes o ON o.question_id = q.id "
             "WHERE f.error IS NULL AND f.probability IS NOT NULL").fetchall()
-        want = Counter((r[0], r[1], r[3], r[4], r[5], _expected_memory(r[5], r[1], r[2], r[6])) for r in raw)
+        want = Counter((r[0], r[1], r[3], r[4], r[5], _expected_memory(r[5], r[1], r[2], r[6], r[7])) for r in raw)
         out = module.scores(led, min_settled=1)
         led.close()
         got = Counter()
@@ -811,9 +839,9 @@ def test_ask_records_the_rosters_model_and_date_and_rule_for_a_rule():
     led.settle("q", 1)
     memory = {r["forecaster"]: r["memory"] for r in tm.scores(led, min_settled=1)}
     led.close()
-    assert got == {"chatty": ("qwen3:8b", None, PROMPT_SHA), "labelled": ("qwen3:8b@500a1f067a9f", "2025-04-29", PROMPT_SHA),
-                   "profiled": (None, None, PROMPT_SHA), "stranger": (None, None, PROMPT_SHA),
-                   "rule-momentum": ("rule", None, PROMPT_SHA), "rule-above-200d": ("rule", None, PROMPT_SHA)}
+    assert got == {"chatty": ("qwen3:8b", None, UNKNOWN_CALLABLE), "labelled": ("qwen3:8b@500a1f067a9f", "2025-04-29", UNKNOWN_CALLABLE),
+                   "profiled": (None, None, UNKNOWN_CALLABLE), "stranger": (None, None, UNKNOWN_CALLABLE),
+                   "rule-momentum": ("rule", None, "rule"), "rule-above-200d": ("rule", None, "rule")}
     assert memory == {"chatty": "may be remembered", "labelled": "after release", "profiled": "may be remembered",
                       "stranger": "may be remembered", "rule-momentum": "no memory", "rule-above-200d": "no memory"}
 
@@ -825,7 +853,7 @@ def test_ask_without_a_roster_reads_the_panels_own_roster():
     tm.ask(led, [CallableMember("qwen3-8b", "decider", lambda case: (0.6, None, ""))])
     got = tuple(led._db.execute("SELECT model, unseen_after, prompt_sha FROM forecasts").fetchone())
     led.close()
-    assert got == (spec.get("model_label") or spec["model"], spec.get("unseen_after"), PROMPT_SHA)
+    assert got == (spec.get("model_label") or spec["model"], spec.get("unseen_after"), UNKNOWN_CALLABLE)
 
 
 def test_the_roster_carries_the_three_fields_unset_and_still_builds_a_panel():
@@ -847,7 +875,7 @@ def test_the_price_models_view_of_the_ledger_still_records_the_rules(tmp_path):
     rows = led._db.execute("SELECT question_id, forecaster, model, prompt_sha FROM forecasts ORDER BY 1, 2").fetchall()
     led.close()
     assert out == {"rule-momentum": {"asked": 2, "answered": 2}, "rule-above-200d": {"asked": 2, "answered": 2}}
-    assert [tuple(r) for r in rows] == [(q, w, "rule", PROMPT_SHA) for q in ("q0", "q2") for w in ("rule-above-200d", "rule-momentum")]
+    assert [tuple(r) for r in rows] == [(q, w, "rule", "rule") for q in ("q0", "q2") for w in ("rule-above-200d", "rule-momentum")]
 
 
 def test_an_old_file_this_process_may_not_write_is_still_scored(tmp_path):
@@ -873,3 +901,101 @@ def test_a_roster_member_cannot_take_the_rule_forecasters_model_name():
         tm.ask(led, [member], roster={"members": [{"name": "sly", "role": "decider", "model_label": "rule"}]})
     assert calls == [] and led.counts()["answers"] == {}
     led.close()
+
+
+# ---- addendum 1: late forward answers, the fingerprint of what each member sends, two writers at once ---------------
+
+REPLY = '{"probability": 0.6, "veto": false, "rationale": "r"}'
+
+
+def test_each_member_class_records_the_fingerprint_of_the_request_it_really_sends():
+    sent = {}
+    chat = panel_mod.ChatMember("chat", "decider", "http://127.0.0.1:9/v1", "qwen3:8b",
+                                transport=lambda url, body, timeout: sent.setdefault("chat", body["messages"][0]["content"]) and
+                                {"choices": [{"message": {"content": REPLY}}]})
+    hermes = panel_mod.HermesProfileMember("herm", "decider", "p", runner=lambda argv, timeout: sent.setdefault("herm", argv[argv.index("-z") + 1])
+                                           and REPLY)
+    class OwnChat(panel_mod.ChatMember):                               # a subclass may send something else
+        pass
+    sub = OwnChat("sub", "decider", "http://127.0.0.1:9/v1", "qwen3:8b", transport=lambda url, body, timeout: {"choices": [{"message": {"content": REPLY}}]})
+    led = tm.TournamentLedger()
+    q = tm.Question("q", "funds", "blind history", "2025-07-01", 5, "AAA", "This asset closes higher", {"n": 1}, 0.5)
+    led.add([q])
+    tm.ask(led, [chat, hermes, sub, CallableMember("call", "decider", lambda case: (0.6, None, ""))] + tm.reference_forecasters(),
+           roster={"members": []})
+    got = dict(led._db.execute("SELECT forecaster, prompt_sha FROM forecasts").fetchall())
+    led.close()
+    case = json.dumps({"thesis": q.thesis, "facts": q.facts}, sort_keys=True, default=str)
+    assert sent == {"chat": panel_mod.PROMPT.format(name="chat", role="decider", case=case),         # both really send PROMPT
+                    "herm": panel_mod.PROMPT.format(name="herm", role="decider", case=case)}
+    assert got == {"chat": PROMPT_SHA, "herm": PROMPT_SHA, "sub": "unknown:OwnChat", "call": UNKNOWN_CALLABLE,
+                   "rule-momentum": "rule", "rule-above-200d": "rule"}
+    nimble = panel_mod.SystemOneMember("nimble", "decider", transport=lambda *a: (_ for _ in ()).throw(AssertionError("no call")))
+    assert tm.prompt_fingerprint(nimble) == "unknown:SystemOneMember"   # its request is built inside _ask, no template to hash
+
+
+def late_perfect_row(module, days_late, n=60):
+    """A perfect forecaster on `n` weekly forward questions, every answer given `days_late` days after the question's day."""
+    led = module.TournamentLedger()
+    outcomes = _mixed(n, seed=11)
+    day0 = pd.Timestamp("2024-01-01")
+    for k, y in enumerate(outcomes):
+        day = (day0 + pd.Timedelta(days=7 * k)).date()
+        led.add([module.Question(f"q{k}", "funds", "forward", str(day), 5, "AAA", "AAA closes higher", {}, 0.3 + 0.04 * ((7 * k) % 11))])
+        led.record(f"q{k}", "oracle", float(y), None, 1.0, model="m", prompt_sha=PROMPT_SHA)
+        led.settle(f"q{k}", y)
+    answered_on_the_day(led, days_late)
+    (row,) = module.scores(led, min_settled=30)
+    led.close()
+    return row
+
+
+def test_a_perfect_forward_forecaster_answering_ten_days_late_is_not_evidence():
+    late, live = late_perfect_row(tm, 10), late_perfect_row(tm, 0)
+    assert late["memory"] == "answered late" and late["verdict"] == LATE and late["ranking_verdict"] == LATE
+    assert late["skill"] == pytest.approx(1.0) and late["skill"] == live["skill"]          # the numbers are still reported
+    assert live["memory"] == "asked live" and live["verdict"] == "beats the baseline" and live["ranking_verdict"] == "ranks better than chance"
+
+
+def test_the_live_window_is_the_asking_windows_default():
+    import inspect
+    assert tm.MAX_LIVE_AGE_DAYS == 3 and inspect.signature(tm.ask).parameters["max_age_days"].default == tm.MAX_LIVE_AGE_DAYS
+
+
+def test_ask_blind_never_puts_a_forward_question(tmp_path, monkeypatch, capsys):
+    folder = _price_folder(tmp_path)
+    ledger_path = tmp_path / "t.sqlite"
+    led = tm.TournamentLedger(ledger_path)                                      # forward questions already on file, unanswered
+    led.add([tm.Question(f"funds:S{k}:2024-03-0{k + 1}:5d", "funds", "forward", f"2024-03-0{k + 1}", 5, f"S{k}", f"forward {k}", {"n": k}, 0.5)
+             for k in range(3)])
+    led.close()
+    calls, fn = _recorder()
+    monkeypatch.setattr(tm, "forecasters", lambda names=None, roster=None: [CallableMember("m", "decider", fn)])
+    args = ["--root", str(tmp_path), "--ledger", str(ledger_path), "ask-blind", "--data", str(folder), "--market", "funds", "--count", "6"]
+    assert tm.main(args + ["--with-rules"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    led = tm.TournamentLedger(ledger_path)
+    kinds = {r[0] for r in led._db.execute("SELECT q.kind FROM forecasts f JOIN questions q ON q.id = f.question_id")}
+    led.close()
+    assert calls and not any(t.startswith("forward") for t in calls) and kinds == {"blind history"}
+    assert out["asked"]["m"]["asked"] == len(calls) == out["questions_added"]
+
+
+def test_two_writers_adding_the_columns_at_once_both_open_and_the_columns_exist_once(tmp_path, monkeypatch):
+    path = tmp_path / "t.sqlite"
+    _old_file(path)
+    old = {"question_id", "forecaster", "probability", "error", "latency_ms", "ts"}
+    monkeypatch.setattr(tm, "_forecast_columns", lambda db: set(old))          # both writers looked before either changed it
+    first = tm.TournamentLedger(path)
+    second = tm.TournamentLedger(path)                                         # every ALTER of its own finds a duplicate column
+    monkeypatch.undo()
+    first.record("q0", "a", 0.6, None, 1.0, model="m1", prompt_sha="s1")
+    second.record("q1", "b", 0.4, None, 1.0, model="m2", prompt_sha="s2")
+    first.close()
+    second.close()
+    cols, _ = _columns(path)
+    assert cols == ["question_id", "forecaster", "probability", "error", "latency_ms", "ts", "model", "unseen_after", "prompt_sha"]
+    db = sqlite3.connect(path)
+    got = db.execute("SELECT forecaster, model, prompt_sha FROM forecasts WHERE forecaster IN ('a', 'b') ORDER BY 1").fetchall()
+    db.close()
+    assert got == [("a", "m1", "s1"), ("b", "m2", "s2")]

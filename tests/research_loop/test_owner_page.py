@@ -410,7 +410,8 @@ def test_the_forecasters_table_shows_which_model_answered_and_what_it_may_rememb
     assert re.findall(r"<th>(.*?)</th>", part) == ["Forecaster", "Model", "Market", "Kind", "Memory", "Settled", "Brier",
                                                    "Baseline Brier", "Skill", "Verdict"]
     text = world.page().sections["Forecasters"]
-    assert text.count("not recorded") == 3 and text.count("asked live") == 3      # recorded without a model, forward questions
+    assert text.count("not recorded") == 3 and text.count("answered late") == 3   # recorded without a model, weeks after the questions
+    assert text.count("not evidence: answered after the question was fresh") == 3
 
 
 OLD_TOURNAMENT_SCHEMA = (
@@ -429,7 +430,8 @@ def test_the_forecasters_table_renders_an_old_tournament_file_and_leaves_it_alon
     for i in range(12):
         kind = "forward" if i < 4 else "blind history"
         db.execute("INSERT INTO questions VALUES (?,?,?,?,?,?,?,?,?)", (f"q{i}", "funds", kind, f"2026-10-{i + 1:02d}", 5, "SPY", "t", "{}", 0.6))
-        db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{i}", "nimble-v3", 0.7, None, 10.0, NOW - 3600))
+        answered = pd.Timestamp(f"2026-10-{i + 1:02d}", tz="UTC").timestamp() + 3600     # on the question's own day
+        db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{i}", "nimble-v3", 0.7, None, 10.0, answered))
         db.execute("INSERT INTO outcomes VALUES (?,?,?)", (f"q{i}", i % 2, NOW - 3600))
     db.commit()
     db.close()
