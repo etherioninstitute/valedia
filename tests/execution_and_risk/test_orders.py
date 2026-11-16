@@ -1215,22 +1215,23 @@ def test_an_average_without_an_amount_is_not_used():
 
 
 def test_a_fee_total_that_falls_beside_a_rise_in_units_drops_only_the_fee():
+    # T34b-3 (A3): a fall that stays at or above zero is a notice and the order's total follows; the row has no fee
     led, venue, _ = _accepted()
     venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=1.0)
     led.reconcile(venue, {})
     venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.5)
     result = led.reconcile(venue, {})
-    assert [a["tag"] for a in result["anomalies"]] == [TAG] and "fee" in result["anomalies"][0]["reason"]
+    assert result["anomalies"] == [] and [n["kind"] for n in result["notices"]] == ["fee_fell"]
     (row,) = result["fills"]
     assert (row["units"], row["fee"], row["price"], row["price_covers_units"]) == (2.0, None, 90.0, 2.0)
     rec = led.order(TAG)
-    assert rec["filled_units"] == 6.0 and rec["fee"] == 1.0 and not result["clean"]
+    assert rec["filled_units"] == 6.0 and rec["fee"] == 0.5
     venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=90.0, fee=0.5)
-    again = led.reconcile(venue, {})                                   # still lower: still an anomaly, no new row
-    assert again["fills"] == [] and [a["tag"] for a in again["anomalies"]] == [TAG]
+    again = led.reconcile(venue, {})                                   # the same lower total: nothing new
+    assert again["fills"] == [] and again["anomalies"] == [] and again["notices"] == []
     venue.set(TAG, state="partly_filled", filled_units=7.0, avg_price=90.0, fee=1.25)
     (row,) = led.reconcile(venue, {})["fills"]
-    assert (row["units"], row["fee"]) == (1.0, 0.25) and led.order(TAG)["fee"] == 1.25
+    assert (row["units"], row["fee"]) == (1.0, 0.75) and led.order(TAG)["fee"] == 1.25
 
 
 def test_an_average_that_implies_a_negative_price_beside_a_rise_in_units_drops_only_the_price():
@@ -1525,7 +1526,8 @@ def test_a_cancelled_order_reported_without_an_amount_gets_its_fill_when_the_amo
     venue.set(TAG, state="cancelled", filled_units=3.0, avg_price=90.0, fee=0.3)
     venue.held = {"XLE": 3.0}
     result = led.reconcile(venue, {})
-    assert [a["tag"] for a in result["anomalies"]] == [TAG] and not result["clean"]
+    assert result["anomalies"] == [] and result["clean"]                 # T34b-3 (A2): a late amount is a notice
+    assert [(n["tag"], n["kind"]) for n in result["notices"]] == [(TAG, "late_amount")]
     (row,) = result["fills"]
     assert (row["units"], row["price"], row["price_covers_units"], row["fee"]) == (3.0, 90.0, 3.0, 0.3)
     rec = led.order(TAG)
@@ -1543,7 +1545,8 @@ def test_an_expired_order_whose_amount_rises_later_gets_its_fill():
     result = led.reconcile(venue, {})
     (row,) = result["fills"]
     assert row["units"] == 2.0 and row["price"] == pytest.approx((91.0 * 6 - 90.0 * 4) / 2)
-    assert [a["tag"] for a in result["anomalies"]] == [TAG] and led.order(TAG)["state"] == "expired"
+    assert result["anomalies"] == [] and led.order(TAG)["state"] == "expired"   # T34b-3 (A2): a notice
+    assert [n["kind"] for n in result["notices"]] == ["late_amount"]
 
 
 def test_a_position_key_that_is_not_a_string_is_a_positions_error_and_the_reconcile_is_recorded():

@@ -19,8 +19,8 @@ Order states: intended, sent, accepted, partly_filled, filled, cancelled, reject
 never_arrived. Terminal (never sent again, never change state again): filled, cancelled, rejected, expired,
 refused; a filled, cancelled or expired order with something filled (or finished on a report that gave no amount) is
 still asked about for `recheck_seconds`, because brokers often post fees, averages and amounts after the fact;
-a larger amount is taken and also listed as an anomaly, a smaller amount or a different state is an anomaly
-that changes nothing. `refused` means the order was stopped on this machine before any network call (an exception listed
+a larger amount is taken (a notice when the venue still names the order's own finished state, an anomaly when it
+names another), a smaller amount or a different state is an anomaly that changes nothing. `refused` means the order was stopped on this machine before any network call (an exception listed
 in `not_sent`). `never_arrived` means the venue still had no order with the tag `settle_seconds` after it was
 marked `sent`, or a person said so with `settle_by_hand`; it is never sent again, but for `recheck_seconds`
 after it was so marked each reconcile asks the venue again, and an order that turns up after all is an
@@ -38,12 +38,35 @@ only). Fee and price are taken from every report, so a report that raises the fe
 for filled units not yet priced, without a rise in units makes an adjustment row with units 0.0. A row's fee
 is the increase of the venue's fee total since the last total it gave (None when there is none); its price is
 the price of all units since the last report that gave an average with an amount (`price_covers_units` of
-them). Over any sequence the units add up to the stored total, the fees to the last fee total, and, when the
-last report with an average left nothing unpriced, the priced rows to that average times that total. A fee
-total that falls, or an average that implies a negative or non-finite price, is an anomaly for that piece of
-information only: the stored fee total (or priced point) is kept, and a rise in units in the same report is
-still taken, its row carrying fee (or price) None. A fee total recorded below zero is kept as reported and opens
-one notice per order (an attention item of a kind in NOTICE_KINDS, which does not block). A reconcile reports
+them). Over any sequence the units add up to the stored total; the fees add up to the last fee total and, when the
+last report with an average left nothing unpriced, the priced rows to that average times that total, until the venue
+restates one of them (below). A fee total recorded below zero is kept as reported and opens one notice per order (an
+attention item of a kind in NOTICE_KINDS, which does not block).
+
+Every entry a reconcile lists carries a `kind` from a closed set (ANOMALY_KINDS, UNRESOLVED_KINDS, RECHECK_KINDS;
+`positions_error_kind` from POSITIONS_ERROR_KINDS beside `positions_error`). T34b-3: three things honest brokers do
+after the fact are NOTICES (`notices`, kinds in RECONCILE_NOTICE_KINDS): they neither make the reconcile unclean nor
+block, and the stored figure follows the venue's:
+  avg_restated    an average restated with no new units, by at most RESTATE_BOUND (a cent) plus REL_TOL: the order's
+                  avg_price and priced_avg take the venue's figure. More than that is the anomaly
+                  avg_restated_beyond, stored figure kept: this blocks on purpose an honest trade price corrected by
+                  more than a cent, which a person must look at;
+  late_amount     a larger amount, within the order's size, on a finished order the venue still reports in that same
+                  state: the units are taken as a fill (another state with more units: late_amount_other_state);
+  fee_fell        a fee total that fell and is still zero or more: the order's stored total takes it and NO row is
+                  written, so the rows' fee increments then sum to the earlier, higher total. A fall to below zero is
+                  the anomaly fee_fell_below_zero, stored total kept: deliberately unlike a first total below zero,
+                  which is kept with its negative_fee notice;
+  piece_unpriced  an average, finite and above zero, that implies a negative or non-finite price for the units since
+                  the last priced point while a cent of rounding on each average explains it
+                  ((avg + 0.01) x total - (priced_avg - 0.01) x priced_units >= 0): the priced point moves to the
+                  venue's average and total, the piece's row carries price None. Beyond that bound:
+                  piece_price_unexplained, the priced point kept and the units still taken with price None.
+After a restatement the rows keep the prices first worked out, and the order's average is the venue's: the rows no
+longer sum to it. A notice is recorded in the attention table, in the same write that follows the figure; an
+earlier open notice of the same order and kind is first closed as superseded (by LEDGER_CLOSER). If the new notice
+did not take, nothing of that venue answer is followed and the entry is the anomaly notice_not_recorded: a figure is
+never followed without its record. A non-finite average or fee stays the anomaly value_not_finite. A reconcile reports
 a fill or an update only once the write that made it true is committed; an order whose write failed is listed as unresolved. The book must apply every row (`unapplied_fills`, then `mark_applied`)
 before another order may be submitted, because orders are sized from the book.
 
@@ -65,7 +88,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 __all__ = ["LiveVenue", "OrderLedger", "OrderError", "OrdersBlocked", "net_orders", "allocate", "STATES", "TERMINAL",
-           "FORWARD"]
+           "FORWARD", "NOTICE_KINDS", "RECONCILE_NOTICE_KINDS", "ANOMALY_KINDS", "UNRESOLVED_KINDS", "RECHECK_KINDS",
+           "POSITIONS_ERROR_KINDS"]
 
 STATES = ("intended", "sent", "accepted", "partly_filled", "filled", "cancelled", "rejected", "expired", "refused",
           "unknown", "never_arrived")
@@ -90,11 +114,28 @@ MIN_UNITS = 1e-8                                          # the smallest order `
 REL_TOL = 1e-9                                            # filled amounts compare within REL_TOL x max(1, |units|)
 MAX_TEXT = 200
 BUSY_SECONDS = 30.0                                       # how long a connection waits for another's write to end
-NOTICE_KINDS = frozenset({"negative_fee"})                # attention kinds that tell a person and do not block
+# T34b-3: what a broker restates after the fact within bounds an honest broker keeps: told, followed, never blocking
+RECONCILE_NOTICE_KINDS = frozenset({"avg_restated", "late_amount", "fee_fell", "piece_unpriced"})
+NOTICE_KINDS = frozenset({"negative_fee"}) | RECONCILE_NOTICE_KINDS   # attention kinds that tell a person, never block
+# T34b-3: the kind every entry of a reconcile carries beside its tag and reason (closed sets)
+ANOMALY_KINDS = frozenset({"reconcile_failed", "not_storable", "status_not_dict", "units_not_finite", "turned_up",
+                           "missing_at_venue", "value_not_finite", "units_negative", "units_fell", "overfill",
+                           "late_amount_other_state", "state_changed", "fee_fell_below_zero", "piece_price_unexplained",
+                           "avg_restated_beyond", "notice_not_recorded"})
+UNRESOLVED_KINDS = frozenset({"status_unread", "answer_unusable", "status_not_dict", "status_unreadable", "not_written",
+                              "not_found_yet", "state_unknown", "filled_short"})
+RECHECK_KINDS = frozenset({"status_unread", "gone", "state_unknown"})
+POSITIONS_ERROR_KINDS = frozenset({"positions_unread", "positions_malformed"})
+RESTATE_BOUND = 0.01                                      # one cent: what a broker's rounding can move an average by
+LEDGER_CLOSER = "order ledger"                            # who closes a notice superseded by a later one of its kind
 
 
 class OrderError(RuntimeError):
     pass
+
+
+class _NoticeNotRecorded(OrderError):
+    """Inside a reconcile's write: a notice did not take, so nothing of that venue answer may be followed."""
 
 
 class OrdersBlocked(OrderError):
@@ -687,7 +728,8 @@ class OrderLedger:
         that, only the position comparison shows it."""
         now = self.clock()
         out = {"clean": False, "orders_checked": 0, "updated": [], "fills": [], "unresolved": [], "anomalies": [],
-               "position_differences": {}, "positions_error": None, "recheck_errors": [], "time": now}
+               "position_differences": {}, "positions_error": None, "positions_error_kind": None, "recheck_errors": [],
+               "notices": [], "time": now}
         try:
             since = now - recheck_seconds
             todo = [(r["tag"], False) for r in self.orders(CHECKED)]
@@ -704,12 +746,14 @@ class OrderLedger:
                                 or out["positions_error"])
         except Exception as exc:                          # the ledger's own failure: recorded, not clean
             out["clean"] = False
-            out["anomalies"].append({"tag": None, "reason": f"the reconcile stopped: {_describe(exc)}"})
+            out["anomalies"].append({"tag": None, "kind": "reconcile_failed",
+                                     "reason": f"the reconcile stopped: {_describe(exc)}"})
         try:
             summary = json.dumps(out, default=str)
         except Exception as exc:                          # never lose the record over what the venue sent
             out["clean"] = False
-            out["anomalies"].append({"tag": None, "reason": f"the result could not be stored in full: {_describe(exc)}"})
+            out["anomalies"].append({"tag": None, "kind": "not_storable",
+                                     "reason": f"the result could not be stored in full: {_describe(exc)}"})
             summary = json.dumps({"time": now, "clean": False, "error": _describe(exc)})
         with self._write():
             self._db.execute("INSERT INTO reconciles (time, clean, summary) VALUES (?,?,?)", (now, int(out["clean"]), summary))
@@ -718,13 +762,20 @@ class OrderLedger:
     def _compare_positions(self, venue: LiveVenue, book_positions, tolerance: float, out: dict) -> None:
         try:
             held = dict(venue.positions())
-            book = dict(book_positions or {})
         except Exception as exc:
             out["positions_error"] = f"the venue's positions could not be read: {_describe(exc)}"
+            out["positions_error_kind"] = "positions_unread"
             return
-        odd = [k for k in (*held, *book) if not isinstance(k, str)]
+        try:
+            book = dict(book_positions or {})
+            odd = [k for k in (*held, *book) if not isinstance(k, str)]
+        except Exception as exc:                          # what was given as the book, or the venue's keys
+            out["positions_error"] = f"the positions could not be compared: {_describe(exc)}"
+            out["positions_error_kind"] = "positions_malformed"
+            return
         if odd:
             out["positions_error"] = f"a position key is not a symbol string: {_safe_repr(odd)}"
+            out["positions_error_kind"] = "positions_malformed"
             return
         unapplied: dict[str, float] = {}
         for f in self.unapplied_fills():
@@ -738,32 +789,36 @@ class OrderLedger:
         try:
             status = venue.order_status(tag)
         except Exception as exc:
+            item = {"tag": tag, "kind": "status_unread", "reason": f"status could not be read: {_describe(exc)}"}
             if recheck:                                   # a venue that raises for "no such order" must not block
-                out["recheck_errors"].append({"tag": tag, "reason": f"status could not be read: {_describe(exc)}"})
+                out["recheck_errors"].append(item)
             else:
-                out["unresolved"].append({"tag": tag, "reason": f"status could not be read: {_describe(exc)}"})
+                out["unresolved"].append(item)
             return
         try:
             self._apply(tag, status, recheck, now, settle_seconds, out)
         except Exception as exc:                          # nothing a venue returns may stop the loop
-            out["unresolved"].append({"tag": tag, "reason": f"the venue's answer could not be used: {_describe(exc)}"})
+            out["unresolved"].append({"tag": tag, "kind": "answer_unusable",
+                                      "reason": f"the venue's answer could not be used: {_describe(exc)}"})
 
     def _apply(self, tag: str, status, recheck: bool, now: float, settle_seconds: float, out: dict) -> None:
         """Use one venue answer. What to do is decided from the order as re-read inside the write transaction, so an
         order another ledger moved meanwhile (to never_arrived, say) is handled as it now is."""
         if status is not None and not isinstance(status, dict):
             (out["anomalies"] if recheck else out["unresolved"]).append(
-                {"tag": tag, "reason": f"the venue's status is not a dict: {_safe_repr(status)}"})
+                {"tag": tag, "kind": "status_not_dict", "reason": f"the venue's status is not a dict: {_safe_repr(status)}"})
             return
         if status is not None:
             try:                                          # a plain copy: an odd mapping cannot raise later
                 status = {k: status.get(k) for k in STATUS_KEYS}
             except Exception as exc:
-                out["unresolved"].append({"tag": tag, "reason": f"the venue's status could not be read: {_describe(exc)}"})
+                out["unresolved"].append({"tag": tag, "kind": "status_unreadable",
+                                          "reason": f"the venue's status could not be read: {_describe(exc)}"})
                 return
             if status["filled_units"] is not None and not _finite(status["filled_units"]):
-                out["anomalies"].append({"tag": tag, "reason": "the venue's filled_units is not a finite number: "
-                                         f"{_safe_repr(status['filled_units'])}"})
+                out["anomalies"].append({"tag": tag, "kind": "units_not_finite",
+                                         "reason": "the venue's filled_units is not a finite number: "
+                                                   f"{_safe_repr(status['filled_units'])}"})
                 return
             status["bad"] = [k for k in ("avg_price", "fee") if status[k] is not None and not _finite(status[k])]
             for k in status["bad"]:                       # that piece only: ignored, the units are still taken
@@ -771,7 +826,8 @@ class OrderLedger:
             for k in ("venue_order_id", "raw_status"):
                 if status[k] is not None:
                     status[k] = _storable(status[k])
-        local: dict[str, list] = {k: [] for k in ("fills", "updated", "unresolved", "anomalies", "recheck_errors")}
+        local: dict[str, list] = {k: [] for k in ("fills", "updated", "unresolved", "anomalies", "recheck_errors",
+                                                  "notices")}
         try:
             with self._write():
                 rec = self.order(tag)
@@ -787,17 +843,23 @@ class OrderLedger:
                     if status is not None:                # proof the order exists wins over never_arrived
                         reason = (f"declared never arrived, but the venue has an order with this tag "
                                   f"({_safe_repr(status.get('state'))})")
-                        local["anomalies"].append({"tag": tag, "reason": reason})
+                        local["anomalies"].append({"tag": tag, "kind": "turned_up", "reason": reason})
                         self._flag(tag, "turned_up", reason + "; check that no replacement was sent")
                         self._apply_status(rec, status, now, local, "turned_up")
                 elif state in FINISHED:
                     if status is None:
-                        local["recheck_errors"].append({"tag": tag, "reason": f"the venue no longer has this {state} order"})
+                        local["recheck_errors"].append({"tag": tag, "kind": "gone",
+                                                        "reason": f"the venue no longer has this {state} order"})
                     else:
                         self._apply_status(rec, status, now, local, "finished")
+        except _NoticeNotRecorded as exc:                 # rolled back: the figure is not followed without its record
+            out["anomalies"].append({"tag": tag, "kind": "notice_not_recorded",
+                                     "reason": f"a notice could not be recorded, so nothing of the venue's answer is "
+                                               f"followed: {exc}"})
+            return
         except Exception as exc:                          # rolled back: nothing of it is reported, it stays unresolved
-            out["unresolved"].append({"tag": tag, "reason": f"the venue's answer could not be written or used: "
-                                      f"{_describe(exc)}"})
+            out["unresolved"].append({"tag": tag, "kind": "not_written",
+                                      "reason": f"the venue's answer could not be written or used: {_describe(exc)}"})
             return
         for k, items in local.items():                    # committed: now it may be reported
             out[k].extend(items)
@@ -810,6 +872,26 @@ class OrderLedger:
         self._flag(tag, "negative_fee", f"the venue reports a fee total of {fee!r} for order {tag}, below zero; it is "
                    "kept as reported: check whether it is a rebate")
 
+    def _record_notice(self, tag: str, kind: str, words: str, old, new) -> int:
+        """Inside the caller's write (T34b-3): record one notice of RECONCILE_NOTICE_KINDS as an attention item whose
+        reason is a JSON object {"words", "old", "new"}. An earlier OPEN notice of the same order and kind is first
+        closed as superseded (one open item per tag and kind is the table's rule), so every restatement keeps its own
+        id. Returns the new item's id; raises _NoticeNotRecorded when the insert did not take, which rolls the whole
+        write back."""
+        self._db.execute("UPDATE attention SET closed_by = ?, closed_note = ?, closed_time = ? "
+                         "WHERE tag = ? AND kind = ? AND closed_time IS NULL",
+                         (LEDGER_CLOSER, "superseded by a later notice of the same kind", self.clock(), tag, kind))
+        reason = json.dumps({"words": words, "old": old, "new": new})
+        cur = self._db.execute("INSERT INTO attention (tag, kind, time, reason) VALUES (?,?,?,?)",
+                               (tag, kind, self.clock(), reason))
+        nid = cur.lastrowid if cur.rowcount == 1 else None
+        got = None if nid is None else self._db.execute(
+            "SELECT id FROM attention WHERE id = ? AND tag = ? AND kind = ? AND reason = ? AND closed_time IS NULL",
+            (nid, tag, kind, reason)).fetchone()
+        if got is None:
+            raise _NoticeNotRecorded(f"the {kind} notice for order {tag} did not take")
+        return int(got[0])
+
     def _apply_missing(self, rec: dict, now: float, settle_seconds: float, out: dict) -> None:
         tag, state = rec["tag"], rec["state"]
         if state in UNSETTLED:
@@ -820,52 +902,64 @@ class OrderLedger:
                              never_arrived_at=now):
                     out["updated"].append({"tag": tag, "from": state, "to": "never_arrived"})
             else:
-                out["unresolved"].append({"tag": tag, "reason": "not found at the venue yet; too early to say it never arrived"})
+                out["unresolved"].append({"tag": tag, "kind": "not_found_yet",
+                                          "reason": "not found at the venue yet; too early to say it never arrived"})
         else:
-            out["anomalies"].append({"tag": tag, "reason": f"the ledger has it {state} but the venue has no order with this tag"})
+            out["anomalies"].append({"tag": tag, "kind": "missing_at_venue",
+                                     "reason": f"the ledger has it {state} but the venue has no order with this tag"})
 
     def _apply_status(self, rec: dict, status: dict, now: float, out: dict, mode: str) -> None:
         """Apply one venue status. `mode` is open (an order still open), turned_up (it had been declared never
-        arrived) or finished (filled, cancelled or expired: fees, averages and a larger amount are taken, the
-        larger amount also as an anomaly; a smaller amount or another state is an anomaly that changes nothing)."""
+        arrived) or finished (filled, cancelled or expired: fees, averages and a larger amount are taken; a larger
+        amount in the order's own state is a notice, in another state an anomaly; a smaller amount or another state
+        with no more units is an anomaly that changes nothing). The four notices (module docstring) are recorded
+        after the order's change, in the same write; a notice that does not take rolls the write back."""
         tag, state, size = rec["tag"], rec["state"], abs(rec["units"])
         tol = _tol(rec["units"])
         vstate = status.get("state")
+        notices: list[tuple[str, str, float, float]] = []
 
-        def anomaly(reason: str) -> None:
-            out["anomalies"].append({"tag": tag, "reason": reason})
+        def anomaly(kind: str, reason: str) -> None:
+            out["anomalies"].append({"tag": tag, "kind": kind, "reason": reason})
 
         for k in status.get("bad", ()):
-            anomaly(f"the venue's {k} is not a finite number; it is ignored")
+            anomaly("value_not_finite", f"the venue's {k} is not a finite number; it is ignored")
         if vstate not in VENUE_STATES:
             where = out["recheck_errors"] if mode == "finished" else out["unresolved"]
-            where.append({"tag": tag, "reason": f"the venue's state is {vstate!r} (raw {_safe_repr(status.get('raw_status'))})"})
+            where.append({"tag": tag, "kind": "state_unknown",
+                          "reason": f"the venue's state is {vstate!r} (raw {_safe_repr(status.get('raw_status'))})"})
             return
         old = rec["filled_units"]
         given = status.get("filled_units")
         said = given is not None                          # None: the venue did not say; never 0, never a decrease
         filled = float(given) if said else old
         if filled < -tol:
-            return anomaly(f"the venue reports filled_units {given!r}")
+            return anomaly("units_negative", f"the venue reports filled_units {given!r}")
         filled = max(filled, 0.0)
         if filled < old - tol:
-            return anomaly(f"the venue reports {filled} filled, less than the {old} on the ledger")
+            return anomaly("units_fell", f"the venue reports {filled} filled, less than the {old} on the ledger")
         if filled > size + tol:
-            return anomaly(f"the venue reports {filled} filled, more than the order's {size}")
+            return anomaly("overfill", f"the venue reports {filled} filled, more than the order's {size}")
         new = VENUE_STATES[vstate]
         if mode == "finished":
-            if said and filled > old + tol:               # taken whatever state it carries, and a person should look
-                anomaly(f"the order is {state} with {old} filled, but the venue now says {vstate} with {filled} filled")
+            if said and filled > old + tol:               # taken whatever state it carries
+                if new == state:                          # A2: a late amount in the order's own finished state
+                    notices.append(("late_amount", f"the order is {state} with {old} filled and the venue now says "
+                                    f"{filled} filled; the units are taken", old, filled))
+                else:
+                    anomaly("late_amount_other_state", f"the order is {state} with {old} filled, but the venue now "
+                            f"says {vstate} with {filled} filled")
                 new = state
             elif new != state:
-                return anomaly(f"the order is {state} with {old} filled, but the venue now says {vstate} with "
-                               f"{filled if said else 'no amount'}")
+                return anomaly("state_changed", f"the order is {state} with {old} filled, but the venue now says "
+                               f"{vstate} with {filled if said else 'no amount'}")
         else:
             if vstate == "filled" and filled < size - tol:    # filled is only believed when the whole size is accounted for
                 new = state
-                out["unresolved"].append({"tag": tag, "reason": f"the venue calls it filled without accounting for the "
-                                          f"whole size: {filled if said else 'no amount given'} of {size}"
-                                          + ("" if said else f" ({old} on the ledger)")})
+                out["unresolved"].append({"tag": tag, "kind": "filled_short",
+                                          "reason": f"the venue calls it filled without accounting for the "
+                                                    f"whole size: {filled if said else 'no amount given'} of {size}"
+                                                    + ("" if said else f" ({old} on the ledger)")})
             if new != state and new not in FORWARD.get(state, ()):
                 new = state                               # never backwards (a partly filled order the venue calls open)
         rise = said and filled > old + tol
@@ -884,8 +978,14 @@ class OrderLedger:
         if fee is not None:
             fee, base = float(fee), rec["fee"]
             ftol = REL_TOL * max(1.0, abs(base or 0.0))
-            if base is not None and fee < base - ftol:    # this piece only: the fee is left, units are still taken
-                anomaly(f"the venue's fee total fell from {base} to {fee}; the stored {base} is kept")
+            if base is not None and fee < base - ftol:    # a fall: no row; the units are still taken
+                if fee >= 0:                              # A3: the order's own total follows, a notice says so
+                    fields["fee"] = fee
+                    notices.append(("fee_fell", f"the venue's fee total fell from {base} to {fee}; the order's total "
+                                    "follows it and no row is written", base, fee))
+                else:                                     # below zero: kept, deliberately unlike a first negative total
+                    anomaly("fee_fell_below_zero", f"the venue's fee total fell from {base} to {fee}, below zero; "
+                            f"the stored {base} is kept")
             else:
                 up = fee - (base or 0.0)
                 if up > ftol or rise:
@@ -896,19 +996,36 @@ class OrderLedger:
             covers = total - p_units
             if covers > tol:
                 price = (avg * total - (p_avg * p_units if p_units > 0 and p_avg is not None else 0.0)) / covers
-                if not math.isfinite(price) or price < 0:  # this piece only: the units stay unpriced
-                    anomaly(f"the venue's average {avg} at {total} filled implies a price of {price} for the "
-                            f"{covers} units since the last priced point; they are left unpriced")
+                if not math.isfinite(price) or price < 0:  # the piece stays unpriced; does rounding explain it?
+                    if avg > 0 and _rounding_explains(avg, total, p_avg, p_units):   # A4
+                        fields.update(avg_price=avg, priced_units=total, priced_avg=avg)
+                        notices.append(("piece_unpriced", f"the venue's average {avg} at {total} filled implies a "
+                                        f"price of {price} for the {covers} units since the last priced point, which "
+                                        "a cent of rounding explains; the piece is left unpriced and the order's "
+                                        "average follows", p_avg, avg))
+                    else:
+                        anomaly("piece_price_unexplained", f"the venue's average {avg} at {total} filled implies a "
+                                f"price of {price} for the {covers} units since the last priced point; they are left "
+                                "unpriced")
                 else:
                     row["price"], row["price_covers_units"], wanted = price, covers, True
                     fields.update(avg_price=avg, priced_units=total, priced_avg=avg)
             elif p_avg is not None and abs(avg - p_avg) > REL_TOL * max(1.0, abs(p_avg)):
-                anomaly(f"the venue's average changed from {p_avg} to {avg} with no new units to price")
+                if avg > 0 and abs(avg - p_avg) <= RESTATE_BOUND + REL_TOL * max(1.0, abs(p_avg)):   # A1
+                    fields.update(avg_price=avg, priced_avg=avg)
+                    notices.append(("avg_restated", f"the venue's average changed from {p_avg} to {avg} with no new "
+                                    "units; the order's average follows it", p_avg, avg))
+                else:
+                    anomaly("avg_restated_beyond", f"the venue's average changed from {p_avg} to {avg} with no new "
+                            "units to price, by more than a cent; the stored average is kept")
         if new == state and not wanted and all(rec[k] == v for k, v in fields.items()):
             return                                        # nothing new: the record is left exactly as it was
         why = f"venue says {vstate}" + ("; it had been declared never arrived" if mode == "turned_up" else "")
         if not self._cas(tag, state, new, why, **fields):
             return
+        for kind, words, was, now_is in notices:          # in the same write: a figure never followed without it
+            nid = self._record_notice(tag, kind, words, was, now_is)
+            out["notices"].append({"tag": tag, "kind": kind, "old": was, "new": now_is, "id": nid})
         if fields.get("fee") is not None and fields["fee"] < 0:
             self._notice_negative_fee(tag, fields["fee"])
         if wanted:
@@ -918,6 +1035,14 @@ class OrderLedger:
             out["fills"].append(dict(self._db.execute("SELECT * FROM fills WHERE id = ?", (cur.lastrowid,)).fetchone()))
         if new != state or wanted:
             out["updated"].append({"tag": tag, "from": state, "to": new})
+
+
+def _rounding_explains(avg: float, total: float, p_avg: float | None, p_units: float) -> bool:
+    """T34b-3 (A4): one cent of rounding on each of the two averages explains a negative worked-out piece:
+    (avg + 0.01) x total - (p_avg - 0.01) x p_units >= 0, every term finite."""
+    before = (p_avg - RESTATE_BOUND) * p_units if p_units > 0 and p_avg is not None else 0.0
+    lhs = (avg + RESTATE_BOUND) * total - before
+    return math.isfinite(before) and math.isfinite(lhs) and lhs >= 0
 
 
 # ---- strategies sharing one account
