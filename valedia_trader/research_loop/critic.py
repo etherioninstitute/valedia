@@ -45,14 +45,19 @@ def _fmt(x: float, pct: bool = True) -> str:
 
 def _backtest_simple_annual(bt: dict) -> tuple[float | None, float | None]:
     """(the backtest's simple annual average, its annual volatility): sharpe * annual_vol, which is its average daily return times
-    252. (None, None) when either is missing, not a number or not finite; the compound `cagr` is never a stand-in."""
+    252. (None, None) unless sharpe and annual_vol are real, finite numbers, annual_vol is above 1e-12 (a backtest with no
+    variation, or a negative volatility, says nothing) and the product is finite; the compound `cagr` is never a stand-in."""
     values = []
     for key in ("sharpe", "annual_vol"):
         v = bt.get(key)
         if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)) or not math.isfinite(float(v)):
             return None, None
         values.append(float(v))
-    return values[0] * values[1], values[1]
+    sharpe, vol = values
+    product = sharpe * vol
+    if vol <= 1e-12 or not math.isfinite(product):
+        return None, None
+    return product, vol
 
 
 def _backtest_figures(r: dict) -> str:
