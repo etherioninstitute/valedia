@@ -2636,3 +2636,12 @@ def test_r5_describe_at_the_ceiling_says_no_rise_is_possible():
     assert (p.mode, p.stake, p.earned, p.ceiling) == ("unattended", 1000.0, 1000.0, 1000.0)
     q = pos(run(Days(), ["clean"] * 61), 500, 1500)                            # below the ceiling: it may double
     assert "the stake doubles from 1,000.00, up to the ceiling" in lines_ok(sl.describe(q, None, LADDER, 0))
+
+
+# ------------------------------------------------------------------ T34b-3 (G): an unreadable venue is a skipped session
+def test_t34b3_a_run_stopped_at_venue_read_is_a_skipped_session_and_a_fault_with_it_is_still_a_fault():
+    assert "venue_read" in sl.SKIP_STAGES and "venue_read" not in sl.FAULT_STAGES
+    d1, d2, d3 = sessions_from(TODAY, 3)
+    entries = [stop(d1, "venue_read"), stop(d2, "venue_read"), summ(d2, batch="b2"),
+               stop(d3, "venue_read", faults=["cap"], cap_refs=["fill-1"], notices=["avg_restated"])]
+    assert kinds(sl.session_facts(entries, LIVE, CAL)) == [(d1, "skipped"), (d2, "clean"), (d3, "fault")]

@@ -8102,3 +8102,510 @@ def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_
     print(f"T34B2-LIVE block {seed_block}: {dict(stats)}")
     assert stats["runs"] >= 150 and stats["stopped days"] > 5 and stats["sent"] > 20, stats
     assert stats["fewer sent"] + stats["fewer ticket lines"] > 0, stats
+
+
+# ---- T34b-3: the verdict of a fill in its own line, carried until a summary covers it; the notices; venue_read
+
+from valedia_trader.execution_and_risk import orders as _orders  # noqa: E402
+
+
+class _Priced(Booked):
+    """A practice stand-in whose orders report their average at the limit times the `buy` (a purchase) or `sell` (a
+    sale) factor in force when each order was taken; `avg` overrides an order's average by tag; an order taken while
+    `no_avg` is set reports no average (`unpriced`, by tag); `answers` gives, by tag, status fields to lay over the
+    reads in turn (the last one stays); `raise_status` and `raise_positions` make those reads raise."""
+    buy = sell = 1.0
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.avg, self.factor, self.unpriced, self.answers = {}, {}, set(), {}
+        self.no_avg = self.raise_status = self.raise_positions = False
+
+    def _take(self, symbol, units, tag, limit_price):
+        self.factor[tag] = self.buy if units > 0 else self.sell
+        if self.no_avg:
+            self.unpriced.add(tag)
+        super()._take(symbol, units, tag, limit_price)
+
+    def order_status(self, tag):
+        if self.raise_status:
+            self.calls.append(("order_status", tag))
+            raise ConnectionError("order_status is down")
+        out = super().order_status(tag)
+        if out is not None and out["avg_price"] is not None:
+            out["avg_price"] = None if tag in self.unpriced else self.avg.get(tag, out["avg_price"] * self.factor.get(tag, 1.0))
+        if out is not None and self.answers.get(tag):
+            out.update(self.answers[tag][0] if len(self.answers[tag]) == 1 else self.answers[tag].pop(0))
+        return out
+
+    def positions(self):
+        if self.raise_positions:
+            self.calls.append(("positions", None))
+            raise ConnectionError("positions is down")
+        return super().positions()
+
+
+def _pw(tmp, **venue_kw):
+    w = ticket_world(tmp, _Priced(held={"OWN": 10.0}))
+    for k, v in venue_kw.items():
+        setattr(w.venue, k, v)
+    return w
+
+
+def _prun(w, wanted=None, **kw):
+    if wanted is not None:
+        w.paper = paper(wanted)
+    return w.run(**kw)
+
+
+def _kill_at(monkeypatch, name, times=1):
+    """The run's own method `name` dies (KeyboardInterrupt) the first `times` times it is called."""
+    real, left = getattr(osx._Run, name), [times]
+
+    def dying(self, *a, **k):
+        if left[0] > 0:
+            left[0] -= 1
+            raise KeyboardInterrupt("killed here by the test")
+        return real(self, *a, **k)
+    monkeypatch.setattr(osx._Run, name, dying)
+
+
+def _breach_run(w, monkeypatch, kill="_judge_final"):
+    """A practice run whose IWM 3 fills at once at 1.05 times its limit of 202 (a breach of (iii)), killed at `kill`
+    after its fill line (None: not killed, the summary returned)."""
+    w.venue.fill_at_once, w.venue.buy = 1.0, 1.05
+    try:
+        if kill is None:
+            return _prun(w, {"a": {"IWM": 3.0}})
+        _kill_at(monkeypatch, kill)
+        with pytest.raises(KeyboardInterrupt):
+            _prun(w, {"a": {"IWM": 3.0}})
+        monkeypatch.undo()
+    finally:
+        w.venue.buy = 1.0
+
+
+def _capped(w):
+    return [e["cap_refs"] for e in w.entries("summary") if "cap_refs" in e]
+
+
+# -- E: whole cents and no half-cent band
+
+def test_t34b3_every_limit_the_order_step_can_send_is_a_whole_number_of_cents():
+    from decimal import Decimal
+    rng = random.Random(3434)
+    quotes = [0.004, 0.005, 0.0051, 0.01, 0.0149, 0.05, 0.5001, 0.999, 1.0, 1.005, 99.995, 5000.0, 99_999.99, 1e7]
+    quotes += [rng.uniform(0.001, 1.0) for _ in range(3000)] + [rng.uniform(1, 200_000) for _ in range(3000)]
+    seen = 0
+    for q in quotes:
+        for units in (3.0, -3.0, 0.00123, -0.5):
+            for reduces in (False, True):
+                lp = osx.limit_price(units, q, reduces)
+                if lp is None:
+                    continue
+                seen += 1
+                assert lp > 0 and Decimal(repr(lp)) == Decimal(repr(lp)).quantize(Decimal("0.01")), (q, units, lp)
+    assert seen > 40_000 and not hasattr(osx, "HALF_A_CENT")
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("off, fault", [(0.0, False), (1.0, False), (1.0 + 2e-9, True), (20.0, True)])
+def test_t34b3_the_limit_band_is_one_part_in_a_million_of_the_limit_at_its_exact_edge(tmp_path, side, off, fault):
+    # E and ruling 14: `off` in units of LIMIT_SAME x limit through the limit; 1.0 is the edge (LIMIT_EDGE: no breach);
+    # 20 is 0.004 on 202 or 0.0039 on 196, a breach now, inside the half cent the old band allowed
+    w = _pw(tmp_path / "w", fill_at_once=1.0)
+    if side == "sell":
+        assert _prun(w, {"a": {"IWM": 3.0}})["orders_sent"] == 1
+        w.later(30)
+    setattr(w.venue, side, 1.0 + off * osx.LIMIT_SAME if side == "buy" else 1.0 - off * osx.LIMIT_SAME)
+    out = _prun(w, {"a": {"IWM": 3.0 if side == "buy" else 0.0}})
+    assert out["orders_sent"] == 1 and out["status"] == "done", out
+    assert ("cap" in out.get("faults", [])) is fault, out
+    assert w.entries("fill")[-1]["verdict"] == ("breach" if fault else "ok")
+
+
+# -- F (ruling 14): two tests of what the last check left untested; no behaviour change
+
+def test_t34b3_a_fill_journaled_at_the_first_reconcile_sets_its_symbol_aside_at_the_final_one(tmp_path):
+    w = _pw(tmp_path / "w")
+    assert _prun(w, {"a": {"IWM": 3.0}})["orders_sent"] == 1
+    w.venue.fill(w.venue.submits()[-1])                # filled between the runs: an order of an earlier batch, finished
+    w.later(30)
+    start, real = len(w.venue.calls), w.venue.positions
+
+    def positions():
+        out = real()
+        if any(c[0] == "quotes" for c in w.venue.calls[start:]):    # after the cancels: the final read lags that fill
+            out.pop("IWM", None)
+        return out
+    w.venue.positions = positions
+    out = _prun(w)
+    assert out["status"] == "done" and out["fills_journaled"] == 1 and "faults" not in out, out
+    assert out["reconcile_pending"] == {"symbols": ["IWM"], "positions_unread": False, "status_unread": 0}, out
+
+
+def test_t34b3_cap_unjudged_is_written_on_a_practice_summary(tmp_path):
+    w = _pw(tmp_path / "w", fill_at_once=1.0, no_avg=True)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    assert out["status"] == "done" and out["cap_unjudged"] == ["IWM"] and "faults" not in out, out
+    assert w.entries("summary")[-1]["cap_unjudged"] == ["IWM"] and "live" not in out
+
+
+# -- D: the verdict in the fill line, carried until a summary covers it
+
+def test_t34b3_the_fill_line_carries_its_verdict_as_its_last_field(tmp_path):
+    w = _pw(tmp_path / "w", fill_at_once=1.0)
+    _prun(w, {"a": {"IWM": 3.0}})
+    w.later(30)
+    w.venue.buy = 1.05
+    assert _prun(w, {"a": {"IWM": 6.0}})["faults"] == ["cap"]
+    w.venue.buy, w.venue.no_avg = 1.0, True
+    w.later(30)
+    assert _prun(w, {"a": {"IWM": 9.0}})["cap_unjudged"] == ["IWM"]
+    lines = w.entries("fill")
+    assert [e["verdict"] for e in lines] == ["ok", "breach", "unjudged"] and all(list(e)[-1] == "verdict" for e in lines)
+
+
+def test_t34b3_a_breach_whose_run_dies_before_its_summary_is_carried_by_exactly_one_later_summary(tmp_path,
+                                                                                                 monkeypatch):
+    w = _pw(tmp_path / "w")
+    _breach_run(w, monkeypatch)                                  # KeyboardInterrupt between the line and the summary
+    (line,) = w.entries("fill")
+    assert line["verdict"] == "breach" and w.entries("summary") == []
+    for k in range(5):
+        w.later(30)
+        out = _prun(w)
+        assert out.get("faults") == (["cap"] if k == 0 else None), (k, out)
+        assert out.get("cap_refs") == ([f"fill-{line['fill_id']}"] if k == 0 else None), (k, out)
+    assert _capped(w) == [[f"fill-{line['fill_id']}"]]
+
+
+def test_t34b3_a_breach_whose_carrying_run_also_dies_is_carried_by_the_run_after(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w")
+    _breach_run(w, monkeypatch)
+    w.later(30)
+    _kill_at(monkeypatch, "_judge_final")
+    with pytest.raises(KeyboardInterrupt):
+        _prun(w)
+    monkeypatch.undo()
+    w.later(30)
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+    w.later(30)
+    assert "faults" not in _prun(w) and _capped(w) == [["fill-1"]]
+
+
+def test_t34b3_a_ledger_read_that_raises_while_judging_writes_no_fill_line_and_the_next_run_judges_it(tmp_path,
+                                                                                                    monkeypatch):
+    w = _pw(tmp_path / "w", fill_at_once=1.0, buy=1.05)
+    real = _Ledger.fills
+
+    def fills(self, tag=None):
+        if tag is not None:
+            raise _orders.OrderError("the order ledger could not be read: disk I/O error")
+        return real(self, tag)
+    monkeypatch.setattr(_Ledger, "fills", fills)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    monkeypatch.undo()
+    assert out["status"] == "stopped" and out["stage"] == "after" and w.entries("fill") == [], out
+    assert "faults" not in out and "cap_refs" not in out
+    w.later(30)
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"] and w.entries("fill")[0]["verdict"] == "breach"
+
+
+def test_t34b3_a_summary_that_cannot_be_written_leaves_the_breach_for_the_next_run(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w")
+    real, failed = Journal.write, []
+
+    def write(self, day, entry):
+        if entry.get("event") == "summary" and not failed:
+            failed.append(entry)
+            raise OSError("no space left on device")
+        return real(self, day, entry)
+    monkeypatch.setattr(Journal, "write", write)
+    out = _breach_run(w, monkeypatch, kill=None)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"] and "journal_error" in out, out
+    assert w.entries("summary") == []
+    w.later(30)
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+
+
+def test_t34b3_a_failure_while_the_faults_are_worked_out_leaves_the_breach_for_the_next_run(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w")
+    _t34_faults_fail(monkeypatch)
+    out = _breach_run(w, monkeypatch, kill=None)
+    monkeypatch.undo()
+    assert out["stage"] == "unexpected" and "cap_refs" not in out and "faults" not in out, out
+    w.later(30)
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+
+
+def test_t34b3_a_mark_applied_that_fails_after_the_line_is_covered_once_and_never_judged_twice(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w", fill_at_once=1.0, buy=1.05)
+
+    def mark(self, ids):
+        raise _orders.OrderError("the order ledger could not be written: database is locked")
+    monkeypatch.setattr(_Ledger, "mark_applied", mark)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    monkeypatch.undo()
+    assert out["stage"] == "after" and out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+    for _ in range(3):
+        w.later(30)
+        assert "faults" not in _prun(w)
+    assert len(w.entries("fill")) == 1 and _capped(w) == [["fill-1"]]
+
+
+# -- B1: who may carry
+
+def test_t34b3_a_breach_is_carried_only_by_a_run_of_its_venue_on_an_exchange_session(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w")
+    w.clock.t = ny("2026-11-25 10:00")                            # a Wednesday; Thursday is Thanksgiving
+    _breach_run(w, monkeypatch)
+    other = ticket_world(tmp_path / "o", _Priced(held={"OWN": 10.0}, name="other-sandbox"))
+    other.journal, other.clock = w.journal, w.clock               # the same journal, another venue
+    w.clock.t = ny("2026-11-25 11:00")
+    out = _prun(other, {})
+    assert out["status"] == "done" and "faults" not in out and "cap_refs" not in out, out
+    w.clock.t = ny("2026-11-26 10:00")
+    out = _prun(w)
+    assert out["status"] == "stopped" and out["stage"] == "session", out
+    assert "faults" not in out and "cap_refs" not in out, out
+    w.clock.t = ny("2026-11-27 11:00")                            # Friday, a half day
+    out = _prun(w)
+    assert out["status"] == "done" and out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+    w.clock.t = ny("2026-11-27 11:30")
+    assert "faults" not in _prun(other) and "faults" not in _prun(w)
+
+
+def test_t34b3_a_run_after_the_close_of_a_session_day_carries_it_and_the_ladder_calls_that_day_a_fault(tmp_path,
+                                                                                                    monkeypatch):
+    w = _pw(tmp_path / "w")
+    _breach_run(w, monkeypatch)
+    w.clock.t = ny("2026-11-13 17:00")
+    out = _prun(w)
+    assert out["stage"] == "session" and out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+    facts = _sl.session_facts(w.journal.read(), w.venue.name, CAL)
+    assert [(str(f.day), f.kind) for f in facts] == [("2026-11-13", "fault")], facts
+
+
+def test_t34b3_a_breach_followed_by_ten_days_without_a_run_is_still_carried(tmp_path, monkeypatch):
+    w = _pw(tmp_path / "w")
+    _breach_run(w, monkeypatch)
+    for _ in range(10):
+        w.next_day()
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-1"], out
+
+
+def test_t34b3_the_scan_reads_every_journal_day_and_four_hundred_days_cost_little(tmp_path, monkeypatch):
+    import time
+    w = _pw(tmp_path / "w")
+    days = [str(d.date()) for d in CAL.sessions_in_range("2024-01-02", "2026-11-12")[-400:]]
+    (w.tmp / "journal").mkdir(parents=True, exist_ok=True)
+    for k, day in enumerate(days):
+        lines = [{"type": "order_step", "venue": w.venue.name, "batch": f"b{k}", "event": "fill", "fill_id": 10_000 + 30 * k + j,
+                  "tag": f"b{k}-IWM", "symbol": "IWM", "units": 1.0, "price": 200.0, "price_covers_units": 1.0, "fee": 0.0,
+                  "verdict": "breach" if (k, j) in ((0, 0), (5, 1)) else "ok"} for j in range(28)]
+        lines.append({"type": "order_step", "venue": w.venue.name, "batch": f"b{k}", "event": "summary", "status": "done",
+                      "stage": None, **({"faults": ["cap"], "cap_refs": ["fill-10151"]} if k == 5 else {})})
+        lines.append({"type": "summary", "equity": 1.0})
+        (w.tmp / "journal" / f"{day}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+    t0 = time.perf_counter()
+    out = _prun(w)
+    took = time.perf_counter() - t0
+    print(f"T34B3-SCAN 400 days, {400 * 30} lines: one run {took:.3f} s")
+    assert out["status"] == "done" and out["cap_refs"] == ["fill-10000"], out    # the oldest day is read; day 5 covered
+    assert took < 5.0
+
+
+# -- R4 and R3
+
+def test_t34b3_fill_lines_without_a_verdict_are_neither_carried_nor_judged_again(tmp_path):
+    w = _pw(tmp_path / "w")
+    for fid, price in ((7, 999.0), (8, None)):
+        w.journal.write("2026-11-12", {"type": "order_step", "venue": w.venue.name, "batch": f"old-{fid}", "event": "fill",
+                                       "fill_id": fid, "tag": f"old-{fid}-IWM", "symbol": "IWM", "units": 3.0, "price": price,
+                                       "price_covers_units": 3.0, "fee": 0.0})
+    out = _prun(w, {"a": {"SPY": 2.0}})
+    assert out["status"] == "done" and "faults" not in out and "cap_unjudged" not in out and "cap_refs" not in out, out
+    assert w.entries("verdict") == []
+
+
+def test_t34b3_an_unjudged_fill_stays_named_until_it_settles_by_one_verdict_line(tmp_path):
+    w = _pw(tmp_path / "w", fill_at_once=1.0, no_avg=True)
+    assert _prun(w, {"a": {"IWM": 3.0}})["cap_unjudged"] == ["IWM"]
+    (tag,) = w.venue.submits()
+    assert w.entries("fill")[0]["verdict"] == "unjudged"
+    w.later(30)
+    out = _prun(w)
+    assert out["cap_unjudged"] == ["IWM"] and "faults" not in out and w.entries("verdict") == [], out
+    w.venue.unpriced.discard(tag)                                 # the average comes at last, through the limit
+    w.venue.factor[tag] = 1.05
+    w.later(30)
+    out = _prun(w)
+    assert out["faults"] == ["cap"] and "fill-1" in out["cap_refs"] and "cap_unjudged" not in out, out
+    assert [(e["ref"], e["verdict"]) for e in w.entries("verdict")] == [("fill-1", "breach")]
+    w.later(30)
+    out = _prun(w)
+    assert "faults" not in out and "cap_unjudged" not in out and len(w.entries("verdict")) == 1, out
+
+
+# -- A and B2: the notices, journaled and judged once each
+
+def _restating(tmp):
+    """A practice world whose first run bought IWM 3, filled at once at its limit of 202."""
+    w = _pw(tmp, fill_at_once=1.0)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    (tag,) = w.venue.submits()
+    assert out["status"] == "done" and "faults" not in out and w.fills()[0]["price"] == 202.0
+    return w, tag
+
+
+def test_t34b3_a_restated_average_is_journaled_as_a_notice_with_its_verdict_and_named_in_the_summary(tmp_path):
+    w, tag = _restating(tmp_path / "w")
+    w.venue.avg[tag] = 201.995                                   # restated by half a cent
+    w.later(30)
+    out = _prun(w)
+    assert out["status"] == "done" and "faults" not in out and out["notices"] == ["avg_restated"], out
+    (n,) = w.entries("notice")
+    assert (n["kind"], n["tag"], n["old"], n["new"], n["verdict"]) == ("avg_restated", tag, 202.0, 201.995, "ok"), n
+    assert type(n["notice_id"]) is int and w.orders()[0]["avg_price"] == 201.995
+    w.later(30)
+    out = _prun(w)
+    assert "notices" not in out and "faults" not in out and len(w.entries("notice")) == 1, out
+
+
+def test_t34b3_three_restatements_give_three_notices_judged_once_and_the_third_through_the_limit_is_cap(tmp_path):
+    w, tag = _restating(tmp_path / "w")
+    outs = []
+    for avg in (201.995, 201.999, 202.004):
+        w.venue.avg[tag] = avg
+        w.later(30)
+        outs.append(_prun(w))
+    notes = w.entries("notice")
+    assert [n["verdict"] for n in notes] == ["ok", "ok", "breach"] and len({n["notice_id"] for n in notes}) == 3, notes
+    assert [o.get("faults") for o in outs] == [None, None, ["cap"]], outs
+    assert outs[2]["cap_refs"] == [f"notice-{notes[2]['notice_id']}"], outs[2]
+    w.later(30)
+    assert "faults" not in _prun(w) and len(w.entries("notice")) == 3
+
+
+@pytest.mark.parametrize("kill", ["_journal_notices", "_judge_final"])
+def test_t34b3_a_restatement_through_the_limit_survives_a_death_before_its_line_or_before_the_summary(tmp_path,
+                                                                                                     monkeypatch, kill):
+    w, tag = _restating(tmp_path / "w")
+    w.venue.avg[tag] = 202.004
+    w.later(30)
+    _kill_at(monkeypatch, kill)
+    with pytest.raises(KeyboardInterrupt):
+        _prun(w)
+    monkeypatch.undo()
+    assert len(w.entries("notice")) == (0 if kill == "_journal_notices" else 1)
+    w.later(30)
+    out = _prun(w)
+    (n,) = w.entries("notice")
+    assert n["verdict"] == "breach" and out["faults"] == ["cap"] and out["cap_refs"] == [f"notice-{n['notice_id']}"], out
+    w.later(30)
+    assert "faults" not in _prun(w) and len(w.entries("notice")) == 1
+
+
+@pytest.mark.parametrize("first, second, verdict", [(202.0, 201.79, "ok"), (202.5, 202.29, "breach")])
+def test_t34b3_an_unpriced_piece_is_judged_on_the_orders_average(tmp_path, first, second, verdict):
+    w = _pw(tmp_path / "w")
+    assert _prun(w, {"a": {"IWM": 1001.0}})["orders_sent"] == 1
+    (tag,) = w.venue.submits()
+    w.venue.held["IWM"] = 1001.0
+    w.venue.answers[tag] = [{"state": "partly_filled", "filled_units": 1000.0, "avg_price": first},
+                            {"state": "cancelled", "filled_units": 1001.0, "avg_price": second}]
+    w.later(30)
+    out = _prun(w)
+    lines = w.entries("fill")
+    assert [(e["units"], e["price"] is None, e["verdict"]) for e in lines] == [(1000.0, False, verdict),
+                                                                               (1.0, True, verdict)], lines
+    (n,) = w.entries("notice")
+    assert (n["kind"], n["old"], n["new"], n["verdict"]) == ("piece_unpriced", first, second, verdict), n
+    assert out["notices"] == ["piece_unpriced"] and "cap_unjudged" not in out, out
+    assert out.get("faults") == (["cap"] if verdict == "breach" else None), out
+
+
+# -- G: an unreadable venue is a skipped day
+
+def _resting(tmp):
+    """A practice world whose first run (2026-11-13) left IWM 3 resting at the venue; the clock at the next session."""
+    w = _pw(tmp)
+    assert _prun(w, {"a": {"IWM": 3.0}})["orders_sent"] == 1
+    w.next_day()
+    return w
+
+
+def _venue_down(w):
+    w.venue.raise_status = w.venue.raise_positions = True
+    w.venue.raise_on = {"cancel"}
+
+
+def test_t34b3_an_outage_alone_is_a_venue_read_stop_that_sends_nothing_and_the_ladder_skips(tmp_path):
+    w = _resting(tmp_path / "w")
+    _venue_down(w)
+    before = len(w.venue.calls)
+    out = _prun(w, {"a": {"IWM": 3.0, "SPY": 2.0}})
+    assert out["status"] == "stopped" and out["stage"] == "venue_read" and out["orders_sent"] == 0, out
+    assert "positions" in out["reason"] and "status" in out["reason"] and "faults" not in out, out
+    assert "submit" not in [c[0] for c in w.venue.calls[before:]]
+    assert "venue_read" in _sl.SKIP_STAGES and "venue_read" not in _sl.FAULT_STAGES
+    facts = _sl.session_facts(w.journal.read(), w.venue.name, CAL)
+    assert [(str(f.day), f.kind) for f in facts] == [("2026-11-13", "clean"), ("2026-11-16", "skipped")], facts
+
+
+@pytest.mark.parametrize("how", ["positions answer", "order read open", "unknown state", "unsettled order",
+                                 "anomaly first", "difference first", "item in the run", "older item", "ledger write"])
+def test_t34b3_an_outage_with_anything_else_wrong_stays_a_reconcile_stop(tmp_path, monkeypatch, how):
+    w = _resting(tmp_path / "w")
+    (tag,) = w.venue.submits()
+    _venue_down(w)
+    if how == "positions answer":                                # (a): the positions read did not raise
+        w.venue.raise_positions = False
+    elif how == "order read open":                               # R2: the venue read it as open after the cancel
+        w.venue.raise_status, w.venue.raise_on, w.venue.cancel_answer = False, set(), "not yet"
+    elif how == "unknown state":                                 # (b): an unresolved entry of another kind
+        w.venue.raise_status, w.venue.raise_on = False, set()
+        w.venue.answers[tag] = [{"state": "mystery"}]
+    elif how == "unsettled order":                               # (c)
+        _t34_ledger_state(w, tag, "unknown")
+    elif how == "anomaly first":                                 # R1, (d): a blocking anomaly in the first reconcile
+        w.venue.raise_status, n = False, [0]
+
+        def status(t):
+            n[0] += 1
+            if n[0] == 1:
+                return {"state": "partly_filled", "filled_units": 99.0, "avg_price": 200.0, "fee": 0.0,
+                        "venue_order_id": None, "raw_status": None}
+            raise ConnectionError("order_status is down")
+        w.venue.order_status = status
+    elif how == "difference first":                              # R1, (d): a position difference in the first one
+        w.venue.raise_positions, n = False, [0]
+
+        def positions():
+            n[0] += 1
+            if n[0] == 1:
+                return {"OWN": 10.0, "XLE": 1.0}
+            raise ConnectionError("positions is down")
+        w.venue.positions = positions
+    elif how == "item in the run":                               # (d): a blocking item opened in this run
+        def cancel(t):
+            _t34_flag(w, ["turned_up"], prefix="in-run")
+            raise ConnectionError("cancel is down")
+        w.venue.cancel = cancel
+    elif how == "older item":                                    # an open blocking item from before the run
+        _t34_flag(w, ["late_outcome"], prefix="old")
+    elif how == "ledger write":                                  # (e): storing the reconcile fails
+        real_rec = _Ledger.reconcile
+
+        def reconcile(self, *a, **k):
+            real_rec(self, *a, **k)
+            raise _orders.OrderError("the order ledger could not be written: disk I/O error")
+        monkeypatch.setattr(_Ledger, "reconcile", reconcile)
+    out = _prun(w, {"a": {"IWM": 3.0}})
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and out["orders_sent"] == 0, (how, out)
