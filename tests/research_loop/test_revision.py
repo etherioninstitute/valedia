@@ -116,3 +116,16 @@ def test_revision_needs_a_tested_version_and_respects_a_round_limit(tmp_path):
     assert out["stopped"] == "round limit reached" and len(out["rounds"]) == 1 and out["revisions_used"] == 1
     assert ledger.get(hid)["status"] == "failed"                         # still the failed development verdict
     assert set(out["rounds"][0]["probed"][0]) >= {"label", "dimension", "kind", "description", "ops", "contrast"}
+
+
+def test_a_pairs_strategy_is_refused_cleanly_and_nothing_is_counted(tmp_path):
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    paths, ledger, g, hid = desk(tmp_path, market(seed=1, drift=(0.0,) * 6))
+    s = PairsStrategy.from_spec({
+        "kind": "pairs", "name": "trend_fix", "version": "1.0.0", "hypothesis": "Two related prices drift back together after they part",
+        "pairs": [["A", "B"], ["C", "D"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}})
+    assert g.develop(hid, s, "strategies/trend_fix.json")["verdict"] == "fail"      # a failed idea: the loop would revise it
+    before = ledger.variations(hid)
+    with pytest.raises(st.SpecError, match="only rule strategies can be revised"):
+        rv.RevisionEngine(g, ledger, paths).revise(hid, s)
+    assert ledger.variations(hid) == before and not (paths.backtests / "trend_fix-revisions.json").exists()
