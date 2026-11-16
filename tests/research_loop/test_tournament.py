@@ -777,7 +777,9 @@ def test_a_perfect_forecaster_that_may_remember_the_dates_is_never_reported_as_s
         led = tm.TournamentLedger()
         day0 = pd.Timestamp("2024-01-01")
         for k, y in enumerate(outcomes):
-            led.add([tm.Question(f"q{k}", "funds", "blind history", str((day0 + pd.Timedelta(days=7 * k)).date()), 5, "AAA", "t", {}, 0.5)])
+            baseline = 0.3 + 0.04 * ((7 * k) % 11)                    # varied, so the weekly differences have a spread
+            led.add([tm.Question(f"q{k}", "funds", "blind history", str((day0 + pd.Timedelta(days=7 * k)).date()), 5, "AAA", "t", {},
+                                 baseline)])
             led.record(f"q{k}", "oracle", float(y), None, 1.0, model="m", unseen_after=unseen_after, prompt_sha=PROMPT_SHA)
             led.settle(f"q{k}", y)
         (row,) = tm.scores(led, min_settled=30)
@@ -846,3 +848,28 @@ def test_the_price_models_view_of_the_ledger_still_records_the_rules(tmp_path):
     led.close()
     assert out == {"rule-momentum": {"asked": 2, "answered": 2}, "rule-above-200d": {"asked": 2, "answered": 2}}
     assert [tuple(r) for r in rows] == [(q, w, "rule", PROMPT_SHA) for q in ("q0", "q2") for w in ("rule-above-200d", "rule-momentum")]
+
+
+def test_an_old_file_this_process_may_not_write_is_still_scored(tmp_path):
+    path = tmp_path / "t.sqlite"
+    _old_file(path)
+    digest = _sha(path)
+    path.chmod(0o444)
+    try:
+        led = tm.TournamentLedger(path)
+        out = tm.scores(led, min_settled=1)
+        led.close()
+    finally:
+        path.chmod(0o644)
+    assert _sha(path) == digest and len(out) == 4 and all(r["model"] is None for r in out)
+
+
+def test_a_roster_member_cannot_take_the_rule_forecasters_model_name():
+    led = tm.TournamentLedger()
+    led.add([tm.Question("q", "funds", "blind history", "2025-07-01", 5, "AAA", "t", {}, 0.5)])
+    calls = []
+    member = CallableMember("sly", "decider", lambda case: (calls.append(1) or (0.6, None, "")))
+    with pytest.raises(ValueError, match="rule"):
+        tm.ask(led, [member], roster={"members": [{"name": "sly", "role": "decider", "model_label": "rule"}]})
+    assert calls == [] and led.counts()["answers"] == {}
+    led.close()

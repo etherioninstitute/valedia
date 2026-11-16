@@ -22,6 +22,14 @@ resampling whole weeks. The rescaled score refits the forecaster's probabilities
 questions only, then scores the later half, so a model that says "about 0.1" to everything but orders the
 cases well is not lost behind its scale. Two rule forecasters (`--with-rules`) give a model a one-line rule to beat.
 
+A model remembers what markets did before it was trained, and a blind question hides the date, not the past. So
+every answer records which model gave it (the panel roster's `model_label`, else its `model`; "rule" for a rule),
+the date after which that model certainly cannot have seen a market (the roster's `unseen_after`; none means
+nothing is certainly unseen) and a fingerprint of the prompt. Each score row is one forecaster, one model, one
+prompt, one market, one kind and one memory class: "asked live" (a forward question), "no memory" (a rule),
+"after release" (a blind question dated after `unseen_after`) or "may be remembered" (every other blind
+question, every old answer with no model recorded among them), which is never evidence of skill.
+
     python -m valedia_trader.research_loop.tournament refresh --universe stocks       (or crypto: see universes.json)
     python -m valedia_trader.research_loop.tournament ask-blind --data artifacts/data --market funds --count 300
     python -m valedia_trader.research_loop.tournament ask-forward --data artifacts/data --market funds --with-rules
@@ -38,6 +46,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -56,6 +65,48 @@ __all__ = ["Question", "TournamentLedger", "direction_questions", "settle_direct
 MIN_HISTORY = 253                 # a year of prices before an asset can be asked about
 HIDDEN_WHEN_BLIND = ("symbol", "as_of", "data_age_days")
 KINDS = ("forward", "blind history")
+IDENTITY_COLUMNS = ("model", "unseen_after", "prompt_sha")        # added to an old file on a writable open
+RULE_MODEL = "rule"                                             # the model of a forecaster that is not a trained model
+MEMORY_CLASSES = ("asked live", "no memory", "after release", "may be remembered")
+NOT_EVIDENCE = "not evidence: the model may remember these dates"
+GROUP_KEYS = ("forecaster", "model", "prompt_sha", "market", "kind", "memory")
+
+
+def prompt_sha() -> str:
+    """The first 12 hex characters of the SHA-1 of the panel's prompt."""
+    return hashlib.sha1(panel_mod.PROMPT.encode()).hexdigest()[:12]
+
+
+def _iso_day(text) -> date | None:
+    """A YYYY-MM-DD day (a time after it is ignored), or None for anything else."""
+    s = str(text)
+    if len(s) < 10 or not (s[:4].isdigit() and s[4] == "-" and s[5:7].isdigit() and s[7] == "-" and s[8:10].isdigit()):
+        return None
+    if len(s) > 10 and s[10] not in "T ":
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def memory_class(kind: str, model: str | None, unseen_after: str | None, asked_on: str) -> str:
+    """What the forecaster may have known of the outcome: one of MEMORY_CLASSES. Anything unreadable is
+    "may be remembered", and so is a blind question asked on the release day itself."""
+    if kind == "forward":
+        return "asked live"
+    if kind != "blind history":
+        return "may be remembered"
+    if model == RULE_MODEL:
+        return "no memory"
+    released, day = (_iso_day(unseen_after) if unseen_after is not None else None), _iso_day(asked_on)
+    if released is not None and day is not None and day > released:
+        return "after release"
+    return "may be remembered"
+
+
+def _forecast_columns(db: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in db.execute("PRAGMA table_info(forecasts)")}
 
 
 @dataclass(frozen=True)
@@ -130,6 +181,24 @@ class TournamentLedger:
             "CREATE TABLE IF NOT EXISTS forecasts (question_id TEXT, forecaster TEXT, probability REAL, error TEXT, latency_ms REAL, "
             "ts REAL, PRIMARY KEY (question_id, forecaster));"
             "CREATE TABLE IF NOT EXISTS outcomes (question_id TEXT PRIMARY KEY, outcome INTEGER, settled_ts REAL);")
+        self._add_identity_columns()
+
+    def _add_identity_columns(self) -> None:
+        """Give an old file the three identity columns, each only when it is missing. A file this process may not
+        write (opened read-only underneath) is left as it is; every read path works without the columns."""
+        have = _forecast_columns(self._db)
+        for col in IDENTITY_COLUMNS:
+            if col in have:
+                continue
+            try:
+                self._db.execute(f"ALTER TABLE forecasts ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" in str(exc):          # another process added it since we looked
+                    continue
+                if "readonly" in str(exc):
+                    break
+                raise
+        self._db.commit()
 
     def add(self, questions: Sequence[Question]) -> int:
         """Add the questions not already on file. Returns how many were new."""
@@ -146,9 +215,15 @@ class TournamentLedger:
         """Questions this forecaster has given a usable answer to. A failed call is asked again."""
         return {r[0] for r in self._db.execute("SELECT question_id FROM forecasts WHERE forecaster = ? AND error IS NULL", (forecaster,))}
 
-    def record(self, question_id: str, forecaster: str, probability: float | None, error: str | None, latency_ms: float) -> None:
-        self._db.execute("INSERT OR REPLACE INTO forecasts VALUES (?,?,?,?,?,?)",
-                         (question_id, forecaster, probability, error, float(latency_ms), time.time()))
+    def record(self, question_id: str, forecaster: str, probability: float | None, error: str | None, latency_ms: float,
+               model: str | None = None, unseen_after: str | None = None, prompt_sha: str | None = None) -> None:
+        """One answer, with the model that gave it, the date after which that model cannot have seen the market and
+        the prompt's fingerprint (each None when unknown)."""
+        text = lambda v: None if v is None else str(v)
+        self._db.execute("INSERT OR REPLACE INTO forecasts (question_id, forecaster, probability, error, latency_ms, ts, model, "
+                         "unseen_after, prompt_sha) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (question_id, forecaster, probability, error, float(latency_ms), time.time(), text(model), text(unseen_after),
+                          text(prompt_sha)))
         self._db.commit()
 
     def settle(self, question_id: str, outcome: int) -> bool:
@@ -164,8 +239,11 @@ class TournamentLedger:
             "SELECT q.id, q.market, q.kind, q.asked_on, q.symbol, q.baseline, o.outcome FROM questions q JOIN outcomes o ON o.question_id = q.id")]
 
     def scored_rows(self) -> list[dict]:
+        """Every usable answer to a settled question. A file without the identity columns reads them as None."""
+        have = _forecast_columns(self._db)
+        ident = ", ".join(f"f.{c}" if c in have else f"NULL AS {c}" for c in IDENTITY_COLUMNS)
         return [dict(r) for r in self._db.execute(
-            "SELECT f.forecaster, f.probability, q.market, q.kind, q.asked_on, q.baseline, o.outcome FROM forecasts f "
+            f"SELECT f.forecaster, {ident}, f.probability, q.market, q.kind, q.asked_on, q.baseline, o.outcome FROM forecasts f "
             "JOIN questions q ON q.id = f.question_id JOIN outcomes o ON o.question_id = q.id "
             "WHERE f.error IS NULL AND f.probability IS NOT NULL ORDER BY q.asked_on, q.id, f.forecaster")]
 
@@ -195,8 +273,24 @@ def settle_directions(ledger: TournamentLedger, prices: pd.DataFrame) -> int:
     return done
 
 
+def _identity(member: panel_mod.Member, specs: dict[str, dict]) -> tuple[str | None, str | None]:
+    """(model, unseen_after) for a forecaster: from the roster entry of its name when there is one (`model_label`,
+    else `model`), "rule" for the rule forecasters, and nothing known otherwise."""
+    spec = specs.get(member.name)
+    if spec is not None:
+        label = spec.get("model_label") or spec.get("model")
+        if label == RULE_MODEL:
+            raise ValueError(f"roster member {member.name!r}: the model name {RULE_MODEL!r} is kept for the rule forecasters")
+        unseen = spec.get("unseen_after")
+        return (None if label is None else str(label)), (None if unseen is None else str(unseen))
+    if getattr(member, "_tournament_rule", False) is True:
+        return RULE_MODEL, None
+    return None, None
+
+
 def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=None, max_age_days: int = 3,
-        limit: int | None = None, progress=None, kinds: Sequence[str] | None = None) -> dict[str, dict[str, int]]:
+        limit: int | None = None, progress=None, kinds: Sequence[str] | None = None,
+        roster: dict | None = None) -> dict[str, dict[str, int]]:
     """Put every question a forecaster has not answered to it. A forecaster sees the thesis and the
     facts, as the decision panel does, and nothing else. Failures are recorded and asked again next time.
 
@@ -204,14 +298,20 @@ def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=Non
     open: a forecaster that arrives later must not answer it with hindsight.
 
     With `kinds` given (values from KINDS), only questions of those kinds are considered, before the freshness
-    rule and before `limit`; an unknown kind is a ValueError, raised before any forecaster is asked."""
+    rule and before `limit`; an unknown kind is a ValueError, raised before any forecaster is asked.
+
+    Each answer records the model and `unseen_after` of the roster entry of the forecaster's name (`roster`,
+    default the panel roster), "rule" for a rule forecaster, and the prompt's fingerprint."""
     if kinds is not None:
         kinds = (kinds,) if isinstance(kinds, str) else tuple(kinds)
         unknown = [k for k in kinds if k not in KINDS]
         if unknown:
             raise ValueError(f"unknown question kind {unknown[0]!r}; the kinds are {', '.join(KINDS)}")
+    specs = {s["name"]: s for s in (panel_mod.load_roster() if roster is None else roster).get("members", [])}
+    identities = [_identity(m, specs) for m in members]             # a bad roster entry fails before anyone is asked
+    sha = prompt_sha()
     out = {}
-    for m in members:
+    for m, (model, unseen_after) in zip(members, identities):
         have = ledger.answered(m.name)
         todo = [q for q in ledger.questions() if q["id"] not in have and (kinds is None or q["kind"] in kinds)]
         if today is not None:
@@ -223,7 +323,9 @@ def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=Non
         for n, q in enumerate(todo, start=1):
             v = m.ask({"thesis": q["thesis"], "facts": q["facts"]})
             ok = v.error is None and v.probability is not None
-            ledger.record(q["id"], m.name, v.probability if ok else None, None if ok else (v.error or "no probability in the reply"), v.latency_ms)
+            # positional on purpose: price_models' view of the ledger passes record(*args) on as it is
+            ledger.record(q["id"], m.name, v.probability if ok else None, None if ok else (v.error or "no probability in the reply"), v.latency_ms,
+                          model, unseen_after, sha)
             answered += int(ok)
             if progress and (n % 25 == 0 or n == len(todo)):
                 progress(f"{m.name}: {n}/{len(todo)} asked, {answered} answered")
@@ -329,12 +431,19 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
     ranking is the chance a case that came true got a higher forecast than one that did not (ties count
     half; 0.5 is a coin), between ranking_low and ranking_high (95%, resampling whole weeks). The rescaled_*
     keys are the same Brier comparison on the later half of the questions after the forecasts are rescaled
-    by a fit to the earlier half alone; None when there are too few questions to split."""
+    by a fit to the earlier half alone; None when there are too few questions to split.
+
+    A row is one forecaster, model, prompt, market, kind and memory class (GROUP_KEYS): two models under one
+    name, two prompts, or a question the model may remember and one it cannot have seen are never pooled. A row
+    whose memory is "may be remembered" has NOT_EVIDENCE as its verdict and its ranking verdict, whatever its
+    numbers, which are still reported."""
     groups: dict[tuple, list[dict]] = {}
     for r in ledger.scored_rows():
-        groups.setdefault((r["forecaster"], r["market"], r["kind"]), []).append(r)
+        r["memory"] = memory_class(r["kind"], r["model"], r["unseen_after"], r["asked_on"])
+        groups.setdefault(tuple(r[k] for k in GROUP_KEYS), []).append(r)
+    in_order = lambda item: tuple((v is None, "" if v is None else str(v)) for v in item[0])   # None sorts last, never compared
     out = []
-    for (who, market, kind), rows in sorted(groups.items()):
+    for (who, model, sha, market, kind, memory), rows in sorted(groups.items(), key=in_order):
         p, y, b = (np.array([r[k] for r in rows], dtype=float) for k in ("probability", "outcome", "baseline"))
         mine, base = (p - y) ** 2, (b - y) ** 2
         t, weeks = _t_by_week(rows, mine - base)
@@ -356,7 +465,10 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
             ranking_verdict = "ranks worse than chance"
         else:
             ranking_verdict = "ranking not distinguishable from chance"
-        out.append({"forecaster": who, "market": market, "kind": kind, "settled": n, "weeks": weeks,
+        if memory == "may be remembered":
+            verdict = ranking_verdict = NOT_EVIDENCE
+        out.append({"forecaster": who, "model": model, "prompt_sha": sha, "market": market, "kind": kind, "memory": memory,
+                    "settled": n, "weeks": weeks,
                     "brier": float(mine.mean()), "baseline_brier": float(base.mean()),
                     "skill": float(1.0 - mine.mean() / base.mean()) if base.mean() > 0 else 0.0, "t_by_week": t,
                     "mean_forecast": float(p.mean()), "came_true": float(y.mean()),
@@ -376,7 +488,10 @@ def reference_forecasters() -> list[panel_mod.Member]:
     def above(case):
         a = case["facts"].get("above_200d_average")
         return (0.5 if a is None else 0.6 if a else 0.4), None, "200-day average rule"
-    return [panel_mod.CallableMember("rule-momentum", "decider", momentum), panel_mod.CallableMember("rule-above-200d", "decider", above)]
+    rules = [panel_mod.CallableMember("rule-momentum", "decider", momentum), panel_mod.CallableMember("rule-above-200d", "decider", above)]
+    for m in rules:
+        m._tournament_rule = True                           # `ask` records these as model "rule": nothing to remember
+    return rules
 
 
 def forecasters(names: Sequence[str] | None = None, roster: dict | None = None) -> list[panel_mod.Member]:
