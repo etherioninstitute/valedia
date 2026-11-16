@@ -1,3 +1,4 @@
+import dataclasses
 import io
 import json
 import math
@@ -143,7 +144,7 @@ def test_tables_and_askers():
     table = rs.price_table(px, px * 1e6)
     assert "volume_20d_vs_1y" in table and _csv_block(table).count("\n") == len(SYMBOLS) + 1
     macro = rs.macro_table(px)
-    assert "TLT/IEF long bonds vs intermediate" in macro and "SPY-TLT correlation of daily returns, last 60 sessions: " in macro
+    assert "TLT/IEF long bonds vs intermediate" in macro and "SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: " in macro
     assert rs.parse_ideas('noise {"ideas": [{"idea": "x"}, 5]} trailing') == [{"idea": "x"}]
     for bad in ("nothing", '{"ideas": 3}'):
         with pytest.raises(ValueError):
@@ -255,7 +256,7 @@ def test_every_price_column_is_defined_and_recomputes_from_its_definition():
     assert set(table.columns) == set(defs) == set(PRICE_RECOMPUTE)       # no unlabelled column, no definition without a column
     assert list(table.index) == SYMBOLS
     for name, d in defs.items():
-        assert d.unit in UNITS and d.sentence.strip() and isinstance(d.window, int) and d.window > 0, name
+        assert d.unit in UNITS and d.text.strip() and isinstance(d.window, int) and d.window > 0, name
         for sym in SYMBOLS:
             want = PRICE_RECOMPUTE[name](px[sym].to_numpy(), dv[sym].to_numpy(), d.window, d.baseline_window)
             assert table.loc[sym, name] == pytest.approx(want, abs=5.01e-4), (name, sym)
@@ -283,7 +284,7 @@ def test_every_macro_column_is_defined_and_recomputes_from_its_definition():
     for a, b, label in present:
         ratio = (px[a] / px[b]).to_numpy()
         for name, d in defs.items():
-            assert d.unit == "fraction" and d.sentence.strip() and d.window > 0
+            assert d.unit == "fraction" and d.text.strip() and d.window > 0
             want = MACRO_RECOMPUTE[name](ratio, None, d.window, d.baseline_window)
             assert table.loc[f"{a}/{b} {label}", name] == pytest.approx(want, abs=5.01e-4), (a, b, name)
     assert [defs[k].window for k in ("chg_3m", "chg_12m", "vs_200d_avg")] == [63, 252, 200]
@@ -308,10 +309,11 @@ def test_the_legend_is_generated_from_the_definitions_and_sits_above_each_table_
         assert prompt.index("Your data, as of") < prompt.index(legend)
         for name, d in defs.items():
             line = next(ln for ln in legend.splitlines() if ln.lstrip("- ").startswith(name + " "))
-            assert d.unit in line and f"{d.window} sessions" in line and d.sentence in line, name
+            assert d.unit in line and f"{d.window} sessions" in line and d.text in line, name
             if d.baseline_window:
                 assert f"{d.baseline_window} sessions" in line
-        for sentence in ("fractions", "0.052 means 5.2%", "1m = 21", "3m = 63", "12m and 1y = 252", "252 sessions a year", "3 decimals"):
+        for sentence in ("fractions", "0.052 means 5.2%", "1m = 21", "3m = 63", "12m and 1y = 252", "252 sessions a year", "3 decimals",
+                         "A blank cell means the symbol does not have a price on every session the column needs."):
             assert sentence in legend, sentence
     other = rs.build_prompt(rs.ROLES["price-analyst"], "us-etf", SYMBOLS, px.index[-1], rs.price_table(px), [])
     assert "ret_12m" in other and "chg_12m" not in other and "credit vs treasuries" not in other
@@ -330,19 +332,39 @@ def test_the_correlation_is_its_own_line_after_the_macro_table_and_in_no_row():
     assert not any("correlation" in str(i).lower() for i in table.index) and "chg_3m" in table.columns
     r = px.pct_change().iloc[-60:]
     want = np.corrcoef(r["SPY"].to_numpy(), r["TLT"].to_numpy())[0, 1]
-    line = f"SPY-TLT correlation of daily returns, last 60 sessions: {want:.3f}"
+    line = f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {want:.3f}"
     assert text.splitlines()[-1] == line and text.count("SPY-TLT correlation") == 1
     assert text.index(line) > text.index(_csv_block(text).strip().splitlines()[-1])
     for gone in ("SPY", "TLT"):
         assert not any(ln.startswith("SPY-TLT correlation") for ln in rs.macro_table(px.drop(columns=gone)).splitlines())
 
 
+def _prices_on(idx, seed=3):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(100 * np.exp(np.cumsum(0.0003 + 0.01 * rng.standard_normal((len(idx), len(SYMBOLS))), axis=0)),
+                        index=idx, columns=SYMBOLS)
+
+
 def _frame(rate, n):
-    """n rows on a calendar of about `rate` rows a year: day offsets rate-spaced, to the day."""
+    """n rows on a seven-day calendar of about `rate` rows a year: day offsets rate-spaced, to the day."""
     days = np.floor(np.arange(n) * 365.25 / rate).astype(int)
-    idx = pd.Timestamp("2018-01-01") + pd.to_timedelta(days, unit="D")
-    rng = np.random.default_rng(3)
-    return pd.DataFrame(100 * np.exp(np.cumsum(0.0003 + 0.01 * rng.standard_normal((n, len(SYMBOLS))), axis=0)), index=idx, columns=SYMBOLS)
+    return _prices_on(pd.Timestamp("2018-01-01") + pd.to_timedelta(days, unit="D"))
+
+
+def _weekday_index(n, d0="2018-01-02", d1="2020-12-31"):
+    """n strictly increasing timestamps, all on weekdays, the first on d0 and the last on d1's last weekday: rows are spread evenly
+    over the weekdays and, when there are more rows than weekdays, share a day an hour apart. The span is fixed, so the rows a year
+    are exactly proportional to n."""
+    days = pd.bdate_range(d0, d1)
+    pos = np.linspace(0, len(days) - 1, n)
+    day = np.floor(pos + 1e-9).astype(int)
+    first_of_day = {d: i for i, d in reversed(list(enumerate(day)))}
+    hour = np.array([i - first_of_day[d] for i, d in enumerate(day)])
+    return pd.DatetimeIndex(days[day]) + pd.to_timedelta(hour, unit="h")
+
+
+def _weekday_frame(rate, years=3):
+    return _prices_on(_weekday_index(int(rate * years)))
 
 
 @pytest.mark.parametrize("fn", ["price_table", "macro_table"])
@@ -352,18 +374,69 @@ def test_calendar_guard_refuses_a_frame_that_is_not_252_sessions_a_year(fn):
     with pytest.raises(ValueError, match=re.escape(measured)):
         getattr(rs, fn)(daily)
     for rate in (200, 230, 275, 300):
-        with pytest.raises(ValueError):
-            getattr(rs, fn)(_frame(rate, int(rate * 3)))
+        with pytest.raises(ValueError, match="rows a year"):
+            getattr(rs, fn)(_weekday_frame(rate))
     for rate in (245, 252, 258):                                         # within 5% of 252
-        assert getattr(rs, fn)(_frame(rate, int(rate * 3)))
+        assert getattr(rs, fn)(_weekday_frame(rate))
     assert getattr(rs, fn)(dev_prices())                                 # the weekday calendar (about 262 a year, holidays kept in)
 
 
+def test_calendar_guard_boundary_is_252_minus_and_plus_five_percent_within_one_row():
+    idx = {n: _weekday_index(n) for n in range(600, 1000)}
+    years = (idx[600][-1] - idx[600][0]).days / 365.25
+    assert all((i[-1] - i[0]).days / 365.25 == years for i in idx.values())      # one span for every row count
+
+    def refused(n):
+        try:
+            rs._check_calendar(pd.DataFrame({"SPY": 1.0}, index=idx[n]))
+        except ValueError:
+            return True
+        return False
+    mid = int(252 * years)
+    below = max(n for n in range(600, mid) if refused(n))                # the largest count refused below 252 a year
+    above = min(n for n in range(mid, 1000) if refused(n))               # the smallest count refused above it
+    assert not refused(mid) and abs(below - 0.95 * 252 * years) <= 1 and abs(above - 1.05 * 252 * years) <= 1
+    assert not any(refused(n) for n in range(below + 1, above))
+
+
 @pytest.mark.parametrize("fn", ["price_table", "macro_table"])
-def test_calendar_guard_does_not_judge_a_frame_shorter_than_a_year(fn):
-    short = _frame(365.25, 200)                                          # 200 daily rows span 0.55 years: not judged
+def test_calendar_guard_does_not_judge_the_rate_of_a_frame_shorter_than_a_year(fn):
+    short = _prices_on(_weekday_index(150, "2018-01-02", "2018-11-30"))  # 150 weekday rows over 0.91 years: about 165 a year
     assert (short.index[-1] - short.index[0]).days < 365
     assert isinstance(getattr(rs, fn)(short), str)
+
+
+@pytest.mark.parametrize("fn", ["price_table", "macro_table"])
+def test_calendar_guard_refuses_a_row_dated_on_a_weekend_whatever_the_length(fn):
+    seven_day_short = _frame(365.25, 360)                                # 360 seven-day rows: under a year
+    assert (seven_day_short.index[-1] - seven_day_short.index[0]).days < 365
+    with pytest.raises(ValueError, match="Saturday or Sunday"):
+        getattr(rs, fn)(seven_day_short)
+    one = dev_prices().copy()                                            # a single Saturday in an otherwise clean frame
+    friday = next(k for k in range(100, 200) if one.index[k].dayofweek == 4)
+    one.index = one.index.where(one.index != one.index[friday], one.index[friday] + pd.Timedelta(days=1))
+    assert one.index[friday].dayofweek == 5 and one.index.is_monotonic_increasing
+    with pytest.raises(ValueError, match="Saturday or Sunday"):
+        getattr(rs, fn)(one)
+    mixed = pd.concat([dev_prices(2600), _prices_on(pd.date_range(dev_prices(2600).index[-1] + pd.Timedelta(days=1), periods=100))])
+    assert abs(len(mixed) / ((mixed.index[-1] - mixed.index[0]).days / 365.25) - 252) < 0.05 * 252   # the rate rule alone passes it
+    with pytest.raises(ValueError, match="Saturday or Sunday"):
+        getattr(rs, fn)(mixed)
+
+
+@pytest.mark.parametrize("fn", ["price_table", "macro_table"])
+def test_calendar_guard_refuses_an_index_that_is_not_strictly_increasing(fn):
+    px = dev_prices()
+    with pytest.raises(ValueError, match="strictly increasing"):
+        getattr(rs, fn)(px.iloc[::-1])
+    swapped = px.copy()
+    swapped.index = swapped.index[:300].tolist() + [swapped.index[301], swapped.index[300]] + swapped.index[302:].tolist()
+    with pytest.raises(ValueError, match="strictly increasing"):
+        getattr(rs, fn)(swapped)
+    dup = px.copy()
+    dup.index = px.index[:50].tolist() + [px.index[49]] + px.index[51:].tolist()
+    with pytest.raises(ValueError, match="strictly increasing"):
+        getattr(rs, fn)(dup)
 
 
 def test_a_refused_frame_is_reported_by_the_run_and_no_prompt_is_sent(env):
@@ -379,3 +452,125 @@ def test_the_macro_legend_says_what_a_session_is_for_a_pair_and_the_price_legend
     sentence = "For a pair, a session is a day on which both funds have a price."
     assert sentence in _legend_part(rs.macro_table(px))
     assert sentence not in _legend_part(rs.price_table(px, dollar_volume(px)))
+
+
+# ---- addendum 1
+
+def _ragged(n_prices, gap=None, symbol="TLT"):
+    """dev_prices with `symbol` priced only on its last `n_prices` sessions (or, with `gap`, missing on the sessions in `gap`)."""
+    px = dev_prices()
+    if gap is not None:
+        px.loc[px.index[gap], symbol] = np.nan
+    else:
+        px.loc[px.index[: len(px) - n_prices], symbol] = np.nan
+    return px
+
+
+# the number of prices a column needs, independent of the module: a change needs the last price and the one `window` back; a
+# standard deviation of `window` returns needs window + 1 consecutive prices; a high or an average needs `window` prices; the
+# move needs its change and its baseline's returns; the volume ratio needs its baseline window of volumes
+def _needs(name, d):
+    if name.startswith("ret_"):
+        return "ends", d.window
+    if name.startswith("vol_"):
+        return "run", d.window + 1
+    if name in ("below_1y_high", "vs_200d_avg"):
+        return "run", d.window
+    if name == "move_5d_in_sd":
+        return "both", (d.window, d.baseline_window + 1)
+    if name == "volume_20d_vs_1y":
+        return "run", d.baseline_window
+    raise AssertionError(name)
+
+
+def _present(series, name, d):
+    """True when the series has a price on every session the column needs."""
+    kind, k = _needs(name, d)
+    ok = ~np.isnan(series)
+    if kind == "ends":
+        return len(series) > k and ok[-1] and ok[-1 - k]
+    if kind == "run":
+        return len(series) >= k and ok[-k:].all()
+    return len(series) > k[0] and ok[-1] and ok[-1 - k[0]] and len(series) >= k[1] and ok[-k[1]:].all()
+
+
+@pytest.mark.parametrize("make", [lambda: _ragged(30), lambda: _ragged(0, gap=[500]), lambda: _ragged(0, gap=slice(560, 575)),
+                                  lambda: _ragged(0, gap=[599]), lambda: _ragged(100)])
+def test_a_column_is_blank_for_a_symbol_without_a_price_on_every_session_it_needs(make):
+    px = make()
+    dv = dollar_volume(px)
+    dv.loc[dv.index[:-15], "XLU"] = np.nan                               # XLU has 15 dollar volumes: the volume ratio needs 252
+    table = _parse(rs.price_table(px, dv))
+    blanks = 0
+    for name, d in rs.PRICE_COLUMNS.items():
+        for sym in SYMBOLS:
+            series = (dv if name == "volume_20d_vs_1y" else px)[sym].to_numpy()
+            if _present(series, name, d):
+                want = PRICE_RECOMPUTE[name](px[sym].to_numpy(), dv[sym].to_numpy(), d.window, d.baseline_window)
+                assert table.loc[sym, name] == pytest.approx(want, abs=5.01e-4), (sym, name)
+            else:
+                blanks += 1
+                assert math.isnan(table.loc[sym, name]), (sym, name)
+    assert blanks >= 1
+
+
+def test_a_symbol_with_29_returns_has_no_yearly_figures_and_the_legend_says_what_blank_means():
+    px = _ragged(30)                                                     # TLT: 30 prices, 29 returns
+    text = rs.price_table(px, dollar_volume(px))
+    row = _parse(text).loc["TLT"]
+    assert row[["ret_1m", "vol_20d"]].notna().all()                      # 21 back and 20 returns are available
+    assert row[["ret_3m", "ret_12m", "vol_1y", "below_1y_high", "vs_200d_avg", "move_5d_in_sd"]].isna().all()
+    assert "A blank cell means the symbol does not have a price on every session the column needs." in _legend_part(text)
+    assert _parse(text).drop(index="TLT").notna().all().all()            # nothing else went blank
+
+
+def test_the_sentences_say_sample_standard_deviation_and_move_5d_in_sd_has_one_reading():
+    defs = rs.PRICE_COLUMNS
+    assert defs["move_5d_in_sd"].text == ("The 5-session change divided by the product of (the sample standard deviation of the "
+                                          "last 60 daily returns) and (the square root of 5).")
+    assert "sample standard deviation" in defs["vol_20d"].text and "sample standard deviation" in defs["vol_1y"].text
+
+
+def test_every_number_in_a_sentence_is_formatted_from_the_definitions_own_fields():
+    for table in (rs.PRICE_COLUMNS, rs.MACRO_COLUMNS):
+        for name, d in table.items():
+            changed = dataclasses.replace(d, window=37, baseline_window=41 if d.baseline_window else None)
+            numbers = {int(x) for x in re.findall(r"\d+", changed.text)}
+            assert 37 in numbers and (41 in numbers) == bool(d.baseline_window), name
+            assert numbers <= {37, 41, 0, 1, 252}, (name, numbers)       # 252 is the sessions a year in "square root of 252"
+            assert (252 in numbers) == name.startswith("vol_"), name
+            line = rs._legend({**table, name: changed}, [name]).splitlines()[-1]
+            assert changed.text in line and "window 37 sessions" in line
+
+
+def _shared(px, a="SPY", b="TLT", k=61):
+    both = px[[a, b]].dropna().iloc[-k:]
+    r = both.to_numpy()[1:] / both.to_numpy()[:-1] - 1
+    return np.corrcoef(r[:, 0], r[:, 1])[0, 1]
+
+
+def test_the_correlation_uses_the_last_60_sessions_on_which_both_funds_have_a_price():
+    px = dev_prices()
+    px.loc[px.index[[590, 595]], "TLT"] = np.nan                         # two sessions without TLT: they are dropped first
+    line = rs.macro_table(px).splitlines()[-1]
+    assert line == f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {_shared(px):.3f}"
+    plain = px.pct_change().iloc[-60:]
+    assert f"{np.corrcoef(plain['SPY'].fillna(0), plain['TLT'].fillna(0))[0, 1]:.3f}" != f"{_shared(px):.3f}"
+
+
+def test_the_correlation_needs_61_shared_prices():
+    px = dev_prices()
+    short = px.copy()
+    short.loc[short.index[:-60], "TLT"] = np.nan                         # TLT has 60 prices: 59 returns
+    assert not any(ln.startswith("SPY-TLT correlation") for ln in rs.macro_table(short).splitlines())
+    enough = px.copy()
+    enough.loc[enough.index[:-61], "TLT"] = np.nan                       # 61 prices: exactly 60 returns
+    assert rs.macro_table(enough).splitlines()[-1].endswith(f"both have a price: {_shared(enough):.3f}")
+
+
+def test_an_empty_macro_table_prints_no_table_and_no_legend():
+    px = dev_prices()[["SPY", "TLT"]]                                    # no pair qualifies
+    text = rs.macro_table(px)
+    assert text == f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {_shared(px):.3f}\n"
+    assert rs.macro_table(dev_prices()[["SPY", "XLK"]]) == ""
+    assert rs.macro_table(dev_prices()[["XLK", "XLU"]].iloc[:200]) == ""   # a pair with too few sessions for the 12-month window

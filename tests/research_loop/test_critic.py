@@ -520,3 +520,60 @@ def test_without_a_simple_figure_the_review_prints_only_the_compound_one_labelle
     assert "backtest_simple_annual" in result and result["backtest_simple_annual"] is None
     line = next(ln for ln in _review_text(journal, days).splitlines() if ln.startswith("- Backtest:"))
     assert "+11.00% a year (compound)" in line and "average daily return times 252" not in line and "n/a" not in line
+
+
+@pytest.mark.parametrize("bt", [
+    {"cagr": 0.1058, "annual_vol": 8.6e-19, "sharpe": 0.0, "max_drawdown": 0.0},       # a constant +0.04% a day backtest (the checker's case)
+    {"cagr": 0.1058, "annual_vol": 1e-13, "sharpe": 3.0, "max_drawdown": 0.0},         # below 1e-12
+    {"cagr": 0.1058, "annual_vol": -0.2, "sharpe": 1.0, "max_drawdown": 0.0},          # a negative volatility
+    {"cagr": 0.1058, "annual_vol": 1e200, "sharpe": 1e200, "max_drawdown": 0.0},       # the product overflows
+    {"cagr": 0.1058, "annual_vol": 0.0, "sharpe": 1.0, "max_drawdown": 0.0},
+])
+def test_a_backtest_with_no_variation_a_negative_volatility_or_an_overflow_gives_no_comparison(tmp_path, bt):
+    assert cr._backtest_simple_annual(bt) == (None, None)
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, bt)
+    days = summaries(journal, "2026-09-01", [0.0004] * LIVE_DAYS)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    result = out["strategies"]["mom"]["result"]
+    assert math.isnan(result["z_vs_backtest"]) and result["backtest_simple_annual"] is None
+    assert not any("is running at" in n for n in out["strategies"]["mom"]["notes"])
+    line = next(ln for ln in _review_text(journal, days).splitlines() if ln.startswith("- Backtest:"))
+    assert "+0.00%" not in line and "average daily return times 252" not in line and "+10.58% a year (compound)" in line
+
+
+def test_the_helper_still_forms_the_product_for_a_sound_backtest():
+    assert cr._backtest_simple_annual({"sharpe": 0.5, "annual_vol": 0.4}) == (pytest.approx(0.2), 0.4)
+    assert cr._backtest_simple_annual({"sharpe": -0.5, "annual_vol": 0.4}) == (pytest.approx(-0.2), 0.4)
+    assert cr._backtest_simple_annual({"sharpe": 0.5, "annual_vol": 1.1e-12})[0] == pytest.approx(0.55e-12)
+
+
+# A pause can flip with the basis. Paper z is (live annual - backtest annual) * sqrt(days) / (annual_vol * sqrt(252)); pause at z <= -2.
+def _z(live_annual, backtest_annual, vol, days):
+    return (live_annual - backtest_annual) * math.sqrt(days) / (vol * math.sqrt(252))
+
+
+def test_a_strategy_the_compound_basis_would_pause_is_not_paused_on_the_simple_basis(tmp_path):
+    # vol 0.10, simple 0.388 (sharpe 3.88) and compound 0.4735 (low volatility: compounding beats the simple average); 25 days at
+    # -0.19 a year.  compound basis z = (-0.19 - 0.4735) * 5 / (0.10 * 15.875) = -2.09 (pause);  simple basis z = -1.82 (no pause).
+    bt = {"cagr": 0.4735, "annual_vol": 0.10, "sharpe": 3.88, "max_drawdown": 0.9}
+    live = -0.19
+    assert _z(live, 0.4735, 0.10, 25) <= -2.0 < _z(live, 0.388, 0.10, 25)
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, bt)
+    days = summaries(journal, "2026-09-01", [live / 252] * 25)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    result = out["strategies"]["mom"]["result"]
+    assert result["z_vs_backtest"] == pytest.approx(_z(live, 0.388, 0.10, 25)) and result["z_vs_backtest"] > -2.0
+    assert ledger.get(hid)["status"] == "passed backtest only" and not any("PAUSE" in n for n in out["findings"])
+
+
+def test_a_strategy_the_simple_basis_pauses_is_not_paused_on_the_compound_basis(tmp_path):
+    # the mirror: vol 0.40, simple 0.20 (sharpe 0.5), compound 0.12; 60 days at -1.48 a year.
+    #   simple basis z = (-1.48 - 0.20) * 7.746 / (0.40 * 15.875) = -2.05 (pause);  compound basis z = -1.95 (no pause).
+    bt = {"cagr": 0.12, "annual_vol": 0.40, "sharpe": 0.5, "max_drawdown": 0.9}
+    live = -1.48
+    assert _z(live, 0.20, 0.40, 60) <= -2.0 < _z(live, 0.12, 0.40, 60)
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, bt)
+    days = summaries(journal, "2026-09-01", [live / 252] * 60)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert out["strategies"]["mom"]["result"]["z_vs_backtest"] == pytest.approx(_z(live, 0.20, 0.40, 60))
+    assert ledger.get(hid)["status"] == "paused" and any("PAUSE mom" in n for n in out["findings"])
