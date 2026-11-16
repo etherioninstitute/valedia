@@ -1,3 +1,4 @@
+import json
 import math
 import multiprocessing
 import os
@@ -2867,3 +2868,205 @@ def test_t34b3_a_finished_order_reported_beyond_its_size_is_an_overfill_never_a_
     result = led.reconcile(venue, {})
     assert _kinds(result["anomalies"]) == ["overfill"] and result["notices"] == [] and not result["clean"]
     assert led.order(TAG)["filled_units"] == before and result["fills"] == []
+
+
+# ---- T34b-3 addenda 3 and 4: after_fill, the replayed averages, fee rows after a fall, reconcile_notices
+
+
+def _limit_order(units=10.0, limit=90.0):
+    """An accepted buy (a sell when `units` < 0) with a limit, nothing filled yet."""
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    intend(led, units=units, limit_price=limit)
+    led.submit_once(venue, TAG)
+    return led, venue, clock
+
+
+def _report(led, venue, clock, **fields):
+    """The venue reports `fields` for TAG; one reconcile, its fills applied."""
+    venue.set(TAG, **fields)
+    clock.t += 60
+    result = led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    return result
+
+
+def test_t34b3_reconcile_notices_returns_open_closed_and_superseded_notices_in_id_order_with_their_figures():
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="filled", filled_units=10.0, avg_price=90.0, fee=1.0)
+    (row,) = led.fills(TAG)
+    a = _report(led, venue, clock, avg_price=90.005)["notices"][0]["id"]
+    b = _report(led, venue, clock, avg_price=90.01)["notices"][0]["id"]          # supersedes a
+    c = _report(led, venue, clock, fee=0.5)["notices"][0]["id"]                  # fee_fell
+    led.close_attention(c, "owner", "looked at the fee")
+    got = led.reconcile_notices()
+    assert [n["id"] for n in got] == [a, b, c] == sorted([a, b, c])
+    assert [(n["kind"], n["old"], n["new"]) for n in got] == [("avg_restated", 90.0, 90.005),
+                                                              ("avg_restated", 90.005, 90.01), ("fee_fell", 1.0, 0.5)]
+    assert [n["closed_by"] for n in got] == [orders.LEDGER_CLOSER, None, "owner"]
+    assert [n["after_fill"] for n in got] == [row["id"]] * 3 and [n["row"] for n in got] == [None] * 3
+    assert all(type(n["words"]) is str and n["words"] for n in got)
+    assert [n["id"] for n in led.reconcile_notices(after_id=a)] == [b, c]
+
+
+def test_t34b3_an_unpriced_piece_records_its_own_row_as_after_fill_and_row():
+    led, venue, clock = _limit_order(units=10.0001, limit=101.0)
+    _report(led, venue, clock, state="partly_filled", filled_units=10.0, avg_price=100.01, fee=0.0)
+    r = _report(led, venue, clock, state="filled", filled_units=10.0001, avg_price=100.0)
+    (n,) = r["notices"]
+    first, piece = led.fills(TAG)
+    assert n["kind"] == "piece_unpriced" and piece["price"] is None and piece["units"] == pytest.approx(0.0001)
+    (rec,) = led.reconcile_notices()
+    assert rec["after_fill"] == piece["id"] == rec["row"] and first["id"] < piece["id"]
+
+
+def test_t34b3_a_restatement_records_the_orders_latest_fill_row_as_after_fill():
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    _report(led, venue, clock, state="partly_filled", filled_units=6.0, avg_price=90.0)
+    _report(led, venue, clock, avg_price=89.995)
+    (rec,) = led.reconcile_notices()
+    assert rec["after_fill"] == led.fills(TAG)[-1]["id"] and rec["row"] is None
+
+
+@pytest.mark.parametrize("rise", [False, True])
+def test_t34b3_after_a_followed_fee_fall_the_rows_never_sum_above_the_highest_total(rise):
+    # M3: 2.50, 2.00, 2.30 leaves rows of 2.50 and the order at 2.30; then 2.60 brings the rows to 2.60
+    led, venue, clock = _limit_order()
+    totals = []
+    for i, fee in enumerate((2.5, 2.0, 2.3, 2.6)):
+        units = 4.0 + 2.0 * i if rise else 10.0
+        _report(led, venue, clock, state="filled" if units == 10.0 else "partly_filled", filled_units=units,
+                avg_price=90.0, fee=fee)
+        rows = led.fills(TAG)
+        totals.append((math.fsum(r["fee"] for r in rows if r["fee"] is not None), led.order(TAG)["fee"]))
+        assert all(r["fee"] is None or r["fee"] >= 0 for r in rows)
+    assert totals == [(2.5, 2.5), (2.5, 2.0), (2.5, 2.3), (pytest.approx(2.6), 2.6)], totals
+    assert sum(1 for r in led.fills(TAG) if r["fee"] is not None and r["fee"] > 0) == 2
+
+
+def test_t34b3_a_first_fee_total_below_zero_writes_no_negative_fee_in_a_row():
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=-0.3)
+    (row,) = led.fills(TAG)
+    assert row["fee"] is None and led.order(TAG)["fee"] == -0.3
+    _report(led, venue, clock, state="filled", filled_units=10.0, avg_price=90.0, fee=0.1)
+    assert [r["fee"] for r in led.fills(TAG)] == [None, pytest.approx(0.1)] and led.order(TAG)["fee"] == 0.1
+
+
+def test_t34b3_the_replay_gives_each_write_the_figure_it_set_in_the_four_step_case():
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="partly_filled", filled_units=1.0, avg_price=90.01, fee=0.0)
+    _report(led, venue, clock, avg_price=90.0)
+    _report(led, venue, clock, filled_units=2.0, avg_price=90.01)
+    _report(led, venue, clock, avg_price=90.0)
+    got = led.average_writes(TAG)
+    (f1, f2), (n1, n2) = led.fills(TAG), led.reconcile_notices()
+    assert got["trusted"] and got["avg"] == pytest.approx(90.0) and got["units"] == pytest.approx(2.0)
+    assert [got["fills"][f["id"]]["sets"] for f in (f1, f2)] == [True, True]
+    assert [got["fills"][f["id"]]["avg"] for f in (f1, f2)] == [pytest.approx(90.01), pytest.approx(90.01)]
+    assert [got["notices"][n["id"]]["avg"] for n in (n1, n2)] == [90.0, 90.0]
+
+
+def test_t34b3_a_row_with_no_average_is_covered_by_the_later_write_that_prices_its_units():
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="partly_filled", filled_units=4.0, avg_price=None, fee=0.0)
+    _report(led, venue, clock, state="partly_filled", filled_units=6.0, avg_price=None)
+    _report(led, venue, clock, state="filled", filled_units=10.0, avg_price=90.02)
+    a, b, c = led.fills(TAG)
+    got = led.average_writes(TAG)
+    assert got["trusted"] and [got["fills"][r["id"]]["sets"] for r in (a, b, c)] == [False, False, True]
+    assert [got["fills"][r["id"]]["covered_by"] for r in (a, b, c)] == [("fill", c["id"]), ("fill", c["id"]), None]
+    assert [got["fills"][r["id"]]["avg"] for r in (a, b)] == [None, None]
+    assert got["fills"][c["id"]]["avg"] == pytest.approx(90.02)
+
+
+def test_t34b3_an_unpriced_piece_sets_the_notices_figure_and_covers_the_rows_before_it():
+    led, venue, clock = _limit_order(units=10.0002, limit=101.0)
+    _report(led, venue, clock, state="partly_filled", filled_units=10.0, avg_price=100.01, fee=0.0)
+    _report(led, venue, clock, state="partly_filled", filled_units=10.0001, avg_price=None)
+    _report(led, venue, clock, state="filled", filled_units=10.0002, avg_price=100.0)
+    first, bare, piece = led.fills(TAG)
+    (n,) = led.reconcile_notices()
+    got = led.average_writes(TAG)
+    assert n["kind"] == "piece_unpriced" and got["trusted"], got
+    assert got["fills"][piece["id"]] == {"avg": 100.0, "sets": True, "units": pytest.approx(0.0001), "covered_by": None}
+    assert got["fills"][bare["id"]]["covered_by"] == ("fill", piece["id"]) and not got["fills"][bare["id"]]["sets"]
+    assert got["fills"][first["id"]]["avg"] == pytest.approx(100.01) and got["units"] == pytest.approx(10.0002)
+
+
+@pytest.mark.parametrize("how", ["stored average", "stored priced units", "after_fill gone", "price gone"])
+def test_t34b3_a_replay_that_does_not_reproduce_the_stored_figures_is_not_trusted(how):
+    led, venue, clock = _limit_order()
+    _report(led, venue, clock, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    _report(led, venue, clock, state="filled", filled_units=10.0, avg_price=90.006)
+    _report(led, venue, clock, avg_price=90.002)
+    assert led.average_writes(TAG)["trusted"]
+    db = led._db
+    if how == "stored average":
+        db.execute("UPDATE orders SET avg_price = 90.01, priced_avg = 90.01 WHERE tag = ?", (TAG,))
+    elif how == "stored priced units":
+        db.execute("UPDATE orders SET priced_units = 4.0 WHERE tag = ?", (TAG,))
+    elif how == "after_fill gone":
+        (n,) = led.reconcile_notices()
+        db.execute("UPDATE attention SET reason = ? WHERE id = ?",
+                   (json.dumps({"words": "x", "old": 90.006, "new": 90.002}), n["id"]))
+    else:
+        db.execute("UPDATE fills SET price = NULL WHERE id = (SELECT MAX(id) FROM fills WHERE tag = ?)", (TAG,))
+    got = led.average_writes(TAG)
+    assert got["trusted"] is False and type(got["why"]) is str and got["why"], got
+    assert led.average_writes("no-such-tag") is None
+
+
+def test_t34b3_the_replay_reproduces_every_figure_the_ledger_stored_over_generated_histories():
+    rng = random.Random(4304)
+    checked = kinds = 0
+    seen = set()
+    for _ in range(400):
+        side = rng.choice((1.0, -1.0))
+        size = rng.choice((10.0, 7.0, 3.5, 10.0003))
+        led, venue, clock = _limit_order(units=side * size, limit=100.0)
+        filled, cash, fee = 0.0, 0.0, 0.0
+        shown = {}                                         # fill id -> the stored average right after its write
+        for _step in range(rng.randint(2, 9)):
+            roll = rng.random()
+            fields = {}
+            if roll < 0.55 and filled < size - 1e-9:
+                piece = min(size - filled, rng.choice((0.0001, 0.5, 1.0, 2.0, 3.0, size)))
+                price = 100.0 + side * rng.choice((-0.03, -0.01, 0.0, 0.004, 0.01))
+                filled, cash = filled + piece, cash + piece * price
+                exact = cash / filled
+                how = rng.choice(("round", "truncate", "exact", "none"))
+                avg = {"round": round(exact, 2), "truncate": math.floor(exact * 100) / 100, "exact": exact,
+                       "none": None}[how]
+                fields.update(filled_units=filled, avg_price=avg,
+                              state="filled" if filled >= size - 1e-9 else "partly_filled")
+            elif roll < 0.8:
+                now = led.order(TAG)["avg_price"]
+                if now is not None:
+                    fields["avg_price"] = round(now + rng.choice((-0.01, -0.005, 0.005, 0.01, 0.02, -0.05)), 4)
+            else:
+                fee = max(0.0, round(fee + rng.choice((-0.2, 0.1, 0.3)), 2))
+                fields["fee"] = fee
+            if not fields:
+                continue
+            before = {f["id"] for f in led.fills(TAG)}
+            result = _report(led, venue, clock, **fields)
+            seen |= {n["kind"] for n in result["notices"]}
+            rec = led.order(TAG)
+            for f in led.fills(TAG):
+                if f["id"] not in before:
+                    shown[f["id"]] = rec["avg_price"]
+            got = led.average_writes(TAG)
+            assert got["trusted"], (got, rec)
+            assert (got["avg"] is None) == (rec["avg_price"] is None)
+            if rec["avg_price"] is not None:
+                assert got["avg"] == pytest.approx(rec["avg_price"], rel=1e-9, abs=1e-9)
+            for fid, stored in shown.items():
+                w = got["fills"][fid]
+                if w["sets"]:
+                    assert w["avg"] == pytest.approx(stored, rel=1e-9, abs=1e-9), (fid, w, stored)
+                    checked += 1
+            kinds += 1
+    assert checked > 1000 and kinds > 1000 and {"avg_restated", "fee_fell", "piece_unpriced"} <= seen, (checked, seen)
