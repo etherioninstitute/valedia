@@ -353,6 +353,24 @@ def test_t38_1b_the_ledger_line_counts_what_the_paper_command_steps_and_says_how
     assert status == D.OK and "1 in paper trading (1 not stepped: can hold a short))" in text, text
 
 
+def test_t38_1b_addendum2_the_doctor_counts_idea_by_idea_so_an_unloadable_file_hides_nothing(live_repo):
+    from valedia_trader.research_loop import ledger as lg
+    paths = LoopPaths(live_repo)
+    _ledger_with(live_repo, "mom_long_basket")
+    _ledger_with(live_repo, "mom_both_basket", direction="both")
+    led = lg.HypothesisLedger(paths.ledger)
+    try:
+        led.set_status(led.propose("An idea whose strategy file is missing", "test", "us-etf+crypto"), "passed paper")
+    finally:
+        led.close()
+    status, text = D.check_ledger(paths)
+    assert "2 in paper trading (1 not stepped: can hold a short))" in text, text   # the missing file: counted as before
+    first = live_repo / "strategies" / "mom_long_basket_h1.json"
+    first.write_text(first.read_text().replace('"direction": "long"', '"direction": "both"'))
+    status, text = D.check_ledger(paths)
+    assert status == D.OK and "1 in paper trading (2 not stepped: can hold a short))" in text, text
+
+
 def test_the_doctor_says_the_broker_book_file_is_missing_and_that_live_mode_would_stop(live_repo):
     before = _tree(live_repo)
     status, detail = _venues(live_repo)

@@ -454,5 +454,34 @@ def test_t38_1b_can_hold_shorts_treats_a_missing_or_raising_attribute_as_true():
     assert st.can_hold_shorts(object()) is True                                 # no such attribute
     assert st.can_hold_shorts(Raises()) is True                                 # it raises
     assert st.can_hold_shorts(Answers(BadBool())) is True                       # its truth value raises
-    assert st.can_hold_shorts(Answers(0)) is False and st.can_hold_shorts(Answers("yes")) is True
+    assert st.can_hold_shorts(Answers("yes")) is True
     assert st.can_hold_shorts(None) is True
+
+
+class _Falsy:
+    def __bool__(self):
+        return False
+
+
+@pytest.mark.parametrize("answer", [None, 0, 0.0, "", np.False_, np.bool_(False), _Falsy(), [], True, np.True_, 1],
+                         ids=["None", "0", "0.0", "empty", "numpy.False_", "numpy.bool_", "falsy object", "empty list",
+                              "True", "numpy.True_", "1"])
+def test_t38_1b_addendum2_only_the_object_false_means_cannot_hold_a_short(answer):
+    class Answers:
+        holds_shorts = answer
+
+    assert st.can_hold_shorts(Answers()) is True                                # it has not answered False
+    Answers.holds_shorts = False
+    assert st.can_hold_shorts(Answers()) is False                               # the one answer that is "cannot"
+
+
+def test_t38_1b_addendum2_the_kinds_answer_real_python_booleans():
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    for direction in ("long", "short", "both"):
+        assert type(st.RuleStrategy.from_spec(spec(entry=_entry(direction))).holds_shorts) is bool
+    for legs in ("both", "long"):
+        s = PairsStrategy.from_spec({"kind": "pairs", "name": "pairs_shorts", "version": "1.0.0",
+                                     "hypothesis": "Two related prices drift back together", "pairs": [["A", "B"]],
+                                     "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}, "legs": legs})
+        assert type(s.holds_shorts) is bool
+    assert st.can_hold_shorts(st.RuleStrategy.from_spec(spec(entry=_entry("long")))) is False

@@ -1557,12 +1557,12 @@ def test_t38_1b_with_nothing_stepped_the_sentence_is_unchanged_and_what_was_left
     root = tmp_path / "project"
     ids = _t38_project(root, [BOTH_RULE])
     status, out, err = run(root, ["paper-step"], px)
-    assert status == 0 and err == "" and out.startswith(NOTHING_TO_TRADE), (status, out, err)
-    assert json.loads(out[len(NOTHING_TO_TRADE):]) == {"not_stepped": [{"id": ids[0], "name": "mom_both",
-                                                                         "reason": NOT_STEPPED}]}
+    said = "nothing is stepped: 1 idea can hold a short position\n"                  # addendum 2, ruling F
+    assert status == 0 and err == "" and out.startswith(said), (status, out, err)
+    assert json.loads(out[len(said):]) == {"not_stepped": [{"id": ids[0], "name": "mom_both", "reason": NOT_STEPPED}]}
     status, out, err = run(root, CYCLE, px)
     got = json.loads(out)
-    assert status == 0 and got["paper"] == "nothing has passed its backtest and sealed test", (status, out, err)
+    assert status == 0 and got["paper"] == "nothing is stepped: 1 idea can hold a short position", (status, out, err)
     assert got["not_stepped"] == [{"id": ids[0], "name": "mom_both", "reason": NOT_STEPPED}]
     assert not (root / "journal" / "paper_state.json").exists()
 
@@ -1589,8 +1589,27 @@ def test_t38_1b_the_alpaca_mirror_run_names_what_was_left_out(tmp_path, t38, mon
     assert got["not_stepped"] == [{"id": ids[1], "name": "mom_both", "reason": NOT_STEPPED}] and got["capital_shared_by"] == 1
 
 
-HELD_REFUSAL = ("refused: the paper book holds positions of mom_both, which can hold a short and is no longer stepped; "
-                "nothing was stepped\n")
+def _base_paper_step(root, px):
+    """The paper step as the base commit ran it: every idea with a paper status stepped, whatever it can hold (the
+    paper trader is unchanged; only the command's guard is new)."""
+    paths = cli.LoopPaths(root)
+    led = lg.HypothesisLedger(paths.ledger)
+    try:
+        every = {h["id"]: cli._strategy_for(paths, led, h["id"], None)[0] for s in cli.PAPER_STATUSES
+                 for h in led.search(status=s)}
+    finally:
+        led.close()
+    return cli.paper_catch_up(cli.paper_trader(paths), px, every)
+
+
+def _state(root):
+    return json.loads((root / "journal" / "paper_state.json").read_text())
+
+
+def _held_lot_refusal(root, name):
+    sym = next(s for s, lot in _state(root)["positions"][name].items() if lot["units"])
+    return (f"refused: the paper book holds a lot of {name} ({sym}), which can hold a short and is no longer stepped; "
+            "nothing was stepped\n")
 
 
 @pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
@@ -1599,16 +1618,14 @@ def test_t38_1b_a_book_already_holding_a_left_out_strategy_stops_the_run_and_ste
     run, reviews = t38
     px, root = prices(), tmp_path / "project"
     _t38_project(root, [LONG_RULE, BOTH_RULE])
-    with monkeypatch.context() as m:
-        m.setattr(cli, "can_hold_shorts", lambda s: False)                        # a book stepped before the guard
-        assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
-        assert run(root, ["paper-step"], px.iloc[:24])[0] == 0
-    held = json.loads((root / "journal" / "paper_state.json").read_text())["positions"]["mom_both"]
+    _base_paper_step(root, px.iloc[:20])                                            # a book stepped before the guard
+    _base_paper_step(root, px.iloc[:24])
+    held = _state(root)["positions"]["mom_both"]
     assert any(lot["units"] < 0 for lot in held.values()), held                    # it holds a short
     before = _book_files(root)
     reviews.clear()
     for _ in range(2):
-        assert run(root, argv, px.iloc[:30]) == (2, "", HELD_REFUSAL)
+        assert run(root, argv, px.iloc[:30]) == (2, "", _held_lot_refusal(root, "mom_both"))
     assert _book_files(root) == before and reviews == []                           # bytes and times; no review after it
 
 
@@ -1761,14 +1778,12 @@ def test_t38_1b_a_held_left_out_book_stops_the_cycle_before_any_refresh_research
     run, reviews = t38
     px, root = prices(), tmp_path / "project"
     _t38_project(root, [LONG_RULE, BOTH_RULE])
-    with monkeypatch.context() as m:
-        m.setattr(cli, "can_hold_shorts", lambda s: False)                        # a book stepped before the guard
-        assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
-        assert run(root, ["paper-step"], px.iloc[:24])[0] == 0
+    _base_paper_step(root, px.iloc[:20])                                            # a book stepped before the guard
+    _base_paper_step(root, px.iloc[:24])
     spent = _spend_watch(monkeypatch)
     book, memory = _book_files(root), _memory_bytes(root)
     reviews.clear()
-    assert run(root, FULL_CYCLE, px.iloc[:30]) == (2, "", HELD_REFUSAL)
+    assert run(root, FULL_CYCLE, px.iloc[:30]) == (2, "", _held_lot_refusal(root, "mom_both"))
     assert spent == {"refresh": 0, "market": 0, "asker": 0, "research": 0, "gauntlet": 0}, spent
     assert _memory_bytes(root) == memory and _book_files(root) == book and reviews == []
 
@@ -1792,3 +1807,300 @@ def test_t38_1b_an_unloadable_strategy_file_still_surfaces_where_it_did_after_th
         led.close()
     assert rows == [(1, "passed backtest only"), (2, "passed backtest only"), (3, "untested")]
     assert not (root / "journal" / "paper_state.json").exists() and reviews == []
+
+
+# ---- T38-1b addendum 2: one invariant over the paper book's durable state; only the object False means "cannot"
+
+def _pending(name, sym, units):
+    return {"strategy": name, "version": "1.0.0", "symbol": sym, "units": units, "decided_on": "2026-01-29",
+            "reduces_risk": units < 0, "reasoning": "hand-written", "conditions": None}
+
+
+def _write_state(root, state):
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+
+
+def _short_refusal(name, sym, tail="nothing was stepped"):
+    return (f"the paper book holds a short position (or an order that would open one) under {name}, {sym}; the paper "
+            f"book and its tax ledger do not handle shorts; {tail}")
+
+
+@pytest.mark.parametrize("buys_only", [False, True], ids=["the checker's case", "a pending buy only"])
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum2_a_pending_order_under_a_left_out_name_stops_the_run_with_every_lot_at_zero(tmp_path, t38,
+                                                                                                  argv, buys_only):
+    run, reviews = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE, BOTH_RULE])
+    _base_paper_step(root, px.iloc[:20])                     # the base: both ideas stepped once, orders not yet filled
+    state = _state(root)
+    assert all(lot["units"] == 0.0 for lot in state["positions"]["mom_both"].values())
+    assert any(o["strategy"] == "mom_both" and o["units"] < 0 for o in state["pending"])    # a pending short (DOWN)
+    if buys_only:
+        state["pending"] = [o for o in state["pending"] if o["units"] > 0]
+        assert any(o["strategy"] == "mom_both" for o in state["pending"])
+        _write_state(root, state)
+    sym = next(o["symbol"] for o in _state(root)["pending"] if o["strategy"] == "mom_both")
+    before = _book_files(root)
+    reviews.clear()
+    for _ in range(2):
+        assert run(root, argv, px.iloc[:24]) == (
+            2, "", f"refused: the paper book holds a pending order of mom_both ({sym}), which can hold a short and is "
+                   "no longer stepped; nothing was stepped\n")
+    assert _book_files(root) == before and reviews == []                           # journal and state: bytes and times
+
+
+def test_t38_1b_addendum2_the_paper_command_checks_before_refresh_secrets_or_a_venue(tmp_path, t38, monkeypatch):
+    from valedia_trader.core import secrets
+    from valedia_trader.data_and_fees import prices as price_data
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE, BOTH_RULE])
+    _base_paper_step(root, px.iloc[:20])
+    spent = []
+    monkeypatch.setattr(price_data, "refresh", lambda data: spent.append("refresh"))
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: spent.append("secrets"))
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: spent.append("secret") or "PKTEST")
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: spent.append("venue"))
+    real_market = cli._market
+    monkeypatch.setattr(cli, "_market", lambda args: spent.append("market") or real_market(args))
+    status, out, err = run(root, ["paper-step", "--refresh", "--alpaca"], px.iloc[:24])
+    assert status == 2 and out == "" and "pending order of mom_both" in err and spent == [], (status, err, spent)
+
+
+# ruling A through the commands: a hand-written strategy whose holds_shorts is each answer; only False is stepped
+
+_PY_STRATEGY = '''"""A hand-written strategy for the T38-1b tests.
+
+version: 1.0.0
+hypothesis: Assets that rose over ten days keep rising
+"""
+import numpy
+
+from valedia_trader.research_loop.strategy import RuleStrategy
+
+
+class Falsy:
+    def __bool__(self):
+        return False
+
+
+class Said(RuleStrategy):
+    holds_shorts = {holds}
+
+
+STRATEGY = Said.from_spec({spec!r})
+'''
+ANSWERS = ["None", "0", '""', "numpy.False_", "Falsy()", "False", "True"]
+
+
+def _py_strategy(path, holds, spec):
+    path.write_text(_PY_STRATEGY.format(holds=holds, spec=spec))
+    return path
+
+
+@pytest.mark.parametrize("holds", ANSWERS)
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum2_only_a_strategy_that_answers_false_is_stepped(tmp_path, t38, argv, holds):
+    run, _ = t38
+    root = tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE])
+    (root / "strategies" / f"mom_long_h{ids[0]}.json").unlink()
+    _py_strategy(root / "strategies" / f"mom_said_h{ids[0]}.py", holds, {**LONG_RULE, "name": "mom_said"})
+    status, out, err = run(root, argv, prices().iloc[:20])
+    assert status == 0, err
+    if holds == "False":
+        got = json.loads(out)
+        assert got["not_stepped"] == [] and (got if argv == ["paper-step"] else got["paper"])["capital_shared_by"] == 1
+        assert set(_state(root)["history"][-1]["strategy_values"]) == {"mom_said"}
+    else:
+        got = json.loads(out.split("\n", 1)[1]) if argv == ["paper-step"] else json.loads(out)
+        assert got["not_stepped"] == [{"id": ids[0], "name": "mom_said", "reason": NOT_STEPPED}], out
+        assert not (root / "journal" / "paper_state.json").exists()
+
+
+@pytest.mark.parametrize("holds", ANSWERS)
+def test_t38_1b_addendum2_only_a_strategy_that_answers_false_is_followed(follow_project, holds):
+    from valedia_trader.execution_and_risk import order_step
+    root, _ = follow_project
+    (root / "strategies" / f"{H26}_h26.json").unlink()
+    _py_strategy(root / "strategies" / f"{H26}_h26.py", holds, {**LONG_RULE, "name": H26, "market": ["QQQ"]})
+    _book_file(root, {"follow": [26]})
+    f = cli.broker_book_follow(cli.LoopPaths(root))
+    if holds == "False":
+        assert f.refused is None and f.names == (H26,), f
+    else:
+        assert f == order_step.Follow(refused=T38_REFUSAL), f
+
+
+# ruling C: no short under any name, whoever says what
+
+@pytest.mark.parametrize("case", ["a negative lot under the stepped name", "a pending sale past the stepped name's lot",
+                                  "a negative lot under an unknown name", "a pending sale under an unknown name"])
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum2_a_short_under_any_name_stops_the_run(tmp_path, t38, argv, case):
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE])
+    assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+    state = _state(root)
+    if case == "a negative lot under the stepped name":
+        state["positions"]["mom_long"]["UP"] = {"units": -5.0, "cost": 100.0}
+        name, sym = "mom_long", "UP"
+    elif case == "a pending sale past the stepped name's lot":
+        state["positions"]["mom_long"]["DOWN"] = {"units": 2.0, "cost": 100.0}
+        state["pending"].append(_pending("mom_long", "DOWN", -3.0))
+        name, sym = "mom_long", "DOWN"
+    elif case == "a negative lot under an unknown name":
+        state["positions"]["ghost_book"] = {"UP": {"units": -1.0, "cost": 100.0}}
+        name, sym = "ghost_book", "UP"
+    else:
+        state["pending"].append(_pending("ghost_book", "DOWN", -1.0))
+        name, sym = "ghost_book", "DOWN"
+    _write_state(root, state)
+    before = _book_files(root)
+    assert run(root, argv, px.iloc[:24]) == (2, "", f"refused: {_short_refusal(name, sym)}\n")
+    assert _book_files(root) == before
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum2_a_strategy_that_says_false_and_shorts_is_caught_after_the_step_and_stops_the_next(tmp_path,
+                                                                                                         t38, argv):
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE])
+    (root / "strategies" / f"mom_long_h{ids[0]}.json").unlink()
+    _py_strategy(root / "strategies" / f"liar_both_h{ids[0]}.py", "False", {**BOTH_RULE, "name": "liar_both"})
+    status, out, err = run(root, argv, px.iloc[:20])
+    assert status == 2 and err == "a strategy that says it cannot hold a short now has one: liar_both, DOWN\n", (status, err)
+    assert any(o["strategy"] == "liar_both" and o["units"] < 0 for o in _state(root)["pending"])   # the day is journalled
+    before = _book_files(root)
+    assert run(root, argv, px.iloc[:24]) == (2, "", f"refused: {_short_refusal('liar_both', 'DOWN')}\n")
+    assert _book_files(root) == before
+
+
+# ruling E: the order step without a follow file does not mirror a book the paper step refuses
+
+@pytest.mark.parametrize("case", ["a lot under a left-out name", "a short under any name"])
+def test_t38_1b_addendum2_the_whole_book_order_step_stops_at_the_follow_stage_on_a_book_the_paper_step_refuses(
+        order_step_project, capsys, case):
+    root, venue = order_step_project
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    if case == "a lot under a left-out name":
+        state["positions"] = {"mom_both": state["positions"]["a"]}
+        state["pending"] = [{**o, "strategy": "mom_both"} for o in state["pending"]]
+        led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+        try:
+            hid = led.propose("Assets that rose over ten days keep rising", "test", cli.MARKET)
+            led.set_status(hid, "passed paper")
+        finally:
+            led.close()
+        _strategy_file(root, hid, "mom_both", direction="both")
+        reason = ("the paper book holds a lot of mom_both (SPY), which can hold a short and is no longer stepped; the "
+                  "order step does not mirror such a book")
+    else:
+        state["positions"]["a"]["SPY"]["units"] = -4.0
+        reason = _short_refusal("a", "SPY", "the order step does not mirror such a book")
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    assert not (root / "config" / "broker_book.json").exists()
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "stopped" and out["stage"] == "follow" and out["reason"] == reason, out
+    assert [c for c in venue.calls if c in ("submit", "cancel")] == [] and venue.book == {}
+
+
+def test_t38_1b_addendum2_a_follow_file_stops_on_a_short_under_a_name_it_follows_only(follow_project):
+    root, _ = follow_project
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    state["positions"]["ghost_book"] = {"SPY": {"units": -1.0, "cost": 1.0}}       # not followed: not the order step's
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    _book_file(root, {"follow": [23, 26]})
+    assert cli.broker_book_follow(cli.LoopPaths(root)).refused is None
+    state["pending"] = [_pending(H26, "QQQ", -7.0)]                                # QQQ 6 held: would go to -1
+    (root / "journal" / "paper_state.json").write_text(json.dumps(state))
+    assert cli.broker_book_follow(cli.LoopPaths(root)).refused == _short_refusal(H26, "QQQ",
+                                                                                 "the order step does not mirror such a book")
+
+
+# the invariant as a property over seeded random states
+
+def _invariant_says_refuse(state, left_out):
+    """The rules of addendum 2 in their own words, written apart from cli.judge_paper_book."""
+    import math
+
+    def number(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    pos, pend = state["positions"], state["pending"]
+    for name in left_out:                                              # B: a left-out name holds nothing at all
+        if any(not (number(lot["units"]) and lot["units"] == 0) for lot in pos.get(name, {}).values()):
+            return True
+        if any(o["strategy"] == name for o in pend):
+            return True
+    for book in pos.values():                                          # C: no short lot, and none it cannot read
+        if any(not number(lot["units"]) or lot["units"] < 0 for lot in book.values()):
+            return True
+    run = {}
+    for o in pend:                                                     # C: no pending order that would open a short
+        if not number(o["units"]):
+            return True
+        key = (o["strategy"], o["symbol"])
+        run[key] = run.get(key, pos.get(o["strategy"], {}).get(o["symbol"], {"units": 0.0})["units"]) + o["units"]
+        if run[key] < -1e-12:
+            return True
+    return False
+
+
+def test_t38_1b_addendum2_the_paper_book_invariant_holds_over_seeded_random_states(tmp_path, capsys):
+    rng = np.random.default_rng(38)
+    px = prices()
+    limits = tmp_path / "risk.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.6,
+                                  "max_open_positions": 5}))
+    long_only = st.RuleStrategy.from_spec(LONG_RULE)
+    names, syms, left_out = ["mom_long", "mom_both", "ghost_book"], ["UP", "DOWN"], ["mom_both"]
+    kinds = ["positive", "zero", "minus zero", "negative", "nan", "text"]
+    generated = refused = stepped = 0
+    wrong = []
+    for k in range(240):
+        positions = {}
+        for name in names:
+            if rng.random() < 0.6:
+                book = {}
+                for sym in syms:
+                    if rng.random() < 0.7:
+                        kind = rng.choice(kinds, p=[0.45, 0.3, 0.05, 0.1, 0.05, 0.05])
+                        units = {"positive": float(rng.uniform(1, 50)), "zero": 0.0, "minus zero": -0.0,
+                                 "negative": -float(rng.uniform(1, 50)), "nan": float("nan"), "text": "ten"}[kind]
+                        book[sym] = {"units": units, "cost": 100.0}
+                positions[name] = book
+        pending = []
+        for _ in range(int(rng.integers(0, 4))):
+            name, sym = str(rng.choice(names)), str(rng.choice(syms))
+            held = positions.get(name, {}).get(sym, {}).get("units", 0.0)
+            pick = rng.random()
+            units = (-held if pick < 0.2 and isinstance(held, float) and held == held
+                     else float(rng.uniform(1, 30)) * (1 if pick < 0.6 else -1))
+            pending.append(_pending(name, sym, units if units != 0 else 1.0))
+        state = {"starting_cash": 100_000.0, "cash": 100_000.0, "positions": positions, "pending": pending, "history": [],
+                 "peak_equity": 100_000.0, "last_day": str(px.index[18].date()), "realized": {}, "panel_cases": []}
+        generated += 1
+        found = cli.judge_paper_book(state, left_out)
+        if (found is not None) != _invariant_says_refuse(state, left_out):
+            wrong.append((k, found, state))
+            continue
+        if found is not None:
+            refused += 1
+            continue
+        book_dir = tmp_path / f"book{k}"
+        book_dir.mkdir()
+        (book_dir / "paper_state.json").write_text(json.dumps(state))
+        trader = PaperTrader(book_dir, limits, halt_file=None)
+        trader.step(px.iloc[:20], {1: long_only})                                  # ONE day, long-only strategies
+        stepped += 1
+        after = trader.state["positions"]
+        if any(lot["units"] < 0 for book in after.values() for lot in book.values()) or any(
+                lot["units"] for lot in after.get("mom_both", {}).values()):
+            wrong.append((k, "after the step", after))
+    with capsys.disabled():
+        print(f"\ninvariant: {generated} states generated, {refused} refused, {stepped} stepped, {len(wrong)} counter-examples")
+    assert wrong == [] and generated == 240 and 40 <= refused <= 200 and stepped >= 40, (refused, stepped, wrong[:2])
