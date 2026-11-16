@@ -1,4 +1,5 @@
 import json
+import math
 
 import numpy as np
 import pandas as pd
@@ -416,3 +417,79 @@ def test_the_reviews_bad_data_lines_are_findings_only_never_lessons_in_the_ledge
         assert len([f for f in out["findings"] if f.startswith("Price data on ")]) == 2
     assert not [r for r in ledger.findings() if "Price data" in r["finding"]]
     assert ledger.findings()                                            # the other findings are written as before
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# T40-B1: paper and backtest are compared on the same basis (the simple annual average, daily mean times 252)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _desk_with_backtest(tmp_path, bt):
+    limits = tmp_path / "risk.json"
+    limits.write_text(json.dumps(LIMITS))
+    ledger = lg.HypothesisLedger()
+    hid = ledger.propose("Assets that rose keep rising for a while", "price-analyst", "us-etf")
+    ledger.register_prediction(hid, "prediction", {"annual_return": 0.10, "win_rate": 0.55, "sharpe": 0.9,
+                                                   "fail_if_sharpe_below": 0.3, "fail_if_drawdown_above": 0.2})
+    ledger.record_backtest(hid, {"result": bt, "verdict": "pass"}, "trending up", "strategies/mom.json", "1.0.0", "untested")
+    ledger.record_sealed(hid, {"verdict": "pass"}, "passed backtest only")
+    return ledger, Journal(tmp_path / "journal"), limits, hid
+
+
+# A volatile backtest. Daily mean 0.2 / 252, annual vol 0.40: sharpe 0.5, so sharpe * annual_vol = 0.20 is its SIMPLE annual
+# average. Its compound figure (cagr) is far below that, 0.11, because volatility drags compounding down by about vol^2 / 2.
+VOLATILE_BACKTEST = {"cagr": 0.11, "annual_vol": 0.40, "sharpe": 0.5, "max_drawdown": 0.50}
+# Paper: 25 days of +0.06% a day, a simple annual average of 0.0006 * 252 = 0.1512.
+#   old comparison: 0.1512 against the compound 0.11  -> "ahead", no sentence, z = +0.03 (a wrong sign)
+#   new comparison: 0.1512 against the simple 0.20    -> "behind", sentence printed, z = -0.04
+LIVE_DAILY, LIVE_DAYS = 0.0006, 25
+
+
+def test_paper_is_compared_with_the_backtests_simple_average_and_not_its_compound_return(tmp_path):
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, dict(VOLATILE_BACKTEST))
+    days = summaries(journal, "2026-09-01", [LIVE_DAILY] * LIVE_DAYS)
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    result = out["strategies"]["mom"]["result"]
+    notes = out["strategies"]["mom"]["notes"]
+    simple = VOLATILE_BACKTEST["sharpe"] * VOLATILE_BACKTEST["annual_vol"]
+    # an independent form of the z-score: standard error of the mean of n days when each day has sd annual_vol / sqrt(252)
+    z = (LIVE_DAILY - simple / 252) * math.sqrt(LIVE_DAYS) * math.sqrt(252) / VOLATILE_BACKTEST["annual_vol"]
+    assert result["z_vs_backtest"] == pytest.approx(z, abs=1e-12) and z < 0           # the old code gave +0.03
+    assert result["annualised_return"] == pytest.approx(LIVE_DAILY * 252)             # this key keeps its meaning
+    sentence = next(n for n in notes if "is running at" in n)                         # the old code printed nothing here
+    assert "+15.12% a year on paper against +20.00% in its backtest, +4.88% worse" in sentence
+    assert "average daily return times 252" in sentence and "25 days" in sentence and "z -0.04" in sentence
+    assert "11.00%" not in sentence                                                    # the compound figure is not offered as the yardstick
+
+
+def test_the_note_is_not_triggered_when_paper_is_above_the_simple_average(tmp_path):
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, dict(VOLATILE_BACKTEST))
+    days = summaries(journal, "2026-09-01", [0.0010] * LIVE_DAYS)                      # 0.252 a year: above 0.20
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    assert not any("is running at" in n for n in out["strategies"]["mom"]["notes"])
+    assert out["strategies"]["mom"]["result"]["z_vs_backtest"] > 0
+
+
+@pytest.mark.parametrize("bt", [
+    {"cagr": 0.11, "annual_vol": 0.40, "max_drawdown": 0.5},                           # no sharpe
+    {"cagr": 0.11, "sharpe": 0.5, "max_drawdown": 0.5},                                # no annual_vol
+    {"cagr": 0.11, "max_drawdown": 0.5},                                               # neither
+    {"cagr": 0.11, "annual_vol": 0.40, "sharpe": float("nan"), "max_drawdown": 0.5},   # not finite
+    {"cagr": 0.11, "annual_vol": float("inf"), "sharpe": 0.5, "max_drawdown": 0.5},
+])
+def test_without_sharpe_or_annual_vol_there_is_no_z_and_no_sentence_and_never_the_cagr(tmp_path, bt):
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, bt)
+    days = summaries(journal, "2026-09-01", [-0.004] * LIVE_DAYS)                      # far below the cagr: the old code would speak
+    out = cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits, apply=False)
+    result, notes = out["strategies"]["mom"]["result"], out["strategies"]["mom"]["notes"]
+    assert math.isnan(result["z_vs_backtest"]) and not any("is running at" in n for n in notes)
+    assert not any("standard errors below the backtest" in n or "overfit" in n for n in notes)
+    assert result["status"] != "paused" and result["backtest_annual_return"] == 0.11  # the stored key keeps its meaning
+
+
+def test_the_promotion_z_uses_the_simple_average_too(tmp_path):
+    # 25 days at +0.06%: against the simple 0.20 the z is -0.04 (above the -1.0 bar), so a strategy that held up still passes
+    ledger, journal, limits, hid = _desk_with_backtest(tmp_path, dict(VOLATILE_BACKTEST))
+    days = summaries(journal, "2026-09-01", [LIVE_DAILY] * LIVE_DAYS)
+    cr.weekly_review(ledger, journal, days[-1], {hid: "mom"}, limits)
+    assert ledger.get(hid)["status"] == "passed paper"
+    assert f"z {-0.0384:.2f}" in ledger.get(hid)["lessons_learned"]

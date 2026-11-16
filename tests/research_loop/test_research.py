@@ -1,5 +1,8 @@
+import io
 import json
+import math
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -138,8 +141,9 @@ def test_fundamentals_reader_is_skipped_honestly_and_the_skeptic_argues_last(env
 def test_tables_and_askers():
     px = dev_prices()
     table = rs.price_table(px, px * 1e6)
-    assert "volume_20d_vs_1y" in table and table.count("\n") == len(SYMBOLS) + 1
-    assert "TLT/IEF long bonds vs intermediate" in rs.macro_table(px) and "SPY-TLT 60d correlation" in rs.macro_table(px)
+    assert "volume_20d_vs_1y" in table and _csv_block(table).count("\n") == len(SYMBOLS) + 1
+    macro = rs.macro_table(px)
+    assert "TLT/IEF long bonds vs intermediate" in macro and "SPY-TLT correlation of daily returns, last 60 sessions: " in macro
     assert rs.parse_ideas('noise {"ideas": [{"idea": "x"}, 5]} trailing') == [{"idea": "x"}]
     for bad in ("nothing", '{"ideas": 3}'):
         with pytest.raises(ValueError):
@@ -182,3 +186,189 @@ def test_research_agents_are_called_without_tools(monkeypatch):
     assert seen["argv"] == ["hermes", "-p", "valedia-trading-decider", "-z", "PROMPT", "-t", "clarify"]
     with pytest.raises(ValueError):
         rs.hermes_asker("valedia-trading-decider", toolsets="file; rm")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# T40-B1: the research tables say what their numbers are
+# ---------------------------------------------------------------------------------------------------------------------
+
+def dollar_volume(px):
+    rng = np.random.default_rng(5)
+    return px * 1e6 * np.exp(0.4 * rng.standard_normal(px.shape))
+
+
+def _csv_block(text):
+    """The CSV part of a table string: from the header line (it starts with a comma) to the first line that is not a row."""
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(","))
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("SPY-TLT correlation")), len(lines))
+    return "\n".join(lines[start:end]) + "\n"
+
+
+def _parse(text):
+    return pd.read_csv(io.StringIO(_csv_block(text)), index_col=0)
+
+
+def _legend_part(text):
+    """Everything written above the CSV header."""
+    lines = text.splitlines()
+    return "\n".join(lines[:next(i for i, ln in enumerate(lines) if ln.startswith(","))])
+
+
+# Each column recomputed from numpy arrays and from the definition's own window, not from the module's code.
+def _ret(p, v, w, b):
+    return p[-1] / p[-1 - w] - 1
+
+
+def _vol(p, v, w, b):
+    r = p[1:] / p[:-1] - 1
+    return np.std(r[-w:], ddof=1) * math.sqrt(252)
+
+
+def _below_high(p, v, w, b):
+    return p[-1] / p[-w:].max() - 1
+
+
+def _vs_avg(p, v, w, b):
+    return p[-1] / p[-w:].mean() - 1
+
+
+def _move_in_sd(p, v, w, b):
+    r = p[1:] / p[:-1] - 1
+    return (p[-1] / p[-1 - w] - 1) / (np.std(r[-b:], ddof=1) * math.sqrt(w))
+
+
+def _volume_ratio(p, v, w, b):
+    return v[-w:].mean() / v[-b:].mean() - 1
+
+
+PRICE_RECOMPUTE = {"ret_1m": _ret, "ret_3m": _ret, "ret_12m": _ret, "vol_20d": _vol, "vol_1y": _vol, "below_1y_high": _below_high,
+                   "vs_200d_avg": _vs_avg, "move_5d_in_sd": _move_in_sd, "volume_20d_vs_1y": _volume_ratio}
+UNITS = {"fraction", "standard deviations", "correlation"}
+
+
+def test_every_price_column_is_defined_and_recomputes_from_its_definition():
+    px = dev_prices()
+    dv = dollar_volume(px)
+    defs = rs.PRICE_COLUMNS
+    table = _parse(rs.price_table(px, dv))
+    assert set(table.columns) == set(defs) == set(PRICE_RECOMPUTE)       # no unlabelled column, no definition without a column
+    assert list(table.index) == SYMBOLS
+    for name, d in defs.items():
+        assert d.unit in UNITS and d.sentence.strip() and isinstance(d.window, int) and d.window > 0, name
+        for sym in SYMBOLS:
+            want = PRICE_RECOMPUTE[name](px[sym].to_numpy(), dv[sym].to_numpy(), d.window, d.baseline_window)
+            assert table.loc[sym, name] == pytest.approx(want, abs=5.01e-4), (name, sym)
+    assert defs["move_5d_in_sd"].unit == "standard deviations"
+    assert all(defs[k].unit == "fraction" for k in defs if k != "move_5d_in_sd")
+    assert [defs[k].window for k in ("ret_1m", "ret_3m", "ret_12m", "vol_1y")] == [21, 63, 252, 252]
+
+
+def test_without_dollar_volume_the_volume_column_and_its_legend_line_are_absent():
+    px = dev_prices()
+    text = rs.price_table(px)
+    assert "volume_20d_vs_1y" not in text and "ret_1m" in text
+
+
+MACRO_RECOMPUTE = {"chg_3m": _ret, "chg_12m": _ret, "vs_200d_avg": _vs_avg}
+
+
+def test_every_macro_column_is_defined_and_recomputes_from_its_definition():
+    px = dev_prices()
+    defs = rs.MACRO_COLUMNS
+    table = _parse(rs.macro_table(px))
+    assert set(table.columns) == set(defs) == set(MACRO_RECOMPUTE)
+    present = [(a, b, label) for a, b, label in rs._PAIRS if a in px and b in px]
+    assert len(present) == 4 and len(table) == len(present)               # one row per pair, and nothing else
+    for a, b, label in present:
+        ratio = (px[a] / px[b]).to_numpy()
+        for name, d in defs.items():
+            assert d.unit == "fraction" and d.sentence.strip() and d.window > 0
+            want = MACRO_RECOMPUTE[name](ratio, None, d.window, d.baseline_window)
+            assert table.loc[f"{a}/{b} {label}", name] == pytest.approx(want, abs=5.01e-4), (a, b, name)
+    assert [defs[k].window for k in ("chg_3m", "chg_12m", "vs_200d_avg")] == [63, 252, 200]
+
+
+def test_a_column_with_no_definition_is_refused_by_the_legend_generator():
+    with pytest.raises(ValueError, match="mystery"):
+        rs._legend(rs.PRICE_COLUMNS, ["ret_1m", "mystery"])
+    assert rs._legend(rs.PRICE_COLUMNS, []) == ""
+
+
+def test_the_legend_is_generated_from_the_definitions_and_sits_above_each_table_in_the_prompt():
+    px = dev_prices()
+    dv = dollar_volume(px)
+    for key, defs in (("price-analyst", rs.PRICE_COLUMNS), ("macro-watcher", rs.MACRO_COLUMNS)):
+        role = rs.ROLES[key]
+        table = role.table(px, dv)
+        prompt = rs.build_prompt(role, "us-etf", SYMBOLS, px.index[-1], table, [])
+        legend = _legend_part(table)
+        header = next(ln for ln in table.splitlines() if ln.startswith(","))
+        assert legend and legend in prompt and prompt.index(legend) < prompt.index(header)
+        assert prompt.index("Your data, as of") < prompt.index(legend)
+        for name, d in defs.items():
+            line = next(ln for ln in legend.splitlines() if ln.lstrip("- ").startswith(name + " "))
+            assert d.unit in line and f"{d.window} sessions" in line and d.sentence in line, name
+            if d.baseline_window:
+                assert f"{d.baseline_window} sessions" in line
+        for sentence in ("fractions", "0.052 means 5.2%", "1m = 21", "3m = 63", "12m and 1y = 252", "252 sessions a year", "3 decimals"):
+            assert sentence in legend, sentence
+    other = rs.build_prompt(rs.ROLES["price-analyst"], "us-etf", SYMBOLS, px.index[-1], rs.price_table(px), [])
+    assert "ret_12m" in other and "chg_12m" not in other and "credit vs treasuries" not in other
+
+
+def test_the_legend_names_only_the_columns_the_table_has():
+    px = dev_prices()
+    with_volume, without = _legend_part(rs.price_table(px, dollar_volume(px))), _legend_part(rs.price_table(px))
+    assert "volume_20d_vs_1y" in with_volume and "volume_20d_vs_1y" not in without
+
+
+def test_the_correlation_is_its_own_line_after_the_macro_table_and_in_no_row():
+    px = dev_prices()
+    text = rs.macro_table(px)
+    table = _parse(text)
+    assert not any("correlation" in str(i).lower() for i in table.index) and "chg_3m" in table.columns
+    r = px.pct_change().iloc[-60:]
+    want = np.corrcoef(r["SPY"].to_numpy(), r["TLT"].to_numpy())[0, 1]
+    line = f"SPY-TLT correlation of daily returns, last 60 sessions: {want:.3f}"
+    assert text.splitlines()[-1] == line and text.count("SPY-TLT correlation") == 1
+    assert text.index(line) > text.index(_csv_block(text).strip().splitlines()[-1])
+    for gone in ("SPY", "TLT"):
+        assert not any(ln.startswith("SPY-TLT correlation") for ln in rs.macro_table(px.drop(columns=gone)).splitlines())
+
+
+def _frame(rate, n):
+    """n rows on a calendar of about `rate` rows a year: day offsets rate-spaced, to the day."""
+    days = np.floor(np.arange(n) * 365.25 / rate).astype(int)
+    idx = pd.Timestamp("2018-01-01") + pd.to_timedelta(days, unit="D")
+    rng = np.random.default_rng(3)
+    return pd.DataFrame(100 * np.exp(np.cumsum(0.0003 + 0.01 * rng.standard_normal((n, len(SYMBOLS))), axis=0)), index=idx, columns=SYMBOLS)
+
+
+@pytest.mark.parametrize("fn", ["price_table", "macro_table"])
+def test_calendar_guard_refuses_a_frame_that_is_not_252_sessions_a_year(fn):
+    daily = _frame(365.25, 800)                                          # a seven-days-a-week frame
+    measured = f"{800 / ((daily.index[-1] - daily.index[0]).days / 365.25):.1f}"
+    with pytest.raises(ValueError, match=re.escape(measured)):
+        getattr(rs, fn)(daily)
+    for rate in (200, 230, 275, 300):
+        with pytest.raises(ValueError):
+            getattr(rs, fn)(_frame(rate, int(rate * 3)))
+    for rate in (245, 252, 258):                                         # within 5% of 252
+        assert getattr(rs, fn)(_frame(rate, int(rate * 3)))
+    assert getattr(rs, fn)(dev_prices())                                 # the weekday calendar (about 262 a year, holidays kept in)
+
+
+@pytest.mark.parametrize("fn", ["price_table", "macro_table"])
+def test_calendar_guard_does_not_judge_a_frame_shorter_than_a_year(fn):
+    short = _frame(365.25, 200)                                          # 200 daily rows span 0.55 years: not judged
+    assert (short.index[-1] - short.index[0]).days < 365
+    assert isinstance(getattr(rs, fn)(short), str)
+
+
+def test_a_refused_frame_is_reported_by_the_run_and_no_prompt_is_sent(env):
+    paths, ledger, _ = env
+    asked = []
+    out = rs.run_research(ledger, paths, _frame(365.25, 800), None, "us-etf",
+                          {"price-analyst": lambda p: asked.append(p) or "{}"}, today="2026-11-10")
+    assert asked == [] and "rows a year" in out["roles"]["price-analyst"]["note"]
