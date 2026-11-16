@@ -401,6 +401,9 @@ def plain_follow_refusal(refused: str, shown: str) -> str:
                 return f"{shown} {words}"
         if ", whose strategy cannot be loaded (" in rest:
             return f"{shown} names a hypothesis whose strategy cannot be loaded"
+        if ", whose strategy can hold a short position; " in rest:      # T38-1b
+            return (f"{shown} names a hypothesis whose strategy can hold a short position, so it cannot be followed "
+                    "until shorts are built")
         return f"{shown} names a hypothesis that cannot be followed"
     if rest.endswith("more than once"):
         return f'{shown} "follow" names a hypothesis more than once'

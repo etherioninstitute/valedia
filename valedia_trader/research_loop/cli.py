@@ -704,6 +704,12 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     from valedia_trader.research_loop.paper import Journal
     from valedia_trader.research_loop.revision import RevisionEngine
     out: dict = {"date": str(pd.Timestamp.today().date())}
+    try:                                                # T38-1b: a held left-out book stops the cycle before it spends
+        refuse_a_held_left_out_book(paths, strategies_to_step(paths, ledger).left_out)
+    except LeftOutBookHeld:
+        raise
+    except Exception:                                   # only LeftOutBookHeld here: anything else surfaces where it did
+        pass
     if args.refresh:
         from valedia_trader.data_and_fees import prices as price_data
         try:
