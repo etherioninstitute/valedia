@@ -9409,6 +9409,27 @@ def test_t34b3_an_unpriced_pieces_fill_line_judges_the_notices_figure_and_the_no
     assert said == {f1: ("breach", 100.01, None), f2: ("ok", 100.0, None), n1: None} and settled == {}, said
 
 
+@pytest.mark.parametrize("first, new, verdict", [(100.0, 99.99, "ok"), (100.03, 100.02, "breach")])
+def test_t34b3_a_piece_unpriced_notice_with_no_row_of_its_own_is_judged_on_its_own_new(tmp_path, first, new, verdict):
+    """Units with no average, then an average that prices them through a notice with no row (the worked-out piece
+    is negative and a cent of rounding explains it): the notice's own line judges its own `new`."""
+    L = _Lines(tmp_path, units=10.0001, limit=100.0)
+    L.report(state="partly_filled", filled_units=10.0, avg_price=first, fee=0.0)
+    L.journal_run()
+    L.report(state="filled", filled_units=10.0001, avg_price=None)  # units with no average: a row that waits
+    L.journal_run()
+    L.report(avg_price=new)                                        # no new units, so no row: only the notice
+    L.journal_run()
+    (f1, f2), (n1,) = _refs(L)
+    (n,) = L.led.reconcile_notices()
+    assert (n["kind"], n["new"], n["row"]) == ("piece_unpriced", new, None), n
+    said, settled = _t34b3_map(L.lines())
+    assert said[n1] == (verdict, new, None) and said[f2][:2] == ("unjudged", None), said
+    assert settled == {f2: ("ok", n1)}, settled
+    first_cap = [[f1]] if first > 100.0 else []
+    assert L.caps() == first_cap + ([[n1]] if verdict == "breach" else []), L.caps()
+
+
 @pytest.mark.parametrize("late", [False, True])
 def test_t34b3_a_row_with_no_average_is_settled_by_the_write_that_prices_it_and_one_ref_carries_the_breach(tmp_path,
                                                                                                             late):
@@ -9439,15 +9460,17 @@ def test_t34b3_a_replay_that_cannot_be_trusted_falls_back_to_the_stored_average_
     assert (line["verdict"], line["judged_avg"], line["judged_on"]) == ("breach", 90.01, "stored"), line
 
 
-def _t34b3_history(rng):
+def _t34b3_history(rng, restate_unpriced=False):
     """One order's history: (units, limit, the venue's reports in turn). Fills in unequal pieces (tiny ones too, so
     a rounding broker gives unpriced pieces), through the limit or not; a broker that rounds, truncates or does not
     round its average; reports with no average; restatements within and beyond a cent; a cancel with part filled
-    and late amounts after it; fee totals that rise and fall."""
+    and late amounts after it; fee totals that rise and fall. With `restate_unpriced`, a restatement may also follow
+    a report with no average (from the last average given), so a later average can price units through a notice
+    with no row of its own (addendum 5); without it the histories are those the property always drew."""
     side, size, limit = rng.choice((1.0, -1.0)), rng.choice((10.0, 6.0, 10.0002)), 90.0
     how = rng.choice(("round", "truncate", "exact"))
     filled = cash = fee = 0.0
-    state, shown, steps = "open", None, []
+    state, shown, last, steps = "open", None, None, []
     for _ in range(rng.randint(2, 10)):
         roll, f = rng.random(), {}
         if roll < 0.5 and filled < size - 1e-9:
@@ -9460,8 +9483,10 @@ def _t34b3_history(rng):
             if state != "cancelled":
                 state = "filled" if filled >= size - 1e-9 else "partly_filled"
             f = {"state": state, "filled_units": filled, "avg_price": shown}
-        elif roll < 0.75 and shown is not None:
-            shown = round(shown + rng.choice((-0.01, -0.005, 0.005, 0.01, 0.02, -0.03)), 4)
+            last = shown if shown is not None else last
+        elif roll < 0.75 and (last if restate_unpriced else shown) is not None:
+            shown = round((last if restate_unpriced else shown) + rng.choice((-0.01, -0.005, 0.005, 0.01, 0.02, -0.03)), 4)
+            last = shown
             f = {"avg_price": shown}
         elif roll < 0.82 and state == "partly_filled":
             state = "cancelled"
@@ -9480,9 +9505,9 @@ def _t34b3_through(units, limit, avg):
 def test_t34b3_the_verdicts_are_the_same_journaled_on_time_late_or_across_a_death(tmp_path):
     rng = random.Random(3404)
     tally = {"histories": 0, "refs": 0, "breach refs": 0, "settled": 0, "stored lines": 0, "deaths": 0,
-             "notices": {}, "unjudged at the end": 0}
-    for k in range(520):
-        units, limit, steps = _t34b3_history(rng)
+             "notices": {}, "unjudged at the end": 0, "setting writes": 0, "rowless piece_unpriced": 0}
+    for k in range(600):                                           # the last 80: restatements after an unpriced report
+        units, limit, steps = _t34b3_history(rng, restate_unpriced=k >= 520)
         die_at, die_after = rng.randrange(len(steps)), rng.randrange(3)
         maps = {}
         for arm in ("on time", "late", "death"):
@@ -9528,9 +9553,19 @@ def test_t34b3_the_verdicts_are_the_same_journaled_on_time_late_or_across_a_deat
             if n["kind"] == "avg_restated":
                 assert said[ref][1] == n["new"] and (said[ref][0] == "breach") == _t34b3_through(units, limit, n["new"])
             elif n["kind"] == "piece_unpriced" and n["row"] is not None:
-                assert said[ref] is None, (k, ref)
+                assert said[ref] is None and replay["fills"][n["row"]]["sets"], (k, ref)
+            elif n["kind"] == "piece_unpriced":                  # no row of its own: its own line judges its own new
+                tally["rowless piece_unpriced"] += 1
+                assert said[ref][1] == n["new"] and (said[ref][0] == "breach") == _t34b3_through(units, limit, n["new"])
             elif n["kind"] in ("late_amount", "fee_fell"):
                 assert said[ref] is None, (k, ref)
+        # addendum 5: every write that sets an average has exactly one line carrying judged_avg (rowless notices too)
+        setting = ({f"fill-{i}" for i, wr in replay["fills"].items() if wr["sets"]}
+                   | {f"notice-{n['id']}" for n in held.led.reconcile_notices()
+                      if n["kind"] == "avg_restated" or (n["kind"] == "piece_unpriced" and n["row"] is None)})
+        carrying = [ref for ref, v in said.items() if v is not None and v[1] is not None]
+        assert sorted(carrying) == sorted(setting), (k, carrying, setting)
+        tally["setting writes"] += len(setting)
         tally["histories"] += 1
         tally["refs"] += len(said)
         tally["breach refs"] += sum(1 for v in said.values() if v and v[0] == "breach")
@@ -9539,7 +9574,7 @@ def test_t34b3_the_verdicts_are_the_same_journaled_on_time_late_or_across_a_deat
     print("T34B3-PROPERTY", tally)
     assert tally["stored lines"] == 0 and tally["deaths"] > 100 and tally["breach refs"] > 200, tally
     assert {"avg_restated", "piece_unpriced", "late_amount", "fee_fell"} <= set(tally["notices"]), tally
-    assert tally["settled"] > 50, tally
+    assert tally["settled"] > 50 and tally["rowless piece_unpriced"] > 0, tally
 
 
 # -- M2: the first reconcile's unread status needs only to be of that kind, for an order the ledger knows
