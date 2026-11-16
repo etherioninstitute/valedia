@@ -2981,6 +2981,7 @@ def test_t34b3_a_row_with_no_average_is_covered_by_the_later_write_that_prices_i
     assert got["trusted"] and [got["fills"][r["id"]]["sets"] for r in (a, b, c)] == [False, False, True]
     assert [got["fills"][r["id"]]["covered_by"] for r in (a, b, c)] == [("fill", c["id"]), ("fill", c["id"]), None]
     assert [got["fills"][r["id"]]["avg"] for r in (a, b)] == [None, None]
+    assert [got["fills"][r["id"]]["waits"] for r in (a, b, c)] == [True, True, False]
     assert got["fills"][c["id"]]["avg"] == pytest.approx(90.02)
 
 
@@ -2993,7 +2994,8 @@ def test_t34b3_an_unpriced_piece_sets_the_notices_figure_and_covers_the_rows_bef
     (n,) = led.reconcile_notices()
     got = led.average_writes(TAG)
     assert n["kind"] == "piece_unpriced" and got["trusted"], got
-    assert got["fills"][piece["id"]] == {"avg": 100.0, "sets": True, "units": pytest.approx(0.0001), "covered_by": None}
+    assert got["fills"][piece["id"]] == {"avg": 100.0, "sets": True, "units": pytest.approx(0.0001),
+                                        "waits": False, "covered_by": None}
     assert got["fills"][bare["id"]]["covered_by"] == ("fill", piece["id"]) and not got["fills"][bare["id"]]["sets"]
     assert got["fills"][first["id"]]["avg"] == pytest.approx(100.01) and got["units"] == pytest.approx(10.0002)
 

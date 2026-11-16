@@ -184,25 +184,33 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
    sorted, of a blocking attention item (a kind not in orders.NOTICE_KINDS) whose id is above the largest id the ledger held when the run took it, read once before
    settle_sends (a kind not [a-z0-9_-]{1,40} is "unknown"); `cap` when a fill broke what was checked: on practice and
    live runs, for every fill at the moment a run first journals it, whichever run sent its order, one order's fills
-   above the units it asked for, or that order's own average fill price as the ledger then holds it (the broker's
-   figure, not a piece worked out from running averages; also for a piece the ledger left unpriced) on the wrong side
-   of its limit by more than one part in a million of the limit, the edge itself no breach (every limit is a whole
-   number of cents, so an average the broker rounds to the cent is either at the limit or a cent through it; an
-   average that includes fees would trip this rule); in live mode also, with the confirmation in force, a purchase
-   fill of this batch worth more than max_order_value at its own price, or at the order's stored average for a piece
-   left unpriced (each fill on its own, never summed; a sale that fills above its limit is a better price, not a
-   breach). The same limit test is made again on every ledger notice that changes an order's average
-   (`avg_restated`, `piece_unpriced`). The verdict (`ok`, `breach`, `unjudged`) is the last field of the fill's own
-   journal line, written before the fill counts as applied; a breach is `cap` in the summary of the run that wrote
+   above the units it asked for, or the order's average fill price (the broker's figure, not a piece worked out from
+   running averages) on the wrong side of its limit by more than one part in a million of the limit, the edge itself
+   no breach (every limit is a whole number of cents, so an average the broker rounds to the cent is either at the
+   limit or a cent through it; an average that includes fees would trip this rule); in live mode also, with the
+   confirmation in force, a purchase fill of this batch worth more than max_order_value at its own price, or at the
+   replayed average for a piece left unpriced (each fill on its own, never summed; a sale that fills above its limit
+   is a better price, not a breach). Every write of the ledger that sets an order's average is judged once, by the
+   line of THAT write, on the figure THAT write set, whenever the line is written (T34b-3 addendum 4): the averages
+   are replayed from the ledger's durable records (`OrderLedger.average_writes`), so a verdict never depends on the
+   order's average at journal time, on which run died, or on an equal value seen before. A priced fill row's line
+   judges the average after its own row; an `avg_restated` notice's line judges its own `new`; a `piece_unpriced`
+   notice's row's fill line judges that notice's figure (the notice line has no verdict); a row whose units the
+   venue gave no average for is `unjudged` until a later write prices them, then settles naming that write
+   (`covered_by`); an old figure is never judged again. Each such line carries `judged_avg`, the figure judged. When
+   the replay does not reproduce the order's stored figures, a fill line is judged on the stored average and says
+   `judged_on: "stored"`. The verdict (`ok`, `breach`, `unjudged`) is the last field of the line, written before the
+   fill counts as applied; a breach is `cap` in the summary of the run that wrote
    it, and `cap_refs` lists the sorted refs (`fill-<id>`, `notice-<id>`) each `cap` stands for. A breach journaled
    but in no summary's `cap_refs` (the run died first, or its summary could not be written) is carried by the next
    run of the same venue whose New York day is an exchange session (it passed the calendar test), whatever stage it
    then stops at: that summary has `cap` and the ref. The scan reads every journal file there is, on every run. What
    cannot be judged is named in `cap_unjudged` instead, on practice and live summaries, and stays named on every later
-   run (after its scan) until a later read settles it with a `verdict` line ({"ref", "verdict"}). A fill line
-   without a `verdict` (written before T34b-3) is never carried or judged again.
+   run (after its scan) until a later read settles it with a `verdict` line ({"ref", "verdict", "covered_by",
+   "judged_avg"}). A fill line without a `verdict` (written before T34b-3) is never carried or judged again.
  - `notices`, the sorted kinds of the ledger notices this run journaled (one `notice` line each: notice_id, kind, tag,
-   old and new figures, and for a kind that changes an average its verdict), only when not empty; never a fault.
+   old and new figures, and for an `avg_restated` its verdict and `judged_avg`), only when not empty; never a
+   fault.
  - stage `venue_read` (a skipped session for the ladder) instead of `reconcile` when the run stops at the reconcile
    only because the venue could not be read: the positions read raised in the second reconcile; every unresolved entry
    of both reconciles is a status that could not be read of an order the ledger holds as accepted or partly filled;
@@ -230,7 +238,8 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
  - the limits that stay for `cap`: a breach journaled on a day with no later session run of the venue is carried
    only by the next such run, however far off; a fill the ledger can never price (a broker that reports a fill with
    no average and never restates it) stays in `cap_unjudged` for good; a broker's honest correction of a trade price
-   by more than a cent is a blocking anomaly, on purpose.
+   by more than a cent is a blocking anomaly, on purpose; pieces that reach the broker between two reads show only
+   their average, so one piece through its limit diluted by honest pieces of the same read is not seen.
 """
 from __future__ import annotations
 
@@ -1963,66 +1972,106 @@ class _Run:
             self.reconcile_pending = {"symbols": sorted({self._cap_symbol(sym) for sym in (*aside, *status_aside.values())}),
                                       "positions_unread": unread, "status_unread": len(status_aside)}
 
-    def _avg_verdict(self, order) -> str:
-        """(iii), K1, on the ORDER'S average fill price as the ledger now holds it (the broker's own figure, never a
-        piece price worked out from two running averages): `breach` when it is beyond LIMIT_SAME x limit (times
-        LIMIT_EDGE, so the edge itself is no breach) on the wrong side of the order's limit; `unjudged` when the order,
-        its units, its limit or its average cannot be read back as usable numbers; else `ok`. Every limit the order step
-        sends is a whole number of cents, so an average the broker rounds to the cent is at its limit or a cent through
-        it; an average that includes fees would trip this rule."""
+    @staticmethod
+    def _limit_verdict(order, avg) -> str:
+        """(iii), K1, on one average `avg` of the order (a broker's own figure, never a piece price worked out from two
+        running averages): `breach` when it is beyond LIMIT_SAME x limit (times LIMIT_EDGE, so the edge itself is no
+        breach) on the wrong side of the order's limit; `unjudged` when the order, its units, its limit or `avg` cannot
+        be read as usable numbers; else `ok`. Every limit the order step sends is a whole number of cents, so an
+        average the broker rounds to the cent is at its limit or a cent through it; an average that includes fees
+        would trip this rule."""
         asked = _as_float(order.get("units")) if isinstance(order, dict) else None
         if asked is None or asked == 0:
             return "unjudged"
-        avg, limit = _as_float(order.get("avg_price")), _as_float(order.get("limit_price"))
+        avg, limit = _as_float(avg), _as_float(order.get("limit_price"))
         if avg is None or not avg > 0 or limit is None or not limit > 0:
             return "unjudged"
         return "breach" if ((avg - limit) if asked > 0 else (limit - avg)) > LIMIT_SAME * limit * LIMIT_EDGE else "ok"
 
-    def _fill_verdict(self, f: dict) -> str:
-        """J1 (T34b-2 addendum 5), as T34b-3 (D, B3) has it: one fill's verdict, worked out BEFORE its journal line is
-        written (a failure here leaves no line, and the next run judges the fill), whichever run or batch sent its
-        order, practice and live alike, against its own order read back from the ledger. `breach` when (ii) the order's
-        fills in the ledger now sum to more units than it asked for (beyond REL_TOL x max(1, |units|)); or (iii) the
-        order's average is through its limit (`_avg_verdict`), whether or not this piece has a price of its own; or, in
-        live mode with the confirmation in force, (i) a purchase fill of this run's batch whose units times its own
-        price, or times the order's stored average for a piece left unpriced, is above max_order_value (each fill on
-        its own, never summed with the batch's other fills, as T34b-2 judged it after the final reconcile). Else
-        `unjudged` when any of the three could not be judged (the order, its units, limit or average, or a fill's units
-        unusable; for (i) neither a price nor a usable average), else `ok`. What this cannot see: a breach of under one
-        part in a million of the limit, and one piece through its limit diluted by honest pieces of the same order."""
+    def _fill_verdict(self, f: dict, settling: bool = False) -> dict:
+        """J1 (T34b-2 addendum 5), as T34b-3 (D, B3, addenda 3 and 4) has it: one fill's verdict, worked out BEFORE its
+        journal line is written (a failure here leaves no line, and the next run judges the fill), whichever run or
+        batch sent its order, practice and live alike, against its own order read back from the ledger. Returns
+        {"verdict", "judged_avg", "judged_on", "covered_by"}.
+        (iii) is made on the average that stood after THIS fill's own write, replayed from the ledger's durable
+        records (`OrderLedger.average_writes`), so a fill journaled late gets the figure it would have had on time
+        and every write that sets an average is judged once, by its own line: a priced row on the figure it set; the
+        row of a `piece_unpriced` notice on that notice's figure; a row with units that sets no average (the venue
+        gave none) is `unjudged` until a later write prices its units, and settles (`settling`, from
+        `_settle_unjudged`) with no limit breach of its own, naming that write (`covered_by`), whose own line judges
+        the figure; a row with no units and no price (a fee) has no limit test. `judged_avg` is the figure the limit
+        test was made on (None when it made none). When the replay does not reproduce the stored figures, (iii) is
+        made on the order's stored average as the ledger now holds it, and `judged_on` says "stored".
+        `breach` also when (ii) the order's fills in the ledger now sum to more units than it asked for (beyond
+        REL_TOL x max(1, |units|)); or, in live mode with the confirmation in force, (i) a purchase fill of this run's
+        batch whose units times its own price, or times the replayed average after its write for a piece left
+        unpriced (the stored average when the replay is not trusted; for a settling fill, the figure of the write
+        that priced it), is above max_order_value (each fill on its own, never summed with the batch's other fills).
+        A fill that settles in a later run is not given (i): it is not that run's batch. Else `unjudged` when any of
+        the three could not be judged (the order, its units or limit, or a fill's units unusable; for (i) no price),
+        else `ok`. What this cannot see: a breach of under one part in a million of the limit; and pieces that reach
+        the broker between two reads show only their average, so one piece through its limit diluted by honest
+        pieces of the same read is not seen."""
+        out = {"verdict": "unjudged", "judged_avg": None, "judged_on": None, "covered_by": None}
         tag = f.get("tag")
         order = self.ledger.order(tag) if type(tag) is str and tag else None
         asked = _as_float(order.get("units")) if isinstance(order, dict) else None
         if asked is None or asked == 0:
-            return "unjudged"
-        unjudged = False
+            return out
+        unjudged = breach = False
         filled = [_as_float(r.get("units")) for r in self.ledger.fills(tag)]
         if None in filled:
             unjudged = True
         elif math.fsum(filled) * (1.0 if asked > 0 else -1.0) > abs(asked) + REL_TOL * max(1.0, abs(asked)):
-            return "breach"                                      # (ii)
-        avg_verdict = self._avg_verdict(order)
-        if avg_verdict == "breach":
-            return "breach"                                      # (iii), K1: on the order's own average
-        unjudged = unjudged or avg_verdict == "unjudged"
+            breach = True                                        # (ii)
+        replay = self.ledger.average_writes(tag)
+        own = replay["fills"].get(f.get("id")) if isinstance(replay, dict) and replay.get("trusted") else None
+        piece_price = None                                       # for (i): the average an unpriced piece is valued at
+        if own is None:                                          # the replay cannot be trusted: the stored average
+            limit_verdict = self._limit_verdict(order, order.get("avg_price"))
+            out["judged_on"] = "stored"
+            if limit_verdict != "unjudged":
+                out["judged_avg"] = _as_float(order.get("avg_price"))
+            piece_price = _as_float(order.get("avg_price"))
+        elif own["sets"]:                                        # this write set the order's average: its own figure
+            limit_verdict = self._limit_verdict(order, own["avg"])
+            if limit_verdict != "unjudged":
+                out["judged_avg"] = own["avg"]
+            piece_price = own["avg"]
+        elif own["waits"]:                                       # units this write did not price
+            cover = own["covered_by"] if settling else None
+            if cover is not None:
+                kind, cid = cover
+                out["covered_by"] = f"{kind}-{cid}"
+                limit_verdict = "ok"                             # the covering write's own line judges the figure
+                piece_price = (replay["fills"].get(cid) or {}).get("avg") if kind == "fill" else \
+                    (replay["notices"].get(cid) or {}).get("avg")
+            else:
+                limit_verdict = "unjudged"
+                piece_price = own["avg"]
+        else:                                                    # no units and no price: no limit test of its own
+            limit_verdict = "ok"
+        breach = breach or limit_verdict == "breach"
+        unjudged = unjudged or limit_verdict == "unjudged"
         conf = self.locks.confirmation if self.live is not None and self.locks is not None else None
         if conf is not None and self.batch and tag.startswith(self.batch + "-"):   # (i), live: this batch's fills
             units, price = _as_float(f.get("units")), _as_float(f.get("price"))
-            if price is None:                                    # a piece left unpriced: the order's stored average
-                avg = _as_float(order.get("avg_price"))
-                price = avg if avg is not None and avg > 0 else None
+            if price is None:                                    # a piece left unpriced: the replayed average
+                price = piece_price if piece_price is not None and piece_price > 0 else None
             if units is None or price is None:
                 unjudged = True
             elif units > 0 and not units * price <= conf["max_order_value"]:
-                return "breach"                                  # (i), purchases only
-        return "unjudged" if unjudged else "ok"
+                breach = True                                    # (i), purchases only
+        out["verdict"] = "breach" if breach else "unjudged" if unjudged else "ok"
+        return out
 
-    def _take_verdict(self, ref: str, verdict: str, symbol) -> None:
-        """A verdict this run wrote into a line: a breach is this run's `cap` with `ref`; unjudged names the symbol."""
-        if verdict == "breach":
+    def _take_verdict(self, ref: str, line: dict) -> None:
+        """A verdict this run wrote into a line: a breach is this run's `cap` with `ref`; an unjudged one waits to be
+        settled (`pending_unjudged`, whose symbols the summary names in `cap_unjudged`), this run included."""
+        if line.get("verdict") == "breach":
             self.cap_refs.add(ref)
-        elif verdict == "unjudged":
-            self.cap_unjudged.add(self._cap_symbol(symbol))
+        elif line.get("verdict") == "unjudged":
+            self.pending_unjudged[ref] = line
 
     def _judge_caps(self, conf: dict) -> None:
         """F3, live mode, after the final reconcile: the money at work in the broker book (this ledger's holdings at
@@ -2629,8 +2678,9 @@ class _Run:
         return result
 
     def _journal_fills(self) -> None:
-        """Each fill of the ledger not yet applied: journaled once (by fill_id), with its verdict as the line's last
-        field, judged before the line is written and synced before the fill counts as applied (T34b-3 D)."""
+        """Each fill of the ledger not yet applied: journaled once (by fill_id), with `judged_avg` (and `judged_on`
+        when the stored average stood in for the replay) and its verdict as the line's last field, judged before the
+        line is written (`_fill_verdict`) and synced before the fill counts as applied (T34b-3 D, addenda 3 and 4)."""
         if self._seen_fill_ids is None:
             try:
                 entries = self.journal.read()
@@ -2641,26 +2691,33 @@ class _Run:
             self._scan_verdicts(entries)
         for f in self.ledger.unapplied_fills():
             if f["id"] not in self._seen_fill_ids:
-                verdict = self._fill_verdict(f)          # T34b-3 (D): first; a failure leaves no line to lose it
-                self._write({"event": "fill", "fill_id": f["id"], "tag": f["tag"] if _plain(_TAG, f["tag"]) else None,
-                             "symbol": f["symbol"] if _plain(_SYMBOL, f["symbol"]) else None,
-                             "units": _number_or_none(f["units"]), "price": _number_or_none(f["price"]),
-                             "price_covers_units": _number_or_none(f["price_covers_units"]), "fee": _number_or_none(f["fee"]),
-                             "verdict": verdict})
+                judged = self._fill_verdict(f)           # T34b-3 (D): first; a failure leaves no line to lose it
+                entry = {"event": "fill", "fill_id": f["id"], "tag": f["tag"] if _plain(_TAG, f["tag"]) else None,
+                         "symbol": f["symbol"] if _plain(_SYMBOL, f["symbol"]) else None,
+                         "units": _number_or_none(f["units"]), "price": _number_or_none(f["price"]),
+                         "price_covers_units": _number_or_none(f["price_covers_units"]),
+                         "fee": _number_or_none(f["fee"]), "judged_avg": _number_or_none(judged["judged_avg"])}
+                if judged["judged_on"] is not None:
+                    entry["judged_on"] = judged["judged_on"]
+                entry["verdict"] = judged["verdict"]
+                self._write(entry)
                 self._sync_journal()                     # on disk before the fill counts as applied
                 self._seen_fill_ids.add(f["id"])
                 self.fills_journaled += 1
                 self.journaled_symbols.add(f["symbol"])
-                self._take_verdict(f"fill-{f['id']}", verdict, f["symbol"])
+                self._take_verdict(f"fill-{f['id']}", entry)
             self.ledger.mark_applied([f["id"]])
 
     def _journal_notices(self) -> None:
-        """T34b-3 (B2, R5): every ledger notice of the four reconcile kinds (orders.RECONCILE_NOTICE_KINDS) whose id
-        the journal does not hold yet, open, closed or superseded, journaled once in id order: one `notice` line (its
-        id, kind, tag, symbol, old and new figures) and, for a kind that changes the order's average (`avg_restated`,
-        `piece_unpriced`), the limit test on that average as the ledger now holds it (`_avg_verdict`), judged before
-        the line is written. `late_amount` and `fee_fell` carry no verdict: a late amount's units come as a fill row,
-        judged in its own line, and a fee is not an average."""
+        """T34b-3 (B2, R5, addenda 3 and 4): every ledger notice of the four reconcile kinds (orders.RECONCILE_NOTICE_
+        KINDS) whose id the journal does not hold yet, open, closed or superseded, journaled once in id order: one
+        `notice` line (its id, kind, tag, symbol, old and new figures). An `avg_restated` line also carries the limit
+        test on its OWN `new` figure (with the order's limit, side and units), never on the order's average at journal
+        time, with `judged_avg`, judged before the line is written; so does a `piece_unpriced` notice that came with
+        no row of its own. A `piece_unpriced` notice with its own row carries no verdict: that row's fill line judges
+        the figure it set. `old` is never judged (the line of the write that set it did). `late_amount` and
+        `fee_fell` carry no verdict: a late amount's units come as a fill row, judged in its own line, and a fee is
+        not an average."""
         for n in self.ledger.reconcile_notices():
             nid, kind, tag = n.get("id"), n.get("kind"), n.get("tag")
             if type(nid) is not int or nid in self._seen_notice_ids or kind not in RECONCILE_NOTICE_KINDS:
@@ -2669,34 +2726,46 @@ class _Run:
             symbol = order.get("symbol") if isinstance(order, dict) and _plain(_SYMBOL, order.get("symbol")) else None
             entry = {"event": "notice", "notice_id": nid, "kind": kind, "tag": tag if _plain(_TAG, tag) else None,
                      "symbol": symbol, "old": _number_or_none(n.get("old")), "new": _number_or_none(n.get("new"))}
-            if kind in AVERAGE_NOTICE_KINDS:
-                entry["verdict"] = self._avg_verdict(order)
+            if kind == "avg_restated" or (kind == "piece_unpriced" and n.get("row") is None):
+                verdict = self._limit_verdict(order, n.get("new"))
+                entry["judged_avg"] = entry["new"] if verdict != "unjudged" else None
+                entry["verdict"] = verdict
             self._write(entry)
             self._sync_journal()
             self._seen_notice_ids.add(nid)
             self.notice_kinds.add(kind)
             if "verdict" in entry:
-                self._take_verdict(f"notice-{nid}", entry["verdict"], symbol)
+                self._take_verdict(f"notice-{nid}", entry)
 
     def _settle_unjudged(self) -> None:
-        """T34b-3 (R3): each earlier `unjudged` verdict judged again on the ledger as it now is; one `verdict` line
-        ({"ref", "verdict"}) only when it settles to `ok` or `breach` (a breach is then this run's `cap`). While it stays
-        unjudged no line is written and its symbol is named in this run's `cap_unjudged`; nothing but settling ends
-        that."""
+        """T34b-3 (R3, addendum 4): each `unjudged` verdict not settled yet (from the journal's scan, and this run's
+        own lines) judged again on the ledger's durable records as they now are; one `verdict` line ({"ref",
+        "verdict", "covered_by", "judged_avg"}) only when it settles to `ok` or `breach` (a breach is then this run's
+        `cap`). A fill whose units had no price settles once a later write prices them: `covered_by` names that
+        write, whose own line judges the figure, and the settling line has no limit breach of its own (a fill that
+        settles in a later run is not given the value test (i), since it is not that run's batch). A notice is judged
+        again on its own `new`. While it stays unjudged no line is written and its symbol is named in this run's
+        `cap_unjudged`; nothing but settling ends that."""
         for ref, line in sorted(self.pending_unjudged.items()):
             tag = line.get("tag")
             order = self.ledger.order(tag) if type(tag) is str and tag else None
             if line.get("event") == "fill":
                 row = next((r for r in self.ledger.fills(tag) if r.get("id") == line.get("fill_id")), None) if order else None
-                verdict = "unjudged" if row is None else self._fill_verdict(row)
+                judged = {"verdict": "unjudged"} if row is None else self._fill_verdict(row, settling=True)
             else:
-                verdict = self._avg_verdict(order)
-            if verdict == "unjudged":
+                verdict = self._limit_verdict(order, line.get("new"))
+                judged = {"verdict": verdict, "judged_avg": _as_float(line.get("new")) if verdict != "unjudged" else None}
+            if judged["verdict"] == "unjudged":
                 continue
-            self._write({"event": "verdict", "ref": ref, "verdict": verdict})
+            entry = {"event": "verdict", "ref": ref, "covered_by": judged.get("covered_by"),
+                     "judged_avg": _number_or_none(judged.get("judged_avg"))}
+            if judged.get("judged_on") is not None:
+                entry["judged_on"] = judged["judged_on"]
+            entry["verdict"] = judged["verdict"]
+            self._write(entry)
             self._sync_journal()
             del self.pending_unjudged[ref]
-            self._take_verdict(ref, verdict, line.get("symbol"))
+            self._take_verdict(ref, {**entry, "symbol": line.get("symbol")})
 
     def _scan_verdicts(self, entries: list[dict]) -> None:
         """T34b-3 (D, B1, R3, R4), from every journal line there is, this venue's only: the notice ids already
@@ -2763,8 +2832,10 @@ class _Run:
         """T34b-3 (G, addenda 1 and 2): why the run stops only because the venue could not be read, or None (the
         stop stays `reconcile`). All must hold: (a) the positions read raised in the second reconcile; (b) every
         unresolved entry of either reconcile is a status read that raised (`status_unread`) of an order the ledger
-        holds as accepted or partly_filled, and the first reconcile's positions error, if any, is the same raise (R1);
-        R2: every order still open after the cancels is one whose status read raised in the second reconcile; (c) no
+        knows, and for the SECOND reconcile's entries one it holds as accepted or partly_filled (a first-read entry
+        is not judged by the order's state now: the second read may have answered it with a normal fill, addendum 3
+        M2); the first reconcile's positions error, if any, is the same raise (R1); R2: every order still open after
+        the cancels is one whose status read raised in the second reconcile; (c) no
         order is sent or unknown; (d) no anomaly and no position difference in either reconcile, and no blocking
         attention item open (whenever it was opened) or opened in this run; (e) no local failure (a fill not yet
         applied, an entry that could not be written: its own kind). Anything that cannot be read is None."""
@@ -2786,8 +2857,9 @@ class _Run:
                 for item in items:                                                                # (b), R1
                     tag = item.get("tag") if isinstance(item, dict) else None
                     order = self.ledger.order(tag) if type(tag) is str and tag else None
-                    if item.get("kind") != "status_unread" or not isinstance(order, dict) \
-                            or order.get("state") not in OPEN_AT_VENUE:
+                    if item.get("kind") != "status_unread" or not isinstance(order, dict):
+                        return None
+                    if res is second and order.get("state") not in OPEN_AT_VENUE:                # M2: now, second only
                         return None
                     if res is second:
                         unread.add(tag)
@@ -2824,7 +2896,7 @@ class _Run:
         waiting = len(self.ledger.unapplied_fills())
         if waiting:
             reasons.append(f"{waiting} fill{'' if waiting == 1 else 's'} not yet applied to the book")
-        items = self.ledger.attention()
+        items = [i for i in self.ledger.attention() if i.get("kind") not in NOTICE_KINDS]   # N2: notices block nothing
         if items:
             reasons.append(f"{len(items)} attention item{'' if len(items) == 1 else 's'} open "
                            f"({', '.join(str(int(i['id'])) + ' for ' + tag(i) for i in items)}); close each with "

@@ -534,11 +534,12 @@ class OrderLedger:
         own arithmetic: a priced row moves the priced point (a, u) to ((a x u + price x covers) / (u + covers),
         u + covers), or to (price, covers) when there is none; an `avg_restated` notice sets a to its `new`; a
         `piece_unpriced` notice sets a to its `new` and u to the units filled up to its row; a row without a price
-        moves nothing. None when the ledger has no such order. Else {"fills": {id: {"avg", "sets", "units",
+        moves nothing. None when the ledger has no such order. Else {"fills": {id: {"avg", "sets", "units", "waits",
         "covered_by"}}, "notices": {id: {"kind", "avg"}}, "avg", "units", "trusted", "why"}: `avg` is a after the
         write (None before any priced point); `sets` is true for a priced row and for the row of its own
-        `piece_unpriced` notice (the figure is the notice's); `covered_by` names, for a row with units that sets
-        nothing, the first later write whose priced point takes in its units (("fill", id), or ("notice", id) for a
+        `piece_unpriced` notice (the figure is the notice's); `waits` is true for a row with units (beyond the
+        ledger's tolerance) that sets nothing, and `covered_by` names, for it, the first later write whose priced
+        point takes in its units (("fill", id), or ("notice", id) for a
         `piece_unpriced` notice that came without a row of its own). `trusted` is false, with `why`, when a record
         cannot be read as the replay needs it or the replayed priced point is not the stored one (avg_price and
         priced_units within REL_TOL x max(1, |x|))."""
@@ -596,9 +597,10 @@ class OrderLedger:
                     return untrusted(f"fill row {fid} has a price without a usable amount it covers")
                 a = price if not (u > 0 and a is not None) else (a * u + price * covers) / (u + covers)
                 u += covers
-            entry = {"avg": a, "sets": sets, "units": abs(units), "covered_by": None}
+            entry = {"avg": a, "sets": sets, "units": abs(units), "waits": not sets and abs(units) > _tol(total),
+                     "covered_by": None}
             out["fills"][fid] = entry
-            if not sets and abs(units) > _tol(total):
+            if entry["waits"]:
                 waiting.append((fid, total))
             if sets:
                 cover(("fill", fid))
@@ -607,7 +609,7 @@ class OrderLedger:
                 if kind == "piece_unpriced":
                     u = total
                     if own == fid:                        # its own row: the row's figure is the notice's
-                        entry.update(avg=a, sets=True)
+                        entry.update(avg=a, sets=True, waits=False)
                         waiting[:] = [w for w in waiting if w[0] != fid]
                         cover(("fill", fid))
                     else:

@@ -7909,7 +7909,8 @@ T34B3_EVENTS = ("notice", "verdict")                 # ... the journal lines it 
 
 def _t34b3_undo(b, m, counts=None):
     """`m` (a run's record through T34b-3 or later) with what T34b-3 is allowed to add taken out, each kind counted in
-    `counts`: the `verdict` field at the end of a fill line, the `notice` and `verdict` lines, the summary keys
+    `counts`: the `verdict` field at the end of a fill line (with `judged_avg` and `judged_on` before it), the `notice`
+    and `verdict` lines, the summary keys
     `notices` and `cap_refs`, and the stage `venue_read` where `b` stopped at `reconcile` (with its reason, in the
     returned summary, the summary line and the stopped line). Anything else is left for the caller to find."""
     def bump(kind):
@@ -7939,6 +7940,10 @@ def _t34b3_undo(b, m, counts=None):
                     if e.get("event") == "fill" and list(e)[-1:] == ["verdict"]:
                         e.pop("verdict")
                         bump("verdict field")
+                        for k in ("judged_avg", "judged_on"):     # addenda 3 and 4: the figure judged, and on what
+                            if k in e:
+                                e.pop(k)
+                                bump(f"{k} field")
                         line = json.dumps(e, default=str).encode()
                     elif e.get("event") == "summary" and any(k in e for k in T34B3_KEYS):
                         line = json.dumps({k: v for k, v in e.items() if k not in T34B3_KEYS}, default=str).encode()
@@ -8507,8 +8512,10 @@ def test_t34b3_an_unjudged_fill_stays_named_until_it_settles_by_one_verdict_line
     w.venue.factor[tag] = 1.05
     w.later(30)
     out = _prun(w)
-    assert out["faults"] == ["cap"] and "fill-1" in out["cap_refs"] and "cap_unjudged" not in out, out
-    assert [(e["ref"], e["verdict"]) for e in w.entries("verdict")] == [("fill-1", "breach")]
+    # addendum 4: the write that priced the units (an adjustment row, fill-2) judges the figure and carries the breach;
+    # fill-1 settles naming it, with no breach of its own (one figure, one ref)
+    assert out["faults"] == ["cap"] and out["cap_refs"] == ["fill-2"] and "cap_unjudged" not in out, out
+    assert [(e["ref"], e["verdict"], e["covered_by"]) for e in w.entries("verdict")] == [("fill-1", "ok", "fill-2")]
     w.later(30)
     out = _prun(w)
     assert "faults" not in out and "cap_unjudged" not in out and len(w.entries("verdict")) == 1, out
@@ -8586,8 +8593,10 @@ def test_t34b3_an_unpriced_piece_is_judged_on_the_orders_average(tmp_path, first
     lines = w.entries("fill")
     assert [(e["units"], e["price"] is None, e["verdict"]) for e in lines] == [(1000.0, False, verdict),
                                                                                (1.0, True, verdict)], lines
+    # addendum 4: each line judges the figure its own write set; the notice line carries no verdict
+    assert [e["judged_avg"] for e in lines] == [first, second], lines
     (n,) = w.entries("notice")
-    assert (n["kind"], n["old"], n["new"], n["verdict"]) == ("piece_unpriced", first, second, verdict), n
+    assert (n["kind"], n["old"], n["new"]) == ("piece_unpriced", first, second) and "verdict" not in n, n
     assert out["notices"] == ["piece_unpriced"] and "cap_unjudged" not in out, out
     assert out.get("faults") == (["cap"] if verdict == "breach" else None), out
 
@@ -8894,6 +8903,7 @@ class _Ordinary(Booked):
         self.rng, self.clock = rng, clock
         self.avg, self.fee, self.rounds, self.done_at = {}, {}, {}, {}
         self.down, self.next_take, self.counts, self.restated = False, None, _Counter(), set()
+        self.status_back, self.read_once = False, set()   # addendum 3 M2: positions down, each status back at its 2nd read
 
     def _take(self, symbol, units, tag, limit_price):
         self.book[tag] = {"symbol": symbol, "units": float(units), "limit": limit_price, "filled": 0.0, "state": "open"}
@@ -8937,7 +8947,8 @@ class _Ordinary(Booked):
 
     def order_status(self, tag):
         self.calls.append(("order_status", tag))
-        if self.down:
+        if self.down or (self.status_back and tag not in self.read_once):
+            self.read_once.add(tag)
             raise ConnectionError("order_status is down")
         o = self.book.get(tag)
         if o is None:
@@ -8947,7 +8958,7 @@ class _Ordinary(Booked):
 
     def positions(self):
         self.calls.append(("positions", None))
-        if self.down:
+        if self.down or self.status_back:
             raise ConnectionError("positions is down")
         return {s: u for s, u in self.held.items() if abs(u) > 1e-12}
 
@@ -9011,10 +9022,15 @@ def _ordinary_day(w, rng, outages=True):
     for run in range(n):
         if run:
             w.later(rng.choice([20, 45, 70]))
-        w.venue.down = outages and rng.random() < 0.07 and w.baseline() is not None   # the first run records the baseline
+        roll = rng.random()
+        w.venue.down = outages and roll < 0.07 and w.baseline() is not None   # the first run records the baseline
+        w.venue.status_back = outages and 0.07 <= roll < 0.10 and w.baseline() is not None   # M2: the second read answers
+        w.venue.read_once = set()
         w.paper = paper(_ordinary_targets(rng, w.book()))
         outs.append(w.run())
-        w.venue.down = False
+        if w.venue.status_back:
+            outs[-1] = {**outs[-1], "status back": True}
+        w.venue.down = w.venue.status_back = False
         w.venue.market(notices=run < n - 1)          # a correction is read the same day (the ledger rechecks 3 days)
     w.next_day()
     return outs
@@ -9040,21 +9056,26 @@ def test_t34b3_ordinary_days_write_no_fault_and_stop_no_run_at_reconcile(tmp_pat
                                                               w.ledger().last_reconcile()["summary"].get("position_differences"))
                 runs += 1
                 stats[out["stage"] or "done"] += 1
+                if out.get("status back"):
+                    stats[f"status back, stage {out['stage'] or 'done'}"] += 1
                 stats["notice kinds"] += len(out.get("notices", []))
                 for kind in out.get("notices", []):
                     stats[kind] += 1
                 stats["sent"] += out["orders_sent"]
         stats.update(w.venue.counts)
+        stats["judged_on stored lines"] += sum(1 for e in w.entries() if e.get("judged_on") == "stored")
         _shutil.rmtree(tmp_path / f"o{k}")
         k += 1
     print(f"T34B3-ORDINARY block {seed_block}: runs {runs}, {dict(sorted(stats.items()))}")
     assert stats["venue_read"] > 0 and stats["avg_restated"] > 0 and stats["late_amount"] > 0 and stats["fee_fell"] > 0
+    assert stats["status back, stage venue_read"] > 0 and stats["judged_on stored lines"] == 0, stats
 
 
 T34B3_FAULTS = ("through a cent", "through a tenth of a cent", "overfill", "restated beyond a cent",
                 "restated through the limit", "fee below zero", "late amount in another state", "units fell",
                 "piece unexplained", "killed after a breach", "killed before a notice line", "outage with a stray position",
-                "outage with a ledger failure", "killed after the summary write failed")
+                "outage with a ledger failure", "killed after the summary write failed",
+                "killed before a notice line, then restated back", "killed before a fill line, then corrected")
 
 
 def _t34b3_fault(w, rng, how, monkeypatch):
@@ -9096,6 +9117,34 @@ def _t34b3_fault(w, rng, how, monkeypatch):
             if how == "killed before a notice line":
                 return killed("_journal_notices")
         return w.run(), None
+    if how == "killed before a notice line, then restated back":  # addendum 4: the outside reviewer's case
+        tag, o = prep({"add": 0.0})
+        v.avg[tag] = o["limit"] + 0.01                            # restated a cent through and followed ...
+        _kill_at(monkeypatch, "_journal_notices")                 # ... the run dies before the notice line ...
+        with pytest.raises(KeyboardInterrupt):
+            w.run()
+        monkeypatch.undo()
+        v.avg[tag] = o["limit"]                                   # ... and the broker restates it back first
+        w.later(20)
+        return None, w.run()
+    if how == "killed before a fill line, then corrected":       # addendum 4: a fill through, its line written late
+        v.next_take = {"add": 0.01, "over": False}
+        w.paper = paper(more)
+        real, died = osx._Run._fill_verdict, []
+
+        def dying(self, f, settling=False):                       # the run dies before the shaped fill's line ...
+            if not died and not settling and f.get("tag") == v.__dict__.get("shaped"):
+                died.append(1)
+                raise KeyboardInterrupt("killed here by the test")
+            return real(self, f, settling)
+        monkeypatch.setattr(osx._Run, "_fill_verdict", dying)
+        with pytest.raises(KeyboardInterrupt):
+            w.run()
+        monkeypatch.undo()
+        assert died and v.book[v.shaped]["symbol"] == "TLT", (how, v.book[v.shaped])
+        v.avg[v.shaped] = v.book[v.shaped]["limit"]               # ... and a restatement corrects it before the next
+        w.later(20)
+        return None, w.run()
     if how in ("late amount in another state", "piece unexplained"):
         tag, o = prep({"add": 0.0, "partial": 1.0})               # 1 of 2 filled at its limit
         if how == "late amount in another state":
@@ -9157,8 +9206,8 @@ def _t34b3_fault(w, rng, how, monkeypatch):
 
 @pytest.mark.parametrize("how", T34B3_FAULTS)
 def test_t34b3_every_fault_is_marked_by_the_run_that_meets_it_or_carried_by_the_next(tmp_path, monkeypatch, how):
-    """Eleven sequences per kind, 154 in all, each after one or two ordinary days (no outages)."""
-    marked = carried = 0
+    """Eleven sequences per kind, 176 in all, each after one or two ordinary days (no outages)."""
+    marked = carried = stored = 0
     for k in range(11):
         seed = 3_600_000 + T34B3_FAULTS.index(how) * 100 + k
         rng = random.Random(seed)
@@ -9181,8 +9230,9 @@ def test_t34b3_every_fault_is_marked_by_the_run_that_meets_it_or_carried_by_the_
         else:
             assert "cap" in nxt.get("faults", []) and nxt.get("cap_refs"), (seed, how, nxt.get("faults"), nxt.get("reason"))
             carried += 1
+        stored += sum(1 for e in w.entries() if e.get("judged_on") == "stored")
         _shutil.rmtree(tmp_path / f"f{k}")
-    print(f"T34B3-FAULT {how}: marked {marked}, carried {carried}")
+    print(f"T34B3-FAULT {how}: marked {marked}, carried {carried}, judged_on stored lines {stored}")
     assert marked + carried == 11
 
 
@@ -9446,7 +9496,8 @@ def test_t34b3_the_verdicts_are_the_same_journaled_on_time_late_or_across_a_deat
             L.journal_run()                                        # the next run finishes the job
             L.journal_run()
             maps[arm] = _t34b3_map(L.lines())
-            records = ([{k2: v for k2, v in f.items() if k2 != "applied"} for f in L.led.fills(_JTAG)],
+            records = ([{k2: v for k2, v in f.items() if k2 not in ("applied", "applied_time")}
+                        for f in L.led.fills(_JTAG)],
                        [{k2: n[k2] for k2 in ("id", "kind", "old", "new", "after_fill", "row")}
                         for n in L.led.reconcile_notices()])
             maps[arm] += (records,)
