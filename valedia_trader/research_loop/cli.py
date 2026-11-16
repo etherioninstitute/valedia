@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from pathlib import Path
@@ -157,29 +158,174 @@ def strategies_to_step(paths: LoopPaths, ledger: HypothesisLedger, statuses=PAPE
     return PaperSet(stepped, left_out, loaded)
 
 
-class LeftOutBookHeld(Exception):
-    """The paper book holds a lot under the name of a strategy that is left out (T38-1b): the run steps nothing."""
+_ZERO = 1e-12                                          # the paper trader's fill sets |units| below this to exactly 0
 
 
-def refuse_a_held_left_out_book(paths: LoopPaths, left_out: list[dict]) -> None:
-    """Raises LeftOutBookHeld when the paper book's state (positions by strategy name, then by symbol) holds a lot
-    whose units are not exactly zero (or not a number) under the name of a strategy in `left_out`: such a position
-    would no longer be managed, and has no stops. Reads the state as the paper trader reads it; writes nothing. Does
-    nothing when `left_out` is empty."""
-    if not left_out:
-        return
-    positions = PaperTrader(paths.journal, paths.risk_limits).state.get("positions") or {}
+def _units(value) -> float | None:
+    """A lot's or an order's units as a float when they are a real, finite number; None otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
-    def held(lot) -> bool:
-        units = lot.get("units") if isinstance(lot, dict) else lot
-        return not (isinstance(units, (int, float)) and not isinstance(units, bool) and units == 0)
 
-    names = [e["name"] for e in left_out if isinstance(e["name"], str) and isinstance(positions.get(e["name"]), dict)
-             and any(held(lot) for lot in positions[e["name"]].values())]
-    if names:
-        verb = "is" if len(names) == 1 else "are"
-        raise LeftOutBookHeld(f"the paper book holds positions of {', '.join(names)}, which can hold a short and {verb} "
-                              "no longer stepped; nothing was stepped")
+def judge_paper_book(state, left_out=(), only=None) -> tuple[str, str, str] | None:
+    """The paper book's one invariant (T38-1b addendum 2), over the parts of its durable state that act on a later step:
+    `positions` ({strategy name: {symbol: lot}}: lots are marked, traded and stopped only through their strategy) and
+    `pending` (orders, each with its strategy's name: filled at the next step whatever the strategy). `realized`,
+    `history`, `benchmarks`, `panel_cases` and `journal_outbox` carry strategy names but never trade, fill or settle a
+    position. None when the book holds, for the names in `only` (every name when None):
+      B. under a name in `left_out` (strategies that can hold a short and are not stepped), no lot whose units are not
+         exactly zero and no pending order of either sign;
+      C. under any name, no lot below zero, and no pending orders that, filled in their order, would take the lot below
+         zero (by more than the fill's own rounding to zero); a lot or an order whose units are not a finite number is
+         refused too, since it cannot be told from a short.
+    Otherwise (rule, strategy name, symbol) of the first breach found, rule "lot" or "pending" (B), "short" (C) or
+    "unreadable". Pure: reads `state` only."""
+    if not isinstance(state, dict):
+        return ("unreadable", "the book", "its state")
+    positions, pending = state.get("positions") or {}, state.get("pending") or []
+    if not isinstance(positions, dict) or not isinstance(pending, list):
+        return ("unreadable", "the book", "positions or pending")
+    asked = (lambda name: True) if only is None else (lambda name: name in only)
+    for name in left_out:                                                       # B
+        if not isinstance(name, str) or not asked(name):
+            continue
+        book = positions.get(name, {})
+        if not isinstance(book, dict):
+            return ("unreadable", name, "its lots")
+        for sym, lot in book.items():
+            if _units(lot.get("units") if isinstance(lot, dict) else None) != 0.0:
+                return ("lot", name, str(sym))
+        for o in pending:
+            if isinstance(o, dict) and o.get("strategy") == name:
+                return ("pending", name, str(o.get("symbol")))
+    held: dict[tuple, float] = {}
+    for name, book in positions.items():                                       # C: lots
+        if not asked(name):
+            continue
+        if not isinstance(book, dict):
+            return ("unreadable", str(name), "its lots")
+        for sym, lot in book.items():
+            units = _units(lot.get("units") if isinstance(lot, dict) else None)
+            if units is None:
+                return ("unreadable", str(name), str(sym))
+            if units < 0:
+                return ("short", str(name), str(sym))
+            held[(name, sym)] = units
+    for o in pending:                                                           # C: pending orders, in fill order
+        if not isinstance(o, dict) or not isinstance(o.get("strategy"), str) or not isinstance(o.get("symbol"), str):
+            if only is None:
+                return ("unreadable", "an order", "a pending order")
+            continue
+        name, sym = o["strategy"], o["symbol"]
+        if not asked(name):
+            continue
+        units = _units(o.get("units"))
+        if units is None:
+            return ("unreadable", name, sym)
+        held[(name, sym)] = held.get((name, sym), 0.0) + units
+        if held[(name, sym)] < -_ZERO:
+            return ("short", name, sym)
+    return None
+
+
+def paper_book_words(found: tuple[str, str, str], tail: str) -> str:
+    """judge_paper_book's finding in words, ending with `tail` (what the command did not do)."""
+    rule, name, sym = found
+    if rule == "lot":
+        core = f"the paper book holds a lot of {name} ({sym}), which can hold a short and is no longer stepped"
+    elif rule == "pending":
+        core = f"the paper book holds a pending order of {name} ({sym}), which can hold a short and is no longer stepped"
+    elif rule == "short":
+        core = (f"the paper book holds a short position (or an order that would open one) under {name}, {sym}; the "
+                "paper book and its tax ledger do not handle shorts")
+    else:
+        core = f"the paper book holds what it cannot read under {name}, {sym}, which cannot be told from a short"
+    return f"{core}; {tail}"
+
+
+def _book_state(paths: LoopPaths):
+    """The paper book's state as the paper trader reads it (paper_state.json; a missing file is a book not started),
+    or None when the file cannot be read or parsed (the paper trader then refuses it itself, where it always has).
+    Writes and creates nothing."""
+    try:
+        raw = (paths.journal / "paper_state.json").read_bytes()
+    except FileNotFoundError:
+        return {"positions": {}, "pending": []}
+    except Exception:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+class PaperBookRefused(Exception):
+    """The paper book breaks its invariant (judge_paper_book): the run steps nothing."""
+
+
+class ShortAfterStep(Exception):
+    """A run that stepped left the book with a short (the backstop of judge_paper_book's rule C)."""
+
+
+def refuse_a_book_that_can_short(paths: LoopPaths, left_out: list[dict]) -> None:
+    """Raises PaperBookRefused, in judge_paper_book's words, when the book on disk breaks the invariant for the
+    strategies `left_out` names. Writes nothing; a state that cannot be read is left to the paper trader."""
+    state = _book_state(paths)
+    found = None if state is None else judge_paper_book(state, [e["name"] for e in left_out])
+    if found is not None:
+        raise PaperBookRefused(paper_book_words(found, "nothing was stepped"))
+
+
+def check_after_step(paths: LoopPaths) -> None:
+    """After a run that stepped: rule C on the state just written. Raises ShortAfterStep naming the strategy and symbol
+    (the day is already journalled; the next run is stopped by the check before stepping)."""
+    state = _book_state(paths)
+    found = None if state is None else judge_paper_book(state)
+    if found is not None:
+        raise ShortAfterStep(f"a strategy that says it cannot hold a short now has one: {found[1]}, {found[2]}")
+
+
+def _left_out_early(paths: LoopPaths, ledger: HypothesisLedger) -> list[dict]:
+    """The left-out strategies for a check made before anything is spent; [] when a strategy file cannot be loaded
+    (that error surfaces later, exactly where it always has; rule C is still checked)."""
+    try:
+        return strategies_to_step(paths, ledger).left_out
+    except Exception:
+        return []
+
+
+MIRROR_TAIL = "the order step does not mirror such a book"
+
+
+def _whole_book_refusal(paths: LoopPaths, ledger: HypothesisLedger | None, trader):
+    """For the order step with no broker book file outside live mode (the whole book): None when judge_paper_book
+    finds nothing in the book the order step would mirror (`trader`'s state, else the state on disk), the left-out
+    strategies read through the research ledger (none when it has no file); otherwise an order_step.Follow refusal in
+    its words. A strategy that cannot be loaded refuses too: the paper command refuses that book itself."""
+    from valedia_trader.execution_and_risk import order_step
+    state = trader.state if trader is not None else _book_state(paths)
+    if state is None:
+        return None                                     # unreadable: the order step's own reading refuses it
+    own = None
+    try:
+        if ledger is None and paths.ledger.is_file():
+            ledger = own = HypothesisLedger(paths.ledger)
+        try:
+            left = [] if ledger is None else strategies_to_step(paths, ledger).left_out
+        except Exception as exc:
+            return order_step.Follow(refused="the paper book cannot be followed whole: the strategy of an idea the paper "
+                                             f"command steps cannot be loaded ({order_step._describe(exc)})")
+    finally:
+        if own is not None:
+            own.close()
+    found = judge_paper_book(state, [e["name"] for e in left])
+    return None if found is None else order_step.Follow(refused=paper_book_words(found, MIRROR_TAIL))
+
+
+def _nothing_stepped(left_out: list[dict]) -> str:
+    n = len(left_out)
+    return f"nothing is stepped: {n} idea{'' if n == 1 else 's'} can hold a short position"
 
 
 def _reading(paths: LoopPaths) -> list[dict]:
@@ -387,7 +533,7 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
             paths = LoopPaths(Path(os.path.abspath(os.fspath(webull.LIVE_REPO))))
         raw, why = webull.read_owner_file(paths.config / order_step.BROKER_BOOK_FILE, paths.root)
         if why == "is missing" and not live:
-            return None
+            return _whole_book_refusal(paths, ledger, trader)   # T38-1b addendum 2 E: None, or the book refused
         if why == "is missing":
             return Follow(refused=f"{shown} is missing: live mode follows only the strategies that file names (such as "
                                   '{"follow": [26]}) and never follows the whole book by default')
@@ -433,6 +579,10 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
         finally:
             if own is not None:
                 own.close()
+        state = trader.state if trader is not None else _book_state(paths)    # T38-1b addendum 2: C for these names
+        found = None if state is None else judge_paper_book(state, (), only=set(names))
+        if found is not None:
+            return Follow(refused=paper_book_words(found, MIRROR_TAIL))
         if trader is not None:
             day, latest = order_step.paper_strategies(trader)
             if latest is None:
@@ -704,12 +854,7 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     from valedia_trader.research_loop.paper import Journal
     from valedia_trader.research_loop.revision import RevisionEngine
     out: dict = {"date": str(pd.Timestamp.today().date())}
-    try:                                                # T38-1b: a held left-out book stops the cycle before it spends
-        refuse_a_held_left_out_book(paths, strategies_to_step(paths, ledger).left_out)
-    except LeftOutBookHeld:
-        raise
-    except Exception:                                   # only LeftOutBookHeld here: anything else surfaces where it did
-        pass
+    refuse_a_book_that_can_short(paths, _left_out_early(paths, ledger))   # T38-1b: before the cycle spends anything
     if args.refresh:
         from valedia_trader.data_and_fees import prices as price_data
         try:
@@ -745,14 +890,16 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     book = strategies_to_step(paths, ledger)            # T38-1b: one that can hold a short is not stepped
     active = book.stepped
     out["not_stepped"] = book.left_out
-    refuse_a_held_left_out_book(paths, book.left_out)
+    refuse_a_book_that_can_short(paths, book.left_out)   # again just before stepping: this cycle may change the set
     journal = Journal(paths.journal)
     if active:
         steps = paper_catch_up(paper_trader(paths), prices, active)
         out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date",
                         "capital_shared_by": len(active)}
+        if steps:
+            check_after_step(paths)
     else:
-        out["paper"] = "nothing has passed its backtest and sealed test"
+        out["paper"] = _nothing_stepped(book.left_out) if book.left_out else "nothing has passed its backtest and sealed test"
     if args.critic or pd.Timestamp.today().dayofweek == 6:
         names = {hid: s.name for hid, s in book.loaded.items()}   # the left-out ones too, as before
         last = max((e["day"] for e in journal.read()), default=out["date"])
@@ -876,6 +1023,7 @@ def main(argv=None) -> int:
                 print("refused: paper-step no longer sends anything to Webull. Orders reach Webull's test environment only "
                       "through `order-step`, run once a day inside the regular session.", file=sys.stderr)
                 return 2
+            refuse_a_book_that_can_short(paths, _left_out_early(paths, ledger))   # T38-1b: before refresh, secrets, venue
             if args.refresh:
                 from valedia_trader.data_and_fees import prices as price_data
                 print("prices:", price_data.refresh(args.data))
@@ -888,18 +1036,22 @@ def main(argv=None) -> int:
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
             trader = paper_trader(paths, venue=venue)
-            refuse_a_held_left_out_book(paths, left_out)
+            refuse_a_book_that_can_short(paths, left_out)
             said = {"capital_shared_by": len(active), "not_stepped": left_out}
-            if not active:
+            if not active and left_out:
+                print(_nothing_stepped(left_out))
+                print(json.dumps({"not_stepped": left_out}, indent=2))
+            elif not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")
-                if left_out:
-                    print(json.dumps({"not_stepped": left_out}, indent=2))
             elif venue is not None:
                 print(json.dumps({**trader.step(prices, active), **said}, indent=2))   # a broker mirror cannot trade in the past
+                check_after_step(paths)
             else:
                 steps = paper_catch_up(trader, prices, active)
                 print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date", **said},
                                  indent=2))
+                if steps:
+                    check_after_step(paths)
         elif args.cmd == "critic":
             from valedia_trader.research_loop.paper import Journal
             book = strategies_to_step(paths, ledger, (*PAPER_STATUSES, "paused"),
@@ -917,8 +1069,11 @@ def main(argv=None) -> int:
         elif args.cmd == "reset-kill-switch":
             trader = PaperTrader(paths.journal, paths.risk_limits)
             print("latch cleared" if trader.reset_latch(args.who, pd.Timestamp.today()) else "the latch was not set")
+    except ShortAfterStep as exc:                       # T38-1b addendum 2 C: the day is journalled; said as it is
+        print(exc, file=sys.stderr)
+        return 2
     except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError, PaperBookNoPrice,
-            LeftOutBookHeld) as exc:
+            PaperBookRefused) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     finally:

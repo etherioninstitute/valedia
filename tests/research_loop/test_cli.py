@@ -1703,6 +1703,7 @@ def test_t38_1b_the_follow_list_refuses_a_strategy_that_can_hold_a_short(follow_
 
 def test_t38_1b_the_order_step_stops_at_the_follow_stage_for_a_strategy_that_can_hold_a_short(follow_project, capsys):
     root, venue = follow_project
+    _strategy_file(root, 24, "idea_twenty_four", ("SPY",))      # addendum 2 E: the whole book is judged, 24 included
     assert cli.main(["--root", str(root), "order-step"]) == 0                             # open orders, as before
     capsys.readouterr()
     book_before = json.dumps(venue.book, sort_keys=True)
@@ -2005,7 +2006,7 @@ def test_t38_1b_addendum2_the_whole_book_order_step_stops_at_the_follow_stage_on
     assert not (root / "config" / "broker_book.json").exists()
     assert cli.main(["--root", str(root), "order-step"]) == 2
     out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "stopped" and out["stage"] == "follow" and out["reason"] == reason, out
+    assert out["status"] == "stopped" and out["stage"] == "follow" and reason in out["reason"], out
     assert [c for c in venue.calls if c in ("submit", "cancel")] == [] and venue.book == {}
 
 
@@ -2059,16 +2060,16 @@ def test_t38_1b_addendum2_the_paper_book_invariant_holds_over_seeded_random_stat
     long_only = st.RuleStrategy.from_spec(LONG_RULE)
     names, syms, left_out = ["mom_long", "mom_both", "ghost_book"], ["UP", "DOWN"], ["mom_both"]
     kinds = ["positive", "zero", "minus zero", "negative", "nan", "text"]
-    generated = refused = stepped = 0
+    generated = refused = stepped = filled = 0
     wrong = []
-    for k in range(240):
+    for k in range(400):
         positions = {}
         for name in names:
             if rng.random() < 0.6:
                 book = {}
                 for sym in syms:
                     if rng.random() < 0.7:
-                        kind = rng.choice(kinds, p=[0.45, 0.3, 0.05, 0.1, 0.05, 0.05])
+                        kind = rng.choice(kinds, p=[0.55, 0.3, 0.05, 0.04, 0.03, 0.03])
                         units = {"positive": float(rng.uniform(1, 50)), "zero": 0.0, "minus zero": -0.0,
                                  "negative": -float(rng.uniform(1, 50)), "nan": float("nan"), "text": "ten"}[kind]
                         book[sym] = {"units": units, "cost": 100.0}
@@ -2097,10 +2098,13 @@ def test_t38_1b_addendum2_the_paper_book_invariant_holds_over_seeded_random_stat
         trader = PaperTrader(book_dir, limits, halt_file=None)
         trader.step(px.iloc[:20], {1: long_only})                                  # ONE day, long-only strategies
         stepped += 1
+        assert trader.state["last_day"] == str(px.index[19].date())                 # the day really ran
+        filled += sum(1 for o in pending if o not in trader.state["pending"])       # its orders were filled
         after = trader.state["positions"]
         if any(lot["units"] < 0 for book in after.values() for lot in book.values()) or any(
                 lot["units"] for lot in after.get("mom_both", {}).values()):
             wrong.append((k, "after the step", after))
     with capsys.disabled():
-        print(f"\ninvariant: {generated} states generated, {refused} refused, {stepped} stepped, {len(wrong)} counter-examples")
-    assert wrong == [] and generated == 240 and 40 <= refused <= 200 and stepped >= 40, (refused, stepped, wrong[:2])
+        print(f"\ninvariant: {generated} states generated, {refused} refused, {stepped} stepped ({filled} pending orders "
+              f"filled), {len(wrong)} counter-examples")
+    assert wrong == [] and generated == 400 and refused >= 40 and stepped >= 40 and filled >= 20, (refused, stepped, filled)

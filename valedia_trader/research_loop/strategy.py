@@ -96,10 +96,11 @@ class Strategy(ABC):
 
 
 def can_hold_shorts(strategy) -> bool:
-    """Whether `strategy` can ever hold a short: its `holds_shorts`, and True when it has no such attribute or reading
-    it (or its truth value) raises. The only thing the paper step's and the broker follow list's guards call."""
+    """Whether `strategy` can ever hold a short. False only when reading `holds_shorts` succeeds and the value is the
+    Python object False (not 0, None, "", a numpy bool or any other falsy object); True otherwise, a missing attribute
+    and any exception included. The only thing the paper step's and the broker follow list's guards call."""
     try:
-        return bool(getattr(strategy, "holds_shorts", True))
+        return getattr(strategy, "holds_shorts", True) is not False
     except Exception:
         return True
 

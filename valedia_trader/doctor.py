@@ -55,11 +55,14 @@ def check_ledger(paths: LoopPaths) -> tuple[str, str]:
     try:
         counts = {s: len(ledger.search(status=s)) for s in STATUSES}
         attempts = int(ledger.attempt_sharpes().size)
-        try:                                              # T38-1b: what the paper command leaves out (can hold a short)
-            from valedia_trader.research_loop import cli
-            left = len(cli.strategies_to_step(paths, ledger).left_out)
-        except Exception:                                 # a strategy that cannot be loaded: counted as before
-            left = 0
+        from valedia_trader.research_loop import cli    # T38-1b: what the paper command leaves out, idea by idea
+        left = 0
+        for s in cli.PAPER_STATUSES:
+            for h in ledger.search(status=s):
+                try:
+                    left += cli.can_hold_shorts(cli._strategy_for(paths, ledger, h["id"], None)[0])
+                except Exception:                         # a strategy that cannot be loaded: counted as before
+                    pass
     finally:
         ledger.close()
     live = counts["passed backtest only"] + counts["passed paper"] - left
