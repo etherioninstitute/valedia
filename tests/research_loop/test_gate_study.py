@@ -251,7 +251,7 @@ def test_the_sealed_checks_and_refused_books():
 
 def test_the_wilson_interval_against_known_values():
     known = {(0, 10): (0.0, 0.2775), (5, 10): (0.2366, 0.7634), (10, 10): (0.7225, 1.0), (1, 100): (0.0018, 0.0545),
-             (20, 400): (0.0327, 0.0759)}
+             (20, 400): (0.0326, 0.0760)}
     from statsmodels.stats.proportion import proportion_confint
     for (k, n), (lo, hi) in known.items():
         got = gs.wilson(k, n)
@@ -430,7 +430,7 @@ def test_the_report_is_strict_json_with_every_family_rule_and_attempt_count(smal
                         assert r["wilson_95"] == gs.wilson(r["passes"], want)
     assert rep["books"] == books == 2 * (12 + 4 + 18)
     a = rep["anchor"]
-    assert a["books"] == books and a["at_prior_attempts_books"] == 2 * 9
+    assert a["books"] == books and a["at_prior_attempts_books"] == 2 * 13     # the first book of every cell
     assert a["development_disagreements"] == a["sealed_disagreements"] == a["material_mismatches"] == 0
     assert a["at_prior_attempts_disagreements"] == 0 and a["sealed_compared"] > 0
     assert rep["r3_re_timing"]["shifts"] == {"1": 400, "31": 12400}
