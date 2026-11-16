@@ -407,11 +407,27 @@ def forecasters_html(world):
 
 def test_the_forecasters_table_shows_which_model_answered_and_what_it_may_remember(world):
     part = forecasters_html(world)
-    assert re.findall(r"<th>(.*?)</th>", part) == ["Forecaster", "Model", "Market", "Kind", "Memory", "Settled", "Brier",
+    assert re.findall(r"<th>(.*?)</th>", part) == ["Forecaster", "Model", "Prompt", "Market", "Kind", "Memory", "Settled", "Brier",
                                                    "Baseline Brier", "Skill", "Verdict"]
     text = world.page().sections["Forecasters"]
-    assert text.count("not recorded") == 3 and text.count("answered late") == 3   # recorded without a model, weeks after the questions
+    assert text.count("not recorded") == 6 and text.count("answered late") == 3   # no model, no prompt, weeks after the questions
     assert text.count("not evidence: answered after the question was fresh") == 3
+
+
+def test_two_rows_that_differ_only_in_prompt_show_their_own_fingerprints(world):
+    led = tm.TournamentLedger(world.root / "memory" / "tournament.sqlite")
+    qs = [tm.Question(f"funds:QQQ:2026-10-{i + 1:02d}:5d", "funds", "forward", f"2026-10-{i + 1:02d}", 5, "QQQ", "QQQ closes higher", {}, 0.5)
+          for i in range(4)]
+    led.add(qs)
+    for i, q in enumerate(qs):
+        led.record(q.id, "twin", 0.6, None, 1.0, model="qwen3:8b", prompt_sha="aaaaaaaaaaaa" if i < 2 else f"bbbbbbbbbbbb{HOSTILE}")
+        led.settle(q.id, i % 2)
+    led.close()
+    part = forecasters_html(world)
+    twins = [r for r in re.findall(r"<tr>(.*?)</tr>", part) if "twin" in r]
+    cells = [re.findall(r"<td>(.*?)</td>", r) for r in twins]
+    assert len(cells) == 2 and {c[2][:12] for c in cells} == {"aaaaaaaaaaaa", "bbbbbbbbbbbb"} and all(c[1] == "qwen3:8b" for c in cells)
+    assert "<script>" not in part
 
 
 OLD_TOURNAMENT_SCHEMA = (

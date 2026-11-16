@@ -693,7 +693,9 @@ def test_a_read_only_open_of_an_old_file_is_scored_without_a_schema_change(tmp_p
     ("blind history", "m", "2025-06-30", "2025-06-27", 0, "may be remembered"),
     ("blind history", "m", None, "2025-07-01", 0, "may be remembered"),
     ("blind history", None, None, "2025-07-01", 0, "may be remembered"),
-    ("blind history", None, "2025-06-30", "2025-07-01", 0, "after release"),
+    ("blind history", None, "2025-06-30", "2025-07-01", 0, "may be remembered"),   # a date but no model recorded
+    ("blind history", "", "2025-06-30", "2025-07-01", 0, "may be remembered"),     # an empty label is no label
+    ("blind history", "  ", "2025-06-30", "2025-07-01", 0, "may be remembered"),
     ("blind history", "m", "not a date", "2025-07-01", 0, "may be remembered"),
     ("blind history", "m", "2025-06-30", "2025-07-01", 400, "after release"),    # lateness does not matter to a blind question
 ])
@@ -722,7 +724,8 @@ def _expected_memory(kind, model, unseen_after, asked_on, ts):
         return "asked live" if late <= 3 else "answered late"
     if model == "rule":
         return "no memory"
-    if unseen_after is not None and pd.Timestamp(asked_on).date() > pd.Timestamp(unseen_after).date():
+    if (model is not None and str(model).strip() and unseen_after is not None
+            and pd.Timestamp(asked_on).date() > pd.Timestamp(unseen_after).date()):
         return "after release"
     return "may be remembered"
 
@@ -999,3 +1002,63 @@ def test_two_writers_adding_the_columns_at_once_both_open_and_the_columns_exist_
     got = db.execute("SELECT forecaster, model, prompt_sha FROM forecasts WHERE forecaster IN ('a', 'b') ORDER BY 1").fetchall()
     db.close()
     assert got == [("a", "m1", "s1"), ("b", "m2", "s2")]
+
+
+# ---- after the blind check: "after release" needs a recorded model; the read path never changes the schema ---------
+
+def _memory_at_585f055(kind, model, unseen_after, asked_on, ts):
+    """The memory rule as it was at 585f055, kept as the reference every unchanged class is held to."""
+    if kind == "forward":
+        if ts is None:
+            return "answered late"
+        return "asked live" if (pd.Timestamp(ts, unit="s", tz="UTC").date() - pd.Timestamp(asked_on).date()).days <= 3 else "answered late"
+    if model == "rule":
+        return "no memory"
+    if unseen_after is not None and pd.Timestamp(asked_on).date() > pd.Timestamp(unseen_after).date():
+        return "after release"
+    return "may be remembered"
+
+
+def test_only_after_release_without_a_recorded_model_changed_since_585f055():
+    changed = same = 0
+    for seed in range(40):
+        led = _pooling_ledger(tm, seed)
+        led._db.execute("UPDATE forecasts SET model = '' WHERE forecaster = 'x' AND model IS NULL AND question_id LIKE '%3'")
+        rows = led._db.execute("SELECT f.model, f.unseen_after, f.ts, q.kind, q.asked_on FROM forecasts f "
+                               "JOIN questions q ON q.id = f.question_id").fetchall()
+        led.close()
+        for model, unseen, ts, kind, asked_on in rows:
+            old, new = _memory_at_585f055(kind, model, unseen, asked_on, ts), tm.memory_class(kind, model, unseen, asked_on, ts)
+            if old == "after release" and kind == "blind history" and not (model or "").strip():
+                assert new == "may be remembered", (model, unseen, asked_on)
+                changed += 1
+            else:
+                assert new == old, (kind, model, unseen, asked_on, ts)
+                same += 1
+    assert changed > 0 and same > 1000
+
+
+def read_path_statements(module, path):
+    """Every SQL statement `module` executes on a read-only connection to `path` across its read paths."""
+    seen = []
+    led = object.__new__(module.TournamentLedger)
+    led._db = sqlite3.connect("file:" + str(path) + "?mode=ro", uri=True)
+    led._db.row_factory = sqlite3.Row
+    led._db.set_trace_callback(seen.append)
+    try:
+        for read in (led.scored_rows, lambda: module.scores(led, min_settled=1), led.counts, lambda: led.answered("old-model")):
+            try:
+                read()
+            except sqlite3.OperationalError:
+                pass                                                 # a refused write still counts as attempted
+    finally:
+        led._db.close()
+    return seen
+
+
+def test_a_read_only_open_never_attempts_a_schema_change(tmp_path):
+    path = tmp_path / "t.sqlite"
+    _old_file(path)
+    seen = read_path_statements(tm, path)
+    assert seen and any(q.lstrip().upper().startswith("SELECT") for q in seen)
+    assert [q for q in seen if q.lstrip().upper().startswith(("ALTER", "CREATE", "INSERT", "UPDATE", "DELETE", "DROP"))] == []
