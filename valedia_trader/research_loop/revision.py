@@ -125,6 +125,8 @@ class RevisionEngine:
         """Try to repair an idea whose development test failed. Returns what was tried, the archive
         and the final verdict. On a pass the strategy file holds the passing version; otherwise it
         holds the best version seen, and the idea stays failed."""
+        if not isinstance(strategy, st.RuleStrategy):
+            raise st.SpecError("only rule strategies can be revised")
         ledger, g = self.ledger, self.gauntlet
         row = ledger.get(hypothesis_id)
         if ledger.sealed_used(hypothesis_id):
