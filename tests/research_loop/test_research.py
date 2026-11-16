@@ -144,7 +144,7 @@ def test_tables_and_askers():
     table = rs.price_table(px, px * 1e6)
     assert "volume_20d_vs_1y" in table and _csv_block(table).count("\n") == len(SYMBOLS) + 1
     macro = rs.macro_table(px)
-    assert "TLT/IEF long bonds vs intermediate" in macro and "SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: " in macro
+    assert "TLT/IEF long bonds vs intermediate" in macro and NEW_CORR in macro
     assert rs.parse_ideas('noise {"ideas": [{"idea": "x"}, 5]} trailing') == [{"idea": "x"}]
     for bad in ("nothing", '{"ideas": 3}'):
         with pytest.raises(ValueError):
@@ -313,7 +313,7 @@ def test_the_legend_is_generated_from_the_definitions_and_sits_above_each_table_
             if d.baseline_window:
                 assert f"{d.baseline_window} sessions" in line
         for sentence in ("fractions", "0.052 means 5.2%", "1m = 21", "3m = 63", "12m and 1y = 252", "252 sessions a year", "3 decimals",
-                         "A blank cell means the symbol does not have a price on every session the column needs."):
+                         NEW_BLANK):
             assert sentence in legend, sentence
     other = rs.build_prompt(rs.ROLES["price-analyst"], "us-etf", SYMBOLS, px.index[-1], rs.price_table(px), [])
     assert "ret_12m" in other and "chg_12m" not in other and "credit vs treasuries" not in other
@@ -332,7 +332,7 @@ def test_the_correlation_is_its_own_line_after_the_macro_table_and_in_no_row():
     assert not any("correlation" in str(i).lower() for i in table.index) and "chg_3m" in table.columns
     r = px.pct_change().iloc[-60:]
     want = np.corrcoef(r["SPY"].to_numpy(), r["TLT"].to_numpy())[0, 1]
-    line = f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {want:.3f}"
+    line = f"{NEW_CORR}{want:.3f}"
     assert text.splitlines()[-1] == line and text.count("SPY-TLT correlation") == 1
     assert text.index(line) > text.index(_csv_block(text).strip().splitlines()[-1])
     for gone in ("SPY", "TLT"):
@@ -520,14 +520,13 @@ def test_a_symbol_with_29_returns_has_no_yearly_figures_and_the_legend_says_what
     row = _parse(text).loc["TLT"]
     assert row[["ret_1m", "vol_20d"]].notna().all()                      # 21 back and 20 returns are available
     assert row[["ret_3m", "ret_12m", "vol_1y", "below_1y_high", "vs_200d_avg", "move_5d_in_sd"]].isna().all()
-    assert "A blank cell means the symbol does not have a price on every session the column needs." in _legend_part(text)
+    assert NEW_BLANK in _legend_part(text)
     assert _parse(text).drop(index="TLT").notna().all().all()            # nothing else went blank
 
 
 def test_the_sentences_say_sample_standard_deviation_and_move_5d_in_sd_has_one_reading():
     defs = rs.PRICE_COLUMNS
-    assert defs["move_5d_in_sd"].text == ("The 5-session change divided by the product of (the sample standard deviation of the "
-                                          "last 60 daily returns) and (the square root of 5).")
+    assert defs["move_5d_in_sd"].text == NEW_MOVE
     assert "sample standard deviation" in defs["vol_20d"].text and "sample standard deviation" in defs["vol_1y"].text
 
 
@@ -553,7 +552,7 @@ def test_the_correlation_uses_the_last_60_sessions_on_which_both_funds_have_a_pr
     px = dev_prices()
     px.loc[px.index[[590, 595]], "TLT"] = np.nan                         # two sessions without TLT: they are dropped first
     line = rs.macro_table(px).splitlines()[-1]
-    assert line == f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {_shared(px):.3f}"
+    assert line == f"{NEW_CORR}{_shared(px):.3f}"
     plain = px.pct_change().iloc[-60:]
     assert f"{np.corrcoef(plain['SPY'].fillna(0), plain['TLT'].fillna(0))[0, 1]:.3f}" != f"{_shared(px):.3f}"
 
@@ -565,12 +564,74 @@ def test_the_correlation_needs_61_shared_prices():
     assert not any(ln.startswith("SPY-TLT correlation") for ln in rs.macro_table(short).splitlines())
     enough = px.copy()
     enough.loc[enough.index[:-61], "TLT"] = np.nan                       # 61 prices: exactly 60 returns
-    assert rs.macro_table(enough).splitlines()[-1].endswith(f"both have a price: {_shared(enough):.3f}")
+    assert rs.macro_table(enough).splitlines()[-1].endswith(f"both have a price: {_shared(enough):.3f}") and NEW_CORR in rs.macro_table(enough)
 
 
 def test_an_empty_macro_table_prints_no_table_and_no_legend():
     px = dev_prices()[["SPY", "TLT"]]                                    # no pair qualifies
     text = rs.macro_table(px)
-    assert text == f"SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: {_shared(px):.3f}\n"
+    assert text == f"{NEW_CORR}{_shared(px):.3f}\n"
     assert rs.macro_table(dev_prices()[["SPY", "XLK"]]) == ""
     assert rs.macro_table(dev_prices()[["XLK", "XLU"]].iloc[:200]) == ""   # a pair with too few sessions for the 12-month window
+
+
+# ---- addendum 2: three wording fixes. The "before" texts are what 1b2267b printed for dev_prices() and its dollar volume.
+BEFORE_PRICE = """How to read the table below. Values are fractions unless the unit says otherwise (0.052 means 5.2%). Windows count trading sessions of this data (1m = 21 sessions, 3m = 63, 12m and 1y = 252). Annual figures use 252 sessions a year. Values are rounded to 3 decimals. A blank cell means the symbol does not have a price on every session the column needs. Columns:
+- ret_1m [fraction; window 21 sessions]: Last close divided by the close 21 sessions earlier, minus 1.
+- ret_3m [fraction; window 63 sessions]: Last close divided by the close 63 sessions earlier, minus 1.
+- ret_12m [fraction; window 252 sessions]: Last close divided by the close 252 sessions earlier, minus 1.
+- vol_20d [fraction; window 20 sessions]: The sample standard deviation of the last 20 simple daily returns, times the square root of 252.
+- vol_1y [fraction; window 252 sessions]: The sample standard deviation of the last 252 simple daily returns, times the square root of 252.
+- below_1y_high [fraction; window 252 sessions]: Last close divided by the highest close of the last 252 sessions, minus 1 (0 means at the high).
+- vs_200d_avg [fraction; window 200 sessions]: Last close divided by the average close of the last 200 sessions, minus 1.
+- move_5d_in_sd [standard deviations; window 5 sessions, baseline 60 sessions]: The 5-session change divided by the product of (the sample standard deviation of the last 60 daily returns) and (the square root of 5).
+- volume_20d_vs_1y [fraction; window 20 sessions, baseline 252 sessions]: Average dollar volume of the last 20 sessions divided by the average of the last 252 sessions, minus 1.
+,ret_1m,ret_3m,ret_12m,vol_20d,vol_1y,below_1y_high,vs_200d_avg,move_5d_in_sd,volume_20d_vs_1y
+SPY,0.065,0.099,0.068,0.139,0.153,0.0,0.072,1.042,0.037
+TLT,0.003,0.061,-0.021,0.128,0.152,-0.086,0.032,-0.259,0.054
+IEF,-0.013,0.048,0.067,0.131,0.147,-0.027,0.03,0.35,-0.055
+LQD,-0.017,-0.067,0.098,0.162,0.169,-0.088,0.025,-0.024,0.078
+XLK,0.076,0.016,0.255,0.173,0.164,-0.026,0.11,1.52,0.163
+XLU,-0.008,0.092,0.825,0.102,0.159,-0.041,0.216,0.025,0.146
+GLD,-0.022,0.057,0.119,0.152,0.164,-0.029,0.086,-0.088,0.037
+DBC,0.087,0.08,0.135,0.178,0.157,-0.029,0.038,0.853,0.133
+"""
+BEFORE_MACRO = """How to read the table below. Values are fractions unless the unit says otherwise (0.052 means 5.2%). Windows count trading sessions of this data (1m = 21 sessions, 3m = 63, 12m and 1y = 252). Annual figures use 252 sessions a year. Values are rounded to 3 decimals. A blank cell means the symbol does not have a price on every session the column needs. For a pair, a session is a day on which both funds have a price. Columns:
+- chg_3m [fraction; window 63 sessions]: The price ratio of the pair now divided by the ratio 63 sessions earlier, minus 1.
+- chg_12m [fraction; window 252 sessions]: The price ratio of the pair now divided by the ratio 252 sessions earlier, minus 1.
+- vs_200d_avg [fraction; window 200 sessions]: The price ratio of the pair now divided by its average over the last 200 sessions, minus 1.
+,chg_3m,chg_12m,vs_200d_avg
+TLT/IEF long bonds vs intermediate (curve),0.013,-0.082,0.001
+LQD/IEF credit vs treasuries,-0.109,0.029,-0.005
+XLK/XLU tech vs utilities (risk appetite),-0.07,-0.312,-0.108
+DBC/GLD commodities vs gold,0.022,0.014,-0.049
+SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: -0.101
+"""
+
+OLD_MOVE = ("The 5-session change divided by the product of (the sample standard deviation of the last 60 daily returns) and "
+            "(the square root of 5).")
+NEW_MOVE = ("The 5-session change (last close divided by the close 5 sessions earlier, minus 1) divided by the product of (the sample "
+            "standard deviation of the last 60 simple daily returns) and (the square root of 5).")
+OLD_BLANK = "A blank cell means the symbol does not have a price on every session the column needs."
+NEW_BLANK = ("A blank cell means the symbol does not have a price (for the volume column, a dollar volume) on every session the "
+             "column needs.")
+OLD_CORR = "SPY-TLT correlation of daily returns, last 60 sessions on which both have a price: "
+NEW_CORR = "SPY-TLT correlation of returns from one shared session to the next, last 60 sessions on which both have a price: "
+
+
+def test_the_three_wording_fixes_read_exactly_so_in_the_prompt_and_nothing_else_changed():
+    px = dev_prices()
+    price, macro = rs.price_table(px, dollar_volume(px)), rs.macro_table(px)
+    assert price == BEFORE_PRICE.replace(OLD_MOVE, NEW_MOVE).replace(OLD_BLANK, NEW_BLANK)
+    assert macro == BEFORE_MACRO.replace(OLD_BLANK, NEW_BLANK).replace(OLD_CORR, NEW_CORR)
+    assert OLD_MOVE in BEFORE_PRICE and OLD_BLANK in BEFORE_MACRO and OLD_CORR in BEFORE_MACRO         # the replacements bit
+    prompt = rs.build_prompt(rs.ROLES["price-analyst"], "us-etf", SYMBOLS, px.index[-1], price, [])
+    assert f"- move_5d_in_sd [standard deviations; window 5 sessions, baseline 60 sessions]: {NEW_MOVE}\n" in prompt
+    assert NEW_BLANK + " Columns:" in prompt
+    prompt = rs.build_prompt(rs.ROLES["macro-watcher"], "us-etf", SYMBOLS, px.index[-1], macro, [])
+    assert f"{NEW_CORR}" in prompt and prompt.count("SPY-TLT correlation") == 1
+
+
+def test_the_move_sentence_still_takes_its_numbers_from_the_definition():
+    d = dataclasses.replace(rs.PRICE_COLUMNS["move_5d_in_sd"], window=7, baseline_window=45)
+    assert d.text == NEW_MOVE.replace("5", "7").replace("60", "45")
