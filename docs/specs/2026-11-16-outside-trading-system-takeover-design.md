@@ -62,8 +62,8 @@ hands over to a strategy's own `walk`. A pair trade counts as one trade in the s
 
 **D3. Both legs in research, the long leg where shorts are not possible.** `"legs": "both"` is the market-neutral
 pair. `"legs": "long"` holds only the leg the signal says is cheap. Three facts make the second one necessary:
-the live account class is a cash account (no shorts); the order step refuses a negative position; spot crypto is not
-shorted in this system. Both forms are tested; only the long form can reach the broker today. Before any strategy
+the live account class is a cash account (no shorts); the order step never sells more than the account owns (it
+caps the sale without a word: see the changes below); spot crypto is not shorted in this system. Both forms are tested; only the long form can reach the broker today. Before any strategy
 that holds a short is promoted to the paper book, the tax ledger must learn short sales or that strategy gets a book
 of its own (today one short fill stops the tax notes for the whole account).
 
@@ -149,6 +149,49 @@ and close everything when merely imported.
 | T38-8 | Shorts in the paper book and the tax ledger | a short fill no longer stops the tax notes |
 | T38-9 | Crypto in the order step; a forex venue | after the owner's choices |
 | T38-10 | Hourly bars | an hourly store, backtest and paper step; compared with daily after costs |
+
+## Changes after an outside challenge of this plan (2026-11-16)
+
+An outside model read this note and the two build specifications and made fourteen points. Each was checked against
+the code. What changed:
+
+- **D3 was wrong about the order step, and the truth is worse.** It does not refuse a short: it caps every sale at
+  what the account owns, symbol by symbol, and says nothing. A followed strategy with both legs would have its long
+  legs bought and its short legs silently dropped: half-open pairs, the outside project's own fault. And a strategy
+  that passes its sealed test joins the paper book automatically. So two guards are built BEFORE any pairs idea is
+  sealed (T38-1b): the paper step does not take a strategy that holds shorts, and the broker's follow list refuses
+  one. `legs` is now required in a pairs spec, with no default. Both legs live also needs the two orders sent as
+  one all-or-nothing batch: a slice of its own, with T38-8 and T38-9.
+- **Pairs rules (T38-1, before its merge).** A missing price no longer freezes an open pair (stops run on the last
+  known price; five sessions without a price close it). With a fitted hedge, an open pair is judged on the spread it
+  actually holds (the entry bar's ratio), not on a newer fit. An entry that would exceed the gross limit is skipped,
+  so open pairs are never rescaled. Re-arming after a stop works when the exit level is zero.
+- **The Kalman filter is a hedge estimator only (D4).** Its standardised forecast error is NOT wired to entries and
+  exits: that would trade on shocks, not on a stretched spread. The z stays the spread-level z, as with the rolling
+  regression. Before its slope may size a leg it gets a moving centre (the state re-expressed around the recent
+  level of x as that level moves, which is exact, not an approximation) and the step-change measurement is run
+  again. The filter replaces the rolling regression only if a test written beforehand shows it better.
+- **Gates and the learning table (D5, D7) are chosen inside the walk-forward,** as variants of one idea: each
+  window uses the variant that was best on the data before it, every variant is a counted attempt, the prediction
+  names them all beforehand, and the sealed period is touched once. A table cell with fewer closed trades than a
+  stated minimum has no opinion (the plain rule applies).
+- **The long-leg form is scored for what it is:** a single-name rule. It must beat holding the same names with the
+  same average exposure (the timing test becomes a pass condition for it), or it has only earned the market's return.
+- **The outside pair lists are hindsight** (today's largest companies; eight coins that survived). A result on them
+  is labelled so and cannot be promoted. A promotable test picks its pairs inside the walk-forward from data before
+  each window, on a universe that includes names that died: for stocks that waits for roadmap 1.6, for crypto 1.7.
+- **Forex.** Profit and loss is computed in the account's currency (a simple price return is the wrong number for a
+  pair quoted in another currency). A repeated fixing is treated as missing. Results on reference rates cannot be
+  promoted; a pass needs a broker's tradable prices.
+- **Prices for stocks are total-return adjusted** (dividends in the series). A short leg therefore pays the
+  dividend through the same series, with the right sign, and a later adjustment scales a whole window by one
+  constant, which leaves every z unchanged. Said here because the specification did not say it.
+- **Two exits of the outside project that were missing from the plan:** its stop that trails profit becomes an
+  optional, tested pairs rule (T38-3). Its daily stop already exists here as the owner's daily loss limit and the
+  drawdown latch in the risk gate.
+- **Not accepted:** that a leg might never open in the paper book (the book is built from weights, not from events;
+  a checker ran both legs for 40 days); that the no-intercept filter is unspecified (it is built and checked
+  against its own reference).
 
 ## The owner's decisions (none blocks T38-1 to T38-7)
 
