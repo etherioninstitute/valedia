@@ -373,3 +373,13 @@ them, memory was short at the same time (20 to 28% free), and seven decisions (s
 ten-second limit and are marked late. Nothing was read from the store for that comparison beyond counts, times and
 status. They are lost slots like any other. The fault was the lead's: no test sends requests to the collector's own
 model again while it is collecting.
+
+## A stop on 16 November (UTC) for the two-model proving run (written at 02:37 UTC on 16 November, 18:37 PST on 15 November, before the stop; no answer has been scored)
+
+Two attempts at this run beside the running collector (01:15 and 01:46 UTC on 16 November) stopped themselves for
+want of memory, and cost the collector no decision. The owner has now asked for the run once with the collector
+stopped. The collector will be stopped for it once, and is to be running again no later than 1 hour 45 minutes after
+that stop, whatever the run does; the run is expected to take about 51 minutes. It is the first stop of 16 November
+(UTC): at most 7.3% of that day's slots, and the day's own count decides whether it counts. The exact times are
+added below afterwards. If the run's preparation fails before the collector is touched, this stop does not take
+place, and that is said here.
