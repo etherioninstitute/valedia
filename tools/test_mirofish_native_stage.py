@@ -637,6 +637,11 @@ class PlanStaging(unittest.TestCase):
         self.assertIn('ternary-bonsai-2-27b',phases['setup_model']);self.assertIn('qwen3-8b',phases['turns_model'])
         self.assertIn('first swap settles it',mp['open_points']['identifier_reuse'])
         self.assertEqual(m['staging_profile']['model_plan'],PLAN)
+        run_text=(s.SRC/'mirofish_native_run.py').read_text()                                          # R10 as built: the 27B's identifiers go to the 27B's record only
+        self.assertIn("if profile==DEFAULT_MODEL_PROFILE:  # R10",run_text)
+        for member in PLAN.values():
+            prov=mp['members'][member]['provenance'];self.assertNotIn('known_wrong',prov)
+            self.assertIn('writes no 27B revision identifiers for it',prov['recorded_by_run']);self.assertEqual(prov['correct_source']['gguf_sha256'],s.model_choice(member,self.base)['entry']['weight_sha256'])
     def test_tmf4b_manifest_for_one_named_model(self):
         m,_=self.manifest_for(s.model_choice('qwen3.8-27b',self.base))                               # the 27B named: its own evidence, the formula's 72
         self.assertNotIn('applies_to',m['GGUF_qualification']);self.assertNotIn('model_plan',m);self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('72pre/30floor/40GiB')])
