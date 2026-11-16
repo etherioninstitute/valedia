@@ -551,3 +551,17 @@ def test_run_rules_hands_over_to_walk_and_the_backtester_takes_the_weights():
         assert np.isfinite(res.net.to_numpy()).all() and res.turnover.sum() > 0
     with pytest.raises(st.SpecError, match="price data"):
         st.run_rules(_universe_strategy("ratio"), px[["X"]])
+
+
+def test_a_spread_that_does_not_move_gives_no_z_even_through_rounding():
+    """An exact hedge leaves a residual of rounding noise (about 1e-16). Its deviation counts as zero: no z, no trade."""
+    rng = np.random.default_rng(2)
+    lb = np.log(100.0) + np.cumsum(0.02 * rng.standard_normal(200))
+    a, b = np.exp(1.5 * lb + 0.3), np.exp(lb)
+    sig = {"hedge": "ols", "window": 20, "hedge_window": 60, "enter": 1.5, "exit": 0.3}
+    _, _, z, betas = oracle(a, b, sig)
+    assert all(v is None for v in z) and all(abs(v - 1.5) < 1e-9 for v in betas if v is not None)
+    w, events = build(signal=sig).walk(frame(A=a, B=b))
+    assert events == [] and (w == 0).all().all()
+    w, events = build().walk(frame(A=[100.0] * 30, B=[50.0] * 30))                  # a ratio that never moves
+    assert events == [] and (w == 0).all().all()
