@@ -306,7 +306,10 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     data = tmp_path / "data"
     data.mkdir()
     prices.to_parquet(data / "close.parquet")
-    (dollar / prices).to_parquet(data / "volume.parquet")
+    volume = dollar / prices
+    for c in ("BTC-USD", "ETH-USD"):                                      # the vendor reports crypto volume in dollars
+        volume[c] = dollar[c]
+    volume.to_parquet(data / "volume.parquet")
     ledger = tmp_path / "ledger.db"
     want = _ledger_with_attempts(ledger)
     seen = {}
@@ -323,6 +326,7 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     _, _, research_cost = cli._market(type("A", (), {"data": str(data)})())
     assert seen["cost"] == research_cost and seen["cost"].slippage_bps["BTC-USD"] == 5.0
     assert seen["prices"].shape == prices.shape
+    assert np.allclose(seen["dollar"].to_numpy(), dollar.to_numpy())      # dollar volume as the research command reads it
     monkeypatch.setattr(controls, "run_controls", lambda p, d, c, **kw: seen.update(none=kw["prior_attempt_sharpes"]) or {})
     controls.main(["--data", str(data)])
     assert list(seen["none"]) == []
