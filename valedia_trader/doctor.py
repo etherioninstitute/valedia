@@ -55,11 +55,17 @@ def check_ledger(paths: LoopPaths) -> tuple[str, str]:
     try:
         counts = {s: len(ledger.search(status=s)) for s in STATUSES}
         attempts = int(ledger.attempt_sharpes().size)
+        try:                                              # T38-1b: what the paper command leaves out (can hold a short)
+            from valedia_trader.research_loop import cli
+            left = len(cli.strategies_to_step(paths, ledger).left_out)
+        except Exception:                                 # a strategy that cannot be loaded: counted as before
+            left = 0
     finally:
         ledger.close()
-    live = counts["passed backtest only"] + counts["passed paper"]
-    text = f"{sum(counts.values())} ideas ({counts['failed']} failed, {counts['untested']} untested, {live} in paper trading), {attempts} counted variations"
-    return (OK if live else ATTENTION), text + ("" if live else "; nothing has passed the gate, so nothing trades")
+    live = counts["passed backtest only"] + counts["passed paper"] - left
+    out = f" ({left} not stepped: can hold a short)" if left else ""
+    text = f"{sum(counts.values())} ideas ({counts['failed']} failed, {counts['untested']} untested, {live} in paper trading{out}), {attempts} counted variations"
+    return (OK if live else ATTENTION), text + ("" if live else "; nothing is stepped, so nothing trades" if left else "; nothing has passed the gate, so nothing trades")
 
 
 # T32 rev 2: the range in which each limit the row shows is a limit (the risk gate's own ranges; the gate sets no top

@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = ["StrategyRisk", "Strategy", "RuleStrategy", "SCORES", "SIZING", "SpecError", "run_rules", "load_strategy",
-           "save_spec", "bump_version", "CRYPTO"]
+           "save_spec", "bump_version", "CRYPTO", "can_hold_shorts"]
 
 CRYPTO = ("BTC-USD", "ETH-USD")       # spot crypto is not shorted in this system
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
@@ -87,6 +87,21 @@ class Strategy(ABC):
     def describe(self) -> dict:
         return {"name": self.name, "version": self.version, "hypothesis": self.hypothesis, "market": list(self.market),
                 "risk": asdict(self.risk)}
+
+    @property
+    def holds_shorts(self) -> bool:
+        """Can this strategy ever hold a short? True unless a subclass says otherwise: a strategy that does not
+        say is assumed able to short (T38-1b)."""
+        return True
+
+
+def can_hold_shorts(strategy) -> bool:
+    """Whether `strategy` can ever hold a short: its `holds_shorts`, and True when it has no such attribute or reading
+    it (or its truth value) raises. The only thing the paper step's and the broker follow list's guards call."""
+    try:
+        return bool(getattr(strategy, "holds_shorts", True))
+    except Exception:
+        return True
 
 
 def _check_identity(s: Strategy) -> None:
@@ -340,6 +355,11 @@ class RuleStrategy(Strategy):
             raise SpecError(f"sizing: rule must be one of {sorted(SIZING)}")
         self._srule, self._size_params = srule, _params(s, _SIZING_PARAMS[srule], f"sizing.{srule}")
         self.rebalance_days = self._size_params.pop("rebalance_days", None)
+
+    @property
+    def holds_shorts(self) -> bool:
+        """True unless the direction is "long" (a "short" direction on spot crypto only counts too: conservative)."""
+        return self._direction != "long"
 
     def score(self, prices: pd.DataFrame) -> pd.DataFrame:
         return SCORES[self._rule](prices, **self._score_params)

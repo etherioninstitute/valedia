@@ -26,6 +26,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -36,7 +37,7 @@ from valedia_trader.research_loop import research as research_mod
 from valedia_trader.research_loop.gauntlet import Criteria, Gauntlet, GauntletError
 from valedia_trader.research_loop.ledger import HypothesisLedger, LedgerError
 from valedia_trader.research_loop.paper import AlpacaPaperVenue, LatchResetError, PaperBookNoPrice, PaperTrader
-from valedia_trader.research_loop.strategy import SpecError, Strategy, load_strategy
+from valedia_trader.research_loop.strategy import SpecError, Strategy, can_hold_shorts, load_strategy
 
 MARKET = "us-etf+crypto"
 PAPER_STATUSES = ("passed backtest only", "passed paper")
@@ -123,6 +124,62 @@ def _strategy_for(paths: LoopPaths, ledger: HypothesisLedger, hid: int, file: st
         if c.is_file():
             return load_strategy(c), str(c.resolve().relative_to(paths.root)) if c.resolve().is_relative_to(paths.root) else str(c)
     raise SpecError(f"no strategy file found for hypothesis {hid}; pass --file")
+
+
+NOT_STEPPED_REASON = "can hold a short position: the paper book and its tax ledger do not handle shorts yet"
+
+
+class PaperSet(NamedTuple):
+    """The strategies of the ideas a command reads, split (T38-1b). `loaded`: every one, in the order read (status by
+    status, each in the ledger's order); `stepped`: those the paper book steps; `left_out`: {"id", "name", "reason"}
+    for each that can hold a short (strategy.can_hold_shorts), which the paper book does not step."""
+    stepped: dict[int, Strategy]
+    left_out: list[dict]
+    loaded: dict[int, Strategy]
+
+
+def strategies_to_step(paths: LoopPaths, ledger: HypothesisLedger, statuses=PAPER_STATUSES, keep=None) -> PaperSet:
+    """The strategies of the ideas with one of `statuses` (and, given `keep(status, row)`, only those it keeps), each
+    loaded as _strategy_for loads it, in the order the paper command has always read them; a file that cannot be
+    loaded raises as before (SpecError for a missing one), at the same idea. The one builder of the paper command,
+    the cycle and the critic command."""
+    loaded, stepped, left_out = {}, {}, []
+    for s in statuses:
+        for h in ledger.search(status=s):
+            if keep is not None and not keep(s, h):
+                continue
+            strategy = _strategy_for(paths, ledger, h["id"], None)[0]
+            loaded[h["id"]] = strategy
+            if can_hold_shorts(strategy):
+                left_out.append({"id": h["id"], "name": strategy.name, "reason": NOT_STEPPED_REASON})
+            else:
+                stepped[h["id"]] = strategy
+    return PaperSet(stepped, left_out, loaded)
+
+
+class LeftOutBookHeld(Exception):
+    """The paper book holds a lot under the name of a strategy that is left out (T38-1b): the run steps nothing."""
+
+
+def refuse_a_held_left_out_book(paths: LoopPaths, left_out: list[dict]) -> None:
+    """Raises LeftOutBookHeld when the paper book's state (positions by strategy name, then by symbol) holds a lot
+    whose units are not exactly zero (or not a number) under the name of a strategy in `left_out`: such a position
+    would no longer be managed, and has no stops. Reads the state as the paper trader reads it; writes nothing. Does
+    nothing when `left_out` is empty."""
+    if not left_out:
+        return
+    positions = PaperTrader(paths.journal, paths.risk_limits).state.get("positions") or {}
+
+    def held(lot) -> bool:
+        units = lot.get("units") if isinstance(lot, dict) else lot
+        return not (isinstance(units, (int, float)) and not isinstance(units, bool) and units == 0)
+
+    names = [e["name"] for e in left_out if isinstance(e["name"], str) and isinstance(positions.get(e["name"]), dict)
+             and any(held(lot) for lot in positions[e["name"]].values())]
+    if names:
+        verb = "is" if len(names) == 1 else "are"
+        raise LeftOutBookHeld(f"the paper book holds positions of {', '.join(names)}, which can hold a short and {verb} "
+                              "no longer stepped; nothing was stepped")
 
 
 def _reading(paths: LoopPaths) -> list[dict]:
@@ -358,12 +415,17 @@ def broker_book_follow(paths: LoopPaths, ledger: HypothesisLedger | None = None,
                     return Follow(refused=f"{shown} names hypothesis {hid}, whose status in the research ledger is "
                                           f"{said}; the paper command steps only {' and '.join(PAPER_STATUSES)}")
                 try:
-                    name = _strategy_for(paths, ledger, hid, None)[0].name
+                    strategy = _strategy_for(paths, ledger, hid, None)[0]
+                    name = strategy.name
                 except Exception as exc:
                     return Follow(refused=f"{shown} names hypothesis {hid}, whose strategy cannot be loaded "
                                           f"({order_step._describe(exc)})")
                 if type(name) is not str or not order_step._plain(order_step._NAME, name):
                     return Follow(refused=f"{shown} names hypothesis {hid}, whose strategy has no plain name")
+                if can_hold_shorts(strategy):               # T38-1b: live and not live
+                    return Follow(refused=f"{shown} names hypothesis {hid}, whose strategy can hold a short position; "
+                                          "the order step sells only what the broker book owns, so it cannot be "
+                                          "followed until shorts are built")
                 if name in names:
                     return Follow(refused=f"{shown} names hypotheses {ids[names.index(name)]} and {hid}, whose strategies "
                                           f"share the name {name}; follow it once")
@@ -674,15 +736,19 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
         except (GauntletError, LedgerError, SpecError) as exc:
             tested[h["id"]] = f"refused: {exc}"
     out["tested"] = tested
-    active = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0] for s in PAPER_STATUSES for h in ledger.search(status=s)}
+    book = strategies_to_step(paths, ledger)            # T38-1b: one that can hold a short is not stepped
+    active = book.stepped
+    out["not_stepped"] = book.left_out
+    refuse_a_held_left_out_book(paths, book.left_out)
     journal = Journal(paths.journal)
     if active:
         steps = paper_catch_up(paper_trader(paths), prices, active)
-        out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date"}
+        out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date",
+                        "capital_shared_by": len(active)}
     else:
         out["paper"] = "nothing has passed its backtest and sealed test"
     if args.critic or pd.Timestamp.today().dayofweek == 6:
-        names = {hid: s.name for hid, s in active.items()}
+        names = {hid: s.name for hid, s in book.loaded.items()}   # the left-out ones too, as before
         last = max((e["day"] for e in journal.read()), default=out["date"])
         out["critic"] = critic_mod.weekly_review(ledger, journal, last, names, paths.risk_limits)["path"]
     out["ledger"] = ledger.summary()
@@ -808,24 +874,31 @@ def main(argv=None) -> int:
                 from valedia_trader.data_and_fees import prices as price_data
                 print("prices:", price_data.refresh(args.data))
             prices, _, _ = _market(args)
-            active = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0] for s in PAPER_STATUSES for h in ledger.search(status=s)}
+            book = strategies_to_step(paths, ledger)        # T38-1b: one that can hold a short is not stepped
+            active, left_out = book.stepped, book.left_out
             venue = None
             if args.alpaca:
                 from valedia_trader.core.secrets import load_env, secret
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
             trader = paper_trader(paths, venue=venue)
+            refuse_a_held_left_out_book(paths, left_out)
+            said = {"capital_shared_by": len(active), "not_stepped": left_out}
             if not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")
+                if left_out:
+                    print(json.dumps({"not_stepped": left_out}, indent=2))
             elif venue is not None:
-                print(json.dumps(trader.step(prices, active), indent=2))      # a broker mirror cannot trade in the past
+                print(json.dumps({**trader.step(prices, active), **said}, indent=2))   # a broker mirror cannot trade in the past
             else:
                 steps = paper_catch_up(trader, prices, active)
-                print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date"}, indent=2))
+                print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date", **said},
+                                 indent=2))
         elif args.cmd == "critic":
             from valedia_trader.research_loop.paper import Journal
-            names = {h["id"]: _strategy_for(paths, ledger, h["id"], None)[0].name
-                     for s in (*PAPER_STATUSES, "paused") for h in ledger.search(status=s) if h["paper_trading_result"] or s != "paused"}
+            book = strategies_to_step(paths, ledger, (*PAPER_STATUSES, "paused"),
+                                      keep=lambda s, h: h["paper_trading_result"] or s != "paused")
+            names = {hid: s.name for hid, s in book.loaded.items()}   # stepped and left out together, as before
             journal = Journal(paths.journal)
             last = max((e["day"] for e in journal.read()), default=str(pd.Timestamp.today().date()))
             out = critic_mod.weekly_review(ledger, journal, last, names, paths.risk_limits, days=args.days,
@@ -838,7 +911,8 @@ def main(argv=None) -> int:
         elif args.cmd == "reset-kill-switch":
             trader = PaperTrader(paths.journal, paths.risk_limits)
             print("latch cleared" if trader.reset_latch(args.who, pd.Timestamp.today()) else "the latch was not set")
-    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError, PaperBookNoPrice) as exc:
+    except (GauntletError, LedgerError, SpecError, risk_gate.RiskConfigError, LatchResetError, PaperBookNoPrice,
+            LeftOutBookHeld) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     finally:
