@@ -210,6 +210,23 @@ the code. What changed:
 - **Entry limits count legs, not nets (T38-1).** Both limits (per symbol and for the book) add up the absolute
   weights of open legs, with no credit for a pair that offsets another: a limit met at entry can then never be broken
   by an exit. Found by the builder with two worked cases against the lead's first two rulings.
+- **T38-1 is merged (main `36b83b3`, 2026-11-16)** after two blind checks: no rule missing; the limits held on
+  84,386 bars of 420 generated markets; the output row is exactly the net of the open legs on 44,754 more. Carried to
+  T38-3: with a fitted hedge, one missing price leaves a pair unable to open or re-arm for the whole fitting window,
+  and with any hedge an open pair's z is unknown for `window` bars after one (its stops still act).
+- **The test gate passes plain exposure (found by the positive control, roadmap 1.23 b).** The gate measures an idea
+  against a return of zero, so a long-only book with random timing passed development and the sealed test in 10 of
+  15 tries on a fresh ledger in rising synthetic markets, and in 0 of 15 once 30 earlier attempts were counted. In the
+  real ledger the only two passes are each the single idea on its own market label (the lowest bar), and on
+  development data neither beats re-timed copies of its own book (trend blend p 0.14; hold and rebalance p 0.053).
+  **Decision, to be built as T39-2:** an idea states before its test whether it claims an EDGE or only EXPOSURE (a
+  holding). An edge claim must also beat 95% of re-timed copies of its own book, and its Deflated Sharpe counts every
+  attempt in the ledger, not only those on its own label. A holding passes as a holding and is labelled so. The
+  controls measure the false-pass rate before and after. This replaces the narrower plan of making the timing test
+  a pass condition for the long-leg pairs form only: it applies to every idea, pairs included.
+- **Two more properties of the gate, recorded and left as they are:** the delayed-fills check turns away an edge that
+  lives in a single bar; and the sealed run charges market impact on equity compounded from 1,000,000, so sealed
+  costs depend on development-period profit (small for a real idea, large for a cheat).
 
 ## The owner's decisions (none blocks T38-1 to T38-7)
 
