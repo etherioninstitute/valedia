@@ -25,11 +25,17 @@ The controls:
   detector must flag it and `develop` must refuse it. The oracle carries its future instead and is NOT flagged: that
   is the detector's blind spot, measured and reported, not assumed.
 
+Every control with a pass count also runs on DETRENDED prices (`detrend`: each symbol's average drift removed), so
+a pass that came from the market's own rise can be told from one that came from timing. Each rung also reports
+the gate's own re-timing test (`timing_null` in the development breaker): it is reported, not a gate, and is the
+measurement a later gate change would rest on. `reading` says the main results in plain sentences.
+
 All controls are ordinary `Strategy` subclasses walked by `run_rules` (no dependency on a strategy's own `walk`).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sqlite3
@@ -49,18 +55,38 @@ from valedia_trader.research_loop import gauntlet as gt
 from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.strategy import CRYPTO, Strategy, StrategyRisk, run_rules
 
-__all__ = ["run_controls", "OracleCheat", "FramePeekingCheat", "NoEdgeBook", "NEUTRAL_PREDICTION",
-           "read_prior_attempt_sharpes", "main"]
+__all__ = ["run_controls", "detrend", "smallest_passing_hit_rate", "OracleCheat", "FramePeekingCheat", "NoEdgeBook",
+           "NEUTRAL_PREDICTION", "read_prior_attempt_sharpes", "main"]
 
 MARKET = "controls"                  # market label inside the temporary ledgers
 REFERENCE_HIT_RATE = 0.60
 PASS_SHARE = 0.8                     # "at least 4 of 5 seeds"
-SMALLEST_UP_TO = 0.70                # smallest_passing_hit_rate looks at every rung from h up to this one
+SMALLEST_UP_TO = 0.70                # smallest_passing_hit_rate considers only rungs up to this one
 NEUTRAL_PREDICTION = gt.Prediction(annual_return=0.0, win_rate=0.5, sharpe=0.0, fail_if_sharpe_below=0.0,
                                    fail_if_drawdown_above=1.0,
                                    notes="control run: neutral terms, so only the gate's own checks decide")
 _LAG = 1                             # the execution lag of the gauntlet's main and sealed runs (engine default)
 _KIND = {"oracle": 1, "no_edge": 2, "peek": 3}
+
+
+def detrend(prices: pd.DataFrame) -> pd.DataFrame:
+    """The same prices with each symbol's average drift removed: its log returns (between consecutive prices it
+    has) have their own mean over the WHOLE frame subtracted, and the prices are rebuilt from the same first price.
+    Volatility, correlation and missing values are those of the data; only the average drift is gone.
+
+    This uses the whole period on purpose: the result is a control universe for measuring the gate, never an input
+    a strategy decides on."""
+    out = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
+    for c in prices.columns:
+        col = prices[c].to_numpy(dtype=float)
+        ok = np.flatnonzero(np.isfinite(col) & (col > 0))
+        if len(ok) == 0:
+            continue
+        lr = np.diff(np.log(col[ok]))
+        if len(lr):
+            lr = lr - lr.mean()
+        out.iloc[ok, out.columns.get_loc(c)] = col[ok[0]] * np.exp(np.concatenate([[0.0], np.cumsum(lr)]))
+    return out
 
 
 def _risk(m: int) -> StrategyRisk:
@@ -210,9 +236,14 @@ def _seed_priors(ledger: HypothesisLedger, priors: Sequence[float]) -> None:
         ledger.record_attempt(hid, "backtest", float(s), None, "0.0.0", {"variant": "prior"})
 
 
+def _fingerprint_weights(w: pd.DataFrame) -> str:
+    return hashlib.sha256(np.ascontiguousarray(np.round(w.to_numpy(dtype=float), 12)).tobytes()).hexdigest()[:16]
+
+
 def _full_run(ctx: _Context, strategy: Strategy) -> dict:
     """The same full-history run the sealed test makes (gauntlet.py: run_rules then run_backtest on all prices),
-    read for two numbers: the equity multiple at the first sealed bar and impact's share of sealed gross return."""
+    read for the equity multiple at the first sealed bar, impact's share of sealed gross return, and a fingerprint
+    of the book (so seeds that claim to differ can be shown to differ)."""
     w, _ = run_rules(strategy, ctx.prices)
     res = run_backtest(ctx.prices, w, ctx.cost, ctx.dollar)
     dev_net = res.net.iloc[: ctx.cut].to_numpy(dtype=float)
@@ -221,7 +252,8 @@ def _full_run(ctx: _Context, strategy: Strategy) -> dict:
     impact = float(res.costs["impact"].iloc[ctx.cut:].sum())
     return {"equity_multiple_end_of_development": math.exp(log_mult) if log_mult < 700 else None,
             "log10_equity_multiple_end_of_development": log_mult / math.log(10.0),
-            "sealed_impact_share_of_gross": impact / gross if gross > 0 else None}
+            "sealed_impact_share_of_gross": impact / gross if gross > 0 else None,
+            "book_fingerprint": _fingerprint_weights(w)}
 
 
 def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = ()) -> dict:
@@ -240,19 +272,24 @@ def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = ()) ->
             out.update(refused=True, error=str(exc)[:200], attempts_recorded=ledger.variations(hid))
             return out
         dsr = rep["deflated_sharpe"]
+        timing = rep["breaker"].get("timing_null") or {}               # develop reports it for passed and failed runs
         out.update(refused=False, passed_development=rep["verdict"].startswith("pass"), dsr=dsr["value"],
                    net_sharpe=rep["result"].get("sharpe"),
                    failed=[k for k, c in rep["checks"].items() if not c["passed"]],
                    delayed_fills_sharpe=rep["breaker"]["delayed_fills"]["sharpe"],
                    market_basket_sharpe=rep["breaker"]["market_basket"].get("sharpe"),
+                   timing_p_value=timing.get("p_value"),
                    variations_of_idea=dsr["variations_of_idea"], attempts_on_market=dsr["attempts_on_market"],
                    variance_of_attempt_sharpes=dsr.get("variance_of_attempt_sharpes"),
-                   passed_sealed=False, sealed_sharpe=None, sealed_failed=None)
+                   sealed_ran=False, passed_sealed=False, sealed_sharpe=None, sealed_failed=None)
         if out["passed_development"]:
             s = g.seal(hid, strategy)
-            out.update(passed_sealed=s["verdict"] == "pass", sealed_sharpe=s["result"].get("sharpe"),
+            out.update(sealed_ran=True, passed_sealed=s["verdict"] == "pass", sealed_sharpe=s["result"].get("sharpe"),
                        sealed_failed=[k for k, c in s["checks"].items() if not c["passed"]])
-        out.update(_full_run(ctx, strategy))
+        full = _full_run(ctx, strategy)
+        if not out["sealed_ran"]:
+            full["sealed_impact_share_of_gross"] = None                 # describes a sealed run that did not happen
+        out.update(full)
         return out
     finally:
         ledger.close()
@@ -263,18 +300,22 @@ def _median(xs):
     return float(np.median(xs)) if xs else None
 
 
-def _rung(ctx: _Context, hit_rate: float, horizon: int, seeds: int, priors: Sequence[float]) -> dict:
-    runs = []
-    for k in range(seeds):
-        oracle = OracleCheat(ctx.prices, hit_rate, horizon, ctx.rng("oracle", round(hit_rate * 10000), horizon, k))
-        runs.append({"seed": k, **_run_one(ctx, oracle, priors)})
+def _timed(r: dict) -> bool:
+    p = r.get("timing_p_value")
+    return p is not None and math.isfinite(p) and p <= 0.05
+
+
+def _summary(runs: list[dict]) -> dict:
     failed: dict[str, int] = {}
     for r in runs:
         for f in r.get("failed") or (["refused"] if r.get("refused") else []):
             failed[f] = failed.get(f, 0) + 1
-    return {"hit_rate": float(hit_rate), "horizon": int(horizon), "runs": len(runs),
+    return {"runs": len(runs),
             "passed_development": sum(bool(r.get("passed_development")) for r in runs),
             "passed_sealed": sum(bool(r.get("passed_sealed")) for r in runs),
+            "median_timing_p_value": _median([r.get("timing_p_value") for r in runs]),
+            "timing_p_at_most_0_05": sum(_timed(r) for r in runs),
+            "passed_both_and_timing": sum(bool(r.get("passed_sealed")) and _timed(r) for r in runs),
             "median_dsr": _median([r.get("dsr") for r in runs]),
             "median_net_sharpe": _median([r.get("net_sharpe") for r in runs]),
             "median_market_basket_sharpe": _median([r.get("market_basket_sharpe") for r in runs]),
@@ -284,14 +325,28 @@ def _rung(ctx: _Context, hit_rate: float, horizon: int, seeds: int, priors: Sequ
             "seeds": runs}
 
 
+def _rung(ctx: _Context, hit_rate: float, horizon: int, seeds: int, priors: Sequence[float]) -> dict:
+    runs = []
+    for k in range(seeds):
+        oracle = OracleCheat(ctx.prices, hit_rate, horizon, ctx.rng("oracle", round(hit_rate * 10000), horizon, k))
+        runs.append({"seed": k, **_run_one(ctx, oracle, priors)})
+    return {"hit_rate": float(hit_rate), "horizon": int(horizon), **_summary(runs)}
+
+
+def _check_distinct(hit_rates: Sequence[float]) -> None:
+    rates = [float(h) for h in hit_rates]
+    if len(set(rates)) != len(rates):
+        raise ValueError(f"hit rates must not repeat: {rates}")
+
+
 def smallest_passing_hit_rate(ladder: list[dict]) -> float | None:
-    """The smallest rung h such that at h and at every higher rung up to 0.70, at least 4 of 5 seeds (80%) passed
-    BOTH development and the sealed test. None if there is none."""
-    rows = sorted(ladder, key=lambda r: r["hit_rate"])
-    ok = {r["hit_rate"]: r["passed_sealed"] >= PASS_SHARE * r["runs"] for r in rows}
-    for r in rows:
-        h = r["hit_rate"]
-        if all(ok[x] for x in ok if h <= x <= max(h, SMALLEST_UP_TO)):
+    """The smallest rung h <= 0.70 such that at h and at every higher rung up to 0.70, at least 4 of 5 seeds (80%)
+    passed BOTH development and the sealed test. Rungs above 0.70 are reported but never considered, so they can
+    neither be returned nor stand in for a failed 0.70. None if there is none."""
+    _check_distinct([r["hit_rate"] for r in ladder])
+    ok = {r["hit_rate"]: r["passed_sealed"] >= PASS_SHARE * r["runs"] for r in ladder if r["hit_rate"] <= SMALLEST_UP_TO}
+    for h in sorted(ok):
+        if all(ok[x] for x in ok if x >= h):
             return h
     return None
 
@@ -301,24 +356,100 @@ def _ladder(ctx, hit_rates, horizon, seeds, priors) -> dict:
     return {"ladder": rows, "smallest_passing_hit_rate": smallest_passing_hit_rate(rows)}
 
 
+def _single_statement(s0: dict) -> str:
+    if s0.get("refused"):
+        return "the one-bar edge was refused: " + str(s0.get("error"))
+    if s0["passed_development"] and s0["passed_sealed"]:
+        return "this gate let through an edge that lives in one bar on this data"
+    if not s0["passed_development"] and s0["failed"] == ["delayed_fills"]:
+        return "this gate turns away an edge that lives in one bar, because of the delayed-fills check"
+    if not s0["passed_development"]:
+        return "the one-bar edge failed development on: " + ", ".join(s0["failed"])
+    return "the one-bar edge failed the sealed test on: " + ", ".join(s0["sealed_failed"] or [])
+
+
+def _suite(ctx: _Context, hit_rates, horizon: int, seeds: int, priors: list[float]) -> dict:
+    """Every control that has a pass count, on one price frame: the ladders, the reference edge, the no-edge book
+    and the single-bar edge."""
+    fresh = _ladder(ctx, hit_rates, horizon, seeds, ())
+
+    def reference(ladder: dict, with_priors: list[float]) -> dict:
+        row = next((r for r in ladder["ladder"] if r["hit_rate"] == REFERENCE_HIT_RATE), None)
+        row = row or _rung(ctx, REFERENCE_HIT_RATE, horizon, seeds, with_priors)
+        return {k: v for k, v in row.items() if k != "seeds"}
+
+    single = _rung(ctx, 1.0, 1, 1, ())
+    single["statement"] = _single_statement(single["seeds"][0])
+    no_edge = _summary([{"seed": k, **_run_one(ctx, NoEdgeBook(ctx.prices, ctx.rng("no_edge", k)))} for k in range(seeds)])
+    ref = reference(fresh, [])
+    out = {"fresh_ledger": fresh, "at_prior_attempts": None, "reference_edge": ref,
+           "reference_edge_at_prior_attempts": None, "no_edge": no_edge, "single_bar_edge": single,
+           "market_basket_sharpe": ref["median_market_basket_sharpe"]}      # the oracle's market: every symbol
+    if priors:
+        at_prior = {"prior_attempts": len(priors),
+                    "prior_variance_of_sharpes": float(np.var(priors, ddof=1)) if len(priors) >= 2 else None,
+                    "variance_rule": "Gauntlet._deflated uses the variance of all attempt Sharpes on the market "
+                                     "(priors plus the run's own) once there are 3 or more, else 1/n_obs",
+                    **_ladder(ctx, hit_rates, horizon, seeds, priors)}
+        at_prior["median_variance_used"] = _median([r.get("variance_of_attempt_sharpes") for row in at_prior["ladder"]
+                                                    for r in row["seeds"]])
+        out["at_prior_attempts"] = at_prior
+        out["reference_edge_at_prior_attempts"] = reference(at_prior, priors)
+    return out
+
+
+def _reading(given: dict, flat: dict) -> list[str]:
+    """Plain sentences generated from the numbers."""
+    def row(suite, ladder, h):
+        lad = suite.get(ladder)
+        return None if lad is None else next((r for r in lad["ladder"] if r["hit_rate"] == h), None)
+
+    def both(r):
+        return f"{r['passed_sealed']} of {r['runs']}"
+
+    out = []
+    a, b = row(given, "fresh_ledger", 0.5), row(flat, "fresh_ledger", 0.5)
+    if a and b:
+        out.append(f"Long-only random timing (h = 0.50) passed both tests in {both(a)} seeds on a fresh ledger on the data as "
+                   f"given, and in {both(b)} seeds on the detrended data; {a['passed_both_and_timing']} and "
+                   f"{b['passed_both_and_timing']} of them also had a re-timing p-value of 0.05 or less.")
+    for suite, data in ((given, "the data as given"), (flat, "the detrended data")):
+        for ladder, ledger in (("fresh_ledger", "a fresh ledger"), ("at_prior_attempts", "the prior attempts")):
+            if suite.get(ladder) is None:
+                continue
+            h = suite[ladder]["smallest_passing_hit_rate"]
+            out.append(f"Smallest passing hit rate on {data} with {ledger}: "
+                       + (f"{h:.2f}." if h is not None else f"none up to {SMALLEST_UP_TO:.2f}."))
+            ref = suite["reference_edge" if ladder == "fresh_ledger" else "reference_edge_at_prior_attempts"]
+            out.append(f"The reference edge (h = {REFERENCE_HIT_RATE:.2f}) passed both tests in {both(ref)} seeds on {data} "
+                       f"with {ledger}, {ref['passed_both_and_timing']} of them also with a re-timing p-value of 0.05 or less.")
+    mb, flat_mb = given.get("market_basket_sharpe"), flat.get("market_basket_sharpe")
+    if mb is not None and mb > 0.3:
+        out.append("On this data a fresh-ledger pass can come from the market's own rise: read the detrended ladder for "
+                   "the smallest timing skill the gate lets through.")
+    if flat_mb is not None and flat_mb > 0.3:
+        out.append(f"The detrended market basket still has a development Sharpe of {flat_mb:.2f}: removing each symbol's "
+                   "mean log return leaves about half its variance as drift in simple returns, which a long book earns.")
+    return out
+
+
 def run_controls(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostModel, *,
                  criteria: gt.Criteria | None = None, seed: int = 20261116,
                  hit_rates: Sequence[float] = (0.50, 0.52, 0.55, 0.60, 0.70, 1.00), seeds_per_rate: int = 5,
                  horizon: int = 5, prior_attempt_sharpes: Sequence[float] = ()) -> dict:
-    """Run every control through the real gauntlet in a temporary folder; return the report (strict JSON)."""
+    """Run every control through the real gauntlet in a temporary folder, on the prices as given and on the same
+    prices detrended (`detrend`); return the report (strict JSON)."""
     if seeds_per_rate < 1 or horizon < 1:
         raise ValueError("seeds_per_rate and horizon must be at least 1")
+    _check_distinct(hit_rates)
     priors = [float(s) for s in prior_attempt_sharpes]
     if not all(math.isfinite(s) for s in priors):
         raise ValueError("prior attempt Sharpes must be finite numbers")
     with tempfile.TemporaryDirectory(prefix="valedia-controls-") as tmp:
-        ctx = _Context(prices, dollar_volume, cost, criteria, Path(tmp), seed)
-        fresh = _ladder(ctx, hit_rates, horizon, seeds_per_rate, ())
-        ref = next((r for r in fresh["ladder"] if r["hit_rate"] == REFERENCE_HIT_RATE), None)
-        if ref is None:
-            ref = _rung(ctx, REFERENCE_HIT_RATE, horizon, seeds_per_rate, ())
-        single = _rung(ctx, 1.0, 1, 1, ())
-        no_edge = [{"seed": k, **_run_one(ctx, NoEdgeBook(prices, ctx.rng("no_edge", k)))} for k in range(seeds_per_rate)]
+        ctx = _Context(prices, dollar_volume, cost, criteria, Path(tmp) / "given", seed)
+        given = _suite(ctx, hit_rates, horizon, seeds_per_rate, priors)
+        flat_ctx = _Context(detrend(prices), dollar_volume, cost, criteria, Path(tmp) / "detrended", seed)
+        flat = _suite(flat_ctx, hit_rates, horizon, seeds_per_rate, priors)
         peek = FramePeekingCheat(prices.columns, REFERENCE_HIT_RATE, horizon, ctx.rng("peek"), len(prices))
         peek_run = _run_one(ctx, peek)
         dev = prices.iloc[: ctx.cut]
@@ -327,39 +458,12 @@ def run_controls(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost:
         sees_peek = research.detect_lookahead(peek.target_weights, probe)
         sees_oracle = research.detect_lookahead(oracle.target_weights, probe)
         sees_noise = research.detect_lookahead(NoEdgeBook(prices, ctx.rng("no_edge", 0)).target_weights, probe)
-        at_prior = None
-        if priors:
-            at_prior = {"prior_attempts": len(priors),
-                        "prior_variance_of_sharpes": float(np.var(priors, ddof=1)) if len(priors) >= 2 else None,
-                        "variance_rule": "Gauntlet._deflated uses the variance of all attempt Sharpes on the market "
-                                         "(priors plus the run's own) once there are 3 or more, else 1/n_obs",
-                        **_ladder(ctx, hit_rates, horizon, seeds_per_rate, priors)}
-            at_prior["median_variance_used"] = _median([r.get("variance_of_attempt_sharpes") for row in at_prior["ladder"]
-                                                        for r in row["seeds"]])
-    single_row = dict(single)
-    s0 = single["seeds"][0]
-    if s0["passed_development"] and s0["passed_sealed"]:
-        statement = "this gate let through an edge that lives in one bar on this data"
-    elif not s0["passed_development"] and s0["failed"] == ["delayed_fills"]:
-        statement = "this gate turns away an edge that lives in one bar, because of the delayed-fills check"
-    else:
-        statement = ("the one-bar edge failed " + ("development on: " + ", ".join(s0["failed"]) if not s0["passed_development"]
-                                                  else "the sealed test on: " + ", ".join(s0["sealed_failed"] or [])))
-    single_row["statement"] = statement
     report = {
         "prediction": asdict(NEUTRAL_PREDICTION),
-        "reference_edge": {"hit_rate": REFERENCE_HIT_RATE, "horizon": horizon, "runs": ref["runs"],
-                           "passed_development": ref["passed_development"], "passed_sealed": ref["passed_sealed"],
-                           "median_dsr": ref["median_dsr"], "failed_checks": ref["failed_checks"],
-                           "median_log10_equity_multiple_end_of_development": ref["median_log10_equity_multiple_end_of_development"],
-                           "median_sealed_impact_share_of_gross": ref["median_sealed_impact_share_of_gross"]},
-        "no_edge": {"runs": len(no_edge), "passed_development": sum(r["passed_development"] for r in no_edge),
-                    "passed_sealed": sum(r["passed_sealed"] for r in no_edge),
-                    "median_dsr": _median([r["dsr"] for r in no_edge]), "seeds": no_edge},
+        **given,
+        "detrended": flat,
+        "reading": _reading(given, flat),
         "frame_peeking": {**peek_run, "flagged_columns": len(sees_peek)},
-        "single_bar_edge": single_row,
-        "fresh_ledger": fresh,
-        "at_prior_attempts": at_prior,
         "detector_sees_frame_peeking": bool(sees_peek),
         "detector_sees_carried_future": bool(sees_oracle),
         "detector_flags_no_edge": bool(sees_noise),
