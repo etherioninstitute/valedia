@@ -102,6 +102,19 @@ inherits the switch with no code of its own. What can actually be live on day on
 | Crypto | daily for 8 coins, the source already used; exchange history with dead coins is roadmap 1.7 | paper book | no | the order step taught crypto (all-hours session, fractional units, Webull's crypto spread sourced), and the owner's choice of venue |
 | Forex | daily rates, the source already used; no volume, so costs are assumptions labelled as such | paper book | no | a broker that trades spot forex: the owner's choice; none is connected |
 
+What the first download showed (2026-11-16, daily closes into `artifacts/data_pairs_us`, `data_pairs_crypto`,
+`data_pairs_fx`; counts only, no strategy was run):
+
+- US stocks: 16 symbols from 2000 (or their listing), no gaps, nothing implausible.
+- Crypto: 8 coins. SHIB has 217 days stored as a zero price (too small for the source's precision) and AVAX and
+  SHIB have gaps; pairs that include them start late and need the zero days treated as missing.
+- Forex: the free series has **bad prints**. Nine of the fifteen series show a one-day move above 8%, among them
+  17% in EUR/USD, 18% in USD/JPY and 52% in USD/NOK, none of which happened (the Swiss franc's 15 January 2015 is
+  the one real case). A pairs rule would "profit" from every one of them. So forex tests use the European Central
+  Bank's daily reference rates (one official snapshot a day since 1999, every cross computed from the euro rates),
+  with the free series kept only as a cross-check. The bank publishes them for information and discourages their
+  use for transactions: they are a research series, not a price anyone traded at, and results on them are labelled so.
+
 **D10. Daily bars first, hourly second.** The outside bots act on hourly bars polled every minute or two. Valedia's
 engine, paper book and order step work on daily closes. The daily form is built and tested first because every part
 already exists for it. Hourly needs its own bar store (the owner's read-only Alpaca data keys cover stocks and
