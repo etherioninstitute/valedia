@@ -237,6 +237,19 @@ def test_every_rung_reports_the_re_timing_test(full):
         assert noise["median_timing_p_value"] >= 0.25 and noise["passed_both_and_timing"] == 0
 
 
+def test_passed_both_and_timing_counts_sealed_passes_not_development_passes():
+    def run(dev, sealed, p):
+        return {"passed_development": dev, "sealed_ran": dev, "passed_sealed": sealed, "timing_p_value": p,
+                "failed": [], "dsr": 0.99, "net_sharpe": 1.0}
+    rows = [run(True, False, 0.01),                                       # passed development, FAILED the sealed test, timed
+            run(True, True, 0.01),                                        # passed all three
+            run(True, True, 0.50),                                        # passed both tests, not timed
+            run(False, False, 0.01)]                                      # failed development, timed
+    out = controls._summary(rows)
+    assert out["passed_development"] == 3 and out["passed_sealed"] == 2 and out["timing_p_at_most_0_05"] == 3
+    assert out["passed_both_and_timing"] == 1
+
+
 def test_smallest_passing_hit_rate_reads_back_from_the_table_and_ignores_rungs_above_0_70(full):
     for name, ladder in LADDERS:
         lad = suite(full, name)[ladder]
@@ -304,7 +317,10 @@ def test_the_reading_says_it_in_words(full):
     assert warning in controls._reading(risen, full["detrended"])
     assert warning not in controls._reading(dict(full, market_basket_sharpe=0.3), full["detrended"])
     # detrended in simple returns the basket has no drift: Sharpe measured -0.003 here and -0.051 on drifting
-    # universe 1 (0.37 and 0.34 when the drift was removed in log terms); mark 0.15, about three times the larger
+    # universe 1 (0.37 and 0.34 when the drift was removed in log terms); mark 0.15, about three times the larger.
+    # This mark is for THIS fixture universe only: the gate's basket Sharpe is taken over the development test window,
+    # not the whole frame the detrending zeroes, so on other universes it sits within about one standard error of
+    # zero (a 9.5-year window: about 0.3), not within 0.15.
     assert abs(full["detrended"]["market_basket_sharpe"]) <= 0.15
     assert any(line.startswith("The detrended market basket has a development Sharpe of") for line in reading)
 
