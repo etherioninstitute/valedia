@@ -391,3 +391,15 @@ The stop lasted 22 minutes 18 seconds: the collector was stopped at 02:40:11 UTC
 The run made every one of its model calls and ended by itself, 1 hour 23 minutes inside the limit. It is the only
 stop of 16 November (UTC) so far, 1.5% of that day's slots. A later run of this kind is declared here before it
 happens.
+
+## A second stop on 16 November (UTC), for the 48-participant run on the two-model plan (written at 03:27 UTC on 16 November, 19:27 PST on 15 November, before the stop; no answer has been scored)
+
+The two-model proving run completed, and the owner has asked for the 48-participant run on the same plan, again
+with the collector stopped. It is expected to take two to two and a half hours; its own time limit is 5 hours
+30 minutes. The collector will be stopped for it once, within the hour after this is written, and is to be running
+again no later than 5 hours 45 minutes after that stop, whatever the run does. All of it falls on 16 November (UTC),
+which already carries one stop of 22 minutes 18 seconds: at the expected length the day's stops come to about
+2 hours 50 minutes (12% of its slots); if this stop lasts longer than 4 hours 25 minutes the day falls under the 80%
+its count needs, and at the limit the stops come to 6 hours 7 minutes (25.5%). Each day's own count decides. The
+exact times are added below afterwards. If the run's preparation fails before the collector is touched, this stop
+does not take place, and that is said here.
