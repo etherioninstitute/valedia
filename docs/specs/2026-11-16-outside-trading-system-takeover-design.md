@@ -193,6 +193,24 @@ the code. What changed:
   a checker ran both legs for 40 days); that the no-intercept filter is unspecified (it is built and checked
   against its own reference).
 
+## Found while building (2026-11-16)
+
+- **Missing prices in the backtest engine (a slice before T38-4).** On a bar with no price the engine drops the held
+  weight and never books the move across the gap (`backtest/engine.py:77-86`). The frames tested to date have no
+  such gaps (measured: none in the default frame as the gate loads it, the stock folder, the new-asset folder and the
+  US pairs folder), so no result so far is affected. The crypto pairs folder has 17 gaps (longest 69 bars, largest
+  move across one 5.0%) and the forex folder 129 across all 15 series (longest 151 bars, 5.6%). No crypto or forex
+  universe is tested until the engine holds a position through an unpriced bar and books the move when the price
+  returns, as the pairs rules already do, with a test that every gap-free frame gives the same result as before.
+- **Calendar (same slice).** A crypto-only folder has 365 rows a year and every annual figure assumes 252. Annual
+  figures take the frame's measured sessions per year, or the run is refused.
+- **The shorts guard is general (T38-1b).** A rule strategy can be written to short as well. Every strategy answers
+  whether it can hold a short, an object that does not answer is treated as able to, and the paper step and the
+  broker's follow list both go by that answer. All ten strategies on file are long-only.
+- **Entry limits count legs, not nets (T38-1).** Both limits (per symbol and for the book) add up the absolute
+  weights of open legs, with no credit for a pair that offsets another: a limit met at entry can then never be broken
+  by an exit. Found by the builder with two worked cases against the lead's first two rulings.
+
 ## The owner's decisions (none blocks T38-1 to T38-7)
 
 1. **Crypto live:** Webull's crypto account (the adapter already knows the account class) or another venue.
