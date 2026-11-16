@@ -43,6 +43,18 @@ def _fmt(x: float, pct: bool = True) -> str:
     return f"{x:+.2%}" if pct else f"{x:.2f}"
 
 
+def _backtest_simple_annual(bt: dict) -> tuple[float | None, float | None]:
+    """(the backtest's simple annual average, its annual volatility): sharpe * annual_vol, which is its average daily return times
+    252. (None, None) when either is missing, not a number or not finite; the compound `cagr` is never a stand-in."""
+    values = []
+    for key in ("sharpe", "annual_vol"):
+        v = bt.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)) or not math.isfinite(float(v)):
+            return None, None
+        values.append(float(v))
+    return values[0] * values[1], values[1]
+
+
 def panel_scorecard(entries: list[dict]) -> dict | None:
     """How the decision panel's verdicts have turned out, from the journal alone. None until a case is settled."""
     verdict = {}
@@ -254,10 +266,13 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         live_annual = float(np.mean(returns) * 252.0) if n else float("nan")
         curve = np.concatenate([[1.0], np.cumprod(1.0 + returns)])        # drawdown is measured from the starting capital
         live_dd = float(np.max(1.0 - curve / np.maximum.accumulate(curve))) if n else 0.0
-        bt_mu, bt_sd = bt.get("cagr"), bt.get("annual_vol")
+        # paper's number is the daily mean times 252, so the backtest is put on that basis: sharpe * annual_vol is exactly its daily
+        # mean times 252 (sharpe = mean / sd * sqrt(252), annual_vol = sd * sqrt(252)). Its cagr is compound and is never compared.
+        bt_mu = bt.get("cagr")                                                # only reported (result key), never compared
+        bt_simple, bt_sd = _backtest_simple_annual(bt)
         z = float("nan")
-        if n >= 2 and bt_mu is not None and bt_sd:
-            z = (float(np.mean(returns)) - bt_mu / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n))
+        if n >= 2 and bt_simple is not None and bt_sd:
+            z = (float(np.mean(returns)) - bt_simple / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n))
         win = float(np.mean([e["realized_pnl"] > 0 for e in closed])) if closed else float("nan")
         result = {"days": n, "week_return": float(np.prod(1.0 + in_week) - 1.0) if len(in_week) else float("nan"),
                   "total_return": live_total, "annualised_return": live_annual, "max_drawdown": live_dd,
@@ -265,8 +280,8 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                   "backtest_annual_return": bt_mu, "backtest_max_drawdown": bt.get("max_drawdown"),
                   "predicted_annual_return": prediction.get("annual_return"), "predicted_win_rate": prediction.get("win_rate")}
         n_kept, total_kept, z_kept = len(kept), float(np.prod(1.0 + kept) - 1.0) if len(kept) else float("nan"), float("nan")
-        if n_kept >= 2 and bt_mu is not None and bt_sd:
-            z_kept = (float(np.mean(kept)) - bt_mu / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n_kept))
+        if n_kept >= 2 and bt_simple is not None and bt_sd:
+            z_kept = (float(np.mean(kept)) - bt_simple / 252.0) / (bt_sd / math.sqrt(252.0) / math.sqrt(n_kept))
         if n_carried:
             result.update({"carried_price_days": n_carried, "carried_price_funds": carried_funds})
         if n_unreadable:
@@ -283,9 +298,9 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
                 notes.append(f"{name}: {k} paper day{'s' if k != 1 else ''} whose {field} field could not be read "
                              f"{'are' if k != 1 else 'is'} left out of the days that count toward passing paper; "
                              f"{n_kept} of its {n} days count. The field is {key} in the day summaries.")
-        if n and bt_mu is not None and math.isfinite(live_annual) and live_annual < bt_mu:
-            notes.append(f"{name} is running at {_fmt(live_annual)} a year on paper against {_fmt(bt_mu)} in its backtest, "
-                         f"{_fmt(bt_mu - live_annual)} worse ({n} days, z {_fmt(z, False)}).")
+        if n and bt_simple is not None and math.isfinite(live_annual) and live_annual < bt_simple:
+            notes.append(f"{name} is running at {_fmt(live_annual)} a year on paper against {_fmt(bt_simple)} in its backtest, "
+                         f"{_fmt(bt_simple - live_annual)} worse (both are average daily return times 252; {n} days, z {_fmt(z, False)}).")
         if prediction and closed and math.isfinite(win) and win < prediction.get("win_rate", 0.0):
             notes.append(f"{name} wins {win:.0%} of its trades on paper; the prediction said {prediction['win_rate']:.0%}.")
         regimes = Counter((e.get("entry_conditions") or {}).get("regime", "unknown") for e in losers)

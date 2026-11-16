@@ -32,7 +32,7 @@ from valedia_trader.research_loop import strategy as st
 from valedia_trader.research_loop.gauntlet import Prediction, write_prediction
 from valedia_trader.research_loop.ledger import DuplicateIdea, HypothesisLedger
 
-__all__ = ["Role", "ROLES", "MAX_IDEAS", "price_table", "macro_table", "build_prompt", "parse_ideas", "run_research",
+__all__ = ["Role", "ROLES", "MAX_IDEAS", "price_table", "macro_table", "PRICE_COLUMNS", "MACRO_COLUMNS", "build_prompt", "parse_ideas", "run_research",
            "hermes_asker", "chat_asker", "RULE_LIBRARY"]
 
 MAX_IDEAS = 3
@@ -52,20 +52,100 @@ def _fmt(df: pd.DataFrame) -> str:
     return df.round(3).to_csv()
 
 
+SESSIONS_PER_YEAR = 252
+_CALENDAR_TOLERANCE = 0.05
+CORRELATION_WINDOW = 60
+
+
+@dataclass(frozen=True)
+class ColumnDef:
+    """What one table column is. `window` is the number of sessions the column looks over (for a move, how far back it
+    compares); `baseline_window` is the number of sessions of the second statistic it is set against, when there is one."""
+    unit: str
+    window: int
+    sentence: str
+    baseline_window: int | None = None
+
+
+# The one place a column's unit, window and meaning are written. The tables take their windows from here and the legend in the
+# prompt is generated from here, so a number printed in a table and the words that describe it cannot drift apart.
+PRICE_COLUMNS: dict[str, ColumnDef] = {
+    "ret_1m": ColumnDef("fraction", 21, "Last close divided by the close 21 sessions earlier, minus 1."),
+    "ret_3m": ColumnDef("fraction", 63, "Last close divided by the close 63 sessions earlier, minus 1."),
+    "ret_12m": ColumnDef("fraction", 252, "Last close divided by the close 252 sessions earlier, minus 1."),
+    "vol_20d": ColumnDef("fraction", 20, "Standard deviation of the last 20 simple daily returns, times the square root of 252."),
+    "vol_1y": ColumnDef("fraction", 252, "Standard deviation of the last 252 simple daily returns, times the square root of 252."),
+    "below_1y_high": ColumnDef("fraction", 252, "Last close divided by the highest close of the last 252 sessions, minus 1 (0 means at the high)."),
+    "vs_200d_avg": ColumnDef("fraction", 200, "Last close divided by the average close of the last 200 sessions, minus 1."),
+    "move_5d_in_sd": ColumnDef("standard deviations", 5, "The 5-session change (last close over the close 5 sessions earlier, minus 1) "
+                                                         "divided by the standard deviation of the last 60 daily returns times the "
+                                                         "square root of 5.", baseline_window=60),
+    "volume_20d_vs_1y": ColumnDef("fraction", 20, "Average dollar volume of the last 20 sessions divided by the average of the last "
+                                                  "252 sessions, minus 1.", baseline_window=252),
+}
+MACRO_COLUMNS: dict[str, ColumnDef] = {
+    "chg_3m": ColumnDef("fraction", 63, "The price ratio of the pair now divided by the ratio 63 sessions earlier, minus 1."),
+    "chg_12m": ColumnDef("fraction", 252, "The price ratio of the pair now divided by the ratio 252 sessions earlier, minus 1."),
+    "vs_200d_avg": ColumnDef("fraction", 200, "The price ratio of the pair now divided by its average over the last 200 sessions, minus 1."),
+}
+_PRICE = {k: v.window for k, v in PRICE_COLUMNS.items()}
+_PRICE_BASE = {k: v.baseline_window for k, v in PRICE_COLUMNS.items()}
+
+
+def _legend(defs: dict[str, ColumnDef], columns) -> str:
+    """The text that goes above a table: how to read the values, then one line per column the table has. A column with no
+    definition is refused, so a new column cannot reach a prompt unlabelled. No columns, no legend."""
+    columns = list(columns)
+    unknown = [c for c in columns if c not in defs]
+    if unknown:
+        raise ValueError(f"table column(s) with no definition: {', '.join(map(str, unknown))}")
+    if not columns:
+        return ""
+    lines = [f"How to read the table below. Values are fractions unless the unit says otherwise (0.052 means 5.2%). Windows count "
+             f"trading sessions of this data (1m = 21 sessions, 3m = 63, 12m and 1y = {SESSIONS_PER_YEAR}). Annual figures use "
+             f"{SESSIONS_PER_YEAR} sessions a year. Values are rounded to 3 decimals. Columns:"]
+    for name in columns:
+        d = defs[name]
+        span = f"window {d.window} sessions" + (f", baseline {d.baseline_window} sessions" if d.baseline_window else "")
+        lines.append(f"- {name} [{d.unit}; {span}]: {d.sentence}")
+    return "\n".join(lines) + "\n"
+
+
+def _check_calendar(prices: pd.DataFrame) -> None:
+    """The legend says 21 rows are one month, so refuse a frame whose rows are not on a 252-sessions-a-year calendar (a seven-day
+    crypto calendar, say). The rate is measured over the whole frame: rows divided by the years the index spans. A frame spanning
+    less than one year is not judged: its rate is too noisy to measure, and its tables cannot fill a 12-month window anyway."""
+    index = pd.DatetimeIndex(prices.index)
+    if len(index) < 2:
+        return
+    years = (index.max() - index.min()).days / 365.25
+    if years < 1.0:
+        return
+    rate = len(index) / years
+    if abs(rate - SESSIONS_PER_YEAR) > _CALENDAR_TOLERANCE * SESSIONS_PER_YEAR:
+        raise ValueError(f"the price frame has {rate:.1f} rows a year, not {SESSIONS_PER_YEAR} sessions a year (within 5%); the "
+                         "tables count rows as sessions, so they are not built for this calendar")
+
+
 def price_table(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None = None) -> str:
-    """Price and volume facts per symbol at the last row of `prices`."""
+    """Price and volume facts per symbol at the last row of `prices`, under a legend generated from PRICE_COLUMNS."""
+    _check_calendar(prices)
+    w, b, last = _PRICE, _PRICE_BASE, prices.iloc[-1]
     r = prices.pct_change()
     out = pd.DataFrame({
-        "ret_1m": prices.iloc[-1] / prices.shift(21).iloc[-1] - 1, "ret_3m": prices.iloc[-1] / prices.shift(63).iloc[-1] - 1,
-        "ret_12m": prices.iloc[-1] / prices.shift(252).iloc[-1] - 1,
-        "vol_20d": r.tail(20).std() * np.sqrt(252), "vol_1y": r.tail(252).std() * np.sqrt(252),
-        "below_1y_high": prices.iloc[-1] / prices.tail(252).max() - 1,
-        "vs_200d_avg": prices.iloc[-1] / prices.tail(200).mean() - 1,
-        "move_5d_in_sd": (prices.iloc[-1] / prices.shift(5).iloc[-1] - 1) / (r.tail(60).std() * np.sqrt(5)),
+        "ret_1m": last / prices.shift(w["ret_1m"]).iloc[-1] - 1, "ret_3m": last / prices.shift(w["ret_3m"]).iloc[-1] - 1,
+        "ret_12m": last / prices.shift(w["ret_12m"]).iloc[-1] - 1,
+        "vol_20d": r.tail(w["vol_20d"]).std() * np.sqrt(SESSIONS_PER_YEAR),
+        "vol_1y": r.tail(w["vol_1y"]).std() * np.sqrt(SESSIONS_PER_YEAR),
+        "below_1y_high": last / prices.tail(w["below_1y_high"]).max() - 1,
+        "vs_200d_avg": last / prices.tail(w["vs_200d_avg"]).mean() - 1,
+        "move_5d_in_sd": (last / prices.shift(w["move_5d_in_sd"]).iloc[-1] - 1)
+                         / (r.tail(b["move_5d_in_sd"]).std() * np.sqrt(w["move_5d_in_sd"])),
     })
     if dollar_volume is not None:
-        out["volume_20d_vs_1y"] = dollar_volume.tail(20).mean() / dollar_volume.tail(252).mean() - 1
-    return _fmt(out)
+        out["volume_20d_vs_1y"] = (dollar_volume.tail(w["volume_20d_vs_1y"]).mean()
+                                   / dollar_volume.tail(b["volume_20d_vs_1y"]).mean() - 1)
+    return _legend(PRICE_COLUMNS, out.columns) + _fmt(out)
 
 
 _PAIRS = (("TLT", "IEF", "long bonds vs intermediate (curve)"), ("LQD", "IEF", "credit vs treasuries"),
@@ -74,20 +154,27 @@ _PAIRS = (("TLT", "IEF", "long bonds vs intermediate (curve)"), ("LQD", "IEF", "
 
 
 def macro_table(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None = None) -> str:
-    """Rates, credit, commodity and sector trends as far as the traded instruments show them. No
-    economic data feed is connected; this table is cross-asset prices only."""
+    """Rates, credit, commodity and sector trends as far as the traded instruments show them, under a legend generated from
+    MACRO_COLUMNS. No economic data feed is connected; this table is cross-asset prices only. The SPY-TLT correlation is not a
+    row of the table (it is not a change in a ratio): it is its own line after it, when both funds are in the frame."""
+    _check_calendar(prices)
+    c3, c12, avg = (MACRO_COLUMNS[k].window for k in ("chg_3m", "chg_12m", "vs_200d_avg"))
     rows = {}
     for a, b, label in _PAIRS:
         if a in prices and b in prices:
             ratio = (prices[a] / prices[b]).dropna()
-            if len(ratio) > 252:
-                rows[f"{a}/{b} {label}"] = {"chg_3m": ratio.iloc[-1] / ratio.iloc[-64] - 1, "chg_12m": ratio.iloc[-1] / ratio.iloc[-253] - 1,
-                                            "vs_200d_avg": ratio.iloc[-1] / ratio.tail(200).mean() - 1}
+            if len(ratio) > c12:
+                rows[f"{a}/{b} {label}"] = {"chg_3m": ratio.iloc[-1] / ratio.iloc[-1 - c3] - 1,
+                                            "chg_12m": ratio.iloc[-1] / ratio.iloc[-1 - c12] - 1,
+                                            "vs_200d_avg": ratio.iloc[-1] / ratio.tail(avg).mean() - 1}
     out = pd.DataFrame(rows).T
+    text = _legend(MACRO_COLUMNS, out.columns) + _fmt(out)
     r = prices.pct_change()
     if "SPY" in r and "TLT" in r:
-        out.loc["SPY-TLT 60d correlation", "chg_3m"] = r["SPY"].tail(60).corr(r["TLT"].tail(60))
-    return _fmt(out)
+        corr = r["SPY"].tail(CORRELATION_WINDOW).corr(r["TLT"].tail(CORRELATION_WINDOW))
+        if pd.notna(corr):
+            text += f"SPY-TLT correlation of daily returns, last {CORRELATION_WINDOW} sessions: {corr:.3f}\n"
+    return text
 
 
 ROLES: dict[str, Role] = {
