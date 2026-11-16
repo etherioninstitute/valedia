@@ -403,3 +403,18 @@ which already carries one stop of 22 minutes 18 seconds: at the expected length 
 its count needs, and at the limit the stops come to 6 hours 7 minutes (25.5%). Each day's own count decides. The
 exact times are added below afterwards. If the run's preparation fails before the collector is touched, this stop
 does not take place, and that is said here.
+
+## The times of the second stop of 16 November (written at 05:26 UTC on 16 November, after the stop; no answer has been scored)
+
+The stop lasted 1 hour 43 minutes 57 seconds: the collector was stopped at 03:31:33 UTC and started again at
+05:15:30 UTC on 16 November, its last heartbeat before the stop at 03:31:07 and its first new one at 05:16:07; the
+store holds its own stop event at 03:31:33 and its start event at 05:15:31. The run made every one of its model calls
+and ended by itself, 4 hours 1 minute inside the limit. With the earlier stop, the stops of 16 November (UTC) so far
+come to 2 hours 6 minutes 15 seconds, 8.8% of that day's slots. The count of decisions not ok is unchanged at 71.
+
+A cost the declarations have not counted: after a stop of this length the collector chooses its markets afresh
+(20 watched by 05:19), and by its own rule a market decides only after 30 minutes of unbroken snapshots. So decisions
+at the usual rate are not expected before about 05:48 UTC; in the first ten minutes after the restart two decisions
+were made (slots 05:19 and 05:24), both ok. The stop of 22 minutes earlier the same day did not have this cost
+(decisions resumed in the first minute). A later declaration of a long stop counts the half hour after it as well.
+A later run of this kind is declared here before it happens.
