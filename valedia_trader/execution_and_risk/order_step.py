@@ -195,7 +195,8 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
    are replayed from the ledger's durable records (`OrderLedger.average_writes`), so a verdict never depends on the
    order's average at journal time, on which run died, or on an equal value seen before. A priced fill row's line
    judges the average after its own row; an `avg_restated` notice's line judges its own `new`; a `piece_unpriced`
-   notice's row's fill line judges that notice's figure (the notice line has no verdict); a row whose units the
+   notice that came with a row of its own is judged by that row's fill line (the notice line has no verdict), and
+   one that came with no row of its own is judged by its own line, on its own `new`; a row whose units the
    venue gave no average for is `unjudged` until a later write prices them, then settles naming that write
    (`covered_by`); an old figure is never judged again. Each such line carries `judged_avg`, the figure judged. When
    the replay does not reproduce the order's stored figures, a fill line is judged on the stored average and says
@@ -209,11 +210,12 @@ What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-l
    run (after its scan) until a later read settles it with a `verdict` line ({"ref", "verdict", "covered_by",
    "judged_avg"}). A fill line without a `verdict` (written before T34b-3) is never carried or judged again.
  - `notices`, the sorted kinds of the ledger notices this run journaled (one `notice` line each: notice_id, kind, tag,
-   old and new figures, and for an `avg_restated` its verdict and `judged_avg`), only when not empty; never a
-   fault.
+   old and new figures, and for an `avg_restated`, or a `piece_unpriced` that came with no row of its own, its
+   verdict and `judged_avg`), only when not empty; never a fault.
  - stage `venue_read` (a skipped session for the ladder) instead of `reconcile` when the run stops at the reconcile
    only because the venue could not be read: the positions read raised in the second reconcile; every unresolved entry
-   of both reconciles is a status that could not be read of an order the ledger holds as accepted or partly filled;
+   of both reconciles is a status that could not be read of an order the ledger holds, and each of the second
+   reconcile's is of an order the ledger holds as accepted or partly filled;
    every order still open after the cancels is one of them; the first reconcile's positions error, if any, is the
    same; no order is sent or unknown; no anomaly or position difference in either reconcile; no blocking attention item
    open or opened in this run; no local failure. Anything else stays `reconcile`. Nothing is sent either way. A failure while they are worked out is the run's own: it
@@ -306,7 +308,6 @@ TICKET_UNITS_SAME = 1e-9                          # fractional units: the same w
 LIMIT_SAME = 1e-6                                 # T34b-2 F3 (iii): an order's average at its limit within this part of it
 LIMIT_EDGE = 1.0 + 1e-9                           # ... the edge itself included on both sides, whatever the rounding
 VERDICTS = ("ok", "breach", "unjudged")           # T34b-3 (D): the verdict a fill line or a notice line carries
-AVERAGE_NOTICE_KINDS = frozenset({"avg_restated", "piece_unpriced"})   # ... the notices that change an order's average
 OPEN_AT_VENUE = ("accepted", "partly_filled")     # T34b-2 E2: an order of the ledger still working at the venue
 WRONG_NUMBERS_MAX = 3                             # refused approvals in a New York day that lock approval
 TICKET_UNWRITABLE = ("the ticket file cannot be written, so no approval can be judged or recorded; nothing is sent")

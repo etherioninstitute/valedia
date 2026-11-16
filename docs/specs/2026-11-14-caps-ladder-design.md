@@ -66,7 +66,8 @@ The function also returns the list of changes, each with its day and its reason 
 - for the ladder's own ticket: what a fill that stays in `cap_unjudged` run after run (a broker that never reports its average) should mean to the ladder;
 - a cancel that loses a race, reported cancelled and then filled: a late amount in another state, then a changed state on every poll for three days;
 - a late fill on an order cancelled with nothing confirmed, which is never rechecked: a position difference;
-- an honest correction of a trade price by more than a cent: a blocking anomaly for up to three days.
+- an honest correction of a trade price by more than a cent: a blocking anomaly for up to three days;
+- a late amount that first becomes readable after the ledger's 72-hour recheck window: a lasting position difference (`reconcile`).
 
 **Known real-fault gaps still open (T34b-3, listed, not fixed).** Each can let a real fault go unrecorded:
 - the broker adapter raises one class of error for an outage and for an ANSWER (an order that is not there, positions in a shape it cannot read), so a day with both is a skipped day (`venue_read`; no order is sent on it);
