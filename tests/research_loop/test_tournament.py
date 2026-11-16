@@ -1,9 +1,14 @@
+import hashlib
 import json
+import sqlite3
+from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from valedia_trader.agents import panel as panel_mod
 from valedia_trader.agents.panel import CallableMember
 from valedia_trader.research_loop import tournament as tm
 
@@ -88,7 +93,9 @@ def _play(tmp_path, forecasters, weeks=60):
     by_thesis_facts = {json.dumps(q["facts"], sort_keys=True): q["id"] for q in led.questions()}
     members = [CallableMember(name, "decider", (lambda fn: lambda case: (fn(truth[by_thesis_facts[json.dumps(case["facts"], sort_keys=True)]], case), None, ""))(fn))
                for name, fn in forecasters.items()]
-    tm.ask(led, members)
+    # these blind questions (2024 on) all come after each test model's release, so the scores are evidence
+    tm.ask(led, members, roster={"members": [{"name": name, "role": "decider", "model_label": f"test-{name}", "unseen_after": "2000-01-01"}
+                                             for name in forecasters]})
     tm.settle_directions(led, px)
     return tm.scores(led, min_settled=30), led
 
@@ -580,3 +587,262 @@ def test_ask_forward_without_the_flag_prints_what_it_printed_and_asks_the_backlo
 def test_only_forward_is_not_an_option_of_ask_blind(tmp_path):
     with pytest.raises(SystemExit):
         tm.main(["--root", str(tmp_path), "ask-blind", "--data", "x", "--market", "funds", "--only-forward"])
+
+
+# ---- which model answered, and whether it may remember the dates it was asked about --------------------------------
+
+OLD_SCHEMA = (                                     # the tables exactly as the tournament created them before T40-A1
+    "CREATE TABLE IF NOT EXISTS questions (id TEXT PRIMARY KEY, market TEXT, kind TEXT, asked_on TEXT, horizon INTEGER, "
+    "symbol TEXT, thesis TEXT, facts TEXT, baseline REAL);"
+    "CREATE TABLE IF NOT EXISTS forecasts (question_id TEXT, forecaster TEXT, probability REAL, error TEXT, latency_ms REAL, "
+    "ts REAL, PRIMARY KEY (question_id, forecaster));"
+    "CREATE TABLE IF NOT EXISTS outcomes (question_id TEXT PRIMARY KEY, outcome INTEGER, settled_ts REAL);")
+PROMPT_SHA = hashlib.sha1(panel_mod.PROMPT.encode()).hexdigest()[:12]
+NOT_EVIDENCE = "not evidence: the model may remember these dates"
+SKILL_WORDS = ("beats", "better than")
+
+
+def _old_file(path):
+    """An old-schema tournament file: blind and forward questions, a model and a rule forecaster, all settled."""
+    db = sqlite3.connect(path)
+    db.executescript(OLD_SCHEMA)
+    day0 = pd.Timestamp("2024-01-01")
+    for k in range(12):
+        kind = "forward" if k % 3 == 0 else "blind history"
+        db.execute("INSERT INTO questions VALUES (?,?,?,?,?,?,?,?,?)",
+                   (f"q{k}", "funds", kind, str((day0 + pd.Timedelta(days=7 * k)).date()), 5, "AAA", "t", "{}", 0.5))
+        for who, p in (("old-model", 0.7), ("rule-momentum", 0.6)):
+            db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{k}", who, p, None, 1.0, 1700000000.0 + k))
+        db.execute("INSERT INTO outcomes VALUES (?,?,?)", (f"q{k}", k % 2, 1700000000.0 + k))
+    db.commit()
+    db.close()
+
+
+def _columns(path):
+    db = sqlite3.connect(path)
+    try:
+        return [r[1] for r in db.execute("PRAGMA table_info(forecasts)")], db.execute("PRAGMA schema_version").fetchone()[0]
+    finally:
+        db.close()
+
+
+def _sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_an_old_file_gains_the_three_columns_once_on_a_writable_open(tmp_path):
+    path = tmp_path / "t.sqlite"
+    _old_file(path)
+    before, _ = _columns(path)
+    assert before == ["question_id", "forecaster", "probability", "error", "latency_ms", "ts"]
+    tm.TournamentLedger(path).close()
+    after, version = _columns(path)
+    assert after == before + ["model", "unseen_after", "prompt_sha"]
+    digest = _sha(path)
+    led = tm.TournamentLedger(path)                                   # a second open changes nothing
+    rows = led._db.execute("SELECT * FROM forecasts ORDER BY question_id, forecaster").fetchall()
+    led.close()
+    assert _columns(path) == (after, version) and _sha(path) == digest
+    assert len(rows) == 24 and all(r["model"] is None and r["unseen_after"] is None and r["prompt_sha"] is None for r in rows)
+    assert {(r["forecaster"], r["probability"]) for r in rows} == {("old-model", 0.7), ("rule-momentum", 0.6)}
+
+
+def test_a_read_only_open_of_an_old_file_is_scored_without_a_schema_change(tmp_path):
+    path = tmp_path / "t.sqlite"
+    _old_file(path)
+    digest, files = _sha(path), sorted(p.name for p in tmp_path.iterdir())
+    led = object.__new__(tm.TournamentLedger)                           # as the owner page opens it
+    led._db = sqlite3.connect("file:" + str(path) + "?mode=ro", uri=True)
+    led._db.row_factory = sqlite3.Row
+    try:
+        out = tm.scores(led, min_settled=1)
+        counts = led.counts()
+    finally:
+        led._db.close()
+    assert _sha(path) == digest and sorted(p.name for p in tmp_path.iterdir()) == files
+    assert counts["questions"] == 12 and counts["answers"] == {"old-model": 12, "rule-momentum": 12}
+    got = {(r["forecaster"], r["kind"]): (r["model"], r["prompt_sha"], r["memory"], r["settled"]) for r in out}
+    assert got == {("old-model", "forward"): (None, None, "asked live", 4), ("old-model", "blind history"): (None, None, "may be remembered", 8),
+                   ("rule-momentum", "forward"): (None, None, "asked live", 4),
+                   ("rule-momentum", "blind history"): (None, None, "may be remembered", 8)}   # no model recorded: not "no memory"
+    assert all(r["verdict"] == NOT_EVIDENCE for r in out if r["memory"] == "may be remembered")
+
+
+@pytest.mark.parametrize("kind, model, unseen_after, asked_on, memory", [
+    ("forward", "m", None, "2025-07-01", "asked live"),
+    ("forward", None, None, "2020-01-06", "asked live"),
+    ("blind history", "rule", None, "2020-01-06", "no memory"),
+    ("blind history", "m", "2025-06-30", "2025-07-01", "after release"),
+    ("blind history", "m", "2025-06-30", "2025-06-30", "may be remembered"),     # the release day itself is not after it
+    ("blind history", "m", "2025-06-30", "2025-06-27", "may be remembered"),
+    ("blind history", "m", None, "2025-07-01", "may be remembered"),
+    ("blind history", None, None, "2025-07-01", "may be remembered"),
+    ("blind history", None, "2025-06-30", "2025-07-01", "after release"),
+    ("blind history", "m", "not a date", "2025-07-01", "may be remembered"),
+])
+def test_each_scored_row_has_the_memory_class_the_rules_give(kind, model, unseen_after, asked_on, memory):
+    led = tm.TournamentLedger()
+    led.add([tm.Question("q", "funds", kind, asked_on, 5, "AAA", "t", {}, 0.5)])
+    led.record("q", "who", 0.7, None, 1.0, model=model, unseen_after=unseen_after, prompt_sha=PROMPT_SHA)
+    led.settle("q", 1)
+    (row,) = tm.scores(led, min_settled=1)
+    led.close()
+    assert (row["model"], row["prompt_sha"], row["memory"]) == (model, PROMPT_SHA, memory)
+    assert (row["verdict"] == NOT_EVIDENCE) == (memory == "may be remembered")
+
+
+def _expected_memory(kind, model, unseen_after, asked_on):
+    """The memory rules written out again here, independently of the code under test."""
+    if kind == "forward":
+        return "asked live"
+    if model == "rule":
+        return "no memory"
+    if unseen_after is not None and pd.Timestamp(asked_on).date() > pd.Timestamp(unseen_after).date():
+        return "after release"
+    return "may be remembered"
+
+
+def _pooling_ledger(module, seed):
+    """Two models under one forecaster name, two prompts, questions on both sides of (and on) the release day,
+    two markets, both kinds, a rule, failed calls and unsettled questions."""
+    rng = np.random.default_rng(seed)
+    led = module.TournamentLedger()
+    release = "2024-07-01"
+    for k in range(int(rng.integers(30, 120))):
+        day = release if rng.random() < 0.1 else str((pd.Timestamp("2024-01-01") + pd.Timedelta(days=int(rng.integers(0, 366)))).date())
+        led.add([module.Question(f"q{k:03d}", ["funds", "stocks"][int(rng.integers(0, 2))], KINDS_FOR_TESTS[int(rng.integers(0, 2))], day,
+                                 5, "AAA", "t", {}, float(rng.uniform(0.3, 0.7)))])
+        for who in ("x", "y", "rule-momentum"):
+            if rng.random() < 0.15:
+                continue
+            if who == "rule-momentum":
+                model, unseen, sha = "rule", None, PROMPT_SHA
+            else:
+                model = [f"{who}-model-a", f"{who}-model-b", None][int(rng.integers(0, 3))]
+                unseen = [release, None][int(rng.integers(0, 2))]
+                sha = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", None][int(rng.integers(0, 3))]
+            failed = rng.random() < 0.1
+            led.record(f"q{k:03d}", who, None if failed else float(rng.uniform(0, 1)), "failed" if failed else None, 1.0,
+                       model=model, unseen_after=unseen, prompt_sha=sha)
+        if rng.random() < 0.85:
+            led.settle(f"q{k:03d}", int(rng.integers(0, 2)))
+    return led
+
+
+def pooling_violations(module, seeds=range(60)) -> list:
+    """Every way `module.scores` pools rows it must keep apart, over seeded random ledgers (empty when none)."""
+    bad = []
+    for seed in seeds:
+        led = _pooling_ledger(module, seed)
+        raw = led._db.execute(
+            "SELECT f.forecaster, f.model, f.unseen_after, f.prompt_sha, q.market, q.kind, q.asked_on FROM forecasts f "
+            "JOIN questions q ON q.id = f.question_id JOIN outcomes o ON o.question_id = q.id "
+            "WHERE f.error IS NULL AND f.probability IS NOT NULL").fetchall()
+        want = Counter((r[0], r[1], r[3], r[4], r[5], _expected_memory(r[5], r[1], r[2], r[6])) for r in raw)
+        out = module.scores(led, min_settled=1)
+        led.close()
+        got = Counter()
+        for r in out:
+            key = (r["forecaster"], r.get("model"), r.get("prompt_sha"), r["market"], r["kind"], r.get("memory"))
+            got[key] += r["settled"]
+            if r["settled"] != want.get(key):
+                bad.append((seed, key, r["settled"], want.get(key)))
+        if got != want or sum(r["settled"] for r in out) != len(raw) or len(out) != len(want):
+            bad.append((seed, "totals", sum(r["settled"] for r in out), len(raw)))
+    return bad
+
+
+def test_no_row_of_the_scores_pools_two_models_two_prompts_or_two_memory_classes():
+    assert pooling_violations(tm) == []
+
+
+def test_the_scores_come_out_in_the_same_order_whatever_order_the_rows_were_stored():
+    led = _pooling_ledger(tm, 7)
+    first = json.dumps(tm.scores(led, min_settled=1), sort_keys=True)
+    rows = led._db.execute("SELECT * FROM forecasts").fetchall()
+    led._db.execute("DELETE FROM forecasts")
+    for r in reversed(rows):
+        led._db.execute("INSERT INTO forecasts (question_id, forecaster, probability, error, latency_ms, ts, model, unseen_after, prompt_sha) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", tuple(r[k] for k in ("question_id", "forecaster", "probability", "error",
+                                                                            "latency_ms", "ts", "model", "unseen_after", "prompt_sha")))
+    again = json.dumps(tm.scores(led, min_settled=1), sort_keys=True)
+    led.close()
+    assert first == again and '"memory"' in first
+
+
+@pytest.mark.parametrize("n", [5, 40, 120])
+def test_a_perfect_forecaster_that_may_remember_the_dates_is_never_reported_as_skill(n):
+    outcomes = _mixed(n, seed=n)
+    def filled(unseen_after):
+        led = tm.TournamentLedger()
+        day0 = pd.Timestamp("2024-01-01")
+        for k, y in enumerate(outcomes):
+            led.add([tm.Question(f"q{k}", "funds", "blind history", str((day0 + pd.Timedelta(days=7 * k)).date()), 5, "AAA", "t", {}, 0.5)])
+            led.record(f"q{k}", "oracle", float(y), None, 1.0, model="m", unseen_after=unseen_after, prompt_sha=PROMPT_SHA)
+            led.settle(f"q{k}", y)
+        (row,) = tm.scores(led, min_settled=30)
+        led.close()
+        return row
+    remembered = filled(None)
+    assert remembered["memory"] == "may be remembered" and remembered["verdict"] == NOT_EVIDENCE
+    assert not any(w in remembered["verdict"] + remembered["ranking_verdict"] for w in SKILL_WORDS)
+    assert remembered["skill"] == pytest.approx(1.0) and remembered["brier"] == 0.0 and remembered["settled"] == n
+    unseen = filled("2023-12-31")                                       # the same answers, all after release
+    assert unseen["memory"] == "after release" and unseen["skill"] == remembered["skill"] and unseen["t_by_week"] == remembered["t_by_week"]
+    if n >= 30:
+        assert unseen["verdict"] == "beats the baseline" and unseen["ranking_verdict"] == "ranks better than chance"
+
+
+def test_ask_records_the_rosters_model_and_date_and_rule_for_a_rule():
+    roster = {"members": [
+        {"name": "chatty", "role": "decider", "backend": "chat", "base_url": "http://127.0.0.1:9/v1", "model": "qwen3:8b",
+         "model_label": None, "unseen_after": None, "unseen_after_source": None},
+        {"name": "labelled", "role": "decider", "backend": "chat", "base_url": "http://127.0.0.1:9/v1", "model": "qwen3:8b",
+         "model_label": "qwen3:8b@500a1f067a9f", "unseen_after": "2025-04-29", "unseen_after_source": "a release note"},
+        {"name": "profiled", "role": "decider", "backend": "hermes", "profile": "p", "model_label": None, "unseen_after": None,
+         "unseen_after_source": None}]}
+    led = tm.TournamentLedger()
+    led.add([tm.Question("q", "funds", "blind history", "2025-07-01", 5, "AAA", "t", {}, 0.5)])
+    members = [CallableMember(n, "decider", lambda case: (0.6, None, "")) for n in ("chatty", "labelled", "profiled", "stranger")]
+    tm.ask(led, members + tm.reference_forecasters(), roster=roster)
+    got = {r[0]: tuple(r[1:]) for r in led._db.execute("SELECT forecaster, model, unseen_after, prompt_sha FROM forecasts")}
+    led.settle("q", 1)
+    memory = {r["forecaster"]: r["memory"] for r in tm.scores(led, min_settled=1)}
+    led.close()
+    assert got == {"chatty": ("qwen3:8b", None, PROMPT_SHA), "labelled": ("qwen3:8b@500a1f067a9f", "2025-04-29", PROMPT_SHA),
+                   "profiled": (None, None, PROMPT_SHA), "stranger": (None, None, PROMPT_SHA),
+                   "rule-momentum": ("rule", None, PROMPT_SHA), "rule-above-200d": ("rule", None, PROMPT_SHA)}
+    assert memory == {"chatty": "may be remembered", "labelled": "after release", "profiled": "may be remembered",
+                      "stranger": "may be remembered", "rule-momentum": "no memory", "rule-above-200d": "no memory"}
+
+
+def test_ask_without_a_roster_reads_the_panels_own_roster():
+    led = tm.TournamentLedger()
+    led.add([tm.Question("q", "funds", "forward", "2025-07-01", 5, "AAA", "t", {}, 0.5)])
+    spec = {s["name"]: s for s in panel_mod.load_roster()["members"]}["qwen3-8b"]
+    tm.ask(led, [CallableMember("qwen3-8b", "decider", lambda case: (0.6, None, ""))])
+    got = tuple(led._db.execute("SELECT model, unseen_after, prompt_sha FROM forecasts").fetchone())
+    led.close()
+    assert got == (spec.get("model_label") or spec["model"], spec.get("unseen_after"), PROMPT_SHA)
+
+
+def test_the_roster_carries_the_three_fields_unset_and_still_builds_a_panel():
+    roster = panel_mod.load_roster()
+    for spec in roster["members"]:
+        assert {"model_label", "unseen_after", "unseen_after_source"} <= set(spec), spec["name"]
+        assert spec["unseen_after"] is None and spec["unseen_after_source"] is None     # no date is guessed here
+    assert "unseen_after" in roster["notes"] and "model_label" in roster["notes"]
+    assert len(panel_mod.build_panel(roster).members) == sum(1 for s in roster["members"] if s.get("enabled", True))
+    assert [m.name for m in tm.forecasters(roster=roster)] == [s["name"] for s in roster["members"]
+                                                               if s["role"] == "decider" and s.get("enabled", True)]
+
+
+def test_the_price_models_view_of_the_ledger_still_records_the_rules(tmp_path):
+    from valedia_trader.research_loop.price_models import _Only
+    led = tm.TournamentLedger(tmp_path / "t.sqlite")
+    led.add([tm.Question(f"q{k}", "funds", "blind history", "2025-07-01", 5, "AAA", "t", {}, 0.5) for k in range(3)])
+    out = tm.ask(_Only(led, {"q0", "q2"}), tm.reference_forecasters())
+    rows = led._db.execute("SELECT question_id, forecaster, model, prompt_sha FROM forecasts ORDER BY 1, 2").fetchall()
+    led.close()
+    assert out == {"rule-momentum": {"asked": 2, "answered": 2}, "rule-above-200d": {"asked": 2, "answered": 2}}
+    assert [tuple(r) for r in rows] == [(q, w, "rule", PROMPT_SHA) for q in ("q0", "q2") for w in ("rule-above-200d", "rule-momentum")]

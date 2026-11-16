@@ -399,6 +399,47 @@ def test_forecasters_is_the_tournaments_own_leaderboard(world):
     assert "nimble-v3" in text and "base-rule" in text and "12" in text
 
 
+def forecasters_html(world):
+    page = world.html()
+    start = page.index(">Forecasters</h2>")
+    return page[start:page.index("</section>", start)]
+
+
+def test_the_forecasters_table_shows_which_model_answered_and_what_it_may_remember(world):
+    part = forecasters_html(world)
+    assert re.findall(r"<th>(.*?)</th>", part) == ["Forecaster", "Model", "Market", "Kind", "Memory", "Settled", "Brier",
+                                                   "Baseline Brier", "Skill", "Verdict"]
+    text = world.page().sections["Forecasters"]
+    assert text.count("not recorded") == 3 and text.count("asked live") == 3      # recorded without a model, forward questions
+
+
+OLD_TOURNAMENT_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS questions (id TEXT PRIMARY KEY, market TEXT, kind TEXT, asked_on TEXT, horizon INTEGER, "
+    "symbol TEXT, thesis TEXT, facts TEXT, baseline REAL);"
+    "CREATE TABLE IF NOT EXISTS forecasts (question_id TEXT, forecaster TEXT, probability REAL, error TEXT, latency_ms REAL, "
+    "ts REAL, PRIMARY KEY (question_id, forecaster));"
+    "CREATE TABLE IF NOT EXISTS outcomes (question_id TEXT PRIMARY KEY, outcome INTEGER, settled_ts REAL);")
+
+
+def test_the_forecasters_table_renders_an_old_tournament_file_and_leaves_it_alone(world):
+    path = world.root / "memory" / "tournament.sqlite"
+    path.unlink()
+    db = sqlite3.connect(path)
+    db.executescript(OLD_TOURNAMENT_SCHEMA)
+    for i in range(12):
+        kind = "forward" if i < 4 else "blind history"
+        db.execute("INSERT INTO questions VALUES (?,?,?,?,?,?,?,?,?)", (f"q{i}", "funds", kind, f"2026-10-{i + 1:02d}", 5, "SPY", "t", "{}", 0.6))
+        db.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?)", (f"q{i}", "nimble-v3", 0.7, None, 10.0, NOW - 3600))
+        db.execute("INSERT INTO outcomes VALUES (?,?,?)", (f"q{i}", i % 2, NOW - 3600))
+    db.commit()
+    db.close()
+    digest, files = hashlib.sha256(path.read_bytes()).hexdigest(), sorted(p.name for p in path.parent.iterdir() if p.name.startswith("tournament"))
+    text = world.page().sections["Forecasters"]
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest and sorted(p.name for p in path.parent.iterdir() if p.name.startswith("tournament")) == files
+    assert "12 questions asked, 12 settled" in text and "asked live" in text and "may be remembered" in text
+    assert "not evidence: the model may remember these dates" in text and "unavailable" not in text.lower()
+
+
 def test_tax_section_says_unavailable_and_why(world):
     text = world.page().sections["Tax so far"]
     assert "unavailable" in text.lower() and "the tax ledger could not take a fill" in text
