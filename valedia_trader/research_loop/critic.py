@@ -55,6 +55,15 @@ def _backtest_simple_annual(bt: dict) -> tuple[float | None, float | None]:
     return values[0] * values[1], values[1]
 
 
+def _backtest_figures(r: dict) -> str:
+    """The backtest's annual figures, each with its basis: the simple one is comparable with paper's annual figure, the compound
+    one is not. Without a simple figure only the compound one is printed."""
+    compound = f"{_fmt(r['backtest_annual_return'])} a year (compound)"
+    if r.get("backtest_simple_annual") is None:
+        return compound
+    return f"{_fmt(r['backtest_simple_annual'])} a year (average daily return times 252, comparable with paper's annual figure), {compound}"
+
+
 def panel_scorecard(entries: list[dict]) -> dict | None:
     """How the decision panel's verdicts have turned out, from the journal alone. None until a case is settled."""
     verdict = {}
@@ -277,7 +286,7 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         result = {"days": n, "week_return": float(np.prod(1.0 + in_week) - 1.0) if len(in_week) else float("nan"),
                   "total_return": live_total, "annualised_return": live_annual, "max_drawdown": live_dd,
                   "closed_trades": len(closed), "trade_win_rate": win, "z_vs_backtest": z,
-                  "backtest_annual_return": bt_mu, "backtest_max_drawdown": bt.get("max_drawdown"),
+                  "backtest_annual_return": bt_mu, "backtest_simple_annual": bt_simple, "backtest_max_drawdown": bt.get("max_drawdown"),
                   "predicted_annual_return": prediction.get("annual_return"), "predicted_win_rate": prediction.get("win_rate")}
         n_kept, total_kept, z_kept = len(kept), float(np.prod(1.0 + kept) - 1.0) if len(kept) else float("nan"), float("nan")
         if n_kept >= 2 and bt_simple is not None and bt_sd:
@@ -362,7 +371,7 @@ def weekly_review(ledger: HypothesisLedger, journal: Journal, as_of, strategies:
         lines += [f"### {name} ({r['status']})", "",
                   f"- Paper: {_fmt(r['week_return'])} this week, {_fmt(r['total_return'])} over {r['days']} days, "
                   f"worst drawdown {r['max_drawdown']:.1%}, {r['closed_trades']} closed trades",
-                  f"- Backtest: {_fmt(r['backtest_annual_return'])} a year; prediction: {_fmt(r['predicted_annual_return'])} a year"]
+                  f"- Backtest: {_backtest_figures(r)}; prediction: {_fmt(r['predicted_annual_return'])} a year"]
         lines += [f"- {n}" for n in item["notes"]] + [""]
     account_notes = [t for hid, t in findings if hid is None]
     lines += ["## Account and kill switch", ""] + ([f"- {t}" for t in account_notes] or ["- Nothing to report."]) + [""]

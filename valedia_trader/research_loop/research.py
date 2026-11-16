@@ -92,9 +92,13 @@ _PRICE = {k: v.window for k, v in PRICE_COLUMNS.items()}
 _PRICE_BASE = {k: v.baseline_window for k, v in PRICE_COLUMNS.items()}
 
 
-def _legend(defs: dict[str, ColumnDef], columns) -> str:
+_PAIR_SESSION = "For a pair, a session is a day on which both funds have a price."
+
+
+def _legend(defs: dict[str, ColumnDef], columns, note: str = "") -> str:
     """The text that goes above a table: how to read the values, then one line per column the table has. A column with no
-    definition is refused, so a new column cannot reach a prompt unlabelled. No columns, no legend."""
+    definition is refused, so a new column cannot reach a prompt unlabelled. No columns, no legend. `note` is one more sentence for
+    the paragraph above the columns."""
     columns = list(columns)
     unknown = [c for c in columns if c not in defs]
     if unknown:
@@ -103,7 +107,7 @@ def _legend(defs: dict[str, ColumnDef], columns) -> str:
         return ""
     lines = [f"How to read the table below. Values are fractions unless the unit says otherwise (0.052 means 5.2%). Windows count "
              f"trading sessions of this data (1m = 21 sessions, 3m = 63, 12m and 1y = {SESSIONS_PER_YEAR}). Annual figures use "
-             f"{SESSIONS_PER_YEAR} sessions a year. Values are rounded to 3 decimals. Columns:"]
+             f"{SESSIONS_PER_YEAR} sessions a year. Values are rounded to 3 decimals. " + (note + " " if note else "") + "Columns:"]
     for name in columns:
         d = defs[name]
         span = f"window {d.window} sessions" + (f", baseline {d.baseline_window} sessions" if d.baseline_window else "")
@@ -168,7 +172,7 @@ def macro_table(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None = None)
                                             "chg_12m": ratio.iloc[-1] / ratio.iloc[-1 - c12] - 1,
                                             "vs_200d_avg": ratio.iloc[-1] / ratio.tail(avg).mean() - 1}
     out = pd.DataFrame(rows).T
-    text = _legend(MACRO_COLUMNS, out.columns) + _fmt(out)
+    text = _legend(MACRO_COLUMNS, out.columns, _PAIR_SESSION) + _fmt(out)
     r = prices.pct_change()
     if "SPY" in r and "TLT" in r:
         corr = r["SPY"].tail(CORRELATION_WINDOW).corr(r["TLT"].tail(CORRELATION_WINDOW))
