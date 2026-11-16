@@ -26,9 +26,11 @@ A model remembers what markets did before it was trained, and a blind question h
 every answer records which model gave it (the panel roster's `model_label`, else its `model`; "rule" for a rule),
 the date after which that model certainly cannot have seen a market (the roster's `unseen_after`; none means
 nothing is certainly unseen) and a fingerprint of the prompt. Each score row is one forecaster, one model, one
-prompt, one market, one kind and one memory class: "asked live" (a forward question), "no memory" (a rule),
-"after release" (a blind question dated after `unseen_after`) or "may be remembered" (every other blind
-question, every old answer with no model recorded among them), which is never evidence of skill.
+prompt, one market, one kind and one memory class: "asked live" (a forward question answered within
+MAX_LIVE_AGE_DAYS of its day), "answered late" (a forward question answered later, when the outcome may have
+existed), "no memory" (a rule), "after release" (a blind question dated after `unseen_after`) or "may be
+remembered" (every other blind question, every old answer with no model recorded among them). Neither "answered
+late" nor "may be remembered" is ever evidence of skill.
 
     python -m valedia_trader.research_loop.tournament refresh --universe stocks       (or crypto: see universes.json)
     python -m valedia_trader.research_loop.tournament ask-blind --data artifacts/data --market funds --count 300
@@ -46,7 +48,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -67,14 +69,31 @@ HIDDEN_WHEN_BLIND = ("symbol", "as_of", "data_age_days")
 KINDS = ("forward", "blind history")
 IDENTITY_COLUMNS = ("model", "unseen_after", "prompt_sha")        # added to an old file on a writable open
 RULE_MODEL = "rule"                                             # the model of a forecaster that is not a trained model
-MEMORY_CLASSES = ("asked live", "no memory", "after release", "may be remembered")
+MEMORY_CLASSES = ("asked live", "answered late", "no memory", "after release", "may be remembered")
 NOT_EVIDENCE = "not evidence: the model may remember these dates"
+LATE_NOT_EVIDENCE = "not evidence: answered after the question was fresh"
+# A forward answer is "asked live" only when given at most this many calendar days (UTC) after its question's day.
+# It is the same constant as `ask`'s default `max_age_days`, the age after which `ask` stops putting a forward
+# question, so the two cannot drift apart: what `ask` still puts as fresh is what the scores still call live.
+MAX_LIVE_AGE_DAYS = 3
 GROUP_KEYS = ("forecaster", "model", "prompt_sha", "market", "kind", "memory")
 
 
 def prompt_sha() -> str:
     """The first 12 hex characters of the SHA-1 of the panel's prompt."""
     return hashlib.sha1(panel_mod.PROMPT.encode()).hexdigest()[:12]
+
+
+def prompt_fingerprint(member: panel_mod.Member) -> str:
+    """The fingerprint of the request this member really sends. ChatMember and HermesProfileMember (exactly those
+    classes, not a subclass) format `panel.PROMPT`, so they carry its SHA-1; a rule forecaster records "rule";
+    any other class (SystemOneMember builds its request inside `_ask`, a CallableMember runs any function) has no
+    template that can be hashed and records "unknown:<ClassName>"."""
+    if getattr(member, "_tournament_rule", False) is True:
+        return RULE_MODEL
+    if type(member) in (panel_mod.ChatMember, panel_mod.HermesProfileMember):
+        return prompt_sha()
+    return f"unknown:{type(member).__name__}"
 
 
 def _iso_day(text) -> date | None:
@@ -90,11 +109,23 @@ def _iso_day(text) -> date | None:
         return None
 
 
-def memory_class(kind: str, model: str | None, unseen_after: str | None, asked_on: str) -> str:
+def _answered_late(asked_on: str, answered_ts) -> bool:
+    """True unless the answer's own time (a UTC date) is at most MAX_LIVE_AGE_DAYS after the question's day."""
+    day = _iso_day(asked_on)
+    try:
+        ts = float(answered_ts)
+        answered = datetime.fromtimestamp(ts, timezone.utc).date() if math.isfinite(ts) else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        answered = None
+    return day is None or answered is None or (answered - day).days > MAX_LIVE_AGE_DAYS
+
+
+def memory_class(kind: str, model: str | None, unseen_after: str | None, asked_on: str, answered_ts) -> str:
     """What the forecaster may have known of the outcome: one of MEMORY_CLASSES. Anything unreadable is
-    "may be remembered", and so is a blind question asked on the release day itself."""
+    "may be remembered" (blind) or "answered late" (forward), and so is a blind question asked on the release
+    day itself."""
     if kind == "forward":
-        return "asked live"
+        return "answered late" if _answered_late(asked_on, answered_ts) else "asked live"
     if kind != "blind history":
         return "may be remembered"
     if model == RULE_MODEL:
@@ -243,7 +274,7 @@ class TournamentLedger:
         have = _forecast_columns(self._db)
         ident = ", ".join(f"f.{c}" if c in have else f"NULL AS {c}" for c in IDENTITY_COLUMNS)
         return [dict(r) for r in self._db.execute(
-            f"SELECT f.forecaster, {ident}, f.probability, q.market, q.kind, q.asked_on, q.baseline, o.outcome FROM forecasts f "
+            f"SELECT f.forecaster, {ident}, f.ts AS answered_ts, f.probability, q.market, q.kind, q.asked_on, q.baseline, o.outcome FROM forecasts f "
             "JOIN questions q ON q.id = f.question_id JOIN outcomes o ON o.question_id = q.id "
             "WHERE f.error IS NULL AND f.probability IS NOT NULL ORDER BY q.asked_on, q.id, f.forecaster")]
 
@@ -288,7 +319,7 @@ def _identity(member: panel_mod.Member, specs: dict[str, dict]) -> tuple[str | N
     return None, None
 
 
-def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=None, max_age_days: int = 3,
+def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=None, max_age_days: int = MAX_LIVE_AGE_DAYS,
         limit: int | None = None, progress=None, kinds: Sequence[str] | None = None,
         roster: dict | None = None) -> dict[str, dict[str, int]]:
     """Put every question a forecaster has not answered to it. A forecaster sees the thesis and the
@@ -301,7 +332,8 @@ def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=Non
     rule and before `limit`; an unknown kind is a ValueError, raised before any forecaster is asked.
 
     Each answer records the model and `unseen_after` of the roster entry of the forecaster's name (`roster`,
-    default the panel roster), "rule" for a rule forecaster, and the prompt's fingerprint."""
+    default the panel roster), "rule" for a rule forecaster, and the fingerprint of the request the member
+    really sends (`prompt_fingerprint`)."""
     if kinds is not None:
         kinds = (kinds,) if isinstance(kinds, str) else tuple(kinds)
         unknown = [k for k in kinds if k not in KINDS]
@@ -309,9 +341,9 @@ def ask(ledger: TournamentLedger, members: Sequence[panel_mod.Member], today=Non
             raise ValueError(f"unknown question kind {unknown[0]!r}; the kinds are {', '.join(KINDS)}")
     specs = {s["name"]: s for s in (panel_mod.load_roster() if roster is None else roster).get("members", [])}
     identities = [_identity(m, specs) for m in members]             # a bad roster entry fails before anyone is asked
-    sha = prompt_sha()
     out = {}
     for m, (model, unseen_after) in zip(members, identities):
+        sha = prompt_fingerprint(m)
         have = ledger.answered(m.name)
         todo = [q for q in ledger.questions() if q["id"] not in have and (kinds is None or q["kind"] in kinds)]
         if today is not None:
@@ -435,11 +467,11 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
 
     A row is one forecaster, model, prompt, market, kind and memory class (GROUP_KEYS): two models under one
     name, two prompts, or a question the model may remember and one it cannot have seen are never pooled. A row
-    whose memory is "may be remembered" has NOT_EVIDENCE as its verdict and its ranking verdict, whatever its
-    numbers, which are still reported."""
+    whose memory is "may be remembered" has NOT_EVIDENCE as its verdict and its ranking verdict, and one that was
+    "answered late" has LATE_NOT_EVIDENCE, whatever its numbers, which are still reported."""
     groups: dict[tuple, list[dict]] = {}
     for r in ledger.scored_rows():
-        r["memory"] = memory_class(r["kind"], r["model"], r["unseen_after"], r["asked_on"])
+        r["memory"] = memory_class(r["kind"], r["model"], r["unseen_after"], r["asked_on"], r["answered_ts"])
         groups.setdefault(tuple(r[k] for k in GROUP_KEYS), []).append(r)
     in_order = lambda item: tuple((v is None, "" if v is None else str(v)) for v in item[0])   # None sorts last, never compared
     out = []
@@ -467,6 +499,8 @@ def scores(ledger: TournamentLedger, min_settled: int = 30) -> list[dict]:
             ranking_verdict = "ranking not distinguishable from chance"
         if memory == "may be remembered":
             verdict = ranking_verdict = NOT_EVIDENCE
+        elif memory == "answered late":
+            verdict = ranking_verdict = LATE_NOT_EVIDENCE
         out.append({"forecaster": who, "model": model, "prompt_sha": sha, "market": market, "kind": kind, "memory": memory,
                     "settled": n, "weeks": weeks,
                     "brier": float(mine.mean()), "baseline_brier": float(base.mean()),
@@ -584,7 +618,7 @@ def main(argv=None) -> int:
         members = forecasters([n for n in args.forecasters.split(",") if n] or None) + (reference_forecasters() if args.with_rules else [])
         only_forward = args.cmd == "ask-forward" and args.only_forward
         asked = ask(ledger, members, today=today, limit=args.limit, progress=lambda s: print(s, file=sys.stderr, flush=True),
-                    kinds=("forward",) if only_forward else None)
+                    kinds=("blind history",) if args.cmd == "ask-blind" else ("forward",) if only_forward else None)
         result = {"questions_added": added, "settled_now": settled, "asked": asked, "counts": ledger.counts()}
         print(json.dumps({**result, "only_forward": True} if only_forward else result, indent=1))
         return 0

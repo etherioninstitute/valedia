@@ -50,6 +50,9 @@ KRONOS_TOKENIZER = TRADING_LAB / "models" / "Kronos-Tokenizer-base"
 WORKER = Path(__file__).resolve().parents[1] / "data_and_fees" / "kronos_worker.py"
 
 FIELDS = ohlc_data.FIELDS
+KRONOS_LABEL = "kronos-small"            # the model each Kronos answer records in the tournament
+KRONOS_UNSEEN_AFTER = "2025-06-30"       # the weights' publication date (this module's docstring)
+PRICE_MODEL_PROMPT = "price-model"       # its fingerprint: it is sent price bars, never the panel's prompt
 MIN_WINDOW = 200
 
 
@@ -254,7 +257,8 @@ def ask_price_model(ledger: tm.TournamentLedger, forecaster: KronosForecaster, o
                 raise                                       # a broken installation stops the run; this question stays unasked
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]
-        ledger.record(q["id"], forecaster.name, p, error, (time.perf_counter() - started) * 1000.0)
+        ledger.record(q["id"], forecaster.name, p, error, (time.perf_counter() - started) * 1000.0,
+                      KRONOS_LABEL, KRONOS_UNSEEN_AFTER, PRICE_MODEL_PROMPT)
         answered += int(error is None)
         if progress and (n % 10 == 0 or n == len(todo)):
             progress(f"{forecaster.name}: {n}/{len(todo)} asked, {answered} answered")
