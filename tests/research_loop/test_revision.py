@@ -123,7 +123,7 @@ def test_a_pairs_strategy_is_refused_cleanly_and_nothing_is_counted(tmp_path):
     paths, ledger, g, hid = desk(tmp_path, market(seed=1, drift=(0.0,) * 6))
     s = PairsStrategy.from_spec({
         "kind": "pairs", "name": "trend_fix", "version": "1.0.0", "hypothesis": "Two related prices drift back together after they part",
-        "pairs": [["A", "B"], ["C", "D"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}})
+        "pairs": [["A", "B"], ["C", "D"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}, "legs": "both"})
     assert g.develop(hid, s, "strategies/trend_fix.json")["verdict"] == "fail"      # a failed idea: the loop would revise it
     before = ledger.variations(hid)
     with pytest.raises(st.SpecError, match="only rule strategies can be revised"):

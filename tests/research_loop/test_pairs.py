@@ -58,19 +58,16 @@ def trades(events):
 # ---- the slow oracle
 
 
+MISSING = 5                       # consecutive bars with a leg unpriced that close an open pair (addendum 2, ruling 2)
+
+
 def _ok(x):
     return isinstance(x, float) and math.isfinite(x) and x > 0
 
 
-def oracle(a, b, signal, legs="both", sizing=None, risk=None):
-    """Single pair, plain loops. Returns (rows of (weight A, weight B), closed trades (bar, reason word, pair result), z, beta)."""
-    sizing, risk = dict(sizing or {}), dict(risk or {})
-    hedge, w, en, ex = signal["hedge"], signal["window"], signal["enter"], signal["exit"]
-    sz, hw = signal.get("stop_z"), signal.get("hedge_window")
-    pw, mpp, mg = sizing.get("pair_weight", 0.10), risk.get("max_position_pct", 0.10), risk.get("max_gross", 1.0)
-    sl = risk["stop_loss_pct"] if "stop_loss_pct" in risk else 0.10
-    tp, mh = risk.get("take_profit_pct"), risk.get("max_holding_days")
-    a, b = [float(x) for x in a], [float(x) for x in b]
+def _bar_signal(a, b, signal):
+    """Each bar's own z and beta for one pair, plain loops."""
+    hedge, w, hw = signal["hedge"], signal["window"], signal.get("hedge_window")
     n = len(a)
     z, beta = [None] * n, [None] * n
     for t in range(n):
@@ -97,54 +94,168 @@ def oracle(a, b, signal, legs="both", sizing=None, risk=None):
             if not all(_ok(a[u]) and _ok(b[u]) for u in idx):
                 continue
             s = [a[u] / b[u] if hedge == "ratio" else math.log(a[u]) - math.log(b[u]) for u in idx]
-        m = math.fsum(s) / w
-        sd = math.sqrt(math.fsum((x - m) ** 2 for x in s) / (w - 1))
-        floor = 0.0 if hedge == "ratio" else 1.0                  # a ratio may be tiny (addendum 1, ruling 3)
-        if not math.isfinite(sd) or sd <= 1e-12 * max(floor, max(abs(x) for x in s)):
-            continue
-        z[t] = (s[-1] - m) / sd
-    side, wa, wb, pa, pb, held, armed = 0, 0.0, 0.0, None, None, 0, True
-    rows, closed_trades = [], []
+        z[t] = _z_of(s, 0.0 if hedge == "ratio" else 1.0)     # a ratio may be tiny (addendum 1, ruling 3)
+    return z, beta
+
+
+def _z_of(s, floor):
+    m = math.fsum(s) / len(s)
+    sd = math.sqrt(math.fsum((x - m) ** 2 for x in s) / (len(s) - 1))
+    if not math.isfinite(sd) or sd <= 1e-12 * max(floor, max(abs(x) for x in s)):
+        return None
+    return (s[-1] - m) / sd
+
+
+def _held_z(a, b, beta0, t, w):
+    """An open ols pair's z: the spread it holds, ln A - beta_0 ln B, over the last `window` bars (addendum 2, ruling 3)."""
+    if t < w - 1 or not all(_ok(a[u]) and _ok(b[u]) for u in range(t - w + 1, t + 1)):
+        return None
+    return _z_of([math.log(a[u]) - beta0 * math.log(b[u]) for u in range(t - w + 1, t + 1)], 1.0)
+
+
+def oracle_book(px, pairs, signal, legs="both", sizing=None, risk=None):
+    """Any number of pairs, plain loops, written from the rulings (ticket and addenda 1 to 3), nothing from pairs.py.
+    Returns (rows: one {symbol: net weight} per bar, closed trades (bar, pair index, reason word, pair result),
+    per pair (z, beta), counts of what happened)."""
+    sizing, risk = dict(sizing or {}), dict(risk or {})
+    hedge, w, en, ex = signal["hedge"], signal["window"], signal["enter"], signal["exit"]
+    sz = signal.get("stop_z")
+    pw, mop = sizing.get("pair_weight", 0.10), sizing.get("max_open_pairs", 3)
+    mpp, mg = risk.get("max_position_pct", 0.10), risk.get("max_gross", 1.0)
+    sl = risk["stop_loss_pct"] if "stop_loss_pct" in risk else 0.10
+    tp, mh = risk.get("take_profit_pct"), risk.get("max_holding_days")
+    px = {k: [float(x) for x in v] for k, v in px.items()}
+    syms = list(dict.fromkeys(s for p in pairs for s in p))
+    n = len(px[syms[0]])
+    sig = [_bar_signal(px[a], px[b], signal) for a, b in pairs]
+    st_ = [{"side": 0, "wa": 0.0, "wb": 0.0, "pa": None, "pb": None, "held": 0, "miss": 0, "armed": True, "cside": 0,
+            "beta0": None} for _ in pairs]
+    last = {s: None for s in syms}
+    rows, closed_trades, counts = [], [], {"position skip": 0, "gross skip": 0, "scaled": 0}
     for t in range(n):
-        closed = False
-        both = _ok(a[t]) and _ok(b[t])
-        if side != 0 and both:
-            held += 1
-            r = (wa * (a[t] / pa - 1.0) + wb * (b[t] / pb - 1.0)) / (abs(wa) + abs(wb))
+        for s in syms:
+            if _ok(px[s][t]):
+                last[s] = px[s][t]
+        closed = set()
+        for i, (a, b) in enumerate(pairs):
+            p = st_[i]
+            if p["side"] == 0:
+                continue
+            both = _ok(px[a][t]) and _ok(px[b][t])
+            p["held"] += 1                                           # the clock runs on every bar (addendum 2, ruling 2)
+            p["miss"] = 0 if both else p["miss"] + 1
+            r = (p["wa"] * (last[a] / p["pa"] - 1.0) + p["wb"] * (last[b] / p["pb"] - 1.0)) / (abs(p["wa"]) + abs(p["wb"]))
+            zt = None
+            if both:
+                zt = _held_z(px[a], px[b], p["beta0"], t, w) if hedge == "ols" else sig[i][0][t]
             why = None
             if sl is not None and r <= -sl:
                 why = "stop loss"
             elif tp is not None and r >= tp:
                 why = "take profit"
-            elif mh is not None and held >= mh:
+            elif mh is not None and p["held"] >= mh:
                 why = "time limit"
-            elif sz is not None and z[t] is not None and ((side > 0 and z[t] <= -sz) or (side < 0 and z[t] >= sz)):
+            elif p["miss"] >= MISSING:
+                why = "missing leg"
+            elif sz is not None and zt is not None and ((p["side"] > 0 and zt <= -sz) or (p["side"] < 0 and zt >= sz)):
                 why = "z stop"
-            elif z[t] is not None and ((side > 0 and z[t] >= -ex) or (side < 0 and z[t] <= ex)):
+            elif zt is not None and ((p["side"] > 0 and zt >= -ex) or (p["side"] < 0 and zt <= ex)):
                 why = "exit rule"
             if why:
-                closed_trades.append((t, why, r))
-                side, wa, wb, pa, pb, held, closed = 0, 0.0, 0.0, None, None, 0, True
-                armed = why == "exit rule"
-        if side == 0 and not closed and not armed and z[t] is not None and abs(z[t]) <= ex:
-            armed = True
-        if (side == 0 and not closed and armed and both and z[t] is not None and abs(z[t]) >= en
-                and (sz is None or abs(z[t]) < sz)                     # nothing opens beyond the z stop (ruling 2)
-                and (hedge != "ols" or (beta[t] is not None and 0.1 <= beta[t] <= 10.0))):
-            new_side = 1 if z[t] <= -en else -1
-            ga, gb = (pw / (1.0 + beta[t]), pw * beta[t] / (1.0 + beta[t])) if hedge == "ols" else (pw / 2.0, pw / 2.0)
+                closed_trades.append((t, i, why, r))
+                counts[why] = counts.get(why, 0) + 1
+                p.update(cside=p["side"], side=0, wa=0.0, wb=0.0, pa=None, pb=None, held=0, miss=0, armed=why == "exit rule")
+                closed.add(i)
+        cands = []
+        for i, (a, b) in enumerate(pairs):
+            p, zt = st_[i], sig[i][0][t]
+            if p["side"] != 0 or i in closed or zt is None:
+                continue
+            if not p["armed"]:                                       # re-arm on the closed trade's own exit condition
+                if (p["cside"] > 0 and zt >= -ex) or (p["cside"] < 0 and zt <= ex):
+                    p["armed"] = True
+                continue                                             # and the re-arm bar opens nothing
+            if not (_ok(px[a][t]) and _ok(px[b][t])) or abs(zt) < en or (sz is not None and abs(zt) >= sz):
+                continue
+            if hedge == "ols" and not (sig[i][1][t] is not None and 0.1 <= sig[i][1][t] <= 10.0):
+                continue
+            cands.append(i)
+        free = mop - sum(1 for p in st_ if p["side"] != 0)
+        legsum = {s: 0.0 for s in syms}
+        for (a, b), p in zip(pairs, st_):
+            if p["side"] != 0:
+                legsum[a] += abs(p["wa"])
+                legsum[b] += abs(p["wb"])
+        book = sum(legsum.values())
+        for i in sorted(cands, key=lambda j: (-abs(sig[j][0][t]), j)):
+            if free == 0:
+                break
+            a, b = pairs[i]
+            zt, bt = sig[i][0][t], sig[i][1][t]
+            new_side = 1 if zt <= -en else -1
+            ga, gb = (pw / (1.0 + bt), pw * bt / (1.0 + bt)) if hedge == "ols" else (pw / 2.0, pw / 2.0)
             big = max(ga, gb)
             if big > mpp:
                 ga, gb = ga * mpp / big, gb * mpp / big
             na, nb = (ga, -gb) if new_side > 0 else (-ga, gb)
             if legs == "long":
                 na, nb = max(na, 0.0), max(nb, 0.0)
-            if max(abs(na), abs(nb)) <= mpp + 1e-12:                   # net limit per symbol (ruling 1; one pair: its legs)
-                side, wa, wb, pa, pb, held = new_side, na, nb, a[t], b[t], 0
-        gross = abs(wa) + abs(wb)
-        k = mg / gross if gross > mg else 1.0
-        rows.append((wa * k, wb * k))
-    return rows, closed_trades, z, beta
+            if legsum[a] + abs(na) > mpp + 1e-12 or legsum[b] + abs(nb) > mpp + 1e-12:
+                counts["position skip"] += 1                         # leg weights, no credit for netting (addendum 3)
+                continue
+            if book + abs(na) + abs(nb) > mg + 1e-12:
+                counts["gross skip"] += 1
+                continue
+            st_[i].update(side=new_side, wa=na, wb=nb, pa=px[a][t], pb=px[b][t], held=0, miss=0, beta0=bt)
+            legsum[a] += abs(na)
+            legsum[b] += abs(nb)
+            book += abs(na) + abs(nb)
+            free -= 1
+        net = {s: 0.0 for s in syms}
+        for (a, b), p in zip(pairs, st_):
+            if p["side"] != 0:
+                net[a] += p["wa"]
+                net[b] += p["wb"]
+        gross = sum(abs(v) for v in net.values())
+        if gross > mg:
+            counts["scaled"] += 1
+            net = {s: v * mg / gross for s, v in net.items()}
+        rows.append(net)
+    return rows, closed_trades, sig, counts
+
+
+def oracle(a, b, signal, legs="both", sizing=None, risk=None):
+    """One pair: (rows of (weight A, weight B), closed trades (bar, reason word, pair result), z, beta)."""
+    rows, closed, sig, _ = oracle_book({"A": a, "B": b}, [("A", "B")], signal, legs, sizing, risk)
+    return [(r["A"], r["B"]) for r in rows], [(t, why, r) for t, _, why, r in closed], sig[0][0], sig[0][1]
+
+
+def leg_invariant(strategy, w, events):
+    """Rebuild the held legs bar by bar from the events and check addendum 3's invariant on every bar: per symbol
+    the sum of absolute leg weights is within max_position_pct, the book's within max_gross, and the output row is
+    exactly the net of the legs (the final scaling never acted). Returns (bars, largest symbol sum / limit, largest
+    book sum / limit)."""
+    held, by_date = {}, {}
+    for e in events:
+        by_date.setdefault(e["date"], []).append(e)
+    worst_sym = worst_book = 0.0
+    mpp, mg = strategy.risk.max_position_pct, strategy.risk.max_gross
+    for d in w.index:
+        for e in by_date.get(d, []):
+            if e["action"] in ("exit", "exit_leg"):
+                del held[(e["pair"], e["symbol"])]
+            else:
+                held[(e["pair"], e["symbol"])] = e["side"] * e["weight"]
+        sums, net = {}, {}
+        for (_, sym), wl in held.items():
+            sums[sym] = sums.get(sym, 0.0) + abs(wl)
+            net[sym] = net.get(sym, 0.0) + wl
+        book = sum(sums.values())
+        assert all(v <= mpp + 1e-12 for v in sums.values()) and book <= mg + 1e-12, d
+        assert all(abs(w.at[d, c] - net.get(c, 0.0)) <= 1e-14 for c in w.columns), d      # never rescaled
+        worst_sym = max([worst_sym] + [v / mpp for v in sums.values()])
+        worst_book = max(worst_book, book / mg)
+    return len(w), worst_sym, worst_book
 
 
 # ---- specs
@@ -204,6 +315,7 @@ def _bad_specs():
         "legs short": spec(legs="short"),
         "crypto with both legs": spec(pairs=[["BTC-USD", "ETH-USD"]]),
         "crypto with both legs (default)": spec(pairs=[["SOL-USD", "AAA"]], legs=DROP),
+        "missing legs": spec(legs=DROP),
         "pair_weight 0": spec(sizing={"pair_weight": 0}),
         "pair_weight above 1": spec(sizing={"pair_weight": 1.5}),
         "max_open_pairs 0": spec(sizing={"max_open_pairs": 0}),
@@ -227,8 +339,11 @@ def test_bad_specs_are_refused(label, bad):
 
 
 def test_good_specs_are_accepted_with_their_defaults():
-    s = pr.PairsStrategy.from_spec({k: v for k, v in spec().items() if k not in ("legs", "sizing", "risk")})
-    assert s.legs == "both" and s.to_spec()["sizing"] == {"pair_weight": 0.10, "max_open_pairs": 3}
+    s = pr.PairsStrategy.from_spec({k: v for k, v in spec().items() if k not in ("sizing", "risk")})
+    assert s.legs == "both" and s.holds_shorts and not build(legs="long").holds_shorts
+    with pytest.raises(AttributeError):
+        s.holds_shorts = False                                                   # read-only
+    assert s.to_spec()["sizing"] == {"pair_weight": 0.10, "max_open_pairs": 3}
     assert s.risk == st.StrategyRisk(max_open_positions=6)                    # two legs per open pair, three pairs
     crypto = build(pairs=[["BTC-USD", "ETH-USD"], ["ETH-USD", "SOL-USD"]], legs="long", sizing={"max_open_pairs": 2})
     assert crypto.market == ("BTC-USD", "ETH-USD", "SOL-USD") and crypto.risk.max_open_positions == 2
@@ -377,30 +492,54 @@ def test_a_symbol_in_two_open_pairs_is_netted():
     assert w["A"].iloc[-1] == 0.0 and w["B"].iloc[-1] == -0.05 and w["C"].iloc[-1] == 0.05
 
 
-def test_the_leg_cap_and_the_gross_cap():
+def test_the_leg_cap_and_the_gross_limit():
     q = [100.0] * 9
     w, events = build(sizing={"pair_weight": 0.5}, risk={"max_position_pct": 0.1}).walk(frame(A=BASE + [94], B=q))
     assert w["A"].iloc[-1] == pytest.approx(0.1) and w["B"].iloc[-1] == pytest.approx(-0.1) and events[0]["weight"] == pytest.approx(0.1)
     two = build(pairs=[["A", "B"], ["C", "D"]], risk={"max_gross": 0.1})
     w, events = two.walk(frame(A=BASE + [94], B=q, C=BASE + [94], D=q))
-    assert w.iloc[-1].abs().sum() == pytest.approx(0.1) and w["A"].iloc[-1] == pytest.approx(0.025)
-    assert all(e["weight"] == pytest.approx(0.05) for e in events)              # the cap scales the book, not the trade
+    assert [e["pair"] for e in events if e["action"] == "enter"] == ["A/B"]        # C/D would take the book to 0.2: refused
+    assert w.iloc[-1].abs().sum() == pytest.approx(0.1) and w["A"].iloc[-1] == 0.05 and (w["C"] == 0).all()
+    leg_invariant(two, w, events)
 
 
-def test_a_missing_price_carries_the_pair_and_stops_its_clock():
+def test_a_missing_leg_keeps_the_clock_running_and_closes_the_pair_after_five_sessions():
     a = BASE + [94, 94.5, 94.2, 94.4, 94.3, 94.1, 94.2, 94.0]
     b = [100.0] * len(a)
-    b_gap = list(b)
-    b_gap[9] = b_gap[10] = float("nan")
-    risk = {"max_holding_days": 3}
-    w, events = build(risk=risk).walk(frame(A=a, B=b))
-    assert trades(events)[0]["date"] == w.index[11]
-    w, events = build(risk=risk).walk(frame(A=a, B=b_gap))
-    assert trades(events)[0]["date"] == w.index[13] and trades(events)[0]["reason"] == "time limit: held 3 days"
-    assert list(w["A"].iloc[8:13]) == [0.05] * 5 and list(w["B"].iloc[8:13]) == [-0.05] * 5
-    gap_on_entry = list(b)
-    gap_on_entry[8] = float("nan")
-    w, events = build().walk(frame(A=BASE + [94, 94], B=gap_on_entry[:10]))
+
+    def gap(series, bars):
+        out = list(series)
+        for k in bars:
+            out[k] = float("nan")
+        return out
+
+    w, events = build().walk(frame(A=a, B=gap(b, range(9, 14))))                # B unpriced on bars 9 to 13
+    ex = trades(events)
+    assert len(ex) == 1 and ex[0]["date"] == w.index[13] and ex[0]["reason"] == "missing leg: no price for 5 sessions"
+    legs = [e for e in events if e["date"] == w.index[13]]
+    assert [(e["action"], e["symbol"], e["price"], e.get("stale")) for e in legs] == [("exit", "A", a[13], None), ("exit_leg", "B", 100.0, True)]
+    assert ex[0]["pnl_pct"] == pytest.approx(0.5 * (a[13] / 94 - 1))
+    assert list(w["A"].iloc[8:13]) == [0.05] * 5 and (w.iloc[13:] == 0).all().all()
+    w, events = build(risk={"max_holding_days": 3}).walk(frame(A=a, B=gap(b, [9, 10])))
+    assert trades(events)[0]["date"] == w.index[11] and trades(events)[0]["reason"] == "time limit: held 3 days"    # the clock ran
+    assert "stale" not in [e for e in events if e["action"] == "exit_leg"][0]
+    w, events = build(risk={"max_holding_days": 3}).walk(frame(A=a, B=gap(b, [10, 11])))
+    assert [(e["symbol"], e.get("stale"), e["price"]) for e in events if e["date"] == w.index[11]] == [("A", None, a[11]), ("B", True, 100.0)]
+    a_fall = BASE + [94, 90, 91, 92, 93, 94]
+    w, events = build(risk={"stop_loss_pct": 0.02}).walk(frame(A=a_fall, B=gap(b[:14], range(9, 13))))
+    assert trades(events)[0]["date"] == w.index[9] and trades(events)[0]["reason"].startswith("stop loss")   # a stop while B is unpriced
+    assert trades(events)[0]["pnl_pct"] == pytest.approx(0.5 * (90 / 94 - 1))
+    w, events = build(risk={"max_holding_days": 5}).walk(frame(A=a, B=gap(b, range(9, 14))))
+    assert trades(events)[0]["reason"] == "time limit: held 5 days"                # the time limit is checked first
+    w, events = build(legs="long").walk(frame(A=a, B=gap(b, range(9, 14))))         # the leg not held counts too
+    assert [(e["action"], e["symbol"], e.get("stale")) for e in events] == [("enter", "A", None), ("exit", "A", None)]
+    assert events[1]["reason"].startswith("missing leg") and events[1]["date"] == w.index[13]
+    w, events = build().walk(frame(A=gap(a, range(9, 14)), B=gap(b, range(9, 14))))
+    assert [(e["price"], e["stale"]) for e in trades(events) + [e for e in events if e["action"] == "exit_leg"]] == [(94.0, True), (100.0, True)]
+    assert trades(events)[0]["pnl_pct"] == 0.0
+    w, events = build().walk(frame(A=a, B=gap(b, [9, 10, 11, 12, 14])))            # four, then a priced bar: the count restarts
+    assert all(not e["reason"].startswith("missing leg") for e in trades(events))
+    w, events = build().walk(frame(A=BASE + [94, 94], B=gap(b[:10], [8])))
     assert events == [] and (w == 0).all().all()                                 # no entry on a bar a leg has no price
     w, events = build(risk={"stop_loss_pct": 0.05}).walk(frame(A=BASE + [94, 0.0, 95, 99, 100], B=b[:13]))
     assert list(w["A"].iloc[8:]) == [0.05] * 5 and trades(events) == []        # a price of zero is no price: no stop,
@@ -454,7 +593,7 @@ def _random_case(rng, hedge):
     sig["stop_z"] = None if rng.random() < 0.5 else float(sig["enter"] + rng.uniform(0.2, 1.2))
     if hedge == "ols":
         sig["hedge_window"] = int(max(20, window + rng.integers(0, 30)))
-    risk = {"max_position_pct": float(rng.uniform(0.05, 1.0)), "max_gross": float(rng.uniform(0.05, 1.5)),
+    risk = {"max_position_pct": float(rng.uniform(0.05, 1.0)), "max_gross": float(rng.uniform(0.05, 1.2)),
             "stop_loss_pct": None if rng.random() < 0.4 else float(rng.uniform(0.003, 0.04)),
             "take_profit_pct": None if rng.random() < 0.5 else float(rng.uniform(0.003, 0.04)),
             "max_holding_days": None if rng.random() < 0.5 else int(rng.integers(1, 12))}
@@ -468,28 +607,96 @@ def _random_case(rng, hedge):
     a, b = np.exp(beta * lb + (1 - beta) * np.log(100.0) + e), np.exp(lb)
     if hedge == "ratio" and rng.random() < 0.25:
         a, b = a * 1e-11, b * 1e3                                   # a ratio near 1e-14 must still trade (ruling 3)
-    for arr in (a, b):
+    _holes(rng, a, b)
+    return a, b, sig, legs, sizing, risk
+
+
+def _holes(rng, *arrays):
+    """Scattered missing and zero prices, and now and then a stretch of 3 to 8 unpriced bars (a halt)."""
+    for arr in arrays:
+        n = len(arr)
         arr[rng.random(n) < 0.03] = np.nan
         arr[rng.random(n) < 0.004] = 0.0
-    return a, b, sig, legs, sizing, risk
+        if rng.random() < 0.35:
+            g0 = int(rng.integers(20, n - 10))
+            arr[g0: g0 + int(rng.integers(3, 9))] = np.nan
+
+
+KINDS = {"stop loss", "take profit", "time limit", "missing leg", "z stop", "exit rule"}
 
 
 @pytest.mark.parametrize("hedge", ["ratio", "log_ratio", "ols"])
 def test_walk_agrees_with_a_slow_walker_written_from_the_rulings(hedge):
     rng = np.random.default_rng({"ratio": 101, "log_ratio": 202, "ols": 303}[hedge])
-    total, kinds = 0, set()
+    total, kinds, skips = 0, set(), 0
     for i in range(200):
         a, b, sig, legs, sizing, risk = _random_case(rng, hedge)
-        rows, closed, _, _ = oracle(a, b, sig, legs, sizing, risk)
+        rows, closed, _, counts = oracle_book({"A": a, "B": b}, [("A", "B")], sig, legs, sizing, risk)
         s = build(signal={**{"stop_z": None}, **sig}, legs=legs, sizing=sizing, risk=risk)
         w, events = s.walk(frame(A=a, B=b))
-        np.testing.assert_allclose(w[["A", "B"]].to_numpy(), np.array(rows), rtol=0, atol=1e-12, err_msg=f"case {i}")
+        np.testing.assert_allclose(w[["A", "B"]].to_numpy(), np.array([(r["A"], r["B"]) for r in rows]), rtol=0, atol=1e-12,
+                                   err_msg=f"case {i}")
         got = [(w.index.get_loc(e["date"]), e["reason"].split(":")[0], e["pnl_pct"]) for e in trades(events)]
-        assert [g[:2] for g in got] == [c[:2] for c in closed], f"case {i}"
-        assert all(math.isclose(g[2], c[2], rel_tol=1e-9, abs_tol=1e-12) for g, c in zip(got, closed))
+        assert [g[:2] for g in got] == [(c[0], c[2]) for c in closed], f"case {i}"
+        assert all(math.isclose(g[2], c[3], rel_tol=1e-9, abs_tol=1e-12) for g, c in zip(got, closed))
+        assert counts["scaled"] == 0
+        leg_invariant(s, w, events)
         total += len(closed)
-        kinds |= {c[1] for c in closed}
-    assert total >= 200 and kinds == {"stop loss", "take profit", "time limit", "z stop", "exit rule"}
+        kinds |= {c[2] for c in closed}
+        skips += counts["gross skip"]
+    assert total >= 200 and kinds == KINDS and skips >= 20
+
+
+def _random_book(rng, hedge):
+    """Six symbols on three common factors, three to six pairs among them (shared symbols included)."""
+    n = int(rng.integers(120, 200))
+    window = int(rng.integers(5, 15))
+    sig = {"hedge": hedge, "window": window, "enter": float(rng.uniform(0.8, 2.0))}
+    sig["exit"] = float(rng.uniform(0.0, 0.9) * sig["enter"])
+    sig["stop_z"] = None if rng.random() < 0.5 else float(sig["enter"] + rng.uniform(0.2, 1.2))
+    if hedge == "ols":
+        sig["hedge_window"] = int(max(20, window + rng.integers(0, 30)))
+    factors = np.log(100.0) + np.cumsum(0.015 * rng.standard_normal((n, 3)), axis=0)
+    px = {}
+    for j in range(6):
+        e = np.zeros(n)
+        for t in range(1, n):
+            e[t] = 0.75 * e[t - 1] + 0.01 * rng.standard_normal()
+        beta = float(rng.uniform(0.5, 2.0)) if hedge == "ols" else 1.0
+        px[f"S{j}"] = np.exp(beta * factors[:, j % 3] + (1 - beta) * np.log(100.0) + e)
+    _holes(rng, *px.values())
+    combos = [(f"S{i}", f"S{j}") for i in range(6) for j in range(i + 1, 6)]
+    pairs = [combos[k] if rng.random() < 0.5 else combos[k][::-1] for k in rng.choice(len(combos), int(rng.integers(3, 7)), replace=False)]
+    sizing = {"pair_weight": float(rng.uniform(0.05, 0.6)), "max_open_pairs": int(rng.integers(1, 5))}
+    risk = {"max_position_pct": float(rng.uniform(0.03, 0.4)), "max_gross": float(rng.uniform(0.05, 1.0)),
+            "stop_loss_pct": None if rng.random() < 0.4 else float(rng.uniform(0.003, 0.04)),
+            "take_profit_pct": None if rng.random() < 0.5 else float(rng.uniform(0.003, 0.04)),
+            "max_holding_days": None if rng.random() < 0.5 else int(rng.integers(1, 12))}
+    return px, pairs, sig, ("both" if rng.random() < 0.6 else "long"), sizing, risk
+
+
+@pytest.mark.parametrize("hedge", ["ratio", "log_ratio", "ols"])
+def test_walk_agrees_with_the_slow_walker_on_universes_of_several_pairs(hedge):
+    rng = np.random.default_rng({"ratio": 404, "log_ratio": 505, "ols": 606}[hedge])
+    totals = {"trades": 0, "gross skip": 0, "position skip": 0, "missing leg": 0}
+    kinds = set()
+    for i in range(80):
+        px, pairs, sig, legs, sizing, risk = _random_book(rng, hedge)
+        rows, closed, _, counts = oracle_book(px, pairs, sig, legs, sizing, risk)
+        s = build(pairs=[list(p) for p in pairs], signal={**{"stop_z": None}, **sig}, legs=legs, sizing=sizing, risk=risk)
+        w, events = s.walk(frame(**px))
+        np.testing.assert_allclose(w[list(px)].to_numpy(), np.array([[r[c] for c in px] for r in rows]), rtol=0, atol=1e-12,
+                                   err_msg=f"case {i}")
+        got = [(w.index.get_loc(e["date"]), e["pair"], e["reason"].split(":")[0]) for e in trades(events)]
+        assert got == [(c[0], "/".join(pairs[c[1]]), c[2]) for c in closed], f"case {i}"
+        assert counts["scaled"] == 0
+        leg_invariant(s, w, events)
+        totals["trades"] += len(closed)
+        totals["gross skip"] += counts["gross skip"]
+        totals["position skip"] += counts["position skip"]
+        totals["missing leg"] += counts.get("missing leg", 0)
+        kinds |= {c[2] for c in closed}
+    assert kinds == KINDS and totals["trades"] >= 300 and min(totals.values()) >= 5, totals
 
 
 # ---- through the hooks and the real consumers
@@ -503,7 +710,7 @@ def test_a_pairs_spec_round_trips_through_save_spec_and_load_strategy(tmp_path):
         assert isinstance(loaded, pr.PairsStrategy) and loaded == s and loaded.to_spec() == json.loads(path.read_text())
 
 
-def _universe(n=320, seed=5, gaps=0.02):
+def _universe(n=320, seed=5, gaps=0.02, halts=True):
     rng = np.random.default_rng(seed)
     base = np.log(100.0) + np.cumsum(0.015 * rng.standard_normal((n, 3)), axis=0)
     e = np.zeros((n, 3))
@@ -512,7 +719,11 @@ def _universe(n=320, seed=5, gaps=0.02):
     cols = {"A": base[:, 0] + e[:, 0], "B": base[:, 0], "C": 1.3 * base[:, 1] + e[:, 1] - 1.0, "D": base[:, 1],
             "E": base[:, 2] + e[:, 2], "F": base[:, 2]}
     px = pd.DataFrame({k: np.exp(v) for k, v in cols.items()}, index=pd.bdate_range("2020-01-01", periods=n))
-    return px.mask(rng.random(px.shape) < gaps)
+    px = px.mask(rng.random(px.shape) < gaps)
+    if halts:
+        for col, start, length in (("B", 60, 6), ("D", 140, 7), ("F", 200, 5), ("C", 250, 8), ("A", 290, 6)):
+            px.iloc[start: start + length, px.columns.get_loc(col)] = np.nan
+    return px
 
 
 def _universe_strategy(hedge):
@@ -520,8 +731,8 @@ def _universe_strategy(hedge):
                  signal={"hedge": hedge, "window": 10, "enter": 1.4, "exit": 0.3, "stop_z": 3.0,
                          **({"hedge_window": 40} if hedge == "ols" else {})},
                  sizing={"pair_weight": 0.2, "max_open_pairs": 2},
-                 risk={"max_position_pct": 0.08, "max_gross": 0.25, "stop_loss_pct": 0.03, "take_profit_pct": 0.03,
-                       "max_holding_days": 8})
+                 risk={"max_position_pct": 0.08, "max_gross": 0.35, "stop_loss_pct": 0.03, "take_profit_pct": 0.03,
+                       "max_holding_days": 12})
 
 
 @pytest.mark.parametrize("hedge", ["ratio", "log_ratio", "ols"])
@@ -531,8 +742,13 @@ def test_the_walk_is_causal(hedge):
     assert detect_lookahead(s.target_weights, px) == [] and detect_lookahead(s.target_weights, px, n_checks=40) == []
     full_w, full_ev = s.walk(px)
     assert len(trades(full_ev)) >= 10
+    leg_invariant(s, full_w, full_ev)
     rng = np.random.default_rng(7)
-    cuts = rng.choice(np.arange(20, len(px) - 1), size=50, replace=False)
+    halted = [k for k in range(len(px)) if px.iloc[k].isna().any() and k >= 60]
+    missing_exits = [px.index.get_loc(e["date"]) for e in trades(full_ev) if e["reason"].startswith("missing leg")]
+    assert missing_exits                                                          # a missing-leg exit to cut on
+    cuts = sorted(set(rng.choice(np.arange(20, len(px) - 1), size=50, replace=False)) | set(halted[::2]) | set(missing_exits))
+    assert len(cuts) >= 70
     for cut in cuts:
         part_w = s.target_weights(px.iloc[: cut + 1])
         pd.testing.assert_frame_equal(part_w, full_w.iloc[: cut + 1], check_exact=True)
@@ -542,7 +758,7 @@ def test_the_walk_is_causal(hedge):
 
 def test_run_rules_hands_over_to_walk_and_the_backtester_takes_the_weights():
     from valedia_trader.backtest.engine import CostModel, run_backtest
-    px = _universe(gaps=0.0)
+    px = _universe(gaps=0.0, halts=False)
     px["X"] = 50.0                                                                # a column outside the market
     for hedge in ("ratio", "log_ratio", "ols"):
         s = _universe_strategy(hedge)
@@ -550,8 +766,9 @@ def test_run_rules_hands_over_to_walk_and_the_backtester_takes_the_weights():
         ww, ee = s.walk(px)
         pd.testing.assert_frame_equal(w, ww, check_exact=True)
         assert events == ee and list(w.columns) == list(px.columns) and (w["X"] == 0).all()
-        assert (w.abs().sum(axis=1) <= 0.25 + 1e-12).all() and (w.abs().sum(axis=1) > 0).any()
-        assert all(e["weight"] <= 0.08 + 1e-12 for e in events if "weight" in e)      # the leg cap; a netted symbol may sum past it
+        assert (w.abs().sum(axis=1) <= 0.35 + 1e-12).all() and (w.abs().sum(axis=1) > 0).any()
+        assert all(e["weight"] <= 0.08 + 1e-12 for e in events if "weight" in e)
+        leg_invariant(s, w, events)
         res = run_backtest(px, w, CostModel(fees_bps=1.0, slippage_bps=1.0, borrow_annual=0.02, funding_annual=0.0))
         assert np.isfinite(res.net.to_numpy()).all() and res.turnover.sum() > 0
     with pytest.raises(st.SpecError, match="price data"):
@@ -627,3 +844,121 @@ def test_every_event_says_which_way_the_spread_was_traded():
     down = BASE + [94, 95, 97, 99, 100, 101, 100, 99, 101, 100]
     _, events = build().walk(frame(A=down, B=b))
     assert all(e["spread_side"] == 1 for e in events) and len(events) == 4
+
+
+# ---- addendum 2 and 3
+
+
+def test_an_open_ols_pair_is_judged_on_the_spread_it_holds():
+    sig = {"hedge": "ols", "window": 20, "hedge_window": 120, "enter": 1.5, "exit": 0.3, "stop_z": 3.0}
+    a, b = _ols_pair(1.5, n=600, seed=13)
+    w, events = build(signal=sig, risk={"stop_loss_pct": None}).walk(frame(A=a, B=b))
+    entries, exits = [e for e in events if e["action"] == "enter"], trades(events)
+    assert len(exits) >= 4
+    _, beta_bar = _bar_signal(a, b, sig)
+    differ = 0
+    for en, ex in zip(entries, exits):
+        t0, t1 = w.index.get_loc(en["date"]), w.index.get_loc(ex["date"])
+        beta0 = en["hedge"]
+        assert ex["hedge"] == beta0 and beta0 == pytest.approx(beta_bar[t0], rel=1e-10)
+        held = [_held_z(a, b, beta0, t, 20) for t in range(t0 + 1, t1 + 1)]
+        side = en["spread_side"]
+        fires = [z is not None and ((side > 0 and (z >= -0.3 or z <= -3.0)) or (side < 0 and (z <= 0.3 or z >= 3.0))) for z in held]
+        assert fires[-1] and not any(fires[:-1])                                  # closes on the first bar its held z says so
+        assert ex["z"] == pytest.approx(held[-1], rel=1e-9, abs=1e-12)
+        bar_z = _bar_signal(a, b, sig)[0][t1]
+        differ += bar_z is not None and abs(bar_z - held[-1]) > 1e-6
+    assert differ >= 2                                                            # the bar's own fit would read differently
+
+
+def test_re_arming_follows_the_closed_trades_own_exit_condition():
+    b = [100.0] * 13
+    sig, risk = {"enter": 1.2, "exit": 0.0}, {"stop_loss_pct": 0.02}
+    a = BASE + [94, 90, 110, 125, 126]                       # z: -1.73 (enter long), -1.48 (stop), +1.51, +1.51, +1.01
+    w, events = build(signal=sig, risk=risk).walk(frame(A=a, B=b))
+    got = [(w.index.get_loc(e["date"]), e["action"], e["spread_side"]) for e in events if e["symbol"] == "A"]
+    assert got == [(8, "enter", 1), (9, "exit", 1), (11, "enter", -1)]        # re-armed on bar 10 (z >= -exit), which opens nothing
+    a = BASE + [94, 90, 95, 99, 100]                         # z after the stop: -0.15 (not yet >= 0), +0.84 (re-arm), +1.09
+    w, events = build(signal={**sig, "enter": 1.0}, risk=risk).walk(frame(A=a, B=b))
+    assert [(w.index.get_loc(e["date"]), e["action"]) for e in events if e["symbol"] == "A"] == [(8, "enter"), (9, "exit"), (12, "enter")]
+
+
+def test_worked_case_one_an_offsetting_pair_is_refused_at_entry():
+    q, n = [100.0] * 8, 12                                  # flat before bar 8, so the signals tie and the pair order decides
+    px = frame(A=[100.0] * n, B=q + [106] * 4, C=q + [94, 94, 100, 100], D=q + [100, 106, 106, 106])
+    s = build(pairs=[["A", "B"], ["A", "C"], ["A", "D"]], sizing={"pair_weight": 0.2, "max_open_pairs": 3},
+              risk={"max_position_pct": 0.1, "max_gross": 0.3})
+    w, events = s.walk(px)
+    assert [e["pair"] for e in events if e["action"] == "enter" and e["date"] <= px.index[9]] == ["A/B"]
+    # A/C (it would offset A/B) on bar 8 and A/D on bar 9 are refused at entry: each would put 0.2 of legs on A
+    assert w["A"].abs().max() <= 0.1 + 1e-12
+    leg_invariant(s, w, events)
+
+
+def test_worked_case_two_the_book_limit_counts_legs_not_nets():
+    q, n = [100.0] * 8, 12
+    px = frame(A=[100.0] * n, B=q + [106] * 4, C=q + [94, 94, 100, 100], D=q + [88] * 4)
+    s = build(pairs=[["A", "C"], ["A", "B"], ["C", "D"]], sizing={"pair_weight": 0.2, "max_open_pairs": 3},
+              risk={"max_position_pct": 0.5, "max_gross": 0.3})
+    w, events = s.walk(px)
+    assert [e["pair"] for e in events if e["action"] == "enter" and e["date"] == px.index[8]] == ["A/C"]
+    # A/B and C/D signal on bar 8 too; each would take the book's legs to 0.4 against 0.3
+    assert trades(events) and (w.abs().sum(axis=1) <= 0.3 + 1e-12).all()
+    leg_invariant(s, w, events)
+
+
+def test_the_position_limit_counts_only_legs_actually_held():
+    q = [100.0] * 9
+    cols = {"A": BASE[:8] + [90.0], "B": q, "C": BASE[:8] + [80.0]}             # A cheap against B, dear against C
+    long_only = build(pairs=[["A", "B"], ["A", "C"]], legs="long", sizing={"pair_weight": 0.2}, risk={"max_position_pct": 0.1})
+    w, events = long_only.walk(frame(**cols))
+    assert [(e["pair"], e["symbol"]) for e in events] == [("A/B", "A"), ("A/C", "C")] or \
+        [(e["pair"], e["symbol"]) for e in events] == [("A/C", "C"), ("A/B", "A")]   # short A is not taken: no weight on A from A/C
+    both = build(pairs=[["A", "B"], ["A", "C"]], sizing={"pair_weight": 0.2}, risk={"max_position_pct": 0.1})
+    w, events = both.walk(frame(**cols))
+    assert len([e for e in events if e["action"] == "enter"]) == 1                # with both legs A would carry 0.2 of legs
+    leg_invariant(both, w, events)
+
+
+def test_the_position_limit_passes_the_slot_on_after_two_fit():
+    q = [100.0] * 9
+    cols = {"A": BASE + [90], "B": q, "C": q, "F": q, "D": BASE + [97], "E": q}
+    s = build(pairs=[["A", "B"], ["A", "C"], ["A", "F"], ["D", "E"]], sizing={"pair_weight": 0.08, "max_open_pairs": 3},
+              risk={"max_position_pct": 0.1})
+    w, events = s.walk(frame(**cols))
+    assert [e["pair"] for e in events if e["action"] == "enter"] == ["A/B", "A/C", "D/E"]   # A/F would make A's legs 0.12
+    assert w["A"].iloc[-1] == pytest.approx(0.08)
+    leg_invariant(s, w, events)
+
+
+def test_the_one_leg_cap_with_an_ols_hedge_keeps_the_hedge_proportion():
+    sig = {"hedge": "ols", "window": 20, "hedge_window": 120, "enter": 1.5, "exit": 0.3}
+    a, b = _ols_pair(3.0)
+    s = build(signal=sig, sizing={"pair_weight": 0.4}, risk={"max_position_pct": 0.1})
+    w, events = s.walk(frame(A=a, B=b))
+    entries = [e for e in events if e["action"] == "enter"]
+    assert entries
+    for e in entries:
+        t, beta0 = w.index.get_loc(e["date"]), e["hedge"]
+        assert abs(beta0 - 3.0) < 0.3 and abs(w["B"].iloc[t]) == pytest.approx(0.1) and abs(w["A"].iloc[t]) == pytest.approx(0.1 / beta0)
+
+
+def test_the_one_leg_cap_on_the_long_leg_and_at_its_boundary():
+    q = [100.0] * 9
+    w, events = build(legs="long", sizing={"pair_weight": 0.5}, risk={"max_position_pct": 0.1}).walk(frame(A=BASE + [94], B=q))
+    assert w["A"].iloc[-1] == pytest.approx(0.1) and (w["B"] == 0).all() and events[0]["weight"] == pytest.approx(0.1)
+    w, _ = build(sizing={"pair_weight": 0.2}, risk={"max_position_pct": 0.1}).walk(frame(A=BASE + [94], B=q))
+    assert w["A"].iloc[-1] == 0.1 and w["B"].iloc[-1] == -0.1                     # exactly at the cap: not scaled
+    w, _ = build(sizing={"pair_weight": 0.2}, risk={"max_position_pct": 0.09}).walk(frame(A=BASE + [94], B=q))
+    assert w["A"].iloc[-1] == pytest.approx(0.09) and w["B"].iloc[-1] == pytest.approx(-0.09)
+
+
+def test_a_price_column_holding_text_raises_as_run_rules_does():
+    px = frame(A=BASE * 3, B=BASE * 3).astype(object)
+    px.iloc[5, 0] = "halted"
+    rule = st.RuleStrategy.from_spec({"name": "hold_text", "version": "1.0.0", "hypothesis": "Holding every fund all the time",
+                                      "market": ["A", "B"], "entry": {"rule": "hold", "enter": 1, "exit": 0}})
+    with pytest.raises(ValueError, match="could not convert string to float"):
+        st.run_rules(rule, px)
+    with pytest.raises(ValueError, match="could not convert string to float"):
+        build().walk(px)

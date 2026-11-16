@@ -363,7 +363,7 @@ def test_run_rules_hands_a_strategy_with_its_own_walk_over_to_it():
 def test_load_strategy_builds_a_pairs_spec_and_refuses_an_unknown_kind(tmp_path):
     from valedia_trader.research_loop.pairs import PairsStrategy
     pairs = {"kind": "pairs", "name": "pairs_load", "version": "1.0.0", "hypothesis": "Two related prices drift back together",
-             "pairs": [["A", "B"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}}
+             "pairs": [["A", "B"]], "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}, "legs": "both"}
     (tmp_path / "pairs_load.json").write_text(json.dumps(pairs))
     loaded = st.load_strategy(tmp_path / "pairs_load.json")
     assert isinstance(loaded, PairsStrategy) and loaded.to_spec()["kind"] == "pairs" and loaded.market == ("A", "B")
