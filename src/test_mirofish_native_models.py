@@ -20,7 +20,7 @@ import unittest
 
 import mirofish_native_model as m
 import mirofish_native_run as r
-from mirofish_native_gateway import Gateway, Limits, NativeRefused
+from mirofish_native_gateway import Gateway, Limits, NativeRefused, encoded
 
 SRC = Path(__file__).resolve().parent
 MODELS = Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models')
@@ -319,7 +319,7 @@ class ObserverReadTests(unittest.TestCase):
 def native_row(**changes):
     row = {'native': True, 'description': 'test', 'lmstudio_key': 'my-gguf', 'max_context': 40960,
            'weight_file': str(MODELS/'tmf4-test-only/model.gguf'), 'weight_bytes': 2048, 'weight_sha256': '1'*64,
-           'tokenizer_root': str(MODELS/'tmf4-test-only/tokenizer'), 'tokenizer_model_type': 'qwen3', 'tokenizer_quant_bits': None,
+           'tokenizer_root': str(MODELS/'Qwen3-8B-tokenizer'), 'tokenizer_model_type': 'qwen3', 'tokenizer_quant_bits': None,
            'gguf_selection': {'modelKey': 'my-gguf', 'path': 'me/My-GGUF/model.gguf', 'indexedModelIdentifier': 'me/My-GGUF/model.gguf',
                               'format': 'gguf', 'publisher': 'me', 'architecture': 'qwen3', 'quantization': {'name': 'Q4_K_M', 'bits': 4},
                               'deviceIdentifier': None, 'vision': False, 'trainedForToolUse': True, 'maxContextLength': 40960}}
@@ -385,6 +385,73 @@ class RegistryTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn('NativeRefused', err); self.assertNotIn('JSONDecodeError', err)
 
+
+    def tokenizer_folder(self, root, name='tok'):
+        folder = root/name; folder.mkdir(parents=True)
+        for file in m.TOKENIZER_FILES:
+            (folder/file).write_text('{}')
+        return folder
+
+    def test_builtin_tokenizer_folders_are_narrow_and_a_registered_row_may_name_them(self):
+        # Addendum 3, S2: the 27B's and the 8B's folders (Bonsai 2 uses the 27B's) satisfy the rule; rows naming them read.
+        pinned = r_pins = [Path(row[key]).resolve() for row in m.MODEL_PROFILES.values() for key in ('weight_file', 'second_file') if row.get(key)]
+        for name in m.BUILTIN_PROFILES:
+            folder = m.MODEL_PROFILES[name]['tokenizer_root']
+            self.assertIsNone(m.narrow_tokenizer_folder_refusal(folder.resolve(), r_pins), name)
+            self.assertTrue(all((folder/file).is_file() for file in m.TOKENIZER_FILES), name)
+            self.assertEqual([x for x in folder.rglob('*') if x.name.lower().endswith('.gguf')], [], name)
+            self.assertFalse(any(x.is_relative_to(folder.resolve()) for x in pinned), name)
+            native, _ = self.read({'profiles': {'m1': native_row(tokenizer_root=str(folder))}})
+            self.assertEqual(native['m1']['tokenizer_root'], folder.resolve())
+
+    def test_a_wide_tokenizer_folder_refuses(self):
+        # Addendum 3, S2: under the pinned models root, folders high in the tree or holding weights are refused.
+        for folder in [MODELS/'lmstudio-library', MODELS/'lmstudio-library/Qwen/Qwen3-8B', BONSAI_DIR, MODELS/'ggml-org']:
+            with self.assertRaisesRegex(NativeRefused, 'tokenizer_root', msg=str(folder)):
+                self.read({'profiles': {'wide': native_row(tokenizer_root=str(folder))}})
+        root = self.dir/'models'; root.mkdir()
+        original = m._MODEL_ROOT
+        m._MODEL_ROOT = root
+        try:
+            tok = self.tokenizer_folder(root)
+            row = lambda **c: native_row(weight_file=str(root/'w/model.gguf'), tokenizer_root=str(tok), **c)
+            native, _ = self.read({'profiles': {'m1': row()}})              # the narrow folder itself reads
+            self.assertEqual(native['m1']['tokenizer_root'], tok.resolve())
+            (tok/'config.json').unlink()
+            with self.assertRaisesRegex(NativeRefused, 'directly hold the five tokenizer files'):
+                self.read({'profiles': {'m1': row()}})
+            (tok/'config.json').mkdir()                                    # a folder of that name is not the file
+            with self.assertRaisesRegex(NativeRefused, 'directly hold the five tokenizer files'):
+                self.read({'profiles': {'m1': row()}})
+            (tok/'config.json').rmdir(); (tok/'config.json').write_text('{}')
+            (tok/'deep/er').mkdir(parents=True); (tok/'deep/er/Weights.GGUF').write_bytes(b'g')
+            with self.assertRaisesRegex(NativeRefused, r'\.gguf file lies beneath'):
+                self.read({'profiles': {'m1': row()}})
+            (tok/'deep/er/Weights.GGUF').unlink()
+            (tok/'deep/er/link.gguf').symlink_to(self.dir/'absent-target')    # a link named .gguf counts too
+            with self.assertRaisesRegex(NativeRefused, r'\.gguf file lies beneath'):
+                self.read({'profiles': {'m1': row()}})
+            (tok/'deep/er/link.gguf').unlink()
+            # the parent of a pinned file (not yet on disk): another registered row's weights, the row's own, a built-in's
+            other = native_row(weight_file=str(tok/'sub/other.bin'), tokenizer_root=str(self.tokenizer_folder(root, 'tok2')))
+            with self.assertRaisesRegex(NativeRefused, 'parent of a pinned model file'):
+                self.read({'profiles': {'m1': row(), 'm2': other}})
+            with self.assertRaisesRegex(NativeRefused, 'parent of a pinned model file'):
+                self.read({'profiles': {'m1': native_row(weight_file=str(tok/'model.bin'), tokenizer_root=str(tok))}})
+            saved = m.MODEL_PROFILES['qwen3-8b']
+            m.MODEL_PROFILES['qwen3-8b'] = dict(saved, weight_file=tok/'q/Qwen3-8B-Q4_K_M.gguf')
+            try:
+                with self.assertRaisesRegex(NativeRefused, 'parent of a pinned model file'):
+                    self.read({'profiles': {'m1': row()}})
+                m.MODEL_PROFILES['qwen3-8b'] = dict(saved, second_file=tok/'q/second.gguf')
+                with self.assertRaisesRegex(NativeRefused, 'parent of a pinned model file'):
+                    self.read({'profiles': {'m1': row()}})
+            finally:
+                m.MODEL_PROFILES['qwen3-8b'] = saved
+            native, _ = self.read({'profiles': {'m1': row()}})
+            self.assertIn('m1', native)
+        finally:
+            m._MODEL_ROOT = original
 
 class FakeChatSDK:
     def __init__(self):
@@ -454,7 +521,7 @@ class SwapTests(unittest.TestCase):
         self.built.append(name); return ('admission', name)
 
     def swap(self, helper):
-        return r.swap_model(helper, self.gateway, ID, 'qwen3-8b', self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
+        return r.swap_model(helper, self.gateway, ID, 'qwen3-8b', PLAN['plan'], self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
 
     def clean_unload(self):
         return {'unloaded': ID, 'snapshot': {'llm': [], 'embedding': [{'identifier': 'ym-research-embedding'}]}}
@@ -542,16 +609,32 @@ class SwapTests(unittest.TestCase):
             raise NativeRefused('frozen native model/tokenizer file changed')
         before = self.gateway.admit_context
         with self.assertRaisesRegex(NativeRefused, 'tokenizer file changed'):
-            r.swap_model(helper, self.gateway, ID, 'qwen3-8b', self.state, 'emb-ref', broken, time.monotonic()+600)
+            r.swap_model(helper, self.gateway, ID, 'qwen3-8b', PLAN['plan'], self.state, 'emb-ref', broken, time.monotonic()+600)
         self.assertTrue(self.gateway.cancelled.is_set()); self.assertIs(self.gateway.admit_context, before)
 
     def test_unknown_or_unchanged_next_profile_refuses(self):
         helper = FakeHelper(unload=self.clean_unload(), load=loaded_readback('qwen3-8b', 'ref-2'))
         with self.assertRaises(NativeRefused):
-            r.swap_model(helper, self.gateway, ID, BONSAI, self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
+            r.swap_model(helper, self.gateway, ID, BONSAI, PLAN['plan'], self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
         with self.assertRaises(NativeRefused):
-            r.swap_model(helper, self.gateway, ID, 'qwen9-900b', self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
+            r.swap_model(helper, self.gateway, ID, 'qwen9-900b', PLAN['plan'], self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
         self.assertEqual(helper.calls, [])
+
+    def test_target_outside_the_run_plan_refuses_before_anything_is_unloaded(self):
+        # Addendum 3, S1: a known profile that is not a member of the run's plan (or a run with no plan) is refused by the
+        # pipeline before the helper is asked for anything; the loaded model, its readback and the admission are untouched.
+        for target, plan in [('qwen3.8-27b', PLAN['plan']), ('qwen3-8b', None), ('qwen3-8b', {'setup': BONSAI, 'turns': 'qwen3.8-27b'}),
+                             ('qwen3-8b', 'qwen3-8b'), ('qwen3-8b', ['qwen3-8b'])]:
+            with self.subTest(target=target, plan=plan):
+                self.tearDown(); self.setUp()
+                helper = FakeHelper(unload=self.clean_unload(), load=loaded_readback(target, 'ref-2'))
+                before = self.gateway.admit_context
+                with self.assertRaisesRegex(NativeRefused, "not a member of the run's model plan"):
+                    r.swap_model(helper, self.gateway, ID, target, plan, self.state, 'emb-ref', self.admission_for, time.monotonic()+600)
+                self.assertEqual(helper.calls, [])
+                self.assertEqual(self.state, {'profile': BONSAI, 'loaded': loaded_readback(BONSAI, 'ref-1')})
+                self.assertEqual(self.built, []); self.assertIs(self.gateway.admit_context, before)
+                self.assertTrue(self.gateway.cancelled.is_set())
 
 
 class BoundaryPlacementTests(unittest.TestCase):
@@ -568,16 +651,88 @@ class BoundaryPlacementTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         boundary = text[text.index('def boundary('):text.index("save('pre_resource'")]
         self.assertIn('ifplanisNone:return', boundary.replace(' ', ''))
-        self.assertLess(boundary.index('swap_model('), boundary.index('compatibility_probes('))
-        self.assertIn("save('model_swap'", boundary); self.assertIn("save('post_swap_compatibility_probes_passed'", boundary)
+        self.assertEqual(boundary.count('model_boundary('), 1)
+        body = inspect.getsource(r.model_boundary)
+        self.assertLess(body.index('swap_model('), body.index('compatibility_probes('))
+        self.assertIn("save('model_swap'", body); self.assertIn("save('post_swap_compatibility_probes_passed'", body)
 
     def test_probe_bodies_are_the_start_probes(self):
         import inspect
         text = inspect.getsource(r.compatibility_probes)
         self.assertIn('Non-market transport check. Reply exactly with JSON {"ok":true}.', text)
         self.assertIn("'no-thinking JSON probe failed'", text); self.assertIn("'no-thinking function-tool probe failed'", text)
-        self.assertEqual(inspect.getsource(r.execute).count('compatibility_probes('), 2)
+        self.assertEqual(inspect.getsource(r.execute).count('compatibility_probes('), 1)
+        self.assertEqual(inspect.getsource(r.model_boundary).count('compatibility_probes('), 1)
 
+
+class BoundaryDriveTests(unittest.TestCase):
+    """Addendum 3, S4: a boundary driven through a compatibility probe that fails after the swap, with a fake helper and the
+    real gateway: the run is refused, the gateway refuses every further call, and cleanup unloads the profile now loaded."""
+    secret = 's'*32
+    bad_json = {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': '{"ok":false}'}}]}
+    good_json = {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': '{"ok":true}'}}]}
+    bad_tool = {'choices': [{'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'content': '', 'tool_calls': [
+        {'id': 'c1', 'type': 'function', 'function': {'name': 'no_effect', 'arguments': '{"ok":false}'}}]}}]}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gateway = Gateway(Limits(ID), self.secret, Path(self.tmp.name).resolve()/'ledger.json', lambda *a: None, deadline=time.monotonic()+2400)
+        self.events = []; self.dispatched = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def admission_for(self, name):
+        return lambda kind, body, deadline: {'verified': True, 'model': body['model'], 'tokens': 40, 'profile': name}
+
+    def drive(self, replies, name, phase, state):
+        def dispatch(route, body, end):
+            self.dispatched.append(body); return 200, encoded(replies[len(self.dispatched)-1])
+        self.gateway.dispatch = dispatch
+        to = PLAN['plan'][phase]
+        helper = FakeHelper(unload={'unloaded': ID, 'snapshot': {'llm': [], 'embedding': [{'identifier': 'ym-research-embedding'}]}},
+                            load=loaded_readback(to, 'ref-2'))
+        save = lambda event, **data: self.events.append(event)
+        return helper, lambda: r.model_boundary(helper, self.gateway, ID, name, to, PLAN['plan'], state, 'emb-ref', self.admission_for,
+                                                 self.secret, time.monotonic()+600, save)
+
+    def test_failed_probe_after_each_boundary_refuses_freezes_the_gateway_and_cleanup_unloads_the_new_profile(self):
+        cases = [('B1', 'turns', BONSAI, [self.bad_json], 'no-thinking JSON probe failed'),
+                 ('B1', 'turns', BONSAI, [self.good_json, self.bad_tool], 'no-thinking function-tool probe failed'),
+                 ('B2', 'setup', 'qwen3-8b', [self.bad_json], 'no-thinking JSON probe failed')]
+        for name, phase, before, replies, reason in cases:
+            with self.subTest(boundary=name, reason=reason):
+                self.tearDown(); self.setUp()
+                state = {'profile': before, 'loaded': loaded_readback(before, 'ref-1')}
+                helper, run_boundary = self.drive(replies, name, phase, state)
+                with self.assertRaisesRegex(NativeRefused, reason):
+                    run_boundary()
+                now = PLAN['plan'][phase]
+                self.assertEqual([c[0] for c in helper.calls], ['unload', 'load'])
+                self.assertEqual(self.events, ['model_swap'])                     # never 'post_swap_compatibility_probes_passed'
+                self.assertEqual(len(self.dispatched), len(replies))
+                self.assertTrue(self.gateway.cancelled.is_set())
+                self.assertTrue(self.gateway.state['cancelled'])
+                with self.assertRaisesRegex(NativeRefused, 'cancelled'):          # every further call is refused
+                    self.gateway.handle('/v1/chat/completions', {'model': ID, 'messages': [{'role': 'user', 'content': 'x'}], 'max_tokens': 16}, 'Bearer '+self.secret)
+                with self.assertRaisesRegex(NativeRefused, 'cancelled'):
+                    self.gateway.handle('/v1/embeddings', {'model': 'ym-research-embedding', 'input': ['x']}, 'Bearer '+self.secret)
+                self.assertEqual(len(self.dispatched), len(replies))
+                self.assertEqual(state, {'profile': now, 'loaded': loaded_readback(now, 'ref-2')})
+                reply = r.unload_owned(helper, ID, PLAN['plan'], None, state, 'emb-ref', time.monotonic()+60)
+                self.assertEqual(helper.calls[-1], ('unload', {'identifier': ID, 'instanceReference': 'ref-2', 'embeddingReference': 'emb-ref', 'profile': now}))
+                self.assertEqual(reply['unloaded'], ID)
+
+    def test_passing_probes_record_the_boundary_and_one_model_cleanup_is_unchanged(self):
+        state = {'profile': BONSAI, 'loaded': loaded_readback(BONSAI, 'ref-1')}
+        tool_ok = copy.deepcopy(self.bad_tool); tool_ok['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = '{"ok":true}'
+        helper, run_boundary = self.drive([self.good_json, tool_ok], 'B1', 'turns', state)
+        run_boundary()
+        self.assertEqual(self.events, ['model_swap', 'post_swap_compatibility_probes_passed'])
+        self.assertFalse(self.gateway.cancelled.is_set()); self.assertEqual(self.gateway.state['chat_attempts'], 2)
+        single = FakeHelper(unload={'unloaded': ID})
+        r.unload_owned(single, ID, None, loaded_readback('qwen3-8b', 'ref-9'), {'profile': None, 'loaded': None}, 'emb-ref', time.monotonic()+60)
+        self.assertEqual(single.calls, [('unload', {'identifier': ID, 'instanceReference': 'ref-9', 'embeddingReference': 'emb-ref'})])
 
 if __name__ == '__main__':
     unittest.main()

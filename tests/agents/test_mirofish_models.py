@@ -164,7 +164,7 @@ def test_add_refuses_files_outside_the_models_root(tmp_path):
 def native_row(**changes):
     row = {"native": True, "description": "test", "lmstudio_key": "my-gguf", "ollama_tag": None, "max_context": 40960,
            "weight_file": str(mm.MODEL_ROOT / "tmf4-test-only/model.gguf"), "weight_bytes": 2048, "weight_sha256": "1" * 64,
-           "tokenizer_root": str(mm.MODEL_ROOT / "tmf4-test-only/tokenizer"), "tokenizer_model_type": "qwen3",
+           "tokenizer_root": str(mm.MODEL_ROOT / "Qwen3-8B-tokenizer"), "tokenizer_model_type": "qwen3",
            "tokenizer_quant_bits": None, "gguf_selection": {k: LISTING["my-gguf"][k] for k in mm._SELECTION_KEYS}}
     row["gguf_selection"]["deviceIdentifier"] = None
     row.update(changes)
@@ -180,6 +180,16 @@ def native_row(**changes):
     json.dumps({"profiles": {"m1": native_row(weight_file="/tmp/model.gguf")}}),
     json.dumps({"profiles": {"m1": native_row(tokenizer_root=str(mm.MODEL_ROOT / "../valedia-trader"))}}),
     json.dumps({"profiles": {"m1": native_row(gguf_selection={"modelKey": "my-gguf"})}}),
+    # addendum 3, S3: the native reader's own shape checks, which this reader now applies too
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={**native_row()["gguf_selection"], "quantization": {"name": "Q4_K_M"}})}}),
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={**native_row()["gguf_selection"], "vision": None})}}),
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={**native_row()["gguf_selection"], "maxContextLength": 8192})}}),
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={**native_row()["gguf_selection"], "format": "safetensors"})}}),
+    json.dumps({"profiles": {"m1": native_row(gguf_selection={**native_row()["gguf_selection"], "deviceIdentifier": "x"})}}),
+    json.dumps({"profiles": {"m1": native_row(tokenizer_model_type=None)}}), json.dumps({"profiles": {"m1": native_row(tokenizer_quant_bits="4")}}),
+    # addendum 3, S2: a tokenizer folder high in the tree, or one that holds weights
+    json.dumps({"profiles": {"m1": native_row(tokenizer_root=str(mm.MODEL_ROOT / "lmstudio-library"))}}),
+    json.dumps({"profiles": {"m1": native_row(tokenizer_root=str(mm.MODEL_ROOT / "lmstudio-library/Qwen/Qwen3-8B"))}}),
 ])
 def test_a_malformed_registry_refuses_with_the_tool_refusal(tmp_path, text):
     reg = tmp_path / "registry.json"
@@ -298,3 +308,86 @@ def test_cli_add_use_status_remove(tmp_path, monkeypatch, capsys):
     assert mm.main(["remove", "mlx-27b"]) == 2                                      # in use
     assert mm.main(["use", "27b"]) in (0, 1) and mm.main(["remove", "mlx-27b"]) == 0
     assert mm.main(["add", "bad name!", "--lmstudio-key", "k"]) == 2
+
+
+# ---- addendum 3, S3: add never writes a row the reader refuses (S2's narrow tokenizer folder included)
+
+NATIVE_READ = ("import json, sys, pathlib, mirofish_native_model as m; m._MODEL_ROOT = pathlib.Path(sys.argv[1]); "
+               "native, http = m.registered_profiles(pathlib.Path(sys.argv[2])); print(json.dumps(sorted(native) + sorted(http)))")
+
+
+def native_read(tmp_path, registry):
+    """The native module's own reader (registered_profiles) on a registry, with the test's models root."""
+    where = tmp_path / "native-module"
+    where.mkdir(exist_ok=True)
+    for name in ("mirofish_native_model.py", "mirofish_native_gateway.py"):
+        shutil.copy2(SRC / name, where / name)
+    return subprocess.run([sys.executable, "-B", "-c", NATIVE_READ, str(tmp_path), str(registry)], cwd=where, capture_output=True, text=True)
+
+
+def listing_with(**changes):
+    return {"my-gguf": {**LISTING["my-gguf"], **changes}}
+
+
+MUTATIONS = [("bits missing", {"quantization": {"name": "Q4_K_M"}}), ("bits text", {"quantization": {"name": "Q4_K_M", "bits": "4"}}),
+             ("quantization none", {"quantization": None}), ("extra quantization field", {"quantization": {"name": "Q4", "bits": 4, "x": 1}}),
+             ("publisher none", {"publisher": None}), ("architecture none", {"architecture": None}), ("vision none", {"vision": None}),
+             ("tool use missing", {"trainedForToolUse": None}), ("context text", {"maxContextLength": "40960"}),
+             ("path number", {"path": 7}), ("identifier none", {"indexedModelIdentifier": None}), ("vision true", {"vision": True}),
+             ("bits two", {"quantization": {"name": "Q2_0", "bits": 2}}), ("as listed", {})]
+
+
+@pytest.mark.parametrize("label, changes", MUTATIONS, ids=[m[0] for m in MUTATIONS])
+def test_add_refuses_or_writes_a_row_both_readers_accept(tmp_path, root, label, changes):
+    reg = tmp_path / "registry.json"
+    weights, tok = assets(tmp_path)
+    try:
+        mm.add("my-model", "my-gguf", weights, tok, listing=listing_with(**changes), registry_file=reg)
+    except mm.ProfileError:
+        assert not reg.exists(), label                                            # refused before anything is written
+        assert label not in ("vision true", "bits two", "as listed")
+        return
+    assert label in ("vision true", "bits two", "as listed")
+    assert "my-model" in mm.profiles(reg)
+    seen = native_read(tmp_path, reg)
+    assert seen.returncode == 0 and json.loads(seen.stdout) == ["my-model"], seen.stderr[-600:]
+
+
+def test_the_listing_whose_quantization_lacks_bits_is_refused_by_add(tmp_path, root):
+    reg = tmp_path / "registry.json"
+    weights, tok = assets(tmp_path)
+    mm.add("first-model", "my-gguf", weights, tok, listing=LISTING, registry_file=reg)
+    before = reg.read_bytes()
+    with pytest.raises(mm.ProfileError, match="quantization"):
+        mm.add("my-model", "my-gguf", weights, tok, listing=listing_with(quantization={"name": "Q4_K_M"}), registry_file=reg)
+    assert reg.read_bytes() == before                                             # the registry is left as it was
+    seen = native_read(tmp_path, reg)
+    assert seen.returncode == 0 and json.loads(seen.stdout) == ["first-model"], seen.stderr[-600:]
+
+
+def test_add_refuses_a_wide_tokenizer_folder(tmp_path, root):
+    reg = tmp_path / "registry.json"
+    weights, tok = assets(tmp_path)
+    (tok / "sub").mkdir()
+    (tok / "sub" / "hidden.gguf").write_bytes(b"g")
+    with pytest.raises(mm.ProfileError, match=r"\.gguf"):
+        mm.add("my-model", "my-gguf", weights, tok, listing=LISTING, registry_file=reg)
+    (tok / "sub" / "hidden.gguf").unlink()
+    inner = tok / "model.gguf"                                                    # weights inside the tokenizer folder
+    inner.write_bytes(weights.read_bytes())
+    with pytest.raises(mm.ProfileError, match=r"\.gguf|parent of a pinned"):
+        mm.add("my-model", "my-gguf", inner, tok, listing=LISTING, registry_file=reg)
+    inner.unlink()
+    wide = tmp_path / "wide"
+    (wide / "x").mkdir(parents=True)
+    for f in mm.TOKENIZER_FILES:
+        shutil.copy2(tok / f, wide / f)
+    first = wide / "x" / "model.gguf"
+    shutil.copy2(weights, first)
+    mm.add("first", "my-gguf", first, tok, listing=LISTING, registry_file=reg)
+    first.unlink()                                                                # pinned, not on disk now
+    with pytest.raises(mm.ProfileError, match="parent of a pinned"):              # the parent of another row's weights
+        mm.add("wide", "my-gguf", weights, wide, listing=LISTING, registry_file=reg)
+    assert set(json.loads(reg.read_text())["profiles"]) == {"first"}
+    seen = native_read(tmp_path, reg)
+    assert seen.returncode == 0 and json.loads(seen.stdout) == ["first"], seen.stderr[-600:]
