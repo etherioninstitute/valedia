@@ -316,7 +316,7 @@ def test_the_doctor_says_off_when_the_locks_cannot_be_judged(live_repo, monkeypa
 # ---- T32: the live-mode note says which strategies the broker book follows, or that config/broker_book.json is
 # missing or refused and that live mode would stop for that, through the reading function the order step is given
 
-def _ledger_with(repo, name="hold_rebalance_etf_2006_2026"):
+def _ledger_with(repo, name="hold_rebalance_etf_2006_2026", direction="long"):
     from valedia_trader.research_loop import ledger as lg
     led = lg.HypothesisLedger(repo / "memory" / "ledger.db")
     try:
@@ -327,9 +327,30 @@ def _ledger_with(repo, name="hold_rebalance_etf_2006_2026"):
     (repo / "strategies").mkdir(exist_ok=True)
     (repo / "strategies" / f"{name}_h{hid}.json").write_text(json.dumps({
         "name": name, "version": "1.0.0", "hypothesis": "Hold a fixed basket and rebalance it", "market": ["SPY", "TLT"],
-        "entry": {"rule": "momentum", "lookback": 10, "enter": 0.03, "exit": 0.0, "direction": "both"},
+        "entry": {"rule": "momentum", "lookback": 10, "enter": 0.03, "exit": 0.0, "direction": direction},   # T38-1b: long
         "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.5, "max_open_positions": 2, "stop_loss_pct": None}}))
     return hid
+
+
+def test_t38_1b_the_doctor_says_a_follow_file_naming_a_strategy_that_can_hold_a_short_would_stop_live_mode(live_repo):
+    hid = _ledger_with(live_repo, direction="both")
+    _owner(live_repo, "broker_book.json", {"follow": [hid]})
+    before = _tree(live_repo)
+    status, detail = _venues(live_repo)
+    assert ("broker book: not followed: config/broker_book.json names a hypothesis that cannot be followed; live mode "
+            "would stop for that") in detail
+    assert f"hypothesis {hid}" not in detail                  # A1: no id from the file
+    assert _tree(live_repo) == before
+
+
+def test_t38_1b_the_ledger_line_counts_what_the_paper_command_steps_and_says_how_many_it_leaves_out(live_repo):
+    paths = LoopPaths(live_repo)
+    _ledger_with(live_repo, "mom_long_basket")
+    status, text = D.check_ledger(paths)
+    assert status == D.OK and "1 in paper trading)" in text and "not stepped" not in text
+    _ledger_with(live_repo, "mom_both_basket", direction="both")
+    status, text = D.check_ledger(paths)
+    assert status == D.OK and "1 in paper trading (1 not stepped: can hold a short))" in text, text
 
 
 def test_the_doctor_says_the_broker_book_file_is_missing_and_that_live_mode_would_stop(live_repo):

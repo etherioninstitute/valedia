@@ -379,3 +379,80 @@ def test_load_strategy_builds_a_pairs_spec_and_refuses_an_unknown_kind(tmp_path)
     (tmp_path / "list.json").write_text("[1, 2]")
     with pytest.raises(st.SpecError, match="JSON object"):
         st.load_strategy(tmp_path / "list.json")
+
+
+# ---- T38-1b: every strategy answers holds_shorts; can_hold_shorts is the one thing the guards call
+
+def _entry(direction=None):
+    e = {"rule": "momentum", "lookback": 5, "enter": 0.05, "exit": 0.0}
+    return e if direction is None else {**e, "direction": direction}
+
+
+@pytest.mark.parametrize("direction, shorts", [(None, False), ("long", False), ("short", True), ("both", True)])
+def test_t38_1b_a_rule_strategy_holds_shorts_unless_it_is_long_only(direction, shorts):
+    s = st.RuleStrategy.from_spec(spec(entry=_entry(direction)))
+    assert s.holds_shorts is shorts and st.can_hold_shorts(s) is shorts
+    with pytest.raises(AttributeError):
+        s.holds_shorts = not shorts                                             # read-only
+
+
+def test_t38_1b_a_short_direction_on_a_crypto_only_market_counts_as_able_to_short():
+    s = st.RuleStrategy.from_spec(spec(market=["BTC-USD", "ETH-USD"], entry=_entry("short")))
+    assert s.holds_shorts is True and st.can_hold_shorts(s) is True              # conservative, though never shorted
+
+
+@pytest.mark.parametrize("legs, shorts", [("both", True), ("long", False)])
+def test_t38_1b_a_pairs_strategy_holds_shorts_exactly_when_it_takes_both_legs(legs, shorts):
+    from valedia_trader.research_loop.pairs import PairsStrategy
+    s = PairsStrategy.from_spec({"kind": "pairs", "name": "pairs_shorts", "version": "1.0.0",
+                                 "hypothesis": "Two related prices drift back together", "pairs": [["A", "B"]],
+                                 "signal": {"hedge": "ratio", "window": 20, "enter": 1.5, "exit": 0.5}, "legs": legs})
+    assert s.holds_shorts is shorts and st.can_hold_shorts(s) is shorts
+
+
+class _Quiet(st.Strategy):
+    """A hand-written strategy that says nothing about shorts."""
+    name, version, market, risk = "quiet_test", "1.0.0", ("A",), st.StrategyRisk()
+    hypothesis = "A strategy that says nothing is assumed able to short"
+
+    def entry(self, prices):
+        return pd.DataFrame(1, index=prices.index, columns=prices.columns)
+
+    def exit(self, prices, side):
+        return pd.DataFrame(False, index=prices.index, columns=prices.columns)
+
+    def size(self, prices):
+        return pd.DataFrame(0.1, index=prices.index, columns=prices.columns)
+
+
+def test_t38_1b_a_hand_written_strategy_that_says_nothing_can_hold_shorts_and_one_that_says_so_cannot():
+    quiet = _Quiet()
+    assert quiet.holds_shorts is True and st.can_hold_shorts(quiet) is True
+    with pytest.raises(AttributeError):
+        quiet.holds_shorts = False                                              # the base property is read-only
+
+    class LongOnly(_Quiet):
+        holds_shorts = False
+
+    assert st.can_hold_shorts(LongOnly()) is False
+
+
+def test_t38_1b_can_hold_shorts_treats_a_missing_or_raising_attribute_as_true():
+    class Raises:
+        @property
+        def holds_shorts(self):
+            raise RuntimeError("cannot say")
+
+    class BadBool:
+        def __bool__(self):
+            raise ValueError("no truth value")
+
+    class Answers:
+        def __init__(self, value):
+            self.holds_shorts = value
+
+    assert st.can_hold_shorts(object()) is True                                 # no such attribute
+    assert st.can_hold_shorts(Raises()) is True                                 # it raises
+    assert st.can_hold_shorts(Answers(BadBool())) is True                       # its truth value raises
+    assert st.can_hold_shorts(Answers(0)) is False and st.can_hold_shorts(Answers("yes")) is True
+    assert st.can_hold_shorts(None) is True

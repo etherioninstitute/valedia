@@ -519,8 +519,11 @@ class _LiveVenue(_Venue):
 REAL_LIVE_VENUE = cli._order_step_live_venue                    # before any fixture replaces it (T32 rev 2)
 
 
-def _strategy_file(root, hid, name, market=("SPY", "QQQ")):
-    spec = {**strat().to_spec(), "name": name, "market": list(market)}
+def _strategy_file(root, hid, name, market=("SPY", "QQQ"), direction="long", entry=None):
+    """T38-1b: long-only by default (a strategy that can hold a short is neither stepped nor followed); `direction`
+    "both" keeps the old form; `entry` replaces the entry rule whole."""
+    base = strat().to_spec()
+    spec = {**base, "name": name, "market": list(market), "entry": entry or {**base["entry"], "direction": direction}}
     (root / "strategies").mkdir(exist_ok=True)
     path = root / "strategies" / f"{name}_h{hid}.json"
     path.write_text(json.dumps(spec))
@@ -1328,7 +1331,7 @@ def _no_price_project(tmp_path, monkeypatch):
         led.set_status(hid, "passed paper")
     finally:
         led.close()
-    _strategy_file(root, hid, "mom_paper", ("UP", "DOWN"))
+    _strategy_file(root, hid, "mom_paper", ("UP", "DOWN"), entry={"rule": "hold", "enter": 1, "exit": 0})   # T38-1b: DOWN held long
     frame = {}
     monkeypatch.setattr(cli, "_market", lambda args: (frame["prices"], None, None))
 
@@ -1412,3 +1415,306 @@ def test_the_cycle_on_a_night_it_cannot_price_says_so_in_one_line_and_runs_no_re
     assert reviews == [] and _book_files(root) == before and not list((root / "journal").glob("review-*"))
     status, out, _ = run(["cycle", "--no-research", "--critic"], px.iloc[:26])   # the data back: the whole cycle runs
     assert status == 0 and json.loads(out)["paper"]["days_processed"] == 3 and len(reviews) == 1
+
+
+# ---- T38-1b: a strategy that can hold a short is not stepped in paper and cannot be followed at the broker
+
+NOT_STEPPED = "can hold a short position: the paper book and its tax ledger do not handle shorts yet"
+LONG_RULE = {"name": "mom_long", "version": "1.0.0", "hypothesis": "Assets that rose over ten days keep rising",
+             "market": ["UP", "DOWN"],
+             "entry": {"rule": "momentum", "lookback": 10, "enter": 0.03, "exit": 0.0, "direction": "long"},
+             "sizing": {"rule": "equal"}, "risk": {"max_position_pct": 0.5, "max_open_positions": 2, "stop_loss_pct": None}}
+BOTH_RULE = {**LONG_RULE, "name": "mom_both", "entry": {**LONG_RULE["entry"], "direction": "both"}}
+PAIRS_BOTH = {"kind": "pairs", "name": "pairs_both", "version": "1.0.0",
+              "hypothesis": "Two related prices drift back together after they part", "pairs": [["UP", "DOWN"]],
+              "signal": {"hedge": "ratio", "window": 5, "enter": 1.0, "exit": 0.2, "stop_z": None}, "legs": "both",
+              "sizing": {"pair_weight": 0.10, "max_open_pairs": 1},
+              "risk": {"max_position_pct": 0.10, "max_gross": 1.0, "stop_loss_pct": None}}
+PAIRS_LONG = {**PAIRS_BOTH, "name": "pairs_long", "legs": "long"}
+T38_TAX_RULES = {"jurisdiction": "made-up", "long_term": {"after_years": 1, "verified_on": None},          # made up: notes only
+                 "wash_sale": {"window_days": 30, "applies_to": {"security": True, "crypto": False}, "verified_on": None},
+                 "wash_sale_same_purchase": {"remainder_is_replacement": True, "verified_on": None},
+                 "lot_method": {"method": "FIFO", "verified_on": None}}
+NOTHING_TO_TRADE = "no strategy has passed its backtest and sealed test; nothing to paper trade\n"
+
+
+def _t38_project(root, specs, statuses=None):
+    """A project with risk limits, made-up tax rules and one idea per spec (in order, ids from 1), each at status
+    "passed backtest only" unless `statuses` names another for its strategy's name, with its strategy file."""
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "risk.json").write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0,
+                                                           "max_position_pct": 0.6, "max_open_positions": 5}))
+    (root / "config" / "tax_rules.json").write_text(json.dumps(T38_TAX_RULES))
+    (root / "strategies").mkdir()
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    ids = []
+    try:
+        for spec in specs:
+            hid = led.propose(f"{spec['hypothesis']} ({spec['name']})", "test", cli.MARKET)
+            led.set_status(hid, (statuses or {}).get(spec["name"], "passed backtest only"))
+            (root / "strategies" / f"{spec['name']}_h{hid}.json").write_text(json.dumps(spec))
+            ids.append(hid)
+    finally:
+        led.close()
+    return ids
+
+
+def _book_bytes(root):
+    return {p.name: p.read_bytes() for p in sorted((root / "journal").iterdir()) if p.name != "paper_state.lock"}
+
+
+def _journal_entries(root):
+    return [json.loads(line) for f in sorted((root / "journal").glob("*.jsonl")) for line in f.read_text().splitlines()]
+
+
+@pytest.fixture
+def t38(tmp_path, monkeypatch):
+    """`run(root, argv, prices)` runs the command line on that price frame and returns (status, out, err); journal
+    lines carry a fixed clock so that two books compare byte for byte. `reviews` collects the names each weekly
+    review is given (the review itself is a stand-in)."""
+    import contextlib
+    import io
+    from datetime import datetime
+
+    from valedia_trader.research_loop import paper, risk_gate
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 3, 2, 21, 0, tzinfo=tz)
+
+    monkeypatch.setattr(paper, "datetime", FixedClock)
+    monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
+    frame, reviews = {}, []
+    monkeypatch.setattr(cli, "_market", lambda args: (frame["prices"], None, None))
+    monkeypatch.setattr(cli, "Gauntlet", lambda *a, **k: object())                 # nothing untested: no tests run
+    monkeypatch.setattr(cli.critic_mod, "weekly_review",
+                        lambda ledger, journal, last, names, *a, **k: reviews.append(dict(names)) or {"path": "review",
+                                                                                                    "findings": []})
+
+    def run(root, argv, prices):
+        frame["prices"] = prices
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = cli.main(["--root", str(root), *argv])
+        return status, out.getvalue(), err.getvalue()
+
+    return run, reviews
+
+
+CYCLE = ["cycle", "--no-research", "--critic"]
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_only_the_long_only_idea_is_stepped_the_others_are_named_every_run_and_its_book_is_byte_identical(
+        tmp_path, t38, argv):
+    run, reviews = t38
+    import shutil
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE])
+    alone = [run(root, argv, px.iloc[:k]) for k in (20, 32)]
+    assert [s for s, _, _ in alone] == [0, 0], alone
+    assert [json.loads(out)["not_stepped"] for _, out, _ in alone] == [[], []]
+    book_alone = _book_bytes(root)
+    shutil.rmtree(root)
+    assert _t38_project(root, [LONG_RULE, BOTH_RULE, PAIRS_BOTH]) == [1, 2, 3]       # the long-only idea keeps id 1
+    reviews.clear()
+    for k in (20, 32):                                                               # a first run and a second one
+        status, out, err = run(root, argv, px.iloc[:k])
+        assert status == 0, err
+        got = json.loads(out)
+        assert sorted(got["not_stepped"], key=lambda e: e["id"]) == [
+            {"id": 2, "name": "mom_both", "reason": NOT_STEPPED}, {"id": 3, "name": "pairs_both", "reason": NOT_STEPPED}]
+        assert (got if argv == ["paper-step"] else got["paper"])["capital_shared_by"] == 1
+    assert _book_bytes(root) == book_alone                                           # journal and state, byte for byte
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    assert set(state["positions"]) == {"mom_long"} and set(state["history"][-1]["strategy_values"]) == {"mom_long"}
+    entries = _journal_entries(root)
+    assert any(e.get("type") == "fill" for e in entries)                             # the long-only book did trade
+    assert not any("unavailable" in json.dumps(e.get("tax")) for e in entries if "tax" in e)   # tax notes stay on
+    if argv == CYCLE:                                                                # the review names what it did before
+        assert reviews == [{1: "mom_long", 2: "mom_both", 3: "pairs_both"}] * 2
+
+
+def test_t38_1b_a_long_leg_pairs_idea_is_stepped(tmp_path, t38):
+    run, _ = t38
+    root = tmp_path / "project"
+    _t38_project(root, [PAIRS_LONG])
+    status, out, err = run(root, ["paper-step"], prices().iloc[:20])
+    assert status == 0, err
+    got = json.loads(out)
+    assert got["not_stepped"] == [] and got["capital_shared_by"] == 1 and got["days_processed"] == 1
+    state = json.loads((root / "journal" / "paper_state.json").read_text())
+    assert set(state["history"][-1]["strategy_values"]) == {"pairs_long"}
+
+
+def test_t38_1b_with_nothing_stepped_the_sentence_is_unchanged_and_what_was_left_out_follows_it(tmp_path, t38):
+    run, _ = t38
+    px = prices().iloc[:20]
+    empty = tmp_path / "empty"
+    _t38_project(empty, [])
+    assert run(empty, ["paper-step"], px) == (0, NOTHING_TO_TRADE, "")              # nothing left out: as before
+    root = tmp_path / "project"
+    ids = _t38_project(root, [BOTH_RULE])
+    status, out, err = run(root, ["paper-step"], px)
+    assert status == 0 and err == "" and out.startswith(NOTHING_TO_TRADE), (status, out, err)
+    assert json.loads(out[len(NOTHING_TO_TRADE):]) == {"not_stepped": [{"id": ids[0], "name": "mom_both",
+                                                                         "reason": NOT_STEPPED}]}
+    status, out, err = run(root, CYCLE, px)
+    got = json.loads(out)
+    assert status == 0 and got["paper"] == "nothing has passed its backtest and sealed test", (status, out, err)
+    assert got["not_stepped"] == [{"id": ids[0], "name": "mom_both", "reason": NOT_STEPPED}]
+    assert not (root / "journal" / "paper_state.json").exists()
+
+
+def test_t38_1b_the_alpaca_mirror_run_names_what_was_left_out(tmp_path, t38, monkeypatch):
+    from valedia_trader.core import secrets
+    run, _ = t38
+
+    class Mirror:
+        name, sent = "alpaca-standin", []
+
+        def submit(self, *a, **k):
+            self.sent.append(a)
+            return {"status": "accepted"}
+
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: "PKTEST")
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: Mirror())
+    root = tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE, BOTH_RULE])
+    status, out, err = run(root, ["paper-step", "--alpaca"], prices().iloc[:20])
+    assert status == 0, err
+    got = json.loads(out)
+    assert got["not_stepped"] == [{"id": ids[1], "name": "mom_both", "reason": NOT_STEPPED}] and got["capital_shared_by"] == 1
+
+
+HELD_REFUSAL = ("refused: the paper book holds positions of mom_both, which can hold a short and is no longer stepped; "
+                "nothing was stepped\n")
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_a_book_already_holding_a_left_out_strategy_stops_the_run_and_steps_nothing(tmp_path, t38, monkeypatch,
+                                                                                            argv):
+    run, reviews = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE, BOTH_RULE])
+    with monkeypatch.context() as m:
+        m.setattr(cli, "can_hold_shorts", lambda s: False)                        # a book stepped before the guard
+        assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+        assert run(root, ["paper-step"], px.iloc[:24])[0] == 0
+    held = json.loads((root / "journal" / "paper_state.json").read_text())["positions"]["mom_both"]
+    assert any(lot["units"] < 0 for lot in held.values()), held                    # it holds a short
+    before = _book_files(root)
+    reviews.clear()
+    for _ in range(2):
+        assert run(root, argv, px.iloc[:30]) == (2, "", HELD_REFUSAL)
+    assert _book_files(root) == before and reviews == []                           # bytes and times; no review after it
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_a_book_with_only_zero_lots_under_a_left_out_name_runs(tmp_path, t38, argv):
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE, BOTH_RULE])
+    assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+    state_file = root / "journal" / "paper_state.json"
+    state = json.loads(state_file.read_text())
+    state["positions"]["mom_both"] = {"UP": {"units": 0.0, "cost": 0.0}, "DOWN": {"units": -0.0, "cost": 0.0}}
+    state_file.write_text(json.dumps(state))
+    status, out, err = run(root, argv, px.iloc[:24])
+    assert status == 0, err
+    assert json.loads(out)["not_stepped"] == [{"id": ids[1], "name": "mom_both", "reason": NOT_STEPPED}]
+    assert json.loads(state_file.read_text())["last_day"] == str(px.index[23].date())
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], ["cycle", "--no-research"]], ids=["paper-step", "cycle"])
+def test_t38_1b_a_strategy_file_that_cannot_be_loaded_refuses_the_run_as_before(tmp_path, t38, argv):
+    run, _ = t38
+    root = tmp_path / "project"
+    ids = _t38_project(root, [BOTH_RULE, LONG_RULE])
+    (root / "strategies" / f"mom_long_h{ids[1]}.json").unlink()
+    assert run(root, argv, prices().iloc[:20]) == (2, "", f"refused: no strategy file found for hypothesis {ids[1]}; "
+                                                         "pass --file\n")
+    assert not (root / "journal" / "paper_state.json").exists()
+
+
+def test_t38_1b_the_critic_command_names_what_it_named_before_through_the_same_builder(tmp_path, t38, monkeypatch):
+    run, reviews = t38
+    root = tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE, BOTH_RULE, PAIRS_BOTH, PAIRS_LONG],
+                       statuses={"mom_long": "passed paper", "pairs_both": "paused", "pairs_long": "paused"})
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        led.record_paper(ids[2], {"days": 5})                                       # paused with a paper record
+        before = {h["id"]: cli._strategy_for(cli.LoopPaths(root), led, h["id"], None)[0].name   # the base commit's reader
+                  for s in (*cli.PAPER_STATUSES, "paused") for h in led.search(status=s)
+                  if h["paper_trading_result"] or s != "paused"}
+    finally:
+        led.close()
+    calls = []
+    real = cli.strategies_to_step
+    monkeypatch.setattr(cli, "strategies_to_step", lambda *a, **k: calls.append(1) or real(*a, **k))
+    status, out, err = run(root, ["critic"], prices())
+    assert status == 0, err
+    assert list(reviews[-1].items()) == list(before.items()) and set(before) == set(ids[:3]), (reviews, before)
+    assert calls == [1]
+
+
+T38_REFUSAL = ("config/broker_book.json names hypothesis 26, whose strategy can hold a short position; the order step "
+               "sells only what the broker book owns, so it cannot be followed until shorts are built")
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["paper", "live"])
+@pytest.mark.parametrize("kind", ["rule both", "rule short", "pairs both"])
+def test_t38_1b_the_follow_list_refuses_a_strategy_that_can_hold_a_short(follow_project, monkeypatch, kind, live):
+    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.venues import webull
+    root, _ = follow_project
+    monkeypatch.setattr(webull, "LIVE_REPO", root, raising=False)
+    if kind == "pairs both":
+        (root / "strategies" / f"{H26}_h26.json").write_text(json.dumps({**PAIRS_BOTH, "name": H26,
+                                                                         "pairs": [["QQQ", "SPY"]]}))
+    else:
+        _strategy_file(root, 26, H26, ("QQQ",), direction=kind.split()[1])
+    paths = cli.LoopPaths(root)
+    for ids in ([23, 26], [26]):
+        _book_file(root, {"follow": ids})
+        for trader in (None, cli.PaperTrader(paths.journal, paths.risk_limits)):
+            assert cli.broker_book_follow(paths, live=live, trader=trader) == order_step.Follow(refused=T38_REFUSAL)
+
+
+def test_t38_1b_the_order_step_stops_at_the_follow_stage_for_a_strategy_that_can_hold_a_short(follow_project, capsys):
+    root, venue = follow_project
+    assert cli.main(["--root", str(root), "order-step"]) == 0                             # open orders, as before
+    capsys.readouterr()
+    book_before = json.dumps(venue.book, sort_keys=True)
+    venue.calls.clear()
+    _strategy_file(root, 26, H26, ("QQQ",), direction="both")                            # the old form of the file
+    _book_file(root, {"follow": [23, 26]})
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "stopped" and out["stage"] == "follow" and T38_REFUSAL in out["reason"], out
+    assert [c for c in venue.calls if c in ("submit", "cancel")] == [] and json.dumps(venue.book, sort_keys=True) == book_before
+
+
+# built with the base commit 09e3be3 (before T38-1b) on this same project, long-only strategy files
+T38_BASE_DIGESTS = {(23, 26): "c9e3c8bc27a31e49fe3de362d07b0c40f05ce3afd66cfefaa7ec866a0ecb2fc2",
+                    (26,): "8c87d49c7641fcc4f3628c91bfb0023a6b1871c1cc94f8006022717d21ecb167"}
+
+
+def test_t38_1b_a_long_only_follow_list_is_accepted_exactly_as_on_the_base_commit(follow_project, monkeypatch):
+    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.venues import webull
+    root, _ = follow_project
+    monkeypatch.setattr(webull, "LIVE_REPO", root, raising=False)
+    paths = cli.LoopPaths(root)
+    names = {23: H23, 26: H26}
+    for ids, digest in T38_BASE_DIGESTS.items():
+        _book_file(root, {"follow": list(ids)})
+        trader = cli.PaperTrader(paths.journal, paths.risk_limits)
+        for live in (False, True):
+            want = order_step.Follow(ids=ids, names=tuple(names[i] for i in ids), digest=digest, every=False)
+            assert cli.broker_book_follow(paths, live=live) == want
+            assert cli.broker_book_follow(paths, live=live, trader=trader) == order_step.Follow(
+                ids=want.ids, names=want.names, digest=digest, every=ids == (23, 26))
