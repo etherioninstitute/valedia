@@ -6688,8 +6688,8 @@ def test_t34b2_a_run_stopped_at_the_reconcile_never_judges_a_final_one(world):
     world.run()
     world.later(30)
     _t34_positions_fail(world, {1, 2})                                 # both reconciles before sending: blocked
-    out = world.run()
-    assert out["status"] == "stopped" and out["stage"] == "reconcile" and "faults" not in out, out
+    out = world.run()                                                  # T34b-3 (G): the positions read alone: venue_read
+    assert out["status"] == "stopped" and out["stage"] == "venue_read" and "faults" not in out, out
 
 
 # ---- F2: a blocking attention item opened in the run
@@ -6981,10 +6981,12 @@ class _ThroughLimit(LiveVenue):
         return out
 
 
-@pytest.mark.parametrize("factor, add, fault", [(1.01, 0.0, True), (1.0, 0.006, True), (1.0, 0.005, False),
-                                                (1.0, 0.004, False), (1 + 1.1e-6, 0.0, False), (1.0, 0.0, False)])
+@pytest.mark.parametrize("factor, add, fault", [(1.01, 0.0, True), (1.0, 0.006, True), (1.0, 0.005, True),
+                                                (1.0, 0.004, True), (1 + 1.1e-6, 0.0, True), (1 + 0.9e-6, 0.0, False),
+                                                (1.0, 0.0, False)])
 def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, factor, add, fault):
-    # K1: the order's average beyond its limit by more than max(1e-6 of it, half a cent); the edge is no breach
+    # K1: the order's average beyond its limit by more than 1e-6 of it (T34b-3 E: the half cent is gone); the edge is
+    # no breach
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
     venue.buy, venue.buy_add = factor, add                            # IWM 3 at 202 x 1.01: 612, under max_order_value
     w = _t34_world(tmp_path / "w", venue=venue)
@@ -6996,8 +6998,9 @@ def test_t34b2_a_purchase_filled_above_its_own_limit_is_a_cap_fault(tmp_path, fa
     assert out.get("faults") == (["cap"] if fault else None) and "cap_unjudged" not in out, out
 
 
-@pytest.mark.parametrize("factor, add, fault", [(0.99, 0.0, True), (1.0, -0.006, True), (1.0, -0.005, False),
-                                                (1.0, -0.004, False), (1 - 1.1e-6, 0.0, False), (1.0, 0.0, False)])
+@pytest.mark.parametrize("factor, add, fault", [(0.99, 0.0, True), (1.0, -0.006, True), (1.0, -0.005, True),
+                                                (1.0, -0.004, True), (1 - 1.1e-6, 0.0, True), (1 - 0.9e-6, 0.0, False),
+                                                (1.0, 0.0, False)])
 def test_t34b2_a_sale_filled_below_its_own_limit_is_a_cap_fault(tmp_path, factor, add, fault):
     venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
     w = _t34_world(tmp_path / "w", venue=venue)
@@ -7900,11 +7903,66 @@ def test_t34b2_a_practice_run_past_any_working_stop_refuses_nothing_and_writes_n
 
 # ---- P and the comparisons with earlier revisions: equal but for the added keys
 
-def _t34_same_but(b, m, keys, where, skip=()):
+T34B3_KEYS = ("notices", "cap_refs")                 # T34b-3: the summary keys it adds
+T34B3_EVENTS = ("notice", "verdict")                 # ... the journal lines it adds
+
+
+def _t34b3_undo(b, m, counts=None):
+    """`m` (a run's record through T34b-3 or later) with what T34b-3 is allowed to add taken out, each kind counted in
+    `counts`: the `verdict` field at the end of a fill line, the `notice` and `verdict` lines, the summary keys
+    `notices` and `cap_refs`, and the stage `venue_read` where `b` stopped at `reconcile` (with its reason, in the
+    returned summary, the summary line and the stopped line). Anything else is left for the caller to find."""
+    def bump(kind):
+        if counts is not None:
+            counts[kind] = counts.get(kind, 0) + 1
+    m = dict(m)
+    if "summary" in m and "summary" in b:
+        bs, ms = json.loads(b["summary"]), json.loads(m["summary"])
+        for k in T34B3_KEYS:
+            if k in ms and k not in bs:
+                ms.pop(k)
+                bump(f"summary key {k}")
+        if ms.get("stage") == "venue_read" and bs.get("stage") == "reconcile":
+            ms["stage"], ms["reason"] = bs["stage"], bs.get("reason")
+            bump("stage venue_read")
+        m["summary"] = json.dumps(ms, sort_keys=True, default=str)
+    if "journal" in m and "journal" in b:
+        journal = {}
+        for name, data in m["journal"].items():
+            kept = []
+            for line in data.split(b"\n"):
+                e = json.loads(line) if line.strip() else None
+                if isinstance(e, dict) and e.get("type") == "order_step":
+                    if e.get("event") in T34B3_EVENTS:
+                        bump(f"{e['event']} line")
+                        continue
+                    if e.get("event") == "fill" and list(e)[-1:] == ["verdict"]:
+                        e.pop("verdict")
+                        bump("verdict field")
+                        line = json.dumps(e, default=str).encode()
+                    elif e.get("event") == "summary" and any(k in e for k in T34B3_KEYS):
+                        line = json.dumps({k: v for k, v in e.items() if k not in T34B3_KEYS}, default=str).encode()
+                kept.append(line)
+            theirs = b["journal"].get(name, b"").split(b"\n")
+            if len(theirs) == len(kept):                 # the stop's stage and reason, line by line
+                for i, (x, y) in enumerate(zip(theirs, kept)):
+                    if x != y and b'"venue_read"' in y:
+                        bx, my = json.loads(x), json.loads(y)
+                        if my.get("stage") == "venue_read" and bx.get("stage") == "reconcile":
+                            my["stage"], my["reason"] = bx["stage"], bx.get("reason")
+                            kept[i] = json.dumps(my, default=str).encode()
+            journal[name] = b"\n".join(kept)
+        m["journal"] = journal
+    return m
+
+
+def _t34_same_but(b, m, keys, where, skip=(), counts=None):
     """One run's record through an earlier revision (`b`) and through this one (`m`): every part equal, except that
     this revision's summaries, returned and journaled, may carry the keys `keys` that the earlier one's do not; a
     journal line that differs is a summary line, the earlier line with only such keys added at its end (the journal
-    holds the summaries of earlier runs too). Returns the keys added to the returned summary, with their values."""
+    holds the summaries of earlier runs too). Returns the keys added to the returned summary, with their values.
+    T34b-3: what it adds (`_t34b3_undo`) is taken out of `m` first, counted in `counts`."""
+    m = _t34b3_undo(b, m, counts)
     added = {}
     for key in b:
         if key in skip:
@@ -7990,17 +8048,18 @@ def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_th
     assert runs >= 200 and sends > 30 and marked + pending > 0, (runs, marked, pending, sends)
 
 
-def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch):
+def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch, venue=None, before_run=None):
     """One generated live scenario, run by run through `mod` (this revision); before each run the whole world (files,
     venue, second source, clock, prices) is copied and the same run is made through `base_mod` from the copy, so that
     each comparison has the same inputs. Returns per run: the orders each sent, whether a day stop was in force, the
-    summary keys added."""
+    summary keys added. T34b-3: `venue` (a function of held and cash) gives another stand-in, and `before_run` is
+    called with the world before each run is copied."""
     rng = random.Random(seed)
     cap = rng.choice([2500, 6000, 20_000])
     mov = rng.choice([m for m in (400, 900, 2500, 5000) if m <= cap])
     held = rng.choice([{"OWN": 10.0}, {"OWN": 10.0, "QQQ": 2.0}])
     wall = rng.choice([0.5, 1.0, 2.0, 5.0, 99.0])
-    w = live_world(tmp / "w", venue=LiveVenue(held=held, cash=rng.choice([2_000.0, 9_500.0, 40_000.0])),
+    w = live_world(tmp / "w", venue=(venue or LiveVenue)(held=held, cash=rng.choice([2_000.0, 9_500.0, 40_000.0])),
                    conf=live_conf(max_order_value=mov, max_capital=cap), limits={**LIVE_LIMITS, "max_daily_loss_pct": wall})
     n = rng.choice([0, 10, 24, 25, 30])
     if n:
@@ -8012,6 +8071,8 @@ def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch):
 
     def one(**kw):
         counter[0] += 1
+        if before_run is not None:
+            before_run(w)
         f = _follow_the_book(w)
         before = set(w.book()) | set(held)
         w.second.verdicts = {s: ("agree" if s in before else rng.choice(["agree", "agree", "agree", "disagree"]))
@@ -8049,7 +8110,7 @@ def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch):
                  for k, r in results.items() if r.get("mode") == "propose"}
         out_runs.append({"base": sent["base"], "mine": sent["mine"], "lines": lines, "stop": "day_stop" in m,
                          "added": sorted(set(m) - set(b)), "status": (b["status"], m["status"], b["stage"], m["stage"]),
-                         "mine_out": m, "trip_lines": len(w.entries("day_stop")) - lines_before})
+                         "mine_out": m, "base_out": b, "trip_lines": len(w.entries("day_stop")) - lines_before})
         return m
     for day in range(rng.randint(2, 3)):
         if day:
@@ -8560,7 +8621,8 @@ def test_t34b3_an_outage_alone_is_a_venue_read_stop_that_sends_nothing_and_the_l
 
 
 @pytest.mark.parametrize("how", ["positions answer", "order read open", "unknown state", "unsettled order",
-                                 "anomaly first", "difference first", "item in the run", "older item", "ledger write"])
+                                 "anomaly first", "difference first", "item in the run", "older item", "ledger write",
+                                 "entry not written"])
 def test_t34b3_an_outage_with_anything_else_wrong_stays_a_reconcile_stop(tmp_path, monkeypatch, how):
     w = _resting(tmp_path / "w")
     (tag,) = w.venue.submits()
@@ -8600,6 +8662,16 @@ def test_t34b3_an_outage_with_anything_else_wrong_stays_a_reconcile_stop(tmp_pat
         w.venue.cancel = cancel
     elif how == "older item":                                    # an open blocking item from before the run
         _t34_flag(w, ["late_outcome"], prefix="old")
+    elif how == "entry not written":                             # (e): a status read, its write failed
+        w.venue.raise_status = False
+        w.venue.fill(tag, 1.0)
+        real_cas = _Ledger._cas
+
+        def cas(self, t, *a, **k):
+            if t == tag:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_cas(self, t, *a, **k)
+        monkeypatch.setattr(_Ledger, "_cas", cas)
     elif how == "ledger write":                                  # (e): storing the reconcile fails
         real_rec = _Ledger.reconcile
 
@@ -8609,3 +8681,506 @@ def test_t34b3_an_outage_with_anything_else_wrong_stays_a_reconcile_stop(tmp_pat
         monkeypatch.setattr(_Ledger, "reconcile", reconcile)
     out = _prun(w, {"a": {"IWM": 3.0}})
     assert out["status"] == "stopped" and out["stage"] == "reconcile" and out["orders_sent"] == 0, (how, out)
+
+
+# -- B3: the value test in the fill's verdict, each purchase fill on its own
+
+def test_t34b3_the_value_test_is_in_the_fill_verdict_and_is_carried_when_the_run_dies(tmp_path, monkeypatch):
+    venue = _ThroughLimit(held={"OWN": 10.0}, cash=9_500.0)
+    venue.buy = 1.0 + 5e-7                                        # inside the limit band: no breach of (iii)
+    w = _t34_world(tmp_path / "w", venue=venue)
+    w.prices["IWM"] = 198.02                                      # limit 200.00: 5 x 200.00 = max_order_value, lock 1 passes
+    _, number = _live_proposed(w, {"a": {"IWM": 5.0}})
+    w.venue.fill_at_once = 1.0
+    w.later(1)
+    _kill_at(monkeypatch, "_judge_final")
+    with pytest.raises(KeyboardInterrupt):
+        lapprove(w, number)                                       # the kill is spent: later runs call the real method
+    (line,) = [e for e in w.entries("fill") if e["venue"] == w.venue.name]
+    assert line["verdict"] == "breach" and line["units"] * line["price"] > 1000.0 > line["units"] * 200.0 * (1 - 1e-6)
+    w.later(1)
+    out = lpropose(w)
+    assert out.get("faults") == ["cap"] and out.get("cap_refs") == [f"fill-{line['fill_id']}"], (out["stage"], out["reason"])
+
+
+# -- the comparisons with this ticket's base (ed4d96f: its order step and its order ledger)
+
+T34B3_BASE = "ed4d96f"
+_T34B3_LEDGER_KEYS = ("kind", "positions_error_kind", "notices")
+
+
+@pytest.fixture(scope="module")
+def t34b3_base(tmp_path_factory):
+    """The order step AND the order ledger of this ticket's base revision, from git, each under its own name (the base
+    order step imports the base ledger)."""
+    root = Path(__file__).resolve().parents[2]
+
+    def show(path):
+        return subprocess.run(["git", "-C", str(root), "show", f"{T34B3_BASE}:{path}"], capture_output=True,
+                              check=True).stdout
+    folder = tmp_path_factory.mktemp("t34b3_base")
+    mods = {}
+    for name, path, src in (
+            ("orders_t34b3_base", "valedia_trader/execution_and_risk/orders.py", None),
+            ("order_step_t34b3_base", "valedia_trader/execution_and_risk/order_step.py",
+             lambda s: s.replace(b"from valedia_trader.execution_and_risk.orders import", b"from orders_t34b3_base import"))):
+        data = show(path)
+        data = src(data) if src else data
+        (folder / f"{name}.py").write_bytes(data)
+        spec = importlib.util.spec_from_file_location(name, folder / f"{name}.py")
+        mods[name] = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mods[name]
+        spec.loader.exec_module(mods[name])
+    base = mods["order_step_t34b3_base"]
+    assert hasattr(base, "HALF_A_CENT") and base.OrderLedger is mods["orders_t34b3_base"].OrderLedger
+    assert not hasattr(mods["orders_t34b3_base"], "RECONCILE_NOTICE_KINDS")
+    return base
+
+
+def _t34b3_ledger(dump, counts=None):
+    """A ledger dump with the entry kinds T34b-3 adds to each stored reconcile record taken out (ruling 3), counted."""
+    if dump is None:
+        return None
+
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if k not in _T34B3_LEDGER_KEYS}
+        return [strip(v) for v in x] if isinstance(x, list) else x
+    rows = dict(dump["rows"])
+    out = []
+    for r in rows.get("reconciles", []):
+        r = list(r)
+        new = json.dumps(strip(json.loads(r[-1])))
+        if counts is not None and new != json.dumps(json.loads(r[-1])):
+            counts["ledger: kinds in a stored reconcile record"] = counts.get("ledger: kinds in a stored reconcile record", 0) + 1
+        out.append(tuple(r[:-1]) + (new,))
+    rows["reconciles"] = out
+    return {**dump, "rows": rows}
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_t34b3_practice_runs_equal_the_bases_but_for_the_allowed_differences(tmp_path, monkeypatch, t34b3_base, seed_block):
+    """50 scenarios per block, 300 in all (the scheduled run and the paper ticket flow, kills, partial fills, refusals,
+    outages), through ed4d96f and here: venue calls, journal lines, ledger, state and tickets equal but for what T34b-3
+    is allowed to add, each kind counted."""
+    counts, runs = {}, 0
+    for k in range(50):
+        seed = 3_400_000 + seed_block * 50 + k
+        base = _flow_scenario(t34b3_base, tmp_path / f"base{k}", seed, monkeypatch)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        assert len(base) == len(mine)
+        for i, (b, m) in enumerate(zip(base, mine)):
+            last, seen = i == len(mine) - 1, {}             # lines and ledger rows counted once, at the scenario's end
+            b, m = dict(b), dict(m)
+            b["ledger"], m["ledger"] = _t34b3_ledger(b["ledger"]), _t34b3_ledger(m["ledger"], seen)
+            added = _t34_same_but(b, m, (), (seed, i), counts=seen)
+            assert added == {}, ((seed, i), added)
+            for kind, n in seen.items():
+                if last or kind.startswith(("summary key", "stage")):
+                    counts[kind] = counts.get(kind, 0) + n
+            runs += 1
+        _shutil.rmtree(tmp_path / f"base{k}")
+        _shutil.rmtree(tmp_path / f"mine{k}")
+    print(f"T34B3-PRACTICE block {seed_block}: runs {runs}, {dict(sorted(counts.items()))}")
+    assert runs >= 200 and counts.get("verdict field", 0) > 0, counts
+
+
+import zlib  # noqa: E402
+
+
+class _T34b3Live(LiveVenue):
+    """The live stand-in with, by a hash of each tag (so a copy of the world behaves the same): 6% of orders filled a
+    cent through their limit, 8% filled at their limit and restated a cent better on every later read (a notice), the
+    rest honest; and `down`: every status, positions and cancel call raises."""
+    seed = 0
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reads, self.down = {}, False
+
+    def _mode(self, tag):
+        r = zlib.crc32(f"{self.seed}:{tag}".encode()) % 100
+        return "through" if r < 6 else "restate" if r < 14 else "honest"
+
+    def order_status(self, tag):
+        if self.down:
+            self.calls.append(("order_status", tag))
+            raise ConnectionError("order_status is down")
+        out = super().order_status(tag)
+        if out is not None and out["avg_price"] is not None:
+            o, mode = self.book[tag], self._mode(tag)
+            sign = 1.0 if o["units"] > 0 else -1.0
+            self.reads[tag] = self.reads.get(tag, 0) + 1
+            if mode == "through":
+                out["avg_price"] = round(o["limit"] + sign * 0.01, 2)
+            elif mode == "restate" and self.reads[tag] > 1:
+                out["avg_price"] = round(o["limit"] - sign * 0.01, 2)
+        return out
+
+    def positions(self):
+        if self.down:
+            self.calls.append(("positions", None))
+            raise ConnectionError("positions is down")
+        return super().positions()
+
+    def cancel(self, tag):
+        if self.down:
+            self.calls.append(("cancel", tag))
+            raise ConnectionError("cancel is down")
+        return super().cancel(tag)
+
+
+@pytest.mark.parametrize("seed_block", range(6))
+def test_t34b3_live_runs_against_the_base_subset_equal_and_the_same_cap_marks(tmp_path, monkeypatch, t34b3_base,
+                                                                              seed_block):
+    """50 live scenarios per block, 300 in all, every run made from the same inputs through ed4d96f and here, with
+    fills through their limit, restated averages and whole-venue outages. Until a scenario's first notice: the orders
+    sent and the ticket lines equal the base's, and `cap` marks the same runs (B3); with an outage only, equal too (the
+    run sends nothing either way). From a notice on, the base is held by a blocking anomaly that is now a notice:
+    counted, with every order sent that the base did not send."""
+    stats = _Counter()
+    for k in range(50):
+        seed = 3_460_000 + seed_block * 50 + k
+        down = random.Random(seed + 77)
+
+        def venue(held, cash, _seed=seed):
+            v = _T34b3Live(held=held, cash=cash)
+            v.seed = _seed
+            return v
+
+        def before(w):
+            w.venue.down = down.random() < 0.08
+        noticed = False
+        for i, r in enumerate(_t34_live_scenario(osx, t34b3_base, tmp_path / f"s{k}", seed, monkeypatch, venue=venue,
+                                                 before_run=before)):
+            where, m, b = (seed, i), r["mine_out"], r["base_out"]
+            noticed = noticed or bool(m.get("notices"))
+            mine_lines, base_lines = r["lines"].get("mine", _Counter()), r["lines"].get("base", _Counter())
+            stats["runs"] += 1
+            stats["sent"] += sum(r["mine"].values())
+            stats["venue_read"] += m.get("stage") == "venue_read"
+            stats["notice runs"] += bool(m.get("notices"))
+            stats["cap runs"] += "cap" in m.get("faults", [])
+            if not noticed:
+                assert r["mine"] == r["base"] and mine_lines == base_lines, where
+                assert ("cap" in m.get("faults", [])) == ("cap" in b.get("faults", [])), (where, m.get("faults"), b.get("faults"))
+                if m.get("stage") == "venue_read":
+                    assert b.get("stage") == "reconcile" and m["orders_sent"] == b["orders_sent"] == 0, where
+                else:
+                    assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
+                assert set(r["added"]) <= {"notices", "cap_refs"}, (where, r["added"])
+            else:
+                stats["runs after a notice"] += 1
+                stats["runs sending more than the base after a notice"] += bool(r["mine"] - r["base"])
+                stats["runs sending less than the base after a notice"] += bool(r["base"] - r["mine"])
+        _shutil.rmtree(tmp_path / f"s{k}")
+    print(f"T34B3-LIVE block {seed_block}: {dict(stats)}")
+    assert stats["runs"] >= 150 and stats["cap runs"] > 0 and stats["venue_read"] > 0 and stats["notice runs"] > 0, stats
+
+
+# -- ordinary days write no fault and stop no run at reconcile; every fault is marked, or carried by the next run
+
+class _Ordinary(Booked):
+    """An honest broker on ordinary days, driven by `rng`: an order fills at once, in pieces between runs, or not at
+    all, each piece at its limit or a few cents better; half the orders report their average rounded to the cent; a fee
+    total of half a cent a unit, rounded; between runs, on its own (within two days of an order finishing): a finished
+    order's average restated a cent better (A1, once an order), a late fill on a cancelled order still reported
+    cancelled (A2), a fee total corrected down (A3), each between two runs of one day; a fill can race a cancel; `down` makes every status, positions and cancel call raise.
+    `next_take` shapes the next TLT purchase taken (a test's fault), filled at once: {"add": price beyond the limit,
+    "partial": the units filled (else all), "over": a unit filled beyond the order}."""
+
+    def __init__(self, rng, held, cash, clock):
+        super().__init__(held=held, cash=cash)
+        self.rng, self.clock = rng, clock
+        self.avg, self.fee, self.rounds, self.done_at = {}, {}, {}, {}
+        self.down, self.next_take, self.counts, self.restated = False, None, _Counter(), set()
+
+    def _take(self, symbol, units, tag, limit_price):
+        self.book[tag] = {"symbol": symbol, "units": float(units), "limit": limit_price, "filled": 0.0, "state": "open"}
+        self.rounds[tag] = self.rng.random() < 0.5
+        shape = self.next_take if symbol == "TLT" and units > 0 else None   # a shape goes to the next TLT purchase
+        if shape is not None:
+            self.next_take, self.shaped = None, tag
+            self._piece(tag, shape.get("partial", abs(units)), add=shape.get("add", 0.0))
+            if shape.get("over"):
+                o = self.book[tag]
+                o["filled"] += 1.0
+                self.held[symbol] = self.held.get(symbol, 0.0) + (1.0 if units > 0 else -1.0)
+            return
+        r = self.rng.random()
+        if r < 0.45:
+            self._piece(tag, abs(units))
+        elif r < 0.7 and abs(units) >= 2:
+            self._piece(tag, float(int(abs(units) / 2)))
+
+    def _piece(self, tag, amount, add=None, late=False):
+        o = self.book[tag]
+        before = o["filled"]
+        if late:                                                  # A2: a cancelled order's late fill, still cancelled
+            got = min(amount, abs(o["units"]) - before)
+            if got <= 0:
+                return
+            o["filled"] += got
+            self.held[o["symbol"]] = self.held.get(o["symbol"], 0.0) + (1.0 if o["units"] > 0 else -1.0) * got
+        else:
+            got = self.fill(tag, amount)
+            if got <= 0:
+                return
+        sign = 1.0 if o["units"] > 0 else -1.0
+        price = o["limit"] + sign * add if add is not None else o["limit"] - sign * self.rng.choice([0.0, 0.0, 0.01, 0.02, 0.05])
+        old = self.avg.get(tag)
+        avg = price if old is None else (old * before + price * got) / (before + got)
+        self.avg[tag] = round(avg, 2) if self.rounds[tag] and add is None else avg
+        self.fee[tag] = round(0.005 * o["filled"], 2)
+        if o["state"] not in ("open", "partly_filled"):
+            self.done_at.setdefault(tag, self.clock.t)
+
+    def order_status(self, tag):
+        self.calls.append(("order_status", tag))
+        if self.down:
+            raise ConnectionError("order_status is down")
+        o = self.book.get(tag)
+        if o is None:
+            return None
+        return {"state": o["state"], "filled_units": o["filled"], "avg_price": self.avg.get(tag) if o["filled"] else None,
+                "fee": self.fee.get(tag, 0.0), "venue_order_id": "V" + tag[-6:], "raw_status": None}
+
+    def positions(self):
+        self.calls.append(("positions", None))
+        if self.down:
+            raise ConnectionError("positions is down")
+        return {s: u for s, u in self.held.items() if abs(u) > 1e-12}
+
+    def cancel(self, tag):
+        self.calls.append(("cancel", tag))
+        if self.down:
+            raise ConnectionError("cancel is down")
+        o = self.book.get(tag)
+        if o is not None and o["state"] in ("open", "partly_filled") and self.rng.random() < 0.1:
+            self._piece(tag, 1.0)                                 # a fill races the cancel
+        if o is None:
+            return {"status": "no such order"}
+        if o["state"] in ("open", "partly_filled"):
+            o["state"] = "cancelled"
+            self.done_at.setdefault(tag, self.clock.t)
+            return {"status": "cancel requested"}
+        return {"status": "already finished"}
+
+    def market(self, notices=True):
+        """Time passes between runs."""
+        for tag, o in self.book.items():
+            if o["state"] in ("open", "partly_filled"):
+                if self.rng.random() < 0.5:
+                    self._piece(tag, self.rng.choice([1.0, abs(o["units"])]))
+                continue
+            fresh = o["filled"] > 0 and self.clock.t - self.done_at.get(tag, -1e18) < 2 * 86400
+            if not (notices and fresh):
+                continue
+            r, sign = self.rng.random(), 1.0 if o["units"] > 0 else -1.0
+            if r < 0.04 and tag not in self.restated:             # A1, a cent better, once an order
+                self.restated.add(tag)
+                self.avg[tag] = round(self.avg[tag] - sign * 0.01, 2) if self.rounds[tag] else self.avg[tag] - sign * 0.01
+                self.counts["A1"] += 1
+            elif r < 0.08 and o["state"] == "cancelled" and o["filled"] < abs(o["units"]):
+                self._piece(tag, 1.0, late=True)                  # A2
+                self.counts["A2"] += 1
+            elif r < 0.12 and self.fee.get(tag, 0.0) >= 0.02:
+                self.fee[tag] = round(self.fee[tag] / 2, 2)       # A3
+                self.counts["A3"] += 1
+
+
+def _ordinary_world(tmp, rng):
+    clock = Clock(ny("2026-11-02 10:00"))
+    w = ticket_world(tmp, _Ordinary(rng, {"OWN": 10.0}, 1_000_000.0, clock))
+    w.clock = clock
+    return w
+
+
+def _ordinary_targets(rng, book):
+    wanted = {s: float(max(0, round(book.get(s, 0.0)) + rng.choice([-2, -1, 0, 0, 1, 2, 3]))) for s in ("SPY", "QQQ", "IWM")}
+    return {"a": wanted}
+
+
+def _ordinary_day(w, rng, outages=True):
+    """One session: two to four practice runs between 10:00 and 15:00, the market moving between them; returns the
+    summaries."""
+    outs = []
+    for sym in ("SPY", "QQQ", "IWM", "TLT"):
+        w.prices[sym] = rng.choice([20.0, 55.5, 101.25, 230.0, 0.85])
+    n = rng.randint(2, 4)
+    for run in range(n):
+        if run:
+            w.later(rng.choice([20, 45, 70]))
+        w.venue.down = outages and rng.random() < 0.07 and w.baseline() is not None   # the first run records the baseline
+        w.paper = paper(_ordinary_targets(rng, w.book()))
+        outs.append(w.run())
+        w.venue.down = False
+        w.venue.market(notices=run < n - 1)          # a correction is read the same day (the ledger rechecks 3 days)
+    w.next_day()
+    return outs
+
+
+@pytest.mark.parametrize("seed_block", range(10))
+def test_t34b3_ordinary_days_write_no_fault_and_stop_no_run_at_reconcile(tmp_path, seed_block):
+    """At least 1,000 ordinary runs per block, 10,000 in all: partial and late pieces, averages rounded to the cent,
+    restatements a cent better, late fills on cancelled orders, fee totals corrected down, fills racing cancels, and
+    whole-venue outages."""
+    stats, runs = _Counter(), 0
+    k = 0
+    while runs < 1000:
+        seed = 3_500_000 + seed_block * 1000 + k
+        rng = random.Random(seed)
+        w = _ordinary_world(tmp_path / f"o{k}", rng)
+        for day in range(rng.randint(3, 6)):
+            for i, out in enumerate(_ordinary_day(w, rng)):
+                where = (seed, day, i)
+                assert "faults" not in out, (where, out.get("faults"), out.get("reason"))
+                assert out["stage"] not in _sl.FAULT_STAGES, (where, out["stage"], out["reason"][-300:],
+                                                              w.ledger().last_reconcile()["summary"].get("anomalies"),
+                                                              w.ledger().last_reconcile()["summary"].get("position_differences"))
+                runs += 1
+                stats[out["stage"] or "done"] += 1
+                stats["notice kinds"] += len(out.get("notices", []))
+                for kind in out.get("notices", []):
+                    stats[kind] += 1
+                stats["sent"] += out["orders_sent"]
+        stats.update(w.venue.counts)
+        _shutil.rmtree(tmp_path / f"o{k}")
+        k += 1
+    print(f"T34B3-ORDINARY block {seed_block}: runs {runs}, {dict(sorted(stats.items()))}")
+    assert stats["venue_read"] > 0 and stats["avg_restated"] > 0 and stats["late_amount"] > 0 and stats["fee_fell"] > 0
+
+
+T34B3_FAULTS = ("through a cent", "through a tenth of a cent", "overfill", "restated beyond a cent",
+                "restated through the limit", "fee below zero", "late amount in another state", "units fell",
+                "piece unexplained", "killed after a breach", "killed before a notice line", "outage with a stray position",
+                "outage with a ledger failure", "killed after the summary write failed")
+
+
+def _t34b3_fault(w, rng, how, monkeypatch):
+    """Meet `how` in one run, after the ordinary days; returns (the run that met it, None), or (None, the next run)
+    when the run that met it was killed or could not write its summary."""
+    v = w.venue
+    held = {s: float(round(u)) for s, u in w.book().items() if s != "OWN"}
+    more = {"a": {**held, "TLT": held.get("TLT", 0.0) + 2.0}}     # a TLT order of 2 in the next run (the shaped one,
+    # when it is the run's first order: v.shaped names the order the shape went to)
+
+    def prep(shape):
+        v.next_take = shape
+        w.paper = paper(more)
+        out = w.run()
+        assert out["orders_sent"] >= 1 and out["stage"] is None, (how, out["stage"], out["reason"])
+        w.later(20)
+        assert v.book[v.shaped]["symbol"] == "TLT" and v.book[v.shaped]["units"] == 2.0, (how, v.book[v.shaped])
+        return v.shaped, v.book[v.shaped]
+
+    def killed(name):
+        _kill_at(monkeypatch, name)
+        with pytest.raises(KeyboardInterrupt):
+            w.run()
+        monkeypatch.undo()
+        w.later(20)
+        return None, w.run()
+    if how in ("restated beyond a cent", "restated through the limit", "killed before a notice line", "fee below zero",
+               "units fell"):
+        tag, o = prep({"add": 0.0})                               # filled at once at its limit
+        if how == "restated beyond a cent":
+            v.avg[tag] = o["limit"] - 0.05
+        elif how == "fee below zero":
+            v.fee[tag] = -0.5
+        elif how == "units fell":
+            o["filled"] -= 1.0
+            v.held["TLT"] -= 1.0
+        else:
+            v.avg[tag] = o["limit"] + 0.01                        # a cent through, a cent from the stored figure
+            if how == "killed before a notice line":
+                return killed("_journal_notices")
+        return w.run(), None
+    if how in ("late amount in another state", "piece unexplained"):
+        tag, o = prep({"add": 0.0, "partial": 1.0})               # 1 of 2 filled at its limit
+        if how == "late amount in another state":
+            o["state"] = "cancelled"                              # cancelled with 1 filled, read so by a run
+            w.paper = paper({"a": {s: float(round(u)) for s, u in w.book().items() if s != "OWN"}})
+            mid = w.run()
+            assert mid["stage"] is None and "faults" not in mid, (how, mid["stage"], mid["reason"])
+            w.later(20)
+            o.update(state="filled", filled=2.0)                  # ... then filled, all of it
+            v.held["TLT"] += 1.0
+        else:
+            o.update(state="filled", filled=2.0)
+            v.held["TLT"] += 1.0
+            v.avg[tag] = o["limit"] * 0.3                         # far below: a negative piece rounding cannot explain
+        return w.run(), None
+    if how in ("through a cent", "through a tenth of a cent", "overfill", "killed after a breach",
+               "killed after the summary write failed"):
+        v.next_take = {"add": 0.001 if how == "through a tenth of a cent" else 0.0 if how == "overfill" else 0.01,
+                       "over": how == "overfill"}
+        w.paper = paper(more)
+        if how == "killed after a breach":
+            return killed("_judge_final")
+        if how == "killed after the summary write failed":
+            real, failed = Journal.write, []
+
+            def write(self, day, entry):
+                if entry.get("event") == "summary" and not failed:
+                    failed.append(1)
+                    raise OSError("no space left on device")
+                return real(self, day, entry)
+            monkeypatch.setattr(Journal, "write", write)
+            w.run()
+            monkeypatch.undo()
+            w.later(20)
+            return None, w.run()
+        return w.run(), None
+    v.down = True                                                 # the outages with something else wrong
+    w.paper = paper(more)
+    if how == "outage with a stray position":
+        v.held["XLE"] = 1.0
+
+        def positions():
+            v.calls.append(("positions", None))
+            return {s: u for s, u in v.held.items() if abs(u) > 1e-12}
+        v.positions = positions
+        out = w.run()
+        del v.positions
+        return out, None
+    real_rec = _Ledger.reconcile
+
+    def reconcile(self, *a, **k):
+        real_rec(self, *a, **k)
+        raise _orders.OrderError("the order ledger could not be written: disk I/O error")
+    monkeypatch.setattr(_Ledger, "reconcile", reconcile)
+    out = w.run()
+    monkeypatch.undo()
+    return out, None
+
+
+@pytest.mark.parametrize("how", T34B3_FAULTS)
+def test_t34b3_every_fault_is_marked_by_the_run_that_meets_it_or_carried_by_the_next(tmp_path, monkeypatch, how):
+    """Eleven sequences per kind, 154 in all, each after one or two ordinary days (no outages)."""
+    marked = carried = 0
+    for k in range(11):
+        seed = 3_600_000 + T34B3_FAULTS.index(how) * 100 + k
+        rng = random.Random(seed)
+        w = _ordinary_world(tmp_path / f"f{k}", rng)
+        for _ in range(rng.randint(1, 2)):
+            for out in _ordinary_day(w, rng, outages=False):
+                assert "faults" not in out and out["stage"] not in _sl.FAULT_STAGES, (seed, out)
+        w.venue.down = False
+        for t, o in w.venue.book.items():                         # the ordinary orders are settled first
+            if o["state"] in ("open", "partly_filled"):
+                o["state"] = "cancelled"
+        w.paper = paper({"a": {s: float(round(u)) for s, u in w.book().items() if s != "OWN"}})
+        settle = w.run()
+        assert "faults" not in settle and settle["stage"] not in _sl.FAULT_STAGES, (seed, settle)
+        w.later(20)
+        met, nxt = _t34b3_fault(w, rng, how, monkeypatch)
+        if met is not None:
+            assert met.get("faults") or met["stage"] in _sl.FAULT_STAGES, (seed, how, met.get("stage"), met.get("reason"))
+            marked += 1
+        else:
+            assert "cap" in nxt.get("faults", []) and nxt.get("cap_refs"), (seed, how, nxt.get("faults"), nxt.get("reason"))
+            carried += 1
+        _shutil.rmtree(tmp_path / f"f{k}")
+    print(f"T34B3-FAULT {how}: marked {marked}, carried {carried}")
+    assert marked + carried == 11

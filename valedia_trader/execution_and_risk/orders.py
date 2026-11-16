@@ -502,6 +502,24 @@ class OrderLedger:
         sql = "SELECT * FROM attention" + (" WHERE closed_time IS NULL" if open_only else "") + " ORDER BY id"
         return [dict(r) for r in self._read(sql)]
 
+    def reconcile_notices(self, after_id: int = 0) -> list[dict]:
+        """T34b-3: every notice of RECONCILE_NOTICE_KINDS with an id above `after_id`, open, closed or superseded,
+        oldest first, each with `words`, `old` and `new` read from the JSON its reason holds (None where it cannot be
+        read). A notice never blocks; this read is for whoever journals and judges each one once."""
+        marks = ",".join("?" * len(RECONCILE_NOTICE_KINDS))
+        out = []
+        for r in self._read(f"SELECT * FROM attention WHERE kind IN ({marks}) AND id > ? ORDER BY id",
+                            (*sorted(RECONCILE_NOTICE_KINDS), int(after_id))):
+            item = dict(r)
+            try:
+                said = json.loads(item["reason"])
+            except (TypeError, ValueError):
+                said = None
+            said = said if isinstance(said, dict) else {}
+            item.update(words=said.get("words"), old=said.get("old"), new=said.get("new"))
+            out.append(item)
+        return out
+
     def close_attention(self, id: int, who: str, note: str) -> dict:
         """Close an open attention item, saying who looked and what they found."""
         if not isinstance(who, str) or not who.strip() or not isinstance(note, str) or not note.strip() \
@@ -715,7 +733,8 @@ class OrderLedger:
         Also asked, for `recheck_seconds` after they reached that state: every order marked never_arrived (one the
         venue now knows has turned up: an anomaly, moved to the venue's state, with its fills), and every order
         that reached filled, cancelled or expired with something filled or without an amount (late fees, averages
-        and a larger amount are taken, the larger amount also as an anomaly; a smaller amount or a different state
+        and a larger amount are taken: the larger amount is the notice `late_amount` while the venue still names the
+        order's own finished state, else the anomaly `late_amount_other_state`; a smaller amount or a different state
         is an anomaly that changes nothing). An exception from the venue on one of these goes
         to `recheck_errors` and does not make the reconcile unclean, so for an order wrongly declared never
         arrived the position comparison is then the remaining safeguard.
