@@ -86,9 +86,10 @@ PRICE_COLUMNS: dict[str, ColumnDef] = {
     "below_1y_high": ColumnDef("fraction", SESSIONS_PER_YEAR, "Last close divided by the highest close of the last {window} "
                                                               "sessions, minus 1 (0 means at the high)."),
     "vs_200d_avg": ColumnDef("fraction", 200, "Last close divided by the average close of the last {window} sessions, minus 1."),
-    "move_5d_in_sd": ColumnDef("standard deviations", 5, "The {window}-session change divided by the product of (the sample "
-                                                         "standard deviation of the last {baseline_window} daily returns) and "
-                                                         "(the square root of {window}).", baseline_window=60),
+    "move_5d_in_sd": ColumnDef("standard deviations", 5, "The {window}-session change (last close divided by the close "
+                                                         "{window} sessions earlier, minus 1) divided by the product of (the "
+                                                         "sample standard deviation of the last {baseline_window} simple daily "
+                                                         "returns) and (the square root of {window}).", baseline_window=60),
     "volume_20d_vs_1y": ColumnDef("fraction", 20, "Average dollar volume of the last {window} sessions divided by the average of "
                                                   "the last {baseline_window} sessions, minus 1.", baseline_window=SESSIONS_PER_YEAR),
 }
@@ -119,7 +120,7 @@ def _legend(defs: dict[str, ColumnDef], columns, note: str = "") -> str:
     lines = [f"How to read the table below. Values are fractions unless the unit says otherwise (0.052 means 5.2%). Windows count "
              f"trading sessions of this data (1m = {_MONTH} sessions, 3m = {_QUARTER}, 12m and 1y = {SESSIONS_PER_YEAR}). Annual "
              f"figures use {SESSIONS_PER_YEAR} sessions a year. Values are rounded to 3 decimals. A blank cell means the symbol does "
-             "not have a price on every session the column needs. " + (note + " " if note else "") + "Columns:"]
+             "not have a price (for the volume column, a dollar volume) on every session the column needs. " + (note + " " if note else "") + "Columns:"]
     for name in columns:
         d = defs[name]
         span = f"window {d.window} sessions" + (f", baseline {d.baseline_window} sessions" if d.baseline_window else "")
@@ -217,7 +218,7 @@ def macro_table(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None = None)
             r = both / both.shift(1) - 1
             corr = r["SPY"].corr(r["TLT"])
             if pd.notna(corr):
-                text += (f"SPY-TLT correlation of daily returns, last {CORRELATION_WINDOW} sessions on which both have a price: "
+                text += (f"SPY-TLT correlation of returns from one shared session to the next, last {CORRELATION_WINDOW} sessions on which both have a price: "
                          f"{corr:.3f}\n")
     return text
 
