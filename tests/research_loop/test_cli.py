@@ -2108,3 +2108,233 @@ def test_t38_1b_addendum2_the_paper_book_invariant_holds_over_seeded_random_stat
         print(f"\ninvariant: {generated} states generated, {refused} refused, {stepped} stepped ({filled} pending orders "
               f"filled), {len(wrong)} counter-examples")
     assert wrong == [] and generated == 400 and refused >= 40 and stepped >= 40 and filled >= 20, (refused, stepped, filled)
+
+
+# ---- T38-1b addendum 3: the notes of the second blind check
+
+def _add_idea(root, spec, status="passed backtest only", py_holds=None):
+    """One more idea in an existing project, with its strategy file (a hand-written .py one when `py_holds` is given,
+    else the JSON spec; None spec: no file at all). Returns its id."""
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        name = spec["name"] if spec else "no_file_idea"
+        hid = led.propose(f"An idea added later to this book ({name})", "test", cli.MARKET)
+        led.set_status(hid, status)
+    finally:
+        led.close()
+    if spec is not None and py_holds is not None:
+        _py_strategy(root / "strategies" / f"{spec['name']}_h{hid}.py", py_holds, spec)
+    elif spec is not None:
+        (root / "strategies" / f"{spec['name']}_h{hid}.json").write_text(json.dumps(spec))
+    return hid
+
+
+def _days_naming(root, name):
+    return sorted({e["day"] for e in _journal_entries(root) if e.get("strategy") == name})
+
+
+LIAR = {**BOTH_RULE, "name": "liar_both"}
+AFTER_STEP = "a strategy that says it cannot hold a short now has one: liar_both, DOWN\n"
+
+
+@pytest.mark.parametrize("argv", [["paper-step"], CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum3_a_lying_strategy_stops_the_catch_up_after_its_first_day(tmp_path, t38, argv):
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE])
+    assert run(root, ["paper-step"], px.iloc[:20])[0] == 0 and run(root, ["paper-step"], px.iloc[:21])[0] == 0
+    _add_idea(root, LIAR, py_holds="False")                               # says it cannot short; its rules short
+    status, out, err = run(root, argv, px.iloc[:31])                      # ten days to catch up in one run
+    assert (status, err) == (2, AFTER_STEP), (status, out, err)
+    if argv == ["paper-step"]:
+        assert json.loads(out)["days_processed"] == 1                     # what the day already stepped printed
+    first = str(px.index[21].date())
+    state = _state(root)
+    assert state["last_day"] == first                                     # no further day was stepped
+    assert _days_naming(root, "liar_both") == [first]                     # exactly ONE day of its orders
+    assert {o["decided_on"] for o in state["pending"] if o["strategy"] == "liar_both"} == {first}
+    assert all(lot["units"] == 0.0 for lot in state["positions"].get("liar_both", {}).values())   # none of it filled
+    before = _book_files(root)
+    assert run(root, argv, px.iloc[:31]) == (2, "", f"refused: {_short_refusal('liar_both', 'DOWN')}\n")
+    assert _book_files(root) == before
+
+
+def test_t38_1b_addendum3_pending_orders_are_added_up():
+    book = {"positions": {"mom_long": {"UP": {"units": 5.0, "cost": 100.0}}}}
+    two_of_three = {**book, "pending": [_pending("mom_long", "UP", -3.0), _pending("mom_long", "UP", -3.0)]}
+    three_and_two = {**book, "pending": [_pending("mom_long", "UP", -3.0), _pending("mom_long", "UP", -2.0)]}
+    assert cli.judge_paper_book(two_of_three) == ("short", "mom_long", "UP")
+    assert cli.judge_paper_book(three_and_two) is None
+
+
+def test_t38_1b_addendum3_the_broker_mirror_branch_checks_after_its_step(tmp_path, t38, monkeypatch):
+    from valedia_trader.core import secrets
+    run, _ = t38
+
+    class Mirror:
+        name, sent = "alpaca-standin", []
+
+        def submit(self, *a, **k):
+            self.sent.append(a)
+            return {"status": "accepted"}
+
+    mirror = Mirror()
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: "PKTEST")
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: mirror)
+    px, root = prices(), tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE])
+    (root / "strategies" / f"mom_long_h{ids[0]}.json").unlink()
+    _py_strategy(root / "strategies" / f"liar_both_h{ids[0]}.py", "False", LIAR)
+    status, out, err = run(root, ["paper-step", "--alpaca"], px.iloc[:20])
+    assert (status, err) == (2, AFTER_STEP), (status, out, err)
+    assert json.loads(out)["capital_shared_by"] == 1                      # the step's own output came first
+    before = _book_files(root)
+    assert run(root, ["paper-step", "--alpaca"], px.iloc[:21]) == (2, "", f"refused: {_short_refusal('liar_both', 'DOWN')}\n")
+    assert _book_files(root) == before
+
+
+def test_t38_1b_addendum3_the_cycles_late_check_catches_an_idea_that_passes_in_this_very_cycle(tmp_path, t38,
+                                                                                                monkeypatch):
+    run, reviews = t38
+    px, root = prices(), tmp_path / "project"
+    ids = _t38_project(root, [LONG_RULE, BOTH_RULE], statuses={"mom_both": "untested"})
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    try:
+        led.register_prediction(ids[1], "It rises after it rose and falls after it fell", {"sharpe": 0.5})
+    finally:
+        led.close()
+    assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+    state = _state(root)
+    state["pending"].append(_pending("mom_both", "UP", 4.0))              # a buy of the idea not yet passed
+    _write_state(root, state)
+
+    class Passes:
+        def __init__(self, prices, dollar, cost, ledger, paths, criteria=None):
+            self.ledger = ledger
+
+        def develop(self, hid, strategy, file):
+            return {"verdict": "pass"}
+
+        def seal(self, hid, strategy, file):
+            self.ledger.set_status(hid, "passed backtest only")          # it passes inside this cycle
+            return {"verdict": "pass"}
+
+    monkeypatch.setattr(cli, "Gauntlet", Passes)
+    before = _book_files(root)
+    reviews.clear()
+    assert run(root, CYCLE, px.iloc[:24]) == (2, "", "refused: the paper book holds a pending order of mom_both (UP), "
+                                                      "which can hold a short and is no longer stepped; nothing was "
+                                                      "stepped\n")
+    assert _book_files(root) == before and reviews == []
+
+
+def _fill_state(lot, orders, day):
+    return {"starting_cash": 100_000.0, "cash": 100_000.0, "positions": {"mom_long": {"UP": {"units": lot, "cost": 100.0}}},
+            "pending": [_pending("mom_long", "UP", u) for u in orders], "history": [], "peak_equity": 100_000.0,
+            "last_day": day, "realized": {}, "panel_cases": []}
+
+
+def test_t38_1b_addendum3_rule_c_rounds_pending_orders_as_the_paper_fill_does(tmp_path, capsys):
+    """For seeded random lots (zero, tiny, whole) and orders around the fill's rounding threshold, judge_paper_book
+    accepts exactly when stepping the state with the real paper trader leaves no negative lot."""
+    assert cli.judge_paper_book(_fill_state(0.0, [9e-13, -1.5e-12], "x")) == ("short", "mom_long", "UP")   # the checker's
+    px = prices()
+    limits = tmp_path / "risk.json"
+    limits.write_text(json.dumps({"max_daily_loss_pct": 50.0, "max_drawdown_pct": 50.0, "max_position_pct": 0.6,
+                                  "max_open_positions": 5}))
+    rng = np.random.default_rng(1238)
+    tiny = [k * 1e-13 for k in range(1, 25)]
+    states = accepted = 0
+    wrong = []
+    for k in range(300):
+        lot = float(rng.choice([0.0, 0.0, 5e-13, 9e-13, 1e-12, 2.0, 3.0]))
+        orders = []
+        for _ in range(int(rng.integers(1, 5))):
+            size = float(rng.choice(tiny)) if rng.random() < 0.6 else float(rng.choice([1.0, 2.0, 3.0, lot or 1.0]))
+            orders.append(size if rng.random() < 0.45 else -size)
+        state = _fill_state(lot, orders, str(px.index[18].date()))
+        found = cli.judge_paper_book(state)
+        book_dir = tmp_path / f"fill{k}"
+        book_dir.mkdir()
+        (book_dir / "paper_state.json").write_text(json.dumps(state))
+        trader = PaperTrader(book_dir, limits, halt_file=None)
+        trader.step(px.iloc[:20], {})                                     # the fill alone: no strategy decides
+        assert trader.state["pending"] == []
+        negative = any(l["units"] < 0 for book in trader.state["positions"].values() for l in book.values())
+        states += 1
+        accepted += found is None
+        if (found is None) == negative:
+            wrong.append((lot, orders, found, trader.state["positions"]))
+    with capsys.disabled():
+        print(f"\nfill rounding: {states} states, {accepted} accepted, {states - accepted} refused, "
+              f"{len(wrong)} counter-examples")
+    assert wrong == [] and 30 <= accepted <= 270, (accepted, wrong[:3])
+
+
+@pytest.mark.parametrize("argv", [["paper-step", "--refresh", "--alpaca"], FULL_CYCLE], ids=["paper-step", "cycle"])
+def test_t38_1b_addendum3_an_unloadable_file_no_longer_hides_a_left_out_pending_order_until_after_spending(
+        tmp_path, t38, monkeypatch, argv):
+    from valedia_trader.core import secrets
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE, BOTH_RULE])
+    _base_paper_step(root, px.iloc[:20])
+    state = _state(root)
+    state["pending"] = [o for o in state["pending"] if o["units"] > 0]        # only buys, mom_both's among them
+    _write_state(root, state)
+    _add_idea(root, None)                                                     # an idea whose strategy file is missing
+    spent = _spend_watch(monkeypatch)
+    monkeypatch.setattr(secrets, "load_env", lambda *a, **k: spent.update(secrets=1))
+    monkeypatch.setattr(secrets, "secret", lambda name, *a: spent.update(secret=1) or "PKTEST")
+    monkeypatch.setattr(cli, "AlpacaPaperVenue", lambda key, secret: spent.update(venue=1))
+    before = _book_files(root)
+    sym = next(o["symbol"] for o in state["pending"] if o["strategy"] == "mom_both")
+    assert run(root, argv, px.iloc[:24]) == (2, "", f"refused: the paper book holds a pending order of mom_both ({sym}), "
+                                                    "which can hold a short and is no longer stepped; nothing was "
+                                                    "stepped\n")
+    assert spent == {"refresh": 0, "market": 0, "asker": 0, "research": 0, "gauntlet": 0}, spent
+    assert _book_files(root) == before
+
+
+UNREADABLE = [
+    ({"positions": [], "pending": []}, "its positions are a list where a mapping of strategies to their lots belongs"),
+    ({"positions": None, "pending": []}, "its positions are null where a mapping of strategies to their lots belongs"),
+    ({"positions": {}, "pending": None}, "its pending orders are null where a list of orders belongs"),
+    ({"positions": {}, "pending": {}}, "its pending orders are a mapping where a list of orders belongs"),
+    ({"positions": {"mom_long": [1]}, "pending": []},
+     "its lots under mom_long are a list where a mapping of symbols to lots belongs"),
+    ({"positions": {"mom_long": {"UP": {"units": "ten", "cost": 1.0}}}, "pending": []},
+     "it holds a lot of mom_long (UP) whose units are not a number"),
+    ({"positions": {}, "pending": [5]}, "it holds a pending entry that is not an order"),
+    ({"positions": {}, "pending": [{"symbol": "UP", "units": 1.0}]}, "it holds a pending order with no strategy name"),
+    ({"positions": {}, "pending": [{"strategy": "mom_long", "units": 1.0}]}, "it holds a pending order with no symbol"),
+    ({"positions": {}, "pending": [{"strategy": "mom_long", "symbol": "UP", "units": None}]},
+     "it holds a pending order of mom_long for UP whose units are not a number"),
+    ([], "it is a list where a mapping belongs"),
+]
+
+
+@pytest.mark.parametrize("state, words", UNREADABLE, ids=[w[:40] for _, w in UNREADABLE])
+def test_t38_1b_addendum3_a_state_it_cannot_read_is_refused_in_plain_words(state, words):
+    found = cli.judge_paper_book(state)
+    assert found is not None and found[0] == "unreadable", found
+    assert cli.paper_book_words(found, "nothing was stepped") == (f"the paper book's state cannot be read: {words}; "
+                                                                  "nothing was stepped")
+
+
+@pytest.mark.parametrize("positions", [[], None], ids=["a list", "null"])
+def test_t38_1b_addendum3_the_paper_command_refuses_positions_that_are_not_a_mapping(tmp_path, t38, positions):
+    run, _ = t38
+    px, root = prices(), tmp_path / "project"
+    _t38_project(root, [LONG_RULE])
+    assert run(root, ["paper-step"], px.iloc[:20])[0] == 0
+    state = _state(root)
+    state["positions"] = positions
+    _write_state(root, state)
+    before = _book_files(root)
+    shown = "a list" if positions == [] else "null"
+    assert run(root, ["paper-step"], px.iloc[:22]) == (
+        2, "", f"refused: the paper book's state cannot be read: its positions are {shown} where a mapping of "
+               "strategies to their lots belongs; nothing was stepped\n")
+    assert _book_files(root) == before

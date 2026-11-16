@@ -371,6 +371,30 @@ def test_t38_1b_addendum2_the_doctor_counts_idea_by_idea_so_an_unloadable_file_h
     assert status == D.OK and "1 in paper trading (2 not stepped: can hold a short))" in text, text
 
 
+def test_t38_1b_addendum3_the_doctor_does_not_run_a_code_strategy_and_says_it_did_not_check_it(live_repo):
+    """A .py strategy file is code: the doctor does not import it (its import would write the marker) and counts the
+    idea as not checked; .json files are read as before."""
+    from valedia_trader.research_loop import ledger as lg
+    paths = LoopPaths(live_repo)
+    _ledger_with(live_repo, "mom_long_basket")
+    led = lg.HypothesisLedger(paths.ledger)
+    try:
+        hid = led.propose("An idea whose strategy is code", "test", "us-etf+crypto")
+        led.set_status(hid, "passed paper")
+    finally:
+        led.close()
+    marker = live_repo.parent / "the-strategy-code-ran"
+    (live_repo / "strategies" / f"coded_h{hid}.py").write_text(
+        f'"""version: 1.0.0\nhypothesis: code\n"""\nimport pathlib\npathlib.Path({str(marker)!r}).write_text("ran")\n')
+    status, text = D.check_ledger(paths)
+    assert not marker.exists()
+    assert status == D.OK and "2 in paper trading (1 not checked: code strategy))" in text, text
+    _ledger_with(live_repo, "mom_both_basket", direction="both")
+    status, text = D.check_ledger(paths)
+    assert not marker.exists()
+    assert "2 in paper trading (1 not stepped: can hold a short; 1 not checked: code strategy))" in text, text
+
+
 def test_the_doctor_says_the_broker_book_file_is_missing_and_that_live_mode_would_stop(live_repo):
     before = _tree(live_repo)
     status, detail = _venues(live_repo)
