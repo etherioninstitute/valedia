@@ -208,18 +208,20 @@ How to read `Owned memory refused the context`:
 cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp nice -n 15 $PY -B mirofish_native_stage.py --stage --profile swarm8 --model qwen3-8b --work <new folder under the crew directory>
 ```
 
-- `--model` takes exactly one of the two built-in profiles of `src/mirofish_native_model.py`: `qwen3.8-27b` or `qwen3-8b`.
+- `--model` takes exactly one of the three built-in profiles of `src/mirofish_native_model.py`: `qwen3.8-27b`, `qwen3-8b` or
+  `ternary-bonsai-2-27b` (TMF4). A plan of two models is staged with `--setup-model` and `--turns-model` instead (next section).
   Anything else is refused in one line, starting `refused:`: an unknown name, a profile that exists only in
   `src/mirofish_model_registry.json` (registered profiles can name their own paths and pins, so none is staged), and
   `qwen3.8-27b-mlx`, which is registered for HTTP backends only. `--model` works with the swarm profiles only.
 - Without `--model`, staging is unchanged: the reviewed W16 bytes, no selector, the 27B.
 - With `--model`, including `--model qwen3.8-27b` named explicitly, the copies of `mirofish_native_model.py` (two) and
-  `mirofish_native_run.py` (three) are the `src/` revisions of commits `ab08400` and `b5a1797`, each pinned in the stage
-  tool by its SHA-256. A changed byte in `src/` refuses staging until the pin is moved. They were reviewed on 2026-11-15
-  (V134) and found unsafe for registered profiles: a registered profile can set the observer's readable directory and its
-  own weight pin, and its hash text reaches the helper script unescaped. They were accepted for the two built-in profiles
-  only, under conditions C1 to C3, which model staging applies: built-in names only, no registry in any staged copy,
-  weight pin and tokenizer hashes checked at staging, no borrowed conformance evidence.
+  `mirofish_native_run.py` (three) are the `src/` revisions of this repository (TMF4a, commit `fc99603`, with the four
+  repairs of TMF4 addendum 3, commit `38bce8a`), read from `src/` beside the tool and each pinned by its SHA-256
+  (`e1cd97e1…` and `0426dd5a…`). A changed byte in `src/` refuses staging until the pin is moved. Review status, as the
+  manifest states it: blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied
+  afterwards and awaiting their own check). The earlier revisions (`ab08400`, `b5a1797`, V134) were unsafe for registered
+  profiles; conditions C1 to C3 still apply: built-in names only, no registry in any staged copy, weight pin and tokenizer
+  hashes checked at staging, no borrowed conformance evidence.
   Every closed number of the run script, the SDK port and the SSD device number is applied to those revisions with the
   same exact-fragment proof.
 - The selector `mirofish_model_profile.json`, `{"profile": "<name>"}` and a newline, is written by the tool beside each
@@ -229,12 +231,15 @@ cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp nice -n 15 
   five tokenizer files and its GGUF. Staging checks every one against its pin, the GGUF by size and SHA-256 (hashed once).
 - The SDK helper and the observer sandbox policy are the reviewed ones with only the checkpoint changed (selection, weight
   size and hash; tokenizer folder and GGUF path), and staging requires that the staged `src/` code generates exactly them.
-- The free-memory start rule follows the checkpoint: 30 + ceil(100 x (weight bytes + 6 GiB) / 64 GiB), which is 47% for
-  the 8B. The 27B keeps its reviewed 65%. The 30% stop floor and the 40 GiB resident-memory bound do not change.
-- For the 8B the manifest says plainly that format conformance with LM Studio's own rendering has not been shown (the
-  metadata receipt is the 27B's), and that the run script writes the 27B's revision identifiers into
-  `model-source-manifest.json` for any profile, so that provenance field is wrong for the 8B. The correct sources are the
-  tokenizer folder's `SOURCE.txt` (Qwen/Qwen3-8B, fetched 2026-11-10) and the GGUF's path, size and hash.
+- The free-memory start rule follows the checkpoint (TMF4 ruling c): 30 + ceil(100 x (serving files + context cache at
+  32,768 in 16-bit floats from the profile's own layer and head counts + 4 GiB) / 64 GiB) + 5. That is 56% for the 8B, 57%
+  for Bonsai 2 (with its projector) and 72% for the 27B staged through the model path. Without a model named, the reviewed
+  65% and its bytes stay. The 30% stop floor and the 40 GiB resident-memory bound do not change.
+- For a checkpoint other than the 27B the manifest says plainly that format conformance with LM Studio's own rendering has
+  not been shown (the metadata receipt is the 27B's), and labels the 27B-only evidence blocks as the 27B's. The run records
+  each profile in `model-source-manifest.json` with its own files and hashes; the 27B's revision identifiers go to the 27B's
+  record only (R10). The upstream source of the 8B's files is the tokenizer folder's `SOURCE.txt` (Qwen/Qwen3-8B, fetched
+  2026-11-10).
 
 Limits (call slots, gateway limits, client timeouts, request and event bytes, model calls, output) stay the 27B's for every
 model: a limit is an upper bound, and a faster model only finishes sooner. The memory window inequality also stays the
@@ -252,7 +257,7 @@ written tokens a second (0.705).
 | Expected total | 74 min (4,418 s) | 39 min (2,346 s) | 5.0 h (18,166 s) | 2.0 h (7,365 s) |
 | Ceiling, at the participant bound | 99 min (5,964 s) | 47 min (2,825 s) | 12.9 h (46,527 s) | 3.9 h (14,048 s) |
 | Wall clock | 2 h (7,200 s) | 1 h (3,600 s) | 16 h (57,600 s) | 5 h (18,000 s) |
-| Free memory needed to start | 65% | 47% | 65% | 47% |
+| Free memory needed to start | 65% (72% named) | 56% | 65% (72% named) | 56% |
 
 The 8B's walls rest on the estimate above, and the admission's fixed cost per call does not shrink with a faster model. If
 the first 8B run is to keep the 27B's walls instead, `derive()` in `tools/mirofish_swarm_limits.py` takes one line: for a model
@@ -261,8 +266,11 @@ history follow the wall.
 
 **What must be off for a run on the 8B, for its whole wall clock:** the hourly pick reader (it uses LM Studio); every other
 language model on LM Studio; the local Hermes helpers, idle (Scout, Valedia, CTO, local delegation workers) and anything else
-that uses the local model server. The order-book collector may stay ON if free memory is above the start threshold (47%)
+that uses the local model server. The order-book collector may stay ON if free memory is above the start threshold (56%)
 when the run starts; the run still stops itself under 30% free.
+
+Bonsai 2 alone (`--model ternary-bonsai-2-27b`) takes the 27B's speeds, an assumption until a run (54 recorded requests
+through the plain server ran at the 27B's speed), so its durations and walls are the 27B's column; it needs 57% free.
 
 **No run on the 8B has been made yet.** Its personas, its agents' turns and its report are unjudged. The first run is a
 pipeline proof; whether the 8B's output is any good is a separate question for after it.
@@ -282,6 +290,53 @@ settled at the first calls, and a refusal there is the pipeline working (fail cl
   `actual SDK template differs ...` line, at the first call that carries such a turn.
 
 Either refusal ends the attempt as designed. Read the call's `request.json` under `run1/calls/` to see which turn caused it.
+
+## Staging a plan of two models (TMF4, 2026-11-15)
+
+```bash
+cd tools && TMPDIR=/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/tmp nice -n 15 $PY -B mirofish_native_stage.py --stage --profile swarm8 --setup-model ternary-bonsai-2-27b --turns-model qwen3-8b --work <new folder under the crew directory>
+```
+
+- The setup model serves everything before the simulation and the report after it; the turns model serves the agent turns.
+  One model is loaded at a time, always under the run's one identifier. The observer swaps at two boundaries: B1 after
+  `native_prepared`, before the simulation starts, and B2 after `native_terminal`, before the report. A swap asserts the
+  gateway idle, unloads, confirms no language model is listed, loads the next checkpoint, reads it back, rebuilds the
+  admission, saves a `model_swap` event, then runs the two compatibility probes on the new model. Any failure refuses the run.
+- Both names must be built-in and different. `--setup-model` without `--turns-model` (or the reverse), either with
+  `--model`, and the same name twice are refused in one line. The design note is
+  `docs/specs/2026-11-15-mirofish-two-model-design.md`.
+- The selector is `{"plan": {"setup": "<name>", "turns": "<name>"}}` and a newline. Staging checks every member's tokenizer
+  files and GGUF files (Bonsai 2's weights and its vision projector) by size and SHA-256, and writes `model_plan` and
+  `model_tokenizer_by_profile` into the manifest.
+- Memory: a plan needs the larger member's threshold, 57% for Bonsai 2 + 8B (8B alone 56%).
+- Budgets: a plan adds four post-swap probes (two after each swap) at 512 output tokens each. For `swarm8` the expected
+  model calls rise from 117 to 121 and the bound from 139 to 143; both round to the same 192 calls. The output reserve is
+  (2 + 4) x 512 + (192 - 6) x 4,096 = 764,928, under the 800,000 budget. For `swarm48`: 436 expected, 525 bound, 672 calls,
+  (2 + 4) x 512 + (672 - 6) x 4,096 = 2,731,008, under 2,800,000.
+- Durations: setup and report at Bonsai 2's speeds (the 27B's, assumed), the simulation at the 8B's (an estimate), and the
+  two swaps at 15 s each expected (assumed) and at the unload and load limits plus the probes in the ceiling.
+
+| Plan Bonsai 2 + 8B | `swarm8` | `swarm48` |
+|---|---|---|
+| Start, graph, personas, settings (Bonsai 2) | 18 min (1,085 s) | 59 min (3,536 s) |
+| Simulation, rounds 1 / 2 / 3 (8B) | 184 / 216 / 216 s | 1,061 / 1,302 / 1,544 s |
+| Two swaps | 30 s (ceiling 639 s) | 30 s (ceiling 639 s) |
+| Report, assumed (Bonsai 2) | 20 min (1,179 s) | 20 min (1,179 s) |
+| Expected total | 51 min (3,044 s) | 2.4 h (8,787 s) |
+| Ceiling, at the participant bound | 70 min (4,182 s) | 4.5 h (16,279 s) |
+| Wall clock | 1.5 h (5,400 s) | 5.5 h (19,800 s) |
+| Free memory needed to start | 57% | 57% |
+
+**Format qualification before a run (needs the owner's yes; it loads a model).** `tools/mirofish_format_qualify.py` takes a
+staged folder, one built-in profile of its plan and an output folder outside the staged one. It uses the folder's own SDK
+helper and admission, loads that one checkpoint as the run would, runs admission only (no generation) on five canned request
+bodies, among them an assistant tool call followed by its tool result and an assistant turn with null content, plus two
+recorded agent requests of `swarm8-d`, then unloads. It refuses without `--owner-approved-load`, writes nothing into the
+staged folder, and a mismatch shows in about a minute instead of at an agent's turn.
+
+```bash
+cd tools && nice -n 15 $PY -B mirofish_format_qualify.py --work <staged folder> --profile qwen3-8b --out <new folder> --owner-approved-load
+```
 
 ## Stage, gate, launch
 
@@ -304,7 +359,11 @@ the tool before these repairs; leave them unlaunched. `swarm48-b` was staged at 
 Staged on 2026-11-15 as proof of model staging, not launched, no gate, no preflight: `valedia-native-20261115-swarm8-q8-b`
 (`swarm8` on `qwen3-8b`, candidate `a42c81cb510dd48fd3542183d0245ea9a976fd7556679d6018b42febca87610e`). It supersedes `valedia-native-20261115-swarm8-q8-a`
 (candidate `82025f4a…`), whose manifest called the `src/` revisions simply reviewed; leave `-q8-a` unlaunched. The folder that is actually launched is staged from `main` after the
-merge, so that its manifest names the repository's own files. A staged folder carries the model server's port as of staging;
+merge, so that its manifest names the repository's own files.
+
+Staged on 2026-11-15 as proof of plan staging, not launched, no gate, no preflight: `valedia-native-20261115-swarm8-b2q8-a`
+(`swarm8`, setup `ternary-bonsai-2-27b`, turns `qwen3-8b`, candidate
+`6b8c64eb19d80d149514f02adb6a9cd8a8d36be5eb71192468fd65c90b7fb514`). A staged folder carries the model server's port as of staging;
 stage again if the server app restarts.
 
 The result is `<work>/builder/native-run-receipt.json` (events, model-call count, whether the report validated, what the
