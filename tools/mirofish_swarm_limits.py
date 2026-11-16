@@ -26,44 +26,84 @@ BYTES_PER_TOKEN_MAX = 5.28    # request bytes per real prompt token, largest ove
 # writes, whatever its language: a reply of N tokens is at most 144 N bytes in the worker's event line.
 ESCAPED_BYTES_PER_TOKEN = 144
 
-# ---- Per model (TMF3, 2026-11-15) -----------------------------------------------------------------------------------------
+# ---- Per model (TMF3, 2026-11-15; TMF4, two models by phase) ---------------------------------------------------------------
 # A LIMIT (call slot, arrival-to-done, queue, client timeouts, request and event bytes, model calls, output) is an upper bound
 # and stays derived from the 27B's constants above for every model: a faster model only finishes sooner. EXPECTED durations
-# and the wall clock use the chosen model's own speeds. The memory window inequality stays the 27B's: the 8B needs fewer real
-# tokens for the same request (token_ratio_to_27b below), so a budget that fits the 27B fits the 8B.
+# and the wall clock use the chosen model's own speeds; in a plan of two models (TMF4), setup and report at the setup model's,
+# the simulation at the turns model's. The memory window inequality stays the 27B's: every other model here needs no more
+# real tokens for the same request (token_ratio_to_27b below), so a budget that fits the 27B fits it.
+# The context cache of each model at the 32,768 window (the start threshold, TMF4 addendum 1 ruling c) is computed from its
+# own full-attention layer, key/value head and head size counts, each checked against its source by test_mirofish_swarm_limits.py.
 DEFAULT_MODEL = 'qwen3.8-27b'
 PLAIN_READ_27B = 260.0        # the 27B's prompt tokens a second through plain LM Studio, against 188 inside the pipeline
 PIPELINE_DISCOUNT = READ_TOKENS_PER_S / PLAIN_READ_27B   # 0.723: what the pipeline (admission, the C++ runtime) cost the 27B
 MODELS = {
+    # Attention: the tokenizer origin's config.json text_config: 64 layers, every 4th a full-attention layer (16), 4 key/value
+    # heads of 256; the other 48 are linear-attention layers whose state does not grow with the context.
     'qwen3.8-27b': {'read_tps': READ_TOKENS_PER_S, 'write_tps': WRITE_TOKENS_PER_S, 'token_ratio_to_27b': 1.0,
+                    'attention_layers': 16, 'kv_heads': 4, 'head_dim': 256,
                     'speed_source': 'measured inside the pipeline: fit over 288 completed calls of the stopped run (R2 0.97)'},
     # Plain LM Studio beside the live collector, 44 real agent turns of the 2026-11-15 proving run: 1,208 read, 46.3 written a
     # second. Both are discounted by the 27B's plain-to-pipeline read ratio (no write ratio was measured for the 27B, so the
     # read ratio is used for both; it is the larger discount and so the longer estimate). An ESTIMATE until a run.
+    # Attention: the tokenizer origin's config.json: 36 layers, all full attention, 8 key/value heads of 128.
     'qwen3-8b': {'read_tps': 1208.0 * PIPELINE_DISCOUNT, 'write_tps': 46.3 * PIPELINE_DISCOUNT, 'token_ratio_to_27b': 0.950,
+                 'attention_layers': 36, 'kv_heads': 8, 'head_dim': 128,
                  'speed_source': 'ESTIMATE until a run: plain-server 1,208 read and 46.3 written a second (44 agent turns, '
                                  '2026-11-15) x 188/260, the 27B\'s plain-to-pipeline read ratio'},
+    # Ternary Bonsai 2 (TMF4): 54 recorded requests through the plain server ran at the 27B's speed, so the 27B's pipeline
+    # speeds are used, an ASSUMPTION until a run. Same tokenizer as the 27B (the GGUF header's vocabulary, merges, special
+    # tokens and template match the 27B's tokenizer origin), so the same real tokens per request. Attention: its own GGUF
+    # header (qwen35.block_count 64, full_attention_interval 4, attention.head_count_kv 4, key_length and value_length 256).
+    'ternary-bonsai-2-27b': {'read_tps': READ_TOKENS_PER_S, 'write_tps': WRITE_TOKENS_PER_S, 'token_ratio_to_27b': 1.0,
+                             'attention_layers': 16, 'kv_heads': 4, 'head_dim': 256,
+                             'speed_source': 'ASSUMED until a run: the 27B\'s pipeline speeds (188 read, 23.6 written a second); '
+                                             'Bonsai 2 answered 54 recorded requests through the plain server at the 27B\'s speed'},
 }
 # The 8B's real prompt tokens per 27B real token for the same 44 request bodies (its reported usage.prompt_tokens against the
 # 27B admission's count): reddit median 0.939, largest 0.950; twitter median 0.918, largest 0.931. The largest is used.
 INSTALLED_MEMORY_BYTES = 68719476736   # this Mac (sysctl hw.memsize, 64 GiB)
-MODEL_HEADROOM_BYTES = 6 * 2**30       # what the run needs besides the weights at its start (TMF3 ticket, outcome 5)
-REVIEWED_START_THRESHOLD = 65          # the reviewed start rule for the 27B (mirofish_native_run.py:380); it stays for the 27B
+# The free-memory start threshold (TMF4 addendum 1, ruling c): 30 + ceil(100 x (the serving files LM Studio loads, weights and
+# any second file + the context cache at 32,768 in 16-bit floats + 4 GiB for the graph store and workers) / installed memory)
+# + 5 points of margin; for a plan, the larger member's. It replaces TMF3's weights + 6 GiB, which left the 8B at the floor.
+STOP_FLOOR_PERCENT = 30                # the run stops under this much free memory (mirofish_native_run.py:380); unchanged
+KV_VALUE_BYTES = 2                     # 16-bit floats
+GRAPH_AND_WORKERS_BYTES = 4 * 2**30    # the graph store and the worker processes besides the model
+START_MARGIN_POINTS = 5
+REVIEWED_START_THRESHOLD = 65          # the reviewed start rule (mirofish_native_run.py:380). The default path (no model named)
+                                       # keeps it and its bytes; whenever a model is named the formula is used (72 for the 27B)
 
 
-def start_threshold(model, weight_bytes):
-    """Free memory, percent, the run needs before it starts: 30 + ceil(100 x (weights + 6 GiB) / installed memory). The 27B
-    keeps its reviewed 65 (the formula gives 67 for it), so its staged bytes do not change. The 30% stop floor and the 40 GiB
-    resident-memory bound are not derived here and do not change."""
-    if model == DEFAULT_MODEL:
-        return REVIEWED_START_THRESHOLD
-    return 30 + math.ceil(100 * (weight_bytes + MODEL_HEADROOM_BYTES) / INSTALLED_MEMORY_BYTES - 1e-12)
+def kv_cache_bytes(model):
+    """The model's key and value cache for the whole 32,768 window in 16-bit floats: 2 x full-attention layers x key/value
+    heads x head size x window x 2 bytes."""
+    require_model(model)
+    m = MODELS[model]
+    return 2 * m['attention_layers'] * m['kv_heads'] * m['head_dim'] * WINDOW * KV_VALUE_BYTES
+
+
+def start_threshold(model, serving_bytes):
+    """Free memory, percent, a run needs before it starts with this checkpoint: ruling (c). serving_bytes is what LM Studio
+    loads: the weights and any second file (Bonsai 2's vision projector). The 30% stop floor and the 40 GiB resident-memory
+    bound are not derived here and do not change."""
+    need = serving_bytes + kv_cache_bytes(model) + GRAPH_AND_WORKERS_BYTES
+    return STOP_FLOOR_PERCENT + math.ceil(100 * need / INSTALLED_MEMORY_BYTES - 1e-12) + START_MARGIN_POINTS
+
+
+def plan_start_threshold(members):
+    """members: {profile: serving bytes}. A plan loads one model at a time, so it needs the larger member's threshold."""
+    return max(start_threshold(name, size) for name, size in members.items())
 
 
 # ---- Fixed by the reviewed code (not tunable here) ----------------------------------------------------------------------
 PLATFORMS = 2                 # twitter and reddit run side by side (run_parallel_simulation.py, platform 'parallel')
 CALLER_IN_FLIGHT = 1          # caller calls are serial: parallel_profile_count 1 (mirofish_native_run.py:317), one report thread
 NATIVE_PROBE_OUTPUT = 512     # the two compatibility probes reserve 512 each (gateway ledger of every run)
+START_PROBES = 2              # the two compatibility probes at the run's start
+PROBES_PER_SWAP = 2           # TMF4 addendum 1, ruling d: the same two probes on the newly loaded model after each swap
+SWAPS_PER_PLAN = 2            # B1 (setup -> turns, before the simulation) and B2 (turns -> setup, before the report)
+SWAP_UNLOAD_LIMIT_S = 45      # the observer's own limit on the unload call of a swap (mirofish_native_run.py swap_model)
+SWAP_LOAD_LIMIT_S = 180       # and on its load call
 HOST_SAMPLE_S = 0.4           # the host samples memory every 0.4 s (mirofish_native_startup.py)
 HISTORY_RECORD_BYTES = 1219   # mean bytes per resource-history record: 21,488,517 bytes / 17,627 records (stopped run)
 CLEANUP_S = 120               # gateway cleanup headroom (Limits.cleanup_seconds); the run keeps it before its deadline
@@ -110,6 +150,8 @@ REPORT_CHATS = 30                 # report-phase chats: 29 in the 4-agent run
 REPORT_MEASURED_S = 393           # report phase, 4-agent run (native_terminal 12:06:43 to fresh_report_validated 12:13:16)
 REPORT_SCALE_ASSUMED = 3          # a swarm's report reads more actions; assumed three times the 4-agent figure (never measured)
 START_S = 15                      # model load, probes and graph prerequisite (about 13 s in every run)
+SWAP_EXPECTED_S = 15              # one swap (unload, load, two probes): ASSUMED equal to the start's load and probes; no swap has run
+PROBE_PROMPT_TOKENS = 512         # a compatibility probe's prompt with its one tool, rounded up (each request is a few lines)
 
 
 def ceil_to(value, step):
@@ -159,6 +201,16 @@ def ceiling_call_seconds(budget, model=DEFAULT_MODEL):
     return call_seconds(RATIO_ASSUMED * budget + OVERHEAD_LARGE, AGENT_REPLY_MEAN, model)
 
 
+def probe_ceiling_seconds(model=DEFAULT_MODEL):
+    """One compatibility probe at most: its prompt read, its whole 512-token reservation written, plus the largest overshoot."""
+    return call_seconds(PROBE_PROMPT_TOKENS, NATIVE_PROBE_OUTPUT, model) + OVERSHOOT_S
+
+
+def swap_ceiling_seconds(loaded):
+    """One swap at most: the observer's unload and load limits, then the two probes on the model just loaded."""
+    return SWAP_UNLOAD_LIMIT_S + SWAP_LOAD_LIMIT_S + PROBES_PER_SWAP * probe_ceiling_seconds(loaded)
+
+
 def action_text_tokens():
     """The most model-written text one recorded action can carry. A quote carries its own text twice (content and
     quote_content, each at most one agent reply), the quoted post (a seed post can be as long as a caller reply) and two
@@ -176,18 +228,40 @@ def worker_event_bytes():
     return ceil_to(MARGIN * (max(wait_event_bound(), FIXED_EVENT_BYTES) + 1), EVENT_STEP)
 
 
+def plan_members(model):
+    """A model is one profile name (one model for the whole run) or a plan {'setup': name, 'turns': name} of two different
+    profiles (TMF4). Returns (setup model, turns model, swaps)."""
+    if isinstance(model, str):
+        require_model(model)
+        return model, model, 0
+    if not (isinstance(model, dict) and set(model) == {'setup', 'turns'} and model['setup'] != model['turns']):
+        raise ValueError('a plan names two different models as {"setup": ..., "turns": ...}: %r' % (model,))
+    require_model(model['setup'])
+    require_model(model['turns'])
+    return model['setup'], model['turns'], SWAPS_PER_PLAN
+
+
+def model_label(model):
+    setup, turns, swaps = plan_members(model)
+    return setup if not swaps else '%s (setup and report) + %s (turns)' % (setup, turns)
+
+
 def derive(profile, model=DEFAULT_MODEL):
     """All numbers for one swarm profile from its closed inputs: actors, agents_bound, rounds, memory_budget. Expected
     figures use the named actors times the measured growth; ceilings, the wall and every budget use the participant bound,
     so they hold for anything the bound admits. Limits use the 27B's constants; expected durations and the wall use the
-    chosen model's speeds (TMF3)."""
-    require_model(model)
+    chosen model's speeds (TMF3), and in a plan each phase's model (TMF4): setup and report the setup model's, the
+    simulation the turns model's, plus the two swaps and the probes after each."""
+    setup_model, turns_model, swaps = plan_members(model)
     actors, rounds, budget, bound = profile['actors'], profile['rounds'], profile['memory_budget'], profile['agents_bound']
     agents = math.ceil(actors * GROWTH - 1e-9)
-    scale = phase_scale(model)
-    out = {'expected_agents': agents, 'model': model, 'read_tps': round(MODELS[model]['read_tps'], 1),
-           'write_tps': round(MODELS[model]['write_tps'], 1), 'phase_scale': round(scale, 3),
-           'token_ratio_to_27b': MODELS[model]['token_ratio_to_27b']}
+    scale = phase_scale(setup_model)
+    out = {'expected_agents': agents, 'model': model_label(model), 'read_tps': round(MODELS[turns_model]['read_tps'], 1),
+           'write_tps': round(MODELS[turns_model]['write_tps'], 1), 'phase_scale': round(scale, 3),
+           'token_ratio_to_27b': max(MODELS[setup_model]['token_ratio_to_27b'], MODELS[turns_model]['token_ratio_to_27b'])}
+    if swaps:  # a plan's own fields; one model keeps exactly the fields it had before TMF4
+        out.update(setup_model=setup_model, turns_model=turns_model, swaps=swaps,
+                   setup_read_tps=round(MODELS[setup_model]['read_tps'], 1), setup_write_tps=round(MODELS[setup_model]['write_tps'], 1))
     # Memory and window.
     out['window_need'] = window_need(budget)
     out['largest_budget'] = largest_budget()
@@ -203,32 +277,41 @@ def derive(profile, model=DEFAULT_MODEL):
     out.update(gateway_arrival_s=arrival, gateway_queue_s=queue, agent_client_s=client, caller_client_s=client, embedding_client_s=client,
                request_bytes=REQUEST_BYTES, request_bytes_need=math.ceil(WINDOW * BYTES_PER_TOKEN_MAX), helper_request_cap=HELPER_REQUEST_CAP)
     out.update(wait_event_bound=wait_event_bound(), worker_event_bytes=worker_event_bytes())
-    # Model calls and output.
+    # Model calls and output. A plan adds the two probes after each of its two swaps (TMF4 addendum 1, ruling d): four chats,
+    # each reserving 512 output tokens like the two at the start.
+    probes = START_PROBES + PROBES_PER_SWAP * swaps
+    swap_chats = PROBES_PER_SWAP * swaps
     turns = rounds * agents * PLATFORMS
     sim_chats = math.ceil(turns * CALLS_PER_TURN)
     setup_chats = SETUP_FIXED_CHATS + agents
-    expected_chats = setup_chats + sim_chats + REPORT_CHATS
+    expected_chats = setup_chats + sim_chats + REPORT_CHATS + swap_chats
     bound_turns = rounds * bound * PLATFORMS
     bound_sim_chats = math.ceil(bound_turns * CALLS_PER_TURN)
-    bound_chats = SETUP_FIXED_CHATS + bound + bound_sim_chats + REPORT_CHATS
+    bound_chats = SETUP_FIXED_CHATS + bound + bound_sim_chats + REPORT_CHATS + swap_chats
     chats = ceil_to(max(CHAT_MARGIN * expected_chats, bound_chats), 32)
-    reserve = 2 * NATIVE_PROBE_OUTPUT + (chats - 2) * max(CALLER_REPLY_CAP, AGENT_REPLY_CAP)
+    reserve = probes * NATIVE_PROBE_OUTPUT + (chats - probes) * max(CALLER_REPLY_CAP, AGENT_REPLY_CAP)
     out.update(turns=turns, sim_chats=sim_chats, setup_chats=setup_chats, report_chats=REPORT_CHATS, expected_chats=expected_chats,
                bound_turns=bound_turns, bound_sim_chats=bound_sim_chats, bound_chats=bound_chats,
                chats=chats, reserve_need=reserve, output=ceil_to(reserve, OUTPUT_STEP))
+    if swaps:
+        out.update(swap_chats=swap_chats, probe_chats=probes)
     # Durations by phase, and the wall clock.
     setup_s = (SETUP_GRAPH_S + (agents + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S) * scale
     ceiling_setup = (SETUP_GRAPH_S + (bound + SETUP_OTHER_CALLER_CALLS) * SETUP_CALLER_CALL_S) * scale
     per_round = turns / rounds * CALLS_PER_TURN
-    expected_rounds = [per_round * expected_round_seconds(budget, r, model) for r in range(1, rounds + 1)]
-    ceiling_sim = bound_sim_chats * ceiling_call_seconds(budget, model)
+    expected_rounds = [per_round * expected_round_seconds(budget, r, turns_model) for r in range(1, rounds + 1)]
+    ceiling_sim = bound_sim_chats * ceiling_call_seconds(budget, turns_model)
     report_s = REPORT_MEASURED_S * REPORT_SCALE_ASSUMED * scale
-    expected_total = START_S + setup_s + sum(expected_rounds) + report_s + CLEANUP_S
-    ceiling_total = START_S + ceiling_setup + ceiling_sim + report_s + CLEANUP_S
+    swap_s = SWAP_EXPECTED_S * swaps
+    ceiling_swaps = (swap_ceiling_seconds(turns_model) + swap_ceiling_seconds(setup_model)) if swaps else 0
+    expected_total = START_S + setup_s + sum(expected_rounds) + swap_s + report_s + CLEANUP_S
+    ceiling_total = START_S + ceiling_setup + ceiling_sim + ceiling_swaps + report_s + CLEANUP_S
     wall = ceil_to(DURATION_MARGIN * ceiling_total, WALL_STEP_S)
     out.update(setup_s=round(setup_s), ceiling_setup_s=round(ceiling_setup), expected_round_s=[round(x) for x in expected_rounds], ceiling_sim_s=round(ceiling_sim),
                report_s=round(report_s), expected_total_s=round(expected_total), ceiling_total_s=round(ceiling_total), wall=wall,
                worker_deadline_s=wall - CLEANUP_S)
+    if swaps:
+        out.update(swap_s=round(swap_s), ceiling_swaps_s=round(ceiling_swaps))
     records = int(wall / HOST_SAMPLE_S) + 1
     out.update(history_records=records, history_mib=ceil_to(records * HISTORY_RECORD_BYTES * 1.5 / 2**20, 32))
     return out
@@ -242,9 +325,12 @@ def require_model(model):
 def violations(profile, d=None, model=DEFAULT_MODEL):
     """Every coupling inequality; an empty list means the profile is consistent. Each entry names the broken inequality."""
     d = d or derive(profile, model)
+    swaps = d.get('swaps', 0)
+    members = (d.get('setup_model', d['model']), d.get('turns_model', d['model']))
+    probes = START_PROBES + PROBES_PER_SWAP * swaps
     checks = [
         ('memory budget fits the window at the assumed ratio: %.2f B + 1750 + 1024 <= 32768' % RATIO_ASSUMED, d['window_need'] <= WINDOW),
-        ('the chosen model needs no more real tokens than the 27B the window was measured on', MODELS[d['model']]['token_ratio_to_27b'] <= 1.0),
+        ('the chosen model needs no more real tokens than the 27B the window was measured on', all(MODELS[m]['token_ratio_to_27b'] <= 1.0 for m in members)),
         ('largest persona fits the memory budget with room for a feed', PERSONA_LIBRARY_MAX < profile['memory_budget']),
         ('a call slot is the worst single call plus 10%', d['agent_slot_s'] >= MARGIN * d['agent_worst_s'] and d['caller_slot_s'] >= MARGIN * d['caller_worst_s']),
         ('gateway arrival-to-done covers every agent call in flight', d['gateway_arrival_s'] >= d['agents_in_flight'] * d['agent_slot_s']),
@@ -262,7 +348,9 @@ def violations(profile, d=None, model=DEFAULT_MODEL):
         ('caller reply cap fits the per-call output ceiling', CALLER_REPLY_CAP <= 4096 and AGENT_REPLY_CAP <= CALLER_REPLY_CAP),
         ('model calls allowed cover the expected calls', d['chats'] >= d['expected_chats']),
         ('model calls allowed cover every call the participant bound admits', d['chats'] >= d['bound_chats']),
-        ('output budget lets every admitted call reserve its cap', d['output'] >= d['reserve_need']),
+        ('model calls allowed count the probes after each swap of a plan', d.get('swap_chats', 0) == PROBES_PER_SWAP * swaps and d.get('probe_chats', START_PROBES) == probes
+                                                                            and d['bound_chats'] >= PROBES_PER_SWAP * swaps),
+        ('output budget lets every admitted call reserve its cap', d['output'] >= d['reserve_need'] >= probes * NATIVE_PROBE_OUTPUT + (d['chats'] - probes) * CALLER_REPLY_CAP),
         ('participant bound covers the named participants and the measured growth', profile['agents_bound'] >= max(profile['actors'], d['expected_agents'])),
         ('wall covers the ceiling at the participant bound with its margin', d['wall'] >= DURATION_MARGIN * d['ceiling_total_s']),
         ('host history covers the wall at one sample each 0.4 s', d['history_records'] >= int(d['wall'] / HOST_SAMPLE_S) + 1),

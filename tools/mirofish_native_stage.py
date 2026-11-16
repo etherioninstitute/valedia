@@ -74,30 +74,38 @@ SCENARIO_SEAL_REL='scenario-input-seal.json'
 MODEL_ORIGINAL_SHA='6e116603d4b3dee43bbf226bce4fe0a2d393958a84f9e85504f5fa953366c677'
 MODEL_COPIES={'builder/review-source/mirofish_native_model.py','owned-source/observer-entry/mirofish_native_model.py'}
 ORIGINAL_SDK_PORT=62298;SERVER_PORT=1235
-# TMF3 (addendum 1, 2026-11-15): staging WITH a model named (--model) takes the src/ revisions of the model module and the run
-# script, each pinned here by its own hash exactly as the memory replacement is (a changed byte in src/ refuses staging until the
-# pin is deliberately moved). They are the revisions of commits ab08400 and b5a1797. Their copies read the checkpoint from a
-# selector file written beside the model module. Staging WITHOUT --model copies the W16 bytes as before, with no selector.
-SRC=BASE/'valedia-trader/src'
-MODEL_SRC_SHA='ea0676a6409a0915cd564bc954790937d8c9fbcb8be2a35d51c77ebda730d103'
-RUN_SRC_SHA='21c4418452a7c19c16ab7164f3c24f60feac097e46bb70219c896c7029be06eb'
-SRC_REVISION_NOTE=('These two files (mirofish_native_model.py, mirofish_native_run.py) are the src/ revisions of commits ab08400 and '
-    'b5a1797, not the W16 bytes. They were reviewed on 2026-11-15 (V134) and found unsafe for registered profiles: a '
+# TMF3 (addendum 1, 2026-11-15): staging WITH a model named (--model, or a plan with --setup-model and --turns-model, TMF4)
+# takes the src/ revisions of the model module and the run script, each pinned here by its own hash exactly as the memory
+# replacement is (a changed byte in src/ refuses staging until the pin is deliberately moved). They are read from this tool's
+# own repository (tools/../src), never from another tree. Their copies read the checkpoint, or the plan of two checkpoints,
+# from a selector file written beside the model module. Staging WITHOUT a model copies the W16 bytes as before, with no selector.
+SRC=Path(__file__).absolute().parents[1]/'src'
+MODEL_SRC_SHA='e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115'   # fc99603 (TMF4a) + 38bce8a (TMF4 addendum 3)
+RUN_SRC_SHA='0426dd5a52ad363f92d02149258507f80bf5f9d8fe51f4a1fa066733f0816b50'
+SRC_REVIEW_STATUS='blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied afterwards and awaiting their own check)'
+SRC_REVISION_NOTE=('These two files (mirofish_native_model.py, mirofish_native_run.py) are the src/ revisions of commit fc99603 (TMF4a: '
+    'two models by phase, the Bonsai 2 profile, validated helper constants, the hardened registry reader) with the four repairs '
+    'of TMF4 addendum 3 (commit 38bce8a), not the W16 bytes. Review status: '+SRC_REVIEW_STATUS+'. History: TMF3 staged the '
+    'revisions of commits ab08400 and b5a1797, which were reviewed on 2026-11-15 (V134) and found unsafe for registered profiles: a '
     'registered profile can set the observer\'s readable directory and its own weight pin, and its hash text reaches the helper '
     'script unescaped. They were accepted for the two built-in profiles only, under conditions C1 to C3, which this folder '
-    'applies: built-in names only, no registry in any staged copy, weight pin and tokenizer hashes checked at staging, no '
-    'borrowed conformance evidence. Every other file is staged as without a model.')
+    'still applies to the three built-in profiles of these revisions: built-in names only, no registry in any staged copy, weight '
+    'pin and tokenizer hashes checked at staging, no borrowed conformance evidence. Every other file is staged as without a model.')
 MODEL_SELECTOR='mirofish_model_profile.json'
 SELECTOR_COPIES={'builder/review-source/'+MODEL_SELECTOR,'owned-source/observer-entry/'+MODEL_SELECTOR}  # beside each staged model copy
 MODEL_REGISTRY=SRC/'mirofish_model_registry.json'  # read only to name a registry-only profile in its refusal; never staged
 REGISTRY_NAME='mirofish_model_registry.json'
-# Addendum 2, C1: --model accepts exactly the two built-in profiles of the pinned module's MODEL_PROFILES literal; a registered
-# profile can name its own paths and pins, so no registry ever reaches a candidate and no registered name is staged.
-BUILTIN_MODELS=('qwen3.8-27b','qwen3-8b')
-# The reviewed tokenizer-origin hashes of each checkpoint other than the 27B (the 27B's are the base manifest's model_tokenizer).
+# Addendum 2, C1: a model is exactly one of the built-in profiles of the pinned module's MODEL_PROFILES literal (three since
+# TMF4a); a registered profile can name its own paths and pins, so no registry ever reaches a candidate and no registered name is
+# staged. A plan (TMF4) names two different built-in profiles: the setup model (preparation and report) and the turns model.
+BUILTIN_MODELS=('qwen3.8-27b','qwen3-8b','ternary-bonsai-2-27b')
+# The reviewed tokenizer-origin hashes of each tokenizer origin other than the 27B's (the 27B's are the base manifest's
+# model_tokenizer; Bonsai 2 uses the 27B's origin, TMF4 addendum 1 Step 0.2), by profile.
 TOKENIZER_PINS={'qwen3-8b':{'config.json':'f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30','tokenizer.json':'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4',
     'tokenizer_config.json':'d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101','chat_template.jinja':'a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8',
     'model.safetensors.index.json':'f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc'}}
+# The words the pinned run script's prepare_candidate adds to runtime_predicates for a plan; staging writes the same words.
+PLAN_PREDICATE='two pinned models by phase: setup model for preparation and report, turns model for the simulation, swapped at the two boundaries with the gateway idle, the same two probes after each swap'
 START_FRAGMENT='(65 if pre else 30)'  # mirofish_native_run.py:380, the free-memory start rule (30 is the stop floor, unchanged)
 SDK_HELPER_REL='builder/sdk_native.mjs'  # the generated helper script; the launcher refuses unless it equals what the model source generates
 # The SSD's device number, which the launcher checks the prompt-cache target against. The reviewed startup source fixes the value
@@ -269,13 +277,13 @@ def sdk_port_helper(text,port):
     old=f'ws://127.0.0.1:{ORIGINAL_SDK_PORT}';require(text.count(old)==1 and text.count(str(ORIGINAL_SDK_PORT))==1,'SDK helper port text missing or ambiguous');return text.replace(old,f'ws://127.0.0.1:{port}')
 def staged_helper_matches_model(work,port,model=None):
     """Load the staged model source (it starts nothing on import) and require that the helper it generates is the staged helper
-    (and, staged with a model, that it reads the chosen profile from its selector)."""
+    (and, staged with a model or a plan, that it reads the chosen profile and plan from its selector)."""
     entry=Path(work)/'owned-source/observer-entry';sys.path.insert(0,str(entry))
     try:
         spec=importlib.util.spec_from_file_location('staged_native_model_check',entry/'mirofish_native_model.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     finally:sys.path.remove(str(entry))
     require(module.SDK_PORT==port and (Path(work)/SDK_HELPER_REL).read_text()==module.SDK_SCRIPT,'staged SDK helper does not match what the staged model source generates')
-    require(model is None or getattr(module,'ACTIVE_MODEL_PROFILE',None)==model,'staged model source does not read the chosen profile from its selector')
+    require(model is None or (getattr(module,'ACTIVE_MODEL_PROFILE',None)==model['active'] and getattr(module,'MODEL_PLAN',None)==model['plan']),'staged model source does not read the chosen profile or plan from its selector')
     return module
 def sdk_port_policy(text,port):
     old=f'(allow network-outbound (remote ip "localhost:{ORIGINAL_SDK_PORT}"))';new=f'(allow network-outbound (remote ip "localhost:{port}"))';require(text.count(old)==1 and new not in text,'observer policy SDK port rule missing or ambiguous')
@@ -450,9 +458,27 @@ def model_profiles(raw=None):
             require(node.targets[0].id not in names,'model profile constant assigned twice');names[node.targets[0].id]=value(node.value)
     require(set(names)=={'_MODEL_ROOT','MODEL_PROFILES','DEFAULT_MODEL_PROFILE','TOKENIZER_FILES'},'model profile constants missing from the pinned module')
     return names['MODEL_PROFILES'],names['TOKENIZER_FILES'],names['DEFAULT_MODEL_PROFILE']
+STAGED_AT='size and SHA-256 checked at staging'
+def _shape(value,kind,why):
+    require(type(value) is kind and (kind is not int or value>0) and (kind is not str or len(value)==64 and all(c in '0123456789abcdef' for c in value)),why);return value
+def check_selection(name,entry):
+    """The profile's LM Studio selection against its pins, following the profile (TMF4 addendum 2): sizeBytes is the serving
+    files together (the weights, plus the pinned second file LM Studio loads with them), sourceSha256 the weights'. Mirrors the
+    pinned module's helper_constants (R6). Returns the serving bytes."""
+    weight=_shape(entry.get('weight_bytes'),int,'model profile %r weight size shape'%name);_shape(entry.get('weight_sha256'),str,'model profile %r weight hash shape'%name);extra=0
+    if any(key in entry for key in ('second_file','second_bytes','second_sha256')):
+        require(isinstance(entry.get('second_file'),Path) and entry['second_file'].is_absolute(),'model profile %r second file must be an absolute path'%name)
+        extra=_shape(entry.get('second_bytes'),int,'model profile %r second file size shape'%name);_shape(entry.get('second_sha256'),str,'model profile %r second file hash shape'%name)
+        require('selection_bytes' in entry,'model profile %r selection disagrees with its pins: a second file needs a pinned selection size'%name)
+    total=entry.get('selection_bytes',weight+extra);selection=entry.get('gguf_selection') or {}
+    require(type(total) is int and total==weight+extra,'model profile %r selection disagrees with its pins: the selection size is not its pinned files together'%name)
+    require(type(selection.get('maxContextLength')) is int and selection['maxContextLength']>=LIMITS.WINDOW and selection.get('format')=='gguf','model profile %r does not support the 32,768 window as a GGUF'%name)
+    require(selection.get('sizeBytes')==total and selection.get('sourceSha256')==entry['weight_sha256'],'model profile %r selection disagrees with its pinned size or hash'%name)
+    return total
 def model_choice(name,base_manifest,registry=None):
     """The chosen built-in profile and its pins, derived from the pinned module (names and paths) and the reviewed hashes (the
-    base manifest's for the 27B, TOKENIZER_PINS otherwise). Refuses, in one line, an unknown name and a registry-only profile."""
+    base manifest's for the 27B's tokenizer origin, which Bonsai 2 shares; TOKENIZER_PINS otherwise). Refuses, in one line, an
+    unknown name and a registry-only profile."""
     profiles,files,default=model_profiles();require(tuple(profiles)==BUILTIN_MODELS and default==BUILTIN_MODELS[0],'the built-in profiles of the pinned module changed')
     if name not in BUILTIN_MODELS:
         registry=MODEL_REGISTRY if registry is None else registry;rows=json.loads(Path(registry).read_text()).get('profiles',{}) if Path(registry).is_file() else {}
@@ -460,35 +486,70 @@ def model_choice(name,base_manifest,registry=None):
         require(name not in rows,'model profile %r is registry-only; only the built-in profiles of the pinned src/ module can be staged'%name)
         raise RuntimeError('unknown model profile %r; expected one of %s'%(name,sorted(profiles)))
     entry=profiles[name];base_rows=base_manifest['model_files'];require(len(base_rows)==len(files)+1,'base model pin count changed')
-    pins=dict(base_manifest['model_tokenizer']) if name==default else TOKENIZER_PINS.get(name)
+    pins=dict(base_manifest['model_tokenizer']) if entry['tokenizer_root']==profiles[default]['tokenizer_root'] else TOKENIZER_PINS.get(name)
     require(pins is not None and set(pins)==set(files),'no reviewed tokenizer pins for model profile %r'%name)
+    serving=check_selection(name,entry);quant=entry['gguf_selection']['quantization']['name']
     rows=[{'bytes':None,'path':str(entry['tokenizer_root']/f),'role':base_rows[0]['role'],'sha256':pins[f]} for f in files]
-    rows.append({'bytes':entry['weight_bytes'],'path':str(entry['weight_file']),'role':base_rows[-1]['role'],'sha256':entry['weight_sha256']})
-    require(entry['gguf_selection']['maxContextLength']>=LIMITS.WINDOW and entry['gguf_selection']['sizeBytes']==entry['weight_bytes'] and entry['gguf_selection']['sourceSha256']==entry['weight_sha256'],'model profile %r does not support the 32,768 window or its selection disagrees with its pins'%name)
-    return {'name':name,'default':name==default,'entry':entry,'tokenizer_files':files,'model_files':rows,'model_tokenizer':{f:pins[f] for f in files},
-            'paths':{Path(row['path']) for row in rows},'start_threshold':LIMITS.start_threshold(name,entry['weight_bytes'])}
+    # C3: only the 27B's weight row carries the base manifest's role (its preflight evidence); another checkpoint's says what was checked.
+    serving_rows=[{'bytes':entry['weight_bytes'],'path':str(entry['weight_file']),'role':base_rows[-1]['role'] if name==default else 'sole serving GGUF %s weight; %s'%(quant,STAGED_AT),'sha256':entry['weight_sha256']}]
+    if entry.get('second_file') is not None:
+        serving_rows.append({'bytes':entry['second_bytes'],'path':str(entry['second_file']),'role':'second file LM Studio loads with the weights (vision projector); loaded and unused; '+STAGED_AT,'sha256':entry['second_sha256']})
+    threshold=LIMITS.start_threshold(name,serving)
+    return {'name':name,'default':name==default,'entry':entry,'entries':{name:entry},'members':[name],'plan':None,'active':name,'limits_key':name,
+            'tokenizer_files':files,'model_files':rows+serving_rows,'model_tokenizer':{f:pins[f] for f in files},'tokenizer_by_profile':{name:{f:pins[f] for f in files}},
+            'paths':{Path(row['path']) for row in rows+serving_rows},'roots':[entry['tokenizer_root']],'serving_files':[Path(row['path']) for row in serving_rows],
+            'serving_bytes':serving,'serving_by_member':{name:serving},'start_threshold':threshold,'members_threshold':{name:threshold},'selector':selector_bytes(name)}
+def plan_choice(setup,turns,base_manifest,registry=None):
+    """TMF4: a plan of two different built-in profiles, the setup model (preparation and report, loaded first) and the turns
+    model (the simulation). Model files in load order: each member's tokenizer origin (listed once when two members share it),
+    then its serving files, labelled with its phase. The start threshold is the larger member's (ruling c)."""
+    require(type(setup) is str and type(turns) is str and setup!=turns,'a plan names two different built-in profiles: setup %r, turns %r'%(setup,turns))
+    members=[model_choice(setup,base_manifest,registry),model_choice(turns,base_manifest,registry)];plan={'setup':setup,'turns':turns}
+    rows=[];roots=[];files=[]
+    for label,member in zip(('setup and report model ','turns model '),members):
+        for row in member['model_files'][:len(member['tokenizer_files'])]:
+            if row['path'] not in {r['path'] for r in rows}:rows.append(dict(row))
+        for row in member['model_files'][len(member['tokenizer_files']):]:
+            role=row['role'] if member['name']!=BUILTIN_MODELS[0] else 'sole serving GGUF %s weight; %s'%(member['entry']['gguf_selection']['quantization']['name'],STAGED_AT)
+            rows.append(dict(row,role=label+member['name']+': '+role))
+        roots+=[r for r in member['roots'] if r not in roots];files+=[f for f in member['serving_files'] if f not in files]
+    serving={m['name']:m['serving_bytes'] for m in members}
+    return {'name':None,'default':False,'entries':{m['name']:m['entry'] for m in members},'members':[setup,turns],'plan':plan,'active':setup,'limits_key':plan,
+            'tokenizer_files':members[0]['tokenizer_files'],'model_files':rows,'model_tokenizer':dict(members[0]['model_tokenizer']),
+            'tokenizer_by_profile':{m['name']:dict(m['model_tokenizer']) for m in members},'paths':members[0]['paths']|members[1]['paths'],'roots':roots,'serving_files':files,
+            'serving_bytes':max(serving.values()),'serving_by_member':serving,'start_threshold':LIMITS.plan_start_threshold(serving),
+            'members_threshold':{m['name']:m['start_threshold'] for m in members},'selector':selector_bytes(plan=plan)}
 def verify_model_files(choice,verified=()):
-    """Every pinned model file is a regular file with its pinned hash (and the GGUF its pinned size); a file inputs() already
-    verified against the same pin is not hashed twice. The tokenizer origin's config names the profile's architecture and a
-    context of at least the window. Fills in the tokenizer files' sizes."""
+    """Every pinned model file (each member's weights, second file and tokenizer origin) is a regular file with its pinned hash
+    (and a serving file its pinned size); a file inputs() already verified against the same pin is not hashed twice. Each
+    member's tokenizer origin config names the profile's architecture and a context of at least the window (at the top level or,
+    for the 27B's origin, under text_config). Fills in the tokenizer files' sizes."""
     done={(row['path'],row['sha256']) for row in verified}
     for row in choice['model_files']:
         p=Path(row['path']);require(p.is_file() and not p.is_symlink(),'model file missing: '+str(p))
         if row['bytes'] is not None:require(p.stat().st_size==row['bytes'],'model file does not match its pinned size: '+str(p))
         require((row['path'],row['sha256']) in done or sha(p)==row['sha256'],'model file does not match its pin: '+str(p))
         if row['bytes'] is None:row['bytes']=p.stat().st_size
-    config=json.loads((choice['entry']['tokenizer_root']/'config.json').read_bytes())
-    require(config.get('model_type')==choice['entry']['tokenizer_model_type'] and config.get('max_position_embeddings',0)>=LIMITS.WINDOW,'model tokenizer origin does not name the profile architecture or the 32,768 window: '+choice['name'])
+    for name,entry in (choice.get('entries') or {choice['name']:choice['entry']}).items():
+        config=json.loads((entry['tokenizer_root']/'config.json').read_bytes());window=config.get('max_position_embeddings') or (config.get('text_config') or {}).get('max_position_embeddings') or 0
+        require(config.get('model_type')==entry['tokenizer_model_type'] and window>=LIMITS.WINDOW,'model tokenizer origin does not name the profile architecture or the 32,768 window: '+name)
     return choice
-def selector_bytes(name):
-    """The selector, written by this tool as exact bytes (addendum 2, C1), never copied from src/."""
-    require(name in BUILTIN_MODELS,'the selector names a built-in profile only');return ('{"profile": "'+name+'"}\n').encode()
+def selector_bytes(name=None,plan=None):
+    """The selector, written by this tool as exact bytes (addendum 2, C1), never copied from src/: {"profile": name} or, for a
+    plan, {"plan": {"setup": name, "turns": name}}."""
+    if plan is None:
+        require(name in BUILTIN_MODELS,'the selector names a built-in profile only');return ('{"profile": "'+name+'"}\n').encode()
+    require(name is None and type(plan) is dict and set(plan)=={'setup','turns'} and plan['setup'] in BUILTIN_MODELS and plan['turns'] in BUILTIN_MODELS and plan['setup']!=plan['turns'],'a plan selector names two different built-in profiles')
+    return ('{"plan": {"setup": "'+plan['setup']+'", "turns": "'+plan['turns']+'"}}\n').encode()
+def _quote(path):return json.dumps(str(path))
 def model_policy(text,choice,reference):
-    """The observer policy for the chosen checkpoint: the reviewed policy with its two checkpoint rules (the tokenizer origin
-    folder and the GGUF file) naming the chosen model's paths, each exactly once; nothing else changes."""
+    """The observer policy for the chosen checkpoint or plan: the reviewed policy with its two checkpoint rules (the tokenizer
+    origin folder and the GGUF file) replaced, each in place and each exactly once, by the rules for the staged tokenizer origins
+    and serving files in load order (R7); nothing else changes."""
     out=text
-    for old,new in [(reference['entry']['tokenizer_root'],choice['entry']['tokenizer_root']),(reference['entry']['weight_file'],choice['entry']['weight_file'])]:
-        old_rule='"'+str(old)+'"';require(out.count(old_rule)==1,'observer policy checkpoint rule missing or ambiguous: '+str(old));out=out.replace(old_rule,'"'+str(new)+'"')
+    for old,new,rule in [(reference['roots'],choice['roots'],'(allow file-read* file-map-executable (subpath %s))'),(reference['serving_files'],choice['serving_files'],'(allow file-read* (literal %s))')]:
+        require(len(old)==1,'reference checkpoint rule');old_rule=rule%_quote(old[0])
+        require(out.count(old_rule)==1,'observer policy checkpoint rule missing or ambiguous: '+str(old[0]));out=out.replace(old_rule,'\n'.join(rule%_quote(path) for path in new))
     return out
 def src_observer_policy(work,proxy_port,graph_port):
     """The observer policy as the staged src/ run script itself generates it, in a fresh interpreter whose only staged modules
@@ -497,12 +558,28 @@ def src_observer_policy(work,proxy_port,graph_port):
     entry=Path(work)/'owned-source/observer-entry';code='import sys;sys.path.insert(0,sys.argv[1]);import mirofish_native_run as r;sys.stdout.write(r.observer_policy(sys.argv[2],int(sys.argv[3]),int(sys.argv[4])))'
     done=subprocess.run([sys.executable,'-B','-c',code,str(entry),str(work),str(proxy_port),str(graph_port)],cwd=str(entry),env={'PATH':'/usr/bin:/bin','TMPDIR':os.environ.get('TMPDIR','/tmp')},capture_output=True,text=True,timeout=120)
     require(done.returncode==0,'staged src run script could not generate the observer policy: '+done.stderr.strip()[-400:]);return done.stdout
+def plan_fragments(raw=None):
+    """The three closed helper fragments of a plan, read from the pinned module's own source text (never retyped)."""
+    raw=raw if raw is not None else src_revision('mirofish_native_model.py',MODEL_SRC_SHA)
+    nodes=[n for n in ast.parse(raw).body if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name) and n.targets[0].id=='_PLAN_FRAGMENTS']
+    require(len(nodes)==1,'plan helper fragments missing from the pinned module');value=ast.literal_eval(nodes[0].value)
+    require(type(value) is tuple and len(value)==3 and all(type(x) is tuple and len(x)==2 and all(type(y) is str for y in x) for x in value),'plan helper fragments shape');return value
+def _constants(entry,serving):return {'selection':entry['gguf_selection'],'weightSize':serving,'weightSha':entry['weight_sha256']}
 def model_helper_text(text,choice,reference):
-    """The SDK helper for the chosen checkpoint: the reviewed helper with its checkpoint selection, weight size and weight hash
-    naming the chosen model's, each exactly once; the staged model module must generate exactly this text."""
+    """The SDK helper for the chosen checkpoint: the reviewed helper with its checkpoint selection, selection size and weight hash
+    naming the chosen model's, each exactly once. For a plan: the plan's three closed fragments of the pinned module, the first
+    carrying both members' validated constants as one JSON table. The staged model module must generate exactly this text."""
+    ref=_constants(reference['entry'],reference['serving_bytes'])
+    if choice['plan'] is None:
+        new=_constants(choice['entry'],choice['serving_bytes'])
+        edits=[(json.dumps(ref['selection'],sort_keys=True),json.dumps(new['selection'],sort_keys=True)),('weightSize=%d,'%ref['weightSize'],'weightSize=%d,'%new['weightSize']),("weightSha='%s'"%ref['weightSha'],"weightSha='%s'"%new['weightSha'])]
+    else:
+        (first_old,first_new),second,third=plan_fragments()
+        filled=first_old.replace('__GGUF_SELECTION__',json.dumps(ref['selection'],sort_keys=True)).replace('__WEIGHT_BYTES__',str(ref['weightSize'])).replace('__WEIGHT_SHA256__',ref['weightSha'])
+        table=json.dumps({name:_constants(choice['entries'][name],choice['serving_by_member'][name]) for name in choice['members']},sort_keys=True)
+        edits=[(filled,first_new.replace('__PLAN_PROFILES__',table)),second,third]
     out=text
-    for old,new in [(json.dumps(reference['entry']['gguf_selection'],sort_keys=True),json.dumps(choice['entry']['gguf_selection'],sort_keys=True)),
-                    ('weightSize=%d,'%reference['entry']['weight_bytes'],'weightSize=%d,'%choice['entry']['weight_bytes']),("weightSha='%s'"%reference['entry']['weight_sha256'],"weightSha='%s'"%choice['entry']['weight_sha256'])]:
+    for old,new in edits:
         require(out.count(old)==1,'SDK helper checkpoint text missing or ambiguous');out=out.replace(old,new)
     return out
 
@@ -512,9 +589,9 @@ def scaffold(work):
 
 def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=ORIGINAL_CACHE_DEVICE,model=None):
     require(profile in PROFILES,'unknown closed staging profile');moved=sdk_port!=ORIGINAL_SDK_PORT;remounted=ssd_device!=ORIGINAL_CACHE_DEVICE
-    # model: None (the W16 bytes, no selector) or a verified model_choice() (the pinned src/ revisions plus the selector).
+    # model: None (the W16 bytes, no selector) or a verified model_choice() or plan_choice() (the pinned src/ revisions plus the selector).
     require(model is None or (profile in SWARM and isinstance(model,dict) and all(row['bytes'] is not None for row in model['model_files'])),'a model is staged only with a swarm profile and verified pins')
-    model_name=model['name'] if model else None
+    model_name=model['limits_key'] if model else None  # one profile name, or a plan {'setup','turns'}: what the swarm numbers are derived for
     if model:src_model,src_run=src_revision('mirofish_native_model.py',MODEL_SRC_SHA),src_revision('mirofish_native_run.py',RUN_SRC_SHA)
     manifest,base_raw,receipt,receipt_raw,acceptance_raw,controls,observations,helpers=data;work=Path(work).absolute();require(work.parent==CREW and not work.exists() and all(not p.is_symlink() for p in [work,*work.parents]),'fresh direct crew work required');work.mkdir();(work/'builder').mkdir();(work/'tmp').mkdir();ancestry=[];pins=[]
     for row in manifest['files']:
@@ -562,11 +639,11 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
     if model:
         reference=model_choice(LIMITS.DEFAULT_MODEL,manifest)
         for relative in sorted(SELECTOR_COPIES):
-            target=work/relative;require(target.parent.is_dir() and not target.exists() and (target.parent/'mirofish_native_model.py').is_file(),'selector must sit beside a staged model copy: '+relative);target.write_bytes(selector_bytes(model_name));target.chmod(0o444);selector_pins.append({'path':str(target),'sha256':sha(target)})
+            target=work/relative;require(target.parent.is_dir() and not target.exists() and (target.parent/'mirofish_native_model.py').is_file(),'selector must sit beside a staged model copy: '+relative);target.write_bytes(model['selector']);target.chmod(0o444);selector_pins.append({'path':str(target),'sha256':sha(target)})
         helper=work/SDK_HELPER_REL;reviewed=helper.read_text();reviewed=sdk_port_helper(reviewed,sdk_port) if moved else reviewed;helper.chmod(0o644);helper.write_text(model_helper_text(reviewed,model,reference));helper.chmod(0o444)
         rows=[row for row in ancestry if row['target']==str(helper)];require(len(rows)==1,'SDK helper ancestry');rows[0].update(kind='PINNED_SRC_REVISION_MODEL_HELPER',sha256=sha(helper))
         pins[[i for i,row in enumerate(pins) if row['path']==str(helper)][0]]['sha256']=sha(helper)
-        staged_helper_matches_model(work,sdk_port,model_name);pins.extend(selector_pins)
+        staged_helper_matches_model(work,sdk_port,model);pins.extend(selector_pins)
     elif moved:staged_helper_matches_model(work,sdk_port)
     scaffold(work)  # Explicit empty runtime directories; never copy historical logs/state.
     native=helpers['mirofish_native_run'];native.graph_configuration(work,manifest['graph_port'])
@@ -594,12 +671,12 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
     if profile in SWARM:require(owned_count==72 and exact_owned+port_owned+device_owned+src_owned==55 and sorted(row['file'] for row in swarm_closed)==sorted(['gateway']*3+['run']*3+['startup']*3+['producer:'+Path(k).name for k in SWARM_PRODUCER]) and swarm_selector==1 and memory_rows==1 and swarm_scenario_rows==3 and gateway_deltas==0,'swarm source ancestry changed')
     else:require(owned_count==72 and exact_owned+port_owned+device_owned==({'compact40':70,'report64':68,'report64_coverage':67}[profile]) and owned_gateway==(0 if profile=='compact40' else 2) and gateway_deltas==(0 if profile=='compact40' else 3) and not swarm_closed and not swarm_scenario_rows and not swarm_selector and not memory_rows,'profile source ancestry changed');require(len({sha(work/relative) for relative in GATEWAY_COPIES})==1,'gateway copies inconsistent')
     lineage={'manifest_pinned_owned_source_files':owned_count,'exact_owned_source_files':exact_owned,'reviewed_prompt_only_deltas':1,'profile':profile,'gateway_budget_deltas_total':gateway_deltas,'gateway_budget_deltas_owned':owned_gateway,'qualification_selector_deltas':sum(row['kind']=='EXPLICIT_BOUNDED_NATIVE_COVERAGE_QUALIFICATION_STIMULUS_THREE_RHS' for row in ancestry),'swarm_integer_delta_files':len(swarm_closed),'sdk_port':{'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port,'model_copies_changed':len(port_rows)+(len(src_model_rows) if moved else 0),'helper_script_changed':moved,'policy_rule_changed':moved,'why':'the local model server chooses a new internal SDK port each time its app restarts; a candidate is usable only while the server that was running at staging keeps running'},'ssd_device':{'reviewed':ORIGINAL_CACHE_DEVICE,'staged':ssd_device,'startup_copies_changed':len(device_rows),'route_record_changed':False,'why':'macOS numbers a volume when it mounts it, so a reboot or remount can change the SSD device number the launcher checks the prompt-cache target against; staging read the live number of the mounted SSD itself. builder/shared-cache-storage-route.json is the dated record of the 2026-11-07 routing and nothing reads it, so it keeps its 2026-11-07 number'},'swarm_selector_deltas':swarm_selector,'swarm_scenario_files_replaced':swarm_scenario_rows,'runtime_scaffolds':EMPTY_SCAFFOLDS,'historical_runtime_log_excluded':'owned-source/producer/backend/logs/2026-11-07.log (not manifest-pinned source)','base_manifest_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'source_copies':ancestry,'canonical_revision_witness':canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA),'historical_proof_policy':'Copied old manifests remain exact historical proof, not new target claims. Operational file paths in this derived manifest and all four generated policies/configs point at new work.','original713_and318':'713 selected pins unchanged; the one canonical extractor row in318 uses the exact closed witness; '+str(len(ACKNOWLEDGED_WITNESSES))+' other original files carry an owner-acknowledged later revision that is NOT copied into this candidate (the reviewed W16 bytes are); the remaining original pins are unchanged','owner_acknowledged_canonical_revisions':{'list_sha256':ACKNOWLEDGED_SHA,'count':len(ACKNOWLEDGED_WITNESSES),'copied_into_candidate':False,'witnesses':list(ACKNOWLEDGED_WITNESSES)},'no_model_graph_worker_paper_or_broker_actions':True}
-    if model:lineage['model_profile']={'name':model_name,'src_revisions':SRC_REVISION_NOTE,'model_copies_from_src':len(src_model_rows),'run_copies_from_src':len(src_run_rows),'selector_files':selector_pins}
+    if model:lineage['model_profile']={'name':model['name'],'plan':model['plan'],'src_revisions':SRC_REVISION_NOTE,'src_revisions_review':SRC_REVIEW_STATUS,'model_copies_from_src':len(src_model_rows),'run_copies_from_src':len(src_run_rows),'selector_files':selector_pins}
     lineage_path=work/'builder/staging-ancestry.json';write(lineage_path,lineage);pins.append({'path':str(lineage_path),'sha256':sha(lineage_path)})
     derived=copy.deepcopy(manifest);derived['staging_profile']={'name':profile,'chat_attempts':PROFILES[profile][0],'requested_output_total':PROFILES[profile][1],'caller_output':1536,'native_probe_output':512,'global_output_per_call':4096,'context':32768,'coverage':'expected finite report coverage, not guaranteed; full report semantics unchanged','participation_stimulus':'EXPLICIT_BOUNDED_CARDINALITY_COVERAGE_QUALIFICATION_ONLY_NOT_NATURALISTIC_FORECAST' if profile=='report64_coverage' else 'FULL_PARTICIPATION_EVERY_ROUND_SWARM_LOAD_NOT_NATURALISTIC_FORECAST' if profile in SWARM else 'UNCHANGED_STOCHASTIC_SCHEDULE'};derived['files']=pins;derived['task_caller_budget']['global_gateway']=[PROFILES[profile][0],PROFILES[profile][1],4096];derived['task_caller_budget']['maximum_reserved']=2*512+(PROFILES[profile][0]-2)*1536;derived['known_blockers']=[];derived['launch_available']=True;
     if profile in SWARM:
         p=swarm_numbers(profile,model_name);derived['uniform_policy']=dict(derived.get('uniform_policy') or {},wall_seconds=p['wall'],caller_timeout=p['caller_client_s'],gateway_arrival_seconds=p['gateway_arrival_s'],queue_seconds=p['gateway_queue_s'])
-        derived['staging_profile'].update(caller_output=p['caller_output'],native_output=p['native_output'],agent_memory_tokens=p['memory_budget']);derived['task_caller_budget']['limit']=p['caller_output'];derived['task_caller_budget']['maximum_reserved']=2*512+(p['chats']-2)*p['caller_output']
+        derived['staging_profile'].update(caller_output=p['caller_output'],native_output=p['native_output'],agent_memory_tokens=p['memory_budget']);derived['task_caller_budget']['limit']=p['caller_output'];derived['task_caller_budget']['maximum_reserved']=p.get('probe_chats',2)*512+(p['chats']-p.get('probe_chats',2))*p['caller_output']
         derived['swarm_profile']=dict(p,name=profile,
             owner_decision='2026-11-11 go-ahead for a larger swarm profile; on 2026-11-15 the owner asked for the 2,048-token agent cap to go. The numbers are the lead\'s, derived from the measurements of the stopped run valedia-native-20261114-swarm48-b. Launching remains the owner\'s decision.',
             memory_replacement={'path':MEMORY_REL,'canonical_sha256':MEMORY_CANONICAL_SHA,'replacement':str(MEMORY_FILE),'replacement_sha256':MEMORY_REPLACEMENT_SHA,'staged_sha256':sha(work/MEMORY_REL),
@@ -615,41 +692,85 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
                         'clients':'gateway arrival + 30 s = '+str(p['agent_client_s'])+' s (agent, persona/config, report and embedding clients)',
                         'request_bytes':'32768 tokens x 5.28 bytes per token (largest measured) = '+str(p['request_bytes_need'])+' <= '+str(p['request_bytes'])+' <= SDK helper cap '+str(p['helper_request_cap'])+' - 4096',
                         'worker_events':'largest wait event = 8192 + 50 recent actions x (14336 text tokens x 144 bytes per token + 512) = '+str(p['wait_event_bound'])+'; limit = 1.1 x (that + 1), rounded up to a MiB = '+str(p['worker_event_bytes']),
-                        'chats':'max((setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+') x 1.5, every call at the participant bound '+str(p['bound_chats'])+'), rounded up to 32 = '+str(p['chats']),
-                        'output':'2 x 512 + (chats - 2) x 4096 = '+str(p['reserve_need'])+', rounded up to 100,000',
-                        'wall':'('+p['model']+' speeds: '+LIMITS.MODELS[p['model']]['speed_source']+') 1.2 x (start 15 s + setup at the participant bound '+str(p['ceiling_setup_s'])+' s + simulation at the bound and full memory '+str(p['ceiling_sim_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s for '+str(p['expected_agents'])+' agents (named actors x 52/48)'},
+                        'chats':'max((setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+') x 1.5, every call at the participant bound '+str(p['bound_chats'])+'), rounded up to 32 = '+str(p['chats']) if 'swaps' not in p else
+                                'max((setup '+str(p['setup_chats'])+' + simulation '+str(p['sim_chats'])+' + report '+str(p['report_chats'])+' + the two probes after each of the two swaps '+str(p['swap_chats'])+') x 1.5, every call at the participant bound with those probes '+str(p['bound_chats'])+'), rounded up to 32 = '+str(p['chats']),
+                        'output':'2 x 512 + (chats - 2) x 4096 = '+str(p['reserve_need'])+', rounded up to 100,000' if 'swaps' not in p else
+                                 '(2 + %d) x 512 + (%d - %d) x 4096 = %d, rounded up to 100,000 = %d (the two start probes and the %d after the swaps reserve 512 each)'%(p['swap_chats'],p['chats'],p['probe_chats'],p['reserve_need'],p['output'],p['swap_chats']),
+                        'wall':('('+p['model']+' speeds: '+LIMITS.MODELS[p['model']]['speed_source']+') 1.2 x (start 15 s + setup at the participant bound '+str(p['ceiling_setup_s'])+' s + simulation at the bound and full memory '+str(p['ceiling_sim_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s for '+str(p['expected_agents'])+' agents (named actors x 52/48)') if 'swaps' not in p else
+                                ('(setup and report at '+p['setup_model']+' speeds: '+LIMITS.MODELS[p['setup_model']]['speed_source']+'; the simulation at '+p['turns_model']+' speeds: '+LIMITS.MODELS[p['turns_model']]['speed_source']+') 1.2 x (start 15 s + setup at the participant bound '+str(p['ceiling_setup_s'])+' s + simulation at the bound and full memory '+str(p['ceiling_sim_s'])+' s + two swaps at their limits (unload 45 s + load 180 s + two probes each) '+str(p['ceiling_swaps_s'])+' s + report '+str(p['report_s'])+' s + cleanup 120 s), rounded up to 1800 s = '+str(p['wall'])+' s; expected '+str(p['expected_total_s'])+' s for '+str(p['expected_agents'])+' agents (named actors x 52/48), the two swaps assumed 15 s each')},
             what_changed='Closed integers in the gateway limits (model calls, output, embeddings, wall clock, arrival-to-done '+str(p['gateway_arrival_s'])+' s, queue '+str(p['gateway_queue_s'])+' s, request bytes '+str(p['request_bytes'])+'), the observer\'s worker event limit ('+str(p['worker_event_bytes'])+' bytes), the supervisor and host deadlines and the host history, the participant bound and round count wherever the worker and the producer check them, the report check\'s freshness window (it spans the run), the agent client timeout and concurrency (one request in flight per platform), the embedding client timeout; two digit strings, the persona/config and report client timeouts ('+str(p['caller_client_s'])+' s, proven by closed_digit_delta); three selector right-hand sides so every configured agent acts in every round; the scenario input and its seal. Reply caps: 4,096 for personas, ontology, config and report text, 1,024 for an agent turn. The agent memory is the reviewed whole-unit memory with a budget of '+str(p['memory_budget'])+' library tokens (see memory_replacement). Why: every simulation agent\'s whole context had been 2,048 tokens, so the library shredded each feed into one-token chunks and the run of 2026-11-15 was stopped after five template refusals; every limit that had been sized for 3,000-token prompts is now derived from one block of measured constants. Unchanged: the 32,768 context, the 4,096 per-call output ceiling, the one dispatch slot, the 10 s context admission, the template admission, the poison-on-unknown rule, confinement and the paper-only handoff.',
             what_it_is_not='The scenario and its participants are invented, and every agent is made to take part in every round: this shows the pipeline at scale. It is not a forecast, not a naturalistic schedule and not evidence about any market.')
     derived['launch_authorized']=False;derived['source_status']='W16_COMPACT_ONTOLOGY_PLUS_CLOSED_'+profile.upper()+'_FOR_ROOT_GATED_QUALIFICATION';derived['intentional_canonical_source_revision']=canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA);derived['old_authority_policy']='Old v1 receipts/stores/hash3c053002 remain unchanged. New source extraction/replays are versioned derived artifacts, not new live proof or rewritten authority.';derived['qualification_stimulus']={'enabled':profile=='report64_coverage','scope':'Only three selector RHS: min(2,N) configured valid agents per platform, all24 hours, probability1.0; random.sample identities/order unchanged. Generated configs/prompts/agent content unchanged. No forced action, answer, direction, trade or weakening of >=2 actual completed200 native forwards. Naturalistic forecasting is not claimed.','selector_original_sha256':SELECTOR_ORIGINAL_SHA,'selector_staged_sha256':sha(work/SELECTOR_REL)};derived['metadata_reuse_impact']={'evidence':METADATA_SHA,'scope':'Format conformance reused only: same roles, tools, schemas, LLMClient, SDK/model/tokenizer; only declared ontology prompt content, opt-in four gateway budget integers and optional explicit qualification participation schedule differ; gateway format/guards unchanged, and every actual request still requires actual SDK/frozen comparison. No new model quality or prep success claimed.','ontology_change':{'source_sha256':ONTOLOGY_ORIGINAL_SHA,'staged_sha256':sha(work/ONTOLOGY_REL),'constant':'ONTOLOGY_SYSTEM_PROMPT','functions_and_other_constants':'AST_IDENTICAL'}};derived['derived_from']={'base_candidate_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'removed_metadata_prerequisite':'ACTUAL_SUPPORTED_THREE_CASE_METADATA_ACCEPTED','moved_from_runtime_blockers_to_post_run':'NO_COMPLETED_GENUINE_NATIVE_AGENT_FORWARD_EVIDENCE_FOR_REPAIRED_CODE'};derived['qualification_status']={'native_forward':'PENDING_POST_RUN_ALL_NATIVE_CHATS_COMPLETED_DISPATCHED_200','fresh_report':'PENDING_POST_RUN_EXACT_CAPTURE_AND_VALIDATE','local_paper':'PENDING_GENUINE_EXTRACTED_SIGNAL_MAY_REFUSE_FIXED_BUY','assistant_final_continuation':'UNSUPPORTED','launch_available_means':'eligible for qualification only; separate expiring one-use root receipt required','model_selected_execution_or_profit':'NOT_CLAIMED'}
     derived['sdk_port_revision']={'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port}
     if model:
-        derived['model_files']=copy.deepcopy(model['model_files']);derived['model_tokenizer']=dict(model['model_tokenizer']);pin_scope(derived['model_files'],model_paths=model['paths'])
-        derived['model_profile']={'name':model_name,'source_files':SRC_REVISION_NOTE,
-            'src_revisions':{'mirofish_native_model.py':{'path':str(SRC/'mirofish_native_model.py'),'sha256':MODEL_SRC_SHA,'copies':sorted(MODEL_COPIES)},'mirofish_native_run.py':{'path':str(SRC/'mirofish_native_run.py'),'sha256':RUN_SRC_SHA,'copies':sorted(RUN_COPIES)}},
-            'selector':{'content':selector_bytes(model_name).decode(),'files':selector_pins,'registry_carried':False,'why_no_registry':'only the built-in profiles of the pinned module are staged; without the registry beside it the staged module knows exactly those'},
-            'model_files':'derived from MODEL_PROFILES['+repr(model_name)+'] in the pinned module text: the five tokenizer-origin files under '+str(model['entry']['tokenizer_root'])+' and the GGUF '+str(model['entry']['weight_file'])+'; hashes from '+('the base manifest' if model['default'] else 'TOKENIZER_PINS in this tool and the profile\'s weight_sha256'),
-            'sdk_helper':'the reviewed helper with its checkpoint selection, weight size and weight hash naming this model (each exactly once), equal to what the staged model module generates',
-            'observer_policy':'the reviewed policy with its tokenizer-origin folder rule and GGUF file rule naming this model (each exactly once), equal to what the staged src/ run script generates',
-            'start_threshold':{'percent_free':model['start_threshold'],'reviewed':65,'stop_floor':30,'rss_bound_gib':40,
-                'rule':'30 + ceil(100 x (weight bytes + 6 GiB) / installed memory %d)'%LIMITS.INSTALLED_MEMORY_BYTES,
-                'why':('The reviewed 65 stays for the 27B (the rule gives 67 for it).' if model['default'] else 'The reviewed 65 was sized for the 19 GB 27B checkpoint; for this '+str(model['entry']['weight_bytes'])+'-byte checkpoint the rule gives '+str(model['start_threshold'])+'. ')+' This is a re-derivation of a rule that was sized for another model, decided by the lead (TMF3); the 30% stop floor and the 40 GiB resident-memory bound are unchanged.'},
-            'model_source_record':'builder/model-source-manifest.json is the W16 record of the 27B and is not read by the launcher; this candidate\'s checkpoint pins are model_files and model_tokenizer above.',
-            'expected_s':p['expected_total_s'],'wall_s':p['wall'],'speeds':LIMITS.MODELS[model_name]['speed_source']}
-        derived['staging_profile']['model']=model_name
-        if not model['default']:
-            # Addendum 2, C3: no borrowed evidence. The metadata receipt and the format-conformance claims rest on the 27B.
-            derived['metadata_reuse_impact'].update(applies_to='qwen3.8-27b only',
-                scope='NOT REUSED for '+model_name+'. Format conformance of this checkpoint with LM Studio\'s own rendering has NOT been shown; the first run is that test, and the run fails closed (template admission refusal) if the rendering differs. The metadata receipt and builder/metadata-qualification/ are the 27B\'s evidence, kept as ancestry only.')
-            derived['derived_from']=dict(derived['derived_from'],removed_metadata_prerequisite='NOT_SHOWN_FOR_'+model_name.upper()+': the accepted three-case metadata is the 27B\'s; for this checkpoint the first run\'s template admission is the conformance test')
-            source_txt=model['entry']['tokenizer_root']/'SOURCE.txt'
-            derived['model_profile']['provenance']={'known_wrong':'mirofish_native_run.py near line 520 writes the 27B\'s revision identifiers (same_base_revision, GGUF_source_revision) into model-source-manifest.json for any profile; for '+model_name+' that provenance field is known to be wrong. A run on '+model_name+' is a pipeline proof, not evidence about that field.',
-                'correct_source':{'tokenizer_origin':str(source_txt),'tokenizer_origin_text':source_txt.read_text() if source_txt.is_file() else None,'gguf':str(model['entry']['weight_file']),'gguf_bytes':model['entry']['weight_bytes'],'gguf_sha256':model['entry']['weight_sha256']}}
+        model_manifest(derived,model,p,selector_pins)
         require(not any(work.rglob(REGISTRY_NAME)),'a model registry reached the staged folder')
     derived['ssd_device_revision']={'reviewed':ORIGINAL_CACHE_DEVICE,'staged':ssd_device}
     if profile in SWARM:derived['metadata_reuse_impact']['scope']+=' SWARM PROFILE: in addition, the closed integers, selector expressions and scenario listed under swarm_profile differ; request formats, roles, tools and schemas do not.'
     write(work/'builder/candidate-manifest.json',derived)
     assert_staged(work,derived)
     return {'status':'STAGED_NOT_AUTHORIZED_NO_SERVICES','work':str(work),'candidate_sha256':sha(work/'builder/candidate-manifest.json'),'base_sha256':BASE_SHA,'metadata_sha256':METADATA_SHA,'pins':len(pins),'source_ancestry':str(lineage_path)}
+def model_manifest(derived,model,p,selector_pins):
+    """The model fields of a candidate staged with a model or a plan (TMF3 C3, TMF4b item 7): its pins, the plan and its
+    tokenizer pins (execute refuses a plan candidate without them), the staged start threshold where the W16 record says 65,
+    the 27B-only evidence labelled as the 27B's, and no conformance evidence borrowed for another checkpoint."""
+    profiles,_,default=model_profiles();members=model['members'];others=[m for m in members if m!=default];threshold=model['start_threshold']
+    derived['model_files']=copy.deepcopy(model['model_files']);derived['model_tokenizer']=dict(model['model_tokenizer']);pin_scope(derived['model_files'],model_paths=model['paths'])
+    if model['plan'] is not None:
+        derived['model_plan']=dict(model['plan']);derived['model_tokenizer_by_profile']={name:dict(pins) for name,pins in model['tokenizer_by_profile'].items()}
+        require(PLAN_PREDICATE.encode() in src_revision('mirofish_native_run.py',RUN_SRC_SHA),'the plan predicate is not the pinned run script\'s')
+    # The W16 runtime predicate states 65; this candidate starts at its own threshold (ruling c).
+    predicates=list(derived.get('runtime_predicates') or []);rows=[i for i,x in enumerate(predicates) if x.startswith('65pre/30floor/40GiB owned caps')];require(len(rows)==1,'start threshold predicate missing or repeated')
+    predicates[rows[0]]=str(threshold)+predicates[rows[0]][2:]
+    if model['plan'] is not None:predicates.append(PLAN_PREDICATE)
+    derived['runtime_predicates']=predicates
+    derived['startup_recovery']=dict(derived.get('startup_recovery') or {},start_threshold_staged={'percent_free':threshold,'note':'caps above is the W16 record, where the reviewed start threshold was 65; this candidate\'s run script starts at '+str(threshold)+'% free (TMF4 addendum 1, ruling c). The 30% stop floor and the 40 GiB resident-memory bound are unchanged.'})
+    if others:
+        for block in ('GGUF_qualification','mlx_profile_recovery'):
+            if isinstance(derived.get(block),dict):derived[block]=dict(derived[block],applies_to='qwen3.8-27b only: this block is the evidence of the 27B checkpoint (W16); it is not evidence for '+' or '.join(others))
+        names=' and '.join(others)
+        derived['metadata_reuse_impact'].update(applies_to='qwen3.8-27b only',
+            scope='NOT REUSED for '+names+'. Format conformance of '+('this checkpoint' if len(others)==1 else 'these checkpoints')+' with LM Studio\'s own rendering has NOT been shown; the first run is that test, and the run fails closed (template admission refusal) if the rendering differs. The metadata receipt and builder/metadata-qualification/ are the 27B\'s evidence, kept as ancestry only.')
+        derived['derived_from']=dict(derived['derived_from'],removed_metadata_prerequisite='NOT_SHOWN_FOR_'+'_AND_'.join(m.upper() for m in others)+': the accepted three-case metadata is the 27B\'s; for '+names+' the first run\'s template admission is the conformance test')
+    role={0:'setup and report',1:'turns'} if model['plan'] is not None else {0:'whole run'}
+    member_rows={}
+    for i,name in enumerate(members):
+        entry=model['entries'][name];row={'phase':role[i],'weight_file':str(entry['weight_file']),'weight_bytes':entry['weight_bytes'],'weight_sha256':entry['weight_sha256'],
+            'serving_bytes':model['serving_by_member'][name],'tokenizer_root':str(entry['tokenizer_root']),'start_threshold':model['members_threshold'][name],'speeds':LIMITS.MODELS[name]['speed_source'],
+            'format_conformance':('shown for this checkpoint by the accepted three-case metadata receipt (W16)' if name==default else
+                'Format conformance of '+name+' with LM Studio\'s own rendering has NOT been shown; the first run is that test (or, with the owner\'s yes, tools/mirofish_format_qualify.py, which loads it and runs admission only); the run fails closed if the rendering differs.')}
+        if entry.get('second_file') is not None:row['second_file']={'path':str(entry['second_file']),'bytes':entry['second_bytes'],'sha256':entry['second_sha256'],'note':'the vision projector LM Studio loads with the weights; loaded and unused (every native message is text); counted in the selection size and the start threshold'}
+        if name!=default:
+            source_txt=entry['tokenizer_root']/'SOURCE.txt'
+            row['provenance']={'known_wrong':'mirofish_native_run.py prepare_candidate writes the 27B\'s revision identifiers (same_base_revision, GGUF_source_revision) into model-source-manifest.json for any profile; for '+name+' that provenance field is known to be wrong. A run on '+name+' is a pipeline proof, not evidence about that field.',
+                'correct_source':{'tokenizer_origin':str(source_txt),'tokenizer_origin_text':source_txt.read_text() if source_txt.is_file() else None,'gguf':str(entry['weight_file']),'gguf_bytes':entry['weight_bytes'],'gguf_sha256':entry['weight_sha256']}}
+        member_rows[name]=row
+    probes=p.get('probe_chats',2);swaps=p.get('swap_chats',0)
+    arithmetic={name:'30 + ceil(100 x (%d + %d + %d) / %d) + 5 = %d'%(model['serving_by_member'][name],LIMITS.kv_cache_bytes(name),LIMITS.GRAPH_AND_WORKERS_BYTES,LIMITS.INSTALLED_MEMORY_BYTES,model['members_threshold'][name]) for name in members}
+    derived['model_profile']={'name':model['name'],'plan':model['plan'],'members':member_rows,'source_files':SRC_REVISION_NOTE,'src_revisions_review':SRC_REVIEW_STATUS,
+        'src_revisions':{'mirofish_native_model.py':{'path':str(SRC/'mirofish_native_model.py'),'sha256':MODEL_SRC_SHA,'copies':sorted(MODEL_COPIES)},'mirofish_native_run.py':{'path':str(SRC/'mirofish_native_run.py'),'sha256':RUN_SRC_SHA,'copies':sorted(RUN_COPIES)}},
+        'selector':{'content':model['selector'].decode(),'files':selector_pins,'registry_carried':False,'why_no_registry':'only the built-in profiles of the pinned module are staged; without the registry beside it the staged module knows exactly those'},
+        'model_files':'derived from MODEL_PROFILES of the pinned module text, in load order: each member\'s five tokenizer-origin files (listed once when shared) and its serving files (the GGUF weights and any second file); tokenizer hashes from '+('the base manifest' if all(model['entries'][m]['tokenizer_root']==profiles[default]['tokenizer_root'] for m in members) else 'the base manifest for the 27B\'s origin and TOKENIZER_PINS in this tool otherwise')+'; every size and hash checked at staging',
+        'sdk_helper':('the reviewed helper with its checkpoint selection, selection size and weight hash naming this model (each exactly once)' if model['plan'] is None else 'the reviewed helper with the pinned module\'s three closed plan fragments, the first carrying both members\' validated constants as one JSON table')+', equal to what the staged model module generates',
+        'observer_policy':'the reviewed policy with its tokenizer-origin folder rule and GGUF file rule replaced in place by the rules for the staged tokenizer origins and serving files, equal to what the staged src/ run script generates',
+        'start_threshold':{'percent_free':threshold,'by_member':dict(model['members_threshold']),'reviewed':65,'stop_floor':30,'rss_bound_gib':40,'arithmetic':arithmetic,
+            'rule':'30 + ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / installed memory %d) + 5; for a plan the larger member\'s (TMF4 addendum 1, ruling c)'%LIMITS.INSTALLED_MEMORY_BYTES,
+            'why':'Whenever a model is named the formula is used, the 27B included (72); the default path without a model keeps the reviewed 65. The 30% stop floor and the 40 GiB resident-memory bound are unchanged.'},
+        'budgets':{'post_swap_probe_chats':swaps,'post_swap_probe_output':swaps*LIMITS.NATIVE_PROBE_OUTPUT,'chats':p['chats'],'output_total':p['output'],
+            'output':'(%d + %d) x 512 + (%d - %d) x 4096 = %d, rounded up to 100,000 = %d'%(LIMITS.START_PROBES,swaps,p['chats'],probes,p['reserve_need'],p['output'])},
+        'expected_by_phase':{'setup_model':p.get('setup_model',p['model'])+' ('+LIMITS.MODELS[p.get('setup_model',members[0])]['speed_source']+')','turns_model':p.get('turns_model',p['model'])+' ('+LIMITS.MODELS[p.get('turns_model',members[-1])]['speed_source']+')',
+            'setup_s':p['setup_s'],'simulation_s':sum(p['expected_round_s']),'swaps_s':p.get('swap_s',0),'report_s':p['report_s'],'start_and_cleanup_s':LIMITS.START_S+LIMITS.CLEANUP_S,
+            'total_s':p['expected_total_s'],'ceiling_total_s':p['ceiling_total_s'],'wall_s':p['wall']},
+        'model_source_record':'builder/model-source-manifest.json is the W16 record of the 27B and is not read by the launcher; this candidate\'s checkpoint pins are model_files and model_tokenizer'+(' and model_tokenizer_by_profile' if model['plan'] is not None else '')+' above.',
+        'expected_s':p['expected_total_s'],'wall_s':p['wall'],'speeds':{name:LIMITS.MODELS[name]['speed_source'] for name in members}}
+    if model['plan'] is not None:
+        open_points={'identifier_reuse':'B1 loads the turns model under the identifier the setup model was loaded with, and B2 loads the setup model again under it; whether LM Studio accepts the same identifier for a different model key after an unload has not been tried; the first swap settles it (a refusal fails the run closed and cleanup unloads what is loaded).',
+            'rendering':'each checkpoint\'s rendering of the chat template is checked by the template admission on every request; for a checkpoint other than the 27B the first request is the first evidence.'}
+        if 'ternary-bonsai-2-27b' in members:open_points['bonsai_reported_size']='LM Studio\'s reported sizeBytes for Bonsai 2 is pinned as the weights and the vision projector together (8,255,255,904); the first load shows whether the server reports that sum, and the helper refuses the load if it does not.'
+        derived['model_profile']['open_points']=open_points
+    derived['staging_profile']['model']=model['name'] if model['plan'] is None else LIMITS.model_label(model['plan'])
+    if model['plan'] is not None:derived['staging_profile']['model_plan']=dict(model['plan'])
+    return derived
 def assert_staged(work,manifest):
     work=Path(work)
     for relative in EMPTY_SCAFFOLDS:require((work/relative).is_dir() and not any((work/relative).iterdir()),'required runtime scaffold missing/nonempty: '+relative)
@@ -660,12 +781,18 @@ def assert_staged(work,manifest):
         require(not Path(row['path']).is_relative_to(W16),'old operational pin path');require(sha(row['path'])==row['sha256'],'derived pin mismatch')
     require(manifest['launch_authorized'] is False and manifest['qualification_status']['native_forward'].startswith('PENDING'),'fabricated launch/native qualification')
 def main(argv=None):
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--stage',action='store_true');parser.add_argument('--profile',choices=tuple(PROFILES),default='compact40');parser.add_argument('--work',type=Path);parser.add_argument('--model',help='stage on this built-in checkpoint profile (the pinned src/ revisions plus a selector); omit for the W16 bytes');args=parser.parse_args(argv);storage_guard();os.environ['TMPDIR']=str(BASE/'project/tmp')
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--stage',action='store_true');parser.add_argument('--profile',choices=tuple(PROFILES),default='compact40');parser.add_argument('--work',type=Path);parser.add_argument('--model',help='stage on this built-in checkpoint profile (the pinned src/ revisions plus a selector); omit for the W16 bytes')
+    parser.add_argument('--setup-model',help='a plan (TMF4): the built-in profile for preparation and the report; needs --turns-model');parser.add_argument('--turns-model',help='a plan: the built-in profile for the simulation\'s agent turns')
+    args=parser.parse_args(argv);storage_guard();os.environ['TMPDIR']=str(BASE/'project/tmp')
     choice=None
-    if args.model is not None:
+    if any(x is not None for x in (args.model,args.setup_model,args.turns_model)):
         try:
-            require(args.profile in SWARM,'--model applies to the swarm profiles only');choice=model_choice(args.model,decoded(W16/'builder/candidate-manifest.json',BASE_SHA)[0])
-        except RuntimeError as refused:print('refused: '+str(refused),file=sys.stderr);return 2
+            require(args.profile in SWARM,'--model, --setup-model and --turns-model apply to the swarm profiles only');base=decoded(W16/'builder/candidate-manifest.json',BASE_SHA)[0]
+            if args.model is not None:
+                require(args.setup_model is None and args.turns_model is None,'--model names one model for the whole run; a plan is --setup-model with --turns-model and no --model');choice=model_choice(args.model,base)
+            else:
+                require(args.setup_model is not None and args.turns_model is not None,'a plan needs both --setup-model and --turns-model');choice=plan_choice(args.setup_model,args.turns_model,base)
+        except RuntimeError as refused:print('refused: '+str(refused).replace('\n',' '),file=sys.stderr);return 2
     data=inputs()
     if choice is not None:
         try:verify_model_files(choice,data[0]['model_files'])

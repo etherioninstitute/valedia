@@ -204,7 +204,8 @@ class SwarmLimits(unittest.TestCase):
         good=S.SWARM['swarm8'];d=L.derive(good,PLAN)
         self.assertIn('model calls allowed count the probes after each swap of a plan',L.violations(good,dict(d,swap_chats=0),PLAN))
         self.assertIn('model calls allowed count the probes after each swap of a plan',L.violations(good,dict(d,probe_chats=2),PLAN))
-        self.assertIn('output budget lets every admitted call reserve its cap',L.violations(good,dict(d,reserve_need=2*512+(d['chats']-2)*4096-1,output=2*512+(d['chats']-2)*4096-1),PLAN))
+        self.assertIn('output budget lets every admitted call reserve its cap',L.violations(good,dict(d,reserve_need=6*512+(d['chats']-6)*4096-1,output=6*512+(d['chats']-6)*4096-1),PLAN))
+        self.assertIn('output budget lets every admitted call reserve its cap',L.violations(good,dict(d,output=d['reserve_need']-1),PLAN))
 PLAN={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
 def gguf_metadata(path,keys):
     """The named scalar keys of a GGUF file's header (read-only: the header only, arrays skipped by their lengths)."""
