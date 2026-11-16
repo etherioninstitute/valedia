@@ -58,7 +58,8 @@ class FormatQualify(unittest.TestCase):
         made=[]
         def factory(out,deadline):
             sdk=FakeSDK(self.modules,profile,self.manifest['model_tokenizer_by_profile'][profile],**fake);made.append(sdk);return sdk
-        result=Q.qualify(WORK,Path(self.out_root.name)/'out',profile,sdk_factory=factory,recorded=[])
+        self.out=Path(self.out_root.name)/('out-%d'%len(list(Path(self.out_root.name).iterdir())))   # a fresh output folder per run
+        result=Q.qualify(WORK,self.out,profile,sdk_factory=factory,recorded=[])
         return result,made[0]
     def test_canned_bodies_are_the_kinds_the_brief_names_and_pass_the_gateway_checks(self):
         names=[name for name,_ in Q.canned_bodies('mf-native-'+'0'*32)]
@@ -92,7 +93,7 @@ class FormatQualify(unittest.TestCase):
             self.assertEqual(sdk.calls[-1],('unload',{'identifier':result['identifier'],'instanceReference':'ref-1','embeddingReference':'emb-1','profile':profile}))
             self.assertTrue(result['cleanup_proven']);self.assertTrue(sdk.stopped)
             self.assertRegex(result['identifier'],'^mf-native-[0-9a-f]{32}$')
-            written=json.loads((Path(self.out_root.name)/'out/qualify-result.json').read_text());self.assertEqual(written['bodies'],result['bodies'])
+            written=json.loads((self.out/'qualify-result.json').read_text());self.assertEqual(written['bodies'],result['bodies'])
             self.tearDown();self.setUp()
     def test_an_altered_rendering_is_refused_with_the_exact_admission_refusal_and_still_unloads(self):
         result,sdk=self.run_with('ternary-bonsai-2-27b',mode='altered')
