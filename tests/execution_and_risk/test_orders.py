@@ -2558,3 +2558,296 @@ def test_a_submitting_process_killed_at_generated_moments_sends_at_most_once_and
         seen[(hold, state)] = seen.get((hold, state), 0) + 1
     assert seen[("ready", "intended")] == 6 and seen[("venue", "never_arrived")] == 6
     assert seen[("called", "accepted")] == 6 and sum(n for (h, _), n in seen.items() if h == "free") == 24
+
+
+# ---- T34b-3: every entry of a reconcile carries a kind; three after-the-fact restatements are notices
+
+
+def _kinds(entries):
+    return [e.get("kind") for e in entries]
+
+
+def _settled(led, venue, book):
+    """Reconcile, apply what was found, return the result."""
+    result = led.reconcile(venue, book)
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    return result
+
+
+def test_t34b3_the_kind_sets_are_closed_exported_and_the_four_notices_never_block():
+    assert orders.RECONCILE_NOTICE_KINDS == {"avg_restated", "late_amount", "fee_fell", "piece_unpriced"}
+    assert orders.NOTICE_KINDS == {"negative_fee"} | orders.RECONCILE_NOTICE_KINDS
+    assert orders.ANOMALY_KINDS == {"reconcile_failed", "not_storable", "status_not_dict", "units_not_finite", "turned_up",
+                                    "missing_at_venue", "value_not_finite", "units_negative", "units_fell", "overfill",
+                                    "late_amount_other_state", "state_changed", "fee_fell_below_zero",
+                                    "piece_price_unexplained", "avg_restated_beyond", "notice_not_recorded"}
+    assert orders.UNRESOLVED_KINDS == {"status_unread", "answer_unusable", "status_not_dict", "status_unreadable",
+                                       "not_written", "not_found_yet", "state_unknown", "filled_short"}
+    assert orders.RECHECK_KINDS == {"status_unread", "gone", "state_unknown"}
+    assert orders.POSITIONS_ERROR_KINDS == {"positions_unread", "positions_malformed"}
+    assert not orders.ANOMALY_KINDS & orders.RECONCILE_NOTICE_KINDS
+    for name in ("ANOMALY_KINDS", "RECONCILE_NOTICE_KINDS", "NOTICE_KINDS", "UNRESOLVED_KINDS", "RECHECK_KINDS",
+                 "POSITIONS_ERROR_KINDS"):
+        assert name in orders.__all__
+
+
+def test_t34b3_a_status_read_that_raises_is_status_unread_on_an_open_order_and_on_a_recheck():
+    led, venue, _ = _accepted()
+    venue.status_raises.add(TAG)
+    result = led.reconcile(venue, {})
+    assert _kinds(result["unresolved"]) == ["status_unread"] and not result["clean"]
+    venue.status_raises.clear()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 10.0}
+    _settled(led, venue, {})
+    venue.status_raises.add(TAG)
+    again = led.reconcile(venue, {"XLE": 10.0})
+    assert _kinds(again["recheck_errors"]) == ["status_unread"] and again["clean"]
+
+
+def test_t34b3_positions_that_raise_and_positions_with_unusable_keys_are_told_apart():
+    led, venue = ledger(), FakeVenue()
+    venue.positions_raise = True
+    down = led.reconcile(venue, {})
+    assert down["positions_error_kind"] == "positions_unread" and down["positions_error"] and not down["clean"]
+    venue.positions_raise = False
+    venue.held = {("XLE",): 1.0}
+    odd = led.reconcile(venue, {})
+    assert odd["positions_error_kind"] == "positions_malformed" and not odd["clean"]
+    venue.held = {}
+    assert led.reconcile(venue, {})["positions_error_kind"] is None
+
+
+@pytest.mark.parametrize("change, kind", [({"filled_units": 11.0}, "overfill"), ({"state": "mystery"}, "state_unknown")])
+def test_t34b3_an_overfill_is_an_overfill_anomaly_and_an_unknown_state_is_unresolved(change, kind):
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, **change)
+    result = led.reconcile(venue, {})
+    where = "anomalies" if kind in orders.ANOMALY_KINDS else "unresolved"
+    assert _kinds(result[where]) == [kind] and not result["clean"]
+
+
+@pytest.mark.parametrize("change, kind", [({"filled_units": 3.0}, "units_fell"),
+                                          ({"state": "filled", "filled_units": 4.0}, "state_changed")])
+def test_t34b3_a_finished_order_reported_with_fewer_units_or_another_state_carries_its_kind(change, kind):
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.4)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled")
+    led.reconcile(venue, {})
+    venue.set(TAG, **change)
+    result = led.reconcile(venue, {})
+    assert _kinds(result["anomalies"]) == [kind] and result["notices"] == []
+
+
+def test_t34b3_an_accepted_order_the_venue_does_not_know_is_missing_at_venue():
+    led, venue, _ = _accepted()
+    del venue.book[TAG]
+    result = led.reconcile(venue, {})
+    assert _kinds(result["anomalies"]) == ["missing_at_venue"]
+
+
+def _restate(first, second, units=10.0, fee=0.0):
+    """An order filled at the venue's `first` average, then reported again with `second`, no new units."""
+    led, venue, clock = _accepted(units)
+    venue.set(TAG, state="filled", filled_units=units, avg_price=first, fee=fee)
+    venue.held = {"XLE": units}
+    _settled(led, venue, {})
+    venue.set(TAG, avg_price=second)
+    clock.t += 60
+    return led, venue, clock, led.reconcile(venue, {"XLE": units})
+
+
+def test_t34b3_an_average_restated_within_a_cent_is_a_notice_the_stored_average_follows_and_it_is_raised_once():
+    led, venue, clock, result = _restate(90.004, 90.0)
+    assert result["clean"] and result["anomalies"] == [] and result["fills"] == []
+    (n,) = result["notices"]
+    assert (n["kind"], n["tag"], n["old"], n["new"]) == ("avg_restated", TAG, 90.004, 90.0) and type(n["id"]) is int
+    rec = led.order(TAG)
+    assert rec["avg_price"] == 90.0 and rec["priced_avg"] == 90.0 and rec["priced_units"] == 10.0
+    (item,) = led.attention()
+    assert item["id"] == n["id"] and item["kind"] == "avg_restated" and led.blocked() == []
+    clock.t += 60
+    again = led.reconcile(venue, {"XLE": 10.0})
+    assert again["clean"] and again["notices"] == [] and again["anomalies"] == []
+    assert [r["price"] for r in led.fills(TAG)] == [90.004]          # the rows keep the price first worked out
+
+
+@pytest.mark.parametrize("second", [90.02, 89.98, 0.9])
+def test_t34b3_an_average_restated_by_more_than_a_cent_stays_a_blocking_anomaly_and_the_stored_one_is_kept(second):
+    led, venue, clock, result = _restate(90.0, second)
+    assert _kinds(result["anomalies"]) == ["avg_restated_beyond"] and not result["clean"] and result["notices"] == []
+    assert led.order(TAG)["avg_price"] == 90.0 and led.order(TAG)["priced_avg"] == 90.0
+    assert led.attention(open_only=False) == []
+
+
+def test_t34b3_an_average_restated_by_exactly_a_cent_is_still_a_notice():
+    led, venue, clock, result = _restate(90.0, 90.01)
+    assert result["clean"] and _kinds(result["notices"]) == ["avg_restated"] and led.order(TAG)["avg_price"] == 90.01
+
+
+def test_t34b3_three_restatements_in_a_row_give_three_notice_ids_and_supersede_the_earlier_open_ones():
+    led, venue, clock, first = _restate(90.0, 90.005)
+    ids = [first["notices"][0]["id"]]
+    for avg in (90.01, 90.015):
+        venue.set(TAG, avg_price=avg)
+        clock.t += 60
+        r = led.reconcile(venue, {"XLE": 10.0})
+        assert r["clean"] and _kinds(r["notices"]) == ["avg_restated"]
+        ids.append(r["notices"][0]["id"])
+    assert len(set(ids)) == 3 and led.order(TAG)["avg_price"] == 90.015
+    items = {i["id"]: i for i in led.attention(open_only=False)}
+    assert [items[i]["closed_time"] is not None for i in ids] == [True, True, False]
+    assert all(items[i]["closed_by"] == "order ledger" and "superseded" in items[i]["closed_note"] for i in ids[:2])
+    assert led.blocked() == []
+
+
+def test_t34b3_a_notice_that_cannot_be_recorded_leaves_the_figure_as_it_was_and_the_reconcile_unclean(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    clock = Clock()
+    led, venue = ledger(path, clock=clock), FakeVenue()
+    ready(led, venue)
+    intend(led)
+    led.submit_once(venue, TAG)
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 10.0}
+    _settled(led, venue, {})
+    raw = sqlite3.connect(str(path))
+    raw.execute("CREATE TRIGGER drop_notices BEFORE INSERT ON attention WHEN NEW.kind = 'avg_restated' "
+                "BEGIN SELECT RAISE(IGNORE); END")
+    raw.commit()
+    raw.close()
+    before = led.order(TAG)
+    venue.set(TAG, avg_price=90.005)
+    clock.t += 60
+    result = led.reconcile(venue, {"XLE": 10.0})
+    assert not result["clean"] and _kinds(result["anomalies"]) == ["notice_not_recorded"] and result["notices"] == []
+    assert led.order(TAG) == before and led.attention(open_only=False) == []
+    assert led.blocked() == ["the latest reconcile was not clean"]
+
+
+def test_t34b3_a_late_amount_on_a_finished_order_in_the_same_state_is_a_notice_and_the_units_are_taken():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0, fee=0.0)
+    venue.held = {"XLE": 4.0}
+    _settled(led, venue, {})
+    venue.set(TAG, state="cancelled")
+    _settled(led, venue, {"XLE": 4.0})
+    venue.set(TAG, state="cancelled", filled_units=6.0, avg_price=90.5)
+    venue.held = {"XLE": 6.0}
+    clock.t += 60
+    result = led.reconcile(venue, {"XLE": 4.0})
+    assert result["clean"] and result["anomalies"] == []
+    (n,) = result["notices"]
+    assert (n["kind"], n["old"], n["new"]) == ("late_amount", 4.0, 6.0)
+    (row,) = result["fills"]
+    assert row["units"] == 2.0 and row["price"] == pytest.approx((90.5 * 6 - 90.0 * 4) / 2)
+    assert led.order(TAG)["state"] == "cancelled" and led.order(TAG)["filled_units"] == 6.0
+
+
+def test_t34b3_a_late_amount_with_another_state_stays_a_blocking_anomaly_and_the_units_are_taken():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=3.0, avg_price=90.0, fee=0.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="cancelled")
+    led.reconcile(venue, {})
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=91.0, fee=0.0)
+    result = led.reconcile(venue, {})
+    assert _kinds(result["anomalies"]) == ["late_amount_other_state"] and result["notices"] == []
+    assert led.order(TAG)["filled_units"] == 10.0 and not result["clean"]
+
+
+def test_t34b3_a_fee_total_that_falls_but_stays_at_or_above_zero_is_a_notice_followed_with_no_fill_row():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=1.0)
+    venue.held = {"XLE": 10.0}
+    _settled(led, venue, {})
+    venue.set(TAG, fee=0.4)
+    clock.t += 60
+    rows = led.fills()
+    result = led.reconcile(venue, {"XLE": 10.0})
+    assert result["clean"] and result["fills"] == [] and led.fills() == rows
+    (n,) = result["notices"]
+    assert (n["kind"], n["old"], n["new"]) == ("fee_fell", 1.0, 0.4)
+    assert led.order(TAG)["fee"] == 0.4 and sum(r["fee"] for r in led.fills(TAG)) == 1.0   # rows: the earlier total
+    clock.t += 60
+    assert led.reconcile(venue, {"XLE": 10.0})["notices"] == []
+    venue.set(TAG, fee=0.0)
+    clock.t += 60
+    assert _kinds(led.reconcile(venue, {"XLE": 10.0})["notices"]) == ["fee_fell"] and led.order(TAG)["fee"] == 0.0
+
+
+def test_t34b3_a_fee_total_that_falls_below_zero_keeps_its_anomaly_kind():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.5)
+    venue.held = {"XLE": 10.0}
+    _settled(led, venue, {})
+    venue.set(TAG, fee=-0.5)
+    clock.t += 5
+    found = led.reconcile(venue, {"XLE": 10.0})
+    assert _kinds(found["anomalies"]) == ["fee_fell_below_zero"] and led.order(TAG)["fee"] == 0.5
+    assert found["notices"] == [] and led.attention(open_only=False) == []
+
+
+def test_t34b3_a_rounded_average_that_implies_a_negative_piece_is_a_notice_and_the_priced_point_moves():
+    led, venue, clock = _accepted(units=1001.0)
+    venue.set(TAG, state="partly_filled", filled_units=1000.0, avg_price=5.01, fee=0.0)   # 5.00501 rounded up
+    venue.held = {"XLE": 1000.0}
+    _settled(led, venue, {})
+    venue.set(TAG, state="filled", filled_units=1001.0, avg_price=5.00)                  # one more at 4.99: 5.004995
+    venue.held = {"XLE": 1001.0}
+    clock.t += 60
+    result = led.reconcile(venue, {"XLE": 1000.0})
+    assert result["clean"] and result["anomalies"] == []
+    (n,) = result["notices"]
+    assert (n["kind"], n["old"], n["new"]) == ("piece_unpriced", 5.01, 5.0)
+    (row,) = result["fills"]
+    assert (row["units"], row["price"], row["price_covers_units"]) == (1.0, None, None)
+    rec = led.order(TAG)
+    assert (rec["avg_price"], rec["priced_avg"], rec["priced_units"]) == (5.0, 5.0, 1001.0)
+    led.mark_applied([row["id"]])
+    clock.t += 60
+    again = led.reconcile(venue, {"XLE": 1001.0})
+    assert again["clean"] and again["notices"] == [] and again["anomalies"] == []
+
+
+def test_t34b3_a_negative_piece_that_a_cent_of_rounding_cannot_explain_stays_a_blocking_anomaly():
+    led, venue, _ = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=100.0, fee=0.0)
+    led.reconcile(venue, {})
+    venue.set(TAG, state="partly_filled", filled_units=6.0, avg_price=50.0)
+    result = led.reconcile(venue, {})
+    assert _kinds(result["anomalies"]) == ["piece_price_unexplained"] and result["notices"] == []
+    assert led.order(TAG)["priced_avg"] == 100.0
+
+
+def test_t34b3_every_anomaly_unresolved_and_recheck_entry_of_a_generated_run_carries_a_kind_of_its_set():
+    rng = random.Random(34)
+    seen = set()
+    for _ in range(300):
+        led, venue, clock = _accepted()
+        for _step in range(rng.randint(1, 6)):
+            change = rng.choice([{"filled_units": rng.choice([2.0, 4.0, 10.0, 11.0, None])},
+                                 {"avg_price": rng.choice([90.0, 90.004, 91.0, 50.0, None, float("nan")])},
+                                 {"fee": rng.choice([0.0, 0.5, 1.0, -0.2, None])},
+                                 {"state": rng.choice(["open", "partly_filled", "filled", "cancelled", "odd"])}])
+            venue.set(TAG, **change)
+            if rng.random() < 0.15:
+                venue.status_raises.add(TAG)
+            else:
+                venue.status_raises.discard(TAG)
+            venue.positions_raise = rng.random() < 0.1
+            clock.t += 60
+            r = led.reconcile(venue, {})
+            for key, allowed in (("anomalies", orders.ANOMALY_KINDS), ("unresolved", orders.UNRESOLVED_KINDS),
+                                 ("recheck_errors", orders.RECHECK_KINDS), ("notices", orders.RECONCILE_NOTICE_KINDS)):
+                for e in r[key]:
+                    assert e["kind"] in allowed, (key, e)
+                    seen.add(e["kind"])
+            assert (r["positions_error"] is None) == (r["positions_error_kind"] is None)
+            assert r["clean"] == (not (r["unresolved"] or r["anomalies"] or r["position_differences"]
+                                       or r["positions_error"] or led.orders(("sent", "unknown"))))
+            led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    assert {"status_unread", "overfill", "avg_restated_beyond"} <= seen, seen
