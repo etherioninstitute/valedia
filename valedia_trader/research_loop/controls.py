@@ -248,8 +248,9 @@ def _fingerprint_weights(w: pd.DataFrame) -> str:
 
 def _full_run(ctx: _Context, strategy: Strategy) -> dict:
     """The same full-history run the sealed test makes (gauntlet.py: run_rules then run_backtest on all prices),
-    read for the equity multiple at the first sealed bar, impact's share of sealed gross return, and a fingerprint
-    of the book (so seeds that claim to differ can be shown to differ)."""
+    read for the equity multiple at the first sealed bar, impact's share of sealed gross return (null when that gross
+    return is not above zero; `_run_one` also nulls it when the sealed test did not run), and a fingerprint of the
+    book (so seeds that claim to differ can be shown to differ)."""
     w, _ = run_rules(strategy, ctx.prices)
     res = run_backtest(ctx.prices, w, ctx.cost, ctx.dollar)
     dev_net = res.net.iloc[: ctx.cut].to_numpy(dtype=float)
@@ -312,6 +313,12 @@ def _timed(r: dict) -> bool:
 
 
 def _summary(runs: list[dict]) -> dict:
+    """A rung's counts and medians over its seeds. `passed_both_and_timing` counts seeds that passed development AND
+    the sealed test AND had a re-timing p-value of 0.05 or less.
+
+    `sealed_impact_share_of_gross` (per seed, and its median here) is null in two cases: the sealed test did not run
+    (development failed), or it ran and the sealed period's gross return was not above zero, so no share of it can
+    be taken. Each seed's `sealed_ran` tells the two apart. `equity_multiple_end_of_development` is always given."""
     failed: dict[str, int] = {}
     for r in runs:
         for f in r.get("failed") or (["refused"] if r.get("refused") else []):
