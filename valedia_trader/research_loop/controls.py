@@ -70,22 +70,28 @@ _KIND = {"oracle": 1, "no_edge": 2, "peek": 3}
 
 
 def detrend(prices: pd.DataFrame) -> pd.DataFrame:
-    """The same prices with each symbol's average drift removed: its log returns (between consecutive prices it
-    has) have their own mean over the WHOLE frame subtracted, and the prices are rebuilt from the same first price.
-    Volatility, correlation and missing values are those of the data; only the average drift is gone.
+    """The same prices with each symbol's average drift removed, in SIMPLE returns: a book that holds assets and
+    rebalances earns the mean simple return, so "no drift" here means every symbol's mean simple return is zero.
+    Each symbol's simple returns (between consecutive prices it has: missing prices stay missing and are not
+    counted) have their own mean over the WHOLE frame subtracted, and prices are rebuilt from the same first price
+    by compounding (1 + r - mean). Volatility and correlation of simple returns, and missing values, are those of
+    the data; only the average drift is gone.
 
     This uses the whole period on purpose: the result is a control universe for measuring the gate, never an input
-    a strategy decides on."""
+    a strategy decides on. A factor (1 + r - mean) at or below zero cannot be rebuilt into a price: ValueError."""
     out = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns)
     for c in prices.columns:
         col = prices[c].to_numpy(dtype=float)
         ok = np.flatnonzero(np.isfinite(col) & (col > 0))
         if len(ok) == 0:
             continue
-        lr = np.diff(np.log(col[ok]))
-        if len(lr):
-            lr = lr - lr.mean()
-        out.iloc[ok, out.columns.get_loc(c)] = col[ok[0]] * np.exp(np.concatenate([[0.0], np.cumsum(lr)]))
+        r = col[ok][1:] / col[ok][:-1] - 1.0
+        factor = 1.0 + (r - r.mean() if len(r) else r)
+        bad = np.flatnonzero(factor <= 0.0)
+        if len(bad):
+            when = prices.index[ok[bad[0] + 1]]
+            raise ValueError(f"{c}: the detrended return on {when} would leave a price at or below zero")
+        out.iloc[ok, out.columns.get_loc(c)] = col[ok[0]] * np.concatenate([[1.0], np.cumprod(factor)])
     return out
 
 
@@ -427,9 +433,9 @@ def _reading(given: dict, flat: dict) -> list[str]:
     if mb is not None and mb > 0.3:
         out.append("On this data a fresh-ledger pass can come from the market's own rise: read the detrended ladder for "
                    "the smallest timing skill the gate lets through.")
-    if flat_mb is not None and flat_mb > 0.3:
-        out.append(f"The detrended market basket still has a development Sharpe of {flat_mb:.2f}: removing each symbol's "
-                   "mean log return leaves about half its variance as drift in simple returns, which a long book earns.")
+    if flat_mb is not None:
+        out.append(f"The detrended market basket has a development Sharpe of {flat_mb:.2f} (every symbol's mean simple "
+                   "return over the whole frame is zero; what remains is the development period's share and cross-terms).")
     return out
 
 
