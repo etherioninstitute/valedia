@@ -423,8 +423,10 @@ def forecasters_section(env: al.Env, ctx: Context) -> tuple[list, str]:
     body = [para(f"{counts['questions']} questions asked, {counts['settled']} settled. Brier scores: lower is better; skill is 1 minus "
                  "the forecaster's score over its baseline's on the same questions (above 0 beats the baseline).")]
     if rows:
-        body.append(table(["Forecaster", "Model", "Market", "Kind", "Memory", "Settled", "Brier", "Baseline Brier", "Skill", "Verdict"],
-                          [[E(r["forecaster"]), "not recorded" if r.get("model") is None else E(r["model"]), E(r["market"]), E(r["kind"]),
+        recorded = lambda v: "not recorded" if v is None else E(v)
+        body.append(table(["Forecaster", "Model", "Prompt", "Market", "Kind", "Memory", "Settled", "Brier", "Baseline Brier", "Skill",
+                           "Verdict"],
+                          [[E(r["forecaster"]), recorded(r.get("model")), recorded(r.get("prompt_sha")), E(r["market"]), E(r["kind"]),
                             E(r.get("memory")), str(r["settled"]), f"{r['brier']:.4f}", f"{r['baseline_brier']:.4f}",
                             f"{r['skill']:+.3f}", E(r["verdict"])] for r in rows]))
     else:

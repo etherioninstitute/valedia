@@ -30,7 +30,11 @@ prompt, one market, one kind and one memory class: "asked live" (a forward quest
 MAX_LIVE_AGE_DAYS of its day), "answered late" (a forward question answered later, when the outcome may have
 existed), "no memory" (a rule), "after release" (a blind question dated after `unseen_after`) or "may be
 remembered" (every other blind question, every old answer with no model recorded among them). Neither "answered
-late" nor "may be remembered" is ever evidence of skill.
+late" nor "may be remembered" is ever evidence of skill. "After release" needs both a recorded model and
+`unseen_after`: a date without a model says nothing about which model answered.
+
+The schema change is one way: once this code has opened a file for writing, the forecasts table has three more
+columns and older code (which inserts six values) can no longer record to it. Reading it still works.
 
     python -m valedia_trader.research_loop.tournament refresh --universe stocks       (or crypto: see universes.json)
     python -m valedia_trader.research_loop.tournament ask-blind --data artifacts/data --market funds --count 300
@@ -74,7 +78,9 @@ NOT_EVIDENCE = "not evidence: the model may remember these dates"
 LATE_NOT_EVIDENCE = "not evidence: answered after the question was fresh"
 # A forward answer is "asked live" only when given at most this many calendar days (UTC) after its question's day.
 # It is the same constant as `ask`'s default `max_age_days`, the age after which `ask` stops putting a forward
-# question, so the two cannot drift apart: what `ask` still puts as fresh is what the scores still call live.
+# question. The two can still differ by time zone: `ask` judges freshness by the local date of `today`, the scores by
+# the UTC date of the answer's own time. That drift only ever turns a borderline answer into "answered late", never
+# a late answer into "asked live".
 MAX_LIVE_AGE_DAYS = 3
 GROUP_KEYS = ("forecaster", "model", "prompt_sha", "market", "kind", "memory")
 
@@ -123,7 +129,7 @@ def _answered_late(asked_on: str, answered_ts) -> bool:
 def memory_class(kind: str, model: str | None, unseen_after: str | None, asked_on: str, answered_ts) -> str:
     """What the forecaster may have known of the outcome: one of MEMORY_CLASSES. Anything unreadable is
     "may be remembered" (blind) or "answered late" (forward), and so is a blind question asked on the release
-    day itself."""
+    day itself, or answered with no model recorded (None, empty or blank)."""
     if kind == "forward":
         return "answered late" if _answered_late(asked_on, answered_ts) else "asked live"
     if kind != "blind history":
@@ -131,6 +137,8 @@ def memory_class(kind: str, model: str | None, unseen_after: str | None, asked_o
     if model == RULE_MODEL:
         return "no memory"
     released, day = (_iso_day(unseen_after) if unseen_after is not None else None), _iso_day(asked_on)
+    if not (model is not None and str(model).strip()):
+        return "may be remembered"                          # a date without a recorded model is not evidence
     if released is not None and day is not None and day > released:
         return "after release"
     return "may be remembered"
