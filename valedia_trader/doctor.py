@@ -56,17 +56,32 @@ def check_ledger(paths: LoopPaths) -> tuple[str, str]:
         counts = {s: len(ledger.search(status=s)) for s in STATUSES}
         attempts = int(ledger.attempt_sharpes().size)
         from valedia_trader.research_loop import cli    # T38-1b: what the paper command leaves out, idea by idea
-        left = 0
+        from valedia_trader.research_loop.strategy import load_strategy
+        left = code = 0
         for s in cli.PAPER_STATUSES:
             for h in ledger.search(status=s):
+                # the file the paper command would load (cli._strategy_for's order), found without loading it: a
+                # strategy file that is not .json is code, and the doctor does not run it (T38-1b addendum 3)
+                row = ledger.get(h["id"])
+                candidates = [paths.root / row["strategy_file"]] if row["strategy_file"] else []
+                candidates += (sorted(paths.strategies.glob(f"*_h{h['id']}.json"))
+                               + sorted(paths.strategies.glob(f"*_h{h['id']}.py")))
+                chosen = next((c for c in candidates if c.is_file()), None)
+                if chosen is None:
+                    continue                              # no strategy file: counted as before
+                if chosen.suffix != ".json":
+                    code += 1
+                    continue
                 try:
-                    left += cli.can_hold_shorts(cli._strategy_for(paths, ledger, h["id"], None)[0])
+                    left += cli.can_hold_shorts(load_strategy(chosen))
                 except Exception:                         # a strategy that cannot be loaded: counted as before
                     pass
     finally:
         ledger.close()
     live = counts["passed backtest only"] + counts["passed paper"] - left
-    out = f" ({left} not stepped: can hold a short)" if left else ""
+    said = ([f"{left} not stepped: can hold a short"] if left else []) + (
+        [f"{code} not checked: code strategy"] if code else [])
+    out = f" ({'; '.join(said)})" if said else ""
     text = f"{sum(counts.values())} ideas ({counts['failed']} failed, {counts['untested']} untested, {live} in paper trading{out}), {attempts} counted variations"
     return (OK if live else ATTENTION), text + ("" if live else "; nothing is stepped, so nothing trades" if left else "; nothing has passed the gate, so nothing trades")
 

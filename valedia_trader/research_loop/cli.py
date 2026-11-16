@@ -168,6 +168,18 @@ def _units(value) -> float | None:
     return float(value)
 
 
+def _kind(value) -> str:
+    """What a value of the state is, in words, for a message about a state that cannot be read."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true or false"
+    for kind, words in ((dict, "a mapping"), (list, "a list"), (str, "text"), ((int, float), "a number")):
+        if isinstance(value, kind):
+            return words
+    return f"a {type(value).__name__}"
+
+
 def judge_paper_book(state, left_out=(), only=None) -> tuple[str, str, str] | None:
     """The paper book's one invariant (T38-1b addendum 2), over the parts of its durable state that act on a later step:
     `positions` ({strategy name: {symbol: lot}}: lots are marked, traded and stopped only through their strategy) and
@@ -176,23 +188,32 @@ def judge_paper_book(state, left_out=(), only=None) -> tuple[str, str, str] | No
     position. None when the book holds, for the names in `only` (every name when None):
       B. under a name in `left_out` (strategies that can hold a short and are not stepped), no lot whose units are not
          exactly zero and no pending order of either sign;
-      C. under any name, no lot below zero, and no pending orders that, filled in their order, would take the lot below
-         zero (by more than the fill's own rounding to zero); a lot or an order whose units are not a finite number is
+      C. under any name, no lot below zero, and no pending orders that, filled in their order with the paper fill's own
+         arithmetic (paper.py `_fill_pending`: each fill adds the order's units to the lot and sets a result below 1e-12
+         in size to exactly 0), would take the lot below zero; a lot or an order whose units are not a finite number is
          refused too, since it cannot be told from a short.
-    Otherwise (rule, strategy name, symbol) of the first breach found, rule "lot" or "pending" (B), "short" (C) or
-    "unreadable". Pure: reads `state` only."""
+    Otherwise (rule, strategy name, symbol) of the first breach found, rule "lot" or "pending" (B) or "short" (C); or
+    ("unreadable", what is wrong in words, "") when `positions` is present but not a mapping, `pending` is present but
+    not a list, or an entry in them cannot be read (T38-1b addendum 3). Pure: reads `state` only."""
     if not isinstance(state, dict):
-        return ("unreadable", "the book", "its state")
-    positions, pending = state.get("positions") or {}, state.get("pending") or []
-    if not isinstance(positions, dict) or not isinstance(pending, list):
-        return ("unreadable", "the book", "positions or pending")
+        return ("unreadable", f"it is {_kind(state)} where a mapping belongs", "")
+    positions, pending = state.get("positions", {}), state.get("pending", [])
+    if not isinstance(positions, dict):
+        return ("unreadable", f"its positions are {_kind(positions)} where a mapping of strategies to their lots belongs",
+                "")
+    if not isinstance(pending, list):
+        return ("unreadable", f"its pending orders are {_kind(pending)} where a list of orders belongs", "")
+
+    def not_a_book(name, book):
+        return ("unreadable", f"its lots under {name} are {_kind(book)} where a mapping of symbols to lots belongs", "")
+
     asked = (lambda name: True) if only is None else (lambda name: name in only)
     for name in left_out:                                                       # B
         if not isinstance(name, str) or not asked(name):
             continue
         book = positions.get(name, {})
         if not isinstance(book, dict):
-            return ("unreadable", name, "its lots")
+            return not_a_book(name, book)
         for sym, lot in book.items():
             if _units(lot.get("units") if isinstance(lot, dict) else None) != 0.0:
                 return ("lot", name, str(sym))
@@ -204,27 +225,31 @@ def judge_paper_book(state, left_out=(), only=None) -> tuple[str, str, str] | No
         if not asked(name):
             continue
         if not isinstance(book, dict):
-            return ("unreadable", str(name), "its lots")
+            return not_a_book(name, book)
         for sym, lot in book.items():
             units = _units(lot.get("units") if isinstance(lot, dict) else None)
             if units is None:
-                return ("unreadable", str(name), str(sym))
+                return ("unreadable", f"it holds a lot of {name} ({sym}) whose units are not a number", "")
             if units < 0:
                 return ("short", str(name), str(sym))
             held[(name, sym)] = units
     for o in pending:                                                           # C: pending orders, in fill order
-        if not isinstance(o, dict) or not isinstance(o.get("strategy"), str) or not isinstance(o.get("symbol"), str):
+        what = ("a pending entry that is not an order" if not isinstance(o, dict) else
+                "a pending order with no strategy name" if not isinstance(o.get("strategy"), str) else
+                "a pending order with no symbol" if not isinstance(o.get("symbol"), str) else None)
+        if what is not None:
             if only is None:
-                return ("unreadable", "an order", "a pending order")
+                return ("unreadable", f"it holds {what}", "")
             continue
         name, sym = o["strategy"], o["symbol"]
         if not asked(name):
             continue
         units = _units(o.get("units"))
         if units is None:
-            return ("unreadable", name, sym)
-        held[(name, sym)] = held.get((name, sym), 0.0) + units
-        if held[(name, sym)] < -_ZERO:
+            return ("unreadable", f"it holds a pending order of {name} for {sym} whose units are not a number", "")
+        after = held.get((name, sym), 0.0) + units                            # the fill's own arithmetic
+        held[(name, sym)] = 0.0 if abs(after) < _ZERO else after
+        if held[(name, sym)] < 0:
             return ("short", name, sym)
     return None
 
@@ -240,7 +265,7 @@ def paper_book_words(found: tuple[str, str, str], tail: str) -> str:
         core = (f"the paper book holds a short position (or an order that would open one) under {name}, {sym}; the "
                 "paper book and its tax ledger do not handle shorts")
     else:
-        core = f"the paper book holds what it cannot read under {name}, {sym}, which cannot be told from a short"
+        core = f"the paper book's state cannot be read: {name}"
     return f"{core}; {tail}"
 
 
@@ -268,31 +293,46 @@ class ShortAfterStep(Exception):
     """A run that stepped left the book with a short (the backstop of judge_paper_book's rule C)."""
 
 
-def refuse_a_book_that_can_short(paths: LoopPaths, left_out: list[dict]) -> None:
+def refuse_a_book_that_can_short(paths: LoopPaths, left_out: list[str]) -> None:
     """Raises PaperBookRefused, in judge_paper_book's words, when the book on disk breaks the invariant for the
-    strategies `left_out` names. Writes nothing; a state that cannot be read is left to the paper trader."""
+    strategy names `left_out`. Writes nothing; a file that cannot be read or parsed is left to the paper trader."""
     state = _book_state(paths)
-    found = None if state is None else judge_paper_book(state, [e["name"] for e in left_out])
+    found = None if state is None else judge_paper_book(state, left_out)
     if found is not None:
         raise PaperBookRefused(paper_book_words(found, "nothing was stepped"))
 
 
 def check_after_step(paths: LoopPaths) -> None:
-    """After a run that stepped: rule C on the state just written. Raises ShortAfterStep naming the strategy and symbol
-    (the day is already journalled; the next run is stopped by the check before stepping)."""
+    """After every day stepped (T38-1b addendum 3: in the catch-up loop and after the broker-mirror branch's one step):
+    rule C on the state just written. Raises ShortAfterStep naming the strategy and symbol (that day is already
+    journalled; no further day is stepped, and the next run is stopped by the check before stepping). Known and
+    accepted for now: with the broker-mirror flag, a strategy that says it cannot hold a short and then shorts has its
+    first day's order sent to the mirror before this check can see it; closing that needs a guard inside the paper
+    trader, which is the shorts slice."""
     state = _book_state(paths)
     found = None if state is None else judge_paper_book(state)
+    if found is not None and found[0] == "unreadable":
+        raise ShortAfterStep(f"the paper book's state cannot be read after the step: {found[1]}")
     if found is not None:
         raise ShortAfterStep(f"a strategy that says it cannot hold a short now has one: {found[1]}, {found[2]}")
 
 
-def _left_out_early(paths: LoopPaths, ledger: HypothesisLedger) -> list[dict]:
-    """The left-out strategies for a check made before anything is spent; [] when a strategy file cannot be loaded
-    (that error surfaces later, exactly where it always has; rule C is still checked)."""
-    try:
-        return strategies_to_step(paths, ledger).left_out
-    except Exception:
-        return []
+def _left_out_names(paths: LoopPaths, ledger: HypothesisLedger | None) -> list[str]:
+    """The names of the paper ideas' strategies that can hold a short, read idea by idea in the paper command's order
+    (T38-1b addendum 3): an idea whose strategy file cannot be loaded names no strategy here (its error surfaces later,
+    exactly where it always has), and every other is still named. None of them when there is no ledger. The one
+    reading of the early checks and of the order step's whole-book refusal."""
+    names = []
+    for s in PAPER_STATUSES if ledger is not None else ():
+        for h in ledger.search(status=s):
+            try:
+                strategy = _strategy_for(paths, ledger, h["id"], None)[0]
+                name = strategy.name
+            except Exception:
+                continue
+            if can_hold_shorts(strategy):
+                names.append(name)
+    return names
 
 
 MIRROR_TAIL = "the order step does not mirror such a book"
@@ -308,19 +348,11 @@ def _whole_book_refusal(paths: LoopPaths, ledger: HypothesisLedger | None, trade
     state = trader.state if trader is not None else _book_state(paths)
     if state is None:
         return None                                     # unreadable: the order step's own reading refuses it
-    own, left = None, []
+    own = None
     try:
         if ledger is None and paths.ledger.is_file():
             ledger = own = HypothesisLedger(paths.ledger)
-        for s in PAPER_STATUSES if ledger is not None else ():
-            for h in ledger.search(status=s):
-                try:
-                    strategy = _strategy_for(paths, ledger, h["id"], None)[0]
-                    name = strategy.name
-                except Exception:
-                    continue
-                if can_hold_shorts(strategy):
-                    left.append(name)
+        left = _left_out_names(paths, ledger)
     finally:
         if own is not None:
             own.close()
@@ -370,17 +402,29 @@ def _asker(spec: str, timeout: float | None = None):
     raise SystemExit(f"backend must be hermes:<profile> or chat:<model>@<base-url>, not {spec}")
 
 
-def paper_catch_up(trader: PaperTrader, prices: pd.DataFrame, active: dict[int, Strategy]) -> list[dict]:
+def paper_catch_up(trader: PaperTrader, prices: pd.DataFrame, active: dict[int, Strategy],
+                   after_each=None) -> list[dict]:
     """Step the paper book through every trading day it has not processed yet, oldest first, each
     with prices up to that day only. A first run starts at the latest day: nothing is backfilled.
     This makes a weekly run produce the same book a daily run would, because a decision at one
     close is filled at the next close either way. It is for the simulated book only; orders cannot
     be mirrored to a broker in the past. A night the book cannot price (`PaperBookNoPrice`) stops it
     there: every night before it is saved, that night and the ones after it are not run, and the
-    error goes to the caller (`main` prints it in one line and exits 2)."""
+    error goes to the caller (`main` prints it in one line and exits 2). `after_each()`, when given, runs after every
+    day stepped (T38-1b addendum 3: the after-step check); when it raises ShortAfterStep no further day is stepped and
+    the error carries the days already stepped as `steps`."""
     last = trader.state["last_day"]
     days = [prices.index[-1]] if last is None else [d for d in prices.index if str(d.date()) > last]
-    return [trader.step(prices.loc[:day], active) for day in days]
+    steps = []
+    for day in days:
+        steps.append(trader.step(prices.loc[:day], active))
+        if after_each is not None:
+            try:
+                after_each()
+            except ShortAfterStep as exc:
+                exc.steps = steps
+                raise
+    return steps
 
 
 def panel_settings(paths: LoopPaths) -> dict:
@@ -859,7 +903,7 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     from valedia_trader.research_loop.paper import Journal
     from valedia_trader.research_loop.revision import RevisionEngine
     out: dict = {"date": str(pd.Timestamp.today().date())}
-    refuse_a_book_that_can_short(paths, _left_out_early(paths, ledger))   # T38-1b: before the cycle spends anything
+    refuse_a_book_that_can_short(paths, _left_out_names(paths, ledger))   # T38-1b: before the cycle spends anything
     if args.refresh:
         from valedia_trader.data_and_fees import prices as price_data
         try:
@@ -895,14 +939,12 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
     book = strategies_to_step(paths, ledger)            # T38-1b: one that can hold a short is not stepped
     active = book.stepped
     out["not_stepped"] = book.left_out
-    refuse_a_book_that_can_short(paths, book.left_out)   # again just before stepping: this cycle may change the set
+    refuse_a_book_that_can_short(paths, [e["name"] for e in book.left_out])   # again: this cycle may change the set
     journal = Journal(paths.journal)
     if active:
-        steps = paper_catch_up(paper_trader(paths), prices, active)
+        steps = paper_catch_up(paper_trader(paths), prices, active, after_each=lambda: check_after_step(paths))
         out["paper"] = {"days_processed": len(steps), "last": steps[-1] if steps else "already up to date",
                         "capital_shared_by": len(active)}
-        if steps:
-            check_after_step(paths)
     else:
         out["paper"] = _nothing_stepped(book.left_out) if book.left_out else "nothing has passed its backtest and sealed test"
     if args.critic or pd.Timestamp.today().dayofweek == 6:
@@ -1028,7 +1070,7 @@ def main(argv=None) -> int:
                 print("refused: paper-step no longer sends anything to Webull. Orders reach Webull's test environment only "
                       "through `order-step`, run once a day inside the regular session.", file=sys.stderr)
                 return 2
-            refuse_a_book_that_can_short(paths, _left_out_early(paths, ledger))   # T38-1b: before refresh, secrets, venue
+            refuse_a_book_that_can_short(paths, _left_out_names(paths, ledger))   # T38-1b: before refresh, secrets, venue
             if args.refresh:
                 from valedia_trader.data_and_fees import prices as price_data
                 print("prices:", price_data.refresh(args.data))
@@ -1041,7 +1083,7 @@ def main(argv=None) -> int:
                 load_env()
                 venue = AlpacaPaperVenue(secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY"))
             trader = paper_trader(paths, venue=venue)
-            refuse_a_book_that_can_short(paths, left_out)
+            refuse_a_book_that_can_short(paths, [e["name"] for e in left_out])
             said = {"capital_shared_by": len(active), "not_stepped": left_out}
             if not active and left_out:
                 print(_nothing_stepped(left_out))
@@ -1049,14 +1091,22 @@ def main(argv=None) -> int:
             elif not active:
                 print("no strategy has passed its backtest and sealed test; nothing to paper trade")
             elif venue is not None:
-                print(json.dumps({**trader.step(prices, active), **said}, indent=2))   # a broker mirror cannot trade in the past
+                # A broker mirror cannot trade in the past: one step, then the after-step check. Known and accepted for
+                # now (T38-1b addendum 3): a strategy that says it cannot hold a short and then shorts has its first
+                # day's order sent to the mirror before any check can see it; closing that needs a guard inside the
+                # paper trader, which is the shorts slice.
+                print(json.dumps({**trader.step(prices, active), **said}, indent=2))
                 check_after_step(paths)
             else:
-                steps = paper_catch_up(trader, prices, active)
-                print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date", **said},
-                                 indent=2))
-                if steps:
-                    check_after_step(paths)
+                def days_said(steps):
+                    print(json.dumps({"days_processed": len(steps), "last": steps[-1] if steps else "already up to date",
+                                      **said}, indent=2))
+                try:
+                    steps = paper_catch_up(trader, prices, active, after_each=lambda: check_after_step(paths))
+                except ShortAfterStep as exc:               # what the days already stepped printed, then the error
+                    days_said(exc.steps)
+                    raise
+                days_said(steps)
         elif args.cmd == "critic":
             from valedia_trader.research_loop.paper import Journal
             book = strategies_to_step(paths, ledger, (*PAPER_STATUSES, "paused"),

@@ -2237,7 +2237,8 @@ def _fill_state(lot, orders, day):
 
 def test_t38_1b_addendum3_rule_c_rounds_pending_orders_as_the_paper_fill_does(tmp_path, capsys):
     """For seeded random lots (zero, tiny, whole) and orders around the fill's rounding threshold, judge_paper_book
-    accepts exactly when stepping the state with the real paper trader leaves no negative lot."""
+    accepts exactly when stepping the state with the real paper trader leaves no negative lot, after any of its fills
+    (a fill that leaves the lot short is a short fill, which stops the tax ledger, even when a later one closes it)."""
     assert cli.judge_paper_book(_fill_state(0.0, [9e-13, -1.5e-12], "x")) == ("short", "mom_long", "UP")   # the checker's
     px = prices()
     limits = tmp_path / "risk.json"
@@ -2259,9 +2260,17 @@ def test_t38_1b_addendum3_rule_c_rounds_pending_orders_as_the_paper_fill_does(tm
         book_dir.mkdir()
         (book_dir / "paper_state.json").write_text(json.dumps(state))
         trader = PaperTrader(book_dir, limits, halt_file=None)
+        seen, take = [], trader._tax_take                                 # the lot as each real fill leaves it
+
+        def after_fill(day, sym, *a, trader=trader, seen=seen, take=take):
+            seen.append(trader.state["positions"]["mom_long"][sym]["units"])
+            return take(day, sym, *a)
+
+        trader._tax_take = after_fill
         trader.step(px.iloc[:20], {})                                     # the fill alone: no strategy decides
-        assert trader.state["pending"] == []
-        negative = any(l["units"] < 0 for book in trader.state["positions"].values() for l in book.values())
+        assert trader.state["pending"] == [] and len(seen) == len(orders)
+        negative = any(u < 0 for u in seen) or any(
+            l["units"] < 0 for book in trader.state["positions"].values() for l in book.values())
         states += 1
         accepted += found is None
         if (found is None) == negative:
