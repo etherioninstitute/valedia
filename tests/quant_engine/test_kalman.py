@@ -1,4 +1,4 @@
-"""Tests for the Kalman hedge-ratio filter (T38-2 and its three addenda). Every test is seeded; each
+"""Tests for the Kalman hedge-ratio filter (T38-2 and its four addenda). Every test is seeded; each
 tolerance carries its reason. Numbers quoted as "measured" come from the builder's run of this file."""
 import inspect
 
@@ -65,18 +65,39 @@ def test_1_delta_zero_is_least_squares_on_every_prefix(intercept):
 @pytest.mark.parametrize("intercept,p", [(True, 2), (False, 1)])
 def test_1b_delta_zero_variance_is_the_least_squares_residual_variance(intercept, p):
     # Not counting the first p bars buys the identity: at delta 0, R at the last bar (from the bars before
-    # it) equals RSS / (n - p) of least squares on those bars. Limit 3e-4 relative: the gap comes from the
-    # ridge prior (and the two near-zero e^2/S* of the uncounted bars); measured -7.33e-5 on this data with
-    # the intercept and -9.7e-6 on other data, 6.6e-10 without the intercept.
-    rng = np.random.default_rng(1)
-    y, x = pair(rng, 500, alpha=0.5 if intercept else 0.0)
-    res = K.kalman_regression(y, x, delta=0.0, intercept=intercept)
-    n = y.size - 1
-    X = np.c_[x[:n], np.ones(n)] if intercept else x[:n, None]
-    resid = y[:n] - X @ np.linalg.lstsq(X, y[:n], rcond=None)[0]
-    rel = res.obs_var[-1] / (resid @ resid / (n - p)) - 1.0
-    print(f"\n[T1b intercept={intercept}] R_last / (RSS/(n-p)) - 1 = {rel:.2e}")
-    assert abs(rel) < 3e-4
+    # it) equals RSS / (n - p) of least squares on those bars. The identity is exact only for a truly
+    # diffuse prior: with prior_var 1e8, when the first two log prices nearly coincide, bar 1 does not
+    # pin the second direction, carries real noise and is not counted, while a later near-zero e^2/S* is.
+    # Measured with the intercept (agreeing with a 50-digit copy to 1e-11): worst -4.73e-3 over 200 seeds,
+    # -3.43e-4 over seeds 0-19; without the intercept 9.4e-10. Limit 1.5e-2, about three times 4.73e-3.
+    worst = 0.0
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        y, x = pair(rng, 500, alpha=0.5 if intercept else 0.0)
+        res = K.kalman_regression(y, x, delta=0.0, intercept=intercept)
+        n = y.size - 1
+        X = np.c_[x[:n], np.ones(n)] if intercept else x[:n, None]
+        resid = y[:n] - X @ np.linalg.lstsq(X, y[:n], rcond=None)[0]
+        rel = res.obs_var[-1] / (resid @ resid / (n - p)) - 1.0
+        worst = max(worst, abs(rel))
+        assert abs(rel) < 1.5e-2, (seed, rel)
+    print(f"\n[T1b intercept={intercept}] worst |R_last / (RSS/(n-p)) - 1| over 20 seeds = {worst:.2e}")
+
+
+@pytest.mark.parametrize("intercept,p", [(True, 2), (False, 1)])
+def test_1c_the_first_p_bars_are_not_counted(intercept, p):
+    # At delta 0 the count n rises by exactly 1 per counted bar: after bar t it is (bars with data up to
+    # t) - p, never below 0, and R is NaN on every bar before which nothing has been counted.
+    rng = np.random.default_rng(11)
+    y, x = pair(rng, 120)
+    y[[0, 5, 6]] = np.nan
+    res, tr = run(y, x, delta=0.0, intercept=intercept)
+    seen = np.cumsum(~np.isnan(y))
+    np.testing.assert_array_equal(tr.count, np.maximum(seen - p, 0).astype(float))
+    before = np.r_[0.0, tr.count[:-1]]
+    has = ~np.isnan(y)
+    assert np.isnan(res.obs_var[has & (before == 0)]).all()
+    assert np.isfinite(res.obs_var[has & (before > 0)]).all()
 
 
 # ------------------------------------------------------------------ 2. following a step
@@ -224,13 +245,12 @@ def test_6a_constant_x_stays_finite_follows_the_level_and_needs_the_cap(delta):
     print(f"\n[T6a delta={delta}] min S* {res.forecast_scale.min():.4f}; max |fit - 2| "
           f"{np.abs(fit[60:] - 2.0).max():.4f}; z var {zvar:.4f}; cap acted on {tr.capped.sum()} bars")
     assert abs(zvar - 1.0) < 0.15
-    # Two-way: without the cap the same data drive S* below 1 (the case the cap exists for); the run then
-    # either reports it or fails on the square root of a negative R S*.
-    try:
-        broke = np.nanmin(run(y, x, delta=delta, cap=False)[0].forecast_scale) < 1.0
-    except ValueError:
-        broke = True
-    assert broke
+    # Two-way: with the cap S* stays near 1 + delta on the constant stretch (measured 1.0101 and 1.0526);
+    # without it the uninformed direction grows without limit and S* runs past 1e6 (measured 2.2e9 and
+    # 2.3e9 in square-root form; the matrix form instead went below 1 or failed).
+    assert res.forecast_scale[60:].max() < 1.1
+    nocap, _ = run(y, x, delta=delta, cap=False)
+    assert np.nanmax(nocap.forecast_scale) > 1e6
 
 
 @pytest.mark.parametrize("delta,slope_tol", [(0.05, 0.15), (0.01, 0.03)])
@@ -350,6 +370,12 @@ GOOD = np.arange(10.0)
     (GOOD, np.r_[-np.inf, GOOD[1:]]),
     (["a", "b", "c"], [1.0, 2.0, 3.0]),            # not numeric
     (GOOD, [{"a": 1}] * 10),
+    (["1.5", "2", "3"], [1.0, 2.0, 3.0]),          # numeric text is still text
+    (np.array(["1", "2", "3"]), [1.0, 2.0, 3.0]),
+    (GOOD, np.array(GOOD, dtype=object)),          # objects, even holding numbers
+    ([1.0, None, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]),  # None is not a missing value: use NaN
+    ([True, False, True], [1.0, 2.0, 3.0]),        # booleans are not prices
+    ([b"1", b"2", b"3"], [1.0, 2.0, 3.0]),
 ])
 def test_8_bad_series_refused(y, x):
     with pytest.raises(ValueError):
@@ -361,11 +387,16 @@ def test_8_bad_series_refused(y, x):
     {"warmup": 1}, {"warmup": 0}, {"warmup": 2.5}, {"warmup": True}, {"warmup": None},
     {"intercept": 1}, {"intercept": "yes"},
     {"prior_var": 0.0}, {"prior_var": -1.0}, {"prior_var": float("inf")}, {"prior_var": float("nan")},
-    {"prior_var": True},
+    {"prior_var": True}, {"prior_var": 0.999}, {"prior_var": 1.0001e12}, {"prior_var": 1e13}, {"prior_var": "1e8"},
 ])
 def test_8_bad_parameters_refused(kw):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=next(iter(kw))):
         K.kalman_regression(GOOD * 2 + 1, GOOD, **kw)
+
+
+def test_8_prior_var_range_ends_are_accepted():
+    for pv in (1.0, 1e12, 1, np.float64(1e10)):
+        K.kalman_regression(GOOD * 2 + 1, GOOD, prior_var=pv)
 
 
 def test_8_good_edges_accepted_and_shapes_follow_the_input():
@@ -421,3 +452,77 @@ def test_9_the_public_function_cannot_turn_the_cap_off():
     pub, core = K.kalman_regression(yc, xc, delta=0.05), run(yc, xc, delta=0.05)[0]
     for f in FIELDS:
         assert getattr(pub, f).tobytes() == getattr(core, f).tobytes(), f
+
+
+# ------------------------------------------------------------------ 10. the forecast is made before the update
+@pytest.mark.parametrize("intercept", [True, False])
+@pytest.mark.parametrize("delta", [0.0, 0.01, 0.05])
+def test_10_forecast_error_and_z_from_the_reported_arrays(intercept, delta):
+    # For every bar t >= 1 with data the forecast error is the one made with the state reported for bar
+    # t - 1 (carried across missing bars), and z = e / sqrt(R S*) from the reported arrays. Measured worst
+    # difference 0.0 over 10 seeds (the code evaluates the same expressions), so asserted exactly.
+    for seed in range(10):
+        rng = np.random.default_rng(400 + seed)
+        y, x = pair(rng, 800)
+        y[rng.choice(800, 60, replace=False)] = np.nan
+        x[rng.choice(800, 30, replace=False)] = np.nan
+        r = K.kalman_regression(y, x, delta=delta, intercept=intercept)
+        has = ~(np.isnan(y) | np.isnan(x))
+        has[0] = False
+        made_before = y[1:] - (r.beta[:-1] * x[1:] + r.alpha[:-1])
+        np.testing.assert_array_equal(r.forecast_error[has], made_before[has[1:]])
+        expected_z = r.forecast_error / np.sqrt(r.obs_var * r.forecast_scale)
+        ok = np.isfinite(r.z)
+        assert ok.sum() > 500
+        np.testing.assert_array_equal(r.z[ok], expected_z[ok])
+
+
+# ------------------------------------------------------------------ 11. slowly moving x, large prior_var
+def _near_constant(seed):
+    """Near-constant x at a log-price level in four shapes (the checker's repro shape and three
+    slower ones), noise 1e-3."""
+    rng = np.random.default_rng(seed)
+    n = 2000
+    kind = seed % 4
+    if kind == 0:
+        x = 4.6 + np.cumsum(rng.normal(0.0, 1e-4, n))      # the checker's repro shape
+    elif kind == 1:
+        x = 4.6 + np.cumsum(rng.normal(0.0, 1e-5, n))
+    elif kind == 2:
+        x = 4.6 + rng.normal(0.0, 1e-4, n)
+    else:
+        x = 4.6 + rng.normal(0.0, 1e-6, n)
+    return 1.2 * x + 0.3 + rng.normal(0.0, 1e-3, n), x
+
+
+def _healthy(res, y, x):
+    has = ~(np.isnan(y) | np.isnan(x))
+    assert np.all(res.forecast_scale[has] >= 1.0)
+    for f in FIELDS:
+        assert np.isfinite(getattr(res, f)[60:]).all(), f
+
+
+def test_11_the_checkers_repro_keeps_the_forecast_scale_at_least_one():
+    # At commit 8bc8750 (covariance carried as a matrix) this gave a smallest forecast_scale of -3.78.
+    rng = np.random.default_rng(0)
+    x = 4.6 + np.cumsum(rng.normal(0, 1e-4, 2000))
+    y = 1.2 * x + .3 + rng.normal(0, 1e-3, 2000)
+    res = K.kalman_regression(y, x, delta=0.01, prior_var=1e12)
+    _healthy(res, y, x)
+
+
+@pytest.mark.parametrize("prior_var", [1e8, 1e9, 1e10, 1e12])
+def test_11_near_constant_x_family_never_fails(prior_var):
+    # 200 seeded runs per prior_var. At 8bc8750 (matrix form) this family failed (raised, S* below 1 or
+    # not finite) in 0, 0, 60 and 180 of 200 runs at 1e8, 1e9, 1e10, 1e12; in square-root form in none.
+    for seed in range(200):
+        y, x = _near_constant(seed)
+        _healthy(K.kalman_regression(y, x, delta=0.01, prior_var=prior_var), y, x)
+
+
+def test_11_log_price_family_at_the_largest_prior_var():
+    # Log-price x (1% steps) at prior_var 1e12: 3 of these 200 runs failed at 8bc8750, none now.
+    for seed in range(200):
+        rng = np.random.default_rng(1000 + seed)
+        y, x = pair(rng, 2000, beta=1.2, alpha=0.3)
+        _healthy(K.kalman_regression(y, x, delta=0.01, prior_var=1e12), y, x)
