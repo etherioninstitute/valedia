@@ -2347,3 +2347,42 @@ def test_t38_1b_addendum3_the_paper_command_refuses_positions_that_are_not_a_map
         2, "", f"refused: the paper book's state cannot be read: its positions are {shown} where a mapping of "
                "strategies to their lots belongs; nothing was stepped\n")
     assert _book_files(root) == before
+
+
+def test_ideas_judged_before_the_split_get_one_finding_and_nothing_else_changes(tmp_path, capsys):
+    """T39-2b, R8: a dry run by default; --apply adds the finding through the ledger's own writer to every idea whose
+    development or sealed result has no claim; a second --apply adds nothing; no other column changes."""
+    root = tmp_path / "repo"
+    assert cli.main(["--root", str(root), "init"]) == 0
+    capsys.readouterr()
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    old_dev, old_sealed, new, untested = (led.propose(f"Idea number {k} about funds and their drift", "price-analyst", "m")
+                                          for k in range(4))
+    old = {"verdict": "fail", "checks": {"deflated_sharpe": {"passed": False, "detail": "0.1"}}}
+    led.record_backtest(old_dev, old, "trending up", "", "1.0.0", "failed")
+    led.record_backtest(old_sealed, {**old, "claim": "edge", "verdict": "pass (development); sealed test pending"}, "trending up", "",
+                        "1.0.0", "untested")
+    led.record_sealed(old_sealed, {"verdict": "pass", "checks": {}}, "passed backtest only")
+    led.record_backtest(new, {**old, "claim": "exposure"}, "trending up", "", "1.0.0", "failed")
+    before = {h["id"]: h for h in led.search()}
+    led.close()
+
+    def run(*extra):
+        assert cli.main(["--root", str(root), "mark-pre-split", *extra]) == 0
+        return json.loads(capsys.readouterr().out)
+    dry = run()
+    assert dry == {"ideas_judged_before_the_split": 2, "already_marked": 0, "to_mark": 2, "added": 0, "applied": False}
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    assert led.findings() == [] and {h["id"]: h for h in led.search()} == before                  # the dry run wrote nothing
+    led.close()
+    assert run("--apply")["added"] == 2
+    again = run("--apply")
+    assert again["added"] == 0 and again["already_marked"] == 2 and again["to_mark"] == 0
+    led = lg.HypothesisLedger(root / "memory" / "ledger.db")
+    marked = [f for f in led.findings() if f["finding"] == cli.PRE_SPLIT_FINDING and f["source"] == cli.PRE_SPLIT_SOURCE]
+    assert sorted(f["hypothesis_id"] for f in marked) == [old_dev, old_sealed] and len(led.findings()) == 2
+    after = {h["id"]: h for h in led.search()}
+    for hid in before:
+        changed = {k for k in before[hid] if before[hid][k] != after[hid][k]}
+        assert changed == ({"lessons_learned"} if hid in (old_dev, old_sealed) else set()), (hid, changed)
+    assert cli.PRE_SPLIT_FINDING in after[old_dev]["lessons_learned"] and after[untested]["lessons_learned"] == ""

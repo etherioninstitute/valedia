@@ -71,6 +71,33 @@ _PRIOR_LESSONS = {
 }
 
 
+PRE_SPLIT_SOURCE = "gate-split"
+PRE_SPLIT_FINDING = ("judged before the edge/exposure split: the pass or fail above came from the Deflated Sharpe rule, "
+                     "which on a fresh market label passes most random long-only timing; a pass here shows a profitable "
+                     "holding, not timing skill")
+
+
+def mark_judged_before_split(ledger: HypothesisLedger, apply: bool = False) -> dict:
+    """T39-2b: one finding for every idea whose development or sealed result was produced before the edge/exposure split
+    (a stored result with no `claim`). A dry run unless `apply`; written through the ledger's own `add_lesson` (the
+    finding and the idea's lessons text, nothing else); an idea that already has this exact finding from this source
+    is skipped, so a second run adds nothing. Returns counts only."""
+    old = marked = added = 0
+    for h in ledger.search():
+        results = [r for r in (h["backtest_result"], h["sealed_test_result"]) if r is not None]
+        if not any(not isinstance(r, dict) or "claim" not in r for r in results):
+            continue
+        old += 1
+        if any(f["source"] == PRE_SPLIT_SOURCE and f["finding"] == PRE_SPLIT_FINDING for f in ledger.findings(h["id"])):
+            marked += 1
+            continue
+        if apply:
+            ledger.add_lesson(h["id"], PRE_SPLIT_FINDING, PRE_SPLIT_SOURCE)
+            added += 1
+    return {"ideas_judged_before_the_split": old, "already_marked": marked, "to_mark": old - marked - added,
+            "added": added, "applied": bool(apply)}
+
+
 def seed_prior_trials(ledger: HypothesisLedger, trials_db: Path, report: Path | None = None) -> int:
     """Record the earlier walk-forward's distinct configurations as tested ideas. Runs once."""
     if not trials_db.exists() or ledger.search(market=MARKET, text="Recorded from the 2026-11-10 walk-forward"):
@@ -997,6 +1024,9 @@ def main(argv=None) -> int:
     p.add_argument("--days", type=int, default=7)
     p = sub.add_parser("reset-kill-switch")
     p.add_argument("--who", required=True)
+    p = sub.add_parser("mark-pre-split", help="add one finding to every idea judged before the edge/exposure split "
+                                              "(a dry run that prints counts; --apply writes)")
+    p.add_argument("--apply", action="store_true", help="write the findings (default: count only)")
     p = sub.add_parser("cycle", help="one full pass of the loop")
     p.add_argument("--refresh", action="store_true", help="download the latest prices first")
     p.add_argument("--no-research", action="store_true", help="skip the research round (test what is already untested)")
@@ -1026,6 +1056,8 @@ def main(argv=None) -> int:
             print(f"folders ready under {paths.root}")
             print(f"risk limits: {paths.risk_limits} ({'created with the example numbers; set your own' if created else 'kept as it was'})")
             print(f"ledger: {paths.ledger} ({seeded} earlier ideas recorded)" if seeded else f"ledger: {paths.ledger}")
+        elif args.cmd == "mark-pre-split":
+            print(json.dumps(mark_judged_before_split(ledger, apply=args.apply)))
         elif args.cmd == "status":
             print(json.dumps(ledger.summary(), indent=2))
             for h in reversed(ledger.search()):
