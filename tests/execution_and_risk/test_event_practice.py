@@ -7,6 +7,7 @@ touches the network, the real secrets file or the repository's files."""
 import json
 import random
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -70,6 +71,7 @@ class Exchange:
         self.held = dict(held or {})
         self.asks, self.bids = {}, {}
         self.place_mode = "ok"
+        self.cancel_mode = "ok"                              # "ignore": the cancel is answered but the order stays open
         self.bp = "1000"                                     # the Events balance: buying power only (None: left out)
         self.account_v2 = SimpleNamespace(get_account_list=lambda: self._log(("accounts",), ACCOUNTS),
                                           get_account_balance=lambda a: self._log(("balance",), self._balance()),
@@ -103,7 +105,7 @@ class Exchange:
 
     def _cancel(self, a, cid):
         self.calls.append(("cancel", cid))
-        if self.orders.get(cid, {}).get("status") == "SUBMITTED":
+        if self.cancel_mode == "ok" and self.orders.get(cid, {}).get("status") == "SUBMITTED":
             self.orders[cid]["status"] = "CANCELLED"
         return Response({"client_order_id": cid, "order_id": "ORD-1"})
 
@@ -553,7 +555,7 @@ def test_tonights_losing_baseline_holding_is_closed_once_at_zero_and_the_run_goe
     e = s[0]
     assert (e["symbol"], e["units"], e["price"], e["baseline_units"], e["program_units"]) == (f"{T}:yes", -1.0, 0.0, 1.0, 0.0)
     assert e["fee"] is None and e["fee_seen"] == "none seen" and type(e["settlement_id"]) is int
-    assert e["kalshi"] == TONIGHT
+    assert e["kalshi"] == TONIGHT and e["witnesses"] == "kalshi_record+cash_equation" and e["confirmed_by"] is None
     assert w.ledger.last_reconcile()["clean"] and w.ledger.blocked() == []
     again = w.run(reconcile_only=True)
     assert again["status"] == "done" and len(w.entries("settlement")) == 1 and w.market_reads == [T]
@@ -605,18 +607,21 @@ def test_another_name_that_differs_stops_and_nothing_is_settled(tmp_path):
     assert out["status"] == "stopped" and out["stage"] == "reconcile" and w.entries("settlement") == []
 
 
-def test_an_order_of_the_ledger_open_on_the_name_defers_the_settlement_to_the_next_run(tmp_path):
+def test_an_order_of_the_ledger_still_open_on_the_name_defers_the_settlement(tmp_path):
     w = baseline_world(tmp_path)
     w.clock.t = ny("2026-11-13 14:30")
     assert buy(w, limit="0.50")["status"] == "done"                                # rests on T:yes
     w.clock.t = NOW
     w.exchange.held[f"{T}:yes"] = 0
     w.markets[T] = TONIGHT
-    out = w.run(reconcile_only=True)                                              # cancels it, settles nothing yet
-    assert out["status"] == "stopped" and "open" in out["reason"] and w.entries("settlement") == []
-    assert [c["answer"] for c in out["cancels"]] == ["cancel requested"]
+    w.exchange.cancel_mode = "ignore"                                             # the cancel does not take
     out = w.run(reconcile_only=True)
+    assert out["status"] == "stopped" and "open" in out["reason"] and w.entries("settlement") == []
+    assert w.state().open_pending() == []                                         # not a cash question: S1 is not met
+    w.exchange.cancel_mode = "ok"
+    out = w.run(reconcile_only=True)                                              # cancelled, then settled in one run
     assert out["status"] == "done" and len(w.entries("settlement")) == 1, out
+    assert [c["answer"] for c in out["cancels"]] == ["cancel requested"]
 
 
 def test_a_production_venue_never_reaches_the_settlement_code(tmp_path):
@@ -662,7 +667,7 @@ def test_a_crash_before_the_journal_write_journals_the_settlement_on_the_next_ru
 
 
 def bought_world(tmp_path, outcome="yes"):
-    """One contract of T bought by this program and reconciled (a buying-power reading taken with it shown)."""
+    """One contract of T bought by this program at 0.71 (fee 0.01) and reconciled; a clean reading taken with it."""
     w = World(tmp_path)
     w.quote(f"{T}:{outcome}", 0.70, 0.71) if outcome == "yes" else w.quote(f"{T}:no", 0.28, 0.29)
     assert buy(w, outcome=outcome, limit=None if outcome == "yes" else "0.30")["status"] == "done"
@@ -673,180 +678,361 @@ def bought_world(tmp_path, outcome="yes"):
     return w
 
 
-def test_a_win_whose_buying_power_rose_by_exactly_the_payout_goes_on_and_sets_the_flag(tmp_path):
-    w = bought_world(tmp_path)
-    assert w.entries("buying_power")[-1]["buying_power"] == 1000.0
-    w.exchange.held[f"{T}:yes"] = 0
-    w.markets[T] = WIN
-    w.exchange.bp = "1001.00"
-    out = w.run(reconcile_only=True)
-    assert out["status"] == "done" and out["win_cash_observed"] is True and out["holds_open"] == [], out
-    e = w.entries("settlement")[0]
-    assert (e["units"], e["price"], e["program_units"], e["baseline_units"]) == (-1.0, 1.0, 1.0, 0.0)
-    assert w.entries("win_cash")[-1]["result"] == "matched" and w.state().win_cash_observed() is True
-    assert w.run(reconcile_only=True)["win_cash_observed"] is True
-
-
-def test_a_held_no_with_result_no_is_a_win_at_one_dollar(tmp_path):
-    w = bought_world(tmp_path, outcome="no")
-    w.exchange.held[f"{T}:no"] = 0
-    w.markets[T] = TONIGHT
-    w.exchange.bp = "1001"
-    out = w.run(reconcile_only=True)
-    assert out["status"] == "done" and w.entries("settlement")[0]["price"] == 1.0 and out["win_cash_observed"] is True
-
-
-@pytest.mark.parametrize("bp", ["1001.01", "1000.99", "1000", "1002"])
-def test_a_win_whose_buying_power_is_off_by_a_cent_or_more_holds(tmp_path, bp):
-    w = bought_world(tmp_path)
-    w.exchange.held[f"{T}:yes"] = 0
-    w.markets[T] = WIN
+def vanish(w, records, bp):
+    """The holdings in `records` gone from the account, Kalshi's record of each, and the buying power now."""
+    for name, rec in records.items():
+        w.exchange.held[name] = 0
+        w.markets[name.split(":")[0]] = rec
     w.exchange.bp = bp
-    out = w.run(reconcile_only=True)
-    assert out["status"] == "done" and len(out["holds_open"]) == 1 and out["win_cash_observed"] is False, out
-    hold = w.entries("hold")[-1]
-    assert "did not show the expected cash" in hold["reason"] and "person must look" in hold["reason"]
-    w.quote(f"{OTHER}:yes", 0.40, 0.41)
-    stopped = w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")
-    assert stopped["status"] == "stopped" and stopped["stage"] == "hold" and len(w.exchange.placed()) == 1
-    assert w.run(reconcile_only=True)["status"] == "done"                        # reconciling still goes on
+    return w.run(reconcile_only=True)
 
 
-@pytest.mark.parametrize("between", ["fill", "unread-before", "unread-now", "raise-now", "order"])
-def test_a_first_win_that_cannot_be_compared_is_journaled_and_does_not_hold(tmp_path, between):
-    w = World(tmp_path)
-    w.quote(f"{T}:yes", 0.70, 0.71)
-    w.quote(f"{OTHER}:yes", 0.40, 0.41)
-    assert buy(w)["status"] == "done"
-    w.clock.t += 10
-    if between == "unread-before":
-        w.exchange.bp = None
-    assert w.run(reconcile_only=True)["status"] == "done"
-    w.exchange.bp = "1000"
-    if between == "fill":                                    # fills in the run's last reconcile, after its reading
-        assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"
-        assert len(w.entries("fill")) == 2
-    if between == "order":
-        assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy", limit="0.10")["status"] == "done"
+def settled(out, w, n=1):
+    return out["status"] == "done" and len(w.entries("settlement")) == n and w.state().open_pending() == []
+
+
+def pending(out, w):
+    return (out["status"] == "stopped" and out["stage"] == "settlement" and w.entries("settlement") == []
+            and len(out["pending_open"]) >= 1 and "does not confirm the holding was still there" in out["reason"])
+
+
+# ---- R1: two witnesses, Kalshi's record and the account's cash, exactly in cents
+
+def test_the_17_november_case_with_no_earlier_reading_is_pending_until_a_person_confirms(tmp_path):
+    w = World(tmp_path, held={})                                         # the holding is already gone
+    layout_1_file(w.state_path, sends=False)                             # the real file: layout 1, a baseline, no reading
     w.clock.t = NOW
-    w.exchange.held[f"{T}:yes"] = 0
-    w.markets[T] = WIN
-    w.exchange.bp = {"unread-now": None, "raise-now": "raise"}.get(between, "1001")
-    out = w.run(reconcile_only=True)
-    assert out["status"] == "done" and out["holds_open"] == [] and out["win_cash_observed"] is False, out
-    assert len(w.entries("settlement")) == 1
-    note = w.entries("win_cash")[-1]
-    assert note["result"] == "not comparable" and note["reason"].startswith("the win's cash effect could not be compared: ")
-    words = {"fill": "a fill was recorded", "order": "an order was handed", "unread-before": "shown is unread",
-             "unread-now": "this run's reading is unread", "raise-now": "this run's reading is unread"}[between]
-    assert words in note["reason"], note
-    if between.startswith(("unread", "raise")):
-        assert any(r["buying_power"] is None and r["unread"] for r in w.entries("buying_power"))
-
-
-def test_a_settlement_time_not_later_than_a_fill_of_the_program_is_not_a_settlement(tmp_path):
-    w = bought_world(tmp_path)                                   # the fill's time: 2026-11-13 14:00 in New York
-    w.exchange.held[f"{T}:yes"] = 0
-    w.markets[T] = {**WIN, "settlement_ts": "2026-11-13T18:59:59Z"}
-    out = w.run(reconcile_only=True)
-    assert out["status"] == "stopped" and "not later than every fill" in out["reason"] and w.entries("settlement") == []
-    w.markets[T] = {**WIN, "settlement_ts": "2026-11-13T19:00:11Z"}       # after the fill (read at 14:00:10)
-    w.exchange.bp = "1001"
-    assert w.run(reconcile_only=True)["status"] == "done" and len(w.entries("settlement")) == 1
-
-
-def test_a_loss_needs_no_cash_comparison(tmp_path):
-    w = bought_world(tmp_path)
-    w.exchange.held[f"{T}:yes"] = 0
     w.markets[T] = TONIGHT
-    w.exchange.bp = "999"
     out = w.run(reconcile_only=True)
-    assert out["status"] == "done" and out["holds_open"] == [] and w.entries("win_cash") == []
-
-
-def test_buying_power_is_journaled_at_every_run_only_with_no_order_open(tmp_path):
-    w = World(tmp_path)
-    w.quote(f"{T}:yes", 0.40, 0.71)
-    assert buy(w, limit="0.50")["status"] == "done"                              # rests after the reading
-    readings = w.entries("buying_power")
-    assert len(readings) == 1 and readings[0]["buying_power"] == 1000.0 and readings[0]["unread"] is None
-    w.exchange.bp = "abc"
-    assert w.run(reconcile_only=True)["status"] == "done"                        # cancels it, then reads
-    last = w.entries("buying_power")[-1]
-    assert last["buying_power"] is None and last["unread"] and len(w.entries("buying_power")) == 2
-
-
-def hold_world(tmp_path):
-    w = bought_world(tmp_path)
-    w.exchange.held[f"{T}:yes"] = 0
-    w.markets[T] = WIN
-    w.exchange.bp = "1000"
-    out = w.run(reconcile_only=True)
-    assert len(out["holds_open"]) == 1
-    return w, out["holds_open"][0]
-
-
-def clear(w, hold_id, who="Burton", note="checked the app: payout arrived late"):
-    return ep.clear_hold(journal=w.journal, state=w.state_path, venue_name=w.venue.name, hold_id=hold_id, who=who, note=note,
-                         clock=w.clock)
-
-
-def test_a_hold_is_cleared_only_by_a_person_with_who_and_a_note(tmp_path):
-    w, hid = hold_world(tmp_path)
-    before = (len(w.entries()), w.state().open_holds())
-    for kw in (dict(who=""), dict(who="   "), dict(note=""), dict(note=" \t "), dict(who=None), dict(note=None),
-               dict(who="Bur\x00ton"), dict(note="a\nb"), dict(note="a​b"), dict(who=5), dict(hold_id=hid + 1),
-               dict(hold_id=True), dict(hold_id="1"), dict(hold_id=0)):
-        args = {"hold_id": hid, **kw}
-        out = clear(w, **args)
-        assert out["status"] == "refused", kw
-        assert (len(w.entries()), w.state().open_holds()) == before, kw
-    out = clear(w, hid)
-    assert out["status"] == "cleared" and w.state().open_holds() == []
-    e = w.entries("hold_cleared")[-1]
-    assert (e["hold_id"], e["who"], e["note"]) == (hid, "Burton", "checked the app: payout arrived late") and e["time"] == w.clock.t
-    n = len(w.entries())
-    assert clear(w, hid)["status"] == "refused" and len(w.entries()) == n             # already cleared
+    assert pending(out, w), out
+    assert "no earlier reading" in out["reason"] and "--confirm-settlement" in out["reason"]
+    p = w.entries("settlement_pending")
+    assert len(p) == 1 and p[0]["symbol"] == f"{T}:yes" and p[0]["kalshi"] == TONIGHT and p[0]["price"] == 0.0
+    pid = p[0]["pending_id"]
     w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "stopped" and w.exchange.placed() == []
+    assert pending(w.run(reconcile_only=True), w) and len(w.entries("settlement_pending")) == 1   # waits; not re-made
+    got = confirm(w, pid)
+    assert got["status"] == "confirmed", got
+    e = w.entries("settlement")
+    assert len(e) == 1 and e[0]["witnesses"] == "kalshi_record+person" and e[0]["confirmed_by"] == "Burton"
+    assert e[0]["note"] == "checked the app: the game was lost" and e[0]["pending_id"] == pid and e[0]["price"] == 0.0
+    out = w.run(reconcile_only=True)                                     # the fresh starting point
+    assert out["status"] == "done" and out["pending_open"] == [] and w.entries("buying_power")[-1]["clean"] is True
+    assert len(w.entries("settlement")) == 1 and w.run(reconcile_only=True)["status"] == "done"
     assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"
 
 
-def test_the_command_clears_a_hold_and_refuses_a_bad_clearing(tmp_path, capsys):
-    w, hid = hold_world(tmp_path)
+def confirm(w, pid, who="Burton", note="checked the app: the game was lost", **kw):
+    return ep.confirm_settlement(journal=w.journal, state=w.state_path, ledger=w.ledger, venue_name=w.venue.name,
+                                 pending_id=pid, who=who, note=note, market=kw.pop("market", w.market), clock=w.clock, **kw)
+
+
+def pending_world(tmp_path):
+    w = World(tmp_path, held={})
+    layout_1_file(w.state_path, sends=False)
+    w.clock.t = NOW
+    w.markets[T] = TONIGHT
+    assert pending(w.run(reconcile_only=True), w)
+    return w, w.entries("settlement_pending")[0]["pending_id"]
+
+
+def test_a_confirmation_is_refused_unless_every_input_and_kalshis_record_hold_now(tmp_path):
+    w, pid = pending_world(tmp_path)
+    before = (len(w.entries()), [r["id"] for r in w.state().open_pending()])
+    for kw in (dict(who=""), dict(who="  "), dict(note=""), dict(note=" \t"), dict(who=None), dict(note=None),
+               dict(who="Bur\x00ton"), dict(note="a\nb"), dict(note="a​b"), dict(who=5), dict(pid=pid + 1),
+               dict(pid=True), dict(pid="1"), dict(pid=0)):
+        args = {"pid": pid, **kw}
+        out = confirm(w, **args)
+        assert out["status"] == "refused", kw
+        assert (len(w.entries()), [r["id"] for r in w.state().open_pending()]) == before, kw
+    for rec in ({**TONIGHT, "status": "determined"}, {**TONIGHT, "settlement_value_dollars": "0.5000"}, None):
+        w.markets[T] = rec
+        if rec is None:
+            w.markets.pop(T)
+        assert confirm(w, pid)["status"] == "refused" and len(w.entries()) == before[0]
+    w.markets[T] = TONIGHT
+    assert confirm(w, pid)["status"] == "confirmed"
+    n = len(w.entries())
+    assert confirm(w, pid)["status"] == "refused" and len(w.entries()) == n                # already confirmed
+
+
+def test_the_command_confirms_a_pending_settlement_and_takes_a_fresh_reading(tmp_path, capsys):
+    w, pid = pending_world(tmp_path)
 
     def build(env):
         return wb.WebullVenue(KEY, SECRET, client=w.exchange, account_class=env["WEBULL_ACCOUNT_CLASS"], limits=HIGH,
                               sleep=lambda s: None, clock=lambda: 0.0, confirmation_file=tmp_path / "x.json")
-    calls = len(w.exchange.calls)
-    assert ep.main(["--clear-hold", str(hid), "--who", "Burton"], environ={}, build_venue=build, root=tmp_path,
-                   clock=w.clock) == 2
-    assert w.state().open_holds() != []
-    assert ep.main(["--clear-hold", str(hid), "--who", "Burton", "--note", "seen in the app"], environ={}, build_venue=build,
-                   root=tmp_path, clock=w.clock) == 0
-    assert w.state().open_holds() == [] and len(w.exchange.calls) == calls        # nothing asked of Webull
+    w.ledger.close()
+    args = ["--confirm-settlement", str(pid), "--who", "Burton"]
+    assert ep.main(args, environ={}, build_venue=build, root=tmp_path, clock=w.clock, market=w.market) == 2
+    assert ep.main(args + ["--note", "seen in the app"], environ={}, build_venue=build, root=tmp_path, clock=w.clock,
+                   market=w.market) == 0
+    capsys.readouterr()
+    assert len(w.entries("settlement")) == 1 and w.entries("buying_power")[-1]["clean"] is True
     with pytest.raises(SystemExit):
-        ep.main(["--clear-hold", str(hid), "--who", "B", "--note", "n", "--reconcile-only"], environ={}, build_venue=build,
-                root=tmp_path, clock=w.clock)
+        ep.main(args + ["--note", "n", "--reconcile-only"], environ={}, build_venue=build, root=tmp_path, clock=w.clock)
+    with pytest.raises(SystemExit):
+        ep.main(["--clear-hold", "1", "--who", "B", "--note", "n"], environ={}, build_venue=build, root=tmp_path,
+                clock=w.clock)
 
 
-# ---- T45-1: the state file's layout 2, migrated from layout 1 with the baseline and sends untouched
+@pytest.mark.parametrize("bp, ok", [("1000", True), ("1000.60", False), ("1000.01", False), ("999.99", False)])
+def test_a_held_loss_settles_only_when_the_cash_is_unchanged_to_the_cent(tmp_path, bp, ok):
+    w = baseline_world(tmp_path)                                          # a clean reading of 1000 with T held
+    out = vanish(w, {f"{T}:yes": TONIGHT}, bp)
+    assert (settled(out, w) if ok else pending(out, w)), out
+    if not ok:                                                            # e.g. sold by hand for 0.60: never a settlement
+        assert "difference of" in out["reason"] and w.state().settlements() == []
+        assert out["win_cash_observed"] is False
+
+
+@pytest.mark.parametrize("bp, ok", [("1002", True), ("1002.00", True), ("1001.99", False), ("1002.01", False),
+                                    ("1000", False)])
+def test_a_win_settles_on_exactly_one_dollar_a_contract_and_sets_the_flag(tmp_path, bp, ok):
+    w = baseline_world(tmp_path, units=2)
+    out = vanish(w, {f"{T}:yes": WIN}, bp)
+    assert (settled(out, w) if ok else pending(out, w)), out
+    assert out["win_cash_observed"] is ok
+    if ok:
+        e = w.entries("settlement")[0]
+        assert (e["units"], e["price"], e["witnesses"]) == (-2.0, 1.0, "kalshi_record+cash_equation")
+
+
+def test_a_program_bought_win_and_a_held_no_that_wins(tmp_path):
+    w = bought_world(tmp_path)                                            # the last reading: after the fill
+    assert settled(vanish(w, {f"{T}:yes": WIN}, "1001"), w)
+    e = w.entries("settlement")[0]
+    assert (e["program_units"], e["baseline_units"], e["price"]) == (1.0, 0.0, 1.0)
+    w = bought_world(tmp_path / "no", outcome="no")
+    assert settled(vanish(w, {f"{T}:no": TONIGHT}, "1001"), w) and w.entries("settlement")[0]["price"] == 1.0
+
+
+@pytest.mark.parametrize("bp, ok", [("999.58", True), ("999.57", False), ("999.59", False)])
+def test_a_purchase_between_the_readings_is_inside_the_equation(tmp_path, bp, ok):
+    w = baseline_world(tmp_path)                                          # reading: 1000, T held
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"
+    fills = w.entries("fill")
+    assert [(f["symbol"], f["price"], f["fee"]) for f in fills] == [(f"{OTHER}:yes", 0.41, 0.01)]   # 42 cents in all
+    out = vanish(w, {f"{T}:yes": TONIGHT}, bp)
+    assert (settled(out, w) if ok else pending(out, w)), out
+
+
+@pytest.mark.parametrize("bp, ok", [("1001", True), ("1000", False), ("1002", False)])
+def test_two_holdings_gone_together_settle_only_on_the_joint_figure(tmp_path, bp, ok):
+    w = World(tmp_path, held={f"{T}:yes": 1, f"{OTHER}:yes": 1})
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
+    lose = {**TONIGHT, "ticker": OTHER}
+    out = vanish(w, {f"{T}:yes": WIN, f"{OTHER}:yes": lose}, bp)
+    if ok:
+        assert settled(out, w, n=2), out
+    else:
+        assert pending(out, w) and w.state().settlements() == [] and len(out["pending_open"]) == 2, out
+
+
+def test_an_open_order_when_the_reading_would_be_taken_means_pending(tmp_path):
+    w = baseline_world(tmp_path)
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy", limit="0.10")["status"] == "done"   # rests
+    w.exchange.cancel_mode = "ignore"
+    out = vanish(w, {f"{T}:yes": TONIGHT}, "1000")
+    assert pending(out, w) and "order of this ledger is open" in out["reason"], out
+
+
+@pytest.mark.parametrize("answer", ["raise", float("nan"), -1.0, True, "1000", None, 1000.005, {"x": 1}, "dict-none"])
+def test_a_reading_that_is_not_a_whole_cent_number_from_0_is_unread_and_settles_nothing(tmp_path, monkeypatch, answer):
+    w = baseline_world(tmp_path)
+    for name in (f"{T}:yes",):
+        w.exchange.held[name] = 0
+    w.markets[T] = TONIGHT
+
+    def cash():
+        if answer == "raise":
+            raise RuntimeError("down")
+        if answer == "dict-none":
+            return {"buying_power": None}
+        if isinstance(answer, dict):
+            return answer
+        return {"buying_power": answer}
+    monkeypatch.setattr(w.venue, "cash", cash)
+    out = w.run(reconcile_only=True)
+    assert pending(out, w), out
+    r = w.entries("buying_power")[-1]
+    assert r["buying_power"] is None and r["cents"] is None and r["unread"], r
+
+
+def test_a_negative_buying_power_on_an_ordinary_run_is_unread(tmp_path):
+    w = World(tmp_path)
+    w.exchange.bp = "-5"
+    assert w.run(reconcile_only=True)["status"] == "done"
+    r = w.entries("buying_power")[-1]
+    assert r["buying_power"] is None and "below 0" in r["unread"] and r["clean"] is True
+
+
+def test_a_settlement_between_the_two_readings_is_inside_the_known_cash(tmp_path):
+    w = World(tmp_path, held={f"{T}:yes": 1, f"{OTHER}:yes": 1})
+    assert w.run(reconcile_only=True)["status"] == "done"                # reading 0: 1000, known 0
+    w.clock.t = NOW
+    assert settled(vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001"), w)
+    w.exchange.bp = None
+    assert w.run(reconcile_only=True)["status"] == "done"                # unread: never a prev
+    out = vanish(w, {f"{T}:yes": WIN}, "1001")                            # 1001 would ignore OTHER's payout
+    assert pending(out, w), out
+    w2 = World(tmp_path / "b", held={f"{T}:yes": 1, f"{OTHER}:yes": 1})
+    assert w2.run(reconcile_only=True)["status"] == "done"
+    w2.clock.t = NOW
+    assert settled(vanish(w2, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001"), w2)
+    w2.exchange.bp = None
+    assert w2.run(reconcile_only=True)["status"] == "done"
+    assert settled(vanish(w2, {f"{T}:yes": WIN}, "1002"), w2, n=2)
+
+
+def test_a_fill_without_a_fee_makes_the_known_cash_unknown(tmp_path, monkeypatch):
+    w = bought_world(tmp_path)
+    real = OrderLedger.fills
+    monkeypatch.setattr(OrderLedger, "fills", lambda self, tag=None: [{**f, "fee": None} for f in real(self, tag)])
+    out = vanish(w, {f"{T}:yes": WIN}, "1001")
+    assert pending(out, w) and "known cash" in out["reason"], out
+    monkeypatch.setattr(OrderLedger, "fills", lambda self, tag=None: [{**f, "price_covers_units": 0.5} for f in real(self, tag)])
+    assert pending(w.run(reconcile_only=True), w)
+
+
+# ---- R2: the time guard uses the time the ledger submitted the order
+
+def test_a_contract_that_fills_and_settles_between_two_runs_settles(tmp_path):
+    w = World(tmp_path)
+    assert buy(w)["status"] == "done"                                     # rests: no ask set; sent 19:00:00Z
+    cid = w.exchange.placed()[-1]["client_order_id"]
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    w.exchange._fill(cid)                                                 # fills at 0.71 at the broker ...
+    w.exchange.held[f"{T}:yes"] = 0                                       # ... and settles, all before the next run
+    w.clock.t = NOW
+    w.markets[T] = {**TONIGHT, "settlement_ts": "2026-11-13T19:00:05Z"}   # after the submission, before the fill was read
+    w.exchange.bp = "999.28"                                              # 1000 less 0.71 and the 0.01 fee
+    out = w.run(reconcile_only=True)
+    assert settled(out, w), out
+    assert w.ledger.fills()[0]["time"] == NOW                             # the fill was recorded after the settlement
+
+
+def test_a_settlement_time_not_later_than_the_orders_submission_stops(tmp_path):
+    w = bought_world(tmp_path)                                            # sent at 2026-11-13 14:00 New York (19:00Z)
+    out = vanish(w, {f"{T}:yes": {**WIN, "settlement_ts": "2026-11-13T18:59:59Z"}}, "1001")
+    assert out["status"] == "stopped" and out["stage"] == "reconcile" and "submitted" in out["reason"]
+    assert w.entries("settlement") == [] and w.state().open_pending() == []
+    w.markets[T] = {**WIN, "settlement_ts": "2026-11-13T19:00:01Z"}
+    assert settled(w.run(reconcile_only=True), w)
+
+
+def test_the_time_guard_on_its_own(tmp_path):
+    rec = {**TONIGHT, "settlement_ts": "2026-11-13T19:00:00Z"}
+    sent = pd.Timestamp("2026-11-13T19:00:00Z").timestamp()
+    with pytest.raises(ep.NotSettled, match="submitted"):
+        ep.judge_settlement(rec, T, NOW, after=sent)
+    assert ep.judge_settlement(rec, T, NOW, after=sent - 1) == Decimal("0.00")
+    assert ep.judge_settlement(rec, T, NOW, after=None) == Decimal("0.00")           # a baseline holding: no order
+
+
+# ---- R3: nothing the state knows stays unjournaled
+
+@pytest.mark.parametrize("kind", ["buying_power", "settlement_pending", "settlement", "confirmed"])
+def test_a_failed_journal_write_is_made_good_once_at_the_next_run(tmp_path, monkeypatch, kind):
+    if kind in ("settlement_pending", "confirmed"):
+        w = World(tmp_path, held={})
+        layout_1_file(w.state_path, sends=False)
+        w.clock.t = NOW
+        w.markets[T] = TONIGHT
+    else:
+        w = baseline_world(tmp_path)
+        w.exchange.held[f"{T}:yes"] = 0
+        w.markets[T] = TONIGHT
+    real = Journal.write
+    failed = []
+
+    def failing(self, day, entry):
+        event = "confirmed" if entry.get("witnesses") == "kalshi_record+person" else entry.get("event")
+        if event == kind and not failed:
+            failed.append(entry)
+            raise OSError("disk")
+        return real(self, day, entry)
+    if kind == "confirmed":
+        assert pending(w.run(reconcile_only=True), w)
+        pid = w.entries("settlement_pending")[0]["pending_id"]
+        monkeypatch.setattr(Journal, "write", failing)
+        got = confirm(w, pid)
+        assert got["status"] == "confirmed" and got["journal_error"] and failed    # the row stands; its line failed
+    else:
+        monkeypatch.setattr(Journal, "write", failing)
+        w.run(reconcile_only=True)
+        assert failed
+    monkeypatch.setattr(Journal, "write", real)
+    w.run(reconcile_only=True)
+    w.run(reconcile_only=True)
+    key = {"buying_power": "reading_id", "settlement_pending": "pending_id", "settlement": "settlement_id",
+           "confirmed": "settlement_id"}[kind]
+    event = "settlement" if kind == "confirmed" else kind
+    lines = [e for e in w.entries(event) if e.get(key) == failed[0][key]]
+    assert len(lines) == 1, (kind, lines)
+    if kind == "confirmed":
+        assert lines[0]["witnesses"] == "kalshi_record+person" and lines[0]["confirmed_by"] == "Burton"
+
+
+# ---- R4: the two inner guards, each on its own
+
+def test_the_inner_guards_on_their_own():
+    with pytest.raises(ep.NotSettled, match="not yet applied"):
+        ep._settle_blockers(f"{T}:yes", unapplied={f"{T}:yes"}, busy=set())
+    with pytest.raises(ep.NotSettled, match="open"):
+        ep._settle_blockers(f"{T}:yes", unapplied=set(), busy={f"{T}:yes"})
+    assert ep._settle_blockers(f"{T}:yes", unapplied={"KXB-1:no"}, busy={"KXB-1:no"}) is None
+    fills = [{"symbol": f"{T}:yes", "units": 2.0}, {"symbol": f"{T}:yes", "units": -1.0}, {"symbol": "KXB-1:no", "units": 3.0}]
+    assert ep._program_owned(f"{T}:yes", fills, []) == 1.0
+    assert ep._program_owned(f"{T}:yes", fills, [{"symbol": f"{T}:yes", "program_units": 1.0}]) == 0.0
+    assert ep._program_owned(f"{T}:yes", fills, [{"symbol": "KXB-1:no", "program_units": 3.0}]) == 1.0
+
+
+def test_known_cash_in_cents_on_its_own():
+    f = lambda units, price, fee, pcu=None: {"units": units, "price": price, "fee": fee, "applied": 1,
+                                              "price_covers_units": units if pcu is None else pcu}
+    assert ep.known_cents([f(1.0, 0.71, 0.01), f(-1.0, 0.70, 0.01)], []) == (-3, None)
+    assert ep.known_cents([], [{"units": 2.0, "price": "1.00"}, {"units": 1.0, "price": "0.00"}]) == (200, None)
+    for bad in (f(1.0, None, 0.01), f(1.0, 0.71, None), f(1.0, 0.71, 0.01, pcu=0.5), f(1.0, 0.715, 0.01),
+                f(1.0, 0.71, 0.001), {**f(1.0, 0.71, 0.01), "applied": 0}, f(float("nan"), 0.71, 0.01)):
+        cents, why = ep.known_cents([bad], [])
+        assert cents is None and why, bad
+
+
+# ---- the state file's layout 3, migrated from layout 1 with the baseline and sends untouched
 
 LAYOUT_1 = [                                                    # event_practice.STATE_SCHEMA at b446e50, verbatim
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS baseline (symbol TEXT PRIMARY KEY, units REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
+LAYOUT_2_A640AA9 = [                                            # the layout 2 tables a640aa9 added (never deployed)
+    "CREATE TABLE IF NOT EXISTS settlements (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, units REAL NOT NULL, "
+    "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
+    "time REAL NOT NULL, batch TEXT, journaled INTEGER NOT NULL DEFAULT 0, cash_check TEXT)",
+    "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY, time REAL NOT NULL, batch TEXT, buying_power REAL, "
+    "unread TEXT, book TEXT NOT NULL, fills INTEGER NOT NULL, orders INTEGER NOT NULL, last_settlement INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS holds (id INTEGER PRIMARY KEY, time REAL NOT NULL, settlement_id INTEGER, "
+    "reason TEXT NOT NULL, cleared_by TEXT, cleared_note TEXT, cleared_time REAL)",
+]
 
 
-def layout_1_file(path):
+def layout_1_file(path, sends=True, tables=LAYOUT_1):
     import sqlite3
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, isolation_level=None)
-    for s in LAYOUT_1:
+    for s in tables:
         db.execute(s)
     db.execute("PRAGMA user_version = 1")
     db.execute("INSERT INTO meta VALUES ('baseline_recorded', '1794600000.0')")
     db.execute("INSERT INTO baseline VALUES (?, ?)", (f"{T}:yes", 1.0))
-    db.execute("INSERT INTO sends VALUES ('ep-1-buy', '2026-11-13', 1794600000.5, 'accepted')")
+    if sends:
+        db.execute("INSERT INTO sends VALUES ('ep-1-buy', '2026-11-13', 1794600000.5, 'accepted')")
     db.close()
 
 
@@ -860,24 +1046,50 @@ def dump(path, tables=("meta", "baseline", "sends")):
         db.close()
 
 
-def test_a_layout_1_state_file_migrates_to_layout_2_keeping_baseline_and_sends(tmp_path):
+def test_a_layout_1_state_file_migrates_to_layout_3_keeping_baseline_and_sends(tmp_path):
     import sqlite3
     p = tmp_path / "s.sqlite"
     layout_1_file(p)
     before = dump(p)
     st = ep.PracticeState(p)
-    assert st.baseline() == {f"{T}:yes": 1.0} and st.settlements() == [] and st.open_holds() == []
+    assert st.baseline() == {f"{T}:yes": 1.0} and st.settlements() == [] and st.open_pending() == []
     assert st.win_cash_observed() is False
     st.close()
     assert dump(p) == before
     db = sqlite3.connect(p)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == ep.STATE_LAYOUT == 2
+    assert db.execute("PRAGMA user_version").fetchone()[0] == ep.STATE_LAYOUT == 3
     db.close()
-    ep.PracticeState(p).close()                                                  # opens again as layout 2
+    ep.PracticeState(p).close()                                                  # opens again as layout 3
     assert dump(p) == before
 
 
-@pytest.mark.parametrize("version, extra", [(3, None), (1, "CREATE TABLE odd (x)"), (2, "CREATE TABLE odd (x)"), (0, None)])
+def test_a_layout_1_file_missing_a_table_is_refused_before_anything_changes(tmp_path):
+    p = tmp_path / "s.sqlite"
+    layout_1_file(p, sends=False, tables=LAYOUT_1[:2])                           # no sends table
+    data = p.read_bytes()
+    with pytest.raises(ep.PracticeError):
+        ep.PracticeState(p)
+    assert p.read_bytes() == data
+
+
+def test_a_layout_2_file_of_a640aa9_with_a_hold_is_refused_unchanged(tmp_path):
+    import sqlite3
+    p = tmp_path / "s.sqlite"
+    layout_1_file(p)
+    db = sqlite3.connect(p, isolation_level=None)
+    for s in LAYOUT_2_A640AA9:
+        db.execute(s)
+    db.execute("INSERT INTO holds (time, settlement_id, reason) VALUES (1.0, 1, 'differs')")
+    db.execute("PRAGMA user_version = 2")
+    db.close()
+    data = p.read_bytes()
+    with pytest.raises(ep.PracticeError):
+        ep.PracticeState(p)
+    assert p.read_bytes() == data
+
+
+@pytest.mark.parametrize("version, extra", [(4, None), (1, "CREATE TABLE odd (x)"), (3, "CREATE TABLE odd (x)"), (0, None),
+                                            (3, None)])
 def test_any_other_layout_is_refused(tmp_path, version, extra):
     import sqlite3
     p = tmp_path / "s.sqlite"
