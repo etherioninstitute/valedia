@@ -88,13 +88,14 @@ import os
 import sqlite3
 import stat
 import time
+import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 __all__ = ["LiveVenue", "OrderLedger", "OrderError", "OrdersBlocked", "net_orders", "allocate", "STATES", "TERMINAL",
            "FORWARD", "NOTICE_KINDS", "RECONCILE_NOTICE_KINDS", "ANOMALY_KINDS", "UNRESOLVED_KINDS", "RECHECK_KINDS",
-           "POSITIONS_ERROR_KINDS"]
+           "POSITIONS_ERROR_KINDS", "ORDER_TYPES", "READABLE_LAYOUTS", "open_read_only"]
 
 STATES = ("intended", "sent", "accepted", "partly_filled", "filled", "cancelled", "rejected", "expired", "refused",
           "unknown", "never_arrived")
@@ -228,8 +229,10 @@ def _tol(units: float) -> float:
     return REL_TOL * max(1.0, abs(units))
 
 
-LAYOUT_VERSION = 3                                        # PRAGMA user_version of a file this module writes
-SCHEMA = [
+LAYOUT_VERSION = 4                                        # PRAGMA user_version of a file this module writes
+READABLE_LAYOUTS = (3, 4)                                 # what `open_read_only` reads; a write-open upgrades 3 to 4
+ORDER_TYPES = ("LIMIT", "MARKET")                         # T51 R7: an order's type, fixed when it is intended
+_LAYOUT3_SCHEMA = [
     "CREATE TABLE IF NOT EXISTS orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, "
     "reference_price REAL NOT NULL, limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, created REAL NOT NULL, "
     "sent_at REAL, updated REAL NOT NULL, venue TEXT, venue_order_id TEXT, filled_units REAL NOT NULL DEFAULT 0, "
@@ -265,7 +268,39 @@ SCHEMA = [
     "CREATE TRIGGER IF NOT EXISTS attention_no_delete BEFORE DELETE ON attention "
     "BEGIN SELECT RAISE(ABORT, 'attention items are never deleted'); END",
 ]
+# T51 R7: layout 4 = layout 3 and these, run in that one write transaction whether the file is new or upgraded, so a
+# new file and an upgraded one have the same schema. Every layout-3 row reads as a LIMIT order with no collar price.
+_UPGRADE_3_TO_4 = [
+    "ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'LIMIT' CHECK (order_type IN ('LIMIT', 'MARKET'))",
+    "ALTER TABLE orders ADD COLUMN collar_price REAL CHECK ((order_type = 'LIMIT' AND collar_price IS NULL) OR "
+    "(order_type = 'MARKET' AND collar_price IS NOT NULL AND collar_price > 0 AND limit_price IS NULL "
+    "AND abs(units) < 1))",                                # a CHECK that is NULL passes: hence IS NOT NULL
+    "CREATE TRIGGER orders_type_fixed BEFORE UPDATE OF order_type, collar_price ON orders "
+    "WHEN NEW.order_type IS NOT OLD.order_type OR NEW.collar_price IS NOT OLD.collar_price "
+    "BEGIN SELECT RAISE(ABORT, 'an order''s type and collar price never change'); END",
+]
+SCHEMA = _LAYOUT3_SCHEMA + _UPGRADE_3_TO_4
 SQLITE_INT = (-(2 ** 63), 2 ** 63 - 1)
+
+
+def _master(db: sqlite3.Connection) -> list:
+    return sorted(tuple(r) for r in db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+
+
+def _layout3_master() -> list:
+    """The schema a layout-3 file has, as sqlite records it (built from the layout-3 statements in memory)."""
+    db = sqlite3.connect(":memory:")
+    try:
+        for statement in _LAYOUT3_SCHEMA:
+            db.execute(statement)
+        return _master(db)
+    finally:
+        db.close()
+
+
+def _not_layout3(path) -> OrderError:
+    return OrderError(f"the ledger file {_one_line(path)} says layout 3, but its tables are not the layout 3 this module "
+                      "upgrades; it is not opened, and nothing in it was changed")
 
 
 class OrderLedger:
@@ -276,8 +311,12 @@ class OrderLedger:
     to BUSY_SECONDS for another's write to finish. A write that fails (even at COMMIT) is rolled back and raised
     as OrderError; the object is outside any transaction afterwards and works again once the cause is gone.
 
-    The file carries a layout version (`PRAGMA user_version` = LAYOUT_VERSION). A new file is created at it; a
-    file written with any other layout is refused, never repaired. `not_sent` lists exception classes that
+    The file carries a layout version (`PRAGMA user_version` = LAYOUT_VERSION). A new file is created at it. A file
+    at layout 3 whose schema is exactly layout 3's is upgraded to layout 4 inside the open's own write transaction
+    (T51 R7: `order_type` and `collar_price` added, every existing order a LIMIT order with no collar price), so it is
+    either upgraded completely or left as it was, and of several openers exactly one upgrades it. A file written with
+    any other layout, or at layout 3 with another schema, is refused, never repaired. `open_read_only` reads a file
+    at layout 3 or 4 and never writes it. `not_sent` lists exception classes that
     guarantee nothing was transmitted; any other failure of a submit leaves the order `unknown`. `clock` gives
     the time in seconds.
 
@@ -321,7 +360,13 @@ class OrderLedger:
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
                 ours = self._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
                 anything = self._db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
-                if ours and version != LAYOUT_VERSION:
+                if ours and version == 3:                     # T51 R7: in this transaction, or not at all
+                    if _master(self._db) != _layout3_master():
+                        raise _not_layout3(path)
+                    for statement in _UPGRADE_3_TO_4:
+                        self._db.execute(statement)
+                    self._db.execute(f"PRAGMA user_version = {LAYOUT_VERSION}")
+                elif ours and version != LAYOUT_VERSION:
                     raise OrderError(f"the ledger file {path} was written by a different version of this module "
                                      f"(layout {version}, this module writes layout {LAYOUT_VERSION}); it is not opened")
                 if not ours and (anything or version != 0):   # only a new or empty database becomes a ledger
@@ -435,6 +480,8 @@ class OrderLedger:
     def _record(row: sqlite3.Row) -> dict:
         rec = dict(row)
         rec["parts"] = json.loads(rec["parts"]) if rec["parts"] is not None else None
+        rec.setdefault("order_type", "LIMIT")             # a layout-3 file read by `open_read_only`
+        rec.setdefault("collar_price", None)
         return rec
 
     def order(self, tag: str) -> dict | None:
@@ -673,8 +720,13 @@ class OrderLedger:
         return True
 
     def intend(self, tag: str, symbol: str, units: float, reference_price: float, limit_price: float | None = None,
-               batch: str | None = None, parts: list | None = None) -> dict:
-        """Record an order in `intended`. The same tag again returns the record when every field matches, else raises."""
+               batch: str | None = None, parts: list | None = None, *, order_type: str = "LIMIT",
+               collar_price: float | None = None) -> dict:
+        """Record an order in `intended`. The same tag again returns the record when every field matches, else raises.
+
+        T51 R7: `order_type` is LIMIT (the default; no collar price) or MARKET (under one unit in size, no limit price,
+        and a `collar_price`, a finite number above zero: the worst price it may fill at). Anything else is refused
+        and nothing is written."""
         if not isinstance(tag, str) or not tag or not _utf8(tag):
             raise OrderError(f"an order needs a tag that is text encodable as UTF-8, not {_safe_repr(tag)}")
         if not isinstance(symbol, str) or not symbol or not _utf8(symbol):
@@ -687,24 +739,39 @@ class OrderLedger:
             raise OrderError(f"the reference price must be a finite number above zero, not {_safe_repr(reference_price)}")
         if limit_price is not None and (not _finite(limit_price) or limit_price <= 0):
             raise OrderError(f"a limit price must be a finite number above zero, not {_safe_repr(limit_price)}")
+        if type(order_type) is not str or order_type not in ORDER_TYPES:
+            raise OrderError(f"an order's order_type must be one of {', '.join(ORDER_TYPES)}, not {_safe_repr(order_type)}")
+        if collar_price is not None and (not _finite(collar_price) or collar_price <= 0):
+            raise OrderError(f"a collar price must be a finite number above zero, not {_safe_repr(collar_price)}")
+        if order_type == "LIMIT" and collar_price is not None:
+            raise OrderError("a LIMIT order carries no collar price: its limit is its bound")
+        if order_type == "MARKET":
+            if collar_price is None:
+                raise OrderError("a MARKET order needs a collar price: the worst price it may fill at")
+            if limit_price is not None:
+                raise OrderError("a MARKET order carries no limit price (a venue would send it as a LIMIT order)")
+            if abs(units) >= 1:
+                raise OrderError(f"a MARKET order must be under one unit in size, not {_safe_repr(units)}")
         try:
             parts_json = json.dumps(parts) if parts is not None else None
         except (TypeError, ValueError) as exc:
             raise OrderError(f"the parts cannot be stored: {_describe(exc)}") from exc
         units, reference_price = float(units), float(reference_price)
         limit_price = float(limit_price) if limit_price is not None else None
+        collar_price = float(collar_price) if collar_price is not None else None
         with self._write():
             existing = self.order(tag)
             if existing is None:
                 now = self.clock()
                 self._db.execute("INSERT INTO orders (tag, symbol, units, reference_price, limit_price, batch, parts, state, "
-                                 "created, updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                 (tag, symbol, units, reference_price, limit_price, batch, parts_json, "intended", now, now))
+                                 "created, updated, order_type, collar_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                 (tag, symbol, units, reference_price, limit_price, batch, parts_json, "intended", now, now,
+                                  order_type, collar_price))
                 self._db.execute("INSERT INTO events (tag, time, from_state, to_state, note) VALUES (?,?,?,?,?)",
                                  (tag, now, None, "intended", None))
         if existing is not None:
             mine = {"symbol": symbol, "units": units, "reference_price": reference_price, "limit_price": limit_price,
-                    "batch": batch}
+                    "batch": batch, "order_type": order_type, "collar_price": collar_price}
             differ = [k for k, v in mine.items() if existing[k] != v]
             if not _same_parts(existing["parts"], parts):
                 differ.append("parts")
@@ -1170,6 +1237,45 @@ class OrderLedger:
             self._notice_negative_fee(tag, fields["fee"])
         if new != state or wanted:
             out["updated"].append({"tag": tag, "from": state, "to": new})
+
+
+def open_read_only(path: str | Path, clock: Callable[[], float] = time.time) -> OrderLedger:
+    """T51 R7: an existing ledger file at layout 3 or 4 (READABLE_LAYOUTS) on a read-only connection (`mode=ro` and
+    `query_only`), read by the ledger's own methods. It never writes, upgrades or rolls back the file: a layout-3
+    file stays layout 3 and its orders read as LIMIT orders with no collar price. Every write through it raises
+    OrderError. Refused in words, like an open for writing: a path that is a symbolic link, a file group or others
+    may write, no file at the path, a database that is not an order ledger, another layout, and a file at layout 3
+    whose schema is not layout 3's."""
+    probe = object.__new__(OrderLedger)
+    probe._path = str(path)
+    probe._check_file(True)                                   # raises before anything is opened
+    where = _one_line(path)
+    try:
+        db = sqlite3.connect("file:" + urllib.parse.quote(str(Path(path).resolve())) + "?mode=ro", uri=True,
+                             timeout=BUSY_SECONDS, isolation_level=None)
+    except (OSError, sqlite3.Error) as exc:
+        raise OrderError(f"the order ledger {where} could not be opened to read: {_describe(exc)}") from exc
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only = ON")
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        ours = db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
+        if not ours:
+            raise OrderError(f"the file {where} is not an order ledger (it has no orders table); it is not opened")
+        if version not in READABLE_LAYOUTS:
+            raise OrderError(f"the ledger file {where} has layout {version}, and this module reads layouts "
+                             f"{' and '.join(map(str, READABLE_LAYOUTS))} only; it is not opened")
+        if version == 3 and _master(db) != _layout3_master():
+            raise _not_layout3(path)
+    except sqlite3.Error as exc:
+        db.close()
+        raise OrderError(f"the order ledger {where} could not be read: {_describe(exc)}") from exc
+    except BaseException:
+        db.close()
+        raise
+    led = object.__new__(OrderLedger)
+    led.not_sent, led.clock, led._path, led._db = (), clock, str(path), db
+    return led
 
 
 def _rounding_explains(avg: float, total: float, p_avg: float | None, p_units: float) -> bool:

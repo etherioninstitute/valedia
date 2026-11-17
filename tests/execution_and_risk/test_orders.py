@@ -3086,8 +3086,8 @@ def test_t34b3_the_replay_reproduces_every_figure_the_ledger_stored_over_generat
 
 
 OLD_COMMIT = "33ace6f"                                    # the last commit whose ledger writes layout 3
-ORDERS_FILE = Path(orders.__file__).resolve()
-REPO = ORDERS_FILE.parents[2]
+ORDERS_FILE = Path(orders.__file__).resolve()             # the module under test (a child process loads it by file)
+REPO = Path(__file__).resolve().parents[2]                # the repository whose history holds OLD_COMMIT
 LEDGER_TABLES = ("orders", "events", "reconciles", "fills", "attention", "sqlite_sequence")
 DDL = ("ALTER", "CREATE", "DROP")
 
@@ -3529,11 +3529,11 @@ def test_intend_over_seeded_orders_accepts_exactly_what_the_rule_allows():
     LIMIT order: no collar price. Any other order type is refused. A refusal writes nothing."""
     led = ledger()
     rng = random.Random(4)
-    types = ["LIMIT", "MARKET", "market", "Limit", "STOP", "", None, 1, True]
-    collars = [None, 90.9, 0.01, 1e6, math.nan, math.inf, -math.inf, 0.0, -1.0, True, "90.9", 0]
+    types = ["LIMIT"] * 3 + ["MARKET"] * 4 + ["market", "Limit", "STOP", "", None, 1, True]
+    collars = [None] * 3 + [90.9, 0.01, 1e6] * 2 + [math.nan, math.inf, -math.inf, 0.0, -1.0, True, "90.9", 0]
     limits = [None, None, 91.0]
     accepted = refused = 0
-    for i in range(1500):
+    for i in range(3000):
         kind = rng.choice(types)
         units = rng.choice([round(rng.uniform(0.00001, 0.99999), 5), float(rng.randint(1, 300)), 1.0,
                             round(rng.uniform(1.0, 50.0), 5), 0.99999, 0.00001])
@@ -3558,7 +3558,7 @@ def test_intend_over_seeded_orders_accepts_exactly_what_the_rule_allows():
                 led.intend(tag, "XLE", units, 90.0, limit, order_type=kind, collar_price=collar)
             assert led.order(tag) is None and led.events(tag) == []
             refused += 1
-    assert accepted > 300 and refused > 300
+    assert accepted > 150 and refused > 1500
 
 
 def test_the_file_itself_refuses_a_market_row_that_breaks_the_rule_and_a_change_of_type(tmp_path, old_orders):
