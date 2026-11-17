@@ -8090,6 +8090,7 @@ def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch, venue=None, before
                 wb = _copy.copy(w)
                 wb.tmp, wb.journal = copy_dir, Journal(copy_dir / "journal")
                 wb.ledger_path = copy_dir / w.ledger_path.relative_to(w.tmp)
+                _t51_ledger_for_base(wb.ledger_path, base_mod)            # T51: its own file, in its own layout
                 wb.state_path = copy_dir / Path(w.state_path).relative_to(w.tmp)
                 wb.limits, wb.latch = copy_dir / "config" / "risk.json", copy_dir / w.latch.relative_to(w.tmp)
                 wb.venue, wb.second = _copy.deepcopy(w.venue), _copy.deepcopy(w.second)
@@ -8746,6 +8747,58 @@ def t34b3_base(tmp_path_factory):
     return base
 
 
+def _t51_layout3_view(dump):
+    """T51 A1 (addendum 3, ruling 1): a layout-4 ledger dump seen through the layout-3 columns, after asserting that it
+    IS layout 4 and that every order is a LIMIT order with no collar price: the orders rows without `order_type` and
+    `collar_price`, the orders table's schema text without those two columns, no `orders_type_fixed` trigger, and
+    the layout number 3. Everything else as it is. None stays None."""
+    if dump is None:
+        return None
+    assert dump["version"] == 4, dump["version"]
+    rows = dict(dump["rows"])
+    assert all(tuple(r[-2:]) == ("LIMIT", None) for r in rows["orders"]), rows["orders"]
+    rows["orders"] = [tuple(r[:-2]) for r in rows["orders"]]
+    added = [st.split(" ADD COLUMN ", 1)[1] for st in _orders._UPGRADE_3_TO_4 if st.startswith("ALTER TABLE orders ADD")]
+    assert len(added) == 2
+    schema = []
+    for sql in dump["schema"]:
+        if sql.startswith("CREATE TRIGGER orders_type_fixed "):
+            continue
+        if sql.startswith("CREATE TABLE orders "):
+            for col in added:
+                assert sql.count(", " + col) == 1, sql
+                sql = sql.replace(", " + col, "")
+        schema.append(sql)
+    assert len(schema) == len(dump["schema"]) - 1
+    return {**dump, "version": 3, "schema": sorted(schema), "rows": rows}
+
+
+def _t51_ledger_for_base(path, base_mod):
+    """T51 A1 (addendum 3, ruling 1): when the base's own ledger module writes layout 3 and the copied world holds a
+    layout-4 file, the base gets a ledger file of its own: made by the base's ledger module (layout 3), holding the
+    same rows seen through the layout-3 columns (checked equal to them), in place of the copy. A base whose ledger
+    module is this revision's is left alone."""
+    base_orders = sys.modules[base_mod.OrderLedger.__module__]
+    if base_orders.LAYOUT_VERSION == _orders.LAYOUT_VERSION or not Path(path).exists():
+        return
+    assert base_orders.LAYOUT_VERSION == 3
+    view = _t51_layout3_view(_dump(path))
+    own = Path(str(path) + ".base-layout3")
+    base_orders.OrderLedger(own).close()
+    con = sqlite3.connect(own)
+    try:
+        for table, rows in view["rows"].items():
+            if rows and table != "sqlite_sequence":
+                con.executemany(f"INSERT INTO {table} VALUES ({','.join('?' * len(rows[0]))})", rows)
+        con.execute("DELETE FROM sqlite_sequence")
+        con.executemany("INSERT INTO sqlite_sequence VALUES (?, ?)", view["rows"].get("sqlite_sequence", []))
+        con.commit()
+    finally:
+        con.close()
+    assert _dump(own) == view                                     # the base's own file holds exactly the same rows
+    _os.replace(own, path)
+
+
 def test_t51_the_base_refuses_a_layout4_ledger_in_words_and_changes_nothing(tmp_path, t34b3_base):
     """Ruling D: ed4d96f's order step, handed a ledger this revision wrote (layout 4), refuses it in words, so a
     roll-back never misreads a ledger; the file is left as it was. (The comparisons above give the base its own.)"""
@@ -8796,7 +8849,7 @@ def test_t34b3_practice_runs_equal_the_bases_but_for_the_allowed_differences(tmp
         for i, (b, m) in enumerate(zip(base, mine)):
             last, seen = i == len(mine) - 1, {}             # lines and ledger rows counted once, at the scenario's end
             b, m = dict(b), dict(m)
-            b["ledger"], m["ledger"] = _t34b3_ledger(b["ledger"]), _t34b3_ledger(m["ledger"], seen)
+            b["ledger"], m["ledger"] = _t34b3_ledger(b["ledger"]), _t34b3_ledger(_t51_layout3_view(m["ledger"]), seen)
             added = _t34_same_but(b, m, (), (seed, i), counts=seen)
             assert added == {}, ((seed, i), added)
             for kind, n in seen.items():
