@@ -70,6 +70,16 @@ class BacktestResult:
         return (1.0 + self.net).cumprod()
 
 
+def booked_returns(px: np.ndarray) -> np.ndarray:
+    """The return the engine books for each symbol on each bar: on a priced bar with a priced bar before it, the
+    move since the last priced bar; 0 on an unpriced bar and on a symbol's first priced bar."""
+    tradable = np.isfinite(px) & (px > 0)
+    last = pd.DataFrame(np.where(tradable, px, np.nan)).ffill().shift(1).to_numpy(dtype=float)
+    booked = tradable & np.isfinite(last)                                    # priced, with a priced bar before
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(booked, px / last - 1.0, 0.0)                        # move since the last priced bar
+
+
 def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: CostModel,
                  dollar_volume: pd.DataFrame | None = None, capital: float = 1_000_000.0, execution_lag: int = 1,
                  vol_window: int = 20, periods_per_year: float = 252.0) -> BacktestResult:
@@ -95,10 +105,7 @@ def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: Cost
     step = np.zeros_like(px)                                                 # bar-to-bar move: the impact
     step[1:] = px[1:] / px[:-1] - 1.0                                        # model's volatility input, as before
     step[~np.isfinite(step)] = 0.0
-    last = pd.DataFrame(np.where(tradable, px, np.nan)).ffill().shift(1).to_numpy(dtype=float)
-    booked = tradable & np.isfinite(last)                                    # priced, with a priced bar before
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ret = np.where(booked, px / last - 1.0, 0.0)                         # move since the last priced bar
+    ret = booked_returns(px)                                                 # move since the last priced bar
     decided = decided_weights.to_numpy(dtype=float)
     decided = np.where(np.isfinite(decided), decided, 0.0)
     held = np.zeros_like(decided)                                            # target; becomes the weight in effect
