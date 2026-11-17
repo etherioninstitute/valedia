@@ -189,7 +189,8 @@ class Gateway:
         self.dispatch = dispatch or self._http
         self.state = {"schema": 1, "chat_attempts": 0, "reserved_output": 0,
                       "embedding_attempts": 0, "embedding_texts": 0,
-                      "embedding_bytes": 0, "calls": [], "cancelled": False}
+                      "embedding_bytes": 0, "calls": [], "cancelled": False,
+                      "refusals": [], "refusal_count": 0}  # TMF5: every HTTP request answered with a refusal
         if self.path.exists():
             raise NativeRefused("fresh gateway ledger required; no budget reset/replay")
         atomic(self.path, self.state)
@@ -205,6 +206,16 @@ class Gateway:
                 connection.close()
         with self.lock:
             self.state["cancelled"] = True; atomic(self.path, self.state)
+
+    def record_refusal(self, route, exc):
+        """TMF5: a refused HTTP request is recorded durably (route, exception type and reason, never a body), whether it was
+        refused before or after its reservation, so the run can fail on it instead of the producer degrading silently."""
+        with self.lock:
+            self.state["refusal_count"] += 1
+            if len(self.state["refusals"]) < 256:
+                reason = str(exc).replace(self.secret, "[REDACTED_LOCAL_AUTH]")[:512]
+                self.state["refusals"].append({"route": str(route)[:64], "failure": type(exc).__name__, "reason": reason})
+            atomic(self.path, self.state)
 
     def remaining(self, end):
         value = min(end, self.active_deadline) - self.clock()
@@ -246,7 +257,7 @@ class Gateway:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw); stream.flush(); os.fsync(stream.fileno())
 
-    def handle(self, route, body, authorization, *, disconnected=lambda: False, arrived=None, deadline=None):
+    def handle(self, route, body, authorization, *, disconnected=lambda: False, arrived=None, deadline=None, query_cut_from=None):
         if not hmac.compare_digest(authorization or "", "Bearer " + self.secret):
             raise NativeRefused("local authentication refused")
         if route == "/v1/chat/completions":
@@ -255,6 +266,10 @@ class Gateway:
             body, texts, byte_count = validate_embedding(body, self.limits); kind = "embedding"
         else:
             raise NativeRefused("route refused")
+        # TMF5 (c): the producer cut one search query to the text limit; the original size is recorded on the call.
+        if query_cut_from is not None and not (kind == "embedding" and texts == 1 and type(query_cut_from) is int
+                                               and query_cut_from > self.limits.embedding_text_bytes):
+            raise NativeRefused("query cut record malformed")
         end = min(self.active_deadline, (self.clock() if arrived is None else arrived) + self.limits.client_seconds, deadline if deadline is not None else float("inf"))
         self.remaining(end)
         if disconnected():
@@ -262,6 +277,8 @@ class Gateway:
         call = self._reserve(kind, body, texts, byte_count)
         locked = False;stage='request_capture'
         try:
+            if query_cut_from is not None:
+                self._save(call, query_truncated_from_bytes=query_cut_from)
             captured=encoded(body).replace(self.secret.encode(),b'[REDACTED_LOCAL_AUTH]')
             self._capture(call, "request.json", captured)
             self._save(call,request_capture_sha256=hashlib.sha256(captured).hexdigest(),request_capture_redacted=captured!=encoded(body))
@@ -447,9 +464,17 @@ def make_server(gateway, port=0):
                 def disconnected():
                     readable, _, _ = select.select([self.connection], [], [], 0)
                     return bool(readable) and self.connection.recv(1, 2) == b""
-                result = gateway.handle(self.path, decode(raw), self.headers.get("Authorization"), disconnected=disconnected, arrived=arrived)
+                cut = self.headers.get("X-Native-Query-Cut-From")
+                if cut is not None and not (cut.isascii() and cut.isdigit() and len(cut) <= 9):
+                    raise NativeRefused("query cut record malformed")
+                result = gateway.handle(self.path, decode(raw), self.headers.get("Authorization"), disconnected=disconnected, arrived=arrived,
+                                        query_cut_from=None if cut is None else int(cut))
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(result))); self.end_headers(); self.wfile.write(result)
-            except Exception:
+            except Exception as exc:
+                try:
+                    gateway.record_refusal(self.path, exc)
+                except Exception:
+                    gateway.cancelled.set()  # a refusal that cannot be recorded freezes the gateway
                 try:
                     result = b'{"error":"owned native gateway refused"}'
                     self.send_response(409); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(result))); self.end_headers(); self.wfile.write(result)

@@ -7,9 +7,12 @@ candidate. Importing this file never imports MiroFish or starts services.
 from __future__ import annotations
 import argparse
 import ast
+import collections
 import hashlib
+import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -143,6 +146,57 @@ def worker_policy(producer, entry_root, proxy_port, graph_port):
     return "\n".join(lines) + "\n"
 
 
+def native_query_cut(text, limit):
+    """TMF5 (c): a search query longer than the gateway's text limit is cut to it at a character boundary (never mid
+    character). Returns the text sent and the original size in bytes when it was cut, else None."""
+    raw = text.encode('utf-8')
+    if len(raw) <= limit:
+        return text, None
+    return raw[:limit].decode('utf-8', 'ignore'), len(raw)
+
+
+NATIVE_GUARD = "__import__('os').environ.get('MIROFISH_TEST_ISOLATED') == '1' and __import__('os').environ.get('MIROFISH_TEST_ROUTE') == 'native-local'"
+
+
+def tmf5_producer_patches():
+    """TMF5 transport patches, applied after the reviewed ones, each to exactly one occurrence, each active only in the
+    isolated native route. (a) No silent fall-back to default or rule-based settings: the four sites re-raise. (c) The
+    single-text embedding (only search queries use it) is cut to the gateway's text limit, the cut travels to the gateway
+    on the call, and a refused graph search raises instead of degrading to local search."""
+    from mirofish_native_gateway import Limits
+    limit = Limits.__dataclass_fields__['embedding_text_bytes'].default
+    cut = inspect.getsource(native_query_cut).replace('def native_query_cut(', 'def _native_query_cut(', 1)
+    def reraise(indent, warning, why, source='e'):
+        return (warning, indent + 'if ' + NATIVE_GUARD + ':\n' + indent + '    raise RuntimeError(' + repr('native-local: ' + why) + ') from ' + source + '\n' + warning)
+    rows = []
+    for warning, why in [('            logger.warning(f"Time config LLM generation failed: {e}, using default configuration")', 'time configuration refused; no default configuration'),
+                         ('            logger.warning(f"Event config LLM generation failed: {e}, using default configuration")', 'event configuration refused; no default configuration'),
+                         ('            logger.warning(f"Agent config batch LLM generation failed: {e}, using rule-based generation")', 'agent configuration refused; no rule-based configuration')]:
+        rows.append(('app/services/simulation_config_generator.py',) + reraise('            ', warning, why))
+    rows.append(('app/services/oasis_profile_generator.py',) + reraise('        ', '        logger.warning(f"LLM persona generation failed ({max_attempts} attempts): {last_error}, using rule-based generation")', 'persona generation refused; no rule-based persona', 'last_error'))
+    rows += [
+        ('app/storage/embedding_service.py', 'def embedding_api_kind(', cut + '\n\ndef embedding_api_kind('),
+        ('app/storage/embedding_service.py', "        text = text.strip()\n\n        if text in self._cache:\n            return self._cache[text]\n\n        vector = self._request_embeddings([text])[0]",
+         "        text = text.strip()\n        native_cut_from = None\n        if " + NATIVE_GUARD + ":\n            text, native_cut_from = _native_query_cut(text, " + str(limit) + ")\n\n        if text in self._cache:\n            return self._cache[text]\n\n        vector = self._request_embeddings([text], native_cut_from=native_cut_from)[0]"),
+        ('app/storage/embedding_service.py', '    def _request_embeddings(self, texts: List[str]) -> List[List[float]]:', '    def _request_embeddings(self, texts: List[str], native_cut_from=None) -> List[List[float]]:'),
+        ('app/storage/embedding_service.py', "headers={'Authorization': 'Bearer ' + Config.LLM_API_KEY} if os.environ.get('MIROFISH_TEST_ISOLATED') == '1' else {},",
+         "headers=dict({'Authorization': 'Bearer ' + Config.LLM_API_KEY}, **({'X-Native-Query-Cut-From': str(native_cut_from)} if native_cut_from else {})) if os.environ.get('MIROFISH_TEST_ISOLATED') == '1' else {},"),
+        ('app/services/graph_tools.py', '            logger.warning(f"Graph search failed, degrading to local search: {str(e)}")',
+         '            if ' + NATIVE_GUARD + ':\n                raise\n            logger.warning(f"Graph search failed, degrading to local search: {str(e)}")'),
+    ]
+    return rows
+
+
+def require_clean_gateway(gateway, phase):
+    """TMF5: after preparation, the simulation and the report, any refused request, incomplete call or cancellation fails
+    the run (a producer that carried on past a refusal has built on something the run did not serve)."""
+    with gateway.lock:
+        cancelled = gateway.cancelled.is_set(); refused = gateway.state.get('refusal_count', 0)
+        incomplete = [row.get('id') for row in gateway.state['calls'] if row.get('state') != 'complete']
+    require(not cancelled and not refused and not incomplete,
+            'gateway refused or cancelled a call during %s: %d refused, %d incomplete%s' % (phase, refused, len(incomplete), ', cancelled' if cancelled else ''))
+
+
 def copy_sources(work):
     work = Path(work)
     parent = owned(work / "owned-source", work)
@@ -184,6 +238,8 @@ def copy_sources(work):
     patch('scripts/run_parallel_simulation.py', '\nasync def main():', "\nif os.environ.get('MIROFISH_TEST_ISOLATED') == '1' and os.environ.get('MIROFISH_TEST_ROUTE') == 'native-local':\n    from owned_oasis_db import wrap_platforms as _owned_wrap_platforms\n    run_twitter_simulation, run_reddit_simulation = _owned_wrap_platforms(\n        run_twitter_simulation, run_reddit_simulation,\n        os.path.join(os.environ['MIROFISH_TEST_ROOT'], 'backend', 'uploads', 'simulations'))\n\n\nasync def main():")
     patch('app/config.py', "    PREP_LLM_MAX_TOKENS = int(os.environ.get('MIROFISH_PREP_LLM_MAX_TOKENS', '2000'))", "    PREP_LLM_MAX_TOKENS = int(os.environ.get('MIROFISH_PREP_LLM_MAX_TOKENS', '2000'))\n    if os.environ.get('MIROFISH_TEST_ISOLATED') == '1' and os.environ.get('MIROFISH_TEST_ROUTE') == 'native-local':\n        from .owned_caller_budget import CALLER_OUTPUT_LIMIT as NATIVE_CHAT_OUTPUT_LIMIT, choose_output_limit as _task_output_limit\n        PREP_LLM_MAX_TOKENS = _task_output_limit(PREP_LLM_MAX_TOKENS)")
     patch('app/utils/llm_client.py', '        kwargs = {\n', "        if os.environ.get('MIROFISH_TEST_ISOLATED') == '1' and os.environ.get('MIROFISH_TEST_ROUTE') == 'native-local':\n            from ..owned_caller_budget import choose_output_limit\n            max_tokens = choose_output_limit(max_tokens)\n            if max_tokens > Config.NATIVE_CHAT_OUTPUT_LIMIT:\n                raise ValueError('task caller output policy drift')\n        kwargs = {\n")
+    for relative, old, new in tmf5_producer_patches():
+        patch(relative, old, new)
     for row in rows:
         target = Path(row["target"]); row["copied_sha256"] = digest(target); target.chmod(0o444)
     control = parent / "worker-entry"
@@ -374,14 +430,80 @@ def verify_launch(work, gate, candidate_digest, run_id=None):
 
 
 
+# TMF5 addendum 1 (d): the start check is one reading; the running phase stops only on what endangers the machine.
+START_FREE_PERCENT=65         # the start check (one reading); staging sets it from the start table in tools/mirofish_swarm_limits.py
+STOP_FREE_PERCENT=30          # (iii): the reviewed floor's number, now held on every sample for SUSTAIN_SECONDS
+SUSTAIN_SECONDS=10.0
+READING_GAP_SECONDS=3.0       # (iv): no fresh, valid reading for this long fails closed
+OWNED_RSS_BOUND=40*1024**3    # the conservative owned resident-memory bound, unchanged (the co-resident is outside it)
+PRESSURE_LEVELS=(1,2,4)       # kern.memorystatus_vm_pressure_level: normal, warning, critical; anything else is not a reading
+TWO_CO_RESIDENTS="two processes serve the co-resident's file"
+
+
+def valid_reading(sample):
+    """A reading the rule may use: an integer free percentage 0..100 and a pressure level of exactly 1, 2 or 4 (a bool, a
+    string, None, NaN, a negative number or 3 is not valid, never 'normal'), with a finite sample time."""
+    if type(sample) is not dict:return False
+    free,level,stamp=sample.get('free_percent'),sample.get('pressure_level'),sample.get('monotonic')
+    return type(free) is int and 0<=free<=100 and type(level) is int and level in PRESSURE_LEVELS and type(stamp) in (int,float) and math.isfinite(stamp)
+
+
+class ResourceRule:
+    """Stop when ANY holds: (i) pressure level 4 on any sample; (ii) level 2 or more on every sample for 10 s; (iii) free
+    below 30 on every sample for 10 s; (iv) no fresh valid reading for 3 s. Also, on any sample, two processes serving the
+    co-resident's file, or the owned resident memory over its bound. Times are the samples' own host monotonic stamps."""
+    def __init__(self,started):
+        self.last_valid=started;self.sequence=None;self.first=None;self.low_since=None;self.warn_since=None
+        self.window=collections.deque();self.lowest_sustained=None;self.max_level=None;self.co_max=0
+    def observe(self,sample):
+        if not valid_reading(sample):return None   # not a reading: only (iv) can follow from it
+        stamp=float(sample['monotonic']);self.last_valid=max(self.last_valid,stamp)
+        if sample.get('sequence') is not None and sample.get('sequence')==self.sequence:return None   # the same capsule read again
+        self.sequence=sample.get('sequence');free,level=sample['free_percent'],sample['pressure_level']
+        self.max_level=level if self.max_level is None else max(self.max_level,level)
+        co_bytes=sample.get('co_resident_rss_bytes',0);self.co_max=max(self.co_max,co_bytes if type(co_bytes) is int else 0)
+        self.first=stamp if self.first is None else self.first;self.window.append((stamp,free))
+        while self.window[0][0]<stamp-SUSTAIN_SECONDS:self.window.popleft()
+        if stamp-self.first>=SUSTAIN_SECONDS:
+            high=max(value for _,value in self.window)
+            self.lowest_sustained=high if self.lowest_sustained is None else min(self.lowest_sustained,high)
+        self.warn_since=(stamp if self.warn_since is None else self.warn_since) if level>=2 else None
+        self.low_since=(stamp if self.low_since is None else self.low_since) if free<STOP_FREE_PERCENT else None
+        if level==4:return 'kernel memory pressure critical (level 4)'
+        if self.warn_since is not None and stamp-self.warn_since>=SUSTAIN_SECONDS:return 'kernel memory pressure warning or worse for 10 s'
+        if self.low_since is not None and stamp-self.low_since>=SUSTAIN_SECONDS:return 'memory free below %d for 10 s'%STOP_FREE_PERCENT
+        if type(sample.get('co_resident_rows')) is int and sample['co_resident_rows']>=2:return TWO_CO_RESIDENTS
+        if type(sample.get('owned_scope_rss_bytes')) is int and sample['owned_scope_rss_bytes']>OWNED_RSS_BOUND:return 'conservative owned-model RSS upper bound exceeded'
+        return None
+    def gap(self,now):
+        return 'no fresh valid resource reading for 3 s' if now-self.last_valid>READING_GAP_SECONDS else None
+    def summary(self):
+        return {'lowest_sustained_free_percent_10s':self.lowest_sustained,'max_pressure_level':self.max_level,'co_resident_rss_bytes_max':self.co_max}
+
+
 def resource_sample(pre=False):
+    """One validated reading. pre: the start check (a single reading against START_FREE_PERCENT). Otherwise only the facts
+    that hold on any single sample (owned memory bound, two co-resident processes); the sustained rule is ResourceRule's."""
     from mirofish_native_startup import resource_from_capsule
     sample=resource_from_capsule()
-    reason='memory free threshold' if sample['free_percent'] < (65 if pre else 30) else ('conservative owned-model RSS upper bound exceeded' if not pre and sample['owned_scope_rss_bytes']>40*1024**3 else None)
+    if pre:reason='resource reading not valid' if not valid_reading(sample) else ('memory free threshold' if sample['free_percent']<START_FREE_PERCENT else (TWO_CO_RESIDENTS if sample['co_resident_rows']>=2 else None))
+    else:reason='conservative owned-model RSS upper bound exceeded' if sample['owned_scope_rss_bytes']>OWNED_RSS_BOUND else (TWO_CO_RESIDENTS if sample['co_resident_rows']>=2 else None)
     if reason:
         failure=NativeRefused(reason);failure.resource_sample=sample
         raise failure
-    return {**sample,'rss_proof':'Original privileged host fixed-field process baseline; includes all Bionic/listener family and every new PID/start, retaining reparented identities. Only stable baseline unrelated identities excluded. Full-host RSS diagnostic retained; signed capsule<=3s.'}
+    return {**sample,'rss_proof':'Original privileged host fixed-field process baseline; includes all Bionic/listener family and every new PID/start, retaining reparented identities, except the declared co-resident\'s process, recorded beside the figure. Only stable baseline unrelated identities excluded. Full-host RSS diagnostic retained; signed capsule<=3s.'}
+
+
+def observe_resource(rule,lock,now=None):
+    """Feed the freshest capsule to the rule. A capsule that cannot be read or validated is no reading (rule iv decides)."""
+    from mirofish_native_startup import resource_from_capsule
+    try:sample=resource_from_capsule()
+    except Exception:sample=None
+    with lock:reason=rule.observe(sample) or rule.gap(time.monotonic() if now is None else now)
+    if reason:
+        failure=NativeRefused(reason);failure.resource_sample=sample
+        raise failure
+    return sample
 
 
 def record_resource_failure(receipt,path,exc):
@@ -390,8 +512,8 @@ def record_resource_failure(receipt,path,exc):
         receipt.setdefault('resource_failure_samples',[]).append({'reason':str(exc),'sample':sample})
         atomic(path,receipt)  # Exact validated bad measurement is durable before cancellation.
 
-def monitor_resource_once(receipt,path,aborted,gateway,errors):
-    try:resource_sample(False)
+def monitor_resource_once(receipt,path,aborted,gateway,errors,rule,lock):
+    try:observe_resource(rule,lock)
     except BaseException as exc:
         errors.append(type(exc).__name__+':'+str(exc))
         try:record_resource_failure(receipt,path,exc)
@@ -713,14 +835,17 @@ def execute(work,gate):
     sdk=worker=graph_group=server=gateway=None;server_thread=None;model_intent=False;loaded=baseline=None;secret=None
     model_state={'profile':plan['setup'] if plan is not None else None,'loaded':None}  # a plan's checkpoint behind the identifier
     aborted=threading.Event();stop_monitor=threading.Event();errors=[]
+    rule=ResourceRule(time.monotonic());rule_lock=threading.Lock()  # TMF5 (d): the running phase's stop rule
     def save(event,**data):
+        with rule_lock:receipt['resource']=rule.summary()
         receipt['events'].append({'event':event,'utc':datetime.now(timezone.utc).isoformat(),**data});atomic(work/'builder/native-run-receipt.json',receipt)
     def resource(pre=False):
         require(not aborted.is_set(),'resource monitor aborted')
-        return resource_sample(pre)
+        return resource_sample(True) if pre else observe_resource(rule,rule_lock)
     def monitor():
-        while not stop_monitor.wait(1):
-            if not monitor_resource_once(receipt,work/'builder/native-run-receipt.json',aborted,gateway,errors):return
+        # Every sample the host publishes (0.4 s) is seen: the capsule is read five times a second, repeats skipped by sequence.
+        while not stop_monitor.wait(.2):
+            if not monitor_resource_once(receipt,work/'builder/native-run-receipt.json',aborted,gateway,errors,rule,rule_lock):return
     def remaining():
         require(not aborted.is_set() and time.monotonic()<active,'active whole-task deadline/resource refusal')
         return active
@@ -779,16 +904,16 @@ def execute(work,gate):
         graph_proof=worker.request('graph_gate',gate_end,{'embedding':embedding,'deadline':gate_end})
         require(graph_proof.get('qualified') is True and graph_proof.get('producer_root')==str(producer) and graph_proof.get('owned_instance')==identifier,'native graph prerequisite identity mismatch')
         save('graph_prerequisite_qualified',schema=graph_proof,embedding={'model':'ym-research-embedding','dimension':768,'cardinality':1,'call_id':embedding_call['id'],'response_sha256':hashlib.sha256(embedding_raw).hexdigest(),'context':embedding_call.get('context'),'budget_charged':True},producer_root=str(producer),run_id=run_id)
-        prepared=worker.request('prepare',remaining());save('native_prepared',data=prepared)
+        prepared=worker.request('prepare',remaining());require_clean_gateway(gateway,'preparation');save('native_prepared',data=prepared)
         boundary('B1','turns')  # the worker waits for its start command; the simulation's turns go to the turns model
         before=gateway.state['chat_attempts'];native_call_start=len(gateway.state['calls'])
         started=worker.request('start',remaining());require(started['child_pgid']==worker.group.owner['pgid'],'native child escaped worker group')
         session=store.begin(prepared['simulation_id']);save('prospective_running_begin',session=session,native=started)
         terminal=worker.request('wait',remaining());require(terminal['child_exit']==0 and terminal['monitor_joined'] is True,'native terminal order failed')
-        native_completed=qualify_native_chat_calls(gateway.state['calls'][native_call_start:])
+        require_clean_gateway(gateway,'the simulation');native_completed=qualify_native_chat_calls(gateway.state['calls'][native_call_start:])
         save('native_terminal',data=terminal,native_chat_attempts=gateway.state['chat_attempts']-before,completed_native_forward_calls=[row['id'] for row in native_completed])
         boundary('B2','setup')  # the worker waits for its report command; the report goes to the setup model
-        report=worker.request('report',remaining());rid=store.finish(session,report['report_id']);receipt_body,features,now=store.validate(rid)
+        report=worker.request('report',remaining());require_clean_gateway(gateway,'the report');rid=store.finish(session,report['report_id']);receipt_body,features,now=store.validate(rid)
         save('fresh_report_validated',receipt_ref=rid,report=report,features=features,manifest=receipt_body['manifest'])
         proposal={'receipt_ref':rid,'instrument':'NVDA','action':'buy','reason':'Fixed reviewed local-paper qualification from exact captured native report.'}
         try:
@@ -831,6 +956,7 @@ def execute(work,gate):
         if server is not None:server.shutdown();server.server_close()
         for sig,handler in old_handlers.items():signal.signal(sig,handler)
         receipt['cleanup']=cleanup;receipt['resource_failures']=errors;receipt['wall_seconds']=time.monotonic()-start
+        with rule_lock:receipt['resource']=rule.summary()
         receipt['cleanup_proven']=not any('failure' in key or 'uncertain' in key for item in cleanup for key in item)
         receipt['complete']=receipt['complete'] and receipt['cleanup_proven'] and receipt['wall_seconds']<=2400
         atomic(work/'builder/native-run-receipt.json',receipt)
