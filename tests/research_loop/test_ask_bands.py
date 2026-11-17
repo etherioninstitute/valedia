@@ -1219,8 +1219,8 @@ def test_a_lower_case_twin_is_left_out_even_when_the_shape_rule_is_off(tmp_path,
 
 
 def test_a_candle_file_named_in_another_case_is_no_candle_and_is_not_read(tmp_path):
-    write_w(tmp_path, [one_market(ev="KXHIGHNY-C1")], skip_files={"KXHIGHNY-Z1-M"})
-    (Path(tmp_path) / "artifacts" / "kalshi_weather" / "candles" / "kxhighny-z1-m.json").write_text("{{ not json")
+    write_w(tmp_path, [one_market(ev="KXHIGHNY-C1")], skip_files={"KXHIGHNY-C1-M"})
+    (Path(tmp_path) / "artifacts" / "kalshi_weather" / "candles" / "kxhighny-c1-m.json").write_text("{{ not json")
     lab = ab.collect("W", "development", root=tmp_path).labels["24h"]
     assert lab.market_skips == {"no_candle": 1}                       # not bad_candle_record: the file was not opened
 

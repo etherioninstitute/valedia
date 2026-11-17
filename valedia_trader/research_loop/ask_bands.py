@@ -74,7 +74,10 @@ MAIN = {"W": "24h", "S": "last"}
 WEATHER_DIR = Path("artifacts") / "kalshi_weather"
 SPORTS_DB = Path("artifacts") / "sports_lines" / "kalshi.sqlite"
 OUT_DIR = Path("artifacts") / "ask_bands"
-_TICKER_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# Kalshi's own ticker shape, one rule for both universes: 1 to 80 characters, a capital first, then only capitals,
+# digits, dots and hyphens. (The same shape is webull_events._EVENT_SYMBOL; that module is a broker venue and is not
+# imported here, so the pattern is repeated.) No two accepted tickers can differ only by case.
+_TICKER_SHAPE = re.compile(r"[A-Z][A-Z0-9.\-]{0,79}")
 
 
 class Refused(Exception):
@@ -347,11 +350,15 @@ def _event_periods(items: list[tuple[str, bool]]) -> dict[str, str]:
     return {ev: ("sealed" if s else "development") for ev, s in sealed.items()}
 
 
+def ticker_ok(t) -> bool:
+    return type(t) is str and _TICKER_SHAPE.fullmatch(t) is not None
+
+
 def _repeated_tickers(rows) -> set:
     """Tickers listed more than once anywhere in a universe's whole listing (both periods: a ticker is neither a price
     nor a result). Every copy of such a ticker is left out."""
-    counts = Counter(r.get("ticker") for r in rows if isinstance(r, dict) and type(r.get("ticker")) is str)
-    return {t for t, n in counts.items() if n > 1}
+    counts = Counter(r["ticker"].casefold() for r in rows if isinstance(r, dict) and type(r.get("ticker")) is str)
+    return {t for t, n in counts.items() if n > 1}               # compared case-folded, over the whole listing
 
 
 def _raw_candle(raw) -> dict:
@@ -415,7 +422,7 @@ def _collect_w(period: str, weather_dir: Path):
             unassigned["bad_record"] += 1
             continue
         t = m.get("ticker")
-        repeat = type(t) is str and t in repeated          # judge the type before any lookup: a list is unhashable
+        repeat = type(t) is str and t.casefold() in repeated    # judge the type before any lookup
         if repeat:
             unassigned["duplicate_ticker"] += 1
         ev = m.get("event_ticker")
@@ -437,11 +444,13 @@ def _collect_w(period: str, weather_dir: Path):
     results = {label: LabelResult() for label in labels}
     events = set()
     n_files, size, mt_lo, mt_hi = 0, 0, None, None
+    cdir = weather_dir / "candles"
+    on_disk = set(os.listdir(cdir)) if cdir.is_dir() else set()     # listed once; the file system is not trusted on case
     for i, ev, ts in keep:
         m = markets[i]
         events.add(ev)
         ticker = m.get("ticker")
-        if type(ticker) is not str or not _TICKER_OK.match(ticker):
+        if not ticker_ok(ticker):
             _ingest(results, ev, None, None, "bad_ticker")
             continue
         result = m.get("result")
@@ -449,7 +458,7 @@ def _collect_w(period: str, weather_dir: Path):
             _ingest(results, ev, None, None, "bad_result")
             continue
         f = weather_dir / "candles" / (ticker + ".json")
-        if not f.is_file():
+        if (ticker + ".json") not in on_disk:               # the name on disk must match byte for byte
             _ingest(results, ev, result, {label: ("skip", "no_candle") for label in labels}, None)
             continue
         try:
@@ -458,7 +467,7 @@ def _collect_w(period: str, weather_dir: Path):
             mt_lo = st.st_mtime if mt_lo is None else min(mt_lo, st.st_mtime)
             mt_hi = st.st_mtime if mt_hi is None else max(mt_hi, st.st_mtime)
             choices = _choices(json.loads(f.read_text())["candles"], ts, labels)
-        except (ValueError, KeyError, TypeError, _BadCandle, UnicodeDecodeError):
+        except (ValueError, KeyError, TypeError, OSError, _BadCandle):
             _ingest(results, ev, result, None, "bad_candle_record")
             continue
         _ingest(results, ev, result, choices, None)
@@ -476,15 +485,16 @@ def _collect_s(period: str, db: Path):
         repeated = _repeated_tickers(rows)
         for i, r in enumerate(rows):
             ev, ticker = r.get("event_ticker"), r.get("ticker")
-            repeat = type(ticker) is str and ticker in repeated    # judge the type before any lookup
+            repeat = type(ticker) is str and ticker.casefold() in repeated    # judge the type before any lookup
             if repeat:
                 unassigned["duplicate_ticker"] += 1
             if not _valid_event(ev):
                 if not repeat:
                     unassigned["bad_event"] += 1
                 continue
-            if type(ticker) is not str or not ticker:
-                unassigned["bad_ticker"] += 1
+            if not ticker_ok(ticker):                          # before any lookup; a repeat is already counted
+                if not repeat:
+                    unassigned["bad_ticker"] += 1
                 continue
             ts = store.db.execute("SELECT MAX(end_ts) FROM candles WHERE ticker = ?", (ticker,)).fetchone()[0]
             if ts is None:
