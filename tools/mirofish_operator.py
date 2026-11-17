@@ -570,6 +570,10 @@ def refusals(s):
         out.append('an unexpired gate file of an earlier run exists: %s' % ', '.join(s['earlier_runs']['unexpired_gates']))
     if s['earlier_runs']['live_observers']:
         out.append('a running observer of an earlier run exists: %s' % ', '.join(s['earlier_runs']['live_observers']))
+    pr = s['pick_reader']
+    if pr['listed'] and pr['plist'] != s['picks_plist_expected']:
+        out.append('the pick reader %s is loaded from %s, not from %s: it is not booted out' % (
+            PICKS_LABEL, pr['plist'], s['picks_plist_expected']))
     if s['intent']['exists']:
         out.append('AN UNFINISHED RUN\'S INTENT FILE EXISTS (%s): AN EARLIER RUN OR LOAD TEST ENDED BEFORE ITS RESTORE AND ITS '
                    'ROW; RUN `recover` FIRST' % s['intent']['path'])
@@ -592,6 +596,7 @@ def do_check(host, profile, plan, kind='run', hold_minutes=None):
     s['disk'] = {'path': str(WORK_VOLUME), 'free_bytes': host.disk_free(WORK_VOLUME)}
     s['earlier_runs'] = earlier_runs(host)
     s['intent'] = {'path': str(host.intent), 'exists': host.intent.exists()}
+    s['picks_plist_expected'] = host.picks_plist
     s['durations'] = run_durations(profile, plan) if kind == 'run' else load_test_durations(hold_minutes)
     s['announcement'] = announcement(kind, profile, plan, s['durations'], s, t, hold_minutes)
     s['refusals'] = refusals(s)
@@ -634,7 +639,7 @@ class SwitchOffs:
     decision instance nor the embedding instance (unloaded by REST, never reloaded). Each with its before-state in the row."""
 
     def __init__(self, host, row):
-        self.host = host
+        self.host = host; self.row_alerts = row['alerts']
         self.rec = row['switch_offs'] = {'pick_reader': None, 'models_unloaded': [], 'models_note': NOT_RELOADED}
 
     def apply(self, summary):
@@ -671,7 +676,13 @@ class SwitchOffs:
                 raise OperatorError('unloading %s failed: HTTP %s' % (iid, status))
             item['unloaded'] = True
         if summary['models']['others']:
-            still = [o['instance_id'] for o in models_state(host)['others']]
+            announced = {o['instance_id'] for o in summary['models']['others']}
+            now = models_state(host)['others']
+            still = [o['instance_id'] for o in now if o['instance_id'] in announced]
+            later = ['%s (%s)' % (o['instance_id'], o['key']) for o in now if o['instance_id'] not in announced]
+            if later:              # addendum 5: only what was announced is unloaded; a later model is reported and left alone
+                self.rec['loaded_after_announcement'] = later
+                self.row_alerts.append('MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE (NOT UNLOADED): %s' % ', '.join(later))
             if still:
                 raise OperatorError('still loaded after the unload: %s' % ', '.join(still))
 
@@ -861,6 +872,9 @@ def job_pids(host):
     return {label: launchd_print(host, label)['pid'] for label in (COLLECTOR_LABEL, PICKS_LABEL)}
 
 
+UNREADABLE = 'unreadable: '     # addendum 5: a proof that could not be made, against one made with the answer no
+
+
 def proof_failure(host, pid, start, role, work, guard):
     """None when the process is proven to be this run's `role`; else which test failed, in words that never carry the
     command. `guard` holds the ancestors and the job pids. Every test must pass: the pid is above 1, not this process or an
@@ -880,7 +894,7 @@ def proof_failure(host, pid, start, role, work, guard):
         return 'pid %d has another start time than the one recorded' % pid
     names = command_names(host, pid, work, role)
     if names is None:
-        return 'pid %d: its command could not be read' % pid
+        return UNREADABLE + 'pid %d: its command could not be read' % pid
     if not names:
         return 'pid %d: its command does not name the staged folder and %s' % (pid, ROLE_SCRIPTS[role])
     return None
@@ -1935,15 +1949,18 @@ def find_survivors(host, intent):
                 scan_note = scan_note or 'THE PROCESS SCAN COULD NOT BE MADE (A COMMAND COULD NOT BE READ)'
             elif names:
                 proposals.append((role, pid, None, 'the scan'))
-    proven, doubtful = [], []
+    proven, doubtful, not_ours = [], [], []
     for role, pid, start, by in proposals:
         why = proof_failure(host, pid, start, role, work, guard)
+        entry = {'role': role, 'pid': pid if type(pid) is int else repr(pid)[:40], 'by': by, 'why': why}
         if why is None:
             seen = observed_identity(host, pid)
             proven.append({'role': role, 'pid': pid, 'start': seen and seen['start'], 'by': by})
+        elif why.startswith(UNREADABLE):
+            doubtful.append(entry)             # the proof could not be made
         elif why != 'gone':
-            doubtful.append({'role': role, 'pid': pid if type(pid) is int else repr(pid)[:40], 'by': by, 'why': why})
-    return proven, doubtful, scan_note, guard
+            not_ours.append(entry)             # addendum 5: made, and the answer is no (a reused pid): never signalled
+    return proven, doubtful, not_ours, scan_note, guard
 
 
 def cmd_recover(host, args):
@@ -1992,13 +2009,16 @@ def _recover(host, args, say):
            'native_loaded': None, 'post': None, 'counts': False, 'alerts': []}
     would = []; changed = False
     try:
-        proven, doubtful, scan_note, guard = find_survivors(host, intent)
+        proven, doubtful, not_ours, scan_note, guard = find_survivors(host, intent)
     except Exception as e:
-        proven, doubtful, guard = [], [], None
+        proven, doubtful, not_ours, guard = [], [], [], None
         scan_note = 'THE PROCESS SCAN COULD NOT BE MADE (%s)' % type(e).__name__
-    row['proven'], row['doubtful'], row['scan'] = proven, doubtful, scan_note or 'made'
+    row['proven'], row['doubtful'], row['not_ours'], row['scan'] = proven, doubtful, not_ours, scan_note or 'made'
     for d in doubtful:
-        row['alerts'].append(('NOT SIGNALLED: pid %s proposed as the %s by %s failed a test: %s' % (
+        row['alerts'].append(('NOT SIGNALLED: THE PROOF COULD NOT BE MADE FOR pid %s proposed as the %s by %s: %s' % (
+            d['pid'], d['role'], d['by'], d['why'][len(UNREADABLE):])).upper())
+    for d in not_ours:
+        say(('NOT SIGNALLED, NOT A SURVIVOR OF THIS RUN: pid %s (proposed as the %s by %s): %s' % (
             d['pid'], d['role'], d['by'], d['why'])).upper())
     if scan_note:
         row['alerts'].append(scan_note)
@@ -2059,8 +2079,9 @@ def _recover(host, args, say):
     row['utc_end'] = utc(host.now())
     say('recover: intent %s from %s (%s, %s), work %s' % (host.intent, intent['utc'], intent['command'], intent['profile'],
                                                            intent['work']))
-    say('  proven survivors %s; not proven %d; scan %s' % (
-        ['%s %d' % (p['role'], p['pid']) for p in proven] or 'none', len(doubtful), row['scan']))
+    say('  proven survivors %s; proof not made %d; not this run\'s %s; scan %s' % (
+        ['%s %d' % (p['role'], p['pid']) for p in proven] or 'none', len(doubtful), [d['pid'] for d in not_ours] or 'none',
+        row['scan']))
     say('  pick reader: before %s, found %s, after %s' % (before['listed'], now['listed'], (pr['after'] or {}).get('listed')))
     say('  stop %s; mf-native loaded %s; models unloaded by the run, %s: %s' % (
         row['stop'], row['native_loaded'], NOT_RELOADED, ', '.join(intent['models_to_unload']) or 'none'))
