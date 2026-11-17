@@ -13,6 +13,8 @@ from valedia_trader.research_loop import strategy as st
 
 COST = CostModel(fees_bps=1.0, slippage_bps=1.0, borrow_annual=0.02, funding_annual=0.0)
 PRED = gt.Prediction(annual_return=0.05, win_rate=0.5, sharpe=0.8, fail_if_sharpe_below=0.3, fail_if_drawdown_above=0.25)
+PRED_EXPOSURE = gt.Prediction(annual_return=0.05, win_rate=0.5, sharpe=0.8, fail_if_sharpe_below=0.3, fail_if_drawdown_above=0.25,
+                              claim="exposure")
 
 
 def market(seed=0, drift=(0.0009, 0.0008, 0.0007, -0.0007, -0.0008, -0.0009), n=2400):
@@ -69,8 +71,11 @@ def test_development_never_sees_the_sealed_period(env):
 
 
 def test_a_real_edge_passes_development_then_its_one_sealed_test(env):
+    # T39-2b: on constant drifts what momentum earns is exposure (re-timed copies earn as much), so this idea now
+    # states the exposure claim and is judged by the rule it always was; the edge claim's pass is in
+    # test_gauntlet_claims.py on a market where only timing pays.
     paths, ledger, prices, g, hid = env
-    gt.write_prediction(ledger, paths, hid, "trend_test", PRED)
+    gt.write_prediction(ledger, paths, hid, "trend_test", PRED_EXPOSURE)
     seen = []
     s = momentum()
     original = s.target_weights
@@ -112,7 +117,7 @@ def test_no_edge_fails_and_the_failure_is_remembered(tmp_path):
     hid = ledger.propose("Momentum works on pure noise", "price-analyst", "synthetic")
     gt.write_prediction(ledger, paths, hid, "trend_test", PRED)
     rep = g.develop(hid, momentum())
-    assert rep["verdict"] == "fail" and not rep["checks"]["deflated_sharpe"]["passed"]
+    assert rep["verdict"] == "fail" and not rep["checks"]["sharpe_one_trial"]["passed"]     # T39-2b: the edge claim's check
     h = ledger.get(hid)
     assert h["status"] == "failed" and "failed the development test" in h["lessons_learned"]
     assert "worst_symbols" in rep["where_it_loses"] and rep["where_it_loses"]["worst_window"]["return"] <= 0
