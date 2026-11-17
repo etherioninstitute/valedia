@@ -1414,6 +1414,15 @@ class Addendum3(Base):
         self.assertTrue(row['launched']); self.assertIn('SystemExit', row['stopped'])
         self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertRestoredAfterTheEnd()
 
+    def test_1_a_signal_inside_the_spawn_is_held_until_the_handle_is_bound(self):
+        self.w.cleanup_s = 30
+        def spawn(argv, cwd=None, env=None):
+            self.w.fire(signal.SIGTERM); return self.w.spawn(argv, cwd, env)
+        self.assertEqual(self.main(RUN, spawn=spawn), 1, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertEqual(row['stopped'], 'operator signalled (SIGTERM)')
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertRestoredAfterTheEnd()
+
     # ---- 2: TERM and HUP handlers; the intent file; recover
     def test_2_handlers_for_term_and_hup_are_installed_before_the_first_switch_off_and_put_back(self):
         self.assertEqual(self.main(RUN), 0)
@@ -1421,6 +1430,13 @@ class Addendum3(Base):
         for sig in (signal.SIGTERM, signal.SIGHUP):
             self.assertTrue(any(s == sig and n <= first_bootout for _, n, s in self.w.installs), sig)
             self.assertEqual(self.w.handlers[sig], 'default')                        # put back at the end
+
+    def test_2_a_hang_up_already_ignored_by_nohup_stays_ignored(self):
+        self.w.handlers[signal.SIGHUP] = signal.SIG_IGN; self.w.cleanup_s = 30
+        self.at(40, lambda world: world.fire(signal.SIGHUP))
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        self.assertIsNone(self.w.rows()[-1]['stopped']); self.assertEqual(self.w.handlers[signal.SIGHUP], signal.SIG_IGN)
+        self.assertTrue(self.w.rows()[-1]['hup_ignored'])
 
     def test_2_a_term_or_hup_during_the_watch_is_a_controlled_stop(self):
         for sig in (signal.SIGTERM, signal.SIGHUP):
