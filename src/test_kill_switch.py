@@ -222,8 +222,26 @@ def test_spot_writers_and_layers():
 
 
 def test_file_arm_env_off_wins_and_self_heal_report_only():
-    _restore()
+    """Writes and arms the halt file, so it replaces the two path functions for its duration.
+
+    valedia_config.halt_state_path()/halt_ping_path() always return <repo>/state/halt*.json (the
+    env override is unreachable by design); without this patch the test wrote the real files and
+    left them halted: true. Note: the legacy "clear" writes a file with halted: false, but the
+    current risk gate (valedia_trader/research_loop/risk_gate.py HALT_FILE) treats that file's
+    PRESENCE as a halt, so clearing the real halt means removing the file.
+    """
     td = tempfile.mkdtemp(prefix="halt_")
+    prev_fns = (vc.halt_state_path, vc.halt_ping_path)
+    vc.halt_state_path = lambda: os.path.join(td, "halt.json")
+    vc.halt_ping_path = lambda: os.path.join(td, "ping.md")
+    try:
+        _file_arm_env_off_wins_and_self_heal_report_only(td)
+    finally:
+        vc.halt_state_path, vc.halt_ping_path = prev_fns
+
+
+def _file_arm_env_off_wins_and_self_heal_report_only(td):
+    _restore()
     halt_path = os.path.join(td, "halt.json")
     ping_path = os.path.join(td, "ping.md")
     os.environ["VALEDIA_TRADING_HALT_FILE"] = halt_path

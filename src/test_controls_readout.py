@@ -187,6 +187,14 @@ def test_env_source_does_not_stick():
 
 
 def test_halt_file_source():
+    """Writes the halt file, so it replaces the two path functions for its duration.
+
+    valedia_config.halt_state_path()/halt_ping_path() always return <repo>/state/halt*.json (the
+    env override is unreachable by design), so the env vars below do not move them. Note: the
+    legacy "clear" writes a file with halted: false, but the current risk gate
+    (valedia_trader/research_loop/risk_gate.py HALT_FILE) treats that file's PRESENCE as a halt,
+    so clearing the real halt means removing the file.
+    """
     fd, path = tempfile.mkstemp(prefix="halt_", suffix=".json")
     os.close(fd)
     os.remove(path)
@@ -194,6 +202,9 @@ def test_halt_file_source():
     prev_e = _env("VALEDIA_TRADING_HALT", None)
     prev_f = _env("VALEDIA_TRADING_HALT_FILE", path)
     prev_p = _env("VALEDIA_TRADING_HALT_PING", ping)
+    prev_fns = (vc.halt_state_path, vc.halt_ping_path)
+    vc.halt_state_path = lambda: path
+    vc.halt_ping_path = lambda: ping
     try:
         vc.write_halt_state(True, reason="test readout", source="test")
         row = _by_name(vc.controls_snapshot())["VALEDIA_TRADING_HALT"]
@@ -204,6 +215,7 @@ def test_halt_file_source():
         assert row["value"] is False
         assert row["source"] == "file"
     finally:
+        vc.halt_state_path, vc.halt_ping_path = prev_fns
         _restore("VALEDIA_TRADING_HALT", prev_e)
         _restore("VALEDIA_TRADING_HALT_FILE", prev_f)
         _restore("VALEDIA_TRADING_HALT_PING", prev_p)
