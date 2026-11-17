@@ -25,8 +25,11 @@ Rules the code holds:
   price windows [t1 + 1 h, +12 h), [t1 + 6 h, +12 h) and [t1 + 24 h, +12 h); then, only for positions whose first
   usable point after the hour has a grain of five minutes or finer, [t1 + 10 min, +12 h). Each step says first what
   it is about to do (the number of pages of a wallet is not known in advance; the phase-2 estimate uses the pace
-  measured in phase 1, kept in the store as `pull_pace`), then one line per finished walk, a running line every 100
-  pages of a long walk with the process's memory, and the totals and what is unfinished; every line is flushed.
+  measured in phase 1, kept in the store as `pull_pace`); then in phase 1 one line per finished walk and a running
+  line every 100 pages of a long walk with the process's memory; in phase 2 a counter only (price windows finished
+  of windows planned, points stored, seconds, memory) every 500 windows and at the end, never a token, a window's
+  time or a wallet (a failed window is named by its number); and the totals and what is unfinished; every line is
+  flushed.
   Raw JSON is kept beside the parsed columns with the time of each read. A walk reaches the store page by page, in
   one transaction committed only when its last page is stored, so the process holds one page at a time (a walk's
   identities, for its repeats and conflicts, sit in a temporary table on disk, never in the store's file); a walk
@@ -35,8 +38,23 @@ Rules the code holds:
   cursor stays valid across a restart). A wallet whose trades reach the reader's limit of 5,000 pages ends with the
   status `page_limit`, keeps no row, is not read again, and the pull goes on; phase 2, `develop` and `sealed` refuse
   until it is named with --leave-out (the refusal prints the exact list), and it is then left out and named
-  (third amendment, 27cde89). Above --max-memory-mb (1,500 by default) of resident memory, read after every page,
-  the pull stops itself cleanly. A second pull asks only for what is missing.
+  (third amendment, 27cde89). The page limit is for wallets' trade walks only: a price window or a resolutions batch
+  past it stays unfinished like any failed walk, the pull ends incomplete (exit 3) and the 10-minute step waits.
+  Above --max-memory-mb (1,500 by default) of resident memory, read after every page, the pull stops itself
+  cleanly. A second pull asks only for what is missing.
+* While a pull runs, nothing else reads the store. The pull holds an exclusive advisory lock (flock) on the file
+  STORE.lock beside the store for its whole life (the kernel releases it if the process dies); a second pull,
+  `develop` and `sealed` take it without waiting and refuse in words: "a pull is running on this store". The pull's
+  first line says it too: never copy the store file while a pull runs (a copy made alone mid-walk, without its
+  rollback journal, can show part of an unfinished walk); to copy it, stop the pull or use SQLite's own backup
+  (`sqlite3 STORE ".backup COPY"`). `develop` and `sealed` refuse a store that fails SQLite's PRAGMA quick_check:
+  every page, record and the free list, not whether each index matches its table. It reads the whole file once,
+  about 1.1 s a GB measured on a 2 GB synthetic store in memory, so about 30 s on a 30 GB store (at least the time
+  to read 30 GB from its disk); the full integrity_check took 4.5 s a GB (about 2.3 minutes on 30 GB), hence the
+  quick form. SQLite's temporary files (a walk's identities, the end-of-walk numbering) go to the folder
+  STORE.pull-tmp beside the store, made by the pull, removed at its end and, after a kill, at the next start; the
+  end-of-walk numbering is done in chunks of RENUMBER_CHUNK rows, so its temporary space does not grow with the
+  walk.
 * The period wall. Development is every month up to June 2026; sealed is July to October 2026. `develop` reads only
   trades before 2026-07-01 plus one day (the 24-hour purchase sums of 30 June's positions), the resolutions of the
   conditions so read, and the price windows of development positions only. A leader's standing for month M uses only
@@ -74,12 +92,15 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -1033,7 +1054,9 @@ class Store:
         """The walk's last page is stored: (prices) every point of an identity in conflict becomes a counted
         conflict, none kept; the rows take their final numbers (as a whole walk numbers them); finished; committed."""
         if kind == "trades":
-            self.db.execute("UPDATE trades SET seq = seq + ? WHERE wallet=?", (st.rows, key))
+            for lo in range(-st.rows, 0, RENUMBER_CHUNK):  # chunks: temporary space bounded, not the walk's size
+                self.db.execute("UPDATE trades SET seq = seq + ? WHERE wallet=? AND seq >= ? AND seq < ?",
+                                (st.rows, key, lo, min(lo + RENUMBER_CHUNK, 0)))
         else:
             for token, ts, grain in sorted(conflicted or ()):
                 rows = self.db.execute("SELECT raw, read_at FROM price_points WHERE walk_key=? AND timestamp=? AND "
@@ -1044,9 +1067,16 @@ class Store:
                                 (key, ts, grain))
                 st.rows -= len(rows)
                 st.rejects["conflicting_row"] += len(rows)
-            self.db.execute("UPDATE price_points SET seq = r.n FROM (SELECT seq AS old, ROW_NUMBER() OVER (ORDER BY "
-                            "seq DESC) - 1 AS n FROM price_points WHERE walk_key=?) AS r WHERE "
-                            "price_points.walk_key=? AND price_points.seq = r.old", (key, key))
+            base = 0                                    # the next RENUMBER_CHUNK provisional rows, in served order
+            while True:
+                n = self.db.execute(
+                    "UPDATE price_points SET seq = r.n + ? FROM (SELECT seq AS old, ROW_NUMBER() OVER (ORDER BY seq "
+                    "DESC) - 1 AS n FROM (SELECT seq FROM price_points WHERE walk_key=? AND seq < 0 ORDER BY seq DESC "
+                    "LIMIT ?)) AS r WHERE price_points.walk_key=? AND price_points.seq = r.old",
+                    (base, key, RENUMBER_CHUNK, key)).rowcount
+                base += n
+                if n < RENUMBER_CHUNK:
+                    break
         self.db.execute("UPDATE walks SET status='finished', finished_at=?, pages=?, rows=?, rejects=? WHERE kind=? "
                         "AND key=?", (_now(), st.pages, st.rows, _j(dict(st.rejects)), kind, key))
         self.db.commit()
@@ -1198,7 +1228,11 @@ def plan_store(s: Store, leave_out=()) -> dict:
 
 PAGE_LIMIT = "page_limit"                 # a walk's status when it reached the reader's page cap with more promised
 MAX_MEMORY_MB = 1500                      # the pull stops itself above this resident memory (--max-memory-mb)
-RUNNING_EVERY = 100                       # a running line every this many pages inside one walk
+RUNNING_EVERY = 100                       # a running line every this many pages inside one walk (phase 1)
+PRICE_COUNTER_EVERY = 500                 # phase 2's counter line every this many finished price windows
+RENUMBER_CHUNK = 50_000                   # rows renumbered by one statement at the end of a walk
+COPY_WARNING = ("never copy the store file while a pull runs (a copy made alone mid-walk can show part of an "
+                "unfinished walk); to copy it, stop the pull or use SQLite's own backup (sqlite3 STORE \".backup COPY\")")
 
 
 class PullStopped(Exception):
@@ -1261,9 +1295,31 @@ def _digest(text: str) -> bytes:
     return hashlib.sha256(text.encode()).digest()[:16]
 
 
+def _canonical(v) -> list:
+    """One value of an identity as the old dict keys compared it (Python's ==, exactly): a bool is its int; a float
+    with no fraction is that exact int (2**53 and 2.0**53 alike, 2**53 + 1 not; 0.0 and -0.0 are 0); any other float
+    is its exact binary value; a string is never a number. A NaN is one value, as the parser's one NaN object was
+    one key (none reaches here: a row's numbers are checked finite before its identity is taken)."""
+    if isinstance(v, bool):
+        v = int(v)
+    if isinstance(v, int):
+        return ["n", str(v)]
+    if isinstance(v, float):
+        if v != v:
+            return ["nan"]
+        if math.isfinite(v) and v.is_integer():
+            return ["n", str(int(v))]
+        return ["f", v.hex()]
+    if isinstance(v, str):
+        return ["s", v]
+    if v is None:
+        return ["none", ""]
+    return ["r", type(v).__name__, repr(v)]
+
+
 def _key_digest(k) -> bytes:
-    """An identity as 16 bytes: numbers as floats (1 and 1.0 are one identity, as they are as Python keys)."""
-    return _digest(_j([v + 0.0 if isinstance(v, (int, float)) and not isinstance(v, bool) else v for v in k]))
+    """An identity as 16 bytes, its values compared exactly as dict keys compare them (see _canonical)."""
+    return _digest(json.dumps([_canonical(v) for v in k]))
 
 
 class _Seen:
@@ -1303,6 +1359,13 @@ class _Run:
         self.client, self.t0, self.req0 = client, clock(), client.requests
         self.walks, self.pages, self.rows, self.rejects = 0, 0, 0, Counter()
         self.walk_in_progress: str | None = None
+        self.quiet = False                        # phase 2: no line per window, only the counter
+        self.windows_planned, self.windows_done, self.points, self.counted = 0, 0, 0, 0
+
+    def counter(self) -> None:
+        self.counted = self.windows_done
+        self.say("phase 2: %d of %d price windows finished, %s points, %d s, memory %d MB" % (
+            self.windows_done, self.windows_planned, format(self.points, ","), self.clock() - self.t0, self.memory()))
 
     def guard(self) -> float:
         mb = self.memory()
@@ -1313,7 +1376,7 @@ class _Run:
     def after_page(self, label: str, st: _WalkState) -> None:
         self.pages += 1
         mb = self.memory()
-        if st.pages % RUNNING_EVERY == 0:
+        if st.pages % RUNNING_EVERY == 0 and not self.quiet:
             self.say("%s: %d pages, %s rows, %d s, memory %d MB" % (label, st.pages, format(st.rows, ","),
                                                                    self.clock() - st.t0, mb))
         if mb > self.limit:
@@ -1323,6 +1386,8 @@ class _Run:
         self.walks += 1
         self.rows += st.rows
         self.rejects.update(st.rejects)
+        if self.quiet:
+            return
         self.say("%s finished: %d pages, %s rows, rejects %s, %d s" % (label, st.pages, format(st.rows, ","),
                                                                       dict(sorted(st.rejects.items())) or "none",
                                                                       self.clock() - st.t0))
@@ -1355,6 +1420,9 @@ def _stream(s: Store, run: _Run, kind: str, key: str, label: str, pages_of) -> N
             run.after_page(label, st)
         s.end_walk(kind, key, st, conflicted if kind == "prices" else None)
     except pd.PageCapHit as e:
+        if kind != "trades":                       # a price window past its limit: unfinished, as any failed walk
+            s.abandon_walk(kind, key)
+            raise
         s.abandon_walk(kind, key, status=PAGE_LIMIT, pages=e.pages or st.pages)
         run.say("%s ended at the page limit: %d pages read and more promised; its rows removed; it stays out of the "
                 "analysis until named with --leave-out" % (label, e.pages or st.pages))
@@ -1368,20 +1436,85 @@ def _stream(s: Store, run: _Run, kind: str, key: str, label: str, pages_of) -> N
 
 
 def _label(kind: str, key: str) -> str:
-    if kind == "trades":
-        return "trades %s" % key[:10]
-    token, _, start = key.rpartition("@")
-    return "prices %s@%s" % (token[:10], start)
+    """A trade walk's name in phase 1's lines (a price window is named by its number only, see _read_windows)."""
+    assert kind == "trades"
+    return "trades %s" % key[:10]
+
+
+@contextlib.contextmanager
+def _store_lock(path: Path, exclusive: bool):
+    """The advisory lock on STORE.lock: exclusive for the pull's whole life, shared while develop or sealed read;
+    taken without waiting, refused in words; the kernel releases it when the process ends, however it ends."""
+    lock = Path(str(path) + ".lock")
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("a pull is running on this store (%s is locked%s): wait for it to end or stop it (nothing "
+                          "done)" % (lock, ", or develop or sealed is reading the store" if exclusive else "")) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _set_temp_folder(folder: str) -> None:
+    """SQLite's folder for its temporary files (process-wide; '' is SQLite's own default)."""
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("PRAGMA temp_store_directory = '%s'" % folder.replace("'", "''"))
+    finally:
+        db.close()
+
+
+def check_integrity(path) -> None:
+    """Refuses, in words and with nothing written, a store that fails SQLite's PRAGMA quick_check (read-only): the
+    pages, records and free list checked; not that each index matches its table (the cost: see the module's doc)."""
+    check_own_shape(path)
+    db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+    try:
+        rows = [r[0] for r in db.execute("PRAGMA quick_check(10)")]
+    except sqlite3.DatabaseError as e:
+        rows = [str(e)]
+    finally:
+        db.close()
+    if rows != ["ok"]:
+        raise Refused("the store %s fails SQLite's integrity check (PRAGMA quick_check: %s; nothing written)"
+                      % (path, "; ".join(rows[:5])))
 
 
 def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), say=None, *,
          max_memory_mb: float = MAX_MEMORY_MB, memory=None, clock=None, page_cap: int = pd.DEFAULT_PAGE_CAP) -> dict:
     """Fill the store, asking only for what is missing, one page at a time (see Store.put_page). Walks that fail
-    stay unfinished (PullIncomplete names them); a walk at the page limit ends with its own status and the pull goes
-    on; above `max_memory_mb` of resident memory (read after every page) the pull stops itself (PullStopped)."""
+    stay unfinished (PullIncomplete names them); a wallet's trade walk at the page limit ends with its own status
+    and the pull goes on; above `max_memory_mb` of resident memory (read after every page) the pull stops itself
+    (PullStopped). For its whole life it holds the store's lock (a second pull refuses) and keeps SQLite's temporary
+    files in STORE.pull-tmp beside the store."""
     if phase not in (1, 2):
         raise ValueError("phase is 1 or 2")
-    say = say or _say
+    path = Path(store_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = say or _say
+    first = [True]
+
+    def said(m: str) -> None:
+        if first:
+            first.clear()
+            m = "%s; %s" % (m, COPY_WARNING)
+        out(m)
+    with _store_lock(path, exclusive=True):
+        tmp = Path(str(path) + ".pull-tmp")
+        shutil.rmtree(tmp, ignore_errors=True)     # a leftover of a killed pull
+        tmp.mkdir()
+        _set_temp_folder(str(tmp.resolve()))
+        try:
+            return _pull(path, client, phase, leave_out, said, max_memory_mb, memory, clock, page_cap)
+        finally:
+            _set_temp_folder("")
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _pull(store_path, client, phase, leave_out, say, max_memory_mb, memory, clock, page_cap) -> dict:
     run = _Run(say, clock or time.monotonic, memory or rss_mb, max_memory_mb, client)
     errors: list = []
     stopped = None
@@ -1421,21 +1554,26 @@ def _summary(s: Store, run: _Run, phase: int, errors: list, limited: dict) -> No
     unfinished = (["wallets " + ", ".join(w[:10] for w in open_wallets)] if open_wallets else []) + \
         (["%d resolution walks" % open_res] if open_res else []) + (["%d price windows" % open_prices] if open_prices
                                                                      else [])
+    at_limit = ("at the page limit (left out until named with --leave-out): %s; " % ", ".join(
+        "%s (%d pages)" % (w, n) for w, n in sorted(limited.items()))) if limited else ""
     run.say("phase %d ended: %d of %d wallets finished; this run %d walks, %d pages, %s rows, rejects %s, %d requests, "
-            "%d s; at the page limit (left out until named with --leave-out): %s; unfinished: %s" % (
+            "%d s; %sunfinished: %s" % (
                 phase, len([w for w in cands if w in done]), len(cands), run.walks, run.pages, format(run.rows, ","),
                 dict(sorted(run.rejects.items())) or "none", run.client.requests - run.req0, run.clock() - run.t0,
-                ", ".join("%s (%d pages)" % (w, n) for w, n in sorted(limited.items())) or "none",
-                "; ".join(unfinished) or "none"))
+                at_limit, "; ".join(unfinished) or "none"))
 
 
-def _guarded(errors, label, fn) -> None:
+def _guarded(errors, label, fn, plain: bool = False) -> None:
     """Run one walk; a failure of the service or of the connection (after the reader's bounded tries) leaves it
-    unfinished and the pull goes on."""
+    unfinished and the pull goes on. `plain` (a price window): the failure's kind only, never its address."""
     try:
         fn()
     except (pd.HttpError, pd.PolymarketDataError, OSError, http.client.HTTPException) as e:
-        errors.append("%s: %s" % (label, e))
+        why = e
+        if plain:
+            why = ("HTTP %s" % e.status if isinstance(e, pd.HttpError) else
+                   "more pages promised past the reader's limit" if isinstance(e, pd.PageCapHit) else type(e).__name__)
+        errors.append("%s: %s" % (label, why))
 
 
 def _pull_phase1(s: Store, client, run: _Run, errors, page_cap: int) -> None:
@@ -1499,12 +1637,29 @@ def add_ten_minute_windows(s: Store) -> dict:
 
 
 def _read_windows(s: Store, client, run: _Run, windows: dict, errors) -> None:
-    for k in sorted(windows):
-        wd = windows[k]
-        _guarded(errors, "prices %s" % k, lambda k=k, wd=wd: _stream(
-            s, run, "prices", k, _label("prices", k),
-            lambda ids, conflicted: client.price_pages(wd.token, wd.start, wd.start + PRICE_SPAN, ids=ids,
-                                                       conflicted=conflicted)))
+    """The windows in key order, each named by its number only; a counter line every PRICE_COUNTER_EVERY finished
+    windows and at the end."""
+    keys = sorted(windows)
+    first = run.windows_planned + 1
+    run.windows_planned += len(keys)
+    run.quiet = True
+    try:
+        for j, k in enumerate(keys, first):
+            wd, label = windows[k], "price window %d of %d" % (j, run.windows_planned)
+            n_errors, rows = len(errors), run.rows
+            _guarded(errors, label, lambda k=k, wd=wd, label=label: _stream(
+                s, run, "prices", k, label,
+                lambda ids, conflicted: client.price_pages(wd.token, wd.start, wd.start + PRICE_SPAN, ids=ids,
+                                                           conflicted=conflicted)), plain=True)
+            if len(errors) == n_errors:
+                run.windows_done += 1
+                run.points += run.rows - rows
+                if run.windows_done % PRICE_COUNTER_EVERY == 0:
+                    run.counter()
+    finally:
+        run.quiet = False
+    if keys and run.windows_done != run.counted:
+        run.counter()
 
 
 def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
@@ -1821,8 +1976,24 @@ def _development_doc(path: Path, leave_out) -> dict:
     return {"provenance": _provenance(path), "result": development_result(data)}
 
 
+@contextlib.contextmanager
+def _readable(path: Path):
+    """develop's and sealed's first steps: the store is there, no pull holds it (the shared lock, held until they
+    end), and it passes PRAGMA quick_check."""
+    if not path.is_file():
+        raise Refused("the store %s is missing (nothing written)" % path)
+    with _store_lock(path, exclusive=False):
+        check_integrity(path)
+        yield
+
+
 def run_develop(*, store=None, out_dir=None, leave_out=()) -> dict:
     path = _store_path(store)
+    with _readable(path):
+        return _run_develop(path, out_dir, leave_out)
+
+
+def _run_develop(path: Path, out_dir, leave_out) -> dict:
     doc = _development_doc(path, leave_out)
     out = _out_dir(out_dir, doc["provenance"]["store_id"]) / "develop.json"
     raw = _dump(doc)
@@ -1914,8 +2085,11 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
     if not flag:
         raise Refused("the sealed period is opened only with --i-am-opening-the-sealed-period")
     path = _store_path(store)
-    if not path.is_file():
-        raise Refused("the store %s is missing (nothing written)" % path)
+    with _readable(path):
+        return _run_sealed(path, out_dir, leave_out, develop_file)
+
+
+def _run_sealed(path: Path, out_dir, leave_out, develop_file) -> dict:
     leave = sorted(set(leave_out))
     with Store(path, own=True) as s:
         sid = s.checked_id()

@@ -2100,9 +2100,10 @@ def test_while_a_pull_runs_pull_develop_and_sealed_refuse_in_words_at_once(tmp_p
         go.touch()
         out, err = p.communicate(timeout=600)
     assert p.returncode == 0 and "PULLED" in out, err[-1500:]
-    with pytest.raises(cl.Refused) as e:                              # the lock is gone: another refusal, not it
-        cl.run_develop(store=store, out_dir=tmp_path / "o")
-    assert "a pull is running" not in str(e.value)
+    try:                                                              # the lock is gone: develop runs (or refuses
+        cl.run_develop(store=store, out_dir=tmp_path / "o")           # for its own reasons, never the lock)
+    except cl.Refused as e:
+        assert "a pull is running" not in str(e)
 
 
 def test_a_killed_pull_leaves_no_lock_held(tmp_path, monkeypatch):
@@ -2155,7 +2156,7 @@ def test_phase_2_prints_a_counter_only_never_a_position(tmp_path, monkeypatch):
     with cl.Store(store) as s:
         windows = s.plan_windows()
     assert len(windows) > 10
-    starts = {str(wd.start) for wd in windows.values()} | {str(wd.start - DELAY) for wd in windows.values()}
+    starts = {str(wd.start) for wd in windows.values()} | {str(wd.start - cl.DELAY) for wd in windows.values()}
     for m in said:
         assert not _POSITION.search(m), m
         assert not any(t in m for t in starts), m
