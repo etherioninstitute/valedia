@@ -94,3 +94,12 @@ cost; it says nothing about resting orders or about a forecaster that knows more
   exists.
 - Two universes and 153 bands each is a search. The search happens only on development data; the sealed run tests
   one band chosen beforehand.
+
+## Note added 2026-11-17, 07:39 UTC (no rule changed; no program for the test has run)
+
+The cost is no longer an assumption. Webull's own help page "Event Contract Fees"
+(webull.com/help/faq/11174-Event-Contract-Fees) states 0.01 dollars commission plus 0.01 dollars exchange fee a
+contract when a position is opened, the same again when it is sold before expiration, no fee for holding to
+settlement, and no fee for an order that is cancelled or expires unfilled. That is the 0.02 a contract on the
+purchase and nothing at settlement used above. The paper account's 0.01 a contract is therefore not the real
+charge.
