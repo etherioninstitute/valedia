@@ -72,10 +72,16 @@ class FakeLauncher:
                 w.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-left', 'config': {}}]})
             w.procs.pop(OBSERVER_PID, None); w.procs.pop(LAUNCHER_PID, None)
             self.returncode = w.exit_override if w.exit_override is not None else (0 if receipt.get('complete') else 1)
+            w.launcher_end_t = w.t
         return self.returncode
 
     def wait(self, timeout=None):
         return self.poll()
+
+    def send_signal(self, sig):
+        # as subprocess.Popen.send_signal: polls first and never signals a child that has been reaped
+        if self.poll() is None:
+            self.world.handle_signals.append((self.pid, sig)); self.world.send_signal(self.pid, sig)
 
 
 class FakeLoadPath:
@@ -120,6 +126,9 @@ class World:
         self.link_err = ''; self.identity = None; self.write_receipt = True; self.receipt_raw = None; self.exit_override = None
         self.bootout_raises_after = None; self.bootstrap_raises = None; self.bootstrap_raises_after = None
         self.fsyncs = []; self.timed = []
+        self.handle_signals = []; self.launcher_end_t = None; self.handlers = {}; self.installs = []
+        self.ps_unreadable = set(); self.ps_raises = {}; self.fsync_raises = None; self.staged_wall = None
+        self.staged_manifest_wall = None; self.staged_startup = True; self.intent_at_bootout = 'unseen'
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
@@ -174,6 +183,8 @@ class World:
                 return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = %s\n\targuments = {\n'
                                '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n%s}\n' % (PICKS_PLIST, state, trigger))
         if argv[:2] == ['/bin/launchctl', 'bootout']:
+            intent = self.tmp / 'artifacts/mirofish/operator-intent.json'
+            self.intent_at_bootout = json.loads(intent.read_text()) if intent.is_file() else None
             if self.bootout_rc == 0:
                 self.picks_loaded = False
             if self.bootout_raises_after:
@@ -194,6 +205,10 @@ class World:
             return done(0, '%d\n' % self.pressure)
         if argv == ['/usr/sbin/sysctl', '-n', 'vm.swapusage']:
             return done(0, 'total = 2048.00M  used = %.2fM  free = 1000.00M  (encrypted)\n' % self.swap_mb)
+        if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_raises:
+            raise self.ps_raises.pop(int(argv[2]))()              # once
+        if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_unreadable:
+            return done(1, '')
         if argv[:2] == ['/bin/ps', '-p']:
             proc = self.procs.get(int(argv[2]))
             if proc is None:
@@ -207,7 +222,12 @@ class World:
             (work / 'builder').mkdir(parents=True); (work / 'owned-source/observer-entry').mkdir(parents=True)
             (work / 'owned-source/observer-entry/mirofish_native_run.py').write_text(
                 "atomic(work/'builder/observer-identity.json', identity)\n" if self.pipeline_writes_identity else '# an older revision\n')
-            manifest = {'launch_authorized': False, 'model_profile': {'start_threshold': {'percent_free': self.threshold}}}
+            wall = self.staged_wall or OP.run_durations('swarm8', {'model': 'qwen3-8b'})['wall_s']
+            if self.staged_startup:
+                (work / 'owned-source/observer-entry/mirofish_native_startup.py').write_text(
+                    "    deadline=time.monotonic()+(30 if preflight else %d);stop=threading.Event();errors=[]\n" % wall)
+            manifest = {'launch_authorized': False, 'model_profile': {'start_threshold': {'percent_free': self.threshold}},
+                        'uniform_policy': {'wall_seconds': self.staged_manifest_wall or wall}}
             (work / 'builder/candidate-manifest.json').write_text(json.dumps(manifest))
             digest = hashlib.sha256((work / 'builder/candidate-manifest.json').read_bytes()).hexdigest()
             return done(0, json.dumps({'status': 'STAGED_NOT_AUTHORIZED_NO_SERVICES', 'work': str(work), 'candidate_sha256': digest}) + '\n')
@@ -238,7 +258,19 @@ class World:
             self.procs[pid].setdefault('termed_at', self.t)
 
     def fsync(self, fd):
+        if self.fsync_raises:
+            exc, self.fsync_raises = self.fsync_raises, None
+            raise exc()
         self.fsyncs.append(fd); os.fsync(fd)
+
+    def install_signal(self, signum, handler):
+        self.installs.append((self.t, len(self.calls), signum)); old = self.handlers.get(signum, 'default')
+        self.handlers[signum] = handler; return old
+
+    def fire(self, signum):
+        handler = self.handlers.get(signum)
+        if callable(handler):
+            handler(signum, None)
 
     def http(self, method, url, body=None, timeout=None):
         self.http_calls.append((method, url, copy.deepcopy(body))); self.timed.append((self.t, [method, url]))
@@ -257,7 +289,8 @@ class World:
                       send_signal=self.send_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
                       crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
                       load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
-                      out=self.out.append, lms='/fake/bin/lms', self_pid=TOOL_PID, parent_pid=TOOL_PARENT, fsync=self.fsync)
+                      out=self.out.append, lms='/fake/bin/lms', self_pid=TOOL_PID, parent_pid=TOOL_PARENT, fsync=self.fsync,
+                      install_signal=self.install_signal, intent=self.tmp / 'artifacts/mirofish/operator-intent.json')
         values.update(overrides)
         return OP.Host(**values)
 
@@ -846,13 +879,12 @@ class RunRecipe(Base):
         self.assertEqual(row['stop']['by'], 'observer'); self.assertNotIn('after_check', row['stop'])
         self.assertFalse(any('IDENTITY FILE NOT WRITTEN' in a for a in row['alerts']))
 
-    def test_a_launcher_not_in_its_own_group_is_never_signalled(self):
-        self.w.write_identity = False; self.w.launcher_pgid = 1; self.slow_after(30)
+    def test_a_launcher_not_in_its_own_group_is_interrupted_through_its_handle_alone(self):
+        # addendum 3, item 1: SIGINT goes through the handle of the tool's own unreaped child, to that pid only, never a group
+        self.w.write_identity = False; self.w.launcher_pgid = 1; self.w.cleanup_s = 120; self.slow_after(30)
         self.main(RUN)
-        self.assertEqual(self.w.signals, [])
-        row = self.w.rows()[-1]
-        self.assertFalse(row['launcher']['own_group'])
-        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
+        self.assertEqual(self.w.handle_signals, [(LAUNCHER_PID, signal.SIGINT)]); self.assertEqual(self.w.signals, self.w.handle_signals)
+        self.assertFalse(self.w.rows()[-1]['launcher']['own_group'])
 
     def test_the_tool_has_no_group_signal_at_all(self):
         self.assertFalse(hasattr(OP, 'GROUP_STOP_SIGNAL'))
@@ -1137,7 +1169,11 @@ class Addendum2(Base):
         self.assertGreaterEqual(sent - launched, wall + OP.CLEANUP_S); self.assertLessEqual(sent - launched, wall + OP.CLEANUP_S + OP.WATCH_S)
 
     def test_3_a_run_that_cannot_be_stopped_still_ends_the_watch(self):
-        self.w.run_s = 50000; self.w.write_identity = False; self.w.launcher_pgid = 1
+        self.w.run_s = 50000; self.w.write_identity = False
+        def recycle(world):                      # its start reads differently: the pid-and-start match fails, so no signal
+            if world.launcher is not None and LAUNCHER_PID in world.procs and world.t >= world.launcher.started + 10:
+                world.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 12:30:00 2026'
+        self.w.on_sleep.append(recycle)
         self.main(RUN)
         wall = OP.run_durations('swarm8', {'model': 'qwen3-8b'})['wall_s']
         self.assertLess(self.w.t - START, wall + OP.CLEANUP_S + OP.IDENTITY_WAIT_S + 2 * OP.STOP_WAIT_S)
@@ -1287,6 +1323,244 @@ class Addendum2(Base):
     def test_12_the_enabled_line_on_standard_error_refuses(self):
         self.w.link_text = ''; self.w.link_err = 'You have enabled LM Link.\n'
         self.assertEqual(self.main(RUN), 2); self.assertEqual(self.changing(), [])
+
+
+class Addendum3(Base):
+    """The repair after the second blind check of 424230b."""
+    LT = LoadTest.LT
+
+    @property
+    def intent(self):
+        return self.w.tmp / 'artifacts/mirofish/operator-intent.json'
+
+    def slow_after(self, seconds):
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + seconds:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+
+    def at(self, seconds, action):
+        """Do `action(world)` once, `seconds` after the launch."""
+        done_ = []
+        def hook(world):
+            if world.launcher is not None and world.t >= world.launcher.started + seconds and not done_:
+                done_.append(world.t); action(world)
+        self.w.on_sleep.append(hook)
+        return done_
+
+    def fresh(self):
+        self.dir.cleanup(); self.setUp()
+
+    def changing(self):
+        return self.w.bootouts() + self.w.posts() + self.w.spawned + self.w.signals
+
+    def assertRestoredAfterTheEnd(self):
+        self.assertIsNotNone(self.w.launcher_end_t)
+        boots = [t for t, c in self.w.timed if c[:2] == ['/bin/launchctl', 'bootstrap']]
+        self.assertTrue(boots); self.assertGreaterEqual(boots[0], self.w.launcher_end_t)
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+
+    # ---- 1: the launcher is the tool's own child from the instant it is spawned
+    def test_1_the_spawn_result_is_bound_to_the_stop_state_in_the_same_statement(self):
+        self.assertRegex(Path(OP.__file__).read_text(), r'\n\s+stopper\.proc = host\.spawn\(')
+
+    def test_1_an_interrupt_at_the_ps_read_after_the_spawn_still_stops_restores_after_the_end_and_records(self):
+        self.w.ps_raises = {LAUNCHER_PID: KeyboardInterrupt}; self.w.cleanup_s = 30
+        self.assertEqual(self.main(RUN), 1, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertIn('interrupted', row['stopped'])
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        self.assertRestoredAfterTheEnd()
+
+    def test_1_an_exception_at_the_ps_read_is_retried_and_the_run_watched(self):
+        self.w.ps_raises = {LAUNCHER_PID: RuntimeError}
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        self.assertEqual(self.w.rows()[-1]['launcher']['start'], LAUNCHER_START)
+
+    def test_1_an_unreadable_start_does_not_disarm_the_fallback(self):
+        self.w.ps_unreadable = {LAUNCHER_PID}; self.w.write_identity = False; self.w.cleanup_s = 120; self.slow_after(30)
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertIsNone(row['launcher']['start'])
+        self.assertEqual(self.w.handle_signals, [(LAUNCHER_PID, signal.SIGINT)]); self.assertEqual(row['stop']['by'], 'launcher interrupt')
+        self.assertRestoredAfterTheEnd()
+
+    def test_1_an_unreadable_launcher_start_still_lets_the_observer_child_be_sent_term(self):
+        self.w.ps_unreadable = {LAUNCHER_PID}; self.w.cleanup_s = 60; self.slow_after(30)
+        self.main(RUN)
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+
+    def test_1_an_exception_in_the_watch_goes_through_the_one_path(self):
+        self.w.cleanup_s = 60
+        def boom(world):
+            raise RuntimeError('fake failure in the watch')
+        self.at(40, boom)
+        self.assertEqual(self.main(RUN), 1)
+        row = self.w.rows()[-1]
+        self.assertIn('fake failure', row['error']); self.assertTrue(row['launched'])
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertRestoredAfterTheEnd()
+        self.assertEqual(row['post']['native_loaded'], [])
+
+    def test_1_an_exit_in_the_watch_goes_through_the_one_path_then_exits(self):
+        self.w.cleanup_s = 60
+        def leave(world):
+            raise SystemExit(7)
+        self.at(40, leave)
+        with self.assertRaises(SystemExit):
+            self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertIn('SystemExit', row['stopped'])
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertRestoredAfterTheEnd()
+
+    # ---- 2: TERM and HUP handlers; the intent file; recover
+    def test_2_handlers_for_term_and_hup_are_installed_before_the_first_switch_off_and_put_back(self):
+        self.assertEqual(self.main(RUN), 0)
+        first_bootout = next(i for i, c in enumerate(self.w.calls) if c[:2] == ['/bin/launchctl', 'bootout'])
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            self.assertTrue(any(s == sig and n <= first_bootout for _, n, s in self.w.installs), sig)
+            self.assertEqual(self.w.handlers[sig], 'default')                        # put back at the end
+
+    def test_2_a_term_or_hup_during_the_watch_is_a_controlled_stop(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig.name):
+                self.fresh(); self.w.cleanup_s = 60
+                self.at(40, lambda world, sig=sig: world.fire(sig))
+                self.assertEqual(self.main(RUN), 1, self.w.text())
+                row = self.w.rows()[-1]
+                self.assertEqual(row['stopped'], 'operator signalled (%s)' % sig.name)
+                self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertRestoredAfterTheEnd()
+
+    def test_2_a_second_signal_during_the_stop_does_not_abort_it(self):
+        self.w.cleanup_s = 90
+        for s in (40, 70, 100, 130):
+            self.at(s, lambda world: world.fire(signal.SIGTERM))
+        self.assertEqual(self.main(RUN), 1)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stopped'], 'operator signalled (SIGTERM)'); self.assertRestoredAfterTheEnd()
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+
+    def test_2_the_intent_file_is_written_before_the_first_switch_off_and_removed_after_the_row(self):
+        seen = {}
+        self.at(40, lambda world: seen.update(json.loads(self.intent.read_text())))
+        self.assertEqual(self.main(RUN), 0)
+        before = self.w.intent_at_bootout; row = self.w.rows()[-1]
+        self.assertEqual(before['pick_reader']['before']['listed'], True); self.assertEqual(before['pick_reader']['before']['plist'], PICKS_PLIST)
+        self.assertEqual(before['models_to_unload'], ['qwen3.8-27b-chat']); self.assertEqual(before['work'], row['staged_folder'])
+        self.assertIsNone(before['launcher'])
+        self.assertEqual(seen['launcher']['pid'], LAUNCHER_PID); self.assertEqual(seen['launcher']['start'], LAUNCHER_START)
+        self.assertFalse(self.intent.exists())
+
+    def test_2_check_run_and_load_test_refuse_while_an_intent_file_exists(self):
+        self.intent.parent.mkdir(parents=True); self.intent.write_text('{"command": "run"}')
+        self.main(['check']); self.assertIn('UNFINISHED', self.w.text())
+        self.assertEqual(self.main(RUN), 2); self.assertIn('UNFINISHED', self.w.rows()[-1]['refused'])
+        self.assertEqual(self.main(self.LT), 2)
+        self.assertEqual(self.changing(), []); self.assertEqual(self.w.stages(), []); self.assertTrue(self.intent.exists())
+
+    def killed_run(self):
+        """A run whose tool was KILLed 40 s after the launch: its intent file, the reader booted out, the run alive."""
+        seen = {}
+        def snap(world):
+            seen['intent'] = self.intent.read_text(); seen['procs'] = copy.deepcopy(world.procs)
+        self.at(40, snap)
+        self.main(RUN)
+        self.w.on_sleep.clear()
+        self.intent.write_text(seen['intent']); self.w.picks_loaded = False; self.w.procs.update(seen['procs'])
+        self.w.out.clear(); self.w.calls.clear(); self.w.signals.clear(); self.w.http_calls.clear(); self.w.timed.clear()
+        self.rows_before = len(self.w.rows())
+
+    def test_2_recover_puts_the_reader_back_reports_the_run_writes_a_row_and_removes_the_intent(self):
+        self.killed_run()
+        self.assertEqual(self.main(['recover']), 3)
+        self.assertTrue(self.w.picks_loaded); self.assertEqual(self.w.signals, [])
+        self.assertIn('LAUNCHER STILL RUNNING', self.w.text()); self.assertIn('OBSERVER STILL RUNNING', self.w.text())
+        row = self.w.rows()[-1]
+        self.assertEqual(row['command'], 'recover'); self.assertEqual(row['recovered'], 'recovered after an unfinished run')
+        self.assertTrue(row['launcher_alive']); self.assertFalse(self.intent.exists())
+
+    def test_2_recover_stop_stops_the_surviving_run_the_documented_way(self):
+        self.killed_run()
+        def reap(world):
+            for pid in [p for p, v in world.procs.items() if v.get('termed_at') is not None and world.t >= v['termed_at'] + 5]:
+                world.procs.pop(pid)
+                if pid == OBSERVER_PID:
+                    world.procs.pop(LAUNCHER_PID, None)
+        self.w.on_sleep.append(reap)
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stop']['by'], 'observer'); self.assertFalse(row['launcher_alive_after'])
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+
+    def test_2_recover_reports_leftover_native_instances_and_unloads_nothing(self):
+        self.killed_run()
+        self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        self.w.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-left', 'config': {}}]})
+        self.assertEqual(self.main(['recover']), 3)
+        self.assertIn('MF-NATIVE INSTANCE STILL LOADED', self.w.text()); self.assertEqual(self.w.posts(), [])
+        self.assertEqual(self.w.rows()[-1]['native_loaded'], ['mf-native-left'])
+
+    def test_2_recover_dry_run_changes_nothing(self):
+        self.killed_run()
+        self.assertEqual(self.main(['recover', '--dry-run']), 0)
+        self.assertFalse(self.w.picks_loaded); self.assertEqual(self.w.signals, []); self.assertTrue(self.intent.exists())
+        self.assertEqual(len(self.w.rows()), self.rows_before)
+        self.assertEqual([c for c in self.w.calls if c[:2] in (['/bin/launchctl', 'bootstrap'], ['/bin/launchctl', 'bootout'])], [])
+
+    def test_2_recover_without_an_intent_file_has_nothing_to_do(self):
+        self.assertEqual(self.main(['recover']), 0); self.assertIn('no intent file', self.w.text()); self.assertEqual(self.w.rows(), [])
+
+    # ---- 3: never neither a row nor the intent file
+    def test_3_a_second_interrupt_while_the_minimal_row_is_written_leaves_the_intent_file(self):
+        orig = OP.post_state
+        def interrupted(host, row):
+            self.w.fsync_raises = KeyboardInterrupt; raise KeyboardInterrupt
+        OP.post_state = interrupted
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.main(RUN)
+        finally:
+            OP.post_state = orig
+        self.assertEqual(self.w.rows(), []); self.assertTrue(self.intent.exists()); self.assertTrue(self.w.picks_loaded)
+        self.assertEqual(self.main(['recover']), 0, self.w.text())
+        self.assertEqual(self.w.rows()[-1]['command'], 'recover'); self.assertFalse(self.intent.exists())
+
+    # ---- 4: a wrongly typed receipt field is an unreadable receipt
+    def test_4_a_wrongly_typed_receipt_field_is_unreadable_and_never_an_exception(self):
+        for field, value in (('events', 'x'), ('events', [1]), ('resource_failures', 'y'), ('complete', 'true'),
+                             ('cleanup_proven', 1), ('failure', 'boom'), ('resource', [1]), ('paper_handoff', 'yes'),
+                             ('resource_failure_samples', {})):
+            with self.subTest(field=field, value=value):
+                self.fresh(); self.w.receipt[field] = value
+                self.assertIn(self.main(RUN), (0, 3), self.w.text())
+                row = self.w.rows()[-1]
+                self.assertFalse(row['pipeline']['receipt_readable']); self.assertFalse(row['verdicts']['pipeline_clean'])
+                self.assertIsNone(row['error'])
+
+    # ---- 5: the watch deadline from the staged folder; durations from the limits table
+    def test_5_the_watch_deadline_comes_from_the_staged_folder(self):
+        self.w.staged_wall = 1800; self.w.run_s = 20000; self.w.cleanup_s = 60
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stopped'], 'wall exceeded'); self.assertEqual(row['deadline']['staged_wall_s'], 1800)
+        self.assertIn('mirofish_native_startup.py', row['deadline']['source'])
+        sent = OP._dt.datetime.fromisoformat(row['stop']['utc']).timestamp()
+        launched = OP._dt.datetime.fromisoformat(row['utc_launch']).timestamp()
+        self.assertGreaterEqual(sent - launched, 1800 + OP.CLEANUP_S); self.assertLessEqual(sent - launched, 1800 + OP.CLEANUP_S + OP.WATCH_S)
+        self.assertIn('staged deadline 1800 s', self.w.text())
+
+    def test_5_a_staged_folder_without_a_readable_deadline_refuses_before_any_switch_off(self):
+        self.w.staged_startup = False
+        self.assertEqual(self.main(RUN), 2); self.assertIn('deadline', self.w.rows()[-1]['refused']); self.assertEqual(self.changing(), [])
+
+    def test_5_startup_and_manifest_deadlines_that_differ_refuse(self):
+        self.w.staged_manifest_wall = 1234
+        self.assertEqual(self.main(RUN), 2); self.assertIn('1234', self.w.rows()[-1]['refused']); self.assertEqual(self.changing(), [])
+
+    def test_5_check_prints_the_expected_duration_and_the_wall_for_the_profile_and_plan(self):
+        self.main(['check', '--profile', 'swarm8', '--model', 'qwen3-8b'])
+        d = OP.run_durations('swarm8', {'model': 'qwen3-8b'})
+        self.assertIn('expected %d s, wall %d s' % (d['expected_s'], d['wall_s']), self.w.text())
 
 
 if __name__ == '__main__':
