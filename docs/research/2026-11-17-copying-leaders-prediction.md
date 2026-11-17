@@ -159,3 +159,27 @@ the 10-minute figure is given only for the months where a grain of five minutes 
 **What has been read by now, in all:** the boards; position lists for shapes and totals; for the two feasibility
 measurements above, counts of purchase prints in 14 markets and the shape of nine price windows. No entry has
 been set beside an outcome.
+
+## Third amendment of 2026-11-17, 15:12 UTC (during the pull's first phase; no trade has been analysed)
+
+**What happened.** The first phase of the pull (every candidate wallet's trades) ran for 76 minutes and was
+stopped by hand. 25 of the 192 candidate wallets were read (2,220,385 trade rows; the largest wallet 380,867).
+The 26th had been read for 50 minutes without ending: its history is in the millions of trades, the program held
+it in memory (6.9 GB and rising beside the live collector), and at the pace the service answers (about 0.7 pages
+of a thousand trades a second) one such wallet takes hours. The builder's estimate of the pull was wrong by a
+factor of about six.
+
+**The rule added.** A candidate wallet whose trades cannot be read within the reader's limit of 5,000 pages (five
+million trades) is LEFT OUT of the candidate set and named in every output. The limit was in the program before
+the pull began; this amendment only says what happens at it. The decision reads the number of pages and nothing
+else. A wallet with that many trades is, by any reading, a market maker or a machine, which the standing rule
+(fewer than 20 shares per dollar of profit) is there to leave out in any case; leaving it out by its size cannot
+look ahead, since size is not an outcome.
+
+**What does not change.** Everything else: the leaders among the wallets that remain, the copied trade, the
+follower's price, the cost, the periods, the one rule and its p-value.
+
+**What has been read by now, in all:** the boards; the shapes and counts listed in the earlier sections; and for
+this pull its own bookkeeping only (wallets finished, pages, rows stored, rows set aside by reason, the size of
+the store, the process's memory). No trade, price or resolution has been set beside an outcome. Resolutions and
+prices have not been pulled at all.
