@@ -189,7 +189,7 @@ class World:
         if self.real:
             if self.kill_at == 'sleep' and self.spawned:
                 os.kill(os.getpid(), signal.SIGKILL)
-            time.sleep(0.1)
+            time.sleep(0.25)               # real time for real children to end and be reaped
         self.t += seconds; self.collector_step()
         for callback in list(self.on_sleep):
             callback(self)
