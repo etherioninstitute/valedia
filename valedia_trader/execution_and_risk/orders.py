@@ -95,7 +95,8 @@ from typing import Callable, Iterable, Protocol
 
 __all__ = ["LiveVenue", "OrderLedger", "OrderError", "OrdersBlocked", "net_orders", "allocate", "STATES", "TERMINAL",
            "FORWARD", "NOTICE_KINDS", "RECONCILE_NOTICE_KINDS", "ANOMALY_KINDS", "UNRESOLVED_KINDS", "RECHECK_KINDS",
-           "POSITIONS_ERROR_KINDS", "ORDER_TYPES", "READABLE_LAYOUTS", "open_read_only"]
+           "POSITIONS_ERROR_KINDS", "ORDER_TYPES", "READABLE_LAYOUTS", "open_read_only",
+           "unreadable_layout"]
 
 STATES = ("intended", "sent", "accepted", "partly_filled", "filled", "cancelled", "rejected", "expired", "refused",
           "unknown", "never_arrived")
@@ -296,6 +297,19 @@ def _layout3_master() -> list:
         return _master(db)
     finally:
         db.close()
+
+
+def unreadable_layout(db: sqlite3.Connection) -> str | None:
+    """T51: why a database open for reading cannot be read as an order ledger (no orders table, a layout outside
+    READABLE_LAYOUTS, or layout 3 with a schema that is not layout 3's), in words; None when it can. Reads only."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if not db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]:
+        return f"it has no orders table (layout {version}): it is not an order ledger"
+    if version not in READABLE_LAYOUTS:
+        return f"it has layout {version}, and this code reads layouts {' and '.join(map(str, READABLE_LAYOUTS))} only"
+    if version == 3 and _master(db) != _layout3_master():
+        return "it says layout 3, but its tables are not layout 3's"
+    return None
 
 
 def _not_layout3(path) -> OrderError:
@@ -1258,15 +1272,9 @@ def open_read_only(path: str | Path, clock: Callable[[], float] = time.time) -> 
     try:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only = ON")
-        version = db.execute("PRAGMA user_version").fetchone()[0]
-        ours = db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
-        if not ours:
-            raise OrderError(f"the file {where} is not an order ledger (it has no orders table); it is not opened")
-        if version not in READABLE_LAYOUTS:
-            raise OrderError(f"the ledger file {where} has layout {version}, and this module reads layouts "
-                             f"{' and '.join(map(str, READABLE_LAYOUTS))} only; it is not opened")
-        if version == 3 and _master(db) != _layout3_master():
-            raise _not_layout3(path)
+        why = unreadable_layout(db)
+        if why is not None:
+            raise OrderError(f"the file {where} is not opened: {why}")
     except sqlite3.Error as exc:
         db.close()
         raise OrderError(f"the order ledger {where} could not be read: {_describe(exc)}") from exc

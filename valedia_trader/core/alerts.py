@@ -737,14 +737,12 @@ def check_switches(env: Env) -> CheckResult:
 def open_order_ledger(path: Path, clock: Callable[[], float]):
     """An order ledger on a read-only connection, read by its own methods. The ledger's constructor writes (it takes the
     write lock and may create tables), so this does not call it."""
-    from valedia_trader.execution_and_risk.orders import LAYOUT_VERSION, OrderLedger
+    from valedia_trader.execution_and_risk.orders import OrderLedger, unreadable_layout
     conn = open_readonly(path)
     try:
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        has = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'").fetchone()[0]
-        if not has or version != LAYOUT_VERSION:
-            raise CheckFailed(f"{path.name} is not an order ledger of the layout this code reads (layout {version}, "
-                              f"this code reads layout {LAYOUT_VERSION})")
+        why = unreadable_layout(conn)                     # T51: layouts 3 and 4 are read alike; nothing is upgraded
+        if why is not None:
+            raise CheckFailed(f"{path.name} is not an order ledger of a layout this code reads: {why}")
     except BaseException:
         conn.close()
         raise

@@ -2439,7 +2439,7 @@ def test_every_ledger_reader_reads_layout_3_and_layout_4_alike_and_writes_neithe
         times, body = op.broker_part(world.ledger_path, world.env(), op.Context(world.env()))
         assert {p.name: p.read_bytes() for p in (world.root / "memory").glob("orders-*")} == before   # nothing written
         assert not any("orders" in f or "layout" in f for f in r.failures), (layout, r.failures)
-        assert ("orders:orders-webull-sandbox" in keys(r)) is unknown, (layout, keys(r))
+        assert any(a["key"] == "orders:orders-webull-sandbox" for a in r.open) is unknown, (layout, r.open)
         assert all((o["order_type"], o["collar_price"]) == ("LIMIT", None) for o in records)
         seen[layout] = ([{k: v for k, v in o.items() if k not in ("order_type", "collar_price")} for o in records],
                         reasons, body, times)
