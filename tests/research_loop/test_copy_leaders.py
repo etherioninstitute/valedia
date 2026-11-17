@@ -914,9 +914,10 @@ def test_an_unfinished_price_window_names_the_leader_that_needs_it(tmp_path):
 class FakeService:
     """A synthetic data service: three wallets, a few trades each. Records every URL; no request leaves."""
 
-    def __init__(self, fail_wallet=None, reset_wallet=None, reset_condition=None):
+    def __init__(self, fail_wallet=None, reset_wallet=None, reset_condition=None, conflict_condition=None):
         self.urls = []
         self.fail_wallet, self.reset_wallet, self.reset_condition = fail_wallet, reset_wallet, reset_condition
+        self.conflict_condition = conflict_condition
         t0 = MS(2026, 2)
         self.trades = {
             "0xa": [{"proxy_wallet": "0xa", "side": "BUY", "token_id": "ta", "condition_id": "ca", "size": 4000.0,
@@ -948,9 +949,12 @@ class FakeService:
         if p == "/v2/resolutions":
             if self.reset_condition in q["condition"].split(","):
                 raise ConnectionResetError("reset by peer")
-            return json.dumps({"data": [{"condition_id": c, "status": "resolved", "payouts": [1_000_000, 0],
-                                         "resolved_at": "2026-02-10T00:00:00Z"}
-                                        for c in q["condition"].split(",") if c != "cb24"]}).encode()
+            rows = [{"condition_id": c, "status": "resolved", "payouts": [1_000_000, 0],
+                     "resolved_at": "2026-02-10T00:00:00Z"} for c in q["condition"].split(",") if c != "cb24"]
+            if self.conflict_condition in q["condition"].split(","):       # a second, different row for one id
+                rows.append({"condition_id": self.conflict_condition, "status": "resolved", "payouts": [0, 1_000_000],
+                             "resolved_at": "2026-02-11T00:00:00Z"})
+            return json.dumps({"data": rows}).encode()
         raise AssertionError(url)
 
 
@@ -1220,7 +1224,146 @@ def test_the_outputs_print_the_stores_counts_by_reason(tmp_path):
     db.commit()
     db.close()
     doc = cl.run_develop(store=store, out_dir=tmp_path / "o")
-    assert doc["result"]["store_counts"] == {"prices": {"conflicting_row": 2},
-                                             "trades": {"repeated_row": 1, "timestamp_out_of_span": 1}}
+    # "k1" is no window of a development position: development prints only what a development run may read
+    assert doc["result"]["store_counts"] == {"trades": {"repeated_row": 1, "timestamp_out_of_span": 1}}
     text = cl.format_table(doc)
-    assert "rows the store set aside" in text and "conflicting_row" in text and "timestamp_out_of_span" in text
+    assert "rows the store set aside" in text and "timestamp_out_of_span" in text and "conflicting_row" not in text
+    sealed = cl.load(store, "sealed")                    # the sealed output prints the whole store's counts
+    assert sealed.store_counts == {"prices": {"conflicting_row": 2},
+                                   "trades": {"repeated_row": 1, "timestamp_out_of_span": 1}}
+    assert "conflicting_row" in cl.format_table({"provenance": {}, "result": cl.sealed_result(sealed)})
+
+
+# ------------------------------------------------------------------ addendum 5
+def _sha(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def _rebuild(db, table, sql_from, sql_to, index=None):
+    """Remake `table` from its stored definition with one text changed (its rows kept)."""
+    sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+    new = sql.replace(sql_from, sql_to)
+    assert new != sql, sql
+    db.executescript("ALTER TABLE %s RENAME TO old_t; %s; INSERT INTO %s SELECT * FROM old_t; DROP TABLE old_t;"
+                     % (table, new, table))
+    if index:
+        db.execute(index)
+
+
+def _break(store, how):
+    sid = cl.store_id(store)
+    db = sqlite3.connect(str(store))
+    if how == "meta_without_its_key_and_two_ids":        # the store the blind check built
+        _rebuild(db, "meta", "key TEXT PRIMARY KEY", "key TEXT")
+        db.execute("INSERT INTO meta VALUES ('store_id', ?)", (json.dumps(sid),))
+    elif how == "trades_without_its_key":
+        _rebuild(db, "trades", ", PRIMARY KEY (wallet, seq)", "",
+                 index="CREATE INDEX trades_ts ON trades (wallet, timestamp)")
+    elif how == "a_table_missing":
+        db.execute("DROP TABLE rejects")
+    elif how == "an_extra_table":
+        db.execute("CREATE TABLE extra (x)")
+    elif how == "a_trigger":
+        db.execute("CREATE TRIGGER t AFTER INSERT ON meta BEGIN DELETE FROM meta WHERE key='sealed_marker'; END")
+    elif how == "two_markers":
+        _rebuild(db, "meta", "key TEXT PRIMARY KEY", "key TEXT")
+        db.executemany("INSERT INTO meta VALUES ('sealed_marker', ?)", [("1",), ("2",)])
+    db.commit()
+    db.close()
+
+
+SHAPES = ["meta_without_its_key_and_two_ids", "trades_without_its_key", "a_table_missing", "an_extra_table",
+          "a_trigger", "two_markers"]
+
+
+@pytest.mark.parametrize("how", SHAPES)
+def test_a_store_not_of_the_programs_own_shape_is_refused_in_words_with_nothing_written(tmp_path, how):
+    store = _cheap(tmp_path)
+    _break(store, how)
+    before = _sha(store)
+    for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o"),
+                lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True),
+                lambda: cl.load(store, "development")):
+        with pytest.raises(cl.Refused, match="shape"):
+            run()
+    assert _sha(store) == before and not (tmp_path / "o").exists()
+
+
+def test_the_store_the_check_built_runs_no_sealed_period_at_all(tmp_path):
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    assert cl.run_develop(store=store, out_dir=out)["result"]["step_1"]["verdict"] == "PROCEED"
+    _break(store, "meta_without_its_key_and_two_ids")
+    before = _sha(store)
+    for _ in range(2):
+        with pytest.raises(cl.Refused, match="shape"):
+            cl.run_sealed(store=store, out_dir=out, flag=True)
+    assert _sha(store) == before and not (out / "sealed.used").exists() and not (out / "sealed.json").exists()
+
+
+def test_conflicting_resolution_rows_are_counted_under_their_own_reason_and_printed(tmp_path):
+    store = tmp_path / "pm.sqlite"
+    cl.pull(store, _client(FakeService(conflict_condition="ca")), phase=1, say=lambda m: None)
+    with cl.Store(store) as s:
+        assert s.resolution_answers()["ca"] == "duplicate"              # still not trusted
+        assert s.resolution_rows(["ca"]) == {}
+        assert s.counts_by_reason() == {"resolutions": {"conflicting_row": 2}}
+    doc = cl.run_develop(store=store, out_dir=tmp_path / "o")          # "ca" is traded in February
+    assert doc["result"]["store_counts"] == {"resolutions": {"conflicting_row": 2}}
+    assert "conflicting_row" in cl.format_table(doc)
+    clean = tmp_path / "clean.sqlite"
+    cl.pull(clean, _client(FakeService()), phase=1, say=lambda m: None)
+    with cl.Store(clean) as s:
+        assert s.counts_by_reason() == {}
+
+
+def _rej(store, rows):
+    db = sqlite3.connect(str(store))
+    db.executemany("INSERT INTO rejects VALUES (?,?,?,?,?)", [r + ("2026-11-17T09:03:00Z",) for r in rows])
+    db.commit()
+    db.close()
+
+
+def test_development_prints_only_counts_it_may_read_and_sealed_the_whole_stores(tmp_path):
+    w = World(5, edge=0.0, move=0.0, pros=6, per_month=12)
+    store = w.write(tmp_path / "c.sqlite")
+    with cl.Store(store) as s:
+        plan, windows = s.plan(), s.plan_windows()
+    sealed_key = sorted(k for k, wd in windows.items() if plan[wd.target].t1 >= cl.SEALED_START)[0]
+    dev_key = sorted(k for k, wd in windows.items() if plan[wd.target].t1 < cl.SEALED_START)[0]
+    sealed_cond = sorted(c for c in _sealed_only(w) if c.startswith("cond"))[0]
+    dev_cond = next(r["condition_id"] for r in w.trades["pro01"] if r["timestamp"] < cl.SEALED_START - DAY)
+
+    def pt(ts):
+        return json.dumps({"price": 0.5, "resolution_seconds": 300, "timestamp": ts})
+
+    def tr(ts):
+        return json.dumps({"proxy_wallet": "pro01", "timestamp": ts})
+    cl.run_develop(store=store, out_dir=tmp_path / "a")
+    _rej(store, [("prices", sealed_key, "repeated_row", pt(cl.SEALED_START + DAY))] * 3
+         + [("prices", sealed_key, "conflicting_row", pt(cl.SEALED_START + DAY))] * 2
+         + [("trades", "pro01", "repeated_row", tr(cl.SEALED_START + 3 * DAY)),
+            ("trades", "pro01", "repeated_row", tr(cl.SEALED_START + 10))]
+         + [("resolutions", sealed_cond, "conflicting_row", "{}")] * 2)
+    cl.run_develop(store=store, out_dir=tmp_path / "b")
+    a, b = (tmp_path / "a" / "develop.json").read_bytes(), (tmp_path / "b" / "develop.json").read_bytes()
+    assert a == b                                        # rows of sealed-only windows change nothing in development
+    _rej(store, [("prices", dev_key, "repeated_row", pt(cl.SEALED_START - DAY)),
+                 ("trades", "pro01", "repeated_row", tr(cl.SEALED_START - DAY)),
+                 ("resolutions", dev_cond, "conflicting_row", "{}")])
+    c = cl.run_develop(store=store, out_dir=tmp_path / "c")
+    assert c["result"]["store_counts"] == {"prices": {"repeated_row": 1}, "resolutions": {"conflicting_row": 1},
+                                           "trades": {"repeated_row": 1}}     # the other side: these are read
+    assert cl.load(store, "sealed").store_counts == {"prices": {"conflicting_row": 2, "repeated_row": 4},
+                                                     "resolutions": {"conflicting_row": 3},
+                                                     "trades": {"repeated_row": 3}}
+
+
+def test_the_docstring_states_what_development_reads_and_the_copied_store_limit_exactly():
+    doc = " ".join(cl.__doc__.split())
+    assert "the resolutions of every market a candidate traded before 2026-07-01" in doc
+    assert "only those a development position or a development standing needs are used" in doc
+    assert "can be run again whenever the original's sealed run used an output folder other than the default" in doc
+    assert "in the same repository too" in doc
+    assert "the default folder's marker protects only" in doc

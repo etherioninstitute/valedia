@@ -162,9 +162,29 @@ def test_any_other_non_200_answer_is_an_error(monkeypatch):
                                  "https://data-api.polymarket.com/v2/Trades",
                                  "https://data-api.polymarket.com/v2/",
                                  "https://data-api.polymarket.com/v2/trades?user=0x1 x",
-                                 "HTTPS://data-api.polymarket.com/v2/trades"])
+                                 "HTTPS://data-api.polymarket.com/v2/trades",
+                                 "https://data-api.polymarket.com/v2//x",          # no empty path segment
+                                 "https://data-api.polymarket.com/v2/x//y",
+                                 "https://data-api.polymarket.com/v2///",
+                                 "https://data-api.polymarket.com/v2/trades/",     # no trailing slash
+                                 "https://data-api.polymarket.com/v2/trades/?user=0x1"])
 def test_default_transport_refuses_any_other_address(monkeypatch, url):
     fake = fake_network(monkeypatch)
+    with pytest.raises(pd.PolymarketDataError):
+        pd.urllib_get(url)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("host", ["data-apiXpolymarket.com", "data-api.polymarketXcom", "data-api.polymarket.com"])
+def test_a_look_alike_host_differing_where_the_real_one_has_a_dot_is_refused(monkeypatch, host):
+    """Fails when the service's host is not escaped in the expression: an unescaped dot matches any character."""
+    fake = fake_network(monkeypatch)
+    url = "https://%s/v2/trades?user=0x1" % host
+    if host == "data-api.polymarket.com":                 # the real host still passes: the check has two sides
+        pd.urllib_get(url)
+        assert len(fake.requests) == 1
+        return
+    assert not pd._allowed(url)
     with pytest.raises(pd.PolymarketDataError):
         pd.urllib_get(url)
     assert fake.requests == []
@@ -291,7 +311,7 @@ def test_not_json_is_a_clear_error():
 def test_only_v2_paths_are_asked():
     c, t, clock = client(lambda p, q: {"data": []})
     for bad in ("/v1/trades", "trades", "/v2/../admin", "//evil.io/v2/trades", "/v2/%2e%2e/x", "/v2/trades ",
-                "/v2/T", "/v2/", " /v2/trades"):
+                "/v2/T", "/v2/", " /v2/trades", "/v2//x", "/v2/x//y", "/v2///", "/v2/trades/"):
         with pytest.raises(pd.PolymarketDataError):
             c.get_json(bad, {})
     assert t.urls == []
