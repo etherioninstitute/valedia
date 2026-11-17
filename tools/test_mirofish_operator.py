@@ -2,7 +2,8 @@
 the stager or the launcher, sends a request to LM Studio, opens the collector's real store, loads a model or signals a real
 process: a World object stands in for all of them (an injected command runner, spawn, HTTP function, clock and sleeper, signal
 sender and model load path) and a scratch SQLite file stands in for the collector's store."""
-import ast, copy, fcntl, hashlib, importlib.util, json, os, random, signal, sqlite3, subprocess, sys, tempfile, time, types, unittest
+import ast, contextlib, copy, fcntl, hashlib, importlib.util, io, json, os, random, signal, sqlite3, subprocess, sys, tempfile, time, types, unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).absolute().parent
@@ -156,6 +157,9 @@ class World:
         self.commands = {}; self.collector_pid = None; self.scan_raises = None; self.command_raises = None
         self.real = False; self.signalled_real = set(); self.kill_at = None; self.term_in_spawn = False; self.on_bootstrap = None; self.on_fsync = None
         self.staged_manifest_wall = None; self.staged_startup = True; self.intent_at_bootout = 'unseen'
+        # addendum 7: a command read that fails for a live pid (pid -> what the read returns), a garbled start, an
+        # unreadable model list, the plist the reader is loaded from
+        self.commands_unreadable = {}; self.ps_garbled = set(); self.models_unreadable = False; self.picks_plist_path = PICKS_PLIST
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
@@ -219,7 +223,7 @@ class World:
                     '\tevent triggers = {\n\t\tcom.valedia.picks.hourly.1 => {\n\t\t\tdescriptor = {\n'
                     '\t\t\t\t"Minute" => %d\n\t\t\t}\n\t\t}\n\t}\n' % self.picks_minute)
                 return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = %s\n\targuments = {\n'
-                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n%s}\n' % (PICKS_PLIST, state, trigger))
+                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n%s}\n' % (self.picks_plist_path, state, trigger))
         if argv[:2] == ['/bin/launchctl', 'bootout']:
             intent = self.tmp / 'artifacts/mirofish/operator-intent.json'
             self.intent_at_bootout = json.loads(intent.read_text()) if intent.is_file() else None
@@ -250,6 +254,8 @@ class World:
                 os.kill(os.getpid(), signal.SIGKILL)
             r = subprocess.run(argv, capture_output=True, text=True)          # read-only: pid, ppid, pgid and start only
             return done(r.returncode, r.stdout, '')
+        if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_garbled:
+            return done(0, 'garbled\n')
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_raises:
             raise self.ps_raises.pop(int(argv[2]))()              # once
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_unreadable:
@@ -308,9 +314,18 @@ class World:
     def proc_command(self, pid):
         if self.command_raises:
             raise self.command_raises('%s fake failure' % SECRET)
+        if pid in self.commands_unreadable:
+            return self.commands_unreadable[pid]
         if self.real and pid in self.real_set():
-            return self.ours(pid)
-        return self.commands.get(pid) if pid in self.procs else None
+            # a real child of this test: its command; a live pid that is no longer ours: an unrelated command (never
+            # read further); a pid that ended: no answer, as ps gives
+            r = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'command='], capture_output=True, text=True)
+            if r.returncode != 0:
+                return None
+            return self.ours(pid) or 'another process, not one of this test\'s'
+        if pid not in self.procs:
+            return None
+        return self.commands.get(pid, '/usr/libexec/an-unrelated-daemon --n %d' % pid)   # every live process has one
 
     def proc_scan(self):
         if self.scan_raises:
@@ -377,6 +392,8 @@ class World:
     def http(self, method, url, body=None, timeout=None):
         self.http_calls.append((method, url, copy.deepcopy(body))); self.timed.append((self.t, [method, url]))
         if method == 'GET' and url.endswith('/api/v1/models'):
+            if self.models_unreadable:
+                raise OSError('fake: LM Studio unreachable')
             return 200, copy.deepcopy(self.models)
         if method == 'POST' and url.endswith('/api/v1/models/unload'):
             if self.unload_status != 200:
@@ -1904,7 +1921,8 @@ class Addendum4(Base):
             self.assertEqual(self.main(['recover', '--stop']), 2); self.assertIn('LOCK', self.w.text())
             self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists())
             self.intent.rename(self.intent.with_name('kept.json'))
-            self.assertEqual(self.main(RUN), 2); self.assertIn('LOCK', self.w.rows()[-1]['refused'])
+            rows = len(self.w.rows())                 # addendum 7, E: a command refused by the lock writes no row
+            self.assertEqual(self.main(RUN), 2); self.assertIn('LOCK', self.w.text()); self.assertEqual(len(self.w.rows()), rows)
             self.assertEqual(self.main(self.LT), 2); self.assertEqual(self.w.bootouts(), [])
             self.intent.with_name('kept.json').rename(self.intent)
         finally:
@@ -2275,6 +2293,283 @@ class Addendum6(Base):
         self.assertEqual(r['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
         self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a for a in r['alerts']))
         self.assertNotIn('late-1', [b['instance_id'] for _, _, b in self.w.posts()])
+
+
+class Addendum7(Base):
+    """The repair after the blind check of b81df20."""
+    LT = LoadTest.LT
+    intent = Addendum3.intent
+    killed_run = Addendum3.killed_run
+    at = Addendum3.at
+    fresh = Addendum3.fresh
+    changing = Addendum3.changing
+    edit_intent = Addendum4.edit_intent
+    identity_names = Addendum4.identity_names
+    assertNoSecret = Addendum4.assertNoSecret
+    lt_result = Addendum6.lt_result
+    LATE = Addendum6.LATE
+
+    def reap_on_term(self):
+        def reap(world):
+            for pid in [p for p, v in world.procs.items() if v.get('termed_at') is not None and world.t >= v['termed_at'] + 5]:
+                world.procs.pop(pid, None)
+                if pid == OBSERVER_PID:
+                    world.procs.pop(LAUNCHER_PID, None)
+        self.w.on_sleep.append(reap)
+
+    def signalled(self):
+        return {pid for pid, _ in self.w.signals}
+
+    def assertHeldBack(self, rc):
+        """Nothing put back: the reader off, the file kept, exit 3, and no command line anywhere."""
+        self.assertEqual(rc, 3, self.w.text()); self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists())
+        self.assertNoSecret()
+
+    # ---- A: survivors are found by the scan alone, every process tested for both roles; a proposal is only a hint
+    def crafted(self, case):
+        self.killed_run()
+        if case in ('swapped', 'the intent alone'):
+            self.edit_intent(launcher={'pid': OBSERVER_PID, 'start': OBSERVER_START, 'pgid': OBSERVER_PID})
+        if case in ('swapped', 'the identity file alone'):
+            self.identity_names(LAUNCHER_PID, LAUNCHER_START, LAUNCHER_PID)
+        if case == 'unrelated live pids':
+            for pid in (8801, 8802):
+                self.w.procs[pid] = {'start': 'Mon Nov 16 10:00:00 2026', 'pgid': pid, 'ppid': 1}
+            self.edit_intent(launcher={'pid': 8801, 'start': 'Mon Nov 16 10:00:00 2026', 'pgid': 8801})
+            self.identity_names(8802, 'Mon Nov 16 10:00:00 2026', 8802)
+
+    def test_A_the_launcher_and_observer_are_found_in_their_true_roles_whatever_the_files_propose(self):
+        for case in ('swapped', 'the intent alone', 'the identity file alone', 'unrelated live pids'):
+            with self.subTest(case=case):
+                self.fresh(); self.crafted(case)
+                self.assertHeldBack(self.main(['recover']))
+                self.assertIn('LAUNCHER STILL RUNNING', self.w.text()); self.assertIn('OBSERVER STILL RUNNING', self.w.text())
+                self.assertEqual(self.w.signals, []); self.assertEqual(len(self.w.rows()), self.rows_before)
+                self.w.out.clear(); self.reap_on_term()
+                self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+                self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])          # the true observer, TERM
+                self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists()); self.assertNoSecret()
+
+    def test_A_a_pid_replaced_after_the_scan_and_before_the_signal_is_never_signalled(self):
+        self.killed_run()
+        original = OP.find_survivors
+        def then_replaced(host, intent):
+            found = original(host, intent)
+            for pid in (LAUNCHER_PID, OBSERVER_PID):          # the same commands, other processes (another start)
+                self.w.procs[pid] = {'start': 'Mon Nov 16 13:13:13 2026', 'pgid': pid, 'ppid': 1}
+            return found
+        with unittest.mock.patch.object(OP, 'find_survivors', then_replaced):
+            self.main(['recover', '--stop'])
+        self.assertEqual(sorted(p['role'] for p in self.w.rows()[-1]['proven']), ['launcher', 'observer'])
+        self.assertEqual(self.w.signals, [])
+
+    # ---- B: a command or a start that could not be read is "the proof could not be made", never "not ours"
+    def test_B_a_command_that_could_not_be_read_holds_everything_back(self):
+        for value in (None, 5, b'bytes', '', '   '):
+            for pid in (LAUNCHER_PID, OBSERVER_PID):
+                with self.subTest(value=value, pid=pid):
+                    self.fresh(); self.killed_run(); self.reap_on_term(); self.w.commands_unreadable = {pid: value}
+                    self.assertHeldBack(self.main(['recover', '--stop']))
+                    self.assertNotIn(pid, self.signalled()); self.assertIn('COULD NOT BE MADE', self.w.text())
+                    self.assertNotIn(pid, [x['pid'] for x in self.w.rows()[-1]['not_ours']] if len(self.w.rows()) > self.rows_before else [])
+
+    def test_B_a_start_that_could_not_be_read_holds_everything_back(self):
+        for pid in (LAUNCHER_PID, OBSERVER_PID):
+            with self.subTest(pid=pid):
+                self.fresh(); self.killed_run(); self.reap_on_term(); self.w.ps_garbled = {pid}
+                self.assertHeldBack(self.main(['recover', '--stop']))
+                self.assertNotIn(pid, self.signalled()); self.assertIn('COULD NOT BE MADE', self.w.text())
+
+    def test_B_a_scan_that_does_not_list_this_tool_could_not_be_made(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        self.assertHeldBack(self.main(['recover', '--stop'], proc_scan=lambda: []))
+        self.assertIn('SCAN COULD NOT BE MADE', self.w.text())
+
+    # ---- C: an unreadable model list: before the spawn a refusal; after it an alert, counting only once read again
+    def assertRefusedUnread(self, rc, row):
+        self.assertEqual(rc, 2, self.w.text()); self.assertFalse(row['launched']); self.assertEqual(self.w.spawned, [])
+        self.assertIn('MODEL LIST COULD NOT BE READ', row['refused']); self.assertTrue(row['model_list_unread'])
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+
+    def test_C_an_unreadable_model_list_before_the_spawn_refuses(self):
+        for where in ('after the unloads', 'before the gate'):
+            with self.subTest(where=where):
+                self.fresh()
+                http, run = self.w.http, self.w.run
+                def unread_http(method, url, body=None, timeout=None):
+                    reply = http(method, url, body, timeout)
+                    if method == 'POST':
+                        self.w.models_unreadable = True
+                    return reply
+                def unread_run(argv, cwd=None, env=None, timeout=None):
+                    if '--preflight' in [str(a) for a in argv]:
+                        self.w.models_unreadable = True
+                    return run(argv, cwd, env, timeout)
+                rc = self.main(RUN, **({'http': unread_http} if where == 'after the unloads' else {'run': unread_run}))
+                self.assertRefusedUnread(rc, self.w.rows()[-1])
+                self.assertFalse(any(p.name == OP.GATE_NAME for p in self.w.crew.rglob('*')))
+
+    def test_C_an_unreadable_model_list_before_the_load_call_refuses(self):
+        def hook(world):
+            if world.t > START + 30 and not world.loads:
+                world.models_unreadable = True
+        self.w.on_sleep.append(hook)
+        rc = self.main(self.LT)
+        r = self.lt_result()
+        self.assertEqual(rc, 2); self.assertEqual(self.w.loads, []); self.assertIn('MODEL LIST COULD NOT BE READ', r['refused'])
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+
+    def test_C_after_the_spawn_an_unreadable_list_is_an_alert_and_the_run_counts_only_once_it_is_read_again(self):
+        self.at(30, lambda world: setattr(world, 'models_unreadable', True))
+        self.at(60, lambda world: setattr(world, 'models_unreadable', False))
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertTrue(row['counts']); self.assertTrue(any('MODEL LIST COULD NOT BE READ' in a for a in row['alerts']), row['alerts'])
+        self.fresh()
+        self.at(30, lambda world: setattr(world, 'models_unreadable', True))
+        self.assertNotEqual(self.main(RUN), 0)
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertFalse(row['counts']); self.assertTrue(row['model_list_unread'])
+        self.assertTrue(any('MODEL LIST COULD NOT BE READ' in a for a in row['alerts']), row['alerts'])
+
+    # ---- D: an instance is protected only as the expected pair of id and key; anything else refuses before a switch-off
+    def listing_cases(self):
+        def emb_id_under_the_27b(m):
+            m[1]['loaded_instances'] = []; m[2]['loaded_instances'][0]['id'] = 'ym-research-embedding'
+        def emb_key_other_id(m):
+            m[1]['loaded_instances'][0]['id'] = 'emb-2'
+        def decision_id_other_key(m):
+            m.append({'key': 'other/key', 'type': 'llm', 'loaded_instances': [{'id': 'elephant-1', 'config': {}}]})
+        def decision_key_other_id(m):
+            m[0]['loaded_instances'].append({'id': 'copy', 'config': {}})
+        def bad(key, iid):
+            def edit(m):
+                inst = {'config': {}} if iid is ... else {'id': iid, 'config': {}}
+                m.append({'key': key, 'type': 'llm', 'loaded_instances': [inst]})
+            return edit
+        return {'embedding id under the 27B key': emb_id_under_the_27b, 'embedding key under another id': emb_key_other_id,
+                'decision id under another key': decision_id_other_key, 'decision key under another id': decision_key_other_id,
+                'id 5': bad('x/y', 5), 'id None': bad('x/y', None), 'no id': bad('x/y', ...), 'id a list': bad('x/y', ['a']),
+                'key None': bad(None, 'z-1'), 'key 7': bad(7, 'z-1'), 'key a list': bad(['k'], 'z-1')}
+
+    def test_D_a_protected_id_or_key_in_another_pair_or_a_non_string_id_or_key_refuses_before_any_switch_off(self):
+        for name, edit in self.listing_cases().items():
+            with self.subTest(case=name):
+                self.fresh(); edit(self.w.models['models'])
+                self.assertEqual(self.main(RUN), 2, self.w.text())
+                self.assertIn('the tool does not guess', self.w.rows()[-1]['refused'])
+                self.assertEqual(self.changing(), []); self.assertEqual(self.w.stages(), []); self.assertFalse(self.intent.exists())
+                self.w.out.clear(); self.assertEqual(self.main(['check']), 0)
+                self.assertTrue(any(str(x).startswith('REFUSED') and 'the tool does not guess' in str(x) for x in self.w.out), self.w.text())
+
+    # ---- E: a command refused by the lock touches nothing of the holder's; refusals in words
+    def test_E_a_load_test_refused_by_the_lock_writes_nothing_of_the_holders_10_trials(self):
+        def wait_for(path):
+            end = time.monotonic() + REAL_WAIT_S
+            while time.monotonic() < end and not path.exists():
+                time.sleep(0.01)
+            return path.exists()
+        for trial in range(10):
+            with self.subTest(trial=trial):
+                self.fresh(); sync = self.w.tmp / 'sync'; sync.mkdir()
+                def hold(world):        # the holder, after its switch-offs: it says so, then waits for the second to end
+                    if not (sync / 'a-holds').exists():
+                        (sync / 'a-holds').touch(); wait_for(sync / 'b-done')
+                a = os.fork()
+                if a == 0:
+                    code = 99
+                    try:
+                        self.w.on_sleep.append(hold); code = OP.main(self.LT, host=self.w.host())
+                    finally:
+                        os._exit(code if type(code) is int else 98)
+                self.assertTrue(wait_for(sync / 'a-holds'))
+                b = os.fork()
+                if b == 0:
+                    code = 99
+                    try:
+                        lines = []
+                        code = OP.main(self.LT, host=self.w.host(out=lines.append))
+                        (sync / 'b-out').write_text(json.dumps([str(x) for x in lines]))
+                    finally:
+                        (sync / 'b-done').touch(); os._exit(code if type(code) is int else 98)
+                rc_b = os.WEXITSTATUS(os.waitpid(b, 0)[1]); rc_a = os.WEXITSTATUS(os.waitpid(a, 0)[1])
+                self.assertEqual((rc_a, rc_b), (0, 2))
+                said = json.loads((sync / 'b-out').read_text())
+                self.assertEqual(len(said), 1, said); self.assertTrue(said[0].startswith('refused: ') and 'LOCK' in said[0])
+                files = sorted((self.w.tmp / 'artifacts/load-tests').glob('*.json'))
+                self.assertEqual(len(files), 1); self.assertIsNone(json.loads(files[0].read_text())['refused'])
+                self.assertFalse(self.intent.exists()); self.assertEqual(self.w.rows(), [])
+
+    def test_E_recover_when_the_pick_readers_job_read_raises_is_a_refusal_in_words(self):
+        self.killed_run(); self.reap_on_term()
+        orig = self.w.run
+        def run(argv, cwd=None, env=None, timeout=None):
+            if argv[:2] == ['/bin/launchctl', 'print'] and str(argv[2]).endswith(OP.PICKS_LABEL):
+                raise OSError('fake: launchctl print failed %s' % SECRET)
+            return orig(argv, cwd, env, timeout)
+        rc = self.main(['recover', '--stop'], run=run)
+        self.assertEqual(rc, 2, self.w.text()); self.assertIn('refused', self.w.text()); self.assertIn('OSError', self.w.text())
+        self.assertEqual(self.w.signals, []); self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
+        self.assertEqual(len(self.w.rows()), self.rows_before); self.assertNoSecret()
+        self.assertEqual([c for c in self.w.calls if c[:2] == ['/bin/launchctl', 'bootstrap']], [])
+
+    def test_E_the_same_model_for_both_roles_and_an_unknown_model_are_refusals_in_words(self):
+        for argv in (['run', '--profile', 'swarm8', '--setup-model', 'qwen3-8b', '--turns-model', 'qwen3-8b', '--announced', 'x'],
+                     ['check', '--setup-model', 'qwen3-8b', '--turns-model', 'qwen3-8b'],
+                     ['run', '--profile', 'swarm8', '--model', 'no-such-model', '--announced', 'x'],
+                     ['check', '--model', 'no-such-model']):
+            with self.subTest(argv=argv):
+                self.fresh()
+                self.assertEqual(self.main(argv), 2); self.assertTrue(self.w.text().startswith('refused: '), self.w.text())
+                self.assertEqual(self.changing(), []); self.assertEqual(self.w.stages(), [])
+
+    def strict_stdout(self):
+        return io.TextIOWrapper(io.BytesIO(), encoding='ascii', errors='strict')
+
+    def test_E_a_lone_surrogate_is_refused_by_the_shape_check_and_every_print_is_safe(self):
+        self.killed_run()
+        self.edit_intent(work=str(self.w.crew / 'valedia-native-\ud800-x'))
+        stream = self.strict_stdout()
+        with contextlib.redirect_stdout(stream):
+            rc = self.main(['recover', '--stop'], out=None)
+        stream.flush(); said = stream.buffer.getvalue().decode('ascii')
+        self.assertEqual(rc, 2, said); self.assertIn('work', said); self.assertTrue(self.intent.exists()); self.assertEqual(self.w.signals, [])
+        self.fresh()
+        self.w.models['models'].append({'key': 'x/\udcff', 'type': 'llm', 'loaded_instances': [{'id': 'other-\ud800', 'config': {}}]})
+        stream = self.strict_stdout()
+        with contextlib.redirect_stdout(stream):
+            self.assertEqual(self.main(['check'], out=None), 0)
+        stream.flush(); self.assertIn('other-', stream.buffer.getvalue().decode('ascii'))
+
+    # ---- F: the tests the surviving mutants showed missing
+    def test_F_an_intent_naming_a_work_folder_outside_the_crew_folder_or_not_a_staged_one_is_refused_whole(self):
+        for work in (lambda: self.w.tmp / 'elsewhere' / 'valedia-native-20261116-swarm8-op120000',
+                     lambda: self.w.crew / 'not-a-staged-folder'):
+            with self.subTest(work=str(work())):
+                self.fresh(); self.killed_run(); self.reap_on_term(); self.edit_intent(work=str(work()))
+                self.assertEqual(self.main(['recover', '--stop']), 2); self.assertIn('MISMATCH', self.w.text())
+                self.assertIn('work folder', self.w.text()); self.assertEqual(self.w.signals, []); self.assertTrue(self.intent.exists())
+                self.assertFalse(self.w.picks_loaded)
+
+    def test_F_a_model_that_appears_and_goes_between_two_watch_checks_still_marks_the_run(self):
+        self.at(30, lambda world: Addendum6.appear(self, world))
+        self.at(60, lambda world: world.models.update(models=[e for e in world.models['models'] if e.get('key') != 'late/model']))
+        self.assertNotEqual(self.main(RUN), 0)
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertFalse(row['counts'])
+        self.assertEqual(row['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
+        self.assertEqual(row['post']['others'], [])                          # gone by the final check
+        self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a for a in row['alerts']))
+
+    def test_F_a_reader_reloaded_from_another_plist_between_the_check_and_the_switch_off_is_not_booted_out(self):
+        orig = self.w.run
+        def run(argv, cwd=None, env=None, timeout=None):
+            if any(str(a).endswith('mirofish_native_stage.py') for a in argv):
+                self.w.picks_plist_path = '/fake/LaunchAgents/elsewhere.plist'
+            return orig(argv, cwd, env, timeout)
+        self.assertEqual(self.main(RUN, run=run), 2)
+        self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.spawned, [])
+        self.assertIn('elsewhere.plist', self.w.rows()[-1]['refused'])
 
 
 if __name__ == '__main__':
