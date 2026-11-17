@@ -285,6 +285,77 @@ def test_the_date_header_is_handed_back_and_existing_callers_see_no_difference(m
     assert plain.last_date is None and dated.last_date == "Fri, 13 Nov 2026 06:00:01 GMT"
 
 
+#
+# ---- T45-1: one market's record, for settlement (live tier, then the historical tier on a 404 only) ----
+
+NBA = "KXNBAGAME-26NOV13ATLCHI-ATL"
+# Kalshi's public record of NBA as the lead read it on 2026-11-17 (key `market`; every field a str).
+NBA_RECORD = {"ticker": NBA, "event_ticker": "KXNBAGAME-26NOV13ATLCHI", "market_type": "binary", "status": "finalized",
+              "result": "no", "settlement_value_dollars": "0.0000", "settlement_ts": "2026-11-14T03:49:44.800032Z",
+              "close_time": "2026-11-14T03:47:58Z", "expiration_value": "125-117", "settlement_bounds_type": "default",
+              "strike_type": "structured", "volume_fp": "1000.00"}
+SIX = {"ticker": NBA, "market_type": "binary", "status": "finalized", "result": "no", "settlement_value_dollars": "0.0000",
+       "settlement_ts": "2026-11-14T03:49:44.800032Z"}
+
+
+def test_market_reads_the_six_settlement_fields_exactly_as_sent_from_the_live_tier():
+    c, clock = client({("/markets/%s" % NBA, ()): {"market": NBA_RECORD}})
+    assert c.market(NBA) == {**SIX, "tier": "live"}
+    assert [urllib.parse.urlsplit(u).path for u in c.fetch.urls] == ["/trade-api/v2/markets/%s" % NBA]
+    assert urllib.parse.urlsplit(c.fetch.urls[0]).query == ""
+    odd = {**NBA_RECORD, "settlement_value_dollars": 1.0, "status": None}
+    del odd["result"]
+    c, _ = client({("/markets/%s" % NBA, ()): {"market": odd}})
+    got = c.market(NBA)                                       # never converted or filled in: judged by the caller
+    assert got["settlement_value_dollars"] == 1.0 and got["status"] is None and got["result"] is None
+
+
+def test_market_goes_to_the_historical_tier_on_a_404_only():
+    c, _ = client({("/historical/markets/%s" % NBA, ()): {"market": NBA_RECORD}})       # live: 404 (no route)
+    assert c.market(NBA) == {**SIX, "tier": "historical"}
+    assert [urllib.parse.urlsplit(u).path for u in c.fetch.urls] == ["/trade-api/v2/markets/%s" % NBA,
+                                                                       "/trade-api/v2/historical/markets/%s" % NBA]
+    c, _ = client({})                                                                    # both 404
+    with pytest.raises(kd.HttpError) as e:
+        c.market(NBA)
+    assert e.value.status == 404 and len(c.fetch.urls) == 2
+    for status in (500, 503, 429):                                                       # retried, never the other tier
+        c, _ = client({("/markets/%s" % NBA, ()): kd.HttpError(status, "u"),
+                       ("/historical/markets/%s" % NBA, ()): {"market": NBA_RECORD}})
+        with pytest.raises(kd.KalshiDataError):
+            c.market(NBA)
+        assert all("/historical/" not in u for u in c.fetch.urls) and len(c.fetch.urls) == 5
+    for status in (400, 401, 403):                                                       # not a 404: no fallback
+        c, _ = client({("/markets/%s" % NBA, ()): kd.HttpError(status, "u"),
+                       ("/historical/markets/%s" % NBA, ()): {"market": NBA_RECORD}})
+        with pytest.raises(kd.HttpError):
+            c.market(NBA)
+        assert len(c.fetch.urls) == 1
+
+
+@pytest.mark.parametrize("body", [[], None, "x", {"markets": [NBA_RECORD]}, {"market": None}, {"market": [NBA_RECORD]}])
+def test_market_refuses_an_answer_of_another_shape(body):
+    c, _ = client({("/markets/%s" % NBA, ()): body})
+    with pytest.raises(kd.KalshiDataError):
+        c.market(NBA)
+
+
+@pytest.mark.parametrize("ticker", ["kxnbagame-1", "", " KX-1", "KX-1 ", "KX/../markets", "KX-1:yes", "KX-1?x=1", "A" * 81,
+                                    "KX%2F1", None, 5, ["KX-1"], True])
+def test_market_puts_only_a_ticker_of_kalshis_shape_into_a_path(ticker):
+    c, _ = client({})
+    with pytest.raises(ValueError):
+        c.market(ticker)
+    assert c.fetch.urls == []
+
+
+def test_market_is_paced_like_every_other_request():
+    c, clock = client({("/markets/%s" % NBA, ()): {"market": NBA_RECORD}})
+    for _ in range(4):
+        c.market(NBA)
+    assert sum(clock.sleeps) >= 1.0                                    # four requests span at least a second
+
+
 def test_the_request_name_is_generic_and_names_no_project_owner_or_business():
     assert kd.USER_AGENT == "market-data-reader/1.0"
     assert not any(word in kd.USER_AGENT.lower() for word in ("valedia", "trader", "burton", "chatelain", "etherion", "@", "python", "urllib"))
