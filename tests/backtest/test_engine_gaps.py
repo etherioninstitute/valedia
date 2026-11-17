@@ -158,16 +158,17 @@ def _late_listing_frame(rng):
 
 
 def _gappy_frame(rng):
-    """Interior gaps: runs of NaN, zero, negative or infinite prices after a symbol's first priced bar."""
+    """Interior gaps: runs of NaN (the only legal "no price" after listing); the bars before listing may hold any
+    kind of cell (NaN, zero, negative or infinite)."""
     n, m = int(rng.integers(25, 90)), int(rng.integers(1, 4))
     idx, cols, px = _frame(rng, n, m)
     for j in range(m):
         first = int(rng.integers(0, n // 3))
-        px[:first, j] = np.nan
+        px[:first, j] = rng.choice([np.nan, 0.0, -2.0, np.inf, -np.inf], size=first)
         for _ in range(int(rng.integers(1, 4))):
             a = int(rng.integers(first, n))
             b = min(n, a + int(rng.integers(1, 12)))
-            px[a:b, j] = rng.choice([np.nan, 0.0, -2.0, np.inf])
+            px[a:b, j] = np.nan
     return pd.DataFrame(px, index=idx, columns=cols)
 
 
@@ -198,12 +199,53 @@ def test_frames_without_interior_gaps_match_the_old_engine_to_1e12():
 # ---- ruling 1: the return across a gap ----------------------------------------------------------------------------
 def test_the_move_across_a_gap_is_booked_on_the_bar_the_price_returns():
     idx = pd.bdate_range("2021-01-04", periods=6)
-    px = pd.DataFrame({"A": [np.nan, 100.0, 0.0, -3.0, 120.0, 132.0]}, index=idx)   # bars 2, 3 unpriced
+    px = pd.DataFrame({"A": [np.nan, 100.0, np.nan, np.nan, 120.0, 132.0]}, index=idx)   # bars 2, 3 unpriced
     w = pd.DataFrame(1.0, index=idx, columns=["A"])
     res = engine.run_backtest(px, w, FREE)
     assert res.gross.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.0, 0.2, 0.1], abs=1e-15)
     assert res.weights["A"].tolist() == [0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     assert res.turnover.tolist() == [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+
+
+# ---- after a symbol's first priced bar, NaN is the only legal "no price" (addendum 1) -----------------------------
+LISTED = [np.nan, np.nan, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0]          # first priced bar is bar 2
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, np.inf, -np.inf])
+@pytest.mark.parametrize("bar", [3, 5, 7])                  # right after listing, in the middle, on the last bar
+def test_a_non_positive_or_infinite_price_after_listing_is_refused(bad, bar):
+    idx = pd.bdate_range("2021-01-04", periods=len(LISTED))
+    a = list(LISTED)
+    a[bar] = bad
+    px = pd.DataFrame({"B": [50.0] * len(a), "A": a}, index=idx)
+    with pytest.raises(ValueError) as err:
+        engine.run_backtest(px, pd.DataFrame(0.5, index=idx, columns=px.columns), FREE)
+    msg = str(err.value)
+    assert "'A'" in msg and "'B'" not in msg and str(idx[bar]) in msg
+    assert "NaN" in msg and "delisting" in msg
+
+
+def test_a_price_that_falls_to_zero_is_refused_not_carried():
+    idx = pd.bdate_range("2021-01-04", periods=5)
+    px = pd.DataFrame({"A": [100.0, 100.0, 50.0, 0.0, 0.0]}, index=idx)    # the checker's case
+    with pytest.raises(ValueError) as err:
+        engine.run_backtest(px, pd.DataFrame(1.0, index=idx, columns=["A"]), FREE)
+    assert "'A'" in str(err.value) and str(idx[3]) in str(err.value) and str(idx[4]) not in str(err.value)
+
+
+def test_any_cell_before_listing_and_a_symbol_never_priced_are_accepted_as_before():
+    idx = pd.bdate_range("2021-01-04", periods=40)
+    rng = np.random.default_rng(7)
+    a = 100.0 * np.exp(np.cumsum(0.02 * rng.standard_normal(40)))
+    a[:6] = [0.0, -1.0, np.inf, -np.inf, np.nan, -50.0]
+    never = np.array([0.0, -1.0, np.inf, -np.inf, np.nan] * 8)
+    px = pd.DataFrame({"A": a, "N": never}, index=idx)
+    w = pd.DataFrame(rng.uniform(-1, 1, (40, 2)), index=idx, columns=px.columns)
+    dv = pd.DataFrame(1e6, index=idx, columns=px.columns)
+    cost = CostModel(5.0, 2.0, 0.02, 0.01)
+    new = engine.run_backtest(px, w, cost, dollar_volume=dv, vol_window=5)
+    _assert_same(new, run_backtest(px, w, cost, dollar_volume=dv, vol_window=5))
+    assert (new.weights["N"] == 0.0).all() and new.stranded == {} and new.costs["impact"].sum() > 0
 
 
 # ---- accounting through a gap -------------------------------------------------------------------------------------
@@ -217,7 +259,7 @@ def test_one_symbol_at_weight_one_compounds_the_price_through_random_gaps(seed):
     a[:first] = np.nan
     for _ in range(6):
         s = int(rng.integers(first + 1, n))
-        a[s:s + int(rng.integers(1, 15))] = rng.choice([np.nan, 0.0, -1.0, np.inf])
+        a[s:s + int(rng.integers(1, 15))] = np.nan
     px = pd.DataFrame({"A": a}, index=idx)
     priced = _priced(px)[:, 0]
     res = engine.run_backtest(px, pd.DataFrame(1.0, index=idx, columns=["A"]), FREE)
@@ -257,7 +299,7 @@ def test_two_symbols_one_with_a_gap_worked_by_hand():
 
 
 # ---- costs through a gap ------------------------------------------------------------------------------------------
-GAP = [100.0, 101.0, 102.0, 103.0, 104.0, np.nan, -1.0, 0.0, 110.0, 111.0]   # bars 5, 6, 7 unpriced
+GAP = [100.0, 101.0, 102.0, 103.0, 104.0, np.nan, np.nan, np.nan, 110.0, 111.0]   # bars 5, 6, 7 unpriced
 
 
 def _gap_costs(weight_before: float, weight_after: float):
@@ -311,7 +353,7 @@ def test_a_target_that_opens_an_unpriced_symbol_opens_nothing_until_it_is_priced
 
 
 def test_a_zero_target_for_a_held_unpriced_symbol_closes_nothing_until_it_is_priced_then_closes():
-    p = [100.0, 101.0, 102.0, 103.0, np.nan, 0.0, np.nan, 107.0, 108.0, 109.0]
+    p = [100.0, 101.0, 102.0, 103.0, np.nan, np.nan, np.nan, 107.0, 108.0, 109.0]
     res = _ten_bars(p, [0.5] * 4 + [0.0] * 6)                    # target 0 from bar 5, inside the gap
     assert res.weights["A"].tolist() == pytest.approx([0.0] + [0.5] * 6 + [0.0] * 3, abs=1e-15)
     r = 107.0 / 103.0 - 1.0
@@ -322,7 +364,7 @@ def test_a_zero_target_for_a_held_unpriced_symbol_closes_nothing_until_it_is_pri
 
 # ---- ruling 5: stranded positions ---------------------------------------------------------------------------------
 def test_a_position_unpriced_on_the_last_bar_is_reported_not_valued():
-    p = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, np.nan, np.nan, -1.0]
+    p = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, np.nan, np.nan, np.nan]
     idx = pd.bdate_range("2021-01-04", periods=10)
     px = pd.DataFrame({"A": p, "B": [50.0] * 10, "C": [np.nan] * 10}, index=idx)
     w = pd.DataFrame({"A": [0.5] * 10, "B": [0.25] * 10, "C": [0.25] * 10}, index=idx)
