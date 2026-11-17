@@ -980,3 +980,187 @@ def test_each_resample_draws_exactly_as_many_events_as_there_are(monkeypatch):
     ab.event_p([3, -2, 7, -1, 4, -9, 2] * 5)                                  # 35 events
     assert calls and all(c[0] == 0 and c[1] == 35 and c[2][1] == 35 for c in calls)
     assert sum(c[2][0] for c in calls) == 2000
+
+
+# ---------------------------------------------------------------- addendum 3
+def _rewrite_w_markets(root, edit):
+    p = Path(root) / "artifacts" / "kalshi_weather" / "markets.json"
+    d = json.loads(p.read_text())
+    edit(d["markets"])
+    p.write_text(json.dumps(d))
+
+
+def _s_db(root):
+    return sqlite3.connect(str(Path(root) / "artifacts" / "sports_lines" / "kalshi.sqlite"))
+
+
+def s_add_market(root, pk, raw):
+    db = _s_db(root)
+    db.execute("INSERT INTO markets VALUES (?, ?, ?, ?, ?, ?)",
+               (pk, "KXNBAGAME", raw.get("event_ticker"), "historical", json.dumps(raw), "x"))
+    db.commit()
+    db.close()
+
+
+def s_add_candles(root, ticker, moment, bid, ask):
+    cts = int(moment.timestamp())
+    db = _s_db(root)
+    db.execute("INSERT INTO candles VALUES (?, ?, ?, ?, ?)",
+               (ticker, cts, "historical", json.dumps(s_candle(cts, bid, ask)), "x"))
+    db.commit()
+    db.close()
+
+
+BAD_TICKERS = [["KXHIGHNY-L"], {"t": 1}, None, 5, True]
+
+
+def test_a_ticker_that_is_not_a_string_is_a_counted_skip_in_w(tmp_path):
+    dev = [one_market(ev="KXHIGHNY-ND%d" % i, close=datetime(2023, 6, 1 + i, 5, 0, tzinfo=UTC)) for i in range(5)]
+    sealed = [one_market(ev="KXHIGHNY-NS%d" % i, close=datetime(2025, 6, 1 + i, 5, 0, tzinfo=UTC)) for i in range(5)]
+    good = [one_market(ev="KXHIGHNY-GD", close=datetime(2023, 7, 1, 5, 0, tzinfo=UTC)),
+            one_market(ev="KXHIGHNY-GS", close=datetime(2025, 7, 1, 5, 0, tzinfo=UTC))]
+    write_w(tmp_path, dev + sealed + good)
+
+    def edit(ms):
+        by_event = {m["event_ticker"]: m for m in ms}
+        for i, bad in enumerate(BAD_TICKERS):
+            by_event["KXHIGHNY-ND%d" % i]["ticker"] = bad
+            by_event["KXHIGHNY-NS%d" % i]["ticker"] = bad
+    _rewrite_w_markets(tmp_path, edit)
+    for period, good_event in (("development", "KXHIGHNY-GD"), ("sealed", "KXHIGHNY-GS")):
+        col = ab.collect("W", period, root=tmp_path)
+        lab = col.labels["24h"]
+        assert lab.market_skips == {"bad_ticker": 5} and col.markets_in_period == 6
+        assert col.unassignable == {} and {t[0] for t in lab.trades} == {good_event}
+
+
+def test_a_ticker_that_is_not_a_string_is_a_counted_skip_in_s(tmp_path):
+    d1, d2 = datetime(2026, 1, 10, 18, 0, tzinfo=UTC), datetime(2026, 1, 25, 18, 0, tzinfo=UTC)
+    specs = [Spec("KXNBAGAME-N%d" % i, "KXNBAGAME-N%d-X" % i, d1 if i % 2 else d2, "yes", 50, 52) for i in range(5)]
+    specs += [Spec("KXNBAGAME-GD", "KXNBAGAME-GD-X", d1, "yes", 50, 52),
+              Spec("KXNBAGAME-GS", "KXNBAGAME-GS-X", d2, "yes", 50, 52)]
+    write_s(tmp_path, specs)
+    db = _s_db(tmp_path)
+    for i, bad in enumerate(BAD_TICKERS):
+        pk = "KXNBAGAME-N%d-X" % i
+        raw = json.loads(db.execute("SELECT raw FROM markets WHERE ticker = ?", (pk,)).fetchone()[0])
+        raw["ticker"] = bad
+        db.execute("UPDATE markets SET raw = ? WHERE ticker = ?", (json.dumps(raw), pk))
+    db.commit()
+    db.close()
+    for period, good_event in (("development", "KXNBAGAME-GD"), ("sealed", "KXNBAGAME-GS")):
+        col = ab.collect("S", period, root=tmp_path)
+        assert col.unassignable == {"bad_ticker": 5}                      # the same in both runs
+        assert {t[0] for t in col.labels["last"].trades} == {good_event}
+
+
+def _repeat_w_root(root, poison):
+    """Event X: a development-side market A and a market R1 on the sealed side whose ticker is repeated (event Y has R2)."""
+    dev_close = datetime(2024, 12, 30, 5, 0, tzinfo=UTC)
+    a = Spec("KXHIGHNY-X", "KXHIGHNY-X-A", dev_close, "yes", 50, 52)
+    r1 = Spec("KXHIGHNY-X", "KXHIGHNY-SHARED", datetime(2025, 2, 1, 5, 0, tzinfo=UTC), "yes", 50, 52)
+    r2 = Spec("KXHIGHNY-Y", "KXHIGHNY-SHARED", datetime(2023, 3, 1, 5, 0, tzinfo=UTC), "yes", 50, 52)
+    base = gen(5, 200, 3, sealed=False, kind="planted", tag="D")
+    if poison:
+        a.result = ["boom"]
+        a.bid, a.ask = float("nan"), "0.5"
+    write_w(root, base + [a, r1, r2], corrupt={a.ticker} if poison else ())
+
+
+def test_an_event_with_a_repeated_ticker_on_the_sealed_side_is_sealed_w(tmp_path):
+    clean, poisoned = tmp_path / "clean", tmp_path / "poisoned"
+    _repeat_w_root(clean, False)
+    _repeat_w_root(poisoned, True)
+    for root in (clean, poisoned):
+        dev = ab.collect("W", "development", root=root)
+        assert "KXHIGHNY-X" not in {t[0] for t in dev.labels["24h"].trades}
+        assert "KXHIGHNY-Y" not in {t[0] for t in dev.labels["24h"].trades}
+        assert dev.unassignable == {"duplicate_ticker": 2}
+    assert canon(develop(clean)["result"]) == canon(develop(poisoned)["result"])
+    sealed = ab.collect("W", "sealed", root=clean)
+    assert {t[0] for t in sealed.labels["24h"].trades} == {"KXHIGHNY-X"}        # A is used, in the sealed run
+
+
+def _repeat_s_root(root, poison):
+    d_dev, d_sealed = datetime(2026, 1, 10, 18, 0, tzinfo=UTC), datetime(2026, 1, 25, 18, 0, tzinfo=UTC)
+    a = Spec("KXNBAGAME-X", "KXNBAGAME-X-A", d_dev, "yes", 50, 52)
+    base = gen(6, 200, 2, sealed=False, universe="S", kind="planted", tag="D")
+    if poison:
+        a.result = ["boom"]
+    write_s(root, base + [a], corrupt_candles={a.ticker} if poison else ())
+    for pk, ev in (("KXNBAGAME-R1", "KXNBAGAME-X"), ("KXNBAGAME-R2", "KXNBAGAME-Y")):
+        s_add_market(root, pk, {"ticker": "KXNBAGAME-SHARED", "event_ticker": ev, "result": "yes"})
+    s_add_candles(root, "KXNBAGAME-SHARED", d_sealed, 50, 52)                # the repeated ticker's moment: sealed side
+
+
+def test_an_event_with_a_repeated_ticker_on_the_sealed_side_is_sealed_s(tmp_path):
+    clean, poisoned = tmp_path / "clean", tmp_path / "poisoned"
+    _repeat_s_root(clean, False)
+    _repeat_s_root(poisoned, True)
+    for root in (clean, poisoned):
+        dev = ab.collect("S", "development", root=root)
+        assert not {"KXNBAGAME-X", "KXNBAGAME-Y"} & {t[0] for t in dev.labels["last"].trades}
+        assert dev.unassignable == {"duplicate_ticker": 2}
+    assert canon(develop(clean, "S")["result"]) == canon(develop(poisoned, "S")["result"])
+    sealed = ab.collect("S", "sealed", root=clean)
+    assert {t[0] for t in sealed.labels["last"].trades} == {"KXNBAGAME-X"}
+
+
+def test_repeated_tickers_in_the_sports_universe_are_left_out(tmp_path):
+    d1, d2 = datetime(2026, 1, 10, 18, 0, tzinfo=UTC), datetime(2026, 1, 25, 18, 0, tzinfo=UTC)
+    write_s(tmp_path, [Spec("KXNBAGAME-GD", "KXNBAGAME-GD-X", d1, "yes", 50, 52),
+                       Spec("KXNBAGAME-GS", "KXNBAGAME-GS-X", d2, "yes", 50, 52)])
+    for pk, ev, result in (("KXNBAGAME-R1", "KXNBAGAME-E1", "yes"), ("KXNBAGAME-R2", "KXNBAGAME-E2", "no")):
+        s_add_market(tmp_path, pk, {"ticker": "KXNBAGAME-SHARED", "event_ticker": ev, "result": result})
+    s_add_candles(tmp_path, "KXNBAGAME-SHARED", d1, 50, 52)
+    for period, good in (("development", "KXNBAGAME-GD"), ("sealed", "KXNBAGAME-GS")):
+        col = ab.collect("S", period, root=tmp_path)
+        assert col.unassignable == {"duplicate_ticker": 2}
+        assert {t[0] for t in col.labels["last"].trades} == {good}
+        assert col.markets_in_period == 1 and col.events_in_period == 1
+
+
+# the sports reader on each documented spelling of a quote: close, close_dollars, close_fp (pick order in that order)
+def _spelled(bid_block, ask_block):
+    return {"end_period_ts": 0, "volume_fp": "1", "open_interest_fp": "1", "price": {},
+            "yes_bid": bid_block, "yes_ask": ask_block}
+
+
+SPELLINGS = {
+    "close": ({"close": 0.5}, {"close": 0.52}),
+    "close_dollars": ({"close_dollars": "0.5000"}, {"close_dollars": "0.5200"}),
+    "close_fp": ({"close_fp": "0.5000"}, {"close_fp": "0.5200"}),
+    "close_and_dollars": ({"close": 0.5, "close_dollars": "0.9000"}, {"close": 0.52, "close_dollars": "0.9200"}),
+    "dollars_and_fp": ({"close_dollars": "0.5000", "close_fp": "0.9000"}, {"close_dollars": "0.5200", "close_fp": "0.9200"}),
+    "all_three": ({"close": 0.5, "close_dollars": "0.9", "close_fp": "0.8"}, {"close": 0.52, "close_dollars": "0.92",
+                                                                              "close_fp": "0.82"}),
+}
+
+
+@pytest.mark.parametrize("name", list(SPELLINGS))
+def test_s_reader_knows_every_spelling_and_the_pick_order(tmp_path, name):
+    when = datetime(2026, 1, 10, 18, 0, tzinfo=UTC)
+    write_s(tmp_path, [Spec("KXNBAGAME-E1", "KXNBAGAME-E1-X", when, "yes", 50, 52)])
+    bid_block, ask_block = SPELLINGS[name]
+    cts = int(when.timestamp())
+    db = _s_db(tmp_path)
+    raw = _spelled(bid_block, ask_block)
+    raw["end_period_ts"] = cts
+    db.execute("UPDATE candles SET raw = ? WHERE ticker = ? AND end_ts = ?",
+               (json.dumps(raw), "KXNBAGAME-E1-X", cts))
+    db.commit()
+    db.close()
+    lab = ab.collect("S", "development", root=tmp_path).labels["last"]
+    assert lab.side_skips == {} and sorted(t[1] for t in lab.trades) == [50, 52]       # no side at 90 or 92
+
+
+def test_s_reader_agrees_with_normalize_candle_on_well_formed_rows(tmp_path):
+    from valedia_trader.venues import kalshi_data as kd
+    when = datetime(2026, 1, 10, 18, 0, tzinfo=UTC)
+    for name in SPELLINGS:
+        raw = _spelled(*SPELLINGS[name])
+        raw["end_period_ts"] = int(when.timestamp())
+        cand = ab._raw_candle(raw)
+        norm = kd.normalize_candle(raw)
+        assert cand["end_ts"] == norm["end_ts"]
+        assert cand["yes_bid"]["close"] == norm["yes_bid"]["close"] and cand["yes_ask"]["close"] == norm["yes_ask"]["close"]
