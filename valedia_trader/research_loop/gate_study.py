@@ -10,6 +10,14 @@ the book's weights, from which the Sharpe, length, skew and kurtosis the Deflate
 checks are rebuilt with the same calls `seal` makes, for every book some rule passes in development, whether or not
 the gate's own development passed. Then every rule is judged by pure functions (`develops`, `passes`).
 
+SINCE T39-2b EVERY BOOK HERE STATES THE EXPOSURE CLAIM (`EXPOSURE_PREDICTION`): R0 is "the gate before T39-2b",
+which is now the gate's rule for an exposure claim, so every number this study produced stays reproducible. The gate
+judges an edge claim by R3_listed; `claim_anchor` checks that, on books from this study's generators, the gate's
+development verdict under an edge claim equals R3_listed judged here (and its verdict under an exposure claim, R0).
+The re-timing pieces the rules use (`listed_start`, `timing_listed`, `r3_shifts`, `ALPHA`) live in `gauntlet.py` and
+are imported from there; asset returns are the engine's booked returns (`gauntlet.booked_asset_returns`), which equal
+`pct_change` on every frame without interior gaps.
+
 THE ANCHOR. Rule R0 judged this way must equal the real gate's own verdict. The study checks it on every book at one
 attempt (the gate's own fresh-ledger run, development and sealed), checks that the rebuilt material reproduces the
 report's Deflated Sharpe, re-timing p-value and headline Sharpe exactly, and, when prior attempts are given, re-runs
@@ -86,6 +94,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -96,21 +105,22 @@ from valedia_trader.quant_engine import level10_ml_research as research
 from valedia_trader.research_loop import LoopPaths
 from valedia_trader.research_loop import controls
 from valedia_trader.research_loop import gauntlet as gt
+from valedia_trader.research_loop.gauntlet import (ALPHA, GATE_SHIFTS, R3_SHIFTS_PER_RECIPROCAL, _held_cols, _p_ok,
+                                                   listed_start, r3_shifts, timing_listed)
 from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.strategy import CRYPTO, SCORES, RuleStrategy, Strategy, StrategyRisk, run_rules
 
 __all__ = ["study", "develops", "passes", "deflated_value", "wilson", "surrogate_bootstrap", "surrogate_prices",
            "stationary_bootstrap_rows", "listing_regimes", "listed_start", "timing_listed", "held_average_book",
            "active_returns", "TIMED", "SURROGATE_BLOCK",
-           "draw_rule_spec", "NeutralOracle", "RULES", "FAMILIES", "DRAW_RANGES", "main"]
+           "draw_rule_spec", "NeutralOracle", "RULES", "FAMILIES", "DRAW_RANGES", "EXPOSURE_PREDICTION", "claim_anchor",
+           "main"]
 
 RULES = ("R0", "R1_gate", "R1_listed", "R2_gate", "R2_listed", "R3_gate", "R3_listed", "R4_gate", "R4_listed")
 TIMED = ("gate", "listed")            # whose re-timing figures a rule uses
 _KEYS = {"gate": ("timing_p", "strict_p", "active_moments"),
          "listed": ("timing_p_listed", "strict_p_listed", "active_moments_listed")}
-ALPHA = 0.05                          # the re-timing threshold of R1 and R2; R3 divides it by N
-R3_SHIFTS_PER_RECIPROCAL = 20         # R3 re-runs timing_null with this many times 1 / threshold shifts
-GATE_SHIFTS = 300                     # timing_null's own default, used by develop
+# ALPHA (the re-timing threshold of R1 and R2; R3 divides it by N), R3_SHIFTS_PER_RECIPROCAL and GATE_SHIFTS: gauntlet.py
 POWER_SHARE = 0.8                     # "passes at least 80% of books"
 MEAN_BLOCK = 20                       # stationary bootstrap: mean block length in bars
 PROGRESS_EVERY = 100
@@ -157,6 +167,7 @@ DRAW_RANGES: dict[str, dict] = {
     "hold": {"enter": 1, "exit": 0},
 }
 SIZING = {"rule": "equal"}            # the library's default sizing; risk is the default StrategyRisk()
+EXPOSURE_PREDICTION = replace(controls.NEUTRAL_PREDICTION, claim="exposure")   # every study book's claim (R0 = before T39-2b)
 
 
 # ---- small pure pieces
@@ -215,18 +226,9 @@ def attempts_counted(material: dict, others: Sequence[float]) -> int:
     return len(others) + max(len(material["own"]), 1)
 
 
-def r3_shifts(n_attempts: int) -> int:
-    """Shifts R3's re-timing test needs to resolve 0.05 / N: 20 times the reciprocal of the threshold."""
-    return int(math.ceil(R3_SHIFTS_PER_RECIPROCAL * n_attempts / ALPHA - 1e-9))
-
-
 def _gate_checks_ok(material: dict) -> bool:
     """Every development check of the gate other than the Deflated Sharpe."""
     return all(ok for k, ok in material["checks"].items() if k != "deflated_sharpe")
-
-
-def _p_ok(p, threshold: float) -> bool:
-    return p is not None and math.isfinite(p) and p <= threshold
 
 
 def _finite(moments: dict | None) -> bool:
@@ -431,39 +433,7 @@ class NeutralOracle(Strategy):
         return self.walk(prices)[0].abs()
 
 
-# ---- the re-timing test on the listed window, and the average book held throughout
-
-def _held_cols(weights: pd.DataFrame, other: pd.DataFrame) -> list[str]:
-    """The symbols a book holds at some time in the window: `timing_null`'s own choice of columns."""
-    return [c for c in weights.columns if c in other.columns and float(weights[c].abs().sum()) > 0]
-
-
-def listed_start(weights: pd.DataFrame, prices: pd.DataFrame) -> int | None:
-    """The first row of the LISTED WINDOW: the first bar on which every symbol the book ever holds in `weights` has a
-    price in `prices` (the same rows). 0 for a book that holds nothing; None if there is no such bar."""
-    cols = _held_cols(weights, prices)
-    if not cols:
-        return 0
-    px = prices[cols].to_numpy(dtype=float)
-    hit = np.flatnonzero((np.isfinite(px) & (px > 0)).all(axis=1))
-    return int(hit[0]) if len(hit) else None
-
-
-def timing_listed(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.DataFrame, n: int = GATE_SHIFTS) -> dict:
-    """`gauntlet.timing_null` run on the listed window only (same statistic, common shift, minimum shift and seed),
-    plus `listed_start`, `listed_bars` and `listed_share` (the count and the share of the window's bars inside it;
-    both None for a book that holds nothing in the window, 0 and 0.0 when no bar has every held symbol priced).
-    Unavailable as timing_null is (too short a stretch, no positions), or when no bar has every held symbol priced."""
-    if not _held_cols(weights, prices):
-        return {**gt.timing_null(weights, asset_returns, n=n), "listed_start": 0, "listed_bars": None,
-                "listed_share": None}
-    s = listed_start(weights, prices)
-    if s is None:
-        return {"unavailable": "no bar has a price for every symbol the book holds", "listed_start": None,
-                "listed_bars": 0, "listed_share": 0.0}
-    out = gt.timing_null(weights.iloc[s:], asset_returns.iloc[s:], n=n)
-    return {**out, "listed_start": s, "listed_bars": len(weights) - s, "listed_share": (len(weights) - s) / len(weights)}
-
+# ---- the average book held throughout (the listed window's re-timing test is gauntlet.timing_listed)
 
 def held_average_book(weights: pd.DataFrame, asset_returns: pd.DataFrame) -> pd.Series | None:
     """The return of `timing_null`'s "same average book, held throughout", computed exactly as it does: |w| averaged
@@ -495,15 +465,17 @@ def _moments(x: np.ndarray) -> dict | None:
     return {"sharpe": m.sharpe, "n_obs": m.n_obs, "skew": m.skew, "kurt": m.kurt}
 
 
-def _gate_run(frame, dollar, cost, criteria, folder: Path, strategy: Strategy, priors: Sequence[float]) -> dict:
-    """The real gate on one book, in a ledger of its own (seeded with `priors`): develop, and seal where it passed."""
+def _gate_run(frame, dollar, cost, criteria, folder: Path, strategy: Strategy, priors: Sequence[float],
+              prediction: gt.Prediction = EXPOSURE_PREDICTION) -> dict:
+    """The real gate on one book, in a ledger of its own (seeded with `priors`): develop, and seal where it passed.
+    Under the exposure claim unless another prediction is given (`claim_anchor` passes the edge claim)."""
     paths = LoopPaths(folder).ensure()
     ledger = HypothesisLedger(paths.ledger)
     try:
         controls._seed_priors(ledger, priors)
         g = gt.Gauntlet(frame, dollar, cost, ledger, paths, criteria)
         hid = ledger.propose(strategy.hypothesis, "gate_study", controls.MARKET)
-        gt.write_prediction(ledger, paths, hid, strategy.name, controls.NEUTRAL_PREDICTION)
+        gt.write_prediction(ledger, paths, hid, strategy.name, prediction)
         try:
             rep = g.develop(hid, strategy)
         except gt.GauntletError as exc:
@@ -625,7 +597,7 @@ def oos_run(frame: pd.DataFrame, dollar, cost: CostModel, criteria: gt.Criteria,
         stitched.iloc[idx] = w.iloc[idx].to_numpy()
     oos = slice(windows[0][0], None)
     base = run_backtest(dev, stitched, cost, dollar)
-    return {"net": base.net.iloc[oos], "weights": base.weights.iloc[oos], "returns": dev.pct_change().iloc[oos],
+    return {"net": base.net.iloc[oos], "weights": base.weights.iloc[oos], "returns": gt.booked_asset_returns(dev).iloc[oos],
             "prices": dev.iloc[oos]}
 
 
@@ -855,6 +827,64 @@ def _anchor_priors(anchor, book, frame, dollar, cost, criteria, folder: Path, pr
     gate_pass = (not g["refused"]) and g["dev_pass"] and g["sealed_pass"]
     if gate_pass != verdict["R0"]:
         anchor["at_prior_attempts_disagreements"] += 1
+
+
+def claim_anchor(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostModel, *,
+                 families: Sequence[str] = ("N1", "N2", "E1"), books_per_family: int = 70,
+                 prior_attempt_sharpes: Sequence[float] = (), seed: int = 20261116,
+                 criteria: gt.Criteria | None = None) -> dict:
+    """The new gate against the rules it was built from, on books from this study's generators (data as given): each
+    book runs the real gate under the EXPOSURE claim (the material every rule is judged from, as in `study`) and again
+    under the EDGE claim, in a fresh ledger and in one seeded with `prior_attempt_sharpes`. Counted per family and
+    ledger: the books whose development verdict under the edge claim differs from R3_listed judged here, and whose
+    verdict under the exposure claim differs from R0, with N (attempts counted, this one included) and D (distinct
+    re-timed copies of the listed window) and the region the gate's timing check ran in. The study measured the drawn
+    region only; a book whose check ran in the enumerated region is counted as outside the anchor's scope."""
+    c = criteria or gt.Criteria()
+    priors = [float(s) for s in prior_attempt_sharpes]
+    ledgers = {"fresh": [], "priors": priors} if priors else {"fresh": []}
+    edge = controls.NEUTRAL_PREDICTION
+    out: dict = {"books": 0, "cells": {}}
+    with warnings.catch_warnings(), tempfile.TemporaryDirectory(prefix="valedia-claim-anchor-") as tmp:
+        warnings.simplefilter("ignore", FutureWarning)
+        root, done = Path(tmp), 0
+        for fam in families:
+            for h, k, frame, strategy, _ in _books(fam, prices, "given", seed, books_per_family, books_per_family, 1, 1):
+                if k >= books_per_family:
+                    continue
+                book = _Book(frame, dollar_volume, cost, c, root / f"book{done:05d}", strategy)
+                for name, others in ledgers.items():
+                    cell = out["cells"].setdefault(f"{fam}/{name}", {
+                        "books": 0, "edge_disagreements": 0, "exposure_disagreements": 0, "outside_drawn_region": 0,
+                        "refused": 0, "N": len(others) + 1, "D": set(), "edge_passes": 0, "exposure_passes": 0})
+                    cell["books"] += 1
+                    shutil.rmtree(root / "run", ignore_errors=True)
+                    g_edge = _gate_run(frame, dollar_volume, cost, c, root / "run", strategy, others, edge)
+                    shutil.rmtree(root / "run", ignore_errors=True)
+                    g_exp = (book.gate if not others else
+                             _gate_run(frame, dollar_volume, cost, c, root / "run", strategy, others))
+                    if g_edge["refused"] or g_exp["refused"] or book.material["refused"]:
+                        cell["refused"] += 1
+                        continue
+                    if _r3_rest(book.material, c):
+                        book.strict_p(attempts_counted(book.material, others), "listed")
+                    timing = g_edge["report"].get("timing") or {}
+                    cell["D"].add(timing.get("copies"))
+                    if timing.get("region") == "enumerated":
+                        cell["outside_drawn_region"] += 1
+                    r3, r0 = develops("R3_listed", book.material, others, c), develops("R0", book.material, others, c)
+                    cell["edge_disagreements"] += int(r3 != g_edge["dev_pass"])
+                    cell["exposure_disagreements"] += int(r0 != g_exp["dev_pass"])
+                    cell["edge_passes"] += int(g_edge["dev_pass"])
+                    cell["exposure_passes"] += int(g_exp["dev_pass"])
+                shutil.rmtree(root / f"book{done:05d}", ignore_errors=True)
+                done += 1
+        out["books"] = done
+    for cell in out["cells"].values():
+        cell["D"] = sorted(d for d in cell["D"] if d is not None)
+    out["edge_disagreements"] = sum(v["edge_disagreements"] for v in out["cells"].values())
+    out["exposure_disagreements"] = sum(v["exposure_disagreements"] for v in out["cells"].values())
+    return out
 
 
 _RULE_TEXT = {

@@ -16,6 +16,7 @@ import os
 import sqlite3
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -337,7 +338,7 @@ def test_a_missing_or_non_finite_figure_never_passes_whatever_the_thresholds(mon
     for alpha in (0.05, 1.0):
         monkeypatch.setattr(gs, "ALPHA", alpha)
         for min_dsr in (0.0, -1.0):
-            c = gt.Criteria(min_dsr=min_dsr)
+            c = SimpleNamespace(min_dsr=min_dsr)     # T39-2b: Criteria refuses these marks; the rules read only min_dsr
             for base, figures in reads.items():
                 for version in gs.TIMED:
                     rule = f"{base}_{version}"
@@ -1106,3 +1107,32 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     assert seen["cost"] == research_cost and seen["prices"].shape == prices.shape
     gs.main(["--data", str(data)])
     assert list(seen["prior_attempt_sharpes"]) == [] and seen["n_null"] == 400 and seen["seed"] == 20261116
+
+
+
+def test_the_re_timing_pieces_are_defined_once_in_the_gate():
+    """T39-2b, R4: the study imports the listed-window test from gauntlet.py; nothing is defined twice."""
+    for name in ("listed_start", "timing_listed", "r3_shifts", "_held_cols", "_p_ok"):
+        assert getattr(gs, name) is getattr(gt, name), name
+    assert gs.ALPHA == gt.ALPHA == 0.05 and gs.GATE_SHIFTS == gt.GATE_SHIFTS == 300
+
+
+def test_study_books_state_the_exposure_claim_so_r0_is_the_gate_before_the_split(market, tmp_path):
+    """T39-2b, R7: R0 stays "the gate before this change" because every study book runs under the exposure claim."""
+    assert gs.EXPOSURE_PREDICTION.claim == "exposure" and controls.NEUTRAL_PREDICTION.claim == "edge"
+    assert {k: v for k, v in gs.EXPOSURE_PREDICTION.__dict__.items() if k != "claim"} == \
+        {k: v for k, v in controls.NEUTRAL_PREDICTION.__dict__.items() if k != "claim"}
+    px, dollar, cost = market
+    s = controls.OracleCheat(px, 0.5, 5, np.random.default_rng(3), name="claim_book")
+    run = gs._gate_run(px, dollar, cost, CRITERIA, tmp_path, s, ())
+    assert run["report"]["claim"] == "exposure" and "deflated_sharpe" in run["report"]["checks"]
+
+
+def test_the_edge_gate_agrees_with_r3_listed_and_the_exposure_gate_with_r0(market):
+    """T39-2b, R7: the anchor of the new gate, small (the full anchor runs on the real data, 200 books or more)."""
+    px, dollar, cost = market
+    out = gs.claim_anchor(px, dollar, cost, families=("N1", "E1"), books_per_family=2, prior_attempt_sharpes=PRIORS)
+    assert out["books"] == 2 + 3 * 2 and out["edge_disagreements"] == 0 and out["exposure_disagreements"] == 0, out
+    for key, cell in out["cells"].items():
+        assert cell["outside_drawn_region"] == 0 and cell["refused"] == 0 and cell["N"] in (1, 31), (key, cell)
+        assert cell["D"] and all(1 / (d + 1) <= 0.05 / cell["N"] for d in cell["D"]), (key, cell)
