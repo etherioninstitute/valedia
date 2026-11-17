@@ -1826,10 +1826,20 @@ class Addendum4(Base):
         self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
 
     def test_A_the_right_command_with_a_wrong_start_is_never_signalled(self):
+        # addendum 7, A: only the start the intent holds for its launcher is compared; the identity file's is a hint
         self.killed_run()
         self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 13:33:33 2026'
-        self.w.procs[OBSERVER_PID]['start'] = 'Mon Nov 16 13:33:34 2026'
+        self.w.procs.pop(OBSERVER_PID)
         self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('START', self.w.text())
+
+    def test_A_an_observer_whose_start_differs_from_the_identity_file_is_still_found_by_its_command(self):
+        self.killed_run(); self.w.procs[OBSERVER_PID]['start'] = 'Mon Nov 16 13:33:34 2026'
+        def reap(world):
+            if world.procs.get(OBSERVER_PID, {}).get('termed_at') is not None:
+                world.procs.pop(OBSERVER_PID, None); world.procs.pop(LAUNCHER_PID, None)
+        self.w.on_sleep.append(reap)
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertNoSecret()
 
     def test_A_a_command_that_cannot_be_read_sends_nothing_and_says_nothing_of_it(self):
         self.killed_run(); self.w.command_raises = RuntimeError
