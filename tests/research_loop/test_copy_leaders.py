@@ -2557,7 +2557,7 @@ def test_sealed_stops_for_memory_before_its_claim_and_the_period_is_not_spent(tm
     said = []
     doc = cl.run_sealed(store=store, out_dir=out, flag=True, max_memory_mb=1000, say=said.append)
     assert claimed and doc["result"]["verdict"]["verdict"] in ("PASS", "FAIL") and (out / "sealed.json").is_file()
-    assert any("claimed" in m and "above the limit" in m for m in said)    # said, not stopped: the period is spent
+    assert any("CLAIMED" in m and "ABOVE THE LIMIT" in m for m in said)    # said, not stopped: the period is spent
 
 
 def test_the_planning_step_stops_for_memory_with_no_plan_written(tmp_path, monkeypatch):
@@ -2706,3 +2706,102 @@ def test_the_wallet_fold_equals_wallet_book_and_new_positions_at_the_edges(tmp_p
                                                      if cl.position_skip(p, res)), seed
                 assert f.first_ts == min((t.ts for t in trades), default=None)
     assert seen["spill"] > 0 and seen["a day apart"] > 0, seen
+
+
+# ------------------------------------------------------------------ T47 addendum 8
+def test_a_stored_number_too_large_for_the_store_is_counted_and_the_pull_goes_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(3)
+    svc = PagedWorld(w, 3, size=50)
+    wallet = sorted(svc.feeds)[0]
+    svc.feeds[wallet][1]["size"] = 2 ** 63                     # a trade
+    cond = sorted(w.res)[0]
+    w.res[cond]["payouts"] = [0, 2 ** 64]                      # a resolution
+    inner = svc.__call__
+    seen = []
+
+    def prices(url):
+        body = inner(url)
+        if "/v2/prices-history" in url and not seen:           # a price point
+            seen.append(url)
+            d = json.loads(body)
+            d["data"].append({"price": 0.5, "resolution_seconds": 2 ** 63, "timestamp": d["data"][0]["timestamp"]})
+            body = json.dumps(d).encode()
+        return body
+    store = tmp_path / "s.sqlite"
+    client = _paged_client(prices)
+    cl.pull(store, client, phase=1, say=lambda m: None)
+    cl.pull(store, client, phase=2, say=lambda m: None)
+    with cl.Store(store) as s:
+        got = dict(s.db.execute("SELECT kind, COUNT(*) FROM rejects WHERE reason='number_too_large_for_store' "
+                                "GROUP BY kind"))
+        assert not s.unfinished("trades") and seen
+    assert got == {"trades": 1, "resolutions": 1, "prices": 1}, got
+
+
+def test_a_reader_that_cannot_make_the_lock_file_refuses_in_words(tmp_path):
+    d = tmp_path / "ro"
+    d.mkdir()
+    store = _cheap(d)
+    lock = Path(str(store) + ".lock")
+    if lock.exists():
+        lock.unlink()
+    os.chmod(d, 0o555)
+    try:
+        for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None),
+                    lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True, say=lambda m: None)):
+            with pytest.raises(cl.Refused, match="cannot (create|open) the lock file .*whether a pull is running"):
+                run()
+    finally:
+        os.chmod(d, 0o755)
+    assert not lock.exists() and not (tmp_path / "o").exists()
+
+
+def test_the_refusals_of_develop_and_sealed_say_the_lock_file_is_all_a_refused_run_may_leave(tmp_path):
+    w = World(5, edge=0.0, move=0.0, pros=6, per_month=12)
+    store = w.write(tmp_path / "s.sqlite", unfinished_wallet="pro03")     # an unfinished pull: both refuse
+    for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None),
+                lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True, say=lambda m: None)):
+        with pytest.raises(cl.Refused) as e:
+            run()
+        assert "the lock file %s.lock is the one thing a refused run may leave beside the store" % store in str(e.value)
+
+
+def test_the_refusal_for_windows_not_pulled_prints_their_count_and_the_command(tmp_path):
+    rec = []
+    skip = _first((2026, 3), rec)
+    skip.how = "unfinished"
+    store = World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / "s.sqlite", skip_window=skip)
+    assert rec
+    with pytest.raises(cl.Refused) as e:
+        cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
+    text = str(e.value)
+    assert re.search(r"\b4 price windows not pulled \(pull them with: pull --phase 2\)", text), text
+    assert not re.search(r"tok\d+|cond\d+|@\d+|\b1[5-9]\d{8}\b", text), text
+
+
+def test_after_its_claim_sealed_never_stops_for_memory_and_says_so_first(tmp_path, monkeypatch, capsys):
+    doc = " ".join(cl.__doc__.split())
+    assert "after the claim it never stops for memory" in doc
+    with pytest.raises(SystemExit):
+        cl.main(["sealed", "--help"])
+    assert "after the claim it never stops for memory" in " ".join(capsys.readouterr().out.split())
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out, say=lambda m: None)
+    claimed, order = [], []
+    real_claim = cl._claim
+
+    def claim(*a):
+        order.append("claim")
+        real_claim(*a)
+        claimed.append(True)
+    monkeypatch.setattr(cl, "_claim", claim)
+    monkeypatch.setattr(cl, "rss_mb", lambda: 5000.0 if claimed else 321.0)
+    said = []
+    cl.run_sealed(store=store, out_dir=out, flag=True, max_memory_mb=1000,
+                  say=lambda m: (said.append(m), order.append(m)))
+    peak = [m for m in order if "the development recomputation needed" in m]
+    assert peak and order.index(peak[0]) < order.index("claim") and "321 MB" in peak[0], order[-5:]
+    alerts = [m for m in said if "ABOVE THE LIMIT" in m]
+    assert len(alerts) == 1 and alerts[0] == alerts[0].upper() and "WALLET 1 OF" in alerts[0], alerts

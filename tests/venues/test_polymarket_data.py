@@ -682,3 +682,16 @@ def test_page_by_page_a_repeated_cursor_or_more_without_a_cursor_raises_before_t
     c, t, clock = client(lambda p, q: page([trade(1)], True, None))
     with pytest.raises(pd.PolymarketDataError, match="no next_cursor"):
         list(c.trade_pages("0xabc", ids={}))
+
+
+# ------------------------------------------------------------------ T47 addendum 8
+@pytest.mark.parametrize("big", [2 ** 63, 2 ** 64, -2 ** 63 - 1])
+def test_a_whole_number_too_large_for_the_store_is_a_malformed_row_with_its_own_reason(big):
+    assert pd.validate_trade(dict(trade(3), size=abs(big)), "0xabc") == (None, "number_too_large_for_store")
+    assert pd.validate_price_point({"price": 0.5, "resolution_seconds": abs(big), "timestamp": 1_700_000_000}) == \
+        (None, "number_too_large_for_store")
+    assert pd.validate_resolution({"condition_id": "c", "status": "resolved", "payouts": [0, abs(big)],
+                                   "resolved_at": None}) == (None, "number_too_large_for_store")
+    assert pd.validate_board_row({"rank": big, "user_id": "u", "pnl": 1.0, "volume": 1.0}) == \
+        (None, "number_too_large_for_store")
+    assert pd.validate_trade(dict(trade(3), size=2 ** 63 - 1), "0xabc")[1] is None    # the largest that fits
