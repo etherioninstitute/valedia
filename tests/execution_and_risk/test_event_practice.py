@@ -737,8 +737,22 @@ def test_a_first_win_that_cannot_be_compared_is_journaled_and_does_not_hold(tmp_
     assert len(w.entries("settlement")) == 1
     note = w.entries("win_cash")[-1]
     assert note["result"] == "not comparable" and note["reason"].startswith("the win's cash effect could not be compared: ")
+    words = {"fill": "a fill was recorded", "order": "an order was handed", "unread-before": "shown is unread",
+             "unread-now": "this run's reading is unread", "raise-now": "this run's reading is unread"}[between]
+    assert words in note["reason"], note
     if between.startswith(("unread", "raise")):
         assert any(r["buying_power"] is None and r["unread"] for r in w.entries("buying_power"))
+
+
+def test_a_settlement_time_not_later_than_a_fill_of_the_program_is_not_a_settlement(tmp_path):
+    w = bought_world(tmp_path)                                   # the fill's time: 2026-11-13 14:00 in New York
+    w.exchange.held[f"{T}:yes"] = 0
+    w.markets[T] = {**WIN, "settlement_ts": "2026-11-13T18:59:59Z"}
+    out = w.run(reconcile_only=True)
+    assert out["status"] == "stopped" and "not later than every fill" in out["reason"] and w.entries("settlement") == []
+    w.markets[T] = {**WIN, "settlement_ts": "2026-11-13T19:00:11Z"}       # after the fill (read at 14:00:10)
+    w.exchange.bp = "1001"
+    assert w.run(reconcile_only=True)["status"] == "done" and len(w.entries("settlement")) == 1
 
 
 def test_a_loss_needs_no_cash_comparison(tmp_path):
