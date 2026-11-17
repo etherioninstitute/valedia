@@ -2319,7 +2319,9 @@ def _variety(seed):
 def _outcome(fn):
     try:
         return "ok", fn()
-    except cl.Refused as e:
+    except Exception as e:                            # either module's own Refused
+        if type(e).__name__ != "Refused":
+            raise
         return "refused", str(e)
 
 
@@ -2349,24 +2351,26 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
         assert ta == tb, seed
         seen["planned"] += len(tb["plan"])
         cl.pull(store, client, phase=2, leave_out=leave, say=lambda m: None)
-        o_old, o_new = d / "o_old", d / "o_new"                      # develop, old and new, on the same store
-        r_old = _outcome(lambda: old.run_develop(store=store, out_dir=o_old, leave_out=leave))
-        r_new = _outcome(lambda: cl.run_develop(store=store, out_dir=o_new, leave_out=leave, say=lambda m: None))
-        assert r_old[0] == r_new[0] and (r_old[0] == "ok" or r_old[1] == r_new[1]), (seed, r_old, r_new)
+        o_old, o_new = d / "o_old", d / "o_new"                      # develop then sealed, old and new, each on
+        c_old, c_new = d / "c_old.sqlite", d / "c_new.sqlite"        # its own copy (sealed spends its store)
+        shutil.copy(store, c_old)
+        shutil.copy(store, c_new)
+        r_old = _outcome(lambda: old.run_develop(store=c_old, out_dir=o_old, leave_out=leave))
+        r_new = _outcome(lambda: cl.run_develop(store=c_new, out_dir=o_new, leave_out=leave, say=lambda m: None))
+        assert r_old[0] == r_new[0] and (r_old[0] == "ok" or r_old[1].replace(str(c_old), str(c_new)) == r_new[1]), \
+            (seed, r_old, r_new)
         if r_old[0] != "ok":
             seen["develop_refused"] += 1
             continue
         sha_old, sha_new = r_old[1]["provenance"]["code_sha256"], r_new[1]["provenance"]["code_sha256"]
         assert sha_old != sha_new
         raw_old = (o_old / "develop.json").read_bytes().replace(sha_old.encode(), sha_new.encode())
+        raw_old = raw_old.replace(str(c_old.resolve()).encode(), str(c_new.resolve()).encode())
         assert raw_old == (o_new / "develop.json").read_bytes(), seed
         res = r_new[1]["result"]
         seen["months_left_out"] += sum(res["months_left_out"].values())
         seen["leave_out"] += len(res["wallets_left_out"])
         seen[res["step_1"]["verdict"]] += 1
-        c_old, c_new = d / "c_old.sqlite", d / "c_new.sqlite"        # sealed, old and new, on two copies
-        shutil.copy(store, c_old)
-        shutil.copy(store, c_new)
         q_old = _outcome(lambda: old.run_sealed(store=c_old, out_dir=o_old, flag=True, leave_out=leave,
                                                 develop_file=o_old / "develop.json"))
         q_new = _outcome(lambda: cl.run_sealed(store=c_new, out_dir=o_new, flag=True, leave_out=leave,
@@ -2377,7 +2381,8 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
             continue
         seen["sealed"] += 1
         swap = [(sha_old, sha_new), (str(c_old.resolve()), str(c_new.resolve())),
-                (str(o_old / "develop.json"), str(o_new / "develop.json"))]
+                (str(o_old / "develop.json"), str(o_new / "develop.json"))] + [   # the development files' own hashes
+            tuple((o / "develop.json.sha256").read_text().strip() for o in (o_old, o_new))]
         raw_old = (o_old / "sealed.json").read_bytes()
         for x, y in swap:
             raw_old = raw_old.replace(x.encode(), y.encode())
@@ -2387,9 +2392,11 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
             m.pop("time")
             m.pop("store")
             m.pop("development_file")
+            m.pop("development_sha256")
         assert m_old == m_new, seed
     assert seen["planned"] > 0 and seen["months_left_out"] > 0 and seen["leave_out"] > 0, seen
     assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
+    print("T47c stores:", dict(sorted(seen.items())))
 
 
 class _Live:
@@ -2463,7 +2470,7 @@ _ANY_ID = re.compile(r"\b(?:tok|mmt|cond|mmc|ev|mmev)\d+\b|0x[0-9a-f]{6,}")
 
 
 def _wallet_lines(said, prefix, wallets):
-    lines = [m for m in said if m.startswith(prefix + ": wallet")]
+    lines = [m.replace("; " + cl.COPY_WARNING, "") for m in said if m.startswith(prefix + ": wallet")]  # 1st line
     got = [_SAID.match(m) for m in lines]
     assert all(got), lines
     assert [int(g.group(2)) for g in got] == list(range(1, len(lines) + 1))

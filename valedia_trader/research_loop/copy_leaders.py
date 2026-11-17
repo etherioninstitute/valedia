@@ -42,6 +42,14 @@ Rules the code holds:
   past it stays unfinished like any failed walk, the pull ends incomplete (exit 3) and the 10-minute step waits.
   Above --max-memory-mb (1,500 by default) of resident memory, read after every page, the pull stops itself
   cleanly. A second pull asks only for what is missing.
+* The reads of the store work wallet by wallet in memory that does not grow with the store (T47c): the planning
+  step of phase 2, `develop` and `sealed` read a wallet's trades through a cursor, once in the order stored (the
+  wallet's markets and their tokens) and once in time order, folding them into the small state the rule needs (the
+  holdings and cost by token, realized profit, resolved positions, shares and sells by calendar month, the new
+  positions found), and read a price window's points only when it is used. Each prints one flushed line a wallet
+  (its number of the total, its first ten characters, rows read, seconds, memory); --max-memory-mb (1,500 by
+  default) is checked at each wallet and stops the step with nothing written. `sealed` checks it while it
+  recomputes the development result, BEFORE its claim; once the period is claimed it says so and does not stop.
 * While a pull runs, nothing else reads the store. The pull holds an exclusive advisory lock (flock) on the file
   STORE.lock beside the store for its whole life (the kernel releases it if the process dies); a second pull,
   `develop` and `sealed` take it without waiting and refuse in words: "a pull is running on this store". The pull's
@@ -106,7 +114,7 @@ import sys
 import time
 import uuid
 from bisect import bisect_left
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -531,6 +539,8 @@ def _count_in(times, lo, hi) -> int:
 def standing(book: Book, month) -> Standing:
     """Realized profit (exact micro-dollars), resolved positions and shares traded over the three calendar months
     before `month`, from events before the month began."""
+    if isinstance(book, MonthBook):
+        return Standing(book.window("realized", month), book.window("resolved", month), book.window("shares", month))
     lo, hi = _bounds(month)
     profit = _window_sum(book.realized_ts, book.realized_cum, lo, hi)
     return Standing(profit, _count_in(book.resolved_ts, lo, hi), _window_sum(book.shares_ts, book.shares_cum, lo, hi))
@@ -575,10 +585,16 @@ def sells_beyond_summary(books: dict, leader_months) -> dict:
     such sell, and the share of the leaders' sells inside their standing windows that were such sells."""
     sells = beyond = 0
     for month, w in leader_months:
+        b = books[w]
+        if isinstance(b, MonthBook):
+            sells += b.window("sells", month)
+            beyond += b.window("beyond", month)
+            continue
         lo, hi = _bounds(month)
-        sells += _count_in(books[w].sell_ts, lo, hi)
-        beyond += _count_in(books[w].beyond_ts, lo, hi)
-    return {"wallets_with_sells_beyond_holding": sum(1 for b in books.values() if b.beyond_ts),
+        sells += _count_in(b.sell_ts, lo, hi)
+        beyond += _count_in(b.beyond_ts, lo, hi)
+    return {"wallets_with_sells_beyond_holding": sum(1 for b in books.values()
+                                                     if (b.any_beyond if isinstance(b, MonthBook) else b.beyond_ts)),
             "candidates": len(books), "leader_window_sells": sells, "leader_window_sells_beyond_holding": beyond,
             "share_of_leader_sells": (beyond / sells) if sells else None}
 
@@ -642,9 +658,13 @@ def _failures(ev: dict) -> list:
 # ---------------------------------------------------------------- months and the plan
 def _months_for(period: str, trades: dict) -> list:
     """Development: from three months after the earliest trade read to June 2026; sealed: July to October 2026."""
+    return _months_from(period, min((t.ts for ts in trades.values() for t in ts), default=None))
+
+
+def _months_from(period: str, first) -> list:
+    """_months_for from the earliest trade's time (None: no trade)."""
     if period == "sealed":
         return list(SEALED_MONTHS)
-    first = min((t.ts for ts in trades.values() for t in ts), default=None)
     if first is None:
         return []
     m, out = add_months(month_of(first), LOOKBACK_MONTHS), []
@@ -1093,14 +1113,34 @@ class Store:
     def trade_rows(self, wallet: str, end: int, spill: int = 0) -> list:
         """A wallet's trades before `end`, and those in [end, end + spill) only in tokens it bought in the day before
         `end` (the 24-hour purchase sums of the last day's positions), selected in the query."""
-        cur = self.db.execute("SELECT seq, proxy_wallet, side, token_id, condition_id, size, price, timestamp, event_slug, "
-                              "outcome_index, transaction_hash, slug FROM trades WHERE wallet=? AND (timestamp < ? OR "
-                              "(timestamp < ? AND token_id IN (SELECT token_id FROM trades WHERE wallet=? AND side='BUY' "
-                              "AND timestamp >= ? AND timestamp < ?))) ORDER BY seq",
-                              (wallet, end, end + spill, wallet, end - BUY_WINDOW, end))
-        keys = ("seq", "proxy_wallet", "side", "token_id", "condition_id", "size", "price", "timestamp", "event_slug",
-                "outcome_index", "transaction_hash", "slug")
-        return [dict(zip(keys, r)) for r in cur]
+        return list(self.trade_stream(wallet, end, spill))
+
+    def trade_stream(self, wallet: str, end: int, spill: int = 0, by_time: bool = False):
+        """trade_rows' rows one at a time through a cursor: in the order stored (seq), or `by_time` in time order
+        (ties: seq), the rows before `end` and then the next day's (all later than they), each through the index."""
+        cols = ("SELECT seq, proxy_wallet, side, token_id, condition_id, size, price, timestamp, event_slug, "
+                "outcome_index, transaction_hash, slug FROM trades WHERE wallet=? AND ")
+        spill_tokens = "token_id IN (SELECT token_id FROM trades WHERE wallet=? AND side='BUY' AND timestamp >= ? AND " \
+                       "timestamp < ?)"
+        if by_time:
+            reads = [(cols + "timestamp < ? ORDER BY timestamp, seq", (wallet, end))]
+            if spill:
+                reads.append((cols + "timestamp >= ? AND timestamp < ? AND " + spill_tokens + " ORDER BY timestamp, seq",
+                              (wallet, end, end + spill, wallet, end - BUY_WINDOW, end)))
+        else:
+            reads = [(cols + "(timestamp < ? OR (timestamp < ? AND " + spill_tokens + ")) ORDER BY seq",
+                      (wallet, end, end + spill, wallet, end - BUY_WINDOW, end))]
+        for sql, args in reads:
+            for r in self.db.execute(sql, args):
+                yield dict(zip(TRADE_KEYS, r))
+
+    def finished_among(self, kind: str, keys) -> set:
+        """The keys among `keys` whose walk of `kind` finished, selected in the query."""
+        out = set()
+        for part in _chunks(sorted(set(keys))):
+            out.update(k for (k,) in self.db.execute("SELECT key FROM walks WHERE kind=? AND status='finished' AND key "
+                                                     "IN (%s)" % ",".join("?" * len(part)), (kind, *part)))
+        return out
 
     def traded_conditions(self) -> set:
         return {r[0] for r in self.db.execute("SELECT DISTINCT condition_id FROM trades")}
@@ -1162,28 +1202,292 @@ class Store:
         return out
 
 
+TRADE_KEYS = ("seq", "proxy_wallet", "side", "token_id", "condition_id", "size", "price", "timestamp", "event_slug",
+              "outcome_index", "transaction_hash", "slug")
+
+
+def _window_points(db, key: str):
+    """A price window's points one at a time in the order stored; None for a row of the wrong shape."""
+    for ts, res, price in db.execute("SELECT timestamp, resolution_seconds, price FROM price_points WHERE walk_key=? "
+                                     "ORDER BY seq", (key,)):
+        if not pd.is_number(price) or not isinstance(res, int) or not isinstance(ts, int):
+            yield None
+            continue
+        yield Point(ts, res, dec(price))
+
+
+class _StoredPoints:
+    """{window key: [Point]} of the named finished windows, each read from the store when it is asked for (one
+    window in memory at a time); `db` a connection, or a store path opened read-only on first use."""
+
+    def __init__(self, db, keys):
+        self.keys, self._db = set(keys), db
+
+    def __contains__(self, k) -> bool:
+        return k in self.keys
+
+    def get(self, k, default=None):
+        if k not in self.keys:
+            return default
+        if not isinstance(self._db, sqlite3.Connection):
+            self._db = sqlite3.connect(Path(self._db).resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+        return [p for p in _window_points(self._db, k) if p is not None]
+
+
+def _count_bad_points(db, keys, counts: Counter) -> None:
+    for k in sorted(keys):
+        for p in _window_points(db, k):
+            if p is None:
+                counts["point_bad_row"] += 1
+
+
 def _chunks(items, n: int = 500):
     for i in range(0, len(items), n):
         yield items[i:i + n]
 
 
-def _stored_trades(s: Store, wallets, end: int, counts: Counter | None = None, spill: int = 0) -> dict:
-    out = {}
-    for w in wallets:
-        rows = []
-        for r in s.trade_rows(w, end, spill):
+def _resolutions(s: Store, conds) -> dict:
+    return {c: resolution_from_row(r) for c, r in s.resolution_rows(conds).items()}
+
+
+# ---------------------------------------------------------------- the reads, wallet by wallet (T47c)
+def _bucket(ts):
+    """The calendar month of a time (None for a time no month of the rule can hold)."""
+    try:
+        return month_of(ts)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+class MonthBook:
+    """A wallet's book (see wallet_book) summed by calendar month: realized profit, resolved positions, shares
+    traded, sells and sells beyond the holding. A standing window is whole months, so its sums are the Book's."""
+
+    def __init__(self):
+        self.realized: dict = defaultdict(int)
+        self.resolved: dict = defaultdict(int)
+        self.shares: dict = defaultdict(int)
+        self.sells: dict = defaultdict(int)
+        self.beyond: dict = defaultdict(int)
+        self.any_beyond = False
+        self.counts = Counter()
+
+    def window(self, what: str, month) -> int:
+        """The sum over the LOOKBACK_MONTHS calendar months before `month`."""
+        d = getattr(self, what)
+        return sum(d.get(add_months(month, -k), 0) for k in range(1, LOOKBACK_MONTHS + 1))
+
+
+class _Opened:
+    __slots__ = ("first", "total")
+
+    def __init__(self, first, total):
+        self.first, self.total = first, total
+
+
+class _WalletFold:
+    """One wallet's trades, given in time order (ties: seq), folded at once into its MonthBook (wallet_book's pass,
+    its markets' resolutions placed at their times) and its new positions (new_positions' pass): the state held is
+    by token and market, and a position waits only until its 24 hours have passed. `tokens_of` is wallet_book's
+    (each market's tokens in the order first stored, each with its last stored outcome index), read beforehand.
+    Positions: `keep` None keeps those that pass the entry tests; `keep` = (lo, hi) keeps, of those first bought in
+    [lo, hi), the ones that pass and counts the others by (month, reason)."""
+
+    def __init__(self, tokens_of: dict, resolutions: dict, keep):
+        self.tokens_of, self.res, self.keep = tokens_of, resolutions, keep
+        events = [(r.resolved_ts, c) for c, r in ((c, resolutions.get(c)) for c in tokens_of)
+                  if r is not None and r.state != "unresolved"]
+        events.sort(key=lambda e: e[0])            # stable: same-time resolutions in the order first stored
+        self.events, self.next_event = events, 0
+        self.book = MonthBook()
+        self.held: dict = defaultdict(int)
+        self.basis: dict = defaultdict(int)
+        self.done: set = set()
+        self.p_held: dict = defaultdict(dict)
+        self.last_touch: dict = {}
+        self.opened: dict = {}
+        self.waiting: deque = deque()
+        self.kept: list = []
+        self.skipped = Counter()
+
+    def add(self, t: Trade) -> None:
+        while self.next_event < len(self.events) and self.events[self.next_event][0] <= t.ts:
+            self._resolve(*self.events[self.next_event])
+            self.next_event += 1
+        while self.waiting and self.waiting[0].first.ts + BUY_WINDOW < t.ts:
+            self._settle(self.waiting.popleft())
+        self._position(t)
+        self._trade(t)
+
+    def finish(self) -> None:
+        while self.next_event < len(self.events):
+            self._resolve(*self.events[self.next_event])
+            self.next_event += 1
+        while self.waiting:
+            self._settle(self.waiting.popleft())
+
+    def _resolve(self, ts, cond) -> None:
+        r, b = self.res[cond], self.book
+        self.done.add(cond)
+        for tok, oi in self.tokens_of[cond].items():
+            if self.held[tok] > 0:
+                m = _bucket(ts)
+                b.realized[m] += idiv_half_up(self.held[tok] * r.payouts[oi], WIN_PAYOUT) - self.basis[tok]
+                b.resolved[m] += 1
+            self.held[tok], self.basis[tok] = 0, 0
+
+    def _trade(self, t: Trade) -> None:
+        b = self.book
+        if t.condition in self.done:
+            b.counts["trade_after_resolution"] += 1
+            return
+        m = _bucket(t.ts)
+        b.shares[m] += t.size_micro
+        if t.side == "BUY":
+            self.held[t.token] += t.size_micro
+            self.basis[t.token] += t.cash_micro
+            return
+        b.sells[m] += 1
+        held = self.held[t.token]
+        if t.size_micro <= held:
+            removed = idiv_half_up(self.basis[t.token] * t.size_micro, held)
+            b.realized[m] += t.cash_micro - removed
+            self.held[t.token] -= t.size_micro
+            self.basis[t.token] -= removed
+        else:
+            b.counts["sell_beyond_holding"] += 1
+            b.beyond[m] += 1
+            b.any_beyond = True
+            if held > 0:
+                b.realized[m] += idiv_half_up(t.cash_micro * held, t.size_micro) - self.basis[t.token]
+            self.held[t.token], self.basis[t.token] = 0, 0
+
+    def _position(self, t: Trade) -> None:
+        ph = self.p_held[t.condition]
+        if t.side == "BUY":
+            holding = any(v > 0 for v in ph.values())
+            recent = t.condition in self.last_touch and self.last_touch[t.condition] >= t.ts - NEW_WINDOW
+            for o in self.opened.get(t.token, ()):  # every one still within its 24 hours (see add)
+                o.total += t.cash_micro
+            if not holding and not recent:
+                o = _Opened(t, t.cash_micro)
+                self.opened.setdefault(t.token, []).append(o)
+                self.waiting.append(o)
+            ph[t.token] = ph.get(t.token, 0) + t.size_micro
+        else:
+            ph[t.token] = max(0, ph.get(t.token, 0) - t.size_micro)
+        self.last_touch[t.condition] = t.ts
+
+    def _settle(self, o: _Opened) -> None:
+        f = o.first
+        same = self.opened[f.token]
+        same.remove(o)
+        if not same:
+            del self.opened[f.token]
+        pos = NewPosition(f.wallet, f.seq, f.token, f.condition, f.event, f.outcome_index, f.ts, f.price,
+                          f.cash_micro, o.total, f.slug)
+        o.first = None
+        if self.keep is not None and not self.keep[0] <= pos.t1 < self.keep[1]:
+            return
+        why = position_skip(pos, self.res)
+        if why is None:
+            self.kept.append(pos)
+        elif self.keep is not None:
+            self.skipped[(month_of(pos.t1), why)] += 1
+
+
+@dataclass
+class _Folded:
+    books: dict = field(default_factory=dict)
+    positions: dict = field(default_factory=dict)
+    skipped: dict = field(default_factory=dict)
+    resolutions: dict = field(default_factory=dict)
+    conditions: set = field(default_factory=set)
+    unanswered: list = field(default_factory=list)
+    first_ts: int | None = None
+
+
+def _fold(s: Store, wallets, end: int, spill: int, keep, counts: Counter | None = None, collect: bool = False,
+          say=None, label: str = "", memory=None, guard=None) -> _Folded:
+    """Every wallet of `wallets` read and folded in turn (see _WalletFold): the trades before `end` (and the next
+    `spill` seconds' in tokens bought on the last day), each wallet's markets' resolutions fetched for it. One line a
+    wallet; `guard(memory MB, i, n)` after each. `collect`: the conditions read and the wallets lacking an answer."""
+    out = _Folded()
+    t0, n = time.monotonic(), len(wallets)
+    for i, w in enumerate(wallets, 1):
+        rows, tokens_of = 0, {}
+        for r in s.trade_stream(w, end, spill):
+            rows += 1
             t, why = trade_from_row(w, r["seq"], r)
             if why:
                 if counts is not None:
                     counts["trade_" + why] += 1
                 continue
-            rows.append(t)
-        out[w] = rows
+            tokens_of.setdefault(t.condition, {})[t.token] = t.outcome_index
+            if out.first_ts is None or t.ts < out.first_ts:
+                out.first_ts = t.ts
+        res = _resolutions(s, tokens_of)
+        if collect:
+            answered = s.resolution_answers(tokens_of)
+            if any(c not in answered for c in tokens_of):
+                out.unanswered.append(w)
+            out.conditions.update(tokens_of)
+        fold = _WalletFold(tokens_of, res, keep)
+        for r in s.trade_stream(w, end, spill, by_time=True):
+            t, why = trade_from_row(w, r["seq"], r)
+            if not why:
+                fold.add(t)
+        fold.finish()
+        out.books[w], out.positions[w], out.skipped[w] = fold.book, fold.kept, fold.skipped
+        for p in fold.kept:
+            out.resolutions[p.condition] = res[p.condition]
+        del fold, res, tokens_of
+        mb = (memory or rss_mb)()
+        if say is not None:
+            say("%s: wallet %d of %d (%s): %s rows read, %d s, memory %d MB" % (
+                label, i, n, w[:10], format(rows, ","), time.monotonic() - t0, mb))
+        if guard is not None:
+            guard(mb, i, n)
     return out
 
 
-def _resolutions(s: Store, conds) -> dict:
-    return {c: resolution_from_row(r) for c, r in s.resolution_rows(conds).items()}
+_READING: dict = {"label": "load", "say": None, "limit": None, "claimed": False}
+
+
+@contextlib.contextmanager
+def _reading(label: str, say, limit, claimed: bool = False):
+    """What `load` prints and checks while develop or sealed runs it (load's own arguments stay the period's)."""
+    before = dict(_READING)
+    _READING.update(label=label, say=say, limit=limit, claimed=claimed)
+    try:
+        yield
+    finally:
+        _READING.clear()
+        _READING.update(before)
+
+
+def _reading_guard():
+    label, say, limit, claimed = (_READING[k] for k in ("label", "say", "limit", "claimed"))
+    said = []
+
+    def guard(mb, i, n):
+        if limit is None or mb <= limit:
+            return
+        if claimed:                                # the period is spent: stopping now would lose it, so say it
+            if not said and say is not None:
+                said.append(True)
+                say("%s: resident memory %d MB is above the limit of %d MB (--max-memory-mb) at wallet %d of %d; not "
+                    "stopped: the sealed period is claimed" % (label, mb, limit, i, n))
+            return
+        raise MemoryStopped("stopped: resident memory %d MB is above the limit of %d MB (--max-memory-mb) at wallet "
+                            "%d of %d of %s; nothing written%s" % (mb, limit, i, n, label, "; the sealed period is not "
+                                                                   "claimed" if label.startswith("sealed") else ""))
+    return guard
+
+
+def _say_err(msg: str) -> None:
+    """develop's and sealed's own lines: to the error stream (the result table is the output), flushed at once."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- the pull (the lead runs it; never in tests)
@@ -1210,18 +1514,17 @@ def phase1_problems(s: Store, leave_out=()) -> list:
     return out
 
 
-def plan_store(s: Store, leave_out=()) -> dict:
+def plan_store(s: Store, leave_out=(), say=None, memory=None, guard=None) -> dict:
     """Compute from phase 1 the leaders' qualifying positions (and their base price windows) of every development
-    and sealed month, record them as the plan, and return them."""
+    and sealed month, record them as the plan, and return them. Wallet by wallet (see _fold): one line a wallet
+    through `say`, `guard` after each (it raises to stop; nothing is recorded then)."""
     leave = sorted(set(leave_out))
     done = s.finished_keys("trades")
     wallets = [w for w in s.candidates() if w not in leave and w in done]
-    trades = _stored_trades(s, wallets, 2 ** 62)
-    res = _resolutions(s, {t.condition for ts in trades.values() for t in ts})
-    books = {w: wallet_book(trades.get(w, []), res) for w in s.candidates() if w not in leave}
-    positions = {w: new_positions(ts) for w, ts in trades.items()}
-    months = _months_for("development", trades) + list(SEALED_MONTHS)
-    targets = plan_targets(books, positions, res, months)
+    f = _fold(s, wallets, 2 ** 62, 0, None, say=say, label="phase 2: planning", memory=memory, guard=guard)
+    books = {w: f.books[w] if w in f.books else MonthBook() for w in s.candidates() if w not in leave}
+    months = _months_from("development", f.first_ts) + list(SEALED_MONTHS)
+    targets = plan_targets(books, f.positions, f.resolutions, months)
     s.record_plan(targets, leave, months)
     return targets
 
@@ -1238,6 +1541,10 @@ COPY_WARNING = ("never copy the store file while a pull runs (a copy made alone 
 class PullStopped(Exception):
     """The pull stopped itself: its resident memory went above the limit. The walk it was in is left unfinished
     (no row of it kept); a re-run starts that walk again from its first page."""
+
+
+class MemoryStopped(PullStopped):
+    """develop or sealed stopped by --max-memory-mb at a wallet, having written nothing."""
 
 
 class _MemoryOver(Exception):
@@ -1628,7 +1935,7 @@ def add_ten_minute_windows(s: Store) -> dict:
     plan = s.plan()
     res = _resolutions(s, {tg.condition for tg in plan.values()})
     main = [price_key(tg.token, tg.t1 + DELAY) for tg in plan.values()]
-    windows = ten_minute_windows(plan, s.price_points(main), res)
+    windows = ten_minute_windows(plan, _StoredPoints(s.db, s.finished_among("prices", main)), res)
     s.add_plan_windows(windows)
     meta = s.meta("plan") or {}
     meta.update({"ten_minute_windows_added": True, "windows": len(s.plan_windows())})
@@ -1666,7 +1973,10 @@ def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
     problems = phase1_problems(s, leave_out)
     if problems:
         raise Refused("phase 1 is unfinished: %s; finish it (or name the wallets with --leave-out)" % "; ".join(problems))
-    plan = plan_store(s, leave_out)
+    def guard(mb, i, n):
+        if mb > run.limit:
+            raise _MemoryOver(mb)
+    plan = plan_store(s, leave_out, say=run.say, memory=run.memory, guard=guard)
     s.commit()
     done = s.finished_keys("prices")
     todo = {k: wd for k, wd in s.plan_windows().items() if k not in done}
@@ -1688,11 +1998,16 @@ def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
 # ---------------------------------------------------------------- loading, with the period wall
 @dataclass
 class Data:
+    """One period's data as the analysis needs it, none of it growing with the trades: each wallet's MonthBook, its
+    new positions that pass the entry tests (first bought in the period), the others counted by (month, reason),
+    the resolutions of those positions' markets, and the price windows (read when used)."""
     period: str
     candidates: list
-    trades: dict
+    books: dict
+    positions: dict
+    skipped: dict
     resolutions: dict
-    points: dict
+    points: "_StoredPoints"
     counts: Counter
     wallets_left_out: list
     unfinished_left_out: list
@@ -1733,20 +2048,20 @@ def load(store, period: str, leave_out=()) -> Data:
         implicated = {w: ["trades walk ended at the page limit (%d pages read)" % limited[w] if w in limited
                           else "trades walk"] for w in s.unfinished("trades")}
         done = s.finished_keys("trades")
-        trades = _stored_trades(s, [w for w in kept if w in done], hi, counts, SPILL)
-        answered = set(s.resolution_answers({t.condition for ts in trades.values() for t in ts}))
-        for w, ts in trades.items():
-            if any(t.condition not in answered for t in ts):
-                implicated.setdefault(w, []).append("resolutions")
-        resolutions = _resolutions(s, {t.condition for ts in trades.values() for t in ts})
-        books = {w: wallet_book(trades.get(w, []), resolutions) for w in kept}
-        positions = {w: new_positions(ts) for w, ts in trades.items()}
-        months = _months_for(period, trades)
-        targets = {k: tg for k, tg in plan_targets(books, positions, resolutions, months).items() if lo <= tg.t1 < hi}
+        f = _fold(s, [w for w in kept if w in done], hi, SPILL, (lo, hi), counts, collect=True,
+                  say=_READING["say"], label=_READING["label"], guard=_reading_guard())
+        for w in f.unanswered:
+            implicated.setdefault(w, []).append("resolutions")
+        resolutions = f.resolutions
+        books = {w: f.books[w] if w in f.books else MonthBook() for w in kept}
+        months = _months_from(period, f.first_ts)
+        targets = {k: tg for k, tg in plan_targets(books, f.positions, resolutions, months).items() if lo <= tg.t1 < hi}
         windows = base_windows(targets)
-        points = s.price_points(windows, counts)
+        points = _StoredPoints(s.db, s.finished_among("prices", windows))
+        _count_bad_points(s.db, points.keys, counts)
         windows.update(ten_minute_windows(targets, points, resolutions))
-        points = s.price_points(windows, counts)
+        points = _StoredPoints(path, s.finished_among("prices", windows))
+        _count_bad_points(s.db, points.keys, counts)
         for k, wd in windows.items():
             if k not in points:
                 for w in targets[wd.target].wallets:
@@ -1757,17 +2072,16 @@ def load(store, period: str, leave_out=()) -> Data:
                           % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10]),
                              " ".join(sorted(set(leave) | set(missing)))))
         if period == "development":                 # only what a development run reads; sealed: the whole store
-            store_counts = s.counts_by_reason(read=(list(trades), hi, {t.condition for ts in trades.values()
-                                                                       for t in ts}, list(windows)))
+            store_counts = s.counts_by_reason(read=(list(f.books), hi, f.conditions, list(windows)))
         else:
             store_counts = s.counts_by_reason()
-    return Data(period, kept, trades, resolutions, points, counts, leave,
+    return Data(period, kept, books, f.positions, f.skipped, resolutions, points, counts, leave,
                 sorted(w for w in implicated if w in leave), months, store_counts)
 
 
 # ---------------------------------------------------------------- the analysis
 def books_of(data: Data) -> dict:
-    return {w: wallet_book(data.trades.get(w, []), data.resolutions) for w in data.candidates}
+    return data.books
 
 
 def _info_block(trades, cost: int, **extra) -> dict:
@@ -1797,7 +2111,7 @@ def _point_table(trades, passed: Counter) -> dict:
 def analyze(data: Data) -> dict:
     lo, hi = _period_bounds(data.period)
     books = books_of(data)
-    positions = {w: new_positions(ts) for w, ts in data.trades.items()}
+    positions = data.positions
     book_counts = Counter()
     for b in books.values():
         book_counts.update(b.counts)
@@ -1816,11 +2130,18 @@ def analyze(data: Data) -> dict:
         leader_months += [(m, w) for w in leaders]
         m0, m1 = month_start(*m), month_start(*add_months(m, 1))
         pos = [p for w in leaders for p in positions.get(w, []) if m0 <= p.t1 < m1 and lo <= p.t1 < hi]
+        pre = Counter()                            # the positions that failed an entry test, counted at the fold
+        for w in leaders:
+            for (mm, why), n in data.skipped.get(w, {}).items():
+                if mm == m:
+                    pre[why] += n
         got, sk = copy_trades(pos, data.resolutions, data.points, DELAY, passed)
         main += got
         position_skips.update(sk)
+        position_skips.update(pre)
         for k, d in info_delays:
             g, s2 = copy_trades(pos, data.resolutions, data.points, d)
+            s2.update(pre)
             if k == TEN_MINUTES[0]:
                 # read only where the main point's grain is five minutes or finer; the figure only at that grain
                 s2["main_point_coarser_than_5_minutes"] = s2.pop("no_price_window", 0)
@@ -1830,7 +2151,7 @@ def analyze(data: Data) -> dict:
             info_trades[k] += g
             info_skips[k].update(s2)
         table.append({"month": month_name(m), "leaders": leaders, "left_out": None, "copied": len(got),
-                      "positions": len(pos)})
+                      "positions": len(pos) + sum(pre.values())})
     info = {k: _info_block(info_trades[k], COST_CENTS, delay_seconds=d, position_skips=dict(sorted(info_skips[k].items())))
             for k, d in info_delays}
     info["cost_4_cents"] = _info_block(main, 4)
@@ -1987,9 +2308,10 @@ def _readable(path: Path):
         yield
 
 
-def run_develop(*, store=None, out_dir=None, leave_out=()) -> dict:
+def run_develop(*, store=None, out_dir=None, leave_out=(), max_memory_mb: float | None = MAX_MEMORY_MB,
+                say=None) -> dict:
     path = _store_path(store)
-    with _readable(path):
+    with _readable(path), _reading("develop", say or _say_err, max_memory_mb):
         return _run_develop(path, out_dir, leave_out)
 
 
@@ -2077,7 +2399,8 @@ def _claim(path: Path, sid: str, note: dict) -> None:
         db.close()
 
 
-def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None) -> dict:
+def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None,
+               max_memory_mb: float | None = MAX_MEMORY_MB, say=None) -> dict:
     """The sealed run, once per store. In order: the flag; the store's own shape and id; the store's own marker; the folder's marker; the
     development file and its hash; the bookkeeping; the development result recomputed from this store (it must pass,
     and the file must equal it byte for byte); the store's marker (committed), the folder's marker; only then the
@@ -2085,7 +2408,7 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
     if not flag:
         raise Refused("the sealed period is opened only with --i-am-opening-the-sealed-period")
     path = _store_path(store)
-    with _readable(path):
+    with _readable(path), _reading("sealed (development recomputed)", say or _say_err, max_memory_mb):
         return _run_sealed(path, out_dir, leave_out, develop_file)
 
 
@@ -2132,7 +2455,8 @@ def _run_sealed(path: Path, out_dir, leave_out, develop_file) -> dict:
             os.fsync(f.fileno())
     except FileExistsError:
         raise Refused("the sealed period was already run") from None
-    data = load(path, "sealed", leave)
+    with _reading("sealed", _READING["say"], _READING["limit"], claimed=True):
+        data = load(path, "sealed", leave)
     prov = _provenance(path)
     prov.update({"development_file": str(dev), "development_sha256": dev_sha})
     doc = {"provenance": prov, "result": sealed_result(data)}
@@ -2207,6 +2531,7 @@ def main(argv=None) -> int:
         p.add_argument("--store", default=None)
         p.add_argument("--out-dir", default=None)
         p.add_argument("--leave-out", nargs="*", default=[])
+        p.add_argument("--max-memory-mb", type=int, default=MAX_MEMORY_MB)
         if name == "sealed":
             p.add_argument("--i-am-opening-the-sealed-period", dest="flag", action="store_true")
             p.add_argument("--develop-file", default=None)
@@ -2221,10 +2546,10 @@ def main(argv=None) -> int:
                                   max_memory_mb=a.max_memory_mb)), flush=True)
             return 0
         if a.cmd == "develop":
-            doc = run_develop(store=a.store, out_dir=a.out_dir, leave_out=a.leave_out)
+            doc = run_develop(store=a.store, out_dir=a.out_dir, leave_out=a.leave_out, max_memory_mb=a.max_memory_mb)
         else:
             doc = run_sealed(store=a.store, out_dir=a.out_dir, flag=a.flag, leave_out=a.leave_out,
-                             develop_file=a.develop_file)
+                             develop_file=a.develop_file, max_memory_mb=a.max_memory_mb)
     except Refused as e:
         print("REFUSED: %s" % e, file=sys.stderr)
         return 2
