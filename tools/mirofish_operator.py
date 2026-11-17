@@ -639,7 +639,7 @@ class SwitchOffs:
     decision instance nor the embedding instance (unloaded by REST, never reloaded). Each with its before-state in the row."""
 
     def __init__(self, host, row):
-        self.host = host; self.row_alerts = row['alerts']
+        self.host = host; self.row_alerts = row['alerts']; self.row = row
         self.rec = row['switch_offs'] = {'pick_reader': None, 'models_unloaded': [], 'models_note': NOT_RELOADED}
 
     def apply(self, summary):
@@ -680,9 +680,9 @@ class SwitchOffs:
             now = models_state(host)['others']
             still = [o['instance_id'] for o in now if o['instance_id'] in announced]
             later = ['%s (%s)' % (o['instance_id'], o['key']) for o in now if o['instance_id'] not in announced]
-            if later:              # addendum 5: only what was announced is unloaded; a later model is reported and left alone
-                self.rec['loaded_after_announcement'] = later
-                self.row_alerts.append('MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE (NOT UNLOADED): %s' % ', '.join(later))
+            if later:              # addendum 6: before the spawn a later model means the run is not launched (never unloaded)
+                late_models(host, self.row, now=[o for o in now if o['instance_id'] not in announced])
+                raise Refused(LATE_REFUSAL % ', '.join(later))
             if still:
                 raise OperatorError('still loaded after the unload: %s' % ', '.join(still))
 
@@ -956,6 +956,38 @@ def staged_threshold(work):
     manifest = json.loads((work / 'builder/candidate-manifest.json').read_text())
     value = ((manifest.get('model_profile') or {}).get('start_threshold') or {}).get('percent_free')
     return value if type(value) is int else LIMITS.REVIEWED_START_THRESHOLD
+
+
+LATE_REFUSAL = ('a model was loaded after the announcement: %s; the start check and what the owner was told no longer hold, '
+                'so nothing is launched (it is not unloaded: only announced models are)')
+
+
+def late_models(host, row, now=None):
+    """Addendum 6: every loaded instance that is neither the decision instance, the embedding instance nor an mf-native
+    one, once the announced models were unloaded, appeared after the announcement. Each is named once in the row
+    (`loaded_after_announcement`, key and id) and, after the spawn, in a capitals alert; it is never unloaded. Returns
+    the new ones."""
+    if now is None:
+        now = models_state(host)['others']
+    known = {m['instance_id'] for m in row['loaded_after_announcement']}
+    new = [{'instance_id': o['instance_id'], 'key': o['key']} for o in now if o['instance_id'] not in known]
+    row['loaded_after_announcement'].extend(new)
+    return new
+
+
+def alert_late(host, row, now=None):
+    new = late_models(host, row, now)
+    if new:
+        row['alerts'].append('MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE (NOT UNLOADED): %s; THE %s DOES NOT COUNT' % (
+            ', '.join('%s (%s)' % (m['instance_id'], m['key']) for m in new), 'RUN' if row['command'] == 'run' else 'TEST'))
+    return new
+
+
+def refuse_if_late(host, row):
+    """Addendum 6: just before the gate and the spawn (a run) or the load call (a load test)."""
+    new = late_models(host, row)
+    if new:
+        raise Refused(LATE_REFUSAL % ', '.join('%s (%s)' % (m['instance_id'], m['key']) for m in new))
 
 
 def settle_after_unloads(host, row):
@@ -1272,7 +1304,7 @@ def verdicts(collector, pipeline, memory):
 def post_state(host, row):
     m = models_state(host)
     row['post'] = {'decision_instance_right': m['decision_instance']['loaded_and_right'], 'why': m['decision_instance']['why'],
-                   'native_loaded': m['native_loaded'], 'utc': utc(host.now())}
+                   'native_loaded': m['native_loaded'], 'others': m['others'], 'utc': utc(host.now())}
     if not m['decision_instance']['loaded_and_right']:
         row['alerts'].append('DECISION INSTANCE NOT LOADED AND RIGHT: %s (THE TOOL DOES NOT RELOAD IT; THE COLLECTOR\'S KEEPER DOES)'
                              % m['decision_instance']['why'])
@@ -1353,7 +1385,7 @@ def new_row(command, args, plan, t):
             'announced': args.announced, 'announced_note': 'the lead\'s statement that the owner was told; the tool cannot check it',
             'launched': False, 'refused': None, 'error': None, 'stopped': None, 'staged_folder': None, 'twin_folder': None,
             'switch_offs': None, 'deadline': None, 'pipeline': None, 'memory': None, 'collector': None, 'stop': None, 'post': None,
-            'verdicts': None, 'counts': False, 'alerts': []}
+            'verdicts': None, 'counts': False, 'loaded_after_announcement': [], 'alerts': []}
 
 
 def watch(host, row, stopper, t_start, t_launch, wall_s, own):
@@ -1364,6 +1396,7 @@ def watch(host, row, stopper, t_start, t_launch, wall_s, own):
         host.sleep(WATCH_S)
         if proc.poll() is not None:
             break
+        alert_late(host, row)                    # addendum 6: after the spawn, an alert at once; the stop rule unchanged
         m = memory(host)
         if m['free_percent'] is not None:
             own['lowest'] = m['free_percent'] if own['lowest'] is None else min(own['lowest'], m['free_percent'])
@@ -1482,8 +1515,9 @@ def cmd_run(host, args):
         threshold, free = require_free(host, work, row)
         row['start_threshold'], row['free_at_start'] = threshold, free
         preflight(host, twin)
-        gate = write_gate(host, work, candidate, args.announced)
         swap_start = memory(host)['swap_used_bytes']
+        refuse_if_late(host, row)                                 # addendum 6: before the gate and the spawn
+        gate = write_gate(host, work, candidate, args.announced)
         t_launch = host.now()
         stopper = Stopper(host, work, row, t_launch)
         row['utc_launch'] = utc(t_launch)
@@ -1602,7 +1636,7 @@ def minimal_row(row, host, exc):
     """Addendum 2, item 8: what is known, for a row whose finishing was interrupted; it never counts."""
     keep = ('command', 'utc_start', 'profile', 'plan', 'announced', 'announced_note', 'launched', 'refused', 'error', 'stopped',
             'staged_folder', 'twin_folder', 'utc_launch', 'launcher', 'stop', 'switch_offs', 'deadline', 'signals_received',
-            'alerts')
+            'loaded_after_announcement', 'alerts')
     out = {k: row.get(k) for k in keep}
     out.update(utc_end=utc(host.now()), recording='interrupted while recording: %s' % type(exc).__name__, counts=False,
                verdicts=None, pipeline=None, memory=None, collector=None, post=None)
@@ -1630,8 +1664,10 @@ def finish_run_row(host, row, work, plan, t_start, swap_start, own):
     row['memory'] = memory_outcome(receipt, swap_start, memory(host)['swap_used_bytes'], own)
     post_state(host, row)
     if row['launched']:
+        alert_late(host, row, now=row['post']['others'])
         row['verdicts'] = verdicts(row['collector'], row['pipeline'], row['memory'])
-        row['counts'] = all(v is True for v in row['verdicts'].values())
+        # addendum 6: a model loaded after the announcement means the run does not count, whatever else it shows
+        row['counts'] = all(v is True for v in row['verdicts'].values()) and not row['loaded_after_announcement']
 
 
 # ============================================================================ load-test
@@ -1684,7 +1720,7 @@ class PipelineLoadPath:
         return self.sdk.group.stop(self.deadline + 60) if hasattr(self.sdk, 'group') else None
 
 
-def sample_phase(host, seconds, t_since):
+def sample_phase(host, seconds, t_since, late_row=None):
     """Memory samples SAMPLE_S apart for `seconds`, the collector checked every WATCH_S; (samples, breach or None)."""
     samples = []; start = host.now(); next_check = start + WATCH_S
     while host.now() - start < seconds:
@@ -1693,6 +1729,8 @@ def sample_phase(host, seconds, t_since):
         if t >= next_check:
             next_check += WATCH_S
             breach = collector_health(host, since=t_since)['breach']
+            if late_row is not None:
+                alert_late(host, late_row)               # addendum 6: during the hold, at every collector check
             if breach:
                 return samples, breach
         host.sleep(max(0.0, start + len(samples) * SAMPLE_S - host.now()))
@@ -1759,6 +1797,7 @@ def cmd_load_test(host, args):
         if breach:
             result['stopped'] = 'collector breach'; result['first_breach'] = breach
         else:
+            refuse_if_late(host, result)                          # addendum 6: before the load call
             asked = True
             try:
                 result['load'].update(lp.load(), ok=True)
@@ -1766,12 +1805,13 @@ def cmd_load_test(host, args):
                 result['load']['refusal'] = '%s: %s' % (type(e).__name__, e)
                 result['error'] = 'the load failed: ' + result['load']['refusal']
             if result['load']['ok']:
+                alert_late(host, result)                          # addendum 6: after the load, an alert at once
                 # addendum 2, item 11: the collector at once when the load call returns, as well as during the hold
                 after = collector_health(host, since=t0)
                 result['collector_after_load'] = collector_figures(after)
                 breach = after['breach']
                 if not breach:
-                    hold, breach = sample_phase(host, hold_s, t0)
+                    hold, breach = sample_phase(host, hold_s, t0, result)
                 if breach:
                     result['stopped'] = 'collector breach'; result['first_breach'] = breach
     except Refused as e:
@@ -1810,6 +1850,8 @@ def cmd_load_test(host, args):
             if result.get('first_breach'):
                 result['collector']['breach'] = result['first_breach']
             post_state(host, result)
+            if asked:
+                alert_late(host, result, now=result['post']['others'])
         steps.run('finishing the result', finish)
 
         def write():
