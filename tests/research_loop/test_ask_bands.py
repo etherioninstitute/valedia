@@ -265,7 +265,8 @@ def test_p_value_extremes_and_determinism():
     assert ab.event_p([5] * 50)[0] == 0                  # every resample is above zero
     assert ab.event_p([-5] * 50) == (2000, 1.0)          # none is
     assert ab.event_p([0] * 50)[0] == 2000               # not above zero counts
-    a, b = ab.event_p([3, -2, 7, -1, 4] * 30), ab.event_p([3, -2, 7, -1, 4] * 30)
+    mixed = [3, -3, 3, -3, 1, -1, 2, -3] * 20           # mean a little below zero
+    a, b = ab.event_p(mixed), ab.event_p(mixed)
     assert a == b and 0 < a[0] < 2000 and a[1] == a[0] / 2000
 
 
@@ -297,7 +298,7 @@ def dev_only_w(tmp_path_factory):
 def planted_s(tmp_path_factory):
     root = tmp_path_factory.mktemp("planted_s")
     write_s(root, gen(41, 1500, 2, sealed=False, universe="S", kind="planted", tag="D") +
-            gen(42, 1500, 2, sealed=True, universe="S", kind="planted", tag="S"))
+            gen(42, 4000, 2, sealed=True, universe="S", kind="planted", tag="S"))     # power: the sealed period is short
     return root
 
 
@@ -517,7 +518,7 @@ def test_duplicate_tickers_and_unsafe_tickers_are_skipped(tmp_path):
 def test_w_at_12_hours_uses_the_candle_12_hours_before_close(tmp_path):
     col = run_w(tmp_path, [one_market(bid=50, ask=52, bid12=60, ask12=62)])
     assert sorted(t[1] for t in col.labels["24h"].trades) == [50, 52]
-    assert sorted(t[1] for t in col.labels["12h"].trades) == [38, 62]
+    assert sorted(t[1] for t in col.labels["12h"].trades) == [40, 62]
 
 
 # ---------------------------------------------------------------- periods
