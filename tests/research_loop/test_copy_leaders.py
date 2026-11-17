@@ -1266,6 +1266,8 @@ def _break(store, how):
         db.execute("CREATE TABLE extra (x)")
     elif how == "a_trigger":
         db.execute("CREATE TRIGGER t AFTER INSERT ON meta BEGIN DELETE FROM meta WHERE key='sealed_marker'; END")
+    elif how == "a_column_constraint_dropped":           # only the stored definition differs, no name
+        _rebuild(db, "candidates", "boards TEXT NOT NULL", "boards TEXT")
     elif how == "two_markers":
         _rebuild(db, "meta", "key TEXT PRIMARY KEY", "key TEXT")
         db.executemany("INSERT INTO meta VALUES ('sealed_marker', ?)", [("1",), ("2",)])
@@ -1274,7 +1276,7 @@ def _break(store, how):
 
 
 SHAPES = ["meta_without_its_key_and_two_ids", "trades_without_its_key", "a_table_missing", "an_extra_table",
-          "a_trigger", "two_markers"]
+          "a_trigger", "two_markers", "a_column_constraint_dropped"]
 
 
 @pytest.mark.parametrize("how", SHAPES)
@@ -1344,20 +1346,23 @@ def test_development_prints_only_counts_it_may_read_and_sealed_the_whole_stores(
     _rej(store, [("prices", sealed_key, "repeated_row", pt(cl.SEALED_START + DAY))] * 3
          + [("prices", sealed_key, "conflicting_row", pt(cl.SEALED_START + DAY))] * 2
          + [("trades", "pro01", "repeated_row", tr(cl.SEALED_START + 3 * DAY)),
-            ("trades", "pro01", "repeated_row", tr(cl.SEALED_START + 10))]
+            ("trades", "pro01", "repeated_row", tr(cl.SEALED_START + 10)),
+            ("trades", "pro01", "timestamp_not_whole", tr(cl.SEALED_START + 5 * DAY + 0.5))]
          + [("resolutions", sealed_cond, "conflicting_row", "{}")] * 2)
     cl.run_develop(store=store, out_dir=tmp_path / "b")
     a, b = (tmp_path / "a" / "develop.json").read_bytes(), (tmp_path / "b" / "develop.json").read_bytes()
     assert a == b                                        # rows of sealed-only windows change nothing in development
     _rej(store, [("prices", dev_key, "repeated_row", pt(cl.SEALED_START - DAY)),
                  ("trades", "pro01", "repeated_row", tr(cl.SEALED_START - DAY)),
+                 ("trades", "pro01", "bad_row", "not json{"),                  # undated: counted
                  ("resolutions", dev_cond, "conflicting_row", "{}")])
     c = cl.run_develop(store=store, out_dir=tmp_path / "c")
     assert c["result"]["store_counts"] == {"prices": {"repeated_row": 1}, "resolutions": {"conflicting_row": 1},
-                                           "trades": {"repeated_row": 1}}     # the other side: these are read
+                                           "trades": {"bad_row": 1, "repeated_row": 1}}     # these are read
     assert cl.load(store, "sealed").store_counts == {"prices": {"conflicting_row": 2, "repeated_row": 4},
                                                      "resolutions": {"conflicting_row": 3},
-                                                     "trades": {"repeated_row": 3}}
+                                                     "trades": {"bad_row": 1, "repeated_row": 3,
+                                                                "timestamp_not_whole": 1}}
 
 
 def test_the_docstring_states_what_development_reads_and_the_copied_store_limit_exactly():
