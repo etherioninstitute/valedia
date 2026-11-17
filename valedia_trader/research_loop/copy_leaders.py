@@ -1,30 +1,35 @@
-"""The locked "copying the leaders" test: buy one contract an hour after a Polymarket leader's new position, hold it to
-the resolution, pay three cents, and see whether anything is left.
+"""The locked "copying the leaders" test: buy one contract after a Polymarket leader's new position, at the first
+price a taker paid for that outcome after the hour, hold it to the resolution, pay three cents, see what is left.
 
 The specification is docs/research/2026-11-17-copying-leaders-prediction.md (committed as 10ad062, its stated time
-corrected in 12a4454, before any code existed).
+corrected in 12a4454, amended in dec8dd7 before any data: the follower's price is the FIRST taker purchase of the
+same outcome token in that market at or after one hour after the leader's first purchase, within six hours).
 
-    python -m valedia_trader.research_loop.copy_leaders pull    [--store FILE]
+    python -m valedia_trader.research_loop.copy_leaders pull --phase 1|2 [--store FILE] [--leave-out W ...]
     python -m valedia_trader.research_loop.copy_leaders develop [--store FILE] [--out-dir DIR] [--leave-out W ...]
     python -m valedia_trader.research_loop.copy_leaders sealed  --i-am-opening-the-sealed-period [--store FILE]
         [--out-dir DIR] [--develop-file FILE] [--leave-out W ...]
 
 Rules the code holds:
 
-* `pull` reads the two profit boards ONCE (the candidate set, stored with its read time; a later pull never reads the
-  boards into the same store), then each candidate's full trade history and positions, the resolution of every
-  traded condition, and the price history around every position that could be copied. Raw JSON is kept beside the
-  parsed columns with the time of each read. A walk that did not finish stays marked unfinished; a second pull asks
-  only for what is missing.
+* The pull has two phases. Phase 1: the two profit boards ONCE (the candidate set, stored with its read time; a later
+  pull never reads the boards into the same store), every candidate's full trade history, and the resolution of
+  every traded condition (twenty ids a request, one answer word per id). Phase 2 refuses while phase 1 is
+  unfinished; it computes from phase 1 the leaders of every month (standing uses only what precedes the month) and
+  their new positions that pass the entry tests, records that plan, and reads for exactly those positions the
+  market's taker prints in [t1, t1 + 30 hours]. Each phase prints how many requests it is about to make first.
+  Raw JSON is kept beside the parsed columns with the time of each read; a walk that did not finish stays marked
+  unfinished; a second pull asks only for what is missing.
 * The period wall. Development is every month up to June 2026; sealed is July to October 2026. `develop` reads only
-  trades before 2026-07-01 plus one day (the 24-hour purchase sums of 30 June's positions), only the resolutions of
-  conditions so read and only price points before 2026-07-02. A leader's standing for month M uses only trades and
-  resolutions before M began. `sealed` needs the flag and the development file with its hash, writes its marker
-  BEFORE any sealed row is read, and runs once.
+  trades before 2026-07-01 plus one day (the 24-hour purchase sums of 30 June's positions), the resolutions of the
+  conditions so read, and the prints of the development windows only. A leader's standing for month M uses only
+  trades and resolutions before M began. `sealed` needs the flag and the development file with its hash; before
+  its marker it checks from bookkeeping tables alone that phase 1 finished and that every sealed window of the plan
+  was pulled; it writes the marker BEFORE any sealed row is read, and runs once.
 * Money is whole cents decided on integers: trade cash is exact micro-dollars, a standing and a 24-hour sum are
   rounded to cents half up, a follower's price is rounded to the cent half up; means are computed at the end.
-* The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position and row
-  is counted by reason.
+* The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, print
+  and row is counted by reason.
 """
 from __future__ import annotations
 
@@ -35,7 +40,7 @@ import json
 import os
 import sqlite3
 import sys
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +57,7 @@ from valedia_trader.venues import polymarket_data as pd
 UTC = timezone.utc
 PREDICTION_COMMIT = "10ad062"
 TIME_CORRECTION_COMMIT = "12a4454"
+AMENDMENT_COMMIT = "dec8dd7"
 PREDICTION_DOC = "docs/research/2026-11-17-copying-leaders-prediction.md"
 
 SEED = 20261117
@@ -73,12 +79,12 @@ MIN_BUY_CENTS = 100_000                   # 1,000 dollars
 FIRST_LO, FIRST_HI = Decimal("0.10"), Decimal("0.90")
 RESOLVE_WITHIN = 45 * DAY
 DELAY = HOUR
-STALE = 6 * HOUR
+FOLLOW_WINDOW = 6 * HOUR                  # the first taker purchase within [T, T + 6 hours], both ends included
 GUARD_LO, GUARD_HI = Decimal("0.05"), Decimal("0.95")
 WIN_PAYOUT = 1_000_000                    # micro-USDC a share
-MAX_BUCKET = DAY                          # the widest bucket the price service serves
-WINDOW_BEFORE, WINDOW_AFTER = 6 * HOUR, DAY + 6 * HOUR   # the price window read around a first purchase
+FEED_AFTER = 30 * HOUR                    # the market feed read for a planned position: [t1, t1 + 30 hours]
 INFO_DELAYS = (("delay_10_minutes", 600), ("delay_6_hours", 6 * HOUR), ("delay_24_hours", DAY))
+WAIT_BUCKETS = ((0, 59), (60, 599), (600, 3599), (3600, FOLLOW_WINDOW))
 BIG_FIRST_MICRO = 10_000 * 1_000_000
 # event slugs taken as sports (information only; neither the trade nor the position row carries a category)
 SPORTS_PREFIXES = ("nfl-", "nba-", "wnba-", "mlb-", "nhl-", "cfb-", "cbb-", "ncaab-", "ncaaf-", "epl-", "ucl-", "uel-",
@@ -88,6 +94,7 @@ SPORTS_PREFIXES = ("nfl-", "nba-", "wnba-", "mlb-", "nhl-", "cfb-", "cbb-", "nca
 
 STORE = Path("artifacts") / "polymarket" / "copy_leaders.sqlite"
 OUT_DIR = Path("artifacts") / "polymarket" / "copy_leaders"
+REQUESTS_PER_SECOND = 3
 
 
 class Refused(Exception):
@@ -114,7 +121,7 @@ def month_of(ts: int) -> tuple[int, int]:
 
 
 def month_name(ym) -> str:
-    return "%04d-%02d" % ym
+    return "%04d-%02d" % tuple(ym)
 
 
 DEV_LAST = (2026, 6)
@@ -151,6 +158,10 @@ def micro_to_cents(m: int) -> int:
 def trade_result(price_c: int, win, cost: int) -> int:
     """One dollar if the outcome wins, else nothing, less the price and the cost, in whole cents."""
     return (100 if win else 0) - price_c - cost
+
+
+def _seconds(n: int) -> str:
+    return "%dh%02dm" % (n // 3600, n % 3600 // 60)
 
 
 # ---------------------------------------------------------------- records
@@ -200,41 +211,48 @@ def resolution_from_row(row: dict) -> Resolution:
     return Resolution(row["condition_id"], "unresolved", None, None)
 
 
-class PricePoint(NamedTuple):
+class Print(NamedTuple):
+    """One taker print of a market: time, order within the walk (oldest first), the taker's side, the token, price."""
     ts: int
-    res: int
+    seq: int
+    side: str
+    token: str
     price: Decimal
 
 
-class TokenPrices:
-    """A token's price points sorted by time, with the times beside them for bisecting."""
-    __slots__ = ("points", "times")
+class MarketPrints:
+    """A market's prints sorted by (time, feed order), with the times beside them for bisecting."""
+    __slots__ = ("prints", "times")
 
-    def __init__(self, points):
-        self.points = sorted(set(points))
-        self.times = [p.ts for p in self.points]
+    def __init__(self, prints):
+        self.prints = sorted(set(prints), key=lambda p: (p.ts, p.seq))
+        self.times = [p.ts for p in self.prints]
+
+    def __iter__(self):
+        return iter(self.prints)
+
+    def __len__(self):
+        return len(self.prints)
 
 
-def price_at(points, moment: int) -> tuple[PricePoint | None, str | None]:
-    """The last price at or before `moment`: the point whose whole observation window [ts, ts + resolution) has ended
-    by then, latest window end first. None with 'no_price_at_or_before', or 'price_stale_over_6h' when that point
-    began more than six hours before the moment."""
-    tp = points if isinstance(points, TokenPrices) else TokenPrices(points)
-    j = bisect_right(tp.times, moment) - 1
-    best = None
-    floor = moment - STALE - MAX_BUCKET
-    while j >= 0:
-        p = tp.points[j]
-        if p.ts + p.res <= moment and (best is None or (p.ts + p.res, p.ts) > (best.ts + best.res, best.ts)):
-            best = p
-        if p.ts < floor and best is not None:
+def follow_print(prints, token: str, moment: int):
+    """The first print in [moment, moment + 6 hours] in which a taker BOUGHT `token` at a price in (0, 1).
+    Returns (print, None, passed) or (None, 'no_buyer_print_after_the_hour', passed); `passed` counts the prints of
+    the window passed over before it, by reason."""
+    mp = prints if isinstance(prints, MarketPrints) else MarketPrints(prints)
+    passed = Counter()
+    for p in mp.prints[bisect_left(mp.times, moment):]:
+        if p.ts > moment + FOLLOW_WINDOW:
             break
-        j -= 1
-    if best is None:
-        return None, "no_price_at_or_before"
-    if best.ts < moment - STALE:
-        return None, "price_stale_over_6h"
-    return best, None
+        if p.side != "BUY":
+            passed["print_not_a_buy"] += 1
+        elif p.token != token:
+            passed["print_other_token"] += 1
+        elif not Decimal(0) < p.price < Decimal(1):
+            passed["print_price_not_in_0_1"] += 1
+        else:
+            return p, None, passed
+    return None, "no_buyer_print_after_the_hour", passed
 
 
 # ---------------------------------------------------------------- new positions
@@ -265,21 +283,19 @@ def new_positions(trades) -> list[NewPosition]:
     firsts = []
     for t in ordered:
         if t.side == "BUY":
-            buys[t.token].append(t)
             holding = any(v > 0 for v in held[t.condition].values())
             recent = t.condition in last_touch and last_touch[t.condition] >= t.ts - NEW_WINDOW
             if not holding and not recent:
-                firsts.append(t)
+                firsts.append((t, len(buys[t.token])))
+            buys[t.token].append(t)
             held[t.condition][t.token] = held[t.condition].get(t.token, 0) + t.size_micro
         else:
             held[t.condition][t.token] = max(0, held[t.condition].get(t.token, 0) - t.size_micro)
         last_touch[t.condition] = t.ts
     out = []
-    for f in firsts:
-        bl = buys[f.token]
-        i = bl.index(f)
+    for f, i in firsts:
         total = 0
-        for b in bl[i:]:
+        for b in buys[f.token][i:]:
             if b.ts > f.ts + BUY_WINDOW:
                 break
             total += b.cash_micro
@@ -319,13 +335,15 @@ class CopiedTrade(NamedTuple):
     token: str
     leader_price_micro: int
     first_cash_micro: int
-    grain: int
+    wait_seconds: int
     sports: bool
 
 
-def copy_trades(positions, resolutions: dict, prices: dict, delay: int = DELAY) -> tuple[list[CopiedTrade], Counter]:
-    """The follower's trades for these leader positions: one contract at the token's price `delay` seconds after the
-    first purchase, if that price is fresh and from 0.05 to 0.95 and the market had not resolved by then."""
+def copy_trades(positions, resolutions: dict, prints: dict, delay: int = DELAY, passed: Counter | None = None):
+    """The follower's trades for these leader positions: one contract at the first taker purchase of the same token
+    at or after `delay` seconds after the first purchase (within six hours), if that price is from 0.05 to 0.95 and
+    the market had not resolved by the moment. `prints` maps a condition to its prints. Returns (trades, skips);
+    prints passed over are added to `passed` when given."""
     out, skips = [], Counter()
     cache: dict = {}
     for pos in positions:
@@ -338,24 +356,26 @@ def copy_trades(positions, resolutions: dict, prices: dict, delay: int = DELAY) 
         if r.resolved_ts <= moment:
             skips["resolved_before_follow"] += 1
             continue
-        pts = prices.get(pos.token)
-        if pts is None:
-            skips["no_price_history"] += 1
+        mp = prints.get(pos.condition)
+        if mp is None:
+            skips["no_market_feed"] += 1
             continue
-        if not isinstance(pts, TokenPrices):
-            if pos.token not in cache:
-                cache[pos.token] = TokenPrices(pts)
-            pts = cache[pos.token]
-        pt, why = price_at(pts, moment)
+        if not isinstance(mp, MarketPrints):
+            if pos.condition not in cache:
+                cache[pos.condition] = MarketPrints(mp)
+            mp = cache[pos.condition]
+        pr, why, over = follow_print(mp, pos.token, moment)
+        if passed is not None:
+            passed.update(over)
         if why:
             skips[why] += 1
             continue
-        if not GUARD_LO <= pt.price <= GUARD_HI:
+        if not GUARD_LO <= pr.price <= GUARD_HI:
             skips["follow_price_outside_0.05_0.95"] += 1
             continue
         win = r.payouts[pos.outcome_index] == WIN_PAYOUT
-        out.append(CopiedTrade(pos.event, price_cents(pt.price), win, pos.wallet, pos.t1, pos.token,
-                               half_up(pos.price * 1_000_000), pos.first_cash_micro, pt.res,
+        out.append(CopiedTrade(pos.event, price_cents(pr.price), win, pos.wallet, pos.t1, pos.token,
+                               half_up(pos.price * 1_000_000), pos.first_cash_micro, pr.ts - moment,
                                is_sports(pos.event) or is_sports(pos.slug)))
     return out, skips
 
@@ -363,12 +383,14 @@ def copy_trades(positions, resolutions: dict, prices: dict, delay: int = DELAY) 
 # ---------------------------------------------------------------- standing
 @dataclass
 class Book:
-    """A wallet's realized profit events, resolved positions and traded shares, each with its time."""
+    """A wallet's realized profit events, resolved positions, traded shares and sells, each with its time."""
     realized_ts: list = field(default_factory=list)
     realized_cum: list = field(default_factory=lambda: [0])
     resolved_ts: list = field(default_factory=list)
     shares_ts: list = field(default_factory=list)
     shares_cum: list = field(default_factory=lambda: [0])
+    sell_ts: list = field(default_factory=list)
+    beyond_ts: list = field(default_factory=list)
     counts: Counter = field(default_factory=Counter)
 
 
@@ -411,13 +433,16 @@ def wallet_book(trades, resolutions: dict) -> Book:
         if t.side == "BUY":
             held[t.token] += t.size_micro
             basis[t.token] += t.cash_micro
-        elif t.size_micro <= held[t.token]:
+            continue
+        b.sell_ts.append(ts)
+        if t.size_micro <= held[t.token]:
             removed = idiv_half_up(basis[t.token] * t.size_micro, held[t.token])
             realized.append((ts, t.cash_micro - removed))
             held[t.token] -= t.size_micro
             basis[t.token] -= removed
         else:
             b.counts["sell_beyond_holding"] += 1
+            b.beyond_ts.append(ts)
             if held[t.token] > 0:
                 realized.append((ts, idiv_half_up(t.cash_micro * held[t.token], t.size_micro) - basis[t.token]))
             held[t.token], basis[t.token] = 0, 0
@@ -436,17 +461,24 @@ class Standing(NamedTuple):
     shares_micro: int
 
 
+def _bounds(month) -> tuple[int, int]:
+    return month_start(*add_months(month, -LOOKBACK_MONTHS)), month_start(*month)
+
+
 def _window_sum(times, cum, lo, hi) -> int:
     return cum[bisect_left(times, hi)] - cum[bisect_left(times, lo)]
+
+
+def _count_in(times, lo, hi) -> int:
+    return bisect_left(times, hi) - bisect_left(times, lo)
 
 
 def standing(book: Book, month) -> Standing:
     """Realized profit (cents), resolved positions and shares traded over the three calendar months before `month`,
     from events before the month began."""
-    lo, hi = month_start(*add_months(month, -LOOKBACK_MONTHS)), month_start(*month)
+    lo, hi = _bounds(month)
     profit = micro_to_cents(_window_sum(book.realized_ts, book.realized_cum, lo, hi))
-    resolved = bisect_left(book.resolved_ts, hi) - bisect_left(book.resolved_ts, lo)
-    return Standing(profit, resolved, _window_sum(book.shares_ts, book.shares_cum, lo, hi))
+    return Standing(profit, _count_in(book.resolved_ts, lo, hi), _window_sum(book.shares_ts, book.shares_cum, lo, hi))
 
 
 def qualifies(st: Standing) -> str | None:
@@ -481,6 +513,19 @@ def pick_leaders(standings: dict) -> tuple[list, Counter]:
 
 def leaders_of(books: dict, month) -> tuple[list, Counter]:
     return pick_leaders({w: standing(b, month) for w, b in books.items()})
+
+
+def sells_beyond_summary(books: dict, leader_months) -> dict:
+    """How much the standing rule missed through shares sold beyond what the trades show held: the wallets with any
+    such sell, and the share of the leaders' sells inside their standing windows that were such sells."""
+    sells = beyond = 0
+    for month, w in leader_months:
+        lo, hi = _bounds(month)
+        sells += _count_in(books[w].sell_ts, lo, hi)
+        beyond += _count_in(books[w].beyond_ts, lo, hi)
+    return {"wallets_with_sells_beyond_holding": sum(1 for b in books.values() if b.beyond_ts),
+            "candidates": len(books), "leader_window_sells": sells, "leader_window_sells_beyond_holding": beyond,
+            "share_of_leader_sells": (beyond / sells) if sells else None}
 
 
 # ---------------------------------------------------------------- the p-value
@@ -539,6 +584,49 @@ def _failures(ev: dict) -> list:
     return failed
 
 
+# ---------------------------------------------------------------- months and the plan
+def _months_for(period: str, trades: dict) -> list:
+    """Development: from three months after the earliest trade read to June 2026; sealed: July to October 2026."""
+    if period == "sealed":
+        return list(SEALED_MONTHS)
+    first = min((t.ts for ts in trades.values() for t in ts), default=None)
+    if first is None:
+        return []
+    m, out = add_months(month_of(first), LOOKBACK_MONTHS), []
+    while m <= DEV_LAST:
+        out.append(m)
+        m = add_months(m, 1)
+    return out
+
+
+def market_key(condition: str, t1: int) -> str:
+    return "%s@%d" % (condition, t1)
+
+
+class Target(NamedTuple):
+    """A market window the rule needs: the leaders' position(s) first bought at t1 in that market, in `month`."""
+    condition: str
+    t1: int
+    month: tuple
+    wallets: tuple
+
+
+def plan_targets(books: dict, positions: dict, resolutions: dict, months) -> dict:
+    """{market key: Target} for every new position of a month's leaders, first bought in that month, that passes the
+    entry tests (which need no price)."""
+    out: dict = {}
+    for m in months:
+        leaders, _ = leaders_of(books, m)
+        m0, m1 = month_start(*m), month_start(*add_months(m, 1))
+        for w in leaders:
+            for p in positions.get(w, []):
+                if m0 <= p.t1 < m1 and position_skip(p, resolutions) is None:
+                    k = market_key(p.condition, p.t1)
+                    old = out.get(k)
+                    out[k] = Target(p.condition, p.t1, tuple(m), tuple(sorted(set((old.wallets if old else ()) + (w,)))))
+    return out
+
+
 # ---------------------------------------------------------------- the store
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -552,15 +640,13 @@ CREATE TABLE IF NOT EXISTS trades (wallet TEXT, seq INTEGER, proxy_wallet TEXT, 
     condition_id TEXT, size REAL, price REAL, timestamp INTEGER, event_slug TEXT, outcome_index INTEGER,
     transaction_hash TEXT, slug TEXT, title TEXT, raw TEXT NOT NULL, read_at TEXT NOT NULL, PRIMARY KEY (wallet, seq));
 CREATE INDEX IF NOT EXISTS trades_ts ON trades (wallet, timestamp);
-CREATE TABLE IF NOT EXISTS positions (wallet TEXT, status_asked TEXT, seq INTEGER, token_id TEXT, condition_id TEXT,
-    status TEXT, total_pnl REAL, realized_pnl REAL, raw TEXT NOT NULL, read_at TEXT NOT NULL,
-    PRIMARY KEY (wallet, status_asked, seq));
 CREATE TABLE IF NOT EXISTS resolutions (condition_id TEXT PRIMARY KEY, status TEXT, payouts TEXT, resolved_at TEXT,
     resolved_ts INTEGER, raw TEXT NOT NULL, read_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS price_points (walk_key TEXT, seq INTEGER, token_id TEXT, timestamp INTEGER,
-    resolution_seconds INTEGER, price REAL, is_final INTEGER, raw TEXT NOT NULL, read_at TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS resolution_answers (condition_id TEXT PRIMARY KEY, answer TEXT NOT NULL, read_at TEXT);
+CREATE TABLE IF NOT EXISTS plan (key TEXT PRIMARY KEY, condition_id TEXT, t1 INTEGER, month TEXT, wallets TEXT);
+CREATE TABLE IF NOT EXISTS market_prints (walk_key TEXT, seq INTEGER, condition_id TEXT, token_id TEXT, side TEXT,
+    price REAL, size REAL, timestamp INTEGER, transaction_hash TEXT, raw TEXT NOT NULL, read_at TEXT NOT NULL,
     PRIMARY KEY (walk_key, seq));
-CREATE INDEX IF NOT EXISTS price_token ON price_points (token_id, timestamp);
 CREATE TABLE IF NOT EXISTS rejects (kind TEXT, key TEXT, reason TEXT, raw TEXT, read_at TEXT);
 """
 
@@ -571,14 +657,6 @@ def _now() -> str:
 
 def _j(v) -> str:
     return json.dumps(v, sort_keys=True, allow_nan=True)
-
-
-def price_key(token: str, start: int, end: int) -> str:
-    return "%s:%d:%d" % (token, start, end)
-
-
-def price_window(t1: int) -> tuple[int, int]:
-    return t1 - WINDOW_BEFORE, t1 + WINDOW_AFTER
 
 
 class Store:
@@ -603,6 +681,13 @@ class Store:
 
     def commit(self):
         self.db.commit()
+
+    def meta(self, key: str, default=None):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_meta(self, key: str, value) -> None:
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, _j(value)))
 
     # ------------------------------------------------------------ the candidate set: read once
     def candidates(self) -> list:
@@ -636,12 +721,13 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO walks VALUES (?,?,?,?,?,?,?,?)",
                         (kind, key, "started", _now(), None, None, None, None))
 
-    def _finish(self, kind: str, key: str, w) -> None:
+    def _finish(self, kind: str, key: str, w, rejects=True) -> None:
         self.db.execute("UPDATE walks SET status='finished', finished_at=?, pages=?, rows=?, rejects=? "
                         "WHERE kind=? AND key=?", (_now(), w.pages, len(w.rows), _j(dict(w.rejects)), kind, key))
-        for (raw, why), at in zip(w.raw, w.raw_read_at):
-            if why:
-                self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", (kind, key, why, _j(raw), at))
+        if rejects:
+            for (raw, why), at in zip(w.raw, w.raw_read_at):
+                if why:
+                    self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", (kind, key, why, _j(raw), at))
 
     def finished_keys(self, kind: str) -> set:
         return {r[0] for r in self.db.execute("SELECT key FROM walks WHERE kind=? AND status='finished'", (kind,))}
@@ -665,52 +751,58 @@ class Store:
             self.db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 wallet, n - 1 - i, row["proxy_wallet"], row["side"], row["token_id"], row["condition_id"], row["size"],
                 row["price"], row["timestamp"], row["event_slug"], row["outcome_index"], row["transaction_hash"],
-                row.get("slug"), row.get("title"), _j(good_raw[i] if i < len(good_raw) else row), at))
+                row.get("slug"), row.get("title"), _j(good_raw[i]), at))
         self._finish("trades", wallet, w)
 
-    def finish_positions(self, wallet: str, status: str | None, w) -> None:
-        asked = status or "OPEN"
-        self.db.execute("DELETE FROM positions WHERE wallet=? AND status_asked=?", (wallet, asked))
+    def finish_resolutions(self, conditions, w, answers: dict) -> None:
+        """One batch of up to twenty ids and the answer word per id (see PolymarketData.resolution_batches). Only an
+        id answered "row" keeps a resolution; every other answer is unresolved or unknown to the analysis."""
         good_raw = [raw for raw, why in w.raw if not why]
-        for i, (row, at) in enumerate(zip(w.rows, w.row_read_at)):
-            self.db.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                wallet, asked, i, row["token_id"], row["condition_id"], row["status"], row["total_pnl"],
-                row["realized_pnl"], _j(good_raw[i]), at))
-        self._finish("positions_" + asked.lower(), wallet, w)
-
-    def finish_resolutions(self, conditions, w) -> None:
-        """The answer for a batch of conditions. A row for a condition not asked, or a second row for one condition,
-        is a counted reject (a repeated condition keeps no row); a condition with no row stays unresolved."""
-        asked = set(conditions)
-        good_raw = [raw for raw, why in w.raw if not why]
-        by: dict = defaultdict(list)
+        read_at = w.read_at[0] if w.read_at else _now()
         for row, raw, at in zip(w.rows, good_raw, w.row_read_at):
-            by[row["condition_id"]].append((row, raw, at))
-        for cond, items in by.items():
-            reason = None if cond in asked and len(items) == 1 else (
-                "condition_not_asked" if cond not in asked else "duplicate_condition")
-            if reason:
-                w.rejects[reason] += len(items)
-                for _, raw, at in items:
-                    self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", ("resolutions", cond, reason, _j(raw), at))
-                continue
-            row, raw, at = items[0]
-            self.db.execute("INSERT OR REPLACE INTO resolutions VALUES (?,?,?,?,?,?,?)", (
-                cond, row["status"], _j(row["payouts"]), row["resolved_at"], row["resolved_ts"], _j(raw), at))
-        for cond in asked:
-            self._finish("resolutions", cond, w)
+            cond = row["condition_id"]
+            if answers.get(cond) == "row":
+                self.db.execute("INSERT OR REPLACE INTO resolutions VALUES (?,?,?,?,?,?,?)", (
+                    cond, row["status"], _j(row["payouts"]), row["resolved_at"], row["resolved_ts"], _j(raw), at))
+            elif cond not in answers:
+                self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", ("resolutions", cond, "condition_not_asked",
+                                                                           _j(raw), at))
+        for raw, why in w.raw:
+            if why:
+                key = raw.get("condition_id") if isinstance(raw, dict) and isinstance(raw.get("condition_id"), str) else ""
+                self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", ("resolutions", key, why, _j(raw), read_at))
+        for cond in conditions:
+            self.db.execute("INSERT OR REPLACE INTO resolution_answers VALUES (?,?,?)", (cond, answers[cond], read_at))
+            self._finish("resolutions", cond, w, rejects=False)
 
-    def finish_prices(self, key: str, token: str, start: int, end: int, w) -> None:
-        """One price window. The last point of a finished walk is marked final and is never used as a price: on a
-        resolved market it is the settlement point, the outcome itself, which may sit before the moment priced."""
-        self.db.execute("DELETE FROM price_points WHERE walk_key=?", (key,))
+    def resolution_answers(self) -> dict:
+        return dict(self.db.execute("SELECT condition_id, answer FROM resolution_answers"))
+
+    def record_plan(self, targets: dict, leave_out, months) -> None:
+        self.db.execute("DELETE FROM plan")
+        for k, tg in targets.items():
+            self.db.execute("INSERT INTO plan VALUES (?,?,?,?,?)", (k, tg.condition, tg.t1, month_name(tg.month),
+                                                                    _j(list(tg.wallets))))
+        self.set_meta("plan", {"made_at": _now(), "leave_out": sorted(leave_out),
+                               "months": [month_name(m) for m in months], "windows": len(targets)})
+
+    def plan(self) -> dict:
+        out = {}
+        for k, cond, t1, month, wallets in self.db.execute("SELECT key, condition_id, t1, month, wallets FROM plan"):
+            y, m = month.split("-")
+            out[k] = Target(cond, t1, (int(y), int(m)), tuple(json.loads(wallets)))
+        return out
+
+    def finish_market(self, key: str, condition: str, t1: int, w) -> None:
+        """One market window [t1, t1 + 30 hours], newest first as served; `seq` counts from the oldest."""
+        self.db.execute("DELETE FROM market_prints WHERE walk_key=?", (key,))
         good_raw = [raw for raw, why in w.raw if not why]
         n = len(w.rows)
         for i, (row, at) in enumerate(zip(w.rows, w.row_read_at)):
-            self.db.execute("INSERT INTO price_points VALUES (?,?,?,?,?,?,?,?,?)", (
-                key, i, token, row["timestamp"], row["resolution_seconds"], row["price"], int(i == n - 1),
-                _j(good_raw[i]), at))
-        self._finish("prices", key, w)
+            self.db.execute("INSERT INTO market_prints VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+                key, n - 1 - i, row["condition_id"], row["token_id"], row["side"], row["price"], row["size"],
+                row["timestamp"], row["transaction_hash"], _j(good_raw[i]), at))
+        self._finish("market", key, w)
 
     # ------------------------------------------------------------ reads for the analysis
     def trade_rows(self, wallet: str, max_ts: int) -> list:
@@ -734,29 +826,24 @@ class Store:
                              "resolved_at": resolved_at, "resolved_ts": resolved_ts}
         return out
 
-    def price_points(self, tokens, max_ts: int) -> dict:
-        want = set(tokens)
-        out: dict = defaultdict(list)
-        for token, ts, res, price in self.db.execute(
-                "SELECT token_id, timestamp, resolution_seconds, price FROM price_points "
-                "WHERE is_final=0 AND timestamp < ? ORDER BY token_id, timestamp", (max_ts,)):
-            if token in want:
-                out[token].append(PricePoint(ts, res, dec(price)))
-        return dict(out)
-
-
-# ---------------------------------------------------------------- the pull (the lead runs it; never in tests)
-def _price_targets(trades_by_wallet: dict, resolutions: dict, before: int) -> dict:
-    """{window key: (token, start, end, wallets)} for every new position, by any candidate, that could be copied: its
-    first purchase before `before` and passing every rule that does not need a price."""
-    out: dict = {}
-    for wallet, trades in trades_by_wallet.items():
-        for pos in new_positions(trades):
-            if pos.t1 < before and position_skip(pos, resolutions) is None:
-                start, end = price_window(pos.t1)
-                key = price_key(pos.token, start, end)
-                out.setdefault(key, (pos.token, start, end, set()))[3].add(wallet)
-    return out
+    def market_prints(self, keys, counts: Counter | None = None) -> dict:
+        """{condition: MarketPrints} from the named windows only. Rows read twice (overlapping windows of one market)
+        are kept once; the feed order within a second is kept."""
+        out: dict = defaultdict(set)
+        for k in sorted(set(keys)):
+            for seq, cond, token, side, price, ts, txh, size in self.db.execute(
+                    "SELECT seq, condition_id, token_id, side, price, timestamp, transaction_hash, size FROM market_prints "
+                    "WHERE walk_key=?", (k,)):
+                if not pd.is_number(price):
+                    if counts is not None:
+                        counts["print_bad_price"] += 1
+                    continue
+                out[cond].add((ts, txh, token, side, dec(price), size, seq))
+        res = {}
+        for cond, rows in out.items():
+            ordered = sorted(rows, key=lambda r: (r[0], r[6], r[1], r[2]))
+            res[cond] = MarketPrints([Print(r[0], i, r[3], r[2], r[4]) for i, r in enumerate(ordered)])
+        return res
 
 
 def _stored_trades(s: Store, wallets, max_ts: int, counts: Counter | None = None) -> dict:
@@ -774,59 +861,121 @@ def _stored_trades(s: Store, wallets, max_ts: int, counts: Counter | None = None
     return out
 
 
-def pull(store_path, client: pd.PolymarketData) -> dict:
+def _resolutions(s: Store, conds) -> dict:
+    return {c: resolution_from_row(r) for c, r in s.resolution_rows(conds).items()}
+
+
+# ---------------------------------------------------------------- the pull (the lead runs it; never in tests)
+def phase1_problems(s: Store, leave_out=()) -> list:
+    """What phase 1 still lacks, from bookkeeping tables only: the candidate set, finished trade walks of every wallet
+    not left out, an answer for every traded condition, no resolution walk left started."""
+    leave = set(leave_out)
+    if not s.board_read_at():
+        return ["the boards were never read"]
+    out = []
+    open_wallets = [w for w in s.unfinished("trades") if w not in leave]
+    if open_wallets:
+        out.append("trade walks of %d wallets (%s)" % (len(open_wallets), ", ".join(open_wallets[:5])))
+    missing = s.traded_conditions() - set(s.resolution_answers())
+    if missing:
+        out.append("no resolution answer for %d traded conditions" % len(missing))
+    started = s.unfinished("resolutions")
+    if started:
+        out.append("%d resolution walks started and not finished" % len(started))
+    return out
+
+
+def plan_store(s: Store, leave_out=()) -> dict:
+    """Compute from phase 1 the market windows of the leaders' qualifying positions of every development and sealed
+    month, record them as the plan, and return them."""
+    leave = sorted(set(leave_out))
+    done = s.finished_keys("trades")
+    wallets = [w for w in s.candidates() if w not in leave and w in done]
+    trades = _stored_trades(s, wallets, 2 ** 62)
+    res = _resolutions(s, {t.condition for ts in trades.values() for t in ts})
+    books = {w: wallet_book(trades.get(w, []), res) for w in s.candidates() if w not in leave}
+    positions = {w: new_positions(ts) for w, ts in trades.items()}
+    months = _months_for("development", trades) + list(SEALED_MONTHS)
+    targets = plan_targets(books, positions, res, months)
+    s.record_plan(targets, leave, months)
+    return targets
+
+
+def _eta(n: int) -> str:
+    return _seconds(-(-n // REQUESTS_PER_SECOND))
+
+
+def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), say=print) -> dict:
     """Fill the store, asking only for what is missing. Walks that fail stay unfinished; PullIncomplete names them."""
+    if phase not in (1, 2):
+        raise ValueError("phase is 1 or 2")
     errors = []
     with Store(store_path) as s:
-        if not s.candidates() and not s.board_read_at():
-            s.put_boards({"all": client.leaderboard("all"), "month": client.leaderboard("month")})
-            s.commit()
-        wallets = s.candidates()
-        for w in wallets:
-            jobs = [("trades", lambda w=w: client.trades(w), lambda walk, w=w: s.finish_trades(w, walk))]
-            for st in (None, "CLOSED"):
-                kind = "positions_" + (st or "OPEN").lower()
-                jobs.append((kind, lambda w=w, st=st: client.positions(w, st),
-                             lambda walk, w=w, st=st: s.finish_positions(w, st, walk)))
-            for kind, read, store in jobs:
-                if w in s.finished_keys(kind):
-                    continue
-                s.start_walk(kind, w)
-                s.commit()
-                try:
-                    store(read())
-                except (pd.HttpError, pd.PolymarketDataError) as e:
-                    errors.append("%s %s: %s" % (kind, w, e))
-                s.commit()
-        conds = sorted(s.traded_conditions() - s.finished_keys("resolutions"))
-        for i in range(0, len(conds), pd.MAX_CONDITIONS):
-            batch = conds[i:i + pd.MAX_CONDITIONS]
-            for c in batch:
-                s.start_walk("resolutions", c)
-            s.commit()
-            try:
-                s.finish_resolutions(batch, client.resolutions(batch))
-            except (pd.HttpError, pd.PolymarketDataError) as e:
-                errors.append("resolutions %s..: %s" % (batch[0], e))
-            s.commit()
-        done = s.finished_keys("trades")
-        trades = _stored_trades(s, [w for w in wallets if w in done], 2 ** 62)
-        res = {c: resolution_from_row(r) for c, r in s.resolution_rows(s.traded_conditions()).items()}
-        finished = s.finished_keys("prices")
-        for key, (token, start, end, _) in sorted(_price_targets(trades, res, SEALED_END).items()):
-            if key in finished:
-                continue
-            s.start_walk("prices", key)
-            s.commit()
-            try:
-                s.finish_prices(key, token, start, end, client.prices_history(token, start, end))
-            except (pd.HttpError, pd.PolymarketDataError) as e:
-                errors.append("prices %s: %s" % (key, e))
-            s.commit()
-        s.db.execute("INSERT OR REPLACE INTO meta VALUES ('last_pull_ended_at', ?)", (_now(),))
+        if phase == 1:
+            _pull_phase1(s, client, say, errors)
+        else:
+            _pull_phase2(s, client, leave_out, say, errors)
+        s.set_meta("last_pull_phase_%d_ended_at" % phase, _now())
     if errors:
         raise PullIncomplete("%d walks did not finish (they stay unfinished): %s" % (len(errors), "; ".join(errors[:20])))
     return {"requests": client.requests}
+
+
+def _guarded(errors, label, fn) -> None:
+    try:
+        fn()
+    except (pd.HttpError, pd.PolymarketDataError) as e:
+        errors.append("%s: %s" % (label, e))
+
+
+def _pull_phase1(s: Store, client, say, errors) -> None:
+    boards = 0 if s.board_read_at() else 2
+    todo = s.unfinished("trades")
+    say("phase 1: about to make at least %d requests (%d board reads, %s trade walks of one request or more each), "
+        "at least %s at three a second; resolutions are counted once the trades are in"
+        % (boards + len(todo), boards, "every candidate's" if boards else len(todo), _eta(boards + len(todo))))
+    if boards:
+        s.put_boards({"all": client.leaderboard("all"), "month": client.leaderboard("month")})
+        s.commit()
+        say("phase 1: %d candidates; about to make at least %d trade-walk requests"
+            % (len(s.candidates()), len(s.unfinished("trades"))))
+    for w in s.unfinished("trades"):
+        s.start_walk("trades", w)
+        s.commit()
+        _guarded(errors, "trades %s" % w, lambda w=w: s.finish_trades(w, client.trades(w)))
+        s.commit()
+    conds = sorted(s.traded_conditions() - set(s.resolution_answers()))
+    n = -(-len(conds) // pd.MAX_CONDITIONS)
+    say("phase 1: about to make %d resolution requests for %d conditions, %s at three a second" % (n, len(conds), _eta(n)))
+    for c in conds:
+        s.start_walk("resolutions", c)
+    s.commit()
+
+    def batches():
+        for batch, w, answers in client.resolution_batches(conds):
+            s.finish_resolutions(batch, w, answers)
+            s.commit()
+    _guarded(errors, "resolutions", batches)
+
+
+def _pull_phase2(s: Store, client, leave_out, say, errors) -> None:
+    problems = phase1_problems(s, leave_out)
+    if problems:
+        raise Refused("phase 1 is unfinished: %s; finish it (or name the wallets with --leave-out)" % "; ".join(problems))
+    plan = plan_store(s, leave_out)
+    s.commit()
+    done = s.finished_keys("market")
+    todo = sorted(k for k in plan if k not in done)
+    say("phase 2: %d market windows planned, %d to read: about to make at least %d requests, at least %s at three a "
+        "second (a market busy after the purchase takes one more request per 1,000 prints)"
+        % (len(plan), len(todo), len(todo), _eta(len(todo))))
+    for k in todo:
+        tg = plan[k]
+        s.start_walk("market", k)
+        s.commit()
+        _guarded(errors, "market %s" % k, lambda k=k, tg=tg: s.finish_market(
+            k, tg.condition, tg.t1, client.market_trades(tg.condition, tg.t1, tg.t1 + FEED_AFTER)))
+        s.commit()
 
 
 # ---------------------------------------------------------------- loading, with the period wall
@@ -836,7 +985,7 @@ class Data:
     candidates: list
     trades: dict
     resolutions: dict
-    prices: dict
+    prints: dict
     counts: Counter
     wallets_left_out: list
     unfinished_left_out: list
@@ -852,22 +1001,9 @@ def _period_bounds(period: str) -> tuple[int, int]:
     raise ValueError(period)
 
 
-def _months(period: str, trades: dict) -> list:
-    if period == "sealed":
-        return list(SEALED_MONTHS)
-    first = min((t.ts for ts in trades.values() for t in ts), default=None)
-    if first is None:
-        return []
-    m, out = add_months(month_of(first), LOOKBACK_MONTHS), []
-    while m <= DEV_LAST:
-        out.append(m)
-        m = add_months(m, 1)
-    return out
-
-
 def load(store, period: str, leave_out=()) -> Data:
     """The data of one period, the wall applied in the reads: trades before the period's end plus one day, the
-    resolutions of those trades' conditions, price points before the period's end plus one day. Refuses an unfinished
+    resolutions of those trades' conditions, the prints of this period's market windows only. Refuses an unfinished
     pull unless every wallet it touches is left out."""
     lo, hi = _period_bounds(period)
     path = Path(store)
@@ -886,26 +1022,27 @@ def load(store, period: str, leave_out=()) -> Data:
         implicated = {w: ["trades walk"] for w in s.unfinished("trades")}
         done = s.finished_keys("trades")
         trades = _stored_trades(s, [w for w in kept if w in done], hi + SPILL, counts)
-        conds = {t.condition for ts in trades.values() for t in ts}
-        res_done = s.finished_keys("resolutions")
+        answered = set(s.resolution_answers())
         for w, ts in trades.items():
-            if any(t.condition not in res_done for t in ts):
+            if any(t.condition not in answered for t in ts):
                 implicated.setdefault(w, []).append("resolutions")
-        resolutions = {c: resolution_from_row(r) for c, r in s.resolution_rows(conds).items()}
-        targets = {k: v for k, v in _price_targets(trades, resolutions, hi).items() if v[1] + WINDOW_BEFORE >= lo}
-        price_done = s.finished_keys("prices")
-        for key, (_, _, _, owners) in targets.items():
-            if key not in price_done:
-                for w in owners:
-                    implicated.setdefault(w, []).append("price window %s" % key)
+        resolutions = _resolutions(s, {t.condition for ts in trades.values() for t in ts})
+        books = {w: wallet_book(trades.get(w, []), resolutions) for w in kept}
+        positions = {w: new_positions(ts) for w, ts in trades.items()}
+        months = _months_for(period, trades)
+        targets = {k: tg for k, tg in plan_targets(books, positions, resolutions, months).items() if lo <= tg.t1 < hi}
+        market_done = s.finished_keys("market")
+        for k, tg in targets.items():
+            if k not in market_done:
+                for w in tg.wallets:
+                    implicated.setdefault(w, []).append("market window %s not pulled" % k)
         missing = sorted(w for w in implicated if w not in leave)
         if missing:
             raise Refused("the pull is unfinished for wallets %s (%s); name them with --leave-out to run without them"
                           % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10])))
-        prices = {tok: TokenPrices(pts) for tok, pts in
-                  s.price_points({v[0] for v in targets.values()}, hi + DAY).items()}
-    return Data(period, kept, trades, resolutions, prices, counts, leave,
-                sorted(w for w in implicated if w in leave), _months(period, trades))
+        prints = s.market_prints(targets, counts)
+    return Data(period, kept, trades, resolutions, prints, counts, leave,
+                sorted(w for w in implicated if w in leave), months)
 
 
 # ---------------------------------------------------------------- the analysis
@@ -920,6 +1057,16 @@ def _info_block(trades, cost: int, **extra) -> dict:
     return d
 
 
+def _wait_table(trades) -> dict:
+    c = Counter()
+    for t in trades:
+        for a, b in WAIT_BUCKETS:
+            if a <= t.wait_seconds <= b:
+                c["%d_to_%d" % (a, b)] += 1
+                break
+    return dict(sorted(c.items()))
+
+
 def analyze(data: Data) -> dict:
     lo, hi = _period_bounds(data.period)
     books = books_of(data)
@@ -928,7 +1075,8 @@ def analyze(data: Data) -> dict:
     for b in books.values():
         book_counts.update(b.counts)
     main, info_trades, info_skips = [], {k: [] for k, _ in INFO_DELAYS}, {k: Counter() for k, _ in INFO_DELAYS}
-    wallet_skips, position_skips, months_left_out, table = Counter(), Counter(), Counter(), []
+    wallet_skips, position_skips, months_left_out, passed, table = Counter(), Counter(), Counter(), Counter(), []
+    leader_months = []
     for m in data.months:
         leaders, wsk = leaders_of(books, m)
         wallet_skips.update(wsk)
@@ -937,13 +1085,14 @@ def analyze(data: Data) -> dict:
             table.append({"month": month_name(m), "leaders": [], "left_out": "fewer_than_3_leaders", "copied": 0,
                           "positions": 0})
             continue
+        leader_months += [(m, w) for w in leaders]
         m0, m1 = month_start(*m), month_start(*add_months(m, 1))
         pos = [p for w in leaders for p in positions.get(w, []) if m0 <= p.t1 < m1 and lo <= p.t1 < hi]
-        got, sk = copy_trades(pos, data.resolutions, data.prices, DELAY)
+        got, sk = copy_trades(pos, data.resolutions, data.prints, DELAY, passed)
         main += got
         position_skips.update(sk)
         for k, d in INFO_DELAYS:
-            g, s2 = copy_trades(pos, data.resolutions, data.prices, d)
+            g, s2 = copy_trades(pos, data.resolutions, data.prints, d)
             info_trades[k] += g
             info_skips[k].update(s2)
         table.append({"month": month_name(m), "leaders": leaders, "left_out": None, "copied": len(got),
@@ -958,11 +1107,12 @@ def analyze(data: Data) -> dict:
     own = [(1_000_000 if t.win else 0) - t.leader_price_micro for t in main]
     info["leaders_own_prices"] = {"note": NOTE, "trades": len(main), "events": len({t.event for t in main}),
                                   "cost_cents": 0, "mean_cents": (sum(own) / len(own) / 10_000) if own else None}
-    info["follow_price_grain"] = {"note": NOTE, "seconds_of_the_point_used": {
-        str(k): v for k, v in sorted(Counter(t.grain for t in main).items())}}
+    info["follow_print_wait"] = {"note": NOTE, "seconds_after_the_moment": _wait_table(main),
+                                 "prints_passed_over": dict(sorted(passed.items()))}
     return {"period": data.period, "months": [month_name(m) for m in data.months], "candidates": len(data.candidates),
             "wallets_left_out": data.wallets_left_out, "unfinished_left_out": data.unfinished_left_out,
             "load_rejects": dict(sorted(data.counts.items())), "book_counts": dict(sorted(book_counts.items())),
+            "sells_beyond_holding": sells_beyond_summary(books, leader_months),
             "month_table": table, "months_left_out": dict(months_left_out),
             "wallet_skips": dict(sorted(wallet_skips.items())), "position_skips": dict(sorted(position_skips.items())),
             "main": evaluate(main, COST_CENTS), "information": info}
@@ -1013,8 +1163,8 @@ def _provenance(store: Path) -> dict:
     with Store(store) as s:
         boards = s.board_read_at()
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
-            "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(), "store": str(store),
-            "boards_read_at": boards}
+            "amendment_commit": AMENDMENT_COMMIT, "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
+            "store": str(store), "boards_read_at": boards}
 
 
 def _store_path(store) -> Path:
@@ -1064,6 +1214,26 @@ def _check_development_file(dev: Path, leave_out: list) -> str:
     return got
 
 
+def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
+    """From bookkeeping tables only (no trade, price or result of a sealed month): phase 1 finished, a plan made with
+    these wallets left out that covers the sealed months, and every sealed window of that plan pulled and finished."""
+    out = phase1_problems(s, leave)
+    plan_meta = s.meta("plan")
+    if plan_meta is None:
+        return out + ["no phase-2 plan: run pull --phase 2"]
+    if plan_meta.get("leave_out") != leave:
+        out.append("the plan left out %s, not %s: run pull --phase 2 with the same --leave-out"
+                   % (plan_meta.get("leave_out"), leave))
+    if not all(month_name(m) in plan_meta.get("months", []) for m in SEALED_MONTHS):
+        out.append("the plan does not cover the sealed months")
+    done = s.finished_keys("market")
+    sealed = [k for k, tg in s.plan().items() if tuple(tg.month) in SEALED_MONTHS]
+    missing = sorted(k for k in sealed if k not in done)
+    if missing:
+        out.append("%d of %d sealed market windows not pulled (first: %s)" % (len(missing), len(sealed), missing[0]))
+    return out
+
+
 def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None) -> dict:
     if not flag:
         raise Refused("the sealed period is opened only with --i-am-opening-the-sealed-period")
@@ -1077,12 +1247,10 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
         raise Refused("the sealed period was already run (%s exists)" % marker)
     if not path.is_file():
         raise Refused("the store %s is missing (nothing was marked used)" % path)
-    with Store(path) as s:                         # the walk table only: no sealed row is read before the marker
-        open_walks = {k: s.unfinished(k) for k in ("resolutions", "prices")}
-        open_wallets = [w for w in s.unfinished("trades") if w not in leave]
-    if open_wallets or any(open_walks.values()):
-        raise Refused("the pull is unfinished (wallets %s, resolutions %d, price windows %d): finish it first"
-                      % (open_wallets, len(open_walks["resolutions"]), len(open_walks["prices"])))
+    with Store(path) as s:                         # bookkeeping only: no sealed row is read before the marker
+        problems = sealed_bookkeeping_problems(s, leave)
+    if problems:
+        raise Refused("the sealed run is not started (nothing written): %s" % "; ".join(problems))
     note = {"time": datetime.now(UTC).isoformat(), "development_sha256": dev_sha, "development_file": str(dev),
             "wallets_left_out": leave}
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1108,7 +1276,10 @@ def _fmt(v, nd=2) -> str:
 
 def format_table(doc: dict) -> str:
     r = doc["result"]
-    lines = ["copying the leaders, %s period (prediction %s)" % (r["period"], PREDICTION_COMMIT),
+    sb = r["sells_beyond_holding"]
+    share = sb["share_of_leader_sells"]
+    lines = ["copying the leaders, %s period (prediction %s, amended %s)" % (r["period"], PREDICTION_COMMIT,
+                                                                             AMENDMENT_COMMIT),
              "candidates %d; wallets left out: %s%s" % (
                  r["candidates"], r["wallets_left_out"] or "none",
                  " (unfinished in the pull: %s)" % r["unfinished_left_out"] if r["unfinished_left_out"] else ""),
@@ -1116,6 +1287,10 @@ def format_table(doc: dict) -> str:
                                                      r["months"][-1] if r["months"] else "-",
                                                      r["months_left_out"] or "none"),
              "rows rejected on load: %s; trade book: %s" % (r["load_rejects"] or "none", r["book_counts"] or "none"),
+             "%d of %d wallets sold beyond what their trades show they held; in the leaders' standing windows %d of "
+             "%d sells (%s) were such sells, and their excess earned nothing in the standing" % (
+                 sb["wallets_with_sells_beyond_holding"], sb["candidates"], sb["leader_window_sells_beyond_holding"],
+                 sb["leader_window_sells"], "-" if share is None else "%.1f%%" % (100 * share)),
              "wallet-months not leaders: %s" % (r["wallet_skips"] or "none"),
              "leader positions not copied: %s" % (r["position_skips"] or "none")]
     s = r.get("step_1") or r["stats"]
@@ -1135,7 +1310,8 @@ def format_table(doc: dict) -> str:
             lines.append("%s: %s: trades %s, events %s, mean %s cents" % (NOTE, k, v["trades"], v["events"],
                                                                          _fmt(v["mean_cents"], 4)))
         else:
-            lines.append("%s: %s: %s" % (NOTE, k, v["seconds_of_the_point_used"]))
+            lines.append("%s: %s: %s; passed over %s" % (NOTE, k, v["seconds_after_the_moment"],
+                                                         v["prints_passed_over"]))
     return "\n".join(lines)
 
 
@@ -1144,7 +1320,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="copy_leaders", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pull")
+    p.add_argument("--phase", type=int, choices=(1, 2), required=True)
     p.add_argument("--store", default=None)
+    p.add_argument("--leave-out", nargs="*", default=[])
     for name in ("develop", "sealed"):
         p = sub.add_parser(name)
         p.add_argument("--store", default=None)
@@ -1156,7 +1334,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "pull":
-            print(json.dumps(pull(_store_path(a.store), pd.PolymarketData())))
+            print(json.dumps(pull(_store_path(a.store), pd.PolymarketData(), a.phase, a.leave_out)))
             return 0
         if a.cmd == "develop":
             doc = run_develop(store=a.store, out_dir=a.out_dir, leave_out=a.leave_out)

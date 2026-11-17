@@ -12,7 +12,15 @@ Routes (field names from the service's published specification, /v2/openapi.json
   cursor, a wrong envelope, or more pages than the cap each RAISE: a walk never returns a silent partial list.
   The first page's filters (all but `limit`) are sent again beside the cursor, except on the profit board, whose
   cursor pins the board and takes no parameters beside it.
-* /v2/resolutions is not paged: {"data": [...]} for at most 20 condition ids a request.
+* /v2/resolutions is not paged: {"data": [...]} for at most 20 condition ids a request. `resolution_batches` asks
+  any number of ids twenty at a time and records an answer per id: a short answer (fewer rows than ids) is the
+  per-id answer "no_row" (unresolved or unknown), never an error for the batch.
+* the market's own trade feed is /v2/trades?condition=<one id>&taker_only=true (each fill once, on its taker side;
+  `side` is the taker's side). The specification says the condition shape serves a fixed three-year window and
+  IGNORES start and end, so `market_trades` walks the feed from its newest row down to the window's start, keeps
+  the rows inside [since, until], and stops at the first row older than `since`. A window holding more rows than a
+  page is simply followed through its cursor pages; the page cap raises. The feed's order is not stated by the
+  specification: every row must be no newer than the one before it, or the walk raises (it never guesses).
 * every row is validated; a row of the wrong shape is a counted reject (reason in `Walk.rejects`), never a guess.
   A bool, None, NaN, infinity or a string where a number belongs is wrong.
 """
@@ -31,13 +39,14 @@ from typing import Any, Callable
 
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
-           "validate_resolution", "validate_price_point"]
+           "validate_resolution", "MARKET_PAGE_CAP"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
 DEFAULT_PAGE_CAP = 5000            # pages of a walk; a wallet with more than 5 million trades raises, never truncates
 BOARD_WINDOWS = ("day", "week", "month", "all")
 POSITION_STATUSES = (None, "CLOSED")
+MARKET_PAGE_CAP = 2000             # pages of one market's feed walk (2 million prints after the window's start)
 MAX_CONDITIONS = 20
 
 
@@ -220,26 +229,12 @@ def validate_resolution(row) -> tuple[dict | None, str | None]:
             "resolved_at": ra, "resolved_ts": ts}, None
 
 
-def validate_price_point(row) -> tuple[dict | None, str | None]:
-    """A price-history point: price a number from 0 to 1, resolution_seconds an int not below 0, timestamp an int
-    above 0 (the observation's own time; an aggregate's bucket start)."""
-    if not isinstance(row, dict):
-        return None, "not_an_object"
-    p, res, ts = row.get("price"), row.get("resolution_seconds"), row.get("timestamp")
-    if not is_number(p) or not 0 <= p <= 1:
-        return None, "bad_price"
-    if not _is_int(res) or res < 0:
-        return None, "bad_resolution_seconds"
-    if not _is_int(ts) or ts <= 0:
-        return None, "bad_timestamp"
-    return {"price": float(p), "resolution_seconds": res, "timestamp": ts}, None
-
-
 # ---------------------------------------------------------------- a walk's result
 @dataclass
 class Walk:
     """Everything one walk read: the valid rows (and each one's read time), every raw row with its reject reason
-    (None when kept), the reject counts, the number of pages and each page's read time."""
+    (None when kept), the reject counts, the number of pages and each page's read time. `outside` counts valid rows
+    a windowed walk read but did not keep."""
     rows: list = field(default_factory=list)
     row_read_at: list = field(default_factory=list)
     raw: list = field(default_factory=list)
@@ -247,6 +242,18 @@ class Walk:
     rejects: Counter = field(default_factory=Counter)
     pages: int = 0
     read_at: list = field(default_factory=list)
+    outside: Counter = field(default_factory=Counter)
+
+    def reject(self, row, why: str, read_at: str) -> None:
+        self.raw.append((row, why))
+        self.raw_read_at.append(read_at)
+        self.rejects[why] += 1
+
+    def keep(self, raw, good, read_at: str) -> None:
+        self.raw.append((raw, None))
+        self.raw_read_at.append(read_at)
+        self.rows.append(good)
+        self.row_read_at.append(read_at)
 
     def add(self, row, validator, read_at: str) -> None:
         good, why = validator(row)
@@ -396,10 +403,67 @@ class PolymarketData:
             w.add(row, validate_resolution, read_at)
         return w
 
-    def prices_history(self, token_id: str, start: int, end: int, page_cap: int = 100) -> Walk:
-        """One outcome token's price points in the window [start, end) (epoch seconds; the service caps an explicit
-        window at 15 days and picks the grain itself), oldest first."""
-        if not _is_str(token_id) or not (_is_int(start) and _is_int(end)) or not 0 < start < end:
-            raise ValueError("a token id and 0 < start < end")
-        params = {"token_id": token_id, "start": start, "end": end}
-        return self.walk("/v2/prices-history", params, validate_price_point, page_cap=page_cap)
+    def resolution_batches(self, conditions):
+        """Every id's resolution, twenty ids a request. Yields (batch, walk, answers) per request; `answers` holds one
+        word per id asked: "row" (exactly one valid row), "no_row" (none: unresolved or unknown), "rejected" (only
+        rows of the wrong shape), "row_and_reject" or "duplicate" (not trusted)."""
+        conds = list(dict.fromkeys(conditions))
+        for i in range(0, len(conds), MAX_CONDITIONS):
+            batch = conds[i:i + MAX_CONDITIONS]
+            w = self.resolutions(batch)
+            good: Counter = Counter(r["condition_id"] for r in w.rows)
+            bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw if why and isinstance(raw, dict))
+            answers = {}
+            for c in batch:
+                if good[c] > 1:
+                    answers[c] = "duplicate"
+                elif good[c] == 1:
+                    answers[c] = "row_and_reject" if bad[c] else "row"
+                else:
+                    answers[c] = "rejected" if bad[c] else "no_row"
+            yield batch, w, answers
+
+    def market_trades(self, condition: str, since: int, until: int, page_cap: int = MARKET_PAGE_CAP) -> Walk:
+        """One market's taker prints with `since` <= timestamp <= `until` (epoch seconds), newest first. Parameters
+        sent: condition (one id), taker_only=true, limit=1000 on the first page; condition, taker_only and the cursor
+        after. The service ignores time bounds on this shape, so the walk reads from the newest print down and stops
+        at the first print older than `since`."""
+        if not _is_str(condition) or "," in condition:
+            raise ValueError("one condition id")
+        if not (_is_int(since) and _is_int(until)) or not 0 < since <= until:
+            raise ValueError("0 < since <= until, whole seconds")
+        params = {"condition": condition, "taker_only": "true", "limit": 1000}
+        resend = {"condition": condition, "taker_only": "true"}
+        w, seen, cursor, last = Walk(), set(), None, None
+        while True:
+            if w.pages >= page_cap:
+                raise PageCapHit("page cap %d reached in the feed of %s above %d" % (page_cap, condition, since))
+            ans = self.get_json("/v2/trades", dict(params) if cursor is None else dict(resend, cursor=cursor))
+            read_at = self.now()
+            rows, more, nxt = self._envelope(ans, "/v2/trades")
+            w.pages += 1
+            w.read_at.append(read_at)
+            for row in rows:
+                good, why = validate_trade(row)
+                if why is None and good["condition_id"] != condition:
+                    why = "other_condition"
+                if why:
+                    w.reject(row, why, read_at)
+                    continue
+                ts = good["timestamp"]
+                if last is not None and ts > last:
+                    raise PolymarketDataError("the feed of %s is not newest-first (%d after %d)" % (condition, ts, last))
+                last = ts
+                if ts > until:
+                    w.outside["after_window"] += 1
+                elif ts < since:
+                    w.outside["before_window"] += 1
+                    return w
+                else:
+                    w.keep(row, good, read_at)
+            if not more:
+                return w
+            if nxt in seen:
+                raise PolymarketDataError("repeated cursor %r in the feed of %s" % (nxt, condition))
+            seen.add(nxt)
+            cursor = nxt
