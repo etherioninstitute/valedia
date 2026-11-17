@@ -1940,3 +1940,310 @@ def test_the_identities_on_disk_behave_as_the_whole_walks_dict_one_and_one_point
                 ids[k], ref[k] = sig, sig
         assert len(ref) == 3
         s.db.rollback()
+
+
+# ------------------------------------------------------------------ addendum 7
+def test_identities_are_exact_as_the_old_dict_keys_were(tmp_path):
+    """The old way kept identities as dict keys: Python's ==. 2**53 and 2**53 + 1 differ (exact ints); 2**53 and
+    2.0**53 are one key, as are 2**63 and 2.0**63; 0, 0.0 and -0.0 are one key; 1, 1.0 and True are one key; a
+    number is never a string."""
+    keys = [2 ** 53, 2 ** 53 + 1, float(2 ** 53), 2 ** 63, float(2 ** 63), 2 ** 63 + 1, 0, 0.0, -0.0, 1, 1.0, True,
+            False, "1", 0.1, 0.1 + 2 ** -56, 1e300, -2 ** 53 - 1]
+    old = {}
+    for i, v in enumerate(keys):
+        old.setdefault(("0xa", v), i)
+    assert old[("0xa", 2 ** 53)] != old[("0xa", 2 ** 53 + 1)] and old[("0xa", float(2 ** 53))] == old[("0xa", 2 ** 53)]
+    assert old[("0xa", 2 ** 63)] == old[("0xa", float(2 ** 63))] != old[("0xa", 2 ** 63 + 1)]
+    assert old[("0xa", 0)] == old[("0xa", -0.0)] == old[("0xa", False)] and old[("0xa", 1)] == old[("0xa", True)]
+    with cl.Store(tmp_path / "s.sqlite", make_id=True) as s:
+        ids = s.seen()
+        for i, v in enumerate(keys):
+            k = ("0xa", v)
+            if k not in ids:
+                ids[k] = "sig%d" % i
+        for i, v in enumerate(keys):            # the first key of each old class holds, every other key finds it
+            assert ids[("0xa", v)] == "sig%d" % old[("0xa", v)], (i, v)
+            assert not (ids[("0xa", v)] == "sig%d" % (old[("0xa", v)] + 100))
+        n = s.db.execute("SELECT COUNT(*) FROM temp.walk_seen").fetchone()[0]
+        assert n == len(set(old.values()))
+        s.db.rollback()
+
+
+class EndlessWindow(PagedWorld):
+    """A PagedWorld whose one named price window never ends (more pages always promised)."""
+
+    def __init__(self, *a, endless=None, **k):
+        super().__init__(*a, **k)
+        self.endless = endless
+
+    def __call__(self, url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        if "/v2/prices-history" in url and (q.get("token_id"), int(q.get("start", 0))) == self.endless:
+            self.urls.append(url)
+            n = int(q.get("cursor", "0"))
+            return json.dumps({"data": [{"price": 0.5, "resolution_seconds": 300, "timestamp": self.endless[1] + n}],
+                               "pagination": {"has_more": True, "next_cursor": str(n + 1)}}).encode()
+        return super().__call__(url)
+
+
+def _phase1_store(tmp_path, monkeypatch, seed=11):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = World(seed, edge=0.3, move=0.0, pros=5, per_month=11, months=SMALL_MONTHS)
+    store = tmp_path / "s.sqlite"
+    cl.pull(store, _paged_client(PagedWorld(w, seed, size=50)), phase=1, say=lambda m: None)
+    return w, store
+
+
+def test_a_price_window_past_its_page_limit_stays_unfinished_and_the_pull_is_incomplete(tmp_path, monkeypatch):
+    w, store = _phase1_store(tmp_path, monkeypatch)
+    with cl.Store(store) as s:
+        targets = cl.plan_store(s)
+        s.commit()
+        first = sorted(cl.base_windows(targets).items())[0]
+    key, wd = first
+    said = []
+    svc = EndlessWindow(w, 11, size=50, endless=(wd.token, wd.start))
+    with pytest.raises(cl.PullIncomplete):
+        cl.pull(store, _paged_client(svc), phase=2, say=said.append)
+    db = sqlite3.connect(str(store))
+    assert db.execute("SELECT status FROM walks WHERE kind='prices' AND key=?", (key,)).fetchone() == ("started",)
+    assert db.execute("SELECT COUNT(*) FROM price_points WHERE walk_key=?", (key,)).fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM walks WHERE status='page_limit'").fetchone()[0] == 0
+    db.close()
+    with cl.Store(store) as s:
+        assert not s.meta("plan").get("ten_minute_windows_added")          # the 10-minute step waits
+    text = " ".join(said)
+    assert "--leave-out" not in text and "page limit" not in text
+    assert "unfinished: 1 price windows" in said[-1], said[-1]
+    monkeypatch.setattr(cl, "pull", lambda *a, **k: (_ for _ in ()).throw(cl.PullIncomplete("x")))
+    monkeypatch.setattr(cl.pd, "PolymarketData", lambda *a, **k: None)
+    assert cl.main(["pull", "--phase", "2", "--store", str(store)]) == 3                # the old exit code
+
+
+def test_a_resolutions_batch_answered_as_a_paged_list_stays_unfinished_and_the_pull_is_incomplete(tmp_path,
+                                                                                                  monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(6)
+    svc = PagedWorld(w, 6, size=50)
+    inner = svc.__call__
+    first = sorted(w.res)[0]
+
+    def paged(url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        if "/v2/resolutions" in url and first in q["condition"].split(","):
+            return json.dumps({"data": [], "pagination": {"has_more": True, "next_cursor": "x"}}).encode()
+        return inner(url)
+    store = tmp_path / "s.sqlite"
+    said = []
+    with pytest.raises(cl.PullIncomplete, match="resolutions"):
+        cl.pull(store, _paged_client(paged), phase=1, say=said.append)
+    with cl.Store(store) as s:
+        assert first in s.unfinished("resolutions") and first not in s.resolution_answers()
+        assert len(s.unfinished("resolutions")) == 20                   # one batch, the others read
+        assert s.db.execute("SELECT COUNT(*) FROM walks WHERE status='page_limit'").fetchone()[0] == 0
+    assert "unfinished: 20 resolution walks" in said[-1], said[-1]
+
+
+LOCK_CHILD = r"""
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import test_copy_leaders as T
+from valedia_trader.research_loop import copy_leaders as cl
+store, ready, go = sys.argv[2], sys.argv[3], sys.argv[4]
+cl._now = lambda: T.FIXED
+w = T._small_world(5)
+svc = T.PagedWorld(w, 5, size=50)
+inner = svc.__call__
+def held(url):
+    if "/v2/trades" in url and "user=pro02&" in url and "cursor" not in url:
+        open(ready, "w").close()
+        t = time.time()
+        while not os.path.exists(go) and time.time() - t < 300:
+            time.sleep(0.01)
+    return inner(url)
+cl.pull(store, T._paged_client(held), phase=1, say=lambda m: None)
+print("PULLED")
+"""
+
+
+def _start_locked_pull(tmp_path, store):
+    script = tmp_path / "lock.py"
+    script.write_text(LOCK_CHILD)
+    ready, go = tmp_path / "ready", tmp_path / "go"
+    root = str(Path(cl.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root, PYTHONDONTWRITEBYTECODE="1")
+    p = subprocess.Popen([sys.executable, "-B", str(script), str(Path(__file__).resolve().parent), str(store),
+                          str(ready), str(go)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    import time as _t
+    t = _t.time()
+    while not ready.exists():
+        assert p.poll() is None, p.communicate()
+        assert _t.time() - t < 300
+        _t.sleep(0.02)
+    return p, go
+
+
+def test_while_a_pull_runs_pull_develop_and_sealed_refuse_in_words_at_once(tmp_path, monkeypatch):
+    import time as _t
+    store = tmp_path / "s.sqlite"
+    p, go = _start_locked_pull(tmp_path, store)
+    try:
+        for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o"),
+                    lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True),
+                    lambda: cl.pull(store, _paged_client(PagedWorld(_small_world(5), 5)), phase=1, say=lambda m: None)):
+            t = _t.time()
+            with pytest.raises(cl.Refused, match="a pull is running on this store"):
+                run()
+            assert _t.time() - t < 5                                      # without waiting
+        assert not (tmp_path / "o").exists()
+    finally:
+        go.touch()
+        out, err = p.communicate(timeout=600)
+    assert p.returncode == 0 and "PULLED" in out, err[-1500:]
+    with pytest.raises(cl.Refused) as e:                              # the lock is gone: another refusal, not it
+        cl.run_develop(store=store, out_dir=tmp_path / "o")
+    assert "a pull is running" not in str(e.value)
+
+
+def test_a_killed_pull_leaves_no_lock_held(tmp_path, monkeypatch):
+    import signal
+    store = tmp_path / "s.sqlite"
+    p, go = _start_locked_pull(tmp_path, store)
+    os.kill(p.pid, signal.SIGKILL)
+    p.communicate(timeout=60)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    cl.pull(store, _paged_client(PagedWorld(_small_world(5), 5, size=50)), phase=1, say=lambda m: None)
+    with cl.Store(store) as s:
+        assert not s.unfinished("trades")
+
+
+def test_the_pull_says_never_to_copy_the_store_while_it_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    said = []
+    cl.pull(tmp_path / "s.sqlite", _paged_client(PagedWorld(_small_world(5), 5, size=50)), phase=1, say=said.append)
+    assert "never copy the store file while a pull runs" in said[0] and "SQLite's own backup" in said[0]
+    doc = " ".join(cl.__doc__.split())
+    assert "never copy the store file while a pull runs" in doc and "SQLite's own backup" in doc
+
+
+def test_develop_and_sealed_refuse_a_store_that_fails_its_integrity_check(tmp_path):
+    store = _cheap(tmp_path)
+    db = sqlite3.connect(str(store))
+    root = db.execute("SELECT rootpage FROM sqlite_master WHERE name='trades'").fetchone()[0]
+    size = db.execute("PRAGMA page_size").fetchone()[0]
+    db.close()
+    assert root > 1
+    with open(store, "r+b") as f:                     # a page of the trades table made garbage
+        f.seek((root - 1) * size + 100)
+        f.write(b"\xff" * 200)
+    before = _sha(store)
+    for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o"),
+                lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True)):
+        with pytest.raises(cl.Refused, match="quick_check"):
+            run()
+    assert _sha(store) == before and not (tmp_path / "o").exists()
+
+
+_POSITION = re.compile(r"\b(?:tok|mmt)\d+\b")
+
+
+def test_phase_2_prints_a_counter_only_never_a_position(tmp_path, monkeypatch):
+    w, store = _phase1_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(cl, "PRICE_COUNTER_EVERY", 5)
+    said = []
+    cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=2, say=said.append)
+    with cl.Store(store) as s:
+        windows = s.plan_windows()
+    assert len(windows) > 10
+    starts = {str(wd.start) for wd in windows.values()} | {str(wd.start - DELAY) for wd in windows.values()}
+    for m in said:
+        assert not _POSITION.search(m), m
+        assert not any(t in m for t in starts), m
+    counters = [m for m in said if re.match(r"phase 2: \d+ of \d+ price windows finished, [\d,]+ points, \d+ s, "
+                                            r"memory \d+ MB$", m)]
+    finished = [int(m.split()[2]) for m in counters]
+    assert finished[0] == 5 and all(b > a for a, b in zip(finished, finished[1:]))
+    assert sum(m.startswith("phase 2: ") and "price windows finished" in m for m in said) == len(counters)
+
+
+def test_a_failed_price_window_is_named_by_its_number_only(tmp_path, monkeypatch):
+    w, store = _phase1_store(tmp_path, monkeypatch)
+    svc = PagedWorld(w, 11, size=50)
+    inner = svc.__call__
+    asked = []
+
+    def failing(url):
+        if "/v2/prices-history" in url:
+            asked.append(url)
+            if len(asked) == 3:
+                raise pd.HttpError(400, url)
+        return inner(url)
+    said = []
+    with pytest.raises(cl.PullIncomplete) as e:
+        cl.pull(store, _paged_client(failing), phase=2, say=said.append)
+    for m in said + [str(e.value)]:
+        assert not _POSITION.search(m) and "prices-history" not in m, m
+    assert "price window 3 of" in str(e.value)
+
+
+TMP_CHILD_CHECK = r"""
+import os, sqlite3, subprocess
+"""
+
+
+def test_sqlites_temporary_files_live_beside_the_store_and_are_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    store = tmp_path / "s.sqlite"
+    folder = tmp_path / "s.sqlite.pull-tmp"
+    folder.mkdir()
+    (folder / "etilqs_leftover").write_text("from a killed pull")       # a leftover from a kill
+    seen = {}
+    svc = PagedWorld(_small_world(5), 5, size=20)
+    inner = svc.__call__
+
+    def watch(url):
+        if "/v2/trades" in url and "cursor=40" in url and "where" not in seen:
+            db = sqlite3.connect(":memory:")
+            seen["where"] = db.execute("PRAGMA temp_store_directory").fetchone()
+            db.close()
+            seen["exists"] = folder.is_dir()
+            seen["leftover"] = (folder / "etilqs_leftover").exists()
+        return inner(url)
+    cl.pull(store, _paged_client(watch), phase=1, say=lambda m: None)
+    assert seen == {"where": (str(folder.resolve()),), "exists": True, "leftover": False}
+    assert not folder.exists()
+    db = sqlite3.connect(":memory:")
+    assert db.execute("PRAGMA temp_store_directory").fetchone() in (None, ("",))
+    db.close()
+
+
+def test_the_end_of_walk_numbering_is_done_in_bounded_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(cl, "RENUMBER_CHUNK", 7)
+    for seed in (0, 1, 2):
+        w = _small_world(seed)
+        old, new = tmp_path / ("old%d.sqlite" % seed), tmp_path / ("new%d.sqlite" % seed)
+        oc, nc = _paged_client(PagedWorld(w, seed)), _paged_client(PagedWorld(w, seed))
+        _old_pull(old, oc, 1)
+        cl.pull(new, nc, phase=1, say=lambda m: None)
+        _old_pull(old, oc, 2)
+        cl.pull(new, nc, phase=2, say=lambda m: None)
+        a, b = _tables(old), _tables(new)
+        for name in a:
+            assert a[name] == b[name], (seed, name)
+    statements = []
+    real = sqlite3.connect
+
+    def traced(*a, **k):
+        db = real(*a, **k)
+        db.set_trace_callback(statements.append)
+        return db
+    monkeypatch.setattr(cl.sqlite3, "connect", traced)
+    store = tmp_path / "big.sqlite"
+    cl.pull(store, pd.PolymarketData(_big_fetch(5, 10), sleep=lambda s: None, clock=lambda: 0.0), phase=1,
+            say=lambda m: None)
+    renumber = [st for st in statements if st.startswith("UPDATE trades SET seq")]
+    assert len(renumber) == -(-50 // 7)                # 50 rows, 7 a statement
+    db = real(str(store))
+    assert db.execute("SELECT MIN(seq), MAX(seq), COUNT(*) FROM trades").fetchone() == (0, 49, 50)
+    db.close()
