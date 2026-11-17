@@ -197,6 +197,14 @@ def sample_host(nonce,host,sequence,deadline,scope,declared=None,resolve=resolve
     return {'schema':1,'outcome':'VALEDIA-MIROFISH-FRESH-1','nonce':nonce,'host_pid':host['pid'],'host_started':host['started'],'source_sha256':digest(__file__),'sequence':sequence,'monotonic':time.monotonic(),'utc':datetime.now(timezone.utc).isoformat(),'free_percent':int(match[1]),'all_process_rss_bytes':sum(r['rss'] for r in rows),'rss_rows':len(rows),'rss_positive_rows':sum(r['rss']>0 for r in rows),'ps_sha256':digest('/bin/ps'),'ps_mode':0o4755,'host_deadline':deadline,'prompt_cache_route':cache_route_metadata(),
             'pressure_level':pressure_level(),'swap_used_bytes':swap_used_bytes(),**measurement}
 
+def observer_record(stdout,code):
+    """TMF5 addendum 2: the observer's exit code and its last stdout line parsed as one JSON object (None when it is not one)."""
+    lines=(stdout or '').strip().splitlines();line=None
+    if lines:
+        try:line=json.loads(lines[-1])
+        except ValueError:line=None
+    return {'exit':code,'line':line if type(line) is dict else None}
+
 def write_observer_identity(work,owner):
     """TMF5 (operator command): the observer's identity (pid, ps start string, process group), written right after it is
     spawned, before anything else."""
@@ -263,6 +271,7 @@ def launch(work,gate=None,preflight=False):
         child_thread=threading.Thread(target=children.serve,name="fixed-host-children",daemon=True);child_thread.start()
         out,err=process.communicate(timeout=max(.1,deadline-time.monotonic()))
         record={'command':command,'exit':process.returncode,'stdout':out,'stderr':err,'host_sampler_errors':errors,'preflight':preflight,'capsule_path':str(path),'resource_history_path':str(history.path),'resource_history_records':history.records,'resource_history_bytes':history.bytes,'host':host,'key_recorded':False}
+        if preflight:record['observer']=observer_record(out,process.returncode)  # why a preflight failed, without opening logs
     except BaseException:
         if process is not None and process.poll() is None:group.stop(time.monotonic()+4)
         raise

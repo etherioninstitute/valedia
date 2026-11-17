@@ -81,11 +81,14 @@ ORIGINAL_SDK_PORT=62298;SERVER_PORT=1235
 # from a selector file written beside the model module. Staging WITHOUT a model copies the W16 bytes as before, with no selector.
 SRC=Path(__file__).absolute().parents[1]/'src'
 MODEL_SRC_SHA='e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115'   # fc99603 (TMF4a) + 38bce8a (TMF4 addendum 3)
-RUN_SRC_SHA='f09d4870835fd0074ab97f4d78bf43b5dca39201051c423a7a778a4cc55707cf'   # TMF5 (was 0426dd5a, TMF4a + addendum 3)
+RUN_SRC_SHA='87e25cb380bcd6a44787b41a15b6e12f0d05ce3f0509e13c9232fc33632d93d6'   # TMF5 addendum 2 (was 0426dd5a, TMF4a + addendum 3; f09d4870, TMF5)
 # TMF5 (2026-11-17): staged with a model, the startup and gateway modules are also the pinned src/ revisions (the stop rule's
 # sample fields, the co-resident, the observer identity; the refusal record and the search-query cut), with the same closed
 # integer deltas as the W16 bytes took, and the producer takes the TMF5 patches the staged run script itself lists.
-STARTUP_SRC_SHA='bd8f952b92b244a7054a064b877b5c2da70c336a62391587151146d62e5c28f7'
+STARTUP_SRC_SHA='92f54fe2fcdfd8eb6149dc3c740999b0bdd0a59728048a5a5c51ed2e1a87baae'   # TMF5 addendum 2 (was bd8f952b, TMF5)
+# TMF5 addendum 2: the observer side of the preflight, staged with a model beside the observer's run script.
+PREFLIGHT_SRC_SHA='dbf5d7890979a355d89b6dc83c492d1dcfef1bd7cc47dd78e2698344a3d839cf'
+PREFLIGHT_REL='owned-source/observer-entry/mirofish_startup_preflight.py'
 GATEWAY_SRC_SHA='7cdf872efcc9d71260a16501d8594eece32372aa9fb4985af2883e2cf91def11'
 SRC_REVIEW_STATUS='blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied afterwards and awaiting their own check); the TMF5 revisions of the run, startup and gateway modules (2026-11-17) await their own check'
 SRC_REVISION_NOTE=('These two files (mirofish_native_model.py, mirofish_native_run.py) are the src/ revisions of commit fc99603 (TMF4a: '
@@ -525,6 +528,11 @@ def tmf5_producer_bytes(raw,patches):
     for old,new in patches:
         require(text.count(old)==1,'TMF5 producer patch site missing or repeated');text=text.replace(old,new)
     ast.parse(text);return text.encode()
+def stage_preflight(work,pins,ancestry):
+    """TMF5 addendum 2: write the pinned src/ preflight script beside the observer's run script (never replacing a file)."""
+    target=Path(work)/PREFLIGHT_REL;require(target.parent.is_dir() and not target.exists(),'the preflight script must be new beside the observer run script')
+    target.write_bytes(src_revision('mirofish_startup_preflight.py',PREFLIGHT_SRC_SHA));target.chmod(0o444)
+    pins.append({'path':str(target),'sha256':sha(target)});ancestry.append({'source':str(SRC/'mirofish_startup_preflight.py'),'target':str(target),'sha256':sha(target),'kind':'PINNED_SRC_STARTUP_PREFLIGHT'})
 def model_choice(name,base_manifest,registry=None):
     """The chosen built-in profile and its pins, derived from the pinned module (names and paths) and the reviewed hashes (the
     base manifest's for the 27B's tokenizer origin, which Bonsai 2 shares; TOKENIZER_PINS otherwise). Refuses, in one line, an
@@ -708,7 +716,7 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
         helper=work/SDK_HELPER_REL;reviewed=helper.read_text();reviewed=sdk_port_helper(reviewed,sdk_port) if moved else reviewed;helper.chmod(0o644);helper.write_text(model_helper_text(reviewed,model,reference));helper.chmod(0o444)
         rows=[row for row in ancestry if row['target']==str(helper)];require(len(rows)==1,'SDK helper ancestry');rows[0].update(kind='PINNED_SRC_REVISION_MODEL_HELPER',sha256=sha(helper))
         pins[[i for i,row in enumerate(pins) if row['path']==str(helper)][0]]['sha256']=sha(helper)
-        staged_helper_matches_model(work,sdk_port,model);pins.extend(selector_pins)
+        staged_helper_matches_model(work,sdk_port,model);pins.extend(selector_pins);stage_preflight(work,pins,ancestry)
     elif moved:staged_helper_matches_model(work,sdk_port)
     scaffold(work)  # Explicit empty runtime directories; never copy historical logs/state.
     native=helpers['mirofish_native_run'];native.graph_configuration(work,manifest['graph_port'])

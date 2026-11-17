@@ -486,7 +486,8 @@ def resource_sample(pre=False):
     that hold on any single sample (owned memory bound, two co-resident processes); the sustained rule is ResourceRule's."""
     from mirofish_native_startup import resource_from_capsule
     sample=resource_from_capsule()
-    if pre:reason='resource reading not valid' if not valid_reading(sample) else ('memory free threshold' if sample['free_percent']<START_FREE_PERCENT else (TWO_CO_RESIDENTS if sample['co_resident_rows']>=2 else None))
+    # TMF5 addendum 2: a run starts only at pressure level 1 (normal); the preflight judges the same rule with this function.
+    if pre:reason='resource reading not valid' if not valid_reading(sample) else ('memory free threshold' if sample['free_percent']<START_FREE_PERCENT else ('kernel memory pressure not normal at start' if sample['pressure_level']!=1 else (TWO_CO_RESIDENTS if sample['co_resident_rows']>=2 else None)))
     else:reason='conservative owned-model RSS upper bound exceeded' if sample['owned_scope_rss_bytes']>OWNED_RSS_BOUND else (TWO_CO_RESIDENTS if sample['co_resident_rows']>=2 else None)
     if reason:
         failure=NativeRefused(reason);failure.resource_sample=sample
@@ -681,6 +682,22 @@ def prepare_candidate(work):
     return {'candidate_sha256':digest(builder/'candidate-manifest.json'),'manifest':str(builder/'candidate-manifest.json'),'frozen_file_count':len(inputs),'model_files':len(model_files)}
 
 
+def require_plan_binding(candidate,plan):
+    """A plan candidate's manifest binds this plan and both members' tokenizer pins (plan None: one model, nothing to bind)."""
+    if plan is not None:
+        require(candidate.get('model_plan')==plan and type(candidate.get('model_tokenizer_by_profile')) is dict and set(candidate['model_tokenizer_by_profile'])==set(plan.values()),'candidate manifest does not bind this model plan and its tokenizer pins')
+
+
+def require_confined():
+    """A valid receipt does not itself provide filesystem confinement. Prove the real original public source is unreadable
+    before any service/model start (the run and the preflight both call this)."""
+    try:
+        (PROJECT/'AGENTS.md').read_bytes()
+    except PermissionError:
+        return
+    raise NativeRefused('observer is not OS-confined from original source/state')
+
+
 def verify_candidate(work):
     work=Path(work);path=work/'builder/candidate-manifest.json';value=decode(path.read_bytes())
     require(value.get('outcome')==OUTCOME,'wrong candidate outcome')
@@ -815,18 +832,10 @@ def execute(work,gate):
     allowed={key:os.environ[key] for key in ['PATH','TMPDIR','PYTHONDONTWRITEBYTECODE','XDG_CACHE_HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','MIROFISH_RESOURCE_CAPSULE','MIROFISH_RESOURCE_KEY','MIROFISH_RESOURCE_NONCE','MIROFISH_RESOURCE_HOST','MIROFISH_HOST_DEADLINE','MIROFISH_IDENTITY_PS','MIROFISH_HOST_CONTROL_FD','MIROFISH_WORKER_COMMAND_FD','MIROFISH_WORKER_EVENT_FD'] if key in os.environ}
     os.environ.clear();os.environ.update(allowed)
     candidate,candidate_digest=verify_candidate(work)
-    if plan is not None:
-        require(candidate.get('model_plan')==plan and type(candidate.get('model_tokenizer_by_profile')) is dict and set(candidate['model_tokenizer_by_profile'])==set(plan.values()),'candidate manifest does not bind this model plan and its tokenizer pins')
+    require_plan_binding(candidate,plan)
     run_id=uuid.uuid4().hex;identifier='mf-native-'+run_id
     verify_launch(work,gate,candidate_digest,run_id)
-    # A valid receipt does not itself provide filesystem confinement. Prove the
-    # real original public source is unreadable before any service/model start.
-    try:
-        (PROJECT/'AGENTS.md').read_bytes()
-    except PermissionError:
-        pass
-    else:
-        raise NativeRefused('observer is not OS-confined from original source/state')
+    require_confined()
     from mirofish_native_children import client
     client().call('bind',run_id=run_id,candidate_sha256=candidate_digest)
     producer=work/'owned-source/producer';control=work/'owned-source/worker-entry'
