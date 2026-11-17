@@ -4,8 +4,11 @@ The real adapter runs against a stand-in for the SDK's TradeClient that behaves 
 2026-11-13 (a purchase fills at the ask, a sale at the bid, on the next read; one fee entry from acceptance, none after
 a cancel). Kalshi's book is a function the test passes. Everything is written in a temporary folder; nothing here
 touches the network, the real secrets file or the repository's files."""
+import copy
 import json
 import random
+import re
+import shutil
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -821,7 +824,7 @@ def test_a_confirmation_is_refused_unless_the_account_shows_exactly_the_pending_
 
 
 def test_holdings_gone_together_are_confirmed_one_by_one(tmp_path):
-    # two names pending together: each other difference is a pending name the account shows at exactly 0
+    # two names pending together: another name that differs blocks only when it has no pending record of its own
     w = World(tmp_path, held={f"{T}:yes": 1, f"{OTHER}:no": 2})
     assert w.run(reconcile_only=True)["status"] == "done"
     w.clock.t = NOW
@@ -829,11 +832,12 @@ def test_holdings_gone_together_are_confirmed_one_by_one(tmp_path):
     assert pending(out, w), out
     pids = sorted(e["pending_id"] for e in w.entries("settlement_pending"))
     assert len(pids) == 2
-    w.exchange.held[f"{OTHER}:no"] = 1                                    # the other one partly back: a person looks
-    before = person_state(w)
-    assert confirm(w, pids[0])["status"] == "refused" and person_state(w) == before
-    w.exchange.held[f"{OTHER}:no"] = 0
+    w.exchange.held[f"{OTHER}:no"] = 1                                    # the other one partly back: it has its own
+    before = person_state(w)                                              # record, so it does not block the first
+    assert confirm(w, pids[1])["status"] == "refused" and person_state(w) == before          # but it is not at 0
+    assert withdraw(w, pids[1])["status"] == "refused" and person_state(w) == before         # nor back in full
     assert confirm(w, pids[0])["status"] == "confirmed"
+    w.exchange.held[f"{OTHER}:no"] = 0
     assert confirm(w, pids[1])["status"] == "confirmed"
     assert len(w.entries("settlement")) == 2 and w.run(reconcile_only=True)["status"] == "done"
 
@@ -1253,6 +1257,7 @@ class CashVenue:
         self.cash, self.held, self.orders = 100000, {}, {}
         self.give_price, self.give_fee = True, True
         self.round_avg = None                                # decimals the average is rounded to (None: exact)
+        self.give_amount = True                              # False: the filled amount is not said
 
     def submit(self, symbol, units, tag, price=None, limit_price=None):
         self.orders[tag] = {"symbol": symbol, "units": units, "filled": 0, "value": 0, "fee": 0, "state": "open"}
@@ -1274,6 +1279,11 @@ class CashVenue:
         o["value"] += cents
         self.cash += -cents if o["units"] > 0 else cents
 
+    def charge(self, tag, cents):
+        """A fee on the order without a fill (the venue's own figure)."""
+        self.orders[tag]["fee"] += cents
+        self.cash -= cents
+
     def fee_falls(self, tag, cents):
         o = self.orders[tag]
         o["fee"] -= cents
@@ -1287,8 +1297,9 @@ class CashVenue:
         if o["filled"] and self.give_price:
             avg = o["value"] / o["filled"] / 100
             avg = round(avg, self.round_avg) if self.round_avg is not None else avg
-        fee = o["fee"] / 100 if o["filled"] and self.give_fee else None
-        return {"state": o["state"], "filled_units": float(o["filled"]), "avg_price": avg, "fee": fee,
+        fee = o["fee"] / 100 if (o["filled"] or o["fee"]) and self.give_fee else None
+        amount = float(o["filled"]) if self.give_amount else None
+        return {"state": o["state"], "filled_units": amount, "avg_price": avg, "fee": fee,
                 "venue_order_id": tag, "raw_status": o["state"]}
 
     def cancel(self, tag):
@@ -1321,7 +1332,7 @@ def read(led, venue, settlements, apply=True):
 _TAGS = iter(range(10 ** 9))
 
 
-def trade(led, venue, symbol, units, pieces, settlements=(), cancel_after=False, readings=None):
+def trade(led, venue, symbol, units, pieces, settlements=(), cancel_after=False, readings=None, hide_fee_from=None):
     """One order through the real ledger: intended, sent once, filled in `pieces` (contracts, price cents, fee cents),
     each piece read by a reconcile; cancelled after its pieces when asked; read once more at the end. Each reading is
     kept in `readings` with the venue's cash at that moment."""
@@ -1329,7 +1340,9 @@ def trade(led, venue, symbol, units, pieces, settlements=(), cancel_after=False,
     read(led, venue, list(settlements))                                   # submit needs a recent clean reconcile
     led.intend(tag, symbol, float(units), 0.5, limit_price=0.99 if units > 0 else 0.01)
     assert led.submit_once(venue, tag)["state"] == "accepted"
-    for qty, price, fee in pieces:
+    for i, (qty, price, fee) in enumerate(pieces):
+        if hide_fee_from is not None and i == hide_fee_from:              # the fee goes unsaid from this piece on
+            venue.give_fee = False
         venue.fill(tag, qty, price, fee)
         got = read(led, venue, list(settlements))
         if readings is not None:
@@ -1449,6 +1462,7 @@ def test_known_cash_change_equals_the_venues_cash_change_at_every_reading(seed):
     readings = [(read(led, venue, []), venue.cash)]
     seen = set()
     plan = ["hide", "buy", "reveal", "fall", "restate"] if seed % 3 == 0 else []       # a third: all of them
+    plan += ["stale", "reveal"] if seed % 4 == 0 else []                  # a quarter: a fee unsaid on a later piece
     steps = plan + [None] * rng.randint(3, 10)
     for forced in steps:
         held = book_of_ledger(led, settlements)
@@ -1457,14 +1471,24 @@ def test_known_cash_change_equals_the_venues_cash_change_at_every_reading(seed):
         sellable = [n for n in live if held.get(n, 0.0) >= 1]
         kind = forced or (rng.choice(["buy", "buy", "sell", "settle", "fee", "hide", "reveal", "fall", "restate"])
                           if sellable else rng.choice(["buy", "buy", "hide"]))
+        if kind == "stale" and live:
+            name = rng.choice(live)
+            pieces = [(1, rng.randint(1, 99), rng.randint(0, 3)), (1, rng.randint(1, 99), rng.randint(1, 3))]
+            trade(led, venue, name, 2, pieces, settlements, readings=readings, hide_fee_from=1)
+            seen.add("stale")
+            continue
         if kind in ("buy", "sell") and live and (kind == "buy" or sellable):
             name = rng.choice(live if kind == "buy" else sellable)
             size = rng.randint(1, 5) if kind == "buy" else rng.randint(1, int(held[name]))
             cut = rng.randint(1, size)
-            low = 1 if not venue.give_fee else 0                          # a late fee of 0 is never stored (orders.py)
-            pieces = [(q, rng.randint(1, 99), rng.randint(low, 3)) for q in _split(rng, cut)]
+            parts = _split(rng, cut)
+            stale = 1 if len(parts) > 1 and venue.give_fee and rng.random() < 0.3 else None
+            low = [1 if not venue.give_fee or (stale is not None and i >= stale) else 0 for i in range(len(parts))]
+            pieces = [(q, rng.randint(1, 99), rng.randint(lo, 3)) for q, lo in zip(parts, low)]  # a late 0 is not stored
             trade(led, venue, name, size if kind == "buy" else -size, pieces, settlements, cancel_after=cut < size,
-                  readings=readings)
+                  readings=readings, hide_fee_from=stale)
+            if stale is not None:
+                seen.add("stale")
             seen.add("trade")
             continue
         if kind == "settle" and sellable:
@@ -1504,6 +1528,8 @@ def test_known_cash_change_equals_the_venues_cash_change_at_every_reading(seed):
     assert final == (venue.cash - start, None), (seed, final, venue.cash - start)
     if seed % 3 == 0:
         assert {"hidden", "fell", "restated"} <= seen, (seed, seen)
+    if seed % 4 == 0:
+        assert "stale" in seen, (seed, seen)
     for got, cash in readings:                                            # where known, exactly, in cents
         assert got[0] is None or got == (cash - start, None), (seed, got, cash - start)
 
@@ -1758,3 +1784,367 @@ def test_a_win_settled_by_a_person_leaves_the_flag_false(tmp_path):
     pid = w.entries("settlement_pending")[0]["pending_id"]
     assert confirm(w, pid)["status"] == "confirmed"
     assert w.state().win_cash_observed() is False and w.run(reconcile_only=True)["win_cash_observed"] is False
+
+
+# ---- addendum 4 A: a fee figure older than the order's last filled contracts is no figure
+
+def test_a_fee_unsaid_on_a_later_piece_leaves_the_order_unknown_until_a_figure_arrives():
+    led, venue = OrderLedger(), CashVenue()
+    trade(led, venue, f"{T}:yes", 2, [(1, 40, 1), (1, 41, 1)], hide_fee_from=1)
+    assert [(f["units"], f["fee"]) for f in led.fills()] == [(1.0, 0.01), (1.0, None)]
+    assert led.orders()[-1]["fee"] == 0.01                                # the ledger keeps piece 1's figure
+    cents, why = ep.known_cents(led, [])
+    assert cents is None and "older" in why, (cents, why)                 # not -82 where the truth is -83
+    venue.give_fee = True
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-83, None)      # known and exact once it arrives
+
+
+def test_a_stale_fee_beside_a_one_cent_hand_sale_is_pending_not_settled(tmp_path):
+    w = World(tmp_path, held={f"{T}:yes": 1})
+    w.exchange.cash = 100000
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=2, side="buy", limit="0.30")["status"] == "done"   # rests
+    o = w.exchange.orders[w.exchange.placed()[-1]["client_order_id"]]
+    o.update(status="PARTIAL_FILLED", filled=1, price="0.30")             # piece 1 with its fee figure, 0.01
+    w.exchange.held[f"{OTHER}:yes"] = 1
+    w.exchange.cash -= 31
+    w.clock.t += 10
+    w.run(reconcile_only=True)
+    w.exchange.fees_given = False                                         # piece 2: its fee not said
+    o.update(status="FILLED", filled=2, price="0.30")
+    w.exchange.held[f"{OTHER}:yes"] = 2
+    w.exchange.cash -= 31
+    w.exchange.cash += 1                                                  # a one-cent hand sale beside it
+    w.clock.t = NOW
+    w.exchange.held[f"{T}:yes"] = 0
+    w.markets[T] = TONIGHT
+    out = w.run(reconcile_only=True)
+    assert pending(out, w) and "older" in out["reason"], out
+    assert w.entries("settlement") == [] and w.state().settlements() == []
+
+
+# ---- addendum 4 B: two names that differ are never a dead end
+
+def first_pending(path, held):
+    w = World(path, held=held)
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
+    assert pending(vanish(w, {f"{T}:yes": TONIGHT}, "1000.37"), w)       # the cash is off: pending on T
+    return w
+
+
+def two_pending(tmp_path):
+    """A pending record on T; then OTHER also settles, and gets its own pending record (the equation would hold for
+    it alone, but while a record is open the cash between the readings cannot be put on one name)."""
+    w = first_pending(tmp_path, {f"{T}:yes": 1, f"{OTHER}:yes": 1})
+    out = vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001.37")
+    assert pending(out, w) and w.entries("settlement") == [], out
+    p = {r["symbol"]: r["id"] for r in w.state().open_pending()}
+    assert set(p) == {f"{T}:yes", f"{OTHER}:yes"}, p
+    return w, p[f"{T}:yes"], p[f"{OTHER}:yes"]
+
+
+@pytest.mark.parametrize("order", ["confirm A then B", "confirm B then A", "withdraw A, confirm B",
+                                   "confirm A, withdraw B", "withdraw B, confirm A"])
+def test_two_names_pending_are_cleared_in_either_order(tmp_path, order):
+    w, a, b = two_pending(tmp_path)
+    steps = {"confirm A then B": [(confirm, a), (confirm, b)], "confirm B then A": [(confirm, b), (confirm, a)],
+             "withdraw A, confirm B": [(withdraw, a), (confirm, b)], "confirm A, withdraw B": [(confirm, a), (withdraw, b)],
+             "withdraw B, confirm A": [(withdraw, b), (confirm, a)]}[order]
+    for f, pid in steps:
+        if f is withdraw:                                                 # that holding is back in full
+            w.exchange.held[f"{T}:yes" if pid == a else f"{OTHER}:yes"] = 1
+    for f, pid in steps:
+        got = f(w, pid)
+        assert got["status"] in ("confirmed", "withdrawn"), (order, got)
+    assert w.state().open_pending() == []
+    out = w.run(reconcile_only=True)
+    assert out["status"] == "done" and out["pending_open"] == [], (order, out)
+    assert len(w.entries("settlement")) == sum(f is confirm for f, _ in steps)
+
+
+def test_a_partly_back_name_with_its_own_record_does_not_block_the_other(tmp_path):
+    w, a, b = two_pending(tmp_path)
+    w.exchange.held[f"{OTHER}:yes"] = 2                                   # more than expected: neither 0 nor in full
+    before = person_state(w)
+    assert confirm(w, b)["status"] == "refused" and person_state(w) == before
+    assert withdraw(w, b)["status"] == "refused" and person_state(w) == before
+    assert withdraw(w, a)["status"] == "refused" and person_state(w) == before       # A is still gone
+    assert confirm(w, a)["status"] == "confirmed"
+
+
+THIRD = "KXTHIRD-26NOV20-B3"
+
+
+def test_a_third_name_gone_without_a_settlement_still_refuses_with_nothing_journaled(tmp_path):
+    w = first_pending(tmp_path, {f"{T}:yes": 1, f"{OTHER}:yes": 1, f"{THIRD}:yes": 1})
+    out = vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER},
+                     f"{THIRD}:yes": {**TONIGHT, "ticker": THIRD, "status": "determined"}}, "1001.37")
+    assert out["status"] == "stopped" and THIRD in out["reason"] and "not finalized" in out["reason"], out
+    assert [r["symbol"] for r in w.state().open_pending()] == [f"{T}:yes"]   # OTHER is not made pending without THIRD
+    pid = w.state().open_pending()[0]["id"]
+    before = person_state(w)
+    for f in (confirm, withdraw):
+        got = f(w, pid)
+        assert got["status"] == "refused" and "another name differs" in got["reason"] and THIRD in got["reason"], got
+        assert person_state(w) == before
+    w.markets[THIRD] = {**TONIGHT, "ticker": THIRD}                       # the other way: Kalshi finalizes it
+    out = w.run(reconcile_only=True)
+    assert pending(out, w) and len(w.state().open_pending()) == 3, out
+    for r in w.state().open_pending():
+        assert confirm(w, r["id"])["status"] == "confirmed"
+    assert w.run(reconcile_only=True)["status"] == "done" and len(w.entries("settlement")) == 3
+
+
+def test_a_kill_after_each_write_of_the_second_pending_record_leaves_one_line_per_fact(tmp_path, monkeypatch):
+    real = Journal.write
+    killed = 0
+    for k in range(40):
+        w = first_pending(tmp_path / f"k{k}", {f"{T}:yes": 1, f"{OTHER}:yes": 1})
+        calls = {"n": 0}
+
+        def failing(self, day, entry, k=k):
+            calls["n"] += 1
+            if calls["n"] == k + 1:
+                raise OSError("killed")
+            return real(self, day, entry)
+        monkeypatch.setattr(Journal, "write", failing)
+        try:
+            vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001.37")
+        except OSError:
+            pass
+        monkeypatch.setattr(Journal, "write", real)
+        if calls["n"] <= k:                                               # every write of that run was let through
+            break
+        killed += 1
+        w.run(reconcile_only=True)
+        w.run(reconcile_only=True)
+        for event, key in (("settlement_pending", "pending_id"), ("buying_power", "reading_id")):
+            ids = [e[key] for e in w.entries(event)]
+            assert len(ids) == len(set(ids)), (k, event, ids)
+        st = w.state()
+        assert len(w.entries("settlement_pending")) == len(st.pending()) == 2, k
+        assert len(w.entries("buying_power")) == len(st.readings()), k
+        assert w.entries("settlement") == [] and st.settlements() == [], k
+    assert killed >= 2, killed
+
+
+def fork(w, path):
+    """A copy of the world at this moment (its files, the account and Kalshi), to try a way out on."""
+    shutil.copytree(w.dir, path)
+    v = World(path, held=dict(w.exchange.held))
+    v.exchange.cash, v.exchange.bp = w.exchange.cash, w.exchange.bp
+    v.markets, v.clock.t = copy.deepcopy(w.markets), w.clock.t
+    return v
+
+
+def way_out(w):
+    """The person's commands and runs, as a person uses them, from a stopped state: a run; Kalshi finalizing a record
+    a stop named as not finalized (the unknown only the venue resolves); each open record confirmed (with --units when
+    the refusal asks for it) or else withdrawn. "clean" when a run reconciles clean with nothing pending; else the
+    stop no command moved past (a dead end)."""
+    out = None
+    for _ in range(25):
+        out = w.run(reconcile_only=True)
+        if out["status"] == "done" and not out["pending_open"]:
+            return "clean"
+        if "not finalized" in (out["reason"] or ""):
+            for t, rec in w.markets.items():
+                if isinstance(rec, dict) and rec.get("status") != "finalized":
+                    w.markets[t] = {**rec, "status": "finalized"}
+            continue
+        moved = False
+        for r in w.state().open_pending():
+            got = confirm(w, r["id"])
+            m = re.search(r"--units (\d+) settles", got.get("reason") or "")
+            if got["status"] == "refused" and m:
+                got = confirm(w, r["id"], units=int(m.group(1)))
+            if got["status"] == "refused":
+                got = withdraw(w, r["id"])
+            moved = moved or got["status"] in ("confirmed", "withdrawn")
+        if not moved:
+            return out
+    return out
+
+
+@pytest.mark.parametrize("seed", range(100))
+def test_from_every_stopped_state_some_commands_reach_a_clean_reconcile(tmp_path, seed):
+    # Three names held at baseline; each step makes some go (Kalshi finalized, a win or a loss, or not yet
+    # finalized), brings a pending one back in full, or moves the cash a cent; a run after each. From EVERY stopped
+    # state on the way a copy of the world is driven by way_out, and it must reach a clean reconcile.
+    rng = random.Random(seed)
+    names = [f"{T}:yes", f"{OTHER}:yes", f"{THIRD}:yes"]
+    w = World(tmp_path / "w", held={n: rng.randint(1, 2) for n in names})
+    w.exchange.cash = 100000
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
+    stops = 0
+    for step in range(rng.randint(2, 7)):
+        kind = rng.choice(["vanish", "vanish", "back", "noise"])
+        held = [n for n in names if w.exchange.held.get(n)]
+        waiting = {r["symbol"]: r for r in w.state().open_pending()}
+        back = [n for n in waiting if not w.exchange.held.get(n)]
+        if kind == "vanish" and held:
+            for n in rng.sample(held, rng.randint(1, len(held))):
+                ticker, win = n.split(":")[0], rng.random() < 0.5
+                rec = {**(WIN if win else TONIGHT), "ticker": ticker}
+                if rng.random() < 0.25:
+                    rec["status"] = "determined"                           # Kalshi has not finalized it yet
+                w.markets[ticker] = rec
+                w.exchange.cash += 100 * w.exchange.held[n] if win else 0
+                w.exchange.held[n] = 0
+            if rng.random() < 0.3:
+                w.exchange.cash += rng.choice([-1, 1])                     # a cent from elsewhere beside it
+        elif kind == "back" and back:
+            n = rng.choice(back)
+            w.exchange.held[n] = int(waiting[n]["units"])
+        else:
+            w.exchange.cash += rng.choice([-1, 1])
+        out = w.run(reconcile_only=True)
+        if out["status"] == "stopped":
+            stops += 1
+            got = way_out(fork(w, tmp_path / f"fork{step}"))
+            assert got == "clean", (seed, step, got)
+    assert way_out(w) == "clean", seed
+
+
+# ---- addendum 4 C: never a crash or a number in place of "unknown"
+
+class StandInLedger:
+    """The ledger's public reads, with one order whose figures a test spoils."""
+
+    def __init__(self, order, rows):
+        self._order, self._rows = order, rows
+
+    def unapplied_fills(self):
+        return []
+
+    def orders(self, states=None):
+        return [dict(self._order)]
+
+    def fills(self, tag=None):
+        return [dict(r) for r in self._rows if tag is None or r["tag"] == tag]
+
+
+GOOD_ORDER = {"tag": "t", "symbol": f"{T}:yes", "units": 1.0, "state": "filled", "filled_units": 1.0,
+              "priced_units": 1.0, "priced_avg": 0.4, "fee": 0.01, "amount_unconfirmed": 0}
+GOOD_ROWS = [{"id": 1, "tag": "t", "symbol": f"{T}:yes", "units": 1.0, "price": 0.4, "price_covers_units": 1.0,
+              "fee": 0.01, "applied": 1}]
+
+
+def test_the_stand_in_ledger_is_good_as_it_is():
+    assert ep.known_cents(StandInLedger(GOOD_ORDER, GOOD_ROWS), []) == (-41, None)
+
+
+@pytest.mark.parametrize("field", ["units", "filled_units", "priced_units", "priced_avg", "fee", "state",
+                                   "amount_unconfirmed"])
+@pytest.mark.parametrize("bad", ["missing", None, float("nan"), "0.4", True, False])
+def test_a_spoiled_order_figure_is_unknown_never_a_crash_or_a_number(field, bad):
+    order = dict(GOOD_ORDER)
+    if bad == "missing":
+        del order[field]
+    else:
+        order[field] = bad
+    if field == "amount_unconfirmed" and bad is False:
+        pytest.skip("False is 0 as a bool: still a bool, refused below")
+    cents, why = ep.known_cents(StandInLedger(order, GOOD_ROWS), [])
+    assert cents is None and isinstance(why, str) and why, (field, bad, cents)
+
+
+def test_a_bool_for_amount_unconfirmed_and_a_state_not_the_ledgers_are_unknown():
+    for order in ({**GOOD_ORDER, "amount_unconfirmed": False}, {**GOOD_ORDER, "state": "settled_somehow"},
+                  {**GOOD_ORDER, "state": ["filled"]}, {**GOOD_ORDER, "tag": None}):
+        cents, why = ep.known_cents(StandInLedger(order, GOOD_ROWS), [])
+        assert cents is None and why, order
+    for rows in ([{**GOOD_ROWS[0], "id": True}], [{**GOOD_ROWS[0], "fee": "0.01"}], [{**GOOD_ROWS[0], "units": None}], []):
+        cents, why = ep.known_cents(StandInLedger(GOOD_ORDER, rows), [])
+        assert cents is None and why, rows
+
+
+def test_the_ledgers_states_are_listed_once_from_orders_py():
+    from valedia_trader.execution_and_risk.orders import STATES
+    assert ep.LEDGER_STATES == frozenset(STATES)
+    for state in STATES:
+        cents, why = ep.known_cents(StandInLedger({**GOOD_ORDER, "state": state}, GOOD_ROWS), [])
+        assert (cents is None) == (state in ("sent", "unknown")), (state, cents, why)
+
+
+# ---- addendum 4 D: after a withdrawal on a ticker Kalshi called finalized
+
+def test_after_a_withdrawal_a_purchase_on_that_ticker_waits_for_kalshi_to_read_not_finalized(tmp_path):
+    w, pid = pending_world(tmp_path)                                      # T pending on a finalized record
+    w.exchange.held[f"{T}:yes"] = 1
+    assert withdraw(w, pid)["status"] == "withdrawn"
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    w.clock.t += 10
+    out = buy(w)
+    assert out["status"] == "stopped" and out["stage"] == "settled" and "finalized" in out["reason"], out
+    assert w.exchange.placed() == []
+    w.markets[T] = {**TONIGHT, "status": "active", "result": "", "settlement_value_dollars": None}
+    w.clock.t += 10
+    out = buy(w)                                                          # the other way: Kalshi reads not finalized
+    assert out["status"] == "done" and len(w.exchange.placed()) == 1, out
+    assert w.state().pending()[0]["kalshi"]["status"] == "finalized"      # the record that said so stays
+
+
+def test_after_a_withdrawal_kalshi_unreadable_still_refuses_the_purchase(tmp_path):
+    w, pid = pending_world(tmp_path)
+    w.exchange.held[f"{T}:yes"] = 1
+    assert withdraw(w, pid)["status"] == "withdrawn"
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    w.markets[T] = kd.HttpError(500, "u")
+    out = buy(w)
+    assert out["status"] == "stopped" and out["stage"] == "settled" and w.exchange.placed() == [], out
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)                                   # another ticker is not held back
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"
+
+
+# ---- addendum 4 E: the tests the surviving mutants showed missing
+
+def test_an_order_left_sent_makes_the_cash_unknown_until_a_reconcile():
+    led, venue = OrderLedger(), CashVenue()
+    read(led, venue, [])
+
+    def died(symbol, units, tag, price=None, limit_price=None):           # the process dies inside the call
+        CashVenue.submit(venue, symbol, units, tag)
+        venue.fill(tag, 1, 40, 1)
+        raise SystemExit("killed")
+    venue.submit = died
+    led.intend("died", f"{T}:yes", 1.0, 0.5, limit_price=0.99)
+    with pytest.raises(SystemExit):
+        led.submit_once(venue, "died")
+    assert led.order("died")["state"] == "sent"
+    cents, why = ep.known_cents(led, [])
+    assert cents is None and "outcome" in why
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-41, None)
+
+
+def test_an_unconfirmed_amount_makes_the_cash_unknown_until_it_is_said():
+    led, venue = OrderLedger(), CashVenue()
+    tag = trade(led, venue, f"{T}:yes", 2, [(1, 40, 1)])
+    venue.give_amount = False
+    venue.cancel(tag)
+    read(led, venue, [])
+    assert led.order(tag)["amount_unconfirmed"] == 1
+    cents, why = ep.known_cents(led, [])
+    assert cents is None and "confirmed" in why
+    venue.give_amount = True
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-41, None)
+
+
+def test_a_fee_on_an_order_with_nothing_filled_is_counted():
+    led, venue = OrderLedger(), CashVenue()
+    tag = trade(led, venue, f"{T}:yes", 1, [])
+    venue.charge(tag, 1)
+    venue.cancel(tag)
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-1, None)
+    assert led.order(tag)["filled_units"] == 0
+
+
+@pytest.mark.parametrize("units", [0, True, False, -1, 2.0, "2"])
+def test_bad_units_are_refused_at_the_input_stage(tmp_path, units):
+    w, pid = pending_world(tmp_path)
+    before = person_state(w)
+    out = confirm(w, pid, units=units)
+    assert out["status"] == "refused" and out["stage"] == "input" and person_state(w) == before, out
