@@ -1786,6 +1786,13 @@ class Addendum4(Base):
         self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
         self.assertFalse(self.w.picks_loaded)
 
+    def test_A_another_runs_launcher_and_observer_are_never_signalled(self):
+        self.killed_run()
+        other = str(self.w.crew / 'valedia-native-20261116-swarm8-op999999')
+        self.w.commands[LAUNCHER_PID] = '/x/python -B mirofish_native_startup.py --work %s --gate g' % other
+        self.w.commands[OBSERVER_PID] = '/x/python -B %s/owned-source/observer-entry/mirofish_native_run.py' % other
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
+
     def test_A_the_right_command_with_a_wrong_start_is_never_signalled(self):
         self.killed_run()
         self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 13:33:33 2026'
