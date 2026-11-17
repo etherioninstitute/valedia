@@ -1,7 +1,8 @@
 """The locked "copying the leaders" test, on SYNTHETIC worlds made here with a seed (no real data, no network).
 
 Specification: docs/research/2026-11-17-copying-leaders-prediction.md (10ad062, time line 12a4454, amendment of
-2026-11-17 09:11 UTC in dec8dd7: the follower's price is the first taker purchase of the token after the hour)."""
+09:11 UTC in dec8dd7, second amendment of 09:35 UTC in a7b9379: the follower's price is the first point of the
+token's public price history at or after the hour, asked for over twelve hours, at a grain of three hours or finer)."""
 import json
 import random
 import urllib.parse
@@ -35,8 +36,8 @@ def R(cond, win_index=0, resolved_ts=None, payouts=None, status="resolved"):
                                    "resolved_ts": resolved_ts})
 
 
-def PR(ts, price, token="a", side="BUY", seq=0):
-    return cl.Print(ts, seq, side, token, Decimal(repr(price)))
+def PT(ts, price, res=3 * HOUR):
+    return cl.Point(ts, res, Decimal(repr(price)))
 
 
 # ------------------------------------------------------------------ money
@@ -141,65 +142,87 @@ def test_an_empty_event_is_left_out_and_counted():
     assert cl.position_skip(pos[0], {"c-a": R("c-a", 0, t0 + DAY)}) == "no_event"
 
 
-# ------------------------------------------------------------------ the follower's price: the first taker purchase
-def test_the_first_taker_buy_of_the_same_token_at_or_after_the_moment():
+# ------------------------------------------------------------------ the follower's price: the first recorded point
+def test_the_first_point_at_or_after_the_moment_at_three_hours_or_finer_before_the_resolution():
     moment = MS(2026, 3) + HOUR
-    prints = [PR(moment - 1, 0.40), PR(moment, 0.45, side="SELL"), PR(moment, 0.46, token="b"),
-              PR(moment + 5, 0.0), PR(moment + 6, 1.0), PR(moment + 10, 0.47), PR(moment + 20, 0.48)]
-    pr, why, passed = cl.follow_print(prints, "a", moment)
-    assert why is None and pr.price == Decimal("0.47")
-    assert passed == Counter({"print_not_a_buy": 1, "print_other_token": 1, "print_price_not_in_0_1": 2})
+    end = moment + 10 * DAY
+    pts = [PT(moment - 1, 0.40, 60), PT(moment + 60, 0.41, 3 * HOUR + 1), PT(moment + 7200, 0.47, 3 * HOUR),
+           PT(moment + 9000, 0.48, 300), PT(end, 1.0, 0)]
+    pt, why, passed = cl.follow_point(pts, moment, end)
+    assert why is None and pt.price == Decimal("0.47") and pt.resolution_seconds == 3 * HOUR
+    assert passed == Counter({"point_before_the_moment": 1, "point_coarser_than_3_hours": 1})
 
 
-@pytest.mark.parametrize("offset,found", [(0, True), (6 * HOUR, True), (6 * HOUR + 1, False), (-1, False)])
-def test_the_six_hour_window_after_the_moment_both_ends_included(offset, found):
+@pytest.mark.parametrize("offset,found", [(0, True), (12 * HOUR - 1, True), (12 * HOUR, False), (-1, False)])
+def test_the_twelve_hour_window_from_the_moment_start_included_end_not(offset, found):
     moment = MS(2026, 3) + HOUR
-    pr, why, _ = cl.follow_print([PR(moment + offset, 0.5)], "a", moment)
-    assert (pr is not None) == found
+    pt, why, _ = cl.follow_point([PT(moment + offset, 0.5)], moment, moment + 10 * DAY)
+    assert (pt is not None) == found
     if not found:
-        assert why == "no_buyer_print_after_the_hour"
+        assert why == "no_price_point_after_the_hour"
 
 
-def test_prints_in_the_same_second_are_taken_in_feed_order():
+def test_a_tie_on_time_takes_the_finer_grain_and_a_zero_grain_counts():
     moment = MS(2026, 3) + HOUR
-    pr, _, _ = cl.follow_print([PR(moment, 0.51, seq=2), PR(moment, 0.50, seq=1)], "a", moment)
-    assert pr.price == Decimal("0.5")
+    pt, _, _ = cl.follow_point([PT(moment + 600, 0.51, 3 * HOUR), PT(moment + 600, 0.50, 300)], moment,
+                               moment + DAY)
+    assert pt.price == Decimal("0.5")
+    pt, _, _ = cl.follow_point([PT(moment + 600, 0.52, 0)], moment, moment + DAY)
+    assert pt.price == Decimal("0.52")
 
 
-def _one(t0, prints, price=0.5, win_index=0, resolved=None, delay=HOUR):
+def test_a_point_at_or_after_the_resolution_is_never_a_price():
+    moment = MS(2026, 3) + HOUR
+    resolved = moment + 2 * HOUR
+    pt, why, passed = cl.follow_point([PT(resolved, 0.5, 0), PT(resolved + 60, 0.5)], moment, resolved)
+    assert pt is None and why == "no_price_point_after_the_hour"
+    assert passed == Counter({"point_at_or_after_resolution": 2})
+
+
+def _one(t0, points, price=0.5, win_index=0, resolved=None, delay=HOUR):
     pos = cl.new_positions([T("L", t0, "a", price=price)])
     res = {"c-a": R("c-a", win_index, resolved or t0 + 10 * DAY)}
-    return cl.copy_trades(pos, res, {"c-a": prints}, delay=delay)
+    return cl.copy_trades(pos, res, {cl.price_key("a", t0 + delay): points}, delay=delay)
 
 
 @pytest.mark.parametrize("fp,ok", [(0.05, True), (0.95, True), (0.0499, False), (0.9501, False)])
 def test_the_0_05_to_0_95_guard_on_the_followers_price(fp, ok):
     t0 = MS(2026, 3) + DAY
-    trades, skips = _one(t0, [PR(t0 + HOUR + 60, fp)])
+    trades, skips = _one(t0, [PT(t0 + HOUR + 60, fp)])
     assert (len(trades) == 1) == ok
     if not ok:
         assert skips == Counter({"follow_price_outside_0.05_0.95": 1})
 
 
-def test_a_copied_trade_carries_event_price_outcome_and_wait():
+def test_a_copied_trade_carries_event_price_outcome_wait_and_grain():
     t0 = MS(2026, 3) + DAY
-    trades, skips = _one(t0, [PR(t0 + HOUR - 5, 0.30), PR(t0 + HOUR + 90, 0.524)], win_index=0)
+    trades, skips = _one(t0, [PT(t0 + HOUR - 5, 0.30), PT(t0 + HOUR + 90, 0.524, 300)], win_index=0)
     assert not skips and len(trades) == 1
     c = trades[0]
-    assert (c.event, c.price_cents, c.win, c.leader, c.wait_seconds) == ("ev", 52, True, "L", 90)
-    trades, _ = _one(t0, [PR(t0 + HOUR + 90, 0.524)], win_index=1)
+    assert (c.event, c.price_cents, c.win, c.leader, c.wait_seconds, c.grain) == ("ev", 52, True, "L", 90, 300)
+    trades, _ = _one(t0, [PT(t0 + HOUR + 90, 0.524)], win_index=1)
     assert trades[0].win is False
 
 
-def test_no_market_feed_no_print_and_resolved_before_the_follow_are_counted():
+def test_no_window_no_point_and_resolved_before_the_follow_are_counted():
     t0 = MS(2026, 3) + DAY
     pos = cl.new_positions([T("L", t0, "a")])
     trades, skips = cl.copy_trades(pos, {"c-a": R("c-a", 0, t0 + 10 * DAY)}, {}, delay=HOUR)
-    assert not trades and skips == Counter({"no_market_feed": 1})
-    trades, skips = _one(t0, [PR(t0 + HOUR - 1, 0.5), PR(t0 + 7 * HOUR + 1, 0.5)])
-    assert not trades and skips == Counter({"no_buyer_print_after_the_hour": 1})
-    trades, skips = _one(t0, [PR(t0 + HOUR, 0.5)], resolved=t0 + HOUR)
+    assert not trades and skips == Counter({"no_price_window": 1})
+    trades, skips = _one(t0, [PT(t0 + HOUR - 1, 0.5), PT(t0 + 13 * HOUR, 0.5)])
+    assert not trades and skips == Counter({"no_price_point_after_the_hour": 1})
+    trades, skips = _one(t0, [PT(t0 + HOUR, 0.5)], resolved=t0 + HOUR)
     assert not trades and skips == Counter({"resolved_before_follow": 1})
+
+
+def test_when_the_only_point_before_the_resolution_is_the_settlement_point_the_trade_is_left_out():
+    """The market resolves 90 minutes after the hour; the window holds only its terminal settlement point (grain 0,
+    stamped at the resolution, a winner's price 1.0 or a price inside the guard): left out, never a gain."""
+    t0 = MS(2026, 3) + DAY
+    resolved = t0 + HOUR + 5400
+    for price in (1.0, 0.94):
+        trades, skips = _one(t0, [PT(resolved, price, 0)], resolved=resolved)
+        assert not trades and skips == Counter({"no_price_point_after_the_hour": 1})
 
 
 # ------------------------------------------------------------------ standing and leaders
@@ -287,8 +310,8 @@ def test_event_p_is_seeded_and_counts_resamples_not_above_zero():
 
 
 def test_the_event_is_the_unit():
-    trades = [cl.CopiedTrade("e1", 50, True, "L", 0, "a", 0, 0, 0, False)] * 3 + \
-             [cl.CopiedTrade("e2", 50, False, "L", 0, "b", 0, 0, 0, False)]
+    trades = [cl.CopiedTrade("e1", 50, True, "L", 0, "a", 0, 0, 0, 300, False)] * 3 + \
+             [cl.CopiedTrade("e2", 50, False, "L", 0, "b", 0, 0, 0, 300, False)]
     ev = cl.evaluate(trades, 3)
     assert (ev["trades"], ev["events"], ev["total_cents"]) == (4, 2, 3 * 47 - 53)
 
@@ -304,14 +327,18 @@ def _next(ym):
 
 
 class World:
-    """Wallets, trades, resolutions and each market's taker prints, made with a seed. `edge`: how much more often than
-    the price says a pro's new position wins; `move`: how far the price jumps at the pro's purchase (and stays)."""
+    """Wallets, trades, resolutions and each outcome token's public price history, made with a seed. `edge`: how much
+    more often than the price says a pro's new position wins; `move`: how far the price jumps at the pro's purchase
+    (and stays). Asked for a window [start, end), the history serves: a bucket stamped two hours before `start` (not
+    at or after the moment: never used), a six-hour point 30 s after `start` (coarser than three hours: never used),
+    the first usable point 120 s after `start` at the grain of its age (five minutes from 2026 on, three hours
+    before), and a terminal point of grain 0 one second before `end`."""
 
     def __init__(self, seed, edge, move, pros=12, per_month=30, months=ALL_MONTHS, market_makers=2, late_rich=False):
         self.rng = random.Random(seed)
         self.trades: dict[str, list[dict]] = {}
         self.res: dict[str, dict] = {}
-        self.prints: dict[str, list[dict]] = {}
+        self.prices: dict[str, list] = {}            # token -> [t1, price before t1, price from t1 on]
         self.n = 0
         for ym in months:
             for i in range(pros):
@@ -338,9 +365,16 @@ class World:
         self.trades.setdefault(wallet, []).append(self._row(wallet, ts, token, cond, side, price, size, event, oi,
                                                             self.n))
 
-    def _print(self, ts, token, cond, side, price, oi=0):
-        self.prints.setdefault(cond, []).append(self._row("0xtaker", ts, token, cond, side, price, 25.0, "ev", oi,
-                                                          len(self.prints.get(cond, []))))
+    @staticmethod
+    def grain(t1):
+        return 300 if t1 >= MS(2026, 1) else 3 * HOUR
+
+    def history(self, token, start, end):
+        if token not in self.prices:
+            return []
+        t1, before, after = self.prices[token]
+        pts = [(start - 2 * HOUR, 3 * HOUR), (start + 30, 6 * HOUR), (start + 120, self.grain(t1)), (end - 1, 0)]
+        return [{"price": before if ts < t1 else after, "resolution_seconds": r, "timestamp": ts} for ts, r in pts]
 
     def position(self, wallet, ym, edge, move, win=None, cash=None):
         self.n += 1
@@ -358,14 +392,8 @@ class World:
         payouts[oi if win else 1 - oi] = 1_000_000
         self.res[cond] = {"condition_id": cond, "status": "resolved", "payouts": payouts, "resolved_ts": rts,
                           "resolved_at": "x"}
-        after = round(min(0.95, p + move), 4)
-        # before the purchase the market trades at p; from the purchase on, at p + move
-        self._print(t1 - HOUR, token, cond, "BUY", p, oi)
-        self._print(t1 + HOUR - 60, token, cond, "BUY", after, oi)
-        self._print(t1 + HOUR, token, cond, "SELL", round(max(0.01, p - 0.05), 2), oi)    # a sale: not a purchase
-        self._print(t1 + HOUR, token + "o", cond, "BUY", round(1 - p, 2), 1 - oi)          # the other outcome
-        for at in (HOUR + 120, 6 * HOUR + 30, 10 * 60 + 30, DAY + 30):
-            self._print(t1 + at, token, cond, "BUY", after, oi)
+        # before the purchase the market is at p; from the purchase on, at p + move
+        self.prices[token] = [t1, p, round(min(0.95, p + move), 4)]
         return t1
 
     def market_maker(self, wallet, ym):
@@ -379,10 +407,6 @@ class World:
                               "resolved_at": None}
         for _ in range(35):
             self.position(wallet, ym, 0.3, 0, cash=1000.0)
-
-    def feed(self, cond, since, until):
-        return [r for r in sorted(self.prints.get(cond, []), key=lambda r: -r["timestamp"])
-                if since <= r["timestamp"] <= until]
 
     def write_phase1(self, s, unfinished_wallet=None):
         boards = {"all": pd.Walk.from_rows([{"rank": i + 1, "user_id": w, "pnl": 1.0, "volume": 1.0}
@@ -401,28 +425,34 @@ class World:
             s.finish_resolutions(batch, pd.Walk.from_rows([self.res[c] for c in batch], "2026-11-17T09:02:00Z"),
                                  {c: "row" for c in batch})
 
-    def write(self, path, unfinished_wallet=None, skip_market=None, phase2=True):
-        """`skip_market(target)` -> None, "unfinished" (started, never finished) or "unstarted"."""
+    def _windows(self, s, plan, windows, skip_window):
+        for key, wd in sorted(windows.items()):
+            how = skip_window(plan[wd.target]) if skip_window else None
+            if how == "unstarted":
+                continue
+            s.start_walk("prices", key)
+            if how != "unfinished":
+                s.finish_prices(key, pd.Walk.from_rows(self.history(wd.token, wd.start, wd.start + cl.PRICE_SPAN),
+                                                       "2026-11-17T09:03:00Z"))
+
+    def write(self, path, unfinished_wallet=None, skip_window=None, phase2=True):
+        """`skip_window(target)` -> None, "unfinished" (started, never finished) or "unstarted", for every price
+        window of that planned position."""
         with cl.Store(path) as s:
             self.write_phase1(s, unfinished_wallet)
             if phase2:
                 plan = cl.plan_store(s, leave_out=[unfinished_wallet] if unfinished_wallet else [])
-                for key, tg in sorted(plan.items()):
-                    how = skip_market(tg) if skip_market else None
-                    if how == "unstarted":
-                        continue
-                    s.start_walk("market", key)
-                    if how != "unfinished":
-                        s.finish_market(key, tg.condition, tg.t1, pd.Walk.from_rows(
-                            self.feed(tg.condition, tg.t1, tg.t1 + cl.FEED_AFTER), "2026-11-17T09:03:00Z"))
+                self._windows(s, plan, s.plan_windows(), skip_window)
+                self._windows(s, plan, cl.add_ten_minute_windows(s), skip_window)
         return path
 
 
 def _first(month, record):
-    """A skip_market that marks the first planned window of `month` and records its target."""
+    """A skip_window that marks every window of the first planned position of `month` and records it."""
     def f(tg):
-        if tg.month == month and not record:
-            record.append(tg)
+        if tg.month == month and (not record or record[0] == tg):
+            if not record:
+                record.append(tg)
             return f.how
         return None
     return f
@@ -450,15 +480,20 @@ def test_skill_with_a_small_move_passes_step_1(skilled, tmp_path):
     # the market makers trade 50 shares a dollar: never a leader, whatever their profit
     assert all(not any(w.startswith("mm") for w in m["leaders"]) for m in r["month_table"])
     assert r["wallet_skips"]["20_or_more_shares_per_dollar"] > 0
-    # every copied trade priced from the purchase 120 s after the hour: not the sale, not the other token
+    # every copied trade priced from the point 120 s after the hour: not the earlier bucket, not the coarse point
     assert r["position_skips"] == {}
-    assert r["information"]["follow_print_wait"]["seconds_after_the_moment"] == {"60_to_599": s["trades"]}
+    fp = r["information"]["follow_point"]
+    assert fp["delay_seconds"] == {"median": 120, "p90": 120}
+    assert sum(fp["grain_seconds"].values()) == s["trades"] and set(fp["grain_seconds"]) == {"300", "10800"}
+    assert fp["points_passed_over"]["point_before_the_moment"] == s["trades"]
+    assert fp["points_passed_over"]["point_coarser_than_3_hours"] == s["trades"]
 
 
 def test_a_price_that_jumps_at_the_purchase_gives_the_follower_nothing(tmp_path):
-    """The bias the amendment closes: the market trades at p until the leader buys, then at p + 0.08 for good, and
-    the leader's outcome wins 8 cents more often than p says. A follower priced from before the jump would gain
-    about 5 cents (8 less the cost of 3); priced from a purchase after the hour, the follower has nothing."""
+    """The bias the amendments close: the market is at p until the leader buys, then at p + 0.08 for good, and the
+    leader's outcome wins 8 cents more often than p says. Each window also serves a bucket stamped before the hour
+    at p. A follower priced from before the jump would gain about 5 cents (8 less the cost of 3); priced from the
+    first point at or after the hour, the follower has nothing."""
     store = World(7, edge=0.08, move=0.08, **SKILLED_SIZE).write(tmp_path / "s.sqlite")
     r = cl.run_develop(store=store, out_dir=tmp_path / "out")["result"]
     s = r["step_1"]
@@ -473,12 +508,19 @@ def test_development_months_and_the_information_tables(skilled, tmp_path):
     assert months[0] == "2025-12" and months[-1] == "2026-06"          # three months of feed before the first
     info = r["information"]
     for key in ("delay_10_minutes", "delay_6_hours", "delay_24_hours", "cost_2_cents", "cost_0_cents", "sports",
-                "everything_else", "first_purchase_over_10000", "leaders_own_prices", "follow_print_wait"):
+                "everything_else", "first_purchase_over_10000", "leaders_own_prices", "follow_point",
+                "cost_4_cents"):
         assert info[key]["note"] == "information: decides nothing", key
     assert info["cost_0_cents"]["mean_cents"] == pytest.approx(r["step_1"]["mean_cents"] + 3)
+    assert info["cost_4_cents"]["mean_cents"] == pytest.approx(r["step_1"]["mean_cents"] - 1)
     assert info["leaders_own_prices"]["trades"] == r["step_1"]["trades"]
-    for k in ("delay_10_minutes", "delay_6_hours", "delay_24_hours"):          # each horizon has its own print
+    for k in ("delay_6_hours", "delay_24_hours"):                               # each horizon has its own window
         assert info[k]["trades"] == r["step_1"]["trades"], k
+    # the 10-minute figure only where a five-minute grain exists (2026 here), with its count
+    grains = info["follow_point"]["grain_seconds"]
+    ten = info["delay_10_minutes"]
+    assert ten["trades"] == grains["300"] and 0 < ten["trades"] < r["step_1"]["trades"]
+    assert ten["position_skips"] == {"main_point_coarser_than_5_minutes": grains["10800"]}
     sb = r["sells_beyond_holding"]
     assert sb["wallets_with_sells_beyond_holding"] == 0 and sb["leader_window_sells"] == 0
 
@@ -490,6 +532,7 @@ def test_develop_writes_its_file_and_hash(skilled, tmp_path):
     assert (tmp_path / "out" / "develop.json.sha256").read_text().strip() == hashlib.sha256(raw).hexdigest()
     assert json.loads(raw)["provenance"]["prediction_commit"] == "10ad062"
     assert json.loads(raw)["provenance"]["amendment_commit"] == "dec8dd7"
+    assert json.loads(raw)["provenance"]["second_amendment_commit"] == "a7b9379"
 
 
 # ------------------------------------------------------------------ walk-forward and the period wall
@@ -513,7 +556,7 @@ def test_develop_never_reads_or_uses_a_sealed_month(skilled, tmp_path):
     base = cl.run_develop(store=skilled, out_dir=tmp_path / "o1")["result"]
     data = cl.load(skilled, "development")
     assert max(t.ts for ts in data.trades.values() for t in ts) < cl.SEALED_START + cl.SPILL
-    assert max(p.ts for ps in data.prints.values() for p in ps) <= cl.SEALED_START + cl.FEED_AFTER
+    assert max(p.ts for ps in data.points.values() for p in ps) < cl.SEALED_START + cl.DAY + cl.PRICE_SPAN
     w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
     for rows in w.trades.values():
         for r in rows:
@@ -523,10 +566,9 @@ def test_develop_never_reads_or_uses_a_sealed_month(skilled, tmp_path):
     for c, r in w.res.items():
         if r["resolved_ts"] and r["resolved_ts"] >= cl.SEALED_START + 50 * DAY:
             r["payouts"] = list(reversed(r["payouts"]))
-    for c, rows in w.prints.items():
-        for r in rows:
-            if r["timestamp"] >= cl.SEALED_START + cl.FEED_AFTER + 1:
-                r["price"] = 0.06
+    for tok, pr in w.prices.items():                   # every price of a sealed position's history
+        if pr[0] >= cl.SEALED_START:
+            pr[1] = pr[2] = 0.06
     poisoned = cl.run_develop(store=w.write(tmp_path / "p.sqlite"), out_dir=tmp_path / "o2")["result"]
     assert poisoned == base
 
@@ -585,7 +627,7 @@ def test_sealed_refuses_before_its_marker_when_a_sealed_window_was_not_pulled(tm
     rec = []
     skip = _first((2026, 8), rec)
     skip.how = how
-    store = World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / "s.sqlite", skip_market=skip)
+    store = World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / "s.sqlite", skip_window=skip)
     assert rec and rec[0].month == (2026, 8)
     out = tmp_path / "out"
     assert cl.run_develop(store=store, out_dir=out)["result"]["step_1"]["verdict"] == "PROCEED"
@@ -610,11 +652,11 @@ def test_an_unfinished_pull_is_refused_unless_told_which_wallets_to_leave_out(tm
     assert "pro03" in cl.format_table(doc)
 
 
-def test_an_unfinished_market_window_names_the_leader_that_needs_it(tmp_path):
+def test_an_unfinished_price_window_names_the_leader_that_needs_it(tmp_path):
     rec = []
     skip = _first((2026, 2), rec)
     skip.how = "unfinished"
-    store = World(9, edge=0.1, move=0.0, pros=8, per_month=20).write(tmp_path / "s.sqlite", skip_market=skip)
+    store = World(9, edge=0.1, move=0.0, pros=8, per_month=20).write(tmp_path / "s.sqlite", skip_window=skip)
     owner = sorted(rec[0].wallets)[0]
     with pytest.raises(cl.Refused, match=owner):
         cl.run_develop(store=store, out_dir=tmp_path / "o")
@@ -693,7 +735,7 @@ def test_pull_phase_1_reads_the_boards_once_and_a_second_run_asks_only_for_what_
     assert svc3.urls == []
 
 
-def test_pull_phase_2_reads_the_market_feed_only_for_the_leaders_qualifying_positions(tmp_path):
+def test_pull_phase_2_reads_price_windows_only_for_the_leaders_qualifying_positions(tmp_path):
     w = World(9, edge=0.1, move=0.0, pros=8, per_month=20)
     store = w.write(tmp_path / "s.sqlite", phase2=False)
     urls = []
@@ -701,20 +743,24 @@ def test_pull_phase_2_reads_the_market_feed_only_for_the_leaders_qualifying_posi
     def transport(url):
         urls.append(url)
         q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
-        assert urllib.parse.urlsplit(url).path == "/v2/trades" and "user" not in q
-        rows = sorted(w.prints.get(q["condition"], []), key=lambda r: -r["timestamp"])
-        return json.dumps({"data": rows, "pagination": {"limit": 1000, "offset": 0, "has_more": False,
+        assert urllib.parse.urlsplit(url).path == "/v2/prices-history" and set(q) == {"token_id", "start", "end"}
+        rows = w.history(q["token_id"], int(q["start"]), int(q["end"]))
+        return json.dumps({"data": rows, "pagination": {"limit": 10000, "offset": 0, "has_more": False,
                                                         "next_cursor": None}}).encode()
     said = []
     cl.pull(store, _client(transport), phase=2, say=said.append)
     with cl.Store(store) as s:
         plan = s.plan()
+        windows = s.plan_windows()
+        meta = s.meta("plan")
         books = cl.books_of(cl.load(store, "development"))
-    assert plan and len(urls) == len(plan)
-    assert "%d" % len(plan) in said[0] and "requests" in said[0]
-    assert all("taker_only=true" in u for u in urls)
-    assert {dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query))["condition"] for u in urls} == \
-        {tg.condition for tg in plan.values()}
+    asked = {(q["token_id"], int(q["start"]), int(q["end"]))
+             for q in (dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query)) for u in urls)}
+    base = {(tg.token, tg.t1 + d, tg.t1 + d + 12 * HOUR) for tg in plan.values() for d in (HOUR, 6 * HOUR, DAY)}
+    ten = {(tg.token, tg.t1 + 600, tg.t1 + 600 + 12 * HOUR) for tg in plan.values() if w.grain(tg.t1) <= 300}
+    assert plan and ten and asked == base | ten and len(urls) == len(asked) == len(windows)
+    assert meta["ten_minute_windows_added"] is True
+    assert "%d" % len(base) in said[0] and "requests" in said[0]           # counted before the first request
     for tg in plan.values():                          # only the month's leaders, only the month's positions
         assert set(tg.wallets) <= set(cl.leaders_of(books, tg.month)[0]) or tg.month >= (2026, 7)
         assert cl.month_of(tg.t1) == tg.month

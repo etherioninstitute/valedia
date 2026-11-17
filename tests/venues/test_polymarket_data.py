@@ -345,9 +345,34 @@ def test_resolutions_refuse_a_paged_answer():
         c.resolutions(["0x1"])
 
 
-def test_the_price_history_route_is_gone():
-    assert not hasattr(pd.PolymarketData, "prices_history")
-    assert not hasattr(pd, "validate_price_point")
+def test_prices_history_window_walk_and_point_shapes():
+    def h(p, q):
+        assert p == "/v2/prices-history"
+        if "cursor" not in q:
+            assert q == {"token_id": "111", "start": "100", "end": "200"}
+            return page([{"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
+                         {"price": True, "resolution_seconds": 300, "timestamp": 400}], True, "p1")
+        assert q == {"token_id": "111", "start": "100", "end": "200", "cursor": "p1"}
+        return page([{"price": 0.45, "resolution_seconds": 0, "timestamp": 150},
+                     {"price": 0.5, "resolution_seconds": -1, "timestamp": 160},
+                     {"price": float("nan"), "resolution_seconds": 0, "timestamp": 170}])
+    c, t, clock = client(h)
+    w = c.prices_history("111", 100, 200)
+    assert [(r["timestamp"], r["price"], r["resolution_seconds"]) for r in w.rows] == [(100, 0.4, 300), (150, 0.45, 0)]
+    assert dict(w.rejects) == {"bad_price": 2, "bad_resolution_seconds": 1}
+    for start, end in ((200, 100), (0, 100), (True, 100)):
+        with pytest.raises(ValueError):
+            c.prices_history("111", start, end)
+
+
+def test_an_empty_price_window_is_a_finished_walk_with_no_points():
+    c, t, clock = client(lambda p, q: page([]))
+    w = c.prices_history("111", 100, 200)
+    assert w.rows == [] and w.pages == 1
+
+
+def test_the_market_trade_feed_is_gone():
+    assert not hasattr(pd.PolymarketData, "market_trades")
 
 
 def test_resolutions_are_batched_by_twenty_and_a_short_answer_is_recorded_per_id():
@@ -362,60 +387,6 @@ def test_resolutions_are_batched_by_twenty_and_a_short_answer_is_recorded_per_id
     assert len(answers) == 45
     assert answers["0x7"] == "no_row" and answers["0x1"] == "row" and answers["0x8"] == "row_and_reject"
     assert out[0][1].rejects == {"bad_payouts": 1}
-
-
-# ------------------------------------------------------------------ the market's own trade feed
-def mrow(ts, side="BUY", token="111", cond="0xc1", price=0.5, i=0):
-    return trade(i, proxy_wallet="0xtaker%d" % i, timestamp=ts, side=side, token_id=token, condition_id=cond,
-                 price=price)
-
-
-def test_market_trades_reads_newest_first_keeps_the_window_and_stops_below_its_start():
-    pages = {None: page([mrow(500), mrow(300), mrow(250)], True, "m1"),
-             "m1": page([mrow(200), mrow(150), mrow(99), mrow(50)], True, "m2")}
-    c, t, clock = client(lambda p, q: pages[q.get("cursor")])
-    w = c.market_trades("0xc1", 100, 300)
-    assert [r["timestamp"] for r in w.rows] == [300, 250, 200, 150]
-    assert w.pages == 2 and w.outside == {"after_window": 1, "before_window": 1}
-    qs = t.queries()
-    assert qs[0] == {"condition": "0xc1", "taker_only": "true", "limit": "1000"}
-    assert qs[1] == {"condition": "0xc1", "taker_only": "true", "cursor": "m1"}
-    assert len(qs) == 2                                    # "m2" is never asked: the window's start was passed
-
-
-def test_market_trades_end_of_feed_before_the_window_start_is_a_finished_walk():
-    c, t, clock = client(lambda p, q: page([mrow(300), mrow(200)]))
-    w = c.market_trades("0xc1", 100, 400)
-    assert [r["timestamp"] for r in w.rows] == [300, 200]
-
-
-def test_market_trades_refuse_a_feed_that_is_not_newest_first():
-    c, t, clock = client(lambda p, q: page([mrow(200), mrow(300)]))
-    with pytest.raises(pd.PolymarketDataError, match="newest-first"):
-        c.market_trades("0xc1", 100, 400)
-
-
-def test_market_trades_rows_of_another_market_or_the_wrong_shape_are_counted():
-    c, t, clock = client(lambda p, q: page([mrow(300), mrow(290, cond="0xother"), mrow(280, price=None), mrow(270)]))
-    w = c.market_trades("0xc1", 100, 400)
-    assert [r["timestamp"] for r in w.rows] == [300, 270]
-    assert dict(w.rejects) == {"other_condition": 1, "bad_price": 1}
-
-
-def test_market_trades_page_cap_raises():
-    c, t, clock = client(lambda p, q: page([mrow(10 ** 6 - int(q.get("cursor", "0")))], True,
-                                           str(int(q.get("cursor", "0")) + 1)))
-    with pytest.raises(pd.PageCapHit):
-        c.market_trades("0xc1", 100, 10 ** 7, page_cap=3)
-
-
-def test_market_trades_refuse_a_bad_window():
-    c, t, clock = client(lambda p, q: page([]))
-    for since, until in ((300, 100), (0, 100), (True, 100)):
-        with pytest.raises(ValueError):
-            c.market_trades("0xc1", since, until)
-    with pytest.raises(ValueError):
-        c.market_trades("0xc1,0xc2", 1, 2)
 
 
 def test_validate_number_helper_fails_closed():
