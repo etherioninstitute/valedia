@@ -1070,7 +1070,8 @@ class TMF5PreflightTests(unittest.TestCase):
         from datetime import datetime, timezone
         sample = HostResourceCapsuleTests().sample()
         sample.update(monotonic=time.monotonic(), utc=datetime.now(timezone.utc).isoformat(), host_deadline=time.monotonic() + 30, source_sha256=self.startup.digest(self.startup.__file__),
-                      prompt_cache_route=dict(sample["prompt_cache_route"], device=self.startup.CACHE_DEVICE, ssd_device=self.startup.CACHE_DEVICE), **fields)
+                      prompt_cache_route=dict(sample["prompt_cache_route"], device=self.startup.CACHE_DEVICE, ssd_device=self.startup.CACHE_DEVICE))
+        sample.update(fields)
         if drop: sample.pop(drop)
         mac = hmac.new(self.KEY.encode(), encoded(sample), hashlib.sha256).hexdigest() if sign else "0" * 64
         self.startup.atomic(self.host / "sample.json", {"sample": sample, "mac": mac})
