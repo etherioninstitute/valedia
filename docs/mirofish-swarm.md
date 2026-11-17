@@ -338,6 +338,62 @@ staged folder, and a mismatch shows in about a minute instead of at an agent's t
 cd tools && nice -n 15 $PY -B mirofish_format_qualify.py --work <staged folder> --profile qwen3-8b --out <new folder> --owner-approved-load
 ```
 
+## Beside the order-book collector (TMF5, 2026-11-17)
+
+The collector's decision model (Elephant-1, `valedia_trader/core/decision_model.py` `FILE`) stays loaded in LM Studio for
+the whole run. The SDK the run uses does not list it, so the ownership guard never saw it; its process was counted in the run's
+own resident memory. TMF5 addendum 1 changed four things, all in the staged copies of the pinned `src/` revisions (staging with
+a model or a plan takes `mirofish_native_run.py`, `mirofish_native_startup.py` and `mirofish_native_gateway.py` from `src/`,
+each pinned by hash in `tools/mirofish_native_stage.py`; `mirofish_native_model.py` is unchanged).
+
+**The co-resident, by identity.** A process is the co-resident when its executable is LM Studio's `llama-server` and its
+`--model` argument, made absolute and resolved with `realpath`, equals the declared file resolved the same way (a path that
+only starts with it, contains it, differs by case or ends in a slash is not it). Its row is left out of
+`owned_scope_rss_bytes`; each sample records `co_resident_rss_bytes` and `co_resident_rows` (0 when it is absent, which is
+never an error: the collector's keeper may reload it under a new pid). Two such processes in one sample stop the run. Every
+other LM Studio process counts as before. The argument list is read only for `llama-server` rows and only the `--model` value
+is kept: it carries an internal access key, and no argument text is written anywhere. Staging writes `FILE` into each staged
+startup copy and refuses a plan whose own serving file resolves to it.
+
+**The stop rule.** The start check is one reading against the start threshold. While running, the run stops when any of
+these holds: the kernel's pressure level (`kern.memorystatus_vm_pressure_level`) is 4 on any sample; it is 2 or more on every
+sample for 10 s; free memory is below 30% on every sample for 10 s; or there is no fresh, valid reading for 3 s (a level that
+is not exactly 1, 2 or 4 is not a reading). The owned memory bound (40 GiB) still holds on every sample. On the four recorded
+runs of 2026-11-15 (`swarm8-b2q8-b`, `-c`, `-d`, `swarm48-b2q8-a`) none of these stops; the lowest 10-second levels (the lowest,
+over the run, of the highest free reading in any 10-second window) are 37, 38, 69 and 68. Swap used is recorded in every
+sample and stops nothing. The receipt's `resource` block carries `lowest_sustained_free_percent_10s`, `max_pressure_level`
+and `co_resident_rss_bytes_max`; `builder/observer-identity.json` (pid, ps start string, process group, time) is written right
+after the observer is spawned.
+
+**The start threshold** is `floor + margin + setup_cost + fall` from the table `START_TERMS` in
+`tools/mirofish_swarm_limits.py`, each value with its source: 30 + 10 + 24 + 10 = 74% free, for every model named. The lead
+replaces `setup_cost` and `fall` with figures from a load-only test beside the collector; that is a change to the table and
+its source strings only. Without a model the W16 bytes keep the reviewed 65.
+
+**No silent fall-back.** Where the producer fell back to default time or event settings, rule-based agent settings or a
+rule-based persona after a refused call, it now raises in the native route. The report's graph search sends its query cut to
+the gateway's text limit (1,536 bytes) at a character boundary; the original size travels on the call
+(`query_truncated_from_bytes`) and the call is served. A refused search is no longer degraded to local search. The gateway
+records every refused request; after preparation, the simulation and the report the run fails on any refused, incomplete
+or cancelled call. The format check (`tools/mirofish_format_qualify.py`) imports `mirofish_native_startup` from the staged
+entry as its fourth pinned module, so it runs with no hand-set path.
+
+### Where an agent turn's time goes (recorded, 2026-11-15)
+
+The "fixed overhead" of about 6 s a turn was model time and queueing, not admission or dispatch. From the gateway ledgers and
+call records of `swarm8-b2q8-d` (9 participants) and `swarm48-b2q8-a` (48), every `qwen3-8b` chat call (probes included):
+
+| participants | calls | model time, median (90th pct) | queueing behind other calls, median (90th pct) | prompt / completion tokens, median |
+|---|---|---|---|---|
+| 9 | 56 | 3.5 s (7.7 s) | 3.2 s (7.2 s) | 2,388 / 65 |
+| 48 | 320 | 5.9 s (19.4 s) | 5.5 s (19.1 s) | 2,733 / 62 |
+
+Model time is the gateway's own dispatch-to-response time (LM Studio's `created` stamp, at 1 s resolution, gives 4.2 s and
+6.3 s). Arrival to dispatch, besides the queue, is under the 1 s resolution of the records. The setup model's chats
+(`ternary-bonsai-2-27b`) took 11.6 s at 9 participants and 33.3 s at 48 (median); embeddings 0.02 to 0.03 s. Calls are
+serial by design (one request in flight per platform, one serial gateway queue), so at 48 participants a turn waits about
+as long as it runs. Nothing was removed: no admission or ownership check costs a measurable share of a turn.
+
 ## Stage, gate, launch
 
 Each staged folder can be launched once. A gate is a small file naming the staged candidate's hash and an expiry at most
