@@ -333,7 +333,10 @@ def _accept(raw: dict, role: Role, market: str, universe: list[str], ledger: Hyp
         draft["risk"] = risk
     try:
         st.RuleStrategy.from_spec(draft)
-        prediction = Prediction(**{k: float(v) for k, v in (raw.get("prediction") or {}).items() if k != "notes"})
+        # the numbers only: a claim in the reply is ignored (this path always writes an edge claim; "exposure" is set
+        # only by a person passing the argument), and so are its notes
+        stated = raw.get("prediction") if isinstance(raw.get("prediction"), dict) else {}
+        prediction = Prediction(**{k: float(v) for k, v in stated.items() if k not in ("notes", "claim")}, claim="edge")
     except (st.SpecError, ValueError, TypeError) as exc:
         return {**out, "reason": f"not testable as written: {exc}"}
     try:

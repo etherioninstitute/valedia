@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from valedia_trader.research_loop import LoopPaths
+from valedia_trader.research_loop import gauntlet as gt
 from valedia_trader.research_loop import ledger as lg
 from valedia_trader.research_loop import research as rs
 from valedia_trader.research_loop import strategy as st
@@ -635,3 +636,19 @@ def test_the_three_wording_fixes_read_exactly_so_in_the_prompt_and_nothing_else_
 def test_the_move_sentence_still_takes_its_numbers_from_the_definition():
     d = dataclasses.replace(rs.PRICE_COLUMNS["move_5d_in_sd"], window=7, baseline_window=45)
     assert d.text == NEW_MOVE.replace("5", "7").replace("60", "45")
+
+
+def test_a_model_reply_never_sets_the_claim(env):
+    """T39-2b: the automatic path always writes an edge claim; a claim (or notes) in the reply is dropped, not read as a
+    number, so the idea is neither thrown out as untestable nor recorded as an exposure claim."""
+    paths, ledger, px = env
+    base = idea()["prediction"]
+    replies = [idea(prediction={**base, "claim": "exposure"}),
+               idea("Utility funds rise in the week after a rate cut is priced", prediction={**base, "claim": 7, "notes": "x"}),
+               idea("Tech funds lag the month after a sharp rally ends", prediction=dict(base))]
+    out = rs.run_research(ledger, paths, px, None, "us-etf",
+                          {"price-analyst": lambda p: json.dumps({"ideas": replies})}, today="2026-11-10")
+    assert len(out["accepted"]) == 3, out
+    for r in out["accepted"]:
+        assert ledger.prediction(r["hypothesis_id"])["expected"]["claim"] == "edge"
+        assert gt.read_prediction(ledger, paths, r["hypothesis_id"], r["strategy"]).claim == "edge"
