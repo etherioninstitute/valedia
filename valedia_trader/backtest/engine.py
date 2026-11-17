@@ -13,7 +13,8 @@ unpriced bar the engine neither buys nor sells the symbol: the weight carried fr
 price comes back is the move since the last priced bar. A position still open on an unpriced last bar is reported
 in `stranded`, not valued. While a symbol is carried, the book's total weight can exceed the total of the targets:
 the reported weights show it and nothing is scaled back. When the book's own return on a bar is -100% or worse,
-every weight, carried ones included, becomes zero as before."""
+every weight held into that bar counts as zero, as before: a carried symbol's position is gone without a trade and
+never shows in `stranded`, and a priced symbol trades from zero to its target."""
 from __future__ import annotations
 
 import math
