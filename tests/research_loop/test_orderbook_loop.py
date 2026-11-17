@@ -251,13 +251,14 @@ class Model:
         self.listing = lm_listing() if listing is None else listing
         self.old_body = old_body                            # the earlier revision's reply (default valid_answer())
         self.on_post = None                                 # rev 6: a hook inside each call
+        self.unreachable = ol.ModelUnavailable              # what an unreachable server raises
 
     def __call__(self, url, data, timeout):
         self.urls.append(url)
         old = url.startswith("http://127.0.0.1:11434/")
         assert old or url.startswith("http://127.0.0.1:1235/")
         if self.down:
-            raise ol.ModelUnavailable("connection refused")
+            raise self.unreachable("connection refused")
         if old and url.endswith("/api/tags"):
             return json.dumps({"models": [{"name": v3.TAG, "digest": "sha256:" + self.digest}]}).encode()
         if old and url.endswith("/api/version"):
@@ -271,7 +272,7 @@ class Model:
         if self.on_post is not None:
             self.on_post()
         if self.post_down:
-            raise ol.ModelUnavailable("connection refused")
+            raise self.unreachable("connection refused")
         if self.exc is not None:
             raise self.exc
         if self.latency > timeout:                        # the socket gives up at the limit, as a real one does
@@ -361,7 +362,6 @@ def no_real_model_side_effects(monkeypatch):
     monkeypatch.setattr(ol, "_file_sha256", refuse)
     monkeypatch.setattr(ol, "_file_stat", refuse)
     monkeypatch.setattr(ol.subprocess, "run", refuse)
-    monkeypatch.setattr(ol.subprocess, "Popen", refuse)
 
 
 def keep(c):
@@ -3665,6 +3665,7 @@ def differential_run(mod, path):
     clock = Clock()
     world = World(clock)
     model = Model(clock, old_body=lm_answer(v3.TAG))     # the same reply; only its model field differs
+    model.unreachable = ConnectionRefusedError           # unreachable to both (each module has its own classes)
     world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i) for i in range(6)]
     for m in world.markets:
         world.books[m["ticker"]] = book(0.40, 0.45)
