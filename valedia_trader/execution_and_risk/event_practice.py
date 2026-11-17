@@ -364,6 +364,10 @@ def _near_cents(d: Decimal) -> int | None:
 
 
 LEDGER_STATES = frozenset(STATES)                         # the ledger's order states (orders.py:99), listed once
+# The status words of a Kalshi market that still trades, listed once: "open", the status venues/kalshi_data.py asks
+# /markets for (open_markets_pages, kalshi_data.py:237, confirmed 2026-11-13); "active", the status the records that
+# answer carry, as research_loop/orderbook_loop.py:466 takes them. Any other word lifts nothing.
+KALSHI_TRADING_STATUSES = frozenset({"active", "open"})
 _ORDER_FIELDS = ("tag", "units", "state", "filled_units", "priced_units", "priced_avg", "fee", "amount_unconfirmed")
 
 
@@ -408,7 +412,17 @@ def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | Non
     the cent cannot be told from a true one: the figure is then off by that rounding. The exact cash equation across
     the reading where it entered then usually fails and a person confirms; it can cancel (two roundings of opposite
     sign between the same readings, or a rounding beside a hand sale of the same size); and a rounding that entered
-    before the earlier clean reading cancels exactly."""
+    before the earlier clean reading cancels exactly. The known cash is the cash of everything the venue has
+    REPORTED in a readable way; a charge the venue makes and does not report readably (a fee added after the last
+    piece, answered with a fee that cannot be read: the ledger writes nothing, orders.py:1101-1123) is a move outside
+    the ledger. Alone it makes the equation fail and a person confirms; beside a second outside move of the opposite
+    size, such as a hand sale of the same size, the two cancel and the equation passes: the cash journaled is right
+    to the cent and the label (settled, where it was sold) is wrong. Three cases stay unknown for good, since the
+    last fee figure stays older than the last contracts: the late zero fee (never stored); a fee that falls and a
+    later piece whose reported total is below the sum of the rows' fees (that row is written with no fee,
+    orders.py:1119-1123); and a fee that falls after a piece reported with no fee (a fall writes no row,
+    orders.py:1105-1109). Each leaves every later settlement on that account to a person until T45-3 (a ledger
+    trace and the account's order history as a third witness)."""
     try:
         return _known_cents(ledger, settlements)
     except Exception as exc:                              # a read of the ledger that fails: unknown, never a crash
@@ -416,7 +430,10 @@ def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | Non
 
 
 def _known_cents(ledger, settlements) -> tuple[int | None, str | None]:
-    if ledger.unapplied_fills():
+    unapplied = ledger.unapplied_fills()
+    if not isinstance(unapplied, list):
+        return None, "the ledger's unapplied fills are not a list"
+    if unapplied:
         return None, "a fill is not yet applied"
     total = 0
     for o in ledger.orders():
@@ -1456,7 +1473,8 @@ class _Run:
 
     def _after_withdrawal(self, ticker: str) -> None:
         """After --withdraw-pending on a record of this ticker made from Kalshi's finalized record (that record stays
-        in the state), a purchase waits until Kalshi's record, read now, shows the ticker plainly not finalized."""
+        in the state), a purchase waits until Kalshi's record, read now, shows the ticker still trading (a word of
+        KALSHI_TRADING_STATUSES, exactly); any other word, a padded one, None or no status lifts nothing."""
         withdrawn = {r["pending_id"] for r in self.state.withdrawals()}
         if not any(r["id"] in withdrawn and (parse_event_name(r["symbol"]) or (None,))[0] == ticker
                    and isinstance(r["kalshi"], dict) and r["kalshi"].get("status") == "finalized"
@@ -1469,11 +1487,11 @@ class _Run:
         else:
             status = record.get("status") if isinstance(record, dict) else None
             plain = isinstance(status, str) and _STATUS_WORD.fullmatch(status) is not None
-            if plain and record.get("ticker") == ticker and status != "finalized":
+            if record.get("ticker") == ticker and status in KALSHI_TRADING_STATUSES:     # exact: no padded word
                 return
             seen = f"its status reads {status if plain else 'missing or not plain'}"
         raise _Stop("settled", f"a pending record on {ticker} made from Kalshi's finalized record was withdrawn; no purchase "
-                               f"is sent until Kalshi's record reads not finalized ({seen})")
+                               f"is sent until Kalshi's record shows it still trading ({seen})")
 
     # -- the summary
     # -- a person's command (T45-1): confirm a pending settlement, or withdraw a pending record

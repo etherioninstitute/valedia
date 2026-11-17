@@ -126,7 +126,9 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
     apart from names with open pending records of their own, and closes the record without a settlement, with a
     `settlement_withdrawn` line carrying who and the note. If the holding goes again later, a new pending record
     is made. After a withdrawal of a record made from Kalshi's finalized record (that record stays in the state),
-    a purchase on that ticker is refused until a run reads Kalshi's record as plainly not finalized.
+    a purchase on that ticker is refused until a run reads Kalshi's record as still trading: status exactly "active"
+    or "open" (`KALSHI_TRADING_STATUSES`); "determined", "settled", "closed", any other word, a padded one or none
+    lift nothing.
 - *The entry.* A `settlement` journal entry, once per name: the whole expected holding closed at 1.00 a contract
   when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. It carries the
   baseline and program parts, the fields read, the two readings, `witnesses`, and `fee` null with `fee_seen`
@@ -162,14 +164,24 @@ removed. Event buying power is derived from that linked account's settled cash (
   as built only in the paper Events account. A `win_cash_observed` set there does not prove the live cash path.
 - A transfer out, or a hand sale netting exactly zero after fees, of a holding Kalshi says lost is recorded as a
   settlement, with the money still right.
-- Any cash move from outside the ledger that exactly cancels a difference passes the equation.
+- Any cash move from outside the ledger that exactly cancels a difference passes the equation. The known cash is
+  the cash of everything the venue has reported in a readable way; a charge the venue makes and does not report
+  readably (for example a fee added after the last piece, answered with a fee that cannot be read, of which the
+  ledger keeps no trace) is such a move. Alone it makes the equation fail and a person confirms. Beside a second
+  outside move of the opposite size, such as a hand sale of the same size, the two cancel and the equation passes:
+  the cash journaled is right to the cent, and the label (settled, where it was sold) is wrong. No rule on the
+  ledger's rows or totals can see a charge that leaves no trace; a third witness (the account's own order history)
+  and a ledger trace remove it, both in T45-3.
 - A venue that reports an average price rounded to the cent can leave an order's cash unknown or off by that
   rounding. The equation across the reading where it entered then usually fails, and a person confirms. It can
   cancel: two roundings of opposite sign between the same readings (the amount is then right), or a rounding
   beside a hand sale of the same size (inside the limit above). A rounding that entered before the earlier clean
   reading cancels exactly.
-- A zero fee reported only after the fill is never stored by the ledger. That order's cash stays unknown for good,
-  so every later settlement on that account then needs a person until the ledger is repaired (T45-3).
+- Three cases leave an order's cash unknown for good, because its last fee figure stays older than its last
+  filled contracts: a zero fee reported only after the fill (never stored by the ledger); a fee that falls and a
+  later piece whose reported total is below the sum of the rows' fees (that row is written with no fee); and a fee
+  that falls after a piece reported with no fee (a fall writes no row). Each means every later settlement on that
+  account then needs a person until the ledger is repaired (T45-3).
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
 - A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run, and refuses the
   person's commands on other records, since it has no pending record of its own. That blocks the whole Events

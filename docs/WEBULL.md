@@ -272,7 +272,7 @@ what settlement looks like.
   journals nothing, changes no practice state and says why. If the holding is back in the account in full, no one
   settles it: `--withdraw-pending ID --who NAME --note TEXT` closes the record without a settlement, only on a
   reconcile clean apart from names with open pending records of their own. After that, a purchase on the ticker
-  is refused until a run reads Kalshi's record as plainly not finalized (the record that said finalized stays in
+  is refused until a run reads Kalshi's record as still trading (status exactly "active" or "open") (the record that said finalized stays in
   the state). A later run never settles a pending record by itself. The 17 November holding has no earlier
   reading, so it waits for a person.
 - **What a loss is confirmed as.** A loss is confirmed by three facts: Kalshi's record says the contract lost, the
@@ -282,12 +282,19 @@ what settlement looks like.
   order history is the third witness a later ticket adds. For a win, the cash rising by exactly the payout is
   real evidence, and the flag `win_cash_observed`, shown in every summary, turns true on the first one.
 - **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference. Any cash
-  move from outside the ledger that exactly cancels a difference passes the equation. An average the venue rounds
+  move from outside the ledger that exactly cancels a difference passes the equation. The known cash is the cash
+  of everything the venue has reported readably; a charge it makes and does not report readably (a fee added
+  after the last piece, answered with a fee that cannot be read) is such a move: alone the equation fails and a
+  person confirms; beside a hand sale of the same size the two cancel, the cash journaled is right and the label
+  (settled, where it was sold) is wrong, until T45-3 adds the account's order history and a ledger trace. An
+  average the venue rounds
   to the cent can leave the known cash off by that rounding; the equation then usually fails and a person
   confirms, but it can cancel (two roundings of opposite sign, or a rounding beside a same-size hand sale), and a
-  rounding that entered before the earlier clean reading cancels exactly. A zero fee reported only after the fill
-  is never stored by the ledger: that order's cash stays unknown for good, so every later settlement on that
-  account then needs a person until the ledger is repaired (T45-3).
+  rounding that entered before the earlier clean reading cancels exactly. Three cases leave an order's cash
+  unknown for good: a zero fee reported only after the fill (never stored by the ledger), a fee that falls and a
+  later piece whose reported total is below the sum of the rows' fees, and a fee that falls after a piece
+  reported with no fee. Each means every later settlement on that account then needs a person until the ledger is
+  repaired (T45-3).
 
 ### Fees and settlement in a real account (Webull's help pages, read by the lead 2026-11-17)
 
