@@ -468,6 +468,16 @@ def webull_environment(env: al.Env) -> str:
     return TEST_ENVIRONMENT if (word or TEST_ENVIRONMENT).strip().lower() == TEST_ENVIRONMENT else f"not {TEST_ENVIRONMENT}"
 
 
+def live_names_in_reach(env: al.Env) -> list[str]:
+    """T50: the live key names (secrets.LIVE_NAMES) in reach of the practice runs, read as webull_environment reads the
+    settings: the given environment, else the process environment and the trading file (nothing is exported). Names
+    only, never a value; the live file itself is never opened."""
+    from valedia_trader.core.secrets import live_names_in
+    if env.environ is not None:
+        return live_names_in(env.environ)
+    return live_names_in({**al.register_trading_file(env), **os.environ})
+
+
 def limits_section(env: al.Env, ctx: Context) -> tuple[list, str]:
     from valedia_trader.research_loop import risk_gate
     times, body = [], []
@@ -485,7 +495,20 @@ def limits_section(env: al.Env, ctx: Context) -> tuple[list, str]:
         rows.append(["Webull environment", E(webull_environment(env))])
     except Exception as exc:
         rows.append(["Webull environment", f"unknown ({E(al.describe(exc), 100)})"])
+    flag = None
+    try:
+        found = live_names_in_reach(env)
+        rows.append(["Webull live key names", f"in reach of the practice runs: {E(' and '.join(found))}" if found
+                     else "none in reach of the practice runs"])
+        if found:
+            flag = (f"{E(' and '.join(found))} {'is' if len(found) == 1 else 'are'} in reach of the practice runs (the "
+                    "process environment or the trading file): every practice run refuses to build a venue while it is "
+                    "there. The live pair belongs in webull-live.env only.")
+    except Exception as exc:
+        rows.append(["Webull live key names", f"unknown ({E(al.describe(exc), 100)})"])
     body.append(table(["Switch", "State"], rows))
+    if flag is not None:
+        body.append(para(flag, "problem"))
     return times, "".join(body)
 
 

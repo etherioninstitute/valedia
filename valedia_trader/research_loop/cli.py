@@ -529,20 +529,40 @@ def _order_step_environment(environ=None) -> str:
     return (environ.get("WEBULL_ENV") or "sandbox").strip().lower()
 
 
+def _order_step_live_names(environ=None) -> list[str]:
+    """T50: the live names (secrets.LIVE_NAMES) in reach of the practice order step: in `environ`, or, with none
+    given, in the process environment after the ordinary secrets file is loaded into it (so a name in the file counts).
+    Never opens the live file."""
+    import os
+    from valedia_trader.core.secrets import live_names_in, load_env
+    if environ is None:
+        load_env()
+        environ = os.environ
+    return live_names_in(environ)
+
+
 def _order_step_refused() -> bool:
-    """True, with one line on stderr, when the configured environment is not the test environment, or when the
-    secrets file cannot be loaded (the line names the error's class only, nothing from the file or its path)."""
+    """True, with one line on stderr, when a live name is in reach (T50), when the configured environment is not the
+    test environment, or when the secrets file cannot be loaded (the line names the error's class only, nothing from
+    the file or its path; for a live name, the name only)."""
     from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT, _venue_error
     try:
         configured = _order_step_environment()
+        found = _order_step_live_names()
     except Exception as exc:
         print(f"refused: the trading secrets file could not be loaded ({_venue_error(exc)}); it must be readable by its "
               "owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
         return True
+    if found:
+        print(f"refused: {' and '.join(found)} {'is' if len(found) == 1 else 'are'} in reach of the practice order step "
+              "(the process environment or the trading secrets file); the live pair belongs in webull-live.env only, "
+              "read by the attended order-step --live", file=sys.stderr)
+        return True
     if configured == TEST_ENVIRONMENT:
         return False
     print(f"refused: the order step runs against Webull's test environment ({TEST_ENVIRONMENT}) only and WEBULL_ENV "
-          "names another; live trading is not built", file=sys.stderr)
+          "names another; live orders run only through the attended order-step --live, from its own key file",
+          file=sys.stderr)
     return True
 
 
@@ -751,11 +771,40 @@ def _live_args_refusal(args) -> str | None:
 
 
 def _live_environ():
-    """The environment the command runs with: the trading secrets file loaded into it."""
+    """The environment the command runs with: the trading secrets file loaded into it (for the second price sources;
+    T50: the live pair is never read from here, and _live_environment_refusal judges what was loaded)."""
     import os
     from valedia_trader.core.secrets import load_env
     load_env()
     return os.environ
+
+
+def _attended() -> bool:
+    """T50: a person at a terminal: standard input is a terminal. A job started by launchd, cron or a pipe has none,
+    so live mode refuses it. This stops an accident only: a program that fakes a terminal is not caught here (the
+    doctor's jobs check is the other half: no scheduled job may name live mode or a live key name)."""
+    import os
+    try:
+        return bool(os.isatty(sys.stdin.fileno()))
+    except Exception:
+        return False
+
+
+def _live_environment_refusal(environ) -> str | None:
+    """T50: why live mode cannot run with the ordinary environment it loaded, or None. The ordinary secrets file (and
+    the process environment, which load_env makes agree with it) must stay a practice file: WEBULL_ENV the practice
+    value or absent, and no live name (secrets.LIVE_NAMES) in it, because the live pair is read from webull-live.env
+    only."""
+    from valedia_trader.core.secrets import is_practice_environment, live_names_in
+    found = live_names_in(environ)
+    if found:
+        return (f"live mode reads the live pair from webull-live.env only, and {' and '.join(found)} "
+                f"{'is' if len(found) == 1 else 'are'} in the trading secrets file or the process environment: remove "
+                f"{'it' if len(found) == 1 else 'them'} from there")
+    if not is_practice_environment(environ):
+        return ("live mode needs WEBULL_ENV in the trading secrets file and the process environment to be sandbox (or "
+                "absent): the ordinary file stays a practice file, and the live entry fixes production in code")
+    return None
 
 
 def _live_files(paths: LoopPaths, environ):
@@ -776,16 +825,18 @@ def _live_root_refusal(paths: LoopPaths) -> str | None:
     return None
 
 
-def _order_step_live_venue(files, environ):
-    """Webull's production venue from the secrets: WEBULL_ENV production and WEBULL_ACCOUNT_CLASS the live class, and
-    the confirmation file the locks read. Raises _LiveRefused when the secrets name anything else."""
-    from valedia_trader.execution_and_risk.order_step import LIVE_ENVIRONMENT
-    if (environ.get("WEBULL_ENV") or "sandbox").strip().lower() != LIVE_ENVIRONMENT:
-        raise _LiveRefused(f"live mode needs WEBULL_ENV={LIVE_ENVIRONMENT} in the trading secrets file")
-    if (environ.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() != LIVE_CLASS:
-        raise _LiveRefused(f"live mode needs WEBULL_ACCOUNT_CLASS={LIVE_CLASS} in the trading secrets file")
+def _order_step_live_venue(files, environ, live_file=None):
+    """Webull's production venue (T50): the pair from webull-live.env only (`live_file` is for tests), production and
+    its host fixed in code (WebullVenue.from_live_file), no account id, the account class from the owner's
+    confirmation (the repository's own config/webull_live.json, judged again here), and that confirmation as the file
+    the adapter's own lock reads. Nothing in `environ` is read: not WEBULL_ENV, not a key, not WEBULL_ACCOUNT_ID or
+    WEBULL_ACCOUNT_CLASS. Raises _LiveRefused when the confirmation cannot be used."""
     from valedia_trader.venues import webull
-    return webull.WebullVenue.from_secrets(environ=environ, confirmation_file=webull.own_confirmation())
+    own = webull.own_confirmation()
+    confirmation, why = webull.live_confirmation(own)
+    if confirmation is None:
+        raise _LiveRefused(f"the owner's confirmation (config/webull_live.json) {why}; no live venue is built")
+    return webull.WebullVenue.from_live_file(live_file, account_class=confirmation["account_class"], confirmation_file=own)
 
 
 class _LockStub:
@@ -803,18 +854,23 @@ class _LockStub:
         raise AttributeError(f"{name}: nothing is read while a lock is unmet")
 
 
-def _build_live_venue(build_venue, files, environ):
-    """The live venue, or (None, why) in the command's own words."""
-    from valedia_trader.core.secrets import SecretError
+def _build_live_venue(build_venue, files, environ, live_file=None):
+    """The live venue, or (None, why) in the command's own words (for the live file, its fault in the reader's own
+    words, which never hold a value)."""
+    from valedia_trader.core.secrets import LiveFileError, SecretError
     from valedia_trader.execution_and_risk.order_step import _venue_error
     from valedia_trader.venues.webull import WebullError
     try:
+        if build_venue is None and live_file is not None:
+            return _order_step_live_venue(files, environ, live_file=live_file), None
         return (build_venue or _order_step_live_venue)(files, environ), None
     except _LiveRefused as exc:
         return None, str(exc)
+    except LiveFileError as exc:
+        return None, f"the live key file cannot be used: {exc}"
     except (WebullError, SecretError, OSError) as exc:
-        return None, (f"the Webull venue could not be set up ({_venue_error(exc)}); check the trading secrets file and "
-                      "its WEBULL_ settings")
+        return None, (f"the Webull venue could not be set up ({_venue_error(exc)}); check webull-live.env (the live "
+                      "pair) and the owner's confirmation")
 
 
 def _live_account_report(venue, confirmation) -> tuple[dict | str, bool]:
@@ -855,7 +911,8 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
     return 0 if out["status"] == "done" else 2
 
 
-def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=None, second_opinion=None, today=None) -> int:
+def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=None, second_opinion=None, today=None,
+                            attended=None, live_file=None) -> int:
     """`order-step --live`: the go-live gate (docs/specs/2026-11-13-go-live-gate-design.md). The flags are checked
     first, before anything is read; then the four locks from the owner's files and the paper record, before any
     venue is built. --check prints each lock (met or not, the figures and the owner's numbers) and, only when locks 1
@@ -864,10 +921,18 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     exit 2 (an approve is still marked refused on the ticket file, when there is one, without any account read).
     Then config/broker_book.json (T32, broker_book_follow): missing or refused, the run is refused the same way,
     before any venue is built; live mode never follows the whole book. `environ` (default: the secrets file loaded into the process environment), `build_venue`, `second_opinion` and
-    `today` are for tests. Nothing here writes, creates or repairs an owner's file."""
+    `today` are for tests. Nothing here writes, creates or repairs an owner's file.
+
+    T50: every live command, --check included, needs a person at a terminal (_attended; `attended` is for tests),
+    checked right after the flags and before anything is read; then the ordinary environment must be a practice one
+    (_live_environment_refusal: WEBULL_ENV sandbox or absent, no live name in it). The venue's pair comes from
+    webull-live.env only (`live_file` is for tests), its environment and host are fixed in code."""
     from valedia_trader.execution_and_risk import go_live, order_step
     from valedia_trader.venues.webull import ny_date
     why = _live_args_refusal(args) or _live_root_refusal(paths)
+    if why is None and not (_attended() if attended is None else attended):
+        why = ("live mode needs a person at a terminal (standard input is not a terminal); it never runs from a job, a "
+               "pipe or a schedule")
     if why is not None:
         print(f"refused: {why}", file=sys.stderr)
         return 2
@@ -881,6 +946,10 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
             print(f"refused: the trading secrets file could not be loaded ({order_step._venue_error(exc)}); it must be "
                   "readable by its owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
             return 2
+    why = _live_environment_refusal(environ)
+    if why is not None:
+        print(f"refused: {why}; nothing was read from the account", file=sys.stderr)
+        return 2
     files = _live_files(paths, environ)
     state = go_live.judge_locks(files, ny_date() if today is None else today, args.capital)
     first_three = all(lock["met"] for lock in state.locks[:3])
@@ -888,7 +957,7 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
         report: dict = {"locks": state.locks, "account": "not read: locks 1 to 3 are not all met"}
         ok = first_three
         if first_three:
-            venue, why = _build_live_venue(build_venue, files, environ)
+            venue, why = _build_live_venue(build_venue, files, environ, live_file)
             if venue is None:
                 report["account"], ok = f"not read: {why}", False
             else:
@@ -912,7 +981,7 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
             if Path(order_step.ticket_path_for(order_step.state_path_for(ledger_path, go_live.LIVE_VENUE))).exists():
                 _run_live(args, paths, _LockStub(), files, second_opinion)
         return 2
-    venue, why = _build_live_venue(build_venue, files, environ)
+    venue, why = _build_live_venue(build_venue, files, environ, live_file)
     if venue is None:
         print(f"refused: {why}", file=sys.stderr)
         return 2

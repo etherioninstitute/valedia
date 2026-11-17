@@ -90,6 +90,7 @@ import hashlib
 import logging
 import math
 import os
+import pwd
 import re
 import stat
 import sys
@@ -99,7 +100,8 @@ from urllib.parse import quote, quote_plus, unquote
 
 __all__ = ["env_file_path", "load_env", "secret", "SecretError", "DEFAULT_ENV_FILE", "SECRETS_DIR",
            "redact", "redact_json", "tripped", "remember", "child_env", "install_output_guard",
-           "remove_output_guard", "ensure_output_guard"]
+           "remove_output_guard", "ensure_output_guard", "LIVE_NAMES", "LIVE_ENV_FILE", "LiveFileError", "LiveNameInReach",
+           "read_live_pair", "live_names_in", "is_practice_environment", "PRACTICE_ENVIRONMENT"]
 
 SECRETS_DIR = Path("~/.hermes/secrets").expanduser()
 DEFAULT_ENV_FILE = SECRETS_DIR / "trading.env"
@@ -180,6 +182,153 @@ def secret(name: str, environ=None) -> str:
     _hidden_names.add(name)
     remember(value)
     return value
+
+
+# ---- T50: the live key pair, in a file of its own beside the secrets file, read only by the live entry ----------
+
+LIVE_NAMES = ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET")
+LIVE_FILE_NAME = "webull-live.env"
+# Fixed in code: the running user's home as the password database gives it (not $HOME), so no environment variable
+# chooses where the live pair is read from. Tests reach another place through read_live_pair's `path` only.
+LIVE_ENV_FILE = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".hermes" / "secrets" / LIVE_FILE_NAME
+LIVE_FILE_MAX_BYTES = 4096
+PRACTICE_ENVIRONMENT = "sandbox"                 # Webull's test environment: the only value an ordinary file may hold
+
+
+class LiveFileError(SecretError):
+    """The live file cannot be used; the message names the fault (and the names in it), never a value."""
+
+
+class LiveNameInReach(SecretError):
+    """A practice entry found a live name (LIVE_NAMES) in its process environment or its ordinary secrets file; the
+    message names the names, never a value."""
+
+
+def _live_fault(p: Path) -> tuple[int | None, str | None]:
+    """(an open descriptor, None) for a live file that may be read, or (None, why). The rule of the owner's files
+    (venues/webull.read_owner_file): no symbolic link at the file or at any folder above it, its real path the path
+    given, a regular file with one name, not writable by its group or by others, belonging to the running user, in a
+    folder that is the running user's alone (not writable by its group or by others); and, because it holds a key,
+    the secrets file's rule as well: not readable by its group or by others (chmod 600)."""
+    for q in [p, *p.parents]:
+        if os.path.islink(q):
+            return None, "is a symbolic link" if q == p else "has a symbolic link in a folder above it"
+    if os.path.realpath(p) != str(p):
+        return None, "is not at its real path (the real path differs from the path given)"
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None, "is missing"
+    except OSError:
+        return None, "cannot be opened (it must be readable by its owner: chmod 600)"
+    why = None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            why = "is not a regular file"
+        elif st.st_nlink > 1:
+            why = "has more than one name on disk (a hard link); give it a name of its own"
+        elif st.st_mode & 0o022:
+            why = "is writable by its group or by others (it must be the owner's alone: chmod 600)"
+        elif st.st_mode & 0o044:
+            why = "is readable by its group or by others (it holds a key: chmod 600)"
+        elif st.st_uid != os.geteuid():
+            why = "belongs to another user (it must be the owner's alone: the user running this trader)"
+        else:
+            folder = os.lstat(p.parent)
+            if folder.st_uid != os.geteuid() or folder.st_mode & 0o022:
+                why = "is in a folder that is not the owner's alone (chmod 700 on the secrets folder)"
+            elif st.st_size > LIVE_FILE_MAX_BYTES:
+                why = f"is larger than {LIVE_FILE_MAX_BYTES} bytes, so it is not a live key file"
+    except OSError:
+        why = "cannot be read"
+    if why is not None:
+        os.close(fd)
+        return None, why
+    return fd, None
+
+
+def _live_pairs(text: str) -> tuple[dict[str, str] | None, str | None]:
+    """The two live names and their values, or (None, why): every line that is not blank or a comment must be
+    NAME=VALUE (`export NAME=VALUE` as in the secrets file), NAME one of LIVE_NAMES, each once, each value non-empty.
+    `why` names a line number or a live name only: nothing a line holds is repeated."""
+    out: dict[str, str] = {}
+    first: dict[str, int] = {}
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            return None, f"line {number} is not NAME=VALUE"
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[len("export "):].strip()
+        if name not in LIVE_NAMES:
+            return None, (f"line {number} names a setting other than {' and '.join(LIVE_NAMES)} (the live file holds "
+                          "those two only)")
+        if name in first:
+            return None, f"sets {name} more than once (lines {first[name]} and {number}); keep exactly one line for it"
+        first[name] = number
+        out[name] = value.strip().strip('"').strip("'")
+    for name in LIVE_NAMES:
+        if name not in out:
+            return None, f"{name} is missing"
+        if not out[name].strip():
+            return None, f"{name} is empty"
+    return out, None
+
+
+def read_live_pair(path: str | Path | None = None) -> tuple[str, str]:
+    """The live App Key and App Secret from the live file (LIVE_ENV_FILE when `path` is None), for the attended live
+    entry only. Raises LiveFileError naming the fault, never a value (_live_fault, _live_pairs). Both values are
+    handed to the output guard; NOTHING is put into the process environment. No practice entry calls this."""
+    ensure_output_guard()
+    p = Path(os.path.abspath(os.fspath(LIVE_ENV_FILE if path is None else path)))
+    fd, why = _live_fault(p)
+    if fd is None:
+        raise LiveFileError(f"{LIVE_FILE_NAME} {why}")
+    try:
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > LIVE_FILE_MAX_BYTES:
+                raise LiveFileError(f"{LIVE_FILE_NAME} is larger than {LIVE_FILE_MAX_BYTES} bytes, so it is not a live "
+                                    "key file")
+            chunks.append(chunk)
+    except OSError:
+        raise LiveFileError(f"{LIVE_FILE_NAME} cannot be read") from None
+    finally:
+        os.close(fd)
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise LiveFileError(f"{LIVE_FILE_NAME} is not UTF-8 text") from None
+    pairs, why = _live_pairs(text)
+    if pairs is None:
+        raise LiveFileError(f"{LIVE_FILE_NAME} {why}")
+    for value in pairs.values():
+        remember(value)
+    _hidden_names.update(LIVE_NAMES)
+    return pairs[LIVE_NAMES[0]], pairs[LIVE_NAMES[1]]
+
+
+def live_names_in(environ=None) -> list[str]:
+    """The live names present in `environ` (default: the process environment, into which load_env puts every name of
+    the ordinary secrets file), in LIVE_NAMES order. Present counts, whatever the value, empty included."""
+    env = os.environ if environ is None else environ
+    return [name for name in LIVE_NAMES if name in env]
+
+
+def is_practice_environment(environ=None) -> bool:
+    """Whether WEBULL_ENV, read as every entry reads it (stripped, lower-cased; missing or empty is the default),
+    names Webull's test environment."""
+    env = os.environ if environ is None else environ
+    word = env.get("WEBULL_ENV") or PRACTICE_ENVIRONMENT
+    return type(word) is str and word.strip().lower() == PRACTICE_ENVIRONMENT
 
 
 # ---- the tripwire: remembered secrets, redaction and the output guard --------------------------

@@ -11,7 +11,8 @@ developer.webull.com on 2026-11-11 and again on 2026-11-13, and checked against 
 - It is long-only: only rows marked as stock or crypto count as holdings, open sells are deducted, and an order that
   would sell more than is free is refused before anything is sent.
 - Quantities and limit prices are sent exactly as given or not at all; nothing is rounded.
-- It chooses its account by class (`WEBULL_ACCOUNT_CLASS`, for example `INDIVIDUAL_CASH`), refuses an order that
+- It chooses its account by class (`WEBULL_ACCOUNT_CLASS`, for example `INDIVIDUAL_CASH`, for the practice venue; live
+  mode takes the class from your confirmation file instead), refuses an order that
   does not fit the account, tells a refusal by Webull apart from an unknown outcome, and paces its own calls under
   Webull's limits (accepted for test use 2026-11-13 after two more blind checks; not cleared for real money).
 - No key, secret or account number can leave it: it passes on only text of a harmless shape and never hands back
@@ -37,7 +38,8 @@ Webull says paper market data "may be delayed or synthetic".
 
 ### 2. Put the keys where the trader reads them
 
-Add to `~/.hermes/secrets/trading.env` (mode 600). Never paste keys anywhere else.
+Add to `~/.hermes/secrets/trading.env` (mode 600). Never paste keys anywhere else. This file holds the PAPER key
+only: its `WEBULL_ENV` stays `sandbox` (or is left out), and a live key never goes here (see "Real money").
 
     WEBULL_APP_KEY=...
     WEBULL_APP_SECRET=...
@@ -54,7 +56,9 @@ Add to `~/.hermes/secrets/trading.env` (mode 600). Never paste keys anywhere els
 2. Developer Console, live side: **Access Credentials**, **API Keys**, **Apply for API Service**.
 3. After approval: **Register an API Application** with **Market Data and Trading**; leave **2FA Verification** on;
    under **Add More Address Segments** enter this Mac's public address so the key works only from here.
-4. **Generate Key** (shown once), then put it in the secrets file with `WEBULL_ENV=production`.
+4. **Generate Key** (shown once), then put it in its own file, `~/.hermes/secrets/webull-live.env`, as
+   `WEBULL_LIVE_APP_KEY` and `WEBULL_LIVE_APP_SECRET` (see "Real money"); never in `trading.env`, and never with
+   `WEBULL_ENV=production` anywhere.
 5. The first connection asks for a one-time approval in the Webull app.
 
 ### 5. Market data
@@ -162,20 +166,65 @@ cancelled; the account ended with no open order and no holding):
 
 ## Real money
 
-Nothing in this repository sends a real-money order on its own, and nothing in it creates the file that allows one.
+Nothing in this repository sends a real-money order on its own, and nothing in it creates the files that allow one.
+Live mode exists only as attended commands, run by you at a terminal, from the repository itself:
 
-A production order needs all of: `WEBULL_ENV=production`; a file `config/webull_live.json` written by you,
+    .venv/bin/python -m valedia_trader.research_loop order-step --live --check
+    .venv/bin/python -m valedia_trader.research_loop order-step --live --propose --capital C
+    .venv/bin/python -m valedia_trader.research_loop order-step --live --approve NUMBER --capital C
 
-    {"account_id": "<your account id>", "confirmed_by": "<your name>", "max_order_value": 250,
-     "i_understand_this_trades_real_money": true}
+`--check` sends nothing: it prints each lock and, once locks 1 to 3 are met, the class and last 4 characters of the
+account the venue would trade. `--propose` writes a ticket and sends nothing; `--approve NUMBER` sends only that
+ticket's orders, each after fresh checks. Whole shares only (`--fractional` is refused).
 
-naming the same account the key trades (the id Webull's API uses is a long internal one that the console does not
-show; how you confirm the live account will be changed to the account's class and last characters before go-live); an order value at or under `max_order_value`; and a known price for the order.
-The paper mirror passes no price, so it can never trade live even with that file present. A live execution path is
-deliberately not wired: it is the last step, taken with you, after the order path has been proven in the test
-environment, a strategy has a paper record, and the order-handling code has been reviewed by a model from another
-family or you have waived that. As of 2026-11-13 two strategies have passed their backtests and sealed tests; the
-paper record is days old.
+**The live key pair** lives in a file of its own, `~/.hermes/secrets/webull-live.env` (beside `trading.env`; the
+place is fixed in code from your user record, and no environment variable moves it), holding exactly two lines:
+
+    WEBULL_LIVE_APP_KEY=...
+    WEBULL_LIVE_APP_SECRET=...
+
+It must be a regular file (not a link, no link in a folder above it, one name on disk), yours, mode 600 (not readable
+or writable by your group or others), in a folder only you can write. Any other line, a repeated name, an empty value
+or wrong permissions is a refusal that names the fault and shows no value. Only the live commands read it. They never
+take a key from the process environment or from `trading.env`, fix the environment to production and the host to
+`api.webull.com` in code, pass no account id (the account is chosen by the class in your confirmation, and its last 4
+characters are checked before any other account read), and refuse when `trading.env` or the process environment holds
+`WEBULL_ENV` other than `sandbox` (absent counts as `sandbox`) or either live name: `trading.env` stays a practice
+file. The values are handed to the output guard, so they are masked in anything printed or logged.
+
+**Needs a terminal.** Every live command, `--check` included, refuses when standard input is not a terminal, so a
+job, a pipe or a schedule cannot run it. This stops an accident only: a program that fakes a terminal is not caught by
+it. The other half is the doctor's `jobs` check: it fails, naming the file, when any job file in `tools/launchd/`, any
+installed LaunchAgent whose label starts with `com.valedia.`, or any file such an agent's program arguments name (one
+level down) holds `--live` or either live name.
+
+**Practice runs never reach production.** The order step without `--live` (the 06:55 and 07:10 jobs), the events
+probe (`python -m valedia_trader.venues.webull_events probe`) and the connection check
+(`python -m valedia_trader.venues.webull check`) refuse to build a venue when either live name is in their process
+environment or in `trading.env`, refuse any environment or host but the test one, and never open `webull-live.env`.
+The doctor's `venues` check fails and the owner page flags a row while a live name is in reach. The event practice
+(`python -m valedia_trader.execution_and_risk.event_practice`) is refused by the venue builder it shares (its line
+names only the error's class); its own refusal, naming the live name, is not built yet.
+
+**The files only you write**, each read without trusting it (a link, a second name, a file others can write, a
+repeated key, NaN and the rest are refused):
+
+- `config/webull_live.json`, lock 1 (the confirmation), also read by the adapter before each production order:
+  `account_class` (exactly `INDIVIDUAL_CASH`), `account_ends` (the account's last 4 characters), `confirmed_by`,
+  `max_order_value`, `max_capital`, `valid_until` (at most 31 days ahead) and `i_understand_this_trades_real_money`
+  (`true`). `--capital` may not exceed `max_capital`.
+- `config/go_live.json`, lock 2 (the checklist, judged against the paper record): `min_paper_broker_days`,
+  `min_reconciled_fills`, `min_days_since_a_stopped_run`, `fills_checked_by_hand`, `min_fills_checked_by_hand` and
+  `confirmed_by`.
+- `config/ladder.json`, the stake ladder: `confirmed_by`, `first_stake`, `unattended`, `fractional` and
+  `valid_until`. Nothing in the order path reads it yet, so it feeds no lock.
+
+Lock 3 is `config/risk.json` (it must hold `max_orders_per_day`, 1 to 200) with the second price sources'
+`ALPACA_API_KEY`, `ALPACA_SECRET_KEY` and `FINNHUB_API_KEY` in `trading.env`; lock 4 is the ticket (propose, then
+approve by number). Live mode follows only the strategies `config/broker_book.json` names.
+
+**Not built yet:** fractional live orders; the live kill switch and its reset; the stake ladder's use (the first stake,
+its steps and `ladder.json`); unattended live runs (live mode never runs from a job).
 
 ## Event contracts: the Events account trades Kalshi's markets (seen 2026-11-13, test environment)
 

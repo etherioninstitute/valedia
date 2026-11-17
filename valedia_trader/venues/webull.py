@@ -278,6 +278,11 @@ class WebullError(RuntimeError):
     pass
 
 
+class NotThePracticeEnvironment(WebullError):
+    """T50: a practice entry was asked for anything but Webull's test environment on its test host. Its text is the
+    adapter's own words."""
+
+
 class NotTransmitted(WebullError):
     """A refusal made on this machine before any order call was sent: the order certainly did not reach Webull."""
 
@@ -1754,14 +1759,55 @@ class WebullVenue:
 
     @classmethod
     def from_secrets(cls, environ=None, **kwargs) -> "WebullVenue":
-        from valedia_trader.core.secrets import load_env, secret
+        """The PRACTICE venue (T50): Webull's test environment only, from the ordinary secrets file (loaded first when
+        no `environ` is given). Refused before anything is built (LiveNameInReach) when a live name (secrets.LIVE_NAMES)
+        is in `environ`, which after the load holds every name of the ordinary file; refused (NotThePracticeEnvironment)
+        when WEBULL_ENV names anything but the test environment or the host it would use is not the test host. It never
+        opens the live file: production is built only by from_live_file, for the attended live entry."""
+        from valedia_trader.core.secrets import LiveNameInReach, live_names_in, load_env, secret
         import os
         env = os.environ if environ is None else environ
         if environ is None:
             load_env()
-        return cls(secret("WEBULL_APP_KEY", env), secret("WEBULL_APP_SECRET", env), environment=(env.get("WEBULL_ENV") or "sandbox").strip().lower(),
-                   account_id=(env.get("WEBULL_ACCOUNT_ID") or "").strip() or None,
-                   account_class=(env.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() or None, **kwargs)
+        found = live_names_in(env)
+        if found:
+            raise LiveNameInReach(f"{' and '.join(found)} {'is' if len(found) == 1 else 'are'} in reach of a practice run "
+                                  "(the process environment or the trading secrets file); the live pair belongs in "
+                                  "webull-live.env only, so no practice venue is built")
+        environment = (env.get("WEBULL_ENV") or "sandbox").strip().lower()
+        if environment != "sandbox" or HOSTS.get(environment) != SANDBOX_HOST:
+            raise NotThePracticeEnvironment("a practice venue runs against Webull's test environment (sandbox, on its "
+                                            "test host) only and WEBULL_ENV or the host names another; live orders "
+                                            "run only through the attended order-step --live")
+        venue = cls(secret("WEBULL_APP_KEY", env), secret("WEBULL_APP_SECRET", env), environment=environment,
+                    account_id=(env.get("WEBULL_ACCOUNT_ID") or "").strip() or None,
+                    account_class=(env.get("WEBULL_ACCOUNT_CLASS") or "").strip().upper() or None, **kwargs)
+        if venue.environment != "sandbox" or venue.host != SANDBOX_HOST:
+            raise NotThePracticeEnvironment("a practice venue runs against Webull's test environment only; this one "
+                                            "would not")
+        return venue
+
+    @classmethod
+    def from_live_file(cls, path=None, *, account_class, confirmation_file: str | Path = LIVE_CONFIRMATION,
+                       client: Any | None = None, token_dir: str | Path | None = None, limits: dict | None = None,
+                       clock: Any = None, sleep: Any = None) -> "WebullVenue":
+        """The PRODUCTION venue for the attended live entry (T50): the App Key and Secret from the live file only
+        (secrets.read_live_pair: LIVE_ENV_FILE, or `path` for tests), never from the process environment or the
+        ordinary secrets file; the environment and the host fixed here (production, PRODUCTION_HOST), whatever
+        WEBULL_ENV says; no account id (the account is chosen by `account_class`, which the caller takes from the
+        owner's confirmation, and the confirmation's account_ends is checked against it before any order)."""
+        from valedia_trader.core.secrets import read_live_pair
+        if not (type(account_class) is str and _ACCOUNT_CLASS.fullmatch(account_class)):
+            raise WebullError("the live venue needs the account class from the owner's confirmation (an upper-case code "
+                              "such as INDIVIDUAL_CASH)")
+        if HOSTS.get("production") != PRODUCTION_HOST:
+            raise WebullError("the live venue's host is not Webull's production host; nothing was built")
+        key, sec = read_live_pair(path)
+        venue = cls(key, sec, environment="production", account_id=None, account_class=account_class, client=client,
+                    confirmation_file=confirmation_file, token_dir=token_dir, limits=limits, clock=clock, sleep=sleep)
+        if venue.environment != "production" or venue.host != PRODUCTION_HOST:
+            raise WebullError("the live venue is not Webull's production environment on its production host")
+        return venue
 
     # ---- reading (allowed in both environments)
     @_public
@@ -2851,13 +2897,23 @@ class WebullVenue:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Prints only the check report (values this module built) or a failure through the gate and the last check."""
+    """Prints only the check report (values this module built) or a failure through the gate and the last check. A
+    practice entry (T50): it refuses, with one line in the adapter's own words, a live name in reach and any
+    environment or host but the test one (from_secrets), and a venue whose host is not the test host."""
+    from valedia_trader.core.secrets import LiveNameInReach
     ap = argparse.ArgumentParser(prog="python -m valedia_trader.venues.webull", description="Webull connection check (read-only).")
     ap.add_argument("cmd", choices=["check"])
     args = ap.parse_args(argv)
     venue = None
     try:
-        venue = WebullVenue.from_secrets()
+        try:
+            venue = WebullVenue.from_secrets()
+        except (LiveNameInReach, NotThePracticeEnvironment) as exc:
+            print(_last_check(f"refused: {_gate(exc, NO_SECRETS, 400)}", ()), file=sys.stderr)
+            return 2
+        if getattr(venue, "environment", None) != "sandbox" or getattr(venue, "host", None) != SANDBOX_HOST:
+            print("refused: the connection check runs against Webull's test environment only", file=sys.stderr)
+            return 2
         if args.cmd == "check":
             print(venue._final(json.dumps(venue.check(), indent=2, default=str)))
     except Exception as exc:

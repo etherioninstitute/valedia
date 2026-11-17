@@ -575,15 +575,22 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
     """The probe's report (values this module built, symbols that passed their shape rule, gated error texts) and the
     reader (for its last check). Refuses (ProbeRefused, no request made) unless the environment is the test
     environment. With no `environ`, the secrets file is loaded first, as WebullVenue.from_secrets does; the
-    environment is checked after that and before the App Key and Secret are taken or any request is made."""
+    environment is checked after that and before the App Key and Secret are taken or any request is made. A practice
+    entry (T50): a live name (secrets.LIVE_NAMES) in `environ`, which after the load holds every name of the ordinary
+    secrets file, is refused first; the live file is never opened."""
     asked = list(series_symbols)
     if not 1 <= len(asked) <= PROBE_MAX_SERIES or len(set(asked)) != len(asked) or not all(
             type(s) is str and _EVENT_SYMBOL.fullmatch(s) for s in asked):
         raise ProbeRefused(f"--series takes 1 to {PROBE_MAX_SERIES} distinct series symbols")
-    from valedia_trader.core.secrets import load_env, secret
+    from valedia_trader.core.secrets import live_names_in, load_env, secret
     env = os.environ if environ is None else environ
     if environ is None:
         load_env()
+    found = live_names_in(env)
+    if found:
+        raise ProbeRefused(f"{' and '.join(found)} {'is' if len(found) == 1 else 'are'} in reach of the probe (the "
+                           "process environment or the trading secrets file); the live pair belongs in webull-live.env "
+                           "only, and a practice run never runs with a live name in reach")
     environment = _check_environment(env)                             # before the key is taken and any request
     reader = WebullEvents(secret("WEBULL_APP_KEY", env), secret("WEBULL_APP_SECRET", env), environment=environment,
                           client=client, token_dir=token_dir, max_requests=PROBE_WEBULL_REQUESTS, clock=clock, sleep=sleep,

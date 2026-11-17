@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -256,6 +258,16 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
         pass
     notes.append(live_mode_note(paths))
     notes.append("the built-in paper book needs no key")
+    try:                                               # T50: a live name in reach of the practice runs fails the check
+        from valedia_trader.core.secrets import live_names_in
+        found = live_names_in()
+    except Exception:
+        found = []
+    if found:
+        notes.append(f"a live key name is in reach of the practice runs: {' and '.join(found)} (the process environment "
+                     "or the trading secrets file); every practice run refuses to build a venue while it is there; the "
+                     "live pair belongs in webull-live.env only")
+        return FAIL, "; ".join(notes)
     return (OK if ready else ATTENTION), "; ".join(notes)
 
 
@@ -263,8 +275,8 @@ LIVE_ONLY_AT_A_PROPOSAL = ("judged only when a batch is proposed and again when 
                            "capital given with --capital against the confirmation's max_capital, the money at work (what "
                            "the account holds plus the batch's buys) against max_capital, the account the venue will "
                            "trade against the confirmation's class and last 4 characters, each order's value against "
-                           "max_order_value, and both second price sources agreeing on each price; WEBULL_ENV and "
-                           "WEBULL_ACCOUNT_CLASS are read when the venue is built, not here")
+                           "max_order_value, and both second price sources agreeing on each price; the live pair is read "
+                           "from webull-live.env when the venue is built (T50), not here")
 
 # T32 A1: the lock judges' reasons the doctor prints as they are, because they are made of the code's own words and
 # nothing from inside the file (after "config/<file> "); any other reason is said in the doctor's own words, or not
@@ -468,6 +480,108 @@ def check_schedule(paths: LoopPaths) -> tuple[str, str]:
     return status, "; ".join(notes)
 
 
+# ---- T50: no scheduled job may name live mode or a live key name
+
+LIVE_FLAG = re.compile(r"(?<![\w-])--live(?![\w-])")    # the flag as a whole word: not --liveness, not --live-ish
+JOB_SCAN_MAX_BYTES = 4 * 1024 * 1024
+OUR_LABEL = "com.valedia."
+
+
+def _job_hits(text: str) -> list[str]:
+    """What a job file holds that a scheduled job must not: the --live flag, either live key name (never a value)."""
+    from valedia_trader.core.secrets import LIVE_NAMES
+    return (["--live"] if LIVE_FLAG.search(text) else []) + [name for name in LIVE_NAMES if name in text]
+
+
+def _read_job_file(p: Path, skip_binary: bool) -> str | None:
+    """The text of a regular file (bytes that are not UTF-8 replaced), or None when it is not a regular file, cannot
+    be read, is larger than JOB_SCAN_MAX_BYTES or (with `skip_binary`) holds a NUL byte in its first 8 KB."""
+    try:
+        if not p.is_file() or p.stat().st_size > JOB_SCAN_MAX_BYTES:
+            return None
+        raw = p.read_bytes()
+    except OSError:
+        return None
+    if skip_binary and b"\0" in raw[:8192]:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def _job_plist(p: Path) -> dict | None:
+    import plistlib
+    try:
+        data = plistlib.loads(p.read_bytes())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _named_by(data: dict | None) -> list[Path]:
+    """The files a job's Program and ProgramArguments name (one level: not what those files name in turn), relative
+    names taken from its WorkingDirectory (launchd's default: /)."""
+    if not data:
+        return []
+    args = data.get("ProgramArguments")
+    words = [w for w in ([data.get("Program")] + (list(args) if isinstance(args, list) else [])) if isinstance(w, str) and w]
+    workdir = data.get("WorkingDirectory") if isinstance(data.get("WorkingDirectory"), str) else "/"
+    out = []
+    for w in words:
+        p = Path(w).expanduser()
+        out.append(p if p.is_absolute() else Path(workdir) / p)
+    return out
+
+
+def check_jobs(paths: LoopPaths, launchd_dir: str | Path | None = None, agents_dir: str | Path | None = None) -> tuple[str, str]:
+    """T50: no scheduled job may run live mode. Scanned: the repository's job files (tools/launchd/*.plist and *.sh,
+    or `launchd_dir`), the installed LaunchAgents whose Label starts with com.valedia. (~/Library/LaunchAgents, or
+    `agents_dir`; a plist that cannot be parsed counts as one of ours when its file name starts so), and the files each
+    of those plists names in its Program and ProgramArguments, one level down (binaries are skipped). A file holding
+    --live as a whole word or either live key name fails the check, named; nothing a file holds is printed."""
+    launchd = Path(launchd_dir) if launchd_dir is not None else paths.root / "tools" / "launchd"
+    agents = Path(agents_dir) if agents_dir is not None else Path.home() / "Library" / "LaunchAgents"
+    scanned: set[Path] = set()
+    hits, unread, named = [], [], []
+
+    def scan(p: Path, skip_binary: bool) -> None:
+        key = Path(os.path.abspath(p))
+        if key in scanned:
+            return
+        text = _read_job_file(p, skip_binary)
+        if text is None:
+            if not skip_binary:
+                unread.append(p.name)
+            return
+        scanned.add(key)
+        found = _job_hits(text)
+        if found:
+            hits.append(f"{p.name if not skip_binary else p} ({', '.join(found)})")
+
+    if launchd.is_dir():
+        for p in sorted(launchd.iterdir()):
+            if p.suffix in (".plist", ".sh"):
+                scan(p, False)
+                if p.suffix == ".plist":
+                    named += _named_by(_job_plist(p))
+    if agents.is_dir():
+        for p in sorted(agents.glob("*.plist")):
+            data = _job_plist(p)
+            label = data.get("Label") if data else None
+            if (isinstance(label, str) and label.startswith(OUR_LABEL)) or (data is None and p.name.startswith(OUR_LABEL)):
+                scan(p, False)
+                named += _named_by(data)
+    for q in named:
+        scan(q, True)
+    if hits:
+        return FAIL, ("a scheduled job names live mode or a live key name, and live mode never runs from a job: "
+                      + "; ".join(hits))
+    if not scanned:
+        return ATTENTION, f"no job files found (looked in {launchd} and {agents})"
+    note = f"{len(scanned)} job files scanned; none names --live or a live key name"
+    if unread:
+        return ATTENTION, f"{note}; could not be read: {', '.join(unread)}"
+    return OK, note
+
+
 def check_mirofish(paths: LoopPaths) -> tuple[str, str]:
     from valedia_trader.agents import mirofish_models as mm
     try:
@@ -525,7 +639,8 @@ def check_repo(paths: LoopPaths) -> tuple[str, str]:
 CHECKS: dict[str, Callable[..., tuple[str, str]]] = {
     "price history": check_data, "hypothesis ledger": check_ledger, "risk limits": check_risk_limits, "kill switch": check_kill_switch,
     "journal": check_journal, "quant sheet": check_quant_sheet, "team": check_team, "decision panel": check_panel, "local models": check_models, "venues": check_venues,
-    "research desk": check_desk, "schedules": check_schedule, "MiroFish": check_mirofish, "repository": check_repo,
+    "research desk": check_desk, "schedules": check_schedule, "jobs": check_jobs, "MiroFish": check_mirofish,
+    "repository": check_repo,
 }
 
 
