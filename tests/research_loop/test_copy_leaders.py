@@ -399,8 +399,9 @@ class World:
     before), and a terminal point of grain 0 one second before `end`."""
 
     def __init__(self, seed, edge, move, pros=12, per_month=30, months=ALL_MONTHS, market_makers=2, late_rich=False,
-                 event_every=2):
+                 event_every=2, odd=0.0):
         self.rng = random.Random(seed)
+        self.odd = odd                               # a share of positions that fail an entry test (price or cash)
         self.event_every = event_every               # positions to an event (2: a pair; more: events with many trades)
         self.trades: dict[str, list[dict]] = {}
         self.res: dict[str, dict] = {}
@@ -448,6 +449,11 @@ class World:
         token, cond, event = "tok%d" % n, "cond%d" % n, "ev%d" % (n // self.event_every)
         t1 = self._ts(ym)
         p = self.rng.randrange(20, 81) / 100
+        if self.odd and cash is None and self.rng.random() < self.odd:
+            if self.rng.random() < 0.5:
+                p = self.rng.choice([0.05, 0.95])
+            else:
+                cash = self.rng.uniform(200, 900)
         size = round((cash or self.rng.uniform(1100, 3000)) / p, 2)
         if win is None:
             win = self.rng.random() < p + edge
@@ -2313,7 +2319,7 @@ def _variety(seed):
     rng = random.Random(4700 + seed)
     return dict(edge=rng.choice([0.0, 0.1, 0.3, 0.3]), move=rng.choice([0.0, 0.02]), pros=rng.randrange(3, 8),
                 per_month=rng.choice([6, 9, 11, 14, 20]), market_makers=rng.randrange(0, 3),
-                event_every=rng.choice([2, 2, 30]), months=SMALL_MONTHS)
+                event_every=rng.choice([2, 2, 30]), months=SMALL_MONTHS, odd=rng.choice([0.0, 0.2, 0.4]))
 
 
 def _outcome(fn):
@@ -2351,6 +2357,11 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
         assert ta == tb, seed
         seen["planned"] += len(tb["plan"])
         cl.pull(store, client, phase=2, leave_out=leave, say=lambda m: None)
+        if seed % 4 == 2:                                            # a stored point of the wrong shape
+            db = sqlite3.connect(str(store))
+            db.execute("UPDATE price_points SET price = 'x' WHERE rowid = (SELECT MIN(rowid) FROM price_points)")
+            db.commit()
+            db.close()
         o_old, o_new = d / "o_old", d / "o_new"                      # develop then sealed, old and new, each on
         c_old, c_new = d / "c_old.sqlite", d / "c_new.sqlite"        # its own copy (sealed spends its store)
         shutil.copy(store, c_old)
@@ -2369,6 +2380,9 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
         assert raw_old == (o_new / "develop.json").read_bytes(), seed
         res = r_new[1]["result"]
         seen["months_left_out"] += sum(res["months_left_out"].values())
+        seen["entry_skips"] += sum(v for k, v in res["position_skips"].items()
+                                   if k in ("first_price_outside_0.10_0.90", "under_1000_in_24h"))
+        seen["bad_points"] += res["load_rejects"].get("point_bad_row", 0)
         seen["leave_out"] += len(res["wallets_left_out"])
         seen[res["step_1"]["verdict"]] += 1
         q_old = _outcome(lambda: old.run_sealed(store=c_old, out_dir=o_old, flag=True, leave_out=leave,
@@ -2395,6 +2409,7 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
             m.pop("development_sha256")
         assert m_old == m_new, seed
     assert seen["planned"] > 0 and seen["months_left_out"] > 0 and seen["leave_out"] > 0, seen
+    assert seen["entry_skips"] > 0 and seen["bad_points"] > 0, seen
     assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
     print("T47c stores:", dict(sorted(seen.items())))
 
@@ -2614,3 +2629,80 @@ def test_a_development_run_fetches_no_row_of_a_market_only_sealed_positions_touc
     fetched["price window"] = sum(1 for st in statements if "price_points" in st
                                   and any("'%s@" % tok in st for tok in sealed_tokens))
     assert rows and fetched == Counter({"trade": 0, "resolution": 0, "price window": 0}), fetched
+
+
+def _edge_wallet(path, seed):
+    """One wallet's trades at the edges the fold must match: times on a six-hour grid (ties; buys exactly 24 hours
+    and trades exactly 30 days apart), resolutions at a trade's own time, a token stored with two outcome indexes,
+    sells beyond the holding, markets resolved some other way or not at all, rows stored out of time order."""
+    rng = random.Random(seed)
+    base = MS(2025, 6)
+    conds = ["k%d" % i for i in range(8)]
+    rows = []
+    slots = 400 if seed % 2 else 2400                  # dense: many buys exactly a day apart and next-day rows
+    for i in range(rng.randrange(150, 400)):
+        c = rng.choice(conds)
+        oi = rng.randrange(2)
+        tok = "%s_%d" % (c, oi) if rng.random() < 0.95 else "%s_%d" % (c, 0)
+        rows.append({"proxy_wallet": "w", "side": rng.choice(["BUY", "BUY", "SELL"]), "token_id": tok,
+                     "condition_id": c, "size": rng.choice([1.0, 50.0, 2500.0, 4000.0]),
+                     "price": rng.choice([0.05, 0.3, 0.5, 0.7, 0.95]),
+                     "timestamp": base + rng.randrange(0, slots) * 6 * HOUR, "event_slug": rng.choice(["", "e1", "e2"]),
+                     "outcome_index": oi, "transaction_hash": "0x%x" % i, "slug": "s", "title": "", "outcome": "Yes"})
+    times = [r["timestamp"] for r in rows]
+    order = list(range(len(rows)))
+    rng.shuffle(order)
+    with cl.Store(path, make_id=True) as s:
+        s.db.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+            ("w", seq, r["proxy_wallet"], r["side"], r["token_id"], r["condition_id"], r["size"], r["price"],
+             r["timestamp"], r["event_slug"], r["outcome_index"], r["transaction_hash"], r["slug"], r["title"],
+             json.dumps(r), FIXED) for seq, r in zip(order, rows)])
+        for c in conds:
+            kind = rng.choice(["clean", "clean", "clean", "otherwise", "open"])
+            ts = rng.choice(times) if rng.random() < 0.6 else base + rng.randrange(0, slots) * 6 * HOUR
+            pay = {"clean": rng.choice([[0, 1_000_000], [1_000_000, 0]]), "otherwise": [500_000, 500_000],
+                   "open": None}[kind]
+            s.db.execute("INSERT INTO resolutions VALUES (?,?,?,?,?,?,?)", (
+                c, "proposed" if kind == "open" else "resolved", json.dumps(pay), "x",
+                None if kind == "open" else ts, "{}", FIXED))
+        s.commit()
+    return times
+
+
+def test_the_wallet_fold_equals_wallet_book_and_new_positions_at_the_edges(tmp_path):
+    seen = Counter()
+    for seed in range(60):
+        path = tmp_path / ("e%d.sqlite" % seed)
+        times = _edge_wallet(path, seed)
+        end = sorted(times)[len(times) // 2]
+        with cl.Store(path) as s:
+            for end_, spill, keep in ((2 ** 62, 0, None), (end, cl.SPILL, (MS(2025, 9), end))):
+                counts = Counter()
+                trades = []
+                for r in s.trade_rows("w", end_, spill):
+                    t, why = cl.trade_from_row("w", r["seq"], r)
+                    if why:
+                        counts["trade_" + why] += 1
+                    else:
+                        trades.append(t)
+                res = cl._resolutions(s, {t.condition for t in trades})
+                book, positions = cl.wallet_book(trades, res), cl.new_positions(trades)
+                got = Counter()
+                f = cl._fold(s, ["w"], end_, spill, keep, got)
+                seen["spill"] += sum(1 for t in trades if t.ts >= end_)
+                seen["a day apart"] += sum(1 for p in positions if any(
+                    t.token == p.token and t.side == "BUY" and t.ts == p.t1 + cl.BUY_WINDOW for t in trades))
+                mb = f.books["w"]
+                assert got == counts and mb.counts == book.counts, seed
+                months = [cl.add_months((2025, 1), k) for k in range(36)]
+                for m in months:
+                    assert cl.standing(mb, m) == cl.standing(book, m), (seed, m)
+                assert cl.sells_beyond_summary({"w": mb}, [(m, "w") for m in months]) == \
+                    cl.sells_beyond_summary({"w": book}, [(m, "w") for m in months]), seed
+                passing = [p for p in positions if (keep is None or keep[0] <= p.t1 < keep[1])]
+                assert f.positions["w"] == [p for p in passing if cl.position_skip(p, res) is None], seed
+                if keep is not None:
+                    assert f.skipped["w"] == Counter((cl.month_of(p.t1), cl.position_skip(p, res)) for p in passing
+                                                     if cl.position_skip(p, res)), seed
+                assert f.first_ts == min((t.ts for t in trades), default=None)
+    assert seen["spill"] > 0 and seen["a day apart"] > 0, seen
