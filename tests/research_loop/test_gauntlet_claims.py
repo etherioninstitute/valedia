@@ -423,3 +423,129 @@ def test_the_report_is_strict_json_under_both_claims(tmp_path):
         g.develop(hid, momentum())
         saved = json.loads((paths.backtests / "claims_test-v1.0.0-attempt1.json").read_text())
         assert saved["claim"] == name and math.isfinite(saved["attempts_counted"]["ledger"])
+
+
+# ---- addendum 3: `develop` never raises on a bad Sharpe figure, under either claim
+
+NAN, INF = float("nan"), float("inf")
+BAD_MOMENTS = [("sharpe", None), ("sharpe", NAN), ("sharpe", "0.05"), ("sharpe", INF),
+               ("skew", None), ("skew", NAN), ("skew", "0"),
+               ("kurt", None), ("kurt", NAN), ("kurt", "3"),
+               ("n_obs", None), ("n_obs", True), ("n_obs", "1500"), ("n_obs", 1500.0)]
+BAD_PSR = [None, NAN, "0.99"]                                           # with BAD_MOMENTS: 17 cases
+NOT_PROBABILITIES = [True, np.True_, 1.5, 3.0, NAN, INF, -0.1]
+
+
+def _bad_moments(field, value):
+    real = gt.research.sharpe_moments
+    return lambda *a, **k: replace(real(*a, **k), **{field: value})
+
+
+def _refused_through_develop(prediction, word, g, ledger, hid):
+    rep = g.develop(hid, momentum())                                    # a verdict, never an exception
+    check = rep["checks"]["sharpe_one_trial" if prediction.claim == "edge" else "deflated_sharpe"]
+    assert not check["passed"] and "fails" in check["detail"] and word in check["detail"], check
+    assert rep["verdict"] == "fail" and ledger.get(hid)["status"] == "failed"
+    with pytest.raises(gt.GauntletError):
+        g.seal(hid, momentum())
+    assert not ledger.sealed_used(hid)                                   # nothing sealed
+
+
+def test_the_twins_pass_the_check_that_reads_the_sharpe_figure(tmp_path):
+    for name, prediction, check in (("edge", EDGE, "sharpe_one_trial"), ("exposure", EXPOSURE, "deflated_sharpe")):
+        _, _, g, hid = desk(tmp_path / name, drift_market(), prediction)
+        assert g.develop(hid, momentum())["checks"][check]["passed"]
+
+
+@pytest.mark.parametrize("prediction", [EDGE, EXPOSURE], ids=["edge", "exposure"])
+@pytest.mark.parametrize("field,value", BAD_MOMENTS, ids=[f"{f}={v!r}" for f, v in BAD_MOMENTS])
+def test_develop_fails_a_bad_moment_with_a_reason(tmp_path, monkeypatch, prediction, field, value):
+    _, ledger, g, hid = desk(tmp_path, drift_market(), prediction)
+    monkeypatch.setattr(gt.research, "sharpe_moments", _bad_moments(field, value))
+    _refused_through_develop(prediction, "moments", g, ledger, hid)
+
+
+@pytest.mark.parametrize("prediction", [EDGE, EXPOSURE], ids=["edge", "exposure"])
+@pytest.mark.parametrize("value", BAD_PSR, ids=[repr(v) for v in BAD_PSR])
+def test_develop_fails_a_bad_probabilistic_sharpe_with_a_reason(tmp_path, monkeypatch, prediction, value):
+    _, ledger, g, hid = desk(tmp_path, drift_market(), prediction)
+    monkeypatch.setattr(gt.research, "probabilistic_sharpe_ratio", lambda *a, _v=value, **k: _v)
+    word = "Probabilistic Sharpe" if prediction.claim == "edge" else "for_idea"
+    _refused_through_develop(prediction, word, g, ledger, hid)
+
+
+# ---- addendum 3: the exposure claim's figures are probabilities, each of them, before `min` is taken
+
+@pytest.mark.parametrize("value", NOT_PROBABILITIES, ids=[repr(v) for v in NOT_PROBABILITIES])
+def test_the_idea_figure_of_the_deflated_sharpe_must_be_a_probability(tmp_path, monkeypatch, value):
+    _, ledger, g, hid = desk(tmp_path, drift_market(), EXPOSURE)
+    monkeypatch.setattr(gt.research, "probabilistic_sharpe_ratio", lambda *a, _v=value, **k: _v)
+    _refused_through_develop(EXPOSURE, "for_idea", g, ledger, hid)
+
+
+def _desk_with_market_attempts(tmp_path):
+    """One attempt of the idea's own (its figure is the Probabilistic Sharpe), four on its market label (that
+    figure is the Deflated Sharpe)."""
+    paths, ledger, g, hid = desk(tmp_path, drift_market(), EXPOSURE)
+    for k in range(3):
+        other = ledger.propose(f"another idea on the label {k}", "price-analyst", "synthetic")
+        ledger.record_attempt(other, "backtest", 0.01 * (k + 1), 1000, "1.0.0")
+    return ledger, g, hid
+
+
+def test_the_market_figure_twin_passes(tmp_path):
+    ledger, g, hid = _desk_with_market_attempts(tmp_path)
+    rep = g.develop(hid, momentum())
+    d = rep["deflated_sharpe"]
+    assert rep["checks"]["deflated_sharpe"]["passed"] and d["attempts_on_market"] == 4
+    assert d["value"] == min(d["for_idea"], d["for_market"]) and d["for_idea"] != d["for_market"]
+
+
+@pytest.mark.parametrize("value", NOT_PROBABILITIES, ids=[repr(v) for v in NOT_PROBABILITIES])
+def test_the_market_figure_of_the_deflated_sharpe_must_be_a_probability(tmp_path, monkeypatch, value):
+    ledger, g, hid = _desk_with_market_attempts(tmp_path)
+    monkeypatch.setattr(gt.research, "deflated_sharpe_ratio", lambda *a, _v=value, **k: _v)   # `min` must not drop it
+    _refused_through_develop(EXPOSURE, "for_market", g, ledger, hid)
+
+
+# ---- addendum 3: the pass marks are judged when they are made
+
+def test_every_figure_of_a_prediction_is_judged_at_construction():
+    good = dict(annual_return=0.05, win_rate=0.5, sharpe=0.8, fail_if_sharpe_below=0.3, fail_if_drawdown_above=0.25)
+    p = gt.Prediction(**{k: np.float32(v) for k, v in good.items()})                   # numpy reals are numbers
+    assert p.fail_if_drawdown_above == pytest.approx(0.25) and type(p.fail_if_drawdown_above) is float
+    gt.Prediction(**{**good, "fail_if_sharpe_below": -0.5, "fail_if_drawdown_above": 1.0, "win_rate": 0,
+                     "annual_return": -0.1})                                            # the edges of each range
+    bad = {"annual_return": (True, NAN, INF, None, "0.05"), "sharpe": (True, NAN, -INF, None, "0.8"),
+           "win_rate": (True, -0.1, 1.1, NAN, None, "0.5"),
+           "fail_if_sharpe_below": (True, np.bool_(False), NAN, INF, -INF, None, "0.3"),
+           "fail_if_drawdown_above": (True, np.bool_(True), 0, 0.0, -0.1, 1.5, NAN, INF, None, "0.25")}
+    for field, values in bad.items():
+        for v in values:
+            with pytest.raises(ValueError, match=field):
+                gt.Prediction(**{**good, field: v})
+
+
+def test_every_pass_mark_of_the_criteria_is_judged_at_construction():
+    c = gt.Criteria(min_dsr=np.float32(0.95), min_positive_windows=np.float64(0.6), min_stress_sharpe=np.float32(0.0),
+                    sealed_fraction=np.float64(0.25))
+    assert c.min_dsr == pytest.approx(0.95) and type(c.min_dsr) is float
+    gt.Criteria(min_positive_windows=1.0, min_stress_sharpe=-0.5)                     # the edges of each range
+    bad = {"min_dsr": (True, 0.0, 1.0, NAN, None, "0.95"),
+           "min_positive_windows": (0, 0.0, -1, 1.5, NAN, INF, True, None, "0.6"),
+           "min_stress_sharpe": (NAN, INF, -INF, True, None, "0"),
+           "sealed_fraction": (True, NAN, None, "0.25")}
+    for field, values in bad.items():
+        for v in values:
+            with pytest.raises(ValueError, match=field):
+                gt.Criteria(**{field: v})
+
+
+# ---- addendum 3: a count of observations is a whole number
+
+def test_a_float_count_of_observations_fails_the_one_trial_check(monkeypatch):
+    good = pd.Series(0.001 + 0.01 * np.random.default_rng(1).standard_normal(2000))
+    assert gt.one_trial_sharpe(good, 0.95)[1]                                          # the twin: n_obs 2000
+    monkeypatch.setattr(gt.research, "sharpe_moments", _bad_moments("n_obs", 2000.0))
+    value, ok, detail = gt.one_trial_sharpe(good, 0.95)
+    assert not ok and value is None and "moments" in detail
