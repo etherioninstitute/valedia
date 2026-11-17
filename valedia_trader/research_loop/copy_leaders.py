@@ -38,16 +38,22 @@ Rules the code holds:
   one atomic act: an immediate write lock and a plain insert of the marker that fails if the key exists, so of two
   runs started together exactly one goes on. The marker's key present, whatever its value, means spent. The id is
   written once, by the pull that makes the store; `develop` and `sealed` never write one and refuse a store without
-  a well-formed id. The limit that remains: a byte copy of a store made before the sealed run, analysed in a place
-  that has never seen the original's markers, cannot be told from the original, so the lead keeps one store and
-  records the sealed run in the project's ledger.
+  a well-formed id. On opening, both refuse, in words and with nothing written, a store that is not of the
+  program's own shape: exactly the tables, indexes and key constraints the pull creates (no other table, no
+  trigger), at most one `store_id` row and at most one marker row. The limit that remains: a byte copy of a store
+  made before its sealed run can be run again whenever the original's sealed run used an output folder other than
+  the default one, in the same repository too; the default folder's marker protects only against a run after one
+  that used the default folder. So the lead keeps one store and records the sealed run in the project's ledger.
 * What a development run reads (and the recomputation inside `sealed`, before its claim): the candidates' trades
   before 2026-07-01, plus the trades of 1 July only in tokens the wallet bought on 30 June (the 24-hour purchase sum
-  of a 30 June position); the resolutions of the markets of those trades only, selected in the query (a
-  development position, or a market a development standing touched, may resolve after June: that resolution row is
-  dated in the sealed period and is read, because the position's outcome and the 45-day test need it); the price
-  windows of development positions only. A resolution, price point or trade of a market that only sealed
-  positions touch is never fetched before the claim; bookkeeping checks are counting queries.
+  of a 30 June position); the resolutions of every market a candidate traded before 2026-07-01 (and of the markets
+  of those 1 July trades), selected in the query, those dated in the sealed period included; of these, only those a
+  development position or a development standing needs are used (a development position's outcome and the 45-day
+  test; a standing for month M uses only resolutions before M began); the price windows of development positions
+  only. A resolution, price point or trade of a market that only sealed positions touch is never fetched before
+  the claim; bookkeeping checks are counting queries. The development output prints the counts of set-aside rows
+  of only those walks and windows (a trade row dated on or after 1 July left out, an undated one counted); the
+  sealed output prints those of the whole store.
 * Money is whole cents decided on integers: trade cash is exact micro-dollars, a standing and a 24-hour sum are
   rounded to cents half up, a follower's price is rounded to the cent half up; means are computed at the end.
 * The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, price
@@ -713,12 +719,63 @@ def _j(v) -> str:
     return json.dumps(v, sort_keys=True, allow_nan=True)
 
 
+_OWN_SHAPE: list | None = None
+
+
+def _shape_of(db) -> list:
+    """Every table, index and trigger with its stored definition: the tables, columns and key constraints."""
+    return sorted(db.execute("SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master"))
+
+
+def own_shape() -> list:
+    """The shape the pull creates (SCHEMA, made in memory)."""
+    global _OWN_SHAPE
+    if _OWN_SHAPE is None:
+        db = sqlite3.connect(":memory:")
+        db.executescript(SCHEMA)
+        _OWN_SHAPE = _shape_of(db)
+        db.close()
+    return _OWN_SHAPE
+
+
+def check_own_shape(path) -> None:
+    """Refuses, in words and with nothing written (the file is opened read-only), a store that is not of the
+    program's own shape: exactly the tables, indexes and key constraints the pull creates, nothing more (no other
+    table, no trigger), at most one `store_id` row and at most one marker row."""
+    path = Path(path)
+    if not path.is_file():
+        raise Refused("the store %s is missing (nothing written)" % path)
+    try:
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+    except sqlite3.Error as e:
+        raise Refused("the store %s cannot be opened (%s; nothing written)" % (path, e)) from None
+    try:
+        got = _shape_of(db)
+        if got != own_shape():
+            want = {r[:2] for r in own_shape()}
+            have = {r[:2] for r in got}
+            differs = sorted(have ^ want) or sorted({r[:2] for r in set(got) ^ set(own_shape())})
+            raise Refused("the store %s is not of this program's own shape (tables, keys or triggers differ: %s; "
+                          "nothing written)" % (path, ", ".join("%s %s" % d for d in differs[:6])))
+        ids, markers = db.execute("SELECT SUM(key = 'store_id'), SUM(key = 'sealed_marker') FROM meta").fetchone()
+        if (ids or 0) > 1 or (markers or 0) > 1:
+            raise Refused("the store %s is not of this program's own shape (%d store_id rows, %d marker rows; "
+                          "nothing written)" % (path, ids or 0, markers or 0))
+    except sqlite3.DatabaseError as e:
+        raise Refused("the store %s is not of this program's own shape (%s; nothing written)" % (path, e)) from None
+    finally:
+        db.close()
+
+
 class Store:
     """The SQLite file of one pull."""
 
-    def __init__(self, path, make_id: bool = False):
-        """Open (or make) a store. Only the pull passes `make_id`: the store's own identity, written once."""
+    def __init__(self, path, make_id: bool = False, own: bool = False):
+        """Open (or make) a store. Only the pull passes `make_id`: the store's own identity, written once. `own`
+        (develop and sealed): first refuse, having written nothing, a store not of the program's own shape."""
         self.path = Path(path)
+        if own:
+            check_own_shape(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), timeout=60)
         self.db.executescript(SCHEMA)
@@ -840,6 +897,9 @@ class Store:
             if answers.get(cond) == "row":
                 self.db.execute("INSERT OR REPLACE INTO resolutions VALUES (?,?,?,?,?,?,?)", (
                     cond, row["status"], _j(row["payouts"]), row["resolved_at"], row["resolved_ts"], _j(raw), at))
+            elif answers.get(cond) == "duplicate":     # two different rows for one id: each counted, none trusted
+                self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", ("resolutions", cond, "conflicting_row",
+                                                                           _j(raw), at))
             elif cond not in answers:
                 self.db.execute("INSERT INTO rejects VALUES (?,?,?,?,?)", ("resolutions", cond, "condition_not_asked",
                                                                            _j(raw), at))
@@ -929,11 +989,30 @@ class Store:
                              "resolved_at": resolved_at, "resolved_ts": resolved_ts}
         return out
 
-    def counts_by_reason(self) -> dict:
-        """{kind: {reason: rows}} of every row the store set aside (repeats, conflicts, out-of-span times, rejects)."""
-        out: dict = {}
-        for kind, reason, n in self.db.execute("SELECT kind, reason, COUNT(*) FROM rejects GROUP BY kind, reason "
-                                               "ORDER BY kind, reason"):
+    def counts_by_reason(self, read=None) -> dict:
+        """{kind: {reason: rows}} of every row the store set aside (repeats, conflicts, out-of-span times, rejects).
+        With `read` = (wallets, before, conditions, windows): only the rows of the walks and windows a development run
+        reads (the trade walks of `wallets`, a row dated at or after `before` left out, an undated row counted; the
+        resolutions of `conditions`; the price windows `windows`), counted in the query."""
+        if read is None:
+            out: dict = {}
+            for kind, reason, n in self.db.execute("SELECT kind, reason, COUNT(*) FROM rejects GROUP BY kind, reason "
+                                                   "ORDER BY kind, reason"):
+                out.setdefault(kind, {})[reason] = n
+            return out
+        wallets, before, conditions, windows = read
+        c: Counter = Counter()
+        ts = "(CASE WHEN json_valid(raw) THEN json_extract(raw, '$.timestamp') END)"
+        for kind, keys, extra, args in (
+                ("trades", wallets, " AND NOT (typeof(%s) IN ('integer', 'real') AND %s >= ?)" % (ts, ts), (before,)),
+                ("resolutions", conditions, "", ()), ("prices", windows, "", ())):
+            for part in _chunks(sorted(set(keys))):
+                for reason, n in self.db.execute(
+                        "SELECT reason, COUNT(*) FROM rejects WHERE kind=? AND key IN (%s)%s GROUP BY reason"
+                        % (",".join("?" * len(part)), extra), (kind, *part, *args)):
+                    c[(kind, reason)] += n
+        out = {}
+        for (kind, reason), n in sorted(c.items()):
             out.setdefault(kind, {})[reason] = n
         return out
 
@@ -1160,7 +1239,7 @@ def load(store, period: str, leave_out=()) -> Data:
     if not path.is_file():
         raise Refused("the store %s is missing: run pull first" % path)
     counts = Counter()
-    with Store(path) as s:
+    with Store(path, own=True) as s:
         s.checked_id()
         cands = s.candidates()
         if not cands:
@@ -1194,7 +1273,11 @@ def load(store, period: str, leave_out=()) -> Data:
         if missing:
             raise Refused("the pull is unfinished for wallets %s (%s); name them with --leave-out to run without them"
                           % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10])))
-        store_counts = s.counts_by_reason()
+        if period == "development":                 # only what a development run reads; sealed: the whole store
+            store_counts = s.counts_by_reason(read=(list(trades), hi, {t.condition for ts in trades.values()
+                                                                       for t in ts}, list(windows)))
+        else:
+            store_counts = s.counts_by_reason()
     return Data(period, kept, trades, resolutions, points, counts, leave,
                 sorted(w for w in implicated if w in leave), months, store_counts)
 
@@ -1362,7 +1445,7 @@ READINGS = (
 
 def store_id(store):
     """The store's id as stored (None when it has none). Opening never writes one."""
-    with Store(store) as s:
+    with Store(store, own=True) as s:
         present, raw = s.meta_raw("store_id")
     if not present:
         return None
@@ -1374,7 +1457,7 @@ def store_id(store):
 
 def store_sealed_marker(store):
     """The sealed marker written in the store (its parsed value, or its text when malformed), or None."""
-    with Store(store) as s:
+    with Store(store, own=True) as s:
         present, raw = s.meta_raw("sealed_marker")
     if not present:
         return None
@@ -1386,7 +1469,7 @@ def store_sealed_marker(store):
 
 
 def _provenance(store: Path) -> dict:
-    with Store(store) as s:
+    with Store(store, own=True) as s:
         boards, sid = s.board_read_at(), s.checked_id()
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
             "amendment_commit": AMENDMENT_COMMIT, "second_amendment_commit": SECOND_AMENDMENT_COMMIT,
@@ -1496,7 +1579,7 @@ def _claim(path: Path, sid: str, note: dict) -> None:
 
 
 def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None) -> dict:
-    """The sealed run, once per store. In order: the flag; the store's own marker; the folder's marker; the
+    """The sealed run, once per store. In order: the flag; the store's own shape and id; the store's own marker; the folder's marker; the
     development file and its hash; the bookkeeping; the development result recomputed from this store (it must pass,
     and the file must equal it byte for byte); the store's marker (committed), the folder's marker; only then the
     sealed rows."""
@@ -1506,7 +1589,7 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
     if not path.is_file():
         raise Refused("the store %s is missing (nothing written)" % path)
     leave = sorted(set(leave_out))
-    with Store(path) as s:
+    with Store(path, own=True) as s:
         sid = s.checked_id()
         spent, raw = s.meta_raw("sealed_marker")
     if spent:                                      # the key present, whatever its value, means spent
@@ -1523,7 +1606,7 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
                       "already run for this store (nothing written)" % default_marker)
     dev = Path(develop_file) if develop_file is not None else od / "develop.json"
     dev_raw, dev_sha = _read_development_file(dev)
-    with Store(path) as s:                         # bookkeeping only: no sealed row is read before the marker
+    with Store(path, own=True) as s:               # bookkeeping only: no sealed row is read before the marker
         problems = sealed_bookkeeping_problems(s, leave)
     if problems:
         raise Refused("the sealed run is not started (nothing written): %s" % "; ".join(problems))

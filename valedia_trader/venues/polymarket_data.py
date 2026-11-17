@@ -92,14 +92,15 @@ class Pacer:
         self.last = self.clock()
 
 
-PATH_RE = r"/v2/[a-z0-9/_-]+"
+PATH_RE = r"/v2(?:/[a-z0-9_-]+)+"               # every segment non-empty; no trailing slash
 QUERY_RE = r"[A-Za-z0-9_.~%+=&-]*"            # what urllib.parse.urlencode writes
 ALLOWED_URL = re.compile(re.escape(BASE_URL) + "(" + PATH_RE + r")(?:\?" + QUERY_RE + ")?")
 
 
 def _allowed(url: str) -> bool:
-    """The allow-list: the whole address is the service's base, a /v2/ path of lower-case letters, digits, `/`, `_`
-    and `-`, and an optional query as the reader encodes it. Nothing else passes."""
+    """The allow-list: the whole address is the service's base (escaped: a dot is a dot), a /v2 path of one or more
+    non-empty segments of lower-case letters, digits, `_` and `-` (no empty segment, no trailing slash), and an
+    optional query as the reader encodes it. Nothing else passes."""
     return isinstance(url, str) and ALLOWED_URL.fullmatch(url) is not None
 
 
