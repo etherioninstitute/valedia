@@ -4,10 +4,10 @@ Four seats in one capped room, filled by the trader's existing bots, and you dec
 
 | Seat | Bot (Hermes profile) | Model | Tools | Job |
 |---|---|---|---|---|
-| Orchestrator | Decider (`valedia-trading-decider`) | Claude Sonnet (your subscription) | none | Turns your question into a brief |
+| Orchestrator | Proposer (`valedia-trading-decider`) | Claude Sonnet (your subscription) | none | Turns your question into a brief |
 | Researcher | Scout (`valedia-trading-scout`) | local 27B | web only | Reads sources, reports findings with links |
 | Reviewer | Auditor (`valedia-trading-auditor`) | Claude Sonnet | none | Attacks the report against a rubric |
-| Librarian | Decider (`valedia-trading-decider`) | Claude Sonnet | none | Files a report you approved as a short library note |
+| Librarian | Proposer (`valedia-trading-decider`) | Claude Sonnet | none | Files a report you approved as a short library note |
 
 The seats are assigned in `valedia_trader/agents/team.json` (see `docs/TEAM.md`); there are no bots that exist only for
 the desk. The bot that writes the brief is not the one that reviews, and the Scout can do neither. The room shares the

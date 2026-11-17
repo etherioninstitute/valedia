@@ -10,19 +10,19 @@ python -m valedia_trader.agents.team sync --dry-run
 
 | Bot | Hermes profile | Model | What it does |
 |---|---|---|---|
-| Decider | `valedia-trading-decider` | Claude Sonnet (your subscription) | Proposes ideas in the research round, votes in the panel, writes the desk's brief, files approved notes |
+| Proposer | `valedia-trading-decider` | Claude Sonnet (your subscription) | Proposes ideas in the research round, writes the desk's brief, files approved notes. No panel vote since 2026-11-16 |
 | Scout | `valedia-trading-scout` | local 27B | Reads sources for the desk (web tools only there) |
 | Auditor | `valedia-trading-auditor` | Claude Sonnet | Skeptic in the research round, vetter in the panel, reviewer at the desk, narrator of the weekly review |
 | CTO | `valedia-cto` | local 27B | Builds and repairs the code when you ask; no seat in any trading decision |
 | Valedia | `valedia` | local 27B | Your assistant: reports the trader's state and carries your decisions |
-| Nimble, Qwen 8B | none (local models) | local | Vote in the panel |
+| Elephant-1 | none (a local model in LM Studio) | local | The panel's only decider (owner's instruction, 2026-11-16); also votes as a risk vetter |
 
 ## How they are kept in step
 
 - **One file assigns the seats.** The research desk, the research round's defaults and the weekly critic read their bots
   from `team.json`. The panel keeps `panel_roster.json` (it also holds local models) and is checked against the team.
 - **Every bot carries the same team card** in its Hermes role file (`SOUL.md`): who the others are, the shared rules
-  (the gate, nobody orders, you approve the library) and "if it is another bot's job, say whose". For Decider, Scout and
+  (the gate, nobody orders, you approve the library) and "if it is another bot's job, say whose". For Proposer, Scout and
   Auditor the whole role file is generated. For Valedia and the CTO only the marked team section is; the rest of their
   files is never touched. Old files are backed up in each profile's `backups/` before any change.
 - **Nobody judges their own work.** The file is refused if the researcher would brief or review its own report, or if
