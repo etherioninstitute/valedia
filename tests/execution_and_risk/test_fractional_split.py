@@ -335,6 +335,10 @@ def test_the_case_found_a_purchase_at_a_price_under_five_dollars_sells_nothing()
     assert [x.units for x in s.legs] == [] and s.residual == Decimal("-0.3") and not s.target_zeroed
     s = split_difference(0.2, 4.0, "buy", 0.5)                  # target 0.7 worth 2.80: zero; 0.5 held worth 2.00
     assert s.target_zeroed and s.legs == ()                     # ... is dust, not a sale leg
+    for difference, quote, side, held in ((0.5, 2.0, "buy", 0.5), (-0.5, 3.0, "sell", 1.5), (1.0, 0.4, "buy", 0.0),
+                                          (-0.99999, 4.99, "sell", 1.99999)):
+        s = split_difference(difference, quote, side, held)   # a target of exactly one share is never zeroed
+        assert not s.target_zeroed, (difference, quote, held)
 
 
 def test_a_purchase_never_yields_a_sale_leg_and_a_sale_never_a_purchase_leg():
