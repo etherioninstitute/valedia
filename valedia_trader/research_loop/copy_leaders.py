@@ -1,9 +1,13 @@
 """The locked "copying the leaders" test: buy one contract after a Polymarket leader's new position, at the first
-price a taker paid for that outcome after the hour, hold it to the resolution, pay three cents, see what is left.
+price the market recorded for that outcome after the hour, hold it to the resolution, pay three cents, see what is
+left.
 
 The specification is docs/research/2026-11-17-copying-leaders-prediction.md (committed as 10ad062, its stated time
-corrected in 12a4454, amended in dec8dd7 before any data: the follower's price is the FIRST taker purchase of the
-same outcome token in that market at or after one hour after the leader's first purchase, within six hours).
+corrected in 12a4454, amended in dec8dd7 and again in a7b9379 before any data: the follower's price is the price of
+the FIRST point of the outcome token's public price history whose timestamp is at or after T = t1 + 1 hour, asked
+for over [T, T + 12 hours), at a grain of three hours or finer (resolution_seconds 0 to 10,800; a tie on time: the
+finer grain), and never a point at or after the market's resolution time, which the program takes from the
+`resolved_at` of /v2/resolutions).
 
     python -m valedia_trader.research_loop.copy_leaders pull --phase 1|2 [--store FILE] [--leave-out W ...]
     python -m valedia_trader.research_loop.copy_leaders develop [--store FILE] [--out-dir DIR] [--leave-out W ...]
@@ -17,19 +21,21 @@ Rules the code holds:
   every traded condition (twenty ids a request, one answer word per id). Phase 2 refuses while phase 1 is
   unfinished; it computes from phase 1 the leaders of every month (standing uses only what precedes the month) and
   their new positions that pass the entry tests, records that plan, and reads for exactly those positions the
-  market's taker prints in [t1, t1 + 30 hours]. Each phase prints how many requests it is about to make first.
+  price windows [t1 + 1 h, +12 h), [t1 + 6 h, +12 h) and [t1 + 24 h, +12 h); then, only for positions whose first
+  usable point after the hour has a grain of five minutes or finer, [t1 + 10 min, +12 h). Each step prints how many
+  requests it is about to make first.
   Raw JSON is kept beside the parsed columns with the time of each read; a walk that did not finish stays marked
   unfinished; a second pull asks only for what is missing.
 * The period wall. Development is every month up to June 2026; sealed is July to October 2026. `develop` reads only
   trades before 2026-07-01 plus one day (the 24-hour purchase sums of 30 June's positions), the resolutions of the
-  conditions so read, and the prints of the development windows only. A leader's standing for month M uses only
+  conditions so read, and the price windows of development positions only. A leader's standing for month M uses only
   trades and resolutions before M began. `sealed` needs the flag and the development file with its hash; before
   its marker it checks from bookkeeping tables alone that phase 1 finished and that every sealed window of the plan
   was pulled; it writes the marker BEFORE any sealed row is read, and runs once.
 * Money is whole cents decided on integers: trade cash is exact micro-dollars, a standing and a 24-hour sum are
   rounded to cents half up, a follower's price is rounded to the cent half up; means are computed at the end.
-* The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, print
-  and row is counted by reason.
+* The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, price
+  point and row is counted by reason.
 """
 from __future__ import annotations
 
@@ -58,6 +64,7 @@ UTC = timezone.utc
 PREDICTION_COMMIT = "10ad062"
 TIME_CORRECTION_COMMIT = "12a4454"
 AMENDMENT_COMMIT = "dec8dd7"
+SECOND_AMENDMENT_COMMIT = "a7b9379"
 PREDICTION_DOC = "docs/research/2026-11-17-copying-leaders-prediction.md"
 
 SEED = 20261117
@@ -79,12 +86,13 @@ MIN_BUY_CENTS = 100_000                   # 1,000 dollars
 FIRST_LO, FIRST_HI = Decimal("0.10"), Decimal("0.90")
 RESOLVE_WITHIN = 45 * DAY
 DELAY = HOUR
-FOLLOW_WINDOW = 6 * HOUR                  # the first taker purchase within [T, T + 6 hours], both ends included
+PRICE_SPAN = 12 * HOUR                    # a price window [T, T + 12 hours): start included, end not
+MAX_GRAIN = 3 * HOUR                      # a point counts at resolution_seconds 0 to 10,800
+FINE_GRAIN = 300                          # the 10-minute figure only where the point used is this fine
 GUARD_LO, GUARD_HI = Decimal("0.05"), Decimal("0.95")
 WIN_PAYOUT = 1_000_000                    # micro-USDC a share
-FEED_AFTER = 30 * HOUR                    # the market feed read for a planned position: [t1, t1 + 30 hours]
-INFO_DELAYS = (("delay_10_minutes", 600), ("delay_6_hours", 6 * HOUR), ("delay_24_hours", DAY))
-WAIT_BUCKETS = ((0, 59), (60, 599), (600, 3599), (3600, FOLLOW_WINDOW))
+HORIZONS = (("main", DELAY), ("delay_6_hours", 6 * HOUR), ("delay_24_hours", DAY))   # windows every position needs
+TEN_MINUTES = ("delay_10_minutes", 600)   # a window read only where the main point's grain is FINE_GRAIN or finer
 BIG_FIRST_MICRO = 10_000 * 1_000_000
 # event slugs taken as sports (information only; neither the trade nor the position row carries a category)
 SPORTS_PREFIXES = ("nfl-", "nba-", "wnba-", "mlb-", "nhl-", "cfb-", "cbb-", "ncaab-", "ncaaf-", "epl-", "ucl-", "uel-",
@@ -211,48 +219,34 @@ def resolution_from_row(row: dict) -> Resolution:
     return Resolution(row["condition_id"], "unresolved", None, None)
 
 
-class Print(NamedTuple):
-    """One taker print of a market: time, order within the walk (oldest first), the taker's side, the token, price."""
+class Point(NamedTuple):
+    """One point of a token's price history: its timestamp (the start of the span it was observed in), its grain in
+    seconds (0 for a terminal point) and its price."""
     ts: int
-    seq: int
-    side: str
-    token: str
+    resolution_seconds: int
     price: Decimal
 
 
-class MarketPrints:
-    """A market's prints sorted by (time, feed order), with the times beside them for bisecting."""
-    __slots__ = ("prints", "times")
-
-    def __init__(self, prints):
-        self.prints = sorted(set(prints), key=lambda p: (p.ts, p.seq))
-        self.times = [p.ts for p in self.prints]
-
-    def __iter__(self):
-        return iter(self.prints)
-
-    def __len__(self):
-        return len(self.prints)
-
-
-def follow_print(prints, token: str, moment: int):
-    """The first print in [moment, moment + 6 hours] in which a taker BOUGHT `token` at a price in (0, 1).
-    Returns (print, None, passed) or (None, 'no_buyer_print_after_the_hour', passed); `passed` counts the prints of
-    the window passed over before it, by reason."""
-    mp = prints if isinstance(prints, MarketPrints) else MarketPrints(prints)
-    passed = Counter()
-    for p in mp.prints[bisect_left(mp.times, moment):]:
-        if p.ts > moment + FOLLOW_WINDOW:
-            break
-        if p.side != "BUY":
-            passed["print_not_a_buy"] += 1
-        elif p.token != token:
-            passed["print_other_token"] += 1
-        elif not Decimal(0) < p.price < Decimal(1):
-            passed["print_price_not_in_0_1"] += 1
-        else:
-            return p, None, passed
-    return None, "no_buyer_print_after_the_hour", passed
+def follow_point(points, moment: int, resolved_ts: int):
+    """The point of `points` (one price window) that prices a follower at `moment`: among the points with timestamp in
+    [moment, moment + 12 hours), grain 0 to 10,800 seconds and timestamp before the market's resolution, the earliest;
+    a tie on time, the finer grain. Returns (point, None, passed) or (None, 'no_price_point_after_the_hour', passed);
+    `passed` counts every point of the window not usable, by reason."""
+    passed, best = Counter(), None
+    for p in points:
+        if p.ts < moment:
+            passed["point_before_the_moment"] += 1
+        elif p.ts >= moment + PRICE_SPAN:
+            passed["point_after_the_window"] += 1
+        elif p.ts >= resolved_ts:
+            passed["point_at_or_after_resolution"] += 1
+        elif not 0 <= p.resolution_seconds <= MAX_GRAIN:
+            passed["point_coarser_than_3_hours"] += 1
+        elif best is None or (p.ts, p.resolution_seconds) < (best.ts, best.resolution_seconds):
+            best = p
+    if best is None:
+        return None, "no_price_point_after_the_hour", passed
+    return best, None, passed
 
 
 # ---------------------------------------------------------------- new positions
@@ -336,16 +330,21 @@ class CopiedTrade(NamedTuple):
     leader_price_micro: int
     first_cash_micro: int
     wait_seconds: int
+    grain: int
     sports: bool
 
 
-def copy_trades(positions, resolutions: dict, prints: dict, delay: int = DELAY, passed: Counter | None = None):
-    """The follower's trades for these leader positions: one contract at the first taker purchase of the same token
-    at or after `delay` seconds after the first purchase (within six hours), if that price is from 0.05 to 0.95 and
-    the market had not resolved by the moment. `prints` maps a condition to its prints. Returns (trades, skips);
-    prints passed over are added to `passed` when given."""
+def price_key(token: str, start: int) -> str:
+    """The name of the price window [start, start + 12 hours) of `token`."""
+    return "%s@%d" % (token, start)
+
+
+def copy_trades(positions, resolutions: dict, points: dict, delay: int = DELAY, passed: Counter | None = None):
+    """The follower's trades for these leader positions: one contract at the first usable price point at or after
+    `delay` seconds after the first purchase (see follow_point), if that price is from 0.05 to 0.95 and the market
+    had not resolved by the moment. `points` maps a price window's key to its points. Returns (trades, skips);
+    points passed over are added to `passed` when given."""
     out, skips = [], Counter()
-    cache: dict = {}
     for pos in positions:
         why = position_skip(pos, resolutions)
         if why:
@@ -356,27 +355,23 @@ def copy_trades(positions, resolutions: dict, prints: dict, delay: int = DELAY, 
         if r.resolved_ts <= moment:
             skips["resolved_before_follow"] += 1
             continue
-        mp = prints.get(pos.condition)
-        if mp is None:
-            skips["no_market_feed"] += 1
+        pts = points.get(price_key(pos.token, moment))
+        if pts is None:
+            skips["no_price_window"] += 1
             continue
-        if not isinstance(mp, MarketPrints):
-            if pos.condition not in cache:
-                cache[pos.condition] = MarketPrints(mp)
-            mp = cache[pos.condition]
-        pr, why, over = follow_print(mp, pos.token, moment)
+        pt, why, over = follow_point(pts, moment, r.resolved_ts)
         if passed is not None:
             passed.update(over)
         if why:
             skips[why] += 1
             continue
-        if not GUARD_LO <= pr.price <= GUARD_HI:
+        if not GUARD_LO <= pt.price <= GUARD_HI:
             skips["follow_price_outside_0.05_0.95"] += 1
             continue
         win = r.payouts[pos.outcome_index] == WIN_PAYOUT
-        out.append(CopiedTrade(pos.event, price_cents(pr.price), win, pos.wallet, pos.t1, pos.token,
-                               half_up(pos.price * 1_000_000), pos.first_cash_micro, pr.ts - moment,
-                               is_sports(pos.event) or is_sports(pos.slug)))
+        out.append(CopiedTrade(pos.event, price_cents(pt.price), win, pos.wallet, pos.t1, pos.token,
+                               half_up(pos.price * 1_000_000), pos.first_cash_micro, pt.ts - moment,
+                               pt.resolution_seconds, is_sports(pos.event) or is_sports(pos.slug)))
     return out, skips
 
 
@@ -599,21 +594,30 @@ def _months_for(period: str, trades: dict) -> list:
     return out
 
 
-def market_key(condition: str, t1: int) -> str:
-    return "%s@%d" % (condition, t1)
+def position_key(token: str, t1: int) -> str:
+    return "%s@%d" % (token, t1)
 
 
 class Target(NamedTuple):
-    """A market window the rule needs: the leaders' position(s) first bought at t1 in that market, in `month`."""
+    """A planned position: the leaders' new position(s) in `token` first bought at t1, in `month`."""
     condition: str
+    token: str
     t1: int
     month: tuple
     wallets: tuple
 
 
+class PriceWindow(NamedTuple):
+    """A price window the plan reads: [start, start + 12 hours) of `token`, for horizon `horizon` of `target`."""
+    token: str
+    start: int
+    horizon: str
+    target: str
+
+
 def plan_targets(books: dict, positions: dict, resolutions: dict, months) -> dict:
-    """{market key: Target} for every new position of a month's leaders, first bought in that month, that passes the
-    entry tests (which need no price)."""
+    """{position key: Target} for every new position of a month's leaders, first bought in that month, that passes
+    the entry tests (which need no price)."""
     out: dict = {}
     for m in months:
         leaders, _ = leaders_of(books, m)
@@ -621,9 +625,35 @@ def plan_targets(books: dict, positions: dict, resolutions: dict, months) -> dic
         for w in leaders:
             for p in positions.get(w, []):
                 if m0 <= p.t1 < m1 and position_skip(p, resolutions) is None:
-                    k = market_key(p.condition, p.t1)
+                    k = position_key(p.token, p.t1)
                     old = out.get(k)
-                    out[k] = Target(p.condition, p.t1, tuple(m), tuple(sorted(set((old.wallets if old else ()) + (w,)))))
+                    out[k] = Target(p.condition, p.token, p.t1, tuple(m),
+                                    tuple(sorted(set((old.wallets if old else ()) + (w,)))))
+    return out
+
+
+def base_windows(targets: dict) -> dict:
+    """{window key: PriceWindow} of the horizons every planned position needs."""
+    out = {}
+    for k, tg in sorted(targets.items()):
+        for h, d in HORIZONS:
+            out.setdefault(price_key(tg.token, tg.t1 + d), PriceWindow(tg.token, tg.t1 + d, h, k))
+    return out
+
+
+def ten_minute_windows(targets: dict, points: dict, resolutions: dict) -> dict:
+    """{window key: PriceWindow} of the 10-minute horizon: only for positions whose main window is in `points` and
+    whose first usable point there has a grain of FINE_GRAIN seconds or finer (the grain decides; no price does)."""
+    out = {}
+    for k, tg in sorted(targets.items()):
+        pts = points.get(price_key(tg.token, tg.t1 + DELAY))
+        r = resolutions.get(tg.condition)
+        if pts is None or r is None or r.resolved_ts is None:
+            continue
+        pt, _, _ = follow_point(pts, tg.t1 + DELAY, r.resolved_ts)
+        if pt is not None and pt.resolution_seconds <= FINE_GRAIN:
+            start = tg.t1 + TEN_MINUTES[1]
+            out.setdefault(price_key(tg.token, start), PriceWindow(tg.token, start, TEN_MINUTES[0], k))
     return out
 
 
@@ -643,9 +673,12 @@ CREATE INDEX IF NOT EXISTS trades_ts ON trades (wallet, timestamp);
 CREATE TABLE IF NOT EXISTS resolutions (condition_id TEXT PRIMARY KEY, status TEXT, payouts TEXT, resolved_at TEXT,
     resolved_ts INTEGER, raw TEXT NOT NULL, read_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resolution_answers (condition_id TEXT PRIMARY KEY, answer TEXT NOT NULL, read_at TEXT);
-CREATE TABLE IF NOT EXISTS plan (key TEXT PRIMARY KEY, condition_id TEXT, t1 INTEGER, month TEXT, wallets TEXT);
-CREATE TABLE IF NOT EXISTS market_prints (walk_key TEXT, seq INTEGER, condition_id TEXT, token_id TEXT, side TEXT,
-    price REAL, size REAL, timestamp INTEGER, transaction_hash TEXT, raw TEXT NOT NULL, read_at TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS plan (key TEXT PRIMARY KEY, condition_id TEXT, token_id TEXT, t1 INTEGER, month TEXT,
+    wallets TEXT);
+CREATE TABLE IF NOT EXISTS plan_windows (key TEXT PRIMARY KEY, token_id TEXT, start INTEGER, horizon TEXT,
+    target TEXT);
+CREATE TABLE IF NOT EXISTS price_points (walk_key TEXT, seq INTEGER, token_id TEXT, price REAL,
+    resolution_seconds INTEGER, timestamp INTEGER, raw TEXT NOT NULL, read_at TEXT NOT NULL,
     PRIMARY KEY (walk_key, seq));
 CREATE TABLE IF NOT EXISTS rejects (kind TEXT, key TEXT, reason TEXT, raw TEXT, read_at TEXT);
 """
@@ -779,30 +812,45 @@ class Store:
         return dict(self.db.execute("SELECT condition_id, answer FROM resolution_answers"))
 
     def record_plan(self, targets: dict, leave_out, months) -> None:
+        """The plan: the planned positions and their base windows; the 10-minute windows are added later."""
         self.db.execute("DELETE FROM plan")
+        self.db.execute("DELETE FROM plan_windows")
         for k, tg in targets.items():
-            self.db.execute("INSERT INTO plan VALUES (?,?,?,?,?)", (k, tg.condition, tg.t1, month_name(tg.month),
-                                                                    _j(list(tg.wallets))))
+            self.db.execute("INSERT INTO plan VALUES (?,?,?,?,?,?)", (k, tg.condition, tg.token, tg.t1,
+                                                                      month_name(tg.month), _j(list(tg.wallets))))
+        windows = base_windows(targets)
+        self.add_plan_windows(windows)
         self.set_meta("plan", {"made_at": _now(), "leave_out": sorted(leave_out),
-                               "months": [month_name(m) for m in months], "windows": len(targets)})
+                               "months": [month_name(m) for m in months], "positions": len(targets),
+                               "windows": len(windows), "ten_minute_windows_added": False})
+
+    def add_plan_windows(self, windows: dict) -> None:
+        for k, wd in windows.items():
+            self.db.execute("INSERT OR IGNORE INTO plan_windows VALUES (?,?,?,?,?)",
+                            (k, wd.token, wd.start, wd.horizon, wd.target))
 
     def plan(self) -> dict:
         out = {}
-        for k, cond, t1, month, wallets in self.db.execute("SELECT key, condition_id, t1, month, wallets FROM plan"):
+        for k, cond, token, t1, month, wallets in self.db.execute(
+                "SELECT key, condition_id, token_id, t1, month, wallets FROM plan"):
             y, m = month.split("-")
-            out[k] = Target(cond, t1, (int(y), int(m)), tuple(json.loads(wallets)))
+            out[k] = Target(cond, token, t1, (int(y), int(m)), tuple(json.loads(wallets)))
         return out
 
-    def finish_market(self, key: str, condition: str, t1: int, w) -> None:
-        """One market window [t1, t1 + 30 hours], newest first as served; `seq` counts from the oldest."""
-        self.db.execute("DELETE FROM market_prints WHERE walk_key=?", (key,))
+    def plan_windows(self) -> dict:
+        return {k: PriceWindow(tok, start, h, tg) for k, tok, start, h, tg in self.db.execute(
+            "SELECT key, token_id, start, horizon, target FROM plan_windows")}
+
+    def finish_prices(self, key: str, w) -> None:
+        """One price window, its points in the order served."""
+        self.db.execute("DELETE FROM price_points WHERE walk_key=?", (key,))
+        self.db.execute("DELETE FROM rejects WHERE kind='prices' AND key=?", (key,))
+        token = key.rsplit("@", 1)[0]
         good_raw = [raw for raw, why in w.raw if not why]
-        n = len(w.rows)
         for i, (row, at) in enumerate(zip(w.rows, w.row_read_at)):
-            self.db.execute("INSERT INTO market_prints VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
-                key, n - 1 - i, row["condition_id"], row["token_id"], row["side"], row["price"], row["size"],
-                row["timestamp"], row["transaction_hash"], _j(good_raw[i]), at))
-        self._finish("market", key, w)
+            self.db.execute("INSERT INTO price_points VALUES (?,?,?,?,?,?,?,?)", (
+                key, i, token, row["price"], row["resolution_seconds"], row["timestamp"], _j(good_raw[i]), at))
+        self._finish("prices", key, w)
 
     # ------------------------------------------------------------ reads for the analysis
     def trade_rows(self, wallet: str, max_ts: int) -> list:
@@ -826,24 +874,23 @@ class Store:
                              "resolved_at": resolved_at, "resolved_ts": resolved_ts}
         return out
 
-    def market_prints(self, keys, counts: Counter | None = None) -> dict:
-        """{condition: MarketPrints} from the named windows only. Rows read twice (overlapping windows of one market)
-        are kept once; the feed order within a second is kept."""
-        out: dict = defaultdict(set)
+    def price_points(self, keys, counts: Counter | None = None) -> dict:
+        """{window key: [Point]} of the named windows that finished (a window not finished is absent)."""
+        done = self.finished_keys("prices")
+        out: dict = {}
         for k in sorted(set(keys)):
-            for seq, cond, token, side, price, ts, txh, size in self.db.execute(
-                    "SELECT seq, condition_id, token_id, side, price, timestamp, transaction_hash, size FROM market_prints "
-                    "WHERE walk_key=?", (k,)):
-                if not pd.is_number(price):
+            if k not in done:
+                continue
+            pts = []
+            for ts, res, price in self.db.execute("SELECT timestamp, resolution_seconds, price FROM price_points "
+                                                  "WHERE walk_key=? ORDER BY seq", (k,)):
+                if not pd.is_number(price) or not isinstance(res, int) or not isinstance(ts, int):
                     if counts is not None:
-                        counts["print_bad_price"] += 1
+                        counts["point_bad_row"] += 1
                     continue
-                out[cond].add((ts, txh, token, side, dec(price), size, seq))
-        res = {}
-        for cond, rows in out.items():
-            ordered = sorted(rows, key=lambda r: (r[0], r[6], r[1], r[2]))
-            res[cond] = MarketPrints([Print(r[0], i, r[3], r[2], r[4]) for i, r in enumerate(ordered)])
-        return res
+                pts.append(Point(ts, res, dec(price)))
+            out[k] = pts
+        return out
 
 
 def _stored_trades(s: Store, wallets, max_ts: int, counts: Counter | None = None) -> dict:
@@ -886,8 +933,8 @@ def phase1_problems(s: Store, leave_out=()) -> list:
 
 
 def plan_store(s: Store, leave_out=()) -> dict:
-    """Compute from phase 1 the market windows of the leaders' qualifying positions of every development and sealed
-    month, record them as the plan, and return them."""
+    """Compute from phase 1 the leaders' qualifying positions (and their base price windows) of every development
+    and sealed month, record them as the plan, and return them."""
     leave = sorted(set(leave_out))
     done = s.finished_keys("trades")
     wallets = [w for w in s.candidates() if w not in leave and w in done]
@@ -958,24 +1005,49 @@ def _pull_phase1(s: Store, client, say, errors) -> None:
     _guarded(errors, "resolutions", batches)
 
 
+def add_ten_minute_windows(s: Store) -> dict:
+    """Add to the plan the 10-minute windows its finished main windows call for (by grain only); returns them."""
+    plan = s.plan()
+    res = _resolutions(s, {tg.condition for tg in plan.values()})
+    main = [price_key(tg.token, tg.t1 + DELAY) for tg in plan.values()]
+    windows = ten_minute_windows(plan, s.price_points(main), res)
+    s.add_plan_windows(windows)
+    meta = s.meta("plan") or {}
+    meta.update({"ten_minute_windows_added": True, "windows": len(s.plan_windows())})
+    s.set_meta("plan", meta)
+    return windows
+
+
+def _read_windows(s: Store, client, windows: dict, errors) -> None:
+    for k in sorted(windows):
+        wd = windows[k]
+        s.start_walk("prices", k)
+        s.commit()
+        _guarded(errors, "prices %s" % k, lambda k=k, wd=wd: s.finish_prices(
+            k, client.prices_history(wd.token, wd.start, wd.start + PRICE_SPAN)))
+        s.commit()
+
+
 def _pull_phase2(s: Store, client, leave_out, say, errors) -> None:
     problems = phase1_problems(s, leave_out)
     if problems:
         raise Refused("phase 1 is unfinished: %s; finish it (or name the wallets with --leave-out)" % "; ".join(problems))
     plan = plan_store(s, leave_out)
     s.commit()
-    done = s.finished_keys("market")
-    todo = sorted(k for k in plan if k not in done)
-    say("phase 2: %d market windows planned, %d to read: about to make at least %d requests, at least %s at three a "
-        "second (a market busy after the purchase takes one more request per 1,000 prints)"
+    done = s.finished_keys("prices")
+    todo = {k: wd for k, wd in s.plan_windows().items() if k not in done}
+    say("phase 2: %d positions planned; about to make at least %d requests for %d price windows (one hour, six "
+        "hours and 24 hours after each first purchase), at least %s at three a second"
         % (len(plan), len(todo), len(todo), _eta(len(todo))))
-    for k in todo:
-        tg = plan[k]
-        s.start_walk("market", k)
-        s.commit()
-        _guarded(errors, "market %s" % k, lambda k=k, tg=tg: s.finish_market(
-            k, tg.condition, tg.t1, client.market_trades(tg.condition, tg.t1, tg.t1 + FEED_AFTER)))
-        s.commit()
+    _read_windows(s, client, todo, errors)
+    if errors:
+        return                                     # the 10-minute step waits for every main window
+    done = s.finished_keys("prices")
+    ten = {k: wd for k, wd in add_ten_minute_windows(s).items() if k not in done}
+    s.commit()
+    say("phase 2: about to make %d requests for the 10-minute windows of positions priced at a five-minute grain, "
+        "%s at three a second" % (len(ten), _eta(len(ten))))
+    _read_windows(s, client, ten, errors)
 
 
 # ---------------------------------------------------------------- loading, with the period wall
@@ -985,7 +1057,7 @@ class Data:
     candidates: list
     trades: dict
     resolutions: dict
-    prints: dict
+    points: dict
     counts: Counter
     wallets_left_out: list
     unfinished_left_out: list
@@ -1003,8 +1075,8 @@ def _period_bounds(period: str) -> tuple[int, int]:
 
 def load(store, period: str, leave_out=()) -> Data:
     """The data of one period, the wall applied in the reads: trades before the period's end plus one day, the
-    resolutions of those trades' conditions, the prints of this period's market windows only. Refuses an unfinished
-    pull unless every wallet it touches is left out."""
+    resolutions of those trades' conditions, the price windows of this period's positions only. Refuses an
+    unfinished pull unless every wallet it touches is left out."""
     lo, hi = _period_bounds(period)
     path = Path(store)
     if not path.is_file():
@@ -1031,17 +1103,19 @@ def load(store, period: str, leave_out=()) -> Data:
         positions = {w: new_positions(ts) for w, ts in trades.items()}
         months = _months_for(period, trades)
         targets = {k: tg for k, tg in plan_targets(books, positions, resolutions, months).items() if lo <= tg.t1 < hi}
-        market_done = s.finished_keys("market")
-        for k, tg in targets.items():
-            if k not in market_done:
-                for w in tg.wallets:
-                    implicated.setdefault(w, []).append("market window %s not pulled" % k)
+        windows = base_windows(targets)
+        points = s.price_points(windows, counts)
+        windows.update(ten_minute_windows(targets, points, resolutions))
+        points = s.price_points(windows, counts)
+        for k, wd in windows.items():
+            if k not in points:
+                for w in targets[wd.target].wallets:
+                    implicated.setdefault(w, []).append("price window %s not pulled" % k)
         missing = sorted(w for w in implicated if w not in leave)
         if missing:
             raise Refused("the pull is unfinished for wallets %s (%s); name them with --leave-out to run without them"
                           % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10])))
-        prints = s.market_prints(targets, counts)
-    return Data(period, kept, trades, resolutions, prints, counts, leave,
+    return Data(period, kept, trades, resolutions, points, counts, leave,
                 sorted(w for w in implicated if w in leave), months)
 
 
@@ -1057,14 +1131,21 @@ def _info_block(trades, cost: int, **extra) -> dict:
     return d
 
 
-def _wait_table(trades) -> dict:
-    c = Counter()
-    for t in trades:
-        for a, b in WAIT_BUCKETS:
-            if a <= t.wait_seconds <= b:
-                c["%d_to_%d" % (a, b)] += 1
-                break
-    return dict(sorted(c.items()))
+def _quantile(xs, q: Fraction):
+    """The nearest-rank quantile of whole numbers: the smallest x with at least q of the values at or below it."""
+    if not xs:
+        return None
+    xs = sorted(xs)
+    k = -(-(q.numerator * len(xs)) // q.denominator)
+    return xs[max(k, 1) - 1]
+
+
+def _point_table(trades, passed: Counter) -> dict:
+    grains = Counter(str(t.grain) for t in trades)
+    waits = [t.wait_seconds for t in trades]
+    return {"note": NOTE, "grain_seconds": dict(sorted(grains.items(), key=lambda kv: int(kv[0]))),
+            "delay_seconds": {"median": _quantile(waits, Fraction(1, 2)), "p90": _quantile(waits, Fraction(9, 10))},
+            "points_passed_over": dict(sorted(passed.items()))}
 
 
 def analyze(data: Data) -> dict:
@@ -1074,7 +1155,8 @@ def analyze(data: Data) -> dict:
     book_counts = Counter()
     for b in books.values():
         book_counts.update(b.counts)
-    main, info_trades, info_skips = [], {k: [] for k, _ in INFO_DELAYS}, {k: Counter() for k, _ in INFO_DELAYS}
+    info_delays = HORIZONS[1:] + (TEN_MINUTES,)
+    main, info_trades, info_skips = [], {k: [] for k, _ in info_delays}, {k: Counter() for k, _ in info_delays}
     wallet_skips, position_skips, months_left_out, passed, table = Counter(), Counter(), Counter(), Counter(), []
     leader_months = []
     for m in data.months:
@@ -1088,17 +1170,24 @@ def analyze(data: Data) -> dict:
         leader_months += [(m, w) for w in leaders]
         m0, m1 = month_start(*m), month_start(*add_months(m, 1))
         pos = [p for w in leaders for p in positions.get(w, []) if m0 <= p.t1 < m1 and lo <= p.t1 < hi]
-        got, sk = copy_trades(pos, data.resolutions, data.prints, DELAY, passed)
+        got, sk = copy_trades(pos, data.resolutions, data.points, DELAY, passed)
         main += got
         position_skips.update(sk)
-        for k, d in INFO_DELAYS:
-            g, s2 = copy_trades(pos, data.resolutions, data.prints, d)
+        for k, d in info_delays:
+            g, s2 = copy_trades(pos, data.resolutions, data.points, d)
+            if k == TEN_MINUTES[0]:
+                # read only where the main point's grain is five minutes or finer; the figure only at that grain
+                s2["main_point_coarser_than_5_minutes"] = s2.pop("no_price_window", 0)
+                s2["point_coarser_than_5_minutes"] = sum(1 for t in g if t.grain > FINE_GRAIN)
+                g = [t for t in g if t.grain <= FINE_GRAIN]
+                s2 = +s2
             info_trades[k] += g
             info_skips[k].update(s2)
         table.append({"month": month_name(m), "leaders": leaders, "left_out": None, "copied": len(got),
                       "positions": len(pos)})
     info = {k: _info_block(info_trades[k], COST_CENTS, delay_seconds=d, position_skips=dict(sorted(info_skips[k].items())))
-            for k, d in INFO_DELAYS}
+            for k, d in info_delays}
+    info["cost_4_cents"] = _info_block(main, 4)
     info["cost_2_cents"] = _info_block(main, 2)
     info["cost_0_cents"] = _info_block(main, 0)
     info["sports"] = _info_block([t for t in main if t.sports], COST_CENTS, rule="event slug starts with a league prefix")
@@ -1107,8 +1196,7 @@ def analyze(data: Data) -> dict:
     own = [(1_000_000 if t.win else 0) - t.leader_price_micro for t in main]
     info["leaders_own_prices"] = {"note": NOTE, "trades": len(main), "events": len({t.event for t in main}),
                                   "cost_cents": 0, "mean_cents": (sum(own) / len(own) / 10_000) if own else None}
-    info["follow_print_wait"] = {"note": NOTE, "seconds_after_the_moment": _wait_table(main),
-                                 "prints_passed_over": dict(sorted(passed.items()))}
+    info["follow_point"] = _point_table(main, passed)
     return {"period": data.period, "months": [month_name(m) for m in data.months], "candidates": len(data.candidates),
             "wallets_left_out": data.wallets_left_out, "unfinished_left_out": data.unfinished_left_out,
             "load_rejects": dict(sorted(data.counts.items())), "book_counts": dict(sorted(book_counts.items())),
@@ -1163,7 +1251,8 @@ def _provenance(store: Path) -> dict:
     with Store(store) as s:
         boards = s.board_read_at()
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
-            "amendment_commit": AMENDMENT_COMMIT, "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
+            "amendment_commit": AMENDMENT_COMMIT, "second_amendment_commit": SECOND_AMENDMENT_COMMIT,
+            "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
             "store": str(store), "boards_read_at": boards}
 
 
@@ -1216,7 +1305,8 @@ def _check_development_file(dev: Path, leave_out: list) -> str:
 
 def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
     """From bookkeeping tables only (no trade, price or result of a sealed month): phase 1 finished, a plan made with
-    these wallets left out that covers the sealed months, and every sealed window of that plan pulled and finished."""
+    these wallets left out that covers the sealed months and has its 10-minute windows, and every sealed window of
+    that plan pulled and finished."""
     out = phase1_problems(s, leave)
     plan_meta = s.meta("plan")
     if plan_meta is None:
@@ -1226,11 +1316,14 @@ def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
                    % (plan_meta.get("leave_out"), leave))
     if not all(month_name(m) in plan_meta.get("months", []) for m in SEALED_MONTHS):
         out.append("the plan does not cover the sealed months")
-    done = s.finished_keys("market")
-    sealed = [k for k, tg in s.plan().items() if tuple(tg.month) in SEALED_MONTHS]
+    if not plan_meta.get("ten_minute_windows_added"):
+        out.append("the 10-minute windows were not yet planned: price windows not pulled; run pull --phase 2")
+    done = s.finished_keys("prices")
+    plan = s.plan()
+    sealed = [k for k, wd in s.plan_windows().items() if tuple(plan[wd.target].month) in SEALED_MONTHS]
     missing = sorted(k for k in sealed if k not in done)
     if missing:
-        out.append("%d of %d sealed market windows not pulled (first: %s)" % (len(missing), len(sealed), missing[0]))
+        out.append("%d of %d sealed price windows not pulled (first: %s)" % (len(missing), len(sealed), missing[0]))
     return out
 
 
@@ -1278,8 +1371,8 @@ def format_table(doc: dict) -> str:
     r = doc["result"]
     sb = r["sells_beyond_holding"]
     share = sb["share_of_leader_sells"]
-    lines = ["copying the leaders, %s period (prediction %s, amended %s)" % (r["period"], PREDICTION_COMMIT,
-                                                                             AMENDMENT_COMMIT),
+    lines = ["copying the leaders, %s period (prediction %s, amended %s and %s)" % (
+                 r["period"], PREDICTION_COMMIT, AMENDMENT_COMMIT, SECOND_AMENDMENT_COMMIT),
              "candidates %d; wallets left out: %s%s" % (
                  r["candidates"], r["wallets_left_out"] or "none",
                  " (unfinished in the pull: %s)" % r["unfinished_left_out"] if r["unfinished_left_out"] else ""),
@@ -1310,8 +1403,10 @@ def format_table(doc: dict) -> str:
             lines.append("%s: %s: trades %s, events %s, mean %s cents" % (NOTE, k, v["trades"], v["events"],
                                                                          _fmt(v["mean_cents"], 4)))
         else:
-            lines.append("%s: %s: %s; passed over %s" % (NOTE, k, v["seconds_after_the_moment"],
-                                                         v["prints_passed_over"]))
+            lines.append("%s: %s: grain used (seconds: trades) %s; delay from the moment to the point, median %s s, "
+                         "90th percentile %s s; points passed over %s" % (
+                             NOTE, k, v["grain_seconds"], v["delay_seconds"]["median"], v["delay_seconds"]["p90"],
+                             v["points_passed_over"]))
     return "\n".join(lines)
 
 

@@ -150,7 +150,8 @@ def test_the_first_point_at_or_after_the_moment_at_three_hours_or_finer_before_t
            PT(moment + 9000, 0.48, 300), PT(end, 1.0, 0)]
     pt, why, passed = cl.follow_point(pts, moment, end)
     assert why is None and pt.price == Decimal("0.47") and pt.resolution_seconds == 3 * HOUR
-    assert passed == Counter({"point_before_the_moment": 1, "point_coarser_than_3_hours": 1})
+    assert passed == Counter({"point_before_the_moment": 1, "point_coarser_than_3_hours": 1,
+                              "point_after_the_window": 1})
 
 
 @pytest.mark.parametrize("offset,found", [(0, True), (12 * HOUR - 1, True), (12 * HOUR, False), (-1, False)])
