@@ -2,7 +2,7 @@
 the stager or the launcher, sends a request to LM Studio, opens the collector's real store, loads a model or signals a real
 process: a World object stands in for all of them (an injected command runner, spawn, HTTP function, clock and sleeper, signal
 sender and model load path) and a scratch SQLite file stands in for the collector's store."""
-import ast, copy, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, types, unittest
+import ast, copy, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, time, types, unittest
 from pathlib import Path
 
 HERE = Path(__file__).absolute().parent
@@ -62,6 +62,8 @@ class FakeLauncher:
                 receipt.update(complete=False, failure={'type': 'NativeRefused', 'reason': 'supervisor interrupted'})
             (self.work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
             (self.work / 'builder/gateway-ledger.json').write_text(json.dumps(w.ledger))
+            if w.procs.get(LAUNCHER_PID, {}).get('termed_at') is not None and w.native_left_after_interrupt:
+                w.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-left', 'config': {}}]})
             w.procs.pop(OBSERVER_PID, None); w.procs.pop(LAUNCHER_PID, None)
             self.returncode = 0 if receipt.get('complete') else 1
         return self.returncode
@@ -98,7 +100,7 @@ class FakeLoadPath:
 
 class World:
     def __init__(self, tmp):
-        self.tmp = Path(tmp); self.t = T0
+        self.tmp = Path(tmp); self.t = T0 + 30            # half a minute past a full hour: clear of the pick reader's start
         self.store = self.tmp / 'orderbook_loop.sqlite'
         with sqlite3.connect(self.store) as db:
             db.executescript(SCHEMA)
@@ -108,7 +110,7 @@ class World:
         self.picks_loaded = True; self.bootout_rc = 0; self.bootstrap_rc = 0; self.picks_running = False
         self.link_text = LINK_OFF; self.link_rc = 0
         self.write_identity = True; self.pipeline_writes_identity = True; self.launcher_pgid = LAUNCHER_PID
-        self.group_signals = []
+        self.native_left_after_interrupt = False; self.picks_minute = None
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {}; self.calls = []; self.http_calls = []; self.signals = []; self.out = []
@@ -155,8 +157,11 @@ class World:
                 if not self.picks_loaded:
                     return done(113, '', 'Could not find service')
                 state = 'running\n\tpid = 6161' if self.picks_running else 'not running'
+                trigger = '' if self.picks_minute is None else (
+                    '\tevent triggers = {\n\t\tcom.valedia.picks.hourly.1 => {\n\t\t\tdescriptor = {\n'
+                    '\t\t\t\t"Minute" => %d\n\t\t\t}\n\t\t}\n\t}\n' % self.picks_minute)
                 return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = %s\n\targuments = {\n'
-                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n}\n' % (PICKS_PLIST, state))
+                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n%s}\n' % (PICKS_PLIST, state, trigger))
         if argv[:2] == ['/bin/launchctl', 'bootout']:
             if self.bootout_rc == 0:
                 self.picks_loaded = False
@@ -206,12 +211,6 @@ class World:
                 {'pid': OBSERVER_PID, 'start': self.identity_start, 'pgid': OBSERVER_PID, 'written_utc': '2026-11-16T12:00:05+00:00'}))
         self.launcher = FakeLauncher(self, work); return self.launcher
 
-    def send_group_signal(self, pgid, sig):
-        self.group_signals.append((pgid, sig))
-        for proc in self.procs.values():
-            if proc['pgid'] == pgid:
-                proc.setdefault('termed_at', self.t)
-
     def send_signal(self, pid, sig):
         self.signals.append((pid, sig))
         if pid in self.procs:
@@ -231,7 +230,7 @@ class World:
 
     def host(self, **overrides):
         values = dict(run=self.run, spawn=self.spawn, http=self.http, now=self.now, sleep=self.sleep,
-                      send_signal=self.send_signal, send_group_signal=self.send_group_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
+                      send_signal=self.send_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
                       crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
                       load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
                       out=self.out.append, lms='/fake/bin/lms')
@@ -356,7 +355,7 @@ class Pure(unittest.TestCase):
         self.assertEqual(OP.streaks(rows + [row('swarm8', False)])['9']['streak'], 0)
 
     def test_verdicts(self):
-        base = dict(collector={'breach': None, 'over_8s': 0, 'model_failures': 0},
+        base = dict(collector={'breach': None, 'over_8s': 0, 'model_failures': 0, 'statuses': {'ok': 40}},
                     pipeline={'failed_calls': 0, 'refused_calls': 0, 'memory_stop': False, 'swaps_clean': True,
                               'cleanup_proven': True, 'failure': None, 'report_usable': True},
                     memory={'lowest_sustained_free_percent_10s': 40})
@@ -372,6 +371,19 @@ class Pure(unittest.TestCase):
         self.assertTrue(OP.verdicts(**b)['pipeline_clean'])
         b = copy.deepcopy(base); b['pipeline']['memory_stop'] = True
         self.assertFalse(OP.verdicts(**b)['pipeline_clean'])
+
+    def test_collector_unharmed_by_status_counts_correction_b(self):
+        def unharmed(statuses, breach=None):
+            c = {'breach': breach, 'over_8s': 0, 'model_failures': sum(v for k, v in statuses.items() if k != 'ok'),
+                 'statuses': dict(statuses, ok=40)}
+            return OP.verdicts(collector=c, pipeline={}, memory={})['collector_unharmed']
+        self.assertTrue(unharmed({}))
+        self.assertTrue(unharmed({'error': 1}))                       # one error alone does not fail it
+        self.assertFalse(unharmed({'error': 2}))
+        self.assertFalse(unharmed({'late': 1}))
+        self.assertFalse(unharmed({'model_unavailable': 1})); self.assertFalse(unharmed({'tag_mismatch': 1}))
+        self.assertTrue(unharmed({'stale_data': 3}))
+        self.assertFalse(unharmed({}, breach='no heartbeat for 160 s'))
 
 
 class Check(Base):
@@ -460,6 +472,61 @@ class Refusals(Base):
         self.assertRefused('Mon Nov 16 12:00:01 2026')
         self.assertIn('running', self.w.rows()[-1]['refused'])
 
+    # ---- correction C: from 2 minutes before each full hour until the reader is seen idle after it (local clock)
+    def at_local(self, mm, ss):
+        """Sleep the world forward (never zero) to the next local time hh:mm:ss with the given minutes and seconds."""
+        lt = time.localtime(self.w.t)
+        self.w.sleep((mm * 60 + ss - (lt.tm_min * 60 + lt.tm_sec)) % 3600 or 3600)
+        lt = time.localtime(self.w.t); self.assertEqual((lt.tm_min, lt.tm_sec), (mm, ss))
+
+    def reader(self, running):
+        self.w.picks_running = running
+        if running:
+            self.w.procs[6161] = {'start': 'Mon Nov 16 13:00:01 2026', 'pgid': 6161}
+
+    def test_c_57_59_reader_running_refused(self):
+        self.at_local(57, 59); self.reader(True); self.assertRefused('is running')
+
+    def test_c_57_59_reader_idle_launches(self):
+        self.at_local(57, 59); self.reader(False)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_c_58_00_reader_running_refused(self):
+        self.at_local(58, 0); self.reader(True); self.assertRefused('due')
+
+    def test_c_58_00_reader_idle_is_still_refused_and_not_booted_out(self):
+        self.at_local(58, 0); self.reader(False); self.assertRefused('due')
+        self.assertIn('2 minutes', self.w.rows()[-1]['refused'])
+
+    def test_c_00_30_reader_running_refused(self):
+        self.at_local(0, 30); self.reader(True); self.assertRefused('is running')
+
+    def test_c_00_30_reader_idle_again_launches(self):
+        self.at_local(0, 30); self.reader(False)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_c_on_the_hour_second_is_not_yet_after_it(self):
+        self.at_local(0, 2); self.reader(False); self.assertRefused('not yet seen idle')
+
+    def test_c_the_scheduled_minute_is_read_from_launchd(self):
+        self.w.picks_minute = 7
+        self.at_local(5, 30); self.reader(False); self.assertRefused(':07')
+
+    def test_c_the_window_is_judged_again_at_the_switch_off(self):
+        # the check passes at 57:59 idle; the clock reads 58:00 by the time the switch-offs begin: no bootout
+        self.at_local(57, 59); self.reader(False)
+        checked = []
+        orig = OP.refusals
+        def mark(s):
+            checked.append(True); return orig(s)
+        OP.refusals = mark
+        try:
+            rc = self.main(RUN, now=lambda: self.w.t + (1 if checked else 0))
+        finally:
+            OP.refusals = orig
+        self.assertEqual(rc, 2); self.assertIn('due', self.w.rows()[-1]['refused'])
+        self.assertEqual(self.w.bootouts(), [])
+
     def test_pipeline_too_old_to_name_its_observer_is_not_launched(self):
         self.w.pipeline_writes_identity = False
         self.assertRefused('too old', switched=True)
@@ -482,7 +549,7 @@ class Refusals(Base):
         self.w.beating = False; self.w.sleep(180); self.assertRefused('heartbeat')
 
     def test_collector_slow_heartbeat_under_150_s_does_not_refuse(self):
-        self.w.beating = False; self.w.sleep(120)
+        self.w.beating = False; self.w.sleep(90)                                 # T0 + 120: the last heartbeat 120 s ago
         self.w.on_sleep.append(lambda world: setattr(world, 'beating', True))    # it writes again at its next minute
         self.assertEqual(self.main(RUN), 0, self.w.text())
 
@@ -648,7 +715,6 @@ class RunRecipe(Base):
         row = self.w.rows()[-1]
         self.assertIn('start', row['stop']['not_signalled'])
         self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
-        self.assertEqual(self.w.group_signals, [])
 
     def slow_after(self, seconds):
         def slow(world):
@@ -656,40 +722,99 @@ class RunRecipe(Base):
                 world.latency = lambda t: 9.5
         self.w.on_sleep.append(slow)
 
-    def test_no_identity_file_after_60_s_is_alerted_and_a_breach_stops_the_launcher_group_once(self):
+    # ---- correction A: no identity file -> SIGINT to the launcher this tool started, never TERM, never its group
+    def test_no_identity_file_after_60_s_is_alerted_and_a_breach_interrupts_the_launcher_once(self):
         self.w.write_identity = False; self.w.cleanup_s = 120; self.slow_after(30)
         rc = self.main(RUN)
         self.assertEqual(rc, 1)
-        self.assertEqual(self.w.group_signals, [(LAUNCHER_PID, signal.SIGTERM)]); self.assertEqual(self.w.signals, [])
+        self.assertEqual(self.w.signals, [(LAUNCHER_PID, signal.SIGINT)])          # SIGINT, to the launcher pid, once
         row = self.w.rows()[-1]
-        self.assertEqual(row['stop']['by'], 'group'); self.assertEqual(row['stop']['pgid'], LAUNCHER_PID)
+        self.assertEqual(row['stop']['by'], 'launcher interrupt'); self.assertEqual(row['stop']['pid'], LAUNCHER_PID)
         self.assertEqual(row['stopped'], 'collector breach')
         self.assertTrue(any('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN 60 S' in a for a in row['alerts']))
+        self.assertTrue(any('INTERRUPT THE LAUNCHER' in a for a in row['alerts']))
         self.assertTrue(row['launcher']['own_group'])
         self.assertTrue(self.w.picks_loaded)
+
+    def test_after_the_interrupt_the_cleanup_time_is_waited_and_no_native_instance_is_said_both_ways(self):
+        for left in (False, True):
+            with self.subTest(left=left):
+                self.dir.cleanup(); self.setUp()
+                self.w.write_identity = False; self.w.cleanup_s = 120; self.slow_after(30)
+                self.w.native_left_after_interrupt = left
+                self.main(RUN)
+                row = self.w.rows()[-1]; after = row['stop']['after_check']
+                self.assertGreaterEqual(after['seconds_after_interrupt'], OP.STOP_WAIT_S)
+                self.assertEqual(after['native_loaded'], ['mf-native-left'] if left else [])
+                said = 'MF-NATIVE INSTANCE STILL LOADED AFTER THE LAUNCHER INTERRUPT'
+                self.assertEqual(any(said in a for a in row['alerts']), left)
+                self.assertEqual(said in self.w.text(), left)
+                self.assertEqual(self.w.posts(), [('POST', OP.LMSTUDIO + '/api/v1/models/unload', {'instance_id': 'qwen3.8-27b-chat'})])
+
+    def test_a_launcher_whose_start_changed_is_never_signalled(self):
+        self.w.write_identity = False; self.slow_after(30)
+        def recycled(world):
+            if world.launcher is not None and LAUNCHER_PID in world.procs and world.t >= world.launcher.started + 10:
+                world.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 12:01:00 2026'
+        self.w.on_sleep.append(recycled)
+        self.main(RUN)
+        self.assertEqual(self.w.signals, [])
+        row = self.w.rows()[-1]
+        self.assertIn('start or group differs', row['stop']['not_signalled'])
+        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
 
     def test_no_identity_file_and_no_breach_only_alerts(self):
         self.w.write_identity = False
         rc = self.main(RUN)
         self.assertEqual(rc, 3)
-        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [])
+        self.assertEqual(self.w.signals, [])
         self.assertTrue(any('OBSERVER IDENTITY FILE NOT WRITTEN' in a for a in self.w.rows()[-1]['alerts']))
 
-    def test_identity_file_present_never_stops_by_group(self):
+    def test_identity_file_present_never_interrupts_the_launcher(self):
         self.w.cleanup_s = 120; self.slow_after(30)
         self.main(RUN)
-        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
         row = self.w.rows()[-1]
-        self.assertEqual(row['stop']['by'], 'observer')
+        self.assertEqual(row['stop']['by'], 'observer'); self.assertNotIn('after_check', row['stop'])
         self.assertFalse(any('IDENTITY FILE NOT WRITTEN' in a for a in row['alerts']))
 
-    def test_a_launcher_not_in_its_own_group_is_never_group_signalled(self):
+    def test_a_launcher_not_in_its_own_group_is_never_signalled(self):
         self.w.write_identity = False; self.w.launcher_pgid = 1; self.slow_after(30)
         self.main(RUN)
-        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [])
+        self.assertEqual(self.w.signals, [])
         row = self.w.rows()[-1]
         self.assertFalse(row['launcher']['own_group'])
         self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
+
+    def test_the_tool_has_no_group_signal_at_all(self):
+        self.assertFalse(hasattr(OP, 'GROUP_STOP_SIGNAL'))
+        self.assertNotIn('killpg', open(OP.__file__).read())
+
+    # ---- correction B, end to end: the record carries every status count
+    def run_with(self, statuses, run_s=180):
+        self.w.per_minute = 1; self.w.run_s = run_s
+        self.w.status = lambda t: statuses.get(int(t - T0), 'ok')          # keyed by seconds after T0, one decision a minute
+        self.assertIn(self.main(RUN), (0, 3), self.w.text())
+        return self.w.rows()[-1]
+
+    def test_b_one_error_in_the_run_leaves_the_collector_unharmed(self):
+        row = self.run_with({60: 'error'})
+        self.assertEqual(row['collector']['statuses'].get('error'), 1); self.assertIn('ok', row['collector']['statuses'])
+        self.assertIsNone(row['collector']['breach']); self.assertTrue(row['verdicts']['collector_unharmed'])
+
+    def test_b_two_errors_apart_in_the_run_harm_it(self):
+        row = self.run_with({60: 'error', 300: 'error'}, run_s=420)
+        self.assertEqual(row['collector']['statuses'].get('error'), 2); self.assertIsNone(row['collector']['breach'])
+        self.assertFalse(row['verdicts']['collector_unharmed']); self.assertFalse(row['counts'])
+
+    def test_b_one_late_harms_it(self):
+        row = self.run_with({60: 'late'})
+        self.assertEqual(row['collector']['statuses'].get('late'), 1); self.assertIsNone(row['collector']['breach'])
+        self.assertFalse(row['verdicts']['collector_unharmed'])
+
+    def test_b_no_error_is_unharmed(self):
+        row = self.run_with({})
+        self.assertEqual(set(row['collector']['statuses']), {'ok'}); self.assertTrue(row['verdicts']['collector_unharmed'])
 
     def test_decision_instance_wrong_after_the_run_is_said_in_capitals_and_never_reloaded(self):
         def drop(world):
