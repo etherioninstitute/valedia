@@ -102,3 +102,28 @@ among others.
 - Polymarket's terms (effective 11 August 2026), as the lead reads them: a person in the United States may use
   its information features and may not trade there. Nothing here trades there. This is the lead's reading, not
   legal advice; the owner can stop the reading of that data at any time.
+
+## Amendment of 2026-11-17, 09:11 UTC (before any data for this test has been pulled; no program has run on real data)
+
+**What changes: where the follower's price comes from.** The text above takes it from the public price history.
+Building the reader showed that this history keeps fine detail only for recent weeks (one-minute points for about
+7 days, five-minute for about 60, thirty-minute for about 90) and, for anything older, only three-hour and
+twelve-hour points. For most of the three years, "the last price at or before one hour after the leader's
+purchase" would then be a three-hour figure formed mostly BEFORE that purchase: the follower would be given the
+price from before the leader moved it. That favours copying and is not a price a follower could have paid.
+
+**The follower's price is now:** the price of the FIRST trade in that market, at or after one hour after the
+leader's first purchase, in which a buyer took that same outcome token (a taker's purchase, from the market's own
+public trade feed, which reaches back three years). No such trade within six hours after that moment: the copied
+trade is left out and counted. The price must still be from 0.05 to 0.95. This is a price somebody demonstrably
+paid for that outcome after the hour had passed. Everything else stands: the leaders, what a new position is, the
+1,000 dollars, the 0.10 to 0.90 first price, the 45 days, the cost of 0.03, the event as the unit, the periods,
+the one rule and its p-value. The information figures at 10 minutes, 6 hours and 24 hours use the same source.
+
+**What does not change and why this is not a second look:** no trade, price or resolution of any wallet has been
+read for this test; the only data read are the boards and shapes listed at the top. The direction of the change is
+against the idea (a later, paid price instead of an earlier, stale one).
+
+**Scope of the pull, stated for the record:** trades and resolutions are read for every candidate wallet (they
+decide who the leaders are); the market trade feed around a purchase is read only for positions of a month's
+leaders in that month, since no other position enters the rule.
