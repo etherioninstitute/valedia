@@ -18,6 +18,10 @@ Rules the code holds (the ticket's item numbers in brackets):
 * [4] Money is whole cents: a stored price is turned to integer cents once; every result is an integer; means are
   computed at the end.
 * The event (Kalshi's event_ticker) is the unit for every count and for the resampling.
+* An event's period is decided from all of its listed markets, repeated tickers included; a repeated ticker is
+  then left out of use in every copy.
+* The sports reader takes only each candle's closing yes bid and yes ask (judged raw, in the spellings close,
+  close_dollars, close_fp) and no longer looks at the candle's `price` block.
 """
 from __future__ import annotations
 
@@ -410,20 +414,24 @@ def _collect_w(period: str, weather_dir: Path):
         if not isinstance(m, dict):
             unassigned["bad_record"] += 1
             continue
-        if m.get("ticker") in repeated:
+        t = m.get("ticker")
+        repeat = type(t) is str and t in repeated          # judge the type before any lookup: a list is unhashable
+        if repeat:
             unassigned["duplicate_ticker"] += 1
-            continue
         ev = m.get("event_ticker")
         if not _valid_event(ev):
-            unassigned["bad_event"] += 1
+            if not repeat:
+                unassigned["bad_event"] += 1
             continue
         ts = _utc_ts(m.get("close_time"))
         if ts is None:
-            unassigned["bad_time"] += 1
+            if not repeat:
+                unassigned["bad_time"] += 1
             continue
-        seen.append((i, ev, ts, _utc_date(ts) >= W_SEALED_FROM))
-    periods = _event_periods([(ev, s) for _, ev, _, s in seen])
-    keep = [(i, ev, ts) for i, ev, ts, _ in seen if periods[ev] == period]       # the wall: the other period is dropped
+        seen.append((i, ev, ts, _utc_date(ts) >= W_SEALED_FROM, repeat))
+    # the period of an event comes from ALL its listed markets, repeated tickers included; only then are they left out
+    periods = _event_periods([(ev, s) for _, ev, _, s, _ in seen])
+    keep = [(i, ev, ts) for i, ev, ts, _, rep in seen if periods[ev] == period and not rep]   # the wall
     del seen
     labels = MOMENTS["W"]
     results = {label: LabelResult() for label in labels}
@@ -468,25 +476,29 @@ def _collect_s(period: str, db: Path):
         repeated = _repeated_tickers(rows)
         for i, r in enumerate(rows):
             ev, ticker = r.get("event_ticker"), r.get("ticker")
-            if ticker in repeated:
+            repeat = type(ticker) is str and ticker in repeated    # judge the type before any lookup
+            if repeat:
                 unassigned["duplicate_ticker"] += 1
-                continue
             if not _valid_event(ev):
-                unassigned["bad_event"] += 1
+                if not repeat:
+                    unassigned["bad_event"] += 1
                 continue
             if type(ticker) is not str or not ticker:
                 unassigned["bad_ticker"] += 1
                 continue
             ts = store.db.execute("SELECT MAX(end_ts) FROM candles WHERE ticker = ?", (ticker,)).fetchone()[0]
             if ts is None:
-                unassigned["no_stored_candle"] += 1
+                if not repeat:
+                    unassigned["no_stored_candle"] += 1
                 continue
             if type(ts) is not int:
-                unassigned["bad_time"] += 1
+                if not repeat:
+                    unassigned["bad_time"] += 1
                 continue
-            seen.append((i, ev, ts, _utc_date(ts) > S_DEV_LAST))
-        periods = _event_periods([(ev, s) for _, ev, _, s in seen])
-        keep = [(i, ev, ts) for i, ev, ts, _ in seen if periods[ev] == period]    # the wall
+            seen.append((i, ev, ts, _utc_date(ts) > S_DEV_LAST, repeat))
+        # the period of an event comes from ALL its listed markets, repeated tickers included; only then are they left out
+        periods = _event_periods([(ev, s) for _, ev, _, s, _ in seen])
+        keep = [(i, ev, ts) for i, ev, ts, _, rep in seen if periods[ev] == period and not rep]   # the wall
         del seen
         labels = MOMENTS["S"]
         results = {label: LabelResult() for label in labels}
