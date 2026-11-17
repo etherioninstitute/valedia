@@ -84,8 +84,14 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   restated, the fee total as last reported, a fall included), never from summing fill rows. A purchase's average
   times its contracts plus its fee is taken away, a sale's average times its contracts less its fee is added, and
   each settlement's payout is added. An unapplied fill, an order with filled contracts not all priced or with no
-  fee figure, or a figure not in whole cents (beyond the ledger's float rounding, a millionth of a cent) makes the
-  known cash unknown until the late figure arrives. The stop at `settlement` gives the figures: both readings, the known cash between them, the payouts
+  fee figure, a fee figure older than the order's last filled contracts, or a figure not in whole cents (beyond the
+  ledger's float rounding, a millionth of a cent) makes the known cash unknown until the late figure arrives.
+  "Older" is decided from the order's fill rows (`OrderLedger.fills`): the last row carrying a fee figure must
+  have a row id no smaller than the last row carrying contracts. The ids are AUTOINCREMENT and rows are never
+  changed or deleted, so the order holds across a crash and a restart; a clock could go back. The ledger keeps an
+  order's old fee total when a later piece arrives without one, and that total alone would undercount. A figure
+  missing, not finite, text or a bool, or an order state that is not one of the ledger's (`orders.STATES`), is
+  unknown too. The stop at `settlement` gives the figures: both readings, the known cash between them, the payouts
   expected and the difference in cents, or "no earlier clean reading". `prev` is the latest reading taken after a clean
   reconcile with both figures read; a reading taken while a holding is missing never counts. It need not have shown
   K: a holding bought after it is sound, because every fill between the two readings is inside the known cash. K is
@@ -100,20 +106,27 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   6. If the equation does not hold, write one pending record per name and stop at stage `settlement` with the
      figures.
 - *Pending.* While any record is pending, nothing is sent. A later run never settles a pending record by itself.
+  While one is open, a run still judges every other name gone: each whose Kalshi record passes the first witness
+  gets its own pending record, never a settlement on the equation (the cash between the readings can no longer be
+  put on one name). A name whose record fails stops the run as before, naming it. A name with its own open record
+  is not judged again.
   Two person's commands close one, each with `--who NAME --note TEXT` (trimmed, not empty, no control characters).
   Each checks the environment first, as every run does. Then, under the lock, it refuses while anything of the
   ledger is open or not yet journaled (a `--reconcile-only` run comes first), and runs the same reconcile a
   `--reconcile-only` run makes. A refusal journals nothing, changes no practice state and says why; the record
   stays open.
-  - `--confirm-settlement ID` needs the account to show the pending name at exactly 0, with nothing else different
-    (other names pending with it, also at 0, aside: holdings gone together are confirmed one by one). It then reads
+  - `--confirm-settlement ID` needs the account to show the pending name at exactly 0. Another name that differs
+    refuses it only when that name has no open pending record of its own, so names pending together are cleared
+    one command each, in either order. It then reads
     Kalshi's record again and requires the first witness again. It journals the settlement with `witnesses`
     "kalshi_record+person", who and the note, and reconciles for a fresh reading. It is refused when the pending
     record's contracts differ from what the ledger now expects of that name (a fill arrived since), unless
     `--units N` gives exactly that expectation; it then settles N, and the entry carries both figures.
-  - `--withdraw-pending ID` is for a holding that is back in the account in full. It needs a clean reconcile and
-    closes the record without a settlement, with a `settlement_withdrawn` line carrying who and the note. If the
-    holding goes again later, a new pending record is made.
+  - `--withdraw-pending ID` is for a holding that is back in the account in full. It needs the reconcile clean
+    apart from names with open pending records of their own, and closes the record without a settlement, with a
+    `settlement_withdrawn` line carrying who and the note. If the holding goes again later, a new pending record
+    is made. After a withdrawal of a record made from Kalshi's finalized record (that record stays in the state),
+    a purchase on that ticker is refused until a run reads Kalshi's record as plainly not finalized.
 - *The entry.* A `settlement` journal entry, once per name: the whole expected holding closed at 1.00 a contract
   when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. It carries the
   baseline and program parts, the fields read, the two readings, `witnesses`, and `fee` null with `fee_seen`
@@ -151,13 +164,16 @@ removed. Event buying power is derived from that linked account's settled cash (
   settlement, with the money still right.
 - Any cash move from outside the ledger that exactly cancels a difference passes the equation.
 - A venue that reports an average price rounded to the cent can leave an order's cash unknown or off by that
-  rounding, and then the equation does not hold and a person confirms.
-- A fee total of zero that the venue reports only after the fill is not stored by the ledger, so that order's cash
-  stays unknown and a person confirms.
+  rounding. The equation across the reading where it entered then usually fails, and a person confirms. It can
+  cancel: two roundings of opposite sign between the same readings (the amount is then right), or a rounding
+  beside a hand sale of the same size (inside the limit above). A rounding that entered before the earlier clean
+  reading cancels exactly.
+- A zero fee reported only after the fill is never stored by the ledger. That order's cash stays unknown for good,
+  so every later settlement on that account then needs a person until the ledger is repaired (T45-3).
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
-- A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
-  whole Events path until Kalshi finalizes. A multi-market strategy will need a per-name waiting state for that
-  next.
+- A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run, and refuses the
+  person's commands on other records, since it has no pending record of its own. That blocks the whole Events
+  path until Kalshi finalizes. A multi-market strategy will need a per-name waiting state for that next.
 - Settlement entries are read by no page and no tax figure yet (`research_loop/owner_page.py`,
   `execution_and_risk/tax.py`).
 

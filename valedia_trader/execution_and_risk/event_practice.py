@@ -363,6 +363,36 @@ def _near_cents(d: Decimal) -> int | None:
         return None
 
 
+LEDGER_STATES = frozenset(STATES)                         # the ledger's order states (orders.py:99), listed once
+_ORDER_FIELDS = ("tag", "units", "state", "filled_units", "priced_units", "priced_avg", "fee", "amount_unconfirmed")
+
+
+def _figure(x) -> Decimal | None:
+    """A finite number from 0 (not a bool, not text) as a Decimal, else None."""
+    v = _dec(x)
+    return v if v is not None and v >= 0 else None
+
+
+def _fee_is_current(rows) -> bool | None:
+    """Whether the order's fee figure is at least as recent as its last filled contracts: L, the last of its fill rows
+    that carries a fee figure (any units), exists and is not older than U, the last that carries contracts (units not
+    0). Recency is the row id: the ledger's fills ids are AUTOINCREMENT (orders.py:242), so they only grow and are never
+    reused, across a crash and a restart too, and its rows are never changed or deleted (triggers refuse it); a clock
+    could go back. None when a row cannot be read."""
+    last_units = last_fee = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        rid, units, fee = r.get("id"), _as_float(r.get("units")), r.get("fee")
+        if type(rid) is not int or rid < 1 or units is None or (fee is not None and _as_float(fee) is None):
+            return None
+        if units != 0:
+            last_units = max(last_units, rid)
+        if fee is not None:
+            last_fee = max(last_fee, rid)
+    return last_units > 0 and last_fee >= last_units
+
+
 def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | None, str | None]:
     """The ledger's cumulative known cash in whole cents, from each order's CURRENT figures as the ledger holds them
     (OrderLedger.orders, orders.py:446: filled_units, the priced point priced_units / priced_avg as last restated,
@@ -370,35 +400,63 @@ def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | Non
     which never change. A purchase pays priced_avg times filled_units plus its fee; a sale brings it less its fee; an
     order with nothing filled counts only a fee it reports. (None, why) while a piece is not known: a fill not yet
     applied (OrderLedger.unapplied_fills, orders.py:474), an order of unknown outcome or whose amount is unconfirmed,
-    an order with contracts filled and no price for every one of them or no fee figure, or a figure more than a
-    millionth of a cent from a whole cent (the ledger keeps floats). It becomes known the moment the late figure
-    arrives. A venue average rounded to the cent cannot be told from a true one: the figure is then off by that
-    rounding, and the exact cash equation does not hold across the reading where it entered."""
+    an order with contracts filled and no price for every one of them, no fee figure, or a fee figure older than its
+    last filled contracts (the ledger keeps the old total when a later piece comes without one, orders.py:1101-1123;
+    _fee_is_current, from OrderLedger.fills), or a figure more than a millionth of a cent from a whole cent (the
+    ledger keeps floats). A figure missing, None, not finite, text or a bool, or a state not one of the ledger's, is
+    unknown too, and nothing raises. It becomes known the moment the late figure arrives. A venue average rounded to
+    the cent cannot be told from a true one: the figure is then off by that rounding. The exact cash equation across
+    the reading where it entered then usually fails and a person confirms; it can cancel (two roundings of opposite
+    sign between the same readings, or a rounding beside a hand sale of the same size); and a rounding that entered
+    before the earlier clean reading cancels exactly."""
+    try:
+        return _known_cents(ledger, settlements)
+    except Exception as exc:                              # a read of the ledger that fails: unknown, never a crash
+        return None, f"the ledger could not be read ({type(exc).__name__})"
+
+
+def _known_cents(ledger, settlements) -> tuple[int | None, str | None]:
     if ledger.unapplied_fills():
         return None, "a fill is not yet applied"
     total = 0
     for o in ledger.orders():
-        if o.get("state") in ("sent", "unknown"):
+        if not isinstance(o, dict) or any(k not in o for k in _ORDER_FIELDS) or not isinstance(o["tag"], str):
+            return None, "an order's record lacks a figure"
+        if not isinstance(o["state"], str) or o["state"] not in LEDGER_STATES:
+            return None, "an order's state is not one of the ledger's"
+        if o["state"] in ("sent", "unknown"):
             return None, "an order's outcome is not known"
-        if o.get("amount_unconfirmed"):
+        flag = o["amount_unconfirmed"]
+        if type(flag) is not int or flag not in (0, 1):
+            return None, "an order's amount flag cannot be read"
+        if flag:
             return None, "an order's filled amount is not confirmed"
-        filled, fee = _dec(o.get("filled_units")), o.get("fee")
-        if filled is None or filled < 0:
+        units = _as_float(o["units"])
+        if units is None or units == 0:
+            return None, "an order's contracts cannot be read"
+        filled, priced = _figure(o["filled_units"]), _figure(o["priced_units"])
+        if filled is None or priced is None:
             return None, "an order's filled amount cannot be read"
-        fee = None if fee is None else _dec(fee)
-        if o.get("fee") is not None and (fee is None or fee < 0):
+        fee = None if o["fee"] is None else _figure(o["fee"])
+        if o["fee"] is not None and fee is None:
             return None, "an order's fee cannot be read"
+        avg = None if o["priced_avg"] is None else _figure(o["priced_avg"])
+        if o["priced_avg"] is not None and avg is None:
+            return None, "an order's price cannot be read"
         if filled == 0:
             cash = -(fee or Decimal(0))
         else:
-            priced, avg = _dec(o.get("priced_units")), o.get("priced_avg")
-            avg = None if avg is None else _dec(avg)
-            if avg is None or avg < 0 or priced is None or abs(priced - filled) > UNIT_SLACK:
+            if avg is None or abs(priced - filled) > UNIT_SLACK:
                 return None, "an order has no price for all its filled contracts"
             if fee is None:
                 return None, "an order has contracts filled and no fee figure"
+            current = _fee_is_current(ledger.fills(o["tag"]))
+            if current is None:
+                return None, "a fill row of an order cannot be read"
+            if not current:
+                return None, "an order's fee figure is older than its last filled contracts"
             value = avg * filled
-            cash = (value if _as_float(o.get("units")) < 0 else -value) - fee      # a sale brings, a purchase pays
+            cash = (value if units < 0 else -value) - fee      # a sale brings, a purchase pays
         c = _near_cents(cash)
         if c is None:
             return None, "an order's cash is not in whole cents"
@@ -1200,7 +1258,10 @@ class _Run:
         and (2) the account's cash confirms it: a reading now (no order of this ledger open) against the latest
         clean earlier reading, exactly in cents, now - prev == (known cash now - known cash then) + the payouts of K.
         (1) failing settles nothing and the stop names the fact; (2) failing keeps one pending record per name for a
-        person (--confirm-settlement) and stops at stage `settlement`. True when K was settled."""
+        person (--confirm-settlement) and stops at stage `settlement`. While a pending record is open, the other names
+        gone are still judged by (1): each that passes gets its own pending record, never a settlement on (2), since the
+        cash between the readings can no longer be put on one name; a name with its own open record is not judged
+        again. True when K was settled."""
         diffs = result.get("position_differences") or {}
         if not diffs:
             return False
@@ -1224,8 +1285,9 @@ class _Run:
                 self._settle_why[sym] = f"{why}, so none is taken as settled"
             return False
         waiting = {r["symbol"]: r["id"] for r in self.state.open_pending()}
-        if any(sym in waiting for sym in candidates):
-            ids = sorted(waiting[s] for s in candidates if s in waiting)
+        new = [sym for sym in candidates if sym not in waiting]       # a name with its own open record is not judged again
+        if not new:
+            ids = sorted(waiting[s] for s in candidates)
             raise _Stop("settlement", f"pending record(s) {', '.join(map(str, ids))} wait for a person: Kalshi's record shows "
                                       "the result, but the account's cash does not confirm the holding was still there; "
                                       "only a person settles it: --confirm-settlement ID --who NAME --note TEXT")
@@ -1233,12 +1295,12 @@ class _Run:
         busy = {o["symbol"] for o in still}
         now_t = self._now()
         judged = []
-        for sym in sorted(candidates):
+        for sym in sorted(new):
             try:
                 judged.append(self._judge(sym, expected[sym], baseline, unapplied, busy, now_t))
             except NotSettled as why:
                 self._settle_why[sym] = str(why)
-        if len(judged) != len(candidates):
+        if len(judged) != len(new):
             for j in judged:
                 self._settle_why[j["symbol"]] = ("Kalshi's record shows it settled, but another holding that is gone is not, "
                                                  "and holdings gone together are settled together")
@@ -1246,6 +1308,9 @@ class _Run:
         now = self._take_reading(baseline, clean=False, open_orders=bool(still))     # before anything of K is settled
         prev = self.state.last_clean_reading()
         figures, why = _cash_equation(prev, now, judged)
+        if waiting:                                       # never on the equation while another record is open
+            why = (f"pending record(s) {', '.join(map(str, sorted(set(waiting.values()))))} are open, so the cash between "
+                   "the readings cannot be put on one name")
         if why is None:
             ids = self.state.add_settlements(judged, witnesses=WITNESSES[0], observed=any(j["price"] == "1.00" for j in judged),
                                              reading_prev=prev["id"], reading_now=now["id"])
@@ -1256,9 +1321,10 @@ class _Run:
         names = ", ".join(j["symbol"] for j in judged)
         reason = (f"Kalshi's record shows the result of {names}, but the account's cash does not confirm the holding was "
                   f"still there ({why}; {_cash_words(figures)}); nothing of it is settled")
-        pids = self.state.add_pending(judged, figures, reason, self.batch)
+        self.state.add_pending(judged, figures, reason, self.batch)
         self._journal_rows()
-        raise _Stop("settlement", f"{reason}; pending record(s) {', '.join(map(str, pids))} wait for a person: "
+        ids = sorted(r["id"] for r in self.state.open_pending())
+        raise _Stop("settlement", f"{reason}; pending record(s) {', '.join(map(str, ids))} wait for a person: "
                                   "--confirm-settlement ID --who NAME --note TEXT")
 
     def _judge(self, sym: str, units: float, baseline: dict, unapplied: set, busy: set, now: float) -> dict:
@@ -1330,6 +1396,8 @@ class _Run:
         self.stage = "settled"
         if req["ticker"] in self.state.settled_tickers():
             raise _Stop("settled", f"the market {req['ticker']} has settled; no order is sent on a settled ticker")
+        if side == "buy":
+            self._after_withdrawal(req["ticker"])
         self.stage = "cap"
         if self.state.sent_on(self.day) >= MAX_ORDERS_PER_DAY:
             raise _Stop("cap", f"the day's cap of {MAX_ORDERS_PER_DAY} practice orders ({self.day}, New York) is reached")
@@ -1385,6 +1453,27 @@ class _Run:
             raise _Stop("send", f"the outcome of order {tag} ({name} {units:+g}) is {state}: {why}; nothing more is sent until "
                                 "a reconcile settles it")
         self._write({"event": "order", **entry})
+
+    def _after_withdrawal(self, ticker: str) -> None:
+        """After --withdraw-pending on a record of this ticker made from Kalshi's finalized record (that record stays
+        in the state), a purchase waits until Kalshi's record, read now, shows the ticker plainly not finalized."""
+        withdrawn = {r["pending_id"] for r in self.state.withdrawals()}
+        if not any(r["id"] in withdrawn and (parse_event_name(r["symbol"]) or (None,))[0] == ticker
+                   and isinstance(r["kalshi"], dict) and r["kalshi"].get("status") == "finalized"
+                   for r in self.state.pending()):
+            return
+        try:
+            record = self.market(ticker)
+        except Exception as exc:
+            seen = f"its record could not be read ({_venue_error(exc)})"
+        else:
+            status = record.get("status") if isinstance(record, dict) else None
+            plain = isinstance(status, str) and _STATUS_WORD.fullmatch(status) is not None
+            if plain and record.get("ticker") == ticker and status != "finalized":
+                return
+            seen = f"its status reads {status if plain else 'missing or not plain'}"
+        raise _Stop("settled", f"a pending record on {ticker} made from Kalshi's finalized record was withdrawn; no purchase "
+                               f"is sent until Kalshi's record reads not finalized ({seen})")
 
     # -- the summary
     # -- a person's command (T45-1): confirm a pending settlement, or withdraw a pending record
@@ -1472,20 +1561,27 @@ class _Run:
                         + "; nothing is changed: run --reconcile-only first, then this command again")
 
     def _account_now(self, kind: str, name: str, result: dict) -> None:
-        """What the account shows now. confirm: the pending name at exactly 0, and every other difference a name of
-        another open pending record also at exactly 0 (holdings gone together are pending together). withdraw: a
-        clean reconcile, so the holding is shown in full. Otherwise _Stop and the record stays open."""
+        """What the account shows now. confirm: the pending name at exactly 0. withdraw: the pending name as the ledger
+        expects it, in full, and the reconcile otherwise clean. For both, every other name that differs is a name of
+        another open pending record of its own (that record is the person's next command). Otherwise _Stop and the
+        record stays open."""
         unclean = [w for w, k in (("the venue's positions could not be read", "positions_error"),
                                   ("an order's status could not be read", "unresolved"),
                                   ("the reconcile found an anomaly", "anomalies")) if result.get(k)]
         if unclean:
             raise _Stop("account", f"{unclean[0]}; the pending record stays open; a person must look")
         diffs = result.get("position_differences") or {}
+        waiting = {r["symbol"] for r in self.state.open_pending()}
+        bad = sorted(str(s) for s in diffs if s != name and s not in waiting)
+        if bad:
+            raise _Stop("account", f"another name differs from baseline plus fills ({', '.join(bad)}) and has no pending "
+                                   "record of its own; the pending record stays open; a person must look")
         if kind == "withdraw":
-            if diffs or result.get("clean") is not True:
-                raise _Stop("account", f"the reconcile is not clean ({', '.join(sorted(map(str, diffs))) or 'not clean'} "
-                                       f"differs): the account does not show {name} in full with nothing else different; "
-                                       "the pending record stays open")
+            if name in diffs:
+                raise _Stop("account", f"the account does not show {name} in full as the ledger expects it; the pending "
+                                       "record stays open")
+            if not diffs and result.get("clean") is not True:
+                raise _Stop("account", "the reconcile is not clean; the pending record stays open")
             return
         def at_zero(sym):
             d = diffs.get(sym)
@@ -1495,11 +1591,6 @@ class _Run:
                 raise _Stop("account", f"the account shows {name} as the ledger expects it: the holding is there, so it is "
                                        "not settled; when it is back in full, --withdraw-pending closes the record")
             raise _Stop("account", f"the account shows {name} at neither 0 nor what the ledger expects; a person must look")
-        waiting = {r["symbol"] for r in self.state.open_pending()}
-        bad = sorted(str(s) for s in diffs if s != name and not (s in waiting and at_zero(s)))
-        if bad:
-            raise _Stop("account", f"another name differs from baseline plus fills ({', '.join(bad)}); the pending record "
-                                   "stays open; a person must look")
 
     def _confirm(self, p: dict, units: float) -> dict:
         self.stage = "kalshi"

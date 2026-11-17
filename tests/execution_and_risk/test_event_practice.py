@@ -1438,7 +1438,8 @@ def test_an_order_of_unknown_outcome_leaves_the_known_cash_unknown_until_a_recon
 def test_an_average_rounded_to_the_cent_never_settles_on_a_wrong_figure():
     # A venue rounding its average to the cent can make price times contracts off by a cent; the program cannot
     # tell that from a true price. The known cash is then off by that cent, and the exact equation, taken across the
-    # reading where it entered, does not hold: the record goes pending and a person confirms.
+    # reading where it entered, fails here: the record goes pending and a person confirms. (It can cancel: two
+    # roundings of opposite sign, or one beside a same-size hand sale; one before the earlier reading cancels exactly.)
     led, venue = OrderLedger(), CashVenue()
     venue.round_avg = 2
     prev_known = read(led, venue, [])[0]
@@ -1838,8 +1839,8 @@ def two_pending(tmp_path):
     """A pending record on T; then OTHER also settles, and gets its own pending record (the equation would hold for
     it alone, but while a record is open the cash between the readings cannot be put on one name)."""
     w = first_pending(tmp_path, {f"{T}:yes": 1, f"{OTHER}:yes": 1})
-    out = vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001.37")
-    assert pending(out, w) and w.entries("settlement") == [], out
+    out = vanish(w, {f"{OTHER}:yes": {**WIN, "ticker": OTHER}}, "1001.00")    # exactly the payout since the clean reading
+    assert pending(out, w) and w.entries("settlement") == [] and "are open" in out["reason"], out
     p = {r["symbol"]: r["id"] for r in w.state().open_pending()}
     assert set(p) == {f"{T}:yes", f"{OTHER}:yes"}, p
     return w, p[f"{T}:yes"], p[f"{OTHER}:yes"]
@@ -1968,7 +1969,7 @@ def way_out(w):
     return out
 
 
-@pytest.mark.parametrize("seed", range(100))
+@pytest.mark.parametrize("seed", range(200))
 def test_from_every_stopped_state_some_commands_reach_a_clean_reconcile(tmp_path, seed):
     # Three names held at baseline; each step makes some go (Kalshi finalized, a win or a loss, or not yet
     # finalized), brings a pending one back in full, or moves the cash a cent; a run after each. From EVERY stopped
@@ -1991,6 +1992,9 @@ def test_from_every_stopped_state_some_commands_reach_a_clean_reconcile(tmp_path
                 rec = {**(WIN if win else TONIGHT), "ticker": ticker}
                 if rng.random() < 0.25:
                     rec["status"] = "determined"                           # Kalshi has not finalized it yet
+                if w.markets.get(ticker, {}).get("status") == "finalized":
+                    rec = w.markets[ticker]                                # a finalized record never changes
+                    win = rec["result"] == "yes"
                 w.markets[ticker] = rec
                 w.exchange.cash += 100 * w.exchange.held[n] if win else 0
                 w.exchange.held[n] = 0
@@ -2046,10 +2050,15 @@ def test_a_spoiled_order_figure_is_unknown_never_a_crash_or_a_number(field, bad)
         del order[field]
     else:
         order[field] = bad
-    if field == "amount_unconfirmed" and bad is False:
-        pytest.skip("False is 0 as a bool: still a bool, refused below")
     cents, why = ep.known_cents(StandInLedger(order, GOOD_ROWS), [])
     assert cents is None and isinstance(why, str) and why, (field, bad, cents)
+
+
+@pytest.mark.parametrize("field,bad", [("units", 0), ("units", 0.0), ("filled_units", -1.0), ("priced_units", -1.0),
+                                       ("priced_avg", -0.4), ("fee", -0.01)])
+def test_no_contracts_and_a_figure_below_zero_are_unknown(field, bad):
+    cents, why = ep.known_cents(StandInLedger({**GOOD_ORDER, field: bad}, GOOD_ROWS), [])
+    assert cents is None and why, (field, bad, cents)
 
 
 def test_a_bool_for_amount_unconfirmed_and_a_state_not_the_ledgers_are_unknown():
@@ -2060,6 +2069,36 @@ def test_a_bool_for_amount_unconfirmed_and_a_state_not_the_ledgers_are_unknown()
     for rows in ([{**GOOD_ROWS[0], "id": True}], [{**GOOD_ROWS[0], "fee": "0.01"}], [{**GOOD_ROWS[0], "units": None}], []):
         cents, why = ep.known_cents(StandInLedger(GOOD_ORDER, rows), [])
         assert cents is None and why, rows
+
+
+def test_a_missing_figure_is_named_and_a_ledger_that_raises_is_unknown_never_a_crash():
+    for field in ep._ORDER_FIELDS:
+        order = {k: v for k, v in GOOD_ORDER.items() if k != field}
+        assert ep.known_cents(StandInLedger(order, GOOD_ROWS), []) == (None, "an order's record lacks a figure"), field
+
+    class Raising(StandInLedger):
+        def __init__(self, where):
+            super().__init__(GOOD_ORDER, GOOD_ROWS)
+            self.where = where
+
+        def _boom(self, name):
+            if name == self.where:
+                raise RuntimeError("the ledger's file is gone")
+
+        def unapplied_fills(self):
+            self._boom("unapplied_fills")
+            return super().unapplied_fills()
+
+        def orders(self, states=None):
+            self._boom("orders")
+            return super().orders(states)
+
+        def fills(self, tag=None):
+            self._boom("fills")
+            return super().fills(tag)
+    for where in ("unapplied_fills", "orders", "fills"):
+        cents, why = ep.known_cents(Raising(where), [])
+        assert cents is None and "could not be read" in why, (where, why)
 
 
 def test_the_ledgers_states_are_listed_once_from_orders_py():
@@ -2094,6 +2133,9 @@ def test_after_a_withdrawal_kalshi_unreadable_still_refuses_the_purchase(tmp_pat
     assert withdraw(w, pid)["status"] == "withdrawn"
     w.quote(f"{T}:yes", 0.70, 0.71)
     w.markets[T] = kd.HttpError(500, "u")
+    out = buy(w)
+    assert out["status"] == "stopped" and out["stage"] == "settled" and w.exchange.placed() == [], out
+    w.markets[T] = {**TONIGHT, "ticker": OTHER, "status": "active"}       # another ticker's record never lifts it
     out = buy(w)
     assert out["status"] == "stopped" and out["stage"] == "settled" and w.exchange.placed() == [], out
     w.quote(f"{OTHER}:yes", 0.40, 0.41)                                   # another ticker is not held back

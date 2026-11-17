@@ -255,18 +255,25 @@ what settlement looks like.
 - **When the cash does not confirm it**, nothing is settled and the run stops. This covers four cases: no earlier
   reading, a reading now that cannot be taken (an order still open, an unread or non-cent figure), known cash
   that cannot be computed, or an equation off by even a cent (for example a contract sold by hand for 0.60). The
-  stop gives the figures, and one pending record per name waits; nothing is sent until a person runs
+  stop gives the figures, and one pending record per name waits. While one waits, a run still judges every
+  other name gone: each that Kalshi's record shows finalized gets its own pending record (never a settlement on
+  the equation, since the cash between the readings can no longer be put on one name), and one that it does not
+  stops the run, naming it. The known cash is also unknown while an order's fee figure is older than its last
+  filled contracts (a later piece reported without a fee). Nothing is sent until a person runs
   `python -m valedia_trader.execution_and_risk.event_practice --confirm-settlement ID --who NAME --note TEXT`.
   That command first checks the environment, as every run does. It then refuses while anything of the ledger is
   open or not yet journaled, and runs the same reconcile `--reconcile-only` makes. That reconcile must show the
-  pending name at exactly 0 and nothing else different (other names pending with it, also at 0, aside). Only then
+  pending name at exactly 0. Another name that differs refuses it only when that name has no open pending
+  record of its own, so names pending together are cleared one command each, in either order. Only then
   does it read Kalshi's record again and require the same safe values. It journals the settlement with
   `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. It also refuses
   when the pending record's contracts differ from what the ledger now expects (a fill arrived since), unless
   `--units N` gives exactly that figure; it then settles N and records both. Any refusal
   journals nothing, changes no practice state and says why. If the holding is back in the account in full, no one
   settles it: `--withdraw-pending ID --who NAME --note TEXT` closes the record without a settlement, only on a
-  clean reconcile. A later run never settles a pending record by itself. The 17 November holding has no earlier
+  reconcile clean apart from names with open pending records of their own. After that, a purchase on the ticker
+  is refused until a run reads Kalshi's record as plainly not finalized (the record that said finalized stays in
+  the state). A later run never settles a pending record by itself. The 17 November holding has no earlier
   reading, so it waits for a person.
 - **What a loss is confirmed as.** A loss is confirmed by three facts: Kalshi's record says the contract lost, the
   account shows none of it, and the account's cash moved by exactly what the ledger knows, no more and no less.
@@ -275,7 +282,12 @@ what settlement looks like.
   order history is the third witness a later ticket adds. For a win, the cash rising by exactly the payout is
   real evidence, and the flag `win_cash_observed`, shown in every summary, turns true on the first one.
 - **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference. Any cash
-  move from outside the ledger that exactly cancels a difference passes the equation.
+  move from outside the ledger that exactly cancels a difference passes the equation. An average the venue rounds
+  to the cent can leave the known cash off by that rounding; the equation then usually fails and a person
+  confirms, but it can cancel (two roundings of opposite sign, or a rounding beside a same-size hand sale), and a
+  rounding that entered before the earlier clean reading cancels exactly. A zero fee reported only after the fill
+  is never stored by the ledger: that order's cash stays unknown for good, so every later settlement on that
+  account then needs a person until the ledger is repaired (T45-3).
 
 ### Fees and settlement in a real account (Webull's help pages, read by the lead 2026-11-17)
 
