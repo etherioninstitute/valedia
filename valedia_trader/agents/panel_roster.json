@@ -1,9 +1,9 @@
 {
   "approve_threshold": 0.55,
-  "min_deciders": 2,
+  "min_deciders": 1,
   "min_vetters": 1,
   "veto_rule": "any",
-  "notes": "Scout and the 27B decider load Qwen3.8-27B (MLX 4-bit in Bionic, model key qwen/qwen3.8-27b, about 16 GB plus cache); on a 64 GB machine enable them only when other large models are unloaded. Hermes members answer with no tools by default (toolsets 'clarify', which Hermes switches off in one-shot mode). Give a member a tool only when its job needs one, by naming the toolset on that member, for example \"toolsets\": \"web\"; \"toolsets\": null uses the profile's own pruned set. Measured on the local 27B: a scout allowed the web tool took 97 s and searched although the prompt says to judge only the facts given; tool-free it takes 25-55 s. model_label, unseen_after and unseen_after_source say which model a member is and what it cannot remember. model_label is the exact model (a tag with its digest, or a version); a member with a model and no model_label is recorded under its model. unseen_after is an ISO date, the model's public release date or later, after which the model certainly cannot have seen a market; unseen_after_source says where that date comes from. null means nothing is certainly unseen, so the tournament scores every blind-history answer of that member as possibly remembered, never as evidence. The owner fills these from a source; no date is guessed.",
+  "notes": "Scout and the 27B decider load Qwen3.8-27B (MLX 4-bit in Bionic, model key qwen/qwen3.8-27b, about 16 GB plus cache); on a 64 GB machine enable them only when other large models are unloaded. Hermes members answer with no tools by default (toolsets 'clarify', which Hermes switches off in one-shot mode). Give a member a tool only when its job needs one, by naming the toolset on that member, for example \"toolsets\": \"web\"; \"toolsets\": null uses the profile's own pruned set. Measured on the local 27B: a scout allowed the web tool took 97 s and searched although the prompt says to judge only the facts given; tool-free it takes 25-55 s. model_label, unseen_after and unseen_after_source say which model a member is and what it cannot remember. model_label is the exact model (a tag with its digest, or a version); a member with a model and no model_label is recorded under its model. unseen_after is an ISO date, the model's public release date or later, after which the model certainly cannot have seen a market; unseen_after_source says where that date comes from. null means nothing is certainly unseen, so the tournament scores every blind-history answer of that member as possibly remembered, never as evidence. The owner fills these from a source; no date is guessed. By the owner's instruction of 2026-11-16 Elephant-1 is the only decider and the Hermes decider no longer votes.",
   "members": [
     {
       "name": "valedia-trading-scout",
@@ -22,6 +22,7 @@
       "backend": "hermes",
       "profile": "valedia-trading-decider",
       "timeout": 180,
+      "enabled": false,
       "model_label": null,
       "unseen_after": null,
       "unseen_after_source": null

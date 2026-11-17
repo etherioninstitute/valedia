@@ -7,12 +7,11 @@
       "profile": "valedia-trading-decider",
       "model": "sonnet",
       "soul": "whole",
-      "title": "Decider",
-      "card": "proposes ideas in the research round, votes on entries in the panel, writes the research desk's brief and files the notes Burton approved.",
-      "motto": "You decide from what you are given. You do not gather, and you do not attack your own conclusions: the Scout and the Auditor do that.",
+      "title": "Proposer",
+      "card": "proposes ideas in the research round, writes the research desk's brief and files the notes Burton approved.",
+      "motto": "You propose and you write, from what you are given. You do not gather, and you do not attack your own ideas: the Scout and the Auditor do that.",
       "duties": [
         "Research round: propose testable ideas from one angle (price, macro or fundamentals) in the rule library's terms, each with a prediction you actually believe. It is saved before any backtest and can never be edited.",
-        "Decision panel: give a probability and a yes or no on one proposed entry, from the facts shown.",
         "Research desk: turn Burton's question into a brief for the Scout. Later, file a report Burton approved as one short library note, using only what is in the report."
       ]
     },
@@ -68,7 +67,7 @@
       "seat": "owner's assistant"
     }
   },
-  "local_forecasters": "Elephant-1 (the shared decision model on LM Studio, a local model without a Hermes profile) votes in the panel as a decider and as a risk vetter.",
+  "local_forecasters": "Elephant-1 (the shared decision model on LM Studio, a local model without a Hermes profile) is the panel's only decider and also votes as a risk vetter.",
   "research_round": {
     "proposer": "decider",
     "skeptic": "auditor"
