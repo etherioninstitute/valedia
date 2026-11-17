@@ -79,12 +79,13 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   If any of this fails, nothing is settled and the run stops as before, naming the fact. The holdings gone in one
   run (K) are judged together; if one fails, none is settled.
 - *Second witness: the account's cash.* Each run reads buying power once, only with no order of the ledger open,
-  and stores it with the ledger's known cash in whole cents. That is, order by order, a purchase's price times its
-  contracts plus its fees taken away, a sale's price times its contracts less its fees added, plus each
-  settlement's payout. The ledger stores a sale's contracts as a negative number and the contracts its price
-  covers as a positive one. An order whose filled contracts are not all priced, a fill with contracts and no fee,
-  or a figure not in whole cents (beyond the ledger's float rounding, a millionth of a cent) makes the known cash
-  unknown. The stop at `settlement` gives the figures: both readings, the known cash between them, the payouts
+  and stores it with the ledger's known cash in whole cents. That is read from each order's current figures as the
+  ledger holds them (`OrderLedger.orders`: the filled contracts, the average it holds for all of them as last
+  restated, the fee total as last reported, a fall included), never from summing fill rows. A purchase's average
+  times its contracts plus its fee is taken away, a sale's average times its contracts less its fee is added, and
+  each settlement's payout is added. An unapplied fill, an order with filled contracts not all priced or with no
+  fee figure, or a figure not in whole cents (beyond the ledger's float rounding, a millionth of a cent) makes the
+  known cash unknown until the late figure arrives. The stop at `settlement` gives the figures: both readings, the known cash between them, the payouts
   expected and the difference in cents, or "no earlier clean reading". `prev` is the latest reading taken after a clean
   reconcile with both figures read; a reading taken while a holding is missing never counts. It need not have shown
   K: a holding bought after it is sound, because every fill between the two readings is inside the known cash. K is
@@ -108,7 +109,8 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
     (other names pending with it, also at 0, aside: holdings gone together are confirmed one by one). It then reads
     Kalshi's record again and requires the first witness again. It journals the settlement with `witnesses`
     "kalshi_record+person", who and the note, and reconciles for a fresh reading. It is refused when the pending
-    record's contracts differ from what the ledger now expects of that name (a fill arrived since).
+    record's contracts differ from what the ledger now expects of that name (a fill arrived since), unless
+    `--units N` gives exactly that expectation; it then settles N, and the entry carries both figures.
   - `--withdraw-pending ID` is for a holding that is back in the account in full. It needs a clean reconcile and
     closes the record without a settlement, with a `settlement_withdrawn` line carrying who and the note. If the
     holding goes again later, a new pending record is made.
@@ -148,6 +150,10 @@ removed. Event buying power is derived from that linked account's settled cash (
 - A transfer out, or a hand sale netting exactly zero after fees, of a holding Kalshi says lost is recorded as a
   settlement, with the money still right.
 - Any cash move from outside the ledger that exactly cancels a difference passes the equation.
+- A venue that reports an average price rounded to the cent can leave an order's cash unknown or off by that
+  rounding, and then the equation does not hold and a person confirms.
+- A fee total of zero that the venue reports only after the fill is not stored by the ledger, so that order's cash
+  stays unknown and a person confirms.
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
 - A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
   whole Events path until Kalshi finalizes. A multi-market strategy will need a per-name waiting state for that

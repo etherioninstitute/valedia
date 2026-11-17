@@ -363,48 +363,45 @@ def _near_cents(d: Decimal) -> int | None:
         return None
 
 
-def known_cents(fills: list[dict], settlements: list[dict]) -> tuple[int | None, str | None]:
-    """The ledger's cumulative known cash in whole cents, from its fill rows as orders.py writes them, plus each
-    settlement's payout. The rows are taken order by order (by tag): a row's units are signed like its order (a sale
-    negative), its price covers `price_covers_units` contracts, a positive count, and a row of 0 units carries only a
-    later fee or a later price. For each order, a purchase costs price times contracts plus its fees and a sale brings
-    price times contracts less its fees. (None, why) when a piece is not known exactly: a fill not yet applied, a row
-    with contracts and no fee, an order whose priced contracts are not exactly its filled contracts, or a figure not
-    in whole cents. orders.py signs every row of an order like the order, so an order's summed units give its side."""
-    orders: dict = {}
-    for f in fills:
-        if not f.get("applied"):
-            return None, "a fill is not yet applied"
-        units = _dec(f.get("units"))
-        if units is None:
-            return None, "a fill has no readable number of contracts"
-        o = orders.setdefault(f.get("tag"), {"units": Decimal(0), "covered": Decimal(0), "value": Decimal(0),
-                                             "fee": Decimal(0)})
-        fee = f.get("fee")
-        if fee is None:
-            if units != 0:
-                return None, "a fill has no fee"
-        else:
-            fee = _dec(fee)
-            if fee is None or fee < 0:
-                return None, "a fill's fee cannot be read"
-            o["fee"] += fee
-        o["units"] += units
-        price, covers = f.get("price"), f.get("price_covers_units")
-        if price is not None or covers is not None:
-            price, covers = _dec(price), _dec(covers)
-            if price is None or covers is None or price < 0 or not covers > 0:
-                return None, "a fill's price cannot be read"
-            o["covered"] += covers
-            o["value"] += price * covers
+def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | None, str | None]:
+    """The ledger's cumulative known cash in whole cents, from each order's CURRENT figures as the ledger holds them
+    (OrderLedger.orders, orders.py:446: filled_units, the priced point priced_units / priced_avg as last restated,
+    the fee total as last reported, a fall included), plus each settlement's payout. Never from summing fill rows,
+    which never change. A purchase pays priced_avg times filled_units plus its fee; a sale brings it less its fee; an
+    order with nothing filled counts only a fee it reports. (None, why) while a piece is not known: a fill not yet
+    applied (OrderLedger.unapplied_fills, orders.py:474), an order of unknown outcome or whose amount is unconfirmed,
+    an order with contracts filled and no price for every one of them or no fee figure, or a figure more than a
+    millionth of a cent from a whole cent (the ledger keeps floats). It becomes known the moment the late figure
+    arrives. A venue average rounded to the cent cannot be told from a true one: the figure is then off by that
+    rounding, and the exact cash equation does not hold across the reading where it entered."""
+    if ledger.unapplied_fills():
+        return None, "a fill is not yet applied"
     total = 0
-    for o in orders.values():
-        if abs(o["covered"] - abs(o["units"])) > UNIT_SLACK:
-            return None, "a fill has no price for all its contracts"
-        cash = (o["value"] if o["units"] < 0 else -o["value"]) - o["fee"]     # a sale brings, a purchase pays
+    for o in ledger.orders():
+        if o.get("state") in ("sent", "unknown"):
+            return None, "an order's outcome is not known"
+        if o.get("amount_unconfirmed"):
+            return None, "an order's filled amount is not confirmed"
+        filled, fee = _dec(o.get("filled_units")), o.get("fee")
+        if filled is None or filled < 0:
+            return None, "an order's filled amount cannot be read"
+        fee = None if fee is None else _dec(fee)
+        if o.get("fee") is not None and (fee is None or fee < 0):
+            return None, "an order's fee cannot be read"
+        if filled == 0:
+            cash = -(fee or Decimal(0))
+        else:
+            priced, avg = _dec(o.get("priced_units")), o.get("priced_avg")
+            avg = None if avg is None else _dec(avg)
+            if avg is None or avg < 0 or priced is None or abs(priced - filled) > UNIT_SLACK:
+                return None, "an order has no price for all its filled contracts"
+            if fee is None:
+                return None, "an order has contracts filled and no fee figure"
+            value = avg * filled
+            cash = (value if _as_float(o.get("units")) < 0 else -value) - fee      # a sale brings, a purchase pays
         c = _near_cents(cash)
         if c is None:
-            return None, "a fill's cash is not in whole cents"
+            return None, "an order's cash is not in whole cents"
         total += c
     for r in settlements:
         units = _dec(r.get("units"))
@@ -506,6 +503,7 @@ def _settlement_entry(r: dict) -> dict:
             "baseline_units": float(r["baseline_units"]), "program_units": float(r["program_units"]),
             "price": float(Decimal(r["price"])), "fee": None, "fee_seen": "none seen", "kalshi": r["kalshi"],
             "witnesses": r["witnesses"], "confirmed_by": r["confirmed_by"], "note": r["note"], "pending_id": r["pending_id"],
+            "pending_units": None if r.get("pending_units") is None else float(r["pending_units"]),
             "reading_prev": r["reading_prev"], "reading_now": r["reading_now"]}
 
 
@@ -652,7 +650,8 @@ class PracticeState:
     # -- settlements (T45-1)
     def settlements(self) -> list[dict]:
         """Every settlement row, oldest first; `kalshi` is the dict of Kalshi's fields read."""
-        rows = self._rows("SELECT * FROM settlements ORDER BY id")
+        rows = self._rows("SELECT s.*, p.units AS pending_units FROM settlements s LEFT JOIN pending p "
+                          "ON p.id = s.pending_id ORDER BY s.id")
         for r in rows:
             r["kalshi"] = json.loads(r["kalshi"])
         return rows
@@ -1302,7 +1301,7 @@ class _Run:
             bp, cents, unread = None, None, "an order of this ledger is open, so buying power is not read"
         else:
             bp, cents, unread = self._read_buying_power()
-        known, known_why = known_cents(self.ledger.fills(), self.state.settlements())
+        known, known_why = known_cents(self.ledger, self.state.settlements())
         book = {s: u for s, u in self._applied_positions(baseline).items() if u > 1e-9}
         rid = self.state.add_reading(self.batch, bp, cents, unread, book, clean and not open_orders, known, known_why)
         self.buying_power, self._read_this_run = bp, True
@@ -1398,6 +1397,9 @@ class _Run:
             raise _Stop("input", f"--who and --note are both needed: plain text, not empty after trimming, without control "
                                  f"characters (who at most {WHO_MAX} characters, the note at most {NOTE_MAX})")
         self.person["who"], self.person["note"] = w, n
+        units = self.person.get("units")
+        if units is not None and (type(units) is not int or units < 1):
+            raise _Stop("input", "--units must be a whole number of contracts from 1")
 
     def _person_step(self) -> dict:
         """Under the lock: the pending record open; nothing of the ledger open or unjournaled; the same reconcile a
@@ -1427,13 +1429,20 @@ class _Run:
             self._quiet(before=False)
             self.stage = "account"
             self._account_now(kind, p["symbol"], result)
-            if kind == "confirm":
-                expected = _as_float(self._applied_positions(baseline).get(p["symbol"]))
-                if expected is None or abs(expected - float(p["units"])) > 1e-9:
-                    raise _Stop("account", f"the pending record holds {float(p['units']):g} of {p['symbol']} but the ledger "
-                                           f"now expects {expected if expected is None else format(expected, 'g')}: a "
-                                           "fill arrived since it was made; the record stays open; a person must look")
-            return self._confirm(p) if kind == "confirm" else self._withdraw(p)
+            if kind == "withdraw":
+                return self._withdraw(p)
+            expected = _as_float(self._applied_positions(baseline).get(p["symbol"]))
+            given = self.person.get("units")
+            if expected is None:
+                raise _Stop("account", f"the ledger's expected holding of {p['symbol']} cannot be read; a person must look")
+            if abs(expected - float(p["units"])) > 1e-9 and given is None:
+                raise _Stop("account", f"the pending record holds {float(p['units']):g} of {p['symbol']} but the ledger now "
+                                       f"expects {expected:g}: a fill arrived since it was made; the record stays open. "
+                                       f"After looking, --units {expected:g} settles what the ledger expects")
+            if given is not None and abs(expected - given) > 1e-9:
+                raise _Stop("account", f"--units {given} is not what the ledger now expects of {p['symbol']} ({expected:g}); "
+                                       "the record stays open")
+            return self._confirm(p, expected)
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         except OrdersBlocked:
@@ -1492,7 +1501,7 @@ class _Run:
             raise _Stop("account", f"another name differs from baseline plus fills ({', '.join(bad)}); the pending record "
                                    "stays open; a person must look")
 
-    def _confirm(self, p: dict) -> dict:
+    def _confirm(self, p: dict, units: float) -> dict:
         self.stage = "kalshi"
         ticker, outcome = parse_event_name(p["symbol"])
         now = self._now()
@@ -1506,8 +1515,8 @@ class _Run:
             yes_value = judge_settlement(record, ticker, now, after)
         except NotSettled as why:
             raise _Stop("kalshi", f"Kalshi's record does not show the settlement now: {why}") from None
-        row = _settlement_row(p["symbol"], outcome, p["units"], p["baseline_units"], p["program_units"], yes_value, record,
-                              self.batch)
+        row = _settlement_row(p["symbol"], outcome, units, p["baseline_units"],
+                              float(p["program_units"]) + (units - float(p["units"])), yes_value, record, self.batch)
         if row["price"] != p["price"]:
             raise _Stop("kalshi", "Kalshi's record now gives another result than when the pending record was made; a person "
                                   "must look")
@@ -1578,7 +1587,7 @@ class _Run:
 # ---- confirming a pending settlement (a person's command)
 
 
-def confirm_settlement(*, journal, state, ledger: OrderLedger, venue, pending_id, who, note,
+def confirm_settlement(*, journal, state, ledger: OrderLedger, venue, pending_id, who, note, units: int | None = None,
                        market: Callable | None = None, clock: Callable[[], float] = wall_clock) -> dict:
     """A person settles a pending record. The venue's name, environment and host first (as every run), then the inputs:
     `pending_id` a plain int from 1; `who` and `note` plain text, not empty after trimming, without control or format
@@ -1589,9 +1598,11 @@ def confirm_settlement(*, journal, state, ledger: OrderLedger, venue, pending_id
     settlement row (witnesses kalshi_record+person, who and the note) and the record's resolution in one write, the
     journal line (synced), the row marked journaled; a failed line is written by the next run. Any refusal journals
     nothing and changes no practice state. The command line then runs a reconcile, which takes the fresh reading the
-    next settlement starts from."""
+    next settlement starts from. When a late fill has changed what the ledger expects of the name since the record was
+    made, it is refused unless `units` (--units N) equals the ledger's current expectation; it then settles N, and the
+    entry carries both the record's units (`pending_units`) and N."""
     return _Run(ledger, venue, journal, state, {}, True, None, clock, market if market is not None else kalshi_market,
-                person={"kind": "confirm", "id": pending_id, "who": who, "note": note}).go()
+                person={"kind": "confirm", "id": pending_id, "who": who, "note": note, "units": units}).go()
 
 
 def withdraw_pending(*, journal, state, ledger: OrderLedger, venue, pending_id, who, note,
@@ -1648,6 +1659,8 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
     ap.add_argument("--withdraw-pending", type=int, metavar="ID", help="close pending record ID without a settlement "
                                                                         "(the holding is back in full); needs --who and "
                                                                         "--note, then reconciles")
+    ap.add_argument("--units", type=int, metavar="N", help="with --confirm-settlement: settle N contracts when a late "
+                                                            "fill changed what the ledger expects (N must equal it)")
     ap.add_argument("--who", help="with --confirm-settlement or --withdraw-pending: who looked")
     ap.add_argument("--note", help="with --confirm-settlement or --withdraw-pending: what they found")
     args = ap.parse_args(argv)
@@ -1660,6 +1673,8 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
         ap.error("--ticker, --outcome, --contracts and --side are needed unless --reconcile-only is given")
     elif args.who is not None or args.note is not None:
         ap.error("--who and --note go with --confirm-settlement or --withdraw-pending")
+    if args.units is not None and args.confirm_settlement is None:
+        ap.error("--units goes with --confirm-settlement")
     from valedia_trader.core.secrets import SecretError
     from valedia_trader.venues.webull import WebullError
     try:
@@ -1696,7 +1711,7 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
             common = dict(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name), ledger=ledger,
                           venue=venue, who=args.who, note=args.note, clock=clock)
             if args.confirm_settlement is not None:
-                done = confirm_settlement(pending_id=args.confirm_settlement, market=market, **common)
+                done = confirm_settlement(pending_id=args.confirm_settlement, units=args.units, market=market, **common)
             else:
                 done = withdraw_pending(pending_id=args.withdraw_pending, **common)
             print(json.dumps(done, indent=2, default=str))

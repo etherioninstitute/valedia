@@ -1352,13 +1352,18 @@ def test_known_cash_follows_the_ledger_as_it_stores_a_purchase_and_a_sale():
     assert ep.known_cents(OrderLedger(), [{"units": 2.0, "price": "1.00"}, {"units": 1.0, "price": "0.00"}]) == (200, None)
 
 
-@pytest.mark.parametrize("withheld", ["price", "fee", "unapplied", "half cent", "four decimals", None])
+@pytest.mark.parametrize("withheld", ["price", "fee", "unapplied", "half cent", "four decimals", "later piece", None])
 def test_known_cash_is_unknown_when_a_piece_is_not_known_to_the_cent(withheld):
     led, venue = OrderLedger(), CashVenue()
     venue.give_price, venue.give_fee = withheld != "price", withheld != "fee"
     if withheld == "four decimals":                                       # 1.2201 for 1.22: never taken as 1.22
         venue.round_avg = 4
         trade(led, venue, f"{T}:yes", 3, [(1, 40, 1), (1, 41, 1), (1, 41, 1)])
+    elif withheld == "later piece":                                       # the second piece's price withheld
+        tag = trade(led, venue, f"{T}:yes", 2, [(1, 40, 1)])
+        venue.give_price = False
+        venue.fill(tag, 1, 42, 1)
+        read(led, venue, [])
     elif withheld == "unapplied":
         tag = trade(led, venue, f"{T}:yes", 2, [(1, 40, 1)])
         venue.fill(tag, 1, 42, 1)
@@ -1400,6 +1405,21 @@ def test_known_cash_follows_the_orders_current_figures(case):
         assert rows == [(1.0, 0.4, 1.0, None), (0.0, None, None, 0.01)], rows
     kinds = {a["kind"] for a in led.attention()}
     assert {"fee fell": {"fee_fell"}, "average restated": {"avg_restated"}}.get(case, set()) <= kinds
+
+
+def test_an_order_of_unknown_outcome_leaves_the_known_cash_unknown_until_a_reconcile_settles_it():
+    led, venue = OrderLedger(), CashVenue()
+    read(led, venue, [])
+
+    def lost_answer(symbol, units, tag, price=None, limit_price=None):   # the venue takes and fills it; the answer is lost
+        CashVenue.submit(venue, symbol, units, tag)
+        venue.fill(tag, 1, 40, 1)
+        raise ConnectionError("timed out")
+    venue.submit = lost_answer
+    led.intend("lost", f"{T}:yes", 1.0, 0.5, limit_price=0.99)
+    assert led.submit_once(venue, "lost")["state"] == "unknown"
+    assert ep.known_cents(led, [])[0] is None
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-41, None)        # the other way: settled, known
 
 
 def test_an_average_rounded_to_the_cent_never_settles_on_a_wrong_figure():
