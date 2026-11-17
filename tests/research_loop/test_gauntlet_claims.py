@@ -158,9 +158,183 @@ def test_edge_timing_fails_closed_on_missing_figures(monkeypatch):
     for bad in (None, float("nan")):
         monkeypatch.setattr(gt, "timing_null", lambda *a, _b=bad, **k: {"p_value": _b, "shifts": 400})
         assert not gt.edge_timing(w, r, prices, 1)["passed"]
-    for bad in (0, -1, 1.5, None, "3"):
-        with pytest.raises(ValueError):
-            gt.edge_timing(w, r, prices, bad)
+    for bad in (0, -1, 1.5, None, "3"):                                                  # a verdict, not an exception
+        out = gt.edge_timing(w, r, prices, bad)
+        assert not out["passed"] and "fails" in out["detail"] and "attempts" in out["detail"], bad
+
+
+# ---- addendum 2: every figure the timing check reads is of the right kind, finite and in range, or the check fails
+
+def _exact(**over):
+    """A `timing_exact` result for the 400-bar window (358 copies, floor 1 / 359), with figures replaced."""
+    base = {"actual_gross_sharpe": 1.0, "copies": 358, "copies_at_or_above": 0, "p_exact": 1 / 359, "floor": 1 / 359,
+            "beats_every_copy": True}
+    base.update(over)
+    return lambda *a, **k: dict(base)
+
+
+def _drawn(p):
+    return lambda *a, **k: {"p_value": p, "shifts": 400}
+
+
+def _fails_naming(out, word):
+    return out["passed"] is False and "fails" in out["detail"] and word in out["detail"]
+
+
+def test_the_number_of_attempts_must_be_a_whole_number_of_at_least_one():
+    r, prices = _window(400)
+    w = _skilled_book(r)
+    for good in (1, np.int64(2)):
+        assert gt.edge_timing(w, r, prices, good)["passed"], good
+    for bad in (0, -1, True, False, 1.5, np.float64(2.0), None, "3", float("nan")):
+        out = gt.edge_timing(w, r, prices, bad)
+        assert _fails_naming(out, "attempts"), (bad, out["detail"])
+
+
+def test_the_drawn_p_value_must_be_a_number_from_zero_to_one(monkeypatch):
+    r, prices = _window(400)
+    w = _skilled_book(r)
+    for good in (0.0, 0, 0.01, np.float64(0.05)):
+        monkeypatch.setattr(gt, "timing_null", _drawn(good))
+        out = gt.edge_timing(w, r, prices, 1)
+        assert out["region"] == "drawn" and out["passed"], good
+    for bad in (-0.1, False, True, np.bool_(False), 1.5, float("nan"), float("inf"), -float("inf"), None, "0.001"):
+        monkeypatch.setattr(gt, "timing_null", _drawn(bad))
+        out = gt.edge_timing(w, r, prices, 1)
+        assert _fails_naming(out, "p-value"), (bad, out["detail"])
+
+
+def test_the_number_of_copies_must_be_a_whole_number_of_at_least_one(monkeypatch):
+    r, prices = _window(400)
+    w = _skilled_book(r)
+    monkeypatch.setattr(gt, "timing_null", _drawn(0.001))
+    for good in (358, np.int64(358)):
+        monkeypatch.setattr(gt, "timing_exact", _exact(copies=good))
+        assert gt.edge_timing(w, r, prices, 1)["passed"], good
+    for bad in (True, np.bool_(True), 0, -3, 1.5, 358.0, None, "358"):
+        monkeypatch.setattr(gt, "timing_exact", _exact(copies=bad))
+        out = gt.edge_timing(w, r, prices, 1)
+        assert _fails_naming(out, "copies"), (bad, out["detail"])
+
+
+def test_the_reachable_floor_must_be_a_number_above_zero_and_at_most_one(monkeypatch):
+    r, prices = _window(400)
+    w = _skilled_book(r)
+    monkeypatch.setattr(gt, "timing_null", _drawn(0.001))                  # both regions would pass on their figure
+    for good in (1 / 359, 1.0):
+        monkeypatch.setattr(gt, "timing_exact", _exact(floor=good))
+        assert gt.edge_timing(w, r, prices, 1)["passed"], good
+    for bad in (float("nan"), float("inf"), -1.0, 0.0, 1.5, True, None, "0.01"):
+        monkeypatch.setattr(gt, "timing_exact", _exact(floor=bad))
+        out = gt.edge_timing(w, r, prices, 1)
+        assert _fails_naming(out, "floor"), (bad, out["detail"])
+
+
+def test_beats_every_copy_passes_only_on_the_flag_true(monkeypatch):
+    r, prices = _window(400)
+    w = _skilled_book(r)
+    monkeypatch.setattr(gt, "timing_exact", _exact(beats_every_copy=True))
+    out = gt.edge_timing(w, r, prices, 50)
+    assert out["region"] == "enumerated" and out["passed"]                 # 0.05 / 50 < 1 / 359: the twin passes
+    for bad in ("yes", "True", 1, 1.0, None):
+        monkeypatch.setattr(gt, "timing_exact", _exact(beats_every_copy=bad))
+        out = gt.edge_timing(w, r, prices, 50)
+        assert _fails_naming(out, "beats every copy"), (bad, out["detail"])
+
+
+def test_the_one_trial_sharpe_check_refuses_a_mistyped_mark_or_figure(monkeypatch):
+    good = pd.Series(0.001 + 0.01 * np.random.default_rng(1).standard_normal(2000))
+    assert gt.one_trial_sharpe(good, 0.95)[1] and gt.one_trial_sharpe(good, np.float64(0.5))[1]      # the twins
+    for bad in (False, True, 0, 0.0, -1.0, 1.0, float("nan"), None, "0.95"):
+        value, ok, detail = gt.one_trial_sharpe(good, bad)
+        assert not ok and "fails" in detail and "mark" in detail, (bad, detail)
+    real = gt.research.probabilistic_sharpe_ratio
+    for bad in (True, 1.5, -0.2, float("nan")):                                              # a figure of the wrong kind
+        monkeypatch.setattr(gt.research, "probabilistic_sharpe_ratio", lambda *a, _b=bad, **k: _b)
+        value, ok, detail = gt.one_trial_sharpe(good, 0.95)
+        assert not ok and "fails" in detail, (bad, detail)
+
+    def refuses(*a, **k):
+        raise ValueError("Sharpe standard-error term is not positive; moments are inconsistent")
+    monkeypatch.setattr(gt.research, "probabilistic_sharpe_ratio", refuses)
+    value, ok, detail = gt.one_trial_sharpe(good, 0.95)
+    assert not ok and "fails" in detail and value is None
+    monkeypatch.setattr(gt.research, "probabilistic_sharpe_ratio", real)
+    m = gt.research.sharpe_moments(good.to_numpy())
+    for bad in ({"n_obs": True}, {"n_obs": 1.5}, {"sharpe": True}, {"skew": None}):
+        monkeypatch.setattr(gt.research, "sharpe_moments", lambda *a, _m=replace(m, **bad), **k: _m)
+        value, ok, detail = gt.one_trial_sharpe(good, 0.95)
+        assert not ok and "fails" in detail and "moments" in detail, (bad, detail)
+
+
+def test_a_development_figure_is_never_a_flag():
+    assert gt._fin(1.0, 0, np.float64(-2.0), np.int64(3))
+    for bad in (True, False, np.bool_(True), float("nan"), None, "1"):
+        assert not gt._fin(1.0, bad), bad
+
+
+def test_a_worst_stretch_that_is_not_a_number_fails():
+    def stretches(*returns):
+        return [{"start": f"2020-0{k + 1}-01", "end": f"2020-0{k + 1}-20", "market_return": -0.1, "strategy_return": x}
+                for k, x in enumerate(returns)]
+    ok, detail = gt._worst_stretch_check(stretches(-0.05, -0.02), 0.25)
+    assert ok and "-5.0%" in detail                                                   # the twin
+    assert not gt._worst_stretch_check(stretches(-0.05, -0.30), 0.25)[0]                # a real figure past the limit
+    for bad in (float("nan"), float("inf"), -float("inf"), None, True, "-0.01"):
+        ok, detail = gt._worst_stretch_check(stretches(-0.05, bad), 0.25)       # second, where min() would skip it
+        assert not ok and "fails" in detail and "2020-02-01" in detail, (bad, detail)
+    ok, detail = gt._worst_stretch_check([], 0.25)
+    assert not ok and "no worst stretch could be formed" in detail
+
+
+# ---- addendum 2: three tests the surviving mutants showed were missing
+
+def test_the_region_boundary_belongs_to_the_drawn_region():
+    days = 101                                                          # 59 distinct shifts: floor 1 / 60 == 0.05 / 3
+    r, prices = _window(days)
+    w = _skilled_book(r)
+    at, past = gt.edge_timing(w, r, prices, 3), gt.edge_timing(w, r, prices, 4)
+    assert at["copies"] == 59 and at["floor"] == at["threshold"] == 0.05 / 3          # exactly on the boundary
+    assert at["region"] == "drawn" and at["drawn_p_value"] is not None             # `>` instead of `>=` fails here
+    assert past["region"] == "enumerated"
+
+
+def test_a_copy_whose_figure_is_not_a_number_counts_against_the_book(monkeypatch):
+    days = 251
+    r, prices = _window(days)
+    w = _skilled_book(r)
+    clean = gt.timing_exact(w, r)
+    assert clean["copies_at_or_above"] == 0 and clean["beats_every_copy"] is True
+    real, calls = gt._gross_sharpe, []
+
+    def one_nan_copy(*a, **k):
+        calls.append(1)
+        return float("nan") if len(calls) == 2 else real(*a, **k)          # call 1 is the book, call 2 the first copy
+    monkeypatch.setattr(gt, "_gross_sharpe", one_nan_copy)
+    out = gt.timing_exact(w, r)
+    assert out["copies"] == clean["copies"] and out["copies_at_or_above"] == 1
+    assert out["beats_every_copy"] is False and out["p_exact"] == pytest.approx(2 / (out["copies"] + 1))
+
+
+def test_develop_reads_the_engines_return_across_an_interior_gap(tmp_path, monkeypatch):
+    prices = regime_market()
+    prices.iloc[1200:1206, 2] = np.nan                                  # an interior gap inside the out-of-sample run
+    prices.iloc[1400, 0] = np.nan
+    _, _, g, hid = desk(tmp_path, prices, EDGE)
+    real, seen = gt.timing_null, []
+
+    def capture(w, r, *a, **k):
+        seen.append((w, r))
+        return real(w, r, *a, **k)
+    monkeypatch.setattr(gt, "timing_null", capture)
+    rep = g.develop(hid, momentum(lookback=20))
+    w, r = seen[0]                                                      # the breaker's call
+    dev = g.dev_prices
+    booked, pct = gt.booked_asset_returns(dev).loc[r.index], dev.pct_change().loc[r.index]
+    assert np.array_equal(r.to_numpy(), booked.to_numpy(), equal_nan=True)
+    assert not np.array_equal(r.to_numpy(), pct.to_numpy(), equal_nan=True)
+    figure = rep["breaker"]["timing_null"]["actual_gross_sharpe"]
+    assert figure == real(w, booked)["actual_gross_sharpe"] != real(w, pct)["actual_gross_sharpe"]
 
 
 # ---- R2 and R3 through the real gate
