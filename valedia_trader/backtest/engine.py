@@ -6,10 +6,14 @@ on the day a trade happens: commission and spread per unit traded, square-root m
 (formula 9.3) from participation in trailing dollar volume, borrow on shorts and carry on perps.
 The cost model must be complete (formula 10.1) or the engine refuses to run.
 
-A bar is priced for a symbol when its price is finite and above zero. On an unpriced bar the engine neither buys
-nor sells the symbol: the weight carried from the bar before stays in effect (drifted by the book's return), adds
-no trading cost and still pays borrow and funding; the return booked when the price comes back is the move since
-the last priced bar. A position still open on an unpriced last bar is reported in `stranded`, not valued."""
+A bar is priced for a symbol when its price is finite and above zero. Before a symbol's first priced bar any cell
+is ignored; after it, NaN is the only legal "no price" and a zero, negative or infinite price is refused. On an
+unpriced bar the engine neither buys nor sells the symbol: the weight carried from the bar before stays in effect
+(drifted by the book's return), adds no trading cost and still pays borrow and funding; the return booked when the
+price comes back is the move since the last priced bar. A position still open on an unpriced last bar is reported
+in `stranded`, not valued. While a symbol is carried, the book's total weight can exceed the total of the targets:
+the reported weights show it and nothing is scaled back. When the book's own return on a bar is -100% or worse,
+every weight, carried ones included, becomes zero as before."""
 from __future__ import annotations
 
 import math
@@ -81,9 +85,14 @@ def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: Cost
         raise ValueError("capital must be positive")
     cols = prices.columns
     px = prices.to_numpy(dtype=float)
+    tradable = np.isfinite(px) & (px > 0)
+    bad = np.maximum.accumulate(tradable, axis=0) & ~tradable & ~np.isnan(px)     # after listing only NaN is legal
+    if bad.any():
+        t, j = np.argwhere(bad)[0]
+        raise ValueError(f"price of {cols[j]!r} on {prices.index[t]} is {px[t, j]} after its first price: "
+                         "mark a missing price as NaN, or model the delisting (an explicit exit and its loss)")
     step = np.zeros_like(px)                                                 # bar-to-bar move: the impact
     step[1:] = px[1:] / px[:-1] - 1.0                                        # model's volatility input, as before
-    tradable = np.isfinite(px) & (px > 0)
     step[~np.isfinite(step)] = 0.0
     last = pd.DataFrame(np.where(tradable, px, np.nan)).ffill().shift(1).to_numpy(dtype=float)
     booked = tradable & np.isfinite(last)                                    # priced, with a priced bar before
