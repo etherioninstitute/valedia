@@ -669,3 +669,16 @@ def test_page_by_page_the_cap_raises_after_that_many_pages_and_says_how_many():
         for one in c.trade_pages("0xabc", page_cap=4, ids={}):
             got.append(one)
     assert len(got) == 4 and e.value.pages == 4 and len(t.urls) == 4
+
+
+def test_page_by_page_a_repeated_cursor_or_more_without_a_cursor_raises_before_that_page_is_given():
+    pages = {None: page([trade(1)], True, "c1"), "c1": page([trade(2)], True, "c1")}
+    c, t, clock = client(lambda p, q: pages[q.get("cursor")])
+    got = []
+    with pytest.raises(pd.PolymarketDataError, match="repeated cursor"):
+        for one in c.trade_pages("0xabc", ids={}):
+            got.append(one)
+    assert len(got) == 1                               # the page that repeated its cursor is never handed on
+    c, t, clock = client(lambda p, q: page([trade(1)], True, None))
+    with pytest.raises(pd.PolymarketDataError, match="no next_cursor"):
+        list(c.trade_pages("0xabc", ids={}))

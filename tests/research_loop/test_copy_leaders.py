@@ -1926,3 +1926,17 @@ def test_a_kill_after_the_walk_spilled_to_the_file_leaves_no_readable_row_and_th
     assert db.execute("SELECT status, pages, rows FROM walks WHERE kind='trades'").fetchone() == ("finished", 40, 40_000)
     assert db.execute("SELECT MIN(seq), MAX(seq), COUNT(*) FROM trades").fetchone() == (0, 39_999, 40_000)
     db.close()
+
+
+def test_the_identities_on_disk_behave_as_the_whole_walks_dict_one_and_one_point_zero_alike(tmp_path):
+    with cl.Store(tmp_path / "s.sqlite", make_id=True) as s:
+        ids, ref = s.seen(), {}
+        for k, sig in ((("0xa", "h", 10, 0.5, 1_780_000_000, 0), "first"), (("0xa", "h", 10.0, 0.5, 1_780_000_000, 0.0), "x"),
+                       (("0xa", "h", 11, 0.5, 1_780_000_000, 0), "y"), (("0xb", "h", 10, 0.5, 1_780_000_000, 0), "z")):
+            assert (k in ids) == (k in ref), k
+            if k in ref:
+                assert (ids[k] == sig) == (ref[k] == sig) and (ids[k] == "first") == (ref[k] == "first")
+            else:
+                ids[k], ref[k] = sig, sig
+        assert len(ref) == 3
+        s.db.rollback()
