@@ -202,15 +202,22 @@ def valid_answer(questions=None):
             "prompt_eval_cached_count": 0}
 
 
-# T44-1: the model is on LM Studio. The values below are written out, not taken from the module, so that a changed
-# constant fails a test.
-INSTANCE = "collector-nimble-9b-v3-q8"
-KEY = "bespoke-nimble-9b-v3@q8_0"
-FILE_SHA = "ad484077ad28c1ba0644509b81e80268f8fd39e9d218415638a988caf3c6e66c"
-FILE_SIZE = 9527503392
-LMS = "/fake/bin/lms"
-LOAD = [LMS, "load", KEY, "--identifier", INSTANCE, "--context-length", "32768", "--parallel", "6", "-y"]
-UNLOAD = [LMS, "unload", INSTANCE]
+# T44-1 / T44-1b: the model is Elephant-1 on LM Studio. The values below are written out, not taken from the module,
+# so that a changed constant fails a test.
+INSTANCE = "elephant-1"
+KEY = "elephant-1"
+FILE_SHA = "652c102967efa9a1adf9c63ebaada547fba189888ca0680944aae595398fdf9d"
+FILE_SIZE = 9527504224
+LISTED_SIZE = 10151733984                          # the entry: the model file plus the vision file
+TAG_NEW = "lmstudio:elephant-1@q8_0"
+LIST_URL = "http://127.0.0.1:1235/api/v1/models"
+LOAD_URL = "http://127.0.0.1:1235/api/v1/models/load"
+UNLOAD_URL = "http://127.0.0.1:1235/api/v1/models/unload"
+LOAD_BODY = {"model": "elephant-1", "context_length": 8192, "parallel": 1, "physical_batch_size": 2048,
+             "eval_batch_size": 2048}
+UNLOAD_BODY = {"instance_id": "elephant-1"}
+LOAD = ("load", LOAD_BODY, 180.0)
+UNLOAD = ("unload", UNLOAD_BODY, 60.0)
 
 
 def lm_answer(model=INSTANCE, questions=None):
@@ -220,13 +227,14 @@ def lm_answer(model=INSTANCE, questions=None):
 
 
 def lm_instance(name=INSTANCE, **config):
-    return {"id": name, "config": {"context_length": 32768, "parallel": 6, "flash_attention": True, **config}}
+    return {"id": name, "config": {"context_length": 8192, "eval_batch_size": 2048, "physical_batch_size": 2048,
+                                   "parallel": 1, "flash_attention": True, **config}}
 
 
 def lm_entry(instances=None, **kw):
     """The model's entry in `GET /api/v1/models`, as measured on 2026-11-16, with the collector's instance loaded."""
-    e = {"type": "decision", "key": KEY, "publisher": "ggml-org", "size_bytes": FILE_SIZE,
-         "quantization": {"name": "Q8_0", "bits_per_weight": 8},
+    e = {"type": "decision", "decision_type": "openjev", "key": KEY, "publisher": "debackerl", "format": "gguf",
+         "size_bytes": LISTED_SIZE, "quantization": {"name": "Q8_0", "bits_per_weight": 8},
          "loaded_instances": [lm_instance()] if instances is None else instances}
     e.update(kw)
     return e
@@ -241,9 +249,11 @@ def lm_listing(entry=None, *others):
 
 
 class Model:
-    """LM Studio at 127.0.0.1:1235 as the collector uses it: the model list and the typed endpoint. For a module of
-    an earlier revision (the differential and continuation tests), Ollama at 127.0.0.1:11434: tags, version, and the
-    typed endpoint."""
+    """LM Studio at 127.0.0.1:1235 as the collector uses it: the model list, the typed endpoint, and the REST load
+    and unload (answers from `load_answers` / `unload_answers`, each a dict (HTTP 200 with it), an int (that HTTP
+    error) or an exception; then the measured answer; `rest_gate` holds them until set). For a module of an earlier
+    revision (the differential and continuation tests), Ollama at 127.0.0.1:11434: tags, version, the typed
+    endpoint."""
     def __init__(self, clock, latency=0.8, digest=v3.MANIFEST_SHA256, body=None, down=False, post_down=False,
                  exc=None, listing=None, old_body=None):
         self.clock, self.latency, self.digest, self.body, self.down, self.post_down = clock, latency, digest, body, down, post_down
@@ -252,6 +262,23 @@ class Model:
         self.old_body = old_body                            # the earlier revision's reply (default valid_answer())
         self.on_post = None                                 # rev 6: a hook inside each call
         self.unreachable = ol.ModelUnavailable              # what an unreachable server raises
+        self.load_answers, self.unload_answers, self.rest_gate = [], [], None
+        self.rest, self.rest_threads = [], []               # (load|unload, body, limit) in order
+
+    def _rest(self, kind, url, data, timeout):
+        self.rest.append((kind, json.loads(data), timeout))
+        self.rest_threads.append(threading.current_thread())
+        if self.rest_gate is not None:
+            assert self.rest_gate.wait(30)
+        answers = self.load_answers if kind == "load" else self.unload_answers
+        a = answers.pop(0) if answers else ({"type": "decision", "instance_id": INSTANCE, "status": "loaded",
+                                             "load_time_seconds": 3.1} if kind == "load" else
+                                            {"instance_id": INSTANCE})
+        if isinstance(a, BaseException):
+            raise a
+        if isinstance(a, int):
+            raise ol.ModelHttpError("HTTP %d from %s" % (a, url))
+        return json.dumps(a).encode()
 
     def __call__(self, url, data, timeout):
         self.urls.append(url)
@@ -263,10 +290,13 @@ class Model:
             return json.dumps({"models": [{"name": v3.TAG, "digest": "sha256:" + self.digest}]}).encode()
         if old and url.endswith("/api/version"):
             return b'{"version": "0.40.16"}'
-        if not old and url.endswith("/api/v1/models"):
+        if not old and url == LIST_URL:
             assert data is None and timeout == ol.PIN_TIMEOUT_S
             listing = self.listing() if callable(self.listing) else self.listing
             return listing if isinstance(listing, bytes) else json.dumps(listing).encode()
+        if not old and url in (LOAD_URL, UNLOAD_URL):
+            assert data is not None
+            return self._rest("load" if url == LOAD_URL else "unload", url, data, timeout)
         assert url.endswith("/v1/systemone") and data is not None and timeout == ol.MODEL_LIMIT_S
         self.posts.append(data)
         if self.on_post is not None:
@@ -290,9 +320,10 @@ class Model:
 
 class ModelFile:
     """The model's file as the client sees it: `stat` (size, modification time) and the injectable hasher, which
-    records the thread it ran on. `gate` (an Event) holds the hash until set."""
-    def __init__(self, digest=FILE_SHA, size=FILE_SIZE, mtime_ns=1_763_300_000_000_000_000, gate=None, exc=None):
-        self.digest, self.size, self.mtime_ns, self.gate, self.exc = digest, size, mtime_ns, gate, exc
+    records the thread it ran on. `gate` (an Event) holds the hash until set; `sleep` makes it slow."""
+    def __init__(self, digest=FILE_SHA, size=FILE_SIZE, mtime_ns=1_763_300_000_000_000_000, gate=None, exc=None,
+                 sleep=0.0):
+        self.digest, self.size, self.mtime_ns, self.gate, self.exc, self.sleep = digest, size, mtime_ns, gate, exc, sleep
         self.paths, self.threads, self.stats = [], [], 0
 
     def stat(self, path):
@@ -302,32 +333,13 @@ class ModelFile:
     def hasher(self, path):
         self.paths.append(path)
         self.threads.append(threading.current_thread())
+        if self.sleep:
+            time.sleep(self.sleep)
         if self.gate is not None:
-            assert self.gate.wait(10)
+            assert self.gate.wait(30)
         if self.exc is not None:
             raise self.exc
         return self.digest
-
-
-class Runner:
-    """The keeper's command runner: records (argv, limit, thread); answers exit codes from `codes` (then 0); `gate`
-    (an Event) holds each command until set. Nothing is ever executed."""
-    def __init__(self, codes=(), gate=None):
-        self.codes, self.gate, self.calls, self.threads = list(codes), gate, [], []
-
-    def __call__(self, argv, timeout):
-        self.calls.append((list(argv), timeout))
-        self.threads.append(threading.current_thread())
-        if self.gate is not None:
-            assert self.gate.wait(30)
-        code =self.codes.pop(0) if self.codes else 0
-        if isinstance(code, BaseException):
-            raise code
-        return code
-
-    @property
-    def argvs(self):
-        return [a for a, _ in self.calls]
 
 
 class KeeperClock:
@@ -339,12 +351,12 @@ class KeeperClock:
         return self.t
 
 
-def client(model, clock, *, file=None, runner=None, kclock=None, verified=True):
-    """The collector's model client on the stand-in server, file, runner and keeper clock. `verified`: the file's
-    check has run (in its own thread, waited for here) before the client is handed over."""
+def client(model, clock, *, file=None, kclock=None, verified=True):
+    """The collector's model client on the stand-in server, file and keeper clock. `verified`: the file's check has
+    run (in its own thread, waited for here) before the client is handed over."""
     file = file or ModelFile()
-    c = ol.ModelClient(transport=model, clock=clock, hasher=file.hasher, stat=file.stat, runner=runner or Runner(),
-                       keeper_clock=kclock or KeeperClock(), lms=LMS)
+    c = ol.ModelClient(transport=model, clock=clock, hasher=file.hasher, stat=file.stat,
+                       keeper_clock=kclock or KeeperClock())
     c.test_file = file
     if verified:
         c.check_file()
@@ -355,20 +367,11 @@ def client(model, clock, *, file=None, runner=None, kclock=None, verified=True):
 
 @pytest.fixture(autouse=True)
 def no_real_model_side_effects(monkeypatch):
-    """No test runs `lms`, hashes or stats the real file: the module's defaults fail the test if reached."""
+    """No test hashes or stats the real file: the module's defaults fail the test if reached."""
     def refuse(*a, **k):
         raise AssertionError("a test reached a real side effect: %r" % (a,))
-    monkeypatch.setattr(ol, "_run_lms", refuse)
     monkeypatch.setattr(ol, "_file_sha256", refuse)
     monkeypatch.setattr(ol, "_file_stat", refuse)
-    monkeypatch.setattr(ol.subprocess, "run", refuse)
-
-
-def keep(c):
-    """One keeper run, waited for."""
-    assert c.keeper.ask()
-    c.keeper.thread.join(10)
-    assert not c.keeper.thread.is_alive()
 
 
 def rig(tmp_path, clock=None, **model_kw):
@@ -666,7 +669,7 @@ def test_an_ok_decision_stores_everything_the_evaluation_needs(tmp_path):
     run_minutes(col, clock, 1, 35)
     d = decisions(store)[0]
     assert d["status"] == "ok" and d["forced"] == 0 and d["battery_id"] == ol.BATTERY_ID
-    assert d["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0" and d["model_digest"] == FILE_SHA
+    assert d["model_tag"] == TAG_NEW and d["model_digest"] == FILE_SHA
     assert d["latency_s"] == pytest.approx(0.8, abs=1e-3) and d["input_tokens"] == 900 and d["error"] is None
     state = json.loads(d["state_json"])
     assert model.posts[0] == ol.request_bytes(state)                          # the bytes sent are the state stored
@@ -3203,12 +3206,20 @@ def test_a_store_written_by_09ecec7_is_continued_and_stays_readable_by_it(tmp_pa
     assert n == 3 * 10
 
 
-# ================================================================= T44-1: the model on LM Studio
+# ================================================================= T44-1 / T44-1b: Elephant-1 on LM Studio
 
-MODEL_PATH = os.path.expanduser("~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf")
+MODEL_PATH = os.path.expanduser("~/.lmstudio/models/debackerl/elephant-1-Q8_0-GGUF/elephant-1.Q8_0.gguf")
+KEEPER_URLS = {LIST_URL, LOAD_URL, UNLOAD_URL}
 
 
-def lm_rig(tmp_path, n=1, *, file=None, runner=None, kclock=None, verified=True, **model_kw):
+def keep(c):
+    """One keeper run, waited for."""
+    assert c.keeper.ask()
+    c.keeper.thread.join(10)
+    assert not c.keeper.thread.is_alive()
+
+
+def lm_rig(tmp_path, n=1, *, file=None, kclock=None, verified=True, **model_kw):
     """A store, a stand-in Kalshi with n markets and a stand-in LM Studio; the client is handed back too. Not
     started."""
     clock = Clock()
@@ -3216,7 +3227,7 @@ def lm_rig(tmp_path, n=1, *, file=None, runner=None, kclock=None, verified=True,
     model = Model(clock, **model_kw)
     store = ol.Store(tmp_path / "loop.sqlite")
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
-    c = client(model, clock, file=file, runner=runner, kclock=kclock, verified=verified)
+    c = client(model, clock, file=file, kclock=kclock, verified=verified)
     col = make_collector(store, kalshi, c, clock=clock)
     world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i) for i in range(n)]
     for m in world.markets:
@@ -3224,24 +3235,28 @@ def lm_rig(tmp_path, n=1, *, file=None, runner=None, kclock=None, verified=True,
     return col, world, model, store, clock, c
 
 
-def only_load_and_unload(runner):
-    """The keeper never runs anything but `lms load ...` and `lms unload <the instance>`."""
-    return all(a == UNLOAD or (a[:2] == [LMS, "load"] and a[3:] == LOAD[3:]) for a in runner.argvs)
+def only_keeper_requests(model):
+    """The keeper's requests are the list, the load and the unload of the instance, nothing else."""
+    return all(r in (LOAD, UNLOAD) for r in model.rest) and \
+        set(u for u in model.urls if not u.endswith("/v1/systemone")) <= KEEPER_URLS
 
 
-# ---------------------------------------------------------------- ruling 1: the constants
+# ---------------------------------------------------------------- ruling 1: the constants, from the shared module
 
-def test_t44_r1_the_model_constants():
-    assert ol.MODEL_URL == "http://127.0.0.1:1235"
-    assert ol.MODEL_KEY_PREFIX == "bespoke-nimble-9b-v3"
-    assert ol.MODEL_FILE == "~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf"
-    assert ol.MODEL_FILE_SIZE == FILE_SIZE == 9527503392 and ol.MODEL_FILE_SHA256 == FILE_SHA
-    assert ol.MODEL_QUANT == "Q8_0" and ol.MODEL_INSTANCE == INSTANCE
-    assert ol.MODEL_SLOTS == 6 and ol.MODEL_CONTEXT == 32768
-    assert ol.TAG == "lmstudio:bespoke-nimble-9b-v3@q8_0" and v3.TAG == "nimble-v3:9b-mxfp8"
+def test_t44_r1_the_collectors_model_names_come_from_the_shared_module():
+    from valedia_trader.core import decision_model as dm
+    assert ol.MODEL_URL == dm.URL == "http://127.0.0.1:1235"
+    assert ol.MODEL_FILE == dm.FILE == "~/.lmstudio/models/debackerl/elephant-1-Q8_0-GGUF/elephant-1.Q8_0.gguf"
+    assert ol.MODEL_FILE_SIZE == dm.FILE_SIZE == FILE_SIZE and ol.MODEL_FILE_SHA256 == dm.FILE_SHA256 == FILE_SHA
+    assert ol.MODEL_INSTANCE == dm.INSTANCE == INSTANCE
+    assert ol.TAG == dm.TAG == TAG_NEW and v3.TAG == "nimble-v3:9b-mxfp8"
+    src = ol.Path(ol.__file__).read_text()
+    for value in (FILE_SHA, TAG_NEW, "9527504224", "10151733984", "debackerl", "openjev", '"elephant-1"', "8192",
+                  "2048"):
+        assert value not in src                           # no second copy of a value
 
 
-# ---------------------------------------------------------------- ruling 5: the pin, every branch both ways
+# ---------------------------------------------------------------- ruling 5 (T44-1) and rulings 2-4 (T44-1b): the pin
 
 class StatGone(ModelFile):
     def __init__(self):
@@ -3268,14 +3283,40 @@ def _gone(c):
     c.test_file.gone = True
 
 
+def _without(d, key):
+    return {k: v for k, v in d.items() if k != key}
+
+
 OTHER_WITH_OURS = {"type": "llm", "key": "qwen/qwen3.8-27b", "size_bytes": 28_000_000_000,
                    "quantization": {"name": "Q8_0"}, "loaded_instances": [lm_instance()]}
+MISSING = object()
+
+
+def _entry_with(field, value):
+    e = lm_entry()
+    return _without(e, field) if value is MISSING else {**e, field: value}
+
+
+def _instance_with(field, value):
+    i = lm_instance()
+    cfg = _without(i["config"], field) if value is MISSING else {**i["config"], field: value}
+    return lm_entry(instances=[{**i, "config": cfg}])
+
+
+ENTRY_FAULTS = [("key", v) for v in ("elephant-1@q8_0", "elephant-1-2", "Elephant-1", None, MISSING)] + \
+    [("type", v) for v in ("llm", None, MISSING)] + [("decision_type", v) for v in ("nimble", None, MISSING)] + \
+    [("publisher", v) for v in ("ggml-org", None, MISSING)] + \
+    [("quantization", v) for v in ({"name": "Q4_K_M"}, "Q8_0", None, MISSING)] + \
+    [("size_bytes", v) for v in (9527503392, LISTED_SIZE + 1, "10151733984", float(LISTED_SIZE), True, None, MISSING)]
+CONFIG_FAULTS = [(k, v) for k, good in (("context_length", 8192), ("parallel", 1), ("physical_batch_size", 2048),
+                                         ("eval_batch_size", 2048))
+                 for v in (good * 2, 512 if good != 512 else 1, str(good), float(good), True, None, MISSING)]
 
 PIN_CASES = {
     # name: (Model kw, ModelFile or None, verified, after-verification step, status, why contains, digest, keeper asked)
     "good": ({}, None, True, None, None, None, FILE_SHA, False),
-    "renamed key, same file": ({"listing": lm_listing(lm_entry(key="bespoke-nimble-9b-v3@q8_0-1"))}, None, True, None,
-                               None, None, FILE_SHA, False),
+    "listed without the vision file": ({"listing": lm_listing(lm_entry(size_bytes=FILE_SIZE))}, None, True, None,
+                                       None, None, FILE_SHA, False),
     "unreachable": ({"down": True}, None, True, None, "model_unavailable", "ModelUnavailable", None, False),
     "timeout": ({"transport": _timeout_transport}, None, True, None, "model_unavailable", "TimeoutError", None, False),
     "not json": ({"listing": b"<html>"}, None, True, None, "error", "tag check", None, False),
@@ -3293,31 +3334,30 @@ PIN_CASES = {
     "file gone": ({}, StatGone(), True, _gone, "tag_mismatch", "FileNotFoundError", None, False),
     "instance not loaded": ({"listing": lm_listing(lm_entry(instances=[]))}, None, True, None, "model_unavailable",
                             "instance not loaded", FILE_SHA, True),
-    "only other names loaded": ({"listing": lm_listing(lm_entry(instances=[lm_instance("someone-else")]))}, None,
+    "only other names loaded": ({"listing": lm_listing(lm_entry(instances=[lm_instance("elephant-1:2")]))}, None,
                                 True, None, "model_unavailable", "instance not loaded", FILE_SHA, True),
-    "type": ({"listing": lm_listing(lm_entry(type="llm"))}, None, True, None, "tag_mismatch", "type", FILE_SHA, True),
-    "key": ({"listing": lm_listing(lm_entry(key="nimble-other@q8_0"))}, None, True, None, "tag_mismatch", "key",
-            FILE_SHA, True),
-    "size_bytes": ({"listing": lm_listing(lm_entry(size_bytes=FILE_SIZE + 1))}, None, True, None, "tag_mismatch",
-                   "size", FILE_SHA, True),
-    "quantisation": ({"listing": lm_listing(lm_entry(quantization={"name": "Q4_K_M"}))}, None, True, None,
-                     "tag_mismatch", "quantisation", FILE_SHA, True),
-    "context_length": ({"listing": lm_listing(lm_entry(instances=[lm_instance(context_length=4096)]))}, None, True,
-                       None, "tag_mismatch", "context", FILE_SHA, True),
-    "parallel": ({"listing": lm_listing(lm_entry(instances=[lm_instance(parallel=1)]))}, None, True, None,
-                 "tag_mismatch", "parallel", FILE_SHA, True),
+    "two instances with the name": ({"listing": lm_listing(lm_entry(instances=[lm_instance(), lm_instance()]))},
+                                    None, True, None, "tag_mismatch", "2 instances", FILE_SHA, True),
+    "two, under two entries": ({"listing": lm_listing(lm_entry(), OTHER_WITH_OURS)}, None, True, None,
+                               "tag_mismatch", "2 instances", FILE_SHA, True),
     "under another entry": ({"listing": lm_listing(lm_entry(instances=[]), OTHER_WITH_OURS)}, None, True, None,
-                            "tag_mismatch", "type", FILE_SHA, True),
+                            "tag_mismatch", "key", FILE_SHA, True),
 }
+for _f, _v in ENTRY_FAULTS:
+    PIN_CASES["entry %s=%r" % (_f, "missing" if _v is MISSING else _v)] = (
+        {"listing": lm_listing(_entry_with(_f, _v))}, None, True, None, "tag_mismatch",
+        "quantisation" if _f == "quantization" else _f, FILE_SHA, True)
+for _f, _v in CONFIG_FAULTS:
+    PIN_CASES["instance %s=%r" % (_f, "missing" if _v is MISSING else _v)] = (
+        {"listing": lm_listing(_instance_with(_f, _v))}, None, True, None, "tag_mismatch", _f, FILE_SHA, True)
 
 
 @pytest.mark.parametrize("name", list(PIN_CASES))
-def test_t44_r5_the_pin_gives_each_status_and_asks_the_keeper_when_the_instance_is_wrong(name):
+def test_t44_the_pin_gives_each_status_and_asks_the_keeper_when_the_instance_is_wrong(name):
     model_kw, file, verified, after, status, why, digest, asked = PIN_CASES[name]
     clock = Clock()
     transport = model_kw.get("transport")
-    model_kw = {k: v for k, v in model_kw.items() if k != "transport"}
-    model = Model(clock, **model_kw)
+    model = Model(clock, **{k: v for k, v in model_kw.items() if k != "transport"})
     c = client(transport or model, clock, file=file, verified=verified)
     if after is not None:
         after(c)
@@ -3328,17 +3368,18 @@ def test_t44_r5_the_pin_gives_each_status_and_asks_the_keeper_when_the_instance_
     assert (got[2] is None) if status is None else (why in got[2])
     assert bool(asks) is asked
     if transport is None:
-        assert model.urls == ["http://127.0.0.1:1235/api/v1/models"]     # one GET, within PIN_TIMEOUT_S (Model)
-    assert model.posts == []
+        assert model.urls == [LIST_URL]                   # one GET, within PIN_TIMEOUT_S (Model)
+    assert model.posts == [] and model.rest == []
 
 
-def test_t44_r5_the_pin_case_table_is_two_way():
+def test_t44_the_pin_case_table_is_two_way():
     """Every fault is a single change from the good case, and every status of the ruling is reached."""
     assert PIN_CASES["good"][4] is None
     assert {v[4] for v in PIN_CASES.values()} == {None, "model_unavailable", "error", "tag_mismatch"}
+    assert len(ENTRY_FAULTS) == 25 and len(CONFIG_FAULTS) == 28
 
 
-# ---------------------------------------------------------------- ruling 4: the file, verified once, in the background
+# ---------------------------------------------------------------- ruling 4 (T44-1): the file, once, in the background
 
 def test_t44_r4_no_call_before_the_file_is_verified_and_the_hash_runs_off_the_collecting_thread(tmp_path):
     gate = threading.Event()
@@ -3402,10 +3443,10 @@ def test_t44_r4_a_file_that_changes_while_it_is_hashed_fails_its_check():
     assert c.pin()[0] == "tag_mismatch"
 
 
-# ---------------------------------------------------------------- ruling 6: the reply
+# ---------------------------------------------------------------- ruling 6 (T44-1), ruling 8 (T44-1b): the reply
 
 def test_t44_r6_a_reply_naming_another_model_or_not_an_object_is_an_error(tmp_path):
-    for body in (lm_answer(model=v3.TAG), lm_answer(model="someone-else"), [lm_answer()], {"answers": {}}):
+    for body in (lm_answer(model=v3.TAG), lm_answer(model="elephant-1:2"), [lm_answer()], {"answers": {}}):
         col, world, model, store, clock, c = lm_rig(tmp_path / str(len(os.listdir(tmp_path))), body=body)
         col.start()
         col.select()
@@ -3422,136 +3463,141 @@ def test_t44_r6_a_good_reply_gives_the_pinned_parsers_answers_and_the_new_tag(tm
     run_minutes(col, clock, 1, 35)
     d = decisions(store)[0]
     reply = json.loads(d["raw_response"])
-    assert list(reply) == ["answers", "model", "usage"] and reply["model"] == INSTANCE
+    assert list(reply) == ["answers", "model", "usage"] and reply["model"] == "elephant-1"
     pinned = v3.parse_response({**reply, "model": v3.TAG}, ol.BATTERY)
     assert json.loads(d["answers_json"]) == pinned["answers"] and d["input_tokens"] == pinned["usage"]["input_tokens"]
-    assert d["status"] == "ok" and d["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0"
-    assert json.loads(model.posts[0])["model"] == INSTANCE
+    assert d["status"] == "ok" and d["model_tag"] == "lmstudio:elephant-1@q8_0"
+    assert json.loads(model.posts[0])["model"] == "elephant-1"
 
 
-# ---------------------------------------------------------------- ruling 7: the keeper
+# ---------------------------------------------------------------- ruling 7 (T44-1), ruling 5 (T44-1b): the keeper
 
-def keeper_client(listing=None, codes=(), gate=None):
+def keeper_client(listing=None):
     clock = Clock()
     model = Model(clock, listing=lm_listing(lm_entry(instances=[])) if listing is None else listing)
-    runner, kc = Runner(codes, gate), KeeperClock()
-    return client(model, clock, runner=runner, kclock=kc), model, runner, kc
+    kc = KeeperClock()
+    return client(model, clock, kclock=kc), model, kc
 
 
-def test_t44_r7_a_missing_instance_is_loaded_with_the_exact_argv_in_a_daemon_thread():
-    c, model, runner, kc = keeper_client()
+def test_t44_r7_a_missing_instance_is_loaded_by_the_rest_call_in_a_daemon_thread():
+    c, model, kc = keeper_client()
     keep(c)
-    assert runner.calls == [(LOAD, 180.0)]
-    assert all(t is not threading.current_thread() and t.daemon for t in runner.threads)
-    assert model.posts == [] and all(u == "http://127.0.0.1:1235/api/v1/models" for u in model.urls)
-
-
-def test_t44_r7_the_load_uses_the_matching_entrys_key_even_renamed():
-    c, model, runner, kc = keeper_client(lm_listing(lm_entry(key="bespoke-nimble-9b-v3@q8_0-2", instances=[])))
-    keep(c)
-    assert runner.argvs == [[LMS, "load", "bespoke-nimble-9b-v3@q8_0-2", *LOAD[3:]]]
+    assert model.rest == [LOAD]
+    assert list(model.rest[0][1]) == ["model", "context_length", "parallel", "physical_batch_size", "eval_batch_size"]
+    assert all(t is not threading.current_thread() and t.daemon for t in model.rest_threads)
+    assert model.posts == [] and model.urls == [LIST_URL, LOAD_URL] and only_keeper_requests(model)
 
 
 @pytest.mark.parametrize("listing", [lm_listing(),                                        # already right
                                      lm_listing(lm_entry(size_bytes=1, instances=[])),    # no matching entry
                                      lm_listing(lm_entry(quantization={"name": "Q4_0"}, instances=[])),
-                                     lm_listing(lm_entry(key="other-model", instances=[])),
+                                     lm_listing(lm_entry(key="elephant-1@q8_0", instances=[])),
+                                     lm_listing(lm_entry(publisher="ggml-org", instances=[])),
+                                     lm_listing(lm_entry(decision_type="nimble", instances=[])),
                                      b"not json"])
-def test_t44_r7_nothing_is_run_when_the_instance_is_right_or_no_entry_matches(listing):
-    c, model, runner, kc = keeper_client(listing)
+def test_t44_r7_nothing_is_sent_when_the_instance_is_right_or_no_entry_matches(listing):
+    c, model, kc = keeper_client(listing)
     keep(c)
-    assert runner.calls == []
+    assert model.rest == [] and model.urls == [LIST_URL]
 
 
-def test_t44_r7_not_twice_within_sixty_seconds_and_a_failed_load_is_tried_again():
-    c, model, runner, kc = keeper_client(codes=[1, 0])
+@pytest.mark.parametrize("failure", [500, 404, 400, {"type": "decision", "instance_id": "elephant-1:2",
+                                                     "status": "loaded"}, {"status": "loaded"}, [],
+                                     TimeoutError("timed out"), ol.ModelUnavailable("connection refused")])
+def test_t44_r7_a_load_that_fails_counts_as_failed_and_is_tried_again_sixty_seconds_later(failure):
+    c, model, kc = keeper_client()
+    model.load_answers = [failure]
     keep(c)
     kc.t += 59
-    assert not c.keeper.ask() and len(runner.calls) == 1
+    assert not c.keeper.ask() and model.rest == [LOAD]
     kc.t += 1
     keep(c)
-    assert runner.argvs == [LOAD, LOAD]
-    runner.codes = [FileNotFoundError("no lms")]         # a refused run is tried again too
-    kc.t += 60
-    keep(c)
-    kc.t += 60
-    keep(c)
-    assert runner.argvs == [LOAD] * 4
+    assert model.rest == [LOAD, LOAD]
+    rows = c.keeper.pending()
+    assert [r["ok"] for r in rows] == [False, True] and rows[0]["error"] and rows[1].get("error") is None
+    assert rows[1]["instance_id"] == "elephant-1"
 
 
 def test_t44_r7_one_run_at_a_time():
-    gate = threading.Event()
-    c, model, runner, kc = keeper_client(gate=gate)
+    c, model, kc = keeper_client()
+    model.rest_gate = threading.Event()
     assert c.keeper.ask()
     for _ in range(500):
-        if runner.calls:
+        if model.rest:
             break
         time.sleep(0.01)
     kc.t += 600
     assert not c.keeper.ask()                             # still loading: no second run
-    gate.set()
+    model.rest_gate.set()
     c.keeper.thread.join(10)
     assert c.keeper.ask()
     c.keeper.thread.join(10)
-    assert runner.argvs == [LOAD, LOAD]
+    assert model.rest == [LOAD, LOAD]
 
 
-@pytest.mark.parametrize("listing", [lm_listing(lm_entry(instances=[lm_instance(parallel=1)])),
-                                     lm_listing(lm_entry(instances=[lm_instance(context_length=8192)])),
+@pytest.mark.parametrize("listing", [lm_listing(lm_entry(instances=[lm_instance(parallel=6)])),
+                                     lm_listing(lm_entry(instances=[lm_instance(context_length=4096)])),
+                                     lm_listing(lm_entry(instances=[lm_instance(physical_batch_size=512)])),
+                                     lm_listing(lm_entry(instances=[lm_instance(eval_batch_size=512)])),
+                                     lm_listing(lm_entry(instances=[lm_instance(), lm_instance()])),
                                      lm_listing(lm_entry(instances=[]), OTHER_WITH_OURS)])
 def test_t44_r7_a_wrongly_loaded_instance_is_unloaded_then_loaded(listing):
-    c, model, runner, kc = keeper_client(listing)
+    c, model, kc = keeper_client(listing)
     keep(c)
-    assert runner.argvs == [UNLOAD, LOAD] and only_load_and_unload(runner)
+    assert model.rest == [UNLOAD, LOAD] and only_keeper_requests(model)
 
 
-def test_t44_r7_a_failed_unload_is_not_followed_by_a_load():
-    c, model, runner, kc = keeper_client(lm_listing(lm_entry(instances=[lm_instance(parallel=2)])), codes=[1])
+@pytest.mark.parametrize("failure", [500, {"instance_id": "qwen/qwen3.8-27b"}, TimeoutError("timed out")])
+def test_t44_r7_a_failed_unload_is_not_followed_by_a_load(failure):
+    c, model, kc = keeper_client(lm_listing(lm_entry(instances=[lm_instance(parallel=2)])))
+    model.unload_answers = [failure]
     keep(c)
-    assert runner.argvs == [UNLOAD]
+    assert model.rest == [UNLOAD]
+    assert c.keeper.pending()[0]["ok"] is False
 
 
 def test_t44_r7_three_replacements_in_a_row_then_thirty_minutes_alone():
-    wrong = lm_listing(lm_entry(instances=[lm_instance(parallel=1)]))
-    c, model, runner, kc = keeper_client(wrong)
+    wrong = lm_listing(lm_entry(instances=[lm_instance(parallel=6)]))
+    c, model, kc = keeper_client(wrong)
     for _ in range(3):
         keep(c)
         kc.t += 60
-    assert runner.argvs == [UNLOAD, LOAD] * 3
+    assert model.rest == [UNLOAD, LOAD] * 3
     third = 1000.0 + 120
-    while kc.t < third + 1800:                            # each ask still runs (reads the list) but runs nothing
+    while kc.t < third + 1800:                            # each ask still runs (reads the list) but sends nothing
         keep(c)
         kc.t += 60
-    assert len(runner.calls) == 6
+    assert len(model.rest) == 6
     kc.t = third + 1800
     keep(c)
-    assert runner.argvs == [UNLOAD, LOAD] * 4 and only_load_and_unload(runner)
+    assert model.rest == [UNLOAD, LOAD] * 4 and only_keeper_requests(model)
 
 
 def test_t44_r7_a_right_instance_ends_the_run_of_replacements_and_a_missing_one_is_loaded_during_the_rest():
-    wrong, right, gone = (lm_listing(lm_entry(instances=[lm_instance(parallel=1)])), lm_listing(),
+    wrong, right, gone = (lm_listing(lm_entry(instances=[lm_instance(parallel=6)])), lm_listing(),
                           lm_listing(lm_entry(instances=[])))
-    c, model, runner, kc = keeper_client(wrong)
+    c, model, kc = keeper_client(wrong)
     for listing in (wrong, wrong, right, wrong, wrong, wrong, wrong, gone):
         model.listing = listing
         keep(c)
         kc.t += 60
     # two replacements, then right (the count starts again), then three, then left alone, but a missing one loads
-    assert runner.argvs == [UNLOAD, LOAD] * 5 + [LOAD]
+    assert model.rest == [UNLOAD, LOAD] * 5 + [LOAD]
 
 
 def test_t44_r7_the_keeper_is_asked_once_at_start_and_its_rows_are_written_by_the_collecting_thread(tmp_path):
     col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
     col.start()                                           # asked once when collecting starts
     c.keeper.thread.join(10)
-    assert c.keeper.runner.argvs == [LOAD]
+    assert model.rest == [LOAD]
     loads = "SELECT ts, detail_json FROM events WHERE kind = 'model_load'"
     assert store.conn.execute(loads).fetchall() == []    # the keeper's thread never touches the store
     col.select()
     run_minutes(col, clock, 1, 1)
     (ts, detail), = store.conn.execute(loads).fetchall()
     detail = json.loads(detail)
-    assert detail["argv"] == LOAD and detail["exit_code"] == 0 and detail["seconds"] >= 0
+    assert detail["request"] == "POST /api/v1/models/load" and detail["body"] == LOAD_BODY
+    assert detail["ok"] is True and detail["http"] == "2xx" and detail["seconds"] >= 0
     run_minutes(col, clock, 2, 3)
     assert len(store.conn.execute(loads).fetchall()) == 1     # written once
     box = {}
@@ -3567,10 +3613,21 @@ def test_t44_r7_the_keeper_is_asked_once_at_start_and_its_rows_are_written_by_th
     assert "e" in box
 
 
+def test_t44_r7_a_failed_call_is_recorded_with_its_error(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
+    model.load_answers = [500]
+    col.start()
+    c.keeper.thread.join(10)
+    col.select()
+    run_minutes(col, clock, 1, 1)
+    (detail,), = store.conn.execute("SELECT detail_json FROM events WHERE kind = 'model_load'").fetchall()
+    detail = json.loads(detail)
+    assert detail["ok"] is False and "HTTP 500" in detail["error"] and detail["body"] == LOAD_BODY
+
+
 def test_t44_r7_a_keeper_that_is_loading_never_delays_a_decision(tmp_path):
-    gate = threading.Event()
-    runner = Runner(gate=gate)
-    col, world, model, store, clock, c = lm_rig(tmp_path, runner=runner, listing=lm_listing(lm_entry(instances=[])))
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
+    model.rest_gate = threading.Event()
     col.start()                                           # the first run is loading, held by the gate
     col.select()
     t0 = time.monotonic()
@@ -3578,9 +3635,9 @@ def test_t44_r7_a_keeper_that_is_loading_never_delays_a_decision(tmp_path):
     took = time.monotonic() - t0
     d = decisions(store)
     assert [x["status"] for x in d] == ["model_unavailable"] * 2 and "instance not loaded" in d[0]["error"]
-    assert c.keeper.thread.is_alive() and len(runner.calls) == 1 and model.posts == []
+    assert c.keeper.thread.is_alive() and model.rest == [LOAD] and model.posts == []
     assert took < 8                                       # a held load would take 30 s
-    gate.set()
+    model.rest_gate.set()
     c.keeper.thread.join(10)
     model.listing = lm_listing()                          # loaded now
     run_minutes(col, clock, 41, 45)
@@ -3595,12 +3652,12 @@ def test_t44_r7_the_pin_asks_the_keeper_and_the_keeper_loads(tmp_path):
     col.select()
     run_minutes(col, clock, 1, 35)                        # the decision's pin asks: a second load is tried
     c.keeper.thread.join(10)
-    assert c.keeper.runner.argvs == [LOAD, LOAD]
+    assert model.rest == [LOAD, LOAD]
 
 
-# ---------------------------------------------------------------- the only host: 127.0.0.1:1235
+# ---------------------------------------------------------------- the only host, and no process
 
-def test_t44_no_request_goes_anywhere_but_lm_studio_on_the_loopback(tmp_path):
+def test_t44_no_request_goes_anywhere_but_lm_studio_on_the_loopback_and_no_process_is_started(tmp_path):
     col, world, model, store, clock, c = lm_rig(tmp_path, n=3, listing=lm_listing(lm_entry(instances=[])))
     col.start()
     c.keeper.thread.join(10)
@@ -3608,14 +3665,14 @@ def test_t44_no_request_goes_anywhere_but_lm_studio_on_the_loopback(tmp_path):
     run_minutes(col, clock, 1, 30)
     model.listing = lm_listing()
     run_minutes(col, clock, 31, 45)
-    assert model.posts and model.urls
-    assert all(u in ("http://127.0.0.1:1235/api/v1/models", "http://127.0.0.1:1235/v1/systemone") for u in model.urls)
+    assert model.posts and model.urls and model.rest == [LOAD]
+    assert set(model.urls) == {LIST_URL, LOAD_URL, "http://127.0.0.1:1235/v1/systemone"}
     src = ol.Path(ol.__file__).read_text()
-    for s in ("11434", "/api/tags", "/api/version"):
+    for s in ("11434", "/api/tags", "/api/version", "subprocess", "shutil", "lms ", "Popen"):
         assert s not in src
 
 
-# ---------------------------------------------------------------- ruling 8: unchanged
+# ---------------------------------------------------------------- ruling 8 (T44-1): unchanged
 
 def test_t44_r8_the_limits_statuses_tables_start_event_and_heartbeat_are_unchanged(tmp_path):
     assert (ol.MODEL_LIMIT_S, ol.PIN_TIMEOUT_S, ol.CALL_RESERVE_S, ol.FAILS_BEFORE_PAUSE, ol.PAUSE_S) == \
@@ -3628,9 +3685,80 @@ def test_t44_r8_the_limits_statuses_tables_start_event_and_heartbeat_are_unchang
     col.select()
     run_minutes(col, clock, 1, 46)
     (detail,), = store.conn.execute("SELECT detail_json FROM events WHERE kind = 'start'").fetchall()
-    assert json.loads(detail) == {"battery_id": ol.BATTERY_ID, "tag": "lmstudio:bespoke-nimble-9b-v3@q8_0"}
+    assert json.loads(detail) == {"battery_id": ol.BATTERY_ID, "tag": "lmstudio:elephant-1@q8_0"}
     calls = sum(r[0] for r in store.conn.execute("SELECT model_calls FROM heartbeats"))
     assert calls == len(model.posts) == 3
+
+
+# ---------------------------------------------------------------- ruling 6 (T44-1b): finish writes the keeper's rows
+
+def test_t44b_r6_finish_writes_the_keepers_pending_rows_before_the_stop(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
+    col.start()
+    c.keeper.thread.join(10)
+    assert len(c.keeper.pending()) == 1
+    col.finish("stop")
+    kinds = [k for (k,) in store.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert kinds[-2:] == ["model_load", "stop"] and c.keeper.pending() == []
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_t44b_r6_with_the_write_refused_the_stop_behaves_as_before(tmp_path, pending):
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[] if pending
+                                                                                      else None)))
+    col.start()
+    c.keeper.thread.join(10)
+    assert len(c.keeper.pending()) == int(pending)
+    before = store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def refuse(*a, **k):
+        raise sqlite3.OperationalError("database or disk is full")
+    store.insert = refuse
+    with pytest.raises(sqlite3.OperationalError):        # the stop row's own failure, as before
+        col.finish("stop")
+    del store.insert
+    assert store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before
+
+
+# ---------------------------------------------------------------- ruling 7 (T44-1b): once waits for the file check
+
+def once_with(tmp_path, file, capsys):
+    clock = Clock()
+    world = World(clock)
+    world.markets = [mkt("A-E-M", vol=3000)]
+    world.books["A-E-M"] = book(0.40, 0.45)
+    model = Model(clock)
+    kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
+    db = tmp_path / "x.sqlite"
+    c = client(model, clock, file=file, verified=False)
+    assert ol.main(["once", "--db", str(db)], kalshi=kalshi, model=c, **main_kw(clock)) == 0
+    return decisions(ol.Store(db)), capsys.readouterr().out
+
+
+def test_t44b_r7_once_waits_for_a_slow_file_check_and_decides_ok(tmp_path, capsys):
+    d, out = once_with(tmp_path, ModelFile(sleep=0.5), capsys)
+    assert len(d) == 1 and d[0]["status"] == "ok" and "model file" not in out
+
+
+def test_t44b_r7_once_says_so_when_the_check_does_not_end_in_time_and_decides_nothing_ok(tmp_path, capsys,
+                                                                                         monkeypatch):
+    assert ol.ONCE_FILE_WAIT_S == 120.0
+    monkeypatch.setattr(ol, "ONCE_FILE_WAIT_S", 0.3)
+    gate = threading.Event()
+    t0 = time.monotonic()
+    d, out = once_with(tmp_path, ModelFile(gate=gate), capsys)
+    gate.set()
+    assert time.monotonic() - t0 >= 0.3
+    assert len(d) == 1 and d[0]["status"] == "model_unavailable"
+    line, = [x for x in out.splitlines() if "model file" in x]
+    assert "did not end within 0.3 s" in line
+
+
+def test_t44b_r7_once_says_so_when_the_check_failed(tmp_path, capsys):
+    d, out = once_with(tmp_path, ModelFile(digest="0" * 64), capsys)
+    assert len(d) == 1 and d[0]["status"] == "tag_mismatch"
+    line, = [x for x in out.splitlines() if "model file" in x]
+    assert "failed" in line and "SHA-256" in line
 
 
 # ---------------------------------------------------------------- the differential test: 4133f56 against this one
@@ -3697,7 +3825,7 @@ def test_t44_differential_the_decision_rows_equal_4133f56s_but_for_the_model_col
     differ = {"model_tag", "model_digest", "request_sha256", "latency_s", "raw_response"}
     for x, y in zip(a, b):
         assert {k: v for k, v in x.items() if k not in differ} == {k: v for k, v in y.items() if k not in differ}
-        assert x["model_tag"] == v3.TAG and y["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0"
+        assert x["model_tag"] == v3.TAG and y["model_tag"] == "lmstudio:elephant-1@q8_0"
         assert (x["model_digest"] is None) == (y["model_digest"] is None)
         assert y["model_digest"] in (None, FILE_SHA)
         assert (x["request_sha256"] is None) == (y["request_sha256"] is None)
