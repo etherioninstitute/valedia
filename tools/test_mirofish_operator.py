@@ -2820,6 +2820,59 @@ class Addendum8(Base):
         self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
         self.assertEqual(self.w.signals, []); self.assertTrue(self.w.picks_loaded)
 
+    # ---- the tests for my own surviving mutants
+    def test_A_a_broken_pair_after_the_spawn_is_named_as_such(self):
+        self.at(30, lambda world: self.breakers()['the 27B under the embedding id'](world.models['models']))
+        self.main(RUN); row = self.w.rows()[-1]
+        self.assertTrue(any(a.startswith('THE LOADED MODELS DO NOT HOLD') and 'PROTECTED PAIR BROKEN' in a for a in row['alerts']), row['alerts'])
+
+    def test_A_the_load_tests_hold_is_checked_during_the_hold_and_allows_only_its_own_instance(self):
+        other = {'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-' + 'd' * 32, 'config': {}}]}
+        seen = []
+        def hook(world):
+            if world.load_t is not None and world.t >= world.load_t + 30 and not seen:
+                seen.append(1); world.models['models'].append(copy.deepcopy(other))
+            elif world.load_t is not None and world.t >= world.load_t + 60 and seen == [1]:
+                seen.append(2); world.models.update(models=[e for e in world.models['models'] if e['loaded_instances'] != other['loaded_instances']])
+        self.w.on_sleep.append(hook)
+        rc = self.main(self.LT); r = self.lt_result()
+        self.assertEqual(seen, [1, 2]); self.assertNotEqual(rc, 0); self.assertFalse(r['models_held'])
+        self.assertTrue(any('d' * 32 in p for f in r['model_check_failures'] for p in f['problems']), r['model_check_failures'])
+
+    def test_A_the_load_tests_own_instance_left_after_its_unload_does_not_hold(self):
+        def unload_that_leaves_it(lp):
+            lp.world.unloads_via_pipeline.append(lp.identifier); lp.world.free = 80
+            return True, {'unloaded': lp.identifier}
+        with unittest.mock.patch.object(FakeLoadPath, 'unload', unload_that_leaves_it):
+            self.main(self.LT)
+        r = self.lt_result(); self.assertFalse(r['models_held'])
+        self.assertTrue(any('a' * 32 in p for p in r['model_check_failures'][-1]['problems']), r['model_check_failures'])
+
+    def test_B_starts_read_in_the_machines_own_zone_match_the_observers_identity_file(self):
+        self.w.system_tz = 'Europe/Paris'                 # the machine's zone, not UTC: ps run without TZ
+        self.w.caller_tz = 'America/Los_Angeles'
+        self.killed_run()
+        self.w.caller_tz = 'Asia/Tokyo'; self.reap_on_term()
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+
+    def test_B_a_run_stops_its_observer_by_the_identity_file_when_the_machines_zone_is_not_utc(self):
+        self.w.system_tz = 'Europe/Paris'; self.w.caller_tz = 'Asia/Tokyo'
+        self.test_B_the_observer_is_stopped_by_its_identity_under_any_caller_time_zone()
+
+    def test_C_the_switch_off_refuses_a_non_plain_id_before_the_reader_is_touched(self):
+        class S(str):
+            pass
+        host = self.w.host()
+        s = OP.do_check(host, 'swarm8', {'model': 'qwen3-8b'})
+        for iid in ('', ' x', S('x-1')):
+            with self.subTest(iid=repr(iid)):
+                s['models']['others'] = [{'instance_id': iid, 'key': 'x/y'}]
+                row = OP.new_row('run', types.SimpleNamespace(announced='x', profile='swarm8'), None, self.w.t)
+                with self.assertRaises(OP.OperatorError):
+                    OP.SwitchOffs(host, row).apply(s)
+                self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.bootouts(), []); self.assertTrue(self.w.picks_loaded)
+
 
 if __name__ == '__main__':
     unittest.main()
