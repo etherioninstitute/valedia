@@ -10,6 +10,12 @@ from datetime import datetime, timezone
 from email.utils import formatdate
 import inspect
 import math
+import os
+import subprocess
+import sys
+import threading
+import time
+import types
 
 import pytest
 
@@ -18,6 +24,7 @@ from valedia_trader.research_loop import orderbook_loop as ol
 from valedia_trader.venues import kalshi_data as kd
 
 v3 = legacy.load("systemone_v3_candidate")
+_REAL_RUN = subprocess.run                     # kept before the fixture below refuses it (only `git show` uses it)
 # rev 6: answers carry their Date header and the collector takes a monotonic clock. Detected rather than assumed so
 # that the same tests can be run against a collector without the rule, to see them fail.
 DATED = hasattr(kd, "urllib_get_dated")
@@ -195,23 +202,70 @@ def valid_answer(questions=None):
             "prompt_eval_cached_count": 0}
 
 
+# T44-1: the model is on LM Studio. The values below are written out, not taken from the module, so that a changed
+# constant fails a test.
+INSTANCE = "collector-nimble-9b-v3-q8"
+KEY = "bespoke-nimble-9b-v3@q8_0"
+FILE_SHA = "ad484077ad28c1ba0644509b81e80268f8fd39e9d218415638a988caf3c6e66c"
+FILE_SIZE = 9527503392
+LMS = "/fake/bin/lms"
+LOAD = [LMS, "load", KEY, "--identifier", INSTANCE, "--context-length", "32768", "--parallel", "6", "-y"]
+UNLOAD = [LMS, "unload", INSTANCE]
+
+
+def lm_answer(model=INSTANCE, questions=None):
+    """LM Studio's reply: exactly `answers`, `model` (the instance the request named) and `usage`."""
+    a = valid_answer(questions)
+    return {"answers": a["answers"], "model": model, "usage": a["usage"]}
+
+
+def lm_instance(name=INSTANCE, **config):
+    return {"id": name, "config": {"context_length": 32768, "parallel": 6, "flash_attention": True, **config}}
+
+
+def lm_entry(instances=None, **kw):
+    """The model's entry in `GET /api/v1/models`, as measured on 2026-11-16, with the collector's instance loaded."""
+    e = {"type": "decision", "key": KEY, "publisher": "ggml-org", "size_bytes": FILE_SIZE,
+         "quantization": {"name": "Q8_0", "bits_per_weight": 8},
+         "loaded_instances": [lm_instance()] if instances is None else instances}
+    e.update(kw)
+    return e
+
+
+def lm_listing(entry=None, *others):
+    """The model list: another model loaded by someone else, then the model's entry."""
+    other = {"type": "llm", "key": "qwen/qwen3.8-27b", "publisher": "qwen", "size_bytes": 28_000_000_000,
+             "quantization": {"name": "Q8_0"}, "loaded_instances": [{"id": "qwen/qwen3.8-27b",
+                                                                     "config": {"context_length": 262144, "parallel": 4}}]}
+    return {"models": [other, *others, lm_entry() if entry is None else entry]}
+
+
 class Model:
-    """Ollama at 127.0.0.1:11434 as the collector uses it: tags, version, and the typed endpoint."""
+    """LM Studio at 127.0.0.1:1235 as the collector uses it: the model list and the typed endpoint. For a module of
+    an earlier revision (the differential and continuation tests), Ollama at 127.0.0.1:11434: tags, version, and the
+    typed endpoint."""
     def __init__(self, clock, latency=0.8, digest=v3.MANIFEST_SHA256, body=None, down=False, post_down=False,
-                 exc=None):
+                 exc=None, listing=None, old_body=None):
         self.clock, self.latency, self.digest, self.body, self.down, self.post_down = clock, latency, digest, body, down, post_down
         self.exc, self.posts, self.urls = exc, [], []
+        self.listing = lm_listing() if listing is None else listing
+        self.old_body = old_body                            # the earlier revision's reply (default valid_answer())
         self.on_post = None                                 # rev 6: a hook inside each call
 
     def __call__(self, url, data, timeout):
         self.urls.append(url)
-        assert url.startswith("http://127.0.0.1:11434/")
+        old = url.startswith("http://127.0.0.1:11434/")
+        assert old or url.startswith("http://127.0.0.1:1235/")
         if self.down:
             raise ol.ModelUnavailable("connection refused")
-        if url.endswith("/api/tags"):
+        if old and url.endswith("/api/tags"):
             return json.dumps({"models": [{"name": v3.TAG, "digest": "sha256:" + self.digest}]}).encode()
-        if url.endswith("/api/version"):
+        if old and url.endswith("/api/version"):
             return b'{"version": "0.40.16"}'
+        if not old and url.endswith("/api/v1/models"):
+            assert data is None and timeout == ol.PIN_TIMEOUT_S
+            listing = self.listing() if callable(self.listing) else self.listing
+            return listing if isinstance(listing, bytes) else json.dumps(listing).encode()
         assert url.endswith("/v1/systemone") and data is not None and timeout == ol.MODEL_LIMIT_S
         self.posts.append(data)
         if self.on_post is not None:
@@ -224,8 +278,97 @@ class Model:
             self.clock.t += timeout
             raise TimeoutError("timed out")
         self.clock.t += self.latency
-        body = self.body if self.body is not None else valid_answer()
+        if self.body is not None:
+            body = self.body
+        elif old:
+            body = self.old_body if self.old_body is not None else valid_answer()
+        else:
+            body = lm_answer(json.loads(data)["model"])   # LM Studio names the instance the request named
         return body if isinstance(body, bytes) else json.dumps(body).encode()
+
+
+class ModelFile:
+    """The model's file as the client sees it: `stat` (size, modification time) and the injectable hasher, which
+    records the thread it ran on. `gate` (an Event) holds the hash until set."""
+    def __init__(self, digest=FILE_SHA, size=FILE_SIZE, mtime_ns=1_763_300_000_000_000_000, gate=None, exc=None):
+        self.digest, self.size, self.mtime_ns, self.gate, self.exc = digest, size, mtime_ns, gate, exc
+        self.paths, self.threads, self.stats = [], [], 0
+
+    def stat(self, path):
+        self.stats += 1
+        return types.SimpleNamespace(st_size=self.size, st_mtime_ns=self.mtime_ns)
+
+    def hasher(self, path):
+        self.paths.append(path)
+        self.threads.append(threading.current_thread())
+        if self.gate is not None:
+            assert self.gate.wait(10)
+        if self.exc is not None:
+            raise self.exc
+        return self.digest
+
+
+class Runner:
+    """The keeper's command runner: records (argv, limit, thread); answers exit codes from `codes` (then 0); `gate`
+    (an Event) holds each command until set. Nothing is ever executed."""
+    def __init__(self, codes=(), gate=None):
+        self.codes, self.gate, self.calls, self.threads = list(codes), gate, [], []
+
+    def __call__(self, argv, timeout):
+        self.calls.append((list(argv), timeout))
+        self.threads.append(threading.current_thread())
+        if self.gate is not None:
+            assert self.gate.wait(30)
+        code =self.codes.pop(0) if self.codes else 0
+        if isinstance(code, BaseException):
+            raise code
+        return code
+
+    @property
+    def argvs(self):
+        return [a for a, _ in self.calls]
+
+
+class KeeperClock:
+    """The keeper's clock: moves only when told to."""
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def client(model, clock, *, file=None, runner=None, kclock=None, verified=True):
+    """The collector's model client on the stand-in server, file, runner and keeper clock. `verified`: the file's
+    check has run (in its own thread, waited for here) before the client is handed over."""
+    file = file or ModelFile()
+    c = ol.ModelClient(transport=model, clock=clock, hasher=file.hasher, stat=file.stat, runner=runner or Runner(),
+                       keeper_clock=kclock or KeeperClock(), lms=LMS)
+    c.test_file = file
+    if verified:
+        c.check_file()
+        c.checking.join(10)
+        assert not c.checking.is_alive()
+    return c
+
+
+@pytest.fixture(autouse=True)
+def no_real_model_side_effects(monkeypatch):
+    """No test runs `lms`, hashes or stats the real file: the module's defaults fail the test if reached."""
+    def refuse(*a, **k):
+        raise AssertionError("a test reached a real side effect: %r" % (a,))
+    monkeypatch.setattr(ol, "_run_lms", refuse)
+    monkeypatch.setattr(ol, "_file_sha256", refuse)
+    monkeypatch.setattr(ol, "_file_stat", refuse)
+    monkeypatch.setattr(ol.subprocess, "run", refuse)
+    monkeypatch.setattr(ol.subprocess, "Popen", refuse)
+
+
+def keep(c):
+    """One keeper run, waited for."""
+    assert c.keeper.ask()
+    c.keeper.thread.join(10)
+    assert not c.keeper.thread.is_alive()
 
 
 def rig(tmp_path, clock=None, **model_kw):
@@ -234,7 +377,7 @@ def rig(tmp_path, clock=None, **model_kw):
     model = Model(clock, **model_kw)
     store = ol.Store(tmp_path / "loop.sqlite")
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
-    col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=clock), clock=clock)
+    col = make_collector(store, kalshi, client(model, clock), clock=clock)
     return col, world, model, store, clock
 
 
@@ -460,8 +603,26 @@ def test_the_model_request_is_the_typed_request_of_the_state_and_the_battery():
     snaps, trades, t, close = hand_worked()
     state = ol.state_at(snaps, trades, t, close)
     body = ol.request_bytes(state)
-    assert json.loads(body) == v3.make_request(state, ol.BATTERY, tag=v3.TAG)
+    assert json.loads(body) == {**v3.make_request(state, ol.BATTERY, tag=v3.TAG), "model": INSTANCE}
     assert list(json.loads(body)["questions"]) == list(ol.BATTERY)
+
+
+def test_t44_r3_the_request_is_todays_body_with_only_the_model_field_changed():
+    snaps, trades, t, close = hand_worked()
+    for state in (ol.state_at(snaps, trades, t, close), {"mid_cents": 50.0, "note": "é"}):
+        today = json.dumps(v3.make_request(state, ol.BATTERY, tag=v3.TAG), separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False).encode("utf-8")              # 4133f56's request_bytes, written out
+        assert today.startswith(b'{"model":"nimble-v3:9b-mxfp8",')
+        body = ol.request_bytes(state)
+        assert body == today.replace(b'{"model":"nimble-v3:9b-mxfp8",', b'{"model":"%s",' % INSTANCE.encode(), 1)
+        assert list(json.loads(body)) == ["model", "state", "questions"]   # same key order
+
+
+def test_t44_r2_the_battery_and_its_hash_do_not_change():
+    assert ol.BATTERY_ID == "3e07adb11ae25c23b334bb9f9576208854686cdb1177d0728026d2d9bd927730"
+    q = json.dumps(v3.make_request({"x": 1}, ol.BATTERY, tag=v3.TAG)["questions"], separators=(",", ":"),
+                   ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert ol.sha256(q) == ol.BATTERY_ID and q in ol.request_bytes({"x": 1})
 
 
 # ================================================================= decisions
@@ -505,12 +666,12 @@ def test_an_ok_decision_stores_everything_the_evaluation_needs(tmp_path):
     run_minutes(col, clock, 1, 35)
     d = decisions(store)[0]
     assert d["status"] == "ok" and d["forced"] == 0 and d["battery_id"] == ol.BATTERY_ID
-    assert d["model_tag"] == v3.TAG and d["model_digest"] == "sha256:" + v3.MANIFEST_SHA256
+    assert d["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0" and d["model_digest"] == FILE_SHA
     assert d["latency_s"] == pytest.approx(0.8, abs=1e-3) and d["input_tokens"] == 900 and d["error"] is None
     state = json.loads(d["state_json"])
     assert model.posts[0] == ol.request_bytes(state)                          # the bytes sent are the state stored
     assert d["request_sha256"] == ol.sha256(model.posts[0])
-    assert json.loads(d["raw_response"]) == valid_answer()
+    assert json.loads(d["raw_response"]) == lm_answer()                       # the reply as it came
     assert json.loads(d["answers_json"]) == v3.parse_answers(valid_answer(), ol.BATTERY)
     assert state["mid_cents"] == 42.5 and state["spread_cents"] == 5.0 and state["mid_change_30m_cents"] == 0.0
     assert state["mid_change_60m_cents"] is None and state["spread_vs_60m_median"] is None   # only 34 minutes so far
@@ -520,7 +681,9 @@ def test_an_ok_decision_stores_everything_the_evaluation_needs(tmp_path):
     ({"latency": 12.0}, "late", 1, False),
     ({"down": True}, "model_unavailable", 0, False),
     ({"post_down": True}, "model_unavailable", 1, False),
-    ({"digest": "0" * 64}, "tag_mismatch", 0, False),
+    ({"listing": lm_listing(lm_entry(size_bytes=FILE_SIZE - 1))}, "tag_mismatch", 0, False),
+    ({"listing": lm_listing(lm_entry(instances=[]))}, "model_unavailable", 0, False),
+    ({"body": lm_answer(model=v3.TAG)}, "error", 1, False),
     ({"body": b"not json"}, "error", 1, False),
     ({"body": {"model": "nimble-v3:9b-mxfp8", "answers": {}, "usage": {"input_tokens": 1, "output_tokens": 0}}},
      "error", 1, False),
@@ -657,7 +820,7 @@ def test_resuming_after_a_stop_keeps_watching_and_records_the_gap(tmp_path):
     clock.t = T0 + 30 * 60 + 0.5
     store2 = ol.Store(tmp_path / "loop.sqlite")
     col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                        ol.ModelClient(transport=model, clock=clock), clock=clock)
+                        client(model, clock), clock=clock)
     col2.start()
     gap = store2.conn.execute("SELECT detail_json FROM events WHERE kind = 'gap'").fetchone()
     gap = json.loads(gap[0])
@@ -676,7 +839,7 @@ def test_resuming_after_the_watch_ran_out_drops_it_and_selects_at_once(tmp_path)
     clock.t = T0 + 13 * 3600 + 60.5
     store2 = ol.Store(tmp_path / "loop.sqlite")
     col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                        ol.ModelClient(transport=model, clock=clock), clock=clock)
+                        client(model, clock), clock=clock)
     col2.start()
     assert col2.watched() == []
     assert "12 hours" in store2.conn.execute("SELECT reason FROM market_drops").fetchone()[0]
@@ -845,8 +1008,7 @@ def test_once_runs_one_full_cycle_and_marks_its_decisions_as_forced(tmp_path, ca
     model = Model(clock)
     kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
     db = tmp_path / "x.sqlite"
-    assert ol.main(["once", "--db", str(db)], kalshi=kalshi, model=ol.ModelClient(transport=model, clock=clock),
-                   **main_kw(clock)) == 0
+    assert ol.main(["once", "--db", str(db)], kalshi=kalshi, model=client(model, clock), **main_kw(clock)) == 0
     store = ol.Store(db)
     d = decisions(store)
     assert len(d) == 1 and d[0]["forced"] == 1 and d[0]["status"] == "ok"
@@ -856,10 +1018,10 @@ def test_once_runs_one_full_cycle_and_marks_its_decisions_as_forced(tmp_path, ca
 
 def test_the_model_is_reached_only_on_the_loopback_address():
     with pytest.raises(ValueError):
-        ol.ModelClient(base_url="http://example.com:11434")
+        ol.ModelClient(base_url="http://example.com:1235")
     with pytest.raises(ValueError):
         ol.ModelClient(base_url="https://127.0.0.1.example.com")
-    assert ol.ModelClient().base == "http://127.0.0.1:11434"
+    assert ol.ModelClient().base == "http://127.0.0.1:1235"
     assert ol.KALSHI_BASE == kd.BASE_URL == "https://api.elections.kalshi.com/trade-api/v2"
 
 
@@ -901,7 +1063,7 @@ def test_phases_are_spread_evenly_when_selected_and_kept_across_a_restart(tmp_pa
     clock.t += 3600
     store2 = ol.Store(tmp_path / "loop.sqlite")
     col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                        ol.ModelClient(transport=model, clock=clock), clock=clock)
+                        client(model, clock), clock=clock)
     col2.start()
     assert {w["ticker"]: w["phase"] for w in col2.watched()} == now
 
@@ -1143,7 +1305,7 @@ def test_a_selection_is_one_transaction_and_a_restart_with_nothing_watched_selec
     clock.t += 30
     store2 = ol.Store(tmp_path / "loop.sqlite")
     col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                        ol.ModelClient(transport=model, clock=clock), clock=clock)
+                        client(model, clock), clock=clock)
     col2.start()
     col2.cycle()
     assert sorted(w["ticker"] for w in col2.watched()) == ["A-E-M", "B-E-M"]
@@ -1238,7 +1400,7 @@ def test_loopback_http_turns_protocol_failures_and_timeouts_into_the_loops_own(m
 
         def open(self, req, timeout):
             raise self.exc
-    url = "http://127.0.0.1:11434/v1/systemone"
+    url = "http://127.0.0.1:1235/v1/systemone"
     monkeypatch.setattr(ol, "_OPENER", Opener(http.client.IncompleteRead(b"")))
     with pytest.raises(ol.ModelUnavailable):
         ol.loopback_http(url, b"{}", 10.0)
@@ -1416,7 +1578,7 @@ def test_status_counts_each_slot_once_and_no_stopped_minute_as_watched(tmp_path)
             i = stop_to
             clock.t = T0 + 60 * i + 0.3
             col = make_collector(store, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                               ol.ModelClient(transport=model, clock=clock), clock=clock, slots=6)
+                               client(model, clock), clock=clock, slots=6)
             col.start()
         model.latency = 12.0 if i in late else 0.8
         model.post_down = i in down
@@ -1531,7 +1693,7 @@ def test_a_restart_after_an_overdue_grid_point_selects_off_grid_and_keeps_the_gr
     clock.t = T0 + 7 * 3600 + 0.5                                  # 12:00 passed while stopped
     store2 = ol.Store(tmp_path / "loop.sqlite")
     col2 = make_collector(store2, kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1),
-                        ol.ModelClient(transport=model, clock=clock), clock=clock)
+                        client(model, clock), clock=clock)
     col2.start()
     run_minutes(col2, clock, 420, 721)
     rows = store2.conn.execute("SELECT kind, started_ts FROM selections ORDER BY id").fetchall()
@@ -1805,7 +1967,7 @@ def sync_rig(tmp_path, n=4, mono=None, tries=1):
     rec = Recorder(store.conn, true, skew)
     store.conn = rec
     kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono, tries=tries)
-    col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew, monotonic=mono)
+    col = make_collector(store, kalshi, client(model, skew), clock=skew, monotonic=mono)
     world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i, close=T0 + 5 * 86400) for i in range(n)]
     for m in world.markets:
         world.books[m["ticker"]] = book(0.40, 0.45)
@@ -2361,7 +2523,7 @@ def outage_run(tmp_path, kind, minutes, in_pause):
         elif i == begin and kind == "restart":
             true.t += minutes * 60
             kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono["m"], tries=1)
-            col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+            col = make_collector(store, kalshi, client(model, skew), clock=skew,
                                  monotonic=mono["m"])
             i = stop
             true.t = max(true.t, T0 + 60 * i + 0.5)
@@ -2587,7 +2749,7 @@ def scenario(tmp_path, events, last, n=2, slots=None, trades=True, seed=0, per_m
             i += length
             if kind == "restart":
                 kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono["m"], tries=1)
-                col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+                col = make_collector(store, kalshi, client(model, skew), clock=skew,
                                      monotonic=mono["m"], slots=slots or ol.WATCH_COUNT)
                 true.t = max(true.t, T0 + 60 * i + 0.5)
                 col.start()
@@ -2787,7 +2949,7 @@ def test_an_unreadable_cut_short_tail_gives_one_trades_lost_across_restarts(tmp_
             run_cycle(col)
         lost.append([t for (t,) in store.conn.execute("SELECT ticker FROM events WHERE kind = 'trades_lost'")])
         kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=true.mono, tries=1)
-        col = make_collector(store, kalshi, ol.ModelClient(transport=model, clock=skew), clock=skew,
+        col = make_collector(store, kalshi, client(model, skew), clock=skew,
                              monotonic=true.mono)
         col.start()
     tries = store.conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'catch_up_failed' AND ticker = ?",
@@ -3002,8 +3164,8 @@ def test_a_store_written_by_09ecec7_is_continued_and_stays_readable_by_it(tmp_pa
 
     def make(mod):
         kalshi = kd.KalshiData(fetch=world, sleep=true.sleep, clock=mono, tries=1)
-        return mod.Collector(mod.Store(path), kalshi, mod.ModelClient(transport=model, clock=skew), clock=skew,
-                             monotonic=mono)
+        mc = client(model, skew) if mod is ol else mod.ModelClient(transport=model, clock=skew)
+        return mod.Collector(mod.Store(path), kalshi, mc, clock=skew, monotonic=mono)
 
     def minutes(col, a, b):
         for i in range(a, b):
@@ -3039,3 +3201,508 @@ def test_a_store_written_by_09ecec7_is_continued_and_stays_readable_by_it(tmp_pa
     minutes(col, 150, 160)
     n = c.execute("SELECT COUNT(*) FROM snapshots WHERE book_end_ts > ?", (T0 + 150 * 60,)).fetchone()[0]
     assert n == 3 * 10
+
+
+# ================================================================= T44-1: the model on LM Studio
+
+MODEL_PATH = os.path.expanduser("~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf")
+
+
+def lm_rig(tmp_path, n=1, *, file=None, runner=None, kclock=None, verified=True, **model_kw):
+    """A store, a stand-in Kalshi with n markets and a stand-in LM Studio; the client is handed back too. Not
+    started."""
+    clock = Clock()
+    world = World(clock)
+    model = Model(clock, **model_kw)
+    store = ol.Store(tmp_path / "loop.sqlite")
+    kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
+    c = client(model, clock, file=file, runner=runner, kclock=kclock, verified=verified)
+    col = make_collector(store, kalshi, c, clock=clock)
+    world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i) for i in range(n)]
+    for m in world.markets:
+        world.books[m["ticker"]] = book(0.40, 0.45)
+    return col, world, model, store, clock, c
+
+
+def only_load_and_unload(runner):
+    """The keeper never runs anything but `lms load ...` and `lms unload <the instance>`."""
+    return all(a == UNLOAD or (a[:2] == [LMS, "load"] and a[3:] == LOAD[3:]) for a in runner.argvs)
+
+
+# ---------------------------------------------------------------- ruling 1: the constants
+
+def test_t44_r1_the_model_constants():
+    assert ol.MODEL_URL == "http://127.0.0.1:1235"
+    assert ol.MODEL_KEY_PREFIX == "bespoke-nimble-9b-v3"
+    assert ol.MODEL_FILE == "~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf"
+    assert ol.MODEL_FILE_SIZE == FILE_SIZE == 9527503392 and ol.MODEL_FILE_SHA256 == FILE_SHA
+    assert ol.MODEL_QUANT == "Q8_0" and ol.MODEL_INSTANCE == INSTANCE
+    assert ol.MODEL_SLOTS == 6 and ol.MODEL_CONTEXT == 32768
+    assert ol.TAG == "lmstudio:bespoke-nimble-9b-v3@q8_0" and v3.TAG == "nimble-v3:9b-mxfp8"
+
+
+# ---------------------------------------------------------------- ruling 5: the pin, every branch both ways
+
+class StatGone(ModelFile):
+    def __init__(self):
+        super().__init__()
+        self.gone = False
+
+    def stat(self, path):
+        if self.gone:
+            raise FileNotFoundError(path)
+        return super().stat(path)
+
+
+def _timeout_transport(url, data, timeout):
+    raise TimeoutError("timed out")
+
+
+def _changed(attr, by):
+    def after(c):
+        setattr(c.test_file, attr, getattr(c.test_file, attr) + by)
+    return after
+
+
+def _gone(c):
+    c.test_file.gone = True
+
+
+OTHER_WITH_OURS = {"type": "llm", "key": "qwen/qwen3.8-27b", "size_bytes": 28_000_000_000,
+                   "quantization": {"name": "Q8_0"}, "loaded_instances": [lm_instance()]}
+
+PIN_CASES = {
+    # name: (Model kw, ModelFile or None, verified, after-verification step, status, why contains, digest, keeper asked)
+    "good": ({}, None, True, None, None, None, FILE_SHA, False),
+    "renamed key, same file": ({"listing": lm_listing(lm_entry(key="bespoke-nimble-9b-v3@q8_0-1"))}, None, True, None,
+                               None, None, FILE_SHA, False),
+    "unreachable": ({"down": True}, None, True, None, "model_unavailable", "ModelUnavailable", None, False),
+    "timeout": ({"transport": _timeout_transport}, None, True, None, "model_unavailable", "TimeoutError", None, False),
+    "not json": ({"listing": b"<html>"}, None, True, None, "error", "tag check", None, False),
+    "no model list": ({"listing": {"data": []}}, None, True, None, "error", "tag check", None, False),
+    "an entry not an object": ({"listing": {"models": ["x"]}}, None, True, None, "error", "tag check", None, False),
+    "instances not a list": ({"listing": lm_listing(lm_entry(instances="x"))}, None, True, None, "error", "tag check",
+                             None, False),
+    "file not yet verified": ({}, None, False, None, "model_unavailable", "model file not yet verified", None, False),
+    "file's hash differs": ({}, ModelFile(digest="0" * 64), True, None, "tag_mismatch", "SHA-256", None, False),
+    "file's size differs": ({}, ModelFile(size=FILE_SIZE - 1), True, None, "tag_mismatch", "size", None, False),
+    "file unreadable": ({}, ModelFile(exc=PermissionError("denied")), True, None, "tag_mismatch", "denied", None,
+                        False),
+    "file's mtime changed": ({}, None, True, _changed("mtime_ns", 1), "tag_mismatch", "changed", None, False),
+    "file's size changed": ({}, None, True, _changed("size", 1), "tag_mismatch", "changed", None, False),
+    "file gone": ({}, StatGone(), True, _gone, "tag_mismatch", "FileNotFoundError", None, False),
+    "instance not loaded": ({"listing": lm_listing(lm_entry(instances=[]))}, None, True, None, "model_unavailable",
+                            "instance not loaded", FILE_SHA, True),
+    "only other names loaded": ({"listing": lm_listing(lm_entry(instances=[lm_instance("someone-else")]))}, None,
+                                True, None, "model_unavailable", "instance not loaded", FILE_SHA, True),
+    "type": ({"listing": lm_listing(lm_entry(type="llm"))}, None, True, None, "tag_mismatch", "type", FILE_SHA, True),
+    "key": ({"listing": lm_listing(lm_entry(key="nimble-other@q8_0"))}, None, True, None, "tag_mismatch", "key",
+            FILE_SHA, True),
+    "size_bytes": ({"listing": lm_listing(lm_entry(size_bytes=FILE_SIZE + 1))}, None, True, None, "tag_mismatch",
+                   "size", FILE_SHA, True),
+    "quantisation": ({"listing": lm_listing(lm_entry(quantization={"name": "Q4_K_M"}))}, None, True, None,
+                     "tag_mismatch", "quantisation", FILE_SHA, True),
+    "context_length": ({"listing": lm_listing(lm_entry(instances=[lm_instance(context_length=4096)]))}, None, True,
+                       None, "tag_mismatch", "context", FILE_SHA, True),
+    "parallel": ({"listing": lm_listing(lm_entry(instances=[lm_instance(parallel=1)]))}, None, True, None,
+                 "tag_mismatch", "parallel", FILE_SHA, True),
+    "under another entry": ({"listing": lm_listing(lm_entry(instances=[]), OTHER_WITH_OURS)}, None, True, None,
+                            "tag_mismatch", "type", FILE_SHA, True),
+}
+
+
+@pytest.mark.parametrize("name", list(PIN_CASES))
+def test_t44_r5_the_pin_gives_each_status_and_asks_the_keeper_when_the_instance_is_wrong(name):
+    model_kw, file, verified, after, status, why, digest, asked = PIN_CASES[name]
+    clock = Clock()
+    transport = model_kw.get("transport")
+    model_kw = {k: v for k, v in model_kw.items() if k != "transport"}
+    model = Model(clock, **model_kw)
+    c = client(transport or model, clock, file=file, verified=verified)
+    if after is not None:
+        after(c)
+    asks = []
+    c.keeper.ask = lambda: asks.append(1) or True
+    got = c.pin()
+    assert got[0] == status and got[1] == digest
+    assert (got[2] is None) if status is None else (why in got[2])
+    assert bool(asks) is asked
+    if transport is None:
+        assert model.urls == ["http://127.0.0.1:1235/api/v1/models"]     # one GET, within PIN_TIMEOUT_S (Model)
+    assert model.posts == []
+
+
+def test_t44_r5_the_pin_case_table_is_two_way():
+    """Every fault is a single change from the good case, and every status of the ruling is reached."""
+    assert PIN_CASES["good"][4] is None
+    assert {v[4] for v in PIN_CASES.values()} == {None, "model_unavailable", "error", "tag_mismatch"}
+
+
+# ---------------------------------------------------------------- ruling 4: the file, verified once, in the background
+
+def test_t44_r4_no_call_before_the_file_is_verified_and_the_hash_runs_off_the_collecting_thread(tmp_path):
+    gate = threading.Event()
+    f = ModelFile(gate=gate)
+    col, world, model, store, clock, c = lm_rig(tmp_path, file=f, verified=False)
+    t0 = time.monotonic()
+    col.start()                                           # the check starts here, and does not hold the start up
+    assert time.monotonic() - t0 < 5 and c.checking.is_alive()
+    col.select()
+    run_minutes(col, clock, 1, 35)
+    d = decisions(store)
+    assert [x["status"] for x in d] == ["model_unavailable"] and "not yet verified" in d[0]["error"]
+    assert d[0]["model_digest"] is None and model.posts == []
+    gate.set()
+    c.checking.join(10)
+    run_minutes(col, clock, 36, 40)
+    d = decisions(store)
+    assert [x["status"] for x in d] == ["model_unavailable", "ok"] and d[1]["model_digest"] == FILE_SHA
+    assert f.paths == [MODEL_PATH]                        # home expanded, hashed once
+    assert all(t is not threading.current_thread() and t.daemon for t in f.threads)
+    c.begin()                                             # once per start: asked again, it does not hash again
+    c.begin()
+    assert len(f.paths) == 1
+
+
+def test_t44_r4_a_wrong_hash_gives_tag_mismatch_for_ever_and_no_call(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, file=ModelFile(digest="f" * 64))
+    col.start()
+    col.select()
+    run_minutes(col, clock, 1, 45)
+    d = decisions(store)
+    assert [x["status"] for x in d] == ["tag_mismatch"] * 3 and model.posts == []
+    assert all(x["model_digest"] is None and "SHA-256" in x["error"] for x in d)
+
+
+def test_t44_r4_a_file_changed_after_its_check_gives_tag_mismatch(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path)
+    col.start()
+    col.select()
+    run_minutes(col, clock, 1, 35)
+    c.test_file.mtime_ns += 1                             # the file was written to
+    run_minutes(col, clock, 36, 40)
+    c.test_file.mtime_ns -= 1
+    c.test_file.size += 1
+    run_minutes(col, clock, 41, 45)
+    d = decisions(store)
+    assert [x["status"] for x in d] == ["ok", "tag_mismatch", "tag_mismatch"] and len(model.posts) == 1
+
+
+def test_t44_r4_a_file_that_changes_while_it_is_hashed_fails_its_check():
+    clock = Clock()
+    f = ModelFile()
+    real = f.hasher
+
+    def hasher(path):
+        out = real(path)
+        f.mtime_ns += 5
+        return out
+    f.hasher = hasher
+    c = client(Model(clock), clock, file=f)
+    assert c.pin()[0] == "tag_mismatch"
+
+
+# ---------------------------------------------------------------- ruling 6: the reply
+
+def test_t44_r6_a_reply_naming_another_model_or_not_an_object_is_an_error(tmp_path):
+    for body in (lm_answer(model=v3.TAG), lm_answer(model="someone-else"), [lm_answer()], {"answers": {}}):
+        col, world, model, store, clock, c = lm_rig(tmp_path / str(len(os.listdir(tmp_path))), body=body)
+        col.start()
+        col.select()
+        run_minutes(col, clock, 1, 35)
+        d = decisions(store)[0]
+        assert d["status"] == "error" and d["error"].startswith("unreadable answer: ") and d["answers_json"] is None
+        assert len(model.posts) == 1
+
+
+def test_t44_r6_a_good_reply_gives_the_pinned_parsers_answers_and_the_new_tag(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path)
+    col.start()
+    col.select()
+    run_minutes(col, clock, 1, 35)
+    d = decisions(store)[0]
+    reply = json.loads(d["raw_response"])
+    assert list(reply) == ["answers", "model", "usage"] and reply["model"] == INSTANCE
+    pinned = v3.parse_response({**reply, "model": v3.TAG}, ol.BATTERY)
+    assert json.loads(d["answers_json"]) == pinned["answers"] and d["input_tokens"] == pinned["usage"]["input_tokens"]
+    assert d["status"] == "ok" and d["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0"
+    assert json.loads(model.posts[0])["model"] == INSTANCE
+
+
+# ---------------------------------------------------------------- ruling 7: the keeper
+
+def keeper_client(listing=None, codes=(), gate=None):
+    clock = Clock()
+    model = Model(clock, listing=lm_listing(lm_entry(instances=[])) if listing is None else listing)
+    runner, kc = Runner(codes, gate), KeeperClock()
+    return client(model, clock, runner=runner, kclock=kc), model, runner, kc
+
+
+def test_t44_r7_a_missing_instance_is_loaded_with_the_exact_argv_in_a_daemon_thread():
+    c, model, runner, kc = keeper_client()
+    keep(c)
+    assert runner.calls == [(LOAD, 180.0)]
+    assert all(t is not threading.current_thread() and t.daemon for t in runner.threads)
+    assert model.posts == [] and all(u == "http://127.0.0.1:1235/api/v1/models" for u in model.urls)
+
+
+def test_t44_r7_the_load_uses_the_matching_entrys_key_even_renamed():
+    c, model, runner, kc = keeper_client(lm_listing(lm_entry(key="bespoke-nimble-9b-v3@q8_0-2", instances=[])))
+    keep(c)
+    assert runner.argvs == [[LMS, "load", "bespoke-nimble-9b-v3@q8_0-2", *LOAD[3:]]]
+
+
+@pytest.mark.parametrize("listing", [lm_listing(),                                        # already right
+                                     lm_listing(lm_entry(size_bytes=1, instances=[])),    # no matching entry
+                                     lm_listing(lm_entry(quantization={"name": "Q4_0"}, instances=[])),
+                                     lm_listing(lm_entry(key="other-model", instances=[])),
+                                     b"not json"])
+def test_t44_r7_nothing_is_run_when_the_instance_is_right_or_no_entry_matches(listing):
+    c, model, runner, kc = keeper_client(listing)
+    keep(c)
+    assert runner.calls == []
+
+
+def test_t44_r7_not_twice_within_sixty_seconds_and_a_failed_load_is_tried_again():
+    c, model, runner, kc = keeper_client(codes=[1, 0])
+    keep(c)
+    kc.t += 59
+    assert not c.keeper.ask() and len(runner.calls) == 1
+    kc.t += 1
+    keep(c)
+    assert runner.argvs == [LOAD, LOAD]
+    runner.codes = [FileNotFoundError("no lms")]         # a refused run is tried again too
+    kc.t += 60
+    keep(c)
+    kc.t += 60
+    keep(c)
+    assert runner.argvs == [LOAD] * 4
+
+
+def test_t44_r7_one_run_at_a_time():
+    gate = threading.Event()
+    c, model, runner, kc = keeper_client(gate=gate)
+    assert c.keeper.ask()
+    for _ in range(500):
+        if runner.calls:
+            break
+        time.sleep(0.01)
+    kc.t += 600
+    assert not c.keeper.ask()                             # still loading: no second run
+    gate.set()
+    c.keeper.thread.join(10)
+    assert c.keeper.ask()
+    c.keeper.thread.join(10)
+    assert runner.argvs == [LOAD, LOAD]
+
+
+@pytest.mark.parametrize("listing", [lm_listing(lm_entry(instances=[lm_instance(parallel=1)])),
+                                     lm_listing(lm_entry(instances=[lm_instance(context_length=8192)])),
+                                     lm_listing(lm_entry(instances=[]), OTHER_WITH_OURS)])
+def test_t44_r7_a_wrongly_loaded_instance_is_unloaded_then_loaded(listing):
+    c, model, runner, kc = keeper_client(listing)
+    keep(c)
+    assert runner.argvs == [UNLOAD, LOAD] and only_load_and_unload(runner)
+
+
+def test_t44_r7_a_failed_unload_is_not_followed_by_a_load():
+    c, model, runner, kc = keeper_client(lm_listing(lm_entry(instances=[lm_instance(parallel=2)])), codes=[1])
+    keep(c)
+    assert runner.argvs == [UNLOAD]
+
+
+def test_t44_r7_three_replacements_in_a_row_then_thirty_minutes_alone():
+    wrong = lm_listing(lm_entry(instances=[lm_instance(parallel=1)]))
+    c, model, runner, kc = keeper_client(wrong)
+    for _ in range(3):
+        keep(c)
+        kc.t += 60
+    assert runner.argvs == [UNLOAD, LOAD] * 3
+    third = 1000.0 + 120
+    while kc.t < third + 1800:                            # each ask still runs (reads the list) but runs nothing
+        keep(c)
+        kc.t += 60
+    assert len(runner.calls) == 6
+    kc.t = third + 1800
+    keep(c)
+    assert runner.argvs == [UNLOAD, LOAD] * 4 and only_load_and_unload(runner)
+
+
+def test_t44_r7_a_right_instance_ends_the_run_of_replacements_and_a_missing_one_is_loaded_during_the_rest():
+    wrong, right, gone = (lm_listing(lm_entry(instances=[lm_instance(parallel=1)])), lm_listing(),
+                          lm_listing(lm_entry(instances=[])))
+    c, model, runner, kc = keeper_client(wrong)
+    for listing in (wrong, wrong, right, wrong, wrong, wrong, wrong, gone):
+        model.listing = listing
+        keep(c)
+        kc.t += 60
+    # two replacements, then right (the count starts again), then three, then left alone, but a missing one loads
+    assert runner.argvs == [UNLOAD, LOAD] * 5 + [LOAD]
+
+
+def test_t44_r7_the_keeper_is_asked_once_at_start_and_its_rows_are_written_by_the_collecting_thread(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
+    col.start()                                           # asked once when collecting starts
+    c.keeper.thread.join(10)
+    assert c.keeper.runner.argvs == [LOAD]
+    loads = "SELECT ts, detail_json FROM events WHERE kind = 'model_load'"
+    assert store.conn.execute(loads).fetchall() == []    # the keeper's thread never touches the store
+    col.select()
+    run_minutes(col, clock, 1, 1)
+    (ts, detail), = store.conn.execute(loads).fetchall()
+    detail = json.loads(detail)
+    assert detail["argv"] == LOAD and detail["exit_code"] == 0 and detail["seconds"] >= 0
+    run_minutes(col, clock, 2, 3)
+    assert len(store.conn.execute(loads).fetchall()) == 1     # written once
+    box = {}
+
+    def other():                                          # why: the store's connection belongs to its thread
+        try:
+            store.conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError as e:
+            box["e"] = e
+    th = threading.Thread(target=other)
+    th.start()
+    th.join()
+    assert "e" in box
+
+
+def test_t44_r7_a_keeper_that_is_loading_never_delays_a_decision(tmp_path):
+    gate = threading.Event()
+    runner = Runner(gate=gate)
+    col, world, model, store, clock, c = lm_rig(tmp_path, runner=runner, listing=lm_listing(lm_entry(instances=[])))
+    col.start()                                           # the first run is loading, held by the gate
+    col.select()
+    t0 = time.monotonic()
+    run_minutes(col, clock, 1, 40)
+    took = time.monotonic() - t0
+    d = decisions(store)
+    assert [x["status"] for x in d] == ["model_unavailable"] * 2 and "instance not loaded" in d[0]["error"]
+    assert c.keeper.thread.is_alive() and len(runner.calls) == 1 and model.posts == []
+    assert took < 8                                       # a held load would take 30 s
+    gate.set()
+    c.keeper.thread.join(10)
+    model.listing = lm_listing()                          # loaded now
+    run_minutes(col, clock, 41, 45)
+    assert decisions(store)[-1]["status"] == "ok"
+
+
+def test_t44_r7_the_pin_asks_the_keeper_and_the_keeper_loads(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, listing=lm_listing(lm_entry(instances=[])))
+    col.start()
+    c.keeper.thread.join(10)
+    c.keeper.clock.t += 60
+    col.select()
+    run_minutes(col, clock, 1, 35)                        # the decision's pin asks: a second load is tried
+    c.keeper.thread.join(10)
+    assert c.keeper.runner.argvs == [LOAD, LOAD]
+
+
+# ---------------------------------------------------------------- the only host: 127.0.0.1:1235
+
+def test_t44_no_request_goes_anywhere_but_lm_studio_on_the_loopback(tmp_path):
+    col, world, model, store, clock, c = lm_rig(tmp_path, n=3, listing=lm_listing(lm_entry(instances=[])))
+    col.start()
+    c.keeper.thread.join(10)
+    col.select()
+    run_minutes(col, clock, 1, 30)
+    model.listing = lm_listing()
+    run_minutes(col, clock, 31, 45)
+    assert model.posts and model.urls
+    assert all(u in ("http://127.0.0.1:1235/api/v1/models", "http://127.0.0.1:1235/v1/systemone") for u in model.urls)
+    src = ol.Path(ol.__file__).read_text()
+    for s in ("11434", "/api/tags", "/api/version"):
+        assert s not in src
+
+
+# ---------------------------------------------------------------- ruling 8: unchanged
+
+def test_t44_r8_the_limits_statuses_tables_start_event_and_heartbeat_are_unchanged(tmp_path):
+    assert (ol.MODEL_LIMIT_S, ol.PIN_TIMEOUT_S, ol.CALL_RESERVE_S, ol.FAILS_BEFORE_PAUSE, ol.PAUSE_S) == \
+        (10.0, 2.0, 2.0, 5, 300)
+    assert ol.STATUSES == ("ok", "late", "model_unavailable", "tag_mismatch", "stale_data", "error")
+    assert ol.TABLES == ("selections", "markets", "market_drops", "snapshots", "trades", "decisions", "heartbeats",
+                         "events")
+    col, world, model, store, clock, c = lm_rig(tmp_path)
+    col.start()
+    col.select()
+    run_minutes(col, clock, 1, 46)
+    (detail,), = store.conn.execute("SELECT detail_json FROM events WHERE kind = 'start'").fetchall()
+    assert json.loads(detail) == {"battery_id": ol.BATTERY_ID, "tag": "lmstudio:bespoke-nimble-9b-v3@q8_0"}
+    calls = sum(r[0] for r in store.conn.execute("SELECT model_calls FROM heartbeats"))
+    assert calls == len(model.posts) == 3
+
+
+# ---------------------------------------------------------------- the differential test: 4133f56 against this one
+
+OLD_REV = "4133f56"
+OLD_REV_SHA = "a9e376ba3801ecbe3b36b33f9a44084e3efcc8ae83a1b4ff4273ec845650f2ed"
+
+
+def old_module(tmp_path):
+    """4133f56's orderbook_loop.py, read from git (`git show`, read-only) and checked by its hash."""
+    import hashlib
+    import importlib.util
+    root = ol.Path(ol.__file__).resolve().parents[2]
+    try:
+        src = _REAL_RUN(["git", "-C", str(root), "show", "%s:valedia_trader/research_loop/orderbook_loop.py" % OLD_REV],
+                        capture_output=True, check=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        pytest.skip("4133f56 cannot be read from git: %s" % e)
+    assert hashlib.sha256(src).hexdigest() == OLD_REV_SHA
+    path = tmp_path / "orderbook_loop_4133f56.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("orderbook_loop_4133f56", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def differential_run(mod, path):
+    """The decision tests' scenario on one revision: six markets, the stand-in model answering the same answers,
+    then too slow, unreachable at the call, unreachable at the pin, unreadable, failing, and well again."""
+    clock = Clock()
+    world = World(clock)
+    model = Model(clock, old_body=lm_answer(v3.TAG))     # the same reply; only its model field differs
+    world.markets = [mkt("%s-E-M" % chr(65 + i), vol=1000 + i) for i in range(6)]
+    for m in world.markets:
+        world.books[m["ticker"]] = book(0.40, 0.45)
+    store = mod.Store(path)
+    kalshi = kd.KalshiData(fetch=world, sleep=clock.sleep, clock=clock, tries=1)
+    mc = client(model, clock) if mod is ol else mod.ModelClient(transport=model, clock=clock)
+    col = mod.Collector(store, kalshi, mc, clock=clock, monotonic=clock.mono)
+    col.start()
+    if mod is ol:
+        mc.keeper.thread.join(10)
+    col.select()
+    for i in range(1, 71):
+        model.latency = 12.0 if 36 <= i <= 40 else 0.8
+        model.post_down = 41 <= i <= 45
+        model.down = 46 <= i <= 50
+        model.body = b"not json" if 51 <= i <= 55 else None
+        model.exc = RuntimeError("something else") if 56 <= i <= 60 else None
+        clock.t = T0 + 60 * i + 0.5
+        col.cycle()
+    return store
+
+
+def test_t44_differential_the_decision_rows_equal_4133f56s_but_for_the_model_columns(tmp_path):
+    old = old_module(tmp_path)
+    a = decisions(differential_run(old, tmp_path / "old.sqlite"))
+    b = decisions(differential_run(ol, tmp_path / "new.sqlite"))
+    assert len(a) == len(b) > 30
+    assert {d["status"] for d in a} == {"ok", "late", "model_unavailable", "error"}
+    differ = {"model_tag", "model_digest", "request_sha256", "latency_s", "raw_response"}
+    for x, y in zip(a, b):
+        assert {k: v for k, v in x.items() if k not in differ} == {k: v for k, v in y.items() if k not in differ}
+        assert x["model_tag"] == v3.TAG and y["model_tag"] == "lmstudio:bespoke-nimble-9b-v3@q8_0"
+        assert (x["model_digest"] is None) == (y["model_digest"] is None)
+        assert y["model_digest"] in (None, FILE_SHA)
+        assert (x["request_sha256"] is None) == (y["request_sha256"] is None)
+        assert x["latency_s"] == pytest.approx(y["latency_s"]) if x["latency_s"] is not None else y["latency_s"] is None
+        if x["raw_response"] is None or x["raw_response"] == "not json":  # the raw reply: equal but for its model
+            assert y["raw_response"] == x["raw_response"]
+        else:
+            ry = json.loads(y["raw_response"])
+            assert ry["model"] == INSTANCE and json.loads(x["raw_response"]) == {**ry, "model": v3.TAG}
