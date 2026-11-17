@@ -1271,3 +1271,159 @@ def test_a_webull_env_that_agrees_or_is_absent_on_one_side_loads_as_before(tmp_p
     os.chmod(g, 0o600)
     env = {"WEBULL_ENV": "production"}
     assert s.load_env(g, environ=env) == ["A_KEY"] and env["WEBULL_ENV"] == "production"
+
+
+# ---- T50: the live key pair lives in a file of its own (webull-live.env), read only by the live entry. Every value
+# below is made up here; each check is computed on a line of its own so that a failure never prints a value.
+
+LIVE_KEY, LIVE_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"
+GOOD_LIVE = f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}\n"
+
+
+def _live_file(folder, text=GOOD_LIVE, mode=0o600, folder_mode=0o700):
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(folder_mode)
+    p = folder / "webull-live.env"
+    p.write_bytes(text if isinstance(text, bytes) else text.encode())
+    p.chmod(mode)
+    return p
+
+
+def _refusal(path):
+    """The LiveFileError's text, or None when the file was accepted."""
+    try:
+        s.read_live_pair(path)
+    except s.LiveFileError as exc:
+        return str(exc)
+    return None
+
+
+def _no_value(text):
+    return LIVE_KEY not in text and LIVE_SECRET not in text
+
+
+def _refused_with(why, words):
+    """A refusal that holds neither value (checked first, so a failure never shows one) and names `words`."""
+    clean = why is not None and _no_value(why) and why.startswith("webull-live.env ")
+    assert clean, "accepted" if why is None else "the refusal holds a value or does not name the file"
+    assert words in why, why
+
+
+def test_t50_the_live_names_and_the_files_place_are_fixed_in_code():
+    import inspect
+    import pwd
+    from pathlib import Path
+    assert s.LIVE_NAMES == ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET")
+    assert s.LIVE_ENV_FILE == Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".hermes" / "secrets" / "webull-live.env"
+    assert s.LIVE_ENV_FILE.parent == Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".hermes" / "secrets"
+    assert issubclass(s.LiveFileError, s.SecretError)
+    assert inspect.signature(s.read_live_pair).parameters["path"].default is None
+    source = inspect.getsource(s.read_live_pair)
+    assert "environ" not in source and "getenv" not in source and "VALEDIA_ENV_FILE" not in source
+
+
+def test_t50_a_good_live_file_gives_the_pair_and_nothing_enters_the_process_environment(tmp_path):
+    before = dict(os.environ)
+    p = _live_file(tmp_path / "secrets")
+    pair = s.read_live_pair(p)
+    right = pair == (LIVE_KEY, LIVE_SECRET)
+    assert right
+    unchanged = dict(os.environ) == before
+    assert unchanged
+    for text in (f"# the owner's live pair\n\nexport WEBULL_LIVE_APP_SECRET='{LIVE_SECRET}'\n"
+                 f"WEBULL_LIVE_APP_KEY=\"{LIVE_KEY}\"\n",):
+        right = s.read_live_pair(_live_file(tmp_path / "other", text)) == (LIVE_KEY, LIVE_SECRET)
+        assert right
+    right = s.read_live_pair(_live_file(tmp_path / "ro", mode=0o400)) == (LIVE_KEY, LIVE_SECRET)
+    assert right
+
+
+def test_t50_the_live_values_are_registered_with_the_output_guard(tmp_path):
+    s.read_live_pair(_live_file(tmp_path / "secrets"))
+    masked, hits = s.redact(f"x-app-key={LIVE_KEY} and {LIVE_SECRET}.")
+    hidden = _no_value(masked) and hits >= 2
+    assert hidden
+    child = s.child_env({"CARRIES_KEY": LIVE_KEY, "CARRIES_SECRET": f"prefix {LIVE_SECRET}", "PLAIN": "ok"})
+    dropped = "CARRIES_KEY" not in child and "CARRIES_SECRET" not in child and child.get("PLAIN") == "ok"
+    assert dropped
+
+
+@pytest.mark.parametrize("text, words", [
+    (GOOD_LIVE + "WEBULL_APP_KEY=ZqPracticeKey1234567\n", "line 3 names a setting other than"),
+    (GOOD_LIVE + f"OTHER_NAME={LIVE_SECRET}\n", "line 3 names a setting other than"),
+    (GOOD_LIVE + f"WEBULL_LIVE_APP_KEY={LIVE_KEY}x\n", "sets WEBULL_LIVE_APP_KEY more than once (lines 1 and 3)"),
+    (f"WEBULL_LIVE_APP_KEY=\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}\n", "WEBULL_LIVE_APP_KEY is empty"),
+    (f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET=''\n", "WEBULL_LIVE_APP_SECRET is empty"),
+    (f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\n", "WEBULL_LIVE_APP_SECRET is missing"),
+    (GOOD_LIVE + f"{LIVE_SECRET}\n", "line 3 is not NAME=VALUE"),
+    (f"{LIVE_KEY}={LIVE_SECRET}\n" + GOOD_LIVE, "line 1 names a setting other than"),
+    ("", "WEBULL_LIVE_APP_KEY is missing"),
+    (b"WEBULL_LIVE_APP_KEY=\xff\xfe\n", "is not UTF-8 text"),
+    ("WEBULL_LIVE_APP_KEY=" + "a" * 5000 + "\n", "is larger than"),
+])
+def test_t50_a_live_file_with_anything_but_the_two_names_once_each_is_refused_naming_the_fault(tmp_path, text, words):
+    _refused_with(_refusal(_live_file(tmp_path / "secrets", text)), words)
+
+
+@pytest.mark.parametrize("mode, words", [(0o644, "readable by its group or by others"), (0o640, "readable by its group"),
+                                         (0o604, "readable by its group or by others"), (0o620, "writable by its group"),
+                                         (0o602, "writable by its group or by others"), (0o666, "by its group or by others"),
+                                         (0o000, "cannot be opened")])
+def test_t50_a_live_file_that_is_not_the_owners_alone_is_refused(tmp_path, mode, words):
+    _refused_with(_refusal(_live_file(tmp_path / "secrets", mode=mode)), words)
+
+
+def test_t50_a_live_file_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+    p = _live_file(tmp_path / "secrets")
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+    _refused_with(_refusal(p), "belongs to another user")
+
+
+@pytest.mark.parametrize("folder_mode", [0o777, 0o775, 0o757])
+def test_t50_a_live_file_in_a_folder_others_can_write_is_refused(tmp_path, folder_mode):
+    _refused_with(_refusal(_live_file(tmp_path / "secrets", folder_mode=folder_mode)), "a folder that is not the owner's alone")
+
+
+def test_t50_a_link_a_second_name_or_a_folder_is_refused_and_a_missing_file_is_named(tmp_path):
+    real = _live_file(tmp_path / "real")
+    links = tmp_path / "links"
+    links.mkdir(mode=0o700)
+    (links / "webull-live.env").symlink_to(real)
+    _refused_with(_refusal(links / "webull-live.env"), "symbolic link")
+    (tmp_path / "linked-folder").symlink_to(tmp_path / "real", target_is_directory=True)
+    _refused_with(_refusal(tmp_path / "linked-folder" / "webull-live.env"), "symbolic link")
+    second = tmp_path / "second"
+    second.mkdir(mode=0o700)
+    os.link(real, second / "webull-live.env")
+    _refused_with(_refusal(second / "webull-live.env"), "more than one name")
+    os.unlink(second / "webull-live.env")
+    folder = tmp_path / "dir" / "webull-live.env"
+    folder.mkdir(parents=True)
+    _refused_with(_refusal(folder), "not a regular file")
+    _refused_with(_refusal(tmp_path / "nowhere" / "webull-live.env"), "is missing")
+
+
+def test_t50_a_path_whose_real_path_differs_is_refused(tmp_path, monkeypatch):
+    _live_file(tmp_path / "secrets")
+    why = _refusal(f"{tmp_path}/secrets/../secrets/webull-live.env")     # abspath folds it: the same file
+    assert why is None
+    real = os.path.realpath
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: real(p, *a, **k) + "-elsewhere")
+    _refused_with(_refusal(tmp_path / "secrets" / "webull-live.env"), "real path")
+
+
+def test_t50_the_live_names_in_reach_are_found_in_any_mapping_and_through_the_ordinary_file(tmp_path):
+    assert s.live_names_in({"WEBULL_APP_KEY": "x", "WEBULL_ENV": "sandbox"}) == []
+    assert s.live_names_in({"WEBULL_LIVE_APP_SECRET": ""}) == ["WEBULL_LIVE_APP_SECRET"]          # present, even empty
+    assert s.live_names_in({"WEBULL_LIVE_APP_SECRET": "a", "WEBULL_LIVE_APP_KEY": "b"}) == list(s.LIVE_NAMES)
+    f = tmp_path / "trading.env"
+    f.write_text(f"WEBULL_APP_KEY=ZqPracticeKey1234567\nWEBULL_LIVE_APP_KEY={LIVE_KEY}\n")
+    os.chmod(f, 0o600)
+    env = {}
+    s.load_env(f, environ=env)
+    assert s.live_names_in(env) == ["WEBULL_LIVE_APP_KEY"]
+    assert s.is_practice_environment({}) and s.is_practice_environment({"WEBULL_ENV": " Sandbox "})
+    assert s.is_practice_environment({"WEBULL_ENV": ""})
+    for word in ("production", "PRODUCTION", "live", "sandbox2", "paper"):
+        assert not s.is_practice_environment({"WEBULL_ENV": word}), word

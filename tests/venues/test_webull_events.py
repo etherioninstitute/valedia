@@ -588,3 +588,45 @@ def test_a_base_exception_inside_an_sdk_call_ends_with_one_plain_line(raised, tm
     lines = captured.err.splitlines()
     assert len(lines) == 1 and raised.__name__ in lines[0]
     assert KEY[:6] not in captured.err and SECRET[:6] not in captured.err and "x-app-key" not in captured.err
+
+
+# ---- T50: the events reader is a practice entry: a live name in reach is refused, and it never opens the live file
+
+LIVE_KEY, LIVE_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"          # made up
+
+
+@pytest.mark.parametrize("name", ["WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET"])
+def test_t50_the_probe_refuses_when_a_live_name_is_in_reach(tmp_path, capsys, name):
+    fake = FakeInstrument(series_pages={None: ([series_row("KXNBAGAME")], None)})
+    fetched = []
+    code = we.main(["probe"], environ={**ENV, name: LIVE_SECRET}, client=FakeData(fake), kalshi_fetch=fetched.append,
+                   sleep=lambda s: None)
+    err = capsys.readouterr().err
+    clean = LIVE_SECRET not in err and KEY not in err and SECRET not in err
+    assert clean and code == 2 and fake.calls == [] and fetched == []
+    assert err.startswith("refused:") and name in err
+
+
+def test_t50_the_probe_finds_a_live_name_in_the_ordinary_file_and_never_opens_the_live_file(tmp_path, monkeypatch, capsys):
+    live = tmp_path / "live" / "webull-live.env"
+    live.parent.mkdir(mode=0o700)
+    live.write_text(f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}\n")
+    live.chmod(0o000)                                                  # present, unreadable
+    monkeypatch.setattr(core_secrets, "LIVE_ENV_FILE", live)
+    monkeypatch.setattr(core_secrets, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in ENV.items()) + f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\n")
+    f.chmod(0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    for k in (*ENV, "WEBULL_LIVE_APP_KEY"):
+        monkeypatch.setenv(k, "x")
+        monkeypatch.delenv(k)                                          # the undo removes what the load puts there
+    fake = FakeInstrument(series_pages={None: ([series_row("KXNBAGAME")], None)})
+    code = we.main(["probe"], client=FakeData(fake), kalshi_fetch=lambda u: b"{}", sleep=lambda s: None)
+    err = capsys.readouterr().err
+    clean = LIVE_KEY not in err
+    assert clean and code == 2 and fake.calls == [] and "WEBULL_LIVE_APP_KEY" in err
+    fake = FakeInstrument(series_pages={None: ([series_row("KXNBAGAME")], None)})
+    code = we.main(["probe"], environ=dict(ENV), client=FakeData(fake), kalshi_fetch=kalshi_fetch_for({}),
+                   sleep=lambda s: None)
+    assert code == 0                                                   # no live name: it runs, the live file unopened

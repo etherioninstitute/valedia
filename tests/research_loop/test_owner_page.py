@@ -1162,3 +1162,41 @@ def test_no_five_characters_of_any_order_tag_reach_the_page(bare_world, trading_
     shown = sorted({(t, t.lower()[i:i + 5]) for t in tags for i in range(len(t) - 4)
                     if t.lower()[i:i + 5] in page and t.lower()[i:i + 5] not in known})
     assert shown == [], shown[:10]
+
+
+# ---- T50: a live key name in reach of the practice runs is a flagged row; the page never opens the live file
+
+T50_SECRET = "ZqLiveSecret3LbNHs4GdYp8"                                             # made up
+
+
+def _t50_flag(html):
+    """The problem paragraphs' text in the Limits and switches section."""
+    part = html.split("Limits and switches", 1)[1]
+    return " ".join(re.findall(r'<p class="problem">(.*?)</p>', part.split("<h2", 1)[0], flags=re.S))
+
+
+@pytest.mark.parametrize("name", ["WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET"])
+def test_t50_a_live_name_in_reach_is_a_flagged_row_without_its_value(world, monkeypatch, tmp_path, name):
+    monkeypatch.setattr(s, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
+    text = world.page().sections["Limits and switches"]
+    assert "Webull live key names" in text and "none in reach of the practice runs" in text
+    assert _t50_flag(world.html()) == ""
+    world.environ[name] = T50_SECRET
+    html = world.html()
+    text = Page(html).sections["Limits and switches"]
+    clean = T50_SECRET not in html
+    assert clean and f"in reach of the practice runs: {name}" in text
+    assert name in _t50_flag(html) and "webull-live.env" in _t50_flag(html)
+
+
+def test_t50_a_live_name_in_the_trading_file_is_flagged_and_nothing_of_it_is_kept(bare_world, trading_file, monkeypatch):
+    monkeypatch.setattr(s, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
+    trading_file.write_text(trading_file.read_text() + f"WEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
+    monkeypatch.setenv("WEBULL_LIVE_APP_SECRET", "x")
+    monkeypatch.delenv("WEBULL_LIVE_APP_SECRET")
+    env = bare_world.env()
+    env.environ = None
+    op.build(env, out=bare_world.tmp / "o.html")
+    html = (bare_world.tmp / "o.html").read_text()
+    clean = T50_SECRET not in html
+    assert clean and "WEBULL_LIVE_APP_SECRET" in _t50_flag(html) and "WEBULL_LIVE_APP_SECRET" not in os.environ

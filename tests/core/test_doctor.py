@@ -704,7 +704,118 @@ def test_t32_a2_the_proposal_only_list_names_the_capital_the_money_at_work_and_t
     proposal = detail.split("judged only when a batch is proposed and again when it is approved: ")[1]
     assert "the capital given with --capital against the confirmation's max_capital" in proposal
     assert "the money at work (what the account holds plus the batch's buys) against max_capital" in proposal
-    assert "WEBULL_ENV and WEBULL_ACCOUNT_CLASS are read when the venue is built" in proposal
+    assert "the live pair is read from webull-live.env when the venue is built (T50)" in proposal   # T50 (rewritten)
+    assert "WEBULL_ENV and WEBULL_ACCOUNT_CLASS are read when the venue is built" not in proposal
     for old in ("lock 4 (the ticket)", "the account the venue will trade against the confirmation's class and last 4",
                 "each order's value against max_order_value", "both second price sources agreeing on each price"):
         assert old in proposal
+
+
+# ---- T50: a live name in reach of the practice runs fails the venues check; no scheduled job may name live mode
+
+T50_KEY, T50_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"          # made up
+T50_NAMES = ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET")
+
+
+@pytest.mark.parametrize("name", T50_NAMES)
+def test_t50_a_live_name_in_reach_of_the_practice_runs_fails_the_venues_check(live_repo, monkeypatch, name):
+    monkeypatch.setenv("WEBULL_ENV", "sandbox")
+    status, detail = _venues(live_repo)
+    assert "live" not in detail.split(";")[0] and T50_NAMES[0] not in detail
+    monkeypatch.setenv(name, T50_SECRET)
+    status, detail = _venues(live_repo)
+    clean = T50_SECRET not in detail and T50_KEY not in detail
+    assert clean and status == D.FAIL and name in detail and "webull-live.env" in detail
+
+
+def _plist(path, label, args, workdir=None):
+    import plistlib
+    data = {"Label": label, "ProgramArguments": [str(a) for a in args]}
+    if workdir is not None:
+        data["WorkingDirectory"] = str(workdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps(data))
+    return path
+
+
+def _jobs(tmp_path):
+    launchd, agents, elsewhere = tmp_path / "tools" / "launchd", tmp_path / "LaunchAgents", tmp_path / "elsewhere"
+    for d in (launchd, agents, elsewhere):
+        d.mkdir(parents=True, exist_ok=True)
+    (launchd / "orderstep-paper.sh").write_text('#!/bin/bash\nOUT=$("$PY" -m valedia_trader.research_loop order-step 2>&1)\n'
+                                                "# a --liveness probe and --live-ish words are not live mode\n")
+    _plist(launchd / "com.valedia.orderstep.paper.plist", "com.valedia.orderstep.paper",
+           ["/bin/bash", launchd / "orderstep-paper.sh"])
+    _plist(agents / "com.valedia.orderstep.paper.plist", "com.valedia.orderstep.paper",
+           ["/bin/bash", launchd / "orderstep-paper.sh"])
+    return launchd, agents, elsewhere
+
+
+def _check_jobs(tmp_path, launchd, agents):
+    return D.check_jobs(LoopPaths(tmp_path), launchd_dir=launchd, agents_dir=agents)
+
+
+def test_t50_clean_job_files_pass_the_jobs_check(tmp_path):
+    launchd, agents, _ = _jobs(tmp_path)
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.OK, detail
+    assert "jobs" in D.CHECKS and D.CHECKS["jobs"] is D.check_jobs
+
+
+@pytest.mark.parametrize("text", ["order-step --live --propose --capital 100", "order-step --live=1", "x --live\n",
+                                  '"--live"', "export WEBULL_LIVE_APP_KEY", f"WEBULL_LIVE_APP_SECRET={T50_SECRET}"])
+def test_t50_a_job_script_in_tools_launchd_naming_live_mode_or_a_live_name_fails_naming_the_file(tmp_path, text):
+    launchd, agents, _ = _jobs(tmp_path)
+    (launchd / "orderstep-paper.sh").write_text(f"#!/bin/bash\n{text}\n")
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    clean = T50_SECRET not in detail
+    assert clean and status == D.FAIL and "orderstep-paper.sh" in detail, detail
+
+
+def test_t50_a_job_plist_with_live_mode_in_its_arguments_fails_naming_the_file(tmp_path):
+    launchd, agents, _ = _jobs(tmp_path)
+    _plist(launchd / "com.valedia.orderstep.paper.plist", "com.valedia.orderstep.paper",
+           ["python", "-m", "valedia_trader.research_loop", "order-step", "--live", "--propose"])
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "com.valedia.orderstep.paper.plist" in detail, detail
+
+
+def test_t50_an_installed_agent_and_the_files_it_names_one_level_down_are_scanned(tmp_path):
+    launchd, agents, elsewhere = _jobs(tmp_path)
+    run = elsewhere / "run.sh"
+    run.write_text("#!/bin/bash\nexec python -m valedia_trader.research_loop order-step --live --approve 1\n")
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", run])
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "run.sh" in detail, detail
+    run.write_text("#!/bin/bash\nexec python -m valedia_trader.research_loop order-step\n")   # clean again
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", "run.sh"], workdir=elsewhere)
+    assert _check_jobs(tmp_path, launchd, agents)[0] == D.OK
+    run.write_text("#!/bin/bash\nWEBULL_LIVE_APP_KEY=x ./inner.sh\n")                   # a relative name, its folder
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "run.sh" in detail, detail
+
+
+def test_t50_the_label_decides_which_installed_agents_are_scanned_and_only_one_level_down(tmp_path):
+    launchd, agents, elsewhere = _jobs(tmp_path)
+    _plist(agents / "com.other.thing.plist", "com.other.thing", ["tool", "--live"])          # not one of ours
+    assert _check_jobs(tmp_path, launchd, agents)[0] == D.OK
+    _plist(agents / "renamed.plist", "com.valedia.renamed", ["tool", "--live"])               # ours by its label
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "renamed.plist" in detail, detail
+    (agents / "renamed.plist").unlink()
+    inner = elsewhere / "inner.sh"
+    inner.write_text("order-step --live --propose\n")
+    outer = elsewhere / "outer.sh"
+    outer.write_text(f"#!/bin/bash\n{inner}\n")
+    _plist(agents / "com.valedia.outer.plist", "com.valedia.outer", ["/bin/bash", outer])
+    assert _check_jobs(tmp_path, launchd, agents)[0] == D.OK                                  # two levels down: not read
+
+
+def test_t50_missing_job_folders_are_said_and_nothing_raises(tmp_path):
+    status, detail = _check_jobs(tmp_path, tmp_path / "no-launchd", tmp_path / "no-agents")
+    assert status == D.ATTENTION and "no job files found" in detail, detail
+    bad = tmp_path / "agents"
+    bad.mkdir()
+    (bad / "com.valedia.broken.plist").write_text("not a plist --live")
+    status, detail = _check_jobs(tmp_path, tmp_path / "no-launchd", bad)
+    assert status == D.FAIL and "com.valedia.broken.plist" in detail, detail

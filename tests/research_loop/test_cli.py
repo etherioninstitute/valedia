@@ -500,8 +500,8 @@ def test_order_step_without_the_new_flags_calls_the_step_exactly_as_before(order
 # ---- T22b: live mode on the command line (order-step --live), every venue a stand-in, every owner's file in tmp
 
 LIVE_ACCOUNT = "ZqLIVEACCOUNT0077"                                     # made up; only its last 4 may ever be printed
-LIVE_KEYS = {"ALPACA_API_KEY": "a", "ALPACA_SECRET_KEY": "b", "FINNHUB_API_KEY": "c", "WEBULL_ENV": "production",
-             "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_CASH"}
+LIVE_KEYS = {"ALPACA_API_KEY": "a", "ALPACA_SECRET_KEY": "b", "FINNHUB_API_KEY": "c", "WEBULL_ENV": "sandbox",
+             "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_CASH"}          # T50: the ordinary file stays a practice file
 
 
 class _LiveVenue(_Venue):
@@ -584,6 +584,7 @@ def live_project(order_step_project, monkeypatch):
     built, asked = [], []
     monkeypatch.setattr(cli, "_live_environ", lambda: dict(LIVE_KEYS))             # never the secrets file
     monkeypatch.setattr(cli, "_order_step_live_venue", lambda files, environ: built.append(files) or venue)
+    monkeypatch.setattr(cli, "_attended", lambda: True)                              # T50: a person at a terminal
     monkeypatch.setattr(second_quote, "second_opinion",
                         lambda price, symbol, **kw: asked.append(symbol) or {"verdict": "agree"})
     monkeypatch.setattr(webull, "ny_date", lambda t=None: date(2026, 11, 13))
@@ -701,19 +702,30 @@ def test_a_live_approve_after_a_lock_stops_being_met_is_refused_and_marked_witho
 
 
 def test_the_live_venue_is_built_only_for_production_and_the_cash_account_with_the_owners_file(monkeypatch, tmp_path):
+    """T50 (rewritten): the live venue is built from the live file only, with the account class of the owner's
+    confirmation and no account id; nothing the environment holds changes what is built."""
     from valedia_trader.venues import webull
     monkeypatch.setattr(webull, "LIVE_REPO", tmp_path, raising=False)   # T22b rev 2: the repository, in-process
+    monkeypatch.setattr(webull, "ny_date", lambda t=None: __import__("datetime").date(2026, 11, 13))
     files = cli._live_files(cli.LoopPaths(tmp_path), {})
     seen = []
-    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: seen.append(kw) or "v"))
-    for env in ({**LIVE_KEYS, "WEBULL_ENV": "sandbox"}, {**LIVE_KEYS, "WEBULL_ENV": ""},
-                {**LIVE_KEYS, "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_MARGIN"}, {**LIVE_KEYS, "WEBULL_ACCOUNT_CLASS": "EVENTS_CASH"},
-                {k: v for k, v in LIVE_KEYS.items() if k != "WEBULL_ACCOUNT_CLASS"}):
-        with pytest.raises(cli._LiveRefused):
-            cli._order_step_live_venue(files, env)
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **kw: pytest.fail("from_secrets")))
+    monkeypatch.setattr(webull.WebullVenue, "from_live_file",
+                        classmethod(lambda cls, path=None, **kw: seen.append((path, kw)) or "v"))
+    live = tmp_path / "secrets" / "webull-live.env"
+    with pytest.raises(cli._LiveRefused, match="confirmation"):          # no confirmation: nothing is built
+        cli._order_step_live_venue(files, dict(LIVE_KEYS), live_file=live)
     assert seen == []
-    assert cli._order_step_live_venue(files, {**LIVE_KEYS, "WEBULL_ENV": " Production "}) == "v"
-    assert seen == [{"confirmation_file": tmp_path / "config" / "webull_live.json"}]
+    (tmp_path / "config").mkdir()
+    conf = tmp_path / "config" / "webull_live.json"
+    conf.write_text(json.dumps({"account_class": "INDIVIDUAL_CASH", "account_ends": LIVE_ACCOUNT[-4:],
+                                "confirmed_by": "Burton", "max_order_value": 3000, "max_capital": 100000,
+                                "valid_until": "2026-11-20", "i_understand_this_trades_real_money": True}))
+    conf.chmod(0o644)
+    for env in (dict(LIVE_KEYS), {**LIVE_KEYS, "WEBULL_ENV": " Production ", "WEBULL_ACCOUNT_ID": "Zq-practice-id"},
+                {**LIVE_KEYS, "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_MARGIN"}, {"WEBULL_ACCOUNT_CLASS": "EVENTS_CASH"}, {}):
+        assert cli._order_step_live_venue(files, env, live_file=live) == "v"
+    assert seen == [(live, {"account_class": "INDIVIDUAL_CASH", "confirmation_file": conf})] * 5
 
 
 def test_a_paper_order_step_never_enters_live_mode(order_step_project, monkeypatch):
@@ -849,10 +861,12 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
     state = go_live.judge_locks(pointing, webull.ny_date(), 100000.0)
     assert [lock["met"] for lock in state.locks[:2]] == [False, False] and state.confirmation is None
     # the function that builds the real production venue, given that object: only the repository's own path
-    seen = []
-    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: seen.append(kw) or "v"))
-    assert _REAL_LIVE_VENUE(pointing, env) == "v"
-    assert seen == [{"confirmation_file": repo / "config" / "webull_live.json"}]
+    seen = []                                                     # T50 (rewritten): the live file's builder
+    monkeypatch.setattr(webull, "live_confirmation", lambda path=None, *a, **k: (seen.append(path) or None, "is missing"))
+    monkeypatch.setattr(webull.WebullVenue, "from_live_file", classmethod(lambda cls, *a, **kw: pytest.fail("built")))
+    with pytest.raises(cli._LiveRefused):
+        _REAL_LIVE_VENUE(pointing, env)
+    assert seen == [repo / "config" / "webull_live.json"]
     # the adapter given the other folder's confirmation
     v = webull.WebullVenue("k", "s", environment="production", client=Recorder(), confirmation_file=cfg / "webull_live.json")
     with pytest.raises(webull.LiveTradingNotConfirmed):
@@ -1194,6 +1208,7 @@ def _secrets_watch(monkeypatch):
     monkeypatch.setattr(cli, "_order_step_live_venue", REAL_LIVE_VENUE)               # the command's own builder
     monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: seen["secret"].append(name) or "x" * 16)
     monkeypatch.setattr(secrets, "load_env", lambda *a, **k: seen["load_env"].append(1) or [])
+    monkeypatch.setattr(secrets, "read_live_pair", lambda *a, **k: seen["secret"].append("live file") or ("x" * 16,) * 2)
     real = webull.WebullVenue.from_secrets
     monkeypatch.setattr(webull.WebullVenue, "from_secrets",
                         classmethod(lambda cls, *a, **k: seen["from_secrets"].append(1) or real.__func__(cls, *a, **k)))
@@ -2386,3 +2401,234 @@ def test_ideas_judged_before_the_split_get_one_finding_and_nothing_else_changes(
         changed = {k for k in before[hid] if before[hid][k] != after[hid][k]}
         assert changed == ({"lessons_learned"} if hid in (old_dev, old_sealed) else set()), (hid, changed)
     assert cli.PRE_SPLIT_FINDING in after[old_dev]["lessons_learned"] and after[untested]["lessons_learned"] == ""
+
+
+# ---- T50: the live pair lives apart; live mode needs a terminal and a practice-only ordinary file; every practice run
+# refuses a live name in reach and never opens the live file. Every value below is made up here.
+
+T50_KEY, T50_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"
+T50_NAMES = ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET")
+REAL_LIVE_ENVIRON = cli._live_environ                                  # before live_project replaces it
+REAL_ATTENDED = getattr(cli, "_attended", lambda: pytest.fail("no _attended"))
+LIVE_RUNS = (["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456", "--capital", "100000"],
+             ["--live", "--check"])
+
+
+def _t50_clean(text):
+    return T50_KEY not in text and T50_SECRET not in text
+
+
+def _t50_live_file(folder, mode=0o600):
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    p = folder / "webull-live.env"
+    p.write_text(f"WEBULL_LIVE_APP_KEY={T50_KEY}\nWEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
+    p.chmod(mode)
+    return p
+
+
+def _t50_no_live_file_read(monkeypatch, tmp_path):
+    """The live file present at its place but unreadable, and its reader failing the test if anything calls it."""
+    from valedia_trader.core import secrets
+    p = _t50_live_file(tmp_path / "live-secrets", mode=0o000)
+    monkeypatch.setattr(secrets, "LIVE_ENV_FILE", p)
+    monkeypatch.setattr(secrets, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
+    return p
+
+
+def _t50_ordinary_file(tmp_path, monkeypatch, text, names=()):
+    """The ordinary secrets file at a temporary place; each name it may load is removed again by the undo."""
+    f = tmp_path / "ordinary" / "trading.env"
+    f.parent.mkdir(exist_ok=True)
+    f.write_text(text)
+    f.chmod(0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    for name in ("WEBULL_ENV", "WEBULL_APP_KEY", "WEBULL_APP_SECRET", "WEBULL_ACCOUNT_CLASS", "ALPACA_API_KEY",
+                 "ALPACA_SECRET_KEY", "FINNHUB_API_KEY", *T50_NAMES, *names):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
+    return f
+
+
+def test_t50_attended_means_a_terminal_on_standard_input(monkeypatch):
+    import io
+    import os
+    import sys
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert REAL_ATTENDED() is False
+    monkeypatch.setattr(sys, "stdin", None)
+    assert REAL_ATTENDED() is False
+    r, w = os.pipe()
+    try:
+        with os.fdopen(r, "r", closefd=False) as pipe:
+            monkeypatch.setattr(sys, "stdin", pipe)
+            assert REAL_ATTENDED() is False
+    finally:
+        os.close(r)
+        os.close(w)
+    master, slave = os.openpty()
+    try:
+        with os.fdopen(slave, "r", closefd=False) as tty:
+            monkeypatch.setattr(sys, "stdin", tty)
+            assert REAL_ATTENDED() is True
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_t50_live_mode_needs_a_terminal_for_every_live_command_check_included(live_project, monkeypatch, capsys):
+    import argparse as ap
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_attended", lambda: False)
+    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    before = _tree(root)
+    for argv in LIVE_RUNS:
+        assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("refused: ") and "terminal" in err and len(err.strip().splitlines()) == 1, err
+    args = ap.Namespace(live=True, check=True, propose=False, approve=None, capital=None, fractional=False)
+    assert cli.live_order_step_command(args, cli.LoopPaths(root), environ=dict(LIVE_KEYS),
+                                       build_venue=lambda *a: pytest.fail("a venue was built")) == 2
+    assert cli.live_order_step_command(args, cli.LoopPaths(root), environ=dict(LIVE_KEYS), attended=False,
+                                       build_venue=lambda *a: pytest.fail("a venue was built")) == 2
+    assert "terminal" in capsys.readouterr().err
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+
+
+@pytest.mark.parametrize("word", ["production", " PRODUCTION ", "live", "sandbox2"])
+def test_t50_live_mode_refuses_an_ordinary_environment_value_other_than_the_practice_one(live_project, monkeypatch, capsys,
+                                                                                         word):
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_live_environ", lambda: {**LIVE_KEYS, "WEBULL_ENV": word})
+    before = _tree(root)
+    for argv in LIVE_RUNS:
+        assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("refused: ") and "WEBULL_ENV" in err and "sandbox" in err, err
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+
+
+@pytest.mark.parametrize("env", [{k: v for k, v in LIVE_KEYS.items() if k != "WEBULL_ENV"}, {**LIVE_KEYS, "WEBULL_ENV": ""},
+                                 {**LIVE_KEYS, "WEBULL_ENV": " Sandbox "}])
+def test_t50_live_mode_takes_a_missing_environment_value_as_the_practice_one(live_project, monkeypatch, capsys, env):
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_live_environ", lambda: dict(env))
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 0
+    assert len(built) == 1
+
+
+@pytest.mark.parametrize("name", T50_NAMES)
+def test_t50_live_mode_refuses_a_live_name_in_the_ordinary_file_or_the_process_environment(live_project, monkeypatch, capsys,
+                                                                                           name):
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_live_environ", lambda: {**LIVE_KEYS, name: T50_SECRET})
+    before = _tree(root)
+    for argv in LIVE_RUNS:
+        assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+        captured = capsys.readouterr()
+        clean = _t50_clean(captured.out + captured.err)
+        assert clean and captured.err.startswith("refused: ") and name in captured.err and "webull-live.env" in captured.err
+    assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
+
+
+def test_t50_live_mode_loads_the_ordinary_file_and_refuses_production_or_a_live_name_found_there(live_project, monkeypatch,
+                                                                                                capsys, tmp_path):
+    root, venue, built, asked = live_project
+    monkeypatch.setattr(cli, "_live_environ", REAL_LIVE_ENVIRON)
+    base = "ALPACA_API_KEY=a\nALPACA_SECRET_KEY=b\nFINNHUB_API_KEY=c\n"
+    _t50_ordinary_file(tmp_path, monkeypatch, base + "WEBULL_ENV=production\n")
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 2
+    err = capsys.readouterr().err
+    assert "WEBULL_ENV" in err and "sandbox" in err, err
+    _t50_ordinary_file(tmp_path, monkeypatch, base + f"WEBULL_ENV=sandbox\nWEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 2
+    captured = capsys.readouterr()
+    clean = _t50_clean(captured.out + captured.err)
+    assert clean and "WEBULL_LIVE_APP_SECRET" in captured.err
+    _t50_ordinary_file(tmp_path, monkeypatch, base)                       # the process says production, the file nothing
+    monkeypatch.setenv("WEBULL_ENV", "production")
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 2
+    assert "WEBULL_ENV" in capsys.readouterr().err
+    assert built == [] and venue.calls == []
+    _t50_ordinary_file(tmp_path, monkeypatch, base + "WEBULL_ENV=sandbox\n")    # a practice file: live mode goes on
+    assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 0
+    assert len(built) == 1
+
+
+def test_t50_a_live_value_never_reaches_stdout_stderr_the_journal_an_exception_or_a_ticket(live_project, monkeypatch, capsys,
+                                                                                          tmp_path):
+    from valedia_trader.core import secrets
+    root, venue, built, asked = live_project
+    live = _t50_live_file(tmp_path / "secrets")
+    leak = f"x-app-key={T50_KEY} x-app-secret={T50_SECRET}"
+
+    class Leaky(_LiveVenue):
+        """A production stand-in whose every account read fails with the live pair in its text."""
+        def positions(self):
+            self.calls.append("positions")
+            raise RuntimeError(leak)
+
+        def cash(self):
+            raise RuntimeError(leak)
+
+    leaky, seen = Leaky(), []
+
+    def build(files, environ):
+        seen.append(secrets.read_live_pair(live) == (T50_KEY, T50_SECRET))
+        return leaky
+
+    monkeypatch.setattr(cli, "_order_step_live_venue", build)
+    codes = [cli.main(["--root", str(root), "order-step", "--live", "--check"]),
+             cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"])]
+    captured = capsys.readouterr()
+    stored = b"".join(p.read_bytes() for p in root.rglob("*") if p.is_file())
+    clean = _t50_clean(captured.out + captured.err) and T50_KEY.encode() not in stored and T50_SECRET.encode() not in stored
+    assert clean and seen == [True, True] and codes[1] == 2
+    masked, hits = secrets.redact(leak)
+    assert _t50_clean(masked) and hits >= 2
+    try:
+        raise RuntimeError(leak)
+    except RuntimeError as exc:
+        from valedia_trader.execution_and_risk.order_step import _venue_error
+        assert _t50_clean(_venue_error(exc))
+
+
+@pytest.mark.parametrize("name", T50_NAMES)
+@pytest.mark.parametrize("argv", [[], ["--propose"]])
+def test_t50_the_practice_order_step_refuses_a_live_name_in_the_process_environment(order_step_project, monkeypatch, capsys,
+                                                                                    tmp_path, name, argv):
+    root, venue = order_step_project
+    _t50_no_live_file_read(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    monkeypatch.setenv(name, T50_SECRET)
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step", *argv]) == 2
+    captured = capsys.readouterr()
+    clean = _t50_clean(captured.out + captured.err)
+    assert clean and captured.err.startswith("refused: ") and name in captured.err and captured.out == ""
+    assert _tree(root) == before and venue.calls == []
+
+
+@pytest.mark.parametrize("name", T50_NAMES)
+def test_t50_the_practice_order_step_refuses_a_live_name_in_the_ordinary_file(order_step_project, monkeypatch, capsys,
+                                                                              tmp_path, name):
+    root, venue = order_step_project
+    _t50_no_live_file_read(monkeypatch, tmp_path)
+    _t50_ordinary_file(tmp_path, monkeypatch, f"WEBULL_ACCOUNT_CLASS=INDIVIDUAL_CASH\n{name}={T50_SECRET}\n")
+    built = []
+    monkeypatch.setattr(cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
+    from valedia_trader.venues import webull
+    monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: built.append(1) or _Venue()))
+    before = _tree(root)
+    assert cli.main(["--root", str(root), "order-step"]) == 2
+    captured = capsys.readouterr()
+    clean = _t50_clean(captured.out + captured.err)
+    assert clean and name in captured.err and built == [] and _tree(root) == before
+
+
+def test_t50_the_practice_order_step_runs_beside_a_live_file_it_never_opens(order_step_project, monkeypatch, capsys, tmp_path):
+    root, venue = order_step_project
+    _t50_no_live_file_read(monkeypatch, tmp_path)
+    for name in T50_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    assert cli.main(["--root", str(root), "order-step"]) == 0

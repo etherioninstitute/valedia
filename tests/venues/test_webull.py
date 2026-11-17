@@ -231,8 +231,10 @@ def test_settings_come_from_the_secrets_and_default_to_the_test_environment(tmp_
     env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET}
     v = wb.WebullVenue.from_secrets(env, client=FakeClient(), confirmation_file=tmp_path / "x.json")
     assert v.environment == "sandbox"
-    v = wb.WebullVenue.from_secrets({**env, "WEBULL_ENV": "production", "WEBULL_ACCOUNT_ID": "ACC-9"}, client=FakeClient(), confirmation_file=tmp_path / "x.json")
-    assert v.environment == "production" and v.account_id == "ACC-9"
+    v = wb.WebullVenue.from_secrets({**env, "WEBULL_ENV": " Sandbox ", "WEBULL_ACCOUNT_ID": "ACC-9"}, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    assert v.environment == "sandbox" and v.account_id == "ACC-9"
+    with pytest.raises(wb.WebullError, match="test environment"):            # T50: the practice builder never builds production
+        wb.WebullVenue.from_secrets({**env, "WEBULL_ENV": "production", "WEBULL_ACCOUNT_ID": "ACC-9"}, client=FakeClient(), confirmation_file=tmp_path / "x.json")
     with pytest.raises(SecretError):
         wb.WebullVenue.from_secrets({"WEBULL_APP_KEY": KEY}, client=FakeClient())
     assert wb.load_live_confirmation(tmp_path / "missing.json") is None
@@ -800,8 +802,8 @@ def test_the_sdks_token_goes_to_a_private_directory_outside_the_repository(tmp_p
     custom = tmp_path / "tokens" / "mine"
     custom.mkdir(parents=True, mode=0o755)
     custom.chmod(0o755)                                                    # an existing directory is tightened to 0700
-    wb.WebullVenue.from_secrets({"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, "WEBULL_ENV": "production"},
-                                confirmation_file=tmp_path / "x.json", token_dir=custom)
+    wb.WebullVenue.from_live_file(_live_pair_file(tmp_path / "secrets"), account_class="INDIVIDUAL_CASH",   # T50: production
+                                  confirmation_file=tmp_path / "x.json", token_dir=custom)                 # is built from the live file
     assert sdk.seen["token_dir"] == custom and (custom.stat().st_mode & 0o777) == 0o700
     assert not (work / "conf").exists()
 
@@ -3828,3 +3830,139 @@ def test_a_floor_never_loosens_the_days_ahead_limit_and_a_floor_that_is_not_a_da
     for bad in (today.isoformat(), _dt.now(), 20261114, True):
         got, why = wb.judge_live_confirmation(ok, today, bad)
         assert got is None and "floor" in why
+
+
+# ---- T50: the live pair comes from its own file, for the live entry only; the practice builder never builds production
+
+LIVE_KEY, LIVE_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"          # made up
+
+
+def _live_pair_file(folder, text=None):
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    p = folder / "webull-live.env"
+    p.write_text(text if text is not None else f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}\n")
+    p.chmod(0o600)
+    return p
+
+
+def test_t50_the_live_venue_is_production_from_the_live_file_whatever_the_environment_says(tmp_path, monkeypatch):
+    for name, value in {"WEBULL_ENV": "sandbox", "WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET,
+                        "WEBULL_ACCOUNT_ID": "ACC-PRACTICE-1", "WEBULL_ACCOUNT_CLASS": "INDIVIDUAL_MARGIN"}.items():
+        monkeypatch.setenv(name, value)
+    v = wb.WebullVenue.from_live_file(_live_pair_file(tmp_path / "secrets"), account_class="INDIVIDUAL_CASH",
+                                      client=FakeClient(accounts=[dict(r) for r in PAPER_ACCOUNTS]),
+                                      confirmation_file=tmp_path / "x.json")
+    assert (v.environment, v.host, v.name) == ("production", wb.PRODUCTION_HOST, "webull-production")
+    assert v.account_id == CASH_ID and v.account_class == "INDIVIDUAL_CASH"      # chosen by the confirmation's class
+    import inspect
+    params = set(inspect.signature(wb.WebullVenue.from_live_file).parameters)
+    assert not params & {"environ", "environment", "account_id", "host", "kwargs"}
+
+
+def test_t50_the_live_venue_never_takes_a_key_from_the_environment(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(wb.WebullVenue, "__init__", lambda self, *a, **k: seen.append((a, k)) or None)
+    monkeypatch.setenv("WEBULL_APP_KEY", KEY)
+    monkeypatch.setenv("WEBULL_LIVE_APP_KEY", "ZqFromTheEnvironment123")
+    path = _live_pair_file(tmp_path / "secrets")
+    try:
+        wb.WebullVenue.from_live_file(path, account_class="INDIVIDUAL_CASH", confirmation_file=tmp_path / "x.json")
+    except Exception:
+        pass                                                   # the stand-in builds nothing, so the host check may refuse
+    ((args, kw),) = seen
+    given = (list(args[:2]) if len(args) >= 2 else [kw.get("app_key"), kw.get("app_secret")])
+    right = given == [LIVE_KEY, LIVE_SECRET]
+    assert right
+    assert (args[2] if len(args) > 2 else kw.get("environment")) == "production"
+    assert kw.get("account_id") is None and (len(args) < 4 or args[3] is None)
+
+
+@pytest.mark.parametrize("cls", [None, "", "individual_cash", 7])
+def test_t50_the_live_venue_needs_the_account_class_from_the_confirmation(tmp_path, cls):
+    with pytest.raises(wb.WebullError):
+        wb.WebullVenue.from_live_file(_live_pair_file(tmp_path / "secrets"), account_class=cls, client=FakeClient(),
+                                      confirmation_file=tmp_path / "x.json")
+
+
+def test_t50_a_bad_live_file_builds_nothing_and_shows_no_value(tmp_path, monkeypatch):
+    from valedia_trader.core.secrets import LiveFileError
+    monkeypatch.setattr(wb.WebullVenue, "__init__", lambda *a, **k: pytest.fail("a venue was built"))
+    p = _live_pair_file(tmp_path / "secrets", f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nEXTRA={LIVE_SECRET}\n")
+    with pytest.raises(LiveFileError) as exc:
+        wb.WebullVenue.from_live_file(p, account_class="INDIVIDUAL_CASH")
+    clean = LIVE_KEY not in str(exc.value) and LIVE_SECRET not in str(exc.value)
+    assert clean
+
+
+@pytest.mark.parametrize("word", ["production", " PRODUCTION ", "live", "sandbox2"])
+def test_t50_the_practice_builder_refuses_any_environment_but_the_test_one(tmp_path, monkeypatch, word):
+    monkeypatch.setattr(wb.WebullVenue, "__init__", lambda *a, **k: pytest.fail("a venue was built"))
+    env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, "WEBULL_ENV": word}
+    with pytest.raises(wb.WebullError, match="test environment"):
+        wb.WebullVenue.from_secrets(env, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+
+
+def test_t50_the_practice_builder_refuses_a_host_that_is_not_the_test_one(tmp_path, monkeypatch):
+    monkeypatch.setitem(wb.HOSTS, "sandbox", wb.PRODUCTION_HOST)
+    env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET}
+    with pytest.raises(wb.WebullError, match="test environment"):
+        wb.WebullVenue.from_secrets(env, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+
+
+@pytest.mark.parametrize("name", ["WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET"])
+def test_t50_the_practice_builder_refuses_when_a_live_name_is_in_reach(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(wb.WebullVenue, "__init__", lambda *a, **k: pytest.fail("a venue was built"))
+    env = {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, name: LIVE_SECRET}
+    with pytest.raises(SecretError) as exc:
+        wb.WebullVenue.from_secrets(env, client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    clean = LIVE_SECRET not in str(exc.value)
+    assert clean and name in str(exc.value)
+    f = tmp_path / "trading.env"                                    # in the ordinary secrets file, loaded first
+    f.write_text(f"WEBULL_APP_KEY={KEY}\nWEBULL_APP_SECRET={SECRET}\n{name}={LIVE_SECRET}\n")
+    f.chmod(0o600)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    monkeypatch.setenv(name, "x")
+    monkeypatch.delenv(name)                                        # the undo removes what the load puts there
+    with pytest.raises(SecretError) as exc:
+        wb.WebullVenue.from_secrets(client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    clean = LIVE_SECRET not in str(exc.value)
+    assert clean and name in str(exc.value)
+
+
+def _no_live_file_read(monkeypatch, tmp_path):
+    """The live file present at its place but unreadable, and its reader failing the test if anything calls it."""
+    from valedia_trader.core import secrets
+    p = _live_pair_file(tmp_path / "live-secrets")
+    p.chmod(0o000)
+    monkeypatch.setattr(secrets, "LIVE_ENV_FILE", p)
+    monkeypatch.setattr(secrets, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
+    return p
+
+
+def test_t50_the_practice_builder_never_reads_the_live_file(tmp_path, monkeypatch):
+    _no_live_file_read(monkeypatch, tmp_path)
+    v = wb.WebullVenue.from_secrets({"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET}, client=FakeClient(),
+                                    confirmation_file=tmp_path / "x.json")
+    assert v.environment == "sandbox" and v.host == wb.SANDBOX_HOST
+
+
+@pytest.mark.parametrize("setting", [{"WEBULL_ENV": "production"}, {"WEBULL_LIVE_APP_KEY": LIVE_KEY},
+                                     {"WEBULL_LIVE_APP_SECRET": LIVE_SECRET}])
+def test_t50_the_connection_check_refuses_production_and_a_live_name_in_reach(tmp_path, monkeypatch, capsys, setting):
+    _no_live_file_read(monkeypatch, tmp_path)
+    monkeypatch.setattr(wb.WebullVenue, "__init__", lambda *a, **k: pytest.fail("a venue was built"))
+    for name, value in {"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, "WEBULL_ENV": "sandbox", **setting}.items():
+        monkeypatch.setenv(name, value)
+    assert wb.main(["check"]) == 2
+    printed = capsys.readouterr()
+    clean = all(v not in printed.out + printed.err for v in (KEY, SECRET, LIVE_KEY, LIVE_SECRET))
+    assert clean and printed.err.startswith("refused:") and printed.out == ""
+
+
+def test_t50_the_connection_check_refuses_a_venue_whose_host_is_not_the_test_one(tmp_path, monkeypatch, capsys):
+    venue = wb.WebullVenue(KEY, SECRET, environment="production", client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    monkeypatch.setattr(wb.WebullVenue, "from_secrets", classmethod(lambda cls, environ=None, **kw: venue))
+    monkeypatch.setattr(wb.WebullVenue, "check", lambda self: pytest.fail("the production venue was asked"))
+    assert wb.main(["check"]) == 2
+    assert capsys.readouterr().err.startswith("refused:")
