@@ -618,3 +618,54 @@ def test_trades_alike_in_identity_but_not_elsewhere_are_a_conflict():
     c, t, clock = client(lambda p, q: page([trade(1), trade(1, title="another"), trade(1)]))
     w = c.trades("0xabc")
     assert len(w.rows) == 1 and dict(w.rejects) == {"conflicting_row": 1, "repeated_row": 1}
+
+
+# ------------------------------------------------------------------ addendum 6: a walk page by page
+def _three_pages():
+    return {None: page([trade(1), trade(2), trade(3, outcome_index=7)], True, "c1"),
+            "c1": page([trade(2), trade(4), trade(1, title="another")], True, "c2"),
+            "c2": page([trade(4), trade(5), trade(1)])}
+
+
+def test_a_walk_page_by_page_yields_each_page_alone_and_together_equals_the_whole_walk():
+    pages = _three_pages()
+    whole, _, _ = client(lambda p, q: pages[q.get("cursor")])
+    w = whole.trades("0xabc")
+    c, t, clock = client(lambda p, q: pages[q.get("cursor")])
+    ids = {}                                            # the caller holds the identities (a store, in the pull)
+    got = []
+    for one in c.trade_pages("0xabc", ids=ids):
+        assert one.pages == 1 and len(t.urls) == len(got) + 1        # one page asked at a time, as it is used
+        got.append(one)
+    assert len(got) == 3
+    assert [r for g in got for r in g.rows] == w.rows
+    assert [r for g in got for r in g.raw] == w.raw
+    assert [a for g in got for a in g.row_read_at] == w.row_read_at
+    assert sum((g.rejects for g in got), pd.Counter()) == w.rejects == {"repeated_row": 3, "conflicting_row": 1,
+                                                                       "bad_outcome_index": 1}
+    assert t.queries() == [dict(user="0xabc", start="1", limit="1000", taker_only="false"),
+                           dict(user="0xabc", start="1", taker_only="false", cursor="c1"),
+                           dict(user="0xabc", start="1", taker_only="false", cursor="c2")]
+
+
+def test_price_pages_leave_the_conflicts_to_the_caller():
+    p1 = [{"price": 0.4, "resolution_seconds": 300, "timestamp": 1_700_000_100},
+          {"price": 0.5, "resolution_seconds": 300, "timestamp": 1_700_000_200}]
+    p2 = [{"price": 0.6, "resolution_seconds": 300, "timestamp": 1_700_000_100},
+          {"price": 0.5, "resolution_seconds": 300, "timestamp": 1_700_000_200}]
+    pages = {None: page(p1, True, "c1"), "c1": page(p2)}
+    c, t, clock = client(lambda p, q: pages[q.get("cursor")])
+    ids, conflicted = {}, set()
+    got = list(c.price_pages("111", 1_700_000_050, 1_700_000_300, ids=ids, conflicted=conflicted))
+    assert [len(g.rows) for g in got] == [2, 0]
+    assert conflicted == {("111", 1_700_000_100, 300)}
+    assert [why for g in got for _, why in g.raw] == [None, None, "conflicting_row", "repeated_row"]
+
+
+def test_page_by_page_the_cap_raises_after_that_many_pages_and_says_how_many():
+    c, t, clock = client(lambda p, q: page([trade(int(q.get("cursor", "0")))], True, str(int(q.get("cursor", "0")) + 1)))
+    got = []
+    with pytest.raises(pd.PageCapHit) as e:
+        for one in c.trade_pages("0xabc", page_cap=4, ids={}):
+            got.append(one)
+    assert len(got) == 4 and e.value.pages == 4 and len(t.urls) == 4

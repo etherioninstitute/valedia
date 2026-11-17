@@ -1372,3 +1372,499 @@ def test_the_docstring_states_what_development_reads_and_the_copied_store_limit_
     assert "can be run again whenever the original's sealed run used an output folder other than the default" in doc
     assert "in the same repository too" in doc
     assert "the default folder's marker protects only" in doc
+
+
+# ------------------------------------------------------------------ addendum 6: the pull holds one page at a time
+SMALL_MONTHS = [(2026, m) for m in range(3, 11)]
+FIXED = "2026-11-17T12:00:00+00:00"
+WALL = MS(2027, 1)                                     # the stand-in clients' start: every world time is in span
+SCHEMA_SHA_27CDE89 = "3f029b1870438af6b52ddb944584293567e0101b141641158f9abb582fa2f644"
+
+
+def _iso(ts):
+    import time as _t
+    return _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(ts))
+
+
+class PagedWorld:
+    """A stand-in service serving a World page by page: each wallet's trades newest first, `size` rows a page with a
+    cursor, and (seeded) rows repeated, in conflict or of the wrong shape on a later page than their first; the
+    resolutions; each price window two points a page, with a repeat and a conflict across pages. The same answer to
+    the same address, every time. `kill` = (wallet, page): the process ends there at once (os._exit), as a kill.
+    `fail` = (wallet, page): a 400 there. `log`: a file each address asked is appended to. No request leaves."""
+
+    def __init__(self, world, seed, size=None, kill=None, fail=None, log=None, clock=None, step=0.0):
+        self.w, self.seed = world, seed
+        rng = random.Random(seed)
+        self.size = size or rng.randrange(3, 10)
+        self.kill, self.fail, self.log, self.clock, self.step = kill, fail, log, clock, step
+        self.urls = []
+        self.feeds = {}
+        for wallet, rows in sorted(world.trades.items()):
+            feed = [dict(r) for r in sorted(rows, key=lambda r: (-r["timestamp"], r["transaction_hash"]))]
+            for _ in range(rng.randrange(0, 4)):
+                i = rng.randrange(len(feed))
+                j = min(len(feed), i + self.size + rng.randrange(0, 2 * self.size))
+                kind = rng.choice(["repeat", "conflict", "bad"])
+                extra = {"repeat": {}, "conflict": {"title": "another"}, "bad": {"outcome_index": 7}}[kind]
+                feed.insert(j, dict(feed[i], **extra))
+            self.feeds[wallet] = feed
+
+    def __call__(self, url):
+        self.urls.append(url)
+        if self.log:
+            with open(self.log, "a") as f:
+                f.write(url + "\n")
+        if self.clock is not None:
+            self.clock.t += self.step
+        parts = urllib.parse.urlsplit(url)
+        q = dict(urllib.parse.parse_qsl(parts.query))
+        p = parts.path
+
+        def pg(rows, off, n):
+            more = off + self.size < n
+            return json.dumps({"data": rows, "pagination": {"limit": 1000, "offset": off, "has_more": more,
+                                                            "next_cursor": str(off + self.size) if more else None}})
+        if p == "/v2/leaderboard":
+            users = sorted(self.feeds) if q["time_period"] == "all" else []
+            return json.dumps({"data": [{"rank": i + 1, "user_id": u, "pnl": 1.0, "volume": 1.0}
+                                        for i, u in enumerate(users)],
+                               "pagination": {"has_more": False, "next_cursor": None}}).encode()
+        if p == "/v2/trades":
+            off = int(q.get("cursor", "0"))
+            here = (q["user"], off // self.size + 1)
+            if self.kill == here:
+                os._exit(9)
+            if self.fail == here:
+                raise pd.HttpError(400, url)
+            feed = self.feeds[q["user"]]
+            return pg(feed[off:off + self.size], off, len(feed)).encode()
+        if p == "/v2/resolutions":
+            rows = []
+            for c in q["condition"].split(","):
+                r = self.w.res[c]
+                rows.append({"condition_id": c, "status": r["status"], "payouts": r["payouts"],
+                             "resolved_at": _iso(r["resolved_ts"]) if r["resolved_ts"] else None})
+            return json.dumps({"data": rows}).encode()
+        if p == "/v2/prices-history":
+            start, end = int(q["start"]), int(q["end"])
+            pts = self.w.history(q["token_id"], start, end)
+            rng = random.Random("%s:%s:%s" % (self.seed, q["token_id"], start))
+            if pts and rng.random() < 0.3:
+                pts.append(dict(pts[0]))                              # a repeat on a later page
+            if pts and rng.random() < 0.2:
+                pts.append(dict(pts[1], price=0.07))                  # a conflict on a later page
+            off = int(q.get("cursor", "0"))
+            return pg(pts[off:off + self.size], off, len(pts)).encode()
+        raise AssertionError(url)
+
+
+def _paged_client(svc, now=None):
+    clock = [0.0]
+    if now is None:
+        n = [0]
+
+        def now():
+            n[0] += 1
+            return "2026-11-17T10:%02d:%02d+00:00" % divmod(n[0] % 3600, 60)
+    return pd.PolymarketData(svc, sleep=lambda s: clock.__setitem__(0, clock[0] + s), clock=lambda: clock[0],
+                             now=now, wall=lambda: WALL)
+
+
+def _old_pull(store, client, phase, leave_out=()):
+    """The pull as it was at 27cde89, each walk held whole and written at its end: the reference."""
+    with cl.Store(store, make_id=True) as s:
+        if phase == 1:
+            if not s.board_read_at():
+                s.put_boards({"all": client.leaderboard("all"), "month": client.leaderboard("month")})
+                s.commit()
+            for w in s.unfinished("trades"):
+                s.start_walk("trades", w)
+                s.commit()
+                s.finish_trades(w, client.trades(w))
+                s.commit()
+            conds = sorted(s.traded_conditions() - set(s.resolution_answers()))
+            for c in conds:
+                s.start_walk("resolutions", c)
+            s.commit()
+            for i in range(0, len(conds), pd.MAX_CONDITIONS):
+                for batch, w, answers in client.resolution_batches(conds[i:i + pd.MAX_CONDITIONS]):
+                    s.finish_resolutions(batch, w, answers)
+                s.commit()
+        else:
+            cl.plan_store(s, leave_out)
+            s.commit()
+
+            def read(windows):
+                done = s.finished_keys("prices")
+                for k in sorted(windows):
+                    if k in done:
+                        continue
+                    wd = windows[k]
+                    s.start_walk("prices", k)
+                    s.commit()
+                    s.finish_prices(k, client.prices_history(wd.token, wd.start, wd.start + cl.PRICE_SPAN))
+                    s.commit()
+            read(s.plan_windows())
+            read(cl.add_ten_minute_windows(s))
+            s.commit()
+        s.set_meta("last_pull_phase_%d_ended_at" % phase, cl._now())
+
+
+def _tables(path):
+    """Every table's rows, sorted (a table without a key has no order); meta without the store's own id and the
+    pace the new pull records."""
+    db = sqlite3.connect(str(path))
+    out = {}
+    for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+        rows = db.execute("SELECT * FROM %s" % name).fetchall()
+        if name == "meta":
+            rows = [r for r in rows if r[0] not in ("store_id", "pull_pace")]
+        out[name] = sorted(rows, key=repr)
+    db.close()
+    return out
+
+
+def _small_world(seed):
+    return World(seed, edge=0.05, move=0.0, pros=5, per_month=11, months=SMALL_MONTHS)
+
+
+def test_a_store_pulled_page_by_page_equals_one_pulled_whole_on_30_seeded_worlds(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(30):
+        w = _small_world(seed)
+        old, new = tmp_path / ("old%02d.sqlite" % seed), tmp_path / ("new%02d.sqlite" % seed)
+        oc, nc = _paged_client(PagedWorld(w, seed)), _paged_client(PagedWorld(w, seed))
+        _old_pull(old, oc, 1)
+        cl.pull(new, nc, phase=1, say=lambda m: None)
+        _old_pull(old, oc, 2)
+        cl.pull(new, nc, phase=2, say=lambda m: None)
+        a, b = _tables(old), _tables(new)
+        assert a.keys() == b.keys()
+        for name in a:
+            assert a[name] == b[name], (seed, name, len(a[name]), len(b[name]))
+        cl.check_own_shape(new)
+        for kind, _, reason, _, _ in b["rejects"]:
+            seen[(kind, reason)] += 1
+        seen["price_points"] += len(b["price_points"])
+        seen["trades"] += len(b["trades"])
+        old.unlink()
+        new.unlink()
+    for k in (("trades", "repeated_row"), ("trades", "conflicting_row"), ("trades", "bad_outcome_index"),
+              ("prices", "repeated_row"), ("prices", "conflicting_row"), "price_points", "trades"):
+        assert seen[k] > 0, (k, seen)
+
+
+KILL_CHILD = r"""
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import test_copy_leaders as T
+from valedia_trader.research_loop import copy_leaders as cl
+cl._now = lambda: T.FIXED
+store, log, wallet, page, seed = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6])
+w = T._small_world(seed)
+svc = T.PagedWorld(w, seed, size=20, kill=(wallet, page), log=log)
+cl.pull(store, T._paged_client(svc, now=lambda: T.FIXED), phase=1, say=lambda m: None)
+print("ENDED WITHOUT A KILL")
+"""
+
+
+def _run_child(script, *args, timeout=600):
+    root = str(Path(cl.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root, PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run([sys.executable, "-B", str(script)] + [str(a) for a in args], env=env, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def test_a_kill_at_every_page_leaves_no_row_of_the_walk_and_a_rerun_restarts_it_from_its_first_page(tmp_path,
+                                                                                                    monkeypatch):
+    seed, target = 3, "pro01"
+    w = _small_world(seed)
+    pages = -(-len(PagedWorld(w, seed, size=20).feeds[target]) // 20)
+    assert pages >= 4
+    script = tmp_path / "child.py"
+    script.write_text(KILL_CHILD)
+    tests_dir = Path(__file__).resolve().parent
+    store = tmp_path / "s.sqlite"
+    order = sorted(w.trades)
+    nxt = order[order.index(target) + 1]
+    for k in range(1, pages + 2):
+        log = tmp_path / ("urls%02d.log" % k)
+        who, at = (target, k) if k <= pages else (nxt, 1)  # the last: the first page of the next wallet
+        r = _run_child(script, tests_dir, store, log, who, at, seed)
+        assert r.returncode == -9 or r.returncode == 9, (k, r.returncode, r.stdout[-300:], r.stderr[-800:])
+        cl.check_own_shape(store)
+        db = sqlite3.connect(str(store))
+        status = db.execute("SELECT status FROM walks WHERE kind='trades' AND key=?", (target,)).fetchone()
+        rows = db.execute("SELECT COUNT(*) FROM trades WHERE wallet=?", (target,)).fetchone()[0]
+        rej = db.execute("SELECT COUNT(*) FROM rejects WHERE kind='trades' AND key=?", (target,)).fetchone()[0]
+        before = [x for (x,) in db.execute("SELECT key FROM walks WHERE kind='trades' AND status='finished'")]
+        db.close()
+        urls = log.read_text().splitlines()
+        mine = [u for u in urls if "user=%s" % target in u]
+        if k <= pages:
+            assert status == ("started",) and rows == 0 and rej == 0, (k, status, rows, rej)
+            assert len(mine) == k and "cursor" not in mine[0]               # from its first page
+            assert sorted(before) == order[:order.index(target)]
+        else:
+            assert status == ("finished",) and rows > 0
+        if k > 1:                                       # a re-run repeats no finished request
+            assert not [u for u in urls if "leaderboard" in u]
+            assert not [u for u in urls if any("user=%s&" % f in u for f in order[:order.index(target)])]
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    cl.pull(store, _paged_client(PagedWorld(w, seed, size=20), now=lambda: FIXED), phase=1, say=lambda m: None)
+    ref = tmp_path / "ref.sqlite"
+    _old_pull(ref, _paged_client(PagedWorld(w, seed, size=20), now=lambda: FIXED), 1)
+    a, b = _tables(ref), _tables(store)
+    for name in a:
+        assert a[name] == b[name], name
+
+
+MEM_CHILD = r"""
+import json, resource, sys
+from valedia_trader.research_loop import copy_leaders as cl
+from valedia_trader.venues import polymarket_data as pd
+store, pages, per = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+T0 = 1_780_000_000
+def body(off):
+    rows = [{"proxy_wallet": "0xbig", "side": "BUY", "token_id": "t%d" % (i % 50), "condition_id": "c%d" % (i % 50),
+             "size": 10.0, "price": 0.5, "timestamp": T0 - i, "event_slug": "e", "outcome_index": 0,
+             "transaction_hash": "0x%x" % i, "title": "a title of some length", "slug": "s"} for i in range(off, off + per)]
+    more = off + per < pages * per
+    return {"data": rows, "pagination": {"has_more": more, "next_cursor": str(off + per) if more else None}}
+def fetch(url):
+    import urllib.parse
+    p = urllib.parse.urlsplit(url)
+    q = dict(urllib.parse.parse_qsl(p.query))
+    if p.path == "/v2/leaderboard":
+        users = ["0xbig"] if q["time_period"] == "all" else []
+        return json.dumps({"data": [{"rank": 1, "user_id": u, "pnl": 1.0, "volume": 1.0} for u in users],
+                           "pagination": {"has_more": False, "next_cursor": None}}).encode()
+    if p.path == "/v2/trades":
+        return json.dumps(body(int(q.get("cursor", "0")))).encode()
+    if p.path == "/v2/resolutions":
+        return json.dumps({"data": []}).encode()
+    raise AssertionError(url)
+client = pd.PolymarketData(fetch, sleep=lambda s: None, clock=lambda: 0.0)
+start = cl.rss_mb()
+seen = [start]
+def mem():
+    m = cl.rss_mb()
+    seen.append(m)
+    return m
+cl.pull(store, client, phase=1, say=lambda m: None, memory=mem)
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 20 if sys.platform == "darwin" else 2 ** 10)
+print(json.dumps({"start": start, "max_sampled": max(seen), "peak": peak, "samples": len(seen)}))
+"""
+
+
+def test_a_3000_page_wallet_is_pulled_with_its_peak_memory_growth_under_200_mb(tmp_path):
+    script = tmp_path / "mem.py"
+    script.write_text(MEM_CHILD)
+    store = tmp_path / "big.sqlite"
+    r = _run_child(script, store, 3000, 100, timeout=1800)
+    assert r.returncode == 0, r.stderr[-2000:]
+    m = json.loads(r.stdout.strip().splitlines()[-1])
+    assert m["samples"] >= 3000                       # read after every page
+    assert m["max_sampled"] - m["start"] < 200, m
+    assert m["peak"] - m["start"] < 200, m
+    db = sqlite3.connect(str(store))
+    assert db.execute("SELECT status, pages, rows FROM walks WHERE kind='trades'").fetchone() == ("finished", 3000,
+                                                                                                    300_000)
+    assert db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 300_000
+    db.close()
+    store.unlink()
+
+
+def test_the_stored_shape_is_unchanged():
+    import hashlib
+    assert hashlib.sha256(cl.SCHEMA.encode()).hexdigest() == SCHEMA_SHA_27CDE89
+
+
+def _limit_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(11)
+    store = tmp_path / "s.sqlite"
+    said = []
+    out = cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=1, say=said.append, page_cap=10)
+    return w, store, said, out
+
+
+def test_a_wallet_at_the_page_limit_ends_with_its_own_status_and_the_pull_goes_on(tmp_path, monkeypatch):
+    w, store, said, out = _limit_world(tmp_path, monkeypatch)
+    db = sqlite3.connect(str(store))
+    st = dict(((k, (s, p)) for k, s, p in db.execute("SELECT key, status, pages FROM walks WHERE kind='trades'")))
+    rows = dict(db.execute("SELECT wallet, COUNT(*) FROM trades GROUP BY wallet"))
+    rej = dict(db.execute("SELECT key, COUNT(*) FROM rejects WHERE kind='trades' GROUP BY key"))
+    db.close()
+    assert st["mm0"] == ("page_limit", 10) and st["mm1"] == ("page_limit", 10)
+    assert all(st[p] == ("finished", 2) for p in ("pro00", "pro01", "pro02", "pro03", "pro04")), st
+    assert "mm0" not in rows and "mm1" not in rows and "mm0" not in rej and "mm1" not in rej
+    assert out["page_limit"] == ["mm0", "mm1"]
+    summary = [m for m in said if "page limit" in m and m.startswith("phase 1 ended")]
+    assert summary and "mm0 (10 pages)" in summary[-1] and "mm1 (10 pages)" in summary[-1]
+    svc = PagedWorld(w, 11, size=50)
+    cl.pull(store, _paged_client(svc), phase=1, say=lambda m: None, page_cap=10)
+    assert svc.urls == []                             # finished and page-limit walks are not read again
+    with pytest.raises(cl.Refused, match=r"--leave-out mm0 mm1"):
+        cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=2, say=lambda m: None)
+    plan = cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=2, leave_out=["mm0", "mm1"],
+                   say=lambda m: None)
+    with cl.Store(store) as s:
+        assert s.plan() and not [tg for tg in s.plan().values() if {"mm0", "mm1"} & set(tg.wallets)]
+        assert s.meta("plan")["leave_out"] == ["mm0", "mm1"]
+
+
+def test_develop_and_sealed_refuse_with_the_exact_leave_out_list_and_with_it_name_the_wallets(tmp_path, monkeypatch):
+    w, store, said, out = _limit_world(tmp_path, monkeypatch)
+    cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=2, leave_out=["mm0", "mm1"], say=lambda m: None)
+    for lo in ([], ["mm1"]):
+        with pytest.raises(cl.Refused) as e:
+            cl.run_develop(store=store, out_dir=tmp_path / "o", leave_out=lo)
+        assert "--leave-out mm0 mm1" in str(e.value) and "page limit" in str(e.value), str(e.value)
+    doc = cl.run_develop(store=store, out_dir=tmp_path / "o", leave_out=["mm0", "mm1"])
+    assert doc["result"]["wallets_left_out"] == ["mm0", "mm1"]
+    assert doc["result"]["unfinished_left_out"] == ["mm0", "mm1"]
+    assert "mm0" in cl.format_table(doc)
+    for lo in ([], ["mm1"]):                          # the development file exists: the bookkeeping refuses
+        with pytest.raises(cl.Refused) as e:
+            cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True, leave_out=lo)
+        assert "--leave-out mm0 mm1" in str(e.value) and "page limit" in str(e.value), str(e.value)
+    assert cl.store_sealed_marker(store) is None
+
+
+def test_an_error_mid_walk_leaves_no_row_of_it_and_the_next_wallet_is_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(5)
+    store = tmp_path / "s.sqlite"
+    with pytest.raises(cl.PullIncomplete, match="pro01"):
+        cl.pull(store, _paged_client(PagedWorld(w, 5, size=20, fail=("pro01", 3))), phase=1, say=lambda m: None)
+    db = sqlite3.connect(str(store))
+    assert db.execute("SELECT status FROM walks WHERE kind='trades' AND key='pro01'").fetchone() == ("started",)
+    assert db.execute("SELECT COUNT(*) FROM trades WHERE wallet='pro01'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM rejects WHERE kind='trades' AND key='pro01'").fetchone()[0] == 0
+    assert db.execute("SELECT status FROM walks WHERE kind='trades' AND key='pro02'").fetchone() == ("finished",)
+    db.close()
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_the_pull_stops_cleanly_above_its_memory_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(5)
+    store = tmp_path / "s.sqlite"
+    svc = PagedWorld(w, 5, size=20)
+
+    def memory():                                     # 2,000 MB once pro01's third page is in
+        return 2000.0 if sum("user=pro01" in u for u in svc.urls) >= 3 else 100.0
+    said = []
+    with pytest.raises(cl.PullStopped, match="1500"):
+        cl.pull(store, _paged_client(svc), phase=1, say=said.append, memory=memory)
+    db = sqlite3.connect(str(store))
+    st = dict(db.execute("SELECT key, status FROM walks WHERE kind='trades'"))
+    assert st["pro01"] == "started" and st["pro00"] == "finished" and "pro02" not in st
+    assert db.execute("SELECT COUNT(*) FROM trades WHERE wallet='pro01'").fetchone()[0] == 0
+    db.close()
+    assert sum("user=pro01" in u for u in svc.urls) == 3            # it stopped after the page that crossed
+    assert any("stopped" in m and "2000" in m and "1500" in m for m in said), said
+    assert any(m.startswith("phase 1 ended") and "pro01" in m for m in said), said
+    cl.check_own_shape(store)
+
+
+def test_the_command_line_takes_a_memory_limit_and_a_stop_is_a_non_zero_exit(monkeypatch, capsys):
+    got = {}
+
+    def fake_pull(store, client, phase=1, leave_out=(), say=None, **kw):
+        got.update(kw, phase=phase)
+        if kw.get("max_memory_mb") == 800:
+            raise cl.PullStopped("stopped: memory 900 MB above the limit of 800 MB")
+        return {"requests": 0}
+    monkeypatch.setattr(cl, "pull", fake_pull)
+    monkeypatch.setattr(cl.pd, "PolymarketData", lambda *a, **k: None)
+    assert cl.main(["pull", "--phase", "1", "--store", "x.sqlite"]) == 0 and got["max_memory_mb"] == 1500
+    assert cl.main(["pull", "--phase", "1", "--store", "x.sqlite", "--max-memory-mb", "800"]) == 4
+    assert "STOPPED" in capsys.readouterr().err
+
+
+def test_rss_mb_reads_the_process_resident_memory_now():
+    a = cl.rss_mb()
+    block = bytearray(150 * 2 ** 20)
+    for i in range(0, len(block), 4096):
+        block[i] = 1
+    b = cl.rss_mb()
+    del block
+    assert 100 < b - a < 400, (a, b)
+
+
+LOG_CHILD = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import test_copy_leaders as T
+from valedia_trader.research_loop import copy_leaders as cl
+from valedia_trader.venues import polymarket_data as pd
+log, seen = sys.argv[2], sys.argv[3]
+w = T._small_world(2)
+w.trades["pro00"] = w.trades["pro00"] * 1 + [dict(r, transaction_hash="0xr%d" % i) for i, r in
+                                              enumerate(w.trades["pro00"] * 3)]
+svc = T.PagedWorld(w, 2, size=1)
+inner = svc.__call__
+def watch(url):
+    if "user=pro00" in url and "cursor=205&" in url + "&":
+        with open(log) as f, open(seen, "w") as g:
+            g.write(f.read())
+    return inner(url)
+cl.pull(sys.argv[4], T._paged_client(watch), phase=1)
+"""
+
+
+def test_every_line_is_flushed_at_once_and_says_where_the_pull_is(tmp_path):
+    script = tmp_path / "log.py"
+    script.write_text(LOG_CHILD)
+    log, seen, store = tmp_path / "pull.log", tmp_path / "seen.log", tmp_path / "s.sqlite"
+    root = str(Path(cl.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root, PYTHONDONTWRITEBYTECODE="1")
+    with open(log, "w") as out:
+        r = subprocess.run([sys.executable, "-B", str(script), str(Path(__file__).resolve().parent), str(log),
+                            str(seen), str(store)], env=env, stdout=out, stderr=subprocess.PIPE, text=True,
+                           timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    mid = seen.read_text()                            # what the log file held while pro00's 206th page was asked
+    assert "phase 1: 7 candidate wallets" in mid and "not known in advance" in mid
+    assert "trades mm0 finished:" in mid
+    running = [l for l in mid.splitlines() if l.startswith("trades pro00: ")]
+    assert [l.split(":")[1].split(" pages")[0].strip() for l in running] == ["100", "200"]
+    assert all("rows" in l and " s," in l and "MB" in l for l in running), running
+    text = log.read_text()
+    done = [l for l in text.splitlines() if l.startswith("trades pro00 finished:")]
+    assert len(done) == 1 and "pages" in done[0] and "rows" in done[0] and "rejects" in done[0] and " s" in done[0]
+    end = [l for l in text.splitlines() if l.startswith("phase 1 ended")]
+    assert end and "7 of 7 wallets finished" in end[-1] and "unfinished: none" in end[-1]
+
+
+def test_the_phase_2_estimate_uses_the_pace_measured_in_phase_1(tmp_path, monkeypatch):
+    import math
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(4)
+    store = tmp_path / "s.sqlite"
+    clock = _Clock()
+    svc = PagedWorld(w, 4, size=20, clock=clock, step=1.5)            # every request takes 1.5 s
+    cl.pull(store, _paged_client(svc), phase=1, say=lambda m: None, clock=clock)
+    with cl.Store(store) as s:
+        pace = s.meta("pull_pace")
+    assert pace["requests"] == len(svc.urls) and pace["seconds"] == 1.5 * len(svc.urls)
+    said = []
+    cl.pull(store, _paged_client(PagedWorld(w, 4, size=20)), phase=2, say=said.append, clock=_Clock())
+    line = [m for m in said if m.startswith("phase 2:") and "price windows" in m][0]
+    with cl.Store(store) as s:
+        n = len([k for k, wd in s.plan_windows().items() if not wd.horizon.startswith("delay_10")])
+    assert "%d price windows" % n in line and "1.50 seconds a request" in line, line
+    assert "at least %s" % cl._seconds(math.ceil(1.5 * n)) in line, line
+    assert "three a second" not in " ".join(said)
