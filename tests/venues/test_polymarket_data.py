@@ -1,12 +1,26 @@
 """The Polymarket public data reader: GET only, paced, retried, cursor walks that never return a silent partial list,
 and every row validated (a wrong-shaped row is a counted reject). All answers here are synthetic: no request leaves."""
+import email.message
+import io
 import json
 import math
+import socket
 import urllib.parse
+import urllib.request
+import urllib.response
 
 import pytest
 
 from valedia_trader.venues import polymarket_data as pd
+
+
+@pytest.fixture(autouse=True)
+def no_socket_may_connect(monkeypatch):
+    """A second lock beside the fakes: any socket connection in these tests fails at once."""
+    def refuse(*a, **k):
+        raise AssertionError("a test tried to open a network connection")
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
 
 
 class FakeClock:
@@ -71,34 +85,70 @@ def test_constants_and_generic_client_name():
     assert pd.USER_AGENT == "market-data-reader/1.0"
 
 
+class FakeHTTPS(urllib.request.HTTPSHandler):
+    """A stand-in for the network inside urllib's own opener: answers (status, headers, body) and records requests."""
+
+    def __init__(self, status=200, headers=None, body=b'{"data": []}'):
+        super().__init__()
+        self.status, self.headers, self.body = status, headers or {}, body
+        self.requests = []
+
+    def https_open(self, req):
+        self.requests.append((req.get_method(), req.get_header("User-agent"), req.full_url, req.data))
+        h = email.message.Message()
+        for k, v in self.headers.items():
+            h[k] = v
+        resp = urllib.response.addinfourl(io.BytesIO(self.body), h, req.full_url, self.status)
+        resp.msg = "fake"
+        return resp
+
+
+def fake_network(monkeypatch, **kw):
+    fake = FakeHTTPS(**kw)
+    monkeypatch.setattr(pd, "_HANDLERS", (urllib.request.ProxyHandler({}), fake))
+    return fake
+
+
 def test_default_transport_sends_only_a_get_with_the_generic_name(monkeypatch):
-    seen = {}
-
-    class Resp:
-        headers = {"Date": "Tue, 17 Nov 2026 10:00:00 GMT"}
-        def read(self): return b'{"data": []}'
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-
-    def fake_urlopen(req, timeout):
-        seen["method"], seen["ua"], seen["url"], seen["data"] = (req.get_method(), req.get_header("User-agent"),
-                                                                req.full_url, req.data)
-        return Resp()
-
-    monkeypatch.setattr(pd.urllib.request, "urlopen", fake_urlopen)
+    fake = fake_network(monkeypatch, headers={"Date": "Tue, 17 Nov 2026 10:00:00 GMT"})
     body, date = pd.urllib_get(pd.BASE_URL + "/v2/resolutions?condition=0x1")
     assert body == b'{"data": []}' and date.startswith("Tue")
-    assert seen == {"method": "GET", "ua": "market-data-reader/1.0", "url": pd.BASE_URL + "/v2/resolutions?condition=0x1",
-                    "data": None}
+    assert fake.requests == [("GET", "market-data-reader/1.0", pd.BASE_URL + "/v2/resolutions?condition=0x1", None)]
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+@pytest.mark.parametrize("where", ["https://example.com/v2/trades", pd.BASE_URL + "/v2/trades?user=0xother"])
+def test_a_redirect_is_never_followed_one_request_and_an_error(monkeypatch, status, where):
+    fake = fake_network(monkeypatch, status=status, headers={"Location": where})
+    with pytest.raises(pd.HttpError, match=str(status)) as e:
+        pd.urllib_get(pd.BASE_URL + "/v2/trades?user=0xabc")
+    assert e.value.status == status and len(fake.requests) == 1
+    c = pd.PolymarketData(pd.urllib_get, sleep=lambda s: None)
+    fake.requests.clear()
+    with pytest.raises(pd.HttpError):
+        c.get_json("/v2/trades", {"user": "0xabc"})
+    assert len(fake.requests) == 1                     # not retried
+
+
+def test_any_other_non_200_answer_is_an_error(monkeypatch):
+    fake_network(monkeypatch, status=204, body=b"")
+    with pytest.raises(pd.HttpError, match="204"):
+        pd.urllib_get(pd.BASE_URL + "/v2/trades?user=0xabc")
 
 
 @pytest.mark.parametrize("url", ["https://example.com/v2/trades", "http://data-api.polymarket.com/v2/trades",
                                  "https://data-api.polymarket.com.evil.io/v2/trades",
-                                 "https://data-api.polymarket.com/v1/trades"])
+                                 "https://data-api.polymarket.com/v1/trades",
+                                 "https://data-api.polymarket.com/v2/../v1/x",
+                                 "https://data-api.polymarket.com/v2/%2e%2e/v1/x",
+                                 "https://data-api.polymarket.com//v2/trades",
+                                 "https://user@data-api.polymarket.com/v2/trades",
+                                 "https://data-api.polymarket.com:8443/v2/trades"])
 def test_default_transport_refuses_any_other_address(monkeypatch, url):
-    monkeypatch.setattr(pd.urllib.request, "urlopen", lambda *a, **k: pytest.fail("no request may leave"))
+    fake = fake_network(monkeypatch)
     with pytest.raises(pd.PolymarketDataError):
         pd.urllib_get(url)
+    assert fake.requests == []
 
 
 def test_client_has_no_base_url_knob_and_no_send_verbs():
@@ -146,6 +196,31 @@ def test_retry_after_is_honoured_and_a_success_after_a_retry_is_returned():
     c, t, clock = client(h)
     assert c.get_json("/v2/resolutions", {"condition": "0x1"}) == {"data": []}
     assert 7.0 in clock.sleeps
+
+
+def test_a_timeout_or_reset_is_retried_with_the_same_waits_then_a_clear_error():
+    calls = []
+
+    def h(p, q):
+        calls.append(1)
+        return [TimeoutError("timed out"), ConnectionResetError("reset"), OSError("dropped")][len(calls) % 3]
+
+    c, t, clock = client(h)
+    with pytest.raises(pd.PolymarketDataError, match="5 tries"):
+        c.get_json("/v2/resolutions", {"condition": "0x1"})
+    assert len(calls) == 5
+    assert [s for s in clock.sleeps if s >= 1.0] == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_a_success_after_a_timeout_is_returned():
+    calls = []
+
+    def h(p, q):
+        calls.append(1)
+        return TimeoutError("timed out") if len(calls) < 3 else {"data": []}
+
+    c, t, clock = client(h)
+    assert c.get_json("/v2/resolutions", {"condition": "0x1"}) == {"data": []} and len(calls) == 3
 
 
 def test_a_400_or_404_is_not_retried():
@@ -393,3 +468,62 @@ def test_validate_number_helper_fails_closed():
     for v in (True, False, None, "1", float("nan"), float("inf"), -float("inf"), [1]):
         assert pd.is_number(v) is False
     assert pd.is_number(0) and pd.is_number(0.5) and not math.isnan(0.5)
+
+
+# ------------------------------------------------------------------ one identity per row
+def test_a_trade_repeated_across_pages_is_kept_once_and_counted():
+    pages = {None: page([trade(1), trade(2)], True, "c1"),
+             "c1": page([trade(2), trade(3), trade(3, size=11.0)])}
+    c, t, clock = client(lambda p, q: pages[q.get("cursor")])
+    w = c.trades("0xabc")
+    assert [(r["timestamp"], r["size"]) for r in w.rows] == [(1_700_000_001, 10.0), (1_700_000_002, 10.0),
+                                                          (1_700_000_003, 10.0), (1_700_000_003, 11.0)]
+    assert dict(w.rejects) == {"repeated_row": 1}
+    assert [why for _, why in w.raw].count("repeated_row") == 1
+
+
+def test_a_trade_identity_is_wallet_hash_token_condition_side_size_price_time_and_outcome():
+    assert pd.trade_identity(pd.validate_trade(trade(1))[0]) == (
+        "0xabc", "0xt1", "111", "0xc1", "BUY", 10.0, 0.42, 1_700_000_001, 0)
+
+
+def test_a_price_point_repeated_is_kept_once_and_counted():
+    pts = [{"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
+           {"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
+           {"price": 0.41, "resolution_seconds": 0, "timestamp": 100}]
+    c, t, clock = client(lambda p, q: page(pts))
+    w = c.prices_history("111", 50, 200)
+    assert len(w.rows) == 2 and dict(w.rejects) == {"repeated_row": 1}
+
+
+def test_an_identical_resolution_row_twice_is_one_row_but_two_different_rows_are_not_trusted():
+    r1 = {"condition_id": "0x1", "status": "resolved", "payouts": [1_000_000, 0], "resolved_at": "2026-02-01T00:00:00Z"}
+    r2 = dict(r1, condition_id="0x2")
+    r2b = dict(r2, payouts=[0, 1_000_000])
+    c, t, clock = client(lambda p, q: {"data": [r1, r1, r2, r2b]})
+    (batch, w, answers), = list(c.resolution_batches(["0x1", "0x2"]))
+    assert answers == {"0x1": "row", "0x2": "duplicate"}
+    assert dict(w.rejects) == {"repeated_row": 1}
+
+
+# ------------------------------------------------------------------ times are whole seconds in a plausible span
+@pytest.mark.parametrize("ts,why", [(1_700_000_000_000, "timestamp_out_of_span"), (1_500_000_000, "timestamp_out_of_span"),
+                                    (1_577_836_799, "timestamp_out_of_span"), (1_577_836_800, None),
+                                    (1.7e9, "bad_timestamp")])
+def test_a_trade_time_must_be_whole_seconds_from_2020_to_a_day_after_the_pull_started(ts, why):
+    assert pd.validate_trade(trade(0, timestamp=ts))[1] == why
+
+
+def test_the_span_ends_one_day_after_the_clients_start():
+    now = 1_790_000_000
+    c, t, clock = client(lambda p, q: page([trade(0, timestamp=now + 86400), trade(1, timestamp=now + 86401)]),
+                         wall=lambda: now)
+    w = c.trades("0xabc")
+    assert [r["timestamp"] for r in w.rows] == [now + 86400] and dict(w.rejects) == {"timestamp_out_of_span": 1}
+
+
+def test_a_price_point_or_resolution_time_outside_the_span_is_a_counted_reject():
+    assert pd.validate_price_point({"price": 0.4, "resolution_seconds": 0, "timestamp": 1_700_000_000_000})[1] == \
+        "timestamp_out_of_span"
+    assert pd.validate_resolution({"condition_id": "0x1", "status": "resolved", "payouts": [1_000_000, 0],
+                                   "resolved_at": "2019-06-01T00:00:00Z"})[1] == "resolved_at_out_of_span"

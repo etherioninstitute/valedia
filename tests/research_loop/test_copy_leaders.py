@@ -5,10 +5,12 @@ Specification: docs/research/2026-11-17-copying-leaders-prediction.md (10ad062, 
 token's public price history at or after the hour, asked for over twelve hours, at a grain of three hours or finer)."""
 import json
 import random
+import socket
 import urllib.parse
 from collections import Counter
 from decimal import Decimal
 
+import numpy as np
 import pytest
 
 from valedia_trader.research_loop import copy_leaders as cl
@@ -17,6 +19,15 @@ from valedia_trader.venues import polymarket_data as pd
 DAY = 86400
 HOUR = 3600
 MS = cl.month_start
+
+
+@pytest.fixture(autouse=True)
+def no_socket_may_connect(monkeypatch):
+    """A second lock beside the fakes: any socket connection in these tests fails at once."""
+    def refuse(*a, **k):
+        raise AssertionError("a test tried to open a network connection")
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
 
 
 # ------------------------------------------------------------------ small builders
@@ -107,6 +118,10 @@ def test_the_24_hour_purchase_sum_boundaries():
           T("w", t0 + 2 * HOUR, "a", side="SELL", price=0.9, size=10.0, seq=3)]
     pos = cl.new_positions(tr)
     assert len(pos) == 1 and pos[0].cash24_micro == 999_990_000          # 500.00 + 499.99 = 999.99
+    assert cl.position_skip(pos[0], {pos[0].condition: R(pos[0].condition, 0, t0 + 2 * DAY)}) == "under_1000_in_24h"
+    tr[1] = T("w", t0 + DAY, "a", price=0.5, size=999.99, seq=1)             # 500.00 + 499.995 = 999.995
+    pos = cl.new_positions(tr)
+    assert pos[0].cash24_micro == 999_995_000
     assert cl.position_skip(pos[0], {pos[0].condition: R(pos[0].condition, 0, t0 + 2 * DAY)}) == "under_1000_in_24h"
     tr[1] = T("w", t0 + DAY, "a", price=0.5, size=1000.0, seq=1)
     pos = cl.new_positions(tr)
@@ -241,7 +256,7 @@ def test_standing_counts_sales_and_resolutions_inside_the_three_months_only():
           T("w", w0 + 4 * DAY, "late", price=0.3, size=100.0, seq=4)]           # resolves after M0: not counted
     res = {"c-old": R("c-old", 0, w0 + 5 * DAY), "c-late": R("c-late", 0, m0 + 1)}
     st = cl.standing(_book(tr, res), M)
-    assert st.profit_cents == 5000 + 500                     # 100 x (1 - 0.5) + 50 x (0.5 - 0.4)
+    assert st.profit_micro == 55_000_000                     # 100 x (1 - 0.5) + 50 x (0.5 - 0.4)
     assert st.resolved_positions == 1
     assert st.shares_micro == (100 + 50 + 100 + 100) * 1_000_000
 
@@ -249,15 +264,15 @@ def test_standing_counts_sales_and_resolutions_inside_the_three_months_only():
 def test_a_resolution_exactly_at_the_start_of_the_month_is_not_yet_known():
     M = (2026, 4)
     tr = [T("w", MS(2026, 2), "x", price=0.5, size=100.0)]
-    assert cl.standing(_book(tr, {"c-x": R("c-x", 0, MS(2026, 4))}), M).profit_cents == 0
-    assert cl.standing(_book(tr, {"c-x": R("c-x", 0, MS(2026, 4) - 1)}), M).profit_cents == 5000
+    assert cl.standing(_book(tr, {"c-x": R("c-x", 0, MS(2026, 4))}), M).profit_micro == 0
+    assert cl.standing(_book(tr, {"c-x": R("c-x", 0, MS(2026, 4) - 1)}), M).profit_micro == 50_000_000
 
 
 def test_selling_more_than_the_feed_shows_held_is_counted_and_earns_nothing():
     tr = [T("w", MS(2026, 2), "x", price=0.5, size=10.0, seq=0),
           T("w", MS(2026, 2) + DAY, "x", side="SELL", price=0.6, size=30.0, seq=1)]
     b = _book(tr, {})
-    assert cl.standing(b, (2026, 4)).profit_cents == 100
+    assert cl.standing(b, (2026, 4)).profit_micro == 1_000_000
     assert b.counts["sell_beyond_holding"] == 1
 
 
@@ -275,7 +290,7 @@ def test_how_much_the_standing_rule_missed_through_sells_beyond_holding():
 
 
 def _qualifier(profit_cents=100_000, resolved=30, shares_per_dollar=10):
-    return cl.Standing(profit_cents, resolved, shares_per_dollar * profit_cents * 10_000)
+    return cl.Standing(profit_cents * 10_000, resolved, shares_per_dollar * profit_cents * 10_000)
 
 
 def test_who_qualifies():
@@ -283,7 +298,22 @@ def test_who_qualifies():
     assert cl.qualifies(_qualifier(resolved=29)) == "fewer_than_30_resolved"
     assert cl.qualifies(_qualifier(profit_cents=0)) == "profit_not_above_zero"
     assert cl.qualifies(_qualifier(shares_per_dollar=20)) == "20_or_more_shares_per_dollar"
-    assert cl.qualifies(cl.Standing(100_000, 30, 20 * 100_000 * 10_000 - 1)) is None
+    assert cl.qualifies(cl.Standing(10 ** 9, 30, 20 * 10 ** 9 - 1)) is None
+
+
+def test_the_20_shares_a_dollar_is_compared_exactly_not_after_rounding_to_cents():
+    # a profit of 0.995 dollars and exactly 19.9 shares: exactly 20 a dollar, which is not fewer than 20
+    assert cl.qualifies(cl.Standing(995_000, 30, 19_900_000)) == "20_or_more_shares_per_dollar"
+    assert cl.qualifies(cl.Standing(995_000, 30, 19_899_999)) is None
+    # a profit of half a cent is above zero
+    assert cl.qualifies(cl.Standing(5_000, 30, 1)) is None
+    assert cl.qualifies(cl.Standing(0, 30, 0)) == "profit_not_above_zero"
+
+
+def test_leaders_are_ranked_on_the_exact_profit():
+    st = {"a": cl.Standing(1_000_004_000, 30, 1), "b": cl.Standing(1_000_006_000, 30, 1),
+          "c": cl.Standing(1_000_005_000, 30, 1)}
+    assert cl.pick_leaders(st)[0] == ["b", "c", "a"]
     assert cl.qualifies(_qualifier(shares_per_dollar=50)) == "20_or_more_shares_per_dollar"
 
 
@@ -308,6 +338,28 @@ def test_event_p_is_seeded_and_counts_resamples_not_above_zero():
     assert cl.event_p([])[1] == 1.0
     assert cl.event_p([-1] * 10) == (2000, 1.0)
     assert cl.p_within_limit(100) and not cl.p_within_limit(101)
+
+
+def test_a_resample_whose_total_is_exactly_zero_is_not_above_zero():
+    assert cl.event_p([0, 0, 0]) == (2000, 1.0)
+    assert cl.event_p([0]) == (2000, 1.0)
+    k, p = cl.event_p([1, -1])                     # totals of -2, 0 or 2: three quarters not above zero
+    assert 0.70 < p < 0.80
+
+
+def test_resampling_is_by_event_and_by_trade_the_verdict_would_differ():
+    """Six events of twenty trades: five of +12 cents a trade, one of -36. By event a sum not above zero needs two
+    draws of the losing event (p about 0.26); by trade the 120 trades look like a steady gain (p about 0.01)."""
+    win = cl.CopiedTrade("w", 85, True, "L", 0, "a", 0, 0, 0, 300, False)
+    trades = [win._replace(event="e%d" % e) for e in range(5) for _ in range(20)]
+    trades += [cl.CopiedTrade("lose", 33, False, "L", 0, "b", 0, 0, 0, 300, False)] * 20
+    ev = cl.evaluate(trades, 3)
+    assert ev["events"] == 6 and ev["total_cents"] == 100 * 12 - 20 * 36
+    assert 0.2 < ev["p_value"] < 0.33 and not cl.p_within_limit(ev["not_above_zero"])
+    vals = np.array([cl.trade_result(t.price_cents, t.win, 3) for t in trades])
+    rng = np.random.default_rng(cl.SEED)
+    by_trade = np.mean(vals[rng.integers(0, len(vals), size=(2000, len(vals)))].sum(axis=1) <= 0)
+    assert by_trade < 0.05
 
 
 def test_the_event_is_the_unit():
@@ -534,6 +586,12 @@ def test_develop_writes_its_file_and_hash(skilled, tmp_path):
     assert json.loads(raw)["provenance"]["prediction_commit"] == "10ad062"
     assert json.loads(raw)["provenance"]["amendment_commit"] == "dec8dd7"
     assert json.loads(raw)["provenance"]["second_amendment_commit"] == "a7b9379"
+    readings = json.loads(raw)["provenance"]["readings"]
+    text = " ".join(readings).lower()
+    assert len(readings) >= 14
+    for phrase in ("average cost", "ties", "wallet name", "first fill", "prefix", "before rounding",
+                   "three months after the earliest trade", "more than one resolution row", "identity"):
+        assert phrase in text, phrase
 
 
 # ------------------------------------------------------------------ walk-forward and the period wall
@@ -596,6 +654,7 @@ def test_sealed_needs_the_flag_the_development_file_and_runs_once(skilled, tmp_p
     def watching_load(store, period, leave_out=()):
         if period == "sealed":
             seen["marker_before_read"] = (out / "sealed.used").exists()
+            seen["store_marker_before_read"] = cl.store_sealed_marker(store) is not None
         return real_load(store, period, leave_out)
 
     cl.load = watching_load
@@ -603,15 +662,122 @@ def test_sealed_needs_the_flag_the_development_file_and_runs_once(skilled, tmp_p
         doc = cl.run_sealed(store=skilled, out_dir=out, flag=True)
     finally:
         cl.load = real_load
-    assert seen == {"marker_before_read": True}
+    assert seen == {"marker_before_read": True, "store_marker_before_read": True}
     marker = json.loads((out / "sealed.used").read_text())
     assert marker["development_sha256"] == (out / "develop.json.sha256").read_text().strip()
+    assert marker["store_id"] == cl.store_id(skilled) == doc["provenance"]["store_id"]
+    assert cl.store_sealed_marker(skilled)["development_sha256"] == marker["development_sha256"]
     v = doc["result"]["verdict"]
     assert v["verdict"] in ("PASS", "FAIL") and v["thresholds"] == {"min_trades": 200, "min_events": 100,
                                                                     "p_limit": 0.05}
     assert [m["month"] for m in doc["result"]["month_table"]] == ["2026-07", "2026-08", "2026-09", "2026-10"]
     with pytest.raises(cl.Refused, match="already"):
         cl.run_sealed(store=skilled, out_dir=out, flag=True)
+    other = tmp_path / "another-folder"                 # the store's own marker: another folder runs nothing
+    cl.run_develop(store=skilled, out_dir=other)
+    with pytest.raises(cl.Refused, match="already"):
+        cl.run_sealed(store=skilled, out_dir=other, flag=True)
+    assert not (other / "sealed.used").exists() and not (other / "sealed.json").exists()
+
+
+def _twin(tmp_path, name):
+    return World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / name)
+
+
+def _no_marker(store, out):
+    return cl.store_sealed_marker(store) is None and not (out / "sealed.used").exists()
+
+
+def test_a_development_file_of_another_store_refuses_even_with_identical_rows(skilled, tmp_path):
+    twin = _twin(tmp_path, "twin.sqlite")             # the same rows, another store
+    assert cl.store_id(twin) != cl.store_id(skilled)
+    a = tmp_path / "a"
+    cl.run_develop(store=skilled, out_dir=a)
+    out = tmp_path / "b"
+    out.mkdir()
+    with pytest.raises(cl.Refused, match="store"):
+        cl.run_sealed(store=twin, out_dir=out, flag=True, develop_file=a / "develop.json")
+    assert _no_marker(twin, out)
+
+
+def test_an_edited_development_file_with_a_recomputed_hash_refuses(tmp_path):
+    import hashlib
+    store = World(3, edge=0.0, move=0.0, pros=8, per_month=15).write(tmp_path / "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out)
+    dev = out / "develop.json"
+    doc = json.loads(dev.read_bytes())
+    assert doc["result"]["step_1"]["verdict"] == "FAIL"
+    doc["result"]["step_1"].update(verdict="PROCEED", failed=[])
+    raw = (json.dumps(doc, sort_keys=True, indent=1) + "\n").encode()
+    dev.write_bytes(raw)
+    (out / "develop.json.sha256").write_text(hashlib.sha256(raw).hexdigest() + "\n")
+    with pytest.raises(cl.Refused, match="step 1"):     # the store's own development, recomputed, failed
+        cl.run_sealed(store=store, out_dir=out, flag=True)
+    assert _no_marker(store, out)
+
+
+def test_an_edited_figure_in_a_passing_development_file_refuses(tmp_path):
+    import hashlib
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out)
+    dev = out / "develop.json"
+    doc = json.loads(dev.read_bytes())
+    doc["result"]["step_1"]["mean_cents"] += 1
+    raw = (json.dumps(doc, sort_keys=True, indent=1) + "\n").encode()
+    dev.write_bytes(raw)
+    (out / "develop.json.sha256").write_text(hashlib.sha256(raw).hexdigest() + "\n")
+    with pytest.raises(cl.Refused, match="recomputed"):
+        cl.run_sealed(store=store, out_dir=out, flag=True)
+    assert _no_marker(store, out)
+
+
+def test_a_kill_after_the_stores_marker_spends_the_period(tmp_path, monkeypatch):
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out)
+    real_load = cl.load
+
+    def killed(st, period, leave_out=()):
+        if period == "sealed":
+            raise KeyboardInterrupt("killed")
+        return real_load(st, period, leave_out)
+    monkeypatch.setattr(cl, "load", killed)
+    with pytest.raises(KeyboardInterrupt):
+        cl.run_sealed(store=store, out_dir=out, flag=True)
+    monkeypatch.setattr(cl, "load", real_load)
+    assert cl.store_sealed_marker(store) is not None and not (out / "sealed.json").exists()
+    fresh = tmp_path / "fresh"
+    cl.run_develop(store=store, out_dir=fresh)
+    with pytest.raises(cl.Refused, match="by hand"):
+        cl.run_sealed(store=store, out_dir=fresh, flag=True)
+    assert not (fresh / "sealed.json").exists()
+
+
+def test_default_output_folders_are_named_for_the_stores_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "REPO", tmp_path)
+    w = World(5, edge=0.0, move=0.0, pros=6, per_month=12)
+    a, b = w.write(tmp_path / "a.sqlite"), w.write(tmp_path / "b.sqlite")
+    da, db = cl.run_develop(store=a), cl.run_develop(store=b)
+    fa = tmp_path / cl.OUT_DIR / cl.store_id(a) / "develop.json"
+    fb = tmp_path / cl.OUT_DIR / cl.store_id(b) / "develop.json"
+    assert fa.is_file() and fb.is_file() and fa.parent != fb.parent
+    assert da["provenance"]["store_id"] == cl.store_id(a) and db["provenance"]["store_id"] == cl.store_id(b)
+    assert json.loads(fa.read_bytes())["provenance"]["store_id"] == cl.store_id(a)
+
+
+def test_the_store_id_is_written_once():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.sqlite"
+        with cl.Store(p):
+            pass
+        first = cl.store_id(p)
+        with cl.Store(p):
+            pass
+        assert cl.store_id(p) == first and len(first) == 32
 
 
 def test_sealed_refuses_when_development_failed(tmp_path):
@@ -642,6 +808,24 @@ def test_sealed_refuses_before_its_marker_when_a_sealed_window_was_not_pulled(tm
     assert not (out / "sealed.used").exists() and not (out / "sealed.json").exists()
 
 
+def test_sealed_refuses_before_its_marker_when_the_10_minute_windows_were_not_planned(tmp_path):
+    store = World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out)
+    with cl.Store(store) as s:
+        meta = s.meta("plan")
+        meta["ten_minute_windows_added"] = False
+        s.set_meta("plan", meta)
+    real_load = cl.load
+    cl.load = lambda *a, **k: pytest.fail("no sealed row may be read")
+    try:
+        with pytest.raises(cl.Refused, match="10-minute"):
+            cl.run_sealed(store=store, out_dir=out, flag=True)
+    finally:
+        cl.load = real_load
+    assert _no_marker(store, out)
+
+
 # ------------------------------------------------------------------ an unfinished pull
 def test_an_unfinished_pull_is_refused_unless_told_which_wallets_to_leave_out(tmp_path):
     w = World(5, edge=0.0, move=0.0, pros=6, per_month=12)
@@ -667,9 +851,9 @@ def test_an_unfinished_price_window_names_the_leader_that_needs_it(tmp_path):
 class FakeService:
     """A synthetic data service: three wallets, a few trades each. Records every URL; no request leaves."""
 
-    def __init__(self, fail_wallet=None):
+    def __init__(self, fail_wallet=None, reset_wallet=None):
         self.urls = []
-        self.fail_wallet = fail_wallet
+        self.fail_wallet, self.reset_wallet = fail_wallet, reset_wallet
         t0 = MS(2026, 2)
         self.trades = {
             "0xa": [{"proxy_wallet": "0xa", "side": "BUY", "token_id": "ta", "condition_id": "ca", "size": 4000.0,
@@ -695,6 +879,8 @@ class FakeService:
         if p == "/v2/trades" and "user" in q:
             if q["user"] == self.fail_wallet:
                 raise pd.HttpError(400, url)
+            if q["user"] == self.reset_wallet:
+                raise ConnectionResetError("reset by peer")
             return pg(self.trades[q["user"]])
         if p == "/v2/resolutions":
             return json.dumps({"data": [{"condition_id": c, "status": "resolved", "payouts": [1_000_000, 0],
@@ -774,6 +960,22 @@ def test_pull_phase_2_reads_price_windows_only_for_the_leaders_qualifying_positi
     assert cl.run_develop(store=store, out_dir=tmp_path / "o")["result"]["step_1"]["trades"] > 0
 
 
+def test_a_reset_connection_is_retried_then_left_unfinished_and_the_pull_goes_on(tmp_path):
+    store = tmp_path / "pm.sqlite"
+    svc, said = FakeService(reset_wallet="0xa"), []
+    with pytest.raises(cl.PullIncomplete, match="0xa"):
+        cl.pull(store, _client(svc), phase=1, say=said.append)
+    assert len([u for u in svc.urls if "user=0xa" in u]) == 5                # the bounded tries, then on
+    with cl.Store(store) as s:
+        assert s.unfinished("trades") == ["0xa"]
+        assert {"0xb", "0xc"} <= s.finished_keys("trades")
+        assert len(s.resolution_answers()) == 25                               # the resolutions were still read
+    assert any("unfinished" in line and "0xa" in line for line in said)        # the summary names it
+    svc2 = FakeService()
+    cl.pull(store, _client(svc2), phase=1, say=said.append)
+    assert [u for u in svc2.urls if "/v2/trades" in u] == [u for u in svc2.urls if "user=0xa" in u]
+
+
 def test_the_store_refuses_a_second_candidate_set(tmp_path):
     with cl.Store(tmp_path / "x.sqlite") as s:
         s.put_boards({"all": pd.Walk.from_rows([{"rank": 1, "user_id": "0xa", "pnl": 1.0, "volume": 1.0}], "t")})
@@ -789,3 +991,4 @@ def test_command_line(skilled, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "step 1" in out and "information: decides nothing" in out
     assert "sold beyond what their trades show" in out
+    assert "readings where the document is silent" in out
