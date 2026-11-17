@@ -79,8 +79,12 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   whose id is not `elephant-1`, `ym-research-embedding`, an `mf-native-*` id or an id beginning `elephant-1`, and whose
   model key is not `elephant-1`; anything else, a model under another key with an id such as `copy` included): unloaded by REST.
   Every instance a run unloads is named (id and key) in the announcement printed before the first switch-off and in the
-  row, and nothing outside that announced list is unloaded: a model loaded after the announcement is reported in capitals
-  (`MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE`) and left alone. The load test's own `mf-native-<hex>` instance is
+  row, and nothing outside that announced list is unloaded. A model loaded after the announcement is never unloaded, and
+  it is named (key and id) in the row's `loaded_after_announcement`: BEFORE the spawn (seen at the unloads or in the check
+  just before the gate; for a load test, just before the load call) nothing is launched, everything is restored and the
+  row is a refusal naming it (exit 2), since the start check and what the owner was told no longer hold; AFTER the spawn
+  (seen at every 30 s check and once more at the end) it is said at once in capitals (`MODEL LOADED AFTER THE
+  ANNOUNCEMENT`), the stop rule governs the run as before, and the run does NOT count, whatever else it shows. The load test's own `mf-native-<hex>` instance is
   named in the intent file before its load call and is the only instance its unload names
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
