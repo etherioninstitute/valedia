@@ -2,7 +2,7 @@
 the stager or the launcher, sends a request to LM Studio, opens the collector's real store, loads a model or signals a real
 process: a World object stands in for all of them (an injected command runner, spawn, HTTP function, clock and sleeper, signal
 sender and model load path) and a scratch SQLite file stands in for the collector's store."""
-import ast, copy, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, time, types, unittest
+import ast, copy, fcntl, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, time, types, unittest
 from pathlib import Path
 
 HERE = Path(__file__).absolute().parent
@@ -261,7 +261,7 @@ class World:
         if self.fsync_raises:
             exc, self.fsync_raises = self.fsync_raises, None
             raise exc()
-        self.fsyncs.append(fd); os.fsync(fd)
+        self.fsyncs.append(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b'\0').decode()); os.fsync(fd)
 
     def install_signal(self, signum, handler):
         self.installs.append((self.t, len(self.calls), signum)); old = self.handlers.get(signum, 'default')
@@ -1264,8 +1264,10 @@ class Addendum2(Base):
         self.assertEqual(damaged, 3); self.assertEqual(OP.streaks(rows)['9']['streak'], 2)       # neither reset nor counted
 
     def test_6_every_append_is_synced(self):
-        self.main(RUN); self.assertEqual(len(self.w.fsyncs), 2)          # a new file: the file and its folder
-        self.main(RUN); self.assertEqual(len(self.w.fsyncs), 3)          # an existing file: the file itself
+        record = os.path.realpath(self.w.tmp / 'artifacts/runs.jsonl')
+        mine = lambda: [p for p in self.w.fsyncs if os.path.realpath(p) in (record, os.path.dirname(record))]
+        self.main(RUN); self.assertEqual(len(mine()), 2)          # a new file: the file and its folder
+        self.main(RUN); self.assertEqual(len(mine()), 3)          # an existing file: the file itself
 
     # ---- 7: the intent to restore is set before the bootout
     def test_7_ctrl_c_right_after_the_bootout_still_bootstraps(self):
@@ -1521,7 +1523,8 @@ class Addendum3(Base):
                 self.main(RUN)
         finally:
             OP.post_state = orig
-        self.assertEqual(self.w.rows(), []); self.assertTrue(self.intent.exists()); self.assertTrue(self.w.picks_loaded)
+        # the minimal row's line reached the file but its sync was interrupted: not a written row, so the intent stays
+        self.assertTrue(self.intent.exists()); self.assertTrue(self.w.picks_loaded)
         self.assertEqual(self.main(['recover']), 0, self.w.text())
         self.assertEqual(self.w.rows()[-1]['command'], 'recover'); self.assertFalse(self.intent.exists())
 

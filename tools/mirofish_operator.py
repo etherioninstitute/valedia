@@ -4,6 +4,7 @@
     $PY -B tools/mirofish_operator.py load-test --model X --hold-minutes M --announced TEXT [--dry-run]
     $PY -B tools/mirofish_operator.py run --profile P [--model X | --setup-model A --turns-model B] --announced TEXT [--dry-run]
     $PY -B tools/mirofish_operator.py record
+    $PY -B tools/mirofish_operator.py recover [--stop] [--dry-run]
 
 `check` only reads. `load-test` and `run` switch off the hourly pick reader and every loaded model that is neither the decision
 instance nor the embedding instance, restore the pick reader in a `finally` (Ctrl-C and exceptions included), watch the
@@ -55,6 +56,7 @@ WORK_VOLUME = Path('/Volumes/NIMROD_SSD')
 RECORD = ROOT / 'artifacts/mirofish/runs.jsonl'
 LOAD_TESTS = ROOT / 'artifacts/mirofish/load-tests'
 LOGS = ROOT / 'artifacts/mirofish/operator-logs'
+INTENT = ROOT / 'artifacts/mirofish/operator-intent.json'   # addendum 3, item 2: written before the first switch-off
 LMS = Path.home() / '.lmstudio/bin/lms'
 LMSTUDIO = DM.URL
 
@@ -96,6 +98,7 @@ LINK_DISABLED_LINE = 'You have disabled LM Link.'   # the real wording of `lms l
 LAUNCHER_STOP_SIGNAL = signal.SIGINT   # correction A: the launcher's KeyboardInterrupt path stops the observer group itself
 PICKS_BEFORE_S = 120            # correction C: no switch-off from 2 minutes before the pick reader's scheduled start ...
 PICKS_MISSED_S = 180            # ... until it is seen running and then idle, or idle this long after its start (addendum 2, 10)
+LAUNCHER_PS_TRIES = 3            # addendum 3, item 1: the launcher's start time is read this often, SAMPLE_S apart
 SETTLE_S = 15                   # addendum 2, item 5: after the unloads, before the free reading (see settle_after_unloads)
 NEAR_NEUTRAL_REASON = 'derived report not usable evidence'   # src/mirofish_provenance.py:437, stored as receipt failure.reason
 NEAR_NEUTRAL_TYPE = 'Refused'                                 # by src/mirofish_native_run.py:806 (str(exc), type name)
@@ -114,10 +117,20 @@ HTTP_S = 10
 STREAKS = (('9', 'swarm8', 10), ('48', 'swarm48', 3))      # (participants, profile, target in a row)
 SWARM_PROFILES = ('swarm8', 'swarm48')
 NOT_RELOADED = 'NOT reloaded (LM Studio loads each again on demand)'
+RECOVERED = 'recovered after an unfinished run'
+STARTUP_DEADLINE = re.compile(r'\(30 if preflight else (\d+)\)')   # the stager's edit of mirofish_native_startup.py:145
+OPERATOR_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 class OperatorError(RuntimeError):
     """Something failed; the command stops and restores."""
+
+
+class OperatorSignalled(BaseException):
+    """Addendum 3, item 2: a TERM or a hang-up, turned into the same controlled path as a Ctrl-C."""
+
+    def __init__(self, name):
+        super().__init__(name); self.name = name
 
 
 class Refused(OperatorError):
@@ -152,7 +165,7 @@ def _http(method, url, body=None, timeout=HTTP_S):
 
 class Host:
     def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
-                 lms=LMS, self_pid=None, parent_pid=None, fsync=None):
+                 lms=LMS, self_pid=None, parent_pid=None, fsync=None, install_signal=None, intent=INTENT):
         self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http   # _spawn: its own session and group
         self.now, self.sleep, self.send_signal = now or time.time, sleep or time.sleep, send_signal or os.kill
         self.disk_free = disk_free or (lambda path: shutil.disk_usage(path).free)
@@ -164,6 +177,8 @@ class Host:
         self.self_pid = os.getpid() if self_pid is None else self_pid          # never a stop target (addendum 2, item 2)
         self.parent_pid = os.getppid() if parent_pid is None else parent_pid
         self.fsync = fsync or os.fsync
+        self.install_signal = install_signal or signal.signal
+        self.intent = Path(intent)
 
 
 def utc(t):
@@ -356,22 +371,22 @@ def launcher_mismatch(host, launcher):
     return None
 
 
-def observer_unusable(host, identity, launcher):
+def observer_unusable(host, identity, launcher_pid, launcher_why):
     """Addendum 2, item 2. None only when ALL hold: the identity is well formed; its pid is alive with exactly that start
-    (and group); its PARENT pid is the launcher this tool started, whose own pid and start still match the spawn record;
-    the pid is not this tool's own, not this tool's parent, not 0 or 1. Else why not: then it is never sent TERM."""
+    (and group); its PARENT pid is the launcher (launcher_why None: the tool's own unreaped child, with its start matching
+    when one was read; or, for `recover`, the recorded launcher with pid and start matching); the pid is not this tool's
+    own, not this tool's parent, not 0 or 1. Else why not: then it is never sent TERM."""
     why = identity_mismatch(host, identity)
     if why:
         return why
     pid = identity['pid']
     if pid <= 1 or pid in (host.self_pid, host.parent_pid):         # the one guard (0, 1 and below; kill(-1) is everyone)
         return 'pid %d is this tool, its parent, or not above 1' % pid
-    why = launcher_mismatch(host, launcher)
-    if why:
-        return why
+    if launcher_why:
+        return launcher_why
     seen = observed_identity(host, pid)
-    if seen is None or seen['ppid'] != launcher['pid']:
-        return 'pid %d is not a child of the launcher %s (parent %s)' % (pid, launcher['pid'], seen and seen['ppid'])
+    if seen is None or seen['ppid'] != launcher_pid:
+        return 'pid %d is not a child of the launcher %s (parent %s)' % (pid, launcher_pid, seen and seen['ppid'])
     return None
 
 
@@ -530,6 +545,9 @@ def refusals(s):
         out.append('an unexpired gate file of an earlier run exists: %s' % ', '.join(s['earlier_runs']['unexpired_gates']))
     if s['earlier_runs']['live_observers']:
         out.append('a running observer of an earlier run exists: %s' % ', '.join(s['earlier_runs']['live_observers']))
+    if s['intent']['exists']:
+        out.append('AN UNFINISHED RUN\'S INTENT FILE EXISTS (%s): AN EARLIER RUN OR LOAD TEST ENDED BEFORE ITS RESTORE AND ITS '
+                   'ROW; RUN `recover` FIRST' % s['intent']['path'])
     return out
 
 
@@ -548,6 +566,7 @@ def do_check(host, profile, plan, kind='run', hold_minutes=None):
     s['pick_reader'] = pick_reader_state(host)
     s['disk'] = {'path': str(WORK_VOLUME), 'free_bytes': host.disk_free(WORK_VOLUME)}
     s['earlier_runs'] = earlier_runs(host)
+    s['intent'] = {'path': str(host.intent), 'exists': host.intent.exists()}
     s['durations'] = run_durations(profile, plan) if kind == 'run' else load_test_durations(hold_minutes)
     s['announcement'] = announcement(kind, profile, plan, s['durations'], s, t, hold_minutes)
     s['refusals'] = refusals(s)
@@ -575,6 +594,10 @@ def check_lines(s):
              '- free disk on %s: %.1f GB' % (s['disk']['path'], s['disk']['free_bytes'] / 1e9),
              '- earlier runs: %d unexpired gate(s), %d live observer(s)' % (len(s['earlier_runs']['unexpired_gates']),
                                                                              len(s['earlier_runs']['live_observers'])),
+             ('- durations from tools/mirofish_swarm_limits.py for %s on %s: expected %d s, wall %d s; a run watches to the '
+              'deadline the stager wrote into the staged folder (startup script, `(30 if preflight else N)`), read after '
+              'staging and printed then' % (s['profile'], plan_label(s['plan']), s['durations']['expected_s'], s['durations']['wall_s'])
+              if s['kind'] == 'run' else '- durations: expected %d s, wall %d s' % (s['durations']['expected_s'], s['durations']['wall_s'])),
              'ANNOUNCEMENT (the lead gives this to the owner before starting): ' + s['announcement']]
     lines += ['REFUSED: ' + r for r in s['refusals']] or ['start rules: none refuses']
     return lines
@@ -664,6 +687,92 @@ class Steps:
     def reraise(self):
         if self.kept is not None:
             raise self.kept
+
+
+class SignalGuard:
+    """Addendum 3, item 2. Installed by `run` and `load-test` before the first switch-off: a TERM or a hang-up (a closed
+    terminal, an ended session, a caller's timeout) raises OperatorSignalled, a Ctrl-C KeyboardInterrupt, each into the
+    same controlled path. At most one signal ever raises: once one has, or once the cleanup has begun (`cleaning`), a
+    further signal is only recorded in the row, so it never aborts the stop, the restore or the row. While `holding` (the
+    one statement that spawns the launcher and binds its handle), a signal is kept and raised just after the binding."""
+
+    def __init__(self, host, row):
+        self.host, self.row, self.old = host, row, {}
+        self.holding = self.cleaning = self.raised = False; self.pending = None
+        row['signals_received'] = []
+
+    def install(self):
+        for sig in OPERATOR_SIGNALS:
+            self.old[sig] = self.host.install_signal(sig, self.handler)
+
+    def handler(self, signum, frame):
+        name = signal.Signals(signum).name
+        self.row['signals_received'].append({'signal': name, 'utc': utc(self.host.now()),
+                                             'during': 'the cleanup' if self.cleaning or self.raised else 'the run'})
+        if self.cleaning or self.raised:
+            return
+        exc = KeyboardInterrupt() if signum == signal.SIGINT else OperatorSignalled(name)
+        if self.holding:
+            self.pending = self.pending or exc; return
+        self.raised = True
+        raise exc
+
+    def release(self):
+        self.holding = False
+        if self.pending is not None and not (self.cleaning or self.raised):
+            exc, self.pending, self.raised = self.pending, None, True
+            raise exc
+
+    def restore(self):
+        for sig, old in self.old.items():
+            self.host.install_signal(sig, signal.SIG_DFL if old is None else old)
+
+
+def _sync_folder(host, folder):
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        host.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class IntentFile:
+    """Addendum 3, item 2: artifacts/mirofish/operator-intent.json, written and synced (a temporary file synced, renamed
+    into place, the folder synced) BEFORE the first switch-off, so that what no handler can catch (a KILL, a crash, a power
+    cut) is still visible: check, run and load-test refuse while it exists, and `recover` reads it. It is rewritten when the
+    launcher's pid and start are known, and removed only after the restore and the row are done."""
+
+    def __init__(self, host):
+        self.host, self.path, self.data, self.written = host, host.intent, None, False
+
+    def write(self, **fields):
+        if self.data is None:
+            self.data = {}
+        self.data.update(fields)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + '.tmp')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps(self.data, indent=2, sort_keys=True) + '\n'); f.flush(); self.host.fsync(f.fileno())
+        os.replace(tmp, self.path); self.written = True
+        _sync_folder(self.host, self.path.parent)
+
+    def remove(self):
+        self.path.unlink(); _sync_folder(self.host, self.path.parent)
+        return True
+
+
+def intent_start(host, command, row, summary):
+    """What is about to be switched off and its before-state, the work folder, this tool's own pid and start, the time."""
+    try:
+        me = observed_identity(host, host.self_pid)
+    except Exception:
+        me = None
+    pr = summary['pick_reader']
+    return dict(command=command, utc=utc(host.now()), tool={'pid': host.self_pid, 'start': me and me['start']},
+                pick_reader={'label': PICKS_LABEL, 'before': {'listed': pr['listed'], 'plist': pr['plist'], 'state': pr['state']}},
+                models_to_unload=[o['instance_id'] for o in summary['models']['others']], models_note=NOT_RELOADED,
+                work=row.get('staged_folder'), twin=row.get('twin_folder'), launcher=None, record=str(host.record))
 
 
 # ============================================================================ the pipeline's own steps
@@ -758,15 +867,67 @@ def require_stoppable(work):
                       'run could not be stopped the documented way; not launched' % IDENTITY_FILE)
 
 
-def launch(host, work, gate, row):
-    """The launcher, started by this tool in its own session and process group (Host.spawn); its pid, start and group are
-    recorded at once, so that a stop by group can be checked against them."""
+def staged_deadline(work):
+    """Addendum 3, item 5: the watch deadline from the STAGED folder, not from the repository. The stager writes the
+    profile's wall into the staged startup script, `deadline=time.monotonic()+(30 if preflight else N)`
+    (src/mirofish_native_startup.py:145, edited by tools/mirofish_native_stage.py swarm_startup_bytes), and into the
+    manifest's uniform_policy.wall_seconds. The startup script's N is the launcher's own deadline and is the one used; the
+    manifest must say the same, or nothing is switched off."""
+    startup = work / 'owned-source/observer-entry/mirofish_native_startup.py'
+    try:
+        values = sorted({int(v) for v in STARTUP_DEADLINE.findall(startup.read_text())})
+    except OSError as e:
+        raise Refused('the staged folder has no readable startup script %s (%s): no staged deadline; not launched' % (
+            startup, type(e).__name__))
+    if len(values) != 1:
+        raise Refused('the staged startup script %s holds %s run deadline(s) `(30 if preflight else N)`, not exactly one: no '
+                      'staged deadline; not launched' % (startup, values or 'no'))
+    wall = values[0]
+    manifest = work / 'builder/candidate-manifest.json'
+    try:
+        policy = json.loads(manifest.read_text()).get('uniform_policy')
+        recorded = policy.get('wall_seconds') if isinstance(policy, dict) else None
+    except (OSError, ValueError, AttributeError) as e:
+        raise Refused('the staged manifest %s is not readable (%s): no staged deadline; not launched' % (manifest, type(e).__name__))
+    if type(recorded) is not int or recorded != wall:
+        raise Refused('the staged deadline %d s (%s) and the staged manifest\'s uniform_policy.wall_seconds %s differ: not launched'
+                      % (wall, startup.name, recorded))
+    return {'staged_wall_s': wall, 'source': '%s: `(30 if preflight else %d)`' % (startup, wall),
+            'manifest_wall_seconds': recorded, 'watch_deadline_s': wall + CLEANUP_S}
+
+
+def launch(host, work, gate, row, stopper, guard, intent):
+    """Addendum 3, item 1. The launcher, started by this tool in its own session and process group (Host.spawn). Its handle
+    is bound to the stop path's state (stopper.proc) in the very statement that spawns it, with every signal held for that
+    statement, so nothing runs between the spawn and the binding: from then on the launcher is this tool's own unreaped
+    child, and the stop path can always reach it through the handle. Its start and group are then read, with retries;
+    a start that cannot be read leaves the handle as the stop route."""
     argv = [str(PIPELINE_PY), '-B', 'mirofish_native_startup.py', '--work', str(work), '--gate', str(gate)]
-    proc = host.spawn(argv, cwd=str(work / 'owned-source/observer-entry'), env=pipeline_env())
-    seen = observed_identity(host, proc.pid)
-    row['launcher'] = {'pid': proc.pid, 'start': seen and seen['start'], 'pgid': seen and seen['pgid'],
-                       'own_group': bool(seen) and seen['pgid'] == proc.pid}
-    return proc
+    guard.holding = True
+    try:
+        stopper.proc = host.spawn(argv, cwd=str(work / 'owned-source/observer-entry'), env=pipeline_env())
+    finally:
+        guard.holding = False
+    row['launched'] = True
+    row['launcher'] = {'pid': stopper.proc.pid, 'start': None, 'pgid': None, 'own_group': None, 'read_errors': []}
+    guard.release()
+    seen = None
+    for attempt in range(LAUNCHER_PS_TRIES):
+        try:
+            seen = observed_identity(host, stopper.proc.pid)
+        except Exception as e:          # a KeyboardInterrupt or a signal goes on to the one stop path
+            row['launcher']['read_errors'].append(type(e).__name__)
+        if seen is not None:
+            break
+        if attempt + 1 < LAUNCHER_PS_TRIES:
+            host.sleep(SAMPLE_S)
+    if seen is not None:
+        row['launcher'].update(start=seen['start'], pgid=seen['pgid'], own_group=seen['pgid'] == stopper.proc.pid)
+    else:
+        row['launcher']['start_note'] = ('start not readable after %d tries: a stop goes through the handle of this tool\'s '
+                                         'own unreaped child' % LAUNCHER_PS_TRIES)
+    intent.write(launcher={k: row['launcher'][k] for k in ('pid', 'start', 'pgid')})
+    return stopper.proc
 
 
 class Stopper:
@@ -783,6 +944,19 @@ class Stopper:
         self.rec = row['stop'] = {'wanted': False, 'signalled': False, 'by': None, 'pid': None, 'pgid': None, 'utc': None,
                                   'not_signalled': None}
         self.sent_t = None
+        self.proc = None            # the launcher's handle, bound by `launch` in the statement that spawns it
+
+    def launcher_why_not(self):
+        """None when the launcher can be stopped through its handle: spawned, not yet ended (an unreaped child's pid cannot
+        belong to another process), and, when its start was read, still that start and group."""
+        if self.proc is None:
+            return 'the launcher was not spawned'
+        if self.proc.poll() is not None:
+            return 'the launcher has ended'
+        launcher = self.row.get('launcher') or {}
+        if not launcher.get('start'):
+            return None
+        return launcher_mismatch(self.host, launcher)
 
     def attempt(self):
         self.rec['wanted'] = True
@@ -792,7 +966,7 @@ class Stopper:
             identity = json.loads(self.path.read_text())
         except (OSError, ValueError) as e:
             return self._by_launcher('no readable observer identity (%s)' % type(e).__name__)
-        why = observer_unusable(self.host, identity, self.row.get('launcher'))
+        why = observer_unusable(self.host, identity, self.proc.pid if self.proc is not None else None, self.launcher_why_not())
         if why:
             return self._by_launcher('no usable observer identity: ' + why)
         self.host.send_signal(identity['pid'], signal.SIGTERM)
@@ -803,17 +977,16 @@ class Stopper:
     def _by_launcher(self, why):
         if self.host.now() < self.t_launch + IDENTITY_WAIT_S:
             self.rec['not_signalled'] = why + '; waiting up to %d s after the launch for it' % IDENTITY_WAIT_S; return False
-        launcher = self.row.get('launcher') or {}
-        if not launcher.get('own_group'):
-            self.rec['not_signalled'] = why + ', and the launcher is not in a process group of its own'; return False
-        moved = launcher_mismatch(self.host, launcher)
-        if moved or launcher['pid'] <= 1 or launcher['pid'] in (self.host.self_pid, self.host.parent_pid):
+        moved = self.launcher_why_not()
+        pid = self.proc.pid if self.proc is not None else None
+        if moved or pid <= 1 or pid in (self.host.self_pid, self.host.parent_pid):
             self.rec['not_signalled'] = why + ', and ' + (moved or 'the launcher pid is this tool, its parent or not above 1')
             return False
-        self.host.send_signal(launcher['pid'], LAUNCHER_STOP_SIGNAL)
+        self.proc.send_signal(LAUNCHER_STOP_SIGNAL)      # through the handle (addendum 3, item 1): Popen polls first
         self.sent_t = self.host.now()
-        self.rec.update(signalled=True, by='launcher interrupt', signal='SIGINT', pid=launcher['pid'], pgid=launcher['pgid'],
-                        utc=utc(self.sent_t), not_signalled=None, why_launcher=why)
+        self.rec.update(signalled=True, by='launcher interrupt', signal='SIGINT', pid=pid,
+                        pgid=(self.row.get('launcher') or {}).get('pgid'), utc=utc(self.sent_t), not_signalled=None,
+                        why_launcher=why)
         return True
 
 
@@ -863,15 +1036,20 @@ def pipeline_outcome(work, plan, launcher_exit=None):
     if not isinstance(receipt, dict):
         out['failure'] = 'the receipt is not a JSON object'
         return out, {}
+    wrong = receipt_type_errors(receipt)
+    if wrong:                   # addendum 3, item 4: a wrongly typed field makes the receipt unreadable, never an exception
+        out['failure'] = 'the receipt field%s %s ha%s the wrong type' % (
+            's' if len(wrong) > 1 else '', ', '.join(wrong), 've' if len(wrong) > 1 else 's')
+        return out, {}
     raw = receipt.get('failure')
-    failure = raw if isinstance(raw, dict) else None
+    failure = raw
     # Addendum 2, item 4: the one failure that is a result, not a fault: the derived report too close to neutral
     # (src/mirofish_provenance.py:437 raises Refused("derived report not usable evidence"); mirofish_native_run.py:806
     # stores {'type': type name, 'reason': str(exc)}). Exactly that type and that reason string, nothing else.
     near = (failure is not None and failure.get('type') == NEAR_NEUTRAL_TYPE and type(failure.get('reason')) is str
             and failure['reason'] == NEAR_NEUTRAL_REASON)
     out.update(receipt_readable=True, complete=receipt.get('complete'), cleanup_proven=receipt.get('cleanup_proven'),
-               failure=None if raw is None else str(failure.get('reason') if failure else raw)[:500], near_neutral=near,
+               failure=None if raw is None else str(raw['reason'] if raw.get('reason') is not None else raw)[:500], near_neutral=near,
                report_usable=receipt.get('paper_handoff') is True)
     reason = out['failure'] or ''
     out['memory_stop'] = bool(receipt.get('resource_failures') or receipt.get('resource_failure_samples')
@@ -894,6 +1072,18 @@ def pipeline_outcome(work, plan, launcher_exit=None):
     else:
         out['swaps'] = 'not applicable: one model'; out['swaps_clean'] = True
     return out, receipt
+
+
+RECEIPT_TYPES = (       # every receipt field pipeline_outcome and memory_outcome walk; absent is null (not clean), never wrong
+    ('complete', (bool,)), ('cleanup_proven', (bool,)), ('paper_handoff', (bool,)), ('failure', (dict,)),
+    ('events', (list,)), ('resource_failures', (list,)), ('resource_failure_samples', (list,)), ('resource', (dict,)))
+
+
+def receipt_type_errors(receipt):
+    wrong = [k for k, types_ in RECEIPT_TYPES if k in receipt and receipt[k] is not None and type(receipt[k]) not in types_]
+    if type(receipt.get('events')) is list and not all(type(e) is dict for e in receipt['events']):
+        wrong.append('events (an entry is not an object)')
+    return wrong
 
 
 def memory_outcome(receipt, swap_start, swap_end, own):
@@ -1012,14 +1202,14 @@ def new_row(command, args, plan, t):
     return {'command': command, 'utc_start': utc(t), 'utc_end': None, 'profile': getattr(args, 'profile', None), 'plan': plan,
             'announced': args.announced, 'announced_note': 'the lead\'s statement that the owner was told; the tool cannot check it',
             'launched': False, 'refused': None, 'error': None, 'stopped': None, 'staged_folder': None, 'twin_folder': None,
-            'switch_offs': None, 'pipeline': None, 'memory': None, 'collector': None, 'stop': None, 'post': None,
+            'switch_offs': None, 'deadline': None, 'pipeline': None, 'memory': None, 'collector': None, 'stop': None, 'post': None,
             'verdicts': None, 'counts': False, 'alerts': []}
 
 
-def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
-    """Every WATCH_S: the launcher, the collector since t_start, the memory. A breach (or an overrun of the wall clock) stops
-    the run once; the loop then waits for the pipeline's own cleanup."""
-    first = None
+def watch(host, row, stopper, t_start, t_launch, wall_s, own):
+    """Every WATCH_S: the launcher, the collector since t_start, the memory. A breach (or an overrun of the STAGED wall
+    clock, addendum 3, item 5) stops the run once; the loop then waits for the pipeline's own cleanup."""
+    first = None; proc = stopper.proc
     while proc.poll() is None:
         host.sleep(WATCH_S)
         if proc.poll() is not None:
@@ -1032,11 +1222,9 @@ def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
         if (not row.get('identity_alerted') and host.now() >= t_launch + IDENTITY_WAIT_S
                 and not (stopper.path.is_file() or stopper.rec['signalled'])):
             row['identity_alerted'] = True
-            row['alerts'].append('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN %d S OF LAUNCH: %s' % (
-                IDENTITY_WAIT_S, 'A BREACH WILL INTERRUPT THE LAUNCHER (SIGINT) INSTEAD'
-                if (row.get('launcher') or {}).get('own_group')
-                else 'A BREACH CANNOT INTERRUPT THE LAUNCHER: IT IS NOT IN ITS OWN GROUP'))
-        deadline = t_launch + wall_s + CLEANUP_S         # addendum 2, item 3: the profile's wall time plus the cleanup
+            row['alerts'].append('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN %d S OF LAUNCH: A BREACH WILL INTERRUPT THE '
+                                 'LAUNCHER (SIGINT, THROUGH ITS HANDLE) INSTEAD' % IDENTITY_WAIT_S)
+        deadline = t_launch + wall_s + CLEANUP_S         # the staged wall time plus the cleanup (addendum 2, 3; addendum 3, 5)
         if first is None:
             h = collector_health(host, since=t_start)
             if h['breach']:
@@ -1106,17 +1294,21 @@ def cmd_run(host, args):
     if args.dry_run:
         for line in check_lines(s):
             say(line)
-        say('dry run: would boot out %s, unload %s, stage %s and its twin, preflight the twin, write the gate, launch, watch '
-            'every %d s, restore, append the record row. Nothing was changed.' % (
-                PICKS_LABEL if s['pick_reader']['listed'] else 'nothing', ', '.join(o['instance_id'] for o in s['models']['others']) or 'nothing',
-                args.profile, WATCH_S))
+        say('dry run: would stage %s and its twin, read the staged deadline, write the intent file %s, boot out %s, unload %s, '
+            'preflight the twin, write the gate, launch, watch every %d s, restore, append the record row, remove the intent '
+            'file. Nothing was changed.' % (
+                args.profile, host.intent, PICKS_LABEL if s['pick_reader']['listed'] else 'nothing',
+                ', '.join(o['instance_id'] for o in s['models']['others']) or 'nothing', WATCH_S))
         return 2 if s['refusals'] else 0
-    switch = SwitchOffs(host, row); proc = None; stopper = None; work = None; own = {'lowest': None, 'max_pressure': None}
-    swap_start = None
+    switch = SwitchOffs(host, row); stopper = None; work = None; own = {'lowest': None, 'max_pressure': None}
+    swap_start = None; kept = None
+    guard = SignalGuard(host, row); intent = IntentFile(host)
     try:
-        # Addendum 2, item 5: (a) every refusal that needs no switch-off; (b) staging, which switches nothing off, and the
-        # old-pipeline refusal; (c) only then the switch-offs; (d) the free reading after the unloads settled; (e) the
-        # twin's preflight; (f) the gate and the launch.
+        # Addendum 3, item 2: the TERM and HUP handlers before anything is switched off. Addendum 2, item 5: (a) every
+        # refusal that needs no switch-off; (b) staging, which switches nothing off, the old-pipeline refusal and the
+        # staged deadline (addendum 3, item 5); (c) the intent file, then the switch-offs; (d) the free reading after the
+        # unloads settled; (e) the twin's preflight; (f) the gate and the launch.
+        guard.install()
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
         work = fresh_folder(host, args.profile); twin = Path(str(work) + '-twin')
@@ -1124,7 +1316,12 @@ def cmd_run(host, args):
         candidate = stage(host, args.profile, flags, work)
         stage(host, args.profile, flags, twin)
         require_stoppable(work)
-        say('check passed and staged; switching off: ' + s['announcement'])
+        deadline = row['deadline'] = staged_deadline(work)
+        say('check passed and staged; expected %d s (tools/mirofish_swarm_limits.py, %s on %s), staged deadline %d s (%s), '
+            'watched to %d s after the launch; switching off: %s' % (
+                s['durations']['expected_s'], args.profile, plan_label(plan), deadline['staged_wall_s'], deadline['source'],
+                deadline['watch_deadline_s'], s['announcement']))
+        intent.write(**intent_start(host, 'run', row, s))
         switch.apply(s)
         settle_after_unloads(host, row)
         threshold, free = require_free(host, work, row)
@@ -1134,24 +1331,38 @@ def cmd_run(host, args):
         swap_start = memory(host)['swap_used_bytes']
         t_launch = host.now()
         stopper = Stopper(host, work, row, t_launch)
-        proc = launch(host, work, gate, row)
-        row['launched'] = True; row['utc_launch'] = utc(t_launch)
+        row['utc_launch'] = utc(t_launch)
+        launch(host, work, gate, row, stopper, guard, intent)
         say('launched %s; watching every %d s' % (work.name, WATCH_S))
-        watch(host, row, proc, stopper, t_start, t_launch, s['durations']['wall_s'], own)
+        watch(host, row, stopper, t_start, t_launch, deadline['staged_wall_s'], own)
     except Refused as e:
-        row['refused'] = str(e)
+        guard.cleaning = True; row['refused'] = str(e)
     except KeyboardInterrupt:
-        row['stopped'] = 'interrupted (Ctrl-C)'
+        guard.cleaning = True; row['stopped'] = 'interrupted (Ctrl-C)'
+    except OperatorSignalled as e:
+        guard.cleaning = True; row['stopped'] = 'operator signalled (%s)' % e.name
     except Exception as e:
-        row['error'] = '%s: %s' % (type(e).__name__, e)
+        guard.cleaning = True; row['error'] = '%s: %s' % (type(e).__name__, e)
+    except BaseException as e:            # SystemExit and the like: the same path, then raised again (addendum 3, item 1)
+        guard.cleaning = True; row['stopped'] = 'interrupted (%s)' % type(e).__name__; kept = e
     finally:
-        # Addendum 2, item 1: every step below runs to its end; the first BaseException of any of them is kept and raised
-        # again only after the record row and the summary are written.
-        steps = Steps(row)
+        # Addendum 3, item 1: from the spawn on, every way out comes here: stop the run (the observer by its identity when
+        # usable, else the launcher through its handle), wait for its cleanup, check for leftover mf-native instances,
+        # restore, write the row. Addendum 2, item 1: every step runs to its end; the first BaseException is kept and
+        # raised again only after the record row and the summary are written. Further signals are only recorded.
+        guard.cleaning = True
+        steps = Steps(row); steps.kept = kept
+        proc = stopper.proc if stopper is not None else None
+        if proc is not None:              # the row never says `launched: false` once the spawn returned
+            row['launched'] = True
+            if not isinstance(row.get('launcher'), dict):
+                row['launcher'] = {'pid': proc.pid, 'start': None, 'pgid': None, 'own_group': None}
+        if guard.pending is not None and row['stopped'] is None and row['error'] is None:
+            row['stopped'] = 'operator signalled (%s)' % getattr(guard.pending, 'name', type(guard.pending).__name__)
 
         def stop_if_running():
-            # Still running after Ctrl-C or an exception (the watch returns only once the launcher has ended, or after it
-            # gave up waiting, which is alerted): stop it the documented way and wait, boundedly.
+            # Still running after an interrupt, a signal or an exception (the watch returns only once the launcher has
+            # ended, or after it gave up waiting, which is alerted): stop it the documented way and wait, boundedly.
             if proc is not None and proc.poll() is None and not any('LEFT RUNNING' in a for a in row['alerts']):
                 stopper.attempt(); wait_after_stop(host, proc, stopper, row)
         steps.run('the stop', stop_if_running)
@@ -1173,29 +1384,46 @@ def cmd_run(host, args):
             else:                  # addendum 2, item 8: interrupted while recording: a minimal row, then raised again
                 steps.kept = steps.kept or e
                 row = steps.row = minimal_row(row, host, e)
+
         def append():
             append_record(host.record, row, host.fsync); return True
         written = steps.run('the record append (RECORD NOT WRITTEN to %s)' % host.record, append) is True
+        intent_left = finish_intent(host, intent, steps, restored, written)
 
         def summary():
             say('RUN SUMMARY')
             for line in summary_lines(row):
                 say(line)
+            if intent_left:
+                say(intent_left)
         steps.run('the summary', summary)
+        steps.run('putting the signal handlers back', guard.restore)
         steps.reraise()
-    if not restored or not written:
+    if not restored or not written or intent_left:
         return 3
     if row['refused']:
         return 2
-    if row['error'] or row['stopped']:
+    if row['error'] or row['stopped'] or row['signals_received']:
         return 1
     return 3 if row['alerts'] else 0
+
+
+def finish_intent(host, intent, steps, restored, written):
+    """Addendum 3, items 2 and 3: the intent file is removed only once the restore and the row are done. Otherwise it
+    stays, so that no path ends with neither a row nor the intent file; returns the line that says so, or None."""
+    if not intent.written:
+        return None
+    if restored and written and steps.run('removing the intent file', intent.remove) is True:
+        return None
+    return ('THE INTENT FILE %s WAS LEFT IN PLACE (%s): RUN `recover` BEFORE THE NEXT RUN' % (
+        intent.path, 'the restore or the row did not complete' if not (restored and written) else 'its removal failed'))
 
 
 def minimal_row(row, host, exc):
     """Addendum 2, item 8: what is known, for a row whose finishing was interrupted; it never counts."""
     keep = ('command', 'utc_start', 'profile', 'plan', 'announced', 'announced_note', 'launched', 'refused', 'error', 'stopped',
-            'staged_folder', 'twin_folder', 'utc_launch', 'launcher', 'stop', 'switch_offs', 'alerts')
+            'staged_folder', 'twin_folder', 'utc_launch', 'launcher', 'stop', 'switch_offs', 'deadline', 'signals_received',
+            'alerts')
     out = {k: row.get(k) for k in keep}
     out.update(utc_end=utc(host.now()), recording='interrupted while recording: %s' % type(exc).__name__, counts=False,
                verdicts=None, pipeline=None, memory=None, collector=None, post=None)
@@ -1323,18 +1551,23 @@ def cmd_load_test(host, args):
             % (PICKS_LABEL if s['pick_reader']['listed'] else 'nothing', ', '.join(o['instance_id'] for o in s['models']['others']) or 'nothing',
                model, BASELINE_S, model, args.hold_minutes))
         return 2 if s['refusals'] else 0
-    switch = SwitchOffs(host, result); lp = None; asked = False; base, hold = [], []
+    switch = SwitchOffs(host, result); lp = None; asked = False; base, hold = [], []; kept = None
+    guard = SignalGuard(host, result); intent = IntentFile(host)
     try:
+        guard.install()                                          # addendum 3, item 2: before the first switch-off
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
         work = fresh_folder(host, 'loadtest-' + re.sub(r'[^a-z0-9.-]', '-', model.lower()))
         result['staged_folder'] = str(work)
         stage(host, 'swarm8', ['--model', model], work)          # addendum 2, item 5: staging before any switch-off
-        say('check passed and staged; switching off: ' + s['announcement'])
+        say('check passed and staged; expected %d s, at most %d s; switching off: %s' % (
+            s['durations']['expected_s'], s['durations']['wall_s'], s['announcement']))
+        intent.write(**intent_start(host, 'load-test', result, s))
         switch.apply(s)
         settle_after_unloads(host, result)
         result['start_threshold'], result['free_at_start'] = require_free(host, work, result)
         lp = host.load_path(work, Path(str(work) + '-out'), model, hold_s)
+        intent.write(load_identifier=getattr(lp, 'identifier', None))
         lp.baseline()
         base, breach = sample_phase(host, BASELINE_S, t0)
         if breach:
@@ -1356,13 +1589,18 @@ def cmd_load_test(host, args):
                 if breach:
                     result['stopped'] = 'collector breach'; result['first_breach'] = breach
     except Refused as e:
-        result['refused'] = str(e)
+        guard.cleaning = True; result['refused'] = str(e)
     except KeyboardInterrupt:
-        result['stopped'] = 'interrupted (Ctrl-C)'
+        guard.cleaning = True; result['stopped'] = 'interrupted (Ctrl-C)'
+    except OperatorSignalled as e:
+        guard.cleaning = True; result['stopped'] = 'operator signalled (%s)' % e.name
     except Exception as e:
-        result['error'] = '%s: %s' % (type(e).__name__, e)
+        guard.cleaning = True; result['error'] = '%s: %s' % (type(e).__name__, e)
+    except BaseException as e:
+        guard.cleaning = True; result['stopped'] = 'interrupted (%s)' % type(e).__name__; kept = e
     finally:
-        steps = Steps(result)            # addendum 2, item 1: every step to its end, a Ctrl-C kept and raised at the end
+        guard.cleaning = True
+        steps = Steps(result); steps.kept = kept   # addendum 2, item 1: every step to its end, a Ctrl-C kept and raised at the end
         if lp is not None and asked:
             def unload():
                 proven, detail = lp.unload(); result['unload'] = {'proven': bool(proven), 'detail': detail}
@@ -1391,6 +1629,7 @@ def cmd_load_test(host, args):
                                                       re.sub(r'[^A-Za-z0-9.-]', '-', model)))
             write_json(path, result); say('result: %s' % path); return True
         written = steps.run('the result write (RESULT NOT WRITTEN)', write) is True
+        intent_left = finish_intent(host, intent, steps, restored, written)
 
         def summary():
             say('LOAD TEST %s: %s; baseline %s; after load %s; setup cost %s points; fall %s points; highest pressure %s; '
@@ -1399,18 +1638,148 @@ def cmd_load_test(host, args):
                     result.get('after_load'), result.get('setup_cost_points'), result.get('fall_points'),
                     result.get('highest_pressure_level'), result.get('swap_change_bytes'), result.get('collector'),
                     result['unload'].get('proven'), '; '.join(result['alerts']) or 'no alerts'))
+            if intent_left:
+                say(intent_left)
         steps.run('the summary', summary)
+        steps.run('putting the signal handlers back', guard.restore)
         steps.reraise()
-    if not restored or not written:
+    if not restored or not written or intent_left:
         return 3
     if result['refused']:
         return 2
-    if result['error'] or result['stopped']:
+    if result['error'] or result['stopped'] or result['signals_received']:
         return 1
     return 3 if result['alerts'] else 0
 
 
 # ============================================================================ check, record, main
+def cmd_recover(host, args):
+    """Addendum 3, item 2: after a run or load test that ended before its restore and its row (a KILL, a crash, a power
+    cut). Reads the intent file; puts the pick reader back from the recorded plist when it was loaded before and is not
+    now; reports whether the recorded launcher and its observer are alive (pid and start match) and, only with --stop,
+    stops the run the documented way (TERM to the observer when its identity is usable and it is the launcher's child,
+    else SIGINT to the launcher when its pid and start match); reports leftover mf-native instances (unloads nothing);
+    appends a row `recovered after an unfinished run`; removes the intent file. --dry-run changes nothing."""
+    say = host.out; t = host.now(); dry = args.dry_run
+    if not host.intent.exists():
+        say('recover: no intent file at %s: no unfinished run to recover; nothing was changed' % host.intent)
+        return 0
+    try:
+        intent = json.loads(host.intent.read_text())
+        if not isinstance(intent, dict):
+            raise ValueError('not a JSON object')
+    except (OSError, ValueError) as e:
+        say('THE INTENT FILE %s IS NOT READABLE (%s): NOTHING WAS CHANGED; READ IT BY HAND' % (host.intent, type(e).__name__))
+        return 3
+    tool = intent.get('tool') if isinstance(intent.get('tool'), dict) else {}
+    if type(tool.get('pid')) is int and tool['pid'] != host.self_pid and tool.get('start'):
+        seen = observed_identity(host, tool['pid'])
+        if seen is not None and seen['start'] == tool['start']:
+            say('refused: THE TOOL THAT WROTE THE INTENT FILE (pid %d) IS STILL RUNNING: ITS OWN CLEANUP RESTORES; nothing '
+                'was changed' % tool['pid'])
+            return 2
+    row = {'command': 'recover', 'utc_start': utc(t), 'utc_end': None, 'recovered': RECOVERED, 'dry_run': dry,
+           'intent': intent, 'pick_reader': None, 'launcher_alive': None, 'observer_alive': None, 'stop': None,
+           'launcher_alive_after': None, 'observer_alive_after': None, 'native_loaded': None, 'post': None,
+           'counts': False, 'alerts': []}
+    would = []
+    # the pick reader
+    before = ((intent.get('pick_reader') or {}).get('before') or {}) if isinstance(intent.get('pick_reader'), dict) else {}
+    now = pick_reader_state(host)
+    pr = row['pick_reader'] = {'label': PICKS_LABEL, 'before': before, 'found': now, 'bootstrap_exit': None, 'after': now}
+    if before.get('listed') and not now['listed']:
+        if not before.get('plist'):
+            row['alerts'].append('PICK READER NOT RESTORED: THE INTENT RECORDS NO PLIST; BOOTSTRAP %s BY HAND' % PICKS_LABEL)
+        elif dry:
+            would.append('bootstrap %s from %s' % (PICKS_LABEL, before['plist']))
+        else:
+            r = host.run(['/bin/launchctl', 'bootstrap', 'gui/%d' % host.uid, before['plist']], timeout=CMD_S)
+            pr['bootstrap_exit'] = r.returncode; pr['after'] = pick_reader_state(host)
+            if not pr['after']['listed']:
+                row['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN FROM %s; BOOTSTRAP IT BY HAND' % (
+                    PICKS_LABEL, before['plist']))
+    reader_ok = not before.get('listed') or bool(pr['after'] and pr['after']['listed'])
+    # the launcher and its observer
+    launcher = intent.get('launcher') if isinstance(intent.get('launcher'), dict) else None
+
+    def alive():
+        why_l = launcher_mismatch(host, launcher) if launcher else 'the intent records no launcher'
+        identity = None
+        if intent.get('work'):
+            try:
+                identity = json.loads((Path(intent['work']) / 'builder' / IDENTITY_FILE).read_text())
+            except (OSError, ValueError, TypeError):
+                identity = None
+        why_o = identity_mismatch(host, identity)
+        return why_l, identity, why_o
+    why_l, identity, why_o = alive()
+    row['launcher_alive'], row['observer_alive'] = why_l is None, why_o is None
+    if launcher and not launcher.get('start') and type(launcher.get('pid')) is int and observed_identity(host, launcher['pid']):
+        row['alerts'].append('PID %d (THE RECORDED LAUNCHER) IS ALIVE BUT ITS START WAS NEVER READ: THE TOOL CANNOT TELL '
+                             'WHETHER IT IS THE LAUNCHER; CHECK IT BY HAND' % launcher['pid'])
+    if args.stop and (why_l is None or why_o is None):
+        stop = row['stop'] = {'by': None, 'pid': None, 'utc': None, 'not_signalled': None}
+        unusable = observer_unusable(host, identity, launcher['pid'] if launcher else None, why_l) if why_o is None else why_o
+        if unusable is None:
+            target, sig, by = identity['pid'], signal.SIGTERM, 'observer'
+        elif why_l is None and launcher['pid'] > 1 and launcher['pid'] not in (host.self_pid, host.parent_pid):
+            target, sig, by = launcher['pid'], LAUNCHER_STOP_SIGNAL, 'launcher interrupt'
+        else:
+            target = None; stop['not_signalled'] = unusable
+        if target is not None and dry:
+            would.append('send %s to %d (%s)' % (signal.Signals(sig).name, target, by))
+        elif target is not None:
+            host.send_signal(target, sig); sent = host.now()
+            stop.update(by=by, pid=target, signal=signal.Signals(sig).name, utc=utc(sent))
+            while host.now() < sent + STOP_WAIT_S:
+                host.sleep(WATCH_S)
+                a_l, _, a_o = alive()
+                if a_l is not None and a_o is not None:
+                    break
+    if row['stop'] is not None and row['stop']['by'] is not None:
+        a_l, _, a_o = alive()
+        row['launcher_alive_after'], row['observer_alive_after'] = a_l is None, a_o is None
+    else:
+        row['launcher_alive_after'], row['observer_alive_after'] = row['launcher_alive'], row['observer_alive']
+    if row['launcher_alive_after']:
+        row['alerts'].append('LAUNCHER STILL RUNNING: pid %d (started %s)%s' % (
+            launcher['pid'], launcher['start'], '' if args.stop else '; `recover --stop` stops it the documented way'))
+    if row['observer_alive_after']:
+        row['alerts'].append('OBSERVER STILL RUNNING: pid %d%s' % (
+            identity['pid'], '' if args.stop else '; `recover --stop` stops it the documented way'))
+    # leftover instances: reported, never unloaded
+    post_state(host, row)
+    row['native_loaded'] = row['post']['native_loaded']
+    row['utc_end'] = utc(host.now())
+    say('recover: intent %s from %s (%s), work %s' % (host.intent, intent.get('utc'), intent.get('command'), intent.get('work')))
+    say('  pick reader: before %s, found %s, after %s' % (before.get('listed'), now['listed'], (pr['after'] or {}).get('listed')))
+    say('  launcher alive %s, observer alive %s; after: %s, %s; stop %s' % (
+        row['launcher_alive'], row['observer_alive'], row['launcher_alive_after'], row['observer_alive_after'], row['stop']))
+    say('  mf-native loaded %s; models unloaded by the run, %s: %s' % (
+        row['native_loaded'], NOT_RELOADED, ', '.join(intent.get('models_to_unload') or []) or 'none'))
+    for alert in row['alerts']:
+        say(alert)
+    if dry:
+        say('dry run: would %s, append the row %r and remove the intent file. Nothing was changed.' % (
+            '; '.join(would) or 'change nothing else', RECOVERED))
+        return 0
+    try:
+        append_record(host.record, row, host.fsync); written = True
+    except Exception as e:
+        say('THE RECOVER ROW WAS NOT WRITTEN TO %s: %s: %s; THE INTENT FILE IS KEPT' % (host.record, type(e).__name__, e))
+        written = False
+    if written and reader_ok:
+        intent_file = IntentFile(host)
+        try:
+            intent_file.remove()
+            say('the intent file %s was removed' % host.intent)
+        except OSError as e:
+            say('THE INTENT FILE %s COULD NOT BE REMOVED: %s' % (host.intent, e)); return 3
+    elif written:
+        say('THE INTENT FILE %s IS KEPT: THE PICK READER IS NOT RESTORED' % host.intent)
+    return 0 if written and reader_ok and not row['alerts'] else 3
+
+
 def cmd_check(host, args):
     if args.dry_run:
         host.out('dry run: check would read LM Link\'s state (lms link status), LM Studio\'s model list (GET %s/api/v1/models), '
@@ -1435,6 +1804,10 @@ def cmd_record(host, args):
         host.out('%d damaged line%s in %s skipped: never counted as a run, never a reset' % (
             damaged, '' if damaged == 1 else 's', host.record))
     for r in rows:
+        if r.get('command') == 'recover':
+            host.out('%s recover: %s; launcher alive %s; mf-native loaded %s' % (
+                r.get('utc_start'), r.get('recovered'), r.get('launcher_alive'), r.get('native_loaded')))
+            continue
         host.out('%s %s %s %s: %s; verdicts %s; counts %s' % (
             r.get('utc_start'), r.get('command'), r.get('profile'), plan_label(r.get('plan')),
             r.get('refused') and 'refused' or r.get('error') and 'error' or r.get('stopped') or ('ran' if r.get('launched') else 'not launched'),
@@ -1447,9 +1820,11 @@ def cmd_record(host, args):
 def parser():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='cmd', required=True)
-    for name in ('check', 'load-test', 'run', 'record'):
+    for name in ('check', 'load-test', 'run', 'record', 'recover'):
         q = sub.add_parser(name)
         q.add_argument('--dry-run', action='store_true')
+        if name == 'recover':
+            q.add_argument('--stop', action='store_true', help='stop a surviving run the documented way')
         if name in ('check', 'run'):
             q.add_argument('--profile', choices=SWARM_PROFILES, default='swarm8' if name == 'check' else None, required=name == 'run')
             q.add_argument('--model'); q.add_argument('--setup-model'); q.add_argument('--turns-model')
@@ -1476,6 +1851,8 @@ def main(argv=None, host=None):
             return cmd_check(host, args)
         if args.cmd == 'record':
             return cmd_record(host, args)
+        if args.cmd == 'recover':
+            return cmd_recover(host, args)
         if args.cmd == 'load-test':
             return cmd_load_test(host, args)
         return cmd_run(host, args)
