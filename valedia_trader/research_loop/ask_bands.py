@@ -39,6 +39,7 @@ from urllib.parse import quote
 import numpy as np
 
 from valedia_trader.research_loop import REPO
+from valedia_trader.venues import kalshi_data as kd
 from valedia_trader.venues import kalshi_history as kh
 
 UTC = timezone.utc
@@ -60,8 +61,8 @@ NOTE = "information: decides nothing"
 CELLS = tuple((5 + 5 * k, 9 + 5 * k) for k in range(17)) + ((90, 95),)         # 5-9, 10-14, ..., 85-89, 90-95
 SIDE_SKIPS = ("price_missing", "price_invalid", "price_not_whole_cent", "price_out_of_range", "other_quote_unusable",
               "crossed_or_locked", "outside_5_95")
-MARKET_SKIPS = ("bad_ticker", "duplicate_ticker", "bad_result", "bad_candle_record", "no_candle", "ambiguous_moment")
-UNASSIGNED = ("bad_record", "bad_event", "bad_time", "bad_ticker", "no_stored_candle")
+MARKET_SKIPS = ("bad_ticker", "bad_result", "bad_candle_record", "no_candle", "ambiguous_moment")
+UNASSIGNED = ("bad_record", "duplicate_ticker", "bad_event", "bad_time", "bad_ticker", "no_stored_candle")
 
 # the labelled purchase moments of each universe: seconds before the close (None: the last stored candle)
 MOMENTS = {"W": {"24h": 24 * 3600, "12h": 12 * 3600}, "S": {"last": None}}
@@ -342,6 +343,41 @@ def _event_periods(items: list[tuple[str, bool]]) -> dict[str, str]:
     return {ev: ("sealed" if s else "development") for ev, s in sealed.items()}
 
 
+def _repeated_tickers(rows) -> set:
+    """Tickers listed more than once anywhere in a universe's whole listing (both periods: a ticker is neither a price
+    nor a result). Every copy of such a ticker is left out."""
+    counts = Counter(r.get("ticker") for r in rows if isinstance(r, dict) and type(r.get("ticker")) is str)
+    return {t for t, n in counts.items() if n > 1}
+
+
+def _raw_candle(raw) -> dict:
+    """One stored S candle in normalize_candle's shape, but with each quote's closing value left as stored: kalshi_data's
+    float conversion turns a JSON false into 0.0, so the raw value is judged here. A numeric string becomes a number;
+    a bool, null, list or non-numeric string stays as it is and is refused later by to_cents."""
+    if not isinstance(raw, dict):
+        raise _BadCandle()
+    try:
+        end = int(raw["end_period_ts"])
+    except (KeyError, TypeError, ValueError):
+        raise _BadCandle() from None
+
+    def close(name):
+        b = raw.get(name)
+        v = kd._pick(b, "close") if isinstance(b, dict) else None
+        if isinstance(v, str):
+            try:
+                return float(v)
+            except ValueError:
+                return v
+        return v
+    return {"end_ts": end, "yes_bid": {"close": close("yes_bid")}, "yes_ask": {"close": close("yes_ask")}}
+
+
+def _s_candles(store, ticker: str) -> list[dict]:
+    return [_raw_candle(json.loads(r["raw"]))
+            for r in store.db.execute("SELECT raw FROM candles WHERE ticker = ? ORDER BY end_ts", (ticker,))]
+
+
 def _valid_event(v) -> bool:
     return type(v) is str and bool(v.strip())
 
@@ -369,9 +405,13 @@ def _collect_w(period: str, weather_dir: Path):
     markets = json.loads(mfile.read_text())["markets"]
     unassigned: Counter = Counter()
     seen = []                                           # (index, event, close ts, sealed): no price, no result
+    repeated = _repeated_tickers(markets)
     for i, m in enumerate(markets):
         if not isinstance(m, dict):
             unassigned["bad_record"] += 1
+            continue
+        if m.get("ticker") in repeated:
+            unassigned["duplicate_ticker"] += 1
             continue
         ev = m.get("event_ticker")
         if not _valid_event(ev):
@@ -387,7 +427,7 @@ def _collect_w(period: str, weather_dir: Path):
     del seen
     labels = MOMENTS["W"]
     results = {label: LabelResult() for label in labels}
-    tickers, events = set(), set()
+    events = set()
     n_files, size, mt_lo, mt_hi = 0, 0, None, None
     for i, ev, ts in keep:
         m = markets[i]
@@ -396,10 +436,6 @@ def _collect_w(period: str, weather_dir: Path):
         if type(ticker) is not str or not _TICKER_OK.match(ticker):
             _ingest(results, ev, None, None, "bad_ticker")
             continue
-        if ticker in tickers:
-            _ingest(results, ev, None, None, "duplicate_ticker")
-            continue
-        tickers.add(ticker)
         result = m.get("result")
         if type(result) is not str or result not in ("yes", "no"):
             _ingest(results, ev, None, None, "bad_result")
@@ -429,8 +465,12 @@ def _collect_s(period: str, db: Path):
         rows = [r for r in store.markets() if isinstance(r, dict) and r.get("series") in set(kh.SERIES.values())]
         unassigned: Counter = Counter()
         seen = []                                       # (index, event, purchase moment, sealed)
+        repeated = _repeated_tickers(rows)
         for i, r in enumerate(rows):
             ev, ticker = r.get("event_ticker"), r.get("ticker")
+            if ticker in repeated:
+                unassigned["duplicate_ticker"] += 1
+                continue
             if not _valid_event(ev):
                 unassigned["bad_event"] += 1
                 continue
@@ -459,7 +499,7 @@ def _collect_s(period: str, db: Path):
                 _ingest(results, ev, None, None, "bad_result")
                 continue
             try:
-                choices = _choices(store.candles(r["ticker"]), ts, labels)
+                choices = _choices(_s_candles(store, r["ticker"]), ts, labels)
             except Exception:                                   # a stored row that cannot be read
                 _ingest(results, ev, result, None, "bad_candle_record")
                 continue
