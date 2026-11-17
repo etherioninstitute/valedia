@@ -92,7 +92,7 @@ import pandas as pd
 from valedia_trader.execution_and_risk.order_step import (CANCEL_WORDS, NOT_SENT, OPEN_STATES, TEST_ENVIRONMENT, _RunLock,
                                                           _sandbox_host, _sync_file, _venue_error, ledger_path_for,
                                                           open_ledger, wall_clock)
-from valedia_trader.execution_and_risk.orders import STATES, OrderError, OrderLedger, OrdersBlocked
+from valedia_trader.execution_and_risk.orders import NOTICE_KINDS, STATES, OrderError, OrderLedger, OrdersBlocked
 from valedia_trader.venues.kalshi_data import MARKET_RECORD_KEYS
 from valedia_trader.venues.webull import EVENTS_CLASS, parse_event_name
 
@@ -348,26 +348,61 @@ def _dec(x) -> Decimal | None:
     return Decimal(repr(v)) if v is not None else None
 
 
+CENT_SLACK = Decimal("0.000001")                         # cents: the ledger keeps floats; a millionth of a cent is them
+UNIT_SLACK = Decimal("0.000000001")                      # contracts, likewise
+
+
+def _near_cents(d: Decimal) -> int | None:
+    """`d` dollars as whole cents when it is within CENT_SLACK of a whole cent (the float sums of the ledger's rows),
+    else None."""
+    try:
+        c = d * 100
+        r = c.to_integral_value()
+        return int(r) if c.is_finite() and abs(c - r) <= CENT_SLACK else None
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
+
+
 def known_cents(fills: list[dict], settlements: list[dict]) -> tuple[int | None, str | None]:
-    """The ledger's cumulative known cash in whole cents: each fill's cash (a purchase: minus price times contracts
-    minus its fee; a sale: plus price times contracts minus its fee) plus each settlement's payout. (None, why) when
-    a piece is not known exactly: a fill not yet applied, without a fee, without a price for all its contracts
-    (price_covers_units differing from its units), or not in whole cents."""
-    total = 0
+    """The ledger's cumulative known cash in whole cents, from its fill rows as orders.py writes them, plus each
+    settlement's payout. The rows are taken order by order (by tag): a row's units are signed like its order (a sale
+    negative), its price covers `price_covers_units` contracts, a positive count, and a row of 0 units carries only a
+    later fee or a later price. For each order, a purchase costs price times contracts plus its fees and a sale brings
+    price times contracts less its fees. (None, why) when a piece is not known exactly: a fill not yet applied, a row
+    with contracts and no fee, an order whose priced contracts are not exactly its filled contracts, or a figure not
+    in whole cents. orders.py signs every row of an order like the order, so an order's summed units give its side."""
+    orders: dict = {}
     for f in fills:
         if not f.get("applied"):
             return None, "a fill is not yet applied"
-        units, fee = _dec(f.get("units")), _dec(f.get("fee"))
-        if units is None or fee is None:
-            return None, "a fill has no readable number of contracts or no fee"
-        if units == 0:
-            piece = -fee
+        units = _dec(f.get("units"))
+        if units is None:
+            return None, "a fill has no readable number of contracts"
+        o = orders.setdefault(f.get("tag"), {"units": Decimal(0), "covered": Decimal(0), "value": Decimal(0),
+                                             "fee": Decimal(0)})
+        fee = f.get("fee")
+        if fee is None:
+            if units != 0:
+                return None, "a fill has no fee"
         else:
-            price, covers = _dec(f.get("price")), _dec(f.get("price_covers_units"))
-            if price is None or covers is None or covers != units:
-                return None, "a fill has no price for all its contracts"
-            piece = -(price * units) - fee
-        c = _whole_cents(piece)
+            fee = _dec(fee)
+            if fee is None or fee < 0:
+                return None, "a fill's fee cannot be read"
+            o["fee"] += fee
+        o["units"] += units
+        price, covers = f.get("price"), f.get("price_covers_units")
+        if price is not None or covers is not None:
+            price, covers = _dec(price), _dec(covers)
+            if price is None or covers is None or price < 0 or not covers > 0:
+                return None, "a fill's price cannot be read"
+            o["covered"] += covers
+            o["value"] += price * covers
+    total = 0
+    for o in orders.values():
+        if abs(o["covered"] - abs(o["units"])) > UNIT_SLACK:
+            return None, "a fill has no price for all its contracts"
+        cash = (o["value"] if o["units"] < 0 else -o["value"]) - o["fee"]     # a sale brings, a purchase pays
+        c = _near_cents(cash)
         if c is None:
             return None, "a fill's cash is not in whole cents"
         total += c
@@ -394,7 +429,7 @@ def _cash_equation(prev: dict | None, now: dict, rows: list[dict]) -> tuple[dict
                "known_prev_cents": prev["known_cents"] if prev else None, "known_now_cents": now["known_cents"],
                "payout_cents": payout, "difference_cents": None}
     if prev is None:
-        return figures, "there is no earlier reading after a clean reconcile with its buying power and known cash"
+        return figures, "there is no earlier clean reading with its buying power and known cash"
     if now["cents"] is None:
         return figures, f"this run's reading is unread: {now['unread']}"
     if now["known_cents"] is None:
@@ -407,6 +442,24 @@ def _cash_equation(prev: dict | None, now: dict, rows: list[dict]) -> tuple[dict
         return figures, (f"buying power moved by {moved} cents, the ledger knows of {known} cents and the payouts are "
                          f"{payout} cents: a difference of {diff} cents")
     return figures, None
+
+
+def _cash_words(f: dict) -> str:
+    """The figures a person needs, in words: both readings where both exist, the known cash between them, the payouts
+    expected and the difference in cents; "no earlier clean reading" where there is none."""
+    def cents(x):
+        return "unread" if x is None else f"{x} cents"
+    words = ["no earlier clean reading" if f["reading_prev"] is None
+             else f"buying power {cents(f['prev_cents'])} at reading {f['reading_prev']}",
+             f"{cents(f['now_cents'])} at reading {f['reading_now']} now"]
+    if f["known_prev_cents"] is not None and f["known_now_cents"] is not None:
+        words.append(f"the known cash between them {f['known_now_cents'] - f['known_prev_cents']} cents")
+    elif f["known_now_cents"] is None:
+        words.append("the known cash now unknown")
+    words.append("payouts expected " + ("not in whole cents" if f["payout_cents"] is None else f"{f['payout_cents']} cents"))
+    if f["difference_cents"] is not None:
+        words.append(f"a difference of {f['difference_cents']} cents")
+    return "; ".join(words)
 
 
 def _settle_blockers(sym: str, unapplied: set, busy: set) -> None:
@@ -1203,7 +1256,7 @@ class _Run:
             return True
         names = ", ".join(j["symbol"] for j in judged)
         reason = (f"Kalshi's record shows the result of {names}, but the account's cash does not confirm the holding was "
-                  f"still there ({why}); nothing of it is settled")
+                  f"still there ({why}; {_cash_words(figures)}); nothing of it is settled")
         pids = self.state.add_pending(judged, figures, reason, self.batch)
         self._journal_rows()
         raise _Stop("settlement", f"{reason}; pending record(s) {', '.join(map(str, pids))} wait for a person: "
@@ -1374,6 +1427,12 @@ class _Run:
             self._quiet(before=False)
             self.stage = "account"
             self._account_now(kind, p["symbol"], result)
+            if kind == "confirm":
+                expected = _as_float(self._applied_positions(baseline).get(p["symbol"]))
+                if expected is None or abs(expected - float(p["units"])) > 1e-9:
+                    raise _Stop("account", f"the pending record holds {float(p['units']):g} of {p['symbol']} but the ledger "
+                                           f"now expects {expected if expected is None else format(expected, 'g')}: a "
+                                           "fill arrived since it was made; the record stays open; a person must look")
             return self._confirm(p) if kind == "confirm" else self._withdraw(p)
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
@@ -1391,7 +1450,7 @@ class _Run:
             reasons.append("an order of this ledger is open or of unknown outcome")
         if self.ledger.unapplied_fills():
             reasons.append("a fill is not yet journaled")
-        if self.ledger.attention():
+        if [a for a in self.ledger.attention() if a.get("kind") not in NOTICE_KINDS]:     # a notice never blocks
             reasons.append("an attention item is open on the ledger")
         if before:
             rows = (self.state.readings(), self.state.pending(), self.state.settlements(), self.state.withdrawals())

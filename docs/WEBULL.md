@@ -233,7 +233,8 @@ what settlement looks like.
     filled. The record is read from `/markets/<ticker>`, and from `/historical/markets/<ticker>` only when the
     first answers 404.
   - *The account's own cash.* Every run reads buying power once, only with no order of its own open, together
-    with the cash the ledger knows: every fill's cost or proceeds less its fee, plus every settlement's payout.
+    with the cash the ledger knows: for each order, a purchase's price times its contracts plus its fees paid, a
+    sale's price times its contracts less its fees received, plus every settlement's payout.
     A holding gone now is confirmed only against the latest earlier reading taken after a clean reconcile with
     both figures read; a reading taken while a holding is missing never counts. That reading need not have shown
     the holding: one bought after it is sound, because every fill between the two readings is inside the known
@@ -259,7 +260,8 @@ what settlement looks like.
   open or not yet journaled, and runs the same reconcile `--reconcile-only` makes. That reconcile must show the
   pending name at exactly 0 and nothing else different (other names pending with it, also at 0, aside). Only then
   does it read Kalshi's record again and require the same safe values. It journals the settlement with
-  `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. Any refusal
+  `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. It also refuses
+  when the pending record's contracts differ from what the ledger now expects (a fill arrived since). Any refusal
   journals nothing, changes no practice state and says why. If the holding is back in the account in full, no one
   settles it: `--withdraw-pending ID --who NAME --note TEXT` closes the record without a settlement, only on a
   clean reconcile. A later run never settles a pending record by itself. The 17 November holding has no earlier

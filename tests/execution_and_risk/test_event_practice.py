@@ -1335,11 +1335,11 @@ def test_known_cash_follows_the_ledger_as_it_stores_a_purchase_and_a_sale():
     assert ep.known_cents([], [{"units": 2.0, "price": "1.00"}, {"units": 1.0, "price": "0.00"}]) == (200, None)
 
 
-@pytest.mark.parametrize("withheld", ["price", "fee", "unapplied", None])
+@pytest.mark.parametrize("withheld", ["price", "fee", "unapplied", "half cent", None])
 def test_known_cash_is_unknown_when_the_venue_withholds_a_piece(withheld):
     led, venue = OrderLedger(), CashVenue()
     venue.give_price, venue.give_fee = withheld != "price", withheld != "fee"
-    trade(led, venue, f"{T}:yes", 2, [(1, 40, 1), (1, 42, 1)])
+    trade(led, venue, f"{T}:yes", 2, [(1, 40, 1), (1, 42.5 if withheld == "half cent" else 42, 1)])
     fills = led.fills()
     if withheld == "unapplied":
         fills = [{**fills[0], "applied": 0}] + fills[1:]

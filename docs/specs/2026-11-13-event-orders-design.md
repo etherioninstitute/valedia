@@ -79,9 +79,13 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   If any of this fails, nothing is settled and the run stops as before, naming the fact. The holdings gone in one
   run (K) are judged together; if one fails, none is settled.
 - *Second witness: the account's cash.* Each run reads buying power once, only with no order of the ledger open,
-  and stores it with the ledger's known cash in whole cents: each fill's cost (a purchase) or proceeds (a sale)
-  less its fee, plus each settlement's payout. A fill without a price for all its contracts or without a fee, or
-  a figure not in whole cents, makes the known cash unknown. `prev` is the latest reading taken after a clean
+  and stores it with the ledger's known cash in whole cents. That is, order by order, a purchase's price times its
+  contracts plus its fees taken away, a sale's price times its contracts less its fees added, plus each
+  settlement's payout. The ledger stores a sale's contracts as a negative number and the contracts its price
+  covers as a positive one. An order whose filled contracts are not all priced, a fill with contracts and no fee,
+  or a figure not in whole cents (beyond the ledger's float rounding, a millionth of a cent) makes the known cash
+  unknown. The stop at `settlement` gives the figures: both readings, the known cash between them, the payouts
+  expected and the difference in cents, or "no earlier clean reading". `prev` is the latest reading taken after a clean
   reconcile with both figures read; a reading taken while a holding is missing never counts. It need not have shown
   K: a holding bought after it is sound, because every fill between the two readings is inside the known cash. K is
   settled only if, exactly, `now - prev == (known_now - known_prev) + payouts(K)`.
@@ -103,7 +107,8 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   - `--confirm-settlement ID` needs the account to show the pending name at exactly 0, with nothing else different
     (other names pending with it, also at 0, aside: holdings gone together are confirmed one by one). It then reads
     Kalshi's record again and requires the first witness again. It journals the settlement with `witnesses`
-    "kalshi_record+person", who and the note, and reconciles for a fresh reading.
+    "kalshi_record+person", who and the note, and reconciles for a fresh reading. It is refused when the pending
+    record's contracts differ from what the ledger now expects of that name (a fill arrived since).
   - `--withdraw-pending ID` is for a holding that is back in the account in full. It needs a clean reconcile and
     closes the record without a settlement, with a `settlement_withdrawn` line carrying who and the note. If the
     holding goes again later, a new pending record is made.
