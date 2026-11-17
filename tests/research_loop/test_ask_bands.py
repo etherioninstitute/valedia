@@ -81,7 +81,7 @@ def write_w(root, specs, *, corrupt=(), candles_override=None, skip_files=()):
 
 
 def s_blk(v):
-    d = None if v is None else "%.4f" % (v / 100)
+    d = "%.4f" % (v / 100) if type(v) is int else v            # an int is cents; anything else is stored as given
     return {"open_dollars": d, "high_dollars": d, "low_dollars": d, "close_dollars": d}
 
 
@@ -155,6 +155,9 @@ def gen_mirrored(seed, n_events, *, sealed=False, edge=8):
         out.append(Spec(ev, ev + "-A", when, "yes" if yes_a else "no", m - 1, m + 1))
         out.append(Spec(ev, ev + "-B", when, "no" if yes_a else "yes", 99 - m, 101 - m))
     return out
+
+
+MIRROR_SEED = 60
 
 
 def canon(obj):
@@ -503,15 +506,15 @@ def test_a_market_without_a_usable_event_or_time_is_counted_unassigned(tmp_path)
     assert col.markets_in_period == 1
 
 
-def test_duplicate_tickers_and_unsafe_tickers_are_skipped(tmp_path):
+def test_unsafe_tickers_are_skipped(tmp_path):
     write_w(tmp_path, [one_market()])
     p = Path(tmp_path) / "artifacts" / "kalshi_weather" / "markets.json"
     d = json.loads(p.read_text())
-    d["markets"].append(dict(d["markets"][0]))                                   # same ticker again
     d["markets"].append(dict(d["markets"][0], ticker="../../etc/passwd", event_ticker="KXHIGHNY-E2"))
+    d["markets"].append(dict(d["markets"][0], ticker=None, event_ticker="KXHIGHNY-E3"))
     p.write_text(json.dumps(d))
     col = ab.collect("W", "development", root=tmp_path)
-    assert col.labels["24h"].market_skips == {"duplicate_ticker": 1, "bad_ticker": 1}
+    assert col.labels["24h"].market_skips == {"bad_ticker": 2}
     assert len(col.labels["24h"].trades) == 2
 
 
@@ -781,3 +784,199 @@ def test_cost_variants_change_only_the_information_tables(tmp_path):
     fee = r["information_kalshi_taker_fee"]["cell_table"][8]
     assert cheap["trades"] == base["trades"] and cheap["total_result_cents"] == base["total_result_cents"] + base["trades"]
     assert fee["trades"] == base["trades"] and fee["mean_price_cents"] == base["mean_price_cents"]
+
+
+# ---------------------------------------------------------------- addendum 2: a bool is never a price (S)
+BAD_RAW = [(False, "price_invalid"), (True, "price_invalid"), (None, "price_missing"), ("", "price_invalid"),
+           ("abc", "price_invalid"), ([1], "price_invalid")]
+
+
+@pytest.mark.parametrize("which", ["bid", "ask"])
+@pytest.mark.parametrize("raw,reason", BAD_RAW, ids=[repr(r) for r, _ in BAD_RAW])
+def test_s_judges_the_raw_stored_quote_before_any_conversion(tmp_path, which, raw, reason):
+    when = datetime(2026, 1, 10, 18, 0, tzinfo=UTC)
+    bid, ask = (raw, 52) if which == "bid" else (50, raw)
+    write_s(tmp_path, [Spec("KXNBAGAME-E1", "KXNBAGAME-E1-X", when, "yes", bid, ask)])
+    lab = ab.collect("S", "development", root=tmp_path).labels["last"]
+    assert lab.trades == [] and lab.sides_considered == 2
+    assert lab.side_skips == {reason: 1, "other_quote_unusable": 1}
+
+
+def test_s_numeric_strings_are_still_prices(tmp_path):
+    when = datetime(2026, 1, 10, 18, 0, tzinfo=UTC)
+    write_s(tmp_path, [Spec("KXNBAGAME-E1", "KXNBAGAME-E1-X", when, "yes", "0.5000", "0.5200")])
+    assert sorted(t[1] for t in ab.collect("S", "development", root=tmp_path).labels["last"].trades) == [50, 52]
+
+
+# ---------------------------------------------------------------- addendum 2: a repeated ticker is not used at all
+def _dup_root(tmp_path, copies):
+    good_d = one_market(ev="KXHIGHNY-GOODD", close=datetime(2023, 6, 1, 5, 0, tzinfo=UTC))
+    good_s = one_market(ev="KXHIGHNY-GOODS", close=datetime(2025, 6, 1, 5, 0, tzinfo=UTC))
+    write_w(tmp_path, [good_d, good_s] + copies)
+    return tmp_path
+
+
+def _dup_assert(root, bad_events, copies_n):
+    runs = {p: ab.collect("W", p, root=root) for p in ("development", "sealed")}
+    for p, col in runs.items():
+        assert col.unassignable == {"duplicate_ticker": copies_n}, p              # the same count in both runs
+        lab = col.labels["24h"]
+        assert {t[0] for t in lab.trades} == {"KXHIGHNY-GOODD" if p == "development" else "KXHIGHNY-GOODS"}
+        assert col.markets_in_period == 1 and col.events_in_period == 1 and lab.market_skips == {}
+        assert not ({t[0] for t in lab.trades} & set(bad_events))
+
+
+def test_a_ticker_in_a_development_and_a_sealed_event_is_left_out_everywhere(tmp_path):
+    a = Spec("KXHIGHNY-DUPD", "KXHIGHNY-SHARED", datetime(2023, 6, 2, 5, 0, tzinfo=UTC), "yes", 50, 52)
+    b = Spec("KXHIGHNY-DUPS", "KXHIGHNY-SHARED", datetime(2025, 6, 2, 5, 0, tzinfo=UTC), "no", 50, 52)
+    _dup_assert(_dup_root(tmp_path, [a, b]), ["KXHIGHNY-DUPD", "KXHIGHNY-DUPS"], 2)
+
+
+@pytest.mark.parametrize("second_result", ["no", "yes"], ids=["different results", "identical copies"])
+def test_a_ticker_twice_in_one_event_is_left_out_whether_the_copies_agree_or_not(tmp_path, second_result):
+    when = datetime(2023, 6, 2, 5, 0, tzinfo=UTC)
+    a = Spec("KXHIGHNY-DUPD", "KXHIGHNY-SHARED", when, "yes", 50, 52)
+    b = Spec("KXHIGHNY-DUPD", "KXHIGHNY-SHARED", when, second_result, 50, 52)
+    root = _dup_root(tmp_path, [a, b])
+    for p in ("development", "sealed"):
+        col = ab.collect("W", p, root=root)
+        assert col.unassignable == {"duplicate_ticker": 2} and col.markets_in_period == 1
+        assert "KXHIGHNY-DUPD" not in {t[0] for t in col.labels["24h"].trades}
+
+
+def test_a_ticker_three_times_counts_all_three_copies(tmp_path):
+    when = datetime(2023, 6, 2, 5, 0, tzinfo=UTC)
+    copies = [Spec("KXHIGHNY-DUPD", "KXHIGHNY-SHARED", when, "yes", 50, 52) for _ in range(3)]
+    root = _dup_root(tmp_path, copies)
+    assert ab.collect("W", "development", root=root).unassignable == {"duplicate_ticker": 3}
+
+
+# ---------------------------------------------------------------- addendum 2: pins for the decision rule
+def fake_col(trades, period="development", universe="W"):
+    lab = ab.LabelResult(trades=trades)
+    labels = {"24h": lab, "12h": ab.LabelResult()} if universe == "W" else {"last": lab}
+    evs = {t[0] for t in trades}
+    return ab.Collected(universe, period, {}, len(trades), len(evs), labels, {})
+
+
+def winners(n_events, per_event, paid=48):
+    return [("E%04d" % i, paid, True) for i in range(n_events) for _ in range(per_event)]
+
+
+def win_and_lose(n_events, paid=48):
+    return [("E%04d" % i, paid, w) for i in range(n_events) for w in (True, False)]
+
+
+def fixed_p(monkeypatch, k):
+    monkeypatch.setattr(ab, "event_p", lambda totals: (k, k / 2000))
+
+
+BAND = (40, 50)            # holds a price of 48
+
+
+def test_program_path_resamples_events_not_trades(tmp_path):
+    """Mirrored universe: the trade-level p-value is under 0.025, the event-level one is over; develop must fail."""
+    write_w(tmp_path, gen_mirrored(MIRROR_SEED, 200))
+    r = develop(tmp_path)["result"]
+    s1 = r["step_1"]
+    col = ab.collect("W", "development", root=tmp_path)
+    sub = ab.band_trades(col.labels["24h"].trades, *s1["band"])
+    res = np.array([ab.trade_result(p, w, 2) for _, p, w in sub])
+    assert res.sum() > 0 and s1["mean_cents"] > 0
+    idx = np.random.default_rng(20261117).integers(0, len(res), size=(2000, len(res)))
+    assert float(np.mean(res[idx].sum(axis=1) <= 0)) < 0.025                 # trade-level resampling would pass
+    assert s1["p_value"] > 0.025 and s1["verdict"] == "FAIL" and s1["failed"] == ["p_above_0.025"]
+
+
+def test_the_p_limit_is_inclusive_in_development(monkeypatch):
+    col = fake_col(winners(150, 2))
+    fixed_p(monkeypatch, 50)                                                # exactly 0.025
+    s = ab.development_result(col)["step_1"]
+    assert s["verdict"] == "PROCEED" and s["failed"] == []
+    fixed_p(monkeypatch, 51)                                                # the next value up
+    s = ab.development_result(col)["step_1"]
+    assert s["verdict"] == "FAIL" and s["failed"] == ["p_above_0.025"]
+
+
+def test_the_p_limit_is_inclusive_in_sealed(monkeypatch):
+    col = fake_col(winners(100, 2), "sealed")
+    fixed_p(monkeypatch, 50)
+    assert ab.sealed_result(col, BAND)["verdict"]["verdict"] == "PASS"
+    fixed_p(monkeypatch, 51)
+    v = ab.sealed_result(col, BAND)["verdict"]
+    assert v["verdict"] == "FAIL" and v["failed"] == ["p_above_0.025"]
+
+
+def test_a_mean_of_exactly_zero_fails_in_development(monkeypatch):
+    fixed_p(monkeypatch, 0)                                                 # only the mean can decide
+    s = ab.development_result(fake_col(win_and_lose(150)))["step_1"]
+    assert s["total_cents"] == 0 and s["mean_cents"] == 0 and s["trades"] == 300
+    assert s["verdict"] == "FAIL" and s["failed"] == ["mean_not_above_zero"]
+    up = win_and_lose(150)
+    up[0] = ("E0000", 47, True)                                             # one cent more: now above zero
+    assert ab.development_result(fake_col(up))["step_1"]["verdict"] == "PROCEED"
+
+
+def test_a_mean_of_exactly_zero_fails_in_sealed(monkeypatch):
+    fixed_p(monkeypatch, 0)
+    v = ab.sealed_result(fake_col(win_and_lose(100), "sealed"), BAND)
+    assert v["stats"]["total_cents"] == 0
+    assert v["verdict"]["verdict"] == "FAIL" and v["verdict"]["failed"] == ["mean_not_above_zero"]
+    up = win_and_lose(100)
+    up[0] = ("E0000", 47, True)
+    assert ab.sealed_result(fake_col(up, "sealed"), BAND)["verdict"]["verdict"] == "PASS"
+
+
+def test_sealed_minimum_trades_199_fails_and_200_passes(monkeypatch):
+    fixed_p(monkeypatch, 0)
+    ok = winners(100, 2)
+    r200 = ab.sealed_result(fake_col(ok, "sealed"), BAND)
+    assert r200["stats"]["trades"] == 200 and r200["verdict"]["verdict"] == "PASS"
+    r199 = ab.sealed_result(fake_col(ok[:-1], "sealed"), BAND)             # 199 trades from still 100 events
+    assert r199["stats"]["trades"] == 199 and r199["stats"]["events"] == 100
+    assert r199["verdict"]["verdict"] == "FAIL" and r199["verdict"]["failed"] == ["trades_below_200"]
+
+
+def test_sealed_minimum_events_99_fails_and_100_passes(monkeypatch):
+    fixed_p(monkeypatch, 0)
+    r100 = ab.sealed_result(fake_col(winners(100, 2), "sealed"), BAND)
+    assert r100["stats"]["events"] == 100 and r100["verdict"]["verdict"] == "PASS"
+    t99 = [("E%04d" % (i % 99), 48, True) for i in range(200)]               # 200 trades from 99 events
+    r99 = ab.sealed_result(fake_col(t99, "sealed"), BAND)
+    assert r99["stats"]["trades"] == 200 and r99["stats"]["events"] == 99
+    assert r99["verdict"]["verdict"] == "FAIL" and r99["verdict"]["failed"] == ["events_below_100"]
+
+
+def test_development_minimums_are_300_trades_and_150_events(monkeypatch):
+    fixed_p(monkeypatch, 0)
+    assert ab.development_result(fake_col(winners(150, 2)))["step_1"]["verdict"] == "PROCEED"
+    for trades in (winners(150, 2)[:-1], [("E%04d" % (i % 149), 48, True) for i in range(300)]):
+        s = ab.development_result(fake_col(trades))["step_1"]
+        assert s["verdict"] == "FAIL" and s["failed"] == ["no_eligible_band"] and s["eligible_bands"] == 0
+
+
+def test_sealed_is_refused_after_a_failed_development_step_even_with_the_band_it_reported(calibrated_w, clean_marker):
+    s1 = develop(calibrated_w)["result"]["step_1"]
+    assert s1["verdict"] == "FAIL" and s1["band"] is not None               # a band was reported, and it is valid
+    assert ab.is_valid_band(*s1["band"])
+    with pytest.raises(ab.Refused, match="failed step 1"):
+        ab.run_sealed("W", tuple(s1["band"]), flag=True, root=calibrated_w)
+    assert not dev_state(calibrated_w)[2].exists()
+
+
+def test_each_resample_draws_exactly_as_many_events_as_there_are(monkeypatch):
+    calls = []
+    real = np.random.default_rng
+
+    class Spy:
+        def __init__(self, g):
+            self.g = g
+
+        def integers(self, low, high=None, size=None, **kw):
+            calls.append((low, high, size))
+            return self.g.integers(low, high, size=size, **kw)
+
+    monkeypatch.setattr(ab.np.random, "default_rng", lambda seed: Spy(real(seed)))
+    ab.event_p([3, -2, 7, -1, 4, -9, 2] * 5)                                  # 35 events
+    assert calls and all(c[0] == 0 and c[1] == 35 and c[2][1] == 35 for c in calls)
+    assert sum(c[2][0] for c in calls) == 2000
