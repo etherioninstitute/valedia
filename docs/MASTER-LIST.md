@@ -250,7 +250,10 @@ Lessons so far (each is also a "do not repeat"):
 Workers on one board (the owner's wish of 2026-11-17: Paperclip used cleanly with RuFlo, its work appearing
 in Hermes's Kanban, the workers watchable on the Live page, coding done by the strongest local model that can
 run beside MiroFish and Elephant-1):
-- **NOW** the design session for it is running (started by the owner 2026-11-17; step 0, installs nothing).
+- **OWNER** the design session's step 0 is done (2026-11-17, read-only, nothing installed). Its reported
+  result, not yet checked by the trader's lead: Hermes's Kanban can be the one board AND the dispatcher, with
+  a local-model profile as the coder and the Live page watching it; Paperclip and RuFlo are not needed for
+  that. Ten decisions wait on him in that session.
 - Found on 2026-11-17: the Paperclip SERVER is not installed on this Mac (no checkout, no command, no data
   folder); only its agent skill sits in four Hermes profiles (scout, decider, auditor, CTO), talking to a
   control plane that is not running. RuFlo is here as Claude Code plugins (core 0.2.11) plus a source backup
