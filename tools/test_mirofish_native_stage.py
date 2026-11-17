@@ -52,7 +52,7 @@ class NativeStaging(unittest.TestCase):
             for key in keys:self.assertTrue(Path(env[key]).is_relative_to(producer/'tmp'));self.assertTrue(Path(env[key]).is_dir())
             self.assertTrue(Path(env['TIKTOKEN_CACHE_DIR']).is_relative_to(s.BASE));self.assertEqual(list((producer/'backend/uploads/reports').iterdir()),[]);self.assertEqual(list((root/'owned-source/paper_app/state').iterdir()),[]);self.assertEqual(list((producer/'backend/log').iterdir()),[]);self.assertEqual(list((producer/'backend/logs').iterdir()),[])
     def test_acknowledged_list_is_pinned_and_every_entry_matches_the_file_on_disk(self):
-        table=s.acknowledged_revisions();self.assertEqual(len(table),69);self.assertEqual(s.sha(s.ACKNOWLEDGED_FILE),s.ACKNOWLEDGED_SHA)
+        table=s.acknowledged_revisions();self.assertEqual(len(table),86);self.assertEqual(s.sha(s.ACKNOWLEDGED_FILE),s.ACKNOWLEDGED_SHA)
         before=json.loads((s.W16/'review98/before-hashes.json').read_text());frozen={row['path']:row['expected'] for row in before['original318']}
         for path,row in table.items():
             self.assertEqual(frozen[path],row['expected_parent_sha256']);self.assertEqual(s.sha(path),row['acknowledged_sha256']);self.assertTrue(row['commits'])

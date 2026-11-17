@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "decision": "The owner (Burton) approved on 2026-11-11 that these exact later revisions of original canonical files are accepted as known drift from the frozen 2026-11-06 review record.",
+ "decision": "The owner (Burton) approved on 2026-11-11 that these exact later revisions of original canonical files are accepted as known drift from the frozen 2026-11-06 review record. On 2026-11-17 the owner approved, in his words \"Yes, accept them\", 22 further revisions made by the merges of 2026-11-16: the legacy decision chain moved to the shared Elephant-1 instance (commits fbaadb1, d5bf0de, 01c7b45, c742853) and the legacy kill-switch tests kept from writing the real halt file (commit b18a549): 17 files new to this list and 5 whose acknowledged revision changed.",
  "scope": "Group 'original318' only, files under valedia-trader/src only, never the signal extractor (it has its own closed witness). None of these files is copied into a candidate: staging still copies the reviewed W16 bytes, so what a candidate runs is unchanged by this list. A pinned file that differs from its frozen hash and is not listed here with exactly its current hash is refused, as before.",
  "revisions": [
   {
@@ -18,6 +18,14 @@
    "acknowledged_sha256": "b12998033c3791101fa4800ae5d1d9662aaf5164aaaba1f781669d2f520de115",
    "commits": [
     "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/calibration_ledger.py",
+   "expected_parent_sha256": "aad5be0188122ed77790d12ebf5062d0e87581231aa265fcb7599b849c84799e",
+   "acknowledged_sha256": "6379995441290ff66fe12ce65010e1cec2c35eb82b7a937399c74d80bdfd5e08",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
    ]
   },
   {
@@ -132,6 +140,39 @@
    ]
   },
   {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/nimble_annotate.py",
+   "expected_parent_sha256": "118fa24282be82da9219a53410c350f81bb2b0392684d06b091aea38e149af75",
+   "acknowledged_sha256": "a4dc40f0ff11cd313cfa89955c6924ae4f3ce10d786efa265980fe6d3293feff",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio",
+    "01c7b45 2026-11-16 T44-3 addendum 2: restore the movers-scan fake transport; two stale comments"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/nimble_decide.py",
+   "expected_parent_sha256": "60f35586380695c1bdad3832b9364d97560d024fb69c2abf289c80c1f69b6d3f",
+   "acknowledged_sha256": "4bb7fa11e423f4032c8f70133e80a48e7ca1c0ccb3dde69b28376c5547708f21",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/nimble_wiring.py",
+   "expected_parent_sha256": "3bdc119e2cc1c95d83e833d7640bef99245575ffd3708488c86ce7a0c8d09552",
+   "acknowledged_sha256": "f0f2ef6707b5c2ec40bc18c855de63e908d0deba98ebd4e5ede48011bafb7185",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/nimble_wiring_spot.py",
+   "expected_parent_sha256": "45eb3bd67d74319c36e883e0ec42a41a9c20335e241fad3c4812ab99a1491335",
+   "acknowledged_sha256": "0b28f7be586301bdf469e1a9c85a22fe686346022e486fccfdf7ecf2f7e6350b",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
+   ]
+  },
+  {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/okx_client.py",
    "expected_parent_sha256": "21b614ae93284a7c64ba95e7b1efb53f7966b979f147d9f9bfcb9abecb8c83e1",
    "acknowledged_sha256": "46266ead5d4be2a022f4b122697451e04c60e4451faa545e2086924ff0801b5a",
@@ -211,9 +252,26 @@
   {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/systemone_hotpath_client.py",
    "expected_parent_sha256": "6ec43a6bd170393b6cb2c69a4dbe63f2e0f3fa8073e90b58d8d8a1a1f8c21c19",
-   "acknowledged_sha256": "9cd2c6a6e7e72de688c78429bfbe65d497fe755c02ff6c9a5362f838e4b1c07a",
+   "acknowledged_sha256": "41215252737626aee21fb01ad60bf74cc344e107737e247c03a8bf28605f52af",
    "commits": [
-    "1339dd1 2026-11-10 Restore the Nimble System One client on loopback Ollama for nimble-v3"
+    "1339dd1 2026-11-10 Restore the Nimble System One client on loopback Ollama for nimble-v3",
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/systemone_pin.py",
+   "expected_parent_sha256": "639e709c32ad03d468258ea76eedc6576bd3c0683a994e013b6f4d3473d91bf0",
+   "acknowledged_sha256": "b05e99c4bdb21535e6a87adcbb1355b1946445b77a5f96da483d3c65dbf2afd8",
+   "commits": [
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/systemone_test_fakes.py",
+   "expected_parent_sha256": "bcbee2971be0a342297160a0aa312c73df52013de6407f918903d26a8ded079b",
+   "acknowledged_sha256": "b5e74eb17066f550c47be559bfb095027922dd1c24d0240702f8350202e28061",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
    ]
   },
   {
@@ -225,11 +283,30 @@
    ]
   },
   {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_all_knowing_movers_scan.py",
+   "expected_parent_sha256": "da556de8b2928869ad3bed359e6f786884781cd37b4f1a47778624fb87348ee1",
+   "acknowledged_sha256": "27ae9896313be325d4958f04d0b49338774af03162e18c6a70511c3ea3e62a13",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)",
+    "01c7b45 2026-11-16 T44-3 addendum 2: restore the movers-scan fake transport; two stale comments"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_calibration_ledger.py",
+   "expected_parent_sha256": "246d75a2cd9fd41205389389a959b027493764348ac73fe8fb1d468d6f388127",
+   "acknowledged_sha256": "64334f5de795f2a9317bddc5c87e6eb469e60e901655fc6dd8b4b6141df5d88d",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_controls_readout.py",
    "expected_parent_sha256": "2a919b789b7444ef2a376a8aaba27af49eca6979338c90c1a9f457de36cbc497",
-   "acknowledged_sha256": "3ae64c1b26c97da1a7c3bb9daf1a88a99ce804970a34dfec597b82cc225270af",
+   "acknowledged_sha256": "23af5bd907b01ea52572b857517715a84ee3ebdcd48a78397208d7da2a2dc745",
    "commits": [
-    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine",
+    "01c7b45 2026-11-16 T44-3 addendum 2: restore the movers-scan fake transport; two stale comments",
+    "b18a549 2026-11-16 T44-6: legacy kill-switch tests patch the halt path functions so they cannot write the real state/ folder"
    ]
   },
   {
@@ -323,9 +400,10 @@
   {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_informed_before_create.py",
    "expected_parent_sha256": "d76c7551ecd62116ae3992898620609ffddf6b1332b72f4982b84956ab92036f",
-   "acknowledged_sha256": "ee0ca98839ea84690728cf4b9b55712e78a47481a492c6067aa1665aa18d10a8",
+   "acknowledged_sha256": "84c9d7c28a4637edc7640fbb4d6ba6e3bbec332d270d09c465f91ba7456eb581",
    "commits": [
-    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine",
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
    ]
   },
   {
@@ -363,9 +441,10 @@
   {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_kill_switch.py",
    "expected_parent_sha256": "5e91fd374ef064f04943c788b0b309770d87cdc54e3d14d00bbac40b6063ca7f",
-   "acknowledged_sha256": "905df1f547b0996df887a69e74f58d6920191d913a08a66d169e838fdc571bb6",
+   "acknowledged_sha256": "38f732ad1bd43f257520568561cbdd8f41c0452cd601cd2a613fab166ee6f723",
    "commits": [
-    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine",
+    "b18a549 2026-11-16 T44-6: legacy kill-switch tests patch the halt path functions so they cannot write the real state/ folder"
    ]
   },
   {
@@ -390,6 +469,55 @@
    "acknowledged_sha256": "2b3f558b052551e175e45c4258973ac8a0bb38e5623597d1510547a9a768b00b",
    "commits": [
     "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_annotate.py",
+   "expected_parent_sha256": "01a40e04ad3b4b034e52d5e86eb87fd9f6b9fb85d895376e00849765350ac225",
+   "acknowledged_sha256": "b81ef2d421ff891a667b8f62110af63d88af844065e778783929a55053e61021",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)",
+    "c742853 2026-11-16 T44-3 tests: scope the annotate test's decision log inside its engine fake"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_decide.py",
+   "expected_parent_sha256": "2fa71a35875cbbfbb2905ffcc4653214833cce1852ff98c8d58d6c44244ab7e0",
+   "acknowledged_sha256": "bd8e2ea00ac10db1e4667451a8ad94201132a28095ab085263ba8fcdb1c94419",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_v3_modes.py",
+   "expected_parent_sha256": "d977c6e97e80fbf43aaa9d7e65128cb0a66fcef0ccc8b917d00c34c661f2cb39",
+   "acknowledged_sha256": "10993ce39393d03256ae67ed1e7a85791349d72f964607f006ae4ccf31950e37",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_veto_rule.py",
+   "expected_parent_sha256": "066fdc1b1bd9b83f49a41a0795105535b0bce9fdb673c54d75ab8fb18eb63707",
+   "acknowledged_sha256": "41b8ca147ee834c30367914c1d27c01fdf32866632276855e903d5159498334c",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_wiring_prediction.py",
+   "expected_parent_sha256": "adaf177e7b84e7df129d2e03d38e8634ee1ee5fd226c8849f546bc51e55bcc40",
+   "acknowledged_sha256": "ed8d09a02955a8f602a7ce906463343706babf295c14ac6563260cc0e3d1df01",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_nimble_wiring_spot.py",
+   "expected_parent_sha256": "c0cd9952203a2e2b22549592c45da856d75f45d4969d823b1f4230fe42cf836a",
+   "acknowledged_sha256": "4a8a41e2d4e25745c51e1edd3ed8f5fec8d87323cf08a9c0f81552fc038be222",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
    ]
   },
   {
@@ -489,6 +617,22 @@
    ]
   },
   {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_systemone_hotpath_client.py",
+   "expected_parent_sha256": "dc2b7b01ee072f95b8477098f3339cfe084bd2a8b44aec4eaed4684af71acd84",
+   "acknowledged_sha256": "6f965e117b5af44b8c912e96966e3005b1e0ff6cb0458f463fd0e78913712657",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
+   "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_systemone_pin.py",
+   "expected_parent_sha256": "0d90ce7ef61bfd111cf6c135f0e0e74aea36a32657bb8f28a37b733407904330",
+   "acknowledged_sha256": "4d8db75d3a64e4deab464394be36e5df21a69b2289fc3474ddf814a39b35e646",
+   "commits": [
+    "d5bf0de 2026-11-16 T44-3 tests: decision chain on the shared Elephant-1 instance (tests first)"
+   ]
+  },
+  {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/test_treasury.py",
    "expected_parent_sha256": "95c98ce9fe4a3382d38e17c5333956a664c76c2df95ad445d780a65bed330111",
    "acknowledged_sha256": "dafa4930a063ffd7d0a917fdbdfa9e3befff8ce18eee10918773e0235b08d5cf",
@@ -531,10 +675,11 @@
   {
    "path": "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/src/valedia_config.py",
    "expected_parent_sha256": "dc2207c48dfe7679bb4c44d9079a207a40f1d3ef0962637703dfa095f366d4f3",
-   "acknowledged_sha256": "bd8642d3950cd5340f305d0bd0fb955bf6997ee64db8eae32bb7b094fe895de3",
+   "acknowledged_sha256": "33145ea852165e2fce74a89761e78c25c5c86304310b13bd2a8c194fd046a240",
    "commits": [
     "6e99eb9 2026-11-10 Move trading credentials to an owner-only secrets directory",
-    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine"
+    "33779b3 2026-11-10 Harden legacy tree, restore lost subpackages, add Level 5 time-series engine",
+    "fbaadb1 2026-11-16 T44-3: the src/ decision chain uses the shared Elephant-1 instance on LM Studio"
    ]
   },
   {
