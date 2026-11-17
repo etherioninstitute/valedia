@@ -126,7 +126,10 @@ def test_the_reference_edge_passes_on_a_fresh_ledger_and_is_measured_at_prior_at
 def test_the_no_edge_book_fails_development_on_every_seed(full, name):
     ne = suite(full, name)["no_edge"]
     assert ne["runs"] == 5 and ne["passed_development"] == 0 and ne["passed_sealed"] == 0
-    assert all("deflated_sharpe" in s["failed"] for s in ne["seeds"])
+    # T39-2b: the controls state the edge claim, whose checks are the one-trial Sharpe test and the re-timing test
+    # (was: "deflated_sharpe" in every seed's failures)
+    assert all(s["claim"] == "edge" and {"sharpe_one_trial", "timing"} & set(s["failed"]) for s in ne["seeds"])
+    assert all("deflated_sharpe" not in s["failed"] for s in ne["seeds"])
     # median Deflated Sharpe measured 0.106 (as given) and 0.114 (detrended); mark 0.35, about three times the
     # larger. Highest single seed measured 0.422 here and 0.876 on drifting universe 1, detrended.
     assert ne["median_dsr"] <= 0.35
@@ -427,7 +430,7 @@ def test_the_report_is_strict_json_and_the_same_seed_gives_the_same_report(marke
     assert one["data"] == {"symbols": 17, "first": str(market[0].index[0].date()), "last": "2026-11-13",
                            "sealed_from": str(market[0].index[int(len(market[0]) * 0.75)].date())}
     assert one["at_prior_attempts"] is None and one["detrended"]["at_prior_attempts"] is None
-    assert set(one["detrended"]) == {"fresh_ledger", "at_prior_attempts", "reference_edge", "reference_edge_at_prior_attempts",
+    assert set(one["detrended"]) == {"fresh_ledger", "random_timing_by_claim", "at_prior_attempts", "reference_edge", "reference_edge_at_prior_attempts",
                                      "no_edge", "single_bar_edge", "market_basket_sharpe"}
 
 
@@ -481,6 +484,7 @@ def test_prior_attempts_are_read_from_a_ledger_opened_read_only(tmp_path):
     raw, mtime = path.read_bytes(), path.stat().st_mtime_ns
     assert controls.read_prior_attempt_sharpes(path, "us-etf+crypto") == want
     assert controls.read_prior_attempt_sharpes(path, "nowhere") == []
+    assert controls.read_prior_attempt_sharpes(path) == want + [0.5]        # T39-2b: every market, the gate's N
     con = controls._open_read_only(path)
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         con.execute("INSERT INTO findings (hypothesis_id, source, finding, recorded_at) VALUES (NULL, 'x', 'y', 'z')")
@@ -513,6 +517,9 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     assert controls.main(["--data", str(data), "--prior-from-ledger", str(ledger), "--market", "us-etf+crypto"]) == 0
     assert json.loads(capsys.readouterr().out) == {"ok": None}
     assert list(seen["prior_attempt_sharpes"]) == want
+    assert controls.main(["--data", str(data), "--prior-from-ledger", str(ledger)]) == 0      # T39-2b: every market
+    capsys.readouterr()
+    assert list(seen["prior_attempt_sharpes"]) == want + [0.5]
     from valedia_trader.research_loop import cli
     _, _, research_cost = cli._market(type("A", (), {"data": str(data)})())
     assert seen["cost"] == research_cost and seen["cost"].slippage_bps["BTC-USD"] == 5.0
@@ -521,3 +528,16 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     monkeypatch.setattr(controls, "run_controls", lambda p, d, c, **kw: seen.update(none=kw["prior_attempt_sharpes"]) or {})
     controls.main(["--data", str(data)])
     assert list(seen["none"]) == []
+
+
+
+@pytest.mark.parametrize("name", ["given", "detrended"])
+def test_the_long_only_random_timing_book_runs_under_each_claim(full, name):
+    """T39-2b, R7: one row runs the h = 0.50 book under each claim, so the report shows what the label changes."""
+    row = suite(full, name)["random_timing_by_claim"]
+    assert set(row) == {"edge", "exposure"} and row["edge"]["runs"] == row["exposure"]["runs"] == 5
+    same = {k: v for k, v in rung(full, "fresh_ledger", 0.50, name).items() if k != "seeds"}
+    assert row["edge"] == same                                          # the ladder's own rung: the same seeds
+    assert "sharpe_one_trial" not in row["exposure"]["failed_checks"] and "timing" not in row["exposure"]["failed_checks"]
+    assert row["exposure"]["passed_sealed"] >= row["edge"]["passed_sealed"]
+    assert all(s["claim"] == "edge" for r in suite(full, name)["fresh_ledger"]["ladder"] for s in r["seeds"])

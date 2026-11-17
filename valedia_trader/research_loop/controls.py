@@ -26,9 +26,13 @@ The controls:
   is the detector's blind spot, measured and reported, not assumed.
 
 Every control with a pass count also runs on DETRENDED prices (`detrend`: each symbol's average drift removed), so
-a pass that came from the market's own rise can be told from one that came from timing. Each rung also reports
-the gate's own re-timing test (`timing_null` in the development breaker): it is reported, not a gate, and is the
-measurement a later gate change would rest on. `reading` says the main results in plain sentences.
+a pass that came from the market's own rise can be told from one that came from timing. Since T39-2b every control
+states the EDGE claim (`NEUTRAL_PREDICTION`): that is what the controls are for, and the gate then judges timing (the
+one-trial Sharpe test and the re-timing test on the listed window at 0.05 / N, N every attempt in the ledger). Each rung
+also reports the breaker's whole-window re-timing figure (`timing_null`), as before. One more row,
+`random_timing_by_claim`, runs the long-only random-timing book (h = 0.50) under EACH claim on a fresh ledger, so the
+report shows what the label changes: under the exposure claim the gate is the gate before T39-2b. `reading` says the
+main results in plain sentences.
 
 All controls are ordinary `Strategy` subclasses walked by `run_rules` (no dependency on a strategy's own `walk`).
 """
@@ -42,7 +46,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +60,7 @@ from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.strategy import CRYPTO, Strategy, StrategyRisk, run_rules
 
 __all__ = ["run_controls", "detrend", "smallest_passing_hit_rate", "OracleCheat", "FramePeekingCheat", "NoEdgeBook",
-           "NEUTRAL_PREDICTION", "read_prior_attempt_sharpes", "main"]
+           "NEUTRAL_PREDICTION", "EXPOSURE_PREDICTION", "read_prior_attempt_sharpes", "main"]
 
 MARKET = "controls"                  # market label inside the temporary ledgers
 REFERENCE_HIT_RATE = 0.60
@@ -64,7 +68,8 @@ PASS_SHARE = 0.8                     # "at least 4 of 5 seeds"
 SMALLEST_UP_TO = 0.70                # smallest_passing_hit_rate considers only rungs up to this one
 NEUTRAL_PREDICTION = gt.Prediction(annual_return=0.0, win_rate=0.5, sharpe=0.0, fail_if_sharpe_below=0.0,
                                    fail_if_drawdown_above=1.0,
-                                   notes="control run: neutral terms, so only the gate's own checks decide")
+                                   notes="control run: neutral terms, so only the gate's own checks decide", claim="edge")
+EXPOSURE_PREDICTION = replace(NEUTRAL_PREDICTION, claim="exposure")      # the same terms under the exposure claim
 _LAG = 1                             # the execution lag of the gauntlet's main and sealed runs (engine default)
 _KIND = {"oracle": 1, "no_edge": 2, "peek": 3}
 
@@ -263,7 +268,7 @@ def _full_run(ctx: _Context, strategy: Strategy) -> dict:
             "book_fingerprint": _fingerprint_weights(w)}
 
 
-def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = ()) -> dict:
+def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = (), prediction: gt.Prediction = NEUTRAL_PREDICTION) -> dict:
     paths = ctx.new_paths()
     ledger = _fresh_ledger(paths)
     try:
@@ -271,8 +276,8 @@ def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = ()) ->
         before = len(ledger.attempt_sharpes(market=MARKET))
         g = gt.Gauntlet(ctx.prices, ctx.dollar, ctx.cost, ledger, paths, ctx.criteria)
         hid = ledger.propose(strategy.hypothesis, "controls", MARKET)
-        gt.write_prediction(ledger, paths, hid, strategy.name, NEUTRAL_PREDICTION)
-        out: dict = {"attempts_on_market_before": before}
+        gt.write_prediction(ledger, paths, hid, strategy.name, prediction)
+        out: dict = {"attempts_on_market_before": before, "claim": prediction.claim}
         try:
             rep = g.develop(hid, strategy)
         except gt.GauntletError as exc:
@@ -288,6 +293,9 @@ def _run_one(ctx: _Context, strategy: Strategy, priors: Sequence[float] = ()) ->
                    timing_p_value=timing.get("p_value"),
                    variations_of_idea=dsr["variations_of_idea"], attempts_on_market=dsr["attempts_on_market"],
                    variance_of_attempt_sharpes=dsr.get("variance_of_attempt_sharpes"),
+                   edge_timing_region=(rep.get("timing") or {}).get("region"),
+                   edge_timing_p_value=(rep.get("timing") or {}).get("drawn_p_value"),
+                   edge_timing_p_exact=(rep.get("timing") or {}).get("p_exact"),
                    sealed_ran=False, passed_sealed=False, sealed_sharpe=None, sealed_failed=None)
         if out["passed_development"]:
             s = g.seal(hid, strategy)
@@ -338,11 +346,12 @@ def _summary(runs: list[dict]) -> dict:
             "seeds": runs}
 
 
-def _rung(ctx: _Context, hit_rate: float, horizon: int, seeds: int, priors: Sequence[float]) -> dict:
+def _rung(ctx: _Context, hit_rate: float, horizon: int, seeds: int, priors: Sequence[float],
+          prediction: gt.Prediction = NEUTRAL_PREDICTION) -> dict:
     runs = []
     for k in range(seeds):
         oracle = OracleCheat(ctx.prices, hit_rate, horizon, ctx.rng("oracle", round(hit_rate * 10000), horizon, k))
-        runs.append({"seed": k, **_run_one(ctx, oracle, priors)})
+        runs.append({"seed": k, **_run_one(ctx, oracle, priors, prediction)})
     return {"hit_rate": float(hit_rate), "horizon": int(horizon), **_summary(runs)}
 
 
@@ -395,7 +404,10 @@ def _suite(ctx: _Context, hit_rates, horizon: int, seeds: int, priors: list[floa
     single["statement"] = _single_statement(single["seeds"][0])
     no_edge = _summary([{"seed": k, **_run_one(ctx, NoEdgeBook(ctx.prices, ctx.rng("no_edge", k)))} for k in range(seeds)])
     ref = reference(fresh, [])
-    out = {"fresh_ledger": fresh, "at_prior_attempts": None, "reference_edge": ref,
+    edge_random = next((r for r in fresh["ladder"] if r["hit_rate"] == 0.5), None) or _rung(ctx, 0.5, horizon, seeds, ())
+    by_claim = {"edge": {k: v for k, v in edge_random.items() if k != "seeds"},      # the same seeds, fresh ledgers
+                "exposure": {k: v for k, v in _rung(ctx, 0.5, horizon, seeds, (), EXPOSURE_PREDICTION).items() if k != "seeds"}}
+    out = {"fresh_ledger": fresh, "random_timing_by_claim": by_claim, "at_prior_attempts": None, "reference_edge": ref,
            "reference_edge_at_prior_attempts": None, "no_edge": no_edge, "single_bar_edge": single,
            "market_basket_sharpe": ref["median_market_basket_sharpe"]}      # the oracle's market: every symbol
     if priors:
@@ -426,6 +438,11 @@ def _reading(given: dict, flat: dict) -> list[str]:
         out.append(f"Long-only random timing (h = 0.50) passed both tests in {both(a)} seeds on a fresh ledger on the data as "
                    f"given, and in {both(b)} seeds on the detrended data; {a['passed_both_and_timing']} and "
                    f"{b['passed_both_and_timing']} of them also had a re-timing p-value of 0.05 or less.")
+    ga, fb = (given.get("random_timing_by_claim") or {}).get("exposure"), (flat.get("random_timing_by_claim") or {}).get("exposure")
+    if ga and fb:
+        out.append(f"Under the exposure claim (the gate before T39-2b) the same book passed both tests in {both(ga)} seeds "
+                   f"on the data as given and in {both(fb)} on the detrended data: that pass shows a profitable holding, "
+                   "not timing skill, and the controls above run under the edge claim.")
     for suite, data in ((given, "the data as given"), (flat, "the detrended data")):
         for ladder, ledger in (("fresh_ledger", "a fresh ledger"), ("at_prior_attempts", "the prior attempts")):
             if suite.get(ladder) is None:
@@ -500,12 +517,15 @@ def _open_read_only(path: str | Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{p.as_uri()}?mode=ro", uri=True)
 
 
-def read_prior_attempt_sharpes(path: str | Path, market: str) -> list[float]:
-    """The per-period Sharpe of every counted attempt on `market` in the ledger at `path`, opened read-only."""
+def read_prior_attempt_sharpes(path: str | Path, market: str | None = None) -> list[float]:
+    """The per-period Sharpe of every counted attempt in the ledger at `path`, opened read-only: on EVERY market by
+    default, because an edge claim's N is every counted attempt in the ledger (`Gauntlet.develop`); on one market label
+    when `market` is given (what the gate study read: its N was the label's count)."""
     con = _open_read_only(path)
     try:
-        rows = con.execute("SELECT a.sharpe FROM attempts a JOIN hypotheses h ON h.id = a.hypothesis_id "
-                           "WHERE a.sharpe IS NOT NULL AND h.market = ? ORDER BY a.id", (market,)).fetchall()
+        sql = ("SELECT a.sharpe FROM attempts a JOIN hypotheses h ON h.id = a.hypothesis_id WHERE a.sharpe IS NOT NULL"
+               + (" AND h.market = ?" if market is not None else "") + " ORDER BY a.id")
+        rows = con.execute(sql, (market,) if market is not None else ()).fetchall()
     finally:
         con.close()
     return [float(r[0]) for r in rows]
@@ -516,12 +536,13 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="folder with close.parquet and volume.parquet")
     ap.add_argument("--prior-from-ledger", default=None, help="ledger to read attempt Sharpes from (opened read-only)")
-    ap.add_argument("--market", default=None, help="market label of those attempts (default: the research command's)")
+    ap.add_argument("--market", default=None, help="read only this market label's attempts (default: every market, "
+                                                     "the gate's N for an edge claim)")
     ap.add_argument("--seed", type=int, default=20261116)
     args = ap.parse_args(argv)
     from valedia_trader.research_loop import cli
     prices, dollar, cost = cli._market(argparse.Namespace(data=args.data))        # the research command's cost model
-    priors = read_prior_attempt_sharpes(args.prior_from_ledger, args.market or cli.MARKET) if args.prior_from_ledger else ()
+    priors = read_prior_attempt_sharpes(args.prior_from_ledger, args.market) if args.prior_from_ledger else ()
     print(json.dumps(run_controls(prices, dollar, cost, seed=args.seed, prior_attempt_sharpes=priors), indent=2, allow_nan=False))
     return 0
 

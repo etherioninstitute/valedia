@@ -114,7 +114,7 @@ __all__ = ["study", "develops", "passes", "deflated_value", "wilson", "surrogate
            "stationary_bootstrap_rows", "listing_regimes", "listed_start", "timing_listed", "held_average_book",
            "active_returns", "TIMED", "SURROGATE_BLOCK",
            "draw_rule_spec", "NeutralOracle", "RULES", "FAMILIES", "DRAW_RANGES", "EXPOSURE_PREDICTION", "claim_anchor",
-           "main"]
+           "ALPHA", "GATE_SHIFTS", "R3_SHIFTS_PER_RECIPROCAL", "r3_shifts", "main"]   # the re-timing names: gauntlet.py
 
 RULES = ("R0", "R1_gate", "R1_listed", "R2_gate", "R2_listed", "R3_gate", "R3_listed", "R4_gate", "R4_listed")
 TIMED = ("gate", "listed")            # whose re-timing figures a rule uses
