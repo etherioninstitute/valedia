@@ -204,8 +204,9 @@ Only the live commands read it. The ordinary loader (the one every other command
 live file however it is named (through `VALEDIA_ENV_FILE`, a link, another spelling of the path or a second name on
 disk: it compares the real paths and the file's device and inode before reading anything), and refuses any file that
 names either live name anywhere, setting nothing from it; the refusal names the fault and no value. The alerts
-commands and the owner page make the same identity test before they open the trading file, and register nothing
-from a file that names a live name.
+commands and the owner page make the same identity test before they open the trading file, and register no setting
+from a file that names a live name (a copy of the live file under another name is read, refused, and its two values
+are handed only to the output guard, so that they are masked wherever they would be printed).
 
 The live commands never take a key from the process environment or from `trading.env`, fix the environment to production and the host to
 `api.webull.com` in code, pass no account id (the account is chosen by the class in your confirmation, and its last 4

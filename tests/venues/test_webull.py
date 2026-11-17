@@ -4004,7 +4004,7 @@ def test_t50_a3_a_fresh_import_with_planted_variables_fixes_the_same_hosts_and_w
             "VALEDIA_ENV_FILE": str(tmp_path / "no-such-trading.env"), "PYTHONDONTWRITEBYTECODE": "1"}
     seen = []
     for env in (base, {**base, **PLANTED}):
-        out = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(here)!r}); {probe}"],
+        out = subprocess.run([sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(here)!r}); {probe}"],
                              env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
         assert out.returncode == 0, out.stderr[-400:]
         seen.append(json.loads(out.stdout))
