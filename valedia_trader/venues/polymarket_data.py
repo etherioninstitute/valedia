@@ -75,7 +75,11 @@ class PolymarketDataError(RuntimeError):
 
 
 class PageCapHit(PolymarketDataError):
-    """A walk reached its page cap with more pages still promised."""
+    """A walk reached its page cap with more pages still promised; `pages` is how many it read."""
+
+    def __init__(self, msg: str, pages: int = 0):
+        super().__init__(msg)
+        self.pages = pages
 
 
 class Pacer:
@@ -450,7 +454,8 @@ class PolymarketData:
         resend = {k: v for k, v in params.items() if k != "limit"}
         while True:
             if w.pages >= page_cap:
-                raise PageCapHit("page cap %d reached at %s %s with more pages promised" % (page_cap, path, resend))
+                raise PageCapHit("page cap %d reached at %s %s with more pages promised" % (page_cap, path, resend),
+                                 w.pages)
             q = dict(params) if cursor is None else ({"cursor": cursor} if cursor_alone else dict(resend, cursor=cursor))
             ans = self.get_json(path, q)
             read_at = self.now()
@@ -467,6 +472,39 @@ class PolymarketData:
                 return w
             if nxt in seen:
                 raise PolymarketDataError("repeated cursor %r at %s" % (nxt, path))
+            seen.add(nxt)
+            cursor = nxt
+
+    def walk_pages(self, path: str, params: dict, validator, *, page_cap: int = DEFAULT_PAGE_CAP,
+                   cursor_alone: bool = False, identity=None, ids=None, conflicted: set | None = None):
+        """The same walk as `walk`, one page at a time: yields, per page as it arrives, a Walk of that page's rows only
+        (pages 1), and asks for the next page only when the caller comes back for it. `ids` (any mapping from an
+        identity to the signature of its first valid row) and `conflicted` (identities in conflict) span the pages;
+        the caller holds them (the pull keeps `ids` on disk), so the process holds one page whatever the walk's size.
+        Conflicts are only marked: the caller drops them. Raises as `walk` does; at the cap, PageCapHit (its `pages`)
+        once `page_cap` pages were yielded with more promised."""
+        if identity is not None and ids is None:
+            ids = {}
+        seen, cursor, pages = set(), None, 0
+        resend = {k: v for k, v in params.items() if k != "limit"}
+        while True:
+            if pages >= page_cap:
+                raise PageCapHit("page cap %d reached at %s %s with more pages promised" % (page_cap, path, resend),
+                                 pages)
+            q = dict(params) if cursor is None else ({"cursor": cursor} if cursor_alone else dict(resend, cursor=cursor))
+            ans = self.get_json(path, q)
+            read_at = self.now()
+            rows, more, nxt = self._envelope(ans, path)
+            if more and nxt in seen:
+                raise PolymarketDataError("repeated cursor %r at %s" % (nxt, path))
+            pages += 1
+            w = Walk(pages=1, read_at=[read_at])
+            for row in rows:
+                w.add(row, validator, read_at, identity, ids, conflicted)
+            del rows, ans
+            yield w
+            if not more:
+                return
             seen.add(nxt)
             cursor = nxt
 
@@ -499,6 +537,12 @@ class PolymarketData:
         params = {"user": user, "start": int(start), "limit": 1000, "taker_only": "false"}
         return self.walk("/v2/trades", params, lambda r: validate_trade(r, user, self.ts_max), page_cap=page_cap,
                          identity=trade_identity)
+
+    def trade_pages(self, user: str, start: int = 1, page_cap: int = DEFAULT_PAGE_CAP, ids=None):
+        """`trades`, one page at a time (see walk_pages); `ids` spans the pages."""
+        params = {"user": user, "start": int(start), "limit": 1000, "taker_only": "false"}
+        return self.walk_pages("/v2/trades", params, lambda r: validate_trade(r, user, self.ts_max), page_cap=page_cap,
+                               identity=trade_identity, ids=ids)
 
     def positions(self, user: str, status: str | None = None, page_cap: int = DEFAULT_PAGE_CAP) -> Walk:
         """A wallet's positions: open (the default, `status` None) or closed (`status` "CLOSED")."""
@@ -559,3 +603,19 @@ class PolymarketData:
         return self.walk("/v2/prices-history", params, lambda r: validate_price_point(r, self.ts_max),
                          page_cap=page_cap, identity=lambda p: (token_id, p["timestamp"], p["resolution_seconds"]),
                          drop_conflicts=True)
+
+    def price_pages(self, token_id: str, start: int, end: int, page_cap: int = 100, ids=None,
+                    conflicted: set | None = None):
+        """`prices_history`, one page at a time (see walk_pages): identities in conflict are only added to
+        `conflicted`; the caller drops every point of them at the walk's end, as `prices_history` does."""
+        if not _is_str(token_id) or not (_is_int(start) and _is_int(end)) or not 0 < start < end:
+            raise ValueError("a token id and 0 < start < end, whole seconds")
+        params = {"token_id": token_id, "start": start, "end": end}
+        return self.walk_pages("/v2/prices-history", params, lambda r: validate_price_point(r, self.ts_max),
+                               page_cap=page_cap, identity=lambda p: price_identity(token_id, p), ids=ids,
+                               conflicted=conflicted)
+
+
+def price_identity(token_id: str, p: dict) -> tuple:
+    """The identity of a validated price point: the token, the time and the grain."""
+    return (token_id, p["timestamp"], p["resolution_seconds"])

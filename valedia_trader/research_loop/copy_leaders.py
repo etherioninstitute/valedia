@@ -10,6 +10,7 @@ finer grain), and never a point at or after the market's resolution time, which 
 `resolved_at` of /v2/resolutions).
 
     python -m valedia_trader.research_loop.copy_leaders pull --phase 1|2 [--store FILE] [--leave-out W ...]
+        [--max-memory-mb MB]
     python -m valedia_trader.research_loop.copy_leaders develop [--store FILE] [--out-dir DIR] [--leave-out W ...]
     python -m valedia_trader.research_loop.copy_leaders sealed  --i-am-opening-the-sealed-period [--store FILE]
         [--out-dir DIR] [--develop-file FILE] [--leave-out W ...]
@@ -22,10 +23,20 @@ Rules the code holds:
   unfinished; it computes from phase 1 the leaders of every month (standing uses only what precedes the month) and
   their new positions that pass the entry tests, records that plan, and reads for exactly those positions the
   price windows [t1 + 1 h, +12 h), [t1 + 6 h, +12 h) and [t1 + 24 h, +12 h); then, only for positions whose first
-  usable point after the hour has a grain of five minutes or finer, [t1 + 10 min, +12 h). Each step prints how many
-  requests it is about to make first.
-  Raw JSON is kept beside the parsed columns with the time of each read; a walk that did not finish stays marked
-  unfinished; a second pull asks only for what is missing.
+  usable point after the hour has a grain of five minutes or finer, [t1 + 10 min, +12 h). Each step says first what
+  it is about to do (the number of pages of a wallet is not known in advance; the phase-2 estimate uses the pace
+  measured in phase 1, kept in the store as `pull_pace`), then one line per finished walk, a running line every 100
+  pages of a long walk with the process's memory, and the totals and what is unfinished; every line is flushed.
+  Raw JSON is kept beside the parsed columns with the time of each read. A walk reaches the store page by page, in
+  one transaction committed only when its last page is stored, so the process holds one page at a time (a walk's
+  identities, for its repeats and conflicts, sit in a temporary table on disk, never in the store's file); a walk
+  that does not finish (an error after the retries, a kill, the memory guard) leaves no row of its own and stays
+  marked started, and a re-run starts it again from its first page (the service's specification does not say a
+  cursor stays valid across a restart). A wallet whose trades reach the reader's limit of 5,000 pages ends with the
+  status `page_limit`, keeps no row, is not read again, and the pull goes on; phase 2, `develop` and `sealed` refuse
+  until it is named with --leave-out (the refusal prints the exact list), and it is then left out and named
+  (third amendment, 27cde89). Above --max-memory-mb (1,500 by default) of resident memory, read after every page,
+  the pull stops itself cleanly. A second pull asks only for what is missing.
 * The period wall. Development is every month up to June 2026; sealed is July to October 2026. `develop` reads only
   trades before 2026-07-01 plus one day (the 24-hour purchase sums of 30 June's positions), the resolutions of the
   conditions so read, and the price windows of development positions only. A leader's standing for month M uses only
@@ -66,10 +77,12 @@ import calendar
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
+import time
 import uuid
 from bisect import bisect_left
 from collections import Counter, defaultdict
@@ -127,7 +140,6 @@ SPORTS_PREFIXES = ("nfl-", "nba-", "wnba-", "mlb-", "nhl-", "cfb-", "cbb-", "nca
 
 STORE = Path("artifacts") / "polymarket" / "copy_leaders.sqlite"
 OUT_DIR = Path("artifacts") / "polymarket" / "copy_leaders"
-REQUESTS_PER_SECOND = 3
 _BEFORE_CLAIM = None                      # a hook run just before the sealed claim (tests line two processes up here)
 ID_RE = r"[0-9a-f]{32}"
 
@@ -762,6 +774,10 @@ def check_own_shape(path) -> None:
             raise Refused("the store %s is not of this program's own shape (%d store_id rows, %d marker rows; "
                           "nothing written)" % (path, ids or 0, markers or 0))
     except sqlite3.DatabaseError as e:
+        if getattr(e, "sqlite_errorcode", None) == 776 or Path(str(path) + "-journal").exists():
+            raise Refused("the store %s holds a write left unfinished by a stopped pull (its rollback journal is "
+                          "beside it): run the pull again, which undoes it and goes on (nothing written)"
+                          % path) from None                # SQLITE_READONLY_ROLLBACK: a read-only open cannot undo it
         raise Refused("the store %s is not of this program's own shape (%s; nothing written)" % (path, e)) from None
     finally:
         db.close()
@@ -962,6 +978,87 @@ class Store:
                 key, i, token, row["price"], row["resolution_seconds"], row["timestamp"], _j(good_raw[i]), at))
         self._finish("prices", key, w)
 
+    # ------------------------------------------------------------ a walk page by page (the pull)
+    # A walk's rows go to their own tables as each page arrives, inside ONE transaction of this connection that is
+    # committed only when the walk ends finished. Until then no other connection can see them (an analysis opens
+    # its own), and a kill leaves them in SQLite's rollback journal, which undoes them when the store is next
+    # opened; an error, the page limit or the memory guard rolls them back at once. Row numbers are provisional
+    # (negative, in the order served) until the end, where they become the numbers a whole walk gets.
+    def seen(self) -> "_Seen":
+        """The identities of the walk about to start, emptied (a temporary table of this connection, on disk)."""
+        if not getattr(self, "_seen_ready", False):
+            self.db.execute("PRAGMA temp_store = FILE")
+            self.db.execute("CREATE TEMP TABLE IF NOT EXISTS walk_seen (k BLOB PRIMARY KEY, sig BLOB NOT NULL) "
+                            "WITHOUT ROWID")
+            self._seen_ready = True
+        self.db.execute("DELETE FROM temp.walk_seen")
+        return _Seen(self.db)
+
+    def page_limited(self, kind: str) -> dict:
+        """{key: pages read} of the walks that ended at the page limit."""
+        return dict(self.db.execute("SELECT key, pages FROM walks WHERE kind=? AND status=?", (kind, PAGE_LIMIT)))
+
+    def begin_walk(self, kind: str, key: str) -> None:
+        """Start a walk (again) from its first page: any row of an earlier start removed, marked started, committed."""
+        self.db.commit()
+        if kind == "trades":
+            self.db.execute("DELETE FROM trades WHERE wallet=?", (key,))
+        else:
+            self.db.execute("DELETE FROM price_points WHERE walk_key=?", (key,))
+        self.db.execute("DELETE FROM rejects WHERE kind=? AND key=?", (kind, key))
+        self.start_walk(kind, key)
+        self.db.commit()
+
+    def put_page(self, kind: str, key: str, w, st) -> None:
+        """One page's rows and set-aside rows, written now (not yet committed); `st` counts the walk so far."""
+        good_raw = [raw for raw, why in w.raw if not why]
+        if kind == "trades":
+            self.db.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [(
+                key, -(st.rows + i + 1), row["proxy_wallet"], row["side"], row["token_id"], row["condition_id"],
+                row["size"], row["price"], row["timestamp"], row["event_slug"], row["outcome_index"],
+                row["transaction_hash"], row.get("slug"), row.get("title"), _j(good_raw[i]), at)
+                for i, (row, at) in enumerate(zip(w.rows, w.row_read_at))])
+        else:
+            token = key.rsplit("@", 1)[0]
+            self.db.executemany("INSERT INTO price_points VALUES (?,?,?,?,?,?,?,?)", [(
+                key, -(st.rows + i + 1), token, row["price"], row["resolution_seconds"], row["timestamp"],
+                _j(good_raw[i]), at) for i, (row, at) in enumerate(zip(w.rows, w.row_read_at))])
+        self.db.executemany("INSERT INTO rejects VALUES (?,?,?,?,?)", [
+            (kind, key, why, _j(raw), at) for (raw, why), at in zip(w.raw, w.raw_read_at) if why])
+        st.pages += 1
+        st.rows += len(w.rows)
+        st.rejects.update(w.rejects)
+
+    def end_walk(self, kind: str, key: str, st, conflicted=None) -> None:
+        """The walk's last page is stored: (prices) every point of an identity in conflict becomes a counted
+        conflict, none kept; the rows take their final numbers (as a whole walk numbers them); finished; committed."""
+        if kind == "trades":
+            self.db.execute("UPDATE trades SET seq = seq + ? WHERE wallet=?", (st.rows, key))
+        else:
+            for token, ts, grain in sorted(conflicted or ()):
+                rows = self.db.execute("SELECT raw, read_at FROM price_points WHERE walk_key=? AND timestamp=? AND "
+                                       "resolution_seconds=?", (key, ts, grain)).fetchall()
+                self.db.executemany("INSERT INTO rejects VALUES (?,?,?,?,?)",
+                                    [("prices", key, "conflicting_row", raw, at) for raw, at in rows])
+                self.db.execute("DELETE FROM price_points WHERE walk_key=? AND timestamp=? AND resolution_seconds=?",
+                                (key, ts, grain))
+                st.rows -= len(rows)
+                st.rejects["conflicting_row"] += len(rows)
+            self.db.execute("UPDATE price_points SET seq = r.n FROM (SELECT seq AS old, ROW_NUMBER() OVER (ORDER BY "
+                            "seq DESC) - 1 AS n FROM price_points WHERE walk_key=?) AS r WHERE "
+                            "price_points.walk_key=? AND price_points.seq = r.old", (key, key))
+        self.db.execute("UPDATE walks SET status='finished', finished_at=?, pages=?, rows=?, rejects=? WHERE kind=? "
+                        "AND key=?", (_now(), st.pages, st.rows, _j(dict(st.rejects)), kind, key))
+        self.db.commit()
+
+    def abandon_walk(self, kind: str, key: str, status: str | None = None, pages: int | None = None) -> None:
+        """Undo every row the walk wrote; it stays started, or (the page limit) takes `status` and its page count."""
+        self.db.rollback()
+        if status is not None:
+            self.db.execute("UPDATE walks SET status=?, pages=?, rows=NULL, rejects=NULL WHERE kind=? AND key=?",
+                            (status, pages, kind, key))
+        self.db.commit()
+
     # ------------------------------------------------------------ reads for the analysis
     def trade_rows(self, wallet: str, end: int, spill: int = 0) -> list:
         """A wallet's trades before `end`, and those in [end, end + spill) only in tokens it bought in the day before
@@ -1069,7 +1166,10 @@ def phase1_problems(s: Store, leave_out=()) -> list:
     out = []
     open_wallets = [w for w in s.unfinished("trades") if w not in leave]
     if open_wallets:
-        out.append("trade walks of %d wallets (%s)" % (len(open_wallets), ", ".join(open_wallets[:5])))
+        limited = s.page_limited("trades")
+        out.append("trade walks of %d wallets not finished (%s); to leave them out: --leave-out %s" % (
+            len(open_wallets), ", ".join("%s at the page limit (%d pages read)" % (w, limited[w]) if w in limited
+                                         else w for w in open_wallets[:10]), " ".join(sorted(leave | set(open_wallets)))))
     missing = s.db.execute("SELECT COUNT(DISTINCT t.condition_id) FROM trades t LEFT JOIN resolution_answers a "
                            "ON a.condition_id = t.condition_id WHERE a.condition_id IS NULL").fetchone()[0]
     if missing:
@@ -1096,26 +1196,237 @@ def plan_store(s: Store, leave_out=()) -> dict:
     return targets
 
 
-def _eta(n: int) -> str:
-    return _seconds(-(-n // REQUESTS_PER_SECOND))
+PAGE_LIMIT = "page_limit"                 # a walk's status when it reached the reader's page cap with more promised
+MAX_MEMORY_MB = 1500                      # the pull stops itself above this resident memory (--max-memory-mb)
+RUNNING_EVERY = 100                       # a running line every this many pages inside one walk
 
 
-def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), say=print) -> dict:
-    """Fill the store, asking only for what is missing. Walks that fail stay unfinished; PullIncomplete names them."""
+class PullStopped(Exception):
+    """The pull stopped itself: its resident memory went above the limit. The walk it was in is left unfinished
+    (no row of it kept); a re-run starts that walk again from its first page."""
+
+
+class _MemoryOver(Exception):
+    def __init__(self, mb: float):
+        super().__init__(mb)
+        self.mb = mb
+
+
+def _say(msg: str) -> None:
+    """The pull's own line: printed and flushed at once, so a log file shows it while the pull runs."""
+    print(msg, flush=True)
+
+
+def _mach_resident_bytes() -> int:
+    import ctypes
+
+    class Info(ctypes.Structure):              # struct mach_task_basic_info
+        _fields_ = [("virtual_size", ctypes.c_uint64), ("resident_size", ctypes.c_uint64),
+                    ("resident_size_max", ctypes.c_uint64), ("user_time", ctypes.c_int32 * 2),
+                    ("system_time", ctypes.c_int32 * 2), ("policy", ctypes.c_int32), ("suspend_count", ctypes.c_int32)]
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    task = ctypes.c_uint32.in_dll(libc, "mach_task_self_")
+    info, count = Info(), ctypes.c_uint32(ctypes.sizeof(Info) // 4)
+    if libc.task_info(task, 20, ctypes.byref(info), ctypes.byref(count)) != 0:     # MACH_TASK_BASIC_INFO
+        raise OSError("task_info failed")
+    return int(info.resident_size)
+
+
+def rss_mb() -> float:
+    """The process's own resident memory now, in MB: the task's resident size on macOS, /proc on Linux; where neither
+    can be read, the peak so far (never below the present)."""
+    if sys.platform == "darwin":
+        try:
+            return _mach_resident_bytes() / 2 ** 20
+        except (OSError, AttributeError, ValueError):
+            pass
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2 ** 20
+    except (OSError, ValueError, IndexError):
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / (2 ** 20 if sys.platform == "darwin" else 2 ** 10)
+
+
+class _Sig:
+    def __init__(self, d: bytes):
+        self.d = d
+
+    def __eq__(self, sig) -> bool:
+        return self.d == _digest(sig)
+
+
+def _digest(text: str) -> bytes:
+    return hashlib.sha256(text.encode()).digest()[:16]
+
+
+def _key_digest(k) -> bytes:
+    """An identity as 16 bytes: numbers as floats (1 and 1.0 are one identity, as they are as Python keys)."""
+    return _digest(_j([v + 0.0 if isinstance(v, (int, float)) and not isinstance(v, bool) else v for v in k]))
+
+
+class _Seen:
+    """The mapping a walk's identities span its pages with (see PolymarketData.walk_pages), on disk: a temporary table
+    of the pull's connection (never in the store's file), keyed by a 16-byte digest of the identity and holding a
+    16-byte digest of the first valid row's signature. Constant memory whatever the walk's size."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def __contains__(self, k) -> bool:
+        return self.db.execute("SELECT 1 FROM temp.walk_seen WHERE k=?", (_key_digest(k),)).fetchone() is not None
+
+    def __getitem__(self, k) -> _Sig:
+        row = self.db.execute("SELECT sig FROM temp.walk_seen WHERE k=?", (_key_digest(k),)).fetchone()
+        if row is None:
+            raise KeyError(k)
+        return _Sig(row[0])
+
+    def __setitem__(self, k, sig: str) -> None:
+        self.db.execute("INSERT INTO temp.walk_seen VALUES (?,?)", (_key_digest(k), _digest(sig)))
+
+
+@dataclass
+class _WalkState:
+    pages: int = 0
+    rows: int = 0
+    rejects: Counter = field(default_factory=Counter)
+    t0: float = 0.0
+
+
+class _Run:
+    """One pull's own bookkeeping: its lines, its clock, its memory guard (read after every page) and its totals."""
+
+    def __init__(self, say, clock, memory, limit_mb: float, client):
+        self.say, self.clock, self.memory, self.limit = say, clock, memory, limit_mb
+        self.client, self.t0, self.req0 = client, clock(), client.requests
+        self.walks, self.pages, self.rows, self.rejects = 0, 0, 0, Counter()
+        self.walk_in_progress: str | None = None
+
+    def guard(self) -> float:
+        mb = self.memory()
+        if mb > self.limit:
+            raise _MemoryOver(mb)
+        return mb
+
+    def after_page(self, label: str, st: _WalkState) -> None:
+        self.pages += 1
+        mb = self.memory()
+        if st.pages % RUNNING_EVERY == 0:
+            self.say("%s: %d pages, %s rows, %d s, memory %d MB" % (label, st.pages, format(st.rows, ","),
+                                                                   self.clock() - st.t0, mb))
+        if mb > self.limit:
+            raise _MemoryOver(mb)
+
+    def walk_done(self, label: str, st: _WalkState) -> None:
+        self.walks += 1
+        self.rows += st.rows
+        self.rejects.update(st.rejects)
+        self.say("%s finished: %d pages, %s rows, rejects %s, %d s" % (label, st.pages, format(st.rows, ","),
+                                                                      dict(sorted(st.rejects.items())) or "none",
+                                                                      self.clock() - st.t0))
+
+    def seconds_a_request(self, s: Store):
+        pace = s.meta("pull_pace")
+        if isinstance(pace, dict) and pace.get("requests"):
+            return pace["seconds"] / pace["requests"]
+        return None
+
+    def estimate(self, s: Store, n: int) -> str:
+        spr = self.seconds_a_request(s)
+        if spr is None:
+            return "no pace was measured in phase 1, so no time is estimated"
+        return "at the pace measured in phase 1 (%.2f seconds a request) that is at least %s" % (
+            spr, _seconds(math.ceil(n * spr)))
+
+
+def _stream(s: Store, run: _Run, kind: str, key: str, label: str, pages_of) -> None:
+    """One walk, page by page into the store (see Store.put_page): it ends finished; or at the page limit with its
+    own status and no row; or (an error, a kill, the memory guard) left started with no row."""
+    st = _WalkState(t0=run.clock())
+    s.begin_walk(kind, key)
+    run.walk_in_progress = label
+    conflicted: set = set()
+    try:
+        for w in pages_of(s.seen(), conflicted):
+            s.put_page(kind, key, w, st)
+            del w
+            run.after_page(label, st)
+        s.end_walk(kind, key, st, conflicted if kind == "prices" else None)
+    except pd.PageCapHit as e:
+        s.abandon_walk(kind, key, status=PAGE_LIMIT, pages=e.pages or st.pages)
+        run.say("%s ended at the page limit: %d pages read and more promised; its rows removed; it stays out of the "
+                "analysis until named with --leave-out" % (label, e.pages or st.pages))
+        run.walk_in_progress = None
+        return
+    except BaseException:
+        s.abandon_walk(kind, key)
+        raise
+    run.walk_in_progress = None
+    run.walk_done(label, st)
+
+
+def _label(kind: str, key: str) -> str:
+    if kind == "trades":
+        return "trades %s" % key[:10]
+    token, _, start = key.rpartition("@")
+    return "prices %s@%s" % (token[:10], start)
+
+
+def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), say=None, *,
+         max_memory_mb: float = MAX_MEMORY_MB, memory=None, clock=None, page_cap: int = pd.DEFAULT_PAGE_CAP) -> dict:
+    """Fill the store, asking only for what is missing, one page at a time (see Store.put_page). Walks that fail
+    stay unfinished (PullIncomplete names them); a walk at the page limit ends with its own status and the pull goes
+    on; above `max_memory_mb` of resident memory (read after every page) the pull stops itself (PullStopped)."""
     if phase not in (1, 2):
         raise ValueError("phase is 1 or 2")
-    errors = []
+    say = say or _say
+    run = _Run(say, clock or time.monotonic, memory or rss_mb, max_memory_mb, client)
+    errors: list = []
+    stopped = None
     with Store(store_path, make_id=True) as s:     # the pull makes the store and its id
+        try:
+            if phase == 1:
+                _pull_phase1(s, client, run, errors, page_cap)
+            else:
+                _pull_phase2(s, client, run, leave_out, errors)
+        except _MemoryOver as e:
+            stopped = e
+            say("stopped: resident memory %d MB is above the limit of %d MB (--max-memory-mb); the walk in progress "
+                "(%s) is left unfinished with no row kept" % (e.mb, max_memory_mb, run.walk_in_progress or "none"))
         if phase == 1:
-            _pull_phase1(s, client, say, errors)
-        else:
-            _pull_phase2(s, client, leave_out, say, errors)
+            pace = s.meta("pull_pace") or {"requests": 0, "seconds": 0.0}
+            pace = {"requests": pace["requests"] + client.requests - run.req0,
+                    "seconds": pace["seconds"] + run.clock() - run.t0}
+            s.set_meta("pull_pace", pace)
         s.set_meta("last_pull_phase_%d_ended_at" % phase, _now())
+        s.commit()
+        limited = s.page_limited("trades")
+        _summary(s, run, phase, errors, limited)
+    if stopped is not None:
+        raise PullStopped("stopped: resident memory %d MB above the limit of %d MB; re-run to go on"
+                          % (stopped.mb, max_memory_mb))
     if errors:
-        say("phase %d ended with %d walks unfinished (a re-run reads only those): %s"
-            % (phase, len(errors), "; ".join(e.split(": ", 1)[0] for e in errors)))
         raise PullIncomplete("%d walks did not finish (they stay unfinished): %s" % (len(errors), "; ".join(errors[:20])))
-    return {"requests": client.requests}
+    return {"requests": client.requests, "page_limit": sorted(limited)}
+
+
+def _summary(s: Store, run: _Run, phase: int, errors: list, limited: dict) -> None:
+    cands = s.candidates()
+    done = s.finished_keys("trades")
+    open_wallets = [w for w in cands if w not in done and w not in limited]
+    open_res = s.db.execute("SELECT COUNT(*) FROM walks WHERE kind='resolutions' AND status!='finished'").fetchone()[0]
+    open_prices = s.db.execute("SELECT COUNT(*) FROM walks WHERE kind='prices' AND status!='finished'").fetchone()[0]
+    unfinished = (["wallets " + ", ".join(w[:10] for w in open_wallets)] if open_wallets else []) + \
+        (["%d resolution walks" % open_res] if open_res else []) + (["%d price windows" % open_prices] if open_prices
+                                                                     else [])
+    run.say("phase %d ended: %d of %d wallets finished; this run %d walks, %d pages, %s rows, rejects %s, %d requests, "
+            "%d s; at the page limit (left out until named with --leave-out): %s; unfinished: %s" % (
+                phase, len([w for w in cands if w in done]), len(cands), run.walks, run.pages, format(run.rows, ","),
+                dict(sorted(run.rejects.items())) or "none", run.client.requests - run.req0, run.clock() - run.t0,
+                ", ".join("%s (%d pages)" % (w, n) for w, n in sorted(limited.items())) or "none",
+                "; ".join(unfinished) or "none"))
 
 
 def _guarded(errors, label, fn) -> None:
@@ -1127,35 +1438,49 @@ def _guarded(errors, label, fn) -> None:
         errors.append("%s: %s" % (label, e))
 
 
-def _pull_phase1(s: Store, client, say, errors) -> None:
-    boards = 0 if s.board_read_at() else 2
-    todo = s.unfinished("trades")
-    say("phase 1: about to make at least %d requests (%d board reads, %s trade walks of one request or more each), "
-        "at least %s at three a second; resolutions are counted once the trades are in"
-        % (boards + len(todo), boards, "every candidate's" if boards else len(todo), _eta(boards + len(todo))))
-    if boards:
+def _pull_phase1(s: Store, client, run: _Run, errors, page_cap: int) -> None:
+    say = run.say
+    if not s.board_read_at():
+        say("phase 1: reading the two profit boards (2 requests): the candidate set, read once")
         s.put_boards({"all": client.leaderboard("all"), "month": client.leaderboard("month")})
         s.commit()
-        say("phase 1: %d candidates; about to make at least %d trade-walk requests"
-            % (len(s.candidates()), len(s.unfinished("trades"))))
-    for w in s.unfinished("trades"):
-        s.start_walk("trades", w)
-        s.commit()
-        _guarded(errors, "trades %s" % w, lambda w=w: s.finish_trades(w, client.trades(w)))
-        s.commit()
+        run.guard()
+    cands, done, limited = s.candidates(), s.finished_keys("trades"), s.page_limited("trades")
+    todo = [w for w in cands if w not in done and w not in limited]
+    spr = run.seconds_a_request(s)
+    say("phase 1: %d candidate wallets: %d finished before, %d ended at the page limit before, %d to read now. The "
+        "number of pages of each wallet's trades (1,000 trades a page, at most %d pages) is not known in advance, so "
+        "no time is estimated; %s" % (len(cands), len([w for w in cands if w in done]), len(limited), len(todo),
+                                      page_cap, "the service answered at %.2f seconds a request before" % spr
+                                      if spr else "the pace is measured as the pull goes"))
+    for w in todo:
+        _guarded(errors, "trades %s" % w, lambda w=w: _stream(
+            s, run, "trades", w, _label("trades", w),
+            lambda ids, conflicted: client.trade_pages(w, page_cap=page_cap, ids=ids)))
     conds = sorted(s.traded_conditions() - set(s.resolution_answers()))
     n = -(-len(conds) // pd.MAX_CONDITIONS)
-    say("phase 1: about to make %d resolution requests for %d conditions, %s at three a second" % (n, len(conds), _eta(n)))
+    elapsed, made = run.clock() - run.t0, client.requests - run.req0
+    say("phase 1: about to make %d resolution requests for %d conditions; %s" % (
+        n, len(conds), "at the pace measured so far (%.2f seconds a request) that is at least %s"
+        % (elapsed / made, _seconds(math.ceil(n * elapsed / made))) if made else "no pace measured yet"))
     for c in conds:
         s.start_walk("resolutions", c)
     s.commit()
-
     for i in range(0, len(conds), pd.MAX_CONDITIONS):
         part = conds[i:i + pd.MAX_CONDITIONS]
 
-        def one(part=part):
+        def one(part=part, i=i):
+            t = run.clock()
             for batch, w, answers in client.resolution_batches(part):
                 s.finish_resolutions(batch, w, answers)
+                s.commit()
+                run.pages += 1
+                run.rows += len(w.rows)
+                run.rejects.update(w.rejects)
+                say("resolutions %d of %d finished: %d ids, %d rows, rejects %s, %d s" % (
+                    i // pd.MAX_CONDITIONS + 1, n, len(batch), len(w.rows), dict(sorted(w.rejects.items())) or "none",
+                    run.clock() - t))
+                run.guard()
         _guarded(errors, "resolutions from %s" % part[0], one)
         s.commit()
 
@@ -1173,17 +1498,16 @@ def add_ten_minute_windows(s: Store) -> dict:
     return windows
 
 
-def _read_windows(s: Store, client, windows: dict, errors) -> None:
+def _read_windows(s: Store, client, run: _Run, windows: dict, errors) -> None:
     for k in sorted(windows):
         wd = windows[k]
-        s.start_walk("prices", k)
-        s.commit()
-        _guarded(errors, "prices %s" % k, lambda k=k, wd=wd: s.finish_prices(
-            k, client.prices_history(wd.token, wd.start, wd.start + PRICE_SPAN)))
-        s.commit()
+        _guarded(errors, "prices %s" % k, lambda k=k, wd=wd: _stream(
+            s, run, "prices", k, _label("prices", k),
+            lambda ids, conflicted: client.price_pages(wd.token, wd.start, wd.start + PRICE_SPAN, ids=ids,
+                                                       conflicted=conflicted)))
 
 
-def _pull_phase2(s: Store, client, leave_out, say, errors) -> None:
+def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
     problems = phase1_problems(s, leave_out)
     if problems:
         raise Refused("phase 1 is unfinished: %s; finish it (or name the wallets with --leave-out)" % "; ".join(problems))
@@ -1191,18 +1515,19 @@ def _pull_phase2(s: Store, client, leave_out, say, errors) -> None:
     s.commit()
     done = s.finished_keys("prices")
     todo = {k: wd for k, wd in s.plan_windows().items() if k not in done}
-    say("phase 2: %d positions planned; about to make at least %d requests for %d price windows (one hour, six "
-        "hours and 24 hours after each first purchase), at least %s at three a second"
-        % (len(plan), len(todo), len(todo), _eta(len(todo))))
-    _read_windows(s, client, todo, errors)
+    run.say("phase 2: %d positions planned; %d price windows to read (one hour, six hours and 24 hours after each "
+            "first purchase), so at least that many requests (more if a window has more than one page); %s"
+            % (len(plan), len(todo), run.estimate(s, len(todo))))
+    _read_windows(s, client, run, todo, errors)
     if errors:
         return                                     # the 10-minute step waits for every main window
     done = s.finished_keys("prices")
     ten = {k: wd for k, wd in add_ten_minute_windows(s).items() if k not in done}
     s.commit()
-    say("phase 2: about to make %d requests for the 10-minute windows of positions priced at a five-minute grain, "
-        "%s at three a second" % (len(ten), _eta(len(ten))))
-    _read_windows(s, client, ten, errors)
+    run.say("phase 2: %d price windows to read for the 10-minute figure of positions priced at a five-minute grain, "
+            "so at least that many requests (more if a window has more than one page); %s"
+            % (len(ten), run.estimate(s, len(ten))))
+    _read_windows(s, client, run, ten, errors)
 
 
 # ---------------------------------------------------------------- loading, with the period wall
@@ -1249,7 +1574,9 @@ def load(store, period: str, leave_out=()) -> Data:
         if unknown:
             raise Refused("not in the candidate set: %s" % unknown)
         kept = [w for w in cands if w not in leave]
-        implicated = {w: ["trades walk"] for w in s.unfinished("trades")}
+        limited = s.page_limited("trades")
+        implicated = {w: ["trades walk ended at the page limit (%d pages read)" % limited[w] if w in limited
+                          else "trades walk"] for w in s.unfinished("trades")}
         done = s.finished_keys("trades")
         trades = _stored_trades(s, [w for w in kept if w in done], hi, counts, SPILL)
         answered = set(s.resolution_answers({t.condition for ts in trades.values() for t in ts}))
@@ -1271,8 +1598,9 @@ def load(store, period: str, leave_out=()) -> Data:
                     implicated.setdefault(w, []).append("price window %s not pulled" % k)
         missing = sorted(w for w in implicated if w not in leave)
         if missing:
-            raise Refused("the pull is unfinished for wallets %s (%s); name them with --leave-out to run without them"
-                          % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10])))
+            raise Refused("the pull is unfinished for wallets %s (%s); to run without them use: --leave-out %s"
+                          % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10]),
+                             " ".join(sorted(set(leave) | set(missing)))))
         if period == "development":                 # only what a development run reads; sealed: the whole store
             store_counts = s.counts_by_reason(read=(list(trades), hi, {t.condition for ts in trades.values()
                                                                        for t in ts}, list(windows)))
@@ -1699,6 +2027,7 @@ def main(argv=None) -> int:
     p.add_argument("--phase", type=int, choices=(1, 2), required=True)
     p.add_argument("--store", default=None)
     p.add_argument("--leave-out", nargs="*", default=[])
+    p.add_argument("--max-memory-mb", type=int, default=MAX_MEMORY_MB)
     for name in ("develop", "sealed"):
         p = sub.add_parser(name)
         p.add_argument("--store", default=None)
@@ -1710,7 +2039,12 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "pull":
-            print(json.dumps(pull(_store_path(a.store), pd.PolymarketData(), a.phase, a.leave_out)))
+            try:
+                sys.stdout.reconfigure(line_buffering=True)
+            except (AttributeError, ValueError):
+                pass
+            print(json.dumps(pull(_store_path(a.store), pd.PolymarketData(), a.phase, a.leave_out,
+                                  max_memory_mb=a.max_memory_mb)), flush=True)
             return 0
         if a.cmd == "develop":
             doc = run_develop(store=a.store, out_dir=a.out_dir, leave_out=a.leave_out)
@@ -1723,6 +2057,9 @@ def main(argv=None) -> int:
     except PullIncomplete as e:
         print("INCOMPLETE: %s" % e, file=sys.stderr)
         return 3
+    except PullStopped as e:
+        print("STOPPED: %s" % e, file=sys.stderr)
+        return 4
     print(format_table(doc))
     return 0
 
