@@ -724,8 +724,189 @@ def test_the_17_november_case_with_no_earlier_reading_is_pending_until_a_person_
 
 
 def confirm(w, pid, who="Burton", note="checked the app: the game was lost", **kw):
-    return ep.confirm_settlement(journal=w.journal, state=w.state_path, ledger=w.ledger, venue_name=w.venue.name,
+    return ep.confirm_settlement(journal=w.journal, state=w.state_path, ledger=w.ledger, venue=w.venue,
                                  pending_id=pid, who=who, note=note, market=kw.pop("market", w.market), clock=w.clock, **kw)
+
+
+def withdraw(w, pid, who="Burton", note="the contract is back in the app", **kw):
+    return ep.withdraw_pending(journal=w.journal, state=w.state_path, ledger=w.ledger, venue=w.venue,
+                               pending_id=pid, who=who, note=note, clock=w.clock, **kw)
+
+
+def person_state(w):
+    """What a refused person's command must leave as it was: the journal and the practice state."""
+    st = w.state()
+    try:
+        return (len(w.entries()), [(r["id"], r["settlement_id"]) for r in st.pending()],
+                [r["id"] for r in st.open_pending()], len(st.settlements()), len(st.withdrawals()), len(st.readings()))
+    finally:
+        st.close()
+
+
+def positions_fail(w):
+    def boom(a):
+        raise ServerException("INTERNAL", "boom", 500)
+    w.exchange.account_v2.get_account_position = boom
+
+
+def positions_back(w):
+    w.exchange.account_v2.get_account_position = lambda a: w.exchange._log(("positions",), w.exchange._rows())
+
+
+# ---- a person's command checks what the account shows NOW, by the same reconcile, before it writes anything
+
+@pytest.mark.parametrize("change", ["holding back", "another name", "unread", "host", "order open", "unjournaled"])
+def test_a_confirmation_is_refused_unless_the_account_shows_exactly_the_pending_name_gone(tmp_path, change):
+    if change == "order open":
+        w = baseline_world(tmp_path)                                      # a resting order the venue will not cancel
+        w.quote(f"{OTHER}:yes", 0.40, 0.41)
+        assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy", limit="0.30")["status"] == "done"
+        w.exchange.cancel_mode = "ignore"
+        out = vanish(w, {f"{T}:yes": TONIGHT}, "1000")
+        assert pending(out, w), out
+        pid = w.entries("settlement_pending")[0]["pending_id"]
+    else:
+        w, pid = pending_world(tmp_path)
+    before = person_state(w)
+    if change == "holding back":
+        w.exchange.held[f"{T}:yes"] = 1
+    elif change == "another name":
+        w.exchange.held[f"{OTHER}:yes"] = 1
+    elif change == "unread":
+        positions_fail(w)
+    elif change == "host":
+        host, w.venue.host = w.venue.host, "api.webull.com"
+    elif change == "unjournaled":
+        import sqlite3
+        db = sqlite3.connect(w.state_path, isolation_level=None)
+        db.execute("UPDATE readings SET journaled = 0")
+        db.close()
+        before = person_state(w)
+    calls = len(w.exchange.calls)
+    out = confirm(w, pid)
+    assert out["status"] == "refused" and out["reason"], (change, out)
+    assert person_state(w) == before, change                              # nothing journaled, no state changed
+    if change == "host":
+        assert out["stage"] == "environment" and len(w.exchange.calls) == calls     # checked before anything is read
+    # the other way: the account shows exactly the pending name gone, and the confirmation goes through
+    if change == "holding back":
+        w.exchange.held[f"{T}:yes"] = 0
+    elif change == "another name":
+        w.exchange.held[f"{OTHER}:yes"] = 0
+    elif change == "unread":
+        positions_back(w)
+    elif change == "host":
+        w.venue.host = host
+    elif change == "order open":
+        w.exchange.cancel_mode = "ok"
+        assert pending(w.run(reconcile_only=True), w)                    # the reconcile run cancels it, then stops
+    elif change == "unjournaled":
+        assert pending(w.run(reconcile_only=True), w)                    # the reconcile run makes the line good
+    got = confirm(w, pid)
+    assert got["status"] == "confirmed", (change, got)
+    assert len(w.entries("settlement")) == 1 and w.entries("settlement")[0]["witnesses"] == "kalshi_record+person"
+
+
+def test_holdings_gone_together_are_confirmed_one_by_one(tmp_path):
+    # two names pending together: each other difference is a pending name the account shows at exactly 0
+    w = World(tmp_path, held={f"{T}:yes": 1, f"{OTHER}:no": 2})
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
+    out = vanish(w, {f"{T}:yes": TONIGHT, f"{OTHER}:no": {**TONIGHT, "ticker": OTHER}}, "1000.50")
+    assert pending(out, w), out
+    pids = sorted(e["pending_id"] for e in w.entries("settlement_pending"))
+    assert len(pids) == 2
+    assert confirm(w, pids[0])["status"] == "confirmed"
+    assert confirm(w, pids[1])["status"] == "confirmed"
+    assert len(w.entries("settlement")) == 2 and w.run(reconcile_only=True)["status"] == "done"
+
+
+def test_a_pending_record_is_withdrawn_only_when_the_holding_is_back_in_full_and_the_reconcile_clean(tmp_path):
+    w, pid = pending_world(tmp_path)
+    before = person_state(w)
+    for kw in (dict(who=""), dict(note=" "), dict(who="a\nb"), dict(pid=pid + 1), dict(pid=True), dict(pid=0)):
+        args = {"pid": pid, **kw}
+        assert withdraw(w, **args)["status"] == "refused", kw
+        assert person_state(w) == before, kw
+    out = withdraw(w, pid)                                                # the holding is still gone
+    assert out["status"] == "refused" and person_state(w) == before, out
+    w.exchange.held[f"{T}:yes"] = 1
+    w.exchange.held[f"{OTHER}:yes"] = 1                                   # back, but something else differs
+    assert withdraw(w, pid)["status"] == "refused" and person_state(w) == before
+    w.exchange.held[f"{OTHER}:yes"] = 0
+    positions_fail(w)
+    assert withdraw(w, pid)["status"] == "refused" and person_state(w) == before
+    positions_back(w)
+    host, w.venue.host = w.venue.host, "api.webull.com"
+    calls = len(w.exchange.calls)
+    out = withdraw(w, pid)
+    assert out["status"] == "refused" and out["stage"] == "environment" and len(w.exchange.calls) == calls
+    w.venue.host = host
+    got = withdraw(w, pid)                                                # back in full, clean: withdrawn
+    assert got["status"] == "withdrawn", got
+    e = w.entries("settlement_withdrawn")
+    assert len(e) == 1 and e[0]["pending_id"] == pid and e[0]["who"] == "Burton" and e[0]["symbol"] == f"{T}:yes"
+    assert e[0]["note"] == "the contract is back in the app" and w.entries("settlement") == []
+    assert w.state().open_pending() == [] and w.state().settlements() == []
+    assert withdraw(w, pid)["status"] == "refused" and confirm(w, pid)["status"] == "refused"   # closed: once
+    assert len(w.entries("settlement_withdrawn")) == 1 and w.entries("settlement") == []
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"    # sends again
+    w.exchange.held[f"{T}:yes"] = 0                                       # gone again later: a new pending record
+    w.exchange.bp = "999.99"
+    assert pending(w.run(reconcile_only=True), w)
+    assert len(w.entries("settlement_pending")) == 2 and len(w.state().open_pending()) == 1
+
+
+def test_a_confirmation_while_the_holding_is_back_is_refused_and_a_withdrawal_closes_it(tmp_path):
+    w, pid = pending_world(tmp_path)
+    w.exchange.held[f"{T}:yes"] = 1
+    before = person_state(w)
+    out = confirm(w, pid)
+    assert out["status"] == "refused" and "shows" in out["reason"] and person_state(w) == before, out
+    assert withdraw(w, pid)["status"] == "withdrawn"
+
+
+def test_a_failed_withdrawal_line_is_made_good_once_at_the_next_run(tmp_path, monkeypatch):
+    w, pid = pending_world(tmp_path)
+    w.exchange.held[f"{T}:yes"] = 1
+    real = Journal.write
+    failed = []
+
+    def failing(self, day, entry):
+        if entry.get("event") == "settlement_withdrawn" and not failed:
+            failed.append(entry)
+            raise OSError("disk")
+        return real(self, day, entry)
+    monkeypatch.setattr(Journal, "write", failing)
+    got = withdraw(w, pid)
+    assert got["status"] == "withdrawn" and got["journal_error"] and failed
+    monkeypatch.setattr(Journal, "write", real)
+    w.run(reconcile_only=True)
+    w.run(reconcile_only=True)
+    lines = w.entries("settlement_withdrawn")
+    assert len(lines) == 1 and lines[0]["withdrawal_id"] == failed[0]["withdrawal_id"] and lines[0]["pending_id"] == pid
+
+
+def test_the_command_withdraws_a_pending_record(tmp_path, capsys):
+    w, pid = pending_world(tmp_path)
+
+    def build(env):
+        return wb.WebullVenue(KEY, SECRET, client=w.exchange, account_class=env["WEBULL_ACCOUNT_CLASS"], limits=HIGH,
+                              sleep=lambda s: None, clock=lambda: 0.0, confirmation_file=tmp_path / "x.json")
+    w.ledger.close()
+    args = ["--withdraw-pending", str(pid), "--who", "Burton", "--note", "back in the app"]
+    assert ep.main(args, environ={}, build_venue=build, root=tmp_path, clock=w.clock, market=w.market) == 2   # still gone
+    w.exchange.held[f"{T}:yes"] = 1
+    assert ep.main(args, environ={}, build_venue=build, root=tmp_path, clock=w.clock, market=w.market) == 0
+    capsys.readouterr()
+    assert len(w.entries("settlement_withdrawn")) == 1 and w.entries("buying_power")[-1]["clean"] is True
+    for extra in (["--confirm-settlement", "1"], ["--reconcile-only"], ["--ticker", T]):
+        with pytest.raises(SystemExit):
+            ep.main(args + extra, environ={}, build_venue=build, root=tmp_path, clock=w.clock)
+    with pytest.raises(SystemExit):
+        ep.main(["--reconcile-only", "--who", "B"], environ={}, build_venue=build, root=tmp_path, clock=w.clock)
 
 
 def pending_world(tmp_path):
@@ -1018,7 +1199,7 @@ def test_known_cash_in_cents_on_its_own():
         assert cents is None and why, bad
 
 
-# ---- the state file's layout 3, migrated from layout 1 with the baseline and sends untouched
+# ---- the state file's layout 4, migrated from layout 1 with the baseline and sends untouched
 
 LAYOUT_1 = [                                                    # event_practice.STATE_SCHEMA at b446e50, verbatim
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -1060,7 +1241,7 @@ def dump(path, tables=("meta", "baseline", "sends")):
         db.close()
 
 
-def test_a_layout_1_state_file_migrates_to_layout_3_keeping_baseline_and_sends(tmp_path):
+def test_a_layout_1_state_file_migrates_to_layout_4_keeping_baseline_and_sends(tmp_path):
     import sqlite3
     p = tmp_path / "s.sqlite"
     layout_1_file(p)
@@ -1071,9 +1252,9 @@ def test_a_layout_1_state_file_migrates_to_layout_3_keeping_baseline_and_sends(t
     st.close()
     assert dump(p) == before
     db = sqlite3.connect(p)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == ep.STATE_LAYOUT == 3
+    assert db.execute("PRAGMA user_version").fetchone()[0] == ep.STATE_LAYOUT == 4
     db.close()
-    ep.PracticeState(p).close()                                                  # opens again as layout 3
+    ep.PracticeState(p).close()                                                  # opens again as layout 4
     assert dump(p) == before
 
 
@@ -1103,7 +1284,7 @@ def test_a_layout_2_file_of_a640aa9_with_a_hold_is_refused_unchanged(tmp_path):
 
 
 @pytest.mark.parametrize("version, extra", [(4, None), (1, "CREATE TABLE odd (x)"), (3, "CREATE TABLE odd (x)"), (0, None),
-                                            (3, None)])
+                                            (3, None), (5, None), (4, "CREATE TABLE odd (x)")])
 def test_any_other_layout_is_refused(tmp_path, version, extra):
     import sqlite3
     p = tmp_path / "s.sqlite"
@@ -1115,3 +1296,35 @@ def test_any_other_layout_is_refused(tmp_path, version, extra):
     db.close()
     with pytest.raises(ep.PracticeError):
         ep.PracticeState(p)
+
+
+LAYOUT_3_4C58A4F = [                                            # the layout 3 tables 4c58a4f added (never deployed)
+    "CREATE TABLE IF NOT EXISTS settlements (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, units REAL NOT NULL, "
+    "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
+    "time REAL NOT NULL, batch TEXT, witnesses TEXT NOT NULL, confirmed_by TEXT, note TEXT, pending_id INTEGER, "
+    "reading_prev INTEGER, reading_now INTEGER, journaled INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, "
+    "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
+    "figures TEXT NOT NULL, reason TEXT NOT NULL, time REAL NOT NULL, batch TEXT, settlement_id INTEGER, "
+    "journaled INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY, time REAL NOT NULL, batch TEXT, buying_power REAL, "
+    "cents INTEGER, unread TEXT, book TEXT NOT NULL, clean INTEGER NOT NULL, known_cents INTEGER, known_why TEXT, "
+    "journaled INTEGER NOT NULL DEFAULT 0)",
+]
+
+
+def test_a_layout_3_file_of_4c58a4f_with_an_open_pending_record_is_refused_unchanged(tmp_path):
+    import sqlite3
+    p = tmp_path / "s.sqlite"
+    layout_1_file(p)
+    db = sqlite3.connect(p, isolation_level=None)
+    for s in LAYOUT_3_4C58A4F:
+        db.execute(s)
+    db.execute("INSERT INTO pending (symbol, units, baseline_units, program_units, price, kalshi, figures, reason, time) "
+               "VALUES ('KXA-1:yes', 1, 1, 0, '0.00', '{}', '{}', 'r', 1.0)")
+    db.execute("PRAGMA user_version = 3")
+    db.close()
+    data = p.read_bytes()
+    with pytest.raises(ep.PracticeError):
+        ep.PracticeState(p)
+    assert p.read_bytes() == data
