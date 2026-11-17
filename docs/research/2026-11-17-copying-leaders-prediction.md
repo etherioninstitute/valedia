@@ -127,3 +127,35 @@ against the idea (a later, paid price instead of an earlier, stale one).
 **Scope of the pull, stated for the record:** trades and resolutions are read for every candidate wallet (they
 decide who the leaders are); the market trade feed around a purchase is read only for positions of a month's
 leaders in that month, since no other position enters the rule.
+
+## Second amendment of 2026-11-17, 09:35 UTC (still before any data for this test has been pulled)
+
+**Why the first amendment cannot be carried out.** The market's trade feed serves a fixed three-year window,
+newest first, and takes no time bounds for a market. To find the first purchase after a moment in the past the
+whole feed has to be walked back to it. Measured on 14 markets taken from leaders' closed positions (counts of
+rows only, no price and no outcome): 8 could be walked in 1 to 14 pages of a thousand prints; 6 were cut off at
+25 pages, having 25,000 purchases inside a fraction of a day to eleven days of trading. For the busy markets,
+which are where leaders trade most, the walk is not feasible at any polite rate.
+
+**The follower's price is now:** the price of the first point of the public price history for that outcome token
+whose time is at or after one hour after the leader's first purchase, asked for over the twelve hours from that
+moment, at a grain of three hours or finer. No such point: the copied trade is left out and counted. The price
+must still be from 0.05 to 0.95. Measured on nine windows from 100 to over 700 days old (shapes only): such
+windows are served; six held a point, the first of them 2.7 to 6 hours after the hour; three held none.
+
+**What this means for the test, stated plainly.** (1) There is no look back: a point's time is the start of the
+span it was observed in, so a point at or after the hour was observed after it. (2) For anything older than about
+ninety days the follower is priced three to six hours after the hour, not at it: later than the label "one
+hour", which works against copying where prices move toward the leader, and is the honest reading of what this
+data can show. (3) The figure is a price the market recorded, not an ask a buyer paid; the cost of 0.03 already
+carries one cent for that kind of difference, and the result is also reported at 0.04. (4) Trades whose market
+recorded nothing in those twelve hours drop out, which removes the quietest markets.
+
+Everything else stands as written and as first amended: the leaders, what a new position is, the 1,000 dollars,
+the 0.10 to 0.90 first price, the 45 days, the cost, the event as the unit, the periods, the one rule, its
+p-value, the scope of the pull. The information figures are given at 6 hours and 24 hours with the same source;
+the 10-minute figure is given only for the months where a grain of five minutes or finer exists.
+
+**What has been read by now, in all:** the boards; position lists for shapes and totals; for the two feasibility
+measurements above, counts of purchase prints in 14 markets and the shape of nine price windows. No entry has
+been set beside an outcome.
