@@ -77,7 +77,11 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   is seen running and then idle sooner.
 - every loaded model that is neither the decision instance nor the embedding instance (exactly: every loaded instance
   whose id is not `elephant-1`, `ym-research-embedding`, an `mf-native-*` id or an id beginning `elephant-1`, and whose
-  model key is not `elephant-1`; anything else, a model under another key with an id such as `copy` included): unloaded by REST
+  model key is not `elephant-1`; anything else, a model under another key with an id such as `copy` included): unloaded by REST.
+  Every instance a run unloads is named (id and key) in the announcement printed before the first switch-off and in the
+  row, and nothing outside that announced list is unloaded: a model loaded after the announcement is reported in capitals
+  (`MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE`) and left alone. The load test's own `mf-native-<hex>` instance is
+  named in the intent file before its load call and is the only instance its unload names
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
 
@@ -202,8 +206,8 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
 2. The intent is parsed against its one typed shape (every field and its type, nothing else); a field that fails is named
    and nothing is done, the file kept (exit 2). Then it is checked against the tool's constants: the pick reader's label
    `com.valedia.picks.hourly`, its one plist `~/Library/LaunchAgents/com.valedia.picks.hourly.plist`, and a work folder that
-   is a staged `valedia-native-*` folder of the crew folder; a `MISMATCH` is printed and nothing is done (exit 2). (The run
-   path, for its part, refuses to boot out a reader loaded from any other plist.)
+   is a staged `valedia-native-*` folder of the crew folder; a `MISMATCH` is printed and nothing is done (exit 2). (`check`,
+   `run` and `load-test`, for their part, refuse before any change when the reader is loaded from any other plist.)
 3. Survivors are looked for: the intent's launcher entry, the observer identity file in the staged folder, and a scan of
    this user's processes (pids only) for the two commands. Each proposed pid is put to the proof, and only a pid that
    passes ALL of it is a survivor: above 1; not this process or any ancestor; not the job pid of
@@ -213,11 +217,15 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
    `... -B <staged folder>/owned-source/observer-entry/mirofish_native_run.py`. The command is read (`ps -ww -p PID -o
    command=`) for that test alone and dropped at once: it is never printed, logged, stored, put in a row or in an exception
    text; only "it names them" or "it does not" leaves the test. An identity file never suffices by itself: it only proposes
-   a pid. A proposed process that is alive but fails a test is never signalled; a capitals line says which test failed.
+   a pid. A proposed process that is alive but fails a test is never signalled. Two cases are kept apart: when the proof
+   could NOT be made (a command or a start unreadable, the job list unreadable, the scan failed) nothing is changed, the
+   file is kept and it says so in capitals (exit 3); when the proof was made and the answer is no (the command does not
+   name this run's folder and script, the start differs, or the pid is 1 or less, this tool, an ancestor or a job's pid:
+   a reused pid), the process is reported by its pid only, never signalled, and does not hold the recovery back.
 4. Every proven survivor is reported in capitals (`LAUNCHER STILL RUNNING`, `OBSERVER STILL RUNNING`). Only with `--stop`
    is it stopped the documented way, each proven again just before its signal: TERM to a proven observer, then, if a
    proven launcher still runs, SIGINT to it; it waits up to 180 s for them to end.
-5. While a proven survivor lives, while the scan could not be made, or while a proposed process is alive but unproven, the
+5. While a proven survivor lives, or while a proof or the scan could not be made, the
    pick reader is NOT put back (the reader beside a live run is what the switch-off exists to prevent) and the intent file
    is kept. Without `--stop` it then changes nothing at all and writes no row (exit 3).
 6. Otherwise: the pick reader is bootstrapped from its one constant plist when it was loaded before and is not now (it
