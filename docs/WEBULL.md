@@ -272,7 +272,7 @@ what settlement looks like.
   journals nothing, changes no practice state and says why. If the holding is back in the account in full, no one
   settles it: `--withdraw-pending ID --who NAME --note TEXT` closes the record without a settlement, only on a
   reconcile clean apart from names with open pending records of their own. After that, a purchase on the ticker
-  is refused until a run reads Kalshi's record as still trading (status exactly "active" or "open") (the record that said finalized stays in
+  is refused until a run reads Kalshi's record as still trading (status exactly "active" or "open"; the record that said finalized stays in
   the state). A later run never settles a pending record by itself. The 17 November holding has no earlier
   reading, so it waits for a person.
 - **What a loss is confirmed as.** A loss is confirmed by three facts: Kalshi's record says the contract lost, the

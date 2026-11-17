@@ -167,7 +167,8 @@ removed. Event buying power is derived from that linked account's settled cash (
 - Any cash move from outside the ledger that exactly cancels a difference passes the equation. The known cash is
   the cash of everything the venue has reported in a readable way; a charge the venue makes and does not report
   readably (for example a fee added after the last piece, answered with a fee that cannot be read, of which the
-  ledger keeps no trace) is such a move. Alone it makes the equation fail and a person confirms. Beside a second
+  ledger keeps no trace) is such a move. Alone, when it falls between the two readings, it makes the equation fail and a
+  person confirms (one that entered before the earlier clean reading cancels, as a rounding does). Beside a second
   outside move of the opposite size, such as a hand sale of the same size, the two cancel and the equation passes:
   the cash journaled is right to the cent, and the label (settled, where it was sold) is wrong. No rule on the
   ledger's rows or totals can see a charge that leaves no trace; a third witness (the account's own order history)

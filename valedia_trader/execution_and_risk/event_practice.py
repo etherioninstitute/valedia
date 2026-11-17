@@ -415,7 +415,8 @@ def known_cents(ledger: OrderLedger, settlements: list[dict]) -> tuple[int | Non
     before the earlier clean reading cancels exactly. The known cash is the cash of everything the venue has
     REPORTED in a readable way; a charge the venue makes and does not report readably (a fee added after the last
     piece, answered with a fee that cannot be read: the ledger writes nothing, orders.py:1101-1123) is a move outside
-    the ledger. Alone it makes the equation fail and a person confirms; beside a second outside move of the opposite
+    the ledger. Alone, between the two readings, it makes the equation fail and a person confirms (before the earlier
+    clean reading it cancels, as a rounding does); beside a second outside move of the opposite
     size, such as a hand sale of the same size, the two cancel and the equation passes: the cash journaled is right
     to the cent and the label (settled, where it was sold) is wrong. Three cases stay unknown for good, since the
     last fee figure stays older than the last contracts: the late zero fee (never stored); a fee that falls and a
